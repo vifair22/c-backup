@@ -30,6 +30,7 @@
 #include <openssl/evp.h>
 
 #include "backup.h"
+#include "chunklist.h"
 #include "object.h"
 #include "pack.h"
 #include "repo.h"
@@ -212,17 +213,21 @@ static void test_twins_stored_once_counted_once(void **state)
     assert_int_equal(rb.objects_new, ra.objects_new);
     assert_int_equal(rb.bytes_stored, ra.bytes_stored);
 
+    /* The twins' content object: one FILE or a chunk list, as the chunker
+     * decided, and the same for both twins. */
     uint8_t name[OBJECT_HASH_SIZE];
     {
-        int fd = open(TEST_SRC "/twin1.bin", O_RDONLY);
-        assert_true(fd >= 0);
-        size_t len = (size_t)TWIN_MIB * MIB;
-        uint8_t *buf = malloc(len);
-        assert_non_null(buf);
-        assert_int_equal(read(fd, buf, len), (ssize_t)len);
-        close(fd);
-        object_name(OBJECT_TYPE_FILE, buf, len, name);
-        free(buf);
+        db_result_t *r = NULL;
+        assert_int_equal(db_execute(b.db, "SELECT DISTINCT content_hash FROM nodes"
+                                    " WHERE name IN ('twin1.bin', 'twin2.bin')",
+                                    NULL, &r), 0);
+        assert_int_equal(r->nrows, 1);
+        for (int k = 0; k < OBJECT_HASH_SIZE; k++) {
+            unsigned v = 0;
+            assert_int_equal(sscanf(r->rows[0][0] + k * 2, "%2x", &v), 1);
+            name[k] = (uint8_t)v;
+        }
+        db_result_free(r);
     }
     assert_int_equal(pack_entries_of(&a, name), 1);
     assert_int_equal(pack_entries_of(&b, name), 1);
@@ -243,16 +248,22 @@ static void test_twins_stored_once_counted_once(void **state)
     db_result_free(r1);
     db_result_free(r2);
 
-    /* The stored object reads back as the twins' content. */
-    void *data = NULL;
-    size_t got = 0;
-    uint8_t type = 0;
-    assert_int_equal(object_load(b.store, name, &data, &got, &type), OK);
-    assert_int_equal(type, OBJECT_TYPE_FILE);
-    assert_int_equal(got, (size_t)TWIN_MIB * MIB);
+    /* The stored content reads back as the twins'. */
+    char outp[600];
+    snprintf(outp, sizeof(outp), "%s/twin.out", TEST_DIR);
+    int ofd = open(outp, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    assert_true(ofd >= 0);
+    uint64_t got = 0;
+    assert_int_equal(content_restore_fd(b.store, name, ofd, &got), OK);
+    assert_int_equal(got, (uint64_t)TWIN_MIB * MIB);
+    uint8_t *data = malloc((size_t)got);
+    assert_non_null(data);
+    assert_int_equal(pread(ofd, data, (size_t)got, 0), (ssize_t)got);
+    close(ofd);
+    unlink(outp);
     uint8_t back[32];
     unsigned hl = 0;
-    EVP_Digest(data, got, back, &hl, EVP_sha256(), NULL);
+    EVP_Digest(data, (size_t)got, back, &hl, EVP_sha256(), NULL);
     free(data);
     assert_memory_equal(back, sha, 32);
 

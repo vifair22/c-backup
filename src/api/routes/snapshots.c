@@ -870,6 +870,7 @@ typedef struct {
     int             ignore_case;
     uint32_t        max_files;
     int             reencrypt;   /* replicate into another repository's key */
+    int64_t         dest_repo_id;   /* replicate: registered destination, or 0 */
     uint32_t        max_hits_per_file;   /* 0: the grep default */
     uint64_t        max_hits;            /* 0: the grep default */
     snap_job_kind_t kind;
@@ -955,6 +956,83 @@ static int snap_job_needs_key(snap_job_kind_t kind)
 }
 
 /*
+ * The repo lock the job manager takes for a job before it starts.
+ *
+ * Restore reads the repo; reindex rewrites index rows for it. Both take the
+ * write lock, because a reindex racing a backup would interleave two writers
+ * over the same snapshot rows. A verify that only checks is the one job that
+ * writes nothing, so it takes the read lock. With repair on it rewrites
+ * object bytes and needs the write lock like everything else.
+ */
+static job_lock_t snap_job_lock(const snap_job_t *j)
+{
+    return (j->kind == SNAP_JOB_VERIFY && !j->verify_repair) ? JOB_LOCK_READ
+                                                             : JOB_LOCK_WRITE;
+}
+
+/*
+ * The registered repository a replicate writes into, or 0: matched by the
+ * marker's uuid (a re-encrypting target is a repository in its own right)
+ * or by canonical path. Resolved when the job is submitted, because the job
+ * manager needs the whole lock set before the job starts; a destination
+ * registered after that is not locked, as one created by the run never was.
+ */
+static int64_t replicate_dest_repo(int64_t src, const char *dest)
+{
+    int64_t id = 0;
+    repo_marker_t dm;
+    if (repo_marker_read(dest, &dm) == OK) {
+        db_result_t *r = NULL;
+        if (db_execute(g_ctx.db, "SELECT id FROM repos WHERE uuid = ?",
+                       (const char *[]){ dm.uuid, NULL }, &r) == 0 &&
+            r && r->nrows == 1)
+            id = strtoll(r->rows[0][0], NULL, 10);
+        db_result_free(r);
+    } else {
+        err_clear();
+    }
+    char cdest[PATH_MAX];
+    if (id <= 0 && canonical_path(dest, cdest) == 0) {
+        db_result_t *r = NULL;
+        if (db_execute(g_ctx.db, "SELECT id, path FROM repos", NULL, &r) == 0 && r) {
+            for (int i = 0; i < r->nrows && id <= 0; i++) {
+                char crepo[PATH_MAX];
+                if (r->rows[i][1][0] && canonical_path(r->rows[i][1], crepo) == 0 &&
+                    strcmp(crepo, cdest) == 0)
+                    id = strtoll(r->rows[i][0], NULL, 10);
+            }
+        }
+        db_result_free(r);
+    }
+    return id == src ? 0 : id;
+}
+
+/*
+ * Every snap job is submitted here. The lock set is the repository itself,
+ * in the mode snap_job_lock picks, plus a replicate's registered
+ * destination, written: a backup into it must not allocate a snapshot id
+ * this run is about to write. The job manager takes the set all or nothing
+ * and the job function locks neither.
+ */
+static status_t snap_job_run(void *arg, atomic_int *cancel,
+                             void (*progress)(const char *, uint64_t, uint64_t, void *),
+                             void *progress_ctx);
+
+static status_t snap_job_submit(job_manager_t *jm, int64_t repo_id, snap_job_t *j,
+                                const char *action, int64_t schedule_id,
+                                int64_t *out_job_id)
+{
+    int nalso = 0;
+    if (j->kind == SNAP_JOB_REPLICATE && j->dest) {
+        j->dest_repo_id = replicate_dest_repo(repo_id, j->dest);
+        nalso = j->dest_repo_id > 0;
+    }
+    return job_submit_lockset(jm, repo_id, snap_job_lock(j), &j->dest_repo_id,
+                              nalso, action, NULL, schedule_id, snap_job_run, j,
+                              snap_job_free, out_job_id);
+}
+
+/*
  * What a gc did, or would do, on the job and in the journal.
  *
  * gc and gc --dry-run both printed a bare job record: the counts reached the
@@ -1015,7 +1093,7 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
              "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
              "\"packs_deleted\":%u,\"tmp_files_removed\":%u,"
-             "\"tmp_bytes_removed\":%llu",
+             "\"tmp_bytes_removed\":%llu,\"content_missing\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
              (unsigned long long)gr->swept,
@@ -1024,7 +1102,8 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              (unsigned long long)gr->pack_entries_dropped,
              gr->packs_rewritten, gr->packs_deleted,
              gr->tmp_files_removed,
-             (unsigned long long)gr->tmp_bytes_removed);
+             (unsigned long long)gr->tmp_bytes_removed,
+             (unsigned long long)gr->content_missing);
     /* Packs compaction could not walk, each with why. Reasons are built by
      * the pack layer from fixed text and numbers, so need no escaping. */
     size_t n = jn > 0 ? (size_t)jn : 0;
@@ -1141,33 +1220,16 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
 {
     snap_job_t *j = arg;
 
-    /*
-     * Restore reads the repo; reindex rewrites index rows for it. Both take
-     * the write lock, because a reindex racing a backup would interleave two
-     * writers over the same snapshot rows.
-     *
-     * A verify that only checks is the one job that does not write anything,
-     * so it takes the read lock and a backup can run underneath it. With
-     * repair on it rewrites object bytes and needs the write lock like
-     * everything else.
-     */
-    status_t st;
-    int read_only_job = (j->kind == SNAP_JOB_VERIFY && !j->verify_repair);
-    if (read_only_job) {
-        st = repo_lock_read(j->repo_id);
-    } else {
-        st = repo_trylock_write(j->repo_id);
-    }
-    if (st != OK) return st;
-
+    /* The job manager holds this job's repo lock, in the mode
+     * snap_job_lock chose, for the whole of this call. */
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    st = snap_job_needs_key(j->kind)
-             ? repo_store_open_keyed(j->repo_path, NULL, &store)
-             : repo_store_open(j->repo_path, NULL, &store);
-    if (st != OK) { repo_unlock(j->repo_id); return st; }
+    status_t st = snap_job_needs_key(j->kind)
+                      ? repo_store_open_keyed(j->repo_path, NULL, &store)
+                      : repo_store_open(j->repo_path, NULL, &store);
+    if (st != OK) return st;
     st = store_index_bind(store, j->db, j->repo_id, &idx);
-    if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
+    if (st != OK) { store_close(store); return st; }
     /* Every loop below the engine boundary that can run for a whole large
      * object checks this; see store_set_cancel. */
     store_set_cancel(store, cancel);
@@ -1271,33 +1333,8 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
          */
         repo_marker_t m;
         st = repo_marker_read(j->repo_path, &m);
-        /*
-         * A re-encrypting target is a repository in its own right, and may
-         * be registered here: hold its write lock too, so a backup into it
-         * cannot allocate a snapshot id this run is about to write. Try,
-         * never wait - the source lock is already held, and waiting for a
-         * second lock while holding one is how two jobs deadlock.
-         */
-        int64_t dest_locked = 0;
-        if (st == OK && j->reencrypt) {
-            repo_marker_t dm;
-            if (repo_marker_read(j->dest, &dm) == OK) {
-                db_result_t *r = NULL;
-                if (db_execute(j->db, "SELECT id FROM repos WHERE uuid = ?",
-                               (const char *[]){ dm.uuid, NULL }, &r) == 0 &&
-                    r && r->nrows == 1)
-                    dest_locked = strtoll(r->rows[0][0], NULL, 10);
-                db_result_free(r);
-            } else {
-                err_clear();
-            }
-            if (dest_locked > 0 && dest_locked != j->repo_id) {
-                st = repo_trylock_write(dest_locked);
-                if (st != OK) dest_locked = 0;
-            } else {
-                dest_locked = 0;
-            }
-        }
+        /* A destination registered here is in this job's lock set
+         * (snap_job_submit), so the job manager holds it already. */
         if (st == OK) {
             replica_sink_t sink;
             st = j->reencrypt ? replica_sink_local_open_reencrypt(j->dest, &m, &sink)
@@ -1321,7 +1358,6 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                              (unsigned long long)rr.subtrees_skipped);
             }
         }
-        if (dest_locked > 0) repo_unlock(dest_locked);
     } else if (j->kind == SNAP_JOB_GC) {
         gc_result_t gr;
         memset(&gr, 0, sizeof(gr));
@@ -1405,7 +1441,6 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
 
     store_index_free(idx);
     store_close(store);
-    repo_unlock(j->repo_id);
     return st;
 }
 
@@ -1667,8 +1702,7 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
                        : kind == SNAP_JOB_GFS     ? "gfs"
                        : kind == SNAP_JOB_REPLICATE ? "replicate"
                                                   : "restore";
-    status_t st = job_submit(g_ctx.jm, repo_id, action,
-                             NULL, snap_job_run, j, snap_job_free, &job_id);
+    status_t st = snap_job_submit(g_ctx.jm, repo_id, j, action, 0, &job_id);
     if (st != OK) return api_error(st == ERR_BUSY ? 503 : 500, err_msg());
 
     char *out = NULL;
@@ -2168,9 +2202,8 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
         }
     }
 
-    return job_submit_scheduled(jm ? jm : g_ctx.jm, repo_id, action, NULL,
-                                schedule_id, snap_job_run, j, snap_job_free,
-                                out_job_id);
+    return snap_job_submit(jm ? jm : g_ctx.jm, repo_id, j, action, schedule_id,
+                           out_job_id);
 }
 
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)

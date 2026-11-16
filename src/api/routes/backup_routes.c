@@ -11,7 +11,6 @@
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
-#include "lock.h"
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
@@ -42,6 +41,19 @@ static backup_ctx_t g_ctx;
 
 /* backup.file_cache_match, parsed once at start. */
 static int g_file_cache_match = FILE_CACHE_MATCH_AUTO;
+
+/* backup.store_workers, read once at start. */
+static unsigned g_store_workers;
+
+void routes_backup_set_store_workers(unsigned n)
+{
+    g_store_workers = n;
+}
+
+unsigned routes_backup_store_workers(void)
+{
+    return g_store_workers;
+}
 
 void routes_backup_set_file_cache_match(int mode)
 {
@@ -135,20 +147,17 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
 {
     backup_job_t *j = arg;
 
-    /* One writer per repo. Rejecting rather than queueing means a client that
-     * fires two backups at the same repo learns immediately. */
-    status_t st = repo_trylock_write(j->repo_id);
-    if (st != OK) return st;
-
+    /* The job manager holds the repo write lock for the whole of this call
+     * (job_submit takes JOB_LOCK_WRITE), so nothing here takes or releases
+     * it. A request holding it at dispatch defers the job, never fails it. */
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    st = repo_store_open_keyed(j->repo_path, NULL, &store);
-    if (st != OK) { repo_unlock(j->repo_id); return st; }
+    status_t st = repo_store_open_keyed(j->repo_path, NULL, &store);
+    if (st != OK) return st;
 
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) {
         store_close(store);
-        repo_unlock(j->repo_id);
         return st;
     }
     /* So a cancel lands inside a file being read, not after it. */
@@ -162,7 +171,6 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     if (!cpaths) {
         store_index_free(idx);
         store_close(store);
-        repo_unlock(j->repo_id);
         return set_error(ERR_NOMEM, "backup job: paths");
     }
     for (int i = 0; i < j->n_paths; i++) cpaths[i] = j->paths[i];
@@ -174,7 +182,6 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
             free(cpaths);
             store_index_free(idx);
             store_close(store);
-            repo_unlock(j->repo_id);
             return set_error(ERR_NOMEM, "backup job: excludes");
         }
         for (int i = 0; i < j->n_excludes; i++) cexcl[i] = j->excludes[i];
@@ -190,6 +197,7 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     o.file_cache_match = g_file_cache_match;
     o.label        = j->label;
     o.cancel       = cancel;
+    o.store_workers = g_store_workers;
     o.progress_cb  = progress;
     o.progress_ctx = progress_ctx;
     o.bytes_cb     = job_progress_bytes;
@@ -260,7 +268,6 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     free(cexcl);
     store_index_free(idx);
     store_close(store);
-    repo_unlock(j->repo_id);
     return st;
 }
 

@@ -72,8 +72,19 @@ trailer:
 
 ## Writing
 
-Every writer (backup, the store's own writer, replication's stored writer,
-gc's rewrite and coalescing) appends header and payload and nothing else.
+The plaintext writer (backup and the store's own writer) encodes the stripe
+as it appends: each group, once complete, goes to a small pool of encoder
+threads, at most eight groups in flight, and the chunk workers compute each
+entry's payload CRC with its encryption, extended by the header's CRC on
+the writer (`crc32c_combine`). Its seal encodes the last partial group and
+group 0 (the pack header's count is patched then) and writes parity, the
+CRC table and the tails without reading the body back. The parity is held
+in memory until the seal: 6.7% of the body, about 18 MiB at the pack bound,
+as per-entry parity was before.
+
+The other writers (replication's stored writer, gc's rewrite and
+coalescing) are off a backup's path and keep the simpler seal described
+next. Every writer appends header and payload and nothing else.
 Sealing reads the body back sequentially a window of groups at a time (64
 groups, 979 KiB, and its 64 KiB of parity), computes each group's RS parity
 and each entry's CRC in the same pass, and writes the trailer. Memory is the

@@ -292,10 +292,10 @@ static void test_pack_finalize_fsync_fail(void **state)
 }
 
 /*
- * The seal reads the body back (pread) and writes the trailer (pwrite).
- * Either failing must discard the staged pack whole, exactly like a failed
- * fwrite of an entry: nothing installed, nothing announced, nothing left in
- * tmp/. Every call position is tried until the seal gets past its last.
+ * The seal writes the trailer by offset (pwrite). A failure must discard
+ * the staged pack whole, exactly like a failed fwrite of an entry: nothing
+ * installed, nothing announced, nothing left in tmp/. Every call position
+ * is tried until the seal gets past its last.
  */
 static void seal_fault_case(int is_write)
 {
@@ -321,10 +321,20 @@ static void seal_fault_case(int is_write)
     assert_all_readable();
 }
 
-static void test_pack_seal_pread_fail(void **state)
+/* The plaintext writer encodes its stripe as it appends, so its seal reads
+ * nothing back: a read that would fail is never made. */
+static void test_pack_seal_reads_nothing_back(void **state)
 {
     (void)state;
-    seal_fault_case(0);
+    assert_int_equal(fill_store(), OK);
+    fault_reset_all();
+    fault_pread_at = 0;
+    status_t st = object_store_flush(store);
+    int armed = fault_pread_at;
+    fault_reset_all();
+    assert_int_equal(st, OK);
+    assert_int_equal(armed, 0);
+    assert_all_readable();
 }
 
 static void test_pack_seal_pwrite_fail(void **state)
@@ -433,7 +443,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_load_fread_fail, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_read_stored_fread_fail, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_pack_write_fwrite_fail, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_pack_seal_pread_fail, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_seal_reads_nothing_back, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_seal_pwrite_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_finalize_fsync_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_gc_malloc_fail, setup_packed, teardown),

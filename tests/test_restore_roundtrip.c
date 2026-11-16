@@ -49,6 +49,7 @@
 #include "store_index.h"
 #include "types.h"
 #include "verify.h"
+#include "scratch_ancestors.h"
 #include "test_tmp.h"
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_restore"
@@ -156,16 +157,11 @@ static void test_roundtrip_is_identical(void **state)
 /*
  * A file with holes comes back with the right bytes.
  *
- * Holes at the start, in the middle and at the end. The sparse object type
- * and its region walk are gone: a file with holes is an ordinary FILE object
- * whose holes read as zeroes, so the stored object carries the logical size
- * and restore writes those zeroes back.
- *
- * TODO(CDC): this used to check the restored allocation too, because writing
- * every zero back gives a file with the right bytes and every hole filled
- * in, which diff does not notice. Holes are the chunker's to keep again
- * (content_restore_fd leaves them unwritten); when it lands the allocation
- * assertions belong back here and in the all-hole test below.
+ * Holes at the start, in the middle and at the end. A file with holes is a
+ * chunk list whose gaps are the holes, and restore leaves them unwritten,
+ * so the restored file is checked for its allocation as well as its bytes:
+ * writing every zero back gives the right bytes and every hole filled in,
+ * which diff does not notice.
  */
 #define SPARSE_SIZE  (4u * 1024 * 1024)
 #define SPARSE_CHUNK (64u * 1024)
@@ -191,8 +187,8 @@ static int make_sparse(const char *path)
     return (uint64_t)sb.st_blocks * 512 < SPARSE_SIZE;
 }
 
-/* The named file's object: a FILE of the logical size, holes included. */
-static void assert_stored_dense(const char *name, uint64_t size)
+/* The named file's content: a chunk list, its holes left as gaps. */
+static void assert_stored_as_list(const char *name)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -203,8 +199,7 @@ static void assert_stored_dense(const char *name, uint64_t size)
         " WHERE n.repo_id = ? AND n.name = ?",
         (const char *[]){ repo, name, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
-    assert_int_equal(strtoull(r->rows[0][0], NULL, 10), OBJECT_TYPE_FILE);
-    assert_int_equal(strtoull(r->rows[0][1], NULL, 10), size);
+    assert_int_equal(strtoull(r->rows[0][0], NULL, 10), OBJECT_TYPE_CHUNKLIST);
     db_result_free(r);
 }
 
@@ -216,7 +211,7 @@ static void test_sparse_file_round_trips_with_its_holes(void **state)
     backup_opts_t o = basic_opts();
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
-    assert_stored_dense("sparse.img", SPARSE_SIZE);
+    assert_stored_as_list("sparse.img");
 
     restore_result_t rr;
     assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr), OK);
@@ -228,16 +223,17 @@ static void test_sparse_file_round_trips_with_its_holes(void **state)
     struct stat sb;
     assert_int_equal(stat(path, &sb), 0);
     assert_int_equal((uint64_t)sb.st_size, SPARSE_SIZE);
+    assert_true((uint64_t)sb.st_blocks * 512 < SPARSE_SIZE / 2);
 }
 
 /*
  * A file that is nothing but a hole restores at its size, as zeroes.
  *
  * SEEK_DATA on such a file fails with ENXIO, which the store once read as
- * "this filesystem does not report holes". Now every file is read whole and
- * the holes are zeroes, which compress to almost nothing: the stored entry
- * is a sliver of the logical size, which is what keeps a `truncate -s` file
- * from costing the repository its size.
+ * "this filesystem does not report holes" and so stored the file whole. The
+ * restore then wrote every zero: `truncate -s 100M` came back as 204,800
+ * allocated blocks. Now it is a chunk list with no leaves at all, and comes
+ * back with no blocks allocated.
  */
 static void test_file_that_is_all_hole_round_trips(void **state)
 {
@@ -249,10 +245,14 @@ static void test_file_that_is_all_hole_round_trips(void **state)
     assert_int_equal(ftruncate(fd, size), 0);
     close(fd);
 
+    struct stat sb;
+    assert_int_equal(stat(src, &sb), 0);
+    if (sb.st_blocks != 0) skip();   /* the fixture is dense here */
+
     backup_opts_t o = basic_opts();
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
-    assert_stored_dense("hole.bin", (uint64_t)size);
+    assert_stored_as_list("hole.bin");
     assert_true(br.bytes_stored < (uint64_t)size / 16);
 
     restore_result_t rr;
@@ -261,10 +261,10 @@ static void test_file_that_is_all_hole_round_trips(void **state)
     assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
 
     char dst[512];
-    struct stat sb;
     snprintf(dst, sizeof(dst), "%s/hole.bin", restored_root());
     assert_int_equal(stat(dst, &sb), 0);
     assert_int_equal(sb.st_size, size);
+    assert_int_equal(sb.st_blocks, 0);
 }
 
 /* Warnings the restore logs, collected so a test can read what an operator
@@ -1335,7 +1335,31 @@ static void test_xattrs_and_acls_round_trip(void **state)
  * (listxattr order, host endianness) would give every tree a fresh hash on
  * every run and dedup would silently die. An unchanged tree backed up twice
  * must store nothing new.
+ *
+ * Nothing new means nothing under TEST_SRC. The ancestors above it are the
+ * machine's directories and may legitimately move between the two backups;
+ * scratch_ancestors.h has the mechanism.
  */
+
+/* The tree object a snapshot recorded for TEST_SRC, as hex. Its bytes carry
+ * the xattr_hash and acl_hash of every entry in the fixture. */
+static void src_subtree_hash(int64_t snap_id, char *out, size_t out_sz)
+{
+    char snap[32];
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT hex(n.subtree_hash) FROM nodes n"
+        " JOIN nodes p ON p.repo_id = n.repo_id AND p.id = n.parent_node_id"
+        " WHERE n.snap_id = ? AND n.name = 'src'"
+        " AND p.name = 'c_backup_test_restore'",
+        (const char *[]){ snap, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_true(r->rows[0][0][0] != '\0');
+    snprintf(out, out_sz, "%s", r->rows[0][0]);
+    db_result_free(r);
+}
+
 static void test_xattr_backup_is_deterministic(void **state)
 {
     (void)state;
@@ -1344,10 +1368,25 @@ static void test_xattr_backup_is_deterministic(void **state)
 
     backup_opts_t o = basic_opts();
     backup_result_t br1, br2;
+    scratch_ancestors_t before, after;
+    scratch_ancestors_read(TEST_SRC, &before);
     assert_int_equal(backup_run(store, db, repo_id, &o, &br1), OK);
     assert_int_equal(backup_run(store, db, repo_id, &o, &br2), OK);
+    scratch_ancestors_read(TEST_SRC, &after);
+
     assert_int_equal(br2.objects_new, 0);
-    assert_int_equal(br2.trees_new, 0);
+
+    char h1[2 * OBJECT_HASH_SIZE + 1], h2[2 * OBJECT_HASH_SIZE + 1];
+    src_subtree_hash(br1.snapshot_id, h1, sizeof(h1));
+    src_subtree_hash(br2.snapshot_id, h2, sizeof(h2));
+    assert_string_equal(h1, h2);
+
+    if (!scratch_ancestors_moved(&before, &after)) {
+        assert_int_equal(br2.trees_new, 0);
+    } else {
+        /* At most every ancestor and the synthetic root. */
+        assert_true(br2.trees_new <= scratch_ancestors_count(&after) + 1);
+    }
 }
 
 /* And the index is still derived: a rebuilt one restores them too. */
@@ -1683,19 +1722,38 @@ static int count_partials(const char *dir)
     return n;
 }
 
-/* The content hash a file node in the newest snapshot names, as hex. */
-static void node_hash_hex(const char *name, char out[OBJECT_HASH_SIZE * 2 + 1])
+/*
+ * Make a file's content one FILE object in a pack and point its node rows at
+ * it. A backup cuts a file this size into several chunks; these tests are
+ * about what parity and the AEAD do for one object, damaged in the middle,
+ * so they want one object of several parity groups. It is valid content
+ * (a file whose chunker found no cut), so the node restores the same.
+ */
+static void whole_object_of(const char *name, char hex_out[OBJECT_HASH_SIZE * 2 + 1])
 {
-    char repo[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    db_result_t *r = NULL;
-    assert_int_equal(db_execute(db,
-        "SELECT content_hash FROM nodes WHERE repo_id = ? AND name = ?"
-        " ORDER BY snap_id DESC LIMIT 1",
-        (const char *[]){ repo, name, NULL }, &r), 0);
-    assert_int_equal(r->nrows, 1);
-    snprintf(out, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[0][0]);
-    db_result_free(r);
+    char src[600];
+    snprintf(src, sizeof(src), "%s/%s", TEST_SRC, name);
+    int fd = open(src, O_RDONLY);
+    assert_true(fd >= 0);
+    struct stat sb;
+    assert_int_equal(fstat(fd, &sb), 0);
+    size_t len = (size_t)sb.st_size;
+    uint8_t *buf = malloc(len ? len : 1);
+    assert_non_null(buf);
+    assert_int_equal(read(fd, buf, len), (ssize_t)len);
+    close(fd);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    object_write_t w;
+    assert_int_equal(object_store_packed(store, OBJECT_TYPE_FILE, buf, len, NULL,
+                                         hash, &w), OK);
+    free(buf);
+    assert_int_equal(object_store_flush(store), OK);
+    assert_int_equal(store_index_put_packed(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                            w.phys_bytes, len), OK);
+    object_hash_to_hex(hash, hex_out);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE nodes SET content_hash = ? WHERE name = ?",
+        (const char *[]){ hex_out, name, NULL }, NULL), 0);
 }
 
 /* Where an object's entry sits on disk. */
@@ -1776,7 +1834,7 @@ static void test_encrypted_flip_restores_and_verifies(void **state)
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
 
     char hex[OBJECT_HASH_SIZE * 2 + 1], path[600];
-    node_hash_hex("big.bin", hex);
+    whole_object_of("big.bin", hex);
     entry_loc_t el = pack_entry_of(hex, path, sizeof(path));
     assert_int_equal(el.encryption, ENCRYPT_CHACHA20);
     assert_true(el.stored > (uint64_t)(4 << 20));
@@ -1969,7 +2027,7 @@ static void test_unknown_object_type_is_refused_by_restore(void **state)
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
 
     char hex[OBJECT_HASH_SIZE * 2 + 1], path[600];
-    node_hash_hex("big.bin", hex);
+    whole_object_of("big.bin", hex);
     entry_loc_t el = pack_entry_of(hex, path, sizeof(path));
     int fd = open(path, O_RDWR);
     assert_true(fd >= 0);

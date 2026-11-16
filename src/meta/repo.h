@@ -11,6 +11,7 @@
  */
 
 #include "error.h"
+#include "cdc.h"
 #include "repo_key.h"
 #include "store.h"
 #include <cutils/db.h>
@@ -33,15 +34,15 @@
  * The content-defined chunker a repository was created with. Repository
  * constants, never tunables: changing any of them changes the hash of every
  * large file, so they are recorded once in the marker and read from there.
- * The values and bounds are the chunker's (docs/repo-format.md, "Format 3:
- * content-defined chunking"); the marker carries and checks them.
+ * The values and bounds are the chunker's own (cdc.h), aliased here so
+ * there is one source; the marker carries and checks them.
  */
-#define REPO_CHUNKER_ALGO        "fastcdc-gear64-v1"
-#define REPO_CHUNKER_MIN_DEFAULT ((uint32_t)512 * 1024)
-#define REPO_CHUNKER_AVG_DEFAULT ((uint32_t)1024 * 1024)
-#define REPO_CHUNKER_MAX_DEFAULT ((uint32_t)8 * 1024 * 1024)
-#define REPO_CHUNKER_MIN_FLOOR   ((uint32_t)4 * 1024)
-#define REPO_CHUNKER_MAX_CEILING ((uint32_t)16 * 1024 * 1024)
+#define REPO_CHUNKER_ALGO        CDC_ALGO_NAME
+#define REPO_CHUNKER_MIN_DEFAULT CDC_MIN_DEFAULT
+#define REPO_CHUNKER_AVG_DEFAULT CDC_AVG_DEFAULT
+#define REPO_CHUNKER_MAX_DEFAULT CDC_MAX_DEFAULT
+#define REPO_CHUNKER_MIN_FLOOR   CDC_MIN_FLOOR
+#define REPO_CHUNKER_MAX_CEILING CDC_MAX_CEILING
 
 /* The longest incompatible-feature name the marker reader keeps. */
 #define REPO_FEATURE_NAME_MAX 64
@@ -78,6 +79,14 @@ typedef struct {
     repo_kdf_params_t kdf;
     char              wrapped[REPO_KEY_WRAPPED_HEX];
 } repo_marker_t;
+
+/*
+ * The chunking parameters a repository's marker and key imply: its constants,
+ * and the gear table keyed from key when the repository is encrypted (key
+ * may be NULL only for an unencrypted one).
+ */
+status_t repo_marker_cdc(const repo_marker_t *m, const repo_key_t *key,
+                         cdc_params_t *out);
 
 /*
  * What the caller wants when creating a repository. Existing callers that do

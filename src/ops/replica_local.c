@@ -3,6 +3,7 @@
 
 #include "replicate.h"
 
+#include "cdc.h"
 #include "object.h"
 #include "pack.h"
 #include "parity.h"
@@ -89,6 +90,14 @@ typedef struct {
     int        no_overwrite;
     repo_key_t dst_key;
 
+    /* Re-chunking (replicate.h): the target's own chunking parameters, set
+     * only for a re-encrypting sink, which holds the target's key, and the
+     * writer plaintext objects go through. A replica proper shares the
+     * source's identity and key, so it always copies. */
+    cdc_params_t          *tcdc;
+    pack_backup_writer_t  *bw;
+    uint32_t               plain_sealed;
+    int                    stored_sealing;
     /* The target's identity, which its snapshot-ids file is bound to. */
     char       uuid[CBACKUP_UUID_LEN];
 } local_ctx_t;
@@ -209,7 +218,9 @@ static status_t seal_pack(local_ctx_t *c, uint32_t *out_packed)
     pack_stored_writer_t *w = c->w;
     uint32_t pack_num = pack_stored_pack_num(w);
     c->w = NULL;
+    c->stored_sealing = 1;
     status_t st = pack_stored_finish(w, out_packed);
+    c->stored_sealing = 0;
     if (st != OK) return st;
     if (*out_packed > 0) index_add_pack(c, pack_num);
     return OK;
@@ -223,6 +234,97 @@ static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZ
         out[i * 2 + 1] = d[h[i] & 0xF];
     }
     out[OBJECT_HASH_SIZE * 2] = '\0';
+}
+
+/*
+ * Packs the plaintext writer installs reach the index here: the backup
+ * writer announces each through the store's commit callback, at rollover
+ * and at the final seal. The stored writer's packs are added by seal_pack
+ * itself, so those announcements are ignored.
+ */
+static void plain_pack_committed(void *user, const pack_commit_info_t *info)
+{
+    local_ctx_t *c = user;
+    if (c->stored_sealing || !info) return;
+    index_add_pack(c, (uint32_t)info->pack_id);
+    c->plain_sealed += info->entry_count;
+}
+
+static status_t seal_plain(local_ctx_t *c)
+{
+    if (!c->bw) return OK;
+    pack_backup_writer_t *bw = c->bw;
+    c->bw = NULL;
+    uint32_t packed = 0;
+    return pack_backup_finish(bw, &packed);
+}
+
+static const cdc_params_t *local_target_cdc(void *vctx)
+{
+    return ((local_ctx_t *)vctx)->tcdc;
+}
+
+/* One plaintext object into the target, named, compressed, encrypted under
+ * the target's key and parity-protected by the target's own pack writer.
+ * Present already (in the target or staged this run) means nothing written. */
+static status_t local_put_plain(void *vctx, uint8_t type, const void *data,
+                                size_t len, uint8_t out_hash[OBJECT_HASH_SIZE],
+                                int *out_is_new)
+{
+    local_ctx_t *c = vctx;
+    *out_is_new = 0;
+    if (!c->tcdc)
+        return set_error(ERR_INVALID, "replica: this sink only takes objects as stored");
+    if (c->w) {
+        /* Never two writers on one store: each picks its pack number when it
+         * opens. A run is one mode or the other, so this does not happen. */
+        uint32_t packed = 0;
+        status_t st = seal_pack(c, &packed);
+        if (st != OK) return st;
+    }
+    if (c->bw && pack_backup_full(c->bw, (uint64_t)len)) {
+        status_t st = pack_backup_rollover(c->bw);
+        if (st != OK) return st;
+    }
+    if (!c->bw) {
+        status_t st = pack_backup_open(c->store, &c->bw);
+        if (st != OK) return st;
+    }
+    uint64_t phys = 0, payload = 0;
+    return pack_backup_add(c->bw, type, data, len, out_hash, out_is_new,
+                           &phys, &payload);
+}
+
+/* Is a snapshot with this id and timestamp already here? A re-chunked
+ * snapshot's root differs from the source's, so the root cannot be the
+ * test; the timestamp, which travels unchanged, tells our snapshot N from
+ * a target's own. */
+static status_t local_has_snapshot_at(void *vctx, int64_t snapshot_id, int64_t ts,
+                                      int *out_present)
+{
+    local_ctx_t *c = vctx;
+    *out_present = 0;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/snapshots/%lld", c->root,
+                 (long long)snapshot_id) >= (int)sizeof(path))
+        return set_error(ERR_IO, "replica: path too long");
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) return OK;
+    char buf[512];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return OK;
+    buf[n] = '\0';
+    const char *t = strstr(buf, "\"ts\":");
+    if (!t) return OK;
+    *out_present = strtoll(t + 5, NULL, 10) == ts;
+    if (!*out_present)
+        return set_error(ERR_INVALID,
+                         "replica: %s already has a snapshot %lld of its own; "
+                         "re-encrypting replication needs a destination that "
+                         "holds no backups of its own", c->root,
+                         (long long)snapshot_id);
+    return OK;
 }
 
 static status_t local_has_objects(void *vctx, const uint8_t *hashes, size_t n,
@@ -356,8 +458,10 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
      */
     uint32_t packed = 0;
     status_t pst = seal_pack(c, &packed);
-    packed += c->sealed_in_snapshot;
+    if (pst == OK) pst = seal_plain(c);
+    packed += c->sealed_in_snapshot + c->plain_sealed;
     c->sealed_in_snapshot = 0;
+    c->plain_sealed = 0;
     if (pst != OK) {
         /* Copied first: err_msg() is the buffer set_error writes into. */
         char why[256];
@@ -481,9 +585,16 @@ static void local_close(void *vctx)
             log_info("replica: %s gained %u object(s)", c->root, packed);
         c->w = NULL;
     }
+    if (c->bw) {
+        /* Like the stored pack above: no record names these yet. */
+        if (seal_plain(c) != OK)
+            log_error("replica: could not install the pack for %s: %s",
+                      c->root, err_msg());
+    }
     if (c->owns_store && c->store) store_close(c->store);
     free(c->rows);
     repo_key_wipe(&c->dst_key);
+    free(c->tcdc);
     free(c);
 }
 
@@ -541,6 +652,9 @@ static const replica_sink_vtbl_t local_vtbl = {
     .raise_snapshot_ids = local_raise_snapshot_ids,
     .has_snapshot    = local_has_snapshot,
     .close           = local_close,
+    .target_cdc      = local_target_cdc,
+    .put_plain       = local_put_plain,
+    .has_snapshot_at = local_has_snapshot_at,
 };
 
 static status_t sink_finish_open(local_ctx_t *c, const char *path,
@@ -680,9 +794,25 @@ status_t replica_sink_local_open_reencrypt(const char *path,
         }
     }
 
+    /*
+     * The target's own chunking, from its marker and key. Where it differs
+     * from the source's - always across keys, and across encrypted and not -
+     * replicate.c re-chunks into it through put_plain, and the target's
+     * store writes under its own key.
+     */
+    cdc_params_t tcdc;
+    status_t cst = repo_marker_cdc(&m, encrypted ? &c->dst_key : NULL, &tcdc);
+    if (cst == OK && !(c->tcdc = malloc(sizeof(*c->tcdc)))) cst = set_error(ERR_NOMEM, "replica: alloc");
+    if (cst != OK) { repo_key_wipe(&c->dst_key); free(c); return cst; }
+    *c->tcdc = tcdc;
+
     status_t st = sink_finish_open(c, path, &m, out);
     if (st != OK) return st;
-    out->reencrypt = 1;
-    out->dst_key   = encrypted ? &c->dst_key : NULL;
+    if (encrypted) {
+        store_set_encrypted(c->store, 1);
+        store_set_key(c->store, &c->dst_key);
+    }
+    store_set_cdc(c->store, c->tcdc);
+    store_set_pack_commit_cb(c->store, plain_pack_committed, c);
     return OK;
 }

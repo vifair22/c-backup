@@ -846,6 +846,18 @@ records it as cancelled with the message "cancelled before it started"; its
 job. A running job's `state` is usually still `running`: it reports `cancelled` once
 it has stopped. A job that is not queued or running is a 404.
 
+Jobs for one repository start one at a time, in submission order. A job
+whose turn comes while a synchronous request holds its repository (`DELETE
+/repos/<id>/snapshots/<sid>`, `DELETE /repos/<id>`) is not failed: it stays
+`queued` with `phase` `"waiting for repository"`, holds no worker, and is
+retried with a backoff of at most 500 ms until the request lets go. It can be
+cancelled meanwhile like any queued job. The `phase` is cleared when it
+starts. A replicate whose `dest` is a repository registered here holds both
+repositories: it starts only when both are free, takes both or neither, and
+counts as queued on each, so a job submitted later on either one starts after
+it. The requests themselves are unchanged: they still answer 503 (or 409
+for a removal) while a job holds the repository.
+
 A job record carries `origin`, who asked for it: `api` for anything submitted
 over the API (the CLI and the app both are), `schedule` for the scheduler, with
 `schedule_id` naming the schedule (null otherwise).
@@ -878,15 +890,16 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `packs_unwalkable`, `unwalkable` (first 16, `{"pack","reason"}`), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` or `packs_unwalkable` is non-zero |
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `packs_unwalkable`, `unwalkable` (first 16, `{"pack","reason"}`), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` or `packs_unwalkable` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
 | reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten) |
 
 A backup's `result` has its counts (`snapshot_id`, `files`, `dirs`,
 `files_unchanged`, `bytes_logical`, `objects_new`, `bytes_stored`,
 `trees_new`, `trees_reused`, `store_workers`) and what it wrote into the
-repository, in bytes. `store_workers` is always 1 for now: file content is
-stored on the backup thread until the chunker's workers are wired in.
+repository, in bytes. `store_workers` is the number of chunk workers the
+backup used for files over 16 MiB (1 when every chunk was stored on the
+backup thread).
 
 | Field | What |
 |---|---|
@@ -976,8 +989,11 @@ same shape is a `GROUP BY` over hash prefixes, and it is a visualisation now
 rather than a lookup structure.
 
 `/content` is capped deliberately. It feeds a preview pane, and a viewer that
-tries to render a multi-gigabyte file helps nobody; restore is how you get a
-whole file.
+tries to render a multi-gigabyte object helps nobody; restore is how you get a
+whole file. For a chunk list (type 6) it returns the start of the file the
+list describes rather than the list's own bytes, holes as zeroes:
+`{"type":6,"chunklist":true,"size":<logical size>,"returned":<bytes>,
+"truncated":<bool>,"base64":"..."}`.
 
 `/diff` walks manifest trees rather than comparing node lists. Two directories
 with the same hash have identical contents by construction, so an unchanged

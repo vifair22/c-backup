@@ -7,6 +7,10 @@
 
 uint32_t crc32c(const void *data, size_t len);
 uint32_t crc32c_update(uint32_t crc, const void *data, size_t len);
+/* The CRC-32C of A||B from crc32c(A), crc32c(B) and the length of B, so a
+ * CRC computed on one thread can be extended by another without a second
+ * pass over the bytes. */
+uint32_t crc32c_combine(uint32_t crc_a, uint32_t crc_b, uint64_t len_b);
 
 /* ---- XOR interleaved parity (headers, stride=256) ----
  *

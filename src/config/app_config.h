@@ -86,6 +86,14 @@ static const config_key_t app_file_keys[] = {
     { "jobs.max_parallel",   CFG_INT, "2",
       "Maximum concurrently running jobs across all repos",
       CFG_STORE_FILE, 0 },
+    /* Object buffers every job together may hold while reading (format 3,
+     * src/common/read_budget.h): one-shot AEAD holds a whole object, up to
+     * 16 MiB, until its tag verifies, so without a cap the resident total
+     * grows with jobs.max_parallel and each job's workers. Under 16 MiB is
+     * refused: an object that size could never be read. */
+    { "jobs.read_budget_mb", CFG_INT, "256",
+      "MiB of object buffers all jobs may hold at once while reading (16 or more)",
+      CFG_STORE_FILE, 0 },
 
     /* How a backup recognises a file it does not need to read again. "auto"
      * compares every field on local filesystems and drops device and inode
@@ -95,6 +103,14 @@ static const config_key_t app_file_keys[] = {
      * --ignore-ctime together. */
     { "backup.file_cache_match", CFG_STRING, "auto",
       "Unchanged-file detection: auto, strict or relaxed",
+      CFG_STORE_FILE, 0 },
+
+    /* Chunk workers one backup stores files over 16 MiB on (cdc.h), a
+     * quarter of which also cut whole files at once (store_pool.h). 0 sizes
+     * them from the CPUs and memory available; 1 stores every chunk on the
+     * backup thread. See store_pool_plan. */
+    { "backup.store_workers", CFG_INT, "0",
+      "Chunk workers for large files: 0 automatic, 1 serial, up to 64",
       CFG_STORE_FILE, 0 },
 
     /* What a retention pass keeps for a repository that has not set its own
@@ -123,6 +139,15 @@ static const config_section_t app_sections[] = {
  * one repository serialise anyway, so more than this buys nothing. */
 #define APP_MAX_PARALLEL_JOBS 256
 
+/* Upper bound on backup.store_workers, the ceiling store_pool_plan applies
+ * to any request. */
+#define APP_MAX_STORE_WORKERS 64
+
+
+/* jobs.read_budget_mb: at least one object of the largest size format 3
+ * allows; at most 1 TiB, past which it is not a budget. */
+#define APP_MIN_READ_BUDGET_MB 16
+#define APP_MAX_READ_BUDGET_MB (1024 * 1024)
 
 /* Ranges, enumerations and the bind address, checked during config init
  * alongside c-utils' own checks (app_config.c). */

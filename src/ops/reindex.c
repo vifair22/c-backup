@@ -4,6 +4,7 @@
 #include "util.h"
 #include "reindex.h"
 
+#include "chunklist.h"
 #include "manifest.h"
 #include "object.h"
 #include "pack.h"
@@ -106,19 +107,63 @@ static status_t note_object(reindex_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_S
     return OK;
 }
 
+/* Every object a directory consists of, with its real type: the root (a
+ * TREE, or for a large directory a CHUNKLIST of fragments), its fragments
+ * and its tree lists (OWN-34). */
+typedef struct {
+    reindex_ctx_t *ctx;
+    status_t       st;
+} dir_note_t;
+
+static void note_dir_object(void *arg, const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type)
+{
+    dir_note_t *d = arg;
+    if (d->st == OK) d->st = note_object(d->ctx, hash, type);
+}
+
 static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HASH_SIZE],
                           int64_t parent_node_id)
 {
-    manifest_entry_t *entries = NULL;
-    uint32_t count = 0;
-    status_t st = manifest_read_tree(ctx->store, tree_hash, &entries, &count);
+    /*
+     * The directory's objects are recorded as the iterator loads them. The
+     * tree is an object too, and nothing else will record it: no entry
+     * points at its own directory. Miss it and GC sweeps the manifest.
+     * The entries themselves are read whole: every one becomes a node row
+     * in the transaction this walk runs in anyway.
+     */
+    dir_note_t dn = { ctx, OK };
+    obj_loader_t ld = obj_loader_store(ctx->store);
+    manifest_iter_t *it = NULL;
+    status_t st = manifest_iter_open(&ld, tree_hash, note_dir_object, &dn, &it);
     if (st != OK) return st;
-    ctx->res->trees_read++;
-
-    /* The tree is an object too, and nothing else will record it: no entry
-     * points at its own directory. Miss it and GC sweeps the manifest. */
-    st = note_object(ctx, tree_hash, OBJECT_TYPE_TREE);
+    manifest_entry_t *entries = NULL;
+    uint32_t count = 0, cap = 0;
+    for (;;) {
+        const manifest_entry_t *me = NULL;
+        int done = 0;
+        st = manifest_iter_next(it, &me, &done);
+        if (st != OK || done) break;
+        if (dn.st != OK) { st = dn.st; break; }
+        if (count == cap) {
+            uint32_t nc = cap ? cap * 2 : 64;
+            manifest_entry_t *t = realloc(entries, (size_t)nc * sizeof(*t));
+            if (!t) { st = set_error(ERR_NOMEM, "reindex: entries"); break; }
+            entries = t;
+            cap = nc;
+        }
+        manifest_entry_t *e = &entries[count];
+        *e = *me;
+        char *nm = strndup(me->name, me->name_len);
+        char *lt = me->link_target ? strndup(me->link_target, me->link_target_len) : NULL;
+        e->name = nm;
+        e->link_target = lt;
+        count++;
+        if (!nm || (me->link_target && !lt)) { st = set_error(ERR_NOMEM, "reindex: entries"); break; }
+    }
+    manifest_iter_close(it);
+    if (st == OK) st = dn.st;
     if (st != OK) { manifest_free_entries(entries, count); return st; }
+    ctx->res->trees_read++;
 
     char repo[32], snap[32], parent[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)ctx->repo_id);
@@ -312,8 +357,28 @@ static status_t read_snapshot_record(store_t *store, int64_t snap_id,
     return OK;
 }
 
+static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
+                              int count);
+
+static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                       int64_t snap_id, int lists,
+                                       reindex_result_t *out);
+
+/*
+ * Standalone, a snapshot's chunk lists are walked too, so every chunk it
+ * names has an object row: compaction keeps exactly the entries with rows,
+ * and a chunk without one would be dropped from its pack. reindex_repo does
+ * that once for every snapshot at the end instead.
+ */
 status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
                           int64_t snap_id, reindex_result_t *out)
+{
+    return reindex_snapshot_inner(store, db, repo_id, snap_id, 1, out);
+}
+
+static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                       int64_t snap_id, int lists,
+                                       reindex_result_t *out)
 {
     uint8_t root[OBJECT_HASH_SIZE];
     int64_t ts = 0;
@@ -401,6 +466,10 @@ status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
      * complete registry for it. Called from reindex_repo this is nearly a
      * no-op, because it only touches rows still missing their sizes. */
     status_t fst = fill_object_sizes(store, db, repo_id);
+    if (fst == OK && lists) {
+        fst = reindex_lists(store, db, repo_id, 0);
+        if (fst == OK) fst = fill_object_sizes(store, db, repo_id);
+    }
     if (fst != OK) return fst;
 
     res.snapshots = 1;
@@ -701,6 +770,133 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
 }
 
 /*
+ * Chunk lists (format 3), after the walk and the sizing.
+ *
+ * The walk records a file's content under type FILE, because finding out
+ * whether it is a list would mean reading each object's header, measured
+ * at 57 ms a packed object. Once sizes are filled the index says which
+ * content can be a list: a single object's payload is the file, so its
+ * size equals the node's, and a list's payload is 48 bytes an entry. Only
+ * content whose sizes disagree is asked, and each list found is recorded
+ * with its real type and walked, recording every sub-list and chunk it
+ * names. Tree lists were typed by the walk.
+ *
+ * With count set (a full reindex, after recompute_refcounts), list
+ * internals are counted the way gc's mark counts them: once per distinct
+ * list naming them, a list's subtree walked only the first time it is
+ * reached. A one-snapshot reindex only records them; the next gc counts.
+ */
+static status_t note_inner(cutils_db_t *db, const char *repo,
+                           const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
+                           int count, int64_t *out_refs)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1], t[8];
+    hash_hex(hash, hex);
+    snprintf(t, sizeof(t), "%u", type);
+    *out_refs = 0;
+    if (db_execute_non_query(db,
+            "INSERT INTO objects (repo_id, hash, refcount, location, type)"
+            " VALUES (?, ?, 0, 'loose', ?)"
+            " ON CONFLICT(repo_id, hash) DO UPDATE SET type = excluded.type",
+            (const char *[]){ repo, hex, t, NULL }, NULL) != 0)
+        return set_error(ERR_IO, "reindex: cannot record object");
+    if (!count) return OK;
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "UPDATE objects SET refcount = refcount + 1"
+            " WHERE repo_id = ? AND hash = ? RETURNING refcount",
+            (const char *[]){ repo, hex, NULL }, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "reindex: cannot count object");
+    }
+    if (r && r->nrows > 0) *out_refs = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return OK;
+}
+
+static status_t walk_list_inner(store_t *store, cutils_db_t *db, const char *repo,
+                                const uint8_t root[OBJECT_HASH_SIZE], uint8_t leaf_type,
+                                int count)
+{
+    obj_loader_t ld = obj_loader_store(store);
+    chunklist_iter_t *it = NULL;
+    status_t st = chunklist_iter_open(&ld, root, leaf_type, 1, NULL, &it);
+    for (int done = 0; st == OK && !done; ) {
+        chunklist_item_t x;
+        st = chunklist_iter_next(it, &x, &done);
+        if (st != OK || done) break;
+        int64_t refs = 0;
+        st = note_inner(db, repo, x.hash,
+                        x.is_list ? OBJECT_TYPE_CHUNKLIST : leaf_type, count, &refs);
+        if (st == OK && x.is_list && count && refs > 1) chunklist_iter_skip(it);
+    }
+    chunklist_iter_close(it);
+    return st;
+}
+
+static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
+                              int count)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT DISTINCT n.content_hash FROM nodes n"
+            "  JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
+            " WHERE n.repo_id = ? AND n.type = 1 AND o.type IN (1, 6)"
+            "   AND (o.orig_size IS NULL OR o.orig_size != n.size OR o.type = 6)",
+            (const char *[]){ repo, NULL }, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "reindex: cannot list chunk lists");
+    }
+    if (db_txn_begin(db) != OK) {
+        db_result_free(r);
+        return set_error(ERR_IO, "reindex: cannot begin chunk lists");
+    }
+    status_t st = OK;
+    for (int i = 0; r && i < r->nrows && st == OK; i++) {
+        uint8_t h[OBJECT_HASH_SIZE];
+        hex_to_hash(r->rows[i][0], h);
+        uint64_t size = 0;
+        uint8_t type = 0;
+        if (object_get_info(store, h, &size, &type) != OK) {
+            /* Absent or unreadable: verify reports it; nothing to walk. */
+            err_clear();
+            continue;
+        }
+        if (type != OBJECT_TYPE_CHUNKLIST) continue;
+        int64_t refs = 0;
+        st = note_inner(db, repo, h, OBJECT_TYPE_CHUNKLIST, 0, &refs);
+        if (st == OK) st = walk_list_inner(store, db, repo, h, OBJECT_TYPE_FILE, count);
+    }
+    db_result_free(r);
+
+    /* Directories split into fragments: typed by the walk, counted here. */
+    r = NULL;
+    if (st == OK && count &&
+        db_execute(db,
+            "SELECT DISTINCT o.hash FROM objects o WHERE o.repo_id = ?1 AND o.type = 6"
+            "   AND (EXISTS (SELECT 1 FROM nodes n WHERE n.repo_id = ?1"
+            "                 AND n.subtree_hash = o.hash)"
+            "        OR EXISTS (SELECT 1 FROM snapshots s WHERE s.repo_id = ?1"
+            "                    AND s.root_tree_hash = o.hash))",
+            (const char *[]){ repo, NULL }, &r) != 0) {
+        st = set_error(ERR_IO, "reindex: cannot list tree lists");
+    }
+    for (int i = 0; st == OK && r && i < r->nrows; i++) {
+        uint8_t h[OBJECT_HASH_SIZE];
+        hex_to_hash(r->rows[i][0], h);
+        st = walk_list_inner(store, db, repo, h, OBJECT_TYPE_TREE, count);
+    }
+    db_result_free(r);
+
+    if (st != OK) { db_txn_rollback(db); return st; }
+    if (db_txn_commit(db) != OK) return set_error(ERR_IO, "reindex: cannot commit chunk lists");
+    return OK;
+}
+
+/*
  * Count every object's references from the rebuilt index.
  *
  * A reindex left every refcount at zero, so the object listing said nothing
@@ -850,7 +1046,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         reindex_result_t one;
         memset(&one, 0, sizeof(one));
-        status_t one_st = reindex_snapshot(store, db, repo_id, id, &one);
+        status_t one_st = reindex_snapshot_inner(store, db, repo_id, id, 0, &one);
         if (one_st != OK) {
             /* One unreadable snapshot must not abandon the rest: partial
              * recovery of a damaged repository is the whole point. Its old
@@ -882,7 +1078,11 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st != OK) return st;
     st = recompute_refcounts(db, repo_id);
     if (st != OK) return st;
-    st = restore_snapshot_mark(store, db, repo_id, highest_record, &total);
+    /* Chunk lists need sizes to be found and refcounts to add to; what they
+     * name was just recorded, so it is sized in a second, small pass. */
+    st = reindex_lists(store, db, repo_id, 1);
+    if (st == OK) st = fill_object_sizes(store, db, repo_id);
+    if (st == OK) st = restore_snapshot_mark(store, db, repo_id, highest_record, &total);
     if (st != OK) return st;
 
     /* Tags last: they attach to snapshot rows, which now exist. */

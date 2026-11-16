@@ -359,8 +359,7 @@ check    "and the error is bare JSON on stderr" '{"error":"no such job"}' "$(cat
 
 # B057: `jobs cancel` printed nothing. A gc queued behind a backup of a lot
 # of data is still cancellable when the request lands, whatever the machine.
-# 512 MiB as before, but in files of at most 16 MiB: a larger one fails the
-# backup at once until the chunker lands (TODO(CDC)), and the gc would run.
+# 512 MiB, in 32 files of 16 MiB.
 mkdir -p "$WORK/big"
 for i in $(seq 1 32); do
     dd if=/dev/zero of="$WORK/big/big$i.bin" bs=1M count=16 status=none
@@ -882,9 +881,8 @@ fi
 # B111 asked whether maintenance.auto_pack kept a sparse file's object out of
 # a pack. There is no pack sweep left for it to switch: every object, a
 # sparse file's included, is in a pack when the backup ends, and the key is
-# refused as unknown. A file with holes is stored dense for now, so what
-# comes back is the same bytes with the holes read as zeroes.
-# TODO(CDC): holes are preserved again once the chunker lands.
+# refused as unknown. The sparse file is a chunk list with its hole as a gap,
+# and comes back byte-identical with the hole still a hole.
 mkdir -p "$WORK/apsrc"
 for i in $(seq 1 16); do echo "auto-pack small $i" > "$WORK/apsrc/s$i.txt"; done
 head -c 65536 /dev/urandom > "$WORK/apsrc/sparse.bin"
@@ -902,6 +900,12 @@ if cmp -s "$WORK/apsrc/sparse.bin" "$WORK/apout$WORK/apsrc/sparse.bin"; then
     ok "a sparse file restores byte-identical"
 else
     bad "a sparse file restores byte-identical" "identical" "differs"
+fi
+AP_BLOCKS=$(stat -c %b "$WORK/apout$WORK/apsrc/sparse.bin")
+if [ "$AP_BLOCKS" -lt 2048 ]; then
+    ok "and its hole is still a hole"
+else
+    bad "and its hole is still a hole" "under 1 MiB allocated" "$AP_BLOCKS blocks"
 fi
 
 # Job commands wait by default and exit non-zero when the job fails.
@@ -1205,8 +1209,7 @@ fi
 # 2,000 files ran inside one transaction. It returns at once now, and the
 # job already running keeps the sources it was submitted with.
 mkdir -p "$WORK/slowsrc" "$WORK/nextsrc"
-# 512 MiB to keep the backup running, in files no larger than one object:
-# a bigger file fails the backup at once until the chunker lands.
+# 512 MiB to keep the backup running, in 32 files of 16 MiB.
 for i in $(seq 1 32); do
     dd if=/dev/zero of="$WORK/slowsrc/slow$i.bin" bs=1M count=16 status=none
 done
@@ -1446,10 +1449,13 @@ damage_beyond_parity() {  # damage_beyond_parity <sample> <pack>
 
 # The failure path is the job manager's: it marks the job failed and sends
 # the alert, and the line it logs as it sends is the evidence.
-# The job is marked failed before the alert goes out, so the CLI can return
-# and look before the line is logged; give the worker a moment to get there.
+# The job manager marks the job failed, which is what the CLI is waiting
+# for, and only then journals and sends the alert, so the line can land a
+# moment after the command returns: under the coverage build it did not
+# land in time and the check failed. Wait for it, up to 10 s.
 alerted() {  # alerted <job-id>
-    for _ in $(seq 1 50); do
+    local _
+    for _ in $(seq 1 100); do
         grep -q "sending failure notification for job $1:" "$WORK/daemon.log" && return 0
         sleep 0.1
     done

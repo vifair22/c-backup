@@ -47,6 +47,7 @@
 #include "pack.h"
 #include "parity.h"
 #include "reindex.h"
+#include "chunklist.h"
 #include "replicate.h"
 #include "repo.h"
 #include "repo_key.h"
@@ -318,7 +319,8 @@ static status_t d_put_object(void *v, const replica_object_t *o)
     drop_ctx_t *d = v;
     d->puts++;
     if (d->cancel && d->puts > d->cancel_after) atomic_store(d->cancel, 1);
-    if (!d->armed || d->fired || o->payload_len < BIG_BYTES / 2)
+    /* Chunks (format 3: about 1 MiB each), not trees or small files. */
+    if (!d->armed || d->fired || o->payload_len < 256 * 1024)
         return d->inner.v->put_object(d->inner.ctx, o);
 
     d->fired = 1;
@@ -470,14 +472,10 @@ static void big_pack_cb(uint32_t num, void *v)
 }
 
 /*
- * Re-encrypting a source object whose ciphertext was damaged beyond
- * parity: its tag does not verify, so nothing of it is encrypted for the
- * target (OWN-36). The run must fail naming the snapshot and the object,
- * and the destination must hold no record.
- *
- * The damage is 4 KiB, past what parity can rebuild: the stored read
- * corrects anything parity covers before it is sent, so a single flipped
- * byte would arrive repaired and authenticate.
+ * Re-encrypting a source whose largest chunk was damaged past what parity
+ * can rebuild: re-chunking reads that chunk whole and checks it before a
+ * byte of it is cut again, so the run fails naming the snapshot, and the
+ * destination holds no record and no staging.
  */
 static void test_source_that_fails_authentication(void **state)
 {
@@ -488,7 +486,7 @@ static void test_source_that_fails_authentication(void **state)
     biggest_t b;
     memset(&b, 0, sizeof(b));
     assert_int_equal(pack_list(store, big_pack_cb, &b), OK);
-    assert_true(b.len > BIG_BYTES / 2);
+    assert_true(b.len > 256 * 1024);
 
     char path[512];
     assert_int_equal(pack_dat_path_resolve(path, sizeof(path), TEST_REPO, b.pack), 0);
@@ -506,7 +504,6 @@ static void test_source_that_fails_authentication(void **state)
     status_t st = replicate_reencrypt(&rr);
     assert_int_not_equal(st, OK);
     assert_non_null(strstr(err_msg(), "snapshot 1"));
-    assert_non_null(strstr(err_msg(), "does not decrypt"));
     err_clear();
     assert_int_equal(rr.snapshots_sent, 0);
     assert_false(record_exists(TEST_DST, 1));
@@ -650,17 +647,39 @@ static void test_stored_writer_that_cannot_cut_installs_nothing(void **state)
 /* Damage at the source (OWN-24/OWN-23, OWN-31)                         */
 /* ------------------------------------------------------------------ */
 
-/* The name of a source file's object: below the bound it is one FILE. */
-static void file_hash(const char *path, uint8_t out[OBJECT_HASH_SIZE])
+/*
+ * One chunk of a source file (format 3: a large file is a chunk list),
+ * by its position in the list. *len gets the chunk's length.
+ */
+static void chunk_hash(const char *name, int which, uint8_t out[OBJECT_HASH_SIZE],
+                       uint64_t *len)
 {
-    uint8_t *buf = malloc(BIG_BYTES);
-    assert_non_null(buf);
-    int fd = open(path, O_RDONLY);
-    assert_true(fd >= 0);
-    assert_int_equal(read(fd, buf, BIG_BYTES), (ssize_t)BIG_BYTES);
-    close(fd);
-    object_name(OBJECT_TYPE_FILE, buf, BIG_BYTES, out);
-    free(buf);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT content_hash FROM nodes WHERE name = ?",
+                                (const char *[]){ name, NULL }, &r), 0);
+    assert_true(r->nrows >= 1);
+    uint8_t root[OBJECT_HASH_SIZE];
+    for (int k = 0; k < OBJECT_HASH_SIZE; k++) {
+        unsigned v = 0;
+        assert_int_equal(sscanf(r->rows[0][0] + k * 2, "%2x", &v), 1);
+        root[k] = (uint8_t)v;
+    }
+    db_result_free(r);
+    obj_loader_t ld = obj_loader_store(store);
+    chunklist_iter_t *it = NULL;
+    assert_int_equal(chunklist_iter_open(&ld, root, OBJECT_TYPE_FILE, 0, NULL, &it), OK);
+    chunklist_item_t x;
+    int done = 0, i = 0, found = 0;
+    while (chunklist_iter_next(it, &x, &done) == OK && !done) {
+        if (i++ == which) {
+            memcpy(out, x.hash, OBJECT_HASH_SIZE);
+            *len = x.length;
+            found = 1;
+            break;
+        }
+    }
+    chunklist_iter_close(it);
+    assert_true(found);
 }
 
 /* Damage n bytes of a packed entry's stored payload at off. */
@@ -694,12 +713,14 @@ static void test_damaged_packed_source_replicates_corrected(void **state)
 {
     (void)state;
     big_snapshot();
-    uint8_t hr[OBJECT_HASH_SIZE], hh[OBJECT_HASH_SIZE];
-    file_hash(TEST_SRC "/random.bin", hr);
-    file_hash(TEST_SRC "/half.bin", hh);
-    damage_packed(hr, 2u * 1024u * 1024u + 3u, 1);
-    damage_packed(hr, 3u * 1024u * 1024u, 512);
-    damage_packed(hh, 1u * 1024u * 1024u + 11u, 300);
+    uint8_t hr[OBJECT_HASH_SIZE], hr2[OBJECT_HASH_SIZE], hh[OBJECT_HASH_SIZE];
+    uint64_t lr = 0, lr2 = 0, lh = 0;
+    chunk_hash("random.bin", 1, hr, &lr);
+    chunk_hash("random.bin", 2, hr2, &lr2);
+    chunk_hash("half.bin", 1, hh, &lh);
+    damage_packed(hr, lr / 2 + 3u, 1);
+    damage_packed(hr2, lr2 / 3, 512);
+    damage_packed(hh, lh / 4 + 11u, 300);
 
     parity_stats_reset();
     replicate_result_t rr;
@@ -742,9 +763,10 @@ static void test_damage_beyond_parity_fails_the_run_and_lists_it(void **state)
     (void)state;
     big_snapshot();
     uint8_t hr[OBJECT_HASH_SIZE], hh[OBJECT_HASH_SIZE];
-    file_hash(TEST_SRC "/random.bin", hr);
-    file_hash(TEST_SRC "/half.bin", hh);
-    damage_packed_beyond(hr, 2u * 1024u * 1024u);
+    uint64_t lr = 0, lh = 0;
+    chunk_hash("random.bin", 1, hr, &lr);
+    chunk_hash("half.bin", 1, hh, &lh);
+    damage_packed_beyond(hr, lr / 4);
 
     replicate_result_t rr;
     assert_int_equal(replicate_plain(&rr), ERR_CORRUPT);

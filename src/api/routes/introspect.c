@@ -552,6 +552,31 @@ api_response_t introspect_object_content(const api_request_t *req, int64_t repo_
         close_bound_store(store, idx);
         return api_error(404, "no such object");
     }
+    if (type == OBJECT_TYPE_CHUNKLIST) {
+        /*
+         * A large file's content hash names its chunk list. A preview of
+         * the list's own bytes would show offsets and hashes, so this hands
+         * over the start of the file it describes, holes as zeroes, loading
+         * only the chunks that overlap it.
+         */
+        void *pre = NULL;
+        size_t plen = 0;
+        uint64_t full = 0;
+        st = content_read_prefix(store, hash, CONTENT_MAX, &pre, &plen, &full);
+        close_bound_store(store, idx);
+        if (st != OK) return api_error(500, err_msg());
+        char *b64 = b64_encode(pre, plen);
+        free(pre);
+        if (!b64) return api_error(500, "out of memory");
+        char *body = NULL;
+        int n = asprintf(&body, "{\"type\":%u,\"chunklist\":true,\"size\":%llu,"
+                         "\"returned\":%zu,\"truncated\":%s,\"base64\":\"%s\"}",
+                         type, (unsigned long long)full, plen,
+                         (uint64_t)plen < full ? "true" : "false", b64);
+        free(b64);
+        if (n < 0) return api_error(500, "out of memory");
+        return api_ok(body);
+    }
     if (size > CONTENT_MAX) {
         close_bound_store(store, idx);
         char *body = NULL;

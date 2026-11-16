@@ -356,7 +356,9 @@ are different: they live in the database and change through the policy API
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
 | `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run. `0` or `1` |
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories. 1 to 256 |
+| `jobs.read_budget_mb` | `256` | MiB of object buffers every job together may hold while reading. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, so this caps that memory whatever runs at once. 16 to 1048576; under 16 stops the daemon at start, since an object that size could never be read |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
+| `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
 | `retention.keep_daily` | `7` | Daily snapshots kept |
 | `retention.keep_weekly` | `4` | Weekly snapshots kept |
@@ -365,11 +367,6 @@ are different: they live in the database and change through the policy API
 
 The `retention.*` keys are defaults for repositories that have not set their
 own (section 9). Each is a whole number, 0 or more.
-
-`backup.store_workers`, the large-file thread count of format 2 builds, is
-gone with the store pool it sized. Like any unknown key it stops the daemon
-at start, so remove it from a `config.yaml` carried over from an earlier
-build.
 
 The daemon refuses to start on a file it cannot honour, rather than running
 on defaults nobody chose. Each problem is printed with the file and line,
@@ -389,7 +386,7 @@ What stops it:
 | An unknown key, or one in an unknown section | `security.key_dri`, `mystery.thing` |
 | A key set twice | |
 | A number that is not one | `jobs.max_parallel: eighty`, or one too large for an integer |
-| A number outside the range in the table above | `http.port: 99999`, `jobs.max_parallel: 0`, `retention.keep_daily: -1`, `auth.cookie_secure: 2` |
+| A number outside the range in the table above | `http.port: 99999`, `jobs.max_parallel: 0`, `retention.keep_daily: -1`, `auth.cookie_secure: 2`, `backup.store_workers: 65` |
 | An `http.bind` that is not an IPv4 address | `localhost`, `not-an-ip` |
 | A missing `db.path` | `<file>: error: required config key 'db.path' is missing or empty; it has no default` |
 | A tab in the indentation | YAML indents with spaces |
@@ -618,9 +615,12 @@ repository deletes its jobs, and the next job on another repository used
 to take the removed one's newest job id, so a script or log line holding
 it named an unrelated job; deleting the newest snapshot likewise gave its
 number to the next backup. Neither happens since 1.0.0, though ids already
-reused by an earlier build stay as they are. Snapshot numbering is tracked
-in the database: after a database loss, a reindex continues above the
-highest snapshot still in the repository.
+reused by an earlier build stay as they are. Snapshot numbering survives
+losing the database too: the repository records the highest snapshot id it
+ever issued in `snapshot-ids`, raised before each snapshot record is
+written, and a reindex continues above that mark, not above the highest
+snapshot still present. Pruning the newest snapshots and then rebuilding
+the index never hands their numbers out again (section 17).
 
 ### 5.3 Where to put a repository
 
@@ -782,9 +782,21 @@ everything that was asked for.
 
 ### 6.4 Concurrency
 
-Jobs for one repository run one at a time: the dispatcher never starts a
-second job for a repository that has one running, and queues it instead. Jobs
-for different repositories run in parallel, up to `jobs.max_parallel`.
+Jobs for one repository run one at a time, in the order they were submitted:
+the dispatcher never starts a second job for a repository that has one
+running, and queues it instead. Jobs for different repositories run in
+parallel, up to `jobs.max_parallel`.
+
+A few requests act on a repository directly rather than as a job: deleting a
+snapshot and removing a repository. They hold the repository for the
+milliseconds they take, and one that finds a job running against it is
+refused (`503 repo is busy` for a snapshot delete, `409` for a removal). The
+reverse never fails a job: a job whose turn comes while such a request holds
+its repository stays `queued`, shows the phase `waiting for repository`, and
+starts as soon as the request is done, retried within at most half a second.
+It holds no worker while it waits, and it can be cancelled like any queued
+job. So deleting snapshots by hand while a scheduled backup is due costs the
+backup nothing more than the wait.
 
 Metadata writes (tags, notes, policy, sources) during a running backup wait
 briefly for the database rather than failing. A backup holds the database's
@@ -1523,7 +1535,9 @@ doing it holds both keys, and so must the host the destination is used on.
 Refused when the destination is not a repository, is a replica of the source
 (replicate without `--reencrypt`), or is encrypted and its key is not on this
 host. If the destination is registered here, its write lock is held for the
-run, and `reindex` it afterwards so its index sees the new snapshots. Run it
+run alongside the source's: the job starts only once both repositories are
+free, waiting its turn on each like any queued job (section 6.4), and jobs
+queued on the destination after it wait behind it. `reindex` it afterwards so its index sees the new snapshots. Run it
 again after more backups and only the new snapshots are sent.
 
 The job's `result` says what moved: `snapshots_sent`, `snapshots_skipped`
@@ -1947,8 +1961,6 @@ the underlying disk.
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
 | `<path> is repository format 2; this build reads only format 3 ...` | The repository was written by an earlier build | No migration: restore from it with the build that wrote it and back up again into a new repository (section 17.4) |
-| Backup fails with `backup: cannot store <file>: file of N bytes is larger than one object ...` | A file over 16 MiB, on a build without the chunker wired in (section 20) | Exclude the file, or back it up with a build that has the chunker |
-| Daemon exits at start naming `backup.store_workers` | A config from an earlier build | Remove the key (section 3) |
 | Backups slow on Unraid | `state.db` on the parity array | Section 18.2 |
 | Daemon exits at start with `config.yaml:N: error: ...` | The config file has a line, key or value the daemon cannot honour | Fix the line it names; every problem is listed (section 3) |
 | No failure notifications arrive | Pushover credentials wrong, or Pushover unreachable for 24 hours | `cbackup_alerts_failed_total`; the journal's `push permanently failed` line says why (section 16.3) |
@@ -1966,12 +1978,6 @@ Known limits:
   (section 18.3), so a tree of many millions of files needs gigabytes of RAM
   while it is scanned. This falls short of the "millions of inodes" design
   constraint on small hosts.
-- **Files over 16 MiB, until the chunker is wired in.** Format 3 stores a
-  large file as content-defined chunks, and keeps holes as holes; the
-  chunker is built but not yet connected to backup and restore. Until it is,
-  a backup containing a regular file over 16 MiB fails with an error naming
-  the file and records no snapshot, and a file with holes is
-  stored dense and restored with its holes filled in.
 - **Plain HTTP.** No TLS in the daemon; use a reverse proxy or a tunnel.
 - **IPv4 only** for `http.bind`.
 - **One admin password.** No users or roles.

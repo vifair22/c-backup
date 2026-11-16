@@ -6,6 +6,36 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-16 - Stripe parity encoded as packs are written (OWN-44)
+
+The first cut of striped parity encoded each pack's stripe at the seal, on
+one thread, reading the body back: 3-4% slower than v6 on large files, and
+it would have been worse with content-defined chunking feeding 256 MiB packs
+from parallel workers. The plaintext writer now hands each 15,296-byte group
+to a small pool (up to four threads) as soon as appends complete it, with at
+most eight groups of body in flight; the chunk workers compute each entry's
+payload CRC with its encryption, and the writer extends it by the 51-byte
+header's CRC (`crc32c_combine`, a few hundred operations). The seal encodes
+only the last partial group and group 0 (its count is patched) and reads
+nothing back. gc's rewrite, coalescing and the stored writer still seal by
+reading back; none is on a backup's path.
+
+`bench_phases -n 0 -l 48 -t 0 -m 16 -R` (48 incompressible 16 MiB files,
+768 MiB, three packs) and `-n 20000 -l 0 -t 0 -R` (20,000 files averaging
+4 KiB), btrfs over LVM on NVMe, v6 = origin/v3 d4658fb (CDC, per-entry
+parity on the chunk workers), v7 = this branch, alternating, five rounds:
+
+| Shape | v6 first backup | v7 first backup | v6 mean | v7 mean |
+|---|---|---|---:|---:|
+| large, 768 MiB | 1.137, 1.100, 1.114, 1.130, 1.123 s | 1.085, 1.056, 1.129, 1.054, 1.079 s | 1.121 s | **1.081 s** |
+| 20,000 small | 1.932, 1.966, 2.113, 1.970, 2.138 s | 1.911, 1.995, 1.897, 1.949, 1.946 s | 2.024 s | **1.940 s** |
+
+Parity written: large 52.0 MiB (v6) and 51.4 MiB (v7); small 25.1 MiB (v6)
+and 3.8 MiB (v7). The incremental with no change is unchanged within noise
+(0.78-0.88 s both). A first measurement with the CRC combine done by
+repeated matrix squaring per entry put v7 4% behind v6 on small files;
+precomputing the 64 zero-byte operators once made it the 4% ahead above.
+
 ## 2026-11-16 - Striped pack parity (OWN-44)
 
 Pack version 7 stripes Reed-Solomon over each pack body as one stream, with
@@ -45,6 +75,110 @@ writer's worker threads as it went, v7 encodes the whole body at the seal,
 on one thread, from the page cache. Moving the stripe encode back onto the
 workers (each window of groups is independent) would recover it if it ever
 matters; at 600 MiB/s of backup it does not today.
+## 2026-11-16 - Tree building is linear in entries (OWN-43)
+
+`build_one_tree` found a directory's children by scanning every scan entry,
+twice (count, then copy), so the trees phase was O(directories x entries).
+The ordering pass in front of it had already been made linear; this was the
+same shape one step later. `tree_build` (src/ops/tree_build.c) now buckets
+every entry under its parent's scan index once, and each tree reads its own
+bucket. Tree bytes are unchanged: `tests/test_tree_build.c` pins every tree
+name of a synthetic scan to values captured from the old code, and a
+no-change incremental reuses the same 25,005 of 25,008 trees before and
+after.
+
+`bench_phases -d ~/.cache/own43bench -n 250000 -s 64 -D 10 -l 0 -t 0 -R`
+(25,000 directories of 10 files, 25,007 directories in all), btrfs on
+NVMe, single run each:
+
+| Build | First backup | trees phase | No-change incremental | trees phase |
+|---|---:|---:|---:|---:|
+| Before | 49.09 s | 7.6 s | 24.42 s | 5.6 s |
+| OWN-43 | 36.71 s | 1.5 s | 16.93 s | 0.3 s |
+
+The first backup's remaining 1.5 s is mostly hashing and staging 25,008 new
+trees and their 13 commits (0.55 s of it). The rest of the gap in the totals
+is run-to-run noise in the store and index phases, which this change does
+not touch.
+
+The tree phase alone, `build_trees` over a synthetic scan with the store
+replaced by `object_name` (no I/O), old and new code built the same way.
+The old cost quadruples per doubling, the new one doubles:
+
+| Directories x 10 files | Entries | Before | OWN-43 |
+|---|---:|---:|---:|
+| 3,125 | 34,376 | 0.102 s | 0.013 s |
+| 6,250 | 68,751 | 0.344 s | 0.021 s |
+| 12,500 | 137,501 | 1.399 s | 0.042 s |
+| 25,000 | 275,001 | 5.449 s | 0.084 s |
+| 1 x 250,000 | 250,002 | 0.077 s | 0.087 s |
+
+Root tree names were identical between the two builds at every size. One
+wide directory was never the problem: the rescan costs entries per
+directory, so with one directory it is a single pass either way.
+## 2026-11-16 - Format 3: content-defined chunking, first backup
+
+The format 3 writer (docs/repo-format.md, "Format 3") against the 1.0.0 base
+it replaces (`origin/fix/infra1-test-scratch`, 7822d17), `bench_phases` on
+this machine (Linux 7.3.3, load average about 3 from other work), one run per
+cell unless stated, restore skipped (`-R`). tmpfs is `/dev/shm`; NVMe is
+`~/.cache` (btrfs on LVM on LUKS), with `-c` (source evicted, trailing sync
+timed). Presets: incompressible `-n 0 -l 4 -t 0 -m 512` (4 x 512 MiB
+random), compressible `-n 0 -l 0 -t 0 -T 4 -m 512` (4 x 512 MiB distinct
+text), mixed (the default: 10,000 small files, 3 x 64 MiB random, 2 x 64 MiB
+identical text), many-small `-n 100000 -l 0 -t 0`.
+
+| Preset | Medium | 1.0.0 s | format 3 s | 1.0.0 written / content | format 3 written / content |
+|---|---|---:|---:|---:|---:|
+| incompressible | tmpfs | 0.410 | 0.429 | 1.067 | 1.068 |
+| compressible | tmpfs | 0.760 | 0.396 | 1.076 | 0.004 |
+| mixed | tmpfs | 0.800 | 0.830 | 1.062 | 0.682 |
+| many-small | tmpfs | 8.084 | 8.419 | 1.010 | 1.010 |
+| incompressible | NVMe | 4.430 | 4.129 | 1.067 | 1.068 |
+| compressible | NVMe | 2.084 | 0.854 | 1.076 | 0.004 |
+| mixed | NVMe | 3.466 | 4.304 | 1.062 | 0.682 |
+| many-small | NVMe | 21.683 | 21.448 | 1.011 | 1.011 |
+
+The NVMe disk is shared with other work and swings by 3x between runs of
+the same binary (incompressible 1.4 to 4.4 s for 1.0.0 across the session).
+Mixed on NVMe, three alternating pairs (1.0.0 / format 3): 2.65 / 2.52,
+3.75 / 4.24, 1.60 / 1.60 s; the earlier table cell is inside that spread.
+Many-small on tmpfs measured 7.99 / 8.02 s in an earlier round of the same
+build.
+
+Written per content byte falls wherever content repeats or compresses:
+the compressible preset's generated text repeats at chunk scale, so it
+deduplicates almost entirely (9 MiB stored for 2 GiB), and the mixed
+preset's two identical text files and compressible chunks bring it to
+0.68x. Nothing is written loose and the pack pass writes nothing: 1.0.0
+wrote large files loose, uncompressed, and rewrote the compressible ones in
+the pack pass (B086).
+
+### What it took to reach the base
+
+The first wired version was far slower; each step below is one change, with
+the cell it moved:
+
+| Change | Cell | Before | After |
+|---|---|---:|---:|
+| Seal (encrypt, CRC, RS parity) on the chunk worker, not under the pack writer's lock | tmpfs incompressible | 1.26 s | (with the next) |
+| Several large files at once, each worker cutting into its own pack writer | tmpfs incompressible | 1.26 s | 0.44 s |
+| One index row per small file, not two (the content root was recorded twice) | tmpfs many-small | 8.76 s | 8.02 s |
+| Writeback started every 8 MiB appended (`sync_file_range`), as the format 2 loose writer did | NVMe incompressible | 4.05 s | 1.60-1.73 s (1.59 s base) |
+| A ring of read-ahead slots filled by its own thread, for spans of 16 MiB on a disk | NVMe incompressible | per file 206 MB/s | overlapping |
+| Pack commit creates missing object rows; file workers write none (was a WAL sync per file) | NVMe mixed | 6.76 s | 4.30 s |
+| No read-ahead on tmpfs or ramfs (a copy for nothing) | tmpfs incompressible | 0.57 s | 0.43 s |
+
+### Per-file CPU ceiling (`bench_micro`)
+
+| | MiB/s |
+|---|---:|
+| `cdc_scan_16M` (boundaries only) | 4,688 |
+| `sha256_oneshot_1M` (one core: format 2's per-file ceiling) | 2,071 |
+| `cdc_store_256M_8workers` (one file, chunk SHA-256 and probe) | 2,880 |
+
+One file goes at 1.4 times what one core's SHA-256 allowed; a tree of
+several large files at the rate of the file workers together.
 
 ## 2026-11-15 - Restore renames verified files in synced batches (OWN-36)
 

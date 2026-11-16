@@ -5,15 +5,19 @@
 #include "backup.h"
 
 #include "file_cache.h"
+#include "cdc.h"
+#include "chunklist.h"
 #include "manifest.h"
 #include "object.h"
 #include "scan.h"
 #include "store_index.h"
+#include "store_pool.h"
 #include "db_txn.h"
 #include "phase_timer.h"
 #include "pack.h"
 #include "snap_record.h"
 #include "snapshot_ids.h"
+#include "tree_build.h"
 
 #include <cutils/log.h>
 
@@ -22,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,7 +110,58 @@ typedef struct {
      * time, which is slower and still right. */
     struct { dev_t dev; unsigned ignore; } fs_seen[16];
     unsigned       n_fs_seen;
+    /* Chunk workers for files over one object's bound (format 3): the
+     * chunks of one large file are named, compressed, encrypted and given
+     * parity on these, so a file is no longer one core. NULL stores every
+     * chunk on this thread. */
+    cdc_workers_t *cdc_w;
+    /* Several large files at once, each on a pool worker that reads and
+     * cuts it into a pack writer of its own (see fworker_t). NULL stores
+     * large files one at a time on this thread. */
+    store_pool_t  *pool;
+    /* Where every object the backup produces goes; see bsink_t. */
+    struct bsink  *sink;
 } pipeline_t;
+
+/*
+ * The backup's object sink: obj_sink_t over the backup pack writer, for the
+ * chunker, the list builder and the tree writer.
+ *
+ * Callable from chunk workers at once. The CPU half of staging (name,
+ * probe, LZ4) runs outside the lock; the lock covers dedup, encryption,
+ * parity and the write.
+ *
+ * Every new object's index row has to exist before its pack commits: the
+ * commit callback turns rows from staged to packed, and a row inserted after
+ * it would stay staged, be dropped by the next backup, and leave the chunk
+ * with no row - which compaction reads as dead and drops from its pack. So
+ * new objects queue here as pending rows, and are written either by the
+ * backup thread inside its batch once the file is stored, or here, in a
+ * transaction of their own, just before a rollover seals the pack they are
+ * in.
+ *
+ * Rollover happens here only while may_rollover is set, which the backup
+ * thread does for a file over OBJECT_MAX_BYTES after letting its batch
+ * go: sealing begins a transaction, and the write lock is not recursive.
+ * Smaller files are stored with the batch held, inside the headroom the
+ * loop keeps before each file, as they always were.
+ */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint8_t  type;
+    uint64_t phys, orig;
+} pending_row_t;
+
+typedef struct bsink {
+    pipeline_t     *p;
+    pack_backup_writer_t *pw;   /* the writer this sink stages into */
+    pthread_mutex_t mu;
+    int             may_rollover;
+    /* Queue no rows: the pack commit creates them (file workers). */
+    int             no_rows;
+    pending_row_t  *rows;
+    size_t          n, cap;
+} bsink_t;
 
 /*
  * The fields the file cache must not compare for this entry. Local
@@ -230,7 +286,7 @@ static void report(pipeline_t *p, const char *phase, uint64_t done, uint64_t tot
     uint64_t _tp = phase_now();
     if (p->opts->bytes_cb)
         p->opts->bytes_cb(p->opts->progress_ctx,
-                          p->bytes_done + p->file_bytes,
+                          p->bytes_done + p->file_bytes + store_pool_bytes(p->pool),
                           p->bytes_total);
     p->opts->progress_cb(phase, done, total, p->opts->progress_ctx);
     phase_add_nested(p->timers, PHASE_PROGRESS, _tp);
@@ -263,61 +319,6 @@ static const char *basename_of(const char *path)
 {
     const char *slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
-}
-
-/*
- * node_id to scan index.
- *
- * This was a linear scan of every entry. It is called once per step of every
- * parent chain, so on a tree with a quarter of a million entries and
- * twenty-five thousand directories the cost compounded into something that
- * would not have finished this decade. Open addressing, built once per run,
- * keeps it O(1) and the whole ordering pass linear, which is what design
- * constraint 3 asks for.
- */
-typedef struct {
-    uint64_t *keys;     /* node_id, 0 means empty */
-    uint32_t *vals;     /* scan index */
-    uint32_t  mask;
-} idmap_t;
-
-static void idmap_free(idmap_t *m)
-{
-    free(m->keys);
-    free(m->vals);
-    m->keys = NULL;
-    m->vals = NULL;
-}
-
-static int idmap_build(idmap_t *m, const node_link_t *links, uint32_t count)
-{
-    uint32_t cap = 16;
-    while (cap < count * 2) cap <<= 1;
-    m->keys = calloc(cap, sizeof(*m->keys));
-    m->vals = calloc(cap, sizeof(*m->vals));
-    if (!m->keys || !m->vals) { idmap_free(m); return -1; }
-    m->mask = cap - 1;
-
-    for (uint32_t i = 0; i < count; i++) {
-        uint64_t k = links[i].node_id;
-        if (k == 0) continue;   /* 0 is the empty marker and never a node id */
-        uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 32) & m->mask;
-        while (m->keys[h] != 0 && m->keys[h] != k) h = (h + 1) & m->mask;
-        m->keys[h] = k;
-        m->vals[h] = i;
-    }
-    return 0;
-}
-
-static uint32_t idmap_get(const idmap_t *m, uint64_t node_id)
-{
-    if (node_id == 0) return UINT32_MAX;
-    uint32_t h = (uint32_t)((node_id * 0x9E3779B97F4A7C15ULL) >> 32) & m->mask;
-    while (m->keys[h] != 0) {
-        if (m->keys[h] == node_id) return m->vals[h];
-        h = (h + 1) & m->mask;
-    }
-    return UINT32_MAX;
 }
 
 /* ------------------------------------------------------------------ */
@@ -422,10 +423,10 @@ static void scan_progress(uint32_t scanned, void *ctx)
  * commits for a 1,605-file backup, about 60 s on the UAT host's storage, all
  * of it unattributed. Now the backup asks (db_txn_waiters) at every point
  * that can: every entry, every read of a file being stored, every slice of a
- * tree.
+ * wait on the file workers, every tree.
  *
  *   - Nobody waiting: the batch ends at BATCH_ENTRIES entries, as it did
- *     before B107, and is held across large files.
+ *     before B107, and is held across large files and pool waits.
  *   - A writer queues: the batch ends at the next check, so it waits for
  *     one entry or one read at most, and the batch becomes contended for
  *     BATCH_CONTENDED_MS from the last time a waiter was seen.
@@ -496,14 +497,386 @@ static void batch_count(pipeline_t *p, batch_t *b)
     else batch_yield(p, b);
 }
 
+static bsink_t *bsink_new(pipeline_t *p, pack_backup_writer_t *pw)
+{
+    bsink_t *s = calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    s->p = p;
+    s->pw = pw;
+    pthread_mutex_init(&s->mu, NULL);
+    return s;
+}
+
+static void bsink_free(bsink_t *s)
+{
+    if (!s) return;
+    free(s->rows);
+    pthread_mutex_destroy(&s->mu);
+    free(s);
+}
+
+/* Write the pending rows. With own_txn the rows get a transaction of their
+ * own (a rollover inside the sink); otherwise the caller's batch is open. */
+static status_t bsink_flush(bsink_t *s, int own_txn)
+{
+    pipeline_t *p = s->p;
+    if (s->n == 0) return OK;
+    if (own_txn && db_txn_begin(p->db) != OK)
+        return set_error(ERR_IO, "backup: cannot begin chunk rows");
+    status_t st = OK;
+    uint64_t _ti = phase_now();
+    for (size_t i = 0; i < s->n && st == OK; i++) {
+        const pending_row_t *r = &s->rows[i];
+        st = pack_backup_holds(s->pw, r->hash)
+            ? store_index_put_staged(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig)
+            : store_index_put_packed(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig);
+    }
+    phase_add(p->timers, PHASE_INDEX_PUT, _ti);
+    if (own_txn) {
+        if (st == OK && db_txn_commit(p->db) != OK)
+            st = set_error(ERR_IO, "backup: cannot commit chunk rows");
+        if (st != OK) db_txn_rollback(p->db);
+    }
+    if (st == OK) s->n = 0;
+    return st;
+}
+
+static status_t bsink_put(void *ctx, uint8_t type, const void *data, size_t len,
+                          obj_put_t *out)
+{
+    bsink_t *s = ctx;
+    pipeline_t *p = s->p;
+    pack_prepared_t pp;
+    status_t st = pack_backup_prepare(p->store, type, data, len, &pp);
+    if (st != OK) return st;
+    memcpy(out->hash, pp.hash, OBJECT_HASH_SIZE);
+
+    (void)p;
+    pthread_mutex_lock(&s->mu);
+    if (s->may_rollover && pack_backup_full(s->pw, pp.payload_len)) {
+        st = bsink_flush(s, 1);
+        if (st == OK) st = pack_backup_rollover(s->pw);
+    }
+    int is_new = 0;
+    uint64_t phys = 0;
+    if (st == OK) st = pack_backup_add_prepared(s->pw, &pp, &is_new, &phys);
+    /*
+     * A row for every object met, not only new ones: one already in the
+     * repository with no row (an index that lost it) gets its row back, as
+     * B060 made the whole-file path do. Without one, compaction would read
+     * the chunk as dead and drop it from its pack. An existing row is left
+     * alone by the insert.
+     */
+    if (st == OK && !s->no_rows) {
+        if (s->n == s->cap) {
+            size_t nc = s->cap ? s->cap * 2 : 256;
+            pending_row_t *t = realloc(s->rows, nc * sizeof(*t));
+            if (!t) st = set_error(ERR_NOMEM, "backup: pending rows");
+            else { s->rows = t; s->cap = nc; }
+        }
+        if (st == OK) {
+            pending_row_t *r = &s->rows[s->n++];
+            memcpy(r->hash, pp.hash, OBJECT_HASH_SIZE);
+            r->type = type;
+            r->phys = phys;
+            r->orig = len;
+        }
+    }
+    pthread_mutex_unlock(&s->mu);
+    pack_prepared_free(&pp);
+    out->is_new = is_new;
+    out->phys_bytes = phys;
+    return st;
+}
+
+static int store_cancelled_cb(void *ctx)
+{
+    return store_cancelled((const store_t *)ctx);
+}
+
+/*
+ * Several large files at once (B086, format 3). Each pool worker reads and
+ * cuts its files into a pack writer of its own, with the chunk work on the
+ * shared chunk workers, and seals that writer's packs itself.
+ *
+ * It writes no index rows: its packs' commits create them (db_pack_commit
+ * inserts a row for every entry it has none for), so the rows appear with
+ * the pack, in its transaction, and the only database work a worker does is
+ * the seal's commit. Writing them per file instead cost a WAL sync each and
+ * a wait behind the backup thread's batch: a mixed tree on NVMe took twice
+ * as long as the format 2 writer.
+ *
+ * Writers do not see each other's unsealed packs, so a chunk two workers
+ * stage at once is stored twice; readers take the first, and gc counts the
+ * other as dead weight. The B086 write-once proposal accepted the same.
+ */
+typedef struct {
+    pipeline_t           *p;
+    pack_backup_writer_t *pw;
+    bsink_t              *sink;
+} fworker_t;
+
+static void store_io_forward(uint64_t bytes, void *ctx)
+{
+    store_io_progress((const store_t *)ctx, bytes);
+}
+
+static status_t fpool_begin(void *ctx, void **wstate)
+{
+    pipeline_t *p = ctx;
+    fworker_t *w = calloc(1, sizeof(*w));
+    if (!w) return set_error(ERR_NOMEM, "backup: file worker");
+    w->p = p;
+    status_t st = pack_backup_open(p->store, &w->pw);
+    if (st != OK) { free(w); return st; }
+    w->sink = bsink_new(p, w->pw);
+    if (!w->sink) { pack_backup_abort(w->pw); free(w); return set_error(ERR_NOMEM, "backup: sink"); }
+    w->sink->may_rollover = 1;
+    w->sink->no_rows = 1;
+    *wstate = w;
+    return OK;
+}
+
+static status_t fpool_store(void *ctx, void *wstate, store_pool_job_t *j)
+{
+    pipeline_t *p = ctx;
+    fworker_t *w = wstate;
+    const cdc_params_t *cp = store_cdc(p->store);
+    if (!cp)
+        return set_error(ERR_INVALID, "repository is encrypted and no key is "
+                         "loaded: its chunk boundaries need the key");
+    cdc_result_t *r = calloc(1, sizeof(*r));
+    if (!r) return set_error(ERR_NOMEM, "backup: file result");
+    obj_sink_t sink = { .put = bsink_put, .ctx = w->sink };
+    cdc_opts_t o = {
+        .workers = p->cdc_w,
+        .cancel = p->opts ? p->opts->cancel : NULL,
+        .cancelled = store_cancelled_cb,
+        .cancelled_ctx = p->store,
+        .progress = store_io_forward,
+        .progress_ctx = p->store,
+    };
+    status_t st = cdc_store_fd(cp, j->fd, j->size, &sink, &o, r);
+    j->out = r;
+    return st;
+}
+
+static status_t fpool_end(void *ctx, void *wstate, int abort)
+{
+    (void)ctx;
+    fworker_t *w = wstate;
+    status_t st = OK;
+    if (abort) pack_backup_abort(w->pw);
+    else st = pack_backup_finish(w->pw, NULL);
+    bsink_free(w->sink);
+    free(w);
+    return st;
+}
+
+/*
+ * Record a large file a pool worker has finished: its rows are in already,
+ * so this is the counters, the content hash and the cache row. Runs on the
+ * backup thread, inside the batch pool_drain opened for it.
+ */
+static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
+{
+    scan_entry_t *e = &p->scan->entries[j->index];
+    p->bytes_done += e->node.size;
+    if (j->st != OK) {
+        if (cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
+        log_warn("backup: cannot store %s: %s", e->path, j->err);
+        return OK;
+    }
+    const cdc_result_t *r = j->out;
+    memcpy(e->node.content_hash, r->hash, OBJECT_HASH_SIZE);
+    p->res->objects_new  += r->chunks_new + r->lists.lists_new;
+    p->res->bytes_stored += r->phys_new;
+    p->res->files++;
+    p->res->bytes_logical += e->node.size;
+
+    uint64_t _tp = phase_now();
+    file_cache_put(p->db, p->repo_id, e->path, &e->st,
+                   e->node.content_hash, p->cache_stamp);
+    phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+    return OK;
+}
+
+/* How long one wait on the workers lasts while a batch is held: how long a
+ * writer that queues - a pool worker's rows among them - can wait before it
+ * is noticed. */
+#define POOL_WAIT_HELD_MS 50
+
+static status_t pool_drain(pipeline_t *p, batch_t *b, unsigned wait_ms)
+{
+    if (!p->pool) return OK;
+    if (wait_ms) {
+        batch_yield(p, b);
+        if (batch_contended(b)) batch_close(p, b);
+        if (b->in_txn && wait_ms > POOL_WAIT_HELD_MS) wait_ms = POOL_WAIT_HELD_MS;
+        uint64_t _tw = phase_now();
+        store_pool_wait(p->pool, wait_ms);
+        phase_add(p->timers, PHASE_STORE_WAIT, _tw);
+        batch_yield(p, b);
+    }
+    store_pool_job_t *j;
+    while ((j = store_pool_take(p->pool)) != NULL) {
+        batch_open(p, b);
+        status_t st = pool_record(p, j);
+        store_pool_job_free(j);
+        if (st != OK) return st;
+        batch_count(p, b);
+    }
+    return OK;
+}
+
+#define POOL_WAIT_MS 250
+
+/*
+ * Store one regular file's content (format 3): content-defined chunks into
+ * the backup pack, and a chunk list when there is more than one chunk or a
+ * hole. A file over one object's bound gets the chunk workers and has the
+ * batch let go first, so the sink may seal packs as they fill; anything
+ * smaller is stored on this thread with the batch held, as before.
+ */
+static status_t store_file_cdc(pipeline_t *p, batch_t *b, int fd, uint64_t size,
+                               cdc_result_t *out)
+{
+    const cdc_params_t *cp = store_cdc(p->store);
+    if (!cp)
+        return set_error(ERR_INVALID, "repository is encrypted and no key is "
+                         "loaded: its chunk boundaries need the key");
+    int large = size > OBJECT_MAX_BYTES;
+    /*
+     * The batch is let go only when the file may not fit in the open pack:
+     * then the sink has to be able to seal mid-file, and sealing begins a
+     * transaction. A file that fits keeps the batch, so a backup with nobody
+     * waiting commits no more often than it did (OWN-16). The margin covers
+     * an entry header per chunk; stored chunks are never larger than their
+     * plaintext.
+     */
+    int may_seal = large &&
+        pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES);
+    if (may_seal) batch_close(p, b);
+
+    obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
+    cdc_opts_t o = {
+        .workers = large ? p->cdc_w : NULL,
+        .cancel = p->opts ? p->opts->cancel : NULL,
+        .cancelled = store_cancelled_cb,
+        .cancelled_ctx = p->store,
+        .progress = store_bytes,
+        .progress_ctx = p,
+    };
+    p->sink->may_rollover = may_seal;
+    status_t st = cdc_store_fd(cp, fd, size, &sink, &o, out);
+    p->sink->may_rollover = 0;
+    return st;
+}
+
 static status_t store_content_loop(pipeline_t *p);
 
-/* Content: every regular file the cache cannot vouch for, into the pack. */
+/*
+ * Content (format 3): every regular file cut into content-defined chunks
+ * straight into the backup pack, with the chunks of a large file named and
+ * compressed on worker threads (B086's one-core-per-file limit).
+ *
+ * The workers exist for the length of this phase. Each file waits for its
+ * own chunks before the loop moves on (cdc_store_fd drains), so whatever
+ * way the loop ends nothing is still running when they are joined here.
+ */
 static status_t store_content(pipeline_t *p)
 {
-    p->res->store_workers = 1;
+    uint64_t n_large = 0;
+    for (uint32_t i = 0; i < p->count; i++) {
+        const scan_entry_t *e = &p->scan->entries[i];
+        if (e->node.type == NODE_TYPE_REG && e->node.size > OBJECT_MAX_BYTES)
+            n_large++;
+    }
+
+    /*
+     * Chunk workers when there are files over one object's bound. The plan
+     * is the one the whole-file pool used (CPUs, memory, operator's
+     * number); each worker holds at most a few max-size chunk buffers.
+     */
+    unsigned workers = 1;
+    size_t parity_cap = 0;
+    store_pool_plan(p->opts->store_workers, n_large ? UINT32_MAX : 0, &workers,
+                    &parity_cap);
+    if (workers > 1) {
+        if (cdc_workers_start(workers, &p->cdc_w) == OK) {
+            log_info("backup: %llu file(s) over %llu MiB, their chunks stored "
+                     "on %u threads", (unsigned long long)n_large,
+                     (unsigned long long)(OBJECT_MAX_BYTES >> 20), workers);
+        } else {
+            /* Slower, not wrong: every chunk can still be stored here. */
+            log_warn("backup: cannot start chunk workers, storing serially: %s",
+                     err_msg());
+            err_clear();
+            workers = 1;
+        }
+    }
+    p->res->store_workers = workers;
+
+    /*
+     * And files at once, when there are several large ones: one file is
+     * bound by its reading thread (pread and the boundary scan), so a tree
+     * of many large files needs several. A quarter of the chunk workers,
+     * at most one per large file.
+     */
+    unsigned fw = workers / 4;
+    if ((uint64_t)fw > n_large) fw = (unsigned)n_large;
+    if (fw >= 2 && p->cdc_w) {
+        store_pool_ops_t ops = {
+            .begin = fpool_begin, .store = fpool_store, .end = fpool_end,
+            .out_free = free, .ctx = p,
+        };
+        if (store_pool_start(p->store, fw, &ops, 1, &p->pool) == OK) {
+            log_info("backup: up to %u large files stored at once", fw);
+        } else {
+            log_warn("backup: cannot start file workers, storing large files "
+                     "one at a time: %s", err_msg());
+            err_clear();
+            p->pool = NULL;
+        }
+    }
+
+    bsink_t *sink = bsink_new(p, p->pack_w);
+    if (!sink) {
+        cdc_workers_stop(p->cdc_w);
+        p->cdc_w = NULL;
+        return set_error(ERR_NOMEM, "backup: object sink");
+    }
+    p->sink = sink;
+
     p->timers->txn_site = PHASE_COMMIT_STORE;
-    return store_content_loop(p);
+    status_t st = store_content_loop(p);
+
+    char why[ERR_MSG_MAX];
+    snprintf(why, sizeof(why), "%s", err_msg());
+    /* The file workers seal their last packs here, which begins
+     * transactions: the loop has let its batch go. Their chunk work runs on
+     * the chunk workers, so those stop after. */
+    status_t pst = store_pool_finish(p->pool, st != OK, p->timers);
+    p->pool = NULL;
+    if (st == OK && pst != OK) {
+        st = pst;
+        snprintf(why, sizeof(why), "%s", err_msg());
+    }
+    cdc_workers_stop(p->cdc_w);
+    p->cdc_w = NULL;
+    /* Rows still pending belong to a file that failed part-way; its chunks
+     * are in the open pack, and the trees phase must not see them as
+     * someone else's. They are written, staged, with the trees' batch. */
+    p->sink = NULL;
+    if (sink->n) {
+        batch_open(p, &p->batch);
+        status_t fst = bsink_flush(sink, 0);
+        batch_close(p, &p->batch);
+        if (st == OK) st = fst;
+    }
+    bsink_free(sink);
+    if (st != OK) set_error(st, "%s", why[0] ? why : err_msg());
+    return st;
 }
 
 static status_t store_content_loop(pipeline_t *p)
@@ -531,14 +904,28 @@ static status_t store_content_loop(pipeline_t *p)
         if (S_ISREG(p->scan->entries[i].st.st_mode))
             p->bytes_total += p->scan->entries[i].node.size;
 
+
+    /* The entry before this one went to the pool, which counts its bytes
+     * when the result comes back. */
+    int prev_pooled = 0;
+
     for (uint32_t i = 0; i < p->count; i++) {
         /* The previous entry is finished, whichever way it went: stored,
          * vouched for by the cache, or skipped as unreadable. */
-        if (i > 0 && S_ISREG(p->scan->entries[i - 1].st.st_mode))
+        if (i > 0 && S_ISREG(p->scan->entries[i - 1].st.st_mode) && !prev_pooled)
             p->bytes_done += p->scan->entries[i - 1].node.size;
+        prev_pooled = 0;
         if (cancelled(p)) {
             batch_close(p, b);
             return set_error(ERR_BUSY, "backup cancelled");
+        }
+
+
+        /* Results come back between entries. */
+        status_t dst = pool_drain(p, b, 0);
+        if (dst != OK) {
+            batch_close(p, b);
+            return dst;
         }
 
         scan_entry_t *e = &p->scan->entries[i];
@@ -625,9 +1012,23 @@ static status_t store_content_loop(pipeline_t *p)
             continue;
         }
 
+        /* A large file goes to the pool once there is room for it; the
+         * backup thread carries on with the entries after it. */
+        int to_pool = p->pool && e->node.size > OBJECT_MAX_BYTES;
+        while (to_pool &&
+               store_pool_outstanding(p->pool) >= store_pool_capacity(p->pool)) {
+            status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
+                                        : pool_drain(p, b, POOL_WAIT_MS);
+            if (wst != OK) {
+                batch_close(p, b);
+                return wst;
+            }
+            report(p, "store", i, p->count);
+        }
+
         /* Contended, a large read on this thread is done with the batch let
          * go, as B107 did; uncontended it is held (batch_t). */
-        if (e->node.size >= BATCH_YIELD_BYTES && batch_contended(b))
+        if (!to_pool && e->node.size >= BATCH_YIELD_BYTES && batch_contended(b))
             batch_close(p, b);
 
         /* Open is part of reading: over NFS it is a round trip per file. */
@@ -650,22 +1051,25 @@ static status_t store_content_loop(pipeline_t *p)
             continue;
         }
 
-        object_write_t w;
+        if (to_pool) {
+            status_t sst = store_pool_submit(p->pool, i, fd, e->node.size);
+            if (sst != OK) {
+                batch_close(p, b);
+                return sst;
+            }
+            prev_pooled = 1;
+            continue;
+        }
+
+        cdc_result_t cr;
+        memset(&cr, 0, sizeof(cr));
         p->file_bytes = 0;
         p->file_size  = e->node.size;
         p->file_index = i;
-        store_io_fn prev_io;
-        void *prev_io_ctx;
-        store_get_io_progress(p->store, &prev_io, &prev_io_ctx);
-        store_set_io_progress(p->store, store_bytes, p);
-        status_t st = object_store_file_packed(p->store, fd, e->node.size,
-                                               p->pack_w,
-                                               e->node.content_hash, &w);
-        store_set_io_progress(p->store, prev_io, prev_io_ctx);
+        status_t st = store_file_cdc(p, b, fd, e->node.size, &cr);
         /* The whole file is counted into bytes_done when the loop moves on. */
         p->file_bytes = 0;
         phase_add_excl(p->timers, PHASE_READ_HASH, _tr, _trn);
-        int is_new = w.is_new;
         close(fd);
         if (st != OK && cancelled(p)) {
             /* Stopped inside the file, not unreadable: no warning, and no
@@ -673,42 +1077,35 @@ static status_t store_content_loop(pipeline_t *p)
             batch_close(p, b);
             return set_error(ERR_BUSY, "backup cancelled");
         }
-        if (st == ERR_TOO_LARGE) {
-            /*
-             * TODO(CDC): a file larger than one object is stored as a chunk
-             * list by the chunker, which is not wired in yet. Until it is,
-             * such a file fails the backup outright: skipping it with a
-             * warning would report a backup that does not hold the file.
-             */
-            char why[ERR_MSG_MAX];
-            snprintf(why, sizeof(why), "%s", err_msg());
-            batch_close(p, b);
-            return set_error(ERR_TOO_LARGE, "backup: cannot store %s: %s", e->path, why);
-        }
         if (st != OK) {
+            /* Chunks it staged before failing are in the open pack; their
+             * rows go in with the next flush, unreferenced, for gc. */
             log_warn("backup: cannot store %s: %s", e->path, err_msg());
             err_clear();
             continue;
         }
+        memcpy(e->node.content_hash, cr.hash, OBJECT_HASH_SIZE);
 
         /* Its rows go in a transaction of the backup's own: a statement
          * issued outside one joins whatever transaction another thread has
          * open on the shared handle, and goes with it if that rolls back. */
         batch_open(p, b);
 
-        if (is_new) {
-            p->res->objects_new++;
-            p->res->bytes_stored += w.phys_bytes;
-        }
+        p->res->objects_new  += cr.chunks_new + cr.lists.lists_new;
+        p->res->bytes_stored += cr.phys_new;
         p->res->files++;
         p->res->bytes_logical += e->node.size;
 
-        /* The object's payload length. For a chunk list that is the list,
-         * not the file; the logical size is the node's (nodes.size). */
-        uint64_t _ti = phase_now();
-        st = record_object(p, e->node.content_hash, OBJECT_TYPE_FILE,
-                           w.phys_bytes, w.payload_size);
-        phase_add(p->timers, PHASE_INDEX_PUT, _ti);
+        /*
+         * A row for every object this file met, its content object (the one
+         * chunk, or the list) among them, since everything reached the
+         * repository through the sink: new ones, and ones already there,
+         * so a row an interrupted run never wrote is written now. The
+         * orig_size is the object's payload, which for a list is the list,
+         * not the file; the logical size is the node's, in nodes.size,
+         * which is where restore reads it.
+         */
+        st = bsink_flush(p->sink, 0);
         if (st != OK) {
             batch_close(p, b);
             return st;
@@ -718,6 +1115,18 @@ static status_t store_content_loop(pipeline_t *p)
         file_cache_put(p->db, p->repo_id, e->path, &e->st,
                        e->node.content_hash, p->cache_stamp);
         phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+    }
+
+    /* The large files still out. */
+    while (p->pool && store_pool_outstanding(p->pool) > 0) {
+        status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
+                                    : pool_drain(p, b, POOL_WAIT_MS);
+        if (wst != OK) {
+            batch_close(p, b);
+            return wst;
+        }
+        unsigned left = store_pool_outstanding(p->pool);
+        report(p, "store", p->count > left ? p->count - left : 0, p->count);
     }
 
     batch_close(p, b);
@@ -740,220 +1149,63 @@ static status_t store_content_loop(pipeline_t *p)
 /* ------------------------------------------------------------------ */
 
 /*
- * Serialise one directory from its immediate children. Called only after
- * every child directory already has its hash, which the depth ordering
- * below guarantees.
+ * The ordering and the grouping of children under parents are tree_build's
+ * (src/ops/tree_build.c), which keeps the phase linear in entries. What
+ * stays here is what a backup does around each tree: cancellation, progress,
+ * the batch, the store and the index.
  */
-static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
-                               uint8_t out_hash[OBJECT_HASH_SIZE])
+
+/* Before each directory, and once more before the synthetic root. */
+static status_t tree_step(void *ctx, uint32_t done, uint32_t total)
 {
-    uint64_t dir_node = (dir_index == UINT32_MAX)
-                        ? 0 : p->links[dir_index].node_id;
-
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < p->count; i++)
-        if (p->links[i].parent_id == dir_node) n++;
-
-    manifest_entry_t *entries = n ? calloc(n, sizeof(*entries)) : NULL;
-    if (n && !entries) return set_error(ERR_NOMEM, "build_one_tree: alloc");
-
-    uint32_t k = 0;
-    for (uint32_t i = 0; i < p->count && k < n; i++) {
-        if (p->links[i].parent_id != dir_node) continue;
-        scan_entry_t *e = &p->scan->entries[i];
-        manifest_entry_t *m = &entries[k++];
-
-        m->name           = basename_of(e->path);
-        m->name_len       = (uint16_t)strlen(m->name);
-        m->type           = e->node.type;
-        m->mode           = e->node.mode;
-        m->uid            = e->node.uid;
-        m->gid            = e->node.gid;
-        m->size           = e->node.size;
-        m->mtime_sec      = e->node.mtime_sec;
-        m->mtime_nsec     = e->node.mtime_nsec;
-        m->inode_identity = e->node.inode_identity;
-        /* node_t overlays device and symlink in a union, so this is only a
-         * device pair for the two types that have one. Copying it
-         * unconditionally would write a symlink's target_len into dev_major
-         * and change tree hashes for every symlink in the repository. */
-        if (e->node.type == NODE_TYPE_CHR || e->node.type == NODE_TYPE_BLK) {
-            m->dev_major = e->node.device.major;
-            m->dev_minor = e->node.device.minor;
-        }
-        memcpy(m->xattr_hash, e->node.xattr_hash, OBJECT_HASH_SIZE);
-        memcpy(m->acl_hash,   e->node.acl_hash,   OBJECT_HASH_SIZE);
-
-        if (e->node.type == NODE_TYPE_DIR)
-            memcpy(m->target_hash, p->links[i].tree_hash, OBJECT_HASH_SIZE);
-        else
-            memcpy(m->target_hash, e->node.content_hash, OBJECT_HASH_SIZE);
-
-        if (e->symlink_target) {
-            m->link_target     = e->symlink_target;
-            m->link_target_len = (uint16_t)strlen(e->symlink_target);
-        }
+    pipeline_t *p = ctx;
+    if (done < total) {
+        if (cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
+        report(p, "trees", done, total);
+    } else if (total) {
+        /* Every directory is built: see the closing store report. */
+        report(p, "trees", total, total);
     }
+    batch_open(p, &p->batch);
+    return OK;
+}
 
-    int is_new = 0;
-    uint64_t tree_phys = 0;
-    uint8_t *buf = NULL; size_t len = 0;
-    status_t st = manifest_serialise(entries, k, &buf, &len);
-    if (st == OK) {
-        object_write_t tw;
-        st = object_store_packed(p->store, OBJECT_TYPE_TREE, buf, len,
-                                 p->pack_w, out_hash, &tw);
-        is_new    = tw.is_new;
-        tree_phys = tw.phys_bytes;
-        free(buf);
-    }
-    free(entries);
+static status_t tree_put(void *ctx, uint32_t index, manifest_entry_t *entries,
+                         uint32_t count, uint8_t out_hash[OBJECT_HASH_SIZE])
+{
+    pipeline_t *p = ctx;
+    /*
+     * One TREE object, or for a directory too large for one, fragments named
+     * by a chunk list (OWN-34), all through the backup's sink so their rows
+     * are written below with the batch held, exactly as one tree's always
+     * was. The rows carry what the store wrote: the physical size, header
+     * and trailer included, and the serialised length as the logical one.
+     */
+    const cdc_params_t *cp = store_cdc(p->store);
+    if (!cp) return set_error(ERR_INVALID, "no chunking parameters");
+    obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
+    manifest_store_stats_t ms;
+    status_t st = manifest_store_tree(entries, count, cp, &sink, out_hash, &ms);
+    if (st == OK) st = bsink_flush(p->sink, 0);
     if (st != OK) return st;
 
     /* The measurement that matters: an unchanged directory serialises to
-     * bytes the store has already seen, so is_new stays 0 and nothing is
-     * written. A run where this is always 1 means determinism has broken. */
-    if (is_new) {
-        p->res->trees_new++;
-        /* The serialised length is the logical size. The physical size is
-         * what the store actually wrote, header and parity trailer included,
-         * and only the store knows it. Recording len for both understated
-         * every tree by the trailer. */
-        st = record_object(p, out_hash, OBJECT_TYPE_TREE, tree_phys, len);
-        if (st != OK) return st;
-    } else {
-        p->res->trees_reused++;
+     * bytes the store has already seen, so nothing is new and nothing is
+     * written. A run where every directory is new means determinism has
+     * broken. A large directory with one changed entry rewrites one
+     * fragment and its list, and counts as new. */
+    if (ms.objects_new) p->res->trees_new++;
+    else                p->res->trees_reused++;
+
+    if (index != TREE_BUILD_ROOT) {
+        p->links[index].hash_ready = 1;
+        batch_count(p, &p->batch);
     }
     return OK;
 }
-
-/*
- * Depth of every entry, in one pass.
- *
- * Each chain walk memoises what it learns, so an entry is resolved once and
- * every descendant that passes through it afterwards stops there. Total work
- * is proportional to the number of entries rather than to entries times
- * depth, and nothing recomputes a depth it has already established.
- *
- * The visiting marker guards against a parent cycle. That should not be
- * possible from a filesystem scan, but a cycle here would be an unkillable
- * loop rather than a wrong answer, and this is the pass that just proved how
- * badly that ends.
- */
-#define DEPTH_UNKNOWN  UINT32_MAX
-#define DEPTH_VISITING (UINT32_MAX - 1)
-
-static status_t compute_depths(const pipeline_t *p, const idmap_t *map,
-                               uint32_t **out_depth)
-{
-    uint32_t *depth = malloc(p->count * sizeof(*depth));
-    if (!depth) return set_error(ERR_NOMEM, "build_trees: depth alloc");
-    for (uint32_t i = 0; i < p->count; i++) depth[i] = DEPTH_UNKNOWN;
-
-    uint32_t *stack = malloc(p->count * sizeof(*stack));
-    if (!stack) { free(depth); return set_error(ERR_NOMEM, "build_trees: depth stack"); }
-
-    for (uint32_t i = 0; i < p->count; i++) {
-        if (depth[i] != DEPTH_UNKNOWN) continue;
-
-        uint32_t n_stack = 0;
-        uint32_t cur = i;
-        uint32_t base = 0;   /* depth to give the topmost entry on the stack */
-
-        /*
-         * Walk up until an ancestor whose depth is already known, or a root.
-         * An anchored chain hangs one level below that ancestor; an unanchored
-         * one is rooted here, at depth zero.
-         */
-        for (;;) {
-            if (depth[cur] == DEPTH_VISITING) { base = 0; break; }  /* cycle */
-            if (depth[cur] != DEPTH_UNKNOWN) { base = depth[cur] + 1; break; }
-
-            depth[cur] = DEPTH_VISITING;
-            stack[n_stack++] = cur;
-
-            uint64_t parent = p->links[cur].parent_id;
-            if (parent == 0) { base = 0; break; }
-            uint32_t pi = idmap_get(map, parent);
-            if (pi == UINT32_MAX) { base = 0; break; }
-            cur = pi;
-        }
-
-        /* Top of the stack is shallowest, so unwind assigning increasing
-         * depth. Everything touched is now resolved for later chains. */
-        uint32_t d = base;
-        while (n_stack > 0) depth[stack[--n_stack]] = d++;
-    }
-
-    free(stack);
-    *out_depth = depth;
-    return OK;
-}
-
-
 
 static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
 {
-    /* Order directories deepest-first so a parent is never serialised before
-     * its children have hashes. */
-    uint32_t *dirs = NULL;
-    uint32_t ndirs = 0;
-    for (uint32_t i = 0; i < p->count; i++)
-        if (p->scan->entries[i].node.type == NODE_TYPE_DIR) ndirs++;
-
-    if (ndirs) {
-        dirs = malloc(ndirs * sizeof(*dirs));
-        if (!dirs) return set_error(ERR_NOMEM, "build_trees: alloc");
-        uint32_t k = 0;
-        for (uint32_t i = 0; i < p->count; i++)
-            if (p->scan->entries[i].node.type == NODE_TYPE_DIR) dirs[k++] = i;
-
-        /*
-         * Counting sort by descending depth.
-         *
-         * This was an insertion sort calling a parent-chain walk on every
-         * comparison, which is fine at a few hundred directories and fatal at
-         * twenty-five thousand: quadratic in directories, each comparison
-         * linear in entries. Depths are already computed, and they are small
-         * integers, so ordering by them is a pair of linear passes.
-         */
-        idmap_t map = { NULL, NULL, 0 };
-        if (idmap_build(&map, p->links, p->count) != 0) {
-            free(dirs);
-            return set_error(ERR_NOMEM, "build_trees: id map");
-        }
-        uint32_t *depth = NULL;
-        status_t dst = compute_depths(p, &map, &depth);
-        idmap_free(&map);
-        if (dst != OK) { free(dirs); return dst; }
-
-        uint32_t maxd = 0;
-        for (uint32_t a = 0; a < ndirs; a++)
-            if (depth[dirs[a]] > maxd) maxd = depth[dirs[a]];
-
-        uint32_t *counts = calloc((size_t)maxd + 2, sizeof(*counts));
-        uint32_t *sorted = malloc(ndirs * sizeof(*sorted));
-        if (!counts || !sorted) {
-            free(counts); free(sorted); free(depth); free(dirs);
-            return set_error(ERR_NOMEM, "build_trees: ordering");
-        }
-        for (uint32_t a = 0; a < ndirs; a++) counts[depth[dirs[a]]]++;
-        /* Deepest first: offsets accumulate from the high end. */
-        uint32_t running = 0;
-        for (uint32_t d = maxd + 1; d-- > 0; ) {
-            uint32_t c = counts[d];
-            counts[d] = running;
-            running += c;
-        }
-        for (uint32_t a = 0; a < ndirs; a++)
-            sorted[counts[depth[dirs[a]]]++] = dirs[a];
-
-        memcpy(dirs, sorted, ndirs * sizeof(*dirs));
-        free(sorted);
-        free(counts);
-        free(depth);
-    }
-
     /*
      * Tree rows are written in batches, like the store phase's (batch_t).
      *
@@ -972,31 +1224,33 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
     batch_t *b = &p->batch;
     memset(b, 0, sizeof(*b));
     p->timers->txn_site = PHASE_COMMIT_TREES;
-    status_t st = OK;
 
-    for (uint32_t a = 0; a < ndirs; a++) {
-        if (cancelled(p)) { st = set_error(ERR_BUSY, "backup cancelled"); break; }
-        report(p, "trees", a, ndirs);
-        batch_open(p, b);
-        st = build_one_tree(p, dirs[a], p->links[dirs[a]].tree_hash);
-        if (st != OK) break;
-        p->links[dirs[a]].hash_ready = 1;
-        batch_count(p, b);
-    }
-    free(dirs);
+    /* Trees go through the same sink as content, with no workers and no
+     * sealing: the batch is held for the whole phase. */
+    bsink_t *tsink = bsink_new(p, p->pack_w);
+    if (!tsink) return set_error(ERR_NOMEM, "backup: object sink");
+    p->sink = tsink;
 
-    if (st == OK) {
-        /* Every directory is built: see the closing store report. */
-        if (ndirs) report(p, "trees", ndirs, ndirs);
-        /* The synthetic root ties the source paths together into one tree. */
-        batch_open(p, b);
-        st = build_one_tree(p, UINT32_MAX, root_hash);
-    }
+    tree_build_ops_t ops = {
+        .step   = tree_step,
+        .put    = tree_put,
+        .ctx    = p,
+        .hashes = p->links[0].tree_hash,
+        .stride = sizeof(node_link_t),
+    };
+    status_t st = tree_build(p->scan, &ops, root_hash, NULL);
 
     /* Committed on failure too, as the store phase does: the rows name
      * objects in the open pack, and the caller drops staged rows when the
      * pack is discarded. */
+    if (tsink->n) {
+        batch_open(p, b);
+        status_t fst = bsink_flush(tsink, 0);
+        if (st == OK) st = fst;
+    }
     batch_close(p, b);
+    p->sink = NULL;
+    bsink_free(tsink);
     return st;
 }
 

@@ -213,10 +213,11 @@ handled whole:
    nonce, and the type and name as associated data, so a ciphertext moved
    under another name fails authentication where it is read.
 5. **Append.** The 51-byte entry header and the payload are appended to the
-   pack's staging file in `<repo>/tmp/`. Protection comes when the pack is
-   sealed: the seal reads the body back a window of groups at a time and
-   writes Reed-Solomon parity striped over all of it, plus each entry's
-   CRCs, into the trailer.
+   pack's staging file in `<repo>/tmp/`, and the same bytes go to the pack's
+   stripe encoder: each 15,296-byte group of the body is Reed-Solomon encoded
+   on a small pool as soon as it is complete. The entry's CRC was computed
+   with its encryption; the seal writes the parity, the CRC table and the
+   tails without reading the body back.
 
 There is no per-object file, no rename per object, and no second pass. The
 one-file-per-object path this replaced spent 41% of a full backup in
@@ -235,11 +236,6 @@ and the lists above them rather than the whole file again. The chunker's
 gear table is keyed per repository when it is encrypted, so cut points do
 not reveal known content. The format is in `repo-format.md` ("Format 3:
 content-defined chunking").
-
-**Gap:** the chunker is built and tested but not yet wired into backup and
-restore. Until it is, a regular file larger than 16 MiB fails the backup
-with an error naming the file, and a file with holes is stored dense, so it
-restores with its holes filled.
 
 A file that is no longer a regular file when it is opened (replaced since the
 scan) is skipped with a warning, as is one that vanished: a directory opens
@@ -573,8 +569,8 @@ Type-specific behaviour, spelled out:
   cannot set `security.*` or `trusted.*` attributes, and that must not fail
   a file whose content restored correctly. The content must be a `FILE`
   object or a `CHUNKLIST` of `FILE` leaves (OWN-39); any other type fails
-  the file. Until the chunker is wired in (the Gap in 1.3) only the
-  single-object case occurs.
+  the file. A list's leaves are written at their offsets and the file is
+  extended to its length, so holes stay holes.
 - **Interruption**: a daemon killed mid-file leaves only a temporary file.
   Before the first file restored into a directory in a run, that
   directory's `.c-backup-partial.` + six-character regular files are

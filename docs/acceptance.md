@@ -15,9 +15,6 @@ contract suite stays green through exactly that.
 > there is no pack operation and no loose objects to count. The results
 > sections further down were measured on earlier formats and are kept as
 > history, numbers unchanged; where a conclusion no longer holds it says so.
-> Until the content-defined chunker is wired in, a backup holding a file
-> over 16 MiB fails naming the file (Manual, known limitations), so set D,
-> which holds large media, cannot pass B2 on an interim build.
 
 ## Data
 

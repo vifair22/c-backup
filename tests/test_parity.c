@@ -479,6 +479,22 @@ static void test_short_buffer_repair_still_works(void **state)
     assert_memory_equal(data, want, sizeof(want));
 }
 
+/* The CRC of A||B from the CRCs of A and B, at every split of a buffer and
+ * for lengths across several powers of two. */
+static void test_crc32c_combine(void **state)
+{
+    (void)state;
+    uint8_t buf[5000];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (uint8_t)(i * 131u + 7u);
+    const size_t splits[] = { 0, 1, 2, 3, 51, 64, 255, 1024, 4096, 4999, 5000 };
+    for (size_t k = 0; k < sizeof(splits) / sizeof(splits[0]); k++) {
+        size_t a = splits[k];
+        uint32_t whole = crc32c(buf, sizeof(buf));
+        uint32_t ca = crc32c(buf, a), cb = crc32c(buf + a, sizeof(buf) - a);
+        assert_int_equal(crc32c_combine(ca, cb, sizeof(buf) - a), whole);
+    }
+}
+
 static void test_parity_record_size(void **state)
 {
     (void)state;
@@ -590,6 +606,7 @@ int main(void)
         cmocka_unit_test(test_record_naming_a_column_past_the_data),
         cmocka_unit_test(test_short_buffer_repair_still_works),
         cmocka_unit_test(test_parity_record_size),
+        cmocka_unit_test(test_crc32c_combine),
         cmocka_unit_test(test_format_bounds_fit_the_trailer_fields),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

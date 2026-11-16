@@ -719,6 +719,88 @@ static void test_replicated_copy_is_corrected(void **state)
     assert_loads_clean(77);
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Stripe encoded while appending                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The plaintext writer encodes each stripe group as it fills, on a pool,
+ * and computes each entry's CRC from the worker's payload CRC: the seal
+ * then reads nothing back. What it writes must be exactly what reading the
+ * body back would have produced - every group's parity, group 0 with the
+ * final entry count in it, the last partial group, and both CRCs of every
+ * entry - so this recomputes all of it from the file and compares.
+ */
+static void test_parity_encoded_while_appending_matches_the_body(void **state)
+{
+    (void)state;
+    uint64_t before = pack_test_seal_readbacks();
+    /* One object of several groups first, so a group lies wholly inside an
+     * entry, then the small ones; one flush seals them into one pack. */
+    uint8_t *big = malloc(100000);
+    assert_non_null(big);
+    fill_random(big, 100000, 0xB16B00B5u);
+    uint8_t bh[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, big, 100000, bh), OK);
+    free(big);
+    store_objects(0, NOBJ);
+    assert_int_equal(pack_test_seal_readbacks(), before);
+
+    char path[512];
+    pack_path_of(0, path, sizeof(path));
+    size_t len = 0;
+    uint8_t *f = slurp(path, &len);
+    layout_t l = layout_of(f, len);
+    assert_int_equal(l.count, NOBJ + 1);
+    assert_true(l.body_len > 8 * PARITY_GROUP_DATA);
+
+    uint8_t par[PARITY_GROUP_PAR];
+    uint64_t groups = (l.body_len + PARITY_GROUP_DATA - 1) / PARITY_GROUP_DATA;
+    for (uint64_t g = 0; g < groups; g++) {
+        uint64_t gs = g * PARITY_GROUP_DATA;
+        size_t glen = l.body_len - gs < PARITY_GROUP_DATA ? (size_t)(l.body_len - gs)
+                                                           : (size_t)PARITY_GROUP_DATA;
+        rs_parity_encode(f + gs, glen, par);
+        assert_memory_equal(par, f + l.par_off + g * PARITY_GROUP_PAR, PARITY_GROUP_PAR);
+    }
+    uint64_t off = sizeof(pack_dat_hdr_t);
+    for (uint32_t i = 0; i < l.count; i++) {
+        pack_dat_entry_hdr_t h;
+        memcpy(&h, f + off, sizeof(h));
+        size_t elen = sizeof(h) + (size_t)h.compressed_size;
+        uint32_t e = 0, hc = 0;
+        memcpy(&e, f + l.tab_off + PACK_CRC_SLOT_BYTES * i, 4);
+        memcpy(&hc, f + l.tab_off + PACK_CRC_SLOT_BYTES * i + 4, 4);
+        assert_int_equal(e, crc32c(f + off, elen));
+        assert_int_equal(hc, crc32c(f + off, sizeof(h)));
+        off += elen;
+    }
+    assert_int_equal(off, l.body_len);
+    free(f);
+}
+
+/* A pack of fewer bytes than one group starts no encoder threads and still
+ * seals without reading back; its only group is group 0, count patched. */
+static void test_a_pack_smaller_than_a_group_encodes_at_the_seal(void **state)
+{
+    (void)state;
+    uint64_t before = pack_test_seal_readbacks();
+    store_objects(0, 3);
+    assert_int_equal(pack_test_seal_readbacks(), before);
+    char path[512];
+    pack_path_of(0, path, sizeof(path));
+    size_t len = 0;
+    uint8_t *f = slurp(path, &len);
+    layout_t l = layout_of(f, len);
+    assert_true(l.body_len < PARITY_GROUP_DATA);
+    uint8_t par[PARITY_GROUP_PAR];
+    rs_parity_encode(f, (size_t)l.body_len, par);
+    assert_memory_equal(par, f + l.par_off, PARITY_GROUP_PAR);
+    free(f);
+    for (size_t i = 0; i < 3; i++) assert_loads_clean(i);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -733,6 +815,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_gc_rewrite_copies_corrected_bytes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_coalesce_copies_corrected_bytes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replicated_copy_is_corrected, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_parity_encoded_while_appending_matches_the_body, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_pack_smaller_than_a_group_encodes_at_the_seal, setup, teardown),
     };
     return cmocka_run_group_tests_name("pack_stripe", tests, NULL, NULL);
 }

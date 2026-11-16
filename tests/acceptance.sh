@@ -107,27 +107,13 @@ EOF
 # hold all of at once: sparse, hardlinked, a FIFO, an extended attribute.
 S="$WORK/specials"
 dd if=/dev/urandom of="$S/data.bin" bs=1M count=4 status=none
-# 16 MiB, one object's worth: a file with holes is stored dense for now, so a
-# larger one would fail the backup like any file over 16 MiB.
-# TODO(CDC): back to 64 MiB, tail at 48 MiB, once the chunker lands.
-truncate -s 16M "$S/sparse.img"
-printf 'tail' | dd of="$S/sparse.img" bs=1 seek=$((12*1024*1024)) conv=notrunc status=none
+truncate -s 64M "$S/sparse.img"
+printf 'tail' | dd of="$S/sparse.img" bs=1 seek=$((48*1024*1024)) conv=notrunc status=none
 echo "linked" > "$S/link-a"; ln "$S/link-a" "$S/link-b"
 ln -s link-a "$S/symlink"
 mkfifo "$S/fifo"
 echo "attr" > "$S/xattr.txt"; setfattr -n user.cbackup -v acceptance "$S/xattr.txt" 2>/dev/null
 D_SOURCES=("${D_PATHS[@]}" "$S")
-
-# One object holds at most 16 MiB, and until the content-defined chunker
-# lands a backup containing a larger regular file fails naming it. Real trees
-# often hold one, so say so up front rather than leave B2 or B7 to fail with
-# the reason buried in a job error. TODO(CDC): drop this once large files
-# back up as chunk lists.
-for set in "${D_SOURCES[@]}" "$G_PATH"; do
-    BIG=$(find "$set" -type f -size +16M 2>/dev/null | head -3)
-    [ -n "$BIG" ] && printf 'warning: %s holds files over 16 MiB, which fail a backup for now:\n%s\n' \
-        "$set" "$BIG" >&2
-done
 
 start_daemon
 echo "c-backup acceptance: $(cb version)" | tee -a "$RESULTS"
@@ -228,14 +214,14 @@ check D1 "whole snapshot restores identical ($((MS/1000)) s)" \
 timed cb restore "$D_ID" 3 "$WORK/restore/sub" --subpath "$S/xattr.txt"
 check D2 "subpath restores only its file" bash -c "[ -f '$WORK/restore/sub$S/xattr.txt' ] && [ ! -e '$WORK/restore/sub$S/data.bin' ]"
 R="$WORK/restore/full$S"
-# The sparse file must come back with the same bytes, holes read as zeroes;
-# that it comes back sparse is not asserted, because it is stored dense.
-# TODO(CDC): holes return with the chunker; restore the allocation check
-# ([ \$(( \$(stat -c %b sparse.img) * 512 )) -lt <half its size> ]).
+# The sparse file must come back with the same bytes and its holes still
+# holes: under half its size allocated.
 check D3 "modes, mtimes, links, sparse contents, fifo, xattr" bash -c "
   [ \"\$(stat -c %a:%Y '$S/data.bin')\" = \"\$(stat -c %a:%Y '$R/data.bin')\" ] &&
   [ -L '$R/symlink' ] && [ \"\$(stat -c %i '$R/link-a')\" = \"\$(stat -c %i '$R/link-b')\" ] &&
-  cmp -s '$S/sparse.img' '$R/sparse.img' && [ -p '$R/fifo' ] &&
+  cmp -s '$S/sparse.img' '$R/sparse.img' &&
+  [ \$(( \$(stat -c %b '$R/sparse.img') * 512 )) -lt \$(( 32 * 1024 * 1024 )) ] &&
+  [ -p '$R/fifo' ] &&
   { ! command -v getfattr >/dev/null || getfattr -n user.cbackup '$R/xattr.txt' 2>/dev/null | grep -q acceptance; }"
 timed cb restore "$D_ID" 3 "$WORK/restore/full"
 check D4 "restoring again skips what exists" grep -q '"state":"completed"' <<<"$OUT"

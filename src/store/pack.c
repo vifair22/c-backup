@@ -1451,6 +1451,291 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
 }
 
 
+/* ------------------------------------------------------------------ */
+/* Stripe parity, encoded as the body is appended                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The plaintext writer's pack body is append-only, so its stripe groups
+ * complete in order while entries are still being written. Each group is
+ * handed, as it fills, to a small pool that encodes its 1,024 parity bytes
+ * off the writer's thread; at the seal only the last, partial group and
+ * group 0 (whose pack header gets its count patched) are left to encode,
+ * and nothing is read back. Memory is ENC_SLOTS groups of body in flight,
+ * a copy of group 0, and the parity itself: 6.7% of the body, at most
+ * 1.2 MiB per 18 MiB of pack and about 18 MiB at the pack bound, which is
+ * what per-entry parity also held in memory before the seal.
+ *
+ * The writer fills one slot at a time; a full slot is marked ready and
+ * the writer takes the next free one, waiting only if every slot is still
+ * queued or encoding - backpressure, so memory stays bounded however fast
+ * the writer appends. Encoder threads start with the first full group, so
+ * a pack smaller than one group never starts any.
+ */
+#define ENC_SLOTS       8
+#define ENC_THREADS_MAX 4
+
+enum { SLOT_FREE = 0, SLOT_FILLING, SLOT_READY, SLOT_ENCODING };
+
+typedef struct stripe_enc {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv_ready;          /* a slot became ready, or stop */
+    pthread_cond_t  cv_free;           /* a slot became free */
+    struct {
+        uint8_t *data;
+        uint64_t g;
+        int      state;
+    } slot[ENC_SLOTS];
+    int       cur;                     /* the slot being filled, or -1 */
+    size_t    cur_len;
+    uint64_t  next_g;                  /* the group the current slot is */
+    uint64_t  fed;                     /* body bytes seen */
+    uint8_t  *par;                     /* parity for every group, by group */
+    size_t    par_groups;
+    uint8_t  *g0;                      /* group 0 as fed, for the count patch */
+    size_t    g0_len;
+    pthread_t th[ENC_THREADS_MAX];
+    int       nth;
+    int       stop;
+    int       broken;                  /* a slot or buffer could not be had */
+} stripe_enc_t;
+
+static void *enc_thread(void *arg)
+{
+    stripe_enc_t *e = arg;
+    pthread_mutex_lock(&e->mu);
+    for (;;) {
+        int k = -1;
+        for (int i = 0; i < ENC_SLOTS; i++)
+            if (e->slot[i].state == SLOT_READY) { k = i; break; }
+        if (k < 0) {
+            if (e->stop) break;
+            pthread_cond_wait(&e->cv_ready, &e->mu);
+            continue;
+        }
+        e->slot[k].state = SLOT_ENCODING;
+        pthread_mutex_unlock(&e->mu);
+        rs_parity_encode(e->slot[k].data, GROUP_DATA, e->par + e->slot[k].g * GROUP_PAR);
+        pthread_mutex_lock(&e->mu);
+        e->slot[k].state = SLOT_FREE;
+        pthread_cond_broadcast(&e->cv_free);
+    }
+    pthread_mutex_unlock(&e->mu);
+    return NULL;
+}
+
+static stripe_enc_t *stripe_enc_new(void)
+{
+    stripe_enc_t *e = calloc(1, sizeof(*e));
+    if (!e) return NULL;
+    rs_init();
+    e->par_groups = (size_t)groups_for(PACK_MAX_BYTES);
+    /* Address space for the bound; only the groups written are touched. */
+    e->par = malloc(e->par_groups * GROUP_PAR);
+    e->g0  = malloc(GROUP_DATA);
+    for (int i = 0; i < ENC_SLOTS && e->par && e->g0; i++) {
+        e->slot[i].data = malloc(GROUP_DATA);
+        if (!e->slot[i].data) { e->broken = 1; break; }
+    }
+    if (!e->par || !e->g0 || e->broken) {
+        for (int i = 0; i < ENC_SLOTS; i++) free(e->slot[i].data);
+        free(e->par);
+        free(e->g0);
+        free(e);
+        return NULL;
+    }
+    pthread_mutex_init(&e->mu, NULL);
+    pthread_cond_init(&e->cv_ready, NULL);
+    pthread_cond_init(&e->cv_free, NULL);
+    e->cur = -1;
+    return e;
+}
+
+static void enc_stop_threads(stripe_enc_t *e)
+{
+    pthread_mutex_lock(&e->mu);
+    e->stop = 1;
+    pthread_cond_broadcast(&e->cv_ready);
+    pthread_mutex_unlock(&e->mu);
+    for (int i = 0; i < e->nth; i++) pthread_join(e->th[i], NULL);
+    e->nth = 0;
+}
+
+static void stripe_enc_free(stripe_enc_t *e)
+{
+    if (!e) return;
+    enc_stop_threads(e);
+    pthread_mutex_destroy(&e->mu);
+    pthread_cond_destroy(&e->cv_ready);
+    pthread_cond_destroy(&e->cv_free);
+    for (int i = 0; i < ENC_SLOTS; i++) free(e->slot[i].data);
+    free(e->par);
+    free(e->g0);
+    free(e);
+}
+
+/* Hand the full current slot to the pool, or encode it here when there is
+ * no pool to hand it to. */
+static void enc_submit(stripe_enc_t *e)
+{
+    int k = e->cur;
+    e->cur = -1;
+    e->cur_len = 0;
+    uint64_t g = e->next_g++;
+    if (g >= e->par_groups) { e->broken = 1; return; }
+    pthread_mutex_lock(&e->mu);
+    if (e->nth == 0 && !e->stop) {
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        int want = ncpu >= 8 ? ENC_THREADS_MAX : ncpu >= 4 ? 2 : 1;
+        for (int i = 0; i < want; i++) {
+            if (pthread_create(&e->th[e->nth], NULL, enc_thread, e) != 0) break;
+            e->nth++;
+        }
+        if (e->nth == 0) e->stop = 1;   /* no threads: encode on this one */
+    }
+    if (e->nth == 0) {
+        pthread_mutex_unlock(&e->mu);
+        rs_parity_encode(e->slot[k].data, GROUP_DATA, e->par + g * GROUP_PAR);
+        pthread_mutex_lock(&e->mu);
+        e->slot[k].state = SLOT_FREE;
+        pthread_mutex_unlock(&e->mu);
+        return;
+    }
+    e->slot[k].g = g;
+    e->slot[k].state = SLOT_READY;
+    pthread_cond_signal(&e->cv_ready);
+    pthread_mutex_unlock(&e->mu);
+}
+
+/* Body bytes, in order, exactly as they are appended to the file. */
+static void stripe_enc_feed(stripe_enc_t *e, const void *buf, size_t n)
+{
+    const uint8_t *p = buf;
+    if (!e || e->broken) return;
+    e->fed += n;
+    while (n > 0) {
+        if (e->cur < 0) {
+            pthread_mutex_lock(&e->mu);
+            for (;;) {
+                for (int i = 0; i < ENC_SLOTS; i++)
+                    if (e->slot[i].state == SLOT_FREE) { e->cur = i; break; }
+                if (e->cur >= 0) break;
+                pthread_cond_wait(&e->cv_free, &e->mu);
+            }
+            e->slot[e->cur].state = SLOT_FILLING;
+            pthread_mutex_unlock(&e->mu);
+        }
+        size_t take = GROUP_DATA - e->cur_len < n ? GROUP_DATA - e->cur_len : n;
+        memcpy(e->slot[e->cur].data + e->cur_len, p, take);
+        if (e->next_g == 0) {
+            memcpy(e->g0 + e->cur_len, p, take);
+            e->g0_len = e->cur_len + take;
+        }
+        e->cur_len += take;
+        p += take;
+        n -= take;
+        if (e->cur_len == GROUP_DATA) enc_submit(e);
+    }
+}
+
+/*
+ * Finish: wait for the pool, encode the last partial group, and re-encode
+ * group 0 with the final pack header (count) in it. Returns 0 when the
+ * parity covers exactly body_len bytes of body, -1 when it cannot be used
+ * (and the seal falls back to reading the body back).
+ */
+static int stripe_enc_finish(stripe_enc_t *e, uint64_t body_len, const pack_dat_hdr_t *hdr)
+{
+    if (!e) return -1;
+    pthread_mutex_lock(&e->mu);
+    for (;;) {
+        int busy = 0;
+        for (int i = 0; i < ENC_SLOTS; i++)
+            if (e->slot[i].state == SLOT_READY || e->slot[i].state == SLOT_ENCODING) busy = 1;
+        if (!busy) break;
+        pthread_cond_wait(&e->cv_free, &e->mu);
+    }
+    pthread_mutex_unlock(&e->mu);
+    enc_stop_threads(e);
+    if (e->broken || e->fed != body_len) return -1;
+    if (e->cur >= 0 && e->cur_len > 0) {
+        if (e->next_g >= e->par_groups) return -1;
+        rs_parity_encode(e->slot[e->cur].data, e->cur_len, e->par + e->next_g * GROUP_PAR);
+    }
+    if (e->g0_len >= sizeof(*hdr)) {
+        memcpy(e->g0, hdr, sizeof(*hdr));
+        rs_parity_encode(e->g0, e->g0_len, e->par);
+    }
+    return 0;
+}
+
+/* Seals that had to read their body back; see pack_test_seal_readbacks. */
+static _Atomic uint64_t seal_readbacks;
+
+uint64_t pack_test_seal_readbacks(void)
+{
+    return atomic_load_explicit(&seal_readbacks, memory_order_relaxed);
+}
+
+/* The two tails, at tail_off; the trailer's size in *out_size. */
+static status_t write_tails(int fd, uint64_t body_len, uint32_t count, uint64_t tail_off,
+                            uint64_t *out_size)
+{
+    uint64_t tsize = trailer_size_for(body_len, count);
+    pack_tail_t t = {
+        .magic = PACK_TAIL_MAGIC, .version = PACK_TAIL_VERSION, .body_len = body_len,
+        .count = count, .trailer_size = (uint32_t)tsize, .reserved = 0,
+    };
+    t.crc = crc32c(&t, offsetof(pack_tail_t, crc));
+    if (pwrite_full(fd, &t, sizeof(t), (off_t)tail_off) != 0 ||
+        pwrite_full(fd, &t, sizeof(t), (off_t)(tail_off + sizeof(t))) != 0)
+        return set_error_errno(ERR_IO, "pack seal: write the tail");
+    *out_size = tsize;
+    return OK;
+}
+
+/*
+ * The trailer from parity already encoded (stripe_enc_t) and CRCs already
+ * in the entry records: the table, its parity and the tails, nothing read.
+ */
+static status_t write_trailer_precomputed(int fd, uint64_t body_len,
+                                          const pack_idx_disk_entry_t *by_offset,
+                                          uint32_t count, const uint8_t *par,
+                                          uint64_t *out_size)
+{
+    uint64_t par_len  = groups_for(body_len) * GROUP_PAR;
+    uint64_t tab_off  = body_len + par_len;
+    uint64_t tab_len  = SLOT * (uint64_t)count;
+    uint64_t tpar_off = tab_off + tab_len;
+    uint64_t tpar_len = groups_for(tab_len) * GROUP_PAR;
+    if (pwrite_full(fd, par, (size_t)par_len, (off_t)body_len) != 0)
+        return set_error_errno(ERR_IO, "pack seal: write stripe parity");
+    uint8_t *tab  = malloc(count ? (size_t)tab_len : 1);
+    uint8_t *tpar = malloc(tpar_len ? (size_t)tpar_len : 1);
+    status_t st = OK;
+    if (!tab || !tpar) { st = set_error(ERR_NOMEM, "pack seal: crc table"); goto out; }
+    for (uint32_t i = 0; i < count; i++) {
+        put_le32(tab + SLOT * i, by_offset[i].entry_crc);
+        put_le32(tab + SLOT * i + 4u, by_offset[i].hdr_crc);
+    }
+    if (tab_len && pwrite_full(fd, tab, (size_t)tab_len, (off_t)tab_off) != 0) {
+        st = set_error_errno(ERR_IO, "pack seal: write the crc table");
+        goto out;
+    }
+    if (tpar_len) {
+        rs_parity_encode(tab, (size_t)tab_len, tpar);
+        if (pwrite_full(fd, tpar, (size_t)tpar_len, (off_t)tpar_off) != 0) {
+            st = set_error_errno(ERR_IO, "pack seal: write table parity");
+            goto out;
+        }
+    }
+    st = write_tails(fd, body_len, count, tpar_off + tpar_len, out_size);
+out:
+    free(tab);
+    free(tpar);
+    return st;
+}
+
 /*
  * Write the striped parity trailer after a body of body_len bytes on fd.
  *
@@ -1464,6 +1749,7 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
  */
 static status_t write_pack_trailer(int fd, uint64_t body_len,
                                    const pack_idx_disk_entry_t *by_offset, uint32_t count,
+                                   const pack_dat_hdr_t *hdr, stripe_enc_t *enc,
                                    uint64_t *out_size)
 {
     uint64_t pos = sizeof(pack_dat_hdr_t);
@@ -1478,6 +1764,15 @@ static status_t write_pack_trailer(int fd, uint64_t body_len,
                          (unsigned long long)pos, (unsigned long long)body_len);
 
     rs_init();
+    /*
+     * The writer that encoded its stripe as it appended (and computed each
+     * entry's CRCs on its workers) leaves the seal nothing to read: the
+     * parity and the table are written as they are.
+     */
+    if (enc && stripe_enc_finish(enc, body_len, hdr) == 0)
+        return write_trailer_precomputed(fd, body_len, by_offset, count, enc->par, out_size);
+    atomic_fetch_add_explicit(&seal_readbacks, 1, memory_order_relaxed);
+
     size_t wg = parity_window_groups();
     size_t win = wg * GROUP_DATA;
     uint8_t *buf = malloc(win);
@@ -1544,19 +1839,7 @@ static status_t write_pack_trailer(int fd, uint64_t body_len,
         if (wr != 0) { st = set_error_errno(ERR_IO, "pack seal: write table parity"); goto out; }
     }
 
-    uint64_t tsize = trailer_size_for(body_len, count);
-    pack_tail_t t = {
-        .magic = PACK_TAIL_MAGIC, .version = PACK_TAIL_VERSION, .body_len = body_len,
-        .count = count, .trailer_size = (uint32_t)tsize, .reserved = 0,
-    };
-    t.crc = crc32c(&t, offsetof(pack_tail_t, crc));
-    uint64_t tail_off = tpar_off + tpar_len;
-    if (pwrite_full(fd, &t, sizeof(t), (off_t)tail_off) != 0 ||
-        pwrite_full(fd, &t, sizeof(t), (off_t)(tail_off + sizeof(t))) != 0) {
-        st = set_error_errno(ERR_IO, "pack seal: write the tail");
-        goto out;
-    }
-    *out_size = tsize;
+    st = write_tails(fd, body_len, count, tpar_off + tpar_len, out_size);
 
 out:
     free(buf);
@@ -1588,7 +1871,7 @@ static int idx_offset_cmp(const void *a, const void *b) {
 static status_t seal_pack_file(store_t *store, FILE **dat_f,
                                pack_dat_hdr_t *dat_hdr,
                                pack_idx_disk_entry_t *idx_entries,
-                               uint32_t packed,
+                               uint32_t packed, stripe_enc_t *enc,
                                uint64_t *out_size)
 {
     status_t st = OK;
@@ -1618,7 +1901,8 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
         memcpy(by_offset, idx_entries, (size_t)packed * sizeof(*by_offset));
         qsort(by_offset, packed, sizeof(*by_offset), idx_offset_cmp);
         uint64_t tsize = 0;
-        st = write_pack_trailer(fileno(*dat_f), (uint64_t)body_end, by_offset, packed, &tsize);
+        st = write_pack_trailer(fileno(*dat_f), (uint64_t)body_end, by_offset, packed,
+                                dat_hdr, enc, &tsize);
         free(by_offset);
         if (st != OK) goto fail;
         *out_size = (uint64_t)body_end + tsize;
@@ -1699,6 +1983,7 @@ static status_t announce_pack(store_t *store, uint32_t pack_num, uint64_t size,
         ce[i].comp_size   = entries[i].compressed_size;
         ce[i].orig_size   = entries[i].uncompressed_size;
         ce[i].entry_index = entries[i].entry_index;
+        ce[i].type        = entries[i].type;
     }
     char fname[64];
     snprintf(fname, sizeof(fname), "pack-%010u.dat", pack_num);
@@ -1729,11 +2014,11 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
                               char *dat_tmp,
                               pack_dat_hdr_t *dat_hdr,
                               pack_idx_disk_entry_t *idx_entries,
-                              uint32_t packed, uint32_t pack_num)
+                              uint32_t packed, uint32_t pack_num, stripe_enc_t *enc)
 {
     uint64_t dat_size = 0;
     status_t st = seal_pack_file(store, dat_f, dat_hdr, idx_entries,
-                                 packed, &dat_size);
+                                 packed, enc, &dat_size);
     if (st == OK) st = install_pack_file(store, dat_tmp, pack_num, &dat_size);
     if (st != OK) { unlink(dat_tmp); return st; }
     return announce_pack(store, pack_num, dat_size, idx_entries, packed);
@@ -1873,7 +2158,7 @@ status_t pack_stored_open(store_t *store, pack_stored_writer_t **out)
     pack_stored_writer_t *w = calloc(1, sizeof(*w));
     if (!w) return set_error(ERR_NOMEM, "pack_stored_open: alloc");
     w->store = store;
-    w->pack_num = next_pack_num(store);
+    w->pack_num = store_alloc_pack_num(store, next_pack_num(store));
 
     status_t st = open_new_pack(store, w->pack_num, &w->dat_f, w->dat_tmp, &w->dat_hdr);
     if (st != OK) { free(w); return st; }
@@ -2028,7 +2313,7 @@ status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed)
     /* Sealing computes the parity by reading the body back a window at a
      * time, so memory does not depend on the pack. */
     status_t st = finalize_pack(w->store, &w->dat_f, w->dat_tmp, &w->dat_hdr,
-                                w->entries, w->count, w->pack_num);
+                                w->entries, w->count, w->pack_num, NULL);
 
     /*
      * Make the rename itself durable before saying the pack is installed.
@@ -2082,9 +2367,35 @@ typedef struct {
     uint32_t              packed;
     uint64_t              body_offset;
     uint32_t              pack_num;
-    uint8_t              *comp_buf;
-    int                   comp_buf_size;
+    /* Body bytes handed to writeback so far; see pw_writeback. */
+    uint64_t              wb_done;
+    /* The body's stripe parity, encoded as it is appended; NULL when it
+     * could not be set up, and then the seal reads the body back. */
+    stripe_enc_t         *enc;
 } pack_writer_t;
+
+/*
+ * Start writeback of what has been appended, every PACK_WB_STEP, without
+ * waiting for it. A backup can append faster than any disk takes it, and
+ * left alone the dirty pages pile up until the kernel throttles the writer
+ * and the seal's fsync writes a whole pack at once: on NVMe that made a
+ * backup of large files half as fast as the 1.0 writer, which started
+ * writeback as it went. Asking early keeps the disk busy from the first
+ * chunk; the seal's fsync still decides durability.
+ */
+#define PACK_WB_STEP ((uint64_t)8 * 1024 * 1024)
+
+static void pw_writeback(pack_writer_t *pw)
+{
+    uint64_t end = sizeof(pack_dat_hdr_t) + pw->body_offset;
+    if (!pw->dat_f || end < pw->wb_done + PACK_WB_STEP) return;
+#ifdef __linux__
+    if (fflush(pw->dat_f) != 0) return;
+    (void)sync_file_range(fileno(pw->dat_f), (off_t)pw->wb_done,
+                          (off_t)(end - pw->wb_done), SYNC_FILE_RANGE_WRITE);
+#endif
+    pw->wb_done = end;
+}
 
 static int pw_ensure_capacity(pack_writer_t *pw, uint32_t need) {
     if (need <= pw->idx_cap) return 0;
@@ -2102,9 +2413,12 @@ static status_t pw_finalize(pack_writer_t *pw) {
 
     status_t st = finalize_pack(pw->store, &pw->dat_f,
                                 pw->dat_tmp, &pw->dat_hdr,
-                                pw->idx_entries, pw->packed, pw->pack_num);
+                                pw->idx_entries, pw->packed, pw->pack_num, pw->enc);
+    stripe_enc_free(pw->enc);
+    pw->enc = NULL;
     pw->packed = 0;
     pw->body_offset = 0;
+    pw->wb_done = 0;
     return st;
 }
 
@@ -2112,96 +2426,137 @@ static void pw_destroy(pack_writer_t *pw) {
     /* Clean up if pack is still open (error path) */
     if (pw->dat_f) { fclose(pw->dat_f); pw->dat_f = NULL; }
     if (pw->dat_tmp[0]) { unlink(pw->dat_tmp); pw->dat_tmp[0] = '\0'; }
+    stripe_enc_free(pw->enc);
     free(pw->idx_entries);
-    free(pw->comp_buf);
     memset(pw, 0, sizeof(*pw));
 }
 
 /*
- * Append one entry: encrypt, write, record its index slot. Parity is the
- * seal's, computed over the body as a whole.
- * This is where the on-disk format of an entry is decided.
- *
- * payload is plaintext-or-compressed and stays the caller's to free; any
- * ciphertext buffer is owned and released here.
+ * An entry ready to append: encrypted when the repository is, with the CRC
+ * of its stored bytes. Both are per-entry CPU work that needs nothing from
+ * the writer, so a backup does them on the chunk worker that cut the chunk
+ * (pack_backup_prepare) and the writer's lock covers only the write, the
+ * 51-byte header's CRC and the copy into the stripe encoder. Parity is the
+ * pack's, striped over the body as it is appended (stripe_enc_t).
  */
+typedef struct {
+    const uint8_t *payload;      /* stored bytes: payload or cipher */
+    uint64_t       stored_size;
+    uint8_t        encryption;
+    uint8_t       *cipher;       /* owned */
+    uint32_t       payload_crc;  /* CRC-32C of the stored bytes */
+} sealed_entry_t;
+
+static void sealed_free(sealed_entry_t *e)
+{
+    free(e->cipher);
+    e->cipher = NULL;
+}
+
+/*
+ * Encrypt last, so parity and the CRC cover ciphertext and a scrub of an
+ * offsite copy needs no key. Compressing first and encrypting after is the
+ * only order that works: ciphertext does not compress.
+ *
+ * A fresh random nonce per encryption (object_encrypt), and the entry's
+ * type and name as associated data, so this ciphertext authenticates only
+ * as this object. payload stays the caller's.
+ */
+static status_t entry_seal(const object_aead_key_t *key, uint8_t type,
+                           const uint8_t hash[OBJECT_HASH_SIZE],
+                           const uint8_t *payload, uint64_t compressed_size,
+                           sealed_entry_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->payload     = payload;
+    out->stored_size = compressed_size;
+    out->encryption  = ENCRYPT_NONE;
+    if (key) {
+        out->cipher = malloc((size_t)compressed_size + OBJECT_CRYPT_OVERHEAD);
+        if (!out->cipher) return set_error(ERR_NOMEM, "pack: ciphertext buffer");
+        status_t est = object_encrypt(key, type, hash, payload,
+                                      (size_t)compressed_size, out->cipher);
+        if (est != OK) { sealed_free(out); return est; }
+        out->payload     = out->cipher;
+        out->stored_size = compressed_size + OBJECT_CRYPT_OVERHEAD;
+        out->encryption  = ENCRYPT_CHACHA20;
+    }
+    out->payload_crc = crc32c(out->payload, (size_t)out->stored_size);
+    return OK;
+}
+
+/*
+ * Append a sealed entry and record its index slot and CRCs. This is where
+ * the on-disk format of an entry is decided.
+ */
+static status_t pw_append_sealed(pack_writer_t *pw,
+                                 const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
+                                 uint64_t uncompressed_size, uint8_t compression,
+                                 sealed_entry_t *se)
+{
+    pack_dat_entry_hdr_t ehdr;
+    memcpy(ehdr.hash, hash, OBJECT_HASH_SIZE);
+    ehdr.type              = type;
+    ehdr.compression       = compression;
+    ehdr.encryption        = se->encryption;
+    ehdr.uncompressed_size = uncompressed_size;
+    ehdr.compressed_size   = se->stored_size;
+    if (entry_hdr_out_of_bounds(&ehdr))
+        return set_error(ERR_TOO_LARGE, "pack: entry of %llu bytes is past the object bound",
+                         (unsigned long long)uncompressed_size);
+
+    if (pw_ensure_capacity(pw, pw->packed + 1) != 0)
+        return set_error(ERR_NOMEM, "pack: entry array");
+
+    size_t csize = (size_t)se->stored_size;
+    uint64_t dat_off = sizeof(pack_dat_hdr_t) + pw->body_offset;
+    if (fwrite(&ehdr, sizeof(ehdr), 1, pw->dat_f) != 1 ||
+        (csize && fwrite_full(se->payload, csize, pw->dat_f) != 0))
+        return set_error_errno(ERR_IO, "pack: write entry to %s", pw->dat_tmp);
+    stripe_enc_feed(pw->enc, &ehdr, sizeof(ehdr));
+    stripe_enc_feed(pw->enc, se->payload, csize);
+
+    /*
+     * entry_index is the on-disk entry position, not the position this entry
+     * will occupy after finalize_pack sorts the array by hash. The CRC table
+     * is indexed by the former; recording the latter makes every CRC check
+     * read another entry's slot, which disables repair without failing
+     * anything.
+     */
+    pack_idx_disk_entry_t *ie = &pw->idx_entries[pw->packed];
+    memcpy(ie->hash, hash, OBJECT_HASH_SIZE);
+    ie->dat_offset        = dat_off;
+    ie->entry_index       = pw->packed;
+    ie->type              = ehdr.type;
+    ie->compression       = ehdr.compression;
+    ie->encryption        = ehdr.encryption;
+    ie->uncompressed_size = ehdr.uncompressed_size;
+    ie->compressed_size   = se->stored_size;
+    /* The whole entry's CRC from the header's and the payload's, the
+     * latter computed on the worker: no pass over the payload here. */
+    ie->hdr_crc   = crc32c(&ehdr, sizeof(ehdr));
+    ie->entry_crc = crc32c_combine(ie->hdr_crc, se->payload_crc, se->stored_size);
+
+    pw->body_offset += sizeof(ehdr) + se->stored_size;
+    pw->packed++;
+    pw_writeback(pw);
+    return OK;
+}
+
+/* Seal and append in one step, on the writer's thread. */
 static status_t pw_emit(pack_writer_t *pw,
                         const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
                         uint64_t uncompressed_size,
                         const uint8_t *payload, uint64_t compressed_size,
                         uint8_t compression)
 {
-    const object_aead_key_t *key = store_aead_key(pw->store);
-
-    /*
-     * Encrypt last, so parity and the CRC below cover ciphertext and a scrub
-     * of an offsite copy needs no key. Compressing first and encrypting after
-     * is the only order that works: ciphertext does not compress.
-     *
-     * A fresh random nonce per encryption (object_encrypt), and the entry's
-     * type and name as associated data, so this ciphertext authenticates
-     * only as this object.
-     */
-    uint8_t  encryption = ENCRYPT_NONE;
-    uint8_t *cipher     = NULL;
-    if (key) {
-        cipher = malloc((size_t)compressed_size + OBJECT_CRYPT_OVERHEAD);
-        if (!cipher) return set_error(ERR_NOMEM, "pack: ciphertext buffer");
-        status_t est = object_encrypt(key, type, hash, payload, (size_t)compressed_size,
-                                      cipher);
-        if (est != OK) { free(cipher); return est; }
-        payload          = cipher;
-        compressed_size += OBJECT_CRYPT_OVERHEAD;
-        encryption       = ENCRYPT_CHACHA20;
-    }
-
-    pack_dat_entry_hdr_t ehdr;
-    memcpy(ehdr.hash, hash, OBJECT_HASH_SIZE);
-    ehdr.type              = type;
-    ehdr.compression       = compression;
-    ehdr.encryption        = encryption;
-    ehdr.uncompressed_size = uncompressed_size;
-    ehdr.compressed_size   = compressed_size;
-    if (entry_hdr_out_of_bounds(&ehdr)) {
-        free(cipher);
-        return set_error(ERR_TOO_LARGE, "pack: entry of %llu bytes is past the object bound",
-                         (unsigned long long)uncompressed_size);
-    }
-
-    if (pw_ensure_capacity(pw, pw->packed + 1) != 0) {
-        free(cipher);
-        return set_error(ERR_NOMEM, "pack: entry array");
-    }
-
-    size_t csize = (size_t)compressed_size;
-    uint64_t dat_off = sizeof(pack_dat_hdr_t) + pw->body_offset;
-    if (fwrite(&ehdr, sizeof(ehdr), 1, pw->dat_f) != 1 ||
-        (csize && fwrite_full(payload, csize, pw->dat_f) != 0)) {
-        free(cipher);
-        return set_error_errno(ERR_IO, "pack: write entry to %s", pw->dat_tmp);
-    }
-
-    /*
-     * entry_index is the on-disk entry position, not the position this entry
-     * will occupy after finalize_pack sorts the array by hash. The parity
-     * trailer is indexed by the former; recording the latter makes every
-     * parity lookup read the wrong offsets, which disables repair without
-     * failing anything.
-     */
-    memcpy(pw->idx_entries[pw->packed].hash, hash, OBJECT_HASH_SIZE);
-    pw->idx_entries[pw->packed].dat_offset        = dat_off;
-    pw->idx_entries[pw->packed].entry_index       = pw->packed;
-    pw->idx_entries[pw->packed].type              = ehdr.type;
-    pw->idx_entries[pw->packed].compression       = ehdr.compression;
-    pw->idx_entries[pw->packed].encryption        = ehdr.encryption;
-    pw->idx_entries[pw->packed].uncompressed_size = ehdr.uncompressed_size;
-    pw->idx_entries[pw->packed].compressed_size   = compressed_size;
-
-    pw->body_offset += sizeof(ehdr) + compressed_size;
-    pw->packed++;
-
-    free(cipher);
-    return OK;
+    sealed_entry_t se;
+    status_t st = entry_seal(store_aead_key(pw->store), type, hash, payload,
+                             compressed_size, &se);
+    if (st != OK) return st;
+    st = pw_append_sealed(pw, hash, type, uncompressed_size, compression, &se);
+    sealed_free(&se);
+    return st;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2215,6 +2570,42 @@ struct pack_backup_writer {
 };
 
 /*
+ * The calling thread's compression scratch, freed when the thread exits.
+ * Chunk workers come and go with every backup; a plain _Thread_local
+ * pointer leaked one buffer per worker per backup.
+ */
+typedef struct {
+    uint8_t *buf;
+    int      cap;
+} comp_scratch_t;
+
+static pthread_key_t  g_comp_key;
+static pthread_once_t g_comp_once = PTHREAD_ONCE_INIT;
+
+static void comp_scratch_free(void *p)
+{
+    comp_scratch_t *c = p;
+    if (!c) return;
+    free(c->buf);
+    free(c);
+}
+
+static void comp_key_init(void)
+{
+    (void)pthread_key_create(&g_comp_key, comp_scratch_free);
+}
+
+static comp_scratch_t *comp_scratch(void)
+{
+    pthread_once(&g_comp_once, comp_key_init);
+    comp_scratch_t *c = pthread_getspecific(g_comp_key);
+    if (c) return c;
+    c = calloc(1, sizeof(*c));
+    if (c && pthread_setspecific(g_comp_key, c) != 0) { free(c); c = NULL; }
+    return c;
+}
+
+/*
  * Decide compression for a plaintext buffer (design constraint 4).
  *
  * A 64 KiB LZ4 probe first: incompressible content (video, audio, already
@@ -2223,12 +2614,13 @@ struct pack_backup_writer {
  * bounded, so the bail-out is per object - for a large file, per chunk -
  * and needs no second look inside an entry. A compressed result is kept
  * only when it is smaller than the input, which is also what the reader's
- * bound on stored size relies on.
+ * bound on stored size relies on. The scratch is the calling thread's own,
+ * so chunk workers compress at once.
  *
  * On return *out points at either the caller's buffer or *owned, which the
  * caller frees.
  */
-static void pb_compress(pack_writer_t *pw, const uint8_t *in, uint64_t len,
+static void pb_compress(const uint8_t *in, uint64_t len,
                         const uint8_t **out, uint64_t *out_len,
                         uint8_t *out_compression, uint8_t **owned)
 {
@@ -2240,18 +2632,28 @@ static void pb_compress(pack_writer_t *pw, const uint8_t *in, uint64_t len,
     /* Under 4 KiB the entry header costs more than the codec saves. */
     if (len < 4096 || len > OBJECT_MAX_BYTES) return;
 
+    int bound = LZ4_compressBound((int)len);
+    comp_scratch_t *cs = comp_scratch();
+    if (!cs) return;                     /* stored uncompressed, still correct */
+    if (bound > cs->cap) {
+        uint8_t *nb = realloc(cs->buf, (size_t)bound);
+        if (!nb) return;
+        cs->buf = nb;
+        cs->cap = bound;
+    }
+
     int sample_len = (len > PACK_PROBE_SIZE) ? PACK_PROBE_SIZE : (int)len;
-    int sc = LZ4_compress_default((const char *)in, (char *)pw->comp_buf,
-                                  sample_len, pw->comp_buf_size);
+    int sc = LZ4_compress_default((const char *)in, (char *)cs->buf,
+                                  sample_len, cs->cap);
     if (sc <= 0 || (double)sc / (double)sample_len > PACK_PROBE_RATIO) return;
 
-    int csz = LZ4_compress_default((const char *)in, (char *)pw->comp_buf,
-                                   (int)len, pw->comp_buf_size);
+    int csz = LZ4_compress_default((const char *)in, (char *)cs->buf,
+                                   (int)len, cs->cap);
     if (csz <= 0 || (uint64_t)csz >= len) return;
 
     uint8_t *copy = malloc((size_t)csz);
     if (!copy) return;
-    memcpy(copy, pw->comp_buf, (size_t)csz);
+    memcpy(copy, cs->buf, (size_t)csz);
     *owned           = copy;
     *out             = copy;
     *out_len         = (uint64_t)csz;
@@ -2273,12 +2675,6 @@ status_t pack_backup_open(store_t *store, pack_backup_writer_t **out)
     if (!w) return set_error(ERR_NOMEM, "pack_backup_open: alloc");
 
     w->pw.store = store;
-    w->pw.comp_buf_size = LZ4_compressBound((int)OBJECT_MAX_BYTES);
-    w->pw.comp_buf = malloc((size_t)w->pw.comp_buf_size);
-    if (!w->pw.comp_buf) {
-        free(w);
-        return set_error(ERR_NOMEM, "pack_backup_open: compression buffer");
-    }
 
     rs_init();
     *out = w;
@@ -2289,11 +2685,18 @@ status_t pack_backup_open(store_t *store, pack_backup_writer_t **out)
 static status_t pb_ensure_open(pack_backup_writer_t *w)
 {
     if (w->pw.dat_f) return OK;
-    w->pw.pack_num = next_pack_num(w->pw.store);
+    w->pw.pack_num = store_alloc_pack_num(w->pw.store, next_pack_num(w->pw.store));
     w->pw.packed = 0;
     w->pw.body_offset = 0;
-    return open_new_pack(w->pw.store, w->pw.pack_num, &w->pw.dat_f,
-                         w->pw.dat_tmp, &w->pw.dat_hdr);
+    w->pw.wb_done = 0;
+    status_t st = open_new_pack(w->pw.store, w->pw.pack_num, &w->pw.dat_f,
+                                w->pw.dat_tmp, &w->pw.dat_hdr);
+    if (st != OK) return st;
+    /* Without an encoder the seal reads the body back: slower, not wrong. */
+    stripe_enc_free(w->pw.enc);
+    w->pw.enc = stripe_enc_new();
+    stripe_enc_feed(w->pw.enc, &w->pw.dat_hdr, sizeof(w->pw.dat_hdr));
+    return OK;
 }
 
 int pack_backup_holds(const pack_backup_writer_t *w, const uint8_t hash[OBJECT_HASH_SIZE])
@@ -2322,6 +2725,61 @@ status_t pack_backup_rollover(pack_backup_writer_t *w)
     return OK;
 }
 
+/*
+ * The CPU half of staging an object, which needs no writer and no lock: the
+ * name, the 64 KiB probe and, if it pays, LZ4. Content-defined chunking runs
+ * this on its worker threads so one large file is not one core, and hands
+ * the result to pack_backup_add_prepared under the writer's lock.
+ */
+status_t pack_backup_prepare_plain(uint8_t type, const void *data, size_t len,
+                                   pack_prepared_t *out)
+{
+    if (!out || (!data && len))
+        return set_error(ERR_INVALID, "pack_backup_prepare: null argument");
+    memset(out, 0, sizeof(*out));
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "pack_backup_prepare: " OBJECT_TYPE_UNKNOWN_FMT, type);
+    if (len > OBJECT_MAX_BYTES)
+        return set_error(ERR_TOO_LARGE,
+                         "pack_backup_prepare: %zu bytes is past the %llu-byte object bound",
+                         len, (unsigned long long)OBJECT_MAX_BYTES);
+
+    out->type = type;
+    out->len  = len;
+    out->data = data;
+    object_name(type, data, len, out->hash);
+    pb_compress(data, (uint64_t)len, &out->payload, &out->payload_len,
+                &out->compression, &out->owned);
+    return OK;
+}
+
+/* And the rest of the per-entry CPU work: encryption and CRC (entry_seal). */
+status_t pack_backup_prepare(store_t *store, uint8_t type, const void *data,
+                             size_t len, pack_prepared_t *out)
+{
+    status_t st = pack_backup_prepare_plain(type, data, len, out);
+    if (st != OK || !store) return st;
+    sealed_entry_t *se = calloc(1, sizeof(*se));
+    if (!se) { pack_prepared_free(out); return set_error(ERR_NOMEM, "pack_backup_prepare: seal"); }
+    st = entry_seal(store_aead_key(store), type, out->hash, out->payload,
+                    out->payload_len, se);
+    if (st != OK) { free(se); pack_prepared_free(out); return st; }
+    out->sealed = se;
+    return OK;
+}
+
+void pack_prepared_free(pack_prepared_t *p)
+{
+    if (!p) return;
+    if (p->sealed) {
+        sealed_free(p->sealed);
+        free(p->sealed);
+        p->sealed = NULL;
+    }
+    free(p->owned);
+    p->owned = NULL;
+}
+
 status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
                          const void *data, size_t len,
                          uint8_t out_hash[OBJECT_HASH_SIZE],
@@ -2329,17 +2787,40 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
                          uint64_t *out_payload_size)
 {
     if (!w || (!data && len)) return set_error(ERR_INVALID, "pack_backup_add: null argument");
+    if (out_is_new)       *out_is_new = 0;
+    if (out_phys_bytes)   *out_phys_bytes = 0;
+    if (out_payload_size) *out_payload_size = len;
+
+    /*
+     * Named before anything else, so an object already staged or stored
+     * costs only its hash: probing and compressing it again would be work
+     * thrown away.
+     */
     if (!object_type_known(type))
         return set_error(ERR_INVALID, "pack_backup_add: " OBJECT_TYPE_UNKNOWN_FMT, type);
     if (len > OBJECT_MAX_BYTES)
         return set_error(ERR_TOO_LARGE,
                          "pack_backup_add: %zu bytes is past the %llu-byte object bound",
                          len, (unsigned long long)OBJECT_MAX_BYTES);
-
     object_name(type, data, len, out_hash);
-    if (out_is_new)        *out_is_new = 0;
-    if (out_payload_size)  *out_payload_size = len;
-    if (out_phys_bytes)    *out_phys_bytes = 0;
+    if (staged_set_contains(&w->seen, w->pw.idx_entries, out_hash)) return OK;
+    if (pack_object_exists(w->pw.store, out_hash)) return OK;
+
+    pack_prepared_t pp;
+    status_t st = pack_backup_prepare_plain(type, data, len, &pp);
+    if (st != OK) return st;
+    st = pack_backup_add_prepared(w, &pp, out_is_new, out_phys_bytes);
+    pack_prepared_free(&pp);
+    return st;
+}
+
+status_t pack_backup_add_prepared(pack_backup_writer_t *w, const pack_prepared_t *pp,
+                                  int *out_is_new, uint64_t *out_phys_bytes)
+{
+    if (!w || !pp) return set_error(ERR_INVALID, "pack_backup_add_prepared: null argument");
+    const uint8_t *out_hash = pp->hash;
+    if (out_is_new)     *out_is_new = 0;
+    if (out_phys_bytes) *out_phys_bytes = 0;
 
     /*
      * Staged first, then the repository. An object written into the pack this
@@ -2362,23 +2843,20 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
     if (w->pw.dat_f && w->pw.packed > 0 &&
         (w->pw.packed >= PACK_MAX_ENTRIES ||
          sizeof(pack_dat_hdr_t) + w->pw.body_offset + sizeof(pack_dat_entry_hdr_t) +
-             (uint64_t)len + OBJECT_CRYPT_OVERHEAD > PACK_MAX_BYTES))
+             (uint64_t)pp->len + OBJECT_CRYPT_OVERHEAD > PACK_MAX_BYTES))
         return set_error(ERR_INVALID, "pack_backup_add: pack is at its bound; "
                          "roll over before adding");
 
     status_t st = pb_ensure_open(w);
     if (st != OK) return st;
 
-    const uint8_t *payload = NULL;
-    uint64_t payload_len = 0;
-    uint8_t compression = COMPRESS_NONE;
-    uint8_t *owned = NULL;
-    pb_compress(&w->pw, data, (uint64_t)len, &payload, &payload_len,
-                &compression, &owned);
-
     uint32_t slot = w->pw.packed;
-    st = pw_emit(&w->pw, out_hash, type, (uint64_t)len, payload, payload_len, compression);
-    free(owned);
+    if (pp->sealed)
+        st = pw_append_sealed(&w->pw, out_hash, pp->type, (uint64_t)pp->len,
+                              pp->compression, pp->sealed);
+    else
+        st = pw_emit(&w->pw, out_hash, pp->type, (uint64_t)pp->len,
+                     pp->payload, pp->payload_len, pp->compression);
     if (st != OK) return st;
 
     /* Keep the set no more than half full, so probing stays short. */
@@ -2765,7 +3243,7 @@ static status_t pack_rw_seal(pack_rw_t *rw)
     uint64_t size = 0;
     err_clear();   /* so a failure with no message of its own is told apart */
     status_t st = seal_pack_file(rw->store, &rw->cur, &rw->hdr,
-                                 rw->ents + rw->cur_first, rw->cur_n, &size);
+                                 rw->ents + rw->cur_first, rw->cur_n, NULL, &size);
     if (st != OK) {
         if (!err_msg()[0]) set_error(st, "pack rewrite: cannot seal an output");
         return st;

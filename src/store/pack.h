@@ -236,6 +236,42 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
                          int *out_is_new, uint64_t *out_phys_bytes,
                          uint64_t *out_payload_size);
 
+/*
+ * Staging split in two, for callers that do the CPU work on threads of their
+ * own (content-defined chunking, cdc.h). pack_backup_prepare is thread-safe
+ * and needs no writer: it names the object and compresses it when the probe
+ * says so, and with a store encrypts it and computes its CRC.
+ * pack_backup_add_prepared does the rest - dedup against the repository and
+ * the open pack, the write, and handing its bytes to the pack's stripe
+ * encoder - and is called with whatever lock serialises the writer. data must stay valid until then.
+ * pack_backup_add is exactly the two in sequence.
+ */
+typedef struct {
+    uint8_t        hash[OBJECT_HASH_SIZE];
+    uint8_t        type;
+    uint8_t        compression;
+    size_t         len;          /* plaintext length */
+    const void    *data;
+    const uint8_t *payload;      /* data, or owned when compressed */
+    uint64_t       payload_len;
+    uint8_t       *owned;
+    /* Encrypted under the store's key, with the stored bytes' CRC, when
+     * prepared with a store: the append is then a write and nothing more.
+     * Parity is the pack's, striped as the body is appended. */
+    void          *sealed;
+} pack_prepared_t;
+
+/* Name, probe, compress; then encrypt and compute the CRC for store's
+ * repository, all on the calling thread. */
+status_t pack_backup_prepare(store_t *store, uint8_t type, const void *data,
+                             size_t len, pack_prepared_t *out);
+/* The same without sealing: pack_backup_add_prepared seals under its lock. */
+status_t pack_backup_prepare_plain(uint8_t type, const void *data, size_t len,
+                                   pack_prepared_t *out);
+status_t pack_backup_add_prepared(pack_backup_writer_t *w, const pack_prepared_t *pp,
+                                  int *out_is_new, uint64_t *out_phys_bytes);
+void     pack_prepared_free(pack_prepared_t *p);
+
 /* Would staging an object of this size push the open pack past its seal? */
 int pack_backup_full(const pack_backup_writer_t *w, uint64_t bytes);
 
@@ -306,6 +342,13 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
  * 64 groups. Lowering it lets a test push a small pack through many windows.
  */
 void pack_test_set_parity_window(size_t groups);
+
+/*
+ * Test hook: how many seals so far had to read their pack's body back to
+ * compute its parity. The plaintext writer encodes as it appends and never
+ * should; gc's rewrite, coalescing and the stored writer do.
+ */
+uint64_t pack_test_seal_readbacks(void);
 
 /*
  * The seal in force: PACK_MAX_MULTI_BYTES unless a test moved it.
@@ -495,19 +538,23 @@ typedef struct {
 } __attribute__((packed)) pack_idx_hdr_t;
 
 /*
- * On-disk index entry, sorted by hash. Carries type and sizes so repository
- * statistics can be computed from the index alone, without seeking the .dat.
+ * One entry of a pack being written or rewritten: where it is and what its
+ * header says, and - from the plaintext writer, which computes them as it
+ * appends - the entry's two CRCs for the trailer's table. No longer on
+ * disk (there is no .idx sidecar); the name is historical.
  */
 typedef struct {
-    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
-    uint64_t dat_offset;               /*  8 */
-    uint32_t entry_index;              /*  4 */
-    uint8_t  type;                     /*  1 */
-    uint8_t  compression;              /*  1 */
-    uint8_t  encryption;               /*  1 */
-    uint64_t uncompressed_size;        /*  8 */
-    uint64_t compressed_size;          /*  8 */
-} __attribute__((packed)) pack_idx_disk_entry_t;  /* 63 bytes */
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint64_t dat_offset;
+    uint32_t entry_index;
+    uint8_t  type;
+    uint8_t  compression;
+    uint8_t  encryption;
+    uint64_t uncompressed_size;
+    uint64_t compressed_size;
+    uint32_t entry_crc;                /* header and payload */
+    uint32_t hdr_crc;                  /* header alone */
+} pack_idx_disk_entry_t;
 
 /* ------------------------------------------------------------------ */
 /* Pack enumeration (read-only iteration)                              */

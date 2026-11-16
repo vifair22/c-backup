@@ -43,6 +43,7 @@ typedef enum {
     PHASE_SETUP,         /* dropping stale staged rows, opening the backup pack */
     PHASE_PACK_SEAL,     /* sealing a full backup pack, and the last one */
     PHASE_SNAPSHOT,      /* snapshot id, the record file and its row */
+    PHASE_STORE_WAIT,    /* the backup thread blocked on the file workers */
     /*
      * Nested spans: recorded from inside whichever phase is running, and
      * subtracted from it by phase_add_excl, so the top-level rows stay
@@ -63,6 +64,9 @@ typedef enum {
     PHASE_COMMIT_TREES,
     PHASE_COMMIT_INDEX,
     PHASE_COMMIT_PACK,
+    /* Not accounted either: the file workers' own time storing files, summed
+     * over them, so it can exceed the wall clock. */
+    PHASE_STORE_WORKERS,
     PHASE__COUNT
 } phase_id_t;
 
@@ -74,6 +78,8 @@ typedef struct {
     uint64_t nested_ns;
     /* Which commit:* row a transaction commit is also charged to, or 0. */
     phase_id_t txn_site;
+    /* File workers the backup ran (store_pool.h); 0 or 1 when none. */
+    unsigned store_threads;
 } phase_timers_t;
 
 /*
