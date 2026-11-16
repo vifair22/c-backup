@@ -1435,11 +1435,12 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         snprintf(rj, sizeof(rj),
                  "{\"files\":%llu,\"dirs\":%llu,\"symlinks\":%llu,"
                  "\"hardlinks\":%llu,\"specials\":%llu,\"bytes\":%llu,"
-                 "\"skipped\":%llu,\"failed\":%llu}",
+                 "\"skipped\":%llu,\"kept\":%llu,\"failed\":%llu}",
                  (unsigned long long)rr.files, (unsigned long long)rr.dirs,
                  (unsigned long long)rr.symlinks, (unsigned long long)rr.hardlinks,
                  (unsigned long long)rr.specials, (unsigned long long)rr.bytes,
-                 (unsigned long long)rr.skipped, (unsigned long long)rr.failed);
+                 (unsigned long long)rr.skipped, (unsigned long long)rr.kept,
+                 (unsigned long long)rr.failed);
         job_set_result(progress_ctx, rj);
     }
 

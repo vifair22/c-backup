@@ -10,6 +10,7 @@
 
 #include <cutils/log.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -509,6 +510,184 @@ static void apply_metadata(const char *path, uint32_t mode, uint32_t uid,
         log_warn("restore: utimensat %s: %s", path, strerror(errno));
 }
 
+/*
+ * A regular file is restored under a temporary name in its own directory
+ * and renamed into place only once the object has read back authentic and
+ * whole (OWN-36).
+ *
+ * The streaming read emits as it goes and learns whether the bytes were
+ * right only at the end, from the tag and the hash. Writing into the final
+ * path and deleting on failure covered a failure the restore lived to see,
+ * not a daemon killed mid-file: that left a file of the right name holding
+ * wrong or partial content, and the resumed restore skipped it as done.
+ * Now the final path either does not exist or holds the verified file with
+ * its metadata, and anything a crash leaves behind is a temporary file
+ * under this prefix, which the next restore into that directory removes.
+ *
+ * The prefix plus mkstemp's six characters, and nothing else, is what the
+ * sweep matches, so it cannot take a file of the user's that merely starts
+ * the same way unless the name has exactly that shape.
+ */
+#define PARTIAL_PREFIX     ".c-backup-partial."
+#define PARTIAL_SUFFIX_LEN 6
+
+/* The directory part of a destination path, which is where its temporary
+ * file goes: the same filesystem, so the rename is atomic. */
+static int dir_of(const char *full, char *out, size_t outsz)
+{
+    const char *slash = strrchr(full, '/');
+    size_t n = slash ? (size_t)(slash - full) : 0;
+    if (n == 0) { snprintf(out, outsz, "%s", slash ? "/" : "."); return 0; }
+    if (n >= outsz) return -1;
+    memcpy(out, full, n);
+    out[n] = '\0';
+    return 0;
+}
+
+static int make_partial(const char *full, char *tmp, size_t tmpsz)
+{
+    char dir[PATH_MAX];
+    if (dir_of(full, dir, sizeof(dir)) != 0 ||
+        snprintf(tmp, tmpsz, "%s/" PARTIAL_PREFIX "XXXXXX", dir) >= (int)tmpsz) {
+        set_error(ERR_IO, "restore: destination path too long for %s", full);
+        return -1;
+    }
+    /* mkstemp creates with O_EXCL and mode 0600: nothing else can have the
+     * name, and nobody else can read the bytes before they are verified
+     * and the file's own mode is applied. */
+    int fd = mkostemp(tmp, O_CLOEXEC);
+    if (fd == -1) set_error_errno(ERR_IO, "restore: cannot create a temporary file beside %s", full);
+    return fd;
+}
+
+static int is_partial_name(const char *name)
+{
+    size_t pl = sizeof(PARTIAL_PREFIX) - 1;
+    return strncmp(name, PARTIAL_PREFIX, pl) == 0 &&
+           strlen(name) == pl + PARTIAL_SUFFIX_LEN;
+}
+
+/*
+ * Remove the temporary files an interrupted restore left in the directory
+ * that holds `full`. Called once per directory per run, before the first
+ * file is restored into it, so a resumed restore cleans up exactly where it
+ * goes back to work. One readdir per directory a run writes into.
+ */
+static void sweep_partials(const char *full)
+{
+    char dir[PATH_MAX];
+    if (dir_of(full, dir, sizeof(dir)) != 0) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    int dfd = dirfd(d);
+    unsigned removed = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!is_partial_name(de->d_name)) continue;
+        struct stat sb;
+        if (fstatat(dfd, de->d_name, &sb, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(sb.st_mode))
+            continue;
+        if (unlinkat(dfd, de->d_name, 0) == 0) removed++;
+        else log_warn("restore: cannot remove partial file %s/%s: %s",
+                      dir, de->d_name, strerror(errno));
+    }
+    closedir(d);
+    if (removed)
+        log_info("restore: removed %u partial file(s) an interrupted restore left in %s",
+                 removed, dir);
+}
+
+/*
+ * The resume rule: an existing regular file whose size matches the
+ * snapshot's and whose mtime is within two seconds of it is the restored
+ * file, and is skipped.
+ *
+ * That is sound because of how files now arrive: the final name only ever
+ * appears by rename, after the content has verified and the mtime has been
+ * set, so a file c-backup put there is complete. The two seconds are for
+ * filesystems that keep coarser timestamps than the snapshot recorded (FAT
+ * keeps two-second mtimes). Anything else at the path - another size, an
+ * mtime from today, a directory or a symlink - is not the snapshot's
+ * version, and is left alone and counted as kept when overwrite is off.
+ */
+static int already_restored(const struct stat *sb, uint64_t size, int64_t mtime_ns)
+{
+    if (!S_ISREG(sb->st_mode) || (uint64_t)sb->st_size != size) return 0;
+    int64_t have = (int64_t)sb->st_mtim.tv_sec * 1000000000LL + sb->st_mtim.tv_nsec;
+    int64_t diff = have > mtime_ns ? have - mtime_ns : mtime_ns - have;
+    return diff < 2000000000LL;
+}
+
+/*
+ * Restore one regular file's content and metadata under a temporary name,
+ * then make it durable and rename it into place. On any failure the
+ * temporary file is removed and the final path is untouched. *out_sz is
+ * the object's payload size.
+ */
+static status_t restore_file(store_t *store, const char *chash, const char *full,
+                             uint64_t size, uint32_t mode, uint32_t uid,
+                             uint32_t gid, int64_t mtime, const char *xhash,
+                             const char *ahash, uint64_t *out_sz)
+{
+    uint8_t hash[OBJECT_HASH_SIZE];
+    hex_to_hash(chash, hash);
+    *out_sz = 0;
+
+    char tmp[PATH_MAX];
+    int fd = make_partial(full, tmp, sizeof(tmp));
+    if (fd == -1) return ERR_IO;
+
+    uint64_t sz = 0;
+    uint8_t  otype = 0;
+    status_t st = object_load_stream(store, hash, fd, &sz, &otype);
+    /* The type is checked against what a file can be: an object of any
+     * other type is not file content, whatever its bytes say (OWN-39). */
+    if (st == OK && otype != OBJECT_TYPE_FILE && otype != OBJECT_TYPE_SPARSE)
+        st = set_error(ERR_CORRUPT, "object is of type %u, not file content", otype);
+
+    if (st == OK && otype == OBJECT_TYPE_SPARSE) {
+        /*
+         * What was just written is the verified payload, a region table
+         * plus data; writing that linearly would turn holes into zeros.
+         * It is laid out from there into a second temporary file, and the
+         * payload is dropped as soon as that exists.
+         */
+        char tmp2[PATH_MAX];
+        int fd2 = make_partial(full, tmp2, sizeof(tmp2));
+        if (fd2 == -1) {
+            st = ERR_IO;
+        } else {
+            st = restore_sparse_from_fd(fd, fd2, size, full);
+            close(fd);
+            unlink(tmp);
+            fd = fd2;
+            memcpy(tmp, tmp2, sizeof(tmp));
+        }
+    }
+
+    /* Metadata goes on before the rename, so the file is final the moment
+     * it has its name: the resume rule relies on the mtime being right. */
+    if (st == OK) {
+        apply_metadata(tmp, mode, uid, gid, mtime);
+        apply_xattrs(store, tmp, xhash);
+        apply_acls(store, tmp, ahash, 0);
+        if (fdatasync(fd) != 0)
+            st = set_error_errno(ERR_IO, "restore: cannot sync %s", full);
+    }
+    if (close(fd) != 0 && st == OK)
+        st = set_error_errno(ERR_IO, "restore: cannot close %s", full);
+    if (st == OK && rename(tmp, full) != 0)
+        st = set_error_errno(ERR_IO, "restore: cannot rename into place %s", full);
+    if (st != OK) {
+        if (unlink(tmp) != 0 && errno != ENOENT)
+            log_warn("restore: cannot remove partial file %s: %s", tmp, strerror(errno));
+        return st;
+    }
+    *out_sz = sz;
+    return OK;
+}
+
 static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
                                   int64_t snap_id, const char *dest,
                                   const restore_opts_t *opts, restore_result_t *out);
@@ -643,8 +822,13 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             char full[PATH_MAX];
             if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full))
                 continue;
+            /* Only a member the resume rule would skip anchors the group:
+             * linking later members to a file that is not the snapshot's
+             * would hand them its content. */
             struct stat sb;
-            if (stat(full, &sb) == 0 && S_ISREG(sb.st_mode))
+            if (lstat(full, &sb) == 0 &&
+                already_restored(&sb, strtoull(r->rows[i][6], NULL, 10),
+                                 strtoll(r->rows[i][5], NULL, 10)))
                 hardlink_remember(&hlinks, hgroup, full);
         }
         groupcount_free(&gcount);
@@ -672,6 +856,16 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             }
             if (reg) bytes_total += strtoull(r->rows[i][6], NULL, 10);
         }
+    }
+
+    /* Per directory row, plus one for the destination itself: whether this
+     * run has swept it for partial files yet. */
+    char *swept = calloc((size_t)r->nrows + 1, 1);
+    if (!swept) {
+        pt_free(&paths);
+        hardlink_map_free(&hlinks);
+        db_result_free(r);
+        return set_error(ERR_NOMEM, "restore: directory sweep map");
     }
 
     for (int i = 0; i < r->nrows && st == OK; i++) {
@@ -879,64 +1073,54 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
 
         if (make_parents(full) != OK) { st = ERR_IO; break; }
 
+        uint64_t nsize = strtoull(r->rows[i][6], NULL, 10);
         if (!opts->overwrite) {
             struct stat sb;
-            if (stat(full, &sb) == 0) {
-                /* Skipped, but still this inode group's anchor. A resumed
-                 * restore skips everything an earlier attempt wrote, and
-                 * without remembering those paths every group whose first
-                 * member landed in the earlier run came back as copies:
-                 * 2,262 links flattened on the first interrupted 45G run,
-                 * silently, because the content was never wrong. */
-                if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
-                res.skipped++;
+            if (lstat(full, &sb) == 0) {
+                if (already_restored(&sb, nsize, mtime)) {
+                    /* Skipped, but still this inode group's anchor. A
+                     * resumed restore skips everything an earlier attempt
+                     * wrote, and without remembering those paths every
+                     * group whose first member landed in the earlier run
+                     * came back as copies: 2,262 links flattened on the
+                     * first interrupted 45G run, silently, because the
+                     * content was never wrong. */
+                    if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
+                    res.skipped++;
+                } else {
+                    log_warn("restore: %s already exists and is not the "
+                             "snapshot's version (size or mtime differ); kept, "
+                             "since overwrite is off", full);
+                    res.kept++;
+                }
                 continue;
             }
         }
 
-        uint8_t hash[OBJECT_HASH_SIZE];
-        hex_to_hash(chash, hash);
-
-        int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd == -1) {
-            log_warn("restore: cannot create %s: %s", full, strerror(errno));
-            res.failed++;
-            continue;
+        /* Leftovers of an interrupted run in this directory, once per run. */
+        int64_t parent = strtoll(r->rows[i][COL_PARENT], NULL, 10);
+        int     slot   = parent == 0 ? r->nrows : pt_find(&paths, parent);
+        if (slot >= 0 && !swept[slot]) {
+            swept[slot] = 1;
+            sweep_partials(full);
         }
 
         uint64_t sz = 0;
-        uint8_t  otype = 0;
         err_clear();    /* so a reason below cannot be left over from before */
-        restore_io_t io = { opts, bytes_done, bytes_total,
-                            strtoull(r->rows[i][6], NULL, 10), 0,
+        restore_io_t io = { opts, bytes_done, bytes_total, nsize, 0,
                             matched - 1, work_total };
         store_io_fn prev_io;
         void *prev_io_ctx;
         store_get_io_progress(store, &prev_io, &prev_io_ctx);
         if (opts->bytes_cb || opts->progress_cb)
             store_set_io_progress(store, restore_bytes, &io);
-        status_t lst = object_load_stream(store, hash, fd, &sz, &otype);
+        status_t lst = restore_file(store, chash, full, nsize, mode, uid, gid,
+                                    mtime, xhash, ahash, &sz);
         store_set_io_progress(store, prev_io, prev_io_ctx);
-        if (lst == OK && otype == OBJECT_TYPE_SPARSE) {
-            /* Sparse objects arrive as a region table plus data; writing them
-             * linearly would turn holes into zeros and inflate the file to
-             * its full logical size. */
-            close(fd);
-            fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (fd != -1) {
-                lst = restore_sparse_streaming(store, hash, fd,
-                                               strtoull(r->rows[i][6], NULL, 10), full);
-            }
-        }
-        if (fd != -1) close(fd);
 
         if (lst != OK && cancelled(opts)) {
-            /* Stopped inside the file. What was written is a prefix, and a
-             * file of the right name holding part of its bytes is worse
-             * than none, so it goes, without a damage warning. */
-            if (unlink(full) != 0 && errno != ENOENT)
-                log_warn("restore: cannot remove incomplete %s: %s",
-                         full, strerror(errno));
+            /* Stopped inside the file. Its temporary file is gone and the
+             * final path was never touched. */
             st = set_error(ERR_BUSY, "restore cancelled");
             break;
         }
@@ -949,31 +1133,18 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             log_warn("restore: %s: object %s could not be read or repaired: %s",
                      full, chash, err_msg()[0] ? err_msg() : status_reason(lst));
             err_clear();
-            /*
-             * Remove what was written before the failure. The streaming read
-             * emits as it goes and only checks the hash at the end, so a
-             * failed object leaves a file of exactly the right name and
-             * length holding wrong bytes - which looks complete to anyone
-             * reading the restored tree, and to any tool that compares
-             * sizes. An absent file is honest; a plausible one is not.
-             */
-            if (unlink(full) != 0 && errno != ENOENT)
-                log_warn("restore: cannot remove incomplete %s: %s",
-                         full, strerror(errno));
             res.failed++;
             continue;
         }
 
-        apply_metadata(full, mode, uid, gid, mtime);
-        /* Later hardlink members share this inode, so the attributes set
-         * here are already theirs; link() sites above need no reapply. */
-        apply_xattrs(store, full, xhash);
-        apply_acls(store, full, ahash, 0);
-        /* First member of its inode group: everything later links here. */
+        /* First member of its inode group: everything later links here.
+         * Later members share this inode, so the attributes restore_file
+         * set are already theirs; the link() sites need no reapply. */
         if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
         res.files++;
         res.bytes += sz;
     }
+    free(swept);
 
     hardlink_map_free(&hlinks);
 
@@ -1028,12 +1199,12 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
 
     log_info("restore: snapshot %lld -> %s, %llu files, %llu dirs, "
              "%llu symlinks, %llu hardlinks, %llu specials, %llu skipped, "
-             "%llu failed",
+             "%llu kept, %llu failed",
              (long long)snap_id, dest, (unsigned long long)res.files,
              (unsigned long long)res.dirs, (unsigned long long)res.symlinks,
              (unsigned long long)res.hardlinks,
              (unsigned long long)res.specials, (unsigned long long)res.skipped,
-             (unsigned long long)res.failed);
+             (unsigned long long)res.kept, (unsigned long long)res.failed);
     if (out) *out = res;
 
     /* Everything that could be written has been. Say what could not, rather

@@ -27,6 +27,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <limits.h>
+#include <dirent.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
@@ -34,13 +37,18 @@
 
 #include "backup.h"
 #include "gc.h"
+#include "object.h"
 #include "pack.h"
+#include "parity.h"
 #include "prune.h"
 #include "reindex.h"
 #include "repo.h"
+#include "repo_key.h"
 #include "restore.h"
 #include "store.h"
 #include "store_index.h"
+#include "types.h"
+#include "verify.h"
 
 #define TEST_DIR  "/tmp/c_backup_test_restore"
 #define TEST_DB   TEST_DIR "/state.db"
@@ -1631,6 +1639,329 @@ static void test_reindex_handles_multiple_snapshots(void **state)
     db_result_free(r);
 }
 
+/* ------------------------------------------------------------------ */
+/* Read safety: only verified bytes reach a final path (OWN-36, -37, -39) */
+/* ------------------------------------------------------------------ */
+
+/* Larger than STREAM_LOAD_MAX, so backup leaves it loose and restore can
+ * only stream it, across more than one read window. */
+#define BIG_SIZE ((size_t)40 * 1024 * 1024)
+
+static void write_random_file(const char *path, size_t size, uint32_t seed)
+{
+    uint8_t *buf = malloc(size);
+    assert_non_null(buf);
+    uint32_t x = seed ? seed : 1;
+    for (size_t i = 0; i < size; i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        buf[i] = (uint8_t)x;
+    }
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    assert_true(fd >= 0);
+    assert_int_equal(write(fd, buf, size), (ssize_t)size);
+    close(fd);
+    free(buf);
+}
+
+static int files_equal(const char *a, const char *b)
+{
+    char cmd[1200];
+    snprintf(cmd, sizeof(cmd), "cmp -s '%s' '%s'", a, b);
+    return system(cmd) == 0;
+}
+
+/* Restore's temporary files in one directory. */
+static int count_partials(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL)
+        if (strncmp(de->d_name, ".c-backup-partial.", 18) == 0) n++;
+    closedir(d);
+    return n;
+}
+
+/* The content hash a file node in the newest snapshot names, as hex. */
+static void node_hash_hex(const char *name, char out[OBJECT_HASH_SIZE * 2 + 1])
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT content_hash FROM nodes WHERE repo_id = ? AND name = ?"
+        " ORDER BY snap_id DESC LIMIT 1",
+        (const char *[]){ repo, name, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    snprintf(out, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[0][0]);
+    db_result_free(r);
+}
+
+static void loose_path_of(const char *hex, char *out, size_t outsz)
+{
+    snprintf(out, outsz, "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
+    struct stat sb;
+    assert_int_equal(stat(out, &sb), 0);   /* large objects stay loose */
+}
+
+static void flip_file_byte(const char *path, off_t off)
+{
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    uint8_t b = 0;
+    assert_int_equal(pread(fd, &b, 1, off), 1);
+    b ^= 0x5a;
+    assert_int_equal(pwrite(fd, &b, 1, off), 1);
+    close(fd);
+}
+
+/*
+ * OWN-37, end to end: an encrypted loose object with a flipped payload byte
+ * restores correct, and a deep verify counts it recoverable rather than
+ * lost. Before the fix the tag failure ended the read with the parity
+ * unused, so the restore failed the file and verify reported loss.
+ */
+static void test_encrypted_loose_flip_restores_and_verifies(void **state)
+{
+    (void)state;
+    repo_key_t key;
+    assert_int_equal(repo_key_generate(&key), OK);
+    store_set_key(store, &key);
+    write_random_file(TEST_SRC "/big.bin", BIG_SIZE, 7);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1], path[600];
+    node_hash_hex("big.bin", hex);
+    loose_path_of(hex, path, sizeof(path));
+    object_header_t hdr;
+    int fd = open(path, O_RDONLY);
+    assert_true(fd >= 0);
+    assert_int_equal(pread(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    close(fd);
+    assert_int_equal(hdr.encryption, ENCRYPT_CHACHA20);
+    flip_file_byte(path, (off_t)sizeof(hdr) + (20 << 20));
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    char out[700];
+    snprintf(out, sizeof(out), "%s/big.bin", restored_root());
+    assert_true(files_equal(TEST_SRC "/big.bin", out));
+
+    verify_result_t vr;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &vr), OK);
+    assert_int_equal(vr.unrecoverable, 0);
+    assert_true(vr.recoverable >= 1);
+    store_set_key(store, NULL);
+}
+
+/* Kill the restoring process the moment a partial file holds bytes: that
+ * is mid-file by construction, whatever order entries are restored in. */
+static void kill_when_partial(void *ctx, uint64_t done, uint64_t total)
+{
+    (void)ctx; (void)done; (void)total;
+    if (count_partials(restored_root()) > 0) raise(SIGKILL);
+}
+
+/*
+ * OWN-36: a restore killed inside a file leaves no file of that name - only
+ * a temporary file, which the next run removes - and the resumed restore
+ * produces the right file rather than skipping a wrong one as done.
+ *
+ * The child opens its own handles: it is killed, and a parent handle used
+ * across fork is not the child's to use.
+ */
+static void test_restore_killed_mid_file_leaves_no_partial_file(void **state)
+{
+    (void)state;
+    write_random_file(TEST_SRC "/big.bin", BIG_SIZE, 11);
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    pid_t pid = fork();
+    assert_true(pid >= 0);
+    if (pid == 0) {
+        cutils_db_t *cdb = NULL;
+        store_t *cst = NULL;
+        store_index_t *cidx = NULL;
+        if (db_open(&cdb, TEST_DB) != 0 ||
+            store_open(TEST_REPO, NULL, &cst) != OK ||
+            store_index_bind(cst, cdb, repo_id, &cidx) != OK)
+            _exit(2);
+        restore_opts_t ro;
+        memset(&ro, 0, sizeof(ro));
+        ro.bytes_cb = kill_when_partial;
+        (void)restore_run(cst, cdb, repo_id, br.snapshot_id, TEST_DST, &ro, NULL);
+        _exit(3);   /* never reached: the restore always writes a partial */
+    }
+    int status = 0;
+    assert_int_equal(waitpid(pid, &status, 0), pid);
+    assert_true(WIFSIGNALED(status));
+    assert_int_equal(WTERMSIG(status), SIGKILL);
+
+    char out[700];
+    snprintf(out, sizeof(out), "%s/big.bin", restored_root());
+    struct stat sb;
+    assert_int_not_equal(lstat(out, &sb), 0);
+    assert_int_equal(errno, ENOENT);
+    assert_true(count_partials(restored_root()) >= 1);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_true(files_equal(TEST_SRC "/big.bin", out));
+    assert_int_equal(count_partials(restored_root()), 0);
+    assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
+}
+
+/*
+ * The resume rule: an existing file is skipped only when its size and
+ * mtime say it is the snapshot's version. Anything else is the operator's,
+ * kept without overwrite and counted as kept, not as skipped.
+ */
+static void test_resume_keeps_a_file_that_is_not_the_snapshots(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, NULL), OK);
+
+    char top[700];
+    snprintf(top, sizeof(top), "%s/top.txt", restored_root());
+    write_file(top, "edited after the restore, and longer than before\n");
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.kept, 1);
+    assert_int_equal(rr.files, 0);
+    assert_int_equal(rr.skipped, 2);   /* mid.txt and leaf.txt */
+    FILE *f = fopen(top, "r");
+    assert_non_null(f);
+    char line[128] = "";
+    assert_non_null(fgets(line, sizeof(line), f));
+    fclose(f);
+    assert_string_equal(line, "edited after the restore, and longer than before\n");
+
+    /* With overwrite the snapshot's version replaces it. */
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.overwrite = 1;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, &ro, &rr), OK);
+    assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
+}
+
+/* A failed object leaves neither a file of its name nor a temporary file. */
+static void test_damaged_object_leaves_no_file_and_no_partial(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    wreck_packs();
+
+    restore_result_t rr;
+    assert_int_not_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                     TEST_DST, NULL, &rr), OK);
+    assert_true(rr.failed >= 1);
+    char top[700];
+    snprintf(top, sizeof(top), "%s/top.txt", restored_root());
+    struct stat sb;
+    assert_int_not_equal(lstat(top, &sb), 0);
+    assert_int_equal(count_partials(restored_root()), 0);
+}
+
+/*
+ * OWN-39: a file node whose content hash names a tree is refused. The
+ * object reads back fine - it is a valid tree - and restore used to write
+ * its bytes out as the file's content because it was not SPARSE.
+ */
+static void test_file_entry_naming_a_tree_is_refused(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)br.snapshot_id);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE nodes SET content_hash = (SELECT subtree_hash FROM nodes"
+        "  WHERE repo_id = ? AND snap_id = ? AND name = 'nested')"
+        " WHERE repo_id = ? AND snap_id = ? AND name = 'top.txt'",
+        (const char *[]){ repo, snap, repo, snap, NULL }, NULL), 0);
+
+    captured_log[0] = '\0';
+    int h = log_stream_register(capture_log, NULL);
+    assert_true(h >= 0);
+    restore_result_t rr;
+    status_t st = restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr);
+    log_stream_unregister(h);
+
+    assert_int_equal(st, ERR_CORRUPT);
+    assert_int_equal(rr.failed, 1);
+    assert_non_null(strstr(captured_log, "type 5, not file content"));
+    char top[700];
+    snprintf(top, sizeof(top), "%s/top.txt", restored_root());
+    struct stat sb;
+    assert_int_not_equal(lstat(top, &sb), 0);
+    assert_int_equal(count_partials(restored_root()), 0);
+}
+
+/* An object of a type from a newer build fails the file with the message
+ * that says so, and nothing is written for it. */
+static void test_unknown_object_type_is_refused_by_restore(void **state)
+{
+    (void)state;
+    write_random_file(TEST_SRC "/big.bin", BIG_SIZE, 13);
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1], path[600];
+    node_hash_hex("big.bin", hex);
+    loose_path_of(hex, path, sizeof(path));
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    object_header_t hdr;
+    assert_int_equal(pread(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    hdr.type = 9;
+    parity_record_t rec;
+    parity_record_compute(&hdr, sizeof(hdr), &rec);
+    assert_int_equal(pwrite(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    assert_int_equal(pwrite(fd, &rec, sizeof(rec),
+                            (off_t)sizeof(hdr) + (off_t)hdr.compressed_size),
+                     (ssize_t)sizeof(rec));
+    close(fd);
+
+    captured_log[0] = '\0';
+    int h = log_stream_register(capture_log, NULL);
+    assert_true(h >= 0);
+    restore_result_t rr;
+    status_t st = restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr);
+    log_stream_unregister(h);
+
+    assert_int_equal(st, ERR_CORRUPT);
+    assert_int_equal(rr.failed, 1);
+    assert_non_null(strstr(captured_log,
+        "object type 9 is not known to this build; written by a newer c-backup?"));
+    char out[700];
+    snprintf(out, sizeof(out), "%s/big.bin", restored_root());
+    struct stat sb;
+    assert_int_not_equal(lstat(out, &sb), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1667,6 +1998,12 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_after_reindex_is_identical, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_is_idempotent, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_handles_multiple_snapshots, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_encrypted_loose_flip_restores_and_verifies, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_killed_mid_file_leaves_no_partial_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_resume_keeps_a_file_that_is_not_the_snapshots, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_damaged_object_leaves_no_file_and_no_partial, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_entry_naming_a_tree_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unknown_object_type_is_refused_by_restore, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
