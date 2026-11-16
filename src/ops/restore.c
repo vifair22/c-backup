@@ -518,9 +518,30 @@ static status_t pt_rel(path_table_t *pt, int i, char *out, size_t outsz, int dep
     return OK;
 }
 
+/*
+ * The parent directory make_parents made last, per restore.
+ *
+ * Restore visits a directory's entries together, and mkdir -p of every
+ * entry's whole path cost one mkdir per component per file: 14 for each of
+ * 100,000 files in the many-small benchmark, every one EEXIST, 0.3 to 0.5 s
+ * of a restore (PERF.md, 2026-11-16). A file whose parent is the one made
+ * last needs none. Per restore, not static: two restores run at once on
+ * different job workers, and a static would also outlive a destination
+ * that was removed between runs.
+ */
+typedef struct {
+    char   last[PATH_MAX];
+    size_t len;          /* 0: nothing made yet */
+} parent_cache_t;
+
 /* mkdir -p for the destination side. */
-static status_t make_parents(const char *path)
+static status_t make_parents(parent_cache_t *pc, const char *path)
 {
+    const char *slash = strrchr(path, '/');
+    size_t plen = slash ? (size_t)(slash - path) : 0;
+    if (pc && plen && plen == pc->len && memcmp(pc->last, path, plen) == 0)
+        return OK;
+
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s", path);
     for (char *p = tmp + 1; *p; p++) {
@@ -529,6 +550,11 @@ static status_t make_parents(const char *path)
         if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
             return set_error_errno(ERR_IO, "restore: mkdir %s", tmp);
         *p = '/';
+    }
+    if (pc && plen && plen < sizeof(pc->last)) {
+        memcpy(pc->last, path, plen);
+        pc->last[plen] = '\0';
+        pc->len = plen;
     }
     return OK;
 }
@@ -738,10 +764,14 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
  *
  * syncfs flushes everything dirty on the destination filesystem, other
  * writers' data included, once per batch. The batch is bounded in files
- * and in bytes so that cost stays proportionate.
+ * and in bytes so that cost stays proportionate. It was 512 files or
+ * 256 MiB; syncfs is a filesystem commit whose cost is mostly per call,
+ * and 196 of them were 46% of a 100,000-file restore on btrfs, so it is
+ * 4,096 files or 1 GiB now (PERF.md, 2026-11-16). A crash costs at most
+ * that much redone work.
  */
-#define BATCH_FILES 512u
-#define BATCH_BYTES ((uint64_t)256 * 1024 * 1024)
+#define BATCH_FILES 4096u
+#define BATCH_BYTES ((uint64_t)1024 * 1024 * 1024)
 
 typedef struct {
     char    *tmp;
@@ -992,9 +1022,11 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
      * run has swept it for partial files yet. */
     char *swept = calloc((size_t)r->nrows + 1, 1);
     rename_batch_t *batch = calloc(1, sizeof(*batch));
-    if (!swept || !batch) {
+    parent_cache_t *pcache = calloc(1, sizeof(*pcache));
+    if (!swept || !batch || !pcache) {
         free(swept);
         free(batch);
+        free(pcache);
         pt_free(&paths);
         hardlink_map_free(&hlinks);
         db_result_free(r);
@@ -1050,7 +1082,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         }
 
         if (ntype == NODE_TYPE_DIR) {
-            if (make_parents(full) != OK) { st = ERR_IO; break; }
+            if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
             if (mkdir(full, 0755) != 0 && errno != EEXIST) {
                 st = set_error_errno(ERR_IO, "restore: mkdir %s", full);
                 break;
@@ -1079,7 +1111,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 restore_fail(&res, rel, "symlink has no recorded target");
                 continue;
             }
-            if (make_parents(full) != OK) { st = ERR_IO; break; }
+            if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
             if (opts->overwrite) unlink(full);
             if (symlink(ltarget, full) != 0 && errno != EEXIST) {
                 restore_fail(&res, full, "cannot create symlink: %s",
@@ -1110,7 +1142,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
          */
         if (ntype == NODE_TYPE_FIFO || ntype == NODE_TYPE_CHR ||
             ntype == NODE_TYPE_BLK) {
-            if (make_parents(full) != OK) { st = ERR_IO; break; }
+            if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
             if (opts->overwrite) unlink(full);
 
             int made;
@@ -1166,7 +1198,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 /* The first member may still be waiting in the batch
                  * under its temporary name. */
                 batch_flush(batch, &res);
-                if (make_parents(full) != OK) { st = ERR_IO; break; }
+                if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
                 if (opts->overwrite) unlink(full);
                 if (link(first, full) == 0) { res.hardlinks++; continue; }
                 /* Cross-device or unsupported: fall through and copy. */
@@ -1210,7 +1242,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         }
 
-        if (make_parents(full) != OK) { st = ERR_IO; break; }
+        if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
 
         uint64_t nsize = strtoull(r->rows[i][6], NULL, 10);
         if (!opts->overwrite) {
@@ -1294,6 +1326,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
     /* Whatever verified before a stop is still worth keeping. */
     batch_flush(batch, &res);
     free(batch);
+    free(pcache);
     free(swept);
 
     hardlink_map_free(&hlinks);

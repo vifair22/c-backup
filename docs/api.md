@@ -908,7 +908,9 @@ for a removal) while a job holds the repository.
 
 A job record carries `origin`, who asked for it: `api` for anything submitted
 over the API (the CLI and the app both are), `schedule` for the scheduler, with
-`schedule_id` naming the schedule (null otherwise).
+`schedule_id` naming the schedule (null otherwise), or `startup` for a reindex
+the daemon queued itself at start because the index had lost snapshots the
+repository holds (Manual section 17.5).
 
 `/jobs/stream/<id>` sends one `data:` frame at once with the job's state as it
 is, then a frame whenever it changes, and the same frame again every 5 seconds
@@ -931,8 +933,8 @@ stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it, and journalled then with that message:
 a daemon that was killed had no chance to journal it itself.
 
-A journal entry's `source` is the job's origin: `api`, or `schedule` with the
-message starting `schedule <id>`.
+A journal entry's `source` is the job's origin: `api`, `startup`, or
+`schedule` with the message starting `schedule <id>`.
 
 What some jobs report in `result`, beyond the backup and restore counts:
 

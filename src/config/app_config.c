@@ -1,6 +1,7 @@
 #include "app_config.h"
 
 #include "file_cache.h"
+#include "state_db.h"
 
 #include <arpa/inet.h>
 #include <limits.h>
@@ -56,6 +57,12 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
     config_check_one_of(chk, "backup.file_cache_match", modes);
     static const char *const unsettled[] = { "store", "skip", NULL };
     config_check_one_of(chk, "backup.unsettled", unsettled);
+
+    static const char *const syncs[] = { "normal", "full", NULL };
+    config_check_one_of(chk, "db.synchronous", syncs);
+    config_check_int_range(chk, "db.cache_mb", STATE_DB_CACHE_MB_MIN, STATE_DB_CACHE_MB_MAX);
+    config_check_int_range(chk, "db.wal_autocheckpoint", STATE_DB_AUTOCKPT_MIN,
+                           STATE_DB_AUTOCKPT_MAX);
 
     /* An empty bind is the documented loopback default, which the listener
      * applies itself. Anything else has to be what the listener parses: an

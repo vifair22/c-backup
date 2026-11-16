@@ -121,6 +121,24 @@ static const config_key_t app_file_keys[] = {
       "Chunk workers for large files: 0 automatic, 1 serial, up to 64",
       CFG_STORE_FILE, 0 },
 
+    /*
+     * How state.db trades durability of the newest edits for speed
+     * (src/common/state_db.h). The defaults are what the daemon is measured
+     * and documented with: NORMAL loses at most about the last second of
+     * index and daemon-state edits on a power cut, and the start-up
+     * reconcile puts lost snapshots back. "full" restores SQLite's
+     * sync-per-commit for an operator who wants it.
+     */
+    { "db.synchronous", CFG_STRING, "normal",
+      "state.db commit durability: normal (WAL synced each second) or full (every commit)",
+      CFG_STORE_FILE, 0 },
+    { "db.cache_mb", CFG_INT, "64",
+      "state.db page cache, MiB (2 to 65536)",
+      CFG_STORE_FILE, 0 },
+    { "db.wal_autocheckpoint", CFG_INT, "16384",
+      "state.db pages written between automatic checkpoints (1000 to 1048576)",
+      CFG_STORE_FILE, 0 },
+
     /* What a retention pass keeps for a repository that has not set its own
      * with the policy API (retention.* policy keys override these). */
     { "retention.keep_snaps",   CFG_INT, "1",  "Newest snapshots always kept, whatever their tier", CFG_STORE_FILE, 0 },

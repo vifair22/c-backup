@@ -31,6 +31,7 @@
 #include "auth.h"
 #include "file_cache.h"
 #include "settle.h"
+#include "index_reconcile.h"
 #include "job_manager.h"
 #include "lock.h"
 #include "repo_purge.h"
@@ -39,6 +40,7 @@
 #include "scheduler.h"
 #include "sd_notify.h"
 #include "server.h"
+#include "state_db.h"
 #include "store_index.h"
 
 #ifndef VERSION_STRING
@@ -100,6 +102,13 @@ static status_t schedule_dispatch(void *user, int64_t schedule_id, int64_t repo_
 static status_t schedule_cancel(void *user, int64_t job_id)
 {
     return job_cancel(user, job_id);
+}
+
+/* index_reconcile's submit: the same reindex job the route runs, queued
+ * with origin "startup". */
+static status_t startup_reindex(int64_t repo_id, void *ctx, int64_t *out_job_id)
+{
+    return routes_submit_startup_reindex(ctx, repo_id, out_job_id);
 }
 
 static void tighten_umask(void)
@@ -173,6 +182,25 @@ int main(int argc, char *argv[])
     }
 
     pin_sqlite_temp_dir(db_path);
+
+    /* Before anything writes: every statement after this runs on the
+     * settings the daemon is measured and documented with (state_db.h). */
+    state_db_tuning_t tuning = {
+        .synchronous        = config_get_str(cfg, "db.synchronous"),
+        .cache_mb           = config_get_int(cfg, "db.cache_mb", STATE_DB_CACHE_MB_DEFAULT),
+        .wal_autocheckpoint = config_get_int(cfg, "db.wal_autocheckpoint",
+                                             STATE_DB_AUTOCKPT_DEFAULT),
+    };
+    if (!tuning.synchronous || !*tuning.synchronous)
+        tuning.synchronous = STATE_DB_SYNC_DEFAULT;
+    if (state_db_tune(db, &tuning) != OK) {
+        log_error("%s", err_msg());
+        appguard_shutdown(guard);
+        return 1;
+    }
+    int sync_normal = strcmp(tuning.synchronous, "normal") == 0;
+    log_info("state database: synchronous=%s, cache %d MiB, checkpoint every %d pages",
+             tuning.synchronous, tuning.cache_mb, tuning.wal_autocheckpoint);
 
     /*
      * A write to a pipe whose reader has gone must return EPIPE, not kill
@@ -312,6 +340,21 @@ int main(int argc, char *argv[])
                                    config_get_int(cfg, "retention.keep_yearly", 3));
     routes_metadata_init(db);
     routes_introspect_init(db);
+
+    /* Snapshots a repository holds and the index lost - the newest commits
+     * a power cut can take with synchronous=NORMAL - are put back by a
+     * reindex job, queued before the scheduler can queue anything else for
+     * the repository. Cheap when nothing is missing (index_reconcile.h). */
+    {
+        reconcile_result_t rr;
+        if (index_reconcile(db, startup_reindex, jm, &rr) != OK) {
+            log_warn("reconcile: %s", err_msg());
+            err_clear();
+        } else if (rr.repos_missing == 0) {
+            log_info("reconcile: %u repositor%s checked, index complete",
+                     rr.repos_checked, rr.repos_checked == 1 ? "y" : "ies");
+        }
+    }
     routes_schedules_init(db, sched);
     if (routes_register_health(srv, db) != 0 ||
         routes_register_auth(srv, db) != 0 ||
@@ -339,11 +382,26 @@ int main(int argc, char *argv[])
     }
 
     log_info("listening on %s and port %d", socket_path ? socket_path : "(no socket)", tcp_port);
+
+    /* Bounds what synchronous=NORMAL can lose to about a second, rather than
+     * the kernel's writeback delay (state_db.h). Not needed under FULL,
+     * which syncs every commit itself. */
+    if (sync_normal && state_db_flusher_start(db_path, 1000) != OK) {
+        log_error("%s", err_msg());
+        api_server_stop(srv);
+        if (sched) scheduler_stop(sched);
+        job_manager_stop(jm);
+        repo_purge_stop();
+        appguard_shutdown(guard);
+        return 1;
+    }
+
     if (sched && scheduler_run(sched) != OK) {
         log_error("cannot start scheduler loop");
         api_server_stop(srv);
         scheduler_stop(sched);
         job_manager_stop(jm);
+        state_db_flusher_stop();
         repo_purge_stop();
         appguard_shutdown(guard);
         return 1;
@@ -375,6 +433,8 @@ int main(int argc, char *argv[])
     job_manager_stop(jm);
     repo_purge_stop();
     repo_locks_shutdown();
+    /* After every writer has stopped: one last sync of the WAL. */
+    state_db_flusher_stop();
     appguard_shutdown(guard);
     return 0;
 }
