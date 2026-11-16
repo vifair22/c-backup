@@ -4,6 +4,7 @@
 #include "grep.h"
 
 #include "object.h"
+#include "node_queries.h"
 
 #include <cutils/log.h>
 
@@ -120,9 +121,7 @@ static status_t grep_resolve_prefix(cutils_db_t *db, const char *repo,
 
         db_result_t *r = NULL;
         if (db_execute(db,
-                "SELECT id FROM nodes"
-                " WHERE repo_id = ? AND snap_id = ? AND parent_node_id = ?"
-                "   AND name = ?",
+                NODE_SQL_PATH_STEP,
                 (const char *[]){ repo, snap, cur, seg, NULL }, &r) != 0
             || !r || r->nrows != 1) {
             db_result_free(r);

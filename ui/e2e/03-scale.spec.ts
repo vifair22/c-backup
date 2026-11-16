@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test'
-import { startHarness, openRepo, descendTo, timed, clock, record, median, reportTimings, timings, BUDGET_MS, type Harness } from './fixtures'
+import { startHarness, openRepo, descendTo, clock, record, median, reportTimings, timings, BUDGET_MS, type Harness } from './fixtures'
 
 /*
  * The same screens, against a directory bigger than a page.
@@ -30,34 +30,67 @@ test.afterAll(async () => {
 
 test.describe.configure({ mode: 'serial' })
 
+/*
+ * Five runs and the median, for the timings below that cannot be made
+ * relative to anything: opening a big directory is what a person waits for,
+ * so it keeps an absolute budget. On one sample those ran at 61-78% of
+ * budget on a loaded runner, close enough that one slow scheduling slice
+ * fails them. The median is what stops that, not a bigger number.
+ */
+const RUNS = 5
+
 test('a directory bigger than one page says so', async () => {
   await openRepo(h.page, 'Documents')
   await h.page.getByRole('button', { name: /^snapshots$/i }).first().click()
-  await h.page.locator('tbody tr').first().click()
-  await expect(h.page.getByText(/Snapshot #/).first()).toBeVisible()
+  await expect(h.page.getByRole('heading', { name: 'Snapshots' })).toBeVisible()
 
-  await descendTo(h.page, h.work)
-
-  const openDir = await timed('open a 1200-entry directory', BUDGET_MS.dialog, async () => {
-    await h.page.getByText('wide', { exact: true }).click()
-    await expect(h.page.getByText('f00000.txt', { exact: true })).toBeVisible()
-  })
-  expect(openDir, 'one page of a large directory is one indexed query').toBeLessThan(BUDGET_MS.dialog)
-
-  /* The claim: it says how much it is showing rather than implying it has
-   * everything. Without this the remaining 700 files are simply absent. */
+  /*
+   * The tree caches every page it has read, so collapsing and reopening
+   * the directory, or reading page two again, would time a render from
+   * memory. Each run leaves the snapshot and comes back instead, which
+   * remounts the browser with nothing cached, and times the same two reads
+   * the first visit makes.
+   */
   const more = h.page.getByRole('button', { name: /shown, load more/i })
-  await expect(more).toBeVisible()
-  await expect(more).toContainText(String(PAGE))
-  await expect(h.page.getByText('f00700.txt', { exact: true })).toHaveCount(0)
+  const open: number[] = []
+  const next: number[] = []
+  for (let i = 0; i < RUNS; i++) {
+    if (i > 0) {
+      await h.page.getByRole('button', { name: /back/i }).first().click()
+      await expect(h.page.getByRole('heading', { name: 'Snapshots' })).toBeVisible()
+    }
+    await h.page.locator('tbody tr').first().click()
+    await expect(h.page.getByText(/Snapshot #/).first()).toBeVisible()
+    await descendTo(h.page, h.work)
 
-  await h.page.screenshot({ path: 'test-results/wide-dir.png', fullPage: false })
+    open.push(await clock(async () => {
+      await h.page.getByText('wide', { exact: true }).click()
+      await expect(h.page.getByText('f00000.txt', { exact: true })).toBeVisible()
+    }))
 
-  const nextPage = await timed('load the next page', BUDGET_MS.dialog, async () => {
-    await more.click()
-    await expect(h.page.getByText('f00700.txt', { exact: true })).toBeVisible()
-  })
-  expect(nextPage).toBeLessThan(BUDGET_MS.dialog)
+    /* The claim: it says how much it is showing rather than implying it
+     * has everything. Without this the remaining 700 files are simply
+     * absent. Checked on every run, since every run is a fresh browser. */
+    await expect(more).toBeVisible()
+    await expect(more).toContainText(String(PAGE))
+    await expect(h.page.getByText('f00700.txt', { exact: true })).toHaveCount(0)
+
+    if (i === 0) await h.page.screenshot({ path: 'test-results/wide-dir.png', fullPage: false })
+
+    next.push(await clock(async () => {
+      await more.click()
+      await expect(h.page.getByText('f00700.txt', { exact: true })).toBeVisible()
+    }))
+  }
+
+  const openDir = median(open)
+  const nextPage = median(next)
+  record('open a 1200-entry directory (median)', openDir, BUDGET_MS.dialog)
+  record('load the next page (median)', nextPage, BUDGET_MS.dialog)
+  expect(openDir, `one page of a large directory opens promptly: ${open.join('/')} ms`)
+    .toBeLessThan(BUDGET_MS.dialog)
+  expect(nextPage, `the next page loads promptly: ${next.join('/')} ms`)
+    .toBeLessThan(BUDGET_MS.dialog)
 
   /* Third page finishes it, and the control goes away rather than offering
    * a page that does not exist. */
@@ -104,7 +137,6 @@ test('searching an index with real entries in it', async () => {
    * empty table and both medians come from the same stretch of runner load.
    * Broad first, so the screenshot afterwards is the one-row page.
    */
-  const RUNS = 5
   const RATIO = 5
   const FLOOR_MS = 150
   /* The route's page cap, which the screen asks for; ~1200 names match. */
@@ -134,13 +166,27 @@ test('searching an index with real entries in it', async () => {
 
 test('the object list at a few thousand objects', async () => {
   await h.page.getByRole('button', { name: /dashboard/i }).first().click()
-  const objects = await timed('open objects at scale', BUDGET_MS.navigation, async () => {
-    await h.page.getByRole('button', { name: /loose|objects/i }).first().click()
-    await expect(h.page.getByRole('heading', { name: 'Objects' })).toBeVisible()
-    await h.page.getByRole('button', { name: /^packed$/i }).click()
-    await expect(h.page.locator('tbody tr').first()).toBeVisible()
-  })
-  expect(objects).toBeLessThan(BUDGET_MS.navigation)
+
+  /* Back to the dashboard between runs: the screen remounts on the loose
+   * tab with nothing loaded, so every run reads the packed page afresh.
+   * Waiting for the full page rather than its first row, because the
+   * count below is the claim. */
+  const runs: number[] = []
+  for (let i = 0; i < RUNS; i++) {
+    if (i > 0) {
+      await h.page.getByRole('button', { name: /back/i }).first().click()
+      await expect(h.page.getByText('Last Backup', { exact: false }).first()).toBeVisible()
+    }
+    runs.push(await clock(async () => {
+      await h.page.getByRole('button', { name: /loose|objects/i }).first().click()
+      await expect(h.page.getByRole('heading', { name: 'Objects' })).toBeVisible()
+      await h.page.getByRole('button', { name: /^packed$/i }).click()
+      await expect(h.page.locator('tbody tr')).toHaveCount(200)
+    }))
+  }
+  const objects = median(runs)
+  record('open objects at scale (median)', objects, BUDGET_MS.navigation)
+  expect(objects, `objects at scale: ${runs.join('/')} ms`).toBeLessThan(BUDGET_MS.navigation)
 
   /* Paged, so the table is 200 rows whatever the store holds. */
   await expect(h.page.locator('tbody tr')).toHaveCount(200)

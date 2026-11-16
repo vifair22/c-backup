@@ -170,7 +170,7 @@ test('the introspection screens', async () => {
     await h.page.getByRole('button', { name: /^search$/i }).last().click()
     await expect(h.page.locator('tbody tr').first()).toBeVisible()
   })
-  expect(query, 'a name search is an index lookup, not a scan').toBeLessThan(BUDGET_MS.submit)
+  expect(query, 'a name search answers promptly (index use is test_schema.c, not this)').toBeLessThan(BUDGET_MS.submit)
   await h.page.getByRole('button', { name: /dashboard/i }).first().click()
 
   const journal = await timed('open activity', BUDGET_MS.navigation, async () => {

@@ -19,6 +19,7 @@
 #include "store_index.h"
 #include "util.h"
 #include "json_row.h"
+#include "node_queries.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -273,7 +274,7 @@ static int subpath_exists(int64_t repo_id, int64_t snap_id, const char *subpath)
 
     db_result_t *r = NULL;
     int resident = db_execute(g_ctx.db,
-            "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? LIMIT 1",
+            NODE_SQL_SNAP_RESIDENT,
             (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
     db_result_free(r);
     if (!resident) return -1;
@@ -293,9 +294,7 @@ static int subpath_exists(int64_t repo_id, int64_t snap_id, const char *subpath)
 
         r = NULL;
         if (db_execute(g_ctx.db,
-                "SELECT id FROM nodes"
-                " WHERE repo_id = ? AND snap_id = ? AND parent_node_id = ?"
-                "   AND name = ?",
+                NODE_SQL_PATH_STEP,
                 (const char *[]){ repo, snap, parent, name, NULL }, &r) != 0 ||
             !r || r->nrows < 1) {
             db_result_free(r);
@@ -411,7 +410,7 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
         snprintf(sb, sizeof(sb), "%lld", (long long)snap_id);
         db_result_t *pr = NULL;
         int found = db_execute(g_ctx.db,
-                "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? AND id = ?",
+                NODE_SQL_DIR_IN_SNAP,
                 (const char *[]){ rb, sb, pidbuf, NULL }, &pr) == 0 && pr && pr->nrows == 1;
         db_result_free(pr);
         if (!found) return api_error(404, "no such directory in this snapshot");
@@ -424,22 +423,9 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
     snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
-    if (db_execute(g_ctx.db,
-            "SELECT id, name, type, mode, size, mtime_ns / 1000000000,"
-            "       mtime_ns % 1000000000, content_hash,"
-            /* Whether this directory has anything in it. A browser needs it
-             * to decide which rows get an expander, and the alternative is a
-             * round trip per directory to find out it is empty. EXISTS and
-             * not COUNT: this runs once per row returned, and counting the
-             * children of a directory holding 10k files to learn that the
-             * answer is "yes" would turn one page into a full scan. It is an
-             * index seek against nodes_by_snap_parent either way. */
-            "       EXISTS (SELECT 1 FROM nodes c"
-            "                WHERE c.repo_id = n.repo_id AND c.snap_id = n.snap_id"
-            "                  AND c.parent_node_id = n.id)"
-            "  FROM nodes n"
-            " WHERE n.repo_id = ? AND n.snap_id = ? AND n.parent_node_id = ?"
-            " ORDER BY n.name LIMIT ? OFFSET ?",
+    /* nodes_by_snap_parent serves the filter and the name order; see
+     * node_queries.h for why the EXISTS is not a COUNT. */
+    if (db_execute(g_ctx.db, NODE_SQL_LIST_DIR,
             (const char *[]){ repo, snap, parent ? parent : "0", lim, off, NULL },
             &r) != 0) {
         db_result_free(r);
@@ -594,8 +580,7 @@ static const anc_slot_t *anc_get(anc_cache_t *c, int64_t snap_id, int64_t node_i
         snprintf(nid,  sizeof(nid),  "%lld", (long long)node_id);
         db_result_t *r = NULL;
         if (db_execute(c->db,
-                "SELECT name, COALESCE(parent_node_id, 0) FROM nodes"
-                " WHERE repo_id = ? AND id = ?",
+                NODE_SQL_ANCESTOR,
                 (const char *[]){ repo, nid, NULL }, &r) != 0
             || !r || r->nrows != 1) {
             db_result_free(r);
@@ -720,27 +705,10 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
     int rc;
     if (only_snap)
         rc = db_execute(g_ctx.db, oldest_first
-            ? "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-              "       COALESCE(n.content_hash, '')"
-              "  FROM node_fts f"
-              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
-              " ORDER BY f.rowid ASC LIMIT ?"
-            : "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-              "       COALESCE(n.content_hash, '')"
-              "  FROM node_fts f"
-              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
-              " ORDER BY f.rowid DESC LIMIT ?",
+            ? NODE_SQL_SEARCH_SNAP_OLDEST : NODE_SQL_SEARCH_SNAP_NEWEST,
             (const char *[]){ repo, repo, mq, snap, lim, NULL }, &r);
     else
-        rc = db_execute(g_ctx.db,
-            "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-            "       COALESCE(n.content_hash, '')"
-            "  FROM node_fts f"
-            "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-            " WHERE f.repo_id = ? AND f.name MATCH ?"
-            " ORDER BY f.rowid DESC LIMIT ?",
+        rc = db_execute(g_ctx.db, NODE_SQL_SEARCH_ALL,
             (const char *[]){ repo, repo, mq, lim, NULL }, &r);
     free(mq);
     if (rc != 0) {
