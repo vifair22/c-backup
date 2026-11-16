@@ -1,0 +1,1 @@
+{"v":1,"id":3,"op":"vm.backup_begin","args":{"unit":"libvirt:5c1fb2a4-0e8d-4a3f-9d2e-1b2c3d4e5f60","disks":[{"target":"vda","mode":"incremental"}],"base":"cbk-7f3a09c1-4127","freeze":"auto"}}
