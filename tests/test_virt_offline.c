@@ -88,7 +88,7 @@ static void define(const char *uuid, const char *name, const char *nvram)
 
 static void undefine(const char *uuid)
 {
-    char cmd[256];
+    char cmd[512];
     snprintf(cmd, sizeof(cmd), "virsh -q -c qemu:///session undefine --nvram %s >/dev/null 2>&1 || "
              "virsh -q -c qemu:///session undefine %s >/dev/null 2>&1", uuid, uuid);
     if (system(cmd) != 0) { /* already gone */ }
@@ -102,7 +102,7 @@ static int setup(void **state)
     if (!have_libvirt) return 0;
     undefine(UUID);
     undefine(UUID2);
-    if (system("rm -rf '" D "' && mkdir -p '" D "/nbd' '" D "/tpm-states/" UUID "'") != 0) return -1;
+    if (system("rm -rf '" D "' && mkdir -p '" D "/nbd' '" D "/scratch' '" D "/tpm-states/" UUID "'") != 0) return -1;
     /* vda: raw, data at the start and near the end; vdb: the same as qcow2. */
     raw_bytes = calloc(1, 8 * M);
     if (!raw_bytes) return -1;
@@ -123,7 +123,8 @@ static int setup(void **state)
              "[helper]\ndaemon_uid = %u\ndaemon_id = 0badf00d\nstate_dir = " D "/hstate\nsocket = " SOCK "\n"
              "[units]\nallow = libvirt:cbk-uat-*\n"
              "[host]\nnsenter = 0\nhost_root =\n"
-             "[libvirt]\nenabled = 1\nuri = qemu:///session\nnbd_dir = " D "/nbd\ntpm_dir = " D "/tpm-states\n",
+             "[libvirt]\nenabled = 1\nuri = qemu:///session\nnbd_dir = " D "/nbd\ntpm_dir = " D "/tpm-states\n"
+             "scratch_dir = " D "/scratch\n",
              (unsigned)getuid());
     memset(&pol, 0, sizeof(pol));
     if (helper_policy_parse(text, &pol) != OK) return -1;
@@ -246,11 +247,58 @@ static void test_missing_state_refused(void **state)
     err_clear();
 }
 
+#define UUID3 "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1c2f"
+
+/* V2: the same disks with the VM running (firmware with nothing to boot
+ * is enough): a pull-mode backup export read by the daemon's NBD client,
+ * crash-consistent without an agent, the job ended and nothing held. */
+static void test_online_backup(void **state)
+{
+    (void)state;
+    if (!have_libvirt) skip();
+    int kvm = access("/dev/kvm", R_OK | W_OK) == 0;
+    char xml[4096];
+    snprintf(xml, sizeof(xml),
+        "<domain type='%s'><name>cbk-uat-v3</name><uuid>" UUID3 "</uuid><memory unit='MiB'>64</memory><vcpu>1</vcpu>"
+        "<os><type arch='x86_64' machine='pc'>hvm</type></os><devices>"
+        "<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='" D "/vda.img'/><target dev='vda' bus='virtio'/></disk>"
+        "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='" D "/vdb.img'/><target dev='vdb' bus='virtio'/></disk>"
+        "<graphics type='vnc' autoport='yes' listen='127.0.0.1'/></devices></domain>", kvm ? "kvm" : "qemu");
+    put(D "/dom3.xml", xml, strlen(xml));
+    if (system("virsh -q -c qemu:///session destroy " UUID3 " >/dev/null 2>&1") != 0) { /* not running */ }
+    undefine(UUID3);
+    sh("virsh -q -c qemu:///session define '" D "/dom3.xml' >/dev/null");
+    if (system("virsh -q -c qemu:///session start cbk-uat-v3 >/dev/null 2>&1") != 0) {
+        undefine(UUID3);
+        print_message("the test VM did not start here: skipped\n");
+        skip();
+    }
+    unit_backup_result_t res;
+    status_t st = backup("cbk-uat-v3", &res);
+    if (st != OK) print_message("online backup: %s\n", res.n ? res.units[0].error : err_msg());
+    assert_int_equal(st, OK);
+    assert_int_equal(res.units[0].achieved, SP_CONSIST_CRASH);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    assert_int_equal(helper_server_holds(srv), 0);
+    /* The backup job is over. */
+    assert_int_equal(system("virsh -q -c qemu:///session domjobinfo cbk-uat-v3 2>/dev/null | grep -q 'Backup'"), 256);
+    if (system("virsh -q -c qemu:///session destroy cbk-uat-v3 >/dev/null 2>&1") != 0) { /* already off */ }
+    undefine(UUID3);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, DEST "3", &ro, &rr), OK);
+    assert_true(file_is(DEST "3/.cbackup-unit/disks/vda", raw_bytes, 8 * M));
+    assert_true(file_is(DEST "3/.cbackup-unit/disks/vdb", raw_bytes, 8 * M));
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_offline_backup),
         cmocka_unit_test(test_missing_state_refused),
+        cmocka_unit_test(test_online_backup),
     };
     return cmocka_run_group_tests(tests, setup, teardown);
 }

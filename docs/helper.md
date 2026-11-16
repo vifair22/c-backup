@@ -421,7 +421,23 @@ renamed aside rather than removed by compose.
 
 Built only when libvirt's and libxml2's development files are present
 (`libvirt-dev libxml2-dev` on Debian; the CI image and Dockerfile carry
-them); the helper links `libvirt.so`, the daemon never does. Enabled by the
+them).
+
+**Dependencies.** `c-backup-helper` links `libvirt.so` (the approved
+dependency) and `libxml2`, which libvirt itself already depends on, so it
+adds no runtime package. Neither is ever linked into `c-backupd` or
+`c-backup`: the Makefile builds `src/virt` into the helper and its own
+test suites only (`ldd build/bins/c-backupd` shows neither). libxml2
+parses the domain XML because libvirt's API does not expose what the
+provider needs any other way: there is no call listing a domain's disks
+with their device kind, source type, source path, driver format and
+read-only or shared flags (`virDomainGetBlockInfo` needs the target name
+and gives sizes only), nor the `<os><nvram>` path, whether a `<tpm>`
+has an emulator backend, or the guest agent channel's connection state;
+and restore define has to rewrite the XML (name, UUID, MACs, disk sources,
+NVRAM path) before `virDomainDefineXML`. Sizes come from
+`virDomainGetBlockInfo`, state from `virDomainGetState`, the rest of the
+lifecycle from the API. Enabled by the
 policy:
 
 ```ini
