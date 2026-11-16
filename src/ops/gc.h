@@ -23,6 +23,9 @@
 
 typedef struct {
     uint64_t reachable;
+    /* File content a tree names that the repository does not hold. Nothing
+     * beneath it can be kept alive; counted so the loss is visible. */
+    uint64_t content_missing;
     uint64_t swept;
     uint64_t bytes_freed;
     /* Pack compaction, the second half of the sweep: entries surviving a

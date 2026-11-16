@@ -1393,6 +1393,7 @@ static status_t announce_pack(store_t *store, uint32_t pack_num, uint64_t size,
         ce[i].comp_size   = entries[i].compressed_size;
         ce[i].orig_size   = entries[i].uncompressed_size;
         ce[i].entry_index = entries[i].entry_index;
+        ce[i].type        = entries[i].type;
     }
     char fname[64];
     snprintf(fname, sizeof(fname), "pack-%010u.dat", pack_num);
@@ -1568,7 +1569,7 @@ status_t pack_stored_open(store_t *store, pack_stored_writer_t **out)
     pack_stored_writer_t *w = calloc(1, sizeof(*w));
     if (!w) return set_error(ERR_NOMEM, "pack_stored_open: alloc");
     w->store = store;
-    w->pack_num = next_pack_num(store);
+    w->pack_num = store_alloc_pack_num(store, next_pack_num(store));
 
     status_t st = open_new_pack(store, w->pack_num, &w->dat_f, w->dat_tmp, &w->dat_hdr);
     if (st != OK) { free(w); return st; }
@@ -1777,9 +1778,32 @@ typedef struct {
     uint32_t              packed;
     uint64_t              body_offset;
     uint32_t              pack_num;
-    uint8_t              *comp_buf;
-    int                   comp_buf_size;
+    /* Body bytes handed to writeback so far; see pw_writeback. */
+    uint64_t              wb_done;
 } pack_writer_t;
+
+/*
+ * Start writeback of what has been appended, every PACK_WB_STEP, without
+ * waiting for it. A backup can append faster than any disk takes it, and
+ * left alone the dirty pages pile up until the kernel throttles the writer
+ * and the seal's fsync writes a whole pack at once: on NVMe that made a
+ * backup of large files half as fast as the 1.0 writer, which started
+ * writeback as it went. Asking early keeps the disk busy from the first
+ * chunk; the seal's fsync still decides durability.
+ */
+#define PACK_WB_STEP ((uint64_t)8 * 1024 * 1024)
+
+static void pw_writeback(pack_writer_t *pw)
+{
+    uint64_t end = sizeof(pack_dat_hdr_t) + pw->body_offset;
+    if (!pw->dat_f || end < pw->wb_done + PACK_WB_STEP) return;
+#ifdef __linux__
+    if (fflush(pw->dat_f) != 0) return;
+    (void)sync_file_range(fileno(pw->dat_f), (off_t)pw->wb_done,
+                          (off_t)(end - pw->wb_done), SYNC_FILE_RANGE_WRITE);
+#endif
+    pw->wb_done = end;
+}
 
 static int pw_ensure_capacity(pack_writer_t *pw, uint32_t need) {
     if (need <= pw->idx_cap) return 0;
@@ -1813,6 +1837,7 @@ static status_t pw_finalize(pack_writer_t *pw) {
     pw_free_parity(pw);
     pw->packed = 0;
     pw->body_offset = 0;
+    pw->wb_done = 0;
     return st;
 }
 
@@ -1823,90 +1848,107 @@ static void pw_destroy(pack_writer_t *pw) {
     pw_free_parity(pw);
     free(pw->idx_entries);
     free(pw->entry_parity);
-    free(pw->comp_buf);
     memset(pw, 0, sizeof(*pw));
 }
 
 /*
- * Append one entry: encrypt, write, compute its parity, record its index slot.
- * This is where the on-disk format of an entry is decided.
- *
- * payload is plaintext-or-compressed and stays the caller's to free; any
- * ciphertext buffer is owned and released here.
+ * An entry ready to append: encrypted when the repository is, with its CRC
+ * and Reed-Solomon parity computed over the stored bytes. All of this is
+ * per-entry CPU work that needs nothing from the writer, so a backup does it
+ * on the chunk worker that cut the chunk (pack_backup_prepare) and the
+ * writer's lock covers only the write.
  */
-static status_t pw_emit(pack_writer_t *pw,
-                        const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
-                        uint64_t uncompressed_size,
-                        const uint8_t *payload, uint64_t compressed_size,
-                        uint8_t compression)
+typedef struct {
+    const uint8_t *payload;      /* stored bytes: payload or cipher */
+    uint64_t       stored_size;
+    uint8_t        encryption;
+    uint8_t       *cipher;       /* owned */
+    uint32_t       payload_crc;
+    uint8_t       *rs_buf;       /* owned until appended */
+    size_t         rs_par_sz;
+} sealed_entry_t;
+
+static void sealed_free(sealed_entry_t *e)
 {
-    const object_aead_key_t *key = store_aead_key(pw->store);
+    free(e->cipher);
+    free(e->rs_buf);
+    e->cipher = NULL;
+    e->rs_buf = NULL;
+}
 
-    /*
-     * Encrypt last, so parity and the CRC below cover ciphertext and a scrub
-     * of an offsite copy needs no key. Compressing first and encrypting after
-     * is the only order that works: ciphertext does not compress.
-     *
-     * A fresh random nonce per encryption (object_encrypt), and the entry's
-     * type and name as associated data, so this ciphertext authenticates
-     * only as this object.
-     */
-    uint8_t  encryption = ENCRYPT_NONE;
-    uint8_t *cipher     = NULL;
+/*
+ * Encrypt last, so parity and the CRC cover ciphertext and a scrub of an
+ * offsite copy needs no key. Compressing first and encrypting after is the
+ * only order that works: ciphertext does not compress.
+ *
+ * A fresh random nonce per encryption (object_encrypt), and the entry's
+ * type and name as associated data, so this ciphertext authenticates only
+ * as this object. payload stays the caller's.
+ */
+static status_t entry_seal(const object_aead_key_t *key, uint8_t type,
+                           const uint8_t hash[OBJECT_HASH_SIZE],
+                           const uint8_t *payload, uint64_t compressed_size,
+                           sealed_entry_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->payload     = payload;
+    out->stored_size = compressed_size;
+    out->encryption  = ENCRYPT_NONE;
     if (key) {
-        cipher = malloc((size_t)compressed_size + OBJECT_CRYPT_OVERHEAD);
-        if (!cipher) return set_error(ERR_NOMEM, "pack: ciphertext buffer");
-        status_t est = object_encrypt(key, type, hash, payload, (size_t)compressed_size,
-                                      cipher);
-        if (est != OK) { free(cipher); return est; }
-        payload          = cipher;
-        compressed_size += OBJECT_CRYPT_OVERHEAD;
-        encryption       = ENCRYPT_CHACHA20;
+        out->cipher = malloc((size_t)compressed_size + OBJECT_CRYPT_OVERHEAD);
+        if (!out->cipher) return set_error(ERR_NOMEM, "pack: ciphertext buffer");
+        status_t est = object_encrypt(key, type, hash, payload,
+                                      (size_t)compressed_size, out->cipher);
+        if (est != OK) { sealed_free(out); return est; }
+        out->payload     = out->cipher;
+        out->stored_size = compressed_size + OBJECT_CRYPT_OVERHEAD;
+        out->encryption  = ENCRYPT_CHACHA20;
     }
+    size_t csize = (size_t)out->stored_size;
+    if (csize > 0) {
+        out->payload_crc = crc32c(out->payload, csize);
+        out->rs_par_sz = rs_parity_size(csize);
+        out->rs_buf = malloc(out->rs_par_sz);
+        if (!out->rs_buf) {
+            sealed_free(out);
+            return set_error(ERR_NOMEM, "pack: parity buffer");
+        }
+        rs_parity_encode(out->payload, csize, out->rs_buf);
+    }
+    return OK;
+}
 
+/*
+ * Append a sealed entry and record its index slot; the writer takes its
+ * parity buffer. This is where the on-disk format of an entry is decided.
+ */
+static status_t pw_append_sealed(pack_writer_t *pw,
+                                 const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
+                                 uint64_t uncompressed_size, uint8_t compression,
+                                 sealed_entry_t *se)
+{
     pack_dat_entry_hdr_t ehdr;
     memcpy(ehdr.hash, hash, OBJECT_HASH_SIZE);
     ehdr.type              = type;
     ehdr.compression       = compression;
-    ehdr.encryption        = encryption;
+    ehdr.encryption        = se->encryption;
     ehdr.uncompressed_size = uncompressed_size;
-    ehdr.compressed_size   = compressed_size;
-    if (entry_hdr_out_of_bounds(&ehdr)) {
-        free(cipher);
+    ehdr.compressed_size   = se->stored_size;
+    if (entry_hdr_out_of_bounds(&ehdr))
         return set_error(ERR_TOO_LARGE, "pack: entry of %llu bytes is past the object bound",
                          (unsigned long long)uncompressed_size);
-    }
 
-    if (pw_ensure_capacity(pw, pw->packed + 1) != 0) {
-        free(cipher);
+    if (pw_ensure_capacity(pw, pw->packed + 1) != 0)
         return set_error(ERR_NOMEM, "pack: entry array");
-    }
 
-    size_t csize = (size_t)compressed_size;
     parity_record_t hdr_par;
     parity_record_compute(&ehdr, sizeof(ehdr), &hdr_par);
 
-    uint32_t payload_crc = 0;
-    uint8_t *rs_buf = NULL;
-    size_t rs_par_sz = 0;
-    if (csize > 0) {
-        payload_crc = crc32c(payload, csize);
-        rs_par_sz = rs_parity_size(csize);
-        rs_buf = malloc(rs_par_sz);
-        if (!rs_buf) {
-            free(cipher);
-            return set_error(ERR_NOMEM, "pack: parity buffer");
-        }
-        rs_parity_encode(payload, csize, rs_buf);
-    }
-
+    size_t csize = (size_t)se->stored_size;
     uint64_t dat_off = sizeof(pack_dat_hdr_t) + pw->body_offset;
     if (fwrite(&ehdr, sizeof(ehdr), 1, pw->dat_f) != 1 ||
-        (csize && fwrite_full(payload, csize, pw->dat_f) != 0)) {
-        free(cipher);
-        free(rs_buf);
+        (csize && fwrite_full(se->payload, csize, pw->dat_f) != 0))
         return set_error_errno(ERR_IO, "pack: write entry to %s", pw->dat_tmp);
-    }
 
     /*
      * entry_index is the on-disk entry position, not the position this entry
@@ -1922,18 +1964,34 @@ static status_t pw_emit(pack_writer_t *pw,
     pw->idx_entries[pw->packed].compression       = ehdr.compression;
     pw->idx_entries[pw->packed].encryption        = ehdr.encryption;
     pw->idx_entries[pw->packed].uncompressed_size = ehdr.uncompressed_size;
-    pw->idx_entries[pw->packed].compressed_size   = compressed_size;
+    pw->idx_entries[pw->packed].compressed_size   = se->stored_size;
 
     pw->entry_parity[pw->packed].hdr_par     = hdr_par;
-    pw->entry_parity[pw->packed].payload_crc = payload_crc;
-    pw->entry_parity[pw->packed].rs_parity   = rs_buf;
-    pw->entry_parity[pw->packed].rs_par_sz   = rs_par_sz;
+    pw->entry_parity[pw->packed].payload_crc = se->payload_crc;
+    pw->entry_parity[pw->packed].rs_parity   = se->rs_buf;
+    pw->entry_parity[pw->packed].rs_par_sz   = se->rs_par_sz;
+    se->rs_buf = NULL;
 
-    pw->body_offset += sizeof(ehdr) + compressed_size;
+    pw->body_offset += sizeof(ehdr) + se->stored_size;
     pw->packed++;
-
-    free(cipher);
+    pw_writeback(pw);
     return OK;
+}
+
+/* Seal and append in one step, on the writer's thread. */
+static status_t pw_emit(pack_writer_t *pw,
+                        const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
+                        uint64_t uncompressed_size,
+                        const uint8_t *payload, uint64_t compressed_size,
+                        uint8_t compression)
+{
+    sealed_entry_t se;
+    status_t st = entry_seal(store_aead_key(pw->store), type, hash, payload,
+                             compressed_size, &se);
+    if (st != OK) return st;
+    st = pw_append_sealed(pw, hash, type, uncompressed_size, compression, &se);
+    sealed_free(&se);
+    return st;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1947,6 +2005,42 @@ struct pack_backup_writer {
 };
 
 /*
+ * The calling thread's compression scratch, freed when the thread exits.
+ * Chunk workers come and go with every backup; a plain _Thread_local
+ * pointer leaked one buffer per worker per backup.
+ */
+typedef struct {
+    uint8_t *buf;
+    int      cap;
+} comp_scratch_t;
+
+static pthread_key_t  g_comp_key;
+static pthread_once_t g_comp_once = PTHREAD_ONCE_INIT;
+
+static void comp_scratch_free(void *p)
+{
+    comp_scratch_t *c = p;
+    if (!c) return;
+    free(c->buf);
+    free(c);
+}
+
+static void comp_key_init(void)
+{
+    (void)pthread_key_create(&g_comp_key, comp_scratch_free);
+}
+
+static comp_scratch_t *comp_scratch(void)
+{
+    pthread_once(&g_comp_once, comp_key_init);
+    comp_scratch_t *c = pthread_getspecific(g_comp_key);
+    if (c) return c;
+    c = calloc(1, sizeof(*c));
+    if (c && pthread_setspecific(g_comp_key, c) != 0) { free(c); c = NULL; }
+    return c;
+}
+
+/*
  * Decide compression for a plaintext buffer (design constraint 4).
  *
  * A 64 KiB LZ4 probe first: incompressible content (video, audio, already
@@ -1955,12 +2049,13 @@ struct pack_backup_writer {
  * bounded, so the bail-out is per object - for a large file, per chunk -
  * and needs no second look inside an entry. A compressed result is kept
  * only when it is smaller than the input, which is also what the reader's
- * bound on stored size relies on.
+ * bound on stored size relies on. The scratch is the calling thread's own,
+ * so chunk workers compress at once.
  *
  * On return *out points at either the caller's buffer or *owned, which the
  * caller frees.
  */
-static void pb_compress(pack_writer_t *pw, const uint8_t *in, uint64_t len,
+static void pb_compress(const uint8_t *in, uint64_t len,
                         const uint8_t **out, uint64_t *out_len,
                         uint8_t *out_compression, uint8_t **owned)
 {
@@ -1972,18 +2067,28 @@ static void pb_compress(pack_writer_t *pw, const uint8_t *in, uint64_t len,
     /* Under 4 KiB the entry header costs more than the codec saves. */
     if (len < 4096 || len > OBJECT_MAX_BYTES) return;
 
+    int bound = LZ4_compressBound((int)len);
+    comp_scratch_t *cs = comp_scratch();
+    if (!cs) return;                     /* stored uncompressed, still correct */
+    if (bound > cs->cap) {
+        uint8_t *nb = realloc(cs->buf, (size_t)bound);
+        if (!nb) return;
+        cs->buf = nb;
+        cs->cap = bound;
+    }
+
     int sample_len = (len > PACK_PROBE_SIZE) ? PACK_PROBE_SIZE : (int)len;
-    int sc = LZ4_compress_default((const char *)in, (char *)pw->comp_buf,
-                                  sample_len, pw->comp_buf_size);
+    int sc = LZ4_compress_default((const char *)in, (char *)cs->buf,
+                                  sample_len, cs->cap);
     if (sc <= 0 || (double)sc / (double)sample_len > PACK_PROBE_RATIO) return;
 
-    int csz = LZ4_compress_default((const char *)in, (char *)pw->comp_buf,
-                                   (int)len, pw->comp_buf_size);
+    int csz = LZ4_compress_default((const char *)in, (char *)cs->buf,
+                                   (int)len, cs->cap);
     if (csz <= 0 || (uint64_t)csz >= len) return;
 
     uint8_t *copy = malloc((size_t)csz);
     if (!copy) return;
-    memcpy(copy, pw->comp_buf, (size_t)csz);
+    memcpy(copy, cs->buf, (size_t)csz);
     *owned           = copy;
     *out             = copy;
     *out_len         = (uint64_t)csz;
@@ -2005,12 +2110,6 @@ status_t pack_backup_open(store_t *store, pack_backup_writer_t **out)
     if (!w) return set_error(ERR_NOMEM, "pack_backup_open: alloc");
 
     w->pw.store = store;
-    w->pw.comp_buf_size = LZ4_compressBound((int)OBJECT_MAX_BYTES);
-    w->pw.comp_buf = malloc((size_t)w->pw.comp_buf_size);
-    if (!w->pw.comp_buf) {
-        free(w);
-        return set_error(ERR_NOMEM, "pack_backup_open: compression buffer");
-    }
 
     rs_init();
     *out = w;
@@ -2021,9 +2120,10 @@ status_t pack_backup_open(store_t *store, pack_backup_writer_t **out)
 static status_t pb_ensure_open(pack_backup_writer_t *w)
 {
     if (w->pw.dat_f) return OK;
-    w->pw.pack_num = next_pack_num(w->pw.store);
+    w->pw.pack_num = store_alloc_pack_num(w->pw.store, next_pack_num(w->pw.store));
     w->pw.packed = 0;
     w->pw.body_offset = 0;
+    w->pw.wb_done = 0;
     return open_new_pack(w->pw.store, w->pw.pack_num, &w->pw.dat_f,
                          w->pw.dat_tmp, &w->pw.dat_hdr);
 }
@@ -2054,6 +2154,61 @@ status_t pack_backup_rollover(pack_backup_writer_t *w)
     return OK;
 }
 
+/*
+ * The CPU half of staging an object, which needs no writer and no lock: the
+ * name, the 64 KiB probe and, if it pays, LZ4. Content-defined chunking runs
+ * this on its worker threads so one large file is not one core, and hands
+ * the result to pack_backup_add_prepared under the writer's lock.
+ */
+status_t pack_backup_prepare_plain(uint8_t type, const void *data, size_t len,
+                                   pack_prepared_t *out)
+{
+    if (!out || (!data && len))
+        return set_error(ERR_INVALID, "pack_backup_prepare: null argument");
+    memset(out, 0, sizeof(*out));
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "pack_backup_prepare: " OBJECT_TYPE_UNKNOWN_FMT, type);
+    if (len > OBJECT_MAX_BYTES)
+        return set_error(ERR_TOO_LARGE,
+                         "pack_backup_prepare: %zu bytes is past the %llu-byte object bound",
+                         len, (unsigned long long)OBJECT_MAX_BYTES);
+
+    out->type = type;
+    out->len  = len;
+    out->data = data;
+    object_name(type, data, len, out->hash);
+    pb_compress(data, (uint64_t)len, &out->payload, &out->payload_len,
+                &out->compression, &out->owned);
+    return OK;
+}
+
+/* And the rest of the CPU work: encryption, CRC and parity (entry_seal). */
+status_t pack_backup_prepare(store_t *store, uint8_t type, const void *data,
+                             size_t len, pack_prepared_t *out)
+{
+    status_t st = pack_backup_prepare_plain(type, data, len, out);
+    if (st != OK || !store) return st;
+    sealed_entry_t *se = calloc(1, sizeof(*se));
+    if (!se) { pack_prepared_free(out); return set_error(ERR_NOMEM, "pack_backup_prepare: seal"); }
+    st = entry_seal(store_aead_key(store), type, out->hash, out->payload,
+                    out->payload_len, se);
+    if (st != OK) { free(se); pack_prepared_free(out); return st; }
+    out->sealed = se;
+    return OK;
+}
+
+void pack_prepared_free(pack_prepared_t *p)
+{
+    if (!p) return;
+    if (p->sealed) {
+        sealed_free(p->sealed);
+        free(p->sealed);
+        p->sealed = NULL;
+    }
+    free(p->owned);
+    p->owned = NULL;
+}
+
 status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
                          const void *data, size_t len,
                          uint8_t out_hash[OBJECT_HASH_SIZE],
@@ -2061,17 +2216,40 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
                          uint64_t *out_payload_size)
 {
     if (!w || (!data && len)) return set_error(ERR_INVALID, "pack_backup_add: null argument");
+    if (out_is_new)       *out_is_new = 0;
+    if (out_phys_bytes)   *out_phys_bytes = 0;
+    if (out_payload_size) *out_payload_size = len;
+
+    /*
+     * Named before anything else, so an object already staged or stored
+     * costs only its hash: probing and compressing it again would be work
+     * thrown away.
+     */
     if (!object_type_known(type))
         return set_error(ERR_INVALID, "pack_backup_add: " OBJECT_TYPE_UNKNOWN_FMT, type);
     if (len > OBJECT_MAX_BYTES)
         return set_error(ERR_TOO_LARGE,
                          "pack_backup_add: %zu bytes is past the %llu-byte object bound",
                          len, (unsigned long long)OBJECT_MAX_BYTES);
-
     object_name(type, data, len, out_hash);
-    if (out_is_new)        *out_is_new = 0;
-    if (out_payload_size)  *out_payload_size = len;
-    if (out_phys_bytes)    *out_phys_bytes = 0;
+    if (staged_set_contains(&w->seen, w->pw.idx_entries, out_hash)) return OK;
+    if (pack_object_exists(w->pw.store, out_hash)) return OK;
+
+    pack_prepared_t pp;
+    status_t st = pack_backup_prepare_plain(type, data, len, &pp);
+    if (st != OK) return st;
+    st = pack_backup_add_prepared(w, &pp, out_is_new, out_phys_bytes);
+    pack_prepared_free(&pp);
+    return st;
+}
+
+status_t pack_backup_add_prepared(pack_backup_writer_t *w, const pack_prepared_t *pp,
+                                  int *out_is_new, uint64_t *out_phys_bytes)
+{
+    if (!w || !pp) return set_error(ERR_INVALID, "pack_backup_add_prepared: null argument");
+    const uint8_t *out_hash = pp->hash;
+    if (out_is_new)     *out_is_new = 0;
+    if (out_phys_bytes) *out_phys_bytes = 0;
 
     /*
      * Staged first, then the repository. An object written into the pack this
@@ -2094,23 +2272,20 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
     if (w->pw.dat_f && w->pw.packed > 0 &&
         (w->pw.packed >= PACK_MAX_ENTRIES ||
          sizeof(pack_dat_hdr_t) + w->pw.body_offset + sizeof(pack_dat_entry_hdr_t) +
-             (uint64_t)len + OBJECT_CRYPT_OVERHEAD > PACK_MAX_BYTES))
+             (uint64_t)pp->len + OBJECT_CRYPT_OVERHEAD > PACK_MAX_BYTES))
         return set_error(ERR_INVALID, "pack_backup_add: pack is at its bound; "
                          "roll over before adding");
 
     status_t st = pb_ensure_open(w);
     if (st != OK) return st;
 
-    const uint8_t *payload = NULL;
-    uint64_t payload_len = 0;
-    uint8_t compression = COMPRESS_NONE;
-    uint8_t *owned = NULL;
-    pb_compress(&w->pw, data, (uint64_t)len, &payload, &payload_len,
-                &compression, &owned);
-
     uint32_t slot = w->pw.packed;
-    st = pw_emit(&w->pw, out_hash, type, (uint64_t)len, payload, payload_len, compression);
-    free(owned);
+    if (pp->sealed)
+        st = pw_append_sealed(&w->pw, out_hash, pp->type, (uint64_t)pp->len,
+                              pp->compression, pp->sealed);
+    else
+        st = pw_emit(&w->pw, out_hash, pp->type, (uint64_t)pp->len,
+                     pp->payload, pp->payload_len, pp->compression);
     if (st != OK) return st;
 
     /* Keep the set no more than half full, so probing stays short. */

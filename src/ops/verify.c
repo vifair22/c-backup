@@ -2,6 +2,8 @@
 
 #include "verify.h"
 
+#include "chunklist.h"
+#include "read_budget.h"
 #include "object.h"
 #include "pack.h"
 #include "parity.h"
@@ -238,10 +240,13 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
 static status_t read_whole_object(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                                   uint64_t *out_bytes)
 {
-    void  *data = NULL;
-    size_t len  = 0;
-    status_t st = object_load(store, hash, &data, &len, NULL);
+    /* One object in flight, held to the daemon's read budget. */
+    void    *data = NULL;
+    size_t   len  = 0;
+    uint64_t taken = 0;
+    status_t st = object_load_budgeted(store, hash, &data, &len, NULL, &taken);
     free(data);
+    read_budget_release(taken);
     if (st == OK && out_bytes) *out_bytes = (uint64_t)len;
     return st;
 }
@@ -268,6 +273,111 @@ static int pack_file_missing(store_t *store, int64_t pack_id)
     struct stat sb;
     if (stat(path, &sb) == 0) return 0;
     return errno == ENOENT || errno == ENOTDIR;
+}
+
+/* Hashes the per-object pass found lost, sorted for the list pass. */
+typedef struct {
+    uint8_t *h;
+    size_t   n, cap;
+} hash_vec_t;
+
+static void hv_add(hash_vec_t *v, const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    if (v->n == v->cap) {
+        size_t nc = v->cap ? v->cap * 2 : 64;
+        uint8_t *t = realloc(v->h, nc * OBJECT_HASH_SIZE);
+        if (!t) return;   /* the list pass then misses one attribution, no more */
+        v->h = t;
+        v->cap = nc;
+    }
+    memcpy(v->h + v->n++ * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
+}
+
+static int hash_cmp_raw(const void *a, const void *b)
+{
+    return memcmp(a, b, OBJECT_HASH_SIZE);
+}
+
+static int hv_has(const hash_vec_t *v, const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    return v->n && bsearch(hash, v->h, v->n, OBJECT_HASH_SIZE, hash_cmp_raw) != NULL;
+}
+
+static void hash_to_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
+{
+    object_hash_to_hex(h, out);
+}
+
+/*
+ * Chunk lists, after every object has been checked on its own (format 3).
+ *
+ * Two things the per-object pass cannot see. A chunk or sub-list the index
+ * has no row for is never visited by it, so a list naming an object that is
+ * not there would pass. And a lost chunk is found by its own hash, which no
+ * node names: the file it belongs to is named by its list, so the finding
+ * would say "no node references it" and the blast radius would leave out
+ * the file that is actually gone. So every list a node names is walked; an
+ * object it names that does not exist is missing, and a list with anything
+ * lost beneath it is recorded as a finding of its own, which is what maps
+ * the loss onto paths and snapshots.
+ */
+static status_t verify_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
+                             verify_result_t *res, hash_vec_t *lost,
+                             atomic_int *cancel)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *roots = NULL;
+    if (db_execute(db,
+            "SELECT DISTINCT n.content_hash FROM nodes n"
+            "  JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
+            " WHERE n.repo_id = ? AND o.type = 6",
+            (const char *[]){ repo, NULL }, &roots) != 0) {
+        db_result_free(roots);
+        return set_error(ERR_IO, "verify: cannot list chunk lists");
+    }
+    if (lost->n) qsort(lost->h, lost->n, OBJECT_HASH_SIZE, hash_cmp_raw);
+
+    obj_loader_t ld = obj_loader_store(store);
+    status_t st = OK;
+    for (int i = 0; roots && i < roots->nrows && st == OK; i++) {
+        uint8_t root[OBJECT_HASH_SIZE];
+        hex_to_hash(roots->rows[i][0], root);
+        /* A damaged list is already a finding under its own hash, which
+         * nodes name directly. */
+        if (hv_has(lost, root)) continue;
+
+        const char *why = NULL;
+        chunklist_iter_t *it = NULL;
+        status_t ist = chunklist_iter_open(&ld, root, OBJECT_TYPE_FILE, 1, NULL, &it);
+        for (int done = 0; ist == OK && !done; ) {
+            if (cancel_requested(cancel)) { st = set_error(ERR_BUSY, "verify cancelled"); break; }
+            chunklist_item_t x;
+            ist = chunklist_iter_next(it, &x, &done);
+            if (ist != OK || done) break;
+            if (hv_has(lost, x.hash)) {
+                why = "contains a lost chunk";
+                if (x.is_list) chunklist_iter_skip(it);
+            } else if (!object_exists(store, x.hash)) {
+                char hex[OBJECT_HASH_SIZE * 2 + 1];
+                hash_to_hex(x.hash, hex);
+                res->missing++;
+                record_finding(db, repo_id, res->run_id, hex, "missing");
+                why = "contains a lost chunk";
+                if (x.is_list) chunklist_iter_skip(it);
+            }
+        }
+        chunklist_iter_close(it);
+        if (st != OK) break;
+        if (ist != OK) {
+            err_clear();
+            res->unrecoverable++;
+            why = "chunk list unreadable";
+        }
+        if (why) record_finding(db, repo_id, res->run_id, roots->rows[i][0], why);
+    }
+    db_result_free(roots);
+    return st;
 }
 
 status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -358,6 +468,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     uint64_t total = (uint64_t)objs->nrows;
     status_t st = OK;
+    hash_vec_t lost = { 0 };
 
     /* Rows arrive grouped by pack, so remembering the last pack's answer
      * stats each pack file once rather than once per object. */
@@ -392,6 +503,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         if ((packed && cur_pack_missing) || !object_exists(store, hash)) {
             res.missing++;
             record_finding(db, repo_id, res.run_id, hex, "missing");
+            hv_add(&lost, hash);
             continue;
         }
         if (level == VERIFY_LEVEL_INDEX) { res.ok++; continue; }
@@ -403,6 +515,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 err_clear();
                 res.unrecoverable++;
                 record_finding(db, repo_id, res.run_id, hex, "unreadable header");
+                hv_add(&lost, hash);
             } else {
                 res.ok++;
             }
@@ -441,6 +554,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 /* The read corrects from parity in memory, so a read that
                  * still fails is beyond parity: loss. */
                 record_finding(db, repo_id, res.run_id, hex, "unrecoverable");
+                hv_add(&lost, hash);
             }
             continue;
         }
@@ -480,12 +594,21 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         } else if (after.uncorrectable > before.uncorrectable) {
             res.unrecoverable++;
             record_finding(db, repo_id, res.run_id, hex, "uncorrectable parity");
+            hv_add(&lost, hash);
         } else {
             res.ok++;
         }
     }
 
     db_result_free(objs);
+
+    /* Structure and deep both read headers or more, which is what walking a
+     * list needs; without the key its payload cannot be read at all. */
+    if (st == OK && level != VERIFY_LEVEL_INDEX && !store_needs_key(store)) {
+        if (progress) progress("chunk lists", total, total, progress_ctx);
+        st = verify_lists(store, db, repo_id, &res, &lost, cancel);
+    }
+    free(lost.h);
 
     if (res.unrecoverable || res.missing)
         run_blast_radius(db, repo_id, res.run_id,

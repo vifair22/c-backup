@@ -39,6 +39,15 @@ typedef struct {
      * counts crawl through large files and say little about how far a
      * backup has to go; bytes do. */
     void (*bytes_cb)(void *ctx, uint64_t done, uint64_t total);
+
+    /*
+     * Chunk workers for files over 16 MiB (cdc.h), a quarter of which also
+     * read and cut whole files at once when there are several (store_pool.h).
+     * 0 picks a number from the CPUs and memory available
+     * (store_pool_plan); 1 stores every chunk on the backup thread. The
+     * snapshot is byte-identical either way.
+     */
+    unsigned     store_workers;
 } backup_opts_t;
 
 typedef struct {
@@ -56,8 +65,8 @@ typedef struct {
     /* Stored bytes (compressed, encrypted) this run added to the repository
      * for new file content. Everything else was already there. */
     uint64_t bytes_stored;
-    /* Threads that stored file content: 1 until the chunker's workers are
-     * wired in. */
+    /* Chunk workers the run used for files over 16 MiB: 1 when every chunk
+     * was stored on the backup thread. */
     unsigned store_workers;
     /*
      * Index transactions committed, by the phase that held them: the store

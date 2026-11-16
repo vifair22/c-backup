@@ -3,6 +3,8 @@
 
 #include "grep.h"
 
+#include "chunklist.h"
+#include "read_budget.h"
 #include "object.h"
 
 #include <cutils/log.h>
@@ -346,6 +348,25 @@ static void scan_buffer(grep_ctx_t *g, const char *buf, size_t len,
     }
 }
 
+/* content_stream's consumer: scan, and stop the walk (with ERR_BUSY, which
+ * the caller translates) on a cancel or once the file needs no more. */
+typedef struct {
+    grep_ctx_t *g;
+    char       *carry;
+    size_t     *carry_len;
+    int         stopped;    /* 1 = file done, 2 = cancelled */
+} scan_emit_t;
+
+static status_t scan_emit(void *ctx, const void *data, size_t len)
+{
+    scan_emit_t *se = ctx;
+    if (cancel_requested(se->g->cancel)) { se->stopped = 2; return ERR_BUSY; }
+    scan_buffer(se->g, data, len, se->carry, se->carry_len);
+    se->g->res->bytes_scanned += len;
+    if (se->g->file_done) { se->stopped = 1; return ERR_BUSY; }
+    return OK;
+}
+
 /*
  * Search one object. Returns 1 if the file matched at least once.
  *
@@ -357,9 +378,6 @@ static void scan_buffer(grep_ctx_t *g, const char *buf, size_t len,
  * or the hit caps can stop the scan at once (V3-NOTE-1). For a file stored
  * as a chunk list the same holds per chunk, so the walk may stop at the cap
  * without reading the rest.
- *
- * TODO(CDC): a CHUNKLIST content hash is walked with content_stream, which
- * the chunker's readers provide; until they land it is skipped and named.
  */
 static int scan_object(grep_ctx_t *g, store_t *store,
                        const uint8_t hash[OBJECT_HASH_SIZE], uint64_t size,
@@ -379,32 +397,39 @@ static int scan_object(grep_ctx_t *g, store_t *store,
     if (!carry) { discard_file(g, path, "out of memory"); return 0; }
     size_t carry_len = 0;
 
-    uint8_t type = 0;
-    char    why[ERR_MSG_MAX] = "";
-    void   *data = NULL;
-    size_t  len  = 0;
+    /*
+     * One FILE object or a chunk list, chunk by chunk, each hash-checked
+     * and type-checked before it is handed over, so every byte matched here
+     * is verified and the walk can stop as soon as nothing more is worth
+     * scanning. A chunk that fails later still discards the file's held
+     * matches below. Each chunk is held to the read budget while scanned.
+     */
+    char why[ERR_MSG_MAX] = "";
+    scan_emit_t se = { g, carry, &carry_len, 0 };
     err_clear();
-    status_t lst = object_load(store, hash, &data, &len, &type);
-    if (lst != OK) {
-        snprintf(why, sizeof(why), "%s", err_msg());
-        err_clear();
-    } else if (type != OBJECT_TYPE_FILE) {
-        lst = ERR_CORRUPT;
-        snprintf(why, sizeof(why), "object is of type %u, not file content", type);
-    } else {
-        scan_buffer(g, data, len, carry, &carry_len);
-        g->res->bytes_scanned += len;
-        /* A final line with no trailing newline still counts. */
-        if (carry_len && !g->file_done) {
-            carry[carry_len] = '\0';
-            g->line_no++;
-            if (line_matches(g->re, carry, carry_len))
-                record_hit(g, g->line_no, carry, carry_len);
-        }
+    status_t lst = content_stream(store, hash, scan_emit, &se, NULL);
+    int cancelled = 0;
+    if (lst == ERR_BUSY && se.stopped == 2) { cancelled = 1; lst = OK; }
+    else if (lst == ERR_BUSY && se.stopped == 1) lst = OK;
+    if (lst != OK) { snprintf(why, sizeof(why), "%s", err_msg()); err_clear(); }
+
+    /* A final line with no trailing newline still counts. */
+    if (lst == OK && !cancelled && carry_len && !g->file_done) {
+        carry[carry_len] = '\0';
+        g->line_no++;
+        if (line_matches(g->re, carry, carry_len))
+            record_hit(g, g->line_no, carry, carry_len);
     }
-    free(data);
     free(carry);
 
+    if (cancelled) {
+        /* Not verified, and not a finding about the file either: the
+         * search stops and the run says it did not complete. */
+        g->file_hits = 0;
+        g->file_capped = 0;
+        g->stop_all = 0;
+        return 0;
+    }
     if (lst != OK) {
         if (!why[0]) snprintf(why, sizeof(why), "could not be read (status %d)", (int)lst);
         discard_file(g, path, why);

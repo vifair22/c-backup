@@ -4,6 +4,7 @@
 
 #include "gc.h"
 
+#include "chunklist.h"
 #include "manifest.h"
 #include "object.h"
 #include "pack.h"
@@ -51,18 +52,123 @@ typedef struct {
     gc_result_t *res;
 } mark_ctx_t;
 
-static status_t mark_object(mark_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_SIZE])
+/*
+ * Count one reference. *out_count gets the refcount after it and *out_type
+ * the type the index records (both 0 when the index has no row for the
+ * hash). Marks start from zero, so a count of 1 means this run has just
+ * reached the object for the first time, which is what lets chunk lists be
+ * walked once per run without holding a visited set.
+ */
+static status_t mark_object_ex(mark_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_SIZE],
+                               int64_t *out_count, uint8_t *out_type)
 {
+    if (out_count) *out_count = 0;
+    if (out_type) *out_type = 0;
     if (hash_is_zero(hash)) return OK;
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_hex(hash, hex);
-    if (db_execute_non_query(ctx->db,
+    db_result_t *r = NULL;
+    if (db_execute(ctx->db,
             "UPDATE objects SET refcount = refcount + 1"
-            " WHERE repo_id = ? AND hash = ?",
-            (const char *[]){ ctx->repo, hex, NULL }, NULL) != 0)
+            " WHERE repo_id = ? AND hash = ? RETURNING refcount, type",
+            (const char *[]){ ctx->repo, hex, NULL }, &r) != 0)
         return set_error(ERR_IO, "gc: cannot mark object");
+    if (r && r->nrows > 0) {
+        /* An empty string is c-utils' NULL (CLAUDE.md); strtoll gives 0. */
+        if (out_count) *out_count = strtoll(r->rows[0][0], NULL, 10);
+        if (out_type) *out_type = (uint8_t)strtoul(r->rows[0][1], NULL, 10);
+    }
+    db_result_free(r);
     ctx->res->reachable++;
     return OK;
+}
+
+static status_t mark_object(mark_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    return mark_object_ex(ctx, hash, NULL, NULL);
+}
+
+/*
+ * A file's content, which in format 3 may be a chunk list (chunklist.h).
+ *
+ * The content object itself is counted on every reference, like any other.
+ * What a list names - sub-lists and chunks - is counted only the first time
+ * this run reaches the list: a list shared by every snapshot of an
+ * unchanged file would otherwise have its chunks walked once per snapshot,
+ * an index write per chunk per snapshot. A chunk's count is therefore the
+ * number of distinct lists naming it, never zero while any live list does,
+ * which is the only property the sweep reads.
+ *
+ * Whether the content is a list comes from the index row, which every
+ * writer records with the object's real type (the name includes it). The
+ * repository is asked instead when there is no row, and when the row says
+ * FILE for content larger than any single object can be: that row is wrong,
+ * and believing it would sweep every chunk of the file.
+ */
+static status_t mark_content(mark_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_SIZE],
+                             uint64_t node_size, atomic_int *cancel)
+{
+    if (hash_is_zero(hash)) return OK;
+    int64_t n = 0;
+    uint8_t type = 0;
+    status_t st = mark_object_ex(ctx, hash, &n, &type);
+    if (st != OK) return st;
+    if (n > 1) return OK;               /* walked earlier in this run */
+
+    if (type == 0 || (type == OBJECT_TYPE_FILE && node_size > OBJECT_MAX_BYTES)) {
+        uint64_t size = 0;
+        st = object_get_info(ctx->store, hash, &size, &type);
+        if (st == ERR_NOT_FOUND) {
+            /* Absent from the repository: nothing beneath it can be read
+             * or restored either, so there is nothing to keep alive. */
+            err_clear();
+            ctx->res->content_missing++;
+            return OK;
+        }
+        if (st != OK)
+            return set_error(ERR_CORRUPT, "gc: cannot read file content (%s), "
+                             "refusing to sweep", err_msg());
+    }
+    if (type != OBJECT_TYPE_CHUNKLIST) return OK;
+
+    obj_loader_t ld = obj_loader_store(ctx->store);
+    chunklist_iter_t *it = NULL;
+    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 1, NULL, &it);
+    for (int done = 0; st == OK && !done; ) {
+        chunklist_item_t x;
+        st = chunklist_iter_next(it, &x, &done);
+        if (st != OK || done) break;
+        if (cancel_requested(cancel)) { st = set_error(ERR_BUSY, "gc cancelled"); break; }
+        int64_t c = 0;
+        st = mark_object_ex(ctx, x.hash, &c, NULL);
+        /* A sub-list reached before (from another file's list) has had its
+         * subtree marked already. A missing row (c == 0) is walked: it
+         * cannot be told apart from a first visit. */
+        if (st == OK && x.is_list && c > 1) chunklist_iter_skip(it);
+    }
+    chunklist_iter_close(it);
+    if (st == ERR_BUSY) return st;
+    if (st != OK)
+        return set_error(ERR_CORRUPT, "gc: cannot read chunk list (%s), "
+                         "refusing to sweep", err_msg());
+    return OK;
+}
+
+/* manifest_iter's report of every object a directory consists of. The root
+ * is marked by mark_tree itself; fragments and tree lists are marked here,
+ * once per visit of the directory, as trees are. */
+typedef struct {
+    mark_ctx_t *ctx;
+    const uint8_t *root;
+    status_t st;
+} dir_objs_t;
+
+static void mark_dir_object(void *arg, const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type)
+{
+    (void)type;
+    dir_objs_t *d = arg;
+    if (d->st != OK || !memcmp(hash, d->root, OBJECT_HASH_SIZE)) return;
+    d->st = mark_object(d->ctx, hash);
 }
 
 /*
@@ -81,29 +187,46 @@ static status_t mark_tree(mark_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HASH_S
     status_t st = mark_object(ctx, tree_hash);
     if (st != OK) return st;
 
-    manifest_entry_t *entries = NULL;
-    uint32_t count = 0;
-    st = manifest_read_tree(ctx->store, tree_hash, &entries, &count);
-    if (st != OK) {
-        /* An unreadable tree is a damaged repository. Marking stops rather
-         * than continuing, because sweeping on an incomplete mark would
-         * delete live objects: the one failure mode GC must never have. */
+    /*
+     * One fragment at a time (OWN-34): a directory of any size is read in
+     * bounded pieces, and every fragment and tree list it consists of is
+     * marked as it is loaded. An unreadable tree is a damaged repository.
+     * Marking stops rather than continuing, because sweeping on an
+     * incomplete mark would delete live objects: the one failure mode GC
+     * must never have.
+     */
+    obj_loader_t ld = obj_loader_store(ctx->store);
+    dir_objs_t dobj = { ctx, tree_hash, OK };
+    manifest_iter_t *it = NULL;
+    st = manifest_iter_open(&ld, tree_hash, mark_dir_object, &dobj, &it);
+    if (st != OK)
         return set_error(ERR_CORRUPT, "gc: cannot read tree, refusing to sweep");
-    }
 
-    for (uint32_t i = 0; i < count && st == OK; i++) {
-        manifest_entry_t *e = &entries[i];
+    for (;;) {
+        const manifest_entry_t *e = NULL;
+        int done = 0;
+        st = manifest_iter_next(it, &e, &done);
+        if (st != OK) {
+            st = set_error(ERR_CORRUPT, "gc: cannot read tree, refusing to sweep");
+            break;
+        }
+        if (dobj.st != OK) { st = dobj.st; break; }
+        if (done) break;
         if (e->type == NODE_TYPE_DIR) {
             if (!hash_is_zero(e->target_hash))
                 st = mark_tree(ctx, e->target_hash, cancel, depth + 1);
+        } else if (e->type == NODE_TYPE_REG) {
+            st = mark_content(ctx, e->target_hash, e->size, cancel);
         } else {
             st = mark_object(ctx, e->target_hash);
         }
         if (st == OK) st = mark_object(ctx, e->xattr_hash);
         if (st == OK) st = mark_object(ctx, e->acl_hash);
+        if (st != OK) break;
     }
 
-    manifest_free_entries(entries, count);
+    manifest_iter_close(it);
+    if (st == OK) st = dobj.st;
     return st;
 }
 

@@ -28,6 +28,7 @@
 #include <cmocka.h>
 
 #include "store.h"
+#include "chunklist.h"
 #include "object.h"
 #include "pack.h"
 #include "types.h"
@@ -223,17 +224,27 @@ static void test_sparse_file_roundtrip(void **state)
     assert_int_equal(info.is_new, 1);
     assert_int_equal(info.payload_size, fsize);
 
+    /* A chunk list with the hole as a gap, which reads back as zeroes. */
     uint8_t *dense = calloc(1, (size_t)fsize);
     assert_non_null(dense);
     memcpy(dense, head, strlen(head));
     memcpy(dense + 8 * 1024 * 1024, tail, strlen(tail));
-    uint8_t want[OBJECT_HASH_SIZE];
-    object_name(OBJECT_TYPE_FILE, dense, (size_t)fsize, want);
-    assert_memory_equal(hash, want, OBJECT_HASH_SIZE);
+    uint64_t osz = 0;
+    uint8_t otype = 0;
+    assert_int_equal(object_get_info(st, hash, &osz, &otype), OK);
+    assert_int_equal(otype, OBJECT_TYPE_CHUNKLIST);
 
-    void *out = NULL; size_t out_len = 0;
-    assert_int_equal(object_load(st, hash, &out, &out_len, NULL), OK);
-    assert_int_equal(out_len, (size_t)fsize);
+    char dst[] = TEST_TMP "/c_backup_test_store_sparse_out.XXXXXX";
+    int ofd = mkstemp(dst);
+    assert_true(ofd >= 0);
+    uint64_t got = 0;
+    assert_int_equal(content_restore_fd(st, hash, ofd, &got), OK);
+    assert_int_equal(got, fsize);
+    uint8_t *out = malloc((size_t)fsize);
+    assert_non_null(out);
+    assert_int_equal(pread(ofd, out, (size_t)fsize, 0), (ssize_t)fsize);
+    close(ofd);
+    unlink(dst);
     assert_memory_equal(out, dense, (size_t)fsize);
     free(out);
     free(dense);
@@ -360,7 +371,7 @@ static void test_pack_commit_cb_registration(void **state)
     commit_probe_t probe = { 0 };
     store_set_pack_commit_cb(st, probe_commit, &probe);
 
-    pack_commit_entry_t e = { { 0 }, 128, 10, 20, 0 };
+    pack_commit_entry_t e = { { 0 }, 128, 10, 20, 0, OBJECT_TYPE_FILE };
     pack_commit_info_t info = {
         .pack_id = 3, .filename = "pack-0000000003.dat",
         .size = 999, .entry_count = 1, .entries = &e,

@@ -19,7 +19,7 @@ printf 'the quick brown fox\n%.0s' $(seq 1 200) > "$W/src/compressible.txt"
 head -c 40000 /dev/urandom                      > "$W/src/incompressible.bin"
 echo "small"                                    > "$W/src/sub/small.txt"
 ln -s compressible.txt "$W/src/link"
-# A file with a hole, read as data until the chunker records holes.
+# A file with a hole, which the chunker records as a gap in a chunk list.
 dd if=/dev/zero of="$W/src/sparse.bin" bs=1 count=0 seek=1048576 2>/dev/null
 printf 'data at the end' | dd of="$W/src/sparse.bin" bs=1 seek=1048000 conv=notrunc 2>/dev/null
 setfattr -n user.seed -v "seedvalue" "$W/src/sub/small.txt" 2>/dev/null || true

@@ -8,6 +8,7 @@
 #include "store.h"
 
 #include <cutils/json.h>
+#include <stdbool.h>
 #include <cutils/log.h>
 
 #include <dirent.h>
@@ -72,7 +73,13 @@ status_t repo_store_open(const char *path, const store_config_t *cfg,
         *out = NULL;
         return st;
     }
-    if (m.enc_mode == REPO_ENC_NONE) return OK;
+    if (m.enc_mode == REPO_ENC_NONE) {
+        cdc_params_t cp;
+        st = repo_marker_cdc(&m, NULL, &cp);
+        if (st == OK) st = store_set_cdc(*out, &cp);
+        if (st != OK) { store_close(*out); *out = NULL; }
+        return st;
+    }
 
     store_set_encrypted(*out, 1);
 
@@ -93,8 +100,13 @@ status_t repo_store_open(const char *path, const store_config_t *cfg,
                          "(marker says %s)", m.uuid, repo_key_dir(), m.key_id);
     }
     store_set_key(*out, &k);
+    cdc_params_t cp;
+    st = repo_marker_cdc(&m, &k, &cp);
+    if (st == OK) st = store_set_cdc(*out, &cp);
+    OPENSSL_cleanse(&cp, sizeof(cp));
     repo_key_wipe(&k);
-    return OK;
+    if (st != OK) { store_close(*out); *out = NULL; }
+    return st;
 }
 
 status_t repo_store_open_keyed(const char *path, const store_config_t *cfg,
@@ -197,6 +209,14 @@ status_t repo_format_check(const char *path, const repo_marker_t *m)
         return set_error(ERR_INVALID,
                          "%s: chunker sizes min %u avg %u max %u are outside the "
                          "format's bounds", path, m->cdc_min, m->cdc_avg, m->cdc_max);
+    /* And the chunker's own checks, so the marker and the code that cuts
+     * with its constants can never disagree about what is usable. */
+    cdc_params_t probe;
+    if (cdc_params_init(&probe, m->cdc_min, m->cdc_avg, m->cdc_max, NULL) != OK) {
+        char why[ERR_MSG_MAX];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        return set_error(ERR_INVALID, "%s: %s", path, why);
+    }
     int encrypted = m->enc_mode != REPO_ENC_NONE;
     if (m->cdc_keyed < 0 || m->cdc_keyed != encrypted)
         return set_error(ERR_INVALID,
@@ -1080,4 +1100,15 @@ status_t repo_deregister(cutils_db_t *db, int64_t repo_id)
     if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "cannot delete repo %lld: commit", (long long)repo_id);
     return OK;
+}
+
+status_t repo_marker_cdc(const repo_marker_t *m, const repo_key_t *key,
+                         cdc_params_t *out)
+{
+    if (!m || !out) return set_error(ERR_INVALID, "repo_marker_cdc: null argument");
+    if (m->enc_mode != REPO_ENC_NONE && !key)
+        return set_error(ERR_INVALID, "repository %s is encrypted: its chunk "
+                         "boundaries need its key", m->uuid);
+    return cdc_params_init(out, m->cdc_min, m->cdc_avg, m->cdc_max,
+                           m->enc_mode != REPO_ENC_NONE ? key->key : NULL);
 }

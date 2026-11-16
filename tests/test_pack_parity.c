@@ -578,8 +578,8 @@ static void test_stored_writer_refuses_what_no_reader_opens(void **state)
 
     /* An object type every reader refuses (OWN-39): 0 and 9 came through
      * before, and fuzz_pack_stored found the first; 4 was the retired
-     * sparse type, which format 3 does not read. */
-    const uint8_t bad_types[] = { 0, 4, 9 };
+     * sparse type, which format 3 does not read; 7 is past the last. */
+    const uint8_t bad_types[] = { 0, 4, 7, 9 };
     for (size_t i = 0; i < sizeof(bad_types); i++) {
         err_clear();
         assert_int_not_equal(pack_stored_add(w, hash, bad_types[i], COMPRESS_NONE,

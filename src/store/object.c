@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "object.h"
 #include "object_crypt.h"
+#include "cdc.h"
+#include "chunklist.h"
 #include "pack.h"
 #include "util.h"
 #include <cutils/log.h>
@@ -153,65 +155,61 @@ status_t object_store_packed(store_t *store, uint8_t type,
     return st;
 }
 
+/* The sink object_store_file_packed hands the chunker. */
+typedef struct {
+    store_t                   *store;
+    struct pack_backup_writer *pack_w;
+} file_sink_ctx_t;
+
+static status_t file_sink_put(void *ctx, uint8_t type, const void *data,
+                              size_t len, obj_put_t *out)
+{
+    file_sink_ctx_t *c = ctx;
+    object_write_t w;
+    memset(&w, 0, sizeof(w));
+    status_t st = object_store_packed(c->store, type, data, len, c->pack_w,
+                                      out->hash, &w);
+    out->is_new     = w.is_new;
+    out->phys_bytes = w.phys_bytes;
+    return st;
+}
+
+static int file_store_cancelled(void *ctx)
+{
+    return store_cancelled((const store_t *)ctx);
+}
+
 status_t object_store_file_packed(store_t *store, int fd, uint64_t file_size,
                                   struct pack_backup_writer *pack_w,
                                   uint8_t out_hash[OBJECT_HASH_SIZE],
                                   object_write_t *out_info)
 {
     /*
-     * TODO(CDC): a file larger than one object is a chunk list of
-     * content-defined chunks, stored by the chunker (cdc_store_fd), which
-     * lands with the chunker's wiring. Until then such a file is refused
-     * here rather than written as an object past the bound: nothing may
-     * ever store one, and every reader refuses one.
+     * Through the chunker, whatever the size, so this and a backup always
+     * give one file the same content hash: one FILE object when the chunker
+     * finds no cut and there are no holes, a chunk list otherwise.
      */
-    if (file_size > OBJECT_MAX_BYTES)
-        return set_error(ERR_TOO_LARGE,
-                         "file of %llu bytes is larger than one object (%llu); "
-                         "storing it needs content-defined chunking",
-                         (unsigned long long)file_size,
-                         (unsigned long long)OBJECT_MAX_BYTES);
-
-    uint8_t *buf = malloc(file_size ? (size_t)file_size : 1);
-    if (!buf) return set_error(ERR_NOMEM, "object_store_file: %llu-byte buffer",
-                               (unsigned long long)file_size);
-    size_t done = 0;
-    unsigned transient = 0;
-    while (done < (size_t)file_size) {
-        if (store_cancelled(store)) {
-            free(buf);
-            return set_error(ERR_BUSY, "object_store_file: cancelled");
-        }
-        ssize_t r = pread(fd, buf + done, (size_t)file_size - done, (off_t)done);
-        if (r < 0 && errno == EINTR) continue;
-        /* FUSE and network sources (an Unraid share, NFS) fail a read now
-         * and then and succeed on the next; pread restarts at the same
-         * offset, so a short wait and a retry is all recovery needs. */
-        if (r < 0 && (errno == EIO || errno == ENXIO || errno == EAGAIN) &&
-            transient < OBJECT_READ_RETRIES) {
-            transient++;
-            log_warn("object_store_file: transient read error (%s) at offset %zu, "
-                     "retry %u/%u", strerror(errno), done, transient, OBJECT_READ_RETRIES);
-            struct timespec ts = { 0, 100L * 1000L * 1000L * (long)transient };
-            nanosleep(&ts, NULL);
-            continue;
-        }
-        if (r < 0) {
-            free(buf);
-            return set_error_errno(ERR_IO, "object_store_file: read");
-        }
-        if (r == 0) {
-            free(buf);
-            return set_error(ERR_IO, "object_store_file: file shrank to %zu of %llu bytes "
-                             "while being read", done, (unsigned long long)file_size);
-        }
-        done += (size_t)r;
-        store_io_progress(store, (uint64_t)r);
+    const cdc_params_t *cp = store_cdc(store);
+    if (!cp)
+        return set_error(ERR_INVALID, "repository is encrypted and no key is "
+                         "loaded: its chunk boundaries need the key");
+    file_sink_ctx_t ctx = { store, pack_w };
+    obj_sink_t sink = { .put = file_sink_put, .ctx = &ctx };
+    cdc_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.unbudgeted = 1;     /* a tool's write, not a daemon reader */
+    opts.cancelled = file_store_cancelled;   /* the handle's flag, between reads */
+    opts.cancelled_ctx = store;
+    cdc_result_t r;
+    status_t st = cdc_store_fd(cp, fd, file_size, &sink, &opts, &r);
+    if (st != OK) return st;
+    memcpy(out_hash, r.hash, OBJECT_HASH_SIZE);
+    if (out_info) {
+        out_info->is_new       = r.chunks_new + r.lists.lists_new > 0;
+        out_info->phys_bytes   = r.phys_new;
+        out_info->payload_size = file_size;
     }
-    status_t st = object_store_packed(store, OBJECT_TYPE_FILE, buf, (size_t)file_size,
-                                      pack_w, out_hash, out_info);
-    free(buf);
-    return st;
+    return OK;
 }
 
 /* ------------------------------------------------------------------ */

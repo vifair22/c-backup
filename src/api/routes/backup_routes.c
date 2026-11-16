@@ -42,6 +42,19 @@ static backup_ctx_t g_ctx;
 /* backup.file_cache_match, parsed once at start. */
 static int g_file_cache_match = FILE_CACHE_MATCH_AUTO;
 
+/* backup.store_workers, read once at start. */
+static unsigned g_store_workers;
+
+void routes_backup_set_store_workers(unsigned n)
+{
+    g_store_workers = n;
+}
+
+unsigned routes_backup_store_workers(void)
+{
+    return g_store_workers;
+}
+
 void routes_backup_set_file_cache_match(int mode)
 {
     g_file_cache_match = mode;
@@ -184,6 +197,7 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     o.file_cache_match = g_file_cache_match;
     o.label        = j->label;
     o.cancel       = cancel;
+    o.store_workers = g_store_workers;
     o.progress_cb  = progress;
     o.progress_ctx = progress_ctx;
     o.bytes_cb     = job_progress_bytes;

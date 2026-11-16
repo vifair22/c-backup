@@ -69,10 +69,13 @@ status_t object_store_packed(store_t *store, uint8_t type,
                              object_write_t *out_info);
 
 /*
- * Store file_size bytes of fd as one OBJECT_TYPE_FILE object. A file larger
- * than OBJECT_MAX_BYTES is ERR_TOO_LARGE: it is a chunk list, which the
- * chunker stores. Reads with pread; fd's offset is untouched. A file that
- * turns out shorter than file_size is ERR_IO.
+ * Store file_size bytes of fd as file content, through the chunker
+ * (cdc_store_fd) with the store's chunking parameters: one OBJECT_TYPE_FILE
+ * object when there is no cut and no hole, a chunk list otherwise, exactly
+ * what a backup stores for the same file. Every chunk goes through
+ * object_store_packed. Reads with pread; fd's offset is untouched. A file
+ * that turns out shorter than file_size is ERR_IO. out_info's payload_size
+ * is the file's length.
  */
 status_t object_store_file_packed(store_t *store, int fd, uint64_t file_size,
                                   struct pack_backup_writer *pack_w,

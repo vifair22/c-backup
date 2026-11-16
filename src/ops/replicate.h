@@ -39,14 +39,15 @@
  * Encryption is fixed when a repository is created, so changing it - adding
  * it, dropping it, moving to a new key - means copying into a new
  * repository. A sink opened for re-encryption is that path: the target is
- * an existing repository with an identity and key of its own, and each
- * object is decrypted with the source key and encrypted under the target's
- * (or left plaintext, for an unencrypted target) on its way across.
- * Compression is untouched, and so are hashes: they are of the plaintext,
- * so the object graph, the tree hashes and every dedup decision carry over
- * unchanged. This is deliberately not the untrusted-target mode: the
- * process doing it holds both keys, which is why it is a separate opening
- * rather than a flag a replica could be talked into.
+ * an existing repository with an identity and key of its own. Its chunk
+ * boundaries are keyed from its key (format 3), so its content cannot be
+ * the source's chunks: every file is reassembled from the source and cut
+ * again with the target's parameters, every tree is rebuilt, and objects
+ * are written from plaintext under the target's key (see RE-CHUNKING on
+ * the vtable). The snapshot's root at the target is therefore not the
+ * source's. This is deliberately not the untrusted-target mode: the process
+ * doing it holds both keys, which is why it is a separate opening rather
+ * than a flag a replica could be talked into.
  *
  * WHAT IS ASKED FOR
  *
@@ -173,6 +174,35 @@ typedef struct {
      * snapshot is already durable, so anything still staged here is an
      * optimisation for the next run at most. */
     void (*close)(void *ctx);
+
+    /*
+     * RE-CHUNKING (format 3). Optional: a sink that leaves these NULL only
+     * ever receives objects as stored.
+     *
+     * Chunk boundaries are a function of the repository's chunker constants
+     * and of its key (the gear table is keyed, cdc.h). A target whose
+     * parameters differ from the source's - another key, encrypted from
+     * plain or plain from encrypted, other constants - would hold the
+     * source's chunks cut where its own backups never cut, so its future
+     * backups would deduplicate against none of them, and its lists and
+     * trees would name objects its own chunker cannot produce. So for such
+     * a target file content is reassembled from the source and chunked
+     * again with the target's parameters, and every tree above it is
+     * rebuilt; the snapshot's root at the target is therefore a different
+     * hash from the source's.
+     *
+     * target_cdc: the target's parameters, compared with the source's to
+     * decide which mode a run is in. put_plain: store one plaintext object
+     * the target names and seals itself (compress, encrypt, parity), the
+     * "put (type, bytes) -> name" contract. has_snapshot_at: a re-chunked
+     * snapshot's target root cannot be known without rebuilding it, so a
+     * run asks by id and timestamp instead.
+     */
+    const struct cdc_params *(*target_cdc)(void *ctx);
+    status_t (*put_plain)(void *ctx, uint8_t type, const void *data, size_t len,
+                          uint8_t out_hash[OBJECT_HASH_SIZE], int *out_is_new);
+    status_t (*has_snapshot_at)(void *ctx, int64_t snapshot_id, int64_t ts,
+                                int *out_present);
 } replica_sink_vtbl_t;
 
 typedef struct {
@@ -182,11 +212,6 @@ typedef struct {
      * end up holding ciphertext under two different keys. Empty for an
      * unencrypted repository. */
     char                       key_id[64];
-    /* Set only by replica_sink_local_open_reencrypt: objects are decrypted
-     * with the source key and re-encrypted under dst_key, or written as
-     * plaintext when dst_key is NULL. The key belongs to the sink. */
-    int                        reencrypt;
-    const repo_key_t          *dst_key;
 } replica_sink_t;
 
 #define REPLICATE_DAMAGED_LIST_MAX 100u
@@ -203,6 +228,16 @@ typedef struct {
     uint64_t objects_sent;
     uint64_t bytes_sent;          /* stored bytes, so what crossed the link */
     uint64_t subtrees_skipped;    /* trees present, and everything beneath */
+
+    /* Re-chunking runs (see the vtable): files reassembled and cut again,
+     * trees rebuilt, and objects that turned out to be new at the target. */
+    int      rechunked;
+    uint64_t files_rechunked;
+    uint64_t trees_rebuilt;
+    uint64_t objects_written;
+    /* The root the target holds for the last tree transferred: the
+     * source's in a copying run, the rebuilt one in a re-chunking run. */
+    uint8_t  target_root[OBJECT_HASH_SIZE];
 
     /*
      * Objects sent damaged beyond parity (OWN-31). The run ships them and

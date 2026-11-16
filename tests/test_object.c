@@ -251,8 +251,9 @@ static void test_object_bound_on_write(void **state) {
     free(buf);
 }
 
-/* A file larger than one object is the chunker's; until it is wired in the
- * whole-file store refuses it rather than writing past the bound. */
+/* A file larger than one object goes through the chunker and comes back as
+ * a chunk list, never as an object past the bound; a small one is one FILE
+ * object. */
 static void test_file_past_the_bound_is_refused(void **state) {
     (void)state;
     char path[] = TEST_TMP "/c_backup_test_object_big.XXXXXX";
@@ -262,8 +263,13 @@ static void test_file_past_the_bound_is_refused(void **state) {
     uint8_t h[OBJECT_HASH_SIZE];
     object_write_t w = { 0 };
     assert_int_equal(object_store_file_packed(store, fd, OBJECT_MAX_BYTES + 1, NULL, h, &w),
-                     ERR_TOO_LARGE);
-    err_clear();
+                     OK);
+    assert_int_equal(w.payload_size, OBJECT_MAX_BYTES + 1);
+    uint64_t osz = 0;
+    uint8_t otype = 0;
+    assert_int_equal(object_get_info(store, h, &osz, &otype), OK);
+    assert_int_equal(otype, OBJECT_TYPE_CHUNKLIST);
+    assert_true(osz < OBJECT_MAX_BYTES);
     assert_int_equal(ftruncate(fd, 4096), 0);
     assert_int_equal(object_store_file_packed(store, fd, 4096, NULL, h, &w), OK);
     assert_int_equal(w.is_new, 1);
