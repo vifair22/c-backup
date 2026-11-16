@@ -23,3 +23,15 @@ void fake_index_reset(void);
 
 /* How many objects the store has announced as packed. */
 size_t fake_index_count(void);
+
+/*
+ * Durability, for power-cut tests. The real index commits to a WAL that
+ * reaches the disk only when synced; this keeps a second copy of the rows
+ * for what has been. The store's index-sync callback copies the live rows
+ * to it (unless fake_index_sync_gate, when set, returns non-OK: a power
+ * cut has happened), mark_durable does so directly, and crash throws the
+ * live rows away for the durable ones.
+ */
+void fake_index_mark_durable(void);
+void fake_index_crash(void);
+extern status_t (*fake_index_sync_gate)(void);
