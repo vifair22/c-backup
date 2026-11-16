@@ -269,11 +269,35 @@ export async function timed(
   budget: number,
   action: () => Promise<void>,
 ): Promise<number> {
+  const ms = await clock(action)
+  record(label, ms, budget)
+  return ms
+}
+
+/* How long an action takes, without putting it in the report. For a figure
+ * built from several runs, which is recorded once as the figure. */
+export async function clock(action: () => Promise<void>): Promise<number> {
   const started = Date.now()
   await action()
-  const ms = Date.now() - started
+  return Date.now() - started
+}
+
+export function record(label: string, ms: number, budget: number): void {
   timings.push({ label, ms, budget })
-  return ms
+}
+
+/*
+ * The middle of several runs.
+ *
+ * One sample on a shared CI runner measures the runner as much as the app:
+ * the ui-e2e job runs alongside other heavy jobs, and a single slow
+ * scheduling slice turned a 250 ms search into 631 ms (FLAKE-11). The median
+ * of five ignores up to two such slices, and the first, cold run with them.
+ */
+export function median(samples: number[]): number {
+  const s = [...samples].sort((a, b) => a - b)
+  const mid = s.length >> 1
+  return s.length % 2 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2)
 }
 
 /* Printed as a table at the end of a run, so a regression is visible as a
