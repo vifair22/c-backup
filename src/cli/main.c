@@ -466,6 +466,8 @@ static int cmd_repo(int argc, char **argv)
         if (a < 2)
             return fail("usage: repo add <path> [label] "
                         "[--encrypt system|passphrase|none] [--passphrase TEXT]");
+        if (a > 2 && snapshot_label_check(v[2]) != 0)
+            return fail("%s", SNAPSHOT_LABEL_RULE);
         sbuf_t b = { 0 };
         sb_puts(&b, "{\"path\":");
         sb_json_str(&b, v[1]);

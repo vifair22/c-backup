@@ -1194,6 +1194,21 @@ contains "a trailing slash is the same repository" '"id":1,"already_registered":
     "$(repo_post_body "{\"path\":\"$WORK/repo/\"}")"
 contains "and the label survives an empty one" '"label":"renamed"' "$(sock_body /repos/1)"
 
+# B116: a repository label follows the snapshot label rule (OWN-33). Both
+# of these registered with a 201 and were listed as given.
+check "a 257-byte repository label is refused" \
+    '{"error":"label must be at most 256 bytes of printable text"} 400' \
+    "$(sock_send POST /repos "{\"path\":\"$WORK/lbl257\",\"label\":\"$(head -c 257 /dev/zero | tr '\0' a)\"}")"
+check "a repository label with a newline is refused" \
+    '{"error":"label must be at most 256 bytes of printable text"} 400' \
+    "$(sock_send POST /repos "{\"path\":\"$WORK/lblnl\",\"label\":\"a\\nb\"}")"
+check "and neither left a directory behind" "absent absent" \
+    "$([ -e "$WORK/lbl257" ] && echo present || echo absent) $([ -e "$WORK/lblnl" ] && echo present || echo absent)"
+check "a relabel is held to the rule too" \
+    '{"error":"label must be at most 256 bytes of printable text"} 400' \
+    "$(sock_send POST /repos "{\"path\":\"$WORK/repo\",\"label\":\"a\\tb\"}")"
+contains "and leaves the label alone" '"label":"renamed"' "$(sock_body /repos/1)"
+
 echo "remote"
 # The same operations the desktop app drives, over TCP with a token, after
 # the socket did the setup.

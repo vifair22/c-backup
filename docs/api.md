@@ -217,7 +217,7 @@ host always has a way in.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/repos` | List |
-| POST | `/repos` | Register: `{path, label}` |
+| POST | `/repos` | Register: `{path, label}`; `label` follows the snapshot label rule (at most 256 bytes of printable UTF-8) |
 | GET | `/repos/<id>` | One repository, the same object as each entry of the list |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it. `{"removed":true,"id"}` |
 

@@ -557,6 +557,9 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
   that differs from the stored one replaces it; leaving the label out keeps
   the old one. Asking for an encryption mode the repository does not have is
   refused: encryption is fixed when a repository is created.
+- A label is at most 256 bytes of UTF-8 text with no control characters,
+  the same rule as a snapshot label; anything else is refused with HTTP 400
+  before anything is created.
 - Paths are stored normalised: `/srv/backup/main/` and
   `/srv/backup//main` are both `/srv/backup/main`.
 - A non-empty directory without a marker is refused. Writing objects into
