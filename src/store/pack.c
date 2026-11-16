@@ -701,7 +701,7 @@ static int locate_entry_parity(FILE *f, uint32_t entry_index, entry_parity_t *ou
     if (file_end < 0) return -1;
     if (!pack_file_parity_fits((uint64_t)file_end)) {
         log_warn("pack: %llu-byte pack is past where its 32-bit parity sizes can be "
-                 "trusted; parity not applied (OWN-30)", (unsigned long long)file_end);
+                 "trusted; parity not applied", (unsigned long long)file_end);
         return -1;
     }
     off_t trailer_start = file_end - (off_t)pftr.trailer_size;

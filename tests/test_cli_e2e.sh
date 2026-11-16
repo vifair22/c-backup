@@ -663,6 +663,7 @@ check    "and creates nothing" 1 "$([ -e "$WORK/syspass" ]; echo $?)"
 
 # Removing a repository deregisters it and leaves its data where it was.
 RM_ID=$(cb repo add "$WORK/gone" gone | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+cb backup "$RM_ID" "$WORK/src" >/dev/null
 OUT=$(cb repo remove "$RM_ID"); RC=$?
 check    "repo remove" 0 "$RC"
 check    "repo remove prints what it removed" "{\"removed\":true,\"id\":$RM_ID}" "$OUT"
@@ -677,6 +678,29 @@ else
     bad "a removed repository's id is not reused" "greater than $RM_ID" "${NEXT_ID:-none}"
 fi
 cb repo remove "$NEXT_ID" >/dev/null 2>&1
+
+# NIT-16: registering a repository that already holds snapshots listed none,
+# and verify passed with "checked 0", until a manual reindex. Registration
+# now queues the reindex itself, as origin "register".
+OUT=$(cb repo add "$WORK/gone" back)
+contains "re-adding a repository with snapshots counts them" '"snapshots_unindexed":1' "$OUT"
+contains "and queues a reindex" '"reindex_job":' "$OUT"
+BACK_ID=$(printf '%s' "$OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+RJ=$(printf '%s' "$OUT" | sed -n 's/.*"reindex_job":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 100); do
+    cb jobs "$RJ" | grep -q '"state":"completed"' && break
+    sleep 0.1
+done
+contains "the reindex completes" '"state":"completed"' "$(cb jobs "$RJ")"
+contains "and records who asked" '"origin":"register"' "$(cb jobs "$RJ")"
+contains "the snapshot is listed without a manual reindex" '"id":1,' "$(cb snapshots "$BACK_ID")"
+contains "the journal names the registration" '"source":"register"' "$(cb journal "$BACK_ID")"
+OUT=$(cb repo add "$WORK/gone" back)
+case "$OUT" in
+    *reindex_job*) bad "re-adding an indexed repository queues nothing" "no reindex_job" "$OUT" ;;
+    *) ok "re-adding an indexed repository queues nothing" ;;
+esac
+cb repo remove "$BACK_ID" >/dev/null 2>&1
 
 # Data written into an encrypted repository has to actually be encrypted.
 # Everything above this tests key management, which was all working while the
@@ -756,9 +780,15 @@ OUT=$(cb repo add "$WORK/passrepo" pass2 --passphrase 'correct horse' 2>&1); RC=
 check    "the right passphrase unlocks a registered repo" 0 "$RC"
 contains "and says it did" '"key_unlocked":true' "$OUT"
 check    "and caches the key" 0 "$([ -f "$WORK/keys/$PASS_UUID.key" ]; echo $?)"
-REINDEX_OUT=$(cb reindex "$PASS_ID")
-contains "the unlocked repo reindexes" '"completed"' "$REINDEX_OUT"
-contains "and the job says the tag came back" '"tags_restored":1' "$REINDEX_OUT"
+# NIT-16: with the key loaded, the registration reindexes it unasked.
+PRJ=$(printf '%s' "$OUT" | sed -n 's/.*"reindex_job":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 100); do
+    cb jobs "$PRJ" | grep -q '"state":"completed"' && break
+    sleep 0.1
+done
+contains "the unlocked repo reindexes" '"completed"' "$(cb jobs "$PRJ")"
+contains "and the job says the tag came back" '"tags_restored":1' "$(cb jobs "$PRJ")"
+contains "a manual reindex still runs" '"completed"' "$(cb reindex "$PASS_ID")"
 contains "the tag survives losing its database rows" 'guard' "$(cb tag list "$PASS_ID")"
 contains "and lists its snapshot" '"id":1,' "$(cb snapshots "$PASS_ID")"
 # B047: a reindexed snapshot listed "size":"", which is null now that a

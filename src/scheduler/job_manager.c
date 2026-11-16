@@ -20,6 +20,9 @@ typedef struct {
     /* The schedule that submitted it, or 0 for a submission over the API.
      * Decides the journal entry's source; see job_submit_scheduled. */
     int64_t  schedule_id;
+    /* Who asked when no schedule did: "api", or "register" for the reindex
+     * a repository registration queues itself. A string literal. */
+    const char *origin;
     char    *action;
     time_t   started_at;
     job_fn   fn;
@@ -104,11 +107,12 @@ void job_manager_set_alerts(job_manager_t *jm, int enabled)
  * "daemon", so a scheduled run and a manual one could not be told apart.
  */
 static void journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
-                        const char *action, const char *outcome,
+                        const char *origin, const char *action, const char *outcome,
                         int64_t took_ms, const char *message)
 {
     if (schedule_id <= 0) {
-        journal_record(db, repo_id, "api", action, outcome, took_ms, message);
+        journal_record(db, repo_id, origin && *origin ? origin : "api", action,
+                       outcome, took_ms, message);
         return;
     }
     char msg[ERR_MSG_MAX + 64];
@@ -123,7 +127,8 @@ static void journal_interrupted(cutils_db_t *db)
 {
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT COALESCE(repo_id, 0), action, COALESCE(schedule_id, 0)"
+            "SELECT COALESCE(repo_id, 0), action, COALESCE(schedule_id, 0),"
+            "       COALESCE(origin, 'api')"
             "  FROM jobs WHERE state IN ('running','queued') ORDER BY id",
             NULL, &r) != 0) {
         db_result_free(r);
@@ -136,7 +141,7 @@ static void journal_interrupted(cutils_db_t *db)
         /* Duration 0: when the process died is not known, and the time
          * since the job started would count the downtime as work. */
         journal_job(db, repo_id, strtoll(r->rows[i][2], NULL, 10),
-                    r->rows[i][1], "failed", 0, "interrupted by daemon restart");
+                    r->rows[i][3], r->rows[i][1], "failed", 0, "interrupted by daemon restart");
     }
     if (r && r->nrows > 0)
         log_warn("job manager: %d job(s) were interrupted by the last shutdown "
@@ -659,7 +664,7 @@ static void *worker_main(void *arg)
             /* A success journalled an empty message, so the entry for a
              * retention pass could not say what it deleted - the one thing
              * anybody reading a journal of deletions wants. */
-            journal_job(jm->db, slot.repo_id, slot.schedule_id, slot.action,
+            journal_job(jm->db, slot.repo_id, slot.schedule_id, slot.origin, slot.action,
                         outcome, took, st == OK ? pc.summary : detail);
             pthread_mutex_unlock(&jm->db_mu);
         }
@@ -813,7 +818,8 @@ static void finish_unstarted(job_manager_t *jm, job_slot_t *taken)
              (long long)taken->job_id, taken->action, (long long)taken->repo_id);
     if (taken->repo_id > 0) {
         pthread_mutex_lock(&jm->db_mu);
-        journal_job(jm->db, taken->repo_id, taken->schedule_id, taken->action,
+        journal_job(jm->db, taken->repo_id, taken->schedule_id, taken->origin,
+                    taken->action,
                     "cancelled", 0, "cancelled before it started");
         pthread_mutex_unlock(&jm->db_mu);
     }
@@ -891,12 +897,35 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
                              schedule_id, fn, arg, arg_free, out_job_id);
 }
 
+static status_t submit_core(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                            const char *action, const char *params_json,
+                            int64_t schedule_id, const char *origin, job_fn fn,
+                            void *arg, void (*arg_free)(void *), int64_t *out_job_id);
+
 status_t job_submit_locked(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
                            const char *action, const char *params_json,
                            int64_t schedule_id, job_fn fn, void *arg,
                            void (*arg_free)(void *), int64_t *out_job_id)
 {
-    if (!jm || !fn || !action) return set_error(ERR_INVALID, "job_submit: null argument");
+    return submit_core(jm, repo_id, lock, action, params_json, schedule_id, "api",
+                       fn, arg, arg_free, out_job_id);
+}
+
+status_t job_submit_origin(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                           const char *action, const char *origin, job_fn fn,
+                           void *arg, void (*arg_free)(void *), int64_t *out_job_id)
+{
+    return submit_core(jm, repo_id, lock, action, NULL, 0, origin, fn, arg,
+                       arg_free, out_job_id);
+}
+
+static status_t submit_core(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                            const char *action, const char *params_json,
+                            int64_t schedule_id, const char *origin, job_fn fn,
+                            void *arg, void (*arg_free)(void *), int64_t *out_job_id)
+{
+    if (!jm || !fn || !action || !origin)
+        return set_error(ERR_INVALID, "job_submit: null argument");
 
     char repo[32], sched[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -928,9 +957,9 @@ status_t job_submit_locked(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
     else
         rc = db_execute(jm->db,
             "INSERT INTO jobs (repo_id, action, params, state, origin)"
-            " VALUES (NULLIF(?, ''), ?, ?, 'queued', 'api') RETURNING id",
+            " VALUES (NULLIF(?, ''), ?, ?, 'queued', ?) RETURNING id",
             (const char *[]){ repo_id > 0 ? repo : "", action,
-                              params_json ? params_json : "", NULL }, &r);
+                              params_json ? params_json : "", origin, NULL }, &r);
     int64_t job_id = 0;
     if (rc == 0 && r && r->nrows == 1)
         job_id = strtoll(r->rows[0][0], NULL, 10);
@@ -966,6 +995,7 @@ status_t job_submit_locked(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
     s->job_id   = job_id;
     s->repo_id  = repo_id;
     s->schedule_id = schedule_id > 0 ? schedule_id : 0;
+    s->origin   = origin;
     s->action   = strdup(action);
     s->fn       = fn;
     s->arg      = arg;
