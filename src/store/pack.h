@@ -418,6 +418,36 @@ typedef struct {
 int pack_restore_headers(store_t *store, uint32_t pack_num,
                          const pack_hdr_hint_t *hints, size_t n);
 
+/* What a salvage kept and left behind. */
+#define PACK_SALVAGE_LIST_MAX 16u
+typedef struct {
+    uint64_t entries_kept;      /* every indexed entry, damaged ones included */
+    uint64_t entries_damaged;   /* of those, damaged beyond parity, carried as they were */
+    uint32_t damaged_listed;
+    uint8_t  damaged[PACK_DAMAGED_LIST_MAX][OBJECT_HASH_SIZE];
+    /* Bytes no index row covers - unreferenced entries gc had swept - and
+     * the first PACK_SALVAGE_LIST_MAX of their ranges in the old pack. */
+    uint64_t dropped_bytes;
+    uint64_t dropped_ranges;
+    uint32_t dropped_listed;
+    struct { uint64_t offset, length; } dropped[PACK_SALVAGE_LIST_MAX];
+    uint32_t first_pack;        /* the new packs: first_pack onward */
+    uint32_t packs_written;
+} pack_salvage_result_t;
+
+/*
+ * The way out for a pack that cannot be walked and whose damaged headers
+ * cannot all be rebuilt, because some belong to entries with no index row.
+ * Copies every entry the index names, located by its indexed offset rather
+ * than by walking, into new packs through gc's rewrite path (install, rows,
+ * .deleting marker, removal, unlink), and drops the rest: bytes no row
+ * covers, which are unreferenced. An indexed entry damaged beyond parity
+ * is carried as it is and listed, so its loss is still reported while the
+ * pack stops being unwalkable. hints are the pack's index rows.
+ */
+status_t pack_salvage(store_t *store, uint32_t pack_num, const pack_hdr_hint_t *hints,
+                      size_t n, pack_salvage_result_t *out);
+
 /* pack_gc, also reporting which packs it rewrote or deleted. stats may be
  * NULL, which is what pack_gc passes. */
 status_t pack_gc_stats(store_t *store,

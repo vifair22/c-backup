@@ -1315,6 +1315,22 @@ fails until it is repaired. A verify with repair rebuilds the damaged
 headers from the index - names, types and sizes are index rows, and each
 rebuilt header is written only once the pack's own header and entry CRCs
 prove it - after which verify passes and gc compacts the pack normally.
+
+When a damaged header has no index row to rebuild it from (it belonged to
+an entry gc had already swept), the repairing verify **salvages** the pack
+instead: every entry the index still names is copied, by its indexed offset,
+into a new pack through the same path gc's rewrite uses, and the old pack is
+removed. Nothing live is dropped. What is left behind is every byte no index
+row covers - the swept, unreferenced entries - reported as
+`unreferenced_dropped_bytes`, `unreferenced_dropped_ranges` and
+`unreferenced_dropped` (pack, offset and length in the old pack, the first
+16), with a `salvaged` finding for the pack. A live entry that is itself
+damaged beyond parity is carried into the new pack as it is: the pack stops
+being unwalkable, and verify goes on reporting that object as
+`unrecoverable` with its files, exactly as for damage beyond parity
+anywhere, so what remains on the report is the real loss and nothing else.
+A pack with no usable trailer is not salvaged: without its CRCs nothing can
+say which entries came through intact, so it stays reported as unwalkable.
 Checking every pack's headers costs index and structure verifies a read of
 each entry header (8 bytes of CRC table each, no payloads).
 

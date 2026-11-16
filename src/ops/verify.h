@@ -34,6 +34,8 @@ typedef enum {
     VERIFY_LEVEL_DEEP,
 } verify_level_t;
 
+#define VERIFY_DROPPED_LIST_MAX 16u
+
 typedef struct {
     uint64_t checked;
     uint64_t ok;
@@ -57,8 +59,18 @@ typedef struct {
      * leaves untouched and reports (B119): a finding at every level, and a
      * failed run, until a repairing run restores them from the index. */
     uint64_t packs_unwalkable;
-    /* Packs a repairing run made walkable again. */
+    /* Packs a repairing run made walkable again by rebuilding headers. */
     uint64_t packs_restored;
+    /* Packs a repairing run could not rebuild - a damaged header had no
+     * index row - and salvaged instead: every indexed entry copied into a
+     * new pack, damaged ones as they were (still reported as loss by a deep
+     * walk), and the bytes no row covers dropped. Those are unreferenced,
+     * garbage gc had swept; their ranges in the old pack are listed. */
+    uint64_t packs_salvaged;
+    uint64_t unreferenced_dropped_bytes;
+    uint64_t unreferenced_dropped_ranges;
+    uint32_t dropped_listed;
+    struct { uint32_t pack; uint64_t offset, length; } dropped[VERIFY_DROPPED_LIST_MAX];
     int64_t  run_id;
 } verify_result_t;
 

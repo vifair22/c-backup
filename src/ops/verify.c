@@ -83,7 +83,8 @@ static const char *level_name(verify_level_t l)
  * was touched, but nothing was lost, so they stay out of the blast radius. */
 static int status_is_loss(const char *status)
 {
-    return strcmp(status, "repaired") != 0 && strcmp(status, "recoverable") != 0;
+    return strcmp(status, "repaired") != 0 && strcmp(status, "recoverable") != 0 &&
+           strcmp(status, "salvaged") != 0;
 }
 
 /*
@@ -279,6 +280,65 @@ static int pack_file_missing(store_t *store, int64_t pack_id)
  * (pack_restore_headers proves each against the table's CRCs before
  * writing it) and walks again.
  */
+/* The pack's index rows (hash, offset, comp_size, orig_size, entry_index,
+ * type) as header hints. */
+static pack_hdr_hint_t *hints_from_rows(const db_result_t *r)
+{
+    pack_hdr_hint_t *hints = calloc((size_t)r->nrows, sizeof(*hints));
+    if (!hints) return NULL;
+    for (int i = 0; i < r->nrows; i++) {
+        hex_to_hash(r->rows[i][0], hints[i].hash);
+        hints[i].offset      = strtoull(r->rows[i][1], NULL, 10);
+        hints[i].comp_size   = strtoull(r->rows[i][2], NULL, 10);
+        hints[i].orig_size   = strtoull(r->rows[i][3], NULL, 10);
+        hints[i].entry_index = (uint32_t)strtoul(r->rows[i][4], NULL, 10);
+        hints[i].type        = (uint8_t)strtoul(r->rows[i][5], NULL, 10);
+    }
+    return hints;
+}
+
+/*
+ * Salvage an unwalkable pack whose headers cannot all be rebuilt, and say
+ * what was left behind. Every indexed entry is kept, damaged ones too (the
+ * object walk then reports their loss as for any damage beyond parity);
+ * what is dropped is what no row covers, which is garbage gc had swept.
+ */
+static status_t salvage_pack(store_t *store, cutils_db_t *db, int64_t repo_id,
+                             uint32_t pnum, const db_result_t *rows, verify_result_t *res)
+{
+    (void)db; (void)repo_id;
+    pack_hdr_hint_t *hints = hints_from_rows(rows);
+    if (!hints) return set_error(ERR_NOMEM, "verify: salvage hints");
+    pack_salvage_result_t sr;
+    status_t st = pack_salvage(store, pnum, hints, (size_t)rows->nrows, &sr);
+    free(hints);
+    if (st != OK) {
+        log_error("verify: pack-%010u.dat cannot be salvaged: %s", pnum, err_msg());
+        return st;
+    }
+    res->packs_salvaged++;
+    res->unreferenced_dropped_bytes += sr.dropped_bytes;
+    res->unreferenced_dropped_ranges += sr.dropped_ranges;
+    for (uint32_t i = 0; i < sr.dropped_listed; i++) {
+        log_warn("verify: pack-%010u.dat: dropped %llu unreferenced byte(s) at %llu",
+                 pnum, (unsigned long long)sr.dropped[i].length,
+                 (unsigned long long)sr.dropped[i].offset);
+        if (res->dropped_listed < VERIFY_DROPPED_LIST_MAX) {
+            res->dropped[res->dropped_listed].pack   = pnum;
+            res->dropped[res->dropped_listed].offset = sr.dropped[i].offset;
+            res->dropped[res->dropped_listed].length = sr.dropped[i].length;
+            res->dropped_listed++;
+        }
+    }
+    log_warn("verify: pack-%010u.dat salvaged: %llu live entr%s kept in %u new pack(s) from "
+             "pack-%010u.dat, %llu of them damaged beyond parity; %llu unreferenced byte(s) "
+             "in %llu range(s) dropped",
+             pnum, (unsigned long long)sr.entries_kept, sr.entries_kept == 1 ? "y" : "ies",
+             sr.packs_written, sr.first_pack, (unsigned long long)sr.entries_damaged,
+             (unsigned long long)sr.dropped_bytes, (unsigned long long)sr.dropped_ranges);
+    return OK;
+}
+
 static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
                              int repair, verify_result_t *res)
 {
@@ -313,22 +373,14 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
                     "    ON o.repo_id = po.repo_id AND o.hash = po.hash"
                     " WHERE po.repo_id = ? AND po.pack_id = ? ORDER BY po.offset",
                     (const char *[]){ repo, pk, NULL }, &r) == 0 && r && r->nrows > 0) {
-                pack_hdr_hint_t *hints = calloc((size_t)r->nrows, sizeof(*hints));
+                pack_hdr_hint_t *hints = hints_from_rows(r);
                 if (hints) {
-                    for (int i = 0; i < r->nrows; i++) {
-                        hex_to_hash(r->rows[i][0], hints[i].hash);
-                        hints[i].offset      = strtoull(r->rows[i][1], NULL, 10);
-                        hints[i].comp_size   = strtoull(r->rows[i][2], NULL, 10);
-                        hints[i].orig_size   = strtoull(r->rows[i][3], NULL, 10);
-                        hints[i].entry_index = (uint32_t)strtoul(r->rows[i][4], NULL, 10);
-                        hints[i].type        = (uint8_t)strtoul(r->rows[i][5], NULL, 10);
-                    }
                     (void)pack_restore_headers(store, pnum, hints, (size_t)r->nrows);
                     free(hints);
                 }
             }
-            db_result_free(r);
             if (pack_walk_check(store, pnum, why, sizeof(why)) == OK) {
+                db_result_free(r);
                 log_warn("verify: %s.dat could not be walked; its headers were restored "
                          "from the index", name);
                 res->packs_restored++;
@@ -336,6 +388,16 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
                 continue;
             }
             err_clear();
+            /* Some damaged header has no row to rebuild it from: it belonged
+             * to an entry gc already swept. Salvage the live entries into a
+             * new pack and leave the unreferenced bytes behind. */
+            if (r && r->nrows > 0 && salvage_pack(store, db, repo_id, pnum, r, res) == OK) {
+                db_result_free(r);
+                record_finding(db, repo_id, res->run_id, name, "salvaged");
+                continue;
+            }
+            err_clear();
+            db_result_free(r);
         }
         log_error("verify: %s.dat cannot be walked (%s); gc leaves it as it is", name, why);
         res->packs_unwalkable++;
@@ -385,6 +447,33 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     db_result_free(r);
 
     /*
+     * Deep verify proves the bytes by reading them and hashing the result,
+     * so it needs the plaintext and therefore the key. Without one, every
+     * object fails to read and the run reports the whole repository as
+     * unrecoverable - a healthy 49-object repository came back as 49
+     * unrecoverable objects across 42 affected files, which is worse than
+     * useless: it is an alarm that sends an operator looking for corruption
+     * that is not there.
+     *
+     * Structure level reads only headers, which are not encrypted, so it
+     * still works and is what an offsite copy can check today. Checking a
+     * payload without decrypting it is possible - parity and the CRC cover
+     * the stored bytes for exactly that reason - but no level does it yet.
+     */
+    if (level == VERIFY_LEVEL_DEEP && store_needs_key(store)) {
+        return set_error(ERR_INVALID,
+                         "deep verify reads payloads and this repository is "
+                         "encrypted with no key loaded; use level 'structure', "
+                         "which checks headers and needs no key");
+    }
+
+    /* Packs first, and before the object list is read: a salvage replaces
+     * a pack under new numbers, and the walk below must see where its
+     * objects are now. */
+    status_t pst = verify_packs(store, db, repo_id, repair, &res);
+    if (pst != OK) return pst;
+
+    /*
      * Pack order, not hash order.
      *
      * Objects inside a pack are read back in the order they were written, so
@@ -409,31 +498,8 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_IO, "verify: cannot list objects");
     }
 
-    /*
-     * Deep verify proves the bytes by reading them and hashing the result,
-     * so it needs the plaintext and therefore the key. Without one, every
-     * object fails to read and the run reports the whole repository as
-     * unrecoverable - a healthy 49-object repository came back as 49
-     * unrecoverable objects across 42 affected files, which is worse than
-     * useless: it is an alarm that sends an operator looking for corruption
-     * that is not there.
-     *
-     * Structure level reads only headers, which are not encrypted, so it
-     * still works and is what an offsite copy can check today. Checking a
-     * payload without decrypting it is possible - parity and the CRC cover
-     * the stored bytes for exactly that reason - but no level does it yet.
-     */
-    if (level == VERIFY_LEVEL_DEEP && store_needs_key(store)) {
-        db_result_free(objs);
-        return set_error(ERR_INVALID,
-                         "deep verify reads payloads and this repository is "
-                         "encrypted with no key loaded; use level 'structure', "
-                         "which checks headers and needs no key");
-    }
-
     uint64_t total = (uint64_t)objs->nrows;
-    status_t st = verify_packs(store, db, repo_id, repair, &res);
-    if (st != OK) { db_result_free(objs); return st; }
+    status_t st = OK;
 
     /* Rows arrive grouped by pack, so remembering the last pack's answer
      * stats each pack file once rather than once per object. */

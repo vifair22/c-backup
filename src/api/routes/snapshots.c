@@ -1240,15 +1240,28 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         char rid[32];
         if (vr.run_id > 0) snprintf(rid, sizeof(rid), "%lld", (long long)vr.run_id);
         else               snprintf(rid, sizeof(rid), "null");
-        char vj[200];
-        snprintf(vj, sizeof(vj),
+        char vj[512 + VERIFY_DROPPED_LIST_MAX * 80];
+        int vn = snprintf(vj, sizeof(vj),
                  "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s,"
-                 "\"packs_unwalkable\":%llu,\"packs_restored\":%llu}",
+                 "\"packs_unwalkable\":%llu,\"packs_restored\":%llu,"
+                 "\"packs_salvaged\":%llu,\"unreferenced_dropped_bytes\":%llu,"
+                 "\"unreferenced_dropped_ranges\":%llu,\"unreferenced_dropped\":[",
                  rid, lvl,
                  j->verify_repair ? "true" : "false",
                  j->dry_run ? "true" : "false",
                  (unsigned long long)vr.packs_unwalkable,
-                 (unsigned long long)vr.packs_restored);
+                 (unsigned long long)vr.packs_restored,
+                 (unsigned long long)vr.packs_salvaged,
+                 (unsigned long long)vr.unreferenced_dropped_bytes,
+                 (unsigned long long)vr.unreferenced_dropped_ranges);
+        size_t vo = vn > 0 ? (size_t)vn : 0;
+        for (uint32_t d = 0; d < vr.dropped_listed && vo < sizeof(vj); d++)
+            vo += (size_t)snprintf(vj + vo, sizeof(vj) - vo,
+                                   "%s{\"pack\":%u,\"offset\":%llu,\"length\":%llu}",
+                                   d ? "," : "", vr.dropped[d].pack,
+                                   (unsigned long long)vr.dropped[d].offset,
+                                   (unsigned long long)vr.dropped[d].length);
+        if (vo < sizeof(vj)) snprintf(vj + vo, sizeof(vj) - vo, "]}");
         job_set_result(progress_ctx, vj);
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*

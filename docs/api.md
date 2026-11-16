@@ -636,6 +636,13 @@ with parity (the packs gc leaves as they are); each is a finding named
 `pack-NNNNNNNNNN` with status `unwalkable pack`, at every level, and fails
 the run. `packs_restored` counts those a repairing run made walkable again
 by rebuilding their headers from the index; each is a `repaired` finding.
+`packs_salvaged` counts packs that could not be rebuilt (a damaged header
+had no index row) and were salvaged instead: every indexed entry copied into
+a new pack, a `salvaged` finding, and the bytes no row covers dropped and
+reported as `unreferenced_dropped_bytes`, `unreferenced_dropped_ranges` and
+`unreferenced_dropped` (first 16, `{"pack","offset","length"}` in the old
+pack). An indexed entry damaged beyond parity is carried as it is and stays
+an `unrecoverable` finding.
 
 `run_id` is null when the walk did not finish (cancelled or aborted); the
 partial run is still in `GET /repos/<id>/verify`, with `completed` false.

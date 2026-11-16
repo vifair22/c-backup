@@ -1082,6 +1082,252 @@ static void test_unwalkable_pack_is_reported_until_repaired(void **state)
     assert_int_equal(vr.unrecoverable + vr.missing + vr.recoverable, 0);
 }
 
+/*
+ * The source tree the salvage tests share: UNW_FILES small files, the
+ * first UNW_DELETED of them gone in the second snapshot.
+ */
+static void unw_two_snapshots(int64_t *s1, int64_t *s2)
+{
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/many", TEST_SRC);
+    assert_int_equal(mkdir(dir, 0700), 0);
+    for (int i = 0; i < UNW_FILES; i++) {
+        char p[PATH_MAX + 32], body[200];
+        snprintf(p, sizeof(p), "%s/f%03d", dir, i);
+        int n = snprintf(body, sizeof(body), "file %03d:", i);
+        unsigned x = 0x9E3779B9u * (unsigned)(i + 1);
+        while (n < 150) {
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            body[n++] = (char)('A' + x % 52);
+        }
+        body[n] = '\0';
+        write_file(p, body);
+    }
+    *s1 = run_backup();
+    for (int i = 0; i < UNW_DELETED; i++) {
+        char p[PATH_MAX + 32];
+        snprintf(p, sizeof(p), "%s/f%03d", dir, i);
+        assert_int_equal(unlink(p), 0);
+    }
+    *s2 = run_backup();
+}
+
+/*
+ * Overwrite every entry header in the parity group holding the named file's
+ * entry. Returns the pack, the number of damaged headers belonging to
+ * entries snapshot s2 no longer has (dead) and to ones it has (live), and
+ * the hash of one live file entry in the group.
+ */
+static uint32_t unw_wipe_group_of(const char *name, int64_t s2, int *dead, int *live,
+                                  char live_hex[OBJECT_HASH_SIZE * 2 + 1], entry_at_t *live_at)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of(name, hex);
+    entry_at_t e = entry_of(hex);
+    uint8_t h[OBJECT_HASH_SIZE];
+    hash_of_hex(hex, h);
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    assert_int_equal(pack_resolve_location(store, h, &pnum, &off), OK);
+    uint64_t g = e.entry / PARITY_GROUP_DATA;
+
+    char pk[32];
+    snprintf(pk, sizeof(pk), "%u", pnum);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT hash, offset FROM pack_objects WHERE pack_id = ? ORDER BY offset",
+        (const char *[]){ pk, NULL }, &r), 0);
+    int fd = open(e.path, O_RDWR);
+    assert_true(fd >= 0);
+    *dead = *live = 0;
+    live_hex[0] = '\0';
+    for (int i = 0; i < r->nrows; i++) {
+        uint64_t o = strtoull(r->rows[i][1], NULL, 10);
+        if (o / PARITY_GROUP_DATA != g ||
+            (o + sizeof(pack_dat_entry_hdr_t) - 1) / PARITY_GROUP_DATA != g)
+            continue;
+        if (snap_count_of(s2, r->rows[i][0]) > 0) {
+            (*live)++;
+            if (!live_hex[0] && i + 1 < r->nrows) {
+                snprintf(live_hex, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[i][0]);
+                *live_at = entry_of(live_hex);
+            }
+        } else {
+            (*dead)++;
+        }
+        uint8_t b[sizeof(pack_dat_entry_hdr_t)];
+        assert_int_equal(pread(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
+        for (size_t k = 0; k < sizeof(b); k++) b[k] ^= 0x5A;
+        assert_int_equal(pwrite(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
+    }
+    close(fd);
+    db_result_free(r);
+    pack_cache_invalidate(store);
+    store_dat_cache_flush(store);
+    return pnum;
+}
+
+/* Every file of snapshot 2, restored, byte for byte against the source. */
+static void unw_assert_restores(int64_t s2, const char *skip_hex)
+{
+    char dst[PATH_MAX];
+    snprintf(dst, sizeof(dst), "%s/dst", TEST_DIR);
+    restore_result_t rr;
+    status_t st = restore_run(store, db, repo_id, s2, dst, NULL, &rr);
+    if (skip_hex) {
+        assert_int_equal(st, ERR_CORRUPT);
+        assert_int_equal(rr.failed, 1);
+        err_clear();
+    } else {
+        assert_int_equal(st, OK);
+    }
+    int compared = 0;
+    for (int i = UNW_DELETED; i < UNW_FILES; i++) {
+        char src[PATH_MAX + 32], out[2 * PATH_MAX + 32];
+        snprintf(src, sizeof(src), "%s/many/f%03d", TEST_SRC, i);
+        snprintf(out, sizeof(out), "%s%s/many/f%03d", dst, TEST_SRC, i);
+        char name[16];
+        snprintf(name, sizeof(name), "f%03d", i);
+        if (skip_hex) {
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            content_hash_of(name, hex);
+            if (strcmp(hex, skip_hex) == 0) continue;
+        }
+        size_t a = 0, b = 0;
+        uint8_t *x = slurp(src, &a);
+        uint8_t *y = slurp(out, &b);
+        assert_int_equal(a, b);
+        assert_memory_equal(x, y, a);
+        free(x);
+        free(y);
+        compared++;
+    }
+    assert_true(compared >= UNW_FILES - UNW_DELETED - 1);
+}
+
+/*
+ * Case (a): the wiped group holds headers of entries gc has since swept
+ * along with live ones. The swept ones have no index row, so their headers
+ * cannot be rebuilt and the pack stays unwalkable after a header restore.
+ * Verify with repair salvages instead: every live entry is copied into a
+ * new pack by its indexed offset, and what no row covers is dropped and
+ * reported. Verify then passes, every live file restores byte for byte, and
+ * gc carries on.
+ */
+static void test_unwalkable_pack_with_swept_headers_is_salvaged(void **state)
+{
+    (void)state;
+    int64_t s1 = 0, s2 = 0;
+    unw_two_snapshots(&s1, &s2);
+    int dead = 0, live = 0;
+    char live_hex[OBJECT_HASH_SIZE * 2 + 1];
+    entry_at_t live_at;
+    uint32_t pnum = unw_wipe_group_of("f049", s2, &dead, &live, live_hex, &live_at);
+    assert_true(dead >= 1);
+    assert_true(live >= 1);
+    assert_true((dead + live) * (int)sizeof(pack_dat_entry_hdr_t) > 2048);
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, s1), OK);
+    gc_result_t gr;
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(gr.packs_unwalkable, 1);
+
+    char pname[32];
+    snprintf(pname, sizeof(pname), "pack-%010u", pnum);
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1, NULL, NULL, NULL, &vr),
+                     OK);
+    assert_int_equal(vr.packs_salvaged, 1);
+    assert_int_equal(vr.packs_restored, 0);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(vr.unrecoverable + vr.missing, 0);
+    assert_true(vr.unreferenced_dropped_bytes >= (uint64_t)dead * sizeof(pack_dat_entry_hdr_t));
+    assert_true(vr.unreferenced_dropped_ranges >= 1);
+    assert_true(vr.dropped_listed >= 1);
+    assert_int_equal(vr.dropped[0].pack, pnum);
+    assert_int_equal(verify_finding_count(pname, "salvaged"), 1);
+
+    /* The old pack is gone, through the rewrite path. */
+    char old[PATH_MAX];
+    assert_int_equal(pack_dat_path_resolve(old, sizeof(old), TEST_REPO, pnum), 0);
+    struct stat sb;
+    assert_int_not_equal(stat(old, &sb), 0);
+
+    const verify_level_t levels[3] = { VERIFY_LEVEL_INDEX, VERIFY_LEVEL_STRUCTURE,
+                                       VERIFY_LEVEL_DEEP };
+    for (int l = 0; l < 3; l++) {
+        memset(&vr, 0, sizeof(vr));
+        assert_int_equal(verify_run(store, db, repo_id, levels[l], 0, NULL, NULL, NULL, &vr), OK);
+        assert_int_equal(vr.packs_unwalkable + vr.unrecoverable + vr.missing, 0);
+    }
+    unw_assert_restores(s2, NULL);
+
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), OK);
+    assert_int_equal(gr.packs_unwalkable, 0);
+}
+
+/*
+ * The same, with one live entry in the wiped group also damaged in its
+ * payload - beyond parity, since the group's parity is already spent. It
+ * is carried into the new pack as it is: the unwalkable finding clears and
+ * verify reports that one object's loss, with its file, and nothing else.
+ */
+static void test_salvage_carries_a_damaged_live_entry_and_reports_its_loss(void **state)
+{
+    (void)state;
+    int64_t s1 = 0, s2 = 0;
+    unw_two_snapshots(&s1, &s2);
+    int dead = 0, live = 0;
+    char live_hex[OBJECT_HASH_SIZE * 2 + 1];
+    entry_at_t live_at;
+    uint32_t pnum = unw_wipe_group_of("f049", s2, &dead, &live, live_hex, &live_at);
+    assert_true(dead >= 1);
+    assert_true(live_hex[0] != '\0');
+    flip_byte(live_at.path, (off_t)(live_at.payload + 3));
+    flip_byte(live_at.path, (off_t)(live_at.payload + 4));
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, s1), OK);
+    gc_result_t gr;
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), ERR_CORRUPT);
+    err_clear();
+
+    char pname[32];
+    snprintf(pname, sizeof(pname), "pack-%010u", pnum);
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1, NULL, NULL, NULL, &vr),
+                     ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(vr.packs_salvaged, 1);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(vr.unrecoverable, 1);
+    assert_int_equal(vr.missing, 0);
+    assert_int_equal(vr.affected_files, 1);
+    char status[64];
+    finding_status_of(live_hex, status, sizeof(status));
+    assert_string_equal(status, "unrecoverable");
+
+    /* From now on only the loss: no unwalkable pack at any level. */
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr),
+                     OK);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0, NULL, NULL, NULL, &vr),
+                     ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(vr.unrecoverable, 1);
+    assert_int_equal(verify_finding_count(pname, "unwalkable pack"), 0);
+
+    unw_assert_restores(s2, live_hex);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1103,6 +1349,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_grown_header_size_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_header_and_payload_damage_repaired_in_one_run, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unwalkable_pack_is_reported_until_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unwalkable_pack_with_swept_headers_is_salvaged, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_salvage_carries_a_damaged_live_entry_and_reports_its_loss, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

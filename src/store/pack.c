@@ -2805,6 +2805,8 @@ static void note_damaged(pack_gc_stats_t *stats, const uint8_t hash[OBJECT_HASH_
  * src_index is the entry's position in the source, which its CRC is indexed
  * by; len_hint its stored size as the walk of the source found it.
  */
+static status_t pack_rw_append(pack_rw_t *rw, uint8_t *buf, size_t len);
+
 static status_t pack_rw_copy(pack_rw_t *rw, int src_fd, const pack_trailer_t *t,
                              uint64_t off, uint32_t src_index, uint64_t len_hint)
 {
@@ -2832,7 +2834,21 @@ static status_t pack_rw_copy(pack_rw_t *rw, int src_fd, const pack_trailer_t *t,
     }
     note_parity_outcome(ehdr.hash, fixed, damaged, "pack rewrite");
     if (damaged) note_damaged(rw->stats, ehdr.hash);
+    return pack_rw_append(rw, buf, len);
+}
 
+/*
+ * Append one entry's bytes, header first, to the open output - sealing it
+ * first if the entry would take it past the seal. Takes buf (freed here).
+ */
+static status_t pack_rw_append(pack_rw_t *rw, uint8_t *buf, size_t len)
+{
+    if (rw->kept >= rw->ents_cap) {
+        free(buf);
+        return set_error(ERR_CORRUPT, "pack rewrite: more entries than planned");
+    }
+    pack_dat_entry_hdr_t ehdr;
+    memcpy(&ehdr, buf, sizeof(ehdr));
     if (rw->cur && rw->cur_n > 0 && rw->body + len > pack_seal_bytes()) {
         status_t st = pack_rw_seal(rw);
         if (st != OK) { free(buf); return st; }
@@ -3133,6 +3149,208 @@ static status_t maybe_coalesce_packs(store_t *store,
                  n_cand, packs_written, total_live);
     free(cand);
     return rc;
+}
+
+static int hint_off_cmp(const void *a, const void *b)
+{
+    const pack_hdr_hint_t *x = a, *y = b;
+    return x->offset < y->offset ? -1 : x->offset > y->offset;
+}
+
+/*
+ * The header an entry was written with, from the best witness there is:
+ * the bytes on disk as the stripe corrects them, if they match the header
+ * CRC; else the one candidate built from the index that matches it; else,
+ * with no CRC to decide, the index's fields and the codec they imply (a
+ * stored size equal to the payload, plus the AEAD bytes when encrypted, is
+ * uncompressed). Returns 1 when the header is proven, 0 when guessed.
+ */
+static int salvage_header(int fd, const pack_trailer_t *t, const pack_hdr_hint_t *hi,
+                          int keyed, pack_dat_entry_hdr_t *out)
+{
+    uint32_t want_h = 0;
+    int have_h = t && entry_table_slot(fd, t, hi->entry_index, 1, NULL, &want_h) == 0;
+    if (hdr_at(fd, t, hi->offset, t != NULL, out) == 0 && have_h &&
+        crc32c(out, sizeof(*out)) == want_h)
+        return 1;
+    static const uint8_t comps[2] = { COMPRESS_NONE, COMPRESS_LZ4 };
+    static const uint8_t encs[2]  = { ENCRYPT_NONE, ENCRYPT_CHACHA20 };
+    pack_dat_entry_hdr_t cand;
+    for (unsigned ty = 0; have_h && ty < 256; ty++) {
+        if (!object_type_known(ty) || (hi->type && ty != hi->type)) continue;
+        for (int c = 0; c < 2; c++)
+            for (int e = 0; e < 2; e++) {
+                memset(&cand, 0, sizeof(cand));
+                memcpy(cand.hash, hi->hash, OBJECT_HASH_SIZE);
+                cand.type              = (uint8_t)ty;
+                cand.compression       = comps[c];
+                cand.encryption        = encs[e];
+                cand.uncompressed_size = hi->orig_size;
+                cand.compressed_size   = hi->comp_size;
+                if (crc32c(&cand, sizeof(cand)) == want_h) { *out = cand; return 1; }
+            }
+    }
+    memset(&cand, 0, sizeof(cand));
+    memcpy(cand.hash, hi->hash, OBJECT_HASH_SIZE);
+    cand.type              = hi->type ? hi->type : OBJECT_TYPE_FILE;
+    cand.encryption        = keyed ? ENCRYPT_CHACHA20 : ENCRYPT_NONE;
+    cand.uncompressed_size = hi->orig_size;
+    cand.compressed_size   = hi->comp_size;
+    uint64_t aead = keyed ? OBJECT_AEAD_OVERHEAD : 0;
+    cand.compression = hi->comp_size == hi->orig_size + aead ? COMPRESS_NONE : COMPRESS_LZ4;
+    *out = cand;
+    return 0;
+}
+
+/*
+ * Salvage a pack that cannot be walked and whose headers cannot all be
+ * rebuilt: some of the damaged headers belong to entries the index no
+ * longer has a row for (gc swept them), so nothing knows what they said.
+ *
+ * Nothing here walks. Every live entry - every index row - is located by
+ * its indexed offset and size, given the header it was written with
+ * (salvage_header) and its payload corrected from the stripe, and copied
+ * through the pack rewriter into new packs; then the old pack goes the way
+ * a gc rewrite's does (pack_rw_replace: install, rows, .deleting marker,
+ * removal callback, unlink). What is left behind is every byte no row
+ * covers: unreferenced entries, garbage gc had already swept. Those ranges
+ * are reported.
+ *
+ * A live entry still failing its CRC after correction is damage beyond
+ * parity. It is carried into the new pack as it is, with its header right,
+ * and listed in out->damaged: the pack becomes walkable, so the unwalkable
+ * finding clears, while the object's own loss stays exactly what verify
+ * reports for damage beyond parity anywhere. Keeping the old pack for one
+ * damaged entry would keep the pack unwalkable and the finding with it,
+ * hiding the one real loss behind a structural one.
+ */
+status_t pack_salvage(store_t *store, uint32_t pack_num, const pack_hdr_hint_t *hints,
+                      size_t n, pack_salvage_result_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (n == 0)
+        return set_error(ERR_INVALID, "pack-%010u.dat: no indexed entries to salvage",
+                         pack_num);
+    char path[PATH_MAX];
+    if (pack_dat_path_resolve(path, sizeof(path), store_root(store), pack_num) != 0)
+        return set_error(ERR_IO, "pack %u: path too long", pack_num);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return set_error_errno(ERR_IO, "pack salvage: open pack-%010u.dat", pack_num);
+    /* The CRCs are the only witness of which entries came through intact.
+     * Without them a salvage could only copy bytes on faith, so the pack is
+     * left as it is, still reported, rather than rewritten unverified. */
+    pack_trailer_t tr;
+    if (pack_trailer_read(fd, &tr) != 0) {
+        close(fd);
+        return set_error(ERR_CORRUPT, "pack-%010u.dat has no usable trailer to check its "
+                         "entries against; not salvaged", pack_num);
+    }
+    const pack_trailer_t *t = &tr;
+    uint64_t body_end = tr.body_len;
+    int keyed = store_needs_key(store) || store_key(store) != NULL;
+
+    pack_hdr_hint_t *h = malloc(n * sizeof(*h));
+    if (!h) { close(fd); return set_error(ERR_NOMEM, "pack salvage: hints"); }
+    memcpy(h, hints, n * sizeof(*h));
+    qsort(h, n, sizeof(*h), hint_off_cmp);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t end = h[i].offset + sizeof(pack_dat_entry_hdr_t) + h[i].comp_size;
+        if (h[i].offset < sizeof(pack_dat_hdr_t) || h[i].comp_size > OBJECT_MAX_STORED_BYTES ||
+            end > body_end || (i + 1 < n && end > h[i + 1].offset)) {
+            unsigned long long bad_off = (unsigned long long)h[i].offset;
+            free(h);
+            close(fd);
+            return set_error(ERR_CORRUPT, "pack-%010u.dat: the index places an entry at %llu "
+                             "that does not fit the pack; not salvaged", pack_num, bad_off);
+        }
+    }
+
+    pack_rw_t rw;
+    status_t st = pack_rw_init(&rw, store, (uint32_t)n);
+    if (st != OK) { free(h); close(fd); return st; }
+    pack_gc_stats_t gs;
+    memset(&gs, 0, sizeof(gs));
+    rw.stats = &gs;
+
+    uint64_t at = sizeof(pack_dat_hdr_t);
+    for (size_t i = 0; i < n && st == OK; i++) {
+        if (h[i].offset > at) {
+            out->dropped_bytes += h[i].offset - at;
+            out->dropped_ranges++;
+            if (out->dropped_listed < PACK_SALVAGE_LIST_MAX) {
+                out->dropped[out->dropped_listed].offset = at;
+                out->dropped[out->dropped_listed].length = h[i].offset - at;
+                out->dropped_listed++;
+            }
+        }
+        size_t len = sizeof(pack_dat_entry_hdr_t) + (size_t)h[i].comp_size;
+        uint8_t *buf = malloc(len);
+        if (!buf) { st = set_error(ERR_NOMEM, "pack salvage: entry buffer"); break; }
+        pack_dat_entry_hdr_t hdr;
+        (void)salvage_header(fd, t, &h[i], keyed, &hdr);
+        memcpy(buf, &hdr, sizeof(hdr));
+        if (pread_full(fd, buf + sizeof(hdr), (size_t)h[i].comp_size,
+                       (off_t)(h[i].offset + sizeof(hdr))) != 0) {
+            free(buf);
+            st = set_error_errno(ERR_IO, "pack salvage: read an entry");
+            break;
+        }
+        int damaged = 0;
+        {
+            uint32_t want_e = 0;
+            int have_e = entry_table_slot(fd, t, h[i].entry_index, 1, &want_e, NULL) == 0;
+            if (!have_e || crc32c(buf, len) != want_e) {
+                int64_t fx = 0;
+                uint64_t bad = 0;
+                /* Payload only: the header is already the best there is. */
+                if (stripe_correct(fd, 0, t->body_len, t->par_off, h[i].offset + sizeof(hdr),
+                                   buf + sizeof(hdr), (size_t)h[i].comp_size, &fx, &bad) != 0) {
+                    free(buf);
+                    st = set_error_errno(ERR_IO, "pack salvage: read parity");
+                    break;
+                }
+                damaged = !have_e ? (bad != 0) : crc32c(buf, len) != want_e;
+            }
+        }
+        if (damaged) {
+            note_parity_outcome(hdr.hash, 0, 1, "pack salvage");
+            note_damaged(&gs, hdr.hash);
+        }
+        out->entries_kept++;
+        at = h[i].offset + len;
+        st = pack_rw_append(&rw, buf, len);
+    }
+    if (st == OK && body_end > at) {
+        out->dropped_bytes += body_end - at;
+        out->dropped_ranges++;
+        if (out->dropped_listed < PACK_SALVAGE_LIST_MAX) {
+            out->dropped[out->dropped_listed].offset = at;
+            out->dropped[out->dropped_listed].length = body_end - at;
+            out->dropped_listed++;
+        }
+    }
+    free(h);
+    close(fd);
+
+    uint32_t base = 0;
+    size_t written = 0;
+    if (st == OK) st = pack_rw_replace(&rw, &pack_num, 1, &base, &written);
+    pack_rw_free(&rw);
+    if (st != OK) return st;
+    out->packs_written = (uint32_t)written;
+    out->first_pack    = base;
+    out->entries_damaged = gs.entries_damaged;
+    out->damaged_listed  = gs.damaged_listed;
+    memcpy(out->damaged, gs.damaged, sizeof(out->damaged));
+    log_warn("pack: salvaged pack-%010u.dat into %zu pack(s) from pack-%010u.dat: "
+             "%llu live entr%s kept (%llu damaged beyond parity, carried as they were), "
+             "%llu unreferenced byte(s) in %llu range(s) dropped",
+             pack_num, written, base,
+             (unsigned long long)out->entries_kept, out->entries_kept == 1 ? "y" : "ies",
+             (unsigned long long)out->entries_damaged,
+             (unsigned long long)out->dropped_bytes,
+             (unsigned long long)out->dropped_ranges);
+    return OK;
 }
 
 /*
