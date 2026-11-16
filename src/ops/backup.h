@@ -43,6 +43,14 @@ typedef struct {
     status_t (*open)(void *ctx, size_t index, cdc_source_t *src, uint64_t *size);
     void     (*close)(void *ctx, size_t index, status_t st, const cdc_result_t *cr);
     void      *ctx;
+    /*
+     * Optional, asked after close of an entry that stored: 0 leaves the
+     * entry out of the snapshot (its chunks become garbage for gc). For
+     * content whose producer can fail after its bytes are all read: a dump
+     * hook that exits non-zero wrote a dump that looks valid and is not.
+     * open may also say CDC_SIZE_STREAM, and the size is then what stored.
+     */
+    int      (*keep)(void *ctx, size_t index);
 } backup_synth_ops_t;
 
 typedef struct {

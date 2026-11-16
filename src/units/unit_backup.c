@@ -457,7 +457,7 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
         memset(&pg, 0, sizeof(pg));
         pg.o = o;
         snprintf(pg.prefix, sizeof(pg.prefix), "unit %zu/%zu %s", index + 1, total, res->name);
-        backup_synth_ops_t sops = { part_open, part_close, &u };
+        backup_synth_ops_t sops = { part_open, part_close, &u, NULL };
         hook_t hk = { &u, repo_id };
         backup_opts_t bo;
         memset(&bo, 0, sizeof(bo));

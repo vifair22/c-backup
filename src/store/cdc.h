@@ -170,7 +170,13 @@ typedef struct {
     uint64_t chunk_bytes_new;/* plaintext bytes of the new chunks */
     uint64_t phys_new;       /* what every new object occupies, lists too */
     chunklist_stats_t lists;
+    uint64_t size;           /* the content's size: as given, or a stream's */
 } cdc_result_t;
+
+/* A size for cdc_store_source when the source is a stream whose length is
+ * only known at its end (a dump hook's stdout): its spans may run anywhere,
+ * and the content's size is where the last one ends, in out->size. */
+#define CDC_SIZE_STREAM UINT64_MAX
 
 /*
  * Store size bytes of fd and return its content hash.

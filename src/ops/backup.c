@@ -1157,8 +1157,9 @@ static status_t store_source_cdc(pipeline_t *p, batch_t *b, const cdc_source_t *
         return set_error(ERR_INVALID, "repository is encrypted and no key is "
                          "loaded: its chunk boundaries need the key");
     int large = size > OBJECT_MAX_BYTES;
-    int may_seal = large &&
-        pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES);
+    /* A stream may be any length: let the pack roll over under it. */
+    int may_seal = size == CDC_SIZE_STREAM ||
+        (large && pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES));
     if (may_seal) batch_close(p, b);
     obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
     cdc_opts_t o = {
@@ -1212,14 +1213,15 @@ static status_t store_synth_all(pipeline_t *p)
         uint64_t size = 0;
         st = o->synth_ops->open(o->synth_ops->ctx, k, &src, &size);
         if (st != OK) break;
-        e->node.size = size;
-        e->st.st_size = (off_t)size;
+        int stream = size == CDC_SIZE_STREAM;
+        e->node.size = stream ? 0 : size;
+        e->st.st_size = stream ? 0 : (off_t)size;
 
         cdc_result_t cr;
         memset(&cr, 0, sizeof(cr));
         batch_open(p, b);
         p->file_bytes = 0;
-        p->file_size = size;
+        p->file_size = stream ? 0 : size;
         p->file_index = i;
         st = store_source_cdc(p, b, &src, size, &cr);
         p->file_bytes = 0;
@@ -1227,9 +1229,19 @@ static status_t store_synth_all(pipeline_t *p)
         p->res->bytes_stored += cr.phys_new;
         if (o->synth_ops->close) o->synth_ops->close(o->synth_ops->ctx, k, st, &cr);
         if (st != OK) break;
+        if (stream) {
+            e->node.size = cr.size;
+            e->st.st_size = (off_t)cr.size;
+        }
+        if (o->synth_ops->keep && !o->synth_ops->keep(o->synth_ops->ctx, k)) {
+            skip_file(p, i, "its producer failed after writing it");
+            batch_open(p, b);
+            st = bsink_flush(p->sink, 0);
+            continue;
+        }
         memcpy(e->node.content_hash, cr.hash, OBJECT_HASH_SIZE);
         p->res->files++;
-        p->res->bytes_logical += size;
+        p->res->bytes_logical += cr.size;
         batch_open(p, b);
         st = bsink_flush(p->sink, 0);
     }
