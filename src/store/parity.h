@@ -124,3 +124,74 @@ typedef struct {
     uint32_t version;
     uint32_t trailer_size;  /* total trailer INCLUDING this footer */
 } __attribute__((packed)) parity_footer_t;  /* 12 bytes */
+
+/* ---- 32-bit parity size fields (OWN-30 stopgap) ----
+ *
+ * The footer's trailer_size and a pack entry's parity block size are both
+ * uint32. RS parity costs 1024 bytes per 15296 stored bytes, so past about
+ * 59.75 GiB of stored data the size written into those fields wraps. Reads
+ * are unaffected - they locate parity from the header - but every repair
+ * path finds the trailer through trailer_size, and with a wrapped value it
+ * reads parity from the wrong place and can write a wrong "correction" into
+ * user data. Until the format grows wider fields, repair refuses anything
+ * whose fields may have wrapped, and writers say so when they produce one.
+ *
+ * The exact limit: a trailer of rs_parity_size(n) plus its fixed bytes must
+ * fit in a uint32. The fixed bytes are 280 for a loose object, 272 for one
+ * pack entry block and 300 for a single-entry pack's whole trailer. All of
+ * them sit inside the same 1024-byte remainder (UINT32_MAX % 1024 == 1023),
+ * so they share one threshold: at most UINT32_MAX / 1024 = 4194303 parity
+ * groups, which is 4194303 * 15296 = 64,156,058,688 stored bytes. One byte
+ * more needs a 4194304th group and wraps every one of those fields.
+ */
+#define PARITY_GROUP_DATA       ((uint64_t)RS_K * RS_INTERLEAVE)   /* 15296 */
+#define PARITY_GROUP_PAR        ((uint64_t)RS_2T * RS_INTERLEAVE)  /* 1024 */
+#define PARITY_TRAILER_FIXED_MAX 300u  /* largest fixed overhead of any trailer */
+#define PARITY_FIELDS_MAX_STORED \
+    (((uint64_t)UINT32_MAX / PARITY_GROUP_PAR) * PARITY_GROUP_DATA)
+
+_Static_assert(PARITY_TRAILER_FIXED_MAX <= (uint64_t)UINT32_MAX % PARITY_GROUP_PAR,
+               "every trailer layout must share one group-count threshold");
+_Static_assert(PARITY_FIELDS_MAX_STORED == 64156058688ull,
+               "the documented threshold is the computed one");
+
+/* What a refused repair says, so the reason reads the same everywhere. */
+#define PARITY_TOO_LARGE_REASON \
+    "too large for 32-bit parity fields; repair disabled pending format fix"
+
+/* Returned by object_repair and pack_object_repair when they refuse. */
+#define PARITY_REPAIR_REFUSED_TOO_LARGE (-2)
+
+/* The largest trailer the size fields can carry: UINT32_MAX, unless a test
+ * has lowered it. */
+uint64_t parity_trailer_limit(void);
+
+/* 1 when an object of stored_size bytes has a trailer whose size fields
+ * cannot wrap, 0 when its parity must not be used for repair. */
+int parity_fields_fit(uint64_t stored_size);
+
+/*
+ * 1 when a file holding `entries` parity-protected payloads cannot have a
+ * trailer larger than parity_trailer_limit(). The file is assumed to be
+ *
+ *   body_fixed + entries * body_per_entry + payload bytes      (body)
+ *   + trailer_fixed + entries * trailer_per_entry + RS parity  (trailer)
+ *
+ * and only its size is trusted, never a header's length, because the header
+ * is exactly what a repair may be about to rewrite. The bound is exact for a
+ * single entry and conservative by at most entries - 1 groups otherwise.
+ */
+int parity_trailer_fits_file(uint64_t file_size, uint64_t entries,
+                             uint64_t body_fixed, uint64_t body_per_entry,
+                             uint64_t trailer_fixed, uint64_t trailer_per_entry);
+
+/* The bound itself: the largest trailer such a file can hold. Exposed so
+ * tests can pin it against real trailers. */
+uint64_t parity_trailer_bound(uint64_t file_size, uint64_t entries,
+                              uint64_t body_fixed, uint64_t body_per_entry,
+                              uint64_t trailer_fixed, uint64_t trailer_per_entry);
+
+/* Test hook: treat any object stored in more groups than max_stored needs
+ * as too large, so a few-MiB object exercises the refusal. 0 restores the
+ * real limit. Never called outside tests. */
+void parity_fields_set_test_limit(uint64_t max_stored);
