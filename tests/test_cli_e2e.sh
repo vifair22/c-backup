@@ -166,7 +166,9 @@ contains "snapshots"     '"id":1,'             "$(cb snapshots 1)"
 contains "ls"            '"name"'              "$(cb ls 1 1)"
 contains "search"        'one.txt'             "$(cb search 1 txt)"
 # B074: these were silently replaced by the defaults.
-OUT=$(cb snapshots 1 --limit -1 2>&1); RC=$?
+# Written --limit=-1: spaced, a value starting with a dash is refused by the
+# CLI as a missing one (B127), and this checks what the daemon says.
+OUT=$(cb snapshots 1 --limit=-1 2>&1); RC=$?
 check    "snapshots --limit -1 fails" 1 "$RC"
 contains "and says why" "limit is out of range; it must be from 1 to" "$OUT"
 OUT=$(cb objects 1 --location nowhere 2>&1); RC=$?
@@ -1508,12 +1510,216 @@ contains "missing arguments show usage" "usage:" "$OUT"
 # repository 1's runs and exited 0.
 OUT=$(cb grep runs 1 2 2>&1); RC=$?
 check    "a stray positional exits non-zero" 1 "$RC"
-contains "and names it" "unexpected argument '2'; usage: c-backup grep runs" "$OUT"
+contains "and names it" "unexpected argument '2'" "$OUT"
+contains "with the usage" "usage: c-backup grep runs <repo-id>" "$OUT"
 OUT=$(cb summary 1 --bogus 2>&1); RC=$?
 check    "an unknown option exits non-zero" 1 "$RC"
-contains "and names it too" "unexpected argument '--bogus'" "$OUT"
+contains "and names it too" "unknown option '--bogus'" "$OUT"
 OUT=$(cb grep runs 1 --limit 1 2>&1); RC=$?
 check    "options are still taken" 0 "$RC"
+
+echo "argument parsing (B127)"
+# `repo add PATH Main --encrypt` with the value forgotten registered an
+# UNENCRYPTED repository and exited 0, and encryption is fixed at creation.
+# Every refusal below must leave the registry as it was and create nothing.
+REPOS_BEFORE=$(cb repo list)
+b127_refused() {  # b127_refused <what> <expected message> <args...>
+    local what="$1" msg="$2"; shift 2
+    local out rc
+    out=$(cb "$@" 2>&1 >/dev/null); rc=$?
+    check    "$what exits 1" 1 "$rc"
+    contains "$what: names it" "$msg" "$out"
+    contains "$what: shows the usage, on stderr" "usage: c-backup repo add <path> [label]" "$out"
+}
+b127_refused "--encrypt with no value"      "option '--encrypt' needs a value" \
+    repo add "$WORK/b127" Main --encrypt
+b127_refused "--passphrase with no value"   "option '--passphrase' needs a value" \
+    repo add "$WORK/b127" Main --passphrase
+b127_refused "--encrypt with no label either" "option '--encrypt' needs a value" \
+    repo add "$WORK/b127" --encrypt
+b127_refused "--encrypt followed by an option" \
+    "option '--encrypt' needs a value, and '--passphrase' looks like an option" \
+    repo add "$WORK/b127" Main --encrypt --passphrase 'correct horse'
+b127_refused "an empty --encrypt"           "needs a value, not an empty one" \
+    repo add "$WORK/b127" Main --encrypt=
+b127_refused "an empty --passphrase"        "needs a value, not an empty one" \
+    repo add "$WORK/b127" Main --passphrase ''
+b127_refused "an unknown flag"              "unknown option '--bogus'" \
+    repo add "$WORK/b127" --bogus
+b127_refused "an extra positional"          "unexpected argument 'extra'" \
+    repo add "$WORK/b127" mylabel extra
+b127_refused "--encrypt given twice"        "option '--encrypt' given more than once" \
+    repo add "$WORK/b127" Main --encrypt system --encrypt none
+check "none of them registered a repository" "$REPOS_BEFORE" "$(cb repo list)"
+if [ -e "$WORK/b127" ]; then bad "and none created the directory" "absent" "present"
+else ok "and none created the directory"; fi
+# The usage line shows the label the Manual's examples pass.
+contains "repo add usage shows the label" "repo add <path> [label]" "$(cb help repo add)"
+# `--` ends the options, so a label may start with a dash.
+contains "-- lets a label start with a dash" '"id"' \
+    "$(cb repo add "$WORK/b127dash" --encrypt system -- -dashed 2>&1)"
+contains "and it is the label" '"label":"-dashed"' "$(cb repo list)"
+contains "and the options before it were taken" '"encryption":"system"' \
+    "$(cb repo list | tr '}' '\n' | grep b127dash)"
+# A value starting with a dash is passed in the = form.
+OUT=$(cb backup 1 "$WORK/src" --label=-dash-label 2>&1); RC=$?
+check    "--label=-x passes a dashed value" 0 "$RC"
+contains "and it is the label" '"label":"-dash-label"' "$(cb snapshots 1)"
+OUT=$("$CLI" --socket 2>&1); RC=$?
+check    "--socket with no value exits 1" 1 "$RC"
+contains "and names it" "option '--socket' needs a value" "$OUT"
+# Variadic positionals still take any number.
+contains "sources set takes several paths" '"sources"' \
+    "$(cb sources set 1 "$WORK/src" "$WORK/src/one.txt" --exclude a --exclude b)"
+contains "all of them" "one.txt" "$(cb sources list 1)"
+cb sources set 1 "$WORK/src" >/dev/null
+
+# Every command, in the longest form its spec takes, with an unknown flag
+# and then with one positional too many. A row is "<command words>|<args>";
+# a leading '*' marks a command whose last positional repeats, so it has no
+# "too many". Each must exit 1 naming the argument, with that command's
+# usage, and send nothing: against a socket where nothing listens a request
+# would say "daemon not running", and against the live daemon the state
+# must not move.
+SWEEP=(
+    "repo list|"
+    "repo add|$WORK/sweep lbl"
+    "repo show|1"
+    "repo remove|1"
+    "repo key export|1"
+    "repo key import|1 00"
+    "repo key ack|1"
+    "sources list|1"
+    "*sources set|1 $WORK/src"
+    "*backup|1 $WORK/src"
+    "restore|1 1 $WORK/sweepdst"
+    "snapshots|1"
+    "snapshot delete|1 1"
+    "snapshot note|1 1 text"
+    "snapshot tree|1 1 0"
+    "ls|1 1 0"
+    "search|1 q"
+    "grep|1 pat"
+    "grep runs|1"
+    "grep show|1 1"
+    "diff|1 1 2"
+    "verify|1"
+    "verify list|1"
+    "verify show|1 1"
+    "gc|1"
+    "gfs|1"
+    "pack|1"
+    "replicate|1 $WORK/sweeprepl"
+    "reindex|1"
+    "stats|1"
+    "summary|1"
+    "objects|1"
+    "object|1 abc refs"
+    "packs|1 1"
+    "fanout|1"
+    "policy list|1"
+    "policy set|1 retention.keep_snaps 1"
+    "tag list|1"
+    "tag set|1 sweep 1"
+    "tag remove|1 sweep"
+    "journal|1"
+    "schedule list|1"
+    "schedule add|1 backup 60"
+    "schedule remove|1 1"
+    "schedule enable|1 1"
+    "schedule disable|1 1"
+    "jobs|1"
+    "jobs cancel|1"
+    "jobs watch|1"
+    "auth status|"
+    "auth setup|pw"
+    "auth password|a b"
+    "auth logout|--all"
+    "metrics|"
+    "health|live"
+    "version|"
+    "help|repo add"
+)
+# Everything a stray request could change. The newest job on repository 1
+# covers every job-starting command (a replicate schedule from an earlier
+# section fires every second on repository 2); the rest cover direct writes.
+b127_state() {
+    cb repo list; cb snapshots 1; cb sources list 1; cb schedule list 1
+    cb tag list 1; cb policy list 1; cb snapshot note 1 1; cb auth status
+    cb jobs --limit 200 | grep -o '"id":[0-9]*,"repo_id":1,' | head -1
+    cb grep runs 1 --limit 1 | grep -o '"id":[0-9]*' | head -1
+    cb verify list 1 --limit 1 | grep -o '"id":[0-9]*' | head -1
+}
+STATE_BEFORE=$(b127_state 2>&1)
+SWEEP_BAD=0
+sweep_one() {  # sweep_one <socket> <command words> <expected message> <words...>
+    local sock="$1" cmd="$2" msg="$3"; shift 3
+    local out rc
+    out=$("$CLI" --socket "$sock" "$@" 2>&1); rc=$?
+    case "$rc:$out" in
+        1:*"$msg"*"usage: c-backup $cmd"*)
+            case "$out" in
+                *"daemon not running"*|*HTTP*) SWEEP_BAD=$((SWEEP_BAD+1))
+                    printf '       sent a request: %s\n' "$*" ;;
+            esac ;;
+        *) SWEEP_BAD=$((SWEEP_BAD+1))
+           printf '       not refused (rc %s): %s\n       %s\n' "$rc" "$*" "$out" ;;
+    esac
+}
+for row in "${SWEEP[@]}"; do
+    variadic=0
+    case "$row" in \**) variadic=1; row="${row#\*}" ;; esac
+    CMD="${row%%|*}"
+    read -ra W <<< "$CMD ${row#*|}"
+    for sock in "$WORK/absent.sock" "$SOCK"; do
+        sweep_one "$sock" "$CMD" "unknown option '--b127-bogus'" "${W[@]}" --b127-bogus
+        sweep_one "$sock" "$CMD" "unknown option '--b127-bogus'" "${W[@]}" --b127-bogus=1
+        [ "$variadic" = 1 ] ||
+            sweep_one "$sock" "$CMD" "unexpected argument 'b127extra'" "${W[@]}" b127extra
+    done
+done
+check "every command refuses an unknown flag and an extra positional, sending nothing" \
+    0 "$SWEEP_BAD"
+check "and the daemon's state did not move" "$STATE_BEFORE" "$(b127_state 2>&1)"
+
+# A value option with its value missing, at the end of the line or before
+# another option, for every command that takes one. Each used to be taken as
+# a positional, or to take the next option as its value.
+SWEEP_BAD=0
+VALUE_SWEEP=(
+    "backup|1 $WORK/src|--label"
+    "backup|1 $WORK/src|--exclude"
+    "sources set|1 $WORK/src|--exclude"
+    "restore|1 1 $WORK/sweepdst|--subpath"
+    "snapshots|1|--limit"
+    "snapshots|1|--offset"
+    "search|1 q|--snapshot"
+    "grep|1 pat|--snapshot"
+    "grep|1 pat|--path-prefix"
+    "grep|1 pat|--max-hits"
+    "grep|1 pat|--max-hits-per-file"
+    "verify|1|--level"
+    "stats|1|--scope"
+    "objects|1|--location"
+    "journal|1|--result"
+    "schedule add|1 backup 60|--on-overlap"
+    "schedule add|1 backup 60|--source"
+    "schedule add|1 replicate|--every"
+    "repo add|$WORK/sweep|--encrypt"
+    "repo add|$WORK/sweep|--passphrase"
+)
+for row in "${VALUE_SWEEP[@]}"; do
+    CMD="${row%%|*}"
+    rest="${row#*|}"
+    opt="${rest#*|}"
+    read -ra W <<< "$CMD ${rest%|*}"
+    for sock in "$WORK/absent.sock" "$SOCK"; do
+        sweep_one "$sock" "$CMD" "option '$opt' needs a value" "${W[@]}" "$opt"
+        sweep_one "$sock" "$CMD" "option '$opt' needs a value" "${W[@]}" "$opt" --no-wait
+    done
+done
+check "every value option refuses a missing value, sending nothing" 0 "$SWEEP_BAD"
+check "and the state still did not move" "$STATE_BEFORE" "$(b127_state 2>&1)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
