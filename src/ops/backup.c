@@ -1660,6 +1660,11 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         scan_result_t *part = NULL;
         st = scan_tree(opts->paths[i], imap, &sopts, &part);
         if (st != OK) { scan_result_free(part); break; }
+        /* scan_tree always sets part on OK; said here so the contract is
+         * checked rather than assumed (gcc's LTO -Wnull-dereference could
+         * not prove it across the inlined call). */
+        if (!part) { st = set_error(ERR_INVALID, "backup_run: scan of %s returned no result",
+                                    opts->paths[i]); break; }
         from_sources += part->root_entries;
         if (!scan) {
             scan = part;
