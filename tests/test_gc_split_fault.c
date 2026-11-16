@@ -54,10 +54,13 @@
 #define TEST_OUT   TEST_DIR "/out"
 #define TEST_PACKS TEST_REPO "/packs/"
 
-#define SEAL_BYTES   PACK_MAX_MULTI_BYTES
-#define BIG_ENTRIES  20      /* of 16 MiB: 320 MiB in one pack */
+/* The seal, moved down from 256 MiB by pack_test_set_seal, and the entries
+ * with it: the same 20-into-a-pack-over-the-seal shape at a sixteenth of the
+ * size. At full size this suite held 1.2 GiB of scratch. */
+#define SEAL_BYTES   ((uint64_t)16 << 20)
+#define BIG_ENTRIES  20      /* of 1 MiB: 20 MiB in one pack */
 #define BIG_DEAD     2       /* entries no snapshot names, for gc to drop */
-#define ENTRY_BYTES  ((size_t)PACK_STREAM_THRESHOLD)
+#define ENTRY_BYTES  ((size_t)1 << 20)
 
 extern const db_migration_t app_migrations[];
 
@@ -123,9 +126,9 @@ static void write_buf(const char *path, const uint8_t *buf, size_t n)
 }
 
 /*
- * One 320 MiB pack, built the way a backup before OWN-16 built it (each
- * object into the open pack, no rollover, sealed at the end), then a backup
- * that finds 18 of its 20 objects as files and names them. The other two
+ * One 20 MiB pack, over the 16 MiB test seal, built the way a backup before
+ * OWN-16 built it (each object into the open pack, no rollover, sealed at the
+ * end), then a backup that finds 18 of its 20 objects as files and names them. The other two
  * are what gc drops, which is what makes it rewrite the pack at all.
  */
 static int setup(void **state)
@@ -133,6 +136,7 @@ static int setup(void **state)
     (void)state;
     rmrf(TEST_DIR);
     disarm();
+    pack_test_set_seal(SEAL_BYTES);
     fault_rename_refused = 0;
     out_seq = 0;
     if (mkdir(TEST_DIR, 0700) != 0) return -1;
@@ -190,6 +194,7 @@ static int teardown(void **state)
 {
     (void)state;
     disarm();
+    pack_test_set_seal(0);
     close_handles();
     rmrf(TEST_DIR);
     return 0;
@@ -334,7 +339,7 @@ static void test_gc_splits_an_oversized_pack(void **state)
     assert_int_equal(g.pack_entries_dropped, BIG_DEAD);
     assert_int_equal(g.packs_rewritten, 1);
     assert_false(big_pack_on_disk());
-    /* One pack in, two out: 288 MiB of live entries at a 256 MiB seal. */
+    /* One pack in, two out: 18 MiB of live entries at a 16 MiB seal. */
     assert_int_equal(pack_files(), before + 1);
     assert_true(max_pack_body() <= SEAL_BYTES);
     assert_int_equal(tmp_entries(), 0);

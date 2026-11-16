@@ -368,6 +368,21 @@ void pack_test_set_parity_window(size_t groups);
 void pack_test_set_parity_fit_limit(uint64_t bytes);
 
 /*
+ * The seal in force: PACK_MAX_MULTI_BYTES unless a test moved it.
+ */
+uint64_t pack_seal_bytes(void);
+
+/*
+ * Test hook: the size every writer seals a pack at, in place of
+ * PACK_MAX_MULTI_BYTES; coalescing's idea of a small pack follows it. 0
+ * restores the default. A test of rollover, splitting or coalescing then
+ * proves the same structure with packs of a few MiB instead of writing
+ * several 256 MiB ones, which is what made the suites fill a CI runner's
+ * disk.
+ */
+void pack_test_set_seal(uint64_t bytes);
+
+/*
  * 1 when the pack open on f cannot have a parity trailer whose uint32 size
  * fields wrapped, 0 when repair must leave it alone (OWN-30). Exposed for
  * the tests that pin it against real trailers.

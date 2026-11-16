@@ -17,7 +17,7 @@
  * verifies clean with only whole snapshots in it, and the next run
  * completes it.
  *
- * Since OWN-19 a snapshot larger than the 256 MiB seal is written as
+ * Since OWN-19 a snapshot larger than the seal is written as
  * several packs, the earlier ones installed mid-snapshot as they fill. The
  * last three tests hold that to the same promise: every pack a record
  * depends on is in place before the record, and an install that fails at
@@ -57,8 +57,12 @@
 #define TEST_SRC   TEST_DIR "/src"
 #define TEST_REPL  TEST_DIR "/replica"
 
-#define SEAL_BYTES PACK_MAX_MULTI_BYTES
-#define BIG_FILES  18        /* of 16 MiB: 288 MiB, two packs at the seal */
+/* The seal moved down from 256 MiB (pack_test_set_seal) and the files with
+ * it, a sixteenth of the size: the same snapshot past the seal, in two
+ * packs, without the 900 MiB of scratch the full size cost. */
+#define SEAL_BYTES ((uint64_t)16 << 20)
+#define BIG_FILES  18        /* of 1 MiB: 18 MiB, two packs at the seal */
+#define BIG_BYTES  ((size_t)1 << 20)
 
 extern const db_migration_t app_migrations[];
 
@@ -94,6 +98,7 @@ static int setup(void **state)
     (void)state;
     rmrf(TEST_DIR);
     disarm();
+    pack_test_set_seal(SEAL_BYTES);
     fault_rename_refused = 0;
     if (mkdir(TEST_DIR, 0700) != 0) return -1;
     if (mkdir(TEST_SRC, 0700) != 0) return -1;
@@ -111,6 +116,7 @@ static int teardown(void **state)
 {
     (void)state;
     disarm();
+    pack_test_set_seal(0);
     store_index_free(idx); idx = NULL;
     store_close(store);    store = NULL;
     db_close(db);          db = NULL;
@@ -152,15 +158,14 @@ static void fill_random(uint8_t *buf, size_t n, uint64_t seed)
     }
 }
 
-/* A small first snapshot, then a second past the seal: 288 MiB of files the
- * first does not have, which replicate as two packs. Each file is exactly
- * PACK_STREAM_THRESHOLD, the largest a backup writes straight into a pack. */
+/* A small first snapshot, then a second past the seal: 18 MiB of files the
+ * first does not have, which replicate as two packs. */
 static void small_then_big_snapshot(void)
 {
     write_file(TEST_SRC "/a", "first snapshot's file, with its own bytes");
     backup();
 
-    const size_t n = (size_t)PACK_STREAM_THRESHOLD;
+    const size_t n = BIG_BYTES;
     uint8_t *buf = malloc(n);
     assert_non_null(buf);
     for (int i = 0; i < BIG_FILES; i++) {
@@ -491,7 +496,7 @@ static void test_a_snapshot_past_the_seal_writes_several_packs(void **state)
     int packs = 0;
     uint64_t max_body = 0;
     assert_int_equal(assert_replica_verifies_packs(&packs, &max_body), 2);
-    /* Snapshot 1's pack, then the 288 MiB of snapshot 2 in two. */
+    /* Snapshot 1's pack, then the 18 MiB of snapshot 2 in two. */
     assert_true(packs >= 3);
     assert_true(max_body <= SEAL_BYTES);
 }

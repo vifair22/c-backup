@@ -19,6 +19,11 @@
  * (with a repair past the 256 MiB offset), restore, replication and gc over
  * it. Since OWN-19 the replica and gc's rewrite both come out sealed at
  * 256 MiB, and the test holds them to it.
+ *
+ * Both run at a 16 MiB seal (pack_test_set_seal) with the files scaled by
+ * the same sixteenth. What is proved is relative to the seal - a pack that
+ * fills, one past it, a repair beyond it - and at full size the suite wrote
+ * over a gigabyte of scratch for no more than that.
  */
 
 #include <setjmp.h>
@@ -57,11 +62,14 @@
 #define TEST_OUT2  TEST_DIR "/out-after-gc"
 
 #define MIB        ((uint64_t)1 << 20)
-#define SEAL_BYTES (256 * MIB)                       /* PACK_MAX_MULTI_BYTES */
+#define SEAL_BYTES (16 * MIB)        /* pack_test_set_seal; the real one is 256 */
 #define ENTRY_HDR  51                                /* pack_dat_entry_hdr_t */
 /* What a pack may hold: the seal, plus the one entry that may land after the
  * last check (an entry is at most PACK_STREAM_THRESHOLD). */
 #define PACK_BOUND (SEAL_BYTES + PACK_STREAM_THRESHOLD + ENTRY_HDR)
+/* A pack the big files went into, as against the few KiB of trees a backup
+ * packs on its own: more than one 1 MiB entry. */
+#define BIG_PACK   MIB
 
 extern const db_migration_t app_migrations[];
 
@@ -82,6 +90,7 @@ static int setup(void **state)
 {
     (void)state;
     rmrf(TEST_DIR);
+    pack_test_set_seal(SEAL_BYTES);
     if (mkdir(TEST_DIR, 0700) != 0) return -1;
     if (mkdir(TEST_SRC, 0700) != 0) return -1;
     if (db_open(&db, TEST_DB) != 0) return -1;
@@ -101,6 +110,7 @@ static int teardown(void **state)
     store_close(store);    store = NULL;
     db_close(db);          db = NULL;
     rmrf(TEST_DIR);
+    pack_test_set_seal(0);
     return 0;
 }
 
@@ -145,7 +155,7 @@ static backup_result_t run_backup(void)
 /*
  * Bytes of entries in each pack, from the index: what the seal measures.
  * Returns the number of packs; the largest goes to *max_bytes, and how many
- * hold more than 16 MiB of entries - the packs the big files went into, as
+ * hold more than BIG_PACK bytes of entries - the packs the big files went into, as
  * against the small ones a backup's trees land in - to *big (may be NULL).
  */
 static int pack_body_sizes_in(cutils_db_t *d, int64_t rid, uint64_t *max_bytes, int *big)
@@ -165,7 +175,7 @@ static int pack_body_sizes_in(cutils_db_t *d, int64_t rid, uint64_t *max_bytes, 
         print_message("  pack %s: %llu bytes in %s entries\n", r->rows[i][0],
                       (unsigned long long)b, r->rows[i][2]);
         if (b > *max_bytes) *max_bytes = b;
-        if (big && b > PACK_STREAM_THRESHOLD) (*big)++;
+        if (big && b > BIG_PACK) (*big)++;
     }
     db_result_free(r);
     return n;
@@ -223,7 +233,7 @@ static void verify_clean(store_t *s, cutils_db_t *d, int64_t rid)
 /* ------------------------------------------------------------------ */
 
 /*
- * Forty 8 MiB files: 320 MiB of packed content in 40 entries, far under the
+ * Forty 512 KiB files: 20 MiB of packed content in 40 entries, far under the
  * 2,000-entry batch, with nobody else writing. Before OWN-16 the pre-B107
  * code put all of it in one pack; now the pack is sealed each time it fills,
  * and each seal is the only reason the store phase commits.
@@ -231,7 +241,7 @@ static void verify_clean(store_t *s, cutils_db_t *d, int64_t rid)
 static void test_a_small_backup_seals_at_256_mib(void **state)
 {
     (void)state;
-    const size_t n = 8 * MIB;
+    const size_t n = MIB / 2;
     uint8_t *buf = malloc(n);
     assert_non_null(buf);
     for (int i = 0; i < 40; i++) {
@@ -266,13 +276,14 @@ static void test_a_small_backup_seals_at_256_mib(void **state)
  * A pack past the seal, as an old backup or any replica writes one, through
  * every path that reads or rewrites packs.
  */
-#define BIG_ENTRIES  20      /* of 16 MiB: 320 MiB in one pack */
+#define BIG_ENTRIES  20      /* of 1 MiB: 20 MiB in one pack */
+#define BIG_N        ((size_t)MIB)
 #define BIG_DEAD     2       /* entries no snapshot names, for gc to drop */
 
 static void test_an_oversized_pack_verifies_restores_replicates_and_gcs(void **state)
 {
     (void)state;
-    const size_t n = (size_t)PACK_STREAM_THRESHOLD;   /* largest packed entry */
+    const size_t n = BIG_N;
     uint8_t *buf = malloc(n);
     assert_non_null(buf);
 
@@ -315,7 +326,7 @@ static void test_an_oversized_pack_verifies_restores_replicates_and_gcs(void **s
     verify_clean(store, db, repo_id);
 
     /*
-     * Damage a byte of the last entry, which starts past 256 MiB, and have
+     * Damage a byte of the last entry, which starts past the seal, and have
      * verify repair it from parity: the parity trailer is addressed by entry
      * index and offset, and those have to be right this far in.
      */
@@ -358,8 +369,8 @@ static void test_an_oversized_pack_verifies_restores_replicates_and_gcs(void **s
 
     /*
      * Replication copies out of it, and the replica reindexes and verifies.
-     * The snapshot's 288 MiB of files does not arrive as one pack, as it
-     * did before OWN-19, but sealed at 256 MiB like a backup's.
+     * The snapshot's 18 MiB of files does not arrive as one pack, as it
+     * did before OWN-19, but sealed at the 16 MiB test seal like a backup's.
      */
     replica_sink_t sink;
     assert_int_equal(replica_sink_local_open(TEST_REPL, &marker, &sink), OK);
@@ -398,8 +409,8 @@ static void test_an_oversized_pack_verifies_restores_replicates_and_gcs(void **s
 
     /*
      * gc drops the two entries nothing names and rewrites what is left,
-     * split at the seal (OWN-19): the 288 MiB of live entries come out as
-     * two packs, neither past 256 MiB, where they used to stay one
+     * split at the seal (OWN-19): the 18 MiB of live entries come out as
+     * two packs, neither past the 16 MiB seal, where they used to stay one
      * oversized pack that every later rewrite would copy whole again.
      */
     gc_result_t g;

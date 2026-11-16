@@ -92,7 +92,8 @@ typedef struct {
  * to spare. The packs this is actually for are the trailing partial one each
  * backup leaves behind, which is nowhere near the cap.
  */
-#define PACK_COALESCE_SMALL_BYTES    (PACK_MAX_MULTI_BYTES / 4)
+#define PACK_COALESCE_SMALL_DIV      4u
+#define PACK_COALESCE_SMALL_BYTES    (pack_seal_bytes() / PACK_COALESCE_SMALL_DIV)
 /* Do not rewrite unless the merge removes at least this many pack files. */
 #define PACK_COALESCE_MIN_REDUCTION  2u
 #define PACK_COALESCE_MIN_SMALL      8u
@@ -112,7 +113,7 @@ typedef struct {
  * merges full packs into full packs forever. Cheap to get wrong again by
  * tuning one constant, so state it where the compiler checks it.
  */
-_Static_assert(PACK_COALESCE_SMALL_BYTES < PACK_MAX_MULTI_BYTES,
+_Static_assert(PACK_MAX_MULTI_BYTES / PACK_COALESCE_SMALL_DIV < PACK_MAX_MULTI_BYTES,
                "coalesce smallness must be below the pack seal size");
 
 /* Sweeper intelligence constants */
@@ -626,6 +627,20 @@ typedef struct {
 #define PARITY_WINDOW_GROUPS_DEFAULT \
     ((size_t)(PACK_STREAM_THRESHOLD / EP_GROUP_DATA))
 static _Atomic size_t parity_window_groups_cfg = PARITY_WINDOW_GROUPS_DEFAULT;
+
+/* The seal every writer rolls over at; see pack_test_set_seal. */
+static _Atomic uint64_t pack_seal_cfg = PACK_MAX_MULTI_BYTES;
+
+void pack_test_set_seal(uint64_t bytes)
+{
+    atomic_store_explicit(&pack_seal_cfg, bytes ? bytes : PACK_MAX_MULTI_BYTES,
+                          memory_order_relaxed);
+}
+
+uint64_t pack_seal_bytes(void)
+{
+    return atomic_load_explicit(&pack_seal_cfg, memory_order_relaxed);
+}
 
 void pack_test_set_parity_window(size_t groups)
 {
@@ -2788,7 +2803,7 @@ uint32_t pack_stored_count(const pack_stored_writer_t *w)
 int pack_stored_full(const pack_stored_writer_t *w, uint64_t len)
 {
     if (!w || w->count == 0) return 0;
-    return w->body + sizeof(pack_dat_entry_hdr_t) + len > PACK_MAX_MULTI_BYTES;
+    return w->body + sizeof(pack_dat_entry_hdr_t) + len > pack_seal_bytes();
 }
 
 status_t pack_stored_open(store_t *store, pack_stored_writer_t **out)
@@ -3963,7 +3978,7 @@ int pack_backup_full(const pack_backup_writer_t *w, uint64_t bytes)
 {
     if (!w || !w->pw.dat_f || w->pw.packed == 0) return 0;
     return w->pw.body_offset + sizeof(pack_dat_entry_hdr_t) + bytes
-           > PACK_MAX_MULTI_BYTES;
+           > pack_seal_bytes();
 }
 
 status_t pack_backup_rollover(pack_backup_writer_t *w)
@@ -4153,7 +4168,7 @@ static void *pack_unified_worker(void *arg) {
         /* Pack split check: use stored size (upper bound) */
         uint64_t entry_bytes_ub = sizeof(pack_dat_entry_hdr_t) + m->compressed_size;
         if (pw.dat_f && pw.packed > 0 &&
-            pw.body_offset + entry_bytes_ub > PACK_MAX_MULTI_BYTES) {
+            pw.body_offset + entry_bytes_ub > pack_seal_bytes()) {
             status_t st = pw_finalize(&pw);
             if (st != OK) { close(fd); pw.error = st; break; }
         }
@@ -4464,7 +4479,7 @@ status_t repo_pack_report(store_t *store, pack_report_t *out,
      * workers than needed.  Use 1 worker per ~PACK_MAX_MULTI_BYTES of data
      * to avoid creating lots of tiny packs. */
     {
-        uint32_t packs_needed = (uint32_t)(total_bytes_for_pack / PACK_MAX_MULTI_BYTES) + 1;
+        uint32_t packs_needed = (uint32_t)(total_bytes_for_pack / pack_seal_bytes()) + 1;
         if (n_workers > packs_needed) n_workers = packs_needed;
     }
     if (n_workers < 1) n_workers = 1;
@@ -5012,7 +5027,7 @@ static status_t pack_rw_copy(pack_rw_t *rw, FILE *src, const pack_dat_entry_hdr_
 
     uint64_t entry_total = sizeof(*ehdr) + ehdr->compressed_size;
 
-    if (rw->cur && rw->cur_n > 0 && rw->body + entry_total > PACK_MAX_MULTI_BYTES) {
+    if (rw->cur && rw->cur_n > 0 && rw->body + entry_total > pack_seal_bytes()) {
         status_t st = pack_rw_seal(rw);
         if (st != OK) return st;
     }
@@ -5230,8 +5245,8 @@ static status_t maybe_coalesce_packs(store_t *store,
      * on every GC.
      */
     {
-        uint64_t out_packs = (cand_bytes + PACK_MAX_MULTI_BYTES - 1)
-                             / PACK_MAX_MULTI_BYTES;
+        uint64_t out_packs = (cand_bytes + pack_seal_bytes() - 1)
+                             / pack_seal_bytes();
         if (out_packs >= n_cand ||
             (uint64_t)n_cand - out_packs < PACK_COALESCE_MIN_REDUCTION) {
             log_info("pack-coalesce: %zu candidate(s) would produce %llu pack(s),"
