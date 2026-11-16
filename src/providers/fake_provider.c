@@ -806,6 +806,13 @@ static status_t f_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
                 snprintf(src, sizeof(src), "hook:%s", u->blobs[i].id + 5);
                 if (!(it->source = strdup(src))) st = set_error(ERR_NOMEM, "fake");
             }
+            /* And a blob named log:<hook> is that hook's log, filled by the
+             * helper once the hook has run, as the container providers'. */
+            if (!u->blobs[i].stream && strncmp(u->blobs[i].id, "log:", 4) == 0) {
+                char src[96];
+                snprintf(src, sizeof(src), "hook:%s", u->blobs[i].id + 4);
+                if (!(it->source = strdup(src))) st = set_error(ERR_NOMEM, "fake");
+            }
             if (!(it->tree_path = strdup(u->blobs[i].path))) st = set_error(ERR_NOMEM, "fake");
         }
         for (size_t i = 0; st == OK && i < u->nd; i++) {

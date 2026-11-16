@@ -1023,6 +1023,35 @@ static void run_drain(run_t *x)
     }
 }
 
+/*
+ * A run has ended: the rest of its stderr, then how it ended, into its log
+ * (B141). A hook inside a unit writes its stderr through the backend (the
+ * docker exec stream is demultiplexed on the backend's own thread), which
+ * may still be writing when the process is reported gone, so the pipe is
+ * read to its end, not to what happens to be there: up to 5 s for the last
+ * writer to close it. The closing line means a log is never empty, and a
+ * failed dump, which is not stored, always says why.
+ */
+static void run_finish(run_t *x)
+{
+    char buf[4096];
+    for (int waited_ms = 0; waited_ms < 5000;) {
+        ssize_t n = read(x->err_fd, buf, sizeof(buf));
+        if (n > 0) { if (hooklog_append(&x->log, buf, (size_t)n) != 0) break; continue; }
+        if (n == 0) break;                         /* every writer is gone */
+        if (errno != EAGAIN && errno != EINTR) break;
+        struct pollfd pf = { x->err_fd, POLLIN, 0 };
+        (void)poll(&pf, 1, 100);
+        waited_ms += 100;
+    }
+    char line[96];
+    if (x->timed_out)
+        snprintf(line, sizeof(line), "\n[c-backup: killed at its timeout, exit status %d]\n", x->status);
+    else
+        snprintf(line, sizeof(line), "\n[c-backup: exit status %d]\n", x->status);
+    (void)hooklog_append(&x->log, line, strlen(line));
+}
+
 /* Reap a run if it ended; kill it if it is past its deadline. Caller
  * holds mu. */
 static void run_poll(run_t *x, time_t now)
@@ -1035,13 +1064,13 @@ static void run_poll(run_t *x, time_t now)
         if (x->b->hook_poll(x->hr, &code)) {
             x->done = 1;
             x->status = code;
-            run_drain(x);
+            run_finish(x);
         } else if (now >= x->deadline) {
             x->b->hook_kill(x->hr);
             x->done = 1;
             x->timed_out = 1;
             x->status = 128 + SIGKILL;
-            run_drain(x);
+            run_finish(x);
         }
         return;
     }
@@ -1049,7 +1078,7 @@ static void run_poll(run_t *x, time_t now)
     if (p == x->pid) {
         x->done = 1;
         x->status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
-        run_drain(x);
+        run_finish(x);
         return;
     }
     if (now >= x->deadline) {
@@ -1058,7 +1087,7 @@ static void run_poll(run_t *x, time_t now)
         x->done = 1;
         x->timed_out = 1;
         x->status = 128 + SIGKILL;
-        run_drain(x);
+        run_finish(x);
     }
 }
 

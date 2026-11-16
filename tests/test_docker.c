@@ -15,6 +15,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -773,6 +774,12 @@ static void test_demux(void **state)
 
 int main(void)
 {
+    /* As c-backup-helper does (helper_main.c): a write to a pipe or socket
+     * whose reader has gone (a dump nobody reads any more, the fake engine
+     * closing first) is an EPIPE to handle, not the end of the process.
+     * Left at the default, a run under load died of SIGPIPE in a later
+     * test, from an exec thread of an earlier one. */
+    signal(SIGPIPE, SIG_IGN);
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_instant_no_pause, setup, teardown),
