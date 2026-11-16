@@ -562,6 +562,21 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
   re-registered, keeping its history. The UUID in the marker is its identity,
   not the path: move a repository, register the new location, and it links
   back to its snapshots.
+- **Registering a repository whose snapshots the index does not hold
+  starts a reindex.** That is the case on a new host, after `state.db` is
+  lost (section 17.1), for a replica, or for a repository removed and added
+  back: the repository holds the snapshot records, and the database is an
+  index built from them. Until the reindex runs, `snapshots` lists nothing
+  and a `verify` passes having checked nothing, so registration counts the
+  records under `<repo>/snapshots` against the index and, when some are
+  missing, queues a `reindex` job itself. The reply says so,
+  `"snapshots_unindexed":3,"reindex_job":17`; the log reads `repo 4 holds
+  3 snapshot(s) the index does not; reindex job 17 queued`; the job and its
+  journal entry carry origin `register`. Wait for that job before trusting
+  a listing or a verify. An encrypted repository registered without its
+  key cannot be read yet: the reply carries `snapshots_unindexed` and the
+  key warning, nothing is queued, and `reindex` is for after the key is
+  loaded (registering it again with the passphrase queues it then).
 - Adding a repository that is already registered succeeds and says so
   (`"already_registered":true`, HTTP 200 rather than 201). A label given
   that differs from the stored one replaces it; leaving the label out keeps
@@ -1866,16 +1881,20 @@ configured: <title>: <body>` without.
 ### 17.1 The database is lost or corrupt
 
 Backups are intact; the index is not. Start the daemon with an empty
-database, register each repository again (its marker identifies it), and
-rebuild:
+database and register each repository again (its marker identifies it).
+Registration sees snapshots the index does not hold and queues the reindex
+itself (section 5.1); wait for the `reindex_job` it names:
 
 ```sh
 sudo systemctl stop c-backupd
 sudo mv /var/lib/c-backupd/state.db /var/lib/c-backupd/state.db.bad
 sudo systemctl start c-backupd
-sudo c-backup repo add /srv/backup/main "Main"
-sudo c-backup reindex 1
+sudo c-backup repo add /srv/backup/main "Main"     # {"id":1,...,"reindex_job":1}
+sudo c-backup jobs 1                               # until "state":"completed"
 ```
+
+`c-backup reindex 1` runs the same job by hand, for an encrypted repository
+whose key was loaded after it was registered, or to rebuild again.
 
 Reindex walks every snapshot's trees, at roughly 764,000 rows per second.
 It fails, rather than completing, if any snapshot or pack cannot be read: the

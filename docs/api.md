@@ -255,6 +255,14 @@ an existing encrypted repository whose key is not on this host still
 succeeds, and the answer carries `key_loaded: false` and a `warning` saying
 `no key loaded for repository <uuid>` and how to supply it.
 
+When the repository holds snapshot records (`<repo>/snapshots/<id>`) that
+the index has no row for - an adopted repository, a replica, one removed
+and added back, or any after `state.db` was lost - either answer carries
+`snapshots_unindexed: N` and, unless the key is missing, `reindex_job: <id>`
+for the reindex the registration queued. That job's `origin` is `register`,
+as is its journal entry's `source`. Until it completes the snapshot list is
+short and a verify checks less than the repository holds.
+
 Repository ids are never reused. Removing the newest repository used to
 make its id the next one handed out, and the new repository inherited the
 old one's schedules, history and index rows, which deregistering does not
@@ -872,7 +880,8 @@ for a removal) while a job holds the repository.
 
 A job record carries `origin`, who asked for it: `api` for anything submitted
 over the API (the CLI and the app both are), `schedule` for the scheduler, with
-`schedule_id` naming the schedule (null otherwise).
+`schedule_id` naming the schedule (null otherwise), or `register` for the
+reindex a repository registration queues (`POST /repos`).
 
 `/jobs/stream/<id>` sends one `data:` frame at once with the job's state as it
 is, then a frame whenever it changes, and the same frame again every 5 seconds
@@ -895,8 +904,8 @@ stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it, and journalled then with that message:
 a daemon that was killed had no chance to journal it itself.
 
-A journal entry's `source` is the job's origin: `api`, or `schedule` with the
-message starting `schedule <id>`.
+A journal entry's `source` is the job's origin: `api`, `register`, or
+`schedule` with the message starting `schedule <id>`.
 
 What some jobs report in `result`, beyond the backup and restore counts:
 

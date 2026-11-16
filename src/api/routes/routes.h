@@ -145,6 +145,15 @@ status_t routes_submit_scheduled(struct job_manager *jm, int64_t repo_id,
                                  const char *action, const char *params,
                                  int64_t schedule_id, int64_t *out_job_id);
 
+/*
+ * Queue a reindex the daemon starts itself, recorded with `origin` (a
+ * string literal) as the job's origin and its journal source. Used by
+ * registration: a repository adopted with snapshots the index has never
+ * seen otherwise lists none and verifies "checked 0" until somebody
+ * thinks to reindex it.
+ */
+status_t routes_submit_reindex(int64_t repo_id, const char *origin, int64_t *out_job_id);
+
 /* Tags, notes, policy and the journal. Repo-scoped sub-handlers, dispatched
  * from repos.c like the snapshot ones. */
 void routes_metadata_init(cutils_db_t *db);
