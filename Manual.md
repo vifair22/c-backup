@@ -618,9 +618,12 @@ repository deletes its jobs, and the next job on another repository used
 to take the removed one's newest job id, so a script or log line holding
 it named an unrelated job; deleting the newest snapshot likewise gave its
 number to the next backup. Neither happens since 1.0.0, though ids already
-reused by an earlier build stay as they are. Snapshot numbering is tracked
-in the database: after a database loss, a reindex continues above the
-highest snapshot still in the repository.
+reused by an earlier build stay as they are. Snapshot numbering survives
+losing the database too: the repository records the highest snapshot id it
+ever issued in `snapshot-ids`, raised before each snapshot record is
+written, and a reindex continues above that mark, not above the highest
+snapshot still present. Pruning the newest snapshots and then rebuilding
+the index never hands their numbers out again (section 17).
 
 ### 5.3 Where to put a repository
 
