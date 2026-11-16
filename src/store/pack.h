@@ -438,8 +438,9 @@ status_t pack_gc(store_t *store,
  */
 void pack_resume_removals(store_t *store);
 
-/* Packs pack_gc_stats touched: rewritten without their dead entries, and
- * deleted outright because every entry was dead. Coalescing is not counted. */
+/* Packs pack_gc_stats touched: rewritten without their dead entries,
+ * deleted outright because every entry was dead, and merged by the
+ * coalescing pass that follows. */
 #define PACK_DAMAGED_LIST_MAX 100u
 
 /* Packs gc found it could not walk, listed with why (at most this many). */
@@ -454,6 +455,12 @@ typedef struct {
 typedef struct {
     uint32_t packs_rewritten;
     uint32_t packs_deleted;
+    /* Coalescing: small packs merged, and how many fewer pack files that
+     * left (merged minus written). 20 merged into 3 is 20 and 17. They
+     * were not counted, so a gc that merged 20 packs into 3 reported no
+     * pack activity at all (B122). */
+    uint32_t packs_coalesced;
+    uint32_t packs_removed_by_coalesce;
     /*
      * Entries copied by a rewrite or a coalesce that carried damage beyond
      * their parity (OWN-31). They are copied as they are, so one lost

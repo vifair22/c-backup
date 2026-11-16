@@ -74,6 +74,9 @@ typedef struct {
     uint64_t unreferenced_dropped_ranges;
     uint32_t dropped_listed;
     struct { uint32_t pack; uint64_t offset, length; } dropped[VERIFY_DROPPED_LIST_MAX];
+    /* File entries stored while still changing (OWN-45-LIVE), reported as a
+     * notice finding. Not loss: they never fail the run. */
+    uint64_t unsettled_files;
     int64_t  run_id;
 } verify_result_t;
 

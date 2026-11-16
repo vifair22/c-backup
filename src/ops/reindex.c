@@ -217,18 +217,22 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
         char ahex[OBJECT_HASH_SIZE * 2 + 1];
         hash_hex(e->acl_hash, ahex);
 
-        char dmaj[16], dmin[16];
+        char dmaj[16], dmin[16], nflags[8];
         snprintf(dmaj, sizeof(dmaj), "%u", e->dev_major);
         snprintf(dmin, sizeof(dmin), "%u", e->dev_minor);
+        /* The "may be torn" flag is the tree's, so it comes back with the
+         * rows (OWN-45-LIVE). */
+        snprintf(nflags, sizeof(nflags), "%u", (unsigned)e->flags);
 
         int rc = db_execute_non_query(ctx->db,
             "INSERT OR REPLACE INTO nodes"
             " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
             "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
-            "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor)"
+            "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor,"
+            "  flags)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
             "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?,"
-            "         NULLIF(?,''), NULLIF(?,''), ?, ?)",
+            "         NULLIF(?,''), NULLIF(?,''), ?, ?, ?)",
             (const char *[]){ repo, id, snap, parent, e->name, ntype, mode,
                               uid, gid, mtime, size,
                               (have_target && !is_dir) ? thex : "",
@@ -236,7 +240,7 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
                               ltarget, hgroup,
                               hash_is_zero(e->xattr_hash) ? "" : xhex,
                               hash_is_zero(e->acl_hash)   ? "" : ahex,
-                              dmaj, dmin, NULL }, NULL);
+                              dmaj, dmin, nflags, NULL }, NULL);
         if (rc != 0) {
             st = set_error(ERR_IO, "reindex: cannot insert node");
             break;
@@ -1026,7 +1030,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     status_t st = OK;
     long long first_failed = 0;
     long long highest_record = 0;
-    char first_err[256] = "";
+    char first_err[ERR_MSG_MAX] = "";
 
     /* Packs first: the tree walk resolves packed objects through these rows,
      * so rebuilding them afterwards would be too late. */
@@ -1088,7 +1092,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* Tags last: they attach to snapshot rows, which now exist. */
     status_t tst = repo_tags_restore(db, repo_id, store_root(store),
                                      &total.tags_restored, &total.tags_skipped);
-    char tags_err[256] = "";
+    char tags_err[ERR_MSG_MAX] = "";
     if (tst != OK) {
         snprintf(tags_err, sizeof(tags_err), "%s", err_msg());
         err_clear();

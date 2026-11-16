@@ -2853,14 +2853,16 @@ static comp_scratch_t *comp_scratch(void)
  * On return *out points at either the caller's buffer or *owned, which the
  * caller frees.
  */
-/* Does the window of up to want bytes at off compress enough to bother? */
+/* Does the window of up to want bytes at off compress enough to bother?
+ * *out_sc (may be NULL) gets the compressed size; the output is in cs->buf. */
 static int probe_passes(const uint8_t *in, uint64_t len, uint64_t off,
-                        uint64_t want, const comp_scratch_t *cs)
+                        uint64_t want, const comp_scratch_t *cs, int *out_sc)
 {
     uint64_t left = len - off;
     int sample_len = left > want ? (int)want : (int)left;
     int sc = LZ4_compress_default((const char *)in + off, (char *)cs->buf,
                                   sample_len, cs->cap);
+    if (out_sc) *out_sc = sc;
     return sc > 0 && (double)sc / (double)sample_len <= PACK_PROBE_RATIO;
 }
 
@@ -2886,19 +2888,26 @@ static void pb_compress(const uint8_t *in, uint64_t len,
         cs->cap = bound;
     }
 
-    int pass;
+    int pass, sc = 0;
     if (len <= 2 * (uint64_t)PACK_PROBE_SIZE) {
-        pass = probe_passes(in, len, 0, PACK_PROBE_SIZE, cs);
+        pass = probe_passes(in, len, 0, PACK_PROBE_SIZE, cs, &sc);
     } else {
         const uint64_t w = PACK_PROBE_SIZE / 2;
         const uint64_t at[4] = { 0, len / 3, len / 3 * 2, len - w };
         pass = 0;
         for (int k = 0; k < 4 && !pass; k++)
-            pass = probe_passes(in, len, at[k], w, cs);
+            pass = probe_passes(in, len, at[k], w, cs, NULL);
     }
     if (!pass) return;
 
-    int csz = LZ4_compress_default((const char *)in, (char *)cs->buf,
+    /* An object no larger than the head probe was compressed whole by it,
+     * so the probe's output, still in cs->buf, is the result. Compressing it
+     * again was a second LZ4 pass over every small file: half the codec's
+     * time on a tree of them (PERF.md, 2026-11-16). Same input, same
+     * function, same bytes. */
+    int csz = len <= (uint64_t)PACK_PROBE_SIZE
+            ? sc
+            : LZ4_compress_default((const char *)in, (char *)cs->buf,
                                    (int)len, cs->cap);
     if (csz <= 0 || (uint64_t)csz >= len) return;
 
@@ -4049,9 +4058,15 @@ static status_t maybe_coalesce_packs(store_t *store, gc_live_t *live,
     rc = pack_rw_replace(&rw, old_nums, n_cand, &base, &packs_written);
     pack_rw_free(&rw);
     free(old_nums);
-    if (rc == OK)
+    if (rc == OK) {
         log_info("pack-coalesce: merged %zu pack(s) into %zu pack(s) (%u objects)",
                  n_cand, packs_written, total_live);
+        if (stats) {
+            stats->packs_coalesced += (uint32_t)n_cand;
+            if (n_cand > packs_written)
+                stats->packs_removed_by_coalesce += (uint32_t)(n_cand - packs_written);
+        }
+    }
     free(cand);
     return rc;
 }

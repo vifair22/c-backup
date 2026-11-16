@@ -176,6 +176,10 @@ CREATE TABLE nodes (
     -- Character and block devices: the pair of numbers is the whole file.
     dev_major         INTEGER NOT NULL DEFAULT 0,
     dev_minor         INTEGER NOT NULL DEFAULT 0,
+    -- MANIFEST_FLAG_* from the tree entry: 1 is "never settled while it was
+    -- read, the stored bytes may mix two versions" (OWN-45-LIVE). Carried
+    -- from the tree, so a reindex restores it.
+    flags             INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo_id, id),
     FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
 );

@@ -75,6 +75,39 @@ static const char *level_name(verify_level_t l)
 
 #define VERIFY_ROOTED " FROM up WHERE COALESCE(up.parent, 0) = 0"
 
+/*
+ * Regular-file node rows that name no file content: a file the snapshot
+ * claims and no restore can produce. "?1" is the repo id. Directories and
+ * symlinks have a NULL content_hash too, so the type is what decides; the
+ * (repo_id, content_hash) index serves the NULL lookup.
+ *
+ * In format 3 a file's content is a FILE object or a CHUNKLIST, an empty
+ * file included (the chunker stores an empty FILE object for it), so a
+ * file entry naming an indexed object of any other type - a tree, an xattr
+ * blob - is as unrestorable as one naming nothing, and is counted with
+ * them. An object the index does not have at all is not this check's: the
+ * object walk and gc's content_missing see those.
+ */
+#define VERIFY_CONTENTLESS                                                  \
+    "n.repo_id = ?1 AND n.type = 1"                                         \
+    " AND (n.content_hash IS NULL OR n.content_hash = ''"                   \
+    "      OR EXISTS (SELECT 1 FROM objects o WHERE o.repo_id = ?1"         \
+    "                 AND o.hash = n.content_hash AND o.type NOT IN (1, 6)))"
+
+/* The status a contentless file entry is recorded under, hash empty. */
+#define VERIFY_CONTENTLESS_STATUS "missing: file entry has no content"
+
+/* File entries flagged as never settled while read (OWN-45-LIVE). */
+#define VERIFY_UNSETTLED "n.repo_id = ?1 AND n.type = 1 AND (n.flags & 1) != 0"
+
+/*
+ * A notice is a finding that is not damage: it is listed with the rest and
+ * never counts as loss. Every notice status starts with this.
+ */
+#define VERIFY_NOTICE_PREFIX "notice: "
+#define VERIFY_UNSETTLED_STATUS \
+    VERIFY_NOTICE_PREFIX "stored while still changing; may not be internally consistent"
+
 /* Example paths per finding, and snapshot ids listed per finding. Both are
  * samples; the counts beside them are exact. */
 #define FINDING_SAMPLE_PATHS 3
@@ -87,7 +120,8 @@ static const char *level_name(verify_level_t l)
 static int status_is_loss(const char *status)
 {
     return strcmp(status, "repaired") != 0 && strcmp(status, "recoverable") != 0 &&
-           strcmp(status, "salvaged") != 0;
+           strcmp(status, "salvaged") != 0 &&
+           strncmp(status, VERIFY_NOTICE_PREFIX, sizeof(VERIFY_NOTICE_PREFIX) - 1) != 0;
 }
 
 /*
@@ -214,10 +248,19 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     if (db_execute(db,
             "WITH RECURSIVE lost(h) AS ("
             "  SELECT DISTINCT hash FROM verify_findings"
-            "   WHERE run_id = ?2 AND status NOT IN ('repaired', 'recoverable')),"
+            "   WHERE run_id = ?2 AND status NOT IN ('repaired', 'recoverable')"
+            "     AND status NOT LIKE '" VERIFY_NOTICE_PREFIX "%'),"
             " up(snap, parent, path, depth) AS ("
             "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
             "    FROM lost JOIN nodes n ON n.repo_id = ?1 AND n.content_hash = lost.h"
+            /* Contentless file entries are loss too, with no hash to join
+             * on; they are seeded only when this run recorded them. */
+            "  UNION ALL"
+            "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
+            "    FROM nodes n WHERE " VERIFY_CONTENTLESS
+            "     AND EXISTS (SELECT 1 FROM verify_findings"
+            "                  WHERE run_id = ?2 AND status = '"
+            VERIFY_CONTENTLESS_STATUS "')"
             VERIFY_PATH_WALK
             " SELECT COUNT(DISTINCT path), COUNT(DISTINCT snap)"
             VERIFY_ROOTED,
@@ -228,6 +271,149 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
         log_warn("verify: cannot total the blast radius of run %s", run);
     }
     db_result_free(r);
+}
+
+/*
+ * One finding over every node row a rule matches, with an empty hash since
+ * it is about entries rather than an object, its paths and snapshots
+ * resolved the way an object finding's are. cond is a WHERE clause over
+ * nodes n with ?1 the repo id. Returns how many rows matched.
+ */
+static uint64_t record_node_rule(cutils_db_t *db, int64_t repo_id, int64_t run_id,
+                                 const char *cond, const char *status,
+                                 char *paths, size_t paths_sz, uint64_t *snaps_out)
+{
+    char repo[32], run[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
+    size_t off = 0;
+    paths[0] = '\0';
+    *snaps_out = 0;
+    uint64_t n_files = 0, n_versions = 0;
+    char sql[2048];
+
+    db_result_t *r = NULL;
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM nodes n WHERE %s", cond);
+    if (db_execute(db, sql, (const char *[]){ repo, NULL }, &r) != 0 || !r ||
+        r->nrows != 1) {
+        db_result_free(r);
+        log_warn("verify: cannot check the index for \"%s\"", status);
+        return 0;
+    }
+    n_versions = strtoull(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    if (n_versions == 0) return 0;
+
+    r = NULL;
+    snprintf(sql, sizeof(sql),
+             "WITH RECURSIVE up(snap, parent, path, depth) AS ("
+             "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
+             "    FROM nodes n WHERE %s"
+             VERIFY_PATH_WALK
+             " SELECT path, COUNT(*) OVER ()"
+             VERIFY_ROOTED
+             " GROUP BY path ORDER BY path LIMIT " VERIFY_STR(FINDING_SAMPLE_PATHS),
+             cond);
+    if (db_execute(db, sql, (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows > 0) {
+        n_files = strtoull(r->rows[0][1], NULL, 10);
+        for (int i = 0; i < r->nrows && i < FINDING_SAMPLE_PATHS; i++) {
+            int w = snprintf(paths + off, paths_sz - off, "%s%s",
+                             off ? ", " : "", r->rows[i][0]);
+            if (w < 0 || (size_t)w >= paths_sz - off) break;
+            off += (size_t)w;
+        }
+    }
+    db_result_free(r);
+
+    char snaps[FINDING_SNAPSHOT_IDS * 24];
+    snaps[0] = '\0';
+    uint64_t n_snaps = 0;
+    r = NULL;
+    snprintf(sql, sizeof(sql),
+             "SELECT snap_id, COUNT(*) OVER () FROM"
+             " (SELECT DISTINCT n.snap_id AS snap_id FROM nodes n WHERE %s)"
+             " ORDER BY snap_id LIMIT " VERIFY_STR(FINDING_SNAPSHOT_IDS), cond);
+    if (db_execute(db, sql, (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows > 0) {
+        n_snaps = strtoull(r->rows[0][1], NULL, 10);
+        size_t so = 0;
+        for (int i = 0; i < r->nrows && i < FINDING_SNAPSHOT_IDS; i++) {
+            int w = snprintf(snaps + so, sizeof(snaps) - so, "%s%s",
+                             so ? "," : "", r->rows[i][0]);
+            if (w < 0 || (size_t)w >= sizeof(snaps) - so) break;
+            so += (size_t)w;
+        }
+    }
+    db_result_free(r);
+
+    char nf[32], nv[32], ns[32];
+    snprintf(nf, sizeof(nf), "%llu", (unsigned long long)n_files);
+    snprintf(nv, sizeof(nv), "%llu", (unsigned long long)n_versions);
+    snprintf(ns, sizeof(ns), "%llu", (unsigned long long)n_snaps);
+    if (db_execute_non_query(db,
+            "INSERT INTO verify_findings"
+            " (run_id, repo_id, hash, status, affected_files, sample_paths,"
+            "  affected_snapshots, affected_versions, affected_snapshot_count,"
+            "  snapshots_truncated)"
+            " VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?)",
+            (const char *[]){ run, repo, status, nf, paths, snaps, nv, ns,
+                              n_snaps > FINDING_SNAPSHOT_IDS ? "1" : "0", NULL },
+            NULL) != 0)
+        log_warn("verify: cannot record the finding \"%s\"", status);
+    *snaps_out = n_snaps;
+    return n_versions;
+}
+
+/*
+ * File entries in the index with no content (B118).
+ *
+ * Every check above is about objects: does each one the index registers
+ * resolve, parse and hash. A file entry that names no object at all passes
+ * every one of them, because there is nothing to find damaged. A backup
+ * that recorded a file it then could not read left exactly that, and verify
+ * reported 52 of 52 objects intact on a snapshot no full restore could
+ * complete. Backup no longer writes such an entry and the tree writer
+ * refuses one, so this finds what older builds left behind, or what
+ * anything else ever manages to slip in. Each node row counts as one
+ * missing item: one version of one file the repository does not have.
+ */
+static uint64_t check_contentless_files(cutils_db_t *db, int64_t repo_id,
+                                        int64_t run_id)
+{
+    char paths[FINDING_SAMPLE_PATHS * (PATH_MAX + 2)];
+    uint64_t n_snaps = 0;
+    uint64_t n = record_node_rule(db, repo_id, run_id, VERIFY_CONTENTLESS,
+                                  VERIFY_CONTENTLESS_STATUS, paths, sizeof(paths),
+                                  &n_snaps);
+    if (n)
+        log_error("verify: %llu file entr%s in %llu snapshot(s) name no content and "
+                  "cannot be restored: %s",
+                  (unsigned long long)n, n == 1 ? "y" : "ies",
+                  (unsigned long long)n_snaps, paths);
+    return n;
+}
+
+/*
+ * Files stored although they never settled while the backup read them
+ * (OWN-45-LIVE): their tree entries carry MANIFEST_FLAG_UNSETTLED, and the
+ * index rows the flag. Nothing is lost - the stored bytes read back and
+ * hash - but they may mix two versions of the file, so this is a notice:
+ * a finding an operator can read, never counted as loss, never failing the
+ * run. Returns how many entries carry the flag.
+ */
+static uint64_t check_unsettled_files(cutils_db_t *db, int64_t repo_id,
+                                      int64_t run_id)
+{
+    char paths[FINDING_SAMPLE_PATHS * (PATH_MAX + 2)];
+    uint64_t n_snaps = 0;
+    uint64_t n = record_node_rule(db, repo_id, run_id, VERIFY_UNSETTLED,
+                                  VERIFY_UNSETTLED_STATUS, paths, sizeof(paths),
+                                  &n_snaps);
+    if (n)
+        log_warn("verify: %llu file entr%s in %llu snapshot(s) were stored while "
+                 "still changing and may not be internally consistent: %s",
+                 (unsigned long long)n, n == 1 ? "y" : "ies",
+                 (unsigned long long)n_snaps, paths);
+    return n;
 }
 
 /*
@@ -764,6 +950,10 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         st = verify_lists(store, db, repo_id, &res, &lost, cancel);
     }
     free(lost.h);
+    /* Every level: it reads the index and nothing else. */
+    if (st == OK) res.missing += check_contentless_files(db, repo_id, res.run_id);
+    /* A notice, not loss: it neither counts in missing nor fails the run. */
+    if (st == OK) res.unsettled_files = check_unsettled_files(db, repo_id, res.run_id);
 
     if (res.unrecoverable || res.missing)
         run_blast_radius(db, repo_id, res.run_id,

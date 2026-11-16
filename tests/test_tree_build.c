@@ -162,89 +162,89 @@ static void fx_free(scan_result_t *s)
     memset(s, 0, sizeof(*s));
 }
 
-/* ---- golden names, captured from backup.c at 015fee8 before OWN-43 ---- */
+/* ---- golden names: tree entry version 3 (OWN-45-LIVE flags byte) ---- */
 
 static const struct { uint32_t index; const char *name; } golden[] = {
-    {   1, "d1f209b17a01e0db1c30169a8163ab26deec67bc295fb88514b5191c51209bc8" }, /* /srv */
-    {   2, "d6d9d9e00eff70faaf9e516a0e7510678798296c6d46226d6c95bc30bc7e90ab" }, /* /home */
-    {   3, "c4ac1a8acdeb7255953873609f8c3a85c5d2b5e3d73096682532c92c34026aba" }, /* /srv/d00 */
-    {   5, "cdc6e9bdfcd4120b48925a221d7010cbdf34b54047c80d99057c5482e8c5d604" }, /* /srv/d00/d01 */
-    {   7, "18a783354f521fcc5b0bf2e1958feffded57d39c9c43ea8e474191ae3a6b7efe" }, /* /srv/d00/d01/d02 */
-    {   9, "bfde7fa64ba8fb3a55d90e296f9203efeac6ca0da8c48ee04210e4d7a396b519" }, /* /srv/d00/d01/d02/d03 */
-    {  11, "dcd8cdf7417ba9c9927eb47b2f028a9913c0c1008d6044094b7102d605ddafe6" }, /* /srv/d00/d01/d02/d03/d04 */
-    {  13, "41bae9412485ccde3160a2c78b6fc86a6385835d520ad9db5e2c0b1b7fcb6275" }, /* /srv/d00/d01/d02/d03/d04/d05 */
-    {  15, "891c18893bbdcaee241e030cb233630cad1b2dc4c20c9f686d458f461ace1b07" }, /* ...d00/d01/d02/d03/d04/d05/d06 */
-    {  17, "e9aacf520b3c51ba3aaa1acda4392cdae79bd51ff68c7cafd7b43dbec1efde50" }, /* ...d01/d02/d03/d04/d05/d06/d07 */
-    {  19, "593721114d11838e3f6f085c972ade2730547679d29568c8b1addd2f8fcb3394" }, /* ...d02/d03/d04/d05/d06/d07/d08 */
-    {  21, "ab677fd4af706b833781d5d0a22a9caf4678a8f9618c7dbe0e7c0714fa21e88e" }, /* ...d03/d04/d05/d06/d07/d08/d09 */
-    {  23, "d3af7a50014e677fd6d0683fabb0a488846bef192a01b948ec3efe7ef60ab7fc" }, /* ...d04/d05/d06/d07/d08/d09/d10 */
-    {  25, "ca46ca02b46d45c0548215f1ccfa45c1b6fb66182d953cbe534343b2e44e581d" }, /* ...d05/d06/d07/d08/d09/d10/d11 */
-    {  27, "d5fbd132772e2787e40b677977a0d33f9988ace80e433a7f15c32634563160a6" }, /* ...d06/d07/d08/d09/d10/d11/d12 */
-    {  29, "ce1bfeba3e5ff1b4aa63126c954f2e2781c513d7661755764aa2a5d6ff3c138d" }, /* ...d07/d08/d09/d10/d11/d12/d13 */
-    {  31, "f4dd018a8ae7ae135b9bed770be99d2f6225bf0da0bf4615699b83d8d5e9260a" }, /* ...d08/d09/d10/d11/d12/d13/d14 */
-    {  33, "bc46898c771b090af8a306518af3918c2512ea0dbaef34f3808099206847ce85" }, /* ...d09/d10/d11/d12/d13/d14/d15 */
-    {  35, "47409d20ffd605a239a8f2965128d56751a32513d922baedd451147f71cac45f" }, /* ...d10/d11/d12/d13/d14/d15/d16 */
-    {  37, "0aa965522ee373e8d6ed31d83a90f8edccdfaef808afc89a114dd555de6ba09e" }, /* ...d11/d12/d13/d14/d15/d16/d17 */
-    {  39, "6c17ce677ec0337734355553befc4cea24525af4b4081fded4ca95c03a72a69a" }, /* ...d12/d13/d14/d15/d16/d17/d18 */
-    {  41, "bc1db252e97c0508c289e9154ccd8edc7ec48874bf4f26e5c1372aba63de277a" }, /* ...d13/d14/d15/d16/d17/d18/d19 */
-    {  43, "6172884b7e06b14acfa8cfafc9aeef298749ea57838806cc085d52f600eec595" }, /* ...d14/d15/d16/d17/d18/d19/d20 */
-    {  45, "b6fac0e2a3a9e70e8ccaae4c0a09846022eca4b38ce4c809a2c8e228de662a9c" }, /* ...d15/d16/d17/d18/d19/d20/d21 */
-    {  47, "57830e9e1d9d4b45e6a23f7f8789093d2ace842dd40498f3b9ad626a88240a20" }, /* ...d16/d17/d18/d19/d20/d21/d22 */
-    {  49, "17fb32d6ccf13807fc6fff19241ddc7cd86993e7adf91ac4269e36d0be323c40" }, /* ...d17/d18/d19/d20/d21/d22/d23 */
-    {  51, "84d2c422747551af0b50452d3b594e8738e655035574f497795928242440fa5b" }, /* ...d18/d19/d20/d21/d22/d23/d24 */
-    {  53, "8fac3f2a684c911c3efeb225cdcdffe6fbe4b3ad8ab7f7f6109e295453903c53" }, /* ...d19/d20/d21/d22/d23/d24/d25 */
-    {  55, "872f5f0194c90967cc099f307d12140d6e7bbae54d95659e43726b7c554f2804" }, /* ...d20/d21/d22/d23/d24/d25/d26 */
-    {  57, "e61b1050ed41d34ceb8b39008feb3df92d01d5ac0978e2e40e7d4479dbf42723" }, /* ...d21/d22/d23/d24/d25/d26/d27 */
-    {  59, "64c83049e84ebae369969402917ec3267ab6f71de03cf46b0e6086f7b2c47e03" }, /* ...d22/d23/d24/d25/d26/d27/d28 */
-    {  61, "3d9d69b6dd317ae76edcf684ad8639dbdf4c707dc3325a42fdb6c694883f4034" }, /* ...d23/d24/d25/d26/d27/d28/d29 */
-    {  63, "0cd1955e297b2f1460fb0cbbaf14a9113e2960018f4622523f93cc70859f2e5a" }, /* ...d24/d25/d26/d27/d28/d29/d30 */
-    {  65, "b074b4e87a000a7ce0efa281bc1245ce59bde9542aec23c9625e8f32daf09bc5" }, /* ...d25/d26/d27/d28/d29/d30/d31 */
-    {  67, "e9fe02c8f19a5ca76e17879fdbf265e1b9f6e1eb736e999d812588ad59aa5edd" }, /* ...d26/d27/d28/d29/d30/d31/d32 */
-    {  69, "fca9b4bf513c717f33b55bb1338d53d0df40639a41b06193c75d06c2765c5d6c" }, /* ...d27/d28/d29/d30/d31/d32/d33 */
-    {  71, "825e383dbda39b65fda265d3db3c7ffa631b80f007222cbf69a44455c3055fc5" }, /* ...d28/d29/d30/d31/d32/d33/d34 */
-    {  73, "cb5f9b05876b6cd3058e18d95f39aed467710053f738fee4c25110eee69eec1b" }, /* ...d29/d30/d31/d32/d33/d34/d35 */
-    {  75, "3b7cf07aa498a77971d3d1d7a39bd66c8f142dafe2c6b4dcbe4ed196cb332616" }, /* ...d30/d31/d32/d33/d34/d35/d36 */
-    {  77, "51fba79338a7b4c493d852d874fa0d38953b2ff10904a80d1b286634ded45705" }, /* ...d31/d32/d33/d34/d35/d36/d37 */
-    {  79, "29606d65a047ea0850356d5ae53e55f918c7af11c59f70e6181a00936fd1380d" }, /* ...d32/d33/d34/d35/d36/d37/d38 */
-    {  81, "16c17be0c9289662d118886f1eecdce3181fe803fa5bf29cae09d3d189c42482" }, /* ...d33/d34/d35/d36/d37/d38/d39 */
-    {  83, "078d56eeaa2ebc8a5a183aaa0310b32f2ef35b9cb44d40f63ed087ff6aeadee2" }, /* /home/wide */
-    {  91, "a4a930b3cabd3e830bad1981612dcfa40d92592d96731eabc74e63684c6fa7b7" }, /* /home/wide/A292 */
-    { 102, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/~282 */
-    { 112, "b8d1505097a03e628f4dac5d639ef149a6f97b10742105fb17ec12a3e85750d6" }, /* /home/wide/_272 */
-    { 123, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/A262 */
-    { 133, "0ed570b0670d606787488b5687efa7c2be31d9ff651d975a603e1ed18f88305f" }, /* /home/wide/~252 */
-    { 144, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/_242 */
-    { 154, "0abdffaaec7728f85e6e4f356286b612fcad190cb4aee857627a3df409a1442e" }, /* /home/wide/A232 */
-    { 165, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/~222 */
-    { 175, "358de9ba02c1b5fc7bca8cfea59f24dad3af95eb2e35c521f24bfdb67377b6de" }, /* /home/wide/_212 */
-    { 186, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/A202 */
-    { 196, "9f74649c6eaa56f8c49e439ef0f761a952031f96fc09caf0023302d2aa9aa901" }, /* /home/wide/~192 */
-    { 207, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/_182 */
-    { 217, "53bea6355d2d028181dfcd3fe9393a84a5cae11e9f95bc89b2695d93dec4d596" }, /* /home/wide/A172 */
-    { 228, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/~162 */
-    { 238, "431dffcbf559ba690a8e4619a5ec4ec13f9cfcfc9a9ab0fa753ad12060963f55" }, /* /home/wide/_152 */
-    { 249, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/A142 */
-    { 259, "80a26ba2a595d75c0a16e6244af0fa5b0717da045498901c2bddd31155b19e20" }, /* /home/wide/~132 */
-    { 270, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/_122 */
-    { 280, "6b1143738b5a30fa938be5f9cf63933250f50bb7fe6ff9d2a0c8c72a973ad3d3" }, /* /home/wide/A112 */
-    { 291, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/~102 */
-    { 301, "66235b12ba8af7fa6189aaaf77b5f3581a884e173632e918bd58833633f49b59" }, /* /home/wide/_092 */
-    { 312, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/A082 */
-    { 322, "bfd345e5cb42870fb2d2be3d33e92b52399c2a8fd0ea3f0818fbecc107075d2d" }, /* /home/wide/~072 */
-    { 333, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/_062 */
-    { 343, "2165edd3acf6e1b15137a5f686c4803c0122d3e0127cdc3c9632e0171257e46a" }, /* /home/wide/A052 */
-    { 354, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/~042 */
-    { 364, "5b3eaaf6a6c1633db16e18efeadc37329dfc41b4a72ed3ebf0d442717150f1db" }, /* /home/wide/_032 */
-    { 375, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/A022 */
-    { 385, "bc8d22dddfa9e7fe3d33b6165609086ca01460273313988772659e691f73c33b" }, /* /home/wide/~012 */
-    { 396, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/wide/_002 */
-    { 399, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /srv/empty */
-    { 400, "c285608bbda53b2ad2d263a7a836a45672b6219018456549a9b8e64483683377" }, /* /home/empty */
-    { 404, "a5f03711c99d220ee29063770d074b36bf229dcb6cd914c695705cb06bf327c8" }, /* /srv/late */
+    {   1, "c887a898da43e3c9271be57f5bd7519fea04ea6d5e912d6c5012f3bbd1307e83" }, /* /srv */
+    {   2, "75fddfa95598b7e14a8952d8db34eb5d9fb3bd89bd2c4742dc7a9c54ebc97f85" }, /* /home */
+    {   3, "5076adfb1de135437438b69975ea8acd8ecab4473297036677474a99a1cc6343" }, /* /srv/d00 */
+    {   5, "e844b30d64de572b503a43bdae50ac7f66a5cb4a779e741a386bdf6f2afa072d" }, /* /srv/d00/d01 */
+    {   7, "cb17146527aec2a2d3810db82c884c4f1ec42a6471b3fca5c7b492fd2ffcf05b" }, /* /srv/d00/d01/d02 */
+    {   9, "b6772cfb93a1d8d6cf952d7204f844107168ae914f9bda6fd19f0d47d3b4a751" }, /* /srv/d00/d01/d02/d03 */
+    {  11, "8a12f8a4797e85ef07a280172cee475034227a135cbaba137d4ce8838c13482a" }, /* /srv/d00/d01/d02/d03/d04 */
+    {  13, "d88af729b21c403a806077856dc227df3fb6ddd4e3bf0791ece91e5e3efaebcb" }, /* /srv/d00/d01/d02/d03/d04/d05 */
+    {  15, "aa96181fc7e0c82a48ae2016a4ae7cae535a14fbf4e3fdf6adea654dbb13f65d" }, /* ...d00/d01/d02/d03/d04/d05/d06 */
+    {  17, "5c403f0bd315ce1209b7663d36e9a4f63a32765bf1e606c24fd1ee8b16db8266" }, /* ...d01/d02/d03/d04/d05/d06/d07 */
+    {  19, "c854d1c9beece303215e7f0d24ffe70247350eb40ced0939937ceb7bc81cc9f1" }, /* ...d02/d03/d04/d05/d06/d07/d08 */
+    {  21, "d2e4328cdb1f069f0d40100c78031a700a9521c7de9bf4737719bf1eeaced80d" }, /* ...d03/d04/d05/d06/d07/d08/d09 */
+    {  23, "bf33564de4e96fd9b47c40ecfc48f6053ced1f6a03937b52354a19391d00aecd" }, /* ...d04/d05/d06/d07/d08/d09/d10 */
+    {  25, "153206b07f614b6221b3382c9dea643fcb7902b86e4afefd465be73613a6c641" }, /* ...d05/d06/d07/d08/d09/d10/d11 */
+    {  27, "5c639b8e6dc438c13463941fbb73cf4011253f483bcbb790e4a61605370f3e70" }, /* ...d06/d07/d08/d09/d10/d11/d12 */
+    {  29, "62f9a75024641c0f177e34f86a61ff7e3570e82b53cf84f7d461ad7f968dba95" }, /* ...d07/d08/d09/d10/d11/d12/d13 */
+    {  31, "cd210bfdab644e9f25cb68269f9c239847d99582d3028859777ec58a81182e23" }, /* ...d08/d09/d10/d11/d12/d13/d14 */
+    {  33, "b1767b24cb1c4f3dd9897cf14273efdf02c3150c6d4e61c71cb79ac4e325edcf" }, /* ...d09/d10/d11/d12/d13/d14/d15 */
+    {  35, "22cd55569759e53095efd66a87dc0ed78bda2e6f8c87febfcc840685d908b823" }, /* ...d10/d11/d12/d13/d14/d15/d16 */
+    {  37, "82edc5b72e6e0faa386aead20c7cbc4f2c894872263b76f18515a523b8f76428" }, /* ...d11/d12/d13/d14/d15/d16/d17 */
+    {  39, "7c92708f7b8682ed9b70c992af3cb78c97ba5ca903fc07776a9cbb344aba9ee3" }, /* ...d12/d13/d14/d15/d16/d17/d18 */
+    {  41, "7e6549aa58f6acd488a0a419276ade821ec20234a8e4f3040f1df8a27fb06a45" }, /* ...d13/d14/d15/d16/d17/d18/d19 */
+    {  43, "5b8adf0de63e403bb84aa041d4e6265491a636ccba4eab916ee6abd0c5ebd874" }, /* ...d14/d15/d16/d17/d18/d19/d20 */
+    {  45, "00c99c63d202eec983669ec0fd6c69609c7359a2b3aa0b67e2b471dcdb00f2df" }, /* ...d15/d16/d17/d18/d19/d20/d21 */
+    {  47, "25e38a44bd7b985c1b8b75619b57fae2da29037e215e44650553f8970c26e073" }, /* ...d16/d17/d18/d19/d20/d21/d22 */
+    {  49, "6d291f7028d24fff70f812dfdafc6a1bd7a746b4728c8fd206842af61df98b6b" }, /* ...d17/d18/d19/d20/d21/d22/d23 */
+    {  51, "7930fc33c4ccaec98aea16aebcd61e1b06ad62846ee5c898c72ab47b7c94239a" }, /* ...d18/d19/d20/d21/d22/d23/d24 */
+    {  53, "94d6cdafaddbee3dcd1ae96d9c85f069e9244431dfbee591c6271555d4ff1a67" }, /* ...d19/d20/d21/d22/d23/d24/d25 */
+    {  55, "7a10f3e6da1ec8c49659a0bf903a4a92b263d7e8e2c64da231520c506bcb60e0" }, /* ...d20/d21/d22/d23/d24/d25/d26 */
+    {  57, "42495e9c3a997d91db6796e0a4a1292127baa29c024cf5e2de4215f4ba09f181" }, /* ...d21/d22/d23/d24/d25/d26/d27 */
+    {  59, "d20856ba3d414830fb03d74516a5936cb3c91a04112d3bc28b04a340fe809c6d" }, /* ...d22/d23/d24/d25/d26/d27/d28 */
+    {  61, "aa8041cd20a6881e1b5e904802e593284acb0e670bb9446b8a0ed68343b08e39" }, /* ...d23/d24/d25/d26/d27/d28/d29 */
+    {  63, "6f220679e7982e68bf7cf801c15b5a6b5815bdfd17234df4a083a1a938db52ab" }, /* ...d24/d25/d26/d27/d28/d29/d30 */
+    {  65, "e731ee29baaf4d9911e434f02036901a9f58ebd7919d34199c99f4db25ec4b90" }, /* ...d25/d26/d27/d28/d29/d30/d31 */
+    {  67, "34403df54e8e2deffa1f5ad13244ace4e79f65fb12b7204bf692ad1fa01623d4" }, /* ...d26/d27/d28/d29/d30/d31/d32 */
+    {  69, "08b3f5a4f78964145ab47ab43f29059e84c0957c106963fcca59a198a3a5b980" }, /* ...d27/d28/d29/d30/d31/d32/d33 */
+    {  71, "09b640ad3415154311c7a29c1ab072d39a9dc1edee6a8ee2e95ea726bc8688b1" }, /* ...d28/d29/d30/d31/d32/d33/d34 */
+    {  73, "abf6c697de24bbfa2deeae0a175a20adf2d125d1a6c349f7bf54b7eec5bd9c07" }, /* ...d29/d30/d31/d32/d33/d34/d35 */
+    {  75, "70f57380d8c1ef2d63bf4e52abb76672b2eb08cc0d181a81cdb76ef357cc16f8" }, /* ...d30/d31/d32/d33/d34/d35/d36 */
+    {  77, "d714489492d897c95af7838d22ba60137caa54ab483ee91e5079f3f4937e0df7" }, /* ...d31/d32/d33/d34/d35/d36/d37 */
+    {  79, "b339ccfc369c600396fa8597f69b3ec6b3055dff5e16388b914a1367eb9925e7" }, /* ...d32/d33/d34/d35/d36/d37/d38 */
+    {  81, "921847f3a85f71dd128f84a1ae794e322191821f6037c05e901d673a4d6190ae" }, /* ...d33/d34/d35/d36/d37/d38/d39 */
+    {  83, "c54949a67d4f42391a61bc202fcec5dce923c0bbf808d327345172092661a6e9" }, /* /home/wide */
+    {  91, "68b6bd542f8a68f21c4f3e7b40912a0b320177b3c9c46209fa649222e9f3e102" }, /* /home/wide/A292 */
+    { 102, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/~282 */
+    { 112, "47324b5185d49068c81110a80dce17cd4fe31d4fdff75bce1632968296f0a54a" }, /* /home/wide/_272 */
+    { 123, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/A262 */
+    { 133, "7c1e169b4f651f9aee4d0d9f0e87e283a246c8648b84e9c6462e44bb07c216db" }, /* /home/wide/~252 */
+    { 144, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/_242 */
+    { 154, "1e7ff493388492cc4b4fc94f6e6aa4a70ec26261352519861331c765f0b60659" }, /* /home/wide/A232 */
+    { 165, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/~222 */
+    { 175, "7dd93d4e3c91817ae7082928cf11d9628cd1f6b5eeab316411a7671d5f95fdb8" }, /* /home/wide/_212 */
+    { 186, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/A202 */
+    { 196, "a98ce394c6f4cbe59a5d0adc86c73dab8b16a602469d85d3c3a063d8ab2560ab" }, /* /home/wide/~192 */
+    { 207, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/_182 */
+    { 217, "decda99e00db91a3ea18956b486b659516ab606eda63424dc0ce8fa76b818b67" }, /* /home/wide/A172 */
+    { 228, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/~162 */
+    { 238, "120ffeb4775bb247d8d8e0c3d58134ce9a7f2d2e5089e91e99b98676265cf8d3" }, /* /home/wide/_152 */
+    { 249, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/A142 */
+    { 259, "a862d0b1692a14fcd2bd512cf0f634b416bd511630866eaa3841e449bc115e66" }, /* /home/wide/~132 */
+    { 270, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/_122 */
+    { 280, "490469030a19f6a5db3cb8551ced89b2745eef293675e35311152fa6f802c61f" }, /* /home/wide/A112 */
+    { 291, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/~102 */
+    { 301, "9fc48f18adad414008c7dbe1eb1fcb8f2232a3c45e9661b2d6a0471cfd92e99d" }, /* /home/wide/_092 */
+    { 312, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/A082 */
+    { 322, "ac05c1dcaed4e7964dd255ccc5b9f3efb5e94db13585d945347847c9c01b04b2" }, /* /home/wide/~072 */
+    { 333, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/_062 */
+    { 343, "138d6f82fd4bdec41308c1761161a5eec819353dc8d5e6ea722c72e3ef22f4d6" }, /* /home/wide/A052 */
+    { 354, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/~042 */
+    { 364, "da05007a0fd705baa35c5e23377eb54f3be51c47736820bff6d474ed9bee4da8" }, /* /home/wide/_032 */
+    { 375, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/A022 */
+    { 385, "06b1743b27cc4f300dc9dc6e43a1c1be4b166e8cc9210a4c7eccf2c46cfcf8d9" }, /* /home/wide/~012 */
+    { 396, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/wide/_002 */
+    { 399, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /srv/empty */
+    { 400, "ea12f45712914a772acf09134a15ef762861391cf06459617c6879f01c869c87" }, /* /home/empty */
+    { 404, "d903fd2198434b0f6f385295ecb9c2f296c1a1fce4650cf3693a01a497fc1a40" }, /* /srv/late */
 };
 
 #define GOLDEN_ROOT \
-    "3831172033db87bfb4da96ef24c52da05990ead6093b6df97ba7e829e9c2a446"
+    "c7406135ede1f4819723441863d4303e967c5d4a72c71f025da83e4f4c00ddb0"
 
 /* ---- harness ---- */
 
@@ -328,11 +328,15 @@ static void hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2
 /* ---- tests ---- */
 
 /*
- * Every tree in the fixture names to what the pre-OWN-43 build produced.
- * The table was captured by driving the old build_trees (backup.c at
- * 015fee8) over this exact fixture, before any of the change was written.
- * A mismatch here means a directory that has not changed would get a new
- * tree on the next backup: a silent dedup regression, not a cosmetic one.
+ * Every tree in the fixture names to a fixed table. A mismatch means a
+ * directory that has not changed would get a new tree on the next backup:
+ * a silent dedup regression, not a cosmetic one.
+ *
+ * The table was first captured from the pre-OWN-43 build_trees (backup.c
+ * at 015fee8) and matched it exactly. It was recaptured once, deliberately,
+ * when tree entries gained a flags byte and the tree version went to 3
+ * (OWN-45-LIVE): that changes every tree's bytes, and format 3 was not yet
+ * frozen. Only a format change may move these names.
  */
 static void test_names_match_the_previous_build(void **state)
 {

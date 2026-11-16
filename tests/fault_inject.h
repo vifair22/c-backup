@@ -139,3 +139,31 @@ extern volatile int fault_rename_die_after;
 #define FAULT_GATE_TIMEOUT_S 30
 void fault_rename_gate_set(const char *dst, int n);
 int  fault_rename_gate_arrivals(void);
+
+/*
+ * A file whose reads fail, the way a failing disk or a dropped network
+ * mount fails them.
+ *
+ * When fault_read_eio_path is set, every read() or pread() on a descriptor
+ * open on exactly that path fails with EIO, and is counted. Keyed by path
+ * rather than by a countdown, because the backup reads source files on its
+ * own thread and on pool workers alike, and a count of calls would land on
+ * whichever read happened to be Nth. The open and the fstat are let
+ * through, so the failure arrives in the middle of storing the file, which
+ * is where a real one does. Process-wide. NULL disables it.
+ */
+extern const char *volatile fault_read_eio_path;
+extern volatile int fault_read_refused;
+
+/*
+ * Run something at a read of one file: when both are set, every read() on
+ * a descriptor open on exactly fault_read_hook_path (read() or pread())
+ * calls the hook first,
+ * on whatever thread is reading. This is how a test changes a file while a
+ * pool worker is part way through reading it. The hook decides how often
+ * it acts. NULL disables it.
+ */
+extern const char *volatile fault_read_hook_path;
+extern void (*volatile fault_read_hook)(const char *path);
+extern ssize_t __real_read(int, void *, size_t);
+extern ssize_t __real_pread(int, void *, size_t, off_t);

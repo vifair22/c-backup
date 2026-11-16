@@ -678,6 +678,19 @@ static void test_small_files_on_workers_match_serial(void **state)
     assert_int_equal(a.bytes_logical, b.bytes_logical);
     assert_int_equal(a.objects_new, b.objects_new);
     assert_int_equal(a.bytes_stored, b.bytes_stored);
+    /* B118: the file that could not be opened is left out and named, the
+     * same way on the workers as on the backup thread. Root reads through
+     * mode 000, as CI's runner does, and then neither path skips it. */
+    if (geteuid() != 0) {
+        assert_int_equal(a.files_skipped, 1);
+        assert_int_equal(b.files_skipped, 1);
+        assert_string_equal(a.skipped[0].path, TEST_SRC "/locked.txt");
+        assert_string_equal(b.skipped[0].path, TEST_SRC "/locked.txt");
+        assert_string_equal(a.skipped[0].reason, b.skipped[0].reason);
+    } else {
+        assert_int_equal(a.files_skipped, 0);
+        assert_int_equal(b.files_skipped, 0);
+    }
 
     char ta[OBJECT_HASH_SIZE * 2 + 1], tb[OBJECT_HASH_SIZE * 2 + 1];
     src_tree_of(a.snapshot_id, ta);
@@ -720,7 +733,12 @@ static void test_small_files_on_workers_match_serial(void **state)
      * wrote, so this snapshot names exactly the objects they prepared. */
     backup_result_t d = backup(8);
     assert_int_equal(d.objects_new, 0);
+    assert_int_equal(d.files_skipped, 0);
     restore_and_diff(d.snapshot_id);
+    backup_result_free(&a);
+    backup_result_free(&b);
+    backup_result_free(&c);
+    backup_result_free(&d);
 }
 
 /*

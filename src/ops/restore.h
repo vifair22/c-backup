@@ -61,6 +61,10 @@ typedef struct {
      * keeping if its gaps are known.
      */
     uint64_t failed;
+    /* The first failed entry and why, "<path>: <reason>"; empty when none
+     * failed. Every one is logged with its path and reason; the error
+     * restore_run returns quotes this one. */
+    char     first_failure[512];
 } restore_result_t;
 
 /*

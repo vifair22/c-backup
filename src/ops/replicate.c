@@ -119,7 +119,7 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
     if (st != OK) {
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         hash_hex(hash, hex);
-        char why[256];
+        char why[ERR_MSG_MAX];
         snprintf(why, sizeof(why), "%s", err_msg());
         return set_error(st, "replicate: cannot read object %s: %s", hex, why);
     }
@@ -674,7 +674,7 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
              * snapshot gets no record and neither does any after it.
              * Copied first: err_msg() is the buffer set_error writes into.
              */
-            char why[256];
+            char why[ERR_MSG_MAX];
             snprintf(why, sizeof(why), "%s", err_msg());
             st = set_error(st, "replicate: snapshot %lld was not recorded: %s",
                            (long long)snap_id, why);

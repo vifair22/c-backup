@@ -36,6 +36,11 @@ typedef status_t (*job_fn)(void *arg, atomic_int *cancel,
 
 status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **out);
 
+/* Whether failure alerts are delivered (Pushover has credentials). Off by
+ * default; it decides only whether a failed job's log line says the alert
+ * is being sent or that it is not. */
+void     job_manager_set_alerts(job_manager_t *jm, int enabled);
+
 /* Shut down: every queued job is recorded cancelled without starting, every
  * running job is asked to stop, and this returns once the workers have
  * joined. A submit racing the shutdown is refused. */
@@ -112,6 +117,19 @@ status_t job_submit_lockset(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
                             int64_t schedule_id, job_fn fn, void *arg,
                             void (*arg_free)(void *), int64_t *out_job_id);
 
+/*
+ * job_submit_lockset for a job the daemon queued itself while starting: the
+ * reindex of a repository whose newest snapshots the index lost
+ * (index_reconcile.h). Locked like any other job; the job row says origin
+ * "startup" and the journal entry's source is "startup", so nobody mistakes
+ * it for something an operator ran.
+ */
+status_t job_submit_startup(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                            const int64_t *also, int nalso,
+                            const char *action, const char *params_json,
+                            job_fn fn, void *arg, void (*arg_free)(void *),
+                            int64_t *out_job_id);
+
 /* The phase a queued job shows while it waits for a synchronous request to
  * let go of its repository, and the bounds of the retry backoff. */
 #define JOB_PHASE_WAITING "waiting for repository"
@@ -142,6 +160,17 @@ void job_set_result(void *progress_ctx, const char *json_object);
 void job_set_summary(void *progress_ctx, const char *text);
 
 /*
+ * job_set_warning: one line saying what a job that succeeded still needs an
+ * operator to know - a backup that left files out, say. The job stays
+ * `completed`, and the warning is not its error; but it goes out through
+ * the alert path a failure uses, a WARN log line and a push notification
+ * when Pushover is configured, so nobody has to open the job's result to
+ * find it. Ignored for a job that fails or is cancelled: that one alerts as
+ * a failure or not at all. The text is copied.
+ */
+void job_set_warning(void *progress_ctx, const char *text);
+
+/*
  * The title and body of the push alert for a failed job: the action, the
  * repository by label, id and path, the job id and the error. A repository
  * no longer registered is named by id. Exposed for its test; the worker is
@@ -150,6 +179,11 @@ void job_set_summary(void *progress_ctx, const char *text);
 void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
                        const char *action, const char *detail,
                        char *title, size_t title_sz, char *body, size_t body_sz);
+
+/* The same for a job that completed with a warning (job_set_warning). */
+void job_warning_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
+                         const char *action, const char *warning,
+                         char *title, size_t title_sz, char *body, size_t body_sz);
 
 /* Request cancellation. Returns OK if the job exists and is not finished.
  * A queued job is removed from the queue and recorded cancelled before this

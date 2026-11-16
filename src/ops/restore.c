@@ -4,6 +4,7 @@
 #include "restore.h"
 #include "metablob.h"
 
+#include "manifest.h"
 #include "object.h"
 #include "chunklist.h"
 #include "read_budget.h"
@@ -13,6 +14,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -346,6 +348,36 @@ static const char *status_reason(status_t st)
     return "unknown error";
 }
 
+/*
+ * One entry that could not be restored: counted, logged with its path and
+ * the reason, and kept as the first failure if it is one.
+ *
+ * The error at the end of a restore says "see the log for which", and the
+ * log did not always say: a regular file with no content hash was counted
+ * failed in silence, so a restore of a B118 snapshot failed naming two
+ * entries and the log named neither. Every failure goes through here so the
+ * promise holds by construction rather than by each site remembering.
+ */
+static void restore_fail(restore_result_t *res, const char *path,
+                         const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+
+static void restore_fail(restore_result_t *res, const char *path,
+                         const char *fmt, ...)
+{
+    char why[768];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(why, sizeof(why), fmt, ap);
+    va_end(ap);
+    log_warn("restore: %s not restored: %s", path, why);
+    /* A long path truncates the copy, never the log line above. */
+    if (res->failed == 0 &&
+        snprintf(res->first_failure, sizeof(res->first_failure), "%s: %s",
+                 path, why) >= (int)sizeof(res->first_failure))
+        memcpy(res->first_failure + sizeof(res->first_failure) - 4, "...", 4);
+    res->failed++;
+}
+
 static int cancelled(const restore_opts_t *o)
 {
     return o && cancel_requested(o->cancel);
@@ -396,6 +428,7 @@ static void restore_bytes(uint64_t bytes, void *ctx)
  * memory is one string per directory beside a result set already in memory.
  */
 #define COL_PARENT 15
+#define COL_FLAGS  16
 
 typedef struct {
     const db_result_t *r;
@@ -485,9 +518,30 @@ static status_t pt_rel(path_table_t *pt, int i, char *out, size_t outsz, int dep
     return OK;
 }
 
+/*
+ * The parent directory make_parents made last, per restore.
+ *
+ * Restore visits a directory's entries together, and mkdir -p of every
+ * entry's whole path cost one mkdir per component per file: 14 for each of
+ * 100,000 files in the many-small benchmark, every one EEXIST, 0.3 to 0.5 s
+ * of a restore (PERF.md, 2026-11-16). A file whose parent is the one made
+ * last needs none. Per restore, not static: two restores run at once on
+ * different job workers, and a static would also outlive a destination
+ * that was removed between runs.
+ */
+typedef struct {
+    char   last[PATH_MAX];
+    size_t len;          /* 0: nothing made yet */
+} parent_cache_t;
+
 /* mkdir -p for the destination side. */
-static status_t make_parents(const char *path)
+static status_t make_parents(parent_cache_t *pc, const char *path)
 {
+    const char *slash = strrchr(path, '/');
+    size_t plen = slash ? (size_t)(slash - path) : 0;
+    if (pc && plen && plen == pc->len && memcmp(pc->last, path, plen) == 0)
+        return OK;
+
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s", path);
     for (char *p = tmp + 1; *p; p++) {
@@ -496,6 +550,11 @@ static status_t make_parents(const char *path)
         if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
             return set_error_errno(ERR_IO, "restore: mkdir %s", tmp);
         *p = '/';
+    }
+    if (pc && plen && plen < sizeof(pc->last)) {
+        memcpy(pc->last, path, plen);
+        pc->last[plen] = '\0';
+        pc->len = plen;
     }
     return OK;
 }
@@ -627,6 +686,21 @@ static int already_restored(const struct stat *sb, uint64_t size, int64_t mtime_
 }
 
 /*
+ * What is at a path already_restored turned down, for the log line that
+ * says it was kept. The line always said "size or mtime differ", including
+ * when the thing there was a directory (NIT-9), which sends the operator
+ * comparing sizes of something that is not a file at all.
+ */
+static const char *kept_reason(const struct stat *sb, uint64_t size)
+{
+    if (S_ISDIR(sb->st_mode)) return "a directory is there, not the file";
+    if (S_ISLNK(sb->st_mode)) return "a symbolic link is there, not the file";
+    if (!S_ISREG(sb->st_mode)) return "something other than a regular file is there";
+    if ((uint64_t)sb->st_size != size) return "a file of a different size is there";
+    return "a file with a different modification time is there";
+}
+
+/*
  * Restore one regular file's content and metadata under a temporary name.
  * On OK the verified file is complete at `tmp` (closed), waiting for the
  * batch below to make it durable and rename it into place; on any failure
@@ -690,10 +764,14 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
  *
  * syncfs flushes everything dirty on the destination filesystem, other
  * writers' data included, once per batch. The batch is bounded in files
- * and in bytes so that cost stays proportionate.
+ * and in bytes so that cost stays proportionate. It was 512 files or
+ * 256 MiB; syncfs is a filesystem commit whose cost is mostly per call,
+ * and 196 of them were 46% of a 100,000-file restore on btrfs, so it is
+ * 4,096 files or 1 GiB now (PERF.md, 2026-11-16). A crash costs at most
+ * that much redone work.
  */
-#define BATCH_FILES 512u
-#define BATCH_BYTES ((uint64_t)256 * 1024 * 1024)
+#define BATCH_FILES 4096u
+#define BATCH_BYTES ((uint64_t)1024 * 1024 * 1024)
 
 typedef struct {
     char    *tmp;
@@ -733,13 +811,12 @@ static void batch_flush(rename_batch_t *b, restore_result_t *res)
     for (uint32_t i = 0; i < b->n; i++) {
         pending_file_t *p = &b->items[i];
         if (!synced) {
-            log_warn("restore: %s not restored: its data could not be synced", p->full);
+            restore_fail(res, p->full, "its data could not be synced");
             batch_discard(b, i);
-            res->failed++;
         } else if (rename(p->tmp, p->full) != 0) {
-            log_warn("restore: cannot rename %s into place: %s", p->full, strerror(errno));
+            restore_fail(res, p->full, "cannot rename it into place: %s",
+                         strerror(errno));
             batch_discard(b, i);
-            res->failed++;
         } else {
             res->files++;
             res->bytes += p->bytes;
@@ -821,7 +898,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             "       COALESCE(link_target,''), COALESCE(hardlink_group_id, 0),"
             "       COALESCE(xattr_hash,''), COALESCE(acl_hash,''),"
             "       COALESCE(dev_major, 0), COALESCE(dev_minor, 0),"
-            "       COALESCE(parent_node_id, 0)"
+            "       COALESCE(parent_node_id, 0), COALESCE(flags, 0)"
             "  FROM nodes WHERE repo_id = ? AND snap_id = ?"
             " ORDER BY CASE WHEN type = 2 THEN 0 ELSE 1 END, id",
             (const char *[]){ repo, snap, NULL }, &r) != 0 || !r) {
@@ -945,9 +1022,11 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
      * run has swept it for partial files yet. */
     char *swept = calloc((size_t)r->nrows + 1, 1);
     rename_batch_t *batch = calloc(1, sizeof(*batch));
-    if (!swept || !batch) {
+    parent_cache_t *pcache = calloc(1, sizeof(*pcache));
+    if (!swept || !batch || !pcache) {
         free(swept);
         free(batch);
+        free(pcache);
         pt_free(&paths);
         hardlink_map_free(&hlinks);
         db_result_free(r);
@@ -980,8 +1059,11 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
 
         char rel[PATH_MAX];
         if (pt_rel(&paths, i, rel, sizeof(rel), 0) != OK) {
-            log_warn("restore: cannot reconstruct the path of node %s", r->rows[i][0]);
-            res.failed++;
+            char what[600];
+            snprintf(what, sizeof(what), "node %s (named '%s')",
+                     r->rows[i][0], r->rows[i][1]);
+            restore_fail(&res, what, "its path cannot be reconstructed: %s",
+                         err_msg()[0] ? err_msg() : "a parent is missing");
             err_clear();
             /* Without a subpath it is in work_total, and it is finished. */
             if (!opts->subpath) matched++;
@@ -995,13 +1077,12 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
 
         char full[PATH_MAX];
         if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full)) {
-            log_warn("restore: destination path too long for %s", rel);
-            res.failed++;
+            restore_fail(&res, rel, "the destination path is too long");
             continue;
         }
 
         if (ntype == NODE_TYPE_DIR) {
-            if (make_parents(full) != OK) { st = ERR_IO; break; }
+            if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
             if (mkdir(full, 0755) != 0 && errno != EEXIST) {
                 st = set_error_errno(ERR_IO, "restore: mkdir %s", full);
                 break;
@@ -1027,15 +1108,14 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
          */
         if (ntype == NODE_TYPE_SYMLINK) {
             if (!ltarget || !ltarget[0]) {
-                log_warn("restore: symlink %s has no recorded target, skipping", rel);
-                res.failed++;
+                restore_fail(&res, rel, "symlink has no recorded target");
                 continue;
             }
-            if (make_parents(full) != OK) { st = ERR_IO; break; }
+            if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
             if (opts->overwrite) unlink(full);
             if (symlink(ltarget, full) != 0 && errno != EEXIST) {
-                log_warn("restore: cannot create symlink %s: %s", full, strerror(errno));
-                res.failed++;
+                restore_fail(&res, full, "cannot create symlink: %s",
+                             strerror(errno));
                 continue;
             }
             /* Mode is not applied: a symlink's own permissions are ignored by
@@ -1062,7 +1142,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
          */
         if (ntype == NODE_TYPE_FIFO || ntype == NODE_TYPE_CHR ||
             ntype == NODE_TYPE_BLK) {
-            if (make_parents(full) != OK) { st = ERR_IO; break; }
+            if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
             if (opts->overwrite) unlink(full);
 
             int made;
@@ -1118,7 +1198,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 /* The first member may still be waiting in the batch
                  * under its temporary name. */
                 batch_flush(batch, &res);
-                if (make_parents(full) != OK) { st = ERR_IO; break; }
+                if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
                 if (opts->overwrite) unlink(full);
                 if (link(first, full) == 0) { res.hardlinks++; continue; }
                 /* Cross-device or unsupported: fall through and copy. */
@@ -1154,13 +1234,15 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 continue;
             }
             if (ntype != NODE_TYPE_REG)
-                log_warn("restore: %s is an unsupported node type %u, skipping",
-                         rel, ntype);
-            res.failed++;
+                restore_fail(&res, rel, "unsupported node type %u", ntype);
+            else
+                restore_fail(&res, rel, "regular file has no content in the "
+                             "snapshot (a backup recorded a file it could not "
+                             "read; B118)");
             continue;
         }
 
-        if (make_parents(full) != OK) { st = ERR_IO; break; }
+        if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
 
         uint64_t nsize = strtoull(r->rows[i][6], NULL, 10);
         if (!opts->overwrite) {
@@ -1178,8 +1260,8 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                     res.skipped++;
                 } else {
                     log_warn("restore: %s already exists and is not the "
-                             "snapshot's version (size or mtime differ); kept, "
-                             "since overwrite is off", full);
+                             "snapshot's version (%s); kept, since overwrite "
+                             "is off", full, kept_reason(&sb, nsize));
                     res.kept++;
                 }
                 continue;
@@ -1220,10 +1302,9 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
              * paths return a bare status, and this line used to read
              * "cannot write <path>: " - pointing an operator at a disk that
              * was fine. */
-            log_warn("restore: %s: object %s could not be read or repaired: %s",
-                     full, chash, err_msg()[0] ? err_msg() : status_reason(lst));
+            restore_fail(&res, full, "object %s could not be read or repaired: %s",
+                         chash, err_msg()[0] ? err_msg() : status_reason(lst));
             err_clear();
-            res.failed++;
             continue;
         }
 
@@ -1231,15 +1312,21 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
          * Later members share this inode, so the attributes restore_file
          * set are already theirs; the link() sites need no reapply. */
         if (batch_add(batch, tmp, full, sz, &res) != 0) {
-            log_warn("restore: %s not restored: out of memory", full);
-            res.failed++;
+            restore_fail(&res, full, "out of memory");
             continue;
         }
+        /* Restored as stored, and said: the file never settled while the
+         * backup read it, so its bytes may mix two versions (OWN-45-LIVE). */
+        if (strtoul(r->rows[i][COL_FLAGS], NULL, 10) & MANIFEST_FLAG_UNSETTLED)
+            log_warn("restore: %s was still changing when it was backed up; "
+                     "restored as stored, and it may not be internally "
+                     "consistent", full);
         if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
     }
     /* Whatever verified before a stop is still worth keeping. */
     batch_flush(batch, &res);
     free(batch);
+    free(pcache);
     free(swept);
 
     hardlink_map_free(&hlinks);
@@ -1308,10 +1395,12 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
     if (res.failed)
         return set_error(ERR_CORRUPT,
                          "restore incomplete: %llu entr%s could not be restored "
-                         "(%llu written); see the log for which",
+                         "(%llu written); see the log for %s; first: %s",
                          (unsigned long long)res.failed,
                          res.failed == 1 ? "y" : "ies",
                          (unsigned long long)(res.files + res.dirs + res.symlinks
-                                              + res.hardlinks + res.specials));
+                                              + res.hardlinks + res.specials),
+                         res.failed == 1 ? "it" : "each",
+                         res.first_failure);
     return OK;
 }

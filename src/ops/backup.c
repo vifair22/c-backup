@@ -14,6 +14,7 @@
 #include "store_index.h"
 #include "store_pool.h"
 #include "small_files.h"
+#include "settle.h"
 #include "read_budget.h"
 #include "db_txn.h"
 #include "phase_timer.h"
@@ -56,6 +57,12 @@ typedef struct {
     uint32_t scan_index;
     uint8_t  tree_hash[OBJECT_HASH_SIZE];   /* directories only */
     int      hash_ready;
+    /* A regular file the store could not read, or that never settled. It
+     * is left out of the trees and the index entirely; see skip_file. */
+    int      skipped;
+    /* Stored although it never settled (OWN-45-LIVE): flagged in the tree,
+     * and given no file cache row, so the next backup reads it again. */
+    int      unsettled;
 } node_link_t;
 
 /*
@@ -174,6 +181,170 @@ typedef struct bsink {
     pending_row_t  *rows;
     size_t          n, cap;
 } bsink_t;
+
+/*
+ * Leave a regular file out of the snapshot, counted and said (B118).
+ *
+ * Every way a store path can fail to produce a file ends here: it vanished,
+ * it cannot be opened, it is no longer a regular file, the read failed, or
+ * it never settled (OWN-45). An entry that went into its tree and its index
+ * row with no content hash made the backup report completed and verify
+ * pass, and every full restore of the snapshot fail on an entry the log
+ * never named. tree_build is given the skip mask and leaves the entry out,
+ * index_nodes skips it, and the tree writer refuses a file entry without
+ * content in case anything else ever tries.
+ *
+ * The list in the result is bounded; the count and the log are not.
+ */
+static void skip_file(pipeline_t *p, uint32_t i, const char *reason)
+{
+    scan_entry_t *e = &p->scan->entries[i];
+    p->links[i].skipped = 1;
+    memset(e->node.content_hash, 0, OBJECT_HASH_SIZE);
+    p->res->files_skipped++;
+    log_warn("backup: skipping %s, it is not in this snapshot: %s", e->path, reason);
+
+    backup_result_t *r = p->res;
+    if (r->skipped_listed >= BACKUP_SKIPPED_LIST_MAX) return;
+    if (!r->skipped) {
+        r->skipped = calloc(BACKUP_SKIPPED_LIST_MAX, sizeof(*r->skipped));
+        if (!r->skipped) return;   /* the count and the log still have it */
+    }
+    char *path = strdup(e->path), *why = strdup(reason);
+    if (!path || !why) { free(path); free(why); return; }
+    r->skipped[r->skipped_listed].path   = path;
+    r->skipped[r->skipped_listed].reason = why;
+    r->skipped_listed++;
+}
+
+void backup_result_free(backup_result_t *r)
+{
+    if (!r) return;
+    for (uint32_t i = 0; i < r->skipped_listed; i++) {
+        free(r->skipped[i].path);
+        free(r->skipped[i].reason);
+    }
+    free(r->skipped);
+    r->skipped = NULL;
+    r->skipped_listed = 0;
+    for (uint32_t i = 0; i < r->changed_listed; i++) free(r->changed[i]);
+    free(r->changed);
+    r->changed = NULL;
+    r->changed_listed = 0;
+    for (uint32_t i = 0; i < r->unsettled_listed; i++) free(r->unsettled[i]);
+    free(r->unsettled);
+    r->unsettled = NULL;
+    r->unsettled_listed = 0;
+}
+
+/*
+ * Make the entry describe the version of the file that was read, not the
+ * one the scan saw (OWN-45): the node, the tree and the file cache row all
+ * describe what was stored.
+ */
+static void adopt_stat(scan_entry_t *e, const struct stat *st)
+{
+    e->st         = *st;
+    e->node.size  = (uint64_t)st->st_size;
+    e->node.mode  = (uint32_t)st->st_mode;
+    e->node.uid   = (uint32_t)st->st_uid;
+    e->node.gid   = (uint32_t)st->st_gid;
+    e->node.mtime_sec  = (int64_t)st->st_mtim.tv_sec;
+    e->node.mtime_nsec = (uint64_t)st->st_mtim.tv_nsec;
+}
+
+/*
+ * A file stored as it was when it was read, not as the scan saw it: its
+ * size or times had moved on (OWN-45). Counted and listed, so the result
+ * says the snapshot is not the moment of the scan for these files.
+ */
+static void note_changed(pipeline_t *p, uint32_t i)
+{
+    backup_result_t *r = p->res;
+    r->files_changed++;
+    if (r->changed_listed >= BACKUP_SKIPPED_LIST_MAX) return;
+    if (!r->changed) {
+        r->changed = calloc(BACKUP_SKIPPED_LIST_MAX, sizeof(*r->changed));
+        if (!r->changed) return;
+    }
+    char *path = strdup(p->scan->entries[i].path);
+    if (!path) return;
+    r->changed[r->changed_listed++] = path;
+}
+
+/*
+ * A file that never settled and was stored as the second read found it
+ * (OWN-45-LIVE). The flag goes into its tree entry, so it outlives the
+ * database and comes back with a reindex; restore warns for it and verify
+ * notes it. It gets no file cache row: a later run whose stat happened to
+ * match would otherwise keep the possibly torn copy for good.
+ */
+static void note_unsettled(pipeline_t *p, uint32_t i)
+{
+    scan_entry_t *e = &p->scan->entries[i];
+    e->node.flags |= MANIFEST_FLAG_UNSETTLED;
+    p->links[i].unsettled = 1;
+    backup_result_t *r = p->res;
+    r->changed_unsettled++;
+    log_warn("backup: %s never settled while it was read; stored as the "
+             "second read found it, flagged as possibly torn", e->path);
+    if (r->unsettled_listed >= BACKUP_SKIPPED_LIST_MAX) return;
+    if (!r->unsettled) {
+        r->unsettled = calloc(BACKUP_SKIPPED_LIST_MAX, sizeof(*r->unsettled));
+        if (!r->unsettled) return;
+    }
+    char *path = strdup(e->path);
+    if (!path) return;
+    r->unsettled[r->unsettled_listed++] = path;
+}
+
+/* The cache row for a stored file, unless it never settled. */
+static void cache_put(pipeline_t *p, uint32_t i)
+{
+    if (p->links[i].unsettled) return;
+    scan_entry_t *e = &p->scan->entries[i];
+    uint64_t _tp = phase_now();
+    file_cache_put(p->db, p->repo_id, e->path, &e->st,
+                   e->node.content_hash, p->cache_stamp);
+    phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+}
+
+/*
+ * One file's settled store, recorded the same way whichever path stored
+ * it. Returns 1 when the content is to be recorded, 0 when the file was
+ * left out. A failed read that did not change the file is the file's own
+ * fault, an unreadable file, and skipped like the rest.
+ */
+static int settle_record(pipeline_t *p, uint32_t i, status_t st,
+                         const settle_result_t *sr, const char *read_err)
+{
+    if (st != OK) {
+        char why[ERR_MSG_MAX + 32];
+        snprintf(why, sizeof(why), "cannot read: %s",
+                 read_err && read_err[0] ? read_err : "no detail recorded");
+        skip_file(p, i, why);
+        return 0;
+    }
+    if (sr->outcome == SETTLE_SKIP) {
+        skip_file(p, i, sr->reason);
+        return 0;
+    }
+    scan_entry_t *e = &p->scan->entries[i];
+    if (sr->unsettled) {
+        adopt_stat(e, &sr->st);
+        note_unsettled(p, i);
+    } else if (sr->changed) {
+        if (sr->reads > 1)
+            log_warn("backup: %s changed while it was being read; stored from "
+                     "a second read", e->path);
+        else
+            log_info("backup: %s changed since the scan or while it was read; "
+                     "stored as read", e->path);
+        adopt_stat(e, &sr->st);
+        note_changed(p, i);
+    }
+    return 1;
+}
 
 /*
  * The fields the file cache must not compare for this entry. Local
@@ -648,6 +819,12 @@ typedef struct {
     bsink_t              *sink;
 } fworker_t;
 
+/* What a file worker hands back: the content, and how the read settled. */
+typedef struct {
+    cdc_result_t    cr;
+    settle_result_t sr;
+} fpool_out_t;
+
 static void store_io_forward(uint64_t bytes, void *ctx)
 {
     store_io_progress((const store_t *)ctx, bytes);
@@ -678,7 +855,7 @@ static status_t fpool_store(void *ctx, void *wstate, store_pool_job_t *j)
     if (!cp)
         return set_error(ERR_INVALID, "repository is encrypted and no key is "
                          "loaded: its chunk boundaries need the key");
-    cdc_result_t *r = calloc(1, sizeof(*r));
+    fpool_out_t *r = calloc(1, sizeof(*r));
     if (!r) return set_error(ERR_NOMEM, "backup: file result");
     obj_sink_t sink = { .put = bsink_put, .ctx = w->sink };
     cdc_opts_t o = {
@@ -689,7 +866,9 @@ static status_t fpool_store(void *ctx, void *wstate, store_pool_job_t *j)
         .progress = store_io_forward,
         .progress_ctx = p->store,
     };
-    status_t st = cdc_store_fd(cp, j->fd, j->size, &sink, &o, r);
+    const scan_entry_t *e = &p->scan->entries[j->index];
+    status_t st = settle_store_fd(cp, j->fd, &e->st, &sink, &o, NULL, NULL,
+                                  &r->cr, &r->sr);
     j->out = r;
     return st;
 }
@@ -715,22 +894,22 @@ static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
 {
     scan_entry_t *e = &p->scan->entries[j->index];
     p->bytes_done += e->node.size;
-    if (j->st != OK) {
-        if (cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
-        log_warn("backup: cannot store %s: %s", e->path, j->err);
-        return OK;
+    if (j->st != OK && cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
+    const fpool_out_t *o = j->out;
+    if (o) {
+        /* A discarded or failed read's objects are in the worker's packs
+         * all the same. */
+        p->res->objects_new  += o->cr.chunks_new + o->cr.lists.lists_new;
+        p->res->bytes_stored += o->cr.phys_new;
     }
-    const cdc_result_t *r = j->out;
+    if (!o || !settle_record(p, j->index, j->st, &o->sr, j->err))
+        return OK;
+    const cdc_result_t *r = &o->cr;
     memcpy(e->node.content_hash, r->hash, OBJECT_HASH_SIZE);
-    p->res->objects_new  += r->chunks_new + r->lists.lists_new;
-    p->res->bytes_stored += r->phys_new;
     p->res->files++;
     p->res->bytes_logical += e->node.size;
 
-    uint64_t _tp = phase_now();
-    file_cache_put(p->db, p->repo_id, e->path, &e->st,
-                   e->node.content_hash, p->cache_stamp);
-    phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+    cache_put(p, j->index);
     return OK;
 }
 
@@ -798,13 +977,25 @@ static status_t small_apply(pipeline_t *p, batch_t *b, small_batch_t *sb)
             break;
         }
         if (f->skipped) {
-            log_warn("backup: %s", f->err);
+            skip_file(p, f->index, f->err);
             continue;
         }
         if (f->st != OK) {
             if (cancelled(p)) { st = set_error(ERR_BUSY, "backup cancelled"); break; }
-            log_warn("backup: cannot store %s: %s", e->path, f->err);
+            char why[ERR_MSG_MAX + 32];
+            snprintf(why, sizeof(why), "cannot read: %s",
+                     f->err[0] ? f->err : "no detail recorded");
+            skip_file(p, f->index, why);
             continue;
+        }
+        if (f->unsettled) {
+            adopt_stat(e, &f->st_read);
+            note_unsettled(p, f->index);
+        } else if (f->changed) {
+            log_info("backup: %s changed since the scan or while it was read; "
+                     "stored as read", e->path);
+            adopt_stat(e, &f->st_read);
+            note_changed(p, f->index);
         }
         st = maybe_rollover(p, b);
         if (st != OK) break;
@@ -828,10 +1019,7 @@ static status_t small_apply(pipeline_t *p, batch_t *b, small_batch_t *sb)
         p->res->bytes_logical += e->node.size;
         st = bsink_flush(p->sink, 0);
         if (st != OK) break;
-        uint64_t _tp = phase_now();
-        file_cache_put(p->db, p->repo_id, e->path, &e->st,
-                       e->node.content_hash, p->cache_stamp);
-        phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+        cache_put(p, f->index);
         /* Not counted into the batch again: the loop counted the entry when
          * it queued it. */
     }
@@ -894,7 +1082,7 @@ static status_t small_queue(pipeline_t *p, batch_t *b, uint32_t index)
     if (!p->sbatch && !(p->sbatch = small_batch_new()))
         return set_error(ERR_NOMEM, "backup: small-file batch");
     const scan_entry_t *e = &p->scan->entries[index];
-    if (small_batch_add(p->sbatch, index, e->path, e->node.size))
+    if (small_batch_add(p->sbatch, index, e->path, e->node.size, &e->st))
         return small_submit(p, b);
     return OK;
 }
@@ -907,12 +1095,18 @@ static status_t small_queue(pipeline_t *p, batch_t *b, uint32_t index)
  * smaller is stored on this thread with the batch held, as before.
  */
 static status_t store_file_cdc(pipeline_t *p, batch_t *b, int fd, uint64_t size,
-                               cdc_result_t *out)
+                               const struct stat *scan_st,
+                               cdc_result_t *out, settle_result_t *sr)
 {
     const cdc_params_t *cp = store_cdc(p->store);
     if (!cp)
         return set_error(ERR_INVALID, "repository is encrypted and no key is "
                          "loaded: its chunk boundaries need the key");
+    /* Sized for the larger of the scan's size and the file's now, so a
+     * file that grew is not stored with the batch held and no room to seal. */
+    struct stat now;
+    if (fstat(fd, &now) == 0 && (uint64_t)now.st_size > size)
+        size = (uint64_t)now.st_size;
     int large = size > OBJECT_MAX_BYTES;
     /*
      * The batch is let go only when the file may not fit in the open pack:
@@ -936,7 +1130,10 @@ static status_t store_file_cdc(pipeline_t *p, batch_t *b, int fd, uint64_t size,
         .progress_ctx = p,
     };
     p->sink->may_rollover = may_seal;
-    status_t st = cdc_store_fd(cp, fd, size, &sink, &o, out);
+    /* The sink writes straight into the pack, so a discarded read needs no
+     * undoing: its objects get rows with the next flush, unreferenced, for
+     * gc, as a failed file's always have. */
+    status_t st = settle_store_fd(cp, fd, scan_st, &sink, &o, NULL, NULL, out, sr);
     p->sink->may_rollover = 0;
     return st;
 }
@@ -1294,21 +1491,32 @@ static status_t store_content_loop(pipeline_t *p)
 
         /* Open is part of reading: over NFS it is a round trip per file. */
         uint64_t _tr = phase_now(), _trn = phase_nested(p->timers);
-        int fd = open(e->path, O_RDONLY);
+        /* Never through a symlink (B128): one swapped in for the file
+         * since the scan was followed, and stored whatever it named. */
+        int fd = open(e->path, SETTLE_OPEN_FLAGS);
         if (fd == -1) {
             /* A file that vanished between scan and store is normal on a live
              * filesystem; it is a warning, not a failed backup. */
-            log_warn("backup: cannot open %s, skipping", e->path);
+            char why[160];
+            skip_file(p, i, settle_open_reason(errno, why, sizeof(why)));
             continue;
         }
-        /* Replaced by something else since the scan. A directory opens
-         * read-only without complaint, and on btrfs SEEK_DATA on it answers
-         * ENXIO, "no data from here on": the sparse probe took that for a
-         * file that is one hole and stored the scan's size in zeros. */
+        /* Replaced by something else since the scan (OWN-41). settle_store_fd
+         * refuses it too; this keeps a directory off the file workers. */
         struct stat fst;
-        if (fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
-            log_warn("backup: %s is no longer a regular file, skipping", e->path);
+        int fst_ok = fstat(fd, &fst) == 0;
+        if (!fst_ok || !S_ISREG(fst.st_mode)) {
+            int was_dir = fst_ok && S_ISDIR(fst.st_mode);
             close(fd);
+            skip_file(p, i, was_dir ? "no longer a regular file (now a directory)"
+                                    : "no longer a regular file");
+            continue;
+        }
+        /* And the inode the scan saw (B128), before a file worker gets it;
+         * settle_store_fd checks it again on every path. */
+        if (fst.st_dev != e->st.st_dev || fst.st_ino != e->st.st_ino) {
+            close(fd);
+            skip_file(p, i, "replaced by another file since the scan");
             continue;
         }
 
@@ -1323,11 +1531,12 @@ static status_t store_content_loop(pipeline_t *p)
         }
 
         cdc_result_t cr;
+        settle_result_t sr;
         memset(&cr, 0, sizeof(cr));
         p->file_bytes = 0;
         p->file_size  = e->node.size;
         p->file_index = i;
-        status_t st = store_file_cdc(p, b, fd, e->node.size, &cr);
+        status_t st = store_file_cdc(p, b, fd, e->node.size, &e->st, &cr, &sr);
         /* The whole file is counted into bytes_done when the loop moves on. */
         p->file_bytes = 0;
         phase_add_excl(p->timers, PHASE_READ_HASH, _tr, _trn);
@@ -1338,13 +1547,14 @@ static status_t store_content_loop(pipeline_t *p)
             batch_close(p, b);
             return set_error(ERR_BUSY, "backup cancelled");
         }
-        if (st != OK) {
-            /* Chunks it staged before failing are in the open pack; their
-             * rows go in with the next flush, unreferenced, for gc. */
-            log_warn("backup: cannot store %s: %s", e->path, err_msg());
-            err_clear();
-            continue;
-        }
+        /* Chunks a failed or discarded read staged are in the open pack;
+         * their rows go in with the next flush, unreferenced, for gc. */
+        p->res->objects_new  += cr.chunks_new + cr.lists.lists_new;
+        p->res->bytes_stored += cr.phys_new;
+        char rerr[ERR_MSG_MAX];
+        snprintf(rerr, sizeof(rerr), "%s", st != OK ? err_msg() : "");
+        err_clear();
+        if (!settle_record(p, i, st, &sr, rerr)) continue;
         memcpy(e->node.content_hash, cr.hash, OBJECT_HASH_SIZE);
 
         /* Its rows go in a transaction of the backup's own: a statement
@@ -1352,8 +1562,6 @@ static status_t store_content_loop(pipeline_t *p)
          * open on the shared handle, and goes with it if that rolls back. */
         batch_open(p, b);
 
-        p->res->objects_new  += cr.chunks_new + cr.lists.lists_new;
-        p->res->bytes_stored += cr.phys_new;
         p->res->files++;
         p->res->bytes_logical += e->node.size;
 
@@ -1372,10 +1580,7 @@ static status_t store_content_loop(pipeline_t *p)
             return st;
         }
 
-        uint64_t _tp = phase_now();
-        file_cache_put(p->db, p->repo_id, e->path, &e->st,
-                       e->node.content_hash, p->cache_stamp);
-        phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+        cache_put(p, i);
     }
 
     /* The small files still out. */
@@ -1512,6 +1717,7 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
         .ctx    = p,
         .hashes = p->links[0].tree_hash,
         .stride = sizeof(node_link_t),
+        .skipped = &p->links[0].skipped,
     };
     status_t st = tree_build(p->scan, &ops, root_hash, NULL);
 
@@ -1739,6 +1945,9 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
     if (bst != OK) return bst;
 
     for (uint32_t i = 0; i < p->count; i++) {
+        /* In no tree, so in no index row either: the index is derived from
+         * the trees, and a reindex would not bring it back. */
+        if (p->links[i].skipped) continue;
         scan_entry_t *e = &p->scan->entries[i];
         const char *name = basename_of(e->path);
 
@@ -1797,7 +2006,8 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
 
         /* Union again: only a device node has a device pair. */
         int is_dev = (e->node.type == NODE_TYPE_CHR || e->node.type == NODE_TYPE_BLK);
-        char dmaj[16], dmin[16];
+        char dmaj[16], dmin[16], nflags[8];
+        snprintf(nflags, sizeof(nflags), "%u", (unsigned)e->node.flags);
         snprintf(dmaj, sizeof(dmaj), "%u", is_dev ? e->node.device.major : 0u);
         snprintf(dmin, sizeof(dmin), "%u", is_dev ? e->node.device.minor : 0u);
 
@@ -1805,10 +2015,11 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                 "INSERT INTO nodes"
                 " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
                 "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
-                "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor)"
+                "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor,"
+                "  flags)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
                 "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?,"
-                "         NULLIF(?,''), NULLIF(?,''), ?, ?)",
+                "         NULLIF(?,''), NULLIF(?,''), ?, ?, ?)",
                 (const char *[]){ repo, id, snap, parent, name, ntype, mode, uid,
                                   gid, mtime, size,
                                   /* A symlink or device node has no content
@@ -1823,7 +2034,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                                   ltarget, hgroup,
                                   hash_is_zero(e->node.xattr_hash) ? "" : xhex,
                                   hash_is_zero(e->node.acl_hash)   ? "" : ahex,
-                                  dmaj, dmin, NULL }, NULL);
+                                  dmaj, dmin, nflags, NULL }, NULL);
         if (rc != 0) {
             db_txn_rollback(p->db);
             return set_error(ERR_IO, "index_nodes: insert failed");
@@ -2119,12 +2330,13 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
          * cancelled backup should leave the index as it found it. The error
          * is the backup's; a failure here is only logged.
          */
-        char why[256];
+        char why[ERR_MSG_MAX];
         snprintf(why, sizeof(why), "%s", err_msg());
         if (store_index_drop_staged(db, repo_id) != OK)
             log_warn("backup: cannot drop staged rows after: %s", why);
         set_error(st, "%s", why);
         hashset_free(&p.meta_seen);
+        backup_result_free(&res);
         free(links);
         scan_result_free(scan);
         return st;
@@ -2172,8 +2384,11 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         const char **seen = malloc(scan->count * sizeof(*seen));
         if (seen) {
             size_t n_seen = 0;
+            /* A skipped file's row goes too, so the next run reads it
+             * rather than vouching for content this snapshot lacks. */
             for (uint32_t i = 0; i < scan->count; i++)
-                if (scan->entries[i].node.type == NODE_TYPE_REG)
+                if (scan->entries[i].node.type == NODE_TYPE_REG &&
+                    !links[i].skipped && !links[i].unsettled)
                     seen[n_seen++] = scan->entries[i].path;
             qsort(seen, n_seen, sizeof(*seen), scan_path_cmp);
             uint64_t _tsw = phase_now(), _tswn = phase_nested(&timers);
@@ -2197,8 +2412,12 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     free(links);
     scan_result_free(scan);
 
-    if (st == OK && out) *out = res;
     if (st == OK) {
+        if (res.files_skipped)
+            log_warn("backup: snapshot %lld leaves out %llu file(s) that could "
+                     "not be read; each is named above and in the job result",
+                     (long long)snap_id, (unsigned long long)res.files_skipped);
+
         /*
          * t0 is taken after the scan has already run, so the old label on
          * this line - "scan+store" - named a phase it did not contain. The
@@ -2218,5 +2437,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
                  (unsigned long long)res.trees_reused);
         log_written(&res);
     }
+    if (st == OK && out) *out = res;
+    else backup_result_free(&res);
     return st;
 }

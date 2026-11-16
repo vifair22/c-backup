@@ -35,6 +35,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 typedef struct store_pool store_pool_t;
 
@@ -51,6 +52,10 @@ typedef struct store_pool_job {
     status_t       st;
     void          *out;
     char           err[ERR_MSG_MAX];
+    /* fstat of the file once the read finished, so the taker can tell a
+     * file that changed under the read (OWN-45); post_ok 0 if it failed. */
+    struct stat    post;
+    int            post_ok;
     /* Bytes this file added to the pool's running count; the taker
      * subtracts them when it counts the whole file instead. */
     uint64_t       reported;

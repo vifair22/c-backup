@@ -6,6 +6,17 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-16 - OWN-44 on v3 after the 1.0.0 merge (c-utils 1.7.1)
+
+After merging origin/v3 e6dd246 (the 1.0.0 merge, V3-4 ports, OWN-45-LIVE,
+many-small-files work), same comparison, v6 = origin/v3 e6dd246, five
+rounds, `bench_phases -n 0 -l 48 -t 0 -m 16 -R` and `-n 20000 -l 0 -t 0 -R`:
+
+| Shape | v6 first backup | v7 first backup | v6 mean | v7 mean |
+|---|---|---|---:|---:|
+| large, 768 MiB | 1.226, 1.102, 1.040, 1.048, 1.109 s | 1.153, 0.990, 0.981, 1.033, 1.026 s | 1.105 s | **1.037 s** |
+| 20,000 small | 0.560, 0.557, 0.575, 0.590, 0.559 s | 0.554, 0.556, 0.552, 0.553, 0.551 s | 0.568 s | **0.553 s** |
+
 ## 2026-11-16 - OWN-44 on v3 with small-file workers and the claim set
 
 After merging origin/v3 b59db42 (small files on workers, OWN-46's claim set
@@ -111,6 +122,80 @@ writer's worker threads as it went, v7 encodes the whole body at the seal,
 on one thread, from the page cache. Moving the stripe encode back onto the
 workers (each window of groups is independent) would recover it if it ever
 matters; at 600 MiB/s of backup it does not today.
+## 2026-11-16 - Many small files: state.db settings, restore batches, one LZ4 pass
+
+Three of the proposals in the profile two entries below, built (`perf/many-small-fixes`):
+
+- **state.db settings** (src/common/state_db.c): `synchronous=NORMAL`,
+  `cache_size` 64 MiB and `wal_autocheckpoint` 16,384 pages on the daemon's
+  handle, read back after setting, and config keys `db.synchronous`,
+  `db.cache_mb` and `db.wal_autocheckpoint`. A thread syncs the WAL once a
+  second when it has changed, so NORMAL loses at most about a second of
+  edits on a power cut rather than the kernel's 30-second writeback; at
+  every start the daemon reindexes, as a job, any repository whose index
+  lost snapshots the repository holds (src/meta/index_reconcile.c, Manual
+  17.5). bench_phases now opens state.db the way the daemon does, flusher
+  included; earlier entries ran on SQLite's defaults.
+- **Restore** syncs every 4,096 files or 1 GiB (was 512 / 256 MiB), and
+  `make_parents` skips a file whose parent it made last (per restore).
+- **One LZ4 pass** for an object no larger than the 64 KiB probe: the
+  probe's output is the result.
+
+The numbers below were measured before the small-file workers (next entry)
+merged; the two changes are independent (database and restore against the
+backup thread's read and hash), and their combined effect is not yet
+measured.
+
+The statement cache (proposal 1) is not in this: it is going into c-utils
+1.7.0 separately, and these numbers are against c-utils 1.6.0.
+
+`bench_phases -n 100000 -l 0 -t 0`, before = `feat/v3-cdc` 4269bc1 plus the
+profiling tools, after = this branch, both linked against c-utils 1.6.0.
+Three interleaved rounds, medians, range in brackets; NVMe is `~/.cache`
+(btrfs on LVM on LUKS, shared), tmpfs `/dev/shm`, page cache warm, bench.slice
+at nice 19.
+
+| | NVMe first | NVMe incr | NVMe restore | tmpfs first | tmpfs incr | tmpfs restore |
+|---|---:|---:|---:|---:|---:|---:|
+| Before | 12.46 [12.23-12.51] | 5.33 [5.32-5.63] | 12.41 [12.14-13.60] | 8.12 [8.10-8.29] | 2.96 [2.93-2.98] | 5.80 [5.71-6.05] |
+| After | 8.51 [8.41-9.81] | 3.37 [3.33-3.47] | 10.39 [10.16-11.09] | 7.27 [7.24-7.54] | 2.80 [2.74-2.87] | 5.53 [5.51-5.53] |
+| Change | -32% | -37% | -16% | -10% | -5% | -5% |
+
+/proc/self/io write_bytes on NVMe: first backup 1,485 to 1,071 MiB (3.80x
+to 2.74x content), incremental 875 to 520 MiB (2.24x to 1.33x).
+
+### From the shim (`prof_shim.so`, one NVMe run each)
+
+| | Before | After |
+|---|---:|---:|
+| First backup: fdatasync | 356 (2.74 s) | 31 (0.61 s) |
+| First backup: COMMIT and BEGIN (`sqlite3_exec`) | 2.90 s | 1.03 s |
+| First backup: state.db pread / pwrite | 729k / 784k | 139k / 303k |
+| Incremental: fdatasync | 206 (1.88 s) | 22 (0.44 s) |
+| Incremental: state.db pread / pwrite | 513k / 444k | 40k / 234k |
+| Restore: syncfs | 196 (9.16 s) | 25 (3.55 s) |
+| Restore: mkdir | 1,414,071 (0.49 s) | 15,084 (0.01 s) |
+| First backup: LZ4 samples (self) | 706 ms | 325 ms |
+
+A syncfs costs more when it flushes more (142 ms a call against 47 ms), but
+far less in total. The fdatasyncs that remain are checkpoints, the flusher's
+once-a-second sync, and the pack and snapshot record syncs. The flusher's
+cost is in the numbers: it runs in the benchmark as in the daemon.
+
+The profiled runs' totals (13.7 / 6.0 / 17.9 s before, 10.5 / 3.8 / 11.4 s
+after) are above the matrix because the shim times every call and samples
+the stack; their proportions are what the table uses.
+
+### Where a first backup goes now (NVMe, median run, phase timers)
+
+read+hash+write 2.56 s, pack-seal 1.20, index-nodes 1.18, index-put 1.09,
+txn-commit 0.84, cache-put 0.72, cache-lookup 0.48, scan 0.26. The
+incremental: index-nodes 1.23 s, cache-lookup 0.96, txn-commit 0.76, scan
+0.24. Most of what is left is statement preparation (806,267 prepares in a
+first backup, 3.6 s under the shim), which is the c-utils statement cache's
+to remove; the profile entry's prototype of both together measured 4.9 s
+first and 2.3 s incremental on NVMe.
+
 ## 2026-11-16 - Small files on workers (many-small profile, proposal 5)
 
 Small files were stored one at a time on the backup thread: open, read,
@@ -150,6 +235,226 @@ Two things tried and not kept:
   70%, and the first backup went from 6.2 to 6.9 s.
 - One small-file worker per chunk worker (21 here): no faster than four,
   since the backup thread is the limit; four it is (`SMALL_POOL_MAX`).
+
+## 2026-11-16 - Where a many-small-files backup goes (format 3, profile)
+
+The many-small preset barely moved between 1.0.0 and format 3 (NVMe 21.7 s
+against 21.4 s, entry below), and real trees are mostly small files. This
+is the analysis: no product code changed. Two prototypes were built outside
+the tree to prove numbers, and are described, not committed.
+
+Branch `feat/v3-cdc` at e93d6be, `bench_phases -n 100000 -l 0 -t 0` (100,000
+files of 2-6 KiB, 390.5 MiB, 100 per directory), restore included. NVMe is
+`~/.cache` (btrfs on LVM on LUKS, shared with other work); tmpfs is
+`/dev/shm`. Every run in `bench.slice` at nice 19, page cache warm (no
+`-c`). Medians of three runs, range in brackets.
+
+### Tools
+
+perf, strace, bpftrace and valgrind are not installed on this machine and
+perf_event_paranoid is 2, so two harness pieces were added:
+
+- `bench/prof_shim.c` (`build/bins/prof_shim.so`), an LD_PRELOAD shim that
+  counts and times libc calls through the PLT (open, fstat, pread, pwrite,
+  fdatasync, syncfs, xattr calls, mkdir, rename, fcntl, fwrite and more),
+  counts SQLite prepares, steps and resets per statement text with
+  `sqlite3_stmt_status` at finalize, and samples the main thread's stack
+  on a wall-clock timer (`PROF_CLOCK=cpu` for its CPU clock), weighting a
+  sample by the timer overrun so time asleep in fdatasync is not
+  undercounted. Counters are reported per step: `bench_phases` now calls
+  `prof_mark` (found with dlsym, so nothing changes without the shim).
+- `bench/prof_report.py`, which symbolises the samples with nm and prints
+  self, innermost-c-backup-frame and inclusive tables per step. The site
+  column skips c-utils' `db_execute` wrappers, so a statement's cost lands
+  on the function that issued it.
+- `BENCH_DB_PRAGMAS` in `bench_common.h`: SQL run once on the fresh
+  state.db handle, for trying connection settings the daemon does not
+  apply. Unset, the handle is the daemon's.
+
+```
+LD_PRELOAD=build/bins/prof_shim.so PROF_OUT=DIR bench_phases -n 100000 -l 0 -t 0
+python3 bench/prof_report.py DIR
+```
+
+### Time breakdown, as shipped (phase timers, NVMe, median run)
+
+| Phase | First backup | No-change incremental |
+|---|---:|---:|
+| read+hash+write (open, CDC, SHA-256, LZ4, parity, pack append) | 2.92 s | - |
+| txn-commit (WAL write and sync at COMMIT) | 3.20 s | 2.27 s |
+| index-put (staged `objects` row per file) | 1.69 s | 0.01 s |
+| index-nodes (`nodes` + `node_fts` row per entry) | 1.66 s | 1.96 s |
+| pack-seal (mostly `pack_objects` and `objects` rows per object) | 1.64 s | 0 |
+| cache-put | 0.78 s | - |
+| cache-lookup (two SELECTs per file) | 0.50 s | 0.99 s |
+| scan | 0.25 s | 0.24 s |
+| trees, snapshot, sweep, other | 0.22 s | 0.23 s |
+| **Total** | **12.86 s** | **5.67 s** |
+
+Restore has no phase timers; from the shim on NVMe (13.8 s run): syncfs
+196 calls 6.32 s, statement prepares 2.18 s, rename 0.90 s, mkdir 1.41M
+calls 0.49 s, fcntl 600k calls 0.21 s.
+
+### Syscalls and statements per file
+
+From the shim, NVMe, per file over 100,000 files:
+
+| | First backup | Incremental | Restore |
+|---|---:|---:|---:|
+| open / fstat / fstatfs / close | 1 / 1 / 1 / 1 | 0 | 0 / 3 / 0 / 1 |
+| lstat, llistxattr, getxattr (scan) | 1, 1, 1 | 1, 1, 1 | 1 (lstat) |
+| pread (source and state.db) | 7.3 | 5.1 | 1.8 |
+| pwrite (state.db WAL and checkpoint) | 7.8 | 4.4 | 1.0 |
+| fwrite (pack, stdio) | 7.1 | 0 | 0 |
+| mkdir / rename / utimensat | 0 | 0 | 14.1 / 1 / 1 |
+| SQLite prepares | 8.1 | 4.0 | 3.0 |
+| SQLite steps | 11.1 | 9.1 | 7.0 |
+| fdatasync, whole run | 356 (3.30 s) | 208 (2.36 s) | 196 syncfs (6.32 s) |
+
+The kernel-side work a small file needs is about 5 us (lstat 0.7, listxattr
+0.8, getxattr 0.5, open 1.7, fstat 0.3, pread 0.8, close 0.4); the
+filesystem calls together are under 0.7 s of a 13 s backup. The time is in
+state.db.
+
+### The sinks, with evidence
+
+**1. Every statement is prepared on every call.** c-utils' `db_execute` and
+`db_execute_non_query` call `sqlite3_prepare_v2` and finalize each time.
+806,267 prepares in a first backup cost 3.4-3.6 s (4.2-4.4 us each),
+404,242 in the incremental 1.1 s, 300,001 in the restore 2.0-2.2 s at 6.7
+us each, because the restore's location lookup is a JOIN and the JOIN is
+the most expensive statement to plan. On tmpfs, prepares are 40% of the
+first backup and 34% of the restore. Per statement, whole run, tmpfs
+(prepare ms / step ms):
+
+| Statement | Calls | Prepare | Step |
+|---|---:|---:|---:|
+| `pack_objects JOIN packs` (db_locate: dedup check, restore twice per file) | 402,014 | 3,124 | 991 |
+| `INSERT INTO objects ... ON CONFLICT` (staged row, then the seal's upsert) | 202,014 | 1,249 | 1,326 |
+| `INSERT INTO nodes` | 202,012 | 1,017 | 796 |
+| `SELECT ... FROM file_cache` | 200,000 | 781 | 181 |
+| `INSERT INTO file_cache` | 100,000 | 737 | 243 |
+| `INSERT INTO node_fts` | 202,012 | 229 | 371 |
+| `INSERT OR REPLACE INTO pack_objects` | 101,007 | 212 | 211 |
+| `SELECT 1 FROM objects` (cache hit check) | 100,000 | 204 | 152 |
+
+**2. state.db runs on SQLite defaults.** Nothing sets a pragma, so it is
+`synchronous=FULL` (a WAL sync per commit), a 2 MB page cache (7 preads and
+8 pwrites per file even on tmpfs) and a checkpoint every 1,000 pages: a
+first backup writes 1.45 GB through /proc/self/io for 390 MB of content
+(3.7x), a no-change incremental 850 MB (2.2x), nearly all of it WAL and
+checkpoint. Lowering synchronous alone does little, because the 4 MB
+checkpoint threshold still syncs twice per checkpoint: 249 fdatasyncs
+remain. Raising the threshold is what removes them (21 left).
+
+**3. Every snapshot re-indexes every entry.** `index_nodes` writes a
+`nodes` row and a trigram `node_fts` row per entry whether or not anything
+changed, so the no-change incremental spends 4.2 s of 5.7 s (index-nodes
+plus its commits) re-recording 101,007 unchanged entries. The manifest
+trees already dedup (1,008 of 1,008 reused); the index does not.
+
+**4. Restore syncs the whole filesystem every 512 files.** 196 syncfs at
+32 ms each are 46% of an NVMe restore. syncfs is a btrfs transaction
+commit for the whole filesystem, so its cost is per call and grows with
+whatever else is dirty on the disk.
+
+**5. Small files are stored serially on the backup thread**, and per file
+carry two LZ4 passes over the same bytes (the 64 KiB probe covers the
+whole of a file under 64 KiB, then the file is compressed again), an RS
+parity encode into a malloc'd buffer (3.3 us; OWN-44 is changing parity),
+SHA-256 (2.9 us) and 7 stdio writes. read+hash+write is 16-19 us per file
+once the database stops dominating.
+
+**6. Smaller items.** `make_parents` mkdirs every component of every
+restored file's path (14 per file, all EEXIST, 0.3-0.5 s); restore loads
+every node of the snapshot into one `db_execute` result; each object row
+is written twice (staged, then at seal); hashes are bound as 64-character
+hex text into BLOB columns, doubling every hash index.
+
+### Prototypes
+
+Built from a scratch copy of c-utils v1.6.0 and a scratch restore.c,
+linked into separate bench binaries; not committed.
+
+- **Statement cache**: 64 prepared statements per handle, keyed by SQL text
+  (FNV hash, then strcmp), `sqlite3_prepare_v3(SQLITE_PREPARE_PERSISTENT)`,
+  `sqlite3_reset` after use. The first version also called
+  `sqlite3_clear_bindings`, and the restore got *slower* (5.7 to 7.3 s on
+  tmpfs): clear_bindings marks a statement expired when its plan depends
+  on a bound value, and the locate JOIN's does, so it was re-prepared on
+  every one of 402,013 executions (`SQLITE_STMTSTATUS_REPREPARE`). Every
+  parameter is rebound before each step, so the clear is unnecessary.
+  Without it there are no reprepares.
+- **Pragmas** via `BENCH_DB_PRAGMAS`: `synchronous=NORMAL;
+  cache_size=-65536; wal_autocheckpoint=16384`.
+- **Restore**: syncfs batches of 4,096 files or 1 GiB (from 512 / 256 MiB),
+  and `make_parents` skipping a path whose parent it made last.
+
+| Config | NVMe first | NVMe incr | NVMe restore | tmpfs first | tmpfs incr | tmpfs restore |
+|---|---:|---:|---:|---:|---:|---:|
+| As shipped | 12.62 [12.44-12.77] | 5.39 [5.36-5.53] | 12.74 [12.40-13.05] | 8.21 [8.10-8.26] | 2.93 [2.92-3.08] | 5.68 [5.66-5.79] |
+| synchronous + cache_size | 12.08 [11.98-17.75] | 5.51 [4.93-5.84] | 12.52 [12.47-13.02] | 7.59 [7.52-7.84] | 2.86 [2.77-3.00] | 5.83 [5.76-5.92] |
+| all three pragmas | 8.73 [8.67-8.82] | 3.39 [3.34-3.49] | 12.02 [11.83-12.50] | 7.54 [7.48-7.55] | 2.75 [2.74-2.75] | 5.66 [5.65-5.73] |
+| statement cache | 8.85 [8.75-8.88] | 4.42 [4.27-4.47] | 9.61 [9.05-10.29] | 4.26 [4.21-4.31] | 1.75 [1.73-1.77] | 3.19 [3.17-3.26] |
+| statement cache + all three pragmas | 4.87 [4.84-4.89] | 2.27 [2.25-2.44] | 9.02 [8.94-9.23] | 3.87 [3.83-3.91] | 1.64 [1.61-1.64] | 3.16 [3.14-3.16] |
+| ... + restore batch and parent cache | 4.83 [4.81-4.84] | 2.25 [2.19-2.25] | 7.21 [6.95-7.25] | 3.83 [3.83-3.83] | 1.60 [1.58-1.61] | 2.79 [2.79-2.82] |
+
+The first two rows come from one interleaved round, the next from a later
+one; the shipped binary measured 12.86 / 5.67 / 12.77 s on NVMe in the
+first round, so rounds agree within about 3%. Together the cache and the
+pragmas take the NVMe first backup from 12.6 to 4.9 s (2.6x), the
+incremental from 5.4 to 2.3 s (2.4x), and the restore from 12.7 to 7.2 s
+with the restore changes. With them, NVMe write_bytes fall from 1.45 GB to
+1.07 GB (first) and from 850 to 520 MB (incremental).
+
+Where the time goes after the cache and the pragmas (NVMe, median run):
+first backup read+hash+write 1.78 s, txn-commit 0.89, pack-seal 0.57,
+index-nodes 0.52, index-put 0.37, scan 0.25, cache-put 0.21; incremental
+txn-commit 0.82, index-nodes 0.59, cache-lookup 0.47, scan 0.24.
+
+### Baselines, same tree, same disk
+
+restic and borg are not installed (not installed for this, by rule).
+
+| Tool | Time |
+|---|---:|
+| `tar cf` (to one file) | 0.39-0.40 s (+0.11 s sync) |
+| `cp -a` | 1.23-1.25 s (+0.10-0.12 s sync) |
+| `rsync -a` (fresh) | 2.53-2.68 s (+0.21-0.33 s sync) |
+| `rsync -a` (no change) | 0.26-0.28 s |
+| `find -printf '%s %T@'` (stat walk) | 0.08-0.09 s |
+| `tar xf` (restore-side) | 2.32-2.58 s (+0.13-0.41 s sync) |
+
+### The floor
+
+Per file, measured: about 5 us of system calls (above); CPU of 2.9 us
+SHA-256, 3.3 us LZ4 once, 3.3 us parity and about 2 us of CRC and stdio,
+roughly 12 us; and with prepared statements about 10 us of SQLite steps
+across the rows a file writes today (cache, object, pack_objects, node,
+fts). On one thread that is about 27 us a file, 2.7 s for this tree, and
+the cache plus pragmas build is at 3.8 s on tmpfs. A deduplicating backup
+also has to hash, compress and index, so `tar cf` at 0.4 s is not the
+target; `cp -a` at 1.2 s is a fair one for a first backup. The
+incremental floor is the stat walk plus a cache lookup per file: rsync
+does it in 0.27 s, against 2.25 s here, nearly all of which is
+re-indexing unchanged nodes.
+
+### Proposals, by expected gain
+
+| # | Change | Expected gain (this preset) | Risk |
+|---|---|---|---|
+| 1 | Statement cache in c-utils `db_execute*` (prototype above; no `clear_bindings`) | NVMe first -30%, incr -18%, restore -25%; tmpfs first -48%, incr -40%, restore -44% | Low. Cached statements must be reset on every path (they are, via cleanup); `db_close` finalizes; a DDL change re-prepares on its own. Needs a c-utils release and the version pin |
+| 2 | Set `synchronous=NORMAL`, a larger `cache_size` and `wal_autocheckpoint` on the daemon's handle | With 1: NVMe first 8.9 to 4.9 s, incr 4.4 to 2.3 s | Medium: NORMAL in WAL mode can lose the last commits on power loss, never corrupt. Safe here because the repository is the source of truth and the snapshot row lands last; each needs a sentence in Manual.md. The cache is per handle memory (64 MB) |
+| 3 | Do not re-index unchanged subtrees: key node rows by tree hash, or fault snapshots in on first browse (`nodes_materialized`) | Incremental 2.25 s to about 0.8 s (index-nodes and its commits are 1.4 s of it); first backup 0.5-1 s | High: schema, browse, search and restore queries, FTS by snapshot. Fault-in does not exist yet |
+| 4 | Restore: larger syncfs batches, a parent-directory cache in `make_parents` | NVMe restore 9.0 to 7.2 s, tmpfs 3.16 to 2.79 s | Low; more verified temp files pending at a crash, which the next run already sweeps. The prototype's cache is a static and must become per-restore state |
+| 5 | Store small files on workers: read, CDC, hash, compress and seal in parallel, append and index on the backup thread | read+hash+write 1.8 s is the largest remaining first-backup row; across 4 workers it could fall to about 0.5 s | Medium: the pack append order and the batch must stay on one thread; the existing large-file pool is the model |
+| 6 | One LZ4 pass for objects under 64 KiB (reuse the probe's output) | About 0.3 s of 0.66 s LZ4 on this tree | Low |
+| 7 | Bind hashes as 32-byte blobs, not hex text; write an object row once at seal rather than staged and then upserted | Unmeasured: halves every hash index and removes one statement per new object | Medium to high: a schema-level change to stored values, and staged rows exist for a reason that has to be re-argued |
+| 8 | OWN-44 (parity, other branch) | Per entry parity is 3.3 us a file, about 4% of the tmpfs first backup once 1 and 2 are in; a cheaper per-entry parity helps in proportion | As that branch |
+
+1 and 2 together are most of what this preset can gain without design
+work, and both are small changes. 3 is where the incremental's remaining
+time is.
 
 ## 2026-11-16 - Tree building is linear in entries (OWN-43)
 

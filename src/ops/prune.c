@@ -128,7 +128,7 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
      * same transaction, as every other tag change does. Left behind, a
      * reindex would skip them only because the timestamp no longer matches. */
     if (ntags > 0 && repo_tags_save(db, repo_id, store_root(store)) != OK) {
-        char why[256];
+        char why[ERR_MSG_MAX];
         snprintf(why, sizeof(why), "%s", err_msg());
         db_txn_rollback(db);
         return set_error(ERR_IO, "prune: cannot record tags in the repository: %s", why);

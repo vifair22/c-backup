@@ -122,9 +122,9 @@ echo "content one" > "$WORK/src/one.txt"
 head -c 65536 /dev/urandom > "$WORK/src/random.bin"
 echo "content two" > "$WORK/src/two.txt"
 
-# info, not warn: the OWN-31 checks read the line the job manager logs as it
-# sends a failure notification, the only trace that path leaves with
-# Pushover unconfigured.
+# info, not warn: the OWN-31 checks read the line the job manager logs for
+# a failure notification, the only trace that path leaves with Pushover
+# unconfigured (where the line says it was not sent, NIT-11).
 cat > "$WORK/config.yaml" <<EOF
 db:
   path: $WORK/state.db
@@ -300,6 +300,8 @@ echo "job reporting"
 GC_OUT=$(cb gc 1)
 contains "gc reports what it swept" '"objects_swept":' "$GC_OUT"
 contains "and what compaction did" '"packs_rewritten":' "$GC_OUT"
+contains "and what coalescing did (B122)" '"packs_removed_by_coalesce":' "$GC_OUT"
+contains "and the summary says so" ' coalesced into ' "$(cb journal 1)"
 contains "and the stale temp files it removed" '"tmp_files_removed":' "$GC_OUT"
 contains "gc dry run says it is one" '"dry_run":true' "$(cb gc 1 --dry-run)"
 contains "gc journals a summary" '"message":"swept ' "$(cb journal 1)"
@@ -1447,16 +1449,19 @@ damage_beyond_parity() {  # damage_beyond_parity <sample> <pack>
         dd of="$2" bs=1 seek=$((at / 2 + 8192)) conv=notrunc status=none
 }
 
-# The failure path is the job manager's: it marks the job failed and sends
-# the alert, and the line it logs as it sends is the evidence.
-# The job manager marks the job failed, which is what the CLI is waiting
-# for, and only then journals and sends the alert, so the line can land a
-# moment after the command returns: under the coverage build it did not
-# land in time and the check failed. Wait for it, up to 10 s.
+# The failure path is the job manager's: it marks the job failed and then
+# composes the alert, and the line it logs for it is the evidence. That line
+# follows the state the client returned on, so it is waited for, up to 10 s
+# (the coverage build is slow enough to need it). With no
+# Pushover credentials here it must say the alert was not sent (NIT-11).
 alerted() {  # alerted <job-id>
     local _
     for _ in $(seq 1 100); do
-        grep -q "sending failure notification for job $1:" "$WORK/daemon.log" && return 0
+        if grep -q "failure notification for job $1 not sent, Pushover is not configured: " \
+                "$WORK/daemon.log"; then
+            ! grep -q "sending failure notification for job $1:" "$WORK/daemon.log"
+            return
+        fi
         sleep 0.1
     done
     return 1
@@ -1487,8 +1492,8 @@ if damage_beyond_parity "$WORK/dmgsrc/lost.bin" "$DMG_DAT"; then
     contains "and counts it"                   '"objects_damaged":1' "$OUT$ERR"
     contains "everything else was still sent"  '"snapshots_sent":1' "$OUT$ERR"
     DJ=$(job_of "$ERR")
-    if [ -n "$DJ" ] && alerted "$DJ"; then ok "the failure alert was sent"
-    else bad "the failure alert was sent" "a notification for job '$DJ'" "none"; fi
+    if [ -n "$DJ" ] && alerted "$DJ"; then ok "the failure alert was composed, and not claimed as sent"
+    else bad "the failure alert was composed, and not claimed as sent" "a notification for job '$DJ'" "none"; fi
 else
     bad "damage fixture" "the file's bytes in the pack" "not found"
 fi
@@ -1514,8 +1519,8 @@ if [ -n "$GCD_DAT" ] && damage_beyond_parity "$WORK/gcdsrc/keep.bin" "$GCD_DAT";
     contains "the gc result lists the entry"  "$KEEP_HASH" "$OUT$ERR"
     contains "and counts it"                  '"pack_entries_damaged":1' "$OUT$ERR"
     GJ=$(job_of "$ERR")
-    if [ -n "$GJ" ] && alerted "$GJ"; then ok "the gc failure alert was sent"
-    else bad "the gc failure alert was sent" "a notification for job '$GJ'" "none"; fi
+    if [ -n "$GJ" ] && alerted "$GJ"; then ok "the gc failure alert was composed, and not claimed as sent"
+    else bad "the gc failure alert was composed, and not claimed as sent" "a notification for job '$GJ'" "none"; fi
 else
     bad "gc damage fixture" "the file's bytes in the pack" "not found"
 fi
@@ -1534,6 +1539,62 @@ contains "a quoted label backs up" '"state":"completed"' \
     "$(cb backup 1 "$WORK/src" --label 'say "hi" C:\dir')"
 contains "and is listed as given" '"label":"say \"hi\" C:\\dir"' "$(cb snapshots 1)"
 
+echo "start-up reconcile"
+# state.db runs synchronous=NORMAL, so a power cut can lose its newest
+# commits; a backup's are its last, after the snapshot-id mark and the record
+# are durable in the repository. That lost tail is made here by hand - the
+# newest snapshot's rows deleted from a stopped daemon's database - and the
+# next start has to put it back with no operator action: a reindex job of
+# origin "startup", a WARN naming the repository and the count.
+contains "the default state.db settings are applied" \
+    "state database: synchronous=normal, cache 64 MiB, checkpoint every 16384 pages" \
+    "$(cat "$WORK/daemon.log")"
+contains "a start with nothing lost says the index is complete" "index complete" \
+    "$(cat "$WORK/daemon.log")"
+contains "a backup to lose" '"state":"completed"' "$(cb backup 1 "$WORK/src" --label tail)"
+LOST=$(cb snapshots 1 | grep -o '"id":[0-9]*' | cut -d: -f2 | sort -n | tail -1)
+kill -TERM "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$WORK/state.db" "DELETE FROM nodes WHERE repo_id = 1 AND snap_id = $LOST;
+        DELETE FROM snapshots WHERE repo_id = 1 AND id = $LOST;
+        UPDATE snapshot_id_seq SET last_id = $LOST - 1 WHERE repo_id = 1;"
+    check "the lost snapshot is gone from the index" "0" \
+        "$(sqlite3 "$WORK/state.db" "SELECT COUNT(*) FROM snapshots WHERE repo_id = 1 AND id = $LOST")"
+    # The restart also changes every state.db setting, to show each one is
+    # read from the file and applied (the line is logged after reading back).
+    sed -i 's|^  path: \(.*state.db\)$|  path: \1\n  synchronous: full\n  cache_mb: 8\n  wal_autocheckpoint: 2000|' \
+        "$WORK/config.yaml"
+    : > "$WORK/daemon.log"
+    C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
+    contains "the configured state.db settings are applied" \
+        "state database: synchronous=full, cache 8 MiB, checkpoint every 2000 pages" \
+        "$(cat "$WORK/daemon.log")"
+    contains "the start names the repository and the count" \
+        "reconcile: repo 1 ($WORK/repo) has 1 snapshot(s) missing from the index" \
+        "$(cat "$WORK/daemon.log")"
+    STATE=""
+    for _ in $(seq 1 300); do
+        STATE=$(sqlite3 "$WORK/state.db" "SELECT state FROM jobs WHERE repo_id = 1
+            AND action = 'reindex' AND origin = 'startup' ORDER BY id DESC LIMIT 1")
+        [ "$STATE" = completed ] && break
+        sleep 0.1
+    done
+    check "the reindex is a startup job and completes" "completed" "$STATE"
+    contains "and its journal entry says startup" '"source":"startup"' "$(cb journal 1)"
+    contains "the lost snapshot is listed again" "\"id\":$LOST," "$(cb snapshots 1)"
+    contains "with its label" '"label":"tail"' "$(cb snapshots 1)"
+    contains "and the next backup numbers past it" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
+    check "to the id after it" "$((LOST + 1))" \
+        "$(cb snapshots 1 | grep -o '"id":[0-9]*' | cut -d: -f2 | sort -n | tail -1)"
+else
+    C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
+    ok "start-up reconcile (skipped: no sqlite3)"
+fi
+
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?
 check    "unknown repo exits non-zero" 1 "$RC"
@@ -1541,6 +1602,16 @@ contains "unknown repo reports status" "HTTP 404" "$OUT"
 OUT=$(cb backup 2>&1); RC=$?
 check    "missing arguments exit non-zero" 1 "$RC"
 contains "missing arguments show usage" "usage:" "$OUT"
+# NIT-8: an argument a command does not take was ignored, so this listed
+# repository 1's runs and exited 0.
+OUT=$(cb grep runs 1 2 2>&1); RC=$?
+check    "a stray positional exits non-zero" 1 "$RC"
+contains "and names it" "unexpected argument '2'; usage: c-backup grep runs" "$OUT"
+OUT=$(cb summary 1 --bogus 2>&1); RC=$?
+check    "an unknown option exits non-zero" 1 "$RC"
+contains "and names it too" "unexpected argument '--bogus'" "$OUT"
+OUT=$(cb grep runs 1 --limit 1 2>&1); RC=$?
+check    "options are still taken" 0 "$RC"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
