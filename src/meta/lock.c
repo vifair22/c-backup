@@ -102,6 +102,15 @@ status_t repo_trylock_write(int64_t repo_id)
     return OK;
 }
 
+status_t repo_trylock_read(int64_t repo_id)
+{
+    lock_slot_t *s = slot_for(repo_id);
+    if (!s) return set_error(ERR_NOMEM, "repo_trylock_read: lock table full");
+    if (pthread_rwlock_tryrdlock(&s->rw) != 0)
+        return set_error(ERR_BUSY, "repo %lld is busy", (long long)repo_id);
+    return OK;
+}
+
 status_t repo_lock_read(int64_t repo_id)
 {
     lock_slot_t *s = slot_for(repo_id);

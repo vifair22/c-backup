@@ -2,6 +2,7 @@
 
 #include "job_manager.h"
 
+#include "lock.h"
 #include "routes.h"
 
 #include <cutils/log.h>
@@ -25,6 +26,21 @@ typedef struct {
     job_fn   fn;
     void    *arg;
     void   (*arg_free)(void *);
+    job_lock_t lock;
+    /* The lock set: repo_id first (in mode `lock`) and then whatever else
+     * the job holds (write). Empty for a job with no repository. */
+    int64_t  repos[JOB_LOCK_SET_MAX];
+    int      nrepos;
+    /* Deferral while a synchronous request holds the repo; see
+     * take_runnable. defer_ms is the current backoff, 0 until the first
+     * refusal; defer_until_ms is when to try again, on the mono_ms clock. */
+    int64_t  defer_until_ms;
+    int      defer_ms;
+    /* Set on the dequeued copy only: the dispatcher holds the lock set on
+     * the job's behalf, or could not take it for a reason other than
+     * contention and the job fails with lock_err instead of running. */
+    int      locked;
+    status_t lock_err;
 } job_slot_t;
 
 /*
@@ -44,6 +60,9 @@ typedef struct {
     int        claimed;   /* a worker owns this entry; see worker_main */
     int64_t    job_id;    /* 0 while idle */
     int64_t    repo_id;   /* 0 while idle or not repo scoped */
+    /* Every repository the running job holds; nrepos 0 while idle. */
+    int64_t    repos[JOB_LOCK_SET_MAX];
+    int        nrepos;
     atomic_int cancel;
 } worker_state_t;
 
@@ -59,11 +78,13 @@ struct job_manager {
     /*
      * One entry per worker: the job it is running, if any.
      *
-     * Also the set of repositories with a job on a worker right now. Every repo-scoped job takes the repo write lock, and that lock rejects
-     * rather than queues, so dispatching two jobs for one repo made the
-     * second fail instantly with "repo is busy". The queue was generating the
-     * contention the lock exists to catch. One entry per worker is enough:
-     * a repo can only be busy because some worker is holding it.
+     * Also the set of repositories with a job on a worker right now. Every
+     * repo-scoped job holds its repo lock while it runs, and that lock
+     * rejects rather than queues, so dispatching two jobs for one repo made
+     * the second fail instantly with "repo is busy". The queue was
+     * generating the contention the lock exists to catch. One entry per
+     * worker is enough to know which repos a job holds; a synchronous
+     * request holding one is found by take_runnable's try instead.
      */
     worker_state_t *running;
     /* Guards DB writes from worker threads. c-utils serialises internally,
@@ -197,15 +218,19 @@ static void set_job_state(job_manager_t *jm, int64_t job_id,
         /* Only a worker claiming the job starts it. A queued job cancelled
          * by `jobs cancel` or by shutdown never ran, and used to be given a
          * start time anyway; it now reads "started": null. */
+        /* A job starting clears the phase it may have shown while it was
+         * deferred; it has reported nothing of its own yet. */
         if (db_execute_non_query(jm->db,
                 "UPDATE jobs SET state = ?,"
+                " progress_phase = CASE WHEN ? = 'running' THEN ''"
+                "                       ELSE progress_phase END,"
                 " started = CASE WHEN ? = 'running'"
                 "                THEN COALESCE(started, strftime('%s','now'))"
                 "                ELSE started END,"
                 " ended = CASE WHEN ? IN ('completed','failed','cancelled')"
                 "              THEN strftime('%s','now') ELSE ended END"
                 " WHERE id = ?",
-                (const char *[]){ state, state, state, id, NULL }, NULL) != 0)
+                (const char *[]){ state, state, state, state, id, NULL }, NULL) != 0)
             log_error("job %s: cannot record state %s", id, state);
     }
     pthread_mutex_unlock(&jm->db_mu);
@@ -333,12 +358,22 @@ void job_set_summary(void *progress_ctx, const char *text)
     pc->summary = copy;
 }
 
-/* Caller holds jm->mu. repo_id 0 means "not repo scoped", never busy. */
-static int repo_is_running(const job_manager_t *jm, int64_t repo_id)
+/* Whether a lock set names repo_id. */
+static int set_has(const int64_t *repos, int nrepos, int64_t repo_id)
 {
-    if (repo_id <= 0) return 0;
+    for (int i = 0; i < nrepos; i++)
+        if (repos[i] == repo_id) return 1;
+    return 0;
+}
+
+/* Caller holds jm->mu. Whether a running job holds any repository in the
+ * set. A job with no repository has an empty set and is never blocked. */
+static int set_is_running(const job_manager_t *jm, const job_slot_t *q)
+{
     for (int i = 0; i < jm->nworkers; i++)
-        if (jm->running[i].repo_id == repo_id) return 1;
+        for (int r = 0; r < q->nrepos; r++)
+            if (set_has(jm->running[i].repos, jm->running[i].nrepos, q->repos[r]))
+                return 1;
     return 0;
 }
 
@@ -362,22 +397,127 @@ static job_slot_t dequeue_at(job_manager_t *jm, int k)
 }
 
 /*
- * Take the oldest queued job whose repository is not already busy.
+ * Caller holds jm->mu. Whether a job ahead of position k shares any
+ * repository with q. A queued job counts on every member of its lock set,
+ * so a replicate waiting for {src, dst} is the head of both queues and a
+ * stream of later jobs on dst cannot keep slipping in front of it.
+ */
+static int set_queued_before(const job_manager_t *jm, const job_slot_t *q, int k)
+{
+    for (int m = 0; m < k; m++) {
+        const job_slot_t *e = &jm->queue[(jm->head + m) % JOB_QUEUE_MAX];
+        for (int r = 0; r < q->nrepos; r++)
+            if (set_has(e->repos, e->nrepos, q->repos[r])) return 1;
+    }
+    return 0;
+}
+
+/*
+ * Try-lock the whole set, or none of it. The first member takes the job's
+ * mode, the rest are written. On any failure whatever was taken is released
+ * before returning, so no job ever holds one lock while waiting for another:
+ * that hold-and-wait is what lets A->B and B->A deadlock. The tries never
+ * block, so the order they are taken in does not matter.
+ */
+static status_t try_lock_set(const job_slot_t *q)
+{
+    for (int r = 0; r < q->nrepos; r++) {
+        status_t st = (r == 0 && q->lock == JOB_LOCK_READ)
+                          ? repo_trylock_read(q->repos[r])
+                          : repo_trylock_write(q->repos[r]);
+        if (st != OK) {
+            for (int u = r - 1; u >= 0; u--) repo_unlock(q->repos[u]);
+            return st;
+        }
+    }
+    return OK;
+}
+
+static void unlock_set(const job_slot_t *q)
+{
+    for (int r = q->nrepos - 1; r >= 0; r--) repo_unlock(q->repos[r]);
+}
+
+/*
+ * Take the oldest queued job whose repositories are free, holding its locks.
  *
  * Scanning past a blocked job rather than waiting on it keeps one slow
  * repository from stalling every other one, which a strict head-of-queue
- * policy would do. Returns 1 with the job in *out, or 0 if nothing is
- * runnable right now. Caller holds jm->mu.
+ * policy would do. Only a job that is the first queued on every repository
+ * of its lock set is a candidate, so jobs for one repository start in the
+ * order submitted, multi-repository jobs included.
+ *
+ * The repo lock is taken here, before the job leaves the queue (B123). Each
+ * job used to take it itself once a worker had marked it running, and the
+ * lock rejects rather than waits, so a snapshot delete or a repository
+ * removal holding it for a few milliseconds failed whichever job was
+ * dispatched in that window, failure alert and all. Contention now leaves
+ * the job where it is, still queued and still cancellable, to be tried again
+ * after a backoff that doubles from JOB_DEFER_MIN_MS to JOB_DEFER_MAX_MS.
+ * The try never blocks, so holding jm->mu across it cannot deadlock against
+ * a request holding the repo lock, and no worker is ever parked on one.
+ *
+ * Returns 1 with the job in *out. Otherwise 0, with *wake_ms the earliest
+ * retry due (0 if none) and *mark a job deferred for the first time, whose
+ * phase the caller records once it has let go of jm->mu. Caller holds jm->mu.
  */
-static int take_runnable(job_manager_t *jm, job_slot_t *out)
+static int take_runnable(job_manager_t *jm, job_slot_t *out,
+                         int64_t *wake_ms, int64_t *mark)
 {
+    int64_t now = mono_ms();
+    *wake_ms = 0;
+    *mark = 0;
     for (int k = 0; k < jm->count; k++) {
-        int i = (jm->head + k) % JOB_QUEUE_MAX;
-        if (repo_is_running(jm, jm->queue[i].repo_id)) continue;
+        job_slot_t *q = &jm->queue[(jm->head + k) % JOB_QUEUE_MAX];
+        status_t lst = OK;
+        if (q->nrepos > 0) {
+            if (set_is_running(jm, q)) continue;
+            if (set_queued_before(jm, q, k)) continue;
+            if (q->defer_until_ms > now) {
+                if (*wake_ms == 0 || q->defer_until_ms < *wake_ms)
+                    *wake_ms = q->defer_until_ms;
+                continue;
+            }
+            lst = try_lock_set(q);
+            if (lst == ERR_BUSY) {
+                err_clear();
+                if (q->defer_ms == 0) {
+                    q->defer_ms = JOB_DEFER_MIN_MS;
+                    if (*mark == 0) *mark = q->job_id;
+                    log_info("job %lld deferred: repo %lld%s is held by a request; "
+                             "it stays queued and retries",
+                             (long long)q->job_id, (long long)q->repo_id,
+                             q->nrepos > 1 ? " or another in its lock set" : "");
+                } else {
+                    q->defer_ms = q->defer_ms * 2 > JOB_DEFER_MAX_MS
+                                      ? JOB_DEFER_MAX_MS : q->defer_ms * 2;
+                }
+                q->defer_until_ms = now + q->defer_ms;
+                if (*wake_ms == 0 || q->defer_until_ms < *wake_ms)
+                    *wake_ms = q->defer_until_ms;
+                continue;
+            }
+        }
         *out = dequeue_at(jm, k);
+        out->locked   = (out->nrepos > 0 && lst == OK);
+        out->lock_err = lst;
         return 1;
     }
     return 0;
+}
+
+/* The phase a deferred job shows. Only while it is still queued: a worker
+ * may have claimed it, or a cancel finished it, since jm->mu was released. */
+static void mark_waiting(job_manager_t *jm, int64_t job_id)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)job_id);
+    pthread_mutex_lock(&jm->db_mu);
+    if (db_execute_non_query(jm->db,
+            "UPDATE jobs SET progress_phase = ? WHERE id = ? AND state = 'queued'",
+            (const char *[]){ JOB_PHASE_WAITING, id, NULL }, NULL) != 0)
+        { /* a report, not the job's outcome */ }
+    pthread_mutex_unlock(&jm->db_mu);
 }
 
 static void *worker_main(void *arg)
@@ -404,13 +544,31 @@ static void *worker_main(void *arg)
                 pthread_mutex_unlock(&jm->mu);
                 return NULL;
             }
-            if (take_runnable(jm, &slot)) break;
-            /* Either nothing queued, or everything queued belongs to a repo
-             * another worker is busy with. Both resolve on the next signal. */
-            pthread_cond_wait(&jm->cv, &jm->mu);
+            int64_t wake_ms, mark;
+            if (take_runnable(jm, &slot, &wake_ms, &mark)) break;
+            if (mark) {
+                pthread_mutex_unlock(&jm->mu);
+                mark_waiting(jm, mark);
+                pthread_mutex_lock(&jm->mu);
+                continue;
+            }
+            /* Nothing queued, or everything queued belongs to a repo another
+             * worker is busy with: both resolve on the next signal. A job
+             * deferred behind a request has a retry due, and nothing signals
+             * a request letting go, so that wait is bounded by the time. */
+            if (wake_ms > 0) {
+                struct timespec ts;
+                ts.tv_sec  = (time_t)(wake_ms / 1000);
+                ts.tv_nsec = (long)(wake_ms % 1000) * 1000000L;
+                pthread_cond_timedwait(&jm->cv, &jm->mu, &ts);
+            } else {
+                pthread_cond_wait(&jm->cv, &jm->mu);
+            }
         }
         ws->job_id  = slot.job_id;
         ws->repo_id = slot.repo_id;
+        memcpy(ws->repos, slot.repos, sizeof(ws->repos));
+        ws->nrepos  = slot.nrepos;
         atomic_store_explicit(&ws->cancel, 0, memory_order_relaxed);
         pthread_mutex_unlock(&jm->mu);
 
@@ -432,8 +590,12 @@ static void *worker_main(void *arg)
         clock_gettime(CLOCK_MONOTONIC, &began);
 
         progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL };
-        status_t st = slot.fn(slot.arg, &ws->cancel,
-                              on_progress, &pc);
+        /* A lock error that is not contention (the lock table is full) fails
+         * the job through the same reporting as any other failure. */
+        status_t st = slot.lock_err != OK
+                          ? slot.lock_err
+                          : slot.fn(slot.arg, &ws->cancel, on_progress, &pc);
+        if (slot.locked) unlock_set(&slot);
 
         /* The job's own account of what it did, and the final byte count,
          * which the throttle may not have written. Before the final state,
@@ -555,6 +717,7 @@ static void *worker_main(void *arg)
         pthread_mutex_lock(&jm->mu);
         ws->job_id  = 0;
         ws->repo_id = 0;
+        ws->nrepos  = 0;
         /* This repo just became free, so a worker parked on it can proceed. */
         pthread_cond_broadcast(&jm->cv);
         pthread_mutex_unlock(&jm->mu);
@@ -571,7 +734,13 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
     jm->db = db;
     pthread_mutex_init(&jm->mu, NULL);
     pthread_mutex_init(&jm->db_mu, NULL);
-    pthread_cond_init(&jm->cv, NULL);
+    /* Monotonic, because a deferred job's retry is a timed wait and a wall
+     * clock step must neither stretch nor skip it. */
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&jm->cv, &ca);
+    pthread_condattr_destroy(&ca);
 
     /*
      * Anything left in 'running' or 'queued' belongs to a previous process
@@ -696,10 +865,11 @@ status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
                                 fn, arg, arg_free, out_job_id);
 }
 
-static status_t submit_slot(job_manager_t *jm, int64_t repo_id, const char *action,
-                            const char *params_json, int64_t schedule_id,
-                            job_fn fn, void *arg, void (*arg_free)(void *),
-                            int64_t *out_job_id);
+static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                            const int64_t *also, int nalso,
+                            const char *action, const char *params_json,
+                            int64_t schedule_id, job_fn fn, void *arg,
+                            void (*arg_free)(void *), int64_t *out_job_id);
 
 status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *action,
                               const char *params_json, int64_t schedule_id,
@@ -707,27 +877,69 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
                               int64_t *out_job_id)
 {
     /* Negative is not a schedule; ORIGIN_STARTUP stays internal. */
-    return submit_slot(jm, repo_id, action, params_json,
+    return job_submit_locked(jm, repo_id, JOB_LOCK_WRITE, action, params_json,
+                             schedule_id > 0 ? schedule_id : 0,
+                             fn, arg, arg_free, out_job_id);
+}
+
+status_t job_submit_locked(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                           const char *action, const char *params_json,
+                           int64_t schedule_id, job_fn fn, void *arg,
+                           void (*arg_free)(void *), int64_t *out_job_id)
+{
+    return job_submit_lockset(jm, repo_id, lock, NULL, 0, action, params_json,
+                              schedule_id, fn, arg, arg_free, out_job_id);
+}
+
+status_t job_submit_lockset(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                            const int64_t *also, int nalso,
+                            const char *action, const char *params_json,
+                            int64_t schedule_id, job_fn fn, void *arg,
+                            void (*arg_free)(void *), int64_t *out_job_id)
+{
+    return submit_slot(jm, repo_id, lock, also, nalso, action, params_json,
                        schedule_id > 0 ? schedule_id : 0,
                        fn, arg, arg_free, out_job_id);
 }
 
-status_t job_submit_startup(job_manager_t *jm, int64_t repo_id, const char *action,
-                            const char *params_json, job_fn fn, void *arg,
-                            void (*arg_free)(void *), int64_t *out_job_id)
-{
-    return submit_slot(jm, repo_id, action, params_json, ORIGIN_STARTUP,
-                       fn, arg, arg_free, out_job_id);
-}
-
-static status_t submit_slot(job_manager_t *jm, int64_t repo_id, const char *action,
-                            const char *params_json, int64_t schedule_id,
+status_t job_submit_startup(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                            const int64_t *also, int nalso,
+                            const char *action, const char *params_json,
                             job_fn fn, void *arg, void (*arg_free)(void *),
                             int64_t *out_job_id)
 {
-    if (!jm || !fn || !action) {
+    return submit_slot(jm, repo_id, lock, also, nalso, action, params_json,
+                       ORIGIN_STARTUP, fn, arg, arg_free, out_job_id);
+}
+
+/* Every submission ends here: schedule_id is a schedule's id, 0 for the
+ * API, or ORIGIN_STARTUP, which only job_submit_startup passes. */
+static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                            const int64_t *also, int nalso,
+                            const char *action, const char *params_json,
+                            int64_t schedule_id, job_fn fn, void *arg,
+                            void (*arg_free)(void *), int64_t *out_job_id)
+{
+    if (!jm || !fn || !action || nalso < 0 || (nalso > 0 && !also)) {
         if (arg_free) arg_free(arg);
         return set_error(ERR_INVALID, "job_submit: null argument");
+    }
+
+    /* The lock set, deduplicated. A job with no repository locks nothing,
+     * whatever it names in `also`: the set is anchored on its repository. */
+    int64_t repos[JOB_LOCK_SET_MAX];
+    int nrepos = 0;
+    if (repo_id > 0) {
+        repos[nrepos++] = repo_id;
+        for (int i = 0; i < nalso; i++) {
+            if (also[i] <= 0 || set_has(repos, nrepos, also[i])) continue;
+            if (nrepos == JOB_LOCK_SET_MAX) {
+                if (arg_free) arg_free(arg);
+                return set_error(ERR_INVALID, "job_submit: lock set holds at most %d "
+                                 "repositories", JOB_LOCK_SET_MAX);
+            }
+            repos[nrepos++] = also[i];
+        }
     }
 
     char repo[32], sched[32];
@@ -808,6 +1020,13 @@ static status_t submit_slot(job_manager_t *jm, int64_t repo_id, const char *acti
     s->fn       = fn;
     s->arg      = arg;
     s->arg_free = arg_free;
+    s->lock     = lock;
+    memcpy(s->repos, repos, sizeof(s->repos));
+    s->nrepos   = nrepos;
+    s->defer_until_ms = 0;
+    s->defer_ms = 0;
+    s->locked   = 0;
+    s->lock_err = OK;
     jm->tail = (jm->tail + 1) % JOB_QUEUE_MAX;
     jm->count++;
     pthread_cond_signal(&jm->cv);

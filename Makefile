@@ -625,7 +625,7 @@ $(BINS)/slow_sync.so: $(BENCH)/slow_sync.c | $(BINS)
 # thread's stack, for profiling where perf and strace are unavailable. See
 # bench/prof_shim.c; bench/prof_report.py reads what it writes.
 $(BINS)/prof_shim.so: $(BENCH)/prof_shim.c | $(BINS)
-	$(CC) -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -lpthread -lrt
+	$(CC) -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -pthread -lrt
 
 bench: $(BINS)/bench_micro $(BINS)/bench_phases $(BINS)/bench_browse $(BINS)/slow_sync.so
 	@echo "=== micro ===" && $(BINS)/bench_micro
