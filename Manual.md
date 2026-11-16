@@ -418,6 +418,7 @@ What stops it:
 | A tab in the indentation | YAML indents with spaces |
 | A `log.level` that is not a level | `log.level: chatty` |
 | A `backup.file_cache_match` that is not a mode | `fast` |
+| An empty value for a key whose values are named or numbered: `log.level`, `db.synchronous`, `backup.file_cache_match`, `backup.unsettled` and every number, in the file or the environment. Leave the key out for its default. `http.bind` (empty is the loopback default) and the paths and Pushover credentials are exempt | `backup.unsettled: ""`, `http.port:` |
 
 The file format is a small subset of YAML: sections at the left margin, each
 holding `key: value` lines indented the same way with spaces, `#` comments,
