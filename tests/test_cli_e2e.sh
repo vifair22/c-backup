@@ -292,6 +292,8 @@ echo "job reporting"
 GC_OUT=$(cb gc 1)
 contains "gc reports what it swept" '"objects_swept":' "$GC_OUT"
 contains "and what compaction did" '"packs_rewritten":' "$GC_OUT"
+contains "and what coalescing did (B122)" '"packs_removed_by_coalesce":' "$GC_OUT"
+contains "and the summary says so" ' coalesced into ' "$(cb journal 1)"
 contains "and the stale temp files it removed" '"tmp_files_removed":' "$GC_OUT"
 contains "gc dry run says it is one" '"dry_run":true' "$(cb gc 1 --dry-run)"
 contains "gc journals a summary" '"message":"swept ' "$(cb journal 1)"

@@ -1081,12 +1081,13 @@ static int64_t repl_snap_at(const void *list, uint32_t i)
 
 static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
 {
-    char js[512];
+    char js[640];
     snprintf(js, sizeof(js),
              "{\"dry_run\":%s,\"reachable\":%llu,\"objects_swept\":%llu,"
              "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
              "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
-             "\"packs_deleted\":%u,\"tmp_files_removed\":%u,"
+             "\"packs_deleted\":%u,\"packs_coalesced\":%u,"
+             "\"packs_removed_by_coalesce\":%u,\"tmp_files_removed\":%u,"
              "\"tmp_bytes_removed\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
@@ -1095,6 +1096,7 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              (unsigned long long)gr->pack_entries_kept,
              (unsigned long long)gr->pack_entries_dropped,
              gr->packs_rewritten, gr->packs_deleted,
+             gr->packs_coalesced, gr->packs_removed_by_coalesce,
              gr->tmp_files_removed,
              (unsigned long long)gr->tmp_bytes_removed);
     char *full = with_damaged(js, "pack_entries_damaged", gr->pack_entries_damaged,
@@ -1117,11 +1119,13 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
     else
         snprintf(msg, sizeof(msg),
                  "swept %llu object%s (%llu bytes); %u pack%s rewritten, "
-                 "%u deleted; %u stale temp file%s removed",
+                 "%u deleted, %u coalesced into %u; %u stale temp file%s removed",
                  (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
                  (unsigned long long)gr->bytes_freed,
                  gr->packs_rewritten, gr->packs_rewritten == 1 ? "" : "s",
                  gr->packs_deleted,
+                 gr->packs_coalesced,
+                 gr->packs_coalesced - gr->packs_removed_by_coalesce,
                  gr->tmp_files_removed, gr->tmp_files_removed == 1 ? "" : "s");
     if (gr->pack_entries_damaged > 0) {
         size_t n = strlen(msg);

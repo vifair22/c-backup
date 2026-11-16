@@ -863,7 +863,7 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
 | pack | `loose` (loose objects found), `packed`, `skip_marked` (already marked incompressible, left loose), `incompressible` (marked by this run's probe, left loose), `reason` |
 

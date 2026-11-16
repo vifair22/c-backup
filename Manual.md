@@ -1286,12 +1286,15 @@ would do:
 ```json
 {"dry_run":false,"reachable":5210,"objects_swept":12,"bytes_freed":40960,
  "pack_entries_kept":5100,"pack_entries_dropped":12,"packs_rewritten":1,
- "packs_deleted":0,"tmp_files_removed":0,"tmp_bytes_removed":0}
+ "packs_deleted":0,"packs_coalesced":20,"packs_removed_by_coalesce":17,
+ "tmp_files_removed":0,"tmp_bytes_removed":0}
 ```
 
 `objects_swept` and `bytes_freed` are what was swept, or on a dry run what
 would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
-does not do; `tmp_files_removed` counts staging files an interrupted run left
+does not do. `packs_coalesced` is how many small packs the coalescing pass
+after compaction merged, and `packs_removed_by_coalesce` how many fewer pack
+files that left: 20 merged into 3 is 20 and 17. `tmp_files_removed` counts staging files an interrupted run left
 behind (section 2.2). The journal entry carries the same in a line.
 
 Compaction copies entries into packs whose parity is computed afresh, so it

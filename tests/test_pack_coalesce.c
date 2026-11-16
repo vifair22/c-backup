@@ -200,6 +200,38 @@ static void test_ratio_trigger_merges_small_packs(void **state)
     assert_all_readable();
 }
 
+/*
+ * B122: the merge is reported. A gc that merged 20 packs into 3 said
+ * packs_rewritten 0 and packs_deleted 0, as though nothing had happened.
+ */
+static void test_coalesce_is_counted(void **state)
+{
+    (void)state;
+    clone_packs_to(10);
+    int before = count_packs();
+
+    uint8_t refs[NOBJ][OBJECT_HASH_SIZE];
+    memcpy(refs, hashes, sizeof(refs));
+    qsort(refs, NOBJ, OBJECT_HASH_SIZE, hash_cmp);
+    uint32_t k = 0, d = 0;
+    pack_gc_stats_t ps;
+    assert_int_equal(pack_gc_stats(store, (const uint8_t *)refs, NOBJ, &k, &d, &ps), OK);
+    int after = count_packs();
+
+    assert_true(after < before);
+    assert_true(ps.packs_coalesced >= 2);
+    /* Nothing was dead, so every pack that went was merged away. */
+    assert_int_equal(ps.packs_rewritten, 0);
+    assert_int_equal(ps.packs_deleted, 0);
+    assert_int_equal(ps.packs_removed_by_coalesce, (uint32_t)(before - after));
+    assert_all_readable();
+
+    /* Nothing left to merge: a second pass counts nothing. */
+    assert_int_equal(pack_gc_stats(store, (const uint8_t *)refs, NOBJ, &k, &d, &ps), OK);
+    assert_int_equal(ps.packs_coalesced, 0);
+    assert_int_equal(ps.packs_removed_by_coalesce, 0);
+}
+
 /* Neither trigger met: coalescing must not run. Merging two packs to save one
  * file would cost a full rewrite for nothing. */
 static void test_below_thresholds_leaves_packs_alone(void **state)
@@ -317,6 +349,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_count_trigger_merges_packs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_ratio_trigger_merges_small_packs, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_coalesce_is_counted, setup, teardown),
         cmocka_unit_test_setup_teardown(test_below_thresholds_leaves_packs_alone, setup, teardown),
         cmocka_unit_test_setup_teardown(test_single_pack_is_a_noop, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deleting_marker_is_replayed, setup, teardown),
