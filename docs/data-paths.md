@@ -327,8 +327,8 @@ tree), in batches under a `recovery_state` marker that the `snapshots` row
 clears in its transaction. Two binding rules apply here and everywhere else
 in the daemon:
 
-- Parameters go through the typed calls (`db_typed.h`): a hash binds as a
-  raw 32-byte BLOB and an absent value as a real NULL. c-utils 1.6's string
+- Parameters go through c-utils' typed calls (`db_execute_typed`): a hash
+  binds as a raw 32-byte BLOB and an absent value as a real NULL. The string
   params could do neither (a NULL ended the list), which is why hash
   columns used to hold hex text; every hash column now holds 32 raw bytes
   and is read back as `lower(hex(col))`.

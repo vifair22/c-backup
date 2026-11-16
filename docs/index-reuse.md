@@ -134,8 +134,9 @@ None in shape. Within the existing contracts:
 
 ## Hash columns (NIT-12)
 
-Every hash column holds a raw 32-byte BLOB. c-utils 1.6 binds strings only,
-so until the typed bind of c-utils 1.7 is pinned, `src/common/db_typed.c`
-implements the agreed `db_execute_typed` API by rewriting each BLOB
-parameter into an `X'..'` literal. Results stay text, so hashes are read as
-`lower(hex(col))`.
+Every hash column holds a raw 32-byte BLOB, bound through c-utils 1.7's
+typed parameters (`db_execute_typed`, `DB_BLOB`); c-utils 1.6 bound strings
+only, which is why the columns held hex. Results stay text, so hashes are
+read as `lower(hex(col))`. An absent hash binds `DB_NULLP`
+(`DB_HASH_OR_NULL` in `src/common/db_typed.h`), never `DB_BLOB(NULL, 32)`,
+which c-utils binds as a 32-byte blob read from nowhere.

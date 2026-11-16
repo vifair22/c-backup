@@ -113,14 +113,13 @@ static void emit_stalest_info(mbuf_t *m, const char *name, const char *help,
 }
 
 /* Single-value query; -1 when it cannot be answered, including a NULL
- * result. c-utils returns a NULL column as an empty string, not a NULL
- * pointer, so the empty string is the test: an aggregate over no rows used
- * to parse as 0 and report "just now" for something that never happened. */
+ * result: an aggregate over no rows used to parse as 0 and report "just
+ * now" for something that never happened. */
 static long long scalar(const char *sql)
 {
     db_result_t *r = NULL;
     if (db_execute(g_db, sql, NULL, &r) != 0 || !r || r->nrows != 1 ||
-        !r->rows[0][0] || !r->rows[0][0][0]) {
+        db_result_is_null(r, 0, 0)) {
         db_result_free(r);
         return -1;
     }

@@ -340,7 +340,7 @@ static int seconds_until_next(scheduler_t *sched, time_t now)
     if (db_execute(sched->db,
             "SELECT MIN(next_due_at) FROM schedules WHERE enabled = 1",
             NULL, &r) == 0 && r && r->nrows == 1 &&
-        r->rows[0][0] && r->rows[0][0][0] != '\0') {
+        !db_result_is_null(r, 0, 0)) {
         time_t due = (time_t)strtoll(r->rows[0][0], NULL, 10);
         long delta = (long)(due - now);
         if (delta < 0) delta = 0;

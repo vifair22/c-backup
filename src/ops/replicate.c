@@ -626,10 +626,9 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         int64_t snap_id = strtoll(snaps->rows[i][0], NULL, 10);
         int64_t ts      = strtoll(snaps->rows[i][1], NULL, 10);
-        /* c-utils hands back an empty string for a NULL column, never a NULL
-         * pointer, so an unlabelled snapshot has to be recognised by testing
-         * the string. */
-        const char *label = (snaps->rows[i][2] && snaps->rows[i][2][0])
+        /* Unlabelled is a NULL label, or the empty one a backup without a
+         * label records. */
+        const char *label = (!db_result_is_null(snaps, (int)i, 2) && snaps->rows[i][2][0])
                             ? snaps->rows[i][2] : NULL;
 
         uint8_t root[OBJECT_HASH_SIZE];

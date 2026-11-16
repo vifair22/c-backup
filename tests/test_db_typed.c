@@ -1,14 +1,15 @@
 #define _POSIX_C_SOURCE 200809L
 
 /*
- * The typed-parameter calls (db_typed.h), on c-utils 1.6.
+ * What c-backup relies on from c-utils' typed parameters (c-utils 1.7).
  *
- * Until c-utils 1.7 is pinned these rewrite each placeholder into the
- * statement, so what matters is that the rewrite binds exactly what a real
- * typed bind would: a BLOB as its raw bytes, NULL as NULL rather than the
- * end of the list, a negative integer without turning into a comment, and a
- * '?' inside a literal or comment left alone. When the pin moves, these
- * same assertions hold the real implementation.
+ * Every hash column holds raw bytes (NIT-12) and absent values are real
+ * NULLs, which the string-array API could do neither of. These pin down
+ * the behaviour the call sites assume, so a c-utils change that broke it
+ * fails here rather than as a hash that matches nothing: a BLOB binds its
+ * raw bytes, NULL is a value rather than the end of the list, integers bind
+ * as integers, numbered placeholders resolve as SQLite numbers them, text
+ * cannot escape its parameter, and db_result_is_null tells NULL from "".
  */
 
 #include <setjmp.h>
@@ -82,10 +83,10 @@ static void test_blob_binds_raw_bytes(void **state)
 static void test_null_is_a_value_not_a_terminator(void **state)
 {
     (void)state;
-    db_param_t p[] = { DB_NULLP, DB_INT64(2), DB_TEXT(NULL), DB_BLOB(NULL, 32),
-                       DB_TEXT("after the nulls") };
+    uint8_t h[32] = { 1 };
+    db_param_t p[] = { DB_HASH_OR_NULL(0, h), DB_INT64(2), DB_TEXT(NULL), DB_NULLP };
     assert_int_equal(db_execute_non_query_typed(db,
-        "INSERT INTO t (b, i, s, d) VALUES (?, ?, ?, ?); ", p, 4, NULL), 0);
+        "INSERT INTO t (b, i, s, d) VALUES (?, ?, ?, ?)", p, DB_NPARAMS(p), NULL), 0);
     char *v = one("SELECT (b IS NULL) || (s IS NULL) || (d IS NULL) || i FROM t");
     assert_string_equal(v, "1112");
     free(v);
@@ -97,43 +98,52 @@ static void test_null_is_a_value_not_a_terminator(void **state)
     free(v);
 }
 
+static void test_result_null_is_not_empty_text(void **state)
+{
+    (void)state;
+    db_param_t p[] = { DB_TEXT(""), DB_INT64(1) };
+    assert_int_equal(db_execute_non_query_typed(db,
+        "INSERT INTO t (s, i) VALUES (?, ?)", p, DB_NPARAMS(p), NULL), 0);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT s, d, MIN(d) FROM t", NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "");
+    assert_string_equal(r->rows[0][1], "");
+    assert_false(db_result_is_null(r, 0, 0));
+    assert_true(db_result_is_null(r, 0, 1));
+    assert_true(db_result_is_null(r, 0, 2));
+    db_result_free(r);
+}
+
 static void test_numbers_and_negatives(void **state)
 {
     (void)state;
     db_param_t p[] = { DB_INT64(INT64_MIN), DB_INT64(-5) };
     db_result_t *r = NULL;
-    assert_int_equal(db_execute_typed(db, "SELECT ?, 10-?, typeof(?1)", p, 2, &r), 0);
+    assert_int_equal(db_execute_typed(db, "SELECT ?1, 10-?2, typeof(?1)", p, 2, &r), 0);
     assert_string_equal(r->rows[0][0], "-9223372036854775808");
     assert_string_equal(r->rows[0][1], "15");
     assert_string_equal(r->rows[0][2], "integer");
     db_result_free(r);
-    db_param_t d[] = { { .type = DB_P_DOUBLE, .dbl = 0.5 } };
+    db_param_t d[] = { DB_DOUBLE(0.5) };
     assert_int_equal(db_execute_typed(db, "SELECT ? * 4", d, 1, &r), 0);
     assert_string_equal(r->rows[0][0], "2.0");
     db_result_free(r);
 }
 
-static void test_placeholders_in_literals_and_numbered(void **state)
+static void test_placeholders_and_text(void **state)
 {
     (void)state;
     db_param_t p[] = { DB_TEXT("a'b"), DB_INT64(7), DB_TEXT("third") };
     db_result_t *r = NULL;
-    /* '?' is a literal; ?2 is used twice; the bare ? after ?2 is number 3;
-     * the ones in comments are comments. */
-    assert_int_equal(db_execute_typed(db,
-        "SELECT '?' || ?1, ?2 + ?2, ? -- trailing ?\n"
-        " /* a ? here */",
-        p, DB_NPARAMS(p), &r), 0);
+    /* '?' in a literal is a literal; ?2 is used twice; the bare ? after ?2
+     * is number 3. */
+    assert_int_equal(db_execute_typed(db, "SELECT '?' || ?1, ?2 + ?2, ?",
+                                      p, DB_NPARAMS(p), &r), 0);
     assert_string_equal(r->rows[0][0], "?a'b");
     assert_string_equal(r->rows[0][1], "14");
     assert_string_equal(r->rows[0][2], "third");
     db_result_free(r);
-    assert_int_not_equal(db_execute_typed(db,
-        "SELECT '?' || ?1, ?2 + ?2, ?", p, 2, &r), 0);   /* ? is 3 of 2 */
-    assert_int_equal(db_execute_typed(db, "SELECT ?1 || '?', ?2 * 2", p, DB_NPARAMS(p), &r), 0);
-    assert_string_equal(r->rows[0][0], "a'b?");
-    assert_string_equal(r->rows[0][1], "14");
-    db_result_free(r);
+
     /* Text stays a bound parameter: a quote in it cannot end a literal. */
     db_param_t q[] = { DB_TEXT("x'); DROP TABLE t; --") };
     assert_int_equal(db_execute_typed(db, "SELECT ?", q, 1, &r), 0);
@@ -144,14 +154,16 @@ static void test_placeholders_in_literals_and_numbered(void **state)
     free(v);
 }
 
-static void test_too_few_parameters_fail(void **state)
+/* More values than placeholders is a caller bug, refused before it runs. */
+static void test_extra_parameters_fail(void **state)
 {
     (void)state;
-    db_param_t p[] = { DB_INT64(1) };
+    db_param_t p[] = { DB_INT64(1), DB_INT64(2) };
     db_result_t *r = NULL;
-    assert_int_not_equal(db_execute_typed(db, "SELECT ?, ?", p, 1, &r), 0);
+    assert_int_not_equal(db_execute_typed(db, "SELECT ?", p, 2, &r), 0);
     assert_null(r);
-    assert_int_not_equal(db_execute_non_query_typed(db, "SELECT ?3", p, 1, NULL), 0);
+    assert_int_not_equal(db_execute_non_query_typed(db, "DELETE FROM t WHERE i = ?",
+                                                    p, 2, NULL), 0);
 }
 
 int main(void)
@@ -159,9 +171,10 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_blob_binds_raw_bytes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_null_is_a_value_not_a_terminator, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_result_null_is_not_empty_text, setup, teardown),
         cmocka_unit_test_setup_teardown(test_numbers_and_negatives, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_placeholders_in_literals_and_numbered, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_too_few_parameters_fail, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_placeholders_and_text, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_extra_parameters_fail, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

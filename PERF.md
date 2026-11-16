@@ -83,6 +83,27 @@ and the deep chain's skeleton rows are wider than the old node rows.
 match placed in the snapshots holding it, one `snap_dirs_by_tree` lookup per
 distinct tree, which replaced the per-hit ancestor walk.
 
+### On c-utils 1.7.0
+
+The same branch rebuilt against c-utils v1.7.0 (c47ceac), whose statement
+cache is on by default, with the 1.6 shim gone and every hash bound through
+its typed parameters. Same preset, machine and conditions; no pragmas (those
+are V3-7's). Median of three:
+
+| | 1.6.0 | 1.7.0 |
+|---|---:|---:|
+| First backup | 9.17 s | 5.46 s [5.37 5.46 5.48] |
+| No-change incremental | 1.58 s | 0.97 s [0.96 0.97 0.98] |
+| Restore | 12.41 s | 10.25 s [10.09 10.25 10.53] |
+
+`bench_browse` on 1.7.0, against the original baseline: list_snapshot_root
+4.7 us (22.8), expand_40child_dir 31.0 (55.3), expand_wide_last_page 405.5
+(456.6), expand_wide_all_pages 13,812 (16,325), resolve_path_deep 55.7
+(153.2), resolve_path_bulk_file 18.6 (46.6), snapshot_switch 45.4 (97.9),
+search_one_snap_rare 151.0 (447.5), search_all_snaps_common 2,073.8
+(2,367.5), cold_open_first_listing 276.1 (223.5; a new connection starts
+with an empty cache).
+
 ---
 
 ## 2026-11-16 - Tree building is linear in entries (OWN-43)

@@ -11,9 +11,12 @@
  * its row once - which column goes under which key, and what kind of value
  * it is - and this turns the text into the right JSON type.
  *
- * A NULL column reads back as "" from c-utils, never as a NULL pointer, so
- * the empty string is what "no value" looks like here. For a numeric, flag
- * or nullable text column it becomes JSON null.
+ * A NULL column reads back as "" from c-utils (db_result_is_null is what
+ * tells the two apart). A numeric or flag column holding anything that does
+ * not parse, "" included, becomes JSON null. JCOL_STR_NULL maps "" to null
+ * on purpose, for NULL and empty alike: in the columns it serves an empty
+ * value means "none" (a label written as "", lower(hex()) of a NULL hash,
+ * which is ""), and a client should see one spelling of it.
  *
  * Numbers are doubles inside the builder, and cJSON prints them with 15
  * significant digits, so an integer comes out digit for digit below 10^15.
@@ -32,9 +35,9 @@
 
 typedef enum {
     JCOL_STR,       /* text, as is; "" stays "" */
-    JCOL_STR_NULL,  /* text; "" (a NULL column) becomes null */
-    JCOL_INT,       /* integer; "" becomes null */
-    JCOL_BOOL       /* 0/1 (or "true"/"false"); "" becomes null */
+    JCOL_STR_NULL,  /* text; NULL or "" (no value) becomes null */
+    JCOL_INT,       /* integer; NULL or unparseable becomes null */
+    JCOL_BOOL       /* 0/1 (or "true"/"false"); NULL or unparseable becomes null */
 } jcol_kind_t;
 
 typedef struct {

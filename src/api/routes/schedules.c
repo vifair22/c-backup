@@ -142,7 +142,7 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
         cJSON_AddBoolToObject(o, "enabled", strtoll(row[6], NULL, 10) != 0);
         /* Only when the daemon turned it off, and says why: a row that
          * broke a rule the route added after it was written. */
-        if (row[10] && row[10][0])
+        if (!db_result_is_null(r, i, 10))
             cJSON_AddStringToObject(o, "disabled_reason", row[10]);
         /* The epoch stays for scripts that compute with it; the ISO form,
          * with the zone's offset, is what a person can read. */
@@ -150,9 +150,9 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
         char iso[48];
         iso_local((time_t)strtoll(row[8], NULL, 10), iso, sizeof(iso));
         cJSON_AddStringToObject(o, "next_due_iso", iso);
-        /* Only where there is one: an empty string is what a NULL column
-         * reads back as, and several actions carry no parameters. */
-        if (row[9] && row[9][0]) add_stored_json(o, "params", row[9]);
+        /* Only where there is one. Several actions carry none, stored as
+         * NULL or, from the string-bound insert, as an empty string. */
+        if (!db_result_is_null(r, i, 9) && row[9][0]) add_stored_json(o, "params", row[9]);
         cJSON_AddItemToArray(arr, o);
     }
     db_result_free(r);

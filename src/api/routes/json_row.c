@@ -88,8 +88,10 @@ static int add_one(const target_t *t, const char *key, jcol_kind_t kind, const c
     switch (kind) {
     case JCOL_STR:      return t_str(t, key, text);
     case JCOL_STR_NULL: return text[0] ? t_str(t, key, text) : t_null(t, key);
-    case JCOL_INT:      return text[0] ? add_int(t, key, text) : t_null(t, key);
-    case JCOL_BOOL:     return text[0] ? add_bool(t, key, text) : t_null(t, key);
+    /* A NULL column reads as "", which is not a number or a flag, so it
+     * becomes null the way any unparseable value does. */
+    case JCOL_INT:      return add_int(t, key, text);
+    case JCOL_BOOL:     return add_bool(t, key, text);
     }
     return t_null(t, key);
 }
