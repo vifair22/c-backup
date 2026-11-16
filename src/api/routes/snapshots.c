@@ -1080,7 +1080,8 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
              "\"packs_deleted\":%u,\"packs_coalesced\":%u,"
              "\"packs_removed_by_coalesce\":%u,\"tmp_files_removed\":%u,"
-             "\"tmp_bytes_removed\":%llu,\"content_missing\":%llu",
+             "\"tmp_bytes_removed\":%llu,\"content_missing\":%llu,"
+             "\"dups_dropped\":%llu,\"dups_kept\":%llu,\"index_relocated\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
              (unsigned long long)gr->swept,
@@ -1091,7 +1092,10 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              gr->packs_coalesced, gr->packs_removed_by_coalesce,
              gr->tmp_files_removed,
              (unsigned long long)gr->tmp_bytes_removed,
-             (unsigned long long)gr->content_missing);
+             (unsigned long long)gr->content_missing,
+             (unsigned long long)gr->dups_dropped,
+             (unsigned long long)gr->dups_kept,
+             (unsigned long long)gr->index_relocated);
     /* Packs compaction could not walk, each with why. Reasons are built by
      * the pack layer from fixed text and numbers, so need no escaping. */
     size_t n = jn > 0 ? (size_t)jn : 0;
@@ -1302,6 +1306,7 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                  "\"recoverable\":%llu,\"unrecoverable\":%llu,\"missing\":%llu,"
                  "\"failed\":%s,"
                  "\"unsettled_files\":%llu,"
+                 "\"pack_structures_repaired\":%llu,\"pack_structures_recoverable\":%llu,"
                  "\"packs_unwalkable\":%llu,\"packs_restored\":%llu,"
                  "\"packs_salvaged\":%llu,\"unreferenced_dropped_bytes\":%llu,"
                  "\"unreferenced_dropped_ranges\":%llu,\"unreferenced_dropped\":[",
@@ -1313,6 +1318,8 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)vr.unrecoverable, (unsigned long long)vr.missing,
                  vr.unrecoverable || vr.missing ? "true" : "false",
                  (unsigned long long)vr.unsettled_files,
+                 (unsigned long long)vr.pack_structures_repaired,
+                 (unsigned long long)vr.pack_structures_recoverable,
                  (unsigned long long)vr.packs_unwalkable,
                  (unsigned long long)vr.packs_restored,
                  (unsigned long long)vr.packs_salvaged,
