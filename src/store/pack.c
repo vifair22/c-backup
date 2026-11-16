@@ -4931,8 +4931,11 @@ static status_t pack_rw_copy(pack_rw_t *rw, FILE *src, const pack_dat_entry_hdr_
             log_warn("pack rewrite: entry header parity uncorrectable");
             parity_stats_add_uncorrectable(1);
         }
-        if (hdr_copy.compressed_size > OBJECT_SIZE_MAX ||
-            (uint64_t)src_pay + hdr_copy.compressed_size > (uint64_t)ep.trailer_start)
+        /* No size cap (OWN-25): the entry only has to fit before the
+         * trailer. Compared by subtraction so a damaged, huge size cannot
+         * overflow the sum and slip past. */
+        if ((off_t)ep.trailer_start < src_pay ||
+            hdr_copy.compressed_size > (uint64_t)((off_t)ep.trailer_start - src_pay))
             return set_error(ERR_CORRUPT, "pack rewrite: entry runs into the parity trailer");
     }
     if (fseeko(src, src_pay, SEEK_SET) != 0)
