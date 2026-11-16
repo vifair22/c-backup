@@ -30,8 +30,8 @@ void routes_repos_set_key_dir(const char *dir);
 /* How strictly backups recognise an unchanged file (file_cache_match_t,
  * from backup.file_cache_match). Set from config at startup. */
 void routes_backup_set_file_cache_match(int mode);
-/* Large-file store threads per backup (backup.store_workers): 0 automatic,
- * 1 serial. Set from config at startup. */
+/* Chunk workers per backup (backup.store_workers): 0 automatic, 1 serial.
+ * Set from config at startup. */
 void routes_backup_set_store_workers(unsigned n);
 unsigned routes_backup_store_workers(void);
 void routes_auth_set_config(cutils_config_t *cfg);
@@ -68,20 +68,6 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
 
 /* Submit a maintenance job by action name, so the scheduler starts exactly
  * the work the routes do. */
-/*
- * Run the pack phase against an already-open store.
- *
- * Shared so the backup job can finish by packing without duplicating the
- * progress adaptation: pack.c predates the job manager and takes its progress
- * callback with the counters first.
- */
-struct store;
-struct pack_report;
-status_t routes_run_pack(struct store *store, int64_t repo_id,
-                         atomic_int *cancel,
-                         void (*progress)(const char *, uint64_t, uint64_t, void *),
-                         void *progress_ctx, struct pack_report *out);
-
 /*
  * Read a boolean policy flag, falling back to def when the repo has not set
  * one. Policy lives in policy_values as text.

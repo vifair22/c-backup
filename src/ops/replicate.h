@@ -90,27 +90,12 @@
 #include <stdint.h>
 
 /*
- * One object, as it sits on disk.
- *
- * These are the fields a reader needs to interpret the payload, which is
- * exactly what a loose object header and a pack entry header both carry -
- * the two on-disk forms differ in layout, not in content, so a target can
- * store what it receives in whichever form it likes.
- *
- * The payload is pulled, not handed over. An object can be larger than the
- * memory of either machine (design constraint 2), so a sink that takes it
- * calls read for as many pieces as it likes, each filled exactly or
- * failed, until payload_len bytes have arrived - and holds one piece at a
- * time, never the object. read may be called only from inside put_object
- * and never for more than payload_len in total. A sink that already holds
- * the hash returns without reading at all.
- *
- * A read failure is the transfer failing part-way: the sink must discard
- * what it took of that object and pass the status up, so the snapshot
- * gets no record.
+ * One object, as it sits in a pack: the fields a reader needs to interpret
+ * the payload, which is what a pack entry header carries, and the stored
+ * payload itself. Every object is bounded (OBJECT_MAX_STORED_BYTES), so it
+ * travels whole. The payload is the caller's and valid only for the length
+ * of put_object.
  */
-typedef status_t (*replica_read_fn)(void *ctx, void *buf, size_t n);
-
 typedef struct {
     uint8_t         hash[OBJECT_HASH_SIZE];
     uint8_t         type;
@@ -118,8 +103,7 @@ typedef struct {
     uint8_t         encryption;
     uint64_t        uncompressed_size;
     uint64_t        payload_len;  /* compressed then encrypted, tag included */
-    replica_read_fn read;
-    void           *read_ctx;
+    const void     *payload;
 } replica_object_t;
 
 /*
@@ -176,6 +160,16 @@ typedef struct {
                              const uint8_t root_tree_hash[OBJECT_HASH_SIZE],
                              int *out_present);
 
+    /*
+     * Raise the target's snapshot-id high-water mark to at least at_least
+     * (snapshot_ids.h). Called once at the end of a run with the source's
+     * mark, so a replica's mark is never below its source's and a reindex of
+     * the replica never reissues an id the source pruned. commit_snapshot
+     * raises it to each snapshot's id on its own. NULL for a sink with no
+     * repository to keep one in.
+     */
+    status_t (*raise_snapshot_ids)(void *ctx, int64_t at_least);
+
     /* Release whatever the sink holds. Never fails: every committed
      * snapshot is already durable, so anything still staged here is an
      * optimisation for the next run at most. */
@@ -218,11 +212,6 @@ typedef struct {
      * end up holding ciphertext under two different keys. Empty for an
      * unencrypted repository. */
     char                       key_id[64];
-    /* Set only by replica_sink_local_open_reencrypt: objects are decrypted
-     * with the source key and re-encrypted under dst_key, or written as
-     * plaintext when dst_key is NULL. The key belongs to the sink. */
-    int                        reencrypt;
-    const repo_key_t          *dst_key;
 } replica_sink_t;
 
 #define REPLICATE_DAMAGED_LIST_MAX 100u

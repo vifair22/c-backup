@@ -10,6 +10,7 @@
 #include "repo.h"
 #include "repo_key.h"
 #include "snap_record.h"
+#include "snapshot_ids.h"
 #include "util.h"
 
 #include <cutils/log.h>
@@ -32,14 +33,9 @@
  * is why this is the sink worth having first - and it needs no network, so
  * it is also the one the engine's tests can drive.
  *
- * Objects arrive already compressed and already encrypted, so they are
- * written into a pack rather than as loose files. Not an optimisation: a
- * loose object header carries a compression field but every loose reader
- * refuses anything but COMPRESS_NONE, on the correct grounds that only
- * packing compresses. Since backup packs on completion, essentially every
- * object in a real repository carries a codec - so writing them loose
- * produced a replica that received every byte intact and could not be
- * opened, with nothing in the transfer to say so.
+ * Objects arrive already compressed and already encrypted, and are written
+ * into the target's packs exactly as they arrive, as every object in a
+ * repository is.
  *
  * object_store is not used for the same reason it cannot be: it would
  * decrypt (needing a key this end is not supposed to have) and re-encrypt
@@ -102,6 +98,8 @@ typedef struct {
     pack_backup_writer_t  *bw;
     uint32_t               plain_sealed;
     int                    stored_sealing;
+    /* The target's identity, which its snapshot-ids file is bound to. */
+    char       uuid[CBACKUP_UUID_LEN];
 } local_ctx_t;
 
 static int idx_cmp(const void *a, const void *b)
@@ -156,7 +154,7 @@ static void scan_pack(uint32_t pack_num, void *vctx)
 {
     local_ctx_t *c = vctx;
     char name[64];
-    snprintf(name, sizeof(name), "pack-%08u.dat", pack_num);
+    snprintf(name, sizeof(name), "pack-%010u.dat", pack_num);
     uint32_t version = 0, count = 0;
     scan_ctx_t sc = { c, pack_num };
     if (pack_enumerate_dat(c->store, name, &version, &count, scan_entry, &sc) != OK)
@@ -394,17 +392,12 @@ static status_t local_put_object(void *vctx, const replica_object_t *obj)
         if (st != OK) return st;
     }
 
-    /*
-     * Streamed in a chunk at a time (design constraint 2): an object larger
-     * than the seal arrives alone in a pack of its own, at any size, without
-     * ever being held whole. A failure part-way - the source unreadable,
-     * the link gone, the target full - is cut back out of the pack by the
-     * writer, so the staged pack still holds only whole entries and a
-     * later seal or close installs nothing torn.
-     */
-    return pack_stored_add_stream(c->w, obj->hash, obj->type, obj->compression,
-                                  obj->encryption, obj->uncompressed_size,
-                                  obj->payload_len, obj->read, obj->read_ctx);
+    /* A failed write is cut back out of the pack by the writer, so the
+     * staged pack still holds only whole entries and a later seal or close
+     * installs nothing torn. */
+    return pack_stored_add(c->w, obj->hash, obj->type, obj->compression,
+                           obj->encryption, obj->uncompressed_size,
+                           obj->payload, (size_t)obj->payload_len);
 }
 
 /*
@@ -480,6 +473,12 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
     if (packed > 0)
         log_info("replica: %s gained %u object(s) for snapshot %lld", c->root,
                  packed, (long long)snap->snapshot_id);
+
+    /* The mark covers the id before the record using it exists, exactly as
+     * a backup orders it, so a replica that loses its index never reissues
+     * one. */
+    status_t mst = snapshot_ids_raise(c->root, c->uuid, snap->snapshot_id, NULL, NULL);
+    if (mst != OK) return mst;
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_hex(snap->root_tree_hash, hex);
@@ -567,6 +566,12 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
  * in replicate.c keeps a partial subtree honest: a tree is staged only after
  * everything it names.
  */
+static status_t local_raise_snapshot_ids(void *vctx, int64_t at_least)
+{
+    local_ctx_t *c = vctx;
+    return snapshot_ids_raise(c->root, c->uuid, at_least, NULL, NULL);
+}
+
 static void local_close(void *vctx)
 {
     local_ctx_t *c = vctx;
@@ -612,7 +617,14 @@ status_t replica_reader_open(const char *path, replica_reader_t **out)
         return set_error(ERR_IO, "replica_reader: path too long");
     }
 
-    status_t st = store_open(path, NULL, &r->c.store);
+    /* A replica is a repository like any other: one this build cannot read
+     * is refused before anything in it is. */
+    repo_marker_t m;
+    status_t st = repo_marker_read(path, &m);
+    if (st == OK) st = repo_format_check(path, &m);
+    if (st != OK) { free(r); return st; }
+
+    st = store_open(path, NULL, &r->c.store);
     if (st != OK) { free(r); return st; }
     r->c.owns_store = 1;
     build_index(&r->c);
@@ -637,6 +649,7 @@ static const replica_sink_vtbl_t local_vtbl = {
     .has_objects     = local_has_objects,
     .put_object      = local_put_object,
     .commit_snapshot = local_commit_snapshot,
+    .raise_snapshot_ids = local_raise_snapshot_ids,
     .has_snapshot    = local_has_snapshot,
     .close           = local_close,
     .target_cdc      = local_target_cdc,
@@ -675,7 +688,11 @@ status_t replica_sink_local_open(const char *path,
         if (st != OK) { free(c); return st; }
         st = repo_marker_write_fixed(path, source_marker, &m);
         if (st != OK) { free(c); return st; }
+        st = snapshot_ids_write(path, m.uuid, 0);
+        if (st != OK) { free(c); return st; }
     } else {
+        st = repo_format_check(path, &m);
+        if (st != OK) { free(c); return st; }
         if (strcmp(m.uuid, source_marker->uuid) != 0) {
             free(c);
             /* The path last: the message buffer is 256 bytes, and with the
@@ -711,6 +728,7 @@ static status_t sink_finish_open(local_ctx_t *c, const char *path,
     status_t st = store_open(path, NULL, &c->store);
     if (st != OK) { repo_key_wipe(&c->dst_key); free(c); return st; }
     c->owns_store = 1;
+    snprintf(c->uuid, sizeof(c->uuid), "%s", m->uuid);
 
     build_index(c);
 
@@ -742,6 +760,8 @@ status_t replica_sink_local_open_reencrypt(const char *path,
                          "repo add %s <label> --encrypt <mode>, then replicate into "
                          "it with --reencrypt", path, path);
     }
+    status_t fst = repo_format_check(path, &m);
+    if (fst != OK) return fst;
     if (strcmp(m.uuid, source_marker->uuid) == 0)
         return set_error(ERR_INVALID,
                          "%s is a replica of this repository, not a different one; "
@@ -794,7 +814,5 @@ status_t replica_sink_local_open_reencrypt(const char *path,
     }
     store_set_cdc(c->store, c->tcdc);
     store_set_pack_commit_cb(c->store, plain_pack_committed, c);
-    out->reencrypt = 1;
-    out->dst_key   = encrypted ? &c->dst_key : NULL;
     return OK;
 }

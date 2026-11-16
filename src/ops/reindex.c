@@ -11,6 +11,7 @@
 #include "db_txn.h"
 #include "repo_tags.h"
 #include "snap_record.h"
+#include "snapshot_ids.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -97,7 +98,7 @@ static status_t note_object(reindex_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_S
 
     if (db_execute_non_query(ctx->db,
             "INSERT INTO objects (repo_id, hash, refcount, location, type)"
-            " VALUES (?, ?, 0, 'loose', ?)"
+            " VALUES (?, ?, 0, 'absent', ?)"
             " ON CONFLICT(repo_id, hash) DO NOTHING",
             (const char *[]){ repo, hex, t, NULL }, NULL) != 0)
         return set_error(ERR_IO, "reindex: cannot record object");
@@ -545,7 +546,7 @@ static void pack_num_seen(uint32_t pack_num, void *vctx)
     c->seen[c->nseen++] = pack_num;
 
     char name[64];
-    snprintf(name, sizeof(name), "pack-%08u.dat", pack_num);
+    snprintf(name, sizeof(name), "pack-%010u.dat", pack_num);
 
     uint32_t version = 0, count = 0;
     pack_entry_ctx_t ec;
@@ -748,54 +749,21 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
         return set_error(ERR_IO, "reindex: cannot size packed objects");
     }
 
-    /* Whatever is left is loose, and a loose object's size is a stat and a
-     * header read: no index lookup, no pack to open. */
+    /* Every object lives in a pack, so whatever is still unsized is
+     * referenced by a tree and held by no pack: absent. The row stays, so
+     * verify reports it missing, and the count is said here. */
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT hash FROM objects WHERE repo_id = ? AND phys_size IS NULL",
-            (const char *[]){ repo, NULL }, &r) != 0) {
-        db_result_free(r);
-        db_txn_rollback(db);
-        return set_error(ERR_IO, "reindex: cannot list unsized objects");
-    }
-
-    status_t st = OK;
-    for (int i = 0; i < (r ? r->nrows : 0); i++) {
-        const char *hex = r->rows[i][0];
-        uint8_t hash[OBJECT_HASH_SIZE];
-        hex_to_hash(hex, hash);
-
-        uint64_t phys = 0, orig = 0;
-        uint8_t  type = 0;
-        if (object_physical_size(store, hash, &phys, NULL) != OK ||
-            object_get_info(store, hash, &orig, &type) != OK) {
-            /* Referenced but absent. Leaving the row unsized rather than
-             * inventing a number keeps the gap visible to a verify pass. */
-            log_warn("reindex: object %.16s referenced but unreadable: %s",
-                     hex, err_msg());
-            err_clear();
-            continue;
-        }
-
-        char pbuf[32], obuf[32], tbuf[8];
-        snprintf(pbuf, sizeof(pbuf), "%llu", (unsigned long long)phys);
-        snprintf(obuf, sizeof(obuf), "%llu", (unsigned long long)orig);
-        snprintf(tbuf, sizeof(tbuf), "%u", type);
-        if (db_execute_non_query(db,
-                "UPDATE objects SET phys_size = ?, orig_size = ?, type = ?,"
-                " location = 'loose' WHERE repo_id = ? AND hash = ?",
-                (const char *[]){ pbuf, obuf, tbuf, repo, hex, NULL },
-                NULL) != 0) {
-            st = set_error(ERR_IO, "reindex: cannot size object");
-            break;
-        }
+            "SELECT COUNT(*) FROM objects WHERE repo_id = ? AND phys_size IS NULL",
+            (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1) {
+        long long absent = strtoll(r->rows[0][0], NULL, 10);
+        if (absent > 0)
+            log_warn("reindex: %lld referenced object(s) are in no pack; "
+                     "verify will report them missing", absent);
     }
     db_result_free(r);
+    (void)store;
 
-    if (st != OK) {
-        db_txn_rollback(db);
-        return st;
-    }
     if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "reindex: cannot commit object sizes");
     return OK;
@@ -979,6 +947,60 @@ static status_t recompute_refcounts(cutils_db_t *db, int64_t repo_id)
     return OK;
 }
 
+/*
+ * Bring the index's snapshot-id mark up to everything the repository says
+ * was ever issued (rule 2 of snapshot_ids.h). The file is the record that
+ * survives a lost database; the highest record covers a file that is
+ * missing or lagging; the index's own value covers a file and records that
+ * both lost the top. Whichever is largest wins everywhere, and a file that
+ * was missing, damaged or behind is rewritten and the run says so.
+ */
+static status_t restore_snapshot_mark(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                      long long highest_record, reindex_result_t *total)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    int64_t file_mark = 0;
+    int file_ok = 1;
+    if (snapshot_ids_read_repo(store_root(store), &file_mark) != OK) {
+        log_warn("reindex: %s", err_msg());
+        err_clear();
+        file_mark = 0;
+        file_ok = 0;
+    }
+
+    int64_t idx_mark = 0;
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT last_id FROM snapshot_id_seq WHERE repo_id = ?",
+                   (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        idx_mark = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+
+    int64_t mark = file_mark;
+    if ((int64_t)highest_record > mark) mark = (int64_t)highest_record;
+    if (idx_mark > mark) mark = idx_mark;
+
+    char m[32];
+    snprintf(m, sizeof(m), "%lld", (long long)mark);
+    if (db_execute_non_query(db,
+            "INSERT INTO snapshot_id_seq (repo_id, last_id) VALUES (?, ?)"
+            " ON CONFLICT(repo_id) DO UPDATE SET last_id = MAX(last_id, excluded.last_id)",
+            (const char *[]){ repo, m, NULL }, NULL) != 0)
+        return set_error(ERR_IO, "reindex: cannot record the snapshot-id mark");
+
+    if (!file_ok || file_mark < mark) {
+        status_t st = snapshot_ids_raise_repo(store_root(store), mark, NULL, NULL);
+        if (st != OK) return st;
+        log_warn("reindex: the repository's snapshot-ids file was %s; rewritten at %lld",
+                 file_ok ? "behind its records or the index" : "missing or damaged",
+                 (long long)mark);
+        total->snapshot_ids_repaired = 1;
+    }
+    total->snapshot_mark = mark;
+    return OK;
+}
+
 status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
                       atomic_int *cancel, reindex_result_t *out)
 {
@@ -1003,6 +1025,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     memset(&total, 0, sizeof(total));
     status_t st = OK;
     long long first_failed = 0;
+    long long highest_record = 0;
     char first_err[256] = "";
 
     /* Packs first: the tree walk resolves packed objects through these rows,
@@ -1019,6 +1042,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
         char *end = NULL;
         long long id = strtoll(e->d_name, &end, 10);
         if (id <= 0 || !end || *end != '\0') continue;
+        if (id > highest_record) highest_record = id;
 
         reindex_result_t one;
         memset(&one, 0, sizeof(one));
@@ -1058,6 +1082,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
      * name was just recorded, so it is sized in a second, small pass. */
     st = reindex_lists(store, db, repo_id, 1);
     if (st == OK) st = fill_object_sizes(store, db, repo_id);
+    if (st == OK) st = restore_snapshot_mark(store, db, repo_id, highest_record, &total);
     if (st != OK) return st;
 
     /* Tags last: they attach to snapshot rows, which now exist. */

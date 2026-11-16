@@ -29,6 +29,7 @@
 #include "backup.h"
 #include "object.h"
 #include "object_crypt.h"
+#include "pack.h"
 #include "reindex.h"
 #include "replicate.h"
 #include "repo.h"
@@ -70,9 +71,8 @@ static void write_file(const char *path, const char *content)
     fclose(f);
 }
 
-static int setup(void **state)
+static int open_fixture(repo_enc_mode_t src_mode)
 {
-    (void)state;
     rmrf(TEST_DIR);
     if (mkdir(TEST_DIR, 0700) != 0) return -1;
     if (db_open(&db, TEST_DB) != 0) return -1;
@@ -82,7 +82,7 @@ static int setup(void **state)
 
     repo_enc_request_t enc;
     memset(&enc, 0, sizeof(enc));
-    enc.mode = REPO_ENC_SYSTEM;
+    enc.mode = src_mode;
     enc.key_dir = TEST_KEYS;
     if (repo_register_ex(db, SRC_REPO, "src", &enc, &src_id) != OK) return -1;
     if (repo_marker_read(SRC_REPO, &src_marker) != OK) return -1;
@@ -102,6 +102,9 @@ static int setup(void **state)
     if (backup_run(src, db, src_id, &o, NULL) != OK) return -1;
     return 0;
 }
+
+static int setup(void **state)       { (void)state; return open_fixture(REPO_ENC_SYSTEM); }
+static int setup_plain(void **state) { (void)state; return open_fixture(REPO_ENC_NONE); }
 
 static int teardown(void **state)
 {
@@ -162,23 +165,35 @@ static void restore_from_dest(int64_t dst_id)
     assert_int_equal(system(cmd), 0);
 }
 
-/* Every pack entry in the destination, and how it is encrypted. */
+/*
+ * Every pack entry in the destination, and how it is encrypted.
+ *
+ * Each encrypted entry is held to what re-encryption promises: it does not
+ * open under the source's key (it was re-encrypted, not copied), it does
+ * open under the destination's own key, and only as the object it is filed
+ * under - the associated data binds the type and the name, so the same key
+ * with either changed fails. It then loads through the destination store
+ * as the plaintext its name was computed from.
+ */
 static void dest_entry_encryption(int *n_plain, int *n_enc)
 {
     *n_plain = 0;
     *n_enc = 0;
-    replica_reader_t *rd = NULL;
-    assert_int_equal(replica_reader_open(DST_REPO, &rd), OK);
-    store_t *st = replica_reader_store(rd);
+    store_t *st = NULL;
+    assert_int_equal(repo_store_open_keyed(DST_REPO, NULL, &st), OK);
+    const object_aead_key_t *dk = store_aead_key(st);
+    const object_aead_key_t *sk = store_aead_key(src);
 
     /* The source's object list names every hash the destination should
-     * now hold: hashes are of the plaintext, so re-encrypting keeps them. */
+     * now hold: names are of the plaintext, so re-encrypting keeps them. */
     db_result_t *r = NULL;
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)src_id);
     assert_int_equal(db_execute(db, "SELECT hash FROM objects WHERE repo_id = ?",
                                 (const char *[]){ id, NULL }, &r), 0);
-    for (int i = 0; r && i < r->nrows; i++) {
+    assert_non_null(r);
+    assert_true(r->nrows > 0);
+    for (int i = 0; i < r->nrows; i++) {
         uint8_t h[OBJECT_HASH_SIZE];
         for (int k = 0; k < OBJECT_HASH_SIZE; k++) {
             unsigned v = 0;
@@ -188,23 +203,52 @@ static void dest_entry_encryption(int *n_plain, int *n_enc)
         object_stored_info_t info;
         void *payload = NULL;
         size_t len = 0;
-        assert_int_equal(object_read_stored(st, h, &info, &payload, &len), OK);
+        int damaged = -1;
+        assert_int_equal(object_read_stored(st, h, &info, &payload, &len, &damaged), OK);
+        assert_int_equal(damaged, 0);
         if (info.encryption == ENCRYPT_NONE) {
             (*n_plain)++;
         } else {
             (*n_enc)++;
-            /* Not readable with the source key: it really was re-encrypted,
-             * not copied. */
-            uint8_t *out = malloc(len);
+            assert_non_null(dk);
+            assert_true(len >= OBJECT_CRYPT_OVERHEAD);
+            size_t plen = len - OBJECT_CRYPT_OVERHEAD;
+            uint8_t *out = malloc(plen ? plen : 1);
             assert_non_null(out);
-            assert_int_not_equal(object_decrypt(store_key(src), payload,
-                                                len - OBJECT_CRYPT_OVERHEAD, out), OK);
+
+            if (sk)
+                assert_int_equal(object_decrypt(sk, info.type, h, payload, plen, out),
+                                 ERR_CORRUPT);
+
+            uint8_t other_type = info.type == OBJECT_TYPE_TREE ? OBJECT_TYPE_FILE
+                                                               : OBJECT_TYPE_TREE;
+            assert_int_equal(object_decrypt(dk, other_type, h, payload, plen, out),
+                             ERR_CORRUPT);
+            uint8_t other_name[OBJECT_HASH_SIZE];
+            memcpy(other_name, h, OBJECT_HASH_SIZE);
+            other_name[OBJECT_HASH_SIZE - 1] ^= 0x01;
+            assert_int_equal(object_decrypt(dk, info.type, other_name, payload, plen, out),
+                             ERR_CORRUPT);
+            err_clear();
+
+            assert_int_equal(object_decrypt(dk, info.type, h, payload, plen, out), OK);
             free(out);
         }
         free(payload);
+
+        void   *plain = NULL;
+        size_t  plain_len = 0;
+        uint8_t type = 0;
+        assert_int_equal(object_load(st, h, &plain, &plain_len, &type), OK);
+        assert_int_equal(type, info.type);
+        assert_int_equal(plain_len, info.uncompressed_size);
+        uint8_t check[OBJECT_HASH_SIZE];
+        object_name(type, plain, plain_len, check);
+        assert_memory_equal(check, h, OBJECT_HASH_SIZE);
+        free(plain);
     }
     db_result_free(r);
-    replica_reader_close(rd);
+    store_close(st);
 }
 
 /* ------------------------------------------------------------------ */
@@ -338,12 +382,85 @@ static void test_reencrypt_never_overwrites_a_destination_snapshot(void **state)
     assert_non_null(strstr(buf, "theirs"));
 }
 
+/* An unencrypted source into an encrypted repository: the way to add
+ * encryption. Every entry arrives encrypted under the destination's key. */
+static void test_encrypt_a_plain_source(void **state)
+{
+    (void)state;
+    int64_t dst_id = make_dest(REPO_ENC_SYSTEM, NULL);
+    replicate_reencrypt();
+
+    int plain = 0, enc = 0;
+    dest_entry_encryption(&plain, &enc);
+    assert_int_equal(plain, 0);
+    assert_true(enc > 0);
+
+    restore_from_dest(dst_id);
+}
+
+/*
+ * A re-encrypted object's ciphertext, filed in the destination under
+ * another name, does not load. Under the destination's key it would
+ * decrypt as the original object if the ciphertext were not bound to the
+ * name it is filed under; with the binding, the tag fails before any
+ * plaintext exists. The original still loads alongside it.
+ */
+static void test_ciphertext_moved_to_another_name_does_not_load(void **state)
+{
+    (void)state;
+    make_dest(REPO_ENC_SYSTEM, NULL);
+    replicate_reencrypt();
+
+    static const char body[] = "alpha alpha alpha\n";
+    uint8_t ha[OBJECT_HASH_SIZE], hb[OBJECT_HASH_SIZE];
+    object_name(OBJECT_TYPE_FILE, body, strlen(body), ha);
+    object_name(OBJECT_TYPE_FILE, "forged", 6, hb);
+
+    store_t *st = NULL;
+    assert_int_equal(repo_store_open_keyed(DST_REPO, NULL, &st), OK);
+    object_stored_info_t info;
+    void  *payload = NULL;
+    size_t len = 0;
+    assert_int_equal(object_read_stored(st, ha, &info, &payload, &len, NULL), OK);
+    assert_int_equal(info.encryption, ENCRYPT_CHACHA20);
+    assert_false(object_exists(st, hb));
+
+    pack_stored_writer_t *w = NULL;
+    assert_int_equal(pack_stored_open(st, &w), OK);
+    assert_int_equal(pack_stored_add(w, hb, info.type, info.compression, info.encryption,
+                                     info.uncompressed_size, payload, len), OK);
+    uint32_t packed = 0;
+    assert_int_equal(pack_stored_finish(w, &packed), OK);
+    assert_int_equal(packed, 1);
+    free(payload);
+    store_close(st);
+
+    /* Reopened, so the lookup is built from the packs as they now stand. */
+    st = NULL;
+    assert_int_equal(repo_store_open_keyed(DST_REPO, NULL, &st), OK);
+    assert_true(object_exists(st, hb));
+    void  *got = NULL;
+    size_t got_len = 0;
+    assert_int_equal(object_load(st, hb, &got, &got_len, NULL), ERR_CORRUPT);
+    assert_null(got);
+    err_clear();
+
+    assert_int_equal(object_load(st, ha, &got, &got_len, NULL), OK);
+    assert_int_equal(got_len, strlen(body));
+    assert_memory_equal(got, body, got_len);
+    free(got);
+    store_close(st);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_reencrypt_into_a_new_system_key, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reencrypt_into_an_unencrypted_repository, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reencrypt_into_a_passphrase_repository, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_encrypt_a_plain_source, setup_plain, teardown),
+        cmocka_unit_test_setup_teardown(test_ciphertext_moved_to_another_name_does_not_load,
+                                        setup, teardown),
         cmocka_unit_test_setup_teardown(test_second_reencrypt_run_sends_nothing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reencrypt_refusals, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reencrypt_never_overwrites_a_destination_snapshot,

@@ -1,15 +1,40 @@
 #pragma once
 
+/*
+ * Objects: naming, storing and loading (repository format 3).
+ *
+ * Every object lives in a pack and is at most OBJECT_MAX_BYTES. Its name is
+ * SHA-256(type || payload) - object_name below, the only implementation -
+ * so the same bytes stored as two types are two objects (OWN-38), and a
+ * load checks the type along with the bytes.
+ *
+ * These are the primitives the chunker and the tree writer build on: they
+ * hand a typed buffer to a store (directly, or through an obj_sink_t over
+ * object_store_ex) and get its name back, and load by name. Nothing outside
+ * this layer computes a name.
+ */
+
 #include "error.h"
 #include "store.h"
 #include "types.h"
 #include <stddef.h>
 #include <stdint.h>
 
+/* The name of an object: SHA-256 of the type byte, then the payload. */
+void object_name(uint8_t type, const void *data, size_t len,
+                 uint8_t out[OBJECT_HASH_SIZE]);
+
 /*
- * Hash data and store it as an object in the store.
+ * Name data and store it as an object of `type`, through the store's own
+ * pack writer: staged into a pack that is sealed and installed when it
+ * fills, when the store is closed, when object_store_flush is called, or
+ * when anything reads an object it holds. OK whether the object was new or
+ * already present (*out_is_new says which; *out_phys_bytes is the stored
+ * size of a new one, 0 otherwise). ERR_TOO_LARGE past OBJECT_MAX_BYTES,
+ * ERR_INVALID for a type this build does not know. Safe to call from
+ * several threads; they share the one writer.
+ *
  * out_hash must point to OBJECT_HASH_SIZE bytes.
- * Returns OK if newly written or already existed.
  */
 status_t object_store(store_t *store, uint8_t type,
                       const void *data, size_t len,
@@ -20,210 +45,77 @@ status_t object_store_ex(store_t *store, uint8_t type,
                          uint8_t out_hash[OBJECT_HASH_SIZE],
                          int *out_is_new, uint64_t *out_phys_bytes);
 
+/* Seal and install whatever object_store_ex has staged, so a walk over the
+ * packs (gc, verify, a test reading the files) sees it. */
+status_t object_store_flush(store_t *store);
 
-/*
- * Store a regular file, automatically detecting sparse regions.
- * Stores as OBJECT_TYPE_SPARSE if the file has holes, OBJECT_TYPE_FILE
- * otherwise.  Caller passes the fd (already open O_RDONLY) and file size.
- */
-status_t object_store_file(store_t *store, int fd, uint64_t file_size,
-                           uint8_t out_hash[OBJECT_HASH_SIZE]);
-
-status_t object_store_file_ex(store_t *store, int fd, uint64_t file_size,
-                              uint8_t out_hash[OBJECT_HASH_SIZE],
-                              int *out_is_new, uint64_t *out_phys_bytes);
-
-/*
- * What the store actually wrote, for the index to record.
- *
- * payload_size is the object header's uncompressed_size, and it is not always
- * the file's logical size. A sparse object's payload is its region table plus
- * the bytes that are not holes, so a 64 MiB file holding 1 MiB of data has a
- * payload of about 1 MiB. The logical size is a property of the manifest node
- * rather than of the object, because one object can legitimately back files of
- * different lengths: two files with the same data and different trailing holes
- * produce the same region table, the same payload, and therefore the same hash.
- * Recording the logical size against the object made stats and summary report
- * different totals before and after a pack, which rewrites the column from the
- * object header and so disagreed with what backup had put there.
- */
+/* What the store wrote, for the index to record. payload_size is the
+ * object's uncompressed size. */
 typedef struct {
     int      is_new;
-    uint64_t phys_bytes;    /* bytes on disk: header, payload, parity trailer */
-    uint64_t payload_size;  /* the object header's uncompressed_size */
+    uint64_t phys_bytes;    /* stored bytes of the entry, header excluded */
+    uint64_t payload_size;
 } object_write_t;
 
-status_t object_store_file_info(store_t *store, int fd, uint64_t file_size,
-                                uint8_t out_hash[OBJECT_HASH_SIZE],
-                                object_write_t *out_info);
-
 /*
- * Like object_store_file_info, but stages the object into an open pack instead
- * of writing it loose - when it can.
- *
- * A file with holes, or one too large to hash before its entry header is
- * written, still goes loose and is packed later as it always was. That choice
- * cannot be made by the caller: it depends on whether the file is sparse, which
- * is decided by probing it, and a sparse object hashes over its region table
- * rather than its contents. Routing one the wrong way would give it a different
- * hash from the same file stored loose and split deduplication in two.
- *
- * pack_w may be NULL, which makes this exactly object_store_file_info.
+ * Store into a caller's open pack writer (a backup's), or through the
+ * store's own writer when pack_w is NULL.
  */
 struct pack_backup_writer;
-status_t object_store_file_packed(store_t *store, int fd, uint64_t file_size,
-                                  struct pack_backup_writer *pack_w,
-                                  uint8_t out_hash[OBJECT_HASH_SIZE],
-                                  object_write_t *out_info);
-
-/*
- * object_store_file_info with a bound on the RS parity the stream holds in
- * memory, past which it spills to tmp/; 0 means the default of 256 MiB.
- *
- * For a file over PACK_STREAM_THRESHOLD this stores exactly what
- * object_store_file_packed would, since such a file never goes into a pack:
- * same bytes, same hash. The parallel large-file store (B086) runs several of
- * these at once on one handle, which is safe - each has its own temp file,
- * the loose set is locked, and the existence check is a read - and divides a
- * memory budget between them through parity_cap. fd is not closed.
- */
-status_t object_store_file_loose(store_t *store, int fd, uint64_t file_size,
-                                 size_t parity_cap,
-                                 uint8_t out_hash[OBJECT_HASH_SIZE],
-                                 object_write_t *out_info);
-/*
- * The buffer counterpart to object_store_file_packed: stage into an open pack
- * when there is one, otherwise write loose exactly as object_store_ex does.
- *
- * This is the path manifest trees and metadata blobs take, and on a real tree
- * it is the majority of objects by count - 130,726 of 230,595 on the corpus
- * this was measured against were trees. An object already in memory has none of
- * the sparseness or size problems a file has, so the only reason to fall back
- * is a buffer too large to hash before its entry header is written.
- */
 status_t object_store_packed(store_t *store, uint8_t type,
                              const void *data, size_t len,
                              struct pack_backup_writer *pack_w,
                              uint8_t out_hash[OBJECT_HASH_SIZE],
                              object_write_t *out_info);
 
-/* Per-chunk progress callback invoked from the write path after each ~16 MiB
- * chunk is written.  chunk_bytes is the bytes in that chunk; ctx is caller-
- * supplied.  May be NULL (no callback). */
-typedef void (*xfer_progress_fn)(uint64_t chunk_bytes, void *ctx);
-
-/* Like object_store_file_ex but fires cb(chunk_bytes, cb_ctx) per chunk.
- * Useful for sub-second progress updates during large-file transfers.
- * If src_path is non-NULL the function takes ownership of fd (closes it)
- * and may reopen the file on transient read errors to recover mid-stream. */
-status_t object_store_file_cb(store_t *store, int fd, const char *src_path,
-                              uint64_t file_size,
-                              uint8_t out_hash[OBJECT_HASH_SIZE],
-                              int *out_is_new, uint64_t *out_phys_bytes,
-                              xfer_progress_fn cb, void *cb_ctx);
+/*
+ * Store file_size bytes of fd as file content, through the chunker
+ * (cdc_store_fd) with the store's chunking parameters: one OBJECT_TYPE_FILE
+ * object when there is no cut and no hole, a chunk list otherwise, exactly
+ * what a backup stores for the same file. Every chunk goes through
+ * object_store_packed. Reads with pread; fd's offset is untouched. A file
+ * that turns out shorter than file_size is ERR_IO. out_info's payload_size
+ * is the file's length.
+ */
+status_t object_store_file_packed(store_t *store, int fd, uint64_t file_size,
+                                  struct pack_backup_writer *pack_w,
+                                  uint8_t out_hash[OBJECT_HASH_SIZE],
+                                  object_write_t *out_info);
 
 /*
- * Load object data by hash.  Caller must free(*out_data).
- * out_size is the uncompressed payload size.
- * out_type (may be NULL) receives the object type byte.
+ * Load an object by name. Caller frees *out_data. out_size is the payload
+ * size; out_type (may be NULL) receives the type. The object is corrected
+ * from parity where it needs it, decrypted and decompressed whole, and
+ * checked against its name - type included - before anything is returned.
  */
 status_t object_load(store_t *store,
                      const uint8_t hash[OBJECT_HASH_SIZE],
                      void **out_data, size_t *out_size,
                      uint8_t *out_type);
 
-/* Check whether an object already exists (avoids re-hashing). */
+/* Is an object of this name present (installed, or staged in the store's
+ * own writer)? */
 int object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
-
-/*
- * Bytes the loose file for `hash` occupies, or 0 when there is no loose file
- * (absent, or packed). One fstatat, no resolver query.
- *
- * Writers report this, rather than 0, for an object that already existed.
- * A backup killed between installing a loose object and committing its
- * index row leaves the file with no row, and the next run deduplicates
- * against the file and records the row from what the writer said; saying 0
- * filed a 2 GiB object as zero bytes and summary under-reported by that.
- * A packed object already has its row, written by the pack commit, so it
- * needs no size from here.
- */
-uint64_t object_loose_phys_size(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
-
-/*
- * Stream object content to out_fd without buffering the entire payload in RAM.
- * Safe for large OBJECT_TYPE_FILE objects that would fail object_load with
- * ERR_TOO_LARGE.  out_size and out_type may be NULL.
- */
-status_t object_load_stream(store_t *store,
-                             const uint8_t hash[OBJECT_HASH_SIZE],
-                             int out_fd,
-                             uint64_t *out_size,
-                             uint8_t *out_type);
-
-/*
- * Test hook: the stored size at and above which a loose object's parity is
- * not applied by a streamed read, because its 32-bit trailer size may have
- * wrapped (OWN-30; about 59.75 GiB). 0 restores the default. Lowering it
- * lets a test show a damaged object past it is refused, not corrected.
- */
-void object_test_set_parity_fit_limit(uint64_t bytes);
-
-/*
- * Load at most max_bytes of an object's uncompressed content.
- * Avoids decompressing the entire payload for large objects.
- * *out_full_size receives the total uncompressed size.
- * *out_size receives the bytes actually returned (≤ max_bytes).
- * Hash verification is skipped (partial data can't be hashed).
- */
-status_t object_load_prefix(store_t *store,
-                             const uint8_t hash[OBJECT_HASH_SIZE],
-                             size_t max_bytes,
-                             void **out_data, size_t *out_size,
-                             uint64_t *out_full_size,
-                             uint8_t *out_type);
 
 /* Hex-encode a hash.  buf must be at least OBJECT_HASH_SIZE*2+1 bytes. */
 void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf);
 
-/*
- * Read object size and type from the header without loading the payload.
- * Works for both loose and packed objects.
- */
+/* Size and type from the entry header, without loading the payload. */
 status_t object_get_info(store_t *store,
                          const uint8_t hash[OBJECT_HASH_SIZE],
                          uint64_t *out_size, uint8_t *out_type);
 
 /*
- * Stream `size` bytes from src_fd into the object store as type `type`,
- * stored uncompressed (COMPRESS_NONE).  Verifies SHA-256 against expected_hash.
- * Used by the xfer importer for large objects that exceed INT_MAX.
- */
-status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size,
-                          const uint8_t expected_hash[OBJECT_HASH_SIZE]);
-
-/*
- * Return on-disk physical bytes used by a single object payload record.
- * For loose objects: object_header_t + compressed payload bytes.
- * For packed objects: pack_dat_entry_hdr_t + compressed payload bytes.
- *
- * out_header_bytes, when non-NULL, receives the size of whichever of those
- * two headers was counted. Callers that report the header separately need it
- * from here rather than assuming: the two differ (64 against 51), and an
- * introspection route that showed the loose header beside a packed object's
- * footprint was describing a layout the object does not have.
+ * Bytes the object's entry occupies in its pack: the 51-byte entry header
+ * plus the stored payload. *out_header_bytes (may be NULL) gets the header
+ * size, for a caller that reports it separately.
  */
 status_t object_physical_size(store_t *store,
                               const uint8_t hash[OBJECT_HASH_SIZE],
                               uint64_t *out_bytes,
                               uint32_t *out_header_bytes);
 
-/*
- * What an object looks like on disk, without decoding it.
- *
- * Everything a reader needs to interpret the payload, which is what the
- * loose header and the pack entry header both carry - the two forms differ
- * in layout, not in content.
- */
+/* What an object looks like as stored, without decoding it. */
 typedef struct {
     uint8_t  type;
     uint8_t  compression;
@@ -232,64 +124,16 @@ typedef struct {
 } object_stored_info_t;
 
 /*
- * Read an object without decrypting or decompressing it.
- *
- * The payload comes back exactly as stored: compressed, then encrypted, with
- * the nonce and tag included. This is the form replication moves, so that a
- * copy holds what the source holds and a target which never receives the
- * key can still store, verify and repair it - parity covers ciphertext for
- * that reason.
- *
- * Loads the whole stored payload, so it is for objects known to be small -
- * tests and inspection. Anything that moves arbitrary objects streams them
- * through object_stored_open below instead; replication did not, and could
- * not copy an object larger than its memory (OWN-26).
- *
- * The hash is not checked, and cannot be: it covers the plaintext, which is
- * the one thing this function deliberately does not produce. A caller
- * handing these bytes to something else is moving a sealed box, not
- * vouching for what is inside it. Whoever eventually decrypts it checks.
- *
- * Caller frees *out_payload.
+ * Read an object without decrypting or decompressing it: the form
+ * replication moves, so a target that never receives the key can still
+ * store, verify and repair it. The bytes are corrected from parity first;
+ * *out_damaged (may be NULL) is set when they carry damage beyond it, which
+ * a caller moving them must report (OWN-31). The name is not checked, and
+ * without the key cannot be. Every object is bounded, so the payload comes
+ * back whole. Caller frees *out_payload.
  */
 status_t object_read_stored(store_t *store,
                             const uint8_t hash[OBJECT_HASH_SIZE],
                             object_stored_info_t *out_info,
-                            void **out_payload, size_t *out_len);
-
-/*
- * The same bytes, read in pieces rather than loaded whole.
- *
- * object_read_stored allocates the full stored size, which for a 50 GiB
- * file is 50 GiB; replication used it and so could not move an object
- * larger than the memory of the machine doing the moving (design
- * constraint 2). This is what it uses instead: open finds the object loose
- * or packed and reports its header and stored length, and each read hands
- * over exactly the bytes asked for, in order, with nothing held between
- * calls but a file position. Reading past the stored length is refused.
- * The same caveats apply: nothing is decoded or checked.
- */
-typedef struct object_stored_reader object_stored_reader_t;
-
-status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
-                            object_stored_info_t *out_info, uint64_t *out_len,
-                            object_stored_reader_t **out);
-status_t object_stored_read(object_stored_reader_t *r, void *buf, size_t n);
-
-/*
- * Reads correct damage parity can carry before handing bytes over. Damage
- * beyond parity is handed over as it stands, so one lost object does not
- * stop a transfer; this says, once every byte has been read, whether that
- * happened. A caller moving the object elsewhere must report it as a
- * failure (OWN-31): the copy is protected by fresh parity over the damage.
- */
-int      object_stored_damaged(const object_stored_reader_t *r);
-void     object_stored_close(object_stored_reader_t *r);
-
-/*
- * Attempt to repair a loose object file in-place using its parity data.
- * Reads the file, applies XOR/RS parity correction, writes corrected bytes
- * back via pwrite.  Only works on version-2 loose objects with parity trailers.
- * Returns: >0 = bytes corrected, 0 = no corruption found, <0 = error or not repairable.
- */
-int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
+                            void **out_payload, size_t *out_len,
+                            int *out_damaged);

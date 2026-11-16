@@ -4,9 +4,9 @@
  * The backup-side pack writer.
  *
  * The property worth testing is not that it writes a pack - it is that what it
- * writes is indistinguishable from what the loose path plus repo_pack would
- * have produced from the same content. Two writers into one format drift
- * silently: the objects still read back, the repository still looks healthy,
+ * writes is indistinguishable from what the store's own writer (object_store,
+ * sealed by object_store_flush) produces from the same content. Two entry
+ * points into one format drift silently: the objects still read back, the repository still looks healthy,
  * and the divergence only surfaces as a dedup miss or a failed repair much
  * later.
  */
@@ -85,11 +85,11 @@ static int count_packs(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * The hash a staged object gets must be the hash the loose writer would have
- * given it, or the two paths stop deduplicating against each other and a
- * repository quietly stores everything twice.
+ * The hash a staged object gets must be the hash object_store gives it, or
+ * the two paths stop deduplicating against each other and a repository
+ * quietly stores everything twice.
  */
-static void test_hash_matches_the_loose_writer(void **state)
+static void test_hash_matches_object_store(void **state)
 {
     (void)state;
     store_t *st = fresh_store();
@@ -101,6 +101,12 @@ static void test_hash_matches_the_loose_writer(void **state)
 
     uint8_t loose_hash[OBJECT_HASH_SIZE] = { 0 };
     assert_int_equal(object_store(st, OBJECT_TYPE_FILE, buf, len, loose_hash), OK);
+    /* Sealed, so the index knows it: another writer's open pack does not. */
+    assert_int_equal(object_store_flush(st), OK);
+
+    uint8_t want[OBJECT_HASH_SIZE];
+    object_name(OBJECT_TYPE_FILE, buf, len, want);
+    assert_memory_equal(loose_hash, want, OBJECT_HASH_SIZE);
 
     pack_backup_writer_t *w = NULL;
     assert_int_equal(pack_backup_open(st, &w), OK);
@@ -110,7 +116,7 @@ static void test_hash_matches_the_loose_writer(void **state)
                                      packed_hash, &is_new, NULL, NULL), OK);
 
     assert_memory_equal(loose_hash, packed_hash, OBJECT_HASH_SIZE);
-    /* And it deduplicated against the loose copy rather than writing it again. */
+    /* And it deduplicated against the stored copy rather than writing it again. */
     assert_int_equal(is_new, 0);
 
     uint32_t packed = 0;
@@ -221,7 +227,7 @@ static void test_writing_nothing_leaves_no_pack(void **state)
     assert_int_equal(packed, 0);
 
     char packs[512];
-    snprintf(packs, sizeof(packs), "%s/packs/pack-00000000.dat", TEST_ROOT);
+    snprintf(packs, sizeof(packs), "%s/packs/000000/pack-0000000000.dat", TEST_ROOT);
     struct stat sb;
     assert_int_not_equal(stat(packs, &sb), 0);
 
@@ -229,10 +235,8 @@ static void test_writing_nothing_leaves_no_pack(void **state)
 }
 
 /*
- * Objects too large to buffer are refused rather than mishandled. An entry
- * header carries its object's hash, so it cannot be written until the whole
- * object has been read; those keep the loose path, where the hash is computed
- * as the bytes go by.
+ * Objects past OBJECT_MAX_BYTES are refused with ERR_TOO_LARGE: no reader
+ * opens one, and a file that large is a chunk list of bounded chunks.
  */
 static void test_refuses_objects_it_cannot_hash_first(void **state)
 {
@@ -246,8 +250,8 @@ static void test_refuses_objects_it_cannot_hash_first(void **state)
     pack_backup_writer_t *w = NULL;
     assert_int_equal(pack_backup_open(st, &w), OK);
     uint8_t h[OBJECT_HASH_SIZE];
-    assert_int_not_equal(pack_backup_add(w, OBJECT_TYPE_FILE, buf, too_big,
-                                         h, NULL, NULL, NULL), OK);
+    assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, buf, too_big,
+                                     h, NULL, NULL, NULL), ERR_TOO_LARGE);
     pack_backup_abort(w);
 
     free(buf);
@@ -297,7 +301,7 @@ static void test_abort_removes_the_staging_file(void **state)
  * get different treatment, and the first symptom is a repair that cannot find
  * its parity or a statistic that contradicts itself.
  */
-static void test_matches_what_repo_pack_would_have_written(void **state)
+static void test_matches_what_object_store_writes(void **state)
 {
     (void)state;
 
@@ -312,7 +316,7 @@ static void test_matches_what_repo_pack_would_have_written(void **state)
         fill_text(bufs[i], lens[i], i + 40);
     }
 
-    /* Reference: store loose, then let repo_pack do its thing. */
+    /* Reference: the store's own writer, sealed by a flush. */
     uint8_t  ref_type[N], ref_comp[N], ref_enc[N];
     uint64_t ref_usize[N];
     void    *ref_payload[N];
@@ -322,14 +326,16 @@ static void test_matches_what_repo_pack_would_have_written(void **state)
         for (int i = 0; i < N; i++)
             assert_int_equal(object_store(st, OBJECT_TYPE_FILE, bufs[i], lens[i],
                                           hashes[i]), OK);
-        uint32_t packed = 0;
-        assert_int_equal(repo_pack(st, &packed, NULL, NULL), OK);
-        assert_int_equal(packed, N);
-        for (int i = 0; i < N; i++)
+        assert_int_equal(object_store_flush(st), OK);
+        assert_int_equal((int)fake_index_count(), N);
+        for (int i = 0; i < N; i++) {
+            int damaged = -1;
             assert_int_equal(pack_object_read_stored(st, hashes[i], &ref_type[i],
                                                      &ref_comp[i], &ref_enc[i],
                                                      &ref_usize[i], &ref_payload[i],
-                                                     &ref_len[i]), OK);
+                                                     &ref_len[i], &damaged), OK);
+            assert_int_equal(damaged, 0);
+        }
         done(st);
     }
 
@@ -353,8 +359,11 @@ static void test_matches_what_repo_pack_would_have_written(void **state)
             uint64_t usize = 0;
             void    *payload = NULL;
             size_t   plen = 0;
+            int damaged = -1;
             assert_int_equal(pack_object_read_stored(st, hashes[i], &type, &comp,
-                                                     &enc, &usize, &payload, &plen), OK);
+                                                     &enc, &usize, &payload, &plen,
+                                                     &damaged), OK);
+            assert_int_equal(damaged, 0);
             assert_int_equal(type,  ref_type[i]);
             assert_int_equal(comp,  ref_comp[i]);   /* same compression verdict */
             assert_int_equal(enc,   ref_enc[i]);
@@ -474,7 +483,7 @@ static void test_reports_full_near_the_seal(void **state)
     uint64_t rng = 0x9E3779B97F4A7C15ull;
     uint64_t staged_bytes = 0;
     int rounds = 0;
-    const uint64_t headroom = PACK_STREAM_THRESHOLD;
+    const uint64_t headroom = OBJECT_MAX_STORED_BYTES;
 
     while (!pack_backup_full(w, headroom) && rounds < 80) {
         for (size_t i = 0; i < chunk; i += 8) {
@@ -513,10 +522,10 @@ static void test_reports_full_near_the_seal(void **state)
 int main(void)
 {
     const struct CMUnitTest tests[] = {
-        cmocka_unit_test(test_hash_matches_the_loose_writer),
+        cmocka_unit_test(test_hash_matches_object_store),
         cmocka_unit_test(test_dedups_against_its_own_open_pack),
         cmocka_unit_test(test_staged_objects_read_back_intact),
-        cmocka_unit_test(test_matches_what_repo_pack_would_have_written),
+        cmocka_unit_test(test_matches_what_object_store_writes),
         cmocka_unit_test(test_writing_nothing_leaves_no_pack),
         cmocka_unit_test(test_refuses_objects_it_cannot_hash_first),
         cmocka_unit_test(test_abort_removes_the_staging_file),

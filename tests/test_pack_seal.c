@@ -66,8 +66,8 @@
 #define SEAL_BYTES (16 * MIB)        /* pack_test_set_seal; the real one is 256 */
 #define ENTRY_HDR  51                                /* pack_dat_entry_hdr_t */
 /* What a pack may hold: the seal, plus the one entry that may land after the
- * last check (an entry is at most PACK_STREAM_THRESHOLD). */
-#define PACK_BOUND (SEAL_BYTES + PACK_STREAM_THRESHOLD + ENTRY_HDR)
+ * last check (an entry stores at most OBJECT_MAX_STORED_BYTES). */
+#define PACK_BOUND (SEAL_BYTES + OBJECT_MAX_STORED_BYTES + ENTRY_HDR)
 /* A pack the big files went into, as against the few KiB of trees a backup
  * packs on its own: more than one 1 MiB entry. */
 #define BIG_PACK   MIB

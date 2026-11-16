@@ -79,7 +79,7 @@ static int setup(void **state)
         if (object_store(store, OBJECT_TYPE_FILE, buf, sizes[i], hashes[i]) != OK)
             return -1;
     }
-    if (repo_pack(store, NULL, NULL, NULL) != OK) return -1;
+    if (object_store_flush(store) != OK) return -1;
     return 0;
 }
 
@@ -91,14 +91,16 @@ static int teardown(void **state)
     return 0;
 }
 
-/* Packs live under packs/<shard>/ once written, but a hand-placed clone in
- * packs/ directly is also resolved, so both layouts are searched. */
+/* Pack n lives at packs/<n >> 8 as six hex digits>/pack-<n as ten digits>.dat.
+ * The shard directory is created so a clone can be written to the path. */
 static int pack_dat_path(char *out, size_t cap, uint32_t num)
 {
-    snprintf(out, cap, "%s/packs/%04x/pack-%08u.dat", TEST_REPO, num / 256, num);
-    if (access(out, F_OK) == 0) return 0;
-    snprintf(out, cap, "%s/packs/pack-%08u.dat", TEST_REPO, num);
-    return access(out, F_OK) == 0 ? 0 : -1;
+    /* The shard is created so a clone can be written straight to the path. */
+    char shard[512];
+    snprintf(shard, sizeof(shard), "%s/packs/%06x", TEST_REPO, num >> 8);
+    mkdir(shard, 0755);
+    int n = snprintf(out, cap, "%s/packs/%06x/pack-%010u.dat", TEST_REPO, num >> 8, num);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
 }
 
 static int count_packs(void)
@@ -134,7 +136,7 @@ static void clone_packs_to(int n)
     assert_int_equal(pack_dat_path(src, sizeof(src), 0), 0);
     for (int i = 1; i < n; i++) {
         char dst[512];
-        snprintf(dst, sizeof(dst), "%s/packs/pack-%08d.dat", TEST_REPO, i);
+        assert_int_equal(pack_dat_path(dst, sizeof(dst), (uint32_t)i), 0);
         copy_file(src, dst);
     }
     pack_cache_invalidate(store);
@@ -237,12 +239,12 @@ static void test_deleting_marker_is_replayed(void **state)
     assert_int_equal(pack_dat_path(src, sizeof(src), 0), 0);
 
     char clone[512];
-    snprintf(clone, sizeof(clone), "%s/packs/pack-%08d.dat", TEST_REPO, 50);
+    assert_int_equal(pack_dat_path(clone, sizeof(clone), 50), 0);
     copy_file(src, clone);
     assert_int_equal(count_packs(), 2);
 
     char marker[512];
-    snprintf(marker, sizeof(marker), "%s/packs/.deleting-00000000", TEST_REPO);
+    snprintf(marker, sizeof(marker), "%s/packs/.deleting-0000000000", TEST_REPO);
     FILE *f = fopen(marker, "w");
     assert_non_null(f);
     fprintf(f, "50\n");
@@ -266,7 +268,7 @@ static void test_deleting_marker_for_missing_pack(void **state)
 {
     (void)state;
     char marker[512];
-    snprintf(marker, sizeof(marker), "%s/packs/.deleting-00000000", TEST_REPO);
+    snprintf(marker, sizeof(marker), "%s/packs/.deleting-0000000000", TEST_REPO);
     FILE *f = fopen(marker, "w");
     assert_non_null(f);
     fprintf(f, "77\n");
@@ -311,6 +313,67 @@ static void test_coalesce_drops_unreferenced_objects(void **state)
         assert_false(pack_object_exists(store, hashes[i]));
 }
 
+static void collect_num(uint32_t n, void *ctx)
+{
+    uint32_t *seen = ctx;
+    if (n == 16777216u)  seen[0]++;
+    if (n == 100000000u) seen[1]++;
+    if (n == 4294967294u) seen[2]++;
+    if (n == 4294967295u) seen[3]++;
+    if (n == 0u) seen[4]++;
+}
+
+/*
+ * Format 2 named pack n with four hex digits of shard and eight decimal
+ * digits of number, so pack 16,777,216 went into a five-digit shard the scan
+ * skipped and pack 100,000,000 was not a pack name at all: the next writer
+ * picked a number already on disk and every pack write failed from then on.
+ * Every u32 pack number now round-trips, and the next pack is numbered past
+ * the highest.
+ */
+static void test_pack_numbers_cover_every_u32(void **state)
+{
+    (void)state;
+    char src[512], dst[512];
+    assert_int_equal(pack_dat_path(src, sizeof(src), 0), 0);
+    const uint32_t nums[] = { 16777216u, 100000000u, 4294967294u };
+    for (size_t i = 0; i < sizeof(nums) / sizeof(nums[0]); i++) {
+        assert_int_equal(pack_dat_path(dst, sizeof(dst), nums[i]), 0);
+        copy_file(src, dst);
+    }
+    struct stat sb;
+    assert_int_equal(stat(TEST_REPO "/packs/010000/pack-0016777216.dat", &sb), 0);
+    assert_int_equal(stat(TEST_REPO "/packs/ffffff/pack-4294967294.dat", &sb), 0);
+
+    /* Format 2 names, and a pack filed under the wrong shard, are not packs. */
+    copy_file(src, TEST_REPO "/packs/000000/pack-00000007.dat");
+    assert_int_equal(mkdir(TEST_REPO "/packs/0000", 0755), 0);
+    copy_file(src, TEST_REPO "/packs/0000/pack-00000008.dat");
+    copy_file(src, TEST_REPO "/packs/000000/pack-0000000300.dat");
+
+    uint32_t seen[5] = { 0 };
+    assert_int_equal(pack_list(store, collect_num, seen), OK);
+    assert_int_equal(seen[0], 1);
+    assert_int_equal(seen[1], 1);
+    assert_int_equal(seen[2], 1);
+    assert_int_equal(seen[4], 1);
+
+    /* The next pack takes the free number past the highest. */
+    pack_backup_writer_t *w = NULL;
+    assert_int_equal(pack_backup_open(store, &w), OK);
+    uint8_t h[OBJECT_HASH_SIZE];
+    int is_new = 0;
+    uint64_t phys = 0, psz = 0;
+    assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, "next pack", 9, h,
+                                     &is_new, &phys, &psz), OK);
+    assert_true(is_new);
+    assert_int_equal(pack_backup_finish(w, NULL), OK);
+    assert_int_equal(stat(TEST_REPO "/packs/ffffff/pack-4294967295.dat", &sb), 0);
+    memset(seen, 0, sizeof(seen));
+    assert_int_equal(pack_list(store, collect_num, seen), OK);
+    assert_int_equal(seen[3], 1);
+}
+
 int main(void)
 {
     rs_init();
@@ -322,6 +385,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_deleting_marker_is_replayed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deleting_marker_for_missing_pack, setup, teardown),
         cmocka_unit_test_setup_teardown(test_coalesce_drops_unreferenced_objects, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_numbers_cover_every_u32, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

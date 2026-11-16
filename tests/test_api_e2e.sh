@@ -398,11 +398,20 @@ JOB_BODY=$(sock_body "/jobs/$BACKUP_JOB")
 contains "backup result names its snapshot" '"result":{"snapshot_id":1,' "$JOB_BODY"
 contains "backup result counts files" '"files":3,' "$JOB_BODY"
 contains "no large files, no store pool" '"store_workers":1,' "$JOB_BODY"
-# B086: what the backup wrote, by category. Three small files go into the
-# backup's pack and nothing is left loose for the pack pass.
+# B086: what the backup wrote, by category. Every object goes into a pack,
+# so the pack payload and its parity are the only categories there are.
 contains "backup result counts bytes written" '"bytes_written":' "$JOB_BODY"
-contains "small files are written into packs, not loose" '"bytes_written_loose":0,' "$JOB_BODY"
-contains "and the pack pass has nothing to do" '"bytes_written_pack_pass":0,"pack_pass_packed":0}' "$JOB_BODY"
+BW=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"bytes_written":\([0-9]*\),.*/\1/p')
+BWP=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"bytes_written_pack":\([0-9]*\),.*/\1/p')
+BWPP=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"bytes_written_pack_parity":\([0-9]*\)}.*/\1/p')
+check "bytes written is pack plus parity" "${BW:-none}" "$(( ${BWP:-0} + ${BWPP:-0} ))"
+# The result is exactly these keys, in this order: nothing for loose
+# objects or a pack pass, which no longer exist.
+RESULT_KEYS=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"result":{\([^}]*\)}.*/\1/p' \
+              | grep -o '"[a-z_]*":' | tr -d '":' | tr '\n' ' ')
+check "the backup result carries exactly its keys" \
+    "snapshot_id files dirs files_unchanged bytes_logical objects_new bytes_stored trees_new trees_reused store_workers bytes_written bytes_written_pack bytes_written_pack_parity " \
+    "$RESULT_KEYS"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -484,29 +493,31 @@ check "and removable" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
 put_policy() { sock_send PUT /repos/1/policy "{\"key\":\"$1\",\"value\":\"$2\"}"; }
 OUT=$(put_policy retention.keep_hourly 5)
 contains "an unknown policy key is a 400" ' 400' "$OUT"
-contains "and the refusal lists the valid keys" 'maintenance.auto_pack' "$OUT"
+contains "and the refusal lists the valid keys" 'retention.keep_yearly' "$OUT"
 contains "a non-numeric count is a 400" ' 400' "$(put_policy retention.keep_daily banana)"
 contains "a negative count is a 400" ' 400' "$(put_policy retention.keep_weekly -3)"
 contains "a signed count is a 400" ' 400' "$(put_policy retention.keep_weekly +3)"
-contains "a non-boolean flag is a 400" ' 400' "$(put_policy maintenance.auto_pack maybe)"
-contains "a boolean in another spelling is accepted" ' 200' "$(put_policy maintenance.auto_pack OFF)"
+# maintenance.auto_pack went with the pack job: there is no pack pass left
+# for it to switch. Refused as unknown, not stored and ignored.
+OUT=$(put_policy maintenance.auto_pack false)
+contains "the retired auto_pack key is a 400" ' 400' "$OUT"
+contains "refused as unknown" "unknown policy key 'maintenance.auto_pack'" "$OUT"
 POL=$(sock_body /repos/1/policy)
-contains "and stored in one spelling" '"key":"maintenance.auto_pack","value":false' "$POL"
 contains "a refused value leaves the stored one" '"key":"retention.keep_daily","value":14' "$POL"
-case "$POL" in *keep_hourly*) bad "an unknown key is not stored" "absent" "$POL" ;;
+case "$POL" in *keep_hourly*|*auto_pack*) bad "an unknown key is not stored" "absent" "$POL" ;;
                *) ok "an unknown key is not stored" ;; esac
-put_policy maintenance.auto_pack true > /dev/null
 
-# B040: the defaults listed every retention key but not auto_pack, which is
-# in force everywhere a repository has not set it.
-contains "policy defaults include auto_pack, on" \
-    '{"key":"maintenance.auto_pack","value":true}]}' "$(sock_body /repos/1/policy)"
+# B040: the defaults list every key in force where a repository has not set
+# it, which with auto_pack gone is exactly the retention keys.
+check "policy defaults are the retention keys" \
+    '"defaults":[{"key":"retention.keep_snaps","value":1},{"key":"retention.keep_daily","value":7},{"key":"retention.keep_weekly","value":4},{"key":"retention.keep_monthly","value":12},{"key":"retention.keep_yearly","value":3}]}' \
+    "$(sock_body /repos/1/policy | sed -n 's/.*\("defaults":.*\)/\1/p')"
 
 # B008: values are typed, so the PUT takes them as the GET serves them.
 check "a count may be sent as a number" '{"ok":true} 200' \
     "$(sock_send PUT /repos/1/policy '{"key":"retention.keep_monthly","value":6}')"
-check "and a flag as a boolean" '{"ok":true} 200' \
-    "$(sock_send PUT /repos/1/policy '{"key":"maintenance.auto_pack","value":true}')"
+contains "but a boolean is not a count" ' 400' \
+    "$(sock_send PUT /repos/1/policy '{"key":"retention.keep_monthly","value":true}')"
 contains "and both read back typed" '"key":"retention.keep_monthly","value":6' \
     "$(sock_body /repos/1/policy)"
 
@@ -665,7 +676,11 @@ check "a duplicate key inside a trigger is a 400" 400 \
 check "trailing data after a schedule is a 400" 400 \
     "$(code_of "$(sched '{"action":"gc","trigger":{"type":"interval","seconds":60}} x')")"
 check "a duplicate top-level schedule key is a 400" 400 \
-    "$(code_of "$(sched '{"action":"gc","action":"pack","trigger":{"type":"interval","seconds":60}}')")"
+    "$(code_of "$(sched '{"action":"gc","action":"verify","trigger":{"type":"interval","seconds":60}}')")"
+# The pack job is gone (every object is written into a pack as it is
+# stored), so "pack" is no longer an action a schedule can name.
+check "a pack schedule is a 400" 400 \
+    "$(code_of "$(sched '{"action":"pack","trigger":{"type":"interval","seconds":60}}')")"
 case "$(sock_body /repos/1/schedules)" in
     *'"action"'*) bad "and no schedule was created" "none" "$(sock_body /repos/1/schedules)" ;;
     *) ok "and no schedule was created" ;;
@@ -759,17 +774,32 @@ check "yearly trigger on 30 February refused" 400 "$(curl -s -o /dev/null -w '%{
      http://localhost/repos/1/schedules)"
 
 echo "introspection"
-contains "summary"      '"snapshots"'  "$(sock_body /repos/1/summary)"
+SUMMARY=$(sock_body /repos/1/summary)
+contains "summary"      '"snapshots"'  "$SUMMARY"
+# There are no loose objects any more. What a client can see short of a
+# sealed pack is the staged count, which is zero once a backup has finished.
+contains "summary counts staged objects" '"staged":0' "$SUMMARY"
+case "$SUMMARY" in *'"loose"'*) bad "summary has no loose count" "absent" "$SUMMARY" ;;
+                   *) ok "summary has no loose count" ;; esac
 contains "stats"        '"per_type"'   "$(sock_body /repos/1/stats)"
-# Backups pack on completion, so the loose scope is legitimately empty here.
-# What matters is that the scoped query answers rather than errors.
-well_formed "loose stats scope answers" "$(sock_body '/repos/1/stats?scope=loose')"
+# The staged scope is legitimately empty here, every backup having sealed its
+# pack. What matters is that the scoped query answers rather than errors.
+well_formed "staged stats scope answers" "$(sock_body '/repos/1/stats?scope=staged')"
+contains "and narrows to nothing" '"per_type":[]' "$(sock_body '/repos/1/stats?scope=staged')"
+# loose is not a scope now; like any unknown scope it is refused rather
+# than answered unscoped.
+check "the loose scope is refused" 400 "$(sock_code '/repos/1/stats?scope=loose')"
 contains "objects"      '"hash"'       "$(sock_body '/repos/1/objects?limit=2')"
 contains "packs"        '{'            "$(sock_body /repos/1/packs)"
 # B074: values that cannot mean anything were ignored, so the default page
 # came back as though the request had been understood.
 check "unknown object location is a 400" 400 "$(sock_code '/repos/1/objects?location=nowhere')"
 check "location=all is accepted"         200 "$(sock_code '/repos/1/objects?location=all')"
+check "location=staged is accepted"      200 "$(sock_code '/repos/1/objects?location=staged')"
+check "location=packed is accepted"      200 "$(sock_code '/repos/1/objects?location=packed')"
+check "location=loose is a 400 now"      400 "$(sock_code '/repos/1/objects?location=loose')"
+contains "nothing is staged after a backup" '"objects":[]' \
+    "$(sock_body '/repos/1/objects?location=staged')"
 check "negative limit is a 400"          400 "$(sock_code '/repos/1/snapshots?limit=-1')"
 check "zero limit is a 400"              400 "$(sock_code '/repos/1/snapshots?limit=0')"
 check "non-numeric limit is a 400"       400 "$(sock_code '/repos/1/objects?limit=lots')"
@@ -834,9 +864,7 @@ check "diff of an unknown snapshot is still 404" \
 contains "fanout"       '"buckets"'    "$(sock_body /repos/1/fanout)"
 
 # type 1 is a file. Tree objects are referenced by subtree_hash rather than
-# content_hash, so they have no refs and would be a misleading probe. No
-# location filter: a backup packs on completion, so which side of the loose
-# and packed split an object lands on is not this test's business.
+# content_hash, so they have no refs and would be a misleading probe.
 OBJ=$(sock_body '/repos/1/objects?limit=200' \
       | tr '}' '\n' | grep '"type":1,' | head -1 \
       | sed -n 's/.*"hash":"\([a-f0-9]*\)".*/\1/p')
@@ -863,18 +891,17 @@ contains "diff adds nothing"             '"added":0'           "$DIFF"
 contains "diff truncation is a boolean"  '"truncated":false'   "$DIFF"
 
 
-echo "packing"
-PACK_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repos/1/pack)")
-check "pack submitted" "1" "$([ -n "$PACK_JOB" ] && echo 1 || echo 0)"
-wait_job "$PACK_JOB"
-contains "pack completed" '"state":"completed"' "$(sock_body "/jobs/$PACK_JOB")"
-# B099: the pack job's result was null; why nothing was packed was only in
-# the log. The second backup packed its own objects, so nothing is loose.
-PACK_BODY=$(sock_body "/jobs/$PACK_JOB")
-contains "pack has a result" '"result":{"loose":' "$PACK_BODY"
-contains "pack result counts what it packed" '"packed":0' "$PACK_BODY"
-contains "pack result says why nothing was packed" '"reason":"no loose objects"' "$PACK_BODY"
+echo "packs"
+# There is no pack job: every object is written into a pack as it is stored.
+check "the pack route is gone" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" http://localhost/repos/1/pack)"
 contains "packs listed"  '"filename"'            "$(sock_body /repos/1/packs)"
+# A repository holds packs and the snapshot-id high-water mark, and no
+# objects directory: nothing writes outside a pack.
+check "the repository has no objects directory" "absent" \
+    "$([ -e "$WORK/repo/objects" ] && echo present || echo absent)"
+check "and keeps its snapshot-id mark" "present" \
+    "$([ -f "$WORK/repo/snapshot-ids" ] && echo present || echo absent)"
 contains "pack entries"  '"entry_index"'         "$(sock_body '/repos/1/packs/0/entries?limit=1')"
 # B075: missing ids answered as empty successes, which reads as "empty".
 check "entries of a missing pack"   404 "$(sock_code '/repos/1/packs/99999/entries')"
@@ -882,14 +909,14 @@ check "tree of a missing snapshot"  404 "$(sock_code '/repos/1/snapshots/99999/t
 check "tree under a missing node"   404 "$(sock_code '/repos/1/snapshots/1/tree?parent=99999999')"
 check "findings of a missing verify run" 404 "$(sock_code '/repos/1/verify/99999')"
 check "hits of a missing search"    404 "$(sock_code '/repos/1/grep/99999')"
-# Objects are in packs now, so every read path has to resolve through the
-# index rather than the objects directory.
+# Every object is in a pack, so every read path has to resolve through the
+# pack index.
 PACKED=$(sock_body '/repos/1/objects?location=pack&limit=1' \
          | sed -n 's/.*"hash":"\([a-f0-9]*\)".*/\1/p')
 contains "packed object locates" '"found":true'  "$(sock_body "/repos/1/objects/$PACKED")"
 contains "packed object layout"  '"header_size"' "$(sock_body "/repos/1/objects/$PACKED/layout")"
 # B076: the docs said 56 bytes. A packed object sits behind the 51-byte pack
-# entry header (a loose one behind the 64-byte object header).
+# entry header.
 contains "packed header is the 51-byte entry header" '"header_size":51' \
     "$(sock_body "/repos/1/objects/$PACKED/layout")"
 # B102: a packed object's phys_size is its stored payload, the entry header
@@ -963,7 +990,7 @@ check    "missing subpath wrote nothing" "absent" "$([ -e "$WORK/nothing" ] && e
 R=$(restore_req '{"dest":"relative/out"}')
 contains "relative dest is 400"          ' 400'                       "$R"
 contains "relative dest says why"        'dest must be an absolute path' "$R"
-# Restoring into a repository writes beside objects/ and packs/. Refused,
+# Restoring into a repository writes beside packs/ and snapshots/. Refused,
 # however the path is spelled: directly, through "..", and through a symlink,
 # which is why the comparison is on canonical paths.
 R=$(restore_req "{\"dest\":\"$WORK/repo/restored\"}")
@@ -1083,7 +1110,7 @@ contains "verify age metric present" 'cbackup_last_verify_age_seconds' "$(sock_b
 # copied out of the database as text, so ids, counts, sizes, timestamps,
 # modes and flags all arrived quoted and every client had to know which
 # strings were numbers. Swept across the repository-scoped reads, after
-# backup, pack, tag, policy, schedule and verify have all left rows behind.
+# backup, tag, policy, schedule and verify have all left rows behind.
 # A string of nothing but digits is what the bug looked like; none of the
 # names, paths, labels or hashes in this fixture is one. The fanout's
 # "prefix" is the exception that proves it: two hex digits, which can be
@@ -1169,6 +1196,23 @@ contains "the new label is stored" '"label":"renamed"' "$(sock_body /repos/1)"
 contains "a trailing slash is the same repository" '"id":1,"already_registered":true' \
     "$(repo_post_body "{\"path\":\"$WORK/repo/\"}")"
 contains "and the label survives an empty one" '"label":"renamed"' "$(sock_body /repos/1)"
+
+# A new repository is format 3 and keeps the snapshot-id mark from the
+# start. An older marker is refused at registration with what to do, not
+# opened by a build that has no reader for it.
+contains "a new marker is format 3" '"version":3' "$(cat "$WORK/deep/a/b/r/.cbackup")"
+check "and the snapshot-id mark is created with it" "present" \
+    "$([ -f "$WORK/deep/a/b/r/snapshot-ids" ] && echo present || echo absent)"
+mkdir -p "$WORK/oldfmt" && chmod 700 "$WORK/oldfmt"
+sed -e 's/"version":3/"version":2/' -e 's/"uuid":"[^"]*"/"uuid":"00000000-0000-4000-8000-000000000002"/' \
+    "$WORK/deep/a/b/r/.cbackup" > "$WORK/oldfmt/.cbackup"
+OUT=$(curl -s -w ' %{http_code}' -X POST --unix-socket "$SOCK" \
+      -d "{\"path\":\"$WORK/oldfmt\"}" http://localhost/repos)
+contains "a format 2 repository is refused" ' 400' "$OUT"
+contains "and the refusal names the formats" \
+    "is repository format 2; this build reads only format 3" "$OUT"
+case "$(sock_body /repos)" in *oldfmt*) bad "and it is not registered" "absent" "listed" ;;
+                              *) ok "and it is not registered" ;; esac
 
 echo "remote"
 # The same operations the desktop app drives, over TCP with a token, after
@@ -1449,24 +1493,19 @@ fi
 contains "policy reports the configured defaults" \
     '"key":"retention.keep_snaps","value":2' "$(sock_body /repos/1/policy)"
 
-# B086: backup.store_workers reaches the backup. Three files over 16 MiB,
-# and the configured 2 caps the pool where automatic would have used 3 on
-# any machine with five CPUs or more; the main daemon, on automatic, stored
-# its three small files serially.
+# One object holds at most 16 MiB (OBJECT_MAX_BYTES); a larger file is a
+# chunk list of content-defined chunks. B086: backup.store_workers reaches
+# the backup. Three files over 16 MiB, and the configured 2 caps the pool
+# where automatic would have used 3 on any machine with five CPUs or more;
+# the main daemon, on automatic, stored its three small files serially.
 mkdir -p "$R/big"
 for i in 1 2 3; do head -c $((17 * 1024 * 1024)) /dev/urandom > "$R/big/f$i"; done
 SW=$(job_id "$(sock_post /repos/2/backup "{\"paths\":[\"$R/big\"]}")")
 wait_job "$SW"
 SW_BODY=$(sock_body "/jobs/$SW")
+contains "files over one object back up" '"state":"completed"' "$SW_BODY"
 contains "store_workers from config sizes the pool" '"store_workers":2,' "$SW_BODY"
-# Format 3: each is content-defined chunks in the backup pack, so the count
-# is of chunks and lists, not files; what holds is all three stored and
-# nothing written loose or left for the pack pass.
 contains "and the backup stores all three" '"files":3,' "$SW_BODY"
-contains "as chunks in packs, nothing loose" '"bytes_written_loose":0,' "$SW_BODY"
-contains "and nothing for the pack pass" '"pack_pass_packed":0' "$SW_BODY"
-contains "large random files are written loose once" '"bytes_written_loose_discarded":0,' "$SW_BODY"
-contains "and the pack pass probes them and writes nothing" '"bytes_written_pack_pass":0,' "$SW_BODY"
 rm -f "$R/big/f1" "$R/big/f2" "$R/big/f3"
 rmdir "$R/big"
 
@@ -1545,6 +1584,13 @@ fi
 RX=$(job_id "$(sock_post /repos/1/reindex)")
 wait_job "$RX"
 contains "the reindex succeeds" '"state":"completed"' "$(sock_body "/jobs/$RX")"
+# The mark lives in the repository, not the index rows just deleted, so it
+# still covers every id handed out, the deleted 3 and 4 included, and
+# nothing needed repairing.
+contains "the reindex reports the snapshot-id mark" "\"snapshot_mark\":$LSID," \
+    "$(sock_body "/jobs/$RX")"
+contains "and that the mark needed no repair" '"snapshot_ids_repaired":false' \
+    "$(sock_body "/jobs/$RX")"
 contains "and the label comes back from the record" "\"label\":\"$LBL_OUT\"" \
     "$(sock_body /repos/1/snapshots)"
 

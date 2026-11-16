@@ -21,8 +21,8 @@
  *   - tags:    the real tag set and remove handlers on snapshot 1
  *   - raw:     db_txn_begin/insert/commit, the shape every other writer has
  *
- * The backup covers large files on both sides of the 16 MiB pack threshold
- * (6 MiB, packed; 20 MiB, loose) and 12,000 small ones, past the 2,000-entry
+ * The backup covers files up to near the 16 MiB object bound (two of 6 MiB
+ * and one of 15 MiB) and 12,000 small ones, past the 2,000-entry
  * batch, so it crosses count commits, commits for a waiter mid-file and pack
  * seals.
  *
@@ -77,7 +77,7 @@
 #define TEST_SRC2 TEST_DIR "/src2"    /* snapshot 1, for the tags */
 
 #define N_SMALL   12000             /* past CACHE_BATCH, so count commits too */
-#define N_FILES   (N_SMALL + 3)       /* plus two 6 MiB and one 20 MiB */
+#define N_FILES   (N_SMALL + 3)       /* plus two 6 MiB and one 15 MiB */
 #define MIN_ITERS 40                  /* per writer, backup or no backup */
 #define MIN_DURING 10                 /* per writer, while the backup runs */
 #define MAX_ITERS 2000
@@ -303,7 +303,7 @@ static void test_writes_during_a_backup_all_land(void **state)
     }
     write_big(TEST_SRC "/big6a.bin", 6);
     write_big(TEST_SRC "/big6b.bin", 6);
-    write_big(TEST_SRC "/big20.bin", 20);
+    write_big(TEST_SRC "/big15.bin", 15);
 
     writer_t w[4];
     memset(w, 0, sizeof(w));

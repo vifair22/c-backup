@@ -7,7 +7,6 @@
 #include "object.h"
 #include "chunklist.h"
 #include "read_budget.h"
-#include "sparse_restore.h"
 #include "util.h"
 
 #include <cutils/log.h>
@@ -363,8 +362,8 @@ static void report(const restore_opts_t *o, const char *phase,
  *
  * Without it a restore's byte count moved only between files, and one large
  * file held the job at a single value for as long as it took (B089). Capped
- * at the file's size: a sparse object is streamed once as its payload before
- * being laid out with its holes, and that second pass must not count again.
+ * at the file's size, so a count that overshoots never reports more than
+ * the file holds.
  */
 typedef struct {
     const restore_opts_t *opts;
@@ -647,41 +646,17 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
     int fd = make_partial(full, tmp, tmpsz);
     if (fd == -1) return ERR_IO;
 
+    /*
+     * One FILE object or a chunk list. Every object is bounded, so each is
+     * loaded, decrypted and checked against its name whole before a byte of
+     * it is written: nothing unverified ever reaches the file. A list's
+     * leaves go in at their offsets and the file is extended to its length,
+     * so holes stay holes. Any other type is refused: it is not file
+     * content, whatever its bytes say (OWN-39).
+     */
+    (void)size;
     uint64_t sz = 0;
-    uint8_t  otype = 0;
-    status_t st = object_get_info(store, hash, &sz, &otype);
-    if (st == OK && otype == OBJECT_TYPE_SPARSE) {
-        st = object_load_stream(store, hash, fd, &sz, &otype);
-    } else if (st == OK) {
-        /*
-         * One FILE object or a chunk list (format 3). Leaves go in at their
-         * offsets, each hash-checked before a byte of it is written, and the
-         * file is extended to its length, so holes stay holes. Any other
-         * type is refused there: it is not file content, whatever its bytes
-         * say (OWN-39).
-         */
-        st = content_restore_fd(store, hash, fd, &sz);
-    }
-
-    if (st == OK && otype == OBJECT_TYPE_SPARSE) {
-        /*
-         * What was just written is the verified payload, a region table
-         * plus data; writing that linearly would turn holes into zeros.
-         * It is laid out from there into a second temporary file, and the
-         * payload is dropped as soon as that exists.
-         */
-        char tmp2[PATH_MAX];
-        int fd2 = make_partial(full, tmp2, sizeof(tmp2));
-        if (fd2 == -1) {
-            st = ERR_IO;
-        } else {
-            st = restore_sparse_from_fd(fd, fd2, size, full);
-            close(fd);
-            unlink(tmp);
-            fd = fd2;
-            snprintf(tmp, tmpsz, "%s", tmp2);
-        }
-    }
+    status_t st = content_restore_fd(store, hash, fd, &sz);
 
     /* Metadata goes on before the rename, so the file is final the moment
      * it has its name: the resume rule relies on the mtime being right. */

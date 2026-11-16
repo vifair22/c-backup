@@ -617,10 +617,19 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
     status_t st = object_get_info(store, hash, &size, &type);
     if (st != OK) return st;
     if (type == OBJECT_TYPE_FILE) {
-        uint64_t taken = read_budget_acquire(size ? size : 1);
-        st = object_load_stream(store, hash, out_fd, &size, NULL);
+        /* Loaded, decrypted and checked whole before a byte is written. */
+        void    *data = NULL;
+        size_t   len = 0;
+        uint8_t  otype = 0;
+        uint64_t taken = 0;
+        st = object_load_budgeted(store, hash, &data, &len, &otype, &taken);
+        if (st == OK && otype != OBJECT_TYPE_FILE)
+            st = set_error(ERR_CORRUPT, "object is of type %u, not file content", otype);
+        if (st == OK && len) st = pwrite_full(out_fd, data, len, 0);
+        if (st == OK) store_io_progress(store, len);
+        free(data);
         read_budget_release(taken);
-        if (st == OK && out_size) *out_size = size;
+        if (st == OK && out_size) *out_size = len;
         return st;
     }
     if (type != OBJECT_TYPE_CHUNKLIST)
@@ -733,10 +742,27 @@ status_t content_read_prefix(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE
     status_t st = object_get_info(store, hash, &size, &type);
     if (st != OK) return st;
     if (type == OBJECT_TYPE_FILE) {
-        uint64_t taken = read_budget_acquire(size < max_bytes ? (size ? size : 1)
-                                                              : (uint64_t)max_bytes);
-        st = object_load_prefix(store, hash, max_bytes, out_data, out_len,
-                                out_full, NULL);
+        /* Every object is bounded, so the prefix is cut from the whole
+         * object once it has been authenticated. */
+        void    *data = NULL;
+        size_t   len = 0;
+        uint8_t  otype = 0;
+        uint64_t taken = 0;
+        st = object_load_budgeted(store, hash, &data, &len, &otype, &taken);
+        if (st == OK && otype != OBJECT_TYPE_FILE)
+            st = set_error(ERR_CORRUPT, "object is of type %u, not file content", otype);
+        if (st == OK) {
+            if (out_full) *out_full = len;
+            if (len > max_bytes) {
+                uint8_t *cut = realloc(data, max_bytes ? max_bytes : 1);
+                if (cut) data = cut;
+                len = max_bytes;
+            }
+            *out_data = data;
+            *out_len = len;
+            data = NULL;
+        }
+        free(data);
         read_budget_release(taken);
         return st;
     }

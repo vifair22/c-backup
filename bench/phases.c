@@ -4,14 +4,13 @@
  * Generates a source tree of many small files and a few large ones, then
  * times, in order:
  *
- *   1. a first backup into an empty repository, and the pack that follows it
- *   2. a second backup with nothing changed, and its pack (normally a no-op)
+ *   1. a first backup into an empty repository
+ *   2. a second backup with nothing changed
  *   3. a restore of the latest snapshot into an empty directory
  *
- * The backup job packs on completion, inside backup_run (pack_after), so the
- * backup's time, profile and write counters all include that pack pass, as
- * the daemon's do. A second, separate pack follows and is timed on its own;
- * after the first it should find nothing to do. backup_run logs its own
+ * Every object a backup stores goes straight into a pack, so the backup's
+ * time, profile and write counters are the whole cost of getting the data
+ * into the repository; there is no pack pass after it. backup_run logs its own
  * per-phase profile (phase_timer.h) at info level, and that log is left on
  * here: it is the same breakdown the daemon writes on a deployment, which is
  * the point of printing it.
@@ -23,7 +22,9 @@
  * The large files are what the B086 first-backup work needs: random ones are
  * incompressible and exercise the object writer's read -> hash -> write ->
  * parity pipeline and the LZ4 bailout; the text copies are compressible and
- * identical, so the second dedups and the first is re-copied by the pack.
+ * identical, so the second dedups. Each is at most OBJECT_MAX_BYTES: a
+ * regular file past the object bound fails the backup until content-defined
+ * chunking lands, so the multi-GiB B086 preset is gone with it.
  *
  * Usage:
  *   bench_phases [options]
@@ -36,12 +37,8 @@
  *     -H, --head-text N    large files with a 1 MiB compressible head and a
  *                          random body, as media files often are; the pack
  *                          prober reads only the head  (BENCH_HEAD_FILES, 0)
- *     -m, --large-mib M    size of each large file, MiB         (BENCH_LARGE_MIB, 64)
- *     -w, --workers N      large-file store workers, 0 automatic, 1 serial
- *                                                          (BENCH_STORE_WORKERS, 0)
- *     -p, --preset NAME    many-large: 8 incompressible files of 2 GiB and
- *                          nothing else, the B086 case; later options still
- *                          override it
+ *     -m, --large-mib M    size of each large file, MiB, at most 16
+ *                                                          (BENCH_LARGE_MIB, 16)
  *     -D, --per-dir N      small files per directory            (BENCH_PER_DIR, 100)
  *     -j, --job-progress   write progress to a jobs row the way the daemon's
  *                          job manager does, at most every 250 ms
@@ -70,8 +67,8 @@
 #include "bench_common.h"
 
 #include "backup.h"
-#include "pack.h"
 #include "restore.h"
+#include "types.h"
 
 #define WRITE_CHUNK   (1u << 20)
 
@@ -85,7 +82,6 @@ typedef struct {
     uint64_t utext_files;
     uint64_t head_files;
     uint64_t large_mib;
-    unsigned workers;
     uint64_t per_dir;
     int      job_progress;
     int      cold;
@@ -408,8 +404,6 @@ static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
     memset(&bo, 0, sizeof(bo));
     bo.paths = paths;
     bo.n_paths = 1;
-    bo.store_workers = o->workers;
-    bo.pack_after = 1;
     job_progress_t jp;
     memset(&jp, 0, sizeof(jp));
     if (o->job_progress) {
@@ -431,14 +425,6 @@ static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
     double tb = finish_timing(o, t0);
     uint64_t wb1 = proc_write_bytes();
 
-    double t1 = bench_now();
-    uint32_t packed = 0;
-    if (repo_pack(e->store, &packed, NULL, NULL) != OK) {
-        fprintf(stderr, "bench: %s pack failed: %s\n", label, err_msg());
-        return -1;
-    }
-    double tp = finish_timing(o, t1);
-
     double mib = (double)res->bytes_logical / (1024.0 * 1024.0);
     char name[96];
     printf("\n");
@@ -448,30 +434,18 @@ static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
     report(name, (double)res->files / tb, "files/s", tb);
     snprintf(name, sizeof(name), "%s MiB/s", label);
     report(name, mib / tb, "MiB/s", tb);
-    snprintf(name, sizeof(name), "%s pack", label);
-    report(name, tp, "s", tp);
-    snprintf(name, sizeof(name), "%s + pack MiB/s", label);
-    report(name, mib / (tb + tp), "MiB/s", tb + tp);
     printf("      (%" PRIu64 " files, %" PRIu64 " dirs, %" PRIu64 " unchanged, "
-           "%" PRIu64 " new objects, %" PRIu64 " new trees, %" PRIu64 " reused, "
-           "%u packed, %u store workers)\n",
+           "%" PRIu64 " new objects, %" PRIu64 " new trees, %" PRIu64 " reused)\n",
            res->files, res->dirs, res->files_unchanged, res->objects_new,
-           res->trees_new, res->trees_reused, packed, res->store_workers);
+           res->trees_new, res->trees_reused);
     if (o->job_progress)
         printf("      (%" PRIu64 " job progress writes)\n", jp.writes);
 
     const uint64_t *w = res->written.bytes;
     double lb = res->bytes_logical ? (double)res->bytes_logical : 1.0;
-    printf("      written %.1f MiB = %.3f x content: loose %.1f + parity %.1f, "
-           "packs %.1f + parity %.1f, spill %.1f, discarded %.1f, abandoned %.1f; "
-           "of which pack pass %.1f (%" PRIu64 " packed)\n",
+    printf("      written %.1f MiB = %.3f x content: packs %.1f + parity %.1f\n",
            (double)res->written_total / 1048576.0, (double)res->written_total / lb,
-           (double)w[STORE_WR_LOOSE] / 1048576.0, (double)w[STORE_WR_LOOSE_PARITY] / 1048576.0,
-           (double)w[STORE_WR_PACK] / 1048576.0, (double)w[STORE_WR_PACK_PARITY] / 1048576.0,
-           (double)w[STORE_WR_PARITY_SPILL] / 1048576.0,
-           (double)w[STORE_WR_LOOSE_DISCARD] / 1048576.0,
-           (double)w[STORE_WR_PACK_ABANDONED] / 1048576.0,
-           (double)res->written_sweep / 1048576.0, res->sweep_packed);
+           (double)w[STORE_WR_PACK] / 1048576.0, (double)w[STORE_WR_PACK_PARITY] / 1048576.0);
     if (wb1 >= wb0 && wb1)
         printf("      /proc/self/io write_bytes %.1f MiB = %.3f x content "
                "(database and everything else included)\n",
@@ -509,7 +483,7 @@ static void usage(FILE *f)
 {
     fprintf(f,
         "usage: bench_phases [-d DIR] [-n SMALL] [-s BYTES] [-l LARGE] [-t TEXT]\n"
-        "                    [-T TEXT] [-H N] [-m MIB] [-w N] [-p PRESET] [-D N] [-j] [-c] [-k]\n"
+        "                    [-T TEXT] [-H N] [-m MIB] [-D N] [-j] [-c] [-k]\n"
         "  -d, --dir DIR        parent of the working directory (BENCH_DIR, /tmp)\n"
         "  -n, --small N        small files (BENCH_SMALL_FILES, 10000)\n"
         "  -s, --small-bytes B  mean small-file size (BENCH_SMALL_BYTES, 4096)\n"
@@ -517,9 +491,7 @@ static void usage(FILE *f)
         "  -t, --text N         identical compressible large files (BENCH_TEXT_FILES, 2)\n"
         "  -T, --text-unique N  distinct compressible large files (BENCH_UTEXT_FILES, 0)\n"
         "  -H, --head-text N    large files, compressible 1 MiB head, random body (BENCH_HEAD_FILES, 0)\n"
-        "  -m, --large-mib M    MiB per large file (BENCH_LARGE_MIB, 64)\n"
-        "  -w, --workers N      large-file store workers, 0 auto, 1 serial (BENCH_STORE_WORKERS, 0)\n"
-        "  -p, --preset NAME    many-large: 8 x 2 GiB incompressible, no small files\n"
+        "  -m, --large-mib M    MiB per large file, at most 16 (BENCH_LARGE_MIB, 16)\n"
         "  -D, --per-dir N      small files per directory (BENCH_PER_DIR, 100)\n"
         "  -j, --job-progress   write job progress like the daemon (BENCH_JOB_PROGRESS, 0)\n"
         "  -c, --cold           evict the source before each backup, sync in timings\n"
@@ -538,9 +510,7 @@ static void parse(int argc, char **argv, opts_t *o)
     o->text_files  = bench_env_u64("BENCH_TEXT_FILES", 2);
     o->utext_files = bench_env_u64("BENCH_UTEXT_FILES", 0);
     o->head_files  = bench_env_u64("BENCH_HEAD_FILES", 0);
-    o->large_mib   = bench_env_u64("BENCH_LARGE_MIB", 64);
-    uint64_t w     = bench_env_u64("BENCH_STORE_WORKERS", 0);
-    o->workers     = w > 64 ? 64u : (unsigned)w;
+    o->large_mib   = bench_env_u64("BENCH_LARGE_MIB", 16);
     o->per_dir     = bench_env_u64("BENCH_PER_DIR", 100);
     o->job_progress = bench_env_u64("BENCH_JOB_PROGRESS", 0) != 0;
 
@@ -553,8 +523,6 @@ static void parse(int argc, char **argv, opts_t *o)
         { "text-unique", required_argument, NULL, 'T' },
         { "head-text",   required_argument, NULL, 'H' },
         { "large-mib",   required_argument, NULL, 'm' },
-        { "workers",     required_argument, NULL, 'w' },
-        { "preset",      required_argument, NULL, 'p' },
         { "per-dir",     required_argument, NULL, 'D' },
         { "job-progress", no_argument,      NULL, 'j' },
         { "cold",        no_argument,       NULL, 'c' },
@@ -565,7 +533,7 @@ static void parse(int argc, char **argv, opts_t *o)
         { NULL, 0, NULL, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "d:n:s:l:t:T:H:m:w:p:D:jckS:Rh", lo, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "d:n:s:l:t:T:H:m:D:jckS:Rh", lo, NULL)) != -1) {
         switch (c) {
         case 'd': snprintf(o->parent, sizeof(o->parent), "%s", optarg); break;
         case 'n': o->small_files = bench_parse_u64("--small", optarg); break;
@@ -575,24 +543,6 @@ static void parse(int argc, char **argv, opts_t *o)
         case 'T': o->utext_files = bench_parse_u64("--text-unique", optarg); break;
         case 'H': o->head_files  = bench_parse_u64("--head-text", optarg); break;
         case 'm': o->large_mib   = bench_parse_u64("--large-mib", optarg); break;
-        case 'w': {
-            uint64_t n = bench_parse_u64("--workers", optarg);
-            if (n > 64) { fprintf(stderr, "bench: --workers is 0 to 64\n"); exit(2); }
-            o->workers = (unsigned)n;
-            break;
-        }
-        case 'p':
-            if (strcmp(optarg, "many-large") != 0) {
-                fprintf(stderr, "bench: unknown preset '%s'\n", optarg);
-                exit(2);
-            }
-            o->small_files = 0;
-            o->large_files = 8;
-            o->text_files  = 0;
-            o->utext_files = 0;
-            o->head_files  = 0;
-            o->large_mib   = 2048;
-            break;
         case 'D': o->per_dir = bench_parse_u64("--per-dir", optarg); break;
         case 'j': o->job_progress = 1; break;
         case 'c': o->cold = 1; break;
@@ -608,8 +558,10 @@ static void parse(int argc, char **argv, opts_t *o)
         fprintf(stderr, "bench: --per-dir must be at least 1\n");
         exit(2);
     }
-    if (o->large_mib > (UINT64_MAX >> 21)) {
-        fprintf(stderr, "bench: --large-mib too large\n");
+    if (o->large_mib > (OBJECT_MAX_BYTES >> 20)) {
+        fprintf(stderr, "bench: --large-mib is at most %llu: a larger file fails "
+                "the backup until content-defined chunking lands\n",
+                (unsigned long long)(OBJECT_MAX_BYTES >> 20));
         exit(2);
     }
     if (!o->source[0] && o->small_files + o->large_files + o->text_files
@@ -667,10 +619,9 @@ int main(int argc, char **argv)
     if (o.source[0]) printf("  source %s (not generated)\n", o.source);
     else printf("  %" PRIu64 " small files of ~%" PRIu64 " B, %" PRIu64 " random + %" PRIu64
            " identical text + %" PRIu64 " distinct text + %" PRIu64
-           " head-text files of %" PRIu64 " MiB, store workers %u%s%s\n",
+           " head-text files of %" PRIu64 " MiB%s\n",
            o.small_files, o.small_bytes, o.large_files, o.text_files, o.utext_files,
-           o.head_files, o.large_mib,
-           o.workers, o.workers ? "" : " (auto)", o.cold ? ", cold" : "");
+           o.head_files, o.large_mib, o.cold ? ", cold" : "");
 
     tree_stats_t ts;
     double t0 = bench_now();

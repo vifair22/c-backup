@@ -257,9 +257,8 @@ static void test_append_and_edit_write_little(void **state)
     printf("first: %llu written for %zu bytes\n",
            (unsigned long long)first.written_total, n);
     assert_true(first.written_total >= n);
-    /* Written once: no loose stage, no pack pass rewriting it. */
+    /* Written once, into packs. */
     assert_true(first.written_total < n + n / 8);
-    assert_int_equal(first.written_sweep, 0);
 
     uint8_t *more = rand_buf(MiB, 22);
     FILE *f = fopen(TEST_SRC "/big.bin", "ab");

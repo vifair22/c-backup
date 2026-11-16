@@ -2,8 +2,8 @@
  * The object store, by object.
  *
  * Migrated off the action bridge, and widened to match `c-backup objects`,
- * which takes a location: loose objects are the interesting case but they
- * are not a different kind of thing, and having no way to look at a packed
+ * which takes a location: every object lives in a pack, staged ones only
+ * until a backup seals its pack, and having no way to look at a packed
  * one from here meant dropping into the pack browser to answer a question
  * about a single hash.
  *
@@ -29,7 +29,7 @@ const api = window.cbackup
 
 const PAGE_SIZE = 200
 
-type Location = 'loose' | 'packed' | 'all'
+type Location = 'staged' | 'packed' | 'all'
 
 interface StoreObject {
   hash: string
@@ -59,7 +59,7 @@ interface Props {
 export function LooseObjects({ connName, repoPath, onBack }: Props): React.ReactElement {
   const repoId = Number(repoPath)
 
-  const [location, setLocation] = useState<Location>('loose')
+  const [location, setLocation] = useState<Location>('all')
   const [perType, setPerType] = useState<WireTypeStat[]>([])
   const [objects, setObjects] = useState<StoreObject[]>([])
   const [offset, setOffset] = useState(0)
@@ -73,7 +73,7 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
    * how much is there without paging through all of it. */
   useEffect(() => {
     api.apiCall<{ per_type?: WireTypeStat[] }>(connName, {
-      kind: 'stats', repoId, ...(location === 'loose' ? { scope: 'loose' } : {}),
+      kind: 'stats', repoId, ...(location === 'staged' ? { scope: 'staged' } : {}),
     })
       .then(r => setPerType(r.per_type ?? []))
       .catch(() => setPerType([]))
@@ -112,7 +112,7 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
   const totalPhys  = perType.reduce((a, t) => a + t.phys_size, 0)
 
   const LOCATIONS: { key: Location; label: string }[] = [
-    { key: 'loose', label: 'Loose' },
+    { key: 'staged', label: 'Staged' },
     { key: 'packed', label: 'Packed' },
     { key: 'all',   label: 'All' },
   ]
@@ -141,17 +141,17 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
             {l.label}
           </button>
         ))}
-        {location === 'loose' && (
+        {location === 'staged' && (
           <span className="text-xs text-text-muted ml-2">
-            Loose objects are stored uncompressed - packing is what compresses
-            them, so an unpacked repository holds more than its source.
+            Staged objects are in the pack a running backup has not sealed yet;
+            every object lives in a pack once it is.
           </span>
         )}
       </div>
 
       {error && <div className="text-status-error text-sm mb-3">{error}</div>}
 
-      {perType.length > 0 && location === 'loose' && (
+      {perType.length > 0 && location === 'staged' && (
         <div className="flex flex-wrap gap-3 mb-4">
           {perType.filter(t => t.count > 0).map(t => (
             <div key={t.type} className="bg-surface-secondary border border-border-default rounded-lg px-3 py-2 text-xs">
@@ -207,8 +207,8 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
       {loading && <div className="text-text-muted text-sm mt-3">Loading...</div>}
       {!loading && objects.length === 0 && !error && (
         <div className="text-text-muted text-sm">
-          {location === 'loose'
-            ? 'Nothing is loose. Everything here has been packed.'
+          {location === 'staged'
+            ? 'Nothing is staged. Every object is in an installed pack.'
             : 'No objects.'}
         </div>
       )}

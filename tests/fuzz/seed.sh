@@ -17,14 +17,9 @@ trap 'rm -rf "$W"' EXIT
 mkdir -p "$W/src/sub"
 printf 'the quick brown fox\n%.0s' $(seq 1 200) > "$W/src/compressible.txt"
 head -c 40000 /dev/urandom                      > "$W/src/incompressible.bin"
-# Backup packs on completion, so the only objects still loose afterwards are
-# the ones the prober marked incompressible and left alone - which by design
-# means larger than the 16 MiB pack threshold. Without one of these there is
-# nothing on disk in loose-object form to seed fuzz_object with.
-head -c 17825792 /dev/urandom                   > "$W/src/big_incompressible.bin"
 echo "small"                                    > "$W/src/sub/small.txt"
 ln -s compressible.txt "$W/src/link"
-# A sparse file, so a sparse object lands in the corpus.
+# A file with a hole, which the chunker records as a gap in a chunk list.
 dd if=/dev/zero of="$W/src/sparse.bin" bs=1 count=0 seek=1048576 2>/dev/null
 printf 'data at the end' | dd of="$W/src/sparse.bin" bs=1 seek=1048000 conv=notrunc 2>/dev/null
 setfattr -n user.seed -v "seedvalue" "$W/src/sub/small.txt" 2>/dev/null || true
@@ -64,21 +59,7 @@ cb repo add "$W/enc" enc --encrypt system >/dev/null
 cb backup 1 "$W/src" >/dev/null
 cb backup 2 "$W/src" >/dev/null
 
-mkdir -p "$CORPUS/fuzz_object" "$CORPUS/fuzz_pack" "$CORPUS/fuzz_manifest"
-
-# Loose objects. These are the incompressible ones the prober left alone, so
-# they are large - too large to keep whole in a corpus, and libFuzzer would
-# refuse them anyway. What matters is the header at the front and the parity
-# trailer at the back, so each contributes both ends as separate seeds and
-# the fuzzer explores outward from each.
-n=0
-for repo in "$W/plain" "$W/enc"; do
-    while IFS= read -r f; do
-        head -c 65536 "$f"        > "$CORPUS/fuzz_object/seed_${n}_head"
-        tail -c 8192  "$f"        > "$CORPUS/fuzz_object/seed_${n}_tail"
-        n=$((n + 1))
-    done < <(find "$repo/objects" -type f 2>/dev/null | head -20)
-done
+mkdir -p "$CORPUS/fuzz_pack" "$CORPUS/fuzz_manifest"
 
 # Pack files. fuzz_pack takes the file as-is; fuzz_pack_read prefixes it
 # with the location the resolver will hand back, and 12 / 0 is the first
@@ -92,25 +73,8 @@ while IFS= read -r f; do
     n=$((n + 1))
 done < <(find "$W/plain/packs" "$W/enc/packs" -name '*.dat' 2>/dev/null)
 
-# The parity stream has no on-disk format to steal, so its seeds are shaped
-# by hand: one per interesting size relative to the 15,296-byte RS group,
-# crossed with a cap that spills and one that does not. The prefix is the
-# memory cap and the three chunk sizes.
-mkdir -p "$CORPUS/fuzz_parity_stream"
-n=0
-for len in 1 4096 15295 15296 15297 30592 45888; do
-    for cap in 0 2 200; do
-        {
-            printf "$(printf '\\%03o' "$cap")"
-            printf '\001\020\377'
-            head -c "$len" /dev/urandom
-        } > "$CORPUS/fuzz_parity_stream/seed_$n"
-        n=$((n + 1))
-    done
-done
-
-# Manifest trees have to come out decoded: on disk they are wrapped in an
-# object header and possibly compressed or encrypted, and fuzz_manifest
+# Manifest trees have to come out decoded: on disk they are pack entries,
+# possibly compressed or encrypted, and fuzz_manifest
 # parses the payload, not the container.
 cb objects 1 --limit 200 2>/dev/null \
   | tr ',' '\n' | grep -o '"hash":"[0-9a-f]*"' | cut -d'"' -f4 > "$W/hashes"

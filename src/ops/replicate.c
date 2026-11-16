@@ -8,6 +8,8 @@
 #include "pack.h"
 #include "read_budget.h"
 #include "object.h"
+#include "object_crypt.h"
+#include "snapshot_ids.h"
 #include "types.h"
 
 #include <cutils/log.h>
@@ -80,49 +82,40 @@ static int hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
 }
 
 /*
- * One object on its way across: the source's stored bytes, exactly as they
- * are (format 3). Streamed, never loaded: the sink pulls pieces into a
- * buffer of its own and this fills them straight from the source file.
+ * One object on its way across: the source's stored bytes, whole. Every
+ * object is bounded (OBJECT_MAX_STORED_BYTES), so it is read in one piece
+ * and handed over in one piece.
  *
- * There is no re-encrypting transform any more. A target under another key
- * has another gear table, so it is always re-chunked (see needs_rechunk),
- * and its objects are written from plaintext under its own key. Copying
- * stored bytes happens only where both repositories cut identically, which
- * means the same key or none, so the stored form is already right for the
- * target.
+ * There is no re-encrypting transform. A target under another key has
+ * another gear table, so it is always re-chunked (see needs_rechunk), and
+ * its objects are written from plaintext under its own key. Copying stored
+ * bytes happens only where both repositories cut identically, which means
+ * the same key or none, and the object key is derived from the repository
+ * key alone, so the stored form is already right for the target.
  */
-typedef struct {
-    object_stored_reader_t *r;
-    const uint8_t          *hash;      /* for messages */
-    atomic_int             *cancel;    /* checked per chunk: one object can take a while */
-} send_src_t;
-
-static status_t src_read_plain(void *vctx, void *buf, size_t n)
-{
-    send_src_t *s = vctx;
-    if (cancel_requested(s->cancel))
-        return set_error(ERR_BUSY, "replicate: cancelled");
-    return object_stored_read(s->r, buf, n);
-}
-
-/* Hand one object over, streamed from the source as stored. */
+/* Hand one object over, as stored. */
 static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
 {
-    /* Zeroed: gcc cannot see that object_stored_open fills it on OK. */
+    if (cancel_requested(c->cancel))
+        return set_error(ERR_BUSY, "replicate: cancelled");
+
     object_stored_info_t info;
     memset(&info, 0, sizeof(info));
-    uint64_t len = 0;
-    send_src_t s;
-    memset(&s, 0, sizeof(s));
-    s.hash = hash;
-    s.cancel = c->cancel;
+    void  *payload = NULL;
+    size_t len = 0;
+    int    damaged = 0;
 
-    /* The sink holds at most a staging chunk of it at once (OWN-26). */
-    uint64_t taken = 0;
-    status_t st = object_stored_open(c->store, hash, &info, &len, &s.r);
-    if (st == OK)
-        taken = read_budget_acquire(len < PACK_STORED_CHUNK_DEFAULT
-                                    ? (len ? len : 1) : PACK_STORED_CHUNK_DEFAULT);
+    /*
+     * Held to the daemon's read budget for as long as the stored bytes are
+     * in memory. The stored size is at most the payload plus the AEAD
+     * overhead, and the index says the payload's before anything is read.
+     */
+    uint64_t taken = 0, psz = 0;
+    status_t st = object_get_info(c->store, hash, &psz, NULL);
+    if (st == OK) {
+        taken = read_budget_acquire(psz + OBJECT_CRYPT_OVERHEAD);
+        st = object_read_stored(c->store, hash, &info, &payload, &len, &damaged);
+    }
     if (st != OK) {
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         hash_hex(hash, hex);
@@ -130,22 +123,23 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
         snprintf(why, sizeof(why), "%s", err_msg());
         return set_error(st, "replicate: cannot read object %s: %s", hex, why);
     }
-    {
+    uint8_t *buf = payload;
+    if (st == OK) {
         replica_object_t obj = {
             .type              = info.type,
             .compression       = info.compression,
             .encryption        = info.encryption,
             .uncompressed_size = info.uncompressed_size,
             .payload_len       = len,
-            .read              = src_read_plain,
-            .read_ctx          = &s,
+            .payload           = buf,
         };
         memcpy(obj.hash, hash, OBJECT_HASH_SIZE);
         st = c->sink->v->put_object(c->sink->ctx, &obj);
     }
+    free(buf);
 
     /* Sent with damage parity could not carry: counted, not fatal here. */
-    if (st == OK && object_stored_damaged(s.r)) {
+    if (st == OK && damaged) {
         replicate_result_t *res = c->res;
         if (res->damaged_listed < REPLICATE_DAMAGED_LIST_MAX) {
             memcpy(res->damaged[res->damaged_listed].hash, hash, OBJECT_HASH_SIZE);
@@ -158,8 +152,6 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
         log_error("replicate: object %s was sent damaged beyond its parity; the "
                   "replica holds it as damaged", hex);
     }
-
-    object_stored_close(s.r);
     if (taken) read_budget_release(taken);
     if (st != OK) return st;
 
@@ -167,7 +159,6 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
     c->res->bytes_sent += len;
     return OK;
 }
-
 /*
  * Everything a chunk list names, leaves first, then the list's sub-lists
  * after their own contents: the same bottom-up promise trees keep. A list
@@ -552,14 +543,17 @@ status_t replicate_tree(store_t *store, replica_sink_t *sink,
 
     replicate_result_t res;
     memset(&res, 0, sizeof(res));
-    status_t st;
-    if (needs_rechunk(store, sink)) {
+    status_t st = OK;
+    /* Objects this handle staged through object_store_ex are sealed first,
+     * so the walk can read every one it reaches. */
+    st = object_store_flush(store);
+    if (st == OK && needs_rechunk(store, sink)) {
         rc_ctx_t r = { .store = store, .sink = sink, .cancel = cancel, .res = &res,
                        .tcdc = sink->v->target_cdc(sink->ctx) };
         res.rechunked = 1;
         st = rc_tree(&r, root_tree_hash, 0, res.target_root);
         free(r.memo);
-    } else {
+    } else if (st == OK) {
         walk_ctx_t c = { .store = store, .sink = sink, .cancel = cancel, .res = &res };
         st = walk_tree(&c, root_tree_hash, 0);
         memcpy(res.target_root, root_tree_hash, OBJECT_HASH_SIZE);
@@ -710,6 +704,29 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     db_result_free(snaps);
     free(rc.memo);
     if (out) *out = res;
+
+    /* The source's mark, carried across once its snapshots are, so the
+     * replica never sits below it (rule 3 of snapshot_ids.h). Taken from
+     * the source repository's file and its index together: either alone
+     * may lag the other after a lost database or a damaged file. */
+    if (st == OK && sink->v->raise_snapshot_ids) {
+        int64_t mark = 0;
+        if (snapshot_ids_read_repo(store_root(store), &mark) != OK) {
+            log_warn("replicate: source mark unreadable (%s); using the index", err_msg());
+            err_clear();
+            mark = 0;
+        }
+        db_result_t *r = NULL;
+        if (db_execute(db,
+                "SELECT MAX(COALESCE((SELECT last_id FROM snapshot_id_seq WHERE repo_id = ?), 0),"
+                "           COALESCE((SELECT MAX(id) FROM snapshots WHERE repo_id = ?), 0))",
+                (const char *[]){ repo, repo, NULL }, &r) == 0 && r && r->nrows == 1) {
+            int64_t idx = strtoll(r->rows[0][0], NULL, 10);
+            if (idx > mark) mark = idx;
+        }
+        db_result_free(r);
+        st = sink->v->raise_snapshot_ids(sink->ctx, mark);
+    }
 
     /*
      * Everything else went across and the snapshots are recorded, which is

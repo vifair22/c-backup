@@ -51,8 +51,8 @@ export type VerifyLevel = 'index' | 'structure' | 'deep'
  * disagree, and so each one is a `kind` the contract suite already proves
  * reaches a real route.
  */
-export type MaintenanceOp = 'verify' | 'pack' | 'gc' | 'gfs' | 'reindex'
-export type ObjectLocation = 'loose' | 'packed'
+export type MaintenanceOp = 'verify' | 'gc' | 'gfs' | 'reindex'
+export type ObjectLocation = 'staged' | 'packed'
 
 export type ApiRequest =
   /* --- repositories --- */
@@ -101,7 +101,6 @@ export type ApiRequest =
   | { kind: 'verifyFindings'; repoId: number; runId: number }
   | { kind: 'gc'; repoId: number; dryRun?: boolean }
   | { kind: 'gfs'; repoId: number; dryRun?: boolean }
-  | { kind: 'pack'; repoId: number }
   | { kind: 'reindex'; repoId: number }
 
   /* --- introspection --- */

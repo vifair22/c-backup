@@ -15,11 +15,11 @@
  * nonce covered by the wrong parity bytes. Both would have died here on the
  * first input.
  *
- * The fuzzer picks the payload and the route it takes: buffered or streamed
- * from a file descriptor, loose or packed, encrypted or not, and how
- * compressible the bytes are. Those choices are what select between codecs
- * and between the small and large writers, so they matter more than the
- * payload content does.
+ * The fuzzer picks the payload and the route it takes: buffered or read
+ * whole from a file descriptor, read back from the open pack writer or
+ * after an explicit seal, encrypted or not, and how compressible the bytes
+ * are. Those choices are what select between codecs and writers, so they
+ * matter more than the payload content does.
  *
  * Input layout: flags(1) + type(1) + size multiplier(1) + payload seed.
  */
@@ -48,14 +48,13 @@
 /*
  * Above the 64 KiB incompressible probe by a wide enough margin to cross it
  * repeatedly, and small enough that an input still runs in milliseconds. The
- * thresholds at 16 MiB - the streaming load, the frame codec, the pack size
- * cutoff - are out of reach at this speed and belong to the cmocka suites,
- * which build fixtures that big deliberately.
+ * 16 MiB object bound is out of reach at this speed and belongs to the
+ * cmocka suites, which build fixtures that big deliberately.
  */
 #define MAX_PAYLOAD (1u << 20)
 
 #define F_ENCRYPTED  0x01u
-#define F_PACK       0x02u
+#define F_FLUSH      0x02u
 #define F_VIA_FD     0x04u
 #define F_SCRAMBLE   0x08u
 
@@ -116,22 +115,6 @@ static uint8_t *build_payload(const uint8_t *seed, size_t seed_len,
     return buf;
 }
 
-/* What the loose object on disk says it is. Returns 0 if it could not be
- * read - after packing there is no loose file, which is not a failure. */
-static int read_loose_header(const uint8_t hash[OBJECT_HASH_SIZE],
-                             object_header_t *out)
-{
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    object_hash_to_hex(hash, hex);
-    char path[512];
-    snprintf(path, sizeof(path), "%s/objects/%.2s/%s", FUZZ_ROOT, hex, hex + 2);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    ssize_t got = read(fd, out, sizeof(*out));
-    close(fd);
-    return got == (ssize_t)sizeof(*out);
-}
-
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
@@ -149,9 +132,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     size_t total = seed_len * mult;
     if (total > MAX_PAYLOAD) total = MAX_PAYLOAD;
 
-    /* The type byte reaches the header either way, but a type the writer
-     * has never emitted tells us nothing the reader half has not already
-     * been asked. Keep it in range so the interesting variable is the data. */
+    /* Kept near the known types, so most inputs store and the few that do
+     * not check that an unknown type is refused rather than written. */
     type = (uint8_t)(type % 8u);
 
     int keyed = (flags & F_ENCRYPTED) != 0;
@@ -162,18 +144,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     uint8_t hash[OBJECT_HASH_SIZE];
     status_t st;
+    /* What the object is stored as: the file writer always stores FILE. */
+    uint8_t stored_type = (flags & F_VIA_FD) ? (uint8_t)OBJECT_TYPE_FILE : type;
 
     if (flags & F_VIA_FD) {
-        /* The streaming writer, which is a different function from the
-         * buffered one and the only one a real backup uses for files. */
+        /* The file writer, which reads the descriptor itself and is the one
+         * a real backup uses for files below the bound. */
         char tmpl[] = FUZZ_ROOT "/src.XXXXXX";
         int fd = mkstemp(tmpl);
         if (fd < 0) { free(payload); return 0; }
         if (write(fd, payload, total) != (ssize_t)total) {
             close(fd); unlink(tmpl); free(payload); return 0;
         }
-        lseek(fd, 0, SEEK_SET);
-        st = object_store_file(g_store, fd, total, hash);
+        object_write_t wi;
+        st = object_store_file_packed(g_store, fd, total, NULL, hash, &wi);
+        if (st == OK && wi.payload_size != total) abort();
         close(fd);
         unlink(tmpl);
     } else {
@@ -186,6 +171,29 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         free(payload);
         return 0;
     }
+    if (!object_type_known(stored_type)) abort();
+
+    /* The name is SHA-256 of the type byte and the payload, whichever
+     * writer produced it. */
+    uint8_t want_name[OBJECT_HASH_SIZE];
+    object_name(stored_type, payload, total, want_name);
+    if (memcmp(hash, want_name, sizeof(hash)) != 0) abort();
+    if (!object_exists(g_store, hash)) abort();
+
+    /* Storing the same bytes again must produce the same name, and must
+     * not store a second copy. */
+    uint8_t hash2[OBJECT_HASH_SIZE];
+    int is_new = -1;
+    if (object_store_ex(g_store, stored_type, payload, total, hash2, &is_new, NULL) != OK)
+        abort();
+    if (memcmp(hash, hash2, sizeof(hash)) != 0) abort();
+    if (is_new != 0) abort();
+
+    /* Either sealed here, or by the first read below: both must work. */
+    if (flags & F_FLUSH) {
+        if (object_store_flush(g_store) != OK) abort();
+        pack_cache_invalidate(g_store);
+    }
 
     /*
      * The header has to say the object is encrypted when the store has a
@@ -194,23 +202,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
      * unencrypted repository holds. Encryption was inert for a week behind
      * exactly that.
      */
-    object_header_t oh;
-    if (read_loose_header(hash, &oh)) {
-        if (keyed && oh.encryption != ENCRYPT_CHACHA20) abort();
-        if (!keyed && oh.encryption != ENCRYPT_NONE) abort();
-    }
-
-    /* Storing the same bytes again must produce the same name. */
-    uint8_t hash2[OBJECT_HASH_SIZE];
-    if (object_store(g_store, type, payload, total, hash2) == OK &&
-        (flags & F_VIA_FD) == 0 &&
-        memcmp(hash, hash2, sizeof(hash)) != 0)
-        abort();
-    err_clear();
-
-    if (flags & F_PACK) {
-        if (repo_pack(g_store, NULL, NULL, NULL) != OK) err_clear();
-        pack_cache_invalidate(g_store);
+    {
+        object_stored_info_t si;
+        void  *sp = NULL;
+        size_t sn = 0;
+        int    damaged = 0;
+        if (object_read_stored(g_store, hash, &si, &sp, &sn, &damaged) != OK) abort();
+        if (damaged) abort();
+        if (si.type != stored_type) abort();
+        if (si.uncompressed_size != total) abort();
+        if (keyed && si.encryption != ENCRYPT_CHACHA20) abort();
+        if (!keyed && si.encryption != ENCRYPT_NONE) abort();
+        free(sp);
     }
 
     /* Buffered read. */
@@ -219,44 +222,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     uint8_t got_type = 0;
     if (object_load(g_store, hash, &out, &got, &got_type) != OK) abort();
     if (got != total) abort();
+    if (got_type != stored_type) abort();
     if (total && memcmp(out, payload, total) != 0) abort();
     free(out);
-
-    /* Streamed read, which decompresses and decrypts through a different
-     * path than the buffered one and has its own offset arithmetic. */
-    {
-        char tmpl[] = FUZZ_ROOT "/out.XXXXXX";
-        int fd = mkstemp(tmpl);
-        if (fd >= 0) {
-            uint64_t ssz = 0;
-            if (object_load_stream(g_store, hash, fd, &ssz, NULL) != OK) abort();
-            if (ssz != total) abort();
-            if (total) {
-                uint8_t *back = malloc(total);
-                if (back) {
-                    if (pread(fd, back, total, 0) != (ssize_t)total) abort();
-                    if (memcmp(back, payload, total) != 0) abort();
-                    free(back);
-                }
-            }
-            close(fd);
-            unlink(tmpl);
-        }
-    }
-
-    /* Prefix read: the partial decompressor, which stops early and so gets
-     * its lengths from somewhere the full read does not. */
-    {
-        size_t want = total < 4096 ? total : 4096;
-        void *pre = NULL; size_t pn = 0; uint64_t full = 0;
-        if (object_load_prefix(g_store, hash, want, &pre, &pn, &full, NULL) == OK) {
-            if (full != total) abort();
-            if (pn > want) abort();
-            if (pn && memcmp(pre, payload, pn) != 0) abort();
-            free(pre);
-        }
-        err_clear();
-    }
 
     /* Size and type without touching the payload. */
     {
@@ -264,6 +232,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         uint8_t  ity = 0;
         if (object_get_info(g_store, hash, &isz, &ity) != OK) abort();
         if (isz != total) abort();
+        if (ity != stored_type) abort();
     }
 
     free(payload);

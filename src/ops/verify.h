@@ -46,7 +46,7 @@ typedef struct {
     uint64_t recoverable;
     /* Damaged beyond what parity can reconstruct. These are data loss. */
     uint64_t unrecoverable;
-    /* Registered but absent: no loose file, no pack entry. */
+    /* Registered but absent: no pack entry, or its pack file is gone. */
     uint64_t missing;
     uint64_t bytes_read;
     /* Blast radius of everything unrecoverable or missing: distinct file

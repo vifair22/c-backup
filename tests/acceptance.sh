@@ -214,10 +214,14 @@ check D1 "whole snapshot restores identical ($((MS/1000)) s)" \
 timed cb restore "$D_ID" 3 "$WORK/restore/sub" --subpath "$S/xattr.txt"
 check D2 "subpath restores only its file" bash -c "[ -f '$WORK/restore/sub$S/xattr.txt' ] && [ ! -e '$WORK/restore/sub$S/data.bin' ]"
 R="$WORK/restore/full$S"
-check D3 "modes, mtimes, links, sparse, fifo, xattr" bash -c "
+# The sparse file must come back with the same bytes and its holes still
+# holes: under half its size allocated.
+check D3 "modes, mtimes, links, sparse contents, fifo, xattr" bash -c "
   [ \"\$(stat -c %a:%Y '$S/data.bin')\" = \"\$(stat -c %a:%Y '$R/data.bin')\" ] &&
   [ -L '$R/symlink' ] && [ \"\$(stat -c %i '$R/link-a')\" = \"\$(stat -c %i '$R/link-b')\" ] &&
-  [ \$(( \$(stat -c %b '$R/sparse.img') * 512 )) -lt 33554432 ] && [ -p '$R/fifo' ] &&
+  cmp -s '$S/sparse.img' '$R/sparse.img' &&
+  [ \$(( \$(stat -c %b '$R/sparse.img') * 512 )) -lt \$(( 32 * 1024 * 1024 )) ] &&
+  [ -p '$R/fifo' ] &&
   { ! command -v getfattr >/dev/null || getfattr -n user.cbackup '$R/xattr.txt' 2>/dev/null | grep -q acceptance; }"
 timed cb restore "$D_ID" 3 "$WORK/restore/full"
 check D4 "restoring again skips what exists" grep -q '"state":"completed"' <<<"$OUT"
@@ -240,8 +244,13 @@ timed cb verify "$D_ID" --level deep
 check E5 "second deep verify clean" bash -c "echo \"\$0\" | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"runs\"][0]; sys.exit(0 if r[\"repaired\"]==0 and r[\"unrecoverable\"]==0 else 1)'" "$OUT"
 
 # ---- F. Maintenance -------------------------------------------------------------
-timed cb pack "$D_ID"
-check F1 "pack" grep -q '"state":"completed"' <<<"$OUT"
+# There is no pack job: every object is written into a pack as it is
+# stored, so after the backups above nothing is staged and nothing lives
+# outside packs/.
+timed cb summary "$D_ID"
+check F1 "every object is in a pack (none staged, no objects/)" bash -c "
+  [ \"\$(echo \"\$0\" | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"staged\"])')\" = 0 ] &&
+  [ ! -e '$WORK/repo-d/objects' ]" "$OUT"
 timed cb gc "$D_ID"
 check F2 "gc" grep -q '"state":"completed"' <<<"$OUT"
 cb policy set "$D_ID" retention.keep_snaps 100 >/dev/null
@@ -311,7 +320,7 @@ check I5 "metrics" grep -q cbackup_last_snapshot_age_seconds <<<"$OUT"
 
 # ---- J. Encryption ------------------------------------------------------------------
 cb backup "$E_ID" "$S" >/dev/null
-check J1 "encrypted backup has no plaintext on disk" bash -c "! grep -rqa 'linked' '$WORK/repo-enc/packs' '$WORK/repo-enc/objects'"
+check J1 "encrypted backup has no plaintext on disk" bash -c "! grep -rqa 'linked' '$WORK/repo-enc/packs'"
 timed cb restore "$E_ID" 1 "$WORK/restore/enc"
 check J2 "encrypted round trip" cmp -s "$S/data.bin" "$WORK/restore/enc$S/data.bin"
 timed cb repo key export "$E_ID"

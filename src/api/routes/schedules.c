@@ -175,7 +175,7 @@ static int one_of(const char *v, const char *const *set)
 static const char *const k_overlap[] = { "skip", "queue", "cancel_running", NULL };
 static const char *const k_catchup[] = { "skip", "run_once", NULL };
 
-#define SCHEDULABLE_ACTIONS "backup, verify, grep, gc, gfs, reindex, pack or replicate"
+#define SCHEDULABLE_ACTIONS "backup, verify, grep, gc, gfs, reindex or replicate"
 
 /*
  * What is wrong with a stored schedule by the rules the route applies to a

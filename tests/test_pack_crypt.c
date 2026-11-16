@@ -1,30 +1,28 @@
 #define _POSIX_C_SOURCE 200809L
 
 /*
- * Packing an encrypted repository.
+ * Objects in an encrypted repository.
  *
- * Loose objects are stored raw and encrypted; compression only happens at
- * pack time. So packing an encrypted repository is decrypt, compress,
- * re-encrypt, and each of those three has a way to be silently wrong:
+ * Every object is compressed, encrypted and parity-protected in one shot as
+ * it is staged into a pack, in that order, and each step has a way to be
+ * silently wrong:
  *
  *   - the prober measures entropy to decide whether an object is worth
  *     compressing. Ciphertext is indistinguishable from random, so a prober
- *     that forgets to decrypt finds everything incompressible, skip-marks it
- *     all, and an encrypted repository quietly never packs anything. Nothing
- *     fails; the packer just stops working.
+ *     that ran after encryption would find everything incompressible and an
+ *     encrypted repository would quietly never compress anything. Nothing
+ *     fails; it just stores more.
  *
- *   - compressing after encrypting instead of before would produce entries
- *     that are larger than the plaintext, again with nothing failing.
+ *   - compressing after encrypting instead of before would likewise produce
+ *     entries no smaller than the plaintext, again with nothing failing.
  *
- *   - the pack must draw its own nonce rather than reusing the loose
- *     object's. The same object is stored twice in an encrypted repository -
- *     raw while loose, compressed once packed - and a stream cipher run twice
- *     under one key and nonce over two different plaintexts leaks both
- *     without the key being involved at all.
+ *   - every encryption must draw its own nonce, and the ciphertext must be
+ *     bound to the name and type it is filed under (the AAD), so bytes moved
+ *     under another name fail authentication instead of decrypting as
+ *     something they are not.
  *
- * Each codec is exercised through both read paths, because the entry layout
- * (nonce, ciphertext, tag) has to survive the buffered reader, the streaming
- * reader, and the prefix reader, which stops before the tag it cannot check.
+ * Each object is read back through the decoding reader and, where it says
+ * something, the stored-form reader, which needs no key.
  */
 
 #include <setjmp.h>
@@ -52,8 +50,8 @@
 
 #define TEST_REPO TEST_TMP "/c_backup_test_pack_crypt"
 
-/* Above the block-codec threshold, so the frame codec is used. */
-#define FRAME_SIZE (17u * 1024u * 1024u)
+/* A file of several MiB, well inside the object bound. */
+#define LARGE_SIZE (6u * 1024u * 1024u)
 
 static store_t *store;
 static repo_key_t key;
@@ -114,13 +112,13 @@ static int find_pack_dat(char *out, size_t cap)
     return out[0] ? 0 : -1;
 }
 
-/* Store a buffer as a loose object and hand back its hash. */
+/* Stage a buffer through the store's own writer and hand back its hash. */
 static void store_obj(const uint8_t *buf, size_t n, uint8_t hash[OBJECT_HASH_SIZE])
 {
     assert_int_equal(object_store(store, OBJECT_TYPE_FILE, buf, n, hash), OK);
 }
 
-/* Store from a file, which is the path large objects take. */
+/* Store from a file, the path a backup's files take. */
 static void store_file(const uint8_t *buf, size_t n, uint8_t hash[OBJECT_HASH_SIZE])
 {
     char path[] = TEST_TMP "/c_backup_pack_crypt_src.XXXXXX";
@@ -128,7 +126,7 @@ static void store_file(const uint8_t *buf, size_t n, uint8_t hash[OBJECT_HASH_SI
     assert_true(fd >= 0);
     assert_int_equal(write(fd, buf, n), (ssize_t)n);
     assert_int_equal(lseek(fd, 0, SEEK_SET), 0);
-    assert_int_equal(object_store_file(store, fd, n, hash), OK);
+    assert_int_equal(object_store_file_packed(store, fd, n, NULL, hash, NULL), OK);
     close(fd);
     unlink(path);
 }
@@ -144,37 +142,22 @@ static void assert_buffered_read_matches(const uint8_t hash[OBJECT_HASH_SIZE],
     free(out);
 }
 
-static void assert_stream_read_matches(const uint8_t hash[OBJECT_HASH_SIZE],
-                                       const uint8_t *expect, size_t len)
+/* The entry as stored: read without the key, checked against its parity. */
+static object_stored_info_t stored_info(const uint8_t hash[OBJECT_HASH_SIZE], size_t *out_len,
+                                        uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES])
 {
-    char out[] = TEST_TMP "/c_backup_pack_crypt_stream.XXXXXX";
-    int fd = mkstemp(out);
-    assert_true(fd >= 0);
-
-    uint64_t ssz = 0;
-    assert_int_equal(object_load_stream(store, hash, fd, &ssz, NULL), OK);
-    assert_int_equal(ssz, len);
-
-    uint8_t *got = malloc(len);
-    assert_non_null(got);
-    assert_int_equal(pread(fd, got, len, 0), (ssize_t)len);
-    assert_memory_equal(got, expect, len);
-    free(got);
-    close(fd);
-    unlink(out);
-}
-
-static void assert_prefix_read_matches(const uint8_t hash[OBJECT_HASH_SIZE],
-                                       const uint8_t *expect, size_t want)
-{
-    void *out = NULL;
-    size_t got = 0;
-    uint64_t full = 0;
-    assert_int_equal(object_load_prefix(store, hash, want, &out, &got, &full, NULL), OK);
-    assert_true(got > 0);
-    assert_true(got <= want);
-    assert_memory_equal(out, expect, got);
-    free(out);
+    object_stored_info_t info;
+    memset(&info, 0, sizeof(info));
+    void *payload = NULL;
+    size_t len = 0;
+    int damaged = -1;
+    assert_int_equal(object_read_stored(store, hash, &info, &payload, &len, &damaged), OK);
+    assert_int_equal(damaged, 0);
+    assert_true(len >= OBJECT_CRYPT_OVERHEAD);
+    if (nonce) memcpy(nonce, payload, OBJECT_CRYPT_NONCE_BYTES);
+    if (out_len) *out_len = len;
+    free(payload);
+    return info;
 }
 
 /* Nothing legible anywhere in any pack file. */
@@ -202,45 +185,9 @@ static void assert_no_plaintext_in_packs(const uint8_t *needle, size_t n)
 
 /*
  * The one that matters most: a compressible object in an encrypted
- * repository must still compress. If the prober sees ciphertext it marks the
- * object incompressible and it never packs at all, so this asserts both that
- * it packed and that packing made it smaller.
+ * repository must still compress, so the entry has to come out smaller than
+ * the plaintext, nonce and tag included.
  */
-/*
- * A prefix read of an encrypted object that has not been packed.
- *
- * Every other assertion in this file packs first, and the packed prefix
- * reader decrypts correctly. The loose one did not: it read the payload
- * straight off disk on the strength of a comment saying loose objects are
- * uncompressed - which is still true - and handed the caller ciphertext
- * with an OK status and the right length. A prefix read is exactly the path
- * that skips the SHA-256 check, so nothing downstream would have noticed.
- *
- * Nothing in the daemon calls object_load_prefix today, which is the only
- * reason this never shipped as a browse route serving 4 KiB of noise.
- *
- * Found by fuzz_roundtrip on its first input.
- */
-static void test_prefix_read_of_a_loose_object_decrypts(void **state)
-{
-    (void)state;
-    enum { N = 8192 };
-    uint8_t *buf = malloc(N);
-    assert_non_null(buf);
-    fill_compressible(buf, N);
-
-    uint8_t hash[OBJECT_HASH_SIZE];
-    store_obj(buf, N, hash);
-
-    /* Deliberately no repo_pack: this is the loose reader. */
-    assert_prefix_read_matches(hash, buf, 4096);
-
-    /* And the whole object, so a prefix that matched by returning nothing
-     * useful still has to agree with the full read. */
-    assert_buffered_read_matches(hash, buf, N);
-    free(buf);
-}
-
 static void test_compressible_object_still_compresses(void **state)
 {
     (void)state;
@@ -251,19 +198,20 @@ static void test_compressible_object_still_compresses(void **state)
 
     uint8_t hash[OBJECT_HASH_SIZE];
     store_obj(buf, N, hash);
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, 1);
+    assert_int_equal(object_store_flush(store), OK);
+    assert_int_equal((int)fake_index_count(), 1);
 
-    /* The entry has to be smaller than the plaintext, tag and nonce
-     * included, or compression did not happen. */
     uint64_t phys = 0;
     assert_int_equal(object_physical_size(store, hash, &phys, NULL), OK);
     assert_true(phys < N / 2);
 
+    size_t slen = 0;
+    object_stored_info_t info = stored_info(hash, &slen, NULL);
+    assert_int_equal(info.compression, COMPRESS_LZ4);
+    assert_int_equal(info.encryption, ENCRYPT_CHACHA20);
+    assert_int_equal(info.uncompressed_size, N);
+
     assert_buffered_read_matches(hash, buf, N);
-    assert_stream_read_matches(hash, buf, N);
-    assert_prefix_read_matches(hash, buf, 4096);
     assert_no_plaintext_in_packs(buf, 4096);
     free(buf);
 }
@@ -279,90 +227,151 @@ static void test_incompressible_object_roundtrips(void **state)
 
     uint8_t hash[OBJECT_HASH_SIZE];
     store_obj(buf, N, hash);
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, 1);
+    assert_int_equal(object_store_flush(store), OK);
+    assert_int_equal((int)fake_index_count(), 1);
+
+    /* Raw, so the stored bytes are the plaintext's length plus nonce and tag. */
+    size_t slen = 0;
+    object_stored_info_t info = stored_info(hash, &slen, NULL);
+    assert_int_equal(info.compression, COMPRESS_NONE);
+    assert_int_equal(info.encryption, ENCRYPT_CHACHA20);
+    assert_int_equal(slen, (size_t)N + OBJECT_CRYPT_OVERHEAD);
 
     assert_buffered_read_matches(hash, buf, N);
-    assert_stream_read_matches(hash, buf, N);
-    assert_prefix_read_matches(hash, buf, 4096);
     assert_no_plaintext_in_packs(buf, 4096);
     free(buf);
 }
 
-/*
- * Large enough for the frame codec and the streaming writer, which runs two
- * cipher streams at once - one decrypting the loose object, one encrypting
- * what LZ4 produces.
- */
-static void test_frame_codec_object_roundtrips(void **state)
+/* A multi-MiB file stored from its descriptor compresses and encrypts the
+ * same way. */
+static void test_large_file_roundtrips(void **state)
 {
     (void)state;
-    uint8_t *buf = malloc(FRAME_SIZE);
+    uint8_t *buf = malloc(LARGE_SIZE);
     assert_non_null(buf);
-    fill_compressible(buf, FRAME_SIZE);
+    fill_compressible(buf, LARGE_SIZE);
 
     uint8_t hash[OBJECT_HASH_SIZE];
-    store_file(buf, FRAME_SIZE, hash);
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, 1);
+    store_file(buf, LARGE_SIZE, hash);
+    assert_int_equal(object_store_flush(store), OK);
+    assert_int_equal((int)fake_index_count(), 1);
 
     uint64_t phys = 0;
     assert_int_equal(object_physical_size(store, hash, &phys, NULL), OK);
-    assert_true(phys < FRAME_SIZE / 2);
+    assert_true(phys < LARGE_SIZE / 2);
 
-    assert_stream_read_matches(hash, buf, FRAME_SIZE);
-    assert_prefix_read_matches(hash, buf, 4096);
+    assert_buffered_read_matches(hash, buf, LARGE_SIZE);
     assert_no_plaintext_in_packs(buf, 4096);
     free(buf);
 }
 
 /*
- * The nonce a pack entry carries must not be the one its loose object used.
- * Reusing it would put the raw plaintext and the compressed plaintext under
- * one key stream, and XORing the two ciphertexts would then cancel the key
- * out entirely - the one mistake a stream cipher does not survive.
- *
- * Checked by storing the object, copying the nonce off the loose file,
- * packing, and looking for those twelve bytes in the pack.
+ * Every encryption draws its own nonce. Two objects under one key and one
+ * nonce would put two plaintexts under one key stream, and XORing the
+ * ciphertexts would cancel the key out entirely - the one mistake a stream
+ * cipher does not survive. Identical plaintexts in two objects of different
+ * types are the case a derived nonce would get wrong.
  */
-static void test_pack_draws_its_own_nonce(void **state)
+static void test_every_entry_draws_its_own_nonce(void **state)
 {
     (void)state;
-    enum { N = 512 * 1024 };
-    uint8_t *buf = malloc(N);
-    assert_non_null(buf);
+    enum { N = 4096, COUNT = 16 };
+    uint8_t buf[N];
     fill_compressible(buf, N);
+    uint8_t hashes[COUNT][OBJECT_HASH_SIZE];
+    for (int i = 0; i < COUNT; i++) {
+        /* Half share one plaintext, as two types; half are distinct. */
+        uint8_t type = (i % 2) ? OBJECT_TYPE_XATTR : OBJECT_TYPE_FILE;
+        if (i >= 2) memcpy(buf, &i, sizeof(i));
+        assert_int_equal(object_store(store, type, buf, N, hashes[i]), OK);
+    }
+    assert_int_equal(object_store_flush(store), OK);
 
-    uint8_t hash[OBJECT_HASH_SIZE];
-    store_obj(buf, N, hash);
+    uint8_t nonces[COUNT][OBJECT_CRYPT_NONCE_BYTES];
+    for (int i = 0; i < COUNT; i++)
+        (void)stored_info(hashes[i], NULL, nonces[i]);
+    for (int i = 0; i < COUNT; i++)
+        for (int j = i + 1; j < COUNT; j++)
+            assert_memory_not_equal(nonces[i], nonces[j], OBJECT_CRYPT_NONCE_BYTES);
+}
 
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    object_hash_to_hex(hash, hex);
-    char loose[512];
-    snprintf(loose, sizeof(loose), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
-    int fd = open(loose, O_RDONLY);
-    assert_true(fd >= 0);
-    uint8_t loose_nonce[OBJECT_CRYPT_NONCE_BYTES];
-    assert_int_equal(pread(fd, loose_nonce, sizeof(loose_nonce),
-                           (off_t)sizeof(object_header_t)),
-                     (ssize_t)sizeof(loose_nonce));
-    close(fd);
+/*
+ * The ciphertext is bound to the name and type it is filed under. The stored
+ * bytes of one object, written verbatim under another name - or under its own
+ * name with another type - must fail authentication rather than decrypt: the
+ * AAD is what stops a damaged or hostile index serving one object's bytes as
+ * another's.
+ */
+static void test_ciphertext_is_bound_to_its_name_and_type(void **state)
+{
+    (void)state;
+    const char *a = "the bytes that belong to object a";
+    const char *b = "object b, which a must not impersonate";
+    uint8_t ha[OBJECT_HASH_SIZE], hb[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, a, strlen(a), ha), OK);
+    object_name(OBJECT_TYPE_FILE, b, strlen(b), hb);
+    assert_int_equal(object_store_flush(store), OK);
 
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, 1);
+    object_stored_info_t info;
+    memset(&info, 0, sizeof(info));
+    void *payload = NULL;
+    size_t len = 0;
+    assert_int_equal(object_read_stored(store, ha, &info, &payload, &len, NULL), OK);
 
-    assert_no_plaintext_in_packs(loose_nonce, sizeof(loose_nonce));
-    free(buf);
+    /* A's stored bytes, verbatim, under B's name. */
+    pack_stored_writer_t *w = NULL;
+    assert_int_equal(pack_stored_open(store, &w), OK);
+    assert_int_equal(pack_stored_add(w, hb, info.type, info.compression, info.encryption,
+                                     info.uncompressed_size, payload, len), OK);
+    assert_int_equal(pack_stored_finish(w, NULL), OK);
+
+    void *out = NULL;
+    size_t got = 0;
+    assert_int_equal(object_load(store, hb, &out, &got, NULL), ERR_CORRUPT);
+    assert_null(out);
+
+    /* The same bytes under their own name but another type: rebuild the
+     * repository with only that entry, so A's name resolves to it. */
+    store_close(store);
+    store = NULL;
+    cleanup();
+    assert_int_equal(store_init_dirs(TEST_REPO), OK);
+    assert_int_equal(store_open(TEST_REPO, NULL, &store), OK);
+    store_set_key(store, &key);
+    fake_index_reset();
+    fake_index_attach(store);
+    assert_int_equal(pack_stored_open(store, &w), OK);
+    assert_int_equal(pack_stored_add(w, ha, OBJECT_TYPE_ACL, info.compression,
+                                     info.encryption, info.uncompressed_size,
+                                     payload, len), OK);
+    assert_int_equal(pack_stored_finish(w, NULL), OK);
+    assert_int_equal(object_load(store, ha, &out, &got, NULL), ERR_CORRUPT);
+    assert_null(out);
+
+    /* And filed correctly, the same bytes decrypt: the refusals are about
+     * the binding, not the bytes. */
+    store_close(store);
+    store = NULL;
+    cleanup();
+    assert_int_equal(store_init_dirs(TEST_REPO), OK);
+    assert_int_equal(store_open(TEST_REPO, NULL, &store), OK);
+    store_set_key(store, &key);
+    fake_index_reset();
+    fake_index_attach(store);
+    assert_int_equal(pack_stored_open(store, &w), OK);
+    assert_int_equal(pack_stored_add(w, ha, info.type, info.compression,
+                                     info.encryption, info.uncompressed_size,
+                                     payload, len), OK);
+    assert_int_equal(pack_stored_finish(w, NULL), OK);
+    assert_buffered_read_matches(ha, (const uint8_t *)a, strlen(a));
+    free(payload);
 }
 
 /*
  * Parity covers the stored bytes - nonce, ciphertext and tag - so a scrub of
  * an offsite copy needs no key. Verified by dropping the key and checking
- * that the packed entry still reads back byte-identically as far as the CRC
- * is concerned, while the plaintext stays unavailable.
+ * that the stored entry still reads back clean against its CRC, while the
+ * plaintext stays unavailable.
  */
 static void test_packed_entry_is_unreadable_without_the_key(void **state)
 {
@@ -374,14 +383,18 @@ static void test_packed_entry_is_unreadable_without_the_key(void **state)
 
     uint8_t hash[OBJECT_HASH_SIZE];
     store_obj(buf, N, hash);
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, 1);
+    assert_int_equal(object_store_flush(store), OK);
 
     store_set_key(store, NULL);
     void *out = NULL;
     size_t got = 0;
     assert_int_not_equal(object_load(store, hash, &out, &got, NULL), OK);
+    assert_null(out);
+
+    /* The stored form needs no key, and its parity check passes. */
+    size_t slen = 0;
+    object_stored_info_t info = stored_info(hash, &slen, NULL);
+    assert_int_equal(info.encryption, ENCRYPT_CHACHA20);
 
     /* Size and type come from the entry header, which is not encrypted, so a
      * keyless scrub can still walk the pack and account for what is in it. */
@@ -414,13 +427,12 @@ static void test_many_objects_in_one_pack(void **state)
         store_obj(bufs[i], N, hashes[i]);
     }
 
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, COUNT);
+    assert_int_equal(object_store_flush(store), OK);
+    assert_int_equal((int)fake_index_count(), COUNT);
 
     for (int i = 0; i < COUNT; i++) {
         assert_buffered_read_matches(hashes[i], bufs[i], N);
-        assert_stream_read_matches(hashes[i], bufs[i], N);
+        (void)stored_info(hashes[i], NULL, NULL);
         free(bufs[i]);
     }
 
@@ -433,11 +445,11 @@ int main(void)
 {
     rs_init();
     const struct CMUnitTest tests[] = {
-        cmocka_unit_test_setup_teardown(test_prefix_read_of_a_loose_object_decrypts, setup, teardown),
         cmocka_unit_test_setup_teardown(test_compressible_object_still_compresses, setup, teardown),
         cmocka_unit_test_setup_teardown(test_incompressible_object_roundtrips, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_frame_codec_object_roundtrips, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_pack_draws_its_own_nonce, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_large_file_roundtrips, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_every_entry_draws_its_own_nonce, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_ciphertext_is_bound_to_its_name_and_type, setup, teardown),
         cmocka_unit_test_setup_teardown(test_packed_entry_is_unreadable_without_the_key, setup, teardown),
         cmocka_unit_test_setup_teardown(test_many_objects_in_one_pack, setup, teardown),
     };

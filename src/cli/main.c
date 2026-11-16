@@ -1056,12 +1056,6 @@ static int cmd_replicate(int argc, char **argv)
     return rc;
 }
 
-static int cmd_pack(int argc, char **argv)
-{
-    int nw = take_flag(&argc, argv, "--no-wait");
-    return maintenance("pack", argc, argv, NULL, nw);
-}
-
 /*
  * Scrub, wait, and say what was found.
  *
@@ -1175,13 +1169,14 @@ static int cmd_verify(int argc, char **argv)
 
 static int cmd_stats(int argc, char **argv)
 {
-    /* ?scope=loose had no flag (B084 audit). Only "loose" narrows; anything
-     * else is refused here rather than sent and silently ignored. */
+    /* Only "staged" narrows (objects in a pack a running backup has not
+     * sealed); anything else is refused here rather than sent and silently
+     * ignored. */
     const char *scope = take_opt(&argc, argv, "--scope");
-    if (argc < 1) return fail("usage: stats <repo-id> [--scope loose]");
-    if (scope && strcmp(scope, "loose") != 0)
-        return fail("--scope takes 'loose', not '%s'", scope);
-    return get_repo_scoped(argv[0], "/stats", scope ? "scope=loose" : NULL);
+    if (argc < 1) return fail("usage: stats <repo-id> [--scope staged]");
+    if (scope && strcmp(scope, "staged") != 0)
+        return fail("--scope takes 'staged', not '%s'", scope);
+    return get_repo_scoped(argv[0], "/stats", scope ? "scope=staged" : NULL);
 }
 
 static int cmd_summary(int argc, char **argv)
@@ -1202,7 +1197,7 @@ static int cmd_objects(int argc, char **argv)
     sbuf_t q = { 0 };
     paging(&argc, argv, &q);
     if (loc) { sb_puts(&q, q.len ? "&location=" : "location="); sb_query_val(&q, loc); }
-    if (argc < 1) { free(q.buf); return fail("usage: objects <repo-id> [--location loose|packed]"); }
+    if (argc < 1) { free(q.buf); return fail("usage: objects <repo-id> [--location staged|packed]"); }
     int rc = get_repo_scoped(argv[0], "/objects", q.buf);
     free(q.buf);
     return rc;
@@ -1612,12 +1607,11 @@ static const struct {
     { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  (deep and repairing by default; --dry-run is --no-repair: the same deep read unless --level says otherwise, with repair off, so nothing is written)  |  verify list <repo-id> [--limit N] [--offset N]  |  verify show <repo-id> <run-id> [--limit N] [--offset N]" },
     { "gc",        cmd_gc,        "gc <repo-id> [--dry-run] [--no-wait]" },
     { "gfs",       cmd_gfs,       "gfs <repo-id> [--dry-run] [--no-wait]" },
-    { "pack",      cmd_pack,      "pack <repo-id> [--no-wait]" },
     { "replicate", cmd_replicate, "replicate <repo-id> <dest-path> [--reencrypt] [--no-wait]" },
     { "reindex",   cmd_reindex,   "reindex <repo-id> [--no-wait]" },
-    { "stats",     cmd_stats,     "stats <repo-id> [--scope loose]" },
+    { "stats",     cmd_stats,     "stats <repo-id> [--scope staged]" },
     { "summary",   cmd_summary,   "summary <repo-id>" },
-    { "objects",   cmd_objects,   "objects <repo-id> [--location loose|packed] [--limit N]" },
+    { "objects",   cmd_objects,   "objects <repo-id> [--location staged|packed] [--limit N]" },
     { "object",    cmd_object,    "object <repo-id> <hash> [refs|layout|content]" },
     { "packs",     cmd_packs,     "packs <repo-id> [pack-id]" },
     { "fanout",    cmd_fanout,    "fanout <repo-id>" },

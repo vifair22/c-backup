@@ -4,15 +4,22 @@ A c-backup repository is a directory. Everything needed to understand its
 contents is inside it, which is the property the whole design rests on: the
 daemon's database is an index over this, not the only copy.
 
+This document specifies **repository format 3**, the format frozen for 1.0.
+There is no reader for any other format (see "Format version" below).
+
 ```
 <repo>/
-  .cbackup            identity marker
-  snapshots/<id>      snapshot records: root tree hash plus metadata
+  .cbackup            identity marker: format version, uuid, chunker, encryption
+  snapshot-ids        snapshot-id high-water mark
+  snapshots/<id>      snapshot records: root tree name plus metadata
   tags                the tag list, which reindex restores (absent until a tag is set)
-  objects/aa/bb...    loose objects, including manifest trees
-  packs/NNNN/pack-XXXXXXXX.dat   packs, 256 per directory
+  packs/XXXXXX/pack-NNNNNNNNNN.dat   every object, in packs, 256 per directory
+  packs/.deleting-NNNNNNNNNN         pending pack removals
   tmp/                staging for atomic writes; never read back
 ```
+
+There is no `objects/` directory. Every object lives in a pack (see "No
+loose objects").
 
 ## Why `tmp/` is inside the repository
 
@@ -20,25 +27,58 @@ Every durable write is `mkstemp`, `fsync`, `rename`, and `rename` only works
 within a filesystem. A staging directory in `/tmp` would silently become a
 copy across a device boundary, losing atomicity exactly when it matters.
 
-## `packs/`
+## Format version
 
-Pack `n` lives at `packs/<n / 256 as 4 hex digits>/pack-<n as 8 decimal
-digits>.dat`: pack 0 is `packs/0000/pack-00000000.dat`, pack 300 is
-`packs/0001/pack-00000300.dat`. Sharding keeps any one directory to 256
-packs. Readers also accept the flat `packs/pack-XXXXXXXX.dat` layout of
-earlier development builds.
+The marker's `version` is the repository format, and this build reads and
+writes exactly one: 3 (`CBACKUP_FORMAT_VER`, `src/meta/repo.h`). One check,
+`repo_format_check`, decides whether a repository can be opened, and it runs
+wherever one is opened: `repo_store_open`, registration of an existing
+repository, and every replica open path (the replica reader, the replica
+sink, and the re-encrypting sink's target). A repository it refuses is
+never read or written.
+
+| Marker says | Refusal |
+|-------------|---------|
+| an older version | `<path> is repository format 2; this build reads only format 3 and has no reader for older formats. Restore from it with the build that wrote it and back up again into a new repository` |
+| a newer version | `<path> is repository format 4, written by a newer c-backup; this build reads only format 3` |
+| an `incompat` feature | `<path> needs feature '<name>', which this build does not know (...)` |
+| no `incompat` list, an unknown chunker, chunker sizes outside their bounds, or `keyed` not matching the encryption | the marker is refused, naming the field |
+
+The marker reader accepts any version number, so a newer marker is refused
+as newer rather than as "not a c-backup marker". There is no migration:
+existing repositories are rebuilt by backing up again. The
+`pre-daemon-rewrite` tag builds a binary that reads format 1, and the last
+format 2 build is the one before this format landed.
+
+Per-file versions are belt and braces against a file copied in from another
+format by hand: `PACK_VERSION` (`src/store/pack.h`), the parity footer's
+`PARITY_VERSION`, and the tree format's `MANIFEST_TREE_VERSION`.
 
 ## `.cbackup`
 
 ```json
-{"format":"cbackup-repo","version":2,"uuid":"d4011a91-..."}
-{"format":"cbackup-repo","version":2,"uuid":"...","encryption":{"mode":"system","cipher":"chacha20-poly1305","key_id":"7752b59887c21e7f"}}
+{"format":"cbackup-repo","version":3,"uuid":"d4011a91-...",
+ "chunker":{"algo":"fastcdc-gear64-v1","min":524288,"avg":1048576,"max":8388608,"keyed":false},
+ "incompat":[]}
+{"format":"cbackup-repo","version":3,"uuid":"...",
+ "chunker":{"algo":"fastcdc-gear64-v1","min":524288,"avg":1048576,"max":8388608,"keyed":true},
+ "incompat":[],
+ "encryption":{"mode":"system","cipher":"chacha20-poly1305","key_id":"7752b59887c21e7f"}}
 ```
 
-Every repository this version creates carries version 2, encrypted or not;
-version 1 markers from before encryption existed are still read. A build
-older than the marker's version refuses the repository rather than writing
-objects in a format it does not know.
+- `chunker` is the content-defined chunker's repository constants (see
+  "Format 3: content-defined chunking" below). They never change for a
+  repository; changing any of them would change the name of every large
+  file. `keyed` is true exactly when the repository is encrypted. The reader
+  holds them as `cdc_algo`, `cdc_min`, `cdc_avg`, `cdc_max` and `cdc_keyed`
+  in `repo_marker_t`.
+- `incompat` lists features a reader must understand to open the
+  repository. Format 3 defines none, so the list is always empty; a reader
+  refuses any entry it does not know. A future feature that an older
+  build could misread goes here rather than in a new format number.
+- `encryption`, when present, records the mode, the cipher and a one-way
+  fingerprint of the key, plus for passphrase mode the Argon2id parameters
+  and the wrapped key, so an offsite copy is self-sufficient.
 
 The UUID is the repository's identity, not its path. Move the directory,
 register the new location, and it re-links to its existing history. The UUID
@@ -53,6 +93,70 @@ Registering a non-empty directory without a marker is refused. The marker is
 the only thing distinguishing "our repository" from "a directory that happens
 to be here", and the cost of guessing wrong is writing objects into somebody
 else's data.
+
+## `snapshot-ids`
+
+The highest snapshot id ever issued in this repository (DEC-1):
+
+```json
+{"format":"cbackup-snapshot-ids","version":1,"uuid":"d4011a91-...","last_issued":4127,"crc32c":"5e1f0c2a"}
+```
+
+- `last_issued` is a non-negative int64; 0 means none issued. It never
+  decreases. It is parsed digit for digit from the text, never through a
+  double, so it is exact past 2^53.
+- `crc32c` is CRC-32C, eight lowercase hex digits, over the ASCII bytes
+  `<uuid>:<last_issued>` (decimal, no leading zeros). The uuid binds the file
+  to this repository, so one copied from another repository is refused. A
+  re-encrypting replica has its own uuid and keeps its own file.
+- Created with `last_issued` 0 when the repository is created, and when a
+  replica target is initialised, so a missing file is damage, not age.
+- Written atomically: `mkstemp` in `tmp/` (prefix `snapids.`), write,
+  `fsync`, `rename` to `<repo>/snapshot-ids`, `fsync` of `<repo>`.
+
+Rules (`src/meta/snapshot_ids.h`):
+
+1. A backup numbers its snapshot `max(index mark, index MAX(id),
+   last_issued) + 1`, skipping any id whose record file exists, records that
+   in the index, raises `snapshot-ids` to it durably, and only then writes
+   `snapshots/<id>`. The record is never written before the mark that covers
+   it.
+2. Reindex sets the index's mark to `max(last_issued, highest record,
+   existing index mark)`. A file that is missing, damaged, from another
+   repository, or behind is rewritten with that value, and the job result
+   says so (`snapshot_ids_repaired`, `snapshot_mark`).
+3. Replication raises the target's mark to each snapshot's id before
+   writing that snapshot's record, and at the end of a successful run to at
+   least the source's mark (the larger of its file and its index). A
+   replica's mark is never below its source's.
+4. Prune and delete never touch it.
+
+Why it exists: ids are never reissued, but the mark that guaranteed it
+lived only in the daemon's database (snapshot_id_seq). After the database
+was lost, a reindex numbered from the highest record still present, so an
+id pruned from the top came back, and anything outside the repository still
+naming it - a tag, a note, a client, a replica - moved to a different tree.
+The timestamp check on tags stays: it protects a repository whose
+`snapshot-ids` was lost at the same time as the database.
+
+## `snapshots/<id>`
+
+One JSON object per snapshot, newline-terminated:
+
+```json
+{"id":42,"ts":1700000000,"root":"<64 hex digits>","label":"nightly"}
+```
+
+`ts` is signed epoch seconds. `root` is the root tree's object name. `label`
+is a JSON string, escaped as JSON requires: a quote, a backslash or a
+control character is written as an escape, and any byte that is not
+well-formed UTF-8 as `\ufffd`, so the record parses whatever the label held.
+A new backup accepts at most 256 bytes of printable text; replication copies
+a label stored before that limit existed, escaped the same way. Readers
+refuse a record larger than 64 KiB. The record is written to `tmp/`, synced,
+renamed into place, and the directory synced, before the snapshot's database
+row is committed, and after every pack holding an object it names is
+installed and synced.
 
 ## `tags`
 
@@ -69,70 +173,218 @@ unprotected. The daemon rewrites this file whole (temp file, `fsync`,
 inserts its tags back, a tag already in the database winning.
 
 `ts` is the tagged snapshot's timestamp. A tag is restored only onto the
-snapshot with the same id *and* timestamp, never onto a later backup that
-reused the number. While the database lives, no backup does: the daemon
-keeps a high-water mark per repository (migration 023), so a deleted
-snapshot's id, the newest included, is never handed out again, and an id
-whose record file exists without an index row is skipped. The mark is not
-in the repository, though. After the database is lost or the repository is
-registered again, a reindex starts the ids above the highest record that
-still exists, so an id pruned from the top before then can come back, and
-the timestamp check is what keeps a tag off it.
+snapshot with the same id *and* timestamp. With `snapshot-ids` an id is
+never reissued, so this only matters when that file was lost too.
 
-The file is optional. A repository written before it existed has none and
-reindexes exactly as it did, restoring no tags. A build that predates it
-ignores it. Replication does not copy it.
+The file is optional: a repository that has never had a tag has none.
+Replication does not copy it.
 
 ## Objects
 
-Content-addressed by SHA-256, stored two hex characters deep. A loose object
-is a 64-byte header (`object_header_t`), an uncompressed payload, and a
-Reed-Solomon parity trailer; compression happens only when objects are
-packed. Inside a pack each entry has a 51-byte entry header
-(`pack_dat_entry_hdr_t`: hash, type, compression, encryption, both sizes)
-before its possibly LZ4-compressed payload.
+### Names
 
-The parity trailer is Reed-Solomon RS(255,239) over the stored payload, 16
-parity bytes per 239 data bytes, interleaved 64 codewords deep (groups of
-15,296 data bytes, 1,024 parity bytes each, the last group paid in full), so
-each codeword corrects 8 bytes and a contiguous burst of up to 512 bytes is
-repairable. That is 16/239 = **6.7% of the stored payload**, the figure
-measured on large incompressible objects, plus about 280 fixed bytes per
-object: a 260-byte XOR parity record over the header, the payload CRC32C, a
-reserved word and the 12-byte footer.
+An object's name is
 
-Compression bails out early. A 64 KiB probe decides whether the payload is
-worth compressing, and an incompressible object is marked so later passes do
-not retry: there is no point spending CPU on video, audio or database files
-that will not shrink. Objects up to 16 MiB are written straight into packs
-by the backup; an object over 16 MiB is written loose, and one that fails the
-probe is marked in its header (`pack_skip_ver`) and stays loose for good,
-never packed (see `docs/data-paths.md`). So is one whose body stops
-compressing partway through the pack pass, which abandons it rather than
-finish an entry that saves nothing.
-
-Sparse files are stored as a region table plus data, so a 1 TiB sparse file
-does not become 1 TiB of zeroes. Restoring one linearly would inflate it to
-its full logical size, so restore routes them through a scatter path. A file
-that is entirely hole has an empty region table: it costs a header, and
-restores as an `ftruncate` with nothing allocated.
-
-## `snapshots/<id>`
-
-One JSON object per snapshot, newline-terminated:
-
-```json
-{"id":42,"ts":1700000000,"root":"<64 hex digits>","label":"nightly"}
+```
+SHA-256(type || payload)
 ```
 
-`ts` is signed epoch seconds. `label` is a JSON string, escaped as JSON
-requires: a quote, a backslash or a control character is written as an
-escape, and any byte that is not well-formed UTF-8 as `\ufffd`, so the record
-parses whatever the label held. A new backup accepts at most 256 bytes of
-printable text; replication copies a label stored before that limit
-existed, escaped the same way. Readers refuse a record larger than 64 KiB.
-The record is written to `tmp/`, synced, renamed into place, and the
-directory synced, before the snapshot's database row is committed.
+the one type byte followed by the payload, written as 64 lowercase hex
+digits wherever it appears as text. `object_name` (`src/store/object.h`) is
+the only implementation; nothing else computes a name. Including the type is
+what makes equal bytes stored as two types two objects (OWN-38): named by
+payload alone, a file whose content was the serialisation of a directory
+tree an attacker chose *was* that tree, so backing up the file planted the
+tree wherever a snapshot named it. Every reader loads by name and checks the
+recomputed name, type included, before using a byte.
+
+### Types
+
+| Type | Value | Payload |
+|------|-------|---------|
+| `FILE` | 1 | file content, or one content-defined chunk of it |
+| `XATTR` | 2 | a file's extended attributes (`src/common/types.h`) |
+| `ACL` | 3 | a file's access and default ACLs |
+| (retired) | 4 | was `SPARSE`; holes are gaps in a chunk list now. Never reused |
+| `TREE` | 5 | one directory, or one fragment of one (see "Manifest trees") |
+| `CHUNKLIST` | 6 | an ordered list of other objects (see "Chunk list objects") |
+
+Readers and writers accept only these (`object_type_known`). A reader that
+passed an unknown type through let restore treat it as file content (OWN-39);
+a new type is a format change, and an older build has to say so rather than
+guess.
+
+### The object bound
+
+Every object payload, of every type, is at most `OBJECT_MAX_BYTES`, 16 MiB
+(`src/common/types.h`). Content-defined chunks are at most `max` (8 MiB by
+default), chunk lists at most 786,452 bytes, tree fragments at most 1 MiB.
+Every writer refuses a larger object (`ERR_TOO_LARGE`) and every reader
+treats an entry claiming one as corrupt, before allocating anything.
+
+That bound is what lets everything below be one-shot and in memory: each
+object is named, probed, compressed, encrypted and parity-protected whole,
+and decrypted and checked whole before any of it is released.
+
+### Compression
+
+Per object, LZ4's block API only (`COMPRESS_NONE` 0, `COMPRESS_LZ4` 1). A
+64 KiB probe decides first: a payload whose first 64 KiB does not compress
+to under 98% of itself is stored as it is, having cost LZ4 on 64 KiB
+rather than on the whole object, so video, audio, archives and databases
+bail out at once (design constraint 4). A compressed result is kept only
+when it is smaller than the input, and payloads under 4 KiB are never
+compressed. Because every large file is chunked, the bail-out is per chunk.
+
+### Encryption
+
+One-shot ChaCha20-Poly1305 per object (`src/store/object_crypt.h`):
+
+- **key:** HKDF-SHA256 (RFC 5869, extract then expand) of the 32-byte
+  repository key, salt `c-backup v3 aead`, info `object key`, 32 bytes. The
+  raw repository key is never a cipher key: the chunker derives its gear
+  table from it under its own salt and info, and the two share no key
+  material.
+- **nonce:** 12 random bytes from the CSPRNG per encryption, stored in front
+  of the ciphertext. Dedup is settled by name before anything is encrypted,
+  so determinism buys nothing, and a derived nonce shared by two different
+  plaintexts is fatal for a stream cipher. Random nonces stay safe to about
+  2^32 encryptions per key, about 5 PB at the measured mean chunk.
+- **associated data:** the type byte followed by the 32-byte name. Every
+  writer has the name before it encrypts, so each ciphertext is bound to the
+  object it is filed under: bytes moved under another name or type fail
+  authentication where they are read.
+
+Stored bytes are `nonce (12) | ciphertext | tag (16)`, so an encrypted entry
+stores 28 bytes more than its (possibly compressed) payload. The order is
+compress, then encrypt, then CRC and Reed-Solomon: parity covers ciphertext,
+so a scrub can verify and repair an offsite copy without the key.
+Re-encrypting replication decrypts under the source's object key and
+encrypts under the target's with the same associated data; nothing is
+decompressed.
+
+### No loose objects
+
+Format 3 stores every object in a pack. Format 2 also had loose objects (one
+file per object under `objects/`, with a 64-byte header and a parity
+trailer of its own) for whatever a backup could not write straight into a
+pack - a file with holes, or one too large to hash before its entry header
+was written - and a pack pass afterwards rewrote them into packs, reading
+and writing every such byte twice. With every object bounded, nothing needs
+that: a backup writes each object once, compressed if its probe says so,
+into its pack. Writes outside a backup (`object_store`, the tree writer's
+convenience form) go through the store's own pack writer, which seals its
+pack when it fills, when the store closes, or when something reads an object
+it holds. So the format has one container, one header layout, one parity
+trailer and one set of readers.
+
+## `packs/`
+
+Pack `n` lives at `packs/<n >> 8 as six hex digits>/pack-<n as ten decimal
+digits>.dat`: pack 0 is `packs/000000/pack-0000000000.dat`, pack 300 is
+`packs/000001/pack-0000000300.dat`, pack 4,294,967,295 is
+`packs/ffffff/pack-4294967295.dat`. Six hex digits are exactly `n >> 8` of
+any u32 and ten decimal digits are any u32, so every pack number has a name
+the directory scan parses back; names are parsed digit for digit, and a
+name of another width is not a pack. A pack filed under the wrong shard is
+ignored with a warning. Format 2 used four and eight digits, so pack
+16,777,216 landed in a five-digit shard the scan skipped and every later
+pack write on the repository failed.
+
+Pack numbers are allocated as max(existing) + 1 by directory scan, plus a
+per-handle reservation so two writers open on one store handle never take
+the same number.
+
+### File layout
+
+All integers little-endian.
+
+```
+header (12 bytes):
+  magic u32 "BPKD" (0x42504b44) | version u32 = PACK_VERSION | count u32
+entries, count of them:
+  entry header (51 bytes):
+    name[32] | type u8 | compression u8 | encryption u8 |
+    uncompressed_size u64 | stored_size u64
+  stored payload, stored_size bytes
+parity trailer:
+  fhdr_crc            u32   CRC-32C of the 12-byte header
+  block[0..count-1], in entry order:
+    hdr_parity        260 B XOR parity record over the 51-byte entry header
+    rs_parity         R_i   ceil(C_i / 15,296) * 1,024 bytes
+    payload_crc       u32   CRC-32C of the stored payload
+    rs_data_len       u32   always 0 (dead field, kept for layout)
+    block_size        u32   260 + R_i + 12
+  offsets[count]      u64   block start, relative to the trailer start
+  entry_count         u32   at file_end - 16
+  footer (12 bytes):  magic u32 "PARI" | version u32 = 1 | trailer_size u32
+```
+
+`stored_size` counts what is stored: for an encrypted entry, nonce,
+ciphertext and tag. An entry header is consistent with its codec or it is
+refused: an uncompressed entry stores exactly its payload (plus 28 when
+encrypted), and a compressed one stores fewer bytes than its payload.
+
+The parity is Reed-Solomon RS(255,239) over the stored payload, 16 parity
+bytes per 239 data bytes, interleaved 64 codewords deep (groups of 15,296
+data bytes, 1,024 parity bytes each, the last group paid in full), so each
+codeword corrects 8 bytes and a contiguous burst of up to 512 bytes is
+repairable: 6.7% of the stored payload, plus 280 fixed trailer bytes per
+entry. A reader CRC-checks the payload and fetches parity only on a
+mismatch; it never uses bytes that fail their CRC after correction.
+
+### Bounds
+
+The trailer's size fields stay 32-bit. Format 3 makes wrapping impossible
+instead of widening them, by bounding every pack (`src/store/pack.h`):
+
+| Bound | Value | Meaning |
+|-------|-------|---------|
+| seal (`PACK_MAX_MULTI_BYTES`) | 256 MiB | the body size every writer rolls over at |
+| `PACK_MAX_ENTRIES` | 1,000,000 | entries per pack; every writer rolls over on it too |
+| `PACK_ENTRY_MAX_BYTES` | 16 MiB + 79 | the largest entry: 51-byte header, 16 MiB payload, 28 AEAD bytes |
+| `PACK_MAX_BYTES` | 285,212,751 | the largest body (header and entries): the seal plus one maximal entry |
+| `PACK_TRAILER_MAX_BYTES` | 1,323,094,548 | the largest trailer such a body can carry |
+| `PACK_MAX_FILE_BYTES` | 1,608,307,299 | the largest pack file |
+
+The trailer bound takes every term at its worst: 4 + count x (260 + 12 + 8)
++ 16 fixed bytes, plus RS parity of at most (body / 15,296 + count) x 1,024
+since each entry rounds its own groups up. Entry count is bounded for the
+trailer's sake, not the body's: each entry costs 280 fixed trailer bytes and
+up to one group of rounding whatever its size, so a million one-byte entries
+make a 1.3 GB trailer. `_Static_assert`s in `pack.h` check that the trailer
+bound, and a maximal entry's parity block, fit in UINT32_MAX; if a constant
+moves, the build decides whether the format still holds.
+
+Enforced on write at the one place every writer passes (sealing refuses a
+body past `PACK_MAX_BYTES` or a count past `PACK_MAX_ENTRIES`, and the
+backup writer refuses an entry that would cross either before writing it),
+and refused on read: a pack file past `PACK_MAX_FILE_BYTES`, a trailer
+starting past `PACK_MAX_BYTES`, or an entry count past `PACK_MAX_ENTRIES` is
+not parsed, and its parity is never applied.
+
+### Writers
+
+- the **backup writer** (`pack_backup_*`): plaintext in, named, deduplicated
+  against the repository and the pack it has open, probed, compressed,
+  encrypted, parity computed in memory per entry. Backup uses it directly;
+  `object_store` uses one owned by the store.
+- the **stored writer** (`pack_stored_*`): entries already in stored form,
+  copied verbatim with fresh parity; replication's. It refuses any entry a
+  reader would refuse (unknown type or codec, past the bound, inconsistent
+  with its codec).
+- the **rewriter** in gc and coalescing: live entries of old packs copied,
+  corrected from parity on the way, into new packs; the old ones removed
+  only once the new ones are installed, synced and announced.
+
+A pack installs with one `rename` from `tmp/`, after `fsync`. Its contents
+reach the daemon's index through the pack-commit callback; a store with no
+resolver indexes its packs itself (`store_scan_packs`).
+
+`.deleting-NNNNNNNNNN` markers name packs a rewrite has replaced and not yet
+removed: ASCII decimal pack numbers, one per line, written atomically. A
+marker is written only after the replacements are durable, so replaying it
+after a crash never deletes the only copy of anything.
 
 ## Manifest trees
 
@@ -141,9 +393,9 @@ stored through the same path as file content and therefore compressed,
 parity-protected and deduplicated by the same code.
 
 ```
-snapshots/42          {ts, parent, label, root: <hash>}
-  root tree           [bulk/ -> hash A, small/ -> hash B, deep/ -> hash C]
-    bulk/  unchanged  -> hash A is identical to snapshot 41, costs nothing
+snapshots/42          {ts, label, root: <name>}
+  root tree           [bulk/ -> name A, small/ -> name B, deep/ -> name C]
+    bulk/  unchanged  -> name A is identical to snapshot 41, costs nothing
     small/ changed    -> new object, new root; A and C are reused
 ```
 
@@ -152,10 +404,32 @@ its size. Measured on a 200k-file tree: changing 200 files produced 344 new
 tree objects and reused 9,972, writing 1.29 MiB against 18.4 MiB for a
 monolithic manifest.
 
+Tree payload (`OBJECT_TYPE_TREE`), every integer little-endian, written
+through explicit helpers:
+
+| Field | Type | Bound |
+|-------|------|-------|
+| magic | u32 | `CBTR` |
+| version | u16 | 2 |
+| count | u32 | entries in this directory or fragment |
+| per entry: name_len, link_len | u16 each | NAME_MAX 255; readlink buffer 4,095 |
+| type | u8 | NODE_TYPE_* |
+| mode, uid, gid | u32 each | Linux ids are 32-bit |
+| size | u64 | logical file size |
+| mtime_sec | i64 in a u64 slot | two's complement; no 2038 or 2106 issue |
+| mtime_nsec | u64 | under 1e9 |
+| inode_identity | u64 | FNV-1a of (st_dev, st_ino): hard-link identity |
+| dev_major, dev_minor | u32 each | device nodes only |
+| target, xattr, acl | 32-byte names | content (or subtree) name, blob names |
+
+XATTR record: name_len u16 (including NUL), name, value_len u32, value; one
+per attribute, sorted by name. ACL record: kind u8, text_len u32 (including
+NUL), `acl_to_text` bytes; access before default.
+
 ### Determinism
 
 Dedup works only if an unchanged directory serialises to byte-identical
-output. If serialisation is unstable, every tree gets a new hash on every
+output. If serialisation is unstable, every tree gets a new name on every
 backup, the repository grows as though manifests were monolithic, and
 **nothing fails**: backups succeed, restores work, and the only symptom is
 disk usage months later.
@@ -163,14 +437,14 @@ disk usage months later.
 The rules exist for that reason:
 
 - Entries sorted by `memcmp` byte order, never locale collation. Locale-aware
-  ordering makes a hash depend on the environment of whichever process wrote
+  ordering makes a name depend on the environment of whichever process wrote
   it.
 - Fixed-width little-endian fields written through explicit helpers, never by
   copying structs. A tree built on a Pi and the same tree built on x86 must
   hash identically.
 - **No snapshot-scoped identifiers.** No node id, no parent pointer, no backup
   timestamp. Those change every run and would give every directory a fresh
-  hash. Children are referenced by content hash; node ids are assigned by the
+  name. Children are referenced by name; node ids are assigned by the
   indexer and live only in the database.
 - `inode_identity` stays, because hard-link identity is not the same as
   identical content, and it is stable across backups of the same filesystem.
@@ -183,10 +457,10 @@ zero new objects. That test is the canary for the entire scheme.
 Status: built and wired (`src/store/cdc.c`, `src/store/chunklist.c`,
 `src/store/manifest.c`; backup, restore, gc, verify, replicate, reindex,
 grep and preview; `tests/test_cdc.c`, `tests/test_cdc_backup.c`,
-`tests/test_manifest_tree.c`). Where this section and the format 2 text
-above disagree, this section is format 3. The loose-object, pack-pass,
-frame-codec and sparse-object text above describes code that format 3 no
-longer reaches from a backup and that the format 3 core removes.
+`tests/test_manifest_tree.c`). The object, pack and encryption sections
+above are format 3's; this section adds the chunker, the chunk-list object,
+fragmented directories and how every reader walks them. What format 2 had
+and format 3 dropped is listed under "What format 3 removed" below.
 
 ### What changes and why
 
@@ -320,9 +594,8 @@ Unkeyed test vectors (also asserted by `tests/test_cdc.c`):
 
 The salt and info strings are the domain separation: no other derivation
 from the repository key uses them, so the table reveals nothing about the
-key the AEAD uses. (Format 3 should go one step further and derive the AEAD
-key through HKDF with its own info string too, rather than using the raw
-repository key; see "Encryption".)
+object key, which is HKDF of the same repository key under its own salt and
+info (see "Encryption" above).
 
 ### File content
 
@@ -505,25 +778,18 @@ Content addressing and the keyed table, together:
   therefore never the source's, which is also what keeps the source's
   boundaries from being revealed by a replica under another key.
 
-**AEAD reconciliation (DEC-2): drop segmented AEAD.** Segmentation answered
-two problems with one large object: ChaCha20-Poly1305's per-message limit
-(about 256 GiB) and a streaming reader releasing plaintext before the tag
-at the end has been checked. With every object at most 16 MiB neither
-exists: each object is encrypted in one shot, as `object_encrypt` already
-does, and decrypted whole and authenticated before a byte of it is used.
-Recommended for format 3 instead:
-
-- one-shot ChaCha20-Poly1305 per object with a fresh random 96-bit nonce
-  (as now);
-- associated data = `type || object name`, which the streaming writers
-  could never supply (they had no name until the end) and every format 3
-  writer has before it encrypts, binding each ciphertext to the object it
-  is filed under;
-- the AEAD key derived from the repository key with HKDF and its own info
-  string, so the gear table and the AEAD never use the same key material
-  directly;
-- nonce budget: random nonces stay safe to about 2^32 encryptions per key,
-  which at the measured mean chunk is about 5 PB written per repository.
+**No segmented AEAD (DEC-2).** Segmentation answered two problems with one
+large object: ChaCha20-Poly1305's per-message limit (about 256 GiB) and a
+streaming reader releasing plaintext before the tag at the end has been
+checked. With every object at most 16 MiB neither exists, so format 3
+encrypts each object in one shot and decrypts and authenticates it whole
+before a byte is used, as "Encryption" above specifies: a fresh random
+nonce, associated data `type || object name` (which every format 3 writer
+has before it encrypts, binding each ciphertext to the object it is filed
+under), and the object key derived from the repository key by HKDF, so the
+gear table and the AEAD share no key material. Random nonces stay safe to
+about 2^32 encryptions per key, which at the measured mean chunk is about
+5 PB written per repository.
 
 ### Backup write path
 
@@ -655,23 +921,46 @@ probe and storing nothing:
 | `cdc_store_256M_4workers` | 2,715 |
 | `cdc_store_256M_8workers` | 2,880 |
 
-One file now runs at 1.4 times what one core's SHA-256 allowed. The
-remaining ceiling is the reading thread itself, `pread` plus the scan;
-overlapping the two (a read-ahead thread) is the next step if a single file
-on fast storage needs more.
+One file now runs at 1.4 times what one core's SHA-256 allowed; the
+remaining ceiling is the reading thread itself, which the read-ahead ring
+overlaps with the scan on a disk. First-backup timings against the 1.0.0
+writer are in PERF.md (2026-11-16).
+
+## What format 3 removed
+
+Each of these existed in format 2 and has no reader, writer or test in
+format 3; a repository that needed one is rebuilt by backing up again.
+
+- loose objects: the `objects/` directory, the 64-byte object header
+  (`object_header_t`), its parity trailer, the loose-object set, loose
+  repair, and the prober's skip mark;
+- the streaming loose writer and its parity spill to `tmp/` (the store pool
+  and `backup.store_workers` survive with new meanings: chunk workers, and
+  file workers cutting several large files at once);
+- the pack pass: `repo_pack`, the pack job and route, `maintenance.auto_pack`,
+  and the in-entry bail-out (OWN-27);
+- `COMPRESS_LZ4_FRAME` and every streaming reader (whole-object reads replace
+  them; every object fits in memory);
+- the streaming AEAD codec;
+- `OBJECT_TYPE_SPARSE` and its region table, and the sparse restore path;
+- the OWN-30 stopgaps that refused repair of packs whose 32-bit trailer
+  sizes might have wrapped (the bounds above make wrapping impossible);
+- the flat `packs/pack-*.dat` layout and the four- and eight-digit names.
 
 ## Recovery
 
-Because the trees are in the repository, the database can be rebuilt:
+Because the trees and the snapshot-id mark are in the repository, the
+database can be rebuilt:
 
 ```sh
 c-backup reindex <repo-id>
 ```
 
-This walks each snapshot record's root tree and repopulates the index.
-Measured at roughly 764k rows per second, so a million-file snapshot takes
-about a second and a half.
+This rebuilds the pack index from the packs, walks each snapshot record's
+root tree to repopulate the node index, restores the snapshot-id mark from
+`snapshot-ids` (rewriting it if it was missing or behind), and brings tags
+back from `tags`. Measured at roughly 764k rows per second, so a
+million-file snapshot takes about a second and a half.
 
-Tags come back from the `tags` file. What reindexing cannot recover is
-daemon-only state: job history, sessions, schedules, notes. None of that
-describes your backups.
+What reindexing cannot recover is daemon-only state: job history, sessions,
+schedules, notes. None of that describes your backups.

@@ -20,18 +20,57 @@
 
 #define CBACKUP_MARKER      ".cbackup"
 #define CBACKUP_FORMAT      "cbackup-repo"
-/* One marker version. There are no repositories from an older build to stay
- * compatible with, and a second version existed only to be compatible with
- * them. */
-#define CBACKUP_FORMAT_VER  2
+/*
+ * The repository format, and the only one this build reads or writes.
+ * Format 3 is the format frozen for 1.0 (docs/repo-format.md). There is no
+ * reader for any other: repo_format_check refuses an older or newer
+ * repository before anything in it is read or written, naming both.
+ */
+#define CBACKUP_FORMAT_VER  3
 #define CBACKUP_UUID_LEN    37   /* RFC-4122 text plus NUL */
 #define CBACKUP_CIPHER      "chacha20-poly1305"
+
+/*
+ * The content-defined chunker a repository was created with. Repository
+ * constants, never tunables: changing any of them changes the hash of every
+ * large file, so they are recorded once in the marker and read from there.
+ * The values and bounds are the chunker's own (cdc.h), aliased here so
+ * there is one source; the marker carries and checks them.
+ */
+#define REPO_CHUNKER_ALGO        CDC_ALGO_NAME
+#define REPO_CHUNKER_MIN_DEFAULT CDC_MIN_DEFAULT
+#define REPO_CHUNKER_AVG_DEFAULT CDC_AVG_DEFAULT
+#define REPO_CHUNKER_MAX_DEFAULT CDC_MAX_DEFAULT
+#define REPO_CHUNKER_MIN_FLOOR   CDC_MIN_FLOOR
+#define REPO_CHUNKER_MAX_CEILING CDC_MAX_CEILING
+
+/* The longest incompatible-feature name the marker reader keeps. */
+#define REPO_FEATURE_NAME_MAX 64
 
 typedef struct {
     char uuid[CBACKUP_UUID_LEN];
     int  version;
 
-    /* Encryption, absent on a version 1 marker. */
+    /*
+     * The marker's "chunker" object. Format 3 only; zeroed on any other
+     * version, which repo_format_check refuses anyway. cdc_keyed is -1 when
+     * the field is absent or not a boolean. A writer that leaves cdc_algo
+     * empty gets the defaults.
+     */
+    char     cdc_algo[32];
+    uint32_t cdc_min, cdc_avg, cdc_max;
+    int      cdc_keyed;
+    /*
+     * "incompat": features a reader must understand to open the repository.
+     * This build knows none, so any entry refuses it; the first is kept for
+     * the message. incompat_missing is set when a format 3 marker has no
+     * list at all, which is damage rather than an empty list.
+     */
+    unsigned incompat_count;
+    int      incompat_missing;
+    char     incompat_first[REPO_FEATURE_NAME_MAX];
+
+    /* Encryption, absent on an unencrypted repository. */
     repo_enc_mode_t   enc_mode;
     char              cipher[32];
     char              key_id[REPO_KEY_ID_LEN];
@@ -39,12 +78,6 @@ typedef struct {
      * the key, kept in the repository so an offsite copy is self-sufficient. */
     repo_kdf_params_t kdf;
     char              wrapped[REPO_KEY_WRAPPED_HEX];
-
-    /* Content-defined chunking constants (format 3, src/store/cdc.h), fixed
-     * at creation like the encryption. Written as the marker's "chunker"
-     * object, whose "keyed" is true exactly when the repository is
-     * encrypted. A writer handed zeroes records the format defaults. */
-    uint32_t          cdc_min, cdc_avg, cdc_max;
 } repo_marker_t;
 
 /*
@@ -98,8 +131,27 @@ status_t repo_store_open_keyed(const char *path, const store_config_t *cfg,
                                store_t **out);
 
 /* Read the marker from a repo directory. ERR_NOT_FOUND if absent,
- * ERR_CORRUPT if present but malformed or of an unknown format. */
+ * ERR_CORRUPT if present but malformed or not a c-backup marker. A marker of
+ * another format version reads successfully: whether this build can open it
+ * is repo_format_check's decision, so the refusal names both versions rather
+ * than calling a newer marker malformed. */
 status_t repo_marker_read(const char *path, repo_marker_t *out);
+
+/*
+ * Can this build open the repository whose marker this is? OK only for a
+ * format CBACKUP_FORMAT_VER marker with a usable chunker and no
+ * incompatible feature. Otherwise ERR_INVALID, naming the repository's
+ * format and this build's.
+ *
+ * The one gate, called wherever a repository is opened: repo_store_open,
+ * registration of an existing repository, and every replica open path. A
+ * repository it refuses is never read or written.
+ */
+status_t repo_format_check(const char *path, const repo_marker_t *m);
+
+/* Fill the marker's chunker with the format defaults; keyed when the
+ * marker records encryption. */
+void repo_marker_cdc_default(repo_marker_t *m);
 
 /* Write a fresh marker with a newly generated UUID. Refuses to overwrite. */
 status_t repo_marker_write(const char *path, repo_marker_t *out);

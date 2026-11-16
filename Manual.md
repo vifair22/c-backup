@@ -69,13 +69,21 @@ flowchart LR
 
 ### 1.1 The storage model
 
-Every file's content is stored once, as an object named by its SHA-256. A
-second copy of the same bytes anywhere, in any snapshot, costs nothing.
-Objects are compressed with LZ4 when a 64 KiB probe says it is worthwhile and
-left alone when it is not, so video, audio and database files do not burn CPU.
-Every object and every pack carries Reed-Solomon parity, so bit rot can be
-repaired, not just detected. Sparse files are stored as their data regions,
-so a 1 TiB disk image holding 40 GiB costs 40 GiB.
+Every file's content is stored once, as objects named by the SHA-256 of
+their type and bytes. A second copy of the same bytes anywhere, in any
+snapshot, costs nothing. No object is larger than 16 MiB: a larger file is
+cut at content-defined boundaries into chunks of 512 KiB to 8 MiB, listed by
+a chunk-list object, so an edit, an insert or an append stores only the
+chunks it touched rather than the whole file again. Objects are compressed
+with LZ4 when a 64 KiB probe says it is worthwhile and left alone when it is
+not, so video, audio and database files do not burn CPU. Every object is
+written once, straight into a pack file, and every pack entry carries
+Reed-Solomon parity, so bit rot can be repaired, not just detected. Holes
+in sparse files are gaps in the chunk list, so a 1 TiB disk image holding
+40 GiB costs 40 GiB and restores sparse.
+
+The on-disk layout is repository format 3 (`docs/repo-format.md`). This
+build reads and writes no other format (section 17.4).
 
 A snapshot's metadata (names, modes, owners, times, links, extended
 attributes, ACLs) is one content-addressed **manifest tree** object per
@@ -98,8 +106,10 @@ These hold everywhere and decide many of the behaviours below.
 
 1. **No size limit.** No limit on file or repository size; nothing assumes
    data fits in memory.
-2. **Files exceed RAM.** Content is streamed, never buffered whole, including
-   parity computation.
+2. **Files exceed RAM.** A file is never buffered whole. Every object is at
+   most 16 MiB and handled whole, so a file larger than that is a list of
+   chunks, and memory per file is bounded by the chunker's window, not by
+   the file.
 3. **Millions of inodes.** Traversal and change detection are linear in the
    number of entries.
 4. **Fast incompressible bailout.** A 64 KiB probe decides compression.
@@ -195,9 +205,9 @@ accepting requests, stops firing schedules, then cancels running jobs, which
 are recorded as `cancelled` in `c-backup jobs` and the journal. Jobs still
 waiting in the queue are never started: they are recorded `cancelled` with no
 start time, and journalled as "cancelled before it started". A job checks
-for cancellation between files and between chunks inside one: storing,
-packing and restoring a file all stop within one read of at most 8 MiB, so a
-multi-gigabyte file in progress does not hold up the shutdown. This takes
+for cancellation between files and inside one: storing and restoring a file
+both stop within one object of at most 16 MiB, so a multi-gigabyte file in
+progress does not hold up the shutdown. This takes
 about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
 or SIGINT forces an immediate exit. Run the cancelled job again after the
 restart; a backup skips what it already stored, a restore skips the files it
@@ -291,11 +301,9 @@ With `--read-only`, the root filesystem is not written: state goes to the
 staging files into each repository's own `tmp/`.
 
 **No writable `/tmp` is needed**, and none is used. Every temporary file
-the engine makes goes into the repository it is working on: staged
-objects and packs, snapshot records, the tag mirror, and the parity that
-backup, `pack`, `gc` compaction and replication spill to disk for entries
-past a few MiB. A replication target's staging goes into the target's own
-`tmp/`. The `tmp/` directory is recreated when a repository is opened if
+the engine makes goes into the repository it is working on: packs being
+written, snapshot records, `snapshot-ids` and the tag mirror. A replication
+target's staging goes into the target's own `tmp/`. The `tmp/` directory is recreated when a repository is opened if
 someone removed it. SQLite's own temporary files (large sorts, temporary
 indices) go beside `state.db`, in the state volume, unless `SQLITE_TMPDIR`
 names somewhere else; set it only to a directory the daemon can write. The
@@ -332,7 +340,7 @@ systemd unit sets `/etc/c-backupd/config.yaml`. Keep the file 0600: it holds
 the Pushover credentials.
 
 There is no API that changes configuration. Edit the file and restart:
-`systemctl restart c-backupd`. Per-repository settings (retention, auto-pack)
+`systemctl restart c-backupd`. Per-repository settings (retention)
 are different: they live in the database and change through the policy API
 (section 9).
 
@@ -526,15 +534,17 @@ A repository is a directory the daemon registers and then owns.
 
 ```
 <repo>/
-  .cbackup          identity marker: format, version, UUID, encryption
-  snapshots/<id>    snapshot records: root tree hash and metadata
-  tags              the tag list, kept so a reindex can restore it
-  objects/aa/bb...  loose objects, including manifest trees
-  packs/<id>.dat    packs
-  tmp/              staging for atomic writes
+  .cbackup                          identity marker: format 3, UUID, chunker, encryption
+  snapshot-ids                      highest snapshot id ever issued
+  snapshots/<id>                    snapshot records: root tree name and metadata
+  tags                              the tag list, kept so a reindex can restore it
+  packs/XXXXXX/pack-NNNNNNNNNN.dat  every object, manifest trees included
+  tmp/                              staging for atomic writes
 ```
 
-`docs/repo-format.md` describes the format.
+There is no `objects/` directory: every object lives in a pack. Packs are
+filed 256 to a directory, the directory named by six hex digits and the pack
+by ten decimal ones. `docs/repo-format.md` describes the format.
 
 ### 5.1 Creating and registering
 
@@ -553,6 +563,10 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
   re-registered, keeping its history. The UUID in the marker is its identity,
   not the path: move a repository, register the new location, and it links
   back to its snapshots.
+- A repository of another format is refused with HTTP 400, naming its
+  format: `<path> is repository format 2; this build reads only format 3
+  ...`, or `... written by a newer c-backup` for a newer one. Nothing in it
+  is read or written. See section 17.4.
 - Adding a repository that is already registered succeeds and says so
   (`"already_registered":true`, HTTP 200 rather than 201). A label given
   that differs from the stored one replaces it; leaving the label out keeps
@@ -694,15 +708,13 @@ A trailing slash is ignored. An excluded directory is never descended into.
 flowchart TD
   A[scan sources] --> B{file cache:<br/>same metadata as last time?}
   B -- yes --> C[reuse the recorded hash]
-  B -- no --> D[read, hash, store object<br/>sparse-aware, parity]
+  B -- no --> D[read, chunk, store objects<br/>into a pack: compressed, parity]
   C --> E[build manifest trees<br/>bottom up]
   D --> E
-  E --> F[write snapshot record<br/>into the repository]
+  E --> P[seal and install packs]
+  P --> F[raise snapshot-ids, write<br/>snapshot record into the repository]
   F --> G[index nodes in state.db]
-  G --> H{maintenance.auto_pack}
-  H -- true --> I[pack sweep: sparse and<br/>over-16-MiB objects]
-  H -- false --> J[done]
-  I --> J
+  G --> J[done]
 ```
 
 1. **Scan.** The sources are walked and every entry recorded with its
@@ -712,11 +724,11 @@ flowchart TD
    still has exactly the metadata it had last time; if so, the recorded hash
    is reused without opening the file. Otherwise the file is read, hashed and
    stored. A file whose content already exists in the repository costs one
-   read and no write. An object of 16 MiB or less (file content, manifest
-   tree, xattr or ACL blob) goes straight into a pack as it is written,
-   compressed if that makes it smaller. Two kinds cannot, and are written
-   loose and uncompressed: the object of a sparse file, and an object over
-   16 MiB, whose pack entry header needs its hash before the bytes are read.
+   read and no write. Every object (a whole small file, a chunk of a large
+   one, a chunk list, a manifest tree, an xattr or ACL blob) is written once,
+   straight into the backup's pack, compressed if its probe says so. A file
+   larger than one chunk is cut at content-defined boundaries, its holes left
+   out, so after an edit only the chunks that changed are new.
 
    "Exactly the metadata" is size, mtime, ctime, and the device and inode
    numbers, on a local filesystem. On a network or FUSE filesystem (NFS,
@@ -732,25 +744,20 @@ flowchart TD
    that differed, which is the place to look when an incremental takes as
    long as the first backup did and `files_unchanged` in the job result is
    near zero.
-3. **Trees.** One manifest tree per directory, bottom up.
-4. **Snapshot.** The snapshot record goes into the repository first, then
+3. **Trees.** One manifest tree per directory, bottom up. A very large
+   directory is split by name into fragments of at most 1 MiB.
+4. **Seal.** Every pack the backup wrote is sealed, synced and installed, so
+   nothing the snapshot names is missing from the repository.
+5. **Snapshot.** The repository's `snapshot-ids` mark is raised to the new
+   snapshot's id, then the snapshot record goes into the repository, then
    the index rows go into the database. An interrupted backup leaves at most
-   index rows a reindex cleans up.
-5. **Pack sweep.** Loose objects are always stored uncompressed, so by
-   default every backup ends with a pack run, as `pack` would do: it packs
-   the loose objects of step 2 (and anything an interrupted run left). It
-   does not merge small packs; only gc does that (section 12). Setting the
-   policy key `maintenance.auto_pack` to `false` skips this sweep and
-   nothing else. Small objects still go into
-   packs during the backup, because that is how they are written; what
-   stays loose until a `pack` is only sparse files' objects and objects
-   over 16 MiB. A backup of small files therefore leaves no loose objects
-   with the key on or off, and a `pack` straight after it finds nothing to
-   do. A large incompressible object stays loose for good either way: the
-   probe, or the pack step's check on the rest of the file, marks it once
-   and no pack run moves it (section 12).
+   staging files and index rows that the next start and a reindex clean up.
 
-What is captured: regular files (sparse or not), directories, symlinks,
+There is no pack step afterwards and nothing to run by hand: a backup leaves
+no loose objects because none exist. Merging the small trailing packs
+backups leave is gc's job (section 12).
+
+What is captured: regular files (holes included), directories, symlinks,
 hardlinks (as groups), FIFOs, device nodes, modes, owner and group, times,
 extended attributes and POSIX ACLs. A unix socket has no content and is
 recorded without one; restore skips it.
@@ -780,8 +787,7 @@ Metadata writes (tags, notes, policy, sources) during a running backup wait
 briefly for the database rather than failing. A backup holds the database's
 write lock across batches of up to 2,000 files, and lets it go as soon as
 another write is queued for it: at the next file, the next read of the file
-it is storing (at most 1 MiB), the next directory tree, or within 50 ms while
-it waits on its large-file workers. A write that is waiting goes before the
+it is storing, or the next directory tree. A write that is waiting goes before the
 backup's next batch, so it returns in well under a second however long the
 backup runs. A backup nobody interrupts commits once per 2,000 files and
 once per sealed pack, which matters on storage where each commit's sync is
@@ -825,17 +831,15 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
   cap, which may hold more matches than were recorded. Both are on the job's
   result and on the run in `grep runs`.
 - **A match is recorded only from a file that read back whole and
-  authentic.** A file's matches are held until its object has been read to
-  the end and its SHA-256 (and, in an encrypted repository, its
-  authentication tag) has checked out; only then are they kept. A capped or
-  binary file over 16 MiB is therefore still read to its end, just not
-  matched further. A file that does not read back - damaged beyond its
-  parity, failing its tag, or not file content - contributes no matches and
-  is counted in `files_skipped`, with the first such file and the reason in
-  the run's `skip_reason` and every one in the daemon log. A damaged file
-  over 16 MiB is skipped even when its parity could correct it, because the
-  search streams it and cannot rewind to apply the correction; a repairing
-  `verify` fixes it on disk. The hits are kept: `c-backup grep runs <id>` lists past
+  authentic.** Every object is checked against its name (and, in an
+  encrypted repository, authenticated) whole before any of it is searched,
+  and damage within parity is corrected on the way. A file's matches are
+  kept only once all of its chunks have read back, so a capped or binary
+  file of many chunks is still read to its end, just not matched further. A
+  file that does not read back - damaged beyond its parity, failing its tag,
+  or not file content - contributes no matches and is counted in
+  `files_skipped`, with the first such file and the reason in the run's
+  `skip_reason` and every one in the daemon log. The hits are kept: `c-backup grep runs <id>` lists past
   searches, newest first, and `c-backup grep show <id> <run>` prints one
   search's hits again, which is how a `--no-wait` search is read once it
   has finished.
@@ -883,9 +887,10 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
 - **A file appears at its path only once it is complete and verified.**
   Each regular file is written to a temporary file named
   `.c-backup-partial.` plus six random characters, in the directory it
-  belongs in, with mode 0600. Only once the whole object has read back and
-  its SHA-256 (and, in an encrypted repository, its authentication tag) has
-  checked out are its mode, ownership, times, extended attributes and ACLs
+  belongs in, with mode 0600. Each object is checked against its name (and,
+  in an encrypted repository, authenticated) before any of it is written,
+  and only once every object of the file has been written are its mode,
+  ownership, times, extended attributes and ACLs
   applied, the data synced to disk, and the file renamed over its real
   name. A file whose object is damaged beyond its parity, or fails its tag,
   never appears; its temporary file is removed.
@@ -907,7 +912,9 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
   the verified file over them; a symlink at the path is replaced, not
   followed.
 - Hardlinks are restored as hardlinks, including across a resumed restore.
-- Sparse files come back sparse.
+- Sparse files come back sparse: holes of 64 KiB or more are recorded as
+  holes and never written; shorter ones are stored as zeroes and come back
+  as allocated zeroes.
 - Modes, times (directories included), extended attributes and ACLs are
   restored. Ownership is restored when the daemon runs as root.
 - Device nodes need root and a kernel that allows them; one that cannot be
@@ -997,10 +1004,7 @@ sudo c-backup policy set 1 retention.keep_daily 14
 sudo c-backup policy set 1 retention.keep_snaps 5
 ```
 
-`policy list` shows the repository's own values and the defaults in force,
-`maintenance.auto_pack` (on) included. `maintenance.auto_pack` decides only
-whether a backup ends with a pack sweep (section 6.3, step 5); it does not
-stop a backup writing small objects into packs.
+`policy list` shows the repository's own values and the defaults in force.
 
 Only these keys are accepted; any other key, and any value of the wrong
 kind, is refused with a message listing what is valid:
@@ -1008,7 +1012,9 @@ kind, is refused with a message listing what is valid:
 | Key | Accepts |
 |---|---|
 | `retention.keep_snaps`, `retention.keep_daily`, `retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly` | a whole number, 0 or more, digits only |
-| `maintenance.auto_pack` | `true` or `false` (`yes`/`no`, `on`/`off`, `1`/`0` also accepted, and stored as `true`/`false`) |
+
+`maintenance.auto_pack` existed while backups ended with a pack pass; format
+3 has none, and the key is refused like any other.
 
 A database from before this check may hold a value that would now be
 refused. A retention pass ignores it, logs a warning naming it, and uses the
@@ -1058,9 +1064,11 @@ sudo c-backup schedule list 1
 sudo c-backup schedule disable 1 <schedule-id>
 ```
 
-Actions: `backup`, `verify`, `grep`, `gc`, `gfs`, `reindex`, `pack`,
-`replicate`. A schedule whose action cannot run is refused when created, not
-when it first fires.
+Actions: `backup`, `verify`, `grep`, `gc`, `gfs`, `reindex`, `replicate`. A
+schedule whose action cannot run is refused when created, not when it first
+fires. A `pack` schedule carried over from an earlier build is disabled at
+start with a `disabled_reason`, since there is no pack job to run; delete
+it.
 
 **Interval** triggers anchor to the last successful run, not to wall-clock
 multiples: a long backup does not make the next one due the moment it ends.
@@ -1153,7 +1161,7 @@ Verify answers the second.
 ```sh
 sudo c-backup verify 1                     # deep, repairing
 sudo c-backup verify 1 --level index       # fast: every object still resolves
-sudo c-backup verify 1 --level structure   # also parses every header
+sudo c-backup verify 1 --level structure   # also parses every entry header
 sudo c-backup verify 1 --no-repair         # check only, write nothing
 sudo c-backup verify 1 --dry-run           # the same: still deep, repair off
 sudo c-backup verify list 1                # past runs
@@ -1162,16 +1170,15 @@ sudo c-backup verify list 1                # past runs
 | Level | Reads | Proves |
 |---|---|---|
 | `index` | no payloads | every registered object resolves to a location, and every pack file it names exists |
-| `structure` | headers | every object's header is well formed |
-| `deep` | everything | every payload's SHA-256 matches its name |
+| `structure` | entry headers | every object's pack entry header is well formed |
+| `deep` | everything | every payload matches its name (SHA-256 of type and payload) |
 
 A deep verify repairs what it finds by default: every object carries
 Reed-Solomon parity, and having already read the damaged bytes, writing the
 correction costs almost nothing more. With `--no-repair` it still tells
-recoverable damage from loss, applying parity in memory. Both work at any
-object size, loose or packed and whatever the codec: parity is read and
-applied one group window at a time (about 16 MiB of data and 1 MiB of
-parity), never loaded whole.
+recoverable damage from loss, applying parity in memory. Every object is
+at most 16 MiB and read whole, and its parity (about 1.1 MiB at most) is
+fetched only when its checksum disagrees.
 
 `--dry-run` is exactly `--no-repair`, and wins over anything else on the
 command line. It changes one thing: repair is off, so nothing in the
@@ -1213,18 +1220,10 @@ printed on stdout (the failed job goes to stderr); `verify show <id> <run>`
 reads them back later. A missing pack is reported as missing, never as
 damage to repair: its parity went with it.
 
-**Repair is disabled past about 59.75 GiB.** The parity trailer records its
-own size in 32-bit fields, and RS parity costs 1024 bytes per 15296 stored,
-so an object stored in more than 64,156,058,688 bytes, or any object in a
-pack whose trailer outgrew those fields (an old unsealed pack can be any
-size), has a trailer size that has wrapped. Reads are unaffected, because
-they find parity from the object's header, but repair finds it from that
-size and would write a wrong correction into the data. Until the format
-carries wider fields, repair refuses these and writes nothing; the finding
-says `unrecoverable: too large for 32-bit parity fields; repair disabled
-pending format fix` when the object could not be read, or `recoverable, not
-written back: ...` with the same reason when the read corrected it in
-memory. The daemon logs a warning when it writes such an object or pack.
+Format 2 refused repair in packs large enough for their 32-bit parity
+sizes to wrap, with findings reading `repair disabled pending format fix`.
+Format 3 bounds every pack (at most 1,000,000 entries and about 1.6 GB per
+file) so those sizes cannot wrap, and repair works on every entry.
 
 Findings name files, not hashes: each object that is not intact is reported
 with its status, how many distinct paths reference it (`affected_files`),
@@ -1245,12 +1244,13 @@ A checking verify takes the read lock; a repairing one takes the write lock.
 |---|---|---|
 | `gc 1` | Mark from every live snapshot, sweep unreferenced objects, compact packs | After retention prunes |
 | `gc 1 --dry-run` | Report what would be removed | Before the first real run |
-| `pack 1` | Pack and compress loose objects | If `maintenance.auto_pack` is off and backups hold sparse files or objects over 16 MiB |
 | `reindex 1` | Rebuild the repository's index from its manifest trees | After a database loss, or if the index is suspect |
 | `snapshot delete 1 12` | Delete one snapshot | By hand; GC reclaims its space |
 
-`gc`, `pack` and `reindex` are jobs. Finished jobs stay visible for 30 days
-(`c-backup jobs`); the per-repository journal (`c-backup journal 1`) is the
+`gc` and `reindex` are jobs. There is no `pack`: every object is written
+into a pack when it is stored, so there is nothing loose to consolidate.
+Finished jobs stay visible for 30 days (`c-backup jobs`); the
+per-repository journal (`c-backup journal 1`) is the
 permanent record of what ran and how it ended. A journal entry's `source`
 says who asked: `api` for a job run by hand (the CLI and the app both go
 through the API), `schedule` for one a schedule fired, with the message
@@ -1296,20 +1296,13 @@ the alert goes out and `c-backup gc` exits 1. The result adds
 `pack_entries_damaged`, `damaged` (the first 100 hashes) and
 `damaged_listed`.
 
-**Compaction rewrites a pack without its dead entries, split at 256 MiB.**
-A pack holding any entry no snapshot names is copied, live entries only,
-into new packs that seal at 256 MiB like a backup's, and the old pack is
-deleted once the new ones are on disk and indexed. Packs every build since
-OWN-19 writes are at most 256 MiB (plus one entry, when a single object is
-larger), so a rewrite costs at most that much I/O and free space. Earlier
-builds could write larger ones: a replica held one pack per snapshot of
-whatever size the snapshot was, and a backup of fewer than 2,000 files put
-everything it packed into one. Such a pack is split the first time
-compaction rewrites it, which needs free space for its live entries once;
-after that it is ordinary 256 MiB packs. A pack with no dead entries is
-never rewritten, however large: splitting it would cost a full copy and free
-nothing, and the same split happens anyway the first time something in it
-dies. A gc interrupted during compaction (cancelled, failed or killed)
+**Compaction rewrites a pack without its dead entries.** A pack holding any
+entry no snapshot names is copied, live entries only, into new packs that
+seal at 256 MiB like a backup's, and the old pack is deleted once the new
+ones are on disk and indexed. Every writer seals at 256 MiB (plus at most
+one entry of 16 MiB), so a rewrite costs at most that much I/O and free
+space. A pack with no dead entries is never rewritten. A gc interrupted
+during compaction (cancelled, failed or killed)
 leaves every object readable. Cancelled or failed while copying, it leaves
 only staging files in `tmp/`; killed after installing the new packs but
 before deleting the old one, it leaves the old pack beside copies of its
@@ -1319,50 +1312,21 @@ gc or reindex. Merging small packs (coalescing), which gc does after
 compaction and nothing else does, follows the same steps and leaves the same
 states.
 
-**Large incompressible objects stay loose.** A backup writes objects up to
-16 MiB straight into packs. Anything larger is written as one loose file,
-and the pack step then reads its first 64 KiB: if that does not compress
-(video, audio, disk images, encrypted or already-compressed archives) the
-object is marked and is never packed, by this or any later `pack` run. A
-file whose head compresses and whose body does not (a container header or a
-thumbnail in front of compressed media) is caught as it is packed: the pack
-step measures what compression achieves over the last 8 MiB it read, and
-once that is no better than the probe's threshold it abandons the entry,
-takes it back off the pack it was writing, and marks the object the same
-way. Abandoned before its compressed output passes 16 MiB, as a header in
-front of media is, nothing of it reaches the pack; the backup's
-`bytes_written_pack_abandoned` counts what a later abandon had to take back
-(docs/api.md). It is
-stored raw with its parity trailer, so `stats` and `summary` keep counting
-it as loose and `phys_size` exceeds `orig_size` by the parity overhead
-(section 18.1). That is deliberate: rewriting gigabytes into a pack would
-save nothing but an inode. Large files that do compress are packed
-normally. Details are in `docs/data-paths.md`.
+**Large incompressible files.** Each chunk is probed on its own: if its
+first 64 KiB does not compress (video, audio, disk images, encrypted or
+already-compressed archives) it is stored as it is, having cost LZ4 on
+64 KiB. A file whose head compresses and whose body does not (a container
+header or a thumbnail in front of compressed media) costs compression on the
+head's chunks only. Nothing is ever left outside a pack, and nothing is
+written twice.
 
-**What `phys_size` counts.** For a loose object, the whole object file:
-header, payload and parity. For a packed object, the stored payload only;
-its 51-byte entry header and its parity are counted in the pack's size, so
-`phys_size` against `orig_size` is its compression ratio and nothing is
-counted twice. `object <id> <hash> layout` reads the object itself, and for
-a packed object its `physical_size` (header plus payload) is `phys_size`
-plus 51. docs/api.md has the full definition.
-
-`pack` reports what it did in the job's `result`, including why it did
-nothing when it did nothing:
-
-```json
-{"loose":3,"packed":0,"skip_marked":3,"incompressible":0,
- "reason":"all loose objects are skip-marked as incompressible"}
-```
-
-`loose` is what it found, `packed` what it moved into packs, `skip_marked`
-objects an earlier run already marked incompressible, and `incompressible`
-those this run's probe marked. `reason` is `null` when something was packed,
-and otherwise one of `no loose objects`, `all loose objects are skip-marked
-as incompressible`, `every remaining loose object is incompressible` or `no
-loose object could be packed`. The journal entry says the same in a line
-(`nothing packed: no loose objects`). Backups pack on completion, so a `pack`
-run by hand afterwards usually finds nothing loose.
+**What `phys_size` counts.** The stored payload only, after compression and
+encryption; the 51-byte entry header and the entry's parity are counted in
+the pack's size, so `phys_size` against `orig_size` is an object's
+compression ratio and nothing is counted twice. `object <id> <hash> layout`
+reads the object itself: its `header_size` is always 51 and its
+`physical_size` (header plus payload) is `phys_size` plus 51. docs/api.md
+has the full definition.
 
 ---
 
@@ -1387,9 +1351,14 @@ as the admin password. Argon2id makes each guess slow, but a one-character
 passphrase is a handful of guesses, and a passphrase repository is meant to
 be safe to carry offsite.
 
-Objects are encrypted with ChaCha20-Poly1305 before they reach disk, chosen
-over AES-GCM because it does not depend on AES-NI. Hashes are of the
-plaintext, so deduplication still works within a repository.
+Objects are encrypted one at a time with ChaCha20-Poly1305 before they
+reach disk, chosen over AES-GCM because it does not depend on AES-NI. The
+cipher key is derived from the repository key with HKDF, every object gets
+a fresh random nonce, and the object's type and name are bound in as
+associated data, so stored bytes moved under another name fail to decrypt.
+Names are of the plaintext, so deduplication still works within a
+repository. The chunker's cut points are keyed by the repository key as
+well, so the sizes of stored chunks do not give away known content.
 
 | Mode | Key lives | To recover elsewhere you need |
 |---|---|---|
@@ -1426,7 +1395,7 @@ The import is refused unless the key matches the fingerprint in the
 repository's marker. The marker never contains the key.
 
 An encrypted repository whose key is not on this host can be registered and
-verified, but not read: backup, restore, reindex, grep, pack, gc and
+verified, but not read: backup, restore, reindex, grep, gc and
 replicate are refused with 409 `no key loaded for repository <uuid>`, which
 names the command that fixes it. A scheduled job fails with the same message.
 
@@ -1451,9 +1420,15 @@ restored from.
 - **Objects, not files.** Only objects the target lacks are sent. A tree hash
   covers everything beneath it, so an unchanged subtree is dismissed by one
   comparison and an unchanged repository replicates in one question.
-- **As stored.** Objects travel compressed and encrypted. The target never
+- **As stored.** Objects travel compressed and encrypted, and the target
+  writes them into packs of its own with fresh parity. The target never
   needs the key, so a replica can live somewhere less trusted than the
   source.
+- **Format 3 at both ends.** A source or target of another format fails the
+  job with the same refusal registration gives (section 5.1).
+- **Snapshot ids stay ahead.** The target's `snapshot-ids` is raised before
+  each snapshot record is written, and at the end of a run to at least the
+  source's mark, so a replica never numbers below its source.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
 - **Whole snapshots only.** Each snapshot's new objects are written into
@@ -1490,9 +1465,9 @@ The destination must already be a repository, created with the encryption
 you want; `--reencrypt` will not create one, so its mode is always chosen on
 purpose. It keeps its own UUID and key. Each object is decrypted with the
 source key and encrypted under the destination's (or written plaintext into
-an unencrypted destination) as it crosses; compression is untouched, and
-hashes are of the plaintext, so they, the trees and deduplication carry over
-unchanged. Snapshot ids carry over too, so the destination must hold no
+an unencrypted destination) as it crosses, each object authenticated whole
+under the source key first; compression is untouched, and names are of the
+plaintext, so they, the trees and deduplication carry over unchanged. Snapshot ids carry over too, so the destination must hold no
 backups of its own: a snapshot number it already uses for a different tree
 fails the run rather than being overwritten.
 
@@ -1734,9 +1709,16 @@ readable snapshots are indexed, and anything unreadable keeps whatever index
 rows it already had, so a reindex never replaces a populated index with an
 empty or partial one. An encrypted repository is refused outright until its
 key is on the host (section 13).
-Tags come back: the repository keeps its own copy of the tag list (a `tags`
-file beside `snapshots/`), and the reindex job's result reports
-`tags_restored`. A reindex that cannot read that file fails rather than
+Snapshot numbering comes back: the repository records the highest snapshot
+id it ever issued in `snapshot-ids`, and reindex restores the index's mark
+from it, so an id pruned from the top is never handed to a new snapshot and
+nothing outside the repository that names a snapshot by id (a tag, a note,
+a script, a replica) ends up pointing at a different backup. The job's
+result reports `snapshot_mark`, and `snapshot_ids_repaired` is true when the
+file was missing, damaged, copied from another repository or behind, and
+was rewritten. Tags come back too: the repository keeps its own copy of the
+tag list (a `tags` file beside `snapshots/`), and the reindex job's result
+reports `tags_restored`. A reindex that cannot read that file fails rather than
 leaving tagged snapshots silently unprotected. Lost for good: schedules,
 sources, policy, notes, the journal, job history and sessions. Re-create the schedules and sources. Remote clients sign
 in again; set the admin password again first with `auth setup`.
@@ -1779,11 +1761,29 @@ the findings list anything unrecoverable with the files and snapshots it
 affects. Restore those files from a replica, or from an older snapshot if the
 damaged object is not shared with it.
 
-### 17.4 Repositories from before the rewrite
+### 17.4 Repositories of another format
 
-1.0 cannot read repositories written by the pre-daemon versions, and there is
-no migration. Build the `pre-daemon-rewrite` tag to read them, restore what
-you need, and back it up again with 1.0.
+This build reads and writes repository format 3 only, and there is no
+migration. A repository of any other format is refused wherever it would be
+opened - registration, every job, and both ends of a replication - with
+`<path> is repository format 2; this build reads only format 3 and has no
+reader for older formats. Restore from it with the build that wrote it and
+back up again into a new repository`, or `... written by a newer c-backup;
+this build reads only format 3` for a newer one. Nothing in it is read or
+written.
+
+To move a format 2 repository forward, restore what you need with the last
+format 2 build and back it up again into a new repository. For a repository
+from before the daemon rewrite, the `pre-daemon-rewrite` tag builds a binary
+that reads it.
+
+The daemon's database starts again with format 3 too: its schema is one
+baseline, and a `state.db` written by an earlier build does not open (the
+daemon stops at start with a migration error naming a table that already
+exists). Move it aside, start the daemon, register each repository again
+(`c-backup repo add <path>`) and run `c-backup reindex <id>`. Snapshots,
+tags and the snapshot-id mark come back from the repositories; schedules,
+notes, job history and sessions do not.
 
 ---
 
@@ -1797,11 +1797,12 @@ running). `docs/acceptance.md` has the full results.
 
 - **gc needs free space for the pack it is rewriting.** Compaction copies a
   pack's live entries before deleting it, so it needs up to 256 MiB free per
-  pack, or the live size of a larger pack written by an earlier build, once
-  (section 12).
-- **Transient headroom: about twice the final size on a first backup.**
-  Loose objects are written uncompressed and packing compresses them at the
-  end. A 46 GB backup peaked at 53 GB of repository and settled at 26 GB.
+  pack (section 12).
+- **No transient headroom beyond one pack.** Every object is written once,
+  compressed, into a pack, so a repository grows by what it keeps plus at
+  most the pack being written (256 MiB). Format 2 wrote large objects loose
+  and uncompressed first: a 46 GB backup peaked at 53 GB of repository and
+  settled at 26 GB, which no longer happens.
 - Deduplication is per repository, across every snapshot.
 - Already-compressed data (media, archives, git objects) gains nothing from
   compression and is detected quickly; expect source size, less duplicates,
@@ -1813,9 +1814,9 @@ running). `docs/acceptance.md` has the full results.
   contiguous burst of up to 512 bytes is repairable. Parity is computed in
   whole interleave groups of 15,296 data bytes carrying 1,024 parity bytes,
   so the last group is paid in full: a tiny file still costs 1 KiB of
-  parity. On top of that every object carries about 280 fixed bytes (a
-  260-byte parity record for its header, a CRC32C, a reserved word and a
-  12-byte footer). For compressible data the 6.7% applies to the compressed
+  parity. On top of that every pack entry carries 51 bytes of header and
+  280 fixed bytes of trailer (a 260-byte parity record for its header, a
+  CRC32C, two size words and its offset). For compressible data the 6.7% applies to the compressed
   size; for a large incompressible file it is essentially the whole
   difference between `phys_size` and `orig_size`, which is where the
   measured +6.7% comes from. The rate is not configurable in 1.0.
@@ -1843,23 +1844,17 @@ on fast storage.
   files measured at 487 MB; 1.2 million is about 925 MB; 10 million about
   8 GB. Fine on a server; on a 2-4 GB NAS, split very large trees into
   several repositories or several sources backed up separately. Section 20.
-- File content is streamed in bounded chunks whatever its size. Parity for a
-  large object spills to `<repo>/tmp` beyond 256 MiB.
-- Storing a large file holds 8 MiB of pipeline buffers (eight 1 MiB chunks
-  shared by a reading, a hashing and a writing thread), and the
-  Reed-Solomon parity for it is kept in memory up to 256 MiB before
-  spilling to disk.
-- A large pack run uses up to about 1 GB of buffers at its widest (32
-  workers, each with a 16 MiB read buffer and a compression buffer). The
-  worker count is capped at one per 256 MiB of data to pack, so small runs
-  use far less.
+- Every object is at most 16 MiB and is handled whole: a store holds one
+  object's payload, an LZ4 buffer of about the same size and its parity
+  (about 1.1 MiB), and nothing more per file however large the file is. A
+  large file is read through the chunker's window, chunk by chunk.
+- Restore, grep, verify and replication likewise hold one object at a time.
 
-So peak memory is the scan's share plus whichever of these is running. As a
-measured reference, a first backup of 66,218 entries and 417 GB of mostly
-large media files peaked at 723 MiB resident (VmHWM) on a 12-core host:
-about 50 MiB of scan, the store buffers, and packing at the end. Plan on
-about 1 GB for a large first backup on a many-core machine, and more only
-for trees of several million files (the scan's 820 bytes each).
+So peak memory is the scan's share plus a few tens of MiB of object buffers.
+As a format 2 reference, a first backup of 66,218 entries and 417 GB of
+mostly large media files peaked at 723 MiB resident (VmHWM) on a 12-core
+host, most of it large-file and pack-pass buffers format 3 no longer has.
+Plan by the scan's 820 bytes per file.
 
 ### 18.4 What to expect
 
@@ -1903,7 +1898,7 @@ the underlying disk.
 | `restore incomplete: N entries could not be restored` | Some entries failed | The job and log name them; check permissions and space at the destination |
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
-| Repository much larger than expected right after a backup | Packing has not run or is running | Wait for the job; `c-backup pack <id>`; check `maintenance.auto_pack` |
+| `<path> is repository format 2; this build reads only format 3 ...` | The repository was written by an earlier build | No migration: restore from it with the build that wrote it and back up again into a new repository (section 17.4) |
 | Backups slow on Unraid | `state.db` on the parity array | Section 18.2 |
 | Daemon exits at start with `config.yaml:N: error: ...` | The config file has a line, key or value the daemon cannot honour | Fix the line it names; every problem is listed (section 3) |
 | No failure notifications arrive | Pushover credentials wrong, or Pushover unreachable for 24 hours | `cbackup_alerts_failed_total`; the journal's `push permanently failed` line says why (section 16.3) |
@@ -1975,11 +1970,10 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id> [--limit N] [--offset N]`, `verify show <id> <run> [--limit N] [--offset N]` | Integrity |
 | `gc <id> [--dry-run]` | Garbage collection |
 | `gfs <id> [--dry-run]` | Retention |
-| `pack <id>` | Pack and compress |
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
-| `stats <id> [--scope loose]`, `summary <id>`, `fanout <id>` | Repository statistics |
-| `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
+| `stats <id> [--scope staged]`, `summary <id>`, `fanout <id>` | Repository statistics; `staged` is objects in packs a running backup has not sealed |
+| `objects <id> [--location staged\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
 | `packs <id> [pack-id]` | Packs |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
@@ -1993,5 +1987,4 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `help` | This list, from the binary |
 
 Policy keys: `retention.keep_snaps`, `retention.keep_daily`,
-`retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly`,
-`maintenance.auto_pack`.
+`retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly`.

@@ -11,7 +11,7 @@
  * every other thread needs for all of that time.
  *
  * The ids are gone from repos before any of this runs and are never reused
- * (migration 019), so nothing can see a half-purged repository: every route
+ * (AUTOINCREMENT), so nothing can see a half-purged repository: every route
  * answers 404 for it, and new registrations get new ids.
  */
 

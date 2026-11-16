@@ -488,7 +488,6 @@ static const char *repo_path_allow(const char *rest)
         { "/gc",         "POST" },
         { "/gfs",        "POST" },
         { "/reindex",    "POST" },
-        { "/pack",       "POST" },
         { "/replicate",  "POST" },
     };
     for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)

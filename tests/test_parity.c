@@ -9,6 +9,8 @@
 #include <time.h>
 
 #include "parity.h"
+#include "pack.h"
+#include "types.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -533,93 +535,42 @@ static void test_parity_shorter_than_data_is_refused(void **state)
     free(data);
 }
 
-/* ---- OWN-30: where the 32-bit size fields wrap ---- */
+/* ---- Format 3: the bounds that keep the trailer's 32-bit sizes whole ---- */
 
-/* The real trailers, field by field, so the threshold is checked against the
- * layouts rather than against the constant it was derived from. */
-#define LOOSE_FIXED  (sizeof(parity_record_t) + 4 + 4 + sizeof(parity_footer_t))
+/* The real per-entry parity block, field by field: header parity, then
+ * payload CRC, deprecated rs_data_len and the block size word. */
 #define ENTRY_FIXED  (sizeof(parity_record_t) + 4 + 4 + 4)
-#define SOLO_FIXED   (4 + ENTRY_FIXED + 8 + 4 + sizeof(parity_footer_t))
 
-static void test_threshold_is_where_the_fields_wrap(void **state)
+/*
+ * Format 3 keeps the trailer's size fields 32-bit and bounds what can be
+ * written instead. These check the bounds against the layouts and against
+ * rs_parity_size itself, rather than against the constants they were
+ * derived from, so a change to either side shows up here.
+ */
+static void test_format_bounds_fit_the_trailer_fields(void **state)
 {
     (void)state;
-    parity_fields_set_test_limit(0);
-    const uint64_t max = PARITY_FIELDS_MAX_STORED;
-    assert_int_equal(max, 64156058688ull);
+    /* The per-entry term PACK_TRAILER_MAX_BYTES charges is the real block. */
+    assert_int_equal(ENTRY_FIXED, 272);
 
-    /* At the threshold every layout still fits a uint32 ... */
-    uint64_t rs = (uint64_t)rs_parity_size((size_t)max);
-    assert_true(rs + LOOSE_FIXED <= UINT32_MAX);
-    assert_true(rs + ENTRY_FIXED <= UINT32_MAX);
-    assert_true(rs + SOLO_FIXED  <= UINT32_MAX);
-    /* ... and one byte more wraps every one of them. */
-    uint64_t rs1 = (uint64_t)rs_parity_size((size_t)(max + 1));
-    assert_true(rs1 + LOOSE_FIXED > UINT32_MAX);
-    assert_true(rs1 + ENTRY_FIXED > UINT32_MAX);
-    assert_true(rs1 + SOLO_FIXED  > UINT32_MAX);
+    /* One maximal entry's parity block fits its size word. */
+    uint64_t one = (uint64_t)rs_parity_size((size_t)OBJECT_MAX_STORED_BYTES);
+    assert_true(one + ENTRY_FIXED <= UINT32_MAX);
 
-    assert_int_equal(parity_fields_fit(0), 1);
-    assert_int_equal(parity_fields_fit(max), 1);
-    assert_int_equal(parity_fields_fit(max + 1), 0);
-    assert_int_equal(parity_fields_fit(UINT64_MAX / 2), 0);
-}
+    /* The RS term of the trailer bound covers a maximal body in one entry
+     * and in many: ceil rounding costs at most one group per entry. */
+    uint64_t body_rs = (uint64_t)rs_parity_size((size_t)PACK_MAX_BYTES);
+    assert_true(body_rs <= (PACK_MAX_BYTES / PARITY_GROUP_DATA + 1u) * PARITY_GROUP_PAR);
+    uint64_t split = 0;
+    const uint64_t pieces = 1000;
+    for (uint64_t k = 0; k < pieces; k++)
+        split += (uint64_t)rs_parity_size((size_t)(PACK_MAX_BYTES / pieces));
+    assert_true(split <= (PACK_MAX_BYTES / PARITY_GROUP_DATA + pieces) * PARITY_GROUP_PAR);
 
-/* For one entry the file-size bound is the trailer itself, so it agrees with
- * parity_fields_fit to the byte, header untrusted. */
-static void test_file_bound_is_exact_for_one_object(void **state)
-{
-    (void)state;
-    parity_fields_set_test_limit(0);
-    const uint64_t hdr = 64;
-    const uint64_t sizes[] = {
-        1, 15295, 15296, 15297, 1000000,
-        PARITY_FIELDS_MAX_STORED - 1, PARITY_FIELDS_MAX_STORED,
-        PARITY_FIELDS_MAX_STORED + 1, PARITY_FIELDS_MAX_STORED + 15296,
-    };
-    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
-        uint64_t s = sizes[i];
-        uint64_t trailer = LOOSE_FIXED + (uint64_t)rs_parity_size((size_t)s);
-        uint64_t file = hdr + s + trailer;
-        assert_int_equal(parity_trailer_bound(file, 1, hdr, 0, LOOSE_FIXED, 0), trailer);
-        assert_int_equal(parity_trailer_fits_file(file, 1, hdr, 0, LOOSE_FIXED, 0),
-                         parity_fields_fit(s));
-    }
-}
-
-/* With several entries the bound may overstate by up to n - 1 groups but must
- * never understate, or a wrapped pack would pass. */
-static void test_file_bound_never_understates(void **state)
-{
-    (void)state;
-    uint32_t seed = 12345;
-    for (int trial = 0; trial < 2000; trial++) {
-        uint64_t n = 1 + (uint64_t)(trial % 40);
-        uint64_t body = 12 + 51 * n, trailer = 20 + 280 * n;
-        for (uint64_t e = 0; e < n; e++) {
-            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
-            uint64_t c = seed % 200000;
-            body += c;
-            trailer += (uint64_t)rs_parity_size((size_t)c);
-        }
-        uint64_t b = parity_trailer_bound(body + trailer, n, 12, 51, 20, 280);
-        assert_true(b >= trailer);
-        assert_true(b <= trailer + (n - 1) * PARITY_GROUP_PAR);
-    }
-}
-
-/* The test hook moves the threshold to a group boundary and back. */
-static void test_test_limit_moves_the_threshold(void **state)
-{
-    (void)state;
-    parity_fields_set_test_limit(4u * 1024 * 1024);
-    uint64_t edge = ((4u * 1024 * 1024 + PARITY_GROUP_DATA - 1) / PARITY_GROUP_DATA)
-                  * PARITY_GROUP_DATA;
-    assert_int_equal(parity_fields_fit(edge), 1);
-    assert_int_equal(parity_fields_fit(edge + 1), 0);
-    parity_fields_set_test_limit(0);
-    assert_int_equal(parity_trailer_limit(), UINT32_MAX);
-    assert_int_equal(parity_fields_fit(edge + 1), 1);
+    /* And the whole worst case fits the footer's trailer_size. */
+    assert_true(PACK_TRAILER_MAX_BYTES <= (uint64_t)UINT32_MAX);
+    assert_true(PACK_MAX_FILE_BYTES == PACK_MAX_BYTES + PACK_TRAILER_MAX_BYTES);
+    assert_true(PACK_MAX_BYTES >= PACK_MAX_MULTI_BYTES + 51u + OBJECT_MAX_STORED_BYTES);
 }
 
 int main(void)
@@ -653,10 +604,7 @@ int main(void)
         cmocka_unit_test(test_record_naming_a_column_past_the_data),
         cmocka_unit_test(test_short_buffer_repair_still_works),
         cmocka_unit_test(test_parity_footer_size),
-        cmocka_unit_test(test_threshold_is_where_the_fields_wrap),
-        cmocka_unit_test(test_file_bound_is_exact_for_one_object),
-        cmocka_unit_test(test_file_bound_never_understates),
-        cmocka_unit_test(test_test_limit_moves_the_threshold),
+        cmocka_unit_test(test_format_bounds_fit_the_trailer_fields),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

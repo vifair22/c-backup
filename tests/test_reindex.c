@@ -35,6 +35,8 @@
 #include "repo_key.h"
 #include "repo_tags.h"
 #include "snap_record.h"
+#include "snapshot_ids.h"
+#include "replicate.h"
 #include "store.h"
 #include "store_index.h"
 #include "test_tmp.h"
@@ -224,7 +226,7 @@ static void test_unreadable_pack_keeps_its_rows(void **state)
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "f=$(find '%s/packs' -name 'pack-%08u.dat' | head -1);"
+             "f=$(find '%s/packs' -name 'pack-%010u.dat' | head -1);"
              " printf 'garbagegarbagegarbage' | dd of=\"$f\" conv=notrunc status=none",
              TEST_REPO, pack_num);
     assert_int_equal(system(cmd), 0);
@@ -447,6 +449,223 @@ static void test_a_tag_does_not_follow_a_reused_snapshot_id(void **state)
     assert_int_equal(rx.tags_restored, 0);
     assert_int_equal(rx.tags_skipped, 1);
     assert_int_equal(scalar("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 0);
+}
+
+/* ---------- DEC-1: snapshot ids survive a lost database ---------- */
+
+/* Throw the database away and register the repository into a new one, as
+ * a host rebuilt from its repositories would. */
+static void lose_the_database(const char *repo_path)
+{
+    close_store();
+    db_close(db);
+    unlink(TEST_DB); unlink(TEST_DB "-wal"); unlink(TEST_DB "-shm");
+    assert_int_equal(db_open(&db, TEST_DB), 0);
+    assert_int_equal(db_run_lib_migrations(db), 0);
+    assert_int_equal(db_run_compiled_migrations(db, app_migrations), 0);
+    assert_int_equal(repo_register(db, repo_path, "test", &repo_id), OK);
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    assert_int_equal(repo_store_open(repo_path, NULL, &store), OK);
+    assert_int_equal(store_index_bind(store, db, repo_id, &idx), OK);
+}
+
+static int64_t newest_id(void)
+{
+    return scalar("SELECT MAX(id) FROM snapshots WHERE repo_id = ?");
+}
+
+static int64_t file_mark(const char *repo_path)
+{
+    int64_t m = -1;
+    assert_int_equal(snapshot_ids_read_repo(repo_path, &m), OK);
+    return m;
+}
+
+/*
+ * The case DEC-1 exists for: prune the newest snapshot, lose the database,
+ * reindex. The highest record left is 2, and numbering from the records
+ * would hand id 3 out again to a different tree. The repository's own mark
+ * says 3 was issued, so the next backup is 4.
+ */
+static void test_lost_database_does_not_reissue_a_pruned_id(void **state)
+{
+    (void)state;
+    backup_once();
+    write_file(TEST_SRC "/top.txt", "second\n");
+    backup_once();
+    write_file(TEST_SRC "/top.txt", "third\n");
+    backup_once();
+    assert_int_equal(newest_id(), 3);
+    assert_int_equal(file_mark(TEST_REPO), 3);
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, 3), OK);
+    assert_int_equal(file_mark(TEST_REPO), 3);   /* prune never lowers it */
+
+    lose_the_database(TEST_REPO);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.snapshots, 2);
+    assert_int_equal(rx.snapshot_mark, 3);
+    assert_int_equal(rx.snapshot_ids_repaired, 0);
+
+    write_file(TEST_SRC "/top.txt", "fourth\n");
+    backup_once();
+    assert_int_equal(newest_id(), 4);
+    assert_int_equal(file_mark(TEST_REPO), 4);
+}
+
+/* A missing or damaged mark is damage: reindex rebuilds it from the records
+ * and the index, rewrites it, and says so. */
+static void test_reindex_repairs_a_missing_or_damaged_mark(void **state)
+{
+    (void)state;
+    backup_once();
+    write_file(TEST_SRC "/top.txt", "second\n");
+    backup_once();
+
+    unlink(TEST_REPO "/snapshot-ids");
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.snapshot_mark, 2);
+    assert_int_equal(rx.snapshot_ids_repaired, 1);
+    assert_int_equal(file_mark(TEST_REPO), 2);
+
+    /* A flipped digit fails the checksum. */
+    char body[512];
+    FILE *f = fopen(TEST_REPO "/snapshot-ids", "r");
+    assert_non_null(f);
+    size_t n = fread(body, 1, sizeof(body) - 1, f);
+    fclose(f);
+    body[n] = '\0';
+    char *li = strstr(body, "\"last_issued\":2");
+    assert_non_null(li);
+    li[strlen("\"last_issued\":")] = '9';
+    write_file(TEST_REPO "/snapshot-ids", body);
+    int64_t m = 0;
+    assert_int_equal(snapshot_ids_read_repo(TEST_REPO, &m), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), "fails its checksum"));
+    err_clear();
+
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.snapshot_ids_repaired, 1);
+    assert_int_equal(file_mark(TEST_REPO), 2);
+
+    /* One copied from another repository is not this one's. */
+    assert_int_equal(snapshot_ids_write(TEST_REPO, "00000000-0000-4000-8000-000000000000", 7), OK);
+    assert_int_equal(snapshot_ids_read_repo(TEST_REPO, &m), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), "belongs to repository"));
+    err_clear();
+}
+
+/* Ids past 2^53 are exact: the mark is never read through a double. */
+static void test_mark_is_exact_past_2_53(void **state)
+{
+    (void)state;
+    const int64_t big = (int64_t)9007199254740993LL;   /* 2^53 + 1 */
+    assert_int_equal(snapshot_ids_raise_repo(TEST_REPO, big, NULL, NULL), OK);
+    assert_int_equal(file_mark(TEST_REPO), big);
+    /* Raising never lowers. */
+    int64_t now = 0;
+    assert_int_equal(snapshot_ids_raise_repo(TEST_REPO, 5, &now, NULL), OK);
+    assert_int_equal(now, big);
+}
+
+/*
+ * The same through a replica. The source issues 1..3 and prunes 3 before
+ * replicating, so the replica receives records 1 and 2 only; its mark is
+ * still the source's 3. The replica then loses its database too (it never
+ * had one) and is registered and reindexed on another host: its next backup
+ * is 4.
+ */
+#define TEST_REPLICA TEST_DIR "/replica"
+#define TEST_DB2     TEST_DIR "/state2.db"
+
+static void test_replica_carries_the_mark(void **state)
+{
+    (void)state;
+    backup_once();
+    write_file(TEST_SRC "/top.txt", "second\n");
+    backup_once();
+    write_file(TEST_SRC "/top.txt", "third\n");
+    backup_once();
+    assert_int_equal(prune_snapshot(store, db, repo_id, 3), OK);
+
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_REPO, &m), OK);
+    replica_sink_t sink;
+    assert_int_equal(replica_sink_local_open(TEST_REPLICA, &m, &sink), OK);
+    replicate_result_t rr;
+    assert_int_equal(replicate_run(store, db, repo_id, &sink, NULL, NULL, NULL, &rr), OK);
+    sink.v->close(sink.ctx);
+    assert_int_equal(rr.snapshots_sent, 2);
+    assert_int_equal(file_mark(TEST_REPLICA), 3);
+
+    /* The replica on a host of its own. */
+    close_store();
+    cutils_db_t *db2 = NULL;
+    assert_int_equal(db_open(&db2, TEST_DB2), 0);
+    assert_int_equal(db_run_lib_migrations(db2), 0);
+    assert_int_equal(db_run_compiled_migrations(db2, app_migrations), 0);
+    int64_t rid = 0;
+    assert_int_equal(repo_register(db2, TEST_REPLICA, "replica", &rid), OK);
+    store_t *rs = NULL;
+    store_index_t *ridx = NULL;
+    assert_int_equal(repo_store_open(TEST_REPLICA, NULL, &rs), OK);
+    assert_int_equal(store_index_bind(rs, db2, rid, &ridx), OK);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(rs, db2, rid, NULL, &rx), OK);
+    assert_int_equal(rx.snapshots, 2);
+    assert_int_equal(rx.snapshot_mark, 3);
+
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    assert_int_equal(backup_run(rs, db2, rid, &o, NULL), OK);
+    db_result_t *r = NULL;
+    char rids[32];
+    snprintf(rids, sizeof(rids), "%lld", (long long)rid);
+    assert_int_equal(db_execute(db2, "SELECT MAX(id) FROM snapshots WHERE repo_id = ?",
+                                (const char *[]){ rids, NULL }, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(strtoll(r->rows[0][0], NULL, 10), 4);
+    db_result_free(r);
+    assert_int_equal(file_mark(TEST_REPLICA), 4);
+
+    store_index_free(ridx);
+    store_close(rs);
+    db_close(db2);
+    /* teardown closes the source handles; give it some. */
+    open_store();
+}
+
+/* A replica is a repository: one of another format is refused by every
+ * replica open path, before anything is read or written. */
+static void test_replica_of_another_format_is_refused(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_REPLICA, 0700), 0);
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_REPO, &m), OK);
+    char body[256];
+    snprintf(body, sizeof(body),
+             "{\"format\":\"cbackup-repo\",\"version\":2,\"uuid\":\"%s\"}\n", m.uuid);
+    write_file(TEST_REPLICA "/.cbackup", body);
+
+    replica_sink_t sink;
+    assert_int_equal(replica_sink_local_open(TEST_REPLICA, &m, &sink), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "is repository format 2; this build reads only format 3"));
+    err_clear();
+    assert_int_equal(replica_sink_local_open_reencrypt(TEST_REPLICA, &m, &sink), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "is repository format 2"));
+    err_clear();
+    replica_reader_t *rd = NULL;
+    assert_int_equal(replica_reader_open(TEST_REPLICA, &rd), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "is repository format 2"));
+    err_clear();
+    struct stat sb;
+    assert_int_not_equal(stat(TEST_REPLICA "/packs", &sb), 0);
 }
 
 /* A repository written before the tag file existed reindexes as before. */
@@ -677,6 +896,11 @@ int main(void)
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_restores_tags_from_the_repository, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_tag_does_not_follow_a_reused_snapshot_id, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_lost_database_does_not_reissue_a_pruned_id, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reindex_repairs_a_missing_or_damaged_mark, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_mark_is_exact_past_2_53, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_replica_carries_the_mark, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_replica_of_another_format_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_without_a_tag_file_restores_none, setup, teardown),
         cmocka_unit_test_setup_teardown(test_corrupt_tag_file_fails_the_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_label_with_quotes_and_unicode_survives_reindex,

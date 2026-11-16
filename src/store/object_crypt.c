@@ -1,194 +1,145 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "object_crypt.h"
-#include "types.h"
 
-#include <limits.h>
-
-#include <stdlib.h>
 #include <string.h>
 
 #include <openssl/core_names.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/params.h>
 #include <openssl/rand.h>
 
-/*
- * A fresh nonce for every encryption, from the CSPRNG.
- *
- * The alternative - deriving it from the content hash - would give identical
- * plaintexts identical ciphertext. That is not needed: dedup is settled by a
- * hash lookup before anything is encrypted, so a duplicate never gets here.
- * And it would be dangerous, because one object is stored raw while loose and
- * compressed once packed, so a hash-derived nonce would cover two different
- * plaintexts under one key.
- */
+#define AEAD_HKDF_SALT "c-backup v3 aead"
+#define AEAD_HKDF_INFO "object key"
 
-static status_t crypt_init(EVP_CIPHER_CTX *c, const repo_key_t *key,
-                           uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES], int encrypting)
+status_t object_aead_key_derive(const repo_key_t *repo_key, object_aead_key_t *out)
 {
-    if (encrypting && RAND_bytes(nonce, OBJECT_CRYPT_NONCE_BYTES) != 1)
-        return set_error(ERR_IO, "object_crypt: CSPRNG failed");
+    if (!repo_key || !out) return set_error(ERR_INVALID, "object_aead_key_derive: null argument");
 
+    EVP_KDF *kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
+    if (!kdf) return set_error(ERR_IO, "object_aead_key_derive: no HKDF");
+    EVP_KDF_CTX *kctx = EVP_KDF_CTX_new(kdf);
+    EVP_KDF_free(kdf);
+    if (!kctx) return set_error(ERR_NOMEM, "object_aead_key_derive: context");
+
+    char digest[] = "SHA256";
+    char salt[] = AEAD_HKDF_SALT;
+    char info[] = AEAD_HKDF_INFO;
+    uint8_t ikm[REPO_KEY_BYTES];
+    memcpy(ikm, repo_key->key, sizeof(ikm));
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, digest, 0),
+        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, ikm, sizeof(ikm)),
+        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, salt, strlen(salt)),
+        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, info, strlen(info)),
+        OSSL_PARAM_construct_end(),
+    };
+    int ok = EVP_KDF_derive(kctx, out->key, sizeof(out->key), params);
+    EVP_KDF_CTX_free(kctx);
+    OPENSSL_cleanse(ikm, sizeof(ikm));
+    if (ok != 1) {
+        object_aead_key_wipe(out);
+        return set_error(ERR_IO, "object_aead_key_derive: HKDF failed");
+    }
+    return OK;
+}
+
+void object_aead_key_wipe(object_aead_key_t *k)
+{
+    if (k) OPENSSL_cleanse(k->key, sizeof(k->key));
+}
+
+/* type || name, the associated data every object is encrypted under. */
+static void make_aad(uint8_t type, const uint8_t name[OBJECT_HASH_SIZE],
+                     uint8_t aad[1 + OBJECT_HASH_SIZE])
+{
+    aad[0] = type;
+    memcpy(aad + 1, name, OBJECT_HASH_SIZE);
+}
+
+static status_t crypt_run(const object_aead_key_t *key, uint8_t type,
+                          const uint8_t name[OBJECT_HASH_SIZE],
+                          const uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES],
+                          const uint8_t *in, size_t len, uint8_t *out,
+                          uint8_t tag[OBJECT_CRYPT_TAG_BYTES], int encrypting)
+{
+    if (len > OBJECT_MAX_STORED_BYTES)
+        return set_error(ERR_TOO_LARGE, "object_crypt: %zu bytes is past the object bound", len);
+
+    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+    if (!c) return set_error(ERR_NOMEM, "object_crypt: cipher context");
+
+    uint8_t aad[1 + OBJECT_HASH_SIZE];
+    make_aad(type, name, aad);
+
+    int outl = 0, finl = 0;
+    status_t st = OK;
     int ok = encrypting
         ? EVP_EncryptInit_ex(c, EVP_chacha20_poly1305(), NULL, key->key, nonce)
         : EVP_DecryptInit_ex(c, EVP_chacha20_poly1305(), NULL, key->key, nonce);
-    if (ok != 1) return set_error(ERR_IO, "object_crypt: cipher init failed");
-    return OK;
-}
+    if (ok != 1) { st = set_error(ERR_IO, "object_crypt: cipher init failed"); goto done; }
 
-status_t object_encrypt(const repo_key_t *key,
-                        const void *in, size_t len, void *out)
-{
-    if (!key || (!in && len) || !out)
-        return set_error(ERR_INVALID, "object_encrypt: null argument");
-    if (len > INT_MAX)
-        return set_error(ERR_TOO_LARGE, "object_encrypt: use the streaming form");
+    ok = encrypting ? EVP_EncryptUpdate(c, NULL, &outl, aad, (int)sizeof(aad))
+                    : EVP_DecryptUpdate(c, NULL, &outl, aad, (int)sizeof(aad));
+    if (ok != 1) { st = set_error(ERR_IO, "object_crypt: associated data failed"); goto done; }
 
-    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
-    if (!c) return set_error(ERR_NOMEM, "object_encrypt: cipher context");
-
-    uint8_t *o = out;
-    status_t st = crypt_init(c, key, o, 1);
-    if (st != OK) { EVP_CIPHER_CTX_free(c); return st; }
-
-    /* Layout: nonce, then ciphertext, then tag. */
-    uint8_t *ct = o + OBJECT_CRYPT_NONCE_BYTES;
-    int outl = 0;
-    if (len && EVP_EncryptUpdate(c, ct, &outl, in, (int)len) != 1) {
-        EVP_CIPHER_CTX_free(c);
-        return set_error(ERR_IO, "object_encrypt: encryption failed");
+    if (encrypting) {
+        if (len && EVP_EncryptUpdate(c, out, &outl, in, (int)len) != 1) {
+            st = set_error(ERR_IO, "object_encrypt: encryption failed");
+            goto done;
+        }
+        if (EVP_EncryptFinal_ex(c, out + (len ? (size_t)outl : 0), &finl) != 1 ||
+            EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_GET_TAG, OBJECT_CRYPT_TAG_BYTES, tag) != 1)
+            st = set_error(ERR_IO, "object_encrypt: tag failed");
+    } else {
+        if (len && EVP_DecryptUpdate(c, out, &outl, in, (int)len) != 1) {
+            st = set_error(ERR_CORRUPT, "object_decrypt: decryption failed");
+            goto done;
+        }
+        if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, OBJECT_CRYPT_TAG_BYTES, tag) != 1 ||
+            EVP_DecryptFinal_ex(c, out + (len ? (size_t)outl : 0), &finl) != 1)
+            /* Wrong key, wrong object, or damage parity could not repair.
+             * All three are the same answer: these bytes are not what they
+             * claim to be. */
+            st = set_error(ERR_CORRUPT, "object_decrypt: authentication failed");
     }
-    int finl = 0;
-    if (EVP_EncryptFinal_ex(c, ct + outl, &finl) != 1 ||
-        EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_GET_TAG, OBJECT_CRYPT_TAG_BYTES,
-                            ct + len) != 1) {
-        EVP_CIPHER_CTX_free(c);
-        return set_error(ERR_IO, "object_encrypt: tag failed");
-    }
+done:
     EVP_CIPHER_CTX_free(c);
-    return OK;
+    return st;
 }
 
-status_t object_decrypt(const repo_key_t *key,
+status_t object_encrypt(const object_aead_key_t *key, uint8_t type,
+                        const uint8_t name[OBJECT_HASH_SIZE],
                         const void *in, size_t len, void *out)
 {
-    if (!key || !in || (!out && len))
+    if (!key || !name || (!in && len) || !out)
+        return set_error(ERR_INVALID, "object_encrypt: null argument");
+    if (len > OBJECT_MAX_STORED_BYTES)
+        return set_error(ERR_TOO_LARGE, "object_encrypt: %zu bytes is past the object bound", len);
+    uint8_t *o = out;
+    if (RAND_bytes(o, OBJECT_CRYPT_NONCE_BYTES) != 1)
+        return set_error(ERR_IO, "object_encrypt: CSPRNG failed");
+    return crypt_run(key, type, name, o, in, len, o + OBJECT_CRYPT_NONCE_BYTES,
+                     o + OBJECT_CRYPT_NONCE_BYTES + len, 1);
+}
+
+status_t object_decrypt(const object_aead_key_t *key, uint8_t type,
+                        const uint8_t name[OBJECT_HASH_SIZE],
+                        const void *in, size_t len, void *out)
+{
+    if (!key || !name || !in || (!out && len))
         return set_error(ERR_INVALID, "object_decrypt: null argument");
-    if (len > INT_MAX)
-        return set_error(ERR_TOO_LARGE, "object_decrypt: use the streaming form");
-
-    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
-    if (!c) return set_error(ERR_NOMEM, "object_decrypt: cipher context");
-
+    if (len > OBJECT_MAX_STORED_BYTES)
+        return set_error(ERR_TOO_LARGE, "object_decrypt: %zu bytes is past the object bound", len);
+    /* Copied out first: out may be in, and decrypting in place overwrites
+     * the nonce before the tag at the end is read. */
     const uint8_t *i = in;
     uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
+    uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
     memcpy(nonce, i, sizeof(nonce));
-    status_t st = crypt_init(c, key, nonce, 0);
-    if (st != OK) { EVP_CIPHER_CTX_free(c); return st; }
-
-    const uint8_t *ct = i + OBJECT_CRYPT_NONCE_BYTES;
-    int outl = 0;
-    if (len && EVP_DecryptUpdate(c, out, &outl, ct, (int)len) != 1) {
-        EVP_CIPHER_CTX_free(c);
-        return set_error(ERR_CORRUPT, "object_decrypt: decryption failed");
-    }
-
-    uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
-    memcpy(tag, ct + len, sizeof(tag));
-    int finl = 0;
-    if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, sizeof(tag), tag) != 1 ||
-        EVP_DecryptFinal_ex(c, (uint8_t *)out + outl, &finl) != 1) {
-        EVP_CIPHER_CTX_free(c);
-        /* Wrong key, wrong object, or damage parity could not repair. All
-         * three are the same answer to the caller: these bytes are not what
-         * they claim to be. */
-        return set_error(ERR_CORRUPT, "object_decrypt: authentication failed");
-    }
-    EVP_CIPHER_CTX_free(c);
-    return OK;
-}
-
-/* ------------------------------------------------------------------ */
-/* Streaming                                                           */
-/* ------------------------------------------------------------------ */
-
-struct object_crypt_stream {
-    EVP_CIPHER_CTX *ctx;
-    int             encrypting;
-};
-
-status_t object_crypt_stream_begin(object_crypt_stream_t **out,
-                                   const repo_key_t *key,
-                                   uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES],
-                                   int encrypting)
-{
-    if (!out || !key)
-        return set_error(ERR_INVALID, "object_crypt_stream: null argument");
-
-    object_crypt_stream_t *s = calloc(1, sizeof(*s));
-    if (!s) return set_error(ERR_NOMEM, "object_crypt_stream: alloc");
-    s->ctx = EVP_CIPHER_CTX_new();
-    s->encrypting = encrypting;
-    if (!s->ctx) { free(s); return set_error(ERR_NOMEM, "object_crypt_stream: context"); }
-
-    status_t st = crypt_init(s->ctx, key, nonce, encrypting);
-    if (st != OK) { object_crypt_stream_free(s); return st; }
-    *out = s;
-    return OK;
-}
-
-status_t object_crypt_stream_update(object_crypt_stream_t *s,
-                                    const void *in, size_t len, void *out)
-{
-    if (!s) return set_error(ERR_INVALID, "object_crypt_stream: null stream");
-    if (len == 0) return OK;
-    if (len > INT_MAX)
-        return set_error(ERR_TOO_LARGE, "object_crypt_stream: chunk too large");
-
-    int outl = 0;
-    int ok = s->encrypting
-        ? EVP_EncryptUpdate(s->ctx, out, &outl, in, (int)len)
-        : EVP_DecryptUpdate(s->ctx, out, &outl, in, (int)len);
-    if (ok != 1 || (size_t)outl != len)
-        return set_error(s->encrypting ? ERR_IO : ERR_CORRUPT,
-                         "object_crypt_stream: chunk failed");
-    return OK;
-}
-
-status_t object_crypt_stream_finish(object_crypt_stream_t *s,
-                                    uint8_t *tag_out, const uint8_t *tag_in)
-{
-    if (!s) return set_error(ERR_INVALID, "object_crypt_stream: null stream");
-
-    uint8_t scratch[64];
-    int finl = 0;
-    if (s->encrypting) {
-        if (!tag_out)
-            return set_error(ERR_INVALID, "object_crypt_stream: nowhere to put the tag");
-        if (EVP_EncryptFinal_ex(s->ctx, scratch, &finl) != 1 ||
-            EVP_CIPHER_CTX_ctrl(s->ctx, EVP_CTRL_AEAD_GET_TAG,
-                                OBJECT_CRYPT_TAG_BYTES, tag_out) != 1)
-            return set_error(ERR_IO, "object_crypt_stream: tag failed");
-        return OK;
-    }
-
-    /* Decrypting without a tag to check would authenticate nothing. */
-    if (!tag_in)
-        return set_error(ERR_INVALID, "object_crypt_stream: no tag to verify");
-
-    uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
-    memcpy(tag, tag_in, sizeof(tag));
-    if (EVP_CIPHER_CTX_ctrl(s->ctx, EVP_CTRL_AEAD_SET_TAG, sizeof(tag), tag) != 1 ||
-        EVP_DecryptFinal_ex(s->ctx, scratch, &finl) != 1)
-        return set_error(ERR_CORRUPT, "object_crypt_stream: authentication failed");
-    return OK;
-}
-
-void object_crypt_stream_free(object_crypt_stream_t *s)
-{
-    if (!s) return;
-    EVP_CIPHER_CTX_free(s->ctx);
-    free(s);
+    memcpy(tag, i + OBJECT_CRYPT_NONCE_BYTES + len, sizeof(tag));
+    return crypt_run(key, type, name, nonce, i + OBJECT_CRYPT_NONCE_BYTES, len,
+                     out, tag, 0);
 }

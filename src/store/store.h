@@ -39,7 +39,7 @@ typedef struct {
 
 /* ---------- lifecycle ---------- */
 
-/* Create the directory skeleton (objects/, packs/) at path. Does not write
+/* Create the directory skeleton (packs/, snapshots/, tmp/) at path. Does not write
  * an identity marker; that is the daemon's business (src/meta/repo.c). */
 status_t store_init_dirs(const char *path);
 
@@ -49,7 +49,7 @@ void     store_close(store_t *st);
 /* ---------- location resolution ---------- */
 
 typedef struct {
-    int      in_pack;      /* 0 = loose object */
+    int      in_pack;      /* always 1: every object lives in a pack */
     uint64_t pack_id;
     uint64_t offset;
     uint64_t comp_size;
@@ -64,8 +64,8 @@ typedef struct {
 /*
  * Answer "where is this hash". Returns OK when found, ERR_NOT_FOUND when not.
  * The daemon backs this with a pack_objects query; the engine never sees SQL.
- * With no resolver registered the engine can still find loose objects, which
- * is what the tests and benchmarks rely on.
+ * With no resolver registered the store answers from its built-in index
+ * (store_scan_packs), which is what tests, tools and benchmarks rely on.
  */
 typedef status_t (*store_locate_fn)(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
                                     store_location_t *out);
@@ -120,6 +120,11 @@ uint32_t store_alloc_pack_num(store_t *st, uint32_t floor);
 struct cdc_params;
 status_t store_set_cdc(store_t *st, const struct cdc_params *p);
 const struct cdc_params *store_cdc(const store_t *st);
+/* The object key derived from it (object_crypt.h), which is what every
+ * object is encrypted under; NULL when the repository is not encrypted. The
+ * raw key above stays available for the chunker's own derivation. */
+struct object_aead_key;
+const struct object_aead_key *store_aead_key(const store_t *st);
 
 /* ---------- cancellation ---------- */
 
@@ -205,20 +210,13 @@ void store_io_progress(const store_t *st, uint64_t bytes);
  * operation's figure takes a snapshot before and after and subtracts.
  *
  * Categories are disjoint, so their sum is everything this handle wrote
- * apart from small metadata (snapshot records, the one-byte skip marks a
- * pack run patches into incompressible loose objects, the .cbackup marker).
+ * apart from small metadata (snapshot records, snapshot-ids, tags, the
+ * .cbackup marker). Every object is written into a pack, so the two are
+ * the whole of it.
  */
 typedef enum {
-    STORE_WR_LOOSE = 0,      /* loose object header and payload, installed */
-    STORE_WR_LOOSE_PARITY,   /* the parity trailers of those objects */
-    STORE_WR_LOOSE_DISCARD,  /* a loose object staged in tmp/ and dropped
-                                because the repository already had it */
-    STORE_WR_PACK,           /* sealed packs: file header, entry headers, payloads */
+    STORE_WR_PACK = 0,       /* sealed packs: file header, entry headers, payloads */
     STORE_WR_PACK_PARITY,    /* the parity trailers of those packs */
-    STORE_WR_PARITY_SPILL,   /* RS parity over its memory cap, staged in tmp/
-                                before being copied into its trailer */
-    STORE_WR_PACK_ABANDONED, /* entries the pack pass began, found not to
-                                compress and truncated off the pack again */
     STORE_WR__COUNT
 } store_write_cat_t;
 
@@ -227,9 +225,6 @@ typedef struct {
 } store_write_stats_t;
 
 void store_count_write(store_t *st, store_write_cat_t cat, uint64_t bytes);
-/* The counter itself, for a layer that has no store_t of its own to hand
- * (the parity stream's spill file). NULL when st is NULL. */
-uint64_t *store_write_counter(store_t *st, store_write_cat_t cat);
 void store_write_stats(const store_t *st, store_write_stats_t *out);
 /* out = after - before, per category, and the sum of them. */
 uint64_t store_write_stats_diff(const store_write_stats_t *after,
@@ -308,16 +303,40 @@ void store_emit_pack_removed(store_t *st, uint64_t pack_id);
 
 int         store_fd(const store_t *st);
 const char *store_root(const store_t *st);
-int         store_objects_fd(store_t *st);
 
 const store_config_t *store_config(const store_t *st);
 
-/* In-memory hash set of loose object hashes; avoids a faccessat per lookup. */
-status_t store_build_loose_set(store_t *st);
-int      store_loose_set_contains(store_t *st, const uint8_t *hash);
-void     store_loose_set_insert(store_t *st, const uint8_t *hash);
-void     store_clear_loose_set(store_t *st);
-int      store_loose_set_ready(const store_t *st);
+/*
+ * A pack number for a writer about to open a pack: at least `scanned` (the
+ * next free number by directory scan) and never one this handle already
+ * handed out. A staging pack is not named until it installs, so two writers
+ * open on one handle - a backup's and the store's own (object_store_ex) -
+ * would otherwise both scan the same free number and the second install
+ * would fail. Across handles the repository write lock rules it out.
+ */
+uint32_t store_reserve_pack_num(store_t *st, uint32_t scanned);
+
+/*
+ * The store's own pack writer, behind object_store_ex. Opaque here; the
+ * writer is pack.c's. close_fn seals and frees it at store_close. Callers
+ * hold store_implicit_lock around any use.
+ */
+void  store_implicit_lock(store_t *st);
+void  store_implicit_unlock(store_t *st);
+void *store_implicit_get(store_t *st);
+void  store_implicit_set(store_t *st, void *writer, void (*close_fn)(store_t *, void *));
+
+/*
+ * The built-in index, used only when no resolver is registered: every pack's
+ * entries, read off the packs on the first lookup and kept up to date by
+ * this handle's own commits and removals afterwards. It is what lets a
+ * store opened with nothing but a path - by a test, a tool or the chunker's
+ * own suite - read back what it wrote. The daemon always registers a
+ * resolver, so it never builds one. The scan is pack.c's.
+ */
+typedef void (*store_index_add_fn)(void *ctx, const uint8_t hash[OBJECT_HASH_SIZE],
+                                   const store_location_t *loc);
+status_t store_scan_packs(store_t *st, store_index_add_fn add, void *ctx);
 
 /* Pack .dat handle cache; avoids repeated open/close on bulk lookups. */
 FILE *store_dat_cache_checkout(store_t *st, uint32_t pack_num);

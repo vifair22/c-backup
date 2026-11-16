@@ -43,6 +43,12 @@ typedef struct {
      * snapshot no longer exists there. */
     uint64_t tags_restored;
     uint64_t tags_skipped;
+    /* The snapshot-id high-water mark the index now holds: the largest of
+     * the repository's snapshot-ids file, its highest record, and what the
+     * index held before. The next backup numbers above it. ids_repaired is
+     * set when the file was missing, damaged or behind and was rewritten. */
+    int64_t  snapshot_mark;
+    int      snapshot_ids_repaired;
 } reindex_result_t;
 
 /*

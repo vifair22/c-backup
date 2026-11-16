@@ -11,15 +11,15 @@
 #include "object.h"
 #include "scan.h"
 #include "store_index.h"
+#include "store_pool.h"
 #include "db_txn.h"
 #include "phase_timer.h"
 #include "pack.h"
 #include "snap_record.h"
-#include "store_pool.h"
+#include "snapshot_ids.h"
 
 #include <cutils/log.h>
 
-#include <openssl/sha.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -94,13 +94,8 @@ typedef struct {
      * the store's byte-progress hook can let it go mid-file when a writer
      * queues. Only one phase runs at a time, and each starts it zeroed. */
     batch_t        batch;
-    /*
-     * Every object this run produces goes into this pack. There is no second
-     * mode: the loose path is what objects fall back to when the pack format
-     * cannot take them - a file with holes, or one too large to hash before
-     * its entry header is written - and those are packed afterwards by the
-     * ordinary auto-pack, as they always were.
-     */
+    /* Every object this run produces goes into this pack writer: content,
+     * metadata blobs and trees alike. There is no other place for one. */
     pack_backup_writer_t *pack_w;
     /* Regular-file bytes handled and expected, for opts->bytes_cb. */
     uint64_t       bytes_done, bytes_total;
@@ -145,7 +140,7 @@ typedef struct {
  * in.
  *
  * Rollover happens here only while may_rollover is set, which the backup
- * thread does for a file over PACK_STREAM_THRESHOLD after letting its batch
+ * thread does for a file over OBJECT_MAX_BYTES after letting its batch
  * go: sealing begins a transaction, and the write lock is not recursive.
  * Smaller files are stored with the batch held, inside the headroom the
  * loop keeps before each file, as they always were.
@@ -403,7 +398,7 @@ static int scan_path_cmp(const void *a, const void *b)
  */
 /*
  * Record a stored object in the index: staged when it went into the open
- * pack, loose when it went to its own file. See store_index_put_staged for
+ * pack, packed when the repository already held it. See store_index_put_staged for
  * why the difference decides whether a crash can lose data silently.
  */
 static status_t record_object(pipeline_t *p, const uint8_t hash[OBJECT_HASH_SIZE],
@@ -411,10 +406,10 @@ static status_t record_object(pipeline_t *p, const uint8_t hash[OBJECT_HASH_SIZE
 {
     return pack_backup_holds(p->pack_w, hash)
         ? store_index_put_staged(p->db, p->repo_id, hash, type, phys, orig)
-        : store_index_put_loose(p->db, p->repo_id, hash, type, phys, orig);
+        : store_index_put_packed(p->db, p->repo_id, hash, type, phys, orig);
 }
 
-static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type,
+static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type, const char *path,
                                 const uint8_t *data, size_t len,
                                 uint8_t out_hash[OBJECT_HASH_SIZE])
 {
@@ -423,17 +418,28 @@ static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type,
         return OK;
     }
 
-    SHA256(data, len, out_hash);
+    /* The memo is keyed by the object's own name, type included, so it
+     * matches what the store files the blob under. */
+    object_name(obj_type, data, len, out_hash);
     if (hashset_contains(&p->meta_seen, out_hash)) return OK;
 
-    int is_new = 0;
-    uint64_t phys = 0;
-    object_write_t ow;
+    object_write_t ow = { 0 };
     status_t st = object_store_packed(p->store, obj_type, data, len,
                                       p->pack_w, out_hash, &ow);
-    is_new = ow.is_new;
-    phys   = ow.phys_bytes;
+    if (st == ERR_TOO_LARGE) {
+        /* A blob past the object bound (a pathological xattr set) is not
+         * stored: the file is backed up without it, and the operator is
+         * told, rather than the backup failing for metadata. */
+        log_warn("backup: %s: %s of %zu bytes is past the object bound; backed "
+                 "up without it", path, obj_type == OBJECT_TYPE_XATTR
+                 ? "extended attribute set" : "ACL set", len);
+        err_clear();
+        memset(out_hash, 0, OBJECT_HASH_SIZE);
+        return OK;
+    }
     if (st != OK) return st;
+    int is_new = ow.is_new;
+    uint64_t phys = ow.phys_bytes;
     if (is_new) {
         p->res->objects_new++;
         st = record_object(p, out_hash, obj_type, phys, len);
@@ -471,7 +477,7 @@ static void scan_progress(uint32_t scanned, void *ctx)
  * commits for a 1,605-file backup, about 60 s on the UAT host's storage, all
  * of it unattributed. Now the backup asks (db_txn_waiters) at every point
  * that can: every entry, every read of a file being stored, every slice of a
- * wait on the large-file workers, every tree.
+ * wait on the file workers, every tree.
  *
  *   - Nobody waiting: the batch ends at BATCH_ENTRIES entries, as it did
  *     before B107, and is held across large files and pool waits.
@@ -577,7 +583,7 @@ static status_t bsink_flush(bsink_t *s, int own_txn)
         const pending_row_t *r = &s->rows[i];
         st = pack_backup_holds(s->pw, r->hash)
             ? store_index_put_staged(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig)
-            : store_index_put_loose(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig);
+            : store_index_put_packed(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig);
     }
     phase_add(p->timers, PHASE_INDEX_PUT, _ti);
     if (own_txn) {
@@ -793,7 +799,7 @@ static status_t store_file_cdc(pipeline_t *p, batch_t *b, int fd, uint64_t size,
     if (!cp)
         return set_error(ERR_INVALID, "repository is encrypted and no key is "
                          "loaded: its chunk boundaries need the key");
-    int large = size > PACK_STREAM_THRESHOLD;
+    int large = size > OBJECT_MAX_BYTES;
     /*
      * The batch is let go only when the file may not fit in the open pack:
      * then the sink has to be able to seal mid-file, and sealing begins a
@@ -803,7 +809,7 @@ static status_t store_file_cdc(pipeline_t *p, batch_t *b, int fd, uint64_t size,
      * plaintext.
      */
     int may_seal = large &&
-        pack_backup_full(p->pack_w, size + size / 4096 + PACK_STREAM_THRESHOLD);
+        pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES);
     if (may_seal) batch_close(p, b);
 
     obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
@@ -837,7 +843,7 @@ static status_t store_content(pipeline_t *p)
     uint64_t n_large = 0;
     for (uint32_t i = 0; i < p->count; i++) {
         const scan_entry_t *e = &p->scan->entries[i];
-        if (e->node.type == NODE_TYPE_REG && e->node.size > PACK_STREAM_THRESHOLD)
+        if (e->node.type == NODE_TYPE_REG && e->node.size > OBJECT_MAX_BYTES)
             n_large++;
     }
 
@@ -854,7 +860,7 @@ static status_t store_content(pipeline_t *p)
         if (cdc_workers_start(workers, &p->cdc_w) == OK) {
             log_info("backup: %llu file(s) over %llu MiB, their chunks stored "
                      "on %u threads", (unsigned long long)n_large,
-                     (unsigned long long)(PACK_STREAM_THRESHOLD >> 20), workers);
+                     (unsigned long long)(OBJECT_MAX_BYTES >> 20), workers);
         } else {
             /* Slower, not wrong: every chunk can still be stored here. */
             log_warn("backup: cannot start chunk workers, storing serially: %s",
@@ -983,11 +989,11 @@ static status_t store_content_loop(pipeline_t *p)
          * stored before the type branches below skip non-regular entries.
          * The hashes land in the node and travel into the manifest. */
         uint64_t _tm = phase_now();
-        status_t mst = store_meta_blob(p, OBJECT_TYPE_XATTR,
+        status_t mst = store_meta_blob(p, OBJECT_TYPE_XATTR, e->path,
                                        e->xattr_data, e->xattr_len,
                                        e->node.xattr_hash);
         if (mst == OK)
-            mst = store_meta_blob(p, OBJECT_TYPE_ACL,
+            mst = store_meta_blob(p, OBJECT_TYPE_ACL, e->path,
                                   e->acl_data, e->acl_len,
                                   e->node.acl_hash);
         phase_add(p->timers, PHASE_META_BLOB, _tm);
@@ -1010,11 +1016,11 @@ static status_t store_content_loop(pipeline_t *p)
          * loop, and every packed file it read went into one pack however
          * large that grew. Committing for a seal costs one sync per 256 MiB.
          *
-         * The headroom is what the next entry might need. Checking after the
-         * fact instead would let one file push the pack past its seal, which
-         * is harmless for a 14 KiB file and is not for a 16 MiB one.
+         * The headroom is the largest entry there can be, so no object this
+         * entry produces (its content and the metadata blobs before it) can
+         * take the pack past PACK_MAX_BYTES, which pack_backup_add refuses.
          */
-        #define PACK_ROLLOVER_HEADROOM PACK_STREAM_THRESHOLD
+        #define PACK_ROLLOVER_HEADROOM PACK_ENTRY_MAX_BYTES
         if (pack_backup_full(p->pack_w, PACK_ROLLOVER_HEADROOM)) {
             batch_close(p, b);
             uint64_t _ts = phase_now(), _tsn = phase_nested(p->timers);
@@ -1062,7 +1068,7 @@ static status_t store_content_loop(pipeline_t *p)
 
         /* A large file goes to the pool once there is room for it; the
          * backup thread carries on with the entries after it. */
-        int to_pool = p->pool && e->node.size > PACK_STREAM_THRESHOLD;
+        int to_pool = p->pool && e->node.size > OBJECT_MAX_BYTES;
         while (to_pool &&
                store_pool_outstanding(p->pool) >= store_pool_capacity(p->pool)) {
             status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
@@ -1497,7 +1503,7 @@ static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZ
  * snapshots present did hand them out twice: deleting the newest snapshot
  * gave its id to the next backup, and a tag, note, search run or client
  * still naming the old one silently moved to a different tree. The
- * high-water mark in snapshot_id_seq (migration 023) remembers ids whose
+ * high-water mark in snapshot_id_seq remembers ids whose
  * rows are gone; MAX(id) still counts, for snapshots a reindex inserted.
  *
  * A record file already at the candidate is skipped too. A backup that
@@ -1510,14 +1516,28 @@ static status_t allocate_snapshot_id(cutils_db_t *db, store_t *store,
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
+    /* The repository's own mark counts too: it is what survives a lost
+     * database. Unreadable is damage, and the index still covers every id
+     * this daemon issued, so the backup goes on and the mark is rewritten
+     * below. */
+    int64_t repo_mark = 0;
+    if (snapshot_ids_read_repo(store_root(store), &repo_mark) != OK) {
+        log_warn("backup: %s; numbering from the index", err_msg());
+        err_clear();
+        repo_mark = 0;
+    }
+    char mark[32];
+    snprintf(mark, sizeof(mark), "%lld", (long long)repo_mark);
+
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "snapshot id: begin");
 
     db_result_t *r = NULL;
     int64_t next = 0;
     if (db_execute(db,
             "SELECT MAX(COALESCE((SELECT last_id FROM snapshot_id_seq WHERE repo_id = ?), 0),"
-            "           COALESCE((SELECT MAX(id) FROM snapshots WHERE repo_id = ?), 0)) + 1",
-            (const char *[]){ repo, repo, NULL }, &r) == 0 && r && r->nrows == 1)
+            "           COALESCE((SELECT MAX(id) FROM snapshots WHERE repo_id = ?), 0),"
+            "           CAST(? AS INTEGER)) + 1",
+            (const char *[]){ repo, repo, mark, NULL }, &r) == 0 && r && r->nrows == 1)
         next = strtoll(r->rows[0][0], NULL, 10);
     db_result_free(r);
     if (next < 1) {
@@ -1549,6 +1569,12 @@ static status_t allocate_snapshot_id(cutils_db_t *db, store_t *store,
         return set_error(ERR_IO, "snapshot id: cannot record %s", id);
     }
     if (db_txn_commit(db) != OK) return set_error(ERR_IO, "snapshot id: commit");
+
+    /* Durable in the repository before the record that uses it exists, and
+     * outside the transaction: an fsync is not something to hold the one
+     * database handle across. */
+    status_t st = snapshot_ids_raise_repo(store_root(store), next, NULL, NULL);
+    if (st != OK) return st;
     *out = next;
     return OK;
 }
@@ -1856,20 +1882,6 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     return st;
 }
 
-/* The pack pass reports through the backup's own progress callback. */
-typedef struct {
-    const backup_opts_t *opts;
-} sweep_bridge_t;
-
-static void sweep_progress(uint64_t current, uint64_t total, const char *phase, void *ctx)
-{
-    sweep_bridge_t *b = ctx;
-    if (!b || !b->opts->progress_cb) return;
-    uint64_t _tp = phase_now();
-    b->opts->progress_cb(phase ? phase : "pack", current, total, b->opts->progress_ctx);
-    phase_add_nested(phase_current, PHASE_PROGRESS, _tp);
-}
-
 /* One line saying where the bytes went, next to the profile saying where the
  * time went. Ratios are of bytes_logical, the regular-file content this run
  * covered, so an incremental that reads nothing new still reads sensibly. */
@@ -1880,15 +1892,9 @@ static void log_written(const backup_result_t *r)
     double ratio = r->bytes_logical
                  ? (double)r->written_total / (double)r->bytes_logical : 0.0;
     log_info("backup: wrote %.1f MiB for %.1f MiB of content (%.3fx): "
-             "loose %.1f + parity %.1f, packs %.1f + parity %.1f, "
-             "parity spill %.1f, discarded duplicates %.1f, "
-             "abandoned pack entries %.1f; pack pass %.1f MiB",
+             "packs %.1f + parity %.1f",
              (double)r->written_total / mib, (double)r->bytes_logical / mib, ratio,
-             (double)w[STORE_WR_LOOSE] / mib, (double)w[STORE_WR_LOOSE_PARITY] / mib,
-             (double)w[STORE_WR_PACK] / mib, (double)w[STORE_WR_PACK_PARITY] / mib,
-             (double)w[STORE_WR_PARITY_SPILL] / mib, (double)w[STORE_WR_LOOSE_DISCARD] / mib,
-             (double)w[STORE_WR_PACK_ABANDONED] / mib,
-             (double)r->written_sweep / mib);
+             (double)w[STORE_WR_PACK] / mib, (double)w[STORE_WR_PACK_PARITY] / mib);
 }
 
 static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -2118,36 +2124,9 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         }
     }
 
-    /*
-     * The pack pass, inside the profile. Run from the job after this
-     * function had reported, it was 70-100 s of UAT's first backup that no
-     * row accounted for. It holds no transaction of ours: the snapshot row
-     * is committed and the pack commit callback takes its own.
-     */
-    store_write_stats_t w_pre_sweep;
-    store_write_stats(store, &w_pre_sweep);
-    if (st == OK && opts->pack_after) {
-        sweep_bridge_t sb = { opts };
-        pack_report_t pr;
-        memset(&pr, 0, sizeof(pr));
-        uint64_t _tpk = phase_now(), _tpkn = phase_nested(&timers);
-        status_t pst = repo_pack_report(store, &pr, sweep_progress, &sb);
-        phase_add_excl(&timers, PHASE_PACK_SWEEP, _tpk, _tpkn);
-        if (pst != OK) {
-            log_warn("backup: snapshot %lld committed but packing failed: %s",
-                     (long long)snap_id, err_msg());
-            err_clear();
-        } else {
-            res.sweep_packed = pr.packed;
-            if (pr.packed > 0)
-                log_info("pack: %llu object(s) packed in repo %lld",
-                         (unsigned long long)pr.packed, (long long)repo_id);
-        }
-    }
     store_write_stats_t w_end;
     store_write_stats(store, &w_end);
     res.written_total = store_write_stats_diff(&w_end, &w_start, &res.written);
-    res.written_sweep = store_write_stats_diff(&w_end, &w_pre_sweep, NULL);
 
     phase_current = NULL;
     res.snapshot_id = snap_id;

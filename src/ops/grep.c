@@ -10,7 +10,6 @@
 #include <cutils/log.h>
 
 #include <limits.h>
-#include <pthread.h>
 #include <regex.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +22,6 @@
  * Matches the store's own in-memory ceiling, so nothing here decides on its
  * own what fits in memory.
  */
-#define GREP_INMEM_MAX ((uint64_t)(16 * 1024 * 1024))
 
 /*
  * A line longer than this is matched in pieces rather than buffered whole.
@@ -350,28 +348,6 @@ static void scan_buffer(grep_ctx_t *g, const char *buf, size_t len,
     }
 }
 
-struct stream_arg {
-    store_t       *store;
-    const uint8_t *hash;
-    int            wfd;
-    status_t       rc;
-    uint8_t        type;
-    char           msg[ERR_MSG_MAX];
-};
-
-static void *stream_worker(void *a)
-{
-    struct stream_arg *arg = a;
-    uint64_t sz = 0;
-    err_clear();
-    arg->rc = object_load_stream(arg->store, arg->hash, arg->wfd, &sz, &arg->type);
-    /* The error buffer is thread-local, so the reason dies with this
-     * thread unless it is carried back by hand. */
-    if (arg->rc != OK) snprintf(arg->msg, sizeof(arg->msg), "%s", err_msg());
-    close(arg->wfd);
-    return NULL;
-}
-
 /* content_stream's consumer: scan, and stop the walk (with ERR_BUSY, which
  * the caller translates) on a cancel or once the file needs no more. */
 typedef struct {
@@ -395,18 +371,19 @@ static status_t scan_emit(void *ctx, const void *data, size_t len)
  * Search one object. Returns 1 if the file matched at least once.
  *
  * Matches are held, not recorded, until the object has read back OK:
- * authenticated, hash-checked and, for an object of type FILE or SPARSE,
- * actually file content (OWN-36, OWN-39). A streamed object is therefore
- * always read to its end, even once a binary match or the hit caps say
- * nothing more is worth scanning, because the tag and the hash are only
- * checked there. Stopping early, as this used to, recorded matches from
- * bytes nothing had verified and did not count the file as skipped when
- * they turned out to be damaged or tampered with.
+ * authenticated, checked against its name and actually file content
+ * (OWN-36, OWN-39). Every object is bounded (OBJECT_MAX_BYTES) and is
+ * loaded, decrypted and checked whole before a byte of it is scanned, so a
+ * match is never taken from bytes nothing has verified, and a binary match
+ * or the hit caps can stop the scan at once (V3-NOTE-1). For a file stored
+ * as a chunk list the same holds per chunk, so the walk may stop at the cap
+ * without reading the rest.
  */
 static int scan_object(grep_ctx_t *g, store_t *store,
                        const uint8_t hash[OBJECT_HASH_SIZE], uint64_t size,
                        const char *node_id, const char *path)
 {
+    (void)size;
     g->line_no = 0;
     g->file_hits = 0;
     g->is_binary = 0;
@@ -414,123 +391,30 @@ static int scan_object(grep_ctx_t *g, store_t *store,
     g->file_done = 0;
     g->file_capped = 0;
 
+    if (cancel_requested(g->cancel)) return 0;
+
     char *carry = malloc(GREP_LINE_MAX + 1);
     if (!carry) { discard_file(g, path, "out of memory"); return 0; }
     size_t carry_len = 0;
 
-    status_t lst = OK;
-    uint8_t  type = 0;
-    char     why[ERR_MSG_MAX] = "";
-    int      cancelled = 0;
-
-    /* Content over one object's bound is a chunk list in format 3; asking
-     * first keeps a list's own bytes out of the streaming path below. */
-    int is_list = 0;
-    if (size > GREP_INMEM_MAX) {
-        uint64_t osz = 0;
-        err_clear();
-        if (object_get_info(store, hash, &osz, &type) == OK &&
-            type == OBJECT_TYPE_CHUNKLIST)
-            is_list = 1;
-        err_clear();
-    }
-
-    if (!is_list && size <= GREP_INMEM_MAX) {
-        void  *data = NULL;
-        size_t len  = 0;
-        uint64_t taken = 0;
-        err_clear();
-        lst = object_load_budgeted(store, hash, &data, &len, &type, &taken);
-        if (lst == OK && type == OBJECT_TYPE_CHUNKLIST) {
-            /* A small sparse or multi-chunk file: what came back is the
-             * list, not the content. Nothing was scanned yet. */
-            is_list = 1;
-        } else if (lst == OK) {
-            scan_buffer(g, data, len, carry, &carry_len);
-            g->res->bytes_scanned += len;
-        } else {
-            snprintf(why, sizeof(why), "%s", err_msg());
-            err_clear();
-        }
-        free(data);
-        read_budget_release(taken);
-    }
-
-    if (is_list) {
-        /*
-         * Chunk by chunk, each one hash-checked before it is handed over,
-         * so every byte matched here is verified and the walk can stop as
-         * soon as nothing more is worth scanning. A chunk that fails later
-         * still discards the file's held matches below.
-         */
-        scan_emit_t se = { g, carry, &carry_len, 0 };
-        err_clear();
-        lst = content_stream(store, hash, scan_emit, &se, NULL);
-        if (lst == ERR_BUSY && se.stopped == 2) { cancelled = 1; lst = OK; }
-        else if (lst == ERR_BUSY && se.stopped == 1) lst = OK;
-        if (lst != OK) { snprintf(why, sizeof(why), "%s", err_msg()); err_clear(); }
-        /* Every chunk was verified as file content. */
-        type = OBJECT_TYPE_FILE;
-    } else if (size > GREP_INMEM_MAX) {
-        /*
-         * Larger than memory is allowed, so the payload arrives through a
-         * pipe rather than a buffer. The same shape sparse restore uses.
-         */
-        int pfd[2];
-        if (pipe(pfd) != 0) {
-            free(carry);
-            discard_file(g, path, "cannot create a pipe");
-            return 0;
-        }
-        struct stream_arg arg;
-        memset(&arg, 0, sizeof(arg));
-        arg.store = store;
-        arg.hash  = hash;
-        arg.wfd   = pfd[1];
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, stream_worker, &arg) != 0) {
-            close(pfd[0]); close(pfd[1]);
-            free(carry);
-            discard_file(g, path, "cannot start a reader thread");
-            return 0;
-        }
-        char *buf = malloc(256 * 1024);
-        if (buf) {
-            for (;;) {
-                /*
-                 * Between chunks, not between files. A cancel used to be
-                 * noticed only once the current file finished, so cancelling
-                 * a search that had reached a 13.8 GB file did nothing for
-                 * the 65 seconds it took to read it - which from the outside
-                 * is indistinguishable from cancel being broken.
-                 */
-                if (cancel_requested(g->cancel)) { cancelled = 1; break; }
-                ssize_t n = read(pfd[0], buf, 256 * 1024);
-                if (n <= 0) break;
-                /* Past a binary match or a cap the rest is only read, for
-                 * the tag and hash at the end; nothing more is matched. */
-                if (g->file_done) continue;
-                scan_buffer(g, buf, (size_t)n, carry, &carry_len);
-                g->res->bytes_scanned += (uint64_t)n;
-            }
-            free(buf);
-        }
-        /*
-         * Closing while the writer still has bytes to push makes its next
-         * write fail with EPIPE, which is how it learns to stop: on a
-         * cancel, or when the buffer could not be had. That is only
-         * survivable because the daemon ignores SIGPIPE; the default
-         * disposition would end the process here.
-         */
-        close(pfd[0]);
-        pthread_join(tid, NULL);
-        lst  = buf ? arg.rc : ERR_NOMEM;
-        type = arg.type;
-        snprintf(why, sizeof(why), "%s", buf ? arg.msg : "out of memory");
-    }
+    /*
+     * One FILE object or a chunk list, chunk by chunk, each hash-checked
+     * and type-checked before it is handed over, so every byte matched here
+     * is verified and the walk can stop as soon as nothing more is worth
+     * scanning. A chunk that fails later still discards the file's held
+     * matches below. Each chunk is held to the read budget while scanned.
+     */
+    char why[ERR_MSG_MAX] = "";
+    scan_emit_t se = { g, carry, &carry_len, 0 };
+    err_clear();
+    status_t lst = content_stream(store, hash, scan_emit, &se, NULL);
+    int cancelled = 0;
+    if (lst == ERR_BUSY && se.stopped == 2) { cancelled = 1; lst = OK; }
+    else if (lst == ERR_BUSY && se.stopped == 1) lst = OK;
+    if (lst != OK) { snprintf(why, sizeof(why), "%s", err_msg()); err_clear(); }
 
     /* A final line with no trailing newline still counts. */
-    if (lst == OK && !cancelled && carry_len) {
+    if (lst == OK && !cancelled && carry_len && !g->file_done) {
         carry[carry_len] = '\0';
         g->line_no++;
         if (line_matches(g->re, carry, carry_len))
@@ -548,11 +432,6 @@ static int scan_object(grep_ctx_t *g, store_t *store,
     }
     if (lst != OK) {
         if (!why[0]) snprintf(why, sizeof(why), "could not be read (status %d)", (int)lst);
-        discard_file(g, path, why);
-        return 0;
-    }
-    if (type != OBJECT_TYPE_FILE && type != OBJECT_TYPE_SPARSE) {
-        snprintf(why, sizeof(why), "object is of type %u, not file content", type);
         discard_file(g, path, why);
         return 0;
     }

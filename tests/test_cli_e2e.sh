@@ -202,7 +202,12 @@ check    "schedule remove" 0      "$RC"
 check    "schedule remove prints what it removed" '{"removed":true,"id":1}' "$OUT"
 
 contains "gc"      '"state":"completed"' "$(cb gc 1)"
-contains "reindex" '"state":"completed"' "$(cb reindex 1)"
+REINDEX_OUT=$(cb reindex 1)
+contains "reindex" '"state":"completed"' "$REINDEX_OUT"
+# The reindex reconciles the repository's snapshot-id mark with the
+# snapshots it holds: one snapshot here, and a mark already covering it.
+contains "reindex reports the snapshot-id mark" '"snapshot_mark":1,' "$REINDEX_OUT"
+contains "and that it needed no repair" '"snapshot_ids_repaired":false' "$REINDEX_OUT"
 contains "gfs"     '"state":"completed"' "$(cb gfs 1)"
 # B035: a dry run printed the job record and nothing about what it would
 # remove. One snapshot, so the answer is nothing, but it is an answer.
@@ -228,16 +233,20 @@ contains "stats"    '"per_type"' "$(cb stats 1)"
 contains "summary"  '"'          "$(cb summary 1)"
 contains "objects"  '"'          "$(cb objects 1 --limit 5)"
 contains "objects filtered by location" '"objects"' "$(cb objects 1 --location packed --limit 5)"
-contains "empty location filter keeps its key" '"objects"' \
-    "$(cb objects 1 --location loose --limit 5)"
+# Nothing is staged once a backup has sealed its pack, so this is empty.
+contains "empty location filter keeps its key" '"objects":[]' \
+    "$(cb objects 1 --location staged --limit 5)"
+# There are no loose objects; the daemon refuses the old location.
+check "objects --location loose fails" 1 "$(cb objects 1 --location loose >/dev/null 2>&1; echo $?)"
 contains "packs"    '"'          "$(cb packs 1)"
 # B075: these printed an empty listing and exited 0 for ids that do not exist.
 check "packs on a missing pack fails"      1 "$(cb packs 1 99999 >/dev/null 2>&1; echo $?)"
 check "ls on a missing snapshot fails"     1 "$(cb ls 1 99999 >/dev/null 2>&1; echo $?)"
 check "verify show on a missing run fails" 1 "$(cb verify show 1 99999 >/dev/null 2>&1; echo $?)"
 # The B084 audit: routes and parameters with no command or flag.
-contains "stats --scope loose" '"per_type"' "$(cb stats 1 --scope loose)"
-check "stats --scope takes only loose" 1 "$(cb stats 1 --scope packed >/dev/null 2>&1; echo $?)"
+contains "stats --scope staged" '"per_type"' "$(cb stats 1 --scope staged)"
+check "stats --scope takes only staged" 1 "$(cb stats 1 --scope packed >/dev/null 2>&1; echo $?)"
+check "and not loose any more" 1 "$(cb stats 1 --scope loose >/dev/null 2>&1; echo $?)"
 check "jobs --limit pages" 1 "$(cb jobs --limit 1 | grep -o '"action":' | wc -l | tr -d ' ')"
 # A bad offset reaching the daemon's 400 proves the flag is sent at all.
 OUT=$(cb jobs --offset x 2>&1); RC=$?
@@ -271,13 +280,12 @@ contains "snapshot note set" '"ok"'   "$(cb snapshot note 1 1 'checked by hand')
 contains "snapshot note get" 'checked by hand' "$(cb snapshot note 1 1)"
 contains "snapshot tree"     '"name"' "$(cb snapshot tree 1 1)"
 
-PACK_OUT=$(cb pack 1)
-contains "pack"   '"state":"completed"' "$PACK_OUT"
-# B099: the pack job had no result, so a run that packed nothing said why
-# only in the log. Backups pack on completion, so this one has the reason.
-contains "pack reports a result" '"result":{"loose":' "$PACK_OUT"
-contains "pack says why it packed nothing" '"reason":"' "$PACK_OUT"
-contains "and the journal says so" 'nothing packed: ' "$(cb journal 1)"
+# The pack job is gone: every object is written into a pack as it is
+# stored, so there is nothing left for a pack command to do.
+OUT=$(cb pack 1 2>&1); RC=$?
+check    "pack is no longer a command" 1 "$RC"
+contains "and says so" "unknown command 'pack'" "$OUT"
+check "a pack schedule is refused" 1 "$(cb schedule add 1 pack 3600 >/dev/null 2>&1; echo $?)"
 contains "verify" '"level":"index"'     "$(cb verify 1 --level index)"
 check "verify list --offset moves on" 1 \
     "$([ "$(cb verify list 1 --limit 1 --offset 1 | grep -o '"level":' | wc -l | tr -d ' ')" -le 1 ] && echo 1 || echo 0)"
@@ -349,10 +357,13 @@ check    "jobs watch of a missing job fails" 1 "$RC"
 check    "and prints nothing on stdout" "" "$(cat "$WORK/watch.out")"
 check    "and the error is bare JSON on stderr" '{"error":"no such job"}' "$(cat "$WORK/watch.err")"
 
-# B057: `jobs cancel` printed nothing. A gc queued behind a backup of a large
-# file is still cancellable when the request lands, whatever the machine.
+# B057: `jobs cancel` printed nothing. A gc queued behind a backup of a lot
+# of data is still cancellable when the request lands, whatever the machine.
+# 512 MiB, in 32 files of 16 MiB.
 mkdir -p "$WORK/big"
-dd if=/dev/zero of="$WORK/big/big.bin" bs=1M count=512 status=none
+for i in $(seq 1 32); do
+    dd if=/dev/zero of="$WORK/big/big$i.bin" bs=1M count=16 status=none
+done
 BJ=$(cb backup 1 "$WORK/big" --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
 GJ=$(cb gc 1 --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
 OUT=$(cb jobs cancel "$GJ")
@@ -371,7 +382,7 @@ for _ in $(seq 1 100); do
 done
 check "a cancelled backup leaves no staging files" "" \
     "$(find "$WORK/repo/tmp" -type f 2>/dev/null)"
-rm -f "$WORK/big/big.bin"
+rm -f "$WORK"/big/big*.bin
 
 # A second snapshot so diff has two sides, and so snapshot delete has
 # something to remove that is not the only copy.
@@ -831,7 +842,7 @@ mkdir -p "$WORK/drysrc"
 head -c 1048576 /dev/urandom > "$WORK/drysrc/blob.bin"
 DRY_ID=$(cb repo add "$WORK/dryrepo" dry | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 cb backup "$DRY_ID" "$WORK/drysrc" > /dev/null
-DRY_OBJ=$(find "$WORK/dryrepo/objects" "$WORK/dryrepo/packs" -type f -size +1000k 2>/dev/null | head -1)
+DRY_OBJ=$(find "$WORK/dryrepo/packs" -type f -size +1000k 2>/dev/null | head -1)
 if [ -n "$DRY_OBJ" ]; then
     DRY_GOOD=$(sha256sum < "$DRY_OBJ")
     DRY_OFF=$(( $(stat -c %s "$DRY_OBJ") / 2 ))
@@ -854,30 +865,40 @@ else
     bad "dry-run repo stored the blob" "a file over 1000k" "$(find "$WORK/dryrepo" -type f | head)"
 fi
 
-# B111: maintenance.auto_pack decides whether a backup ends with a pack
-# sweep, not whether objects are packed at all. In format 3 every object a
-# backup writes goes into a pack as it is written - a sparse file is a chunk
-# list with its holes as gaps, a large file is chunks - so with the key off
-# or on nothing is left loose for the sweep.
+# B111 asked whether maintenance.auto_pack kept a sparse file's object out of
+# a pack. There is no pack sweep left for it to switch: every object, a
+# sparse file's included, is in a pack when the backup ends, and the key is
+# refused as unknown. The sparse file is a chunk list with its hole as a gap,
+# and comes back byte-identical with the hole still a hole.
 mkdir -p "$WORK/apsrc"
 for i in $(seq 1 16); do echo "auto-pack small $i" > "$WORK/apsrc/s$i.txt"; done
 head -c 65536 /dev/urandom > "$WORK/apsrc/sparse.bin"
 truncate -s 8M "$WORK/apsrc/sparse.bin"
 AP_ID=$(cb repo add "$WORK/aprepo" ap | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-cb policy set "$AP_ID" maintenance.auto_pack false > /dev/null
+check "auto_pack is no longer a policy key" 1 \
+    "$(cb policy set "$AP_ID" maintenance.auto_pack false > /dev/null 2>&1; echo $?)"
 cb backup "$AP_ID" "$WORK/apsrc" > /dev/null
-AP_LOOSE=$(cb objects "$AP_ID" --location loose --limit 100 | grep -o '"hash"' | wc -l | tr -d ' ')
-check "auto_pack off: everything is packed anyway, the sparse file too" 0 "$AP_LOOSE"
-cb policy set "$AP_ID" maintenance.auto_pack true > /dev/null
-echo "auto-pack on" > "$WORK/apsrc/on.txt"
-cb backup "$AP_ID" "$WORK/apsrc" > /dev/null
-AP_LOOSE=$(cb objects "$AP_ID" --location loose --limit 100 | grep -o '"hash"' | wc -l | tr -d ' ')
-check "auto_pack on: nothing loose either" 0 "$AP_LOOSE"
+check "nothing is left staged after the backup" 0 \
+    "$(cb objects "$AP_ID" --location staged --limit 100 | grep -o '"hash"' | wc -l | tr -d ' ')"
+check "every object is in a pack, the sparse file's too" 17 \
+    "$(cb objects "$AP_ID" --location packed --limit 100 | grep -o '"type":1,' | wc -l | tr -d ' ')"
+cb restore "$AP_ID" 1 "$WORK/apout" > /dev/null
+if cmp -s "$WORK/apsrc/sparse.bin" "$WORK/apout$WORK/apsrc/sparse.bin"; then
+    ok "a sparse file restores byte-identical"
+else
+    bad "a sparse file restores byte-identical" "identical" "differs"
+fi
+AP_BLOCKS=$(stat -c %b "$WORK/apout$WORK/apsrc/sparse.bin")
+if [ "$AP_BLOCKS" -lt 2048 ]; then
+    ok "and its hole is still a hole"
+else
+    bad "and its hole is still a hole" "under 1 MiB allocated" "$AP_BLOCKS blocks"
+fi
 
 # Job commands wait by default and exit non-zero when the job fails.
-OUT=$(cb pack "$ENC_ID"); RC=$?
-check    "pack waits for its job"  0            "$RC"
-contains "pack reports completion" '"completed"' "$OUT"
+OUT=$(cb gc "$ENC_ID"); RC=$?
+check    "gc waits for its job"  0            "$RC"
+contains "gc reports completion" '"completed"' "$OUT"
 contains "--no-wait returns the id" '"job_id"'   "$(cb verify "$ENC_ID" --no-wait)"
 
 # Search takes a filename, not an FTS expression. A dot used to be a syntax
@@ -931,11 +952,15 @@ if [ "$NPACK" -gt 0 ]; then
 else
     bad "replica holds a pack" ">0" "$NPACK"
 fi
-if [ -z "$(find "$REPL/objects" -type f 2>/dev/null)" ]; then
-    ok "replica writes no loose objects"
+if [ ! -e "$REPL/objects" ]; then
+    ok "replica has no objects directory"
 else
-    bad "replica writes no loose objects" "none" "$(find "$REPL/objects" -type f | wc -l)"
+    bad "replica has no objects directory" "absent" "$(find "$REPL/objects" | head -3)"
 fi
+# The replica is a format 3 repository in its own right, high-water mark
+# included, so snapshot ids allocated against it never repeat one it holds.
+if [ -f "$REPL/snapshot-ids" ]; then ok "replica keeps a snapshot-id mark"
+else bad "replica keeps a snapshot-id mark" "present" "absent"; fi
 
 # And it is still ciphertext. The same fixture the pack test uses, for the
 # same reason: compressed text is unsearchable either way, so look for the
@@ -1171,7 +1196,10 @@ fi
 # 2,000 files ran inside one transaction. It returns at once now, and the
 # job already running keeps the sources it was submitted with.
 mkdir -p "$WORK/slowsrc" "$WORK/nextsrc"
-dd if=/dev/zero of="$WORK/slowsrc/slow.bin" bs=1M count=512 status=none
+# 512 MiB to keep the backup running, in 32 files of 16 MiB.
+for i in $(seq 1 32); do
+    dd if=/dev/zero of="$WORK/slowsrc/slow$i.bin" bs=1M count=16 status=none
+done
 echo "next content" > "$WORK/nextsrc/next.txt"
 SR=$(cb repo add "$WORK/srcrepo" sr | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 cb sources set "$SR" "$WORK/slowsrc" >/dev/null
@@ -1199,12 +1227,12 @@ for _ in $(seq 1 600); do
     cb jobs "$SJ" | grep -Eq '"state":"(completed|failed|cancelled)"' && break
     sleep 0.1
 done
-contains "the running backup kept the sources it started with" "slow.bin" \
-    "$(cb search "$SR" slow.bin --snapshot 1)"
+contains "the running backup kept the sources it started with" "slow32.bin" \
+    "$(cb search "$SR" slow32.bin --snapshot 1)"
 cb backup "$SR" >/dev/null
 contains "and the next backup uses the new ones" "next.txt" \
     "$(cb search "$SR" next.txt --snapshot 2)"
-rm -f "$WORK/slowsrc/slow.bin"
+rm -f "$WORK"/slowsrc/slow*.bin
 
 echo "scheduled backups"
 
@@ -1408,6 +1436,8 @@ damage_beyond_parity() {  # damage_beyond_parity <sample> <pack>
 
 # The failure path is the job manager's: it marks the job failed and sends
 # the alert, and the line it logs as it sends is the evidence.
+# The job is marked failed before the alert goes out, so the CLI can return
+# and look before the line is logged; give the worker a moment to get there.
 alerted() {  # alerted <job-id>
     # The notification is logged after the job's failure is recorded, on
     # another thread, so the CLI can see the failure first. Up to 5 s.
@@ -1428,7 +1458,9 @@ head -c 65536 /dev/urandom > "$WORK/dmgsrc/lost.bin"
 echo "an intact neighbour" > "$WORK/dmgsrc/ok.txt"
 DMG_ID=$(cb repo add "$WORK/dmgrepo" dmg | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 cb backup "$DMG_ID" "$WORK/dmgsrc" > /dev/null
-LOST_HASH=$(sha256sum "$WORK/dmgsrc/lost.bin" | cut -c1-64)
+# An object is named by SHA-256 over its type byte (1, a file) and then its
+# payload, never over the payload alone.
+LOST_HASH=$({ printf '\001'; cat "$WORK/dmgsrc/lost.bin"; } | sha256sum | cut -c1-64)
 DMG_DAT=$(find "$WORK/dmgrepo/packs" -name '*.dat' | head -1)
 if damage_beyond_parity "$WORK/dmgsrc/lost.bin" "$DMG_DAT"; then
     OUT=$(cb replicate "$DMG_ID" "$WORK/dmgrepl" 2>"$WORK/dmg.err"); RC=$?
@@ -1456,7 +1488,7 @@ cb backup "$GCD_ID" "$WORK/gcdsrc" > /dev/null
 rm -f "$WORK/gcdsrc/drop.bin"
 cb backup "$GCD_ID" "$WORK/gcdsrc" > /dev/null
 cb snapshot delete "$GCD_ID" 1 --force > /dev/null
-KEEP_HASH=$(sha256sum "$WORK/gcdsrc/keep.bin" | cut -c1-64)
+KEEP_HASH=$({ printf '\001'; cat "$WORK/gcdsrc/keep.bin"; } | sha256sum | cut -c1-64)
 GCD_DAT=$(find "$WORK/gcdrepo/packs" -name '*.dat' -size +100k | head -1)
 if [ -n "$GCD_DAT" ] && damage_beyond_parity "$WORK/gcdsrc/keep.bin" "$GCD_DAT"; then
     OUT=$(cb gc "$GCD_ID" 2>"$WORK/gcd.err"); RC=$?

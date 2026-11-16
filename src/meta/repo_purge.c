@@ -21,8 +21,7 @@
  * keeps a purge interrupted half way looking like a smaller repository.
  */
 static const char *const keyed_tables[] = {
-    "nodes", "sparse_regions", "hardlink_groups",
-    "xattr_refs", "xattr_blobs", "acl_refs", "acl_blobs",
+    "nodes",
     "pack_objects", "packs", "objects", "file_cache",
     "tags", "notes", "snapshots", "policy_values", "recovery_state",
     "journal", "repo_backup_paths", "snapshot_id_seq",

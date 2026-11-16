@@ -30,6 +30,7 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "cdc.h"
 #include "db_txn.h"
 #include "manifest.h"
 #include "pack.h"
@@ -271,37 +272,22 @@ static void test_phys_size_matches_bytes_on_disk(void **state)
     assert_true(r->nrows > 0);
 
     /*
-     * phys_size has to be the bytes the object really occupies, whichever way
-     * it was stored. A backup now writes into a pack, so most of these have no
-     * loose file at all; the ones that do are what the pack format cannot take
-     * without reading them twice.
+     * phys_size has to be the bytes the object really occupies. Every object
+     * is in a pack, and its phys_size is the stored payload alone, because
+     * the pack's own header and trailer are charged to packs.size - folding
+     * entry headers in here would count them twice.
      *
-     * The two storage forms count differently, and deliberately. A loose
-     * object's phys_size is its whole file, header and parity trailer
-     * included. A packed one's is the stored payload alone, because the pack's
-     * own header and trailer are charged to packs.size - so total bytes on
-     * disk is sum(packs.size) plus the phys_size of everything still loose,
-     * and folding entry headers in here would count them twice.
-     *
-     * Checking the packed case against pack_object_physical_size, which
-     * answers the other question - what the entry occupies, header included -
-     * ties the two conventions together. They disagreed silently before this
-     * test asked them to agree.
+     * Checking it against pack_object_physical_size, which answers the other
+     * question - what the entry occupies, header included - ties the two
+     * conventions together. They disagreed silently before this test asked
+     * them to agree.
      */
-    int loose = 0, packed = 0;
     for (int i = 0; i < r->nrows; i++) {
         const char *hex = r->rows[i][0];
         uint64_t phys = strtoull(r->rows[i][1], NULL, 10);
-
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
-
-        struct stat sb;
-        if (stat(path, &sb) == 0) {
-            assert_int_equal((unsigned long long)sb.st_size, phys);
-            loose++;
-            continue;
-        }
+        /* Never 'loose', and never still staged once the backup returns. */
+        assert_string_not_equal(r->rows[i][2], "loose");
+        assert_string_not_equal(r->rows[i][2], "staged");
 
         uint8_t hash[OBJECT_HASH_SIZE];
         for (size_t k = 0; k < OBJECT_HASH_SIZE; k++) {
@@ -312,13 +298,8 @@ static void test_phys_size_matches_bytes_on_disk(void **state)
         uint64_t entry_bytes = 0;
         assert_int_equal(pack_object_physical_size(store, hash, &entry_bytes), OK);
         assert_int_equal(entry_bytes, phys + sizeof(pack_dat_entry_hdr_t));
-        packed++;
     }
     db_result_free(r);
-
-    /* And the point of the change: this run packed rather than wrote loose. */
-    assert_true(packed > 0);
-    (void)loose;
 }
 
 /*
@@ -342,41 +323,36 @@ static void test_packed_phys_size_never_exceeds_the_payload(void **state)
     assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
 
     assert_int_equal(scalar("SELECT COUNT(*) FROM objects"
-                            " WHERE repo_id = ? AND location != 'loose'"
-                            "   AND phys_size > orig_size", "1"), 0);
+                            " WHERE repo_id = ? AND phys_size > orig_size", "1"), 0);
     /* The fixture is small text, under the floor below which compression is
      * not attempted, so the two are equal rather than merely ordered. */
     assert_true(scalar("SELECT COUNT(*) FROM objects"
-                       " WHERE repo_id = ? AND location != 'loose'"
-                       "   AND phys_size = orig_size", "1") > 0);
+                       " WHERE repo_id = ? AND phys_size = orig_size", "1") > 0);
 }
 
 
 /*
- * orig_size is the object's payload length, and packing must not change it.
+ * orig_size is the object's payload length, and the pack commit must not
+ * change it.
  *
  * The column used to hold two different things. Backup wrote the file's
  * logical size; the pack commit rewrote it from the object header, which for
- * a sparse object carries the payload - the region table plus the bytes that
- * are not holes. So `stats` and `summary` reported one original-size total
+ * a sparse object carried the payload - a region table plus the bytes that
+ * were not holes. So `stats` and `summary` reported one original-size total
  * before a pack and a smaller one after, on a repository whose contents had
  * not changed. Found on a 4.5 GB repository where the total moved by 23 MB.
  *
- * The logical size is not the object's to hold: two files with the same data
- * and different trailing holes have the same region table, the same payload
- * and therefore the same hash. It belongs to the node, and restore reads it
- * from there.
- *
- * The fixture is only meaningful if the filesystem under TEST_SRC reports
- * holes; where it does not, the file is stored dense and both numbers are the
- * logical size, so the test would pass without exercising anything. It checks
- * what the store actually wrote and skips rather than pass for that reason.
+ * Sparse objects are gone: a file with holes is a chunk list whose gaps are
+ * the holes, so its object's payload is the list, not the file. The
+ * invariant still worth holding is that the row the backup wrote, the row
+ * after the pack commit, and the entry's own header all agree, and that the
+ * node keeps the logical size restore reads.
  */
 static void test_pack_does_not_change_orig_size(void **state)
 {
     (void)state;
 
-    enum { LOGICAL = 64u * 1024 * 1024, DATA = 1024 * 1024 };
+    enum { LOGICAL = 8u * 1024 * 1024, DATA = 1024 * 1024 };
     int fd = open(TEST_SRC "/sparse.bin", O_CREAT | O_TRUNC | O_RDWR, 0644);
     assert_true(fd >= 0);
     char *buf = malloc(DATA);
@@ -411,38 +387,21 @@ static void test_pack_does_not_change_orig_size(void **state)
     uint64_t header_size = 0;
     uint8_t  otype = 0;
     assert_int_equal(object_get_info(store, hash, &header_size, &otype), OK);
-    if (otype != OBJECT_TYPE_SPARSE)
-        skip();   /* no holes here: the fixture is dense and proves nothing */
+    assert_int_equal(otype, OBJECT_TYPE_CHUNKLIST);
 
-    /* What backup recorded has to be what the object header says, because the
-     * pack commit will later take it from that header. */
     const char *hp[] = { "1", hex, NULL };
     assert_int_equal(db_execute(db,
-        "SELECT orig_size FROM objects WHERE repo_id = ? AND hash = ?",
+        "SELECT orig_size, location FROM objects WHERE repo_id = ? AND hash = ?",
         hp, &r), 0);
     assert_non_null(r);
     assert_int_equal(r->nrows, 1);
-    uint64_t before = strtoull(r->rows[0][0], NULL, 10);
+    uint64_t recorded = strtoull(r->rows[0][0], NULL, 10);
+    /* The pack commit has run: the row carries a pack id, not 'staged'. */
+    assert_string_not_equal(r->rows[0][1], "staged");
     db_result_free(r);
+    assert_int_equal(recorded, header_size);
 
-    assert_int_equal(before, header_size);
-    assert_true(before < LOGICAL);   /* the holes were never stored */
-
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_true(packed > 0);
-
-    assert_int_equal(db_execute(db,
-        "SELECT orig_size FROM objects WHERE repo_id = ? AND hash = ?",
-        hp, &r), 0);
-    assert_non_null(r);
-    assert_int_equal(r->nrows, 1);
-    uint64_t after = strtoull(r->rows[0][0], NULL, 10);
-    db_result_free(r);
-
-    assert_int_equal(after, before);
-
-    /* And the logical size is still recorded where it belongs. */
+    /* And the logical size is recorded on the node, where restore reads it. */
     assert_int_equal(scalar("SELECT size FROM nodes"
                             " WHERE repo_id = ? AND name = 'sparse.bin'", "1"),
                      LOGICAL);
@@ -625,6 +584,115 @@ static void test_unreadable_source_fails_but_unreadable_file_does_not(void **sta
     assert_int_equal(res.files, 3);   /* alpha, beta, gamma; not secret */
 }
 
+static int dir_entries(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL)
+        if (de->d_name[0] != '.') n++;
+    closedir(d);
+    return n;
+}
+
+/*
+ * A file of exactly `size` bytes of incompressible content from a seed, so
+ * the stored entry is as large as the object bound lets it be.
+ */
+static void write_sized(const char *path, uint64_t size, uint64_t seed)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert_true(fd >= 0);
+    enum { BUF = 1 << 20 };
+    uint64_t *buf = malloc(BUF);
+    assert_non_null(buf);
+    uint64_t x = seed * 0x9E3779B97F4A7C15ull + 1;
+    uint64_t left = size;
+    while (left > 0) {
+        for (size_t k = 0; k < BUF / sizeof(*buf); k++) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            buf[k] = x;
+        }
+        size_t n = left < BUF ? (size_t)left : (size_t)BUF;
+        assert_int_equal(write(fd, buf, n), (ssize_t)n);
+        left -= n;
+    }
+    free(buf);
+    close(fd);
+}
+
+static int files_identical(const char *a, const char *b)
+{
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    int same = fa && fb;
+    enum { BUF = 1 << 16 };
+    static char ba[BUF], bb[BUF];
+    while (same) {
+        size_t na = fread(ba, 1, BUF, fa), nb = fread(bb, 1, BUF, fb);
+        if (na != nb || memcmp(ba, bb, na) != 0) same = 0;
+        if (na == 0) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+
+/*
+ * Files at and past the object bound back up and restore byte for byte.
+ *
+ * Neither is one object: the chunker cuts at most CDC_MAX_DEFAULT (8 MiB)
+ * at a time, so both are chunk lists and no FILE object is larger than a
+ * chunk. One byte past the bound once failed the whole backup, before the
+ * chunker was wired in; now it is an ordinary file.
+ */
+static void bound_round_trip(const char *name, uint64_t size, uint64_t seed)
+{
+    char src[600], out[700];
+    snprintf(src, sizeof(src), "%s/%s", TEST_SRC, name);
+    snprintf(out, sizeof(out), "%s/out%s/%s", TEST_DIR, TEST_SRC, name);
+    write_sized(src, size, seed);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.files, 4);
+    assert_int_equal(res.bytes_logical,
+                     size + strlen("alpha content") +
+                     strlen("beta content") + strlen("gamma content"));
+
+    char sql[160];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM objects WHERE type = %d",
+             OBJECT_TYPE_CHUNKLIST);
+    assert_int_equal(scalar(sql, NULL), 1);
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM objects WHERE type = %d AND orig_size > %llu",
+             OBJECT_TYPE_FILE, (unsigned long long)CDC_MAX_DEFAULT);
+    assert_int_equal(scalar(sql, NULL), 0);
+
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, res.snapshot_id,
+                                 TEST_DIR "/out", NULL, &rr), OK);
+    assert_int_equal(rr.files, 4);
+    struct stat sb;
+    assert_int_equal(stat(out, &sb), 0);
+    assert_int_equal((uint64_t)sb.st_size, size);
+    assert_true(files_identical(src, out));
+}
+
+static void test_file_past_the_object_bound_round_trips(void **state)
+{
+    (void)state;
+    bound_round_trip("over.bin", OBJECT_MAX_BYTES + 1, 3);
+}
+
+static void test_file_at_the_object_bound_round_trips(void **state)
+{
+    (void)state;
+    bound_round_trip("exact.bin", OBJECT_MAX_BYTES, 4);
+}
+
 /* A non-sparse file of `mib` MiB, filled with a pattern rather than zeroes
  * so nothing along the way can mistake it for a hole. */
 static void write_big(const char *path, int mib)
@@ -640,18 +708,6 @@ static void write_big(const char *path, int mib)
     }
     free(buf);
     close(fd);
-}
-
-static int dir_entries(const char *path)
-{
-    DIR *d = opendir(path);
-    if (!d) return -1;
-    int n = 0;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL)
-        if (de->d_name[0] != '.') n++;
-    closedir(d);
-    return n;
 }
 
 /* Cancels the moment the store phase reaches the last entry, which the
@@ -679,7 +735,7 @@ static void cancel_at_last_entry(const char *phase, uint64_t done, uint64_t tota
 static void test_cancel_lands_inside_a_large_file(void **state)
 {
     (void)state;
-    write_big(TEST_DIR "/big.bin", 64);
+    write_big(TEST_DIR "/big.bin", 12);
     static const char *paths[] = { TEST_SRC, TEST_DIR "/big.bin" };
     atomic_int cancel = 0;
     backup_opts_t o = basic_opts();
@@ -713,139 +769,108 @@ static void test_cancel_lands_inside_a_large_file(void **state)
 }
 
 /*
- * The object writers stop on the store's flag directly, with their staging
- * file removed. Restore and pack read the same flag through the same
- * handle, which is how one flag reaches every loop below a job.
+ * The file writer stops on the store's flag directly, before it has staged
+ * anything. Restore reads the same flag through the same handle, which is
+ * how one flag reaches every loop below a job.
  */
 static void test_object_writer_stops_on_the_store_flag(void **state)
 {
     (void)state;
-    write_big(TEST_DIR "/big.bin", 24);
+    write_big(TEST_DIR "/big.bin", 12);
     int fd = open(TEST_DIR "/big.bin", O_RDONLY);
     assert_true(fd >= 0);
     atomic_int cancel = 1;
     store_set_cancel(store, &cancel);
     uint8_t hash[OBJECT_HASH_SIZE];
     object_write_t w;
-    status_t st = object_store_file_info(store, fd, 24u << 20, hash, &w);
+    status_t st = object_store_file_packed(store, fd, 12u << 20, NULL, hash, &w);
     store_set_cancel(store, NULL);
     close(fd);
     assert_int_equal(st, ERR_BUSY);
+    /* Nothing was staged, so a flush installs no pack. */
+    assert_int_equal(object_store_flush(store), OK);
     assert_int_equal(dir_entries(TEST_REPO "/tmp"), 0);
+    assert_int_equal(dir_entries(TEST_REPO "/packs"), 0);
 }
 
 /*
- * The readers and the packer stop on the same flag: a restore of one large
- * file, and the auto-pack that ends every backup, were each as long as the
- * file and as uncancellable. Loose first, then packed, and a cancelled pack
- * leaves the object loose and no new pack behind.
- */
-static void test_readers_and_packer_stop_on_the_store_flag(void **state)
-{
-    (void)state;
-    write_big(TEST_DIR "/big.bin", 24);
-    /* A format 3 backup writes nothing loose, so the loose object these
-     * readers stop inside is made through the store directly. */
-    int bfd = open(TEST_DIR "/big.bin", O_RDONLY);
-    assert_true(bfd >= 0);
-    uint8_t hash[OBJECT_HASH_SIZE];
-    object_write_t bw;
-    assert_int_equal(object_store_file_info(store, bfd, 24u << 20, hash, &bw), OK);
-    close(bfd);
-
-    char hex[OBJECT_HASH_SIZE * 2 + 1], loose[PATH_MAX];
-    object_hash_to_hex(hash, hex);
-    snprintf(loose, sizeof(loose), TEST_REPO "/objects/%.2s/%s", hex, hex + 2);
-    struct stat sb;
-
-    int out = open("/dev/null", O_WRONLY);
-    assert_true(out >= 0);
-    atomic_int cancel = 1;
-    uint64_t sz = 0;
-
-    store_set_cancel(store, &cancel);
-    assert_int_equal(object_load_stream(store, hash, out, &sz, NULL), ERR_BUSY);
-
-    int packs_before = dir_entries(TEST_REPO "/packs");
-    assert_int_equal(repo_pack(store, NULL, NULL, NULL), ERR_BUSY);
-    assert_int_equal(dir_entries(TEST_REPO "/packs"), packs_before);
-    assert_int_equal(dir_entries(TEST_REPO "/tmp"), 0);
-    assert_int_equal(stat(loose, &sb), 0);   /* still loose */
-
-    store_set_cancel(store, NULL);
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_true(packed >= 1);
-    assert_int_equal(stat(loose, &sb), -1);  /* packed now */
-
-    store_set_cancel(store, &cancel);
-    assert_int_equal(object_load_stream(store, hash, out, &sz, NULL), ERR_BUSY);
-    store_set_cancel(store, NULL);
-    assert_int_equal(object_load_stream(store, hash, out, &sz, NULL), OK);
-    assert_int_equal(sz, 24u << 20);
-    close(out);
-}
-
-/*
- * B060, format 3: an object the repository holds and the index has no row
- * for gets its row back when the next run meets it.
+ * B060: an object an interrupted run left in the repository, with no index
+ * row, is recorded at its real size when the next run meets it.
  *
- * The whole-file form of this - a large object an interrupted run left
- * loose - cannot arise any more, since backup writes nothing loose. The
- * same gap can for a chunk: dedup finds it present and stores nothing, and
- * a run that recorded only new objects would leave it with no row, which
- * compaction reads as dead. So every chunk a run meets is recorded.
+ * A backup killed after a large object was installed but before the batch
+ * holding its row committed leaves exactly that. The next run deduplicated
+ * against it, the writer reported a physical size of 0 for an object it had
+ * not written, and the row went in as zero bytes - a 2,291,249,496 byte
+ * object, in the report that found it, so summary under-reported by that
+ * much. The object is in a pack now rather than loose, and its phys_size is
+ * the stored payload, the entry less its header.
  */
 static void test_object_left_by_an_interrupted_run_keeps_its_size(void **state)
 {
     (void)state;
-    write_big(TEST_DIR "/big.bin", 20);
+    /* Under the chunker's minimum, so the file is one object; a larger one
+     * is a chunk list and the same holds for each of its chunks. */
+    int wfd = open(TEST_DIR "/big.bin", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert_true(wfd >= 0);
+    char *blk = malloc(256 * 1024);
+    assert_non_null(blk);
+    for (size_t k = 0; k < 256 * 1024; k++) blk[k] = (char)('a' + (k * 7) % 26);
+    assert_int_equal(write(wfd, blk, 256 * 1024), 256 * 1024);
+    free(blk);
+    close(wfd);
+
+    /* What the killed run left: the object in a pack, and no row. */
+    int fd = open(TEST_DIR "/big.bin", O_RDONLY);
+    assert_true(fd >= 0);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    object_write_t w;
+    assert_int_equal(object_store_file_packed(store, fd, 256u * 1024u, NULL, hash, &w), OK);
+    close(fd);
+    assert_int_equal(w.is_new, 1);
+    assert_int_equal(object_store_flush(store), OK);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    uint64_t entry_bytes = 0;
+    assert_int_equal(pack_object_physical_size(store, hash, &entry_bytes), OK);
+    uint64_t stored = entry_bytes - sizeof(pack_dat_entry_hdr_t);
+    assert_int_equal(stored, w.phys_bytes);
+    /* The pack's commit creates the row along with the pack's own rows, so
+     * a crash cannot leave a sealed pack without them any more; a row lost
+     * some other way (a damaged or restored index) is what is left to test. */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects", NULL), 1);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM objects", NULL, NULL), 0);
+
     static const char *paths[] = { TEST_DIR "/big.bin" };
     backup_opts_t o = basic_opts();
     o.paths = paths;
     backup_result_t res;
     assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.objects_new, 0);
 
-    /* One chunk's row lost. */
-    db_result_t *r = NULL;
-    assert_int_equal(db_execute(db,
-        "SELECT hash FROM objects WHERE type = 1 ORDER BY hash LIMIT 1", NULL, &r), 0);
-    assert_int_equal(r->nrows, 1);
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    snprintf(hex, sizeof(hex), "%s", r->rows[0][0]);
-    db_result_free(r);
     char sql[256];
+    snprintf(sql, sizeof(sql),
+             "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
+    assert_int_equal(scalar(sql, NULL), (int)stored);
+
+    /* The row's sizes are the pack's, as its commit recorded them, whatever
+     * figures the caller passes: a caller that dedups against an object it
+     * did not write has nothing true to say about its size. */
     snprintf(sql, sizeof(sql), "DELETE FROM objects WHERE hash = '%s'", hex);
     assert_int_equal(db_execute_non_query(db, sql, NULL, NULL), 0);
-
-    /* The file changes at its end, so the next run reads it again and
-     * meets every earlier chunk as already present. */
-    FILE *f = fopen(TEST_DIR "/big.bin", "ab");
-    assert_non_null(f);
-    fputs("one more line at the end\n", f);
-    fclose(f);
-    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
-    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM objects WHERE hash = '%s'", hex);
-    assert_int_equal(scalar(sql, NULL), 1);
-
-    /* A row an earlier build wrote as zero bytes is repaired by the next
-     * writer that offers a real size, and only such a row. */
-    int fd = open(TEST_DIR "/big.bin", O_RDONLY);
-    assert_true(fd >= 0);
-    uint8_t hash[OBJECT_HASH_SIZE];
-    object_write_t w;
-    assert_int_equal(object_store_file_info(store, fd, 1u << 20, hash, &w), OK);
-    close(fd);
-    object_hash_to_hex(hash, hex);
-    assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
-                                           0, 1u << 20), OK);
-    assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
-                                           w.phys_bytes, 1u << 20), OK);
-    snprintf(sql, sizeof(sql), "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
-    assert_int_equal(scalar(sql, NULL), (int)w.phys_bytes);
-    assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
-                                           1, 1u << 20), OK);
-    assert_int_equal(scalar(sql, NULL), (int)w.phys_bytes);
+    assert_int_equal(store_index_put_packed(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                           0, 1), OK);
+    snprintf(sql, sizeof(sql),
+             "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
+    assert_int_equal(scalar(sql, NULL), (int)stored);
+    snprintf(sql, sizeof(sql),
+             "SELECT orig_size FROM objects WHERE hash = '%s'", hex);
+    assert_int_equal(scalar(sql, NULL), 256 * 1024);
+    /* And an existing row is left as it stands. */
+    assert_int_equal(store_index_put_packed(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                           1, 1), OK);
+    snprintf(sql, sizeof(sql),
+             "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
+    assert_int_equal(scalar(sql, NULL), (int)stored);
 }
 
 /*
@@ -853,14 +878,15 @@ static void test_object_left_by_an_interrupted_run_keeps_its_size(void **state)
  *
  * store_open only removes what is an hour old, because it cannot know who
  * else is writing; a backup holds the repository's write lock and can. 134
- * MB of obj.* from one killed backup survived every later run. Only the
- * engine's own names are touched.
+ * MB of staging files from one killed backup survived every later run. Only
+ * the engine's own names are touched; obj.* and par.* were the loose
+ * writers' and are not the engine's any more.
  */
 static void test_backup_removes_staging_files_left_by_a_killed_run(void **state)
 {
     (void)state;
-    const char *stale[] = { TEST_REPO "/tmp/obj.Ab12Cd", TEST_REPO "/tmp/pack-dat.Zz99Yy",
-                            TEST_REPO "/tmp/snap.Qq11Ww", TEST_REPO "/tmp/par.Rr22Tt" };
+    const char *stale[] = { TEST_REPO "/tmp/snapids.Ab12Cd", TEST_REPO "/tmp/pack-dat.Zz99Yy",
+                            TEST_REPO "/tmp/snap.Qq11Ww", TEST_REPO "/tmp/deleting.Rr22Tt" };
     struct timespec past[2];
     clock_gettime(CLOCK_REALTIME, &past[0]);
     past[0].tv_sec -= 30;
@@ -882,17 +908,17 @@ static void test_backup_removes_staging_files_left_by_a_killed_run(void **state)
 }
 
 /*
- * B089: bytes move while one large file is stored or restored.
+ * B089: the byte count a run reports covers one large file.
  *
  * Progress was reported between files only, so a backup of a 2 GiB file sat
- * at one entry and one byte count for the half minute it took, and so did
- * the event stream built on it. These record every byte count a run reports
- * and ask for one strictly inside a single large file: a value that only
- * the store loops, not the per-file accounting, can produce.
+ * at one entry and one byte count for the half minute it took. That file is
+ * a chunk list now, and moving inside it is the chunker's to report. What
+ * holds for one object - at most OBJECT_MAX_BYTES, read and loaded whole -
+ * is that its bytes are counted through the store's I/O hook, so a run of
+ * one file still ends on its full size and never runs backwards.
  */
 typedef struct {
     uint64_t total;
-    int      mid;       /* reports with 0 < done < total */
     uint64_t last;
     int      backwards; /* a report below the one before it */
 } bytes_seen_t;
@@ -903,7 +929,6 @@ static void note_bytes(void *ctx, uint64_t done, uint64_t total)
     if (done < b->last) b->backwards++;
     b->last = done;
     b->total = total;
-    if (done > 0 && done < total) b->mid++;
 }
 
 static void ignore_progress(const char *phase, uint64_t done, uint64_t total, void *ctx)
@@ -959,7 +984,7 @@ static int64_t only_snapshot(void)
 
 static void restore_and_watch(const char *dest, uint64_t size)
 {
-    bytes_seen_t seen = { 0, 0, 0, 0 };
+    bytes_seen_t seen = { 0, 0, 0 };
     restore_opts_t ro;
     memset(&ro, 0, sizeof(ro));
     ro.bytes_cb = note_bytes;
@@ -970,25 +995,24 @@ static void restore_and_watch(const char *dest, uint64_t size)
     assert_int_equal(restore_run(store, db, repo_id, only_snapshot(), dest, &ro, &rr), OK);
     assert_int_equal(seen.total, size);
     assert_int_equal(seen.last, size);
-    assert_true(seen.mid > 0);
     assert_int_equal(seen.backwards, 0);
 }
 
-static void test_bytes_move_inside_one_large_file(void **state)
+static void test_bytes_cover_one_large_file(void **state)
 {
     (void)state;
-    const uint64_t size = 64u << 20;
-    write_big(TEST_DIR "/big.bin", 64);
+    const uint64_t size = 12u << 20;
+    write_big(TEST_DIR "/big.bin", 12);
     static const char *paths[] = { TEST_DIR "/big.bin" };
     backup_opts_t o = basic_opts();
     o.paths = paths;
-    bytes_seen_t seen = { 0, 0, 0, 0 };
+    bytes_seen_t seen = { 0, 0, 0 };
     o.bytes_cb = note_bytes;
     o.progress_cb = ignore_progress;
     o.progress_ctx = &seen;
     assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
     assert_int_equal(seen.total, size);
-    assert_true(seen.mid > 0);
+    assert_int_equal(seen.last, size);
     assert_int_equal(seen.backwards, 0);
 
     /* The hook is the run's, not the handle's: it is gone afterwards. */
@@ -997,15 +1021,10 @@ static void test_bytes_move_inside_one_large_file(void **state)
     store_get_io_progress(store, &fn, &fctx);
     assert_null(fn);
 
-    /* Restored from its chunks, which the backup packed as it went (format
-     * 3): nothing is left for a pack pass to move. */
     restore_and_watch(TEST_DIR "/out1", size);
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, 0);
 }
 
-/* The sparse writer has its own read loop, so it is checked on its own. */
+/* A file with holes is read span by span, so it is checked on its own. */
 static void test_bytes_move_inside_one_sparse_file(void **state)
 {
     (void)state;
@@ -1024,13 +1043,13 @@ static void test_bytes_move_inside_one_sparse_file(void **state)
     static const char *paths[] = { TEST_DIR "/sparse.bin" };
     backup_opts_t o = basic_opts();
     o.paths = paths;
-    bytes_seen_t seen = { 0, 0, 0, 0 };
+    bytes_seen_t seen = { 0, 0, 0 };
     o.bytes_cb = note_bytes;
     o.progress_cb = ignore_progress;
     o.progress_ctx = &seen;
     assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
     assert_int_equal(seen.total, (uint64_t)64 << 20);
-    assert_true(seen.mid > 0);
+    assert_int_equal(seen.last, (uint64_t)64 << 20);
     assert_int_equal(seen.backwards, 0);
 }
 
@@ -1057,8 +1076,6 @@ typedef struct {
     int             slow_ms;      /* per callback, once the probe is out */
     int             slow_calls;   /* callbacks slowed so far */
     int             slow_max;     /* and at most this many */
-    int             want_mid;     /* trigger mid-file rather than per entry */
-    uint64_t        bytes_done, bytes_total;
 } txn_probe_t;
 
 static void *txn_probe_run(void *arg)
@@ -1079,61 +1096,24 @@ static void *txn_probe_run(void *arg)
     return NULL;
 }
 
-static void probe_bytes(void *ctx, uint64_t done, uint64_t total)
-{
-    txn_probe_t *pr = ctx;
-    pr->bytes_done  = done;
-    pr->bytes_total = total;
-}
-
 static void probe_progress(const char *phase, uint64_t done, uint64_t total,
                            void *ctx)
 {
     (void)done; (void)total;
     txn_probe_t *pr = ctx;
     if (!phase || strcmp(phase, "store") != 0) return;
-    if (!pr->started) {
-        /* Mid-file, or once several entries in: the slowing starts with the
-         * phase, so by then the batch has been open across regular files. */
-        int ready = pr->want_mid
-            ? (pr->bytes_done > 0 && pr->bytes_done < pr->bytes_total)
-            : (pr->slow_calls >= 8);
-        if (ready) {
-            pr->started = 1;
-            clock_gettime(CLOCK_MONOTONIC, &pr->t0);
-            assert_int_equal(pthread_create(&pr->thr, NULL, txn_probe_run, pr), 0);
-        }
+    /* Once several entries in: the slowing starts with the phase, so by
+     * then the batch has been open across regular files. */
+    if (!pr->started && pr->slow_calls >= 8) {
+        pr->started = 1;
+        clock_gettime(CLOCK_MONOTONIC, &pr->t0);
+        assert_int_equal(pthread_create(&pr->thr, NULL, txn_probe_run, pr), 0);
     }
-    if ((pr->started || !pr->want_mid) && pr->slow_calls < pr->slow_max) {
+    if (pr->slow_calls < pr->slow_max) {
         pr->slow_calls++;
         struct timespec ts = { 0, (long)pr->slow_ms * 1000000L };
         nanosleep(&ts, NULL);
     }
-}
-
-/* One large file: the read is outside any transaction. */
-static void test_metadata_write_is_not_held_by_a_large_file(void **state)
-{
-    (void)state;
-    write_big(TEST_DIR "/big.bin", 48);
-    static const char *paths[] = { TEST_DIR "/big.bin" };
-    backup_opts_t o = basic_opts();
-    o.paths = paths;
-    txn_probe_t pr;
-    memset(&pr, 0, sizeof(pr));
-    pr.want_mid = 1;
-    pr.slow_ms  = 100;
-    pr.slow_max = 30;          /* 3 s of slow reading after the probe */
-    o.progress_cb  = probe_progress;
-    o.bytes_cb     = probe_bytes;
-    o.progress_ctx = &pr;
-
-    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
-    assert_true(pr.started);
-    pthread_join(pr.thr, NULL);
-    assert_int_equal(pr.begin_st, OK);
-    /* The old code: until the whole file was read, about 3 s here. */
-    assert_true(pr.waited_ms < 1000);
 }
 
 /* Many small slow files: the batch is cut by time, not only by count. */
@@ -1171,8 +1151,8 @@ static void test_metadata_write_is_not_held_by_a_slow_batch(void **state)
  * or not another writer wanted the lock, and on the UAT host's storage that
  * cost a WAL sync per large file: 60 s of a 400 s backup. Here the batch is
  * kept open well past 200 ms by a slow progress callback, and three files sit
- * over the old 4 MiB line (two packed, one loose and read on this thread),
- * and the store phase must still commit exactly once per 2,000 files.
+ * over the old 4 MiB line, and the store phase must still commit exactly
+ * once per 2,000 files.
  */
 static void slow_store_progress(const char *phase, uint64_t done, uint64_t total,
                                 void *ctx)
@@ -1197,10 +1177,9 @@ static void test_no_waiter_means_no_extra_commits(void **state)
     }
     write_big(TEST_SRC "/six.bin", 6);
     write_big(TEST_SRC "/seven.bin", 7);
-    write_big(TEST_SRC "/twenty.bin", 20);
+    write_big(TEST_SRC "/twelve.bin", 12);
 
     backup_opts_t o = basic_opts();
-    o.store_workers = 1;           /* the 20 MiB file is read on this thread */
     int calls = 0;
     o.progress_cb  = slow_store_progress;
     o.progress_ctx = &calls;
@@ -1214,42 +1193,8 @@ static void test_no_waiter_means_no_extra_commits(void **state)
      * added one per large file and one per 200 ms on top. */
     assert_int_equal(res.commits_store, 3);
     assert_int_equal(res.commits_trees, 1);
-    /* 13 MiB packed: no seal in the loop, one at the end. */
+    /* 25 MiB packed: no seal in the loop, one at the end. */
     assert_int_equal(res.commits_pack, 1);
-}
-
-/*
- * OWN-16: the batch is held across a large file now, so a writer that queues
- * mid-file has to be noticed mid-file. It must get in within the B107 bound,
- * and cost the backup exactly one commit beyond what it would have made
- * alone: the commits a backup adds are bounded by the writers it meets.
- */
-static void test_a_waiter_mid_file_costs_one_commit(void **state)
-{
-    (void)state;
-    write_big(TEST_DIR "/big.bin", 48);
-    static const char *paths[] = { TEST_DIR "/big.bin" };
-    backup_opts_t o = basic_opts();
-    o.paths = paths;
-    o.store_workers = 1;
-    txn_probe_t pr;
-    memset(&pr, 0, sizeof(pr));
-    pr.want_mid = 1;
-    pr.slow_ms  = 100;
-    pr.slow_max = 30;
-    o.progress_cb  = probe_progress;
-    o.bytes_cb     = probe_bytes;
-    o.progress_ctx = &pr;
-
-    backup_result_t res;
-    memset(&res, 0, sizeof(res));
-    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
-    assert_true(pr.started);
-    pthread_join(pr.thr, NULL);
-    assert_int_equal(pr.begin_st, OK);
-    assert_true(pr.waited_ms < 1000);
-    /* Alone: one batch, committed at the end. The waiter adds one. */
-    assert_int_equal(res.commits_store, 2);
 }
 
 /*
@@ -1438,9 +1383,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_backup_runs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deleted_newest_snapshot_id_is_not_reused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_orphaned_snapshot_record_keeps_its_id, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_bytes_move_inside_one_large_file, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_phases_end_at_their_totals, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_bytes_cover_one_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_bytes_move_inside_one_sparse_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_phases_end_at_their_totals, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_record_written, setup, teardown),
         cmocka_unit_test_setup_teardown(test_index_is_internally_consistent, setup, teardown),
         cmocka_unit_test_setup_teardown(test_root_tree_is_walkable, setup, teardown),
@@ -1454,15 +1399,14 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_rejects_empty_path_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_of_nothing_fails_without_a_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unreadable_source_fails_but_unreadable_file_does_not, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_past_the_object_bound_round_trips, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_at_the_object_bound_round_trips, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_lands_inside_a_large_file, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_metadata_write_is_not_held_by_a_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_metadata_write_is_not_held_by_a_slow_batch, setup, teardown),
         cmocka_unit_test_setup_teardown(test_no_waiter_means_no_extra_commits, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_a_waiter_mid_file_costs_one_commit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_waiter_gets_in_between_trees, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_persistent_writer_does_not_cost_a_commit_per_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_writer_stops_on_the_store_flag, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_readers_and_packer_stop_on_the_store_flag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_left_by_an_interrupted_run_keeps_its_size, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_removes_staging_files_left_by_a_killed_run, setup, teardown),
     };

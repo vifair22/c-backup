@@ -30,6 +30,7 @@
 #include <cmocka.h>
 
 #include "cdc.h"
+#include "pack.h"
 #include "chunklist.h"
 #include "object.h"
 #include "store.h"
@@ -751,6 +752,8 @@ static delta_t store_delta(const char *path)
     store_write_stats(store, &before);
     cdc_result_t r;
     assert_int_equal(store_path(path, NULL, &r), OK);
+    /* Objects stage into the store's own pack; sealing it is the write. */
+    assert_int_equal(object_store_flush(store), OK);
     store_write_stats(store, &after);
     delta_t out;
     out.written = store_write_stats_diff(&after, &before, &d);
@@ -1018,18 +1021,23 @@ static void test_corrupt_chunk_detected(void **state)
     assert_int_equal(chunklist_iter_next(it, &x, &done), OK);
     chunklist_iter_close(it);
 
-    /* Flip far more bytes in the second chunk's loose file than its parity
-     * can correct. */
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    object_hash_to_hex(x.hash, hex);
+    /* Flip far more bytes in the second chunk's pack entry than its
+     * parity can correct. */
+    assert_int_equal(object_store_flush(store), OK);
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    assert_int_equal(pack_resolve_location(store, x.hash, &pnum, &off), OK);
     char path[512];
-    snprintf(path, sizeof(path), REPO "/objects/%.2s/%s", hex, hex + 2);
+    assert_int_equal(pack_dat_path_resolve(path, sizeof(path), REPO, pnum), 0);
     int fd = open(path, O_RDWR);
     assert_true(fd >= 0);
     uint8_t junk[65536];
     memset(junk, 0xEE, sizeof(junk));
-    assert_int_equal(pwrite(fd, junk, sizeof(junk), 4096), (ssize_t)sizeof(junk));
+    assert_int_equal(pwrite(fd, junk, sizeof(junk),
+                            (off_t)(off + sizeof(pack_dat_entry_hdr_t) + 4096)),
+                     (ssize_t)sizeof(junk));
     close(fd);
+    pack_cache_invalidate(store);
 
     unlink(DST);
     fd = open(DST, O_RDWR | O_CREAT | O_TRUNC, 0644);

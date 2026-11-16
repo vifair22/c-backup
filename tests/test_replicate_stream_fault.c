@@ -1,31 +1,28 @@
 #define _POSIX_C_SOURCE 200809L
 
 /*
- * Replication moves an object in bounded memory, whatever its size.
+ * Replication when something goes wrong part-way.
  *
- * OWN-26: replication read each object's whole stored size into one buffer,
- * loose or packed, so replicating a 50 GiB file needed 50 GiB of memory -
- * design constraint 2 ("files exceed RAM: stream, never buffer a whole
- * file") broken on the path that exists to make an offsite copy. The
- * transfer now pulls a chunk at a time from source file to replica pack,
- * re-encrypting in the same chunk when asked to.
+ * This suite began as the proof of OWN-26, that replication moved an
+ * object in bounded memory whatever its size. Format 3 bounds every object
+ * at OBJECT_MAX_BYTES and moves each one whole, so the bounded-memory
+ * cases went with the streaming they measured. What remains is what
+ * replication still has to get right when the source or the target
+ * misbehaves:
  *
- * Proving that at 50 GiB would take 50 GiB. Instead the chunk is lowered
- * (pack_stored_set_chunk) so a 12 MiB object crosses nearly two hundred
- * chunk boundaries, and the fault injector's malloc wrapper reports the
- * largest single allocation made while the transfer ran. Whole-object
- * buffering shows up there as a 12 MiB request; streaming keeps it to the
- * fixed buffers of the pack writer and its parity pass, independent of the
- * object. Every case then rebuilds the target's index from nothing,
- * verifies it deep and restores byte-identical files from it, because a
- * stream that is small and wrong is worse than a buffer that is large and
- * right.
+ *   - damage at the source within parity arrives corrected, so the
+ *     replica's fresh parity does not certify bad bytes;
+ *   - damage beyond parity is sent, counted and listed, and fails the run
+ *     (OWN-31) instead of a replica silently taking bad data;
+ *   - a write that fails part-way through an entry is cut back out of the
+ *     staged pack, so the replica never holds a torn entry, the run fails
+ *     naming the snapshot, and no record is written for it;
+ *   - a cancel, or a source that does not authenticate, stops the snapshot
+ *     before its record.
  *
- * The other half is a stream failing part-way. A chunked transfer has a
- * state the buffered one never had - half an entry written into the staged
- * pack - and that half must come back out: the run fails naming the
- * snapshot, no record is written, the replica still verifies, and the next
- * run completes it.
+ * Every case that leaves a replica behind rebuilds its index from nothing,
+ * verifies it deep and, where a snapshot completed, restores it byte for
+ * byte.
  */
 
 #include <setjmp.h>
@@ -42,14 +39,13 @@
 
 #include <cmocka.h>
 #include <cutils/db.h>
-#include <openssl/sha.h>
 
 #include "backup.h"
 #include "fault_inject.h"
 #include "manifest.h"
 #include "object.h"
 #include "pack.h"
-#include "parity_stream.h"
+#include "parity.h"
 #include "reindex.h"
 #include "chunklist.h"
 #include "replicate.h"
@@ -71,19 +67,9 @@
 #define TEST_OUT   TEST_DIR "/out"
 #define TEST_KEYS  TEST_DIR "/keys"
 
-/* A chunk small enough that a few-MiB object is many of them. */
-#define CHUNK      ((size_t)64 * 1024)
-#define BIG_BYTES  ((size_t)12 * 1024 * 1024)
-/*
- * The largest single allocation the transfer may make, and none of what
- * reaches it scales with an object: the chunk, the parity pass's 128 KiB
- * read buffer and 256 KiB parity stream, and - the largest - the fixed
- * 4 MiB buffer the parity stream replays a spilled trailer through when a
- * pack is sealed. The objects are three times that, so buffering one whole
- * cannot pass. The loose-object cases measure only the transfer, before
- * any seal, and hold it to the chunk itself.
- */
-#define MEM_BOUND  RS_PS_REPLAY_CHUNK
+/* Large enough to span many parity groups and to stand out from the small
+ * objects around it, well inside the object bound. */
+#define BIG_BYTES  ((size_t)4 * 1024 * 1024)
 
 extern const db_migration_t app_migrations[];
 
@@ -119,7 +105,7 @@ static void fill_random(uint8_t *buf, size_t n, uint64_t seed)
 }
 
 /* Random 64-byte blocks, each written twice: LZ4 halves it, so the packed
- * object carries a codec and is still many chunks long. */
+ * object carries a codec. */
 static void fill_half(uint8_t *buf, size_t n, uint64_t seed)
 {
     fill_random(buf, n, seed);
@@ -148,7 +134,6 @@ static int open_fixture(int encrypted)
 {
     rmrf(TEST_DIR);
     fault_reset_all();
-    pack_stored_set_chunk(CHUNK);
     if (mkdir(TEST_DIR, 0700) != 0) return -1;
     if (mkdir(TEST_SRC, 0700) != 0) return -1;
     if (db_open(&db, TEST_DB) != 0) return -1;
@@ -173,7 +158,6 @@ static int setup_encrypted(void **state) { (void)state; return open_fixture(1); 
 static int teardown(void **state)
 {
     (void)state;
-    pack_stored_set_chunk(0);
     fault_reset_all();
     store_index_free(idx); idx = NULL;
     store_close(store);    store = NULL;
@@ -304,153 +288,25 @@ static status_t replicate_reencrypt(replicate_result_t *rr)
     return st;
 }
 
-static manifest_entry_t mk_file(const char *name, const uint8_t hash[OBJECT_HASH_SIZE],
-                                uint64_t size)
-{
-    manifest_entry_t e;
-    memset(&e, 0, sizeof(e));
-    e.name     = name;
-    e.name_len = (uint16_t)strlen(name);
-    e.type     = NODE_TYPE_REG;
-    e.mode     = 0644;
-    e.size     = size;
-    e.mtime_sec = 1700000000;
-    memcpy(e.target_hash, hash, OBJECT_HASH_SIZE);
-    return e;
-}
-
-static int is_loose(const char *root, const uint8_t h[OBJECT_HASH_SIZE])
-{
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) snprintf(hex + i * 2, 3, "%02x", h[i]);
-    char p[512];
-    snprintf(p, sizeof(p), "%s/objects/%.2s/%s", root, hex, hex + 2);
-    struct stat sb;
-    return stat(p, &sb) == 0;
-}
-
 /* ------------------------------------------------------------------ */
-
-/* Packed source, plain replica: bounded, and restores byte for byte. */
-static void test_large_packed_objects_stream_in_bounded_memory(void **state)
-{
-    (void)state;
-    big_snapshot();
-
-    fault_malloc_peak = 0;
-    replicate_result_t rr;
-    assert_int_equal(replicate_plain(&rr), OK);
-    size_t peak = fault_malloc_peak;
-
-    assert_int_equal(rr.snapshots_sent, 1);
-    assert_true(rr.bytes_sent > BIG_BYTES);
-    assert_true(peak <= MEM_BOUND);
-    assert_int_equal(verify_and_restore(TEST_REPL, NULL, 0, 1), 1);
-}
-
-/* A loose source object takes the other half of object_stored_open. */
-static void test_large_loose_object_streams_in_bounded_memory(void **state)
-{
-    (void)state;
-    uint8_t *body = malloc(BIG_BYTES);
-    assert_non_null(body);
-    fill_random(body, BIG_BYTES, 21);
-    uint8_t blob[OBJECT_HASH_SIZE], root[OBJECT_HASH_SIZE];
-    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, body, BIG_BYTES, blob), OK);
-    assert_true(is_loose(TEST_REPO, blob));
-    manifest_entry_t e[1] = { mk_file("loose.bin", blob, BIG_BYTES) };
-    assert_int_equal(manifest_write_tree(store, e, 1, root), OK);
-
-    replica_sink_t sink;
-    assert_int_equal(replica_sink_local_open(TEST_REPL, &marker, &sink), OK);
-    fault_malloc_peak = 0;
-    replicate_result_t rr;
-    status_t st = replicate_tree(store, &sink, root, NULL, &rr);
-    size_t peak = fault_malloc_peak;
-    sink.v->close(sink.ctx);
-    assert_int_equal(st, OK);
-    assert_true(peak <= CHUNK);
-
-    replica_reader_t *rd = NULL;
-    assert_int_equal(replica_reader_open(TEST_REPL, &rd), OK);
-    void *got = NULL;
-    size_t len = 0;
-    assert_int_equal(object_load(replica_reader_store(rd), blob, &got, &len, NULL), OK);
-    assert_int_equal(len, BIG_BYTES);
-    assert_memory_equal(got, body, BIG_BYTES);
-    free(got);
-    replica_reader_close(rd);
-    free(body);
-}
-
-/*
- * Re-encrypting, in each of its three shapes: system key to another, to an
- * unencrypted repository, an unencrypted source to an encrypted one. In
- * format 3 each target cuts with its own gear table, so every file is
- * re-chunked into it from plaintext: memory is bounded by one object (a
- * chunk is at most 8 MiB, any object 16 MiB), never by a file.
- */
-static void reencrypt_big(repo_enc_mode_t dst_mode)
-{
-    big_snapshot();
-    int64_t dst_id = make_dest(dst_mode);
-
-    fault_malloc_peak = 0;
-    replicate_result_t rr;
-    assert_int_equal(replicate_reencrypt(&rr), OK);
-    size_t peak = fault_malloc_peak;
-
-    assert_int_equal(rr.snapshots_sent, 1);
-    assert_int_equal(rr.rechunked, 1);
-    assert_true(rr.files_rechunked >= 2);
-    assert_true(rr.objects_written > 0);
-    assert_true(peak <= (size_t)OBJECT_MAX_BYTES);
-    assert_int_equal(verify_and_restore(TEST_DST, db, dst_id, 1), 1);
-}
-
-static void test_reencrypt_to_a_new_key_streams(void **state)
-{
-    (void)state;
-    reencrypt_big(REPO_ENC_SYSTEM);
-}
-
-static void test_reencrypt_to_plaintext_streams(void **state)
-{
-    (void)state;
-    reencrypt_big(REPO_ENC_NONE);
-}
-
-static void test_encrypt_a_plain_source_streams(void **state)
-{
-    (void)state;
-    reencrypt_big(REPO_ENC_SYSTEM);
-}
-
+/* A sink that misbehaves part-way                                      */
 /* ------------------------------------------------------------------ */
 
 /*
- * A sink whose link drops part-way through a large object: the reads it
- * passes through to the real sink start failing after a few chunks.
+ * Wraps the real local sink. Armed, the first large object it passes on
+ * meets a disk that fills: fwrite lets the small writes before the payload
+ * through (a pack header, the entry header) and refuses the payload, so the
+ * entry is torn where a full disk would tear it. With cancel set it cancels
+ * the job after cancel_after objects instead.
  */
 typedef struct {
     replica_sink_t  inner;
     int             armed;
-    int             reads;
-    int             fail_after;
-    replica_read_fn real_read;
-    void           *real_ctx;
-    atomic_int     *cancel;   /* set: cancel the job instead of failing the read */
+    int             fired;
+    int             puts;
+    int             cancel_after;
+    atomic_int     *cancel;
 } drop_ctx_t;
-
-static status_t d_read(void *v, void *buf, size_t n)
-{
-    drop_ctx_t *d = v;
-    if (d->reads++ >= d->fail_after) {
-        if (!d->cancel) return set_error(ERR_IO, "link dropped mid-object");
-        atomic_store(d->cancel, 1);
-    }
-    return d->real_read(d->real_ctx, buf, n);
-}
 
 static status_t d_has_objects(void *v, const uint8_t *h, size_t n, uint8_t *out)
 {
@@ -461,16 +317,18 @@ static status_t d_has_objects(void *v, const uint8_t *h, size_t n, uint8_t *out)
 static status_t d_put_object(void *v, const replica_object_t *o)
 {
     drop_ctx_t *d = v;
-    /* Chunks (format 3: about 1 MiB each) and not trees or small files;
-     * the read count runs across objects, so the drop lands mid-chunk. */
-    if (!d->armed || o->payload_len < 256 * 1024)
+    d->puts++;
+    if (d->cancel && d->puts > d->cancel_after) atomic_store(d->cancel, 1);
+    /* Chunks (format 3: about 1 MiB each), not trees or small files. */
+    if (!d->armed || d->fired || o->payload_len < 256 * 1024)
         return d->inner.v->put_object(d->inner.ctx, o);
-    replica_object_t w = *o;
-    d->real_read = o->read;
-    d->real_ctx  = o->read_ctx;
-    w.read     = d_read;
-    w.read_ctx = d;
-    return d->inner.v->put_object(d->inner.ctx, &w);
+
+    d->fired = 1;
+    fault_fwrite_bytes_seen = 0;
+    fault_fwrite_bytes_left = 4096;
+    status_t st = d->inner.v->put_object(d->inner.ctx, o);
+    fault_fwrite_bytes_left = -1;
+    return st;
 }
 
 static status_t d_commit(void *v, const replica_snapshot_t *s)
@@ -486,6 +344,12 @@ static status_t d_has_snapshot(void *v, int64_t id,
     return d->inner.v->has_snapshot(d->inner.ctx, id, root, out);
 }
 
+static status_t d_raise_ids(void *v, int64_t at_least)
+{
+    drop_ctx_t *d = v;
+    return d->inner.v->raise_snapshot_ids(d->inner.ctx, at_least);
+}
+
 static void d_close(void *v)
 {
     drop_ctx_t *d = v;
@@ -495,18 +359,27 @@ static void d_close(void *v)
 static const replica_sink_vtbl_t drop_vtbl = {
     .has_objects = d_has_objects, .put_object = d_put_object,
     .commit_snapshot = d_commit, .has_snapshot = d_has_snapshot,
-    .close = d_close,
+    .raise_snapshot_ids = d_raise_ids, .close = d_close,
 };
 
+/* The wrapper keeps the inner sink's key id and re-encryption settings. */
+static replica_sink_t drop_sink(drop_ctx_t *d)
+{
+    replica_sink_t s = d->inner;
+    s.v   = &drop_vtbl;
+    s.ctx = d;
+    return s;
+}
+
 /*
- * Snapshot 1 is small; snapshot 2 brings the large files, and the link
- * drops ten chunks into the first of them. The half-written entry is cut
- * back out of the staged pack, the run fails naming snapshot 2, and close
- * installs only whole entries - which the reindex and deep verify would
- * catch otherwise, since a torn entry breaks the walk of every entry after
- * it. The next run sends the rest and restores byte for byte.
+ * Snapshot 1 is small; snapshot 2 brings the large files, and the disk
+ * fills under the first of them. The torn entry is cut back out of the
+ * staged pack, the run fails naming snapshot 2, and close installs only
+ * whole entries - which the reindex and deep verify would catch otherwise,
+ * since a torn entry breaks the walk of every entry after it. Snapshot 2
+ * has no record. The next run sends the rest and restores byte for byte.
  */
-static void test_fault_mid_stream_fails_the_snapshot(void **state)
+static void test_write_failing_mid_entry_fails_the_snapshot(void **state)
 {
     (void)state;
     write_file(TEST_SRC "/small.txt", "snapshot one\n");
@@ -518,18 +391,18 @@ static void test_fault_mid_stream_fails_the_snapshot(void **state)
     drop_ctx_t d;
     memset(&d, 0, sizeof(d));
     d.armed = 1;
-    d.fail_after = 10;
     assert_int_equal(replica_sink_local_open(TEST_REPL, &marker, &d.inner), OK);
-    replica_sink_t sink = { .v = &drop_vtbl, .ctx = &d };
+    replica_sink_t sink = drop_sink(&d);
     replicate_result_t rr;
     status_t st = replicate_run(store, db, repo_id, &sink, NULL, NULL, NULL, &rr);
     sink.v->close(sink.ctx);
+    fault_reset_all();
 
     assert_int_not_equal(st, OK);
+    assert_true(d.fired);
     assert_non_null(strstr(err_msg(), "snapshot 2"));
-    assert_non_null(strstr(err_msg(), "link dropped mid-object"));
+    assert_non_null(strstr(err_msg(), "write entry"));
     err_clear();
-    assert_true(d.reads > d.fail_after);
     assert_int_equal(rr.snapshots_sent, 1);
     assert_true(record_exists(TEST_REPL, 1));
     assert_false(record_exists(TEST_REPL, 2));
@@ -543,12 +416,11 @@ static void test_fault_mid_stream_fails_the_snapshot(void **state)
 }
 
 /*
- * A cancel lands while one large object is crossing. It is honoured at the
- * next chunk rather than when the object finishes, which for a 50 GiB file
- * would be hours later, and the half-sent entry is discarded like any
- * other failure.
+ * A cancel lands part-way through a snapshot. It is honoured before the
+ * next object, the snapshot gets no record, and what was staged installs
+ * whole, so the next run completes it.
  */
-static void test_cancel_mid_object_stops_at_the_next_chunk(void **state)
+static void test_cancel_part_way_writes_no_record(void **state)
 {
     (void)state;
     big_snapshot();
@@ -556,11 +428,10 @@ static void test_cancel_mid_object_stops_at_the_next_chunk(void **state)
     atomic_int cancel = 0;
     drop_ctx_t d;
     memset(&d, 0, sizeof(d));
-    d.armed = 1;
-    d.fail_after = 5;
+    d.cancel_after = 1;
     d.cancel = &cancel;
     assert_int_equal(replica_sink_local_open(TEST_REPL, &marker, &d.inner), OK);
-    replica_sink_t sink = { .v = &drop_vtbl, .ctx = &d };
+    replica_sink_t sink = drop_sink(&d);
     replicate_result_t rr;
     status_t st = replicate_run(store, db, repo_id, &sink, &cancel, NULL, NULL, &rr);
     sink.v->close(sink.ctx);
@@ -569,7 +440,7 @@ static void test_cancel_mid_object_stops_at_the_next_chunk(void **state)
     assert_non_null(strstr(err_msg(), "snapshot 1"));
     assert_non_null(strstr(err_msg(), "cancelled"));
     err_clear();
-    assert_int_equal(d.reads, d.fail_after + 1);
+    assert_int_equal(d.puts, d.cancel_after + 1);
     assert_false(record_exists(TEST_REPL, 1));
     assert_true(tmp_is_empty(TEST_REPL));
 
@@ -594,7 +465,7 @@ static void big_pack_cb(uint32_t num, void *v)
 {
     biggest_t *b = v;
     char name[64];
-    snprintf(name, sizeof(name), "pack-%08u.dat", num);
+    snprintf(name, sizeof(name), "pack-" PACK_NUM_FMT ".dat", num);
     b->cur = num;
     uint32_t ver = 0, cnt = 0;
     assert_int_equal(pack_enumerate_dat(store, name, &ver, &cnt, big_entry_cb, b), OK);
@@ -606,7 +477,7 @@ static void big_pack_cb(uint32_t num, void *v)
  * byte of it is cut again, so the run fails naming the snapshot, and the
  * destination holds no record and no staging.
  */
-static void test_source_that_fails_authentication_mid_stream(void **state)
+static void test_source_that_fails_authentication(void **state)
 {
     (void)state;
     big_snapshot();
@@ -627,6 +498,7 @@ static void test_source_that_fails_authentication_mid_stream(void **state)
     for (size_t i = 0; i < sizeof(junk); i++) junk[i] ^= 0x5a;
     assert_int_equal(pwrite(fd, junk, sizeof(junk), at), (ssize_t)sizeof(junk));
     close(fd);
+    pack_cache_invalidate(store);
 
     replicate_result_t rr;
     status_t st = replicate_reencrypt(&rr);
@@ -639,17 +511,8 @@ static void test_source_that_fails_authentication_mid_stream(void **state)
 }
 
 /* ------------------------------------------------------------------ */
-
-/* Hands out a fixed byte pattern, failing on the given call. */
-typedef struct { uint8_t fill; int calls; int fail_at; } pattern_src_t;
-
-static status_t pattern_read(void *v, void *buf, size_t n)
-{
-    pattern_src_t *p = v;
-    if (p->calls++ == p->fail_at) return set_error(ERR_IO, "source went away");
-    memset(buf, p->fill, n);
-    return OK;
-}
+/* The stored writer on its own                                         */
+/* ------------------------------------------------------------------ */
 
 typedef struct { int n; uint8_t first[3]; } walk_t;
 
@@ -661,13 +524,12 @@ static void walk_cb(const pack_entry_info_t *info, void *v)
 }
 
 /*
- * The writer, without replication around it: an entry that fails part-way
- * is cut back out and the writer goes on. Replication stops at the first
- * failure, so there a torn tail would sit harmlessly after the last whole
- * entry; this is the case where it would not - an entry written after the
- * torn one, which a walk of the pack has to step over the torn bytes to
- * reach. Without the cut, the walk reads the torn payload as the next
- * header.
+ * The writer, without replication around it: an entry whose write fails
+ * part-way is cut back out and the writer goes on. Replication stops at the
+ * first failure, so there a torn tail would sit harmlessly after the last
+ * whole entry; this is the case where it would not - an entry written after
+ * the torn one, which a walk of the pack has to step over the torn bytes to
+ * reach. Without the cut, the walk reads the torn header as the next entry.
  */
 static void test_stored_writer_cuts_a_failed_entry_out(void **state)
 {
@@ -676,27 +538,32 @@ static void test_stored_writer_cuts_a_failed_entry_out(void **state)
     memset(ha, 0xA1, sizeof(ha));
     memset(hb, 0xB2, sizeof(hb));
     memset(hc, 0xC3, sizeof(hc));
-    const uint64_t n = (uint64_t)CHUNK * 8 + 123;
+    const size_t n = (size_t)512 * 1024 + 123;
+    uint8_t *pa = malloc(n), *pb = malloc(n), *pc = malloc(n);
+    assert_non_null(pa);
+    assert_non_null(pb);
+    assert_non_null(pc);
+    memset(pa, 0xAA, n);
+    memset(pb, 0xBB, n);
+    memset(pc, 0xCC, n);
 
     pack_stored_writer_t *w = NULL;
     assert_int_equal(pack_stored_open(store, &w), OK);
+    assert_int_equal(pack_stored_add(w, ha, OBJECT_TYPE_FILE, COMPRESS_NONE,
+                                     ENCRYPT_NONE, n, pa, n), OK);
 
-    pattern_src_t a = { 0xAA, 0, -1 };
-    assert_int_equal(pack_stored_add_stream(w, ha, OBJECT_TYPE_FILE, COMPRESS_NONE,
-                                            ENCRYPT_NONE, n, n, pattern_read, &a), OK);
-    assert_int_equal(a.calls, 9);
-
-    pattern_src_t b = { 0xBB, 0, 4 };
-    assert_int_not_equal(pack_stored_add_stream(w, hb, OBJECT_TYPE_FILE, COMPRESS_NONE,
-                                                ENCRYPT_NONE, n, n, pattern_read, &b), OK);
-    assert_non_null(strstr(err_msg(), "source went away"));
+    /* The entry header is written, the payload is refused. */
+    fault_fwrite_at = 1;
+    assert_int_not_equal(pack_stored_add(w, hb, OBJECT_TYPE_FILE, COMPRESS_NONE,
+                                         ENCRYPT_NONE, n, pb, n), OK);
+    fault_fwrite_at = -1;
+    assert_non_null(strstr(err_msg(), "write entry"));
     err_clear();
     assert_false(pack_stored_has(w, hb));
     assert_int_equal(pack_stored_count(w), 1);
 
-    pattern_src_t c = { 0xCC, 0, -1 };
-    assert_int_equal(pack_stored_add_stream(w, hc, OBJECT_TYPE_FILE, COMPRESS_NONE,
-                                            ENCRYPT_NONE, n, n, pattern_read, &c), OK);
+    assert_int_equal(pack_stored_add(w, hc, OBJECT_TYPE_FILE, COMPRESS_NONE,
+                                     ENCRYPT_NONE, n, pc, n), OK);
 
     uint32_t num = pack_stored_pack_num(w);
     uint32_t packed = 0;
@@ -704,7 +571,7 @@ static void test_stored_writer_cuts_a_failed_entry_out(void **state)
     assert_int_equal(packed, 2);
 
     char name[64];
-    snprintf(name, sizeof(name), "pack-%08u.dat", num);
+    snprintf(name, sizeof(name), "pack-" PACK_NUM_FMT ".dat", num);
     walk_t wk;
     memset(&wk, 0, sizeof(wk));
     uint32_t ver = 0, cnt = 0;
@@ -714,22 +581,20 @@ static void test_stored_writer_cuts_a_failed_entry_out(void **state)
     assert_int_equal(wk.first[0], 0xA1);
     assert_int_equal(wk.first[1], 0xC3);
 
-    /* And the entry after the cut reads back whole. */
+    /* And the entry after the cut reads back whole and undamaged. */
     pack_cache_invalidate(store);
     object_stored_info_t info;
-    uint64_t len = 0;
-    object_stored_reader_t *r = NULL;
-    assert_int_equal(object_stored_open(store, hc, &info, &len, &r), OK);
+    void  *got = NULL;
+    size_t len = 0;
+    int    damaged = -1;
+    assert_int_equal(object_read_stored(store, hc, &info, &got, &len, &damaged), OK);
+    assert_int_equal(damaged, 0);
     assert_int_equal(len, n);
-    uint8_t *buf = malloc((size_t)n);
-    assert_non_null(buf);
-    assert_int_equal(object_stored_read(r, buf, (size_t)n), OK);
-    for (uint64_t i = 0; i < n; i++) assert_int_equal(buf[i], 0xCC);
-    /* Nothing past the stored length. */
-    assert_int_not_equal(object_stored_read(r, buf, 1), OK);
-    err_clear();
-    free(buf);
-    object_stored_close(r);
+    assert_memory_equal(got, pc, n);
+    free(got);
+    free(pa);
+    free(pb);
+    free(pc);
 }
 
 /*
@@ -744,28 +609,30 @@ static void test_stored_writer_that_cannot_cut_installs_nothing(void **state)
     memset(ha, 0xA1, sizeof(ha));
     memset(hb, 0xB2, sizeof(hb));
     memset(hc, 0xC3, sizeof(hc));
-    const uint64_t n = (uint64_t)CHUNK * 4;
+    const size_t n = (size_t)256 * 1024;
+    uint8_t *p = malloc(n);
+    assert_non_null(p);
+    memset(p, 0x5E, n);
 
     pack_stored_writer_t *w = NULL;
     assert_int_equal(pack_stored_open(store, &w), OK);
-    pattern_src_t a = { 0xAA, 0, -1 };
-    assert_int_equal(pack_stored_add_stream(w, ha, OBJECT_TYPE_FILE, COMPRESS_NONE,
-                                            ENCRYPT_NONE, n, n, pattern_read, &a), OK);
+    assert_int_equal(pack_stored_add(w, ha, OBJECT_TYPE_FILE, COMPRESS_NONE,
+                                     ENCRYPT_NONE, n, p, n), OK);
 
     /* The only fseeko in an entry's path is the one that cuts it back. */
     fault_fseeko_at = 0;
-    pattern_src_t b = { 0xBB, 0, 2 };
-    assert_int_not_equal(pack_stored_add_stream(w, hb, OBJECT_TYPE_FILE, COMPRESS_NONE,
-                                                ENCRYPT_NONE, n, n, pattern_read, &b), OK);
+    fault_fwrite_at = 1;
+    assert_int_not_equal(pack_stored_add(w, hb, OBJECT_TYPE_FILE, COMPRESS_NONE,
+                                         ENCRYPT_NONE, n, p, n), OK);
     fault_fseeko_at = -1;
-    /* The reader's failure is what is reported, not the cut's. */
-    assert_non_null(strstr(err_msg(), "source went away"));
+    fault_fwrite_at = -1;
+    /* The write's failure is what is reported, not the cut's. */
+    assert_non_null(strstr(err_msg(), "write entry"));
     err_clear();
 
-    pattern_src_t c = { 0xCC, 0, -1 };
-    assert_int_not_equal(pack_stored_add_stream(w, hc, OBJECT_TYPE_FILE, COMPRESS_NONE,
-                                                ENCRYPT_NONE, n, n, pattern_read, &c), OK);
-    assert_int_equal(c.calls, 0);
+    assert_int_not_equal(pack_stored_add(w, hc, OBJECT_TYPE_FILE, COMPRESS_NONE,
+                                         ENCRYPT_NONE, n, p, n), OK);
+    assert_non_null(strstr(err_msg(), "refusing to add more"));
     err_clear();
 
     uint32_t packed = 0;
@@ -773,10 +640,11 @@ static void test_stored_writer_that_cannot_cut_installs_nothing(void **state)
     err_clear();
     assert_false(pack_object_exists(store, ha));
     assert_true(tmp_is_empty(TEST_REPO));
+    free(p);
 }
 
 /* ------------------------------------------------------------------ */
-/* Damage at the source (OWN-24/OWN-23 on the streaming read)           */
+/* Damage at the source (OWN-24/OWN-23, OWN-31)                         */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -837,10 +705,9 @@ static void damage_packed(const uint8_t hash[OBJECT_HASH_SIZE], uint64_t off, si
 /*
  * Damage the source's packed entries within parity, then replicate. The
  * target computes fresh parity over whatever it is sent, so damage shipped
- * as it stood would verify clean there and restore wrong. The streaming
- * read corrects it instead, in the same bounded memory, and the replica
- * verifies clean (its parity covers the corrected bytes, not the damage)
- * and restores byte for byte.
+ * as it stood would verify clean there and restore wrong. The stored read
+ * corrects it instead, and the replica verifies clean (its parity covers
+ * the corrected bytes, not the damage) and restores byte for byte.
  */
 static void test_damaged_packed_source_replicates_corrected(void **state)
 {
@@ -856,69 +723,14 @@ static void test_damaged_packed_source_replicates_corrected(void **state)
     damage_packed(hh, lh / 4 + 11u, 300);
 
     parity_stats_reset();
-    fault_malloc_peak = 0;
     replicate_result_t rr;
     assert_int_equal(replicate_plain(&rr), OK);
-    size_t peak = fault_malloc_peak;
     assert_int_equal(rr.snapshots_sent, 1);
-    assert_true(peak <= MEM_BOUND);
+    assert_int_equal(rr.objects_damaged, 0);
     assert_true(parity_stats_get().repaired >= 2);
     assert_int_equal((int)parity_stats_get().uncorrectable, 0);
 
     assert_int_equal(verify_and_restore(TEST_REPL, NULL, 0, 1), 1);
-}
-
-/* The loose half of the reader: a damaged loose object arrives corrected,
- * and the transfer is still held to the chunk. */
-static void test_damaged_loose_source_replicates_corrected(void **state)
-{
-    (void)state;
-    uint8_t *body = malloc(BIG_BYTES);
-    assert_non_null(body);
-    fill_random(body, BIG_BYTES, 31);
-    uint8_t blob[OBJECT_HASH_SIZE], root[OBJECT_HASH_SIZE];
-    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, body, BIG_BYTES, blob), OK);
-    assert_true(is_loose(TEST_REPO, blob));
-    manifest_entry_t e[1] = { mk_file("loose.bin", blob, BIG_BYTES) };
-    assert_int_equal(manifest_write_tree(store, e, 1, root), OK);
-
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) snprintf(hex + i * 2, 3, "%02x", blob[i]);
-    char p[512];
-    snprintf(p, sizeof(p), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
-    int fd = open(p, O_RDWR);
-    assert_true(fd >= 0);
-    uint8_t b = 0;
-    off_t at = (off_t)sizeof(object_header_t) + 5 * 1024 * 1024 + 17;
-    assert_int_equal(pread(fd, &b, 1, at), 1);
-    b ^= 0x81;
-    assert_int_equal(pwrite(fd, &b, 1, at), 1);
-    close(fd);
-
-    replica_sink_t sink;
-    assert_int_equal(replica_sink_local_open(TEST_REPL, &marker, &sink), OK);
-    parity_stats_reset();
-    fault_malloc_peak = 0;
-    replicate_result_t rr;
-    status_t st = replicate_tree(store, &sink, root, NULL, &rr);
-    size_t peak = fault_malloc_peak;
-    sink.v->close(sink.ctx);
-    assert_int_equal(st, OK);
-    assert_true(peak <= CHUNK);
-    assert_true(parity_stats_get().repaired > 0);
-
-    replica_reader_t *rd = NULL;
-    assert_int_equal(replica_reader_open(TEST_REPL, &rd), OK);
-    void *got = NULL;
-    size_t len = 0;
-    parity_stats_reset();
-    assert_int_equal(object_load(replica_reader_store(rd), blob, &got, &len, NULL), OK);
-    assert_int_equal(len, BIG_BYTES);
-    assert_memory_equal(got, body, BIG_BYTES);
-    assert_int_equal((int)parity_stats_get().repaired, 0);
-    free(got);
-    replica_reader_close(rd);
-    free(body);
 }
 
 /* Damage 4 KiB of a packed entry: eight times the burst parity rebuilds. */
@@ -931,10 +743,10 @@ static int replica_loads(const uint8_t hash[OBJECT_HASH_SIZE])
 {
     replica_reader_t *rd = NULL;
     assert_int_equal(replica_reader_open(TEST_REPL, &rd), OK);
-    int nul = open("/dev/null", O_WRONLY | O_CLOEXEC);
-    assert_true(nul >= 0);
-    status_t st = object_load_stream(replica_reader_store(rd), hash, nul, NULL, NULL);
-    close(nul);
+    void  *got = NULL;
+    size_t len = 0;
+    status_t st = object_load(replica_reader_store(rd), hash, &got, &len, NULL);
+    free(got);
     err_clear();
     replica_reader_close(rd);
     return st == OK;
@@ -981,23 +793,11 @@ int main(void)
                                         setup_plain, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_packed_source_replicates_corrected,
                                         setup_plain, teardown),
-        cmocka_unit_test_setup_teardown(test_damaged_loose_source_replicates_corrected,
+        cmocka_unit_test_setup_teardown(test_write_failing_mid_entry_fails_the_snapshot,
                                         setup_plain, teardown),
-        cmocka_unit_test_setup_teardown(test_large_packed_objects_stream_in_bounded_memory,
+        cmocka_unit_test_setup_teardown(test_cancel_part_way_writes_no_record,
                                         setup_plain, teardown),
-        cmocka_unit_test_setup_teardown(test_large_loose_object_streams_in_bounded_memory,
-                                        setup_plain, teardown),
-        cmocka_unit_test_setup_teardown(test_reencrypt_to_a_new_key_streams,
-                                        setup_encrypted, teardown),
-        cmocka_unit_test_setup_teardown(test_reencrypt_to_plaintext_streams,
-                                        setup_encrypted, teardown),
-        cmocka_unit_test_setup_teardown(test_encrypt_a_plain_source_streams,
-                                        setup_plain, teardown),
-        cmocka_unit_test_setup_teardown(test_fault_mid_stream_fails_the_snapshot,
-                                        setup_plain, teardown),
-        cmocka_unit_test_setup_teardown(test_cancel_mid_object_stops_at_the_next_chunk,
-                                        setup_plain, teardown),
-        cmocka_unit_test_setup_teardown(test_source_that_fails_authentication_mid_stream,
+        cmocka_unit_test_setup_teardown(test_source_that_fails_authentication,
                                         setup_encrypted, teardown),
         cmocka_unit_test_setup_teardown(test_stored_writer_cuts_a_failed_entry_out,
                                         setup_plain, teardown),

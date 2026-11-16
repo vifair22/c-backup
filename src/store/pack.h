@@ -3,6 +3,7 @@
 #include "error.h"
 #include "store.h"
 #include "object.h"
+#include "parity.h"
 #include "progress.h"
 #include <stdio.h>
 #include <stdint.h>
@@ -25,78 +26,99 @@
  *
  * A pack file at any other version is refused with a message that says to
  * rebuild it, not decoded on a guess.
+ *
+ * 6 is repository format 3: the entry layout is version 5's, but names now
+ * cover the type byte, entries are bounded and encrypted entries carry
+ * type || name as associated data, so a version 5 pack copied in by hand
+ * would fail every name check. Refusing it at its header says why.
  */
-#define PACK_VERSION     5u
+#define PACK_VERSION     6u
 
 /*
- * Objects above this threshold are streamed chunk-by-chunk rather than loaded
- * entirely into memory. Matches STREAM_CHUNK in object.c.
- *
- * In the header because it is part of pack_backup_add's contract as well as an
- * internal size choice: an entry header carries its object's hash, so an object
- * that cannot be held in memory cannot be hashed before its header is written,
- * and the writer refuses it rather than guessing.
+ * Where pack n lives: packs/<shard>/pack-<n>.dat, the shard being n >> 8 so
+ * a directory holds 256 packs. Six hex digits are exactly n >> 8 of any u32
+ * and ten decimal digits are any u32, so no pack number can produce a name
+ * the directory scan would not parse back. .deleting-<n> markers use the
+ * same number width.
  */
-#define PACK_STREAM_THRESHOLD ((uint64_t)(16 * 1024 * 1024))
+#define PACK_SHARD_DIGITS 6u
+#define PACK_NUM_DIGITS   10u
+#define PACK_SHARD_FMT    "%06x"
+#define PACK_NUM_FMT      "%010u"
+#define PACK_SHARD_OF(n)  ((uint32_t)(n) >> 8)
 
 /*
  * The seal: the body size a pack is closed at. When adding the next entry
  * would take a pack past it, the pack is installed and another started.
- * Every writer seals here - backup, pack, coalescing, gc's rewrite and
- * replication - so a pack holds at most this much plus, when one entry is
- * itself larger, that one entry.
- *
- * Packs larger than this exist anyway and every reader accepts them: a
- * backup before OWN-16 and a replication before OWN-19 wrote one pack per
- * run or per snapshot, of any size. gc splits such a pack at the seal the
- * first time it rewrites it.
+ * Every writer seals here - backup, coalescing, gc's rewrite, replication
+ * and the store's own writer - so a pack holds at most this much plus, when
+ * the seal falls inside it, one more entry.
  */
 #define PACK_MAX_MULTI_BYTES ((uint64_t)(256 * 1024 * 1024))
 
 /*
- * Pack all loose objects into a new pack file.
- * *out_packed (may be NULL) receives the number of objects packed.
- */
-status_t repo_pack(store_t *store, uint32_t *out_packed,
-                   task_progress_fn progress, void *progress_ctx);
-
-/*
- * What one pack run found and did, for the job result.
+ * Entries per pack, at most. Every writer rolls over on it as well as on
+ * bytes (the *_full predicates), and every reader refuses a pack claiming
+ * more, so no writer can produce a pack its own reader refuses.
  *
- * A run that packed nothing said why only in the daemon log, and the job
- * that ran it recorded no result at all (B099). `reason` is NULL when
- * something was packed, and otherwise a static string saying why nothing
- * was: there were no loose objects, every one was already skip-marked as
- * incompressible, or the probe found the rest incompressible and marked
- * them. Counts are filled as far as the run got, failure included.
+ * Chosen for the trailer, not the body: each entry costs 280 fixed trailer
+ * bytes plus up to one parity group of rounding (1,024 bytes) whatever its
+ * size, so a pack of a million one-byte entries has a 1.3 GB trailer. The
+ * assertion below holds it under the trailer's 32-bit size field. A million
+ * entries at the seal is a 268-byte mean entry; real packs roll over on
+ * bytes long before.
  */
-typedef struct pack_report {
-    uint64_t    loose;          /* loose objects found */
-    uint64_t    skip_marked;    /* already marked incompressible, left loose */
-    uint64_t    incompressible; /* marked by this run's probe, left loose */
-    uint64_t    packed;         /* moved into packs */
-    const char *reason;         /* why nothing was packed, or NULL */
-} pack_report_t;
+#define PACK_MAX_ENTRIES 1000000u
 
-/* repo_pack, reporting into *out (may be NULL). repo_pack is this with
- * only the packed count kept. */
-status_t repo_pack_report(store_t *store, pack_report_t *out,
-                          task_progress_fn progress, void *progress_ctx);
+/* The largest entry: its 51-byte header and the largest stored payload. */
+#define PACK_ENTRY_MAX_BYTES ((uint64_t)51 + OBJECT_MAX_STORED_BYTES)
 
 /*
- * The function this used to document is gone. Packs install with a single
- * rename now, so there is no interrupted two-file move to replay; what does
- * survive a crash is an orphaned staging file, which store_open sweeps by age.
+ * The largest pack body (file header and entries, the trailer excluded):
+ * the seal plus one maximal entry, which is the most a writer that rolls
+ * over at the seal can produce. Enforced when a pack is sealed and refused
+ * by every reader.
  */
+#define PACK_MAX_BYTES (PACK_MAX_MULTI_BYTES + PACK_ENTRY_MAX_BYTES)
+
+/*
+ * The largest parity trailer such a body can carry, every term at its worst:
+ *
+ *   4                         file header CRC
+ *   + n * (260 + 4 + 4 + 4)   per entry: header parity, CRC, two size words
+ *   + n * 8                   the offsets table
+ *   + 4 + 12                  entry count and footer
+ *   + RS parity               ceil(C_i / 15,296) * 1,024 per entry, at most
+ *                             (body / 15,296 + n) * 1,024 in total
+ */
+#define PACK_TRAILER_MAX_BYTES                                                    \
+    ((uint64_t)4 + (uint64_t)PACK_MAX_ENTRIES * (260u + 12u + 8u) + 16u +         \
+     (PACK_MAX_BYTES / PARITY_GROUP_DATA + 1u + (uint64_t)PACK_MAX_ENTRIES) *    \
+         PARITY_GROUP_PAR)
+
+/* The largest pack file there can be. A reader refuses anything larger. */
+#define PACK_MAX_FILE_BYTES (PACK_MAX_BYTES + PACK_TRAILER_MAX_BYTES)
+
+/*
+ * Format 3 keeps the trailer's sizes 32-bit (the footer's trailer_size and
+ * each block's size word) and makes wrapping impossible instead: no pack a
+ * writer can produce has a trailer, or a parity block, past UINT32_MAX. If
+ * a constant above moves, this decides whether the format still holds.
+ */
+_Static_assert(PACK_TRAILER_MAX_BYTES <= (uint64_t)UINT32_MAX,
+               "a maximal pack's parity trailer must fit its 32-bit size field");
+_Static_assert(OBJECT_MAX_STORED_BYTES / PARITY_GROUP_DATA * PARITY_GROUP_PAR +
+               PARITY_GROUP_PAR + 272u <= (uint64_t)UINT32_MAX,
+               "a maximal entry's parity block must fit its 32-bit size word");
 
 /* --- used by object.c -------------------------------------------- */
 
 /*
- * Search all pack index files for hash.  If found, decompress and
- * return the payload in *out_data / *out_size.  Returns OK,
- * ERR_NOT_FOUND (not in any pack), ERR_TOO_LARGE (uncompressed object
- * exceeds STREAM_CHUNK — use pack_object_load_stream instead),
- * or ERR_IO / ERR_CORRUPT.
+ * Find hash through the store's resolver, read its entry, correct it from
+ * parity where needed, decrypt, decompress and check it against its name.
+ * Returns OK, ERR_NOT_FOUND (not in any pack), or ERR_IO / ERR_CORRUPT.
+ * Every entry is bounded by OBJECT_MAX_BYTES, so the whole object is held
+ * in memory and authenticated before any of it is returned.
  */
 status_t pack_object_load(store_t *store,
                           const uint8_t hash[OBJECT_HASH_SIZE],
@@ -104,79 +126,28 @@ status_t pack_object_load(store_t *store,
                           uint8_t *out_type);
 
 /*
- * Stream a packed object to out_fd without buffering the full payload.
- * Safe for large COMPRESS_NONE objects that would OOM pack_object_load.
- */
-status_t pack_object_load_stream(store_t *store,
-                                 const uint8_t hash[OBJECT_HASH_SIZE],
-                                 int out_fd,
-                                 uint64_t *out_size,
-                                 uint8_t *out_type);
-
-/*
- * Load at most max_bytes of uncompressed data from a packed object.
- * Uses LZ4_decompress_safe_partial for LZ4 objects — avoids decompressing
- * the entire payload.  Skips hash verification (partial data can't be hashed).
- * *out_full_size receives the full uncompressed size from the entry header.
- * *out_size receives the number of bytes actually returned (≤ max_bytes).
- */
-status_t pack_object_load_prefix(store_t *store,
-                                  const uint8_t hash[OBJECT_HASH_SIZE],
-                                  size_t max_bytes,
-                                  void **out_data, size_t *out_size,
-                                  uint64_t *out_full_size,
-                                  uint8_t *out_type);
-
-/*
- * Read a packed object's entry without decrypting or decompressing it.
- * The loose-object counterpart is object_read_stored, which dispatches here.
- * Caller frees *out_payload.
+ * Read a packed object's entry without decrypting or decompressing it,
+ * corrected from its parity where needed. *out_damaged (may be NULL) is set
+ * when the bytes still fail their CRC after correction: damage beyond
+ * parity, handed over as it stands, which a caller moving the object
+ * elsewhere must report (OWN-31). Caller frees *out_payload.
  */
 status_t pack_object_read_stored(store_t *store,
                                  const uint8_t hash[OBJECT_HASH_SIZE],
                                  uint8_t *out_type, uint8_t *out_compression,
                                  uint8_t *out_encryption,
                                  uint64_t *out_uncompressed_size,
-                                 void **out_payload, size_t *out_len);
-
-/*
- * Open a packed object's entry for reading as stored, without loading it.
- * On OK, *out reads *out_len payload bytes, in order, through
- * pack_stored_read; pack_stored_close releases it. object_stored_open is
- * the caller and the only one that should be.
- *
- * The bytes handed over are corrected from the entry's parity: open
- * CRC-scans the payload, and on a mismatch every read is served from a
- * window corrected group by group, so damage parity can carry is never
- * passed on. Memory is one window (at most 64 groups, about 1 MiB) whatever
- * the entry's size.
- */
-typedef struct pack_stored_reader pack_stored_reader_t;
-
-status_t pack_object_open_stored(store_t *store,
-                                 const uint8_t hash[OBJECT_HASH_SIZE],
-                                 uint8_t *out_type, uint8_t *out_compression,
-                                 uint8_t *out_encryption,
-                                 uint64_t *out_uncompressed_size,
-                                 uint64_t *out_len, pack_stored_reader_t **out);
-status_t pack_stored_read(pack_stored_reader_t *r, void *buf, size_t n);
-void     pack_stored_close(pack_stored_reader_t *r);
-
-/* After every byte has been read: did any of them carry damage beyond
- * parity, handed over as it stood? The caller must report it (OWN-31). */
-int      pack_stored_damaged(const pack_stored_reader_t *r);
+                                 void **out_payload, size_t *out_len,
+                                 int *out_damaged);
 
 /*
  * Write a pack out of objects that are already in stored form.
  *
- * Everything repo_pack does on the way in - decrypt, probe, compress,
+ * Everything pack_backup_add does on the way in - name, probe, compress,
  * encrypt - is skipped, because these bytes have already been through it
  * somewhere else. Replication is the caller: it moves objects exactly as
  * they sit on disk so that a target which never receives the key can still
- * hold them, and a compressed object has nowhere to live except a pack. The
- * loose format carries a compression field but every loose reader refuses
- * anything but COMPRESS_NONE, on the correct grounds that only packing
- * compresses.
+ * hold them.
  *
  * No key is required and none is used.
  *
@@ -189,44 +160,18 @@ typedef struct pack_stored_writer pack_stored_writer_t;
 
 status_t pack_stored_open(store_t *store, pack_stored_writer_t **out);
 
+/*
+ * Stage one entry. An entry the readers would refuse (unknown type or
+ * codec, past the object bound, sizes inconsistent with its codec) is
+ * refused here with ERR_INVALID, before anything is written. A failed write
+ * is cut back off the staging file, so the writer stays usable; if even
+ * that fails, it refuses everything after and finish installs nothing.
+ */
 status_t pack_stored_add(pack_stored_writer_t *w,
                          const uint8_t hash[OBJECT_HASH_SIZE],
                          uint8_t type, uint8_t compression, uint8_t encryption,
                          uint64_t uncompressed_size,
                          const void *payload, size_t len);
-
-/*
- * The same entry, with its len stored bytes pulled through read in bounded
- * chunks instead of handed over in one buffer.
- *
- * This is the form replication uses, because an object can be larger than
- * the memory of the machine moving it (design constraint 2): the writer
- * holds one chunk at a time, never the payload. rd must fill exactly the
- * n bytes it is asked for or fail; it is never asked for more than len in
- * total. Its buffer is the writer's and may be transformed in place.
- *
- * A failure part-way - read returning an error, or a short write - takes
- * the entry back out: the staging file is cut back to where the entry
- * began, so the writer stays usable and a later finish installs only whole
- * entries. If even that cut fails, the writer refuses everything after,
- * and finish fails instead of installing a pack with a torn entry in it.
- * rd's own error message is left as the one reported.
- */
-typedef status_t (*pack_stored_read_fn)(void *ctx, void *buf, size_t n);
-
-status_t pack_stored_add_stream(pack_stored_writer_t *w,
-                                const uint8_t hash[OBJECT_HASH_SIZE],
-                                uint8_t type, uint8_t compression,
-                                uint8_t encryption, uint64_t uncompressed_size,
-                                uint64_t len, pack_stored_read_fn rd,
-                                void *rd_ctx);
-
-/* The most pack_stored_add_stream holds of an entry at once. */
-#define PACK_STORED_CHUNK_DEFAULT ((size_t)1024 * 1024)
-
-/* Test hook: lower the chunk so a few-MiB object crosses many chunk
- * boundaries. 0 restores the default. Process-wide; not for production. */
-void pack_stored_set_chunk(size_t bytes);
 
 /* Has this writer already staged that hash in the current pack? Objects not
  * yet finalised are invisible to any lookup that reads the repository. */
@@ -236,10 +181,10 @@ int pack_stored_has(const pack_stored_writer_t *w,
 uint32_t pack_stored_count(const pack_stored_writer_t *w);
 
 /* Would adding an entry storing len bytes take the open pack past the seal
- * (PACK_MAX_MULTI_BYTES)? Never true of an empty pack, so an entry larger
- * than the seal still goes in, alone. The writer does not roll over by
- * itself: a caller that has promised its objects are durable before it
- * says so (replication) has to install each pack at a point it chooses. */
+ * (PACK_MAX_MULTI_BYTES) or PACK_MAX_ENTRIES? Never true of an empty pack.
+ * The writer does not roll over by itself: a caller that has promised its
+ * objects are durable before it says so (replication) has to install each
+ * pack at a point it chooses. */
 int pack_stored_full(const pack_stored_writer_t *w, uint64_t len);
 
 /* The number the pack will be installed under. Read it before finish, which
@@ -254,23 +199,18 @@ status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed);
 void     pack_stored_abort(pack_stored_writer_t *w);
 
 /*
- * Write objects into a pack as a backup produces them.
+ * Write objects into a pack as they are produced: the one plaintext writer.
+ * Backup uses it directly, and object_store_ex through the store's own
+ * writer.
  *
- * The loose path costs an inode create, a rename, a second full read at pack
- * time, an unlink, and double the write volume per object - measured at 41% of
- * a full backup in one rename() alone. A pack amortises one rename across
- * thousands of objects.
+ * This is the plaintext counterpart to pack_stored_writer_t. That one is
+ * handed bytes that have already been through the pipeline and copies them
+ * verbatim; this one is handed content and does the whole thing - name,
+ * deduplicate, probe, compress, encrypt, parity.
  *
- * This is the plaintext counterpart to pack_stored_writer_t. That one is handed
- * bytes that have already been through the pipeline and copies them verbatim;
- * this one is handed content and does the whole thing - hash, deduplicate,
- * probe, compress, encrypt - so that what lands is byte-for-byte what repo_pack
- * would have produced from the same object.
- *
- * Objects large enough to stream (PACK_STREAM_THRESHOLD) are not accepted: an
- * entry header carries its object's hash and therefore cannot be written until
- * the whole object has been read. They keep the loose path, where the hash is
- * computed as the bytes go by, and are packed afterwards as they always were.
+ * Objects past OBJECT_MAX_BYTES are refused with ERR_TOO_LARGE: a file
+ * larger than one object is a chunk list of bounded chunks, and the chunker
+ * stores each through here.
  */
 typedef struct pack_backup_writer pack_backup_writer_t;
 
@@ -303,7 +243,7 @@ typedef struct {
     uint8_t        compression;
     size_t         len;          /* plaintext length */
     const void    *data;
-    const void    *payload;      /* data, or owned when compressed */
+    const uint8_t *payload;      /* data, or owned when compressed */
     uint64_t       payload_len;
     uint8_t       *owned;
     /* Encrypted under the store's key, with CRC and parity, when prepared
@@ -369,7 +309,7 @@ void pack_cache_invalidate(store_t *store);
 /*
  * Resolve a hash to its pack location.  Returns OK and fills out_pack_num +
  * out_dat_offset on success.  Returns ERR_NOT_FOUND if the hash is not in
- * any pack (i.e. the object is loose or missing).
+ * any pack.
  */
 status_t pack_resolve_location(store_t *store,
                                const uint8_t hash[OBJECT_HASH_SIZE],
@@ -394,14 +334,6 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 void pack_test_set_parity_window(size_t groups);
 
 /*
- * Test hook: the pack size at and above which parity is not trusted because
- * the trailer's 32-bit sizes may have wrapped (OWN-30; about 59.75 GiB). 0
- * restores the default. Lowering it lets a test show that repair refuses
- * such a pack and writes nothing.
- */
-void pack_test_set_parity_fit_limit(uint64_t bytes);
-
-/*
  * The seal in force: PACK_MAX_MULTI_BYTES unless a test moved it.
  */
 uint64_t pack_seal_bytes(void);
@@ -415,13 +347,6 @@ uint64_t pack_seal_bytes(void);
  * disk.
  */
 void pack_test_set_seal(uint64_t bytes);
-
-/*
- * 1 when the pack open on f cannot have a parity trailer whose uint32 size
- * fields wrapped, 0 when repair must leave it alone (OWN-30). Exposed for
- * the tests that pin it against real trailers.
- */
-int pack_parity_fields_fit(FILE *f);
 
 /*
  * Rewrite any pack files that contain unreferenced objects, keeping only
@@ -440,7 +365,7 @@ status_t pack_gc(store_t *store,
 
 /*
  * Finish pack removals a crash interrupted: delete every pack a
- * .deleting-NNNNNNNN marker names, emit its removal callback, and remove
+ * .deleting-NNNNNNNNNN marker names, emit its removal callback, and remove
  * the marker. A marker is written only once the packs replacing the ones
  * it names are installed, synced and announced, so this never deletes the
  * only copy of anything. pack_gc runs it first; reindex must too, before it
@@ -493,8 +418,8 @@ typedef struct {
  * Per-object header inside the .dat body.
  *
  * compressed_size counts what is stored, so for an encrypted entry that is
- * nonce, ciphertext and tag together - the same convention the loose object
- * header uses, which keeps every offset in this file a plain byte count.
+ * nonce, ciphertext and tag together, which keeps every offset in this file a
+ * plain byte count.
  */
 typedef struct {
     uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
@@ -557,9 +482,8 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                              pack_dat_entry_cb cb, void *ctx);
 
 /*
- * Iterate the pack numbers present in the repository, whatever directory
- * layout they are in. Exposed so a rebuild does not have to reimplement the
- * sharded and flat path rules and drift from them.
+ * Iterate the pack numbers present in the repository. Exposed so a rebuild
+ * does not have to reimplement the path rules and drift from them.
  */
 typedef void (*pack_num_cb)(uint32_t pack_num, void *ctx);
 status_t pack_list(store_t *store, pack_num_cb cb, void *ctx);
@@ -575,9 +499,10 @@ typedef void (*pack_idx_entry_cb)(const pack_idx_info_t *info, void *ctx);
 
 /* --- path helpers (shared with json_api.c) ------------------------- */
 
-/* Resolve a pack_num to its .dat path (sharded first, flat fallback). */
+/* Build pack_num's .dat path (see PACK_SHARD_FMT). */
 int pack_dat_path_resolve(char *buf, size_t sz, const char *store,
                           uint32_t pack_num);
 
-/* Parse "pack-NNNNNNNN.dat" → pack_num.  Returns 1 on success, 0 on fail. */
+/* Parse "pack-NNNNNNNNNN.dat", exactly PACK_NUM_DIGITS digits, to its
+ * number. Returns 1 on success, 0 on fail. */
 int parse_pack_dat_name(const char *name, uint32_t *out_num);

@@ -362,21 +362,28 @@ static void test_max_files_stops_early(void **state)
 }
 
 /*
- * Packed content is not a special case, it is the only case: a backup writes
- * its objects into packs as it produces them.
+ * Packed content is not a special case, it is the only case: there are no
+ * loose objects, and a backup writes every object into a pack.
  *
- * This used to back up, then call repo_pack and assert it had work to do. It
- * has none now, and that is the assertion worth making instead - a repo_pack
- * immediately after a backup should find nothing loose to collect, because
- * nothing was written loose.
+ * This used to call repo_pack after the backup and assert it found nothing
+ * loose. The assertion that replaces it is the index's: every object the
+ * backup recorded is located in a pack, and the search reads it from there.
  */
 static void test_searches_packed_content(void **state)
 {
     (void)state;
     int64_t snap = run_backup();
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, 0);
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM objects o WHERE o.repo_id = ? AND NOT EXISTS"
+        " (SELECT 1 FROM pack_objects po"
+        "  WHERE po.repo_id = o.repo_id AND po.hash = o.hash)",
+        (const char *[]){ repo, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "0");
+    db_result_free(r);
 
     grep_opts_t o = opts_for("swordfish");
     grep_result_t res;
@@ -739,7 +746,7 @@ static void test_damage_past_a_verified_match_keeps_the_match(void **state)
 }
 
 /* An undamaged large object still matches, and is not skipped, though it
- * is now read to the end after its first hit. */
+ * is loaded and checked whole before its first hit is taken. */
 static void test_intact_large_object_still_matches(void **state)
 {
     (void)state;

@@ -1,17 +1,17 @@
 /*
  * Packing, and whether what comes out still reads back.
  *
- * repo_pack is the most intricate writer here. It partitions loose objects
- * by size, runs worker threads that each hold an open pack, probes for
- * compressibility, compresses, encrypts with a fresh nonce, computes a
- * parity record and a Reed-Solomon trailer per entry, sorts the entries by
- * hash, and only then writes the offsets table that every later parity
- * lookup is indexed through. Almost none of that fails loudly when it is
- * wrong.
+ * The store's own pack writer is the most intricate writer here.
+ * object_store stages each object into it - probing for compressibility,
+ * compressing, encrypting with a fresh nonce under associated data that
+ * binds the type and name - and object_store_flush seals it: a parity
+ * record and a Reed-Solomon trailer per entry, the entries sorted by hash,
+ * and only then the offsets table that every later parity lookup is
+ * indexed through. Almost none of that fails loudly when it is wrong.
  *
  * Two properties, both aimed at failures that do not announce themselves:
  *
- * Round trip. Every object stored before the pack reads back byte-identical
+ * Round trip. Every object stored before the seal reads back byte-identical
  * after it. Compression and encryption both happen here and nowhere else on
  * the write side, so a codec or a nonce that is handled wrongly shows up as
  * an equality failure rather than as a restore that quietly produced the
@@ -86,10 +86,6 @@ static void setup_once(void)
     rs_init();
     memset(&g_key, 0x5a, sizeof(g_key));
     repo_key_compute_id(&g_key);
-    /* One worker, so a failure is a bug in the packing rather than a race
-     * this build is not instrumented to see. Concurrency belongs to a TSan
-     * run, not to a harness whose oracle is byte equality. */
-    setenv("CBACKUP_PACK_THREADS", "1", 1);
 }
 
 static uint8_t *build(const uint8_t *seed, size_t seed_len, size_t total, int scramble)
@@ -165,7 +161,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     }
     if (stored == 0) goto done;
 
-    if (repo_pack(g_store, NULL, NULL, NULL) != OK) { err_clear(); goto done; }
+    if (object_store_flush(g_store) != OK) { err_clear(); goto done; }
     pack_cache_invalidate(g_store);
 
     for (unsigned i = 0; i < stored; i++)

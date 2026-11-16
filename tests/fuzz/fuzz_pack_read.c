@@ -75,9 +75,9 @@ static void setup_once(void)
     store_set_locate_cb(g_store, fuzz_locate, NULL);
 
     char dir[256];
-    snprintf(dir, sizeof(dir), "%s/packs/0000", FUZZ_ROOT);
+    snprintf(dir, sizeof(dir), "%s/packs/000000", FUZZ_ROOT);
     if (mkdir(dir, 0755) != 0) { /* already there */ }
-    snprintf(g_dat_path, sizeof(g_dat_path), "%s/pack-00000000.dat", dir);
+    snprintf(g_dat_path, sizeof(g_dat_path), "%s/pack-0000000000.dat", dir);
 
     memset(&g_key, 0x5a, sizeof(g_key));
     repo_key_compute_id(&g_key);
@@ -123,20 +123,16 @@ static void read_every_way(void)
     if (pack_object_load(g_store, g_hash, &out, &len, &type) == OK) free(out);
     err_clear();
 
+    /* The stored form replication moves: corrected from parity, neither
+     * decrypted nor decompressed, so it reaches the parity arithmetic
+     * without the codec checks in front of it. */
     out = NULL; len = 0;
-    uint64_t full = 0;
-    if (pack_object_load_prefix(g_store, g_hash, 4096, &out, &len, &full,
-                                &type) == OK)
+    uint8_t comp = 0, enc = 0;
+    int damaged = 0;
+    if (pack_object_read_stored(g_store, g_hash, &type, &comp, &enc, &usize,
+                                &out, &len, &damaged) == OK)
         free(out);
     err_clear();
-
-    int devnull = open("/dev/null", O_WRONLY);
-    if (devnull >= 0) {
-        uint64_t sz = 0;
-        pack_object_load_stream(g_store, g_hash, devnull, &sz, &type);
-        err_clear();
-        close(devnull);
-    }
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);

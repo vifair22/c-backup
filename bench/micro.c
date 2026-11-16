@@ -151,10 +151,14 @@ static void bench_sha256_16m(double *tp)
 }
 REGISTER_BENCH("sha256_oneshot_16M", "MiB/s", bench_sha256_16m)
 
-/* EVP streaming: N x Update calls of chunk_sz, then Final */
+/*
+ * object_name's path: an EVP context fed the type byte and then a whole
+ * object of 16 MiB, the object bound. The name is kept from when this
+ * measured the streaming writer, so PERF.md entries stay comparable.
+ */
 static void bench_sha256_evp_stream(double *tp)
 {
-    /* Simulate object.c's streaming path: 16 MiB buffer, EVP update */
+    const uint8_t type = 1;
     uint8_t hash[32];
     unsigned int dlen;
     uint64_t iters = 0;
@@ -164,12 +168,14 @@ static void bench_sha256_evp_stream(double *tp)
     /* warmup */
     for (int i = 0; i < BENCH_WARMUP; i++) {
         EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+        EVP_DigestUpdate(ctx, &type, 1);
         EVP_DigestUpdate(ctx, g_buf, chunk);
         EVP_DigestFinal_ex(ctx, hash, &dlen);
     }
     double t0 = now_sec(), elapsed;
     do {
         EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+        EVP_DigestUpdate(ctx, &type, 1);
         EVP_DigestUpdate(ctx, g_buf, chunk);
         EVP_DigestFinal_ex(ctx, hash, &dlen);
         iters++;

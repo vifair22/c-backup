@@ -229,57 +229,27 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
 }
 
 /*
- * Objects up to this size are read through object_load rather than streamed.
+ * Read one object end to end, which is what forces the name check.
  *
- * The two paths are not equivalent, and the difference decides what a scrub
- * can conclude. object_load applies the Reed-Solomon parity to the payload,
- * so damage that parity covers is corrected in memory and the read succeeds;
- * object_load_stream only repairs the header and then checks the SHA-256, so
- * the same damage simply fails. Reading small objects the in-memory way is
- * what lets verify tell "damaged but recoverable" apart from "gone" without
- * writing anything, which is exactly what a read-only scrub has to report.
- *
- * Matches STREAM_LOAD_MAX in object.c, the size above which object_load
- * refuses outright.
- */
-#define VERIFY_INMEM_MAX ((uint64_t)(16 * 1024 * 1024))
-
-/*
- * Read one object end to end, which is what forces the hash check.
- *
- * Large objects have to stream: they may exceed memory, and design
- * constraint 2 says never to assume otherwise. Streaming into /dev/null
- * still applies parity in memory, one group window at a time, so a streamed
- * read tells recoverable damage from loss just as an in-memory one does.
+ * object_load applies the Reed-Solomon parity to the payload, so damage that
+ * parity covers is corrected in memory and the read succeeds; damage beyond
+ * it fails. That is what lets verify tell "damaged but recoverable" apart
+ * from "gone" without writing anything. Every object is bounded, so every
+ * one is read this way.
  */
 static status_t read_whole_object(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
-                                  uint64_t size, int devnull,
                                   uint64_t *out_bytes)
 {
-
     /* One object in flight, held to the daemon's read budget. */
-    uint64_t taken = read_budget_acquire(size ? size : 1);
-    if (size <= VERIFY_INMEM_MAX) {
-        void  *data = NULL;
-        size_t len  = 0;
-        status_t st = object_load(store, hash, &data, &len, NULL);
-        free(data);
-        if (st != ERR_TOO_LARGE) read_budget_release(taken);
-        if (st == OK && out_bytes) *out_bytes = (uint64_t)len;
-        /* Anything object_load refuses on size grounds falls through to the
-         * stream path rather than being called damaged. */
-        if (st != ERR_TOO_LARGE) return st;
-        err_clear();
-    }
-
-    uint64_t sz = 0;
-    uint8_t  type = 0;
-    status_t st = object_load_stream(store, hash, devnull, &sz, &type);
+    void    *data = NULL;
+    size_t   len  = 0;
+    uint64_t taken = 0;
+    status_t st = object_load_budgeted(store, hash, &data, &len, NULL, &taken);
+    free(data);
     read_budget_release(taken);
-    if (st == OK && out_bytes) *out_bytes = sz;
+    if (st == OK && out_bytes) *out_bytes = (uint64_t)len;
     return st;
 }
-
 /*
  * Is a pack's data file still there?
  *
@@ -419,6 +389,11 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 {
     if (!store || !db) return set_error(ERR_INVALID, "verify_run: null argument");
 
+    /* Objects this handle staged through object_store_ex are sealed and
+     * indexed first, so the run sees everything written through it. */
+    status_t fst = object_store_flush(store);
+    if (fst != OK) return fst;
+
     verify_result_t res;
     memset(&res, 0, sizeof(res));
 
@@ -452,8 +427,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * object. On the rotational disks this tool is aimed at, the difference
      * between sequential and random over a hundred thousand entries is the
      * difference between a scrub that finishes overnight and one that does
-     * not. Loose objects sort last, where their directory order is as good as
-     * anything.
+     * not.
      */
     db_result_t *objs = NULL;
     if (db_execute(db,
@@ -492,15 +466,6 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                          "which checks headers and needs no key");
     }
 
-    int devnull = -1;
-    if (level == VERIFY_LEVEL_DEEP) {
-        devnull = open("/dev/null", O_WRONLY);
-        if (devnull == -1) {
-            db_result_free(objs);
-            return set_error_errno(ERR_IO, "verify: cannot open /dev/null");
-        }
-    }
-
     uint64_t total = (uint64_t)objs->nrows;
     status_t st = OK;
     hash_vec_t lost = { 0 };
@@ -518,7 +483,6 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         const char *hex     = objs->rows[i][0];
         int64_t     pack_id = strtoll(objs->rows[i][2], NULL, 10);
         int         packed  = (pack_id >= 0);
-        uint64_t    osize  = strtoull(objs->rows[i][4], NULL, 10);
         uint8_t hash[OBJECT_HASH_SIZE];
         hex_to_hash(hex, hash);
 
@@ -528,7 +492,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             cur_pack = pack_id;
             cur_pack_missing = pack_file_missing(store, pack_id);
             if (cur_pack_missing)
-                log_error("verify: pack-%08u.dat is missing; every object "
+                log_error("verify: pack-%010u.dat is missing; every object "
                           "indexed in it is missing", (unsigned)pack_id);
         }
 
@@ -568,7 +532,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
          */
         parity_stats_t before = parity_stats_get();
         uint64_t bytes = 0;
-        status_t rst = read_whole_object(store, hash, osize, devnull, &bytes);
+        status_t rst = read_whole_object(store, hash, &bytes);
         parity_stats_t after = parity_stats_get();
 
         if (rst != OK) {
@@ -576,34 +540,19 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             /* Unreadable as it stands. Parity may still be able to rebuild
              * it from the on-disk record, which is exactly what the repair
              * functions do; nothing has ever called them before now. */
-            int fixed = repair ? (packed ? pack_object_repair(store, hash)
-                                         : object_repair(store, hash))
+            int fixed = repair ? (packed ? pack_object_repair(store, hash) : -1)
                                : 0;
             if (fixed > 0 &&
-                read_whole_object(store, hash, osize, devnull, &bytes) == OK) {
+                read_whole_object(store, hash, &bytes) == OK) {
                 res.repaired++;
                 res.bytes_read += bytes;
                 log_warn("verify: repaired %s (%d byte(s) corrected)", hex, fixed);
                 record_finding(db, repo_id, res.run_id, hex, "repaired");
-            } else if (fixed == PARITY_REPAIR_REFUSED_TOO_LARGE) {
-                /* Repair declined to touch it (OWN-30), so this is not data
-                 * parity failed to recover; it is data parity was not
-                 * allowed to try on. Say which. */
-                res.unrecoverable++;
-                record_finding(db, repo_id, res.run_id, hex,
-                               "unrecoverable: " PARITY_TOO_LARGE_REASON);
-                hv_add(&lost, hash);
             } else {
                 err_clear();
                 res.unrecoverable++;
-                /*
-                 * This used to say "damaged (run with repair to attempt
-                 * recovery)" for a streamed object with repair off, because
-                 * the streaming path could not apply parity without writing.
-                 * Every streaming reader now corrects into /dev/null in
-                 * memory, loose or packed and any codec, so a streamed read
-                 * that still fails is beyond parity: loss, like any other.
-                 */
+                /* The read corrects from parity in memory, so a read that
+                 * still fails is beyond parity: loss. */
                 record_finding(db, repo_id, res.run_id, hex, "unrecoverable");
                 hv_add(&lost, hash);
             }
@@ -625,21 +574,13 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
              * actually fix it. Damage parity can carry but that is still on
              * disk is "recoverable".
              */
-            int fixed = repair ? (packed ? pack_object_repair(store, hash)
-                                         : object_repair(store, hash))
+            int fixed = repair ? (packed ? pack_object_repair(store, hash) : -1)
                                : 0;
             if (fixed > 0) {
                 log_warn("verify: %s was silently corrected on read; wrote "
                          "%d byte(s) back to disk", hex, fixed);
                 res.repaired++;
                 record_finding(db, repo_id, res.run_id, hex, "repaired");
-            } else if (fixed == PARITY_REPAIR_REFUSED_TOO_LARGE) {
-                /* Readable, since the in-memory correction was checked
-                 * against the hash, but repair would not write it back
-                 * (OWN-30), so the damage stays on disk. */
-                res.recoverable++;
-                record_finding(db, repo_id, res.run_id, hex,
-                               "recoverable, not written back: " PARITY_TOO_LARGE_REASON);
             } else {
                 if (repair)
                     log_warn("verify: %s was silently corrected on read but the "
@@ -659,7 +600,6 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
     }
 
-    if (devnull != -1) close(devnull);
     db_result_free(objs);
 
     /* Structure and deep both read headers or more, which is what walking a

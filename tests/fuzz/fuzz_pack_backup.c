@@ -152,7 +152,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
          * transaction, and a caller holding one would deadlock against
          * itself. This mirrors what store_content does at its batch boundary.
          */
-        if (pack_backup_full(w, PACK_STREAM_THRESHOLD)) {
+        if (pack_backup_full(w, PACK_ENTRY_MAX_BYTES)) {
             if (pack_backup_rollover(w) != OK) { err_clear(); free(s->body); break; }
         }
 

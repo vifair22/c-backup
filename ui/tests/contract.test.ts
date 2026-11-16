@@ -169,7 +169,6 @@ const SAMPLES: Record<ApiKind, ApiRequest> = {
   verifyFindings:  { kind: 'verifyFindings', repoId: 1, runId: 1 },
   gc:              { kind: 'gc', repoId: 1, dryRun: true },
   gfs:             { kind: 'gfs', repoId: 1, dryRun: true },
-  pack:            { kind: 'pack', repoId: 1 },
   reindex:         { kind: 'reindex', repoId: 1 },
 
   stats:           { kind: 'stats', repoId: 1 },
@@ -471,7 +470,7 @@ describe('the flows behind the buttons', () => {
   })
 
   test('the maintenance menu starts every operation it offers', async () => {
-    const ops = ['verify', 'pack', 'gc', 'gfs', 'reindex'] as const
+    const ops = ['verify', 'gc', 'gfs', 'reindex'] as const
     for (const kind of ops) {
       const r = await request(toEndpoint({ kind, repoId: 1 }))
       assert.equal(r.status, 202, `${kind} was refused: ${JSON.stringify(r.body)}`)
