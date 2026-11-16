@@ -270,10 +270,11 @@ static const cdc_params_t *local_target_cdc(void *vctx)
  * Present already (in the target or staged this run) means nothing written. */
 static status_t local_put_plain(void *vctx, uint8_t type, const void *data,
                                 size_t len, uint8_t out_hash[OBJECT_HASH_SIZE],
-                                int *out_is_new)
+                                int *out_is_new, uint64_t *out_stored)
 {
     local_ctx_t *c = vctx;
     *out_is_new = 0;
+    if (out_stored) *out_stored = 0;
     if (!c->tcdc)
         return set_error(ERR_INVALID, "replica: this sink only takes objects as stored");
     if (c->w) {
@@ -292,8 +293,10 @@ static status_t local_put_plain(void *vctx, uint8_t type, const void *data,
         if (st != OK) return st;
     }
     uint64_t phys = 0, payload = 0;
-    return pack_backup_add(c->bw, type, data, len, out_hash, out_is_new,
-                           &phys, &payload);
+    status_t st = pack_backup_add(c->bw, type, data, len, out_hash, out_is_new,
+                                  &phys, &payload);
+    if (st == OK && out_stored) *out_stored = phys;
+    return st;
 }
 
 /* Is a snapshot with this id and timestamp already here? A re-chunked
