@@ -813,6 +813,15 @@ records it as cancelled with the message "cancelled before it started"; its
 job. A running job's `state` is usually still `running`: it reports `cancelled` once
 it has stopped. A job that is not queued or running is a 404.
 
+Jobs for one repository start one at a time, in submission order. A job
+whose turn comes while a synchronous request holds its repository (`DELETE
+/repos/<id>/snapshots/<sid>`, `DELETE /repos/<id>`) is not failed: it stays
+`queued` with `phase` `"waiting for repository"`, holds no worker, and is
+retried with a backoff of at most 500 ms until the request lets go. It can be
+cancelled meanwhile like any queued job. The `phase` is cleared when it
+starts. The requests themselves are unchanged: they still answer 503 (or 409
+for a removal) while a job holds the repository.
+
 A job record carries `origin`, who asked for it: `api` for anything submitted
 over the API (the CLI and the app both are), `schedule` for the scheduler, with
 `schedule_id` naming the schedule (null otherwise).

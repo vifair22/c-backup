@@ -1027,6 +1027,21 @@ static int snap_job_needs_key(snap_job_kind_t kind)
 }
 
 /*
+ * The repo lock the job manager takes for a job before it starts.
+ *
+ * Restore reads the repo; reindex rewrites index rows for it. Both take the
+ * write lock, because a reindex racing a backup would interleave two writers
+ * over the same snapshot rows. A verify that only checks is the one job that
+ * writes nothing, so it takes the read lock. With repair on it rewrites
+ * object bytes and needs the write lock like everything else.
+ */
+static job_lock_t snap_job_lock(const snap_job_t *j)
+{
+    return (j->kind == SNAP_JOB_VERIFY && !j->verify_repair) ? JOB_LOCK_READ
+                                                             : JOB_LOCK_WRITE;
+}
+
+/*
  * What a gc did, or would do, on the job and in the journal.
  *
  * gc and gc --dry-run both printed a bare job record: the counts reached the
@@ -1198,33 +1213,16 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
 {
     snap_job_t *j = arg;
 
-    /*
-     * Restore reads the repo; reindex rewrites index rows for it. Both take
-     * the write lock, because a reindex racing a backup would interleave two
-     * writers over the same snapshot rows.
-     *
-     * A verify that only checks is the one job that does not write anything,
-     * so it takes the read lock and a backup can run underneath it. With
-     * repair on it rewrites object bytes and needs the write lock like
-     * everything else.
-     */
-    status_t st;
-    int read_only_job = (j->kind == SNAP_JOB_VERIFY && !j->verify_repair);
-    if (read_only_job) {
-        st = repo_lock_read(j->repo_id);
-    } else {
-        st = repo_trylock_write(j->repo_id);
-    }
-    if (st != OK) return st;
-
+    /* The job manager holds this job's repo lock, in the mode
+     * snap_job_lock chose, for the whole of this call. */
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    st = snap_job_needs_key(j->kind)
-             ? repo_store_open_keyed(j->repo_path, NULL, &store)
-             : repo_store_open(j->repo_path, NULL, &store);
-    if (st != OK) { repo_unlock(j->repo_id); return st; }
+    status_t st = snap_job_needs_key(j->kind)
+                      ? repo_store_open_keyed(j->repo_path, NULL, &store)
+                      : repo_store_open(j->repo_path, NULL, &store);
+    if (st != OK) return st;
     st = store_index_bind(store, j->db, j->repo_id, &idx);
-    if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
+    if (st != OK) { store_close(store); return st; }
     /* Every loop below the engine boundary that can run for a whole large
      * object checks this; see store_set_cancel. */
     store_set_cancel(store, cancel);
@@ -1452,7 +1450,6 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
 
     store_index_free(idx);
     store_close(store);
-    repo_unlock(j->repo_id);
     return st;
 }
 
@@ -1715,8 +1712,9 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
                        : kind == SNAP_JOB_PACK    ? "pack"
                        : kind == SNAP_JOB_REPLICATE ? "replicate"
                                                   : "restore";
-    status_t st = job_submit(g_ctx.jm, repo_id, action,
-                             NULL, snap_job_run, j, snap_job_free, &job_id);
+    status_t st = job_submit_locked(g_ctx.jm, repo_id, snap_job_lock(j), action,
+                                    NULL, 0, snap_job_run, j, snap_job_free,
+                                    &job_id);
     if (st != OK) return api_error(st == ERR_BUSY ? 503 : 500, err_msg());
 
     char *out = NULL;
@@ -2218,9 +2216,9 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
         }
     }
 
-    return job_submit_scheduled(jm ? jm : g_ctx.jm, repo_id, action, NULL,
-                                schedule_id, snap_job_run, j, snap_job_free,
-                                out_job_id);
+    return job_submit_locked(jm ? jm : g_ctx.jm, repo_id, snap_job_lock(j),
+                             action, NULL, schedule_id, snap_job_run, j,
+                             snap_job_free, out_job_id);
 }
 
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)
