@@ -242,8 +242,15 @@ static void test_new_tree_fraction_stays_low(void **state)
      * instead of 10,000. What matters is that untouched siblings are reused
      * at all: a determinism regression takes this to 1.0.
      */
-    double fraction = (double)second.trees_new / (double)total;
-    assert_true(fraction < 0.6);
+    /* Measured inside the source tree: the ancestors of the scratch
+     * directory are rewritten on every run whatever changed (scan_tree
+     * records absolute paths), and how many there are depends on where the
+     * scratch directory lives - two levels under /tmp, seven in a CI build
+     * directory. Counting them made the fraction a property of the machine. */
+    uint64_t fixed = (uint64_t)(ANCESTOR_TREES + ROOT_TREES);
+    assert_true(second.trees_new >= fixed && total > fixed);
+    double fraction = (double)(second.trees_new - fixed) / (double)(total - fixed);
+    assert_true(fraction < 0.5);
     assert_true(second.trees_reused >= 7);
 }
 
