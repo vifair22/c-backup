@@ -1426,9 +1426,20 @@ sed -i "s/  bind: not-an-address/  bind: 127.0.0.1/; s/  port: $BINDPORT/  port:
 C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind3.log" 2>&1
 check    "a port already taken stops the daemon" 1 "$?"
 contains "and says it cannot start" "cannot start API server" "$(cat "$WORK/bind3.log")"
+contains "naming the address" "failed to start HTTP server on 127.0.0.1:$MAIN_PORT" \
+    "$(cat "$WORK/bind3.log")"
 check    "and unwinds without a leak too" 0 \
     "$(grep -c 'LeakSanitizer\|AddressSanitizer' "$WORK/bind3.log")"
 contains "and leaves the running daemon alone" '"repos"' "$(cb repo list)"
+# NIT-19: a socket in a directory that does not exist said only "cannot
+# start API server". The line now carries the path and the reason.
+sed -i "s|  socket: $WORK/bind.sock|  socket: $WORK/no-such-dir/bind.sock|; s/  port: $MAIN_PORT/  port: 0/" \
+    "$WORK/bindcfg.yaml"
+C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind4.log" 2>&1
+check    "a socket in a missing directory stops the daemon" 1 "$?"
+contains "and names the path and the reason" \
+    "cannot start API server: cannot bind the unix socket at $WORK/no-such-dir/bind.sock (http.socket): No such file or directory" \
+    "$(cat "$WORK/bind4.log")"
 
 # sun_path is 108 bytes and the daemon used to strncpy into it, so a longer
 # socket path was silently truncated: bind and listen succeeded against a
