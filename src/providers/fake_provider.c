@@ -53,7 +53,7 @@ typedef struct {
 typedef struct {
     char unit_id[SP_UNIT_ID_MAX];
     char kind[16];
-    char detail[128];
+    char detail[192];
     int  held;
 } fhold_t;
 
@@ -841,7 +841,7 @@ static status_t release_all(sp_session_t *s)
         status_t st = release_one(s, i);
         if (st != OK && first == OK) {
             first = st;
-            snprintf(msg, sizeof(msg), "%s", err_msg());
+            snprintf(msg, sizeof(msg), "%.500s", err_msg());
         }
     }
     s->nheld = 0;
@@ -893,7 +893,7 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
     funit_t *su = s->unit;
     int running = su->state == SP_STATE_RUNNING || su->state == SP_STATE_PAUSED;
     int froze = 0, watchdog = 0, paused = 0, snapped = 0, exported = 0;
-    char detail[128];
+    char detail[192];
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -1016,7 +1016,7 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
         /* Nothing left behind: whatever was taken goes, and a release that
          * fails leaves its journal row for the sweep. */
         char why[512];
-        snprintf(why, sizeof(why), "%s", err_msg());
+        snprintf(why, sizeof(why), "%.500s", err_msg());
         (void)release_all(s);
         pthread_mutex_lock(&c->mu);
         c->st.begin_failures++;

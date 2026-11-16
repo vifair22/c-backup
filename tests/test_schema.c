@@ -77,7 +77,8 @@ static void test_migrations_apply(void **state)
         "objects", "packs", "pack_objects", "tags", "notes",
         "policy_values", "repo_backup_paths", "journal", "recovery_state",
         "file_cache", "verify_runs", "verify_findings", "grep_runs",
-        "grep_hits", NULL
+        "grep_hits", "snapshot_units", "snapshot_unit_items", "unit_policy",
+        "unit_intents", "daemon_state", NULL
     };
     for (int i = 0; tables[i]; i++)
         assert_true(object_exists(db, "table", tables[i]));
@@ -107,7 +108,10 @@ static void test_one_baseline_migration(void **state)
     (void)state;
     assert_non_null(app_migrations[0].name);
     assert_string_equal(app_migrations[0].name, "001_v3_baseline.sql");
-    assert_null(app_migrations[1].name);
+    /* Units (source-providers.md), the first migration after it. */
+    assert_non_null(app_migrations[1].name);
+    assert_string_equal(app_migrations[1].name, "002_units.sql");
+    assert_null(app_migrations[2].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */
