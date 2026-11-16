@@ -519,6 +519,79 @@ static void test_reports_full_near_the_seal(void **state)
     done(st);
 }
 
+/* ------------------------------------------------------------------ */
+/* B124: where in an object the compression probe looks                */
+/* ------------------------------------------------------------------ */
+
+static uint64_t prng_state;
+static void fill_random(uint8_t *b, size_t n, uint64_t seed)
+{
+    prng_state = seed * 0x9E3779B97F4A7C15ULL + 1;
+    for (size_t i = 0; i < n; i++) {
+        prng_state ^= prng_state << 13; prng_state ^= prng_state >> 7;
+        prng_state ^= prng_state << 17;
+        b[i] = (uint8_t)(prng_state >> 24);
+    }
+}
+
+static void fill_words(uint8_t *b, size_t n)
+{
+    static const char t[] = "the quick brown fox jumps over the lazy dog 0123 ";
+    for (size_t i = 0; i < n; i++) b[i] = (uint8_t)t[i % (sizeof(t) - 1)];
+}
+
+static uint8_t compression_of(const uint8_t *b, size_t n)
+{
+    pack_prepared_t pp;
+    assert_int_equal(pack_backup_prepare_plain(OBJECT_TYPE_FILE, b, n, &pp), OK);
+    uint8_t c = pp.compression;
+    pack_prepared_free(&pp);
+    return c;
+}
+
+/*
+ * The decision samples the whole object, not its head: a chunk whose
+ * compressible bytes are only in its middle third, only at its end or only
+ * past an incompressible start is compressed, and random bytes are never,
+ * whatever their size and whichever 32 KiB samples land on them.
+ */
+static void test_compression_samples_the_whole_object(void **state)
+{
+    (void)state;
+    const size_t n = 1024 * 1024;
+    uint8_t *b = malloc(n);
+    assert_non_null(b);
+
+    /* Compressible only in the middle third: head and tail probes miss it. */
+    fill_random(b, n, 1);
+    fill_words(b + n / 3, n / 3);
+    assert_int_equal(compression_of(b, n), COMPRESS_LZ4);
+
+    /* Only the last 32 KiB compresses. */
+    fill_random(b, n, 2);
+    fill_words(b + n - 32 * 1024, 32 * 1024);
+    assert_int_equal(compression_of(b, n), COMPRESS_LZ4);
+
+    /* An incompressible start, then zeros to the end. */
+    fill_random(b, n, 3);
+    memset(b + n * 2 / 5, 0, n - n * 2 / 5);
+    assert_int_equal(compression_of(b, n), COMPRESS_LZ4);
+
+    /* Random at every size the probe has a rule for: never compressed. */
+    const size_t sizes[] = { 5000, 64 * 1024, 100 * 1024, 128 * 1024,
+                             128 * 1024 + 1, 300 * 1024, 1024 * 1024 };
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++)
+        for (uint64_t seed = 10; seed < 42; seed++) {
+            fill_random(b, sizes[k], seed * 131 + k);
+            assert_int_equal(compression_of(b, sizes[k]), COMPRESS_NONE);
+        }
+
+    /* Small objects keep the single head probe. */
+    fill_words(b, 100 * 1024);
+    assert_int_equal(compression_of(b, 100 * 1024), COMPRESS_LZ4);
+    free(b);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -531,6 +604,7 @@ int main(void)
         cmocka_unit_test(test_abort_removes_the_staging_file),
         cmocka_unit_test(test_rollover_seals_and_keeps_going),
         cmocka_unit_test(test_reports_full_near_the_seal),
+        cmocka_unit_test(test_compression_samples_the_whole_object),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
