@@ -198,7 +198,7 @@ static int record_exists(const char *root, int64_t id)
 static int tmp_is_empty(const char *root)
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "test -z \"$(ls -A '%s/tmp')\"", root);
+    snprintf(cmd, sizeof(cmd), "test -z \"$(ls -A '%s/tmp' | grep -vx .lock)\"", root);
     return system(cmd) == 0;
 }
 

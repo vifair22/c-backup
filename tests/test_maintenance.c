@@ -393,6 +393,11 @@ static void test_node_ids_do_not_repeat_across_snapshots(void **state)
  * B061: gc removes staging files a killed writer left in tmp/, as backup
  * does, and reports them. A dry run promises to change nothing and removes
  * nothing; a file that is not one of the engine's names is never touched.
+ *
+ * The tag mirror's staging is written by a tag route, which holds neither
+ * tmp/'s claim nor the repository's write lock, so it may be mid-write
+ * while gc runs: a young tags.* file is left alone even though gc holds the
+ * claim, and only one past the hour rule goes (B133).
  */
 static void test_gc_removes_stale_staging_files(void **state)
 {
@@ -406,9 +411,16 @@ static void test_gc_removes_stale_staging_files(void **state)
     past[1] = past[0];
     write_file(TEST_REPO "/tmp/pack-dat.Kk33Ll", "a killed pack writer's half-written pack");
     assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/pack-dat.Kk33Ll", past, 0), 0);
-    /* The tag mirror stages there too, and its orphans are the engine's. */
+    /* The tag mirror stages there too: a write in progress, and an orphan
+     * two hours old. */
     write_file(TEST_REPO "/tmp/tags.Mm44Nn", "{\"version\":1,\"tags\":[]}");
     assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/tags.Mm44Nn", past, 0), 0);
+    struct timespec old[2];
+    clock_gettime(CLOCK_REALTIME, &old[0]);
+    old[0].tv_sec -= 2 * 60 * 60;
+    old[1] = old[0];
+    write_file(TEST_REPO "/tmp/tags.Oo55Pp", "{\"version\":1,\"tags\":[]}");
+    assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/tags.Oo55Pp", old, 0), 0);
     write_file(TEST_REPO "/tmp/mine.txt", "somebody else's");
     assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/mine.txt", past, 0), 0);
 
@@ -422,7 +434,8 @@ static void test_gc_removes_stale_staging_files(void **state)
     assert_int_equal(g.tmp_files_removed, 2);
     assert_true(g.tmp_bytes_removed > 0);
     assert_int_equal(stat(TEST_REPO "/tmp/pack-dat.Kk33Ll", &sb), -1);
-    assert_int_equal(stat(TEST_REPO "/tmp/tags.Mm44Nn", &sb), -1);
+    assert_int_equal(stat(TEST_REPO "/tmp/tags.Mm44Nn", &sb), 0);    /* in progress */
+    assert_int_equal(stat(TEST_REPO "/tmp/tags.Oo55Pp", &sb), -1);   /* an orphan */
     assert_int_equal(stat(TEST_REPO "/tmp/mine.txt", &sb), 0);
 }
 

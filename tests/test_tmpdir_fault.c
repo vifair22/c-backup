@@ -350,6 +350,8 @@ static void test_store_open_recreates_tmp(void **state)
     (void)state;
     store_index_free(idx); idx = NULL;
     store_close(store);    store = NULL;
+    /* The claim's lock file (store_claim_tmp) is all a used tmp/ holds. */
+    (void)unlink(TEST_REPO "/tmp/.lock");
     assert_int_equal(rmdir(TEST_REPO "/tmp"), 0);
 
     assert_int_equal(store_open(TEST_REPO, NULL, &store), OK);

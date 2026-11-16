@@ -100,7 +100,9 @@ static int teardown(void **state)
 static int count_files(const char *dir)
 {
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "find '%s' -type f 2>/dev/null | wc -l", dir);
+    /* tmp/.lock is the writers' claim on tmp/ (store_claim_tmp), not a
+     * staging file. */
+    snprintf(cmd, sizeof(cmd), "find '%s' -type f ! -name .lock 2>/dev/null | wc -l", dir);
     FILE *f = popen(cmd, "r");
     if (!f) return -1;
     int n = -1;
