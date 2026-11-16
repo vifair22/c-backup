@@ -47,6 +47,16 @@ typedef struct {
      * another, as before. The snapshot is byte-identical either way.
      */
     unsigned     store_workers;
+
+    /*
+     * Run a pack pass (repo_pack_report) once the snapshot is committed, as
+     * the daemon's backup job does under maintenance.auto_pack. It is part of
+     * the backup the user waits for, so it runs inside the profile and the
+     * write counters rather than after them (B086). A failure here does not
+     * fail the backup: the snapshot is committed and its objects readable
+     * loose, so it is logged and left for the next run.
+     */
+    int          pack_after;
 } backup_opts_t;
 
 typedef struct {
@@ -74,6 +84,18 @@ typedef struct {
      * phase commits once per 2,000 files plus once per pack seal.
      */
     uint32_t commits_store, commits_trees, commits_index, commits_pack;
+    /*
+     * Bytes the run wrote into the repository, by category (store.h,
+     * store_write_cat_t), the pack pass included when pack_after was set.
+     * written_total is their sum, and the figure to divide by bytes read to
+     * get the write amplification a write-bound disk pays for (B086).
+     * written_sweep is the pack pass's share of written_total.
+     */
+    store_write_stats_t written;
+    uint64_t written_total;
+    uint64_t written_sweep;
+    /* Objects the pack pass packed; 0 when it did not run or found nothing. */
+    uint64_t sweep_packed;
 } backup_result_t;
 
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,

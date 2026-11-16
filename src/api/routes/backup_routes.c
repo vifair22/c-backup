@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "json_row.h"
 
 #include "backup.h"
 #include "file_cache.h"
@@ -17,6 +18,7 @@
 #include <cutils/json.h>
 #include <cutils/log.h>
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,7 +73,8 @@ typedef struct {
     int          one_filesystem;
 } backup_job_t;
 
-static void backup_opts_from_json(cutils_json_req_t *body, backup_job_t *j);
+static int backup_opts_from_json(cutils_json_req_t *body, backup_job_t *j,
+                                 jreq_err_t *err);
 
 /*
  * Fall back to what the repository is configured to back up.
@@ -234,10 +237,6 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
         db_result_free(kr);
     }
 
-    backup_result_t res;
-    memset(&res, 0, sizeof(res));
-    st = backup_run(store, j->db, j->repo_id, &o, &res);
-
     /*
      * Packing finishes the backup rather than waiting for someone to ask.
      *
@@ -250,36 +249,43 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
      * consolidated.
      *
      * A pack failure does not fail the backup: the snapshot is committed and
-     * its objects are readable loose. It is logged and left for the next run
-     * or an explicit pack.
+     * its objects are readable loose. backup_run logs it and carries on.
      *
-     * This sweep is all maintenance.auto_pack controls (B111). Objects up to
+     * This pass is all maintenance.auto_pack controls (B111). Objects up to
      * PACK_STREAM_THRESHOLD went into a pack as backup_run wrote them, key or
-     * no key, so what the sweep finds is a sparse file's object, anything
-     * larger, and pack coalescing. Writing small objects loose when the key
-     * is off would honour the old wording at the cost of an inode and an
-     * uncompressed copy per object, which is what direct-to-pack removed.
+     * no key, so what the pass finds is a sparse file's object and anything
+     * larger. Writing small objects loose when the key is off would honour
+     * the old wording at the cost of an inode and an uncompressed copy per
+     * object, which is what direct-to-pack removed.
+     *
+     * backup_run runs it, rather than this function after it returns, so
+     * its time is in the backup's profile and its writes in bytes_written
+     * (B086): on UAT FS2 it was 70-100 s that neither accounted for.
      */
-    if (st == OK && routes_policy_flag(j->db, j->repo_id, "maintenance.auto_pack", 1)) {
-        status_t pst = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx,
-                                       NULL);
-        if (pst != OK) {
-            log_warn("backup: snapshot %lld committed but packing failed: %s",
-                     (long long)res.snapshot_id, err_msg());
-            err_clear();
-        }
-    }
+    o.pack_after = routes_policy_flag(j->db, j->repo_id, "maintenance.auto_pack", 1);
+
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    st = backup_run(store, j->db, j->repo_id, &o, &res);
 
     /* What the backup did, on the job record: the log line had it, the job
      * did not, so a client saw only "completed". Every field is numeric. */
     if (res.snapshot_id > 0) {
-        char rj[512];
+        const uint64_t *w = res.written.bytes;
+        char rj[1536];
         snprintf(rj, sizeof(rj),
                  "{\"snapshot_id\":%lld,\"files\":%llu,\"dirs\":%llu,"
                  "\"files_unchanged\":%llu,\"bytes_logical\":%llu,"
                  "\"objects_new\":%llu,\"bytes_stored\":%llu,"
                  "\"trees_new\":%llu,\"trees_reused\":%llu,"
-                 "\"store_workers\":%u}",
+                 "\"store_workers\":%u,"
+                 "\"bytes_written\":%llu,\"bytes_written_loose\":%llu,"
+                 "\"bytes_written_loose_parity\":%llu,"
+                 "\"bytes_written_loose_discarded\":%llu,"
+                 "\"bytes_written_pack\":%llu,\"bytes_written_pack_parity\":%llu,"
+                 "\"bytes_written_parity_spill\":%llu,"
+                 "\"bytes_written_pack_abandoned\":%llu,"
+                 "\"bytes_written_pack_pass\":%llu,\"pack_pass_packed\":%llu}",
                  (long long)res.snapshot_id,
                  (unsigned long long)res.files, (unsigned long long)res.dirs,
                  (unsigned long long)res.files_unchanged,
@@ -288,7 +294,17 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)res.bytes_stored,
                  (unsigned long long)res.trees_new,
                  (unsigned long long)res.trees_reused,
-                 res.store_workers);
+                 res.store_workers,
+                 (unsigned long long)res.written_total,
+                 (unsigned long long)w[STORE_WR_LOOSE],
+                 (unsigned long long)w[STORE_WR_LOOSE_PARITY],
+                 (unsigned long long)w[STORE_WR_LOOSE_DISCARD],
+                 (unsigned long long)w[STORE_WR_PACK],
+                 (unsigned long long)w[STORE_WR_PACK_PARITY],
+                 (unsigned long long)w[STORE_WR_PARITY_SPILL],
+                 (unsigned long long)w[STORE_WR_PACK_ABANDONED],
+                 (unsigned long long)res.written_sweep,
+                 (unsigned long long)res.sweep_packed);
         job_set_result(progress_ctx, rj);
     }
 
@@ -325,26 +341,32 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
     char *repo_path = repo_path_for(ctx->db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
 
-    /* Said now, while the caller is listening, rather than by a job that
-     * fails with "refusing to pack" once the whole tree has been read. */
-    if (repo_require_key(repo_path) != OK) {
-        free(repo_path);
-        return api_error(409, err_msg());
-    }
-
     backup_job_t *j = calloc(1, sizeof(*j));
     if (!j) { free(repo_path); return api_error(500, "out of memory"); }
     j->db = ctx->db;
     j->repo_id = repo_id;
     j->repo_path = repo_path;
 
+    /* The body first: what the client sent is its own to fix, and it hears
+     * about that before anything about the repository's state (B112). */
     if (req->body && req->body_len) {
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
         if (json_req_parse(req->body, req->body_len, &body) != 0) {
             backup_job_free(j);
             return api_error(400, "invalid JSON");
         }
-        backup_opts_from_json(body, j);
+        jreq_err_t je;
+        if (backup_opts_from_json(body, j, &je) != 0) {
+            backup_job_free(j);
+            return api_error(400, je.msg);
+        }
+    }
+
+    /* Said now, while the caller is listening, rather than by a job that
+     * fails with "refusing to pack" once the whole tree has been read. */
+    if (repo_require_key(j->repo_path) != OK) {
+        backup_job_free(j);
+        return api_error(409, err_msg());
     }
 
     backup_fill_from_config(j);
@@ -377,52 +399,57 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
  * that took a slightly different body from the route would be a second way
  * to describe a backup, and the two would drift.
  */
-static void backup_opts_from_json(cutils_json_req_t *body, backup_job_t *j)
+static int backup_opts_from_json(cutils_json_req_t *body, backup_job_t *j,
+                                 jreq_err_t *err)
 {
-    {
-        if (json_req_get_str_opt(body, "label", &j->label) != 0) j->label = NULL;
+    /*
+     * Every field is read for its type. Each of these used to be dropped
+     * when it was the wrong one: a non-string label stored no label, a path
+     * that was not a string was skipped and the rest backed up, and
+     * "one_filesystem":true - the spelling every other flag takes - was not
+     * 0 or 1, so the backup crossed into every mount below the source.
+     */
+    if (jreq_str(body, "label", &j->label, err) == JREQ_BAD) return -1;
 
-        CUTILS_AUTO_JSON_ITER cutils_json_iter_t it;
-        if (json_iter_begin(body, "paths", &it) == 0) {
-            while (json_iter_next(&it)) {
-                char *p = NULL;
-                /* Empty path, not NULL: paths is an array of bare strings,
-                 * and the iterator resolves "" to the element itself while
-                 * NULL means "no such field". */
-                if (json_iter_get_str(&it, "", &p) != 0 || !p) continue;
-                char **grown = realloc(j->paths, (size_t)(j->n_paths + 1) * sizeof(*grown));
-                if (!grown) { free(p); break; }
-                j->paths = grown;
-                j->paths[j->n_paths++] = p;
-            }
+    char **v = NULL;
+    size_t n = 0;
+    if (jreq_strv(body, "paths", (size_t)INT_MAX, &v, &n, err) == JREQ_BAD) return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (!v[i][0]) {
+            jreq_strv_free(v, n);
+            snprintf(err->msg, sizeof(err->msg), "a backup path cannot be empty");
+            return -1;
         }
-
-        /*
-         * Exclusions. The engine has always supported them and the daemon
-         * never passed any, so through the API nothing could be excluded at
-         * all: every backup took the whole tree, caches and build
-         * directories included, however the request was written.
-         */
-        CUTILS_AUTO_JSON_ITER cutils_json_iter_t ex;
-        if (json_iter_begin(body, "exclude", &ex) == 0) {
-            while (json_iter_next(&ex)) {
-                char *p = NULL;
-                if (json_iter_get_str(&ex, "", &p) != 0 || !p) continue;
-                if (!*p) { free(p); continue; }
-                char **grown = realloc(j->excludes,
-                                       (size_t)(j->n_excludes + 1) * sizeof(*grown));
-                if (!grown) { free(p); break; }
-                j->excludes = grown;
-                j->excludes[j->n_excludes++] = p;
-            }
-        }
-
-        /* Staying on one filesystem is the difference between backing up a
-         * home directory and backing up every network mount under it. */
-        uint32_t onefs = 0;
-        if (json_req_get_u32(body, "one_filesystem", &onefs, 0, 1) == 0)
-            j->one_filesystem = (int)onefs;
     }
+    j->paths = v;
+    j->n_paths = (int)n;
+
+    /*
+     * Exclusions. The engine has always supported them and the daemon
+     * never passed any, so through the API nothing could be excluded at
+     * all: every backup took the whole tree, caches and build directories
+     * included, however the request was written.
+     */
+    v = NULL;
+    n = 0;
+    if (jreq_strv(body, "exclude", (size_t)INT_MAX, &v, &n, err) == JREQ_BAD) return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (!v[i][0]) {
+            jreq_strv_free(v, n);
+            snprintf(err->msg, sizeof(err->msg), "an exclude pattern cannot be empty");
+            return -1;
+        }
+    }
+    j->excludes = v;
+    j->n_excludes = (int)n;
+
+    /* Staying on one filesystem is the difference between backing up a
+     * home directory and backing up every network mount under it. */
+    if (jreq_flag(body, "one_filesystem", &j->one_filesystem) != 0) {
+        snprintf(err->msg, sizeof(err->msg), "one_filesystem must be true or false");
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -458,7 +485,11 @@ status_t routes_submit_backup(job_manager_t *jm, int64_t repo_id,
             backup_job_free(j);
             return set_error(ERR_INVALID, "backup schedule: parameters are not JSON");
         }
-        backup_opts_from_json(body, j);
+        jreq_err_t je;
+        if (backup_opts_from_json(body, j, &je) != 0) {
+            backup_job_free(j);
+            return set_error(ERR_INVALID, "backup schedule: %s", je.msg);
+        }
     }
 
     backup_fill_from_config(j);

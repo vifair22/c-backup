@@ -260,6 +260,10 @@ contains "still unconfigured" '"configured":false' "$(sock_body /api/auth/setup)
 
 check "short password refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
      --unix-socket "$SOCK" -d '{"password":"short"}' http://localhost/api/auth/setup)"
+# B112: a password of the wrong type was told it was required.
+check "a non-string password is named" '{"error":"password must be a string"} 400' \
+    "$(curl -s -w ' %{http_code}' -X POST --unix-socket "$SOCK" \
+       -d '{"password":["correcthorsebattery"]}' http://localhost/api/auth/setup)"
 check "socket setup" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
      --unix-socket "$SOCK" -d '{"password":"correcthorsebattery"}' http://localhost/api/auth/setup)"
 check "setup twice refused" 409 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
@@ -385,7 +389,12 @@ contains "job completed" '"state":"completed"' "$(sock_body "/jobs/$BACKUP_JOB")
 JOB_BODY=$(sock_body "/jobs/$BACKUP_JOB")
 contains "backup result names its snapshot" '"result":{"snapshot_id":1,' "$JOB_BODY"
 contains "backup result counts files" '"files":3,' "$JOB_BODY"
-contains "no large files, no store pool" '"store_workers":1}' "$JOB_BODY"
+contains "no large files, no store pool" '"store_workers":1,' "$JOB_BODY"
+# B086: what the backup wrote, by category. Three small files go into the
+# backup's pack and nothing is left loose for the pack pass.
+contains "backup result counts bytes written" '"bytes_written":' "$JOB_BODY"
+contains "small files are written into packs, not loose" '"bytes_written_loose":0,' "$JOB_BODY"
+contains "and the pack pass has nothing to do" '"bytes_written_pack_pass":0,"pack_pass_packed":0}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -492,6 +501,152 @@ check "and a flag as a boolean" '{"ok":true} 200' \
     "$(sock_send PUT /repos/1/policy '{"key":"maintenance.auto_pack","value":true}')"
 contains "and both read back typed" '"key":"retention.keep_monthly","value":6' \
     "$(sock_body /repos/1/policy)"
+
+echo "request field types"
+# B112: a field present with the wrong JSON type read as absent. An array
+# label registered a repository with no label and answered 201, and a
+# snap_id of 1e999 was told it was required. Each is a 400 naming the field
+# and what it must be, and nothing is created.
+for lbl in '["a"]' '{"a":1}' '5' 'true' 'null'; do
+    R=$(sock_send POST /repos "{\"path\":\"$WORK/typedrepo\",\"label\":$lbl}")
+    check "label $lbl is refused" '{"error":"label must be a string"} 400' "$R"
+done
+check "and no repository was made" "absent" \
+    "$([ -e "$WORK/typedrepo" ] && echo present || echo absent)"
+case "$(sock_body /repos)" in *typedrepo*) bad "and none was registered" "absent" "listed" ;;
+                              *) ok "and none was registered" ;; esac
+check "a non-string path is refused" '{"error":"path must be a string"} 400' \
+    "$(sock_send POST /repos '{"path":["/x"]}')"
+check "a missing path is still required" '{"error":"path is required"} 400' \
+    "$(sock_send POST /repos '{"label":"x"}')"
+check "a non-string encrypt is refused" '{"error":"encrypt must be a string"} 400' \
+    "$(sock_send POST /repos "{\"path\":\"$WORK/typedrepo\",\"encrypt\":1}")"
+
+tag_snap() { sock_send POST /repos/1/tags "{\"name\":\"typed\",\"snap_id\":$1}"; }
+RANGE='snap_id is out of range; it must be from 1 to 4294967295'
+check "snap_id 1e999 is out of range"   "{\"error\":\"$RANGE\"} 400" "$(tag_snap 1e999)"
+check "snap_id -1 is out of range"      "{\"error\":\"$RANGE\"} 400" "$(tag_snap -1)"
+check "snap_id 0 is out of range"       "{\"error\":\"$RANGE\"} 400" "$(tag_snap 0)"
+check "snap_id past uint32 is out of range" "{\"error\":\"$RANGE\"} 400" "$(tag_snap 4294967296)"
+check "snap_id 99999999999999999999 is out of range" "{\"error\":\"$RANGE\"} 400" \
+    "$(tag_snap 99999999999999999999)"
+check "snap_id 1.5 is not whole" '{"error":"snap_id must be a whole number"} 400' "$(tag_snap 1.5)"
+check "snap_id as a string" '{"error":"snap_id must be a number"} 400' "$(tag_snap '"1"')"
+check "snap_id as a list"   '{"error":"snap_id must be a number"} 400' "$(tag_snap '[1]')"
+check "a missing snap_id is still required" '{"error":"snap_id is required"} 400' \
+    "$(sock_send POST /repos/1/tags '{"name":"typed"}')"
+check "move must be a boolean" '{"error":"move must be true or false"} 400' \
+    "$(sock_send POST /repos/1/tags '{"name":"typed","snap_id":1,"move":1}')"
+check "no typed tag was stored" '{"tags":[]}' "$(sock_body /repos/1/tags)"
+
+check "a note body must be a string" '{"error":"body must be a string"} 400' \
+    "$(sock_send PUT /repos/1/snapshots/1/note '{"body":["x"]}')"
+check "a fractional policy value" '{"error":"value must be a whole number"} 400' \
+    "$(sock_send PUT /repos/1/policy '{"key":"retention.keep_daily","value":1.5}')"
+check "a policy value of 1e999" \
+    '{"error":"value is out of range; it must be from -9007199254740992 to 9007199254740992"} 400' \
+    "$(sock_send PUT /repos/1/policy '{"key":"retention.keep_daily","value":1e999}')"
+check "a policy value that is a list" \
+    '{"error":"value must be a string, a whole number, or true or false"} 400' \
+    "$(sock_send PUT /repos/1/policy '{"key":"retention.keep_daily","value":[1]}')"
+check "a non-string policy key" '{"error":"key must be a string"} 400' \
+    "$(sock_send PUT /repos/1/policy '{"key":7,"value":1}')"
+contains "and the stored value is untouched" '"key":"retention.keep_daily","value":14' \
+    "$(sock_body /repos/1/policy)"
+
+# The backup body: each of these used to be dropped and the backup run
+# anyway, from the configured sources or with the wrong options.
+check "a backup label must be a string" '{"error":"label must be a string"} 400' \
+    "$(sock_send POST /repos/1/backup '{"label":["x"]}')"
+check "backup paths must be a list" '{"error":"paths must be a list of strings"} 400' \
+    "$(sock_send POST /repos/1/backup '{"paths":"/x"}')"
+check "a non-string backup path" \
+    '{"error":"paths must be a list of strings; entry 2 is not one"} 400' \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\",5]}")"
+check "one_filesystem must be a flag" '{"error":"one_filesystem must be true or false"} 400' \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"one_filesystem\":\"yes\"}")"
+check "restore overwrite must be a flag" '{"error":"overwrite must be true or false"} 400' \
+    "$(sock_send POST /repos/1/snapshots/1/restore "{\"dest\":\"$WORK/typed\",\"overwrite\":\"yes\"}")"
+check "restore subpath must be a string" '{"error":"subpath must be a string"} 400' \
+    "$(sock_send POST /repos/1/snapshots/1/restore "{\"dest\":\"$WORK/typed\",\"subpath\":[\"/a\"]}")"
+check "restore dest must be a string" '{"error":"dest must be a string"} 400' \
+    "$(sock_send POST /repos/1/snapshots/1/restore '{"dest":5}')"
+check "grep max_files must be a number" '{"error":"max_files must be a number"} 400' \
+    "$(sock_send POST /repos/1/grep '{"pattern":"x","max_files":"10"}')"
+check "grep snapshot of 1e999" \
+    '{"error":"snapshot is out of range; it must be from 1 to 4294967295"} 400' \
+    "$(sock_send POST /repos/1/grep '{"pattern":"x","snapshot":1e999}')"
+check "nothing was restored by a refusal" "absent" \
+    "$([ -e "$WORK/typed" ] && echo present || echo absent)"
+
+# B112: the body is checked before the repository. Repository 1 has no
+# sources configured (cleared above), and a backup schedule naming none
+# was refused for that even when its trigger was malformed, so the client
+# fixed the sources and then learned about the trigger.
+contains "repository 1 has no sources here" '"sources":[]' "$(sock_body /repos/1/sources)"
+sched() { sock_send POST /repos/1/schedules "$1"; }
+check "a malformed trigger is reported before missing sources" \
+    "{\"error\":\"trigger: unknown type 'cron'\"} 400" \
+    "$(sched '{"action":"backup","trigger":{"type":"cron"}}')"
+check "a trigger of the wrong type" '{"error":"trigger must be an object"} 400' \
+    "$(sched '{"action":"backup","trigger":"daily"}')"
+check "a missing trigger" '{"error":"trigger is required"} 400' \
+    "$(sched '{"action":"backup"}')"
+check "trigger seconds of the wrong type" \
+    '{"error":"interval trigger: trigger.seconds must be a number"} 400' \
+    "$(sched '{"action":"backup","trigger":{"type":"interval","seconds":"3600"}}')"
+check "trigger seconds of 1e999" \
+    '{"error":"interval trigger: trigger.seconds is out of range; it must be from 1 to 9007199254740992"} 400' \
+    "$(sched '{"action":"backup","trigger":{"type":"interval","seconds":1e999}}')"
+check "a bad on_overlap is reported before missing sources" \
+    '{"error":"on_overlap must be skip, queue or cancel_running"} 400' \
+    "$(sched '{"action":"backup","on_overlap":"x","trigger":{"type":"interval","seconds":60}}')"
+check "a bad catchup is reported before missing sources" \
+    '{"error":"catchup must be skip or run_once"} 400' \
+    "$(sched '{"action":"backup","catchup":["skip"],"trigger":{"type":"interval","seconds":60}}')"
+check "non-string schedule paths are reported before missing sources" \
+    '{"error":"paths must be a list of strings; entry 1 is not one"} 400' \
+    "$(sched '{"action":"backup","paths":[1],"trigger":{"type":"interval","seconds":60}}')"
+check "a sound body then hears about the sources" \
+    '{"error":"this repository has no backup sources configured, and none were given"} 400' \
+    "$(sched '{"action":"backup","trigger":{"type":"interval","seconds":60}}')"
+check "a non-string action" '{"error":"action must be a string"} 400' \
+    "$(sched '{"action":1,"trigger":{"type":"interval","seconds":60}}')"
+check "a non-string grep pattern" '{"error":"pattern must be a string"} 400' \
+    "$(sched '{"action":"grep","pattern":5,"trigger":{"type":"interval","seconds":60}}')"
+case "$(sock_body /repos/1/schedules)" in
+    *'"action"'*) bad "no schedule was created by any of them" "none" "$(sock_body /repos/1/schedules)" ;;
+    *) ok "no schedule was created by any of them" ;;
+esac
+
+# B112 (1), (2): the parser stopped at the end of the first value, so data
+# after it was never read, and a repeated key silently took one of its
+# values. c-utils 1.6.0 refuses both, at any depth, before a route sees
+# the body.
+code_of() { printf '%s' "$1" | awk '{print $NF}'; }
+check "trailing junk after a repo body is a 400" 400 \
+    "$(code_of "$(sock_send POST /repos "{\"path\":\"$WORK/junkrepo\",\"label\":\"x\"} junk")")"
+check "a second object after a repo body is a 400" 400 \
+    "$(code_of "$(sock_send POST /repos "{\"path\":\"$WORK/junkrepo\"}{}")")"
+check "a bare {}{} is a 400" 400 "$(code_of "$(sock_send POST /repos '{}{}')")"
+check "a duplicate top-level key is a 400" 400 \
+    "$(code_of "$(sock_send POST /repos "{\"path\":\"$WORK/junkrepo\",\"path\":\"$WORK/junkrepo2\"}")")"
+check "trailing whitespace is still fine to send" '{"error":"path is required"} 400' \
+    "$(sock_send POST /repos "{\"label\":\"x\"}"$' \t\n')"
+check "and no repository was made by any of them" "absent absent" \
+    "$([ -e "$WORK/junkrepo" ] && echo present || echo absent) $([ -e "$WORK/junkrepo2" ] && echo present || echo absent)"
+case "$(sock_body /repos)" in *junkrepo*) bad "and none was registered" "absent" "listed" ;;
+                              *) ok "and none was registered" ;; esac
+check "a duplicate key inside a trigger is a 400" 400 \
+    "$(code_of "$(sched '{"action":"gc","trigger":{"type":"interval","seconds":60,"seconds":3600}}')")"
+check "trailing data after a schedule is a 400" 400 \
+    "$(code_of "$(sched '{"action":"gc","trigger":{"type":"interval","seconds":60}} x')")"
+check "a duplicate top-level schedule key is a 400" 400 \
+    "$(code_of "$(sched '{"action":"gc","action":"pack","trigger":{"type":"interval","seconds":60}}')")"
+case "$(sock_body /repos/1/schedules)" in
+    *'"action"'*) bad "and no schedule was created" "none" "$(sock_body /repos/1/schedules)" ;;
+    *) ok "and no schedule was created" ;;
+esac
 
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
@@ -608,8 +763,51 @@ check "a large limit is clamped, not refused" 200 "$(sock_code '/repos/1/snapsho
 check "an overflowing limit is clamped too" 200 "$(sock_code '/jobs?limit=99999999999')"
 check "an overflowing offset is an empty page" 200 "$(sock_code '/jobs?offset=99999999999')"
 check "a bad limit names the range" \
-    '{"error":"limit must be a whole number from 1 to 1000 (a larger one is reduced to 1000)"}' \
+    '{"error":"limit is out of range; it must be from 1 to 1000 (a larger one is reduced to 1000)"}' \
     "$(sock_body '/jobs?limit=0')"
+# B112: every numeric query parameter reads numbers the same way and words
+# a refusal the way a body field does. An overflowing id used to be clamped
+# by strtoll and answered 404, as though it were merely unknown.
+check "a non-numeric limit says whole number" '{"error":"limit must be a whole number"} 400' \
+    "$(sock_send GET '/jobs?limit=lots')"
+check "a fractional limit says whole number" '{"error":"limit must be a whole number"} 400' \
+    "$(sock_send GET '/jobs?limit=1.5')"
+check "a negative offset is out of range" \
+    '{"error":"offset is out of range; it must be from 0 to 2147483647 (a larger one is past every row)"} 400' \
+    "$(sock_send GET '/jobs?offset=-5')"
+check "a huge limit in exponent form is clamped too" 200 "$(sock_code '/jobs?limit=1e999')"
+check "a leading zero still reads" 200 "$(sock_code '/jobs?limit=010')"
+SRANGE='snapshot is out of range; it must be from 1 to 4294967295'
+for v in 1e999 -1 0 99999999999999999999; do
+    check "search ?snapshot=$v is out of range" "{\"error\":\"$SRANGE\"} 400" \
+        "$(sock_send GET "/repos/1/search?q=txt&snapshot=$v")"
+done
+for v in abc 1.5 +5; do
+    check "search ?snapshot=$v is not a whole number" \
+        '{"error":"snapshot must be a whole number"} 400' \
+        "$(sock_send GET "/repos/1/search?q=txt&snapshot=$v")"
+done
+check "search ?snapshot= of an unknown id is still 404" '{"error":"no such snapshot"} 404' \
+    "$(sock_send GET '/repos/1/search?q=txt&snapshot=4000000000')"
+PRANGE='parent is out of range; it must be from 0 to 9007199254740992'
+for v in 1e999 -1 99999999999999999999; do
+    check "tree ?parent=$v is out of range" "{\"error\":\"$PRANGE\"} 400" \
+        "$(sock_send GET "/repos/1/snapshots/1/tree?parent=$v")"
+done
+check "tree ?parent=x is not a whole number" '{"error":"parent must be a whole number"} 400' \
+    "$(sock_send GET '/repos/1/snapshots/1/tree?parent=x')"
+check "tree ?parent= of an unknown node is still 404" \
+    '{"error":"no such directory in this snapshot"} 404' \
+    "$(sock_send GET '/repos/1/snapshots/1/tree?parent=9000000000')"
+check "tree ?parent=0 is the root" 200 "$(sock_code '/repos/1/snapshots/1/tree?parent=0')"
+check "diff ?from=1e999 is out of range" \
+    '{"error":"from is out of range; it must be from 1 to 4294967295"} 400' \
+    "$(sock_send GET '/repos/1/diff?from=1e999&to=1')"
+check "diff ?to=x is not a whole number" '{"error":"to must be a whole number"} 400' \
+    "$(sock_send GET '/repos/1/diff?from=1&to=x')"
+check "diff of an unknown snapshot is still 404" \
+    "{\"error\":\"no such snapshot in 'to'\"} 404" \
+    "$(sock_send GET '/repos/1/diff?from=1&to=4000000000')"
 contains "fanout"       '"buckets"'    "$(sock_body /repos/1/fanout)"
 
 # type 1 is a file. Tree objects are referenced by subtree_hash rather than
@@ -1237,8 +1435,10 @@ for i in 1 2 3; do head -c $((17 * 1024 * 1024)) /dev/urandom > "$R/big/f$i"; do
 SW=$(job_id "$(sock_post /repos/2/backup "{\"paths\":[\"$R/big\"]}")")
 wait_job "$SW"
 SW_BODY=$(sock_body "/jobs/$SW")
-contains "store_workers from config sizes the pool" '"store_workers":2}' "$SW_BODY"
+contains "store_workers from config sizes the pool" '"store_workers":2,' "$SW_BODY"
 contains "and the backup stores all three" '"objects_new":3,' "$SW_BODY"
+contains "large random files are written loose once" '"bytes_written_loose_discarded":0,' "$SW_BODY"
+contains "and the pack pass probes them and writes nothing" '"bytes_written_pack_pass":0,' "$SW_BODY"
 rm -f "$R/big/f1" "$R/big/f2" "$R/big/f3"
 rmdir "$R/big"
 

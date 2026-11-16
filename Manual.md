@@ -699,7 +699,7 @@ flowchart TD
   E --> F[write snapshot record<br/>into the repository]
   F --> G[index nodes in state.db]
   G --> H{maintenance.auto_pack}
-  H -- true --> I[pack sweep: sparse and<br/>over-16-MiB objects, coalesce]
+  H -- true --> I[pack sweep: sparse and<br/>over-16-MiB objects]
   H -- false --> J[done]
   I --> J
 ```
@@ -737,15 +737,17 @@ flowchart TD
    index rows a reindex cleans up.
 5. **Pack sweep.** Loose objects are always stored uncompressed, so by
    default every backup ends with a pack run, as `pack` would do: it packs
-   the loose objects of step 2 (and anything an interrupted run left) and
-   coalesces small packs. Setting the policy key `maintenance.auto_pack` to
-   `false` skips this sweep and nothing else. Small objects still go into
+   the loose objects of step 2 (and anything an interrupted run left). It
+   does not merge small packs; only gc does that (section 12). Setting the
+   policy key `maintenance.auto_pack` to `false` skips this sweep and
+   nothing else. Small objects still go into
    packs during the backup, because that is how they are written; what
    stays loose until a `pack` is only sparse files' objects and objects
    over 16 MiB. A backup of small files therefore leaves no loose objects
    with the key on or off, and a `pack` straight after it finds nothing to
    do. A large incompressible object stays loose for good either way: the
-   probe marks it once and no pack run moves it (section 12).
+   probe, or the pack step's check on the rest of the file, marks it once
+   and no pack run moves it (section 12).
 
 What is captured: regular files (sparse or not), directories, symlinks,
 hardlinks (as groups), FIFOs, device nodes, modes, owner and group, times,
@@ -1229,7 +1231,7 @@ A checking verify takes the read lock; a repairing one takes the write lock.
 |---|---|---|
 | `gc 1` | Mark from every live snapshot, sweep unreferenced objects, compact packs | After retention prunes |
 | `gc 1 --dry-run` | Report what would be removed | Before the first real run |
-| `pack 1` | Pack and compress loose objects, coalesce small packs | If `maintenance.auto_pack` is off and backups hold sparse files or objects over 16 MiB |
+| `pack 1` | Pack and compress loose objects | If `maintenance.auto_pack` is off and backups hold sparse files or objects over 16 MiB |
 | `reindex 1` | Rebuild the repository's index from its manifest trees | After a database loss, or if the index is suspect |
 | `snapshot delete 1 12` | Delete one snapshot | By hand; GC reclaims its space |
 
@@ -1299,14 +1301,24 @@ only staging files in `tmp/`; killed after installing the new packs but
 before deleting the old one, it leaves the old pack beside copies of its
 live entries, which wastes that space until the snapshots naming them are
 pruned and loses nothing; killed while deleting, it is finished by the next
-gc or reindex. Merging small packs (coalescing, which gc also does) follows
-the same steps and leaves the same states.
+gc or reindex. Merging small packs (coalescing), which gc does after
+compaction and nothing else does, follows the same steps and leaves the same
+states.
 
 **Large incompressible objects stay loose.** A backup writes objects up to
 16 MiB straight into packs. Anything larger is written as one loose file,
 and the pack step then reads its first 64 KiB: if that does not compress
 (video, audio, disk images, encrypted or already-compressed archives) the
-object is marked and is never packed, by this or any later `pack` run. It is
+object is marked and is never packed, by this or any later `pack` run. A
+file whose head compresses and whose body does not (a container header or a
+thumbnail in front of compressed media) is caught as it is packed: the pack
+step measures what compression achieves over the last 8 MiB it read, and
+once that is no better than the probe's threshold it abandons the entry,
+takes it back off the pack it was writing, and marks the object the same
+way. Abandoned before its compressed output passes 16 MiB, as a header in
+front of media is, nothing of it reaches the pack; the backup's
+`bytes_written_pack_abandoned` counts what a later abandon had to take back
+(docs/api.md). It is
 stored raw with its parity trailer, so `stats` and `summary` keep counting
 it as loose and `phys_size` exceeds `orig_size` by the parity overhead
 (section 18.1). That is deliberate: rewriting gigabytes into a pack would

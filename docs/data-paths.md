@@ -420,7 +420,16 @@ The run itself:
    `entry header + payload`. Large objects are streamed through the LZ4
    frame API in 256 KiB chunks with the entry header's `compressed_size`
    patched afterwards; large objects that are already compressed are
-   raw-copied. Every entry gets its own parity set (XOR header record,
+   raw-copied. A large object's first read ends at the 64 KiB the probe
+   judged; past it, the worker tracks LZ4's ratio over the trailing 8 MiB
+   (`PACK_BAIL_WINDOW`) and, once that reaches `PACK_RATIO_THRESHOLD`,
+   abandons the entry (OWN-27): it truncates the staging pack back to the
+   entry's start, so the entry never had an index slot or parity, skip-marks
+   the loose object and leaves it loose. Output is held in the worker's idle
+   16 MiB read buffer until it would overflow, so an object abandoned
+   before then (a header in front of media) writes nothing but its entry
+   header; what a later abandon truncates is counted in
+   `bytes_written_pack_abandoned`. Every entry gets its own parity set (XOR header record,
    CRC32C, RS parity - streamed with the same 256 MiB spill bound), so a
    packed object is exactly as repairable as it was loose.
 6. **Finalize** (`finalize_pack`): patch the entry count into the pack
@@ -748,6 +757,7 @@ packed codec alike.
 |---|---|---|
 | `PROBE_SIZE` / `PACK_PROBE_SIZE` | 64 KiB | incompressibility probe sample |
 | `PACK_RATIO_THRESHOLD` | 0.90 | probe ratio at/above which a large object is skip-marked |
+| `PACK_BAIL_WINDOW` | 8 MiB | trailing window over which the pack pass re-judges a large object past the probe |
 | `PACK_STREAM_THRESHOLD` | 16 MiB | small/large split for pack entries; also the whole-object load cap |
 | `PACK_MAX_MULTI_BYTES` | 256 MiB | pack body seal size |
 | `STREAM_PIPE_CHUNK` x `STREAM_PIPE_DEPTH` | 1 MiB x 8 | backup stream pipeline chunks in flight |
