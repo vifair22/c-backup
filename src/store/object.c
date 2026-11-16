@@ -89,6 +89,40 @@ static void sha256(const void *data, size_t len, uint8_t out[OBJECT_HASH_SIZE]) 
  * know is refused by name rather than handed to a caller that would treat
  * it as file bytes (OWN-39).
  */
+/*
+ * A type byte this build does not know may be damage rather than a newer
+ * format, and the header parity record can tell: if it reconstructs a
+ * header whose type is known, that is the header. Checked here, before the
+ * refusal, because every reader refuses at this point and the parity pass
+ * the two loaders run afterwards would otherwise never see the header.
+ * pread, so the descriptor stays just past the header for the caller.
+ */
+static int header_parity_fixes_type(int fd, object_header_t *hdr)
+{
+    off_t trailer_off = (off_t)sizeof(*hdr) + (off_t)hdr->compressed_size;
+    parity_record_t hpar;
+    parity_footer_t pftr;
+    size_t rs_sz = rs_parity_size((size_t)hdr->compressed_size);
+    off_t ftr_off = trailer_off + (off_t)sizeof(hpar) + (off_t)rs_sz
+                  + (off_t)(sizeof(uint32_t) * 2);
+    if (pread(fd, &hpar, sizeof(hpar), trailer_off) != (ssize_t)sizeof(hpar) ||
+        pread(fd, &pftr, sizeof(pftr), ftr_off) != (ssize_t)sizeof(pftr) ||
+        pftr.magic != PARITY_FOOTER_MAGIC || pftr.version != PARITY_VERSION)
+        return 0;
+    object_header_t copy = *hdr;
+    /* The trailer was found through compressed_size, so a reconstruction
+     * that changes it located its own parity through a wrong field. */
+    if (parity_record_check(&copy, sizeof(copy), &hpar) != 1 ||
+        !object_type_known(copy.type) ||
+        copy.compressed_size != hdr->compressed_size)
+        return 0;
+    log_warn("object: repaired a damaged type byte (%u -> %u) via header parity",
+             hdr->type, copy.type);
+    parity_stats_add_repaired(1);
+    *hdr = copy;
+    return 1;
+}
+
 static status_t read_object_header(int fd, object_header_t *hdr)
 {
     if (io_read_full(fd, hdr, sizeof(*hdr)) != 0)
@@ -97,8 +131,6 @@ static status_t read_object_header(int fd, object_header_t *hdr)
         return set_error(ERR_CORRUPT, "object: bad magic");
     if (hdr->version != OBJECT_HDR_VERSION)
         return set_error(ERR_CORRUPT, "object: unsupported version %u", hdr->version);
-    if (!object_type_known(hdr->type))
-        return set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, hdr->type);
     if (hdr->compression != COMPRESS_NONE &&
         hdr->compression != COMPRESS_LZ4 &&
         hdr->compression != COMPRESS_LZ4_FRAME)
@@ -121,6 +153,8 @@ static status_t read_object_header(int fd, object_header_t *hdr)
                          "object: header claims %llu payload bytes, file holds %llu",
                          (unsigned long long)hdr->compressed_size,
                          (unsigned long long)avail);
+    if (!object_type_known(hdr->type) && !header_parity_fixes_type(fd, hdr))
+        return set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, hdr->type);
     return OK;
 }
 

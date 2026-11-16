@@ -564,10 +564,89 @@ static void test_stored_writer_refuses_what_no_reader_opens(void **state)
     free(payload);
 }
 
+/* ------------------------------------------------------------------ */
+/* Entry types (OWN-39)                                                */
+/* ------------------------------------------------------------------ */
+
+static void set_pack_byte(off_t off, uint8_t v)
+{
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    if (off < 0) off += lseek(fd, 0, SEEK_END);
+    assert_int_equal(pwrite(fd, &v, 1, off), 1);
+    close(fd);
+    pack_cache_invalidate(store);
+}
+
+#define UNKNOWN_TYPE_MSG \
+    "object type 9 is not known to this build; written by a newer c-backup?"
+
+/*
+ * A pack entry of a type this build does not know is refused by name, by
+ * every reader, rather than handed to restore as file bytes. The footer is
+ * broken too so the entry has no parity: with parity, header repair would
+ * (rightly) put the original type back, which is the next test.
+ */
+static void test_unknown_entry_type_is_refused(void **state)
+{
+    (void)state;
+    uint8_t data[4096];
+    fill_compressible(data, sizeof(data));
+    uint8_t hash[OBJECT_HASH_SIZE];
+    pack_one(data, sizeof(data), hash);
+
+    set_pack_byte((off_t)(entry_offset(hash) + offsetof(pack_dat_entry_hdr_t, type)), 9);
+    set_pack_byte(-(off_t)sizeof(parity_footer_t), 0);   /* footer magic */
+
+    void *out = NULL;
+    size_t len = 0;
+    err_clear();
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
+
+    char tmp[] = "/tmp/c_backup_pack_type.XXXXXX";
+    int fd = mkstemp(tmp);
+    assert_true(fd >= 0);
+    err_clear();
+    assert_int_equal(object_load_stream(store, hash, fd, NULL, NULL), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
+    close(fd);
+    unlink(tmp);
+
+    uint64_t sz = 0;
+    uint8_t  type = 0;
+    err_clear();
+    assert_int_equal(object_get_info(store, hash, &sz, &type), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
+}
+
+/* One flipped bit that lands the type outside 1-5 is damage, and the entry
+ * header parity still repairs it on both reads. */
+static void test_damaged_entry_type_byte_is_repaired(void **state)
+{
+    (void)state;
+    uint8_t data[4096];
+    fill_compressible(data, sizeof(data));
+    uint8_t hash[OBJECT_HASH_SIZE];
+    pack_one(data, sizeof(data), hash);
+
+    set_pack_byte((off_t)(entry_offset(hash) + offsetof(pack_dat_entry_hdr_t, type)),
+                  OBJECT_TYPE_FILE | 0x08);
+
+    parity_stats_reset();
+    assert_buffered_read_matches(hash, data, sizeof(data));
+    assert_stream_read_matches(hash, data, sizeof(data));
+    assert_true(parity_stats_get().repaired > 0);
+}
+
 int main(void)
 {
     rs_init();
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_unknown_entry_type_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_damaged_entry_type_byte_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_uncompressed_entry_reads_clean, setup, teardown),
         cmocka_unit_test_setup_teardown(test_lz4_block_entry_reads_clean, setup, teardown),
         cmocka_unit_test_setup_teardown(test_payload_corruption_repaired_for_uncompressed, setup, teardown),
