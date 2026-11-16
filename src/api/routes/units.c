@@ -121,8 +121,21 @@ static api_response_t providers_list(void)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = root ? cJSON_AddArrayToObject(root, "providers") : NULL;
-    const sp_provider_ops_t *const *all = NULL;
-    size_t n = sp_registry_compiled(&all);
+    /* Compiled providers, then any the helper brought that this binary
+     * does not carry itself (docker, lxc). */
+    const sp_provider_ops_t *const *compiled = NULL;
+    size_t nc = sp_registry_compiled(&compiled);
+    const sp_provider_ops_t *all[32];
+    size_t n = 0;
+    for (size_t i = 0; i < nc && n < 32; i++) all[n++] = compiled[i];
+    for (size_t i = 0; i < sp_registry_count() && n < 32; i++) {
+        const sp_provider_ops_t *ops = NULL;
+        sp_ctx_t *ctx = NULL;
+        sp_registry_at(i, &ops, &ctx);
+        int dup = 0;
+        for (size_t k = 0; ops && k < n && !dup; k++) dup = strcmp(all[k]->name, ops->name) == 0;
+        if (ops && !dup) all[n++] = ops;
+    }
     for (size_t i = 0; arr && i < n; i++) {
         cJSON *o = cJSON_CreateObject();
         if (!o) break;
