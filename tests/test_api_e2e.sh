@@ -291,6 +291,14 @@ if [ -n "$TOKEN" ]; then ok "login returns a token"; else bad "login returns a t
 check "bearer accepted" 200 "$(tcp_code /repos -H "Authorization: Bearer $TOKEN")"
 check "bare token accepted" 200 "$(tcp_code /repos -H "Authorization: $TOKEN")"
 check "bad token refused" 401 "$(tcp_code /repos -H "Authorization: Bearer nonesuch")"
+# B127 follow-up: no empty or wrongly typed credential gets anywhere.
+check "an empty bearer token is refused" 401 "$(tcp_code /repos -H "Authorization: Bearer ")"
+check "an empty cookie is refused" 401 "$(tcp_code /repos -b "auth=")"
+check "an empty password does not log in" 401 \
+    "$(tcp_code /api/auth/login -X POST -d '{"password":""}')"
+check "a numeric password is a 400" 400 "$(tcp_code /api/auth/login -X POST -d '{"password":1}')"
+check "a null password is a 400" 400 "$(tcp_code /api/auth/login -X POST -d '{"password":null}')"
+check "a missing password is a 400" 400 "$(tcp_code /api/auth/login -X POST -d '{}')"
 check "cookie accepted" 200 "$(tcp_code /repos -b "auth=$TOKEN")"
 # B082: the key was read into the route context and then cleared when the
 # routes registered, so the flag was parsed and never honoured.
@@ -1721,6 +1729,150 @@ SCH=$(sock_send POST /repos/1/schedules \
     "{\"action\":\"backup\",\"paths\":[\"$R/src\"],\"label\":\"$LBL_JSON\",\"trigger\":{\"type\":\"interval\",\"seconds\":86400}}")
 contains "a labelled backup schedule is created" ' 201' "$SCH"
 contains "and stores the label" "\"label\":\"$LBL_OUT\"" "$(sock_body /repos/1/schedules)"
+
+echo "no silent security downgrade (B127)"
+# An explicit field carries a valid value or is a 400 naming it. Empty or
+# unrecognised never means "none" or "off": "encrypt":"" and
+# "passphrase":"" each registered an unencrypted repository with a 201.
+# Every refusal must leave nothing behind.
+dg_state() {
+    sock_body /repos; sock_body /repos/1/snapshots
+    sock_body '/jobs?limit=1' | grep -o '"id":[0-9]*' | head -1
+    find "$R/keys" -type f -exec sha256sum {} + 2>/dev/null | sort
+}
+DG_BEFORE=$(dg_state)
+dg() {  # dg <name> <expected error> <path> [extra JSON members]
+    local out
+    out=$(sock_send POST /repos "{\"path\":\"$3\"${4:+,$4}}")
+    check "$1" "{\"error\":\"$2\"} 400" "$out"
+}
+ENC_BAD='encrypt must be none, system or passphrase'
+PASS_EMPTY='passphrase must not be empty; leave it out for a repository without one'
+DG="$R/dgrepo"
+dg "encrypt empty"            "$ENC_BAD" "$DG" '"encrypt":""'
+dg "encrypt unknown"          "$ENC_BAD" "$DG" '"encrypt":"aes"'
+dg "encrypt in capitals"      "$ENC_BAD" "$DG" '"encrypt":"SYSTEM"'
+dg "encrypt with a space"     "$ENC_BAD" "$DG" '"encrypt":" system"'
+dg "encrypt empty, with a passphrase" "$ENC_BAD" "$DG" '"encrypt":"","passphrase":"correct horse"'
+dg "encrypt null"             'encrypt must be a string' "$DG" '"encrypt":null'
+dg "encrypt true"             'encrypt must be a string' "$DG" '"encrypt":true'
+dg "encrypt as a list"        'encrypt must be a string' "$DG" '"encrypt":["system"]'
+dg "passphrase empty"         "$PASS_EMPTY" "$DG" '"passphrase":""'
+dg "passphrase empty, encrypt passphrase" "$PASS_EMPTY" "$DG" '"encrypt":"passphrase","passphrase":""'
+dg "passphrase empty, encrypt none" "$PASS_EMPTY" "$DG" '"encrypt":"none","passphrase":""'
+dg "passphrase as a number"   'passphrase must be a string' "$DG" '"passphrase":12345678'
+dg "passphrase null"          'passphrase must be a string' "$DG" '"passphrase":null'
+check "no refused request created the directory" "absent" \
+    "$([ -e "$DG" ] && echo present || echo absent)"
+check "or changed anything" "$DG_BEFORE" "$(dg_state)"
+# Absent is still the documented default.
+contains "encrypt left out is accepted" ' 201' \
+    "$(sock_send POST /repos "{\"path\":\"$R/plainrepo\",\"label\":\"plain\"}")"
+contains "as an unencrypted repository" '"encryption":"none"' \
+    "$(sock_body /repos | tr '}' '\n' | grep plainrepo)"
+
+# Re-registering: the marker decides, and a request naming a different mode,
+# "none" included, is refused rather than read as "not asked".
+ENC_OUT=$(sock_send POST /repos "{\"path\":\"$R/encrepo\",\"label\":\"enc\",\"encrypt\":\"system\"}")
+contains "an encrypted repository is created" ' 201' "$ENC_OUT"
+ENC_ID=$(printf '%s' "$ENC_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+ENC_KEY=$(printf '%s' "$ENC_OUT" | sed -n 's/.*"key":"\([0-9a-fA-F]*\)".*/\1/p')
+DG_BEFORE=$(dg_state)
+contains "re-register saying encrypt none is refused" \
+    "already a repository with encryption system" \
+    "$(sock_send POST /repos "{\"path\":\"$R/encrepo\",\"label\":\"x\",\"encrypt\":\"none\"}")"
+dg "re-register with encrypt empty"   "$ENC_BAD"    "$R/encrepo" '"label":"x","encrypt":""'
+dg "re-register with passphrase empty" "$PASS_EMPTY" "$R/encrepo" '"label":"x","passphrase":""'
+check "and the repository is unchanged, label included" "$DG_BEFORE" "$(dg_state)"
+contains "a plain re-register still works" '"already_registered":true' \
+    "$(sock_send POST /repos "{\"path\":\"$R/encrepo\"}")"
+
+# Key import: exactly 64 hex characters, or a 400.
+ki() { sock_send POST "/repos/$ENC_ID/key/import" "$1"; }
+for body in '{"key":""}' '{"key":"zz"}' "{\"key\":\"${ENC_KEY}00\"}" \
+            "{\"key\":\"+${ENC_KEY:1}\"}" "{\"key\":\"0x${ENC_KEY:2}\"}" \
+            '{"key":1}' '{"key":null}' '{"key":["k"]}' '{}'; do
+    contains "key import refuses $body" ' 400' "$(ki "$body")"
+done
+check "and no key file changed" "$DG_BEFORE" "$(dg_state)"
+contains "the right key is still accepted" '{"ok":true} 200' "$(ki "{\"key\":\"$ENC_KEY\"}")"
+
+# Replicate: reencrypt is true or false, dest a path.
+rp() { sock_send POST /repos/1/replicate "$1"; }
+for v in '"true"' '1' 'null' '""'; do
+    check "reencrypt $v is refused" '{"error":"reencrypt must be true or false"} 400' \
+        "$(rp "{\"dest\":\"$R/encrepo\",\"reencrypt\":$v}")"
+done
+contains "an empty dest is refused" ' 400' "$(rp '{"dest":"","reencrypt":true}')"
+contains "a non-string dest is refused" 'dest must be a string' "$(rp '{"dest":1}')"
+
+# Safety switches in the query: an unrecognised value used to read as off,
+# so "dry_run=yes" ran the real pass and "repair=no" repaired.
+check "gc dry_run=yes is refused" '{"error":"dry_run must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/gc?dry_run=yes')"
+check "gfs dry_run= is refused" '{"error":"dry_run must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/gfs?dry_run=')"
+check "verify repair=no is refused" '{"error":"repair must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/verify?repair=no')"
+check "verify dry_run=on is refused" '{"error":"dry_run must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/verify?dry_run=on')"
+check "snapshot delete force= is refused" '{"error":"force must be 1 or 0"} 400' \
+    "$(sock_send DELETE '/repos/1/snapshots/1?force=')"
+check "none of them started a job or removed anything" "$DG_BEFORE" "$(dg_state)"
+
+echo "re-encrypting into plaintext needs allow_plaintext"
+# reencrypt into a path holding an unencrypted repository wrote the whole
+# encrypted repository out in plaintext, with nothing in the request saying
+# that was meant. It takes "allow_plaintext":true now, and is logged and
+# journalled when it happens.
+wait_job "$(job_id "$(sock_post "/repos/$ENC_ID/backup" "{\"paths\":[\"$R/src\"]}")")"
+PT_OUT=$(sock_send POST /repos "{\"path\":\"$R/ptarget\",\"label\":\"pt\"}")
+contains "an unencrypted target is registered" ' 201' "$PT_OUT"
+pt_files() { find "$R/ptarget" -type f | sort; }
+PT_BEFORE="$(dg_state)
+$(pt_files)"
+PT_REFUSAL="this repository is encrypted and the target is not, so the copy would hold every file in plaintext; to do that deliberately, set allow_plaintext (CLI --to-plaintext) (target at $R/ptarget)"
+rp_enc() { sock_send POST "/repos/$ENC_ID/replicate" "$1"; }
+check "encrypted into plaintext without the flag is refused" \
+    "{\"error\":\"$PT_REFUSAL\"} 400" \
+    "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true}")"
+check "allow_plaintext false is the same refusal" \
+    "{\"error\":\"$PT_REFUSAL\"} 400" \
+    "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":false}")"
+for v in '"true"' '1' 'null' '""'; do
+    check "allow_plaintext $v is refused" \
+        '{"error":"allow_plaintext must be true or false"} 400' \
+        "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":$v}")"
+done
+contains "allow_plaintext without reencrypt is refused" \
+    'allow_plaintext applies only with reencrypt' \
+    "$(rp_enc "{\"dest\":\"$R/ptarget\",\"allow_plaintext\":true}")"
+check "no refusal wrote to the target or changed anything" "$PT_BEFORE" "$(dg_state)
+$(pt_files)"
+PT_JOB=$(job_id "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":true}")")
+wait_job "$PT_JOB"
+contains "with allow_plaintext it runs" '"state":"completed"' "$(sock_body "/jobs/$PT_JOB")"
+PT_MSG="replicated encrypted repo $ENC_ID into plaintext at $R/ptarget"
+for _ in $(seq 1 50); do grep -q "$PT_MSG" "$R/daemon.log" && break; sleep 0.1; done
+# The level, without depending on the log format: plain output carries no
+# level marker, and the <4> prefix appears only when the daemon finds a
+# journal (JOURNAL_STREAM under a systemd scope, not in CI). This daemon
+# runs at log.level warn, so the line being there at all means warning or
+# above - and the run's info-level summary being absent shows the filter is
+# what decided it.
+contains "and logs a warning" "$PT_MSG" "$(cat "$R/daemon.log")"
+check "at warning level: the info-level summary of the same run is filtered" 0 \
+    "$(grep -c "replicate: repo $ENC_ID -> $R/ptarget:" "$R/daemon.log")"
+contains "and journals it" "\"message\":\"$PT_MSG\"" "$(sock_body "/repos/$ENC_ID/journal")"
+# Unencrypted to unencrypted drops nothing, so it needs no flag.
+P2_OUT=$(sock_send POST /repos "{\"path\":\"$R/ptarget2\",\"label\":\"pt2\"}")
+contains "a second unencrypted target" ' 201' "$P2_OUT"
+P2_JOB=$(job_id "$(sock_post /repos/1/replicate "{\"dest\":\"$R/ptarget2\",\"reencrypt\":true}")")
+wait_job "$P2_JOB"
+contains "unencrypted into unencrypted needs no flag" '"state":"completed"' \
+    "$(sock_body "/jobs/$P2_JOB")"
+check "and is not journalled as a plaintext copy" 0 \
+    "$(sock_body /repos/1/journal | grep -c 'into plaintext')"
 
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null

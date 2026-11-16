@@ -923,14 +923,23 @@ static int h_pack(const args_t *a)
  * they are stored in, so an encrypted repository stays encrypted at the far
  * end and the target never needs the key. --reencrypt goes into a different
  * repository under its own encryption: the way to change a repository's
- * encryption, which is fixed at creation.
+ * encryption, which is fixed at creation. Into an unencrypted repository
+ * that drops encryption, which the daemon refuses unless --to-plaintext
+ * says it is meant.
  */
 static int h_replicate(const args_t *a)
 {
+    int reencrypt = args_flag(a, "--reencrypt");
+    int to_plain  = args_flag(a, "--to-plaintext");
+    /* The daemon refuses it too; it only means anything with --reencrypt. */
+    if (to_plain && !reencrypt)
+        return refuse(a, "--to-plaintext needs --reencrypt: a plain replica keeps "
+                         "the source's encryption");
     sbuf_t b = { 0 };
     sb_puts(&b, "{\"dest\":");
     sb_json_str(&b, a->pos[1]);
-    if (args_flag(a, "--reencrypt")) sb_puts(&b, ",\"reencrypt\":true");
+    if (reencrypt) sb_puts(&b, ",\"reencrypt\":true");
+    if (to_plain)  sb_puts(&b, ",\"allow_plaintext\":true");
     sb_puts(&b, "}");
 
     sbuf_t p = { 0 };
@@ -1514,7 +1523,9 @@ static const arg_opt_t O_VERIFY[] = {
     OPT_DRYRUN, OPT_NOWAIT, OPT_END,
 };
 static const arg_opt_t O_REPLICATE[] = {
-    { "--reencrypt", NULL, ARG_FLAG, NULL }, OPT_NOWAIT, OPT_END,
+    { "--reencrypt", NULL, ARG_FLAG, NULL },
+    { "--to-plaintext", NULL, ARG_FLAG, NULL },
+    OPT_NOWAIT, OPT_END,
 };
 static const arg_opt_t O_STATS[] = { { "--scope", NULL, ARG_VALUE, "loose" }, OPT_END };
 static const arg_opt_t O_OBJECTS[] = {
