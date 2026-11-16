@@ -838,7 +838,10 @@ whose turn comes while a synchronous request holds its repository (`DELETE
 `queued` with `phase` `"waiting for repository"`, holds no worker, and is
 retried with a backoff of at most 500 ms until the request lets go. It can be
 cancelled meanwhile like any queued job. The `phase` is cleared when it
-starts. The requests themselves are unchanged: they still answer 503 (or 409
+starts. A replicate whose `dest` is a repository registered here holds both
+repositories: it starts only when both are free, takes both or neither, and
+counts as queued on each, so a job submitted later on either one starts after
+it. The requests themselves are unchanged: they still answer 503 (or 409
 for a removal) while a job holds the repository.
 
 A job record carries `origin`, who asked for it: `api` for anything submitted

@@ -92,6 +92,26 @@ status_t job_submit_locked(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
                            int64_t schedule_id, job_fn fn, void *arg,
                            void (*arg_free)(void *), int64_t *out_job_id);
 
+/*
+ * job_submit_locked for a job that holds more than its own repository: a
+ * replicate into another registered repository holds the destination too.
+ * `also` names up to JOB_LOCK_SET_MAX - 1 further repositories, each locked
+ * for writing; ids <= 0, duplicates and repo_id itself are dropped.
+ *
+ * The dispatcher try-locks the whole set or none of it: a member held by
+ * anything releases whatever was taken and defers the job, so no job holds
+ * one lock while waiting for another, and A->B queued beside B->A cannot
+ * deadlock. The job counts as queued on every member of its set, so a
+ * later job on any of them waits behind it and it cannot be starved.
+ */
+#define JOB_LOCK_SET_MAX 2
+
+status_t job_submit_lockset(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                            const int64_t *also, int nalso,
+                            const char *action, const char *params_json,
+                            int64_t schedule_id, job_fn fn, void *arg,
+                            void (*arg_free)(void *), int64_t *out_job_id);
+
 /* The phase a queued job shows while it waits for a synchronous request to
  * let go of its repository, and the bounds of the retry backoff. */
 #define JOB_PHASE_WAITING "waiting for repository"

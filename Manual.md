@@ -1491,7 +1491,9 @@ doing it holds both keys, and so must the host the destination is used on.
 Refused when the destination is not a repository, is a replica of the source
 (replicate without `--reencrypt`), or is encrypted and its key is not on this
 host. If the destination is registered here, its write lock is held for the
-run, and `reindex` it afterwards so its index sees the new snapshots. Run it
+run alongside the source's: the job starts only once both repositories are
+free, waiting its turn on each like any queued job (section 6.4), and jobs
+queued on the destination after it wait behind it. `reindex` it afterwards so its index sees the new snapshots. Run it
 again after more backups and only the new snapshots are sent.
 
 The job's `result` says what moved: `snapshots_sent`, `snapshots_skipped`
