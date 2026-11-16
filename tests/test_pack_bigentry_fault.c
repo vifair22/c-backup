@@ -149,7 +149,11 @@ static void test_gc_takes_an_entry_past_128_gib(void **state)
     fault_reset_all();
     assert_true(fired);
     assert_int_not_equal(st, OK);
-    assert_non_null(strstr(err_msg(), "pack rewrite: short entry"));
+    /* Where the injected read lands depends on how many reads the copy
+     * makes (the OWN-29 CRC pass added some), so any failure inside the
+     * rewrite proves the point: the entry got past the header into the
+     * copy. What must never appear is a refusal of the header itself. */
+    if (!strstr(err_msg(), "pack rewrite:")) fail_msg("err: %s", err_msg());
     assert_null(strstr(err_msg(), "bad entry header"));
 
     struct stat sb;

@@ -246,16 +246,14 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
  * Read one object end to end, which is what forces the hash check.
  *
  * Large objects have to stream: they may exceed memory, and design
- * constraint 2 says never to assume otherwise. The cost is that a streamed
- * read cannot use the payload parity, so for those the answer is only
- * "intact" or "not", and deciding whether the damage was recoverable takes a
- * repair attempt.
+ * constraint 2 says never to assume otherwise. Streaming into /dev/null
+ * still applies parity in memory, one group window at a time, so a streamed
+ * read tells recoverable damage from loss just as an in-memory one does.
  */
 static status_t read_whole_object(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                                   uint64_t size, int devnull,
-                                  uint64_t *out_bytes, int *out_streamed)
+                                  uint64_t *out_bytes)
 {
-    if (out_streamed) *out_streamed = 0;
 
     if (size <= VERIFY_INMEM_MAX) {
         void  *data = NULL;
@@ -269,7 +267,6 @@ static status_t read_whole_object(store_t *store, const uint8_t hash[OBJECT_HASH
         err_clear();
     }
 
-    if (out_streamed) *out_streamed = 1;
     uint64_t sz = 0;
     uint8_t  type = 0;
     status_t st = object_load_stream(store, hash, devnull, &sz, &type);
@@ -457,8 +454,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
          */
         parity_stats_t before = parity_stats_get();
         uint64_t bytes = 0;
-        int streamed = 0;
-        status_t rst = read_whole_object(store, hash, osize, devnull, &bytes, &streamed);
+        status_t rst = read_whole_object(store, hash, osize, devnull, &bytes);
         parity_stats_t after = parity_stats_get();
 
         if (rst != OK) {
@@ -470,7 +466,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                                          : object_repair(store, hash))
                                : 0;
             if (fixed > 0 &&
-                read_whole_object(store, hash, osize, devnull, &bytes, NULL) == OK) {
+                read_whole_object(store, hash, osize, devnull, &bytes) == OK) {
                 res.repaired++;
                 res.bytes_read += bytes;
                 log_warn("verify: repaired %s (%d byte(s) corrected)", hex, fixed);
@@ -479,14 +475,14 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 err_clear();
                 res.unrecoverable++;
                 /*
-                 * A streamed object that failed with repair disabled might
-                 * still have been recoverable; the streaming path has no way
-                 * to ask without writing. Say so rather than reporting data
-                 * loss that a repairing scrub would have fixed.
+                 * This used to say "damaged (run with repair to attempt
+                 * recovery)" for a streamed object with repair off, because
+                 * the streaming path could not apply parity without writing.
+                 * Every streaming reader now corrects into /dev/null in
+                 * memory, loose or packed and any codec, so a streamed read
+                 * that still fails is beyond parity: loss, like any other.
                  */
-                record_finding(db, repo_id, res.run_id, hex,
-                               (streamed && !repair) ? "damaged (run with repair to attempt recovery)"
-                                                     : "unrecoverable");
+                record_finding(db, repo_id, res.run_id, hex, "unrecoverable");
             }
             continue;
         }

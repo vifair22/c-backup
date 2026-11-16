@@ -16,6 +16,7 @@
 
 #include "error.h"
 #include "store.h"
+#include "pack.h"
 
 #include <cutils/db.h>
 #include <stdint.h>
@@ -37,7 +38,18 @@ typedef struct {
      * A dry run removes none. */
     uint32_t tmp_files_removed;
     uint64_t tmp_bytes_removed;
+    /* Entries a rewrite or coalesce copied with damage beyond parity, and
+     * the first PACK_DAMAGED_LIST_MAX of their hashes (OWN-31). */
+    uint64_t pack_entries_damaged;
+    uint32_t damaged_listed;
+    uint8_t  damaged[PACK_DAMAGED_LIST_MAX][OBJECT_HASH_SIZE];
 } gc_result_t;
 
+/*
+ * Sweep unreferenced objects and compact packs. A pack entry found damaged
+ * beyond parity while being copied is copied as it is and compaction goes
+ * on, then gc returns ERR_CORRUPT naming how many: the new pack's parity
+ * covers the damage, and reporting OK would hide it (OWN-31).
+ */
 status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 int dry_run, atomic_int *cancel, gc_result_t *out);
