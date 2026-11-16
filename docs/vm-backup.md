@@ -34,8 +34,10 @@ format change.
 | Data, shut-off VM | raw: read the file directly (`SEEK_DATA`/`SEEK_HOLE`); qcow2 and anything else: `qemu-nbd --read-only` spawned by the daemon, read by the same NBD client (2.4) |
 | Consistency | guest-agent `fsfreeze` around the backup start when the agent is connected, else crash-consistent; the achieved level recorded per snapshot |
 | Incremental | libvirt checkpoints (persistent qcow2 dirty bitmaps); changed ranges re-chunked from the previous CDC boundary until the chunker resyncs (5.3) |
-| Raw disks | full read every session (libvirt checkpoints are qcow2-only); offline raw with an unchanged file reuses the previous root. An opt-in qcow2 external-data-file wrapper gives raw disks bitmaps without converting the data (5.6) |
-| Passthrough disks | excluded by default, recorded as excluded (3.4) |
+| Raw disks | full read every session (libvirt checkpoints are qcow2-only); offline raw with an unchanged file reuses the previous root. Decided: full reads accepted; the user converts to qcow2 after the 1.0 work (5.5) |
+| Passthrough disks | decided: excluded by default, marked as excluded on every snapshot (3.4) |
+| Domain XML | decided: stored verbatim, secrets included (section 6) |
+| Audit | decided: a full audit read every 30 days per unit, configurable (5.4) |
 | Restore | sparse raw natively; qcow2 through `qemu-nbd`; domain re-define with name/UUID/MAC collision handling; read-only NBD export from the daemon for file-level recovery |
 | Production VMs | not touched until the user says so; enforced by `units.allow` (`source-providers.md` 8.3) |
 
@@ -739,7 +741,13 @@ ours and useless), and repeats `begin` as a full read with a new
 checkpoint: `read_mode: full`, reason `token-invalid`. One extra round trip,
 no user action.
 
-### 5.6 Opt-in: raw data under a qcow2 metadata file
+### 5.6 Background: raw data under a qcow2 metadata file
+
+**Not a recommendation.** Decided: raw VMs take full reads, and the user
+converts them to qcow2 after the 1.0 work by their own procedure. c-backup
+neither converts nor wraps anything. This section is kept only as
+background on the one way to give a raw disk bitmaps without moving its
+data, should it ever be wanted.
 
 QEMU can keep a disk's data in a raw file and its metadata, including
 persistent bitmaps, in a small qcow2 file (`data_file` with
@@ -772,9 +780,8 @@ Risks: the truncation hazard above; a tool that writes the raw file
 directly while the VM is off bypasses the bitmap (the audit catches it);
 Unraid's VM manager may rewrite the disk XML when the VM is edited in its
 UI, silently reverting the change (to check on a disposable VM); and one
-more file per disk that must move with the image. This is presented as an
-option for Noah MC and DLBox, not a recommendation; at their sizes a full
-read is cheap (5.5).
+more file per disk that must move with the image. At Noah MC's and DLBox's
+sizes a full read is cheap (5.5), which is why it was not adopted.
 
 ### 5.7 Disks added, removed, resized, swapped
 
@@ -827,18 +834,21 @@ Per `source-providers.md` section 7, with:
 ```
 .cbackup-unit/
   unit.json
-  config/domain.xml        inactive XML; SECURE only into encrypted repos (below)
+  config/domain.xml        inactive XML, verbatim, with VIR_DOMAIN_XML_SECURE
   config/nvram.fd
   config/tpm/...           swtpm state, when present
   disks/<target>           one per included disk
 ```
 
-`VIR_DOMAIN_XML_SECURE` includes passwords (VNC/SPICE) and secret
-references. They are written into an encrypted repository; into an
-unencrypted one the XML is fetched without `SECURE`, and the snapshot
-carries the warning `domain XML stored without secrets (repository is not
-encrypted)`. Restore then asks for new graphics passwords if the XML had
-them.
+**Backup never mutates what it captures** (decided). The domain XML is
+fetched with `VIR_DOMAIN_XML_SECURE` and stored byte for byte as libvirt
+returned it, including graphics (VNC/SPICE) passwords and anything else the
+XML carries. In an encrypted repository it is encrypted like every object;
+**an unencrypted repository holds whatever the XML holds, in the clear**,
+readable by anyone who can read the repository directory. The Manual says
+so in the VM chapter, and `GET /providers` reports `libvirt` units enrolled
+into unencrypted repositories so the exposure is visible. Restore uses the
+stored XML as is.
 
 ## 7. Restore
 
@@ -1037,7 +1047,7 @@ New chapter "Virtual machines", after "Backing up":
 2. Requirements: libvirt and QEMU versions, the guest agent, qemu-utils, mounts
 3. Enabling the provider; `vm list` and what each column means
 4. Consistency levels, freeze behaviour, the worst-case freeze, Windows VSS
-5. Full, incremental and unchanged reads; checkpoints; why raw disks read in full; the data-file option and its risks
+5. Full, incremental and unchanged reads; checkpoints; why raw disks read in full and what converting to qcow2 gains
 6. Audits and what an audit failure means; `reset-incremental`
 7. Schedules and retention per VM
 8. Restoring: a disk, a whole VM, define, replace; name, UUID and MAC rules
@@ -1061,8 +1071,10 @@ c-backupd on FS1 (the same instance as container backup,
 | **FS1 array disk, by disk path** (`/mnt/diskN/...`, not `/mnt/user`, which is shfs) | another set of devices on the same host; 53 TB free (survey section 2); xfs, local, real `fsync` and `rename` | parity writes are slower (about 100-200 MB/s), which bounds a first full backup, not incrementals |
 | FS2 over NFS | another host | every byte crosses the network; NFS `rename`/`fsync` semantics need a `sync` export |
 
-Recommended: primary repository on an FS1 array disk, then a daily
-`replicate` to FS2 (an NFS-mounted path), so one copy is off-host.
+Decided: the primary repository goes on an FS1 array disk by disk path,
+with a daily `replicate` to FS2 (an NFS-mounted path), so one copy is
+off-host. The cache pool was rejected because it is the same pool as the
+VMs and appdata it protects.
 
 ### 9.2 Container mounts
 
@@ -1225,7 +1237,6 @@ destroyed after, never the five production domains:
 | `cbk-uat-img` | qcow2 named `.img`: format detection |
 | `cbk-uat-w` | Windows with qemu-ga (optional): VSS level |
 | `cbk-uat-pt` | a passthrough of a spare scratch block device or loop device: exclusion and opt-in |
-| `cbk-uat-df` | raw under a qcow2 data-file wrapper: the 5.6 procedure, on a copy |
 
 Scenarios: a week of nightly schedules with a guest workload (fio with a
 known write pattern), audits forced daily (`vm.audit_days: 1`), host-side
@@ -1317,23 +1328,21 @@ Risks:
 - **R3. The delta algorithm** is new code on the correctness path. The
   invariant tests (10.1) and the audit (5.4) are its defence; incrementals
   should ship behind `vm.incremental: 1` (default on only after UAT).
-- **R4. Data-file wrapper** (5.6): truncation hazard during creation; only
-  with the user's OK, proven on a copy.
+Decided by the user (2026-11-16):
 
-Open questions for the user:
+| Question | Decision |
+|---|---|
+| Security model | Option B: the privileged helper sidecar, as specified in `source-providers.md` section 11 |
+| Passthrough disks | Excluded by default and marked `excluded: passthrough` on every snapshot (3.4); opt in per disk |
+| Raw VMs | Full reads accepted. The user converts them to qcow2 after the 1.0 work, by their own procedure; c-backup converts nothing. The data-file wrapper (5.6) is background only, not a recommendation |
+| Domain XML secrets | Never stripped. Backup does not mutate what it captures: the domain XML is stored verbatim with `VIR_DOMAIN_XML_SECURE`, and an unencrypted repository holds whatever the XML holds (section 6) |
+| Audit cadence | A full audit read every 30 days per unit, configurable (`vm.audit_days`) |
+| FS1 repository | On an FS1 array disk by disk path (`/mnt/diskN/...`, not `/mnt/user`), replicated daily to FS2 (9.1) |
 
-1. **Q1.** Passthrough disks excluded by default with a visible marker
-   (proposed), or refuse to back up a VM that has one until the user decides?
-2. **Q2.** Where Unraid 7.4 keeps `/var/lib/libvirt/qemu/checkpoint`: if in
+Still to verify (facts, not decisions), read-only or in UAT:
+
+1. **Q2.** Where Unraid 7.4 keeps `/var/lib/libvirt/qemu/checkpoint`: if in
    RAM, every host reboot costs a checkpoint redefine (handled), and an
-   untested path becomes routine. To check read-only on FS1.
-3. **Q3.** Raw VMs (Noah MC, DLBox): accept full reads (about 80 s and 35 s
-   of reading per session, proposed), or trial the data-file wrapper on a
-   disposable copy?
-4. **Q4.** Domain XML secrets into unencrypted repositories: omit them
-   (proposed) or store them?
-5. **Q5.** Audit cadence: 30 days (proposed) or more often for the first
-   months?
-6. **Q6.** Unraid's swtpm state location, for Windows 11 VMs with a TPM.
-7. **Q7.** Repository for FS1 workloads: FS1 array disk plus replication to
-   FS2 (proposed)?
+   untested path becomes routine.
+2. **Q6.** Unraid's swtpm state location, for Windows 11 VMs with a TPM.
+3. **R1** above: QEMU's behaviour when scratch fills.

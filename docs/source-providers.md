@@ -31,7 +31,9 @@ One **behavioural** reservation (not a format change) must ship with the
 feature: file backups never emit a top-level `.cbackup-unit` entry, and a
 file source at or under `/.cbackup-unit` is refused. That is what lets
 reindex trust the directory as a daemon-written unit marker. It changes no
-reader and no byte on disk. Section 7 gives the alternatives that were
+reader and no byte on disk. `db-detection.md` adds a second reserved name of
+the same kind, `.cbackup-captures`, for engine copies in file snapshots;
+both reservations should land together. Section 7 gives the alternatives that were
 rejected, notably a field in `snapshots/<id>`, which a 1.0 replicator would
 silently strip.
 
@@ -1002,9 +1004,10 @@ repository is not authenticated (content addressing detects damage, not a
 forger who rewrites names), so on such a repository define is refused
 unless the config sets `units.define_from_unencrypted: 1`.
 
-**Asked of the user:** choose A or B for 1.0. The recommendation is B,
-built in phase 1 of the container work, because LXC and host-version ZFS
-need host-side execution anyway.
+**Decided (user, 2026-11-16): option B**, the privileged helper sidecar as
+specified in 11.1 to 11.7, built in phase C2 of the container work.
+Option A remains only as the in-process transport for tests and
+development.
 
 ## 12. Restore framework
 
@@ -1058,12 +1061,26 @@ Later providers fit the same shape: Proxmox (`qm`/QEMU backups are libvirt-
 like with their own API), Incus/LXD (instances with storage-pool snapshots),
 Podman (Docker-compatible API), Hyper-V (RCT change tracking as `changed`).
 
-## 15. Open questions (common)
+## 15. Decisions and open questions (common)
 
-1. Option A or B (section 11). Recommendation: B.
-2. Per-unit retention defaults: inherit the repository policy (proposed), or
+Decided by the user (2026-11-16):
+
+| Question | Decision |
+|---|---|
+| Security model | Option B, the helper sidecar (section 11) |
+| Secrets in captured configuration | Never stripped: backup does not mutate what it captures. Domain XML, `docker inspect` output and templates are stored verbatim; an unencrypted repository holds them in the clear, and the Manual says so plainly |
+| Repository for FS1 workloads | An FS1 array disk by disk path, replicated daily to FS2 (`vm-backup.md` 9.1) |
+
+The provider-specific decisions are listed in `vm-backup.md` section 13
+and `container-backup.md` section 16. Database detection, which replaces
+per-application hook decisions such as the Immich dump, is designed in
+`db-detection.md`.
+
+Not yet asked, with the proposals standing:
+
+1. Per-unit retention defaults: inherit the repository policy (proposed), or
    ship a separate default for units?
-3. Should a repository mix file snapshots and unit snapshots? Proposed:
+2. Should a repository mix file snapshots and unit snapshots? Proposed:
    allowed (retention groups make it safe), but the UI suggests one
    repository per host for workloads, separate from file backups.
-4. `units.allow` as the UAT guard rail (8.3): agreed?
+3. `units.allow` as the UAT guard rail (8.3).

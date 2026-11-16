@@ -29,7 +29,7 @@ behaviour change, not a format change (`source-providers.md` section 7).
 | Decision | Choice |
 |----------|--------|
 | Docker and LXC | Both 1.0, behind the same provider interface |
-| Consistency | Pre hooks (live), then pause, filesystem snapshot, unpause, post hooks; the backup reads from the snapshot while the workload runs |
+| Consistency | Pre hooks (live), then an atomic filesystem snapshot, with a pause around it only when the capture needs one (`pause: auto`, decided; `always` per unit), then post hooks; the backup reads from the snapshot while the workload runs |
 | Filesystems | ZFS and btrfs first: FS1's cache is ZFS, FS2's is btrfs (survey section 2). Other filesystems get a fallback (section 7), flagged for the user |
 | Images | Not backed up. The definition is, and restore pulls the image |
 | Definitions | `docker inspect` output, plus the compose files or the Unraid template (`/boot/config/plugins/dockerMan/templates-user/my-*.xml`) where present |
@@ -119,9 +119,11 @@ with no `docker` CLI in the image), API version negotiated via `/version`:
 
 Secrets: the survey notes some FS1 templates carry secrets (fleet-derper,
 tailsync), and inspect output contains every environment variable. They are
-stored, because a restore needs them; into an unencrypted repository with a
-warning on every snapshot that carries them (`definition contains
-environment values; repository is not encrypted`).
+stored verbatim (decided: backup never mutates what it captures, and a
+restore needs them). An unencrypted repository therefore holds every
+environment value, template field and compose `.env` entry in the clear;
+the Manual says so plainly, and each such snapshot carries the notice
+`definition stored verbatim; repository is not encrypted`.
 
 LXC: `<lxcpath>/<name>/config`, plus any `lxc.include` file under the LXC
 path (system includes under `/usr/share/lxc` are recorded by path only).
@@ -162,8 +164,9 @@ Docker expects it; the read path is the snapshot's copy of the resolved
 path.
 
 Per-unit exclusions use the existing pattern syntax (Manual section 6.2),
-applied to recorded paths. Suggested defaults for the FS1 workloads,
-shipped as examples, not applied automatically:
+applied to recorded paths. Decided (C7): exclusions are suggestions only,
+shown in the UI and the Manual and never applied by default. Suggestions
+for the FS1 workloads:
 
 | Unit | Exclude | Why |
 |---|---|---|
@@ -321,11 +324,11 @@ exactly as consistent as with one. Only units with opted-in fallback
 mounts (frigate's `/mnt/disks/NVR`) would pause. On FS2, with no
 subvolumes, the single top-level snapshot is likewise atomic.
 
-`pause: always` (the user's call, the current default) remains correct and
-costs about a second per unit (6.1); `pause: auto` is the proposal behind
-C1, now with the reasoning above. A pause never makes a capture worse, so
-`always` is the safe choice if there is doubt; `auto` is the one that never
-touches a workload it does not need to.
+**Decided (C1): `pause: auto` is the default**, because it never touches a
+workload it does not need to. `pause: always` is available per unit in
+enrolment and costs about a second per capture (6.1); a pause never makes a
+capture worse, so it is the choice for a unit whose owner wants it
+regardless.
 
 ### 6.5 Failure handling
 
@@ -427,8 +430,11 @@ because the whole data directory is captured atomically and PostgreSQL
 recovers from a crash-consistent copy. The dump adds a logical backup that
 restores into any later PostgreSQL, which matters because Immich pins a
 specific PostgreSQL-with-vector-extension image that will change. It is a
-few hundred MB, compresses well, and dedups poorly (a dump shifts); a
-weekly dump schedule instead of nightly is open question C4.
+few hundred MB, compresses well, and dedups poorly (a dump shifts).
+Whether to enable it is no longer a per-application decision: database
+detection (`db-detection.md`) finds Immich's PostgreSQL, reports that the
+atomic snapshot already covers it, and offers this dump as a one-click
+suggestion.
 
 ```json
 {"unit":"docker:Grafana",
@@ -495,8 +501,9 @@ non-ZFS, non-btrfs filesystem cannot be snapshotted. Options per mount
   pause, so the unit's level is `crash` when pass 2 finishes in time.
 
 On FS1 today only opt-in mounts would use it (frigate's NVR, if included);
-appdata is all on the ZFS pool. Open question C2: is `pause-read` the right
-default, and is keeping a flagged snapshot on deadline right?
+appdata is all on the ZFS pool. Decided (C2): `pause-read` with a 30 s
+cap is the default, and a capture that hits the cap keeps its snapshot
+with those mounts flagged `inconsistent`.
 
 ## 8. Snapshot mechanics
 
@@ -552,7 +559,7 @@ domain is the top-level subvolume (id 5): the whole pool.
   must **not** be a new top-level directory: Unraid treats top-level
   directories on a pool as shares, so `/mnt/cache/.cbackup-snapshots` could
   surface as a user share, be walked through `/mnt/user`, or worse be
-  handed to the mover. The proposed location is
+  handed to the mover. The location is
   `/mnt/cache/system/.cbackup-snapshots/` (`containers.btrfs_snapshot_dir`),
   inside an existing pool-only share. Whether Unraid exports or moves dot
   directories at a pool's top level, and confirming `system` is pool-only
@@ -574,12 +581,12 @@ domain is the top-level subvolume (id 5): the whole pool.
   walk `/mnt/cache/system` (indexers, `du`, another backup tool) would see
   a read-only copy of the pool for the minutes a job holds it; that window
   is the cost of no subvolumes.
-- **The alternative** is converting `appdata` into a subvolume (stop
-  containers, `btrfs subvolume create`, `cp -a --reflink=always`, swap
-  names): snapshots then cover appdata only and can live inside it. It is
-  an operator step with downtime and is **not** done without the user's
-  approval. FS2 carries no production containers, so the top-level design
-  is what UAT exercises there.
+- **Decided (C6): snapshot the whole pool.** The alternative, converting
+  `appdata` into a subvolume (stop containers, `btrfs subvolume create`,
+  `cp -a --reflink=always`, swap names) so snapshots cover appdata only, was
+  not adopted: it is an operator step with downtime. FS2 carries no
+  production containers, so the top-level design is what UAT exercises
+  there.
 
 ## 9. Privileges and deployment
 
@@ -675,7 +682,7 @@ docker run -d --name c-backupd-fs1 --restart unless-stopped \
 keeping exactly those capabilities; Docker gives a non-root `--user` none
 of them.)
 
-**Asked of the user:** A or B. Recommendation: B, as the sidecar.
+**Decided (C5): option B, as the sidecar.**
 
 ### 9.3 Which host runs what
 
@@ -702,7 +709,7 @@ flowchart LR
 ```
 
 - **FS1** gets a new `c-backupd-fs1` (plus helper) for its containers, LXC
-  and VMs (`vm-backup.md` section 9.1). Its repository goes on an FS1 array
+  and VMs (`vm-backup.md` section 9.1). Decided: its repository goes on an FS1 array
   disk by disk path (`/mnt/diskN/...`, not shfs): different devices from the
   cache pool it protects, local `fsync`/`rename`. A daily `replicate`
   schedule copies it to FS2 through an NFS mount, for one off-host copy.
@@ -756,7 +763,7 @@ user decides; running both means keeping its downtime meanwhile.
 - **Immich's library** (290 GB of photos, written once): stored once, then
   only new photos.
 - **Dumps** dedup poorly, since a logical dump shifts with every change;
-  which is why the dump hook is opt-in (C4).
+  which is why a dump is only ever a suggestion (`db-detection.md`).
 
 ### 11.2 Restore
 
@@ -780,9 +787,11 @@ user decides; running both means keeping its downtime meanwhile.
    (`POST /images/create?fromImage=<repo>@<digest>`), so the application
    comes back at the version its data was written by: tags such as
    `release`, `beta` and `latest` move, and GitLab in particular requires
-   stepwise upgrades. If the registry no longer serves the digest, the
-   request must say `allow_tag: true` to pull the tag instead, with a
-   warning. Open question C3.
+   stepwise upgrades. Decided (C3): if the registry no longer serves the
+   digest, the restore falls back to the recorded tag and says so in the
+   job result and the journal (`image digest sha256:... no longer
+   available; pulled tag gitlab/gitlab-ee:19.5.5-ee.0 instead`).
+   `pin_digest: true` in the request refuses the fallback.
 4. **Create**:
    - standalone container with an Unraid template: write the template back
      to `templates-user/my-<name>.xml` (so Unraid's UI knows the container)
@@ -830,7 +839,7 @@ unprivileged containers keep their shifted ids; `lxc-start` only if asked.
 | `containers.enabled` | `0` | Load the Docker provider |
 | `containers.docker_socket` | `/var/run/docker.sock` | Engine API socket (option A only) |
 | `containers.include_roots` | `/mnt/cache/appdata,/mnt/user/appdata` | Bind sources under these are data; others are excluded and listed |
-| `containers.pause` | `always` | `always`, `auto`, `never` (6.4) |
+| `containers.pause` | `auto` | `auto`, `always`, `never` (6.4); per-unit override in enrolment |
 | `containers.pause_scope` | `unit` | `unit`, `group`, `job` (6.2) |
 | `containers.pause_timeout_s` | `5` | Time for every member to freeze |
 | `containers.max_pause_s` | `30` | Watchdog bound on the window, fallback pass 2 included |
@@ -848,7 +857,7 @@ unprivileged containers keep their shifted ids; `lxc-start` only if asked.
 Common routes are in `source-providers.md` section 10, with `<p>` =
 `docker` (units `compose:<project>` or a container name) or `lxc`.
 Container-specific: restore bodies take `containers`, `mounts`, `name`,
-`replace`, `allow_tag`, `start`, `accept_privileged`.
+`replace`, `pin_digest`, `start`, `accept_privileged`.
 
 ```sh
 c-backup container list                       # units, members, mounts and their capture method
@@ -972,27 +981,21 @@ Production containers are enrolled only after the user's explicit OK.
 All of C1 to C6 are in the 1.0 scope the user set; C1, C3 and C5 are what
 replacing the Appdata Backup plugin on FS1 needs.
 
-## 16. Open questions for the user
+## 16. Decisions
 
-1. **C1.** `containers.pause: always` (your call, the default) or `auto`,
-   which pauses only when the capture has more than one snapshot instant
-   (several pools, several btrfs subvolumes), a fallback mount, or a hook
-   that needs the application quiesced (6.4)? Under `auto` no production
-   unit on FS1 would pause: all their data is in one pool, which one
-   `zfs snapshot` captures atomically.
-2. **C2.** Fallback default `pause-read` with a 30-second cap, keeping a
-   flagged `inconsistent` snapshot when the cap is hit (proposed)?
-3. **C3.** Restore pulls by digest by default and needs `allow_tag` to fall
-   back to the tag (proposed)?
-4. **C4.** Immich `pg_dumpall` dump hook: nightly, weekly, or not at all
-   (the snapshot is already crash-consistent)?
-5. **C5.** SECURITY: option A or B (helper sidecar, recommended), section
-   9.2.
-6. **C6.** FS2 btrfs: snapshot the top-level subvolume into
-   `system/.cbackup-snapshots` (proposed), or convert `appdata` to a
-   subvolume (operator step, needs your approval)?
-7. **C7.** Default exclusions for GitLab logs and the OpenSearch index:
-   ship as suggestions only (proposed) or apply by default?
+Decided by the user (2026-11-16):
+
+| Question | Decision |
+|---|---|
+| C1. Pause policy | `containers.pause: auto` is the default: pause only when the capture has more than one snapshot instant, a fallback mount, or a hook with `needs_quiesce` (6.4). `always` is available per unit in enrolment (and `never` for units listed in `containers.never_pause`) |
+| C2. Fallback | Two-pass `pause-read` with a 30 s cap; when the cap is hit, the snapshot is kept and its fallback mounts are flagged `inconsistent` (section 7) |
+| C3. Restore image | Pull by the recorded digest; if the registry no longer serves it, fall back to the recorded tag with a warning in the job result and the journal (11.2) |
+| C4. Immich dump hook | Superseded: per-application hook decisions give way to general database detection (`db-detection.md`), which suggests a capture method per detected engine and never applies one silently |
+| C5. Security | Option B, the helper sidecar (9.2; `source-providers.md` section 11) |
+| C6. FS2 btrfs | Snapshot the whole pool (the top-level subvolume) into `system/.cbackup-snapshots` (8.2); `appdata` is not converted |
+| C7. Exclusions | Suggestions only: shown in the UI and the Manual, never applied by default (4.2) |
+| Secrets in definitions | Never stripped: `docker inspect`, templates and compose files are stored verbatim; an unencrypted repository holds them in the clear (4.1) |
+| FS1 repository | An FS1 array disk by disk path, replicated daily to FS2 (9.3) |
 
 UAT items to settle before conclusions: U3 (`.zfs` snapshot visibility
 inside a container with `rslave`), U4 (whether Unraid exports or moves dot
