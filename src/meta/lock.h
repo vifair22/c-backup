@@ -23,6 +23,9 @@ status_t repo_lock_write(int64_t repo_id);
 status_t repo_lock_read(int64_t repo_id);
 void     repo_unlock(int64_t repo_id);
 
-/* Non-blocking write acquire: OK if taken, ERR_BUSY if another job holds it.
- * Used to reject a second write job on the same repo rather than queue one. */
+/* Non-blocking acquire: OK if taken, ERR_BUSY if anything else holds it in a
+ * conflicting mode. Synchronous routes use the write form to answer 503
+ * rather than wait behind a job; the job manager uses both to defer a job,
+ * never to block a worker, while a synchronous request holds the repo. */
 status_t repo_trylock_write(int64_t repo_id);
+status_t repo_trylock_read(int64_t repo_id);

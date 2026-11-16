@@ -34,6 +34,7 @@
 #include <cutils/db.h>
 
 #include "job_manager.h"
+#include "lock.h"
 #include "test_tmp.h"
 
 #define TEST_DIR TEST_TMP "/c_backup_test_jobm"
@@ -732,6 +733,543 @@ static void test_alert_names_repository_and_error(void **state)
     assert_non_null(strstr(body, "(no label) (id 8) at /srv/repos/misc"));
 }
 
+/*
+ * B123: a job dispatched while a synchronous request held its repository's
+ * lock failed "repo N is busy", failure alert and all. Snapshot delete and
+ * repository removal take the repo write lock inline, so an operator's
+ * delete could cost a scheduled backup. The test thread stands in for the
+ * request, taking the lock the way snapshots_route_delete does.
+ */
+static int job_waiting(int64_t id)
+{
+    char q[192];
+    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM jobs WHERE id = %lld AND state = 'queued'"
+             " AND progress_phase = '" JOB_PHASE_WAITING "'", (long long)id);
+    for (int i = 0; i < 400; i++) {
+        if (db_count(q) == 1) return 1;
+        usleep(5000);
+    }
+    return 0;
+}
+
+static int job_state_is(int64_t id, const char *want)
+{
+    char q[96], st[32];
+    snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)id);
+    for (int i = 0; i < 400; i++) {
+        if (db_text(q, st, sizeof(st)) == 0 && strcmp(st, want) == 0) return 1;
+        usleep(5000);
+    }
+    return 0;
+}
+
+static void test_a_job_waits_for_a_request_holding_the_repo(void **state)
+{
+    (void)state;
+    assert_int_equal(repo_trylock_write(1), OK);
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, probe_job,
+                                (void *)(intptr_t)1, NULL, &id), OK);
+
+    /* Deferred, not failed: still queued, saying why, never started. */
+    assert_true(job_waiting(id));
+    usleep(3 * JOB_DEFER_MAX_MS * 1000);   /* several retries, all refused */
+    pthread_mutex_lock(&g_mu);
+    assert_int_equal(g_completed, 0);
+    assert_int_equal(g_peak[1], 0);
+    pthread_mutex_unlock(&g_mu);
+    char q[96], buf[32];
+    snprintf(q, sizeof(q), "SELECT COALESCE(started, 'null') FROM jobs WHERE id = %lld",
+             (long long)id);
+    assert_int_equal(db_text(q, buf, sizeof(buf)), 0);
+    assert_string_equal(buf, "null");
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'failed'"), 0);
+
+    repo_unlock(1);
+    wait_for(1);
+    assert_true(job_state_is(id, "completed"));
+    snprintf(q, sizeof(q), "SELECT COALESCE(progress_phase, '') FROM jobs WHERE id = %lld",
+             (long long)id);
+    assert_int_equal(db_text(q, buf, sizeof(buf)), 0);
+    assert_string_equal(buf, "");   /* the waiting phase does not outlive the wait */
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE result = 'failed'"), 0);
+}
+
+/* And a request still gets its 503 when a job holds the repository: the
+ * manager holds the lock for the job's whole run, in the job's mode. */
+static void test_a_running_job_still_refuses_requests(void **state)
+{
+    (void)state;
+    g_gate_open = 0;
+    int64_t w = 0, r = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, gated_job, NULL, NULL, &w), OK);
+    assert_true(job_state_is(w, "running"));
+    assert_int_equal(repo_trylock_write(1), ERR_BUSY);
+    err_clear();
+    assert_int_equal(repo_trylock_read(1), ERR_BUSY);
+    err_clear();
+    g_gate_open = 1;
+    assert_true(job_state_is(w, "completed"));
+
+    /* A read-locked job shares with readers and refuses a writer. */
+    g_gate_open = 0;
+    assert_int_equal(job_submit_locked(jm, 2, JOB_LOCK_READ, "verify", NULL, 0,
+                                       gated_job, NULL, NULL, &r), OK);
+    assert_true(job_state_is(r, "running"));
+    assert_int_equal(repo_trylock_write(2), ERR_BUSY);
+    err_clear();
+    assert_int_equal(repo_trylock_read(2), OK);
+    repo_unlock(2);
+    g_gate_open = 1;
+    assert_true(job_state_is(r, "completed"));
+
+    /* A read-locked job runs beside a reader and waits for a writer. */
+    g_gate_open = 1;
+    assert_int_equal(repo_trylock_read(2), OK);
+    assert_int_equal(job_submit_locked(jm, 2, JOB_LOCK_READ, "verify", NULL, 0,
+                                       gated_job, NULL, NULL, &r), OK);
+    assert_true(job_state_is(r, "completed"));
+    repo_unlock(2);
+    assert_int_equal(repo_trylock_write(2), OK);
+    assert_int_equal(job_submit_locked(jm, 2, JOB_LOCK_READ, "verify", NULL, 0,
+                                       gated_job, NULL, NULL, &r), OK);
+    assert_true(job_waiting(r));
+    repo_unlock(2);
+    assert_true(job_state_is(r, "completed"));
+}
+
+static void test_a_deferred_job_can_be_cancelled(void **state)
+{
+    (void)state;
+    g_arg_freed = 0;
+    assert_int_equal(repo_trylock_write(1), OK);
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, probe_job,
+                                (void *)(intptr_t)1, count_free, &id), OK);
+    assert_true(job_waiting(id));
+
+    assert_int_equal(job_cancel(jm, id), OK);
+    char q[96], st[32];
+    snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)id);
+    assert_int_equal(db_text(q, st, sizeof(st)), 0);
+    assert_string_equal(st, "cancelled");
+    assert_int_equal(g_arg_freed, 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE result = 'cancelled'"
+                              " AND message = 'cancelled before it started'"), 1);
+
+    repo_unlock(1);
+    usleep(2 * JOB_DEFER_MAX_MS * 1000);
+    pthread_mutex_lock(&g_mu);
+    assert_int_equal(g_completed, 0);
+    pthread_mutex_unlock(&g_mu);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'cancelled'"
+                              " AND started IS NULL"), 1);
+}
+
+/* Shutdown treats a deferred job as the queued job it is. */
+static void test_shutdown_cancels_a_deferred_job(void **state)
+{
+    (void)state;
+    assert_int_equal(repo_trylock_write(1), OK);
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, probe_job,
+                                (void *)(intptr_t)1, NULL, &id), OK);
+    assert_true(job_waiting(id));
+    job_manager_stop(jm);
+    jm = NULL;
+    repo_unlock(1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'cancelled'"
+                              " AND started IS NULL"), 1);
+    assert_int_equal(g_completed, 0);
+}
+
+static int g_order[16];
+static int g_norder;
+
+static status_t ordered_job(void *arg, atomic_int *cancel,
+                            void (*progress)(const char *, uint64_t, uint64_t, void *),
+                            void *progress_ctx)
+{
+    (void)cancel; (void)progress; (void)progress_ctx;
+    pthread_mutex_lock(&g_mu);
+    if (g_norder < 16) g_order[g_norder++] = (int)(intptr_t)arg;
+    g_completed++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+/* Jobs queued behind a deferred one stay behind it: the second must not
+ * take the lock in the gap between two of the first one's retries. */
+static void test_deferred_jobs_keep_their_order(void **state)
+{
+    (void)state;
+    g_norder = 0;
+    assert_int_equal(repo_trylock_write(1), OK);
+    int64_t first = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, ordered_job,
+                                (void *)(intptr_t)0, NULL, &first), OK);
+    assert_true(job_waiting(first));
+    for (int i = 1; i < 6; i++) {
+        int64_t id = 0;
+        assert_int_equal(job_submit(jm, 1, "backup", NULL, ordered_job,
+                                    (void *)(intptr_t)i, NULL, &id), OK);
+    }
+    /* Release in the middle of the first job's backoff so a later job,
+     * if the scan let it, would be the first to see the lock free. */
+    usleep((JOB_DEFER_MIN_MS + JOB_DEFER_MIN_MS / 2) * 1000);
+    repo_unlock(1);
+    wait_for(6);
+    pthread_mutex_lock(&g_mu);
+    assert_int_equal(g_norder, 6);
+    for (int i = 0; i < 6; i++) assert_int_equal(g_order[i], i);
+    pthread_mutex_unlock(&g_mu);
+}
+
+/* A repository held by a request does not hold up another repository. */
+static void test_a_held_repo_does_not_block_another(void **state)
+{
+    (void)state;
+    assert_int_equal(repo_trylock_write(1), OK);
+    int64_t a = 0, b = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, probe_job,
+                                (void *)(intptr_t)1, NULL, &a), OK);
+    assert_int_equal(job_submit(jm, 2, "backup", NULL, probe_job,
+                                (void *)(intptr_t)2, NULL, &b), OK);
+    assert_true(job_state_is(b, "completed"));
+    assert_true(job_waiting(a));
+    repo_unlock(1);
+    assert_true(job_state_is(a, "completed"));
+}
+
+/*
+ * The UAT trigger, in-process: backups for two repositories submitted and
+ * snapshot-delete-shaped requests (take the write lock, hold it briefly,
+ * release; a refusal is the route's 503) fired in a fixed shuffle from
+ * twelve threads. Every job must complete and none may fail, within a
+ * bounded time.
+ */
+#define STRESS_JOBS     40
+#define STRESS_REQUESTS 40
+#define STRESS_THREADS  12
+
+static int         g_stress_ops[STRESS_JOBS + STRESS_REQUESTS];
+static atomic_int  g_stress_next;
+static atomic_int  g_stress_refused;
+
+static status_t stress_job(void *arg, atomic_int *cancel,
+                           void (*progress)(const char *, uint64_t, uint64_t, void *),
+                           void *progress_ctx)
+{
+    (void)cancel; (void)progress; (void)progress_ctx;
+    int repo = (int)(intptr_t)arg;
+    pthread_mutex_lock(&g_mu);
+    g_running[repo]++;
+    if (g_running[repo] > g_peak[repo]) g_peak[repo] = g_running[repo];
+    pthread_mutex_unlock(&g_mu);
+    usleep(2000);
+    pthread_mutex_lock(&g_mu);
+    g_running[repo]--;
+    g_completed++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+static void *stress_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        int n = atomic_fetch_add(&g_stress_next, 1);
+        if (n >= STRESS_JOBS + STRESS_REQUESTS) return NULL;
+        int op = g_stress_ops[n];
+        int64_t repo = 5 + (n % 2);   /* g_running, g_peak: ids 0-7 */
+        if (op) {
+            int64_t id = 0;
+            if (job_submit(jm, repo, "backup", NULL, stress_job,
+                           (void *)(intptr_t)repo, NULL, &id) != OK)
+                return (void *)1;
+        } else if (repo_trylock_write(repo) == OK) {
+            usleep(3000);
+            repo_unlock(repo);
+        } else {
+            err_clear();
+            g_stress_refused++;
+        }
+    }
+}
+
+static void test_requests_racing_jobs_lose_no_job(void **state)
+{
+    (void)state;
+    for (int i = 0; i < STRESS_JOBS + STRESS_REQUESTS; i++)
+        g_stress_ops[i] = i < STRESS_JOBS;
+    /* Fixed seed: the same interleaving of submits and requests each run. */
+    unsigned seed = 123;
+    for (int i = STRESS_JOBS + STRESS_REQUESTS - 1; i > 0; i--) {
+        int k = rand_r(&seed) % (i + 1);
+        int t = g_stress_ops[i]; g_stress_ops[i] = g_stress_ops[k]; g_stress_ops[k] = t;
+    }
+    g_stress_next = 0;
+    g_stress_refused = 0;
+
+    pthread_t th[STRESS_THREADS];
+    for (int i = 0; i < STRESS_THREADS; i++)
+        assert_int_equal(pthread_create(&th[i], NULL, stress_thread, NULL), 0);
+    for (int i = 0; i < STRESS_THREADS; i++) {
+        void *rv = NULL;
+        pthread_join(th[i], &rv);
+        assert_null(rv);
+    }
+
+    /* Bounded: 40 jobs of 2 ms on two workers, plus at most one backoff
+     * step per deferral. 20 s is generous on a loaded CI runner. */
+    for (int i = 0; i < 800; i++) {
+        if (db_count("SELECT COUNT(*) FROM jobs WHERE state IN ('queued','running')") == 0)
+            break;
+        usleep(25000);
+    }
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'completed'"),
+                     STRESS_JOBS);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'failed'"), 0);
+    pthread_mutex_lock(&g_mu);
+    assert_int_equal(g_completed, STRESS_JOBS);
+    assert_int_equal(g_peak[5], 1);
+    assert_int_equal(g_peak[6], 1);
+    pthread_mutex_unlock(&g_mu);
+}
+
+/*
+ * Lock sets. A replicate into a registered repository holds the destination
+ * as well as its source. It used to try-lock the destination itself while
+ * already holding the source, and failed outright when it was busy. The
+ * dispatcher now takes the whole set or none of it, and a job queued on a
+ * set is the head of every member's queue.
+ */
+static int locked_int(const int *p)
+{
+    pthread_mutex_lock(&g_mu);
+    int v = *p;
+    pthread_mutex_unlock(&g_mu);
+    return v;
+}
+
+static void submit_set(int64_t src, int64_t dst, job_fn fn, void *arg,
+                       void (*arg_free)(void *), int64_t *id)
+{
+    assert_int_equal(job_submit_lockset(jm, src, JOB_LOCK_WRITE, &dst, 1, "replicate",
+                                        NULL, 0, fn, arg, arg_free, id), OK);
+}
+
+/* Runs as both repositories of a set: arg is src * 8 + dst. */
+static status_t set_job(void *arg, atomic_int *cancel,
+                        void (*progress)(const char *, uint64_t, uint64_t, void *),
+                        void *progress_ctx)
+{
+    (void)cancel; (void)progress; (void)progress_ctx;
+    int src = (int)(intptr_t)arg / 8, dst = (int)(intptr_t)arg % 8;
+    pthread_mutex_lock(&g_mu);
+    g_running[src]++;
+    g_running[dst]++;
+    if (g_running[src] > g_peak[src]) g_peak[src] = g_running[src];
+    if (g_running[dst] > g_peak[dst]) g_peak[dst] = g_running[dst];
+    pthread_mutex_unlock(&g_mu);
+    usleep(50000);
+    pthread_mutex_lock(&g_mu);
+    g_running[src]--;
+    g_running[dst]--;
+    g_completed++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+static void test_lock_set_is_bounded_and_deduplicated(void **state)
+{
+    (void)state;
+    g_arg_freed = 0;
+    int64_t id = 0, also[2] = { 2, 3 }, self = 1;
+    assert_int_equal(job_submit_lockset(jm, 1, JOB_LOCK_WRITE, also, 2, "replicate",
+                                        NULL, 0, set_job, (void *)(intptr_t)(1 * 8 + 2),
+                                        count_free, &id), ERR_INVALID);
+    err_clear();
+    assert_int_equal(g_arg_freed, 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs"), 0);
+    /* Itself, or nothing, is a set of one. */
+    assert_int_equal(job_submit_lockset(jm, 1, JOB_LOCK_WRITE, &self, 1, "replicate",
+                                        NULL, 0, probe_job, (void *)(intptr_t)1,
+                                        NULL, &id), OK);
+    wait_for(1);
+    assert_true(job_state_is(id, "completed"));
+}
+
+/* A sync request (the 503 path) holding a member defers the job, and the
+ * job holds nothing meanwhile: the free member stays takeable. */
+static void test_a_held_set_member_defers_and_holds_nothing(void **state)
+{
+    (void)state;
+    assert_int_equal(repo_trylock_write(2), OK);
+    int64_t id = 0;
+    submit_set(1, 2, set_job, (void *)(intptr_t)(1 * 8 + 2), NULL, &id);
+    assert_true(job_waiting(id));
+    for (int i = 0; i < 5; i++) {   /* across several retries */
+        assert_int_equal(repo_trylock_write(1), OK);
+        repo_unlock(1);
+        usleep(JOB_DEFER_MAX_MS * 1000 / 2);
+    }
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'failed'"), 0);
+    repo_unlock(2);
+    assert_true(job_state_is(id, "completed"));
+
+    /* Same with the source held instead. */
+    assert_int_equal(repo_trylock_write(1), OK);
+    submit_set(1, 2, set_job, (void *)(intptr_t)(1 * 8 + 2), NULL, &id);
+    assert_true(job_waiting(id));
+    assert_int_equal(repo_trylock_write(2), OK);
+    repo_unlock(2);
+    repo_unlock(1);
+    assert_true(job_state_is(id, "completed"));
+}
+
+static void test_a_job_waiting_on_a_set_can_be_cancelled(void **state)
+{
+    (void)state;
+    g_arg_freed = 0;
+    assert_int_equal(repo_trylock_write(2), OK);
+    int64_t id = 0;
+    submit_set(1, 2, set_job, (void *)(intptr_t)(1 * 8 + 2), count_free, &id);
+    assert_true(job_waiting(id));
+    assert_int_equal(job_cancel(jm, id), OK);
+    assert_true(job_state_is(id, "cancelled"));
+    assert_int_equal(g_arg_freed, 1);
+    repo_unlock(2);
+    usleep(2 * JOB_DEFER_MAX_MS * 1000);
+    assert_int_equal(locked_int(&g_completed), 0);
+    /* Neither member was left locked. */
+    assert_int_equal(repo_trylock_write(1), OK);
+    repo_unlock(1);
+    assert_int_equal(repo_trylock_write(2), OK);
+    repo_unlock(2);
+}
+
+/* A->B beside B->A: no hold-and-wait, so no deadlock, and never both at
+ * once. A request on A makes the first wait, so the second is queued
+ * against a set that is half free. */
+static void test_crossed_sets_both_complete(void **state)
+{
+    (void)state;
+    assert_int_equal(repo_trylock_write(1), OK);
+    int64_t ab = 0, ba = 0;
+    submit_set(1, 2, set_job, (void *)(intptr_t)(1 * 8 + 2), NULL, &ab);
+    submit_set(2, 1, set_job, (void *)(intptr_t)(2 * 8 + 1), NULL, &ba);
+    assert_true(job_waiting(ab));
+    usleep(JOB_DEFER_MAX_MS * 1000);
+    /* FIFO on both repos: B->A must not run while A->B, ahead of it on B,
+     * waits for A. */
+    assert_int_equal(locked_int(&g_completed), 0);
+    repo_unlock(1);
+    wait_for(2);
+    assert_true(job_state_is(ab, "completed"));
+    assert_true(job_state_is(ba, "completed"));
+    pthread_mutex_lock(&g_mu);
+    assert_int_equal(g_peak[1], 1);
+    assert_int_equal(g_peak[2], 1);
+    pthread_mutex_unlock(&g_mu);
+
+    /* And submitted together with nothing held. */
+    int64_t ids[6];
+    for (int i = 0; i < 6; i++)
+        submit_set(i % 2 ? 2 : 1, i % 2 ? 1 : 2, set_job,
+                   (void *)(intptr_t)(i % 2 ? 2 * 8 + 1 : 1 * 8 + 2), NULL, &ids[i]);
+    wait_for(8);
+    for (int i = 0; i < 6; i++) assert_true(job_state_is(ids[i], "completed"));
+    assert_int_equal(locked_int(&g_peak[1]), 1);
+    assert_int_equal(locked_int(&g_peak[2]), 1);
+}
+
+/*
+ * Starvation: backups on dst submitted continuously, so dst always has one
+ * running and more queued, while a replicate into dst waits. A request on
+ * the source makes it wait through several backoff steps first, which is
+ * exactly when later dst jobs would slip past a job that counted only on
+ * its own repository. It must run within a bound, and no dst job submitted
+ * after it may start before it.
+ */
+static atomic_int g_feed_stop;
+static atomic_int g_feed_seq;
+static int g_starts[512];
+static int g_nstarts;
+#define SET_MARK 100000
+
+static status_t feed_job(void *arg, atomic_int *cancel,
+                         void (*progress)(const char *, uint64_t, uint64_t, void *),
+                         void *progress_ctx)
+{
+    (void)cancel; (void)progress; (void)progress_ctx;
+    pthread_mutex_lock(&g_mu);
+    if (g_nstarts < 512) g_starts[g_nstarts++] = (int)(intptr_t)arg;
+    pthread_mutex_unlock(&g_mu);
+    usleep(10000);
+    pthread_mutex_lock(&g_mu);
+    g_completed++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+static void *feeder(void *arg)
+{
+    (void)arg;
+    while (!g_feed_stop) {
+        /* Keep a few dst jobs outstanding: always one to run next. */
+        if (db_count("SELECT COUNT(*) FROM jobs WHERE repo_id = 2"
+                     " AND state IN ('queued','running')") < 4) {
+            int seq = ++g_feed_seq;
+            int64_t id = 0;
+            if (job_submit(jm, 2, "backup", NULL, feed_job, (void *)(intptr_t)seq,
+                           NULL, &id) != OK)
+                return (void *)1;
+        }
+        usleep(3000);
+    }
+    return NULL;
+}
+
+static void test_a_stream_on_dst_cannot_starve_a_set(void **state)
+{
+    (void)state;
+    g_feed_stop = 0;
+    g_feed_seq = 0;
+    g_nstarts = 0;
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, feeder, NULL), 0);
+    while (g_feed_seq < 10) usleep(5000);
+
+    assert_int_equal(repo_trylock_write(1), OK);
+    int64_t id = 0;
+    int seq_at_submit = g_feed_seq;
+    submit_set(1, 2, feed_job, (void *)(intptr_t)SET_MARK, NULL, &id);
+    assert_true(job_waiting(id));
+    usleep(3 * JOB_DEFER_MAX_MS * 1000);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    repo_unlock(1);
+
+    /* Bound: the dst jobs queued ahead of it (at most 4 of 10 ms) and one
+     * backoff step. 3 s is generous on a loaded runner. */
+    assert_true(job_state_is(id, "completed"));
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double waited = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    g_feed_stop = 1;
+    void *rv = NULL;
+    pthread_join(th, &rv);
+    assert_null(rv);
+    assert_true(waited < 3.0);
+
+    pthread_mutex_lock(&g_mu);
+    int pos = -1;
+    for (int i = 0; i < g_nstarts; i++) if (g_starts[i] == SET_MARK) { pos = i; break; }
+    assert_true(pos >= 0);
+    for (int i = 0; i < pos; i++) assert_true(g_starts[i] <= seq_at_submit + 1);
+    pthread_mutex_unlock(&g_mu);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -750,6 +1288,18 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_shutdown_never_starts_a_queued_job, setup, teardown),
         cmocka_unit_test_setup_teardown(test_full_queue_refuses_and_spares_running_jobs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_alert_names_repository_and_error, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_job_waits_for_a_request_holding_the_repo, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_running_job_still_refuses_requests, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_deferred_job_can_be_cancelled, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_shutdown_cancels_a_deferred_job, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_deferred_jobs_keep_their_order, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_held_repo_does_not_block_another, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_requests_racing_jobs_lose_no_job, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_lock_set_is_bounded_and_deduplicated, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_held_set_member_defers_and_holds_nothing, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_job_waiting_on_a_set_can_be_cancelled, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_crossed_sets_both_complete, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_stream_on_dst_cannot_starve_a_set, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
