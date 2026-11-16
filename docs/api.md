@@ -38,9 +38,9 @@ to 1000)`. They used
 to be replaced by the defaults, which answered a request the server had not
 understood as if it had. A `limit` above a route's maximum is clamped to it,
 however many digits it has; an `offset` past the last row is an empty page. The same goes for filters with a
-fixed set of values: `objects?location=` takes `loose`, `pack` (or
-`packed`) or `all`, and anything else is a 400 rather than an unfiltered
-listing.
+fixed set of values: `objects?location=` takes `staged`, `pack` (or
+`packed`) or `all`, and anything else (`loose` included, which format 3 no
+longer has) is a 400 rather than an unfiltered listing.
 
 Directory listings are ordered by name because the index carries `name` as its
 trailing column, making the query a range scan rather than a sort of every
@@ -223,7 +223,17 @@ stores that form. It answers:
 |---|---|---|
 | 201 | `{id}`, plus `encryption` and key fields for an encrypted repository | a new registration: a repository created, or an existing one adopted |
 | 200 | `{id, already_registered: true, label_updated, encryption}` | the repository was already registered, at this path or, if it moved, at its old one |
-| 400 | `{error}` | the path is relative, cannot be created, is inside or contains a registered repository, is a non-empty directory with no marker, asks for an encryption mode the existing repository does not have, or gives a passphrase that does not unlock it (`wrong passphrase`) |
+| 400 | `{error}` | the path is relative, cannot be created, is inside or contains a registered repository, is a non-empty directory with no marker, holds a repository of another format, asks for an encryption mode the existing repository does not have, or gives a passphrase that does not unlock it (`wrong passphrase`) |
+
+This build reads and writes repository format 3 only. Registering an
+existing repository of another format is refused with `<path> is repository
+format 2; this build reads only format 3 and has no reader for older
+formats. Restore from it with the build that wrote it and back up again into
+a new repository`, or for a newer one `<path> is repository format 4,
+written by a newer c-backup; this build reads only format 3`. The same check
+runs wherever a repository is opened, so a job against a registered
+repository whose marker no longer passes fails with the same message, and so
+does a replication whose source or target fails it. There is no migration.
 
 Registering an existing passphrase repository with its `passphrase`, whether
 or not it is already registered, unwraps the key from the marker and caches
@@ -248,9 +258,12 @@ unrelated job (B113). Migration 023 rebuilt those tables with
 `AUTOINCREMENT`. Snapshot ids were one more than the highest present, so
 deleting the newest snapshot gave its id to the next backup; the daemon
 now keeps a per-repository high-water mark. Ids reused before 023 stay
-reused. The snapshot mark lives in the database, so after a database loss
-a reindex resumes above the highest snapshot record left in the repository
-(see `docs/repo-format.md`).
+reused. The mark is kept in the repository too, in `<repo>/snapshot-ids`,
+raised before each snapshot record is written, so after a database loss a
+reindex restores it from there rather than resuming above whatever record
+happens to be highest, which would hand an id pruned from the top to the
+next backup. The reindex job's result says what it found
+(`snapshot_mark`, `snapshot_ids_repaired`); see `docs/repo-format.md`.
 
 A repository is `{id, uuid, path, label, added_at, encryption,
 key_escrowed}`: `label` is `null` when none was given, `encryption` is
@@ -311,8 +324,9 @@ bits included: `33188` is `0100644`, a regular file with `rw-r--r--`, and
 
 The same codes are `type` in search results. Object `type` (in `stats`,
 `objects` and an object's locate, layout and content) is a different set:
-1 file content, 2 extended attributes, 3 ACL, 4 sparse file, 5 manifest
-tree.
+1 file content (a whole file or one chunk of one), 2 extended attributes,
+3 ACL, 5 manifest tree (a directory or one fragment of one), 6 chunk list.
+4 was the sparse-file type of format 2 and is never reused.
 
 Search goes through an FTS5 trigram index. A B-tree cannot serve
 `LIKE '%needle%'`, and scanning the node table loses to the pre-rewrite
@@ -378,7 +392,7 @@ All three answer 400 `repository is not encrypted` for an unencrypted
 repository, which has no key to export, import or escrow.
 
 An encrypted repository whose key is not on this host answers 409 `no key
-loaded for repository <uuid>; ...` to backup, restore, reindex, grep, pack,
+loaded for repository <uuid>; ...` to backup, restore, reindex, grep,
 gc and replicate, naming the command that supplies the key. Verify and gfs
 run without it: parity covers ciphertext, and retention only deletes
 records. A job that reaches the repository without the key (a scheduled
@@ -386,12 +400,19 @@ one, or a key removed after submission) fails with the same message.
 
 The marker records the mode, cipher and a one-way fingerprint of the key, and
 for passphrase mode the Argon2id parameters and wrapped key. It never contains
-the key itself. Markers are version 2 for every repository, encrypted or
-not, so a build predating encryption refuses them outright rather than
-writing plaintext objects into an encrypted one.
+the key itself. Markers are format 3 for every repository, encrypted or
+not, and a build of another format refuses them outright, so nothing ever
+writes plaintext objects into an encrypted repository by not knowing it is
+one.
 
-Keys are ChaCha20-Poly1305, chosen over AES-GCM because ARM64 is a deploy
-target and it does not depend on AES-NI. `security.key_dir` sets where host
+Objects are encrypted one at a time with ChaCha20-Poly1305, chosen over
+AES-GCM because ARM64 is a deploy target and it does not depend on AES-NI.
+The cipher key is derived from the repository key with HKDF, each object
+gets a fresh random nonce, and the object's type and name are the
+associated data, so stored bytes moved under another name fail to
+authenticate. The content-defined chunker's boundaries are keyed by the
+repository key too, so the sizes of stored chunks do not reveal known
+content. `security.key_dir` sets where host
 keyfiles live (default `/etc/c-backupd/keys`, one file per repository UUID,
 mode 0600). It is file-backed configuration rather than runtime-settable: a
 key directory changeable through the API would let an attacker with API access
@@ -411,7 +432,7 @@ desktop app, to run their own backup tool - which is the friction the daemon
 rewrite existed to remove. When an endpoint is added, a command goes with it,
 and `tests/test_cli_e2e.sh` exercises the whole table. The search and verify
 run lists, a search's hits, `GET /api/auth/setup` (`auth status`), the jobs
-list's paging and `stats?scope=loose` were found missing in an audit of this
+list's paging and `stats?scope=` were found missing in an audit of this
 table and added; every route and query parameter here now has a command or
 a flag.
 
@@ -452,7 +473,6 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only |
 | POST | `/repos/<id>/gfs` | Apply retention |
 | POST | `/repos/<id>/reindex` | Rebuild the index from the repository; the job fails if any snapshot or pack cannot be read, and what could not be read keeps its previous rows |
-| POST | `/repos/<id>/pack` | Coalesce loose objects into pack files |
 | POST | `/repos/<id>/grep` | Content search as a job: `{pattern, snapshot, path_prefix, ignore_case, max_files}` |
 | GET | `/repos/<id>/grep` | Recent searches, newest first; `limit` and `offset` |
 | GET | `/repos/<id>/grep/<run-id>` | The hits from one search, paginated |
@@ -563,10 +583,10 @@ run record in `GET /repos/<id>/grep` and the job's `result` carry. The
 `result` also has `run_id`, `snapshot`, `files_scanned`, `files_matched`,
 `files_skipped`, `hits` and `truncated`.
 
-A file's matches are recorded only once its object has read back whole and
-authentic: hash, and in an encrypted repository the authentication tag,
-both checked at the end of the read, so an object over 16 MiB is read to
-its end even after its cap or a binary match. A file that does not read
+A file's matches are recorded only once its content has read back whole and
+authentic: every object is checked against its name, and in an encrypted
+repository authenticated, before any of it is searched, and a file of many
+chunks is read to its end even after its cap or a binary match. A file that does not read
 back (damaged beyond parity, failing its tag, or an object that is not file
 content) records nothing and is counted in `files_skipped`; the run record
 carries `files_skipped` and `skip_reason`, the first such file as `<path>:
@@ -588,9 +608,9 @@ Verify is the answer to "is the backup still good", which is a different
 question from "did the backup run". Three levels, because the cost spread is
 enormous: `index` confirms every registered object still resolves and that
 every pack file the index refers to exists, and reads no payloads;
-`structure` additionally parses each object header; `deep` reads every
-payload and checks its SHA-256, which is the only level that can prove the
-bytes are right. Every object in a pack file that has gone is `missing` at
+`structure` additionally parses each entry header; `deep` reads every
+payload and checks it against its name (the SHA-256 of its type and
+payload), which is the only level that can prove the bytes are right. Every object in a pack file that has gone is `missing` at
 every level, never "damaged": parity lives in the same file as the payload,
 so there is nothing for a repair to work from.
 
@@ -598,8 +618,8 @@ By default a deep verify repairs what it can. Every object carries Reed-Solomon
 parity, and the read that proves damage exists is the expensive part, so
 writing the correction while already there costs almost nothing extra. Pass
 `repair=0` (or `dry_run=1`) for a scrub that touches nothing; it still reports
-damage, and for small objects it still distinguishes recoverable damage from
-loss, because it can apply parity in memory without writing.
+damage, and it still distinguishes recoverable damage from loss, because it
+applies parity in memory without writing.
 
 `dry_run=1` is `repair=0` and nothing else: it overrides `repair`, and it
 does not lower the level, so with no `level` it is a full deep read like a
@@ -632,22 +652,20 @@ A run (`GET /repos/<id>/verify`) carries these counts:
 | `repaired` | Damaged, corrected from parity, and the correction written to disk. Always 0 with `repair=0` |
 | `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed |
 | `unrecoverable` | Damaged beyond what parity can rebuild. Data loss |
-| `missing` | Indexed but absent: no loose file, no pack entry, or a pack file that has gone. Data loss |
+| `missing` | Indexed but absent: no pack entry, or a pack file that has gone. Data loss |
 | `affected_files` | Distinct file paths referencing a lost object |
 | `affected_snapshots` | Distinct snapshots holding any of those files |
 
 Findings (`GET /repos/<id>/verify/<run-id>`) name files, not hashes, so the
 report says what was lost and what is still clean. Every object that is not
 `ok` gets one, with `status` one of `missing`, `unrecoverable`, `unreadable
-header`, `uncorrectable parity`, `recoverable` or `repaired`. Parity is
-applied in memory at every object size, so `unrecoverable` means the same
-with repair off as with it on. (Before 1.0 a large streamed object with
-repair off was reported `damaged (run with repair to attempt recovery)`;
-that status is gone.) Two more carry the reason repair declined to write:
-`unrecoverable: too large for 32-bit parity fields; repair disabled pending
-format fix` and `recoverable, not written back: ` followed by the same
-reason, for an object or pack past the parity format's size limit (Manual
-section 11). Each finding also carries:
+header`, `uncorrectable parity`, `recoverable` or `repaired`. Every object
+is read whole with parity applied in memory, so `unrecoverable` means the
+same with repair off as with it on. (Format 2 had two more, `unrecoverable:
+too large for 32-bit parity fields; repair disabled pending format fix` and
+its `recoverable, not written back` form, for packs whose trailer sizes
+might have wrapped. Format 3 bounds every pack so that cannot happen, and
+they are gone.) Each finding also carries:
 
 | Field | Meaning |
 |---|---|
@@ -668,14 +686,9 @@ newest completed run's `cbackup_verify_unrecoverable_objects` (unrecoverable
 plus missing), `cbackup_verify_repaired_objects`,
 `cbackup_verify_recoverable_objects` and `cbackup_verify_affected_files`.
 
-A backup writes every object of 16 MiB or less straight into a pack, and
-ends with a pack sweep for what it could not: a sparse file's object and an
-object over 16 MiB are written loose and uncompressed, and the sweep packs
-them, as this endpoint does. Neither merges small packs; gc does that. The policy key
-`maintenance.auto_pack` set to `false` skips that sweep and nothing else;
-small objects are packed during the backup either way, so a backup of small
-files leaves nothing loose and a pack after it reports `loose` 0. With the
-key off, use this endpoint or a schedule for the sweep.
+A backup writes every object exactly once, straight into a pack; there are
+no loose objects, so there is no pack job, no `/pack` route and no
+`maintenance.auto_pack` policy. Small packs are merged by gc.
 
 ### Sources belong to the repository
 
@@ -720,9 +733,11 @@ fire checks again. Into its own directory a replication used to "complete":
 the target was the source, already held every object, and nothing was
 copied anywhere. What is copied is objects, not files - packs
 get rewritten by GC and by coalescing, and a file-level copy would re-send a
-whole pack because one object inside it was collected. The target stores what
-it receives and packs it on its own schedule, so the two sides may disagree
-about physical layout while holding provably the same data.
+whole pack because one object inside it was collected. The target writes
+what it receives into packs of its own, with fresh parity, so the two sides
+may disagree about physical layout while holding provably the same data.
+Both ends must be format 3; a source or target of another format fails the
+job with the refusal described under `POST /repos`.
 
 Objects move in the form they are stored in, still compressed and still
 encrypted. A replica of an encrypted repository is therefore encrypted with
@@ -740,7 +755,7 @@ comparison and an unchanged repository replicates in one question.
 encryption. `dest` must already be a repository with an identity of its
 own (create it with `POST /repos` and the encryption wanted); each object is
 decrypted with the source key and encrypted under the destination's, or
-written plaintext into an unencrypted destination. Hashes are of the
+written plaintext into an unencrypted destination. Names are of the
 plaintext, so they and the trees carry over unchanged, as do snapshot ids;
 a snapshot id the destination already uses for another tree fails the run
 instead of being overwritten. The job fails, saying which, when `dest` is
@@ -752,12 +767,16 @@ sent and the run finishes, then the job fails with `replicated with N
 object(s) damaged beyond parity; the replica holds them as damaged`, and the
 result adds `objects_damaged`, `damaged` (the first 100, each
 `{"hash","snapshot"}`) and `damaged_listed`. Re-encrypting is a manual
-operation: the schedule route does not store `reencrypt`. Objects are
-re-encrypted as they stream, and the source tag is checked at the end of
-each, so an object's bytes reach the destination's `tmp/` staging pack
-before they are authenticated - as plaintext, into an unencrypted
-destination. An object whose tag fails is cut back out of the staging pack
-and fails the run; nothing unverified is installed or named by a snapshot.
+operation: the schedule route does not store `reencrypt`. Each object is
+decrypted and authenticated whole under the source key before it is
+encrypted for the destination, with the same associated data, so nothing
+unauthenticated reaches the destination at all. An object that does not
+authenticate fails the run.
+
+Replication also carries the snapshot-id mark: the target's `snapshot-ids`
+is raised to each snapshot's id before that snapshot's record is written,
+and at the end of a successful run to at least the source's mark, so a
+replica never numbers below its source.
 
 There is no delete. Retention at the target belongs to the target, which is
 what stops a compromised source from taking the offsite copy with it.
@@ -800,9 +819,9 @@ and returned by `GET /repos/<id>/schedules`.
 | POST | `/jobs/<id>/cancel` | Request cancellation |
 
 Cancellation is cooperative: the flag is set and the job stops at its next
-check. Those sit between files and also between chunks inside one file -
-storing it, packing it, restoring it - so a cancel lands within one read
-(at most 8 MiB of I/O), not at the end of a large file. A cancelled backup
+check. Those sit between files and also inside one file - between reads
+while storing it and between objects while restoring it - so a cancel lands
+within one object (at most 16 MiB of I/O), not at the end of a large file. A cancelled backup
 discards its open pack, the index rows staged into it and its staging files.
 
 `POST /jobs/<id>/cancel` answers 200 with the job record, as `/jobs/<id>`
@@ -847,45 +866,31 @@ What some jobs report in `result`, beyond the backup and restore counts:
 |---|---|
 | gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
-| pack | `loose` (loose objects found), `packed`, `skip_marked` (already marked incompressible, left loose), `incompressible` (marked by this run's probe, left loose), `reason` |
+| reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten) |
 
 A backup's `result` has its counts (`snapshot_id`, `files`, `dirs`,
 `files_unchanged`, `bytes_logical`, `objects_new`, `bytes_stored`,
 `trees_new`, `trees_reused`, `store_workers`) and what it wrote into the
-repository, in bytes:
+repository, in bytes. `store_workers` is always 1 for now: file content is
+stored on the backup thread until the chunker's workers are wired in.
 
 | Field | What |
 |---|---|
-| `bytes_written` | The sum of the categories below: everything the backup wrote into the repository apart from small metadata (the snapshot record, skip marks) |
-| `bytes_written_loose` | Loose objects installed, header and payload: files over 16 MiB and sparse files, always uncompressed |
-| `bytes_written_loose_parity` | The parity trailers of those loose objects |
-| `bytes_written_loose_discarded` | Loose objects written to `tmp/` in full and then dropped because the repository already had them, such as the second of two identical large files |
-| `bytes_written_pack` | Sealed pack files, without their parity trailers: the backup's own packs and any the pack pass wrote |
+| `bytes_written` | The sum of the categories below: everything the backup wrote into the repository apart from small metadata (the snapshot record, `snapshot-ids`) |
+| `bytes_written_pack` | Sealed pack files, without their parity trailers |
 | `bytes_written_pack_parity` | The parity trailers of those packs |
-| `bytes_written_parity_spill` | Reed-Solomon parity over its memory cap, written to `tmp/` and then copied into its trailer, so these bytes are written twice |
-| `bytes_written_pack_abandoned` | Entries the pack pass began writing and then truncated off the pack again, because the file's head compressed and its body did not; the object stays loose and skip-marked. Usually under 100 bytes even then (the entry header): an entry abandoned before its compressed output passes 16 MiB never reaches the pack |
-| `bytes_written_pack_pass` | Of `bytes_written`, the share of the pack pass the job ends with (`maintenance.auto_pack`) |
-| `pack_pass_packed` | Objects that pass packed; `0` when it is off or found nothing |
 
 `bytes_written / bytes_logical` is the backup's write amplification: on
 storage whose write bandwidth is the limit, it is roughly the backup's time
-over a plain copy's. A loose object the pack pass compresses is counted
-twice, once loose and once in its pack, because it was written twice; its
-loose copy is deleted afterwards. The state database is not counted. The
-same figures are logged after the backup's phase profile, which also
-covers the pack pass (`pack-sweep`).
+over a plain copy's. Every object is written once, into a pack, so nothing
+is counted twice. The state database is not counted. The same figures are
+logged after the backup's phase profile.
 
-A pack's `reason` is `null` when it packed something, and otherwise says why
-it did not: `no loose objects`, `all loose objects are skip-marked as
-incompressible`, `every remaining loose object is incompressible`, or `no
-loose object could be packed`. It had no result at all before, so a run that
-packed nothing read as a bare `completed`.
-
-All three also put a one-line summary in their journal entry, such as `swept
-12 objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale temp files
-removed`, `target already up to date (3 snapshots present)` or `nothing
-packed: no loose objects`. A dry-run gc removes nothing, temp files
-included; its pack figures are zero because compaction does not run.
+Gc and replicate also put a one-line summary in their journal entry, such
+as `swept 12 objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale
+temp files removed` or `target already up to date (3 snapshots present)`. A
+dry-run gc removes nothing, temp files included; its pack figures are zero
+because compaction does not run.
 
 A finished job's `phase`, `current` and `total` are its last progress report.
 Progress reaches the database a few times a second, and the final report is
@@ -901,37 +906,31 @@ What is actually inside a repository, as opposed to what it can do.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/repos/<id>/summary` | Dashboard aggregate in one request |
-| GET | `/repos/<id>/stats` | Object counts and sizes by type; `?scope=loose` narrows |
+| GET | `/repos/<id>/stats` | Object counts and sizes by type; `?scope=staged` narrows to objects in a pack a running backup has not sealed yet |
+
+`/summary` carries `snapshots`, `objects`, `phys_size`, `orig_size`,
+`packs`, `staged` (objects in packs not yet sealed: 0 unless a backup is
+running) and `tags`, plus `last_snapshot_ts`.
 
 Size fields on the object endpoints are `orig_size`, the logical bytes that
-went in, and `phys_size`, the bytes the object itself is charged for. What
-that covers depends on where the object lives, by design:
-
-- **Loose:** the whole object file. The 64-byte `object_header_t`, the
-  payload after compression, and the Reed-Solomon parity trailer. This
-  matches `/layout`'s `physical_size`. `phys_size` exceeding `orig_size` is
-  normal for incompressible input, where the payload is stored raw and the
-  parity trailer is pure overhead.
-- **Packed:** the stored payload alone, after compression (and encryption,
-  nonce and tag included). The 51-byte pack entry header and the entry's
-  parity block in the pack's trailer are charged to the pack (`packs.size`),
-  not to the object. So for a packed object `phys_size` against `orig_size`
-  is its compression ratio, and the disk a repository uses is the sum of
-  `packs.size` plus `phys_size` over loose objects, with nothing counted
-  twice. `pack_objects` reports the same figure as `comp_size`.
+went in, and `phys_size`, the bytes the object itself is charged for: the
+stored payload alone, after compression (and encryption, nonce and tag
+included). Every object lives in a pack, and the 51-byte pack entry header
+and the entry's parity block in the pack's trailer are charged to the pack
+(`packs.size`), not to the object. So `phys_size` against `orig_size` is an
+object's compression ratio, and the disk a repository uses is the sum of
+`packs.size`, with nothing counted twice. `pack_objects` reports the same
+figure as `comp_size`.
 
 `/layout` reads the object on disk rather than the index. `header_size` is
-64 or 51, whichever header the object sits behind (the sizes are
-compile-time checked in `src/common/types.h` and `src/store/pack.h`).
-`physical_size` is the record as it sits in the file: for a loose object,
-the whole file (equal to `phys_size`); for a packed one, entry header plus
-payload, which is `phys_size + 51`, with the parity block in the pack
-trailer in neither figure. `payload_size` is `physical_size - header_size`.
-For a packed object that equals `phys_size`; for a loose one it also
-includes the parity trailer. A packed object that reports `phys_size`
+always 51, the pack entry header (compile-time checked in
+`src/store/pack.h`). `physical_size` is the entry as it sits in the pack:
+entry header plus payload, which is `phys_size + 51`, with the parity block
+in the pack trailer not counted. `payload_size` is `physical_size -
+header_size`, which equals `phys_size`. An object that reports `phys_size`
 5242880 and `physical_size` 5242931 is consistent: 5242931 - 51 = 5242880.
 
-| GET | `/repos/<id>/objects` | Paginated; `?location=loose` or `?location=pack` |
+| GET | `/repos/<id>/objects` | Paginated; `?location=staged`, `?location=pack` (or `packed`), or `?location=all` |
 | GET | `/repos/<id>/objects/<hash>` | Where one object lives |
 | GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it |
 | GET | `/repos/<id>/objects/<hash>/layout` | Header fields and on-disk footprint |
@@ -941,7 +940,9 @@ includes the parity trailer. A packed object that reports `phys_size`
 | GET | `/repos/<id>/fanout` | Hash-prefix histogram |
 | GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots |
 
-An object's `location` is `loose`, `staged` or `packed`, and `pack_id` is
+An object's `location` is `packed`, `staged` (in a pack a running backup
+has not sealed yet) or `absent` (named by a snapshot's trees but held by no
+pack, as a reindex found it; verify reports it `missing`), and `pack_id` is
 the pack's number or `null`. The index stores the pack number in place of
 the location, and serving it as stored made `location` a word for some
 objects and `"3"` for others. `/objects/<hash>` also gives `offset` and
@@ -961,7 +962,7 @@ same shape is a `GROUP BY` over hash prefixes, and it is a visualisation now
 rather than a lookup structure.
 
 `/content` is capped deliberately. It feeds a preview pane, and a viewer that
-tries to render a multi-gigabyte object helps nobody; restore is how you get a
+tries to render a multi-gigabyte file helps nobody; restore is how you get a
 whole file.
 
 `/diff` walks manifest trees rather than comparing node lists. Two directories
@@ -1000,9 +1001,8 @@ before this rule can be removed: the server decodes the path before routing.
 
 `GET /repos/<id>/policy` returns `policy`, what the repository has set, and
 `defaults`, what applies wherever the repository has set nothing: the
-daemon's configured `retention.*` values from `config.yaml`, and
-`maintenance.auto_pack` (`true`). Each is `{key, value}` with the value
-typed by its key: a number for a count, a boolean for `auto_pack`. A value
+daemon's configured `retention.*` values from `config.yaml`. Each is
+`{key, value}` with the value typed by its key, a number for a count. A value
 stored before the route validated, which the readers ignore, is `null`. A client cannot read the daemon's config
 file, so without them it could only guess at what is in force.
 
@@ -1016,10 +1016,10 @@ and refuses anything else with a 400 that lists them:
 | `retention.keep_weekly` | whole number, 0 or more |
 | `retention.keep_monthly` | whole number, 0 or more |
 | `retention.keep_yearly` | whole number, 0 or more |
-| `maintenance.auto_pack` | `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`, any case); stored as `true` or `false` |
 
-The value may be sent as the GET serves it (`6`, `true`) or as text (`"6"`,
-`"true"`). A count is decimal digits only: `-3`, `+3` and `banana` are refused. These
+The value may be sent as the GET serves it (`6`) or as text (`"6"`).
+`maintenance.auto_pack` is refused like any other unknown key: format 3 has
+no pack pass for it to control. A count is decimal digits only: `-3`, `+3` and `banana` are refused. These
 were all stored once, and a retention pass read `banana` as 0, which for a
 tier means "keep all". A value stored before the route validated is ignored
 when read, with a warning in the daemon log, and the default applies.

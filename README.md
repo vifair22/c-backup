@@ -8,15 +8,19 @@ Version 1.0. The operator's reference is [`Manual.md`](Manual.md): installing,
 configuring, remote access, every operation, disaster recovery, capacity
 planning and the known limits.
 
-Repositories written before the daemon rewrite are not readable by this
-version and there is no migration; the `pre-daemon-rewrite` tag builds a
-binary that reads them.
+This version reads and writes repository format 3 only. A repository of any
+other format is refused at registration and at open, naming its format, and
+there is no migration: rebuild it by backing up again into a new repository.
+The `pre-daemon-rewrite` tag builds a binary that reads the pre-rewrite format,
+and the last format 2 build reads format 2.
 
 ## What it does
 
-- **Content-addressed storage.** SHA-256 objects, LZ4 with a 64 KiB probe that
-  gives up quickly on incompressible data, Reed-Solomon parity in every object
-  and pack trailer, sparse-file handling, and pack coalescing.
+- **Content-addressed storage.** Objects named by SHA-256 of type and payload
+  and written once, straight into packs; content-defined chunking for large
+  files, so an edit stores only the chunks it touched; LZ4 with a 64 KiB probe
+  that gives up quickly on incompressible data; Reed-Solomon parity for every
+  pack entry; holes kept as holes; and pack coalescing.
 - **Manifest trees.** A snapshot's metadata is one content-addressed object per
   directory, so an unchanged directory costs nothing on the next backup.
   Measured: 3.3% new tree objects per incremental snapshot.

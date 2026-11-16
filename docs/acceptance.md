@@ -10,6 +10,15 @@ daemon and have failed differently before. A route can answer correctly
 while the screen reading it looks for fields that are not there, and the
 contract suite stays green through exactly that.
 
+> **Repository format 3.** The checklist below is written for format 3
+> (`docs/repo-format.md`): every object is written once into a pack, so
+> there is no pack operation and no loose objects to count. The results
+> sections further down were measured on earlier formats and are kept as
+> history, numbers unchanged; where a conclusion no longer holds it says so.
+> Until the content-defined chunker is wired in, a backup holding a file
+> over 16 MiB fails naming the file (Manual, known limitations), so set D,
+> which holds large media, cannot pass B2 on an interim build.
+
 ## Data
 
 | Set | Path | Files | Dirs | Size | What it is for |
@@ -49,6 +58,7 @@ Legend: **CLI** = the command. **UI** = where it lives in the app.
 | A3 | Show one repository | `repo show <id>` | Dashboard header | Path, label, encryption agree |
 | A4 | Create encrypted repo | `repo add --encrypt system` | Add Repo dialog | `encryption` reads `system`, key file exists |
 | A5 | Remove a repository | `repo remove <id>` | Repo context menu > Remove | Gone from both; **repo directory still on disk** |
+| A6 | Another format is refused | `repo add <format 2 repo> <label>` | Connections > Add Repo | 400 naming the repository's format and "this build reads only format 3"; nothing in the directory changes |
 
 ### B. Sources and backup
 
@@ -100,10 +110,10 @@ Legend: **CLI** = the command. **UI** = where it lives in the app.
 
 | # | Function | CLI | UI | Proof |
 |---|----------|-----|----|-------|
-| F1 | Pack | `pack <id>` | Ops > Pack | Loose count drops; objects still readable |
+| F1 | Nothing left outside a pack | `summary <id>`, `objects <id> --location staged` after a backup | Dashboard, Objects | `staged` is 0 and the listing empty; there is no pack operation to run |
 | F2 | Garbage collect | `gc <id>` | Ops > Garbage Collect | Runs; nothing referenced is removed |
 | F3 | Apply retention | `gfs <id>` | Ops > Apply Retention | Tier flags appear; the newest snapshot holds all four (15) |
-| F4 | Reindex | `reindex <id>` | Ops > Reindex | Rebuilt index agrees with the pre-reindex stats |
+| F4 | Reindex | `reindex <id>` | Ops > Reindex | Rebuilt index agrees with the pre-reindex stats; `snapshot_mark` equals the highest id ever issued, with `snapshot_ids_repaired` false on an intact repository |
 | F5 | Delete a snapshot | `snapshot delete <id> <snap>` | Snapshots > Delete | Gone; other snapshots still restore |
 
 ### G. Metadata
@@ -205,6 +215,9 @@ CLI, and nothing is near the 400 ms budget.
   packing finished.** Loose objects are written uncompressed by design, so
   transient headroom needs to be roughly twice the final size. Nothing says
   this anywhere and it is the number that decides whether a backup fits.
+  (No longer true in format 3: objects are written once, compressed, into
+  packs, so a repository grows by what it finally keeps plus at most the
+  pack being written.)
 
 ## Defects found
 
@@ -276,7 +289,8 @@ The same source, the same 6,749 files, with only the destination changed:
 
 A repository is thousands of small loose objects before it is packed, and
 every small write to a parity-protected array costs a parity
-read-modify-write. Reads are unaffected - a deep verify read 2.38 GB back
+read-modify-write. (True before backups wrote straight into packs; format 3 writes only
+packs, in large sequential pieces.) Reads are unaffected - a deep verify read 2.38 GB back
 off the same array in 18 seconds - so this is a write-amplification story,
 not a slow-disk story.
 
@@ -357,6 +371,9 @@ constraint that says never assume the data fits in memory.
 
 ## The pack ceiling, fixed and re-measured
 
+History: `repo_pack` and loose objects no longer exist in format 3. Kept
+for the measurements and for the lesson about EMFILE.
+
 The first Unraid pass left 189,647 of 230,595 objects loose and reported
 success. `repo_pack` held an open descriptor for every object it classified,
 so `open` began failing with EMFILE partway through and every object after
@@ -386,6 +403,10 @@ Descriptor use over the run, sampled every 20s: 10, 10, 50, 45, 36, 29, 25,
 of objects, which is the property that was wanted.
 
 ## Defect: orig_size changes when an object is packed
+
+History: format 3 has no sparse object type and no pack pass, so neither
+half of this can recur. `orig_size` is the object's payload size, as this
+section concluded.
 
 Found while checking the numbers above, because `orig_size` moved during a
 pack that by definition changes no content: 7,985,899,320 to 7,962,249,560,
@@ -471,7 +492,7 @@ Mounted so the container really does see `shfs ... fuse.shfs`:
 
 Same binary, same repository storage, same data, caches dropped before each.
 Both runs produced the same objects, the same 40 packs, and the same 101 loose
-skip-marked objects. No ENXIO, no stall, no error or warning in the log.
+skip-marked objects (a format 2 outcome: format 3 has neither). No ENXIO, no stall, no error or warning in the log.
 Descriptors stayed at 12 through the copy and peaked at 109 during packing.
 RSS oscillated between 9 MB and 170 MB as streaming buffers came and went.
 

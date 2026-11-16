@@ -1,6 +1,7 @@
 # Parity Trailer Byte Layout
 
-Physical byte-level anatomy of parity trailers across all on-disk file types.
+Physical byte-level anatomy of the pack parity trailer, the one parity trailer
+format 3 has.
 
 ## Common building blocks
 
@@ -18,38 +19,13 @@ flowchart LR
     end
 ```
 
-## Loose Object (version 2)
-
-```mermaid
-flowchart LR
-    subgraph "Object File"
-        OH["object_header_t<br>56 B"]
-        OP["Compressed<br>payload"]
-        subgraph "Parity Trailer (280 + M bytes)"
-            T1["XOR parity<br>over header<br>260 B"]
-            T2["RS parity<br>over payload<br>M bytes"]
-            T3["Payload CRC<br>4 B"]
-            T4["RS data len<br>4 B"]
-            T5["parity_footer_t<br>12 B"]
-        end
-    end
-
-    OH --> OP --> T1 --> T2 --> T3 --> T4 --> T5
-
-    style OH fill:#cce5ff,stroke:#004085
-    style OP fill:#d4edda,stroke:#155724
-    style T1 fill:#fff3cd,stroke:#856404
-    style T2 fill:#fff3cd,stroke:#856404
-    style T5 fill:#f8d7da,stroke:#721c24
-```
-
-## Pack .dat (V3/V4)
+## Pack .dat (format 3)
 
 ```mermaid
 flowchart LR
     subgraph ".dat File"
         DH["pack_dat_hdr_t<br>12 B"]
-        E1["Entry 1<br>50 B hdr + payload"]
+        E1["Entry 1<br>51 B hdr + payload<br>(at most 16 MiB + 28)"]
         E2["Entry 2<br>..."]
         EN["Entry N"]
         subgraph "Parity Trailer"
@@ -77,6 +53,8 @@ flowchart LR
     style PF fill:#f8d7da,stroke:#721c24
 ```
 
-> The `.idx` sidecar and the `.snap` container both had layouts here. Neither
-> exists any more: a pack is a single `.dat` installed by one rename, and a
-> snapshot is a record plus manifest trees. See `docs/repo-format.md`.
+> Loose objects, the `.idx` sidecar and the `.snap` container all had layouts
+> here. None exists any more: every object is in a pack, a pack is a single
+> `.dat` installed by one rename, and a snapshot is a record plus manifest
+> trees. The trailer's 32-bit sizes cannot wrap because every pack is bounded
+> (`PACK_MAX_BYTES`, `PACK_MAX_ENTRIES`). See `docs/repo-format.md`.

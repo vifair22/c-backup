@@ -1,5 +1,13 @@
 # Direct-to-pack writing
 
+> **Superseded by repository format 3.** This is a format 2 record, kept as
+> history. Format 3 has no loose objects at all: every object is bounded at
+> 16 MiB and written once into a pack, so the loose fallback, the pack pass
+> and the `objects/` directory described below no longer exist. Names,
+> encryption and pack file names changed too. The current format is
+> [`repo-format.md`](repo-format.md); the current write path is
+> [`data-paths.md`](data-paths.md).
+
 Done. A full backup went from 31.07s to 6.33s on the reference fixture and
 leaves nothing loose; the numbers are journalled in PERF.md. What follows is
 the survey this was designed from, kept because the constraints it records are
