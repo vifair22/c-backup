@@ -592,6 +592,69 @@ static void test_compression_samples_the_whole_object(void **state)
     free(b);
 }
 
+/*
+ * OWN-46: writers sharing a claim set store a name once between them. A
+ * name another writer is storing is referenced, not written; once the
+ * owner's pack commits the index answers for it; and an owner that aborts
+ * leaves its claims counted as abandoned, so the caller knows a reference
+ * may name bytes that never landed.
+ */
+static void test_shared_claims_store_a_name_once(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+    const size_t len = 9000;
+    char *buf = malloc(len);
+    assert_non_null(buf);
+    fill_text(buf, len, 7);
+
+    pack_claims_t *c = pack_claims_new();
+    assert_non_null(c);
+    pack_backup_writer_t *a = NULL, *b = NULL;
+    assert_int_equal(pack_backup_open(st, &a), OK);
+    assert_int_equal(pack_backup_open(st, &b), OK);
+    pack_backup_share_claims(a, c);
+    pack_backup_share_claims(b, c);
+
+    uint8_t h[OBJECT_HASH_SIZE];
+    int is_new = -1;
+    assert_int_equal(pack_backup_add(a, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 1);
+    /* b meets it while a's pack is open: referenced, not written. */
+    assert_int_equal(pack_backup_add(b, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 0);
+    assert_false(pack_backup_holds(b, h));
+    assert_int_equal(pack_claims_deferred(c), 1);
+
+    /* a commits; the claim goes and the index answers for the name. */
+    assert_int_equal(pack_backup_rollover(a), OK);
+    assert_true(pack_object_exists(st, h));
+    assert_int_equal(pack_backup_add(b, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 0);
+    assert_false(pack_backup_holds(b, h));
+
+    /* A name b claims and then abandons is counted. */
+    fill_text(buf, len, 8);
+    assert_int_equal(pack_backup_add(b, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 1);
+    assert_int_equal(pack_backup_add(a, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 0);
+    assert_int_equal(pack_claims_abandoned(c), 0);
+    pack_backup_abort(b);
+    assert_int_equal(pack_claims_abandoned(c), 1);
+    /* With the claim gone, a stores it after all. */
+    assert_int_equal(pack_backup_add(a, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 1);
+
+    uint32_t packed = 0;
+    assert_int_equal(pack_backup_finish(a, &packed), OK);
+    assert_int_equal(packed, 2);
+    assert_int_equal(count_packs(), 2);
+    pack_claims_free(c);
+    free(buf);
+    done(st);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -604,6 +667,7 @@ int main(void)
         cmocka_unit_test(test_abort_removes_the_staging_file),
         cmocka_unit_test(test_rollover_seals_and_keeps_going),
         cmocka_unit_test(test_reports_full_near_the_seal),
+        cmocka_unit_test(test_shared_claims_store_a_name_once),
         cmocka_unit_test(test_compression_samples_the_whole_object),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
