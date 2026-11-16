@@ -794,6 +794,21 @@ static int units_params(const char *body, size_t len, units_job_t *j, char **can
     free(txt);
     if (!o || !cJSON_IsObject(o)) { cJSON_Delete(o); snprintf(why, wsz, "body must be a JSON object"); return -1; }
     int rc = -1;
+    {
+        static const char *const known[] = { "provider", "all", "exclude", "units", "require",
+                                             "pause_scope", NULL };
+        const cJSON *it = NULL;
+        cJSON_ArrayForEach(it, o) {
+            int ok = 0;
+            for (int i = 0; known[i] && !ok; i++) ok = it->string && strcmp(it->string, known[i]) == 0;
+            if (!ok) {
+                snprintf(why, wsz, "unknown key '%.80s'; a units job takes provider, all, exclude, "
+                         "units, require and pause_scope", it->string ? it->string : "");
+                cJSON_Delete(o);
+                return -1;
+            }
+        }
+    }
     const cJSON *prov = cJSON_GetObjectItemCaseSensitive(o, "provider");
     const cJSON *all = cJSON_GetObjectItemCaseSensitive(o, "all");
     const cJSON *ex = cJSON_GetObjectItemCaseSensitive(o, "exclude");
