@@ -999,6 +999,17 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
   the restore. `--overwrite` replaces existing files instead, by renaming
   the verified file over them; a symlink at the path is replaced, not
   followed.
+- **Nothing in the destination is followed.** Every entry is created
+  through its parent directory, opened beneath the destination with no
+  symlink anywhere on the way, and its ownership, mode, times, extended
+  attributes and ACLs are applied through that or through the entry's own
+  descriptor. A symlink (or a file) standing where the snapshot has a
+  directory fails that directory and everything under it, with
+  `restore: <path> not restored: a symlink is there where the directory
+  belongs; not followed or replaced`; the link's target is never chmod'd,
+  chown'd or written into, with or without `--overwrite`. The rest of the
+  tree restores. The destination path itself may run through symlinks;
+  only what is below it is protected.
 - Hardlinks are restored as hardlinks, including across a resumed restore.
 - Sparse files come back sparse.
 - Modes, times (directories included), extended attributes and ACLs are
