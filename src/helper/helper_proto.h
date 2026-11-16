@@ -144,6 +144,10 @@ int helper_path_clean(const char *p);
 
 /* ---- transport ---- */
 
+/* The largest configuration blob units.describe passes in its sealed memfd
+ * (items carry data_off and data_len into it). */
+#define HELPER_BLOB_MAX ((size_t)16 * 1024 * 1024)
+
 /* One packet, and optionally one fd as SCM_RIGHTS. ERR_IO on failure. */
 status_t helper_send(int fd, const void *buf, size_t len, int pass_fd);
 /* One packet into buf (cap bytes, NUL appended, so cap - 1 data); *got is

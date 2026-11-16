@@ -2,8 +2,10 @@
 
 #include "helper_server.h"
 #include "artefact.h"
-#include "fake_provider.h"
+#include "helper_backend.h"
 #include "helper_proto.h"
+
+#include <sys/mman.h>
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
@@ -53,6 +55,7 @@ struct jctx;
 
 typedef struct {
     char    unit[HELPER_UNIT_KEY_MAX + 1];
+    const helper_backend_t *b;
     sp_session_t *sess;
     struct jctx  *j;          /* the session's journal context, freed after end */
 } member_t;
@@ -69,7 +72,9 @@ typedef struct {
 typedef struct {
     int      used;
     char     token[HELPER_TOKEN_HEX + 1];
-    pid_t    pid;
+    pid_t    pid;             /* a local process, or */
+    const helper_backend_t *b;/* a run inside the unit, through its backend */
+    helper_run_t *hr;
     int      err_fd;          /* the hook's stderr, for the log */
     time_t   deadline;
     int      done, status, timed_out;
@@ -89,7 +94,8 @@ typedef struct {
 
 struct helper_server {
     const helper_policy_t *pol;
-    sp_ctx_t              *fake;
+    helper_backend_t       backends[HELPER_BACKENDS_MAX];
+    size_t                 nb;
     pthread_mutex_t        mu;          /* everything below but the journal */
     capture_t              caps[CAPTURES_MAX];
     run_t                  runs[RUNS_MAX];
@@ -231,20 +237,36 @@ static void journal_load(helper_server_t *s)
  */
 typedef int (*hold_pick_fn)(const hold_t *h, void *ctx);
 
+/* The backend a unit key's provider names; *uid points past the colon. */
+static const helper_backend_t *backend_of(const helper_server_t *s, const char *key,
+                                          const char **uid)
+{
+    const char *colon = strchr(key, ':');
+    if (!colon) return NULL;
+    size_t pl = (size_t)(colon - key);
+    for (size_t i = 0; i < s->nb; i++)
+        if (strlen(s->backends[i].name) == pl && strncmp(s->backends[i].name, key, pl) == 0) {
+            if (uid) *uid = colon + 1;
+            return &s->backends[i];
+        }
+    return NULL;
+}
+
 static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx, const char *why)
 {
-    if (!s->fake) return 0;
     hold_t *picked = calloc(HOLDS_MAX, sizeof(*picked));
     if (!picked) return 0;
     size_t n = 0;
     pthread_mutex_lock(&s->jmu);
     for (size_t i = 0; i < s->n_holds; i++)
-        if (strncmp(s->holds[i].unit, "fake:", 5) == 0 && pick(&s->holds[i], pctx))
+        if (backend_of(s, s->holds[i].unit, NULL) && pick(&s->holds[i], pctx))
             picked[n++] = s->holds[i];
     pthread_mutex_unlock(&s->jmu);
     unsigned released = 0;
     for (size_t i = 0; i < n; i++) {
-        sp_intent_t in = { picked[i].id, picked[i].unit + 5, picked[i].kind, picked[i].detail, 0 };
+        const char *uid = NULL;
+        const helper_backend_t *b = backend_of(s, picked[i].unit, &uid);
+        sp_intent_t in = { picked[i].id, uid, picked[i].kind, picked[i].detail, 0 };
         int rel = 0;
         sp_sweep_req_t rq;
         memset(&rq, 0, sizeof(rq));
@@ -253,7 +275,7 @@ static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx,
         rq.n_intents = 1;
         rq.released = &rel;
         sp_sweep_report_t rep;
-        if (fake_provider_ops.sweep(s->fake, &rq, &rep) == OK && rel) {
+        if (b && b->ops->sweep && b->ops->sweep(b->ctx, &rq, &rep) == OK && rel) {
             jctx_t j = { s, "", 0 };
             (void)j_clear(&j, picked[i].id);
             released++;
@@ -336,21 +358,29 @@ static char *resp_ok(int64_t id, cJSON *result)
 /* Units                                                               */
 /* ------------------------------------------------------------------ */
 
-/* The fake backend for a unit key, or why not. On OK *uid points into key. */
+/* The backend for a unit key, or why not. On OK *uid points into key. */
 static helper_err_t backend_for(helper_server_t *s, const char *key, const char **uid,
-                                char *why, size_t wsz)
+                                const helper_backend_t **b, char *why, size_t wsz)
 {
     char prov[16], id[HELPER_UNIT_KEY_MAX + 1];
     if (!helper_unit_key_ok(key, prov, sizeof(prov), id, sizeof(id))) {
         snprintf(why, wsz, "malformed unit key");
         return HELPER_E_INVALID;
     }
-    if (strcmp(prov, "fake") != 0 || !s->fake) {
+    const helper_backend_t *found = backend_of(s, key, uid);
+    if (!found) {
         snprintf(why, wsz, "provider %s is not available in this helper", prov);
         return HELPER_E_UNSUPPORTED;
     }
-    *uid = key + 5;
+    if (b) *b = found;
     return HELPER_OK;
+}
+
+static const helper_backend_t *backend_named(const helper_server_t *s, const char *prov)
+{
+    for (size_t i = 0; i < s->nb; i++)
+        if (strcmp(s->backends[i].name, prov) == 0) return &s->backends[i];
+    return NULL;
 }
 
 /* Policy first, by key; then by name, which only the helper's own inspect
@@ -360,11 +390,12 @@ static helper_err_t unit_allowed(helper_server_t *s, const char *key, char *why,
 {
     if (helper_policy_unit_allowed(s->pol, key, NULL)) return HELPER_OK;
     const char *uid = NULL;
-    if (backend_for(s, key, &uid, why, wsz) == HELPER_OK) {
+    const helper_backend_t *b = NULL;
+    if (backend_for(s, key, &uid, &b, why, wsz) == HELPER_OK) {
         sp_unit_desc_t *d = NULL;
-        if (fake_provider_ops.describe(s->fake, uid, &d) == OK) {
+        if (b->ops->describe(b->ctx, uid, &d) == OK) {
             int ok = helper_policy_unit_allowed(s->pol, key, d->name);
-            fake_provider_ops.desc_free(d);
+            b->ops->desc_free(d);
             if (ok) return HELPER_OK;
         }
         err_clear();
@@ -373,13 +404,13 @@ static helper_err_t unit_allowed(helper_server_t *s, const char *key, char *why,
     return HELPER_E_DENIED;
 }
 
-typedef struct { helper_server_t *s; cJSON *arr; } list_ctx_t;
+typedef struct { helper_server_t *s; cJSON *arr; const char *prov; } list_ctx_t;
 
 static status_t list_cb(void *ctx, const char *id, const char *name, int state)
 {
     list_ctx_t *l = ctx;
-    char key[HELPER_UNIT_KEY_MAX + 8];
-    snprintf(key, sizeof(key), "fake:%s", id);
+    char key[HELPER_UNIT_KEY_MAX + 24];
+    snprintf(key, sizeof(key), "%s:%s", l->prov, id);
     if (!helper_unit_key_ok(key, NULL, 0, NULL, 0) || !helper_policy_unit_allowed(l->s->pol, key, name))
         return OK;
     cJSON *o = cJSON_CreateObject();
@@ -393,30 +424,58 @@ static status_t list_cb(void *ctx, const char *id, const char *name, int state)
 
 static char *op_units_list(helper_server_t *s, const helper_req_t *r)
 {
-    if (strcmp(r->provider, "fake") != 0 || !s->fake)
+    const helper_backend_t *b = backend_named(s, r->provider);
+    if (!b)
         return resp_error(r->id, HELPER_E_UNSUPPORTED, "provider %s is not available in this helper", r->provider);
     cJSON *res = cJSON_CreateObject();
     cJSON *arr = res ? cJSON_AddArrayToObject(res, "units") : NULL;
     if (!arr) { cJSON_Delete(res); return resp_error(r->id, HELPER_E_FAILED, "out of memory"); }
-    list_ctx_t l = { s, arr };
-    if (fake_provider_ops.list_units(s->fake, list_cb, &l) != OK) {
+    list_ctx_t l = { s, arr, b->name };
+    if (b->ops->list_units(b->ctx, list_cb, &l) != OK) {
         cJSON_Delete(res);
         return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
     }
     return resp_ok(r->id, res);
 }
 
-static char *op_units_describe(helper_server_t *s, const helper_req_t *r)
+/*
+ * Configuration blobs travel in one sealed memfd passed with the response,
+ * each item naming its offset and length in it: a container's inspect JSON
+ * or an LXC config can exceed what a 64 KiB packet holds, and the daemon
+ * reads sealed bytes that cannot change under it.
+ */
+static int blob_fd_append(int *fd, uint64_t *off, const void *data, size_t len)
+{
+    if (*fd < 0) {
+        *fd = memfd_create("cbk-blobs", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (*fd < 0) return -1;
+    }
+    const char *p = data;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t w = pwrite(*fd, p + done, len - done, (off_t)(*off + done));
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return -1;
+        done += (size_t)w;
+    }
+    *off += len;
+    return 0;
+}
+
+static char *op_units_describe(helper_server_t *s, const helper_req_t *r, int *pass_fd)
 {
     char why[256];
     helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
     if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
     const char *uid = NULL;
-    if ((e = backend_for(s, r->unit, &uid, why, sizeof(why))) != HELPER_OK)
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
         return resp_error(r->id, e, "%s", why);
     sp_unit_desc_t *d = NULL;
-    if (fake_provider_ops.describe(s->fake, uid, &d) != OK)
+    if (b->ops->describe(b->ctx, uid, &d) != OK)
         return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
+    int bfd = -1;
+    uint64_t boff = 0;
     cJSON *res = cJSON_CreateObject();
     cJSON *items = res ? cJSON_AddArrayToObject(res, "items") : NULL;
     int bad = !items;
@@ -443,50 +502,39 @@ static char *op_units_describe(helper_server_t *s, const helper_req_t *r)
         if (it->kind == SP_ITEM_BLOB) {
             void *data = NULL;
             size_t len = 0;
-            if (fake_blob_data(s->fake, uid, it->id, &data, &len) != OK || len > HELPER_PACKET_MAX / 2) {
+            if (!b->blob_data || b->blob_data(b->ctx, uid, it->id, &data, &len) != OK) {
                 free(data);
                 err_clear();
                 bad = 2;
                 break;
             }
-            char *hex = malloc(len * 2 + 1);
-            if (hex) helper_hex_encode(data, len, hex);
+            uint64_t at = boff;
+            int werr = len > HELPER_BLOB_MAX || blob_fd_append(&bfd, &boff, data, len) != 0;
             free(data);
-            if (!hex) { bad = 1; break; }
-            cJSON_AddStringToObject(o, "data", hex);
-            free(hex);
-        } else if (it->kind == SP_ITEM_BLOCK) {
-            /* The fake's data plane: the run map the daemon reads through,
-             * as it would read a real export through its own mount. */
-            uint64_t size = 0;
-            fake_run_t *runs = NULL;
-            size_t n = 0;
-            fake_alloc_t alloc = FAKE_ALLOC_EXACT;
-            if (fake_disk_runs(s->fake, uid, it->id, &size, &runs, &n, &alloc) != OK) {
-                err_clear();
-                bad = 1;
-                break;
-            }
-            cJSON *fk = cJSON_AddObjectToObject(o, "fake");
-            cJSON *ra = fk ? cJSON_AddArrayToObject(fk, "runs") : NULL;
-            if (fk) cJSON_AddNumberToObject(fk, "alloc", alloc);
-            for (size_t k = 0; ra && k < n; k++) {
-                cJSON *x = cJSON_CreateArray();
-                if (!x) break;
-                cJSON_AddItemToArray(x, cJSON_CreateNumber((double)runs[k].off));
-                cJSON_AddItemToArray(x, cJSON_CreateNumber((double)runs[k].len));
-                cJSON_AddItemToArray(x, cJSON_CreateNumber((double)runs[k].kind));
-                cJSON_AddItemToArray(x, cJSON_CreateNumber((double)runs[k].seed));
-                cJSON_AddItemToArray(ra, x);
-            }
-            free(runs);
+            if (werr) { bad = 3; break; }
+            cJSON_AddNumberToObject(o, "data_off", (double)at);
+            cJSON_AddNumberToObject(o, "data_len", (double)len);
+        } else if (b->item_extra && b->item_extra(b->ctx, uid, it, o) != OK) {
+            err_clear();
+            bad = 1;
+            break;
         }
     }
-    fake_provider_ops.desc_free(d);
+    b->ops->desc_free(d);
+    if (!bad && bfd >= 0 &&
+        fcntl(bfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) != 0)
+        bad = 3;
     if (bad) {
+        if (bfd >= 0) close(bfd);
         cJSON_Delete(res);
-        return resp_error(r->id, HELPER_E_FAILED, bad == 2 ? "a configuration item is too large for one packet"
-                                                          : "out of memory");
+        return resp_error(r->id, HELPER_E_FAILED, "%s",
+                          bad == 2 ? "a configuration item could not be read"
+                          : bad == 3 ? "a configuration item could not be passed (too large, or no memfd)"
+                          : "out of memory");
+    }
+    if (bfd >= 0) {
+        cJSON_AddNumberToObject(res, "blob_bytes", (double)boff);
+        *pass_fd = bfd;
     }
     return resp_ok(r->id, res);
 }
@@ -521,7 +569,7 @@ static void capture_finish(helper_server_t *s, capture_t *c, sp_end_outcome_t ho
     (void)s;
     for (size_t i = 0; i < c->n_members; i++) {
         if (!c->members[i].sess) continue;
-        if (fake_provider_ops.end(c->members[i].sess, how, 0) != OK) {
+        if (c->members[i].b->ops->end(c->members[i].sess, how, 0) != OK) {
             log_warn("helper: ending %s: %s; the sweep will retry", c->members[i].unit, err_msg());
             err_clear();
         }
@@ -548,7 +596,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r)
         helper_err_t e = unit_allowed(s, r->units[i], why, sizeof(why));
         if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
         const char *uid = NULL;
-        if ((e = backend_for(s, r->units[i], &uid, why, sizeof(why))) != HELPER_OK)
+        if ((e = backend_for(s, r->units[i], &uid, NULL, why, sizeof(why))) != HELPER_OK)
             return resp_error(r->id, e, "%s", why);
     }
     time_t now = time(NULL);
@@ -578,15 +626,16 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r)
     helper_err_t fail = mem ? HELPER_OK : HELPER_E_FAILED;
     char fmsg[512] = "out of memory";
     for (size_t i = 0; fail == HELPER_OK && i < r->n_units; i++) {
-        const char *uid = r->units[i] + 5;
+        const char *uid = NULL;
+        const helper_backend_t *b = backend_of(s, r->units[i], &uid);
         sp_unit_desc_t *d = NULL;
-        if (fake_provider_ops.describe(s->fake, uid, &d) != OK) {
+        if (!b || b->ops->describe(b->ctx, uid, &d) != OK) {
             snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
             fail = HELPER_E_FAILED;
             break;
         }
         jctx_t *j = calloc(1, sizeof(*j));
-        if (!j) { fake_provider_ops.desc_free(d); fail = HELPER_E_FAILED; break; }
+        if (!j) { b->ops->desc_free(d); fail = HELPER_E_FAILED; break; }
         j->s = s;
         snprintf(j->unit, sizeof(j->unit), "%s", r->units[i]);
         j->capture = seq;
@@ -602,22 +651,23 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r)
         q.daemon8 = s->pol->daemon_id;
         sp_session_t *sess = NULL;
         const sp_session_info_t *info = NULL;
-        status_t st = fake_provider_ops.begin(s->fake, d, &q, &sess, &info);
+        status_t st = b->ops->begin(b->ctx, d, &q, &sess, &info);
         /* The journal context outlives begin: end releases through it, so
          * it lives with the member and goes after end. */
         if (st != OK) {
             snprintf(fmsg, sizeof(fmsg), "%s: %.400s", r->units[i], err_msg());
-            fake_provider_ops.desc_free(d);
+            b->ops->desc_free(d);
             free(j);
             fail = HELPER_E_FAILED;
             break;
         }
         member_t *m = &c.members[c.n_members++];
         snprintf(m->unit, sizeof(m->unit), "%s", r->units[i]);
+        m->b = b;
         m->sess = sess;
         m->j = j;
         cJSON *o = cJSON_CreateObject();
-        if (!o) { fake_provider_ops.desc_free(d); fail = HELPER_E_FAILED; break; }
+        if (!o) { b->ops->desc_free(d); fail = HELPER_E_FAILED; break; }
         cJSON_AddItemToArray(mem, o);
         cJSON_AddStringToObject(o, "unit", r->units[i]);
         cJSON_AddNumberToObject(o, "achieved", info->achieved);
@@ -642,14 +692,14 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r)
         for (size_t k = 0; rr && k < d->n_items; k++) {
             if (d->items[k].kind != SP_ITEM_TREE) continue;
             char root[PATH_MAX];
-            if (fake_provider_ops.tree_root(sess, &d->items[k], root, sizeof(root)) != OK) {
+            if (b->ops->tree_root(sess, &d->items[k], root, sizeof(root)) != OK) {
                 snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
                 fail = HELPER_E_FAILED;
                 break;
             }
             cJSON_AddStringToObject(rr, d->items[k].id, root);
         }
-        fake_provider_ops.desc_free(d);
+        b->ops->desc_free(d);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (fail != HELPER_OK) {
@@ -748,23 +798,37 @@ static char *op_hook_run(helper_server_t *s, const helper_req_t *r, int *pass_fd
     if (!h || strcmp(h->unit, r->unit) != 0)
         return resp_error(r->id, HELPER_E_DENIED, "hook %s is not in the policy for %s", r->hook, r->unit);
     const char *uid = NULL;
-    if ((e = backend_for(s, r->unit, &uid, why, sizeof(why))) != HELPER_OK)
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
         return resp_error(r->id, e, "%s", why);
 
-    /* The fake has no containers: the policy's argv runs as given, with no
-     * shell, which is what docker exec and lxc-attach will wrap. */
     int out[2] = { -1, -1 }, err[2] = { -1, -1 };
     if (pipe2(err, O_CLOEXEC) != 0 || (h->dump && pipe2(out, O_CLOEXEC) != 0)) {
         if (err[0] >= 0) { close(err[0]); close(err[1]); }
         return resp_error(r->id, HELPER_E_FAILED, "pipe: %s", strerror(errno));
     }
+    pid_t pid = -1;
+    helper_run_t *hr = NULL;
+    if (b->hook_start) {
+        /* Inside the unit (docker exec, lxc-attach), argv as the policy
+         * gives it and no shell. */
+        status_t hst = b->hook_start(b->ctx, uid, h, h->dump ? out[1] : -1, err[1], &hr);
+        close(err[1]);
+        if (h->dump) close(out[1]);
+        if (hst != OK) {
+            close(err[0]);
+            if (h->dump) close(out[0]);
+            return resp_error(r->id, HELPER_E_FAILED, "hook %s: %.300s", r->hook, err_msg());
+        }
+    } else {
+    /* No unit to enter (the fake): the policy's argv runs as given, with no
+     * shell. */
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
     if (h->dump) posix_spawn_file_actions_adddup2(&fa, out[1], 1);
     else posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
     posix_spawn_file_actions_adddup2(&fa, err[1], 2);
-    pid_t pid = -1;
     int rc = posix_spawn(&pid, h->argv[0], &fa, NULL, h->argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     close(err[1]);
@@ -774,6 +838,7 @@ static char *op_hook_run(helper_server_t *s, const helper_req_t *r, int *pass_fd
         if (h->dump) close(out[0]);
         return resp_error(r->id, HELPER_E_FAILED, "hook %s: %s", r->hook, strerror(rc));
     }
+    }
     (void)fcntl(err[0], F_SETFL, O_NONBLOCK);
     pthread_mutex_lock(&s->mu);
     run_t *slot = NULL;
@@ -781,6 +846,8 @@ static char *op_hook_run(helper_server_t *s, const helper_req_t *r, int *pass_fd
     if (slot) {
         memset(slot, 0, sizeof(*slot));
         slot->pid = pid;
+        slot->b = hr ? b : NULL;
+        slot->hr = hr;
         slot->err_fd = err[0];
         slot->deadline = time(NULL) + (time_t)h->timeout_s;
         if (helper_random_hex(slot->token, 16) == OK) slot->used = 1;
@@ -790,8 +857,8 @@ static char *op_hook_run(helper_server_t *s, const helper_req_t *r, int *pass_fd
     if (slot) memcpy(token, slot->token, sizeof(token));
     pthread_mutex_unlock(&s->mu);
     if (!slot) {
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
+        if (hr) { b->hook_kill(hr); b->hook_free(hr); }
+        else { kill(pid, SIGKILL); waitpid(pid, NULL, 0); }
         close(err[0]);
         if (h->dump) close(out[0]);
         return resp_error(r->id, HELPER_E_BUSY, "too many hook runs");
@@ -832,6 +899,21 @@ static void run_poll(run_t *x, time_t now)
     if (x->done) return;
     run_drain(x);
     int st = 0;
+    if (x->hr) {
+        int code = 0;
+        if (x->b->hook_poll(x->hr, &code)) {
+            x->done = 1;
+            x->status = code;
+            run_drain(x);
+        } else if (now >= x->deadline) {
+            x->b->hook_kill(x->hr);
+            x->done = 1;
+            x->timed_out = 1;
+            x->status = 128 + SIGKILL;
+            run_drain(x);
+        }
+        return;
+    }
     pid_t p = waitpid(x->pid, &st, WNOHANG);
     if (p == x->pid) {
         x->done = 1;
@@ -870,6 +952,7 @@ static char *op_hook_wait(helper_server_t *s, const helper_req_t *r)
             }
             close(x->err_fd);
             free(x->log);
+            if (x->hr) x->b->hook_free(x->hr);
             memset(x, 0, sizeof(*x));
             pthread_mutex_unlock(&s->mu);
             return resp_ok(r->id, res);
@@ -886,15 +969,15 @@ static char *op_hook_wait(helper_server_t *s, const helper_req_t *r)
 
 /* Whether mount is a mount source of the unit in the helper's own inspect:
  * the one path the daemon names, never trusted otherwise. */
-static int unit_has_mount(helper_server_t *s, const char *uid, const char *mount)
+static int unit_has_mount(const helper_backend_t *b, const char *uid, const char *mount)
 {
     sp_unit_desc_t *d = NULL;
-    if (fake_provider_ops.describe(s->fake, uid, &d) != OK) { err_clear(); return 0; }
+    if (b->ops->describe(b->ctx, uid, &d) != OK) { err_clear(); return 0; }
     int ok = 0;
     for (size_t i = 0; i < d->n_items; i++)
         if (d->items[i].kind == SP_ITEM_TREE && d->items[i].tree_path &&
             strcmp(d->items[i].tree_path, mount) == 0) ok = 1;
-    fake_provider_ops.desc_free(d);
+    b->ops->desc_free(d);
     return ok;
 }
 
@@ -914,11 +997,21 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
     if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
     const char *uid = NULL;
-    if ((e = backend_for(s, r->unit, &uid, why, sizeof(why))) != HELPER_OK)
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
         return resp_error(r->id, e, "%s", why);
-    if (!unit_has_mount(s, uid, r->mount))
+    if (!unit_has_mount(b, uid, r->mount))
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is not a mount of %s", r->mount, r->unit);
-    const char *dom = helper_policy_dir_domain(s->pol, r->mount);
+    /* The staging directory sits in the mount's own snapshot domain, so the
+     * swap is a rename within one filesystem. */
+    char droot[PATH_MAX] = "";
+    const char *dom = NULL;
+    if (b->mount_root) {
+        if (b->mount_root(b->ctx, r->mount, droot, sizeof(droot)) == OK) dom = droot;
+        else err_clear();
+    } else {
+        dom = helper_policy_dir_domain(s->pol, r->mount);
+    }
     if (!dom || strcmp(dom, r->mount) == 0)
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is in no snapshot domain of the policy", r->mount);
     char base[PATH_MAX], path[PATH_MAX];
@@ -963,7 +1056,11 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     pthread_mutex_unlock(&s->mu);
     if (!x) return resp_error(r->id, HELPER_E_INVALID, "no such staging");
     if (st.swapped) return resp_error(r->id, HELPER_E_INVALID, "already swapped");
-    int state = fake_unit_state(s->fake, st.unit + 5);
+    const char *suid = NULL;
+    const helper_backend_t *sb_ = backend_of(s, st.unit, &suid);
+    int state = sb_ && sb_->unit_state ? sb_->unit_state(sb_->ctx, suid) : -1;
+    if (state < 0)
+        return resp_error(r->id, HELPER_E_FAILED, "cannot tell whether %s is running", st.unit);
     if (state == SP_STATE_RUNNING || state == SP_STATE_PAUSED)
         return resp_error(r->id, HELPER_E_BUSY, "%s is running; stop it first", st.unit);
     /* Moved aside, never deleted: the operator can reverse it. */
@@ -999,9 +1096,12 @@ static char *op_unit_stop_start(helper_server_t *s, const helper_req_t *r, int s
     helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
     if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
     const char *uid = NULL;
-    if ((e = backend_for(s, r->unit, &uid, why, sizeof(why))) != HELPER_OK)
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
         return resp_error(r->id, e, "%s", why);
-    if (fake_unit_set_state(s->fake, uid, start ? SP_STATE_RUNNING : SP_STATE_STOPPED) != OK)
+    if (!b->set_running)
+        return resp_error(r->id, HELPER_E_UNSUPPORTED, "%s cannot be stopped or started here", r->unit);
+    if (b->set_running(b->ctx, uid, start) != OK)
         return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
     cJSON *res = cJSON_CreateObject();
     if (res) cJSON_AddStringToObject(res, "state", start ? "running" : "stopped");
@@ -1022,7 +1122,18 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r)
     cJSON_Delete(d);
     if (priv && !s->pol->allow_privileged_define)
         return resp_error(r->id, HELPER_E_DENIED, "a privileged definition and allow_privileged_define is off");
-    return resp_error(r->id, HELPER_E_UNSUPPORTED, "no provider in this helper defines units");
+    const char *uid = NULL;
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
+        return resp_error(r->id, e, "%s", why);
+    if (!b->define)
+        return resp_error(r->id, HELPER_E_UNSUPPORTED, "provider %s does not define units", b->name);
+    cJSON *res = NULL;
+    if (b->define(b->ctx, uid, r->definition ? r->definition : "{}", s->pol, &res) != OK) {
+        cJSON_Delete(res);
+        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
+    }
+    return resp_ok(r->id, res ? res : cJSON_CreateObject());
 }
 
 /* vm.*: validated and held to the policy here; libvirt is not built yet. */
@@ -1060,7 +1171,6 @@ static int pick_unowned(const hold_t *h, void *ctx)
 static void sweep_artefacts(helper_server_t *s, sp_sweep_report_t *rep)
 {
     memset(rep, 0, sizeof(*rep));
-    if (!s->fake) return;
     int64_t live[CAPTURES_MAX];
     size_t nl = 0;
     pthread_mutex_lock(&s->mu);
@@ -1072,7 +1182,14 @@ static void sweep_artefacts(helper_server_t *s, sp_sweep_report_t *rep)
     rq.scan_artefacts = 1;
     rq.live_jobs = live;
     rq.n_live_jobs = nl;
-    if (fake_provider_ops.sweep(s->fake, &rq, rep) != OK) err_clear();
+    for (size_t i = 0; i < s->nb; i++) {
+        const helper_backend_t *b = &s->backends[i];
+        sp_sweep_report_t one;
+        memset(&one, 0, sizeof(one));
+        if (!b->ops->sweep || b->ops->sweep(b->ctx, &rq, &one) != OK) { err_clear(); continue; }
+        rep->removed += one.removed;
+        rep->left_foreign += one.left_foreign;
+    }
 }
 
 static char *op_sweep(helper_server_t *s, const helper_req_t *r)
@@ -1102,7 +1219,8 @@ static char *op_hello(helper_server_t *s, const helper_req_t *r)
     cJSON_AddStringToObject(res, "daemon_id", s->pol->daemon_id);
     cJSON_AddStringToObject(res, "policy", s->pol->digest);
     cJSON *p = cJSON_AddArrayToObject(res, "providers");
-    if (p && s->fake) cJSON_AddItemToArray(p, cJSON_CreateString("fake"));
+    for (size_t i = 0; p && i < s->nb; i++)
+        cJSON_AddItemToArray(p, cJSON_CreateString(s->backends[i].name));
     return resp_ok(r->id, res);
 }
 
@@ -1111,7 +1229,7 @@ static char *dispatch(helper_server_t *s, const helper_req_t *r, int *pass_fd)
     switch (r->op) {
     case HOP_HELLO:                  return op_hello(s, r);
     case HOP_UNITS_LIST:             return op_units_list(s, r);
-    case HOP_UNITS_DESCRIBE:         return op_units_describe(s, r);
+    case HOP_UNITS_DESCRIBE:         return op_units_describe(s, r, pass_fd);
     case HOP_CAPTURE_BEGIN:          return op_capture_begin(s, r);
     case HOP_CAPTURE_BEGIN_PATHS:    return op_capture_begin_paths(s, r);
     case HOP_CAPTURE_END:            return op_capture_end(s, r);
@@ -1341,7 +1459,9 @@ status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **o
     helper_server_t *s = calloc(1, sizeof(*s));
     if (!s) return set_error(ERR_NOMEM, "helper: server");
     s->pol = cfg->policy;
-    s->fake = cfg->fake;
+    if (cfg->fake) helper_backend_fake(&s->backends[s->nb++], cfg->fake);
+    for (size_t i = 0; i < cfg->n_backends && s->nb < HELPER_BACKENDS_MAX; i++)
+        s->backends[s->nb++] = cfg->backends[i];
     s->lfd = -1;
     s->wd_ms = cfg->watchdog_ms ? cfg->watchdog_ms : 1000;
     for (int i = 0; i < CONNS_MAX; i++) s->conns[i] = -1;
@@ -1399,7 +1519,13 @@ void helper_server_stop(helper_server_t *s)
         if (s->caps[i].used == 1) { capture_t c = s->caps[i]; s->caps[i].used = 0; capture_finish(s, &c, SP_END_ABORTED); }
     for (size_t i = 0; i < RUNS_MAX; i++)
         if (s->runs[i].used) {
-            if (!s->runs[i].done) { kill(s->runs[i].pid, SIGKILL); waitpid(s->runs[i].pid, NULL, 0); }
+            if (s->runs[i].hr) {
+                if (!s->runs[i].done) s->runs[i].b->hook_kill(s->runs[i].hr);
+                s->runs[i].b->hook_free(s->runs[i].hr);
+            } else if (!s->runs[i].done) {
+                kill(s->runs[i].pid, SIGKILL);
+                waitpid(s->runs[i].pid, NULL, 0);
+            }
             close(s->runs[i].err_fd);
             free(s->runs[i].log);
         }

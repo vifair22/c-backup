@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -32,7 +33,8 @@ struct sp_ctx {
 struct sp_session {
     struct sp_ctx    *ctx;
     char              token[HELPER_TOKEN_HEX + 1];
-    cJSON            *desc;        /* units.describe at begin: blobs, run maps */
+    cJSON            *desc;        /* units.describe at begin: blob offsets, run maps */
+    int               blob_fd;     /* the sealed memfd describe passed, or -1 */
     cJSON            *roots;       /* read_roots */
     sp_session_info_t info;
 };
@@ -129,10 +131,13 @@ static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, in
     return OK;
 }
 
-/* Connect, hello, one request. *result (may be NULL) is the result. */
-static status_t rcall(const char *sock, const char *op, cJSON *args, cJSON **result)
+/* Connect, hello, one request. *result (may be NULL) is the result; an fd
+ * passed with the answer lands in *recv_fd (NULL: closed), -1 if none. */
+static status_t rcall_fd(const char *sock, const char *op, cJSON *args, cJSON **result,
+                         int *recv_fd)
 {
     if (result) *result = NULL;
+    if (recv_fd) *recv_fd = -1;
     int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0) { cJSON_Delete(args); return set_error_errno(ERR_IO, "helper: socket"); }
     struct sockaddr_un a;
@@ -155,9 +160,10 @@ static status_t rcall(const char *sock, const char *op, cJSON *args, cJSON **res
     int transport = 0;
     status_t st = exchange(fd, "hello", hargs, &hres, NULL, &transport);
     cJSON_Delete(hres);
-    if (st == OK) st = exchange(fd, op, args, result, NULL, &transport);
+    if (st == OK) st = exchange(fd, op, args, result, recv_fd, &transport);
     else cJSON_Delete(args);
     close(fd);
+    if (st != OK && recv_fd && *recv_fd >= 0) { close(*recv_fd); *recv_fd = -1; }
     if (st != OK && transport) {
         /* Not the helper refusing: the helper gone mid-request. */
         char why[512];
@@ -166,6 +172,11 @@ static status_t rcall(const char *sock, const char *op, cJSON *args, cJSON **res
         set_error(st, "helper at %s: %s", sock, why);
     }
     return st;
+}
+
+static status_t rcall(const char *sock, const char *op, cJSON *args, cJSON **result)
+{
+    return rcall_fd(sock, op, args, result, NULL);
 }
 
 static cJSON *args_unit(const struct sp_ctx *c, const char *unit_id)
@@ -303,6 +314,7 @@ static void session_free(struct sp_session *s)
     if (!s) return;
     cJSON_Delete(s->desc);
     cJSON_Delete(s->roots);
+    if (s->blob_fd >= 0) close(s->blob_fd);
     sp_session_info_free(&s->info);
     free(s);
 }
@@ -313,9 +325,11 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     struct sp_session *s = calloc(1, sizeof(*s));
     if (!s) return set_error(ERR_NOMEM, "helper: session");
     s->ctx = c;
+    s->blob_fd = -1;
     /* The configuration and data-plane facts as of now; the capture is the
      * point in time for the trees. */
-    status_t st = rcall(c->socket, "units.describe", args_unit(c, unit->unit_id), &s->desc);
+    status_t st = rcall_fd(c->socket, "units.describe", args_unit(c, unit->unit_id), &s->desc,
+                           &s->blob_fd);
     cJSON *res = NULL;
     if (st == OK) {
         cJSON *a = cJSON_CreateObject();
@@ -393,13 +407,27 @@ static const cJSON *item_json(const struct sp_session *s, const char *id)
 
 static status_t r_blob_read(sp_session_t *s, const sp_item_desc_t *item, void **data, size_t *len)
 {
-    const char *hex = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(item_json(s, item->id), "data"));
-    if (!hex) return set_error(ERR_IO, "helper: no data for %s", item->id);
-    size_t cap = strlen(hex) / 2 + 1;
-    uint8_t *buf = malloc(cap);
+    /* The bytes are in the sealed memfd describe passed: the helper could
+     * not change them under us, and any size fits. */
+    const cJSON *it = item_json(s, item->id);
+    const cJSON *jo = cJSON_GetObjectItemCaseSensitive(it, "data_off");
+    const cJSON *jl = cJSON_GetObjectItemCaseSensitive(it, "data_len");
+    if (!cJSON_IsNumber(jo) || !cJSON_IsNumber(jl) || s->blob_fd < 0)
+        return set_error(ERR_IO, "helper: no data for %s", item->id);
+    uint64_t off = num(it, "data_off"), n = num(it, "data_len");
+    struct stat sb;
+    if (fstat(s->blob_fd, &sb) != 0 || n > HELPER_BLOB_MAX || off + n < off ||
+        off + n > (uint64_t)sb.st_size)
+        return set_error(ERR_IO, "helper: data for %s lies outside what was passed", item->id);
+    uint8_t *buf = malloc(n ? (size_t)n : 1);
     if (!buf) return set_error(ERR_NOMEM, "helper: blob");
-    long n = helper_hex_decode(hex, buf, cap);
-    if (n < 0) { free(buf); return set_error(ERR_IO, "helper: bad data for %s", item->id); }
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = pread(s->blob_fd, buf + done, (size_t)n - done, (off_t)(off + done));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { free(buf); return set_error_errno(ERR_IO, "helper: reading %s", item->id); }
+        done += (size_t)r;
+    }
     *data = buf;
     *len = (size_t)n;
     return OK;

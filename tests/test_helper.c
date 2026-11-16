@@ -39,7 +39,7 @@ static void hstart(unsigned uid, unsigned pause_s, unsigned capture_s, unsigned 
     char text[4096];
     hf_policy_text(text, sizeof(text), uid, pause_s, capture_s, per_hour, restore);
     assert_int_equal(helper_policy_parse(text, &pol), OK);
-    helper_server_cfg_t cfg = { &pol, fk, listen, 50 };
+    helper_server_cfg_t cfg = { &pol, fk, listen, 50, NULL, 0 };
     assert_int_equal(helper_server_start(&cfg, &srv), OK);
 }
 

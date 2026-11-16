@@ -82,7 +82,7 @@ int main(int argc, char **argv)
         log_warn("helper: the fake provider is enabled from %s; this is for tests", pol.fake_spec);
     }
 
-    helper_server_cfg_t cfg = { &pol, fake, 1, 0 };
+    helper_server_cfg_t cfg = { &pol, fake, 1, 0, NULL, 0 };
     helper_server_t *srv = NULL;
     if (helper_server_start(&cfg, &srv) != OK) {
         fprintf(stderr, "c-backup-helper: %s\n", err_msg());

@@ -60,7 +60,7 @@ static long long scalar(const char *sql)
 
 static int helper_up(void)
 {
-    helper_server_cfg_t cfg = { &pol, fk, 1, 50 };
+    helper_server_cfg_t cfg = { &pol, fk, 1, 50, NULL, 0 };
     return helper_server_start(&cfg, &srv) == OK ? 0 : -1;
 }
 
@@ -112,7 +112,7 @@ static int setup(void **state)
     char text[4096];
     hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
     if (helper_policy_parse(text, &pol) != OK) return -1;
-    helper_server_cfg_t cfg = { &pol, fk, 1, 50 };
+    helper_server_cfg_t cfg = { &pol, fk, 1, 50, NULL, 0 };
     if (helper_server_start(&cfg, &srv) != OK) return -1;
 
     if (db_open(&db, DB_PATH) != 0 || db_run_lib_migrations(db) != 0 ||
@@ -254,6 +254,36 @@ static void test_failure_through_helper(void **state)
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
 }
 
+/* A configuration blob far past one 64 KiB packet crosses in the describe
+ * memfd and restores byte for byte. */
+static void test_large_blob(void **state)
+{
+    (void)state;
+    size_t n = 1048576;
+    char *big = malloc(n);
+    assert_non_null(big);
+    for (size_t i = 0; i < n; i++) big[i] = (char)('a' + (i * 7 + i / 977) % 26);
+    assert_int_equal(fake_blob_add(fk, "u1", "inspect.json", ".cbackup-unit/config/inspect.json",
+                                   big, n), OK);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, DEST, &ro, &rr), OK);
+    FILE *f = fopen(DEST "/.cbackup-unit/config/inspect.json", "rb");
+    assert_non_null(f);
+    char *got = malloc(n + 1);
+    assert_non_null(got);
+    assert_int_equal(fread(got, 1, n + 1, f), n);
+    fclose(f);
+    assert_memory_equal(got, big, n);
+    free(got);
+    free(big);
+}
+
 /* Wait up to 5 s for the link to be connected with fake enabled. */
 static int wait_connected(void)
 {
@@ -347,6 +377,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_starts_before_helper, setup_late, teardown),
         cmocka_unit_test_setup_teardown(test_helper_restarts_mid_job, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_large_blob, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),

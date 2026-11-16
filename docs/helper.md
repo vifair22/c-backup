@@ -196,11 +196,18 @@ the policy allows succeed; tokens it did not get from the helper are
 `invalid`; a sweep it asks for never removes an artefact the helper cannot
 prove is its own.
 
+## Configuration blobs
+
+`units.describe` does not carry BLOB bytes in its JSON. The helper writes
+every BLOB of the unit into one memfd, seals it (`F_SEAL_SHRINK`,
+`F_SEAL_GROW`, `F_SEAL_WRITE`, `F_SEAL_SEAL`) and passes it with the
+answer; each BLOB item names `data_off` and `data_len` in it, and the
+answer carries `blob_bytes`. The daemon refuses a range outside the memfd.
+One BLOB may be up to 16 MiB (`HELPER_BLOB_MAX`), which covers a
+container's inspect JSON, an LXC config and UEFI NVRAM alike.
+
 ## Known limits in this build
 
-- A BLOB is returned in `units.describe` as hex inside the 64 KiB packet, so
-  one larger than about 30 KiB is `failed`. UEFI NVRAM (128 KiB to 4 MiB)
-  needs the daemon to read the file through its own mount, or an fd.
 - `capture.begin_paths` and `restore.stage` over `dir_domains` take no real
   snapshot; ZFS and btrfs domains come with the container provider.
 - `pause: false` is passed to the backend as the wanted level; the fake
