@@ -26,7 +26,7 @@
 /* .cbackup marker                                                     */
 /* ------------------------------------------------------------------ */
 
-static status_t marker_emit(const char *mp, const repo_marker_t *m);
+static status_t marker_emit(const char *mp, repo_marker_t *m);
 
 static int marker_path(char *buf, size_t sz, const char *repo_path)
 {
@@ -64,6 +64,12 @@ status_t repo_store_open(const char *path, const store_config_t *cfg,
          * attach, and nothing to guard against. */
         err_clear();
         return OK;
+    }
+    st = repo_format_check(path, &m);
+    if (st != OK) {
+        store_close(*out);
+        *out = NULL;
+        return st;
     }
     if (m.enc_mode == REPO_ENC_NONE) return OK;
 
@@ -106,6 +112,101 @@ status_t repo_store_open_keyed(const char *path, const store_config_t *cfg,
     return st;
 }
 
+void repo_chunker_default(repo_chunker_t *out, int keyed)
+{
+    memset(out, 0, sizeof(*out));
+    snprintf(out->algo, sizeof(out->algo), "%s", REPO_CHUNKER_ALGO);
+    out->min   = REPO_CHUNKER_MIN_DEFAULT;
+    out->avg   = REPO_CHUNKER_AVG_DEFAULT;
+    out->max   = REPO_CHUNKER_MAX_DEFAULT;
+    out->keyed = keyed ? 1 : 0;
+}
+
+/*
+ * The fields only a format 3 marker has. Anything absent or of the wrong
+ * type is left zeroed and repo_format_check refuses it, so this never fails
+ * on its own: the marker is still identifiable, and the refusal says what is
+ * wrong with it.
+ */
+static void marker_read_v3_fields(const cutils_json_req_t *req, repo_marker_t *out)
+{
+    char *algo = NULL;
+    uint32_t v = 0;
+    bool keyed = false;
+    if (json_req_get_str(req, "chunker.algo", &algo) == 0 && algo &&
+        strlen(algo) < sizeof(out->chunker.algo))
+        snprintf(out->chunker.algo, sizeof(out->chunker.algo), "%s", algo);
+    free(algo);
+    if (json_req_get_u32(req, "chunker.min", &v, 0, UINT32_MAX) == 0) out->chunker.min = v;
+    if (json_req_get_u32(req, "chunker.avg", &v, 0, UINT32_MAX) == 0) out->chunker.avg = v;
+    if (json_req_get_u32(req, "chunker.max", &v, 0, UINT32_MAX) == 0) out->chunker.max = v;
+    if (json_req_get_bool(req, "chunker.keyed", &keyed) == 0) out->chunker.keyed = keyed ? 1 : 0;
+    else out->chunker.keyed = -1;
+
+    size_t n = 0;
+    if (json_req_array_len(req, "incompat", &n) != 0) {
+        out->incompat_missing = 1;
+        return;
+    }
+    out->incompat_count = (unsigned)(n > UINT_MAX ? UINT_MAX : n);
+    if (n == 0) return;
+    cutils_json_iter_t it;
+    if (json_iter_begin(req, "incompat", &it) != 0) return;
+    if (json_iter_next(&it)) {
+        char *name = NULL;
+        if (json_iter_get_str(&it, "", &name) == 0 && name)
+            snprintf(out->incompat_first, sizeof(out->incompat_first), "%s", name);
+        free(name);
+    }
+    json_iter_end(&it);
+    if (!out->incompat_first[0])
+        snprintf(out->incompat_first, sizeof(out->incompat_first), "(not a string)");
+}
+
+status_t repo_format_check(const char *path, const repo_marker_t *m)
+{
+    if (!m) return set_error(ERR_INVALID, "repo_format_check: no marker");
+    if (m->version < CBACKUP_FORMAT_VER)
+        return set_error(ERR_INVALID,
+                         "%s is repository format %d; this build reads only format %d "
+                         "and has no reader for older formats. Restore from it with "
+                         "the build that wrote it and back up again into a new "
+                         "repository", path, m->version, CBACKUP_FORMAT_VER);
+    if (m->version > CBACKUP_FORMAT_VER)
+        return set_error(ERR_INVALID,
+                         "%s is repository format %d, written by a newer c-backup; "
+                         "this build reads only format %d", path, m->version,
+                         CBACKUP_FORMAT_VER);
+
+    if (m->incompat_missing)
+        return set_error(ERR_INVALID, "%s: format %d marker has no incompat list",
+                         path, m->version);
+    if (m->incompat_count > 0)
+        return set_error(ERR_INVALID,
+                         "%s needs feature '%s', which this build does not know "
+                         "(%u incompatible feature%s); written by a newer c-backup?",
+                         path, m->incompat_first, m->incompat_count,
+                         m->incompat_count == 1 ? "" : "s");
+
+    const repo_chunker_t *c = &m->chunker;
+    if (strcmp(c->algo, REPO_CHUNKER_ALGO) != 0)
+        return set_error(ERR_INVALID, "%s: unknown or missing chunker '%s'; this "
+                         "build knows only %s", path, c->algo, REPO_CHUNKER_ALGO);
+    int avg_pow2 = c->avg && (c->avg & (c->avg - 1)) == 0;
+    if (c->min < REPO_CHUNKER_MIN_FLOOR || c->min >= c->avg || c->avg >= c->max ||
+        c->max > REPO_CHUNKER_MAX_CEILING || !avg_pow2)
+        return set_error(ERR_INVALID,
+                         "%s: chunker sizes min %u avg %u max %u are outside the "
+                         "format's bounds", path, c->min, c->avg, c->max);
+    int encrypted = m->enc_mode != REPO_ENC_NONE;
+    if (c->keyed < 0 || c->keyed != encrypted)
+        return set_error(ERR_INVALID,
+                         "%s: chunker keyed=%d does not match the repository's "
+                         "encryption (%s)", path, c->keyed,
+                         repo_enc_mode_name(m->enc_mode));
+    return OK;
+}
+
 status_t repo_marker_read(const char *path, repo_marker_t *out)
 {
     char mp[PATH_MAX];
@@ -134,7 +235,9 @@ status_t repo_marker_read(const char *path, repo_marker_t *out)
     uint32_t ver = 0;
     int bad = (json_req_get_str(req, "format", &fmt) != 0) ||
               (json_req_get_str(req, "uuid", &uuid) != 0) ||
-              (json_req_get_u32(req, "version", &ver, 1, 64) != 0);
+              /* Wide, so a newer marker reaches repo_format_check and is
+               * refused as newer rather than as not a marker at all. */
+              (json_req_get_u32(req, "version", &ver, 1, 1000000) != 0);
 
     status_t rc = OK;
     if (bad || !fmt || !uuid || strcmp(fmt, CBACKUP_FORMAT) != 0) {
@@ -146,6 +249,7 @@ status_t repo_marker_read(const char *path, repo_marker_t *out)
         snprintf(out->uuid, sizeof(out->uuid), "%s", uuid);
         out->version = (int)ver;
         out->enc_mode = REPO_ENC_NONE;
+        if (ver == CBACKUP_FORMAT_VER) marker_read_v3_fields(req, out);
 
         /*
          * The encryption block is absent on a plaintext repository, which is
@@ -232,9 +336,19 @@ status_t repo_marker_write_ex(const char *path, const repo_marker_t *in,
     return OK;
 }
 
-/* Serialise a fully-decided marker to disk. */
-static status_t marker_emit(const char *mp, const repo_marker_t *mp_in)
+/*
+ * Serialise a fully-decided marker to disk. A marker is always written at
+ * this build's format, with the caller's chunker if it set one (a replica
+ * carries its source's sizes) and the defaults otherwise; keyed always
+ * follows the repository's own encryption.
+ */
+static status_t marker_emit(const char *mp, repo_marker_t *mp_in)
 {
+    mp_in->version = CBACKUP_FORMAT_VER;
+    if (!mp_in->chunker.algo[0]) repo_chunker_default(&mp_in->chunker, 0);
+    mp_in->chunker.keyed = mp_in->enc_mode != REPO_ENC_NONE;
+    mp_in->incompat_count = 0;
+    mp_in->incompat_missing = 0;
     const repo_marker_t m = *mp_in;
 
     /* O_EXCL: a marker is written exactly once, at creation. Overwriting one
@@ -247,31 +361,35 @@ static status_t marker_emit(const char *mp, const repo_marker_t *mp_in)
     }
 
     char body[2048];
-    int n;
-    if (m.enc_mode == REPO_ENC_NONE) {
-        n = snprintf(body, sizeof(body),
-                     "{\"format\":\"%s\",\"version\":%d,\"uuid\":\"%s\"}\n",
-                     CBACKUP_FORMAT, m.version, m.uuid);
-    } else if (m.enc_mode == REPO_ENC_SYSTEM) {
-        n = snprintf(body, sizeof(body),
+    int n = snprintf(body, sizeof(body),
                      "{\"format\":\"%s\",\"version\":%d,\"uuid\":\"%s\","
-                     "\"encryption\":{\"mode\":\"%s\",\"cipher\":\"%s\","
+                     "\"chunker\":{\"algo\":\"%s\",\"min\":%u,\"avg\":%u,"
+                     "\"max\":%u,\"keyed\":%s},\"incompat\":[]",
+                     CBACKUP_FORMAT, m.version, m.uuid, m.chunker.algo,
+                     m.chunker.min, m.chunker.avg, m.chunker.max,
+                     m.chunker.keyed ? "true" : "false");
+    size_t used = (n > 0 && n < (int)sizeof(body)) ? (size_t)n : sizeof(body);
+    int k;
+    if (m.enc_mode == REPO_ENC_NONE) {
+        k = snprintf(body + used, sizeof(body) - used, "}\n");
+    } else if (m.enc_mode == REPO_ENC_SYSTEM) {
+        k = snprintf(body + used, sizeof(body) - used,
+                     ",\"encryption\":{\"mode\":\"%s\",\"cipher\":\"%s\","
                      "\"key_id\":\"%s\"}}\n",
-                     CBACKUP_FORMAT, m.version, m.uuid,
                      repo_enc_mode_name(m.enc_mode), m.cipher, m.key_id);
     } else {
-        n = snprintf(body, sizeof(body),
-                     "{\"format\":\"%s\",\"version\":%d,\"uuid\":\"%s\","
-                     "\"encryption\":{\"mode\":\"%s\",\"cipher\":\"%s\","
+        k = snprintf(body + used, sizeof(body) - used,
+                     ",\"encryption\":{\"mode\":\"%s\",\"cipher\":\"%s\","
                      "\"key_id\":\"%s\","
                      "\"kdf\":{\"name\":\"argon2id\",\"salt\":\"%s\","
                      "\"iterations\":%u,\"memory_kib\":%u,\"lanes\":%u},"
                      "\"wrapped\":\"%s\"}}\n",
-                     CBACKUP_FORMAT, m.version, m.uuid,
                      repo_enc_mode_name(m.enc_mode), m.cipher, m.key_id,
                      m.kdf.salt_hex, m.kdf.iterations, m.kdf.memory_kib,
                      m.kdf.lanes, m.wrapped);
     }
+    if (n < 0 || k < 0) n = -1;
+    else n += k;
     if (n >= (int)sizeof(body)) {
         close(fd); unlink(mp);
         return set_error(ERR_IO, "marker would be truncated");
@@ -791,10 +909,8 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
                              path, CBACKUP_MARKER);
         return st;
     }
-    if (marker.version > CBACKUP_FORMAT_VER)
-        return set_error(ERR_INVALID,
-                         "%s was written by a newer c-backup (marker version %d)",
-                         path, marker.version);
+    st = repo_format_check(path, &marker);
+    if (st != OK) return st;
 
     /*
      * Encryption is the marker's to say, not the request's. Asking for a

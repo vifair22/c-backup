@@ -669,7 +669,7 @@ static void test_marker_with_broken_encryption_block_is_refused(void **state)
     assert_int_equal(mkdir(TEST_ROOT "/broken", 0700), 0);
     FILE *f = fopen(TEST_ROOT "/broken/.cbackup", "w");
     assert_non_null(f);
-    fputs("{\"format\":\"cbackup-repo\",\"version\":2,"
+    fputs("{\"format\":\"cbackup-repo\",\"version\":3,"
           "\"uuid\":\"3f2504e0-4f89-11d3-9a0c-0305e82c3301\","
           "\"encryption\":{\"mode\":\"passphrase\","
           "\"cipher\":\"chacha20-poly1305\",\"key_id\":\"aabbccddeeff0011\"}}\n", f);
@@ -686,7 +686,7 @@ static void test_unknown_encryption_mode_is_refused(void **state)
     assert_int_equal(mkdir(TEST_ROOT "/future", 0700), 0);
     FILE *f = fopen(TEST_ROOT "/future/.cbackup", "w");
     assert_non_null(f);
-    fputs("{\"format\":\"cbackup-repo\",\"version\":2,"
+    fputs("{\"format\":\"cbackup-repo\",\"version\":3,"
           "\"uuid\":\"3f2504e0-4f89-11d3-9a0c-0305e82c3302\","
           "\"encryption\":{\"mode\":\"quantum\",\"cipher\":\"chacha20-poly1305\","
           "\"key_id\":\"aabbccddeeff0011\"}}\n", f);
@@ -695,6 +695,120 @@ static void test_unknown_encryption_mode_is_refused(void **state)
     repo_marker_t m;
     assert_int_not_equal(repo_marker_read(TEST_ROOT "/future", &m), OK);
     err_clear();
+}
+
+/* ---------- the format gate ---------- */
+
+#define FMT_UUID "3f2504e0-4f89-11d3-9a0c-0305e82c3310"
+#define FMT_CHUNKER "\"chunker\":{\"algo\":\"fastcdc-gear64-v1\",\"min\":524288," \
+                    "\"avg\":1048576,\"max\":8388608,\"keyed\":false}"
+
+static void write_marker(const char *dir, const char *body)
+{
+    mkdir(dir, 0700);
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/.cbackup", dir);
+    FILE *f = fopen(p, "w");
+    assert_non_null(f);
+    fputs(body, f);
+    fclose(f);
+}
+
+/* Every way of opening the repository refuses it, and says why. */
+static void assert_refused_everywhere(const char *dir, const char *needle)
+{
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(dir, &m), OK);
+    assert_int_equal(repo_format_check(dir, &m), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), needle));
+
+    store_t *s = NULL;
+    assert_int_equal(repo_store_open(dir, NULL, &s), ERR_INVALID);
+    assert_null(s);
+    assert_non_null(strstr(err_msg(), needle));
+
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, dir, "x", &id), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), needle));
+    assert_int_equal(count_repos(), 0);
+    err_clear();
+}
+
+static void test_format_2_repo_is_refused_naming_both_versions(void **state)
+{
+    (void)state;
+    write_marker(TEST_ROOT "/v2",
+                 "{\"format\":\"cbackup-repo\",\"version\":2,\"uuid\":\"" FMT_UUID "\"}\n");
+    assert_refused_everywhere(TEST_ROOT "/v2", "is repository format 2; this build reads only format 3");
+}
+
+static void test_format_4_repo_is_refused_as_newer(void **state)
+{
+    (void)state;
+    write_marker(TEST_ROOT "/v4",
+                 "{\"format\":\"cbackup-repo\",\"version\":4,\"uuid\":\"" FMT_UUID "\","
+                 FMT_CHUNKER ",\"incompat\":[]}\n");
+    assert_refused_everywhere(TEST_ROOT "/v4",
+                              "is repository format 4, written by a newer c-backup; "
+                              "this build reads only format 3");
+}
+
+static void test_unknown_incompat_feature_is_refused(void **state)
+{
+    (void)state;
+    write_marker(TEST_ROOT "/feat",
+                 "{\"format\":\"cbackup-repo\",\"version\":3,\"uuid\":\"" FMT_UUID "\","
+                 FMT_CHUNKER ",\"incompat\":[\"zstd-packs\"]}\n");
+    assert_refused_everywhere(TEST_ROOT "/feat", "needs feature 'zstd-packs'");
+
+    write_marker(TEST_ROOT "/nolist",
+                 "{\"format\":\"cbackup-repo\",\"version\":3,\"uuid\":\"" "3f2504e0-4f89-11d3-9a0c-0305e82c3311\","
+                 FMT_CHUNKER "}\n");
+    assert_refused_everywhere(TEST_ROOT "/nolist", "has no incompat list");
+}
+
+static void test_bad_chunker_is_refused(void **state)
+{
+    (void)state;
+    write_marker(TEST_ROOT "/algo",
+                 "{\"format\":\"cbackup-repo\",\"version\":3,\"uuid\":\"" FMT_UUID "\","
+                 "\"chunker\":{\"algo\":\"rabin\",\"min\":524288,\"avg\":1048576,"
+                 "\"max\":8388608,\"keyed\":false},\"incompat\":[]}\n");
+    assert_refused_everywhere(TEST_ROOT "/algo", "unknown or missing chunker 'rabin'");
+
+    /* max past the object bound */
+    write_marker(TEST_ROOT "/big",
+                 "{\"format\":\"cbackup-repo\",\"version\":3,\"uuid\":\"" "3f2504e0-4f89-11d3-9a0c-0305e82c3311\","
+                 "\"chunker\":{\"algo\":\"fastcdc-gear64-v1\",\"min\":524288,\"avg\":1048576,"
+                 "\"max\":33554432,\"keyed\":false},\"incompat\":[]}\n");
+    assert_refused_everywhere(TEST_ROOT "/big", "outside the format's bounds");
+
+    /* keyed must follow encryption */
+    write_marker(TEST_ROOT "/keyed",
+                 "{\"format\":\"cbackup-repo\",\"version\":3,\"uuid\":\"" "3f2504e0-4f89-11d3-9a0c-0305e82c3312\","
+                 "\"chunker\":{\"algo\":\"fastcdc-gear64-v1\",\"min\":524288,\"avg\":1048576,"
+                 "\"max\":8388608,\"keyed\":true},\"incompat\":[]}\n");
+    assert_refused_everywhere(TEST_ROOT "/keyed", "does not match the repository's encryption");
+}
+
+/* What this build writes, it opens: format 3, the default chunker, keyed
+ * exactly when encrypted, and an empty incompat list. */
+static void test_new_repo_marker_is_format_3_with_chunker(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/fresh", "fresh", &id), OK);
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/fresh", &m), OK);
+    assert_int_equal(m.version, 3);
+    assert_string_equal(m.chunker.algo, "fastcdc-gear64-v1");
+    assert_int_equal(m.chunker.min, 524288);
+    assert_int_equal(m.chunker.avg, 1048576);
+    assert_int_equal(m.chunker.max, 8388608);
+    assert_int_equal(m.chunker.keyed, 0);
+    assert_int_equal(m.incompat_count, 0);
+    assert_int_equal(m.incompat_missing, 0);
+    assert_int_equal(repo_format_check(TEST_ROOT "/fresh", &m), OK);
 }
 
 /* ---------- opening an encrypted repository ---------- */
@@ -859,6 +973,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_reregistering_with_the_passphrase_unlocks, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_with_broken_encryption_block_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unknown_encryption_mode_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_format_2_repo_is_refused_naming_both_versions, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_format_4_repo_is_refused_as_newer, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unknown_incompat_feature_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_bad_chunker_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_new_repo_marker_is_format_3_with_chunker, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_creates_missing_dir, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_adopts_empty_dir, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_is_idempotent, setup, teardown),

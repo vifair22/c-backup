@@ -500,7 +500,14 @@ status_t replica_reader_open(const char *path, replica_reader_t **out)
         return set_error(ERR_IO, "replica_reader: path too long");
     }
 
-    status_t st = store_open(path, NULL, &r->c.store);
+    /* A replica is a repository like any other: one this build cannot read
+     * is refused before anything in it is. */
+    repo_marker_t m;
+    status_t st = repo_marker_read(path, &m);
+    if (st == OK) st = repo_format_check(path, &m);
+    if (st != OK) { free(r); return st; }
+
+    st = store_open(path, NULL, &r->c.store);
     if (st != OK) { free(r); return st; }
     r->c.owns_store = 1;
     build_index(&r->c);
@@ -561,6 +568,8 @@ status_t replica_sink_local_open(const char *path,
         st = repo_marker_write_fixed(path, source_marker, &m);
         if (st != OK) { free(c); return st; }
     } else {
+        st = repo_format_check(path, &m);
+        if (st != OK) { free(c); return st; }
         if (strcmp(m.uuid, source_marker->uuid) != 0) {
             free(c);
             /* The path last: the message buffer is 256 bytes, and with the
@@ -627,6 +636,8 @@ status_t replica_sink_local_open_reencrypt(const char *path,
                          "repo add %s <label> --encrypt <mode>, then replicate into "
                          "it with --reencrypt", path, path);
     }
+    status_t fst = repo_format_check(path, &m);
+    if (fst != OK) return fst;
     if (strcmp(m.uuid, source_marker->uuid) == 0)
         return set_error(ERR_INVALID,
                          "%s is a replica of this repository, not a different one; "
