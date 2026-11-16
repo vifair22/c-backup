@@ -79,4 +79,15 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  gfs_result_t *out);
 
 /* Human-readable GFS tier string, e.g. "daily+weekly+monthly". */
+/*
+ * One retention group (docs/source-providers.md 8.1): group NULL is the file
+ * snapshots (those with no snapshot_units row), otherwise one unit key's.
+ * The election is gfs_run's over that group alone, with the group's newest
+ * snapshot as its head, never pruned. gfs_run is this for the file group
+ * with the head given. A group named unknown:* is never pruned.
+ */
+status_t gfs_run_group(store_t *store, cutils_db_t *db, int64_t repo_id,
+                       const gfs_retention_t *policy, const char *group,
+                       int dry_run, int quiet, gfs_result_t *out);
+
 void gfs_flags_str(uint32_t flags, char *buf, size_t sz);

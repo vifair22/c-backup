@@ -78,6 +78,7 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
 SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/scheduler -I src/common \
+                -I src/providers -I src/units \
                 -I src/config -I src/daemon -I $(CUTILS_DIR)/include \
                 -I $(CUTILS_DIR)/lib/cJSON
 COMMON_CFLAGS := -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
@@ -295,9 +296,23 @@ test-api: all $(FREE_PORT)
 # The CLI holds no repository logic, so what is worth testing is that each
 # command reaches the right endpoint and that a missing daemon produces a
 # clear message rather than a crash or a hang.
+# B134 at UAT's sizes: one 300 MB, 600 MB and 2 GiB file each into a fresh
+# repository at the production pack seal. About 2.5 GiB of scratch, so it is
+# a nightly target, not part of make test (which runs the same rollover
+# logic at an 8 MiB seal in test_pack_rollover).
+.PHONY: test-rollover-full
+test-rollover-full: $(BINS)/test_pack_rollover
+	@ROLLOVER_FULL=1 $(SCRATCH_GUARD) test_pack_rollover_full $(BINS)/test_pack_rollover
+
 .PHONY: test-cli
 test-cli: all $(FREE_PORT)
 	@$(SCRATCH_GUARD) test_cli_e2e.sh ./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
+
+# Units through the API and the CLI, with the fake provider enabled by its
+# test-only config key: routes, the job, units.allow, restore, schedules.
+.PHONY: test-units
+test-units: all
+	@$(SCRATCH_GUARD) test_units_e2e.sh ./$(TESTS)/test_units_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 
 # The shell suites each start a daemon and poll jobs on a wall-clock budget,
 # so anything running beside them under -j competes for CPU and disk and makes
@@ -308,7 +323,8 @@ test-cli: all $(FREE_PORT)
 # suite's leftovers from another's live files, when one runs at a time.
 test-api: analyze
 test-cli: test-api
-test-ui: test-cli
+test-units: test-cli
+test-ui: test-units
 
 # || exit 1, because without it a failing unit suite is invisible: cmocka
 # exits non-zero, the loop swallows it, make reports success, and every gate
@@ -334,7 +350,7 @@ test-ui: all
 	    echo "ui contract: skipped (no node)"; \
 	fi
 
-test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli test-ui
+test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli test-units test-ui
 	@for t in $(TEST_BINS) $(FAULT_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
 
 # ---- ASAN tests -------------------------------------------------------

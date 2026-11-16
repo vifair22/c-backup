@@ -77,7 +77,8 @@ static void test_migrations_apply(void **state)
         "objects", "packs", "pack_objects", "tags", "notes",
         "policy_values", "repo_backup_paths", "journal", "recovery_state",
         "file_cache", "verify_runs", "verify_findings", "grep_runs",
-        "grep_hits", NULL
+        "grep_hits", "snapshot_units", "snapshot_unit_items", "unit_policy",
+        "unit_intents", "daemon_state", NULL
     };
     for (int i = 0; tables[i]; i++)
         assert_true(object_exists(db, "table", tables[i]));
@@ -102,12 +103,65 @@ static void test_migrations_apply(void **state)
  * A second migration belongs after it; a renamed or rewritten baseline
  * would fail every existing database's checksum.
  */
+/*
+ * Once the v3 image is cut, state.db files in the field hold daemon-only
+ * state no reindex can bring back: schedules, tags, policies, sessions.
+ * A schema change after that is a numbered migration applied on top, and
+ * it must leave all of that alone. This builds a database at the baseline
+ * alone, fills it the way a running daemon would, then applies the rest.
+ */
+static void test_units_migration_keeps_baseline_data(void **state)
+{
+    (void)state;
+    unlink_db();
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
+    const db_migration_t baseline_only[] = { app_migrations[0], { NULL, NULL } };
+    assert_string_equal(baseline_only[0].name, "001_v3_baseline.sql");
+    assert_int_equal(db_run_compiled_migrations(db, baseline_only), CUTILS_OK);
+    assert_false(object_exists(db, "table", "snapshot_units"));
+
+    static const char *const fill[] = {
+        "INSERT INTO repos (id, uuid, path, label, added_at) VALUES (1, 'u-1', '/r', 'main', 1)",
+        "INSERT INTO snapshots (repo_id, id, ts, root_tree_hash) VALUES (1, 7, 100, 'aa')",
+        "INSERT INTO tags (repo_id, name, snap_id, created_at) VALUES (1, 'keep', 7, 5)",
+        "INSERT INTO policy_values (repo_id, key, value) VALUES (1, 'retention.keep_daily', '9')",
+        "INSERT INTO schedules (repo_id, action, params, trigger_type, trigger_spec, next_due_at)"
+        " VALUES (1, 'gc', '', 'interval', '{\"type\":\"interval\",\"seconds\":60}', 200)",
+        "INSERT INTO auth_config (key, value) VALUES ('admin_hash', 'x')",
+        NULL,
+    };
+    for (int i = 0; fill[i]; i++) assert_int_equal(db_exec_raw(db, fill[i]), CUTILS_OK);
+
+    /* Then the daemon is upgraded: every later migration applies. */
+    assert_int_equal(db_run_compiled_migrations(db, app_migrations), CUTILS_OK);
+    assert_true(object_exists(db, "table", "snapshot_units"));
+    assert_true(object_exists(db, "table", "unit_intents"));
+    assert_int_equal(count_rows(db, "SELECT 1 FROM tags WHERE name = 'keep' AND snap_id = 7"), 1);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM policy_values WHERE value = '9'"), 1);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM schedules WHERE action = 'gc'"), 1);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM auth_config WHERE key = 'admin_hash'"), 1);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM snapshots WHERE id = 7"), 1);
+    /* An existing snapshot has no unit row: it stays a file snapshot. */
+    assert_int_equal(count_rows(db, "SELECT 1 FROM snapshot_units"), 0);
+    /* And the new tables work against the old rows. */
+    assert_int_equal(db_exec_raw(db, "INSERT INTO unit_policy (repo_id, unit_key, key, value)"
+                                     " VALUES (1, 'fake:u', 'retention.keep_daily', '3')"),
+                     CUTILS_OK);
+    db_close(db);
+    unlink_db();
+}
+
 static void test_one_baseline_migration(void **state)
 {
     (void)state;
     assert_non_null(app_migrations[0].name);
     assert_string_equal(app_migrations[0].name, "001_v3_baseline.sql");
-    assert_null(app_migrations[1].name);
+    /* Units (source-providers.md), the first migration after it. */
+    assert_non_null(app_migrations[1].name);
+    assert_string_equal(app_migrations[1].name, "002_units.sql");
+    assert_null(app_migrations[2].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */
@@ -570,6 +624,7 @@ int main(void)
         cmocka_unit_test(test_repo_ids_are_not_reused),
         cmocka_unit_test(test_migrations_apply),
         cmocka_unit_test(test_one_baseline_migration),
+        cmocka_unit_test(test_units_migration_keeps_baseline_data),
         cmocka_unit_test(test_migrations_are_idempotent),
         cmocka_unit_test(test_child_index_includes_name),
         cmocka_unit_test(test_fts_search_works),

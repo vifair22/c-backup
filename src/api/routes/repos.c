@@ -603,6 +603,10 @@ static const char *repo_path_allow(const char *rest)
     for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)
         if (strcmp(rest, fixed[i].path) == 0) return fixed[i].allow;
 
+    /* Units (units.c) keep their own part of the table. */
+    const char *ua = units_path_allow(rest);
+    if (ua) return ua;
+
     const char *e;
     if (strncmp(rest, "/tags/", 6) == 0 && rest[6]) return "DELETE";
     if (strncmp(rest, "/schedules/", 11) == 0 &&
@@ -862,6 +866,9 @@ static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
     int64_t sid = snap_suffix(rest, "/note");
     if (sid > 0) return metadata_note_get(req, repo_id, sid);
 
+    if (strcmp(rest, "/units") == 0 || strncmp(rest, "/units/", 7) == 0)
+        return units_route_get(req, repo_id, rest);
+
     return snapshots_route_get(req, repo_id, rest);
 }
 
@@ -887,6 +894,8 @@ static api_response_t repo_scoped_put(const api_request_t *req, void *ud)
     int64_t sid = snap_suffix(rest, "/note");
     if (sid > 0) return metadata_note_put(req, repo_id, sid);
 
+    if (strncmp(rest, "/units/", 7) == 0) return units_route_put(req, repo_id, rest);
+
     return api_error(404, "not found");
 }
 
@@ -906,6 +915,9 @@ static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
         return metadata_tags_post(req, repo_id);
     if (strcmp(rest, "/schedules") == 0)
         return schedules_post(req, repo_id);
+    if (strncmp(rest, "/units/", 7) == 0 ||
+        (strncmp(rest, "/snapshots/", 11) == 0 && strstr(rest, "/unit/restore")))
+        return units_route_post(req, repo_id, rest);
     return snapshots_route_post(req, repo_id, rest);
 }
 

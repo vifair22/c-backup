@@ -1315,6 +1315,11 @@ static void test_replicate_across_keys_rechunks(void **state)
     assert_int_equal(rr.snapshots_sent, 1);
     assert_int_equal(rr.rechunked, 1);
     assert_true(rr.files_rechunked >= 2);
+    /* B135: what reached the target is reported as sent, as a copying run
+     * reports it: every new object, and the bytes the target stored. */
+    assert_true(rr.objects_written > 0);
+    assert_int_equal(rr.objects_sent, rr.objects_written);
+    assert_true(rr.bytes_sent > 0);
     char dst_root[OBJECT_HASH_SIZE * 2 + 1];
     object_hash_to_hex(rr.target_root, dst_root);
     assert_string_not_equal(src_root, dst_root);

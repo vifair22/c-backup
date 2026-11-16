@@ -3,6 +3,7 @@
 
 #include "util.h"
 #include "reindex.h"
+#include "unit_index.h"
 
 #include "chunklist.h"
 #include "manifest.h"
@@ -455,6 +456,12 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
                 (const char *[]){ repo, snap, tsbuf, label ? label : "",
                                   files, bytes, tsbuf, rhex, NULL }, NULL) != 0)
             failed = 1;
+    }
+    /* Which unit it is, if any, from its own .cbackup-unit/unit.json: the
+     * repository says, the index follows (source-providers.md 7.4). */
+    if (!failed) {
+        st = unit_index_from_tree(store, db, repo_id, snap_id, root, NULL);
+        if (st != OK) failed = 1;
     }
 
     free(label);
