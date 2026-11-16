@@ -537,6 +537,18 @@ static void test_stored_writer_refuses_what_no_reader_opens(void **state)
                                          ENCRYPT_CHACHA20, 1, body, 4), OK);
     err_clear();
 
+    /* An object type every reader refuses (OWN-39); 0, 6 and 9 all came
+     * through before, and fuzz_pack_stored found the first. */
+    const uint8_t bad_types[] = { 0, 6, 9 };
+    for (size_t i = 0; i < sizeof(bad_types); i++) {
+        err_clear();
+        assert_int_not_equal(pack_stored_add(w, hash, bad_types[i], COMPRESS_NONE,
+                                             ENCRYPT_NONE, sizeof(body) - 1,
+                                             body, sizeof(body) - 1), OK);
+        assert_non_null(strstr(err_msg(), "is not known to this build"));
+    }
+    err_clear();
+
     /* Nothing was accepted, so there is nothing to install. */
     assert_int_equal(pack_stored_count(w), 0);
 

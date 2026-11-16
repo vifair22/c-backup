@@ -631,6 +631,32 @@ static void test_unknown_loose_type_is_refused(void **state)
     assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
 }
 
+/* Writers refuse the types readers refuse, so nothing is ever stored that
+ * cannot be opened. fuzz_roundtrip found object_store writing type 6 and
+ * every read of it then failing. */
+static void test_writers_refuse_unknown_types(void **state)
+{
+    (void)state;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    const char body[] = "a payload of a type nobody reads";
+    const uint8_t bad_types[] = { 0, 6, 7, 9, 255 };
+    for (size_t i = 0; i < sizeof(bad_types); i++) {
+        err_clear();
+        assert_int_equal(object_store(store, bad_types[i], body, sizeof(body) - 1, hash),
+                         ERR_INVALID);
+        assert_non_null(strstr(err_msg(), "is not known to this build"));
+    }
+    err_clear();
+    for (uint8_t t = OBJECT_TYPE_FILE; t <= OBJECT_TYPE_TREE; t++) {
+        char data[64];
+        snprintf(data, sizeof(data), "%s %u", body, t);
+        assert_int_equal(object_store(store, t, data, strlen(data), hash), OK);
+        uint8_t got = 0;
+        assert_int_equal(object_get_info(store, hash, NULL, &got), OK);
+        assert_int_equal(got, t);
+    }
+}
+
 /* A type byte that is damage, not a newer format, is what header parity
  * is for: it must still repair, not be refused as unknown. */
 static void test_damaged_loose_type_byte_is_repaired(void **state)
@@ -667,6 +693,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_streamed_repair_refused_past_parity_fit_limit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unknown_loose_type_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_loose_type_byte_is_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_writers_refuse_unknown_types, setup, teardown),
         cmocka_unit_test_setup_teardown(test_clean_object_needs_no_repair, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pipelined_object_round_trips, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pipelined_encrypted_object_round_trips, setup, teardown),

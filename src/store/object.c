@@ -227,6 +227,10 @@ static status_t write_object(store_t *store, uint8_t type,
                              const void *data, size_t len,
                              uint8_t out_hash[OBJECT_HASH_SIZE],
                              int *out_is_new, uint64_t *out_phys_bytes) {
+    /* Every reader refuses a type outside 1-5 (OWN-39), so writing one
+     * would store an object nothing can open. */
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "write_object: " OBJECT_TYPE_UNKNOWN_FMT, type);
     if (store_needs_key(store))
         return set_error(ERR_INVALID,
                          "repository is encrypted and no key is loaded: "
@@ -2848,6 +2852,8 @@ status_t object_get_info(store_t *store,
  */
 status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size,
                           const uint8_t expected_hash[OBJECT_HASH_SIZE]) {
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "store_fd: " OBJECT_TYPE_UNKNOWN_FMT, type);
     /* Check existence first to avoid redundant work. */
     if (object_exists(store, expected_hash)) return OK;
 

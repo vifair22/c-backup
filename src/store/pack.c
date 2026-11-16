@@ -2805,8 +2805,12 @@ status_t pack_stored_add_stream(pack_stored_writer_t *w,
      * is still cheap.
      *
      * The checks are the reader's own, not stricter ones: whatever
-     * read_entry_hdr accepts, this accepts.
+     * read_entry_hdr accepts, this accepts. That includes the type since
+     * OWN-39: a reader refuses one outside 1-5, so writing it would store
+     * exactly the unreadable entry this check exists to keep out.
      */
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "pack_stored_add: " OBJECT_TYPE_UNKNOWN_FMT, type);
     if (compression != COMPRESS_NONE && compression != COMPRESS_LZ4 &&
         compression != COMPRESS_LZ4_FRAME)
         return set_error(ERR_INVALID, "pack_stored_add: unknown compression codec %u",
@@ -3801,6 +3805,8 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
                          uint64_t *out_payload_size)
 {
     if (!w || (!data && len)) return set_error(ERR_INVALID, "pack_backup_add: null argument");
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "pack_backup_add: " OBJECT_TYPE_UNKNOWN_FMT, type);
     if (len > PACK_STREAM_THRESHOLD)
         return set_error(ERR_TOO_LARGE,
                          "pack_backup_add: %zu bytes exceeds the streaming threshold", len);
