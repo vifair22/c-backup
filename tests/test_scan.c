@@ -13,10 +13,11 @@
 
 #include "scan.h"
 #include "util.h"
+#include "test_tmp.h"
 
-#define TEST_ROOT1 "/tmp/c_backup_scan_root1"
-#define TEST_ROOT2 "/tmp/c_backup_scan_root2"
-#define TEST_MISS  "/tmp/c_backup_scan_missing"
+#define TEST_ROOT1 TEST_TMP "/c_backup_scan_root1"
+#define TEST_ROOT2 TEST_TMP "/c_backup_scan_root2"
+#define TEST_MISS  TEST_TMP "/c_backup_scan_missing"
 
 static void write_file(const char *path, const char *content) {
     FILE *f = fopen(path, "w");
@@ -269,10 +270,10 @@ static void test_absolute_exclude_stops_at_component_boundary(void **state) {
 static void test_absolute_exclude_is_normalised(void **state) {
     (void)state;
     const char *literal[] = {
-        "/tmp/c_backup_scan_root1/../c_backup_scan_root1/sub",
-        "//tmp//c_backup_scan_root1///sub",
-        "/tmp/./c_backup_scan_root1/./sub/.",
-        "/tmp/c_backup_scan_root1/sub/x/..",
+        TEST_TMP "/c_backup_scan_root1/../c_backup_scan_root1/sub",
+        "/" TEST_TMP "//c_backup_scan_root1///sub",
+        TEST_TMP "/./c_backup_scan_root1/./sub/.",
+        TEST_TMP "/c_backup_scan_root1/sub/x/..",
     };
     for (size_t i = 0; i < sizeof(literal) / sizeof(literal[0]); i++) {
         scan_result_t *res = NULL;
@@ -283,7 +284,7 @@ static void test_absolute_exclude_is_normalised(void **state) {
         scan_result_free(res);
     }
 
-    const char *glob[] = { "/tmp/c_backup_scan_root1/sub/../*.tmp" };
+    const char *glob[] = { TEST_TMP "/c_backup_scan_root1/sub/../*.tmp" };
     scan_result_t *res = NULL;
     scan_with(glob, 1, &res);
     assert_false(saw(res, "skip.tmp"));

@@ -34,8 +34,9 @@
 #include "parity.h"
 #include "store.h"
 #include "util.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_test_pack_fault"
+#define TEST_REPO TEST_TMP "/c_backup_test_pack_fault"
 #define NOBJ 8
 
 static store_t *store;
@@ -192,7 +193,7 @@ static void test_load_fread_fail(void **state)
 static void test_stream_fread_fail(void **state)
 {
     (void)state;
-    char out[] = "/tmp/c_backup_pack_fault_stream.XXXXXX";
+    char out[] = TEST_TMP "/c_backup_pack_fault_stream.XXXXXX";
     int fd = mkstemp(out);
     assert_true(fd >= 0);
 

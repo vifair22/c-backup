@@ -117,6 +117,23 @@ its full logical size, so restore routes them through a scatter path. A file
 that is entirely hole has an empty region table: it costs a header, and
 restores as an `ftruncate` with nothing allocated.
 
+## `snapshots/<id>`
+
+One JSON object per snapshot, newline-terminated:
+
+```json
+{"id":42,"ts":1700000000,"root":"<64 hex digits>","label":"nightly"}
+```
+
+`ts` is signed epoch seconds. `label` is a JSON string, escaped as JSON
+requires: a quote, a backslash or a control character is written as an
+escape, and any byte that is not well-formed UTF-8 as `\ufffd`, so the record
+parses whatever the label held. A new backup accepts at most 256 bytes of
+printable text; replication copies a label stored before that limit
+existed, escaped the same way. Readers refuse a record larger than 64 KiB.
+The record is written to `tmp/`, synced, renamed into place, and the
+directory synced, before the snapshot's database row is committed.
+
 ## Manifest trees
 
 A snapshot's file metadata is one content-addressed object per directory,

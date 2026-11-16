@@ -1273,15 +1273,16 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
          * run exists, cancelled or not, so a client following the job
          * opens this job's run and never an older one. */
         if (gr.run_id > 0) {
-            char rj[320];
+            char rj[352];
             snprintf(rj, sizeof(rj),
                      "{\"run_id\":%lld,\"snapshot\":%lld,\"files_scanned\":%llu,"
-                     "\"files_matched\":%llu,\"files_capped\":%llu,\"hits\":%llu,"
-                     "\"truncated\":%s}",
+                     "\"files_matched\":%llu,\"files_capped\":%llu,"
+                     "\"files_skipped\":%llu,\"hits\":%llu,\"truncated\":%s}",
                      (long long)gr.run_id, (long long)j->snap_id,
                      (unsigned long long)gr.files_scanned,
                      (unsigned long long)gr.files_matched,
                      (unsigned long long)gr.files_capped,
+                     (unsigned long long)gr.files_skipped,
                      (unsigned long long)gr.hits, gr.truncated ? "true" : "false");
             job_set_result(progress_ctx, rj);
         }
@@ -1440,11 +1441,12 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         snprintf(rj, sizeof(rj),
                  "{\"files\":%llu,\"dirs\":%llu,\"symlinks\":%llu,"
                  "\"hardlinks\":%llu,\"specials\":%llu,\"bytes\":%llu,"
-                 "\"skipped\":%llu,\"failed\":%llu}",
+                 "\"skipped\":%llu,\"kept\":%llu,\"failed\":%llu}",
                  (unsigned long long)rr.files, (unsigned long long)rr.dirs,
                  (unsigned long long)rr.symlinks, (unsigned long long)rr.hardlinks,
                  (unsigned long long)rr.specials, (unsigned long long)rr.bytes,
-                 (unsigned long long)rr.skipped, (unsigned long long)rr.failed);
+                 (unsigned long long)rr.skipped, (unsigned long long)rr.kept,
+                 (unsigned long long)rr.failed);
         job_set_result(progress_ctx, rj);
     }
 
@@ -1747,7 +1749,8 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
             "SELECT id, snap_id, pattern, started_at, finished_at, completed,"
-            "       files_scanned, files_matched, hits, truncated, files_capped"
+            "       files_scanned, files_matched, hits, truncated, files_capped,"
+            "       files_skipped, skip_reason"
             "  FROM grep_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
             (const char *[]){ repo, limit, offset, NULL }, &r) != 0) {
         db_result_free(r);
@@ -1768,6 +1771,7 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
             { "files_scanned", 6, JCOL_INT }, { "files_matched", 7, JCOL_INT },
             { "hits", 8, JCOL_INT }, { "truncated", 9, JCOL_BOOL },
             { "files_capped", 10, JCOL_INT },
+            { "files_skipped", 11, JCOL_INT }, { "skip_reason", 12, JCOL_STR_NULL },
         };
         int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);

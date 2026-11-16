@@ -6,6 +6,29 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-15 - Restore renames verified files in synced batches (OWN-36)
+
+Restore now writes each file to a temporary file and renames it into place
+only once its object has verified, and the data has to be on disk before
+the name is, or a power failure leaves a right-named file of zeros.
+
+`bench_phases -d ~/.cache/own36bench -n 10000 -l 1 -t 0 -m 64` (10,000
+small files averaging 4 KiB plus one 64 MiB file) on btrfs over LVM on
+NVMe, restore phase only, two rounds each:
+
+| Build | Restore | Files/s |
+|---|---|---|
+| Before (writes in place, never syncs) | 0.735 s, 0.735 s | 13,600 |
+| Temp file + rename, no sync (not shipped) | 0.879 s, 0.866 s | 11,500 |
+| Temp file + `fdatasync` per file + rename | 56.99 s, 53.53 s | 175-187 |
+| Temp file + one `syncfs` per 512 files or 256 MiB + rename (shipped) | 1.615 s, 1.601 s | 6,200 |
+
+The temporary file and rename cost about 18%. Syncing per file costs a
+btrfs log commit per file regardless of size, 70 times slower; batching
+pays about 20 syncs for this tree. Most of the remaining difference from
+"before" is writeback the old restore never waited for, which the shipped
+build pays inside the timing.
+
 ## 2026-11-15 - The pack pass bails out inside an entry (OWN-27)
 
 The pack-pass half of the streaming bail-out proposed below ("Until the

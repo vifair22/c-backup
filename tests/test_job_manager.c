@@ -34,8 +34,9 @@
 #include <cutils/db.h>
 
 #include "job_manager.h"
+#include "test_tmp.h"
 
-#define TEST_DIR "/tmp/c_backup_test_jobm"
+#define TEST_DIR TEST_TMP "/c_backup_test_jobm"
 #define TEST_DB  TEST_DIR "/state.db"
 
 extern const db_migration_t app_migrations[];

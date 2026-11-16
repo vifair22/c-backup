@@ -22,8 +22,9 @@
 #include <cutils/error.h>
 
 #include "app_config.h"
+#include "test_tmp.h"
 
-#define TEST_CFG "/tmp/c_backup_test_app_config.yaml"
+#define TEST_CFG TEST_TMP "/c_backup_test_app_config.yaml"
 
 static int load(const char *body)
 {

@@ -36,8 +36,9 @@
 #include "restore.h"
 #include "store_index.h"
 #include "verify.h"
+#include "test_tmp.h"
 
-#define TEST_DIR  "/tmp/c_backup_test_verify"
+#define TEST_DIR  TEST_TMP "/c_backup_test_verify"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_REPO TEST_DIR "/repo"
 #define TEST_SRC  TEST_DIR "/src"

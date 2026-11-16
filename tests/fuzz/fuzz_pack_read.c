@@ -36,8 +36,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../test_tmp.h"
 
-#define FUZZ_ROOT "/tmp/c_backup_fuzz_pack_read"
+#define FUZZ_ROOT TEST_TMP "/c_backup_fuzz_pack_read"
 #define CTRL_BYTES 8
 
 static store_t   *g_store;

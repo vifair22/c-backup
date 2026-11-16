@@ -30,8 +30,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../test_tmp.h"
 
-#define FUZZ_TMP    "/tmp/c_backup_fuzz_parity_stream"
+#define FUZZ_TMP    TEST_TMP "/c_backup_fuzz_parity_stream"
 #define CTRL_BYTES  4
 /* Four RS groups is enough to put a group boundary and a spill boundary on
  * either side of each other; more only makes the corpus bigger. */

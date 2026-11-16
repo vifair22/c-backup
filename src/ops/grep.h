@@ -45,13 +45,19 @@ typedef struct {
 
 typedef struct {
     uint64_t files_scanned;
-    uint64_t files_skipped;   /* unreadable or without content */
+    /* Not searched: unreadable, damaged beyond parity, failing
+     * authentication, or not file content. Any match such a file produced
+     * is discarded, never recorded. */
+    uint64_t files_skipped;
     uint64_t files_matched;
     uint64_t files_capped;    /* stopped reading at max_hits_per_file */
     uint64_t bytes_scanned;
     uint64_t hits;            /* recorded hits: at most max_hits */
     int      truncated;       /* stopped early on max_files or max_hits */
     int64_t  run_id;
+    /* The first skipped file and why, "<path>: <reason>"; empty when none
+     * was. Every one is logged; the run keeps the first. */
+    char     skip_reason[256];
 } grep_result_t;
 
 status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,

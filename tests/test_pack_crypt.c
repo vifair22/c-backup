@@ -48,8 +48,9 @@
 #include "repo_key.h"
 #include "store.h"
 #include "types.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_test_pack_crypt"
+#define TEST_REPO TEST_TMP "/c_backup_test_pack_crypt"
 
 /* Above the block-codec threshold, so the frame codec is used. */
 #define FRAME_SIZE (17u * 1024u * 1024u)
@@ -122,7 +123,7 @@ static void store_obj(const uint8_t *buf, size_t n, uint8_t hash[OBJECT_HASH_SIZ
 /* Store from a file, which is the path large objects take. */
 static void store_file(const uint8_t *buf, size_t n, uint8_t hash[OBJECT_HASH_SIZE])
 {
-    char path[] = "/tmp/c_backup_pack_crypt_src.XXXXXX";
+    char path[] = TEST_TMP "/c_backup_pack_crypt_src.XXXXXX";
     int fd = mkstemp(path);
     assert_true(fd >= 0);
     assert_int_equal(write(fd, buf, n), (ssize_t)n);
@@ -146,7 +147,7 @@ static void assert_buffered_read_matches(const uint8_t hash[OBJECT_HASH_SIZE],
 static void assert_stream_read_matches(const uint8_t hash[OBJECT_HASH_SIZE],
                                        const uint8_t *expect, size_t len)
 {
-    char out[] = "/tmp/c_backup_pack_crypt_stream.XXXXXX";
+    char out[] = TEST_TMP "/c_backup_pack_crypt_stream.XXXXXX";
     int fd = mkstemp(out);
     assert_true(fd >= 0);
 

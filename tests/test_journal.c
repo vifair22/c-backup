@@ -26,8 +26,9 @@
 
 #include "db_txn.h"
 #include "routes.h"
+#include "test_tmp.h"
 
-#define TEST_DIR "/tmp/c_backup_test_journal"
+#define TEST_DIR TEST_TMP "/c_backup_test_journal"
 #define TEST_DB  TEST_DIR "/state.db"
 
 #define WRITERS    8

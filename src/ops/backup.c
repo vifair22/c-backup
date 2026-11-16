@@ -12,6 +12,7 @@
 #include "db_txn.h"
 #include "phase_timer.h"
 #include "pack.h"
+#include "snap_record.h"
 #include "store_pool.h"
 
 #include <cutils/log.h>
@@ -806,6 +807,16 @@ static status_t store_content_loop(pipeline_t *p)
             log_warn("backup: cannot open %s, skipping", e->path);
             continue;
         }
+        /* Replaced by something else since the scan. A directory opens
+         * read-only without complaint, and on btrfs SEEK_DATA on it answers
+         * ENXIO, "no data from here on": the sparse probe took that for a
+         * file that is one hole and stored the scan's size in zeros. */
+        struct stat fst;
+        if (fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
+            log_warn("backup: %s is no longer a regular file, skipping", e->path);
+            close(fd);
+            continue;
+        }
 
         if (to_pool) {
             status_t sst = store_pool_submit(p->pool, i, fd, e->node.size);
@@ -1276,30 +1287,44 @@ static status_t write_snapshot_record(store_t *store, int64_t snap_id,
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_hex(root, hex);
 
-    char tmp[PATH_MAX], final[PATH_MAX];
-    if (snprintf(tmp, sizeof(tmp), "%s/tmp/snap.XXXXXX", store_root(store)) >= (int)sizeof(tmp) ||
+    char tmp[PATH_MAX], final[PATH_MAX], snap_dir[PATH_MAX];
+    if (snprintf(snap_dir, sizeof(snap_dir), "%s/snapshots", store_root(store)) >= (int)sizeof(snap_dir) ||
+        snprintf(tmp, sizeof(tmp), "%s/tmp/snap.XXXXXX", store_root(store)) >= (int)sizeof(tmp) ||
         snprintf(final, sizeof(final), "%s/snapshots/%lld",
                  store_root(store), (long long)snap_id) >= (int)sizeof(final))
         return set_error(ERR_IO, "snapshot record: path too long");
 
-    int fd = mkstemp(tmp);
-    if (fd == -1) return set_error_errno(ERR_IO, "snapshot record: mkstemp");
+    size_t len = 0;
+    char *body = snapshot_record_encode(snap_id, (int64_t)ts, hex, label, &len);
+    if (!body) {
+        if (errno == E2BIG)
+            return set_error(ERR_INVALID, "snapshot record: the label is too long to record");
+        return set_error(ERR_NOMEM, "snapshot record: out of memory");
+    }
 
-    char body[512];
-    int n = snprintf(body, sizeof(body),
-                     "{\"id\":%lld,\"ts\":%lld,\"root\":\"%s\",\"label\":\"%s\"}\n",
-                     (long long)snap_id, (long long)ts, hex, label ? label : "");
-    if (n < 0 || write(fd, body, (size_t)n) != n) {
-        close(fd); unlink(tmp);
+    int fd = mkstemp(tmp);
+    if (fd == -1) { free(body); return set_error_errno(ERR_IO, "snapshot record: mkstemp"); }
+
+    if (snapshot_write_all(fd, body, len) != 0) {
+        int err = errno;
+        free(body); close(fd); unlink(tmp);
+        errno = err;
         return set_error_errno(ERR_IO, "snapshot record: write");
     }
+    free(body);
     if (fsync(fd) != 0) { close(fd); unlink(tmp); return set_error_errno(ERR_IO, "snapshot record: fsync"); }
-    close(fd);
+    if (close(fd) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "snapshot record: close"); }
 
     if (rename(tmp, final) != 0) {
         unlink(tmp);
         return set_error_errno(ERR_IO, "snapshot record: rename");
     }
+    /* The rename is only durable once the directory is: without this a
+     * power cut could lose the record while the database row, committed
+     * after this returns, survives - an index naming a snapshot the
+     * repository does not have. */
+    if (snapshot_fsync_dir(snap_dir) != 0)
+        return set_error_errno(ERR_IO, "snapshot record: sync %s", snap_dir);
     return OK;
 }
 
@@ -1516,6 +1541,12 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 {
     if (!store || !db || !opts || opts->n_paths < 1)
         return set_error(ERR_INVALID, "backup_run: missing store, db or paths");
+    /* The routes and the CLI refuse a bad label first, with a 400; this is
+     * the engine's own guard, so no caller can reach the record writer or
+     * the snapshots row with one. Before the scan, so nothing is read for a
+     * backup that would only be refused at the end. */
+    if (snapshot_label_check(opts->label) != 0)
+        return set_error(ERR_INVALID, "%s", SNAPSHOT_LABEL_RULE);
 
     status_t st = check_sources(opts);
     if (st != OK) return st;
@@ -1629,6 +1660,11 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         scan_result_t *part = NULL;
         st = scan_tree(opts->paths[i], imap, &sopts, &part);
         if (st != OK) { scan_result_free(part); break; }
+        /* scan_tree always sets part on OK; said here so the contract is
+         * checked rather than assumed (gcc's LTO -Wnull-dereference could
+         * not prove it across the inlined call). */
+        if (!part) { st = set_error(ERR_INVALID, "backup_run: scan of %s returned no result",
+                                    opts->paths[i]); break; }
         from_sources += part->root_entries;
         if (!scan) {
             scan = part;

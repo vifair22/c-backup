@@ -22,9 +22,16 @@
  *   - raw:     db_txn_begin/insert/commit, the shape every other writer has
  *
  * The backup covers large files on both sides of the 16 MiB pack threshold
- * (6 MiB, packed; 20 MiB, loose) and 3,000 small ones, past the 2,000-entry
+ * (6 MiB, packed; 20 MiB, loose) and 12,000 small ones, past the 2,000-entry
  * batch, so it crosses count commits, commits for a waiter mid-file and pack
  * seals.
+ *
+ * It was 3,000 while the suites ran in /tmp, which is a tmpfs on most
+ * desktops and makes every fsync free. On a real disk (btrfs, here) the tag
+ * and sources writers sync a file per write, and the backup over 3,000 files
+ * finished inside eight of their writes. More small files make the backup
+ * long enough to overlap MIN_DURING of them at the cost of a few MiB of
+ * scratch, rather than loosening what overlap means.
  *
  * What is asserted: no handler returns anything but success, every write is
  * in the final state, no single write waited longer than the bound, the
@@ -61,14 +68,15 @@
 #include "store.h"
 #include "store_index.h"
 #include "verify.h"
+#include "test_tmp.h"
 
-#define TEST_DIR  "/tmp/c_backup_test_dbstress"
+#define TEST_DIR  TEST_TMP "/c_backup_test_dbstress"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_REPO TEST_DIR "/repo"
 #define TEST_SRC  TEST_DIR "/src"     /* what the stressed backup reads */
 #define TEST_SRC2 TEST_DIR "/src2"    /* snapshot 1, for the tags */
 
-#define N_SMALL   3000              /* past CACHE_BATCH, so count commits too */
+#define N_SMALL   12000             /* past CACHE_BATCH, so count commits too */
 #define N_FILES   (N_SMALL + 3)       /* plus two 6 MiB and one 20 MiB */
 #define MIN_ITERS 40                  /* per writer, backup or no backup */
 #define MIN_DURING 10                 /* per writer, while the backup runs */

@@ -28,8 +28,9 @@
 #include "routes.h"
 #include "job_manager.h"
 #include "scheduler.h"
+#include "test_tmp.h"
 
-#define TEST_DB "/tmp/c_backup_test_sched.db"
+#define TEST_DB TEST_TMP "/c_backup_test_sched.db"
 
 extern const db_migration_t app_migrations[];
 

@@ -200,9 +200,9 @@ packing and restoring a file all stop within one read of at most 8 MiB, so a
 multi-gigabyte file in progress does not hold up the shutdown. This takes
 about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
 or SIGINT forces an immediate exit. Run the cancelled job again after the
-restart; a backup skips what it already stored, a restore skips what it
-already wrote. `c-backup jobs cancel <id>` is the same cancellation for one
-job, and prints the job record with `"cancel_requested":true`. A job still
+restart; a backup skips what it already stored, a restore skips the files it
+finished and redoes the one it was inside. `c-backup jobs cancel <id>` is the
+same cancellation for one job, and prints the job record with `"cancel_requested":true`. A job still
 waiting in the queue never starts: it is `cancelled` in that record already,
 and in the journal as "cancelled before it started".
 
@@ -671,7 +671,7 @@ Options:
 |---|---|
 | `--exclude PAT` | Repeatable. See 6.2 |
 | `--one-filesystem` | Do not cross into other mounts below a source |
-| `--label TEXT` | A label on the snapshot |
+| `--label TEXT` | A label on the snapshot: at most 256 bytes of UTF-8 text with no control characters (tabs and newlines included). Anything else is refused before the backup starts |
 
 ### 6.2 Exclusion patterns
 
@@ -820,9 +820,21 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
   matching files. A file stops being read after `--max-hits-per-file`
   matches (default 100) and the whole search after `--max-hits` (default
   10,000). `truncated` says the search itself stopped early (`--limit` or
-  `--max-hits`); `files_capped` counts files read only as far as their cap,
-  which may hold more matches than were recorded. Both are on the job's
-  result and on the run in `grep runs`. The hits are kept: `c-backup grep runs <id>` lists past
+  `--max-hits`); `files_capped` counts files whose matching stopped at their
+  cap, which may hold more matches than were recorded. Both are on the job's
+  result and on the run in `grep runs`.
+- **A match is recorded only from a file that read back whole and
+  authentic.** A file's matches are held until its object has been read to
+  the end and its SHA-256 (and, in an encrypted repository, its
+  authentication tag) has checked out; only then are they kept. A capped or
+  binary file over 16 MiB is therefore still read to its end, just not
+  matched further. A file that does not read back - damaged beyond its
+  parity, failing its tag, or not file content - contributes no matches and
+  is counted in `files_skipped`, with the first such file and the reason in
+  the run's `skip_reason` and every one in the daemon log. A damaged file
+  over 16 MiB is skipped even when its parity could correct it, because the
+  search streams it and cannot rewind to apply the correction; a repairing
+  `verify` fixes it on disk. The hits are kept: `c-backup grep runs <id>` lists past
   searches, newest first, and `c-backup grep show <id> <run>` prints one
   search's hits again, which is how a `--no-wait` search is read once it
   has finished.
@@ -867,9 +879,32 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
   backup of `/home/me` into `/mnt/restore` produces `/mnt/restore/home/me/...`.
 - `--subpath` restores one file or directory. It matches on component
   boundaries and accepts the path with or without its leading slash.
-- **Existing files are skipped, not overwritten**, and counted as skipped.
-  This makes an interrupted restore re-runnable: run it again and it
-  continues. `--overwrite` replaces existing files instead.
+- **A file appears at its path only once it is complete and verified.**
+  Each regular file is written to a temporary file named
+  `.c-backup-partial.` plus six random characters, in the directory it
+  belongs in, with mode 0600. Only once the whole object has read back and
+  its SHA-256 (and, in an encrypted repository, its authentication tag) has
+  checked out are its mode, ownership, times, extended attributes and ACLs
+  applied, the data synced to disk, and the file renamed over its real
+  name. A file whose object is damaged beyond its parity, or fails its tag,
+  never appears; its temporary file is removed.
+- **An interrupted restore leaves only temporary files.** A daemon killed
+  mid-file (`kill -9`, a crash, power loss) leaves a `.c-backup-partial.*`
+  file, never a file of the right name with the wrong content. The next
+  restore into that directory removes them before it writes there. Do not
+  run two restores into the same directory at the same time: each would
+  remove the other's temporary files.
+- **Existing files are not overwritten.** This makes an interrupted restore
+  re-runnable: run it again and it continues. An existing regular file whose
+  size matches the snapshot's and whose modification time is within two
+  seconds of it (the slack is for filesystems with coarse timestamps) is
+  taken as already restored and counted as **skipped**. Anything else at
+  the path - a different size or time, a directory, a symlink - is the
+  operator's and is left alone, logged, and counted as **kept**; the
+  snapshot's version of that file is not in the destination. Neither fails
+  the restore. `--overwrite` replaces existing files instead, by renaming
+  the verified file over them; a symlink at the path is replaced, not
+  followed.
 - Hardlinks are restored as hardlinks, including across a resumed restore.
 - Sparse files come back sparse.
 - Modes, times (directories included), extended attributes and ACLs are
@@ -878,9 +913,21 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
   created is skipped and counted, not failed.
 - Sockets are skipped: they have no content.
 
-The job reports files, directories, links, specials, skipped and failed. Any
-failed entry makes the job fail with "restore incomplete", so a restore that
-reports success restored everything restorable.
+The job reports files, directories, links, specials, skipped, kept and
+failed. Any failed entry makes the job fail with "restore incomplete", so a
+restore that reports success restored everything restorable. An object of a
+type this build does not know fails its file with "object type N is not
+known to this build; written by a newer c-backup?", and a file entry whose
+object is not file content (a directory tree, say) fails rather than being
+written out as bytes.
+
+Verified files are made durable in batches - up to 512 files or 256 MiB,
+one `syncfs` on the destination filesystem - and only then renamed, so a
+power failure cannot leave a right-named file whose data never reached
+the disk. Syncing each file on its own ran at 175 files/s on btrfs; the
+batch measured 6,200 files/s for 10,000 small files where the old restore,
+which synced nothing, measured 13,600 (PERF.md). `syncfs` also flushes
+whatever else is dirty on that filesystem, once per batch.
 
 ---
 
@@ -1878,7 +1925,8 @@ Known limits:
 - **One admin password.** No users or roles.
 - **No configuration API.** Edit `config.yaml` and restart.
 - **No resumable jobs.** A job interrupted by a restart is marked failed and
-  run again. Backups skip what is unchanged; restores skip what exists.
+  run again. Backups skip what is unchanged; restores skip what they
+  already finished (section 8).
 
 Not in 1.0, by decision:
 

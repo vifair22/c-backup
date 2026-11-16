@@ -38,8 +38,9 @@
 #include "parity.h"
 #include "store.h"
 #include "types.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_test_object_parity"
+#define TEST_REPO TEST_TMP "/c_backup_test_object_parity"
 
 static store_t *store;
 
@@ -434,10 +435,266 @@ static void test_pipelined_encrypted_object_round_trips(void **state)
     pipelined_object_round_trips(1);
 }
 
+/* ------------------------------------------------------------------ */
+/* Streamed reads of large loose objects (OWN-37)                      */
+/* ------------------------------------------------------------------ */
+
+/* Over STREAM_LOAD_MAX, so it is written loose and can only be streamed,
+ * and spans two read windows so a correction lands mid-object. */
+#define BIG_SZ ((size_t)20 * 1024 * 1024)
+
+static void store_big(uint8_t hash[OBJECT_HASH_SIZE], uint8_t **out_body)
+{
+    uint8_t *body = malloc(BIG_SZ);
+    assert_non_null(body);
+    uint32_t x = 2463534242u;
+    for (size_t i = 0; i < BIG_SZ; i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        body[i] = (uint8_t)x;
+    }
+    const char *src = TEST_REPO "/tmp/big_src.bin";
+    int fd = open(src, O_CREAT | O_TRUNC | O_RDWR, 0644);
+    assert_true(fd >= 0);
+    assert_int_equal(write(fd, body, BIG_SZ), (ssize_t)BIG_SZ);
+    assert_int_equal(lseek(fd, 0, SEEK_SET), 0);
+    object_write_t w;
+    assert_int_equal(object_store_file_loose(store, fd, BIG_SZ, 0, hash, &w), OK);
+    close(fd);
+    unlink(src);
+    *out_body = body;
+}
+
+/* Stream into a fresh temporary file; on OK it must hold exactly body. */
+static status_t stream_and_compare(const uint8_t hash[OBJECT_HASH_SIZE],
+                                   const uint8_t *body)
+{
+    char out[] = TEST_REPO "/tmp/streamed.XXXXXX";
+    int fd = mkstemp(out);
+    assert_true(fd >= 0);
+    uint64_t sz = 0;
+    uint8_t  type = 0;
+    err_clear();
+    status_t st = object_load_stream(store, hash, fd, &sz, &type);
+    if (st == OK) {
+        struct stat sb;
+        assert_int_equal(fstat(fd, &sb), 0);
+        assert_int_equal((uint64_t)sb.st_size, BIG_SZ);
+        uint8_t *got = malloc(BIG_SZ);
+        assert_non_null(got);
+        assert_int_equal(pread(fd, got, BIG_SZ, 0), (ssize_t)BIG_SZ);
+        assert_memory_equal(got, body, BIG_SZ);
+        free(got);
+    }
+    close(fd);
+    unlink(out);
+    return st;
+}
+
+/*
+ * An encrypted loose object with one flipped payload byte streams back
+ * correct. A failed tag used to end the read before the parity pass was
+ * considered - it ran only for a plaintext hash mismatch - so the same
+ * damage that a plaintext object shrugged off made an encrypted one
+ * unreadable. The two halves of the probe that found it are both here.
+ */
+static void streamed_flip_is_repaired(int keyed)
+{
+    repo_key_t key;
+    if (keyed) {
+        assert_int_equal(repo_key_generate(&key), OK);
+        store_set_key(store, &key);
+    }
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint8_t *body = NULL;
+    store_big(hash, &body);
+
+    char path[512];
+    object_path(hash, path);
+    object_header_t hdr;
+    int fd = open(path, O_RDONLY);
+    assert_true(fd >= 0);
+    assert_int_equal(pread(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    close(fd);
+    assert_int_equal(hdr.encryption, keyed ? ENCRYPT_CHACHA20 : ENCRYPT_NONE);
+
+    flip_byte(path, (off_t)sizeof(hdr) + (1 << 20));
+
+    parity_stats_reset();
+    assert_int_equal(stream_and_compare(hash, body), OK);
+    assert_true(parity_stats_get().repaired > 0);
+
+    /* Bytes nonce, tag and the last window: every part of the stored
+     * payload is covered by parity, not just the ciphertext. */
+    flip_byte(path, (off_t)sizeof(hdr) + 1);
+    flip_byte(path, (off_t)sizeof(hdr) + (off_t)hdr.compressed_size - 2);
+    assert_int_equal(stream_and_compare(hash, body), OK);
+
+    free(body);
+    if (keyed) store_set_key(store, NULL);
+}
+
+static void test_streamed_flip_is_repaired(void **state)
+{
+    (void)state;
+    streamed_flip_is_repaired(0);
+}
+
+static void test_streamed_flip_in_encrypted_object_is_repaired(void **state)
+{
+    (void)state;
+    streamed_flip_is_repaired(1);
+}
+
+/*
+ * Past the OWN-30 limit a damaged object is refused, never corrected, and
+ * nothing it streamed is left behind as if it were the object.
+ */
+static void test_streamed_repair_refused_past_parity_fit_limit(void **state)
+{
+    (void)state;
+    repo_key_t key;
+    assert_int_equal(repo_key_generate(&key), OK);
+    store_set_key(store, &key);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint8_t *body = NULL;
+    store_big(hash, &body);
+    char path[512];
+    object_path(hash, path);
+    flip_byte(path, (off_t)sizeof(object_header_t) + (1 << 20));
+
+    object_test_set_parity_fit_limit(BIG_SZ / 2);
+    status_t st = stream_and_compare(hash, body);
+    object_test_set_parity_fit_limit(0);
+    assert_int_equal(st, ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), "parity not applied"));
+
+    /* And with the limit back, the same object repairs. */
+    assert_int_equal(stream_and_compare(hash, body), OK);
+    free(body);
+    store_set_key(store, NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/* Object types (OWN-39)                                               */
+/* ------------------------------------------------------------------ */
+
+/* Rewrite a loose object's header type and its header parity record to
+ * match, which is what an object written by a newer build looks like. */
+static void retype_loose(const char *path, uint8_t type)
+{
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    object_header_t hdr;
+    assert_int_equal(pread(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    hdr.type = type;
+    parity_record_t rec;
+    parity_record_compute(&hdr, sizeof(hdr), &rec);
+    assert_int_equal(pwrite(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    assert_int_equal(pwrite(fd, &rec, sizeof(rec),
+                            (off_t)sizeof(hdr) + (off_t)hdr.compressed_size),
+                     (ssize_t)sizeof(rec));
+    close(fd);
+}
+
+#define UNKNOWN_TYPE_MSG \
+    "object type 9 is not known to this build; written by a newer c-backup?"
+
+static void test_unknown_loose_type_is_refused(void **state)
+{
+    (void)state;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    char path[512];
+    store_and_path("bytes of a type from the future", hash, path);
+    retype_loose(path, 9);
+
+    void *out = NULL;
+    size_t len = 0;
+    err_clear();
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
+
+    char tmp[] = TEST_REPO "/tmp/typed.XXXXXX";
+    int fd = mkstemp(tmp);
+    assert_true(fd >= 0);
+    err_clear();
+    assert_int_equal(object_load_stream(store, hash, fd, NULL, NULL), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
+    struct stat sb;
+    assert_int_equal(fstat(fd, &sb), 0);
+    assert_int_equal(sb.st_size, 0);   /* refused before a byte was emitted */
+    close(fd);
+    unlink(tmp);
+
+    uint64_t sz = 0;
+    uint8_t  type = 0;
+    err_clear();
+    assert_int_equal(object_get_info(store, hash, &sz, &type), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
+}
+
+/* Writers refuse the types readers refuse, so nothing is ever stored that
+ * cannot be opened. fuzz_roundtrip found object_store writing type 6 and
+ * every read of it then failing. */
+static void test_writers_refuse_unknown_types(void **state)
+{
+    (void)state;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    const char body[] = "a payload of a type nobody reads";
+    const uint8_t bad_types[] = { 0, 6, 7, 9, 255 };
+    for (size_t i = 0; i < sizeof(bad_types); i++) {
+        err_clear();
+        assert_int_equal(object_store(store, bad_types[i], body, sizeof(body) - 1, hash),
+                         ERR_INVALID);
+        assert_non_null(strstr(err_msg(), "is not known to this build"));
+    }
+    err_clear();
+    for (uint8_t t = OBJECT_TYPE_FILE; t <= OBJECT_TYPE_TREE; t++) {
+        char data[64];
+        snprintf(data, sizeof(data), "%s %u", body, t);
+        assert_int_equal(object_store(store, t, data, strlen(data), hash), OK);
+        uint8_t got = 0;
+        assert_int_equal(object_get_info(store, hash, NULL, &got), OK);
+        assert_int_equal(got, t);
+    }
+}
+
+/* A type byte that is damage, not a newer format, is what header parity
+ * is for: it must still repair, not be refused as unknown. */
+static void test_damaged_loose_type_byte_is_repaired(void **state)
+{
+    (void)state;
+    const char *data = "a type byte one bit away from unknown";
+    uint8_t hash[OBJECT_HASH_SIZE];
+    char path[512];
+    store_and_path(data, hash, path);
+    /* FILE (1) with bit 3 set is 9. */
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    uint8_t t = 0;
+    off_t toff = (off_t)offsetof(object_header_t, type);
+    assert_int_equal(pread(fd, &t, 1, toff), 1);
+    t ^= 0x08;
+    assert_int_equal(pwrite(fd, &t, 1, toff), 1);
+    close(fd);
+
+    parity_stats_reset();
+    assert_loads_as(hash, data);
+    assert_true(parity_stats_get().repaired > 0);
+    uint8_t type = 0;
+    assert_int_equal(object_get_info(store, hash, NULL, &type), OK);
+    assert_int_equal(type, OBJECT_TYPE_FILE);
+}
+
 int main(void)
 {
     rs_init();
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_streamed_flip_is_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_streamed_flip_in_encrypted_object_is_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_streamed_repair_refused_past_parity_fit_limit, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unknown_loose_type_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_damaged_loose_type_byte_is_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_writers_refuse_unknown_types, setup, teardown),
         cmocka_unit_test_setup_teardown(test_clean_object_needs_no_repair, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pipelined_object_round_trips, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pipelined_encrypted_object_round_trips, setup, teardown),

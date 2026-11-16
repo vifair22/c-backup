@@ -49,6 +49,28 @@ OBJ_DIR    := $(BUILD)/$(BUILD_TYPE)
 SRC        := src
 TESTS      := tests
 
+# ---- Test scratch -----------------------------------------------------
+# Every suite, the shell ones and the fuzzers included, writes its scratch
+# under this one directory: compiled into the C suites (tests/test_tmp.h) and
+# exported to the shell ones. On disk under the user's cache rather than in
+# /tmp, which on a desktop is commonly a tmpfs: dense scratch there is RAM,
+# and a suite that writes a few GiB stalls the machine. Per checkout, because
+# two worktrees running `make test` at once otherwise share one set of fixed
+# paths, and short, because two suites put unix sockets in it and sun_path
+# holds 108 bytes. CI points it at the job directory.
+XDG_CACHE_HOME    ?= $(HOME)/.cache
+C_BACKUP_TEST_DIR ?= $(XDG_CACHE_HOME)/c-backup-test-$(shell printf '%s' '$(CURDIR)' | cksum | cut -d' ' -f1)
+# The most scratch one suite may hold at once. tests/scratch-guard.sh runs
+# each suite, polls the directory, and fails the suite that goes past this.
+# Bytes, or with a K/M/G suffix.
+C_BACKUP_SCRATCH_BUDGET ?= 10G
+export C_BACKUP_TEST_DIR C_BACKUP_SCRATCH_BUDGET
+SCRATCH_GUARD  := ./$(TESTS)/scratch-guard.sh
+TEST_DIR_DEF   := -DC_BACKUP_TEST_DIR='"$(C_BACKUP_TEST_DIR)"'
+# Rewritten only when the directory changes, so the suites relink then and
+# not on every run.
+TEST_DIR_STAMP := $(BUILD)/test_dir.stamp
+
 # ---- Flags ------------------------------------------------------------
 WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wunused-parameter -Wunused-result -Wdouble-promotion \
@@ -238,11 +260,18 @@ FAULT_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
               -Wl,--wrap=sync_file_range,--wrap=mkstemp,--wrap=rename
 
 # Ensure release objects exist before linking tests
-$(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) | $(BINS)
-	$(CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
+$(TEST_DIR_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@[ "$$(cat $@ 2>/dev/null)" = '$(C_BACKUP_TEST_DIR)' ] || echo '$(C_BACKUP_TEST_DIR)' > $@
 
-$(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) | $(BINS)
-	$(CC) $(TEST_CFLAGS) $(FAULT_WRAP) $^ -o $@ $(TEST_LDFLAGS)
+.PHONY: FORCE
+FORCE:
+
+$(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(TEST_LDFLAGS)
+
+$(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(FAULT_WRAP) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(TEST_LDFLAGS)
 
 # The shell suite drives a real daemon over HTTP. The unit tests cover the
 # code behind the routes; nothing else covers the routes themselves, the auth
@@ -250,21 +279,25 @@ $(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/f
 # those only exist once a process is listening.
 .PHONY: test-api
 test-api: all
-	@./$(TESTS)/test_api_e2e.sh $(BINS)/c-backupd
+	@$(SCRATCH_GUARD) test_api_e2e.sh ./$(TESTS)/test_api_e2e.sh $(BINS)/c-backupd
 
 # The CLI holds no repository logic, so what is worth testing is that each
 # command reaches the right endpoint and that a missing daemon produces a
 # clear message rather than a crash or a hang.
 .PHONY: test-cli
 test-cli: all
-	@./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
+	@$(SCRATCH_GUARD) test_cli_e2e.sh ./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 
 # The shell suites each start a daemon and poll jobs on a wall-clock budget,
 # so anything running beside them under -j competes for CPU and disk and makes
 # them fail on timing rather than on behaviour. analyze is the worst offender
 # because cppcheck and -fanalyzer saturate every core. Chain all three.
+# The ui contract joins the chain too: every suite shares one scratch
+# directory, and the guard can only attribute its growth, and tell a
+# suite's leftovers from another's live files, when one runs at a time.
 test-api: analyze
 test-cli: test-api
+test-ui: test-cli
 
 # || exit 1, because without it a failing unit suite is invisible: cmocka
 # exits non-zero, the loop swallows it, make reports success, and every gate
@@ -284,14 +317,14 @@ test-cli: test-api
 .PHONY: test-ui
 test-ui: all
 	@if command -v node >/dev/null 2>&1 && [ -d ui/tests ]; then \
-	    echo "=== ui contract ==="; \
-	    (cd ui && npm test) || exit 1; \
+	    $(SCRATCH_GUARD) "ui contract" \
+	        sh -c 'cd ui && TMPDIR="$$C_BACKUP_TEST_DIR" npm test' || exit 1; \
 	else \
 	    echo "ui contract: skipped (no node)"; \
 	fi
 
 test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli test-ui
-	@for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t || exit 1; done
+	@for t in $(TEST_BINS) $(FAULT_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
 
 # ---- ASAN tests -------------------------------------------------------
 ASAN_OBJ_DIR := $(BUILD)/asan
@@ -301,12 +334,12 @@ ASAN_LIB_OBJS = $(patsubst %.c, $(ASAN_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
 ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
 ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(TEST_SRCS))
 
-$(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) | $(BINS)
-	$(CC) $(ASAN_TEST_CFLAGS) $^ -o $@ -static-libasan \
+$(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(ASAN_TEST_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ -static-libasan \
 	    $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm -lcmocka
 
 test-asan: asan $(ASAN_TEST_BINS)
-	@for t in $(ASAN_TEST_BINS); do echo "=== $$t ==="; $$t || exit 1; done
+	@for t in $(ASAN_TEST_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
 
 .PHONY: test-asan
 
@@ -364,8 +397,8 @@ $(FUZZ_OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(FUZZ_OBJ_DIR)
 $(FUZZ_OBJ_DIR)/fake_index.o: $(TESTS)/fake_index.c | $(FUZZ_OBJ_DIR)
 	$(FUZZ_CC) $(FUZZ_CFLAGS) -I $(TESTS) -c $< -o $@
 
-$(FUZZ_BIN_DIR)/%: $(TESTS)/fuzz/%.c $(FUZZ_LIB_OBJS) | $(FUZZ_BIN_DIR)
-	$(FUZZ_CC) $(FUZZ_CFLAGS) $^ -o $@ $(FUZZ_LDFLAGS)
+$(FUZZ_BIN_DIR)/%: $(TESTS)/fuzz/%.c $(FUZZ_LIB_OBJS) $(TEST_DIR_STAMP) | $(FUZZ_BIN_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(FUZZ_LDFLAGS)
 
 .PHONY: fuzz
 fuzz: $(MIGRATE_SRC) $(FUZZ_BINS)
@@ -389,7 +422,7 @@ fuzz-run: fuzz
 	    n=$$(basename $$t); \
 	    mkdir -p $(FUZZ_CORPUS)/$$n; \
 	    d=""; [ -f $(FUZZ_DICT)/$$n.dict ] && d="-dict=$(FUZZ_DICT)/$$n.dict"; \
-	    echo "=== $$n ($(FUZZ_TIME)s) ==="; \
+	    C_BACKUP_SCRATCH_LEFTOVERS=remove $(SCRATCH_GUARD) "$$n ($(FUZZ_TIME)s)" \
 	    $$t $(FUZZ_CORPUS)/$$n $$d -max_total_time=$(FUZZ_TIME) \
 	        -jobs=$(FUZZ_JOBS) -workers=$(FUZZ_JOBS) -timeout=25 \
 	        -rss_limit_mb=2048 -print_final_stats=1 -error_exitcode=77 || rc=1; \
@@ -457,7 +490,7 @@ fuzz-cov: $(MIGRATE_SRC)
 	@$(FUZZ_CC) $(FUZZCOV_CF) -c $(TESTS)/fake_index.c -o $(FUZZCOV_OBJ)/fake_index.o
 	@for t in $(FUZZ_SRCS); do \
 	    n=$$(basename $${t%.c}); \
-	    $(FUZZ_CC) $(FUZZCOV_CF) $$t $(FUZZCOV_OBJ)/*.o -o $(FUZZCOV_BIN)/$$n \
+	    $(FUZZ_CC) $(FUZZCOV_CF) $(TEST_DIR_DEF) $$t $(FUZZCOV_OBJ)/*.o -o $(FUZZCOV_BIN)/$$n \
 	        -fsanitize=fuzzer -fprofile-instr-generate -fcoverage-mapping \
 	        $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm || exit 1; \
 	done
@@ -498,8 +531,8 @@ fuzz-regress: fuzz
 	for t in $(FUZZ_BINS); do \
 	    n=$$(basename $$t); \
 	    if [ -d $(FUZZ_CORPUS)/$$n ]; then \
-	        echo "=== $$n (replay) ==="; \
-	        $$t -runs=0 -error_exitcode=77 $(FUZZ_CORPUS)/$$n || rc=1; \
+	        C_BACKUP_SCRATCH_LEFTOVERS=remove $(SCRATCH_GUARD) "$$n (replay)" \
+	            $$t -runs=0 -error_exitcode=77 $(FUZZ_CORPUS)/$$n || rc=1; \
 	    fi; \
 	done; \
 	exit $$rc
@@ -641,8 +674,8 @@ $(COV_DIR)/%.o: $(SRC)/%.c | $(COV_DIR)
 $(COV_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(COV_DIR)
 	$(CC) -std=c11 -O0 -g --coverage $(SRC_INCLUDES) -c $< -o $@
 
-$(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) | $(COV_DIR)
-	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS) -lcmocka
+$(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) $(TEST_DIR_STAMP) | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(COV_LDFLAGS) -lcmocka
 
 $(COV_DIR)/daemon_main.o: $(DAEMON_MAIN) | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) -c $< -o $@
@@ -658,8 +691,8 @@ $(COV_CLI): $(COV_DIR)/cli_main.o $(COV_LIB)
 
 # Shorter stem, so make prefers this over the rule above for the fault
 # suites - the same way the release build already resolves them.
-$(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(COV_LIB) | $(COV_DIR)
-	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS) $(FAULT_WRAP) -lcmocka
+$(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(COV_LIB) $(TEST_DIR_STAMP) | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(COV_LDFLAGS) $(FAULT_WRAP) -lcmocka
 
 # Two gates. The whole repository holds the 80% standard. src/store/ has a
 # ratchet of its own because it is the code that survives: the floor is what
@@ -697,13 +730,17 @@ COV_E2E_TIMEOUT  := 900
 # the hit counts on parity.c's SIMD loop grew past what gcovr will believe.
 coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI)
 	@find $(COV_DIR) -name '*.gcda' -delete
-	@for t in $(COV_TESTS) $(COV_FAULT_TESTS); do \
-	    timeout $(COV_TEST_TIMEOUT) $$t >/dev/null 2>&1 || echo "coverage: $$t failed or timed out"; \
-	done
-	@timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_api_e2e.sh $(COV_DAEMON) >/dev/null 2>&1 \
-	    || echo "coverage: test_api_e2e.sh failed or timed out"
-	@timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI) >/dev/null 2>&1 \
-	    || echo "coverage: test_cli_e2e.sh failed or timed out"
+	@over=0; \
+	run() { n=$$1; shift; \
+	    C_BACKUP_SCRATCH_QUIET=1 $(SCRATCH_GUARD) "$$n" "$$@"; rc=$$?; \
+	    [ $$rc -eq 99 ] && over=1; \
+	    [ $$rc -eq 0 ] || echo "coverage: $$n failed or timed out"; }; \
+	for t in $(COV_TESTS) $(COV_FAULT_TESTS); do \
+	    run $$(basename $$t) timeout $(COV_TEST_TIMEOUT) $$t; \
+	done; \
+	run test_api_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_api_e2e.sh $(COV_DAEMON); \
+	run test_cli_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI); \
+	if [ $$over -ne 0 ]; then echo "coverage: a suite went over its scratch budget" >&2; exit 1; fi
 	@gcovr -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="
 	@gcovr -r $(SRC) $(COV_DIR) --filter 'src/store/.*' \

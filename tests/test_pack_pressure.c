@@ -35,8 +35,9 @@
 #include "pack.h"
 #include "store.h"
 #include "util.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_test_pack_pressure"
+#define TEST_REPO TEST_TMP "/c_backup_test_pack_pressure"
 #define NOBJ 64
 
 static store_t *store;
@@ -414,7 +415,7 @@ static void test_pack_gc_with_no_refs(void **state)
 static void test_packed_object_streams(void **state)
 {
     (void)state;
-    char out[] = "/tmp/c_backup_pack_pressure_stream.XXXXXX";
+    char out[] = TEST_TMP "/c_backup_pack_pressure_stream.XXXXXX";
     int fd = mkstemp(out);
     assert_true(fd >= 0);
 

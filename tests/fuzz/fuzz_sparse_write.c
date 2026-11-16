@@ -42,8 +42,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../test_tmp.h"
 
-#define FUZZ_ROOT    "/tmp/c_backup_fuzz_sparse_write"
+#define FUZZ_ROOT    TEST_TMP "/c_backup_fuzz_sparse_write"
 #define MAX_ISLANDS  8
 #define ISLAND_BYTES 4096u
 
@@ -59,7 +60,7 @@ static const char *hole_dir(void)
     if (probed) return g_srcdir[0] ? g_srcdir : NULL;
     probed = 1;
 
-    const char *cands[] = { getenv("CBACKUP_FUZZ_SPARSE_DIR"), "build", "." };
+    const char *cands[] = { getenv("CBACKUP_FUZZ_SPARSE_DIR"), TEST_TMP, "build", "." };
     for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
         if (!cands[i]) continue;
         char probe[300];

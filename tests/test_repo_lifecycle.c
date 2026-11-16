@@ -28,9 +28,10 @@
 #include "store.h"
 #include "types.h"
 #include "lock.h"
+#include "test_tmp.h"
 
-#define TEST_DB   "/tmp/c_backup_test_lifecycle.db"
-#define TEST_ROOT "/tmp/c_backup_test_lifecycle"
+#define TEST_DB   TEST_TMP "/c_backup_test_lifecycle.db"
+#define TEST_ROOT TEST_TMP "/c_backup_test_lifecycle"
 
 extern const db_migration_t app_migrations[];
 

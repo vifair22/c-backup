@@ -26,8 +26,9 @@
 
 #include "auth.h"
 #include "login_throttle.h"
+#include "test_tmp.h"
 
-#define TEST_DB "/tmp/c_backup_test_auth.db"
+#define TEST_DB TEST_TMP "/c_backup_test_auth.db"
 
 extern const db_migration_t app_migrations[];
 

@@ -22,9 +22,10 @@
 #include "parity.h"
 #include "types.h"
 #include "repo_key.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_objsparse_repo"
-#define TEST_SRC  "/tmp/c_backup_objsparse_src"
+#define TEST_REPO TEST_TMP "/c_backup_objsparse_repo"
+#define TEST_SRC  TEST_TMP "/c_backup_objsparse_src"
 
 static store_t *store;
 
@@ -70,7 +71,7 @@ static const char *sparse_dir(void) {
     if (probed) return chosen[0] ? chosen : NULL;
     probed = 1;
 
-    const char *cands[] = { getenv("CBACKUP_TEST_SPARSE_DIR"), "build", "/tmp" };
+    const char *cands[] = { getenv("CBACKUP_TEST_SPARSE_DIR"), TEST_TMP, "build" };
     for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
         if (!cands[i]) continue;
         char probe[300];
@@ -239,7 +240,7 @@ static void test_sparse_all_hole(void **state) {
 
 static void test_sparse_empty_file(void **state) {
     (void)state;
-    const char *path = "/tmp/c_backup_objsparse_empty.bin";
+    const char *path = TEST_TMP "/c_backup_objsparse_empty.bin";
     int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0644);
     assert_true(fd >= 0);
 
@@ -469,7 +470,7 @@ static void test_sparse_encrypted_roundtrip(void **state) {
     free(got);
 
     /* The streaming reader is the one restore actually uses for sparse. */
-    const char *outp = "/tmp/c_backup_objsparse_enc.out";
+    const char *outp = TEST_TMP "/c_backup_objsparse_enc.out";
     int ofd = open(outp, O_CREAT | O_TRUNC | O_RDWR, 0644);
     assert_true(ofd >= 0);
     uint64_t sz = 0;

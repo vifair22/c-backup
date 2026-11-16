@@ -23,9 +23,10 @@
 #include "parity.h"
 #include "types.h"
 #include "repo_key.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_objstore_repo"
-#define TEST_SRC  "/tmp/c_backup_objstore_src"
+#define TEST_REPO TEST_TMP "/c_backup_objstore_repo"
+#define TEST_SRC  TEST_TMP "/c_backup_objstore_src"
 
 static store_t *store;
 

@@ -26,8 +26,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "../test_tmp.h"
 
-#define FUZZ_ROOT "/tmp/c_backup_fuzz_object"
+#define FUZZ_ROOT TEST_TMP "/c_backup_fuzz_object"
 
 static store_t *g_store;
 static repo_key_t g_key;
