@@ -843,6 +843,7 @@ typedef struct {
     uint32_t        max_files;
     int             reencrypt;   /* replicate into another repository's key */
     int64_t         dest_repo_id;   /* replicate: registered destination, or 0 */
+    int             allow_plaintext; /* reencrypt may drop encryption */
     uint32_t        max_hits_per_file;   /* 0: the grep default */
     uint64_t        max_hits;            /* 0: the grep default */
     snap_job_kind_t kind;
@@ -1291,9 +1292,15 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         char rid[32];
         if (vr.run_id > 0) snprintf(rid, sizeof(rid), "%lld", (long long)vr.run_id);
         else               snprintf(rid, sizeof(rid), "null");
-        char vj[544 + VERIFY_DROPPED_LIST_MAX * 80];
+        /* The counts too, so the job says what the run found without a
+         * second request, and in the same terms as the run record: ok
+         * excludes every failure, and `failed` states the verdict (NIT-17). */
+        char vj[768 + VERIFY_DROPPED_LIST_MAX * 80];
         int vn = snprintf(vj, sizeof(vj),
                  "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s,"
+                 "\"checked\":%llu,\"ok\":%llu,\"repaired\":%llu,"
+                 "\"recoverable\":%llu,\"unrecoverable\":%llu,\"missing\":%llu,"
+                 "\"failed\":%s,"
                  "\"unsettled_files\":%llu,"
                  "\"packs_unwalkable\":%llu,\"packs_restored\":%llu,"
                  "\"packs_salvaged\":%llu,\"unreferenced_dropped_bytes\":%llu,"
@@ -1301,6 +1308,10 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                  rid, lvl,
                  j->verify_repair ? "true" : "false",
                  j->dry_run ? "true" : "false",
+                 (unsigned long long)vr.checked, (unsigned long long)vr.ok,
+                 (unsigned long long)vr.repaired, (unsigned long long)vr.recoverable,
+                 (unsigned long long)vr.unrecoverable, (unsigned long long)vr.missing,
+                 vr.unrecoverable || vr.missing ? "true" : "false",
                  (unsigned long long)vr.unsettled_files,
                  (unsigned long long)vr.packs_unwalkable,
                  (unsigned long long)vr.packs_restored,
@@ -1328,7 +1339,9 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
          * (snap_job_submit), so the job manager holds it already. */
         if (st == OK) {
             replica_sink_t sink;
-            st = j->reencrypt ? replica_sink_local_open_reencrypt(j->dest, &m, &sink)
+            int to_plain = j->reencrypt && replica_reencrypt_drops_encryption(j->dest, &m);
+            st = j->reencrypt ? replica_sink_local_open_reencrypt(j->dest, &m,
+                                                                   j->allow_plaintext, &sink)
                               : replica_sink_local_open(j->dest, &m, &sink);
             if (st == OK) {
                 replicate_result_t rr;
@@ -1336,6 +1349,22 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                 st = replicate_run(store, j->db, j->repo_id, &sink, cancel,
                                    NULL, NULL, &rr);
                 sink.v->close(sink.ctx);
+                if (to_plain) {
+                    /*
+                     * Allowed, and on the record: the one place this
+                     * repository's data leaves its encryption. Recorded
+                     * whatever the outcome, since a run that failed part
+                     * way has still written what it committed.
+                     */
+                    char msg[PATH_MAX + 96];
+                    snprintf(msg, sizeof(msg),
+                             "replicated encrypted repo %lld into plaintext at %s%s",
+                             (long long)j->repo_id, j->dest,
+                             st == OK ? "" : " (the run did not complete)");
+                    log_warn("replicate: %s", msg);
+                    journal_record(j->db, j->repo_id, "replicate", "plaintext-copy",
+                                   "warning", 0, msg);
+                }
                 /* A cancelled run keeps what it committed, so its counts
                  * are true either way. */
                 replicate_report(progress_ctx, &rr, j->reencrypt);
@@ -1435,6 +1464,22 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
     return st;
 }
 
+/*
+ * A boolean query parameter: 1/true or 0/false, or absent, which leaves
+ * *out holding the caller's default. Anything else is -1 for a 400. These
+ * parameters are safety switches (dry_run, repair=0, force), and reading an
+ * unrecognised value as the default turned a typo into the destructive
+ * choice.
+ */
+static int query_bool(const api_request_t *req, const char *name, int *out)
+{
+    const char *v = api_query_param(req, name);
+    if (!v) return 0;
+    if (strcmp(v, "1") == 0 || strcmp(v, "true") == 0)  { *out = 1; return 0; }
+    if (strcmp(v, "0") == 0 || strcmp(v, "false") == 0) { *out = 0; return 0; }
+    return -1;
+}
+
 static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
                                       const api_request_t *req,
                                       snap_job_kind_t kind)
@@ -1462,9 +1507,14 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
     j->repo_path = repo_path;
     j->kind = kind;
 
-    {
-        const char *dry = api_query_param(req, "dry_run");
-        j->dry_run = dry && (strcmp(dry, "1") == 0 || strcmp(dry, "true") == 0);
+    /*
+     * dry_run is the safety catch, so anything but a recognised value is
+     * refused: "dry_run=yes" or "dry_run=" used to read as off and ran the
+     * real gc or retention pass, deleting what the caller meant to preview.
+     */
+    if (query_bool(req, "dry_run", &j->dry_run) != 0) {
+        snap_job_free(j);
+        return api_error(400, "dry_run must be 1, true, 0 or false");
     }
 
     /*
@@ -1482,9 +1532,12 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "level must be index, structure or deep");
         }
-        const char *rep = api_query_param(req, "repair");
-        if (rep && (strcmp(rep, "0") == 0 || strcmp(rep, "false") == 0))
-            j->verify_repair = 0;
+        /* "repair=no" used to mean repair on: a check the caller asked not
+         * to write, writing. */
+        if (query_bool(req, "repair", &j->verify_repair) != 0) {
+            snap_job_free(j);
+            return api_error(400, "repair must be 1, true, 0 or false");
+        }
         /* A dry run is a check that must not write, whatever else was
          * asked for. */
         if (j->dry_run) j->verify_repair = 0;
@@ -1584,10 +1637,41 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, je.msg);
         }
         j->reencrypt = reenc ? 1 : 0;
+        /*
+         * Dropping encryption has to be asked for by name. "reencrypt" into
+         * a path that happens to hold an unencrypted repository wrote the
+         * whole repository out in plaintext, and nothing in the request
+         * said that was the intent.
+         */
+        bool plain = false;
+        if (jreq_bool(body, "allow_plaintext", &plain, &je) == JREQ_BAD) {
+            snap_job_free(j);
+            return api_error(400, je.msg);
+        }
+        if (plain && !j->reencrypt) {
+            snap_job_free(j);
+            return api_error(400, "allow_plaintext applies only with reencrypt: a "
+                                  "plain replica keeps the source's encryption");
+        }
+        j->allow_plaintext = plain ? 1 : 0;
         char why[PATH_MAX + 128];
         if (routes_replicate_dest_check(repo_id, j->dest, why, sizeof(why)) != 0) {
             snap_job_free(j);
             return api_error(400, why);
+        }
+        if (j->reencrypt && !j->allow_plaintext) {
+            repo_marker_t sm;
+            if (repo_marker_read(j->repo_path, &sm) == OK) {
+                if (replica_reencrypt_drops_encryption(j->dest, &sm)) {
+                    char msg[PATH_MAX + 256];
+                    snprintf(msg, sizeof(msg), REPLICA_PLAINTEXT_REFUSAL, j->dest);
+                    snap_job_free(j);
+                    return api_error(400, msg);
+                }
+            } else {
+                /* The job reads it again and fails with the reason. */
+                err_clear();
+            }
         }
     }
 
@@ -2027,12 +2111,8 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
                                       int64_t snap_id)
 {
     int force = 0;
-    const char *fv = api_query_param(req, "force");
-    if (fv) {
-        if (strcmp(fv, "1") == 0 || strcmp(fv, "true") == 0) force = 1;
-        else if (strcmp(fv, "0") == 0 || strcmp(fv, "false") == 0) force = 0;
-        else return api_error(400, "force must be 1 or 0");
-    }
+    if (query_bool(req, "force", &force) != 0)
+        return api_error(400, "force must be 1 or 0");
 
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
@@ -2213,6 +2293,21 @@ status_t routes_submit_startup_reindex(job_manager_t *jm, int64_t repo_id,
     j->kind = SNAP_JOB_REINDEX;
     return snap_job_submit_as(jm ? jm : g_ctx.jm, repo_id, j, "reindex", 0, 1,
                               out_job_id);
+}
+
+status_t routes_submit_reindex(int64_t repo_id, const char *origin, int64_t *out_job_id)
+{
+    if (!g_ctx.jm) return set_error(ERR_INVALID, "no job manager to queue a reindex on");
+    char *repo_path = repo_path_for(g_ctx.db, repo_id);
+    if (!repo_path) return set_error(ERR_NOT_FOUND, "no such repo");
+    snap_job_t *j = calloc(1, sizeof(*j));
+    if (!j) { free(repo_path); return set_error(ERR_NOMEM, "reindex job: alloc"); }
+    j->db = g_ctx.db;
+    j->repo_id = repo_id;
+    j->repo_path = repo_path;
+    j->kind = SNAP_JOB_REINDEX;
+    return job_submit_origin(g_ctx.jm, repo_id, snap_job_lock(j), "reindex", origin,
+                             snap_job_run, j, snap_job_free, out_job_id);
 }
 
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)

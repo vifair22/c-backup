@@ -473,16 +473,24 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
  *
  * A passphrase alongside a mode that cannot use it is refused rather than
  * ignored, for the same reason: ignoring it is how the first bug happened.
- * An empty passphrase counts as absent, so a client that always sends the
- * field does not trip over it.
  */
 status_t repo_enc_resolve(const char *mode, const char *passphrase,
                           repo_enc_mode_t *out)
 {
-    int has_pass = passphrase && *passphrase;
+    /*
+     * Given means given. An empty passphrase used to count as absent and an
+     * empty mode as "not given", so "encrypt":"" or "passphrase":"" made an
+     * unencrypted repository and answered 201: the same silent downgrade as
+     * the CLI's missing --encrypt value (B127), one layer down. A client
+     * that has nothing to say leaves the field out.
+     */
+    if (passphrase && !*passphrase)
+        return set_error(ERR_INVALID, "passphrase must not be empty; leave it out "
+                                      "for a repository without one");
+    int has_pass = passphrase != NULL;
     repo_enc_mode_t m = REPO_ENC_NONE;
 
-    if (!mode || !*mode) {
+    if (!mode) {
         *out = has_pass ? REPO_ENC_PASSPHRASE : REPO_ENC_NONE;
         return OK;
     }
@@ -965,9 +973,12 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
      * mode an existing repository does not have used to be accepted, and
      * the route then recorded the requested mode against a repository whose
      * objects were written otherwise - a plaintext repository listed as
-     * encrypted is the worst way round for that to be wrong.
+     * encrypted is the worst way round for that to be wrong. An explicit
+     * "none" is a mode too: re-registering an encrypted repository while
+     * saying it is unencrypted is refused, not read as "not asked".
      */
-    if (enc && enc->mode != REPO_ENC_NONE && enc->mode != marker.enc_mode)
+    if (enc && (enc->mode != REPO_ENC_NONE || enc->mode_given) &&
+        enc->mode != marker.enc_mode)
         return set_error(ERR_INVALID,
                          "%s is already a repository with encryption %s; "
                          "encryption is decided when a repository is created",

@@ -167,3 +167,19 @@ extern const char *volatile fault_read_hook_path;
 extern void (*volatile fault_read_hook)(const char *path);
 extern ssize_t __real_read(int, void *, size_t);
 extern ssize_t __real_pread(int, void *, size_t, off_t);
+
+/*
+ * A kernel or container without openat2: while fault_openat2_errno is
+ * non-zero, syscall(SYS_openat2, ...) fails with that errno (ENOSYS for a
+ * kernel before 5.6, EPERM for a seccomp profile that predates it, as
+ * Docker's older defaults do) and is counted in fault_openat2_refused.
+ * Every other syscall() passes through. This is how the suites reach the
+ * per-component fallback in backup and restore without a switch in the
+ * production code. Note both modules remember that openat2 is missing for
+ * the life of the process, so a test that needs each errno runs each in
+ * its own child. 0 disables it. Process-wide.
+ */
+extern volatile int fault_openat2_errno;
+extern volatile int fault_openat2_refused;
+extern long __real_syscall(long number, ...);
+long __wrap_syscall(long number, ...);

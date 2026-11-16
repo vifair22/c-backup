@@ -257,6 +257,9 @@ int auth_validate_token(cutils_db_t *db, const char *token)
     /* Strip "Bearer " prefix if present */
     const char *tok = token;
     if (strncmp(tok, "Bearer ", 7) == 0) tok += 7;
+    /* "Bearer " alone names no token; never look one up by the empty
+     * string. */
+    if (!tok[0]) return 0;
 
     /* Look up kind so we can decide whether to slide the expiry.
      * revoked_at IS NULL filters out soft-deleted rows. */
