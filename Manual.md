@@ -785,9 +785,21 @@ everything that was asked for.
 
 ### 6.4 Concurrency
 
-Jobs for one repository run one at a time: the dispatcher never starts a
-second job for a repository that has one running, and queues it instead. Jobs
-for different repositories run in parallel, up to `jobs.max_parallel`.
+Jobs for one repository run one at a time, in the order they were submitted:
+the dispatcher never starts a second job for a repository that has one
+running, and queues it instead. Jobs for different repositories run in
+parallel, up to `jobs.max_parallel`.
+
+A few requests act on a repository directly rather than as a job: deleting a
+snapshot and removing a repository. They hold the repository for the
+milliseconds they take, and one that finds a job running against it is
+refused (`503 repo is busy` for a snapshot delete, `409` for a removal). The
+reverse never fails a job: a job whose turn comes while such a request holds
+its repository stays `queued`, shows the phase `waiting for repository`, and
+starts as soon as the request is done, retried within at most half a second.
+It holds no worker while it waits, and it can be cancelled like any queued
+job. So deleting snapshots by hand while a scheduled backup is due costs the
+backup nothing more than the wait.
 
 Metadata writes (tags, notes, policy, sources) during a running backup wait
 briefly for the database rather than failing. A backup holds the database's
@@ -1482,7 +1494,9 @@ doing it holds both keys, and so must the host the destination is used on.
 Refused when the destination is not a repository, is a replica of the source
 (replicate without `--reencrypt`), or is encrypted and its key is not on this
 host. If the destination is registered here, its write lock is held for the
-run, and `reindex` it afterwards so its index sees the new snapshots. Run it
+run alongside the source's: the job starts only once both repositories are
+free, waiting its turn on each like any queued job (section 6.4), and jobs
+queued on the destination after it wait behind it. `reindex` it afterwards so its index sees the new snapshots. Run it
 again after more backups and only the new snapshots are sent.
 
 The job's `result` says what moved: `snapshots_sent`, `snapshots_skipped`
