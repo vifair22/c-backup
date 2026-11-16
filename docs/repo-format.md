@@ -830,6 +830,17 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
    cannot see each other's packs in `tmp/`. Writers do not see each other's
    unsealed entries either, so a chunk two of them stage at the same moment
    is stored twice; readers take the first and gc counts the other dead.
+   Many small files at once. Files of at most 1 MiB the cache cannot
+   vouch for are collected into batches of up to 256 files or 4 MiB and
+   read, chunked and prepared (name, probe, LZ4, encryption, CRC, parity)
+   by up to four small-file workers (`src/ops/small_files.c`). The backup
+   thread takes the batches back in submission order and appends their
+   objects, writes their rows and cache entries, so packs, rows and the
+   cache stay on one thread and the objects reach the pack in file order,
+   as when it stored them itself. Batches in flight are capped at twice
+   the workers and hold their bytes of the read budget, at most half of
+   it. Used when there are at least two batches' worth of small files and
+   more than one worker.
 5. Index rows. A pack's commit creates the object row of every entry that
    has none (`db_pack_commit` upserts with the entry's type), in the same
    transaction as the pack's own rows, so no writer races its own seal: a

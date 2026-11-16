@@ -8,7 +8,7 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ## 2026-11-16 - Many small files: state.db settings, restore batches, one LZ4 pass
 
-Three of the proposals in the profile below, built (`perf/many-small-fixes`):
+Three of the proposals in the profile two entries below, built (`perf/many-small-fixes`):
 
 - **state.db settings** (src/common/state_db.c): `synchronous=NORMAL`,
   `cache_size` 64 MiB and `wal_autocheckpoint` 16,384 pages on the daemon's
@@ -24,6 +24,11 @@ Three of the proposals in the profile below, built (`perf/many-small-fixes`):
   `make_parents` skips a file whose parent it made last (per restore).
 - **One LZ4 pass** for an object no larger than the 64 KiB probe: the
   probe's output is the result.
+
+The numbers below were measured before the small-file workers (next entry)
+merged; the two changes are independent (database and restore against the
+backup thread's read and hash), and their combined effect is not yet
+measured.
 
 The statement cache (proposal 1) is not in this: it is going into c-utils
 1.7.0 separately, and these numbers are against c-utils 1.6.0.
@@ -74,6 +79,46 @@ incremental: index-nodes 1.23 s, cache-lookup 0.96, txn-commit 0.76, scan
 first backup, 3.6 s under the shim), which is the c-utils statement cache's
 to remove; the profile entry's prototype of both together measured 4.9 s
 first and 2.3 s incremental on NVMe.
+
+## 2026-11-16 - Small files on workers (many-small profile, proposal 5)
+
+Small files were stored one at a time on the backup thread: open, read,
+SHA-256, the LZ4 probe and compression, parity, then the pack append and
+the rows. Files of at most 1 MiB the cache cannot vouch for now go to up to
+four workers in batches of 256 files or 4 MiB (`src/ops/small_files.c`),
+which read, chunk and prepare them; the backup thread appends their objects
+in file order and writes the rows and cache entries, as before.
+
+`feat/v3-cdc` at 4269bc1 plus this change, c-utils v1.6.0 (the pinned
+version: no statement cache, no pragmas), `bench_phases -n 100000 -l 0 -t 0
+-R` (100,000 files of 2-6 KiB), `-w 1` (serial, as before) against `-w 0`
+(automatic: 21 chunk workers on this machine, 4 small-file workers),
+alternating, three pairs each, in `bench.slice`. NVMe is `~/.cache` with
+`-c` (source evicted, trailing sync timed); tmpfs is `/dev/shm`, warm.
+
+| First backup | `-w 1` | `-w 0` | Change |
+|---|---|---|---:|
+| tmpfs | 7.99 / 8.04 / 8.10 s | 6.13 / 6.31 / 6.12 s | -24% |
+| NVMe, cold | 17.60 / 18.26 / 17.00 s | 10.57 / 11.93 / 10.58 s | -38% |
+
+The read+hash+write row on the backup thread, which is now the append
+alone, falls from 2.5 s to 0.93 s on tmpfs and from 7.1 s to 1.3 s on NVMe;
+the workers are busy 1.8 s together on tmpfs (5.8 s on NVMe, where they
+wait on the disk in parallel instead of the backup thread waiting in
+series) and the backup thread waits for them for 0.0-0.1 s in all. What is
+left on the backup thread is the database: pack-seal 1.3 s, index-nodes
+1.2 s, index-put 1.0 s, cache-put 0.7 s, cache-lookup 0.35 s on tmpfs,
+which the statement cache and pragmas (proposals 1 and 2) address.
+
+Two things tried and not kept:
+
+- Asking the index whether an object exists on the workers rather than in
+  the append, to take that statement off the backup thread: every worker
+  then queued on the one database handle's mutex behind the backup
+  thread's own statements, the backup thread's statements slowed by about
+  70%, and the first backup went from 6.2 to 6.9 s.
+- One small-file worker per chunk worker (21 here): no faster than four,
+  since the backup thread is the limit; four it is (`SMALL_POOL_MAX`).
 
 ## 2026-11-16 - Where a many-small-files backup goes (format 3, profile)
 
