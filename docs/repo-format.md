@@ -866,7 +866,6 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
    and seals its own packs. Pack numbers come from one allocator on the
    store handle (`store_alloc_pack_num`), since writers staging at once
    cannot see each other's packs in `tmp/`. Writers do not see each other's
-<<<<<<< HEAD
    unsealed entries either, so they share a claim set (`pack_claims_t`,
    OWN-46): a writer claims a name before writing it, a writer that finds
    it claimed references it without writing it, and the claims clear when
@@ -875,9 +874,6 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
    reference may have been made on its strength. Without it, identical
    files on two workers were stored once each: 22 names twice and twice the
    payload on the twins fixture in `test_cdc_backup`.
-=======
-   unsealed entries either, so a chunk two of them stage at the same moment
-   is stored twice; readers take the first and gc counts the other dead.
    Many small files at once. Files of at most 1 MiB the cache cannot
    vouch for are collected into batches of up to 256 files or 4 MiB and
    read, chunked and prepared (name, probe, LZ4, encryption, CRC, parity)
@@ -889,7 +885,6 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
    the workers and hold their bytes of the read budget, at most half of
    it. Used when there are at least two batches' worth of small files and
    more than one worker.
->>>>>>> origin/v3
 5. Index rows. A pack's commit creates the object row of every entry that
    has none (`db_pack_commit` upserts with the entry's type), in the same
    transaction as the pack's own rows, so no writer races its own seal: a
