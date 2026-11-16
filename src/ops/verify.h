@@ -67,6 +67,9 @@ typedef struct {
      * walk), and the bytes no row covers dropped. Those are unreferenced,
      * garbage gc had swept; their ranges in the old pack are listed. */
     uint64_t packs_salvaged;
+    /* Of packs_unwalkable, those only the key can unblock: the repository
+     * is encrypted, its key is not loaded, and salvage decrypts. */
+    uint64_t packs_need_key;
     uint64_t unreferenced_dropped_bytes;
     uint64_t unreferenced_dropped_ranges;
     uint32_t dropped_listed;

@@ -1334,7 +1334,10 @@ entry is checked the way a deep verify checks it - decrypted, so AEAD
 authenticates its type and name, or decompressed and hashed against its
 name - nothing corrected, and kept clean or carried as lost accordingly.
 That costs a read of the pack's live payloads. An encrypted repository needs
-its key loaded for it; without one the pack stays reported as unwalkable.
+its key loaded for it; without one the pack stays reported as unwalkable, and
+the finding (`unwalkable pack: salvage needs the repository key`), the
+verify error and the gc error all say so and give the step: `repo key
+import` (or `repo add --passphrase`), then verify again.
 A pack overwritten wholesale therefore ends as what it is: every object in
 it `unrecoverable`, with its files, and no pack left that nothing can walk.
 Checking every pack's headers costs index and structure verifies a read of

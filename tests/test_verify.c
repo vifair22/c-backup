@@ -1371,6 +1371,38 @@ static void test_salvage_without_a_trailer_verifies_by_name(void **state)
     assert_int_equal(gr.packs_unwalkable, 1);
     assert_non_null(strstr(gr.unwalkable[0].reason, "no usable trailer"));
 
+    /*
+     * Encrypted with its key not loaded, salvage cannot decrypt to check
+     * anything, and says what unblocks it - the key, and how to load it -
+     * rather than leaving an operator to read the finding as loss.
+     */
+    store_set_encrypted(store, 1);
+    {
+        verify_result_t kv;
+        memset(&kv, 0, sizeof(kv));
+        err_clear();
+        assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_STRUCTURE, 1, NULL, NULL,
+                                    NULL, &kv), ERR_CORRUPT);
+        assert_non_null(strstr(err_msg(), "salvage needs the repository key"));
+        assert_non_null(strstr(err_msg(), "c-backup repo key import"));
+        assert_non_null(strstr(err_msg(), "--passphrase"));
+        assert_non_null(strstr(err_msg(), "then verify again"));
+        err_clear();
+        assert_int_equal(kv.packs_unwalkable, 1);
+        assert_int_equal(kv.packs_need_key, 1);
+        assert_int_equal(kv.packs_salvaged, 0);
+        char ps[32];
+        snprintf(ps, sizeof(ps), "pack-%010u", pnum);
+        assert_int_equal(verify_finding_count(ps, "unwalkable pack: salvage needs the "
+                                                  "repository key"), 1);
+        gc_result_t kg;
+        memset(&kg, 0, sizeof(kg));
+        assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &kg), ERR_CORRUPT);
+        assert_non_null(strstr(err_msg(), "salvage needs the repository key"));
+        err_clear();
+    }
+    store_set_encrypted(store, 0);
+
     verify_result_t vr;
     memset(&vr, 0, sizeof(vr));
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1, NULL, NULL, NULL, &vr),

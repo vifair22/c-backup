@@ -5,6 +5,7 @@
 #include "object.h"
 #include "pack.h"
 #include "parity.h"
+#include "repo.h"
 
 #include <cutils/log.h>
 
@@ -399,9 +400,21 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
             err_clear();
             db_result_free(r);
         }
-        log_error("verify: %s.dat cannot be walked (%s); gc leaves it as it is", name, why);
+        /* The one case a repair cannot get past on its own: an encrypted
+         * pack with no trailer is salvaged by decrypting its objects, and
+         * the key is not here. Say what unblocks it. */
+        int needs_key = store_needs_key(store);
+        if (needs_key) {
+            res->packs_need_key++;
+            log_error("verify: %s.dat cannot be walked (%s); " REPO_SALVAGE_NEEDS_KEY,
+                      name, why);
+        } else {
+            log_error("verify: %s.dat cannot be walked (%s); gc leaves it as it is", name, why);
+        }
         res->packs_unwalkable++;
-        record_finding(db, repo_id, res->run_id, name, "unwalkable pack");
+        record_finding(db, repo_id, res->run_id, name,
+                       needs_key ? "unwalkable pack: salvage needs the repository key"
+                                 : "unwalkable pack");
     }
     db_result_free(packs);
     return OK;
@@ -699,6 +712,13 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * The walk itself did finish, so the record stays completed = 1 and the
      * metrics that read completed runs still see the damage.
      */
+    /* First, because it is the one thing standing between the operator
+     * and a salvage, and any objects counted lost below may be in it. */
+    if (res.packs_unwalkable && res.packs_need_key)
+        return set_error(ERR_CORRUPT,
+                         "verify run %lld found %llu pack(s) that cannot be walked; "
+                         REPO_SALVAGE_NEEDS_KEY,
+                         (long long)res.run_id, (unsigned long long)res.packs_unwalkable);
     if (res.unrecoverable || res.missing)
         return set_error(ERR_CORRUPT,
                          "verify run %lld found data loss: %llu unrecoverable and "

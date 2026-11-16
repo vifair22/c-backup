@@ -7,6 +7,7 @@
 #include "manifest.h"
 #include "object.h"
 #include "pack.h"
+#include "repo.h"
 #include "db_txn.h"
 
 #include <cutils/log.h>
@@ -285,6 +286,10 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* A pack left whole because its headers cannot be walked holds space gc
      * could not reclaim and, worse, damage nobody would otherwise hear
      * about until a restore: the job fails and says which, as for damage. */
+    if (res.packs_unwalkable > 0 && store_needs_key(store))
+        return set_error(ERR_CORRUPT, "gc: %u pack(s) could not be walked (first: "
+                         "pack-%010u.dat); " REPO_SALVAGE_NEEDS_KEY,
+                         res.packs_unwalkable, res.unwalkable[0].pack);
     if (res.packs_unwalkable > 0)
         return set_error(ERR_CORRUPT, "gc: %u pack(s) could not be walked and were left "
                          "as they are (first: pack-%010u.dat, %s); run verify with repair",
