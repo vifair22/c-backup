@@ -262,6 +262,26 @@ ui-e2e:
       # these are the pictures a review looks at.
       - ui/test-results/
 
+# Real-size pack rollover (B134): files of 300 MB, 600 MB and 2 GiB stored at
+# the production seal. About 2.5 GiB of scratch, so it runs nightly rather
+# than on every MR; make test covers the same logic at an 8 MiB test seal.
+# The scratch directory is the job's own and is removed whatever happens.
+nightly-rollover:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  stage: test
+  image: debian:trixie
+  tags: [docker]
+  timeout: 90m
+  before_script:
+    - *debian_deps
+    - *fetch_cutils
+  script:
+    - mkdir -p "$C_BACKUP_TEST_DIR"
+    - make test-rollover-full
+  after_script:
+    - rm -rf "$C_BACKUP_TEST_DIR"
+
 coverage:
   rules:
     # Gate jobs: every MR and branch pipeline, never the nightly schedule.
