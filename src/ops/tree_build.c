@@ -216,8 +216,15 @@ static void children_free(children_t *c)
 
 #define NO_BUCKET UINT32_MAX
 
+/* Entry i is to be left out of every tree (tree_build_ops_t.skipped). */
+static int is_skipped(const tree_build_ops_t *ops, uint32_t i)
+{
+    if (!ops || !ops->skipped) return 0;
+    return *(const int *)((const uint8_t *)ops->skipped + (size_t)i * ops->stride) != 0;
+}
+
 static status_t children_build(const scan_result_t *scan, const idmap_t *map,
-                               children_t *c)
+                               const tree_build_ops_t *ops, children_t *c)
 {
     uint32_t count = scan->count;
     memset(c, 0, sizeof(*c));
@@ -233,7 +240,7 @@ static status_t children_build(const scan_result_t *scan, const idmap_t *map,
     for (uint32_t i = 0; i < count; i++) {
         uint64_t parent = scan->entries[i].parent_node_id;
         uint32_t b = parent == 0 ? count : idmap_get(map, parent);
-        bucket[i] = b == UINT32_MAX ? NO_BUCKET : b;
+        bucket[i] = (b == UINT32_MAX || is_skipped(ops, i)) ? NO_BUCKET : b;
         if (bucket[i] != NO_BUCKET) c->off[bucket[i] + 1]++;
     }
     for (uint32_t b = 0; b <= count; b++) {
@@ -330,7 +337,7 @@ status_t tree_build(const scan_result_t *scan, const tree_build_ops_t *ops,
     uint32_t *depth = NULL;
     children_t c = { NULL, NULL, 0 };
     status_t st = compute_depths(scan, &map, &depth);
-    if (st == OK) st = children_build(scan, &map, &c);
+    if (st == OK) st = children_build(scan, &map, ops, &c);
     idmap_free(&map);
 
     uint32_t *dirs = NULL;

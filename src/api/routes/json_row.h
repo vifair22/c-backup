@@ -163,4 +163,21 @@ int jquery_number(const char *text, double *out);
 int jquery_i64(const char *text, const char *name, int64_t min, int64_t max,
                int64_t *out, jreq_err_t *err);
 
+/*
+ * Parse a request body, refusing what the parser would let through
+ * silently. JREQ_OK with *out set (free it with json_req_free), or JREQ_BAD
+ * with err->msg holding the refusal:
+ *
+ *  - a string holding a NUL, escaped as \u0000 or raw. cJSON decodes it
+ *    into a C string, which ends there: a label "nul\u0000here" was stored
+ *    as "nul" with a 202, and a path would name a different file from the
+ *    one sent (B115). Nothing in this API can hold a NUL, so the request
+ *    is refused naming the field; a label gets the label rule's words,
+ *    since NUL is a control character like the ones it already refuses.
+ *  - malformed JSON: "invalid JSON", in the same words on every route, and
+ *    for a repeated member name "invalid JSON: duplicate key '<name>' ...".
+ */
+int jreq_parse_body(const char *body, size_t len, cutils_json_req_t **out,
+                    jreq_err_t *err);
+
 #endif

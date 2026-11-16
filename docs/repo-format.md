@@ -621,6 +621,16 @@ that entry.
 
 `OBJECT_TYPE_SPARSE` (4) is retired in format 3. Its number is not reused.
 
+**Every file entry has content.** A regular-file entry always names a
+`FILE` object or a `CHUNKLIST` with `FILE` leaves, an empty file included
+(an empty `FILE` object), so its hash is never all zeroes. The tree writer
+refuses an entry that breaks that, on both paths (`manifest_serialise` and
+`manifest_store_tree`), and a backup leaves a file it could not read out of
+the tree instead (B118). Verify reports a file entry whose hash names
+nothing, or names an object of another type, as `missing: file entry has no
+content`; restore fails such an entry by name. Symlinks, device nodes,
+FIFOs and sockets have no content object and carry a zero hash by design.
+
 ### Holes
 
 Holes are gaps in a chunk list. The file is walked with `SEEK_DATA` and

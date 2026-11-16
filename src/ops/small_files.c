@@ -5,6 +5,7 @@
 #include "chunklist.h"
 #include "phase_timer.h"
 #include "read_budget.h"
+#include "settle.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -49,13 +50,14 @@ small_batch_t *small_batch_new(void)
 }
 
 int small_batch_add(small_batch_t *b, uint32_t index, const char *path,
-                    uint64_t size)
+                    uint64_t size, const struct stat *scan_st)
 {
     small_file_t *f = &b->files[b->n++];
     memset(f, 0, sizeof(*f));
     f->index = index;
     f->path = path;
     f->size = size;
+    f->scan_st = scan_st;
     b->bytes += size;
     return b->n >= b->cap || b->bytes >= SMALL_BATCH_BYTES;
 }
@@ -125,22 +127,23 @@ static int pool_cancelled(void *ctx)
     return (pool->cancel && atomic_load(pool->cancel)) || store_cancelled(pool->store);
 }
 
+/* A discarded read's prepared objects: nothing was appended yet, so they
+ * are simply dropped before the file is read again. */
+static void discard_objs(void *ctx)
+{
+    file_free_objs((small_file_t *)ctx);
+}
+
 static void store_one(small_pool_t *pool, small_file_t *f)
 {
     f->ran = 1;
-    int fd = open(f->path, O_RDONLY);
+    /* O_NONBLOCK so a FIFO put where the file was cannot hang the worker;
+     * settle_store_fd refuses anything that is not a regular file. */
+    int fd = open(f->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd == -1) {
         f->skipped = 1;
-        snprintf(f->err, sizeof(f->err), "cannot open %s, skipping", f->path);
-        return;
-    }
-    /* Replaced by something else since the scan; see the serial path. */
-    struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-        close(fd);
-        f->skipped = 1;
-        snprintf(f->err, sizeof(f->err), "%s is no longer a regular file, skipping",
-                 f->path);
+        snprintf(f->err, sizeof(f->err), "cannot open: %s",
+                 errno == ENOENT ? "it no longer exists" : strerror(errno));
         return;
     }
     keep_ctx_t k = { pool->store, f };
@@ -153,13 +156,22 @@ static void store_one(small_pool_t *pool, small_file_t *f)
      * a second acquisition per chunk would be nested. */
     o.unbudgeted = 1;
     cdc_result_t r;
+    settle_result_t sr;
     err_clear();
-    f->st = cdc_store_fd(pool->cp, fd, f->size, &sink, &o, &r);
+    f->st = settle_store_fd(pool->cp, fd, f->scan_st, &sink, &o,
+                            discard_objs, f, &r, &sr);
     close(fd);
-    if (f->st == OK) memcpy(f->hash, r.hash, OBJECT_HASH_SIZE);
-    else {
+    if (f->st != OK) {
         snprintf(f->err, sizeof(f->err), "%s", err_msg());
         file_free_objs(f);
+    } else if (sr.outcome == SETTLE_SKIP) {
+        f->skipped = 1;
+        snprintf(f->err, sizeof(f->err), "%s", sr.reason);
+        file_free_objs(f);
+    } else {
+        memcpy(f->hash, r.hash, OBJECT_HASH_SIZE);
+        f->st_read = sr.st;
+        f->changed = sr.changed;
     }
 }
 

@@ -91,7 +91,16 @@ struct job_manager {
      * lock keeps them from interleaving mid-transaction with a job's own
      * writes. */
     pthread_mutex_t db_mu;
+    /* Whether a failure alert goes anywhere: Pushover has a token and a
+     * user (job_manager_set_alerts). push_send accepts and drops a message
+     * when it has not, so this is only what the log line may claim. */
+    atomic_int      alerts;
 };
+
+void job_manager_set_alerts(job_manager_t *jm, int enabled)
+{
+    if (jm) atomic_store(&jm->alerts, enabled ? 1 : 0);
+}
 
 /*
  * One journal entry for a job that ended.
@@ -109,7 +118,7 @@ static void journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
         journal_record(db, repo_id, "api", action, outcome, took_ms, message);
         return;
     }
-    char msg[640];
+    char msg[ERR_MSG_MAX + 64];
     snprintf(msg, sizeof(msg), "schedule %lld%s%s", (long long)schedule_id,
              message && *message ? ": " : "", message ? message : "");
     journal_record(db, repo_id, "schedule", action, outcome, took_ms, msg);
@@ -153,9 +162,11 @@ static void journal_interrupted(cutils_db_t *db)
  * and the label goes in the title as well so that it survives into that log
  * line.
  */
-void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
-                       const char *action, const char *detail,
-                       char *title, size_t title_sz, char *body, size_t body_sz)
+/* A failure ("failed") or a success that carries a warning ("completed
+ * with a warning"): the same repository naming either way. */
+static void alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
+                          const char *action, const char *detail, int warning,
+                          char *title, size_t title_sz, char *body, size_t body_sz)
 {
     char idbuf[24];
     snprintf(idbuf, sizeof(idbuf), "%lld", (long long)repo_id);
@@ -176,20 +187,38 @@ void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
 
     /* c-utils returns NULL columns as "", so an unlabelled repository and a
      * removed one both arrive as an empty label. */
+    const char *ended = warning ? "completed with a warning" : "failed";
+
     if (label[0])
-        snprintf(title, title_sz, "c-backup: %s of %s failed", what, label);
+        snprintf(title, title_sz, "c-backup: %s of %s %s", what, label, ended);
     else
-        snprintf(title, title_sz, "c-backup: %s of repo %lld failed", what,
-                 (long long)repo_id);
+        snprintf(title, title_sz, "c-backup: %s of repo %lld %s", what,
+                 (long long)repo_id, ended);
 
     if (path[0])
-        snprintf(body, body_sz, "Repository %s (id %lld) at %s\nJob %lld (%s) failed: %s",
+        snprintf(body, body_sz, "Repository %s (id %lld) at %s\nJob %lld (%s) %s: %.900s",
                  label[0] ? label : "(no label)", (long long)repo_id, path,
-                 (long long)job_id, what, why);
+                 (long long)job_id, what, ended, why);
     else
         snprintf(body, body_sz, "Repository %lld (no longer registered)\n"
-                 "Job %lld (%s) failed: %s",
-                 (long long)repo_id, (long long)job_id, what, why);
+                 "Job %lld (%s) %s: %.900s",
+                 (long long)repo_id, (long long)job_id, what, ended, why);
+}
+
+void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
+                       const char *action, const char *detail,
+                       char *title, size_t title_sz, char *body, size_t body_sz)
+{
+    alert_compose(db, repo_id, job_id, action, detail, 0,
+                  title, title_sz, body, body_sz);
+}
+
+void job_warning_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
+                         const char *action, const char *warning,
+                         char *title, size_t title_sz, char *body, size_t body_sz)
+{
+    alert_compose(db, repo_id, job_id, action, warning, 1,
+                  title, title_sz, body, body_sz);
 }
 
 static void set_job_state(job_manager_t *jm, int64_t job_id,
@@ -267,6 +296,8 @@ typedef struct {
     char          *result;
     /* job_set_summary: the journal message for a job that succeeds. */
     char          *summary;
+    /* job_set_warning: alerted for a job that succeeds anyway. */
+    char          *warning;
 } progress_ctx_t;
 
 /* How often a running job's progress reaches the database. */
@@ -346,6 +377,16 @@ void job_set_summary(void *progress_ctx, const char *text)
     if (!copy) return;   /* an empty journal message, as before */
     free(pc->summary);
     pc->summary = copy;
+}
+
+void job_set_warning(void *progress_ctx, const char *text)
+{
+    progress_ctx_t *pc = progress_ctx;
+    if (!pc || !text) return;
+    char *copy = strdup(text);
+    if (!copy) return;   /* the log line and the result still say it */
+    free(pc->warning);
+    pc->warning = copy;
 }
 
 /* Whether a lock set names repo_id. */
@@ -579,7 +620,7 @@ static void *worker_main(void *arg)
         struct timespec began;
         clock_gettime(CLOCK_MONOTONIC, &began);
 
-        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL };
+        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL, NULL };
         /* A lock error that is not contention (the lock table is full) fails
          * the job through the same reporting as any other failure. */
         status_t st = slot.lock_err != OK
@@ -692,13 +733,49 @@ static void *worker_main(void *arg)
             pthread_mutex_unlock(&jm->db_mu);
             /* c-utils logs a send only when it is rejected, and then only
              * the title, so the log never said an alert went out or what
-             * it said. */
-            log_info("sending failure notification for job %lld: %s: %s",
-                     (long long)slot.job_id, title, body);
-            if (push_send(title, body) != 0)
-                log_warn("cannot queue failure notification for job %lld",
-                         (long long)slot.job_id);
+             * it said. Nor does it say when it drops one for want of
+             * credentials, and this line said "sending" after push_init
+             * had logged that Pushover is not configured (NIT-11). */
+            if (atomic_load(&jm->alerts)) {
+                log_info("sending failure notification for job %lld: %s: %s",
+                         (long long)slot.job_id, title, body);
+                if (push_send(title, body) != 0)
+                    log_warn("cannot queue failure notification for job %lld",
+                             (long long)slot.job_id);
+            } else {
+                log_info("failure notification for job %lld not sent, Pushover "
+                         "is not configured: %s: %s",
+                         (long long)slot.job_id, title, body);
+            }
         }
+        /*
+         * A job that succeeded with something an operator must hear about.
+         * The same path as a failure, so it reaches whoever reads failures,
+         * but at WARN and titled as completed: the job did what it was
+         * asked, and the state says so.
+         */
+        if (st == OK && pc.warning) {
+            char title[250], body[1024];
+            pthread_mutex_lock(&jm->db_mu);
+            job_warning_compose(jm->db, slot.repo_id, slot.job_id, slot.action,
+                                pc.warning, title, sizeof(title), body, sizeof(body));
+            pthread_mutex_unlock(&jm->db_mu);
+            /* Logged either way, at warning, and only called "sending"
+             * when there is somewhere to send it (NIT-11). */
+            if (atomic_load(&jm->alerts)) {
+                log_warn("sending warning notification for job %lld: %s: %s",
+                         (long long)slot.job_id, title, body);
+                if (push_send(title, body) != 0)
+                    log_warn("cannot queue warning notification for job %lld",
+                             (long long)slot.job_id);
+            } else {
+                log_warn("warning notification for job %lld not sent, Pushover "
+                         "is not configured: %s: %s",
+                         (long long)slot.job_id, title, body);
+            }
+        }
+        free(pc.warning);
+        pc.warning = NULL;
         if (st != OK && outcome[0] == 'f') err_clear();
 
         if (slot.arg_free) slot.arg_free(slot.arg);

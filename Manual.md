@@ -212,7 +212,9 @@ progress does not hold up the shutdown. This takes
 about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
 or SIGINT forces an immediate exit. Run the cancelled job again after the
 restart; a backup skips what it already stored, a restore skips the files it
-finished and redoes the one it was inside. `c-backup jobs cancel <id>` is the
+finished and redoes the one it was inside (a stop renames every file the
+restore has verified into place before the job ends, so finished means
+verified). `c-backup jobs cancel <id>` is the
 same cancellation for one job, and prints the job record with `"cancel_requested":true`. A job still
 waiting in the queue never starts: it is `cancelled` in that record already,
 and in the journal as "cancelled before it started".
@@ -226,6 +228,14 @@ those files again. Staging files a killed writer left in the repository's
 `tmp/` are removed by the next backup or gc, which hold the repository's write
 lock and so know nothing else is writing there; opening a repository also
 removes any an hour old.
+
+A restore killed this way redoes more than the file it was inside. Verified
+files wait under temporary names (`.c-backup-partial.XXXXXX`) until one
+`syncfs` makes a batch of them durable and they are renamed into place, a
+batch being up to 512 files or 256 MiB; a kill before that leaves the batch
+under its temporary names. The rerun removes them and restores those files
+again, so it can redo up to a whole batch of files that had finished. What
+it never does is leave a right-named file with the wrong contents.
 
 ### 2.3 Docker
 
@@ -573,6 +583,9 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
   that differs from the stored one replaces it; leaving the label out keeps
   the old one. Asking for an encryption mode the repository does not have is
   refused: encryption is fixed when a repository is created.
+- A label is at most 256 bytes of UTF-8 text with no control characters,
+  the same rule as a snapshot label; anything else is refused with HTTP 400
+  before anything is created.
 - Paths are stored normalised: `/srv/backup/main/` and
   `/srv/backup//main` are both `/srv/backup/main`.
 - A non-empty directory without a marker is refused. Writing objects into
@@ -767,7 +780,64 @@ extended attributes and POSIX ACLs. A unix socket has no content and is
 recorded without one; restore skips it.
 
 A file inside a source that cannot be read is logged and skipped; the backup
-continues. A source itself - a path named on the command line or configured
+continues. Skipped means left out: the file is not in the snapshot's trees
+or its index, so the snapshot never lists a file it cannot restore. That
+covers a file that vanished between the scan and the read, one the daemon
+may not open, one replaced by a directory or anything else that is not a
+regular file, one whose read fails partway (an I/O error), and one still
+changing on a second read (below). A backup
+with skipped files still ends `completed`, but not silently:
+
+- each file is a `WARN` line naming it and the reason, `backup: skipping
+  /data/x, it is not in this snapshot: cannot open: Permission denied`,
+  and one closing line counts them;
+- the job `result` carries `files_skipped` and the first 100 as `skipped`,
+  each with its path and reason (`docs/api.md`);
+- a warning alert goes out through the failure-alert path, the log line
+  and Pushover when configured (section 16.3);
+- the journal entry, the permanent record, reads `snapshot 12: 50 files, 1
+  skipped (not in the snapshot); first: /data/x: ...`.
+
+**A file that changes while it is backed up.** A live filesystem changes
+under a backup, and a file can be a different size by the time it is read
+than when the scan listed it. The backup stores the file as it is when it
+is read, never as the scan saw it: its size, times and content all come
+from that read, so it is not cut short when it grew and not padded with
+zeros when it shrank. Change is detected by size, mtime and ctime (and
+inode), compared between the scan and the open, and again between the
+start and end of the read:
+
+- changed since the scan, steady while read: stored as read, logged at
+  `info`, and counted;
+- changed during the read: read once more from the start. If the second
+  read is steady, that version is stored, logged at `warning`, and counted;
+- changed during the second read too: left out, as a skipped file with the
+  reason `changed while it was being read, and again on a second read`.
+
+The rule is rsync's rather than tar's. tar keeps what it read and warns
+"file changed as we read it"; but bytes read across a change are a mix of
+two versions, a file that never existed, and restoring it is as wrong as
+padding. A file read whole between two identical looks is one real version
+of it. The job `result` counts the stored ones in `files_changed` and lists
+the first 100 in `changed`; the snapshot holds those files as they were a
+moment after the scan, not at it. A file that is always being written (a
+live database, a busy log) may be skipped on every run: back it up from a
+snapshot of its filesystem, or with its application's own dump.
+
+Every store path applies this the same way: the backup thread, the chunk
+workers, the file workers that cut several large files at once, and the
+small-file workers. What happens to a file that is still changing on its
+second read is decided in one place (`settle_on_unsettled` in
+`src/ops/settle.c`); leaving it out is the default, and keeping the second
+read with the file flagged is the alternative, pending decision
+OWN-45-LIVE.
+
+The next backup tries every skipped file again. Before 1.0.0's fix for
+B118 a skipped file stayed in the snapshot with no content: the backup
+reported success, verify passed, and every full restore failed on it.
+Verify now reports any such entry an older build left (section 11).
+
+A source itself - a path named on the command line or configured
 with `sources set` - that does not exist or cannot be opened fails the job
 before anything is written, with an error naming it, even when the other
 sources are fine:
@@ -836,7 +906,11 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
 - **Content search** (`grep`) runs as a job, because it reads the
   repository. Matching is POSIX extended regular expressions, line by line,
   over every distinct object in the snapshot; a file present under several
-  names is read once. A binary file that matches is one hit, `(binary file
+  names is read once, and a match in it is reported under every one of
+  those names in the snapshot (or under `--path-prefix`), each counted in
+  `files_matched`. The counts are files, not objects, and each name counts
+  against `--limit` and `--max-hits` like any other matching file; one left
+  out for a cap makes the search `truncated`. A binary file that matches is one hit, `(binary file
   matches)`, however often it matches. `--snapshot N` picks the snapshot
   (newest by default; one that does not exist is an error), `--path-prefix`
   limits it to a subtree, `-i` ignores case, `--limit N` stops after N
@@ -939,7 +1013,13 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
 
 The job reports files, directories, links, specials, skipped, kept and
 failed. Any failed entry makes the job fail with "restore incomplete", so a
-restore that reports success restored everything restorable. An object of a
+restore that reports success restored everything restorable. Every failed
+entry is logged with its path and the reason (`restore: <path> not
+restored: <reason>`), and the job's error quotes the first:
+
+```
+restore incomplete: 2 entries could not be restored (51 written); see the log for each; first: /data/x: regular file has no content in the snapshot (...)
+``` An object of a
 type this build does not know fails its file with "object type N is not
 known to this build; written by a newer c-backup?", and a file entry whose
 object is not file content (a directory tree, say) fails rather than being
@@ -1226,7 +1306,7 @@ What a run counts:
 | `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` or `--dry-run` |
 | `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
 | `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
-| `missing` | Indexed but absent, including every object in a pack file that has gone. **Data loss** |
+| `missing` | Indexed but absent, including every object in a pack file that has gone, and every index entry of a regular file that names no content at all. **Data loss** |
 
 **Loss fails the verify.** Any `unrecoverable` or `missing` object ends the
 job `failed`, with an error naming the run and the counts, and
@@ -1249,6 +1329,15 @@ three full paths, and up to ten snapshot ids beside the exact count
 short). The run's `affected_files` and `affected_snapshots` are distinct
 paths and snapshots across every lost object. The CLI prints the run and its
 findings as one JSON document.
+
+Every level also checks the index for regular files that name no content
+object. A backup before 1.0.0's fix for B118 recorded a file it skipped
+that way: the snapshot listed the file, no restore could produce it, and
+every object check passed because no object was damaged. These are one
+finding, status `missing: file entry has no content` with an empty hash,
+naming the files and snapshots; each counts in `missing` and fails the
+run. Such a snapshot restores everything else; delete it once a newer one
+covers the files, or keep it and expect its restore to report them.
 
 A checking verify takes the read lock; a repairing one takes the write lock.
 
@@ -1296,12 +1385,15 @@ would do:
 ```json
 {"dry_run":false,"reachable":5210,"objects_swept":12,"bytes_freed":40960,
  "pack_entries_kept":5100,"pack_entries_dropped":12,"packs_rewritten":1,
- "packs_deleted":0,"tmp_files_removed":0,"tmp_bytes_removed":0}
+ "packs_deleted":0,"packs_coalesced":20,"packs_removed_by_coalesce":17,
+ "tmp_files_removed":0,"tmp_bytes_removed":0}
 ```
 
 `objects_swept` and `bytes_freed` are what was swept, or on a dry run what
 would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
-does not do; `tmp_files_removed` counts staging files an interrupted run left
+does not do. `packs_coalesced` is how many small packs the coalescing pass
+after compaction merged, and `packs_removed_by_coalesce` how many fewer pack
+files that left: 20 merged into 3 is 20 and 17. `tmp_files_removed` counts staging files an interrupted run left
 behind (section 2.2). The journal entry carries the same in a line.
 
 Compaction copies entries into packs whose parity is computed afresh, so it
@@ -1693,6 +1785,20 @@ Repository photos (id 3) at /mnt/backup/photos
 Job 118 (backup) failed: cannot read /data/photos/2024: Permission denied
 ```
 
+A backup that completed but left files out (section 6.3: a file that
+vanished, could not be opened or read, or stopped being a regular file)
+sends a warning the same way. The job stays `completed`; the title says so,
+and the body gives the count and the first file with its reason:
+
+```
+c-backup: backup of photos completed with a warning
+
+Repository photos (id 3) at /mnt/backup/photos
+Job 119 (backup) completed with a warning: 2 file(s) could not be read and are not in snapshot 41; first: /data/photos/locked.jpg: cannot open: Permission denied
+```
+
+A clean backup sends nothing.
+
 A notification that cannot be delivered is retried for 24 hours unless
 Pushover rejects it outright (a wrong token or user key), in which case it is
 dropped at once. Either way the journal has a line naming the notification,
@@ -1704,6 +1810,15 @@ push permanently failed (HTTP 400, {"user":"invalid",...}): c-backup: backup of 
 
 and `cbackup_alerts_failed_total` counts it (section 16.2). Watch that
 counter: an alert path that has stopped working is otherwise silent.
+
+The daemon log has one line per failed job either way: `sending failure
+notification for job N: <title>: <body>` with credentials set, and
+`failure notification for job N not sent, Pushover is not configured:
+<title>: <body>` without them.
+A backup that completed with skipped files logs the same pair at
+`warning` level: `sending warning notification for job N: <title>: <body>`
+with credentials, `warning notification for job N not sent, Pushover is not
+configured: <title>: <body>` without.
 
 ---
 
@@ -1915,7 +2030,7 @@ the underlying disk.
 | Backup logs `key not escrowed` | System key not acknowledged | Section 13 |
 | Job `cancelled` after a restart | `systemctl stop` cancels running jobs (section 2.2) | Run it again |
 | Job `failed: interrupted by daemon restart` | The daemon died mid-job: crash, `kill -9`, power loss | Run it again; nothing partial is kept |
-| `restore incomplete: N entries could not be restored` | Some entries failed | The job and log name them; check permissions and space at the destination |
+| `restore incomplete: N entries could not be restored` | Some entries failed | The error quotes the first, the log names each (`restore: <path> not restored: <reason>`); check permissions and space at the destination. `regular file has no content` is a snapshot written before the B118 fix; verify reports the same entries |
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
 | `<path> is repository format 2; this build reads only format 3 ...` | The repository was written by an earlier build | No migration: restore from it with the build that wrote it and back up again into a new repository (section 17.4) |
@@ -1968,6 +2083,10 @@ JSON, one document per command, on stdout (a remove prints what it removed,
 that prints several: one document per line until the job ends. The exit
 status is 0 on success and 1 otherwise. Flags may appear anywhere after the
 command. Commands that start a job wait for it unless given `--no-wait`.
+The listing and lookup commands refuse an argument they do not take, a
+stray positional or an unknown option, with `unexpected argument` and their
+usage, rather than ignore it: `grep runs 1 2` is an error, not repository
+1's runs.
 
 | Command | Purpose |
 |---|---|
@@ -1993,7 +2112,7 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
 | `stats <id> [--scope staged]`, `summary <id>`, `fanout <id>` | Repository statistics; `staged` is objects in packs a running backup has not sealed |
-| `objects <id> [--location staged\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
+| `objects <id> [--location staged\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
 | `packs <id> [pack-id]` | Packs |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |

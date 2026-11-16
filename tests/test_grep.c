@@ -542,9 +542,91 @@ static void test_duplicate_content_is_scanned_once(void **state)
     grep_opts_t o = opts_for("shared marker");
     grep_result_t res;
     assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
-    /* Both copies are the same object, so one scan and one match. */
-    assert_int_equal(res.files_matched, 1);
-    assert_int_equal(res.hits, 1);
+    /* Both copies are one object, read once: the bytes say so. */
+    assert_int_equal(res.bytes_scanned,
+                     strlen("shared marker line\n") + strlen("first line\nthe secret token "
+                     "is swordfish\nlast line\n") + strlen("[server]\nport = 8080\ntoken "
+                     "= swordfish\n") + strlen("nothing interesting here\n"));
+    /* B117: but both are files holding the match, and both are named. */
+    assert_int_equal(res.files_scanned, 5);
+    assert_int_equal(res.files_matched, 2);
+    assert_int_equal(res.hits, 2);
+    assert_false(res.truncated);
+    char *t = hits_text(res.run_id);
+    assert_non_null(strstr(t, "/copy_a.txt:1:shared marker line"));
+    assert_non_null(strstr(t, "/copy_b.txt:1:shared marker line"));
+    free(t);
+}
+
+/*
+ * B117: the paths holding a matched object are bounded by the caps like any
+ * other matching file, and a path left out is a truncated search.
+ */
+static void test_duplicate_content_respects_the_caps(void **state)
+{
+    (void)state;
+    write_file(TEST_SRC "/copy_a.txt", "dup one\ndup two\n");
+    write_file(TEST_SRC "/copy_b.txt", "dup one\ndup two\n");
+    write_file(TEST_SRC "/copy_c.txt", "dup one\ndup two\n");
+    int64_t snap = run_backup();
+
+    /* max_files 2: two of the three named, and the run says it stopped. */
+    grep_opts_t o = opts_for("dup");
+    o.max_files = 2;
+    grep_result_t res;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.files_matched, 2);
+    assert_int_equal(res.hits, 4);
+    assert_int_equal(count_hit_rows(res.run_id), 4);
+    assert_true(res.truncated);
+
+    /* max_hits 5: the third path is recorded with the one hit left. */
+    o = opts_for("dup");
+    o.max_hits = 5;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.hits, 5);
+    assert_int_equal(count_hit_rows(res.run_id), 5);
+    assert_int_equal(res.files_matched, 3);
+    assert_true(res.truncated);
+
+    /* Exactly enough room for all three: nothing left out. */
+    o = opts_for("dup");
+    o.max_files = 3;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.files_matched, 3);
+    assert_int_equal(res.hits, 6);
+    assert_false(res.truncated);
+
+    /* A per-file cap applies to every path, and each counts as capped. */
+    o = opts_for("dup");
+    o.max_hits_per_file = 1;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.files_matched, 3);
+    assert_int_equal(res.hits, 3);
+    assert_int_equal(res.files_capped, 3);
+    assert_false(res.truncated);
+}
+
+/* B117: with a path prefix, only the paths inside it are named or counted. */
+static void test_duplicate_content_stays_in_scope(void **state)
+{
+    (void)state;
+    write_file(TEST_SRC "/conf/dup.txt", "scoped dup\n");
+    write_file(TEST_SRC "/conf/dup2.txt", "scoped dup\n");
+    write_file(TEST_SRC "/dup_outside.txt", "scoped dup\n");
+    int64_t snap = run_backup();
+
+    grep_opts_t o = opts_for("scoped dup");
+    o.path_prefix = TEST_SRC "/conf";
+    grep_result_t res;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.files_matched, 2);
+    assert_int_equal(res.files_scanned, 3);   /* app.ini, dup.txt, dup2.txt */
+    char *t = hits_text(res.run_id);
+    assert_non_null(strstr(t, "/conf/dup.txt:1:"));
+    assert_non_null(strstr(t, "/conf/dup2.txt:1:"));
+    assert_null(strstr(t, "dup_outside"));
+    free(t);
 }
 
 /* A cancelled search still closes its run row, marked incomplete. */
@@ -782,6 +864,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_per_file_cap_stops_reading_the_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_total_hit_cap_truncates_the_search, setup, teardown),
         cmocka_unit_test_setup_teardown(test_duplicate_content_is_scanned_once, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_duplicate_content_respects_the_caps, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_duplicate_content_stays_in_scope, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_marks_the_run_incomplete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_very_long_line_does_not_buffer_without_bound, setup, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_large_object_records_no_matches, setup, teardown),

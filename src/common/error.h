@@ -28,7 +28,15 @@ typedef enum {
 /* it on the way up.                                                  */
 /* ------------------------------------------------------------------ */
 
-#define ERR_MSG_MAX 256
+/*
+ * Room for a message naming a path of PATH_MAX and saying what to do about
+ * it. At 256 bytes a replica path of 135 characters cut off the advice in
+ * the replicate refusal (OWN-42, B121), and any message carrying a long
+ * path lost its end. Thread-local, so this is per thread, and the copies
+ * callers keep (char why[ERR_MSG_MAX]) stay well inside the 64 KiB frame
+ * limit make analyze enforces.
+ */
+#define ERR_MSG_MAX 8192
 
 extern _Thread_local char _err_buf[ERR_MSG_MAX];
 

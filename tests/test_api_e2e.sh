@@ -403,15 +403,18 @@ contains "no large files, no store pool" '"store_workers":1,' "$JOB_BODY"
 contains "backup result counts bytes written" '"bytes_written":' "$JOB_BODY"
 BW=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"bytes_written":\([0-9]*\),.*/\1/p')
 BWP=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"bytes_written_pack":\([0-9]*\),.*/\1/p')
-BWPP=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"bytes_written_pack_parity":\([0-9]*\)}.*/\1/p')
+BWPP=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"bytes_written_pack_parity":\([0-9]*\)[,}].*/\1/p')
 check "bytes written is pack plus parity" "${BW:-none}" "$(( ${BWP:-0} + ${BWPP:-0} ))"
 # The result is exactly these keys, in this order: nothing for loose
-# objects or a pack pass, which no longer exist.
+# objects or a pack pass, which no longer exist, and the files left out
+# (B118) and stored as read (OWN-45).
 RESULT_KEYS=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"result":{\([^}]*\)}.*/\1/p' \
               | grep -o '"[a-z_]*":' | tr -d '":' | tr '\n' ' ')
 check "the backup result carries exactly its keys" \
-    "snapshot_id files dirs files_unchanged bytes_logical objects_new bytes_stored trees_new trees_reused store_workers bytes_written bytes_written_pack bytes_written_pack_parity " \
+    "snapshot_id files dirs files_unchanged bytes_logical objects_new bytes_stored trees_new trees_reused store_workers bytes_written bytes_written_pack bytes_written_pack_parity files_skipped skipped skipped_listed files_changed changed changed_listed " \
     "$RESULT_KEYS"
+contains "and a clean backup left nothing out" '"files_skipped":0,"skipped":[],"skipped_listed":0,' "$JOB_BODY"
+contains "and saw nothing change under it" '"files_changed":0,"changed":[],"changed_listed":0}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -587,6 +590,30 @@ check "a label with a newline is refused" "$LABEL_RULE" \
     "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"label\":\"a\\nb\"}")"
 check "a label with a C1 control is refused" "$LABEL_RULE" \
     "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"label\":\"a\\u009bb\"}")"
+# B115: cJSON decodes \u0000 into a C string that ends there, so the label
+# was stored as "nul" with a 202 and a path named a shorter one.
+check "a label with an escaped NUL is refused" "$LABEL_RULE" \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"label\":\"nul\\u0000here\"}")"
+check "a backup path with an escaped NUL is refused" \
+    '{"error":"paths must not contain a NUL character"} 400' \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\\u0000/x\"]}")"
+check "a schedule label with an escaped NUL is refused" "$LABEL_RULE" \
+    "$(sock_send POST /repos/1/schedules '{"action":"backup","label":"a\u0000b","trigger":{"type":"interval","seconds":60}}')"
+check "a tag name with an escaped NUL is refused" \
+    '{"error":"name must not contain a NUL character"} 400' \
+    "$(sock_send POST /repos/1/tags '{"name":"t\u0000x","snap_id":1}')"
+check "a NUL in a nested trigger field is refused by name" \
+    '{"error":"every must not contain a NUL character"} 400' \
+    "$(sock_send POST /repos/1/schedules '{"action":"gc","trigger":{"type":"calendar","every":"day\u0000","at":"01:00"}}')"
+OUT=$(sock_send POST /repos/1/tags '{"name":"t\\u0000","snap_id":1}')
+case "$OUT" in
+    *NUL*) bad "an escaped backslash before u0000 is not a NUL" "the tag-name rule" "$OUT" ;;
+    *400)  ok "an escaped backslash before u0000 is not a NUL" ;;
+    *)     bad "an escaped backslash before u0000 is not a NUL" "a 400" "$OUT" ;;
+esac
+check "a query value with %00 is refused" \
+    '{"error":"q must not contain a NUL character"} 400' \
+    "$(sock_send GET '/repos/1/search?q=a%00b')"
 check "backup paths must be a list" '{"error":"paths must be a list of strings"} 400' \
     "$(sock_send POST /repos/1/backup '{"paths":"/x"}')"
 check "a non-string backup path" \
@@ -685,6 +712,19 @@ case "$(sock_body /repos/1/schedules)" in
     *'"action"'*) bad "and no schedule was created" "none" "$(sock_body /repos/1/schedules)" ;;
     *) ok "and no schedule was created" ;;
 esac
+# NIT-8: one wording on every route, and it names the problem. POST /repos
+# said "body is not valid JSON", the rest "invalid JSON", neither the key.
+check "a duplicate repo key is named" \
+    "{\"error\":\"invalid JSON: duplicate key 'path' at the top level\"} 400" \
+    "$(sock_send POST /repos "{\"path\":\"$WORK/junkrepo\",\"path\":\"$WORK/junkrepo2\"}")"
+check "a duplicate key in a trigger is named, with where it is" \
+    "{\"error\":\"invalid JSON: duplicate key 'seconds' in object 'trigger'\"} 400" \
+    "$(sched '{"action":"gc","trigger":{"type":"interval","seconds":60,"seconds":3600}}')"
+check "a duplicate backup key is named" \
+    "{\"error\":\"invalid JSON: duplicate key 'label' at the top level\"} 400" \
+    "$(sock_send POST /repos/1/backup '{"label":"a","label":"b"}')"
+check "malformed JSON on POST /repos says invalid JSON" '{"error":"invalid JSON"} 400' \
+    "$(sock_send POST /repos '{"path":')"
 
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
@@ -816,7 +856,7 @@ check "a large limit is clamped, not refused" 200 "$(sock_code '/repos/1/snapsho
 check "an overflowing limit is clamped too" 200 "$(sock_code '/jobs?limit=99999999999')"
 check "an overflowing offset is an empty page" 200 "$(sock_code '/jobs?offset=99999999999')"
 check "a bad limit names the range" \
-    '{"error":"limit is out of range; it must be from 1 to 1000 (a larger one is reduced to 1000)"}' \
+    '{"error":"limit is out of range; it must be from 1 to 1000 (a larger one, up to 9007199254740992, is reduced to 1000)"}' \
     "$(sock_body '/jobs?limit=0')"
 # B112: every numeric query parameter reads numbers the same way and words
 # a refusal the way a body field does. An overflowing id used to be clamped
@@ -826,9 +866,42 @@ check "a non-numeric limit says whole number" '{"error":"limit must be a whole n
 check "a fractional limit says whole number" '{"error":"limit must be a whole number"} 400' \
     "$(sock_send GET '/jobs?limit=1.5')"
 check "a negative offset is out of range" \
-    '{"error":"offset is out of range; it must be from 0 to 2147483647 (a larger one is past every row)"} 400' \
+    '{"error":"offset is out of range; it must be from 0 to 2147483647 (a larger one, up to 9007199254740992, is past every row)"} 400' \
     "$(sock_send GET '/jobs?offset=-5')"
-check "a huge limit in exponent form is clamped too" 200 "$(sock_code '/jobs?limit=1e999')"
+# NIT-8: a number too large to represent is out of range, as it is in a
+# body; these were read as the maximum and answered 200.
+LRANGE='limit is out of range; it must be from 1 to 1000 (a larger one, up to 9007199254740992, is reduced to 1000)'
+for v in 1e999 99999999999999999999 9007199254740994; do
+    check "limit=$v is out of range" "{\"error\":\"$LRANGE\"} 400" "$(sock_send GET "/jobs?limit=$v")"
+done
+check "limit=9007199254740992 is still clamped" 200 "$(sock_code '/jobs?limit=9007199254740992')"
+check "an unrepresentable offset is out of range" 400 "$(sock_code '/jobs?offset=1e999')"
+# NIT-8: an id in the path is parsed, not routed. These were a 405, a 404
+# and a 404, while /repos/-1 was already a 400.
+for v in 99999999999999999999 1e999 -1 0 1.5 abc; do
+    check "snapshot id $v is invalid" '{"error":"invalid snapshot id"} 400' \
+        "$(sock_send DELETE "/repos/1/snapshots/$v")"
+done
+check "and under a suffix too" '{"error":"invalid snapshot id"} 400' \
+    "$(sock_send GET /repos/1/snapshots/1e999/tree)"
+for v in 99999999999999999999 1e999 -1 0; do
+    check "repo id $v is invalid" '{"error":"invalid repo id"} 400' "$(sock_send GET "/repos/$v")"
+    check "job id $v is invalid" '{"error":"invalid job id"} 400' "$(sock_send GET "/jobs/$v")"
+done
+check "a cancel with a bad job id" '{"error":"invalid job id"} 400' \
+    "$(sock_send POST /jobs/-1/cancel)"
+check "a stream with a bad job id" 400 "$(sock_code /jobs/stream/99999999999999999999)"
+check "a schedule id is parsed" '{"error":"invalid schedule id"} 400' \
+    "$(sock_send DELETE /repos/1/schedules/1e999)"
+check "a grep run id is parsed" '{"error":"invalid grep run id"} 400' \
+    "$(sock_send GET /repos/1/grep/-1)"
+check "a verify run id is parsed" '{"error":"invalid verify run id"} 400' \
+    "$(sock_send GET /repos/1/verify/99999999999999999999)"
+check "a pack id is parsed" '{"error":"invalid pack id"} 400' \
+    "$(sock_send GET /repos/1/packs/-1/entries)"
+check "an unknown valid snapshot id is still a 404" 404 \
+    "$(sock_code /repos/1/snapshots/999999/tree)"
+check "an unknown valid job id is still a 404" 404 "$(sock_code /jobs/999999)"
 check "a leading zero still reads" 200 "$(sock_code '/jobs?limit=010')"
 SRANGE='snapshot is out of range; it must be from 1 to 4294967295'
 for v in 1e999 -1 0 99999999999999999999; do
@@ -1258,6 +1331,20 @@ contains "and the refusal names the formats" \
     "is repository format 2; this build reads only format 3" "$OUT"
 case "$(sock_body /repos)" in *oldfmt*) bad "and it is not registered" "absent" "listed" ;;
                               *) ok "and it is not registered" ;; esac
+# B116: a repository label follows the snapshot label rule (OWN-33). Both
+# of these registered with a 201 and were listed as given.
+check "a 257-byte repository label is refused" \
+    '{"error":"label must be at most 256 bytes of printable text"} 400' \
+    "$(sock_send POST /repos "{\"path\":\"$WORK/lbl257\",\"label\":\"$(head -c 257 /dev/zero | tr '\0' a)\"}")"
+check "a repository label with a newline is refused" \
+    '{"error":"label must be at most 256 bytes of printable text"} 400' \
+    "$(sock_send POST /repos "{\"path\":\"$WORK/lblnl\",\"label\":\"a\\nb\"}")"
+check "and neither left a directory behind" "absent absent" \
+    "$([ -e "$WORK/lbl257" ] && echo present || echo absent) $([ -e "$WORK/lblnl" ] && echo present || echo absent)"
+check "a relabel is held to the rule too" \
+    '{"error":"label must be at most 256 bytes of printable text"} 400' \
+    "$(sock_send POST /repos "{\"path\":\"$WORK/repo\",\"label\":\"a\\tb\"}")"
+contains "and leaves the label alone" '"label":"renamed"' "$(sock_body /repos/1)"
 
 echo "remote"
 # The same operations the desktop app drives, over TCP with a token, after
@@ -1638,6 +1725,45 @@ contains "and that the mark needed no repair" '"snapshot_ids_repaired":false' \
     "$(sock_body "/jobs/$RX")"
 contains "and the label comes back from the record" "\"label\":\"$LBL_OUT\"" \
     "$(sock_body /repos/1/snapshots)"
+
+# B118: a file the backup cannot read is left out, counted and named, in
+# the result and in the journal. It used to stay in the snapshot with no
+# content, and the job said nothing. Root reads through mode 000.
+if [ "$(id -u)" != 0 ]; then
+    echo "locked" > "$R/src/locked.txt"
+    chmod 000 "$R/src/locked.txt"
+    SJ=$(job_id "$(sock_post /repos/1/backup "{\"paths\":[\"$R/src\"]}")")
+    wait_job "$SJ"
+    chmod 600 "$R/src/locked.txt"
+    SBODY=$(sock_body "/jobs/$SJ")
+    contains "a backup with an unreadable file still completes" '"state":"completed"' "$SBODY"
+    contains "and counts it" '"files_skipped":1,' "$SBODY"
+    contains "and names it, with the reason" \
+        "\"skipped\":[{\"path\":\"$R/src/locked.txt\",\"reason\":\"cannot open: Permission denied\"}],\"skipped_listed\":1," \
+        "$SBODY"
+    contains "and the journal says so" \
+        "1 skipped (not in the snapshot); first: $R/src/locked.txt: cannot open: Permission denied" \
+        "$(sock_body '/repos/1/journal?limit=1')"
+    # And alerted, as a warning, without anyone opening the job. The worker
+    # writes the line after the state, so it is waited for. No Pushover is
+    # configured here, so the line must say it was not sent (NIT-11).
+    WLINE="warning notification for job $SJ not sent, Pushover is not configured: "
+    for _ in $(seq 1 100); do
+        grep -q "$WLINE" "$R/daemon.log" && break
+        sleep 0.1
+    done
+    contains "and the operator is alerted, naming the count and the first path" \
+        "completed with a warning: 1 file(s) could not be read and are not in snapshot" \
+        "$(grep -A1 "$WLINE" "$R/daemon.log")"
+    contains "the alert names the file" "first: $R/src/locked.txt: cannot open: Permission denied" \
+        "$(grep -A1 "$WLINE" "$R/daemon.log")"
+    check "and does not claim it was sent" 0 \
+        "$(grep -c "sending warning notification for job $SJ:" "$R/daemon.log")"
+    rm -f "$R/src/locked.txt"
+fi
+# A clean backup alerts nobody: the label backup above skipped nothing.
+check "a clean backup sends no warning" 0 \
+    "$(grep -c "warning notification for job $LJ" "$R/daemon.log")"
 
 # A backup schedule carries its label, checked when it is made.
 SCH=$(sock_send POST /repos/1/schedules \

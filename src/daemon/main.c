@@ -24,6 +24,7 @@
 #include <cutils/config.h>
 #include <cutils/db.h>
 #include <cutils/log.h>
+#include <cutils/push.h>
 #include <cutils/version.h>
 
 #include "app_config.h"
@@ -230,6 +231,13 @@ int main(int argc, char *argv[])
         repo_purge_stop();
         appguard_shutdown(guard);
         return 1;
+    }
+    /* The same test push_init makes before it starts its worker: without
+     * both, push_send drops every message. */
+    {
+        const char *tok = config_get_str(cfg, PUSH_CONFIG_TOKEN);
+        const char *usr = config_get_str(cfg, PUSH_CONFIG_USER);
+        job_manager_set_alerts(jm, tok && tok[0] && usr && usr[0]);
     }
 
     /*

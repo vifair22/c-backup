@@ -5,6 +5,7 @@
 #include "repo.h"
 #include "db_txn.h"
 #include "snapshot_ids.h"
+#include "snap_record.h"
 #include "store.h"
 
 #include <cutils/json.h>
@@ -846,6 +847,13 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
     memset(out, 0, sizeof(*out));
     if (!db || !path || !path[0])
         return set_error(ERR_INVALID, "repo_register: missing db or path");
+    /* The rule snapshot and schedule labels follow (OWN-33). A repository
+     * label was stored as given, 257 bytes or a newline included, for every
+     * listing and log line to carry (B116). Checked before anything is
+     * created, here rather than in the route, because this is also where a
+     * re-registration relabels. */
+    if (snapshot_label_check(label) != 0)
+        return set_error(ERR_INVALID, "%s", SNAPSHOT_LABEL_RULE);
 
     /* Everything below works on, and stores, the normalised form. */
     char npath[PATH_MAX];

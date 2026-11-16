@@ -97,6 +97,35 @@ static void test_roundtrip(void **state)
     manifest_free_entries(out, n);
 }
 
+/*
+ * B118's backstop: a regular file with no content is refused, never written.
+ * A tree is permanent and every snapshot naming it would carry an entry no
+ * restore can produce. Other types legitimately have a zero target: a
+ * symlink's payload is its target string, a device node's its numbers.
+ */
+static void test_file_entry_without_content_is_refused(void **state)
+{
+    (void)state;
+    manifest_entry_t e[2] = { mk("ok", NODE_TYPE_REG, 1), mk("hole", NODE_TYPE_REG, 2) };
+    memset(e[1].target_hash, 0, OBJECT_HASH_SIZE);
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    err_clear();
+    assert_int_equal(manifest_serialise(e, 2, &buf, &len), ERR_INVALID);
+    assert_null(buf);
+    assert_non_null(strstr(err_msg(), "'hole' has no content hash"));
+    uint8_t h[OBJECT_HASH_SIZE];
+    assert_int_equal(manifest_write_tree(store, e, 2, h), ERR_INVALID);
+    err_clear();
+
+    manifest_entry_t s = mk("link", NODE_TYPE_SYMLINK, 4);
+    memset(s.target_hash, 0, OBJECT_HASH_SIZE);
+    s.link_target = "dest";
+    s.link_target_len = 4;
+    assert_int_equal(manifest_serialise(&s, 1, &buf, &len), OK);
+    free(buf);
+}
+
 /* The same directory serialised twice must be byte-identical. */
 static void test_serialisation_is_stable(void **state)
 {
@@ -605,6 +634,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_roundtrip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_serialisation_is_stable, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_entry_without_content_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_mtime_is_signed_without_changing_the_bytes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_input_order_does_not_matter, setup, teardown),
         cmocka_unit_test_setup_teardown(test_duplicate_names_still_order_deterministically, setup, teardown),

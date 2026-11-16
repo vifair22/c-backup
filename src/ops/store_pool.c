@@ -236,6 +236,7 @@ static void *worker_main(void *arg)
             phase_add(phase_current, PHASE_STORE_WORKERS, t0);
         }
         if (j->st != OK) snprintf(j->err, sizeof(j->err), "%s", err_msg());
+        j->post_ok = fstat(j->fd, &j->post) == 0;
         close(j->fd);
         j->fd = -1;
         wk->job = NULL;

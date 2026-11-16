@@ -211,11 +211,38 @@ static void serialise_run(sbuf_t *b, const manifest_entry_t *entries,
     }
 }
 
+/*
+ * A regular file with no content is a file no restore can produce, and a
+ * tree is permanent: once written, every snapshot naming it carries the
+ * hole, and verify passed over it because nothing it reads is damaged
+ * (B118). Backup leaves an unreadable file out of the tree instead; this is
+ * the backstop for any writer that forgets to. Every regular file names a
+ * FILE object or a CHUNKLIST, an empty one included (the chunker stores an
+ * empty FILE object for it), so an all-zero hash is never one; which of the
+ * two it names is verify's to check, since only the store knows.
+ */
+static status_t refuse_contentless(const manifest_entry_t *entries, uint32_t count)
+{
+    static const uint8_t zero[OBJECT_HASH_SIZE] = { 0 };
+    for (uint32_t i = 0; i < count; i++)
+        if (entries[i].type == NODE_TYPE_REG &&
+            memcmp(entries[i].target_hash, zero, OBJECT_HASH_SIZE) == 0)
+            return set_error(ERR_INVALID,
+                             "manifest: file entry '%.*s' has no content hash; "
+                             "refusing to write a tree that cannot be restored",
+                             (int)entries[i].name_len,
+                             entries[i].name ? entries[i].name : "");
+    return OK;
+}
+
 status_t manifest_serialise(manifest_entry_t *entries, uint32_t count,
                             uint8_t **out_buf, size_t *out_len)
 {
     if (!out_buf || !out_len) return set_error(ERR_INVALID, "manifest_serialise: null out");
     if (count > 0 && !entries) return set_error(ERR_INVALID, "manifest_serialise: null entries");
+
+    status_t rst = refuse_contentless(entries, count);
+    if (rst != OK) return rst;
 
     qsort(entries, count, sizeof(*entries), entry_cmp);
 
@@ -259,6 +286,8 @@ status_t manifest_store_tree(manifest_entry_t *entries, uint32_t count,
         return set_error(ERR_INVALID, "manifest_store_tree: bad arguments");
     if (count > 0 && !entries)
         return set_error(ERR_INVALID, "manifest_store_tree: null entries");
+    status_t rst = refuse_contentless(entries, count);
+    if (rst != OK) return rst;
     manifest_store_stats_t local;
     memset(&local, 0, sizeof(local));
     if (!stats) stats = &local;
