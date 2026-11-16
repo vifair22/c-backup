@@ -603,6 +603,53 @@ status_t pack_object_read_stored(store_t *store,
     return OK;
 }
 
+/*
+ * The same entry, opened for the caller to read in pieces.
+ *
+ * A private stream rather than one checked out of the dat cache: the caller
+ * holds it for as long as a large payload takes to move, and a cached
+ * handle held that long is one every reader of that pack waits on.
+ */
+status_t pack_object_open_stored(store_t *store,
+                                 const uint8_t hash[OBJECT_HASH_SIZE],
+                                 uint8_t *out_type, uint8_t *out_compression,
+                                 uint8_t *out_encryption,
+                                 uint64_t *out_uncompressed_size,
+                                 uint64_t *out_len, FILE **out_f) {
+    pack_cache_entry_t found;
+    status_t st = pack_find_entry(store, hash, &found);
+    if (st != OK) return st;
+
+    char dat_path[PATH_MAX];
+    if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
+                              store_root(store), found.pack_num) != 0)
+        return set_error(ERR_IO, "pack_object_open_stored: path too long");
+
+    FILE *f = fopen(dat_path, "rb");
+    if (!f) return set_error_errno(ERR_IO, "pack_object_open_stored: fopen(%s)", dat_path);
+
+    pack_dat_entry_hdr_t ehdr;
+    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
+        fclose(f);
+        return set_error_errno(ERR_IO, "pack_object_open_stored: fseeko(%s)", dat_path);
+    }
+    /* read_entry_hdr refuses a length the file cannot hold, so a reader of
+     * *out_len bytes cannot be sent past the end of the pack. */
+    if (read_entry_hdr(f, &ehdr) != 0 || memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) {
+        fclose(f);
+        return set_error(ERR_CORRUPT, "pack_object_open_stored: bad entry header in %s",
+                         dat_path);
+    }
+
+    *out_type              = ehdr.type;
+    *out_compression       = ehdr.compression;
+    *out_encryption        = ehdr.encryption;
+    *out_uncompressed_size = ehdr.uncompressed_size;
+    *out_len               = ehdr.compressed_size;
+    *out_f                 = f;
+    return OK;
+}
+
 
 /* Load parity data for a pack entry from the .dat parity trailer.
  * On success, *out_hdr_par, *out_payload_crc, *out_rs_par (caller frees) are
@@ -2174,7 +2221,20 @@ struct pack_stored_writer {
     uint64_t               body;   /* entry bytes written, headers included */
 
     staged_set_t           seen;
+
+    /* A torn entry could not be cut back out of the staging file. Nothing
+     * more may be added and finish must not install what is there. */
+    int                    broken;
 };
+
+/* See pack_stored_set_chunk. Atomic only so a test lowering it cannot race
+ * a writer on another thread into a torn read; nothing orders around it. */
+static _Atomic size_t pack_stored_chunk = PACK_STORED_CHUNK_DEFAULT;
+
+void pack_stored_set_chunk(size_t bytes)
+{
+    atomic_store(&pack_stored_chunk, bytes ? bytes : PACK_STORED_CHUNK_DEFAULT);
+}
 
 static uint32_t hash_slot(const uint8_t h[OBJECT_HASH_SIZE], uint32_t cap)
 {
@@ -2278,13 +2338,59 @@ status_t pack_stored_open(store_t *store, pack_stored_writer_t **out)
     return OK;
 }
 
+/* The whole-buffer form, for callers that already hold the payload. */
+typedef struct { const uint8_t *p; } mem_reader_t;
+
+static status_t mem_read(void *ctx, void *buf, size_t n)
+{
+    mem_reader_t *m = ctx;
+    memcpy(buf, m->p, n);
+    m->p += n;
+    return OK;
+}
+
 status_t pack_stored_add(pack_stored_writer_t *w,
                          const uint8_t hash[OBJECT_HASH_SIZE],
                          uint8_t type, uint8_t compression, uint8_t encryption,
                          uint64_t uncompressed_size,
                          const void *payload, size_t len)
 {
+    if (len && !payload) return set_error(ERR_INVALID, "pack_stored_add: null payload");
+    mem_reader_t m = { payload };
+    return pack_stored_add_stream(w, hash, type, compression, encryption,
+                                  uncompressed_size, (uint64_t)len, mem_read, &m);
+}
+
+/*
+ * Take a half-written entry back out of the staging file.
+ *
+ * The entry has no row in w->entries yet, so once the file is cut back to
+ * where its header began the writer is exactly as it was before the entry
+ * started. fseeko first: it flushes what stdio still buffers, which would
+ * otherwise land after the truncate and put the torn bytes back.
+ */
+static void stored_entry_rollback(pack_stored_writer_t *w, off_t at)
+{
+    if (fseeko(w->dat_f, at, SEEK_SET) != 0 ||
+        ftruncate(fileno(w->dat_f), at) != 0) {
+        w->broken = 1;
+        log_error("pack_stored: cannot cut a failed entry out of %s; the pack "
+                  "will not be installed", w->dat_tmp);
+    }
+}
+
+status_t pack_stored_add_stream(pack_stored_writer_t *w,
+                                const uint8_t hash[OBJECT_HASH_SIZE],
+                                uint8_t type, uint8_t compression,
+                                uint8_t encryption, uint64_t uncompressed_size,
+                                uint64_t len, pack_stored_read_fn rd,
+                                void *rd_ctx)
+{
     if (!w || !w->dat_f) return set_error(ERR_INVALID, "pack_stored_add: no writer");
+    if (!rd) return set_error(ERR_INVALID, "pack_stored_add: no reader");
+    if (w->broken)
+        return set_error(ERR_IO, "pack_stored_add: an earlier entry could not be "
+                         "rolled back, refusing to add more to %s", w->dat_tmp);
     if (pack_stored_has(w, hash)) return OK;
 
     /*
@@ -2324,10 +2430,11 @@ status_t pack_stored_add(pack_stored_writer_t *w,
     if (compression == COMPRESS_NONE) {
         uint64_t expect = uncompressed_size +
                           (encryption != ENCRYPT_NONE ? OBJECT_CRYPT_OVERHEAD : 0u);
-        if ((uint64_t)len != expect)
+        if (len != expect)
             return set_error(ERR_INVALID,
-                             "pack_stored_add: uncompressed entry stores %zu bytes, "
-                             "expected %llu", len, (unsigned long long)expect);
+                             "pack_stored_add: uncompressed entry stores %llu bytes, "
+                             "expected %llu", (unsigned long long)len,
+                             (unsigned long long)expect);
     }
 
     if (w->count == w->cap) {
@@ -2346,6 +2453,13 @@ status_t pack_stored_add(pack_stored_writer_t *w,
     off_t at = ftello(w->dat_f);
     if (at < 0) return set_error_errno(ERR_IO, "pack_stored_add: ftello");
 
+    /* One chunk, never the payload: the object may not fit in memory. A
+     * small entry gets a buffer its own size rather than a whole chunk. */
+    size_t chunk = atomic_load(&pack_stored_chunk);
+    size_t bufsz = len < (uint64_t)chunk ? (size_t)len : chunk;
+    uint8_t *buf = malloc(bufsz ? bufsz : 1);
+    if (!buf) return set_error(ERR_NOMEM, "pack_stored_add: chunk buffer");
+
     pack_dat_entry_hdr_t eh;
     memset(&eh, 0, sizeof(eh));
     memcpy(eh.hash, hash, OBJECT_HASH_SIZE);
@@ -2355,10 +2469,21 @@ status_t pack_stored_add(pack_stored_writer_t *w,
     eh.uncompressed_size = uncompressed_size;
     eh.compressed_size   = len;
 
+    status_t st = OK;
     if (fwrite(&eh, sizeof(eh), 1, w->dat_f) != 1)
-        return set_error_errno(ERR_IO, "pack_stored_add: write entry header");
-    if (len && fwrite(payload, 1, len, w->dat_f) != len)
-        return set_error_errno(ERR_IO, "pack_stored_add: write payload");
+        st = set_error_errno(ERR_IO, "pack_stored_add: write entry header");
+    for (uint64_t left = len; st == OK && left > 0; ) {
+        size_t n = left < (uint64_t)bufsz ? (size_t)left : bufsz;
+        st = rd(rd_ctx, buf, n);
+        if (st == OK && fwrite(buf, 1, n, w->dat_f) != n)
+            st = set_error_errno(ERR_IO, "pack_stored_add: write payload");
+        left -= n;
+    }
+    free(buf);
+    if (st != OK) {
+        stored_entry_rollback(w, at);
+        return st;
+    }
 
     pack_idx_disk_entry_t *e = &w->entries[w->count];
     memset(e, 0, sizeof(*e));
@@ -2393,6 +2518,16 @@ static void pack_stored_free(pack_stored_writer_t *w)
 status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed)
 {
     if (!w) return set_error(ERR_INVALID, "pack_stored_finish: no writer");
+
+    if (w->broken) {
+        /* A torn entry is still in the file; installing it would put an
+         * entry on disk that enumerates and never reads. */
+        char tmp[PATH_MAX];
+        snprintf(tmp, sizeof(tmp), "%s", w->dat_tmp);
+        pack_stored_abort(w);
+        return set_error(ERR_IO, "pack_stored_finish: %s holds an entry that could "
+                         "not be rolled back; discarded", tmp);
+    }
 
     if (w->count == 0) {
         /* Nothing arrived. An empty pack is a file every later enumeration
