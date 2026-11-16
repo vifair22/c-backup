@@ -135,9 +135,9 @@ Notes that matter:
 
 ## The policy
 
-A line starting with `#` or `;` is a comment, and so is `#` after
-whitespace at the end of a value, as in the example; an `argv.N` value is
-taken verbatim, `#` included.
+A line starting with `#` or `;` is a comment, and so is `#` or `;` after
+whitespace at the end of a value, as in the examples; an `argv.N` value is
+taken verbatim, `#` and `;` included.
 
 ```ini
 [helper]
