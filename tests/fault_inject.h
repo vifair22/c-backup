@@ -34,6 +34,21 @@ extern _Thread_local int fault_fsync_at;
  */
 extern _Thread_local size_t fault_malloc_peak;
 
+/*
+ * A disk that fills: once armed (>= 0), fwrite on this thread succeeds for
+ * that many bytes in total and then fails every call with ENOSPC until
+ * reset. fault_fwrite_bytes_seen counts what was let through.
+ *
+ * A countdown of calls is the wrong tool for stopping a copy: it lands
+ * wherever the call count says, and when a change upstream adds a call the
+ * fault fires somewhere harmless and the copy runs to completion. A test of
+ * a 129 GiB sparse entry did exactly that and wrote it out densely until the
+ * CI runner's disk was full. A byte budget bounds what can be written
+ * however the calls are arranged.
+ */
+extern _Thread_local long long fault_fwrite_bytes_left;
+extern _Thread_local long long fault_fwrite_bytes_seen;
+
 /* __real_* declarations (provided by linker --wrap) */
 extern void   *__real_malloc(size_t);
 extern void   *__real_calloc(size_t, size_t);
@@ -52,6 +67,8 @@ static inline void fault_reset_all(void) {
     fault_fseeko_at = -1;
     fault_fsync_at  = -1;
     fault_malloc_peak = 0;
+    fault_fwrite_bytes_left = -1;
+    fault_fwrite_bytes_seen = 0;
 }
 
 /*
