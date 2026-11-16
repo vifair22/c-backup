@@ -28,9 +28,14 @@
 #include <cmocka.h>
 
 #include "server.h"
+#include "test_port.h"
 #include "test_tmp.h"
 
-#define TEST_PORT  18731
+/* Chosen by the kernel before each test (FLAKE-13). It was a fixed 18731,
+ * which a second run on the same host - another worktree, another CI job -
+ * already held. */
+static int g_port;
+#define TEST_PORT  g_port
 #define TEST_SOCK  TEST_TMP "/c_backup_test_server.sock"
 
 /* 1 if something accepts a TCP connection on addr:port (host byte order). */
@@ -229,16 +234,23 @@ static void test_empty_bind_means_loopback(void **state)
     api_server_stop(srv);
 }
 
+static int fresh_port(void **state)
+{
+    (void)state;
+    g_port = test_free_port();
+    return g_port > 0 ? 0 : -1;
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
-        cmocka_unit_test(test_nothing_listens_until_start),
-        cmocka_unit_test(test_failed_start_leaves_another_socket_alone),
-        cmocka_unit_test(test_second_instance_refused_on_socket_alone),
-        cmocka_unit_test(test_stale_socket_file_is_replaced),
-        cmocka_unit_test(test_restart_rebinds_over_time_wait),
-        cmocka_unit_test(test_create_rejects_what_cannot_work),
-        cmocka_unit_test(test_empty_bind_means_loopback),
+        cmocka_unit_test_setup(test_nothing_listens_until_start, fresh_port),
+        cmocka_unit_test_setup(test_failed_start_leaves_another_socket_alone, fresh_port),
+        cmocka_unit_test_setup(test_second_instance_refused_on_socket_alone, fresh_port),
+        cmocka_unit_test_setup(test_stale_socket_file_is_replaced, fresh_port),
+        cmocka_unit_test_setup(test_restart_rebinds_over_time_wait, fresh_port),
+        cmocka_unit_test_setup(test_create_rejects_what_cannot_work, fresh_port),
+        cmocka_unit_test_setup(test_empty_bind_means_loopback, fresh_port),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
