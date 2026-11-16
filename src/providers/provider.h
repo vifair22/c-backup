@@ -346,6 +346,16 @@ typedef struct sp_provider_ops {
      * to EOF by the caller and closed by it; stream_close then says whether
      * the producer succeeded (*ok), and only then is the item kept. NULL
      * when the provider has no streams. */
+    /* One capture over several units (pause scope group or job,
+     * container-backup.md 6.2): every member of every unit paused together
+     * when a pause is called for, one atomic snapshot per pool for all of
+     * them, then one session per unit, read and ended separately; the
+     * shared snapshots go with the last end. NULL: each unit begins on its
+     * own. */
+    status_t (*begin_group)(sp_ctx_t *ctx, const sp_unit_desc_t *const *units, size_t n,
+                            const sp_begin_req_t *req, sp_session_t **out,
+                            const sp_session_info_t **infos);
+
     /* Let go a pause begin kept (SP_CF_PAUSE_HELD). *cap_hit 1 when it had
      * already been released by the watchdog at the pause cap, so what was
      * read under it is not all from one instant. NULL: never held. */

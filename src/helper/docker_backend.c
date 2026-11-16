@@ -74,6 +74,8 @@ struct sp_session {
     size_t            n_logs;
     struct { char item[SP_ITEM_ID_MAX]; helper_run_t *run; int err_fd; } streams[4];
     size_t            n_streams;
+    /* Snapshots shared with the other units of a group capture, or NULL. */
+    struct group_snaps *grp;
     /* A pause kept past begin for the fallback's second pass. */
     int               held;
     int               paused[MEMBERS_MAX];
@@ -877,6 +879,18 @@ static void session_free(struct sp_session *s)
     free(s);
 }
 
+/* A group capture's snapshots: one set for every unit, destroyed with the
+ * last session that reads from it. */
+struct group_snaps {
+    pthread_mutex_t mu;
+    int             refs;
+    snap_set_t      set;
+    sp_holds_t      holds;
+    int             has_holds;
+};
+
+static snap_set_t *snaps_of(struct sp_session *s) { return s->grp ? &s->grp->set : &s->snaps; }
+
 /* Unpause every member this session paused, clearing each hold. */
 static void unpause_all(struct sp_session *s, int64_t *hold, int *paused)
 {
@@ -1073,7 +1087,7 @@ static status_t d_tree_root(sp_session_t *s, const sp_item_desc_t *item, char *b
             snprintf(buf, sz, "%s", s->items[i].real);
             return OK;
         }
-        return snap_read_path(&s->c->snap, &s->snaps, s->items[i].real, buf, sz);
+        return snap_read_path(&s->c->snap, snaps_of(s), s->items[i].real, buf, sz);
     }
     return set_error(ERR_NOT_FOUND, "docker: no tree %s in this session", item->id);
 }
@@ -1083,7 +1097,21 @@ static status_t d_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapsho
     (void)outcome; (void)snapshot_id;
     int cap = 0;
     (void)d_release(s, &cap);
-    status_t st = snap_release(&s->c->snap, &s->snaps, s->c->pol->daemon_id, s->has_holds ? &s->holds : NULL);
+    status_t st = OK;
+    if (s->grp) {
+        struct group_snaps *g = s->grp;
+        pthread_mutex_lock(&g->mu);
+        int last = --g->refs == 0;
+        pthread_mutex_unlock(&g->mu);
+        if (last) {
+            st = snap_release(&s->c->snap, &g->set, s->c->pol->daemon_id, g->has_holds ? &g->holds : NULL);
+            pthread_mutex_destroy(&g->mu);
+            free(g);
+        }
+        s->grp = NULL;
+    } else {
+        st = snap_release(&s->c->snap, &s->snaps, s->c->pol->daemon_id, s->has_holds ? &s->holds : NULL);
+    }
     if (st != OK) { log_warn("docker: %s", err_msg()); err_clear(); }
     session_free(s);
     return OK;
@@ -1179,12 +1207,151 @@ static status_t d_stream_close(sp_session_t *s, const sp_item_desc_t *item, int 
     return set_error(ERR_NOT_FOUND, "docker: dump %s was not open", item->id);
 }
 
+/*
+ * A group capture (6.2, pause_scope group or job): the units' members
+ * paused together when the combined capture needs it (pause: auto, more
+ * than one instant over all of them; always if any unit says so), one
+ * snapshot set over every domain any of them touches, taken once,
+ * unpaused, then a session per unit sharing that set.
+ */
+static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, size_t n,
+                              const sp_begin_req_t *req, sp_session_t **out,
+                              const sp_session_info_t **infos)
+{
+    if (n == 0 || n > 64) return set_error(ERR_INVALID, "docker: a group capture is 1 to 64 units");
+    struct sp_session **ss = calloc(n, sizeof(*ss));
+    struct group_snaps *g = calloc(1, sizeof(*g));
+    if (!ss || !g) { free(ss); free(g); return set_error(ERR_NOMEM, "docker: group"); }
+    pthread_mutex_init(&g->mu, NULL);
+    if (req->holds) { g->holds = *req->holds; g->has_holds = 1; }
+    status_t st = OK;
+    size_t fallback[64] = { 0 };
+    int running[64] = { 0 }, any_running = 0, mode_always = 0;
+    for (size_t k = 0; st == OK && k < n; k++) {
+        struct sp_session *s = ss[k] = calloc(1, sizeof(*s));
+        if (!s) { st = set_error(ERR_NOMEM, "docker: group"); break; }
+        s->c = c;
+        s->grp = g;
+        g->refs++;
+        snprintf(s->unit, sizeof(s->unit), "%s", units[k]->unit_id);
+        if ((st = members_of(c, units[k]->unit_id, s->members, &s->n_members)) != OK) break;
+        s->items = calloc(units[k]->n_items ? units[k]->n_items : 1, sizeof(*s->items));
+        if (!s->items) { st = set_error(ERR_NOMEM, "docker: group"); break; }
+        for (size_t i = 0; st == OK && i < units[k]->n_items; i++) {
+            const sp_item_desc_t *it = &units[k]->items[i];
+            if (it->kind != SP_ITEM_TREE || !it->source) continue;
+            sitem_t *x = &s->items[s->n_items++];
+            snprintf(x->id, sizeof(x->id), "%s", it->id);
+            snprintf(x->real, sizeof(x->real), "%s", it->source);
+            snap_dom_t d;
+            if ((st = snap_domain_of(&c->snap, x->real, &d)) != OK) break;
+            if (d.kind == SNAP_NONE) { x->live = 1; fallback[k]++; continue; }
+            st = snap_set_add(&g->set, &d);
+        }
+        for (size_t i = 0; i < s->n_members; i++) running[k] |= s->members[i].running;
+        any_running |= running[k];
+        mode_always |= glob_any(c->pol->pause_always, c->pol->n_pause_always, units[k]->unit_id);
+    }
+    unsigned instants = st == OK ? snap_instants(g->set.doms, g->set.n) : 0;
+    /* Pre hooks of every unit, live, before the pause. */
+    int ran[64] = { 0 }, failed[64] = { 0 };
+    for (size_t k = 0; st == OK && k < n; k++) {
+        failed[k] = running[k] ? run_hooks(c, units[k]->unit_id, 1, ss[k], &ran[k]) : 0;
+        if (failed[k] < 0) st = ERR_IO;
+    }
+    int mode = mode_always ? 1 : c->pol->docker_pause;
+    int want = st == OK && any_running && (mode == 1 || (mode == 0 && instants > 1));
+    /* Every member of every unit, journalled, then paused together. */
+    size_t nm = 0;
+    for (size_t k = 0; k < n && ss[k]; k++) nm += ss[k]->n_members;
+    pause_job_t *jobs = calloc(nm ? nm : 1, sizeof(*jobs));
+    pthread_t *th = calloc(nm ? nm : 1, sizeof(*th));
+    int *started = calloc(nm ? nm : 1, sizeof(*started));
+    int64_t *hid = calloc(nm ? nm : 1, sizeof(*hid));
+    int *pz = calloc(nm ? nm : 1, sizeof(*pz));
+    if (st == OK && (!jobs || !th || !started || !hid || !pz)) st = set_error(ERR_NOMEM, "docker: group");
+    int pause_failed = 0;
+    uint64_t t0 = ms_now();
+    size_t m = 0;
+    for (size_t k = 0; want && st == OK && k < n; k++)
+        for (size_t i = 0; i < ss[k]->n_members; i++, m++) {
+            member_t *mb = &ss[k]->members[i];
+            jobs[m] = (pause_job_t){ c, mb, ERR_IO, "not attempted" };
+            if (!mb->running || mb->paused || mb->never) { jobs[m].st = OK; continue; }
+            char detail[128];
+            snprintf(detail, sizeof(detail), "docker:%s", mb->id);
+            if (g->has_holds && g->holds.record(g->holds.ctx, SP_HOLD_PAUSE, detail, &hid[m]) != OK) { err_clear(); pause_failed = 1; }
+            else if (pthread_create(&th[m], NULL, pause_main, &jobs[m]) == 0) started[m] = 1;
+        }
+    for (size_t q = 0; q < m; q++) {
+        if (started[q]) { pthread_join(th[q], NULL); if (jobs[q].st == OK) pz[q] = 1; else pause_failed = 1; }
+    }
+    int any_paused = 0;
+    for (size_t q = 0; q < m; q++) any_paused |= pz[q];
+    if (st == OK && pause_failed && instants > 1)
+        st = set_error(ERR_IO, "docker: a member did not pause, and the group spans %u snapshot instants", instants);
+    for (size_t i = 0; st == OK && i < g->set.n; i++) syncfs_root(c, g->set.doms[i].root);
+    if (st == OK && g->set.n) st = snap_take(&c->snap, &g->set, c->pol->daemon_id, req->job_id, g->has_holds ? &g->holds : NULL);
+    char why[512] = "";
+    if (st != OK) snprintf(why, sizeof(why), "%.500s", err_msg());
+    /* Unpause whatever paused, whatever happened. */
+    m = 0;
+    for (size_t k = 0; k < n && ss[k]; k++)
+        for (size_t i = 0; i < ss[k]->n_members && m < nm; i++, m++) {
+            if (!pz[m]) continue;
+            if (pause_one(c, &ss[k]->members[i], 0) == OK) {
+                if (g->has_holds && hid[m] && g->holds.clear(g->holds.ctx, hid[m]) != OK) err_clear();
+            } else {
+                log_error("docker: cannot unpause %s: %s", ss[k]->members[i].name, err_msg());
+                err_clear();
+            }
+        }
+    uint64_t pause_ms = any_paused ? ms_now() - t0 : 0;
+    free(jobs); free(th); free(started); free(hid); free(pz);
+    for (size_t k = 0; st == OK && k < n; k++) {
+        struct sp_session *s = ss[k];
+        int pran = 0;
+        if (running[k] && run_hooks(c, units[k]->unit_id, 0, s, &pran) < 0) {
+            (void)sp_session_info_warn(&s->info, "%.400s", err_msg());
+            err_clear();
+        }
+        sp_consistency_t lvl;
+        if (!running[k]) lvl = SP_CONSIST_OFFLINE;
+        else if (fallback[k] || (instants > 1 && !any_paused)) lvl = SP_CONSIST_INCONSISTENT;
+        else if (ran[k] && failed[k] == 0) lvl = SP_CONSIST_APPLICATION;
+        else lvl = SP_CONSIST_CRASH;
+        if (fallback[k] && running[k])
+            (void)sp_session_info_warn(&s->info, "%zu mount(s) on no snapshot domain read live (fallback-live)", fallback[k]);
+        (void)sp_session_info_warn(&s->info, "captured with %zu other unit(s) at one instant", n - 1);
+        s->info.achieved = lvl;
+        s->info.pause_ms = pause_ms;
+        s->info.consist_flags = (any_paused ? SP_CF_PAUSED : 0) | (g->set.n ? SP_CF_FS_SNAPSHOT : 0) |
+                                (ran[k] && failed[k] == 0 ? SP_CF_HOOK_PRE_OK : 0);
+        if (lvl < req->require)
+            st = set_error(ERR_IO, "docker: %s reached %s, below the %s required", units[k]->unit_id,
+                           sp_consistency_name(lvl), sp_consistency_name(req->require));
+    }
+    if (st != OK) {
+        if (!why[0]) snprintf(why, sizeof(why), "%.500s", err_msg());
+        (void)snap_release(&c->snap, &g->set, c->pol->daemon_id, g->has_holds ? &g->holds : NULL);
+        for (size_t k = 0; k < n; k++) if (ss[k]) { ss[k]->grp = NULL; session_free(ss[k]); }
+        pthread_mutex_destroy(&g->mu);
+        free(g);
+        free(ss);
+        return set_error(ERR_IO, "%s", why);
+    }
+    for (size_t k = 0; k < n; k++) { out[k] = ss[k]; infos[k] = &ss[k]->info; }
+    free(ss);
+    return OK;
+}
+
 static const sp_provider_ops_t k_docker_ops = {
     .name = "docker", .abi = SP_ABI_VERSION,
     .init = d_init, .fini = d_fini, .probe = d_probe, .list_units = d_list,
     .describe = d_describe, .desc_free = sp_unit_desc_free, .begin = d_begin,
     .blob_read = d_blob_read, .tree_root = d_tree_root, .end = d_end, .sweep = d_sweep,
     .stream_open = d_stream_open, .stream_close = d_stream_close, .release = d_release,
+    .begin_group = d_begin_group,
 };
 
 /* ------------------------------------------------------------------ */

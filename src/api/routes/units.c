@@ -592,6 +592,16 @@ static api_response_t unit_policy_put(const api_request_t *req, int64_t repo_id,
     cJSON_ArrayForEach(e, o) {
         /* Enrolled exclusions: patterns on recorded paths, one per line,
          * applied to this unit only (container-backup.md 4.2). */
+        if (e->string && strcmp(e->string, "capture.group") == 0) {
+            /* The units sharing a capture under pause_scope group (6.2). */
+            if (cJSON_IsNull(e)) continue;
+            const char *g = cJSON_GetStringValue(e);
+            if (!g || strlen(g) > 63 || strspn(g, "abcdefghijklmnopqrstuvwxyz0123456789_.-") != strlen(g)) {
+                cJSON_Delete(o);
+                return api_error(400, "capture.group is a name of up to 63 of a-z 0-9 _ . -, or \"\" for none");
+            }
+            continue;
+        }
         if (e->string && strcmp(e->string, "capture.exclude") == 0) {
             if (cJSON_IsNull(e)) continue;
             int bad = !cJSON_IsString(e) || strlen(e->valuestring) > 64 * 1024;
@@ -611,7 +621,7 @@ static api_response_t unit_policy_put(const api_request_t *req, int64_t repo_id,
         gfs_retention_t probe;
         if (!e->string || !ret_field(&probe, e->string)) {
             char msg[160];
-            snprintf(msg, sizeof(msg), "unknown unit policy key '%.100s'; use retention.keep_* or capture.exclude",
+            snprintf(msg, sizeof(msg), "unknown unit policy key '%.100s'; use retention.keep_*, capture.exclude or capture.group",
                      e->string ? e->string : "");
             cJSON_Delete(o);
             return api_error(400, msg);
@@ -669,6 +679,7 @@ typedef struct {
     char       **units;
     size_t       n_units;
     sp_consistency_t require;
+    int              pause_scope;
 } units_job_t;
 
 static void units_job_free(void *p)
@@ -712,6 +723,7 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
     o.units = (const char **)(void *)j->units;
     o.n_units = j->n_units;
     o.require = j->require;
+    o.pause_scope = j->pause_scope;
     o.job_id = job_progress_id(progress_ctx);
     o.cancel = cancel;
     o.progress_cb = progress;
@@ -786,8 +798,17 @@ static int units_params(const char *body, size_t len, units_job_t *j, char **can
     const cJSON *ex = cJSON_GetObjectItemCaseSensitive(o, "exclude");
     const cJSON *un = cJSON_GetObjectItemCaseSensitive(o, "units");
     const cJSON *rq = cJSON_GetObjectItemCaseSensitive(o, "require");
+    const cJSON *ps = cJSON_GetObjectItemCaseSensitive(o, "pause_scope");
     const cJSON *e;
     j->require = SP_CONSIST_CRASH;
+    j->pause_scope = UNIT_SCOPE_UNIT;
+    if (ps) {
+        const char *v = cJSON_GetStringValue(ps);
+        if (v && strcmp(v, "unit") == 0) j->pause_scope = UNIT_SCOPE_UNIT;
+        else if (v && strcmp(v, "group") == 0) j->pause_scope = UNIT_SCOPE_GROUP;
+        else if (v && strcmp(v, "job") == 0) j->pause_scope = UNIT_SCOPE_JOB;
+        else { snprintf(why, wsz, "pause_scope must be unit, group or job"); goto out; }
+    }
     if (!cJSON_IsString(prov) || !*prov->valuestring || strlen(prov->valuestring) >= SP_PROVIDER_MAX) {
         snprintf(why, wsz, "provider is required");
         goto out;
@@ -840,6 +861,8 @@ static int units_params(const char *body, size_t len, units_job_t *j, char **can
                 cJSON_AddItemToArray(ua, cJSON_CreateString(j->units[i]));
         }
         if (rq) cJSON_AddStringToObject(c, "require", sp_consistency_name(j->require));
+        if (j->pause_scope == UNIT_SCOPE_GROUP) cJSON_AddStringToObject(c, "pause_scope", "group");
+        else if (j->pause_scope == UNIT_SCOPE_JOB) cJSON_AddStringToObject(c, "pause_scope", "job");
         char *t = cJSON_PrintUnformatted(c);
         cJSON_Delete(c);
         if (!t) goto out;

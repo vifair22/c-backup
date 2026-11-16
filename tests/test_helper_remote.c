@@ -446,6 +446,32 @@ static void test_compose_definition(void **state)
     free(txt);
 }
 
+/* pause_scope job through the helper: one capture for both units, each
+ * its own snapshot, the capture ended with the last of them. */
+static void test_group_through_helper(void **state)
+{
+    (void)state;
+    assert_int_equal(fake_unit_add(fk, "u2", "cbk-uat-two", SP_STATE_RUNNING, SP_CAP_QUIESCE | SP_CAP_SNAPSHOT), OK);
+    assert_int_equal(fake_blob_add(fk, "u2", "conf", ".cbackup-unit/config/conf", "two", 3), OK);
+    const char *names[] = { "cbk-uat-one", "cbk-uat-two" };
+    unit_backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.provider = "fake";
+    o.units = names;
+    o.n_units = 2;
+    o.require = SP_CONSIST_CRASH;
+    o.job_id = 81;
+    o.pause_scope = UNIT_SCOPE_JOB;
+    unit_backup_result_t res;
+    assert_int_equal(unit_backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.ok, 2);
+    assert_true(res.units[0].snapshot_id > 0 && res.units[1].snapshot_id > 0);
+    unit_backup_result_free(&res);
+    assert_int_equal(helper_server_captures(srv), 0);
+    assert_int_equal(helper_server_holds(srv), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshot_units WHERE repo_id = ?"), 2);
+}
+
 /* Wait up to 5 s for the link to be connected with fake enabled. */
 static int wait_connected(void)
 {
@@ -543,6 +569,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
         cmocka_unit_test_setup_teardown(test_unit_restore, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_compose_definition, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_group_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),

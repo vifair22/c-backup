@@ -583,13 +583,23 @@ static void held_done(void *ctx)
     u->cap_hit = cap;
 }
 
-static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
-                        const unit_backup_opts_t *o, const sp_provider_ops_t *ops,
-                        sp_ctx_t *pctx, const listed_t *lu, size_t index, size_t total,
-                        unit_backup_one_t *res)
+/* A unit made ready for begin: locked, described, checked, journalled. */
+typedef struct {
+    char                     key[UNIT_KEY_MAX];
+    sp_unit_desc_t          *d;
+    units_journal_t          jr;
+    sp_holds_t               holds;
+    sp_session_t            *sess;
+    const sp_session_info_t *info;
+} unit_prep_t;
+
+static status_t unit_prepare(cutils_db_t *db, const unit_backup_opts_t *o,
+                             const sp_provider_ops_t *ops, sp_ctx_t *pctx, const listed_t *lu,
+                             unit_backup_one_t *res, unit_prep_t *pp)
 {
-    char key[UNIT_KEY_MAX];
-    unit_key_format(key, sizeof(key), ops->name, lu->id);
+    memset(pp, 0, sizeof(*pp));
+    unit_key_format(pp->key, sizeof(pp->key), ops->name, lu->id);
+    const char *key = pp->key;
     snprintf(res->unit_key, sizeof(res->unit_key), "%s", key);
     snprintf(res->name, sizeof(res->name), "%s", lu->name);
 
@@ -609,44 +619,50 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
         return st;
     }
     if (d->name) snprintf(res->name, sizeof(res->name), "%s", d->name);
+    pp->d = d;
+    pp->jr.db = db;
+    snprintf(pp->jr.provider, sizeof(pp->jr.provider), "%s", ops->name);
+    snprintf(pp->jr.unit_id, sizeof(pp->jr.unit_id), "%s", d->unit_id);
+    pp->jr.job_id = o->job_id;
+    pp->holds = units_journal_holds(&pp->jr);
+    return OK;
+}
 
-    units_journal_t jr;
-    memset(&jr, 0, sizeof(jr));
-    jr.db = db;
-    snprintf(jr.provider, sizeof(jr.provider), "%s", ops->name);
-    snprintf(jr.unit_id, sizeof(jr.unit_id), "%s", d->unit_id);
-    jr.job_id = o->job_id;
-    sp_holds_t holds = units_journal_holds(&jr);
-    sp_begin_req_t req;
-    memset(&req, 0, sizeof(req));
-    req.job_id = o->job_id;
-    req.want = SP_CONSIST_APPLICATION;
-    req.require = o->require;
-    req.freeze_timeout_s = units_config()->freeze_timeout_s;
-    req.pause_max_s = units_config()->max_pause_s;
-    req.cancel = o->cancel;
-    req.holds = &holds;
-    req.daemon8 = units_daemon8();
+/* Undo unit_prepare for a unit that never began. */
+static void unit_unprepare(const sp_provider_ops_t *ops, unit_prep_t *pp)
+{
+    if (pp->d) ops->desc_free(pp->d);
+    pp->d = NULL;
+    units_unlock(pp->key);
+}
 
-    size_t n_fb = 0;
-    for (size_t i = 0; i < d->n_items; i++) n_fb += is_fallback(&d->items[i]) ? 1u : 0u;
-    req.hold_pause = n_fb > 0 && ops->release && d->state == SP_STATE_RUNNING;
-    if (req.hold_pause && (st = fallback_pass1(store, db, repo_id, o, d, key)) != OK) {
-        ops->desc_free(d);
-        units_unlock(key);
-        return st;
-    }
+static void begin_req(const unit_backup_opts_t *o, sp_holds_t *holds, sp_begin_req_t *req)
+{
+    memset(req, 0, sizeof(*req));
+    req->job_id = o->job_id;
+    req->want = SP_CONSIST_APPLICATION;
+    req->require = o->require;
+    req->freeze_timeout_s = units_config()->freeze_timeout_s;
+    req->pause_max_s = units_config()->max_pause_s;
+    req->cancel = o->cancel;
+    req->holds = holds;
+    req->daemon8 = units_daemon8();
+}
 
+/* After begin: the unit's content from its session, then end and unlock. */
+static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
+                           const unit_backup_opts_t *o, const sp_provider_ops_t *ops,
+                           unit_prep_t *pp, size_t index, size_t total, unit_backup_one_t *res)
+{
+    const char *key = pp->key;
+    sp_unit_desc_t *d = pp->d;
+    status_t st = OK;
     uctx_t u;
     memset(&u, 0, sizeof(u));
     u.ops = ops;
     u.desc = d;
-    st = ops->begin(pctx, d, &req, &u.sess, &u.info);
-    if (st != OK) {
-        ops->desc_free(d);
-        units_unlock(key);
-        return st;
-    }
+    u.sess = pp->sess;
+    u.info = pp->info;
     u.held = (u.info->consist_flags & SP_CF_PAUSE_HELD) != 0;
     res->achieved = u.info->achieved;
     res->n_warnings = (unsigned)u.info->n_warnings;
@@ -802,6 +818,28 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
     return OK;
 }
 
+static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
+                        const unit_backup_opts_t *o, const sp_provider_ops_t *ops,
+                        sp_ctx_t *pctx, const listed_t *lu, size_t index, size_t total,
+                        unit_backup_one_t *res)
+{
+    unit_prep_t pp;
+    status_t st = unit_prepare(db, o, ops, pctx, lu, res, &pp);
+    if (st != OK) return st;
+    sp_begin_req_t req;
+    begin_req(o, &pp.holds, &req);
+    size_t n_fb = 0;
+    for (size_t i = 0; i < pp.d->n_items; i++) n_fb += is_fallback(&pp.d->items[i]) ? 1u : 0u;
+    req.hold_pause = n_fb > 0 && ops->release && pp.d->state == SP_STATE_RUNNING;
+    if (req.hold_pause && (st = fallback_pass1(store, db, repo_id, o, pp.d, pp.key)) != OK) {
+        unit_unprepare(ops, &pp);
+        return st;
+    }
+    st = ops->begin(pctx, pp.d, &req, &pp.sess, &pp.info);
+    if (st != OK) { unit_unprepare(ops, &pp); return st; }
+    return unit_store(store, db, repo_id, o, ops, &pp, index, total, res);
+}
+
 /* ------------------------------------------------------------------ */
 
 void unit_backup_result_free(unit_backup_result_t *r)
@@ -818,6 +856,90 @@ static unit_backup_one_t *result_add(unit_backup_result_t *r)
     r->units = g;
     memset(&g[r->n], 0, sizeof(g[r->n]));
     return &g[r->n++];
+}
+
+/* A unit's capture group (unit_policy capture.group), "" for none. */
+static void group_of(cutils_db_t *db, int64_t repo_id, const char *key, char *buf, size_t sz)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    buf[0] = '\0';
+    if (db_execute(db, "SELECT value FROM unit_policy WHERE repo_id = ? AND unit_key = ? AND key = 'capture.group'",
+                   (const char *[]){ repo, key, NULL }, &r) == 0 && r && r->nrows == 1)
+        snprintf(buf, sz, "%s", r->rows[0][0]);
+    db_result_free(r);
+}
+
+/* What one unit's attempt leaves in the job's result. */
+static void tally(unit_backup_result_t *out, unit_backup_one_t *r, status_t one,
+                  status_t *first_st, char *first_err, size_t fsz)
+{
+    r->st = one;
+    if (one == OK) { out->ok++; return; }
+    snprintf(r->error, sizeof(r->error), "%.500s", err_msg());
+    log_warn("unit backup: %s: %s", r->unit_key, r->error);
+    err_clear();
+    out->failed++;
+    if (*first_st == OK) {
+        *first_st = one;
+        snprintf(first_err, fsz, "%.150s: %.350s", r->unit_key, r->error);
+    }
+}
+
+/*
+ * Several units in one capture (pause scope group or job, 6.2): each
+ * prepared, then one begin_group, then each read from its own session. A
+ * unit that cannot be prepared fails alone; a begin that fails fails them
+ * all.
+ */
+static void run_group(store_t *store, cutils_db_t *db, int64_t repo_id, const unit_backup_opts_t *o,
+                      const sp_provider_ops_t *ops, sp_ctx_t *pctx, const listed_t *const *lus,
+                      unit_backup_one_t **rs, size_t n, size_t first_index, size_t total,
+                      unit_backup_result_t *out, status_t *first_st, char *first_err, size_t fsz)
+{
+    unit_prep_t *pp = calloc(n, sizeof(*pp));
+    size_t *who = calloc(n, sizeof(*who));
+    const sp_unit_desc_t **descs = calloc(n, sizeof(*descs));
+    sp_session_t **sess = calloc(n, sizeof(*sess));
+    const sp_session_info_t **infos = calloc(n, sizeof(*infos));
+    if (!pp || !who || !descs || !sess || !infos) {
+        set_error(ERR_NOMEM, "unit backup: group");
+        for (size_t k = 0; k < n; k++) tally(out, rs[k], ERR_NOMEM, first_st, first_err, fsz);
+        free(pp); free(who); free(descs); free(sess); free(infos);
+        return;
+    }
+    size_t m = 0;
+    for (size_t k = 0; k < n; k++) {
+        status_t st = unit_prepare(db, o, ops, pctx, lus[k], rs[k], &pp[m]);
+        if (st != OK) { tally(out, rs[k], st, first_st, first_err, fsz); continue; }
+        who[m] = k;
+        descs[m] = pp[m].d;
+        m++;
+    }
+    if (m) {
+        log_info("unit backup: %zu unit(s) in one capture", m);
+        sp_begin_req_t req;
+        begin_req(o, &pp[0].holds, &req);
+        status_t st = ops->begin_group(pctx, descs, m, &req, sess, infos);
+        if (st != OK) {
+            char why[ERR_MSG_MAX];
+            snprintf(why, sizeof(why), "%s", err_msg());
+            for (size_t q = 0; q < m; q++) {
+                unit_unprepare(ops, &pp[q]);
+                set_error(st, "%s", why);
+                tally(out, rs[who[q]], st, first_st, first_err, fsz);
+            }
+        } else {
+            for (size_t q = 0; q < m; q++) {
+                pp[q].sess = sess[q];
+                pp[q].info = infos[q];
+                status_t one = unit_store(store, db, repo_id, o, ops, &pp[q], first_index + who[q], total, rs[who[q]]);
+                tally(out, rs[who[q]], one, first_st, first_err, fsz);
+            }
+        }
+    }
+    free(pp); free(who); free(descs); free(sess); free(infos);
 }
 
 status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -884,7 +1006,44 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
     }
 
-    for (size_t k = 0; st == OK && k < np; k++) {
+    /* Capture groups: everything under job scope, units sharing a
+     * capture.group under group scope; a group of one is a unit. */
+    char (*grp)[64] = calloc(np ? np : 1, sizeof(*grp));
+    int *done = calloc(np ? np : 1, sizeof(*done));
+    if (!grp || !done) st = set_error(ERR_NOMEM, "unit backup");
+    if (st == OK && ops->begin_group && o->pause_scope != UNIT_SCOPE_UNIT) {
+        for (size_t k = 0; k < np; k++) {
+            if (o->pause_scope == UNIT_SCOPE_JOB) { snprintf(grp[k], sizeof(grp[k]), "job"); continue; }
+            char key[UNIT_KEY_MAX];
+            unit_key_format(key, sizeof(key), ops->name, l.v[pick[k]].id);
+            group_of(db, repo_id, key, grp[k], sizeof(grp[k]));
+        }
+    }
+    for (size_t k = 0; st == OK && grp && done && k < np; k++) {
+        if (done[k]) continue;
+        size_t members = 0;
+        for (size_t q = k; grp[k][0] && q < np; q++) members += !done[q] && strcmp(grp[q], grp[k]) == 0;
+        if (members > 1 && !(o->cancel && atomic_load(o->cancel))) {
+            const listed_t **lus = calloc(members, sizeof(*lus));
+            unit_backup_one_t **rs = calloc(members, sizeof(*rs));
+            size_t g = 0;
+            for (size_t q = k; lus && rs && q < np; q++) {
+                if (done[q] || strcmp(grp[q], grp[k]) != 0) continue;
+                unit_backup_one_t *r = result_add(out);
+                if (!r) break;
+                lus[g] = &l.v[pick[q]];
+                rs[g++] = r;
+                done[q] = 1;
+            }
+            /* result_add may move the array: take the pointers afresh. */
+            for (size_t q = 0; rs && q < g; q++) rs[q] = &out->units[out->n - g + q];
+            if (!lus || !rs || g != members) st = set_error(ERR_NOMEM, "unit backup");
+            else run_group(store, db, repo_id, o, ops, pctx, lus, rs, g, k, np, out, &first_st, first_err, sizeof(first_err));
+            free(lus);
+            free(rs);
+            continue;
+        }
+        done[k] = 1;
         unit_backup_one_t *r = result_add(out);
         if (!r) { st = set_error(ERR_NOMEM, "unit backup"); break; }
         if (o->cancel && atomic_load(o->cancel)) {
@@ -896,20 +1055,10 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             continue;
         }
         status_t one = run_one(store, db, repo_id, o, ops, pctx, &l.v[pick[k]], k, np, r);
-        r->st = one;
-        if (one == OK) {
-            out->ok++;
-        } else {
-            snprintf(r->error, sizeof(r->error), "%.500s", err_msg());
-            log_warn("unit backup: %s: %s", r->unit_key, r->error);
-            err_clear();
-            out->failed++;
-            if (first_st == OK) {
-                first_st = one;
-                snprintf(first_err, sizeof(first_err), "%.150s: %.350s", r->unit_key, r->error);
-            }
-        }
+        tally(out, r, one, &first_st, first_err, sizeof(first_err));
     }
+    free(grp);
+    free(done);
     free(pick);
     listing_free(&l);
 

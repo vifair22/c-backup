@@ -49,7 +49,16 @@ typedef struct {
     void (*bytes_cb)(void *ctx, uint64_t done, uint64_t total);
     unsigned     store_workers;
     int          file_cache_match;
+    /* Pause scope (container-backup.md 6.2): each unit its own capture
+     * (unit), units sharing a capture.group in one (group), or every unit
+     * of the job in one (job). Group and job need a provider with
+     * begin_group; without one every unit is its own capture. */
+    int          pause_scope;          /* UNIT_SCOPE_* */
 } unit_backup_opts_t;
+
+#define UNIT_SCOPE_UNIT  0
+#define UNIT_SCOPE_GROUP 1
+#define UNIT_SCOPE_JOB   2
 
 typedef struct {
     char             unit_key[SP_PROVIDER_MAX + SP_UNIT_ID_MAX + 1];

@@ -343,6 +343,23 @@ only then are the snapshot mounts walked and read, so neither their
 directory walk nor their content falls inside the pause.
 `pause = never` units, and stopped ones, are read live and flagged.
 
+### Pause scope: unit, group, job
+
+By default every unit is its own capture (`pause_scope: unit`). A units
+job or schedule can ask for `"pause_scope": "job"`, every unit of the job
+in one capture, or `"group"`, units sharing a `capture.group` (unit
+policy, `PUT .../units/<p>/<unit>/policy {"capture.group": "proxy"}`) in
+one capture each and the rest alone (container-backup.md 6.2). A capture
+over several units takes their pre hooks, pauses every member of every
+unit together when the combined capture needs it (`pause: auto`: more
+than one snapshot instant over all of them; any unit in `pause_always`),
+takes one snapshot per pool for all of them, unpauses and runs the post
+hooks; each unit is then read and stored on its own, and the shared
+snapshots go with the last. A unit that cannot be described fails alone;
+a begin that fails fails the group. pause-read's held pause applies to
+unit scope only; in a group, mounts on no snapshot domain are read live
+and flagged.
+
 ### Pausing
 
 Members of a unit are paused together (each pause journalled first), so
@@ -484,8 +501,7 @@ journal rows after every fault (`GET /providers` `holds_open` 0, helper
 - `pause: false` is passed to the backend as the wanted level; the fake
   pauses whenever the unit can. The Docker provider decides from its
   policy (`pause`, `pause_always`) instead.
-- Not built yet (container-backup.md): pause scope `group` and `job`;
-  the `containers.fallback` modes other than `pause-read` (`live` is what
+- Not built yet (container-backup.md): the `containers.fallback` modes other than `pause-read` (`live` is what
   `pause = never` gives; `stop` and `fail` are not offered).
 - `restore.stage` and `restore.swap` act on host paths directly, so for a
   container provider they need the helper to see the pools at their host

@@ -11,6 +11,7 @@
 #include <cutils/log.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -34,6 +35,7 @@ struct sp_session {
     struct sp_ctx    *ctx;
     char              token[HELPER_TOKEN_HEX + 1];
     char              unit_id[SP_UNIT_ID_MAX];
+    struct rgroup    *grp;          /* a group capture's shared count, or NULL */
     cJSON            *desc;        /* units.describe at begin: blob offsets, run maps */
     int               blob_fd;     /* the sealed memfd describe passed, or -1 */
     int               late_fd;     /* capture.begin's memfd: hook logs, or -1 */
@@ -617,9 +619,102 @@ static status_t r_release(sp_session_t *s, int *cap_hit)
     return st;
 }
 
+/* A group capture (begin_group): one capture, ended with its last session. */
+struct rgroup { pthread_mutex_t mu; int refs; };
+
+static status_t r_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, size_t n,
+                              const sp_begin_req_t *req, sp_session_t **out,
+                              const sp_session_info_t **infos)
+{
+    if (n == 0 || n > HELPER_UNITS_MAX) return set_error(ERR_INVALID, "helper: a group capture is 1 to %d units", HELPER_UNITS_MAX);
+    struct sp_session **ss = calloc(n, sizeof(*ss));
+    struct rgroup *g = calloc(1, sizeof(*g));
+    if (!ss || !g) { free(ss); free(g); return set_error(ERR_NOMEM, "helper: group"); }
+    pthread_mutex_init(&g->mu, NULL);
+    status_t st = OK;
+    for (size_t k = 0; st == OK && k < n; k++) {
+        struct sp_session *s = ss[k] = calloc(1, sizeof(*s));
+        if (!s) { st = set_error(ERR_NOMEM, "helper: group"); break; }
+        s->ctx = c;
+        s->blob_fd = -1;
+        s->late_fd = -1;
+        snprintf(s->unit_id, sizeof(s->unit_id), "%s", units[k]->unit_id);
+        st = rcall_fd(c->socket, "units.describe", args_unit(c, units[k]->unit_id), &s->desc, &s->blob_fd);
+    }
+    cJSON *res = NULL;
+    int late = -1;
+    if (st == OK) {
+        cJSON *a = cJSON_CreateObject();
+        cJSON *u = a ? cJSON_AddArrayToObject(a, "units") : NULL;
+        for (size_t k = 0; u && k < n; k++) {
+            char key[HELPER_UNIT_KEY_MAX + 1];
+            snprintf(key, sizeof(key), "%s:%s", c->provider, units[k]->unit_id);
+            cJSON_AddItemToArray(u, cJSON_CreateString(key));
+        }
+        if (a) cJSON_AddBoolToObject(a, "pause", (units[0]->caps & SP_CAP_PAUSE) != 0);
+        st = rcall_fd(c->socket, "capture.begin", a, &res, &late);
+    }
+    const char *tok = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture")) : NULL;
+    const cJSON *mem = cJSON_GetObjectItemCaseSensitive(res, "members");
+    if (st == OK && (!tok || strlen(tok) != HELPER_TOKEN_HEX || cJSON_GetArraySize(mem) != (int)n))
+        st = set_error(ERR_IO, "helper: a malformed group capture");
+    for (size_t k = 0; st == OK && k < n; k++) {
+        struct sp_session *s = ss[k];
+        cJSON *m = cJSON_GetArrayItem(mem, (int)k);
+        snprintf(s->token, sizeof(s->token), "%s", tok);
+        s->grp = g;
+        g->refs++;
+        s->roots = cJSON_DetachItemFromObjectCaseSensitive(m, "read_roots");
+        s->late = cJSON_DetachItemFromObjectCaseSensitive(m, "late_blobs");
+        if (late >= 0) s->late_fd = fcntl(late, F_DUPFD_CLOEXEC, 0);
+        s->info.achieved = (sp_consistency_t)num(m, "achieved");
+        s->info.consist_flags = (uint32_t)num(m, "flags");
+        s->info.freeze_ms = num(m, "freeze_ms");
+        s->info.pause_ms = num(m, "pause_ms");
+        const cJSON *w;
+        cJSON_ArrayForEach(w, cJSON_GetObjectItemCaseSensitive(m, "warnings"))
+            if (cJSON_IsString(w) && st == OK) st = sp_session_info_warn(&s->info, "%s", w->valuestring);
+        if (st == OK && !(s->info.plans = calloc(1, sizeof(*s->info.plans)))) st = set_error(ERR_NOMEM, "helper: plans");
+        if (st == OK && req && s->info.achieved < req->require)
+            st = set_error(ERR_INVALID, "unit %s: achieved %s, below the required %s", units[k]->unit_id,
+                           str_or(sp_consistency_name(s->info.achieved), "?"),
+                           str_or(sp_consistency_name(req->require), "?"));
+    }
+    if (late >= 0) close(late);
+    if (st != OK && tok && strlen(tok) == HELPER_TOKEN_HEX) {
+        char why[512];
+        snprintf(why, sizeof(why), "%.500s", err_msg());
+        cJSON *ea = cJSON_CreateObject();
+        if (ea) cJSON_AddStringToObject(ea, "capture", tok);
+        (void)rcall(c->socket, "capture.end", ea, NULL);
+        set_error(st, "%s", why);
+    }
+    cJSON_Delete(res);
+    if (st != OK) {
+        for (size_t k = 0; k < n; k++) if (ss[k]) { ss[k]->grp = NULL; session_free(ss[k]); }
+        pthread_mutex_destroy(&g->mu);
+        free(g);
+        free(ss);
+        return st;
+    }
+    for (size_t k = 0; k < n; k++) { out[k] = ss[k]; infos[k] = &ss[k]->info; }
+    free(ss);
+    return OK;
+}
+
 static status_t r_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapshot_id)
 {
     (void)outcome; (void)snapshot_id;
+    if (s->grp) {
+        /* Only the last unit of a group capture ends it. */
+        pthread_mutex_lock(&s->grp->mu);
+        int last = --s->grp->refs == 0;
+        pthread_mutex_unlock(&s->grp->mu);
+        if (!last) { s->grp = NULL; session_free(s); return OK; }
+        pthread_mutex_destroy(&s->grp->mu);
+        free(s->grp);
+        s->grp = NULL;
+    }
     cJSON *a = cJSON_CreateObject();
     if (a) cJSON_AddStringToObject(a, "capture", s->token);
     /* The lease bounds it either way: a capture.end that does not arrive
@@ -716,6 +811,7 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
             .blob_read = r_blob_read, .block_open = r_block_open, .tree_root = r_tree_root,
             .end = r_end, .sweep = r_sweep,
             .stream_open = r_stream_open, .stream_close = r_stream_close, .release = r_release,
+            .begin_group = r_begin_group,
         };
         st = sp_registry_add(o, c);
         if (st != OK) { free(c); break; }

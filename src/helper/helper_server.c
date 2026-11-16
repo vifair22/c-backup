@@ -626,16 +626,79 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
     cJSON *mem = res ? cJSON_AddArrayToObject(res, "members") : NULL;
     helper_err_t fail = mem ? HELPER_OK : HELPER_E_FAILED;
     char fmsg[512] = "out of memory";
+    /* Several units of one backend that can capture them together: one
+     * pause and one snapshot set for all (6.2), a session each. */
+    sp_unit_desc_t *gd[HELPER_UNITS_MAX] = { 0 };
+    sp_session_t *gs[HELPER_UNITS_MAX] = { 0 };
+    const sp_session_info_t *gi[HELPER_UNITS_MAX] = { 0 };
+    jctx_t *gj = NULL;
+    int grp = 0;
+    if (fail == HELPER_OK && r->n_units > 1) {
+        const char *u0 = NULL;
+        const helper_backend_t *b0 = backend_of(s, r->units[0], &u0);
+        grp = b0 && b0->ops->begin_group != NULL;
+        for (size_t i = 1; grp && i < r->n_units; i++) grp = backend_of(s, r->units[i], NULL) == b0;
+        for (size_t i = 0; grp && fail == HELPER_OK && i < r->n_units; i++) {
+            const char *uid = NULL;
+            (void)backend_of(s, r->units[i], &uid);
+            if (b0->ops->describe(b0->ctx, uid, &gd[i]) != OK) {
+                snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
+                fail = HELPER_E_FAILED;
+            }
+        }
+        if (grp && fail == HELPER_OK && !(gj = calloc(1, sizeof(*gj)))) fail = HELPER_E_FAILED;
+        if (grp && fail == HELPER_OK) {
+            gj->s = s;
+            snprintf(gj->unit, sizeof(gj->unit), "%s", r->units[0]);
+            gj->capture = seq;
+            sp_holds_t gh = { j_record, j_clear, gj };
+            sp_begin_req_t q;
+            memset(&q, 0, sizeof(q));
+            q.job_id = seq;
+            q.want = r->pause ? SP_CONSIST_QUIESCED : SP_CONSIST_CRASH;
+            q.require = SP_CONSIST_INCONSISTENT;
+            q.freeze_timeout_s = s->pol->max_pause_s;
+            q.pause_max_s = s->pol->max_pause_s;
+            q.holds = &gh;
+            q.daemon8 = s->pol->daemon_id;
+            if (b0->ops->begin_group(b0->ctx, (const sp_unit_desc_t *const *)gd, r->n_units, &q, gs, gi) != OK) {
+                snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
+                fail = HELPER_E_FAILED;
+            }
+        }
+        if (grp && fail != HELPER_OK) {
+            for (size_t i = 0; i < r->n_units; i++) if (gd[i]) b0->ops->desc_free(gd[i]);
+            free(gj);
+            gj = NULL;
+        }
+    }
     for (size_t i = 0; fail == HELPER_OK && i < r->n_units; i++) {
         const char *uid = NULL;
         const helper_backend_t *b = backend_of(s, r->units[i], &uid);
         sp_unit_desc_t *d = NULL;
+        jctx_t *j = NULL;
+        sp_session_t *sess = NULL;
+        const sp_session_info_t *info = NULL;
+        status_t st = OK;
+        if (grp) {
+            /* The last member carries the group's journal context: the
+             * shared snapshots are released through it at the last end,
+             * and members end in order. */
+            d = gd[i];
+            sess = gs[i];
+            info = gi[i];
+            gd[i] = NULL;
+            gs[i] = NULL;
+            j = i + 1 == r->n_units ? gj : NULL;
+            if (j) gj = NULL;
+            goto have_session;
+        }
         if (!b || b->ops->describe(b->ctx, uid, &d) != OK) {
             snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
             fail = HELPER_E_FAILED;
             break;
         }
-        jctx_t *j = calloc(1, sizeof(*j));
+        j = calloc(1, sizeof(*j));
         if (!j) { b->ops->desc_free(d); fail = HELPER_E_FAILED; break; }
         j->s = s;
         snprintf(j->unit, sizeof(j->unit), "%s", r->units[i]);
@@ -653,9 +716,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         /* pause: a pause may be held for the daemon's second pass over
          * mounts on no snapshot domain, released with lease.release. */
         q.hold_pause = r->hold;
-        sp_session_t *sess = NULL;
-        const sp_session_info_t *info = NULL;
-        status_t st = b->ops->begin(b->ctx, d, &q, &sess, &info);
+        st = b->ops->begin(b->ctx, d, &q, &sess, &info);
         /* The journal context outlives begin: end releases through it, so
          * it lives with the member and goes after end. */
         if (st != OK) {
@@ -665,6 +726,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
             fail = HELPER_E_FAILED;
             break;
         }
+    have_session:;
         member_t *m = &c.members[c.n_members++];
         snprintf(m->unit, sizeof(m->unit), "%s", r->units[i]);
         m->b = b;
@@ -733,6 +795,18 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
     if (fail != HELPER_OK) {
         cJSON_Delete(res);
         capture_finish(s, &c, SP_END_ABORTED);
+        if (grp) {
+            /* Group sessions that never became members end after those
+             * that did; the journal context the shared snapshots are
+             * released through goes last. */
+            const helper_backend_t *b0 = backend_of(s, r->units[0], NULL);
+            for (size_t i = 0; b0 && i < r->n_units; i++) {
+                if (gs[i]) (void)b0->ops->end(gs[i], SP_END_ABORTED, 0);
+                if (gd[i]) b0->ops->desc_free(gd[i]);
+            }
+            err_clear();
+            free(gj);
+        }
         pthread_mutex_lock(&s->mu);
         slot->used = 0;
         pthread_mutex_unlock(&s->mu);

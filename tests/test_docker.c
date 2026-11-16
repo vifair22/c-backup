@@ -565,6 +565,83 @@ static void test_pause_read(void **state)
     assert_true(has(D "/out" MNT "/disk1/slow/s", "slow-v1"));
 }
 
+static int zfs_snapshot_calls(void)
+{
+    FILE *f = fopen(STATE "/zfs.log", "r");
+    char line[1024];
+    int n = 0;
+    while (f && fgets(line, sizeof(line), f)) if (strncmp(line, "zfs snapshot", 12) == 0) n++;
+    if (f) fclose(f);
+    return n;
+}
+
+static int our_snaps_left(void)
+{
+    FILE *f = fopen(STATE "/snaps", "r");
+    char line[1024];
+    int n = 0;
+    while (f && fgets(line, sizeof(line), f)) n++;
+    if (f) fclose(f);
+    return n;
+}
+
+static status_t scoped(int scope, const char **names, size_t n, unit_backup_result_t *res)
+{
+    unit_backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.provider = "docker";
+    o.units = names;
+    o.n_units = n;
+    o.require = SP_CONSIST_INCONSISTENT;
+    o.job_id = 71;
+    o.pause_scope = scope;
+    return unit_backup_run(ustore, udb, urepo, &o, res);
+}
+
+/* pause_scope job: two units in one capture, one snapshot per pool for
+ * both (two pools: two commands, where separately it is three), every
+ * member of both paused together, each unit its own snapshot. */
+static void test_scope_job(void **state)
+{
+    (void)state;
+    const char *names[] = { "solo", "compose:web" };
+    unit_backup_result_t res;
+    assert_int_equal(scoped(UNIT_SCOPE_JOB, names, 2, &res), OK);
+    assert_int_equal(res.ok, 2);
+    assert_true(res.units[0].snapshot_id > 0 && res.units[1].snapshot_id > 0);
+    assert_int_not_equal(res.units[0].snapshot_id, res.units[1].snapshot_id);
+    unit_backup_result_free(&res);
+    assert_int_equal(zfs_snapshot_calls(), 2);
+    assert_int_equal(fdk.pauses, 3);
+    assert_int_equal(fdk.unpauses, 3);
+    assert_int_equal(our_snaps_left(), 0);          /* gone with the last unit */
+    assert_int_equal(units_intents_open(udb, NULL), 0);
+}
+
+/* pause_scope group: units sharing a capture.group in one capture, the
+ * rest alone. */
+static void test_scope_group(void **state)
+{
+    (void)state;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)urepo);
+    assert_int_equal(db_execute_non_query(udb, "INSERT INTO unit_policy (repo_id, unit_key, key, value)"
+                                               " VALUES (?, 'docker:solo', 'capture.group', 'g1'),"
+                                               " (?, 'docker:compose:web', 'capture.group', 'g1')",
+                                          (const char *[]){ repo, repo, NULL }, NULL), 0);
+    const char *names[] = { "solo", "compose:web", "parked" };
+    unit_backup_result_t res;
+    assert_int_equal(scoped(UNIT_SCOPE_GROUP, names, 3, &res), OK);
+    assert_int_equal(res.ok, 3);
+    unit_backup_result_free(&res);
+    assert_int_equal(zfs_snapshot_calls(), 3);      /* g1: two pools; parked: one */
+    assert_int_equal(our_snaps_left(), 0);
+    /* Unit scope for comparison: each its own capture. */
+    assert_int_equal(scoped(UNIT_SCOPE_UNIT, names, 2, &res), OK);
+    unit_backup_result_free(&res);
+    assert_int_equal(zfs_snapshot_calls(), 3 + 3);
+}
+
 /* A pause held past max_pause_s: the release says the cap was hit. */
 static int setup_cap(void **state)
 {
@@ -705,6 +782,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_compose, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pause_read, setup_units, teardown_units),
+        cmocka_unit_test_setup_teardown(test_scope_job, setup_units, teardown_units),
+        cmocka_unit_test_setup_teardown(test_scope_group, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_pause_cap, setup_cap, teardown),
         cmocka_unit_test_setup_teardown(test_fallback_flagged, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failing_hook, setup_failing_hook, teardown),
