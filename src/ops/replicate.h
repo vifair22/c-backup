@@ -339,7 +339,26 @@ status_t replica_sink_local_open(const char *path,
  * over one the target already has under the same number with a different
  * tree, so a target holding backups of its own fails rather than losing
  * them.
+ *
+ * An encrypted source into an unencrypted target writes every byte of the
+ * repository out in plaintext, so it is refused unless allow_plaintext is
+ * set: the caller asked for exactly that, not merely for "reencrypt" into a
+ * path that turned out to be unencrypted.
  */
 status_t replica_sink_local_open_reencrypt(const char *path,
                                            const repo_marker_t *source_marker,
+                                           int allow_plaintext,
                                            replica_sink_t *out);
+
+/* The refusal, shared by the route and the sink so both say the same; one
+ * %s, the target path, last so the advice reads first. */
+#define REPLICA_PLAINTEXT_REFUSAL                                             \
+    "this repository is encrypted and the target is not, so the copy would "  \
+    "hold every file in plaintext; to do that deliberately, set "             \
+    "allow_plaintext (CLI --to-plaintext) (target at %s)"
+
+/* Whether a re-encrypting copy from source into the repository at path
+ * would drop encryption: the source is encrypted and path holds a
+ * repository that is not. 0 when path holds no readable marker. */
+int replica_reencrypt_drops_encryption(const char *path,
+                                       const repo_marker_t *source_marker);

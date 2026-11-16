@@ -17,10 +17,13 @@
 typedef struct {
     int64_t  job_id;
     int64_t  repo_id;
-    /* The schedule that submitted it, 0 for a submission over the API, or
-     * ORIGIN_STARTUP for one the daemon queued at start. Decides the journal
-     * entry's source; see job_submit_scheduled and job_submit_startup. */
+    /* The schedule that submitted it, or 0. Decides the journal entry's
+     * source with origin; see job_submit_scheduled. */
     int64_t  schedule_id;
+    /* Who asked when no schedule did: "api", "startup" for a reindex the
+     * daemon queues at start (index_reconcile.h), or "register" for the one
+     * a registration queues (NIT-16). A string literal. */
+    const char *origin;
     char    *action;
     time_t   started_at;
     job_fn   fn;
@@ -102,28 +105,23 @@ void job_manager_set_alerts(job_manager_t *jm, int enabled)
 {
     if (jm) atomic_store(&jm->alerts, enabled ? 1 : 0);
 }
-/* A schedule_id no schedule has: the daemon queued the job itself. */
-#define ORIGIN_STARTUP ((int64_t)-1)
 
 /*
  * One journal entry for a job that ended.
  *
  * The source says who asked: "schedule" for the scheduler, with its id at
  * the head of the message so the entry names which schedule, or "api" for a
- * submission by hand through the CLI or the app, or "startup" for a job the
- * daemon queued itself. Every entry used to say
+ * submission by hand through the CLI or the app, or the origin of a job the
+ * daemon queued itself ("startup", "register"). Every entry used to say
  * "daemon", so a scheduled run and a manual one could not be told apart.
  */
 static void journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
-                        const char *action, const char *outcome,
+                        const char *origin, const char *action, const char *outcome,
                         int64_t took_ms, const char *message)
 {
-    if (schedule_id == ORIGIN_STARTUP) {
-        journal_record(db, repo_id, "startup", action, outcome, took_ms, message);
-        return;
-    }
     if (schedule_id <= 0) {
-        journal_record(db, repo_id, "api", action, outcome, took_ms, message);
+        journal_record(db, repo_id, origin && *origin ? origin : "api", action,
+                       outcome, took_ms, message);
         return;
     }
     char msg[ERR_MSG_MAX + 64];
@@ -138,8 +136,8 @@ static void journal_interrupted(cutils_db_t *db)
 {
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT COALESCE(repo_id, 0), action,"
-            "       CASE WHEN origin = 'startup' THEN -1 ELSE COALESCE(schedule_id, 0) END"
+            "SELECT COALESCE(repo_id, 0), action, COALESCE(schedule_id, 0),"
+            "       COALESCE(origin, 'api')"
             "  FROM jobs WHERE state IN ('running','queued') ORDER BY id",
             NULL, &r) != 0) {
         db_result_free(r);
@@ -152,7 +150,7 @@ static void journal_interrupted(cutils_db_t *db)
         /* Duration 0: when the process died is not known, and the time
          * since the job started would count the downtime as work. */
         journal_job(db, repo_id, strtoll(r->rows[i][2], NULL, 10),
-                    r->rows[i][1], "failed", 0, "interrupted by daemon restart");
+                    r->rows[i][3], r->rows[i][1], "failed", 0, "interrupted by daemon restart");
     }
     if (r && r->nrows > 0)
         log_warn("job manager: %d job(s) were interrupted by the last shutdown "
@@ -717,7 +715,7 @@ static void *worker_main(void *arg)
             /* A success journalled an empty message, so the entry for a
              * retention pass could not say what it deleted - the one thing
              * anybody reading a journal of deletions wants. */
-            journal_job(jm->db, slot.repo_id, slot.schedule_id, slot.action,
+            journal_job(jm->db, slot.repo_id, slot.schedule_id, slot.origin, slot.action,
                         outcome, took, st == OK ? pc.summary : detail);
             pthread_mutex_unlock(&jm->db_mu);
         }
@@ -872,7 +870,8 @@ static void finish_unstarted(job_manager_t *jm, job_slot_t *taken)
              (long long)taken->job_id, taken->action, (long long)taken->repo_id);
     if (taken->repo_id > 0) {
         pthread_mutex_lock(&jm->db_mu);
-        journal_job(jm->db, taken->repo_id, taken->schedule_id, taken->action,
+        journal_job(jm->db, taken->repo_id, taken->schedule_id, taken->origin,
+                    taken->action,
                     "cancelled", 0, "cancelled before it started");
         pthread_mutex_unlock(&jm->db_mu);
     }
@@ -944,15 +943,15 @@ status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
 static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
                             const int64_t *also, int nalso,
                             const char *action, const char *params_json,
-                            int64_t schedule_id, job_fn fn, void *arg,
-                            void (*arg_free)(void *), int64_t *out_job_id);
+                            int64_t schedule_id, const char *origin, job_fn fn,
+                            void *arg, void (*arg_free)(void *), int64_t *out_job_id);
 
 status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *action,
                               const char *params_json, int64_t schedule_id,
                               job_fn fn, void *arg, void (*arg_free)(void *),
                               int64_t *out_job_id)
 {
-    /* Negative is not a schedule; ORIGIN_STARTUP stays internal. */
+    /* Negative is not a schedule. */
     return job_submit_locked(jm, repo_id, JOB_LOCK_WRITE, action, params_json,
                              schedule_id > 0 ? schedule_id : 0,
                              fn, arg, arg_free, out_job_id);
@@ -974,7 +973,7 @@ status_t job_submit_lockset(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
                             void (*arg_free)(void *), int64_t *out_job_id)
 {
     return submit_slot(jm, repo_id, lock, also, nalso, action, params_json,
-                       schedule_id > 0 ? schedule_id : 0,
+                       schedule_id > 0 ? schedule_id : 0, "api",
                        fn, arg, arg_free, out_job_id);
 }
 
@@ -985,18 +984,26 @@ status_t job_submit_startup(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
                             int64_t *out_job_id)
 {
     return submit_slot(jm, repo_id, lock, also, nalso, action, params_json,
-                       ORIGIN_STARTUP, fn, arg, arg_free, out_job_id);
+                       0, "startup", fn, arg, arg_free, out_job_id);
 }
 
-/* Every submission ends here: schedule_id is a schedule's id, 0 for the
- * API, or ORIGIN_STARTUP, which only job_submit_startup passes. */
+status_t job_submit_origin(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                           const char *action, const char *origin, job_fn fn,
+                           void *arg, void (*arg_free)(void *), int64_t *out_job_id)
+{
+    return submit_slot(jm, repo_id, lock, NULL, 0, action, NULL, 0, origin,
+                       fn, arg, arg_free, out_job_id);
+}
+
+/* Every submission ends here: schedule_id is a schedule's id or 0, and
+ * origin says who asked when no schedule did (a string literal). */
 static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
                             const int64_t *also, int nalso,
                             const char *action, const char *params_json,
-                            int64_t schedule_id, job_fn fn, void *arg,
-                            void (*arg_free)(void *), int64_t *out_job_id)
+                            int64_t schedule_id, const char *origin, job_fn fn,
+                            void *arg, void (*arg_free)(void *), int64_t *out_job_id)
 {
-    if (!jm || !fn || !action || nalso < 0 || (nalso > 0 && !also)) {
+    if (!jm || !fn || !action || !origin || nalso < 0 || (nalso > 0 && !also)) {
         if (arg_free) arg_free(arg);
         return set_error(ERR_INVALID, "job_submit: null argument");
     }
@@ -1045,18 +1052,12 @@ static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
             " VALUES (NULLIF(?, ''), ?, ?, 'queued', 'schedule', ?) RETURNING id",
             (const char *[]){ repo_id > 0 ? repo : "", action,
                               params_json ? params_json : "", sched, NULL }, &r);
-    else if (schedule_id == ORIGIN_STARTUP)
-        rc = db_execute(jm->db,
-            "INSERT INTO jobs (repo_id, action, params, state, origin)"
-            " VALUES (NULLIF(?, ''), ?, ?, 'queued', 'startup') RETURNING id",
-            (const char *[]){ repo_id > 0 ? repo : "", action,
-                              params_json ? params_json : "", NULL }, &r);
     else
         rc = db_execute(jm->db,
             "INSERT INTO jobs (repo_id, action, params, state, origin)"
-            " VALUES (NULLIF(?, ''), ?, ?, 'queued', 'api') RETURNING id",
+            " VALUES (NULLIF(?, ''), ?, ?, 'queued', ?) RETURNING id",
             (const char *[]){ repo_id > 0 ? repo : "", action,
-                              params_json ? params_json : "", NULL }, &r);
+                              params_json ? params_json : "", origin, NULL }, &r);
     int64_t job_id = 0;
     if (rc == 0 && r && r->nrows == 1)
         job_id = strtoll(r->rows[0][0], NULL, 10);
@@ -1091,7 +1092,8 @@ static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
     job_slot_t *s = &jm->queue[jm->tail];
     s->job_id   = job_id;
     s->repo_id  = repo_id;
-    s->schedule_id = schedule_id;
+    s->schedule_id = schedule_id > 0 ? schedule_id : 0;
+    s->origin   = origin;
     s->action   = strdup(action);
     s->fn       = fn;
     s->arg      = arg;

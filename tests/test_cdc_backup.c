@@ -1308,7 +1308,7 @@ static void test_replicate_across_keys_rechunks(void **state)
     repo_marker_t m;
     assert_int_equal(repo_marker_read(TEST_REPO, &m), OK);
     replica_sink_t sink;
-    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &m, &sink), OK);
+    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &m, 0, &sink), OK);
     replicate_result_t rr;
     assert_int_equal(replicate_run(store, db, repo_id, &sink, NULL, NULL, NULL, &rr), OK);
     sink.v->close(sink.ctx);
@@ -1320,7 +1320,7 @@ static void test_replicate_across_keys_rechunks(void **state)
     assert_string_not_equal(src_root, dst_root);
 
     /* Again: the target has the snapshot, nothing is rebuilt. */
-    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &m, &sink), OK);
+    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &m, 0, &sink), OK);
     assert_int_equal(replicate_run(store, db, repo_id, &sink, NULL, NULL, NULL, &rr), OK);
     sink.v->close(sink.ctx);
     assert_int_equal(rr.snapshots_sent, 0);

@@ -96,6 +96,10 @@ typedef struct {
     repo_enc_mode_t mode;
     const char     *passphrase;   /* required for REPO_ENC_PASSPHRASE */
     const char     *key_dir;      /* where the host keyfile is written */
+    /* The caller named the mode, rather than mode holding the default. An
+     * existing repository refuses a named mode that is not its own, "none"
+     * included; zero keeps the old reading, where NONE means "not asked". */
+    int             mode_given;
     /* Out, system mode only: the key, for the one chance the operator has to
      * write it down. Empty otherwise. */
     char            key_hex[REPO_KEY_BYTES * 2 + 1];
@@ -166,10 +170,11 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
                                  repo_marker_t *out);
 
 /*
- * Decide the encryption mode from what a caller sent. mode may be NULL or
- * empty (not given). A non-empty passphrase with no mode means passphrase
- * mode; with none or system it is ERR_INVALID, as is passphrase mode without
- * one.
+ * Decide the encryption mode from what a caller sent. NULL means not given;
+ * a given value must be valid, so an empty or unknown mode and an empty
+ * passphrase are ERR_INVALID rather than read as "none" (B127). A passphrase
+ * with no mode means passphrase mode; with none or system it is
+ * ERR_INVALID, as is passphrase mode without one.
  */
 status_t repo_enc_resolve(const char *mode, const char *passphrase,
                           repo_enc_mode_t *out);
