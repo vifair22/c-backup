@@ -375,11 +375,16 @@ replicating into a fresh repository with `reencrypt` (see Replication) is the
 supported path instead.
 
 `POST /repos` takes `encrypt` (`none`, `system`, `passphrase`) and, for the
-last, a `passphrase`. A non-empty `passphrase` with no `encrypt` means
-`passphrase` mode. A non-empty `passphrase` with `encrypt` `none` or `system`
-is refused with 400 rather than ignored: ignoring it used to create an
-unencrypted repository for somebody who had just typed a passphrase. An empty
-`passphrase` is treated as absent. Creating a repository needs a passphrase
+last, a `passphrase`. A `passphrase` with no `encrypt` means `passphrase`
+mode. A `passphrase` with `encrypt` `none` or `system` is refused with 400
+rather than ignored: ignoring it used to create an unencrypted repository for
+somebody who had just typed a passphrase. Leaving a field out means the
+default (no encryption); a field that is present must carry a valid value.
+An empty or unknown `encrypt` (`""`, `"SYSTEM"`), an empty `passphrase`, and
+either one of the wrong JSON type are each a 400 naming the field, and
+nothing is created: both empty forms used to register an unencrypted
+repository (B127). On an existing repository, an `encrypt` other than its
+own mode is refused, `none` included. Creating a repository needs a passphrase
 of at least 8 characters (400 otherwise); unlocking an existing one accepts
 whatever it was created with.
 
@@ -402,7 +407,7 @@ is deliberately a persistent nag rather than a message shown once.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/repos/<id>/key` | Export the key for escrow |
-| POST | `/repos/<id>/key/import` | Install a key on a host that lacks one: the recovery path after losing the original machine. Refused unless it matches the fingerprint in the marker |
+| POST | `/repos/<id>/key/import` | Install a key on a host that lacks one: the recovery path after losing the original machine. `{key}` is exactly 64 hex characters (whitespace around and between them is ignored); anything longer, shorter or not hex is a 400. Refused unless it matches the fingerprint in the marker |
 | POST | `/repos/<id>/key/ack` | Confirm the key is stored elsewhere; clears the warning |
 
 All three answer 400 `repository is not encrypted` for an unencrypted
@@ -480,7 +485,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/backup` | `{paths:[...], label, exclude:[...], one_filesystem}`; with no `paths`, the repository's configured sources are used. `label` is at most 256 bytes of well-formed UTF-8 with no control characters (C0, DEL or C1); anything else is `400 {"error":"label must be at most 256 bytes of printable text"}` |
 | GET/PUT | `/repos/<id>/sources` | What this repository backs up: `{sources:[...], exclude:[...]}` |
 | POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite, subpath}` |
-| POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only |
+| POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only. On gc, gfs and verify, `dry_run` and `repair` take `1`, `true`, `0` or `false`; any other value, empty included, is a 400 rather than read as off |
 | POST | `/repos/<id>/gfs` | Apply retention |
 | POST | `/repos/<id>/reindex` | Rebuild the index from the repository; the job fails if any snapshot or pack cannot be read, and what could not be read keeps its previous rows |
 | POST | `/repos/<id>/pack` | Coalesce loose objects into pack files |
@@ -490,7 +495,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing, `?dry_run=1` (or `true`) the same and overriding any `repair` |
 | GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) and `offset` |
 | GET | `/repos/<id>/verify/<run-id>` | The findings from one run, paginated |
-| POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt}` |
+| POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt, allow_plaintext}` |
 
 `subpath` restores one path out of the snapshot instead of all of it, so
 pulling a single file back does not cost a full restore. It accepts the path
@@ -801,7 +806,15 @@ comparison and an unchanged repository replicates in one question.
 encryption. `dest` must already be a repository with an identity of its
 own (create it with `POST /repos` and the encryption wanted); each object is
 decrypted with the source key and encrypted under the destination's, or
-written plaintext into an unencrypted destination. Hashes are of the
+written plaintext into an unencrypted destination. That last case, an
+encrypted source into an unencrypted destination, is a 400 (`this
+repository is encrypted and the target is not, so the copy would hold every
+file in plaintext; ...`) unless the request also sets `"allow_plaintext":
+true`, a JSON boolean (anything else is `allow_plaintext must be true or
+false`; with no `reencrypt` it is `allow_plaintext applies only with
+reencrypt`). The check is repeated when the job runs. An allowed run logs a
+warning and journals `replicated encrypted repo N into plaintext at <path>`
+on the source. Unencrypted into unencrypted needs no flag. Hashes are of the
 plaintext, so they and the trees carry over unchanged, as do snapshot ids;
 a snapshot id the destination already uses for another tree fails the run
 instead of being overwritten. The job fails, saying which, when `dest` is

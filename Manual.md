@@ -1656,6 +1656,24 @@ unchanged. Snapshot ids carry over too, so the destination must hold no
 backups of its own: a snapshot number it already uses for a different tree
 fails the run rather than being overwritten.
 
+**Removing encryption has to be asked for.** Copying an encrypted repository
+into an unencrypted one writes every file out in plaintext, so it is refused
+unless `--to-plaintext` is also given (`"allow_plaintext": true` over the
+API):
+
+```sh
+sudo c-backup repo add /srv/backup/plain "Plain"
+sudo c-backup replicate 1 /srv/backup/plain --reencrypt --to-plaintext
+```
+
+Without it the run is refused before anything is written, naming the flag.
+With it, the daemon logs a warning and journals `replicated encrypted repo
+N into plaintext at <path>` on the source repository, so the one place its
+data leaves its encryption is on the record. Copying an unencrypted
+repository into another unencrypted one drops nothing and needs no flag.
+`--to-plaintext` without `--reencrypt` is refused, since a plain replica
+keeps the source's encryption.
+
 Unlike a plain replica, this is not for an untrusted target: the daemon
 doing it holds both keys, and so must the host the destination is used on.
 Refused when the destination is not a repository, is a replica of the source
@@ -2189,7 +2207,7 @@ lists every command with all of its arguments.
 | `gfs <id> [--dry-run]` | Retention |
 | `pack <id>` | Pack and compress |
 | `reindex <id>` | Rebuild the index |
-| `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
+| `replicate <id> <dest> [--reencrypt] [--to-plaintext]` | Copy into another directory; `--reencrypt` into another repository under its own encryption; `--to-plaintext` to allow that repository to be unencrypted (section 14.1) |
 | `stats <id> [--scope loose]`, `summary <id>`, `fanout <id>` | Repository statistics |
 | `objects <id> [--location loose\|packed] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
 | `packs <id> [pack-id] [--limit N] [--offset N]` | Packs, or one pack's entries |
