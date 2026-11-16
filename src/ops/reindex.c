@@ -807,7 +807,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     memset(&total, 0, sizeof(total));
     status_t st = OK;
     long long first_failed = 0;
-    char first_err[256] = "";
+    char first_err[ERR_MSG_MAX] = "";
 
     /* Packs first: the tree walk resolves packed objects through these rows,
      * so rebuilding them afterwards would be too late. */
@@ -862,7 +862,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* Tags last: they attach to snapshot rows, which now exist. */
     status_t tst = repo_tags_restore(db, repo_id, store_root(store),
                                      &total.tags_restored, &total.tags_skipped);
-    char tags_err[256] = "";
+    char tags_err[ERR_MSG_MAX] = "";
     if (tst != OK) {
         snprintf(tags_err, sizeof(tags_err), "%s", err_msg());
         err_clear();

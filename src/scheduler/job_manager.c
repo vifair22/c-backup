@@ -88,7 +88,7 @@ static void journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
         journal_record(db, repo_id, "api", action, outcome, took_ms, message);
         return;
     }
-    char msg[640];
+    char msg[ERR_MSG_MAX + 64];
     snprintf(msg, sizeof(msg), "schedule %lld%s%s", (long long)schedule_id,
              message && *message ? ": " : "", message ? message : "");
     journal_record(db, repo_id, "schedule", action, outcome, took_ms, msg);
@@ -162,12 +162,12 @@ void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
                  (long long)repo_id);
 
     if (path[0])
-        snprintf(body, body_sz, "Repository %s (id %lld) at %s\nJob %lld (%s) failed: %s",
+        snprintf(body, body_sz, "Repository %s (id %lld) at %s\nJob %lld (%s) failed: %.900s",
                  label[0] ? label : "(no label)", (long long)repo_id, path,
                  (long long)job_id, what, why);
     else
         snprintf(body, body_sz, "Repository %lld (no longer registered)\n"
-                 "Job %lld (%s) failed: %s",
+                 "Job %lld (%s) failed: %.900s",
                  (long long)repo_id, (long long)job_id, what, why);
 }
 

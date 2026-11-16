@@ -197,7 +197,7 @@ static int schedule_row_problem(const char *action, const char *spec,
     }
     trigger_t t;
     if (trigger_parse(spec ? spec : "", &t) != OK) {
-        snprintf(why, whysz, "invalid trigger: %s", err_msg());
+        snprintf(why, whysz, "invalid trigger: %.300s", err_msg());
         err_clear();
         return 1;
     }

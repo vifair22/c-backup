@@ -2074,7 +2074,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     prune_info_t info;
     st = prune_snapshot_checked(store, g_ctx.db, repo_id, snap_id, force, &info);
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    char why[512];
+    char why[ERR_MSG_MAX];
     snprintf(why, sizeof(why), "%s", st == OK ? "" : err_msg());
     store_close(store);
     repo_unlock(repo_id);
@@ -2084,7 +2084,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     if (st == ERR_NOT_FOUND) return api_error(404, "no such snapshot");
     if (st == ERR_INVALID && info.ntags > 0) return api_error(409, why);
 
-    char msg[640];
+    char msg[ERR_MSG_MAX + 64];
     if (st != OK) {
         snprintf(msg, sizeof(msg), "snapshot %lld: %s", (long long)snap_id, why);
         journal_record(g_ctx.db, repo_id, "api", "snapshot-delete", "failed", took_ms, msg);

@@ -231,7 +231,7 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
         db_txn_rollback(g_db);
         return api_error(500, "cannot set tag");
     }
-    char merr[PATH_MAX + 128];
+    char merr[ERR_MSG_MAX + 64];
     if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
         db_txn_rollback(g_db);
         return api_error(500, merr);
@@ -263,7 +263,7 @@ api_response_t metadata_tags_delete(const api_request_t *req, int64_t repo_id,
         db_txn_rollback(g_db);
         return api_error(404, "no such tag");
     }
-    char merr[PATH_MAX + 128];
+    char merr[ERR_MSG_MAX + 64];
     if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
         db_txn_rollback(g_db);
         return api_error(500, merr);
