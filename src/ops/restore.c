@@ -1529,9 +1529,10 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             if (ntype != NODE_TYPE_REG)
                 restore_fail(&res, rel, "unsupported node type %u", ntype);
             else
+                /* B118: a build before 1.0.0 kept files it skipped. */
                 restore_fail(&res, rel, "regular file has no content in the "
-                             "snapshot (a backup recorded a file it could not "
-                             "read; B118)");
+                             "snapshot (written by a c-backup older than "
+                             "1.0.0, which recorded a file it could not read)");
             continue;
         }
 

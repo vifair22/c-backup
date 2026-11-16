@@ -701,9 +701,9 @@ An object no file references - a manifest tree, or one from an evicted
 snapshot - reports zero files; that is not a claim the loss is harmless.
 
 Every level also checks the index for regular files that name no content
-object: a file a snapshot lists and no restore can produce. Backups before
-the B118 fix recorded a file that was skipped during the store phase that
-way. These are one finding with `hash` `""` and `status` `missing: file
+object: a file a snapshot lists and no restore can produce. Backups by a
+c-backup older than 1.0.0 recorded a file that was skipped during the store
+phase that way. These are one finding with `hash` `""` and `status` `missing: file
 entry has no content`, its `affected_*` fields and `sample_paths` naming
 the files and snapshots, and each such row counts once in `missing`, so
 the run fails. A backup no longer writes such an entry (see the backup

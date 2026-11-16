@@ -828,8 +828,8 @@ different inode, skipped this run and taken by the next. Extended
 attributes and ACLs are read through the same pinned descriptor (via
 `/proc/self/fd`, so `/proc` must be mounted for that guarantee).
 
-The next backup tries every skipped file again. Before 1.0.0's fix for
-B118 a skipped file stayed in the snapshot with no content: the backup
+The next backup tries every skipped file again. Before 1.0.0 a skipped
+file stayed in the snapshot with no content: the backup
 reported success, verify passed, and every full restore failed on it.
 Verify now reports any such entry an older build left (section 11).
 
@@ -1350,7 +1350,7 @@ paths and snapshots across every lost object. The CLI prints the run and its
 findings as one JSON document.
 
 Every level also checks the index for regular files that name no content
-object. A backup before 1.0.0's fix for B118 recorded a file it skipped
+object. A backup by a c-backup older than 1.0.0 recorded a file it skipped
 that way: the snapshot listed the file, no restore could produce it, and
 every object check passed because no object was damaged. These are one
 finding, status `missing: file entry has no content` with an empty hash,
@@ -2049,7 +2049,7 @@ the underlying disk.
 | Backup logs `key not escrowed` | System key not acknowledged | Section 13 |
 | Job `cancelled` after a restart | `systemctl stop` cancels running jobs (section 2.2) | Run it again |
 | Job `failed: interrupted by daemon restart` | The daemon died mid-job: crash, `kill -9`, power loss | Run it again; nothing partial is kept |
-| `restore incomplete: N entries could not be restored` | Some entries failed | The error quotes the first, the log names each (`restore: <path> not restored: <reason>`); check permissions and space at the destination. `regular file has no content` is a snapshot written before the B118 fix; verify reports the same entries |
+| `restore incomplete: N entries could not be restored` | Some entries failed | The error quotes the first, the log names each (`restore: <path> not restored: <reason>`); check permissions and space at the destination. `regular file has no content in the snapshot (written by a c-backup older than 1.0.0, ...)` is a file an older build recorded without being able to read it; verify reports the same entries |
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
 | Repository much larger than expected right after a backup | Packing has not run or is running | Wait for the job; `c-backup pack <id>`; check `maintenance.auto_pack` |

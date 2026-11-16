@@ -2354,7 +2354,7 @@ static status_t loose_stream(store_t *store, int fd, const object_header_t *hdr,
     }
     if (!loose_parity_fits(hdr->compressed_size)) {
         log_warn("object %s: %llu stored bytes is past where its 32-bit parity "
-                 "sizes can be trusted; parity not applied (OWN-30)", hex,
+                 "sizes can be trusted; parity not applied", hex,
                  (unsigned long long)hdr->compressed_size);
         parity_stats_add_uncorrectable(1);
         return set_error(ERR_CORRUPT, "object %s: %s (parity not applied)", hex, first);
