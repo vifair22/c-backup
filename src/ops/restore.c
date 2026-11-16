@@ -620,22 +620,23 @@ static int already_restored(const struct stat *sb, uint64_t size, int64_t mtime_
 }
 
 /*
- * Restore one regular file's content and metadata under a temporary name,
- * then make it durable and rename it into place. On any failure the
- * temporary file is removed and the final path is untouched. *out_sz is
+ * Restore one regular file's content and metadata under a temporary name.
+ * On OK the verified file is complete at `tmp` (closed), waiting for the
+ * batch below to make it durable and rename it into place; on any failure
+ * the temporary file is removed and the final path is untouched. *out_sz is
  * the object's payload size.
  */
 static status_t restore_file(store_t *store, const char *chash, const char *full,
                              uint64_t size, uint32_t mode, uint32_t uid,
                              uint32_t gid, int64_t mtime, const char *xhash,
-                             const char *ahash, uint64_t *out_sz)
+                             const char *ahash, char *tmp, size_t tmpsz,
+                             uint64_t *out_sz)
 {
     uint8_t hash[OBJECT_HASH_SIZE];
     hex_to_hash(chash, hash);
     *out_sz = 0;
 
-    char tmp[PATH_MAX];
-    int fd = make_partial(full, tmp, sizeof(tmp));
+    int fd = make_partial(full, tmp, tmpsz);
     if (fd == -1) return ERR_IO;
 
     uint64_t sz = 0;
@@ -662,7 +663,7 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
             close(fd);
             unlink(tmp);
             fd = fd2;
-            memcpy(tmp, tmp2, sizeof(tmp));
+            snprintf(tmp, tmpsz, "%s", tmp2);
         }
     }
 
@@ -672,13 +673,9 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
         apply_metadata(tmp, mode, uid, gid, mtime);
         apply_xattrs(store, tmp, xhash);
         apply_acls(store, tmp, ahash, 0);
-        if (fdatasync(fd) != 0)
-            st = set_error_errno(ERR_IO, "restore: cannot sync %s", full);
     }
     if (close(fd) != 0 && st == OK)
         st = set_error_errno(ERR_IO, "restore: cannot close %s", full);
-    if (st == OK && rename(tmp, full) != 0)
-        st = set_error_errno(ERR_IO, "restore: cannot rename into place %s", full);
     if (st != OK) {
         if (unlink(tmp) != 0 && errno != ENOENT)
             log_warn("restore: cannot remove partial file %s: %s", tmp, strerror(errno));
@@ -686,6 +683,101 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
     }
     *out_sz = sz;
     return OK;
+}
+
+/*
+ * Verified files waiting to be made durable and renamed into place.
+ *
+ * The final name must not reach disk before the data does, or a power
+ * failure leaves a right-named file of zeros - the very thing the
+ * temporary file exists to prevent. Syncing each file on its own did that
+ * at 175 files/s on btrfs, against 13,400 without: a sync costs a journal
+ * commit whatever the file's size. So verified files queue here, and one
+ * syncfs makes the whole batch durable before any of them is renamed. A
+ * crash before the renames leaves verified temporary files, which the next
+ * run sweeps and restores again; that is lost work, never a wrong file.
+ *
+ * syncfs flushes everything dirty on the destination filesystem, other
+ * writers' data included, once per batch. The batch is bounded in files
+ * and in bytes so that cost stays proportionate.
+ */
+#define BATCH_FILES 512u
+#define BATCH_BYTES ((uint64_t)256 * 1024 * 1024)
+
+typedef struct {
+    char    *tmp;
+    char    *full;
+    uint64_t bytes;
+} pending_file_t;
+
+typedef struct {
+    pending_file_t items[BATCH_FILES];
+    uint32_t       n;
+    uint64_t       bytes;
+} rename_batch_t;
+
+static void batch_discard(rename_batch_t *b, uint32_t i)
+{
+    if (unlink(b->items[i].tmp) != 0 && errno != ENOENT)
+        log_warn("restore: cannot remove partial file %s: %s",
+                 b->items[i].tmp, strerror(errno));
+}
+
+/* Sync the batch, rename each file into place, and count the outcome. */
+static void batch_flush(rename_batch_t *b, restore_result_t *res)
+{
+    if (b->n == 0) return;
+    int synced = 0;
+    int fd = open(b->items[0].tmp, O_RDONLY | O_CLOEXEC);
+    if (fd != -1) {
+        synced = syncfs(fd) == 0;
+        if (!synced)
+            log_warn("restore: cannot sync %u restored file(s) to disk: %s",
+                     b->n, strerror(errno));
+        close(fd);
+    } else {
+        log_warn("restore: cannot open %s to sync it: %s", b->items[0].tmp,
+                 strerror(errno));
+    }
+    for (uint32_t i = 0; i < b->n; i++) {
+        pending_file_t *p = &b->items[i];
+        if (!synced) {
+            log_warn("restore: %s not restored: its data could not be synced", p->full);
+            batch_discard(b, i);
+            res->failed++;
+        } else if (rename(p->tmp, p->full) != 0) {
+            log_warn("restore: cannot rename %s into place: %s", p->full, strerror(errno));
+            batch_discard(b, i);
+            res->failed++;
+        } else {
+            res->files++;
+            res->bytes += p->bytes;
+        }
+        free(p->tmp);
+        free(p->full);
+    }
+    b->n = 0;
+    b->bytes = 0;
+}
+
+/* Queue a verified file; a full batch is flushed. Returns -1 when the
+ * paths cannot be held, and the temporary file is removed. */
+static int batch_add(rename_batch_t *b, const char *tmp, const char *full,
+                     uint64_t bytes, restore_result_t *res)
+{
+    char *t = strdup(tmp), *f = strdup(full);
+    if (!t || !f) {
+        free(t); free(f);
+        if (unlink(tmp) != 0 && errno != ENOENT) { /* swept next run */ }
+        return -1;
+    }
+    b->items[b->n].tmp   = t;
+    b->items[b->n].full  = f;
+    b->items[b->n].bytes = bytes;
+    b->n++;
+    b->bytes += bytes;
+    if (b->n == BATCH_FILES || b->bytes >= BATCH_BYTES) batch_flush(b, res);
+    return 0;
 }
 
 static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -861,7 +953,10 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
     /* Per directory row, plus one for the destination itself: whether this
      * run has swept it for partial files yet. */
     char *swept = calloc((size_t)r->nrows + 1, 1);
-    if (!swept) {
+    rename_batch_t *batch = calloc(1, sizeof(*batch));
+    if (!swept || !batch) {
+        free(swept);
+        free(batch);
         pt_free(&paths);
         hardlink_map_free(&hlinks);
         db_result_free(r);
@@ -1029,6 +1124,9 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         if (hgroup != 0) {
             const char *first = hardlink_lookup(&hlinks, hgroup);
             if (first) {
+                /* The first member may still be waiting in the batch
+                 * under its temporary name. */
+                batch_flush(batch, &res);
                 if (make_parents(full) != OK) { st = ERR_IO; break; }
                 if (opts->overwrite) unlink(full);
                 if (link(first, full) == 0) { res.hardlinks++; continue; }
@@ -1106,6 +1204,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         }
 
         uint64_t sz = 0;
+        char     tmp[PATH_MAX];
         err_clear();    /* so a reason below cannot be left over from before */
         restore_io_t io = { opts, bytes_done, bytes_total, nsize, 0,
                             matched - 1, work_total };
@@ -1115,7 +1214,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         if (opts->bytes_cb || opts->progress_cb)
             store_set_io_progress(store, restore_bytes, &io);
         status_t lst = restore_file(store, chash, full, nsize, mode, uid, gid,
-                                    mtime, xhash, ahash, &sz);
+                                    mtime, xhash, ahash, tmp, sizeof(tmp), &sz);
         store_set_io_progress(store, prev_io, prev_io_ctx);
 
         if (lst != OK && cancelled(opts)) {
@@ -1140,10 +1239,16 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         /* First member of its inode group: everything later links here.
          * Later members share this inode, so the attributes restore_file
          * set are already theirs; the link() sites need no reapply. */
+        if (batch_add(batch, tmp, full, sz, &res) != 0) {
+            log_warn("restore: %s not restored: out of memory", full);
+            res.failed++;
+            continue;
+        }
         if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
-        res.files++;
-        res.bytes += sz;
     }
+    /* Whatever verified before a stop is still worth keeping. */
+    batch_flush(batch, &res);
+    free(batch);
     free(swept);
 
     hardlink_map_free(&hlinks);

@@ -919,9 +919,13 @@ known to this build; written by a newer c-backup?", and a file entry whose
 object is not file content (a directory tree, say) fails rather than being
 written out as bytes.
 
-Writing every file through a temporary file costs one rename and one
-`fdatasync` per file. On a fast disk that is noise; on a slow one a restore
-of many small files is bounded by sync latency.
+Verified files are made durable in batches - up to 512 files or 256 MiB,
+one `syncfs` on the destination filesystem - and only then renamed, so a
+power failure cannot leave a right-named file whose data never reached
+the disk. Syncing each file on its own ran at 175 files/s on btrfs; the
+batch measured 6,200 files/s for 10,000 small files where the old restore,
+which synced nothing, measured 13,600 (PERF.md). `syncfs` also flushes
+whatever else is dirty on that filesystem, once per batch.
 
 ---
 

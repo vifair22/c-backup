@@ -587,7 +587,7 @@ flowchart TD
     SP -->|yes| SCAT[scatter regions from the verified<br>payload into a second temp file]
     SP -->|no| META[mode/owner/mtime, xattrs, ACLs<br>on the temp file]
     SCAT --> META
-    META --> REN[fdatasync, rename over the final path]
+    META --> REN[queue; per batch of 512 files or 256 MiB:<br>one syncfs, then rename each over its final path]
     REN --> REM[first of a hardlink group:<br>remember path for later members]
 ```
 
@@ -619,7 +619,12 @@ Type-specific behaviour, spelled out:
   writes may sit at the final path before it returns OK. Then metadata,
   xattrs and ACLs go onto the temporary file - the ACL last because its
   base entries carry the definitive permissions and must win over chmod -
-  then `fdatasync`, then `rename` over the final path. Later hardlink
+  then the file joins a batch: once 512 files or 256 MiB are queued (or a
+  hardlink needs a queued member, or the run ends), one `syncfs` makes the
+  batch durable and each file is renamed over its final path. The final
+  name never reaches disk before the data, and one sync per batch instead
+  of per file is the difference between 175 and 6,200 small files a second
+  on btrfs. Later hardlink
   members share the first member's inode, so the attributes applied there
   are already theirs. Metadata is best effort with warnings: an
   unprivileged restore cannot set `security.*` or `trusted.*` attributes,
