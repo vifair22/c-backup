@@ -1332,6 +1332,18 @@ sed -i 's/  bind: 127.0.0.1/  bind: not-an-address/' "$WORK/bindcfg.yaml"
 C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind2.log" 2>&1
 check    "an unparseable bind address stops the daemon" 1 "$?"
 contains "and says which value was rejected" "not-an-address" "$(cat "$WORK/bind2.log")"
+# B132: a port another daemon already holds fails at api_server_start, with
+# the job manager, scheduler and routes all set up. Each startup failure
+# unwinds what came before it; under ASan a leak report lands in the log, so
+# its absence is the check (vacuous in a plain build).
+sed -i "s/  bind: not-an-address/  bind: 127.0.0.1/; s/  port: $BINDPORT/  port: $PORTBASE/" \
+    "$WORK/bindcfg.yaml"
+C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind3.log" 2>&1
+check    "a port already taken stops the daemon" 1 "$?"
+contains "and says it cannot start" "cannot start API server" "$(cat "$WORK/bind3.log")"
+check    "and unwinds without a leak too" 0 \
+    "$(grep -c 'LeakSanitizer\|AddressSanitizer' "$WORK/bind3.log")"
+contains "and leaves the running daemon alone" '"repos"' "$(cb repo list)"
 
 # sun_path is 108 bytes and the daemon used to strncpy into it, so a longer
 # socket path was silently truncated: bind and listen succeeded against a
@@ -1355,6 +1367,11 @@ EOF
 C_BACKUP_CONFIG_PATH="$WORK/longcfg.yaml" "$DAEMON" > "$WORK/long.log" 2>&1
 check    "an over-long socket path stops the daemon" 1 "$?"
 contains "and says so rather than truncating" "socket path too long" "$(cat "$WORK/long.log")"
+# B132: this is api_server_create failing, which returned with the scheduler
+# open and the job manager's workers running; an ASan daemon reported the
+# scheduler as leaked. Now it unwinds both.
+check    "and unwinds its startup without a leak" 0 \
+    "$(grep -c 'LeakSanitizer\|AddressSanitizer' "$WORK/long.log")"
 if [ -n "$(find "$LONGDIR" -maxdepth 1 -name '*.sock' 2>/dev/null)" ]; then
     bad "leaves no socket behind" "no socket" "a socket was created"
 else
