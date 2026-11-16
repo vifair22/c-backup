@@ -17,6 +17,9 @@
  *               pause_always, never_pause (unit name globs), pause_timeout_s,
  *               templates_dir
  *   [lxc]       enabled, path
+ *   [libvirt]   enabled, uri, nbd_dir, scratch_dir, tpm_dir, nvram_dir,
+ *               qemu_nbd, freeze (auto|off|required), freeze_timeout_s,
+ *               staging_root
  *   [hook NAME] unit, kind (dump|run), phase (pre|post), container,
  *               argv.0 .. argv.N, timeout_s, on_fail (continue|fail)
  *
@@ -92,6 +95,18 @@ typedef struct {
     /* [lxc] */
     int      lxc_enabled;
     char     lxc_path[4096];
+
+    /* [libvirt] */
+    int      libvirt_enabled;
+    char     libvirt_uri[256];
+    char     nbd_dir[256];            /* exports and qemu-nbd sockets, shared with the daemon */
+    char     scratch_dir[4096];       /* copy-before-write scratch files */
+    char     tpm_dir[4096];           /* swtpm tpm-states/ */
+    char     nvram_dir[4096];         /* where restored NVRAM goes */
+    char     qemu_nbd[256];
+    int      vm_freeze;               /* 0 auto, 1 off, 2 required */
+    unsigned vm_freeze_timeout_s;
+    char     staging_root[4096];      /* where the daemon stages NVRAM and TPM state */
 
     policy_hook_t hooks[POLICY_HOOKS_MAX];
     size_t   n_hooks;

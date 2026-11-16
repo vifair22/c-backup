@@ -48,3 +48,8 @@ void host_tools_defaults(host_tools_t *t);
  */
 status_t host_run(const host_tools_t *t, int netns, const char *const *argv,
                   unsigned timeout_s, char **out, size_t cap);
+
+/* Start argv in the background the same way (qemu-nbd), stdout and stdin
+ * on /dev/null, stderr to err_fd (-1: /dev/null). The caller reaps it. */
+#include <sys/types.h>
+status_t host_spawn(const host_tools_t *t, const char *const *argv, int err_fd, pid_t *pid);

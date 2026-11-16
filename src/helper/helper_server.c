@@ -382,6 +382,19 @@ static const helper_backend_t *backend_named(const helper_server_t *s, const cha
     return NULL;
 }
 
+typedef struct { const char *id; char name[256]; int found; } name_find_t;
+
+static status_t find_name(void *ctx, const char *id, const char *name, int state)
+{
+    (void)state;
+    name_find_t *f = ctx;
+    if (!f->found && strcmp(id, f->id) == 0) {
+        snprintf(f->name, sizeof(f->name), "%s", name ? name : "");
+        f->found = 1;
+    }
+    return OK;
+}
+
 /* Policy first, by key; then by name, which only the helper's own inspect
  * can supply. A unit the policy does not allow is denied whether or not it
  * exists, so the answer says nothing about what lies outside. */
@@ -391,12 +404,13 @@ static helper_err_t unit_allowed(helper_server_t *s, const char *key, char *why,
     const char *uid = NULL;
     const helper_backend_t *b = NULL;
     if (backend_for(s, key, &uid, &b, why, wsz) == HELPER_OK) {
-        sp_unit_desc_t *d = NULL;
-        if (b->ops->describe(b->ctx, uid, &d) == OK) {
-            int ok = helper_policy_unit_allowed(s->pol, key, d->name);
-            b->ops->desc_free(d);
-            if (ok) return HELPER_OK;
-        }
+        /* The name from the enumeration, not a describe: a unit whose
+         * describe fails (a missing NVRAM file, say) is still the unit the
+         * policy allows, and its describe then says what is wrong. */
+        name_find_t nf = { uid, "", 0 };
+        if (b->ops->list_units(b->ctx, find_name, &nf) == OK && nf.found &&
+            helper_policy_unit_allowed(s->pol, key, nf.name))
+            return HELPER_OK;
         err_clear();
     }
     snprintf(why, wsz, "unit %s is not in the policy", key);
@@ -764,6 +778,20 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
                 break;
             }
             cJSON_AddStringToObject(rr, d->items[k].id, root);
+        }
+        /* Where each disk is read, as the backend set it up. */
+        cJSON *blk = b->block_where ? cJSON_AddObjectToObject(o, "blocks") : NULL;
+        for (size_t k = 0; blk && fail == HELPER_OK && k < d->n_items; k++) {
+            if (d->items[k].kind != SP_ITEM_BLOCK) continue;
+            cJSON *where = cJSON_CreateObject();
+            if (!where) break;
+            if (b->block_where(sess, &d->items[k], where) != OK) {
+                snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
+                cJSON_Delete(where);
+                fail = HELPER_E_FAILED;
+                break;
+            }
+            cJSON_AddItemToObject(blk, d->items[k].id, where);
         }
         /* Hook logs exist only now that begin ran the hooks. */
         cJSON *late = cJSON_AddObjectToObject(o, "late_blobs");

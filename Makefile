@@ -78,7 +78,7 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
 SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/scheduler -I src/common \
-                -I src/providers -I src/units -I src/helper \
+                -I src/providers -I src/units -I src/helper -I src/virt \
                 -I src/config -I src/daemon -I $(CUTILS_DIR)/include \
                 -I $(CUTILS_DIR)/lib/cJSON
 COMMON_CFLAGS := -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
@@ -142,7 +142,22 @@ DAEMON_MAIN := $(SRC)/daemon/main.c
 CLI_MAIN    := $(SRC)/cli/main.c
 HELPER_MAIN := $(SRC)/helper/helper_main.c
 ALL_SRCS    := $(shell find $(SRC) -name '*.c')
-SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN) $(HELPER_MAIN), $(ALL_SRCS))
+# The libvirt provider lives in the helper alone (vm-backup.md 9, the
+# approved dependency): src/virt is compiled with libvirt's and libxml2's
+# flags and linked into c-backup-helper and its own tests, never into the
+# daemon or the CLI. Without libvirt's development files it is left out and
+# the helper offers no libvirt provider.
+VIRT_SRCS   := $(wildcard $(SRC)/virt/*.c)
+HAVE_LIBVIRT := $(shell pkg-config --exists libvirt libxml-2.0 2>/dev/null && echo 1)
+ifeq ($(HAVE_LIBVIRT),1)
+VIRT_CFLAGS := $(patsubst -I%,-isystem %,$(shell pkg-config --cflags libvirt libxml-2.0)) -DHAVE_LIBVIRT
+VIRT_LIBS   := $(shell pkg-config --libs libvirt libxml-2.0)
+else
+VIRT_SRCS   :=
+VIRT_CFLAGS :=
+VIRT_LIBS   :=
+endif
+SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN) $(HELPER_MAIN) $(wildcard $(SRC)/virt/*.c), $(ALL_SRCS))
 SRC_DIRS    := $(sort $(dir $(ALL_SRCS)))
 VPATH       := $(SRC_DIRS)
 # cJSON is not compiled here. c-utils carries it and libc-utils.a holds its
@@ -164,6 +179,8 @@ endif
 DAEMON_OBJ  := $(OBJ_DIR)/daemon_main.o
 CLI_OBJ     := $(OBJ_DIR)/cli_main.o
 HELPER_OBJ  := $(OBJ_DIR)/helper_main.o
+VIRT_OBJS   := $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(VIRT_SRCS)))
+$(VIRT_OBJS) $(HELPER_OBJ): TYPE_CFLAGS += $(VIRT_CFLAGS)
 OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ) $(HELPER_OBJ)
 
 # Generated code (the embedded migrations): match the optimisation level but
@@ -244,8 +261,8 @@ $(DAEMON_TARGET): $(LIB_OBJS) $(DAEMON_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
 $(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
 	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
 
-$(HELPER_TARGET): $(LIB_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
-	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
+$(HELPER_TARGET): $(LIB_OBJS) $(VIRT_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
+	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS) $(VIRT_LIBS)
 
 # ---- Tests (link against release lib objects) -------------------------
 REL_OBJ_DIR := $(BUILD)/release
@@ -278,6 +295,17 @@ FORCE:
 
 $(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
 	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(TEST_LDFLAGS)
+
+# Suites of the libvirt provider link it and libvirt; they exist only where
+# libvirt does.
+REL_VIRT_OBJS = $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(VIRT_SRCS)))
+$(REL_VIRT_OBJS): TYPE_CFLAGS += $(VIRT_CFLAGS)
+ifneq ($(HAVE_LIBVIRT),1)
+TEST_SRCS := $(filter-out $(wildcard $(TESTS)/test_virt*.c), $(TEST_SRCS))
+TEST_BINS := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(TEST_SRCS))
+endif
+$(BINS)/test_virt%: $(TESTS)/test_virt%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(REL_VIRT_OBJS) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(TEST_CFLAGS) $(VIRT_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(TEST_LDFLAGS) $(VIRT_LIBS)
 
 $(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
 	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(FAULT_WRAP) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(TEST_LDFLAGS)
@@ -349,7 +377,8 @@ ASAN_LIB_OBJS = $(patsubst %.c, $(ASAN_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
                 $(ASAN_OBJ_DIR)/app_migrations.o
 
 ASAN_TEST_CFLAGS := -std=c11 -pthread -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
-ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(TEST_SRCS))
+# The libvirt suites are linked by their own rule and left out here.
+ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(filter-out $(wildcard $(TESTS)/test_virt*.c), $(TEST_SRCS)))
 
 $(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
 	$(CC) $(ASAN_TEST_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ -static-libasan \
@@ -565,6 +594,10 @@ analyze: | $(BUILD)
 	    base=$$(basename $$f .c); \
 	    $(CC) $(ANALYZE_CFLAGS) -fstack-usage -c $$f -o $(BUILD)/analyze/$$base.o 2>/dev/null; \
 	done
+	@for f in $(VIRT_SRCS); do \
+	    base=$$(basename $$f .c); \
+	    $(CC) $(ANALYZE_CFLAGS) $(VIRT_CFLAGS) -fstack-usage -c $$f -o $(BUILD)/analyze/$$base.o 2>/dev/null; \
+	done
 	@fail=0; for su in $(BUILD)/analyze/*.su; do \
 	    [ -f "$$su" ] || continue; \
 	    awk -v limit=$(STACK_LIMIT) -v file="$$su" \
@@ -578,6 +611,9 @@ analyze: | $(BUILD)
 	@for f in $(SRCS); do \
 	    $(CC) $(ANALYZE_CFLAGS) -fanalyzer -fsyntax-only $$f 2>&1; \
 	done
+	@for f in $(VIRT_SRCS); do \
+	    $(CC) $(ANALYZE_CFLAGS) $(VIRT_CFLAGS) -fanalyzer -fsyntax-only $$f 2>&1; \
+	done
 	@echo "gcc-fanalyzer: OK"
 	@echo "=== cppcheck ==="
 	@cppcheck --enable=warning,performance,portability --error-exitcode=1 \
@@ -588,7 +624,7 @@ analyze: | $(BUILD)
 	    --suppress=oppositeInnerCondition:src/store/object.c \
 	    -DVERSION_STRING=\"0.0.0\" \
 	    --inline-suppr \
-	    --quiet $(SRC_INCLUDES) $(SRCS)
+	    --quiet $(SRC_INCLUDES) -DHAVE_LIBVIRT $(SRCS) $(VIRT_SRCS)
 	@echo "cppcheck: OK"
 
 lint:
@@ -679,7 +715,7 @@ COV_OBJS    := $(patsubst $(SRC)/%.c, $(COV_DIR)/%.o, $(SRCS))
 COV_OBJS    += $(COV_DIR)/app_migrations.o
 COV_MAIN    := $(COV_DIR)/main.o
 COV_LIB     := $(filter-out $(COV_MAIN), $(COV_OBJS))
-COV_TESTS   := $(patsubst $(TESTS)/%.c, $(COV_DIR)/%, $(TEST_SRCS))
+COV_TESTS   := $(patsubst $(TESTS)/%.c, $(COV_DIR)/%, $(filter-out $(wildcard $(TESTS)/test_virt*.c), $(TEST_SRCS)))
 # The fault suites too. They were left out because TEST_SRCS filters them -
 # it feeds both TEST_BINS and COV_TESTS, and they need their own link rule
 # for --wrap - so nineteen tests that exercise nothing but error paths in

@@ -417,6 +417,59 @@ services' binds and sets container names `<project>-<service>`; then
 `--start`). Replacing a project needs its containers stopped; they are
 renamed aside rather than removed by compose.
 
+## Libvirt provider (VMs)
+
+Built only when libvirt's and libxml2's development files are present
+(`libvirt-dev libxml2-dev` on Debian; the CI image and Dockerfile carry
+them); the helper links `libvirt.so`, the daemon never does. Enabled by the
+policy:
+
+```ini
+[units]
+allow = libvirt:cbk-uat-*
+
+[libvirt]
+enabled = 1
+; uri = qemu:///system
+; nbd_dir = /run/c-backup-helper/nbd          ; exports and qemu-nbd sockets, shared with the daemon
+; scratch_dir = /mnt/cache/system/cbackup-scratch
+; tpm_dir = /etc/libvirt/qemu/swtpm/tpm-states
+; nvram_dir = /etc/libvirt/qemu/nvram
+; qemu_nbd = /usr/bin/qemu-nbd                 ; the host's, run through nsenter
+; freeze = auto                                ; auto | off | required
+; freeze_timeout_s = 10
+```
+
+A unit is a persistent domain, keyed by UUID (`libvirt:<uuid>`) and
+allowed by name. Its snapshot holds `.cbackup-unit/config/domain.xml`
+(inactive, `VIR_DOMAIN_XML_SECURE`, verbatim), `config/disks.json` (every
+disk and its outcome: `included`, `passthrough`, `removable`, `readonly`,
+`shareable`, ...), `config/nvram.fd` when the XML names NVRAM,
+`disks/<target>` per included disk, and the swtpm state directory of the
+VM's own UUID at its real path. A named NVRAM file or a TPM's state that
+cannot be read fails the unit.
+
+**Shut off** (`offline`, or `crash` with a managed save image): the
+format is the XML's `<driver type>`, checked against the image's first
+bytes (a qcow2 header in a raw disk, or none in a qcow2, is refused);
+raw disks are read by the daemon directly (`SEEK_DATA`/`SEEK_HOLE`),
+qcow2 through the host's `qemu-nbd --read-only` over a socket in
+`nbd_dir`, handed to the daemon's uid. This qemu-nbd has no
+`--force-share`, so the helper passes `--image-opts ...,file.locking=off`,
+which is what it did: a backup never stops the VM starting, and a change
+of the image during the read is logged.
+
+**Running**: a pull-mode `virDomainBackupBegin` exporting every included
+disk by target name over a unix socket in `nbd_dir`, scratch files in
+`scratch_dir`; with a connected guest agent the guest is frozen for the
+begin alone and thawed in every path (a watchdog thaws at
+`freeze_timeout_s`), `quiesced`; without one `crash`. The daemon reads the
+export with its own NBD client.
+
+The daemon needs `nbd_dir` bind-mounted at the same path, read access to
+the images (the pools read-only) and to `nvram_dir` and `tpm_dir`
+read-only (container-backup and vm-backup 9.2).
+
 ## Testing
 
 The unit suites run everything above against stand-ins: `tests/fake_host`
@@ -489,6 +542,31 @@ Policy: `zfs_domains = cache/appdata`. Repeat steps 1, 2, 4 and 5 under
 `cache/lxc`: back it up running (expect `lxc-freeze`/`lxc-unfreeze` in the
 helper log, level `crash`) and stopped (`offline`), then restore the
 rootfs to a scratch path and compare.
+
+**VMs (FS1, disposable `cbk-uat-*` domains only).**
+
+1. Shut off, raw and qcow2 disks (one of each, a qcow2 named `.img`):
+   back up, restore both disks to images, `qemu-img compare` them with the
+   originals (identical), and check `disks.json`.
+2. A passthrough disk on a disposable domain (a spare loop device given as
+   `type='block'`): listed as `passthrough` and not read.
+3. Running with qemu-ga: level `quiesced`, the freeze window in the helper
+   log well under a second; without the agent channel: `crash`.
+4. **R1, scratch fill**: point `scratch_dir` at a small tmpfs (e.g. 256
+   MiB), start a backup of a running `cbk-uat-*` VM, and inside the guest
+   write more than that (`dd if=/dev/urandom of=/big bs=1M count=1024
+   oflag=direct`). Record what happens: the guest's state (paused on
+   ENOSPC or still running), the export (read error or not), what the job
+   reports, and that `virsh domjobinfo` is clear afterwards. The expected
+   outcome is a failed job and a running guest; anything else goes to the
+   design's open risk R1.
+5. **TPM-sealed secret**: a disposable VM with an emulated TPM, NVRAM and a
+   LUKS volume whose key is sealed to the TPM (`systemd-cryptenroll
+   --tpm2-device=auto`), so it unlocks at boot without a passphrase. Back
+   it up shut off, delete the VM and its TPM state directory, restore it
+   with define, `vm.install_state` for the new UUID, start it: it must
+   unlock without the passphrase. Also check that only the restored
+   UUID's directory under `tpm-states/` changed.
 
 Exit: every restore verified; zero leftover snapshots, pauses, freezes or
 journal rows after every fault (`GET /providers` `holds_open` 0, helper

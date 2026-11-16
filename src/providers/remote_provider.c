@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "remote_provider.h"
+#include "disk_stream.h"
 #include "fake_provider.h"
 #include "helper_proto.h"
 #include "registry.h"
@@ -43,6 +44,7 @@ struct sp_session {
     struct { char hook[72]; char run[HELPER_TOKEN_HEX + 1]; char *log; size_t log_len; } dumps[4];
     size_t            n_dumps;
     cJSON            *roots;       /* read_roots */
+    cJSON            *blocks;      /* where each disk is read: a file or an NBD export */
     sp_session_info_t info;
 };
 
@@ -339,6 +341,7 @@ static void session_free(struct sp_session *s)
     if (!s) return;
     cJSON_Delete(s->desc);
     cJSON_Delete(s->roots);
+    cJSON_Delete(s->blocks);
     if (s->blob_fd >= 0) close(s->blob_fd);
     if (s->late_fd >= 0) close(s->late_fd);
     cJSON_Delete(s->late);
@@ -379,6 +382,7 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(s->token, sizeof(s->token), "%s", tok);
         s->roots = cJSON_DetachItemFromObjectCaseSensitive((cJSON *)(uintptr_t)m, "read_roots");
         s->late = cJSON_DetachItemFromObjectCaseSensitive((cJSON *)(uintptr_t)m, "late_blobs");
+        s->blocks = cJSON_DetachItemFromObjectCaseSensitive((cJSON *)(uintptr_t)m, "blocks");
         s->info.achieved = (sp_consistency_t)num(m, "achieved");
         s->info.consist_flags = (uint32_t)num(m, "flags");
         s->info.freeze_ms = num(m, "freeze_ms");
@@ -511,6 +515,18 @@ static status_t r_blob_read(sp_session_t *s, const sp_item_desc_t *item, void **
 
 static status_t r_block_open(sp_session_t *s, const sp_item_desc_t *item, sp_block_stream_t *out)
 {
+    /* Where the helper said this disk is read (vm-backup.md 2.3, 2.4): the
+     * image itself, through the daemon's read-only mount, or an NBD export
+     * on a socket in the shared directory. */
+    const cJSON *rp = cJSON_GetObjectItemCaseSensitive(s->blocks, item->id);
+    if (rp) {
+        const char *kind = jstr(rp, "kind");
+        if (strcmp(kind, "file") == 0 && jstr(rp, "path")[0] == '/')
+            return disk_stream_file(jstr(rp, "path"), item->size, out);
+        if (strcmp(kind, "nbd") == 0 && jstr(rp, "socket")[0] == '/')
+            return disk_stream_nbd(jstr(rp, "socket"), jstr(rp, "export"), item->size, out);
+        return set_error(ERR_IO, "helper: no usable read path for disk %s", item->id);
+    }
     if (strcmp(s->ctx->provider, "fake") != 0)
         return set_error(ERR_INVALID, "helper: no data plane for %s disks in this build", s->ctx->provider);
     const cJSON *fk = cJSON_GetObjectItemCaseSensitive(item_json(s, item->id), "fake");
@@ -666,6 +682,7 @@ static status_t r_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
         g->refs++;
         s->roots = cJSON_DetachItemFromObjectCaseSensitive(m, "read_roots");
         s->late = cJSON_DetachItemFromObjectCaseSensitive(m, "late_blobs");
+        s->blocks = cJSON_DetachItemFromObjectCaseSensitive(m, "blocks");
         if (late >= 0) s->late_fd = fcntl(late, F_DUPFD_CLOEXEC, 0);
         s->info.achieved = (sp_consistency_t)num(m, "achieved");
         s->info.consist_flags = (uint32_t)num(m, "flags");
