@@ -1353,7 +1353,43 @@ different action is a 400 rather than a value stored and never read:
 | `backup` | `paths` (optional; the repository's sources otherwise), `label` (optional; the same rule as a backup request, checked at creation) |
 | `replicate` | `dest` (required, absolute) |
 | `grep` | `pattern` (required, a valid extended regular expression), `path_prefix`, `ignore_case` (a boolean, stored as one; `0`/`1` accepted), `max_files` |
+| `units` | `provider` (required, enabled now), and `all` with optional `exclude` globs, or `units` (names or ids); optional `require`. The body of `POST /repos/<id>/units/backup`, stored canonically |
 | others | none |
+
+A `units` schedule with `all` enumerates the provider's units each time it
+fires, so a unit added since is included. Its overlap is keyed by repository,
+action and unit set: two `units` schedules naming different units are not
+each other's overlap. From the CLI: `schedule add 1 units --every day --at
+01:00 --provider fake --all [--exclude GLOB]...` or `--unit NAME`.
+
+## Units
+
+Virtual machines and containers backed up through a source provider
+(`docs/source-providers.md`). One snapshot per unit per run, with the unit's
+metadata under the reserved `.cbackup-unit/` directory at its top, disks as
+sparse regular files and container data at its real paths. Every unit a
+request names is held to `units.allow` (a config key, so no session can widen
+it); a unit outside it is not listed and cannot be described or backed up.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/providers` | Every compiled-in provider, enabled or not, its probe, the daemon id, `units.allow` and how many holds are journalled |
+| GET | `/providers/<p>/units` | Live enumeration, by name, paginated (`limit`, `offset`), with `total` |
+| GET | `/providers/<p>/units/<u>` | Describe one unit (by name or id): items, kinds, sizes, capabilities |
+| GET | `/repos/<id>/units` | Units with history here: last snapshot, its level, how many, paginated by name |
+| GET | `/repos/<id>/units/<p>/<u>/snapshots` | That unit's snapshots, newest first, each with its level and items (`read_mode`, `reason`, `bytes_read`) |
+| GET/PUT | `/repos/<id>/units/<p>/<u>/policy` | Per-unit retention: `retention.keep_*` keys over the repository's; `null` or `""` drops one; GET shows the unit's own and what is in force |
+| POST | `/repos/<id>/units/backup` | `{"provider":"fake","all":true,"exclude":["x*"]}` or `{"provider":"fake","units":["a"]}`, optional `"require":"crash"` (the default); 202 with a job. The job fails when any unit fails, and its result lists each unit's outcome and snapshot |
+| POST | `/repos/<id>/snapshots/<sid>/unit/restore` | `{"mode":"files","dest":"/abs/dir"}`, the whole snapshot with each disk as a sparse raw file; or `{"mode":"item","item":"vda","dest":"/abs/file","format":"raw"}`, one item, written through `<dest>.cbk-partial` and never over an existing path. 202 with a job |
+
+A retention pass (`POST /repos/<id>/gfs`) runs once per retention group: the
+file snapshots, then each unit, each with its own newest snapshot, which is
+never pruned. A snapshot whose `.cbackup-unit/unit.json` cannot be read is its
+own `unknown:<id>` group and is never pruned.
+
+File backups refuse a source at or under `/.cbackup-unit` or
+`/.cbackup-captures`, on `POST /backup`, `PUT /sources` and backup schedules
+alike: those names are the daemon's in every snapshot root.
 
 A `grep` schedule searches the newest snapshot as of each fire, so it takes
 no `snapshot`. From the CLI: `schedule add 1 grep --every day --at 04:00

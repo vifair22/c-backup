@@ -42,6 +42,9 @@
 #include "server.h"
 #include "state_db.h"
 #include "store_index.h"
+#include "fake_provider.h"
+#include "registry.h"
+#include "unit_state.h"
 
 #ifndef VERSION_STRING
 #define VERSION_STRING "0.0.0-dev"
@@ -109,6 +112,49 @@ static status_t schedule_cancel(void *user, int64_t job_id)
 static status_t startup_reindex(int64_t repo_id, void *ctx, int64_t *out_job_id)
 {
     return routes_submit_startup_reindex(ctx, repo_id, out_job_id);
+}
+
+/*
+ * Daemon id, unit settings, providers and the start-up sweep. The fake
+ * provider is enabled only by units.fake_spec, which only the end-to-end
+ * suite sets.
+ */
+static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *db_path)
+{
+    char dir[PATH_MAX] = "";
+    if (db_path && *db_path) {
+        char tmp[PATH_MAX];
+        snprintf(tmp, sizeof(tmp), "%s", db_path);
+        snprintf(dir, sizeof(dir), "%s", dirname(tmp));
+    }
+    units_config_t uc = {
+        .allow            = config_get_str(cfg, "units.allow"),
+        .unit_wait_s      = (unsigned)config_get_int(cfg, "units.unit_wait_s", (int)UNITS_WAIT_DEFAULT_S),
+        .freeze_timeout_s = (unsigned)config_get_int(cfg, "vm.freeze_timeout_s", (int)UNITS_FREEZE_DEFAULT_S),
+        .max_pause_s      = (unsigned)config_get_int(cfg, "containers.max_pause_s", (int)UNITS_PAUSE_DEFAULT_S),
+        .trust_zero       = config_get_int(cfg, "vm.trust_zero_status", 1),
+    };
+    status_t st = units_init(db, dir[0] ? dir : NULL, &uc);
+    if (st != OK) return st;
+    log_info("units: daemon id %s, units.allow '%s'", units_daemon8(),
+             uc.allow && *uc.allow ? uc.allow : "(all)");
+
+    const char *spec = config_get_str(cfg, "units.fake_spec");
+    if (spec && *spec) {
+        sp_config_t pc = { spec, units_daemon8() };
+        st = sp_registry_enable(&fake_provider_ops, &pc);
+        if (st != OK) return st;
+        log_warn("units: the fake provider is enabled from %s; this is for tests", spec);
+    }
+
+    units_sweep_result_t sw;
+    st = units_sweep(db, 0, &sw);
+    if (st != OK) return st;
+    if (sw.released || sw.failed || sw.removed)
+        log_warn("units: start-up sweep released %u hold(s), %u could not be, removed "
+                 "%u leftover artefact(s), left %u not this daemon's",
+                 sw.released, sw.failed, sw.removed, sw.left_foreign);
+    return units_watchdog_start(db, 1000);
 }
 
 static void tighten_umask(void)
@@ -277,6 +323,17 @@ int main(int argc, char *argv[])
     }
 
     /*
+     * Units (source-providers.md): the daemon id, the providers, then the
+     * sweep, after the job manager has failed whatever was running when
+     * the last process died, so every hold it journalled is released now.
+     */
+    if (start_units(db, cfg, db_path) != OK) {
+        log_error("%s", err_msg());
+        goto out_jm;
+    }
+    routes_units_init(db, jm);
+
+    /*
      * The scheduler submits work through the job manager rather than running
      * it: firing a schedule and executing it are different concerns, and
      * keeping them apart means a slow job cannot delay the next tick.
@@ -362,7 +419,8 @@ int main(int argc, char *argv[])
         routes_register_repos(srv, db) != 0 ||
         routes_register_jobs(srv, db, jm) != 0 ||
         routes_register_metrics(srv, db) != 0 ||
-        routes_register_stream(srv, db) != 0) {
+        routes_register_stream(srv, db) != 0 ||
+        routes_register_providers(srv) != 0) {
         log_error("cannot register routes");
         goto out_srv;
     }
@@ -421,6 +479,10 @@ out_sched:
     scheduler_stop(sched);      /* NULL when disabled by config */
 out_jm:
     job_manager_stop(jm);
+    /* After the jobs: none is in a session any more. Both are safe when
+     * startup failed before they were set up. */
+    units_shutdown();
+    sp_registry_shutdown();
 out_purge:
     repo_purge_stop();
 out_locks:

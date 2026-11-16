@@ -169,6 +169,11 @@ void job_set_result(void *progress_ctx, const char *json_object);
  */
 void job_set_summary(void *progress_ctx, const char *text);
 
+/* The running job's id, from its progress context: what a job names the
+ * holds it journals and the artefacts it creates with (unit backups). 0
+ * for NULL. */
+int64_t job_progress_id(void *progress_ctx);
+
 /*
  * job_set_warning: one line saying what a job that succeeded still needs an
  * operator to know - a backup that left files out, say. The job stays

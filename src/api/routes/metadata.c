@@ -4,6 +4,7 @@
 #include "routes.h"
 #include "db_txn.h"
 #include "repo_tags.h"
+#include "reserved.h"
 #include "util.h"
 #include "json_row.h"
 
@@ -532,6 +533,14 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
                 break;
             }
             free(sp);
+            /* The daemon's reserved snapshot names (reserved.h) can never
+             * be a file source: refused here, not at the first backup. */
+            char rwhy[PATH_MAX + 160];
+            if (reserved_source_refused(norm, rwhy, sizeof(rwhy)) != 0) {
+                bad = api_error(400, rwhy);
+                failed = 1;
+                break;
+            }
             /*
              * A source that does not exist is accepted with a warning, not
              * refused: it may be a share that is not mounted yet, or a disk
