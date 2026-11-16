@@ -6,6 +6,122 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-16 - OWN-44 on v3 after the 1.0.0 merge (c-utils 1.7.1)
+
+After merging origin/v3 e6dd246 (the 1.0.0 merge, V3-4 ports, OWN-45-LIVE,
+many-small-files work), same comparison, v6 = origin/v3 e6dd246, five
+rounds, `bench_phases -n 0 -l 48 -t 0 -m 16 -R` and `-n 20000 -l 0 -t 0 -R`:
+
+| Shape | v6 first backup | v7 first backup | v6 mean | v7 mean |
+|---|---|---|---:|---:|
+| large, 768 MiB | 1.226, 1.102, 1.040, 1.048, 1.109 s | 1.153, 0.990, 0.981, 1.033, 1.026 s | 1.105 s | **1.037 s** |
+| 20,000 small | 0.560, 0.557, 0.575, 0.590, 0.559 s | 0.554, 0.556, 0.552, 0.553, 0.551 s | 0.568 s | **0.553 s** |
+
+## 2026-11-16 - OWN-44 on v3 with small-file workers and the claim set
+
+After merging origin/v3 b59db42 (small files on workers, OWN-46's claim set
+and gc reclaim), the same comparison, v6 = origin/v3 b59db42, five rounds,
+`bench_phases -n 0 -l 48 -t 0 -m 16 -R` and `-n 20000 -l 0 -t 0 -R`:
+
+| Shape | v6 first backup | v7 first backup | v6 mean | v7 mean |
+|---|---|---|---:|---:|
+| large, 768 MiB | 1.131, 1.086, 1.098, 1.061, 1.066 s | 0.994, 1.002, 1.003, 0.978, 0.990 s | 1.088 s | **0.993 s** |
+| 20,000 small | 1.708, 1.570, 1.602, 1.544, 1.541 s | 1.555, 1.539, 1.556, 1.519, 1.540 s | 1.593 s | **1.542 s** |
+
+The small-file workers took both builds' small-file backup from about 1.9 s
+to about 1.6 s; v7 stays ahead with them, its workers computing each entry's
+CRC and AEAD and no parity.
+
+## 2026-11-16 - Pack writers within the buffer budget, one encoder pool (OWN-44)
+
+Review of the encode-as-you-write change found writer memory unbudgeted: a
+backup with sixteen file workers could open seventeen writers, about
+311 MiB of parity and buffers and 68 encoder threads. Each writer now takes
+its encoder and write buffer (26.3 MiB) from `jobs.read_budget_mb` when it
+opens, never waiting and never past one object's room left for readers, and
+a backup plans its file workers to what fits; the encoder threads are one
+process-wide pool of min(4, CPUs). Same benchmark as below, rerun on this
+build (bench_phases sets no budget, so every writer encodes; at the default
+256 MiB a backup gets up to nine), v6 = origin/v3 d4658fb, five rounds:
+
+| Shape | v6 first backup | v7 first backup | v6 mean | v7 mean |
+|---|---|---|---:|---:|
+| large, 768 MiB | 1.067, 1.066, 1.047, 1.087, 1.065 s | 0.978, 0.969, 1.039, 0.966, 0.996 s | 1.066 s | **0.990 s** |
+| 20,000 small | 1.897, 1.952, 1.923, 1.963, 1.986 s | 1.908, 1.913, 1.947, 1.964, 1.899 s | 1.944 s | **1.926 s** |
+
+One shared pool instead of four threads per writer made the large-file
+case faster, not slower: the three packs of that run no longer each start
+and join a pool of their own.
+
+## 2026-11-16 - Stripe parity encoded as packs are written (OWN-44)
+
+The first cut of striped parity encoded each pack's stripe at the seal, on
+one thread, reading the body back: 3-4% slower than v6 on large files, and
+it would have been worse with content-defined chunking feeding 256 MiB packs
+from parallel workers. The plaintext writer now hands each 15,296-byte group
+to a small pool (up to four threads) as soon as appends complete it, with at
+most eight groups of body in flight; the chunk workers compute each entry's
+payload CRC with its encryption, and the writer extends it by the 51-byte
+header's CRC (`crc32c_combine`, a few hundred operations). The seal encodes
+only the last partial group and group 0 (its count is patched) and reads
+nothing back. gc's rewrite, coalescing and the stored writer still seal by
+reading back; none is on a backup's path.
+
+`bench_phases -n 0 -l 48 -t 0 -m 16 -R` (48 incompressible 16 MiB files,
+768 MiB, three packs) and `-n 20000 -l 0 -t 0 -R` (20,000 files averaging
+4 KiB), btrfs over LVM on NVMe, v6 = origin/v3 d4658fb (CDC, per-entry
+parity on the chunk workers), v7 = this branch, alternating, five rounds:
+
+| Shape | v6 first backup | v7 first backup | v6 mean | v7 mean |
+|---|---|---|---:|---:|
+| large, 768 MiB | 1.137, 1.100, 1.114, 1.130, 1.123 s | 1.085, 1.056, 1.129, 1.054, 1.079 s | 1.121 s | **1.081 s** |
+| 20,000 small | 1.932, 1.966, 2.113, 1.970, 2.138 s | 1.911, 1.995, 1.897, 1.949, 1.946 s | 2.024 s | **1.940 s** |
+
+Parity written: large 52.0 MiB (v6) and 51.4 MiB (v7); small 25.1 MiB (v6)
+and 3.8 MiB (v7). The incremental with no change is unchanged within noise
+(0.78-0.88 s both). A first measurement with the CRC combine done by
+repeated matrix squaring per entry put v7 4% behind v6 on small files;
+precomputing the 64 zero-byte operators once made it the 4% ahead above.
+
+## 2026-11-16 - Striped pack parity (OWN-44)
+
+Pack version 7 stripes Reed-Solomon over each pack body as one stream, with
+an 8-byte CRC slot per entry, instead of giving every entry its own parity
+rounded up to whole groups and a 260-byte header record
+(`docs/pack-parity.md`). Parity against data, from
+`tests/test_pack_parity_ratio.c` (random content; "data" is the pack body):
+
+| Shape | Objects | v6 parity / data | v7 parity / data | v7 x RS rate |
+|---|---:|---:|---:|---:|
+| small files, 100 B to 2 KiB | 12,000 | 1.1606 | **0.0746** | 1.12 |
+| mixed tree, 64 B to 1 MiB, 1% 4 MiB | 1,000 | 0.0734 | **0.0670** | 1.00 |
+| chunks, 512 KiB to 8 MiB | 64 | 0.0674 | **0.0670** | 1.00 |
+
+Four of the small-file case's eight bytes an entry are the header CRC that
+lets a walk check every entry header without reading payload (B119); with
+a 4-byte slot it was 0.0709.
+
+`bench_phases -n 20000 -l 3 -t 0 -m 16` (20,000 small files averaging 4 KiB
+plus three 16 MiB files) on btrfs over LVM on NVMe, base = origin/v3
+015fee8, alternating, two rounds:
+
+| Build | First backup | Written | Parity | Incremental | Restore |
+|---|---|---:|---:|---|---|
+| v6 | 2.237 s, 2.140 s | 130.1 MiB | 28.3 MiB | 0.959 s, 0.913 s | 2.587 s, 2.430 s |
+| v7 | 2.122 s, 2.089 s | 108.8 MiB | 7.0 MiB | 0.986 s, 0.942 s | 2.532 s, 2.479 s |
+
+Writing 75% less parity makes the small-file first backup a little faster,
+not slower, although the seal now reads each pack back to compute it.
+Incremental and restore are unchanged within noise: a clean read touches no
+parity in either version.
+
+Large incompressible files (`-n 0 -l 24 -t 0 -m 16 -R`, 384 MiB, two rounds):
+v6 0.630 s and 0.633 s, v7 0.651 s and 0.659 s, both writing 25.7 MiB of
+parity. The 3-4% is the seal: v6 computed each entry's parity on the pack
+writer's worker threads as it went, v7 encodes the whole body at the seal,
+on one thread, from the page cache. Moving the stripe encode back onto the
+workers (each window of groups is independent) would recover it if it ever
+matters; at 600 MiB/s of backup it does not today.
 ## 2026-11-16 - Many small files: state.db settings, restore batches, one LZ4 pass
 
 Three of the proposals in the profile two entries below, built (`perf/many-small-fixes`):

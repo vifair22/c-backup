@@ -280,7 +280,7 @@ static int pack_files(void)
 static int tmp_entries(void)
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ls -A '%s/tmp' | wc -l", TEST_REPO);
+    snprintf(cmd, sizeof(cmd), "ls -A '%s/tmp' | grep -vx .lock | wc -l", TEST_REPO);
     FILE *p = popen(cmd, "r");
     assert_non_null(p);
     int n = -1;

@@ -81,7 +81,7 @@ typedef struct {
 } store_pool_ops_t;
 
 /*
- * How many workers to run and how much RS parity each may hold in memory.
+ * How many workers to run.
  *
  * requested: 0 for automatic, otherwise the operator's number, which is
  * honoured exactly except that more workers than candidate files would only
@@ -95,15 +95,14 @@ typedef struct {
  * n_large: files that may go to the pool (over PACK_STREAM_THRESHOLD; the
  * cache may still vouch for some of them).
  *
- * The parity cap divides what the budget leaves after the 8 MiB of pipeline
- * buffers per worker, between 16 MiB and the serial default of 256 MiB.
- * Parity past the cap spills to the repository's tmp/, which costs a write
- * and a read of it, not correctness.
+ * Parity is no longer a per-worker cost here: it is each pack writer's,
+ * charged to the daemon's buffer budget when the writer opens (pack.h,
+ * pack_writer_budget_bytes), which is what bounds how many large files a
+ * backup stores at once (backup.c, store_content).
  *
  * A result of one worker means: do not start a pool, store serially.
  */
-void store_pool_plan(unsigned requested, uint64_t n_large,
-                     unsigned *out_workers, size_t *out_parity_cap);
+void store_pool_plan(unsigned requested, uint64_t n_large, unsigned *out_workers);
 
 /* The inputs store_pool_plan reads from the machine, for tests and logs. */
 unsigned store_pool_cpus(void);

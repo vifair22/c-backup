@@ -18,14 +18,14 @@
  * place that decides what happens to a file that never settles.
  *
  * Every store path calls this: the backup thread, the file workers and the
- * small-file workers. It also refuses a descriptor that is no longer a
- * regular file (OWN-41), which all three used to check for themselves.
+ * small-file workers, each with a descriptor from open_scanned (opened
+ * beneath the source root, B128). It refuses one that is no longer a
+ * regular file too (OWN-41).
  */
 
 #include "cdc.h"
 #include "error.h"
 
-#include <fcntl.h>
 #include <stddef.h>
 #include <sys/stat.h>
 
@@ -96,16 +96,3 @@ status_t settle_store_fd(const cdc_params_t *cp, int fd, const struct stat *scan
 /* Size, mtime, ctime and inode all equal. */
 int settle_stat_same(const struct stat *a, const struct stat *b);
 
-/*
- * The flags every store path opens a source file with. O_NOFOLLOW above
- * all (B128): a file replaced by a symlink between the scan and the store
- * was followed, and `ln -s /etc/shadow` put the shadow file in the
- * snapshot, where a restore wrote it out again. O_NONBLOCK so a FIFO put in
- * its place cannot hang the open; settle_store_fd refuses anything that is
- * not the scanned regular file.
- */
-#define SETTLE_OPEN_FLAGS (O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-
-/* Why an open with SETTLE_OPEN_FLAGS failed, for the B118 skip reason:
- * ELOOP is the symlink O_NOFOLLOW refused. Writes into buf and returns it. */
-const char *settle_open_reason(int err, char *buf, size_t n);
