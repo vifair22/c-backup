@@ -112,6 +112,47 @@ static char *req(const char *op, const char *args)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * The examples in docs/helper.md put a comment after a value. The parser
+ * used to take the comment as part of the value and refuse it, so a policy
+ * copied from the docs did not start. A '#' after whitespace now ends the
+ * value; a '#' inside a value, and anything in argv.N, is kept.
+ */
+static void test_policy_inline_comments(void **state)
+{
+    (void)state;
+    const char *text =
+        "[helper]\n"
+        "daemon_uid = 990              # the only peer uid accepted (non-root)\n"
+        "daemon_id = 7f3a09c1          # the daemon id artefacts are named with\n"
+        "max_pause_s = 30\t# watchdog bound\n"
+        "allow_restore = 1             # restore.stage, restore.swap\n"
+        "state_dir = /mnt/cache/system/c-backup-helper   # on a pool\n"
+        "[units]\n"
+        "allow = docker:cbk-*   # a glob\n"
+        "[snapshot]\n"
+        "dir_domains =                  # directory domains (tests, begin_paths)\n"
+        "[hook h]\n"
+        "unit = docker:cbk-a   # the unit\n"
+        "kind = dump                    # dump: stdout comes back as a pipe fd\n"
+        "argv.0 = /bin/sh\n"
+        "argv.1 = -c\n"
+        "argv.2 = echo a # not a comment here\n";
+    helper_policy_t p;
+    assert_int_equal(helper_policy_parse(text, &p), OK);
+    assert_int_equal(p.daemon_uid, 990);
+    assert_string_equal(p.daemon_id, "7f3a09c1");
+    assert_int_equal(p.max_pause_s, 30);
+    assert_true(p.allow_restore);
+    assert_string_equal(p.state_dir, "/mnt/cache/system/c-backup-helper");
+    assert_int_equal(p.n_hooks, 1);
+    assert_string_equal(p.hooks[0].argv[2], "echo a # not a comment here");
+    helper_policy_free(&p);
+    /* A value that is wrong is still refused, comment or not. */
+    assert_int_not_equal(helper_policy_parse("[helper]\ndaemon_uid = 0   # root\n"
+                                             "daemon_id = 7f3a09c1\nstate_dir = /x\n", &p), OK);
+}
+
 static void test_policy(void **state)
 {
     (void)state;
@@ -618,6 +659,7 @@ int main(void)
     if (hf_unroot() != 0) { perror("cannot leave root for the helper suites"); return 1; }
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_policy),
+        cmocka_unit_test(test_policy_inline_comments),
         cmocka_unit_test(test_unit_key_grammar),
         cmocka_unit_test_setup_teardown(test_malformed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_fuzz_requests, setup, teardown),

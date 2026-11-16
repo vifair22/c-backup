@@ -122,6 +122,10 @@ Notes that matter:
 
 ## The policy
 
+A line starting with `#` or `;` is a comment, and so is `#` after
+whitespace at the end of a value, as in the example; an `argv.N` value is
+taken verbatim, `#` included.
+
 ```ini
 [helper]
 daemon_uid = 990              # the only peer uid accepted (non-root)

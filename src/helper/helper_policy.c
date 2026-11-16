@@ -138,6 +138,18 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
         if (!eq) { st = bad(line, "expected key = value", s); break; }
         *eq = '\0';
         char *k = trim(s), *v = trim(eq + 1);
+        /* An inline comment, whitespace then '#', ends the value, as the
+         * examples in docs/helper.md write them. Not for argv.N: an
+         * argument is taken verbatim, '#' and all. */
+        if (strncmp(k, "argv.", 5) != 0) {
+            for (char *c = v; *c; c++) {
+                if (*c == '#' && (c == v || c[-1] == ' ' || c[-1] == '\t')) {
+                    *c = '\0';
+                    v = trim(v);
+                    break;
+                }
+            }
+        }
         unsigned u = 0;
         if (sec == S_HELPER) {
             if (strcmp(k, "daemon_uid") == 0) {
