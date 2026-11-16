@@ -422,7 +422,7 @@ fuzz-run: fuzz
 	    n=$$(basename $$t); \
 	    mkdir -p $(FUZZ_CORPUS)/$$n; \
 	    d=""; [ -f $(FUZZ_DICT)/$$n.dict ] && d="-dict=$(FUZZ_DICT)/$$n.dict"; \
-	    $(SCRATCH_GUARD) "$$n ($(FUZZ_TIME)s)" \
+	    C_BACKUP_SCRATCH_LEFTOVERS=remove $(SCRATCH_GUARD) "$$n ($(FUZZ_TIME)s)" \
 	    $$t $(FUZZ_CORPUS)/$$n $$d -max_total_time=$(FUZZ_TIME) \
 	        -jobs=$(FUZZ_JOBS) -workers=$(FUZZ_JOBS) -timeout=25 \
 	        -rss_limit_mb=2048 -print_final_stats=1 -error_exitcode=77 || rc=1; \
@@ -531,7 +531,7 @@ fuzz-regress: fuzz
 	for t in $(FUZZ_BINS); do \
 	    n=$$(basename $$t); \
 	    if [ -d $(FUZZ_CORPUS)/$$n ]; then \
-	        $(SCRATCH_GUARD) "$$n (replay)" \
+	        C_BACKUP_SCRATCH_LEFTOVERS=remove $(SCRATCH_GUARD) "$$n (replay)" \
 	            $$t -runs=0 -error_exitcode=77 $(FUZZ_CORPUS)/$$n || rc=1; \
 	    fi; \
 	done; \

@@ -27,6 +27,10 @@
 #   C_BACKUP_SCRATCH_LOG     optional file to append "<label> <peak bytes>"
 #   C_BACKUP_SCRATCH_QUIET   1 to discard the suite's own output, keeping
 #                            this script's lines (make coverage)
+#   C_BACKUP_SCRATCH_LEFTOVERS  "fail" (default) or "remove": the fuzz
+#                            targets keep one working directory for the
+#                            whole run and libFuzzer gives them no
+#                            teardown, so theirs are removed, not failed
 #
 # Exit status: the suite's, or 99 when it went over budget, so a caller that
 # tolerates failing suites (make coverage) can still fail on that.
@@ -139,6 +143,6 @@ fi
 if [ -n "$left" ]; then
     echo "scratch-guard: $label left $(human "${lbytes:-0}") behind in $dir (removed):" >&2
     printf '  %s\n' $left >&2
-    [ "$rc" -eq 0 ] && rc=1
+    [ "$rc" -eq 0 ] && [ "${C_BACKUP_SCRATCH_LEFTOVERS:-fail}" != remove ] && rc=1
 fi
 exit "$rc"
