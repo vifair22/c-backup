@@ -255,6 +255,14 @@ an existing encrypted repository whose key is not on this host still
 succeeds, and the answer carries `key_loaded: false` and a `warning` saying
 `no key loaded for repository <uuid>` and how to supply it.
 
+When the repository holds snapshot records (`<repo>/snapshots/<id>`) that
+the index has no row for - an adopted repository, a replica, one removed
+and added back, or any after `state.db` was lost - either answer carries
+`snapshots_unindexed: N` and, unless the key is missing, `reindex_job: <id>`
+for the reindex the registration queued. That job's `origin` is `register`,
+as is its journal entry's `source`. Until it completes the snapshot list is
+short and a verify checks less than the repository holds.
+
 Repository ids are never reused. Removing the newest repository used to
 make its id the next one handed out, and the new repository inherited the
 old one's schedules, history and index rows, which deregistering does not
@@ -646,8 +654,13 @@ plain verify, with the same counts on a healthy repository. The job's
 `result` says which kind of run it was, since the run record does not:
 
 ```json
-{"run_id":12,"level":"deep","repair":false,"dry_run":true}
+{"run_id":12,"level":"deep","repair":false,"dry_run":true,"checked":52,
+ "ok":52,"repaired":0,"recoverable":0,"unrecoverable":0,"missing":0,
+ "failed":false}
 ```
+
+The counts are the run's (table below), and `failed` is true exactly when
+`unrecoverable` or `missing` is non-zero, which is when the job fails.
 
 `run_id` is null when the walk did not finish (cancelled or aborted); the
 partial run is still in `GET /repos/<id>/verify`, with `completed` false.
@@ -666,8 +679,8 @@ A run (`GET /repos/<id>/verify`) carries these counts:
 
 | Field | Meaning |
 |---|---|
-| `checked` | Objects examined |
-| `ok` | Intact on disk |
+| `checked` | Items examined: every indexed object, plus every regular-file entry that names no content. Always `ok + repaired + recoverable + unrecoverable + missing` |
+| `ok` | Intact on disk. Never counts a failure: a run with anything missing or unrecoverable has `ok` below `checked` |
 | `repaired` | Damaged, corrected from parity, and the correction written to disk. Always 0 with `repair=0` |
 | `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed |
 | `unrecoverable` | Damaged beyond what parity can rebuild. Data loss |
@@ -701,12 +714,12 @@ An object no file references - a manifest tree, or one from an evicted
 snapshot - reports zero files; that is not a claim the loss is harmless.
 
 Every level also checks the index for regular files that name no content
-object: a file a snapshot lists and no restore can produce. Backups before
-the B118 fix recorded a file that was skipped during the store phase that
-way. These are one finding with `hash` `""` and `status` `missing: file
+object: a file a snapshot lists and no restore can produce. Backups by a
+c-backup older than 1.0.0 recorded a file that was skipped during the store
+phase that way. These are one finding with `hash` `""` and `status` `missing: file
 entry has no content`, its `affected_*` fields and `sample_paths` naming
-the files and snapshots, and each such row counts once in `missing`, so
-the run fails. A backup no longer writes such an entry (see the backup
+the files and snapshots, and each such row counts once in `checked` and
+once in `missing`, so the run fails and `ok` stays below `checked`. A backup no longer writes such an entry (see the backup
 `result` below), and the tree writer refuses one.
 
 `/metrics` exposes `cbackup_last_verify_age_seconds` alongside
@@ -872,7 +885,8 @@ for a removal) while a job holds the repository.
 
 A job record carries `origin`, who asked for it: `api` for anything submitted
 over the API (the CLI and the app both are), `schedule` for the scheduler, with
-`schedule_id` naming the schedule (null otherwise).
+`schedule_id` naming the schedule (null otherwise), or `register` for the
+reindex a repository registration queues (`POST /repos`).
 
 `/jobs/stream/<id>` sends one `data:` frame at once with the job's state as it
 is, then a frame whenever it changes, and the same frame again every 5 seconds
@@ -895,8 +909,8 @@ stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it, and journalled then with that message:
 a daemon that was killed had no chance to journal it itself.
 
-A journal entry's `source` is the job's origin: `api`, or `schedule` with the
-message starting `schedule <id>`.
+A journal entry's `source` is the job's origin: `api`, `register`, or
+`schedule` with the message starting `schedule <id>`.
 
 What some jobs report in `result`, beyond the backup and restore counts:
 
@@ -922,13 +936,17 @@ failed partway. The job still completes (Manual section 6.3), and says so:
 | `files_skipped` | Every file left out. Always present; `0` on a clean run |
 | `skipped` | The first 100 of them, in scan order, each `{"path","reason"}`; `[]` when none |
 | `skipped_listed` | How many `skipped` holds; less than `files_skipped` when more than 100 were left out |
-| `files_changed` | Files whose size or times had changed by the time they were read (since the scan, or during a read that was then repeated) and that were stored as read: one whole version, its size and mtime in the snapshot. Always present |
+| `files_changed` | Files whose size, times or inode (a file replaced by rename) had changed by the time they were read (since the scan, or during a read that was then repeated) and that were stored as read: one whole version, its size and mtime in the snapshot. Always present |
 | `changed` | The first 100 of them, as paths; `[]` when none |
 | `changed_listed` | How many `changed` holds |
 
 `reason` reads `cannot open: it no longer exists`, `cannot open:
 Permission denied` (or another errno text), `no longer a regular file (now
-a directory)`, `no longer a regular file`, `changed while it was being
+a symlink)` (or `a directory`, `a FIFO`, `a socket`, `a character device`,
+`a block device`; a symlink is never followed), `a directory on its path is
+now a symlink; not followed`, `its path now crosses a mount point or leaves
+the source; not followed` (a one-filesystem backup; Manual section 6.3),
+`changed while it was being
 read, and again on a second read` (a file still changing when read a second
 time; Manual section 6.3), or `cannot read: ` followed by the store's
 error. Each is also a `WARN` line in the daemon log, `backup:

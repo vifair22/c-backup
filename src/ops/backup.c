@@ -23,6 +23,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/openat2.h>
+#include <stdatomic.h>
+#include <sys/syscall.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,6 +127,10 @@ typedef struct {
      * large files stored at once both find the object absent and both
      * install it; the second one to be taken back is not new. */
     hashset_t      pool_new;
+    /* Each source root, opened once for the store phase: every file is
+     * opened beneath its root, never by its whole path (open_scanned). */
+    struct source_root *roots;
+    unsigned       n_roots;
 } pipeline_t;
 
 /*
@@ -160,6 +167,259 @@ static void skip_file(pipeline_t *p, uint32_t i, const char *reason)
     r->skipped[r->skipped_listed].path   = path;
     r->skipped[r->skipped_listed].reason = why;
     r->skipped_listed++;
+}
+
+/* What a path names now, for a skip reason. */
+static const char *file_kind(mode_t m)
+{
+    if (S_ISLNK(m))  return "a symlink";
+    if (S_ISDIR(m))  return "a directory";
+    if (S_ISFIFO(m)) return "a FIFO";
+    if (S_ISSOCK(m)) return "a socket";
+    if (S_ISCHR(m))  return "a character device";
+    if (S_ISBLK(m))  return "a block device";
+    return "something other than a regular file";
+}
+
+/*
+ * Open scan entry i for its content, reached only through its own source
+ * tree; or skip it (skip_file) and return -1.
+ *
+ * The scan saw a regular file through lstat; the store reads it later.
+ * Whoever can write inside a source can put a symlink where the file was in
+ * between, and a plain open by path followed it: the daemon, running as
+ * root, stored /etc/shadow under the file's name, and restore and grep
+ * handed it to anyone with rights to those (B128). Opening by the whole
+ * path cannot be made safe, because every directory on it is a symlink
+ * waiting to happen. So the file is resolved beneath its source root:
+ *
+ *  - The root is opened once per backup (source_root) and must still be
+ *    the directory the scan lstat'd. Its own path is the operator's and may
+ *    run through symlinks; nothing below it may.
+ *  - The rest of the path is resolved from that fd with openat2
+ *    RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS, and RESOLVE_NO_XDEV for a
+ *    one-filesystem backup: a symlink anywhere on the way, an escape out of
+ *    the tree, or a mount point that was not there at the scan, is refused
+ *    rather than followed. Where openat2 is missing (old kernel, a container
+ *    whose seccomp profile predates it) the same walk is done one component
+ *    at a time, each O_NOFOLLOW, with the device compared for one
+ *    filesystem.
+ *  - O_NOFOLLOW | O_NONBLOCK on the file itself, and fstat must say S_ISREG:
+ *    a directory, FIFO or device put there is refused, and a FIFO cannot
+ *    hang the open.
+ *
+ * Why beneath the root and not from a pinned fd per directory: the scan
+ * walks with one fd per level and lets go of it, and holding one per
+ * directory through the store phase would be one fd per directory of the
+ * tree, tens of thousands on the trees this runs on. One fd per source and
+ * one openat2 per file costs a path walk the kernel does anyway.
+ *
+ * A regular file that is a different inode from the scan's - replaced by
+ * rename, as editors save - is a normal change, not a refusal: the caller
+ * stores it as read under the OWN-45 rules and lists it as changed.
+ */
+struct source_root {
+    const char *path;     /* the root entry's path; not owned */
+    uint32_t    len;
+    dev_t       dev;
+    ino_t       ino;
+    int         fd;       /* -1 until opened */
+    int         failed;   /* opened and found wrong, or could not open */
+    char        why[160];
+};
+typedef struct source_root source_root_t;
+
+/* Every source root in the scan, from the entries whose path is the root. */
+static status_t roots_build(pipeline_t *p)
+{
+    unsigned n = 0;
+    for (uint32_t i = 0; i < p->count; i++) {
+        const scan_entry_t *e = &p->scan->entries[i];
+        if (e->root_len && strlen(e->path) == e->root_len) n++;
+    }
+    if (n == 0) return OK;
+    p->roots = calloc(n, sizeof(*p->roots));
+    if (!p->roots) return set_error(ERR_NOMEM, "backup: source root table");
+    for (uint32_t i = 0; i < p->count; i++) {
+        const scan_entry_t *e = &p->scan->entries[i];
+        if (!e->root_len || strlen(e->path) != e->root_len) continue;
+        source_root_t *r = &p->roots[p->n_roots++];
+        r->path = e->path;
+        r->len  = e->root_len;
+        r->dev  = e->st.st_dev;
+        r->ino  = e->st.st_ino;
+        r->fd   = -1;
+    }
+    return OK;
+}
+
+static void roots_close(pipeline_t *p)
+{
+    for (unsigned k = 0; k < p->n_roots; k++)
+        if (p->roots[k].fd != -1) close(p->roots[k].fd);
+    free(p->roots);
+    p->roots = NULL;
+    p->n_roots = 0;
+}
+
+/* The open root an entry was scanned under, or NULL with *why set. */
+static source_root_t *source_root(pipeline_t *p, const scan_entry_t *e,
+                                  const char **why)
+{
+    source_root_t *r = NULL;
+    for (unsigned k = 0; k < p->n_roots && !r; k++)
+        if (p->roots[k].len == e->root_len &&
+            memcmp(p->roots[k].path, e->path, e->root_len) == 0)
+            r = &p->roots[k];
+    if (!r) { *why = "cannot open: its source root is not in the scan"; return NULL; }
+    if (r->fd == -1 && !r->failed) {
+        int fd = open(r->path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        struct stat st;
+        if (fd == -1) {
+            snprintf(r->why, sizeof(r->why), "cannot open its source root: %s",
+                     strerror(errno));
+            r->failed = 1;
+        } else if (fstat(fd, &st) != 0 || st.st_dev != r->dev || st.st_ino != r->ino) {
+            snprintf(r->why, sizeof(r->why), "its source root %s was replaced "
+                     "since the scan", r->path);
+            close(fd);
+            r->failed = 1;
+        } else {
+            r->fd = fd;
+        }
+    }
+    if (r->failed) { *why = r->why; return NULL; }
+    return r;
+}
+
+/* Whether openat2 is there; known after the first call that needed it. */
+static _Atomic int openat2_missing = 0;
+
+/*
+ * Open `rel` beneath dirfd as the store must: no symlink, no escape, no
+ * mount crossing when one_fs (root_dev is the root's device). -1 with
+ * errno: ELOOP for a symlink on the way or at the end, EXDEV for a mount
+ * crossed or an escape.
+ */
+static int open_beneath(int dirfd, const char *rel, int one_fs, dev_t root_dev)
+{
+    const int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW;
+    if (!openat2_missing) {
+        struct open_how how;
+        memset(&how, 0, sizeof(how));
+        how.flags   = (uint64_t)flags;
+        how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |
+                      (one_fs ? RESOLVE_NO_XDEV : 0);
+        long fd = syscall(SYS_openat2, dirfd, rel, &how, sizeof(how));
+        if (fd >= 0) return (int)fd;
+        if (errno != ENOSYS && errno != EPERM) return -1;
+        openat2_missing = 1;
+    }
+    char buf[PATH_MAX];
+    if (snprintf(buf, sizeof(buf), "%s", rel) >= (int)sizeof(buf)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int cur = dirfd;
+    char *save = NULL;
+    char *c = strtok_r(buf, "/", &save);
+    while (c) {
+        char *next = strtok_r(NULL, "/", &save);
+        if (strcmp(c, ".") == 0 || strcmp(c, "..") == 0) {
+            if (cur != dirfd) close(cur);
+            errno = EXDEV;
+            return -1;
+        }
+        int fd = openat(cur, c, next ? (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                                     : flags);
+        int err = errno;
+        /* O_DIRECTORY | O_NOFOLLOW on a symlink says ENOTDIR; call it what
+         * it is. */
+        struct stat ls;
+        if (fd == -1 && next && err == ENOTDIR &&
+            fstatat(cur, c, &ls, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(ls.st_mode))
+            err = ELOOP;
+        if (cur != dirfd) close(cur);
+        if (fd == -1) { errno = err; return -1; }
+        struct stat st;
+        if (one_fs && (fstat(fd, &st) != 0 || st.st_dev != root_dev)) {
+            close(fd);
+            errno = EXDEV;
+            return -1;
+        }
+        cur = fd;
+        c = next;
+    }
+    if (cur == dirfd) { errno = EINVAL; return -1; }
+    return cur;
+}
+
+static int open_scanned(pipeline_t *p, uint32_t i, struct stat *fst)
+{
+    const scan_entry_t *e = &p->scan->entries[i];
+    const int one_fs = p->opts->one_filesystem;
+    char why[256];
+    int fd;
+
+    if (e->root_len && e->path[e->root_len] == '/') {
+        const char *rwhy = NULL;
+        source_root_t *r = source_root(p, e, &rwhy);
+        if (!r) { skip_file(p, i, rwhy); return -1; }
+        const char *rel = e->path + e->root_len + 1;
+        fd = open_beneath(r->fd, rel, one_fs, r->dev);
+        if (fd == -1) {
+            int err = errno;
+            struct stat lst;
+            if (err == ELOOP && fstatat(r->fd, rel, &lst, AT_SYMLINK_NOFOLLOW) == 0 &&
+                S_ISLNK(lst.st_mode))
+                snprintf(why, sizeof(why), "no longer a regular file (now a symlink)");
+            else if (err == ELOOP)
+                snprintf(why, sizeof(why), "a directory on its path is now a "
+                         "symlink; not followed");
+            else if (err == EXDEV)
+                snprintf(why, sizeof(why), "its path now crosses a mount point "
+                         "or leaves the source; not followed");
+            else
+                /* A file that vanished between scan and store is normal on a
+                 * live filesystem; it is a warning, not a failed backup. */
+                snprintf(why, sizeof(why), "cannot open: %s",
+                         err == ENOENT ? "it no longer exists" : strerror(err));
+            skip_file(p, i, why);
+            return -1;
+        }
+    } else {
+        /* The source root itself is this file: its path is the operator's,
+         * and only its last component must not be a symlink now. */
+        fd = open(e->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+        if (fd == -1) {
+            int err = errno;
+            snprintf(why, sizeof(why), "%s%s",
+                     err == ELOOP ? "no longer a regular file (now a symlink)"
+                                  : "cannot open: ",
+                     err == ELOOP ? "" : err == ENOENT ? "it no longer exists"
+                                                       : strerror(err));
+            skip_file(p, i, why);
+            return -1;
+        }
+    }
+    /* A directory opens read-only without complaint, and on btrfs SEEK_DATA
+     * on it answers ENXIO, "no data from here on": the sparse probe took
+     * that for a file that is one hole and stored the scan's size in
+     * zeros. */
+    if (fstat(fd, fst) != 0) {
+        snprintf(why, sizeof(why), "cannot open: fstat: %s", strerror(errno));
+        close(fd);
+        skip_file(p, i, why);
+        return -1;
+    }
+    if (!S_ISREG(fst->st_mode)) {
+        snprintf(why, sizeof(why), "no longer a regular file (now %s)",
+                 file_kind(fst->st_mode));
+        close(fd);
+        skip_file(p, i, why);
+        return -1;
+    }
+    return fd;
 }
 
 void backup_result_free(backup_result_t *r)
@@ -612,14 +872,10 @@ static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
         }
         log_warn("backup: %s changed while it was being read; reading it again",
                  e->path);
-        int fd = open(e->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        /* Opened as the first read was: the same file, never a symlink. */
         struct stat fst;
-        if (fd == -1 || fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
-            if (fd != -1) close(fd);
-            skip_file(p, j->index, "changed while it was being read, and "
-                                   "could not be opened again as a regular file");
-            return OK;
-        }
+        int fd = open_scanned(p, j->index, &fst);
+        if (fd == -1) return OK;
         adopt_stat(e, &fst);
         status_t sst = store_file_serial(p, j->index, fd, &fst, 1, 1);
         close(fd);
@@ -1092,32 +1348,11 @@ static status_t store_content_loop(pipeline_t *p)
         if (!to_pool && e->node.size >= BATCH_YIELD_BYTES && batch_contended(b))
             batch_close(p, b);
 
-        /* O_NONBLOCK so a FIFO put where the file was cannot hang the
-         * backup in open; it is refused just below like anything else that
-         * is not a regular file. It changes nothing for a regular file. */
-        int fd = open(e->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd == -1) {
-            /* A file that vanished between scan and store is normal on a live
-             * filesystem; it is a warning, not a failed backup. */
-            char why[160];
-            snprintf(why, sizeof(why), "cannot open: %s",
-                     errno == ENOENT ? "it no longer exists" : strerror(errno));
-            skip_file(p, i, why);
-            continue;
-        }
-        /* Replaced by something else since the scan. A directory opens
-         * read-only without complaint, and on btrfs SEEK_DATA on it answers
-         * ENXIO, "no data from here on": the sparse probe took that for a
-         * file that is one hole and stored the scan's size in zeros. */
+        /* Never followed if it is a symlink now, and refused if it is
+         * anything but the regular file the scan listed (open_scanned). */
         struct stat fst;
-        int fst_ok = fstat(fd, &fst) == 0;
-        if (!fst_ok || !S_ISREG(fst.st_mode)) {
-            int was_dir = fst_ok && S_ISDIR(fst.st_mode);
-            close(fd);
-            skip_file(p, i, was_dir ? "no longer a regular file (now a directory)"
-                                    : "no longer a regular file");
-            continue;
-        }
+        int fd = open_scanned(p, i, &fst);
+        if (fd == -1) continue;
 
         /* The file as it is now, not as the scan saw it (OWN-45). */
         int changed = 0;
@@ -1994,7 +2229,9 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     uint8_t root_hash[OBJECT_HASH_SIZE];
     struct timespec t0, t1, t2, t3;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    st = store_content(&p);
+    st = roots_build(&p);
+    if (st == OK) st = store_content(&p);
+    roots_close(&p);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     uint64_t _ttr = phase_now(), _ttrn = phase_nested(&timers);
     if (st == OK) st = build_trees(&p, root_hash);

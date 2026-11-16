@@ -1273,12 +1273,22 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         char rid[32];
         if (vr.run_id > 0) snprintf(rid, sizeof(rid), "%lld", (long long)vr.run_id);
         else               snprintf(rid, sizeof(rid), "null");
-        char vj[160];
+        /* The counts too, so the job says what the run found without a
+         * second request, and in the same terms as the run record: ok
+         * excludes every failure, and `failed` states the verdict. */
+        char vj[512];
         snprintf(vj, sizeof(vj),
-                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s}",
+                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s,"
+                 "\"checked\":%llu,\"ok\":%llu,\"repaired\":%llu,"
+                 "\"recoverable\":%llu,\"unrecoverable\":%llu,\"missing\":%llu,"
+                 "\"failed\":%s}",
                  rid, lvl,
                  j->verify_repair ? "true" : "false",
-                 j->dry_run ? "true" : "false");
+                 j->dry_run ? "true" : "false",
+                 (unsigned long long)vr.checked, (unsigned long long)vr.ok,
+                 (unsigned long long)vr.repaired, (unsigned long long)vr.recoverable,
+                 (unsigned long long)vr.unrecoverable, (unsigned long long)vr.missing,
+                 vr.unrecoverable || vr.missing ? "true" : "false");
         job_set_result(progress_ctx, vj);
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*
@@ -2194,6 +2204,21 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
     return job_submit_locked(jm ? jm : g_ctx.jm, repo_id, snap_job_lock(j),
                              action, NULL, schedule_id, snap_job_run, j,
                              snap_job_free, out_job_id);
+}
+
+status_t routes_submit_reindex(int64_t repo_id, const char *origin, int64_t *out_job_id)
+{
+    if (!g_ctx.jm) return set_error(ERR_INVALID, "no job manager to queue a reindex on");
+    char *repo_path = repo_path_for(g_ctx.db, repo_id);
+    if (!repo_path) return set_error(ERR_NOT_FOUND, "no such repo");
+    snap_job_t *j = calloc(1, sizeof(*j));
+    if (!j) { free(repo_path); return set_error(ERR_NOMEM, "reindex job: alloc"); }
+    j->db = g_ctx.db;
+    j->repo_id = repo_id;
+    j->repo_path = repo_path;
+    j->kind = SNAP_JOB_REINDEX;
+    return job_submit_origin(g_ctx.jm, repo_id, snap_job_lock(j), "reindex", origin,
+                             snap_job_run, j, snap_job_free, out_job_id);
 }
 
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)

@@ -7,6 +7,8 @@
 
 #include "fault_inject.h"
 #include <limits.h>
+#include <stdarg.h>
+#include <sys/syscall.h>
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
@@ -211,4 +213,27 @@ ssize_t __wrap_read(int fd, void *buf, size_t count) {
         }
     }
     return __real_read(fd, buf, count);
+}
+
+volatile int fault_openat2_errno = 0;
+volatile int fault_openat2_refused = 0;
+
+/*
+ * syscall() is variadic and the wrapper cannot know how many arguments the
+ * caller passed, so it forwards six, as glibc's own syscall() reads six
+ * registers whatever the number. Extra ones are ignored by the kernel.
+ */
+long __wrap_syscall(long number, ...) {
+    va_list ap;
+    va_start(ap, number);
+    long a1 = va_arg(ap, long), a2 = va_arg(ap, long), a3 = va_arg(ap, long);
+    long a4 = va_arg(ap, long), a5 = va_arg(ap, long), a6 = va_arg(ap, long);
+    va_end(ap);
+    int e = fault_openat2_errno;
+    if (number == SYS_openat2 && e != 0) {
+        __atomic_add_fetch(&fault_openat2_refused, 1, __ATOMIC_SEQ_CST);
+        errno = e;
+        return -1;
+    }
+    return __real_syscall(number, a1, a2, a3, a4, a5, a6);
 }

@@ -671,8 +671,18 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (devnull != -1) close(devnull);
     db_result_free(objs);
 
-    /* Every level: it reads the index and nothing else. */
-    if (st == OK) res.missing += check_contentless_files(db, repo_id, res.run_id);
+    /*
+     * Every level: it reads the index and nothing else. Each contentless
+     * entry is an item checked as well as one missing, so the counts add
+     * up: checked = ok + repaired + recoverable + unrecoverable + missing.
+     * Adding them to missing alone gave "checked 52, ok 52" on a run that
+     * failed with 2 missing, a summary that read clean (NIT-17).
+     */
+    if (st == OK) {
+        uint64_t nc = check_contentless_files(db, repo_id, res.run_id);
+        res.checked += nc;
+        res.missing += nc;
+    }
 
     if (res.unrecoverable || res.missing)
         run_blast_radius(db, repo_id, res.run_id,
@@ -709,10 +719,12 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st != OK) return st;
 
     if (res.unrecoverable || res.missing)
-        log_error("verify (%s%s): %llu checked, %llu repaired, %llu recoverable, "
-                  "%llu UNRECOVERABLE, %llu MISSING, affecting %llu file(s)",
+        log_error("verify (%s%s) FAILED: %llu checked, %llu ok, %llu repaired, "
+                  "%llu recoverable, %llu UNRECOVERABLE, %llu MISSING, affecting "
+                  "%llu file(s)",
                   level_name(level), repair ? "" : ", check only",
                   (unsigned long long)res.checked,
+                  (unsigned long long)res.ok,
                   (unsigned long long)res.repaired,
                   (unsigned long long)res.recoverable,
                   (unsigned long long)res.unrecoverable,
@@ -742,10 +754,12 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      */
     if (res.unrecoverable || res.missing)
         return set_error(ERR_CORRUPT,
-                         "verify run %lld found data loss: %llu unrecoverable and "
-                         "%llu missing object(s), affecting %llu file(s) in %llu "
-                         "snapshot(s)",
+                         "verify run %lld found data loss: %llu of %llu checked "
+                         "ok, %llu unrecoverable and %llu missing, affecting "
+                         "%llu file(s) in %llu snapshot(s)",
                          (long long)res.run_id,
+                         (unsigned long long)res.ok,
+                         (unsigned long long)res.checked,
                          (unsigned long long)res.unrecoverable,
                          (unsigned long long)res.missing,
                          (unsigned long long)res.affected_files,

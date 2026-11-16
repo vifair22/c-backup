@@ -412,6 +412,12 @@ static void test_contentless_file_is_named_by_restore_and_verify(void **state)
     st = verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr);
     assert_int_equal(st, ERR_CORRUPT);
     assert_int_equal(vr.missing, 1);
+    /* NIT-17: the summary adds up and ok excludes the failure. It read
+     * "checked 52, ok 52" with 2 missing. */
+    assert_true(vr.ok < vr.checked);
+    assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                 vr.unrecoverable + vr.missing);
+    assert_non_null(strstr(err_msg(), "ok, 0 unrecoverable and 1 missing"));
     assert_int_equal(vr.affected_files, 1);
     assert_int_equal(vr.affected_snapshots, 1);
     char run[32];
@@ -1307,6 +1313,124 @@ static void test_gc_compacts_packs(void **state)
     assert_int_equal(rr.skipped, 0);
 }
 
+/* ---------- symlinks planted in the destination (B128) ---------- */
+
+/*
+ * The restore wrote by path, so anything already in the destination was
+ * followed. The daemon runs as root: a symlink planted where a directory
+ * belongs had its target chown'd and chmod'd and every file beneath it
+ * created inside the target, renamed over what was there with --overwrite.
+ * Now nothing below the destination is reached through a symlink.
+ */
+static void plant_dest(void)
+{
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", restored_root());
+    assert_int_equal(system(cmd), 0);
+}
+
+static void assert_file_is(const char *path, const char *want, mode_t mode)
+{
+    char buf[256] = "";
+    FILE *f = fopen(path, "r");
+    assert_non_null(f);
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    assert_string_equal(buf, want);
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+    assert_int_equal(sb.st_mode & 07777, mode);
+}
+
+static void test_planted_symlink_at_a_file_path_is_not_followed(void **state)
+{
+    (void)state;
+    backup_result_t br;
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    write_file(TEST_DIR "/victim.txt", "victim\n");
+    assert_int_equal(chmod(TEST_DIR "/victim.txt", 0600), 0);
+    plant_dest();
+    char at[PATH_MAX];
+    snprintf(at, sizeof(at), "%s/top.txt", restored_root());
+    assert_int_equal(symlink(TEST_DIR "/victim.txt", at), 0);
+
+    /* Without overwrite the link is the operator's: kept, not followed. */
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.kept, 1);
+    assert_file_is(TEST_DIR "/victim.txt", "victim\n", 0600);
+    struct stat sb;
+    assert_int_equal(lstat(at, &sb), 0);
+    assert_true(S_ISLNK(sb.st_mode));
+
+    /* With overwrite the link itself is replaced; its target is untouched. */
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.overwrite = 1;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, &ro, &rr), OK);
+    assert_int_equal(lstat(at, &sb), 0);
+    assert_true(S_ISREG(sb.st_mode));
+    struct stat src;
+    assert_int_equal(stat(TEST_SRC "/top.txt", &src), 0);
+    assert_file_is(at, "top level content\n", src.st_mode & 07777);
+    assert_file_is(TEST_DIR "/victim.txt", "victim\n", 0600);
+}
+
+static int dir_count(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL)
+        if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..")) n++;
+    closedir(d);
+    return n;
+}
+
+static void test_planted_symlink_at_a_directory_path_is_not_followed(void **state)
+{
+    (void)state;
+    backup_result_t br;
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    assert_int_equal(mkdir(TEST_DIR "/outside", 0700), 0);
+    plant_dest();
+    char at[PATH_MAX];
+    snprintf(at, sizeof(at), "%s/nested", restored_root());
+    assert_int_equal(symlink(TEST_DIR "/outside", at), 0);
+
+    for (int overwrite = 0; overwrite <= 1; overwrite++) {
+        restore_opts_t ro;
+        memset(&ro, 0, sizeof(ro));
+        ro.overwrite = overwrite;
+        restore_result_t rr;
+        memset(&rr, 0, sizeof(rr));
+        /* nested, nested/deeper, mid.txt and leaf.txt cannot be restored:
+         * a failure the job reports, not a write into the link's target. */
+        assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                     TEST_DST, &ro, &rr), ERR_CORRUPT);
+        assert_int_equal(rr.failed, 4);
+        assert_int_equal(dir_count(TEST_DIR "/outside"), 0);
+        struct stat sb;
+        assert_int_equal(stat(TEST_DIR "/outside", &sb), 0);
+        assert_int_equal(sb.st_mode & 07777, 0700);
+        assert_int_equal(lstat(at, &sb), 0);
+        assert_true(S_ISLNK(sb.st_mode));
+        /* The rest of the tree still restores. */
+        char top[PATH_MAX];
+        snprintf(top, sizeof(top), "%s/top.txt", restored_root());
+        assert_int_equal(lstat(top, &sb), 0);
+        assert_true(S_ISREG(sb.st_mode));
+    }
+}
+
 /* ---------- xattrs and ACLs ---------- */
 
 /*
@@ -1357,6 +1481,79 @@ static void assert_acl_equals(const char *path, acl_type_t type,
     assert_non_null(txt);
     assert_string_equal(txt, want_text);
     acl_free(txt);
+}
+
+/*
+ * B129: an entry backed up with no ACL, restored inside a directory whose
+ * default ACL the restore has already set, inherited that default - a
+ * file as its access ACL, a directory as its access and default ACL - and
+ * kept it. The children here are made before the parent gets its default,
+ * so at the source they have none.
+ */
+static int has_xattr(const char *path, const char *name)
+{
+    return getxattr(path, name, NULL, 0) >= 0;
+}
+
+static void test_inherited_acls_are_not_restored(void **state)
+{
+    (void)state;
+    const char *dir = TEST_SRC "/acldir";
+    assert_int_equal(mkdir(dir, 0750), 0);
+    assert_int_equal(mkdir(TEST_SRC "/acldir/inner", 0751), 0);
+    write_file(TEST_SRC "/acldir/plain.txt", "no acl of its own\n");
+    assert_int_equal(chmod(TEST_SRC "/acldir/plain.txt", 0640), 0);
+    write_file(TEST_SRC "/acldir/own.txt", "its own acl\n");
+
+    acl_t dflt = acl_from_text("u::rwx,g::r-x,o::---,u:1234:rwx,g:4321:r-x,m::rwx");
+    acl_t own  = acl_from_text("u::rw-,g::r--,o::---,u:1234:r--,m::r--");
+    assert_non_null(dflt);
+    assert_non_null(own);
+    int rc = acl_set_file(dir, ACL_TYPE_DEFAULT, dflt);
+    if (rc == 0) rc = acl_set_file(TEST_SRC "/acldir/own.txt", ACL_TYPE_ACCESS, own);
+    acl_free(dflt);
+    acl_free(own);
+    if (rc != 0) skip();   /* no ACL support here */
+
+    acl_t a = acl_get_file(TEST_SRC "/acldir/own.txt", ACL_TYPE_ACCESS);
+    assert_non_null(a);
+    char *want_own = acl_to_text(a, NULL);
+    acl_free(a);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    static const char *const kids[] = { "inner", "plain.txt" };
+    for (size_t k = 0; k < 2; k++) {
+        char src[PATH_MAX], dst[PATH_MAX];
+        snprintf(src, sizeof(src), "%s/acldir/%s", TEST_SRC, kids[k]);
+        snprintf(dst, sizeof(dst), "%s/acldir/%s", restored_root(), kids[k]);
+        if (has_xattr(dst, "system.posix_acl_access"))
+            fail_msg("%s inherited an access ACL", kids[k]);
+        if (has_xattr(dst, "system.posix_acl_default"))
+            fail_msg("%s inherited a default ACL", kids[k]);
+        struct stat ss, ds;
+        assert_int_equal(stat(src, &ss), 0);
+        assert_int_equal(stat(dst, &ds), 0);
+        assert_int_equal(ds.st_mode & 07777, ss.st_mode & 07777);
+    }
+
+    /* The parent keeps its default, and a child with its own ACL keeps
+     * exactly that. */
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/acldir", restored_root());
+    assert_true(has_xattr(path, "system.posix_acl_default"));
+    snprintf(path, sizeof(path), "%s/acldir/own.txt", restored_root());
+    assert_acl_equals(path, ACL_TYPE_ACCESS, want_own);
+    struct stat ss, ds;
+    assert_int_equal(stat(TEST_SRC "/acldir/own.txt", &ss), 0);
+    assert_int_equal(stat(path, &ds), 0);
+    assert_int_equal(ds.st_mode & 07777, ss.st_mode & 07777);
+    acl_free(want_own);
 }
 
 static void test_xattrs_and_acls_round_trip(void **state)
@@ -2124,7 +2321,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_device_the_kernel_refuses_is_skipped_not_created, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unprivileged_device_failure_does_not_fail_the_restore, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_compacts_packs, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_planted_symlink_at_a_file_path_is_not_followed, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_planted_symlink_at_a_directory_path_is_not_followed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_round_trip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_inherited_acls_are_not_restored, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattr_backup_is_deterministic, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_survive_a_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_rebuilds_the_index, setup, teardown),
