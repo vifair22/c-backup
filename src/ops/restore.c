@@ -240,11 +240,18 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
 
     uint8_t hash[OBJECT_HASH_SIZE];
     hex_to_hash(xhex, hash);
-    void  *data = NULL;
-    size_t len  = 0;
-    if (object_load(store, hash, &data, &len, NULL) != OK) {
+    void   *data = NULL;
+    size_t  len  = 0;
+    uint8_t type = 0;
+    if (object_load(store, hash, &data, &len, &type) != OK) {
         log_warn("restore: cannot load xattrs for %s: %s", path, err_msg());
         err_clear();
+        return;
+    }
+    if (type != OBJECT_TYPE_XATTR) {
+        log_warn("restore: xattrs for %s name a type %u object, not an xattr "
+                 "blob; not applied", path, type);
+        free(data);
         return;
     }
 
@@ -292,11 +299,18 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
 
     uint8_t hash[OBJECT_HASH_SIZE];
     hex_to_hash(ahex, hash);
-    void  *data = NULL;
-    size_t len  = 0;
-    if (object_load(store, hash, &data, &len, NULL) != OK) {
+    void   *data = NULL;
+    size_t  len  = 0;
+    uint8_t type = 0;
+    if (object_load(store, hash, &data, &len, &type) != OK) {
         log_warn("restore: cannot load ACL for %s: %s", path, err_msg());
         err_clear();
+        return;
+    }
+    if (type != OBJECT_TYPE_ACL) {
+        log_warn("restore: ACLs for %s name a type %u object, not an ACL "
+                 "blob; not applied", path, type);
+        free(data);
         return;
     }
 

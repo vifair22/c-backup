@@ -85,7 +85,9 @@ static void sha256(const void *data, size_t len, uint8_t out[OBJECT_HASH_SIZE]) 
  * refuse: the payload cannot be bigger than the file holding it.
  *
  * The codecs are checked here too, so exactly one place decides what a
- * plausible header looks like.
+ * plausible header looks like. So is the type: a type this build does not
+ * know is refused by name rather than handed to a caller that would treat
+ * it as file bytes (OWN-39).
  */
 static status_t read_object_header(int fd, object_header_t *hdr)
 {
@@ -95,6 +97,8 @@ static status_t read_object_header(int fd, object_header_t *hdr)
         return set_error(ERR_CORRUPT, "object: bad magic");
     if (hdr->version != OBJECT_HDR_VERSION)
         return set_error(ERR_CORRUPT, "object: unsupported version %u", hdr->version);
+    if (!object_type_known(hdr->type))
+        return set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, hdr->type);
     if (hdr->compression != COMPRESS_NONE &&
         hdr->compression != COMPRESS_LZ4 &&
         hdr->compression != COMPRESS_LZ4_FRAME)

@@ -322,8 +322,19 @@ static uint32_t next_pack_num(store_t *store) {
  * and whose inode is hot. The alternative is threading a file size through
  * every caller, and a caller that forgets is silently unchecked again.
  */
+#define ENTRY_HDR_UNKNOWN_TYPE (-2)
+
 static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out) {
     if (fread(out, sizeof(*out), 1, f) != 1) return -1;
+
+    /* The one refusal with its own message: "bad entry header" would send
+     * an operator looking for damage when the pack is simply newer than
+     * this build (OWN-39). Callers keep this message rather than writing
+     * their own over it; see entry_hdr_error. */
+    if (!object_type_known(out->type)) {
+        set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, out->type);
+        return ENTRY_HDR_UNKNOWN_TYPE;
+    }
 
     if (out->compression != COMPRESS_NONE && out->compression != COMPRESS_LZ4 &&
         out->compression != COMPRESS_LZ4_FRAME)
@@ -341,6 +352,14 @@ static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out) {
 
     return 0;
 }
+
+/*
+ * The status for a failed read_entry_hdr: its own message when it refused
+ * an unknown type, otherwise the caller's. A macro so the caller's format
+ * and arguments reach set_error unchanged.
+ */
+#define entry_hdr_error(rc, ...) \
+    ((rc) == ENTRY_HDR_UNKNOWN_TYPE ? ERR_CORRUPT : set_error(ERR_CORRUPT, __VA_ARGS__))
 
 /* write_full_fd: uses io_write_full from util.h */
 #define write_full_fd io_write_full
@@ -498,9 +517,10 @@ status_t pack_object_physical_size(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) {
+    int ehrc = read_entry_hdr(f, &ehdr);
+    if (ehrc != 0) {
         fclose(f);
-        return set_error(ERR_CORRUPT, "pack_object_physical_size: bad entry header in pack-%08u.dat", found.pack_num);
+        return entry_hdr_error(ehrc, "pack_object_physical_size: bad entry header in pack-%08u.dat", found.pack_num);
     }
     dat_return_or_close(store, found.pack_num, f);
     *out_bytes = (uint64_t)sizeof(pack_dat_entry_hdr_t) + ehdr.compressed_size;
@@ -522,8 +542,9 @@ status_t pack_object_get_info(store_t *store,
         fclose(f); return set_error_errno(ERR_IO, "pack_object_get_info: fseeko pack-%08u.dat", found.pack_num);
     }
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) {
-        fclose(f); return set_error(ERR_CORRUPT, "pack_object_get_info: bad entry header in pack-%08u.dat", found.pack_num);
+    int ehrc = read_entry_hdr(f, &ehdr);
+    if (ehrc != 0) {
+        fclose(f); return entry_hdr_error(ehrc, "pack_object_get_info: bad entry header in pack-%08u.dat", found.pack_num);
     }
     dat_return_or_close(store, found.pack_num, f);
 
@@ -853,9 +874,10 @@ status_t pack_object_read_stored(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) {
+    int ehrc = read_entry_hdr(f, &ehdr);
+    if (ehrc != 0) {
         fclose(f);
-        return set_error(ERR_CORRUPT, "pack_object_read_stored: bad entry header in %s", dat_path);
+        return entry_hdr_error(ehrc, "pack_object_read_stored: bad entry header in %s", dat_path);
     }
 
     entry_parity_t ep;
@@ -987,8 +1009,9 @@ status_t pack_object_open_stored(store_t *store,
     }
     /* read_entry_hdr refuses a length the file cannot hold, so a reader of
      * *out_len bytes cannot be sent past the end of the pack. */
-    if (read_entry_hdr(r->f, &ehdr) != 0) {
-        st = set_error(ERR_CORRUPT, "pack_object_open_stored: bad entry header in %s", dat_path);
+    int ehrc = read_entry_hdr(r->f, &ehdr);
+    if (ehrc != 0) {
+        st = entry_hdr_error(ehrc, "pack_object_open_stored: bad entry header in %s", dat_path);
         goto fail;
     }
 
@@ -1218,7 +1241,8 @@ status_t pack_object_load(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header in %s", dat_path); }
+    int ehrc = read_entry_hdr(f, &ehdr);
+    if (ehrc != 0) { fclose(f); return entry_hdr_error(ehrc, "pack_object_load: bad entry header in %s", dat_path); }
 
     /* --- Parity: attempt entry header repair --- */
     if (found.pack_version == PACK_VERSION && found.entry_index != UINT32_MAX) {
@@ -1308,8 +1332,9 @@ status_t pack_object_load(store_t *store,
         if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
             fclose(f); return set_error_errno(ERR_IO, "pack_object_load: re-seek failed in %s", dat_path);
         }
-        if (read_entry_hdr(f, &ehdr) != 0) {
-            fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header on re-read in %s", dat_path);
+        ehrc = read_entry_hdr(f, &ehdr);
+        if (ehrc != 0) {
+            fclose(f); return entry_hdr_error(ehrc, "pack_object_load: bad entry header on re-read in %s", dat_path);
         }
     }
 
@@ -1401,8 +1426,9 @@ status_t pack_object_load_prefix(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) {
-        fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_prefix: bad entry header");
+    int ehrc = read_entry_hdr(f, &ehdr);
+    if (ehrc != 0) {
+        fclose(f); return entry_hdr_error(ehrc, "pack_object_load_prefix: bad entry header");
     }
 
     if (out_full_size) *out_full_size = ehdr.uncompressed_size;
@@ -1923,7 +1949,8 @@ status_t pack_object_load_stream(store_t *store,
     if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) { fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko(%s)", dat_path); }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: bad entry header in %s", dat_path); }
+    int ehrc = read_entry_hdr(f, &ehdr);
+    if (ehrc != 0) { fclose(f); return entry_hdr_error(ehrc, "pack_object_load_stream: bad entry header in %s", dat_path); }
 
     /* Parity: locate the entry's parity for v3 packs (persists across codec paths) */
     entry_parity_t ep;
@@ -5069,9 +5096,10 @@ static status_t maybe_coalesce_packs(store_t *store,
                 break;
             }
             pack_dat_entry_hdr_t ehdr;
-            if (read_entry_hdr(datf, &ehdr) != 0 || ehdr.compressed_size > OBJECT_SIZE_MAX) {
-                rc = set_error(ERR_CORRUPT, "pack-coalesce: bad entry header in pack %u",
-                               cand[ci].num);
+            int ehrc = read_entry_hdr(datf, &ehdr);
+            if (ehrc != 0 || ehdr.compressed_size > OBJECT_SIZE_MAX) {
+                rc = entry_hdr_error(ehrc, "pack-coalesce: bad entry header in pack %u",
+                                     cand[ci].num);
                 break;
             }
             rc = pack_rw_copy(&rw, datf, &ehdr, i, chunk, CHUNK);
@@ -5322,9 +5350,10 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
             break;
         }
         pack_dat_entry_hdr_t ehdr;
-        if (read_entry_hdr(old, &ehdr) != 0 || ehdr.compressed_size > OBJECT_SIZE_MAX) {
-            st = set_error(ERR_CORRUPT, "pack_gc: bad entry header at %llu in pack %u",
-                           (unsigned long long)disk_idx[i].dat_offset, pnum);
+        int ehrc = read_entry_hdr(old, &ehdr);
+        if (ehrc != 0 || ehdr.compressed_size > OBJECT_SIZE_MAX) {
+            st = entry_hdr_error(ehrc, "pack_gc: bad entry header at %llu in pack %u",
+                                 (unsigned long long)disk_idx[i].dat_offset, pnum);
             break;
         }
         size_t sealed = rw.nouts;
