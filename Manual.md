@@ -816,7 +816,11 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
 - **Content search** (`grep`) runs as a job, because it reads the
   repository. Matching is POSIX extended regular expressions, line by line,
   over every distinct object in the snapshot; a file present under several
-  names is read once. A binary file that matches is one hit, `(binary file
+  names is read once, and a match in it is reported under every one of
+  those names in the snapshot (or under `--path-prefix`), each counted in
+  `files_matched`. The counts are files, not objects, and each name counts
+  against `--limit` and `--max-hits` like any other matching file; one left
+  out for a cap makes the search `truncated`. A binary file that matches is one hit, `(binary file
   matches)`, however often it matches. `--snapshot N` picks the snapshot
   (newest by default; one that does not exist is an error), `--path-prefix`
   limits it to a subtree, `-i` ignores case, `--limit N` stops after N

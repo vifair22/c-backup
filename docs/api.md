@@ -543,9 +543,11 @@ are encrypted, the only side that can read one.
 
 Matching is POSIX extended regular expressions, line by line, over every
 distinct object in the snapshot. Distinct, not every path: a file present
-under several names is one object, so it is read once and reported once
-rather than re-read per copy. Objects are visited in pack order for the same
-reason verify is. A file with a NUL byte in its first 8 KiB is a binary: it
+under several names is one object, so it is read once rather than re-read
+per copy. A match in it is still reported under every name, in the searched
+snapshot and inside `path_prefix` when one is given, with the same hits:
+the other names come from the index, not from reading the content again.
+Objects are visited in pack order for the same reason verify is. A file with a NUL byte in its first 8 KiB is a binary: it
 gets one hit, excerpt `(binary file matches)`, and is not read further, the
 way `grep(1)` reports one. Three limits bound the rest:
 
@@ -559,6 +561,17 @@ A value out of range is a 400, not clamped. These exist because hits were
 counted without limit: one 10 MiB binary produced 40,776 hits and one
 20 MiB log 806,597, every one of them read and matched for nothing.
 `hits` counts what was recorded, so it never exceeds `max_hits`.
+
+`files_scanned`, `files_matched`, `files_skipped` and `files_capped` count
+files, meaning paths, not objects: content held under three names is read
+once, counts as three files, and its match is recorded three times. The
+caps treat each name as a matching file of its own. `max_files` 2 against
+those three names records two and stops, `truncated`; a name that would
+take the hit count past `max_hits` gets the hits that are left, and the
+search stops there, `truncated`. A name over its `max_hits_per_file` is in
+`files_capped`, as the first one is. `files_matched` used to count objects
+and the hits named only the first path, so three identical logs holding a
+match showed one file.
 
 The run's `truncated` is `true` when `max_files` or `max_hits` stopped the
 search, so a caller can tell "no more matches" from "stopped looking". A file
