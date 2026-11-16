@@ -43,12 +43,6 @@
 #define REPO_CHUNKER_MIN_FLOOR   ((uint32_t)4 * 1024)
 #define REPO_CHUNKER_MAX_CEILING ((uint32_t)16 * 1024 * 1024)
 
-typedef struct {
-    char     algo[32];
-    uint32_t min, avg, max;
-    int      keyed;
-} repo_chunker_t;
-
 /* The longest incompatible-feature name the marker reader keeps. */
 #define REPO_FEATURE_NAME_MAX 64
 
@@ -56,9 +50,15 @@ typedef struct {
     char uuid[CBACKUP_UUID_LEN];
     int  version;
 
-    /* Format 3 only; zeroed on any other version, which repo_format_check
-     * refuses anyway. */
-    repo_chunker_t chunker;
+    /*
+     * The marker's "chunker" object. Format 3 only; zeroed on any other
+     * version, which repo_format_check refuses anyway. cdc_keyed is -1 when
+     * the field is absent or not a boolean. A writer that leaves cdc_algo
+     * empty gets the defaults.
+     */
+    char     cdc_algo[32];
+    uint32_t cdc_min, cdc_avg, cdc_max;
+    int      cdc_keyed;
     /*
      * "incompat": features a reader must understand to open the repository.
      * This build knows none, so any entry refuses it; the first is kept for
@@ -140,8 +140,9 @@ status_t repo_marker_read(const char *path, repo_marker_t *out);
  */
 status_t repo_format_check(const char *path, const repo_marker_t *m);
 
-/* The chunker a new repository is created with; keyed when encrypted. */
-void repo_chunker_default(repo_chunker_t *out, int keyed);
+/* Fill the marker's chunker with the format defaults; keyed when the
+ * marker records encryption. */
+void repo_marker_cdc_default(repo_marker_t *m);
 
 /* Write a fresh marker with a newly generated UUID. Refuses to overwrite. */
 status_t repo_marker_write(const char *path, repo_marker_t *out);

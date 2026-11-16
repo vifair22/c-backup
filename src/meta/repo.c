@@ -113,14 +113,13 @@ status_t repo_store_open_keyed(const char *path, const store_config_t *cfg,
     return st;
 }
 
-void repo_chunker_default(repo_chunker_t *out, int keyed)
+void repo_marker_cdc_default(repo_marker_t *m)
 {
-    memset(out, 0, sizeof(*out));
-    snprintf(out->algo, sizeof(out->algo), "%s", REPO_CHUNKER_ALGO);
-    out->min   = REPO_CHUNKER_MIN_DEFAULT;
-    out->avg   = REPO_CHUNKER_AVG_DEFAULT;
-    out->max   = REPO_CHUNKER_MAX_DEFAULT;
-    out->keyed = keyed ? 1 : 0;
+    snprintf(m->cdc_algo, sizeof(m->cdc_algo), "%s", REPO_CHUNKER_ALGO);
+    m->cdc_min   = REPO_CHUNKER_MIN_DEFAULT;
+    m->cdc_avg   = REPO_CHUNKER_AVG_DEFAULT;
+    m->cdc_max   = REPO_CHUNKER_MAX_DEFAULT;
+    m->cdc_keyed = m->enc_mode != REPO_ENC_NONE;
 }
 
 /*
@@ -135,14 +134,14 @@ static void marker_read_v3_fields(const cutils_json_req_t *req, repo_marker_t *o
     uint32_t v = 0;
     bool keyed = false;
     if (json_req_get_str(req, "chunker.algo", &algo) == 0 && algo &&
-        strlen(algo) < sizeof(out->chunker.algo))
-        snprintf(out->chunker.algo, sizeof(out->chunker.algo), "%s", algo);
+        strlen(algo) < sizeof(out->cdc_algo))
+        snprintf(out->cdc_algo, sizeof(out->cdc_algo), "%s", algo);
     free(algo);
-    if (json_req_get_u32(req, "chunker.min", &v, 0, UINT32_MAX) == 0) out->chunker.min = v;
-    if (json_req_get_u32(req, "chunker.avg", &v, 0, UINT32_MAX) == 0) out->chunker.avg = v;
-    if (json_req_get_u32(req, "chunker.max", &v, 0, UINT32_MAX) == 0) out->chunker.max = v;
-    if (json_req_get_bool(req, "chunker.keyed", &keyed) == 0) out->chunker.keyed = keyed ? 1 : 0;
-    else out->chunker.keyed = -1;
+    if (json_req_get_u32(req, "chunker.min", &v, 0, UINT32_MAX) == 0) out->cdc_min = v;
+    if (json_req_get_u32(req, "chunker.avg", &v, 0, UINT32_MAX) == 0) out->cdc_avg = v;
+    if (json_req_get_u32(req, "chunker.max", &v, 0, UINT32_MAX) == 0) out->cdc_max = v;
+    if (json_req_get_bool(req, "chunker.keyed", &keyed) == 0) out->cdc_keyed = keyed ? 1 : 0;
+    else out->cdc_keyed = -1;
 
     size_t n = 0;
     if (json_req_array_len(req, "incompat", &n) != 0) {
@@ -189,21 +188,20 @@ status_t repo_format_check(const char *path, const repo_marker_t *m)
                          path, m->incompat_first, m->incompat_count,
                          m->incompat_count == 1 ? "" : "s");
 
-    const repo_chunker_t *c = &m->chunker;
-    if (strcmp(c->algo, REPO_CHUNKER_ALGO) != 0)
+    if (strcmp(m->cdc_algo, REPO_CHUNKER_ALGO) != 0)
         return set_error(ERR_INVALID, "%s: unknown or missing chunker '%s'; this "
-                         "build knows only %s", path, c->algo, REPO_CHUNKER_ALGO);
-    int avg_pow2 = c->avg && (c->avg & (c->avg - 1)) == 0;
-    if (c->min < REPO_CHUNKER_MIN_FLOOR || c->min >= c->avg || c->avg >= c->max ||
-        c->max > REPO_CHUNKER_MAX_CEILING || !avg_pow2)
+                         "build knows only %s", path, m->cdc_algo, REPO_CHUNKER_ALGO);
+    int avg_pow2 = m->cdc_avg && (m->cdc_avg & (m->cdc_avg - 1)) == 0;
+    if (m->cdc_min < REPO_CHUNKER_MIN_FLOOR || m->cdc_min >= m->cdc_avg ||
+        m->cdc_avg >= m->cdc_max || m->cdc_max > REPO_CHUNKER_MAX_CEILING || !avg_pow2)
         return set_error(ERR_INVALID,
                          "%s: chunker sizes min %u avg %u max %u are outside the "
-                         "format's bounds", path, c->min, c->avg, c->max);
+                         "format's bounds", path, m->cdc_min, m->cdc_avg, m->cdc_max);
     int encrypted = m->enc_mode != REPO_ENC_NONE;
-    if (c->keyed < 0 || c->keyed != encrypted)
+    if (m->cdc_keyed < 0 || m->cdc_keyed != encrypted)
         return set_error(ERR_INVALID,
                          "%s: chunker keyed=%d does not match the repository's "
-                         "encryption (%s)", path, c->keyed,
+                         "encryption (%s)", path, m->cdc_keyed,
                          repo_enc_mode_name(m->enc_mode));
     return OK;
 }
@@ -346,8 +344,8 @@ status_t repo_marker_write_ex(const char *path, const repo_marker_t *in,
 static status_t marker_emit(const char *mp, repo_marker_t *mp_in)
 {
     mp_in->version = CBACKUP_FORMAT_VER;
-    if (!mp_in->chunker.algo[0]) repo_chunker_default(&mp_in->chunker, 0);
-    mp_in->chunker.keyed = mp_in->enc_mode != REPO_ENC_NONE;
+    if (!mp_in->cdc_algo[0]) repo_marker_cdc_default(mp_in);
+    mp_in->cdc_keyed = mp_in->enc_mode != REPO_ENC_NONE;
     mp_in->incompat_count = 0;
     mp_in->incompat_missing = 0;
     const repo_marker_t m = *mp_in;
@@ -366,9 +364,9 @@ static status_t marker_emit(const char *mp, repo_marker_t *mp_in)
                      "{\"format\":\"%s\",\"version\":%d,\"uuid\":\"%s\","
                      "\"chunker\":{\"algo\":\"%s\",\"min\":%u,\"avg\":%u,"
                      "\"max\":%u,\"keyed\":%s},\"incompat\":[]",
-                     CBACKUP_FORMAT, m.version, m.uuid, m.chunker.algo,
-                     m.chunker.min, m.chunker.avg, m.chunker.max,
-                     m.chunker.keyed ? "true" : "false");
+                     CBACKUP_FORMAT, m.version, m.uuid, m.cdc_algo,
+                     m.cdc_min, m.cdc_avg, m.cdc_max,
+                     m.cdc_keyed ? "true" : "false");
     size_t used = (n > 0 && n < (int)sizeof(body)) ? (size_t)n : sizeof(body);
     int k;
     if (m.enc_mode == REPO_ENC_NONE) {

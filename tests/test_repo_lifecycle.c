@@ -801,11 +801,11 @@ static void test_new_repo_marker_is_format_3_with_chunker(void **state)
     repo_marker_t m;
     assert_int_equal(repo_marker_read(TEST_ROOT "/fresh", &m), OK);
     assert_int_equal(m.version, 3);
-    assert_string_equal(m.chunker.algo, "fastcdc-gear64-v1");
-    assert_int_equal(m.chunker.min, 524288);
-    assert_int_equal(m.chunker.avg, 1048576);
-    assert_int_equal(m.chunker.max, 8388608);
-    assert_int_equal(m.chunker.keyed, 0);
+    assert_string_equal(m.cdc_algo, "fastcdc-gear64-v1");
+    assert_int_equal(m.cdc_min, 524288);
+    assert_int_equal(m.cdc_avg, 1048576);
+    assert_int_equal(m.cdc_max, 8388608);
+    assert_int_equal(m.cdc_keyed, 0);
     assert_int_equal(m.incompat_count, 0);
     assert_int_equal(m.incompat_missing, 0);
     assert_int_equal(repo_format_check(TEST_ROOT "/fresh", &m), OK);
