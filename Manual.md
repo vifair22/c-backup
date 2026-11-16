@@ -771,9 +771,21 @@ everything that was asked for.
 
 ### 6.4 Concurrency
 
-Jobs for one repository run one at a time: the dispatcher never starts a
-second job for a repository that has one running, and queues it instead. Jobs
-for different repositories run in parallel, up to `jobs.max_parallel`.
+Jobs for one repository run one at a time, in the order they were submitted:
+the dispatcher never starts a second job for a repository that has one
+running, and queues it instead. Jobs for different repositories run in
+parallel, up to `jobs.max_parallel`.
+
+A few requests act on a repository directly rather than as a job: deleting a
+snapshot and removing a repository. They hold the repository for the
+milliseconds they take, and one that finds a job running against it is
+refused (`503 repo is busy` for a snapshot delete, `409` for a removal). The
+reverse never fails a job: a job whose turn comes while such a request holds
+its repository stays `queued`, shows the phase `waiting for repository`, and
+starts as soon as the request is done, retried within at most half a second.
+It holds no worker while it waits, and it can be cancelled like any queued
+job. So deleting snapshots by hand while a scheduled backup is due costs the
+backup nothing more than the wait.
 
 Metadata writes (tags, notes, policy, sources) during a running backup wait
 briefly for the database rather than failing. A backup holds the database's
