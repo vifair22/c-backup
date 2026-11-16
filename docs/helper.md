@@ -337,9 +337,10 @@ The pause is capped by the policy's `max_pause_s` (30 s by default): the
 helper's watchdog unpauses at the cap whatever the daemon does, and
 `lease.release` then reports `cap_hit`, the snapshot is kept, and the unit
 is flagged `inconsistent` with a warning. Within the cap the unit is
-`crash`-consistent like a fully snapshotted one. The scan of every root
-happens before any file is stored, so the directory walk of the snapshot
-mounts falls inside the pause as well; their file content does not.
+`crash`-consistent like a fully snapshotted one. The work
+is split: the held mounts are scanned and stored, the pause let go, and
+only then are the snapshot mounts walked and read, so neither their
+directory walk nor their content falls inside the pause.
 `pause = never` units, and stopped ones, are read live and flagged.
 
 ### Pausing

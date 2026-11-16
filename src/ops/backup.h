@@ -73,12 +73,11 @@ typedef struct {
      * changed since.
      *
      * held_roots / held_done: the first held_roots paths are read under a
-     * hold (a pause the caller took). Their files are stored first, then
-     * held_done(held_ctx) is called once, and only then the other roots'
-     * files and the synthetic entries, so the hold covers the scan and the
-     * changed files of the held roots and not the bulk of the rest. (The
-     * scan of every root happens before any store, so the other roots'
-     * directory walk falls inside the hold too.)
+     * hold (a pause the caller took). They are scanned and their files
+     * stored, then held_done(held_ctx) is called once, and only then are
+     * the other roots scanned and stored, then the synthetic entries: the
+     * hold covers the held roots alone, neither the other roots' directory
+     * walk nor their content.
      */
     int          content_only;
     int          held_roots;

@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cmocka.h>
@@ -269,12 +270,84 @@ static void test_content_only_and_hold(void **state)
     assert_int_equal(h.other_rows, 0);
 }
 
+typedef struct { struct timespec t0; double held_s; long long small_rows, big_rows; const char *big; } held_clock_t;
+
+static void on_held_clock(void *ctx)
+{
+    held_clock_t *h = ctx;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    h->held_s = (double)(t.tv_sec - h->t0.tv_sec) + (double)(t.tv_nsec - h->t0.tv_nsec) / 1e9;
+    h->small_rows = count_of("SELECT COUNT(*) FROM file_cache WHERE repo_id = ? AND path LIKE ?", D "/small/%");
+    char like[200];
+    snprintf(like, sizeof(like), "%s/%%", h->big);
+    h->big_rows = count_of("SELECT COUNT(*) FROM file_cache WHERE repo_id = ? AND path LIKE ?", like);
+}
+
+/* One run: a small held tree and a snapshot tree of n files; how long the
+ * hold lasted, from the start of the run to its release. */
+static double held_for(const char *big, int n)
+{
+    char p[256];
+    snprintf(p, sizeof(p), "%s", big);
+    assert_int_equal(mkdir(p, 0700), 0);
+    for (int i = 0; i < n; i++) {
+        if (i % 500 == 0) {
+            snprintf(p, sizeof(p), "%s/d%d", big, i / 500);
+            assert_int_equal(mkdir(p, 0700), 0);
+        }
+        snprintf(p, sizeof(p), "%s/d%d/f%d", big, i / 500, i);
+        put_file(p, "x");
+    }
+    const char *paths[] = { D "/small", big };
+    held_clock_t h;
+    memset(&h, 0, sizeof(h));
+    h.big = big;
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 2;
+    o.held_roots = 1;
+    o.held_done = on_held_clock;
+    o.held_ctx = &h;
+    backup_result_t r;
+    memset(&r, 0, sizeof(r));
+    clock_gettime(CLOCK_MONOTONIC, &h.t0);
+    assert_int_equal(backup_run(store, db, repo_id, &o, &r), OK);
+    /* Every file of both roots made it in, the held ones first. */
+    assert_true(r.files >= (uint64_t)n + 10);
+    backup_result_free(&r);
+    /* At the release the held files were in, none of the snapshot tree's. */
+    assert_int_equal(h.small_rows, 10);
+    assert_int_equal(h.big_rows, 0);
+    return h.held_s;
+}
+
+/* The hold covers the held roots' scan and store only: the snapshot
+ * tree's directory walk comes after it, so ten times the files there
+ * leaves the hold about as long. */
+static void test_hold_excludes_rest_scan(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(D "/small", 0700), 0);
+    char p[256];
+    for (int i = 0; i < 10; i++) {
+        snprintf(p, sizeof(p), D "/small/s%d", i);
+        put_file(p, "held");
+    }
+    double a = held_for(D "/big1", 2000);
+    double b = held_for(D "/big2", 20000);
+    print_message("held for %.6f s with 2000 snapshot files, %.6f s with 20000\n", a, b);
+    assert_true(b < 2 * a + 0.5);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_stream_and_drop, setup, teardown),
         cmocka_unit_test(test_cdc_stream_sizes),
         cmocka_unit_test_setup_teardown(test_content_only_and_hold, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_hold_excludes_rest_scan, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

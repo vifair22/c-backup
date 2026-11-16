@@ -142,9 +142,13 @@ typedef struct {
     small_pool_t  *spool;
     small_batch_t *sbatch;
     uint64_t       spool_taken;
-    /* Entries below held_end belong to the held roots (backup_opts_t). */
+    /* Entries below held_end belong to the held roots (backup_opts_t). The
+     * other roots are scanned only once the hold is let go, with the scan's
+     * own options and inode map kept for it. */
     uint32_t       held_end;
     int            held_pending;
+    scan_imap_t   *imap;
+    const scan_opts_t *sopts;
 } pipeline_t;
 
 /*
@@ -1451,14 +1455,58 @@ static status_t drain_all(pipeline_t *p, batch_t *b)
     return OK;
 }
 
-/* The held roots are all stored: let the hold go. */
+/*
+ * The other roots, scanned after the hold: frozen in a snapshot, they need
+ * no pause, and their directory walk can be far longer than one (a photo
+ * library of hundreds of thousands of files). Their entries are appended;
+ * nothing outstanding refers to the old arrays, the workers being drained.
+ */
+static status_t scan_rest(pipeline_t *p)
+{
+    const backup_opts_t *o = p->opts;
+    status_t st = OK;
+    for (int i = o->held_roots; st == OK && i < o->n_paths; i++) {
+        scan_result_t *part = NULL;
+        const char *rd = (o->read_paths && o->read_paths[i]) ? o->read_paths[i] : NULL;
+        st = (rd && strcmp(rd, o->paths[i]) != 0) ? scan_tree_as(rd, o->paths[i], p->imap, p->sopts, &part)
+                                                  : scan_tree(o->paths[i], p->imap, p->sopts, &part);
+        if (st != OK) { scan_result_free(part); break; }
+        if (!part) { st = set_error(ERR_INVALID, "backup_run: scan of %s returned no result", o->paths[i]); break; }
+        uint32_t base = p->scan->count, need = base + part->count;
+        scan_entry_t *grown = realloc(p->scan->entries, (size_t)need * sizeof(*grown));
+        node_link_t *gl = grown ? realloc(p->links, (size_t)need * sizeof(*gl)) : NULL;
+        if (grown) p->scan->entries = grown;
+        if (!gl) { scan_result_free(part); st = set_error(ERR_NOMEM, "backup_run: merge"); break; }
+        p->links = gl;
+        memcpy(p->scan->entries + base, part->entries, part->count * sizeof(*part->entries));
+        memset(p->links + base, 0, (size_t)part->count * sizeof(*p->links));
+        for (uint32_t k = base; k < need; k++) {
+            p->links[k].node_id    = p->scan->entries[k].node.node_id;
+            p->links[k].parent_id  = p->scan->entries[k].parent_node_id;
+            p->links[k].scan_index = k;
+            if (S_ISREG(p->scan->entries[k].st.st_mode)) p->bytes_total += p->scan->entries[k].node.size;
+        }
+        p->scan->count = need;
+        p->scan->capacity = need;
+        p->count = need;
+        free(part->entries);
+        part->entries = NULL;
+        part->count = 0;
+        scan_result_free(part);
+    }
+    scan_imap_free(p->imap);
+    p->imap = NULL;
+    return st;
+}
+
+/* The held roots are all stored: let the hold go, then scan the rest. */
 static status_t release_hold(pipeline_t *p, batch_t *b)
 {
     status_t st = drain_all(p, b);
     if (st != OK) return st;
     p->held_pending = 0;
     if (p->opts->held_done) p->opts->held_done(p->opts->held_ctx);
-    return OK;
+    return scan_rest(p);
 }
 
 static status_t store_content_loop(pipeline_t *p)
@@ -1491,7 +1539,14 @@ static status_t store_content_loop(pipeline_t *p)
      * when the result comes back. */
     int prev_pooled = 0;
 
-    for (uint32_t i = 0; i < p->count; i++) {
+    /* Under a hold the loop runs on past the held roots' entries: releasing
+     * the hold scans the other roots and appends them. */
+    for (uint32_t i = 0; i < p->count || p->held_pending; i++) {
+        if (p->held_pending && i >= p->held_end) {
+            status_t hst = release_hold(p, b);
+            if (hst != OK) { batch_close(p, b); return hst; }
+            if (i >= p->count) break;
+        }
         /* The previous entry is finished, whichever way it went: stored,
          * vouched for by the cache, or skipped as unreadable. */
         if (i > 0 && S_ISREG(p->scan->entries[i - 1].st.st_mode) && !prev_pooled)
@@ -1502,11 +1557,6 @@ static status_t store_content_loop(pipeline_t *p)
             return set_error(ERR_BUSY, "backup cancelled");
         }
 
-
-        if (p->held_pending && i >= p->held_end) {
-            status_t hst = release_hold(p, b);
-            if (hst != OK) { batch_close(p, b); return hst; }
-        }
 
         /* Results come back between entries. */
         status_t dst = pool_drain(p, b, 0);
@@ -2383,8 +2433,8 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     uint64_t _tscan = phase_now();
     uint64_t from_sources = 0;
     uint32_t held_end = 0;
-    for (int i = 0; i < opts->n_paths; i++) {
-        if (i == opts->held_roots && scan) held_end = scan->count;
+    int scan_now = opts->held_roots > 0 && opts->held_roots < opts->n_paths ? opts->held_roots : opts->n_paths;
+    for (int i = 0; i < scan_now; i++) {
         scan_result_t *part = NULL;
         const char *rd = (opts->read_paths && opts->read_paths[i]) ? opts->read_paths[i] : NULL;
         st = (rd && strcmp(rd, opts->paths[i]) != 0)
@@ -2423,7 +2473,8 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
      * leave a few synthesised directories behind and write a snapshot of
      * nothing that reported success. Nothing is written before this.
      */
-    if (opts->n_paths > 0 && (!scan || scan->count == 0 || from_sources == 0)) {
+    held_end = scan ? scan->count : 0;
+    if (opts->n_paths > 0 && scan_now == opts->n_paths && (!scan || scan->count == 0 || from_sources == 0)) {
         scan_imap_free(imap);
         scan_result_free(scan);
         return set_error(ERR_INVALID,
@@ -2450,8 +2501,11 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
             st = scan_add_synthetic(&scan, imap, opts->synth[i].path, &nd, &synth_at[i]);
         }
     }
-    scan_imap_free(imap);
+    /* Under a hold the other roots are scanned later, with this map. */
+    int scan_later = scan_now < opts->n_paths;
+    if (!scan_later) { scan_imap_free(imap); imap = NULL; }
     if (st != OK || !scan) {
+        scan_imap_free(imap);
         free(synth_at);
         scan_result_free(scan);
         return st != OK ? st : set_error(ERR_INVALID, "nothing to back up");
@@ -2484,6 +2538,8 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     if (opts->held_roots > 0) {
         p.held_end = opts->held_roots >= opts->n_paths ? scan->count : held_end;
         p.held_pending = 1;
+        p.imap = imap;
+        p.sopts = &sopts;
     }
 
     /* Layers below here attribute through the thread-local; see phase_timer.h.
@@ -2503,6 +2559,8 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     struct timespec t0, t1, t2, t3;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     st = store_content(&p);
+    links = p.links;            /* the rest's scan may have grown it */
+    if (p.imap) { scan_imap_free(p.imap); p.imap = NULL; }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     uint64_t _ttr = phase_now(), _ttrn = phase_nested(&timers);
     if (st == OK && !opts->content_only) st = build_trees(&p, root_hash);
