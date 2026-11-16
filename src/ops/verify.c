@@ -409,10 +409,10 @@ static uint64_t check_unsettled_files(cutils_db_t *db, int64_t repo_id,
                                   VERIFY_UNSETTLED_STATUS, paths, sizeof(paths),
                                   &n_snaps);
     if (n)
-        log_warn("verify: %llu file entr%s in %llu snapshot(s) were stored while "
+        log_warn("verify: %llu file entr%s in %llu snapshot(s) %s stored while "
                  "still changing and may not be internally consistent: %s",
                  (unsigned long long)n, n == 1 ? "y" : "ies",
-                 (unsigned long long)n_snaps, paths);
+                 (unsigned long long)n_snaps, n == 1 ? "was" : "were", paths);
     return n;
 }
 

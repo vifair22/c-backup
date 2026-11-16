@@ -1588,7 +1588,7 @@ if [ -n "$GCD_DAT" ] && damage_beyond_parity "$WORK/gcdsrc/keep.bin" "$GCD_DAT";
     check    "gc that copies damage beyond parity exits non-zero" 1 "$RC"
     contains "the gc job is failed"           '"state":"failed"' "$ERR"
     contains "the gc failure says what happened" \
-        "1 pack entry damaged beyond parity were copied as damaged" "$ERR"
+        "1 pack entry damaged beyond parity was copied as damaged" "$ERR"
     contains "the gc result lists the entry"  "$KEEP_HASH" "$OUT$ERR"
     contains "and counts it"                  '"pack_entries_damaged":1' "$OUT$ERR"
     GJ=$(job_of "$ERR")
