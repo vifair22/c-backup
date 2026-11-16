@@ -154,6 +154,33 @@ static void test_placeholders_and_text(void **state)
     free(v);
 }
 
+/*
+ * An empty blob and NULL are different values, and only the pointer says
+ * which: from c-utils 1.7.1 a NULL pointer binds NULL whatever the length.
+ * Every blob c-backup binds is a 32-byte name from an array (DB_HASH), and
+ * an absent one is DB_NULLP (DB_HASH_OR_NULL), so neither depends on what
+ * DB_BLOB does with NULL; this holds the two spellings that are meant.
+ */
+static void test_empty_blob_and_null_are_distinct(void **state)
+{
+    (void)state;
+    static const uint8_t none[1] = { 0 };
+    uint8_t h[32] = { 7 };
+    db_param_t p[] = { DB_BLOB(none, 0), DB_INT64(1) };
+    assert_int_equal(db_execute_non_query_typed(db, "INSERT INTO t (b, i) VALUES (?, ?)",
+                                                p, DB_NPARAMS(p), NULL), 0);
+    db_param_t q[] = { DB_HASH_OR_NULL(0, h), DB_INT64(2) };
+    assert_int_equal(db_execute_non_query_typed(db, "INSERT INTO t (b, i) VALUES (?, ?)",
+                                                q, DB_NPARAMS(q), NULL), 0);
+    db_param_t s[] = { DB_HASH_OR_NULL(1, h), DB_INT64(3) };
+    assert_int_equal(db_execute_non_query_typed(db, "INSERT INTO t (b, i) VALUES (?, ?)",
+                                                s, DB_NPARAMS(s), NULL), 0);
+    char *v = one("SELECT group_concat(typeof(b) || ':' || COALESCE(length(b), -1), ',')"
+                  " FROM (SELECT b FROM t ORDER BY i)");
+    assert_string_equal(v, "blob:0,null:-1,blob:32");
+    free(v);
+}
+
 /* More values than placeholders is a caller bug, refused before it runs. */
 static void test_extra_parameters_fail(void **state)
 {
@@ -174,6 +201,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_result_null_is_not_empty_text, setup, teardown),
         cmocka_unit_test_setup_teardown(test_numbers_and_negatives, setup, teardown),
         cmocka_unit_test_setup_teardown(test_placeholders_and_text, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_empty_blob_and_null_are_distinct, setup, teardown),
         cmocka_unit_test_setup_teardown(test_extra_parameters_fail, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

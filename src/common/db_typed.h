@@ -17,8 +17,12 @@
 #define DB_HASH(h)    DB_BLOB((h), 32)
 
 /*
- * A name, or SQL NULL when there is none. Not DB_BLOB(NULL, 32): c-utils
- * binds a NULL pointer as an empty blob of the given length, not as NULL,
- * and would read 32 bytes from nowhere.
+ * A name, or SQL NULL when there is none, said explicitly. What DB_BLOB does
+ * with a NULL pointer changed between c-utils releases (1.7.0 bound an empty
+ * blob, reading len bytes from nowhere for a non-zero len; 1.7.1 binds NULL
+ * whatever the length), so nothing here passes one: names come from arrays,
+ * and an absent one is DB_NULLP. A blob meant to be empty would need a
+ * non-NULL pointer with length 0; none is bound today (xattr and ACL values
+ * live in packs, and only their names reach the database).
  */
 #define DB_HASH_OR_NULL(present, h) ((present) ? DB_HASH(h) : DB_NULLP)
