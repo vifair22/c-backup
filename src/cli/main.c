@@ -17,6 +17,7 @@
  */
 
 #include "args.h"
+#include "calendar_check.h"
 #include "http.h"
 #include "sse.h"
 #include "snap_record.h"
@@ -1052,11 +1053,9 @@ static int h_verify(const args_t *a)
 static int h_stats(const args_t *a)
 {
     /* Only "staged" (objects in a pack a running backup has not sealed)
-     * narrows; format 3 has no loose objects. Anything
-     * else is refused here rather than sent and silently ignored. */
+     * narrows; format 3 has no loose objects. The spec refuses anything
+     * else rather than send it to be silently ignored. */
     const char *scope = args_value(a, "--scope");
-    if (scope && strcmp(scope, "staged") != 0)
-        return fail("--scope takes 'staged', not '%s'", scope);
     return get_repo_scoped(a->pos[0], "/stats", scope ? "scope=staged" : NULL);
 }
 
@@ -1214,9 +1213,10 @@ static int h_schedule_add(const args_t *a)
     if (!every && a->npos < 3)
         return refuse(a, "missing [seconds]: an interval schedule needs it, "
                     "or give --every for a calendar one");
-    if (!every && (at || on || on_day || on_month))
-        return refuse(a, "--at, --on, --on-day and --on-month describe a calendar "
-                    "schedule; they need --every");
+    /* What each period needs, and nothing it would drop (calendar_check.h). */
+    char why[160];
+    if (calendar_check(every, at, on, on_day, on_month, why, sizeof(why)) != 0)
+        return refuse(a, "%s", why);
 
     /* Numbers go into the body bare, so a non-number would be malformed
      * JSON and come back as "invalid JSON", describing the request rather
@@ -1228,6 +1228,8 @@ static int h_schedule_add(const args_t *a)
         long n = strtol(nums[k], &endp, 10);
         if (!nums[k][0] || !endp || *endp || n <= 0)
             return fail("--on-day and --on-month take a positive number, not '%s'", nums[k]);
+        if (n > (k == 0 ? 31 : 12))
+            return fail("%s", k == 0 ? "--on-day takes 1 to 31" : "--on-month takes 1 to 12");
     }
     if (!every) {
         /*
@@ -1258,8 +1260,8 @@ static int h_schedule_add(const args_t *a)
     if (overlap) { sb_puts(&b, ",\"on_overlap\":"); sb_json_str(&b, overlap); }
     if (catchup) { sb_puts(&b, ",\"catchup\":");    sb_json_str(&b, catchup); }
     if (every) {
-        /* The daemon validates the combination and says what is missing,
-         * so this only assembles it. */
+        /* Checked above; the daemon checks it again, and alone knows
+         * whether the day exists in the month. */
         sb_puts(&b, ",\"trigger\":{\"type\":\"calendar\",\"every\":");
         sb_json_str(&b, every);
         if (at)       { sb_puts(&b, ",\"at\":");       sb_json_str(&b, at); }
@@ -1484,7 +1486,7 @@ static const arg_opt_t O_PAGING[] = { OPT_LIMIT, OPT_OFFSET, OPT_END };
 static const arg_opt_t O_NOWAIT[] = { OPT_NOWAIT, OPT_END };
 static const arg_opt_t O_DRY_NOWAIT[] = { OPT_DRYRUN, OPT_NOWAIT, OPT_END };
 static const arg_opt_t O_REPO_ADD[] = {
-    { "--encrypt",    NULL, ARG_VALUE, "system|passphrase|none" },
+    { "--encrypt",    NULL, ARG_CHOICE, "system|passphrase|none" },
     { "--passphrase", NULL, ARG_VALUE, "TEXT" },
     OPT_END,
 };
@@ -1514,7 +1516,7 @@ static const arg_opt_t O_GREP[] = {
     OPT_NOWAIT, OPT_END,
 };
 static const arg_opt_t O_VERIFY[] = {
-    { "--level", NULL, ARG_VALUE, "index|structure|deep" },
+    { "--level", NULL, ARG_CHOICE, "index|structure|deep" },
     { "--no-repair", NULL, ARG_FLAG, NULL },
     OPT_DRYRUN, OPT_NOWAIT, OPT_END,
 };
@@ -1523,22 +1525,22 @@ static const arg_opt_t O_REPLICATE[] = {
     { "--to-plaintext", NULL, ARG_FLAG, NULL },
     OPT_NOWAIT, OPT_END,
 };
-static const arg_opt_t O_STATS[] = { { "--scope", NULL, ARG_VALUE, "staged" }, OPT_END };
+static const arg_opt_t O_STATS[] = { { "--scope", NULL, ARG_CHOICE, "staged" }, OPT_END };
 static const arg_opt_t O_OBJECTS[] = {
-    { "--location", NULL, ARG_VALUE, "staged|packed" }, OPT_LIMIT, OPT_OFFSET, OPT_END,
+    { "--location", NULL, ARG_CHOICE, "staged|packed|all" }, OPT_LIMIT, OPT_OFFSET, OPT_END,
 };
 static const arg_opt_t O_MOVE[] = { { "--move", NULL, ARG_FLAG, NULL }, OPT_END };
 static const arg_opt_t O_JOURNAL[] = {
     OPT_LIMIT, OPT_OFFSET, { "--result", NULL, ARG_VALUE, "STATE" }, OPT_END,
 };
 static const arg_opt_t O_SCHED_ADD[] = {
-    { "--every",       NULL, ARG_VALUE, "day|week|month|year" },
+    { "--every",       NULL, ARG_CHOICE, "day|week|month|year" },
     { "--at",          NULL, ARG_VALUE, "HH:MM" },
     { "--on",          NULL, ARG_VALUE, "WEEKDAY" },
     { "--on-day",      NULL, ARG_VALUE, "N" },
     { "--on-month",    NULL, ARG_VALUE, "N" },
-    { "--on-overlap",  NULL, ARG_VALUE, "skip|queue|cancel_running" },
-    { "--catchup",     NULL, ARG_VALUE, "skip|run_once" },
+    { "--on-overlap",  NULL, ARG_CHOICE, "skip|queue|cancel_running" },
+    { "--catchup",     NULL, ARG_CHOICE, "skip|run_once" },
     { "--source",      NULL, ARG_MULTI, "PATH" },
     { "--dest",        NULL, ARG_VALUE, "PATH" },
     { "--pattern",     NULL, ARG_VALUE, "REGEX" },

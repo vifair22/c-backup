@@ -460,7 +460,7 @@ contains "weekly schedule from the CLI" '"id"' \
 contains "monthly schedule from the CLI" '"id"' \
     "$(cb schedule add 1 verify --every month --on-day 31 --at 02:30)"
 contains "calendar schedules listed" 'calendar' "$(cb schedule list 1)"
-contains "a weekly schedule needs its day" 'weekday' \
+contains "a weekly schedule needs its day" 'needs --on WEEKDAY' \
     "$(cb schedule add 1 gc --every week --at 03:00 2>&1)"
 contains "a non-numeric day is refused before sending" 'positive number' \
     "$(cb schedule add 1 gc --every month --on-day first --at 03:00 2>&1)"
@@ -1888,6 +1888,49 @@ for row in "${VALUE_SWEEP[@]}"; do
 done
 check "every value option refuses a missing value, sending nothing" 0 "$SWEEP_BAD"
 check "and the state still did not move" "$STATE_BEFORE" "$(b127_state 2>&1)"
+
+# NIT-26: a value outside an option's fixed set, and a calendar missing what
+# its period needs or carrying what it would drop. `verify --level bogus`,
+# `objects --location bogus` and `--every day` without --at were sent and
+# refused by the daemon, unlike `stats --scope bogus`.
+SWEEP_BAD=0
+CHOICE_SWEEP=(
+    "verify|1 --level bogus|option '--level' takes index, structure or deep, not 'bogus'"
+    "objects|1 --location bogus|option '--location' takes staged, packed or all, not 'bogus'"
+    "stats|1 --scope bogus|option '--scope' takes staged, not 'bogus'"
+    "repo add|$WORK/sweep --encrypt SYSTEM|option '--encrypt' takes system, passphrase or none"
+    "schedule add|1 backup --every fortnight --at 01:00|option '--every' takes day, week, month or year"
+    "schedule add|1 backup 60 --on-overlap later|option '--on-overlap' takes skip, queue or cancel_running"
+    "schedule add|1 backup 60 --catchup always|option '--catchup' takes skip or run_once"
+    "schedule add|1 backup --every day|--every day needs --at HH:MM"
+    "schedule add|1 backup --every day --at 24:00|--at takes a 24-hour HH:MM, not '24:00'"
+    "schedule add|1 backup --every day --at noon|--at takes a 24-hour HH:MM"
+    "schedule add|1 backup --every week --at 01:00|--every week needs --on WEEKDAY"
+    "schedule add|1 backup --every week --at 01:00 --on someday|--on takes a weekday name"
+    "schedule add|1 backup --every day --at 01:00 --on monday|--on names a weekday, which only --every week uses"
+    "schedule add|1 backup --every month --at 01:00|--every month needs --on-day N"
+    "schedule add|1 backup --every day --at 01:00 --on-day 3|--on-day is for --every month or year, not day"
+    "schedule add|1 backup --every year --at 01:00 --on-day 3|--every year needs --on-month N"
+    "schedule add|1 backup --every month --at 01:00 --on-day 3 --on-month 2|--on-month is for --every year, not month"
+    "schedule add|1 backup 60 --at 01:00|they need --every"
+)
+for row in "${CHOICE_SWEEP[@]}"; do
+    CMD="${row%%|*}"
+    rest="${row#*|}"
+    msg="${rest#*|}"
+    read -ra W <<< "$CMD ${rest%%|*}"
+    for sock in "$WORK/absent.sock" "$SOCK"; do
+        sweep_one "$sock" "$CMD" "$msg" "${W[@]}"
+    done
+done
+check "every bad option value and calendar shape is refused locally, sending nothing" \
+    0 "$SWEEP_BAD"
+check "and the state did not move for those either" "$STATE_BEFORE" "$(b127_state 2>&1)"
+# Case is the daemon's to ignore for a weekday, so the CLI does too; and
+# `all`, the daemon's default, is now in the CLI's list.
+contains "a weekday in capitals is accepted" '"id"' \
+    "$(cb schedule add 1 gfs --every week --on Sunday --at 03:00)"
+contains "objects --location all answers" '"objects"' "$(cb objects 1 --location all --limit 1)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
