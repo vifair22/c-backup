@@ -476,7 +476,7 @@ static void pack_num_seen(uint32_t pack_num, void *vctx)
     c->seen[c->nseen++] = pack_num;
 
     char name[64];
-    snprintf(name, sizeof(name), "pack-%08u.dat", pack_num);
+    snprintf(name, sizeof(name), "pack-%010u.dat", pack_num);
 
     uint32_t version = 0, count = 0;
     pack_entry_ctx_t ec;

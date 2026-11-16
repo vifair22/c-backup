@@ -29,6 +29,19 @@
 #define PACK_VERSION     5u
 
 /*
+ * Where pack n lives: packs/<shard>/pack-<n>.dat, the shard being n >> 8 so
+ * a directory holds 256 packs. Six hex digits are exactly n >> 8 of any u32
+ * and ten decimal digits are any u32, so no pack number can produce a name
+ * the directory scan would not parse back. .deleting-<n> markers use the
+ * same number width.
+ */
+#define PACK_SHARD_DIGITS 6u
+#define PACK_NUM_DIGITS   10u
+#define PACK_SHARD_FMT    "%06x"
+#define PACK_NUM_FMT      "%010u"
+#define PACK_SHARD_OF(n)  ((uint32_t)(n) >> 8)
+
+/*
  * Objects above this threshold are streamed chunk-by-chunk rather than loaded
  * entirely into memory. Matches STREAM_CHUNK in object.c.
  *
@@ -406,7 +419,7 @@ status_t pack_gc(store_t *store,
 
 /*
  * Finish pack removals a crash interrupted: delete every pack a
- * .deleting-NNNNNNNN marker names, emit its removal callback, and remove
+ * .deleting-NNNNNNNNNN marker names, emit its removal callback, and remove
  * the marker. A marker is written only once the packs replacing the ones
  * it names are installed, synced and announced, so this never deletes the
  * only copy of anything. pack_gc runs it first; reindex must too, before it
@@ -523,9 +536,8 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                              pack_dat_entry_cb cb, void *ctx);
 
 /*
- * Iterate the pack numbers present in the repository, whatever directory
- * layout they are in. Exposed so a rebuild does not have to reimplement the
- * sharded and flat path rules and drift from them.
+ * Iterate the pack numbers present in the repository. Exposed so a rebuild
+ * does not have to reimplement the path rules and drift from them.
  */
 typedef void (*pack_num_cb)(uint32_t pack_num, void *ctx);
 status_t pack_list(store_t *store, pack_num_cb cb, void *ctx);
@@ -541,9 +553,10 @@ typedef void (*pack_idx_entry_cb)(const pack_idx_info_t *info, void *ctx);
 
 /* --- path helpers (shared with json_api.c) ------------------------- */
 
-/* Resolve a pack_num to its .dat path (sharded first, flat fallback). */
+/* Build pack_num's .dat path (see PACK_SHARD_FMT). */
 int pack_dat_path_resolve(char *buf, size_t sz, const char *store,
                           uint32_t pack_num);
 
-/* Parse "pack-NNNNNNNN.dat" → pack_num.  Returns 1 on success, 0 on fail. */
+/* Parse "pack-NNNNNNNNNN.dat", exactly PACK_NUM_DIGITS digits, to its
+ * number. Returns 1 on success, 0 on fail. */
 int parse_pack_dat_name(const char *name, uint32_t *out_num);

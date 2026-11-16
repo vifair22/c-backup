@@ -224,7 +224,7 @@ static void test_unreadable_pack_keeps_its_rows(void **state)
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "f=$(find '%s/packs' -name 'pack-%08u.dat' | head -1);"
+             "f=$(find '%s/packs' -name 'pack-%010u.dat' | head -1);"
              " printf 'garbagegarbagegarbage' | dd of=\"$f\" conv=notrunc status=none",
              TEST_REPO, pack_num);
     assert_int_equal(system(cmd), 0);

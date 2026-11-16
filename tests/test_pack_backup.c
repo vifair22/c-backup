@@ -221,7 +221,7 @@ static void test_writing_nothing_leaves_no_pack(void **state)
     assert_int_equal(packed, 0);
 
     char packs[512];
-    snprintf(packs, sizeof(packs), "%s/packs/pack-00000000.dat", TEST_ROOT);
+    snprintf(packs, sizeof(packs), "%s/packs/000000/pack-0000000000.dat", TEST_ROOT);
     struct stat sb;
     assert_int_not_equal(stat(packs, &sb), 0);
 

@@ -633,7 +633,7 @@ static void big_pack_cb(uint32_t num, void *v)
 {
     biggest_t *b = v;
     char name[64];
-    snprintf(name, sizeof(name), "pack-%08u.dat", num);
+    snprintf(name, sizeof(name), "pack-%010u.dat", num);
     b->cur = num;
     uint32_t ver = 0, cnt = 0;
     assert_int_equal(pack_enumerate_dat(store, name, &ver, &cnt, big_entry_cb, b), OK);
@@ -748,7 +748,7 @@ static void test_stored_writer_cuts_a_failed_entry_out(void **state)
     assert_int_equal(packed, 2);
 
     char name[64];
-    snprintf(name, sizeof(name), "pack-%08u.dat", num);
+    snprintf(name, sizeof(name), "pack-%010u.dat", num);
     walk_t wk;
     memset(&wk, 0, sizeof(wk));
     uint32_t ver = 0, cnt = 0;

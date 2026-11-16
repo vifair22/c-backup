@@ -59,9 +59,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     setup_once();
 
     char dir[256], path[512];
-    snprintf(dir, sizeof(dir), "%s/packs/0000", FUZZ_ROOT);
+    snprintf(dir, sizeof(dir), "%s/packs/000000", FUZZ_ROOT);
     if (mkdir(dir, 0755) != 0) { /* already there */ }
-    snprintf(path, sizeof(path), "%s/pack-00000000.dat", dir);
+    snprintf(path, sizeof(path), "%s/pack-0000000000.dat", dir);
 
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return 0;
@@ -72,7 +72,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     uint32_t version = 0, count = 0;
     uint64_t seen = 0;
-    pack_enumerate_dat(g_store, "pack-00000000.dat", &version, &count,
+    pack_enumerate_dat(g_store, "pack-0000000000.dat", &version, &count,
                        count_entry, &seen);
     err_clear();
 

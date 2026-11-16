@@ -195,37 +195,32 @@ static void mark_loose_skip(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
     update_loose_header_parity(wfd, compressed_size);
     close(wfd);
 }
-
-/* ---- Sharded pack path helpers ----
- * New layout:  packs/XXXX/pack-NNNNNNNN.{dat,idx}
- *   where XXXX = pack_num / 256 (4-char zero-padded hex)
- * Legacy flat: packs/pack-NNNNNNNN.{dat,idx}
+/* ---- Pack paths ----
  *
- * pack_dat_path / pack_idx_path build the *sharded* path (for writes).
- * pack_dat_path_resolve / pack_idx_path_resolve try sharded first,
- * fall back to flat (for reads). */
+ * Pack n is packs/<n >> 8 as PACK_SHARD_FMT>/pack-<n as PACK_NUM_FMT>.dat,
+ * 256 packs per shard directory. Both widths cover every 32-bit pack
+ * number: format 2 used four hex digits and eight decimal ones, so pack
+ * 16,777,216 landed in a five-digit shard the scan skipped and every later
+ * pack write on the repository failed, and pack 100,000,000 was invisible
+ * to the name parser. Names are parsed exactly, so a name of the wrong
+ * width is not a pack. There is one layout and no fallback. */
 
 static int pack_dat_path(char *buf, size_t sz, const char *store,
                          uint32_t pack_num) {
-    return path_fmt(buf, sz, "%s/packs/%04x/pack-%08u.dat",
-                    store, pack_num / 256, pack_num);
+    return path_fmt(buf, sz, "%s/packs/" PACK_SHARD_FMT "/pack-" PACK_NUM_FMT ".dat",
+                    store, PACK_SHARD_OF(pack_num), pack_num);
 }
 
-
-/* Build sharded path; if file doesn't exist, try flat layout. */
 int pack_dat_path_resolve(char *buf, size_t sz, const char *store,
                           uint32_t pack_num) {
-    if (pack_dat_path(buf, sz, store, pack_num) != 0) return -1;
-    if (access(buf, F_OK) == 0) return 0;
-    return path_fmt(buf, sz, "%s/packs/pack-%08u.dat", store, pack_num);
+    return pack_dat_path(buf, sz, store, pack_num);
 }
-
 
 /* Ensure the shard directory exists for a pack_num. */
 static void pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
     char shard[PATH_MAX];
-    if (path_fmt(shard, sizeof(shard), "%s/packs/%04x",
-                 store, pack_num / 256) == 0)
+    if (path_fmt(shard, sizeof(shard), "%s/packs/" PACK_SHARD_FMT,
+                 store, PACK_SHARD_OF(pack_num)) == 0)
         (void)mkdir(shard, 0755);  /* EEXIST is fine */
 }
 
@@ -241,19 +236,55 @@ static int fsync_dir_path(const char *path) {
     return rc;
 }
 
-int parse_pack_dat_name(const char *name, uint32_t *out_num) {
-    int end = 0;
-    uint32_t n;
-    if (sscanf(name, "pack-%08u.dat%n", &n, &end) == 1 && name[end] == '\0') {
-        if (out_num) *out_num = n;
-        return 1;
+/* Exactly `digits` decimal digits at s, as a u32. sscanf's %u would take
+ * fewer digits, a sign or leading space, and wrap on overflow. */
+static int parse_fixed_dec(const char *s, unsigned digits, uint32_t *out) {
+    uint64_t v = 0;
+    for (unsigned i = 0; i < digits; i++) {
+        if (s[i] < '0' || s[i] > '9') return 0;
+        v = v * 10u + (uint64_t)(s[i] - '0');
     }
-    return 0;
+    if (v > UINT32_MAX) return 0;
+    *out = (uint32_t)v;
+    return 1;
 }
 
-/* Walk packs/ directory (both flat and sharded) collecting pack numbers
- * from .dat files.  Calls cb(pack_num, ctx) for each found pack.
- * pack_num_cb is declared in pack.h, which pack_list exposes. */
+int parse_pack_dat_name(const char *name, uint32_t *out_num) {
+    uint32_t n;
+    if (strncmp(name, "pack-", 5) != 0 || !parse_fixed_dec(name + 5, PACK_NUM_DIGITS, &n) ||
+        strcmp(name + 5 + PACK_NUM_DIGITS, ".dat") != 0)
+        return 0;
+    if (out_num) *out_num = n;
+    return 1;
+}
+
+static int parse_deleting_name(const char *name, uint32_t *out_num) {
+    return strncmp(name, ".deleting-", 10) == 0 &&
+           parse_fixed_dec(name + 10, PACK_NUM_DIGITS, out_num) &&
+           name[10 + PACK_NUM_DIGITS] == '\0';
+}
+
+/* A shard directory name: exactly PACK_SHARD_DIGITS lowercase hex digits. */
+static int parse_shard_name(const char *name, uint32_t *out) {
+    uint32_t v = 0;
+    for (unsigned i = 0; i < PACK_SHARD_DIGITS; i++) {
+        char c = name[i];
+        uint32_t d;
+        if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+        else return 0;
+        v = (v << 4) | d;
+    }
+    if (name[PACK_SHARD_DIGITS] != '\0') return 0;
+    *out = v;
+    return 1;
+}
+
+/* Walk the shard directories under packs/ collecting pack numbers from .dat
+ * files. Calls cb(pack_num, ctx) for each pack in the shard its number
+ * names; one filed under another shard cannot be opened by number, so it is
+ * not reported as a pack. pack_num_cb is declared in pack.h, which
+ * pack_list exposes. */
 static void pack_for_each_num(const char *packs_dir, pack_num_cb cb,
                                void *ctx) {
     DIR *dir = opendir(packs_dir);
@@ -261,37 +292,33 @@ static void pack_for_each_num(const char *packs_dir, pack_num_cb cb,
 
     struct dirent *de;
     while ((de = readdir(dir)) != NULL) {
-        uint32_t n;
-        /* Flat layout: pack-NNNNNNNN.dat */
-        if (parse_pack_dat_name(de->d_name, &n)) {
-            cb(n, ctx);
+        uint32_t shard_val;
+        if (de->d_type != DT_DIR && de->d_type != DT_UNKNOWN) continue;
+        if (!parse_shard_name(de->d_name, &shard_val)) continue;
+
+        char subdir[PATH_MAX];
+        if (path_fmt(subdir, sizeof(subdir), "%s/%s", packs_dir, de->d_name) != 0)
             continue;
-        }
-        /* Shard subdir: 4-char hex */
-        if (de->d_type == DT_DIR || de->d_type == DT_UNKNOWN) {
-            unsigned shard_val;
-            int end = 0;
-            if (sscanf(de->d_name, "%04x%n", &shard_val, &end) != 1 ||
-                end != 4 || de->d_name[4] != '\0')
-                continue;
 
-            char subdir[PATH_MAX];
-            if (path_fmt(subdir, sizeof(subdir), "%s/%s",
-                         packs_dir, de->d_name) != 0)
+        DIR *sdir = opendir(subdir);
+        if (!sdir) continue;
+        struct dirent *sde;
+        while ((sde = readdir(sdir)) != NULL) {
+            uint32_t n;
+            if (!parse_pack_dat_name(sde->d_name, &n)) continue;
+            if (PACK_SHARD_OF(n) != shard_val) {
+                log_warn("packs/%s/%s is filed under the wrong shard; ignored",
+                         de->d_name, sde->d_name);
                 continue;
-
-            DIR *sdir = opendir(subdir);
-            if (!sdir) continue;
-            struct dirent *sde;
-            while ((sde = readdir(sdir)) != NULL) {
-                if (parse_pack_dat_name(sde->d_name, &n))
-                    cb(n, ctx);
             }
-            closedir(sdir);
+            cb(n, ctx);
         }
+        closedir(sdir);
     }
     closedir(dir);
 }
+
+
 
 /* Callback for pack_for_each_num: collect pack numbers into a dynamic array */
 typedef struct {
@@ -550,18 +577,18 @@ status_t pack_object_physical_size(store_t *store,
 
     // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
     FILE *f = dat_open_or_checkout(store, found.pack_num);
-    if (!f) return set_error_errno(ERR_IO, "pack_object_physical_size: fopen pack-%08u.dat", found.pack_num);
+    if (!f) return set_error_errno(ERR_IO, "pack_object_physical_size: fopen pack-%010u.dat", found.pack_num);
 
     if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
         fclose(f);
-        return set_error_errno(ERR_IO, "pack_object_physical_size: fseeko pack-%08u.dat", found.pack_num);
+        return set_error_errno(ERR_IO, "pack_object_physical_size: fseeko pack-%010u.dat", found.pack_num);
     }
 
     pack_dat_entry_hdr_t ehdr;
     int ehrc = read_entry_hdr(f, &ehdr, 1);
     if (ehrc != 0) {
         fclose(f);
-        return entry_hdr_error(ehrc, "pack_object_physical_size: bad entry header in pack-%08u.dat", found.pack_num);
+        return entry_hdr_error(ehrc, "pack_object_physical_size: bad entry header in pack-%010u.dat", found.pack_num);
     }
     dat_return_or_close(store, found.pack_num, f);
     *out_bytes = (uint64_t)sizeof(pack_dat_entry_hdr_t) + ehdr.compressed_size;
@@ -577,19 +604,19 @@ status_t pack_object_get_info(store_t *store,
     if (st != OK) return st;
 
     FILE *f = dat_open_or_checkout(store, found.pack_num);
-    if (!f) return set_error_errno(ERR_IO, "pack_object_get_info: fopen pack-%08u.dat", found.pack_num);
+    if (!f) return set_error_errno(ERR_IO, "pack_object_get_info: fopen pack-%010u.dat", found.pack_num);
 
     if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
-        fclose(f); return set_error_errno(ERR_IO, "pack_object_get_info: fseeko pack-%08u.dat", found.pack_num);
+        fclose(f); return set_error_errno(ERR_IO, "pack_object_get_info: fseeko pack-%010u.dat", found.pack_num);
     }
     pack_dat_entry_hdr_t ehdr;
     int ehrc = read_entry_hdr(f, &ehdr, 1);
     if (ehrc != 0) {
-        fclose(f); return entry_hdr_error(ehrc, "pack_object_get_info: bad entry header in pack-%08u.dat", found.pack_num);
+        fclose(f); return entry_hdr_error(ehrc, "pack_object_get_info: bad entry header in pack-%010u.dat", found.pack_num);
     }
     dat_return_or_close(store, found.pack_num, f);
 
-    if (memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) return set_error(ERR_CORRUPT, "pack_object_get_info: hash mismatch in pack-%08u.dat", found.pack_num);
+    if (memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) return set_error(ERR_CORRUPT, "pack_object_get_info: hash mismatch in pack-%010u.dat", found.pack_num);
     if (out_uncompressed_size) *out_uncompressed_size = ehdr.uncompressed_size;
     if (out_type) *out_type = ehdr.type;
     return OK;
@@ -1288,7 +1315,7 @@ status_t pack_object_load(store_t *store,
     char dat_path[PATH_MAX];
     if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
                               store_root(store), pnum) != 0)
-        return set_error(ERR_IO, "pack_object_load: path too long for pack-%08u.dat", pnum);
+        return set_error(ERR_IO, "pack_object_load: path too long for pack-%010u.dat", pnum);
     FILE *f = dat_open_or_checkout(store, pnum);
     if (!f) return set_error_errno(ERR_IO, "pack_object_load: fopen(%s)", dat_path);
 
@@ -2010,7 +2037,7 @@ status_t pack_object_load_stream(store_t *store,
     char dat_path[PATH_MAX];
     if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
                               store_root(store), pnum) != 0)
-        return set_error(ERR_IO, "pack_object_load_stream: path too long for pack-%08u.dat", pnum);
+        return set_error(ERR_IO, "pack_object_load_stream: path too long for pack-%010u.dat", pnum);
     FILE *f = dat_open_or_checkout(store, pnum);
     if (!f) return set_error_errno(ERR_IO, "pack_object_load_stream: fopen(%s)", dat_path);
 
@@ -2597,7 +2624,7 @@ static status_t install_pack_file(store_t *store, const char *dat_tmp,
     struct stat st_chk;
     if (stat(dat_final, &st_chk) == 0)
         return set_error(ERR_IO,
-                         "install_pack_file: pack %08u already exists - refusing to overwrite",
+                         "install_pack_file: pack %010u already exists - refusing to overwrite",
                          pack_num);
 
     if (rename(dat_tmp, dat_final) != 0)
@@ -2632,7 +2659,7 @@ static status_t announce_pack(store_t *store, uint32_t pack_num, uint64_t size,
         ce[i].entry_index = entries[i].entry_index;
     }
     char fname[64];
-    snprintf(fname, sizeof(fname), "pack-%08u.dat", pack_num);
+    snprintf(fname, sizeof(fname), "pack-%010u.dat", pack_num);
     pack_commit_info_t info = {
         .pack_id     = pack_num,
         .filename    = fname,
@@ -3043,8 +3070,8 @@ status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed)
      */
     if (st == OK) {
         char dir[PATH_MAX];
-        if (path_fmt(dir, sizeof(dir), "%s/packs/%04x", store_root(w->store),
-                     w->pack_num / 256) != 0 ||
+        if (path_fmt(dir, sizeof(dir), "%s/packs/" PACK_SHARD_FMT, store_root(w->store),
+                     PACK_SHARD_OF(w->pack_num)) != 0 ||
             fsync_dir_path(dir) != 0)
             st = set_error_errno(ERR_IO, "pack_stored_finish: sync %s", dir);
         else if (path_fmt(dir, sizeof(dir), "%s/packs", store_root(w->store)) != 0 ||
@@ -4675,7 +4702,7 @@ static status_t collect_pack_meta(store_t *store,
     return OK;
 }
 
-/* Resume interrupted pack removals (coalescing, gc rewrites) by scanning for .deleting-NNNNNNNN
+/* Resume interrupted pack removals (coalescing, gc rewrites) by scanning for .deleting-NNNNNNNNNN
  * marker files in the packs/ directory and re-attempting the listed deletions. */
 static void pack_resume_deleting(store_t *store) {
     char packs_dir[PATH_MAX];
@@ -4689,7 +4716,7 @@ static void pack_resume_deleting(store_t *store) {
     struct dirent *de;
     while ((de = readdir(dir)) != NULL) {
         uint32_t marker_num;
-        if (sscanf(de->d_name, ".deleting-%08u", &marker_num) != 1) continue;
+        if (!parse_deleting_name(de->d_name, &marker_num)) continue;
 
         char marker_path[PATH_MAX];
         if (snprintf(marker_path, sizeof(marker_path), "%s/%s",
@@ -4702,7 +4729,7 @@ static void pack_resume_deleting(store_t *store) {
         uint32_t pnum;
         while (fscanf(mf, "%u", &pnum) == 1) {
             char dat_path[PATH_MAX];
-            /* Try sharded path first, then flat fallback */
+
             if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
                                       store_root(store), pnum) == 0)
                 unlink(dat_path);
@@ -4751,7 +4778,7 @@ static int build_disk_idx_from_dat(FILE *f, uint32_t count,
 /* ------------------------------------------------------------------ */
 
 /*
- * Write a .deleting-NNNNNNNN marker naming packs to remove, atomically.
+ * Write a .deleting-NNNNNNNNNN marker naming packs to remove, atomically.
  *
  * pack_resume_deleting replays a marker by deleting every pack it names, so
  * a marker cut short by a crash is worse than none: "123" truncated to "12"
@@ -4770,7 +4797,7 @@ static status_t write_deleting_marker(store_t *store, uint32_t key,
     char tmp[PATH_MAX], packs_dir[PATH_MAX];
     if (path_fmt(tmp, sizeof(tmp), "%s/tmp/deleting.XXXXXX", store_root(store)) != 0 ||
         path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0 ||
-        path_fmt(out_path, out_sz, "%s/.deleting-%08u", packs_dir, key) != 0)
+        path_fmt(out_path, out_sz, "%s/.deleting-" PACK_NUM_FMT, packs_dir, key) != 0)
         return set_error(ERR_IO, "pack marker: path too long");
 
     int fd = mkstemp(tmp);
@@ -5137,10 +5164,10 @@ static status_t pack_rw_replace(pack_rw_t *rw, const uint32_t *old_nums, size_t 
     if (st == OK) {
         uint32_t synced_shard = UINT32_MAX;
         for (size_t k = 0; st == OK && k < rw->nouts; k++) {
-            uint32_t shard = (base + (uint32_t)k) / 256;
+            uint32_t shard = PACK_SHARD_OF(base + (uint32_t)k);
             if (shard == synced_shard) continue;
             char dir[PATH_MAX];
-            if (path_fmt(dir, sizeof(dir), "%s/packs/%04x", store_root(store), shard) != 0 ||
+            if (path_fmt(dir, sizeof(dir), "%s/packs/" PACK_SHARD_FMT, store_root(store), shard) != 0 ||
                 fsync_dir_path(dir) != 0)
                 st = set_error_errno(ERR_IO, "pack rewrite: sync %s", dir);
             synced_shard = shard;
@@ -5523,7 +5550,7 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     if (bad > 0 || fixed_crc != ep.payload_crc || payload_fixed == 0) {
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         object_hash_to_hex(hash, hex);
-        log_warn("pack: %s in pack-%08u.dat is damaged beyond its parity "
+        log_warn("pack: %s in pack-%010u.dat is damaged beyond its parity "
                  "(%llu group(s) uncorrectable); nothing written",
                  hex, found.pack_num, (unsigned long long)bad);
         failed = 1;

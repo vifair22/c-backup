@@ -172,7 +172,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (found[0] != 1u) abort();   /* one writer, one pack */
 
     char dat_name[64];
-    snprintf(dat_name, sizeof(dat_name), "pack-%08u.dat", found[1]);
+    snprintf(dat_name, sizeof(dat_name), "pack-%010u.dat", found[1]);
 
     uint32_t version = 0, count = 0;
     size_t seen = 0;

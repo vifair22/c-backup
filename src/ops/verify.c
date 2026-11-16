@@ -416,7 +416,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             cur_pack = pack_id;
             cur_pack_missing = pack_file_missing(store, pack_id);
             if (cur_pack_missing)
-                log_error("verify: pack-%08u.dat is missing; every object "
+                log_error("verify: pack-%010u.dat is missing; every object "
                           "indexed in it is missing", (unsigned)pack_id);
         }
 

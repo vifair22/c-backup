@@ -343,7 +343,7 @@ static void test_pack_commit_cb_registration(void **state)
 
     pack_commit_entry_t e = { { 0 }, 128, 10, 20, 0 };
     pack_commit_info_t info = {
-        .pack_id = 3, .filename = "pack-00000003.dat",
+        .pack_id = 3, .filename = "pack-0000000003.dat",
         .size = 999, .entry_count = 1, .entries = &e,
     };
     store_emit_pack_commit(st, &info);
@@ -361,7 +361,7 @@ static void test_pack_commit_without_cb(void **state)
 {
     (void)state;
     store_t *st = fresh_store();
-    pack_commit_info_t info = { 1, "pack-00000001.dat", 0, 0, NULL };
+    pack_commit_info_t info = { 1, "pack-0000000001.dat", 0, 0, NULL };
     store_emit_pack_commit(st, &info);
     done(st);
 }

@@ -146,7 +146,7 @@ static void scan_pack(uint32_t pack_num, void *vctx)
 {
     local_ctx_t *c = vctx;
     char name[64];
-    snprintf(name, sizeof(name), "pack-%08u.dat", pack_num);
+    snprintf(name, sizeof(name), "pack-%010u.dat", pack_num);
     uint32_t version = 0, count = 0;
     scan_ctx_t sc = { c, pack_num };
     if (pack_enumerate_dat(c->store, name, &version, &count, scan_entry, &sc) != OK)

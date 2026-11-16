@@ -41,7 +41,7 @@
 
 #define TEST_DIR   TEST_TMP "/c_backup_test_pack_bigentry_fault"
 #define TEST_REPO  TEST_DIR "/repo"
-#define PACK_PATH  TEST_REPO "/packs/0000/pack-00000001.dat"
+#define PACK_PATH  TEST_REPO "/packs/000000/pack-0000000001.dat"
 #define GIB        ((uint64_t)1 << 30)
 
 static store_t *store;
@@ -96,7 +96,7 @@ static void write_sparse_pack(uint64_t live_size, uint64_t file_payload,
                               const uint8_t dead[OBJECT_HASH_SIZE],
                               const uint8_t live[OBJECT_HASH_SIZE])
 {
-    assert_int_equal(mkdir(TEST_REPO "/packs/0000", 0700), 0);
+    assert_int_equal(mkdir(TEST_REPO "/packs/000000", 0700), 0);
     int fd = open(PACK_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     assert_true(fd >= 0);
     pack_dat_hdr_t ph = { PACK_DAT_MAGIC, PACK_VERSION, 2 };

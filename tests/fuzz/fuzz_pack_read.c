@@ -75,9 +75,9 @@ static void setup_once(void)
     store_set_locate_cb(g_store, fuzz_locate, NULL);
 
     char dir[256];
-    snprintf(dir, sizeof(dir), "%s/packs/0000", FUZZ_ROOT);
+    snprintf(dir, sizeof(dir), "%s/packs/000000", FUZZ_ROOT);
     if (mkdir(dir, 0755) != 0) { /* already there */ }
-    snprintf(g_dat_path, sizeof(g_dat_path), "%s/pack-00000000.dat", dir);
+    snprintf(g_dat_path, sizeof(g_dat_path), "%s/pack-0000000000.dat", dir);
 
     memset(&g_key, 0x5a, sizeof(g_key));
     repo_key_compute_id(&g_key);
