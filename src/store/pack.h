@@ -399,6 +399,8 @@ uint64_t pack_test_encoder_threads(void);
  * The seal in force: PACK_MAX_MULTI_BYTES unless a test moved it.
  */
 uint64_t pack_seal_bytes(void);
+/* What no pack may exceed: the seal plus one entry, at most PACK_MAX_BYTES. */
+uint64_t pack_hard_bound(void);
 
 /*
  * Test hook: the size every writer seals a pack at, in place of

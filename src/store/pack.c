@@ -1087,6 +1087,19 @@ uint64_t pack_seal_bytes(void)
 }
 
 /*
+ * The most a writer may put in one pack: the seal plus one entry, which is
+ * what a caller that rolls over at the seal can reach, and never more than
+ * the format's PACK_MAX_BYTES (equal to it at the default seal). Tied to
+ * the seal so a test that lowers the seal (pack_test_set_seal) meets the
+ * bound at a size it can afford, the way production meets PACK_MAX_BYTES.
+ */
+uint64_t pack_hard_bound(void)
+{
+    uint64_t b = pack_seal_bytes() + PACK_ENTRY_MAX_BYTES;
+    return b < PACK_MAX_BYTES ? b : PACK_MAX_BYTES;
+}
+
+/*
  * Groups the seal reads back and encodes at a time: 64 groups is 979 KiB of
  * body and 64 KiB of parity. A test lowers it so a small pack spans many
  * windows; nothing else changes it.
@@ -3139,7 +3152,7 @@ status_t pack_backup_add_prepared(pack_backup_writer_t *w, const pack_prepared_t
     if (w->pw.dat_f && w->pw.packed > 0 &&
         (w->pw.packed >= PACK_MAX_ENTRIES ||
          sizeof(pack_dat_hdr_t) + w->pw.body_offset + sizeof(pack_dat_entry_hdr_t) +
-             (uint64_t)pp->len + OBJECT_CRYPT_OVERHEAD > PACK_MAX_BYTES))
+             (uint64_t)pp->len + OBJECT_CRYPT_OVERHEAD > pack_hard_bound()))
         st = set_error(ERR_INVALID, "pack_backup_add: pack is at its bound; "
                        "roll over before adding");
 

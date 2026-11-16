@@ -1126,15 +1126,19 @@ static status_t store_file_cdc(pipeline_t *p, batch_t *b, int fd, uint64_t size,
         size = (uint64_t)now.st_size;
     int large = size > OBJECT_MAX_BYTES;
     /*
-     * The batch is let go only when the file may not fit in the open pack:
-     * then the sink has to be able to seal mid-file, and sealing begins a
-     * transaction. A file that fits keeps the batch, so a backup with nobody
-     * waiting commits no more often than it did (OWN-16). The margin covers
-     * an entry header per chunk; stored chunks are never larger than their
-     * plaintext.
+     * A file over one object's bound may seal the pack mid-file, so the
+     * batch is let go first: sealing begins a transaction (OWN-16). Every
+     * such file, not only one that looks as if it will not fit (B134).
+     * That test asked pack_backup_full, which answers "not full" for a
+     * pack with nothing in it - so the first large file into a fresh writer
+     * was cut with no way to seal, and at the pack bound the append refused
+     * the next chunk and the file was left out. And a size known before
+     * the read is a guess: the read is the file's own size (settle), and a
+     * file that grows while it is read, or is read twice, is larger than
+     * any figure taken here. Smaller files never need it: the loop seals
+     * before each entry with a whole object's headroom.
      */
-    int may_seal = large &&
-        pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES);
+    int may_seal = large;
     if (may_seal) batch_close(p, b);
 
     obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
