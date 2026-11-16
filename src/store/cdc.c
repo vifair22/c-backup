@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "cdc.h"
+#include "read_budget.h"
 #include "types.h"
 
 #include <errno.h>
@@ -227,6 +228,7 @@ typedef struct cdc_job {
     obj_put_t         put;
     status_t          st;
     int               done;
+    uint64_t          taken;    /* read budget, given back by the worker */
     char              err[ERR_MSG_MAX];
 } cdc_job_t;
 
@@ -297,6 +299,7 @@ static void *worker_main(void *arg)
         memset(&put, 0, sizeof(put));
         status_t st = j->sink->put(j->sink->ctx, OBJECT_TYPE_FILE,
                                    j->data, j->len, &put);
+        if (j->taken) read_budget_release_foreign(j->taken);
 
         pthread_mutex_lock(&w->mu);
         j->put = put;
@@ -465,6 +468,7 @@ typedef struct {
     chunklist_builder_t *b;
     cdc_result_t       *r;
     uint8_t             first[OBJECT_HASH_SIZE];
+    uint64_t            first_off, first_len;
     /* Parallel: this file's jobs in submission order. */
     cdc_job_t          *ohead, *otail;
     size_t              inflight, inflight_max;
@@ -483,15 +487,25 @@ static void drv_fail(drv_t *d, status_t st, const char *msg)
 static status_t consume(drv_t *d, uint64_t offset, size_t len, const obj_put_t *put)
 {
     cdc_result_t *r = d->r;
-    if (r->chunks == 0) memcpy(d->first, put->hash, OBJECT_HASH_SIZE);
-    r->chunks++;
     if (put->is_new) {
         r->chunks_new++;
         r->chunk_bytes_new += len;
         r->phys_new += put->phys_bytes;
     }
+    /*
+     * The builder (and its 786 KB of scratch) only once there is a second
+     * chunk: most files are one chunk and never need a list. The first is
+     * held and replayed into it.
+     */
+    if (r->chunks++ == 0) {
+        memcpy(d->first, put->hash, OBJECT_HASH_SIZE);
+        d->first_off = offset;
+        d->first_len = len;
+        return OK;
+    }
     if (!d->b) {
         status_t st = chunklist_builder_new(OBJECT_TYPE_FILE, d->sink, &d->b);
+        if (st == OK) st = chunklist_builder_add(d->b, d->first_off, d->first_len, d->first);
         if (st != OK) return st;
     }
     return chunklist_builder_add(d->b, offset, len, put->hash);
@@ -539,16 +553,29 @@ static void drain(drv_t *d, size_t keep_bytes, unsigned keep_jobs)
 static status_t emit_chunk(drv_t *d, uint8_t **bufp, size_t len,
                            uint64_t offset)
 {
+    /*
+     * A cut chunk is an object buffer in flight until the sink has staged
+     * it: it takes its size from the read budget. On the pool the slot
+     * travels with the job and the worker gives it back, so this thread,
+     * which waits for workers, never holds one while it does.
+     */
     if (!d->w) {
         obj_put_t put;
         memset(&put, 0, sizeof(put));
+        int budget = !(d->o && d->o->unbudgeted);
+        uint64_t taken = budget ? read_budget_acquire(len ? len : 1) : 0;
         status_t st = d->sink->put(d->sink->ctx, OBJECT_TYPE_FILE, *bufp, len, &put);
+        if (budget) read_budget_release(taken);
         if (st != OK) return st;
         return consume(d, offset, len, &put);
     }
 
     cdc_job_t *j = calloc(1, sizeof(*j));
     if (!j) return set_error(ERR_NOMEM, "cdc: chunk job");
+    if (!(d->o && d->o->unbudgeted)) {
+        j->taken = read_budget_acquire(len ? len : 1);
+        read_budget_handoff(j->taken);
+    }
     j->sink = d->sink;
     j->data = *bufp;
     *bufp = NULL;
@@ -754,7 +781,12 @@ status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
         memcpy(out->hash, d.first, OBJECT_HASH_SIZE);
         out->type = OBJECT_TYPE_FILE;
     } else if (st == OK) {
-        if (!d.b) st = chunklist_builder_new(OBJECT_TYPE_FILE, sink, &d.b);
+        if (!d.b) {
+            /* One chunk with holes around it, or none at all. */
+            st = chunklist_builder_new(OBJECT_TYPE_FILE, sink, &d.b);
+            if (st == OK && out->chunks == 1)
+                st = chunklist_builder_add(d.b, d.first_off, d.first_len, d.first);
+        }
         if (st == OK) st = chunklist_builder_finish(d.b, size, out->hash);
         if (st == OK) {
             out->type = OBJECT_TYPE_CHUNKLIST;

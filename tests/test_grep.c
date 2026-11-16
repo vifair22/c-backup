@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,7 @@
 
 #include "backup.h"
 #include "grep.h"
+#include "chunklist.h"
 #include "object.h"
 #include "pack.h"
 #include "repo.h"
@@ -582,9 +584,8 @@ static void test_very_long_line_does_not_buffer_without_bound(void **state)
 /* Matches only from verified bytes (OWN-36)                           */
 /* ------------------------------------------------------------------ */
 
-/* Over GREP_INMEM_MAX, so it is loose and streamed through the pipe, with
- * the needle on its first line: a reader that stops at its hit cap never
- * reaches the tag or hash at the end. */
+/* Over one object's bound, so in format 3 it is a chunk list of about 20
+ * chunks, with the needle on its first line, in the first chunk. */
 #define BIG_TEXT ((size_t)20 * 1024 * 1024)
 
 static void write_big_text(const char *path)
@@ -602,7 +603,12 @@ static void write_big_text(const char *path)
     fclose(f);
 }
 
-static void damage_object_of(const char *name, off_t from_end)
+/*
+ * Flip one stored byte in the middle of chunk number `which` of a file's
+ * content (0 = the first, -1 = the last), inside its pack. Ten flipped
+ * bytes, spread out, so the pack's parity cannot carry them all.
+ */
+static void damage_chunk_of(const char *name, int which)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -611,24 +617,51 @@ static void damage_object_of(const char *name, off_t from_end)
         "SELECT content_hash FROM nodes WHERE repo_id = ? AND name = ?",
         (const char *[]){ repo, name, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
-    char path[600];
-    snprintf(path, sizeof(path), "%s/objects/%.2s/%s", TEST_REPO,
-             r->rows[0][0], r->rows[0][0] + 2);
+    uint8_t root[OBJECT_HASH_SIZE];
+    for (int k = 0; k < OBJECT_HASH_SIZE; k++) {
+        unsigned v = 0;
+        assert_int_equal(sscanf(r->rows[0][0] + k * 2, "%2x", &v), 1);
+        root[k] = (uint8_t)v;
+    }
     db_result_free(r);
 
-    FILE *f = fopen(path, "r+b");
-    assert_non_null(f);
-    object_header_t hdr;
-    assert_int_equal(fread(&hdr, sizeof(hdr), 1, f), 1);
-    off_t off = (off_t)sizeof(hdr) + (off_t)hdr.compressed_size - from_end;
-    assert_int_equal(fseeko(f, off, SEEK_SET), 0);
-    int c = fgetc(f);
-    assert_true(c != EOF);
-    assert_int_equal(fseeko(f, off, SEEK_SET), 0);
-    assert_int_not_equal(fputc(c ^ 0x5a, f), EOF);
-    fclose(f);
+    obj_loader_t ld = obj_loader_store(store);
+    chunklist_iter_t *it = NULL;
+    assert_int_equal(chunklist_iter_open(&ld, root, OBJECT_TYPE_FILE, 0, NULL, &it), OK);
+    chunklist_item_t x, pick;
+    memset(&pick, 0, sizeof(pick));
+    int done = 0, i = 0;
+    while (chunklist_iter_next(it, &x, &done) == OK && !done) {
+        if (which < 0 || i == which) pick = x;
+        i++;
+    }
+    chunklist_iter_close(it);
+    assert_true(i > 2);
+
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    assert_int_equal(pack_resolve_location(store, pick.hash, &pnum, &off), OK);
+    char path[600];
+    assert_int_equal(pack_dat_path_resolve(path, sizeof(path), TEST_REPO, pnum), 0);
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    pack_dat_entry_hdr_t eh;
+    assert_int_equal(pread(fd, &eh, sizeof(eh), (off_t)off), (ssize_t)sizeof(eh));
+    uint8_t junk[4096];
+    memset(junk, 0x5a, sizeof(junk));
+    assert_int_equal(pwrite(fd, junk, sizeof(junk),
+                            (off_t)(off + sizeof(eh) + eh.compressed_size / 2)),
+                     (ssize_t)sizeof(junk));
+    close(fd);
+    pack_cache_invalidate(store);
 }
 
+/*
+ * Damage in the chunk the needle is in: the file is skipped with the reason,
+ * and nothing it matched is recorded (OWN-36). Every chunk is hash-checked
+ * (and, encrypted, authenticated) before a byte of it is scanned, so damage
+ * anywhere a match could come from is caught before the match is.
+ */
 static void check_damaged_large_object_is_skipped(int keyed)
 {
     repo_key_t key;
@@ -638,8 +671,7 @@ static void check_damaged_large_object_is_skipped(int keyed)
     }
     write_big_text(TEST_SRC "/big.txt");
     int64_t snap = run_backup();
-    /* Near the end: far past where the hit cap used to stop the read. */
-    damage_object_of("big.txt", 100);
+    damage_chunk_of("big.txt", 0);
 
     grep_opts_t o = opts_for("needle|swordfish");
     o.max_hits_per_file = 1;
@@ -667,8 +699,8 @@ static void check_damaged_large_object_is_skipped(int keyed)
     if (keyed) store_set_key(store, NULL);
 }
 
-/* A large plaintext object damaged near its end records no match from its
- * first line and is reported skipped, with the reason on the run. */
+/* A large plaintext file damaged where its match is records no match from
+ * it and is reported skipped, with the reason on the run. */
 static void test_damaged_large_object_records_no_matches(void **state)
 {
     (void)state;
@@ -676,11 +708,34 @@ static void test_damaged_large_object_records_no_matches(void **state)
 }
 
 /* The same for a tag failure: matches decrypted from tampered ciphertext
- * are not the file's, and were recorded before the tag was ever read. */
+ * are not the file's. */
 static void test_tampered_encrypted_object_records_no_matches(void **state)
 {
     (void)state;
     check_damaged_large_object_is_skipped(1);
+}
+
+/*
+ * Format 3: damage in a chunk after the match, with the hit cap reached.
+ * The match came from a chunk that verified, so it is the file's and is
+ * recorded; the search stops there and never reads the damaged chunk. This
+ * is a search, not a scrub; verify is what reports the damage.
+ */
+static void test_damage_past_a_verified_match_keeps_the_match(void **state)
+{
+    (void)state;
+    write_big_text(TEST_SRC "/big.txt");
+    int64_t snap = run_backup();
+    damage_chunk_of("big.txt", -1);
+
+    grep_opts_t o = opts_for("needle");
+    o.max_hits_per_file = 1;
+    grep_result_t res;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    char *text = hits_text(res.run_id);
+    assert_non_null(strstr(text, "big.txt"));
+    free(text);
+    assert_int_equal(res.files_skipped, 0);
 }
 
 /* An undamaged large object still matches, and is not skipped, though it
@@ -724,6 +779,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_very_long_line_does_not_buffer_without_bound, setup, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_large_object_records_no_matches, setup, teardown),
         cmocka_unit_test_setup_teardown(test_tampered_encrypted_object_records_no_matches, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_damage_past_a_verified_match_keeps_the_match, setup, teardown),
         cmocka_unit_test_setup_teardown(test_intact_large_object_still_matches, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

@@ -213,8 +213,20 @@ typedef struct {
     void       *ctx;
 } obj_loader_t;
 
-/* The loader over object_load, for code that has a store. */
+/* The loader over object_load, for code that has a store. Each load takes
+ * its size from the read budget (read_budget.h) and gives it back once the
+ * object is parsed: what a walker keeps is an index, not a buffer in
+ * flight. */
 obj_loader_t obj_loader_store(store_t *store);
+
+/*
+ * object_load with the object's size taken from the read budget first.
+ * *out_taken is what to give back with read_budget_release once the buffer
+ * is freed. The caller must hold no other slot (read_budget.h).
+ */
+status_t object_load_budgeted(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                              void **out_data, size_t *out_len, uint8_t *out_type,
+                              uint64_t *out_taken);
 
 typedef struct {
     int      is_list;        /* a sub-list about to be descended into */

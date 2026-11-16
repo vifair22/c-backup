@@ -3886,50 +3886,6 @@ struct pack_backup_writer {
     uint32_t      sealed;    /* objects in packs already installed */
 };
 
-/*
- * Decide compression for a plaintext buffer, mirroring what pw_write_small
- * does to a loose object once it has decrypted it.
- *
- * The skip-marking branch there has no counterpart here and needs none. That
- * marker exists so a later pack run does not re-probe an incompressible loose
- * object, and an object written straight into a pack is never offered to a
- * pack run at all - repo_pack only ever considers loose objects, and neither
- * pack_gc nor maybe_coalesce_packs re-probes. The verdict is durable by
- * construction rather than by a byte in a header.
- *
- * On return *out points at either the caller's buffer or *owned, which the
- * caller frees.
- */
-static void pb_compress(pack_writer_t *pw, const uint8_t *in, uint64_t len,
-                        const uint8_t **out, uint64_t *out_len,
-                        uint8_t *out_compression, uint8_t **owned)
-{
-    *out             = in;
-    *out_len         = len;
-    *out_compression = COMPRESS_NONE;
-    *owned           = NULL;
-
-    /* Under 4 KiB the entry header costs more than the codec saves. */
-    if (len < 4096 || len > (uint64_t)INT_MAX) return;
-
-    int sample_len = (len > 65536) ? 65536 : (int)len;
-    int sc = LZ4_compress_default((const char *)in, (char *)pw->comp_buf,
-                                  sample_len, pw->comp_buf_size);
-    if (sc <= 0 || (double)sc / (double)sample_len > 0.98) return;
-
-    int csz = LZ4_compress_default((const char *)in, (char *)pw->comp_buf,
-                                   (int)len, pw->comp_buf_size);
-    if (csz <= 0 || (uint64_t)csz >= len) return;
-
-    uint8_t *copy = malloc((size_t)csz);
-    if (!copy) return;
-    memcpy(copy, pw->comp_buf, (size_t)csz);
-    *owned           = copy;
-    *out             = copy;
-    *out_len         = (uint64_t)csz;
-    *out_compression = COMPRESS_LZ4;
-}
-
 status_t pack_backup_open(store_t *store, pack_backup_writer_t **out)
 {
     if (!store || !out) return set_error(ERR_INVALID, "pack_backup_open: null argument");
@@ -3945,12 +3901,8 @@ status_t pack_backup_open(store_t *store, pack_backup_writer_t **out)
     if (!w) return set_error(ERR_NOMEM, "pack_backup_open: alloc");
 
     w->pw.store = store;
-    w->pw.comp_buf_size = LZ4_compressBound((int)PACK_STREAM_THRESHOLD);
-    w->pw.comp_buf = malloc((size_t)w->pw.comp_buf_size);
-    if (!w->pw.comp_buf) {
-        free(w);
-        return set_error(ERR_NOMEM, "pack_backup_open: compression buffer");
-    }
+    /* No compression buffer: pack_backup_prepare compresses on the calling
+     * thread into a buffer of its own, so chunk workers can run it at once. */
 
     rs_init();
     *out = w;
@@ -3994,6 +3946,113 @@ status_t pack_backup_rollover(pack_backup_writer_t *w)
     return OK;
 }
 
+/*
+ * The CPU half of staging an object, which needs no writer and no lock: the
+ * name, the 64 KiB probe and, if it pays, LZ4. Content-defined chunking runs
+ * this on its worker threads so one large file is not one core, and hands
+ * the result to pack_backup_add_prepared under the writer's lock, which is
+ * left only the encryption, the parity and the write.
+ *
+ * Compression decided here mirrors what pw_write_small does to a loose
+ * object (same thresholds, same codec). There is no skip mark: that exists
+ * so a pack run does not re-probe an incompressible loose object, and an
+ * object written straight into a pack is never offered to one. The scratch
+ * buffer is the calling thread's own.
+ */
+/*
+ * The calling thread's compression scratch, freed when the thread exits.
+ * Chunk workers come and go with every backup; a plain _Thread_local
+ * pointer leaked one buffer of up to 8 MiB per worker per backup.
+ */
+typedef struct {
+    uint8_t *buf;
+    int      cap;
+} comp_scratch_t;
+
+static pthread_key_t  g_comp_key;
+static pthread_once_t g_comp_once = PTHREAD_ONCE_INIT;
+
+static void comp_scratch_free(void *p)
+{
+    comp_scratch_t *c = p;
+    if (!c) return;
+    free(c->buf);
+    free(c);
+}
+
+static void comp_key_init(void)
+{
+    (void)pthread_key_create(&g_comp_key, comp_scratch_free);
+}
+
+static comp_scratch_t *comp_scratch(void)
+{
+    pthread_once(&g_comp_once, comp_key_init);
+    comp_scratch_t *c = pthread_getspecific(g_comp_key);
+    if (c) return c;
+    c = calloc(1, sizeof(*c));
+    if (c && pthread_setspecific(g_comp_key, c) != 0) { free(c); c = NULL; }
+    return c;
+}
+
+status_t pack_backup_prepare(uint8_t type, const void *data, size_t len,
+                             pack_prepared_t *out)
+{
+    if (!out || (!data && len)) return set_error(ERR_INVALID, "pack_backup_prepare: null argument");
+    memset(out, 0, sizeof(*out));
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "pack_backup_prepare: " OBJECT_TYPE_UNKNOWN_FMT, type);
+    if (len > PACK_STREAM_THRESHOLD)
+        return set_error(ERR_TOO_LARGE,
+                         "pack_backup_prepare: %zu bytes exceeds the object bound", len);
+
+    out->type = type;
+    out->len = len;
+    out->data = data;
+    out->payload = data;
+    out->payload_len = len;
+    out->compression = COMPRESS_NONE;
+    /* The same digest object.c takes, over the same bytes: the raw payload,
+     * with no type prefix. Dedup only works across the two write paths if
+     * this stays identical to what the loose writer would have produced. */
+    SHA256((const unsigned char *)data, len, out->hash);
+
+    if (len < 4096) return OK;
+    int bound = LZ4_compressBound((int)len);
+    comp_scratch_t *cs = comp_scratch();
+    if (!cs) return OK;                  /* stored uncompressed, still correct */
+    if (bound > cs->cap) {
+        uint8_t *nb = realloc(cs->buf, (size_t)bound);
+        if (!nb) return OK;
+        cs->buf = nb;
+        cs->cap = bound;
+    }
+    uint8_t *t_comp_buf = cs->buf;
+    int t_comp_cap = cs->cap;
+    int sample_len = (len > 65536) ? 65536 : (int)len;
+    int sc = LZ4_compress_default((const char *)data, (char *)t_comp_buf,
+                                  sample_len, t_comp_cap);
+    if (sc <= 0 || (double)sc / (double)sample_len > 0.98) return OK;
+    int csz = LZ4_compress_default((const char *)data, (char *)t_comp_buf,
+                                   (int)len, t_comp_cap);
+    if (csz <= 0 || (uint64_t)csz >= len) return OK;
+    uint8_t *copy = malloc((size_t)csz);
+    if (!copy) return OK;
+    memcpy(copy, t_comp_buf, (size_t)csz);
+    out->owned = copy;
+    out->payload = copy;
+    out->payload_len = (uint64_t)csz;
+    out->compression = COMPRESS_LZ4;
+    return OK;
+}
+
+void pack_prepared_free(pack_prepared_t *p)
+{
+    if (!p) return;
+    free(p->owned);
+    p->owned = NULL;
+}
+
 status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
                          const void *data, size_t len,
                          uint8_t out_hash[OBJECT_HASH_SIZE],
@@ -4001,18 +4060,24 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
                          uint64_t *out_payload_size)
 {
     if (!w || (!data && len)) return set_error(ERR_INVALID, "pack_backup_add: null argument");
-    if (!object_type_known(type))
-        return set_error(ERR_INVALID, "pack_backup_add: " OBJECT_TYPE_UNKNOWN_FMT, type);
-    if (len > PACK_STREAM_THRESHOLD)
-        return set_error(ERR_TOO_LARGE,
-                         "pack_backup_add: %zu bytes exceeds the streaming threshold", len);
+    pack_prepared_t pp;
+    status_t st = pack_backup_prepare(type, data, len, &pp);
+    if (st != OK) return st;
+    st = pack_backup_add_prepared(w, &pp, out_is_new, out_phys_bytes);
+    memcpy(out_hash, pp.hash, OBJECT_HASH_SIZE);
+    if (out_payload_size) *out_payload_size = len;
+    pack_prepared_free(&pp);
+    return st;
+}
 
-    /* The same digest object.c takes, over the same bytes: the raw payload,
-     * with no type prefix. Dedup only works across the two write paths if
-     * this stays identical to what the loose writer would have produced. */
-    SHA256((const unsigned char *)data, len, out_hash);
+status_t pack_backup_add_prepared(pack_backup_writer_t *w, const pack_prepared_t *pp,
+                                  int *out_is_new, uint64_t *out_phys_bytes)
+{
+    if (!w || !pp) return set_error(ERR_INVALID, "pack_backup_add_prepared: null argument");
+    const uint8_t *out_hash = pp->hash;
+    uint8_t type = pp->type;
+    size_t len = pp->len;
     if (out_is_new)        *out_is_new = 0;
-    if (out_payload_size)  *out_payload_size = len;
     if (out_phys_bytes)    *out_phys_bytes = 0;
 
     /*
@@ -4032,17 +4097,9 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
     status_t st = pb_ensure_open(w);
     if (st != OK) return st;
 
-    const uint8_t *payload = NULL;
-    uint64_t payload_len = 0;
-    uint8_t compression = COMPRESS_NONE;
-    uint8_t *owned = NULL;
-    pb_compress(&w->pw, data, (uint64_t)len, &payload, &payload_len,
-                &compression, &owned);
-
     uint32_t slot = w->pw.packed;
     st = pw_emit(&w->pw, NULL, out_hash, type, (uint64_t)len,
-                 payload, payload_len, compression);
-    free(owned);
+                 pp->payload, pp->payload_len, pp->compression);
     if (st != OK) return st;
 
     /* Keep the set no more than half full, so probing stays short. */

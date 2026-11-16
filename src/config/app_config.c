@@ -33,6 +33,18 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
     config_check_int_range(chk, "jobs.max_parallel", 1, APP_MAX_PARALLEL_JOBS);
     config_check_int_range(chk, "backup.store_workers", 0, APP_MAX_STORE_WORKERS);
 
+    /* The floor has its own message: "not between 16 and ..." would not say
+     * why a smaller budget cannot work. */
+    int rb = config_get_int(cfg, "jobs.read_budget_mb", 256);
+    if (rb < APP_MIN_READ_BUDGET_MB)
+        config_check_fail(chk, "jobs.read_budget_mb",
+                          "'%d' MiB is under %d MiB, the largest object a "
+                          "repository holds; no object that size could ever be "
+                          "read", rb, APP_MIN_READ_BUDGET_MB);
+    else
+        config_check_int_range(chk, "jobs.read_budget_mb", APP_MIN_READ_BUDGET_MB,
+                               APP_MAX_READ_BUDGET_MB);
+
     static const char *const retention[] = {
         "retention.keep_snaps", "retention.keep_daily", "retention.keep_weekly",
         "retention.keep_monthly", "retention.keep_yearly", NULL

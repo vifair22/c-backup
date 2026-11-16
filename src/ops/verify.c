@@ -3,6 +3,7 @@
 #include "verify.h"
 
 #include "chunklist.h"
+#include "read_budget.h"
 #include "object.h"
 #include "pack.h"
 #include "parity.h"
@@ -256,11 +257,14 @@ static status_t read_whole_object(store_t *store, const uint8_t hash[OBJECT_HASH
                                   uint64_t *out_bytes)
 {
 
+    /* One object in flight, held to the daemon's read budget. */
+    uint64_t taken = read_budget_acquire(size ? size : 1);
     if (size <= VERIFY_INMEM_MAX) {
         void  *data = NULL;
         size_t len  = 0;
         status_t st = object_load(store, hash, &data, &len, NULL);
         free(data);
+        if (st != ERR_TOO_LARGE) read_budget_release(taken);
         if (st == OK && out_bytes) *out_bytes = (uint64_t)len;
         /* Anything object_load refuses on size grounds falls through to the
          * stream path rather than being called damaged. */
@@ -271,6 +275,7 @@ static status_t read_whole_object(store_t *store, const uint8_t hash[OBJECT_HASH
     uint64_t sz = 0;
     uint8_t  type = 0;
     status_t st = object_load_stream(store, hash, devnull, &sz, &type);
+    read_budget_release(taken);
     if (st == OK && out_bytes) *out_bytes = sz;
     return st;
 }

@@ -455,8 +455,11 @@ struct manifest_iter {
     uint32_t           n, idx;
     int                steal;       /* strings belong to the caller */
     int                any;         /* a fragment has been read */
-    uint16_t           last_len;    /* the previous fragment's last name */
-    char               last[UINT16_MAX + 1];
+    /* The previous fragment's last name, for the order check. A copy of
+     * its own: names are short, and a fixed 64 KiB here made every
+     * iterator a 64 KiB allocation. */
+    uint16_t           last_len, last_cap;
+    char              *last;
 };
 
 static void free_entry_strings(const manifest_entry_t *e);
@@ -530,6 +533,12 @@ static status_t take_fragment(manifest_iter_t *it, const chunklist_item_t *x)
         return set_error(ERR_CORRUPT, "tree fragment %s is out of order", hex);
     }
     const manifest_entry_t *l = &it->ents[it->n - 1];
+    if (l->name_len > it->last_cap || !it->last) {
+        char *nl = realloc(it->last, (size_t)l->name_len + 1);
+        if (!nl) { drop_fragment(it); return set_error(ERR_NOMEM, "manifest: name copy"); }
+        it->last = nl;
+        it->last_cap = l->name_len;
+    }
     memcpy(it->last, l->name, l->name_len);
     it->last_len = l->name_len;
     it->any = 1;
@@ -624,6 +633,7 @@ void manifest_iter_close(manifest_iter_t *it)
     if (!it) return;
     drop_fragment(it);
     chunklist_iter_close(it->cl);
+    free(it->last);
     free(it);
 }
 

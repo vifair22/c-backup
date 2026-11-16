@@ -180,12 +180,13 @@ zero new objects. That test is the canary for the entire scheme.
 
 ## Format 3: content-defined chunking
 
-Status: the chunker, the chunk-list object and the fragmented directory
-format are built and tested (`src/store/cdc.c`, `src/store/chunklist.c`,
-`src/store/manifest.c`; `tests/test_cdc.c`, `tests/test_manifest_tree.c`).
-Wiring them into backup, restore, gc, verify, replicate, reindex, grep and
-preview lands with the rest of format 3. Where this section and the format 2
-text above disagree, this section is format 3.
+Status: built and wired (`src/store/cdc.c`, `src/store/chunklist.c`,
+`src/store/manifest.c`; backup, restore, gc, verify, replicate, reindex,
+grep and preview; `tests/test_cdc.c`, `tests/test_cdc_backup.c`,
+`tests/test_manifest_tree.c`). Where this section and the format 2 text
+above disagree, this section is format 3. The loose-object, pack-pass,
+frame-codec and sparse-object text above describes code that format 3 no
+longer reaches from a backup and that the format 3 core removes.
 
 ### What changes and why
 
@@ -463,6 +464,28 @@ It also makes OWN-30's 64-bit parity sizes unnecessary for objects (a
 16 MiB payload's parity is about 1.1 MiB), though they cost nothing to keep
 for packs.
 
+### Read budget
+
+One-shot AEAD means a reader holds a whole object until its tag verifies.
+Every job reads, and a backup runs a worker pool, so the daemon caps object
+buffers in flight with one counting semaphore in bytes
+(`src/common/read_budget.h`, `jobs.read_budget_mb`, default 256 MiB, at
+least 16 MiB). Restore, grep, preview, verify, replicate and the backup's
+chunk jobs take an object's size before loading it and give it back when the
+buffer is freed; a request larger than the budget is clamped to all of it.
+
+No thread ever waits for a slot while holding one: with a budget of one
+object, two threads each holding one and waiting for another would deadlock.
+Every reader is flat - a chunk list or tree fragment is loaded under the
+budget and released at once, its parsed form kept as a bounded index (at
+most nine lists per walk), before any chunk beneath it is acquired; a
+backup's reading thread hands each chunk's slot to the worker that stores
+it; re-chunking accounts the source chunk, not the copies cut from it. The
+module enforces this rather than trusting it: a nested acquire does not
+wait, and is counted, and the tests assert the count stays at zero, with
+restore, verify, grep, replicate and a pooled backup all running at once on
+16 MiB (`tests/test_read_budget.c`).
+
 ### Encryption
 
 Content addressing and the keyed table, together:
@@ -475,12 +498,12 @@ Content addressing and the keyed table, together:
   any encrypted store leaks: entry sizes (approximately chunk sizes, since
   compression is per chunk), counts and access patterns. Tree fragment cuts
   use the same keyed table through `cdc_name_hash`.
-- **Replication with re-encryption** moves objects under their existing
-  names into a repository with another key. The chunks keep the source's
-  boundaries; content written into the replica later would be cut with the
-  replica's own table and so not deduplicate against them. Correctness is
-  unaffected (a list is self-describing). Replicas are read targets, so
-  this costs nothing in practice.
+- **Replication with re-encryption** re-chunks: the target's table is keyed
+  from its own key, so its content is cut again with it and its trees are
+  rebuilt, and its snapshot roots differ from the source's (see
+  "Replication across keys and constants" below). Its chunk boundaries are
+  therefore never the source's, which is also what keeps the source's
+  boundaries from being revealed by a replica under another key.
 
 **AEAD reconciliation (DEC-2): drop segmented AEAD.** Segmentation answered
 two problems with one large object: ChaCha20-Poly1305's per-message limit
@@ -504,45 +527,87 @@ Recommended for format 3 instead:
 
 ### Backup write path
 
-1. The backup thread (or a store worker) opens a file the cache cannot
-   vouch for and walks its data spans. A read window of `max + 1 MiB` feeds
-   the scanner; at each cut the chunk is copied out and handed to the chunk
-   workers. Files under `min` skip the machinery and go to the backup pack
-   as now.
-2. Each worker, for one chunk: name it (SHA-256 of `type || payload`),
-   check the repository and the in-flight set, run the 64 KiB probe and
-   LZ4 if it says so, encrypt, CRC and RS parity, then append the prepared
-   entry to the backup's pack under the pack writer's lock. The lock covers
-   the write and the bookkeeping only; all CPU work is outside it.
+1. Every regular file the cache cannot vouch for goes through
+   `cdc_store_fd`: its data spans are walked with `SEEK_DATA`/`SEEK_HOLE`
+   and read straight into the buffer of the chunk being cut (8 MiB,
+   recycled), 256 KiB a read; at a cut only the read-ahead past it is
+   copied. One chunk and no holes is the file; otherwise a list.
+2. A chunk's CPU work, `pack_backup_prepare` (name, 64 KiB probe, LZ4), runs
+   on a chunk worker for a file over 16 MiB and on the backup thread
+   otherwise. The prepared entry is appended under the backup sink's lock by
+   `pack_backup_add_prepared` (dedup against the repository and the open
+   pack, encryption, parity, write). Chunks in flight per file are capped at
+   three per worker and `8 * max` bytes.
 3. Results are taken back in submission order and appended to the file's
    list builder, which stores sub-lists and the root through the same sink.
-   Order, not completion, decides the list, so it is identical for any
-   worker count. In-flight chunk bytes per file are bounded (default
-   `8 * max`), as is the window: memory never depends on the file's size.
-4. Packs seal at 256 MiB as now and every pack is sealed and announced
-   before the snapshot record is written, so a snapshot never names an
-   unresolvable chunk. A staged chunk counts as present for the rest of the
-   run (`pack_backup_holds`).
-5. Index rows: one per new object, chunks and lists included, recorded as
-   staged exactly as backup-pack objects are now. The file cache maps a
-   path to its content hash, which is the list's when there is one.
+   Order, not completion, decides the list, so the snapshot is identical for
+   any worker count (`test_cdc_backup`).
+4. Index rows. Every object the sink meets - new or already present, so an
+   index that lost a chunk's row gets it back - queues a pending row. A row
+   must exist before its pack commits: the commit turns staged rows into
+   packed ones, and a row written after it would stay staged, be dropped by
+   the next backup, and leave a chunk compaction reads as dead. The backup
+   thread writes the pending rows inside its batch once the file is stored;
+   the sink writes them in a transaction of its own just before it seals a
+   full pack.
+5. Sealing. The sink seals mid-file only when the open pack cannot take the
+   file, and the backup thread lets its batch go first, because sealing
+   begins a transaction and the write lock is not recursive. A file that
+   fits keeps the batch, so a backup nobody waits on commits no more often
+   than before (OWN-16). Smaller files are stored with the batch held inside
+   the loop's 16 MiB rollover headroom, as before.
+6. Directories: `manifest_store_tree` through the same sink, fragmenting
+   above 256 KiB serialised. The tree phase never seals, as before.
 
 Crash safety is the backup pack's, unchanged: staging in `tmp/`, install by
 rename, rows after install, sweep of staging and staged rows at the next
-start.
+start. Nothing is written loose and the pack pass finds nothing to do.
 
 ### Readers
 
 | Reader | Format 3 behaviour |
 |--------|--------------------|
 | restore | `content_restore_fd`: walk the leaves, `pwrite` each at its offset, `ftruncate` to `total_len`. Holes are never written. Every leaf is loaded whole and hash-checked before any of it is written |
-| grep | `content_stream`: leaves in order, holes as zeroes |
-| preview | `content_read_prefix`: only the leaves overlapping the prefix |
-| gc | marks through lists: `content_collect` visits a list once per run (a visited set, not a per-snapshot refcount walk), marking every sub-list and leaf; directories through `manifest_iter`'s object callback, fragments and tree lists included. A chunk referenced only from a list is live |
-| verify | unchanged per object (every chunk is a pack entry with parity); a reachability pass checks that every leaf of every list exists |
-| repair | unchanged: per pack entry, by its parity. Damage beyond parity fails the job per OWN-31 |
-| replicate | the closure of a snapshot is `content_collect` over every file plus `manifest_iter` objects over every directory; objects move as stored bytes, as now |
-| reindex | `pack_objects` from the packs as now; nodes from trees through `manifest_iter`. No chunk-membership table: the lists are in the repository and are read when needed |
+| grep | `content_stream`: leaves in order, each verified before it is scanned, holes as zeroes. Damage in a chunk a match could come from skips the file with nothing recorded; a search that has reached its hit cap stops without reading the rest, so damage past a verified match is verify's to report |
+| preview | `/objects/<hash>/content` on a list returns the start of its file (`content_read_prefix`), loading only the leaves that overlap it |
+| gc | marks through lists. Refcounts start at zero, so `UPDATE ... RETURNING refcount` says whether this run has reached a list before: its subtree is walked only the first time, with no visited set held. A chunk's count is the number of distinct lists naming it. Directory fragments and tree lists are marked through `manifest_iter`'s object callback. Content the index calls FILE but that is larger than an object can be is checked against the repository, since believing that row would sweep every chunk of the file |
+| verify | per object as before (every chunk is a pack entry with parity). Then every root list is walked: an object it names that does not exist is missing, and a list with a lost chunk beneath it is recorded as a finding of its own ("contains a lost chunk"), which is what maps the loss onto files and snapshots in the blast radius |
+| repair | per pack entry, by its parity. Damage beyond parity fails the job (OWN-31) |
+| replicate | copying (same chunking): objects move as stored bytes, bottom-up as trees always were - a list's leaves, then its sub-lists, then the list, a directory's fragments and lists before its root - so a list present at the target promises its chunks. Re-chunking (another key or other constants): see below |
+| reindex | `pack_objects` from the packs; directory objects typed as `manifest_iter` loads them; file lists found where a node's size and its object's payload size disagree (a single object's payload is the file), recorded with their real type, walked, and every sub-list and chunk recorded and counted as gc counts them |
+
+### Replication across keys and constants
+
+A target's chunk boundaries are a function of its constants and its key.
+Replicating into a repository under another key - re-encrypting, encrypted
+to plain, plain to encrypted - or with other constants, would leave it
+holding the source's chunks: cut where its own backups never cut, so they
+deduplicate against nothing it writes later, named by lists its own chunker
+cannot produce. So `replicate_run` compares the target's parameters
+(`target_cdc` on the sink) with the source's and, where they differ:
+
+- every file is reassembled from the source (`content_source_open`: the
+  source list's gaps are the spans, so holes stay holes) and cut again with
+  the target's gear and constants (`cdc_store_source`);
+- every tree is rebuilt with the new content hashes and fragmented with the
+  target's name hash; xattr and ACL blobs are re-put as plaintext;
+- objects go to the target as plaintext (`put_plain`), named, compressed,
+  encrypted under the target's key and parity-protected by the target's own
+  pack writer. Nothing travels as stored bytes, so there is no stored
+  re-encryption transform any more;
+- the snapshot record at the target names the rebuilt root, which is not
+  the source's. A later run asks for a snapshot by id and timestamp
+  (`has_snapshot_at`), since the target's root cannot be known without
+  rebuilding it; an id the target holds with another timestamp is the
+  target's own snapshot and fails the run rather than being overwritten.
+- Within a run, source directories already rebuilt are remembered (up to
+  2^20), so a second snapshot rebuilds only what changed. Across runs
+  nothing is remembered: re-encrypting replication is a migration, run once
+  into a fresh repository, and a later run re-reads the snapshots it adds.
+
+`tests/test_cdc_backup.c` replicates into a repository under another key,
+checks the root differs, reindexes the target and restores it byte for byte
+against the source tree; a second run sends nothing.
 
 ### Measured (unit level, tmpfs)
 

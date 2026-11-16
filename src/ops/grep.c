@@ -4,6 +4,7 @@
 #include "grep.h"
 
 #include "chunklist.h"
+#include "read_budget.h"
 #include "object.h"
 
 #include <cutils/log.h>
@@ -437,8 +438,9 @@ static int scan_object(grep_ctx_t *g, store_t *store,
     if (!is_list && size <= GREP_INMEM_MAX) {
         void  *data = NULL;
         size_t len  = 0;
+        uint64_t taken = 0;
         err_clear();
-        lst = object_load(store, hash, &data, &len, &type);
+        lst = object_load_budgeted(store, hash, &data, &len, &type, &taken);
         if (lst == OK && type == OBJECT_TYPE_CHUNKLIST) {
             /* A small sparse or multi-chunk file: what came back is the
              * list, not the content. Nothing was scanned yet. */
@@ -451,6 +453,7 @@ static int scan_object(grep_ctx_t *g, store_t *store,
             err_clear();
         }
         free(data);
+        read_budget_release(taken);
     }
 
     if (is_list) {

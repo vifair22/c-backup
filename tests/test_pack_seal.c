@@ -277,8 +277,10 @@ static void test_a_small_backup_seals_at_256_mib(void **state)
  * A pack past the seal, as an old backup or any replica writes one, through
  * every path that reads or rewrites packs.
  */
-#define BIG_ENTRIES  20      /* of 1 MiB: 20 MiB in one pack */
-#define BIG_N        ((size_t)MIB)
+#define BIG_ENTRIES  46      /* of 448 KiB: 20 MiB in one pack */
+/* Under the 512 KiB minimum chunk (format 3), so each file is one chunk and
+ * the backup finds it as the entry packed here. */
+#define BIG_N        ((size_t)448 << 10)
 #define BIG_DEAD     2       /* entries no snapshot names, for gc to drop */
 
 static void test_an_oversized_pack_verifies_restores_replicates_and_gcs(void **state)

@@ -154,6 +154,35 @@ static int64_t run_backup(void)
     return br.snapshot_id;
 }
 
+/*
+ * Make a source file's content one loose object and point its node rows at
+ * it. A format 3 backup writes nothing loose; the large-entry read, verify
+ * and repair paths these tests cover remain until large objects leave the
+ * format, and the pack pass and the stored writer are how such an entry is
+ * made from a loose one.
+ */
+static void make_loose(const char *name)
+{
+    char src[PATH_MAX];
+    snprintf(src, sizeof(src), "%s/%s", TEST_SRC, name);
+    int fd = open(src, O_RDONLY);
+    assert_true(fd >= 0);
+    struct stat sb;
+    assert_int_equal(fstat(fd, &sb), 0);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    object_write_t w;
+    assert_int_equal(object_store_file_loose(store, fd, (uint64_t)sb.st_size, 0,
+                                             hash, &w), OK);
+    close(fd);
+    assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                           w.phys_bytes, w.payload_size), OK);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE nodes SET content_hash = ? WHERE name = ?",
+        (const char *[]){ hex, name, NULL }, NULL), 0);
+}
+
 static void hash_of(const char *name, char *hex_out, uint8_t hash[OBJECT_HASH_SIZE])
 {
     db_result_t *r = NULL;
@@ -216,6 +245,7 @@ static void make_frame_entry(const char *name, uint8_t hash[OBJECT_HASH_SIZE],
     snprintf(path, sizeof(path), "%s/%s", TEST_SRC, name);
     write_semicompressible(path, FRAME_BYTES, 0x5EEDF00Du);
     *snap = run_backup();
+    make_loose(name);
     assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
     hash_of(name, hex, hash);
     entry_at(hash, at);
@@ -236,6 +266,7 @@ static void make_stored_entry(const char *name, uint8_t hash[OBJECT_HASH_SIZE],
     snprintf(path, sizeof(path), "%s/%s", TEST_SRC, name);
     write_incompressible(path, STORED_BYTES, 0xC0FFEEu);
     *snap = run_backup();
+    make_loose(name);
     hash_of(name, hex, hash);
 
     object_stored_info_t info;

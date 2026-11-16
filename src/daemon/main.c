@@ -32,6 +32,7 @@
 #include "job_manager.h"
 #include "lock.h"
 #include "repo_purge.h"
+#include "read_budget.h"
 #include "routes.h"
 #include "scheduler.h"
 #include "sd_notify.h"
@@ -211,6 +212,16 @@ int main(int argc, char *argv[])
     if (!auth_is_setup(db))
         log_warn("no admin password set: TCP serves only the health probes "
                  "until one is, with 'c-backup auth setup' on this host");
+
+    /* Before any job can read an object. app_config_check has held the
+     * setting to its range already. */
+    int rb_mb = config_get_int(cfg, "jobs.read_budget_mb", 256);
+    if (read_budget_init((uint64_t)rb_mb * 1024 * 1024) != OK) {
+        log_error("%s", err_msg());
+        repo_purge_stop();
+        appguard_shutdown(guard);
+        return 1;
+    }
 
     job_manager_t *jm = NULL;
     int max_parallel = config_get_int(cfg, "jobs.max_parallel", 2);

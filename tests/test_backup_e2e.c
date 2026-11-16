@@ -744,24 +744,14 @@ static void test_readers_and_packer_stop_on_the_store_flag(void **state)
 {
     (void)state;
     write_big(TEST_DIR "/big.bin", 24);
-    static const char *paths[] = { TEST_DIR "/big.bin" };
-    backup_opts_t o = basic_opts();
-    o.paths = paths;
-    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
-
-    db_result_t *r = NULL;
-    char sql[128];
-    snprintf(sql, sizeof(sql), "SELECT hash FROM objects WHERE orig_size = %u", 24u << 20);
-    assert_int_equal(db_execute(db, sql, NULL, &r), 0);
-    assert_non_null(r);
-    assert_int_equal(r->nrows, 1);
+    /* A format 3 backup writes nothing loose, so the loose object these
+     * readers stop inside is made through the store directly. */
+    int bfd = open(TEST_DIR "/big.bin", O_RDONLY);
+    assert_true(bfd >= 0);
     uint8_t hash[OBJECT_HASH_SIZE];
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
-        unsigned v = 0;
-        assert_int_equal(sscanf(r->rows[0][0] + i * 2, "%2x", &v), 1);
-        hash[i] = (uint8_t)v;
-    }
-    db_result_free(r);
+    object_write_t bw;
+    assert_int_equal(object_store_file_info(store, bfd, 24u << 20, hash, &bw), OK);
+    close(bfd);
 
     char hex[OBJECT_HASH_SIZE * 2 + 1], loose[PATH_MAX];
     object_hash_to_hex(hash, hex);
@@ -797,60 +787,65 @@ static void test_readers_and_packer_stop_on_the_store_flag(void **state)
 }
 
 /*
- * B060: an object an interrupted run left loose, with no index row, is
- * recorded at its real size when the next run meets it.
+ * B060, format 3: an object the repository holds and the index has no row
+ * for gets its row back when the next run meets it.
  *
- * A backup killed after a large object was installed but before the batch
- * holding its row committed leaves exactly that. The next run deduplicated
- * against the file, the writer reported a physical size of 0 for an object
- * it had not written, and the row went in as zero bytes - a 2,291,249,496
- * byte object, in the report that found it, so summary under-reported by
- * that much.
+ * The whole-file form of this - a large object an interrupted run left
+ * loose - cannot arise any more, since backup writes nothing loose. The
+ * same gap can for a chunk: dedup finds it present and stores nothing, and
+ * a run that recorded only new objects would leave it with no row, which
+ * compaction reads as dead. So every chunk a run meets is recorded.
  */
 static void test_object_left_by_an_interrupted_run_keeps_its_size(void **state)
 {
     (void)state;
     write_big(TEST_DIR "/big.bin", 20);
-
-    /* What the killed run left: the loose object, and no row. */
-    int fd = open(TEST_DIR "/big.bin", O_RDONLY);
-    assert_true(fd >= 0);
-    uint8_t hash[OBJECT_HASH_SIZE];
-    object_write_t w;
-    assert_int_equal(object_store_file_info(store, fd, 20u << 20, hash, &w), OK);
-    close(fd);
-    assert_int_equal(w.is_new, 1);
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    object_hash_to_hex(hash, hex);
-    char loose[PATH_MAX];
-    snprintf(loose, sizeof(loose), TEST_REPO "/objects/%.2s/%s", hex, hex + 2);
-    struct stat sb;
-    assert_int_equal(stat(loose, &sb), 0);
-    assert_int_equal(scalar("SELECT COUNT(*) FROM objects", NULL), 0);
-
     static const char *paths[] = { TEST_DIR "/big.bin" };
     backup_opts_t o = basic_opts();
     o.paths = paths;
     backup_result_t res;
     assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
 
+    /* One chunk's row lost. */
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT hash FROM objects WHERE type = 1 ORDER BY hash LIMIT 1", NULL, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    snprintf(hex, sizeof(hex), "%s", r->rows[0][0]);
+    db_result_free(r);
     char sql[256];
-    snprintf(sql, sizeof(sql),
-             "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
-    assert_int_equal(scalar(sql, NULL), (int)sb.st_size);
-
-    /* A row an earlier build already wrote as zero is repaired by the next
-     * run that meets the object, and only such a row. */
-    snprintf(sql, sizeof(sql), "UPDATE objects SET phys_size = 0 WHERE hash = '%s'", hex);
+    snprintf(sql, sizeof(sql), "DELETE FROM objects WHERE hash = '%s'", hex);
     assert_int_equal(db_execute_non_query(db, sql, NULL, NULL), 0);
+
+    /* The file changes at its end, so the next run reads it again and
+     * meets every earlier chunk as already present. */
+    FILE *f = fopen(TEST_DIR "/big.bin", "ab");
+    assert_non_null(f);
+    fputs("one more line at the end\n", f);
+    fclose(f);
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM objects WHERE hash = '%s'", hex);
+    assert_int_equal(scalar(sql, NULL), 1);
+
+    /* A row an earlier build wrote as zero bytes is repaired by the next
+     * writer that offers a real size, and only such a row. */
+    int fd = open(TEST_DIR "/big.bin", O_RDONLY);
+    assert_true(fd >= 0);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    object_write_t w;
+    assert_int_equal(object_store_file_info(store, fd, 1u << 20, hash, &w), OK);
+    close(fd);
+    object_hash_to_hex(hash, hex);
     assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
-                                           (uint64_t)sb.st_size, 20u << 20), OK);
-    snprintf(sql, sizeof(sql),
-             "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
-    assert_int_equal(scalar(sql, NULL), (int)sb.st_size);
+                                           0, 1u << 20), OK);
     assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
-                                           1, 20u << 20), OK);
-    assert_int_equal(scalar(sql, NULL), (int)sb.st_size);
+                                           w.phys_bytes, 1u << 20), OK);
+    snprintf(sql, sizeof(sql), "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
+    assert_int_equal(scalar(sql, NULL), (int)w.phys_bytes);
+    assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                           1, 1u << 20), OK);
+    assert_int_equal(scalar(sql, NULL), (int)w.phys_bytes);
 }
 
 /*
@@ -1002,12 +997,12 @@ static void test_bytes_move_inside_one_large_file(void **state)
     store_get_io_progress(store, &fn, &fctx);
     assert_null(fn);
 
-    /* Restored from the loose object, then again once it is packed. */
+    /* Restored from its chunks, which the backup packed as it went (format
+     * 3): nothing is left for a pack pass to move. */
     restore_and_watch(TEST_DIR "/out1", size);
     uint32_t packed = 0;
     assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_true(packed >= 1);
-    restore_and_watch(TEST_DIR "/out2", size);
+    assert_int_equal(packed, 0);
 }
 
 /* The sparse writer has its own read loop, so it is checked on its own. */

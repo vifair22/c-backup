@@ -633,14 +633,15 @@ static void test_unknown_loose_type_is_refused(void **state)
 }
 
 /* Writers refuse the types readers refuse, so nothing is ever stored that
- * cannot be opened. fuzz_roundtrip found object_store writing type 6 and
+ * cannot be opened. fuzz_roundtrip found object_store writing type 6 (a
+ * chunk list since format 3; 7 stands in for it now) and
  * every read of it then failing. */
 static void test_writers_refuse_unknown_types(void **state)
 {
     (void)state;
     uint8_t hash[OBJECT_HASH_SIZE];
     const char body[] = "a payload of a type nobody reads";
-    const uint8_t bad_types[] = { 0, 6, 7, 9, 255 };
+    const uint8_t bad_types[] = { 0, 7, 9, 255 };
     for (size_t i = 0; i < sizeof(bad_types); i++) {
         err_clear();
         assert_int_equal(object_store(store, bad_types[i], body, sizeof(body) - 1, hash),

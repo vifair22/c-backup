@@ -626,10 +626,11 @@ static void test_same_repository_on_one_or_many_workers(void **state)
 
     char *da = repo_digest(&a), *db_ = repo_digest(&b);
     assert_string_equal(da, db_);
-    /* Six large objects loose: the twins are one. */
+    /* Nothing loose (format 3): every large file is chunks in packs, and
+     * the twins' chunks are one set. */
     size_t loose = 0;
     for (const char *c = da; (c = strstr(c, "/objects/")) != NULL; c++) loose++;
-    assert_int_equal(loose, 6);
+    assert_int_equal(loose, 0);
     free(da);
     free(db_);
 
@@ -841,11 +842,11 @@ static uint64_t loose_size(uint64_t p)
  * repository, by what it was: checked against the files on disk, not
  * against the counters' own arithmetic.
  *
- * The source has small files (packed during the backup), an incompressible
- * large file (left loose, the pack pass probes it and moves on), a
- * compressible one (loose, then rewritten into a pack by the pack pass and
- * its loose copy deleted) and two identical large files (the second staged
- * in full and then dropped).
+ * Format 3: small files, an incompressible large file, a compressible one
+ * and two identical large files all go into packs as they are read, each
+ * chunk compressed or not by its own probe, and the second twin's chunks
+ * are found present before anything of them is written. Nothing is loose,
+ * nothing is staged and dropped, and the pack pass finds nothing to do.
  */
 static void test_write_counters_match_the_disk(void **state)
 {
@@ -875,26 +876,24 @@ static void test_write_counters_match_the_disk(void **state)
     for (int i = 0; i < STORE_WR__COUNT; i++) sum += w[i];
     assert_int_equal(r.written_total, sum);
 
-    /* Three large objects written loose: random, text and one twin. */
+    /* Nothing loose, nothing discarded, nothing spilled, no sweep. */
     uint64_t p20 = 20ull * MIB, p18 = 18ull * MIB;
-    assert_int_equal(w[STORE_WR_LOOSE], (64 + p20) * 2 + 64 + p18);
-    assert_int_equal(w[STORE_WR_LOOSE] + w[STORE_WR_LOOSE_PARITY],
-                     loose_size(p20) * 2 + loose_size(p18));
-    /* The second twin was staged in full, then found present. */
-    assert_int_equal(w[STORE_WR_LOOSE_DISCARD], 64 + p18);
+    assert_int_equal(w[STORE_WR_LOOSE], 0);
+    assert_int_equal(w[STORE_WR_LOOSE_PARITY], 0);
+    assert_int_equal(w[STORE_WR_LOOSE_DISCARD], 0);
     assert_int_equal(w[STORE_WR_PARITY_SPILL], 0);
-
-    /* What is left loose is the random file and the twin; the text file's
-     * loose copy went when the pack pass packed it. */
-    assert_int_equal(r.sweep_packed, 1);
-    assert_int_equal(tree_bytes(&e, "objects"), loose_size(p20) + loose_size(p18));
+    assert_int_equal(r.sweep_packed, 0);
+    assert_int_equal(r.written_sweep, 0);
+    assert_int_equal(tree_bytes(&e, "objects"), 0);
 
     /* Every pack is still on disk after a first backup, so the pack
      * counters are exactly the size of packs/. */
     assert_int_equal(w[STORE_WR_PACK] + w[STORE_WR_PACK_PARITY], tree_bytes(&e, "packs"));
-    /* The pack pass wrote one pack, and the text compressed in it. */
-    assert_true(r.written_sweep > 0);
-    assert_true(r.written_sweep < p20 / 4);
+    /* Written once: the random file and one twin at about their size with
+     * parity, the text compressed, the second twin not at all. */
+    uint64_t packed = w[STORE_WR_PACK] + w[STORE_WR_PACK_PARITY];
+    assert_true(packed > p20 + p18);
+    assert_true(packed < (p20 + p18) * 107 / 100 + p20 / 4);
 
     /* A second backup of the same tree writes nothing at all. */
     backup_result_t r2;

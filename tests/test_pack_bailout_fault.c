@@ -361,6 +361,34 @@ static int64_t backup(int pack_after, backup_result_t *r)
     return r->snapshot_id;
 }
 
+/*
+ * Make a source file's content one loose object and point its node rows at
+ * it. A format 3 backup writes nothing loose - every file is chunks in
+ * packs - so the loose objects the pack pass works on are made here; the
+ * pass, and its bail-out, remain until loose objects leave the format.
+ */
+static void make_loose(const char *name)
+{
+    char src[PATH_MAX];
+    snprintf(src, sizeof(src), TEST_SRC "/%s", name);
+    int fd = open(src, O_RDONLY);
+    assert_true(fd >= 0);
+    struct stat sb;
+    assert_int_equal(fstat(fd, &sb), 0);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    object_write_t w;
+    assert_int_equal(object_store_file_loose(store, fd, (uint64_t)sb.st_size, 0,
+                                             hash, &w), OK);
+    close(fd);
+    assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                           w.phys_bytes, w.payload_size), OK);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE nodes SET content_hash = ? WHERE name = ?",
+        (const char *[]){ hex, name, NULL }, NULL), 0);
+}
+
 /* A pack run's report and what it wrote, by category. */
 static void pack_run(pack_report_t *rep, store_write_stats_t *w, uint64_t *total)
 {
@@ -403,16 +431,18 @@ static void header_in_front_of_media(int repetitive)
     fclose(f);
 
     backup_result_t r;
-    int64_t snap = backup(1, &r);
+    int64_t snap = backup(0, &r);
+    make_loose("movie.bin");
 
-    assert_int_equal(r.sweep_packed, 0);
+    pack_report_t rep;
+    store_write_stats_t w;
+    uint64_t total = 0;
+    pack_run(&rep, &w, &total);
+    assert_int_equal(rep.packed, 0);
     /* The pack pass wrote nothing but the header it truncated off again. */
-    assert_int_equal(r.written.bytes[STORE_WR_PACK_ABANDONED],
-                     sizeof(pack_dat_entry_hdr_t));
-    assert_int_equal(r.written_sweep, sizeof(pack_dat_entry_hdr_t));
-    /* It was written once, loose, by the backup. */
+    assert_int_equal(w.bytes[STORE_WR_PACK_ABANDONED], sizeof(pack_dat_entry_hdr_t));
+    assert_int_equal(total, sizeof(pack_dat_entry_hdr_t));
     uint64_t p = 65 * MIB;
-    assert_int_equal(r.written.bytes[STORE_WR_LOOSE], sizeof(object_header_t) + p);
 
     loose_t l[8];
     assert_int_equal(loose_list(l, 8), 1);
@@ -473,6 +503,10 @@ static void test_late_abandon_inside_a_shared_pack(void **state)
 
     backup_result_t r;
     int64_t snap = backup(0, &r);
+    make_loose("late.bin");
+    make_loose("text1.txt");
+    make_loose("text2.txt");
+    make_loose("text3.txt");
 
     loose_t l[8];
     assert_int_equal(loose_list(l, 8), 4);
@@ -538,6 +572,9 @@ static void test_killed_after_an_abandon(void **state)
 
     backup_result_t r;
     int64_t snap = backup(0, &r);
+    make_loose("late.bin");
+    make_loose("text1.txt");
+    make_loose("text2.txt");
     loose_t l[8];
     assert_int_equal(loose_list(l, 8), 3);
     const loose_t *late = loose_by_size(l, 3, LATE_BYTES);

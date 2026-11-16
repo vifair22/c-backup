@@ -6,6 +6,7 @@
 
 #include "object.h"
 #include "chunklist.h"
+#include "read_budget.h"
 #include "sparse_restore.h"
 #include "util.h"
 
@@ -245,7 +246,8 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
     void   *data = NULL;
     size_t  len  = 0;
     uint8_t type = 0;
-    if (object_load(store, hash, &data, &len, &type) != OK) {
+    uint64_t taken = 0;
+    if (object_load_budgeted(store, hash, &data, &len, &type, &taken) != OK) {
         log_warn("restore: cannot load xattrs for %s: %s", path, err_msg());
         err_clear();
         return;
@@ -254,6 +256,7 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
         log_warn("restore: xattrs for %s name a type %u object, not an xattr "
                  "blob; not applied", path, type);
         free(data);
+    read_budget_release(taken);
         return;
     }
 
@@ -263,6 +266,7 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
         err_clear();
     }
     free(data);
+    read_budget_release(taken);
 }
 
 /*
@@ -304,7 +308,8 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
     void   *data = NULL;
     size_t  len  = 0;
     uint8_t type = 0;
-    if (object_load(store, hash, &data, &len, &type) != OK) {
+    uint64_t taken = 0;
+    if (object_load_budgeted(store, hash, &data, &len, &type, &taken) != OK) {
         log_warn("restore: cannot load ACL for %s: %s", path, err_msg());
         err_clear();
         return;
@@ -313,6 +318,7 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
         log_warn("restore: ACLs for %s name a type %u object, not an ACL "
                  "blob; not applied", path, type);
         free(data);
+    read_budget_release(taken);
         return;
     }
 
@@ -322,6 +328,7 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
         err_clear();
     }
     free(data);
+    read_budget_release(taken);
 }
 
 /* Something to say when a failure arrives with no message attached. */

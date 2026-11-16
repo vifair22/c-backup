@@ -539,8 +539,9 @@ static void test_stored_writer_refuses_what_no_reader_opens(void **state)
     err_clear();
 
     /* An object type every reader refuses (OWN-39); 0, 6 and 9 all came
-     * through before, and fuzz_pack_stored found the first. */
-    const uint8_t bad_types[] = { 0, 6, 9 };
+     * through before (6 is a chunk list now), and fuzz_pack_stored found
+     * the first. */
+    const uint8_t bad_types[] = { 0, 7, 9 };
     for (size_t i = 0; i < sizeof(bad_types); i++) {
         err_clear();
         assert_int_not_equal(pack_stored_add(w, hash, bad_types[i], COMPRESS_NONE,

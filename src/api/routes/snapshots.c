@@ -1087,7 +1087,7 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
              "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
              "\"packs_deleted\":%u,\"tmp_files_removed\":%u,"
-             "\"tmp_bytes_removed\":%llu",
+             "\"tmp_bytes_removed\":%llu,\"content_missing\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
              (unsigned long long)gr->swept,
@@ -1096,7 +1096,8 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              (unsigned long long)gr->pack_entries_dropped,
              gr->packs_rewritten, gr->packs_deleted,
              gr->tmp_files_removed,
-             (unsigned long long)gr->tmp_bytes_removed);
+             (unsigned long long)gr->tmp_bytes_removed,
+             (unsigned long long)gr->content_missing);
     char *full = with_damaged(js, "pack_entries_damaged", gr->pack_entries_damaged,
                               gr->damaged_listed, gc_hash_at, NULL, gr);
     if (full) {

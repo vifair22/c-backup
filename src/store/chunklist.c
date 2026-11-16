@@ -3,6 +3,7 @@
 
 #include "chunklist.h"
 #include "object.h"
+#include "read_budget.h"
 #include "util.h"
 
 #include <errno.h>
@@ -349,10 +350,37 @@ obj_sink_t obj_sink_store(store_t *store)
     return s;
 }
 
+status_t object_load_budgeted(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                              void **out_data, size_t *out_len, uint8_t *out_type,
+                              uint64_t *out_taken)
+{
+    *out_taken = 0;
+    uint64_t size = 0;
+    uint8_t type = 0;
+    status_t st = object_get_info(store, hash, &size, &type);
+    if (st != OK) return st;
+    uint64_t taken = read_budget_acquire(size ? size : 1);
+    st = object_load(store, hash, out_data, out_len, out_type);
+    if (st != OK) { read_budget_release(taken); return st; }
+    *out_taken = taken;
+    return OK;
+}
+
+/*
+ * Lists and tree fragments: loaded under the budget and released at once.
+ * What the walker keeps afterwards is a parsed index - at most one list per
+ * level, CHUNKLIST_MAX_LEVEL + 1 of them, or one fragment - not a buffer in
+ * flight, and holding its slot while a chunk is loaded beneath it would be
+ * the nested acquisition read_budget.h forbids.
+ */
 static status_t store_loader(void *ctx, const uint8_t hash[OBJECT_HASH_SIZE],
                              void **out_data, size_t *out_len, uint8_t *out_type)
 {
-    return object_load((store_t *)ctx, hash, out_data, out_len, out_type);
+    uint64_t taken = 0;
+    status_t st = object_load_budgeted((store_t *)ctx, hash, out_data, out_len,
+                                       out_type, &taken);
+    if (st == OK) read_budget_release(taken);
+    return st;
 }
 
 obj_loader_t obj_loader_store(store_t *store)
@@ -529,16 +557,23 @@ void chunklist_iter_close(chunklist_iter_t *it)
 /* Content                                                             */
 /* ------------------------------------------------------------------ */
 
-/* Load one leaf and hold it to what its list entry promised. */
+/*
+ * Load one leaf under the read budget and hold it to what its list entry
+ * promised. The slot is the caller's until it frees the buffer: release with
+ * leaf_free. Every caller has released the previous leaf by then, and lists
+ * are loaded only between leaves, so a thread never waits holding a slot.
+ */
 static status_t load_leaf(store_t *store, const chunklist_item_t *x,
                           uint8_t want_type, void **out)
 {
     void *data = NULL;
     size_t len = 0;
     uint8_t type = 0;
+    uint64_t taken = read_budget_acquire(x->length);
     status_t st = object_load(store, x->hash, &data, &len, &type);
-    if (st != OK) return st;
+    if (st != OK) { read_budget_release(taken); return st; }
     if (type != want_type || (uint64_t)len != x->length) {
+        read_budget_release(taken);
         free(data);
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         object_hash_to_hex(x->hash, hex);
@@ -548,6 +583,13 @@ static status_t load_leaf(store_t *store, const chunklist_item_t *x,
     }
     *out = data;
     return OK;
+}
+
+static void leaf_free(void *data, uint64_t length)
+{
+    free(data);
+    read_budget_release(read_budget_total() && length > read_budget_total()
+                        ? read_budget_total() : length);
 }
 
 static status_t pwrite_full(int fd, const void *buf, size_t n, uint64_t off)
@@ -575,7 +617,9 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
     status_t st = object_get_info(store, hash, &size, &type);
     if (st != OK) return st;
     if (type == OBJECT_TYPE_FILE) {
+        uint64_t taken = read_budget_acquire(size ? size : 1);
         st = object_load_stream(store, hash, out_fd, &size, NULL);
+        read_budget_release(taken);
         if (st == OK && out_size) *out_size = size;
         return st;
     }
@@ -598,7 +642,7 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
         st = load_leaf(store, &x, OBJECT_TYPE_FILE, &data);
         if (st != OK) break;
         st = pwrite_full(out_fd, data, (size_t)x.length, x.offset);
-        free(data);
+        leaf_free(data, x.length);
         if (st != OK) break;
         store_io_progress(store, x.length);
     }
@@ -638,10 +682,12 @@ status_t content_stream(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
     if (type == OBJECT_TYPE_FILE) {
         void *data = NULL;
         size_t len = 0;
+        uint64_t taken = read_budget_acquire(size ? size : 1);
         st = object_load(store, hash, &data, &len, NULL);
-        if (st != OK) return st;
+        if (st != OK) { read_budget_release(taken); return st; }
         st = len ? emit(ctx, data, len) : OK;
         free(data);
+        read_budget_release(taken);
         if (st == OK && out_size) *out_size = len;
         return st;
     }
@@ -666,7 +712,7 @@ status_t content_stream(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
         st = load_leaf(store, &x, OBJECT_TYPE_FILE, &data);
         if (st != OK) break;
         st = emit(ctx, data, (size_t)x.length);
-        free(data);
+        leaf_free(data, x.length);
         if (st != OK) break;
         pos = x.offset + x.length;
     }
@@ -686,9 +732,14 @@ status_t content_read_prefix(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE
     uint8_t type = 0;
     status_t st = object_get_info(store, hash, &size, &type);
     if (st != OK) return st;
-    if (type == OBJECT_TYPE_FILE)
-        return object_load_prefix(store, hash, max_bytes, out_data, out_len,
-                                  out_full, NULL);
+    if (type == OBJECT_TYPE_FILE) {
+        uint64_t taken = read_budget_acquire(size < max_bytes ? (size ? size : 1)
+                                                              : (uint64_t)max_bytes);
+        st = object_load_prefix(store, hash, max_bytes, out_data, out_len,
+                                out_full, NULL);
+        read_budget_release(taken);
+        return st;
+    }
     if (type != OBJECT_TYPE_CHUNKLIST)
         return set_error(ERR_CORRUPT, "object is of type %u, not file "
                          "content", type);
@@ -714,7 +765,7 @@ status_t content_read_prefix(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE
         size_t n = (size_t)(want - x.offset) < x.length ? (size_t)(want - x.offset)
                                                          : (size_t)x.length;
         memcpy(buf + x.offset, data, n);
-        free(data);
+        leaf_free(data, x.length);
     }
     chunklist_iter_close(it);
     if (st != OK) { free(buf); return st; }
@@ -770,8 +821,9 @@ struct content_src {
     int       is_list;
     uint64_t  total;
 
-    /* FILE: the whole object, one span. */
+    /* FILE: the whole object, one span, and its budget slot. */
     uint8_t  *whole;
+    uint64_t  whole_taken;
     int       span_given;
 
     /* Lists: one walk looks ahead for spans, a second loads the data, so
@@ -788,6 +840,13 @@ static status_t cs_next_span(void *ctx, uint64_t *s, uint64_t *e, int *got)
 {
     content_src_t *cs = ctx;
     *got = 0;
+    /* The chunker asks for a span only once it has read the last one to
+     * its end, so the leaf in hand is spent. Let it go before looking
+     * ahead, which may load a sub-list: no slot is held while waiting. */
+    if (cs->leaf) {
+        leaf_free(cs->leaf, cs->leaf_len);
+        cs->leaf = NULL;
+    }
     if (!cs->is_list) {
         if (cs->span_given || cs->total == 0) return OK;
         cs->span_given = 1;
@@ -825,7 +884,7 @@ static status_t cs_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
     }
     while (n > 0) {
         if (!cs->leaf || off >= cs->leaf_off + cs->leaf_len) {
-            free(cs->leaf);
+            if (cs->leaf) leaf_free(cs->leaf, cs->leaf_len);
             cs->leaf = NULL;
             chunklist_item_t x;
             int done = 0;
@@ -865,9 +924,11 @@ status_t content_source_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE
     if (st == OK && type == OBJECT_TYPE_FILE) {
         void *data = NULL;
         size_t len = 0;
-        st = object_load(store, hash, &data, &len, &type);
+        st = object_load_budgeted(store, hash, &data, &len, &type, &cs->whole_taken);
         if (st == OK && type != OBJECT_TYPE_FILE) {
             free(data);
+            read_budget_release(cs->whole_taken);
+            cs->whole_taken = 0;
             st = set_error(ERR_CORRUPT, "object is of type %u, not file content", type);
         }
         if (st == OK) { cs->whole = data; cs->total = len; }
@@ -899,7 +960,8 @@ void content_source_close(content_src_t *cs)
 {
     if (!cs) return;
     free(cs->whole);
-    free(cs->leaf);
+    if (cs->whole_taken) read_budget_release(cs->whole_taken);
+    if (cs->leaf) leaf_free(cs->leaf, cs->leaf_len);
     chunklist_iter_close(cs->spans_it);
     chunklist_iter_close(cs->data_it);
     free(cs);

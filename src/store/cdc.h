@@ -148,6 +148,10 @@ typedef struct {
     size_t         inflight_max;
     /* Consulted between reads; set means stop with ERR_BUSY. May be NULL. */
     atomic_int    *cancel;
+    /* Cut chunks take their size from the read budget (read_budget.h)
+     * unless this is set: re-chunking reads from objects that already hold
+     * their slot, and taking a second would be nested acquisition. */
+    int            unbudgeted;
     /* Called on the calling thread with each read's byte count. */
     void         (*progress)(uint64_t bytes, void *ctx);
     void          *progress_ctx;

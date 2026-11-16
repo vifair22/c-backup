@@ -39,14 +39,15 @@
  * Encryption is fixed when a repository is created, so changing it - adding
  * it, dropping it, moving to a new key - means copying into a new
  * repository. A sink opened for re-encryption is that path: the target is
- * an existing repository with an identity and key of its own, and each
- * object is decrypted with the source key and encrypted under the target's
- * (or left plaintext, for an unencrypted target) on its way across.
- * Compression is untouched, and so are hashes: they are of the plaintext,
- * so the object graph, the tree hashes and every dedup decision carry over
- * unchanged. This is deliberately not the untrusted-target mode: the
- * process doing it holds both keys, which is why it is a separate opening
- * rather than a flag a replica could be talked into.
+ * an existing repository with an identity and key of its own. Its chunk
+ * boundaries are keyed from its key (format 3), so its content cannot be
+ * the source's chunks: every file is reassembled from the source and cut
+ * again with the target's parameters, every tree is rebuilt, and objects
+ * are written from plaintext under the target's key (see RE-CHUNKING on
+ * the vtable). The snapshot's root at the target is therefore not the
+ * source's. This is deliberately not the untrusted-target mode: the process
+ * doing it holds both keys, which is why it is a separate opening rather
+ * than a flag a replica could be talked into.
  *
  * WHAT IS ASKED FOR
  *

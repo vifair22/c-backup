@@ -1684,26 +1684,39 @@ static int count_partials(const char *dir)
     return n;
 }
 
-/* The content hash a file node in the newest snapshot names, as hex. */
-static void node_hash_hex(const char *name, char out[OBJECT_HASH_SIZE * 2 + 1])
+/*
+ * Make a file's content one loose object and point its node rows at it.
+ * A format 3 backup writes nothing loose (every file is chunks in packs);
+ * the loose read paths remain until loose objects leave the format, and
+ * these tests keep them covered. The object is the file's own bytes as a
+ * single FILE object, which is valid content, so the node restores the same.
+ */
+static void make_loose(const char *name, char hex_out[OBJECT_HASH_SIZE * 2 + 1])
 {
-    char repo[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    db_result_t *r = NULL;
-    assert_int_equal(db_execute(db,
-        "SELECT content_hash FROM nodes WHERE repo_id = ? AND name = ?"
-        " ORDER BY snap_id DESC LIMIT 1",
-        (const char *[]){ repo, name, NULL }, &r), 0);
-    assert_int_equal(r->nrows, 1);
-    snprintf(out, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[0][0]);
-    db_result_free(r);
+    char src[600];
+    snprintf(src, sizeof(src), "%s/%s", TEST_SRC, name);
+    int fd = open(src, O_RDONLY);
+    assert_true(fd >= 0);
+    struct stat sb;
+    assert_int_equal(fstat(fd, &sb), 0);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    object_write_t w;
+    assert_int_equal(object_store_file_loose(store, fd, (uint64_t)sb.st_size, 0,
+                                             hash, &w), OK);
+    close(fd);
+    assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                           w.phys_bytes, w.payload_size), OK);
+    object_hash_to_hex(hash, hex_out);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE nodes SET content_hash = ? WHERE name = ?",
+        (const char *[]){ hex_out, name, NULL }, NULL), 0);
 }
 
 static void loose_path_of(const char *hex, char *out, size_t outsz)
 {
     snprintf(out, outsz, "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
     struct stat sb;
-    assert_int_equal(stat(out, &sb), 0);   /* large objects stay loose */
+    assert_int_equal(stat(out, &sb), 0);   /* made loose by make_loose */
 }
 
 static void flip_file_byte(const char *path, off_t off)
@@ -1736,7 +1749,7 @@ static void test_encrypted_loose_flip_restores_and_verifies(void **state)
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
 
     char hex[OBJECT_HASH_SIZE * 2 + 1], path[600];
-    node_hash_hex("big.bin", hex);
+    make_loose("big.bin", hex);
     loose_path_of(hex, path, sizeof(path));
     object_header_t hdr;
     int fd = open(path, O_RDONLY);
@@ -1931,7 +1944,7 @@ static void test_unknown_object_type_is_refused_by_restore(void **state)
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
 
     char hex[OBJECT_HASH_SIZE * 2 + 1], path[600];
-    node_hash_hex("big.bin", hex);
+    make_loose("big.bin", hex);
     loose_path_of(hex, path, sizeof(path));
     int fd = open(path, O_RDWR);
     assert_true(fd >= 0);
