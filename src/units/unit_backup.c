@@ -12,11 +12,13 @@
 
 #include <cutils/log.h>
 
+#include <errno.h>
 #include <fnmatch.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define UNIT_ITEMS_MAX 64u
 
@@ -116,7 +118,7 @@ static status_t validate(const sp_unit_desc_t *d)
         const char *tp = it->tree_path;
         if (!path_clean(tp))
             return set_error(ERR_INVALID, "unit %s: item %s has no clean path", d->unit_id, it->id);
-        if (it->kind == SP_ITEM_BLOB || it->kind == SP_ITEM_BLOCK) {
+        if (it->kind == SP_ITEM_BLOB || it->kind == SP_ITEM_BLOCK || it->kind == SP_ITEM_STREAM) {
             if (strncmp(tp, unit_dir, sizeof(unit_dir) - 1) != 0 || tp[sizeof(unit_dir) - 1] == '\0' ||
                 strcmp(tp, RESERVED_UNIT_DIR "/unit.json") == 0)
                 return set_error(ERR_INVALID, "unit %s: item %s would land at %s, outside "
@@ -171,6 +173,64 @@ static status_t mem_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
     return OK;
 }
 
+/* A STREAM item's pipe as a chunker source: one span handed over in
+ * pieces as the bytes arrive, closed by an empty piece at EOF. Memory is
+ * the one buffer, whatever the dump's size. */
+#define PIPE_BUF_BYTES ((size_t)1024 * 1024)
+
+typedef struct {
+    int      fd;
+    uint8_t *buf;
+    uint64_t off, buf_off;
+    size_t   buf_len;
+    int      open, eof;
+} pipesrc_t;
+
+static status_t pipe_piece(void *ctx, uint64_t *s, uint64_t *e, int *got, int *more)
+{
+    pipesrc_t *p = ctx;
+    *got = 0;
+    if (p->eof) return OK;
+    size_t n = 0;
+    while (n < PIPE_BUF_BYTES) {
+        ssize_t r = read(p->fd, p->buf + n, PIPE_BUF_BYTES - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) return set_error_errno(ERR_IO, "unit backup: reading a stream");
+        if (r == 0) break;
+        n += (size_t)r;
+        if (n >= PIPE_BUF_BYTES / 4) break;     /* enough for one piece */
+    }
+    p->buf_off = p->off;
+    p->buf_len = n;
+    if (n > 0) {
+        *s = p->off;
+        *e = p->off + n;
+        *got = 1;
+        *more = 1;
+        p->open = 1;
+        p->off += n;
+        return OK;
+    }
+    p->eof = 1;
+    if (p->open) { *s = *e = p->off; *got = 1; *more = 0; }
+    return OK;
+}
+
+static status_t pipe_span(void *ctx, uint64_t *s, uint64_t *e, int *got)
+{
+    (void)ctx; (void)s; (void)e; (void)got;
+    return set_error(ERR_INVALID, "unit backup: a stream is read in pieces");
+}
+
+static status_t pipe_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
+{
+    pipesrc_t *p = ctx;
+    if (off < p->buf_off || off - p->buf_off + n > p->buf_len)
+        return set_error(ERR_IO, "unit backup: a stream read outside its piece");
+    memcpy(buf, p->buf + (off - p->buf_off), n);
+    return OK;
+}
+
 typedef struct {
     int               item;        /* index into desc->items; -1 for unit.json */
     void             *blob;
@@ -180,6 +240,8 @@ typedef struct {
     int               bs_open;
     block_source_t   *src;
     uint64_t          bytes_read;
+    pipesrc_t         pipe;
+    int               stream_open, stream_ok;
 } part_t;
 
 typedef struct {
@@ -246,6 +308,23 @@ static status_t build_unit_json(uctx_t *u)
         if (!(j->warnings[i] = strdup(u->info->warnings[i]))) return set_error(ERR_NOMEM, "unit.json");
         j->n_warnings++;
     }
+    size_t dropped = 0;
+    for (size_t p = 0; p < u->n_parts; p++) {
+        if (u->parts[p].item < 0) continue;
+        const sp_item_desc_t *it = &u->desc->items[u->parts[p].item];
+        if (it->kind != SP_ITEM_STREAM) continue;
+        j->items[u->parts[p].item].size = u->parts[p].bytes_read;
+        if (!u->parts[p].stream_ok) dropped++;
+    }
+    if (dropped) {
+        char **g = realloc(j->warnings, (j->n_warnings + 1) * sizeof(*g));
+        if (!g) return set_error(ERR_NOMEM, "unit.json");
+        j->warnings = g;
+        char msg[96];
+        snprintf(msg, sizeof(msg), "%zu stream(s) failed and were not stored", dropped);
+        if (!(g[j->n_warnings] = strdup(msg))) return set_error(ERR_NOMEM, "unit.json");
+        j->n_warnings++;
+    }
     return OK;
 }
 
@@ -265,6 +344,19 @@ static status_t part_open(void *ctx, size_t index, cdc_source_t *src, uint64_t *
         return OK;
     }
     const sp_item_desc_t *it = &u->desc->items[p->item];
+    if (it->kind == SP_ITEM_STREAM) {
+        if (!u->ops->stream_open || !u->ops->stream_close)
+            return set_error(ERR_INVALID, "provider %s has no streams for %s", u->desc->provider, it->id);
+        memset(&p->pipe, 0, sizeof(p->pipe));
+        p->pipe.fd = -1;
+        if (!(p->pipe.buf = malloc(PIPE_BUF_BYTES))) return set_error(ERR_NOMEM, "unit backup: stream");
+        status_t st = u->ops->stream_open(u->sess, it, &p->pipe.fd);
+        if (st != OK) return st;
+        p->stream_open = 1;
+        *src = (cdc_source_t){ pipe_span, pipe_read, &p->pipe, pipe_piece };
+        *size = CDC_SIZE_STREAM;
+        return OK;
+    }
     if (it->kind == SP_ITEM_BLOB) {
         status_t st = u->ops->blob_read(u->sess, it, &p->blob, &p->blob_len);
         if (st != OK) return st;
@@ -303,10 +395,42 @@ static void part_release(part_t *p)
 
 static void part_close(void *ctx, size_t index, status_t st, const cdc_result_t *cr)
 {
-    (void)st; (void)cr;
     uctx_t *u = ctx;
-    part_release(&u->parts[index]);
-    u->bytes_read += u->parts[index].bytes_read;
+    part_t *p = &u->parts[index];
+    if (p->stream_open) {
+        /* Drain what is left so the producer is not stuck writing, then
+         * ask whether it succeeded: only then is the stream kept. */
+        if (p->pipe.fd >= 0) {
+            if (st != OK) { char sink[4096]; while (read(p->pipe.fd, sink, sizeof(sink)) > 0) {} }
+            close(p->pipe.fd);
+            p->pipe.fd = -1;
+        }
+        int ok = 0;
+        const sp_item_desc_t *it = &u->desc->items[p->item];
+        if (u->ops->stream_close(u->sess, it, &ok) != OK) {
+            log_warn("unit %s: stream %s: %s", u->desc->unit_id, it->id, err_msg());
+            err_clear();
+            ok = 0;
+        }
+        p->stream_ok = st == OK && ok;
+        p->stream_open = 0;
+        if (st == OK && cr) p->bytes_read = cr->size;
+        if (!p->stream_ok)
+            log_warn("unit %s: %s failed; it is not stored", u->desc->unit_id, it->tree_path);
+        free(p->pipe.buf);
+        p->pipe.buf = NULL;
+    }
+    part_release(p);
+    u->bytes_read += p->bytes_read;
+}
+
+/* A failed dump is never stored: it looks valid and is not (6.6). */
+static int part_keep(void *ctx, size_t index)
+{
+    uctx_t *u = ctx;
+    const part_t *p = &u->parts[index];
+    if (p->item < 0 || u->desc->items[p->item].kind != SP_ITEM_STREAM) return 1;
+    return p->stream_ok;
 }
 
 typedef struct {
@@ -457,7 +581,7 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
         memset(&pg, 0, sizeof(pg));
         pg.o = o;
         snprintf(pg.prefix, sizeof(pg.prefix), "unit %zu/%zu %s", index + 1, total, res->name);
-        backup_synth_ops_t sops = { part_open, part_close, &u, NULL };
+        backup_synth_ops_t sops = { part_open, part_close, &u, part_keep };
         hook_t hk = { &u, repo_id };
         backup_opts_t bo;
         memset(&bo, 0, sizeof(bo));

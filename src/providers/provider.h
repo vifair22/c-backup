@@ -43,7 +43,10 @@ typedef enum {
     SP_CONSIST_OFFLINE      = 4, /* the unit was not running while read */
 } sp_consistency_t;
 
-typedef enum { SP_ITEM_BLOB = 1, SP_ITEM_BLOCK = 2, SP_ITEM_TREE = 3 } sp_item_kind_t;
+/* STREAM: bytes of unknown length produced while the unit is read (a dump
+ * hook's stdout), stored like a BLOB under the unit directory but never held
+ * in memory, and left out of the snapshot when its producer fails. */
+typedef enum { SP_ITEM_BLOB = 1, SP_ITEM_BLOCK = 2, SP_ITEM_TREE = 3, SP_ITEM_STREAM = 4 } sp_item_kind_t;
 
 typedef enum {
     SP_STATE_UNKNOWN   = 0,
@@ -332,6 +335,13 @@ typedef struct sp_provider_ops {
                                   sp_restore_plan_t *out);
     status_t (*define)(sp_ctx_t *ctx, const sp_restore_req_t *req,
                        const sp_restore_plan_t *plan, sp_define_result_t *out);
+
+    /* STREAM items. stream_open hands over a pipe the bytes arrive on, read
+     * to EOF by the caller and closed by it; stream_close then says whether
+     * the producer succeeded (*ok), and only then is the item kept. NULL
+     * when the provider has no streams. */
+    status_t (*stream_open)(sp_session_t *s, const sp_item_desc_t *item, int *fd);
+    status_t (*stream_close)(sp_session_t *s, const sp_item_desc_t *item, int *ok);
 } sp_provider_ops_t;
 
 /* Names, for unit.json, the API and the index. NULL for a value outside

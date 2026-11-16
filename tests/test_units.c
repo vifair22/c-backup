@@ -286,6 +286,41 @@ static void test_one_unit_roundtrip(void **state)
     free(disk);
 }
 
+/* Dump hooks as STREAM items: a good one stored at its real size, byte
+ * for byte; a failed one never stored, and unit.json says so. */
+static void test_streams(void **state)
+{
+    (void)state;
+    uint64_t len = 5 * M + 4321;
+    assert_int_equal(fake_stream_add(fk, "u1", "dump:pg", ".cbackup-unit/hooks/pg.dump", len, 1), OK);
+    assert_int_equal(fake_stream_add(fk, "u1", "dump:bad", ".cbackup-unit/hooks/bad.dump", 1000, 0), OK);
+    const char *names[] = { "cbk-uat-one" };
+    unit_backup_result_t res;
+    assert_int_equal(run_units(names, 1, 0, &res), OK);
+    assert_int_equal(res.ok, 1);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, DEST, &ro, &rr), OK);
+    uint8_t *want = malloc(len);
+    assert_non_null(want);
+    for (uint64_t o = 0; o < len; o++) want[o] = fake_byte(91, o);
+    assert_file_bytes(DEST "/.cbackup-unit/hooks/pg.dump", want, len);
+    free(want);
+    struct stat sb;
+    assert_int_not_equal(stat(DEST "/.cbackup-unit/hooks/bad.dump", &sb), 0);
+    FILE *f = fopen(DEST "/.cbackup-unit/unit.json", "r");
+    assert_non_null(f);
+    char buf[16384];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    assert_non_null(strstr(buf, "failed and were not stored"));
+    assert_non_null(strstr(buf, "\"stream\""));
+}
+
 static void test_one_snapshot_per_unit(void **state)
 {
     (void)state;
@@ -515,7 +550,7 @@ static void test_unknown_never_pruned(void **state)
     (void)state;
     junk_done = 0;
     backup_synth_t s = { "/.cbackup-unit/unit.json", 0600, 0, 0, 0, 0 };
-    backup_synth_ops_t ops = { bad_open, NULL, NULL };
+    backup_synth_ops_t ops = { bad_open, NULL, NULL, NULL };
     backup_opts_t bo;
     memset(&bo, 0, sizeof(bo));
     bo.synth = &s;
@@ -716,6 +751,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_one_unit_roundtrip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_streams, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_snapshot_per_unit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failures_leave_nothing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_end_failure_swept, setup, teardown),
