@@ -30,6 +30,10 @@ void routes_repos_set_key_dir(const char *dir);
 /* How strictly backups recognise an unchanged file (file_cache_match_t,
  * from backup.file_cache_match). Set from config at startup. */
 void routes_backup_set_file_cache_match(int mode);
+/* Chunk workers per backup (backup.store_workers): 0 automatic, 1 serial.
+ * Set from config at startup. */
+void routes_backup_set_store_workers(unsigned n);
+unsigned routes_backup_store_workers(void);
 void routes_auth_set_config(cutils_config_t *cfg);
 
 /* Backup submission and job inspection. Needs the job manager because a

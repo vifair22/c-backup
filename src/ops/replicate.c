@@ -2,7 +2,11 @@
 
 #include "replicate.h"
 
+#include "cdc.h"
+#include "chunklist.h"
 #include "manifest.h"
+#include "pack.h"
+#include "read_budget.h"
 #include "object.h"
 #include "object_crypt.h"
 #include "snapshot_ids.h"
@@ -27,10 +31,6 @@ typedef struct {
     replica_sink_t     *sink;
     atomic_int       *cancel;
     replicate_result_t *res;
-
-    /* A re-encrypting sink's target key, derived once for the run. */
-    object_aead_key_t   dst_key;
-    int                 have_dst_key;
 
     /*
      * Hashes waiting to be asked about.
@@ -86,60 +86,13 @@ static int hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
  * object is bounded (OBJECT_MAX_STORED_BYTES), so it is read in one piece
  * and handed over in one piece.
  *
- * For a re-encrypting sink only the outermost layer changes. The payload is
- * compress-then-encrypt, so removing the encryption leaves exactly the
- * compressed bytes the source stored, and those are encrypted again under
- * the target's key; nothing is decompressed, and the uncompressed size in
- * the header stays true. The associated data is the same type and name on
- * both sides, since the object keeps its name. The source's tag is checked
- * before anything is encrypted for the target, so bytes that do not
- * authenticate never reach the sink at all (OWN-36).
+ * There is no re-encrypting transform. A target under another key has
+ * another gear table, so it is always re-chunked (see needs_rechunk), and
+ * its objects are written from plaintext under its own key. Copying stored
+ * bytes happens only where both repositories cut identically, which means
+ * the same key or none, and the object key is derived from the repository
+ * key alone, so the stored form is already right for the target.
  */
-static status_t reencrypt(const walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE],
-                          object_stored_info_t *info, uint8_t **io_payload, size_t *io_len)
-{
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    uint8_t *buf = *io_payload;
-    size_t   len = *io_len;
-
-    if (info->encryption != ENCRYPT_NONE) {
-        const object_aead_key_t *sk = store_aead_key(c->store);
-        hash_hex(hash, hex);
-        if (!sk)
-            return set_error(ERR_INVALID,
-                             "replicate: object %s is encrypted and the source key "
-                             "is not loaded", hex);
-        if (len < OBJECT_CRYPT_OVERHEAD)
-            return set_error(ERR_CORRUPT,
-                             "replicate: object %s is shorter than its nonce and tag", hex);
-        len -= OBJECT_CRYPT_OVERHEAD;
-        if (object_decrypt(sk, info->type, hash, buf, len, buf) != OK)
-            return set_error(ERR_CORRUPT, "replicate: object %s does not decrypt with "
-                             "the source key", hex);
-    }
-
-    uint8_t enc = ENCRYPT_NONE;
-    if (c->have_dst_key) {
-        uint8_t *out = malloc(len + OBJECT_CRYPT_OVERHEAD);
-        if (!out) return set_error(ERR_NOMEM, "replicate: ciphertext buffer");
-        status_t st = object_encrypt(&c->dst_key, info->type, hash, buf, len, out);
-        if (st != OK) {
-            free(out);
-            hash_hex(hash, hex);
-            return set_error(st, "replicate: cannot encrypt object %s for the target", hex);
-        }
-        free(buf);
-        buf = out;
-        len += OBJECT_CRYPT_OVERHEAD;
-        enc = ENCRYPT_CHACHA20;
-    }
-
-    info->encryption = enc;
-    *io_payload = buf;
-    *io_len = len;
-    return OK;
-}
-
 /* Hand one object over, as stored. */
 static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
 {
@@ -152,7 +105,17 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
     size_t len = 0;
     int    damaged = 0;
 
-    status_t st = object_read_stored(c->store, hash, &info, &payload, &len, &damaged);
+    /*
+     * Held to the daemon's read budget for as long as the stored bytes are
+     * in memory. The stored size is at most the payload plus the AEAD
+     * overhead, and the index says the payload's before anything is read.
+     */
+    uint64_t taken = 0, psz = 0;
+    status_t st = object_get_info(c->store, hash, &psz, NULL);
+    if (st == OK) {
+        taken = read_budget_acquire(psz + OBJECT_CRYPT_OVERHEAD);
+        st = object_read_stored(c->store, hash, &info, &payload, &len, &damaged);
+    }
     if (st != OK) {
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         hash_hex(hash, hex);
@@ -161,9 +124,6 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
         return set_error(st, "replicate: cannot read object %s: %s", hex, why);
     }
     uint8_t *buf = payload;
-    if (c->sink->reencrypt)
-        st = reencrypt(c, hash, &info, &buf, &len);
-
     if (st == OK) {
         replica_object_t obj = {
             .type              = info.type,
@@ -192,12 +152,85 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
         log_error("replicate: object %s was sent damaged beyond its parity; the "
                   "replica holds it as damaged", hex);
     }
+    if (taken) read_budget_release(taken);
     if (st != OK) return st;
 
     c->res->objects_sent++;
     c->res->bytes_sent += len;
     return OK;
 }
+/*
+ * Everything a chunk list names, leaves first, then the list's sub-lists
+ * after their own contents: the same bottom-up promise trees keep. A list
+ * present at the target means every chunk beneath it is too, so a later
+ * run that finds the list skips the file without asking about its chunks,
+ * and an interrupted transfer never leaves a list naming chunks that did
+ * not arrive. Children are asked about in batches; only absent ones are
+ * opened. The caller sends the list itself once this returns.
+ *
+ * Depth is bounded by the format (CHUNKLIST_MAX_LEVEL), and one loaded
+ * list per level is all that is held.
+ */
+static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE]);
+
+static status_t send_list_body(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE],
+                               unsigned depth)
+{
+    if (depth > CHUNKLIST_MAX_LEVEL)
+        return set_error(ERR_CORRUPT, "replicate: chunk list nested too deep");
+    /* Loaded under the budget and released at once: what is kept while
+     * the children go across is a parsed index, and holding its slot while
+     * they are read would be nested acquisition (read_budget.h). */
+    void *data = NULL;
+    size_t len = 0;
+    uint8_t type = 0;
+    uint64_t taken = 0;
+    status_t st = object_load_budgeted(c->store, hash, &data, &len, &type, &taken);
+    if (st != OK) return st;
+    read_budget_release(taken);
+    chunklist_hdr_t h;
+    if (type != OBJECT_TYPE_CHUNKLIST)
+        st = set_error(ERR_CORRUPT, "replicate: object type %u is not a chunk list", type);
+    if (st == OK) st = chunklist_parse(data, len, &h);
+
+    uint8_t (*batch)[OBJECT_HASH_SIZE] = NULL;
+    if (st == OK && !(batch = malloc(REPLICA_BATCH_MAX * OBJECT_HASH_SIZE)))
+        st = set_error(ERR_NOMEM, "replicate: batch");
+    for (uint32_t i = 0; st == OK && i < h.count; ) {
+        if (cancel_requested(c->cancel)) { st = set_error(ERR_BUSY, "replicate: cancelled"); break; }
+        size_t n = 0;
+        for (; i < h.count && n < REPLICA_BATCH_MAX; i++, n++) {
+            chunklist_entry_t e;
+            chunklist_entry_at(data, i, &e);
+            memcpy(batch[n], e.hash, OBJECT_HASH_SIZE);
+        }
+        uint8_t present[REPLICA_BATCH_MAX];
+        st = c->sink->v->has_objects(c->sink->ctx, batch[0], n, present);
+        if (st != OK) break;
+        c->res->objects_asked += n;
+        for (size_t k = 0; k < n && st == OK; k++) {
+            if (present[k]) continue;
+            if (h.level > 0) st = send_list_body(c, batch[k], depth + 1);
+            if (st == OK) st = send_one(c, batch[k]);
+        }
+    }
+    free(batch);
+    free(data);
+    return st;
+}
+
+/* One object, and first whatever it names when it is a chunk list. */
+static status_t send_obj(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    uint64_t size = 0;
+    uint8_t type = 0;
+    status_t st = object_get_info(c->store, hash, &size, &type);
+    if (st == OK && type == OBJECT_TYPE_CHUNKLIST) st = send_list_body(c, hash, 0);
+    if (st == ERR_NOT_FOUND) err_clear();   /* send_one names the object */
+    else if (st != OK) return st;
+    return send_one(c, hash);
+}
+
 /*
  * Ask about everything queued and send what is missing.
  *
@@ -218,7 +251,7 @@ static status_t flush_pending(walk_ctx_t *c)
 
     for (size_t i = 0; i < c->pending_n; i++) {
         if (present[i]) continue;
-        st = send_one(c, c->pending[i]);
+        st = send_obj(c, c->pending[i]);
         if (st != OK) { c->pending_n = 0; return st; }
     }
     c->pending_n = 0;
@@ -295,11 +328,210 @@ static status_t walk_tree(walk_ctx_t *c, const uint8_t tree_hash[OBJECT_HASH_SIZ
     manifest_free_entries(entries, count);
     if (st != OK) return st;
 
-    /* Everything this tree names is now stored. Only now may the tree be. */
+    /* Everything this tree names is now stored. Only now may the tree be:
+     * and a directory split into fragments sends them, then its lists. */
     st = flush_pending(c);
     if (st != OK) return st;
+    return send_obj(c, tree_hash);
+}
 
-    return send_one(c, tree_hash);
+/* ------------------------------------------------------------------ */
+/* Re-chunking, for a target that cuts differently                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Source tree hash to rebuilt target hash, for the run. Snapshots share most
+ * of their trees, so the second snapshot of a run rebuilds only what
+ * changed. Bounded: past the cap nothing more is remembered, which costs
+ * rebuilding, never correctness.
+ */
+#define RC_MEMO_MAX ((size_t)1 << 20)
+
+typedef struct {
+    uint8_t src[OBJECT_HASH_SIZE];
+    uint8_t tgt[OBJECT_HASH_SIZE];
+    int     used;
+} rc_slot_t;
+
+typedef struct {
+    store_t            *store;
+    replica_sink_t     *sink;
+    const cdc_params_t *tcdc;
+    atomic_int         *cancel;
+    replicate_result_t *res;
+    rc_slot_t          *memo;
+    size_t              memo_cap, memo_n;
+} rc_ctx_t;
+
+static size_t rc_slot(const rc_ctx_t *r, const uint8_t h[OBJECT_HASH_SIZE])
+{
+    uint64_t v;
+    memcpy(&v, h, sizeof(v));
+    return (size_t)v & (r->memo_cap - 1);
+}
+
+static int rc_memo_get(const rc_ctx_t *r, const uint8_t src[OBJECT_HASH_SIZE],
+                       uint8_t tgt[OBJECT_HASH_SIZE])
+{
+    if (!r->memo) return 0;
+    for (size_t i = rc_slot(r, src); r->memo[i].used; i = (i + 1) & (r->memo_cap - 1))
+        if (!memcmp(r->memo[i].src, src, OBJECT_HASH_SIZE)) {
+            memcpy(tgt, r->memo[i].tgt, OBJECT_HASH_SIZE);
+            return 1;
+        }
+    return 0;
+}
+
+static void rc_memo_put(rc_ctx_t *r, const uint8_t src[OBJECT_HASH_SIZE],
+                        const uint8_t tgt[OBJECT_HASH_SIZE])
+{
+    if (r->memo_n >= RC_MEMO_MAX) return;
+    if ((r->memo_n + 1) * 2 > r->memo_cap) {
+        size_t ncap = r->memo_cap ? r->memo_cap * 2 : 1024;
+        rc_slot_t *nm = calloc(ncap, sizeof(*nm));
+        if (!nm) return;
+        rc_slot_t *old = r->memo;
+        size_t ocap = r->memo_cap;
+        r->memo = nm;
+        r->memo_cap = ncap;
+        r->memo_n = 0;
+        for (size_t i = 0; i < ocap; i++)
+            if (old[i].used) rc_memo_put(r, old[i].src, old[i].tgt);
+        free(old);
+    }
+    size_t i = rc_slot(r, src);
+    while (r->memo[i].used) {
+        if (!memcmp(r->memo[i].src, src, OBJECT_HASH_SIZE)) return;
+        i = (i + 1) & (r->memo_cap - 1);
+    }
+    memcpy(r->memo[i].src, src, OBJECT_HASH_SIZE);
+    memcpy(r->memo[i].tgt, tgt, OBJECT_HASH_SIZE);
+    r->memo[i].used = 1;
+    r->memo_n++;
+}
+
+/* The target's "put (type, bytes) -> name", as the chunker and the tree
+ * writer take it. */
+static status_t rc_put(void *ctx, uint8_t type, const void *data, size_t len,
+                       obj_put_t *out)
+{
+    rc_ctx_t *r = ctx;
+    int is_new = 0;
+    status_t st = r->sink->v->put_plain(r->sink->ctx, type, data, len,
+                                        out->hash, &is_new);
+    if (st != OK) return st;
+    out->is_new = is_new;
+    out->phys_bytes = 0;
+    if (is_new) r->res->objects_written++;
+    return OK;
+}
+
+/* An object whose bytes do not depend on chunking (xattrs, ACLs): its
+ * plaintext, handed over whole. Its name may still differ at the target. */
+static status_t rc_copy_plain(rc_ctx_t *r, const uint8_t src[OBJECT_HASH_SIZE],
+                              uint8_t tgt[OBJECT_HASH_SIZE])
+{
+    void *data = NULL;
+    size_t len = 0;
+    uint8_t type = 0;
+    uint64_t taken = 0;
+    status_t st = object_load_budgeted(r->store, src, &data, &len, &type, &taken);
+    if (st != OK) return st;
+    obj_put_t put;
+    memset(&put, 0, sizeof(put));
+    st = rc_put(r, type, data, len, &put);
+    free(data);
+    read_budget_release(taken);
+    if (st == OK) memcpy(tgt, put.hash, OBJECT_HASH_SIZE);
+    return st;
+}
+
+/* A file's content, reassembled from the source and cut with the target's
+ * parameters. Holes stay where they were: the source list's gaps are the
+ * spans the chunker is given. */
+static status_t rc_content(rc_ctx_t *r, const uint8_t src[OBJECT_HASH_SIZE],
+                           uint8_t tgt[OBJECT_HASH_SIZE])
+{
+    content_src_t *cs = NULL;
+    uint64_t size = 0;
+    status_t st = content_source_open(r->store, src, &cs, &size);
+    if (st != OK) return st;
+    cdc_source_t iface = content_source_iface(cs);
+    obj_sink_t sink = { .put = rc_put, .ctx = r };
+    /* The source's leaf holds the budget for what is in flight. */
+    cdc_opts_t o = { .cancel = r->cancel, .unbudgeted = 1 };
+    cdc_result_t res;
+    st = cdc_store_source(r->tcdc, &iface, size, &sink, &o, &res);
+    content_source_close(cs);
+    if (st != OK) return st;
+    memcpy(tgt, res.hash, OBJECT_HASH_SIZE);
+    r->res->files_rechunked++;
+    return OK;
+}
+
+static void rc_free_entries(manifest_entry_t *e, uint32_t n)
+{
+    manifest_free_entries(e, n);
+}
+
+/*
+ * Rebuild one directory for the target, children first. Every object the
+ * new tree names is stored at the target before the tree is, the same
+ * bottom-up rule the copying walk keeps; the tree itself goes through
+ * manifest_store_tree with the target's parameters, so a large directory
+ * is fragmented where the target's own backups would fragment it.
+ */
+static status_t rc_tree(rc_ctx_t *r, const uint8_t src[OBJECT_HASH_SIZE],
+                        int depth, uint8_t tgt[OBJECT_HASH_SIZE])
+{
+    if (cancel_requested(r->cancel)) return set_error(ERR_BUSY, "replicate: cancelled");
+    if (depth > REPLICATE_MAX_DEPTH)
+        return set_error(ERR_CORRUPT, "replicate: tree nesting too deep");
+    if (rc_memo_get(r, src, tgt)) return OK;
+
+    manifest_entry_t *ents = NULL;
+    uint32_t n = 0;
+    status_t st = manifest_read_tree(r->store, src, &ents, &n);
+    if (st != OK)
+        return set_error(ERR_CORRUPT, "replicate: cannot read tree, refusing to "
+                         "send a partial snapshot");
+
+    for (uint32_t i = 0; i < n && st == OK; i++) {
+        manifest_entry_t *e = &ents[i];
+        if (!hash_is_zero(e->target_hash)) {
+            uint8_t h[OBJECT_HASH_SIZE];
+            if (e->type == NODE_TYPE_DIR)      st = rc_tree(r, e->target_hash, depth + 1, h);
+            else if (e->type == NODE_TYPE_REG) st = rc_content(r, e->target_hash, h);
+            else                               st = rc_copy_plain(r, e->target_hash, h);
+            if (st == OK) memcpy(e->target_hash, h, OBJECT_HASH_SIZE);
+        }
+        if (st == OK && !hash_is_zero(e->xattr_hash))
+            st = rc_copy_plain(r, e->xattr_hash, e->xattr_hash);
+        if (st == OK && !hash_is_zero(e->acl_hash))
+            st = rc_copy_plain(r, e->acl_hash, e->acl_hash);
+    }
+    if (st == OK) {
+        obj_sink_t sink = { .put = rc_put, .ctx = r };
+        st = manifest_store_tree(ents, n, r->tcdc, &sink, tgt, NULL);
+    }
+    rc_free_entries(ents, n);
+    if (st != OK) return st;
+    r->res->trees_rebuilt++;
+    rc_memo_put(r, src, tgt);
+    return OK;
+}
+
+/* Does the sink cut differently from the source? */
+static int needs_rechunk(store_t *store, const replica_sink_t *sink)
+{
+    if (!sink->v->target_cdc || !sink->v->put_plain) return 0;
+    const cdc_params_t *t = sink->v->target_cdc(sink->ctx);
+    if (!t) return 0;
+    const cdc_params_t *sp = store_cdc(store);
+    if (!sp) return 1;
+    return t->min_size != sp->min_size || t->avg_size != sp->avg_size ||
+           t->max_size != sp->max_size ||
+           memcmp(t->gear, sp->gear, sizeof(t->gear)) != 0;
 }
 
 status_t replicate_tree(store_t *store, replica_sink_t *sink,
@@ -311,23 +543,39 @@ status_t replicate_tree(store_t *store, replica_sink_t *sink,
 
     replicate_result_t res;
     memset(&res, 0, sizeof(res));
-
-    walk_ctx_t c = { .store = store, .sink = sink, .cancel = cancel, .res = &res };
     status_t st = OK;
-    if (sink->reencrypt && sink->dst_key) {
-        st = object_aead_key_derive(sink->dst_key, &c.dst_key);
-        c.have_dst_key = (st == OK);
-    }
     /* Objects this handle staged through object_store_ex are sealed first,
      * so the walk can read every one it reaches. */
-    if (st == OK) st = object_store_flush(store);
-    if (st == OK) st = walk_tree(&c, root_tree_hash, 0);
-    object_aead_key_wipe(&c.dst_key);
+    st = object_store_flush(store);
+    if (st == OK && needs_rechunk(store, sink)) {
+        rc_ctx_t r = { .store = store, .sink = sink, .cancel = cancel, .res = &res,
+                       .tcdc = sink->v->target_cdc(sink->ctx) };
+        res.rechunked = 1;
+        st = rc_tree(&r, root_tree_hash, 0, res.target_root);
+        free(r.memo);
+    } else if (st == OK) {
+        walk_ctx_t c = { .store = store, .sink = sink, .cancel = cancel, .res = &res };
+        st = walk_tree(&c, root_tree_hash, 0);
+        memcpy(res.target_root, root_tree_hash, OBJECT_HASH_SIZE);
+    }
 
     /* Report what was transferred even on failure: a caller deciding whether
      * to retry wants to know how far it got. */
     if (out) *out = res;
     return st;
+}
+
+/* replicate_run's per-snapshot transfer, sharing one memo across the run. */
+static status_t transfer_one(store_t *store, replica_sink_t *sink, int rechunk,
+                             rc_ctx_t *rc, const uint8_t root[OBJECT_HASH_SIZE],
+                             atomic_int *cancel, replicate_result_t *one)
+{
+    if (!rechunk) return replicate_tree(store, sink, root, cancel, one);
+    memset(one, 0, sizeof(*one));
+    one->rechunked = 1;
+    rc->res = one;
+    rc->cancel = cancel;
+    return rc_tree(rc, root, 0, one->target_root);
 }
 
 status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -359,6 +607,20 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     status_t st = OK;
     size_t nrows = snaps ? (size_t)snaps->nrows : 0;
 
+    int rechunk = needs_rechunk(store, sink);
+    if (rechunk && !sink->v->has_snapshot_at) {
+        db_result_free(snaps);
+        return set_error(ERR_INVALID, "replicate: the target cuts files "
+                         "differently and this sink cannot say which snapshots "
+                         "it already holds");
+    }
+    rc_ctx_t rc = { .store = store, .sink = sink,
+                    .tcdc = rechunk ? sink->v->target_cdc(sink->ctx) : NULL };
+    if (rechunk)
+        log_info("replicate: the target's chunking differs from the source's "
+                 "(key or constants); file content is re-chunked and trees are "
+                 "rebuilt, so snapshot roots at the target differ");
+
     for (size_t i = 0; i < nrows && st == OK; i++) {
         if (cancel_requested(cancel)) { st = set_error(ERR_BUSY, "replicate: cancelled"); break; }
 
@@ -378,7 +640,8 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
 
         int have = 0;
-        st = sink->v->has_snapshot(sink->ctx, snap_id, root, &have);
+        st = rechunk ? sink->v->has_snapshot_at(sink->ctx, snap_id, ts, &have)
+                     : sink->v->has_snapshot(sink->ctx, snap_id, root, &have);
         if (st != OK) break;
         if (have) { res.snapshots_skipped++; continue; }
 
@@ -386,7 +649,12 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
          * argument, and the counters below are read either way. */
         replicate_result_t one;
         memset(&one, 0, sizeof(one));
-        st = replicate_tree(store, sink, root, cancel, &one);
+        st = transfer_one(store, sink, rechunk, &rc, root, cancel, &one);
+        res.rechunked         = one.rechunked;
+        res.files_rechunked  += one.files_rechunked;
+        res.trees_rebuilt    += one.trees_rebuilt;
+        res.objects_written  += one.objects_written;
+        memcpy(res.target_root, one.target_root, OBJECT_HASH_SIZE);
         res.objects_asked    += one.objects_asked;
         res.objects_sent     += one.objects_sent;
         res.bytes_sent       += one.bytes_sent;
@@ -420,7 +688,7 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             .file_count  = (uint64_t)strtoull(snaps->rows[i][4], NULL, 10),
             .total_size  = (uint64_t)strtoull(snaps->rows[i][5], NULL, 10),
         };
-        memcpy(rs.root_tree_hash, root, OBJECT_HASH_SIZE);
+        memcpy(rs.root_tree_hash, one.target_root, OBJECT_HASH_SIZE);
 
         st = sink->v->commit_snapshot(sink->ctx, &rs);
         if (st != OK) break;
@@ -434,6 +702,7 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     db_result_free(snaps);
+    free(rc.memo);
     if (out) *out = res;
 
     /* The source's mark, carried across once its snapshots are, so the

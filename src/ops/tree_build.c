@@ -308,13 +308,7 @@ static status_t build_one_tree(const scan_result_t *scan, const tree_build_ops_t
     stats->entries_visited += n;
     stats->trees++;
 
-    uint8_t *buf = NULL;
-    size_t len = 0;
-    status_t st = manifest_serialise(entries, n, &buf, &len);
-    if (st != OK) return st;
-    st = ops->put(ops->ctx, index, buf, len, out_hash);
-    free(buf);
-    return st;
+    return ops->put(ops->ctx, index, entries, n, out_hash);
 }
 
 status_t tree_build(const scan_result_t *scan, const tree_build_ops_t *ops,

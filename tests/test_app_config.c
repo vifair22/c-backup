@@ -59,7 +59,7 @@ static void test_edges_pass(void **state)
 {
     (void)state;
     assert_int_equal(load("http:\n  port: 0\n  bind: 0.0.0.0\n"
-                          "jobs:\n  max_parallel: 256\n"
+                          "jobs:\n  max_parallel: 256\n  read_budget_mb: 16\n"
                           "auth:\n  cookie_secure: 1\n"
                           "scheduler:\n  enabled: 0\n"
                           "retention:\n  keep_snaps: 0\n  keep_yearly: 2147483647\n"
@@ -77,12 +77,17 @@ static void test_ranges_refused(void **state)
     refused("http:\n  port: -1\n", "http.port: '-1'");
     refused("jobs:\n  max_parallel: 0\n", "jobs.max_parallel: '0' is not between 1 and 256");
     refused("jobs:\n  max_parallel: 257\n", "jobs.max_parallel: '257'");
+    /* A read budget smaller than one largest object could never read it. */
+    refused("jobs:\n  read_budget_mb: 15\n",
+            "jobs.read_budget_mb: '15' MiB is under 16 MiB, the largest object");
+    refused("jobs:\n  read_budget_mb: 0\n", "jobs.read_budget_mb: '0' MiB");
+    refused("jobs:\n  read_budget_mb: 1048577\n", "jobs.read_budget_mb: '1048577'");
     refused("auth:\n  cookie_secure: 2\n", "auth.cookie_secure: '2' is not between 0 and 1");
     refused("scheduler:\n  enabled: -1\n", "scheduler.enabled: '-1'");
     refused("retention:\n  keep_daily: -1\n", "retention.keep_daily: '-1'");
     refused("retention:\n  keep_snaps: -5\n", "retention.keep_snaps: '-5'");
-    /* The large-file pool went with format 3; its key is no longer known. */
-    refused("backup:\n  store_workers: 2\n", "unknown key 'backup.store_workers'");
+    refused("backup:\n  store_workers: 65\n",
+            "backup.store_workers: '65' is not between 0 and 64");
 }
 
 static void test_bind_and_mode_refused(void **state)

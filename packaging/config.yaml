@@ -65,6 +65,13 @@ backup:
   # relaxed compares only size and mtime.
   file_cache_match: auto
 
+  # Threads the chunks of one large file (over 16 MiB) are named, compressed,
+  # encrypted and given parity on; with several large files a quarter of
+  # them also read and cut whole files at once. 0 picks two thirds of the
+  # CPUs, fewer if memory is short; 1 stores every chunk on the backup
+  # thread. The snapshot is identical either way.
+  store_workers: 0
+
 retention:
   # What a retention pass (c-backup gfs, or a gfs schedule) keeps for a
   # repository that has not set its own with 'c-backup policy set'. A

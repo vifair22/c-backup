@@ -5,6 +5,8 @@
 #include "metablob.h"
 
 #include "object.h"
+#include "chunklist.h"
+#include "read_budget.h"
 #include "util.h"
 
 #include <cutils/log.h>
@@ -243,7 +245,8 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
     void   *data = NULL;
     size_t  len  = 0;
     uint8_t type = 0;
-    if (object_load(store, hash, &data, &len, &type) != OK) {
+    uint64_t taken = 0;
+    if (object_load_budgeted(store, hash, &data, &len, &type, &taken) != OK) {
         log_warn("restore: cannot load xattrs for %s: %s", path, err_msg());
         err_clear();
         return;
@@ -252,6 +255,7 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
         log_warn("restore: xattrs for %s name a type %u object, not an xattr "
                  "blob; not applied", path, type);
         free(data);
+    read_budget_release(taken);
         return;
     }
 
@@ -261,6 +265,7 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
         err_clear();
     }
     free(data);
+    read_budget_release(taken);
 }
 
 /*
@@ -302,7 +307,8 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
     void   *data = NULL;
     size_t  len  = 0;
     uint8_t type = 0;
-    if (object_load(store, hash, &data, &len, &type) != OK) {
+    uint64_t taken = 0;
+    if (object_load_budgeted(store, hash, &data, &len, &type, &taken) != OK) {
         log_warn("restore: cannot load ACL for %s: %s", path, err_msg());
         err_clear();
         return;
@@ -311,6 +317,7 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
         log_warn("restore: ACLs for %s name a type %u object, not an ACL "
                  "blob; not applied", path, type);
         free(data);
+    read_budget_release(taken);
         return;
     }
 
@@ -320,6 +327,7 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
         err_clear();
     }
     free(data);
+    read_budget_release(taken);
 }
 
 /* Something to say when a failure arrives with no message attached. */
@@ -639,34 +647,16 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
     if (fd == -1) return ERR_IO;
 
     /*
-     * The object is loaded, decrypted and checked against its name whole
-     * before a byte of it is written: every object is bounded, so nothing
-     * unverified ever reaches the file.
-     *
-     * TODO(CDC): a CHUNKLIST content hash is restored with
-     * content_restore_fd (leaves written at their offsets, holes left as
-     * holes), which the chunker's readers provide; until they land such a
-     * file fails here and is named.
+     * One FILE object or a chunk list. Every object is bounded, so each is
+     * loaded, decrypted and checked against its name whole before a byte of
+     * it is written: nothing unverified ever reaches the file. A list's
+     * leaves go in at their offsets and the file is extended to its length,
+     * so holes stay holes. Any other type is refused: it is not file
+     * content, whatever its bytes say (OWN-39).
      */
     (void)size;
     uint64_t sz = 0;
-    uint8_t  otype = 0;
-    void    *data = NULL;
-    size_t   len = 0;
-    status_t st = object_load(store, hash, &data, &len, &otype);
-    /* The type is checked against what a file can be: an object of any
-     * other type is not file content, whatever its bytes say (OWN-39). */
-    if (st == OK && otype != OBJECT_TYPE_FILE)
-        st = set_error(ERR_CORRUPT, "object is of type %u, not file content", otype);
-    if (st == OK) {
-        if (len && io_write_full(fd, data, len) != 0)
-            st = set_error_errno(ERR_IO, "restore: cannot write %s", full);
-        else {
-            sz = len;
-            store_io_progress(store, len);
-        }
-    }
-    free(data);
+    status_t st = content_restore_fd(store, hash, fd, &sz);
 
     /* Metadata goes on before the rename, so the file is final the moment
      * it has its name: the resume rule relies on the mtime being right. */

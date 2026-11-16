@@ -32,6 +32,7 @@
 #include "job_manager.h"
 #include "lock.h"
 #include "repo_purge.h"
+#include "read_budget.h"
 #include "routes.h"
 #include "scheduler.h"
 #include "sd_notify.h"
@@ -212,6 +213,16 @@ int main(int argc, char *argv[])
         log_warn("no admin password set: TCP serves only the health probes "
                  "until one is, with 'c-backup auth setup' on this host");
 
+    /* Before any job can read an object. app_config_check has held the
+     * setting to its range already. */
+    int rb_mb = config_get_int(cfg, "jobs.read_budget_mb", 256);
+    if (read_budget_init((uint64_t)rb_mb * 1024 * 1024) != OK) {
+        log_error("%s", err_msg());
+        repo_purge_stop();
+        appguard_shutdown(guard);
+        return 1;
+    }
+
     job_manager_t *jm = NULL;
     int max_parallel = config_get_int(cfg, "jobs.max_parallel", 2);
     if (job_manager_start(db, max_parallel, &jm) != OK) {
@@ -266,6 +277,12 @@ int main(int argc, char *argv[])
         int mode = file_cache_match_parse(m);
         if (mode < 0) mode = FILE_CACHE_MATCH_AUTO;
         routes_backup_set_file_cache_match(mode);
+
+        /* Range-checked to 0..APP_MAX_STORE_WORKERS during config init. */
+        int sw = config_get_int(cfg, "backup.store_workers", 0);
+        routes_backup_set_store_workers(sw > 0 ? (unsigned)sw : 0u);
+        if (sw > 0)
+            log_info("backup.store_workers: %d", sw);
         if (mode != FILE_CACHE_MATCH_AUTO)
             log_info("backup.file_cache_match: %s", m);
     }

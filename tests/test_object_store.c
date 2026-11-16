@@ -327,8 +327,8 @@ static void test_store_file_roundtrip(void **state) {
     assert_int_equal(info.is_new, 0);
 }
 
-/* A file past the object bound is refused (it needs a chunk list), and so is
- * a file shorter than the size the caller promised. */
+/* A file past the object bound is a chunk list, not one object; a file
+ * shorter than the size the caller promised is refused. */
 static void test_store_file_refusals(void **state) {
     (void)state;
     int fd = write_src(TEST_SRC "/fd_big.bin", "", 0);
@@ -339,8 +339,14 @@ static void test_store_file_refusals(void **state) {
 
     uint8_t hash[OBJECT_HASH_SIZE];
     assert_int_equal(object_store_file_packed(store, fd, OBJECT_MAX_BYTES + 1, NULL,
-                                              hash, NULL), ERR_TOO_LARGE);
+                                              hash, NULL), OK);
     close(fd);
+    uint64_t osz = 0;
+    uint8_t otype = 0;
+    assert_int_equal(object_get_info(store, hash, &osz, &otype), OK);
+    assert_int_equal(otype, OBJECT_TYPE_CHUNKLIST);
+    assert_int_equal(object_store_flush(store), OK);
+    size_t stored = fake_index_count();
 
     const char *data = "short";
     fd = write_src(TEST_SRC "/fd_short.bin", data, strlen(data));
@@ -348,9 +354,9 @@ static void test_store_file_refusals(void **state) {
                                               hash, NULL), ERR_IO);
     close(fd);
 
-    /* Neither left anything behind. */
+    /* The short file left nothing behind. */
     assert_int_equal(object_store_flush(store), OK);
-    assert_int_equal(fake_index_count(), 0);
+    assert_int_equal(fake_index_count(), stored);
 }
 
 /* Read a pack file whole. */

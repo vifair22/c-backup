@@ -32,6 +32,9 @@
 
 #include <cmocka.h>
 
+#include "cdc.h"
+#include "chunklist.h"
+#include "manifest.h"
 #include "object.h"
 #include "scan.h"
 #include "tree_build.h"
@@ -245,12 +248,30 @@ static const struct { uint32_t index; const char *name; } golden[] = {
 
 /* ---- harness ---- */
 
-/* Names a tree the way the store would, without a store. */
+/*
+ * Stores a tree the way a backup does - manifest_store_tree, fragmenting a
+ * directory past 256 KiB serialised - into a sink that only names objects,
+ * so the names are the store's without a store.
+ */
 typedef struct {
     uint32_t puts;
     uint32_t fail_at_step;     /* 0: never */
     uint32_t steps;
+    uint32_t objects;          /* objects the sink was handed */
+    uint32_t lists;            /* of which chunk lists: fragmented directories */
 } harness_t;
+
+static status_t name_only_put(void *ctx, uint8_t type, const void *data,
+                              size_t len, obj_put_t *out)
+{
+    harness_t *h = ctx;
+    h->objects++;
+    if (type == OBJECT_TYPE_CHUNKLIST) h->lists++;
+    object_name(type, data, len, out->hash);
+    out->is_new = 1;
+    out->phys_bytes = len;
+    return OK;
+}
 
 static status_t h_step(void *ctx, uint32_t done, uint32_t total)
 {
@@ -262,14 +283,16 @@ static status_t h_step(void *ctx, uint32_t done, uint32_t total)
     return OK;
 }
 
-static status_t h_put(void *ctx, uint32_t index, const uint8_t *buf, size_t len,
-                      uint8_t out_hash[OBJECT_HASH_SIZE])
+static status_t h_put(void *ctx, uint32_t index, manifest_entry_t *entries,
+                      uint32_t count, uint8_t out_hash[OBJECT_HASH_SIZE])
 {
     harness_t *h = ctx;
     (void)index;
     h->puts++;
-    object_name(OBJECT_TYPE_TREE, buf, len, out_hash);
-    return OK;
+    cdc_params_t cp;
+    cdc_params_default(&cp);
+    obj_sink_t sink = { .put = name_only_put, .ctx = h };
+    return manifest_store_tree(entries, count, &cp, &sink, out_hash, NULL);
 }
 
 typedef struct {
@@ -541,10 +564,74 @@ static void test_one_huge_directory_is_linear(void **state)
     fx_free(&s);
 }
 
+/*
+ * A directory past 256 KiB serialised is fragments and a chunk list
+ * (OWN-34), and its name is the list's - not the name one TREE object of
+ * the same entries would have had, by design. Its name does not depend on
+ * scan order, and the small directory beside it keeps the name a single
+ * TREE gives it.
+ */
+static void test_large_directory_fragments_deterministically(void **state)
+{
+    (void)state;
+    scan_result_t a, b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    /* 6,000 entries with long names: well past 256 KiB serialised. */
+    char path[256];
+    for (int pass = 0; pass < 2; pass++) {
+        scan_result_t *s = pass ? &b : &a;
+        fx_push(s, "/big", 1, 0, NODE_TYPE_DIR, 1);
+        fx_push(s, "/small", 2, 0, NODE_TYPE_DIR, 2);
+        fx_push(s, "/small/one.txt", 3, 2, NODE_TYPE_REG, 3);
+        for (int k = 0; k < 6000; k++) {
+            int i = pass ? 5999 - k : k;
+            snprintf(path, sizeof(path),
+                     "/big/a-rather-long-file-name-to-fill-the-tree-%06d.dat", i);
+            fx_push(s, path, (uint64_t)(100 + i), 1, NODE_TYPE_REG, (uint32_t)(100 + i));
+        }
+    }
+
+    run_t ra, rb;
+    assert_int_equal(run(&a, &ra), OK);
+    assert_int_equal(run(&b, &rb), OK);
+    assert_true(ra.h.lists >= 1);
+    assert_memory_equal(ra.root, rb.root, OBJECT_HASH_SIZE);
+    assert_memory_equal(ra.hashes[0], rb.hashes[0], OBJECT_HASH_SIZE);
+
+    /* /small is index 1 in both scans: one TREE object, named as such. */
+    manifest_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.name = "one.txt";
+    e.name_len = 7;
+    e.type = NODE_TYPE_REG;
+    const scan_entry_t *se = &a.entries[2];
+    e.mode = se->node.mode; e.uid = se->node.uid; e.gid = se->node.gid;
+    e.size = se->node.size; e.mtime_sec = se->node.mtime_sec;
+    e.mtime_nsec = se->node.mtime_nsec; e.inode_identity = se->node.inode_identity;
+    memcpy(e.target_hash, se->node.content_hash, OBJECT_HASH_SIZE);
+    memcpy(e.xattr_hash, se->node.xattr_hash, OBJECT_HASH_SIZE);
+    memcpy(e.acl_hash, se->node.acl_hash, OBJECT_HASH_SIZE);
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    assert_int_equal(manifest_serialise(&e, 1, &buf, &len), OK);
+    uint8_t want[OBJECT_HASH_SIZE];
+    object_name(OBJECT_TYPE_TREE, buf, len, want);
+    free(buf);
+    assert_memory_equal(ra.hashes[1], want, OBJECT_HASH_SIZE);
+
+    /* The big one is not that: its name is its chunk list's. */
+    run_free(&ra);
+    run_free(&rb);
+    fx_free(&a);
+    fx_free(&b);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_names_match_the_previous_build),
+        cmocka_unit_test(test_large_directory_fragments_deterministically),
         cmocka_unit_test(test_scan_order_does_not_change_names),
         cmocka_unit_test(test_each_entry_is_visited_once),
         cmocka_unit_test(test_a_failed_step_stops_the_build),

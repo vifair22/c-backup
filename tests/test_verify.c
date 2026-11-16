@@ -31,6 +31,7 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "chunklist.h"
 #include "object.h"
 #include "pack.h"
 #include "parity.h"
@@ -139,6 +140,38 @@ static void content_hash_of(const char *name, char *hex_out)
     assert_int_equal(r->nrows, 1);
     snprintf(hex_out, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[0][0]);
     db_result_free(r);
+}
+
+/*
+ * Make a file's content one FILE object in a pack and point its node rows at
+ * it. A backup cuts a multi-MiB file into chunks; the large-object tests
+ * below are about parity across many groups of one entry, so they want one
+ * object. Valid content (a file the chunker found no cut in), so the node
+ * restores the same.
+ */
+static void whole_object_of(const char *name, const char *src, char *hex_out)
+{
+    int fd = open(src, O_RDONLY);
+    assert_true(fd >= 0);
+    struct stat sb;
+    assert_int_equal(fstat(fd, &sb), 0);
+    size_t len = (size_t)sb.st_size;
+    uint8_t *buf = malloc(len ? len : 1);
+    assert_non_null(buf);
+    assert_int_equal(read(fd, buf, len), (ssize_t)len);
+    close(fd);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    object_write_t w;
+    assert_int_equal(object_store_packed(store, OBJECT_TYPE_FILE, buf, len, NULL,
+                                         hash, &w), OK);
+    free(buf);
+    assert_int_equal(object_store_flush(store), OK);
+    assert_int_equal(store_index_put_packed(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                            w.phys_bytes, len), OK);
+    object_hash_to_hex(hash, hex_out);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE nodes SET content_hash = ? WHERE name = ?",
+        (const char *[]){ hex_out, name, NULL }, NULL), 0);
 }
 
 static void flip_byte(const char *path, off_t off)
@@ -714,7 +747,7 @@ static void test_large_object_damage_is_repaired(void **state)
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    content_hash_of("big.bin", hex);
+    whole_object_of("big.bin", TEST_SRC "/big.bin", hex);
     entry_at_t e = entry_of(hex);
     /* Incompressible, so stored at full size. */
     assert_int_equal(e.stored, BIG_OBJECT_BYTES);
@@ -750,7 +783,7 @@ static void test_large_object_loads_through_damage(void **state)
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    content_hash_of("big.bin", hex);
+    whole_object_of("big.bin", TEST_SRC "/big.bin", hex);
     entry_at_t e = entry_of(hex);
     flip_byte(e.path, (off_t)e.payload + 4 * 1024 * 1024);
 
@@ -792,7 +825,7 @@ static void test_failed_restore_leaves_no_plausible_file(void **state)
     int64_t snap = run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    content_hash_of("big.bin", hex);
+    whole_object_of("big.bin", TEST_SRC "/big.bin", hex);
     entry_at_t e = entry_of(hex);
 
     /* Shred a whole region: far past what parity can rebuild. */
@@ -846,7 +879,7 @@ static void test_grown_header_size_is_repaired(void **state)
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    content_hash_of("big.bin", hex);
+    whole_object_of("big.bin", TEST_SRC "/big.bin", hex);
     entry_at_t e = entry_of(hex);
 
     size_t orig_len = 0;
@@ -887,7 +920,7 @@ static void test_header_and_payload_damage_repaired_in_one_run(void **state)
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    content_hash_of("big.bin", hex);
+    whole_object_of("big.bin", TEST_SRC "/big.bin", hex);
     entry_at_t e = entry_of(hex);
 
     size_t orig_len = 0;
@@ -916,6 +949,128 @@ static void test_header_and_payload_damage_repaired_in_one_run(void **state)
     free(orig);
 }
 
+/*
+ * One chunk of a file's content (format 3): the middle leaf of its chunk
+ * list, or the content itself when it is one object. *len gets its length.
+ */
+static void chunk_of(const char *name, char *hex_out, uint64_t *len)
+{
+    char root_hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of(name, root_hex);
+    uint8_t root[OBJECT_HASH_SIZE];
+    hash_of_hex(root_hex, root);
+    uint64_t size = 0;
+    uint8_t type = 0;
+    assert_int_equal(object_get_info(store, root, &size, &type), OK);
+    if (type != OBJECT_TYPE_CHUNKLIST) {
+        snprintf(hex_out, OBJECT_HASH_SIZE * 2 + 1, "%s", root_hex);
+        *len = size;
+        return;
+    }
+    obj_loader_t ld = obj_loader_store(store);
+    chunklist_iter_t *it = NULL;
+    chunklist_hdr_t h;
+    assert_int_equal(chunklist_iter_open(&ld, root, OBJECT_TYPE_FILE, 0, &h, &it), OK);
+    chunklist_item_t x, pick;
+    memset(&pick, 0, sizeof(pick));
+    int done = 0, n = 0;
+    while (chunklist_iter_next(it, &x, &done) == OK && !done)
+        if (n++ <= 1) pick = x;          /* the second leaf: not the file's head */
+    chunklist_iter_close(it);
+    assert_true(n >= 2);
+    object_hash_to_hex(pick.hash, hex_out);
+    *len = pick.length;
+}
+
+/* Flip a byte at `at` into a packed object's stored payload. */
+static void flip_packed(const char *hex, uint64_t at, char *pack_path, size_t ppsz)
+{
+    uint8_t hash[OBJECT_HASH_SIZE];
+    hash_of_hex(hex, hash);
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &pnum, &off), OK);
+    assert_int_equal(pack_dat_path_resolve(pack_path, ppsz, TEST_REPO, pnum), 0);
+    flip_byte(pack_path, (off_t)(off + sizeof(pack_dat_entry_hdr_t) + at));
+    pack_cache_invalidate(store);
+}
+
+/*
+ * Format 3: a large file is chunks in a pack. One damaged byte in a chunk
+ * is repaired through the pack's parity; damage beyond it fails the run, and
+ * the finding that names the file is its list's, since no node names a
+ * chunk. Restore refuses the file rather than writing it wrong.
+ */
+static void test_chunk_damage_repaired_and_attributed(void **state)
+{
+    (void)state;
+    write_incompressible(TEST_SRC "/big.bin", BIG_OBJECT_BYTES, 61u);
+    int64_t snap = run_backup();
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    uint64_t clen = 0;
+    chunk_of("big.bin", hex, &clen);
+    char ppath[PATH_MAX];
+    flip_packed(hex, clen / 2, ppath, sizeof(ppath));
+
+    verify_result_t res;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
+                                NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.repaired, 1);
+    assert_int_equal(res.unrecoverable, 0);
+    char status[256];
+    finding_status_of(hex, status, sizeof(status));
+    assert_string_equal(status, "repaired");
+
+    /* Beyond parity: a run of bytes the chunk's parity cannot rebuild. */
+    uint8_t hash[OBJECT_HASH_SIZE];
+    hash_of_hex(hex, hash);
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &pnum, &off), OK);
+    int fd = open(ppath, O_RDWR);
+    assert_true(fd >= 0);
+    size_t n = 256 * 1024;
+    uint8_t *junk = malloc(n);
+    assert_non_null(junk);
+    memset(junk, 0x5A, n);
+    assert_int_equal(pwrite(fd, junk, n,
+                            (off_t)(off + sizeof(pack_dat_entry_hdr_t) + 1024)),
+                     (ssize_t)n);
+    free(junk);
+    close(fd);
+    pack_cache_invalidate(store);
+
+    verify_result_t bad;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
+                                NULL, NULL, NULL, &bad), ERR_CORRUPT);
+    err_clear();
+    assert_true(bad.unrecoverable >= 1);
+    assert_int_equal(bad.affected_files, 1);
+
+    char root_hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("big.bin", root_hex);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT status, sample_paths FROM verify_findings WHERE hash = ?"
+        "   AND run_id = (SELECT MAX(id) FROM verify_runs)",
+        (const char *[]){ root_hex, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "contains a lost chunk");
+    assert_string_equal(r->rows[0][1], TEST_SRC "/big.bin");
+    db_result_free(r);
+
+    char dst[PATH_MAX];
+    snprintf(dst, sizeof(dst), "%s/dst", TEST_DIR);
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, dst, NULL, &rr), ERR_CORRUPT);
+    assert_int_equal(rr.failed, 1);
+    char restored[PATH_MAX];
+    snprintf(restored, sizeof(restored), "%s%s/big.bin", dst, TEST_SRC);
+    struct stat sb;
+    assert_int_not_equal(lstat(restored, &sb), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -936,6 +1091,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_failed_restore_leaves_no_plausible_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_grown_header_size_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_header_and_payload_damage_repaired_in_one_run, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_chunk_damage_repaired_and_attributed, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

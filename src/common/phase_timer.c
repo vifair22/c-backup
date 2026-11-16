@@ -22,6 +22,7 @@ static const char *const phase_names[PHASE__COUNT] = {
     [PHASE_SETUP]        = "setup",
     [PHASE_PACK_SEAL]    = "pack-seal",
     [PHASE_SNAPSHOT]     = "snapshot-record",
+    [PHASE_STORE_WAIT]   = "file-wait",
     [PHASE_TXN_WAIT]     = "txn-wait",
     [PHASE_TXN_COMMIT]   = "txn-commit",
     [PHASE_PROGRESS]     = "progress-cb",
@@ -29,6 +30,7 @@ static const char *const phase_names[PHASE__COUNT] = {
     [PHASE_COMMIT_TREES] = "  commit:trees",
     [PHASE_COMMIT_INDEX] = "  commit:index",
     [PHASE_COMMIT_PACK]  = "  commit:pack",
+    [PHASE_STORE_WORKERS] = "  file-workers",
 };
 
 void phase_merge(phase_timers_t *dst, const phase_timers_t *src)
@@ -104,6 +106,13 @@ void phase_report(const phase_timers_t *t, const char *what, uint64_t total_ns)
                  (unsigned long long)rows[i].count, per_call_us);
     }
 
+
+    /* Said once rather than left for the reader to infer: file-workers is
+     * summed across threads and can exceed the wall clock. The backup
+     * thread's own wait for them is file-wait. */
+    if (t->store_threads > 1)
+        log_info("  (files stored on %u workers at once: file-workers is wall "
+                 "time summed over them)", t->store_threads);
 
     if (total_ns > accounted) {
         double gap = (double)(total_ns - accounted) / 1e9;

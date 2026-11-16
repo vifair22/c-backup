@@ -155,11 +155,8 @@ refuses "bind not an address" "bad.yaml:6: error: http.bind: 'not-an-ip' is not 
     '  bind: not-an-ip'
 refuses "file cache mode" "backup.file_cache_match: 'fast' is not one of auto, strict, relaxed" \
     'backup:' '  file_cache_match: fast'
-# The store pool went with the large-file path, and its key with it. A config
-# still carrying it is refused like any other unknown key rather than read
-# and ignored.
-refuses "the retired store_workers key" "bad.yaml:7: error: unknown key 'backup.store_workers'" \
-    'backup:' '  store_workers: 2'
+refuses "store workers out of range" "backup.store_workers: '65' is not between 0 and 64" \
+    'backup:' '  store_workers: 65'
 refuses "tab indentation" "bad.yaml:6: error: tab in the indentation" \
     "$(printf '\tbind: 127.0.0.1')"
 # log.level among other problems: it was dropped from the list.
@@ -400,7 +397,7 @@ contains "job completed" '"state":"completed"' "$(sock_body "/jobs/$BACKUP_JOB")
 JOB_BODY=$(sock_body "/jobs/$BACKUP_JOB")
 contains "backup result names its snapshot" '"result":{"snapshot_id":1,' "$JOB_BODY"
 contains "backup result counts files" '"files":3,' "$JOB_BODY"
-contains "there is no store pool" '"store_workers":1,' "$JOB_BODY"
+contains "no large files, no store pool" '"store_workers":1,' "$JOB_BODY"
 # B086: what the backup wrote, by category. Every object goes into a pack,
 # so the pack payload and its parity are the only categories there are.
 contains "backup result counts bytes written" '"bytes_written":' "$JOB_BODY"
@@ -1426,6 +1423,8 @@ security:
   key_dir: $R/keys
 retention:
   keep_snaps: 2
+backup:
+  store_workers: 2
 EOF
 C_BACKUP_CONFIG_PATH="$R/config.yaml" "$BIN" > "$R/daemon.log" 2>&1 &
 DAEMON_PID=$!
@@ -1539,27 +1538,20 @@ fi
 contains "policy reports the configured defaults" \
     '"key":"retention.keep_snaps","value":2' "$(sock_body /repos/1/policy)"
 
-# One object holds at most 16 MiB (OBJECT_MAX_BYTES). A file of exactly
-# that size is one object. A larger one needs the content-defined chunker,
-# which is not wired in yet, so until it is the backup fails outright and
-# names the file: skipping it with a warning would report a backup that does
-# not hold it. TODO(CDC): a 17 MiB file backs up as a chunk list.
+# One object holds at most 16 MiB (OBJECT_MAX_BYTES); a larger file is a
+# chunk list of content-defined chunks. B086: backup.store_workers reaches
+# the backup. Three files over 16 MiB, and the configured 2 caps the pool
+# where automatic would have used 3 on any machine with five CPUs or more;
+# the main daemon, on automatic, stored its three small files serially.
 mkdir -p "$R/big"
-head -c $((16 * 1024 * 1024)) /dev/urandom > "$R/big/max.bin"
+for i in 1 2 3; do head -c $((17 * 1024 * 1024)) /dev/urandom > "$R/big/f$i"; done
 SW=$(job_id "$(sock_post /repos/2/backup "{\"paths\":[\"$R/big\"]}")")
 wait_job "$SW"
 SW_BODY=$(sock_body "/jobs/$SW")
-contains "a 16 MiB file backs up" '"state":"completed"' "$SW_BODY"
-contains "as one object" '"objects_new":1,' "$SW_BODY"
-head -c $((17 * 1024 * 1024)) /dev/urandom > "$R/big/over.bin"
-SW=$(job_id "$(sock_post /repos/2/backup "{\"paths\":[\"$R/big\"]}")")
-wait_job "$SW"
-SW_BODY=$(sock_body "/jobs/$SW")
-contains "a 17 MiB file fails the backup" '"state":"failed"' "$SW_BODY"
-contains "and the job error names the file" "\"error\":\"backup: cannot store $R/big/over.bin" "$SW_BODY"
-check "and no snapshot is recorded for it" 1 \
-    "$(sock_body /repos/2/snapshots | grep -o '"id":[0-9]*' | wc -l | tr -d ' ')"
-rm -f "$R/big/max.bin" "$R/big/over.bin"
+contains "files over one object back up" '"state":"completed"' "$SW_BODY"
+contains "store_workers from config sizes the pool" '"store_workers":2,' "$SW_BODY"
+contains "and the backup stores all three" '"files":3,' "$SW_BODY"
+rm -f "$R/big/f1" "$R/big/f2" "$R/big/f3"
 rmdir "$R/big"
 
 # B101: deleting a snapshot. A tag protects it unless force says otherwise,

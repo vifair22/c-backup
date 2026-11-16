@@ -59,9 +59,11 @@
  * with it: the same 20-into-a-pack-over-the-seal shape at a sixteenth of the
  * size. At full size this suite held 1.2 GiB of scratch. */
 #define SEAL_BYTES   ((uint64_t)16 << 20)
-#define BIG_ENTRIES  20      /* of 1 MiB: 20 MiB in one pack */
+#define BIG_ENTRIES  46      /* of 448 KiB: 20 MiB in one pack */
 #define BIG_DEAD     2       /* entries no snapshot names, for gc to drop */
-#define ENTRY_BYTES  ((size_t)1 << 20)
+/* Under the 512 KiB minimum chunk (format 3), so each file is one chunk
+ * and backup finds it as the entry packed here. */
+#define ENTRY_BYTES  ((size_t)448 << 10)
 
 extern const db_migration_t app_migrations[];
 

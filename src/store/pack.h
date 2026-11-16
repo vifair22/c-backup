@@ -228,6 +228,40 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
                          int *out_is_new, uint64_t *out_phys_bytes,
                          uint64_t *out_payload_size);
 
+/*
+ * Staging split in two, for callers that do the CPU work on threads of their
+ * own (content-defined chunking, cdc.h). pack_backup_prepare is thread-safe
+ * and needs no writer: it names the object and compresses it when the probe
+ * says so. pack_backup_add_prepared does the rest - dedup against the
+ * repository and the open pack, encrypt, parity, write - and is called with
+ * whatever lock serialises the writer. data must stay valid until then.
+ * pack_backup_add is exactly the two in sequence.
+ */
+typedef struct {
+    uint8_t        hash[OBJECT_HASH_SIZE];
+    uint8_t        type;
+    uint8_t        compression;
+    size_t         len;          /* plaintext length */
+    const void    *data;
+    const uint8_t *payload;      /* data, or owned when compressed */
+    uint64_t       payload_len;
+    uint8_t       *owned;
+    /* Encrypted under the store's key, with CRC and parity, when prepared
+     * with a store: the append is then a write and nothing more. */
+    void          *sealed;
+} pack_prepared_t;
+
+/* Name, probe, compress; then encrypt and compute CRC and parity for
+ * store's repository, all on the calling thread. */
+status_t pack_backup_prepare(store_t *store, uint8_t type, const void *data,
+                             size_t len, pack_prepared_t *out);
+/* The same without sealing: pack_backup_add_prepared seals under its lock. */
+status_t pack_backup_prepare_plain(uint8_t type, const void *data, size_t len,
+                                   pack_prepared_t *out);
+status_t pack_backup_add_prepared(pack_backup_writer_t *w, const pack_prepared_t *pp,
+                                  int *out_is_new, uint64_t *out_phys_bytes);
+void     pack_prepared_free(pack_prepared_t *p);
+
 /* Would staging an object of this size push the open pack past its seal? */
 int pack_backup_full(const pack_backup_writer_t *w, uint64_t bytes);
 

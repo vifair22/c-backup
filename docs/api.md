@@ -876,15 +876,16 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
 | reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten) |
 
 A backup's `result` has its counts (`snapshot_id`, `files`, `dirs`,
 `files_unchanged`, `bytes_logical`, `objects_new`, `bytes_stored`,
 `trees_new`, `trees_reused`, `store_workers`) and what it wrote into the
-repository, in bytes. `store_workers` is always 1 for now: file content is
-stored on the backup thread until the chunker's workers are wired in.
+repository, in bytes. `store_workers` is the number of chunk workers the
+backup used for files over 16 MiB (1 when every chunk was stored on the
+backup thread).
 
 | Field | What |
 |---|---|
@@ -974,8 +975,11 @@ same shape is a `GROUP BY` over hash prefixes, and it is a visualisation now
 rather than a lookup structure.
 
 `/content` is capped deliberately. It feeds a preview pane, and a viewer that
-tries to render a multi-gigabyte file helps nobody; restore is how you get a
-whole file.
+tries to render a multi-gigabyte object helps nobody; restore is how you get a
+whole file. For a chunk list (type 6) it returns the start of the file the
+list describes rather than the list's own bytes, holes as zeroes:
+`{"type":6,"chunklist":true,"size":<logical size>,"returned":<bytes>,
+"truncated":<bool>,"base64":"..."}`.
 
 `/diff` walks manifest trees rather than comparing node lists. Two directories
 with the same hash have identical contents by construction, so an unchanged

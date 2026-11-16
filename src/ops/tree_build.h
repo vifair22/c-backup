@@ -19,6 +19,7 @@
  */
 
 #include "error.h"
+#include "manifest.h"
 #include "scan.h"
 #include "types.h"
 
@@ -36,12 +37,17 @@ typedef struct {
      */
     status_t (*step)(void *ctx, uint32_t done, uint32_t total);
     /*
-     * Store one serialised tree and name it into out_hash. index is the
-     * directory's scan index, or TREE_BUILD_ROOT. For a directory out_hash
-     * points into the hashes array, so the name is in place when put returns.
+     * Store one directory, given as its entries, and name it into out_hash.
+     * index is the directory's scan index, or TREE_BUILD_ROOT. For a
+     * directory out_hash points into the hashes array, so the name is in
+     * place when put returns. Serialising is put's: a backup stores through
+     * manifest_store_tree, which writes one TREE object, or fragments and a
+     * chunk list for a directory past 256 KiB serialised (OWN-34). put may
+     * reorder entries (manifest_store_tree sorts them); they are rebuilt
+     * for the next directory.
      */
-    status_t (*put)(void *ctx, uint32_t index, const uint8_t *buf, size_t len,
-                    uint8_t out_hash[OBJECT_HASH_SIZE]);
+    status_t (*put)(void *ctx, uint32_t index, manifest_entry_t *entries,
+                    uint32_t count, uint8_t out_hash[OBJECT_HASH_SIZE]);
     void *ctx;
     /*
      * Where entry i's tree hash lives: hashes + i * stride, OBJECT_HASH_SIZE

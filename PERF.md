@@ -47,6 +47,69 @@ The old cost quadruples per doubling, the new one doubles:
 Root tree names were identical between the two builds at every size. One
 wide directory was never the problem: the rescan costs entries per
 directory, so with one directory it is a single pass either way.
+## 2026-11-16 - Format 3: content-defined chunking, first backup
+
+The format 3 writer (docs/repo-format.md, "Format 3") against the 1.0.0 base
+it replaces (`origin/fix/infra1-test-scratch`, 7822d17), `bench_phases` on
+this machine (Linux 7.3.3, load average about 3 from other work), one run per
+cell unless stated, restore skipped (`-R`). tmpfs is `/dev/shm`; NVMe is
+`~/.cache` (btrfs on LVM on LUKS), with `-c` (source evicted, trailing sync
+timed). Presets: incompressible `-n 0 -l 4 -t 0 -m 512` (4 x 512 MiB
+random), compressible `-n 0 -l 0 -t 0 -T 4 -m 512` (4 x 512 MiB distinct
+text), mixed (the default: 10,000 small files, 3 x 64 MiB random, 2 x 64 MiB
+identical text), many-small `-n 100000 -l 0 -t 0`.
+
+| Preset | Medium | 1.0.0 s | format 3 s | 1.0.0 written / content | format 3 written / content |
+|---|---|---:|---:|---:|---:|
+| incompressible | tmpfs | 0.410 | 0.429 | 1.067 | 1.068 |
+| compressible | tmpfs | 0.760 | 0.396 | 1.076 | 0.004 |
+| mixed | tmpfs | 0.800 | 0.830 | 1.062 | 0.682 |
+| many-small | tmpfs | 8.084 | 8.419 | 1.010 | 1.010 |
+| incompressible | NVMe | 4.430 | 4.129 | 1.067 | 1.068 |
+| compressible | NVMe | 2.084 | 0.854 | 1.076 | 0.004 |
+| mixed | NVMe | 3.466 | 4.304 | 1.062 | 0.682 |
+| many-small | NVMe | 21.683 | 21.448 | 1.011 | 1.011 |
+
+The NVMe disk is shared with other work and swings by 3x between runs of
+the same binary (incompressible 1.4 to 4.4 s for 1.0.0 across the session).
+Mixed on NVMe, three alternating pairs (1.0.0 / format 3): 2.65 / 2.52,
+3.75 / 4.24, 1.60 / 1.60 s; the earlier table cell is inside that spread.
+Many-small on tmpfs measured 7.99 / 8.02 s in an earlier round of the same
+build.
+
+Written per content byte falls wherever content repeats or compresses:
+the compressible preset's generated text repeats at chunk scale, so it
+deduplicates almost entirely (9 MiB stored for 2 GiB), and the mixed
+preset's two identical text files and compressible chunks bring it to
+0.68x. Nothing is written loose and the pack pass writes nothing: 1.0.0
+wrote large files loose, uncompressed, and rewrote the compressible ones in
+the pack pass (B086).
+
+### What it took to reach the base
+
+The first wired version was far slower; each step below is one change, with
+the cell it moved:
+
+| Change | Cell | Before | After |
+|---|---|---:|---:|
+| Seal (encrypt, CRC, RS parity) on the chunk worker, not under the pack writer's lock | tmpfs incompressible | 1.26 s | (with the next) |
+| Several large files at once, each worker cutting into its own pack writer | tmpfs incompressible | 1.26 s | 0.44 s |
+| One index row per small file, not two (the content root was recorded twice) | tmpfs many-small | 8.76 s | 8.02 s |
+| Writeback started every 8 MiB appended (`sync_file_range`), as the format 2 loose writer did | NVMe incompressible | 4.05 s | 1.60-1.73 s (1.59 s base) |
+| A ring of read-ahead slots filled by its own thread, for spans of 16 MiB on a disk | NVMe incompressible | per file 206 MB/s | overlapping |
+| Pack commit creates missing object rows; file workers write none (was a WAL sync per file) | NVMe mixed | 6.76 s | 4.30 s |
+| No read-ahead on tmpfs or ramfs (a copy for nothing) | tmpfs incompressible | 0.57 s | 0.43 s |
+
+### Per-file CPU ceiling (`bench_micro`)
+
+| | MiB/s |
+|---|---:|
+| `cdc_scan_16M` (boundaries only) | 4,688 |
+| `sha256_oneshot_1M` (one core: format 2's per-file ceiling) | 2,071 |
+| `cdc_store_256M_8workers` (one file, chunk SHA-256 and probe) | 2,880 |
+
+One file goes at 1.4 times what one core's SHA-256 allowed; a tree of
+several large files at the rate of the file workers together.
 
 ## 2026-11-15 - Restore renames verified files in synced batches (OWN-36)
 

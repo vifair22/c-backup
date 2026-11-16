@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "store.h"
+#include "cdc.h"
 #include "repo_key.h"
 #include "object_crypt.h"
 #include "pack.h"
@@ -105,6 +106,15 @@ struct store {
      * with the calloc in store_open. Updated with __atomic builtins from
      * whichever threads write through the handle. */
     uint64_t            written[STORE_WR__COUNT];
+
+    /* Chunking parameters (format 3): the repository's constants and its
+     * keyed gear table. NULL until store_set_cdc; see store_cdc. Owned. */
+    cdc_params_t       *cdc;
+
+    /* Pack numbers handed out to writers open at once; see
+     * store_alloc_pack_num. 0 until the first allocation. */
+    pthread_mutex_t     pack_num_mu;
+    uint32_t            pack_num_next;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -424,6 +434,9 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->removed_cb      = NULL;
     r->removed_user    = NULL;
     r->cancel          = NULL;
+    r->cdc             = NULL;
+    r->pack_num_next   = 0;
+    pthread_mutex_init(&r->pack_num_mu, NULL);
     pthread_mutex_init(&r->bidx_mu, NULL);
     pthread_mutex_init(&r->implicit_mu, NULL);
 
@@ -449,16 +462,23 @@ void store_close(store_t *st) {
     if (st->implicit && st->implicit_close) st->implicit_close(st, st->implicit);
     st->implicit = NULL;
 
-    /* The key does not outlive the handle that used it. */
+    /* The key does not outlive the handle that used it, nor does the gear
+     * table derived from it. */
     OPENSSL_cleanse(&st->key, sizeof(st->key));
     object_aead_key_wipe(&st->aead);
     st->has_key = 0;
+    if (st->cdc) {
+        OPENSSL_cleanse(st->cdc, sizeof(*st->cdc));
+        free(st->cdc);
+        st->cdc = NULL;
+    }
 
     store_dat_cache_flush(st);
     free(st->dat_cache);
     st->dat_cache = NULL;
     close(st->dirfd);
     free(st->path);
+    pthread_mutex_destroy(&st->pack_num_mu);
     pthread_mutex_destroy(&st->bidx_mu);
     pthread_mutex_destroy(&st->implicit_mu);
     free(st->bidx);
@@ -768,4 +788,46 @@ void store_emit_pack_removed(store_t *st, uint64_t pack_id) {
     if (!st) return;
     if (!st->locate_cb) bidx_removed(st, pack_id);
     if (st->removed_cb) st->removed_cb(st->removed_user, pack_id);
+}
+
+status_t store_set_cdc(store_t *st, const cdc_params_t *p)
+{
+    if (!st || !p) return set_error(ERR_INVALID, "store_set_cdc: null argument");
+    if (!st->cdc && !(st->cdc = malloc(sizeof(*st->cdc))))
+        return set_error(ERR_NOMEM, "store_set_cdc");
+    *st->cdc = *p;
+    return OK;
+}
+
+/*
+ * A bare store (tests, benchmarks, a replica read without its marker) has no
+ * parameters set and chunks with the unkeyed format defaults. An encrypted
+ * one never does: its boundaries come from its key, and guessing them would
+ * cut every file differently from how its chunks were cut. Its write paths
+ * refuse without a key anyway; this makes the reason explicit.
+ */
+static cdc_params_t   g_cdc_defaults;
+static pthread_once_t g_cdc_once = PTHREAD_ONCE_INIT;
+
+static void store_cdc_init_defaults(void)
+{
+    cdc_params_default(&g_cdc_defaults);
+}
+
+const cdc_params_t *store_cdc(const store_t *st)
+{
+    if (!st) return NULL;
+    if (st->cdc) return st->cdc;
+    if (st->encrypted) return NULL;
+    pthread_once(&g_cdc_once, store_cdc_init_defaults);
+    return &g_cdc_defaults;
+}
+
+uint32_t store_alloc_pack_num(store_t *st, uint32_t floor)
+{
+    pthread_mutex_lock(&st->pack_num_mu);
+    if (st->pack_num_next < floor) st->pack_num_next = floor;
+    uint32_t n = st->pack_num_next++;
+    pthread_mutex_unlock(&st->pack_num_mu);
+    return n;
 }
