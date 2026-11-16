@@ -45,6 +45,10 @@ typedef struct {
     char  boot_config[PATH_MAX];      /* Unraid's /boot/config, for share exports */
 } snap_ctx_t;
 
+/* Host tools and a snapshot context from the policy's [host] and
+ * [snapshot] sections; tools must outlive ctx. */
+void snap_host_setup(const helper_policy_t *pol, host_tools_t *tools, snap_ctx_t *ctx);
+
 /* The domain a resolved, real path lies in. SNAP_NONE (OK) when it is in no
  * domain the policy names: the caller falls back. */
 status_t snap_domain_of(const snap_ctx_t *c, const char *real_path, snap_dom_t *out);

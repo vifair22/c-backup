@@ -32,6 +32,23 @@ static int zfs_allowed(const helper_policy_t *p, const char *ds)
     return 0;
 }
 
+void snap_host_setup(const helper_policy_t *pol, host_tools_t *t, snap_ctx_t *c)
+{
+    host_tools_defaults(t);
+    t->nsenter = pol->host_nsenter;
+    if (pol->host_nsenter_bin[0]) snprintf(t->nsenter_bin, sizeof(t->nsenter_bin), "%s", pol->host_nsenter_bin);
+    if (pol->host_zfs[0]) snprintf(t->zfs, sizeof(t->zfs), "%s", pol->host_zfs);
+    if (pol->host_btrfs[0]) snprintf(t->btrfs, sizeof(t->btrfs), "%s", pol->host_btrfs);
+    if (pol->host_realpath[0]) snprintf(t->realpath, sizeof(t->realpath), "%s", pol->host_realpath);
+    if (pol->host_lxc_dir[0]) snprintf(t->lxc_dir, sizeof(t->lxc_dir), "%s", pol->host_lxc_dir);
+    snprintf(t->host_root, sizeof(t->host_root), "%s", pol->host_root);
+    memset(c, 0, sizeof(*c));
+    c->tools = t;
+    c->pol = pol;
+    snprintf(c->btrfs_snapdir, sizeof(c->btrfs_snapdir), "%s", pol->btrfs_snapshot_dir);
+    snprintf(c->boot_config, sizeof(c->boot_config), "%s", pol->boot_config);
+}
+
 status_t snap_domain_of(const snap_ctx_t *c, const char *real_path, snap_dom_t *out)
 {
     memset(out, 0, sizeof(*out));

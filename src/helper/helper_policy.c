@@ -19,6 +19,9 @@ void helper_policy_free(helper_policy_t *p)
     if (!p) return;
     for (size_t i = 0; i < p->n_allow; i++) free(p->allow[i]);
     for (size_t i = 0; i < p->n_zfs; i++) free(p->zfs_domains[i]);
+    for (size_t i = 0; i < p->n_include; i++) free(p->include_roots[i]);
+    for (size_t i = 0; i < p->n_pause_always; i++) free(p->pause_always[i]);
+    for (size_t i = 0; i < p->n_never_pause; i++) free(p->never_pause[i]);
     for (size_t i = 0; i < p->n_btrfs; i++) free(p->btrfs_domains[i]);
     for (size_t i = 0; i < p->n_dir; i++) free(p->dir_domains[i]);
     for (size_t h = 0; h < p->n_hooks; h++)
@@ -96,12 +99,22 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
     out->max_pause_s = 30;
     out->max_captures_per_hour = 60;
     out->capture_max_s = 86400;
+    /* Unraid's layout (container-backup.md 13.1). */
+    out->host_nsenter = 1;
+    out->pause_timeout_s = 5;
+    snprintf(out->host_root, sizeof(out->host_root), "/proc/1/root");
+    snprintf(out->docker_socket, sizeof(out->docker_socket), "/var/run/docker.sock");
+    snprintf(out->user_root, sizeof(out->user_root), "/mnt/user");
+    snprintf(out->mnt_root, sizeof(out->mnt_root), "/mnt");
+    snprintf(out->boot_config, sizeof(out->boot_config), "/boot/config");
+    snprintf(out->templates_dir, sizeof(out->templates_dir), "/boot/config/plugins/dockerMan/templates-user");
+    snprintf(out->lxc_path, sizeof(out->lxc_path), "/mnt/cache/lxc");
     snprintf(out->socket, sizeof(out->socket), "/run/c-backup-helper/helper.sock");
 
     char *buf = strdup(text ? text : "");
     if (!buf) return set_error(ERR_NOMEM, "policy");
     status_t st = OK;
-    enum { S_NONE, S_HELPER, S_UNITS, S_SNAPSHOT, S_HOOK } sec = S_NONE;
+    enum { S_NONE, S_HELPER, S_UNITS, S_SNAPSHOT, S_HOOK, S_HOST, S_DOCKER, S_LXC } sec = S_NONE;
     policy_hook_t *hook = NULL;
     int line = 0;
     char *save = NULL;
@@ -117,6 +130,9 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
             if (strcmp(s, "helper") == 0) sec = S_HELPER;
             else if (strcmp(s, "units") == 0) sec = S_UNITS;
             else if (strcmp(s, "snapshot") == 0) sec = S_SNAPSHOT;
+            else if (strcmp(s, "host") == 0) sec = S_HOST;
+            else if (strcmp(s, "docker") == 0) sec = S_DOCKER;
+            else if (strcmp(s, "lxc") == 0) sec = S_LXC;
             else if (strncmp(s, "hook ", 5) == 0) {
                 const char *nm = trim(s + 5);
                 if (out->n_hooks >= POLICY_HOOKS_MAX) { st = bad(line, "too many hooks", NULL); break; }
@@ -173,6 +189,66 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
                 st = bad(line, "[units] takes allow = <provider>:<glob>, ...", v);
                 break;
             }
+        } else if (sec == S_HOST) {
+            struct { const char *k; char *dst; size_t sz; } paths[] = {
+                { "nsenter_bin", out->host_nsenter_bin, sizeof(out->host_nsenter_bin) },
+                { "zfs", out->host_zfs, sizeof(out->host_zfs) },
+                { "btrfs", out->host_btrfs, sizeof(out->host_btrfs) },
+                { "realpath", out->host_realpath, sizeof(out->host_realpath) },
+                { "lxc_dir", out->host_lxc_dir, sizeof(out->host_lxc_dir) },
+                { "user_root", out->user_root, sizeof(out->user_root) },
+                { "mnt_root", out->mnt_root, sizeof(out->mnt_root) },
+                { "boot_config", out->boot_config, sizeof(out->boot_config) },
+            };
+            int done = 0;
+            for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]) && !done; i++) {
+                if (strcmp(k, paths[i].k) != 0) continue;
+                done = 1;
+                if (*v && (!dir_ok(v) || strlen(v) >= paths[i].sz)) { st = bad(line, "must be a clean absolute path", v); break; }
+                snprintf(paths[i].dst, paths[i].sz, "%s", v);
+            }
+            if (st != OK) break;
+            if (done) continue;
+            if (strcmp(k, "nsenter") == 0) {
+                if (to_flag(v, &out->host_nsenter)) { st = bad(line, "nsenter is 0 or 1", v); break; }
+            } else if (strcmp(k, "host_root") == 0) {
+                /* "" is allowed: the helper already sees the host's tree. */
+                if (*v && (!dir_ok(v) || strlen(v) >= sizeof(out->host_root))) { st = bad(line, "host_root must be empty or a clean absolute path", v); break; }
+                snprintf(out->host_root, sizeof(out->host_root), "%s", v);
+            } else { st = bad(line, "unknown key in [host]", k); break; }
+        } else if (sec == S_DOCKER) {
+            if (strcmp(k, "enabled") == 0) {
+                if (to_flag(v, &out->docker_enabled)) { st = bad(line, "enabled is 0 or 1", v); break; }
+            } else if (strcmp(k, "socket") == 0) {
+                if (!dir_ok(v) || strlen(v) >= sizeof(out->docker_socket)) { st = bad(line, "socket must be a clean absolute path under 108 bytes", v); break; }
+                snprintf(out->docker_socket, sizeof(out->docker_socket), "%s", v);
+            } else if (strcmp(k, "include_roots") == 0) {
+                if (to_list(v, out->include_roots, &out->n_include, dir_ok)) { st = bad(line, "bad include_roots", v); break; }
+            } else if (strcmp(k, "pause") == 0) {
+                if (strcmp(v, "auto") == 0) out->docker_pause = 0;
+                else if (strcmp(v, "always") == 0) out->docker_pause = 1;
+                else if (strcmp(v, "never") == 0) out->docker_pause = 2;
+                else { st = bad(line, "pause is auto, always or never", v); break; }
+            } else if (strcmp(k, "pause_always") == 0) {
+                if (to_list(v, out->pause_always, &out->n_pause_always, NULL)) { st = bad(line, "bad pause_always", v); break; }
+            } else if (strcmp(k, "never_pause") == 0) {
+                if (to_list(v, out->never_pause, &out->n_never_pause, NULL)) { st = bad(line, "bad never_pause", v); break; }
+            } else if (strcmp(k, "pause_timeout_s") == 0) {
+                if (to_uint(v, 1, 300, &out->pause_timeout_s)) { st = bad(line, "pause_timeout_s is 1 to 300", v); break; }
+            } else if (strcmp(k, "templates_dir") == 0) {
+                if (*v && (!dir_ok(v) || strlen(v) >= sizeof(out->templates_dir))) { st = bad(line, "templates_dir must be a clean absolute path", v); break; }
+                snprintf(out->templates_dir, sizeof(out->templates_dir), "%s", v);
+            } else { st = bad(line, "unknown key in [docker]", k); break; }
+        } else if (sec == S_LXC) {
+            if (strcmp(k, "enabled") == 0) {
+                if (to_flag(v, &out->lxc_enabled)) { st = bad(line, "enabled is 0 or 1", v); break; }
+            } else if (strcmp(k, "path") == 0) {
+                if (!dir_ok(v) || strlen(v) >= sizeof(out->lxc_path)) { st = bad(line, "path must be a clean absolute path", v); break; }
+                snprintf(out->lxc_path, sizeof(out->lxc_path), "%s", v);
+            } else { st = bad(line, "unknown key in [lxc]", k); break; }
+        } else if (sec == S_SNAPSHOT && strcmp(k, "btrfs_snapshot_dir") == 0) {
+            if (!dir_ok(v) || strlen(v) >= sizeof(out->btrfs_snapshot_dir)) { st = bad(line, "btrfs_snapshot_dir must be a clean absolute path", v); break; }
+            snprintf(out->btrfs_snapshot_dir, sizeof(out->btrfs_snapshot_dir), "%s", v);
         } else if (sec == S_SNAPSHOT) {
             int rc = strcmp(k, "zfs_domains") == 0   ? to_list(v, out->zfs_domains, &out->n_zfs, dataset_ok)
                    : strcmp(k, "btrfs_domains") == 0 ? to_list(v, out->btrfs_domains, &out->n_btrfs, dir_ok)
@@ -222,6 +298,9 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
     for (size_t h = 0; st == OK && h < out->n_hooks; h++)
         if (!out->hooks[h].unit[0] || out->hooks[h].argc == 0)
             st = set_error(ERR_INVALID, "policy: hook %s needs a unit and argv.0", out->hooks[h].name);
+    if (st == OK && out->docker_enabled && out->n_include == 0 &&
+        to_list("/mnt/cache/appdata,/mnt/user/appdata", out->include_roots, &out->n_include, dir_ok))
+        st = set_error(ERR_NOMEM, "policy");
     if (st != OK) { helper_policy_free(out); return st; }
     /* The digest the hello carries, so the daemon can log which policy it
      * is talking to. */

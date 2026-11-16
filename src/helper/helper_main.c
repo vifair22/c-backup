@@ -13,7 +13,9 @@
  * No network, no shell, no command but those the policy names.
  */
 
+#include "docker_backend.h"
 #include "fake_provider.h"
+#include "lxc_backend.h"
 #include "helper_policy.h"
 #include "helper_server.h"
 
@@ -82,10 +84,37 @@ int main(int argc, char **argv)
         log_warn("helper: the fake provider is enabled from %s; this is for tests", pol.fake_spec);
     }
 
-    helper_server_cfg_t cfg = { &pol, fake, 1, 0, NULL, 0 };
+    helper_backend_t be[2];
+    size_t nbe = 0;
+    int have_docker = 0, have_lxc = 0;
+    if (pol.docker_enabled) {
+        if (docker_backend_init(&pol, &be[nbe]) != OK) {
+            fprintf(stderr, "c-backup-helper: %s\n", err_msg());
+            if (fake) fake_provider_ops.fini(fake);
+            helper_policy_free(&pol);
+            return 1;
+        }
+        have_docker = (int)++nbe;
+        log_info("helper: docker provider over %s", pol.docker_socket);
+    }
+    if (pol.lxc_enabled) {
+        if (lxc_backend_init(&pol, &be[nbe]) != OK) {
+            fprintf(stderr, "c-backup-helper: %s\n", err_msg());
+            if (have_docker) docker_backend_fini(&be[have_docker - 1]);
+            if (fake) fake_provider_ops.fini(fake);
+            helper_policy_free(&pol);
+            return 1;
+        }
+        have_lxc = (int)++nbe;
+        log_info("helper: lxc provider over %s", pol.lxc_path);
+    }
+
+    helper_server_cfg_t cfg = { &pol, fake, 1, 0, be, nbe };
     helper_server_t *srv = NULL;
     if (helper_server_start(&cfg, &srv) != OK) {
         fprintf(stderr, "c-backup-helper: %s\n", err_msg());
+        if (have_docker) docker_backend_fini(&be[have_docker - 1]);
+        if (have_lxc) lxc_backend_fini(&be[have_lxc - 1]);
         if (fake) fake_provider_ops.fini(fake);
         helper_policy_free(&pol);
         return 1;
@@ -98,6 +127,8 @@ int main(int argc, char **argv)
     }
     log_info("helper: stopping");
     helper_server_stop(srv);
+    if (have_docker) docker_backend_fini(&be[have_docker - 1]);
+    if (have_lxc) lxc_backend_fini(&be[have_lxc - 1]);
     if (fake) fake_provider_ops.fini(fake);
     helper_policy_free(&pol);
     return 0;
