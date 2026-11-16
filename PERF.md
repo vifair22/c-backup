@@ -6,6 +6,47 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-16 - Tree building is linear in entries (OWN-43)
+
+`build_one_tree` found a directory's children by scanning every scan entry,
+twice (count, then copy), so the trees phase was O(directories x entries).
+The ordering pass in front of it had already been made linear; this was the
+same shape one step later. `tree_build` (src/ops/tree_build.c) now buckets
+every entry under its parent's scan index once, and each tree reads its own
+bucket. Tree bytes are unchanged: `tests/test_tree_build.c` pins every tree
+name of a synthetic scan to values captured from the old code, and a
+no-change incremental reuses the same 25,005 of 25,008 trees before and
+after.
+
+`bench_phases -d ~/.cache/own43bench -n 250000 -s 64 -D 10 -l 0 -t 0 -R`
+(25,000 directories of 10 files, 25,007 directories in all), btrfs on
+NVMe, single run each:
+
+| Build | First backup | trees phase | No-change incremental | trees phase |
+|---|---:|---:|---:|---:|
+| Before | 49.09 s | 7.6 s | 24.42 s | 5.6 s |
+| OWN-43 | 36.71 s | 1.5 s | 16.93 s | 0.3 s |
+
+The first backup's remaining 1.5 s is mostly hashing and staging 25,008 new
+trees and their 13 commits (0.55 s of it). The rest of the gap in the totals
+is run-to-run noise in the store and index phases, which this change does
+not touch.
+
+The tree phase alone, `build_trees` over a synthetic scan with the store
+replaced by `object_name` (no I/O), old and new code built the same way.
+The old cost quadruples per doubling, the new one doubles:
+
+| Directories x 10 files | Entries | Before | OWN-43 |
+|---|---:|---:|---:|
+| 3,125 | 34,376 | 0.102 s | 0.013 s |
+| 6,250 | 68,751 | 0.344 s | 0.021 s |
+| 12,500 | 137,501 | 1.399 s | 0.042 s |
+| 25,000 | 275,001 | 5.449 s | 0.084 s |
+| 1 x 250,000 | 250,002 | 0.077 s | 0.087 s |
+
+Root tree names were identical between the two builds at every size. One
+wide directory was never the problem: the rescan costs entries per
+directory, so with one directory it is a single pass either way.
 ## 2026-11-16 - Format 3: content-defined chunking, first backup
 
 The format 3 writer (docs/repo-format.md, "Format 3") against the 1.0.0 base

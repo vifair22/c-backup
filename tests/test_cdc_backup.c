@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <stdatomic.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
@@ -31,6 +32,8 @@
 #include "cdc.h"
 #include "chunklist.h"
 #include "gc.h"
+#include "pack.h"
+#include "verify.h"
 #include "manifest.h"
 #include "object.h"
 #include "prune.h"
@@ -344,6 +347,102 @@ static void test_gc_keeps_chunks_of_live_lists(void **state)
 }
 
 /*
+ * Rows created at pack commit are garbage until a snapshot names them.
+ *
+ * A pack's commit creates the object row of every entry in it (refcount 0,
+ * db_pack_commit), so a backup that fails after one of its packs committed
+ * leaves rows and pack entries no snapshot reaches. gc must take them: it
+ * zeroes every refcount and marks from the snapshots alone (gc_run), so
+ * nothing about how a row was created can make it look referenced. The
+ * repository verifies clean afterwards and the next backup is whole.
+ */
+typedef struct {
+    atomic_int *cancel;
+    uint64_t    at;
+} cancel_at_t;
+
+static void cancel_at_bytes(void *ctx, uint64_t done, uint64_t total)
+{
+    cancel_at_t *c = ctx;
+    (void)total;
+    if (done >= c->at) atomic_store(c->cancel, 1);
+}
+
+static void quiet_progress(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)phase; (void)done; (void)total; (void)ctx;
+}
+
+static void count_pack(uint32_t num, void *ctx)
+{
+    (void)num;
+    (*(int *)ctx)++;
+}
+
+static void test_failed_backup_leaves_garbage_gc_reclaims(void **state)
+{
+    (void)state;
+    /* Small packs, so the file workers seal several before the cancel. */
+    pack_test_set_seal(4 * MiB);
+    for (int f = 0; f < 2; f++) {
+        uint8_t *d = rand_buf(24 * MiB, 71 + (uint64_t)f);
+        char path[256];
+        snprintf(path, sizeof(path), TEST_SRC "/big%d.bin", f);
+        write_buf(path, d, 24 * MiB);
+        free(d);
+    }
+
+    static const char *paths[] = { TEST_SRC };
+    atomic_int cancel = 0;
+    cancel_at_t ca = { &cancel, 24 * MiB };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.store_workers = 8;          /* two file workers: rows only at commit */
+    o.cancel = &cancel;
+    o.progress_cb = quiet_progress;
+    o.bytes_cb = cancel_at_bytes;
+    o.progress_ctx = &ca;
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), ERR_BUSY);
+    err_clear();
+
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
+    int committed = scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?"
+                           " AND location != 'staged'");
+    printf("cancelled backup left %d committed object row(s)\n", committed);
+    assert_true(committed > 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?"
+                            " AND refcount != 0"), 0);
+    int packs = 0;
+    assert_int_equal(pack_list(store, count_pack, &packs), OK);
+    assert_true(packs > 0);
+
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_true(g.swept >= (uint64_t)committed);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?"), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?"), 0);
+    packs = 0;
+    assert_int_equal(pack_list(store, count_pack, &packs), OK);
+    assert_int_equal(packs, 0);
+
+    verify_result_t v;
+    memset(&v, 0, sizeof(v));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &v), OK);
+    assert_int_equal(v.missing, 0);
+    assert_int_equal(v.unrecoverable, 0);
+    assert_int_equal(v.ok, v.checked);
+
+    /* And the next backup is whole. */
+    backup_result_t r = backup(8);
+    restore_and_diff(r.snapshot_id);
+    pack_test_set_seal(0);
+}
+
+/*
  * Reindex from an empty object table: every list and chunk gets its row
  * back with its real type, so a gc afterwards keeps every chunk and the
  * snapshot still restores.
@@ -590,6 +689,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_workers_do_not_change_the_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_append_and_edit_write_little, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_keeps_chunks_of_live_lists, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_failed_backup_leaves_garbage_gc_reclaims, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_restores_chunk_rows, setup, teardown),
         cmocka_unit_test_setup_teardown(test_huge_directory, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replicate_across_keys_rechunks, setup, teardown),

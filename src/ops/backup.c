@@ -17,6 +17,7 @@
 #include "pack.h"
 #include "snap_record.h"
 #include "snapshot_ids.h"
+#include "tree_build.h"
 
 #include <cutils/log.h>
 
@@ -318,61 +319,6 @@ static const char *basename_of(const char *path)
 {
     const char *slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
-}
-
-/*
- * node_id to scan index.
- *
- * This was a linear scan of every entry. It is called once per step of every
- * parent chain, so on a tree with a quarter of a million entries and
- * twenty-five thousand directories the cost compounded into something that
- * would not have finished this decade. Open addressing, built once per run,
- * keeps it O(1) and the whole ordering pass linear, which is what design
- * constraint 3 asks for.
- */
-typedef struct {
-    uint64_t *keys;     /* node_id, 0 means empty */
-    uint32_t *vals;     /* scan index */
-    uint32_t  mask;
-} idmap_t;
-
-static void idmap_free(idmap_t *m)
-{
-    free(m->keys);
-    free(m->vals);
-    m->keys = NULL;
-    m->vals = NULL;
-}
-
-static int idmap_build(idmap_t *m, const node_link_t *links, uint32_t count)
-{
-    uint32_t cap = 16;
-    while (cap < count * 2) cap <<= 1;
-    m->keys = calloc(cap, sizeof(*m->keys));
-    m->vals = calloc(cap, sizeof(*m->vals));
-    if (!m->keys || !m->vals) { idmap_free(m); return -1; }
-    m->mask = cap - 1;
-
-    for (uint32_t i = 0; i < count; i++) {
-        uint64_t k = links[i].node_id;
-        if (k == 0) continue;   /* 0 is the empty marker and never a node id */
-        uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 32) & m->mask;
-        while (m->keys[h] != 0 && m->keys[h] != k) h = (h + 1) & m->mask;
-        m->keys[h] = k;
-        m->vals[h] = i;
-    }
-    return 0;
-}
-
-static uint32_t idmap_get(const idmap_t *m, uint64_t node_id)
-{
-    if (node_id == 0) return UINT32_MAX;
-    uint32_t h = (uint32_t)((node_id * 0x9E3779B97F4A7C15ULL) >> 32) & m->mask;
-    while (m->keys[h] != 0) {
-        if (m->keys[h] == node_id) return m->vals[h];
-        h = (h + 1) & m->mask;
-    }
-    return UINT32_MAX;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1203,61 +1149,31 @@ static status_t store_content_loop(pipeline_t *p)
 /* ------------------------------------------------------------------ */
 
 /*
- * Serialise one directory from its immediate children. Called only after
- * every child directory already has its hash, which the depth ordering
- * below guarantees.
+ * The ordering and the grouping of children under parents are tree_build's
+ * (src/ops/tree_build.c), which keeps the phase linear in entries. What
+ * stays here is what a backup does around each tree: cancellation, progress,
+ * the batch, the store and the index.
  */
-static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
-                               uint8_t out_hash[OBJECT_HASH_SIZE])
+
+/* Before each directory, and once more before the synthetic root. */
+static status_t tree_step(void *ctx, uint32_t done, uint32_t total)
 {
-    uint64_t dir_node = (dir_index == UINT32_MAX)
-                        ? 0 : p->links[dir_index].node_id;
-
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < p->count; i++)
-        if (p->links[i].parent_id == dir_node) n++;
-
-    manifest_entry_t *entries = n ? calloc(n, sizeof(*entries)) : NULL;
-    if (n && !entries) return set_error(ERR_NOMEM, "build_one_tree: alloc");
-
-    uint32_t k = 0;
-    for (uint32_t i = 0; i < p->count && k < n; i++) {
-        if (p->links[i].parent_id != dir_node) continue;
-        scan_entry_t *e = &p->scan->entries[i];
-        manifest_entry_t *m = &entries[k++];
-
-        m->name           = basename_of(e->path);
-        m->name_len       = (uint16_t)strlen(m->name);
-        m->type           = e->node.type;
-        m->mode           = e->node.mode;
-        m->uid            = e->node.uid;
-        m->gid            = e->node.gid;
-        m->size           = e->node.size;
-        m->mtime_sec      = e->node.mtime_sec;
-        m->mtime_nsec     = e->node.mtime_nsec;
-        m->inode_identity = e->node.inode_identity;
-        /* node_t overlays device and symlink in a union, so this is only a
-         * device pair for the two types that have one. Copying it
-         * unconditionally would write a symlink's target_len into dev_major
-         * and change tree hashes for every symlink in the repository. */
-        if (e->node.type == NODE_TYPE_CHR || e->node.type == NODE_TYPE_BLK) {
-            m->dev_major = e->node.device.major;
-            m->dev_minor = e->node.device.minor;
-        }
-        memcpy(m->xattr_hash, e->node.xattr_hash, OBJECT_HASH_SIZE);
-        memcpy(m->acl_hash,   e->node.acl_hash,   OBJECT_HASH_SIZE);
-
-        if (e->node.type == NODE_TYPE_DIR)
-            memcpy(m->target_hash, p->links[i].tree_hash, OBJECT_HASH_SIZE);
-        else
-            memcpy(m->target_hash, e->node.content_hash, OBJECT_HASH_SIZE);
-
-        if (e->symlink_target) {
-            m->link_target     = e->symlink_target;
-            m->link_target_len = (uint16_t)strlen(e->symlink_target);
-        }
+    pipeline_t *p = ctx;
+    if (done < total) {
+        if (cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
+        report(p, "trees", done, total);
+    } else if (total) {
+        /* Every directory is built: see the closing store report. */
+        report(p, "trees", total, total);
     }
+    batch_open(p, &p->batch);
+    return OK;
+}
 
+static status_t tree_put(void *ctx, uint32_t index, manifest_entry_t *entries,
+                         uint32_t count, uint8_t out_hash[OBJECT_HASH_SIZE])
+{
+    pipeline_t *p = ctx;
     /*
      * One TREE object, or for a directory too large for one, fragments named
      * by a chunk list (OWN-34), all through the backup's sink so their rows
@@ -1266,11 +1182,10 @@ static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
      * and trailer included, and the serialised length as the logical one.
      */
     const cdc_params_t *cp = store_cdc(p->store);
-    if (!cp) { free(entries); return set_error(ERR_INVALID, "no chunking parameters"); }
+    if (!cp) return set_error(ERR_INVALID, "no chunking parameters");
     obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
     manifest_store_stats_t ms;
-    status_t st = manifest_store_tree(entries, k, cp, &sink, out_hash, &ms);
-    free(entries);
+    status_t st = manifest_store_tree(entries, count, cp, &sink, out_hash, &ms);
     if (st == OK) st = bsink_flush(p->sink, 0);
     if (st != OK) return st;
 
@@ -1281,136 +1196,16 @@ static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
      * fragment and its list, and counts as new. */
     if (ms.objects_new) p->res->trees_new++;
     else                p->res->trees_reused++;
-    return OK;
-}
 
-/*
- * Depth of every entry, in one pass.
- *
- * Each chain walk memoises what it learns, so an entry is resolved once and
- * every descendant that passes through it afterwards stops there. Total work
- * is proportional to the number of entries rather than to entries times
- * depth, and nothing recomputes a depth it has already established.
- *
- * The visiting marker guards against a parent cycle. That should not be
- * possible from a filesystem scan, but a cycle here would be an unkillable
- * loop rather than a wrong answer, and this is the pass that just proved how
- * badly that ends.
- */
-#define DEPTH_UNKNOWN  UINT32_MAX
-#define DEPTH_VISITING (UINT32_MAX - 1)
-
-static status_t compute_depths(const pipeline_t *p, const idmap_t *map,
-                               uint32_t **out_depth)
-{
-    uint32_t *depth = malloc(p->count * sizeof(*depth));
-    if (!depth) return set_error(ERR_NOMEM, "build_trees: depth alloc");
-    for (uint32_t i = 0; i < p->count; i++) depth[i] = DEPTH_UNKNOWN;
-
-    uint32_t *stack = malloc(p->count * sizeof(*stack));
-    if (!stack) { free(depth); return set_error(ERR_NOMEM, "build_trees: depth stack"); }
-
-    for (uint32_t i = 0; i < p->count; i++) {
-        if (depth[i] != DEPTH_UNKNOWN) continue;
-
-        uint32_t n_stack = 0;
-        uint32_t cur = i;
-        uint32_t base = 0;   /* depth to give the topmost entry on the stack */
-
-        /*
-         * Walk up until an ancestor whose depth is already known, or a root.
-         * An anchored chain hangs one level below that ancestor; an unanchored
-         * one is rooted here, at depth zero.
-         */
-        for (;;) {
-            if (depth[cur] == DEPTH_VISITING) { base = 0; break; }  /* cycle */
-            if (depth[cur] != DEPTH_UNKNOWN) { base = depth[cur] + 1; break; }
-
-            depth[cur] = DEPTH_VISITING;
-            stack[n_stack++] = cur;
-
-            uint64_t parent = p->links[cur].parent_id;
-            if (parent == 0) { base = 0; break; }
-            uint32_t pi = idmap_get(map, parent);
-            if (pi == UINT32_MAX) { base = 0; break; }
-            cur = pi;
-        }
-
-        /* Top of the stack is shallowest, so unwind assigning increasing
-         * depth. Everything touched is now resolved for later chains. */
-        uint32_t d = base;
-        while (n_stack > 0) depth[stack[--n_stack]] = d++;
+    if (index != TREE_BUILD_ROOT) {
+        p->links[index].hash_ready = 1;
+        batch_count(p, &p->batch);
     }
-
-    free(stack);
-    *out_depth = depth;
     return OK;
 }
-
-
 
 static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
 {
-    /* Order directories deepest-first so a parent is never serialised before
-     * its children have hashes. */
-    uint32_t *dirs = NULL;
-    uint32_t ndirs = 0;
-    for (uint32_t i = 0; i < p->count; i++)
-        if (p->scan->entries[i].node.type == NODE_TYPE_DIR) ndirs++;
-
-    if (ndirs) {
-        dirs = malloc(ndirs * sizeof(*dirs));
-        if (!dirs) return set_error(ERR_NOMEM, "build_trees: alloc");
-        uint32_t k = 0;
-        for (uint32_t i = 0; i < p->count; i++)
-            if (p->scan->entries[i].node.type == NODE_TYPE_DIR) dirs[k++] = i;
-
-        /*
-         * Counting sort by descending depth.
-         *
-         * This was an insertion sort calling a parent-chain walk on every
-         * comparison, which is fine at a few hundred directories and fatal at
-         * twenty-five thousand: quadratic in directories, each comparison
-         * linear in entries. Depths are already computed, and they are small
-         * integers, so ordering by them is a pair of linear passes.
-         */
-        idmap_t map = { NULL, NULL, 0 };
-        if (idmap_build(&map, p->links, p->count) != 0) {
-            free(dirs);
-            return set_error(ERR_NOMEM, "build_trees: id map");
-        }
-        uint32_t *depth = NULL;
-        status_t dst = compute_depths(p, &map, &depth);
-        idmap_free(&map);
-        if (dst != OK) { free(dirs); return dst; }
-
-        uint32_t maxd = 0;
-        for (uint32_t a = 0; a < ndirs; a++)
-            if (depth[dirs[a]] > maxd) maxd = depth[dirs[a]];
-
-        uint32_t *counts = calloc((size_t)maxd + 2, sizeof(*counts));
-        uint32_t *sorted = malloc(ndirs * sizeof(*sorted));
-        if (!counts || !sorted) {
-            free(counts); free(sorted); free(depth); free(dirs);
-            return set_error(ERR_NOMEM, "build_trees: ordering");
-        }
-        for (uint32_t a = 0; a < ndirs; a++) counts[depth[dirs[a]]]++;
-        /* Deepest first: offsets accumulate from the high end. */
-        uint32_t running = 0;
-        for (uint32_t d = maxd + 1; d-- > 0; ) {
-            uint32_t c = counts[d];
-            counts[d] = running;
-            running += c;
-        }
-        for (uint32_t a = 0; a < ndirs; a++)
-            sorted[counts[depth[dirs[a]]]++] = dirs[a];
-
-        memcpy(dirs, sorted, ndirs * sizeof(*dirs));
-        free(sorted);
-        free(counts);
-        free(depth);
-    }
-
     /*
      * Tree rows are written in batches, like the store phase's (batch_t).
      *
@@ -1429,32 +1224,21 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
     batch_t *b = &p->batch;
     memset(b, 0, sizeof(*b));
     p->timers->txn_site = PHASE_COMMIT_TREES;
-    status_t st = OK;
 
     /* Trees go through the same sink as content, with no workers and no
      * sealing: the batch is held for the whole phase. */
     bsink_t *tsink = bsink_new(p, p->pack_w);
-    if (!tsink) { free(dirs); return set_error(ERR_NOMEM, "backup: object sink"); }
+    if (!tsink) return set_error(ERR_NOMEM, "backup: object sink");
     p->sink = tsink;
 
-    for (uint32_t a = 0; a < ndirs; a++) {
-        if (cancelled(p)) { st = set_error(ERR_BUSY, "backup cancelled"); break; }
-        report(p, "trees", a, ndirs);
-        batch_open(p, b);
-        st = build_one_tree(p, dirs[a], p->links[dirs[a]].tree_hash);
-        if (st != OK) break;
-        p->links[dirs[a]].hash_ready = 1;
-        batch_count(p, b);
-    }
-    free(dirs);
-
-    if (st == OK) {
-        /* Every directory is built: see the closing store report. */
-        if (ndirs) report(p, "trees", ndirs, ndirs);
-        /* The synthetic root ties the source paths together into one tree. */
-        batch_open(p, b);
-        st = build_one_tree(p, UINT32_MAX, root_hash);
-    }
+    tree_build_ops_t ops = {
+        .step   = tree_step,
+        .put    = tree_put,
+        .ctx    = p,
+        .hashes = p->links[0].tree_hash,
+        .stride = sizeof(node_link_t),
+    };
+    status_t st = tree_build(p->scan, &ops, root_hash, NULL);
 
     /* Committed on failure too, as the store phase does: the rows name
      * objects in the open pack, and the caller drops staged rows when the
