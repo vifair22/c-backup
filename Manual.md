@@ -1532,7 +1532,8 @@ behind (section 2.2). The journal entry carries the same in a line.
 Compaction copies entries into packs whose parity is computed afresh, so it
 corrects each entry from its old parity on the way. An entry damaged beyond
 parity is copied as it is and compaction finishes, then the job **fails**
-with `gc: N pack entr(ies) damaged beyond parity were copied as damaged`,
+with `gc: N pack entr(ies) damaged beyond parity were copied as damaged` (`was`
+for one),
 the alert goes out and `c-backup gc` exits 1. The result adds
 `pack_entries_damaged`, `damaged` (the first 100 hashes) and
 `damaged_listed`.

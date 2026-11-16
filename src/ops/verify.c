@@ -135,21 +135,18 @@ static int status_is_loss(const char *status)
  * affected_files is distinct paths; affected_versions is node rows, one per
  * path per snapshot, which is what the first used to count.
  */
-static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
-                           const char *hex, const char *status)
+/*
+ * The files that name hex as their content: distinct paths, node rows, and
+ * a handful of example paths, not all of them - a pack entry shared by ten
+ * thousand nodes would otherwise write a row nobody can read. The window
+ * counts are over every path, before the LIMIT.
+ */
+static void paths_of(cutils_db_t *db, const char *repo, const char *hex,
+                     uint64_t *out_files, uint64_t *out_versions, char *paths, size_t cap)
 {
-    char repo[32], run[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
-
-    /* A handful of example paths, not all of them: a pack entry shared by
-     * ten thousand nodes would otherwise write a row nobody can read. The
-     * window counts are over every path, before the LIMIT. */
-    char paths[FINDING_SAMPLE_PATHS * (PATH_MAX + 2)];
     size_t off = 0;
     paths[0] = '\0';
-    uint64_t n_files = 0, n_versions = 0;
-
+    *out_files = *out_versions = 0;
     db_result_t *r = NULL;
     if (db_execute(db,
             "WITH RECURSIVE up(snap, parent, path, depth) AS ("
@@ -160,16 +157,40 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
             VERIFY_ROOTED
             " GROUP BY path ORDER BY path LIMIT " VERIFY_STR(FINDING_SAMPLE_PATHS),
             (const char *[]){ repo, hex, NULL }, &r) == 0 && r && r->nrows > 0) {
-        n_files    = strtoull(r->rows[0][1], NULL, 10);
-        n_versions = strtoull(r->rows[0][2], NULL, 10);
+        *out_files    = strtoull(r->rows[0][1], NULL, 10);
+        *out_versions = strtoull(r->rows[0][2], NULL, 10);
         for (int i = 0; i < r->nrows && i < FINDING_SAMPLE_PATHS; i++) {
-            int w = snprintf(paths + off, sizeof(paths) - off, "%s%s",
+            int w = snprintf(paths + off, cap - off, "%s%s",
                              off ? ", " : "", r->rows[i][0]);
-            if (w < 0 || (size_t)w >= sizeof(paths) - off) break;
+            if (w < 0 || (size_t)w >= cap - off) break;
             off += (size_t)w;
         }
     }
     db_result_free(r);
+}
+
+static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
+                           const char *hex, const char *status)
+{
+    char repo[32], run[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
+
+    /* A pack's own finding names no content and no file; its caller logs
+     * what it is and why. */
+    if (strncmp(hex, "pack-", 5) == 0) {
+        if (db_execute_non_query(db,
+                "INSERT INTO verify_findings (run_id, repo_id, hash, status)"
+                " VALUES (?, ?, ?, ?)",
+                (const char *[]){ run, repo, hex, status, NULL }, NULL) != 0)
+            log_warn("verify: cannot record finding for %s", hex);
+        return;
+    }
+
+    char paths[FINDING_SAMPLE_PATHS * (PATH_MAX + 2)];
+    uint64_t n_files = 0, n_versions = 0;
+    paths_of(db, repo, hex, &n_files, &n_versions, paths, sizeof(paths));
+    db_result_t *r = NULL;
 
     /* The list is capped so the row stays readable; the count is not, and
      * the truncated flag says when the list is short of it. Silently
@@ -218,8 +239,9 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
         log_warn("verify: %s %s (%llu file(s) in %llu snapshot(s))", status, hex,
                  (unsigned long long)n_files, (unsigned long long)n_snaps);
     else if (n_files == 0)
-        log_error("verify: %s %s (no node references it: a manifest tree or an "
-                  "object from an evicted snapshot)", status, hex);
+        log_error("verify: %s %s (no file names it directly: a tree, a chunk or a "
+                  "chunk list; the list pass names the files a lost chunk belongs to)",
+                  status, hex);
     else
         log_error("verify: %s %s affects %llu file(s) in %llu snapshot(s): %s",
                   status, hex, (unsigned long long)n_files,
@@ -531,6 +553,45 @@ static status_t salvage_pack(store_t *store, cutils_db_t *db, int64_t repo_id,
     return OK;
 }
 
+/*
+ * A walkable pack's own structures against their redundancy (B136): its
+ * header, both tail copies and its CRC table. Damage within their parity
+ * is what readers correct in memory and never write back, so it used to
+ * accumulate unseen. Reported as recoverable, and with repair rewritten.
+ */
+static void verify_pack_structure(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                  uint32_t pnum, int repair, verify_result_t *res)
+{
+    pack_struct_check_t c;
+    if (pack_check_structure(store, pnum, repair, &c) != OK) {
+        log_warn("verify: pack-%010u.dat: cannot check its structure: %s", pnum, err_msg());
+        err_clear();
+        return;
+    }
+    if (!c.found) return;
+    char what[160];
+    snprintf(what, sizeof(what), "%s%s%s%s%llu crc table byte(s) within parity, "
+             "%llu table group(s) past it",
+             c.header_bad ? "pack header, " : "",
+             (c.tails_bad & 1u) ? "last tail, " : "",
+             (c.tails_bad & 2u) ? "first tail, " : "", "",
+             (unsigned long long)c.table_bytes_fixed,
+             (unsigned long long)c.table_groups_bad);
+    char name[32];
+    snprintf(name, sizeof(name), "pack-%010u", pnum);
+    if (c.repaired) {
+        res->pack_structures_repaired++;
+        log_warn("verify: pack %s.dat: damaged structure rewritten (%s)", name, what);
+        record_finding(db, repo_id, res->run_id, name, "repaired");
+    } else {
+        res->pack_structures_recoverable++;
+        log_warn("verify: pack %s.dat: damaged structure, %s (%s)", name,
+                 repair ? "and the repair could not finish" :
+                          "recoverable; a repairing verify rewrites it", what);
+        record_finding(db, repo_id, res->run_id, name, "recoverable");
+    }
+}
+
 static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
                              int repair, verify_result_t *res)
 {
@@ -549,7 +610,10 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (pack_file_missing(store, pid)) continue;   /* the object walk says missing */
         uint32_t pnum = (uint32_t)pid;
         char why[PACK_UNWALKABLE_REASON_MAX];
-        if (pack_walk_check(store, pnum, why, sizeof(why)) == OK) continue;
+        if (pack_walk_check(store, pnum, why, sizeof(why)) == OK) {
+            verify_pack_structure(store, db, repo_id, pnum, repair, res);
+            continue;
+        }
         err_clear();
 
         char name[32];
@@ -577,6 +641,7 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
                          "from the index", name);
                 res->packs_restored++;
                 record_finding(db, repo_id, res->run_id, name, "repaired");
+                verify_pack_structure(store, db, repo_id, pnum, repair, res);
                 continue;
             }
             err_clear();
@@ -600,7 +665,8 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
             log_error("verify: %s.dat cannot be walked (%s); " REPO_SALVAGE_NEEDS_KEY,
                       name, why);
         } else {
-            log_error("verify: %s.dat cannot be walked (%s); gc leaves it as it is", name, why);
+            log_error("verify: pack %s.dat cannot be walked: %s; gc leaves it as it is and "
+                  "a repairing verify rebuilds or salvages it", name, why);
         }
         res->packs_unwalkable++;
         record_finding(db, repo_id, res->run_id, name,
@@ -642,6 +708,38 @@ static int hv_has(const hash_vec_t *v, const uint8_t hash[OBJECT_HASH_SIZE])
 static void hash_to_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
 {
     object_hash_to_hex(h, out);
+}
+
+/*
+ * A lost chunk's own finding, credited with the files of a list it belongs
+ * to: chunks are named by lists, not by nodes, so its row would otherwise
+ * say no file is affected, while the file is gone (NIT-22).
+ */
+static void attribute_chunk(cutils_db_t *db, int64_t repo_id, int64_t run_id,
+                            const uint8_t chunk[OBJECT_HASH_SIZE], const char *root_hex)
+{
+    char repo[32], run[32], chex[OBJECT_HASH_SIZE * 2 + 1];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
+    object_hash_to_hex(chunk, chex);
+    char paths[FINDING_SAMPLE_PATHS * (PATH_MAX + 2)];
+    uint64_t n_files = 0, n_versions = 0;
+    paths_of(db, repo, root_hex, &n_files, &n_versions, paths, sizeof(paths));
+    if (!n_files) return;
+    char nf[32], nv[32];
+    snprintf(nf, sizeof(nf), "%llu", (unsigned long long)n_files);
+    snprintf(nv, sizeof(nv), "%llu", (unsigned long long)n_versions);
+    if (db_execute_non_query(db,
+            "UPDATE verify_findings SET affected_files = affected_files + ?,"
+            " affected_versions = affected_versions + ?,"
+            " sample_paths = CASE WHEN COALESCE(sample_paths, '') = '' THEN ?"
+            "                     ELSE sample_paths END"
+            " WHERE run_id = ? AND hash = ?",
+            (const char *[]){ nf, nv, paths, run, chex, NULL }, NULL) != 0)
+        log_warn("verify: cannot attribute chunk %s to its files", chex);
+    else
+        log_error("verify: lost chunk %s belongs to %llu file(s): %s", chex,
+                  (unsigned long long)n_files, paths);
 }
 
 /*
@@ -693,6 +791,7 @@ static status_t verify_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
             if (ist != OK || done) break;
             if (hv_has(lost, x.hash)) {
                 why = "contains a lost chunk";
+                attribute_chunk(db, repo_id, res->run_id, x.hash, roots->rows[i][0]);
                 if (x.is_list) chunklist_iter_skip(it);
             } else if (!object_exists(store, x.hash)) {
                 char hex[OBJECT_HASH_SIZE * 2 + 1];
@@ -769,11 +868,19 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * payload without decrypting it is possible - parity and the CRC cover
      * the stored bytes for exactly that reason - but no level does it yet.
      */
+    /* A repairing run is how an unwalkable pack is salvaged, and salvage
+     * may have to decrypt: the answer then is the key, not another level
+     * (NIT-25). A check-only run can still be told about structure. */
     if (level == VERIFY_LEVEL_DEEP && store_needs_key(store)) {
+        if (repair)
+            return set_error(ERR_INVALID, "deep verify reads payloads and the repository "
+                             "key is not loaded: c-backup repo key import <repo-id> "
+                             "<key-hex>, or repo add <path> --passphrase <pass>, then "
+                             "verify again");
         return set_error(ERR_INVALID,
                          "deep verify reads payloads and this repository is "
-                         "encrypted with no key loaded; use level 'structure', "
-                         "which checks headers and needs no key");
+                         "encrypted with no key loaded; load the key (c-backup repo key "
+                         "import), or use level 'structure', which needs none");
     }
 
     /* Packs first, and before the object list is read: a salvage replaces

@@ -484,6 +484,14 @@ typedef struct {
     uint32_t packs_unwalkable;
     uint32_t unwalkable_listed;
     pack_unwalkable_t unwalkable[PACK_UNWALKABLE_LIST_MAX];
+    /*
+     * Duplicate copies (OWN-22): dropped because the copy the index names
+     * was confirmed, kept because it was not, and index rows moved off a
+     * copy that failed confirmation onto one proven to be the object.
+     */
+    uint64_t dups_dropped;
+    uint64_t dups_kept;
+    uint64_t index_relocated;
 } pack_gc_stats_t;
 
 /*
@@ -514,6 +522,27 @@ typedef struct {
  */
 int pack_restore_headers(store_t *store, uint32_t pack_num,
                          const pack_hdr_hint_t *hints, size_t n);
+
+/* What pack_check_structure found, and whether it was all rewritten. */
+typedef struct {
+    int      found;                /* anything below */
+    int      header_bad;           /* the pack header disagreed with its redundancy */
+    uint32_t tails_bad;            /* bit 0: the last tail copy failed, bit 1: the first */
+    uint64_t table_bytes_fixed;    /* crc table bytes its own parity corrects */
+    uint64_t table_groups_bad;     /* crc table groups past their parity */
+    uint64_t table_slots_rebuilt;  /* slots of those rebuilt from the entries */
+    int      repaired;             /* repair asked for, and everything found written */
+} pack_struct_check_t;
+
+/*
+ * Check a pack's own structures - its header, both tail copies and its CRC
+ * table - against their redundancy, and with repair rewrite whatever
+ * disagrees (B136). A table group past its parity is rebuilt from the
+ * entries the stripe vouches for. OK whether or not anything was found;
+ * ERR_CORRUPT when the pack has no usable trailer to check against.
+ */
+status_t pack_check_structure(store_t *store, uint32_t pack_num, int repair,
+                              pack_struct_check_t *out);
 
 /* What a salvage kept and left behind. */
 #define PACK_SALVAGE_LIST_MAX 16u
