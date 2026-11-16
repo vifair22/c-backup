@@ -92,6 +92,19 @@ struct handoff {
     status_t        contender_status;
 };
 
+/* Wait, bounded at 10 s, until another thread is queued in db_txn_begin.
+ * A broken count fails the test rather than hanging it. */
+static void wait_for_waiter(void)
+{
+    int seen = 0;
+    for (int i = 0; i < 5000 && !seen; i++) {
+        if (db_txn_waiters() >= 1) { seen = 1; break; }
+        struct timespec ts = { 0, 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    assert_true(seen);
+}
+
 static void *contender_main(void *arg)
 {
     struct handoff *h = arg;
@@ -139,14 +152,12 @@ static void test_a_second_writer_waits_instead_of_failing(void **state)
     pthread_mutex_unlock(&h.mu);
 
     /*
-     * Give the contender long enough to have reached its begin and, if the
-     * lock is absent, to have failed and recorded that. Waiting on
-     * contender_done instead would deadlock in the fixed build, where it
-     * cannot return until this transaction commits - so the wait is on the
-     * clock, and what the test asserts is the status it eventually reports.
+     * Wait until the contender is queued in its begin. Waiting on
+     * contender_done instead would deadlock, since it cannot return until
+     * this transaction commits; a fixed sleep raced on a loaded runner
+     * (FLAKE-15), so the wait is on the queue itself.
      */
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
-    nanosleep(&ts, NULL);
+    wait_for_waiter();
 
     assert_int_equal(db_txn_commit(db), OK);
     assert_int_equal(pthread_join(t, NULL), 0);
@@ -186,9 +197,9 @@ static void test_a_waiting_writer_goes_first(void **state)
     pthread_cond_broadcast(&h.cv);
     pthread_mutex_unlock(&h.mu);
 
-    /* Long enough for the contender to be queued in its begin. */
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
-    nanosleep(&ts, NULL);
+    /* Until the contender is queued in its begin (FLAKE-15: a fixed sleep
+     * was not always long enough on a loaded runner). */
+    wait_for_waiter();
 
     assert_int_equal(db_txn_commit(db), OK);
     assert_int_equal(db_txn_begin(db), OK);
