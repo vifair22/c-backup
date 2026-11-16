@@ -566,7 +566,7 @@ static api_response_t unit_policy_put(const api_request_t *req, int64_t repo_id,
     cJSON_ArrayForEach(e, o) {
         char num[32];
         const char *val = cJSON_IsNumber(e) ? (snprintf(num, sizeof(num), "%.0f", e->valuedouble), num)
-                        : cJSON_IsString(e) ? e->valuestring : "";
+                        : (cJSON_IsString(e) && e->valuestring) ? e->valuestring : "";
         int rc = (!*val)
             ? db_execute_non_query(g_db, "DELETE FROM unit_policy WHERE repo_id = ? AND unit_key = ?"
                                          " AND key = ?",
@@ -931,7 +931,7 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     j->snap_id = snap_id;
     j->repo_path = repo_path_of(repo_id);
     j->dest = strdup(dest);
-    j->item = strcmp(mode, "item") == 0 ? strdup(item) : NULL;
+    j->item = (strcmp(mode, "item") == 0 && item) ? strdup(item) : NULL;
     j->overwrite = ow && cJSON_IsTrue(ow);
     cJSON_Delete(o);
     if (!j->repo_path || !j->dest || (strcmp(mode, "item") == 0 && !j->item)) {

@@ -415,10 +415,10 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
     const char **paths = calloc(n_trees ? n_trees : 1, sizeof(*paths));
     const char **rpaths = calloc(n_trees ? n_trees : 1, sizeof(*rpaths));
     char **rbuf = calloc(n_trees ? n_trees : 1, sizeof(*rbuf));
-    if (!u.parts || !syn || !synpath || !paths || !rpaths || !rbuf)
-        st = set_error(ERR_NOMEM, "unit backup");
+    int have_all = u.parts && syn && synpath && paths && rpaths && rbuf;
+    if (!have_all) st = set_error(ERR_NOMEM, "unit backup");
     size_t ns = 0, nt = 0;
-    for (size_t i = 0; st == OK && i < d->n_items; i++) {
+    for (size_t i = 0; have_all && st == OK && i < d->n_items; i++) {
         const sp_item_desc_t *it = &d->items[i];
         if (it->kind == SP_ITEM_TREE) {
             if (!(rbuf[nt] = malloc(PATH_MAX))) { st = set_error(ERR_NOMEM, "unit backup"); break; }

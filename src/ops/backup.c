@@ -2406,7 +2406,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         links[i].parent_id  = scan->entries[i].parent_node_id;
         links[i].scan_index = i;
     }
-    for (size_t i = 0; i < opts->n_synth; i++) links[synth_at[i]].synth = i + 1;
+    for (size_t i = 0; synth_at && i < opts->n_synth; i++) links[synth_at[i]].synth = i + 1;
     free(synth_at);
 
     pipeline_t p;
