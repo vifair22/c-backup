@@ -671,7 +671,7 @@ Options:
 |---|---|
 | `--exclude PAT` | Repeatable. See 6.2 |
 | `--one-filesystem` | Do not cross into other mounts below a source |
-| `--label TEXT` | A label on the snapshot |
+| `--label TEXT` | A label on the snapshot: at most 256 bytes of UTF-8 text with no control characters (tabs and newlines included). Anything else is refused before the backup starts |
 
 ### 6.2 Exclusion patterns
 

@@ -8,6 +8,7 @@
 #include "parity.h"
 #include "repo.h"
 #include "repo_key.h"
+#include "snap_record.h"
 #include "util.h"
 
 #include <cutils/log.h>
@@ -215,18 +216,6 @@ static status_t seal_pack(local_ctx_t *c, uint32_t *out_packed)
     return OK;
 }
 
-/* fsync a directory, so an entry renamed into it survives a power cut. */
-static int fsync_dir(const char *path)
-{
-    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd == -1) return -1;
-    int rc = fsync(fd);
-    int err = errno;
-    close(fd);
-    errno = err;
-    return rc;
-}
-
 static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
 {
     static const char *d = "0123456789abcdef";
@@ -389,22 +378,32 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
                  (long long)snap->snapshot_id) >= (int)sizeof(final))
         return set_error(ERR_IO, "replica: path too long");
 
-    int fd = mkstemp(tmp);
-    if (fd == -1) return set_error_errno(ERR_IO, "replica: mkstemp");
-
     /* Byte-identical to what backup.c writes, so a replica reindexes with
-     * the same reader and nothing has to know how the record got there. */
-    char body[512];
-    int n = snprintf(body, sizeof(body),
-                     "{\"id\":%lld,\"ts\":%lld,\"root\":\"%s\",\"label\":\"%s\"}\n",
-                     (long long)snap->snapshot_id, (long long)snap->ts, hex,
-                     snap->label ? snap->label : "");
+     * the same reader and nothing has to know how the record got there. The
+     * label comes from the source's index and may predate the label rules,
+     * so it is escaped rather than checked: refusing it would leave that
+     * snapshot unreplicable forever. */
+    size_t len = 0;
+    char *body = snapshot_record_encode(snap->snapshot_id, (int64_t)snap->ts, hex,
+                                        snap->label, &len);
+    if (!body) {
+        if (errno == E2BIG)
+            return set_error(ERR_INVALID, "replica: the label of snapshot %lld is too "
+                             "long to record", (long long)snap->snapshot_id);
+        return set_error(ERR_NOMEM, "replica: out of memory");
+    }
+
+    int fd = mkstemp(tmp);
+    if (fd == -1) { free(body); return set_error_errno(ERR_IO, "replica: mkstemp"); }
+
     status_t st = OK;
-    if (n < 0 || write(fd, body, (size_t)n) != n)
+    if (snapshot_write_all(fd, body, len) != 0)
         st = set_error_errno(ERR_IO, "replica: write snapshot record");
+    free(body);
     if (st == OK && fsync(fd) != 0)
         st = set_error_errno(ERR_IO, "replica: fsync snapshot record");
-    close(fd);
+    if (close(fd) != 0 && st == OK)
+        st = set_error_errno(ERR_IO, "replica: close snapshot record");
 
     if (st != OK) { unlink(tmp); return st; }
 
@@ -420,7 +419,7 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
         int err = errno;
         unlink(tmp);
         if (rc == 0) {
-            if (fsync_dir(snap_dir) != 0)
+            if (snapshot_fsync_dir(snap_dir) != 0)
                 return set_error_errno(ERR_IO, "replica: sync %s", snap_dir);
             return OK;
         }
@@ -438,7 +437,7 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
         return set_error_errno(ERR_IO, "replica: rename snapshot record");
     }
     /* replicate_run counts the snapshot as sent once this returns. */
-    if (fsync_dir(snap_dir) != 0)
+    if (snapshot_fsync_dir(snap_dir) != 0)
         return set_error_errno(ERR_IO, "replica: sync %s", snap_dir);
     return OK;
 }

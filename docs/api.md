@@ -446,7 +446,7 @@ lazily on first append, which used to leave an empty result serialising as
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/repos/<id>/backup` | `{paths:[...], label, exclude:[...], one_filesystem}`; with no `paths`, the repository's configured sources are used |
+| POST | `/repos/<id>/backup` | `{paths:[...], label, exclude:[...], one_filesystem}`; with no `paths`, the repository's configured sources are used. `label` is at most 256 bytes of well-formed UTF-8 with no control characters (C0, DEL or C1); anything else is `400 {"error":"label must be at most 256 bytes of printable text"}` |
 | GET/PUT | `/repos/<id>/sources` | What this repository backs up: `{sources:[...], exclude:[...]}` |
 | POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite, subpath}` |
 | POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only |
@@ -1135,7 +1135,7 @@ different action is a 400 rather than a value stored and never read:
 
 | Action | Parameters |
 |---|---|
-| `backup` | `paths` (optional; the repository's sources otherwise) |
+| `backup` | `paths` (optional; the repository's sources otherwise), `label` (optional; the same rule as a backup request, checked at creation) |
 | `replicate` | `dest` (required, absolute) |
 | `grep` | `pattern` (required, a valid extended regular expression), `path_prefix`, `ignore_case` (a boolean, stored as one; `0`/`1` accepted), `max_files` |
 | others | none |

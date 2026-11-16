@@ -24,6 +24,7 @@
 
 #include <cmocka.h>
 #include <cutils/db.h>
+#include <cutils/json.h>
 
 #include "backup.h"
 #include "gc.h"
@@ -33,6 +34,7 @@
 #include "repo.h"
 #include "repo_key.h"
 #include "repo_tags.h"
+#include "snap_record.h"
 #include "store.h"
 #include "store_index.h"
 
@@ -472,6 +474,193 @@ static void test_corrupt_tag_file_fails_the_reindex(void **state)
     assert_int_equal(rx.snapshots, 1);
 }
 
+/* ---------- OWN-33 ---------- */
+
+static status_t backup_labelled(const char *label)
+{
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.label = label;
+    return backup_run(store, db, repo_id, &o, NULL);
+}
+
+/* The whole record file; *len is its size on disk. */
+static char *read_record(int64_t sid, size_t *len)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/snapshots/%lld", TEST_REPO, (long long)sid);
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+    char *buf = malloc((size_t)sb.st_size + 1);
+    assert_non_null(buf);
+    FILE *f = fopen(path, "rb");
+    assert_non_null(f);
+    assert_int_equal(fread(buf, 1, (size_t)sb.st_size, f), (size_t)sb.st_size);
+    fclose(f);
+    buf[sb.st_size] = '\0';
+    *len = (size_t)sb.st_size;
+    return buf;
+}
+
+static char *db_label(int64_t sid)
+{
+    char snap[32];
+    snprintf(snap, sizeof(snap), "%lld", (long long)sid);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT label FROM snapshots WHERE repo_id = ? AND id = ?",
+                                (const char *[]){ repo, snap, NULL }, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    char *v = strdup(r->rows[0][0]);
+    db_result_free(r);
+    return v;
+}
+
+static void drop_index_and_reindex(void)
+{
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.snapshots_failed, 0);
+    assert_int_equal(rx.snapshots, 1);
+}
+
+/*
+ * A quote or a backslash made a record that was not JSON, and the snapshot
+ * dropped out of a rebuilt index. Now the label survives backup, the
+ * index, and a reindex from the record alone, byte for byte.
+ */
+static void test_label_with_quotes_and_unicode_survives_reindex(void **state)
+{
+    (void)state;
+    const char *label = "say \"hi\" C:\\dir\\ caf\xc3\xa9 \xe2\x98\x83 \xf0\x9f\x98\x80";
+    assert_int_equal(backup_labelled(label), OK);
+
+    char *got = db_label(1);
+    assert_string_equal(got, label);
+    free(got);
+
+    drop_index_and_reindex();
+    got = db_label(1);
+    assert_string_equal(got, label);
+    free(got);
+}
+
+/*
+ * The longest label accepted, every byte of it needing an escape: the
+ * record on disk is exactly the encoder's output, valid JSON, and nothing
+ * past it. The old writer put about 300 bytes of its stack after a record
+ * this size. It also reindexes, well past the old 1,024-byte read.
+ */
+static void test_record_at_the_label_limit_is_exact_on_disk(void **state)
+{
+    (void)state;
+    char label[SNAPSHOT_LABEL_MAX + 1];
+    for (size_t i = 0; i < SNAPSHOT_LABEL_MAX; i++) label[i] = (i % 2) ? '"' : '\\';
+    label[SNAPSHOT_LABEL_MAX] = '\0';
+    assert_int_equal(backup_labelled(label), OK);
+
+    size_t len = 0;
+    char *rec = read_record(1, &len);
+    long long ts = scalar("SELECT ts FROM snapshots WHERE repo_id = ? AND id = 1");
+    char head[128];
+    int hn = snprintf(head, sizeof(head), "{\"id\":1,\"ts\":%lld,\"root\":\"", ts);
+    size_t want = (size_t)hn + 64 + strlen("\",\"label\":\"\"}\n") + 2 * SNAPSHOT_LABEL_MAX;
+    assert_int_equal(len, want);
+    assert_memory_equal(rec, head, (size_t)hn);
+    assert_int_equal(strlen(rec), len); /* no NUL hiding inside */
+    assert_int_equal(rec[len - 1], '\n');
+
+    cutils_json_req_t *req = NULL;
+    assert_int_equal(json_req_parse(rec, len, &req), 0);
+    char *back = NULL;
+    assert_int_equal(json_req_get_str(req, "label", &back), 0);
+    assert_string_equal(back, label);
+    free(back);
+    json_req_free(req);
+    free(rec);
+
+    drop_index_and_reindex();
+    char *got = db_label(1);
+    assert_string_equal(got, label);
+    free(got);
+}
+
+/* The engine refuses what the routes and the CLI refuse, before reading
+ * anything, so no caller reaches the writer with an unchecked label. */
+static void test_backup_refuses_a_bad_label(void **state)
+{
+    (void)state;
+    char big[1001];
+    memset(big, 'x', 1000);
+    big[1000] = '\0';
+    assert_int_equal(backup_labelled(big), ERR_INVALID);
+    assert_string_equal(err_msg(), SNAPSHOT_LABEL_RULE);
+    err_clear();
+    assert_int_equal(backup_labelled("two\nlines"), ERR_INVALID);
+    err_clear();
+    assert_int_equal(backup_labelled("bad \xff byte"), ERR_INVALID);
+    err_clear();
+
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
+    struct stat sb;
+    assert_int_not_equal(stat(TEST_REPO "/snapshots/1", &sb), 0);
+}
+
+/*
+ * A record longer than the old 1,024-byte buffer (a label stored before the
+ * limit, say) reindexes; one larger than any record can be is refused as
+ * corrupt rather than read; and a time before 1970 comes back signed, where
+ * the unsigned read made it 0.
+ */
+static void test_reindex_reads_long_records_and_signed_times(void **state)
+{
+    (void)state;
+    backup_once();
+    size_t len = 0;
+    char *rec = read_record(1, &len);
+    char *root = strstr(rec, "\"root\":\"");
+    assert_non_null(root);
+    char hex[65];
+    memcpy(hex, root + 8, 64);
+    hex[64] = '\0';
+    free(rec);
+
+    char label[3001];
+    memset(label, 'L', 3000);
+    label[3000] = '\0';
+    char *body = snapshot_record_encode(1, -86400, hex, label, &len);
+    assert_non_null(body);
+    assert_true(len > 1024);
+    write_file(TEST_REPO "/snapshots/1", body);
+    free(body);
+
+    drop_index_and_reindex();
+    assert_int_equal(scalar("SELECT ts FROM snapshots WHERE repo_id = ? AND id = 1"), -86400);
+    char *got = db_label(1);
+    assert_string_equal(got, label);
+    free(got);
+
+    /* Past the cap: the reader refuses it and the run says so. */
+    FILE *f = fopen(TEST_REPO "/snapshots/1", "w");
+    assert_non_null(f);
+    fputs("{\"id\":1,\"ts\":1,\"root\":\"", f);
+    fputs(hex, f);
+    fputs("\",\"label\":\"", f);
+    for (int i = 0; i < SNAPSHOT_RECORD_MAX; i++) fputc('L', f);
+    fputs("\"}\n", f);
+    fclose(f);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), ERR_CORRUPT);
+    assert_int_equal(rx.snapshots_failed, 1);
+    err_clear();
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -489,6 +678,13 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_tag_does_not_follow_a_reused_snapshot_id, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_without_a_tag_file_restores_none, setup, teardown),
         cmocka_unit_test_setup_teardown(test_corrupt_tag_file_fails_the_reindex, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_label_with_quotes_and_unicode_survives_reindex,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_record_at_the_label_limit_is_exact_on_disk,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_backup_refuses_a_bad_label, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reindex_reads_long_records_and_signed_times,
+                                        setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

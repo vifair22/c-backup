@@ -7,6 +7,7 @@
 #include "backup.h"
 #include "file_cache.h"
 #include "job_manager.h"
+#include "snap_record.h"
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
@@ -408,6 +409,14 @@ static int backup_opts_from_json(cutils_json_req_t *body, backup_job_t *j,
      * 0 or 1, so the backup crossed into every mount below the source.
      */
     if (jreq_str(body, "label", &j->label, err) == JREQ_BAD) return -1;
+    /* Unchecked, a label went straight into the snapshot record: past about
+     * 420 bytes the writer copied stack memory into the repository after it,
+     * and a quote made a record no reindex could read (OWN-33). The same
+     * rule reaches scheduled backups, whose parameters come through here. */
+    if (snapshot_label_check(j->label) != 0) {
+        snprintf(err->msg, sizeof(err->msg), "%s", SNAPSHOT_LABEL_RULE);
+        return -1;
+    }
 
     char **v = NULL;
     size_t n = 0;
