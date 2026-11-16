@@ -152,20 +152,39 @@ void gfs_flags_str(uint32_t flags, char *buf, size_t sz) {
  * per-snapshot tag lookup. The preserved flag comes from a join rather than
  * a directory scan.
  */
-static status_t load_snap_infos(cutils_db_t *db, int64_t repo_id, uint32_t head_id,
+/*
+ * One retention group's snapshots (source-providers.md 8.1): group NULL is
+ * the file snapshots, those with no snapshot_units row; otherwise the
+ * snapshots of that unit key.
+ */
+static status_t load_snap_infos(cutils_db_t *db, int64_t repo_id, const char *group,
                                 gfs_snap_info_t **out, uint32_t *out_n) {
-    (void)head_id;
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
     db_result_t *r = NULL;
-    if (db_execute(db,
+    int rc = group
+        ? db_execute(db,
             "SELECT s.id, s.ts, s.gfs_flags,"
             "       EXISTS(SELECT 1 FROM tags t"
             "               WHERE t.repo_id = s.repo_id AND t.snap_id = s.id)"
-            "  FROM snapshots s WHERE s.repo_id = ? ORDER BY s.id ASC",
-            (const char *[]){ repo, NULL }, &r) != 0 || !r)
+            "  FROM snapshots s JOIN snapshot_units u"
+            "    ON u.repo_id = s.repo_id AND u.snap_id = s.id"
+            " WHERE s.repo_id = ? AND u.unit_key = ? ORDER BY s.id ASC",
+            (const char *[]){ repo, group, NULL }, &r)
+        : db_execute(db,
+            "SELECT s.id, s.ts, s.gfs_flags,"
+            "       EXISTS(SELECT 1 FROM tags t"
+            "               WHERE t.repo_id = s.repo_id AND t.snap_id = s.id)"
+            "  FROM snapshots s WHERE s.repo_id = ?"
+            "   AND NOT EXISTS (SELECT 1 FROM snapshot_units u"
+            "                    WHERE u.repo_id = s.repo_id AND u.snap_id = s.id)"
+            " ORDER BY s.id ASC",
+            (const char *[]){ repo, NULL }, &r);
+    if (rc != 0 || !r) {
+        db_result_free(r);
         return set_error(ERR_IO, "load_snap_infos: cannot read snapshots");
+    }
 
     gfs_snap_info_t *arr = calloc((size_t)(r->nrows ? r->nrows : 1), sizeof(*arr));
     if (!arr) { db_result_free(r); return set_error(ERR_NOMEM, "load_snap_infos: alloc"); }
@@ -237,20 +256,49 @@ static int64_t key_day(int64_t d) { return d; }
 /* gfs_run                                                             */
 /* ------------------------------------------------------------------ */
 
+static status_t gfs_group(store_t *store, cutils_db_t *db, int64_t repo_id,
+                          const gfs_retention_t *policy, const char *group,
+                          uint32_t new_snap_id, int dry_run, int quiet,
+                          gfs_result_t *out);
+
 status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
                  gfs_result_t *out) {
+    if (out) { out->pruned = 0; out->ids = NULL; }
+    if (new_snap_id == 0) return OK;
+    return gfs_group(store, db, repo_id, policy, NULL, new_snap_id, dry_run, quiet, out);
+}
+
+status_t gfs_run_group(store_t *store, cutils_db_t *db, int64_t repo_id,
+                       const gfs_retention_t *policy, const char *group,
+                       int dry_run, int quiet, gfs_result_t *out) {
+    if (out) { out->pruned = 0; out->ids = NULL; }
+    /* A snapshot nothing can classify must not be judged by any group's
+     * calendar: its group is never pruned. */
+    if (group && strncmp(group, "unknown:", 8) == 0) {
+        log_warn("gfs: group %s is an unclassified snapshot; it is never pruned", group);
+        return OK;
+    }
+    return gfs_group(store, db, repo_id, policy, group, 0, dry_run, quiet, out);
+}
+
+/* new_snap_id 0: the group's newest. */
+static status_t gfs_group(store_t *store, cutils_db_t *db, int64_t repo_id,
+                          const gfs_retention_t *policy, const char *group,
+                          uint32_t new_snap_id, int dry_run, int quiet,
+                          gfs_result_t *out) {
     /* Empty before any early return, so a caller can always report and
      * free it. */
     if (out) { out->pruned = 0; out->ids = NULL; }
-    if (new_snap_id == 0) return OK;
 
     gfs_snap_info_t *snaps = NULL;
     uint32_t n = 0;
-    status_t st = load_snap_infos(db, repo_id, new_snap_id, &snaps, &n);
+    status_t st = load_snap_infos(db, repo_id, group, &snaps, &n);
     if (st != OK) return st;
     if (n == 0) { free(snaps); return OK; }
+    /* The group's head, never pruned. */
+    if (new_snap_id == 0) new_snap_id = snaps[n - 1].id;
 
     /* Save original flags so we can detect what changed at flush time. */
     uint32_t *orig_flags = calloc(n, sizeof(uint32_t));
@@ -365,16 +413,20 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * deleted nothing, ever, while reporting success. The tier tests all
      * passed keep_snaps = 3, so none of them saw it.
      */
+    /*
+     * The window counts snapshots of this group, newest first, not ids:
+     * other groups' snapshots take ids in between, and a window of ids
+     * would keep fewer than keep_snaps of this one. snaps is in id order.
+     */
     uint32_t snap_window = (policy->keep_snaps > 1) ? (uint32_t)policy->keep_snaps : 1;
-    uint32_t span = snap_window - 1;
-    uint32_t snap_window_start = (new_snap_id > span) ? (new_snap_id - span) : 1;
+    uint32_t window_from = n > snap_window ? n - snap_window : 0;
     uint32_t pruned_snaps = 0;
 
     for (uint32_t i = 0; i < n; i++) {
         uint32_t id = snaps[i].id;
         if (id == new_snap_id)                            continue;
         if (snaps[i].gfs_flags != 0 && !tier_expired[i]) continue;
-        if (id >= snap_window_start)                      continue;
+        if (i >= window_from)                             continue;
         if (snaps[i].preserved)                           continue;
 
         if (dry_run) {

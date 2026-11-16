@@ -1205,6 +1205,11 @@ static int h_schedule_add(const args_t *a)
     const char *pattern  = args_value(a, "--pattern");
     const char *gprefix  = args_value(a, "--path-prefix");
     int gicase = args_flag(a, "-i");
+    /* A units schedule: a provider, and --all (enumerated when it fires,
+     * less --exclude globs) or each --unit by name. */
+    const char *uprov = args_value(a, "--provider");
+    const char *ureq  = args_value(a, "--require");
+    int uall = args_flag(a, "--all");
 
     /* An interval and a calendar are two triggers, and either one alone.
      * The calendar fields only go into a calendar trigger, so with an
@@ -1251,6 +1256,17 @@ static int h_schedule_add(const args_t *a)
     if (pattern) { sb_puts(&b, ",\"pattern\":");     sb_json_str(&b, pattern); }
     if (gprefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, gprefix); }
     if (gicase)  sb_puts(&b, ",\"ignore_case\":true");
+    if (uprov) { sb_puts(&b, ",\"provider\":"); sb_json_str(&b, uprov); }
+    if (ureq)  { sb_puts(&b, ",\"require\":");  sb_json_str(&b, ureq); }
+    if (uall)  sb_puts(&b, ",\"all\":true");
+    if (args_multi_count(a, "--unit") > 0) {
+        sb_puts(&b, ",\"units\":");
+        sb_json_multi(&b, a, "--unit");
+    }
+    if (args_multi_count(a, "--exclude") > 0) {
+        sb_puts(&b, ",\"exclude\":");
+        sb_json_multi(&b, a, "--exclude");
+    }
     if (args_multi_count(a, "--source") > 0) {
         sb_puts(&b, ",\"paths\":");
         sb_json_multi(&b, a, "--source");
@@ -1298,6 +1314,141 @@ static int schedule_enabled(const args_t *a, int on)
 
 static int h_schedule_enable(const args_t *a)  { return schedule_enabled(a, 1); }
 static int h_schedule_disable(const args_t *a) { return schedule_enabled(a, 0); }
+
+/*
+ * Units: VMs and containers through a source provider
+ * (docs/source-providers.md 10). Each subcommand is one route; the output
+ * is the daemon's JSON, as everywhere else.
+ */
+
+/* /repos/<id>/units/<p>/<u>/<suffix> */
+static void unit_path(sbuf_t *p, const char *repo, const char *prov, const char *unit,
+                      const char *suffix)
+{
+    sb_puts(p, "/repos/"); sb_path_seg(p, repo);
+    sb_puts(p, "/units/"); sb_path_seg(p, prov);
+    sb_puts(p, "/");       sb_path_seg(p, unit);
+    sb_puts(p, suffix);
+}
+
+static int h_unit_providers(const args_t *a)
+{
+    (void)a;
+    return call("GET", "/providers", NULL);
+}
+
+static int h_unit_list(const args_t *a)
+{
+    sbuf_t q = { 0 };
+    paging(a, &q);
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/providers/"); sb_path_seg(&p, a->pos[0]); sb_puts(&p, "/units");
+    if (q.len) { sb_puts(&p, "?"); sb_puts(&p, q.buf); }
+    free(q.buf);
+    return call_path_sb("GET", &p, NULL);
+}
+
+static int h_unit_show(const args_t *a)
+{
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/providers/"); sb_path_seg(&p, a->pos[0]);
+    sb_puts(&p, "/units/");     sb_path_seg(&p, a->pos[1]);
+    return call_path_sb("GET", &p, NULL);
+}
+
+static int h_unit_backup(const args_t *a)
+{
+    const char *prov = args_value(a, "--provider");
+    const char *req  = args_value(a, "--require");
+    int all     = args_flag(a, "--all");
+    int no_wait = args_flag(a, "--no-wait");
+    if (!prov) return refuse(a, "--provider is required");
+    if (all && a->npos != 1) return refuse(a, "--all backs up every unit; name none with it");
+    if (!all && a->npos < 2) return refuse(a, "name the units, or give --all");
+    if (!all && args_multi_count(a, "--exclude") > 0)
+        return refuse(a, "--exclude applies only with --all");
+    sbuf_t b = { 0 };
+    sb_puts(&b, "{\"provider\":"); sb_json_str(&b, prov);
+    if (all) {
+        sb_puts(&b, ",\"all\":true,\"exclude\":");
+        sb_json_multi(&b, a, "--exclude");
+    } else {
+        sb_puts(&b, ",\"units\":[");
+        for (int i = 1; i < a->npos; i++) { if (i > 1) sb_puts(&b, ","); sb_json_str(&b, a->pos[i]); }
+        sb_puts(&b, "]");
+    }
+    if (req) { sb_puts(&b, ",\"require\":"); sb_json_str(&b, req); }
+    sb_puts(&b, "}");
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/repos/"); sb_path_seg(&p, a->pos[0]); sb_puts(&p, "/units/backup");
+    if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+    int rc = job_run("POST", p.buf, b.buf, no_wait, 0, NULL);
+    free(p.buf); free(b.buf);
+    return rc;
+}
+
+static int h_unit_history(const args_t *a)
+{
+    const char *prov = args_value(a, "--provider");
+    if ((a->npos == 2) != (prov != NULL))
+        return refuse(a, "a unit and --provider go together");
+    sbuf_t q = { 0 };
+    paging(a, &q);
+    sbuf_t p = { 0 };
+    if (a->npos == 1) {
+        sb_puts(&p, "/repos/"); sb_path_seg(&p, a->pos[0]); sb_puts(&p, "/units");
+    } else {
+        unit_path(&p, a->pos[0], prov, a->pos[1], "/snapshots");
+    }
+    if (q.len) { sb_puts(&p, "?"); sb_puts(&p, q.buf); }
+    free(q.buf);
+    return call_path_sb("GET", &p, NULL);
+}
+
+static int h_unit_restore(const args_t *a)
+{
+    const char *item = args_value(a, "--item");
+    int overwrite = args_flag(a, "--overwrite");
+    int no_wait   = args_flag(a, "--no-wait");
+    sbuf_t b = { 0 };
+    sb_puts(&b, item ? "{\"mode\":\"item\",\"format\":\"raw\",\"item\":" : "{\"mode\":\"files\"");
+    if (item) sb_json_str(&b, item);
+    sb_puts(&b, ",\"dest\":"); sb_json_str(&b, a->pos[2]);
+    if (overwrite) sb_puts(&b, ",\"overwrite\":true");
+    sb_puts(&b, "}");
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/repos/");     sb_path_seg(&p, a->pos[0]);
+    sb_puts(&p, "/snapshots/"); sb_path_seg(&p, a->pos[1]);
+    sb_puts(&p, "/unit/restore");
+    if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+    int rc = job_run("POST", p.buf, b.buf, no_wait, 0, NULL);
+    free(p.buf); free(b.buf);
+    return rc;
+}
+
+static int h_unit_policy_show(const args_t *a)
+{
+    const char *prov = args_value(a, "--provider");
+    if (!prov) return refuse(a, "--provider is required");
+    sbuf_t p = { 0 };
+    unit_path(&p, a->pos[0], prov, a->pos[1], "/policy");
+    return call_path_sb("GET", &p, NULL);
+}
+
+static int h_unit_policy_set(const args_t *a)
+{
+    const char *prov = args_value(a, "--provider");
+    if (!prov) return refuse(a, "--provider is required");
+    sbuf_t p = { 0 };
+    unit_path(&p, a->pos[0], prov, a->pos[1], "/policy");
+    sbuf_t b = { 0 };
+    sb_puts(&b, "{"); sb_json_str(&b, a->pos[2]); sb_puts(&b, ":"); sb_json_str(&b, a->pos[3]);
+    sb_puts(&b, "}");
+    if (b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+    int rc = call_path_sb("PUT", &p, b.buf);
+    free(b.buf);
+    return rc;
+}
 
 /*
  * Read a password without putting it on the command line.
@@ -1473,6 +1624,12 @@ static const char *const P_PW_SETUP[] = { "[password]", NULL };
 static const char *const P_PW_CHG[]   = { "[current]", "[new]", NULL };
 static const char *const P_HEALTH[]   = { "[live]", NULL };
 static const char *const P_HELP[]     = { "[command]", "[subcommand]", NULL };
+static const char *const P_PROV[]     = { "<provider>", NULL };
+static const char *const P_PROV_UNIT[] = { "<provider>", "<unit>", NULL };
+static const char *const P_UBACKUP[]  = { "<repo-id>", "[unit...]", NULL };
+static const char *const P_UHIST[]    = { "<repo-id>", "[unit]", NULL };
+static const char *const P_UPOL[]     = { "<repo-id>", "<unit>", NULL };
+static const char *const P_UPOL_SET[] = { "<repo-id>", "<unit>", "<key>", "<value>", NULL };
 
 #define OPT_LIMIT   { "--limit",   NULL, ARG_VALUE, "N" }
 #define OPT_OFFSET  { "--offset",  NULL, ARG_VALUE, "N" }
@@ -1544,8 +1701,29 @@ static const arg_opt_t O_SCHED_ADD[] = {
     { "--pattern",     NULL, ARG_VALUE, "REGEX" },
     { "--path-prefix", NULL, ARG_VALUE, "PATH" },
     { "-i", "--ignore-case", ARG_FLAG, NULL },
+    { "--provider",    NULL, ARG_VALUE, "P" },
+    { "--all",         NULL, ARG_FLAG,  NULL },
+    { "--unit",        NULL, ARG_MULTI, "NAME" },
+    { "--exclude",     NULL, ARG_MULTI, "GLOB" },
+    { "--require",     NULL, ARG_VALUE, "LEVEL" },
     OPT_END,
 };
+static const arg_opt_t O_UNIT_BACKUP[] = {
+    { "--provider", NULL, ARG_VALUE, "P" },
+    { "--all",      NULL, ARG_FLAG,  NULL },
+    { "--exclude",  NULL, ARG_MULTI, "GLOB" },
+    { "--require",  NULL, ARG_VALUE, "LEVEL" },
+    OPT_NOWAIT, OPT_END,
+};
+static const arg_opt_t O_UNIT_HISTORY[] = {
+    { "--provider", NULL, ARG_VALUE, "P" }, OPT_LIMIT, OPT_OFFSET, OPT_END,
+};
+static const arg_opt_t O_UNIT_RESTORE[] = {
+    { "--item",      NULL, ARG_VALUE, "ID" },
+    { "--overwrite", NULL, ARG_FLAG,  NULL },
+    OPT_NOWAIT, OPT_END,
+};
+static const arg_opt_t O_PROVIDER[] = { { "--provider", NULL, ARG_VALUE, "P" }, OPT_END };
 static const arg_opt_t O_ALL[] = { { "--all", NULL, ARG_FLAG, NULL }, OPT_END };
 
 typedef struct {
@@ -1569,6 +1747,20 @@ static const command_t COMMANDS[] = {
       h_sources_set, 0 },
     { { "backup",          P_BACKUP,   O_BACKUP, NULL }, h_backup, 0 },
     { { "restore",         P_RESTORE,  O_RESTORE, NULL }, h_restore, 0 },
+    { { "unit providers",  P_NONE,     NULL, NULL }, h_unit_providers, 0 },
+    { { "unit list",       P_PROV,     O_PAGING, NULL }, h_unit_list, 0 },
+    { { "unit show",       P_PROV_UNIT, NULL, NULL }, h_unit_show, 0 },
+    { { "unit backup",     P_UBACKUP,  O_UNIT_BACKUP,
+        "--provider with the units by name, or --all less any --exclude globs" },
+      h_unit_backup, 0 },
+    { { "unit history",    P_UHIST,    O_UNIT_HISTORY,
+        "every unit with history, or one unit's snapshots with --provider" },
+      h_unit_history, 0 },
+    { { "unit restore",    P_RESTORE,  O_UNIT_RESTORE,
+        "the whole snapshot, disks as sparse raw files; or one --item into <dest>" },
+      h_unit_restore, 0 },
+    { { "unit policy show", P_UPOL,    O_PROVIDER, NULL }, h_unit_policy_show, 0 },
+    { { "unit policy set", P_UPOL_SET, O_PROVIDER, NULL }, h_unit_policy_set, 0 },
     { { "snapshots",       P_REPO,     O_PAGING, NULL }, h_snapshots, 0 },
     { { "snapshot delete", P_SNAP,     O_FORCE, NULL }, h_snapshot_delete, 0 },
     { { "snapshot note",   P_NOTE,     NULL, "reads the note, or writes [text]" },

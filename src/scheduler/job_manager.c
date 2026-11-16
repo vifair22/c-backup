@@ -295,7 +295,8 @@ typedef struct {
     /* Throttle state: see on_progress. Touched only by the job's own
      * worker thread, which is the only caller. */
     int64_t        last_ms;
-    char           last_phase[32];
+    /* Room for a unit backup's "unit 3/12 <name>: store". */
+    char           last_phase[192];
     /* The latest report, written or not, for the job's closing log line. */
     uint64_t       seen_done, seen_total;
     /* job_progress_bytes and job_set_result. */
@@ -374,6 +375,12 @@ void job_set_result(void *progress_ctx, const char *json_object)
     if (!copy) return;   /* a result is a report, not the job's outcome */
     free(pc->result);
     pc->result = copy;
+}
+
+int64_t job_progress_id(void *progress_ctx)
+{
+    const progress_ctx_t *pc = progress_ctx;
+    return pc ? pc->job_id : 0;
 }
 
 void job_set_summary(void *progress_ctx, const char *text)

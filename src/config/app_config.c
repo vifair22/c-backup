@@ -33,6 +33,10 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
     config_check_int_range(chk, "scheduler.enabled", 0, 1);
     config_check_int_range(chk, "jobs.max_parallel", 1, APP_MAX_PARALLEL_JOBS);
     config_check_int_range(chk, "backup.store_workers", 0, APP_MAX_STORE_WORKERS);
+    config_check_int_range(chk, "units.unit_wait_s", 1, 86400);
+    config_check_int_range(chk, "vm.freeze_timeout_s", 1, 600);
+    config_check_int_range(chk, "vm.trust_zero_status", 0, 1);
+    config_check_int_range(chk, "containers.max_pause_s", 1, 600);
 
     /* The floor has its own message: "not between 16 and ..." would not say
      * why a smaller budget cannot work. */

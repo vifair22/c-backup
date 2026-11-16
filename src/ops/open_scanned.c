@@ -2,6 +2,11 @@
 
 #include "open_scanned.h"
 
+/* Where an entry's bytes are: its recorded path, or for a unit's tree read
+ * through a filesystem snapshot (scan_tree_as) the path it was found at,
+ * which is the one root_len measures. */
+#define SRC_PATH(e) ((e)->read_path ? (e)->read_path : (e)->path)
+
 #include <linux/openat2.h>
 
 #include <errno.h>
@@ -47,7 +52,7 @@ status_t scan_roots_new(const scan_result_t *scan, scan_roots_t **out)
     unsigned n = 0;
     for (uint32_t i = 0; i < scan->count; i++) {
         const scan_entry_t *e = &scan->entries[i];
-        if (e->root_len && strlen(e->path) == e->root_len) n++;
+        if (e->root_len && strlen(SRC_PATH(e)) == e->root_len) n++;
     }
     if (n) {
         t->r = calloc(n, sizeof(*t->r));
@@ -59,9 +64,9 @@ status_t scan_roots_new(const scan_result_t *scan, scan_roots_t **out)
     }
     for (uint32_t i = 0; i < scan->count; i++) {
         const scan_entry_t *e = &scan->entries[i];
-        if (!e->root_len || strlen(e->path) != e->root_len) continue;
+        if (!e->root_len || strlen(SRC_PATH(e)) != e->root_len) continue;
         source_root_t *r = &t->r[t->n++];
-        r->path = e->path;
+        r->path = SRC_PATH(e);
         r->len  = e->root_len;
         r->dev  = e->st.st_dev;
         r->ino  = e->st.st_ino;
@@ -90,7 +95,7 @@ static source_root_t *root_of(scan_roots_t *t, const scan_entry_t *e,
     source_root_t *r = NULL;
     for (unsigned k = 0; k < t->n && !r; k++)
         if (t->r[k].len == e->root_len &&
-            memcmp(t->r[k].path, e->path, e->root_len) == 0)
+            memcmp(t->r[k].path, SRC_PATH(e), e->root_len) == 0)
             r = &t->r[k];
     if (!r) {
         snprintf(why, why_sz, "cannot open: its source root is not in the scan");
@@ -197,10 +202,10 @@ int open_scanned(scan_roots_t *roots, const scan_entry_t *e, int one_fs,
                  struct stat *fst, char *why, size_t why_sz)
 {
     int fd;
-    if (roots && e->root_len && e->path[e->root_len] == '/') {
+    if (roots && e->root_len && SRC_PATH(e)[e->root_len] == '/') {
         source_root_t *r = root_of(roots, e, why, why_sz);
         if (!r) return -1;
-        const char *rel = e->path + e->root_len + 1;
+        const char *rel = SRC_PATH(e) + e->root_len + 1;
         fd = open_beneath(r->fd, rel, one_fs, r->dev);
         if (fd == -1) {
             int err = errno;
@@ -224,7 +229,7 @@ int open_scanned(scan_roots_t *roots, const scan_entry_t *e, int one_fs,
     } else {
         /* The source root itself is this file: its path is the operator's,
          * and only its last component must not be a symlink now. */
-        fd = open(e->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+        fd = open(SRC_PATH(e), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
         if (fd == -1) {
             int err = errno;
             if (err == ELOOP)

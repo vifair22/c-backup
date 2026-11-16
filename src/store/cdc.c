@@ -631,36 +631,62 @@ static status_t read_full_at(int fd, uint8_t *buf, size_t n, uint64_t off)
 }
 
 /*
- * Chunk one span.
+ * Where the chunker is inside a span that is still open, between the pieces
+ * of a source that hands spans over in pieces (cdc_source_t.next_piece).
+ * For an ordinary source every span is one piece and this never outlives
+ * one call of chunk_span.
+ */
+typedef struct {
+    int         open;
+    cdc_state_t cs;
+    size_t      blen;       /* bytes in *cur, all scanned, none cut yet */
+    uint64_t    chunk_abs;  /* where the chunk in *cur starts */
+    size_t      need;       /* buffer size the span was opened with */
+} span_state_t;
+
+/*
+ * Chunk one span, or one piece of one.
  *
  * Reads go straight into the buffer of the chunk being cut (max_size bytes),
  * a read step at a time. At a cut, only what was read past it - less than
  * one step - is copied, into the next chunk's buffer. Reading into a window
  * and copying each chunk out cost every byte two extra copies, which
  * capped one file at about 1.8 GB/s however many workers hashed.
+ *
+ * With more set the span goes on after e: the bytes not yet cut stay in
+ * *cur with the scanner's state, and the next piece carries on from them,
+ * so where the cuts fall does not depend on where the pieces end.
  */
 static status_t chunk_span(drv_t *d, const cdc_source_t *src,
-                           uint64_t s, uint64_t e,
-                           uint8_t **cur, uint8_t **spare)
+                           uint64_t s, uint64_t e, int more,
+                           uint8_t **cur, uint8_t **spare, span_state_t *ss)
 {
     const size_t max = d->p->max_size;
-    cdc_state_t cs;
-    cdc_reset(&cs);
-    size_t blen = 0, scanned = 0;
-    uint64_t pos = s, chunk_abs = s;
 
-    /* No chunk of this span can be longer than the span: a small file gets
-     * a small buffer, not a max_size mapping made and torn down for it. */
-    size_t need = (e - s) < (uint64_t)max ? (size_t)(e - s) : max;
-    if (*cur && d->cur_cap < need) {
-        buf_put(d->w, *cur, d->cur_cap);
-        *cur = NULL;
+    if (!ss->open) {
+        cdc_reset(&ss->cs);
+        ss->blen = 0;
+        ss->chunk_abs = s;
+        /* No chunk of this span can be longer than the span: a small file
+         * gets a small buffer, not a max_size mapping made and torn down for
+         * it. A span arriving in pieces has no known length, so it gets the
+         * full size. */
+        ss->need = (!more && (e - s) < (uint64_t)max) ? (size_t)(e - s) : max;
+        if (*cur && d->cur_cap < ss->need) {
+            buf_put(d->w, *cur, d->cur_cap);
+            *cur = NULL;
+        }
+        if (!*cur) {
+            if (!(*cur = buf_get(d->w, ss->need, ss->need == max)))
+                return set_error(ERR_NOMEM, "cdc: chunk buffer");
+            d->cur_cap = ss->need;
+        }
+        ss->open = 1;
     }
-    if (!*cur) {
-        if (!(*cur = buf_get(d->w, need, need == max)))
-            return set_error(ERR_NOMEM, "cdc: chunk buffer");
-        d->cur_cap = need;
-    }
+    const size_t need = ss->need;
+    cdc_state_t cs = ss->cs;
+    size_t blen = ss->blen, scanned = ss->blen;
+    uint64_t pos = s, chunk_abs = ss->chunk_abs;
 
     for (;;) {
         if (scanned == blen) {
@@ -706,6 +732,13 @@ static status_t chunk_span(drv_t *d, const cdc_source_t *src,
         blen = spill;
         scanned = 0;
     }
+    if (more) {
+        ss->cs = cs;
+        ss->blen = blen;
+        ss->chunk_abs = chunk_abs;
+        return OK;
+    }
+    ss->open = 0;
     /* The span's end is a boundary of its own. */
     if (blen > 0) return emit_chunk(d, cur, blen, chunk_abs);
     return OK;
@@ -941,24 +974,39 @@ status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
 
     uint8_t *cur = NULL, *spare = NULL;
 
-    uint64_t covered = 0;
+    uint64_t covered = 0, last_end = 0;
     unsigned nspans = 0;
     int whole = 1;          /* one span covering [0, size) */
+    span_state_t ss;
+    memset(&ss, 0, sizeof(ss));
     status_t st = OK;
     for (;;) {
         uint64_t s = 0, e = 0;
-        int got = 0;
-        st = src->next_span(src->ctx, &s, &e, &got);
-        if (st != OK || !got) break;
-        if (e <= s || e > size) {
-            st = set_error(ERR_INVALID, "cdc: span [%llu, %llu) outside %llu bytes",
+        int got = 0, more = 0;
+        st = src->next_piece ? src->next_piece(src->ctx, &s, &e, &got, &more)
+                             : src->next_span(src->ctx, &s, &e, &got);
+        if (st != OK) break;
+        if (!got) {
+            if (ss.open)
+                st = set_error(ERR_INVALID, "cdc: the source ended inside a span");
+            break;
+        }
+        /* An empty piece only ever closes a span already open. Pieces of
+         * one span abut; spans never overlap or go backwards. */
+        int bad = e > size || e < s || (e == s && (more || !ss.open)) ||
+                  (ss.open && s != last_end) ||
+                  (!ss.open && nspans > 0 && s < last_end);
+        if (bad) {
+            st = set_error(ERR_INVALID, "cdc: span [%llu, %llu) outside %llu bytes "
+                           "or out of order",
                            (unsigned long long)s, (unsigned long long)e,
                            (unsigned long long)size);
             break;
         }
-        if (nspans++ > 0 || s != 0) whole = 0;
+        if (!ss.open && (nspans++ > 0 || s != 0)) whole = 0;
         covered += e - s;
-        st = chunk_span(&d, src, s, e, &cur, &spare);
+        last_end = e;
+        st = chunk_span(&d, src, s, e, more, &cur, &spare, &ss);
         if (st != OK) break;
     }
     if (covered != size) whole = 0;

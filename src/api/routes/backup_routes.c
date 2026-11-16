@@ -12,6 +12,7 @@
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
 #include "repo.h"
+#include "reserved.h"
 #include "store.h"
 #include "store_index.h"
 
@@ -536,6 +537,12 @@ static int backup_opts_from_json(cutils_json_req_t *body, backup_job_t *j,
         if (!v[i][0]) {
             jreq_strv_free(v, n);
             snprintf(err->msg, sizeof(err->msg), "a backup path cannot be empty");
+            return -1;
+        }
+        /* The daemon's reserved snapshot names (reserved.h): a 400 now,
+         * rather than a job that fails in the engine's own check. */
+        if (reserved_source_refused(v[i], err->msg, sizeof(err->msg)) != 0) {
+            jreq_strv_free(v, n);
             return -1;
         }
     }

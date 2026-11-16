@@ -136,13 +136,25 @@ static int schedule_has_queued_run(cutils_db_t *db, int64_t schedule_id)
  * the same request `jobs cancel` makes. Queued jobs are left alone: one of
  * them may be the replacement this policy exists to start.
  */
+/*
+ * Which jobs a schedule overlaps: the same repository and action, and for a
+ * units schedule the same unit set too (source-providers.md 8.2), which the
+ * job's params carry in the canonical form the schedule stores. Two units
+ * schedules for different units of one repository are not each other's
+ * overlap; they serialise on the repository lock like any two jobs.
+ */
+#define OVERLAP_WHERE \
+    " WHERE repo_id = ? AND action = ?" \
+    "   AND (action <> 'units' OR COALESCE(params, '') = ?)"
+
 static void cancel_running_overlap(scheduler_t *s, int64_t schedule_id,
-                                   const char *repo, const char *action)
+                                   const char *repo, const char *action,
+                                   const char *params)
 {
     db_result_t *r = NULL;
     if (db_execute(s->db,
-            "SELECT id FROM jobs WHERE repo_id = ? AND action = ? AND state = 'running'",
-            (const char *[]){ repo, action, NULL }, &r) != 0) {
+            "SELECT id FROM jobs" OVERLAP_WHERE " AND state = 'running'",
+            (const char *[]){ repo, action, params ? params : "", NULL }, &r) != 0) {
         db_result_free(r);
         log_warn("scheduler: schedule %lld cannot list its running jobs",
                  (long long)schedule_id);
@@ -176,7 +188,7 @@ static void cancel_running_overlap(scheduler_t *s, int64_t schedule_id,
  */
 static int overlap_allows_fire(scheduler_t *s, int64_t schedule_id,
                                int64_t repo_id, const char *action,
-                               const char *policy)
+                               const char *params, const char *policy)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -189,8 +201,9 @@ static int overlap_allows_fire(scheduler_t *s, int64_t schedule_id,
     int running = 0, queued = 0;
     if (db_execute(s->db,
             "SELECT SUM(state = 'running'), SUM(state = 'queued') FROM jobs"
-            " WHERE repo_id = ? AND action = ? AND state IN ('queued','running')",
-            (const char *[]){ repo, action, NULL }, &r) == 0 && r && r->nrows == 1) {
+            OVERLAP_WHERE " AND state IN ('queued','running')",
+            (const char *[]){ repo, action, params ? params : "", NULL }, &r) == 0 &&
+        r && r->nrows == 1) {
         running = atoi(r->rows[0][0]);
         queued  = atoi(r->rows[0][1]);
     }
@@ -234,7 +247,7 @@ static int overlap_allows_fire(scheduler_t *s, int64_t schedule_id,
          * is harmless, and adds nothing.
          */
         if (s->cancel)
-            cancel_running_overlap(s, schedule_id, repo, action);
+            cancel_running_overlap(s, schedule_id, repo, action, params);
         else
             /* Nothing can stop the running job, so this degrades to queue
              * rather than claiming it was cancelled. */
@@ -285,7 +298,7 @@ status_t scheduler_tick(scheduler_t *sched, time_t now)
             continue;
         }
 
-        if (overlap_allows_fire(sched, sid, repo, action, r->rows[i][4])) {
+        if (overlap_allows_fire(sched, sid, repo, action, r->rows[i][3], r->rows[i][4])) {
             status_t st = sched->dispatch ? sched->dispatch(sched->user, sid, repo,
                                                             action, r->rows[i][3])
                                           : OK;

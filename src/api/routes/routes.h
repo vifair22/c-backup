@@ -92,6 +92,31 @@ int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int de
  */
 int routes_policy_count(const char *text, int *out);
 
+/* Overlay a unit's unit_policy rows (retention.* keys) on *ret, which holds
+ * the repository's policy already. Invalid stored values are skipped with
+ * a warning, as the repository's are. */
+#include "gfs.h"
+void routes_unit_policy(cutils_db_t *db, int64_t repo_id, const char *unit_key,
+                        gfs_retention_t *ret);
+
+/* Units (src/api/routes/units.c). /providers registers its own routes; the
+ * repo-scoped ones are dispatched from repos.c, and units_path_allow is
+ * their part of the repo path table. */
+struct job_manager;
+void           routes_units_init(cutils_db_t *db, struct job_manager *jm);
+int            routes_register_providers(api_server_t *srv);
+const char    *units_path_allow(const char *rest);
+api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const char *rest);
+api_response_t units_route_put(const api_request_t *req, int64_t repo_id, const char *rest);
+api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const char *rest);
+/* A `units` job from a schedule's params, which have the route's shape. */
+status_t       routes_submit_units(struct job_manager *jm, int64_t repo_id,
+                                   const char *params, int64_t schedule_id,
+                                   int64_t *out_job_id);
+/* Validate and canonicalise those params, for the schedule route. */
+int            routes_units_params_check(const char *params, char **canon,
+                                         char *why, size_t wsz);
+
 /*
  * Read ?limit= and (when offset is non-NULL) ?offset= for a collection
  * route. Absent means def_limit and 0; a limit above max_limit is clamped

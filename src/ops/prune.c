@@ -117,6 +117,14 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
         failed = db_execute_non_query(db,
             "DELETE FROM notes WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
+    if (!failed)
+        failed = db_execute_non_query(db,
+            "DELETE FROM snapshot_unit_items WHERE repo_id = ? AND snap_id = ?",
+            (const char *[]){ repo, snap, NULL }, NULL) != 0;
+    if (!failed)
+        failed = db_execute_non_query(db,
+            "DELETE FROM snapshot_units WHERE repo_id = ? AND snap_id = ?",
+            (const char *[]){ repo, snap, NULL }, NULL) != 0;
 
     if (failed) {
         db_txn_rollback(db);
