@@ -80,7 +80,7 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
 SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/scheduler -I src/common \
                 -I src/config -I src/daemon -I $(CUTILS_DIR)/include \
                 -I $(CUTILS_DIR)/lib/cJSON
-COMMON_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
+COMMON_CFLAGS := -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
                  -fstack-protector-strong -fstack-clash-protection \
                  $(SRC_INCLUDES) $(VERSION_DEF) $(CUTILS_VERSION_DEF)
 
@@ -102,7 +102,7 @@ DEBUG_CFLAGS   := $(COMMON_CFLAGS) -Og -g $(ARCH_CFLAGS)
 ASAN_CFLAGS    := $(COMMON_CFLAGS) -O1 -g -fsanitize=address -fno-omit-frame-pointer $(ARCH_CFLAGS)
 
 CUTILS_LIB     := -L$(CUTILS_DIR)/build -lc-utils
-LDFLAGS        := $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm
+LDFLAGS        := $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -pthread -lm
 
 # Per-type CFLAGS/LDFLAGS selection
 ifeq ($(BUILD_TYPE),release)
@@ -119,7 +119,7 @@ else ifeq ($(BUILD_TYPE),debug)
   BIN_SUFFIX   := -debug
 else ifeq ($(BUILD_TYPE),asan)
   TYPE_CFLAGS  := $(ASAN_CFLAGS)
-  TYPE_LDFLAGS := -static-libasan $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm
+  TYPE_LDFLAGS := -static-libasan $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -pthread -lm
   BIN_SUFFIX   := -asan
 endif
 
@@ -163,11 +163,11 @@ OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ)
 # Generated code (the embedded migrations): match the optimisation level but
 # drop the strict warnings, since nobody edits it by hand.
 ifeq ($(BUILD_TYPE),debug)
-  GEN_CFLAGS := -std=c11 -Og -g $(SRC_INCLUDES) $(VERSION_DEF)
+  GEN_CFLAGS := -std=c11 -pthread -Og -g $(SRC_INCLUDES) $(VERSION_DEF)
 else ifeq ($(BUILD_TYPE),asan)
-  GEN_CFLAGS := -std=c11 -O1 -g $(SRC_INCLUDES) $(VERSION_DEF)
+  GEN_CFLAGS := -std=c11 -pthread -O1 -g $(SRC_INCLUDES) $(VERSION_DEF)
 else
-  GEN_CFLAGS := -std=c11 -O3 -flto=auto -march=$(MARCH) $(SRC_INCLUDES) $(VERSION_DEF)
+  GEN_CFLAGS := -std=c11 -pthread -O3 -flto=auto -march=$(MARCH) $(SRC_INCLUDES) $(VERSION_DEF)
 endif
 
 # ---- Phony targets ----------------------------------------------------
@@ -243,7 +243,7 @@ REL_OBJ_DIR := $(BUILD)/release
 REL_LIB_OBJS = $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
                $(REL_OBJ_DIR)/app_migrations.o
 
-TEST_CFLAGS  := -std=c11 -Wall -Wextra -O2 -march=$(MARCH) -Wno-unused-result $(SRC_INCLUDES)
+TEST_CFLAGS  := -std=c11 -pthread -Wall -Wextra -O2 -march=$(MARCH) -Wno-unused-result $(SRC_INCLUDES)
 TEST_LDFLAGS := -flto=auto $(LDFLAGS) -lcmocka
 
 # Every suite in tests/ is live. Helpers are linked into suites rather than
@@ -331,12 +331,12 @@ ASAN_OBJ_DIR := $(BUILD)/asan
 ASAN_LIB_OBJS = $(patsubst %.c, $(ASAN_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
                 $(ASAN_OBJ_DIR)/app_migrations.o
 
-ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
+ASAN_TEST_CFLAGS := -std=c11 -pthread -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
 ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(TEST_SRCS))
 
 $(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
 	$(CC) $(ASAN_TEST_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ -static-libasan \
-	    $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm -lcmocka
+	    $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -pthread -lm -lcmocka
 
 test-asan: asan $(ASAN_TEST_BINS)
 	@for t in $(ASAN_TEST_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
@@ -374,10 +374,10 @@ FUZZ_LIB_OBJS := $(patsubst %.c, $(FUZZ_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
                  $(FUZZ_OBJ_DIR)/fake_index.o
 
 FUZZ_SAN    := -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -g
-FUZZ_CFLAGS := -std=c11 -Wall -Wextra -O1 -Wno-unused-result $(FUZZ_SAN) \
+FUZZ_CFLAGS := -std=c11 -pthread -Wall -Wextra -O1 -Wno-unused-result $(FUZZ_SAN) \
                $(SRC_INCLUDES) -I $(TESTS) $(CUTILS_VERSION_DEF)
 FUZZ_LDFLAGS := -fsanitize=fuzzer,address,undefined \
-                $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm
+                $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -pthread -lm
 
 $(FUZZ_OBJ_DIR) $(FUZZ_BIN_DIR):
 	mkdir -p $@
@@ -473,7 +473,7 @@ fuzz-min: fuzz
 FUZZCOV_DIR  := $(BUILD)/fuzzcov
 FUZZCOV_OBJ  := $(FUZZCOV_DIR)/obj
 FUZZCOV_BIN  := $(FUZZCOV_DIR)/bin
-FUZZCOV_CF   := -std=c11 -O1 -g -fsanitize=fuzzer-no-link \
+FUZZCOV_CF   := -std=c11 -pthread -O1 -g -fsanitize=fuzzer-no-link \
                 -fprofile-instr-generate -fcoverage-mapping -Wno-unused-result \
                 $(SRC_INCLUDES) -I $(TESTS) $(CUTILS_VERSION_DEF)
 LLVM_PROFDATA ?= llvm-profdata
@@ -492,7 +492,7 @@ fuzz-cov: $(MIGRATE_SRC)
 	    n=$$(basename $${t%.c}); \
 	    $(FUZZ_CC) $(FUZZCOV_CF) $(TEST_DIR_DEF) $$t $(FUZZCOV_OBJ)/*.o -o $(FUZZCOV_BIN)/$$n \
 	        -fsanitize=fuzzer -fprofile-instr-generate -fcoverage-mapping \
-	        $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm || exit 1; \
+	        $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -pthread -lm || exit 1; \
 	done
 	@rm -rf $(FUZZCOV_DIR)/prof && mkdir -p $(FUZZCOV_DIR)/prof
 	@for t in $(FUZZCOV_BIN)/*; do \
@@ -538,7 +538,7 @@ fuzz-regress: fuzz
 	exit $$rc
 
 # ---- Static analysis --------------------------------------------------
-ANALYZE_CFLAGS := -std=c11 -Wall -Wextra -O2 -march=$(MARCH) $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
+ANALYZE_CFLAGS := -std=c11 -pthread -Wall -Wextra -O2 -march=$(MARCH) $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
 STACK_LIMIT    := 65536
 
 analyze: | $(BUILD)
@@ -576,7 +576,7 @@ analyze: | $(BUILD)
 
 lint:
 	@echo "=== clang-tidy ==="
-	@clang-tidy $(SRCS) -- -std=c11 $(SRC_INCLUDES) 2>&1 | \
+	@clang-tidy $(SRCS) -- -std=c11 -pthread $(SRC_INCLUDES) 2>&1 | \
 	    grep -E "warning:|error:" || echo "clang-tidy: OK"
 
 # ---- Editor index -----------------------------------------------------
@@ -603,7 +603,7 @@ BENCH        := bench
 # The daemon's include set and warning set. A private -I list here went stale
 # twice: after the April src/ reorganisation, and again when the daemon
 # rewrite added src/meta, src/scheduler, src/config and the c-utils headers.
-BENCH_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O3 -flto=auto $(ARCH_CFLAGS) \
+BENCH_CFLAGS := -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O3 -flto=auto $(ARCH_CFLAGS) \
                 $(SRC_INCLUDES)
 
 $(BINS)/bench_micro: $(BENCH)/micro.c $(REL_LIB_OBJS) | $(BINS)
@@ -622,7 +622,7 @@ $(BINS)/bench_browse: $(BENCH)/browse.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) 
 # under chosen directories so bench_phases can model slow sync storage. See
 # bench/slow_sync.c.
 $(BINS)/slow_sync.so: $(BENCH)/slow_sync.c | $(BINS)
-	$(CC) -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -lpthread
+	$(CC) -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -pthread
 
 bench: $(BINS)/bench_micro $(BINS)/bench_phases $(BINS)/bench_browse $(BINS)/slow_sync.so
 	@echo "=== micro ===" && $(BINS)/bench_micro
@@ -640,7 +640,7 @@ bench-browse: $(BINS)/bench_browse
 
 # ---- Coverage ---------------------------------------------------------
 COV_DIR     := $(BUILD)/coverage
-COV_CFLAGS  := -std=c11 -Wall -Wextra -O0 -g --coverage -march=$(MARCH) \
+COV_CFLAGS  := -std=c11 -pthread -Wall -Wextra -O0 -g --coverage -march=$(MARCH) \
                -Wno-unused-result -Wno-format-truncation $(SRC_INCLUDES) \
                $(VERSION_DEF) $(CUTILS_VERSION_DEF)
 COV_LDFLAGS := --coverage $(LDFLAGS)
@@ -672,7 +672,7 @@ $(COV_DIR)/%.o: $(SRC)/%.c | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) -c $< -o $@
 
 $(COV_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(COV_DIR)
-	$(CC) -std=c11 -O0 -g --coverage $(SRC_INCLUDES) -c $< -o $@
+	$(CC) -std=c11 -pthread -O0 -g --coverage $(SRC_INCLUDES) -c $< -o $@
 
 $(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) $(TEST_DIR_STAMP) | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(COV_LDFLAGS) -lcmocka
