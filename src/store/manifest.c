@@ -453,9 +453,11 @@ status_t manifest_parse(const void *buf, size_t len,
          * anything but a regular file, so one entry has one encoding. */
         if ((e->flags & ~MANIFEST_FLAGS_KNOWN) != 0 ||
             (e->flags && e->type != NODE_TYPE_REG)) {
+            /* Read before the entries, e among them, are freed. */
+            unsigned bad_flags = e->flags, bad_type = e->type;
             manifest_free_entries(out, count);
             return set_error(ERR_CORRUPT, "manifest_parse: entry flags 0x%02x "
-                             "on type %u are not valid", e->flags, e->type);
+                             "on type %u are not valid", bad_flags, bad_type);
         }
 
         /* Both lengths are 16-bit and off is size_t, so this cannot wrap. */
