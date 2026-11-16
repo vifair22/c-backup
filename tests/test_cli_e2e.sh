@@ -1436,12 +1436,13 @@ damage_beyond_parity() {  # damage_beyond_parity <sample> <pack>
 
 # The failure path is the job manager's: it marks the job failed and sends
 # the alert, and the line it logs as it sends is the evidence.
-# The job is marked failed before the alert goes out, so the CLI can return
-# and look before the line is logged; give the worker a moment to get there.
+# The job manager marks the job failed, which is what the CLI is waiting
+# for, and only then journals and sends the alert, so the line can land a
+# moment after the command returns: under the coverage build it did not
+# land in time and the check failed. Wait for it, up to 10 s.
 alerted() {  # alerted <job-id>
-    # The notification is logged after the job's failure is recorded, on
-    # another thread, so the CLI can see the failure first. Up to 5 s.
-    for _ in $(seq 1 50); do
+    local _
+    for _ in $(seq 1 100); do
         grep -q "sending failure notification for job $1:" "$WORK/daemon.log" && return 0
         sleep 0.1
     done
