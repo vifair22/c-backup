@@ -16,7 +16,7 @@
 import { _electron as electron, expect, type ElectronApplication, type Page } from '@playwright/test'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { createServer } from 'node:net'
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, linkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -54,6 +54,15 @@ export interface HarnessOptions {
    *             app with none so a spec can add it through the dialog.
    */
   remote?: { password?: string; seed: boolean }
+
+  /*
+   * Two directories holding one file under two names (a hard link), so
+   * their trees serialise to the same bytes and share one set of entry rows
+   * in the index (docs/index-reuse.md): one file id, two paths, in every
+   * snapshot. Anything on screen keyed by a file's id shows the copies as
+   * one.
+   */
+  twins?: boolean
 }
 
 export interface Harness {
@@ -114,6 +123,13 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   mkdirSync(join(work, 'src', 'docs'), { recursive: true })
   writeFileSync(join(work, 'src', 'notes.txt'), 'the quick brown fox\n'.repeat(40))
   writeFileSync(join(work, 'src', 'docs', 'readme.md'), '# demo\n\nA fixture file.\n')
+
+  if (opts.twins) {
+    mkdirSync(join(work, 'src', 'twin-a'), { recursive: true })
+    mkdirSync(join(work, 'src', 'twin-b'), { recursive: true })
+    writeFileSync(join(work, 'src', 'twin-a', 'same.txt'), 'one file, two names\n')
+    linkSync(join(work, 'src', 'twin-a', 'same.txt'), join(work, 'src', 'twin-b', 'same.txt'))
+  }
 
   if (opts.wideDir) {
     mkdirSync(join(work, 'src', 'wide'), { recursive: true })

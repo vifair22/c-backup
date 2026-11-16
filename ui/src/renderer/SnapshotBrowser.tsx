@@ -127,7 +127,15 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
   const [complete, setComplete] = useState<Set<number>>(new Set())
   const [breadcrumb, setBreadcrumb] = useState<Breadcrumb[]>([])
   const [error, setError] = useState<string | null>(null)
-  const [highlightNodeId, setHighlightNodeId] = useState<number | null>(null)
+  /*
+   * Selection and the search highlight are keyed by path, not node id. A
+   * file's id is its entry row, shared by every snapshot that holds it in an
+   * unchanged directory and by every copy of an identical directory within
+   * one snapshot (docs/index-reuse.md), so two rows on screen can carry the
+   * same id. A path names one row. Directory ids stay unique per snapshot,
+   * which is why the tree and its paging are still keyed by them.
+   */
+  const [highlightPath, setHighlightPath] = useState<string | null>(null)
   const [initLoading, setInitLoading] = useState(true)
   const [selectedFile, setSelectedFile] = useState<{ node: TreeNode; path: string } | null>(null)
   const [note, setNote] = useState<string | null>(null)
@@ -204,6 +212,10 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
     setBreadcrumb([])
     setNote(null)
     setNoteEditing(false)
+    /* A file selected in another snapshot is not this snapshot's: its card
+     * would offer to restore a path with another snapshot's metadata. */
+    setSelectedFile(null)
+    setHighlightPath(null)
 
     /*
      * A snapshot with no note 404s, which is the correct answer and not an
@@ -250,7 +262,7 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
 
           const isLast = i === segments.length - 1
           if (isLast) {
-            setHighlightNodeId(match.nodeId)
+            setHighlightPath('/' + segments.slice(0, i + 1).join('/'))
             if (match.type === NODE_DIR) {
               expandedSet.add(match.nodeId)
               crumbs.push({ nodeId: match.nodeId, name: match.name })
@@ -325,12 +337,15 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       const chain = isDir ? [...parentChain, { nodeId: node.nodeId, name: node.name }] : parentChain
 
       const filePath = '/' + [...parentChain.map(b => b.name), node.name].join('/')
-      const isSelected = selectedFile?.node.nodeId === node.nodeId
+      const isSelected = selectedFile?.path === filePath
 
-      const isHighlighted = highlightNodeId === node.nodeId
+      const isHighlighted = highlightPath === filePath
 
       rows.push(
         <tr key={`${parentId}-${node.nodeId}`}
+          data-path={filePath}
+          aria-selected={isSelected}
+          data-highlighted={isHighlighted ? 'true' : undefined}
           ref={isHighlighted ? (el) => { el?.scrollIntoView({ block: 'center', behavior: 'smooth' }) } : undefined}
           onClick={isDir
             ? () => toggleDir(node, depth, parentChain)
