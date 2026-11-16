@@ -89,8 +89,9 @@ static void test_ranges_refused(void **state)
     refused("jobs:\n  read_budget_mb: 1048577\n", "jobs.read_budget_mb: '1048577'");
     /* Each NBD export connection may hold one 16 MiB object of the budget
      * beside the 48 a job needs: four want 112 MiB, or exports off. */
-    refused("jobs:\n  read_budget_mb: 64\n", "vm.export_max_conns: '4' connections can hold 64 MiB");
-    refused("jobs:\n  read_budget_mb: 111\n", "raise jobs.read_budget_mb to 112");
+    refused("jobs:\n  read_budget_mb: 64\n",
+            "vm.export_max_conns: '4' needs jobs.read_budget_mb of at least 4 x 16 MiB + 48 MiB = 112 MiB");
+    refused("jobs:\n  read_budget_mb: 111\n", "set jobs.read_budget_mb >= 112, or lower vm.export_max_conns");
     assert_int_equal(load("jobs:\n  read_budget_mb: 112\n"), CUTILS_OK);
     assert_int_equal(load("jobs:\n  read_budget_mb: 64\nvm:\n  export_max_conns: 1\n"), CUTILS_OK);
     refused("vm:\n  export_max_conns: 65\n", "vm.export_max_conns: '65'");

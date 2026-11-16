@@ -66,11 +66,13 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
         if (conns > 0 && budget >= APP_MIN_READ_BUDGET_MB &&
             budget < APP_MIN_READ_BUDGET_MB + conns * 16)
             config_check_fail(chk, "vm.export_max_conns",
-                              "'%d' connections can hold %d MiB of jobs.read_budget_mb "
-                              "(%d MiB), which leaves less than the %d MiB a job needs; "
-                              "raise jobs.read_budget_mb to %d or lower this (0 turns "
-                              "exports off)", conns, conns * 16, budget,
-                              APP_MIN_READ_BUDGET_MB, APP_MIN_READ_BUDGET_MB + conns * 16);
+                              "'%d' needs jobs.read_budget_mb of at least %d x 16 MiB + "
+                              "%d MiB = %d MiB (each export connection may hold one "
+                              "16 MiB object beside a job's %d MiB), and it is %d; set "
+                              "jobs.read_budget_mb >= %d, or lower vm.export_max_conns "
+                              "(0 turns exports off)", conns, conns, APP_MIN_READ_BUDGET_MB,
+                              APP_MIN_READ_BUDGET_MB + conns * 16, APP_MIN_READ_BUDGET_MB,
+                              budget, APP_MIN_READ_BUDGET_MB + conns * 16);
     }
 
     static const char *const retention[] = {

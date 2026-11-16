@@ -27,6 +27,7 @@ docker run -d --name c-backup-helper --restart unless-stopped \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /mnt/cache:/mnt/cache:rshared \
+  -v /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock \
   --label net.cbackup.role=helper \
   --entrypoint /usr/local/bin/c-backup-helper \
   c-backup:latest --policy /etc/c-backup-helper.ini
@@ -63,6 +64,9 @@ services:
       - /boot/config/c-backup-helper.ini:/etc/c-backup-helper.ini:ro
       - /mnt/cache/system/c-backup-helper:/mnt/cache/system/c-backup-helper
       - /run/c-backup-helper:/run/c-backup-helper
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt/cache:/mnt/cache:rshared
+      - /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock
   c-backupd:
     image: c-backup:latest
     depends_on: [c-backup-helper]
@@ -81,6 +85,15 @@ services:
 ```
 
 Notes that matter:
+
+- **libvirt's socket is mounted into the helper.** The helper connects to
+  `qemu:///system` from its own mount namespace, so without
+  `/var/run/libvirt/libvirt-sock` it cannot reach libvirtd and the libvirt
+  provider reports itself unavailable. Leave it out only on a host with no
+  VMs to back up (`[libvirt] enabled = 0`). `nbd_dir`
+  (`/run/c-backup-helper/nbd` here) sits under the helper's socket
+  directory, so the daemon's existing mount of `/run/c-backup-helper`
+  already shows it at the same path, which libvirt's exports need.
 
 - **The policy lives on the flash** (`/boot/config/`), root-owned, mode 0600
   or 0644. The helper refuses to start on a file anybody but its owner can
