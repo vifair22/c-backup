@@ -17,16 +17,16 @@ TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
 mkdir -p "$TEST_ROOT"
 WORK="$(mktemp -d "$TEST_ROOT/c_backup_cli_e2e.XXXXXX")"
 # Ports per run, so concurrent suites (CI jobs on one runner, parallel
-# worktrees) never reach each other's daemons.
-PORTBASE=$((20000 + ($$ % 15000) * 3))
-# Skip past ports something already holds: the base is derived from the pid,
-# and anything bound there (a listener, or an outgoing connection that drew
-# it from the ephemeral range) made the daemon exit with "cannot start API
-# server" about once in a few dozen runs.
-port_busy() { ss -Htan "( sport = :$1 )" 2>/dev/null | grep -q .; }
-while port_busy "$PORTBASE" || port_busy $((PORTBASE + 1)) || port_busy $((PORTBASE + 2)); do
-    PORTBASE=$((PORTBASE + 3)); [ "$PORTBASE" -gt 64990 ] && PORTBASE=20000
-done
+# worktrees) never reach each other's daemons: one for the main daemon, one
+# for the second daemon that adopts a replica, one for the bind test. They
+# came from the pid, skipping any `ss` showed busy, which still raced the
+# bind; the kernel chooses them now (FLAKE-13).
+. "$(dirname "$0")/free_port.sh"
+mapfile -t PORTS < <(free_ports 3 "$WORK")
+[ "${#PORTS[@]}" -eq 3 ] || { echo "cannot choose TCP ports"; exit 1; }
+MAIN_PORT=${PORTS[0]}
+PORT2=${PORTS[1]}
+BINDPORT=${PORTS[2]}
 SOCK="$WORK/c.sock"
 PASS=0
 FAIL=0
@@ -130,7 +130,7 @@ db:
   path: $WORK/state.db
 http:
   socket: $SOCK
-  port: $PORTBASE
+  port: $MAIN_PORT
   bind: 127.0.0.1
 log:
   level: info
@@ -1078,7 +1078,7 @@ db:
   path: $WORK/state2.db
 http:
   socket: $SOCK2
-  port: $((PORTBASE + 1))
+  port: $PORT2
   bind: 127.0.0.1
 log:
   level: warn
@@ -1323,7 +1323,7 @@ OUT=$(cb auth logout 2>&1); RC=$?
 check    "auth logout without --all fails" 1 "$RC"
 contains "and points at --all" "auth logout --all" "$OUT"
 tcp_login() {  # tcp_login <password>: the response body of a TCP login
-    curl -s -X POST -d "{\"password\":\"$1\"}" "http://127.0.0.1:$PORTBASE/api/auth/login"
+    curl -s -X POST -d "{\"password\":\"$1\"}" "http://127.0.0.1:$MAIN_PORT/api/auth/login"
 }
 OUT=$(printf 'correcthorsebattery\nbrandnewpassword\n' | cb auth password 2>&1); RC=$?
 check "password change reads both from stdin" 0 "$RC"
@@ -1331,10 +1331,10 @@ contains "old password no longer logs in" "invalid password" "$(tcp_login correc
 # B053: from the host, logout --all ends every session a client holds.
 LTOK=$(tcp_login brandnewpassword | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 check "a fresh token works over tcp" 200 "$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
+    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$MAIN_PORT/repos")"
 contains "logout --all revokes" '"revoked":1' "$(cb auth logout --all 2>&1)"
 check "and the token is dead" 401 "$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
+    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$MAIN_PORT/repos")"
 OUT=$(cb auth setup < /dev/null 2>&1); RC=$?
 check "no password on stdin fails" 1 "$RC"
 contains "and says so" "no password read" "$OUT"
@@ -1346,7 +1346,6 @@ echo "listen address"
 # proxy", and it was never read: MHD was started without a socket address,
 # which binds every interface. Setting it to 127.0.0.1 produced a port
 # answering on the LAN and a config file saying it did not.
-BINDPORT=$((PORTBASE + 2))
 cat > "$WORK/bindcfg.yaml" <<EOF
 db:
   path: $WORK/bind.db

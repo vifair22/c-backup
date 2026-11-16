@@ -20,14 +20,11 @@ WORK="$(mktemp -d "$TEST_ROOT/c_backup_api_e2e.XXXXXX")"
 SOCK="$WORK/c.sock"
 # Per run, so two suites running at once (CI jobs on one runner, parallel
 # worktrees) cannot answer each other's requests. A fixed port made a second
-# daemon fail to bind, or worse, sent a request to the other run's daemon.
-PORT=$((20000 + ($$ % 20000)))
-# Skip past ports something already holds: the base is derived from the pid,
-# and anything bound there (a listener, or an outgoing connection that drew
-# it from the ephemeral range) made the daemon exit with "cannot start API
-# server" about once in a few dozen runs.
-port_busy() { ss -Htan "( sport = :$1 )" 2>/dev/null | grep -q .; }
-while port_busy "$PORT"; do PORT=$((PORT + 1)); [ "$PORT" -gt 64990 ] && PORT=20000; done
+# daemon fail to bind, or worse, sent a request to the other run's daemon,
+# and a pid-derived one checked with `ss` could still be taken between the
+# check and the bind. The kernel chooses it now (FLAKE-13).
+. "$(dirname "$0")/free_port.sh"
+PORT=$(free_ports 1 "$WORK") || { echo "cannot choose a TCP port"; exit 1; }
 PASS=0
 FAIL=0
 
