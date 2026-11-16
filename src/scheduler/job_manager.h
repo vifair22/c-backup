@@ -112,6 +112,19 @@ status_t job_submit_lockset(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
                             int64_t schedule_id, job_fn fn, void *arg,
                             void (*arg_free)(void *), int64_t *out_job_id);
 
+/*
+ * job_submit_lockset for a job the daemon queued itself while starting: the
+ * reindex of a repository whose newest snapshots the index lost
+ * (index_reconcile.h). Locked like any other job; the job row says origin
+ * "startup" and the journal entry's source is "startup", so nobody mistakes
+ * it for something an operator ran.
+ */
+status_t job_submit_startup(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                            const int64_t *also, int nalso,
+                            const char *action, const char *params_json,
+                            job_fn fn, void *arg, void (*arg_free)(void *),
+                            int64_t *out_job_id);
+
 /* The phase a queued job shows while it waits for a synchronous request to
  * let go of its repository, and the bounds of the retry backoff. */
 #define JOB_PHASE_WAITING "waiting for repository"

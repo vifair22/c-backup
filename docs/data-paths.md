@@ -512,7 +512,7 @@ flowchart TD
     SP -->|yes| SCAT[each leaf at its offset,<br>ftruncate to the length: holes stay holes]
     SP -->|no| META[mode/owner/mtime, xattrs, ACLs<br>on the temp file]
     SCAT --> META
-    META --> REN[queue; per batch of 512 files or 256 MiB:<br>one syncfs, then rename each over its final path]
+    META --> REN[queue; per batch of 4,096 files or 1 GiB:<br>one syncfs, then rename each over its final path]
     REN --> REM[first of a hardlink group:<br>remember path for later members]
 ```
 
@@ -548,8 +548,8 @@ Type-specific behaviour, spelled out:
   written and memory is one leaf plus one list per level whatever the
   file's size. Then metadata, xattrs and ACLs go onto the temporary file -
   the ACL last because its base entries carry the definitive permissions
-  and must win over chmod - then the file joins a batch: once 512 files or
-  256 MiB are queued (or a hardlink needs a queued member, or the run
+  and must win over chmod - then the file joins a batch: once 4,096 files or
+  1 GiB are queued (or a hardlink needs a queued member, or the run
   ends), one `syncfs` makes the batch durable and each file is renamed over
   its final path. The final name never reaches disk before the data, and
   one sync per batch instead of per file is the difference between 175 and
