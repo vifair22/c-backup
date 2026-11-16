@@ -226,6 +226,44 @@ static void pack_removed(void *user, uint64_t pack_id)
         log_error("pack removed: commit failed for pack %s", pack);
 }
 
+/*
+ * gc proved another copy of an object and the indexed one is not that
+ * object any more: the row moves to the proven copy, the object's location
+ * and size with it, in one transaction (OWN-22).
+ */
+static status_t pack_relocate(void *user, uint64_t pack_id, const pack_commit_entry_t *e)
+{
+    store_index_t *idx = user;
+    if (!idx || !e) return set_error(ERR_INVALID, "pack_relocate: null argument");
+    char repo[32], pack[32], off[32], comp[32], orig[32], eidx[16];
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    hash_to_hex(e->hash, hex);
+    snprintf(repo, sizeof(repo), "%lld", (long long)idx->repo_id);
+    snprintf(pack, sizeof(pack), "%llu", (unsigned long long)pack_id);
+    snprintf(off,  sizeof(off),  "%llu", (unsigned long long)e->offset);
+    snprintf(comp, sizeof(comp), "%llu", (unsigned long long)e->comp_size);
+    snprintf(orig, sizeof(orig), "%llu", (unsigned long long)e->orig_size);
+    snprintf(eidx, sizeof(eidx), "%u", e->entry_index);
+
+    if (db_txn_begin(idx->db) != OK)
+        return set_error(ERR_IO, "relocate %s: cannot begin", hex);
+    int failed =
+        db_execute_non_query(idx->db,
+            "UPDATE pack_objects SET pack_id = ?, offset = ?, comp_size = ?,"
+            " orig_size = ?, entry_index = ? WHERE repo_id = ? AND hash = ?",
+            (const char *[]){ pack, off, comp, orig, eidx, repo, hex, NULL }, NULL) != 0 ||
+        db_execute_non_query(idx->db,
+            "UPDATE objects SET location = ?, phys_size = ? WHERE repo_id = ? AND hash = ?",
+            (const char *[]){ pack, comp, repo, hex, NULL }, NULL) != 0;
+    if (failed) {
+        db_txn_rollback(idx->db);
+        return set_error(ERR_IO, "relocate %s: cannot update its rows", hex);
+    }
+    if (db_txn_commit(idx->db) != OK)
+        return set_error(ERR_IO, "relocate %s: commit", hex);
+    return OK;
+}
+
 /* ------------------------------------------------------------------ */
 
 status_t store_index_bind(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -242,6 +280,7 @@ status_t store_index_bind(store_t *store, cutils_db_t *db, int64_t repo_id,
     store_set_locate_cb(store, db_locate, idx);
     store_set_pack_commit_cb(store, db_pack_commit, idx);
     store_set_pack_removed_cb(store, pack_removed, idx);
+    store_set_pack_relocate_cb(store, pack_relocate, idx);
     *out = idx;
     return OK;
 }

@@ -816,6 +816,11 @@ static int entry_repair_mem(FILE *f, const entry_parity_t *ep,
  * The header's type is checked only after header parity has had its
  * chance: a damaged type byte is repairable, an unknown one is not.
  */
+static status_t entry_read_at(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                              const pack_cache_entry_t *where,
+                              const char *what, pack_dat_entry_hdr_t *out_hdr,
+                              uint8_t **out_payload, int *out_damaged);
+
 static status_t entry_read(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                            const char *what, pack_dat_entry_hdr_t *out_hdr,
                            uint8_t **out_payload, int *out_damaged)
@@ -826,6 +831,18 @@ static status_t entry_read(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
     pack_cache_entry_t found;
     status_t st = pack_find_entry(store, hash, &found);
     if (st != OK) return st;
+    return entry_read_at(store, hash, &found, what, out_hdr, out_payload, out_damaged);
+}
+
+/* entry_read at a location the caller names rather than the index's. */
+static status_t entry_read_at(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                              const pack_cache_entry_t *where,
+                              const char *what, pack_dat_entry_hdr_t *out_hdr,
+                              uint8_t **out_payload, int *out_damaged)
+{
+    *out_payload = NULL;
+    if (out_damaged) *out_damaged = 0;
+    pack_cache_entry_t found = *where;
 
     uint32_t pnum = found.pack_num;
     char dat_path[PATH_MAX];
@@ -2539,34 +2556,71 @@ typedef struct {
     const uint8_t       *refs;
     const pack_gc_loc_t *locs;
     size_t               cnt;
-    uint64_t             dups_dropped, dups_kept;
+    uint64_t             dups_dropped, dups_kept, relocated;
+    /* The first pass: move index rows off copies that fail confirmation,
+     * decide nothing else. See pack_gc_stats_loc. */
+    int                  probe;
 } gc_live_t;
 
-/* Does pack pnum hold an entry for this name at this offset, in bounds? */
-static int gc_copy_confirmed(store_t *store, uint32_t pnum, uint64_t off,
+static status_t entry_read_at(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                              const pack_cache_entry_t *where,
+                              const char *what, pack_dat_entry_hdr_t *out_hdr,
+                              uint8_t **out_payload, int *out_damaged);
+static status_t entry_decode(store_t *store, pack_dat_entry_hdr_t *ehdr,
+                             const uint8_t hash[OBJECT_HASH_SIZE], uint8_t *payload,
+                             void **out_data, size_t *out_size, const char *what);
+
+/*
+ * Is the entry at e in pack pnum provably its object? The header (after its
+ * parity), the name in it, the payload's CRC (after its parity), and the
+ * payload decrypted and decompressed and checked against the name - the
+ * whole read a restore would do. An encrypted copy with no key loaded
+ * cannot be proven.
+ */
+static int gc_copy_proven(store_t *store, uint32_t pnum, const pack_idx_disk_entry_t *e)
+{
+    pack_cache_entry_t where;
+    memset(&where, 0, sizeof(where));
+    memcpy(where.hash, e->hash, OBJECT_HASH_SIZE);
+    where.dat_offset   = e->dat_offset;
+    where.pack_num     = pnum;
+    where.pack_version = PACK_VERSION;
+    where.entry_index  = e->entry_index;
+    pack_dat_entry_hdr_t h;
+    uint8_t *buf = NULL;
+    int damaged = 0;
+    if (entry_read_at(store, e->hash, &where, "pack-gc", &h, &buf, &damaged) != OK ||
+        damaged) {
+        free(buf);
+        err_clear();
+        return 0;
+    }
+    void *data = NULL;
+    size_t sz = 0;
+    if (entry_decode(store, &h, e->hash, buf, &data, &sz, "pack-gc") != OK) {
+        err_clear();
+        return 0;
+    }
+    free(data);
+    return 1;
+}
+
+/*
+ * Is the copy the index names really that object, as far as can be told
+ * without the key? Its header after parity, the name in it, and its payload
+ * against the CRC after parity: entry_read_at's checks. A copy that fails
+ * any of them is not one to drop the others in favour of.
+ */
+static int gc_copy_confirmed(store_t *store, const pack_cache_entry_t *where,
                              const uint8_t hash[OBJECT_HASH_SIZE])
 {
-    char path[PATH_MAX];
-    if (pack_dat_path_resolve(path, sizeof(path), store_root(store), pnum) != 0)
-        return 0;
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-    int ok = 0;
-    pack_dat_hdr_t dh;
-    pack_dat_entry_hdr_t eh;
-    struct stat sb;
-    if (fstat(fileno(f), &sb) == 0 &&
-        fread(&dh, sizeof(dh), 1, f) == 1 &&
-        dh.magic == PACK_DAT_MAGIC && dh.version == PACK_VERSION &&
-        off >= sizeof(dh) &&
-        fseeko(f, (off_t)off, SEEK_SET) == 0 &&
-        fread(&eh, sizeof(eh), 1, f) == 1 &&
-        !entry_hdr_out_of_bounds(&eh) &&
-        memcmp(eh.hash, hash, OBJECT_HASH_SIZE) == 0 &&
-        off + sizeof(eh) + eh.compressed_size <= (uint64_t)sb.st_size)
-        ok = 1;
-    fclose(f);
-    return ok;
+    pack_dat_entry_hdr_t h;
+    uint8_t *buf = NULL;
+    int damaged = 0;
+    status_t st = entry_read_at(store, hash, where, "pack-gc", &h, &buf, &damaged);
+    free(buf);
+    if (st != OK) { err_clear(); return 0; }
+    return !damaged;
 }
 
 static int ref_cmp(const void *key, const void *entry);
@@ -2584,18 +2638,50 @@ static int gc_entry_live(gc_live_t *g, uint32_t pnum, const pack_idx_disk_entry_
      * locations is stale for it), or one with no index row at all: ask the
      * index now, and drop this one only if the copy it names is confirmed.
      */
-    uint32_t fp = 0;
-    uint64_t fo = 0;
-    if (pack_resolve_location(g->store, e->hash, &fp, &fo) != OK) {
+    pack_cache_entry_t named;
+    if (pack_find_entry(g->store, e->hash, &named) != OK) {
         err_clear();
         return 1;
     }
+    uint32_t fp = named.pack_num;
+    uint64_t fo = named.dat_offset;
     if (fp == pnum && fo == e->dat_offset) return 1;
-    if (gc_copy_confirmed(g->store, fp, fo, e->hash)) {
-        g->dups_dropped++;
+    if (gc_copy_confirmed(g->store, &named, e->hash)) {
+        if (!g->probe) g->dups_dropped++;
         return 0;
     }
-    g->dups_kept++;
+    if (!g->probe) g->dups_kept++;
+    /*
+     * The copy the index names is not this object. If this one is proven,
+     * the index moves to it, so a restore stops depending on the damaged
+     * copy's parity; the next gc then finds the damaged copy unnamed and,
+     * with this one confirmed, drops it.
+     */
+    if (gc_copy_proven(g->store, pnum, e)) {
+        pack_commit_entry_t ce;
+        memset(&ce, 0, sizeof(ce));
+        memcpy(ce.hash, e->hash, OBJECT_HASH_SIZE);
+        ce.offset      = e->dat_offset;
+        ce.comp_size   = e->compressed_size;
+        ce.orig_size   = e->uncompressed_size;
+        ce.entry_index = e->entry_index;
+        ce.type        = e->type;
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(e->hash, hex);
+        if (store_emit_pack_relocate(g->store, pnum, &ce) == OK) {
+            g->relocated++;
+            pack_cache_invalidate(g->store);
+            log_warn("pack-gc: object %s: the indexed copy in pack %u at %llu is not "
+                     "that object; the index now names the proven copy in pack %u "
+                     "at %llu", hex, fp, (unsigned long long)fo, pnum,
+                     (unsigned long long)e->dat_offset);
+        } else {
+            log_warn("pack-gc: object %s: the indexed copy is not that object and "
+                     "the index could not be moved to the proven copy in pack %u: %s",
+                     hex, pnum, err_msg());
+            err_clear();
+        }
+    }
     return 1;
 }
 
@@ -3629,7 +3715,7 @@ status_t pack_gc_stats_loc(store_t *store,
                            size_t refs_cnt,
                            uint32_t *out_kept, uint32_t *out_deleted,
                            pack_gc_stats_t *stats) {
-    gc_live_t live = { store, refs, locs, refs_cnt, 0, 0 };
+    gc_live_t live = { store, refs, locs, refs_cnt, 0, 0, 0, 0 };
     pack_gc_stats_t scratch_stats;
     if (!stats) stats = &scratch_stats;
     memset(stats, 0, sizeof(*stats));
@@ -3664,6 +3750,38 @@ status_t pack_gc_stats_loc(store_t *store,
     const size_t GC_CHUNK = 128 * 1024;
     char *gc_chunk = malloc(GC_CHUNK);
     if (!gc_chunk) { free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: gc_chunk alloc failed"); }
+
+    /*
+     * With locations, a first pass moves the index off any named copy that
+     * fails confirmation and onto a proven one, before a single pack is
+     * rewritten. In one pass a pack holding a damaged named copy could be
+     * rewritten or deleted - its rows go with it - before the pack holding
+     * the good copy had been reached, leaving the object with no index row
+     * at all. Reading headers twice is the price; rewriting is the cost.
+     */
+    if (locs) {
+        live.probe = 1;
+        for (size_t pi = 0; pi < npack; pi++) {
+            if (store_cancelled(store)) break;
+            char dp[PATH_MAX];
+            if (pack_dat_path_resolve(dp, sizeof(dp), store_root(store), pack_nums[pi]) != 0)
+                continue;
+            FILE *pf = fopen(dp, "rb");
+            if (!pf) continue;
+            pack_dat_hdr_t ph;
+            pack_idx_disk_entry_t *pidx = NULL;
+            if (fread(&ph, sizeof(ph), 1, pf) == 1 && ph.magic == PACK_DAT_MAGIC &&
+                ph.version == PACK_VERSION && ph.count <= PACK_MAX_ENTRIES &&
+                (pidx = malloc((ph.count ? ph.count : 1) * sizeof(*pidx))) != NULL &&
+                build_disk_idx_from_dat(pf, ph.count, pidx) == 0) {
+                for (uint32_t i = 0; i < ph.count; i++)
+                    (void)gc_entry_live(&live, pack_nums[pi], &pidx[i]);
+            }
+            free(pidx);
+            fclose(pf);
+        }
+        live.probe = 0;
+    }
 
     int gc_cancelled = 0;
     for (size_t pi = 0; pi < npack; pi++) {
@@ -3762,12 +3880,13 @@ status_t pack_gc_stats_loc(store_t *store,
     }
 
     status_t coalesce_st = maybe_coalesce_packs(store, &live, stats);
-    if (live.dups_dropped || live.dups_kept)
+    if (live.dups_dropped || live.dups_kept || live.relocated)
         log_info("pack-gc: %llu duplicate cop%s dropped, %llu kept because the "
-                 "indexed copy could not be confirmed",
+                 "indexed copy could not be confirmed, %llu index row(s) moved to a proven copy",
                  (unsigned long long)live.dups_dropped,
                  live.dups_dropped == 1 ? "y" : "ies",
-                 (unsigned long long)live.dups_kept);
+                 (unsigned long long)live.dups_kept,
+                 (unsigned long long)live.relocated);
     if (coalesce_st != OK)
         log_warn("pack-coalesce: skipped due to error");
 
