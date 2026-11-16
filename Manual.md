@@ -768,7 +768,29 @@ extended attributes and POSIX ACLs. A unix socket has no content and is
 recorded without one; restore skips it.
 
 A file inside a source that cannot be read is logged and skipped; the backup
-continues. A source itself - a path named on the command line or configured
+continues. Skipped means left out: the file is not in the snapshot's trees
+or its index, so the snapshot never lists a file it cannot restore. That
+covers a file that vanished between the scan and the read, one the daemon
+may not open, one replaced by a directory or anything else that is not a
+regular file, and one whose read fails partway (an I/O error). A backup
+with skipped files still ends `completed`, but not silently:
+
+- each file is a `WARN` line naming it and the reason, `backup: skipping
+  /data/x, it is not in this snapshot: cannot open: Permission denied`,
+  and one closing line counts them;
+- the job `result` carries `files_skipped` and the first 100 as `skipped`,
+  each with its path and reason (`docs/api.md`);
+- a warning alert goes out through the failure-alert path, the log line
+  and Pushover when configured (section 16.3);
+- the journal entry, the permanent record, reads `snapshot 12: 50 files, 1
+  skipped (not in the snapshot); first: /data/x: ...`.
+
+The next backup tries every skipped file again. Before 1.0.0's fix for
+B118 a skipped file stayed in the snapshot with no content: the backup
+reported success, verify passed, and every full restore failed on it.
+Verify now reports any such entry an older build left (section 11).
+
+A source itself - a path named on the command line or configured
 with `sources set` - that does not exist or cannot be opened fails the job
 before anything is written, with an error naming it, even when the other
 sources are fine:
@@ -944,7 +966,13 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
 
 The job reports files, directories, links, specials, skipped, kept and
 failed. Any failed entry makes the job fail with "restore incomplete", so a
-restore that reports success restored everything restorable. An object of a
+restore that reports success restored everything restorable. Every failed
+entry is logged with its path and the reason (`restore: <path> not
+restored: <reason>`), and the job's error quotes the first:
+
+```
+restore incomplete: 2 entries could not be restored (51 written); see the log for each; first: /data/x: regular file has no content in the snapshot (...)
+``` An object of a
 type this build does not know fails its file with "object type N is not
 known to this build; written by a newer c-backup?", and a file entry whose
 object is not file content (a directory tree, say) fails rather than being
@@ -1231,7 +1259,7 @@ What a run counts:
 | `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` or `--dry-run` |
 | `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
 | `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
-| `missing` | Indexed but absent, including every object in a pack file that has gone. **Data loss** |
+| `missing` | Indexed but absent, including every object in a pack file that has gone, and every index entry of a regular file that names no content at all. **Data loss** |
 
 **Loss fails the verify.** Any `unrecoverable` or `missing` object ends the
 job `failed`, with an error naming the run and the counts, and
@@ -1262,6 +1290,15 @@ three full paths, and up to ten snapshot ids beside the exact count
 short). The run's `affected_files` and `affected_snapshots` are distinct
 paths and snapshots across every lost object. The CLI prints the run and its
 findings as one JSON document.
+
+Every level also checks the index for regular files that name no content
+object. A backup before 1.0.0's fix for B118 recorded a file it skipped
+that way: the snapshot listed the file, no restore could produce it, and
+every object check passed because no object was damaged. These are one
+finding, status `missing: file entry has no content` with an empty hash,
+naming the files and snapshots; each counts in `missing` and fails the
+run. Such a snapshot restores everything else; delete it once a newer one
+covers the files, or keep it and expect its restore to report them.
 
 A checking verify takes the read lock; a repairing one takes the write lock.
 
@@ -1729,6 +1766,20 @@ Repository photos (id 3) at /mnt/backup/photos
 Job 118 (backup) failed: cannot read /data/photos/2024: Permission denied
 ```
 
+A backup that completed but left files out (section 6.3: a file that
+vanished, could not be opened or read, or stopped being a regular file)
+sends a warning the same way. The job stays `completed`; the title says so,
+and the body gives the count and the first file with its reason:
+
+```
+c-backup: backup of photos completed with a warning
+
+Repository photos (id 3) at /mnt/backup/photos
+Job 119 (backup) completed with a warning: 2 file(s) could not be read and are not in snapshot 41; first: /data/photos/locked.jpg: cannot open: Permission denied
+```
+
+A clean backup sends nothing.
+
 A notification that cannot be delivered is retried for 24 hours unless
 Pushover rejects it outright (a wrong token or user key), in which case it is
 dropped at once. Either way the journal has a line naming the notification,
@@ -1745,6 +1796,10 @@ The daemon log has one line per failed job either way: `sending failure
 notification for job N: <title>: <body>` with credentials set, and
 `failure notification for job N not sent, Pushover is not configured:
 <title>: <body>` without them.
+A backup that completed with skipped files logs the same pair at
+`warning` level: `sending warning notification for job N: <title>: <body>`
+with credentials, `warning notification for job N not sent, Pushover is not
+configured: <title>: <body>` without.
 
 ---
 
@@ -1936,7 +1991,7 @@ the underlying disk.
 | Backup logs `key not escrowed` | System key not acknowledged | Section 13 |
 | Job `cancelled` after a restart | `systemctl stop` cancels running jobs (section 2.2) | Run it again |
 | Job `failed: interrupted by daemon restart` | The daemon died mid-job: crash, `kill -9`, power loss | Run it again; nothing partial is kept |
-| `restore incomplete: N entries could not be restored` | Some entries failed | The job and log name them; check permissions and space at the destination |
+| `restore incomplete: N entries could not be restored` | Some entries failed | The error quotes the first, the log names each (`restore: <path> not restored: <reason>`); check permissions and space at the destination. `regular file has no content` is a snapshot written before the B118 fix; verify reports the same entries |
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
 | Repository much larger than expected right after a backup | Packing has not run or is running | Wait for the job; `c-backup pack <id>`; check `maintenance.auto_pack` |

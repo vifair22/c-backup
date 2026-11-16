@@ -59,6 +59,15 @@ typedef struct {
     int          pack_after;
 } backup_opts_t;
 
+/* One file the backup left out, and why. */
+typedef struct {
+    char *path;
+    char *reason;
+} backup_skip_t;
+
+/* The skipped files a result names; files_skipped counts every one. */
+#define BACKUP_SKIPPED_LIST_MAX 100u
+
 typedef struct {
     int64_t  snapshot_id;
     uint64_t files;
@@ -96,7 +105,26 @@ typedef struct {
     uint64_t written_sweep;
     /* Objects the pack pass packed; 0 when it did not run or found nothing. */
     uint64_t sweep_packed;
+    /*
+     * Regular files the scan found and the store could not read: gone,
+     * unreadable, replaced by something that is not a regular file, or
+     * failing mid-read. None of them is in the snapshot - not in its trees,
+     * not in its index rows - because an entry without content is a file
+     * the snapshot claims and no restore can produce (B118). The first
+     * BACKUP_SKIPPED_LIST_MAX are listed in `skipped`, heap-owned: release
+     * them with backup_result_free. Every one is also logged.
+     */
+    uint64_t       files_skipped;
+    backup_skip_t *skipped;
+    uint32_t       skipped_listed;
 } backup_result_t;
 
+/*
+ * On OK *out is filled and owns the skipped list; call backup_result_free
+ * on it. On any other status *out is left untouched.
+ */
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     const backup_opts_t *opts, backup_result_t *out);
+
+/* Release what a result owns. Safe on a zeroed or already-freed result. */
+void backup_result_free(backup_result_t *r);

@@ -49,6 +49,9 @@ typedef struct {
     uint32_t scan_index;
     uint8_t  tree_hash[OBJECT_HASH_SIZE];   /* directories only */
     int      hash_ready;
+    /* A regular file the store could not read. It is left out of the trees
+     * and the index entirely; see skip_file. */
+    int      skipped;
 } node_link_t;
 
 /*
@@ -119,6 +122,54 @@ typedef struct {
      * install it; the second one to be taken back is not new. */
     hashset_t      pool_new;
 } pipeline_t;
+
+/*
+ * Leave a regular file out of the snapshot, counted and said.
+ *
+ * Every way the store can fail to read a file ends here: it vanished, it
+ * cannot be opened, it is no longer a regular file, or the read itself
+ * failed. Before this the loop just moved on, and the entry went into its
+ * tree and its index row with no content hash. The backup reported
+ * completed, verify passed, and every full restore of the snapshot failed
+ * on an entry the log never named (B118). A file the snapshot cannot
+ * produce must not be in it: build_one_tree and index_nodes skip the entry,
+ * and manifest_serialise refuses a file entry without content in case
+ * anything else ever tries.
+ *
+ * The list in the result is bounded; the count and the log are not.
+ */
+static void skip_file(pipeline_t *p, uint32_t i, const char *reason)
+{
+    const scan_entry_t *e = &p->scan->entries[i];
+    p->links[i].skipped = 1;
+    memset(p->scan->entries[i].node.content_hash, 0, OBJECT_HASH_SIZE);
+    p->res->files_skipped++;
+    log_warn("backup: skipping %s, it is not in this snapshot: %s", e->path, reason);
+
+    backup_result_t *r = p->res;
+    if (r->skipped_listed >= BACKUP_SKIPPED_LIST_MAX) return;
+    if (!r->skipped) {
+        r->skipped = calloc(BACKUP_SKIPPED_LIST_MAX, sizeof(*r->skipped));
+        if (!r->skipped) return;   /* the count and the log still have it */
+    }
+    char *path = strdup(e->path), *why = strdup(reason);
+    if (!path || !why) { free(path); free(why); return; }
+    r->skipped[r->skipped_listed].path   = path;
+    r->skipped[r->skipped_listed].reason = why;
+    r->skipped_listed++;
+}
+
+void backup_result_free(backup_result_t *r)
+{
+    if (!r) return;
+    for (uint32_t i = 0; i < r->skipped_listed; i++) {
+        free(r->skipped[i].path);
+        free(r->skipped[i].reason);
+    }
+    free(r->skipped);
+    r->skipped = NULL;
+    r->skipped_listed = 0;
+}
 
 /*
  * The fields the file cache must not compare for this entry. Local
@@ -513,7 +564,10 @@ static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
 
     if (j->st != OK) {
         if (cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
-        log_warn("backup: cannot store %s: %s", e->path, j->err);
+        char why[ERR_MSG_MAX + 32];
+        snprintf(why, sizeof(why), "cannot read: %s",
+                 j->err[0] ? j->err : "no detail recorded");
+        skip_file(p, j->index, why);
         return OK;
     }
 
@@ -800,11 +854,17 @@ static status_t store_content_loop(pipeline_t *p)
 
         /* Open is part of reading: over NFS it is a round trip per file. */
         uint64_t _tr = phase_now(), _trn = phase_nested(p->timers);
-        int fd = open(e->path, O_RDONLY);
+        /* O_NONBLOCK so a FIFO put where the file was cannot hang the
+         * backup in open; it is refused just below like anything else that
+         * is not a regular file. It changes nothing for a regular file. */
+        int fd = open(e->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd == -1) {
             /* A file that vanished between scan and store is normal on a live
              * filesystem; it is a warning, not a failed backup. */
-            log_warn("backup: cannot open %s, skipping", e->path);
+            char why[160];
+            snprintf(why, sizeof(why), "cannot open: %s",
+                     errno == ENOENT ? "it no longer exists" : strerror(errno));
+            skip_file(p, i, why);
             continue;
         }
         /* Replaced by something else since the scan. A directory opens
@@ -812,9 +872,12 @@ static status_t store_content_loop(pipeline_t *p)
          * ENXIO, "no data from here on": the sparse probe took that for a
          * file that is one hole and stored the scan's size in zeros. */
         struct stat fst;
-        if (fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
-            log_warn("backup: %s is no longer a regular file, skipping", e->path);
+        int fst_ok = fstat(fd, &fst) == 0;
+        if (!fst_ok || !S_ISREG(fst.st_mode)) {
+            int was_dir = fst_ok && S_ISDIR(fst.st_mode);
             close(fd);
+            skip_file(p, i, was_dir ? "no longer a regular file (now a directory)"
+                                    : "no longer a regular file");
             continue;
         }
 
@@ -852,8 +915,11 @@ static status_t store_content_loop(pipeline_t *p)
             return set_error(ERR_BUSY, "backup cancelled");
         }
         if (st != OK) {
-            log_warn("backup: cannot store %s: %s", e->path, err_msg());
+            char why[ERR_MSG_MAX + 32];
+            snprintf(why, sizeof(why), "cannot read: %s",
+                     err_msg()[0] ? err_msg() : "no detail recorded");
             err_clear();
+            skip_file(p, i, why);
             continue;
         }
 
@@ -941,16 +1007,17 @@ static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
     uint64_t dir_node = (dir_index == UINT32_MAX)
                         ? 0 : p->links[dir_index].node_id;
 
+    /* A skipped file is not a child of anything: see skip_file. */
     uint32_t n = 0;
     for (uint32_t i = 0; i < p->count; i++)
-        if (p->links[i].parent_id == dir_node) n++;
+        if (p->links[i].parent_id == dir_node && !p->links[i].skipped) n++;
 
     manifest_entry_t *entries = n ? calloc(n, sizeof(*entries)) : NULL;
     if (n && !entries) return set_error(ERR_NOMEM, "build_one_tree: alloc");
 
     uint32_t k = 0;
     for (uint32_t i = 0; i < p->count && k < n; i++) {
-        if (p->links[i].parent_id != dir_node) continue;
+        if (p->links[i].parent_id != dir_node || p->links[i].skipped) continue;
         scan_entry_t *e = &p->scan->entries[i];
         manifest_entry_t *m = &entries[k++];
 
@@ -1381,6 +1448,9 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
     if (bst != OK) return bst;
 
     for (uint32_t i = 0; i < p->count; i++) {
+        /* In no tree, so in no index row either: the index is derived from
+         * the trees, and a reindex would not bring it back. */
+        if (p->links[i].skipped) continue;
         scan_entry_t *e = &p->scan->entries[i];
         const char *name = basename_of(e->path);
 
@@ -1787,6 +1857,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
             log_warn("backup: cannot drop staged rows after: %s", why);
         set_error(st, "%s", why);
         hashset_free(&p.meta_seen);
+        backup_result_free(&res);
         free(links);
         scan_result_free(scan);
         return st;
@@ -1834,8 +1905,10 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         const char **seen = malloc(scan->count * sizeof(*seen));
         if (seen) {
             size_t n_seen = 0;
+            /* A skipped file's row goes too, so the next run reads it
+             * rather than vouching for content this snapshot lacks. */
             for (uint32_t i = 0; i < scan->count; i++)
-                if (scan->entries[i].node.type == NODE_TYPE_REG)
+                if (scan->entries[i].node.type == NODE_TYPE_REG && !links[i].skipped)
                     seen[n_seen++] = scan->entries[i].path;
             qsort(seen, n_seen, sizeof(*seen), scan_path_cmp);
             uint64_t _tsw = phase_now(), _tswn = phase_nested(&timers);
@@ -1886,8 +1959,12 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     free(links);
     scan_result_free(scan);
 
-    if (st == OK && out) *out = res;
     if (st == OK) {
+        if (res.files_skipped)
+            log_warn("backup: snapshot %lld leaves out %llu file(s) that could "
+                     "not be read; each is named above and in the job result",
+                     (long long)snap_id, (unsigned long long)res.files_skipped);
+
         /*
          * t0 is taken after the scan has already run, so the old label on
          * this line - "scan+store" - named a phase it did not contain. The
@@ -1907,5 +1984,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
                  (unsigned long long)res.trees_reused);
         log_written(&res);
     }
+    if (st == OK && out) *out = res;
+    else backup_result_free(&res);
     return st;
 }

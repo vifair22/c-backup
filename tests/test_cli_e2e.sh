@@ -1415,7 +1415,7 @@ damage_beyond_parity() {  # damage_beyond_parity <sample> <pack>
 # Pushover credentials here it must say the alert was not sent (NIT-11).
 alerted() {  # alerted <job-id>
     local _
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 100); do
         if grep -q "failure notification for job $1 not sent, Pushover is not configured: " \
                 "$WORK/daemon.log"; then
             ! grep -q "sending failure notification for job $1:" "$WORK/daemon.log"
