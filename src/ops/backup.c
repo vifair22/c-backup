@@ -807,6 +807,16 @@ static status_t store_content_loop(pipeline_t *p)
             log_warn("backup: cannot open %s, skipping", e->path);
             continue;
         }
+        /* Replaced by something else since the scan. A directory opens
+         * read-only without complaint, and on btrfs SEEK_DATA on it answers
+         * ENXIO, "no data from here on": the sparse probe took that for a
+         * file that is one hole and stored the scan's size in zeros. */
+        struct stat fst;
+        if (fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
+            log_warn("backup: %s is no longer a regular file, skipping", e->path);
+            close(fd);
+            continue;
+        }
 
         if (to_pool) {
             status_t sst = store_pool_submit(p->pool, i, fd, e->node.size);
