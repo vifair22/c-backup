@@ -1165,6 +1165,51 @@ contains "empty search keeps its key" '"results"' \
 contains "empty object refs keep their key" '"refs"' \
     "$(sock_body '/repos/1/objects/0000000000000000000000000000000000000000000000000000000000000000/refs')"
 
+# B123: backups submitted while snapshot deletes ran against the same
+# repository failed "repo N is busy" whenever a delete held the repo lock at
+# the moment the job was dispatched, each with a failure alert. The UAT
+# trigger, smaller: backups and forced deletes shuffled through xargs -P 12.
+# A delete may still be refused with 503 while a backup holds the repository;
+# a job must never fail because a delete held it.
+echo "jobs racing snapshot deletes"
+RACE_BODY=$(curl -s -X POST --unix-socket "$SOCK" \
+            -d "{\"path\":\"$WORK/racerepo\",\"label\":\"race\"}" http://localhost/repos)
+RACE=$(printf '%s' "$RACE_BODY" | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
+contains "race repository registered" '"id":' "$RACE_BODY"
+for _ in 1 2 3 4 5 6 7 8; do
+    wait_job "$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
+        -d "{\"paths\":[\"$WORK/src\"]}" "http://localhost/repos/$RACE/backup")")"
+done
+RACE_SNAPS=$(sock_body "/repos/$RACE/snapshots?limit=100" | grep -oE '"id":[0-9]+' | tr -dc '0-9\n')
+check "eight snapshots to delete" 8 "$(printf '%s\n' "$RACE_SNAPS" | grep -c .)"
+race_op() {  # race_op b | race_op <snapshot id>
+    if [ "$1" = b ]; then
+        # One id per line: the body has no trailing newline, and twelve
+        # unterminated ids written in parallel would run together.
+        printf '%s\n' "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"paths\":[\"$WORK/src\"]}" \
+             "http://localhost/repos/$RACE/backup" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')"
+    else
+        curl -s -o /dev/null -X DELETE --unix-socket "$SOCK" \
+             "http://localhost/repos/$RACE/snapshots/$1?force=1"
+    fi
+}
+export -f race_op
+export SOCK WORK RACE
+RACE_JOBS=$({ for _ in $(seq 1 12); do echo b; done; printf '%s\n' "$RACE_SNAPS"; } \
+            | shuf --random-source=<(yes) | timeout 60 xargs -P 12 -n 1 bash -c 'race_op "$0"')
+check "every racing backup was accepted" 12 "$(printf '%s\n' "$RACE_JOBS" | grep -c .)"
+RACE_FAILED=0
+RACE_DONE=0
+for j in $RACE_JOBS; do
+    wait_job "$j"
+    case "$(sock_body "/jobs/$j")" in
+        *'"state":"completed"'*) RACE_DONE=$((RACE_DONE + 1)) ;;
+        *) RACE_FAILED=$((RACE_FAILED + 1)); sock_body "/jobs/$j"; echo ;;
+    esac
+done
+check "every racing backup completed" 12 "$RACE_DONE"
+check "none failed on a delete holding the repository" 0 "$RACE_FAILED"
+
 # Registration edge cases from UAT. Kept after every hardcoded /repos/<id>
 # above, because each one registers a repository and takes an id.
 echo "repo lifecycle"
