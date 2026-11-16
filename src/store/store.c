@@ -253,21 +253,35 @@ done:
  * hand is never the engine's to delete. "tags." is the tag mirror's staging
  * file (repo_tags.c): written by the daemon rather than the store, but a
  * crash between its mkstemp and rename orphans it all the same. */
-static int is_engine_tmp_name(const char *name)
+/*
+ * 1: staging only a holder of tmp/'s claim or of the repository's write
+ * lock ever writes - pack-dat. (every pack writer takes the claim), snap.
+ * and snapids. (backup, a replica sink, reindex and snapshot delete, all
+ * under one or the other), deleting. (gc). 2: staging written under
+ * neither - tags., the tag mirror's, which a tag route writes while a
+ * backup or gc may be running. 0: not the engine's.
+ */
+static int engine_tmp_kind(const char *name)
 {
-    static const char *const prefixes[] = {
-        "pack-dat.", "snap.", "snapids.", "deleting.", "tags.",
-    };
-    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
-        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return 1;
+    static const char *const owned[] = { "pack-dat.", "snap.", "snapids.", "deleting." };
+    for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++)
+        if (strncmp(name, owned[i], strlen(owned[i])) == 0) return 1;
+    if (strncmp(name, "tags.", 5) == 0) return 2;
     return 0;
 }
 
-/* Unlink regular files in <root>/tmp whose mtime is before `cutoff`.
- * `engine_only` limits it to the engine's own staging names. */
+/*
+ * Unlink regular files in <root>/tmp whose mtime is before `cutoff`.
+ * `engine_only` limits it to the engine's own staging names, and holds the
+ * tag mirror's (kind 2) to the hour rule whatever `cutoff` says: the
+ * invariant an age-free sweep relies on is that nothing it may remove can
+ * have a live writer, and only kind 1 staging is written exclusively by
+ * holders of the claim or the write lock the sweeper holds.
+ */
 static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
                               uint64_t *out_bytes)
 {
+    const time_t hour_ago = time(NULL) - 60 * 60;
     char tmp_dir[PATH_MAX];
     if (snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", root) >= (int)sizeof(tmp_dir))
         return 0;
@@ -281,7 +295,10 @@ static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (de->d_name[0] == '.') continue;
-        if (engine_only && !is_engine_tmp_name(de->d_name)) continue;
+        int kind = engine_tmp_kind(de->d_name);
+        if (engine_only && kind == 0) continue;
+        time_t file_cutoff = (engine_only && kind == 2 && cutoff > hour_ago)
+                             ? hour_ago : cutoff;
 
         char path[PATH_MAX];
         if (snprintf(path, sizeof(path), "%s/%s", tmp_dir, de->d_name)
@@ -290,7 +307,7 @@ static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
 
         struct stat sb;
         if (lstat(path, &sb) != 0 || !S_ISREG(sb.st_mode)) continue;
-        if (sb.st_mtime >= cutoff) continue;
+        if (sb.st_mtime >= file_cutoff) continue;
 
         if (unlink(path) == 0) {
             swept++;

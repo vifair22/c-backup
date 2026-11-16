@@ -252,6 +252,11 @@ unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes);
  * without it, another handle may be writing, so only the hour rule applies.
  * Callers that sweep with the claim: backup, gc, reindex, a replica sink's
  * open, and registering an existing repository (B133).
+ *
+ * The invariant: an age-free sweep removes only staging whose every writer
+ * holds this claim or the repository's write lock (pack-dat., snap.,
+ * snapids., deleting.). The tag mirror's tags.* staging is written under
+ * neither, so it is removed by the hour rule alone.
  */
 int store_claim_tmp(store_t *st);
 

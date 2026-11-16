@@ -229,10 +229,14 @@ those files again. Staging files a killed writer left in the repository's
 `tmp/` are removed by the next backup, gc or reindex, by registering the
 repository, and in a replica by the next replicate into it. Each of these
 first takes an exclusive lock on `tmp/.lock`, which every process staging
-a pack there also holds, so getting it means nothing else is writing there
-and everything in `tmp/` is a dead writer's; when another process holds it,
-only staging an hour old goes. Opening a repository also removes any an
-hour old. Installed packs, in `packs/`, are never touched.
+a pack there also holds. Getting it means no other writer of pack, snapshot
+record, snapshot-id or deletion-marker staging can be live (those are
+written only under that lock or the repository's write lock), so all of
+those go whatever their age; when another process holds it, only staging
+an hour old goes. The tag mirror's staging (`tags.*`) is written by tag
+commands, which hold neither and may run during a backup or gc, so it is
+only ever removed once it is an hour old. Opening a repository also removes
+any staging an hour old. Installed packs, in `packs/`, are never touched.
 
 ### 2.3 Docker
 
