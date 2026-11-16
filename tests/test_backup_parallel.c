@@ -218,7 +218,10 @@ typedef struct {
     char  **nsize;     /* node size, compared apart like mtime */
     char  **subtree;
     int     n;
-    char    root[80];
+    /* hex() of the stored hash, which is itself 64 hex characters. This
+     * was 80, which cut the root to 79 characters so the root skip in
+     * test_same_repository_on_one_or_many_workers could never match. */
+    char    root[4 * OBJECT_HASH_SIZE + 1];
     char    files[32], size[32];
 } snap_rows_t;
 
@@ -233,6 +236,7 @@ static void snap_rows_load(env_t *e, int64_t snap, snap_rows_t *out)
                                 " total_size FROM snapshots WHERE id = ?",
                                 (const char *[]){ id, NULL }, &s), 0);
     assert_int_equal(s->nrows, 1);
+    assert_true(strlen(s->rows[0][0]) < sizeof(out->root));
     snprintf(out->root, sizeof(out->root), "%s", s->rows[0][0]);
     snprintf(out->files, sizeof(out->files), "%s", s->rows[0][1]);
     snprintf(out->size, sizeof(out->size), "%s", s->rows[0][2]);
@@ -364,7 +368,7 @@ static void assert_same_snapshot(env_t *a, int64_t sa, env_t *b, int64_t sb,
  * location is left out: it names a pack by number, and which numbers a
  * repository hands out is not part of what a backup means.
  */
-static char *object_rows(env_t *e, const char *skip1, const char *skip2)
+static char *object_rows(env_t *e, char *const *skip, int nskip)
 {
     db_result_t *r = NULL;
     assert_int_equal(db_execute(e->db, "SELECT hex(hash), type, phys_size,"
@@ -374,8 +378,10 @@ static char *object_rows(env_t *e, const char *skip1, const char *skip2)
     char *out = malloc(cap);
     out[0] = '\0';
     for (int i = 0; i < r->nrows; i++) {
-        if ((skip1 && strcmp(r->rows[i][0], skip1) == 0) ||
-            (skip2 && strcmp(r->rows[i][0], skip2) == 0))
+        int skipped = 0;
+        for (int k = 0; k < nskip && !skipped; k++)
+            skipped = strcmp(r->rows[i][0], skip[k]) == 0;
+        if (skipped)
             continue;
         off += (size_t)snprintf(out + off, cap - off, "%s|%s|%s|%s\n",
                                 r->rows[i][0], r->rows[i][1],
@@ -600,18 +606,39 @@ static void test_same_repository_on_one_or_many_workers(void **state)
     assert_same_snapshot(&a, ra.snapshot_id, &b, rb.snapshot_id, TEST_DIR);
 
     /* And every object the index knows of, trees and small files included.
-     * The two roots are left out only when they differ, which
-     * assert_same_snapshot has just shown is down to /tmp alone. */
+     * Left out, only where they differ: the root tree and the subtree of
+     * each ancestor of TEST_DIR, the trees an ancestor's moved mtime feeds,
+     * which assert_same_snapshot has just shown is all that differs. A moved
+     * ancestor rewrites its parent's tree and every one above it, so this is
+     * the root alone only when the scratch directory sits directly under a
+     * top-level directory such as /tmp; under ~/.cache a change to $HOME
+     * also rewrites /home's tree. */
     {
         snap_rows_t x, y;
         snap_rows_load(&a, ra.snapshot_id, &x);
         snap_rows_load(&b, rb.snapshot_id, &y);
-        int same_root = strcmp(x.root, y.root) == 0;
-        char *oa = object_rows(&a, same_root ? NULL : x.root, NULL);
-        char *ob = object_rows(&b, same_root ? NULL : y.root, NULL);
+        char **ska = calloc((size_t)x.n + 1, sizeof(char *));
+        char **skb = calloc((size_t)x.n + 1, sizeof(char *));
+        assert_non_null(ska);
+        assert_non_null(skb);
+        int nsk = 0;
+        if (strcmp(x.root, y.root) != 0) {
+            ska[nsk] = x.root; skb[nsk] = y.root; nsk++;
+        }
+        for (int i = 0; i < x.n; i++) {
+            if (!is_ancestor(x.path[i], TEST_DIR)) continue;
+            int j = find_path(&y, x.path[i]);
+            assert_true(j >= 0);
+            if (strcmp(x.subtree[i], y.subtree[j]) == 0) continue;
+            ska[nsk] = x.subtree[i]; skb[nsk] = y.subtree[j]; nsk++;
+        }
+        char *oa = object_rows(&a, ska, nsk);
+        char *ob = object_rows(&b, skb, nsk);
         assert_string_equal(oa, ob);
         free(oa);
         free(ob);
+        free(ska);
+        free(skb);
         snap_rows_free(&x);
         snap_rows_free(&y);
     }

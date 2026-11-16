@@ -282,6 +282,24 @@ static enum MHD_Result send_response(struct MHD_Connection *conn,
     return send_response_ra(conn, status, content_type, body, set_cookie, 0);
 }
 
+/* For MHD_get_connection_values_n: the first query parameter whose name or
+ * value holds a NUL, as the refusal to send, into cls (64 bytes). */
+static enum MHD_Result query_nul_check(void *cls, enum MHD_ValueKind kind,
+                                       const char *key, size_t key_size,
+                                       const char *value, size_t value_size)
+{
+    (void)kind;
+    char *out = cls;
+    int key_nul = key && memchr(key, '\0', key_size) != NULL;
+    int val_nul = value && memchr(value, '\0', value_size) != NULL;
+    if (!key_nul && !val_nul) return MHD_YES;
+    if (key_nul || strlen(key) > 24)
+        snprintf(out, 64, "a query parameter must not contain a NUL character");
+    else
+        snprintf(out, 64, "%s must not contain a NUL character", key);
+    return MHD_NO;
+}
+
 /* The TCP peer as text, or "" when there is none to report. */
 static void peer_address(struct MHD_Connection *conn, int is_local,
                          char *out, size_t outsz)
@@ -623,6 +641,21 @@ static enum MHD_Result request_handler(void *cls,
                     "with 'c-backup auth setup' on the daemon's host\"}", NULL);
             return send_response(conn, 401, "application/json",
                 "{\"error\":\"unauthorized\"}", NULL);
+        }
+
+        /* A query value holding %00 reaches a route as a C string cut at
+         * the NUL, so the route would act on less than was sent (B115). */
+        char nulq[64] = "";
+        MHD_get_connection_values_n(conn, MHD_GET_ARGUMENT_KIND, query_nul_check, nulq);
+        if (nulq[0]) {
+            free(pb->data);
+            free(pb);
+            *req_cls = NULL;
+            api_response_t bad = api_error(400, nulq);
+            enum MHD_Result ret = send_response(conn, bad.status, "application/json",
+                                                bad.body, NULL);
+            free(bad.body);
+            return ret;
         }
 
         if (route->kind == ROUTE_KIND_STREAMING) {

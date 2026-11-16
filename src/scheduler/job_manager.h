@@ -36,18 +36,40 @@ typedef status_t (*job_fn)(void *arg, atomic_int *cancel,
 
 status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **out);
 
+/* Whether failure alerts are delivered (Pushover has credentials). Off by
+ * default; it decides only whether a failed job's log line says the alert
+ * is being sent or that it is not. */
+void     job_manager_set_alerts(job_manager_t *jm, int enabled);
+
 /* Shut down: every queued job is recorded cancelled without starting, every
  * running job is asked to stop, and this returns once the workers have
  * joined. A submit racing the shutdown is refused. */
 void     job_manager_stop(job_manager_t *jm);
 
 /*
+ * How a repo-scoped job holds its repository while it runs. The job manager
+ * takes the lock before the job starts and releases it after the job
+ * function returns, so a job function never takes its own repo lock.
+ */
+typedef enum {
+    JOB_LOCK_WRITE = 0,   /* everything that writes, and the default */
+    JOB_LOCK_READ  = 1,   /* a job that only reads, such as a plain verify */
+} job_lock_t;
+
+/*
  * Queue a job.
  *
  * repo_id must reference a registered repository: jobs.repo_id carries a
  * foreign key, so a daemon-wide value of 0 is rejected at insert. Jobs for
- * one repository are dispatched one at a time, because each takes the repo
- * write lock and that lock rejects rather than queues.
+ * one repository are dispatched one at a time and in submission order.
+ *
+ * A repo-scoped job is started only once the dispatcher holds its repo lock
+ * (write, for job_submit and job_submit_scheduled). When a synchronous
+ * request holds the lock at that moment - a snapshot delete, a repository
+ * removal - the job is not failed: it stays queued, reads phase
+ * "waiting for repository", and is retried with a backoff of at most
+ * JOB_DEFER_MAX_MS. The worker is not held while it waits, and the job can
+ * be cancelled like any queued job.
  *
  * `arg` is owned by the job manager from this point and released with
  * `arg_free` once the job ends, however it ends.
@@ -65,6 +87,21 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
                               const char *params_json, int64_t schedule_id,
                               job_fn fn, void *arg, void (*arg_free)(void *),
                               int64_t *out_job_id);
+
+/*
+ * job_submit_scheduled with the repo lock mode chosen by the caller.
+ * Ignored for a job with no repository.
+ */
+status_t job_submit_locked(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                           const char *action, const char *params_json,
+                           int64_t schedule_id, job_fn fn, void *arg,
+                           void (*arg_free)(void *), int64_t *out_job_id);
+
+/* The phase a queued job shows while it waits for a synchronous request to
+ * let go of its repository, and the bounds of the retry backoff. */
+#define JOB_PHASE_WAITING "waiting for repository"
+#define JOB_DEFER_MIN_MS  20
+#define JOB_DEFER_MAX_MS  500
 
 /*
  * What a job reports beyond its phase and item count, through the progress

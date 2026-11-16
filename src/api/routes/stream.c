@@ -152,9 +152,9 @@ static api_stream_response_t handle_job_stream(const api_request_t *req, void *u
      * trailing wildcard, so the id has to come last for this pattern to be
      * distinguishable from the buffered jobs handler. */
     const char *tail = req->url + strlen("/jobs/stream/");
-    char *end = NULL;
-    long long id = strtoll(tail, &end, 10);
-    if (id <= 0 || !end || *end != '\0') {
+    int64_t id = 0;
+    const char *end = NULL;
+    if (routes_path_id(tail, 1, &id, &end) != 1 || *end != '\0') {
         resp.status = 400;
         resp.error_body = "{\"error\":\"invalid job id\"}";
         return resp;

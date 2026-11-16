@@ -201,7 +201,9 @@ multi-gigabyte file in progress does not hold up the shutdown. This takes
 about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
 or SIGINT forces an immediate exit. Run the cancelled job again after the
 restart; a backup skips what it already stored, a restore skips the files it
-finished and redoes the one it was inside. `c-backup jobs cancel <id>` is the
+finished and redoes the one it was inside (a stop renames every file the
+restore has verified into place before the job ends, so finished means
+verified). `c-backup jobs cancel <id>` is the
 same cancellation for one job, and prints the job record with `"cancel_requested":true`. A job still
 waiting in the queue never starts: it is `cancelled` in that record already,
 and in the journal as "cancelled before it started".
@@ -215,6 +217,14 @@ those files again. Staging files a killed writer left in the repository's
 `tmp/` are removed by the next backup or gc, which hold the repository's write
 lock and so know nothing else is writing there; opening a repository also
 removes any an hour old.
+
+A restore killed this way redoes more than the file it was inside. Verified
+files wait under temporary names (`.c-backup-partial.XXXXXX`) until one
+`syncfs` makes a batch of them durable and they are renamed into place, a
+batch being up to 512 files or 256 MiB; a kill before that leaves the batch
+under its temporary names. The rerun removes them and restores those files
+again, so it can redo up to a whole batch of files that had finished. What
+it never does is leave a right-named file with the wrong contents.
 
 ### 2.3 Docker
 
@@ -557,6 +567,9 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
   that differs from the stored one replaces it; leaving the label out keeps
   the old one. Asking for an encryption mode the repository does not have is
   refused: encryption is fixed when a repository is created.
+- A label is at most 256 bytes of UTF-8 text with no control characters,
+  the same rule as a snapshot label; anything else is refused with HTTP 400
+  before anything is created.
 - Paths are stored normalised: `/srv/backup/main/` and
   `/srv/backup//main` are both `/srv/backup/main`.
 - A non-empty directory without a marker is refused. Writing objects into
@@ -793,9 +806,21 @@ everything that was asked for.
 
 ### 6.4 Concurrency
 
-Jobs for one repository run one at a time: the dispatcher never starts a
-second job for a repository that has one running, and queues it instead. Jobs
-for different repositories run in parallel, up to `jobs.max_parallel`.
+Jobs for one repository run one at a time, in the order they were submitted:
+the dispatcher never starts a second job for a repository that has one
+running, and queues it instead. Jobs for different repositories run in
+parallel, up to `jobs.max_parallel`.
+
+A few requests act on a repository directly rather than as a job: deleting a
+snapshot and removing a repository. They hold the repository for the
+milliseconds they take, and one that finds a job running against it is
+refused (`503 repo is busy` for a snapshot delete, `409` for a removal). The
+reverse never fails a job: a job whose turn comes while such a request holds
+its repository stays `queued`, shows the phase `waiting for repository`, and
+starts as soon as the request is done, retried within at most half a second.
+It holds no worker while it waits, and it can be cancelled like any queued
+job. So deleting snapshots by hand while a scheduled backup is due costs the
+backup nothing more than the wait.
 
 Metadata writes (tags, notes, policy, sources) during a running backup wait
 briefly for the database rather than failing. A backup holds the database's
@@ -835,7 +860,11 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
 - **Content search** (`grep`) runs as a job, because it reads the
   repository. Matching is POSIX extended regular expressions, line by line,
   over every distinct object in the snapshot; a file present under several
-  names is read once. A binary file that matches is one hit, `(binary file
+  names is read once, and a match in it is reported under every one of
+  those names in the snapshot (or under `--path-prefix`), each counted in
+  `files_matched`. The counts are files, not objects, and each name counts
+  against `--limit` and `--max-hits` like any other matching file; one left
+  out for a cap makes the search `truncated`. A binary file that matches is one hit, `(binary file
   matches)`, however often it matches. `--snapshot N` picks the snapshot
   (newest by default; one that does not exist is an error), `--path-prefix`
   limits it to a subtree, `-i` ignores case, `--limit N` stops after N
@@ -1316,12 +1345,15 @@ would do:
 ```json
 {"dry_run":false,"reachable":5210,"objects_swept":12,"bytes_freed":40960,
  "pack_entries_kept":5100,"pack_entries_dropped":12,"packs_rewritten":1,
- "packs_deleted":0,"tmp_files_removed":0,"tmp_bytes_removed":0}
+ "packs_deleted":0,"packs_coalesced":20,"packs_removed_by_coalesce":17,
+ "tmp_files_removed":0,"tmp_bytes_removed":0}
 ```
 
 `objects_swept` and `bytes_freed` are what was swept, or on a dry run what
 would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
-does not do; `tmp_files_removed` counts staging files an interrupted run left
+does not do. `packs_coalesced` is how many small packs the coalescing pass
+after compaction merged, and `packs_removed_by_coalesce` how many fewer pack
+files that left: 20 merged into 3 is 20 and 17. `tmp_files_removed` counts staging files an interrupted run left
 behind (section 2.2). The journal entry carries the same in a line.
 
 Compaction copies entries into packs whose parity is computed afresh, so it
@@ -1746,11 +1778,7 @@ Repository photos (id 3) at /mnt/backup/photos
 Job 119 (backup) completed with a warning: 2 file(s) could not be read and are not in snapshot 41; first: /data/photos/locked.jpg: cannot open: Permission denied
 ```
 
-The daemon logs every alert before it is sent, a failure as `sending
-failure notification for job N: ...` (beside the job's own `failed` line)
-and a warning at `warning` level as `sending warning notification for job
-N: ...`, so the log carries them with or without Pushover configured. A clean backup sends
-nothing.
+A clean backup sends nothing.
 
 A notification that cannot be delivered is retried for 24 hours unless
 Pushover rejects it outright (a wrong token or user key), in which case it is
@@ -1763,6 +1791,15 @@ push permanently failed (HTTP 400, {"user":"invalid",...}): c-backup: backup of 
 
 and `cbackup_alerts_failed_total` counts it (section 16.2). Watch that
 counter: an alert path that has stopped working is otherwise silent.
+
+The daemon log has one line per failed job either way: `sending failure
+notification for job N: <title>: <body>` with credentials set, and
+`failure notification for job N not sent, Pushover is not configured:
+<title>: <body>` without them.
+A backup that completed with skipped files logs the same pair at
+`warning` level: `sending warning notification for job N: <title>: <body>`
+with credentials, `warning notification for job N not sent, Pushover is not
+configured: <title>: <body>` without.
 
 ---
 
@@ -2007,6 +2044,10 @@ JSON, one document per command, on stdout (a remove prints what it removed,
 that prints several: one document per line until the job ends. The exit
 status is 0 on success and 1 otherwise. Flags may appear anywhere after the
 command. Commands that start a job wait for it unless given `--no-wait`.
+The listing and lookup commands refuse an argument they do not take, a
+stray positional or an unknown option, with `unexpected argument` and their
+usage, rather than ignore it: `grep runs 1 2` is an error, not repository
+1's runs.
 
 | Command | Purpose |
 |---|---|
@@ -2033,7 +2074,7 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
 | `stats <id> [--scope loose]`, `summary <id>`, `fanout <id>` | Repository statistics |
-| `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
+| `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
 | `packs <id> [pack-id]` | Packs |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |

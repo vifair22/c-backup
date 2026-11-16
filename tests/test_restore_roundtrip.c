@@ -49,6 +49,7 @@
 #include "store_index.h"
 #include "types.h"
 #include "verify.h"
+#include "scratch_ancestors.h"
 #include "test_tmp.h"
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_restore"
@@ -1411,7 +1412,31 @@ static void test_xattrs_and_acls_round_trip(void **state)
  * (listxattr order, host endianness) would give every tree a fresh hash on
  * every run and dedup would silently die. An unchanged tree backed up twice
  * must store nothing new.
+ *
+ * Nothing new means nothing under TEST_SRC. The ancestors above it are the
+ * machine's directories and may legitimately move between the two backups;
+ * scratch_ancestors.h has the mechanism.
  */
+
+/* The tree object a snapshot recorded for TEST_SRC, as hex. Its bytes carry
+ * the xattr_hash and acl_hash of every entry in the fixture. */
+static void src_subtree_hash(int64_t snap_id, char *out, size_t out_sz)
+{
+    char snap[32];
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT hex(n.subtree_hash) FROM nodes n"
+        " JOIN nodes p ON p.repo_id = n.repo_id AND p.id = n.parent_node_id"
+        " WHERE n.snap_id = ? AND n.name = 'src'"
+        " AND p.name = 'c_backup_test_restore'",
+        (const char *[]){ snap, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_true(r->rows[0][0][0] != '\0');
+    snprintf(out, out_sz, "%s", r->rows[0][0]);
+    db_result_free(r);
+}
+
 static void test_xattr_backup_is_deterministic(void **state)
 {
     (void)state;
@@ -1420,10 +1445,25 @@ static void test_xattr_backup_is_deterministic(void **state)
 
     backup_opts_t o = basic_opts();
     backup_result_t br1, br2;
+    scratch_ancestors_t before, after;
+    scratch_ancestors_read(TEST_SRC, &before);
     assert_int_equal(backup_run(store, db, repo_id, &o, &br1), OK);
     assert_int_equal(backup_run(store, db, repo_id, &o, &br2), OK);
+    scratch_ancestors_read(TEST_SRC, &after);
+
     assert_int_equal(br2.objects_new, 0);
-    assert_int_equal(br2.trees_new, 0);
+
+    char h1[2 * OBJECT_HASH_SIZE + 1], h2[2 * OBJECT_HASH_SIZE + 1];
+    src_subtree_hash(br1.snapshot_id, h1, sizeof(h1));
+    src_subtree_hash(br2.snapshot_id, h2, sizeof(h2));
+    assert_string_equal(h1, h2);
+
+    if (!scratch_ancestors_moved(&before, &after)) {
+        assert_int_equal(br2.trees_new, 0);
+    } else {
+        /* At most every ancestor and the synthetic root. */
+        assert_true(br2.trees_new <= scratch_ancestors_count(&after) + 1);
+    }
 }
 
 /* And the index is still derived: a rebuilt one restores them too. */
@@ -1915,12 +1955,31 @@ static void test_resume_keeps_a_file_that_is_not_the_snapshots(void **state)
     snprintf(top, sizeof(top), "%s/top.txt", restored_root());
     write_file(top, "edited after the restore, and longer than before\n");
 
+    /* NIT-9: the log line says what is there, a directory included. */
+    char mid[700];
+    snprintf(mid, sizeof(mid), "%s/nested/mid.txt", restored_root());
+    assert_int_equal(unlink(mid), 0);
+    assert_int_equal(mkdir(mid, 0700), 0);
+    captured_log[0] = '\0';
+    int h = log_stream_register(capture_log, NULL);
+    assert_true(h >= 0);
     restore_result_t rr;
     assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
                                  TEST_DST, NULL, &rr), OK);
-    assert_int_equal(rr.kept, 1);
+    log_stream_unregister(h);
+    assert_int_equal(rr.kept, 2);
     assert_int_equal(rr.files, 0);
-    assert_int_equal(rr.skipped, 2);   /* mid.txt and leaf.txt */
+    assert_int_equal(rr.skipped, 1);   /* leaf.txt */
+    assert_non_null(strstr(captured_log, "(a file of a different size is there)"));
+    assert_non_null(strstr(captured_log, "(a directory is there, not the file)"));
+    assert_null(strstr(captured_log, "size or mtime differ"));
+    assert_int_equal(rmdir(mid), 0);
+
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.kept, 1);
+    assert_int_equal(rr.files, 1);     /* mid.txt, back once the directory went */
+    assert_int_equal(rr.skipped, 1);   /* leaf.txt */
     FILE *f = fopen(top, "r");
     assert_non_null(f);
     char line[128] = "";

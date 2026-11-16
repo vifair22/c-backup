@@ -2,6 +2,7 @@
 
 #include "job_manager.h"
 
+#include "lock.h"
 #include "routes.h"
 
 #include <cutils/log.h>
@@ -24,6 +25,17 @@ typedef struct {
     job_fn   fn;
     void    *arg;
     void   (*arg_free)(void *);
+    job_lock_t lock;
+    /* Deferral while a synchronous request holds the repo; see
+     * take_runnable. defer_ms is the current backoff, 0 until the first
+     * refusal; defer_until_ms is when to try again, on the mono_ms clock. */
+    int64_t  defer_until_ms;
+    int      defer_ms;
+    /* Set on the dequeued copy only: the dispatcher holds the repo lock on
+     * the job's behalf, or could not take it for a reason other than
+     * contention and the job fails with lock_err instead of running. */
+    int      locked;
+    status_t lock_err;
 } job_slot_t;
 
 /*
@@ -58,11 +70,13 @@ struct job_manager {
     /*
      * One entry per worker: the job it is running, if any.
      *
-     * Also the set of repositories with a job on a worker right now. Every repo-scoped job takes the repo write lock, and that lock rejects
-     * rather than queues, so dispatching two jobs for one repo made the
-     * second fail instantly with "repo is busy". The queue was generating the
-     * contention the lock exists to catch. One entry per worker is enough:
-     * a repo can only be busy because some worker is holding it.
+     * Also the set of repositories with a job on a worker right now. Every
+     * repo-scoped job holds its repo lock while it runs, and that lock
+     * rejects rather than queues, so dispatching two jobs for one repo made
+     * the second fail instantly with "repo is busy". The queue was
+     * generating the contention the lock exists to catch. One entry per
+     * worker is enough to know which repos a job holds; a synchronous
+     * request holding one is found by take_runnable's try instead.
      */
     worker_state_t *running;
     /* Guards DB writes from worker threads. c-utils serialises internally,
@@ -70,7 +84,16 @@ struct job_manager {
      * lock keeps them from interleaving mid-transaction with a job's own
      * writes. */
     pthread_mutex_t db_mu;
+    /* Whether a failure alert goes anywhere: Pushover has a token and a
+     * user (job_manager_set_alerts). push_send accepts and drops a message
+     * when it has not, so this is only what the log line may claim. */
+    atomic_int      alerts;
 };
+
+void job_manager_set_alerts(job_manager_t *jm, int enabled)
+{
+    if (jm) atomic_store(&jm->alerts, enabled ? 1 : 0);
+}
 
 /*
  * One journal entry for a job that ended.
@@ -88,7 +111,7 @@ static void journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
         journal_record(db, repo_id, "api", action, outcome, took_ms, message);
         return;
     }
-    char msg[640];
+    char msg[ERR_MSG_MAX + 64];
     snprintf(msg, sizeof(msg), "schedule %lld%s%s", (long long)schedule_id,
              message && *message ? ": " : "", message ? message : "");
     journal_record(db, repo_id, "schedule", action, outcome, took_ms, msg);
@@ -166,12 +189,12 @@ static void alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
                  (long long)repo_id, ended);
 
     if (path[0])
-        snprintf(body, body_sz, "Repository %s (id %lld) at %s\nJob %lld (%s) %s: %s",
+        snprintf(body, body_sz, "Repository %s (id %lld) at %s\nJob %lld (%s) %s: %.900s",
                  label[0] ? label : "(no label)", (long long)repo_id, path,
                  (long long)job_id, what, ended, why);
     else
         snprintf(body, body_sz, "Repository %lld (no longer registered)\n"
-                 "Job %lld (%s) %s: %s",
+                 "Job %lld (%s) %s: %.900s",
                  (long long)repo_id, (long long)job_id, what, ended, why);
 }
 
@@ -207,15 +230,19 @@ static void set_job_state(job_manager_t *jm, int64_t job_id,
         /* Only a worker claiming the job starts it. A queued job cancelled
          * by `jobs cancel` or by shutdown never ran, and used to be given a
          * start time anyway; it now reads "started": null. */
+        /* A job starting clears the phase it may have shown while it was
+         * deferred; it has reported nothing of its own yet. */
         if (db_execute_non_query(jm->db,
                 "UPDATE jobs SET state = ?,"
+                " progress_phase = CASE WHEN ? = 'running' THEN ''"
+                "                       ELSE progress_phase END,"
                 " started = CASE WHEN ? = 'running'"
                 "                THEN COALESCE(started, strftime('%s','now'))"
                 "                ELSE started END,"
                 " ended = CASE WHEN ? IN ('completed','failed','cancelled')"
                 "              THEN strftime('%s','now') ELSE ended END"
                 " WHERE id = ?",
-                (const char *[]){ state, state, state, id, NULL }, NULL) != 0)
+                (const char *[]){ state, state, state, state, id, NULL }, NULL) != 0)
             log_error("job %s: cannot record state %s", id, state);
     }
     pthread_mutex_unlock(&jm->db_mu);
@@ -383,23 +410,98 @@ static job_slot_t dequeue_at(job_manager_t *jm, int k)
     return out;
 }
 
+/* Caller holds jm->mu. Whether a job for repo_id sits ahead of position k. */
+static int repo_queued_before(const job_manager_t *jm, int64_t repo_id, int k)
+{
+    for (int m = 0; m < k; m++)
+        if (jm->queue[(jm->head + m) % JOB_QUEUE_MAX].repo_id == repo_id) return 1;
+    return 0;
+}
+
+static status_t try_repo_lock(int64_t repo_id, job_lock_t lock)
+{
+    return lock == JOB_LOCK_READ ? repo_trylock_read(repo_id)
+                                 : repo_trylock_write(repo_id);
+}
+
 /*
- * Take the oldest queued job whose repository is not already busy.
+ * Take the oldest queued job whose repository is free, holding its repo lock.
  *
  * Scanning past a blocked job rather than waiting on it keeps one slow
  * repository from stalling every other one, which a strict head-of-queue
- * policy would do. Returns 1 with the job in *out, or 0 if nothing is
- * runnable right now. Caller holds jm->mu.
+ * policy would do. Only the first queued job of each repository is a
+ * candidate, so jobs for one repository start in the order submitted.
+ *
+ * The repo lock is taken here, before the job leaves the queue (B123). Each
+ * job used to take it itself once a worker had marked it running, and the
+ * lock rejects rather than waits, so a snapshot delete or a repository
+ * removal holding it for a few milliseconds failed whichever job was
+ * dispatched in that window, failure alert and all. Contention now leaves
+ * the job where it is, still queued and still cancellable, to be tried again
+ * after a backoff that doubles from JOB_DEFER_MIN_MS to JOB_DEFER_MAX_MS.
+ * The try never blocks, so holding jm->mu across it cannot deadlock against
+ * a request holding the repo lock, and no worker is ever parked on one.
+ *
+ * Returns 1 with the job in *out. Otherwise 0, with *wake_ms the earliest
+ * retry due (0 if none) and *mark a job deferred for the first time, whose
+ * phase the caller records once it has let go of jm->mu. Caller holds jm->mu.
  */
-static int take_runnable(job_manager_t *jm, job_slot_t *out)
+static int take_runnable(job_manager_t *jm, job_slot_t *out,
+                         int64_t *wake_ms, int64_t *mark)
 {
+    int64_t now = mono_ms();
+    *wake_ms = 0;
+    *mark = 0;
     for (int k = 0; k < jm->count; k++) {
-        int i = (jm->head + k) % JOB_QUEUE_MAX;
-        if (repo_is_running(jm, jm->queue[i].repo_id)) continue;
+        job_slot_t *q = &jm->queue[(jm->head + k) % JOB_QUEUE_MAX];
+        status_t lst = OK;
+        if (q->repo_id > 0) {
+            if (repo_is_running(jm, q->repo_id)) continue;
+            if (repo_queued_before(jm, q->repo_id, k)) continue;
+            if (q->defer_until_ms > now) {
+                if (*wake_ms == 0 || q->defer_until_ms < *wake_ms)
+                    *wake_ms = q->defer_until_ms;
+                continue;
+            }
+            lst = try_repo_lock(q->repo_id, q->lock);
+            if (lst == ERR_BUSY) {
+                err_clear();
+                if (q->defer_ms == 0) {
+                    q->defer_ms = JOB_DEFER_MIN_MS;
+                    if (*mark == 0) *mark = q->job_id;
+                    log_info("job %lld deferred: repo %lld is held by a request; "
+                             "it stays queued and retries",
+                             (long long)q->job_id, (long long)q->repo_id);
+                } else {
+                    q->defer_ms = q->defer_ms * 2 > JOB_DEFER_MAX_MS
+                                      ? JOB_DEFER_MAX_MS : q->defer_ms * 2;
+                }
+                q->defer_until_ms = now + q->defer_ms;
+                if (*wake_ms == 0 || q->defer_until_ms < *wake_ms)
+                    *wake_ms = q->defer_until_ms;
+                continue;
+            }
+        }
         *out = dequeue_at(jm, k);
+        out->locked   = (out->repo_id > 0 && lst == OK);
+        out->lock_err = lst;
         return 1;
     }
     return 0;
+}
+
+/* The phase a deferred job shows. Only while it is still queued: a worker
+ * may have claimed it, or a cancel finished it, since jm->mu was released. */
+static void mark_waiting(job_manager_t *jm, int64_t job_id)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)job_id);
+    pthread_mutex_lock(&jm->db_mu);
+    if (db_execute_non_query(jm->db,
+            "UPDATE jobs SET progress_phase = ? WHERE id = ? AND state = 'queued'",
+            (const char *[]){ JOB_PHASE_WAITING, id, NULL }, NULL) != 0)
+        { /* a report, not the job's outcome */ }
+    pthread_mutex_unlock(&jm->db_mu);
 }
 
 static void *worker_main(void *arg)
@@ -426,10 +528,26 @@ static void *worker_main(void *arg)
                 pthread_mutex_unlock(&jm->mu);
                 return NULL;
             }
-            if (take_runnable(jm, &slot)) break;
-            /* Either nothing queued, or everything queued belongs to a repo
-             * another worker is busy with. Both resolve on the next signal. */
-            pthread_cond_wait(&jm->cv, &jm->mu);
+            int64_t wake_ms, mark;
+            if (take_runnable(jm, &slot, &wake_ms, &mark)) break;
+            if (mark) {
+                pthread_mutex_unlock(&jm->mu);
+                mark_waiting(jm, mark);
+                pthread_mutex_lock(&jm->mu);
+                continue;
+            }
+            /* Nothing queued, or everything queued belongs to a repo another
+             * worker is busy with: both resolve on the next signal. A job
+             * deferred behind a request has a retry due, and nothing signals
+             * a request letting go, so that wait is bounded by the time. */
+            if (wake_ms > 0) {
+                struct timespec ts;
+                ts.tv_sec  = (time_t)(wake_ms / 1000);
+                ts.tv_nsec = (long)(wake_ms % 1000) * 1000000L;
+                pthread_cond_timedwait(&jm->cv, &jm->mu, &ts);
+            } else {
+                pthread_cond_wait(&jm->cv, &jm->mu);
+            }
         }
         ws->job_id  = slot.job_id;
         ws->repo_id = slot.repo_id;
@@ -454,8 +572,12 @@ static void *worker_main(void *arg)
         clock_gettime(CLOCK_MONOTONIC, &began);
 
         progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL, NULL };
-        status_t st = slot.fn(slot.arg, &ws->cancel,
-                              on_progress, &pc);
+        /* A lock error that is not contention (the lock table is full) fails
+         * the job through the same reporting as any other failure. */
+        status_t st = slot.lock_err != OK
+                          ? slot.lock_err
+                          : slot.fn(slot.arg, &ws->cancel, on_progress, &pc);
+        if (slot.locked) repo_unlock(slot.repo_id);
 
         /* The job's own account of what it did, and the final byte count,
          * which the throttle may not have written. Before the final state,
@@ -562,12 +684,20 @@ static void *worker_main(void *arg)
             pthread_mutex_unlock(&jm->db_mu);
             /* c-utils logs a send only when it is rejected, and then only
              * the title, so the log never said an alert went out or what
-             * it said. */
-            log_info("sending failure notification for job %lld: %s: %s",
-                     (long long)slot.job_id, title, body);
-            if (push_send(title, body) != 0)
-                log_warn("cannot queue failure notification for job %lld",
-                         (long long)slot.job_id);
+             * it said. Nor does it say when it drops one for want of
+             * credentials, and this line said "sending" after push_init
+             * had logged that Pushover is not configured (NIT-11). */
+            if (atomic_load(&jm->alerts)) {
+                log_info("sending failure notification for job %lld: %s: %s",
+                         (long long)slot.job_id, title, body);
+                if (push_send(title, body) != 0)
+                    log_warn("cannot queue failure notification for job %lld",
+                             (long long)slot.job_id);
+            } else {
+                log_info("failure notification for job %lld not sent, Pushover "
+                         "is not configured: %s: %s",
+                         (long long)slot.job_id, title, body);
+            }
         }
         /*
          * A job that succeeded with something an operator must hear about.
@@ -581,11 +711,19 @@ static void *worker_main(void *arg)
             job_warning_compose(jm->db, slot.repo_id, slot.job_id, slot.action,
                                 pc.warning, title, sizeof(title), body, sizeof(body));
             pthread_mutex_unlock(&jm->db_mu);
-            log_warn("sending warning notification for job %lld: %s: %s",
-                     (long long)slot.job_id, title, body);
-            if (push_send(title, body) != 0)
-                log_warn("cannot queue warning notification for job %lld",
-                         (long long)slot.job_id);
+            /* Logged either way, at warning, and only called "sending"
+             * when there is somewhere to send it (NIT-11). */
+            if (atomic_load(&jm->alerts)) {
+                log_warn("sending warning notification for job %lld: %s: %s",
+                         (long long)slot.job_id, title, body);
+                if (push_send(title, body) != 0)
+                    log_warn("cannot queue warning notification for job %lld",
+                             (long long)slot.job_id);
+            } else {
+                log_warn("warning notification for job %lld not sent, Pushover "
+                         "is not configured: %s: %s",
+                         (long long)slot.job_id, title, body);
+            }
         }
         free(pc.warning);
         pc.warning = NULL;
@@ -613,7 +751,13 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
     jm->db = db;
     pthread_mutex_init(&jm->mu, NULL);
     pthread_mutex_init(&jm->db_mu, NULL);
-    pthread_cond_init(&jm->cv, NULL);
+    /* Monotonic, because a deferred job's retry is a timed wait and a wall
+     * clock step must neither stretch nor skip it. */
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&jm->cv, &ca);
+    pthread_condattr_destroy(&ca);
 
     /*
      * Anything left in 'running' or 'queued' belongs to a previous process
@@ -743,6 +887,15 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
                               job_fn fn, void *arg, void (*arg_free)(void *),
                               int64_t *out_job_id)
 {
+    return job_submit_locked(jm, repo_id, JOB_LOCK_WRITE, action, params_json,
+                             schedule_id, fn, arg, arg_free, out_job_id);
+}
+
+status_t job_submit_locked(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                           const char *action, const char *params_json,
+                           int64_t schedule_id, job_fn fn, void *arg,
+                           void (*arg_free)(void *), int64_t *out_job_id)
+{
     if (!jm || !fn || !action) return set_error(ERR_INVALID, "job_submit: null argument");
 
     char repo[32], sched[32];
@@ -817,6 +970,11 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
     s->fn       = fn;
     s->arg      = arg;
     s->arg_free = arg_free;
+    s->lock     = lock;
+    s->defer_until_ms = 0;
+    s->defer_ms = 0;
+    s->locked   = 0;
+    s->lock_err = OK;
     jm->tail = (jm->tail + 1) % JOB_QUEUE_MAX;
     jm->count++;
     pthread_cond_signal(&jm->cv);

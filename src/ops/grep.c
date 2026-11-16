@@ -57,6 +57,7 @@ typedef struct {
     int          stop_all;     /* total_cap reached: end the search */
 
     /* Per-file state, reset for each object. */
+    uint64_t     paths;        /* files in scope holding this object */
     uint64_t     line_no;
     uint32_t     file_hits;
     /* This file's hits, held until its read has authenticated. Sized to
@@ -260,13 +261,15 @@ static void record_hit(grep_ctx_t *g, uint64_t line_no, const char *line, size_t
     if (g->res->hits + g->file_hits >= g->total_cap) { g->stop_all = 1; g->file_done = 1; }
 }
 
-/* The file read back authentic: its held hits become the run's. */
-static void flush_hits(grep_ctx_t *g, const char *node_id, const char *path)
+/* The file read back authentic: the first n of its held hits become the
+ * run's, under this path. */
+static void flush_hits(grep_ctx_t *g, const char *node_id, const char *path,
+                       uint32_t n)
 {
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)g->repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)g->run_id);
-    for (uint32_t i = 0; i < g->file_hits; i++) {
+    for (uint32_t i = 0; i < n; i++) {
         char ln[32];
         snprintf(ln, sizeof(ln), "%llu", (unsigned long long)g->pending[i].line_no);
         if (db_execute_non_query(g->db,
@@ -277,7 +280,7 @@ static void flush_hits(grep_ctx_t *g, const char *node_id, const char *path)
                 NULL) != 0)
             log_warn("grep: cannot record hit for %s", path);
     }
-    g->res->hits += g->file_hits;
+    g->res->hits += n;
 }
 
 /*
@@ -289,10 +292,26 @@ static void flush_hits(grep_ctx_t *g, const char *node_id, const char *path)
  */
 static void discard_file(grep_ctx_t *g, const char *path, const char *why)
 {
-    log_warn("grep: %s not searched: %s", path, why);
-    g->res->files_skipped++;
-    if (!g->res->skip_reason[0])
-        snprintf(g->res->skip_reason, sizeof(g->res->skip_reason), "%s: %s", path, why);
+    if (g->paths > 1)
+        log_warn("grep: %s and %llu other path(s) holding the same content "
+                 "not searched: %s", path, (unsigned long long)(g->paths - 1), why);
+    else
+        log_warn("grep: %s not searched: %s", path, why);
+    g->res->files_skipped += g->paths ? g->paths : 1;
+    if (!g->res->skip_reason[0]) {
+        /* A longer one is cut; the log line above has it whole. Copied by
+         * hand, as snprintf into the fixed field draws a truncation
+         * warning wherever this is inlined beside a PATH_MAX buffer. */
+        char *dst = g->res->skip_reason;
+        size_t cap = sizeof(g->res->skip_reason) - 1, o = 0;
+        for (const char *parts[] = { path, ": ", why }, **p = parts;
+             p < parts + 3 && o < cap; p++) {
+            size_t n = strnlen(*p, cap - o);
+            memcpy(dst + o, *p, n);
+            o += n;
+        }
+        dst[o] = '\0';
+    }
     g->file_hits = 0;
     g->file_capped = 0;
     g->stop_all = 0;
@@ -500,8 +519,91 @@ static int scan_object(grep_ctx_t *g, store_t *store,
         discard_file(g, path, why);
         return 0;
     }
-    flush_hits(g, node_id, path);
+    flush_hits(g, node_id, path, g->file_hits);
     return g->file_hits > 0;
+}
+
+/*
+ * The object behind a match is held under other paths too, and each of
+ * them holds the match, so each gets the same hits without the content
+ * being read again (B117). Only the first path used to be named: three
+ * identical logs reported one, and files_matched counted the object.
+ *
+ * The paths come from the node index, in scope: the subtree when the
+ * search has a prefix, the snapshot otherwise. The caps bound them as they
+ * bound any other matching file - no more files than max_files leaves
+ * room for, no more hits than max_hits - and a path left out for either
+ * stops the search, reported truncated.
+ */
+static void record_shared_paths(grep_ctx_t *g, const char *repo, const char *snap,
+                                const char *scope_id, const char *hex,
+                                const char *first_node)
+{
+    uint64_t want  = g->paths - 1;
+    uint64_t limit = want;
+    if (g->opts->max_files) {
+        uint64_t files_left = g->opts->max_files > g->res->files_matched
+                            ? g->opts->max_files - g->res->files_matched : 0;
+        if (limit > files_left) limit = files_left;
+    }
+    /* Every path recorded takes at least one hit. */
+    uint64_t room = g->total_cap > g->res->hits ? g->total_cap - g->res->hits : 0;
+    if (limit > room) limit = room;
+
+    uint64_t done = 0;
+    if (limit > 0) {
+        char lim[32];
+        snprintf(lim, sizeof(lim), "%llu", (unsigned long long)limit);
+        db_result_t *r = NULL;
+        int qrc = scope_id
+            ? db_execute(g->db,
+                "WITH RECURSIVE sub(id) AS ("
+                "  SELECT CAST(? AS INTEGER)"
+                "  UNION ALL"
+                "  SELECT n.id FROM nodes n JOIN sub ON n.parent_node_id = sub.id"
+                "   WHERE n.repo_id = ? AND n.snap_id = ?"
+                ")"
+                "SELECT n.id FROM nodes n JOIN sub ON sub.id = n.id"
+                " WHERE n.repo_id = ? AND n.snap_id = ? AND n.type = 1"
+                "   AND n.content_hash = ? AND n.id != ?"
+                " ORDER BY n.id LIMIT ?",
+                (const char *[]){ scope_id, repo, snap, repo, snap, hex,
+                                  first_node, lim, NULL }, &r)
+            : db_execute(g->db,
+                "SELECT id FROM nodes"
+                " WHERE repo_id = ? AND content_hash = ? AND snap_id = ?"
+                "   AND type = 1 AND id != ?"
+                " ORDER BY id LIMIT ?",
+                (const char *[]){ repo, hex, snap, first_node, lim, NULL }, &r);
+        if (qrc != 0 || !r) {
+            db_result_free(r);
+            log_warn("grep: cannot list the other paths holding %s", hex);
+            return;
+        }
+        for (int i = 0; i < r->nrows; i++) {
+            uint64_t left = g->total_cap - g->res->hits;
+            uint32_t n = g->file_hits;
+            if (left < n) n = (uint32_t)left;
+            if (n == 0) break;
+
+            char rel[PATH_MAX];
+            if (grep_node_path(g->db, repo, snap, r->rows[i][0], rel, sizeof(rel)) != OK) {
+                err_clear();
+                snprintf(rel, sizeof(rel), "%s", hex);
+            }
+            flush_hits(g, r->rows[i][0], rel, n);
+            g->res->files_matched++;
+            if (g->file_capped) g->res->files_capped++;
+            done++;
+            if (n < g->file_hits) break;   /* max_hits fell inside this path */
+        }
+        db_result_free(r);
+    }
+
+    /* A path left out, or one recorded short of its hits: the search
+     * stopped early, and says so. */
+    if (done < want || g->res->hits >= g->total_cap)
+        g->stop_all = 1;
 }
 
 status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -677,10 +779,19 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             snprintf(rel, sizeof(rel), "%s", hex);
         }
 
-        res.files_scanned++;
-        if (scan_object(&g, store, hash, size, node_id, rel))
+        /* Files, not objects: content held under three names is three
+         * files scanned, and three matched or three skipped. */
+        g.paths = strtoull(objs->rows[i][2], NULL, 10);
+        if (g.paths == 0) g.paths = 1;
+        res.files_scanned += g.paths;
+        int matched = scan_object(&g, store, hash, size, node_id, rel);
+        if (matched) {
             res.files_matched++;
-        if (g.file_capped) res.files_capped++;
+            if (g.file_capped) res.files_capped++;
+            if (g.paths > 1 && !g.stop_all)
+                record_shared_paths(&g, repo, snap, scoped ? prefix_id : NULL,
+                                    hex, node_id);
+        }
         if (g.stop_all) {
             res.truncated = 1;
             break;
