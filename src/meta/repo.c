@@ -945,6 +945,22 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
     if (st != OK) return st;
 
     /*
+     * Staging a killed writer left behind (a replicate SIGKILLed mid-copy
+     * leaves a pack of up to 2 GB in tmp/, B133) goes now, if no handle is
+     * writing here; see store_claim_tmp. Failing to open or sweep is not a
+     * reason to refuse the registration.
+     */
+    {
+        store_t *sw = NULL;
+        if (store_open(path, NULL, &sw) == OK) {
+            (void)store_sweep_tmp_before(sw, time(NULL), NULL);
+            store_close(sw);
+        } else {
+            err_clear();
+        }
+    }
+
+    /*
      * Encryption is the marker's to say, not the request's. Asking for a
      * mode an existing repository does not have used to be accepted, and
      * the route then recorded the requested mode against a repository whose

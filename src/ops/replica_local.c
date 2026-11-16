@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -729,6 +730,15 @@ static status_t sink_finish_open(local_ctx_t *c, const char *path,
     if (st != OK) { repo_key_wipe(&c->dst_key); free(c); return st; }
     c->owns_store = 1;
     snprintf(c->uuid, sizeof(c->uuid), "%s", m->uuid);
+
+    /*
+     * A replicate killed mid-copy leaves its staging pack in tmp/ (B133):
+     * up to the size of the object it was copying. This sink is about to
+     * write here; if it holds tmp/ (store_claim_tmp), nothing else is
+     * staging, and every staging file there is a dead writer's. Packs in
+     * packs/ are never touched: the sweep reads tmp/ only.
+     */
+    (void)store_sweep_tmp_before(c->store, time(NULL), NULL);
 
     build_index(c);
 

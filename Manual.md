@@ -228,9 +228,17 @@ edits; the next start puts back any snapshot that went with them on its own
 (section 17.5). Either way the repository is consistent: a backup's partial pack
 and the index rows staged into it are discarded, and the next backup stores
 those files again. Staging files a killed writer left in the repository's
-`tmp/` are removed by the next backup or gc, which hold the repository's write
-lock and so know nothing else is writing there; opening a repository also
-removes any an hour old.
+`tmp/` are removed by the next backup, gc or reindex, by registering the
+repository, and in a replica by the next replicate into it. Each of these
+first takes an exclusive lock on `tmp/.lock`, which every process staging
+a pack there also holds. Getting it means no other writer of pack, snapshot
+record, snapshot-id or deletion-marker staging can be live (those are
+written only under that lock or the repository's write lock), so all of
+those go whatever their age; when another process holds it, only staging
+an hour old goes. The tag mirror's staging (`tags.*`) is written by tag
+commands, which hold neither and may run during a backup or gc, so it is
+only ever removed once it is an hour old. Opening a repository also removes
+any staging an hour old. Installed packs, in `packs/`, are never touched.
 
 A restore killed this way redoes more than the file it was inside. Verified
 files wait under temporary names (`.c-backup-partial.XXXXXX`) until one
@@ -1606,7 +1614,9 @@ restored from.
   part-way leaves the replica openable and verify-clean with the snapshots
   it finished; the next run skips those and carries on. Objects it had
   staged for an unfinished snapshot are either kept (reused by the next
-  run) or left in the replica's `tmp/`, where a later open sweeps them.
+  run) or left in the replica's `tmp/`, where the next replicate into it
+  (or registering the replica, a reindex or a gc of it) removes them; see
+  section 2.2.
 - A destination already holding a different repository is refused, unless
   `--reencrypt` says that is the point (below).
 - So is the source repository's own directory, anything inside it, and any

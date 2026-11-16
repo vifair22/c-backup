@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -1021,6 +1022,10 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_INVALID,
                          "reindex: repository is encrypted and no key is loaded; "
                          "nothing was changed");
+
+    /* The job holds the repository's write lock; staging a killed writer
+     * left (B133) goes, if no other handle holds tmp/. */
+    (void)store_sweep_tmp_before(store, time(NULL), NULL);
 
     DIR *d = opendir(dir);
     if (!d) return set_error_errno(ERR_IO, "reindex: cannot open %s", dir);
