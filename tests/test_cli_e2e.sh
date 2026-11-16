@@ -1411,7 +1411,8 @@ damage_beyond_parity() {  # damage_beyond_parity <sample> <pack>
 
 # The failure path is the job manager's: it marks the job failed and then
 # composes the alert, and the line it logs for it is the evidence. That line
-# follows the state the client returned on, so it is waited for. With no
+# follows the state the client returned on, so it is waited for, up to 10 s
+# (the coverage build is slow enough to need it). With no
 # Pushover credentials here it must say the alert was not sent (NIT-11).
 alerted() {  # alerted <job-id>
     local _

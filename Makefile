@@ -640,7 +640,18 @@ bench-browse: $(BINS)/bench_browse
 
 # ---- Coverage ---------------------------------------------------------
 COV_DIR     := $(BUILD)/coverage
-COV_CFLAGS  := -std=c11 -pthread -Wall -Wextra -O0 -g --coverage -march=$(MARCH) \
+# -fprofile-update=atomic: the store pool, the pack workers and the job
+# manager run the same instrumented blocks on several threads at once, and
+# gcov's default counter update is a plain load-add-store. Concurrent
+# increments are lost, the arcs of a block stop adding up, and the counts
+# gcov derives from them by subtraction come out negative: "branch 1 taken
+# -1" in store_pool.c, which gcovr rejects, intermittently failing the CI
+# coverage job (FLAKE-9). With the default, eight threads in one loop kept
+# 14% of their increments. gcc picks atomic updates by itself under
+# -pthread, which the build now uses too, but the flag stays explicit so
+# coverage never depends on how the link line is spelled.
+COV_PROFILE := -fprofile-update=atomic
+COV_CFLAGS  := -std=c11 -pthread -Wall -Wextra -O0 -g --coverage $(COV_PROFILE) -march=$(MARCH) \
                -Wno-unused-result -Wno-format-truncation $(SRC_INCLUDES) \
                $(VERSION_DEF) $(CUTILS_VERSION_DEF)
 COV_LDFLAGS := --coverage $(LDFLAGS)
@@ -672,7 +683,7 @@ $(COV_DIR)/%.o: $(SRC)/%.c | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) -c $< -o $@
 
 $(COV_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(COV_DIR)
-	$(CC) -std=c11 -pthread -O0 -g --coverage $(SRC_INCLUDES) -c $< -o $@
+	$(CC) -std=c11 -pthread -O0 -g --coverage $(COV_PROFILE) $(SRC_INCLUDES) -c $< -o $@
 
 $(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) $(TEST_DIR_STAMP) | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(COV_LDFLAGS) -lcmocka
@@ -720,6 +731,21 @@ COV_STORE_MIN := 78
 COV_TEST_TIMEOUT := 300
 COV_E2E_TIMEOUT  := 900
 
+# gcovr rejects any count over 2^32 as "suspicious", a guard against gcc bug
+# 68080: racing non-atomic counter updates in threaded code produced bogus
+# counts. COV_PROFILE makes the updates atomic, so the counts are real, and
+# one is legitimately far past 2^32: with no AVX2 (CI builds x86-64-v2),
+# rs_decode's scalar syndrome loop calls gf_mul about 31 billion times in a
+# coverage run. The racy counters used to lose most of those increments,
+# which is the only reason CI stayed under the line. 2^40 still catches a
+# counter that wrapped or was garbage, which reads near 2^64.
+#
+# The check and its flag arrived in gcovr 8; Debian trixie ships 7.2, which
+# has neither and refuses the unknown flag, so pass it only when the
+# installed gcovr knows it.
+GCOVR_FLAGS := $(shell gcovr --help 2>/dev/null | grep -q -- --gcov-suspicious-hits-threshold \
+                 && echo --gcov-suspicious-hits-threshold 1099511627776)
+
 # The whole-repo summary prints last, on purpose. GitLab's coverage regex keeps
 # the last "lines:" in the log, and printing the store gate second made every
 # pipeline report src/store as the project figure. The HTML report is still
@@ -741,12 +767,12 @@ coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI)
 	run test_api_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_api_e2e.sh $(COV_DAEMON); \
 	run test_cli_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI); \
 	if [ $$over -ne 0 ]; then echo "coverage: a suite went over its scratch budget" >&2; exit 1; fi
-	@gcovr -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html
+	@gcovr $(GCOVR_FLAGS) -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="
-	@gcovr -r $(SRC) $(COV_DIR) --filter 'src/store/.*' \
+	@gcovr $(GCOVR_FLAGS) -r $(SRC) $(COV_DIR) --filter 'src/store/.*' \
 	    --fail-under-line $(COV_STORE_MIN) -s
 	@echo "=== whole repo (min $(COV_MIN)% lines) ==="
-	@gcovr -r $(SRC) $(COV_DIR) --txt $(COV_DIR)/coverage.txt \
+	@gcovr $(GCOVR_FLAGS) -r $(SRC) $(COV_DIR) --txt $(COV_DIR)/coverage.txt \
 	    --fail-under-line $(COV_MIN) -s
 	@echo "Coverage report: $(COV_DIR)/coverage.html"
 
