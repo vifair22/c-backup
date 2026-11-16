@@ -206,7 +206,7 @@ makes the finding `split`.
 | `covered-crash` / `covered-quiesced` | none required. Optional, with its reason: a logical dump for PostgreSQL, MySQL and MongoDB when the image pins a version that will change (portability), shown as "optional" |
 | `engine-unsafe` | MySQL with MyISAM/Aria tables: `mariadb-dump`. Elasticsearch/OpenSearch: exclude and rebuild if the index is derived, otherwise configure the snapshot API (documented steps) |
 | `split` | group the units (one capture) or `pause: always`; failing that, the engine's dump |
-| `uncovered` | the engine method from section 9 for file sources; for containers, the reason the capture is live (a fallback mount) and the dump template |
+| `uncovered` | for file sources, source snapshot mode where the filesystem allows it (9.4), else the engine method (9.2); for containers, the reason the capture is live (a fallback mount) and the dump template |
 
 ## 7. Suggesting and enabling
 
@@ -239,7 +239,8 @@ CREATE TABLE db_findings (
     evidence     TEXT NOT NULL,       -- JSON: files, processes, open files, markers
     first_seen   INTEGER NOT NULL,
     last_seen    INTEGER NOT NULL,
-    last_snap_id INTEGER
+    last_snap_id INTEGER,
+    alerted_at   INTEGER              -- the one alert for this uncovered spell
 );
 ```
 
@@ -275,13 +276,20 @@ Dumps are uncompressed by design (`-Z0`, no `--gzip`): c-backup compresses
 with its per-chunk probe, and compressed dumps defeat what little dedup a
 dump allows.
 
-The helper's policy enables templates by category (`[db] allow_templates =
-pg-dumpall, mariadb-dump, ...`). The shipped policy allows the read-only
-dump and probe templates; templates that change application state
-(`nextcloud-maintenance`, `redis-bgsave`) are commented out until the
-operator allows them. Enabling a suggestion therefore never requires
-editing the policy for an allowed template, and the policy keeps the final
-say for the rest.
+The helper's policy enables templates by name (`[db] allow_templates =
+pg-dumpall, mariadb-dump, ...`). **Decided:** the shipped policy allows only
+templates that write nothing inside the application's data: the stdout
+dumps (`pg-dumpall`, `pg-dump`, `pg-basebackup`, `mariadb-dump`,
+`redis-rdb`, `mongodump`, and `sqlite-backup` and `influx2-backup`, whose
+temporary files are in the container's own `/tmp`, not in its data) and
+every template's probe. Templates that write into the application's data
+or change its state are **opt-in per host** in the helper policy, where
+they ship commented out: `redis-bgsave` (rewrites `dump.rdb`),
+`prometheus-snapshot` (writes `snapshots/` in the TSDB directory) and
+`nextcloud-maintenance` (rewrites `config.php`). Until a host's policy
+allows one, its suggestion shows the policy line to add instead of an
+Enable button. Enabling an allowed template never requires editing the
+policy, and the policy keeps the final say for the rest.
 
 ### 7.3 The flow
 
@@ -300,9 +308,15 @@ flowchart LR
 ```
 
 - **Result.** Each job's result has a `databases` section; a new `live`
-  finding or a change in coverage also writes a journal entry. An
-  `uncovered` finding raises a notification when
-  `db_detect.notify_uncovered` is on (default 1).
+  finding or a change in coverage also writes a journal entry.
+  **Decided:** an `uncovered` live finding alerts **once**, when it is
+  first detected (Pushover, `db_detect.notify_uncovered`, default 1). After
+  that it is not re-alerted on every backup: it stays visible in the UI
+  (an "uncovered" badge on the unit or source and in the repository-wide
+  list) and in each job result and journal, until it is fixed (its coverage
+  changes) or dismissed. A finding that becomes uncovered again after being
+  fixed counts as new and alerts once more. `db_findings` records
+  `alerted_at` for this.
 - **UI card**, per finding: engine and version, path, confidence with its
   evidence, coverage in words ("captured by one atomic ZFS snapshot with
   the rest of Immich: restores like a power cut; PostgreSQL recovers"), the
@@ -371,11 +385,12 @@ Detection depends on the provider work and nothing depends on detection:
 | D1 | `units.probe` liveness, UI cards and the findings API | C2 |
 | D2 | Template catalog, `db.probe`, preview/enable/dismiss | C3 |
 | D3 | File-source engine copies (SQLite through the daemon's own library, 9.2), `.cbackup-captures/`, OWN-45 messages | D0 |
-| D4 | Source snapshot mode for plain file sources on ZFS/btrfs (9.4) | C2 |
+| D4 | Source snapshot mode for plain file sources on ZFS/btrfs (9.4): `capture.begin_paths` in the helper, path remapping and the file cache rule from the TREE item, per-source opt-in | C2 and C4 (the helper's ZFS and btrfs machinery) |
 
-D0 to D2 are what the user asked for in place of the Immich decision. D3
-and D4 can follow, since they need only the `.cbackup-captures`
-reservation now.
+**Decided:** the design is approved, and D0 to D4 are all 1.0, built in
+that order after the provider slices (V0 to V3, C1 to C6). D0 to D2
+replace the per-application Immich decision; D4 reuses the helper's
+snapshot machinery rather than adding any of its own.
 
 Detector module sketch (`src/ops/db_detect.h`):
 
@@ -461,12 +476,30 @@ the copy's path. Readers that do not know it see ordinary files.
 
 ### 9.4 Source snapshot mode (D4)
 
-A plain file source on ZFS or btrfs could be read from a snapshot exactly
-as a container's mounts are, through the helper's capture operations with
-paths instead of units (`capture.begin_paths`, validated against the policy's
-domains). Every database in it is then `covered-crash` without any engine
-copy, and OWN-45 has nothing left to flag. Recorded here because detection
-is what will show users where it matters; it is a separate change.
+**Decided: in 1.0**, built after the provider slices on the helper's ZFS
+and btrfs machinery. A plain file source on ZFS or btrfs is read from a
+snapshot exactly as a container's mounts are:
+
+- **Opt-in per source** (`sources set ... --snapshot`, or a per-source flag
+  in the API), suggested by detection wherever a file source holds a live
+  database on a snapshot-capable filesystem. No pause: there is no unit to
+  pause, and one atomic snapshot per pool is already crash-consistent for
+  everything in it (`container-backup.md` 6.4).
+- **Helper:** `capture.begin_paths {paths}` (added to `source-providers.md`
+  11.3). The helper resolves each path to its snapshot domain itself,
+  checks the domains against the policy's `zfs_domains`/`btrfs_domains`,
+  takes one atomic snapshot per pool, and returns read roots;
+  `capture.end` destroys them. Same names, ownership proofs, intents,
+  watchdog, leases and sweep as unit captures.
+- **Daemon:** each source is scanned from its read root and recorded at
+  its own path (the TREE item's `(read_root, record_root)` pair), with the
+  file cache's device check relaxed as for container snapshots, so
+  incrementals still skip unchanged files.
+- **A source not on ZFS or btrfs**, or outside the policy's domains, is
+  read live as today, and the job result says so for that source.
+
+Every database in a snapshot-read source is then `covered-crash` without
+any engine copy, and OWN-45 has nothing left to flag there.
 
 ### 9.5 The flag explains, and restore prefers the engine copy
 
@@ -483,10 +516,9 @@ notice):
 Settle's behaviour with an engine copy enabled: the raw file is read
 **once** and not re-read when it moves (the re-read exists to obtain a
 consistent version, which the engine copy now provides), and it is still
-flagged if it moved. The raw copy is kept by default (backup does not
-drop what was there); `raw: skip` per finding leaves it out and keeps only
-the engine copy, for databases large enough that storing a torn copy too is
-waste.
+flagged if it moved. **Decided: both are kept**, always: the raw file as
+read (flagged if it moved) and the engine copy. Backup drops nothing it
+read, and there is no option to skip the raw copy.
 
 Restore: a whole-snapshot or subtree restore restores the raw files, as
 stored, and lists each flagged database that has an engine copy, with the
@@ -621,7 +653,7 @@ reporting is read-only; enabling anything on them waits for the user.
 |---|---|---|
 | `db_detect.enabled` | `1` | Run detectors during backups (reporting only) |
 | `db_detect.sqlite_min_kb` | `1024` | Smallest dormant SQLite file listed as a finding |
-| `db_detect.notify_uncovered` | `1` | Pushover alert for a live database captured `uncovered` |
+| `db_detect.notify_uncovered` | `1` | One Pushover alert when a live database is first found captured `uncovered` (7.3) |
 
 | Metric | Type | Labels |
 |---|---|---|
@@ -639,14 +671,14 @@ for, coverage levels, methods per engine with the trade-offs of section 6,
 enabling a suggestion, file-source engine copies and OWN-45 flags, restoring
 dumps per engine, VM guidance with fsfreeze hook scripts.
 
-## 13. Open questions
+## 13. Decisions
 
-1. `db_detect.notify_uncovered` on by default (proposed), or job-result
-   only?
-2. For file sources, the raw copy of a database with a successful engine
-   copy: keep by default (proposed, backup drops nothing) or skip by default
-   to save space?
-3. Which templates the shipped helper policy allows by default: the
-   read-only dumps and probes (proposed), with state-changing ones commented
-   out?
-4. Source snapshot mode for plain file sources (9.4): in 1.0 or after?
+The design is approved (user, 2026-11-16), to be built in phases D0 to D4
+after the provider work. Decided:
+
+| Question | Decision |
+|---|---|
+| Alerting for an uncovered live database | One alert, on first detection. After that the finding shows in the UI, job results and journal until it is fixed or dismissed; becoming uncovered again after a fix alerts once more (7.3) |
+| Raw copy alongside an engine copy | Keep both: the raw file as read, flagged if it moved, and the engine copy. No option to skip the raw copy (9.5) |
+| Templates allowed by default | Only those that write nothing inside the application's data (the stdout dumps). Anything that writes into the application's data or changes its state (`redis-bgsave`, `prometheus-snapshot`, `nextcloud-maintenance`) is opt-in per host in the helper policy (7.2) |
+| Source snapshot mode for plain file sources | In 1.0, phase D4, on the helper's ZFS/btrfs machinery after the provider slices (9.4) |

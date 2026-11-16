@@ -827,6 +827,7 @@ snapshot name, raw XML for libvirt, or a raw create body for Docker.
 | `units.list` | `provider` enum | enumerate, filtered by the policy's unit allowlist |
 | `units.describe` | `unit` unit key | inspect / domain XML / LXC config, templates and compose files, read by the helper and returned as data |
 | `capture.begin` | `units` 1 to 32 unit keys; `pause` bool | resolves every included mount itself, computes snapshot domains itself and intersects them with the policy's domains; pauses or freezes members if asked, `syncfs`, one atomic snapshot per pool with names it generates, unpauses; returns an opaque capture token, the read root of each mount, timings and per-member outcomes. Holds a lease with a deadline |
+| `capture.begin_paths` | `paths` 1 to 64 absolute paths | source snapshot mode for plain file sources (`db-detection.md` 9.4): resolves each path to its snapshot domain itself, checks the domains against the policy, takes one atomic snapshot per pool with names it generates, no pause; returns a capture token and a read root per path. Same lease, expiry and sweep as `capture.begin` |
 | `capture.end` | `capture` token | destroys that capture's snapshots |
 | `hook.run` | `unit` unit key; `hook` name | runs the named hook from the policy, inside the unit's container (`container-backup.md` 6.6); returns a run token and, for a dump, a pipe fd |
 | `hook.wait` | `run` token | exit status, timed-out flag, log (capped) |
@@ -1073,8 +1074,13 @@ Decided by the user (2026-11-16):
 
 The provider-specific decisions are listed in `vm-backup.md` section 13
 and `container-backup.md` section 16. Database detection, which replaces
-per-application hook decisions such as the Immich dump, is designed in
-`db-detection.md`.
+per-application hook decisions such as the Immich dump, is designed and
+approved in `db-detection.md` (decisions in its section 13), to be built in
+phases D0 to D4 after the provider work. Two of its decisions bear on the
+helper: only templates that write nothing inside an application's data are
+allowed by default (the rest are opt-in per host in the policy), and source
+snapshot mode for plain file sources is 1.0, through `capture.begin_paths`
+(11.3).
 
 Not yet asked, with the proposals standing:
 
