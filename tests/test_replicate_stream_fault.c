@@ -42,6 +42,7 @@
 
 #include <cmocka.h>
 #include <cutils/db.h>
+#include <openssl/sha.h>
 
 #include "backup.h"
 #include "fault_inject.h"
@@ -642,6 +643,10 @@ static void big_pack_cb(uint32_t num, void *v)
  * tag cannot verify until the last chunk, by which time most of the entry
  * is in the staged pack. It must come back out, the run must fail naming
  * the snapshot and the object, and the destination must hold no record.
+ *
+ * The damage is 4 KiB, past what parity can rebuild: the stored read now
+ * corrects anything parity covers before it is sent, so a single flipped
+ * byte would arrive repaired and authenticate.
  */
 static void test_source_that_fails_authentication_mid_stream(void **state)
 {
@@ -658,11 +663,11 @@ static void test_source_that_fails_authentication_mid_stream(void **state)
     assert_int_equal(pack_dat_path_resolve(path, sizeof(path), TEST_REPO, b.pack), 0);
     int fd = open(path, O_RDWR);
     assert_true(fd >= 0);
-    uint8_t byte = 0;
+    uint8_t junk[4096];
     off_t at = (off_t)(b.off + b.len / 2);
-    assert_int_equal(pread(fd, &byte, 1, at), 1);
-    byte ^= 0x5a;
-    assert_int_equal(pwrite(fd, &byte, 1, at), 1);
+    assert_int_equal(pread(fd, junk, sizeof(junk), at), (ssize_t)sizeof(junk));
+    for (size_t i = 0; i < sizeof(junk); i++) junk[i] ^= 0x5a;
+    assert_int_equal(pwrite(fd, junk, sizeof(junk), at), (ssize_t)sizeof(junk));
     close(fd);
 
     replicate_result_t rr;
@@ -813,9 +818,189 @@ static void test_stored_writer_that_cannot_cut_installs_nothing(void **state)
     assert_true(tmp_is_empty(TEST_REPO));
 }
 
+/* ------------------------------------------------------------------ */
+/* Damage at the source (OWN-24/OWN-23 on the streaming read)           */
+/* ------------------------------------------------------------------ */
+
+/* The content hash of a source file, which is its object's name. */
+static void file_hash(const char *path, uint8_t out[OBJECT_HASH_SIZE])
+{
+    uint8_t *buf = malloc(BIG_BYTES);
+    assert_non_null(buf);
+    int fd = open(path, O_RDONLY);
+    assert_true(fd >= 0);
+    assert_int_equal(read(fd, buf, BIG_BYTES), (ssize_t)BIG_BYTES);
+    close(fd);
+    SHA256(buf, BIG_BYTES, out);
+    free(buf);
+}
+
+/* Damage n bytes of a packed entry's stored payload at off. */
+static void damage_packed(const uint8_t hash[OBJECT_HASH_SIZE], uint64_t off, size_t n)
+{
+    uint32_t pnum = 0;
+    uint64_t at = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &pnum, &at), OK);
+    char dat[512];
+    assert_int_equal(pack_dat_path_resolve(dat, sizeof(dat), TEST_REPO, pnum), 0);
+    int fd = open(dat, O_RDWR);
+    assert_true(fd >= 0);
+    off_t p = (off_t)(at + sizeof(pack_dat_entry_hdr_t) + off);
+    uint8_t b[512];
+    assert_true(n <= sizeof(b));
+    assert_int_equal(pread(fd, b, n, p), (ssize_t)n);
+    for (size_t i = 0; i < n; i++) b[i] ^= 0x3C;
+    assert_int_equal(pwrite(fd, b, n, p), (ssize_t)n);
+    close(fd);
+    pack_cache_invalidate(store);
+}
+
+/*
+ * Damage the source's packed entries within parity, then replicate. The
+ * target computes fresh parity over whatever it is sent, so damage shipped
+ * as it stood would verify clean there and restore wrong. The streaming
+ * read corrects it instead, in the same bounded memory, and the replica
+ * verifies clean (its parity covers the corrected bytes, not the damage)
+ * and restores byte for byte.
+ */
+static void test_damaged_packed_source_replicates_corrected(void **state)
+{
+    (void)state;
+    big_snapshot();
+    uint8_t hr[OBJECT_HASH_SIZE], hh[OBJECT_HASH_SIZE];
+    file_hash(TEST_SRC "/random.bin", hr);
+    file_hash(TEST_SRC "/half.bin", hh);
+    damage_packed(hr, 7u * 1024u * 1024u + 3u, 1);
+    damage_packed(hr, 9u * 1024u * 1024u, 512);
+    damage_packed(hh, 2u * 1024u * 1024u + 11u, 300);
+
+    parity_stats_reset();
+    fault_malloc_peak = 0;
+    replicate_result_t rr;
+    assert_int_equal(replicate_plain(&rr), OK);
+    size_t peak = fault_malloc_peak;
+    assert_int_equal(rr.snapshots_sent, 1);
+    assert_true(peak <= MEM_BOUND);
+    assert_true(parity_stats_get().repaired >= 2);
+    assert_int_equal((int)parity_stats_get().uncorrectable, 0);
+
+    assert_int_equal(verify_and_restore(TEST_REPL, NULL, 0, 1), 1);
+}
+
+/* The loose half of the reader: a damaged loose object arrives corrected,
+ * and the transfer is still held to the chunk. */
+static void test_damaged_loose_source_replicates_corrected(void **state)
+{
+    (void)state;
+    uint8_t *body = malloc(BIG_BYTES);
+    assert_non_null(body);
+    fill_random(body, BIG_BYTES, 31);
+    uint8_t blob[OBJECT_HASH_SIZE], root[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, body, BIG_BYTES, blob), OK);
+    assert_true(is_loose(TEST_REPO, blob));
+    manifest_entry_t e[1] = { mk_file("loose.bin", blob, BIG_BYTES) };
+    assert_int_equal(manifest_write_tree(store, e, 1, root), OK);
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    for (int i = 0; i < OBJECT_HASH_SIZE; i++) snprintf(hex + i * 2, 3, "%02x", blob[i]);
+    char p[512];
+    snprintf(p, sizeof(p), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
+    int fd = open(p, O_RDWR);
+    assert_true(fd >= 0);
+    uint8_t b = 0;
+    off_t at = (off_t)sizeof(object_header_t) + 5 * 1024 * 1024 + 17;
+    assert_int_equal(pread(fd, &b, 1, at), 1);
+    b ^= 0x81;
+    assert_int_equal(pwrite(fd, &b, 1, at), 1);
+    close(fd);
+
+    replica_sink_t sink;
+    assert_int_equal(replica_sink_local_open(TEST_REPL, &marker, &sink), OK);
+    parity_stats_reset();
+    fault_malloc_peak = 0;
+    replicate_result_t rr;
+    status_t st = replicate_tree(store, &sink, root, NULL, &rr);
+    size_t peak = fault_malloc_peak;
+    sink.v->close(sink.ctx);
+    assert_int_equal(st, OK);
+    assert_true(peak <= CHUNK);
+    assert_true(parity_stats_get().repaired > 0);
+
+    replica_reader_t *rd = NULL;
+    assert_int_equal(replica_reader_open(TEST_REPL, &rd), OK);
+    void *got = NULL;
+    size_t len = 0;
+    parity_stats_reset();
+    assert_int_equal(object_load(replica_reader_store(rd), blob, &got, &len, NULL), OK);
+    assert_int_equal(len, BIG_BYTES);
+    assert_memory_equal(got, body, BIG_BYTES);
+    assert_int_equal((int)parity_stats_get().repaired, 0);
+    free(got);
+    replica_reader_close(rd);
+    free(body);
+}
+
+/* Damage 4 KiB of a packed entry: eight times the burst parity rebuilds. */
+static void damage_packed_beyond(const uint8_t hash[OBJECT_HASH_SIZE], uint64_t off)
+{
+    for (int k = 0; k < 8; k++) damage_packed(hash, off + (uint64_t)k * 512u, 512);
+}
+
+static int replica_loads(const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    replica_reader_t *rd = NULL;
+    assert_int_equal(replica_reader_open(TEST_REPL, &rd), OK);
+    int nul = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    assert_true(nul >= 0);
+    status_t st = object_load_stream(replica_reader_store(rd), hash, nul, NULL, NULL);
+    close(nul);
+    err_clear();
+    replica_reader_close(rd);
+    return st == OK;
+}
+
+/*
+ * OWN-31: an object damaged beyond parity is sent, everything else goes
+ * across and the snapshot is recorded, and then the run FAILS, naming the
+ * count and listing the object with its snapshot. Reporting OK would be a
+ * replica silently taking bad data (OWN-11).
+ */
+static void test_damage_beyond_parity_fails_the_run_and_lists_it(void **state)
+{
+    (void)state;
+    big_snapshot();
+    uint8_t hr[OBJECT_HASH_SIZE], hh[OBJECT_HASH_SIZE];
+    file_hash(TEST_SRC "/random.bin", hr);
+    file_hash(TEST_SRC "/half.bin", hh);
+    damage_packed_beyond(hr, 6u * 1024u * 1024u);
+
+    replicate_result_t rr;
+    assert_int_equal(replicate_plain(&rr), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), "replicated with 1 object(s) damaged beyond parity; "
+                                      "the replica holds them as damaged"));
+    err_clear();
+
+    assert_int_equal(rr.snapshots_sent, 1);
+    assert_true(record_exists(TEST_REPL, 1));
+    assert_int_equal(rr.objects_damaged, 1);
+    assert_int_equal(rr.damaged_listed, 1);
+    assert_memory_equal(rr.damaged[0].hash, hr, OBJECT_HASH_SIZE);
+    assert_int_equal(rr.damaged[0].snapshot_id, 1);
+
+    /* The rest arrived intact; the damaged one is held, and reads as damaged. */
+    assert_true(replica_loads(hh));
+    assert_false(replica_loads(hr));
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_damage_beyond_parity_fails_the_run_and_lists_it,
+                                        setup_plain, teardown),
+        cmocka_unit_test_setup_teardown(test_damaged_packed_source_replicates_corrected,
+                                        setup_plain, teardown),
+        cmocka_unit_test_setup_teardown(test_damaged_loose_source_replicates_corrected,
+                                        setup_plain, teardown),
         cmocka_unit_test_setup_teardown(test_large_packed_objects_stream_in_bounded_memory,
                                         setup_plain, teardown),
         cmocka_unit_test_setup_teardown(test_large_loose_object_streams_in_bounded_memory,

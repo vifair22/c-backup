@@ -1120,7 +1120,10 @@ sudo c-backup verify list 1                # past runs
 A deep verify repairs what it finds by default: every object carries
 Reed-Solomon parity, and having already read the damaged bytes, writing the
 correction costs almost nothing more. With `--no-repair` it still tells
-recoverable damage from loss for small objects, applying parity in memory.
+recoverable damage from loss, applying parity in memory. Both work at any
+object size, loose or packed and whatever the codec: parity is read and
+applied one group window at a time (about 16 MiB of data and 1 MiB of
+parity), never loaded whole.
 
 `--dry-run` is exactly `--no-repair`, and wins over anything else on the
 command line. It changes one thing: repair is off, so nothing in the
@@ -1134,8 +1137,8 @@ nothing to repair. The differences show only when there is damage:
 |---|---|---|
 | Level | deep | deep (or what `--level` says) |
 | Reads | every payload | every payload |
-| Damage within parity, object up to 16 MiB | corrected on disk, counted `repaired` | corrected in memory only, counted `recoverable`; the disk stays wrong |
-| Damage within parity, larger object | corrected on disk, counted `repaired` | reported damaged, with a note to run a repairing verify: streaming it through parity would mean writing |
+| Damage within parity, any size | corrected on disk, counted `repaired` | corrected in memory only, counted `recoverable`; the disk stays wrong |
+| Damage beyond parity | nothing written, counted `unrecoverable` | counted `unrecoverable` |
 | Lock | write | read |
 | Job `result` | `"repair":true,"dry_run":false` | `"repair":false`, and `"dry_run":true` for `--dry-run` |
 
@@ -1223,6 +1226,14 @@ would do:
 would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
 does not do; `tmp_files_removed` counts staging files an interrupted run left
 behind (section 2.2). The journal entry carries the same in a line.
+
+Compaction copies entries into packs whose parity is computed afresh, so it
+corrects each entry from its old parity on the way. An entry damaged beyond
+parity is copied as it is and compaction finishes, then the job **fails**
+with `gc: N pack entr(ies) damaged beyond parity were copied as damaged`,
+the alert goes out and `c-backup gc` exits 1. The result adds
+`pack_entries_damaged`, `damaged` (the first 100 hashes) and
+`damaged_listed`.
 
 **Compaction rewrites a pack without its dead entries, split at 256 MiB.**
 A pack holding any entry no snapshot names is copied, live entries only,
@@ -1438,6 +1449,17 @@ The job's `result` says what moved: `snapshots_sent`, `snapshots_skipped`
 `subtrees_skipped` and `reencrypted`. A run with nothing to send reports
 zeros and journals `target already up to date`, so a no-op and a full copy
 are told apart at a glance.
+
+Damage is corrected from parity before it is sent: the target computes
+fresh parity over what it receives, so damage sent as it stood could never
+be corrected there. An object damaged beyond parity is still sent, and the
+run carries on and records its snapshots, so one lost object does not stop
+replication for good. The job then **fails** with `replicated with N
+object(s) damaged beyond parity; the replica holds them as damaged`, the
+failure alert goes out, and `c-backup replicate` exits 1. The result adds
+`objects_damaged` and `damaged`, the first 100 as `{"hash","snapshot"}`,
+with `damaged_listed` saying how many are listed. Each is lost at the source
+too; `verify` names the files.
 
 The target is a path. Replicating to another machine means mounting it (NFS,
 SMB, sshfs) or running a daemon there and replicating locally on that side.

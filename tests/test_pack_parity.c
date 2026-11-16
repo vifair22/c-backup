@@ -317,13 +317,13 @@ static void test_frame_codec_entry_reads_clean(void **state)
 }
 
 /*
- * The frame codec is detection-only by design: repairing it would mean
- * buffering the whole compressed payload, which is exactly what streaming
- * exists to avoid for a payload that may not fit in RAM. So corruption must
- * surface as an error rather than as repaired-looking output, and it must be
- * counted as uncorrectable rather than as a repair.
+ * The frame codec used to be detection-only, on the grounds that repairing
+ * it meant buffering the whole compressed payload. It does not: parity is
+ * per group and the decompressor takes its input in any pieces, so the
+ * stream is corrected a window at a time (OWN-24/OWN-23), and a flipped byte
+ * now reads back as the original, counted as a repair.
  */
-static void test_frame_codec_corruption_is_detected_not_repaired(void **state)
+static void test_frame_codec_corruption_is_repaired(void **state)
 {
     (void)state;
     uint8_t *data = malloc(FRAME_SIZE);
@@ -335,6 +335,44 @@ static void test_frame_codec_corruption_is_detected_not_repaired(void **state)
     assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
 
     flip_pack_byte((off_t)(entry_offset(hash) + sizeof(pack_dat_entry_hdr_t) + 128));
+
+    parity_stats_reset();
+    assert_stream_read_matches(hash, data, FRAME_SIZE);
+    assert_true(parity_stats_get().repaired > 0);
+    assert_int_equal((int)parity_stats_get().uncorrectable, 0);
+    free(data);
+}
+
+/*
+ * Damage past what parity can carry must still surface as an error rather
+ * than as plausible output, and must be counted as uncorrectable rather than
+ * as a repair: nothing was fixed.
+ */
+static void test_frame_codec_damage_beyond_parity_is_not_repaired(void **state)
+{
+    (void)state;
+    uint8_t *data = malloc(FRAME_SIZE);
+    assert_non_null(data);
+    fill_compressible(data, FRAME_SIZE);
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, FRAME_SIZE, hash), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+
+    /* 2 KiB of junk in one group: four times the 512-byte burst it covers. */
+    {
+        char path[512];
+        assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+        int dfd = open(path, O_RDWR);
+        assert_true(dfd >= 0);
+        uint8_t junk[2048];
+        memset(junk, 0xA7, sizeof(junk));
+        assert_int_equal(pwrite(dfd, junk, sizeof(junk),
+                                (off_t)(entry_offset(hash) + sizeof(pack_dat_entry_hdr_t) + 4096)),
+                         (ssize_t)sizeof(junk));
+        close(dfd);
+        pack_cache_invalidate(store);
+    }
 
     char out[] = "/tmp/c_backup_pack_parity_frame.XXXXXX";
     int fd = mkstemp(out);
@@ -349,6 +387,10 @@ static void test_frame_codec_corruption_is_detected_not_repaired(void **state)
 
     /* Nothing was fixed, so nothing may be counted as fixed. */
     assert_int_equal((int)parity_stats_get().repaired, 0);
+    assert_true(parity_stats_get().uncorrectable > 0);
+
+    /* And a repair refuses to write what it cannot prove. */
+    assert_int_equal(pack_object_repair(store, hash), -1);
     free(data);
 }
 
@@ -534,7 +576,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_entry_header_corruption_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repair_persists_and_is_idempotent, setup, teardown),
         cmocka_unit_test_setup_teardown(test_frame_codec_entry_reads_clean, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_frame_codec_corruption_is_detected_not_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_frame_codec_corruption_is_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_frame_codec_damage_beyond_parity_is_not_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_absurd_entry_count_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_entry_header_beyond_file_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_stored_writer_refuses_what_no_reader_opens, setup, teardown),
