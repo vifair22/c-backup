@@ -161,7 +161,10 @@ static void test_one_baseline_migration(void **state)
     /* Units (source-providers.md), the first migration after it. */
     assert_non_null(app_migrations[1].name);
     assert_string_equal(app_migrations[1].name, "002_units.sql");
-    assert_null(app_migrations[2].name);
+    /* NBD exports of unit disks (vm-backup.md 7.3). */
+    assert_non_null(app_migrations[2].name);
+    assert_string_equal(app_migrations[2].name, "003_exports.sql");
+    assert_null(app_migrations[3].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */

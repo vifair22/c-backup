@@ -449,13 +449,17 @@ int main(int argc, char *argv[])
         }
     }
     routes_schedules_init(db, sched);
+    routes_exports_init(db, config_get_str(cfg, "vm.export_dir"),
+                        (unsigned)config_get_int(cfg, "vm.export_ttl_s", 14400),
+                        (unsigned)config_get_int(cfg, "vm.export_idle_s", 1800));
     if (routes_register_health(srv, db) != 0 ||
         routes_register_auth(srv, db) != 0 ||
         routes_register_repos(srv, db) != 0 ||
         routes_register_jobs(srv, db, jm) != 0 ||
         routes_register_metrics(srv, db) != 0 ||
         routes_register_stream(srv, db) != 0 ||
-        routes_register_providers(srv) != 0) {
+        routes_register_providers(srv) != 0 ||
+        routes_register_exports(srv) != 0) {
         log_error("cannot register routes");
         api_server_stop(srv);
         repo_purge_stop();
@@ -510,6 +514,7 @@ int main(int argc, char *argv[])
     while (atomic_load(&running)) {
         struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
         nanosleep(&req, NULL);
+        exports_tick();
     }
 
     /*
@@ -523,6 +528,9 @@ int main(int argc, char *argv[])
     if (sd_notify_state("STOPPING=1") != OK)
         log_warn("cannot notify the service manager: %s", err_msg());
     api_server_stop(srv);
+    /* No route can open one now; close every export while the database
+     * is there to record it. */
+    exports_shutdown();
     if (sched) scheduler_stop(sched);
     job_manager_stop(jm);
     /* After the jobs: none is in a session any more. */

@@ -511,6 +511,21 @@ read-only (container-backup and vm-backup 9.2).
 - `<hostdev>` and `<filesystem>` devices need `allow_privileged_define`;
   `--start` starts the domain only after its state is installed.
 
+**File-level recovery** needs no helper: the daemon serves a snapshot's
+disk itself as a read-only NBD export (vm-backup.md 7.3, `docs/api.md`):
+
+```sh
+c-backup vm export 1 4127 vda --ttl 4h
+# {"export_id":9,"socket":"/run/c-backupd/exports/9.sock","name":"8f1c...",...}
+qemu-nbd --read-only -c /dev/nbd0 --image-opts \
+  driver=nbd,server.type=unix,server.path=/run/c-backupd/exports/9.sock,export=8f1c...
+mount -o ro,noload /dev/nbd0p1 /mnt/recover   # xfs: ro,norecovery
+c-backup vm unexport 9
+```
+
+`vm.export_dir` must be the same path on the host and in a container.
+The export pins its snapshot and defers gc until it closes.
+
 The NVRAM and TPM state are staged by the daemon under `staging_root`
 (writable by the daemon), and disk staging sits in
 `<image directory>/.cbackup-restore/`, which the daemon needs writable for

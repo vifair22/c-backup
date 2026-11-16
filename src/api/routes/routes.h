@@ -193,6 +193,15 @@ api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id);
 api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id);
 api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id);
 
+/* NBD exports of a unit disk (src/api/routes/exports.c, vm-backup.md 7.3).
+ * init closes rows a previous run left open; tick, from the daemon's main
+ * loop, ends expired and idle exports; shutdown ends every one. */
+void           routes_exports_init(cutils_db_t *db, const char *dir, unsigned ttl_s, unsigned idle_s);
+int            routes_register_exports(api_server_t *srv);
+api_response_t exports_create(const api_request_t *req, int64_t repo_id, int64_t snap_id);
+void           exports_tick(void);
+void           exports_shutdown(void);
+
 /* Record an operation in a repo's journal. Best effort by design. */
 void journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
                     const char *operation, const char *result,

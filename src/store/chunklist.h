@@ -341,3 +341,22 @@ cdc_source_t content_source_iface(content_src_t *cs);
 void         content_source_close(content_src_t *cs);
 status_t content_collect(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                          uint8_t leaf_type, content_visit_fn visit, void *ctx);
+
+/*
+ * Random access to file content, for the NBD export (vm-backup.md 7.3).
+ * read() fills [off, off + len) with holes as zeroes; extents() reports
+ * the data and hole runs over a range, adjacent runs of one kind merged,
+ * stopping early when fn returns non-zero. A reader keeps up to 64 parsed
+ * lists and 4 verified leaves (up to 4 chunks, 32 MiB at the default CDC
+ * maximum) outside the read budget, and is not thread-safe: one per
+ * connection.
+ */
+typedef struct content_reader content_reader_t;
+typedef int (*content_extent_fn)(void *ctx, uint64_t off, uint64_t len, int is_hole);
+status_t content_reader_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                             content_reader_t **out, uint64_t *out_size);
+uint64_t content_reader_size(const content_reader_t *r);
+status_t content_reader_read(content_reader_t *r, uint64_t off, void *buf, size_t len);
+status_t content_reader_extents(content_reader_t *r, uint64_t off, uint64_t len,
+                                content_extent_fn fn, void *ctx);
+void     content_reader_close(content_reader_t *r);

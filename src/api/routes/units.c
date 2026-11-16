@@ -403,7 +403,8 @@ const char *units_path_allow(const char *rest)
     if (strncmp(rest, "/snapshots/", 11) == 0) {
         int64_t sid = 0;
         const char *end = NULL;
-        if (routes_path_id(rest + 11, 1, &sid, &end) == 1 && strcmp(end, "/unit/restore") == 0)
+        if (routes_path_id(rest + 11, 1, &sid, &end) == 1 &&
+            (strcmp(end, "/unit/restore") == 0 || strcmp(end, "/unit/export") == 0))
             return "POST";
     }
     return NULL;
@@ -1147,6 +1148,8 @@ api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const
         const char *end = NULL;
         if (routes_path_id(rest + 11, 1, &sid, &end) == 1 && strcmp(end, "/unit/restore") == 0)
             return unit_restore_post(req, repo_id, sid);
+        if (routes_path_id(rest + 11, 1, &sid, &end) == 1 && strcmp(end, "/unit/export") == 0)
+            return exports_create(req, repo_id, sid);
     }
     return api_error(404, "not found");
 }

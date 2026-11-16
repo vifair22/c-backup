@@ -1585,6 +1585,64 @@ static void unit_path(sbuf_t *p, const char *repo, const char *prov, const char 
     sb_puts(p, suffix);
 }
 
+/*
+ * NBD exports of a VM disk for file-level recovery (vm-backup.md 7.3). The
+ * export's name is printed once, by `vm export`; nothing shows it again.
+ */
+#define VM_USAGE "vm export <repo-id> <snapshot-id> <disk> [--ttl N[s|m|h|d]]  |  vm exports  |  vm export-show <export-id>  |  vm unexport <export-id>"
+
+/* "90", "90s", "15m", "4h", "2d" -> seconds; 0 on anything else. */
+static long ttl_seconds(const char *t)
+{
+    char *end = NULL;
+    long v = strtol(t, &end, 10);
+    if (!end || end == t || v <= 0) return 0;
+    long mul = 1;
+    if (*end == 'm') mul = 60;
+    else if (*end == 'h') mul = 3600;
+    else if (*end == 'd') mul = 86400;
+    else if (*end != 's' && *end != '\0') return 0;
+    if (*end && end[1]) return 0;
+    if (v > 604800 / mul) return 0;
+    return v * mul;
+}
+
+static int cmd_vm(int argc, char **argv)
+{
+    if (argc < 1) return fail("usage: %s", VM_USAGE);
+    const char *sub = argv[0];
+    argc--; argv++;
+    if (strcmp(sub, "export") == 0) {
+        const char *ttl = take_opt(&argc, argv, "--ttl");
+        if (argc != 3) return fail("usage: vm export <repo-id> <snapshot-id> <disk> [--ttl N[s|m|h|d]]");
+        long secs = ttl ? ttl_seconds(ttl) : 0;
+        if (ttl && (secs < 60))
+            return fail("--ttl must be 60 seconds to 7 days, as N, Ns, Nm, Nh or Nd");
+        sbuf_t b = { 0 };
+        sb_puts(&b, "{\"item\":"); sb_json_str(&b, argv[2]);
+        if (secs) { char n[32]; snprintf(n, sizeof(n), ",\"ttl_s\":%ld", secs); sb_puts(&b, n); }
+        sb_puts(&b, "}");
+        sbuf_t p = { 0 };
+        sb_puts(&p, "/repos/"); sb_path_seg(&p, argv[0]);
+        sb_puts(&p, "/snapshots/"); sb_path_seg(&p, argv[1]); sb_puts(&p, "/unit/export");
+        if (b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+        int rc = call_path_sb("POST", &p, b.buf);
+        free(b.buf);
+        return rc;
+    }
+    if (strcmp(sub, "exports") == 0) {
+        if (argc != 0) return fail("usage: vm exports");
+        return call("GET", "/exports", NULL);
+    }
+    if (strcmp(sub, "export-show") == 0 || strcmp(sub, "unexport") == 0) {
+        if (argc != 1) return fail("usage: vm %s <export-id>", sub);
+        sbuf_t p = { 0 };
+        sb_puts(&p, "/exports/"); sb_path_seg(&p, argv[0]);
+        return call_path_sb(strcmp(sub, "unexport") == 0 ? "DELETE" : "GET", &p, NULL);
+    }
+    return fail("usage: %s", VM_USAGE);
+}
+
 static int cmd_unit(int argc, char **argv)
 {
     if (argc < 1) return fail("usage: %s", UNIT_USAGE);
@@ -1877,6 +1935,7 @@ static const struct {
     { "backup",    cmd_backup,    "backup <repo-id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT] [--no-wait]" },
     { "restore",   cmd_restore,   "restore <repo-id> <snapshot-id> <dest> [--subpath PATH] [--overwrite] [--no-wait]" },
     { "unit",      cmd_unit,      UNIT_USAGE },
+    { "vm",        cmd_vm,        VM_USAGE },
     { "snapshots", cmd_snapshots, "snapshots <repo-id> [--limit N] [--offset N]" },
     { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text | --force]" },
     { "ls",        cmd_ls,        "ls <repo-id> <snapshot-id> [parent-node-id]" },

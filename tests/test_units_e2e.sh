@@ -3,8 +3,9 @@
 # Units end to end: the CLI against a real daemon with the fake provider
 # enabled by its test-only key (units.fake_spec). Covers the routes, the job,
 # units.allow, the reserved names on the file-backup routes, restore of a
-# disk as a sparse raw image, per-unit policy, the units schedule action and
-# reindex rebuilding unit history.
+# disk as a sparse raw image, the NBD export of a disk (read by QEMU where
+# installed, pinning, gc deferral, revoke, ttl, idle and restart), per-unit
+# policy, the units schedule action and reindex rebuilding unit history.
 
 set -u
 
@@ -78,12 +79,18 @@ security:
 units:
   allow: cbk-uat-*
   fake_spec: $WORK/units.json
+vm:
+  export_dir: $WORK/ex
+  export_idle_s: 1800
 EOF
 
-C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" > "$WORK/daemon.log" 2>&1 &
-DAEMON_PID=$!
-for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
-if [ ! -S "$SOCK" ]; then echo "daemon did not start"; cat "$WORK/daemon.log"; exit 1; fi
+start_daemon() {
+    C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
+    if [ ! -S "$SOCK" ]; then echo "daemon did not start"; cat "$WORK/daemon.log"; exit 1; fi
+}
+start_daemon
 
 echo "providers"
 OUT=$(cb unit providers)
@@ -139,6 +146,56 @@ if cmp -s "$WORK/vda.raw" "$WORK/out/.cbackup-unit/disks/vda"; then ok "the raw 
 check    "no partial file is left" "no" "$([ -e "$WORK/vda.raw.cbk-partial" ] && echo yes || echo no)"
 OUT=$(cb unit restore 1 1 "$WORK/vda.raw" --item vda 2>&1); RC=$?
 check    "an item never lands on an existing file" 1 "$RC"
+
+
+echo "nbd export"
+jget() { sed -n "s/.*\"$1\":\"\{0,1\}\([^\",}]*\).*/\1/p" | head -1; }
+OUT=$(cb vm export 1 1 vda)
+contains "an export opens" '"export_id"' "$OUT"
+EID=$(printf '%s' "$OUT" | jget export_id)
+ESOCK=$(printf '%s' "$OUT" | jget socket)
+ENAME=$(printf '%s' "$OUT" | jget name)
+check    "its name is 128 random bits" 32 "${#ENAME}"
+check    "its socket is the owner's alone" 600 "$(stat -c %a "$ESOCK")"
+check    "in a directory nobody else can enter" 700 "$(stat -c %a "$WORK/ex")"
+if command -v qemu-img >/dev/null 2>&1; then
+    qemu-img convert -q -f raw -O raw "nbd+unix:///$ENAME?socket=$ESOCK" "$WORK/vda.nbd" 2>"$WORK/qi.err"
+    if cmp -s "$WORK/vda.nbd" "$WORK/vda.raw"; then ok "QEMU reads the disk back byte for byte"; else bad "QEMU reads the disk back" "same bytes" "$(cat "$WORK/qi.err")"; fi
+    contains "and sees its holes" '"data": false' "$(qemu-img map --output=json "nbd+unix:///$ENAME?socket=$ESOCK" 2>&1)"
+    OUT=$(qemu-img info "nbd+unix:///wrong?socket=$ESOCK" 2>&1); RC=$?
+    check    "a wrong export name is refused" 1 "$RC"
+else
+    echo "  (qemu-img not installed: reads through QEMU not checked)"
+fi
+OUT=$(cb vm exports)
+contains "it is listed" "\"id\":$EID" "$OUT"
+lacks    "without its name" "$ENAME" "$OUT"
+OUT=$(cb snapshot delete 1 1 --force 2>&1); RC=$?
+check    "the exported snapshot cannot be deleted, even forced" 1 "$RC"
+contains "and says why" "is exported" "$OUT"
+contains "gc defers while it is open" "gc deferred" "$(cb gc 1 2>&1)"
+OUT=$(cb vm export 1 1 domain.xml 2>&1); RC=$?
+check    "only disks are exported" 1 "$RC"
+OUT=$(cb vm export 1 1 vda --ttl 10s 2>&1); RC=$?
+check    "a ttl under a minute is refused" 1 "$RC"
+OUT=$(cb vm unexport "$EID"); RC=$?
+check    "revoking it succeeds" 0 "$RC"
+check    "and removes the socket" "no" "$([ -e "$ESOCK" ] && echo yes || echo no)"
+contains "it is recorded as revoked" '"close_reason":"revoked"' "$(cb vm export-show "$EID")"
+contains "gc runs again" '"state":"completed"' "$(cb gc 1)"
+contains "the journal has it" "nbd-export" "$(cb journal 1)"
+OUT=$(cb vm export 1 1 vda --ttl 2m)
+EID2=$(printf '%s' "$OUT" | jget export_id)
+SHOW=$(cb vm export-show "$EID2")
+check    "--ttl sets its lifetime" 120 "$(( $(printf '%s' "$SHOW" | jget expires) - $(printf '%s' "$SHOW" | jget created_at) ))"
+# The idle timeout is honoured, and an export ends with the daemon.
+kill "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null
+sed -i 's/^  export_idle_s: .*/  export_idle_s: 2/' "$WORK/config.yaml"
+start_daemon
+contains "an export ends with the daemon" '"close_reason":"daemon stopped"' "$(cb vm export-show "$EID2")"
+EID3=$(cb vm export 1 1 vda | jget export_id)
+sleep 4
+contains "an export nobody uses closes when idle" '"close_reason":"idle"' "$(cb vm export-show "$EID3")"
 
 echo "reserved names"
 OUT=$(cb backup 1 /.cbackup-unit 2>&1); RC=$?

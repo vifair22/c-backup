@@ -992,3 +992,295 @@ void content_source_close(content_src_t *cs)
     chunklist_iter_close(cs->data_it);
     free(cs);
 }
+
+/* ------------------------------------------------------------------ */
+/* Random access (vm-backup.md 7.3)                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * An offset resolves to a leaf by descending the list tree: a binary search
+ * of each level's entries, at most CHUNKLIST_MAX_LEVEL + 1 lists. Parsed
+ * lists and verified leaves are kept in small LRUs, because an NBD client
+ * reads a filesystem's metadata over and over and in pieces far smaller
+ * than a chunk. Every leaf is the output of object_load, so its hash has
+ * been checked before a byte of it is copied out; the parent's promises
+ * (type, length, level) are checked on every descent, since one list
+ * object can sit under several parents.
+ */
+#define CR_LISTS 64
+#define CR_LEAVES 4
+
+typedef struct {
+    uint8_t         hash[OBJECT_HASH_SIZE];
+    uint8_t        *buf;       /* NULL: slot free */
+    chunklist_hdr_t hdr;
+    uint64_t        used;
+} cr_list_t;
+
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint8_t *data;             /* NULL: slot free */
+    uint64_t len;
+    uint64_t used;
+} cr_leaf_t;
+
+struct content_reader {
+    store_t  *store;
+    uint8_t   root[OBJECT_HASH_SIZE];
+    int       is_list;         /* 0: the content is one FILE object */
+    uint64_t  size;
+    uint64_t  tick;
+    cr_list_t lists[CR_LISTS];
+    cr_leaf_t leaves[CR_LEAVES];
+};
+
+static status_t cr_list(content_reader_t *r, const uint8_t hash[OBJECT_HASH_SIZE],
+                        const cr_list_t **out)
+{
+    cr_list_t *victim = &r->lists[0];
+    for (size_t i = 0; i < CR_LISTS; i++) {
+        cr_list_t *l = &r->lists[i];
+        if (l->buf && memcmp(l->hash, hash, OBJECT_HASH_SIZE) == 0) {
+            l->used = ++r->tick;
+            *out = l;
+            return OK;
+        }
+        if (!l->buf) victim = l;
+        else if (victim->buf && l->used < victim->used) victim = l;
+    }
+    obj_loader_t ld = obj_loader_store(r->store);
+    uint8_t *buf = NULL;
+    chunklist_hdr_t h;
+    status_t st = load_list(&ld, hash, &buf, &h);
+    if (st != OK) return st;
+    free(victim->buf);
+    victim->buf = buf;
+    victim->hdr = h;
+    memcpy(victim->hash, hash, OBJECT_HASH_SIZE);
+    victim->used = ++r->tick;
+    *out = victim;
+    return OK;
+}
+
+static status_t cr_leaf(content_reader_t *r, const uint8_t hash[OBJECT_HASH_SIZE],
+                        uint64_t length, const cr_leaf_t **out)
+{
+    cr_leaf_t *victim = &r->leaves[0];
+    for (size_t i = 0; i < CR_LEAVES; i++) {
+        cr_leaf_t *l = &r->leaves[i];
+        if (l->data && memcmp(l->hash, hash, OBJECT_HASH_SIZE) == 0 && l->len == length) {
+            l->used = ++r->tick;
+            *out = l;
+            return OK;
+        }
+        if (!l->data) victim = l;
+        else if (victim->data && l->used < victim->used) victim = l;
+    }
+    void *data = NULL;
+    size_t len = 0;
+    uint8_t type = 0;
+    status_t st = object_load(r->store, hash, &data, &len, &type);
+    if (st != OK) return st;
+    if (type != OBJECT_TYPE_FILE || (uint64_t)len != length) {
+        free(data);
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(hash, hex);
+        return set_error(ERR_CORRUPT, "chunk %s: type %u and %zu bytes, list says "
+                         "file content of %llu bytes", hex, type, len,
+                         (unsigned long long)length);
+    }
+    free(victim->data);
+    victim->data = data;
+    victim->len = len;
+    memcpy(victim->hash, hash, OBJECT_HASH_SIZE);
+    victim->used = ++r->tick;
+    *out = victim;
+    return OK;
+}
+
+status_t content_reader_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                             content_reader_t **out, uint64_t *out_size)
+{
+    *out = NULL;
+    uint64_t size = 0;
+    uint8_t type = 0;
+    status_t st = object_get_info(store, hash, &size, &type);
+    if (st != OK) return st;
+    if (type != OBJECT_TYPE_FILE && type != OBJECT_TYPE_CHUNKLIST)
+        return set_error(ERR_CORRUPT, "object is of type %u, not file content", type);
+    content_reader_t *r = calloc(1, sizeof(*r));
+    if (!r) return set_error(ERR_NOMEM, "content reader");
+    r->store = store;
+    memcpy(r->root, hash, OBJECT_HASH_SIZE);
+    r->is_list = type == OBJECT_TYPE_CHUNKLIST;
+    if (r->is_list) {
+        const cr_list_t *l = NULL;
+        st = cr_list(r, hash, &l);
+        if (st == OK && l->hdr.leaf_type != OBJECT_TYPE_FILE)
+            st = set_error(ERR_CORRUPT, "chunk list of directory fragments, not file content");
+        if (st == OK) r->size = l->hdr.total_len;
+    } else {
+        const cr_leaf_t *f = NULL;
+        st = cr_leaf(r, hash, size, &f);
+        if (st == OK) r->size = f->len;
+    }
+    if (st != OK) { content_reader_close(r); return st; }
+    *out = r;
+    if (out_size) *out_size = r->size;
+    return OK;
+}
+
+uint64_t content_reader_size(const content_reader_t *r)
+{
+    return r->size;
+}
+
+/*
+ * The extent holding off: a leaf (hash set, *is_hole 0) or a hole, as
+ * [*start, *start + *len). A hole's end is the next entry at the deepest
+ * list reached, so a hole may come back in more than one piece; callers
+ * loop.
+ */
+static status_t cr_locate(content_reader_t *r, uint64_t off, int *is_hole,
+                          uint64_t *start, uint64_t *len, uint8_t hash[OBJECT_HASH_SIZE])
+{
+    if (!r->is_list) {
+        *is_hole = 0;
+        *start = 0;
+        *len = r->size;
+        memcpy(hash, r->root, OBJECT_HASH_SIZE);
+        return OK;
+    }
+    uint8_t cur[OBJECT_HASH_SIZE];
+    memcpy(cur, r->root, OBJECT_HASH_SIZE);
+    uint64_t base = 0;
+    int have_parent = 0;
+    uint8_t want_level = 0;
+    uint64_t want_len = 0;
+    for (unsigned depth = 0; depth <= CHUNKLIST_MAX_LEVEL + 1; depth++) {
+        const cr_list_t *l = NULL;
+        status_t st = cr_list(r, cur, &l);
+        if (st != OK) return st;
+        const char *why = NULL;
+        if (l->hdr.leaf_type != OBJECT_TYPE_FILE) why = "leaf type is not file content";
+        else if (have_parent && l->hdr.level != want_level) why = "level is not one below its parent's";
+        else if (have_parent && l->hdr.total_len != want_len) why = "length differs from its parent entry";
+        else if (have_parent && l->hdr.count == 0) why = "sub-list is empty";
+        if (why) {
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            object_hash_to_hex(cur, hex);
+            return set_error(ERR_CORRUPT, "chunklist %s: %s", hex, why);
+        }
+        uint64_t rel = off - base;
+        /* The last entry starting at or before rel. */
+        uint32_t lo = 0, hi = l->hdr.count;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            chunklist_entry_t m;
+            chunklist_entry_at(l->buf, mid, &m);
+            if (m.offset <= rel) lo = mid + 1; else hi = mid;
+        }
+        chunklist_entry_t e;
+        memset(&e, 0, sizeof(e));
+        int inside = 0;
+        if (lo > 0) {
+            chunklist_entry_at(l->buf, lo - 1, &e);
+            inside = rel < e.offset + e.length;
+        }
+        if (!inside) {
+            uint64_t end = l->hdr.total_len;
+            if (lo < l->hdr.count) {
+                chunklist_entry_t nx;
+                chunklist_entry_at(l->buf, lo, &nx);
+                end = nx.offset;
+            }
+            *is_hole = 1;
+            *start = off;
+            *len = end - rel;
+            return OK;
+        }
+        if (l->hdr.level == 0) {
+            *is_hole = 0;
+            *start = base + e.offset;
+            *len = e.length;
+            memcpy(hash, e.hash, OBJECT_HASH_SIZE);
+            return OK;
+        }
+        have_parent = 1;
+        want_level = (uint8_t)(l->hdr.level - 1u);
+        want_len = e.length;
+        base += e.offset;
+        memcpy(cur, e.hash, OBJECT_HASH_SIZE);
+    }
+    return set_error(ERR_CORRUPT, "chunklist: nested too deep");
+}
+
+status_t content_reader_read(content_reader_t *r, uint64_t off, void *buf, size_t len)
+{
+    if (off > r->size || len > r->size - off)
+        return set_error(ERR_INVALID, "content read past the end (%llu + %zu > %llu)",
+                         (unsigned long long)off, len, (unsigned long long)r->size);
+    uint8_t *p = buf;
+    while (len > 0) {
+        int hole = 0;
+        uint64_t s = 0, n = 0;
+        uint8_t h[OBJECT_HASH_SIZE];
+        status_t st = cr_locate(r, off, &hole, &s, &n, h);
+        if (st != OK) return st;
+        uint64_t avail = s + n - off;
+        size_t take = avail < len ? (size_t)avail : len;
+        if (take == 0) return set_error(ERR_CORRUPT, "chunklist: an empty extent");
+        if (hole) {
+            memset(p, 0, take);
+        } else {
+            const cr_leaf_t *f = NULL;
+            st = cr_leaf(r, h, n, &f);
+            if (st != OK) return st;
+            memcpy(p, f->data + (off - s), take);
+        }
+        p += take;
+        off += take;
+        len -= take;
+    }
+    return OK;
+}
+
+status_t content_reader_extents(content_reader_t *r, uint64_t off, uint64_t len,
+                                content_extent_fn fn, void *ctx)
+{
+    if (off > r->size || len > r->size - off)
+        return set_error(ERR_INVALID, "content extents past the end");
+    int have = 0, cur_hole = 0;
+    uint64_t cur_s = 0, cur_n = 0;
+    while (len > 0) {
+        int hole = 0;
+        uint64_t s = 0, n = 0;
+        uint8_t h[OBJECT_HASH_SIZE];
+        status_t st = cr_locate(r, off, &hole, &s, &n, h);
+        if (st != OK) return st;
+        uint64_t avail = s + n - off;
+        uint64_t take = avail < len ? avail : len;
+        if (take == 0) return set_error(ERR_CORRUPT, "chunklist: an empty extent");
+        if (have && hole == cur_hole) {
+            cur_n += take;
+        } else {
+            if (have && fn(ctx, cur_s, cur_n, cur_hole) != 0) return OK;
+            have = 1;
+            cur_hole = hole;
+            cur_s = off;
+            cur_n = take;
+        }
+        off += take;
+        len -= take;
+    }
+    if (have) (void)fn(ctx, cur_s, cur_n, cur_hole);
+    return OK;
+}
+
+void content_reader_close(content_reader_t *r)
+{
+    if (!r) return;
+    for (size_t i = 0; i < CR_LISTS; i++) free(r->lists[i].buf);
+    for (size_t i = 0; i < CR_LEAVES; i++) free(r->leaves[i].data);
+    free(r);
+}

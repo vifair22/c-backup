@@ -31,6 +31,7 @@
 #include <cutils/db.h>
 
 #include "gfs.h"
+#include "prune.h"
 #include "repo.h"
 #include "store.h"
 #include "test_tmp.h"
@@ -329,6 +330,36 @@ static void test_tagged_snapshots_are_preserved(void **state)
 }
 
 /*
+ * An open NBD export pins its snapshot (vm-backup.md 7.3): retention keeps
+ * it while the export is open and prunes it once the export is closed.
+ */
+static void test_exported_snapshot_is_pinned(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 20; i++)
+        add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO exports (repo_id, snap_id, item_id, socket, size, created_at, expires_at)"
+        " VALUES (?, 2, 'vda', '/x.sock', 1, 0, 9999999999)",
+        (const char *[]){ repo, NULL }, NULL), 0);
+
+    gfs_retention_t ret = { 3, 2, 1, 1, 1 };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, NULL), OK);
+    assert_int_not_equal(flags_of(2), 0xFFFFFFFFu);
+    /* Neither can it be deleted by hand, force or not. */
+    assert_int_equal(prune_snapshot_checked(store, db, repo_id, 2, 1, NULL), ERR_BUSY);
+    assert_int_not_equal(flags_of(2), 0xFFFFFFFFu);
+
+    assert_int_equal(db_execute_non_query(db, "UPDATE exports SET closed_at = 1",
+                                          (const char *[]){ NULL }, NULL), 0);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, NULL), OK);
+    assert_int_equal(flags_of(2), 0xFFFFFFFFu);
+}
+
+/*
  * B094, the tester's case: eighteen daily snapshots, every tier at 1, one
  * tagged. The newest holds every tier; the tagged one holds the daily it was
  * elected for, though that tier no longer keeps it, and survives on its tag.
@@ -528,6 +559,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_dry_run_prunes_nothing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_prune_removes_expired_snapshots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_tagged_snapshots_are_preserved, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_exported_snapshot_is_pinned, setup, teardown),
         cmocka_unit_test_setup_teardown(test_every_tier_at_one_with_a_tag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_day_every_tier_at_one_with_a_tag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_zero_retention_keeps_everything, setup, teardown),

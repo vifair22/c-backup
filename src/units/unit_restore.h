@@ -33,6 +33,12 @@ typedef struct {
     char     path[4096];      /* the file or directory written */
 } unit_restore_item_result_t;
 
+/* The content of a disk (block) item, for the NBD export: its content
+ * hash and logical size. ERR_NOT_FOUND for an unknown item, ERR_INVALID
+ * for one that is not a disk. */
+status_t unit_item_content(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                           const char *item_id, uint8_t hash[OBJECT_HASH_SIZE], uint64_t *size);
+
 /* One item by id. dest must not exist. */
 status_t unit_restore_item(store_t *store, cutils_db_t *db, int64_t repo_id,
                            int64_t snap_id, const char *item_id, const char *dest,

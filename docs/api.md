@@ -1343,6 +1343,28 @@ file snapshots, then each unit, each with its own newest snapshot, which is
 never pruned. A snapshot whose `.cbackup-unit/unit.json` cannot be read is its
 own `unknown:<id>` group and is never pruned.
 
+**NBD exports** (vm-backup.md 7.3) serve one disk of a unit snapshot
+read-only over NBD on a unix socket, so a filesystem in it can be mounted
+without restoring the image:
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/repos/<id>/snapshots/<sid>/unit/export` | `{"item":"vda","ttl_s":14400}` (`ttl_s` 60 to 604800, default `vm.export_ttl_s`). 201 with `export_id`, `socket`, `name`, `size`, `expires` (wall clock), `idle_timeout_s` and an `attach` command line. The `name` (128 random bits) is returned here only; 400 for an item that is not a disk, 404 for no such snapshot or item, 503 while gc or another writer holds the repository |
+| GET | `/exports` | Open exports: id, repo, snapshot, item, socket, size, caller, created and expiry times, live `connections` and `bytes_served`; never the name |
+| GET | `/exports/<id>` | One, open or closed; a closed one has `closed_at` and `close_reason` (`revoked`, `expired`, `idle`, `daemon stopped`, `daemon restarted`) |
+| DELETE | `/exports/<id>` | Revoke: disconnect every client, remove the socket, close. 204 |
+
+An open export pins its snapshot: deleting it is refused even with
+`force` (`ERR_BUSY`, the message names the export) and retention keeps it
+as if tagged; a gc on its repository fails with "gc deferred" and runs
+again on its next schedule. An export closes at its expiry, after
+`vm.export_idle_s` with no connection, when revoked, and when the daemon
+stops; the ids are `AUTOINCREMENT` and opening and closing are journalled
+with the caller. The server speaks fixed newstyle with structured replies,
+`NBD_OPT_GO`/`INFO`, `base:allocation` (the snapshot's holes are holes to
+the client), `READ`, `BLOCK_STATUS` and `DISC`; writes are refused with
+`EPERM`, `NBD_OPT_LIST` with a policy error, a wrong name at `NBD_OPT_GO`.
+
 File backups refuse a source at or under `/.cbackup-unit` or
 `/.cbackup-captures`, on `POST /backup`, `PUT /sources` and backup schedules
 alike: those names are the daemon's in every snapshot root.
