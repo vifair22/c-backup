@@ -130,6 +130,16 @@ status_t job_submit_startup(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
                             job_fn fn, void *arg, void (*arg_free)(void *),
                             int64_t *out_job_id);
 
+/*
+ * job_submit_locked for a job the daemon queues itself rather than one a
+ * caller or a schedule asked for. `origin` is a string literal recorded as
+ * the job's origin and its journal entry's source ("register" for the
+ * reindex a registration starts).
+ */
+status_t job_submit_origin(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
+                           const char *action, const char *origin, job_fn fn,
+                           void *arg, void (*arg_free)(void *), int64_t *out_job_id);
+
 /* The phase a queued job shows while it waits for a synchronous request to
  * let go of its repository, and the bounds of the retry backoff. */
 #define JOB_PHASE_WAITING "waiting for repository"

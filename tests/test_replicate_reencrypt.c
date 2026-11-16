@@ -131,7 +131,7 @@ static int64_t make_dest(repo_enc_mode_t mode, const char *pass)
 static void replicate_reencrypt(void)
 {
     replica_sink_t sink;
-    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, &sink), OK);
+    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, 1, &sink), OK);
     replicate_result_t rr;
     status_t st = replicate_run(src, db, src_id, &sink, NULL, NULL, NULL, &rr);
     sink.v->close(sink.ctx);
@@ -283,6 +283,19 @@ static void test_reencrypt_into_an_unencrypted_repository(void **state)
 {
     (void)state;
     int64_t dst_id = make_dest(REPO_ENC_NONE, NULL);
+
+    /* Only when asked for by name: without allow_plaintext the sink
+     * refuses before opening anything. */
+    replica_sink_t sink;
+    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, 0, &sink),
+                     ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "allow_plaintext"));
+    err_clear();
+    assert_true(replica_reencrypt_drops_encryption(DST_REPO, &src_marker));
+    /* The source is encrypted and so is a source-shaped copy: the
+     * question only arises for an unencrypted target. */
+    assert_false(replica_reencrypt_drops_encryption(SRC_REPO, &src_marker));
+
     replicate_reencrypt();
 
     int plain = 0, enc = 0;
@@ -311,7 +324,7 @@ static void test_second_reencrypt_run_sends_nothing(void **state)
     replicate_reencrypt();
 
     replica_sink_t sink;
-    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, &sink), OK);
+    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, 0, &sink), OK);
     replicate_result_t rr;
     assert_int_equal(replicate_run(src, db, src_id, &sink, NULL, NULL, NULL, &rr), OK);
     sink.v->close(sink.ctx);
@@ -326,13 +339,13 @@ static void test_reencrypt_refusals(void **state)
     replica_sink_t sink;
 
     /* No repository there: its encryption has to be chosen by repo add. */
-    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, &sink),
+    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, 0, &sink),
                      ERR_INVALID);
     assert_non_null(strstr(err_msg(), "repo add"));
     err_clear();
 
     /* The source itself, or a replica of it. */
-    assert_int_equal(replica_sink_local_open_reencrypt(SRC_REPO, &src_marker, &sink),
+    assert_int_equal(replica_sink_local_open_reencrypt(SRC_REPO, &src_marker, 0, &sink),
                      ERR_INVALID);
     assert_non_null(strstr(err_msg(), "without --reencrypt"));
     err_clear();
@@ -342,7 +355,7 @@ static void test_reencrypt_refusals(void **state)
     repo_marker_t dm;
     assert_int_equal(repo_marker_read(DST_REPO, &dm), OK);
     assert_int_equal(repo_key_remove(TEST_KEYS, dm.uuid), OK);
-    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, &sink),
+    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, 0, &sink),
                      ERR_INVALID);
     assert_non_null(strstr(err_msg(), "no key loaded for repository"));
     err_clear();
@@ -365,7 +378,7 @@ static void test_reencrypt_never_overwrites_a_destination_snapshot(void **state)
                "\",\"label\":\"theirs\"}\n");
 
     replica_sink_t sink;
-    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, &sink), OK);
+    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &src_marker, 1, &sink), OK);
     replicate_result_t rr;
     assert_int_equal(replicate_run(src, db, src_id, &sink, NULL, NULL, NULL, &rr),
                      ERR_INVALID);

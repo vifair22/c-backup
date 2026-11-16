@@ -245,6 +245,21 @@ uint64_t store_write_stats_diff(const store_write_stats_t *after,
  */
 unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes);
 
+/*
+ * Take this handle's claim on tmp/ (an flock on tmp/.lock, held until
+ * store_close); 1 if held. Pack staging takes it, and
+ * store_sweep_tmp_before needs it to remove staging younger than an hour:
+ * without it, another handle may be writing, so only the hour rule applies.
+ * Callers that sweep with the claim: backup, gc, reindex, a replica sink's
+ * open, and registering an existing repository (B133).
+ *
+ * The invariant: an age-free sweep removes only staging whose every writer
+ * holds this claim or the repository's write lock (pack-dat., snap.,
+ * snapids., deleting.). The tag mirror's tags.* staging is written under
+ * neither, so it is removed by the hour rule alone.
+ */
+int store_claim_tmp(store_t *st);
+
 status_t store_locate(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],
                       store_location_t *out);
 
@@ -256,10 +271,10 @@ typedef struct {
     uint64_t comp_size;
     uint64_t orig_size;
     /* Position in the pack's on-disk entry order, which is what indexes the
-     * parity trailer's offsets table. It is NOT the position of this entry in
-     * the entries array: that array is sorted by hash before it is handed
-     * over. Recording the array position instead makes every parity lookup
-     * read the wrong offsets and silently disables repair. */
+     * trailer's CRC table. It is NOT the position of this entry in the
+     * entries array: that array is sorted by hash before it is handed over.
+     * Recording the array position instead makes every CRC check read
+     * another entry's slot and silently disables repair. */
     uint32_t entry_index;
     /* The object's type, so the commit can create the object's index row
      * when nothing recorded one before the pack was sealed (format 3: a

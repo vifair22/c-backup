@@ -32,6 +32,11 @@ typedef struct {
     /* An entry with no file behind it (scan_add_synthetic): its content
      * comes from the caller, never from the filesystem. */
     int      synthetic;
+    /* Length of the source root's path at the head of `path`, for an entry
+     * the walk of that root produced (the root itself included); 0 for an
+     * ancestor directory synthesised above it. The store opens a file
+     * beneath its root with this, never by the whole path (B128). */
+    uint32_t root_len;
 } scan_entry_t;
 
 typedef struct {

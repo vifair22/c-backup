@@ -17,6 +17,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { createServer } from 'node:net'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -31,8 +32,21 @@ const CLI = join(REPO_ROOT, 'build', 'bins', 'c-backup')
 const PASSWORD = 'correcthorsebattery'
 
 /* A port per run, so a suite left running elsewhere cannot answer for this
- * one. */
-const PORT = 20000 + (process.pid % 10000)
+ * one. Chosen by the kernel in before() (FLAKE-13): it was derived from the
+ * pid, which another run on the host could share. */
+let PORT = 0
+
+function freePort(): Promise<number> {
+  return new Promise((done, fail) => {
+    const srv = createServer()
+    srv.once('error', fail)
+    srv.listen(0, () => {
+      const addr = srv.address()
+      const port = typeof addr === 'object' && addr ? addr.port : 0
+      srv.close(() => done(port))
+    })
+  })
+}
 
 let work: string
 let sock: string
@@ -68,6 +82,7 @@ function tcp(method: string, path: string, token?: string): Promise<number> {
 
 before(async () => {
   assert.ok(existsSync(DAEMON), `build the daemon first: ${DAEMON}`)
+  PORT = await freePort()
   work = mkdtempSync(join(tmpdir(), 'cbackup-connections-'))
   sock = join(work, 'sock')
   mkdirSync(join(work, 'keys'), { recursive: true })
