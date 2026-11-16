@@ -487,7 +487,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing, `?dry_run=1` (or `true`) the same and overriding any `repair` |
 | GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) and `offset` |
 | GET | `/repos/<id>/verify/<run-id>` | The findings from one run, paginated |
-| POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt}` |
+| POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt, allow_plaintext}` |
 
 `subpath` restores one path out of the snapshot instead of all of it, so
 pulling a single file back does not cost a full restore. It accepts the path
@@ -793,7 +793,15 @@ comparison and an unchanged repository replicates in one question.
 encryption. `dest` must already be a repository with an identity of its
 own (create it with `POST /repos` and the encryption wanted); each object is
 decrypted with the source key and encrypted under the destination's, or
-written plaintext into an unencrypted destination. Hashes are of the
+written plaintext into an unencrypted destination. That last case, an
+encrypted source into an unencrypted destination, is a 400 (`this
+repository is encrypted and the target is not, so the copy would hold every
+file in plaintext; ...`) unless the request also sets `"allow_plaintext":
+true`, a JSON boolean (anything else is `allow_plaintext must be true or
+false`; with no `reencrypt` it is `allow_plaintext applies only with
+reencrypt`). The check is repeated when the job runs. An allowed run logs a
+warning and journals `replicated encrypted repo N into plaintext at <path>`
+on the source. Unencrypted into unencrypted needs no flag. Hashes are of the
 plaintext, so they and the trees carry over unchanged, as do snapshot ids;
 a snapshot id the destination already uses for another tree fails the run
 instead of being overwritten. The job fails, saying which, when `dest` is

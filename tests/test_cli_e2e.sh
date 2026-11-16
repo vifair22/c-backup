@@ -1135,6 +1135,19 @@ fi
 OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-missing" --reencrypt 2>&1); RC=$?
 check    "re-encrypting into no repository is refused" 1 "$RC"
 contains "and says to create it first" "repo add" "$OUT"
+# Into an unencrypted repository the copy is plaintext, which takes
+# --to-plaintext; without it nothing is written.
+cb repo add "$WORK/reenc-plain" rp >/dev/null
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-plain" --reencrypt 2>&1); RC=$?
+check    "re-encrypting into plaintext without --to-plaintext is refused" 1 "$RC"
+contains "and names the flag" "--to-plaintext" "$OUT"
+check    "and wrote no pack" 0 "$(find "$WORK/reenc-plain/packs" -type f | wc -l | tr -d ' ')"
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-plain" --to-plaintext 2>&1); RC=$?
+check    "--to-plaintext without --reencrypt is refused locally" 1 "$RC"
+contains "and says why" "--to-plaintext needs --reencrypt" "$OUT"
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-plain" --reencrypt --to-plaintext 2>&1); RC=$?
+check    "with --to-plaintext it runs" 0 "$RC"
+contains "and the journal says so" "into plaintext at $WORK/reenc-plain" "$(cb journal "$ENC_ID")"
 
 echo "configured sources"
 

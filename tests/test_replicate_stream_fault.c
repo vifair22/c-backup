@@ -297,7 +297,7 @@ static int64_t make_dest(repo_enc_mode_t mode)
 static status_t replicate_reencrypt(replicate_result_t *rr)
 {
     replica_sink_t sink;
-    assert_int_equal(replica_sink_local_open_reencrypt(TEST_DST, &marker, &sink), OK);
+    assert_int_equal(replica_sink_local_open_reencrypt(TEST_DST, &marker, 1, &sink), OK);
     status_t st = replicate_run(store, db, repo_id, &sink, NULL, NULL, NULL, rr);
     sink.v->close(sink.ctx);
     return st;
@@ -438,7 +438,7 @@ static void test_large_loose_object_reencrypts(void **state)
     int64_t dst_id = make_dest(REPO_ENC_SYSTEM);
 
     replica_sink_t sink;
-    assert_int_equal(replica_sink_local_open_reencrypt(TEST_DST, &marker, &sink), OK);
+    assert_int_equal(replica_sink_local_open_reencrypt(TEST_DST, &marker, 1, &sink), OK);
     fault_malloc_peak = 0;
     replicate_result_t rr;
     status_t st = replicate_tree(store, &sink, root, NULL, &rr);

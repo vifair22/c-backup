@@ -1818,6 +1818,53 @@ check "snapshot delete force= is refused" '{"error":"force must be 1 or 0"} 400'
     "$(sock_send DELETE '/repos/1/snapshots/1?force=')"
 check "none of them started a job or removed anything" "$DG_BEFORE" "$(dg_state)"
 
+echo "re-encrypting into plaintext needs allow_plaintext"
+# reencrypt into a path holding an unencrypted repository wrote the whole
+# encrypted repository out in plaintext, with nothing in the request saying
+# that was meant. It takes "allow_plaintext":true now, and is logged and
+# journalled when it happens.
+wait_job "$(job_id "$(sock_post "/repos/$ENC_ID/backup" "{\"paths\":[\"$R/src\"]}")")"
+PT_OUT=$(sock_send POST /repos "{\"path\":\"$R/ptarget\",\"label\":\"pt\"}")
+contains "an unencrypted target is registered" ' 201' "$PT_OUT"
+pt_files() { find "$R/ptarget" -type f | sort; }
+PT_BEFORE="$(dg_state)
+$(pt_files)"
+PT_REFUSAL="this repository is encrypted and the target is not, so the copy would hold every file in plaintext; to do that deliberately, set allow_plaintext (CLI --to-plaintext) (target at $R/ptarget)"
+rp_enc() { sock_send POST "/repos/$ENC_ID/replicate" "$1"; }
+check "encrypted into plaintext without the flag is refused" \
+    "{\"error\":\"$PT_REFUSAL\"} 400" \
+    "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true}")"
+check "allow_plaintext false is the same refusal" \
+    "{\"error\":\"$PT_REFUSAL\"} 400" \
+    "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":false}")"
+for v in '"true"' '1' 'null' '""'; do
+    check "allow_plaintext $v is refused" \
+        '{"error":"allow_plaintext must be true or false"} 400' \
+        "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":$v}")"
+done
+contains "allow_plaintext without reencrypt is refused" \
+    'allow_plaintext applies only with reencrypt' \
+    "$(rp_enc "{\"dest\":\"$R/ptarget\",\"allow_plaintext\":true}")"
+check "no refusal wrote to the target or changed anything" "$PT_BEFORE" "$(dg_state)
+$(pt_files)"
+PT_JOB=$(job_id "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":true}")")
+wait_job "$PT_JOB"
+contains "with allow_plaintext it runs" '"state":"completed"' "$(sock_body "/jobs/$PT_JOB")"
+PT_MSG="replicated encrypted repo $ENC_ID into plaintext at $R/ptarget"
+for _ in $(seq 1 50); do grep -q "$PT_MSG" "$R/daemon.log" && break; sleep 0.1; done
+# Not a terminal, so the level is the syslog prefix: <4> is warning.
+contains "and logs a warning" "<4>" "$(grep "$PT_MSG" "$R/daemon.log")"
+contains "and journals it" "\"message\":\"$PT_MSG\"" "$(sock_body "/repos/$ENC_ID/journal")"
+# Unencrypted to unencrypted drops nothing, so it needs no flag.
+P2_OUT=$(sock_send POST /repos "{\"path\":\"$R/ptarget2\",\"label\":\"pt2\"}")
+contains "a second unencrypted target" ' 201' "$P2_OUT"
+P2_JOB=$(job_id "$(sock_post /repos/1/replicate "{\"dest\":\"$R/ptarget2\",\"reencrypt\":true}")")
+wait_job "$P2_JOB"
+contains "unencrypted into unencrypted needs no flag" '"state":"completed"' \
+    "$(sock_body "/jobs/$P2_JOB")"
+check "and is not journalled as a plaintext copy" 0 \
+    "$(sock_body /repos/1/journal | grep -c 'into plaintext')"
+
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
 DAEMON_PID=""

@@ -839,6 +839,7 @@ typedef struct {
     int             ignore_case;
     uint32_t        max_files;
     int             reencrypt;   /* replicate into another repository's key */
+    int             allow_plaintext; /* reencrypt may drop encryption */
     uint32_t        max_hits_per_file;   /* 0: the grep default */
     uint64_t        max_hits;            /* 0: the grep default */
     snap_job_kind_t kind;
@@ -1317,7 +1318,9 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         }
         if (st == OK) {
             replica_sink_t sink;
-            st = j->reencrypt ? replica_sink_local_open_reencrypt(j->dest, &m, &sink)
+            int to_plain = j->reencrypt && replica_reencrypt_drops_encryption(j->dest, &m);
+            st = j->reencrypt ? replica_sink_local_open_reencrypt(j->dest, &m,
+                                                                   j->allow_plaintext, &sink)
                               : replica_sink_local_open(j->dest, &m, &sink);
             if (st == OK) {
                 replicate_result_t rr;
@@ -1325,6 +1328,22 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                 st = replicate_run(store, j->db, j->repo_id, &sink, cancel,
                                    NULL, NULL, &rr);
                 sink.v->close(sink.ctx);
+                if (to_plain) {
+                    /*
+                     * Allowed, and on the record: the one place this
+                     * repository's data leaves its encryption. Recorded
+                     * whatever the outcome, since a run that failed part
+                     * way has still written what it committed.
+                     */
+                    char msg[PATH_MAX + 96];
+                    snprintf(msg, sizeof(msg),
+                             "replicated encrypted repo %lld into plaintext at %s%s",
+                             (long long)j->repo_id, j->dest,
+                             st == OK ? "" : " (the run did not complete)");
+                    log_warn("replicate: %s", msg);
+                    journal_record(j->db, j->repo_id, "replicate", "plaintext-copy",
+                                   "warning", 0, msg);
+                }
                 /* A cancelled run keeps what it committed, so its counts
                  * are true either way. */
                 replicate_report(progress_ctx, &rr, j->reencrypt);
@@ -1598,10 +1617,41 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, je.msg);
         }
         j->reencrypt = reenc ? 1 : 0;
+        /*
+         * Dropping encryption has to be asked for by name. "reencrypt" into
+         * a path that happens to hold an unencrypted repository wrote the
+         * whole repository out in plaintext, and nothing in the request
+         * said that was the intent.
+         */
+        bool plain = false;
+        if (jreq_bool(body, "allow_plaintext", &plain, &je) == JREQ_BAD) {
+            snap_job_free(j);
+            return api_error(400, je.msg);
+        }
+        if (plain && !j->reencrypt) {
+            snap_job_free(j);
+            return api_error(400, "allow_plaintext applies only with reencrypt: a "
+                                  "plain replica keeps the source's encryption");
+        }
+        j->allow_plaintext = plain ? 1 : 0;
         char why[PATH_MAX + 128];
         if (routes_replicate_dest_check(repo_id, j->dest, why, sizeof(why)) != 0) {
             snap_job_free(j);
             return api_error(400, why);
+        }
+        if (j->reencrypt && !j->allow_plaintext) {
+            repo_marker_t sm;
+            if (repo_marker_read(j->repo_path, &sm) == OK) {
+                if (replica_reencrypt_drops_encryption(j->dest, &sm)) {
+                    char msg[PATH_MAX + 256];
+                    snprintf(msg, sizeof(msg), REPLICA_PLAINTEXT_REFUSAL, j->dest);
+                    snap_job_free(j);
+                    return api_error(400, msg);
+                }
+            } else {
+                /* The job reads it again and fails with the reason. */
+                err_clear();
+            }
         }
     }
 
