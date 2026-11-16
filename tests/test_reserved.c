@@ -245,6 +245,40 @@ static void test_scan_drops_at_top(void **state)
     scan_imap_free(im);
 }
 
+/* Snapshot directories are never entered, at any depth, whatever the root:
+ * a file backup of a pool must not read the capture snapshots in it. Their
+ * contents are what a unit reads, from the snapshot path given as a root. */
+static void test_scan_skips_snapshot_dirs(void **state)
+{
+    (void)state;
+    mkdir(TEST_SRC "/.zfs", 0700);
+    mkdir(TEST_SRC "/.zfs/snapshot", 0700);
+    touch(TEST_SRC "/.zfs/snapshot/f", "s");
+    mkdir(TEST_SRC "/system", 0700);
+    mkdir(TEST_SRC "/system/.cbackup-snapshots", 0700);
+    mkdir(TEST_SRC "/system/.cbackup-snapshots/cbk-0badf00d-1-0", 0700);
+    touch(TEST_SRC "/system/.cbackup-snapshots/cbk-0badf00d-1-0/g", "s");
+    touch(TEST_SRC "/system/kept", "k");
+    scan_imap_t *im = scan_imap_new();
+    scan_result_t *r = NULL;
+    assert_int_equal(scan_tree(TEST_SRC, im, NULL, &r), OK);
+    assert_true(has_path(r, TEST_SRC "/system/kept"));
+    assert_false(has_path(r, TEST_SRC "/.zfs"));
+    assert_false(has_path(r, TEST_SRC "/.zfs/snapshot/f"));
+    assert_false(has_path(r, TEST_SRC "/system/.cbackup-snapshots"));
+    assert_false(has_path(r, TEST_SRC "/system/.cbackup-snapshots/cbk-0badf00d-1-0/g"));
+    scan_result_free(r);
+    /* A unit reads from inside one, given as its root. */
+    r = NULL;
+    assert_int_equal(scan_tree(TEST_SRC "/system/.cbackup-snapshots/cbk-0badf00d-1-0", im, NULL, &r), OK);
+    assert_true(has_path(r, TEST_SRC "/system/.cbackup-snapshots/cbk-0badf00d-1-0/g"));
+    scan_result_free(r);
+    scan_imap_free(im);
+    assert_true(reserved_snapshot_dir(".zfs"));
+    assert_true(reserved_snapshot_dir(".cbackup-snapshots"));
+    assert_false(reserved_snapshot_dir("zfs"));
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -253,6 +287,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_backup_refuses, setup, teardown),
         cmocka_unit_test_setup_teardown(test_synthetic_gated, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_drops_at_top, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_scan_skips_snapshot_dirs, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -721,6 +721,12 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
             log_error("%s", msg);
             continue;
         }
+        /* Capture snapshots of the pool being backed up: reading them
+         * would store the pool twice, and a frozen copy at that. */
+        if (reserved_snapshot_dir(batch[i].name)) {
+            log_debug("scan: not entering snapshot directory %s", child);
+            continue;
+        }
         if (is_excluded(child, opts)) continue;
         st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts,
                            root_dev, res);
