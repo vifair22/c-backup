@@ -331,7 +331,14 @@ if command -v sqlite3 > /dev/null 2>&1; then
         'store')"
     "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2> "$WORK/watch.err" &
     WPID=$!
-    sleep 1
+    # The row stays running until this test completes it, so whatever the
+    # watch prints before then arrived while the job ran, which is what B058
+    # is about. A fixed sleep 1 guessed how long the CLI takes to start and
+    # connect, and lost under load (FLAKE-17); this waits up to 10 s for it.
+    for _ in $(seq 1 100); do
+        grep -q '"state":"running"' "$WORK/watch.out" 2>/dev/null && break
+        sleep 0.1
+    done
     contains "jobs watch prints a running job at once" '"state":"running"' \
         "$(cat "$WORK/watch.out")"
     sqlite3 -cmd ".timeout 10000" "$WORK/state.db" "UPDATE jobs SET state = 'completed',
