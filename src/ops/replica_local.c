@@ -563,11 +563,14 @@ status_t replica_sink_local_open(const char *path,
     } else {
         if (strcmp(m.uuid, source_marker->uuid) != 0) {
             free(c);
+            /* The path last: the message buffer is 256 bytes, and with the
+             * path first a long one cut off the advice, which is the part
+             * that says what to do. */
             return set_error(ERR_INVALID,
-                             "replica at %s belongs to repository %s, not %s; to "
+                             "replica belongs to repository %s, not %s; to "
                              "copy into a different repository under its own "
-                             "encryption, replicate with --reencrypt",
-                             path, m.uuid, source_marker->uuid);
+                             "encryption, replicate with --reencrypt (replica at %s)",
+                             m.uuid, source_marker->uuid, path);
         }
         /*
          * Ciphertext under two keys in one repository is unopenable: nothing
