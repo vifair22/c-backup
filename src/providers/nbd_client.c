@@ -69,6 +69,8 @@ struct nbd_client {
     uint32_t bs_min, bs_pref, bs_max;
     uint64_t cookie;
     int      broken;
+    unsigned depth;
+    uint32_t req_bytes;
 };
 
 /* ---- bytes ---- */
@@ -242,6 +244,8 @@ static status_t handshake(nbd_client_t *c, const nbd_open_opts_t *o)
     if (c->bs_min == 0 || c->bs_min > 65536 || (c->bs_min & (c->bs_min - 1))) c->bs_min = 1;
     if (c->bs_max == 0 || c->bs_max > READ_MAX) c->bs_max = READ_MAX;
     if (c->bs_pref == 0 || c->bs_pref > c->bs_max) c->bs_pref = c->bs_max < 4u << 20 ? c->bs_max : 4u << 20;
+    if (c->req_bytes > c->bs_max) c->req_bytes = c->bs_max;
+    if (c->req_bytes < 65536) c->req_bytes = 65536 < c->bs_max ? 65536 : c->bs_max;
     return OK;
 }
 
@@ -266,6 +270,8 @@ status_t nbd_open(const nbd_open_opts_t *o, nbd_client_t **out)
         free(c);
         return st;
     }
+    c->depth = o->depth ? (o->depth > 64 ? 64 : o->depth) : 8;
+    c->req_bytes = (o->request_kb ? o->request_kb : 256) * 1024u;
     status_t st = handshake(c, o);
     if (st != OK) {
         char why[512];
@@ -452,8 +458,127 @@ static status_t replies(nbd_client_t *c, uint64_t cookie, int is_read, reply_t *
     return st;
 }
 
+/*
+ * Pipelined reads (4.3): requests go out until depth are in flight, and
+ * each reply chunk is placed into the request its cookie names; a server
+ * may interleave chunks of different requests. Coverage, overlap and
+ * bounds are checked per request exactly as for one.
+ */
+typedef struct {
+    uint64_t cookie, off;
+    uint32_t len;
+    uint8_t *buf;
+    ivl_t   *cov;
+    size_t   ncov;
+    int      done;
+} inflight_t;
+
+static status_t read_pipelined(nbd_client_t *c, uint64_t off, uint8_t *buf, size_t len)
+{
+    unsigned depth = c->depth;
+    inflight_t *q = calloc(depth, sizeof(*q));
+    if (!q) return set_error(ERR_NOMEM, "nbd: pipeline");
+    for (unsigned i = 0; i < depth; i++)
+        if (!(q[i].cov = calloc(COVER_MAX, sizeof(ivl_t)))) {
+            for (unsigned k = 0; k < i; k++) free(q[k].cov);
+            free(q);
+            return set_error(ERR_NOMEM, "nbd: pipeline");
+        }
+    status_t st = OK, failed = OK;
+    char fmsg[512] = "";
+    size_t sent = 0;            /* bytes requested so far */
+    unsigned out = 0;           /* requests in flight */
+    while (st == OK && (sent < len || out > 0)) {
+        /* Fill the window. */
+        while (st == OK && sent < len && out < depth) {
+            unsigned slot = 0;
+            while (slot < depth && q[slot].len && !q[slot].done) slot++;
+            if (slot == depth) break;
+            uint32_t n = len - sent > c->req_bytes ? c->req_bytes : (uint32_t)(len - sent);
+            q[slot].off = off + sent;
+            q[slot].len = n;
+            q[slot].buf = buf + sent;
+            q[slot].ncov = 0;
+            q[slot].done = 0;
+            st = send_req(c, CMD_READ, 0, q[slot].off, n, &q[slot].cookie);
+            sent += n;
+            out++;
+        }
+        if (st != OK || out == 0) break;
+        /* One reply chunk, to whichever request it belongs. */
+        uint8_t m[4];
+        if ((st = rd(c, m, 4)) != OK) break;
+        uint32_t magic = get32(m);
+        if (magic == SIMPLE_MAGIC) {
+            uint8_t h[12];
+            if ((st = rd(c, h, 12)) != OK) break;
+            uint64_t ck = get64(h + 4);
+            unsigned k = 0;
+            while (k < depth && !(q[k].len && !q[k].done && q[k].cookie == ck)) k++;
+            if (k == depth) { st = bad(c, "a reply to a request never made", NULL); break; }
+            uint32_t err = get32(h);
+            if (err == 0) { st = bad(c, "a simple reply to a read", NULL); break; }
+            if (failed == OK) { failed = set_error(ERR_IO, "nbd: the server failed a read: error %u", err); snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg()); err_clear(); }
+            q[k].done = 1;
+            q[k].len = 0;
+            out--;
+            continue;
+        }
+        if (magic != STRUCT_MAGIC) { st = bad(c, "a bad reply magic", NULL); break; }
+        uint8_t h[16];
+        if ((st = rd(c, h, 16)) != OK) break;
+        uint16_t flags = get16(h), type = get16(h + 2);
+        uint64_t ck = get64(h + 4);
+        uint32_t clen = get32(h + 12);
+        unsigned k = 0;
+        while (k < depth && !(q[k].len && !q[k].done && q[k].cookie == ck)) k++;
+        if (k == depth) { st = bad(c, "a reply to a request never made", NULL); break; }
+        if (clen > CHUNK_MAX) { st = bad(c, "a reply chunk over 64 MiB", NULL); break; }
+        inflight_t *x = &q[k];
+        if (type == CH_NONE) {
+            if (clen != 0 || !(flags & CH_FLAG_DONE)) { st = bad(c, "a malformed none chunk", NULL); break; }
+        } else if (type == CH_ERROR || type == CH_ERROR_OFFSET) {
+            status_t e = chunk_error(c, type, clen, "a read");
+            if (c->broken) { st = e; break; }
+            if (failed == OK) { failed = e; snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg()); }
+            err_clear();
+        } else if (type == CH_OFFSET_DATA) {
+            uint8_t o8[8];
+            if (clen < 8) { st = bad(c, "a short data chunk", NULL); break; }
+            if ((st = rd(c, o8, 8)) != OK) break;
+            uint64_t co = get64(o8), n = clen - 8u;
+            if (co < x->off || co + n > x->off + x->len || co + n < co) { st = bad(c, "a data chunk outside its request", NULL); break; }
+            if (cover_add(x->cov, &x->ncov, co - x->off, co - x->off + n) != 0) { st = bad(c, "overlapping read chunks", NULL); break; }
+            if ((st = rd(c, x->buf + (co - x->off), (size_t)n)) != OK) break;
+        } else if (type == CH_OFFSET_HOLE) {
+            uint8_t p[12];
+            if (clen != 12) { st = bad(c, "a malformed hole chunk", NULL); break; }
+            if ((st = rd(c, p, 12)) != OK) break;
+            uint64_t co = get64(p), n = get32(p + 8);
+            if (n == 0 || co < x->off || co + n > x->off + x->len) { st = bad(c, "a hole chunk outside its request", NULL); break; }
+            if (cover_add(x->cov, &x->ncov, co - x->off, co - x->off + n) != 0) { st = bad(c, "overlapping read chunks", NULL); break; }
+            memset(x->buf + (co - x->off), 0, (size_t)n);
+        } else {
+            st = bad(c, "an unexpected reply chunk type", NULL);
+            break;
+        }
+        if (flags & CH_FLAG_DONE) {
+            if (failed == OK && !covered(x->cov, x->ncov, x->len)) { st = bad(c, "a read reply that left part of the request unanswered", NULL); break; }
+            x->done = 1;
+            x->len = 0;
+            out--;
+        }
+    }
+    for (unsigned i = 0; i < depth; i++) free(q[i].cov);
+    free(q);
+    if (st == OK && failed != OK) st = set_error(failed, "%s", fmsg);
+    return st;
+}
+
 status_t nbd_read(nbd_client_t *c, uint64_t off, void *buf, size_t len)
 {
+    if (off + len > c->size || off + len < off) return set_error(ERR_INVALID, "nbd: a read past the end of the export");
+    if (c->depth > 1 && len > c->req_bytes) return read_pipelined(c, off, buf, len);
     uint8_t *p = buf;
     while (len) {
         uint32_t n = len > c->bs_max ? c->bs_max : (uint32_t)len;

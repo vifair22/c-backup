@@ -6,6 +6,46 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-16 - NBD reads: pipelining and request size (VM disks)
+
+`make bench-nbd` (`bench/nbd.c`): qemu-nbd 11.1.3 over a 1 GiB image of
+incompressible data, raw and qcow2 (the same bytes), read whole by the
+native client in 32 MiB calls, page cache warm (the image is read once
+first, so this is the protocol and qemu-nbd, not the disk). Best of three,
+vfairfield-dt, bench.slice at nice 19, unix socket.
+
+| format | depth | request | MiB/s |
+|--------|------:|--------:|------:|
+| raw    | 1 | 4096 KiB | 3,603 |
+| raw    | 8 | 4096 KiB | 3,857 |
+| raw    | 1 | 1024 KiB | 3,565 |
+| raw    | 8 | 1024 KiB | 3,905 |
+| raw    | 1 |  512 KiB | 3,229 |
+| raw    | 8 |  512 KiB | 7,926 |
+| raw    | 16 | 512 KiB | 7,717 |
+| raw    | 8 |  256 KiB | 8,819 |
+| qcow2  | 1 | 4096 KiB | 3,930 |
+| qcow2  | 8 | 4096 KiB | 3,818 |
+| qcow2  | 1 | 1024 KiB | 4,046 |
+| qcow2  | 8 | 1024 KiB | 4,008 |
+| qcow2  | 1 |  512 KiB | 3,634 |
+| qcow2  | 8 |  512 KiB | 5,356 |
+| qcow2  | 16 | 512 KiB | 4,663 |
+| qcow2  | 8 |  256 KiB | 8,450 |
+
+Depth alone does nothing with large requests: at 4 MiB, eight in flight
+read no faster than one, because qemu-nbd copies each large request
+through on its own and the time goes there, not in round trips. Small
+requests in flight are what helps: depth 8 at 256 KiB reads 2.3x what one
+4 MiB request at a time does (8.8 against 3.6-3.9 GiB/s raw, 8.5 against
+3.9 qcow2). So the defaults are `vm.nbd_queue_depth` 8 and
+`vm.nbd_request_kb` 256, not the 4096 the design guessed; both are
+configurable. The block source asks for 4 MiB windows, so each window is
+sixteen requests in flight. At these rates a full read of a 78 GB raw
+disk (Noah MC) is bound by the disk and the chunker, not the NBD path.
+Measured on a desktop over a unix socket; the online export (QEMU's own
+NBD server in a running VM) is to be measured in UAT.
+
 ## 2026-11-16 - Many small files: state.db settings, restore batches, one LZ4 pass
 
 Three of the proposals in the profile two entries below, built (`perf/many-small-fixes`):

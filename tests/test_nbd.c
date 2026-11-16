@@ -60,7 +60,7 @@ static nbd_client_t *open_with(int fault, unsigned fuzz, const char *bitmap, sta
     srv.fault = fault;
     srv.fuzz_seed = fuzz;
     if (ts_start(&srv, SOCK) != 0) fail_msg("server");
-    nbd_open_opts_t o = { SOCK, "", bitmap, 5 };
+    nbd_open_opts_t o = { SOCK, "", bitmap, 5, 0, 0 };
     nbd_client_t *c = NULL;
     *st = nbd_open(&o, &c);
     return c;
@@ -237,7 +237,7 @@ static void check_image(const char *img, const char *fmt, const uint8_t *want, s
     unlink(sock);
     pid_t p = start_qemu_nbd(img, fmt, sock);
     assert_true(p > 0);
-    nbd_open_opts_t o = { sock, "disk", NULL, 10 };
+    nbd_open_opts_t o = { sock, "disk", NULL, 10, 0, 0 };
     nbd_client_t *c = NULL;
     assert_int_equal(nbd_open(&o, &c), OK);
     assert_int_equal(nbd_size(c), size);

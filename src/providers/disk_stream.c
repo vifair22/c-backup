@@ -153,10 +153,18 @@ static void n_close(void *ctx)
     free(s);
 }
 
+static unsigned g_depth, g_request_kb;
+
+void disk_stream_nbd_tuning(unsigned depth, unsigned request_kb)
+{
+    g_depth = depth > 64 ? 64 : depth;
+    g_request_kb = request_kb > 32768 ? 32768 : request_kb;
+}
+
 status_t disk_stream_nbd(const char *socket, const char *export_name, uint64_t size,
                          sp_block_stream_t *out)
 {
-    nbd_open_opts_t o = { socket, export_name ? export_name : "", NULL, 0 };
+    nbd_open_opts_t o = { socket, export_name ? export_name : "", NULL, 0, g_depth, g_request_kb };
     nbd_client_t *c = NULL;
     status_t st = nbd_open(&o, &c);
     if (st != OK) return st;

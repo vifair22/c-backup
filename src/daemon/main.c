@@ -45,6 +45,7 @@
 #include "fake_provider.h"
 #include "privs.h"
 #include "registry.h"
+#include "disk_stream.h"
 #include "remote_provider.h"
 #include "unit_state.h"
 
@@ -153,6 +154,8 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
      * helper that is not up yet is not fatal: the link keeps trying with a
      * bounded backoff and enables its providers when it answers, and a unit
      * job meanwhile fails naming the socket (remote_provider.h). */
+    disk_stream_nbd_tuning((unsigned)config_get_int(cfg, "vm.nbd_queue_depth", 8),
+                           (unsigned)config_get_int(cfg, "vm.nbd_request_kb", 256));
     const char *hs = config_get_str(cfg, "units.helper_socket");
     if (hs && *hs && remote_start(hs, units_daemon8(), NULL) != OK) {
         log_warn("units: %s; retrying in the background", err_msg());

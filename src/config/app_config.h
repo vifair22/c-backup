@@ -171,6 +171,17 @@ static const config_key_t app_file_keys[] = {
     { "units.helper_socket", CFG_STRING, "",
       "Path of c-backup-helper's socket; empty runs providers in-process",
       CFG_STORE_FILE, 0 },
+    /* VM disks over NBD (docs/vm-backup.md 4.3): reads in flight per disk
+     * and the size of each, clamped by the server's block sizes. */
+    { "vm.nbd_queue_depth", CFG_INT, "8",
+      "NBD reads in flight per VM disk (1 to 64)",
+      CFG_STORE_FILE, 0 },
+    /* 256 KiB at depth 8 measured 2.3x the throughput of 4 MiB requests
+     * against qemu-nbd (PERF.md, 2026-11-16): big requests are copied one
+     * at a time on the server side and pipelining them gains nothing. */
+    { "vm.nbd_request_kb", CFG_INT, "256",
+      "Size of each NBD read of a VM disk, KiB (64 to 32768)",
+      CFG_STORE_FILE, 0 },
     { "units.unit_wait_s", CFG_INT, "3600",
       "Seconds a job waits for a unit another job is backing up (1 to 86400)",
       CFG_STORE_FILE, 0 },

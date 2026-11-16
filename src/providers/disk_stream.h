@@ -23,6 +23,10 @@
 /* A raw image at path, expected to be size bytes. */
 status_t disk_stream_file(const char *path, uint64_t size, sp_block_stream_t *out);
 
+/* The NBD reads in flight per disk and their size in KiB (vm.nbd_queue_depth,
+ * vm.nbd_request_kb); 0 keeps the default (8, 256). */
+void disk_stream_nbd_tuning(unsigned depth, unsigned request_kb);
+
 /* An NBD export on a unix socket, expected to be size bytes. */
 status_t disk_stream_nbd(const char *socket, const char *export_name, uint64_t size,
                          sp_block_stream_t *out);

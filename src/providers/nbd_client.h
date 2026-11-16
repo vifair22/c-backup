@@ -38,6 +38,13 @@ typedef struct {
     const char *export_name;   /* "" for the default export */
     const char *bitmap;        /* qemu:dirty-bitmap:<bitmap> to ask for, or NULL */
     unsigned    timeout_s;     /* per request; 0: 120 */
+    /* Reads in flight on the connection (4.3): a large read is cut into
+     * requests of request_kb and up to depth go out before the first
+     * reply is waited for, the replies matched to their requests by
+     * cookie. 0: 8 and 256 (clamped by the server's block sizes; see
+     * PERF.md for why requests are small and many). */
+    unsigned    depth;
+    unsigned    request_kb;
 } nbd_open_opts_t;
 
 status_t nbd_open(const nbd_open_opts_t *o, nbd_client_t **out);

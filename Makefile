@@ -194,7 +194,7 @@ else
 endif
 
 # ---- Phony targets ----------------------------------------------------
-.PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse analyze lint
+.PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse bench-nbd analyze lint
 
 all:
 	$(MAKE) BUILD_TYPE=release _build
@@ -667,6 +667,13 @@ $(BINS)/bench_phases: $(BENCH)/phases.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) 
 
 $(BINS)/bench_browse: $(BENCH)/browse.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $(filter %.c %.o,$^) -o $@ -flto=auto $(LDFLAGS)
+
+$(BINS)/bench_nbd: $(BENCH)/nbd.c $(REL_LIB_OBJS) | $(BINS)
+	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS)
+
+# NBD read throughput, depth 1 against 8, through qemu-nbd (PERF.md).
+bench-nbd: $(BINS)/bench_nbd
+	$(BINS)/bench_nbd
 
 # An LD_PRELOAD shim, not linked into anything: it delays fsync and fdatasync
 # under chosen directories so bench_phases can model slow sync storage. See
