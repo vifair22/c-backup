@@ -143,6 +143,24 @@ static int db_count(const char *sql)
     return v;
 }
 
+/*
+ * Poll until `sql` counts `want`, for at most about ten seconds, and return
+ * the last count. For a step the worker takes after the job function
+ * returns, which wait_for cannot see: a fixed sleep there is a guess at how
+ * long the worker takes, and under a loaded `make test` the guess loses
+ * (FLAKE-16). The caller still asserts the count, so a step that never
+ * happens fails at the bound instead of passing on a timer.
+ */
+static int wait_db_count(const char *sql, int want)
+{
+    int v = db_count(sql);
+    for (int i = 0; i < 2000 && v != want; i++) {
+        usleep(5000);
+        v = db_count(sql);
+    }
+    return v;
+}
+
 /* ------------------------------------------------------------------ */
 
 /*
@@ -251,7 +269,11 @@ static void test_old_finished_jobs_are_pruned_as_jobs_finish(void **state)
     insert_job("completed", 40LL * 86400);
     submit(1, "gc");
     wait_for(1);
-    usleep(200000);
+    /* The prune runs on the worker after the job function returns and the
+     * job's state and journal entry are written, so wait_for alone returns
+     * before it. Wait for the old row to go, then check what is left. */
+    assert_int_equal(wait_db_count("SELECT COUNT(*) FROM jobs WHERE ended < "
+                                   "strftime('%s','now') - 86400", 0), 0);
     /* The one just run is all that is left. */
     assert_int_equal(db_count("SELECT COUNT(*) FROM jobs"), 1);
     assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE ended < strftime('%s','now') - 86400"), 0);
