@@ -3,6 +3,7 @@
 
 #include "util.h"
 #include "backup.h"
+#include "read_budget.h"
 
 #include "file_cache.h"
 #include "cdc.h"
@@ -1166,9 +1167,8 @@ static status_t store_content(pipeline_t *p)
      * number); each worker holds at most a few max-size chunk buffers.
      */
     unsigned workers = 1;
-    size_t parity_cap = 0;
     store_pool_plan(p->opts->store_workers,
-                    (n_large || small_par) ? UINT32_MAX : 0, &workers, &parity_cap);
+                    (n_large || small_par) ? UINT32_MAX : 0, &workers);
     if (workers > 1 && n_large) {
         if (cdc_workers_start(workers, &p->cdc_w) == OK) {
             log_info("backup: %llu file(s) over %llu MiB, their chunks stored "
@@ -1205,6 +1205,7 @@ static status_t store_content(pipeline_t *p)
     }
     if (!p->cdc_w && !p->spool) workers = 1;
     p->res->store_workers = workers;
+    p->res->file_workers = 1;
 
     /*
      * And files at once, when there are several large ones: one file is
@@ -1214,6 +1215,25 @@ static status_t store_content(pipeline_t *p)
      */
     unsigned fw = workers / 4;
     if ((uint64_t)fw > n_large) fw = (unsigned)n_large;
+    /*
+     * And no more than the buffer budget has writers for: each file worker
+     * opens a pack writer of its own (about 26 MiB of parity encoder and
+     * write buffer, pack_writer_budget_bytes) beside the backup's own. A
+     * writer the budget cannot cover would still work, sealing by reading
+     * its body back, but planning to what fits keeps every writer fast.
+     */
+    uint64_t rb = read_budget_total();
+    if (rb) {
+        uint64_t room = rb > READ_BUDGET_READER_RESERVE ? rb - READ_BUDGET_READER_RESERVE : 0;
+        uint64_t writers = room / pack_writer_budget_bytes();
+        uint64_t files = writers > 1 ? writers - 1 : 0;   /* the backup's own first */
+        if ((uint64_t)fw > files) {
+            log_info("backup: the buffer budget (%llu MiB) has pack writers for %llu "
+                     "large file(s) at once, not %u", (unsigned long long)(rb >> 20),
+                     (unsigned long long)files, fw);
+            fw = (unsigned)files;
+        }
+    }
     if (fw >= 2 && p->cdc_w) {
         p->claims = pack_claims_new();
         if (p->claims) pack_backup_share_claims(p->pack_w, p->claims);
@@ -1225,6 +1245,7 @@ static status_t store_content(pipeline_t *p)
             .out_free = free, .ctx = p,
         };
         if (store_pool_start(p->store, fw, &ops, 1, &p->pool) == OK) {
+            p->res->file_workers = fw;
             log_info("backup: up to %u large files stored at once", fw);
         } else {
             log_warn("backup: cannot start file workers, storing large files "

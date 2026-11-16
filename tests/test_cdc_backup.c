@@ -514,7 +514,7 @@ static void ruin(uint32_t pnum, uint64_t off, size_t n)
 
 /*
  * The copy the index names is no longer that object - its header's name is
- * ruined - so gc must keep the other copy rather than drop the only good
+ * ruined past its parity - so gc must keep the other copy rather than drop the only good
  * one, and having proven it (header, name, payload against the name) moves
  * the index to it. The ruined entry, which no name claims now, goes with
  * its pack, and the restore needs nothing of it.
@@ -526,7 +526,11 @@ static void test_gc_moves_the_index_off_a_ruined_header(void **state)
     uint32_t pnum = 0;
     uint64_t off = 0;
     plant_duplicate(hash, &pnum, &off);
+    /* The name alone is within the stripe's parity (a header is ordinary
+     * body, B119), which would put it back; 600 more bytes in the same
+     * group take that group past what its parity carries. */
     ruin(pnum, off + offsetof(pack_dat_entry_hdr_t, hash), OBJECT_HASH_SIZE);
+    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 100, 600);
 
     gc_result_t g;
     memset(&g, 0, sizeof(g));

@@ -39,6 +39,7 @@
 #include <openssl/evp.h>
 
 #include "backup.h"
+#include "read_budget.h"
 #include "object.h"
 #include "parity.h"
 #include "phase_timer.h"
@@ -413,35 +414,30 @@ static void test_plan(void **state)
 {
     (void)state;
     unsigned w;
-    size_t cap;
 
-    store_pool_plan(1, 100, &w, &cap);
+    store_pool_plan(1, 100, &w);
     assert_int_equal(w, 1);
-    store_pool_plan(3, 100, &w, &cap);
+    store_pool_plan(3, 100, &w);
     assert_int_equal(w, 3);
     /* More workers than files would only idle. */
-    store_pool_plan(8, 2, &w, &cap);
+    store_pool_plan(8, 2, &w);
     assert_int_equal(w, 2);
-    store_pool_plan(0, 1, &w, &cap);
+    store_pool_plan(0, 1, &w);
     assert_int_equal(w, 1);
-    store_pool_plan(0, 0, &w, &cap);
+    store_pool_plan(0, 0, &w);
     assert_int_equal(w, 1);
     /* The ceiling the config key's range matches. */
-    store_pool_plan(1000, 1000, &w, &cap);
+    store_pool_plan(1000, 1000, &w);
     assert_int_equal(w, 64);
 
     /* Automatic: two thirds of the CPUs, within the memory budget. */
-    store_pool_plan(0, 1000, &w, &cap);
+    store_pool_plan(0, 1000, &w);
     unsigned want = store_pool_cpus() * 2 / 3;
     if (want < 1) want = 1;
     uint64_t by_mem = store_pool_mem_budget() / (40u * MIB);
     if (want > by_mem) want = (unsigned)by_mem;
     if (want > 64) want = 64;
     assert_int_equal(w, want);
-    assert_true(cap >= 16u * MIB && cap <= 256u * MIB);
-    /* No worker gets more than its share of the budget. */
-    assert_true((uint64_t)w * (cap + 8u * MIB) <= store_pool_mem_budget() ||
-                cap == 16u * MIB);
 }
 
 static void put_file(const char *path, const char *body)
@@ -820,12 +816,48 @@ static void test_write_counters_match_the_disk(void **state)
     env_close(&e);
 }
 
+
+/*
+ * A buffer budget with room for one pack writer still completes a backup
+ * of several large files on many chunk workers: it stores them one at a
+ * time, on the backup's own writer, and the repository is the one an
+ * unconstrained run writes. The budget is never passed.
+ */
+static void test_small_budget_runs_fewer_writers(void **state)
+{
+    (void)state;
+    make_source();
+
+    env_t a, b;
+    env_open(&a, "roomy");
+    backup_opts_t oa = opts_for(16);
+    backup_result_t ra;
+    assert_int_equal(backup_run(a.store, a.db, a.repo_id, &oa, &ra), OK);
+    assert_true(ra.file_workers >= 2);
+
+    assert_int_equal(read_budget_init(READ_BUDGET_MIN), OK);
+    read_budget_reset_stats();
+    env_open(&b, "tight");
+    backup_opts_t ob = opts_for(16);
+    backup_result_t rb;
+    assert_int_equal(backup_run(b.store, b.db, b.repo_id, &ob, &rb), OK);
+    uint64_t peak = read_budget_peak();
+    assert_int_equal(read_budget_init(0), OK);
+    assert_int_equal(rb.file_workers, 1);
+    assert_true(peak <= READ_BUDGET_MIN);
+
+    assert_same_snapshot(&a, ra.snapshot_id, &b, rb.snapshot_id, TEST_DIR);
+    env_close(&a);
+    env_close(&b);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_plan),
         cmocka_unit_test_setup_teardown(test_memory_budget_reads_cgroup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_same_repository_on_one_or_many_workers, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_small_budget_runs_fewer_writers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failing_file_is_skipped_as_it_is_serially, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_stops_the_workers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_write_counters_match_the_disk, setup, teardown),

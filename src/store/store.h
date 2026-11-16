@@ -271,10 +271,10 @@ typedef struct {
     uint64_t comp_size;
     uint64_t orig_size;
     /* Position in the pack's on-disk entry order, which is what indexes the
-     * parity trailer's offsets table. It is NOT the position of this entry in
-     * the entries array: that array is sorted by hash before it is handed
-     * over. Recording the array position instead makes every parity lookup
-     * read the wrong offsets and silently disables repair. */
+     * trailer's CRC table. It is NOT the position of this entry in the
+     * entries array: that array is sorted by hash before it is handed over.
+     * Recording the array position instead makes every CRC check read
+     * another entry's slot and silently disables repair. */
     uint32_t entry_index;
     /* The object's type, so the commit can create the object's index row
      * when nothing recorded one before the pack was sealed (format 3: a

@@ -670,11 +670,26 @@ plain verify, with the same counts on a healthy repository. The job's
 `result` says which kind of run it was, since the run record does not:
 
 ```json
-{"run_id":12,"level":"deep","repair":false,"dry_run":true,"unsettled_files":0}
+{"run_id":12,"level":"deep","repair":false,"dry_run":true,"unsettled_files":0,
+ "packs_unwalkable":0,"packs_restored":0,"packs_salvaged":0,
+ "unreferenced_dropped_bytes":0,"unreferenced_dropped_ranges":0,"unreferenced_dropped":[]}
 ```
 
 `unsettled_files` is how many file entries the run found flagged as
 possibly torn (below); a notice, never a failure.
+
+`packs_unwalkable` counts packs whose entry headers cannot be walked even
+with parity (the packs gc leaves as they are); each is a finding named
+`pack-NNNNNNNNNN` with status `unwalkable pack`, at every level, and fails
+the run. `packs_restored` counts those a repairing run made walkable again
+by rebuilding their headers from the index; each is a `repaired` finding.
+`packs_salvaged` counts packs that could not be rebuilt (a damaged header
+had no index row) and were salvaged instead: every indexed entry copied into
+a new pack, a `salvaged` finding, and the bytes no row covers dropped and
+reported as `unreferenced_dropped_bytes`, `unreferenced_dropped_ranges` and
+`unreferenced_dropped` (first 16, `{"pack","offset","length"}` in the old
+pack). An indexed entry damaged beyond parity is carried as it is and stays
+an `unrecoverable` finding.
 
 `run_id` is null when the walk did not finish (cancelled or aborted); the
 partial run is still in `GET /repos/<id>/verify`, with `completed` false.
@@ -940,7 +955,7 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `packs_unwalkable`, `unwalkable` (first 16, `{"pack","reason"}`), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` or `packs_unwalkable` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
 | reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten) |
 

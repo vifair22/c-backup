@@ -40,8 +40,9 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
     if (rb < APP_MIN_READ_BUDGET_MB)
         config_check_fail(chk, "jobs.read_budget_mb",
                           "'%d' MiB is under %d MiB, the largest object a "
-                          "repository holds; no object that size could ever be "
-                          "read", rb, APP_MIN_READ_BUDGET_MB);
+                          "repository holds and one pack writer's buffers; no "
+                          "object that size could ever be read beside a backup",
+                          rb, APP_MIN_READ_BUDGET_MB);
     else
         config_check_int_range(chk, "jobs.read_budget_mb", APP_MIN_READ_BUDGET_MB,
                                APP_MAX_READ_BUDGET_MB);
