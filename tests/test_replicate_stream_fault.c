@@ -940,9 +940,63 @@ static void test_damaged_loose_source_replicates_corrected(void **state)
     free(body);
 }
 
+/* Damage 4 KiB of a packed entry: eight times the burst parity rebuilds. */
+static void damage_packed_beyond(const uint8_t hash[OBJECT_HASH_SIZE], uint64_t off)
+{
+    for (int k = 0; k < 8; k++) damage_packed(hash, off + (uint64_t)k * 512u, 512);
+}
+
+static int replica_loads(const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    replica_reader_t *rd = NULL;
+    assert_int_equal(replica_reader_open(TEST_REPL, &rd), OK);
+    int nul = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    assert_true(nul >= 0);
+    status_t st = object_load_stream(replica_reader_store(rd), hash, nul, NULL, NULL);
+    close(nul);
+    err_clear();
+    replica_reader_close(rd);
+    return st == OK;
+}
+
+/*
+ * OWN-31: an object damaged beyond parity is sent, everything else goes
+ * across and the snapshot is recorded, and then the run FAILS, naming the
+ * count and listing the object with its snapshot. Reporting OK would be a
+ * replica silently taking bad data (OWN-11).
+ */
+static void test_damage_beyond_parity_fails_the_run_and_lists_it(void **state)
+{
+    (void)state;
+    big_snapshot();
+    uint8_t hr[OBJECT_HASH_SIZE], hh[OBJECT_HASH_SIZE];
+    file_hash(TEST_SRC "/random.bin", hr);
+    file_hash(TEST_SRC "/half.bin", hh);
+    damage_packed_beyond(hr, 6u * 1024u * 1024u);
+
+    replicate_result_t rr;
+    assert_int_equal(replicate_plain(&rr), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), "replicated with 1 object(s) damaged beyond parity; "
+                                      "the replica holds them as damaged"));
+    err_clear();
+
+    assert_int_equal(rr.snapshots_sent, 1);
+    assert_true(record_exists(TEST_REPL, 1));
+    assert_int_equal(rr.objects_damaged, 1);
+    assert_int_equal(rr.damaged_listed, 1);
+    assert_memory_equal(rr.damaged[0].hash, hr, OBJECT_HASH_SIZE);
+    assert_int_equal(rr.damaged[0].snapshot_id, 1);
+
+    /* The rest arrived intact; the damaged one is held, and reads as damaged. */
+    assert_true(replica_loads(hh));
+    assert_false(replica_loads(hr));
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_damage_beyond_parity_fails_the_run_and_lists_it,
+                                        setup_plain, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_packed_source_replicates_corrected,
                                         setup_plain, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_loose_source_replicates_corrected,

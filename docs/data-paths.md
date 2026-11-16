@@ -489,8 +489,9 @@ Every load verifies before it trusts:
   never shipped to a replica that would compute fresh parity over it. A
   clean object costs one extra sequential read; memory is one window (a
   15 KiB group for loose, at most 64 groups for packed). Damage beyond
-  parity is sent as it is, logged and counted uncorrectable: it was already
-  lost and its hash still exposes it. `object_read_stored` is the
+  parity is sent as it is so one lost object does not block replication,
+  and `object_stored_damaged` says so; `replicate_run` counts and lists
+  those objects and fails the job at the end (OWN-31). `object_read_stored` is the
   whole-buffer form, for tests and inspection, with the same correction.
 
 A pack at or above about 59.75 GiB is not corrected from at all (OWN-30):
@@ -524,7 +525,9 @@ the whole pack to fix a few bytes, on a disk that is already failing.
 gc's rewrite and coalescing copy entries into new packs whose parity is
 computed afresh over what they hold. They check each entry's CRC as the
 bytes go by and rewrite it corrected on a mismatch, so a copy never turns
-damage parity could still fix into damage it protects.
+damage parity could still fix into damage it protects. An entry damaged
+beyond parity is copied as it is and listed in `pack_gc_stats_t`, and
+`gc_run` fails once compaction has finished (OWN-31).
 
 ---
 

@@ -161,6 +161,10 @@ status_t pack_object_open_stored(store_t *store,
 status_t pack_stored_read(pack_stored_reader_t *r, void *buf, size_t n);
 void     pack_stored_close(pack_stored_reader_t *r);
 
+/* After every byte has been read: did any of them carry damage beyond
+ * parity, handed over as it stood? The caller must report it (OWN-31). */
+int      pack_stored_damaged(const pack_stored_reader_t *r);
+
 /*
  * Write a pack out of objects that are already in stored form.
  *
@@ -392,9 +396,22 @@ void pack_resume_removals(store_t *store);
 
 /* Packs pack_gc_stats touched: rewritten without their dead entries, and
  * deleted outright because every entry was dead. Coalescing is not counted. */
+#define PACK_DAMAGED_LIST_MAX 100u
+
 typedef struct {
     uint32_t packs_rewritten;
     uint32_t packs_deleted;
+    /*
+     * Entries copied by a rewrite or a coalesce that carried damage beyond
+     * their parity (OWN-31). They are copied as they are, so one lost
+     * object does not stop compaction for ever, but the new pack's parity
+     * is computed over the damage and nothing can correct it later: the
+     * caller must fail the job, not report it OK. The first
+     * PACK_DAMAGED_LIST_MAX hashes are listed.
+     */
+    uint64_t entries_damaged;
+    uint32_t damaged_listed;
+    uint8_t  damaged[PACK_DAMAGED_LIST_MAX][OBJECT_HASH_SIZE];
 } pack_gc_stats_t;
 
 /* pack_gc, also reporting which packs it rewrote or deleted. stats may be

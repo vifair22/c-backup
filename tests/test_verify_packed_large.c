@@ -591,9 +591,83 @@ static void test_coalesce_corrects_a_damaged_entry(void **state)
     assert_rewritten_clean(h, at.dat, snap, "f02.bin");
 }
 
+/*
+ * OWN-31: a rewrite that copies an entry damaged beyond parity keeps going,
+ * so compaction is not blocked for ever by one lost object, but gc then
+ * fails naming the count and listing the hash. Its new parity covers the
+ * damage, so an OK would hide a loss nothing can correct any more.
+ */
+static void assert_gc_fails_listing(const uint8_t hash[OBJECT_HASH_SIZE], gc_result_t *g)
+{
+    memset(g, 0, sizeof(*g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, g), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), "1 pack entry damaged beyond parity were copied as damaged"));
+    err_clear();
+    assert_int_equal(g->pack_entries_damaged, 1);
+    assert_int_equal(g->damaged_listed, 1);
+    assert_memory_equal(g->damaged[0], hash, OBJECT_HASH_SIZE);
+}
+
+static void test_gc_rewrite_fails_on_damage_beyond_parity(void **state)
+{
+    (void)state;
+    write_random_file("keep.bin", 256 * 1024, 0x4444u);
+    write_random_file("other.bin", 256 * 1024, 0x5555u);
+    write_random_file("drop.bin", 256 * 1024, 0x6666u);
+    int64_t s1 = run_backup();
+    char drop[PATH_MAX];
+    snprintf(drop, sizeof(drop), "%s/drop.bin", TEST_SRC);
+    assert_int_equal(unlink(drop), 0);
+    int64_t s2 = run_backup();
+    assert_int_equal(prune_snapshot(store, db, repo_id, s1), OK);
+
+    uint8_t h[OBJECT_HASH_SIZE]; char x[OBJECT_HASH_SIZE * 2 + 1];
+    hash_of("keep.bin", x, h);
+    entry_at_t at;
+    entry_at(h, &at);
+    smash(at.dat, at.payload + 100000, 4096, NULL);
+
+    gc_result_t g;
+    assert_gc_fails_listing(h, &g);
+    assert_true(g.swept >= 1);           /* the sweep and the rewrite still ran */
+    assert_true(g.packs_rewritten >= 1);
+
+    /* The other live object came through the rewrite intact. */
+    uint8_t ho[OBJECT_HASH_SIZE]; char xo[OBJECT_HASH_SIZE * 2 + 1];
+    hash_of("other.bin", xo, ho);
+    void *out = NULL;
+    size_t len = 0;
+    assert_int_equal(object_load(store, ho, &out, &len, NULL), OK);
+    free(out);
+    (void)s2;
+}
+
+static void test_coalesce_fails_on_damage_beyond_parity(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 10; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "f%02d.bin", i);
+        write_random_file(name, 64 * 1024, 0x7000u + (uint32_t)i);
+        (void)run_backup();
+    }
+    int before = count_pack_files();
+    uint8_t h[OBJECT_HASH_SIZE]; char x[OBJECT_HASH_SIZE * 2 + 1];
+    hash_of("f01.bin", x, h);
+    entry_at_t at;
+    entry_at(h, &at);
+    smash(at.dat, at.payload + 30000, 4096, NULL);
+
+    gc_result_t g;
+    assert_gc_fails_listing(h, &g);
+    assert_true(count_pack_files() < before);   /* the coalesce still happened */
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_gc_rewrite_fails_on_damage_beyond_parity, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_coalesce_fails_on_damage_beyond_parity, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_rewrite_corrects_a_damaged_live_entry, setup, teardown),
         cmocka_unit_test_setup_teardown(test_coalesce_corrects_a_damaged_entry, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_packed_entries_restore_and_verify_clean, setup, teardown),

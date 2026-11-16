@@ -114,6 +114,9 @@ echo "content one" > "$WORK/src/one.txt"
 head -c 65536 /dev/urandom > "$WORK/src/random.bin"
 echo "content two" > "$WORK/src/two.txt"
 
+# info, not warn: the OWN-31 checks read the line the job manager logs as it
+# sends a failure notification, the only trace that path leaves with
+# Pushover unconfigured.
 cat > "$WORK/config.yaml" <<EOF
 db:
   path: $WORK/state.db
@@ -122,7 +125,7 @@ http:
   port: $PORTBASE
   bind: 127.0.0.1
 log:
-  level: warn
+  level: info
 security:
   key_dir: $WORK/keys
 EOF
@@ -1379,6 +1382,84 @@ check "the environment's key directory wins over the file's" 1 \
 check "and the file's is not used" 0 \
     "$(find "$WORK/filekeys" -name '*.key' 2>/dev/null | wc -l | tr -d ' ')"
 kill $ENV_PID 2>/dev/null; wait $ENV_PID 2>/dev/null
+
+echo "damage beyond parity (OWN-31)"
+
+# Overwrite 4 KiB of a file's stored bytes inside a pack, 8 KiB into it:
+# eight times the burst parity can rebuild. The file is incompressible and
+# the repository unencrypted, so its bytes sit in the pack as they are and
+# can be found by content.
+damage_beyond_parity() {  # damage_beyond_parity <sample> <pack>
+    local pat hex at
+    pat=$(head -c 32 "$1" | od -An -tx1 -v | tr -d ' \n')
+    hex=$(od -An -tx1 -v "$2" | tr -d ' \n')
+    at=$(printf '%s' "$hex" | grep -obF "$pat" | head -1 | cut -d: -f1)
+    [ -n "$at" ] && [ $((at % 2)) -eq 0 ] || return 1
+    head -c 4096 /dev/urandom | \
+        dd of="$2" bs=1 seek=$((at / 2 + 8192)) conv=notrunc status=none
+}
+
+# The failure path is the job manager's: it marks the job failed and sends
+# the alert, and the line it logs as it sends is the evidence.
+alerted() {  # alerted <job-id>
+    grep -q "sending failure notification for job $1:" "$WORK/daemon.log"
+}
+job_of() {  # job_of <failed job document>: its id, the first "id" in it
+    printf '%s' "$1" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2
+}
+
+# Replication ships everything, records the snapshot, and fails the job
+# naming the damaged object. It used to log the damage and report OK.
+mkdir -p "$WORK/dmgsrc"
+head -c 65536 /dev/urandom > "$WORK/dmgsrc/lost.bin"
+echo "an intact neighbour" > "$WORK/dmgsrc/ok.txt"
+DMG_ID=$(cb repo add "$WORK/dmgrepo" dmg | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+cb backup "$DMG_ID" "$WORK/dmgsrc" > /dev/null
+LOST_HASH=$(sha256sum "$WORK/dmgsrc/lost.bin" | cut -c1-64)
+DMG_DAT=$(find "$WORK/dmgrepo/packs" -name '*.dat' | head -1)
+if damage_beyond_parity "$WORK/dmgsrc/lost.bin" "$DMG_DAT"; then
+    OUT=$(cb replicate "$DMG_ID" "$WORK/dmgrepl" 2>"$WORK/dmg.err"); RC=$?
+    ERR=$(cat "$WORK/dmg.err")
+    check    "replicating damage beyond parity exits non-zero" 1 "$RC"
+    contains "the job is failed"               '"state":"failed"' "$ERR"
+    contains "the failure says what happened" \
+        "replicated with 1 object(s) damaged beyond parity; the replica holds them as damaged" "$ERR"
+    contains "the result lists the object"     "$LOST_HASH" "$OUT$ERR"
+    contains "and counts it"                   '"objects_damaged":1' "$OUT$ERR"
+    contains "everything else was still sent"  '"snapshots_sent":1' "$OUT$ERR"
+    DJ=$(job_of "$ERR")
+    if [ -n "$DJ" ] && alerted "$DJ"; then ok "the failure alert was sent"
+    else bad "the failure alert was sent" "a notification for job '$DJ'" "none"; fi
+else
+    bad "damage fixture" "the file's bytes in the pack" "not found"
+fi
+
+# gc rewriting a pack copies the damaged entry as it is, finishes, and fails.
+mkdir -p "$WORK/gcdsrc"
+head -c 65536 /dev/urandom > "$WORK/gcdsrc/keep.bin"
+head -c 65536 /dev/urandom > "$WORK/gcdsrc/drop.bin"
+GCD_ID=$(cb repo add "$WORK/gcdrepo" gcd | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+cb backup "$GCD_ID" "$WORK/gcdsrc" > /dev/null
+rm -f "$WORK/gcdsrc/drop.bin"
+cb backup "$GCD_ID" "$WORK/gcdsrc" > /dev/null
+cb snapshot delete "$GCD_ID" 1 --force > /dev/null
+KEEP_HASH=$(sha256sum "$WORK/gcdsrc/keep.bin" | cut -c1-64)
+GCD_DAT=$(find "$WORK/gcdrepo/packs" -name '*.dat' -size +100k | head -1)
+if [ -n "$GCD_DAT" ] && damage_beyond_parity "$WORK/gcdsrc/keep.bin" "$GCD_DAT"; then
+    OUT=$(cb gc "$GCD_ID" 2>"$WORK/gcd.err"); RC=$?
+    ERR=$(cat "$WORK/gcd.err")
+    check    "gc that copies damage beyond parity exits non-zero" 1 "$RC"
+    contains "the gc job is failed"           '"state":"failed"' "$ERR"
+    contains "the gc failure says what happened" \
+        "1 pack entry damaged beyond parity were copied as damaged" "$ERR"
+    contains "the gc result lists the entry"  "$KEEP_HASH" "$OUT$ERR"
+    contains "and counts it"                  '"pack_entries_damaged":1' "$OUT$ERR"
+    GJ=$(job_of "$ERR")
+    if [ -n "$GJ" ] && alerted "$GJ"; then ok "the gc failure alert was sent"
+    else bad "the gc failure alert was sent" "a notification for job '$GJ'" "none"; fi
+else
+    bad "gc damage fixture" "the file's bytes in the pack" "not found"
+fi
 
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?

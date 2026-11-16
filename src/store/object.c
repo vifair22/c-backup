@@ -2621,6 +2621,13 @@ status_t object_stored_read(object_stored_reader_t *r, void *buf, size_t n)
     return OK;
 }
 
+int object_stored_damaged(const object_stored_reader_t *r)
+{
+    if (!r) return 0;
+    if (r->p) return pack_stored_damaged(r->p);
+    return r->bad > 0;
+}
+
 void object_stored_close(object_stored_reader_t *r)
 {
     if (!r) return;

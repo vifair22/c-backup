@@ -1112,6 +1112,11 @@ status_t pack_stored_read(pack_stored_reader_t *r, void *buf, size_t n)
     return OK;
 }
 
+int pack_stored_damaged(const pack_stored_reader_t *r)
+{
+    return r && r->bad > 0;
+}
+
 void pack_stored_close(pack_stored_reader_t *r)
 {
     if (!r) return;
@@ -4612,6 +4617,10 @@ typedef struct {
     pack_dat_hdr_t         hdr;
     uint64_t               body;
     uint32_t               cur_first, cur_n;
+
+    /* Where entries copied with damage beyond parity are noted (OWN-31);
+     * NULL when nobody asked. */
+    pack_gc_stats_t       *stats;
 } pack_rw_t;
 
 /* cap is the most entries the rewrite can copy: the caller knows it from
@@ -4654,6 +4663,15 @@ static status_t pack_rw_seal(pack_rw_t *rw)
     return OK;
 }
 
+/* Note an entry copied with damage beyond parity (OWN-31). */
+static void note_damaged(pack_gc_stats_t *stats, const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    if (!stats) return;
+    if (stats->damaged_listed < PACK_DAMAGED_LIST_MAX)
+        memcpy(stats->damaged[stats->damaged_listed++], hash, OBJECT_HASH_SIZE);
+    stats->entries_damaged++;
+}
+
 /*
  * Rewrite the payload just copied to out at out_pay, this time corrected
  * from the source entry's parity a window at a time.
@@ -4662,12 +4680,14 @@ static status_t pack_rw_seal(pack_rw_t *rw)
  * and CRC are computed afresh over whatever bytes it holds, so a damaged
  * byte copied as it stands is protected from then on as if it were right,
  * and the old pack - the only thing that could still have corrected it - is
- * about to be deleted. Damage beyond parity is copied as it is and said so;
+ * about to be deleted. Damage beyond parity is copied as it is, noted in the
+ * gc stats so the job fails (OWN-31), and logged;
  * it was lost before the copy, and the hash still exposes it.
  */
 static status_t pack_rw_copy_repaired(FILE *out, off_t out_pay, FILE *src, off_t src_pay,
                                       const entry_parity_t *ep,
-                                      const pack_dat_entry_hdr_t *ehdr)
+                                      const pack_dat_entry_hdr_t *ehdr,
+                                      pack_gc_stats_t *stats)
 {
     const size_t groups  = parity_window_groups();
     const size_t win     = groups * EP_GROUP_DATA;
@@ -4703,6 +4723,7 @@ static status_t pack_rw_copy_repaired(FILE *out, off_t out_pay, FILE *src, off_t
         log_warn("pack rewrite: %s is damaged beyond its parity (%llu group(s)); "
                  "copied as it is", hex, (unsigned long long)bad);
         parity_stats_add_uncorrectable(1);
+        note_damaged(stats, ehdr->hash);
     } else if (fixed > 0) {
         log_warn("pack rewrite: %s corrected from parity while copying (%lld byte(s))",
                  hex, (long long)fixed);
@@ -4785,7 +4806,8 @@ static status_t pack_rw_copy(pack_rw_t *rw, FILE *src, const pack_dat_entry_hdr_
         remaining -= want;
     }
     if (have_parity && ep.rs_sz > 0 && ehdr->compressed_size > 0 && crc != ep.payload_crc) {
-        status_t st = pack_rw_copy_repaired(rw->cur, out_pay, src, src_pay, &ep, ehdr);
+        status_t st = pack_rw_copy_repaired(rw->cur, out_pay, src, src_pay, &ep, ehdr,
+                                            rw->stats);
         if (st != OK) return st;
     }
 
@@ -4920,7 +4942,8 @@ static status_t pack_rw_replace(pack_rw_t *rw, const uint32_t *old_nums, size_t 
 }
 
 static status_t maybe_coalesce_packs(store_t *store,
-                                     const uint8_t *refs, size_t refs_cnt) {
+                                     const uint8_t *refs, size_t refs_cnt,
+                                     pack_gc_stats_t *stats) {
     pack_resume_deleting(store);
     pack_meta_t *meta = NULL;
     size_t pack_cnt = 0;
@@ -4992,6 +5015,7 @@ static status_t maybe_coalesce_packs(store_t *store,
      * durable installs, rows moved, then the marker and the removals. */
     pack_rw_t rw;
     status_t rc = pack_rw_init(&rw, store, (uint32_t)total_entries);
+    rw.stats = stats;
     if (rc != OK) { free(cand); return rc; }
 
     const size_t CHUNK = 128 * 1024;
@@ -5273,7 +5297,7 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
                                 const uint8_t *refs, size_t refs_cnt,
                                 char *chunk, size_t chunk_sz,
                                 uint32_t *out_kept, uint32_t *out_dropped,
-                                uint32_t *out_written)
+                                uint32_t *out_written, pack_gc_stats_t *stats)
 {
     *out_kept = 0;
     *out_dropped = 0;
@@ -5285,6 +5309,7 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
     pack_rw_t rw;
     status_t st = pack_rw_init(&rw, store, count);
     if (st != OK) { fclose(old); return st; }
+    rw.stats = stats;
 
     uint32_t dropped = 0;
     for (uint32_t i = 0; st == OK && i < count; i++) {
@@ -5433,7 +5458,7 @@ status_t pack_gc_stats(store_t *store,
         uint32_t kept = 0, dropped = 0, written = 0;
         status_t st = gc_rewrite_pack(store, pnum, dat_path, disk_idx, count,
                                       refs, refs_cnt, gc_chunk, GC_CHUNK,
-                                      &kept, &dropped, &written);
+                                      &kept, &dropped, &written, stats);
         free(disk_idx);
         if (st == ERR_BUSY) {
             /* Cancelled mid-rewrite, with nothing installed: the pack is
@@ -5464,7 +5489,7 @@ status_t pack_gc_stats(store_t *store,
         return set_error(ERR_BUSY, "pack compaction cancelled");
     }
 
-    status_t coalesce_st = maybe_coalesce_packs(store, refs, refs_cnt);
+    status_t coalesce_st = maybe_coalesce_packs(store, refs, refs_cnt, stats);
     if (coalesce_st != OK)
         log_warn("pack-coalesce: skipped due to error");
 

@@ -678,8 +678,12 @@ instead of being overwritten. The job fails, saying which, when `dest` is
 not a repository, is a replica of the source, or is encrypted and its key is
 not on this host. The job's result reports `snapshots_sent`,
 `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent`,
-`subtrees_skipped` and `reencrypted`. Re-encrypting is a manual operation: the
-schedule route does not store `reencrypt`.
+`subtrees_skipped` and `reencrypted`. An object damaged beyond parity is
+sent and the run finishes, then the job fails with `replicated with N
+object(s) damaged beyond parity; the replica holds them as damaged`, and the
+result adds `objects_damaged`, `damaged` (the first 100, each
+`{"hash","snapshot"}`) and `damaged_listed`. Re-encrypting is a manual
+operation: the schedule route does not store `reencrypt`.
 
 There is no delete. Retention at the target belongs to the target, which is
 what stops a compromised source from taking the offsite copy with it.
@@ -767,8 +771,8 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed` |
-| replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted` |
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
+| replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
 | pack | `loose` (loose objects found), `packed`, `skip_marked` (already marked incompressible, left loose), `incompressible` (marked by this run's probe, left loose), `reason` |
 
 A pack's `reason` is `null` when it packed something, and otherwise says why

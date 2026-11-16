@@ -195,6 +195,13 @@ typedef struct {
     const repo_key_t          *dst_key;
 } replica_sink_t;
 
+#define REPLICATE_DAMAGED_LIST_MAX 100u
+
+typedef struct {
+    uint8_t hash[OBJECT_HASH_SIZE];
+    int64_t snapshot_id;          /* the snapshot it was sent for; 0 from replicate_tree */
+} replicate_damaged_t;
+
 typedef struct {
     uint64_t snapshots_sent;
     uint64_t snapshots_skipped;   /* already complete at the target */
@@ -202,6 +209,17 @@ typedef struct {
     uint64_t objects_sent;
     uint64_t bytes_sent;          /* stored bytes, so what crossed the link */
     uint64_t subtrees_skipped;    /* trees present, and everything beneath */
+
+    /*
+     * Objects sent damaged beyond parity (OWN-31). The run ships them and
+     * carries on, so one lost object does not block replication for ever,
+     * but the replica stores them under fresh parity that cannot correct
+     * them: replicate_run fails when this is non-zero. The first
+     * REPLICATE_DAMAGED_LIST_MAX are listed.
+     */
+    uint64_t            objects_damaged;
+    uint32_t            damaged_listed;
+    replicate_damaged_t damaged[REPLICATE_DAMAGED_LIST_MAX];
 } replicate_result_t;
 
 /*
@@ -214,6 +232,9 @@ typedef struct {
  *
  * Does not record the snapshot: the caller does that once this returns OK,
  * which is what makes the record mean "everything beneath it is here".
+ * An object sent damaged beyond parity is counted in out->objects_damaged
+ * and does not fail the walk; the tree is complete, if not intact, and it
+ * is replicate_run that turns the count into a failure.
  */
 status_t replicate_tree(store_t *store, replica_sink_t *sink,
                         const uint8_t root_tree_hash[OBJECT_HASH_SIZE],
@@ -226,6 +247,11 @@ status_t replicate_tree(store_t *store, replica_sink_t *sink,
  * run returns ERR_BUSY with whatever was completed already committed: the
  * bottom-up ordering means an interruption costs the current snapshot, never
  * a previous one.
+ *
+ * Objects damaged beyond parity are sent and the run goes on to the end,
+ * then it returns ERR_CORRUPT naming how many: the replica holds them as
+ * damaged, and a job that reported OK would be OWN-11 again - a replica
+ * silently taking bad data. out lists them with their snapshots.
  */
 status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                        replica_sink_t *sink, atomic_int *cancel,
