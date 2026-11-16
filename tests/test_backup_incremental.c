@@ -35,6 +35,7 @@
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
+#include "scratch_ancestors.h"
 #include "test_tmp.h"
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_incr"
@@ -148,18 +149,38 @@ static void test_unchanged_rebackup_writes_nothing(void **state)
     (void)state;
     backup_opts_t o = basic_opts();
     backup_result_t first, second;
+    scratch_ancestors_t before, after;
 
+    scratch_ancestors_read(TEST_SRC, &before);
     assert_int_equal(backup_run(store, db, repo_id, &o, &first), OK);
     assert_true(first.objects_new > 0);
     assert_true(first.trees_new > 0);
 
     assert_int_equal(backup_run(store, db, repo_id, &o, &second), OK);
+    scratch_ancestors_read(TEST_SRC, &after);
     assert_int_equal(second.snapshot_id, 2);
     assert_int_equal(second.files, first.files);
 
     assert_int_equal(second.objects_new, 0);
-    assert_int_equal(second.trees_new, 0);
-    assert_int_equal(second.trees_reused, first.trees_new + first.trees_reused);
+    assert_int_equal(second.trees_new + second.trees_reused,
+                     first.trees_new + first.trees_reused);
+
+    /* The ancestors above TEST_SRC are the machine's and may move between
+     * the two runs (see scratch_ancestors.h); the source tree may not. */
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(DISTINCT hex(n.subtree_hash)), COUNT(*) FROM nodes n"
+        " JOIN nodes p ON p.repo_id = n.repo_id AND p.id = n.parent_node_id"
+        " WHERE n.name = 'src' AND p.name = 'c_backup_test_incr'",
+        NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "1");
+    assert_string_equal(r->rows[0][1], "2");
+    db_result_free(r);
+
+    if (!scratch_ancestors_moved(&before, &after))
+        assert_int_equal(second.trees_new, 0);
+    else   /* at most every ancestor and the synthetic root */
+        assert_true(second.trees_new <= scratch_ancestors_count(&after) + ROOT_TREES);
 }
 
 /*

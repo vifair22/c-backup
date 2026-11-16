@@ -10,8 +10,11 @@
  * from the snapshot records each time, so it is self-correcting, and a
  * reachability walk is exactly what the tree structure already supports.
  *
- * The refcount column is used as the mark bit, which keeps it meaningful for
- * anything that wants to know how many snapshots reference an object.
+ * The refcount column is used as the mark bit, which leaves it meaningful for
+ * anything that wants to know how many references an object has - as of the
+ * last gc (or reindex, which counts the same way). Nothing else maintains
+ * it: a backup records new objects at 0 and a prune does not decrement, so
+ * between runs it is stale in both directions (NIT-11, docs/api.md).
  */
 
 #include "error.h"
@@ -34,6 +37,10 @@ typedef struct {
      * nothing in them was alive. */
     uint32_t packs_rewritten;
     uint32_t packs_deleted;
+    /* Small packs the coalescing pass merged, and how many fewer pack
+     * files that left: 20 merged into 3 is 20 and 17. */
+    uint32_t packs_coalesced;
+    uint32_t packs_removed_by_coalesce;
     /* Staging files an interrupted run left in tmp/, removed by this run.
      * A dry run removes none. */
     uint32_t tmp_files_removed;

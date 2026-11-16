@@ -278,7 +278,7 @@ status_t scheduler_tick(scheduler_t *sched, time_t now)
          */
         trigger_t parsed;
         if (trigger_parse(r->rows[i][5], &parsed) != OK) {
-            char why[320];
+            char why[ERR_MSG_MAX + 32];
             snprintf(why, sizeof(why), "invalid trigger: %s", err_msg());
             err_clear();
             disable_schedule(sched->db, sid, why);
@@ -308,7 +308,7 @@ status_t scheduler_tick(scheduler_t *sched, time_t now)
          * kept its old due time would fire again on the next tick, and every
          * tick after that. */
         if (scheduler_recompute(sched->db, sid, now) != OK) {
-            char why[320];
+            char why[ERR_MSG_MAX + 32];
             snprintf(why, sizeof(why), "%s", err_msg());
             err_clear();
             disable_schedule(sched->db, sid, why);

@@ -85,8 +85,9 @@ static api_response_t handle_setup_post(const api_request_t *req, void *ud)
     if (!req->body) return api_error(400, "request body required");
 
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-    if (json_req_parse(req->body, req->body_len, &body) != 0)
-        return api_error(400, "invalid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     CUTILS_AUTOFREE char *password = NULL;
     jreq_err_t je;
@@ -114,8 +115,9 @@ static api_response_t handle_login(const api_request_t *req, void *ud)
     if (!req->body) return api_error(400, "request body required");
 
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-    if (json_req_parse(req->body, req->body_len, &body) != 0)
-        return api_error(400, "invalid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     CUTILS_AUTOFREE char *password = NULL;
     jreq_err_t je;
@@ -209,8 +211,9 @@ static api_response_t handle_password(const api_request_t *req, void *ud)
     if (!req->body) return api_error(400, "request body required");
 
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-    if (json_req_parse(req->body, req->body_len, &body) != 0)
-        return api_error(400, "invalid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     CUTILS_AUTOFREE char *current = NULL;
     CUTILS_AUTOFREE char *next = NULL;

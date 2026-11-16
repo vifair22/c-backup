@@ -1027,6 +1027,21 @@ static int snap_job_needs_key(snap_job_kind_t kind)
 }
 
 /*
+ * The repo lock the job manager takes for a job before it starts.
+ *
+ * Restore reads the repo; reindex rewrites index rows for it. Both take the
+ * write lock, because a reindex racing a backup would interleave two writers
+ * over the same snapshot rows. A verify that only checks is the one job that
+ * writes nothing, so it takes the read lock. With repair on it rewrites
+ * object bytes and needs the write lock like everything else.
+ */
+static job_lock_t snap_job_lock(const snap_job_t *j)
+{
+    return (j->kind == SNAP_JOB_VERIFY && !j->verify_repair) ? JOB_LOCK_READ
+                                                             : JOB_LOCK_WRITE;
+}
+
+/*
  * What a gc did, or would do, on the job and in the journal.
  *
  * gc and gc --dry-run both printed a bare job record: the counts reached the
@@ -1081,12 +1096,13 @@ static int64_t repl_snap_at(const void *list, uint32_t i)
 
 static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
 {
-    char js[512];
+    char js[640];
     snprintf(js, sizeof(js),
              "{\"dry_run\":%s,\"reachable\":%llu,\"objects_swept\":%llu,"
              "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
              "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
-             "\"packs_deleted\":%u,\"tmp_files_removed\":%u,"
+             "\"packs_deleted\":%u,\"packs_coalesced\":%u,"
+             "\"packs_removed_by_coalesce\":%u,\"tmp_files_removed\":%u,"
              "\"tmp_bytes_removed\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
@@ -1095,6 +1111,7 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              (unsigned long long)gr->pack_entries_kept,
              (unsigned long long)gr->pack_entries_dropped,
              gr->packs_rewritten, gr->packs_deleted,
+             gr->packs_coalesced, gr->packs_removed_by_coalesce,
              gr->tmp_files_removed,
              (unsigned long long)gr->tmp_bytes_removed);
     char *full = with_damaged(js, "pack_entries_damaged", gr->pack_entries_damaged,
@@ -1117,11 +1134,13 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
     else
         snprintf(msg, sizeof(msg),
                  "swept %llu object%s (%llu bytes); %u pack%s rewritten, "
-                 "%u deleted; %u stale temp file%s removed",
+                 "%u deleted, %u coalesced into %u; %u stale temp file%s removed",
                  (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
                  (unsigned long long)gr->bytes_freed,
                  gr->packs_rewritten, gr->packs_rewritten == 1 ? "" : "s",
                  gr->packs_deleted,
+                 gr->packs_coalesced,
+                 gr->packs_coalesced - gr->packs_removed_by_coalesce,
                  gr->tmp_files_removed, gr->tmp_files_removed == 1 ? "" : "s");
     if (gr->pack_entries_damaged > 0) {
         size_t n = strlen(msg);
@@ -1198,33 +1217,16 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
 {
     snap_job_t *j = arg;
 
-    /*
-     * Restore reads the repo; reindex rewrites index rows for it. Both take
-     * the write lock, because a reindex racing a backup would interleave two
-     * writers over the same snapshot rows.
-     *
-     * A verify that only checks is the one job that does not write anything,
-     * so it takes the read lock and a backup can run underneath it. With
-     * repair on it rewrites object bytes and needs the write lock like
-     * everything else.
-     */
-    status_t st;
-    int read_only_job = (j->kind == SNAP_JOB_VERIFY && !j->verify_repair);
-    if (read_only_job) {
-        st = repo_lock_read(j->repo_id);
-    } else {
-        st = repo_trylock_write(j->repo_id);
-    }
-    if (st != OK) return st;
-
+    /* The job manager holds this job's repo lock, in the mode
+     * snap_job_lock chose, for the whole of this call. */
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    st = snap_job_needs_key(j->kind)
-             ? repo_store_open_keyed(j->repo_path, NULL, &store)
-             : repo_store_open(j->repo_path, NULL, &store);
-    if (st != OK) { repo_unlock(j->repo_id); return st; }
+    status_t st = snap_job_needs_key(j->kind)
+                      ? repo_store_open_keyed(j->repo_path, NULL, &store)
+                      : repo_store_open(j->repo_path, NULL, &store);
+    if (st != OK) return st;
     st = store_index_bind(store, j->db, j->repo_id, &idx);
-    if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
+    if (st != OK) { store_close(store); return st; }
     /* Every loop below the engine boundary that can run for a whole large
      * object checks this; see store_set_cancel. */
     store_set_cancel(store, cancel);
@@ -1452,7 +1454,6 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
 
     store_index_free(idx);
     store_close(store);
-    repo_unlock(j->repo_id);
     return st;
 }
 
@@ -1517,9 +1518,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "pattern is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         /* A field of the wrong type is refused by name. path_prefix and
          * max_files used to be dropped when they were, so the search ran
@@ -1587,9 +1589,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "dest is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         jreq_err_t je;
         int rc = jreq_str(body, "dest", &j->dest, &je);
@@ -1616,9 +1619,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "dest is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         /*
          * Every field is read for its type before any is acted on.
@@ -1715,8 +1719,9 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
                        : kind == SNAP_JOB_PACK    ? "pack"
                        : kind == SNAP_JOB_REPLICATE ? "replicate"
                                                   : "restore";
-    status_t st = job_submit(g_ctx.jm, repo_id, action,
-                             NULL, snap_job_run, j, snap_job_free, &job_id);
+    status_t st = job_submit_locked(g_ctx.jm, repo_id, snap_job_lock(j), action,
+                                    NULL, 0, snap_job_run, j, snap_job_free,
+                                    &job_id);
     if (st != OK) return api_error(st == ERR_BUSY ? 503 : 500, err_msg());
 
     char *out = NULL;
@@ -2071,7 +2076,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     prune_info_t info;
     st = prune_snapshot_checked(store, g_ctx.db, repo_id, snap_id, force, &info);
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    char why[512];
+    char why[ERR_MSG_MAX];
     snprintf(why, sizeof(why), "%s", st == OK ? "" : err_msg());
     store_close(store);
     repo_unlock(repo_id);
@@ -2081,7 +2086,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     if (st == ERR_NOT_FOUND) return api_error(404, "no such snapshot");
     if (st == ERR_INVALID && info.ntags > 0) return api_error(409, why);
 
-    char msg[640];
+    char msg[ERR_MSG_MAX + 64];
     if (st != OK) {
         snprintf(msg, sizeof(msg), "snapshot %lld: %s", (long long)snap_id, why);
         journal_record(g_ctx.db, repo_id, "api", "snapshot-delete", "failed", took_ms, msg);
@@ -2218,9 +2223,9 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
         }
     }
 
-    return job_submit_scheduled(jm ? jm : g_ctx.jm, repo_id, action, NULL,
-                                schedule_id, snap_job_run, j, snap_job_free,
-                                out_job_id);
+    return job_submit_locked(jm ? jm : g_ctx.jm, repo_id, snap_job_lock(j),
+                             action, NULL, schedule_id, snap_job_run, j,
+                             snap_job_free, out_job_id);
 }
 
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)
