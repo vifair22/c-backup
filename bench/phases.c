@@ -60,6 +60,7 @@
  */
 
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -283,6 +284,25 @@ static void evict(const char *src)
     (void)nftw(src, evict_one, 32, FTW_PHYS | FTW_MOUNT);
 }
 
+/* ---------- profiler segments ---------- */
+
+/*
+ * bench/prof_shim.c, when it is preloaded, reports its counters and tags its
+ * samples per step; prof_mark is how a step says it has started. Looked up
+ * rather than linked, so the benchmark neither needs nor notices the shim.
+ */
+static void prof_mark(const char *label)
+{
+    static void (*fn)(const char *);
+    static int looked;
+    if (!looked) {
+        void *p = dlsym(RTLD_DEFAULT, "prof_mark");
+        memcpy(&fn, &p, sizeof(p));
+        looked = 1;
+    }
+    if (fn) fn(label);
+}
+
 /* ---------- reporting ---------- */
 
 /* Bytes this process caused to be sent to storage, or 0 where the kernel
@@ -415,6 +435,7 @@ static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
 
     if (o->cold) evict(src);
     section(label);
+    prof_mark(label);
     memset(res, 0, sizeof(*res));
     uint64_t wb0 = proc_write_bytes();
     double t0 = bench_now();
@@ -462,6 +483,7 @@ static int timed_restore(const opts_t *o, bench_env_t *e, int64_t snap_id,
     memset(&rr, 0, sizeof(rr));
 
     section("restore");
+    prof_mark("restore");
     double t0 = bench_now();
     status_t st = restore_run(e->store, e->db, e->repo_id, snap_id, dst, &ro, &rr);
     double t = finish_timing(o, t0);
@@ -636,6 +658,7 @@ int main(int argc, char **argv)
         printf("  source holds %" PRIu64 " files, %.1f MiB\n",
                ts.files, (double)ts.bytes / (1024.0 * 1024.0));
     } else {
+        prof_mark("generate");
         if (generate(&o, src, &ts) != 0) { bench_rm_tree(o.work); return 1; }
         printf("  generated %" PRIu64 " files, %.1f MiB in %.2fs\n",
                ts.files, (double)ts.bytes / (1024.0 * 1024.0), bench_now() - t0);
@@ -656,6 +679,7 @@ int main(int argc, char **argv)
 
 out:
     bench_env_close(&e);
+    prof_mark("cleanup");
     if (o.keep) printf("\nkept %s\n", o.work);
     else if (bench_rm_tree(o.work) != 0) rc = 1;
     return rc;

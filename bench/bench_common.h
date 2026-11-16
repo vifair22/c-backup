@@ -112,6 +112,20 @@ static inline int bench_env_open(bench_env_t *e, const char *dir)
         fprintf(stderr, "bench: cannot open %s\n", dbp);
         return -1;
     }
+    /*
+     * Extra SQL run once on the fresh handle, for trying connection settings
+     * the daemon does not apply (synchronous, cache_size, wal_autocheckpoint):
+     * BENCH_DB_PRAGMAS="PRAGMA synchronous=NORMAL; PRAGMA cache_size=-65536".
+     * Unset, the handle is exactly the daemon's.
+     */
+    const char *pragmas = getenv("BENCH_DB_PRAGMAS");
+    if (pragmas && *pragmas) {
+        if (db_exec_raw(e->db, pragmas) != 0) {
+            fprintf(stderr, "bench: BENCH_DB_PRAGMAS failed\n");
+            return -1;
+        }
+        printf("  state.db settings: %s\n", pragmas);
+    }
     if (db_run_lib_migrations(e->db) != 0 ||
         db_run_compiled_migrations(e->db, app_migrations) != 0) {
         fprintf(stderr, "bench: migrations failed\n");
