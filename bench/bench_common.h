@@ -29,6 +29,7 @@
 
 #include "error.h"
 #include "repo.h"
+#include "state_db.h"
 #include "store.h"
 #include "store_index.h"
 
@@ -112,6 +113,33 @@ static inline int bench_env_open(bench_env_t *e, const char *dir)
         fprintf(stderr, "bench: cannot open %s\n", dbp);
         return -1;
     }
+    /*
+     * The daemon's settings and its once-a-second WAL sync (state_db.h), at
+     * their shipped defaults, so a benchmark measures the handle a backup
+     * actually runs on. Entries in PERF.md before 2026-11-16's "fixes" entry
+     * ran on SQLite's defaults; BENCH_DB_PRAGMAS="PRAGMA synchronous=FULL;
+     * PRAGMA cache_size=-2000; PRAGMA wal_autocheckpoint=1000" puts those
+     * back for a comparison.
+     */
+    state_db_tuning_t tuning = { STATE_DB_SYNC_DEFAULT, STATE_DB_CACHE_MB_DEFAULT,
+                                 STATE_DB_AUTOCKPT_DEFAULT };
+    if (state_db_tune(e->db, &tuning) != OK ||
+        state_db_flusher_start(dbp, 1000) != OK) {
+        fprintf(stderr, "bench: state.db settings: %s\n", err_msg());
+        return -1;
+    }
+    /*
+     * Extra SQL run once on the fresh handle, after the daemon's settings,
+     * for trying others. Unset, the handle is exactly the daemon's.
+     */
+    const char *pragmas = getenv("BENCH_DB_PRAGMAS");
+    if (pragmas && *pragmas) {
+        if (db_exec_raw(e->db, pragmas) != 0) {
+            fprintf(stderr, "bench: BENCH_DB_PRAGMAS failed\n");
+            return -1;
+        }
+        printf("  state.db settings: %s\n", pragmas);
+    }
     if (db_run_lib_migrations(e->db) != 0 ||
         db_run_compiled_migrations(e->db, app_migrations) != 0) {
         fprintf(stderr, "bench: migrations failed\n");
@@ -141,6 +169,7 @@ static inline void bench_env_close(bench_env_t *e)
     /* The index binding must outlive the store it is registered on. */
     if (e->store) store_close(e->store);
     if (e->idx)   store_index_free(e->idx);
+    state_db_flusher_stop();
     if (e->db)    db_close(e->db);
     memset(e, 0, sizeof(*e));
 }

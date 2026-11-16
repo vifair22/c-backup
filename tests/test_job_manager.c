@@ -393,6 +393,47 @@ static void test_journal_source_says_who_asked(void **state)
 }
 
 /*
+ * A job the daemon queues itself at start (the reconcile's reindex) says so:
+ * origin "startup" on the job, source "startup" in the journal, and the same
+ * again if it is interrupted - not "api", which would claim an operator ran
+ * it. A negative schedule id from a caller is still an API job.
+ */
+static void test_startup_jobs_say_startup(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(job_submit_startup(jm, 1, JOB_LOCK_WRITE, NULL, 0, "reindex", NULL, probe_job,
+                                        (void *)(intptr_t)1, NULL, &id), OK);
+    assert_true(id > 0);
+    wait_for(1);
+    assert_int_equal(job_submit_scheduled(jm, 1, "gc", NULL, -1, probe_job,
+                                          (void *)(intptr_t)1, NULL, &id), OK);
+    wait_for(2);
+    usleep(200000);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'startup'"
+                              " AND operation = 'reindex'"), 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'api'"
+                              " AND operation = 'gc'"), 1);
+    char origin[32];
+    assert_int_equal(db_text("SELECT origin || ':' || COALESCE(schedule_id, 0)"
+                             "  FROM jobs ORDER BY id LIMIT 1", origin, sizeof(origin)), 0);
+    assert_string_equal(origin, "startup:0");
+    assert_int_equal(db_text("SELECT origin || ':' || COALESCE(schedule_id, 0)"
+                             "  FROM jobs ORDER BY id DESC LIMIT 1", origin, sizeof(origin)), 0);
+    assert_string_equal(origin, "api:0");
+
+    /* Interrupted by a crash, it is journalled as startup at the next start. */
+    job_manager_stop(jm); jm = NULL;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO jobs (repo_id, action, state, started, origin)"
+        " VALUES (1, 'reindex', 'running', strftime('%s','now'), 'startup')",
+        NULL, NULL), 0);
+    assert_int_equal(job_manager_start(db, 2, &jm), OK);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'startup'"
+                              " AND message = 'interrupted by daemon restart'"), 1);
+}
+
+/*
  * Job ids come from the job's own INSERT. They came from a following
  * SELECT last_insert_rowid(), which is per connection, and every thread
  * shares the one connection: a grep or verify inserting its run row in
@@ -1283,6 +1324,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_final_progress_is_the_last_report, setup, teardown),
         cmocka_unit_test_setup_teardown(test_interrupted_jobs_are_journalled_at_start, setup, teardown),
         cmocka_unit_test_setup_teardown(test_journal_source_says_who_asked, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_startup_jobs_say_startup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_job_ids_survive_concurrent_inserts, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancelling_a_queued_job_is_immediate, setup, teardown),
         cmocka_unit_test_setup_teardown(test_shutdown_never_starts_a_queued_job, setup, teardown),

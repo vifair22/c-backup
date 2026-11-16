@@ -529,7 +529,8 @@ static cJSON *job_json(char **row)
     cJSON *res = row[12][0] ? cJSON_Parse(row[12]) : NULL;
     if (res) cJSON_AddItemToObject(o, "result", res);
     else     cJSON_AddNullToObject(o, "result");
-    /* Who asked: "api" or "schedule", and which schedule. */
+    /* Who asked: "api", "schedule" (and which), or "startup" for a job the
+     * daemon queued itself at start (index_reconcile.h). */
     cJSON_AddStringToObject(o, "origin", row[13]);
     long long sched = strtoll(row[14], NULL, 10);
     if (sched > 0) cJSON_AddNumberToObject(o, "schedule_id", (double)sched);
