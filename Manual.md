@@ -1013,7 +1013,11 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
 - Hardlinks are restored as hardlinks, including across a resumed restore.
 - Sparse files come back sparse.
 - Modes, times (directories included), extended attributes and ACLs are
-  restored. Ownership is restored when the daemon runs as root.
+  restored. Ownership is restored when the daemon runs as root. ACLs come
+  back exactly as recorded: an entry backed up without one has none after
+  the restore, even inside a directory whose restored default ACL the
+  kernel would otherwise have handed down to it, and its mode is the
+  backed-up mode.
 - Device nodes need root and a kernel that allows them; one that cannot be
   created is skipped and counted, not failed.
 - Sockets are skipped: they have no content.

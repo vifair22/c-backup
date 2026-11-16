@@ -460,12 +460,41 @@ static void apply_xattrs(store_t *store, const meta_target_t *t, const char *xhe
 }
 
 /*
+ * Remove whatever ACLs an entry has before its own are applied: the access
+ * ACL, and on a directory the default ACL too.
+ *
+ * A restored directory gets its default ACL before its children are
+ * created, and the kernel hands that default to every child as it is made:
+ * as a file's access ACL, and as a directory's access and default ACL. The
+ * restore only ever set what the snapshot recorded, so a child backed up
+ * with no ACL came back with its parent's (B129), named users and all. So
+ * every entry starts from none; apply_acls then sets exactly what was
+ * recorded. Runs before the chmod, because while an access ACL is present
+ * chmod's group bits set the ACL mask rather than the group class, and the
+ * final mode would not be the backed-up one.
+ */
+static void clear_acls(const meta_target_t *t, int is_dir)
+{
+    static const char *const names[] = {
+        "system.posix_acl_access", "system.posix_acl_default"
+    };
+    for (int i = 0; i < (is_dir ? 2 : 1); i++) {
+        int rc = t->fd >= 0 ? fremovexattr(t->fd, names[i])
+               : t->follow  ? removexattr(t->path, names[i])
+                            : lremovexattr(t->path, names[i]);
+        if (rc != 0 && errno != ENODATA && errno != ENOTSUP)
+            log_warn("restore: cannot clear the inherited %s ACL on %s: %s",
+                     i ? "default" : "access", t->shown, strerror(errno));
+    }
+}
+
+/*
  * Reapply a node's stored ACLs. Runs after chmod on purpose: the access
  * ACL's base entries carry the definitive permissions, and applying it last
  * means the ACL wins over whatever chmod left. Default ACLs only make sense
  * on directories; applying one here, before the directory's children are
- * restored, is harmless because every child's own recorded state is applied
- * over anything it inherits.
+ * restored, is harmless because every child is cleared (clear_acls) and
+ * given its own recorded state over anything it inherits.
  */
 struct acl_ctx { meta_target_t t; int is_dir; };
 
@@ -903,6 +932,7 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
      * Through the fd: the file is never looked up by name again. */
     if (st == OK) {
         meta_target_t t = { fd, NULL, 0, full };
+        clear_acls(&t, 0);
         apply_metadata_fd(fd, full, mode, uid, gid, mtime);
         apply_xattrs(store, &t, xhash);
         apply_acls(store, &t, ahash, 0);
@@ -1308,6 +1338,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
              * the restore. It is reapplied in the pass below, after
              * everything has been written. */
             meta_target_t t = { dfd, NULL, 0, full };
+            clear_acls(&t, 1);
             apply_metadata_fd(dfd, full, mode, uid, gid, mtime);
             apply_xattrs(store, &t, xhash);
             apply_acls(store, &t, ahash, 1);
@@ -1423,12 +1454,13 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 res.kept++;
                 continue;
             }
-            apply_metadata_at(pfd, leaf, full, 1, mode, uid, gid, mtime);
             /* An O_PATH fd takes no fsetxattr; its magic link, followed,
              * reaches exactly the node it holds. */
             char xp[64];
             snprintf(xp, sizeof(xp), "/proc/self/fd/%d", ofd);
             meta_target_t t = { -1, xp, 1, full };
+            clear_acls(&t, 0);
+            apply_metadata_at(pfd, leaf, full, 1, mode, uid, gid, mtime);
             apply_xattrs(store, &t, xhash);
             apply_acls(store, &t, ahash, 0);
             close(ofd);

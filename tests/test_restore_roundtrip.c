@@ -1477,6 +1477,79 @@ static void assert_acl_equals(const char *path, acl_type_t type,
     acl_free(txt);
 }
 
+/*
+ * B129: an entry backed up with no ACL, restored inside a directory whose
+ * default ACL the restore has already set, inherited that default - a
+ * file as its access ACL, a directory as its access and default ACL - and
+ * kept it. The children here are made before the parent gets its default,
+ * so at the source they have none.
+ */
+static int has_xattr(const char *path, const char *name)
+{
+    return getxattr(path, name, NULL, 0) >= 0;
+}
+
+static void test_inherited_acls_are_not_restored(void **state)
+{
+    (void)state;
+    const char *dir = TEST_SRC "/acldir";
+    assert_int_equal(mkdir(dir, 0750), 0);
+    assert_int_equal(mkdir(TEST_SRC "/acldir/inner", 0751), 0);
+    write_file(TEST_SRC "/acldir/plain.txt", "no acl of its own\n");
+    assert_int_equal(chmod(TEST_SRC "/acldir/plain.txt", 0640), 0);
+    write_file(TEST_SRC "/acldir/own.txt", "its own acl\n");
+
+    acl_t dflt = acl_from_text("u::rwx,g::r-x,o::---,u:1234:rwx,g:4321:r-x,m::rwx");
+    acl_t own  = acl_from_text("u::rw-,g::r--,o::---,u:1234:r--,m::r--");
+    assert_non_null(dflt);
+    assert_non_null(own);
+    int rc = acl_set_file(dir, ACL_TYPE_DEFAULT, dflt);
+    if (rc == 0) rc = acl_set_file(TEST_SRC "/acldir/own.txt", ACL_TYPE_ACCESS, own);
+    acl_free(dflt);
+    acl_free(own);
+    if (rc != 0) skip();   /* no ACL support here */
+
+    acl_t a = acl_get_file(TEST_SRC "/acldir/own.txt", ACL_TYPE_ACCESS);
+    assert_non_null(a);
+    char *want_own = acl_to_text(a, NULL);
+    acl_free(a);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    static const char *const kids[] = { "inner", "plain.txt" };
+    for (size_t k = 0; k < 2; k++) {
+        char src[PATH_MAX], dst[PATH_MAX];
+        snprintf(src, sizeof(src), "%s/acldir/%s", TEST_SRC, kids[k]);
+        snprintf(dst, sizeof(dst), "%s/acldir/%s", restored_root(), kids[k]);
+        if (has_xattr(dst, "system.posix_acl_access"))
+            fail_msg("%s inherited an access ACL", kids[k]);
+        if (has_xattr(dst, "system.posix_acl_default"))
+            fail_msg("%s inherited a default ACL", kids[k]);
+        struct stat ss, ds;
+        assert_int_equal(stat(src, &ss), 0);
+        assert_int_equal(stat(dst, &ds), 0);
+        assert_int_equal(ds.st_mode & 07777, ss.st_mode & 07777);
+    }
+
+    /* The parent keeps its default, and a child with its own ACL keeps
+     * exactly that. */
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/acldir", restored_root());
+    assert_true(has_xattr(path, "system.posix_acl_default"));
+    snprintf(path, sizeof(path), "%s/acldir/own.txt", restored_root());
+    assert_acl_equals(path, ACL_TYPE_ACCESS, want_own);
+    struct stat ss, ds;
+    assert_int_equal(stat(TEST_SRC "/acldir/own.txt", &ss), 0);
+    assert_int_equal(stat(path, &ds), 0);
+    assert_int_equal(ds.st_mode & 07777, ss.st_mode & 07777);
+    acl_free(want_own);
+}
+
 static void test_xattrs_and_acls_round_trip(void **state)
 {
     (void)state;
@@ -2245,6 +2318,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_planted_symlink_at_a_file_path_is_not_followed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_planted_symlink_at_a_directory_path_is_not_followed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_round_trip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_inherited_acls_are_not_restored, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattr_backup_is_deterministic, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_survive_a_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_rebuilds_the_index, setup, teardown),
