@@ -2,6 +2,8 @@
 
 #include "json_row.h"
 
+#include "snap_record.h"
+
 #include <cutils/error.h>
 
 #include <errno.h>
@@ -379,5 +381,127 @@ int jreq_strv(const cutils_json_req_t *req, const char *key, size_t max,
     json_iter_end(&it);
     *out = v;
     *n = got;
+    return JREQ_OK;
+}
+
+/* Nesting tracked for naming a field; a NUL deeper than this is still
+ * refused, only without a name. */
+#define NUL_SCAN_DEPTH 32
+
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int is_json_space(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/*
+ * Find a string holding a NUL before cJSON decodes it into a C string that
+ * would end there. Only the lexical structure is followed - strings,
+ * escapes and nesting - and anything malformed is left for the parser to
+ * refuse. Returns 1 when a string holds one, with *name and *name_len set to
+ * the member it belongs to (an array's elements belong to the member
+ * holding the array; NULL when there is none) or *is_key set when the NUL
+ * is in a member name; 0 when no string holds a NUL.
+ */
+static int find_nul_string(const char *b, size_t len, const char **name,
+                           size_t *name_len, int *is_key)
+{
+    const char *key[NUL_SCAN_DEPTH + 1] = { NULL };
+    size_t      klen[NUL_SCAN_DEPTH + 1] = { 0 };
+    int depth = 0;
+
+    for (size_t i = 0; i < len; i++) {
+        char c = b[i];
+        if (c == '{' || c == '[') {
+            depth++;
+            if (depth <= NUL_SCAN_DEPTH) {
+                /* An object's members name themselves; an array's
+                 * elements are named by the member holding the array. */
+                int inherit = (c == '[' && depth - 1 <= NUL_SCAN_DEPTH);
+                key[depth]  = inherit ? key[depth - 1] : NULL;
+                klen[depth] = inherit ? klen[depth - 1] : 0;
+            }
+            continue;
+        }
+        if (c == '}' || c == ']') {
+            if (depth > 0) depth--;
+            continue;
+        }
+        if (c != '"') continue;
+
+        size_t start = ++i;
+        int nul = 0;
+        while (i < len && b[i] != '"') {
+            if (b[i] == '\\' && i + 1 < len) {
+                if (b[i + 1] == 'u' && i + 5 < len) {
+                    int v = 0;
+                    int ok = 1;
+                    for (size_t k = i + 2; k < i + 6; k++) {
+                        int h = hexval(b[k]);
+                        if (h < 0) { ok = 0; break; }
+                        v = v * 16 + h;
+                    }
+                    if (ok && v == 0) nul = 1;
+                }
+                i += 2;
+                continue;
+            }
+            if (b[i] == '\0') nul = 1;
+            i++;
+        }
+        size_t end = i < len ? i : len;
+
+        /* A member name is a string followed by a colon. */
+        size_t j = end + 1;
+        while (j < len && is_json_space(b[j])) j++;
+        int member = (j < len && b[j] == ':');
+
+        int d = depth <= NUL_SCAN_DEPTH ? depth : -1;
+        if (nul) {
+            *is_key = member;
+            *name = (!member && d >= 0) ? key[d] : NULL;
+            *name_len = (!member && d >= 0) ? klen[d] : 0;
+            return 1;
+        }
+        if (member && d >= 0) {
+            key[d]  = b + start;
+            klen[d] = end - start;
+        }
+    }
+    return 0;
+}
+
+int jreq_parse_body(const char *body, size_t len, cutils_json_req_t **out,
+                    jreq_err_t *err)
+{
+    *out = NULL;
+    if (!body) return jreq_bad(err, "invalid JSON");
+
+    const char *name = NULL;
+    size_t nlen = 0;
+    int is_key = 0;
+    if (find_nul_string(body, len, &name, &nlen, &is_key)) {
+        if (is_key)
+            return jreq_bad(err, "a member name must not contain a NUL character");
+        if (name && nlen == 5 && memcmp(name, "label", 5) == 0)
+            return jreq_bad(err, "%s", SNAPSHOT_LABEL_RULE);
+        if (name && nlen > 0 && nlen <= 64)
+            return jreq_bad(err, "%.*s must not contain a NUL character",
+                            (int)nlen, name);
+        return jreq_bad(err, "a string must not contain a NUL character");
+    }
+
+    if (json_req_parse(body, len, out) != 0 || !*out) {
+        json_req_free(*out);
+        *out = NULL;
+        return jreq_bad(err, "invalid JSON");
+    }
     return JREQ_OK;
 }

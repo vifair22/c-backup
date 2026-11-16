@@ -159,8 +159,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         return api_error(400, "request body required");
 
     cutils_json_req_t *jr = NULL;
-    if (json_req_parse(req->body, req->body_len, &jr) != 0 || !jr)
-        return api_error(400, "body is not valid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &jr, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     /*
      * Each field is read for its type as well as its presence. A label of
@@ -632,8 +633,9 @@ static api_response_t key_import(const api_request_t *req, int64_t repo_id)
         return api_error(400, "key is required");
 
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *jr = NULL;
-    if (json_req_parse(req->body, req->body_len, &jr) != 0 || !jr)
-        return api_error(400, "body is not valid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &jr, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     char *hex = NULL;
     jreq_err_t je;

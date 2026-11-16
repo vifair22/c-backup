@@ -576,6 +576,30 @@ check "a label with a newline is refused" "$LABEL_RULE" \
     "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"label\":\"a\\nb\"}")"
 check "a label with a C1 control is refused" "$LABEL_RULE" \
     "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"label\":\"a\\u009bb\"}")"
+# B115: cJSON decodes \u0000 into a C string that ends there, so the label
+# was stored as "nul" with a 202 and a path named a shorter one.
+check "a label with an escaped NUL is refused" "$LABEL_RULE" \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"label\":\"nul\\u0000here\"}")"
+check "a backup path with an escaped NUL is refused" \
+    '{"error":"paths must not contain a NUL character"} 400' \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\\u0000/x\"]}")"
+check "a schedule label with an escaped NUL is refused" "$LABEL_RULE" \
+    "$(sock_send POST /repos/1/schedules '{"action":"backup","label":"a\u0000b","trigger":{"type":"interval","seconds":60}}')"
+check "a tag name with an escaped NUL is refused" \
+    '{"error":"name must not contain a NUL character"} 400' \
+    "$(sock_send POST /repos/1/tags '{"name":"t\u0000x","snap_id":1}')"
+check "a NUL in a nested trigger field is refused by name" \
+    '{"error":"every must not contain a NUL character"} 400' \
+    "$(sock_send POST /repos/1/schedules '{"action":"gc","trigger":{"type":"calendar","every":"day\u0000","at":"01:00"}}')"
+OUT=$(sock_send POST /repos/1/tags '{"name":"t\\u0000","snap_id":1}')
+case "$OUT" in
+    *NUL*) bad "an escaped backslash before u0000 is not a NUL" "the tag-name rule" "$OUT" ;;
+    *400)  ok "an escaped backslash before u0000 is not a NUL" ;;
+    *)     bad "an escaped backslash before u0000 is not a NUL" "a 400" "$OUT" ;;
+esac
+check "a query value with %00 is refused" \
+    '{"error":"q must not contain a NUL character"} 400' \
+    "$(sock_send GET '/repos/1/search?q=a%00b')"
 check "backup paths must be a list" '{"error":"paths must be a list of strings"} 400' \
     "$(sock_send POST /repos/1/backup '{"paths":"/x"}')"
 check "a non-string backup path" \

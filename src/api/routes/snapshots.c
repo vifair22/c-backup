@@ -1517,9 +1517,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "pattern is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         /* A field of the wrong type is refused by name. path_prefix and
          * max_files used to be dropped when they were, so the search ran
@@ -1587,9 +1588,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "dest is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         jreq_err_t je;
         int rc = jreq_str(body, "dest", &j->dest, &je);
@@ -1616,9 +1618,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "dest is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         /*
          * Every field is read for its type before any is acted on.

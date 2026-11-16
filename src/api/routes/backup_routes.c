@@ -352,9 +352,10 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
      * about that before anything about the repository's state (B112). */
     if (req->body && req->body_len) {
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             backup_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         jreq_err_t je;
         if (backup_opts_from_json(body, j, &je) != 0) {

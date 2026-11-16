@@ -331,8 +331,9 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
 {
     if (!req->body) return api_error(400, "request body required");
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-    if (json_req_parse(req->body, req->body_len, &body) != 0)
-        return api_error(400, "invalid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     CUTILS_AUTOFREE char *action = NULL;
     CUTILS_AUTOFREE char *overlap = NULL;
@@ -566,8 +567,9 @@ api_response_t schedules_patch(const api_request_t *req, int64_t repo_id,
 {
     if (!req->body) return api_error(400, "request body required");
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-    if (json_req_parse(req->body, req->body_len, &body) != 0)
-        return api_error(400, "invalid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     /* A boolean, as the list serves it, or 0/1 as it was always sent. */
     uint32_t enabled = 1;

@@ -115,6 +115,7 @@ must be, and nothing is changed:
 | A whole-number field holds a fraction | `<field> must be a whole number` |
 | A number outside the field's range, negative where it cannot be, or too large to represent (`1e999`) | `<field> is out of range; it must be from <min> to <max>` |
 | A list of strings is not a list, or an entry is not a string | `<field> must be a list of strings` (with the entry's position) |
+| A string holds a NUL (`\u0000`), in the body or as `%00` in the query | `<field> must not contain a NUL character`; a `label` gets the label rule, `label must be at most 256 bytes of printable text` |
 
 `null` is a value of the wrong type, not a way of leaving a field out: omit
 a field to leave it unset. Flags that also accepted `0`/`1` (`ignore_case`,
@@ -122,6 +123,10 @@ a field to leave it unset. Flags that also accepted `0`/`1` (`ignore_case`,
 field is named by its path, as in `interval trigger: trigger.seconds must
 be a number`. Integers are exact only up to 2^53, so a field whose type
 allows more is limited to that, and the range in the message says so.
+
+A NUL used to cut the string short without a word: the daemon is C, and
+`"label":"nul\u0000here"` stored the label `nul` and answered 202. No
+field in this API can hold one, so the request is refused instead.
 
 Each of these used to read as absent: an array `label` registered a
 repository with no label and answered 201, `"one_filesystem":true` was
