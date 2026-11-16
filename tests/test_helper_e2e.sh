@@ -62,6 +62,7 @@ daemon_id = 0badf00d
 max_pause_s = 30
 capture_max_s = 3600
 allow_restore = 1
+allow_define = 1
 state_dir = $WORK/hstate
 socket = $HSOCK
 fake_spec = $WORK/units.json
@@ -159,6 +160,24 @@ check    "the disk came back full size" 4194304 "$(stat -c %s "$WORK/out/.cbacku
 check    "the tree from the helper's read root" alpha "$(cat "$WORK/out$WORK/pool/app/a/a.txt")"
 check    "configuration as the helper read it" "<domain>a</domain>" "$(cat "$WORK/out/.cbackup-unit/config/domain.xml")"
 check    "no holds are left in the helper's journal" "[]" "$(cat "$WORK/hstate/holds.json")"
+
+echo "restore as a unit"
+OUT=$(cb unit restore 1 1 --define 2>&1); RC=$?
+check    "in place without --replace is refused" 1 "$RC"
+contains "and says to pass replace" "pass replace" "$OUT"
+OUT=$(cb unit restore 1 1 --define --name cbk-uat-b 2>&1); RC=$?
+check    "a new name without a target root is refused" 1 "$RC"
+contains "and says so" "needs target_root" "$OUT"
+OUT=$(cb unit restore 1 1 --define --name cbk-uat-b --target-root "$WORK/target")
+contains "a new-name restore completes" '"state":"completed"' "$OUT"
+contains "its result says where the data went" "restored_to" "$OUT"
+check    "the data is under the target root" alpha "$(cat "$WORK/target$WORK/pool/app/a/a.txt")"
+check    "the original's path is untouched" "" "$(ls "$WORK/pool/app/a")"
+contains "the helper got the remapped paths" "$WORK/target$WORK/pool/app/a" "$(cat "$WORK/hstate/fake-define-a.json")"
+contains "its warning is in the journal" "fake define" "$(cb journal 1)"
+OUT=$(cb unit restore 1 1 --define --replace)
+contains "an in-place restore completes" '"state":"completed"' "$OUT"
+check    "the data is back in place" alpha "$(cat "$WORK/pool/app/a/a.txt")"
 
 echo "helper gone"
 kill "$HELPER_PID"; wait "$HELPER_PID" 2>/dev/null; HELPER_PID=

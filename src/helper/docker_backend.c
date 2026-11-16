@@ -1201,6 +1201,31 @@ static int name_ok(const char *n)
 
 /* Settings that make a container root on the host, refused without
  * allow_privileged_define. */
+static int under_root(const char *p, const char *root)
+{
+    size_t n = strlen(root);
+    return strncmp(p, root, n) == 0 && (p[n] == '\0' || p[n] == '/');
+}
+
+/* A bind of a host path outside the include roots (11.2): data the
+ * container was never meant to have, and with a rewritten definition the
+ * one way a compromised daemon could hand a container the host. */
+static const char *bind_outside(const struct sp_ctx *c, const cJSON *hc)
+{
+    static char why[300];
+    const cJSON *b;
+    cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Binds")) {
+        const char *v = cJSON_GetStringValue(b);
+        if (!v || v[0] != '/') continue;           /* a named volume */
+        char src[PATH_MAX];
+        snprintf(src, sizeof(src), "%.*s", (int)strcspn(v, ":"), v);
+        int ok = 0;
+        for (size_t i = 0; i < c->pol->n_include && !ok; i++) ok = under_root(src, c->pol->include_roots[i]);
+        if (!ok && !strstr(src, "docker.sock")) { snprintf(why, sizeof(why), "a bind of %.250s outside the include roots", src); return why; }
+    }
+    return NULL;
+}
+
 static const char *privileged_reason(const cJSON *hc)
 {
     if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(hc, "Privileged"))) return "Privileged";
@@ -1293,6 +1318,7 @@ static status_t d_define(sp_ctx_t *c, const char *unit_id, const char *definitio
     status_t st = OK;
     if (!name_ok(name)) st = set_error(ERR_INVALID, "docker: bad container name %.100s", name);
     const char *why = st == OK ? privileged_reason(hc) : NULL;
+    if (st == OK && !why) why = bind_outside(c, hc);
     if (st == OK && why && !pol->allow_privileged_define)
         st = set_error(ERR_INVALID, "docker: the definition sets %s, and allow_privileged_define is off", why);
 

@@ -370,7 +370,7 @@ static void test_hook_logs_and_dumps(void **state)
 
 static const char *k_def =
     "{\"inspect\":{\"Name\":\"/solo\",\"Config\":{\"Image\":\"alpine:3\",\"Env\":[\"X=1\"],\"Hostname\":\"abc\"},"
-    "\"HostConfig\":{\"Binds\":[\"/a:/a\"]},\"NetworkSettings\":{\"Networks\":{\"br0\":{\"IPAMConfig\":"
+    "\"HostConfig\":{\"Binds\":[\"" APPS "/web/www:/a\"]},\"NetworkSettings\":{\"Networks\":{\"br0\":{\"IPAMConfig\":"
     "{\"IPv4Address\":\"10.0.0.9\"}}}}},"
     "\"image\":{\"RepoDigests\":[\"alpine@sha256:abc123\"],\"RepoTags\":[\"alpine:3\"]},"
     "\"template\":\"<Container>solo</Container>\"%s}";
@@ -429,6 +429,12 @@ static void test_define(void **state)
              "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"solo3\"}");
     assert_int_not_equal(be.define(be.ctx, "solo", def, &pol, &res), OK);
     assert_non_null(strstr(err_msg(), "Privileged"));
+    err_clear();
+    /* So does a bind of a host path outside the include roots. */
+    snprintf(def, sizeof(def), "{\"inspect\":{\"Name\":\"/x\",\"Config\":{},\"HostConfig\":{\"Binds\":[\"/etc:/x\"]}},"
+             "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"solo4\"}");
+    assert_int_not_equal(be.define(be.ctx, "solo", def, &pol, &res), OK);
+    assert_non_null(strstr(err_msg(), "outside the include roots"));
     err_clear();
 }
 

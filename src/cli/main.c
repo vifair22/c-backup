@@ -1571,6 +1571,8 @@ static int cmd_schedule(int argc, char **argv)
     "[--require LEVEL] [--no-wait] | " \
     "unit history <repo-id> [--provider P <unit>] [--limit N] [--offset N] | " \
     "unit restore <repo-id> <snapshot-id> <dest> [--item ID] [--overwrite] [--no-wait] | " \
+    "unit restore <repo-id> <snapshot-id> --define [--replace | --name N --target-root DIR] " \
+    "[--pin-digest] [--start] [--keep-macs] | " \
     "unit policy <show|set> <repo-id> --provider P <unit> [key value]"
 
 /* /repos/<id>/units/<p>/<u>/<suffix> */
@@ -1670,16 +1672,34 @@ static int cmd_unit(int argc, char **argv)
 
     if (strcmp(sub, "restore") == 0) {
         const char *item = take_opt(&argc, argv, "--item");
+        const char *name = take_opt(&argc, argv, "--name");
+        const char *troot = take_opt(&argc, argv, "--target-root");
+        int define    = take_flag(&argc, argv, "--define");
+        int replace   = take_flag(&argc, argv, "--replace");
+        int pin       = take_flag(&argc, argv, "--pin-digest");
+        int start     = take_flag(&argc, argv, "--start");
+        int keep_macs = take_flag(&argc, argv, "--keep-macs");
         int overwrite = take_flag(&argc, argv, "--overwrite");
         int no_wait   = take_flag(&argc, argv, "--no-wait");
-        if (argc != 3)
+        if (define ? argc != 2 : argc != 3)
             return fail("usage: unit restore <repo-id> <snapshot-id> <dest> [--item ID] "
-                        "[--overwrite] [--no-wait]");
+                        "[--overwrite] [--no-wait] | unit restore <repo-id> <snapshot-id> --define "
+                        "[--replace | --name N --target-root DIR] [--pin-digest] [--start] [--keep-macs]");
         sbuf_t b = { 0 };
-        sb_puts(&b, item ? "{\"mode\":\"item\",\"format\":\"raw\",\"item\":" : "{\"mode\":\"files\"");
-        if (item) sb_json_str(&b, item);
-        sb_puts(&b, ",\"dest\":"); sb_json_str(&b, argv[2]);
-        if (overwrite) sb_puts(&b, ",\"overwrite\":true");
+        if (define) {
+            sb_puts(&b, "{\"mode\":\"unit\"");
+            if (name)  { sb_puts(&b, ",\"name\":"); sb_json_str(&b, name); }
+            if (troot) { sb_puts(&b, ",\"target_root\":"); sb_json_str(&b, troot); }
+            if (replace)   sb_puts(&b, ",\"replace\":true");
+            if (pin)       sb_puts(&b, ",\"pin_digest\":true");
+            if (start)     sb_puts(&b, ",\"start\":true");
+            if (keep_macs) sb_puts(&b, ",\"keep_macs\":true");
+        } else {
+            sb_puts(&b, item ? "{\"mode\":\"item\",\"format\":\"raw\",\"item\":" : "{\"mode\":\"files\"");
+            if (item) sb_json_str(&b, item);
+            sb_puts(&b, ",\"dest\":"); sb_json_str(&b, argv[2]);
+            if (overwrite) sb_puts(&b, ",\"overwrite\":true");
+        }
         sb_puts(&b, "}");
         sbuf_t p = { 0 };
         sb_puts(&p, "/repos/");     sb_path_seg(&p, argv[0]);

@@ -1143,7 +1143,34 @@ static char *op_unit_stop_start(helper_server_t *s, const helper_req_t *r, int s
 /* The helper parses a definition field by field and serialises its own;
  * none of the daemon's bytes would pass through. No backend here defines
  * units yet, so after the policy's checks the answer is unsupported. */
-static char *op_unit_define(helper_server_t *s, const helper_req_t *r)
+/* A definition passed as a sealed memfd with the request ({"memfd": true}
+ * in place of the object): no 64 KiB limit, and bytes that cannot change
+ * while the helper reads them. */
+static char *read_sealed(int fd, size_t max, size_t *len, char *why, size_t wsz)
+{
+    struct stat sb;
+    int seals = fcntl(fd, F_GET_SEALS);
+    int need = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+    if (fstat(fd, &sb) != 0 || seals < 0 || (seals & need) != need) {
+        snprintf(why, wsz, "the definition must be a sealed memfd");
+        return NULL;
+    }
+    if ((uint64_t)sb.st_size > max) { snprintf(why, wsz, "the definition is over %zu bytes", max); return NULL; }
+    char *buf = malloc((size_t)sb.st_size + 1);
+    if (!buf) { snprintf(why, wsz, "out of memory"); return NULL; }
+    size_t done = 0;
+    while (done < (size_t)sb.st_size) {
+        ssize_t n = pread(fd, buf + done, (size_t)sb.st_size - done, (off_t)done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { free(buf); snprintf(why, wsz, "cannot read the definition"); return NULL; }
+        done += (size_t)n;
+    }
+    buf[done] = '\0';
+    *len = done;
+    return buf;
+}
+
+static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd)
 {
     if (!s->pol->allow_define) return resp_error(r->id, HELPER_E_DENIED, "the policy does not allow define");
     char why[256];
@@ -1151,17 +1178,38 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r)
     if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
     cJSON *d = cJSON_Parse(r->definition ? r->definition : "{}");
     int priv = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "privileged"));
+    int by_fd = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "memfd"));
     cJSON_Delete(d);
-    if (priv && !s->pol->allow_privileged_define)
+    char *passed = NULL;
+    if (by_fd) {
+        size_t plen = 0;
+        char fwhy[160];
+        if (in_fd < 0) return resp_error(r->id, HELPER_E_INVALID, "the definition is said to be passed, and no fd came");
+        if (!(passed = read_sealed(in_fd, HELPER_BLOB_MAX, &plen, fwhy, sizeof(fwhy))))
+            return resp_error(r->id, HELPER_E_INVALID, "%s", fwhy);
+        cJSON *pd = cJSON_Parse(passed);
+        if (!cJSON_IsObject(pd)) { cJSON_Delete(pd); free(passed); return resp_error(r->id, HELPER_E_INVALID, "the passed definition is not a JSON object"); }
+        priv = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(pd, "privileged"));
+        cJSON_Delete(pd);
+    }
+    if (priv && !s->pol->allow_privileged_define) {
+        free(passed);
         return resp_error(r->id, HELPER_E_DENIED, "a privileged definition and allow_privileged_define is off");
+    }
     const char *uid = NULL;
     const helper_backend_t *b = NULL;
-    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK) {
+        free(passed);
         return resp_error(r->id, e, "%s", why);
-    if (!b->define)
+    }
+    if (!b->define) {
+        free(passed);
         return resp_error(r->id, HELPER_E_UNSUPPORTED, "provider %s does not define units", b->name);
+    }
     cJSON *res = NULL;
-    if (b->define(b->ctx, uid, r->definition ? r->definition : "{}", s->pol, &res) != OK) {
+    status_t dst = b->define(b->ctx, uid, passed ? passed : (r->definition ? r->definition : "{}"), s->pol, &res);
+    free(passed);
+    if (dst != OK) {
         cJSON_Delete(res);
         return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
     }
@@ -1256,7 +1304,7 @@ static char *op_hello(helper_server_t *s, const helper_req_t *r)
     return resp_ok(r->id, res);
 }
 
-static char *dispatch(helper_server_t *s, const helper_req_t *r, int *pass_fd)
+static char *dispatch(helper_server_t *s, const helper_req_t *r, int *pass_fd, int in_fd)
 {
     switch (r->op) {
     case HOP_HELLO:                  return op_hello(s, r);
@@ -1275,7 +1323,7 @@ static char *dispatch(helper_server_t *s, const helper_req_t *r, int *pass_fd)
     case HOP_RESTORE_SWAP:           return op_restore_swap(s, r);
     case HOP_UNIT_STOP:              return op_unit_stop_start(s, r, 0);
     case HOP_UNIT_START:             return op_unit_stop_start(s, r, 1);
-    case HOP_UNIT_DEFINE:            return op_unit_define(s, r);
+    case HOP_UNIT_DEFINE:            return op_unit_define(s, r, in_fd);
     case HOP_LEASE_RELEASE:          return op_capture_end(s, r);
     case HOP_SWEEP:                  return op_sweep(s, r);
     case HOP_COUNT:                  break;
@@ -1286,11 +1334,17 @@ static char *dispatch(helper_server_t *s, const helper_req_t *r, int *pass_fd)
 void helper_server_handle(helper_server_t *s, const char *req, size_t len,
                           char **resp, int *pass_fd)
 {
+    helper_server_handle_fd(s, req, len, -1, resp, pass_fd);
+}
+
+void helper_server_handle_fd(helper_server_t *s, const char *req, size_t len, int in_fd,
+                             char **resp, int *pass_fd)
+{
     *pass_fd = -1;
     helper_req_t r;
     char why[512];
     helper_err_t e = helper_request_parse(req, len, &r, why, sizeof(why));
-    *resp = e == HELPER_OK ? dispatch(s, &r, pass_fd) : resp_error(r.id, e, "%s", why);
+    *resp = e == HELPER_OK ? dispatch(s, &r, pass_fd, in_fd) : resp_error(r.id, e, "%s", why);
     helper_req_free(&r);
     err_clear();
 }
@@ -1309,15 +1363,17 @@ static void *conn_main(void *arg)
     int greeted = 0;
     while (buf) {
         size_t got = 0;
-        status_t st = helper_recv(c->fd, buf, HELPER_PACKET_MAX + 2, &got, NULL);
+        int rfd = -1;
+        status_t st = helper_recv(c->fd, buf, HELPER_PACKET_MAX + 2, &got, &rfd);
         if (st == ERR_TOO_LARGE) {
             char *e = resp_error(0, HELPER_E_INVALID, "a request is at most 65536 bytes");
             if (e) (void)helper_send(c->fd, e, strlen(e), -1);
             free(e);
             err_clear();
+            if (rfd >= 0) close(rfd);
             continue;
         }
-        if (st != OK) { err_clear(); break; }
+        if (st != OK) { err_clear(); if (rfd >= 0) close(rfd); break; }
         char *resp = NULL;
         int pfd = -1;
         if (!greeted) {
@@ -1325,7 +1381,7 @@ static void *conn_main(void *arg)
             char why[512];
             helper_err_t e = helper_request_parse(buf, got, &r, why, sizeof(why));
             if (e == HELPER_OK && r.op == HOP_HELLO) {
-                resp = dispatch(s, &r, &pfd);
+                resp = dispatch(s, &r, &pfd, -1);
                 greeted = 1;
             } else {
                 resp = resp_error(r.id, e != HELPER_OK ? e : HELPER_E_DENIED,
@@ -1333,8 +1389,9 @@ static void *conn_main(void *arg)
             }
             helper_req_free(&r);
         } else {
-            helper_server_handle(s, buf, got, &resp, &pfd);
+            helper_server_handle_fd(s, buf, got, rfd, &resp, &pfd);
         }
+        if (rfd >= 0) close(rfd);
         if (resp) (void)helper_send(c->fd, resp, strlen(resp), pfd);
         err_clear();
         free(resp);

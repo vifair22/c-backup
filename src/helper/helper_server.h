@@ -54,6 +54,10 @@ void     helper_server_stop(helper_server_t *s);
  */
 void helper_server_handle(helper_server_t *s, const char *req, size_t len,
                           char **resp, int *pass_fd);
+/* The same with an fd that came with the request (-1: none); the caller
+ * still owns it. unit.define reads a passed definition from it. */
+void helper_server_handle_fd(helper_server_t *s, const char *req, size_t len, int in_fd,
+                             char **resp, int *pass_fd);
 
 /* One watchdog pass at now: holds past max_pause_s, captures past their
  * lease, hook runs past their timeout. Returns how many it released. */

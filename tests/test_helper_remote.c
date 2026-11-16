@@ -31,6 +31,7 @@
 #include "store.h"
 #include "store_index.h"
 #include "unit_backup.h"
+#include "unit_define.h"
 #include "unit_state.h"
 
 #define DB_PATH HF_DIR "/state.db"
@@ -143,6 +144,22 @@ static int setup_dumps(void **state)
     if (helper_policy_parse(text, &pol) != OK) return -1;
     if (fake_stream_add(fk, "u1", "dump:pgdump", ".cbackup-unit/hooks/pgdump.dump", 0, 1) != OK ||
         fake_stream_add(fk, "u1", "dump:baddump", ".cbackup-unit/hooks/baddump.dump", 0, 1) != OK) return -1;
+    if (helper_up() != 0) return -1;
+    return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
+}
+
+/* As setup, with restore and define allowed in the helper's policy. */
+static int setup_define(void **state)
+{
+    (void)state;
+    if (setup_base() != 0) return -1;
+    char text[8192];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
+    char *p = strstr(text, "allow_define = 0");
+    if (!p) return -1;
+    p[15] = '1';
+    helper_policy_free(&pol);
+    if (helper_policy_parse(text, &pol) != OK) return -1;
     if (helper_up() != 0) return -1;
     return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
 }
@@ -329,6 +346,68 @@ static void test_dumps_through_helper(void **state)
     assert_int_equal(helper_server_holds(srv), 0);
 }
 
+static int file_has(const char *path, const char *text)
+{
+    char buf[8192] = "";
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, text) != NULL;
+}
+
+/* mode unit: the refusals, a new name under target_root that leaves the
+ * original untouched, and in place with replace through stage and swap. */
+static void test_unit_restore(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    unit_define_result_t dr;
+    /* In place without replace, and a new name without target_root. */
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "pass replace"));
+    o.name = "u1-copy";
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "needs target_root"));
+    err_clear();
+
+    /* A new name: data under the target root, the original's untouched. */
+    o.target_root = HF_DIR "/target";
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), OK);
+    struct stat sb;
+    assert_int_equal(stat(HF_DIR "/target" HF_MOUNT "/a.txt", &sb), 0);
+    assert_int_not_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+    assert_int_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_true(file_has(HF_DIR "/state/fake-define-u1.json", "\"u1-copy\""));
+    assert_true(file_has(HF_DIR "/state/fake-define-u1.json", HF_DIR "/target" HF_MOUNT));
+    assert_int_equal(dr.n_warnings, 1);
+    assert_non_null(strstr(dr.warnings[0], "fake define"));
+    assert_non_null(strstr(dr.json, "restored_to"));
+    unit_define_result_free(&dr);
+    /* Again into the same target root: refused, nothing merged. */
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 32, &o, &dr), ERR_INVALID);
+    err_clear();
+
+    /* In place: stopped, staged, swapped, the old data kept beside it. */
+    memset(&o, 0, sizeof(o));
+    o.replace = 1;
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 33, &o, &dr), OK);
+    assert_int_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+    assert_int_not_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_int_equal(stat(HF_MOUNT ".cbackup-old-33/live.txt", &sb), 0);
+    assert_int_equal(fake_unit_state(fk, "u1"), SP_STATE_STOPPED);
+    assert_non_null(strstr(dr.json, "cbackup-old-33"));
+    assert_true(file_has(HF_DIR "/state/fake-define-u1.json", "\"replace\":true"));
+    unit_define_result_free(&dr);
+}
+
 /* Wait up to 5 s for the link to be connected with fake enabled. */
 static int wait_connected(void)
 {
@@ -424,6 +503,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_helper_restarts_mid_job, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_blob, setup, teardown),
         cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
+        cmocka_unit_test_setup_teardown(test_unit_restore, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),

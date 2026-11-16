@@ -521,6 +521,14 @@ static status_t x_define(sp_ctx_t *c, const char *unit_id, const char *definitio
     snprintf(dir, sizeof(dir), "%.3900s/%s", c->pol->lxc_path, name);
     snprintf(conf, sizeof(conf), "%s/config", dir);
     snprintf(rootfs, sizeof(rootfs), "%s/rootfs", dir);
+    /* Restored under a target root: the daemon says where the rootfs and
+     * each bind source landed. Both must be clean absolute paths. */
+    const char *rf = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(d, "rootfs"));
+    if (st == OK && rf) {
+        if (rf[0] != '/' || !helper_path_clean(rf)) st = set_error(ERR_INVALID, "lxc: bad rootfs path");
+        else snprintf(rootfs, sizeof(rootfs), "%s", rf);
+    }
+    const cJSON *mmap = cJSON_GetObjectItemCaseSensitive(d, "mount_map");
     cJSON *res = cJSON_CreateObject();
     if (st == OK && !res) st = set_error(ERR_NOMEM, "lxc: define");
     struct stat sb;
@@ -537,7 +545,9 @@ static status_t x_define(sp_ctx_t *c, const char *unit_id, const char *definitio
         }
     }
     /* Rewrite line by line; everything else is kept as recorded. */
-    size_t cap = cfg ? strlen(cfg) + 2 * PATH_MAX + 256 : 0;
+    size_t lines = 0;
+    for (const char *q = cfg; q && *q; q++) lines += *q == '\n';
+    size_t cap = cfg ? strlen(cfg) + (lines + 4) * (PATH_MAX + 64) : 0;
     char *out = st == OK ? malloc(cap) : NULL;
     if (st == OK && !out) st = set_error(ERR_NOMEM, "lxc: config");
     size_t o = 0;
@@ -555,6 +565,18 @@ static status_t x_define(sp_ctx_t *c, const char *unit_id, const char *definitio
         if (strcmp(key, "lxc.uts.name") == 0) o += (size_t)snprintf(out + o, cap - o, "lxc.uts.name = %s\n", name);
         else if (strcmp(key, "lxc.rootfs.path") == 0) o += (size_t)snprintf(out + o, cap - o, "lxc.rootfs.path = dir:%s\n", rootfs);
         else if (!keep_macs && strncmp(key, "lxc.net.", 8) == 0 && strstr(key, ".hwaddr")) { /* LXC makes a new one */ }
+        else if (strcmp(key, "lxc.mount.entry") == 0 && mmap && eq) {
+            /* The source is the first field after '='. */
+            const char *v = eq + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            size_t sl = strcspn(v, " \t\n");
+            char src[PATH_MAX];
+            snprintf(src, sizeof(src), "%.*s", (int)sl, v);
+            const char *to = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(mmap, src));
+            if (to && to[0] == '/' && helper_path_clean(to))
+                o += (size_t)snprintf(out + o, cap - o, "lxc.mount.entry = %s%.*s\n", to, (int)(l + n - (v + sl)), v + sl);
+            else { memcpy(out + o, l, n); o += n; out[o++] = '\n'; }
+        }
         else { memcpy(out + o, l, n); o += n; out[o++] = '\n'; }
         l += n + (l[n] == '\n');
     }

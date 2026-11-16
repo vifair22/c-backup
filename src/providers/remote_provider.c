@@ -95,8 +95,17 @@ static status_t map_error(const char *code, const char *msg)
     return set_error(st, "helper: %s: %.400s", helper_err_name(e), msg ? msg : "");
 }
 
+static status_t exchange_fd(int fd, const char *op, cJSON *args, cJSON **result, int send_fd,
+                            int *recv_fd, int *transport);
+
 static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, int *recv_fd,
                          int *transport)
+{
+    return exchange_fd(fd, op, args, result, -1, recv_fd, transport);
+}
+
+static status_t exchange_fd(int fd, const char *op, cJSON *args, cJSON **result, int send_fd,
+                            int *recv_fd, int *transport)
 {
     long id = atomic_fetch_add(&g_req_id, 1) + 1;
     cJSON *o = cJSON_CreateObject();
@@ -108,7 +117,7 @@ static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, in
     char *txt = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!txt) return set_error(ERR_NOMEM, "helper: request");
-    status_t st = helper_send(fd, txt, strlen(txt), -1);
+    status_t st = helper_send(fd, txt, strlen(txt), send_fd);
     cJSON_free(txt);
     if (st != OK) { *transport = 1; return st; }
     char *buf = malloc(HELPER_PACKET_MAX + 2);
@@ -138,8 +147,17 @@ static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, in
 
 /* Connect, hello, one request. *result (may be NULL) is the result; an fd
  * passed with the answer lands in *recv_fd (NULL: closed), -1 if none. */
+static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON **result,
+                           int send_fd, int *recv_fd);
+
 static status_t rcall_fd(const char *sock, const char *op, cJSON *args, cJSON **result,
                          int *recv_fd)
+{
+    return rcall_full(sock, op, args, result, -1, recv_fd);
+}
+
+static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON **result,
+                           int send_fd, int *recv_fd)
 {
     if (result) *result = NULL;
     if (recv_fd) *recv_fd = -1;
@@ -165,7 +183,7 @@ static status_t rcall_fd(const char *sock, const char *op, cJSON *args, cJSON **
     int transport = 0;
     status_t st = exchange(fd, "hello", hargs, &hres, NULL, &transport);
     cJSON_Delete(hres);
-    if (st == OK) st = exchange(fd, op, args, result, recv_fd, &transport);
+    if (st == OK) st = exchange_fd(fd, op, args, result, send_fd, recv_fd, &transport);
     else cJSON_Delete(args);
     close(fd);
     if (st != OK && recv_fd && *recv_fd >= 0) { close(*recv_fd); *recv_fd = -1; }
@@ -617,6 +635,21 @@ static sp_provider_ops_t g_ops[REMOTE_MAX];
 static char              g_names[REMOTE_MAX][SP_PROVIDER_MAX];
 
 int remote_is_remote(const sp_provider_ops_t *ops) { return ops && ops->init == r_init; }
+
+status_t remote_op(const char *provider, const char *op, cJSON *args, int send_fd, cJSON **result)
+{
+    if (result) *result = NULL;
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *c = NULL;
+    if (sp_registry_get(provider, &ops, &c) != OK || !remote_is_remote(ops)) {
+        cJSON_Delete(args);
+        err_clear();
+        char why[512];
+        if (remote_unusable(provider, why, sizeof(why))) return set_error(ERR_IO, "%s", why);
+        return set_error(ERR_INVALID, "provider %s is not behind the helper", provider);
+    }
+    return rcall_full(c->socket, op, args, result, send_fd, NULL);
+}
 
 /* One hello; enable any provider offered that is not enabled yet. */
 static status_t attach_once(const char *socket_path, const char *daemon8, remote_hello_t *out)

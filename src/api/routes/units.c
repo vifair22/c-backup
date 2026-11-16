@@ -33,6 +33,7 @@
 #include "unit_backup.h"
 #include "unit_index.h"
 #include "unit_restore.h"
+#include "unit_define.h"
 #include "unit_state.h"
 
 #define CUTILS_CJSON_ALLOW
@@ -921,6 +922,9 @@ typedef struct {
     char        *dest;
     char        *item;
     int          overwrite;
+    int          unit_mode;       /* mode unit: data, then the definition */
+    char        *name, *target_root;
+    int          replace, pin_digest, start, keep_macs;
 } urestore_job_t;
 
 static void urestore_free(void *p)
@@ -928,6 +932,7 @@ static void urestore_free(void *p)
     urestore_job_t *j = p;
     if (!j) return;
     free(j->repo_path); free(j->dest); free(j->item);
+    free(j->name); free(j->target_root);
     free(j);
 }
 
@@ -951,7 +956,29 @@ static status_t urestore_run(void *arg, atomic_int *cancel,
     /* The restore capabilities on this thread, for as long as it writes. */
     st = privs_restore_raise();
     if (st != OK) { store_index_free(idx); store_close(store); return st; }
-    if (j->item) {
+    char *uj = NULL;
+    if (j->unit_mode) {
+        unit_define_opts_t uo;
+        memset(&uo, 0, sizeof(uo));
+        uo.name = j->name;
+        uo.target_root = j->target_root;
+        uo.replace = j->replace;
+        uo.pin_digest = j->pin_digest;
+        uo.start = j->start;
+        uo.keep_macs = j->keep_macs;
+        uo.ropts = o;
+        unit_define_result_t dr;
+        st = unit_define_run(store, j->db, j->repo_id, j->snap_id, job_progress_id(progress_ctx), &uo, &dr);
+        /* The helper's warnings (an image pulled by tag, say) belong in the
+         * permanent record, not only in the job. */
+        for (size_t i = 0; st == OK && i < dr.n_warnings; i++) {
+            journal_record(j->db, j->repo_id, "restore", "unit-define", "warning", 0, dr.warnings[i]);
+            job_set_warning(progress_ctx, dr.warnings[i]);
+        }
+        if (st == OK) { uj = dr.json; dr.json = NULL; }
+        unit_define_result_free(&dr);
+        snprintf(rj, sizeof(rj), "{\"mode\":\"unit\"}");
+    } else if (j->item) {
         unit_restore_item_result_t ir;
         st = unit_restore_item(store, j->db, j->repo_id, j->snap_id, j->item, j->dest, &o, &ir);
         snprintf(rj, sizeof(rj), "{\"mode\":\"item\",\"bytes\":%llu}", (unsigned long long)ir.bytes);
@@ -965,7 +992,8 @@ static status_t urestore_run(void *arg, atomic_int *cancel,
                  (unsigned long long)rr.failed);
     }
     privs_restore_drop();
-    job_set_result(progress_ctx, rj);
+    job_set_result(progress_ctx, uj ? uj : rj);
+    free(uj);
     store_index_free(idx);
     store_close(store);
     return st;
@@ -988,9 +1016,11 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     const cJSON *ow  = cJSON_GetObjectItemCaseSensitive(o, "overwrite");
     const char *bad = NULL;
     if (!mode) mode = item ? "item" : "files";
-    if (strcmp(mode, "files") != 0 && strcmp(mode, "item") != 0)
-        bad = "mode must be files or item; unit and export need a provider that defines units";
-    else if (!dest || dest[0] != '/') bad = "dest must be an absolute path";
+    int unit_mode = strcmp(mode, "unit") == 0;
+    if (strcmp(mode, "files") != 0 && strcmp(mode, "item") != 0 && !unit_mode)
+        bad = "mode must be files, item or unit";
+    else if (!unit_mode && (!dest || dest[0] != '/')) bad = "dest must be an absolute path";
+    else if (unit_mode && dest) bad = "mode unit restores to the unit's own paths, or under target_root; it takes no dest";
     else if (strcmp(mode, "item") == 0 && (!item || !*item)) bad = "item is required for mode item";
     else if (strcmp(mode, "files") == 0 && item) bad = "item applies only to mode item";
     else if (fmt && strcmp(fmt, "raw") != 0) bad = "format must be raw; qcow2 comes with the libvirt provider";
@@ -1002,15 +1032,40 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
         cJSON_Delete(o);
         return api_error(404, err_msg());
     }
+    const char *uname = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(o, "name"));
+    const char *troot = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(o, "target_root"));
+    if (unit_mode) {
+        unit_define_opts_t chk;
+        memset(&chk, 0, sizeof(chk));
+        chk.name = uname;
+        chk.target_root = troot;
+        chk.replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "replace"));
+        char why[512];
+        const char *colon = strchr(key, ':');
+        if (unit_define_check(colon ? colon + 1 : key, &chk, why, sizeof(why)) != 0) {
+            cJSON_Delete(o);
+            return api_error(400, why);
+        }
+    }
     urestore_job_t *j = calloc(1, sizeof(*j));
     if (!j) { cJSON_Delete(o); return api_error(500, "out of memory"); }
     j->db = g_db;
     j->repo_id = repo_id;
     j->snap_id = snap_id;
     j->repo_path = repo_path_of(repo_id);
-    j->dest = strdup(dest);
+    j->dest = dest ? strdup(dest) : NULL;
     j->item = (strcmp(mode, "item") == 0 && item) ? strdup(item) : NULL;
     j->overwrite = ow && cJSON_IsTrue(ow);
+    j->unit_mode = unit_mode;
+    if (unit_mode) {
+        j->name = uname ? strdup(uname) : NULL;
+        j->target_root = troot ? strdup(troot) : NULL;
+        j->replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "replace"));
+        j->pin_digest = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "pin_digest"));
+        j->start = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "start"));
+        j->keep_macs = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "keep_macs"));
+        if (!j->dest) j->dest = strdup("/");
+    }
     cJSON_Delete(o);
     if (!j->repo_path || !j->dest || (strcmp(mode, "item") == 0 && !j->item)) {
         urestore_free(j);

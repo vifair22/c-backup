@@ -17,6 +17,7 @@
 
 typedef struct {
     const char   *subpath;    /* restore only this path within the snapshot */
+    int           strip_subpath; /* the subpath's contents go straight into dest */
     int           overwrite;  /* replace existing files at the destination */
     atomic_int *cancel;
     void (*progress_cb)(const char *phase, uint64_t done, uint64_t total, void *ctx);
