@@ -23,6 +23,7 @@ typedef struct {
     char zfs[HOST_TOOL_PATH_MAX];         /* these are paths in the host's */
     char btrfs[HOST_TOOL_PATH_MAX];
     char lxc_dir[HOST_TOOL_PATH_MAX];     /* directory holding lxc-ls, lxc-info, ... */
+    char realpath[HOST_TOOL_PATH_MAX];
     /* Prefix for the helper's own file access to host paths (directories
      * it lists or creates, share configs): /proc/1/root under --pid=host,
      * "" when the helper already sees the host's tree. */
