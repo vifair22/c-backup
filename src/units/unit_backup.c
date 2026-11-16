@@ -254,6 +254,8 @@ typedef struct {
     unit_json_t               uj;
     char                     *uj_text;
     uint64_t                  bytes_read;
+    int                       held;      /* begin kept a pause for pass 2 */
+    int                       cap_hit;   /* and the watchdog let it go first */
 } uctx_t;
 
 static const sp_item_plan_t *plan_for(const uctx_t *u, const char *item)
@@ -306,6 +308,18 @@ static status_t build_unit_json(uctx_t *u)
             j->items[u->parts[p].item].size = u->parts[p].blob_len;
     for (size_t i = 0; i < u->info->n_warnings; i++) {
         if (!(j->warnings[i] = strdup(u->info->warnings[i]))) return set_error(ERR_NOMEM, "unit.json");
+        j->n_warnings++;
+    }
+    if (u->cap_hit) {
+        /* The second pass outlived the pause cap: what it read after the
+         * watchdog unpaused the unit is not from the snapshot's instant. */
+        j->consistency = SP_CONSIST_INCONSISTENT;
+        char **g = realloc(j->warnings, (j->n_warnings + 1) * sizeof(*g));
+        if (!g) return set_error(ERR_NOMEM, "unit.json");
+        j->warnings = g;
+        if (!(g[j->n_warnings] = strdup("the pause hit its cap before the second pass over mounts on no "
+                                        "snapshot domain finished; those mounts are flagged inconsistent")))
+            return set_error(ERR_NOMEM, "unit.json");
         j->n_warnings++;
     }
     size_t dropped = 0;
@@ -512,6 +526,63 @@ static size_t unit_excludes(cutils_db_t *db, int64_t repo_id, const char *key,
     return n;
 }
 
+/* Trees on no snapshot domain: read live, so pause-read re-reads them. */
+static int is_fallback(const sp_item_desc_t *it)
+{
+    return it->kind == SP_ITEM_TREE && !(it->caps & SP_CAP_SNAPSHOT);
+}
+
+/*
+ * pause-read, pass 1 (container-backup.md section 7): every fallback tree
+ * read live and its content and cache rows stored, no snapshot written, so
+ * the paused pass re-reads only what changed since.
+ */
+static status_t fallback_pass1(store_t *store, cutils_db_t *db, int64_t repo_id,
+                               const unit_backup_opts_t *o, const sp_unit_desc_t *d, const char *key)
+{
+    const char **paths = calloc(d->n_items ? d->n_items : 1, sizeof(*paths));
+    const char **rpaths = calloc(d->n_items ? d->n_items : 1, sizeof(*rpaths));
+    if (!paths || !rpaths) { free(paths); free(rpaths); return set_error(ERR_NOMEM, "unit backup"); }
+    int n = 0;
+    for (size_t i = 0; i < d->n_items; i++) {
+        if (!is_fallback(&d->items[i])) continue;
+        paths[n] = d->items[i].tree_path;
+        rpaths[n] = d->items[i].source && d->items[i].source[0] == '/' ? d->items[i].source : d->items[i].tree_path;
+        n++;
+    }
+    backup_opts_t bo;
+    memset(&bo, 0, sizeof(bo));
+    bo.paths = paths;
+    bo.n_paths = n;
+    bo.read_paths = rpaths;
+    bo.content_only = 1;
+    bo.cancel = o->cancel;
+    bo.store_workers = o->store_workers;
+    bo.file_cache_match = o->file_cache_match;
+    log_info("unit %s: pause-read pass 1 over %d mount(s) on no snapshot domain", key, n);
+    backup_result_t br;
+    memset(&br, 0, sizeof(br));
+    status_t st = backup_run(store, db, repo_id, &bo, &br);
+    backup_result_free(&br);
+    free(paths);
+    free(rpaths);
+    return st;
+}
+
+/* The held roots are stored: the pause goes. */
+static void held_done(void *ctx)
+{
+    uctx_t *u = ctx;
+    int cap = 0;
+    if (!u->ops->release || u->ops->release(u->sess, &cap) != OK) {
+        log_warn("unit %s: releasing the pause: %s; the helper's watchdog will", u->desc->unit_id, err_msg());
+        err_clear();
+        cap = 1;
+    }
+    u->held = 0;
+    u->cap_hit = cap;
+}
+
 static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
                         const unit_backup_opts_t *o, const sp_provider_ops_t *ops,
                         sp_ctx_t *pctx, const listed_t *lu, size_t index, size_t total,
@@ -557,6 +628,15 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
     req.holds = &holds;
     req.daemon8 = units_daemon8();
 
+    size_t n_fb = 0;
+    for (size_t i = 0; i < d->n_items; i++) n_fb += is_fallback(&d->items[i]) ? 1u : 0u;
+    req.hold_pause = n_fb > 0 && ops->release && d->state == SP_STATE_RUNNING;
+    if (req.hold_pause && (st = fallback_pass1(store, db, repo_id, o, d, key)) != OK) {
+        ops->desc_free(d);
+        units_unlock(key);
+        return st;
+    }
+
     uctx_t u;
     memset(&u, 0, sizeof(u));
     u.ops = ops;
@@ -567,6 +647,7 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
         units_unlock(key);
         return st;
     }
+    u.held = (u.info->consist_flags & SP_CF_PAUSE_HELD) != 0;
     res->achieved = u.info->achieved;
     res->n_warnings = (unsigned)u.info->n_warnings;
     if (u.info->n_warnings) snprintf(res->warning, sizeof(res->warning), "%s", u.info->warnings[0]);
@@ -587,9 +668,15 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
     int have_all = u.parts && syn && synpath && paths && rpaths && rbuf;
     if (!have_all) st = set_error(ERR_NOMEM, "unit backup");
     size_t ns = 0, nt = 0;
-    for (size_t i = 0; have_all && st == OK && i < d->n_items; i++) {
-        const sp_item_desc_t *it = &d->items[i];
-        if (it->kind == SP_ITEM_TREE) {
+    /* Trees first, and under a held pause the fallback ones before the
+     * rest, so the pause covers them alone (backup_opts_t.held_roots). */
+    size_t held_roots = 0;
+    for (int pass = 0; have_all && st == OK && pass < 2; pass++) {
+        for (size_t i = 0; st == OK && i < d->n_items; i++) {
+            const sp_item_desc_t *it = &d->items[i];
+            if (it->kind != SP_ITEM_TREE) continue;
+            int first = u.held && is_fallback(it);
+            if ((pass == 0) != first) continue;
             if (!(rbuf[nt] = malloc(PATH_MAX))) { st = set_error(ERR_NOMEM, "unit backup"); break; }
             st = ops->tree_root(u.sess, it, rbuf[nt], PATH_MAX);
             if (st == OK && rbuf[nt][0] != '/')
@@ -597,8 +684,12 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
             paths[nt] = it->tree_path;
             rpaths[nt] = rbuf[nt];
             nt++;
-            continue;
+            if (first) held_roots++;
         }
+    }
+    for (size_t i = 0; have_all && st == OK && i < d->n_items; i++) {
+        const sp_item_desc_t *it = &d->items[i];
+        if (it->kind == SP_ITEM_TREE) continue;
         size_t n = strlen(it->tree_path) + 2;
         if (!(synpath[ns] = malloc(n))) { st = set_error(ERR_NOMEM, "unit backup"); break; }
         snprintf(synpath[ns], n, "/%s", it->tree_path);
@@ -634,6 +725,11 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
         bo.paths = paths;
         bo.n_paths = (int)nt;
         bo.read_paths = rpaths;
+        if (u.held && held_roots) {
+            bo.held_roots = (int)held_roots;
+            bo.held_done = held_done;
+            bo.held_ctx = &u;
+        }
         n_excl = unit_excludes(db, repo_id, key, paths, rpaths, nt, excl);
         if (n_excl) {
             bo.exclude = (const char **)(void *)excl;
@@ -683,6 +779,7 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
         err_clear();
     }
     res->snapshot_id = snap;
+    if (u.cap_hit) res->achieved = SP_CONSIST_INCONSISTENT;
     res->bytes_read = u.bytes_read;
     if (st == OK)
         log_info("unit %s: snapshot %lld, %s, %llu disk bytes read", key, (long long)snap,

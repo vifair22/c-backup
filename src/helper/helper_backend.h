@@ -51,10 +51,8 @@ typedef struct helper_backend {
      * NULL: define is unsupported for this provider. */
     status_t (*define)(sp_ctx_t *c, const char *unit_id, const char *definition,
                        const helper_policy_t *pol, cJSON **result);
-    /* Release a pause a session still holds (the fallback's second pass,
-     * container-backup.md section 7): *released 1 when it held one. NULL:
-     * sessions never hold a pause past begin. */
-    status_t (*session_release)(sp_session_t *s, int *released);
+    /* (The vtable's release lets a held pause go; nothing extra here.) */
+    void     *reserved;
 } helper_backend_t;
 
 /* The fake provider as a backend, over ctx. */

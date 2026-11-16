@@ -366,6 +366,7 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(key, sizeof(key), "%s:%s", c->provider, unit->unit_id);
         if (u) cJSON_AddItemToArray(u, cJSON_CreateString(key));
         if (a) cJSON_AddBoolToObject(a, "pause", (unit->caps & SP_CAP_PAUSE) != 0);
+        if (a && req->hold_pause) cJSON_AddBoolToObject(a, "hold", 1);
         st = rcall_fd(c->socket, "capture.begin", a, &res, &s->late_fd);
     }
     const char *tok = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture")) : NULL;
@@ -603,6 +604,19 @@ static status_t r_stream_close(sp_session_t *s, const sp_item_desc_t *item, int 
     return set_error(ERR_NOT_FOUND, "helper: dump %s was not open", item->id);
 }
 
+/* The pause the helper kept for the second pass, let go (lease.release). */
+static status_t r_release(sp_session_t *s, int *cap_hit)
+{
+    *cap_hit = 0;
+    cJSON *a = cJSON_CreateObject();
+    if (a) cJSON_AddStringToObject(a, "capture", s->token);
+    cJSON *res = NULL;
+    status_t st = rcall(s->ctx->socket, "lease.release", a, &res);
+    if (st == OK) *cap_hit = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "cap_hit"));
+    cJSON_Delete(res);
+    return st;
+}
+
 static status_t r_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapshot_id)
 {
     (void)outcome; (void)snapshot_id;
@@ -701,7 +715,7 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
             .describe = r_describe, .desc_free = r_desc_free, .begin = r_begin,
             .blob_read = r_blob_read, .block_open = r_block_open, .tree_root = r_tree_root,
             .end = r_end, .sweep = r_sweep,
-            .stream_open = r_stream_open, .stream_close = r_stream_close,
+            .stream_open = r_stream_open, .stream_close = r_stream_close, .release = r_release,
         };
         st = sp_registry_add(o, c);
         if (st != OK) { free(c); break; }

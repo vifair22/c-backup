@@ -317,6 +317,31 @@ curl --unix-socket /run/c-backupd/api.sock -X PUT \
 Up to 64 patterns, one per line, naming the paths as the container binds
 them; `null` or `""` removes them.
 
+### Mounts on no snapshot domain: pause-read
+
+A mount on an array disk, an unassigned device or a split share cannot be
+snapshotted (container-backup.md section 7). For a running unit with such
+mounts the daemon makes two passes:
+
+1. **Pass 1, live**: those mounts are read with the unit running, their
+   content and file cache rows stored, no snapshot written.
+2. `capture.begin` with `hold: true`: the helper pauses the unit, takes the
+   snapshots of every other mount in the same pause, and returns with the
+   unit **still paused** (`SP_CF_PAUSE_HELD`).
+3. **Pass 2, paused**: the unit job scans those mounts again and re-reads
+   only files whose metadata changed since pass 1, then sends
+   `lease.release`; the helper unpauses and runs the post hooks. The other
+   mounts' files and the configuration are stored after, unpaused.
+
+The pause is capped by the policy's `max_pause_s` (30 s by default): the
+helper's watchdog unpauses at the cap whatever the daemon does, and
+`lease.release` then reports `cap_hit`, the snapshot is kept, and the unit
+is flagged `inconsistent` with a warning. Within the cap the unit is
+`crash`-consistent like a fully snapshotted one. The scan of every root
+happens before any file is stored, so the directory walk of the snapshot
+mounts falls inside the pause as well; their file content does not.
+`pause = never` units, and stopped ones, are read live and flagged.
+
 ### Pausing
 
 Members of a unit are paused together (each pause journalled first), so
@@ -458,9 +483,9 @@ journal rows after every fault (`GET /providers` `holds_open` 0, helper
 - `pause: false` is passed to the backend as the wanted level; the fake
   pauses whenever the unit can. The Docker provider decides from its
   policy (`pause`, `pause_always`) instead.
-- Not built yet (container-backup.md): the fallback's second, paused pass
-  (`pause-read`; a non-snapshot mount is read live and flagged
-  `inconsistent`); pause scope `group` and `job`.
+- Not built yet (container-backup.md): pause scope `group` and `job`;
+  the `containers.fallback` modes other than `pause-read` (`live` is what
+  `pause = never` gives; `stop` and `fail` are not offered).
 - `restore.stage` and `restore.swap` act on host paths directly, so for a
   container provider they need the helper to see the pools at their host
   paths (bind them in as well as using `host_root`).

@@ -650,6 +650,9 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         q.pause_max_s = s->pol->max_pause_s;
         q.holds = &holds;
         q.daemon8 = s->pol->daemon_id;
+        /* pause: a pause may be held for the daemon's second pass over
+         * mounts on no snapshot domain, released with lease.release. */
+        q.hold_pause = r->hold;
         sp_session_t *sess = NULL;
         const sp_session_info_t *info = NULL;
         status_t st = b->ops->begin(b->ctx, d, &q, &sess, &info);
@@ -798,6 +801,42 @@ static char *op_capture_begin_paths(helper_server_t *s, const helper_req_t *r)
     }
     cJSON_AddStringToObject(res, "capture", slot->token);
     cJSON_AddNumberToObject(res, "expires", (double)slot->deadline);
+    return resp_ok(r->id, res);
+}
+
+/* lease.release: let go what a capture holds beyond its snapshots (a
+ * pause kept for the fallback's second pass), keeping the capture; a
+ * capture with no member sessions (begin_paths) is ended, as before. */
+static char *op_capture_end(helper_server_t *s, const helper_req_t *r);
+
+static char *op_lease_release(helper_server_t *s, const helper_req_t *r)
+{
+    member_t mem[HELPER_UNITS_MAX];
+    size_t n = 0;
+    pthread_mutex_lock(&s->mu);
+    capture_t *c = capture_find(s, r->token);
+    if (c) { n = c->n_members; memcpy(mem, c->members, n * sizeof(*mem)); }
+    pthread_mutex_unlock(&s->mu);
+    if (!c) return resp_error(r->id, HELPER_E_INVALID, "no such capture");
+    if (n == 0) return op_capture_end(s, r);
+    int cap_hit = 0;
+    unsigned released = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!mem[i].sess || !mem[i].b->ops->release) continue;
+        int hit = 0;
+        if (mem[i].b->ops->release(mem[i].sess, &hit) != OK) {
+            log_warn("helper: releasing %s: %s", mem[i].unit, err_msg());
+            err_clear();
+            continue;
+        }
+        released++;
+        cap_hit |= hit;
+    }
+    cJSON *res = cJSON_CreateObject();
+    if (res) {
+        cJSON_AddNumberToObject(res, "released", released);
+        cJSON_AddBoolToObject(res, "cap_hit", cap_hit);
+    }
     return resp_ok(r->id, res);
 }
 
@@ -1324,7 +1363,7 @@ static char *dispatch(helper_server_t *s, const helper_req_t *r, int *pass_fd, i
     case HOP_UNIT_STOP:              return op_unit_stop_start(s, r, 0);
     case HOP_UNIT_START:             return op_unit_stop_start(s, r, 1);
     case HOP_UNIT_DEFINE:            return op_unit_define(s, r, in_fd);
-    case HOP_LEASE_RELEASE:          return op_capture_end(s, r);
+    case HOP_LEASE_RELEASE:          return op_lease_release(s, r);
     case HOP_SWEEP:                  return op_sweep(s, r);
     case HOP_COUNT:                  break;
     }

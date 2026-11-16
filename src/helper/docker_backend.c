@@ -74,6 +74,12 @@ struct sp_session {
     size_t            n_logs;
     struct { char item[SP_ITEM_ID_MAX]; helper_run_t *run; int err_fd; } streams[4];
     size_t            n_streams;
+    /* A pause kept past begin for the fallback's second pass. */
+    int               held;
+    int               paused[MEMBERS_MAX];
+    int64_t           hold[MEMBERS_MAX];
+    uint64_t          pause_t0;
+    int               post_ran;
 };
 
 static void keep_log(struct sp_session *s, const char *name, char *text, size_t len)
@@ -924,9 +930,12 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
      * tear the unit (6.4); always per unit; never for our own containers. */
     int mode = c->pol->docker_pause;
     if (glob_any(c->pol->pause_always, c->pol->n_pause_always, unit->unit_id)) mode = 1;
-    int want = running && (mode == 1 || (mode == 0 && instants > 1));
+    /* pause-read: mounts on no snapshot domain are re-read under a pause the
+     * caller asked to keep (section 7), unless the unit is never paused. */
+    int hold = req->hold_pause && fallback > 0 && running && mode != 2;
+    int want = running && (mode == 1 || (mode == 0 && (instants > 1 || hold)));
     int paused[MEMBERS_MAX] = { 0 };
-    int64_t hold[MEMBERS_MAX] = { 0 };
+    int64_t hold_ids[MEMBERS_MAX] = { 0 };
     int pause_failed = 0;
     /* Pre-flush outside any pause, so the snapshot's own commit is short. */
     for (size_t i = 0; i < s->snaps.n; i++) syncfs_root(c, s->snaps.doms[i].root);
@@ -942,7 +951,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         jobs[i] = (pause_job_t){ c, m, ERR_IO, "not attempted" };
         char detail[128];
         snprintf(detail, sizeof(detail), "docker:%s", m->id);
-        if (s->has_holds && s->holds.record(s->holds.ctx, SP_HOLD_PAUSE, detail, &hold[i]) != OK) {
+        if (s->has_holds && s->holds.record(s->holds.ctx, SP_HOLD_PAUSE, detail, &hold_ids[i]) != OK) {
             snprintf(jobs[i].why, sizeof(jobs[i].why), "%.250s", err_msg());
             err_clear();
             pause_failed = 1;
@@ -961,14 +970,14 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         /* Whatever paused is recorded, so unpause_all releases it. */
         if (started[i] && jobs[i].st == OK) { paused[i] = 1; continue; }
         log_warn("docker: %s did not pause: %s", m->name, jobs[i].why);
-        if (s->has_holds && hold[i] && s->holds.clear(s->holds.ctx, hold[i]) != OK) err_clear();
-        hold[i] = 0;
+        if (s->has_holds && hold_ids[i] && s->holds.clear(s->holds.ctx, hold_ids[i]) != OK) err_clear();
+        hold_ids[i] = 0;
         pause_failed = 1;
     }
     if (pause_failed) {
         /* 6.5: unpause what paused and take the snapshot unpaused, which is
          * still crash-consistent in one instant, and fails otherwise. */
-        unpause_all(s, hold, paused);
+        unpause_all(s, hold_ids, paused);
         if (instants > 1) {
             session_free(s);
             return set_error(ERR_IO, "docker: %s did not pause and spans %u snapshot instants", unit->unit_id, instants);
@@ -983,29 +992,41 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
                                 s->has_holds ? &s->holds : NULL) : OK;
     char why[512] = "";
     if (st != OK) snprintf(why, sizeof(why), "%.500s", err_msg());
-    unpause_all(s, hold, paused);
-    s->info.pause_ms = any_paused ? ms_now() - t0 : 0;
+    int keep = st == OK && hold && any_paused;
+    if (keep) {
+        /* Still paused: the journal rows stay, so the watchdog releases it
+         * at max_pause_s if the caller never does. */
+        s->held = 1;
+        s->pause_t0 = t0;
+        memcpy(s->paused, paused, sizeof(paused));
+        memcpy(s->hold, hold_ids, sizeof(hold_ids));
+    } else {
+        unpause_all(s, hold_ids, paused);
+        s->info.pause_ms = any_paused ? ms_now() - t0 : 0;
+    }
     if (st != OK) { session_free(s); return set_error(st, "%s", why); }
 
-    /* Post hooks run after the unpause and the snapshot (6.6). */
+    /* Post hooks run after the unpause and the snapshot (6.6); a held
+     * pause runs them at release. */
     int pran = 0;
-    if (running && run_hooks(c, unit->unit_id, 0, s, &pran) < 0) {
+    if (!keep && running && run_hooks(c, unit->unit_id, 0, s, &pran) < 0) {
         (void)sp_session_info_warn(&s->info, "%.400s", err_msg());
         err_clear();
     }
+    s->post_ran = !keep;
 
     sp_consistency_t lvl;
     if (!running) lvl = SP_CONSIST_OFFLINE;
-    else if (fallback || (instants > 1 && !any_paused)) lvl = SP_CONSIST_INCONSISTENT;
+    else if ((fallback && !keep) || (instants > 1 && !any_paused)) lvl = SP_CONSIST_INCONSISTENT;
     else if (ran && failed == 0) lvl = SP_CONSIST_APPLICATION;
     else lvl = SP_CONSIST_CRASH;
-    if (fallback && running)
+    if (fallback && running && !keep)
         (void)sp_session_info_warn(&s->info, "%zu mount(s) on no snapshot domain read live (fallback-live)", fallback);
     if (instants > 1 && !any_paused && running)
         (void)sp_session_info_warn(&s->info, "%u snapshot instants without a pause", instants);
     s->info.achieved = lvl;
     s->info.consist_flags = (any_paused ? SP_CF_PAUSED : 0) | (s->snaps.n ? SP_CF_FS_SNAPSHOT : 0) |
-                            (ran && failed == 0 ? SP_CF_HOOK_PRE_OK : 0);
+                            (ran && failed == 0 ? SP_CF_HOOK_PRE_OK : 0) | (keep ? SP_CF_PAUSE_HELD : 0);
     if (lvl < req->require) {
         (void)snap_release(&c->snap, &s->snaps, c->pol->daemon_id, s->has_holds ? &s->holds : NULL);
         session_free(s);
@@ -1014,6 +1035,32 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     }
     *out = s;
     *info = &s->info;
+    return OK;
+}
+
+/* The held pause ends: unpaused, journal cleared, post hooks run. Past
+ * max_pause_s the helper's watchdog has already unpaused it, so the second
+ * pass ran partly live. */
+static status_t d_release(sp_session_t *s, int *cap_hit)
+{
+    *cap_hit = 0;
+    if (!s->held) return OK;
+    uint64_t held_ms = ms_now() - s->pause_t0;
+    *cap_hit = held_ms > (uint64_t)s->c->pol->max_pause_s * 1000u;
+    unpause_all(s, s->hold, s->paused);
+    s->held = 0;
+    s->info.pause_ms = held_ms;
+    if (*cap_hit) {
+        s->info.consist_flags |= SP_CF_WATCHDOG_RELEASED;
+        (void)sp_session_info_warn(&s->info, "the pause hit its cap of %u s; mounts on no snapshot domain "
+                                   "were partly read live", s->c->pol->max_pause_s);
+    }
+    int pran = 0;
+    if (!s->post_ran && run_hooks(s->c, s->unit, 0, s, &pran) < 0) {
+        (void)sp_session_info_warn(&s->info, "%.400s", err_msg());
+        err_clear();
+    }
+    s->post_ran = 1;
     return OK;
 }
 
@@ -1034,6 +1081,8 @@ static status_t d_tree_root(sp_session_t *s, const sp_item_desc_t *item, char *b
 static status_t d_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapshot_id)
 {
     (void)outcome; (void)snapshot_id;
+    int cap = 0;
+    (void)d_release(s, &cap);
     status_t st = snap_release(&s->c->snap, &s->snaps, s->c->pol->daemon_id, s->has_holds ? &s->holds : NULL);
     if (st != OK) { log_warn("docker: %s", err_msg()); err_clear(); }
     session_free(s);
@@ -1135,7 +1184,7 @@ static const sp_provider_ops_t k_docker_ops = {
     .init = d_init, .fini = d_fini, .probe = d_probe, .list_units = d_list,
     .describe = d_describe, .desc_free = sp_unit_desc_free, .begin = d_begin,
     .blob_read = d_blob_read, .tree_root = d_tree_root, .end = d_end, .sweep = d_sweep,
-    .stream_open = d_stream_open, .stream_close = d_stream_close,
+    .stream_open = d_stream_open, .stream_close = d_stream_close, .release = d_release,
 };
 
 /* ------------------------------------------------------------------ */

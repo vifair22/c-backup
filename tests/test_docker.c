@@ -24,6 +24,17 @@
 #include <cmocka.h>
 
 #include "docker_backend.h"
+#include "registry.h"
+#include "repo.h"
+#include "restore.h"
+#include "store.h"
+#include "store_index.h"
+#include "unit_backup.h"
+#include "unit_state.h"
+
+#include <cutils/db.h>
+
+extern const db_migration_t app_migrations[];
 #include "docker_api.h"
 #include "fake_docker.h"
 
@@ -495,6 +506,100 @@ static void test_define_compose(void **state)
     unsetenv("FAKE_COMPOSE_FAIL");
 }
 
+/* pause-read through the unit job: pass 1 live, then the unit paused
+ * across the snapshot and the second pass over the mount on no snapshot
+ * domain, released before the rest; crash-consistent, the content as at
+ * the pause. */
+static cutils_db_t *udb;
+static store_t *ustore;
+static store_index_t *uidx;
+static int64_t urepo;
+
+static int setup_units(void **state)
+{
+    if (setup(state) != 0) return -1;
+    if (db_open(&udb, D "/state.db") != 0 || db_run_lib_migrations(udb) != 0 ||
+        db_run_compiled_migrations(udb, app_migrations) != 0) return -1;
+    if (repo_register(udb, D "/repo", "t", &urepo) != OK) return -1;
+    if (repo_store_open(D "/repo", NULL, &ustore) != OK) return -1;
+    if (store_index_bind(ustore, udb, urepo, &uidx) != OK) return -1;
+    units_config_t uc = { "", 2, 10, 30, 1 };
+    if (units_init(udb, NULL, &uc) != OK) return -1;
+    return sp_registry_add(be.ops, be.ctx) == OK ? 0 : -1;
+}
+
+static int teardown_units(void **state)
+{
+    units_shutdown();
+    sp_registry_shutdown();
+    store_index_free(uidx);
+    store_close(ustore);
+    db_close(udb);
+    return teardown(state);
+}
+
+static void test_pause_read(void **state)
+{
+    (void)state;
+    const char *names[] = { "slowpoke" };
+    unit_backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.provider = "docker";
+    o.units = names;
+    o.n_units = 1;
+    o.require = SP_CONSIST_CRASH;
+    o.job_id = 61;
+    unit_backup_result_t res;
+    assert_int_equal(unit_backup_run(ustore, udb, urepo, &o, &res), OK);
+    assert_int_equal(res.ok, 1);
+    assert_int_equal(res.units[0].achieved, SP_CONSIST_CRASH);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    assert_int_equal(fdk.pauses, 1);
+    assert_int_equal(fdk.unpauses, 1);
+    assert_string_equal(fdk.c[3].state, "running");
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(ustore, udb, urepo, snap, D "/out", &ro, &rr), OK);
+    assert_true(has(D "/out" MNT "/disk1/slow/s", "slow-v1"));
+}
+
+/* A pause held past max_pause_s: the release says the cap was hit. */
+static int setup_cap(void **state)
+{
+    (void)state;
+    return start("[helper]\nmax_pause_s = 1\n");
+}
+
+static void test_pause_cap(void **state)
+{
+    (void)state;
+    sp_unit_desc_t *d = NULL;
+    assert_int_equal(be.ops->describe(be.ctx, "slowpoke", &d), OK);
+    sp_begin_req_t q;
+    memset(&q, 0, sizeof(q));
+    q.job_id = 62;
+    q.require = SP_CONSIST_INCONSISTENT;
+    q.holds = &holds;
+    q.hold_pause = 1;
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    assert_int_equal(be.ops->begin(be.ctx, d, &q, &s, &info), OK);
+    assert_true(info->consist_flags & SP_CF_PAUSE_HELD);
+    assert_string_equal(fdk.c[3].state, "paused");
+    struct timespec ts = { 1, 200 * 1000000L };
+    nanosleep(&ts, NULL);
+    int cap = 0;
+    assert_int_equal(be.ops->release(s, &cap), OK);
+    assert_int_equal(cap, 1);
+    assert_true(info->consist_flags & SP_CF_WATCHDOG_RELEASED);
+    assert_string_equal(fdk.c[3].state, "running");
+    assert_int_equal(holds_open, 0);
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+}
+
 /* A mount on no snapshot domain is read live, and the level says so. */
 static void test_fallback_flagged(void **state)
 {
@@ -599,6 +704,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_hook_logs_and_dumps, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_compose, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pause_read, setup_units, teardown_units),
+        cmocka_unit_test_setup_teardown(test_pause_cap, setup_cap, teardown),
         cmocka_unit_test_setup_teardown(test_fallback_flagged, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failing_hook, setup_failing_hook, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),

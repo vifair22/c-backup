@@ -148,6 +148,11 @@ typedef struct {
     const sp_holds_t      *holds;
     /* The per-daemon id artefacts are named with (section 6.3), 8 hex. */
     const char            *daemon8;
+    /* pause-read (container-backup.md section 7): when the unit has mounts
+     * on no snapshot domain, pause it and keep the pause past begin
+     * (SP_CF_PAUSE_HELD) until release, so the caller's second pass over
+     * those mounts is consistent with the snapshot. */
+    int                    hold_pause;
 } sp_begin_req_t;
 
 typedef struct {
@@ -162,6 +167,7 @@ typedef struct {
 #define SP_CF_PAUSED            0x04u
 #define SP_CF_FS_SNAPSHOT       0x08u
 #define SP_CF_WATCHDOG_RELEASED 0x10u
+#define SP_CF_PAUSE_HELD        0x20u  /* begin returned with the unit still paused */
 
 /* Filled by begin, read by the job, owned by the session. */
 typedef struct {
@@ -340,6 +346,11 @@ typedef struct sp_provider_ops {
      * to EOF by the caller and closed by it; stream_close then says whether
      * the producer succeeded (*ok), and only then is the item kept. NULL
      * when the provider has no streams. */
+    /* Let go a pause begin kept (SP_CF_PAUSE_HELD). *cap_hit 1 when it had
+     * already been released by the watchdog at the pause cap, so what was
+     * read under it is not all from one instant. NULL: never held. */
+    status_t (*release)(sp_session_t *s, int *cap_hit);
+
     status_t (*stream_open)(sp_session_t *s, const sp_item_desc_t *item, int *fd);
     status_t (*stream_close)(sp_session_t *s, const sp_item_desc_t *item, int *ok);
 } sp_provider_ops_t;

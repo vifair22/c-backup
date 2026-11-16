@@ -101,6 +101,7 @@ typedef struct {
     char        units[HELPER_UNITS_MAX][HELPER_UNIT_KEY_MAX + 1];
     size_t      n_units;
     int         pause;
+    int         hold;        /* capture.begin: keep a pause for the daemon's second pass */
     /* capture.begin_paths */
     char       *paths[HELPER_PATHS_MAX];
     size_t      n_paths;
