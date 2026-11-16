@@ -12,6 +12,7 @@
 static int under(const char *path, const char *root)
 {
     size_t n = strlen(root);
+    if (n == 1 && root[0] == '/') return path[0] == '/';
     return n && strncmp(path, root, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 

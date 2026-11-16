@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# A stand-in for the host's lxc-* tools, for the helper's tests, dispatched
+# on the name it is called by (the other names are symlinks to it).
+# Containers are directories under -P; their state is in
+# $FAKE_HOST_STATE/lxc-<name> (RUNNING, FROZEN or STOPPED).
+set -u
+S=${FAKE_HOST_STATE:?FAKE_HOST_STATE is not set}
+tool=$(basename "$0")
+echo "$tool $*" >> "$S/lxc.log"
+P="" N=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -P) P=$2; shift 2 ;;
+    -n) N=$2; shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+    esac
+done
+st() { cat "$S/lxc-$N" 2>/dev/null || echo STOPPED; }
+case "$tool" in
+lxc-ls)
+    [ "${1:-}" = "--version" ] && { echo "6.0.0-fake"; exit 0; }
+    for d in "$P"/*/; do [ -f "$d/config" ] && basename "$d"; done ;;
+lxc-info) echo "State:          $(st)" ;;
+lxc-freeze) [ "$(st)" = RUNNING ] || { echo "$N is not running" >&2; exit 1; }; echo FROZEN > "$S/lxc-$N" ;;
+lxc-unfreeze) [ "$(st)" = FROZEN ] || { echo "$N is not frozen" >&2; exit 1; }; echo RUNNING > "$S/lxc-$N" ;;
+lxc-start) echo RUNNING > "$S/lxc-$N" ;;
+lxc-stop) echo STOPPED > "$S/lxc-$N" ;;
+lxc-attach) exec "$@" ;;
+*) echo "fake lxc: $tool not understood" >&2; exit 2 ;;
+esac
