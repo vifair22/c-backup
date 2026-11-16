@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -730,6 +731,15 @@ static status_t sink_finish_open(local_ctx_t *c, const char *path,
     c->owns_store = 1;
     snprintf(c->uuid, sizeof(c->uuid), "%s", m->uuid);
 
+    /*
+     * A replicate killed mid-copy leaves its staging pack in tmp/ (B133):
+     * up to the size of the object it was copying. This sink is about to
+     * write here; if it holds tmp/ (store_claim_tmp), nothing else is
+     * staging, and every staging file there is a dead writer's. Packs in
+     * packs/ are never touched: the sweep reads tmp/ only.
+     */
+    (void)store_sweep_tmp_before(c->store, time(NULL), NULL);
+
     build_index(c);
 
     memset(out, 0, sizeof(*out));
@@ -739,8 +749,21 @@ static status_t sink_finish_open(local_ctx_t *c, const char *path,
     return OK;
 }
 
+int replica_reencrypt_drops_encryption(const char *path,
+                                       const repo_marker_t *source_marker)
+{
+    if (!path || !source_marker || source_marker->enc_mode == REPO_ENC_NONE) return 0;
+    repo_marker_t m;
+    if (repo_marker_read(path, &m) != OK) {
+        err_clear();
+        return 0;
+    }
+    return m.enc_mode == REPO_ENC_NONE;
+}
+
 status_t replica_sink_local_open_reencrypt(const char *path,
                                            const repo_marker_t *source_marker,
+                                           int allow_plaintext,
                                            replica_sink_t *out)
 {
     if (!path || !source_marker || !out)
@@ -766,6 +789,14 @@ status_t replica_sink_local_open_reencrypt(const char *path,
         return set_error(ERR_INVALID,
                          "%s is a replica of this repository, not a different one; "
                          "replicate into it without --reencrypt", path);
+    /*
+     * Checked here as well as by the route: the route answers before the
+     * job is queued, and this holds when the job runs, after anything that
+     * could have replaced the target in between.
+     */
+    if (source_marker->enc_mode != REPO_ENC_NONE && m.enc_mode == REPO_ENC_NONE &&
+        !allow_plaintext)
+        return set_error(ERR_INVALID, REPLICA_PLAINTEXT_REFUSAL, path);
 
     local_ctx_t *c = calloc(1, sizeof(*c));
     if (!c) return set_error(ERR_NOMEM, "replica: alloc");

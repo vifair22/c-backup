@@ -60,6 +60,10 @@ typedef struct {
 struct store {
     char   *path;
     int     dirfd;
+    /* An exclusive flock on tmp/.lock, held from the first time this handle
+     * stages into tmp/ or sweeps it until store_close; -1 when not held.
+     * See store_claim_tmp. */
+    int     tmp_lock_fd;
     /* Dynamic .dat file handle cache (open-addressing hash table) */
     dat_cache_slot_t *dat_cache;
     uint32_t          dat_cache_mask;   /* power-of-2 - 1 */
@@ -249,21 +253,35 @@ done:
  * hand is never the engine's to delete. "tags." is the tag mirror's staging
  * file (repo_tags.c): written by the daemon rather than the store, but a
  * crash between its mkstemp and rename orphans it all the same. */
-static int is_engine_tmp_name(const char *name)
+/*
+ * 1: staging only a holder of tmp/'s claim or of the repository's write
+ * lock ever writes - pack-dat. (every pack writer takes the claim), snap.
+ * and snapids. (backup, a replica sink, reindex and snapshot delete, all
+ * under one or the other), deleting. (gc). 2: staging written under
+ * neither - tags., the tag mirror's, which a tag route writes while a
+ * backup or gc may be running. 0: not the engine's.
+ */
+static int engine_tmp_kind(const char *name)
 {
-    static const char *const prefixes[] = {
-        "pack-dat.", "snap.", "snapids.", "deleting.", "tags.",
-    };
-    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
-        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return 1;
+    static const char *const owned[] = { "pack-dat.", "snap.", "snapids.", "deleting." };
+    for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++)
+        if (strncmp(name, owned[i], strlen(owned[i])) == 0) return 1;
+    if (strncmp(name, "tags.", 5) == 0) return 2;
     return 0;
 }
 
-/* Unlink regular files in <root>/tmp whose mtime is before `cutoff`.
- * `engine_only` limits it to the engine's own staging names. */
+/*
+ * Unlink regular files in <root>/tmp whose mtime is before `cutoff`.
+ * `engine_only` limits it to the engine's own staging names, and holds the
+ * tag mirror's (kind 2) to the hour rule whatever `cutoff` says: the
+ * invariant an age-free sweep relies on is that nothing it may remove can
+ * have a live writer, and only kind 1 staging is written exclusively by
+ * holders of the claim or the write lock the sweeper holds.
+ */
 static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
                               uint64_t *out_bytes)
 {
+    const time_t hour_ago = time(NULL) - 60 * 60;
     char tmp_dir[PATH_MAX];
     if (snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", root) >= (int)sizeof(tmp_dir))
         return 0;
@@ -277,7 +295,10 @@ static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (de->d_name[0] == '.') continue;
-        if (engine_only && !is_engine_tmp_name(de->d_name)) continue;
+        int kind = engine_tmp_kind(de->d_name);
+        if (engine_only && kind == 0) continue;
+        time_t file_cutoff = (engine_only && kind == 2 && cutoff > hour_ago)
+                             ? hour_ago : cutoff;
 
         char path[PATH_MAX];
         if (snprintf(path, sizeof(path), "%s/%s", tmp_dir, de->d_name)
@@ -286,7 +307,7 @@ static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
 
         struct stat sb;
         if (lstat(path, &sb) != 0 || !S_ISREG(sb.st_mode)) continue;
-        if (sb.st_mtime >= cutoff) continue;
+        if (sb.st_mtime >= file_cutoff) continue;
 
         if (unlink(path) == 0) {
             swept++;
@@ -308,9 +329,52 @@ static void store_sweep_tmp(const char *root)
     (void)sweep_tmp_dir(root, time(NULL) - stale_after, 0, NULL);
 }
 
+/*
+ * Claim tmp/ for this handle: an exclusive, non-blocking flock on
+ * tmp/.lock, held until store_close. Every handle that stages into tmp/
+ * (open_new_pack) takes it, and so does every sweep that would remove
+ * staging younger than the hour rule allows. So a sweep that holds the
+ * claim knows no other handle - in this process or another, on this
+ * machine - is writing staging files there: whatever it finds was left
+ * by a writer that is gone. A writer that cannot get the claim writes
+ * anyway (two writers in one repository are the job layer's to prevent);
+ * the claim only decides what a sweep may assume.
+ */
+int store_claim_tmp(store_t *st)
+{
+    if (!st) return 0;
+    if (st->tmp_lock_fd >= 0) return 1;
+    char p[PATH_MAX];
+    if (snprintf(p, sizeof(p), "%s/tmp/.lock", st->path) >= (int)sizeof(p)) return 0;
+    int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return 0;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return 0;
+    }
+    st->tmp_lock_fd = fd;
+    return 1;
+}
+
 unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes)
 {
     if (!st) return 0;
+    /*
+     * Without the claim another handle may be staging right now, so only
+     * what the hour rule would remove anyway goes (store_open's sweep).
+     */
+    if (!store_claim_tmp(st)) {
+        time_t hour_ago = time(NULL) - 60 * 60;
+        if (before > hour_ago) before = hour_ago;
+        log_info("store: another writer holds %s/tmp; sweeping only staging "
+                 "older than an hour", st->path);
+    } else {
+        /* Held: no other handle is staging here, so a file written this
+         * very second is a dead writer's too. The callers sweep before
+         * staging anything themselves. */
+        time_t now = time(NULL);
+        if (before <= now) before = now + 1;
+    }
     return sweep_tmp_dir(st->path, before, 1, bytes);
 }
 
@@ -421,6 +485,7 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->path           = strdup(path);
     if (!r->path) { close(fd); free(r); return set_error(ERR_NOMEM, "store_open: strdup failed"); }
     r->dirfd          = fd;
+    r->tmp_lock_fd    = -1;     /* calloc'd: 0 would be stdin */
     r->dat_cache       = calloc(DAT_CACHE_MIN_SLOTS, sizeof(dat_cache_slot_t));
     r->dat_cache_mask  = DAT_CACHE_MIN_SLOTS - 1;
     r->dat_cache_count = 0;
@@ -480,6 +545,7 @@ void store_close(store_t *st) {
     store_dat_cache_flush(st);
     free(st->dat_cache);
     st->dat_cache = NULL;
+    if (st->tmp_lock_fd >= 0) close(st->tmp_lock_fd);    /* releases the claim */
     close(st->dirfd);
     free(st->path);
     pthread_mutex_destroy(&st->pack_num_mu);

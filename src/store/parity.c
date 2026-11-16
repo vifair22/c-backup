@@ -862,3 +862,50 @@ int rs_parity_decode(void *data, size_t len, const void *parity,
 
     return total_corrected;
 }
+
+/*
+ * crc32c_combine: appending n zero bytes to A is a linear map over GF(2),
+ * a 32x32 bit matrix. The maps for 2^k bytes, k = 0..63, are built once
+ * (each the square of the one before), so combining costs one matrix-vector
+ * product per set bit of len_b - a few hundred operations - which is what
+ * lets the pack writer extend a worker's payload CRC by the header's for
+ * every entry, small ones included, without a pass over the payload.
+ */
+static uint32_t crc32c_zeros[64][32];
+static pthread_once_t crc32c_zeros_once = PTHREAD_ONCE_INIT;
+
+static uint32_t gf2_times(const uint32_t *mat, uint32_t vec)
+{
+    uint32_t sum = 0;
+    while (vec) {
+        if (vec & 1u) sum ^= *mat;
+        vec >>= 1;
+        mat++;
+    }
+    return sum;
+}
+
+static void gf2_square(uint32_t *sq, const uint32_t *mat)
+{
+    for (int n = 0; n < 32; n++) sq[n] = gf2_times(mat, mat[n]);
+}
+
+static void crc32c_zeros_build(void)
+{
+    uint32_t one[32], two[32], four[32];
+    one[0] = 0x82F63B78u;             /* one zero bit: the reflected polynomial */
+    uint32_t row = 1;
+    for (int n = 1; n < 32; n++) { one[n] = row; row <<= 1; }
+    gf2_square(two, one);             /* two bits */
+    gf2_square(four, two);            /* four bits */
+    gf2_square(crc32c_zeros[0], four); /* one byte */
+    for (int k = 1; k < 64; k++) gf2_square(crc32c_zeros[k], crc32c_zeros[k - 1]);
+}
+
+uint32_t crc32c_combine(uint32_t crc_a, uint32_t crc_b, uint64_t len_b)
+{
+    pthread_once(&crc32c_zeros_once, crc32c_zeros_build);
+    for (int k = 0; len_b; k++, len_b >>= 1)
+        if (len_b & 1u) crc_a = gf2_times(crc32c_zeros[k], crc_a);
+    return crc_a ^ crc_b;
+}

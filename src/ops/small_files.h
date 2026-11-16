@@ -41,6 +41,7 @@
 
 #include "cdc.h"
 #include "error.h"
+#include "open_scanned.h"
 #include "pack.h"
 #include "store.h"
 
@@ -74,7 +75,9 @@ typedef struct {
     uint32_t     index;         /* the scan entry */
     const char  *path;          /* the scan entry's, valid for the backup */
     uint64_t     size;          /* the scan's size */
-    const struct stat *scan_st; /* the scan's stat, valid for the backup */
+    const scan_entry_t *entry;  /* the scan's entry, valid for the backup:
+                                 * its stat, and its source root to open
+                                 * beneath (open_scanned.h) */
     /* Out */
     int          ran;           /* a worker got to it (not cancelled first) */
     status_t     st;
@@ -109,16 +112,18 @@ typedef struct small_pool small_pool_t;
 /*
  * Start n workers. cancel (may be NULL) and the store's own flag stop a
  * worker between files. inflight caps batches submitted and not yet taken.
+ * roots is the backup's source root table: every file is opened beneath
+ * its root (B128), with mount crossings refused when one_fs.
  */
 status_t small_pool_start(store_t *store, const cdc_params_t *cp, unsigned n,
                           unsigned inflight, atomic_int *cancel,
+                          scan_roots_t *roots, int one_fs,
                           small_pool_t **out);
 
 /* A new, empty batch, or NULL on allocation failure. */
 small_batch_t *small_batch_new(void);
 /* Add one file. Returns 1 when the batch is full and should be submitted. */
-int  small_batch_add(small_batch_t *b, uint32_t index, const char *path,
-                     uint64_t size, const struct stat *scan_st);
+int  small_batch_add(small_batch_t *b, uint32_t index, const scan_entry_t *e);
 void small_batch_free(small_batch_t *b);
 
 /* Hand a batch over; the pool owns it until small_pool_take returns it. */

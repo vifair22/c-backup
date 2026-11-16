@@ -228,9 +228,17 @@ edits; the next start puts back any snapshot that went with them on its own
 (section 17.5). Either way the repository is consistent: a backup's partial pack
 and the index rows staged into it are discarded, and the next backup stores
 those files again. Staging files a killed writer left in the repository's
-`tmp/` are removed by the next backup or gc, which hold the repository's write
-lock and so know nothing else is writing there; opening a repository also
-removes any an hour old.
+`tmp/` are removed by the next backup, gc or reindex, by registering the
+repository, and in a replica by the next replicate into it. Each of these
+first takes an exclusive lock on `tmp/.lock`, which every process staging
+a pack there also holds. Getting it means no other writer of pack, snapshot
+record, snapshot-id or deletion-marker staging can be live (those are
+written only under that lock or the repository's write lock), so all of
+those go whatever their age; when another process holds it, only staging
+an hour old goes. The tag mirror's staging (`tags.*`) is written by tag
+commands, which hold neither and may run during a backup or gc, so it is
+only ever removed once it is an hour old. Opening a repository also removes
+any staging an hour old. Installed packs, in `packs/`, are never touched.
 
 A restore killed this way redoes more than the file it was inside. Verified
 files wait under temporary names (`.c-backup-partial.XXXXXX`) until one
@@ -373,7 +381,7 @@ are different: they live in the database and change through the policy API
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
 | `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run. `0` or `1` |
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories. 1 to 256 |
-| `jobs.read_budget_mb` | `256` | MiB of object buffers every job together may hold while reading. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, so this caps that memory whatever runs at once. 16 to 1048576; under 16 stops the daemon at start, since an object that size could never be read |
+| `jobs.read_budget_mb` | `256` | MiB of object and pack-writer buffers every job together may hold. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, and each backup pack writer holds about 26.3 MiB while its pack is open (section 18.3), so this caps that memory whatever runs at once. 48 to 1048576; under 48 stops the daemon at start, since one object and one writer must fit |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
 | `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. Files of 1 MiB or less are read and prepared, many to a batch, on up to four of them. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
@@ -585,6 +593,21 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
   format: `<path> is repository format 2; this build reads only format 3
   ...`, or `... written by a newer c-backup` for a newer one. Nothing in it
   is read or written. See section 17.4.
+- **Registering a repository whose snapshots the index does not hold
+  starts a reindex.** That is the case on a new host, after `state.db` is
+  lost (section 17.1), for a replica, or for a repository removed and added
+  back: the repository holds the snapshot records, and the database is an
+  index built from them. Until the reindex runs, `snapshots` lists nothing
+  and a `verify` passes having checked nothing, so registration counts the
+  records under `<repo>/snapshots` against the index and, when some are
+  missing, queues a `reindex` job itself. The reply says so,
+  `"snapshots_unindexed":3,"reindex_job":17`; the log reads `repo 4 holds
+  3 snapshot(s) the index does not; reindex job 17 queued`; the job and its
+  journal entry carry origin `register`. Wait for that job before trusting
+  a listing or a verify. An encrypted repository registered without its
+  key cannot be read yet: the reply carries `snapshots_unindexed` and the
+  key warning, nothing is queued, and `reindex` is for after the key is
+  loaded (registering it again with the passphrase queues it then).
 - Adding a repository that is already registered succeeds and says so
   (`"already_registered":true`, HTTP 200 rather than 201). A label given
   that differs from the stored one replaces it; leaving the label out keeps
@@ -790,16 +813,12 @@ A file inside a source that cannot be read is logged and skipped; the backup
 continues. Skipped means left out: the file is not in the snapshot's trees
 or its index, so the snapshot never lists a file it cannot restore. That
 covers a file that vanished between the scan and the read, one the daemon
-may not open, one replaced by a directory or anything else that is not a
-regular file, one whose read fails partway (an I/O error), and, with
-`backup.unsettled: skip`, one still changing on a second read (below). A
-file replaced by a symlink is left
-out too, and the link is never followed: every store path opens with
-`O_NOFOLLOW` and checks the open file is the inode the scan saw, so a
-symlink to `/etc/shadow` swapped in mid-backup cannot put the shadow file
-in a snapshot (B128); a file something else was renamed over is left out
-the same way. A backup
-with skipped files still ends `completed`, but not silently:
+may not open, one replaced by a symlink, a directory or anything else that
+is not a regular file, one whose path now runs through a symlink or (for a
+one-filesystem backup) a mount point, one whose read fails partway (an I/O
+error), and, with `backup.unsettled: skip`, one still changing on a second
+read (below). A backup with skipped files still ends `completed`, but not
+silently:
 
 - each file is a `WARN` line naming it and the reason, `backup: skipping
   /data/x, it is not in this snapshot: cannot open: Permission denied`,
@@ -816,9 +835,10 @@ under a backup, and a file can be a different size by the time it is read
 than when the scan listed it. The backup stores the file as it is when it
 is read, never as the scan saw it: its size, times and content all come
 from that read, so it is not cut short when it grew and not padded with
-zeros when it shrank. Change is detected by size, mtime and ctime (and
-inode), compared between the scan and the open, and again between the
-start and end of the read:
+zeros when it shrank. Change is detected by size, mtime, ctime and inode,
+compared between the scan and the open, and again between the start and
+end of the read. A file replaced by rename, as editors save, is a change
+like any other:
 
 - changed since the scan, steady while read: stored as read, logged at
   `info`, and counted;
@@ -882,8 +902,31 @@ Every store path applies all of this the same way: the backup thread, the
 chunk workers, the file workers that cut several large files at once, and
 the small-file workers (`src/ops/settle.c`).
 
-The next backup tries every skipped file again. Before 1.0.0's fix for
-B118 a skipped file stayed in the snapshot with no content: the backup
+**Symlinks inside a source are never followed.** The daemon runs as root;
+without this, anyone able to write inside a source could have `ln -s
+/etc/shadow` put the host's shadow file into the snapshot. Each source is
+opened once at the start of the store phase and must still be the
+directory the scan saw (its own path may run through symlinks: it is
+yours). Every file is then opened beneath it with `openat2`
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, plus `RESOLVE_NO_XDEV` for a
+one-filesystem backup, and `O_NOFOLLOW | O_NONBLOCK`; it must be a regular
+file. A file swapped for a symlink is skipped with `no longer a regular
+file (now a symlink)`; one whose directory became a symlink with `a
+directory on its path is now a symlink; not followed`; one behind a mount
+that appeared with `its path now crosses a mount point or leaves the
+source; not followed`. The link's target is never opened. On a kernel
+without `openat2` (before 5.6, or a container whose seccomp profile
+predates it) the same rules are applied one path component at a time.
+Files are opened beneath the source rather than from a descriptor held
+for each directory, because that would hold one descriptor per directory
+of the tree for the whole store phase. The scan walks the same way, each
+directory opened from its parent's descriptor and refused if it has become
+a symlink, and reads extended attributes and ACLs through a pinned
+descriptor (via `/proc/self/fd`, so `/proc` must be mounted for that
+guarantee).
+
+The next backup tries every skipped file again. Before 1.0.0 a skipped
+file stayed in the snapshot with no content: the backup
 reported success, verify passed, and every full restore failed on it.
 Verify now reports any such entry an older build left (section 11).
 
@@ -1051,12 +1094,27 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
   the restore. `--overwrite` replaces existing files instead, by renaming
   the verified file over them; a symlink at the path is replaced, not
   followed.
+- **Nothing in the destination is followed.** Every entry is created
+  through its parent directory, opened beneath the destination with no
+  symlink anywhere on the way, and its ownership, mode, times, extended
+  attributes and ACLs are applied through that or through the entry's own
+  descriptor. A symlink (or a file) standing where the snapshot has a
+  directory fails that directory and everything under it, with
+  `restore: <path> not restored: a symlink is there where the directory
+  belongs; not followed or replaced`; the link's target is never chmod'd,
+  chown'd or written into, with or without `--overwrite`. The rest of the
+  tree restores. The destination path itself may run through symlinks;
+  only what is below it is protected.
 - Hardlinks are restored as hardlinks, including across a resumed restore.
 - Sparse files come back sparse: holes of 64 KiB or more are recorded as
   holes and never written; shorter ones are stored as zeroes and come back
   as allocated zeroes.
 - Modes, times (directories included), extended attributes and ACLs are
-  restored. Ownership is restored when the daemon runs as root.
+  restored. Ownership is restored when the daemon runs as root. ACLs come
+  back exactly as recorded: an entry backed up without one has none after
+  the restore, even inside a directory whose restored default ACL the
+  kernel would otherwise have handed down to it, and its mode is the
+  backed-up mode.
 - Device nodes need root and a kernel that allows them; one that cannot be
   created is skipped and counted, not failed.
 - Sockets are skipped: they have no content.
@@ -1220,6 +1278,10 @@ fires. A `pack` schedule carried over from an earlier build is disabled at
 start with a `disabled_reason`, since there is no pack job to run; delete
 it.
 
+A schedule has one trigger: an interval in seconds, or a calendar with
+`--every`. Giving both, or `--at`, `--on`, `--on-day` or `--on-month`
+without `--every`, is refused by the CLI rather than one half being dropped.
+
 **Interval** triggers anchor to the last successful run, not to wall-clock
 multiples: a long backup does not make the next one due the moment it ends.
 
@@ -1323,12 +1385,16 @@ sudo c-backup verify list 1                # past runs
 | `structure` | entry headers | every object's pack entry header is well formed |
 | `deep` | everything | every payload matches its name (SHA-256 of type and payload) |
 
-A deep verify repairs what it finds by default: every object carries
-Reed-Solomon parity, and having already read the damaged bytes, writing the
-correction costs almost nothing more. With `--no-repair` it still tells
-recoverable damage from loss, applying parity in memory. Every object is
-at most 16 MiB and read whole, and its parity (about 1.1 MiB at most) is
-fetched only when its checksum disagrees.
+A deep verify repairs what it finds by default: every pack carries
+Reed-Solomon parity over all of its bytes, and having already read the
+damaged bytes, writing the correction costs almost nothing more. With
+`--no-repair` it still tells recoverable damage from loss, applying parity
+in memory. Every object is at most 16 MiB and read whole, and parity is
+fetched only when its checksum disagrees: the groups of 15,296 bytes the
+object overlaps, with 1,024 parity bytes each. Small objects share groups,
+and a repair writes back only the object's own bytes. Entry headers, the
+pack header and the trailer's tail are covered too, so a few damaged header
+bytes never lose an object whose data and parity are intact.
 
 `--dry-run` is exactly `--no-repair`, and wins over anything else on the
 command line. It changes one thing: repair is off, so nothing in the
@@ -1357,13 +1423,19 @@ What a run counts:
 
 | Count | Meaning |
 |---|---|
+| `checked` | Everything examined: each indexed object, and each regular-file entry that names no content. Always the sum of the five counts below |
+| `ok` | Intact. Never includes a failure, so a run with anything missing or unrecoverable shows `ok` below `checked` |
 | `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` or `--dry-run` |
 | `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
 | `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
 | `missing` | Indexed but absent, including every object in a pack file that has gone, and every index entry of a regular file that names no content at all. **Data loss** |
 
 **Loss fails the verify.** Any `unrecoverable` or `missing` object ends the
-job `failed`, with an error naming the run and the counts, and
+job `failed`, with an error naming the run and the counts (`verify run 7
+found data loss: 52 of 54 checked ok, 0 unrecoverable and 2 missing,
+affecting 2 file(s) in 1 snapshot(s)`; the log line starts `verify (deep)
+FAILED:`), and the job `result` carries the same counts with
+`"failed":true`, and
 `c-backup verify` exits 1, so a scheduler or script that checks the exit
 status sees it. The run and its findings are still recorded and still
 printed on stdout (the failed job goes to stderr); `verify show <id> <run>`
@@ -1372,7 +1444,7 @@ damage to repair: its parity went with it.
 
 Format 2 refused repair in packs large enough for their 32-bit parity
 sizes to wrap, with findings reading `repair disabled pending format fix`.
-Format 3 bounds every pack (at most 1,000,000 entries and about 1.6 GB per
+Format 3 bounds every pack (at most 1,000,000 entries and about 313 MB per
 file) so those sizes cannot wrap, and repair works on every entry.
 
 Findings name files, not hashes: each object that is not intact is reported
@@ -1385,12 +1457,12 @@ paths and snapshots across every lost object. The CLI prints the run and its
 findings as one JSON document.
 
 Every level also checks the index for regular files that name no content
-object. A backup before 1.0.0's fix for B118 recorded a file it skipped
+object. A backup by a c-backup older than 1.0.0 recorded a file it skipped
 that way: the snapshot listed the file, no restore could produce it, and
 every object check passed because no object was damaged. These are one
 finding, status `missing: file entry has no content` with an empty hash,
-naming the files and snapshots; each counts in `missing` and fails the
-run. Such a snapshot restores everything else; delete it once a newer one
+naming the files and snapshots; each counts once in `checked` and once in
+`missing`, and fails the run. Such a snapshot restores everything else; delete it once a newer one
 covers the files, or keep it and expect its restore to report them.
 
 A checking verify takes the read lock; a repairing one takes the write lock.
@@ -1457,6 +1529,46 @@ with `gc: N pack entr(ies) damaged beyond parity were copied as damaged`,
 the alert goes out and `c-backup gc` exits 1. The result adds
 `pack_entries_damaged`, `damaged` (the first 100 hashes) and
 `damaged_listed`.
+
+A pack whose entry headers cannot be walked, even with parity, is not
+rewritten: every later offset and the liveness of every entry depend on
+those headers, and gc does not guess. It is left exactly as it is, and the
+job **fails** with `gc: N pack(s) could not be walked and were left as they
+are (first: pack-NNNNNNNNNN.dat, <reason>); run verify with repair`, so the
+alert goes out like any other failure. The result adds `packs_unwalkable`
+and `unwalkable` (pack number and reason, the first 16). Every verify level
+reports such a pack as a finding (`pack-NNNNNNNNNN`, `unwalkable pack`) and
+fails until it is repaired. A verify with repair rebuilds the damaged
+headers from the index - names, types and sizes are index rows, and each
+rebuilt header is written only once the pack's own header and entry CRCs
+prove it - after which verify passes and gc compacts the pack normally.
+
+When a damaged header has no index row to rebuild it from (it belonged to
+an entry gc had already swept), the repairing verify **salvages** the pack
+instead: every entry the index still names is copied, by its indexed offset,
+into a new pack through the same path gc's rewrite uses, and the old pack is
+removed. Nothing live is dropped. What is left behind is every byte no index
+row covers - the swept, unreferenced entries - reported as
+`unreferenced_dropped_bytes`, `unreferenced_dropped_ranges` and
+`unreferenced_dropped` (pack, offset and length in the old pack, the first
+16), with a `salvaged` finding for the pack. A live entry that is itself
+damaged beyond parity is carried into the new pack as it is: the pack stops
+being unwalkable, and verify goes on reporting that object as
+`unrecoverable` with its files, exactly as for damage beyond parity
+anywhere, so what remains on the report is the real loss and nothing else.
+A pack with no usable trailer is salvaged too: without its CRCs each live
+entry is checked the way a deep verify checks it - decrypted, so AEAD
+authenticates its type and name, or decompressed and hashed against its
+name - nothing corrected, and kept clean or carried as lost accordingly.
+That costs a read of the pack's live payloads. An encrypted repository needs
+its key loaded for it; without one the pack stays reported as unwalkable, and
+the finding (`unwalkable pack: salvage needs the repository key`), the
+verify error and the gc error all say so and give the step: `repo key
+import` (or `repo add --passphrase`), then verify again.
+A pack overwritten wholesale therefore ends as what it is: every object in
+it `unrecoverable`, with its files, and no pack left that nothing can walk.
+Checking every pack's headers costs index and structure verifies a read of
+each entry header (8 bytes of CRC table each, no payloads).
 
 **Compaction rewrites a pack without its dead entries.** A pack holding any
 entry no snapshot names is copied, live entries only, into new packs that
@@ -1606,7 +1718,9 @@ restored from.
   part-way leaves the replica openable and verify-clean with the snapshots
   it finished; the next run skips those and carries on. Objects it had
   staged for an unfinished snapshot are either kept (reused by the next
-  run) or left in the replica's `tmp/`, where a later open sweeps them.
+  run) or left in the replica's `tmp/`, where the next replicate into it
+  (or registering the replica, a reindex or a gc of it) removes them; see
+  section 2.2.
 - A destination already holding a different repository is refused, unless
   `--reencrypt` says that is the point (below).
 - So is the source repository's own directory, anything inside it, and any
@@ -1634,6 +1748,24 @@ under the source key first; compression is untouched, and names are of the
 plaintext, so they, the trees and deduplication carry over unchanged. Snapshot ids carry over too, so the destination must hold no
 backups of its own: a snapshot number it already uses for a different tree
 fails the run rather than being overwritten.
+
+**Removing encryption has to be asked for.** Copying an encrypted repository
+into an unencrypted one writes every file out in plaintext, so it is refused
+unless `--to-plaintext` is also given (`"allow_plaintext": true` over the
+API):
+
+```sh
+sudo c-backup repo add /srv/backup/plain "Plain"
+sudo c-backup replicate 1 /srv/backup/plain --reencrypt --to-plaintext
+```
+
+Without it the run is refused before anything is written, naming the flag.
+With it, the daemon logs a warning and journals `replicated encrypted repo
+N into plaintext at <path>` on the source repository, so the one place its
+data leaves its encryption is on the record. Copying an unencrypted
+repository into another unencrypted one drops nothing and needs no flag.
+`--to-plaintext` without `--reencrypt` is refused, since a plain replica
+keeps the source's encryption.
 
 Unlike a plain replica, this is not for an untrusted target: the daemon
 doing it holds both keys, and so must the host the destination is used on.
@@ -1889,16 +2021,20 @@ configured: <title>: <body>` without.
 ### 17.1 The database is lost or corrupt
 
 Backups are intact; the index is not. Start the daemon with an empty
-database, register each repository again (its marker identifies it), and
-rebuild:
+database and register each repository again (its marker identifies it).
+Registration sees snapshots the index does not hold and queues the reindex
+itself (section 5.1); wait for the `reindex_job` it names:
 
 ```sh
 sudo systemctl stop c-backupd
 sudo mv /var/lib/c-backupd/state.db /var/lib/c-backupd/state.db.bad
 sudo systemctl start c-backupd
-sudo c-backup repo add /srv/backup/main "Main"
-sudo c-backup reindex 1
+sudo c-backup repo add /srv/backup/main "Main"     # {"id":1,...,"reindex_job":1}
+sudo c-backup jobs 1                               # until "state":"completed"
 ```
+
+`c-backup reindex 1` runs the same job by hand, for an encrypted repository
+whose key was loaded after it was registered, or to rebuild again.
 
 Reindex walks every snapshot's trees, at roughly 764,000 rows per second.
 It fails, rather than completing, if any snapshot or pack cannot be read: the
@@ -2067,14 +2203,14 @@ running). `docs/acceptance.md` has the full results.
   Payloads are protected by Reed-Solomon RS(255,239): every 239 bytes of
   data carry 16 bytes of parity, 16/239 = 6.69%, which corrects up to 8
   damaged bytes per codeword, and codewords are interleaved 64 deep so a
-  contiguous burst of up to 512 bytes is repairable. Parity is computed in
-  whole interleave groups of 15,296 data bytes carrying 1,024 parity bytes,
-  so the last group is paid in full: a tiny file still costs 1 KiB of
-  parity. On top of that every pack entry carries 51 bytes of header and
-  280 fixed bytes of trailer (a 260-byte parity record for its header, a
-  CRC32C, two size words and its offset). For compressible data the 6.7% applies to the compressed
-  size; for a large incompressible file it is essentially the whole
-  difference between `phys_size` and `orig_size`, which is where the
+  contiguous burst of up to 512 bytes per group of 15,296 bytes is
+  repairable. Parity covers each pack as one stream, so the rate holds
+  whatever the file sizes: a tree of 12,000 small files pays 7.1% (it paid
+  116% before pack version 7, when every entry rounded up to a whole group
+  of its own). On top of that every pack entry carries 51 bytes of header
+  and 8 bytes of CRCs. For compressible data the 6.7% applies to the
+  compressed size; for a large incompressible file it is essentially the
+  whole difference between `phys_size` and `orig_size`, which is where the
   measured +6.7% comes from. The rate is not configurable in 1.0.
 
 ### 18.2 Where state.db goes
@@ -2110,12 +2246,26 @@ on fast storage.
   8 GB. Fine on a server; on a 2-4 GB NAS, split very large trees into
   several repositories or several sources backed up separately. Section 20.
 - Every object is at most 16 MiB and is handled whole: a store holds one
-  object's payload, an LZ4 buffer of about the same size and its parity
-  (about 1.1 MiB), and nothing more per file however large the file is. A
-  large file is read through the chunker's window, chunk by chunk.
+  object's payload and an LZ4 buffer of about the same size, and nothing
+  more per file however large the file is. A large file is read through
+  the chunker's window, chunk by chunk.
+- **Each backup pack writer holds about 26.3 MiB while it has a pack
+  open**: parity for a pack at its bound, encoded as the pack is written
+  (19.1 MiB, only the part written touched), nine groups of body in flight
+  and an 8 MiB write buffer. A backup has one writer, plus one per large
+  file stored at once. The writers' share comes out of the same
+  `jobs.read_budget_mb` as object reads, taken when a writer opens and
+  given back when its pack seals, and never past the 17 MiB always left
+  for readers: a backup stores no more large files at once than the
+  budget has writers for, and a writer that cannot get its share works
+  without it, sealing by reading its pack back (slower, the same bytes).
+  At the default 256 MiB that is up to nine writers across all jobs. The
+  parity encoding itself runs on one process-wide pool of at most four
+  threads (fewer on smaller machines), whatever the number of writers.
 - Restore, grep, verify and replication likewise hold one object at a time.
 
-So peak memory is the scan's share plus a few tens of MiB of object buffers.
+So peak memory is the scan's share plus `jobs.read_budget_mb` of object and
+writer buffers.
 As a format 2 reference, a first backup of 66,218 entries and 417 GB of
 mostly large media files peaked at 723 MiB resident (VmHWM) on a 12-core
 host, most of it large-file and pack-pass buffers format 3 no longer has.
@@ -2160,7 +2310,7 @@ the underlying disk.
 | Backup logs `key not escrowed` | System key not acknowledged | Section 13 |
 | Job `cancelled` after a restart | `systemctl stop` cancels running jobs (section 2.2) | Run it again |
 | Job `failed: interrupted by daemon restart` | The daemon died mid-job: crash, `kill -9`, power loss | Run it again; nothing partial is kept |
-| `restore incomplete: N entries could not be restored` | Some entries failed | The error quotes the first, the log names each (`restore: <path> not restored: <reason>`); check permissions and space at the destination. `regular file has no content` is a snapshot written before the B118 fix; verify reports the same entries |
+| `restore incomplete: N entries could not be restored` | Some entries failed | The error quotes the first, the log names each (`restore: <path> not restored: <reason>`); check permissions and space at the destination. `regular file has no content in the snapshot (written by a c-backup older than 1.0.0, ...)` is a file an older build recorded without being able to read it; verify reports the same entries |
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
 | `<path> is repository format 2; this build reads only format 3 ...` | The repository was written by an earlier build | No migration: restore from it with the build that wrote it and back up again into a new repository (section 17.4) |
@@ -2211,39 +2361,60 @@ command, or `C_BACKUP_SOCKET`, overrides the default. Output is the daemon's
 JSON, one document per command, on stdout (a remove prints what it removed,
 `{"removed":true,...}`); errors go to stderr. `jobs watch` is the one command
 that prints several: one document per line until the job ends. The exit
-status is 0 on success and 1 otherwise. Flags may appear anywhere after the
-command. Commands that start a job wait for it unless given `--no-wait`.
-The listing and lookup commands refuse an argument they do not take, a
-stray positional or an unknown option, with `unexpected argument` and their
-usage, rather than ignore it: `grep runs 1 2` is an error, not repository
-1's runs.
+status is 0 on success and 1 otherwise. Commands that start a job wait for
+it unless given `--no-wait`.
+
+Arguments follow one set of rules for every command, checked before
+anything is sent to the daemon:
+
+- Options may appear anywhere after the command. A value option is written
+  `--name VALUE` or `--name=VALUE`.
+- `--` ends the options: everything after it is a positional, even if it
+  starts with `-`. That is how to pass a label, pattern or note that starts
+  with a dash: `repo add /srv/backup/x -- -scratch`. A value that starts
+  with a dash uses the `=` form: `backup 1 --label=-nightly`.
+- A value option needs a value. One at the end of the line, one followed by
+  another option (`--encrypt --passphrase ...`) and an empty one
+  (`--encrypt=`) are all refused, naming the option. Before 1.0 a missing
+  `--encrypt` value created an unencrypted repository labelled
+  `--encrypt` (B127).
+- An option the command does not take is refused with `unknown option`, and
+  a positional past the ones it takes with `unexpected argument`:
+  `grep runs 1 2` is an error, not repository 1's runs.
+- Only `--exclude` and `--source` repeat. Any other option given twice is
+  refused rather than one copy being picked.
+
+Each refusal prints the reason and the command's usage to stderr and exits
+1; nothing reaches the daemon. `c-backup <command> --help` (or `-h`, before
+any `--`) prints the usage without running anything, and `c-backup help`
+lists every command with all of its arguments.
 
 | Command | Purpose |
 |---|---|
 | `repo list` | Registered repositories |
-| `repo add <path> [label] [--encrypt system\|passphrase] [--passphrase TEXT]` | Create or register |
+| `repo add <path> [label] [--encrypt system\|passphrase\|none] [--passphrase TEXT]` | Create or register |
 | `repo show <id>` | One repository |
 | `repo remove <id>` | Deregister; the directory is kept |
 | `repo key export\|ack <id>`, `repo key import <id> <key-hex>` | Encryption key escrow and recovery |
-| `sources list <id>`, `sources set <id> <path>... [--exclude PAT]...` | What a repository backs up |
+| `sources list <id>`, `sources set <id> [path...] [--exclude PAT]...` | What a repository backs up; `set` with no paths clears the list |
 | `backup <id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT]` | Back up |
 | `restore <id> <snapshot> <dest> [--subpath PATH] [--overwrite]` | Restore |
 | `snapshots <id> [--limit N] [--offset N]` | List snapshots |
 | `snapshot delete <id> <snapshot> [--force]` | Delete one; a tagged one only with `--force` (section 12) |
 | `snapshot note <id> <snapshot> [text]` | Read or write a note |
-| `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
-| `search <id> <text> [--snapshot N] [--limit N]` | File names, one result per path and content |
+| `ls <id> <snapshot> [node-id] [--limit N] [--offset N]`, `snapshot tree` (the same) | One directory level; the root when no node is given |
+| `search <id> <text> [--snapshot N] [--limit N] [--offset N]` | File names, one result per path and content |
 | `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i]` | File contents |
 | `grep runs <id> [--limit N] [--offset N]`, `grep show <id> <run> [--limit N] [--offset N]` | Past content searches, and one search's hits |
-| `diff <id> <from> <to>` | Compare two snapshots |
+| `diff <id> <from> <to> [--limit N] [--offset N]` | Compare two snapshots |
 | `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id> [--limit N] [--offset N]`, `verify show <id> <run> [--limit N] [--offset N]` | Integrity |
 | `gc <id> [--dry-run]` | Garbage collection |
 | `gfs <id> [--dry-run]` | Retention |
 | `reindex <id>` | Rebuild the index |
-| `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
+| `replicate <id> <dest> [--reencrypt] [--to-plaintext]` | Copy into another directory; `--reencrypt` into another repository under its own encryption; `--to-plaintext` to allow that repository to be unencrypted (section 14.1) |
 | `stats <id> [--scope staged]`, `summary <id>`, `fanout <id>` | Repository statistics; `staged` is objects in packs a running backup has not sealed |
-| `objects <id> [--location staged\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
-| `packs <id> [pack-id]` | Packs |
+| `objects <id> [--location staged\|packed] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
+| `packs <id> [pack-id] [--limit N] [--offset N]` | Packs, or one pack's entries |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--result STATE]` | Operation history |
@@ -2253,7 +2424,7 @@ usage, rather than ignore it: `grep runs 1 2` is an error, not repository
 | `auth setup\|password` | Set or change the admin password (prompts) |
 | `auth logout --all` | Revoke every remote session (section 4.3) |
 | `health [live]`, `metrics`, `version` | The daemon |
-| `help` | This list, from the binary |
+| `help [command] [subcommand]` | This list, from the binary; with a command, its usage |
 
 Policy keys: `retention.keep_snaps`, `retention.keep_daily`,
 `retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly`.

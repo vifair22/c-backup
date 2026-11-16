@@ -17,6 +17,8 @@
 #include <cutils/json.h>
 #include <cutils/log.h>
 
+#include <dirent.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,6 +154,81 @@ static int repo_uuid_of(cutils_db_t *db, int64_t repo_id, char *out, size_t outs
     return 0;
 }
 
+/*
+ * Snapshot records in the repository that the index has no row for.
+ *
+ * The repository is the source of truth and the database a derived index,
+ * so registering a repository that already has snapshots - on a new host,
+ * after losing state.db, or adopting a replica - registers it with an
+ * empty index: `snapshots` listed nothing and `verify` passed with
+ * "checked 0" until somebody ran a reindex (NIT-16). The records are
+ * counted the way reindex finds them, one numeric name each under
+ * <repo>/snapshots.
+ */
+static long long unindexed_snapshots(cutils_db_t *db, int64_t repo_id)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT path, (SELECT COUNT(*) FROM snapshots WHERE repo_id = repos.id)"
+            "  FROM repos WHERE id = ?",
+            (const char *[]){ id, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return 0;
+    }
+    char dir[PATH_MAX];
+    int w = snprintf(dir, sizeof(dir), "%s/snapshots", r->rows[0][0]);
+    long long indexed = strtoll(r->rows[0][1], NULL, 10);
+    db_result_free(r);
+    if (w < 0 || (size_t)w >= sizeof(dir)) return 0;
+
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    long long on_disk = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        char *end = NULL;
+        long long n = strtoll(e->d_name, &end, 10);
+        if (n > 0 && end && *end == '\0') on_disk++;
+    }
+    closedir(d);
+    return on_disk > indexed ? on_disk - indexed : 0;
+}
+
+/*
+ * After a registration: queue the reindex an adopted repository needs, and
+ * say so in the reply (`snapshots_unindexed`, `reindex_job`). Without its
+ * key an encrypted repository cannot be reindexed yet; the reply counts the
+ * snapshots and the key warning beside it says what to supply.
+ */
+static void reindex_if_needed(cutils_db_t *db, int64_t repo_id, int key_missing,
+                              char *frag, size_t fragsz)
+{
+    frag[0] = '\0';
+    long long missing = unindexed_snapshots(db, repo_id);
+    if (missing <= 0) return;
+    if (key_missing) {
+        snprintf(frag, fragsz, ",\"snapshots_unindexed\":%lld", missing);
+        log_warn("repo %lld holds %lld snapshot(s) the index does not; reindex "
+                 "it once its key is loaded", (long long)repo_id, missing);
+        return;
+    }
+    int64_t job_id = 0;
+    if (routes_submit_reindex(repo_id, "register", &job_id) != OK) {
+        log_warn("repo %lld holds %lld snapshot(s) the index does not, and a "
+                 "reindex could not be queued: %s; run c-backup reindex %lld",
+                 (long long)repo_id, missing, err_msg(), (long long)repo_id);
+        err_clear();
+        snprintf(frag, fragsz, ",\"snapshots_unindexed\":%lld", missing);
+        return;
+    }
+    log_info("repo %lld holds %lld snapshot(s) the index does not; reindex job "
+             "%lld queued", (long long)repo_id, missing, (long long)job_id);
+    snprintf(frag, fragsz, ",\"snapshots_unindexed\":%lld,\"reindex_job\":%lld",
+             missing, (long long)job_id);
+}
+
 static api_response_t create_repo(const api_request_t *req, void *userdata)
 {
     cutils_db_t *db = userdata;
@@ -194,6 +271,7 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
     repo_enc_request_t enc;
     memset(&enc, 0, sizeof(enc));
     enc.key_dir = repo_key_dir();
+    enc.mode_given = encstr != NULL;
     if (repo_enc_resolve(encstr, passphrase, &enc.mode) != OK) {
         api_response_t bad = api_error(400, err_msg());
         free(path); free(label); free(encstr); free(passphrase);
@@ -226,6 +304,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         err_clear();
     }
     const char *unlocked = reg.key_unlocked ? ",\"key_unlocked\":true" : "";
+    char reidx[128] = "";
+    if (st == OK && !reg.created) reindex_if_needed(db, id, reg.key_missing,
+                                                    reidx, sizeof(reidx));
 
     api_response_t out;
     if (st != OK) {
@@ -244,9 +325,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         char *body = NULL;
         int n = asprintf(&body,
             "{\"id\":%lld,\"already_registered\":true,\"label_updated\":%s,"
-            "\"encryption\":\"%s\"%s%s}",
+            "\"encryption\":\"%s\"%s%s%s}",
             (long long)id, reg.label_updated ? "true" : "false",
-            repo_enc_mode_name(reg.enc_mode), unlocked, keywarn);
+            repo_enc_mode_name(reg.enc_mode), unlocked, keywarn, reidx);
         out = n < 0 ? api_error(500, "out of memory") : api_ok(body);
         log_info("repo %lld at %s was already registered%s", (long long)id, path,
                  reg.label_updated ? "; label updated" : "");
@@ -279,12 +360,12 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
                 (long long)id, enc.key_hex, (long long)id);
         } else if (reg.enc_mode != REPO_ENC_NONE) {
             n = asprintf(&body,
-                "{\"id\":%lld,\"encryption\":\"%s\",\"key_escrowed\":%s%s%s}",
+                "{\"id\":%lld,\"encryption\":\"%s\",\"key_escrowed\":%s%s%s%s}",
                 (long long)id, repo_enc_mode_name(reg.enc_mode),
                 reg.enc_mode == REPO_ENC_PASSPHRASE ? "true" : "false",
-                unlocked, keywarn);
+                unlocked, keywarn, reidx);
         } else {
-            n = asprintf(&body, "{\"id\":%lld}", (long long)id);
+            n = asprintf(&body, "{\"id\":%lld%s}", (long long)id, reidx);
         }
         if (n < 0)
             out = api_error(500, "out of memory");

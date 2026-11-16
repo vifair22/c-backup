@@ -101,6 +101,32 @@ static void test_malformed_key_is_rejected(void **state)
     assert_int_not_equal(repo_key_from_hex("zz" "00000000000000000000000000000000"
                                            "000000000000000000000000000000", &k), OK);
     err_clear();
+    assert_int_not_equal(repo_key_from_hex("", &k), OK);
+    err_clear();
+
+    /* A valid key with more after it was cut to its first 64 characters
+     * and accepted, and sscanf's %x read a sign or "0x" as part of a byte. */
+    repo_key_t a;
+    assert_int_equal(repo_key_generate(&a), OK);
+    char hex[REPO_KEY_BYTES * 2 + 1];
+    repo_key_to_hex(&a, hex);
+    char longer[REPO_KEY_BYTES * 2 + 8];
+    snprintf(longer, sizeof(longer), "%s00", hex);
+    assert_int_not_equal(repo_key_from_hex(longer, &k), OK);
+    err_clear();
+    snprintf(longer, sizeof(longer), "%s z", hex);
+    assert_int_not_equal(repo_key_from_hex(longer, &k), OK);
+    err_clear();
+    char signed_hex[REPO_KEY_BYTES * 2 + 1];
+    memcpy(signed_hex, hex, sizeof(signed_hex));
+    signed_hex[0] = '+';
+    assert_int_not_equal(repo_key_from_hex(signed_hex, &k), OK);
+    err_clear();
+    memcpy(signed_hex, hex, sizeof(signed_hex));
+    signed_hex[0] = '0';
+    signed_hex[1] = 'x';
+    assert_int_not_equal(repo_key_from_hex(signed_hex, &k), OK);
+    err_clear();
 }
 
 static void test_keyfile_round_trip(void **state)
