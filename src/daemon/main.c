@@ -29,6 +29,7 @@
 
 #include "app_config.h"
 #include "auth.h"
+#include "db_txn.h"
 #include "file_cache.h"
 #include "settle.h"
 #include "index_reconcile.h"
@@ -115,13 +116,16 @@ static status_t startup_reindex(int64_t repo_id, void *ctx, int64_t *out_job_id)
 }
 
 /* Every API request that changed something - a tag, a note, a policy, a
- * registered repository - is durable before its answer is sent: one WAL
- * sync, where synchronous=NORMAL would otherwise leave it for the next
- * once-a-second flush (B139, B140). */
+ * registered repository - is durable before its answer is sent (B139,
+ * B140), by the same means gc and prune use before removing what a commit
+ * describes (db_txn_make_durable, B142), where synchronous=NORMAL would
+ * otherwise leave it for the next once-a-second flush. */
 static void after_write(void *userdata)
 {
-    (void)userdata;
-    state_db_sync_now();
+    if (db_txn_make_durable(userdata) != OK) {
+        log_warn("state.db: an API edit may not survive a power cut yet: %s", err_msg());
+        err_clear();
+    }
 }
 
 /*
@@ -268,7 +272,6 @@ int main(int argc, char *argv[])
         goto out_guard;
     }
     int sync_normal = strcmp(tuning.synchronous, "normal") == 0;
-    state_db_set_path(db_path);
     log_info("state database: synchronous=%s, cache %d MiB, checkpoint every %d pages",
              tuning.synchronous, tuning.cache_mb, tuning.wal_autocheckpoint);
 
@@ -439,7 +442,7 @@ int main(int argc, char *argv[])
     /* The unix socket bypasses this entirely; see auth_check. Filesystem
      * permissions on the socket are the access control there. */
     api_server_set_auth(srv, auth_check, db);
-    api_server_set_after_write(srv, after_write, NULL);
+    api_server_set_after_write(srv, after_write, db);
 
     if (api_server_start(srv) != 0) {
         log_error("cannot start API server: %s", api_server_error());

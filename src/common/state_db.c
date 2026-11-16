@@ -89,44 +89,6 @@ status_t state_db_tune(cutils_db_t *db, const state_db_tuning_t *t)
 }
 
 /* ------------------------------------------------------------------ */
-/* Sync now                                                            */
-/* ------------------------------------------------------------------ */
-
-static pthread_mutex_t g_now_mu = PTHREAD_MUTEX_INITIALIZER;
-static char            g_now_wal[PATH_MAX];
-static atomic_ulong    g_now_syncs;
-
-void state_db_set_path(const char *db_path)
-{
-    pthread_mutex_lock(&g_now_mu);
-    if (!db_path || !*db_path ||
-        snprintf(g_now_wal, sizeof(g_now_wal), "%s-wal", db_path) >= (int)sizeof(g_now_wal))
-        g_now_wal[0] = '\0';
-    pthread_mutex_unlock(&g_now_mu);
-}
-
-void state_db_sync_now(void)
-{
-    char wal[PATH_MAX];
-    pthread_mutex_lock(&g_now_mu);
-    snprintf(wal, sizeof(wal), "%s", g_now_wal);
-    pthread_mutex_unlock(&g_now_mu);
-    if (!wal[0]) return;
-    /* No WAL yet means nothing has been written since the last checkpoint
-     * truncated it, so there is nothing to make durable. */
-    int fd = open(wal, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    if (fdatasync(fd) == 0) atomic_fetch_add(&g_now_syncs, 1);
-    else log_warn("state.db: cannot sync %s: %s", wal, strerror(errno));
-    close(fd);
-}
-
-unsigned long state_db_sync_now_count(void)
-{
-    return atomic_load(&g_now_syncs);
-}
-
-/* ------------------------------------------------------------------ */
 /* The WAL flusher                                                     */
 /* ------------------------------------------------------------------ */
 

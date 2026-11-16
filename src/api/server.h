@@ -188,7 +188,7 @@ void api_server_set_auth(api_server_t *srv, api_auth_fn fn, void *userdata);
 
 /* Called after a buffered handler for a request that is not a GET or HEAD
  * answers 2xx, before the response is sent. c-backupd makes the database
- * durable there (state_db_sync_now), so an edit the client was told
+ * durable there (db_txn_make_durable), so an edit the client was told
  * succeeded - a tag, a note, a registered repository - survives a power
  * cut that follows (B139, B140). Not called for streaming routes. */
 typedef void (*api_after_write_fn)(void *userdata);
