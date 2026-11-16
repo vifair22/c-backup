@@ -24,6 +24,13 @@
  * cut and hands the slot with the chunk to a worker, which releases it
  * (read_budget_handoff, read_budget_release_foreign).
  *
+ * Pack writers draw on the same budget for their parity encoder and stdio
+ * buffer (read_budget_try_take): taken once when a writer opens and given
+ * back at its seal, never waited for, and never past what would leave
+ * READ_BUDGET_READER_RESERVE for readers, so a reader can always proceed
+ * and no writer can deadlock against one. A writer that does not get its
+ * share runs without the encoder (its seal reads its body back).
+ *
  * Before read_budget_init runs (tests, tools) the budget is unlimited.
  */
 
@@ -31,11 +38,16 @@
 
 #include <stdint.h>
 
-/* Default, and the floor app_config_check holds the setting to: smaller than
- * one object of the largest size the format allows, and an object that size
- * could never be read at all. */
+/* What writers always leave for readers: one object of the largest size,
+ * with room for its AEAD bytes. */
+#define READ_BUDGET_READER_RESERVE ((uint64_t)17 * 1024 * 1024)
+
+/* Default, and the floor app_config_check holds the setting to: one object
+ * of the largest size the format allows, which could otherwise never be
+ * read, plus one pack writer's buffers (pack.h asserts they fit), so a
+ * backup on an otherwise idle daemon always gets its writer's encoder. */
 #define READ_BUDGET_DEFAULT ((uint64_t)256 * 1024 * 1024)
-#define READ_BUDGET_MIN     ((uint64_t)16 * 1024 * 1024)
+#define READ_BUDGET_MIN     ((uint64_t)48 * 1024 * 1024)
 
 /* Set the budget, in bytes. 0 means unlimited. ERR_INVALID under the floor.
  * Called once at startup, before any reader runs. */
@@ -52,6 +64,12 @@ void     read_budget_release(uint64_t taken);
  * the work; whoever finishes it calls read_budget_release_foreign. */
 void     read_budget_handoff(uint64_t taken);
 void     read_budget_release_foreign(uint64_t taken);
+
+/* Take n bytes for something no thread holds - a pack writer's buffers -
+ * only if that leaves `reserve` bytes free; never waits, and is not counted
+ * as this thread's (no nesting with its reads). Returns n, or 0 when it did
+ * not fit. Give it back with read_budget_release_foreign. */
+uint64_t read_budget_try_take(uint64_t n, uint64_t reserve);
 
 /* Observation, for metrics and tests. */
 uint64_t read_budget_in_use(void);

@@ -33,6 +33,7 @@
 #include "fake_index.h"
 #include "object.h"
 #include "pack.h"
+#include "read_budget.h"
 #include "parity.h"
 #include "store.h"
 #include "types.h"
@@ -801,6 +802,74 @@ static void test_a_pack_smaller_than_a_group_encodes_at_the_seal(void **state)
     for (size_t i = 0; i < 3; i++) assert_loads_clean(i);
 }
 
+/* ------------------------------------------------------------------ */
+/* Writers and the buffer budget                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Pack writers held open at once take their encoders from the daemon's
+ * buffer budget and never past what leaves one object's room for readers:
+ * with room for two, the third and later writers open without an encoder
+ * and seal by reading back, nothing waits, the budget is never exceeded,
+ * and every byte is given back at the seals. Every object reads back clean
+ * either way, and the encoder threads are the shared pool's, not one set
+ * per writer.
+ */
+static void test_writers_stay_within_the_buffer_budget(void **state)
+{
+    (void)state;
+    const int nw = 6;
+    uint64_t wb = pack_writer_budget_bytes();
+    uint64_t total = READ_BUDGET_READER_RESERVE + 2 * wb + wb / 2;
+    assert_int_equal(read_budget_init(total), OK);
+    read_budget_reset_stats();
+    uint64_t unb0 = pack_test_writers_unbudgeted();
+    uint64_t rb0  = pack_test_seal_readbacks();
+
+    pack_backup_writer_t *w[6];
+    uint8_t h[6][OBJECT_HASH_SIZE];
+    uint8_t *data[6];
+    for (int i = 0; i < nw; i++) {
+        assert_int_equal(pack_backup_open(store, &w[i]), OK);
+        /* Several groups each, so encoding is real work for the pool. */
+        data[i] = malloc(200000);
+        assert_non_null(data[i]);
+        fill_random(data[i], 200000, (uint32_t)(0xC0FFEE + i));
+        int is_new = 0;
+        uint64_t phys = 0, plen = 0;
+        assert_int_equal(pack_backup_add(w[i], OBJECT_TYPE_FILE, data[i], 200000, h[i],
+                                         &is_new, &phys, &plen), OK);
+        assert_true(read_budget_in_use() <= total);
+    }
+    assert_int_equal(read_budget_in_use(), 2 * wb);
+    assert_int_equal(pack_test_writers_unbudgeted() - unb0, (uint64_t)(nw - 2));
+    assert_true(pack_test_encoder_threads() <= 4);
+
+    for (int i = 0; i < nw; i++) {
+        uint32_t packed = 0;
+        assert_int_equal(pack_backup_finish(w[i], &packed), OK);
+        assert_int_equal(packed, 1);
+    }
+    assert_int_equal(read_budget_in_use(), 0);
+    assert_true(read_budget_peak() <= total - READ_BUDGET_READER_RESERVE);
+    /* The writers without an encoder sealed by reading back; the others
+     * did not. */
+    assert_int_equal(pack_test_seal_readbacks() - rb0, (uint64_t)(nw - 2));
+    assert_int_equal(read_budget_init(0), OK);
+
+    for (int i = 0; i < nw; i++) {
+        void *out = NULL;
+        size_t len = 0;
+        parity_stats_reset();
+        assert_int_equal(object_load(store, h[i], &out, &len, NULL), OK);
+        assert_int_equal(len, 200000);
+        assert_memory_equal(out, data[i], len);
+        assert_int_equal((int)parity_stats_get().repaired, 0);
+        free(out);
+        free(data[i]);
+    }
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -817,6 +886,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_replicated_copy_is_corrected, setup, teardown),
         cmocka_unit_test_setup_teardown(test_parity_encoded_while_appending_matches_the_body, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_pack_smaller_than_a_group_encodes_at_the_seal, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_writers_stay_within_the_buffer_budget, setup, teardown),
     };
     return cmocka_run_group_tests_name("pack_stripe", tests, NULL, NULL);
 }

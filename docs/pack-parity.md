@@ -78,9 +78,25 @@ threads, at most eight groups in flight, and the chunk workers compute each
 entry's payload CRC with its encryption, extended by the header's CRC on
 the writer (`crc32c_combine`). Its seal encodes the last partial group and
 group 0 (the pack header's count is patched then) and writes parity, the
-CRC table and the tails without reading the body back. The parity is held
-in memory until the seal: 6.7% of the body, about 18 MiB at the pack bound,
-as per-entry parity was before.
+CRC table and the tails without reading the body back.
+
+What a writer holds is fixed and budgeted. Its encoder allocates parity for
+a pack at its bound (19,094,528 bytes, only the groups written touched) and
+nine groups of body (eight slots and a copy of group 0, 137,664 bytes); with
+its 8 MiB stdio buffer that is `pack_writer_budget_bytes()`, about 26.3 MiB.
+It is taken from the daemon's buffer budget (`jobs.read_budget_mb`, shared
+with object reads) when the writer opens and given back at its seal, never
+waited for and never past the 17 MiB reserved for readers, so a writer can
+neither stall nor starve a reader. A writer the budget cannot cover opens
+without an encoder and a small stdio buffer and seals by reading back. A
+backup plans its large-file workers to the writers the budget covers, one
+for its own pack first; the floor of the budget, 48 MiB, fits one object
+and one writer. The encoding runs on one process-wide pool of min(4, CPUs)
+threads, which every writer queues its full groups to, so the thread count
+does not grow with writers. At the default budget of 256 MiB the whole
+daemon has at most nine encoding writers: about 237 MiB of writer buffers
+and four encoder threads, against about 311 MiB and 68 threads for one
+backup with sixteen file workers before the budget applied.
 
 The other writers (replication's stored writer, gc's rewrite and
 coalescing) are off a backup's path and keep the simpler seal described

@@ -356,7 +356,7 @@ are different: they live in the database and change through the policy API
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
 | `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run. `0` or `1` |
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories. 1 to 256 |
-| `jobs.read_budget_mb` | `256` | MiB of object buffers every job together may hold while reading. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, so this caps that memory whatever runs at once. 16 to 1048576; under 16 stops the daemon at start, since an object that size could never be read |
+| `jobs.read_budget_mb` | `256` | MiB of object and pack-writer buffers every job together may hold. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, and each backup pack writer holds about 26.3 MiB while its pack is open (section 18.3), so this caps that memory whatever runs at once. 48 to 1048576; under 48 stops the daemon at start, since one object and one writer must fit |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
@@ -1907,12 +1907,25 @@ on fast storage.
   several repositories or several sources backed up separately. Section 20.
 - Every object is at most 16 MiB and is handled whole: a store holds one
   object's payload and an LZ4 buffer of about the same size, and nothing
-  more per file however large the file is; parity is computed when a pack
-  seals, a window of about 1 MiB at a time. A
-  large file is read through the chunker's window, chunk by chunk.
+  more per file however large the file is. A large file is read through
+  the chunker's window, chunk by chunk.
+- **Each backup pack writer holds about 26.3 MiB while it has a pack
+  open**: parity for a pack at its bound, encoded as the pack is written
+  (19.1 MiB, only the part written touched), nine groups of body in flight
+  and an 8 MiB write buffer. A backup has one writer, plus one per large
+  file stored at once. The writers' share comes out of the same
+  `jobs.read_budget_mb` as object reads, taken when a writer opens and
+  given back when its pack seals, and never past the 17 MiB always left
+  for readers: a backup stores no more large files at once than the
+  budget has writers for, and a writer that cannot get its share works
+  without it, sealing by reading its pack back (slower, the same bytes).
+  At the default 256 MiB that is up to nine writers across all jobs. The
+  parity encoding itself runs on one process-wide pool of at most four
+  threads (fewer on smaller machines), whatever the number of writers.
 - Restore, grep, verify and replication likewise hold one object at a time.
 
-So peak memory is the scan's share plus a few tens of MiB of object buffers.
+So peak memory is the scan's share plus `jobs.read_budget_mb` of object and
+writer buffers.
 As a format 2 reference, a first backup of 66,218 entries and 417 GB of
 mostly large media files peaked at 723 MiB resident (VmHWM) on a 12-core
 host, most of it large-file and pack-pass buffers format 3 no longer has.

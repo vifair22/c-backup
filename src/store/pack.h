@@ -351,6 +351,23 @@ void pack_test_set_parity_window(size_t groups);
 uint64_t pack_test_seal_readbacks(void);
 
 /*
+ * What one plaintext pack writer (a backup's, the store's own) takes from
+ * the daemon's buffer budget while it has a pack open: its stripe encoder
+ * (parity for a pack at its bound plus nine groups of body) and its 8 MiB
+ * stdio buffer, about 26.3 MiB. A writer that cannot take it seals by
+ * reading its body back. A backup sizes its file workers by it.
+ */
+uint64_t pack_writer_budget_bytes(void);
+
+/* Test hook: writers opened without an encoder because the budget could
+ * not cover one. */
+uint64_t pack_test_writers_unbudgeted(void);
+
+/* Test hook: threads in the process-wide stripe encoder pool, at most
+ * min(4, CPUs) whatever the number of writers. */
+uint64_t pack_test_encoder_threads(void);
+
+/*
  * The seal in force: PACK_MAX_MULTI_BYTES unless a test moved it.
  */
 uint64_t pack_seal_bytes(void);

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include "pack.h"
+#include "read_budget.h"
 #include "parity.h"
 #include "object.h"
 #include "object_crypt.h"
@@ -1420,9 +1421,20 @@ status_t pack_object_load(store_t *store,
 /* Pack file open / finalize helpers                                   */
 /* ------------------------------------------------------------------ */
 
+/* A staging pack with a stdio buffer of bufsz bytes (0: libc's default). */
+static status_t open_new_pack_buf(store_t *store, FILE **dat_f, char *dat_tmp,
+                                  pack_dat_hdr_t *dat_hdr, size_t bufsz);
+
 static status_t open_new_pack(store_t *store, uint32_t pack_num,
                               FILE **dat_f, char *dat_tmp,
                               pack_dat_hdr_t *dat_hdr)
+{
+    (void)pack_num;  /* used by caller for naming, not needed here */
+    return open_new_pack_buf(store, dat_f, dat_tmp, dat_hdr, (size_t)8 * 1024 * 1024);
+}
+
+static status_t open_new_pack_buf(store_t *store, FILE **dat_f, char *dat_tmp,
+                                  pack_dat_hdr_t *dat_hdr, size_t bufsz)
 {
     if (path_fmt(dat_tmp, PATH_MAX, "%s/tmp/pack-dat.XXXXXX", store_root(store)) != 0)
         return set_error(ERR_IO, "open_new_pack: tmp path too long");
@@ -1436,7 +1448,7 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
         return set_error_errno(ERR_IO, "open_new_pack: fdopen failed");
     }
 
-    (void)setvbuf(*dat_f, NULL, _IOFBF, 8u * 1024u * 1024u);
+    if (bufsz) (void)setvbuf(*dat_f, NULL, _IOFBF, bufsz);
 
     *dat_hdr = (pack_dat_hdr_t){ PACK_DAT_MAGIC, PACK_VERSION, 0 };
     if (fwrite(dat_hdr, sizeof(*dat_hdr), 1, *dat_f) != 1) {
@@ -1446,7 +1458,6 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
         return set_error_errno(ERR_IO, "open_new_pack: fwrite dat header failed");
     }
 
-    (void)pack_num;  /* used by caller for naming, not needed here */
     return OK;
 }
 
@@ -1458,34 +1469,44 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
 /*
  * The plaintext writer's pack body is append-only, so its stripe groups
  * complete in order while entries are still being written. Each group is
- * handed, as it fills, to a small pool that encodes its 1,024 parity bytes
- * off the writer's thread; at the seal only the last, partial group and
- * group 0 (whose pack header gets its count patched) are left to encode,
- * and nothing is read back. Memory is ENC_SLOTS groups of body in flight,
- * a copy of group 0, and the parity itself: 6.7% of the body, at most
- * 1.2 MiB per 18 MiB of pack and about 18 MiB at the pack bound, which is
- * what per-entry parity also held in memory before the seal.
+ * handed, as it fills, to the daemon-wide encoder pool, which encodes its
+ * 1,024 parity bytes off the writer's thread; at the seal only the last,
+ * partial group and group 0 (whose pack header gets its count patched) are
+ * left to encode, and nothing is read back.
  *
- * The writer fills one slot at a time; a full slot is marked ready and
- * the writer takes the next free one, waiting only if every slot is still
- * queued or encoding - backpressure, so memory stays bounded however fast
- * the writer appends. Encoder threads start with the first full group, so
- * a pack smaller than one group never starts any.
+ * Memory per writer is fixed and charged to the daemon's buffer budget when
+ * the writer opens (PACK_WRITER_BUDGET_BYTES, read_budget.h): parity for a
+ * pack at its bound (19,094,528 bytes; only the groups written are touched),
+ * ENC_SLOTS groups of body in flight plus a copy of group 0, and the 8 MiB
+ * stdio buffer. A writer the budget cannot cover runs without an encoder
+ * and a small stdio buffer, and its seal reads the body back: slower, the
+ * same bytes.
+ *
+ * The writer fills one slot at a time; a full slot is queued and the writer
+ * takes the next free one, waiting only if all of its slots are queued or
+ * encoding - backpressure, so its memory stays bounded however fast it
+ * appends. The pool's threads, min(4, CPUs), serve every writer in the
+ * process and start with the first full group anywhere.
  */
 #define ENC_SLOTS       8
 #define ENC_THREADS_MAX 4
 
 enum { SLOT_FREE = 0, SLOT_FILLING, SLOT_READY, SLOT_ENCODING };
 
+struct stripe_enc;
+
+typedef struct enc_slot {
+    uint8_t           *data;
+    uint64_t           g;
+    int                state;          /* under the owner's mu */
+    struct stripe_enc *owner;
+    struct enc_slot   *next;           /* in the pool's queue */
+} enc_slot_t;
+
 typedef struct stripe_enc {
     pthread_mutex_t mu;
-    pthread_cond_t  cv_ready;          /* a slot became ready, or stop */
-    pthread_cond_t  cv_free;           /* a slot became free */
-    struct {
-        uint8_t *data;
-        uint64_t g;
-        int      state;
-    } slot[ENC_SLOTS];
+    pthread_cond_t  cv_free;           /* a slot of this writer became free */
+    enc_slot_t      slot[ENC_SLOTS];
     int       cur;                     /* the slot being filled, or -1 */
     size_t    cur_len;
     uint64_t  next_g;                  /* the group the current slot is */
@@ -1494,34 +1515,88 @@ typedef struct stripe_enc {
     size_t    par_groups;
     uint8_t  *g0;                      /* group 0 as fed, for the count patch */
     size_t    g0_len;
-    pthread_t th[ENC_THREADS_MAX];
-    int       nth;
-    int       stop;
-    int       broken;                  /* a slot or buffer could not be had */
+    int       broken;
 } stripe_enc_t;
+
+/* What one writer's encoder holds, all of it allocated when it opens. */
+#define STRIPE_ENC_BYTES \
+    (PACK_PARITY_GROUPS(PACK_MAX_BYTES) * PARITY_GROUP_PAR + \
+     (uint64_t)(ENC_SLOTS + 1) * PARITY_GROUP_DATA)
+#define PACK_WRITER_STDIO_BYTES ((size_t)8 * 1024 * 1024)
+#define PACK_WRITER_BUDGET_BYTES (STRIPE_ENC_BYTES + PACK_WRITER_STDIO_BYTES)
+/* The budget's floor has room for one object read and one writer beyond the
+ * reserve writers leave for readers. */
+_Static_assert(READ_BUDGET_MIN >= READ_BUDGET_READER_RESERVE + PACK_WRITER_BUDGET_BYTES,
+               "the buffer budget's floor must fit one pack writer beside one object");
+
+uint64_t pack_writer_budget_bytes(void) { return PACK_WRITER_BUDGET_BYTES; }
+
+static _Atomic uint64_t writers_unbudgeted;
+uint64_t pack_test_writers_unbudgeted(void)
+{
+    return atomic_load_explicit(&writers_unbudgeted, memory_order_relaxed);
+}
+
+/* The daemon-wide pool: one queue of full groups from every writer. */
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    enc_slot_t     *head, *tail;
+    int             nth;               /* threads running; -1 none could start */
+} g_enc = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL, 0 };
+
+uint64_t pack_test_encoder_threads(void)
+{
+    pthread_mutex_lock(&g_enc.mu);
+    int n = g_enc.nth;
+    pthread_mutex_unlock(&g_enc.mu);
+    return n > 0 ? (uint64_t)n : 0;
+}
 
 static void *enc_thread(void *arg)
 {
-    stripe_enc_t *e = arg;
-    pthread_mutex_lock(&e->mu);
+    (void)arg;
     for (;;) {
-        int k = -1;
-        for (int i = 0; i < ENC_SLOTS; i++)
-            if (e->slot[i].state == SLOT_READY) { k = i; break; }
-        if (k < 0) {
-            if (e->stop) break;
-            pthread_cond_wait(&e->cv_ready, &e->mu);
-            continue;
-        }
-        e->slot[k].state = SLOT_ENCODING;
-        pthread_mutex_unlock(&e->mu);
-        rs_parity_encode(e->slot[k].data, GROUP_DATA, e->par + e->slot[k].g * GROUP_PAR);
+        pthread_mutex_lock(&g_enc.mu);
+        while (!g_enc.head) pthread_cond_wait(&g_enc.cv, &g_enc.mu);
+        enc_slot_t *s = g_enc.head;
+        g_enc.head = s->next;
+        if (!g_enc.head) g_enc.tail = NULL;
+        pthread_mutex_unlock(&g_enc.mu);
+
+        stripe_enc_t *e = s->owner;
         pthread_mutex_lock(&e->mu);
-        e->slot[k].state = SLOT_FREE;
+        s->state = SLOT_ENCODING;
+        pthread_mutex_unlock(&e->mu);
+        rs_parity_encode(s->data, GROUP_DATA, e->par + s->g * GROUP_PAR);
+        /* After this unlock the owner may be freed: nothing of it is
+         * touched again. */
+        pthread_mutex_lock(&e->mu);
+        s->state = SLOT_FREE;
         pthread_cond_broadcast(&e->cv_free);
+        pthread_mutex_unlock(&e->mu);
     }
-    pthread_mutex_unlock(&e->mu);
     return NULL;
+}
+
+/* Start the pool on first use. Returns its thread count; 0 or less means
+ * encode on the caller's thread. */
+static int enc_pool_start_locked(void)
+{
+    if (g_enc.nth != 0) return g_enc.nth;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int want = ncpu < 1 ? 1 : ncpu > ENC_THREADS_MAX ? ENC_THREADS_MAX : (int)ncpu;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    for (int i = 0; i < want; i++) {
+        pthread_t th;
+        if (pthread_create(&th, &at, enc_thread, NULL) != 0) break;
+        g_enc.nth++;
+    }
+    pthread_attr_destroy(&at);
+    if (g_enc.nth == 0) g_enc.nth = -1;
+    return g_enc.nth;
 }
 
 static stripe_enc_t *stripe_enc_new(void)
@@ -1533,11 +1608,13 @@ static stripe_enc_t *stripe_enc_new(void)
     /* Address space for the bound; only the groups written are touched. */
     e->par = malloc(e->par_groups * GROUP_PAR);
     e->g0  = malloc(GROUP_DATA);
-    for (int i = 0; i < ENC_SLOTS && e->par && e->g0; i++) {
-        e->slot[i].data = malloc(GROUP_DATA);
-        if (!e->slot[i].data) { e->broken = 1; break; }
+    int ok = e->par && e->g0;
+    for (int i = 0; i < ENC_SLOTS && ok; i++) {
+        e->slot[i].data  = malloc(GROUP_DATA);
+        e->slot[i].owner = e;
+        if (!e->slot[i].data) ok = 0;
     }
-    if (!e->par || !e->g0 || e->broken) {
+    if (!ok) {
         for (int i = 0; i < ENC_SLOTS; i++) free(e->slot[i].data);
         free(e->par);
         free(e->g0);
@@ -1545,28 +1622,30 @@ static stripe_enc_t *stripe_enc_new(void)
         return NULL;
     }
     pthread_mutex_init(&e->mu, NULL);
-    pthread_cond_init(&e->cv_ready, NULL);
     pthread_cond_init(&e->cv_free, NULL);
     e->cur = -1;
     return e;
 }
 
-static void enc_stop_threads(stripe_enc_t *e)
+/* Wait until none of this writer's groups is queued or being encoded. */
+static void enc_drain(stripe_enc_t *e)
 {
     pthread_mutex_lock(&e->mu);
-    e->stop = 1;
-    pthread_cond_broadcast(&e->cv_ready);
+    for (;;) {
+        int busy = 0;
+        for (int i = 0; i < ENC_SLOTS; i++)
+            if (e->slot[i].state == SLOT_READY || e->slot[i].state == SLOT_ENCODING) busy = 1;
+        if (!busy) break;
+        pthread_cond_wait(&e->cv_free, &e->mu);
+    }
     pthread_mutex_unlock(&e->mu);
-    for (int i = 0; i < e->nth; i++) pthread_join(e->th[i], NULL);
-    e->nth = 0;
 }
 
 static void stripe_enc_free(stripe_enc_t *e)
 {
     if (!e) return;
-    enc_stop_threads(e);
+    enc_drain(e);   /* the pool may still hold a group of ours */
     pthread_mutex_destroy(&e->mu);
-    pthread_cond_destroy(&e->cv_ready);
     pthread_cond_destroy(&e->cv_free);
     for (int i = 0; i < ENC_SLOTS; i++) free(e->slot[i].data);
     free(e->par);
@@ -1574,37 +1653,40 @@ static void stripe_enc_free(stripe_enc_t *e)
     free(e);
 }
 
-/* Hand the full current slot to the pool, or encode it here when there is
- * no pool to hand it to. */
+/* Queue the full current slot, or encode it here when there is no pool. */
 static void enc_submit(stripe_enc_t *e)
 {
     int k = e->cur;
     e->cur = -1;
     e->cur_len = 0;
     uint64_t g = e->next_g++;
-    if (g >= e->par_groups) { e->broken = 1; return; }
-    pthread_mutex_lock(&e->mu);
-    if (e->nth == 0 && !e->stop) {
-        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-        int want = ncpu >= 8 ? ENC_THREADS_MAX : ncpu >= 4 ? 2 : 1;
-        for (int i = 0; i < want; i++) {
-            if (pthread_create(&e->th[e->nth], NULL, enc_thread, e) != 0) break;
-            e->nth++;
-        }
-        if (e->nth == 0) e->stop = 1;   /* no threads: encode on this one */
-    }
-    if (e->nth == 0) {
-        pthread_mutex_unlock(&e->mu);
-        rs_parity_encode(e->slot[k].data, GROUP_DATA, e->par + g * GROUP_PAR);
+    enc_slot_t *s = &e->slot[k];
+    if (g >= e->par_groups) {
+        e->broken = 1;
         pthread_mutex_lock(&e->mu);
-        e->slot[k].state = SLOT_FREE;
+        s->state = SLOT_FREE;
         pthread_mutex_unlock(&e->mu);
         return;
     }
-    e->slot[k].g = g;
-    e->slot[k].state = SLOT_READY;
-    pthread_cond_signal(&e->cv_ready);
+    s->g = g;
+    pthread_mutex_lock(&g_enc.mu);
+    if (enc_pool_start_locked() <= 0) {
+        pthread_mutex_unlock(&g_enc.mu);
+        rs_parity_encode(s->data, GROUP_DATA, e->par + g * GROUP_PAR);
+        pthread_mutex_lock(&e->mu);
+        s->state = SLOT_FREE;
+        pthread_mutex_unlock(&e->mu);
+        return;
+    }
+    pthread_mutex_lock(&e->mu);
+    s->state = SLOT_READY;
     pthread_mutex_unlock(&e->mu);
+    s->next = NULL;
+    if (g_enc.tail) g_enc.tail->next = s;
+    else            g_enc.head = s;
+    g_enc.tail = s;
+    pthread_cond_signal(&g_enc.cv);
+    pthread_mutex_unlock(&g_enc.mu);
 }
 
 /* Body bytes, in order, exactly as they are appended to the file. */
@@ -1647,16 +1729,7 @@ static void stripe_enc_feed(stripe_enc_t *e, const void *buf, size_t n)
 static int stripe_enc_finish(stripe_enc_t *e, uint64_t body_len, const pack_dat_hdr_t *hdr)
 {
     if (!e) return -1;
-    pthread_mutex_lock(&e->mu);
-    for (;;) {
-        int busy = 0;
-        for (int i = 0; i < ENC_SLOTS; i++)
-            if (e->slot[i].state == SLOT_READY || e->slot[i].state == SLOT_ENCODING) busy = 1;
-        if (!busy) break;
-        pthread_cond_wait(&e->cv_free, &e->mu);
-    }
-    pthread_mutex_unlock(&e->mu);
-    enc_stop_threads(e);
+    enc_drain(e);
     if (e->broken || e->fed != body_len) return -1;
     if (e->cur >= 0 && e->cur_len > 0) {
         if (e->next_g >= e->par_groups) return -1;
@@ -2369,9 +2442,11 @@ typedef struct {
     uint32_t              pack_num;
     /* Body bytes handed to writeback so far; see pw_writeback. */
     uint64_t              wb_done;
-    /* The body's stripe parity, encoded as it is appended; NULL when it
-     * could not be set up, and then the seal reads the body back. */
+    /* The body's stripe parity, encoded as it is appended; NULL when the
+     * buffer budget could not cover it, and then the seal reads the body
+     * back. budget is what was taken for it (and the stdio buffer). */
     stripe_enc_t         *enc;
+    uint64_t              budget;
 } pack_writer_t;
 
 /*
@@ -2408,14 +2483,23 @@ static int pw_ensure_capacity(pack_writer_t *pw, uint32_t need) {
     return 0;
 }
 
+/* The encoder and its share of the buffer budget, given back at the seal
+ * or when the writer is torn down. */
+static void pw_release_encoder(pack_writer_t *pw)
+{
+    stripe_enc_free(pw->enc);
+    pw->enc = NULL;
+    if (pw->budget) read_budget_release_foreign(pw->budget);
+    pw->budget = 0;
+}
+
 static status_t pw_finalize(pack_writer_t *pw) {
     if (!pw->dat_f || pw->packed == 0) return OK;
 
     status_t st = finalize_pack(pw->store, &pw->dat_f,
                                 pw->dat_tmp, &pw->dat_hdr,
                                 pw->idx_entries, pw->packed, pw->pack_num, pw->enc);
-    stripe_enc_free(pw->enc);
-    pw->enc = NULL;
+    pw_release_encoder(pw);
     pw->packed = 0;
     pw->body_offset = 0;
     pw->wb_done = 0;
@@ -2426,7 +2510,7 @@ static void pw_destroy(pack_writer_t *pw) {
     /* Clean up if pack is still open (error path) */
     if (pw->dat_f) { fclose(pw->dat_f); pw->dat_f = NULL; }
     if (pw->dat_tmp[0]) { unlink(pw->dat_tmp); pw->dat_tmp[0] = '\0'; }
-    stripe_enc_free(pw->enc);
+    pw_release_encoder(pw);
     free(pw->idx_entries);
     memset(pw, 0, sizeof(*pw));
 }
@@ -2689,12 +2773,25 @@ static status_t pb_ensure_open(pack_backup_writer_t *w)
     w->pw.packed = 0;
     w->pw.body_offset = 0;
     w->pw.wb_done = 0;
-    status_t st = open_new_pack(w->pw.store, w->pw.pack_num, &w->pw.dat_f,
-                                w->pw.dat_tmp, &w->pw.dat_hdr);
-    if (st != OK) return st;
-    /* Without an encoder the seal reads the body back: slower, not wrong. */
-    stripe_enc_free(w->pw.enc);
-    w->pw.enc = stripe_enc_new();
+    /*
+     * The encoder's memory and the large stdio buffer come out of the
+     * daemon's buffer budget, taken once here and given back at the seal,
+     * never waited for: a writer the budget cannot cover runs without them
+     * and its seal reads the body back - slower, the same bytes - rather
+     * than stall a backup whose other writers hold the budget.
+     */
+    pw_release_encoder(&w->pw);
+    w->pw.budget = read_budget_try_take(PACK_WRITER_BUDGET_BYTES, READ_BUDGET_READER_RESERVE);
+    if (w->pw.budget) {
+        w->pw.enc = stripe_enc_new();
+        if (!w->pw.enc) pw_release_encoder(&w->pw);
+    }
+    if (!w->pw.enc)
+        atomic_fetch_add_explicit(&writers_unbudgeted, 1, memory_order_relaxed);
+    status_t st = open_new_pack_buf(w->pw.store, &w->pw.dat_f, w->pw.dat_tmp,
+                                    &w->pw.dat_hdr,
+                                    w->pw.enc ? PACK_WRITER_STDIO_BYTES : 0);
+    if (st != OK) { pw_release_encoder(&w->pw); return st; }
     stripe_enc_feed(w->pw.enc, &w->pw.dat_hdr, sizeof(w->pw.dat_hdr));
     return OK;
 }

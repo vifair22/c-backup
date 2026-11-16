@@ -6,6 +6,27 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-16 - Pack writers within the buffer budget, one encoder pool (OWN-44)
+
+Review of the encode-as-you-write change found writer memory unbudgeted: a
+backup with sixteen file workers could open seventeen writers, about
+311 MiB of parity and buffers and 68 encoder threads. Each writer now takes
+its encoder and write buffer (26.3 MiB) from `jobs.read_budget_mb` when it
+opens, never waiting and never past one object's room left for readers, and
+a backup plans its file workers to what fits; the encoder threads are one
+process-wide pool of min(4, CPUs). Same benchmark as below, rerun on this
+build (bench_phases sets no budget, so every writer encodes; at the default
+256 MiB a backup gets up to nine), v6 = origin/v3 d4658fb, five rounds:
+
+| Shape | v6 first backup | v7 first backup | v6 mean | v7 mean |
+|---|---|---|---:|---:|
+| large, 768 MiB | 1.067, 1.066, 1.047, 1.087, 1.065 s | 0.978, 0.969, 1.039, 0.966, 0.996 s | 1.066 s | **0.990 s** |
+| 20,000 small | 1.897, 1.952, 1.923, 1.963, 1.986 s | 1.908, 1.913, 1.947, 1.964, 1.899 s | 1.944 s | **1.926 s** |
+
+One shared pool instead of four threads per writer made the large-file
+case faster, not slower: the three packs of that run no longer each start
+and join a pool of their own.
+
 ## 2026-11-16 - Stripe parity encoded as packs are written (OWN-44)
 
 The first cut of striped parity encoded each pack's stripe at the seal, on

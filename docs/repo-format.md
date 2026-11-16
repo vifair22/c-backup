@@ -762,9 +762,13 @@ One-shot AEAD means a reader holds a whole object until its tag verifies.
 Every job reads, and a backup runs a worker pool, so the daemon caps object
 buffers in flight with one counting semaphore in bytes
 (`src/common/read_budget.h`, `jobs.read_budget_mb`, default 256 MiB, at
-least 16 MiB). Restore, grep, preview, verify, replicate and the backup's
+least 48 MiB). Restore, grep, preview, verify, replicate and the backup's
 chunk jobs take an object's size before loading it and give it back when the
 buffer is freed; a request larger than the budget is clamped to all of it.
+Backup pack writers draw their parity encoder and write buffer (about
+26.3 MiB each) from the same budget without waiting and never past one
+object's room left for readers; one that cannot get it seals by reading
+back (`docs/pack-parity.md`).
 
 No thread ever waits for a slot while holding one: with a budget of one
 object, two threads each holding one and waiting for another would deadlock.

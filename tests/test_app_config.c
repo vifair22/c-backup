@@ -59,7 +59,7 @@ static void test_edges_pass(void **state)
 {
     (void)state;
     assert_int_equal(load("http:\n  port: 0\n  bind: 0.0.0.0\n"
-                          "jobs:\n  max_parallel: 256\n  read_budget_mb: 16\n"
+                          "jobs:\n  max_parallel: 256\n  read_budget_mb: 48\n"
                           "auth:\n  cookie_secure: 1\n"
                           "scheduler:\n  enabled: 0\n"
                           "retention:\n  keep_snaps: 0\n  keep_yearly: 2147483647\n"
@@ -78,8 +78,8 @@ static void test_ranges_refused(void **state)
     refused("jobs:\n  max_parallel: 0\n", "jobs.max_parallel: '0' is not between 1 and 256");
     refused("jobs:\n  max_parallel: 257\n", "jobs.max_parallel: '257'");
     /* A read budget smaller than one largest object could never read it. */
-    refused("jobs:\n  read_budget_mb: 15\n",
-            "jobs.read_budget_mb: '15' MiB is under 16 MiB, the largest object");
+    refused("jobs:\n  read_budget_mb: 47\n",
+            "jobs.read_budget_mb: '47' MiB is under 48 MiB, the largest object");
     refused("jobs:\n  read_budget_mb: 0\n", "jobs.read_budget_mb: '0' MiB");
     refused("jobs:\n  read_budget_mb: 1048577\n", "jobs.read_budget_mb: '1048577'");
     refused("auth:\n  cookie_secure: 2\n", "auth.cookie_secure: '2' is not between 0 and 1");
