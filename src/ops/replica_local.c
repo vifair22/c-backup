@@ -9,6 +9,7 @@
 #include "repo.h"
 #include "repo_key.h"
 #include "snap_record.h"
+#include "snapshot_ids.h"
 #include "util.h"
 
 #include <cutils/log.h>
@@ -92,6 +93,9 @@ typedef struct {
      * record over one already there, and hold the target's key. */
     int        no_overwrite;
     repo_key_t dst_key;
+
+    /* The target's identity, which its snapshot-ids file is bound to. */
+    char       uuid[CBACKUP_UUID_LEN];
 } local_ctx_t;
 
 static int idx_cmp(const void *a, const void *b)
@@ -376,6 +380,12 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
         log_info("replica: %s gained %u object(s) for snapshot %lld", c->root,
                  packed, (long long)snap->snapshot_id);
 
+    /* The mark covers the id before the record using it exists, exactly as
+     * a backup orders it, so a replica that loses its index never reissues
+     * one. */
+    status_t mst = snapshot_ids_raise(c->root, c->uuid, snap->snapshot_id, NULL, NULL);
+    if (mst != OK) return mst;
+
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_hex(snap->root_tree_hash, hex);
 
@@ -462,6 +472,12 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
  * in replicate.c keeps a partial subtree honest: a tree is staged only after
  * everything it names.
  */
+static status_t local_raise_snapshot_ids(void *vctx, int64_t at_least)
+{
+    local_ctx_t *c = vctx;
+    return snapshot_ids_raise(c->root, c->uuid, at_least, NULL, NULL);
+}
+
 static void local_close(void *vctx)
 {
     local_ctx_t *c = vctx;
@@ -532,6 +548,7 @@ static const replica_sink_vtbl_t local_vtbl = {
     .has_objects     = local_has_objects,
     .put_object      = local_put_object,
     .commit_snapshot = local_commit_snapshot,
+    .raise_snapshot_ids = local_raise_snapshot_ids,
     .has_snapshot    = local_has_snapshot,
     .close           = local_close,
 };
@@ -566,6 +583,8 @@ status_t replica_sink_local_open(const char *path,
         st = store_init_dirs(path);
         if (st != OK) { free(c); return st; }
         st = repo_marker_write_fixed(path, source_marker, &m);
+        if (st != OK) { free(c); return st; }
+        st = snapshot_ids_write(path, m.uuid, 0);
         if (st != OK) { free(c); return st; }
     } else {
         st = repo_format_check(path, &m);
@@ -605,6 +624,7 @@ static status_t sink_finish_open(local_ctx_t *c, const char *path,
     status_t st = store_open(path, NULL, &c->store);
     if (st != OK) { repo_key_wipe(&c->dst_key); free(c); return st; }
     c->owns_store = 1;
+    snprintf(c->uuid, sizeof(c->uuid), "%s", m->uuid);
 
     build_index(c);
 

@@ -10,6 +10,7 @@
 #include "db_txn.h"
 #include "repo_tags.h"
 #include "snap_record.h"
+#include "snapshot_ids.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -783,6 +784,60 @@ static status_t recompute_refcounts(cutils_db_t *db, int64_t repo_id)
     return OK;
 }
 
+/*
+ * Bring the index's snapshot-id mark up to everything the repository says
+ * was ever issued (rule 2 of snapshot_ids.h). The file is the record that
+ * survives a lost database; the highest record covers a file that is
+ * missing or lagging; the index's own value covers a file and records that
+ * both lost the top. Whichever is largest wins everywhere, and a file that
+ * was missing, damaged or behind is rewritten and the run says so.
+ */
+static status_t restore_snapshot_mark(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                      long long highest_record, reindex_result_t *total)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    int64_t file_mark = 0;
+    int file_ok = 1;
+    if (snapshot_ids_read_repo(store_root(store), &file_mark) != OK) {
+        log_warn("reindex: %s", err_msg());
+        err_clear();
+        file_mark = 0;
+        file_ok = 0;
+    }
+
+    int64_t idx_mark = 0;
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT last_id FROM snapshot_id_seq WHERE repo_id = ?",
+                   (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        idx_mark = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+
+    int64_t mark = file_mark;
+    if ((int64_t)highest_record > mark) mark = (int64_t)highest_record;
+    if (idx_mark > mark) mark = idx_mark;
+
+    char m[32];
+    snprintf(m, sizeof(m), "%lld", (long long)mark);
+    if (db_execute_non_query(db,
+            "INSERT INTO snapshot_id_seq (repo_id, last_id) VALUES (?, ?)"
+            " ON CONFLICT(repo_id) DO UPDATE SET last_id = MAX(last_id, excluded.last_id)",
+            (const char *[]){ repo, m, NULL }, NULL) != 0)
+        return set_error(ERR_IO, "reindex: cannot record the snapshot-id mark");
+
+    if (!file_ok || file_mark < mark) {
+        status_t st = snapshot_ids_raise_repo(store_root(store), mark, NULL, NULL);
+        if (st != OK) return st;
+        log_warn("reindex: the repository's snapshot-ids file was %s; rewritten at %lld",
+                 file_ok ? "behind its records or the index" : "missing or damaged",
+                 (long long)mark);
+        total->snapshot_ids_repaired = 1;
+    }
+    total->snapshot_mark = mark;
+    return OK;
+}
+
 status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
                       atomic_int *cancel, reindex_result_t *out)
 {
@@ -807,6 +862,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     memset(&total, 0, sizeof(total));
     status_t st = OK;
     long long first_failed = 0;
+    long long highest_record = 0;
     char first_err[256] = "";
 
     /* Packs first: the tree walk resolves packed objects through these rows,
@@ -823,6 +879,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
         char *end = NULL;
         long long id = strtoll(e->d_name, &end, 10);
         if (id <= 0 || !end || *end != '\0') continue;
+        if (id > highest_record) highest_record = id;
 
         reindex_result_t one;
         memset(&one, 0, sizeof(one));
@@ -857,6 +914,8 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     st = fill_object_sizes(store, db, repo_id);
     if (st != OK) return st;
     st = recompute_refcounts(db, repo_id);
+    if (st != OK) return st;
+    st = restore_snapshot_mark(store, db, repo_id, highest_record, &total);
     if (st != OK) return st;
 
     /* Tags last: they attach to snapshot rows, which now exist. */

@@ -13,6 +13,7 @@
 #include "phase_timer.h"
 #include "pack.h"
 #include "snap_record.h"
+#include "snapshot_ids.h"
 #include "store_pool.h"
 
 #include <cutils/log.h>
@@ -1237,14 +1238,28 @@ static status_t allocate_snapshot_id(cutils_db_t *db, store_t *store,
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
+    /* The repository's own mark counts too: it is what survives a lost
+     * database. Unreadable is damage, and the index still covers every id
+     * this daemon issued, so the backup goes on and the mark is rewritten
+     * below. */
+    int64_t repo_mark = 0;
+    if (snapshot_ids_read_repo(store_root(store), &repo_mark) != OK) {
+        log_warn("backup: %s; numbering from the index", err_msg());
+        err_clear();
+        repo_mark = 0;
+    }
+    char mark[32];
+    snprintf(mark, sizeof(mark), "%lld", (long long)repo_mark);
+
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "snapshot id: begin");
 
     db_result_t *r = NULL;
     int64_t next = 0;
     if (db_execute(db,
             "SELECT MAX(COALESCE((SELECT last_id FROM snapshot_id_seq WHERE repo_id = ?), 0),"
-            "           COALESCE((SELECT MAX(id) FROM snapshots WHERE repo_id = ?), 0)) + 1",
-            (const char *[]){ repo, repo, NULL }, &r) == 0 && r && r->nrows == 1)
+            "           COALESCE((SELECT MAX(id) FROM snapshots WHERE repo_id = ?), 0),"
+            "           CAST(? AS INTEGER)) + 1",
+            (const char *[]){ repo, repo, mark, NULL }, &r) == 0 && r && r->nrows == 1)
         next = strtoll(r->rows[0][0], NULL, 10);
     db_result_free(r);
     if (next < 1) {
@@ -1276,6 +1291,12 @@ static status_t allocate_snapshot_id(cutils_db_t *db, store_t *store,
         return set_error(ERR_IO, "snapshot id: cannot record %s", id);
     }
     if (db_txn_commit(db) != OK) return set_error(ERR_IO, "snapshot id: commit");
+
+    /* Durable in the repository before the record that uses it exists, and
+     * outside the transaction: an fsync is not something to hold the one
+     * database handle across. */
+    status_t st = snapshot_ids_raise_repo(store_root(store), next, NULL, NULL);
+    if (st != OK) return st;
     *out = next;
     return OK;
 }

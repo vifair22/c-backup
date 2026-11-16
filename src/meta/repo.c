@@ -4,6 +4,7 @@
 
 #include "repo.h"
 #include "db_txn.h"
+#include "snapshot_ids.h"
 #include "store.h"
 
 #include <cutils/json.h>
@@ -893,6 +894,10 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
             st = repo_marker_write(path, &marker);
             if (st != OK) return st;
         }
+        /* Created with the repository, so a format 3 repository without
+         * one is damaged rather than old. */
+        st = snapshot_ids_write(path, marker.uuid, 0);
+        if (st != OK) return st;
         out->created  = 1;
         out->inserted = 1;
         out->enc_mode = marker.enc_mode;

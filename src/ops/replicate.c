@@ -5,6 +5,7 @@
 #include "manifest.h"
 #include "object.h"
 #include "object_crypt.h"
+#include "snapshot_ids.h"
 #include "types.h"
 
 #include <cutils/log.h>
@@ -545,6 +546,29 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     db_result_free(snaps);
     if (out) *out = res;
+
+    /* The source's mark, carried across once its snapshots are, so the
+     * replica never sits below it (rule 3 of snapshot_ids.h). Taken from
+     * the source repository's file and its index together: either alone
+     * may lag the other after a lost database or a damaged file. */
+    if (st == OK && sink->v->raise_snapshot_ids) {
+        int64_t mark = 0;
+        if (snapshot_ids_read_repo(store_root(store), &mark) != OK) {
+            log_warn("replicate: source mark unreadable (%s); using the index", err_msg());
+            err_clear();
+            mark = 0;
+        }
+        db_result_t *r = NULL;
+        if (db_execute(db,
+                "SELECT MAX(COALESCE((SELECT last_id FROM snapshot_id_seq WHERE repo_id = ?), 0),"
+                "           COALESCE((SELECT MAX(id) FROM snapshots WHERE repo_id = ?), 0))",
+                (const char *[]){ repo, repo, NULL }, &r) == 0 && r && r->nrows == 1) {
+            int64_t idx = strtoll(r->rows[0][0], NULL, 10);
+            if (idx > mark) mark = idx;
+        }
+        db_result_free(r);
+        st = sink->v->raise_snapshot_ids(sink->ctx, mark);
+    }
 
     /*
      * Everything else went across and the snapshots are recorded, which is

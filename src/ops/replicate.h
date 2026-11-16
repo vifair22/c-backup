@@ -175,6 +175,16 @@ typedef struct {
                              const uint8_t root_tree_hash[OBJECT_HASH_SIZE],
                              int *out_present);
 
+    /*
+     * Raise the target's snapshot-id high-water mark to at least at_least
+     * (snapshot_ids.h). Called once at the end of a run with the source's
+     * mark, so a replica's mark is never below its source's and a reindex of
+     * the replica never reissues an id the source pruned. commit_snapshot
+     * raises it to each snapshot's id on its own. NULL for a sink with no
+     * repository to keep one in.
+     */
+    status_t (*raise_snapshot_ids)(void *ctx, int64_t at_least);
+
     /* Release whatever the sink holds. Never fails: every committed
      * snapshot is already durable, so anything still staged here is an
      * optimisation for the next run at most. */
