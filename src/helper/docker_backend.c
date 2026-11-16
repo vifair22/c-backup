@@ -3,6 +3,7 @@
 #include "docker_backend.h"
 #include "docker_api.h"
 #include "helper_proto.h"
+#include "hooklog.h"
 #include "mounts.h"
 #include "snap.h"
 
@@ -18,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -68,7 +70,25 @@ struct sp_session {
     member_t          members[MEMBERS_MAX];
     size_t            n_members;
     sp_session_info_t info;
+    struct { char name[65]; char *text; size_t len; } logs[POLICY_HOOKS_MAX];
+    size_t            n_logs;
+    struct { char item[SP_ITEM_ID_MAX]; helper_run_t *run; int err_fd; } streams[4];
+    size_t            n_streams;
 };
+
+static void keep_log(struct sp_session *s, const char *name, char *text, size_t len)
+{
+    for (size_t i = 0; i < s->n_logs; i++)
+        if (strcmp(s->logs[i].name, name) == 0) { free(s->logs[i].text); s->logs[i].text = text; s->logs[i].len = len; return; }
+    if (s->n_logs >= POLICY_HOOKS_MAX) { free(text); return; }
+    snprintf(s->logs[s->n_logs].name, sizeof(s->logs[s->n_logs].name), "%s", name);
+    s->logs[s->n_logs].text = text;
+    s->logs[s->n_logs].len = len;
+    s->n_logs++;
+}
+
+static void d_hook_kill(helper_run_t *r);
+static void d_hook_free(helper_run_t *r);
 
 /* ------------------------------------------------------------------ */
 /* Members                                                             */
@@ -466,6 +486,27 @@ static status_t d_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
     int compose_done = 0;
     if (!d->name || !mounts) st = set_error(ERR_NOMEM, "docker: describe");
     for (size_t i = 0; st == OK && i < n; i++) st = describe_member(c, &b, unit_id, &m[i], mounts, &compose_done);
+    /* The unit's hooks: a log for each, a STREAM for each dump (6.6). Dumps
+     * come before their logs, so a dump's log is read after it ends. */
+    char key[HELPER_UNIT_KEY_MAX + 1];
+    snprintf(key, sizeof(key), "docker:%s", unit_id);
+    for (size_t i = 0; st == OK && i < c->pol->n_hooks; i++) {
+        const policy_hook_t *h = &c->pol->hooks[i];
+        if (strcmp(h->unit, key) != 0) continue;
+        char id[SP_ITEM_ID_MAX], tp[PATH_MAX], src[96];
+        snprintf(src, sizeof(src), "hook:%s", h->name);
+        if (h->dump) {
+            item_id(id, sizeof(id), "dump:", h->name);
+            snprintf(tp, sizeof(tp), ".cbackup-unit/hooks/%s.dump", h->name);
+            if ((st = add_item(&b, SP_ITEM_STREAM, id, tp, src, 0, 0)) != OK) break;
+        }
+        item_id(id, sizeof(id), "log:", h->name);
+        snprintf(tp, sizeof(tp), ".cbackup-unit/hooks/%s.log", h->name);
+        char *empty = calloc(1, 1);
+        st = empty ? add_item(&b, SP_ITEM_BLOB, id, tp, src, 0, 0) : set_error(ERR_NOMEM, "docker: hook log");
+        if (st == OK) st = cache_blob(c, unit_id, id, empty, 0);
+        else free(empty);
+    }
     if (st == OK) {
         char *txt = cJSON_Print(mounts);
         st = txt ? blob(&b, c, unit_id, "mounts", CFG_DIR "/mounts.json", txt, strlen(txt))
@@ -496,9 +537,25 @@ static status_t d_blob_data(sp_ctx_t *c, const char *unit_id, const char *item_i
     return st;
 }
 
+static const char *hook_of(const sp_item_desc_t *item)
+{
+    return item->source && strncmp(item->source, "hook:", 5) == 0 ? item->source + 5 : NULL;
+}
+
 static status_t d_blob_read(sp_session_t *s, const sp_item_desc_t *item, void **data, size_t *len)
 {
-    return d_blob_data(s->c, s->unit, item->id, data, len);
+    const char *hk = strncmp(item->id, "log:", 4) == 0 ? hook_of(item) : NULL;
+    if (!hk) return d_blob_data(s->c, s->unit, item->id, data, len);
+    const char *text = "c-backup: this hook did not run (the unit was not running)\n";
+    size_t n = strlen(text);
+    for (size_t i = 0; i < s->n_logs; i++)
+        if (strcmp(s->logs[i].name, hk) == 0) { text = s->logs[i].text; n = s->logs[i].len; }
+    void *cp = malloc(n ? n : 1);
+    if (!cp) return set_error(ERR_NOMEM, "docker: hook log");
+    memcpy(cp, text, n);
+    *data = cp;
+    *len = n;
+    return OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -652,7 +709,8 @@ static void d_hook_free(helper_run_t *r)
 }
 
 /* Run one policy hook to its end, keeping the tail of its output. */
-static int run_hook(struct sp_ctx *c, const char *unit_id, const policy_hook_t *h, char *tail, size_t tsz)
+static int run_hook(struct sp_ctx *c, const char *unit_id, const policy_hook_t *h, char *tail, size_t tsz,
+                    hooklog_t *log)
 {
     tail[0] = '\0';
     int p[2];
@@ -674,6 +732,7 @@ static int run_hook(struct sp_ctx *c, const char *unit_id, const policy_hook_t *
         char buf[1024];
         ssize_t got;
         while ((got = read(p[0], buf, sizeof(buf))) > 0) {
+            if (log) (void)hooklog_append(log, buf, (size_t)got);
             /* A rolling tail: the end of a failing hook is where its error is. */
             size_t g = (size_t)got;
             if (g > tsz - 1) g = tsz - 1;      /* buf is smaller than the tail */
@@ -696,8 +755,9 @@ static int run_hook(struct sp_ctx *c, const char *unit_id, const policy_hook_t *
 
 /* Every policy hook for this unit in a phase. Returns -1 when one with
  * on_fail = fail failed (the unit fails), else how many failed. */
-static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, sp_session_info_t *info, int *ran)
+static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, struct sp_session *sess, int *ran)
 {
+    sp_session_info_t *info = sess ? &sess->info : NULL;
     char key[HELPER_UNIT_KEY_MAX + 1];
     snprintf(key, sizeof(key), "docker:%s", unit_id);
     int failed = 0;
@@ -707,7 +767,19 @@ static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, sp_session_
         if (strcmp(h->unit, key) != 0 || h->pre != pre || h->dump) continue;
         (*ran)++;
         char tail[HOOK_TAIL];
-        int code = run_hook(c, unit_id, h, tail, sizeof(tail));
+        hooklog_t log;
+        memset(&log, 0, sizeof(log));
+        int code = run_hook(c, unit_id, h, tail, sizeof(tail), &log);
+        if (code != 0) {
+            char line[64];
+            snprintf(line, sizeof(line), "\n[c-backup: exit status %d]\n", code);
+            (void)hooklog_append(&log, line, strlen(line));
+        }
+        size_t llen = 0;
+        char *ltxt = hooklog_render(&log, &llen);
+        hooklog_free(&log);
+        if (sess && ltxt) keep_log(sess, h->name, ltxt, llen);
+        else free(ltxt);
         if (code == 0) continue;
         failed++;
         log_warn("docker: %s hook %s on %s failed (%d): %s", pre ? "pre" : "post", h->name, unit_id, code, tail);
@@ -770,6 +842,11 @@ static uint64_t ms_now(void)
 static void session_free(struct sp_session *s)
 {
     if (!s) return;
+    for (size_t i = 0; i < s->n_logs; i++) free(s->logs[i].text);
+    for (size_t i = 0; i < s->n_streams; i++) {
+        if (s->streams[i].run) { d_hook_kill(s->streams[i].run); d_hook_free(s->streams[i].run); }
+        if (s->streams[i].err_fd >= 0) close(s->streams[i].err_fd);
+    }
     free(s->items);
     sp_session_info_free(&s->info);
     free(s);
@@ -821,7 +898,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     unsigned instants = snap_instants(s->snaps.doms, s->snaps.n);
 
     /* Pre hooks, live, before any pause (6.6). */
-    int ran = 0, failed = running ? run_hooks(c, unit->unit_id, 1, &s->info, &ran) : 0;
+    int ran = 0, failed = running ? run_hooks(c, unit->unit_id, 1, s, &ran) : 0;
     if (failed < 0) { session_free(s); return ERR_IO; }
 
     /* pause: auto pauses only when more than one instant would otherwise
@@ -893,7 +970,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
 
     /* Post hooks run after the unpause and the snapshot (6.6). */
     int pran = 0;
-    if (running && run_hooks(c, unit->unit_id, 0, &s->info, &pran) < 0) {
+    if (running && run_hooks(c, unit->unit_id, 0, s, &pran) < 0) {
         (void)sp_session_info_warn(&s->info, "%.400s", err_msg());
         err_clear();
     }
@@ -976,11 +1053,70 @@ static status_t d_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
     return OK;
 }
 
+/* A dump hook in-process: stdout to the caller's pipe, stderr to a memfd
+ * (never blocks the exec), its exit status at close. Through the helper the
+ * daemon uses hook.run and hook.wait instead, under the helper's watchdog. */
+static status_t d_stream_open(sp_session_t *s, const sp_item_desc_t *item, int *fd)
+{
+    const char *hk = hook_of(item);
+    const policy_hook_t *h = hk ? helper_policy_hook(s->c->pol, hk) : NULL;
+    if (!h || !h->dump) return set_error(ERR_NOT_FOUND, "docker: no dump hook for %s", item->id);
+    if (s->n_streams >= sizeof(s->streams) / sizeof(s->streams[0])) return set_error(ERR_INVALID, "docker: too many dumps");
+    int pp[2];
+    if (pipe2(pp, O_CLOEXEC) != 0) return set_error_errno(ERR_IO, "docker: pipe");
+    int efd = memfd_create("cbk-hook-err", MFD_CLOEXEC);
+    helper_run_t *run = NULL;
+    status_t st = efd < 0 ? set_error_errno(ERR_IO, "docker: memfd")
+                          : d_hook_start(s->c, s->unit, h, pp[1], efd, &run);
+    close(pp[1]);
+    if (st != OK) { close(pp[0]); if (efd >= 0) close(efd); return st; }
+    snprintf(s->streams[s->n_streams].item, sizeof(s->streams[0].item), "%s", item->id);
+    s->streams[s->n_streams].run = run;
+    s->streams[s->n_streams].err_fd = efd;
+    s->n_streams++;
+    *fd = pp[0];
+    return OK;
+}
+
+static status_t d_stream_close(sp_session_t *s, const sp_item_desc_t *item, int *ok)
+{
+    for (size_t i = 0; i < s->n_streams; i++) {
+        if (!s->streams[i].run || strcmp(s->streams[i].item, item->id) != 0) continue;
+        int code = 255;
+        while (!d_hook_poll(s->streams[i].run, &code)) {
+            struct timespec ts = { 0, 20 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        d_hook_free(s->streams[i].run);
+        s->streams[i].run = NULL;
+        hooklog_t log;
+        memset(&log, 0, sizeof(log));
+        char buf[8192];
+        ssize_t n;
+        off_t off = 0;
+        while ((n = pread(s->streams[i].err_fd, buf, sizeof(buf), off)) > 0) { (void)hooklog_append(&log, buf, (size_t)n); off += n; }
+        close(s->streams[i].err_fd);
+        s->streams[i].err_fd = -1;
+        char line[64];
+        snprintf(line, sizeof(line), "\n[c-backup: exit status %d]\n", code);
+        (void)hooklog_append(&log, line, strlen(line));
+        size_t len = 0;
+        char *txt = hooklog_render(&log, &len);
+        hooklog_free(&log);
+        if (txt) keep_log(s, hook_of(item), txt, len);
+        *ok = code == 0;
+        if (code) (void)sp_session_info_warn(&s->info, "dump hook %s exited %d; not stored", hook_of(item), code);
+        return OK;
+    }
+    return set_error(ERR_NOT_FOUND, "docker: dump %s was not open", item->id);
+}
+
 static const sp_provider_ops_t k_docker_ops = {
     .name = "docker", .abi = SP_ABI_VERSION,
     .init = d_init, .fini = d_fini, .probe = d_probe, .list_units = d_list,
     .describe = d_describe, .desc_free = sp_unit_desc_free, .begin = d_begin,
     .blob_read = d_blob_read, .tree_root = d_tree_root, .end = d_end, .sweep = d_sweep,
+    .stream_open = d_stream_open, .stream_close = d_stream_close,
 };
 
 /* ------------------------------------------------------------------ */

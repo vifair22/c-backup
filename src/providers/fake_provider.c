@@ -799,6 +799,13 @@ static status_t f_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
             memcpy(it->id, u->blobs[i].id, sizeof(it->id));
             it->kind = u->blobs[i].stream ? SP_ITEM_STREAM : SP_ITEM_BLOB;
             it->size = u->blobs[i].stream ? 0 : u->blobs[i].len;
+            /* A stream named dump:<hook> is that policy hook's, as the
+             * container providers name theirs, so the helper can run it. */
+            if (u->blobs[i].stream && strncmp(u->blobs[i].id, "dump:", 5) == 0) {
+                char src[96];
+                snprintf(src, sizeof(src), "hook:%s", u->blobs[i].id + 5);
+                if (!(it->source = strdup(src))) st = set_error(ERR_NOMEM, "fake");
+            }
             if (!(it->tree_path = strdup(u->blobs[i].path))) st = set_error(ERR_NOMEM, "fake");
         }
         for (size_t i = 0; st == OK && i < u->nd; i++) {
@@ -1085,7 +1092,7 @@ static const fblob_t *blob_of(sp_session_t *s, const char *id)
 static void *pipe_main(void *arg)
 {
     fpipe_t *p = arg;
-    uint8_t buf[65536];
+    uint8_t buf[16384];
     for (uint64_t off = 0; off < p->len; ) {
         size_t n = p->len - off < sizeof(buf) ? (size_t)(p->len - off) : sizeof(buf);
         for (size_t i = 0; i < n; i++) buf[i] = fake_byte(91, off + i);

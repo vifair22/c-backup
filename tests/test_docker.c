@@ -65,7 +65,9 @@ static int has(const char *path, const char *text)
 
 static const char *k_hooks =
     "[hook pre-echo]\nunit = docker:compose:web\ncontainer = web-db\nargv.0 = echo\nargv.1 = flushed\n"
-    "phase = pre\ntimeout_s = 10\n";
+    "phase = pre\ntimeout_s = 10\n"
+    "[hook pgdump]\nunit = docker:compose:web\ncontainer = web-db\nkind = dump\nargv.0 = echo\nargv.1 = DUMPDATA\n"
+    "[hook baddump]\nunit = docker:compose:web\ncontainer = web-db\nkind = dump\nargv.0 = fail\n";
 
 static int start(const char *extra_policy)
 {
@@ -299,6 +301,66 @@ static void test_parallel_pause(void **state)
     assert_int_equal(holds_open, 0);
 }
 
+static const sp_item_desc_t *item_id_of(const sp_unit_desc_t *d, const char *id)
+{
+    for (size_t i = 0; i < d->n_items; i++) if (strcmp(d->items[i].id, id) == 0) return &d->items[i];
+    return NULL;
+}
+
+/* Hook logs as files, and dumps as streams that fail closed (6.6). */
+static void test_hook_logs_and_dumps(void **state)
+{
+    (void)state;
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    sp_unit_desc_t *d = NULL;
+    assert_int_equal(capture("compose:web", SP_CONSIST_CRASH, &s, &info, &d), OK);
+    const sp_item_desc_t *dump = item_id_of(d, "dump:pgdump");
+    const sp_item_desc_t *bad = item_id_of(d, "dump:baddump");
+    const sp_item_desc_t *log = item_id_of(d, "log:pre-echo");
+    const sp_item_desc_t *dlog = item_id_of(d, "log:pgdump");
+    assert_non_null(dump);
+    assert_non_null(bad);
+    assert_non_null(log);
+    assert_non_null(dlog);
+    assert_int_equal(dump->kind, SP_ITEM_STREAM);
+    assert_string_equal(dump->tree_path, ".cbackup-unit/hooks/pgdump.dump");
+    assert_string_equal(log->tree_path, ".cbackup-unit/hooks/pre-echo.log");
+    /* The pre hook's whole output, as its log. */
+    void *data = NULL;
+    size_t len = 0;
+    assert_int_equal(be.ops->blob_read(s, log, &data, &len), OK);
+    assert_non_null(memmem(data, len, "flushed", 7));
+    free(data);
+    /* A good dump: its stdout through the pipe, then ok. */
+    int fd = -1, ok = -1;
+    assert_int_equal(be.ops->stream_open(s, dump, &fd), OK);
+    char buf[256];
+    size_t got = 0;
+    ssize_t n;
+    while ((n = read(fd, buf + got, sizeof(buf) - 1 - got)) > 0) got += (size_t)n;
+    close(fd);
+    buf[got] = '\0';
+    assert_string_equal(buf, "DUMPDATA\n");
+    assert_int_equal(be.ops->stream_close(s, dump, &ok), OK);
+    assert_int_equal(ok, 1);
+    assert_int_equal(be.ops->blob_read(s, dlog, &data, &len), OK);
+    assert_non_null(memmem(data, len, "exit status 0", 13));
+    free(data);
+    /* A failing one: not ok, and its log says why. */
+    assert_int_equal(be.ops->stream_open(s, bad, &fd), OK);
+    while (read(fd, buf, sizeof(buf)) > 0) {}
+    close(fd);
+    assert_int_equal(be.ops->stream_close(s, bad, &ok), OK);
+    assert_int_equal(ok, 0);
+    assert_int_equal(be.ops->blob_read(s, item_id_of(d, "log:baddump"), &data, &len), OK);
+    assert_non_null(memmem(data, len, "boom", 4));
+    assert_non_null(memmem(data, len, "exit status 3", 13));
+    free(data);
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+}
+
 /* A mount on no snapshot domain is read live, and the level says so. */
 static void test_fallback_flagged(void **state)
 {
@@ -400,6 +462,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_one_instant_no_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_two_instants_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_parallel_pause, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_hook_logs_and_dumps, setup, teardown),
         cmocka_unit_test_setup_teardown(test_fallback_flagged, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failing_hook, setup_failing_hook, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),

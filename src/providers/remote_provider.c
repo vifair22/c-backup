@@ -33,8 +33,13 @@ struct sp_ctx {
 struct sp_session {
     struct sp_ctx    *ctx;
     char              token[HELPER_TOKEN_HEX + 1];
+    char              unit_id[SP_UNIT_ID_MAX];
     cJSON            *desc;        /* units.describe at begin: blob offsets, run maps */
     int               blob_fd;     /* the sealed memfd describe passed, or -1 */
+    int               late_fd;     /* capture.begin's memfd: hook logs, or -1 */
+    cJSON            *late;        /* item id -> [offset, length] in late_fd */
+    struct { char hook[72]; char run[HELPER_TOKEN_HEX + 1]; char *log; size_t log_len; } dumps[4];
+    size_t            n_dumps;
     cJSON            *roots;       /* read_roots */
     sp_session_info_t info;
 };
@@ -315,6 +320,9 @@ static void session_free(struct sp_session *s)
     cJSON_Delete(s->desc);
     cJSON_Delete(s->roots);
     if (s->blob_fd >= 0) close(s->blob_fd);
+    if (s->late_fd >= 0) close(s->late_fd);
+    cJSON_Delete(s->late);
+    for (size_t i = 0; i < s->n_dumps; i++) free(s->dumps[i].log);
     sp_session_info_free(&s->info);
     free(s);
 }
@@ -326,6 +334,8 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     if (!s) return set_error(ERR_NOMEM, "helper: session");
     s->ctx = c;
     s->blob_fd = -1;
+    s->late_fd = -1;
+    snprintf(s->unit_id, sizeof(s->unit_id), "%s", unit->unit_id);
     /* The configuration and data-plane facts as of now; the capture is the
      * point in time for the trees. */
     status_t st = rcall_fd(c->socket, "units.describe", args_unit(c, unit->unit_id), &s->desc,
@@ -338,7 +348,7 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(key, sizeof(key), "%s:%s", c->provider, unit->unit_id);
         if (u) cJSON_AddItemToArray(u, cJSON_CreateString(key));
         if (a) cJSON_AddBoolToObject(a, "pause", (unit->caps & SP_CAP_PAUSE) != 0);
-        st = rcall(c->socket, "capture.begin", a, &res);
+        st = rcall_fd(c->socket, "capture.begin", a, &res, &s->late_fd);
     }
     const char *tok = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture")) : NULL;
     const cJSON *m = st == OK ? cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(res, "members"), 0) : NULL;
@@ -347,6 +357,7 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     if (st == OK) {
         snprintf(s->token, sizeof(s->token), "%s", tok);
         s->roots = cJSON_DetachItemFromObjectCaseSensitive((cJSON *)(uintptr_t)m, "read_roots");
+        s->late = cJSON_DetachItemFromObjectCaseSensitive((cJSON *)(uintptr_t)m, "late_blobs");
         s->info.achieved = (sp_consistency_t)num(m, "achieved");
         s->info.consist_flags = (uint32_t)num(m, "flags");
         s->info.freeze_ms = num(m, "freeze_ms");
@@ -405,8 +416,52 @@ static const cJSON *item_json(const struct sp_session *s, const char *id)
     return NULL;
 }
 
+/* n bytes at off of a sealed memfd the helper passed, bounds-checked. */
+static status_t read_passed(int fd, uint64_t off, uint64_t n, const char *what, void **data, size_t *len)
+{
+    struct stat sb;
+    if (fd < 0 || fstat(fd, &sb) != 0 || n > HELPER_BLOB_MAX || off + n < off || off + n > (uint64_t)sb.st_size)
+        return set_error(ERR_IO, "helper: data for %s lies outside what was passed", what);
+    uint8_t *buf = malloc(n ? (size_t)n : 1);
+    if (!buf) return set_error(ERR_NOMEM, "helper: blob");
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = pread(fd, buf + done, (size_t)n - done, (off_t)(off + done));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { free(buf); return set_error_errno(ERR_IO, "helper: reading %s", what); }
+        done += (size_t)r;
+    }
+    *data = buf;
+    *len = (size_t)n;
+    return OK;
+}
+
+static const char *hook_of(const sp_item_desc_t *item)
+{
+    return item->source && strncmp(item->source, "hook:", 5) == 0 ? item->source + 5 : NULL;
+}
+
 static status_t r_blob_read(sp_session_t *s, const sp_item_desc_t *item, void **data, size_t *len)
 {
+    /* A dump hook's log, from its hook.wait; then logs capture.begin
+     * passed; then what describe passed. */
+    const char *hk = hook_of(item);
+    for (size_t i = 0; hk && i < s->n_dumps; i++) {
+        if (strcmp(s->dumps[i].hook, hk) != 0 || !s->dumps[i].log) continue;
+        void *cp = malloc(s->dumps[i].log_len ? s->dumps[i].log_len : 1);
+        if (!cp) return set_error(ERR_NOMEM, "helper: hook log");
+        memcpy(cp, s->dumps[i].log, s->dumps[i].log_len);
+        *data = cp;
+        *len = s->dumps[i].log_len;
+        return OK;
+    }
+    const cJSON *lp = cJSON_GetObjectItemCaseSensitive(s->late, item->id);
+    if (cJSON_GetArraySize(lp) == 2) {
+        const cJSON *o = cJSON_GetArrayItem(lp, 0), *n = cJSON_GetArrayItem(lp, 1);
+        if (!cJSON_IsNumber(o) || !cJSON_IsNumber(n) || o->valuedouble < 0 || n->valuedouble < 0)
+            return set_error(ERR_IO, "helper: a malformed late blob for %s", item->id);
+        return read_passed(s->late_fd, (uint64_t)o->valuedouble, (uint64_t)n->valuedouble, item->id, data, len);
+    }
     /* The bytes are in the sealed memfd describe passed: the helper could
      * not change them under us, and any size fits. */
     const cJSON *it = item_json(s, item->id);
@@ -470,6 +525,64 @@ static status_t r_tree_root(sp_session_t *s, const sp_item_desc_t *item, char *r
     if (!p || p[0] != '/') return set_error(ERR_IO, "helper: no read root for %s", item->id);
     if (snprintf(read_root, sz, "%s", p) >= (int)sz) return set_error(ERR_INVALID, "helper: read root too long");
     return OK;
+}
+
+/* A dump hook: hook.run passes its stdout as a pipe; the helper's watchdog
+ * kills it at its timeout, which ends the pipe. */
+static status_t r_stream_open(sp_session_t *s, const sp_item_desc_t *item, int *fd)
+{
+    const char *hk = hook_of(item);
+    if (!hk || strlen(hk) >= sizeof(s->dumps[0].hook)) return set_error(ERR_INVALID, "helper: %s names no hook", item->id);
+    if (s->n_dumps >= sizeof(s->dumps) / sizeof(s->dumps[0])) return set_error(ERR_INVALID, "helper: too many dumps");
+    cJSON *a = args_unit(s->ctx, s->unit_id);
+    if (a) cJSON_AddStringToObject(a, "hook", hk);
+    cJSON *res = NULL;
+    int pfd = -1;
+    status_t st = rcall_fd(s->ctx->socket, "hook.run", a, &res, &pfd);
+    const char *run = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "run")) : NULL;
+    if (st == OK && (!run || strlen(run) != HELPER_TOKEN_HEX || pfd < 0))
+        st = set_error(ERR_IO, "helper: hook.run for %s gave no run or no pipe", hk);
+    if (st == OK) {
+        memset(&s->dumps[s->n_dumps], 0, sizeof(s->dumps[0]));
+        snprintf(s->dumps[s->n_dumps].hook, sizeof(s->dumps[0].hook), "%s", hk);
+        snprintf(s->dumps[s->n_dumps].run, sizeof(s->dumps[0].run), "%s", run);
+        s->n_dumps++;
+        *fd = pfd;
+        pfd = -1;
+    }
+    if (pfd >= 0) close(pfd);
+    cJSON_Delete(res);
+    return st;
+}
+
+static status_t r_stream_close(sp_session_t *s, const sp_item_desc_t *item, int *ok)
+{
+    const char *hk = hook_of(item);
+    for (size_t i = 0; hk && i < s->n_dumps; i++) {
+        if (strcmp(s->dumps[i].hook, hk) != 0 || !s->dumps[i].run[0]) continue;
+        cJSON *a = cJSON_CreateObject();
+        if (a) cJSON_AddStringToObject(a, "run", s->dumps[i].run);
+        cJSON *res = NULL;
+        int lfd = -1;
+        status_t st = rcall_fd(s->ctx->socket, "hook.wait", a, &res, &lfd);
+        s->dumps[i].run[0] = '\0';
+        if (st != OK) { if (lfd >= 0) close(lfd); return st; }
+        int code = (int)num(res, "exit");
+        *ok = code == 0 && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "timed_out"));
+        void *log = NULL;
+        size_t len = 0;
+        if (lfd >= 0 && read_passed(lfd, 0, num(res, "log_bytes"), hk, &log, &len) == OK) {
+            s->dumps[i].log = log;
+            s->dumps[i].log_len = len;
+        } else {
+            err_clear();
+        }
+        if (lfd >= 0) close(lfd);
+        if (!*ok) (void)sp_session_info_warn(&s->info, "dump hook %s exited %d; not stored", hk, code);
+        cJSON_Delete(res);
+        return OK;
+    }
+    return set_error(ERR_NOT_FOUND, "helper: dump %s was not open", item->id);
 }
 
 static status_t r_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapshot_id)
@@ -555,6 +668,7 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
             .describe = r_describe, .desc_free = r_desc_free, .begin = r_begin,
             .blob_read = r_blob_read, .block_open = r_block_open, .tree_root = r_tree_root,
             .end = r_end, .sweep = r_sweep,
+            .stream_open = r_stream_open, .stream_close = r_stream_close,
         };
         st = sp_registry_add(o, c);
         if (st != OK) { free(c); break; }

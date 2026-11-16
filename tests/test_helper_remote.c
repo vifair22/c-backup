@@ -126,6 +126,27 @@ static int setup(void **state)
     return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
 }
 
+/* As setup, with two dump hooks on fake:u1 in the helper's policy. */
+static int setup_dumps(void **state)
+{
+    (void)state;
+    if (setup_base() != 0) return -1;
+    char text[8192];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
+    size_t l = strlen(text);
+    snprintf(text + l, sizeof(text) - l,
+             "[hook pgdump]\nunit = fake:u1\nkind = dump\nargv.0 = /bin/sh\nargv.1 = -c\n"
+             "argv.2 = printf DUMP-%%s ok; echo noise >&2\n"
+             "[hook baddump]\nunit = fake:u1\nkind = dump\nargv.0 = /bin/sh\nargv.1 = -c\n"
+             "argv.2 = printf partial; echo broke >&2; exit 3\n");
+    helper_policy_free(&pol);
+    if (helper_policy_parse(text, &pol) != OK) return -1;
+    if (fake_stream_add(fk, "u1", "dump:pgdump", ".cbackup-unit/hooks/pgdump.dump", 0, 1) != OK ||
+        fake_stream_add(fk, "u1", "dump:baddump", ".cbackup-unit/hooks/baddump.dump", 0, 1) != OK) return -1;
+    if (helper_up() != 0) return -1;
+    return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
+}
+
 static int teardown(void **state)
 {
     (void)state;
@@ -284,6 +305,30 @@ static void test_large_blob(void **state)
     free(big);
 }
 
+/* Dump hooks through the helper: hook.run's pipe stored, hook.wait's exit
+ * deciding; the failed one never lands. */
+static void test_dumps_through_helper(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, DEST, &ro, &rr), OK);
+    FILE *f = fopen(DEST "/.cbackup-unit/hooks/pgdump.dump", "r");
+    assert_non_null(f);
+    char buf[64] = "";
+    assert_non_null(fgets(buf, sizeof(buf), f));
+    fclose(f);
+    assert_string_equal(buf, "DUMP-ok");
+    struct stat sb;
+    assert_int_not_equal(stat(DEST "/.cbackup-unit/hooks/baddump.dump", &sb), 0);
+    assert_int_equal(helper_server_holds(srv), 0);
+}
+
 /* Wait up to 5 s for the link to be connected with fake enabled. */
 static int wait_connected(void)
 {
@@ -378,6 +423,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_starts_before_helper, setup_late, teardown),
         cmocka_unit_test_setup_teardown(test_helper_restarts_mid_job, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_blob, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),

@@ -4,6 +4,7 @@
 #include "artefact.h"
 #include "helper_backend.h"
 #include "helper_proto.h"
+#include "hooklog.h"
 
 #include <sys/mman.h>
 
@@ -36,7 +37,6 @@ extern char **environ;
 #define RUNS_MAX      32
 #define STAGINGS_MAX  32
 #define CONNS_MAX     16
-#define HOOK_LOG_MAX  ((size_t)16 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* State                                                               */
@@ -78,8 +78,7 @@ typedef struct {
     int      err_fd;          /* the hook's stderr, for the log */
     time_t   deadline;
     int      done, status, timed_out;
-    char    *log;
-    size_t   log_len;
+    hooklog_t log;            /* stderr, head and tail kept (6.6) */
 } run_t;
 
 typedef struct {
@@ -589,8 +588,10 @@ static int capture_take(helper_server_t *s, const char *token, capture_t *out)
     return c != NULL;
 }
 
-static char *op_capture_begin(helper_server_t *s, const helper_req_t *r)
+static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pass_fd)
 {
+    int lfd = -1;             /* items only known after begin: hook logs */
+    uint64_t loff = 0;
     char why[256];
     for (size_t i = 0; i < r->n_units; i++) {
         helper_err_t e = unit_allowed(s, r->units[i], why, sizeof(why));
@@ -699,8 +700,32 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r)
             }
             cJSON_AddStringToObject(rr, d->items[k].id, root);
         }
+        /* Hook logs exist only now that begin ran the hooks. */
+        cJSON *late = cJSON_AddObjectToObject(o, "late_blobs");
+        for (size_t k = 0; late && fail == HELPER_OK && k < d->n_items; k++) {
+            const sp_item_desc_t *it = &d->items[k];
+            if (it->kind != SP_ITEM_BLOB || strncmp(it->id, "log:", 4) != 0) continue;
+            void *data = NULL;
+            size_t len = 0;
+            if (b->ops->blob_read(sess, it, &data, &len) != OK) { err_clear(); continue; }
+            uint64_t at = loff;
+            int werr = len > HELPER_BLOB_MAX || blob_fd_append(&lfd, &loff, data, len) != 0;
+            free(data);
+            if (werr) { snprintf(fmsg, sizeof(fmsg), "cannot pass the hook logs"); fail = HELPER_E_FAILED; break; }
+            cJSON *pair = cJSON_CreateArray();
+            if (!pair) break;
+            cJSON_AddItemToArray(pair, cJSON_CreateNumber((double)at));
+            cJSON_AddItemToArray(pair, cJSON_CreateNumber((double)len));
+            cJSON_AddItemToObject(late, it->id, pair);
+        }
         b->ops->desc_free(d);
     }
+    if (fail == HELPER_OK && lfd >= 0 &&
+        fcntl(lfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) != 0) {
+        snprintf(fmsg, sizeof(fmsg), "cannot seal the hook logs");
+        fail = HELPER_E_FAILED;
+    }
+    if (fail != HELPER_OK && lfd >= 0) { close(lfd); lfd = -1; }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (fail != HELPER_OK) {
         cJSON_Delete(res);
@@ -717,6 +742,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r)
         pthread_mutex_lock(&s->mu);
         slot->used = 0;
         pthread_mutex_unlock(&s->mu);
+        if (lfd >= 0) close(lfd);
         return resp_error(r->id, HELPER_E_FAILED, "no randomness for a token");
     }
     c.deadline = now + (time_t)s->pol->capture_max_s;
@@ -728,6 +754,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r)
     cJSON_AddNumberToObject(res, "snapshot_ms",
                             (double)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
     cJSON_AddNumberToObject(res, "expires", (double)c.deadline);
+    if (lfd >= 0) *pass_fd = lfd;
     return resp_ok(r->id, res);
 }
 
@@ -879,16 +906,7 @@ static void run_drain(run_t *x)
     for (;;) {
         ssize_t n = read(x->err_fd, buf, sizeof(buf));
         if (n <= 0) break;
-        size_t take = (size_t)n;
-        if (x->log_len + take > HOOK_LOG_MAX) take = HOOK_LOG_MAX - x->log_len;
-        if (take) {
-            char *g = realloc(x->log, x->log_len + take + 1);
-            if (!g) break;
-            x->log = g;
-            memcpy(x->log + x->log_len, buf, take);
-            x->log_len += take;
-            x->log[x->log_len] = '\0';
-        }
+        if (hooklog_append(&x->log, buf, (size_t)n) != 0) break;
     }
 }
 
@@ -931,7 +949,7 @@ static void run_poll(run_t *x, time_t now)
     }
 }
 
-static char *op_hook_wait(helper_server_t *s, const helper_req_t *r)
+static char *op_hook_wait(helper_server_t *s, const helper_req_t *r, int *pass_fd)
 {
     for (;;) {
         pthread_mutex_lock(&s->mu);
@@ -944,14 +962,28 @@ static char *op_hook_wait(helper_server_t *s, const helper_req_t *r)
         }
         run_poll(x, time(NULL));
         if (x->done) {
+            /* The whole log, up to 1 MiB, in a sealed memfd; a tail of it
+             * inline for messages. */
+            size_t len = 0;
+            char *txt = hooklog_render(&x->log, &len);
+            int lfd = -1;
+            uint64_t loff = 0;
+            if (txt && (blob_fd_append(&lfd, &loff, txt, len) != 0 ||
+                        fcntl(lfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) != 0)) {
+                if (lfd >= 0) close(lfd);
+                lfd = -1;
+            }
             cJSON *res = cJSON_CreateObject();
             if (res) {
                 cJSON_AddNumberToObject(res, "exit", x->status);
                 cJSON_AddBoolToObject(res, "timed_out", x->timed_out);
-                cJSON_AddStringToObject(res, "log", x->log ? x->log : "");
+                cJSON_AddStringToObject(res, "log", txt ? txt + (len > 1024 ? len - 1024 : 0) : "");
+                if (lfd >= 0) cJSON_AddNumberToObject(res, "log_bytes", (double)len);
             }
+            free(txt);
+            if (lfd >= 0) *pass_fd = lfd;
             close(x->err_fd);
-            free(x->log);
+            hooklog_free(&x->log);
             if (x->hr) x->b->hook_free(x->hr);
             memset(x, 0, sizeof(*x));
             pthread_mutex_unlock(&s->mu);
@@ -1230,11 +1262,11 @@ static char *dispatch(helper_server_t *s, const helper_req_t *r, int *pass_fd)
     case HOP_HELLO:                  return op_hello(s, r);
     case HOP_UNITS_LIST:             return op_units_list(s, r);
     case HOP_UNITS_DESCRIBE:         return op_units_describe(s, r, pass_fd);
-    case HOP_CAPTURE_BEGIN:          return op_capture_begin(s, r);
+    case HOP_CAPTURE_BEGIN:          return op_capture_begin(s, r, pass_fd);
     case HOP_CAPTURE_BEGIN_PATHS:    return op_capture_begin_paths(s, r);
     case HOP_CAPTURE_END:            return op_capture_end(s, r);
     case HOP_HOOK_RUN:               return op_hook_run(s, r, pass_fd);
-    case HOP_HOOK_WAIT:              return op_hook_wait(s, r);
+    case HOP_HOOK_WAIT:              return op_hook_wait(s, r, pass_fd);
     case HOP_VM_BACKUP_BEGIN:
     case HOP_VM_BACKUP_END:
     case HOP_VM_CHECKPOINT_REDEFINE:
@@ -1527,7 +1559,7 @@ void helper_server_stop(helper_server_t *s)
                 waitpid(s->runs[i].pid, NULL, 0);
             }
             close(s->runs[i].err_fd);
-            free(s->runs[i].log);
+            hooklog_free(&s->runs[i].log);
         }
     pthread_cond_destroy(&s->wcv);
     pthread_mutex_destroy(&s->cmu);
