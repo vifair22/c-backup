@@ -339,6 +339,187 @@ status_t unit_define_build(store_t *store, cutils_db_t *db, int64_t repo_id, int
     return st;
 }
 
+/* One file of the snapshot (a disk image, the NVRAM) restored to dest. */
+static status_t restore_file(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                             const unit_define_opts_t *o, const char *rel, const char *dest)
+{
+    /* restore_run writes into a directory: a fresh one beside dest, the
+     * file moved out of it to dest (one filesystem), the directory gone. */
+    char tmp[PATH_MAX + 32], at[2 * PATH_MAX + 64];
+    snprintf(tmp, sizeof(tmp), "%.4000s.cbk-restore", dest);
+    snprintf(at, sizeof(at), "%s/%s", tmp, rel[0] == '/' ? rel + 1 : rel);
+    restore_opts_t ro = o->ropts;
+    ro.subpath = rel;
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    status_t st = restore_run(store, db, repo_id, snap_id, tmp, &ro, &rr);
+    if (st == OK && rr.files == 0 && rr.dirs == 0) st = set_error(ERR_NOT_FOUND, "unit restore: %s is not in the snapshot", rel);
+    if (st == OK && rename(at, dest) != 0) st = set_error_errno(ERR_IO, "unit restore: moving %s into place", rel);
+    /* Empty directories of the path inside tmp, deepest first. */
+    for (char *p2 = strrchr(at, '/'); p2 && p2 > at + strlen(tmp); p2 = strrchr(at, '/')) {
+        *p2 = '\0';
+        if (rmdir(at) != 0) break;
+    }
+    (void)rmdir(tmp);
+    return st;
+}
+
+/* A path of the helper's answer, checked. */
+static const char *abs_of(const cJSON *o, const char *k)
+{
+    const char *v = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(o, k));
+    return v && v[0] == '/' ? v : NULL;
+}
+
+/*
+ * A VM (vm-backup.md 7.1, 7.2): every disk restored to a sparse raw image
+ * (under target_root at its original path for a new domain; staged beside
+ * the original and swapped in, the old image moved aside, for replace),
+ * NVRAM and TPM state staged, the recorded XML defined by the helper with
+ * the disks pointing at their images, then vm.install_state for the UUID
+ * the define returned, and a start only on request.
+ */
+static status_t vm_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                              int64_t job_id, const unit_define_opts_t *o, const char *unit,
+                              int new_name, cJSON *res, unit_define_result_t *out)
+{
+    char key[256];
+    snprintf(key, sizeof(key), "libvirt:%s", unit);
+    char *uj = NULL, *xml = NULL;
+    size_t ul = 0, xl = 0;
+    status_t st = unit_read_file(store, db, repo_id, snap_id, ".cbackup-unit/unit.json", DEF_FILE_MAX, &uj, &ul);
+    if (st == OK) st = unit_read_file(store, db, repo_id, snap_id, ".cbackup-unit/config/domain.xml", DEF_FILE_MAX, &xml, &xl);
+    cJSON *u = st == OK ? cJSON_ParseWithLength(uj, ul) : NULL;
+    free(uj);
+    if (st == OK && !u) st = set_error(ERR_CORRUPT, "unit restore: unit.json does not parse");
+    cJSON *disks = cJSON_CreateObject(), *done = cJSON_GetObjectItemCaseSensitive(res, "trees");
+    const char *nvram = NULL, *tpm = NULL;
+    struct { char token[64]; } swaps[64];
+    size_t nsw = 0;
+    const cJSON *it;
+    cJSON_ArrayForEach(it, cJSON_GetObjectItemCaseSensitive(u, "items")) {
+        const char *kind = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "kind"));
+        const char *id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "id"));
+        if (kind && id && strcmp(id, "nvram") == 0) nvram = abs_of(it, "source");
+        if (kind && id && strcmp(kind, "tree") == 0 && strcmp(id, "tpm") == 0) tpm = abs_of(it, "path");
+        if (st != OK || !kind || strcmp(kind, "block") != 0 || !id) continue;
+        const char *src = abs_of(it, "source");
+        const char *rel = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "path"));
+        if (!src || !rel) { st = set_error(ERR_CORRUPT, "unit restore: disk %s has no source in unit.json", id); break; }
+        char dest[PATH_MAX + 8];
+        if (new_name) {
+            snprintf(dest, sizeof(dest), "%s%s", o->target_root, src);
+            struct stat sb;
+            if (lstat(dest, &sb) == 0) { st = set_error(ERR_INVALID, "unit restore: %s exists", dest); break; }
+            if ((st = mkdir_p(dest)) == OK) st = restore_file(store, db, repo_id, snap_id, o, rel, dest);
+            if (st == OK) cJSON_AddStringToObject(disks, id, dest);
+        } else {
+            cJSON *a = args_unit("libvirt", unit), *sr = NULL;
+            if (a) { cJSON_AddStringToObject(a, "mount", src); cJSON_AddNumberToObject(a, "job", (double)job_id); }
+            st = remote_op("libvirt", "restore.stage", a, -1, &sr);
+            const char *tok = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(sr, "staging"));
+            const char *sp = abs_of(sr, "path");
+            if (st == OK && (!tok || !sp || nsw >= 64)) st = set_error(ERR_IO, "unit restore: a malformed staging for %s", src);
+            if (st == OK) {
+                snprintf(dest, sizeof(dest), "%.4000s/image", sp);
+                st = restore_file(store, db, repo_id, snap_id, o, rel, dest);
+            }
+            if (st == OK) {
+                snprintf(swaps[nsw++].token, sizeof(swaps[0].token), "%s", tok);
+                cJSON_AddStringToObject(disks, id, src);
+            }
+            cJSON_Delete(sr);
+        }
+        cJSON *x = cJSON_CreateObject();
+        if (x && st == OK) {
+            cJSON_AddStringToObject(x, "disk", id);
+            cJSON_AddStringToObject(x, "image", cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(disks, id)));
+            cJSON_AddItemToArray(done, x);
+        } else {
+            cJSON_Delete(x);
+        }
+    }
+    /* Every disk is in: only now do the originals move aside. */
+    for (size_t i = 0; st == OK && i < nsw; i++) {
+        cJSON *b = cJSON_CreateObject(), *sw = NULL;
+        if (b) cJSON_AddStringToObject(b, "staging", swaps[i].token);
+        st = remote_op("libvirt", "restore.swap", b, -1, &sw);
+        const char *prev = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(sw, "previous"));
+        if (st == OK && prev) cJSON_AddItemToArray(cJSON_AddArrayToObject(res, "previous"), cJSON_CreateString(prev));
+        cJSON_Delete(sw);
+    }
+    /* NVRAM and TPM state, staged for vm.install_state. */
+    char state_tok[64] = "";
+    if (st == OK && (nvram || tpm)) {
+        cJSON *a = args_unit("libvirt", unit), *sr = NULL;
+        if (a) { cJSON_AddStringToObject(a, "mount", nvram ? nvram : tpm); cJSON_AddNumberToObject(a, "job", (double)job_id); }
+        st = remote_op("libvirt", "restore.stage", a, -1, &sr);
+        const char *tok = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(sr, "staging"));
+        const char *sp = abs_of(sr, "path");
+        if (st == OK && (!tok || !sp)) st = set_error(ERR_IO, "unit restore: a malformed state staging");
+        char dest[PATH_MAX + 16];
+        if (st == OK && nvram) {
+            snprintf(dest, sizeof(dest), "%.4000s/nvram.fd", sp);
+            st = restore_file(store, db, repo_id, snap_id, o, ".cbackup-unit/config/nvram.fd", dest);
+        }
+        if (st == OK && tpm) {
+            snprintf(dest, sizeof(dest), "%.4000s/tpm", sp);
+            st = restore_file(store, db, repo_id, snap_id, o, tpm, dest);
+        }
+        if (st == OK) snprintf(state_tok, sizeof(state_tok), "%s", tok);
+        cJSON_Delete(sr);
+    }
+    /* The definition, by memfd, then the state for the UUID it got. */
+    cJSON *dr = NULL;
+    if (st == OK) {
+        cJSON *d = cJSON_CreateObject();
+        if (d) {
+            cJSON_AddStringToObject(d, "xml", xml);
+            cJSON_AddStringToObject(d, "name", new_name ? o->name : "");
+            cJSON_AddBoolToObject(d, "replace", !new_name && o->replace);
+            cJSON_AddBoolToObject(d, "keep_macs", o->keep_macs);
+            cJSON_AddItemToObject(d, "disks", disks);
+            disks = NULL;
+        }
+        char *txt = d ? cJSON_PrintUnformatted(d) : NULL;
+        cJSON_Delete(d);
+        int fd = -1;
+        st = txt ? sealed_memfd(txt, &fd) : set_error(ERR_NOMEM, "unit restore");
+        free(txt);
+        if (st == OK) {
+            cJSON *a = args_unit("libvirt", unit);
+            cJSON *ph = a ? cJSON_AddObjectToObject(a, "definition") : NULL;
+            if (ph) cJSON_AddBoolToObject(ph, "memfd", 1);
+            st = remote_op("libvirt", "unit.define", a, fd, &dr);
+        }
+        if (fd >= 0) close(fd);
+    }
+    const char *nuuid = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(dr, "uuid"));
+    if (st == OK && !nuuid) st = set_error(ERR_IO, "unit restore: the define returned no uuid");
+    if (st == OK && state_tok[0]) {
+        cJSON *a = args_unit("libvirt", nuuid), *ir = NULL;
+        if (a) cJSON_AddStringToObject(a, "staging", state_tok);
+        st = remote_op("libvirt", "vm.install_state", a, -1, &ir);
+        if (st == OK && ir) cJSON_AddItemToObject(res, "state", ir);
+        else cJSON_Delete(ir);
+    }
+    if (st == OK && o->start) st = remote_op("libvirt", "unit.start", args_unit("libvirt", nuuid), -1, NULL);
+    if (st == OK) {
+        const cJSON *w;
+        cJSON_ArrayForEach(w, cJSON_GetObjectItemCaseSensitive(dr, "warnings"))
+            if (cJSON_IsString(w) && out->n_warnings < sizeof(out->warnings) / sizeof(out->warnings[0]) &&
+                (out->warnings[out->n_warnings] = strdup(w->valuestring)) != NULL) out->n_warnings++;
+        cJSON_AddItemToObject(res, "define", dr);
+        dr = NULL;
+    }
+    (void)key;
+    cJSON_Delete(dr);
+    cJSON_Delete(disks);
+    cJSON_Delete(u);
+    free(xml);
+    return st;
+}
+
 status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                          int64_t job_id, const unit_define_opts_t *o, unit_define_result_t *out)
 {
@@ -366,6 +547,15 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
         cJSON_AddStringToObject(res, "mode", "unit");
         cJSON_AddStringToObject(res, "unit", key);
         cJSON_AddStringToObject(res, "name", new_name ? o->name : unit);
+    }
+
+    if (st == OK && strcmp(prov, "libvirt") == 0) {
+        st = vm_define_run(store, db, repo_id, snap_id, job_id, o, unit, new_name, res, out);
+        for (size_t i = 0; st == OK && i < out->n_warnings; i++) log_warn("unit restore %s: %s", key, out->warnings[i]);
+        if (st == OK && !(out->json = cJSON_PrintUnformatted(res))) st = set_error(ERR_NOMEM, "unit restore");
+        cJSON_Delete(res);
+        free(t);
+        return st;
     }
 
     if (st == OK && new_name) {

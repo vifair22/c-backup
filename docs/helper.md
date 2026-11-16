@@ -486,6 +486,36 @@ The daemon needs `nbd_dir` bind-mounted at the same path, read access to
 the images (the pools read-only) and to `nvram_dir` and `tpm_dir`
 read-only (container-backup and vm-backup 9.2).
 
+**Restore** (`c-backup unit restore <repo> <snap> --define ...`, vm-backup
+7.1 and 7.2):
+
+- every disk is restored as a sparse **raw** image (holes stay holes); a
+  qcow2 disk comes back raw and the definition says so;
+- **new name** (`--name N --target-root DIR`): images at
+  `DIR/<original image path>`, the recorded XML defined by the helper with
+  the name changed, the `<uuid>` removed (libvirt makes a new one), MACs
+  regenerated unless `--keep-macs`, the disks pointing at the new images,
+  excluded passthrough disks dropped and listed, the `<nvram>` path left
+  to libvirt; a domain with that name already there is refused;
+- **in place** (`--replace`, the domain shut off): each image restored into
+  a staging directory beside it, and only after every disk is in, swapped
+  in with the old image kept as `<image>.cbackup-old-<job>`; the XML
+  redefined with the same UUID;
+- then `vm.install_state` for the UUID the define returned: the NVRAM goes
+  to the path the defined XML names, the TPM state to
+  `tpm_dir/<that uuid>`; a replaced domain's old state is moved aside, a new
+  UUID that already has a state directory is refused, and no other UUID's
+  directory is listed or touched. A TPM VM with no staged state is refused.
+  The helper only installs state for a domain it has just defined or
+  replaced;
+- `<hostdev>` and `<filesystem>` devices need `allow_privileged_define`;
+  `--start` starts the domain only after its state is installed.
+
+The NVRAM and TPM state are staged by the daemon under `staging_root`
+(writable by the daemon), and disk staging sits in
+`<image directory>/.cbackup-restore/`, which the daemon needs writable for
+in-place restores.
+
 ## Testing
 
 The unit suites run everything above against stand-ins: `tests/fake_host`

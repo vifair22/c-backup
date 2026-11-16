@@ -137,6 +137,8 @@ static status_t parse_def(const char *xml, vdef_t *d)
 
 typedef struct { char unit[VIR_UUID_STRING_BUFLEN]; char item[SP_ITEM_ID_MAX]; char *data; size_t len; } vblob_t;
 
+#define DEFINED_MAX 16
+
 struct sp_ctx {
     const helper_policy_t *pol;
     host_tools_t tools;
@@ -145,6 +147,10 @@ struct sp_ctx {
     pthread_mutex_t mu;
     vblob_t     *blobs;
     size_t       nblobs;
+    /* Domains this helper defined or replaced, the only UUIDs
+     * vm.install_state will write state for (7.2). */
+    struct { char uuid[VIR_UUID_STRING_BUFLEN]; int replaced; } defined[DEFINED_MAX];
+    size_t       n_defined;
 };
 
 typedef struct {
@@ -838,6 +844,248 @@ static const sp_provider_ops_t k_libvirt_ops = {
     .blob_read = v_blob_read, .tree_root = v_tree_root, .end = v_end, .sweep = v_sweep,
 };
 
+/* ------------------------------------------------------------------ */
+/* Restore (7.2)                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Staging for a disk image goes beside it, so the swap is one rename;
+ * NVRAM and TPM state are staged under staging_root. */
+static status_t v_mount_root(sp_ctx_t *c, const char *mount, char *buf, size_t sz)
+{
+    size_t tl = strlen(c->pol->tpm_dir), nl = strlen(c->pol->nvram_dir);
+    if ((strncmp(mount, c->pol->tpm_dir, tl) == 0 && mount[tl] == '/') ||
+        strncmp(mount, c->pol->nvram_dir, nl) == 0 || strstr(mount, "_VARS") || strstr(mount, ".fd")) {
+        snprintf(buf, sz, "%s", c->pol->staging_root);
+        return OK;
+    }
+    const char *slash = strrchr(mount, '/');
+    if (!slash || slash == mount) return set_error(ERR_INVALID, "libvirt: no directory for %s", mount);
+    snprintf(buf, sz, "%.*s", (int)(slash - mount), mount);
+    return OK;
+}
+
+static void remove_children(xmlNodePtr n, const char *name)
+{
+    for (xmlNodePtr c = n ? n->children : NULL; c; ) {
+        xmlNodePtr next = c->next;
+        if (c->type == XML_ELEMENT_NODE && xmlStrcmp(c->name, (const xmlChar *)name) == 0) {
+            xmlUnlinkNode(c);
+            xmlFreeNode(c);
+        }
+        c = next;
+    }
+}
+
+/*
+ * Re-create a domain from its recorded XML, the helper doing every edit:
+ *   {"xml": "<domain>...", "name": "", "replace": false, "keep_macs": false,
+ *    "disks": {"vda": "/restored/vda.img"}}
+ * A new name gets a new UUID (the element removed, libvirt makes one),
+ * new MACs unless keep_macs, and NVRAM placed where libvirt puts it; replace
+ * keeps the UUID of a domain that exists and is shut off. Restored disks
+ * point at their new images, raw; excluded disks are dropped and listed.
+ * Passthrough devices and host directories need allow_privileged_define.
+ */
+static status_t v_define(sp_ctx_t *c, const char *unit_id, const char *definition,
+                         const helper_policy_t *pol, cJSON **result)
+{
+    *result = NULL;
+    cJSON *d = cJSON_Parse(definition);
+    const char *xml = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(d, "xml"));
+    const char *want = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(d, "name"));
+    int replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "replace"));
+    int keep_macs = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "keep_macs"));
+    const cJSON *disks = cJSON_GetObjectItemCaseSensitive(d, "disks");
+    status_t st = conn_ok(c);
+    if (st == OK && !xml) st = set_error(ERR_INVALID, "libvirt: the definition has no xml");
+    xmlDocPtr doc = st == OK ? xmlReadMemory(xml, (int)strlen(xml), "domain.xml", NULL,
+                                             XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING) : NULL;
+    if (st == OK && !doc) st = set_error(ERR_INVALID, "libvirt: the recorded domain XML does not parse");
+    xmlNodePtr root = doc ? xmlDocGetRootElement(doc) : NULL;
+    cJSON *res = cJSON_CreateObject();
+    cJSON *removed = res ? cJSON_AddArrayToObject(res, "removed") : NULL;
+    cJSON *warn = res ? cJSON_AddArrayToObject(res, "warnings") : NULL;
+    if (st == OK && (!root || !removed || !warn)) st = set_error(ERR_NOMEM, "libvirt: define");
+    char name[256] = "";
+    if (st == OK) text(child(root, "name"), name, sizeof(name));
+    if (st == OK && want && *want) {
+        if (strlen(want) > 200 || strspn(want, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != strlen(want))
+            st = set_error(ERR_INVALID, "libvirt: bad domain name %.80s", want);
+        else snprintf(name, sizeof(name), "%s", want);
+    }
+    int new_name = want && *want;
+    if (st == OK && new_name) {
+        /* Name and UUID collisions: a new domain, never over another. */
+        virDomainPtr other = virDomainLookupByName(c->conn, name);
+        if (other) { virDomainFree(other); st = set_error(ERR_BUSY, "libvirt: a domain named %s exists", name); }
+        else err_clear();
+        if (st == OK) {
+            xmlNodePtr nn = child(root, "name");
+            if (nn) xmlNodeSetContent(nn, (const xmlChar *)name);
+            remove_children(root, "uuid");
+        }
+    } else if (st == OK) {
+        if (!replace) st = set_error(ERR_INVALID, "libvirt: re-defining %s in place needs replace", name);
+        virDomainPtr dom = NULL;
+        if (st == OK && domain(c, unit_id, &dom) == OK) {
+            if (dom_state(dom) != SP_STATE_STOPPED) st = set_error(ERR_BUSY, "libvirt: %s is not shut off", name);
+            virDomainFree(dom);
+        } else {
+            err_clear();
+        }
+    }
+    xmlNodePtr devs = root ? child(root, "devices") : NULL;
+    for (xmlNodePtr n = devs ? devs->children : NULL; st == OK && n; ) {
+        xmlNodePtr next = n->next;
+        if (n->type != XML_ELEMENT_NODE) { n = next; continue; }
+        if ((xmlStrcmp(n->name, (const xmlChar *)"hostdev") == 0 || xmlStrcmp(n->name, (const xmlChar *)"filesystem") == 0) &&
+            !pol->allow_privileged_define) {
+            st = set_error(ERR_INVALID, "libvirt: the domain has a %s, which needs allow_privileged_define", (const char *)n->name);
+            break;
+        }
+        if (!keep_macs && xmlStrcmp(n->name, (const xmlChar *)"interface") == 0 && new_name) remove_children(n, "mac");
+        if (xmlStrcmp(n->name, (const xmlChar *)"disk") == 0) {
+            char tgt[32];
+            attr(child(n, "target"), "dev", tgt, sizeof(tgt));
+            const char *to = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(disks, tgt));
+            char dev[16], type[16];
+            attr(n, "device", dev, sizeof(dev));
+            attr(n, "type", type, sizeof(type));
+            if (to) {
+                if (to[0] != '/' || !helper_path_clean(to)) { st = set_error(ERR_INVALID, "libvirt: bad disk path for %s", tgt); break; }
+                xmlNodePtr src = child(n, "source");
+                if (src) xmlSetProp(src, (const xmlChar *)"file", (const xmlChar *)to);
+                xmlNodePtr drv = child(n, "driver");
+                if (drv) xmlSetProp(drv, (const xmlChar *)"type", (const xmlChar *)"raw");   /* restored as raw (7.1) */
+            } else if (strcmp(dev, "disk") == 0 && strcmp(type, "block") == 0) {
+                /* An excluded passthrough disk: out of the definition, listed. */
+                cJSON_AddItemToArray(removed, cJSON_CreateString(tgt));
+                xmlUnlinkNode(n);
+                xmlFreeNode(n);
+            }
+        }
+        n = next;
+    }
+    if (st == OK && new_name) {
+        /* NVRAM: libvirt places a new domain's where it keeps them;
+         * vm.install_state then writes the recorded contents there. */
+        xmlNodePtr nv = child(child(root, "os"), "nvram");
+        if (nv) xmlNodeSetContent(nv, NULL);
+    }
+    virDomainPtr def = NULL;
+    if (st == OK) {
+        xmlChar *out = NULL;
+        int olen = 0;
+        xmlDocDumpMemory(doc, &out, &olen);
+        if (!out) st = set_error(ERR_NOMEM, "libvirt: define");
+        else {
+            def = virDomainDefineXML(c->conn, (const char *)out);
+            xmlFree(out);
+            if (!def) st = set_error(ERR_IO, "libvirt: defining %s: %s", name, verr());
+        }
+    }
+    if (st == OK) {
+        char uuid[VIR_UUID_STRING_BUFLEN];
+        if (virDomainGetUUIDString(def, uuid) != 0) uuid[0] = '\0';
+        pthread_mutex_lock(&c->mu);
+        if (c->n_defined == DEFINED_MAX) {
+            memmove(c->defined, c->defined + 1, (DEFINED_MAX - 1) * sizeof(c->defined[0]));
+            c->n_defined--;
+        }
+        size_t k = c->n_defined++;
+        snprintf(c->defined[k].uuid, sizeof(c->defined[k].uuid), "%s", uuid);
+        c->defined[k].replaced = !new_name;
+        pthread_mutex_unlock(&c->mu);
+        cJSON_AddStringToObject(res, "uuid", uuid);
+        cJSON_AddStringToObject(res, "name", name);
+        cJSON_AddBoolToObject(res, "replaced", !new_name);
+        virDomainFree(def);
+        *result = res;
+        res = NULL;
+    }
+    if (doc) xmlFreeDoc(doc);
+    cJSON_Delete(res);
+    cJSON_Delete(d);
+    return st;
+}
+
+/*
+ * vm.install_state: staging_dir holds nvram.fd and tpm/ as the daemon
+ * restored them. Only for a domain this helper just defined or replaced;
+ * the NVRAM goes to the path its XML names, the TPM state to
+ * tpm_dir/<uuid>. A new UUID with a state directory already there is
+ * refused; a replaced one has its old state moved aside. No other UUID's
+ * directory is listed or touched.
+ */
+static status_t v_install_state(sp_ctx_t *c, const char *unit_id, const char *staging_dir,
+                                int64_t job, cJSON **result)
+{
+    *result = NULL;
+    int known = 0, replaced = 0;
+    pthread_mutex_lock(&c->mu);
+    for (size_t i = 0; i < c->n_defined; i++)
+        if (strcmp(c->defined[i].uuid, unit_id) == 0) { known = 1; replaced = c->defined[i].replaced; }
+    pthread_mutex_unlock(&c->mu);
+    if (!known) return set_error(ERR_INVALID, "libvirt: %s was not defined by this helper; no state is installed for it", unit_id);
+    virDomainPtr dom = NULL;
+    status_t st = domain(c, unit_id, &dom);
+    if (st != OK) return st;
+    char *xml = virDomainGetXMLDesc(dom, VIR_DOMAIN_XML_INACTIVE);
+    vdef_t *def = calloc(1, sizeof(*def));
+    if (!xml || !def) st = set_error(ERR_IO, "libvirt: the XML of %s: %s", unit_id, verr());
+    if (st == OK) st = parse_def(xml, def);
+    free(xml);
+    if (st == OK && dom_state(dom) != SP_STATE_STOPPED) st = set_error(ERR_BUSY, "libvirt: %s is running; state is installed before a start", unit_id);
+    virDomainFree(dom);
+    cJSON *res = cJSON_CreateObject();
+    if (st == OK && !res) st = set_error(ERR_NOMEM, "libvirt: install");
+    char src[PATH_MAX + 32], hs[PATH_MAX + HOST_TOOL_PATH_MAX + 32];
+    struct stat sb;
+    /* NVRAM. */
+    snprintf(src, sizeof(src), "%.4000s/nvram.fd", staging_dir);
+    int have_nv = host_path(&c->tools, src, hs, sizeof(hs)) == 0 && stat(hs, &sb) == 0;
+    if (st == OK && have_nv) {
+        if (!def->nvram[0]) {
+            cJSON_AddStringToObject(res, "warning", "an NVRAM file was staged and the domain names none; not installed");
+        } else {
+            char aside[PATH_MAX + 64], ha[PATH_MAX + HOST_TOOL_PATH_MAX + 64], hd[PATH_MAX + HOST_TOOL_PATH_MAX];
+            snprintf(aside, sizeof(aside), "%.4000s.cbackup-old-%lld", def->nvram, (long long)job);
+            if (host_path(&c->tools, def->nvram, hd, sizeof(hd)) == 0 && stat(hd, &sb) == 0 &&
+                host_path(&c->tools, aside, ha, sizeof(ha)) == 0 && rename(hd, ha) != 0)
+                st = set_error_errno(ERR_IO, "libvirt: moving %s aside", def->nvram);
+            const char *cp[] = { "/bin/cp", "-a", src, def->nvram, NULL };
+            if (st == OK) st = host_run(&c->tools, 0, cp, 120, NULL, 0);
+            if (st == OK) cJSON_AddStringToObject(res, "nvram", def->nvram);
+        }
+    }
+    /* TPM state, for this UUID's directory alone. */
+    snprintf(src, sizeof(src), "%.4000s/tpm", staging_dir);
+    int have_tpm = host_path(&c->tools, src, hs, sizeof(hs)) == 0 && stat(hs, &sb) == 0 && S_ISDIR(sb.st_mode);
+    if (st == OK && def->tpm && !have_tpm)
+        st = set_error(ERR_INVALID, "libvirt: %s has an emulated TPM and no TPM state was staged; keys sealed to it would not unseal", unit_id);
+    if (st == OK && have_tpm) {
+        char dst[PATH_MAX + 64], hd[PATH_MAX + HOST_TOOL_PATH_MAX + 64];
+        snprintf(dst, sizeof(dst), "%.4000s/%.36s", c->pol->tpm_dir, unit_id);
+        if (host_path(&c->tools, dst, hd, sizeof(hd)) == 0 && stat(hd, &sb) == 0) {
+            if (!replaced) st = set_error(ERR_BUSY, "libvirt: %s already has TPM state, and it is a new domain", unit_id);
+            else {
+                char aside[PATH_MAX + 96], ha[PATH_MAX + HOST_TOOL_PATH_MAX + 96];
+                snprintf(aside, sizeof(aside), "%.4000s.cbackup-old-%lld", dst, (long long)job);
+                if (host_path(&c->tools, aside, ha, sizeof(ha)) != 0 || rename(hd, ha) != 0)
+                    st = set_error_errno(ERR_IO, "libvirt: moving %s aside", dst);
+                else cJSON_AddStringToObject(res, "previous_tpm", aside);
+            }
+        }
+        const char *cp[] = { "/bin/cp", "-a", src, dst, NULL };
+        if (st == OK) st = host_run(&c->tools, 0, cp, 120, NULL, 0);
+        if (st == OK) cJSON_AddStringToObject(res, "tpm", dst);
+    }
+    free(def);
+    if (st != OK) { cJSON_Delete(res); return st; }
+    *result = res;
+    return OK;
+}
+
 static int v_unit_state(sp_ctx_t *c, const char *unit_id)
 {
     virDomainPtr dom = NULL;
@@ -875,7 +1123,8 @@ status_t libvirt_backend_init(const helper_policy_t *pol, helper_backend_t *out)
     *out = (helper_backend_t){
         .name = "libvirt", .ops = &k_libvirt_ops, .ctx = c,
         .blob_data = v_blob_data, .unit_state = v_unit_state, .set_running = v_set_running,
-        .block_where = v_block_where,
+        .block_where = v_block_where, .mount_root = v_mount_root, .define = v_define,
+        .install_state = v_install_state,
     };
     return OK;
 }
