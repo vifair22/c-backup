@@ -2249,24 +2249,152 @@ static void test_resume_keeps_a_file_that_is_not_the_snapshots(void **state)
     assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
 }
 
-/* A failed object leaves neither a file of its name nor a temporary file. */
+/* Temporary restore files anywhere under dir, at any depth. */
+static int count_partials_deep(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (strncmp(de->d_name, ".c-backup-partial.", 18) == 0) { n++; continue; }
+        char p[PATH_MAX];
+        if (snprintf(p, sizeof(p), "%s/%s", dir, de->d_name) >= (int)sizeof(p)) continue;
+        struct stat sb;
+        if (lstat(p, &sb) == 0 && S_ISDIR(sb.st_mode)) n += count_partials_deep(p);
+    }
+    closedir(d);
+    return n;
+}
+
+/* The pack bytes [off, off + 51-byte entry header + stored payload) of a
+ * file's object, which is everything a read of it touches besides parity. */
+static void entry_span(const char *name, uint64_t *off, uint64_t *end, uint8_t hash[OBJECT_HASH_SIZE])
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT n.content_hash, p.comp_size FROM nodes n"
+                                " JOIN pack_objects p ON p.hash = n.content_hash"
+                                " WHERE n.repo_id = ? AND n.name = ? AND n.type = 1",
+                                (const char *[]){ repo, name, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    const char *hex = r->rows[0][0];
+    assert_int_equal(strlen(hex), OBJECT_HASH_SIZE * 2);
+    for (size_t i = 0; i < OBJECT_HASH_SIZE; i++) {
+        unsigned int byte = 0;
+        assert_int_equal(sscanf(hex + 2 * i, "%2x", &byte), 1);
+        hash[i] = (uint8_t)byte;
+    }
+    uint64_t size = strtoull(r->rows[0][1], NULL, 10);
+    db_result_free(r);
+    uint32_t pnum = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &pnum, off), OK);
+    *end = *off + sizeof(pack_dat_entry_hdr_t) + size;
+}
+
+/*
+ * A failed object leaves neither a file of its name nor a temporary file
+ * (OWN-36), and a file whose bytes were not touched still comes back whole.
+ *
+ * wreck_packs overwrites every pack between its first and last 128 bytes,
+ * which takes every parity stripe with it, so nothing in a damaged entry
+ * can be rebuilt. What it spares depends on where the backup laid each
+ * object out: the first entry ends inside the first 128 bytes, so it is
+ * untouched and reads back by its CRC and name, no repair involved. Which
+ * file that is depends on the filesystem, because the scan visits a
+ * directory's entries in inode order: on btrfs or tmpfs nested/ is older
+ * than top.txt and leaf.txt comes first; on the CI runner top.txt came
+ * first, restored intact, and the old assertion that it was absent failed
+ * (v3 pipeline 5100). So top.txt is now damaged deliberately as well,
+ * wherever it lies, and every file is judged by whether its own bytes were
+ * hit: hit means no file and no partial, untouched means byte-exact.
+ */
 static void test_damaged_object_leaves_no_file_and_no_partial(void **state)
 {
     (void)state;
     backup_opts_t o = basic_opts();
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    static const struct { const char *name, *rel, *content; } files[] = {
+        { "top.txt",  "/top.txt",               "top level content\n" },
+        { "mid.txt",  "/nested/mid.txt",        "middle content\n" },
+        { "leaf.txt", "/nested/deeper/leaf.txt", "leaf content\n" },
+    };
+    enum { NFILES = sizeof(files) / sizeof(files[0]) };
+    uint64_t off[NFILES], end[NFILES];
+    uint8_t hash[NFILES][OBJECT_HASH_SIZE];
+    for (int i = 0; i < NFILES; i++) entry_span(files[i].name, &off[i], &end[i], hash[i]);
+
+    /* The one pack the backup wrote, and its size before the damage. */
+    char pack[512] = "";
+    FILE *fp = popen("find " TEST_REPO "/packs -name '*.dat'", "r");
+    assert_non_null(fp);
+    int npacks = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = '\0';
+        snprintf(pack, sizeof(pack), "%s", line);
+        npacks++;
+    }
+    pclose(fp);
+    assert_int_equal(npacks, 1);
+    struct stat psb;
+    assert_int_equal(stat(pack, &psb), 0);
+    uint64_t wreck_lo = 128, wreck_hi = (uint64_t)psb.st_size - 128;
+
     wreck_packs();
+    /* And top.txt's own entry, wherever it is: one file always fails. */
+    {
+        int fd = open(pack, O_RDWR);
+        assert_true(fd >= 0);
+        size_t n = (size_t)(end[0] - off[0]);
+        uint8_t *buf = malloc(n);
+        assert_non_null(buf);
+        assert_int_equal(pread(fd, buf, n, (off_t)off[0]), (ssize_t)n);
+        for (size_t k = 0; k < n; k++) buf[k] ^= 0xA5;
+        assert_int_equal(pwrite(fd, buf, n, (off_t)off[0]), (ssize_t)n);
+        free(buf);
+        close(fd);
+        pack_cache_invalidate(store);
+        store_dat_cache_flush(store);
+    }
+
+    int damaged[NFILES], ndamaged = 0;
+    for (int i = 0; i < NFILES; i++) {
+        damaged[i] = i == 0 || (off[i] < wreck_hi && end[i] > wreck_lo);
+        ndamaged += damaged[i];
+    }
 
     restore_result_t rr;
-    assert_int_not_equal(restore_run(store, db, repo_id, br.snapshot_id,
-                                     TEST_DST, NULL, &rr), OK);
-    assert_true(rr.failed >= 1);
-    char top[700];
-    snprintf(top, sizeof(top), "%s/top.txt", restored_root());
-    struct stat sb;
-    assert_int_not_equal(lstat(top, &sb), 0);
-    assert_int_equal(count_partials(restored_root()), 0);
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr),
+                     ERR_CORRUPT);
+    assert_int_equal(rr.failed, (uint64_t)ndamaged);
+    assert_int_equal(rr.files, (uint64_t)(NFILES - ndamaged));
+
+    for (int i = 0; i < NFILES; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s%s", restored_root(), files[i].rel);
+        struct stat sb;
+        if (damaged[i]) {
+            /* Neither a file of its name, nor anything of it left about. */
+            if (lstat(path, &sb) == 0)
+                fail_msg("%s failed to restore and still left a file of its name", files[i].rel);
+            continue;
+        }
+        /* Untouched bytes: whole, exactly as backed up. */
+        FILE *f = fopen(path, "rb");
+        if (!f) fail_msg("%s was not damaged and did not restore", files[i].rel);
+        char got[128] = { 0 };
+        size_t n = fread(got, 1, sizeof(got) - 1, f);
+        fclose(f);
+        assert_int_equal(n, strlen(files[i].content));
+        assert_string_equal(got, files[i].content);
+    }
+    assert_int_equal(count_partials_deep(TEST_DST), 0);
 }
 
 /*
