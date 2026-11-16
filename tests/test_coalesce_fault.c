@@ -249,6 +249,22 @@ static void run_gc(void)
     assert_int_equal(g.pack_entries_dropped, 0);   /* nothing is dead: only coalescing runs */
 }
 
+/*
+ * After a coalesce killed with its merged pack installed and no marker,
+ * every merged object is on disk twice: in the merged pack and in the small
+ * pack it came from. The index names one copy of each, so the next gc drops
+ * the others as duplicates (OWN-22), having confirmed the named ones, and
+ * nothing else.
+ */
+static void run_gc_after_a_kill_with_duplicates(void)
+{
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_int_equal(g.swept, 0);
+    assert_true(g.pack_entries_dropped > 0);
+}
+
 /* Everything an operator checks, on the index as it stands and rebuilt. */
 static void all_clean(void)
 {
@@ -349,7 +365,7 @@ static void test_killed_before_the_marker(void **state)
     assert_int_equal(markers(), 0);
     all_clean();
 
-    run_gc();
+    run_gc_after_a_kill_with_duplicates();
     assert_true(pack_files() < BACKUPS + 1);
     assert_int_equal(markers(), 0);
     all_clean();

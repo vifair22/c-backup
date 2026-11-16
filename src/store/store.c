@@ -89,6 +89,8 @@ struct store {
     void                 *commit_user;
     store_pack_removed_fn removed_cb;
     void                 *removed_user;
+    store_pack_relocate_fn relocate_cb;
+    void                 *relocate_user;
 
     /* Repository key, copied in. has_key is separate from a zero check
      * because an all-zero key is a valid key, just an unlucky one. */
@@ -432,6 +434,8 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->commit_cb       = NULL;
     r->commit_user     = NULL;
     r->removed_cb      = NULL;
+    r->relocate_cb     = NULL;
+    r->relocate_user   = NULL;
     r->removed_user    = NULL;
     r->cancel          = NULL;
     r->cdc             = NULL;
@@ -788,6 +792,20 @@ void store_emit_pack_removed(store_t *st, uint64_t pack_id) {
     if (!st) return;
     if (!st->locate_cb) bidx_removed(st, pack_id);
     if (st->removed_cb) st->removed_cb(st->removed_user, pack_id);
+}
+
+void store_set_pack_relocate_cb(store_t *st, store_pack_relocate_fn cb, void *user) {
+    if (!st) return;
+    st->relocate_cb = cb;
+    st->relocate_user = user;
+}
+
+status_t store_emit_pack_relocate(store_t *st, uint64_t pack_id,
+                                  const pack_commit_entry_t *e) {
+    if (!st || !e) return set_error(ERR_INVALID, "store_emit_pack_relocate: null argument");
+    if (!st->relocate_cb)
+        return set_error(ERR_INVALID, "no index is bound to relocate objects in");
+    return st->relocate_cb(st->relocate_user, pack_id, e);
 }
 
 status_t store_set_cdc(store_t *st, const cdc_params_t *p)

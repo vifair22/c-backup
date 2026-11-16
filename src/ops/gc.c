@@ -348,25 +348,39 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (cancel_requested(cancel))
         return set_error(ERR_BUSY, "gc cancelled");
 
+    /* With each name, where the index says its copy is: compaction keeps
+     * that copy and drops any other of the same name once the indexed one
+     * is confirmed (OWN-22). */
     db_result_t *live = NULL;
-    if (db_execute(db, "SELECT hash FROM objects WHERE repo_id = ? ORDER BY hash",
-                   (const char *[]){ repo, NULL }, &live) != 0)
+    if (db_execute(db,
+            "SELECT o.hash, COALESCE(p.pack_id, 0), COALESCE(p.offset, 0)"
+            " FROM objects o LEFT JOIN pack_objects p"
+            "   ON p.repo_id = o.repo_id AND p.hash = o.hash"
+            " WHERE o.repo_id = ? ORDER BY o.hash",
+            (const char *[]){ repo, NULL }, &live) != 0)
         return set_error(ERR_IO, "gc: cannot list live objects for compaction");
 
     size_t refs_cnt = live ? (size_t)live->nrows : 0;
     uint8_t *refs = refs_cnt ? malloc(refs_cnt * OBJECT_HASH_SIZE) : NULL;
-    if (refs_cnt && !refs) {
+    pack_gc_loc_t *locs = refs_cnt ? malloc(refs_cnt * sizeof(*locs)) : NULL;
+    if (refs_cnt && (!refs || !locs)) {
+        free(refs);
+        free(locs);
         db_result_free(live);
         return set_error(ERR_NOMEM, "gc: refs alloc");
     }
-    for (size_t i = 0; i < refs_cnt; i++)
+    for (size_t i = 0; i < refs_cnt; i++) {
         hex_to_hash(live->rows[i][0], refs + i * OBJECT_HASH_SIZE);
+        locs[i].pack   = (uint32_t)strtoul(live->rows[i][1], NULL, 10);
+        locs[i].offset = strtoull(live->rows[i][2], NULL, 10);
+    }
     db_result_free(live);
 
     uint32_t kept = 0, dropped = 0;
     pack_gc_stats_t pstats;
-    status_t pst = pack_gc_stats(store, refs, refs_cnt, &kept, &dropped, &pstats);
+    status_t pst = pack_gc_stats_loc(store, refs, locs, refs_cnt, &kept, &dropped, &pstats);
     free(refs);
+    free(locs);
     res.pack_entries_kept    = kept;
     res.pack_entries_dropped = dropped;
     res.packs_rewritten      = pstats.packs_rewritten;

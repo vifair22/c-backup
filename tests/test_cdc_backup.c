@@ -249,6 +249,346 @@ static void test_workers_do_not_change_the_snapshot(void **state)
 }
 
 /*
+ * Every pack entry in a store: count and payload bytes, and how many names
+ * appear in more than one entry.
+ */
+typedef struct {
+    store_t *st;
+    uint64_t entries, payload;
+    uint8_t (*names)[OBJECT_HASH_SIZE];
+    size_t   n, cap;
+} pack_census_t;
+
+static void census_entry(const pack_entry_info_t *info, void *ctx)
+{
+    pack_census_t *c = ctx;
+    c->entries++;
+    c->payload += info->compressed_size;
+    if (c->n == c->cap) {
+        c->cap = c->cap ? c->cap * 2 : 1024;
+        c->names = realloc(c->names, c->cap * sizeof(*c->names));
+        assert_non_null(c->names);
+    }
+    memcpy(c->names[c->n++], info->hash, OBJECT_HASH_SIZE);
+}
+
+static void census_pack(uint32_t num, void *ctx)
+{
+    pack_census_t *c = ctx;
+    char name[64];
+    snprintf(name, sizeof(name), "pack-" PACK_NUM_FMT ".dat", num);
+    uint32_t ver = 0, cnt = 0;
+    assert_int_equal(pack_enumerate_dat(c->st, name, &ver, &cnt, census_entry, c), OK);
+}
+
+static int hash_cmp(const void *a, const void *b)
+{
+    return memcmp(a, b, OBJECT_HASH_SIZE);
+}
+
+static void census(store_t *st, pack_census_t *c, size_t *dup_names)
+{
+    memset(c, 0, sizeof(*c));
+    c->st = st;
+    assert_int_equal(object_store_flush(st), OK);
+    assert_int_equal(pack_list(st, census_pack, c), OK);
+    qsort(c->names, c->n, sizeof(*c->names), hash_cmp);
+    size_t d = 0;
+    for (size_t i = 1; i < c->n; i++)
+        if (memcmp(c->names[i], c->names[i - 1], OBJECT_HASH_SIZE) == 0 &&
+            (i < 2 || memcmp(c->names[i - 1], c->names[i - 2], OBJECT_HASH_SIZE) != 0))
+            d++;
+    *dup_names = d;
+    free(c->names);
+}
+
+/*
+ * OWN-46: several large files at once, each on a file worker with a pack
+ * writer of its own, against one at a time. Twins - identical large files -
+ * land on different workers, which used to store their chunks once each:
+ * the same name in two packs, the bytes twice, one index row pointing at
+ * either. Now a chunk one writer is storing is not stored again by another,
+ * so the parallel run writes exactly what the serial one does.
+ */
+static void test_file_workers_do_not_store_twins_twice(void **state)
+{
+    (void)state;
+    uint8_t *big = rand_buf(24 * MiB + 333, 461);
+    write_buf(TEST_SRC "/twin-a.bin", big, 24 * MiB + 333);
+    write_buf(TEST_SRC "/twin-b.bin", big, 24 * MiB + 333);
+    write_buf(TEST_SRC "/twin-c.bin", big, 24 * MiB + 333);
+    free(big);
+    uint8_t *other = rand_buf(20 * MiB, 462);
+    write_buf(TEST_SRC "/other.bin", other, 20 * MiB);
+    free(other);
+
+    /* Sixteen chunk workers: a quarter of them, four, are file workers,
+     * capped at one per large file. */
+    backup_result_t a = backup(16);
+    assert_int_equal(a.store_workers, 16);
+
+    int64_t rid2 = 0;
+    store_t *st2 = NULL;
+    store_index_t *idx2 = NULL;
+    assert_int_equal(repo_register(db, TEST_DIR "/serial", "serial", &rid2), OK);
+    assert_int_equal(repo_store_open(TEST_DIR "/serial", NULL, &st2), OK);
+    assert_int_equal(store_index_bind(st2, db, rid2, &idx2), OK);
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.store_workers = 1;
+    backup_result_t b;
+    memset(&b, 0, sizeof(b));
+    assert_int_equal(backup_run(st2, db, rid2, &o, &b), OK);
+
+    pack_census_t ca, cb;
+    size_t dup_a = 0, dup_b = 0;
+    census(store, &ca, &dup_a);
+    census(st2, &cb, &dup_b);
+    printf("parallel: %llu objects new, %llu entries, %llu payload bytes, %zu names "
+           "stored twice; serial: %llu, %llu, %llu, %zu\n",
+           (unsigned long long)a.objects_new, (unsigned long long)ca.entries,
+           (unsigned long long)ca.payload, dup_a,
+           (unsigned long long)b.objects_new, (unsigned long long)cb.entries,
+           (unsigned long long)cb.payload, dup_b);
+    assert_int_equal(dup_b, 0);
+    assert_int_equal(dup_a, 0);
+    assert_int_equal(a.objects_new, b.objects_new);
+    assert_int_equal(a.bytes_stored, b.bytes_stored);
+    assert_int_equal(ca.entries, cb.entries);
+    assert_int_equal(ca.payload, cb.payload);
+
+    char *ra = NULL, *rb = NULL;
+    {
+        char repo[2][32];
+        snprintf(repo[0], 32, "%lld", (long long)repo_id);
+        snprintf(repo[1], 32, "%lld", (long long)rid2);
+        for (int k = 0; k < 2; k++) {
+            db_result_t *r = NULL;
+            assert_int_equal(db_execute(db, "SELECT hash, type, orig_size, phys_size"
+                                        " FROM objects WHERE repo_id = ? AND type != 5"
+                                        " ORDER BY hash",
+                                        (const char *[]){ repo[k], NULL }, &r), 0);
+            size_t cap = (size_t)r->nrows * 120 + 1, off = 0;
+            char *out = malloc(cap);
+            out[0] = '\0';
+            for (int i = 0; i < r->nrows; i++)
+                off += (size_t)snprintf(out + off, cap - off, "%s %s %s %s\n",
+                                        r->rows[i][0], r->rows[i][1],
+                                        r->rows[i][2], r->rows[i][3]);
+            db_result_free(r);
+            if (k == 0) ra = out; else rb = out;
+        }
+    }
+    assert_string_equal(ra, rb);
+    free(ra);
+    free(rb);
+
+    store_index_free(idx2);
+    store_close(st2);
+    restore_and_diff(a.snapshot_id);
+}
+
+/*
+ * OWN-22: gc reclaims a duplicate copy of an object - the same name in two
+ * pack entries - keeping the one the index names, once that one has been
+ * read and confirmed. A copy is planted by writing the object's stored
+ * bytes into a second pack, as a dedup race used to.
+ */
+static uint64_t packs_bytes(void)
+{
+    char cmd[600];
+    snprintf(cmd, sizeof(cmd), "find '%s/packs' -name 'pack-*.dat' -printf '%%s\\n'"
+             " | awk '{s+=$1} END {print s+0}'", TEST_REPO);
+    FILE *f = popen(cmd, "r");
+    assert_non_null(f);
+    unsigned long long v = 0;
+    assert_int_equal(fscanf(f, "%llu", &v), 1);
+    pclose(f);
+    return (uint64_t)v;
+}
+
+/* The one object a 300 KiB file is stored as, and a second copy of it in a
+ * pack of its own. Returns the index's location for it after the plant. */
+static void plant_duplicate(uint8_t hash[OBJECT_HASH_SIZE], uint32_t *pnum, uint64_t *off)
+{
+    uint8_t *d = rand_buf(300 * 1024, 4610);
+    write_buf(TEST_SRC "/one.bin", d, 300 * 1024);
+    free(d);
+    backup_result_t r = backup(1);
+    (void)r;
+    db_result_t *q = NULL;
+    assert_int_equal(db_execute(db, "SELECT content_hash FROM nodes WHERE name = 'one.bin'",
+                                NULL, &q), 0);
+    assert_int_equal(q->nrows, 1);
+    for (int k = 0; k < OBJECT_HASH_SIZE; k++) {
+        unsigned v = 0;
+        assert_int_equal(sscanf(q->rows[0][0] + k * 2, "%2x", &v), 1);
+        hash[k] = (uint8_t)v;
+    }
+    db_result_free(q);
+
+    object_stored_info_t info;
+    void *payload = NULL;
+    size_t len = 0;
+    int damaged = 0;
+    assert_int_equal(object_read_stored(store, hash, &info, &payload, &len, &damaged), OK);
+    pack_stored_writer_t *w = NULL;
+    assert_int_equal(pack_stored_open(store, &w), OK);
+    assert_int_equal(pack_stored_add(w, hash, info.type, info.compression, info.encryption,
+                                     info.uncompressed_size, payload, len), OK);
+    assert_int_equal(pack_stored_finish(w, NULL), OK);
+    free(payload);
+
+    size_t dup = 0;
+    pack_census_t c;
+    census(store, &c, &dup);
+    assert_int_equal(dup, 1);
+    assert_int_equal(pack_resolve_location(store, hash, pnum, off), OK);
+}
+
+static void test_gc_reclaims_a_duplicate_copy(void **state)
+{
+    (void)state;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    plant_duplicate(hash, &pnum, &off);
+    uint64_t before = packs_bytes();
+
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_int_equal(g.swept, 0);
+
+    size_t dup = 0;
+    pack_census_t c;
+    census(store, &c, &dup);
+    assert_int_equal(dup, 0);
+    uint64_t after = packs_bytes();
+    printf("duplicate reclaimed: packs %llu -> %llu bytes\n",
+           (unsigned long long)before, (unsigned long long)after);
+    assert_true(after + 300 * 1024 / 2 < before);
+    uint32_t p2 = 0;
+    uint64_t o2 = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+
+    verify_result_t v;
+    memset(&v, 0, sizeof(v));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &v), OK);
+    assert_int_equal(v.ok, v.checked);
+    db_result_t *q = NULL;
+    assert_int_equal(db_execute(db, "SELECT MAX(id) FROM snapshots", NULL, &q), 0);
+    int64_t snap = strtoll(q->rows[0][0], NULL, 10);
+    db_result_free(q);
+    restore_and_diff(snap);
+}
+
+static int64_t latest_snapshot(void)
+{
+    db_result_t *q = NULL;
+    assert_int_equal(db_execute(db, "SELECT MAX(id) FROM snapshots", NULL, &q), 0);
+    int64_t snap = strtoll(q->rows[0][0], NULL, 10);
+    db_result_free(q);
+    return snap;
+}
+
+/* Overwrite n bytes at off in pack pnum with a fixed fill. */
+static void ruin(uint32_t pnum, uint64_t off, size_t n)
+{
+    char path[600];
+    assert_int_equal(pack_dat_path_resolve(path, sizeof(path), TEST_REPO, pnum), 0);
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    uint8_t *junk = malloc(n);
+    assert_non_null(junk);
+    memset(junk, 0xA5, n);
+    assert_int_equal(pwrite(fd, junk, n, (off_t)off), (ssize_t)n);
+    free(junk);
+    close(fd);
+    pack_cache_invalidate(store);
+}
+
+/*
+ * The copy the index names is no longer that object - its header's name is
+ * ruined - so gc must keep the other copy rather than drop the only good
+ * one, and having proven it (header, name, payload against the name) moves
+ * the index to it. The ruined entry, which no name claims now, goes with
+ * its pack, and the restore needs nothing of it.
+ */
+static void test_gc_moves_the_index_off_a_ruined_header(void **state)
+{
+    (void)state;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    plant_duplicate(hash, &pnum, &off);
+    ruin(pnum, off + offsetof(pack_dat_entry_hdr_t, hash), OBJECT_HASH_SIZE);
+
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+
+    uint32_t p2 = 0;
+    uint64_t o2 = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+    assert_true(p2 != pnum);
+    size_t dup = 0;
+    pack_census_t c;
+    census(store, &c, &dup);
+    assert_int_equal(dup, 0);
+    char path[600];
+    struct stat sb;
+    assert_int_equal(pack_dat_path_resolve(path, sizeof(path), TEST_REPO, pnum), 0);
+    assert_int_not_equal(stat(path, &sb), 0);    /* it held only that copy */
+    restore_and_diff(latest_snapshot());
+}
+
+/*
+ * The named copy's header is sound but its payload is damaged past its
+ * parity. Confirmation reads the payload against its CRC, so it fails, and
+ * the good copy is not dropped as a duplicate of a bad one: it is proven
+ * and indexed, the restore reads it, and the next gc - finding the damaged
+ * copy unnamed and the named one confirmed - drops the damaged one.
+ */
+static void test_gc_moves_the_index_off_a_damaged_payload(void **state)
+{
+    (void)state;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    plant_duplicate(hash, &pnum, &off);
+    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    uint32_t p2 = 0;
+    uint64_t o2 = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+    assert_true(p2 != pnum);
+    restore_and_diff(latest_snapshot());
+
+    uint64_t before = packs_bytes();
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    size_t dup = 0;
+    pack_census_t c;
+    census(store, &c, &dup);
+    assert_int_equal(dup, 0);
+    assert_true(packs_bytes() < before);
+    verify_result_t v;
+    memset(&v, 0, sizeof(v));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &v), OK);
+    assert_int_equal(v.ok, v.checked);
+    restore_and_diff(latest_snapshot());
+}
+
+/*
  * Small files on workers (small_files.h): a fresh backup of a tree of many
  * small files gives the same snapshot, the same objects with the same rows,
  * the same counters and a cache row per file whether one thread stores them
@@ -1070,6 +1410,10 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_workers_do_not_change_the_snapshot, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_workers_do_not_store_twins_twice, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_reclaims_a_duplicate_copy, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_moves_the_index_off_a_ruined_header, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_moves_the_index_off_a_damaged_payload, setup, teardown),
         cmocka_unit_test_setup_teardown(test_small_files_on_workers_match_serial, setup, teardown),
         cmocka_unit_test_setup_teardown(test_append_and_edit_write_little, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_keeps_chunks_of_live_lists, setup, teardown),
