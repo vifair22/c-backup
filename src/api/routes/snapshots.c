@@ -5,6 +5,7 @@
 
 #include "job_manager.h"
 #include "lock.h"
+#include "privs.h"
 #include "gc.h"
 #include "replicate.h"
 #include "gfs.h"
@@ -1401,7 +1402,11 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         o.bytes_cb     = job_progress_bytes;
         restore_result_t rr;
         memset(&rr, 0, sizeof(rr));
-        st = restore_run(store, j->db, j->repo_id, j->snap_id, j->dest, &o, &rr);
+        /* Owners, modes and device nodes need the restore capabilities,
+         * raised on this thread only and dropped again (privs.h). */
+        st = privs_restore_raise();
+        if (st == OK) st = restore_run(store, j->db, j->repo_id, j->snap_id, j->dest, &o, &rr);
+        privs_restore_drop();
         /* What was restored, on the job: the counts the Manual promises and
          * the log had, where the job showed only the snapshot's entry count.
          * Recorded on failure too, since that is when "failed" matters. */

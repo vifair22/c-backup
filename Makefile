@@ -78,7 +78,7 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
 SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/scheduler -I src/common \
-                -I src/providers -I src/units \
+                -I src/providers -I src/units -I src/helper \
                 -I src/config -I src/daemon -I $(CUTILS_DIR)/include \
                 -I $(CUTILS_DIR)/lib/cJSON
 COMMON_CFLAGS := -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
@@ -126,7 +126,10 @@ endif
 
 DAEMON_TARGET := $(BINS)/c-backupd$(BIN_SUFFIX)
 CLI_TARGET    := $(BINS)/c-backup$(BIN_SUFFIX)
-TARGETS       := $(DAEMON_TARGET) $(CLI_TARGET)
+# The host helper (docs/source-providers.md 11): a separate privileged
+# sidecar, built from the same objects with its own main.
+HELPER_TARGET := $(BINS)/c-backup-helper$(BIN_SUFFIX)
+TARGETS       := $(DAEMON_TARGET) $(CLI_TARGET) $(HELPER_TARGET)
 
 # ---- Sources and objects ----------------------------------------------
 # Sources live under src/{cli,ops,store,api,common}.  Object files are
@@ -137,8 +140,9 @@ TARGETS       := $(DAEMON_TARGET) $(CLI_TARGET)
 # with distinct object names rather than going through the pattern rule.
 DAEMON_MAIN := $(SRC)/daemon/main.c
 CLI_MAIN    := $(SRC)/cli/main.c
+HELPER_MAIN := $(SRC)/helper/helper_main.c
 ALL_SRCS    := $(shell find $(SRC) -name '*.c')
-SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN), $(ALL_SRCS))
+SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN) $(HELPER_MAIN), $(ALL_SRCS))
 SRC_DIRS    := $(sort $(dir $(ALL_SRCS)))
 VPATH       := $(SRC_DIRS)
 # cJSON is not compiled here. c-utils carries it and libc-utils.a holds its
@@ -159,7 +163,8 @@ endif
 
 DAEMON_OBJ  := $(OBJ_DIR)/daemon_main.o
 CLI_OBJ     := $(OBJ_DIR)/cli_main.o
-OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ)
+HELPER_OBJ  := $(OBJ_DIR)/helper_main.o
+OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ) $(HELPER_OBJ)
 
 # Generated code (the embedded migrations): match the optimisation level but
 # drop the strict warnings, since nobody edits it by hand.
@@ -239,6 +244,9 @@ $(DAEMON_TARGET): $(LIB_OBJS) $(DAEMON_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
 $(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
 	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
 
+$(HELPER_TARGET): $(LIB_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
+	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
+
 # ---- Tests (link against release lib objects) -------------------------
 REL_OBJ_DIR := $(BUILD)/release
 REL_LIB_OBJS = $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
@@ -294,6 +302,7 @@ test-cli: all
 .PHONY: test-units
 test-units: all
 	@$(SCRATCH_GUARD) test_units_e2e.sh ./$(TESTS)/test_units_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
+	@$(SCRATCH_GUARD) test_helper_e2e.sh ./$(TESTS)/test_helper_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/c-backup-helper
 
 # The shell suites each start a daemon and poll jobs on a wall-clock budget,
 # so anything running beside them under -j competes for CPU and disk and makes

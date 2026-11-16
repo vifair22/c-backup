@@ -24,7 +24,9 @@
 
 #include "db_txn.h"
 #include "job_manager.h"
+#include "privs.h"
 #include "registry.h"
+#include "remote_provider.h"
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
@@ -149,6 +151,18 @@ static api_response_t providers_list(void)
         cJSON_AddStringToObject(root, "daemon_id", units_daemon8());
         cJSON_AddStringToObject(root, "allow", units_config()->allow ? units_config()->allow : "");
         cJSON_AddNumberToObject(root, "holds_open", (double)units_intents_open(g_db, NULL));
+        /* The helper, as its hello said (source-providers.md 11.2). */
+        const remote_hello_t *h = remote_last_hello();
+        if (h->version > 0) {
+            cJSON *ho = cJSON_AddObjectToObject(root, "helper");
+            if (ho) {
+                cJSON_AddNumberToObject(ho, "version", h->version);
+                cJSON_AddStringToObject(ho, "daemon_id", h->daemon_id);
+                cJSON_AddStringToObject(ho, "policy", h->policy);
+                cJSON_AddStringToObject(ho, "providers", h->providers);
+            }
+        }
+        cJSON_AddBoolToObject(root, "privileges_dropped", privs_dropped());
     }
     return json_out(root);
 }
@@ -874,6 +888,9 @@ static status_t urestore_run(void *arg, atomic_int *cancel,
     o.progress_ctx = progress_ctx;
     o.bytes_cb = job_progress_bytes;
     char rj[512];
+    /* The restore capabilities on this thread, for as long as it writes. */
+    st = privs_restore_raise();
+    if (st != OK) { store_index_free(idx); store_close(store); return st; }
     if (j->item) {
         unit_restore_item_result_t ir;
         st = unit_restore_item(store, j->db, j->repo_id, j->snap_id, j->item, j->dest, &o, &ir);
@@ -887,6 +904,7 @@ static status_t urestore_run(void *arg, atomic_int *cancel,
                  (unsigned long long)rr.dirs, (unsigned long long)rr.bytes,
                  (unsigned long long)rr.failed);
     }
+    privs_restore_drop();
     job_set_result(progress_ctx, rj);
     store_index_free(idx);
     store_close(store);

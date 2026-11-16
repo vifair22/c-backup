@@ -58,6 +58,16 @@ static const config_key_t app_file_keys[] = {
       "Directory holding per-repository encryption keys (0600, root-owned)",
       CFG_STORE_FILE, 0 },
 
+    /*
+     * Drop to this uid (and the same gid) at start, keeping only
+     * CAP_DAC_READ_SEARCH effective and the five restore capabilities
+     * permitted (src/common/privs.h). 0 keeps today's behaviour; the image
+     * for workload backup sets 990.
+     */
+    { "security.run_as_uid", CFG_INT, "0",
+      "Non-root uid (and gid) to run as after start; 0 does not drop",
+      CFG_STORE_FILE, 0 },
+
     { "log.level",   CFG_STRING, "info",
       "Minimum log level: debug, info, warn, error",
       CFG_STORE_FILE, 0 },
@@ -154,6 +164,12 @@ static const config_key_t app_file_keys[] = {
      */
     { "units.allow", CFG_STRING, "",
       "Comma-separated globs of unit names the daemon may touch at all; empty allows all",
+      CFG_STORE_FILE, 0 },
+    /* The host helper's socket (docs/source-providers.md 11). Set, every
+     * provider the helper offers is used through it and the daemon holds
+     * no socket, device or capability of its own for units. */
+    { "units.helper_socket", CFG_STRING, "",
+      "Path of c-backup-helper's socket; empty runs providers in-process",
       CFG_STORE_FILE, 0 },
     { "units.unit_wait_s", CFG_INT, "3600",
       "Seconds a job waits for a unit another job is backing up (1 to 86400)",

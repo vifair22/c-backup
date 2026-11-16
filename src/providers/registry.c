@@ -43,6 +43,19 @@ status_t sp_registry_enable(const sp_provider_ops_t *ops, const sp_config_t *cfg
     return OK;
 }
 
+status_t sp_registry_add(const sp_provider_ops_t *ops, sp_ctx_t *ctx)
+{
+    if (!ops || !ops->name || ops->abi != SP_ABI_VERSION)
+        return set_error(ERR_INVALID, "provider: bad ops");
+    if (sp_registry_enabled(ops->name))
+        return set_error(ERR_INVALID, "provider %s is already enabled", ops->name);
+    if (g_n >= REG_MAX) return set_error(ERR_INVALID, "too many providers");
+    g_enabled[g_n].ops = ops;
+    g_enabled[g_n].ctx = ctx;
+    g_n++;
+    return OK;
+}
+
 status_t sp_registry_get(const char *name, const sp_provider_ops_t **ops,
                          sp_ctx_t **ctx)
 {
