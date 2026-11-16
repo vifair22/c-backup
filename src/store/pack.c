@@ -3775,6 +3775,15 @@ static void pack_resume_deleting(store_t *store) {
                      packs_dir, de->d_name) >= (int)sizeof(marker_path))
             continue;
 
+        /* A marker is written only after the index commits it depends on
+         * were made durable, but one left by an older build may not be:
+         * make sure before replaying it (B142). */
+        if (store_emit_index_sync(store) != OK) {
+            log_warn("pack: cannot make the index durable; %s left for later: %s",
+                     de->d_name, err_msg());
+            err_clear();
+            continue;
+        }
         FILE *mf = fopen(marker_path, "r");
         if (!mf) continue;
 
@@ -3783,12 +3792,16 @@ static void pack_resume_deleting(store_t *store) {
             char dat_path[PATH_MAX];
 
             if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
-                                      store_root(store), pnum) == 0)
+                                      store_root(store), pnum) == 0) {
                 unlink(dat_path);
+                char *slash = strrchr(dat_path, '/');
+                if (slash) { *slash = '\0'; (void)fsync_dir_path(dat_path); }
+            }
             store_emit_pack_removed(store, pnum);
         }
         fclose(mf);
         unlink(marker_path);
+        (void)fsync_dir_path(packs_dir);
     }
     closedir(dir);
 
@@ -4206,7 +4219,19 @@ static status_t pack_rw_replace(pack_rw_t *rw, const uint32_t *old_nums, size_t 
         return st;
     }
 
-    /* ---- 4. remove the old packs ---- */
+    /* ---- 4. remove the old packs ----
+     *
+     * Only once the index commits that moved their contents are durable
+     * (B142). The database runs synchronous=NORMAL, so on return from the
+     * commit callback those rows are in the WAL and nowhere safer; the old
+     * packs' unlinks, by contrast, are made durable by the directory sync
+     * below. A power cut between the two used to keep the unlinks and lose
+     * the rows: the index came back naming the old packs, which were gone,
+     * and every live object they held was missing. If the index cannot be
+     * made durable now, the old packs stay; the next gc finds the
+     * duplicates and drops them. */
+    st = store_emit_index_sync(store);
+    if (st != OK) return st;
     char marker[PATH_MAX];
     st = write_deleting_marker(store, base, old_nums, n_old, marker, sizeof(marker));
     if (st != OK) return st;
@@ -4219,7 +4244,18 @@ static status_t pack_rw_replace(pack_rw_t *rw, const uint32_t *old_nums, size_t 
     unlink(marker);
     {
         /* Not needed for safety - a resurrected old pack holds duplicates -
-         * but it keeps a power cut from bringing back what was freed. */
+         * but it keeps a power cut from bringing back what was freed. The
+         * unlinks are in the shard directories; the marker in packs/. */
+        uint32_t synced_shard = UINT32_MAX;
+        for (size_t i = 0; i < n_old; i++) {
+            uint32_t shard = PACK_SHARD_OF(old_nums[i]);
+            if (shard == synced_shard) continue;
+            char sd[PATH_MAX];
+            if (path_fmt(sd, sizeof(sd), "%s/packs/" PACK_SHARD_FMT, store_root(store),
+                         shard) == 0)
+                (void)fsync_dir_path(sd);
+            synced_shard = shard;
+        }
         char dir[PATH_MAX];
         if (path_fmt(dir, sizeof(dir), "%s/packs", store_root(store)) == 0)
             (void)fsync_dir_path(dir);
@@ -5021,8 +5057,26 @@ status_t pack_gc_stats_loc(store_t *store,
         }
 
         if (n_dead == count) {
-            /* Every entry is dead — delete the whole pack */
+            /* Every entry is dead - delete the whole pack, once the commit
+             * that declared them dead (gc's sweep, and any repoint) is
+             * durable: rolled back, it would bring back rows naming this
+             * pack (B142). If it cannot be made durable, the pack stays. */
+            if (store_emit_index_sync(store) != OK) {
+                log_warn("pack_gc: cannot make the index durable; pack %u left in place: %s",
+                         pnum, err_msg());
+                err_clear();
+                total_kept += count;
+                free(live_marks);
+                free(disk_idx);
+                continue;
+            }
             unlink(dat_path);
+            {
+                char sd[PATH_MAX];
+                if (path_fmt(sd, sizeof(sd), "%s/packs/" PACK_SHARD_FMT, store_root(store),
+                             PACK_SHARD_OF(pnum)) == 0)
+                    (void)fsync_dir_path(sd);
+            }
             store_emit_pack_removed(store, pnum);
             total_deleted += count;
             stats->packs_deleted++;

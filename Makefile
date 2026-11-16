@@ -259,7 +259,7 @@ FAULT_BINS  := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(FAULT_SRCS))
 FAULT_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
               -Wl,--wrap=fread,--wrap=fwrite,--wrap=fseeko,--wrap=fsync,--wrap=fdatasync \
               -Wl,--wrap=sync_file_range,--wrap=mkstemp,--wrap=rename,--wrap=read,--wrap=pread \
-              -Wl,--wrap=pwrite,--wrap=syscall
+              -Wl,--wrap=pwrite,--wrap=unlink,--wrap=syscall
 
 # Ensure release objects exist before linking tests
 $(TEST_DIR_STAMP): FORCE
