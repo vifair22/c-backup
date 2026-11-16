@@ -155,6 +155,8 @@ refuses "bind not an address" "bad.yaml:6: error: http.bind: 'not-an-ip' is not 
     '  bind: not-an-ip'
 refuses "file cache mode" "backup.file_cache_match: 'fast' is not one of auto, strict, relaxed" \
     'backup:' '  file_cache_match: fast'
+refuses "unsettled policy" "backup.unsettled: 'maybe' is not one of store, skip" \
+    'backup:' '  unsettled: maybe'
 refuses "store workers out of range" "backup.store_workers: '65' is not between 0 and 64" \
     'backup:' '  store_workers: 65'
 refuses "tab indentation" "bad.yaml:6: error: tab in the indentation" \
@@ -185,6 +187,19 @@ for kind in crlf bom; do
         *) ok "$kind config: no errors" ;;
     esac
     rm -f "$WORK/bad.db" "$WORK/bad.db-wal" "$WORK/bad.db-shm" "$WORK/bad.sock" "$WORK/$kind.log"
+done
+# OWN-45-LIVE: the daemon applies backup.unsettled, store by default and
+# skip when set; test_settle_fault shows each value's behaviour through the
+# same parser.
+for pol in default skip; do
+    body=$(printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: 0\nlog:\n  level: info\n' "$WORK" "$WORK")
+    [ "$pol" = skip ] && body=$(printf '%s\nbackup:\n  unsettled: skip\n' "$body")
+    printf '%s\n' "$body" > "$WORK/bad.yaml"
+    chmod 600 "$WORK/bad.yaml"
+    C_BACKUP_CONFIG_PATH="$WORK/bad.yaml" timeout 3 "$BIN" > "$WORK/pol.log" 2>&1
+    want=$([ "$pol" = skip ] && echo skip || echo store)
+    contains "backup.unsettled $pol is applied as $want" "backup.unsettled: $want" "$(cat "$WORK/pol.log")"
+    rm -f "$WORK/bad.db" "$WORK/bad.db-wal" "$WORK/bad.db-shm" "$WORK/bad.sock" "$WORK/pol.log"
 done
 # An environment override has no line, so it is named instead.
 printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: 0\n' \
@@ -411,10 +426,11 @@ check "bytes written is pack plus parity" "${BW:-none}" "$(( ${BWP:-0} + ${BWPP:
 RESULT_KEYS=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"result":{\([^}]*\)}.*/\1/p' \
               | grep -o '"[a-z_]*":' | tr -d '":' | tr '\n' ' ')
 check "the backup result carries exactly its keys" \
-    "snapshot_id files dirs files_unchanged bytes_logical objects_new bytes_stored trees_new trees_reused store_workers bytes_written bytes_written_pack bytes_written_pack_parity files_skipped skipped skipped_listed files_changed changed changed_listed " \
+    "snapshot_id files dirs files_unchanged bytes_logical objects_new bytes_stored trees_new trees_reused store_workers bytes_written bytes_written_pack bytes_written_pack_parity files_skipped skipped skipped_listed files_changed changed changed_listed changed_unsettled unsettled unsettled_listed " \
     "$RESULT_KEYS"
 contains "and a clean backup left nothing out" '"files_skipped":0,"skipped":[],"skipped_listed":0,' "$JOB_BODY"
-contains "and saw nothing change under it" '"files_changed":0,"changed":[],"changed_listed":0}' "$JOB_BODY"
+contains "and saw nothing change under it" '"files_changed":0,"changed":[],"changed_listed":0,' "$JOB_BODY"
+contains "and kept nothing that never settled" '"changed_unsettled":0,"unsettled":[],"unsettled_listed":0}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -422,6 +438,8 @@ contains "the job list carries the same detail" '"elapsed_s":' "$(sock_body /job
 contains "snapshot listed" '"id":1,' "$(sock_body /repos/1/snapshots)"
 contains "tree lists root" '"name"' "$(sock_body '/repos/1/snapshots/1/tree?parent=0')"
 contains "search finds file" 'a.txt' "$(sock_body '/repos/1/search?q=txt')"
+contains "a search result says whether it may be torn" '"may_be_torn":false' \
+    "$(sock_body '/repos/1/search?q=txt')"
 
 echo "sources"
 # B078: anything the loop could not read was skipped, and the route replaces
@@ -1214,6 +1232,7 @@ contains "a tree mode is the st_mode"     '"type":2,"mode":1'      "$TREE"  # S_
 contains "mtime is whole seconds"         '"mtime":1'             "$TREE"
 contains "with the nanoseconds apart"     '"mtime_nsec":'         "$TREE"
 contains "has_children is a boolean"      '"has_children":true'   "$TREE"
+contains "may_be_torn is a boolean"       '"may_be_torn":false'   "$TREE"
 contains "a directory has a null hash"    '"hash":null'           "$TREE"
 contains "materialized is a boolean"      '"materialized":true'   "$(sock_body /repos/1/snapshots)"
 contains "the last snapshot time is a number" '"last_snapshot_ts":1' "$(sock_body /repos/1/summary)"

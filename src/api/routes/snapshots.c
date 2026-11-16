@@ -466,6 +466,9 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
             { "size", 4, JCOL_INT }, { "mtime", 5, JCOL_INT },
             { "mtime_nsec", 6, JCOL_INT }, { "hash", 7, JCOL_STR_NULL },
             { "has_children", 8, JCOL_BOOL },
+            /* Stored while still changing; the bytes may mix two versions
+             * of the file (OWN-45-LIVE). False for everything else. */
+            { "may_be_torn", 9, JCOL_BOOL },
         };
         int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
@@ -788,7 +791,8 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
                || json_elem_add_str(&e, "path",    paths[hits[k].row] ? paths[hits[k].row] : "") != 0
                || jrow_elem_add(&e, "type", JCOL_INT, row[3]) != 0
                || jrow_elem_add(&e, "size", JCOL_INT, row[4]) != 0
-               || jrow_elem_add(&e, "hash", JCOL_STR_NULL, row[5]) != 0;
+               || jrow_elem_add(&e, "hash", JCOL_STR_NULL, row[5]) != 0
+               || jrow_elem_add(&e, "may_be_torn", JCOL_BOOL, row[6]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -1259,12 +1263,14 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         char rid[32];
         if (vr.run_id > 0) snprintf(rid, sizeof(rid), "%lld", (long long)vr.run_id);
         else               snprintf(rid, sizeof(rid), "null");
-        char vj[160];
+        char vj[224];
         snprintf(vj, sizeof(vj),
-                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s}",
+                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s,"
+                 "\"unsettled_files\":%llu}",
                  rid, lvl,
                  j->verify_repair ? "true" : "false",
-                 j->dry_run ? "true" : "false");
+                 j->dry_run ? "true" : "false",
+                 (unsigned long long)vr.unsettled_files);
         job_set_result(progress_ctx, vj);
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*

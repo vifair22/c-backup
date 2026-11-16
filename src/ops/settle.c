@@ -7,7 +7,15 @@
 #include <stdio.h>
 #include <string.h>
 
-static atomic_int g_policy = SETTLE_UNSETTLED_SKIP;
+static atomic_int g_policy = SETTLE_UNSETTLED_STORE_FLAGGED;
+
+int settle_unsettled_parse(const char *s)
+{
+    if (!s) return -1;
+    if (strcmp(s, "store") == 0) return SETTLE_UNSETTLED_STORE_FLAGGED;
+    if (strcmp(s, "skip") == 0)  return SETTLE_UNSETTLED_SKIP;
+    return -1;
+}
 
 void settle_set_unsettled_policy(settle_unsettled_policy_t p)
 {

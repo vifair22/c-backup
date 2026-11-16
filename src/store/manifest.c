@@ -30,11 +30,12 @@
  * breaking - see the note on manifest_serialise.
  */
 #define MANIFEST_TREE_MAGIC   0x52544243u   /* "CBTR" little-endian */
-#define MANIFEST_TREE_VERSION 2u
+/* 3: a flags byte ends each entry's fixed part (MANIFEST_FLAG_*). */
+#define MANIFEST_TREE_VERSION 3u
 
 /* Fixed-width part of one entry. */
 #define MANIFEST_FIXED (2u + 2u + 1u + 4u + 4u + 4u + 8u + 8u + 8u + 8u \
-                        + 4u + 4u + 3u * OBJECT_HASH_SIZE)
+                        + 4u + 4u + 3u * OBJECT_HASH_SIZE + 1u)
 
 typedef struct {
     uint8_t *buf;
@@ -206,6 +207,7 @@ static void serialise_run(sbuf_t *b, const manifest_entry_t *entries,
         put_bytes(b, e->target_hash, OBJECT_HASH_SIZE);
         put_bytes(b, e->xattr_hash,  OBJECT_HASH_SIZE);
         put_bytes(b, e->acl_hash,    OBJECT_HASH_SIZE);
+        put_u8 (b, e->flags);
         if (e->name_len) put_bytes(b, e->name, e->name_len);
         if (e->link_target_len) put_bytes(b, e->link_target, e->link_target_len);
     }
@@ -224,7 +226,7 @@ static void serialise_run(sbuf_t *b, const manifest_entry_t *entries,
 static status_t refuse_contentless(const manifest_entry_t *entries, uint32_t count)
 {
     static const uint8_t zero[OBJECT_HASH_SIZE] = { 0 };
-    for (uint32_t i = 0; i < count; i++)
+    for (uint32_t i = 0; i < count; i++) {
         if (entries[i].type == NODE_TYPE_REG &&
             memcmp(entries[i].target_hash, zero, OBJECT_HASH_SIZE) == 0)
             return set_error(ERR_INVALID,
@@ -232,6 +234,16 @@ static status_t refuse_contentless(const manifest_entry_t *entries, uint32_t cou
                              "refusing to write a tree that cannot be restored",
                              (int)entries[i].name_len,
                              entries[i].name ? entries[i].name : "");
+        /* What manifest_parse would refuse is never written. */
+        if ((entries[i].flags & ~MANIFEST_FLAGS_KNOWN) != 0 ||
+            (entries[i].flags && entries[i].type != NODE_TYPE_REG))
+            return set_error(ERR_INVALID,
+                             "manifest: entry '%.*s' carries flags 0x%02x its "
+                             "type %u cannot have",
+                             (int)entries[i].name_len,
+                             entries[i].name ? entries[i].name : "",
+                             entries[i].flags, entries[i].type);
+    }
     return OK;
 }
 
@@ -436,6 +448,15 @@ status_t manifest_parse(const void *buf, size_t len,
         memcpy(e->target_hash, p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;
         memcpy(e->xattr_hash,  p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;
         memcpy(e->acl_hash,    p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;
+        e->flags           = p[off];          off += 1;
+        /* Canonical form: no bit this build does not know, and none on
+         * anything but a regular file, so one entry has one encoding. */
+        if ((e->flags & ~MANIFEST_FLAGS_KNOWN) != 0 ||
+            (e->flags && e->type != NODE_TYPE_REG)) {
+            manifest_free_entries(out, count);
+            return set_error(ERR_CORRUPT, "manifest_parse: entry flags 0x%02x "
+                             "on type %u are not valid", e->flags, e->type);
+        }
 
         /* Both lengths are 16-bit and off is size_t, so this cannot wrap. */
         if (off + e->name_len + e->link_target_len > len) goto corrupt;

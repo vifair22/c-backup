@@ -30,6 +30,7 @@
 #include "app_config.h"
 #include "auth.h"
 #include "file_cache.h"
+#include "settle.h"
 #include "job_manager.h"
 #include "lock.h"
 #include "repo_purge.h"
@@ -293,6 +294,14 @@ int main(int argc, char *argv[])
             log_info("backup.store_workers: %d", sw);
         if (mode != FILE_CACHE_MATCH_AUTO)
             log_info("backup.file_cache_match: %s", m);
+
+        /* Refused at config init unless store or skip; every store path
+         * reads it through settle_store_fd. */
+        const char *u = config_get_str(cfg, "backup.unsettled");
+        int up = settle_unsettled_parse(u);
+        settle_set_unsettled_policy(up < 0 ? SETTLE_UNSETTLED_STORE_FLAGGED
+                                           : (settle_unsettled_policy_t)up);
+        log_info("backup.unsettled: %s", up == SETTLE_UNSETTLED_SKIP ? "skip" : "store");
     }
     routes_repos_set_key_dir(config_get_str(cfg, "security.key_dir"));
     routes_snapshots_init(db, jm);

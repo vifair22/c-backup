@@ -290,6 +290,7 @@ static status_t build_one_tree(const scan_result_t *scan, const tree_build_ops_t
         m->mtime_sec      = e->node.mtime_sec;
         m->mtime_nsec     = e->node.mtime_nsec;
         m->inode_identity = e->node.inode_identity;
+        m->flags          = e->node.type == NODE_TYPE_REG ? e->node.flags : 0;
         /* node_t overlays device and symlink in a union, so this is only a
          * device pair for the two types that have one. Copying it
          * unconditionally would write a symlink's target_len into dev_major

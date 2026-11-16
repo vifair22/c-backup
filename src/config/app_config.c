@@ -54,6 +54,8 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
 
     static const char *const modes[] = { "auto", "strict", "relaxed", NULL };
     config_check_one_of(chk, "backup.file_cache_match", modes);
+    static const char *const unsettled[] = { "store", "skip", NULL };
+    config_check_one_of(chk, "backup.unsettled", unsettled);
 
     /* An empty bind is the documented loopback default, which the listener
      * applies itself. Anything else has to be what the listener parses: an

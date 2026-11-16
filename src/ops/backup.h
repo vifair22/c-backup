@@ -117,6 +117,16 @@ typedef struct {
     uint64_t       files_changed;
     char         **changed;
     uint32_t       changed_listed;
+    /*
+     * Regular files still changing on the second read and stored as that
+     * read found them (OWN-45-LIVE, the default policy): flagged in their
+     * tree entry as possibly torn, since the bytes may mix two versions.
+     * Not counted in files_changed. The first BACKUP_SKIPPED_LIST_MAX
+     * paths, heap-owned; backup_result_free releases them.
+     */
+    uint64_t       changed_unsettled;
+    char         **unsettled;
+    uint32_t       unsettled_listed;
 } backup_result_t;
 
 /*

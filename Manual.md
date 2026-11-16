@@ -369,6 +369,7 @@ are different: they live in the database and change through the policy API
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories. 1 to 256 |
 | `jobs.read_budget_mb` | `256` | MiB of object buffers every job together may hold while reading. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, so this caps that memory whatever runs at once. 16 to 1048576; under 16 stops the daemon at start, since an object that size could never be read |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
+| `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
 | `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. Files of 1 MiB or less are read and prepared, many to a batch, on up to four of them. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
 | `retention.keep_daily` | `7` | Daily snapshots kept |
@@ -784,8 +785,9 @@ continues. Skipped means left out: the file is not in the snapshot's trees
 or its index, so the snapshot never lists a file it cannot restore. That
 covers a file that vanished between the scan and the read, one the daemon
 may not open, one replaced by a directory or anything else that is not a
-regular file, one whose read fails partway (an I/O error), and one still
-changing on a second read (below). A file replaced by a symlink is left
+regular file, one whose read fails partway (an I/O error), and, with
+`backup.unsettled: skip`, one still changing on a second read (below). A
+file replaced by a symlink is left
 out too, and the link is never followed: every store path opens with
 `O_NOFOLLOW` and checks the open file is the inode the scan saw, so a
 symlink to `/etc/shadow` swapped in mid-backup cannot put the shadow file
@@ -816,26 +818,63 @@ start and end of the read:
   `info`, and counted;
 - changed during the read: read once more from the start. If the second
   read is steady, that version is stored, logged at `warning`, and counted;
-- changed during the second read too: left out, as a skipped file with the
-  reason `changed while it was being read, and again on a second read`.
+- changed during the second read too: the file never settled. What happens
+  then is `backup.unsettled` (below): by default it is stored as the second
+  read found it and flagged as possibly torn.
 
-The rule is rsync's rather than tar's. tar keeps what it read and warns
-"file changed as we read it"; but bytes read across a change are a mix of
-two versions, a file that never existed, and restoring it is as wrong as
-padding. A file read whole between two identical looks is one real version
-of it. The job `result` counts the stored ones in `files_changed` and lists
-the first 100 in `changed`; the snapshot holds those files as they were a
-moment after the scan, not at it. A file that is always being written (a
-live database, a busy log) may be skipped on every run: back it up from a
-snapshot of its filesystem, or with its application's own dump.
+A file read whole between two identical looks is one real version of it.
+The job `result` counts those in `files_changed` and lists the first 100
+in `changed`; the snapshot holds them as they were a moment after the
+scan, not at it.
 
-Every store path applies this the same way: the backup thread, the chunk
-workers, the file workers that cut several large files at once, and the
-small-file workers. What happens to a file that is still changing on its
-second read is decided in one place (`settle_on_unsettled` in
-`src/ops/settle.c`); leaving it out is the default, and keeping the second
-read with the file flagged is the alternative, pending decision
-OWN-45-LIVE.
+**A file that never settles.** Bytes read while a file is being written
+can mix two versions of it: the first half from before a write and the
+second from after. That is not a file that ever existed, and for anything
+with internal structure (a database, a VM disk image, an archive being
+written) it may not open. `backup.unsettled` decides what to do:
+
+| Value | What happens |
+|---|---|
+| `store` (default) | The second read is stored and the file **flagged as possibly torn** in its tree entry. It is in the snapshot, every byte of it a byte the file held |
+| `skip` | The file is left out of the snapshot, as a skipped file with the reason `changed while it was being read, and again on a second read` |
+
+A flagged file is reported everywhere it can be met:
+
+- the backup logs a `WARN` line for it, counts it in the job `result` as
+  `changed_unsettled` with the first 100 in `unsettled` (each
+  `{"path"}`), journals `snapshot 12: 50 files, 1 stored while still
+  changing (may be torn); first: /data/db.sqlite`, and sends a warning
+  alert, the same way as for skipped files (section 16.3);
+- browse and search show `"may_be_torn": true` on its entry, in the API and
+  in `c-backup ls` and `c-backup search`;
+- restore restores it and logs `restore: <path> was still changing when it
+  was backed up; restored as stored, and it may not be internally
+  consistent` for each one;
+- verify reports it as a **notice**, a finding with status `notice: stored
+  while still changing; may not be internally consistent` and the count in
+  the job `result`'s `unsettled_files`. A notice never fails a verify.
+
+The flag is part of the snapshot, not the database, so it survives losing
+`state.db`: a reindex reads it back from the trees. A flagged file gets no
+file cache row, so the next backup reads it again rather than keeping the
+doubtful copy.
+
+**Live databases and VM disks need more than this.** A flagged copy is the
+bytes the file held, in no order that the program writing it promised. A
+database (SQLite, PostgreSQL, MySQL data directories), a mail store, or a
+running VM's disk image is consistent only at moments its program chooses,
+and a backup that reads it while it runs, flagged or not, may restore to
+something that will not open or that silently lost writes. Back these up
+from a consistent point instead: the application's own dump (`sqlite3
+.backup`, `pg_dump`, `mysqldump`) into a directory the backup covers, a
+filesystem snapshot (btrfs, ZFS, LVM) taken first and backed up from, or a
+VM snapshot. `backup.unsettled: skip` keeps such files out of snapshots
+rather than holding a copy that may not work; it does not make them
+consistent.
+
+Every store path applies all of this the same way: the backup thread, the
+chunk workers, the file workers that cut several large files at once, and
+the small-file workers (`src/ops/settle.c`).
 
 The next backup tries every skipped file again. Before 1.0.0's fix for
 B118 a skipped file stayed in the snapshot with no content: the backup
@@ -1800,6 +1839,14 @@ c-backup: backup of photos completed with a warning
 
 Repository photos (id 3) at /mnt/backup/photos
 Job 119 (backup) completed with a warning: 2 file(s) could not be read and are not in snapshot 41; first: /data/photos/locked.jpg: cannot open: Permission denied
+```
+
+A backup that kept a file which never settled while it was read (section
+6.3, `backup.unsettled: store`) warns the same way, and when it did both
+the two are joined in one alert:
+
+```
+Job 120 (backup) completed with a warning: 1 file(s) were still changing and are in snapshot 42 as read, flagged as possibly torn; first: /data/app/db.sqlite
 ```
 
 A clean backup sends nothing.

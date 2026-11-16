@@ -71,7 +71,7 @@ static void rmrf(const char *p)
 static int setup(void **state)
 {
     (void)state;
-    settle_set_unsettled_policy(SETTLE_UNSETTLED_SKIP);
+    settle_set_unsettled_policy(SETTLE_UNSETTLED_STORE_FLAGGED);
     rmrf(TEST_DIR);
     { int rc = system("mkdir -p '" TEST_DIR "'"); (void)rc; }
     if (db_open(&db, TEST_DB) != 0) return -1;
@@ -88,7 +88,7 @@ static int setup(void **state)
 static int teardown(void **state)
 {
     (void)state;
-    settle_set_unsettled_policy(SETTLE_UNSETTLED_SKIP);
+    settle_set_unsettled_policy(SETTLE_UNSETTLED_STORE_FLAGGED);
     store_index_free(idx); idx = NULL;
     store_close(store);    store = NULL;
     db_close(db);          db = NULL;
@@ -536,12 +536,12 @@ static void test_large_file_that_shrinks_mid_read_is_read_again(void **state)
     backup_result_free(&res);
 }
 
-/* The default policy: rsync's. A file still moving on its second read is
- * left out, through the B118 path. */
+/* backup.unsettled = skip: rsync's rule. A file still moving on its second
+ * read is left out, through the B118 path. */
 static void test_large_file_that_never_settles_is_left_out(void **state)
 {
     (void)state;
-    assert_int_equal(settle_unsettled_policy(), SETTLE_UNSETTLED_SKIP);
+    settle_set_unsettled_policy(SETTLE_UNSETTLED_SKIP);
     const char *path = TEST_DIR "/mid-busy.bin";
     backup_result_t res = run_mid_read(MID_KEEPS_GROWING, path, 1);
     assert_int_equal(res.files, 0);
@@ -555,20 +555,23 @@ static void test_large_file_that_never_settles_is_left_out(void **state)
     backup_result_free(&res);
 }
 
-/* The other setting of the OWN-45-LIVE switch: tar's. The second read is
- * stored and the file flagged. Every byte of it is a byte the file held:
- * this file is only ever appended to, so what was read is a prefix of what
- * is there now, at the size the second read started from. */
+/* The default, OWN-45-LIVE's option B: tar's rule with the doubt recorded.
+ * The second read is stored and the file flagged as possibly torn. Every
+ * byte of it is a byte the file held: this file is only ever appended to,
+ * so what was read is a prefix of what is there now, at the size the
+ * second read started from. test_settle_fault covers the flag itself on
+ * every path. */
 static void test_store_flagged_policy_keeps_the_second_read(void **state)
 {
     (void)state;
-    settle_set_unsettled_policy(SETTLE_UNSETTLED_STORE_FLAGGED);
+    assert_int_equal(settle_unsettled_policy(), SETTLE_UNSETTLED_STORE_FLAGGED);
     const char *path = TEST_DIR "/mid-busy.bin";
     backup_result_t res = run_mid_read(MID_KEEPS_GROWING, path, 1);
     assert_int_equal(res.files_skipped, 0);
     assert_int_equal(res.files, 1);
-    assert_int_equal(res.files_changed, 1);
-    assert_true(changed_has(&res, path));
+    assert_int_equal(res.files_changed, 0);
+    assert_int_equal(res.changed_unsettled, 1);
+    assert_string_equal(res.unsettled[0], path);
     int64_t n = node_size(res.snapshot_id, "mid-busy.bin");
     struct stat sb;
     assert_int_equal(stat(path, &sb), 0);

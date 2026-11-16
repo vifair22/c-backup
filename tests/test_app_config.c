@@ -63,11 +63,11 @@ static void test_edges_pass(void **state)
                           "auth:\n  cookie_secure: 1\n"
                           "scheduler:\n  enabled: 0\n"
                           "retention:\n  keep_snaps: 0\n  keep_yearly: 2147483647\n"
-                          "backup:\n  file_cache_match: relaxed\n"),
+                          "backup:\n  file_cache_match: relaxed\n  unsettled: skip\n"),
                      CUTILS_OK);
     assert_int_equal(load("http:\n  port: 65535\n  bind: \"\"\n"
                           "jobs:\n  max_parallel: 1\n"
-                          "backup:\n  file_cache_match: auto\n"), CUTILS_OK);
+                          "backup:\n  file_cache_match: auto\n  unsettled: store\n"), CUTILS_OK);
 }
 
 static void test_ranges_refused(void **state)
@@ -98,6 +98,8 @@ static void test_bind_and_mode_refused(void **state)
     refused("http:\n  bind: \"::1\"\n", "http.bind: '::1'");
     refused("backup:\n  file_cache_match: fast\n",
             "backup.file_cache_match: 'fast' is not one of auto, strict, relaxed");
+    refused("backup:\n  unsettled: maybe\n",
+            "backup.unsettled: 'maybe' is not one of store, skip");
 }
 
 /* One run reports the lot, with log.level among them. */

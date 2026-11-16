@@ -38,6 +38,7 @@
 #include "object.h"
 #include "repo.h"
 #include "restore.h"
+#include "settle.h"
 #include "verify.h"
 #include "store.h"
 #include "store_index.h"
@@ -1015,9 +1016,13 @@ static void test_file_that_shrinks_mid_read_is_read_again(void **state)
 static void test_file_that_keeps_changing_is_left_out(void **state)
 {
     (void)state;
+    /* backup.unsettled = skip; the default stores it flagged instead
+     * (test_settle_fault). */
+    settle_set_unsettled_policy(SETTLE_UNSETTLED_SKIP);
     const char *path = TEST_DIR "/mid-busy.bin";
     backup_result_t res;
     run_mid_read(MID_KEEPS_CHANGING, &res, path);
+    settle_set_unsettled_policy(SETTLE_UNSETTLED_STORE_FLAGGED);
     assert_int_equal(res.files, 0);
     assert_int_equal(res.files_changed, 0);
     assert_int_equal(res.files_skipped, 1);

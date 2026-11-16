@@ -86,6 +86,7 @@ typedef struct {
      * version stored, changed says it differed from the scan. */
     struct stat  st_read;
     int          changed;
+    int          unsettled;     /* never settled; stored flagged (OWN-45-LIVE) */
     uint8_t      hash[OBJECT_HASH_SIZE];
     small_obj_t *objs;
     size_t       nobjs, capobjs;

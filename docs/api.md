@@ -77,7 +77,7 @@ client had to know which strings were numbers; they no longer do.
 | Ids, counts, byte sizes, offsets | number | `id`, `snap_id`, `files`, `size`, `phys_size`, `refcount`, `offset` |
 | Times | number, epoch seconds | `ts`, `added_at`, `started_at`, `finished_at`, `next_due`, `mtime` |
 | Type codes, modes, bitfields | number | `type`, `mode`, `gfs_flags`, pack `version` |
-| Flags | `true`/`false` | `enabled`, `completed`, `truncated`, `materialized`, `has_children`, `key_escrowed` |
+| Flags | `true`/`false` | `enabled`, `completed`, `truncated`, `materialized`, `has_children`, `may_be_torn`, `key_escrowed` |
 | Paths, names, labels, hashes, enums | string | `path`, `name`, `label`, `hash` (hex), `state`, `location`, `level` |
 | A value the row does not have | `null` | `label` never set, `finished_at` of a running scrub, `hash` of a directory |
 
@@ -329,7 +329,11 @@ snapshot of any year. A snapshot no tier elected shows 0, tagged or not.
 back in before it can be browsed.
 
 A tree entry is `{id, name, type, mode, size, mtime, mtime_nsec, hash,
-has_children}`. `id` is the node id to pass back as `parent`. `hash` is
+has_children, may_be_torn}`. `id` is the node id to pass back as `parent`.
+`may_be_torn` is `true` for a file that was still changing on the backup's
+second read and was stored as that read found it (Manual section 6.3): its
+bytes may mix two versions of the file. It is `false` for everything else,
+and a search result carries it too. `hash` is
 the content's hex hash, `null` for a directory or a file with no content
 object. `mode` is the file's full `st_mode` as a decimal integer, file type
 bits included: `33188` is `0100644`, a regular file with `rw-r--r--`, and
@@ -666,8 +670,11 @@ plain verify, with the same counts on a healthy repository. The job's
 `result` says which kind of run it was, since the run record does not:
 
 ```json
-{"run_id":12,"level":"deep","repair":false,"dry_run":true}
+{"run_id":12,"level":"deep","repair":false,"dry_run":true,"unsettled_files":0}
 ```
+
+`unsettled_files` is how many file entries the run found flagged as
+possibly torn (below); a notice, never a failure.
 
 `run_id` is null when the walk did not finish (cancelled or aborted); the
 partial run is still in `GET /repos/<id>/verify`, with `completed` false.
@@ -726,6 +733,13 @@ entry has no content`, its `affected_*` fields and `sample_paths` naming
 the files and snapshots, and each such row counts once in `missing`, so
 the run fails. A backup no longer writes such an entry (see the backup
 `result` below), and the tree writer refuses one.
+
+Every level also lists the file entries flagged as possibly torn - stored
+while still changing, `backup.unsettled: store` - as one finding with
+`hash` `""` and `status` `notice: stored while still changing; may not be
+internally consistent`, naming the files and snapshots. A status starting
+`notice: ` is not damage: it is never counted in `missing` or
+`unrecoverable`, never in the blast radius, and never fails the run.
 
 `/metrics` exposes `cbackup_last_verify_age_seconds` alongside
 `cbackup_last_snapshot_age_seconds` - between them, an alert can tell that
@@ -951,6 +965,13 @@ small-file workers. The job still completes (Manual section 6.3), and says so:
 | `files_changed` | Files whose size or times had changed by the time they were read (since the scan, or during a read that was then repeated) and that were stored as read: one whole version, its size and mtime in the snapshot. Always present |
 | `changed` | The first 100 of them, as paths; `[]` when none |
 | `changed_listed` | How many `changed` holds |
+| `changed_unsettled` | Files still changing on the second read and stored as it found them, flagged as possibly torn (`backup.unsettled: store`, the default). Not in `files_changed`. Always present |
+| `unsettled` | The first 100 of them, each `{"path"}`; `[]` when none |
+| `unsettled_listed` | How many `unsettled` holds |
+
+A file is skipped for still changing on its second read only under
+`backup.unsettled: skip`; by default it is stored and counted in
+`changed_unsettled` instead.
 
 `reason` reads `cannot open: it no longer exists`, `cannot open:
 Permission denied` (or another errno text), `no longer a regular file (now
@@ -962,9 +983,13 @@ time; Manual section 6.3), or `cannot read: ` followed by the store's
 error. Each is also a `WARN` line in the daemon log, `backup:
 skipping <path>, it is not in this snapshot: <reason>`, followed by one
 summary line, and the job's journal entry reads `snapshot N: F files, S
-skipped (not in the snapshot); first: <path>: <reason>`. A clean backup
-journals no message, as before. A backup that skipped anything also sends a
-warning alert (Manual section 16.3); the job stays `completed`.
+skipped (not in the snapshot); first: <path>: <reason>`. A file stored
+although it never settled adds `U stored while still changing (may be
+torn); first: <path>` to the same entry (after a `; ` when both apply). A
+clean backup journals no message, as before. A backup that skipped
+anything, or kept anything that never settled, also sends one warning
+alert naming the count and first path of each (Manual section 16.3); the
+job stays `completed`.
 
 What it wrote:
 

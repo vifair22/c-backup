@@ -4,6 +4,7 @@
 #include "restore.h"
 #include "metablob.h"
 
+#include "manifest.h"
 #include "object.h"
 #include "chunklist.h"
 #include "read_budget.h"
@@ -427,6 +428,7 @@ static void restore_bytes(uint64_t bytes, void *ctx)
  * memory is one string per directory beside a result set already in memory.
  */
 #define COL_PARENT 15
+#define COL_FLAGS  16
 
 typedef struct {
     const db_result_t *r;
@@ -866,7 +868,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             "       COALESCE(link_target,''), COALESCE(hardlink_group_id, 0),"
             "       COALESCE(xattr_hash,''), COALESCE(acl_hash,''),"
             "       COALESCE(dev_major, 0), COALESCE(dev_minor, 0),"
-            "       COALESCE(parent_node_id, 0)"
+            "       COALESCE(parent_node_id, 0), COALESCE(flags, 0)"
             "  FROM nodes WHERE repo_id = ? AND snap_id = ?"
             " ORDER BY CASE WHEN type = 2 THEN 0 ELSE 1 END, id",
             (const char *[]){ repo, snap, NULL }, &r) != 0 || !r) {
@@ -1281,6 +1283,12 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             restore_fail(&res, full, "out of memory");
             continue;
         }
+        /* Restored as stored, and said: the file never settled while the
+         * backup read it, so its bytes may mix two versions (OWN-45-LIVE). */
+        if (strtoul(r->rows[i][COL_FLAGS], NULL, 10) & MANIFEST_FLAG_UNSETTLED)
+            log_warn("restore: %s was still changing when it was backed up; "
+                     "restored as stored, and it may not be internally "
+                     "consistent", full);
         if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
     }
     /* Whatever verified before a stop is still worth keeping. */

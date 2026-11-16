@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include "error.h"
+#include "backup.h"
 
 /*
  * Route registration.
@@ -30,6 +31,15 @@ void routes_repos_set_key_dir(const char *dir);
 /* How strictly backups recognise an unchanged file (file_cache_match_t,
  * from backup.file_cache_match). Set from config at startup. */
 void routes_backup_set_file_cache_match(int mode);
+
+/*
+ * The journal message and the warning alert text for a backup that left
+ * files out (B118) or kept files that never settled (OWN-45-LIVE); both
+ * empty for a clean backup. Exposed for its test; the backup job is the
+ * only caller.
+ */
+void routes_backup_describe_doubts(const backup_result_t *res, char *summary,
+                                   size_t ssz, char *warning, size_t wsz);
 /* Chunk workers per backup (backup.store_workers): 0 automatic, 1 serial.
  * Set from config at startup. */
 void routes_backup_set_store_workers(unsigned n);

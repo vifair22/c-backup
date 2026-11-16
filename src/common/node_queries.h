@@ -28,7 +28,7 @@
  */
 #define NODE_SQL_SEARCH_ALL \
     "SELECT f.node_id, f.snap_id, f.name, n.type, n.size," \
-    "       COALESCE(n.content_hash, '')" \
+    "       COALESCE(n.content_hash, ''), (n.flags & 1)" \
     "  FROM node_fts f" \
     "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id" \
     " WHERE f.repo_id = ? AND f.name MATCH ?" \
@@ -36,7 +36,7 @@
 
 #define NODE_SQL_SEARCH_SNAP_NEWEST \
     "SELECT f.node_id, f.snap_id, f.name, n.type, n.size," \
-    "       COALESCE(n.content_hash, '')" \
+    "       COALESCE(n.content_hash, ''), (n.flags & 1)" \
     "  FROM node_fts f" \
     "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id" \
     " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?" \
@@ -44,11 +44,14 @@
 
 #define NODE_SQL_SEARCH_SNAP_OLDEST \
     "SELECT f.node_id, f.snap_id, f.name, n.type, n.size," \
-    "       COALESCE(n.content_hash, '')" \
+    "       COALESCE(n.content_hash, ''), (n.flags & 1)" \
     "  FROM node_fts f" \
     "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id" \
     " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?" \
     " ORDER BY f.rowid ASC LIMIT ?"
+
+/* The last column of the searches and of a directory page is the entry's
+ * MANIFEST_FLAG_UNSETTLED bit: stored while still changing (OWN-45-LIVE). */
 
 /* One step up a search result's ancestry, to build its path: repo, node. */
 #define NODE_SQL_ANCESTOR \
@@ -70,7 +73,8 @@
     "       mtime_ns % 1000000000, content_hash," \
     "       EXISTS (SELECT 1 FROM nodes c" \
     "                WHERE c.repo_id = n.repo_id AND c.snap_id = n.snap_id" \
-    "                  AND c.parent_node_id = n.id)" \
+    "                  AND c.parent_node_id = n.id)," \
+    "       (n.flags & 1)" \
     "  FROM nodes n" \
     " WHERE n.repo_id = ? AND n.snap_id = ? AND n.parent_node_id = ?" \
     " ORDER BY n.name LIMIT ? OFFSET ?"

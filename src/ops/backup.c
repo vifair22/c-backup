@@ -59,6 +59,9 @@ typedef struct {
     /* A regular file the store could not read, or that never settled. It
      * is left out of the trees and the index entirely; see skip_file. */
     int      skipped;
+    /* Stored although it never settled (OWN-45-LIVE): flagged in the tree,
+     * and given no file cache row, so the next backup reads it again. */
+    int      unsettled;
 } node_link_t;
 
 /*
@@ -227,6 +230,10 @@ void backup_result_free(backup_result_t *r)
     free(r->changed);
     r->changed = NULL;
     r->changed_listed = 0;
+    for (uint32_t i = 0; i < r->unsettled_listed; i++) free(r->unsettled[i]);
+    free(r->unsettled);
+    r->unsettled = NULL;
+    r->unsettled_listed = 0;
 }
 
 /*
@@ -265,6 +272,43 @@ static void note_changed(pipeline_t *p, uint32_t i)
 }
 
 /*
+ * A file that never settled and was stored as the second read found it
+ * (OWN-45-LIVE). The flag goes into its tree entry, so it outlives the
+ * database and comes back with a reindex; restore warns for it and verify
+ * notes it. It gets no file cache row: a later run whose stat happened to
+ * match would otherwise keep the possibly torn copy for good.
+ */
+static void note_unsettled(pipeline_t *p, uint32_t i)
+{
+    scan_entry_t *e = &p->scan->entries[i];
+    e->node.flags |= MANIFEST_FLAG_UNSETTLED;
+    p->links[i].unsettled = 1;
+    backup_result_t *r = p->res;
+    r->changed_unsettled++;
+    log_warn("backup: %s never settled while it was read; stored as the "
+             "second read found it, flagged as possibly torn", e->path);
+    if (r->unsettled_listed >= BACKUP_SKIPPED_LIST_MAX) return;
+    if (!r->unsettled) {
+        r->unsettled = calloc(BACKUP_SKIPPED_LIST_MAX, sizeof(*r->unsettled));
+        if (!r->unsettled) return;
+    }
+    char *path = strdup(e->path);
+    if (!path) return;
+    r->unsettled[r->unsettled_listed++] = path;
+}
+
+/* The cache row for a stored file, unless it never settled. */
+static void cache_put(pipeline_t *p, uint32_t i)
+{
+    if (p->links[i].unsettled) return;
+    scan_entry_t *e = &p->scan->entries[i];
+    uint64_t _tp = phase_now();
+    file_cache_put(p->db, p->repo_id, e->path, &e->st,
+                   e->node.content_hash, p->cache_stamp);
+    phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+}
+
+/*
  * One file's settled store, recorded the same way whichever path stored
  * it. Returns 1 when the content is to be recorded, 0 when the file was
  * left out. A failed read that did not change the file is the file's own
@@ -285,11 +329,11 @@ static int settle_record(pipeline_t *p, uint32_t i, status_t st,
         return 0;
     }
     scan_entry_t *e = &p->scan->entries[i];
-    if (sr->changed) {
-        if (sr->unsettled)
-            log_warn("backup: %s never settled while it was read; stored as "
-                     "the second read found it", e->path);
-        else if (sr->reads > 1)
+    if (sr->unsettled) {
+        adopt_stat(e, &sr->st);
+        note_unsettled(p, i);
+    } else if (sr->changed) {
+        if (sr->reads > 1)
             log_warn("backup: %s changed while it was being read; stored from "
                      "a second read", e->path);
         else
@@ -864,10 +908,7 @@ static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
     p->res->files++;
     p->res->bytes_logical += e->node.size;
 
-    uint64_t _tp = phase_now();
-    file_cache_put(p->db, p->repo_id, e->path, &e->st,
-                   e->node.content_hash, p->cache_stamp);
-    phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+    cache_put(p, j->index);
     return OK;
 }
 
@@ -946,7 +987,10 @@ static status_t small_apply(pipeline_t *p, batch_t *b, small_batch_t *sb)
             skip_file(p, f->index, why);
             continue;
         }
-        if (f->changed) {
+        if (f->unsettled) {
+            adopt_stat(e, &f->st_read);
+            note_unsettled(p, f->index);
+        } else if (f->changed) {
             log_info("backup: %s changed since the scan or while it was read; "
                      "stored as read", e->path);
             adopt_stat(e, &f->st_read);
@@ -974,10 +1018,7 @@ static status_t small_apply(pipeline_t *p, batch_t *b, small_batch_t *sb)
         p->res->bytes_logical += e->node.size;
         st = bsink_flush(p->sink, 0);
         if (st != OK) break;
-        uint64_t _tp = phase_now();
-        file_cache_put(p->db, p->repo_id, e->path, &e->st,
-                       e->node.content_hash, p->cache_stamp);
-        phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+        cache_put(p, f->index);
         /* Not counted into the batch again: the loop counted the entry when
          * it queued it. */
     }
@@ -1518,10 +1559,7 @@ static status_t store_content_loop(pipeline_t *p)
             return st;
         }
 
-        uint64_t _tp = phase_now();
-        file_cache_put(p->db, p->repo_id, e->path, &e->st,
-                       e->node.content_hash, p->cache_stamp);
-        phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+        cache_put(p, i);
     }
 
     /* The small files still out. */
@@ -1947,7 +1985,8 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
 
         /* Union again: only a device node has a device pair. */
         int is_dev = (e->node.type == NODE_TYPE_CHR || e->node.type == NODE_TYPE_BLK);
-        char dmaj[16], dmin[16];
+        char dmaj[16], dmin[16], nflags[8];
+        snprintf(nflags, sizeof(nflags), "%u", (unsigned)e->node.flags);
         snprintf(dmaj, sizeof(dmaj), "%u", is_dev ? e->node.device.major : 0u);
         snprintf(dmin, sizeof(dmin), "%u", is_dev ? e->node.device.minor : 0u);
 
@@ -1955,10 +1994,11 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                 "INSERT INTO nodes"
                 " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
                 "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
-                "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor)"
+                "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor,"
+                "  flags)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
                 "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?,"
-                "         NULLIF(?,''), NULLIF(?,''), ?, ?)",
+                "         NULLIF(?,''), NULLIF(?,''), ?, ?, ?)",
                 (const char *[]){ repo, id, snap, parent, name, ntype, mode, uid,
                                   gid, mtime, size,
                                   /* A symlink or device node has no content
@@ -1973,7 +2013,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                                   ltarget, hgroup,
                                   hash_is_zero(e->node.xattr_hash) ? "" : xhex,
                                   hash_is_zero(e->node.acl_hash)   ? "" : ahex,
-                                  dmaj, dmin, NULL }, NULL);
+                                  dmaj, dmin, nflags, NULL }, NULL);
         if (rc != 0) {
             db_txn_rollback(p->db);
             return set_error(ERR_IO, "index_nodes: insert failed");
@@ -2326,7 +2366,8 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
             /* A skipped file's row goes too, so the next run reads it
              * rather than vouching for content this snapshot lacks. */
             for (uint32_t i = 0; i < scan->count; i++)
-                if (scan->entries[i].node.type == NODE_TYPE_REG && !links[i].skipped)
+                if (scan->entries[i].node.type == NODE_TYPE_REG &&
+                    !links[i].skipped && !links[i].unsettled)
                     seen[n_seen++] = scan->entries[i].path;
             qsort(seen, n_seen, sizeof(*seen), scan_path_cmp);
             uint64_t _tsw = phase_now(), _tswn = phase_nested(&timers);

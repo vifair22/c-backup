@@ -150,48 +150,120 @@ static void backup_job_free(void *p)
  * count. Paths go through cJSON because, unlike every other field here,
  * they are not numbers. Returns a malloc'd document, or NULL.
  */
+/* A JSON array, printed: the paths alone, or {"path"} objects. */
+static char *paths_json(char *const *paths, uint32_t n, int as_objects)
+{
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        cJSON *item;
+        if (as_objects) {
+            item = cJSON_CreateObject();
+            if (item && !cJSON_AddStringToObject(item, "path", paths[i])) {
+                cJSON_Delete(item);
+                item = NULL;
+            }
+        } else {
+            item = cJSON_CreateString(paths[i]);
+        }
+        if (!item) { cJSON_Delete(arr); return NULL; }
+        cJSON_AddItemToArray(arr, item);
+    }
+    char *out = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    return out;
+}
+
 static char *with_skipped(const char *base, const backup_result_t *res)
 {
-    /* Changed files (OWN-45) are stored, so they are paths alone. */
-    cJSON *chg = cJSON_CreateArray();
-    if (!chg) return NULL;
-    for (uint32_t i = 0; i < res->changed_listed; i++) {
-        cJSON *str = cJSON_CreateString(res->changed[i]);
-        if (!str) { cJSON_Delete(chg); return NULL; }
-        cJSON_AddItemToArray(chg, str);
-    }
-    char *clist = cJSON_PrintUnformatted(chg);
-    cJSON_Delete(chg);
-    if (!clist) return NULL;
+    /* Changed files (OWN-45) are stored, so they are paths alone; files
+     * that never settled (OWN-45-LIVE) are {"path"} objects. */
+    char *clist = paths_json(res->changed, res->changed_listed, 0);
+    char *ulist = paths_json(res->unsettled, res->unsettled_listed, 1);
 
     cJSON *arr = cJSON_CreateArray();
-    if (!arr) { cJSON_free(clist); return NULL; }
-    for (uint32_t i = 0; i < res->skipped_listed; i++) {
-        cJSON *o = cJSON_CreateObject();
-        if (!o) { cJSON_Delete(arr); cJSON_free(clist); return NULL; }
-        cJSON_AddItemToArray(arr, o);
-        if (!cJSON_AddStringToObject(o, "path", res->skipped[i].path) ||
-            !cJSON_AddStringToObject(o, "reason", res->skipped[i].reason)) {
-            cJSON_Delete(arr);
-            cJSON_free(clist);
-            return NULL;
+    char *list = NULL;
+    if (arr && clist && ulist) {
+        int ok = 1;
+        for (uint32_t i = 0; ok && i < res->skipped_listed; i++) {
+            cJSON *o = cJSON_CreateObject();
+            if (!o) { ok = 0; break; }
+            cJSON_AddItemToArray(arr, o);
+            if (!cJSON_AddStringToObject(o, "path", res->skipped[i].path) ||
+                !cJSON_AddStringToObject(o, "reason", res->skipped[i].reason))
+                ok = 0;
         }
+        if (ok) list = cJSON_PrintUnformatted(arr);
     }
-    char *list = cJSON_PrintUnformatted(arr);
     cJSON_Delete(arr);
-    if (!list) { cJSON_free(clist); return NULL; }
 
-    size_t cap = strlen(base) + strlen(list) + strlen(clist) + 160;
-    char *js = malloc(cap);
-    if (js)
-        snprintf(js, cap, "%s,\"skipped\":%s,\"skipped_listed\":%u,"
-                 "\"files_changed\":%llu,\"changed\":%s,\"changed_listed\":%u}",
-                 base, list, res->skipped_listed,
-                 (unsigned long long)res->files_changed, clist,
-                 res->changed_listed);
+    char *js = NULL;
+    if (list && clist && ulist) {
+        size_t cap = strlen(base) + strlen(list) + strlen(clist) + strlen(ulist) + 256;
+        js = malloc(cap);
+        if (js)
+            snprintf(js, cap, "%s,\"skipped\":%s,\"skipped_listed\":%u,"
+                     "\"files_changed\":%llu,\"changed\":%s,\"changed_listed\":%u,"
+                     "\"changed_unsettled\":%llu,\"unsettled\":%s,"
+                     "\"unsettled_listed\":%u}",
+                     base, list, res->skipped_listed,
+                     (unsigned long long)res->files_changed, clist,
+                     res->changed_listed,
+                     (unsigned long long)res->changed_unsettled, ulist,
+                     res->unsettled_listed);
+    }
     cJSON_free(list);
     cJSON_free(clist);
+    cJSON_free(ulist);
     return js;
+}
+
+/*
+ * What the journal and the alert say about a backup that left files out
+ * (B118) or kept files that never settled (OWN-45-LIVE). Empty when it did
+ * neither: a clean backup journals no message and alerts nobody.
+ */
+void routes_backup_describe_doubts(const backup_result_t *res, char *summary,
+                                   size_t ssz, char *warning, size_t wsz)
+{
+    char skip_s[PATH_MAX * 2 + 128] = "", skip_w[PATH_MAX * 2 + 160] = "";
+    char uns_s[PATH_MAX + 128] = "", uns_w[PATH_MAX + 192] = "";
+    if (res->files_skipped && res->skipped_listed) {
+        snprintf(skip_s, sizeof(skip_s), "%llu skipped (not in the snapshot); first: %s: %s",
+                 (unsigned long long)res->files_skipped,
+                 res->skipped[0].path, res->skipped[0].reason);
+        snprintf(skip_w, sizeof(skip_w), "%llu file(s) could not be read and are not "
+                 "in snapshot %lld; first: %s: %s",
+                 (unsigned long long)res->files_skipped, (long long)res->snapshot_id,
+                 res->skipped[0].path, res->skipped[0].reason);
+    } else if (res->files_skipped) {
+        snprintf(skip_s, sizeof(skip_s), "%llu skipped (not in the snapshot); see the log",
+                 (unsigned long long)res->files_skipped);
+        snprintf(skip_w, sizeof(skip_w), "%llu file(s) could not be read and are not "
+                 "in snapshot %lld; see the log",
+                 (unsigned long long)res->files_skipped, (long long)res->snapshot_id);
+    }
+    if (res->changed_unsettled && res->unsettled_listed) {
+        snprintf(uns_s, sizeof(uns_s), "%llu stored while still changing (may be "
+                 "torn); first: %s",
+                 (unsigned long long)res->changed_unsettled, res->unsettled[0]);
+        snprintf(uns_w, sizeof(uns_w), "%llu file(s) were still changing and are in "
+                 "snapshot %lld as read, flagged as possibly torn; first: %s",
+                 (unsigned long long)res->changed_unsettled, (long long)res->snapshot_id,
+                 res->unsettled[0]);
+    } else if (res->changed_unsettled) {
+        snprintf(uns_s, sizeof(uns_s), "%llu stored while still changing (may be "
+                 "torn); see the log", (unsigned long long)res->changed_unsettled);
+        snprintf(uns_w, sizeof(uns_w), "%llu file(s) were still changing and are in "
+                 "snapshot %lld as read, flagged as possibly torn; see the log",
+                 (unsigned long long)res->changed_unsettled, (long long)res->snapshot_id);
+    }
+    summary[0] = warning[0] = '\0';
+    if (!skip_s[0] && !uns_s[0]) return;
+    snprintf(summary, ssz, "snapshot %lld: %llu files, %s%s%s",
+             (long long)res->snapshot_id, (unsigned long long)res->files,
+             skip_s, skip_s[0] && uns_s[0] ? "; " : "", uns_s);
+    snprintf(warning, wsz, "%s%s%s", skip_w, skip_w[0] && uns_w[0] ? "; " : "", uns_w);
 }
 
 static status_t backup_job_run(void *arg, atomic_int *cancel,
@@ -329,42 +401,20 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
         }
 
         /* The journal is the permanent record, and a snapshot that lacks
-         * files has to say so there too, not only in a job row that is
-         * deleted after 30 days. A clean backup journals as it always has,
-         * with no message. */
-        char msg[768];
-        if (res.files_skipped && res.skipped_listed) {
-            snprintf(msg, sizeof(msg),
-                     "snapshot %lld: %llu files, %llu skipped (not in the "
-                     "snapshot); first: %s: %s",
-                     (long long)res.snapshot_id, (unsigned long long)res.files,
-                     (unsigned long long)res.files_skipped,
-                     res.skipped[0].path, res.skipped[0].reason);
-            job_set_summary(progress_ctx, msg);
-            /* And alerted: a snapshot that lacks files is something to
-             * hear about without opening the job, though the job did what
-             * it could and stays completed. */
-            snprintf(msg, sizeof(msg),
-                     "%llu file(s) could not be read and are not in snapshot "
-                     "%lld; first: %s: %s",
-                     (unsigned long long)res.files_skipped,
-                     (long long)res.snapshot_id,
-                     res.skipped[0].path, res.skipped[0].reason);
-            job_set_warning(progress_ctx, msg);
-        } else if (res.files_skipped) {
-            snprintf(msg, sizeof(msg),
-                     "snapshot %lld: %llu files, %llu skipped (not in the "
-                     "snapshot); see the log",
-                     (long long)res.snapshot_id, (unsigned long long)res.files,
-                     (unsigned long long)res.files_skipped);
-            job_set_summary(progress_ctx, msg);
-            snprintf(msg, sizeof(msg),
-                     "%llu file(s) could not be read and are not in snapshot "
-                     "%lld; see the log",
-                     (unsigned long long)res.files_skipped,
-                     (long long)res.snapshot_id);
-            job_set_warning(progress_ctx, msg);
+         * files, or holds files that may be torn, has to say so there too,
+         * not only in a job row deleted after 30 days. And alerted, through
+         * the failure path at warning level: the job did what it could and
+         * stays completed. A clean backup journals no message, as always. */
+        char *summary = malloc(PATH_MAX * 4);
+        char *warning = malloc(PATH_MAX * 4);
+        if (summary && warning) {
+            routes_backup_describe_doubts(&res, summary, PATH_MAX * 4,
+                                          warning, PATH_MAX * 4);
+            if (summary[0]) job_set_summary(progress_ctx, summary);
+            if (warning[0]) job_set_warning(progress_ctx, warning);
         }
+        free(summary);
+        free(warning);
     }
     backup_result_free(&res);
 

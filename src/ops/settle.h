@@ -35,21 +35,27 @@ typedef enum {
 } settle_outcome_t;
 
 /*
- * What to do with a file still changing on the last read allowed. The user
- * decision OWN-45-LIVE is pending; this is the switch it will set.
+ * What to do with a file still changing on the last read allowed
+ * (OWN-45-LIVE, decided as option B), from `backup.unsettled`:
  *
- *   SETTLE_UNSETTLED_SKIP: leave it out of the snapshot (the B118 skip
- *     path: counted, named, alerted). rsync's rule. The default.
- *   SETTLE_UNSETTLED_STORE_FLAGGED: store what the second read produced and
- *     flag the file. tar's rule; the bytes may mix two versions.
+ *   SETTLE_UNSETTLED_STORE_FLAGGED ("store", the default): store what the
+ *     second read produced and flag the file as possibly torn, in its tree
+ *     entry. tar's rule, with the doubt recorded: the bytes may mix two
+ *     versions, and restore and verify say so.
+ *   SETTLE_UNSETTLED_SKIP ("skip"): leave it out of the snapshot through the
+ *     B118 skip path, counted, named and alerted. rsync's rule.
+ *
+ * Process-wide; every store path reads it through settle_store_fd.
  */
 typedef enum {
-    SETTLE_UNSETTLED_SKIP = 0,
-    SETTLE_UNSETTLED_STORE_FLAGGED,
+    SETTLE_UNSETTLED_STORE_FLAGGED = 0,
+    SETTLE_UNSETTLED_SKIP,
 } settle_unsettled_policy_t;
 
 void settle_set_unsettled_policy(settle_unsettled_policy_t p);
 settle_unsettled_policy_t settle_unsettled_policy(void);
+/* A `backup.unsettled` value ("store" or "skip"); -1 for anything else. */
+int settle_unsettled_parse(const char *s);
 
 typedef struct {
     settle_outcome_t outcome;

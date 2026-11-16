@@ -170,6 +170,7 @@ static void store_one(small_pool_t *pool, small_file_t *f)
         memcpy(f->hash, r.hash, OBJECT_HASH_SIZE);
         f->st_read = sr.st;
         f->changed = sr.changed;
+        f->unsettled = sr.unsettled;
     }
 }
 
