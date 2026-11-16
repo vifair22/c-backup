@@ -1461,6 +1461,20 @@ else
     bad "gc damage fixture" "the file's bytes in the pack" "not found"
 fi
 
+# OWN-33: a label past the limit is refused before anything is sent, in
+# the daemon's words; one with quotes and a backslash arrives intact.
+N_BEFORE=$(cb snapshots 1 | grep -o '"id":[0-9]*' | wc -l | tr -d ' ')
+OUT=$(cb backup 1 "$WORK/src" --label "$(head -c 1000 /dev/zero | tr '\0' x)" 2>&1); RC=$?
+check    "a 1,000-byte label fails the backup" 1 "$RC"
+contains "and says why" "label must be at most 256 bytes of printable text" "$OUT"
+OUT=$(cb backup 1 "$WORK/src" --label "$(printf 'tab\there')" 2>&1); RC=$?
+check    "a label with a tab fails too" 1 "$RC"
+check    "and neither made a snapshot" "$N_BEFORE" \
+    "$(cb snapshots 1 | grep -o '"id":[0-9]*' | wc -l | tr -d ' ')"
+contains "a quoted label backs up" '"state":"completed"' \
+    "$(cb backup 1 "$WORK/src" --label 'say "hi" C:\dir')"
+contains "and is listed as given" '"label":"say \"hi\" C:\\dir"' "$(cb snapshots 1)"
+
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?
 check    "unknown repo exits non-zero" 1 "$RC"

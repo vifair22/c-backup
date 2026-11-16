@@ -18,6 +18,7 @@
 
 #include "http.h"
 #include "sse.h"
+#include "snap_record.h"
 #include "start_advice.h"
 
 #include <ctype.h>
@@ -552,6 +553,11 @@ static int cmd_backup(int argc, char **argv)
         return fail("usage: backup <repo-id> [path...] "
                     "[--exclude PATTERN]... [--one-filesystem] [--label TEXT] "
                     "[--no-wait]");
+
+    /* The daemon refuses it too; saying so here costs no round trip and
+     * reads the same either way. */
+    if (label && snapshot_label_check(label) != 0)
+        return fail("%s", SNAPSHOT_LABEL_RULE);
 
     sbuf_t b = { 0 };
     sb_puts(&b, "{\"paths\":[");
