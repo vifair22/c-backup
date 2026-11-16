@@ -199,8 +199,11 @@ typedef struct {
      * run asks by id and timestamp instead.
      */
     const struct cdc_params *(*target_cdc)(void *ctx);
+    /* *out_stored (may be NULL): the bytes the target stored for a new
+     * object, as objects_sent/bytes_sent count a copied one. */
     status_t (*put_plain)(void *ctx, uint8_t type, const void *data, size_t len,
-                          uint8_t out_hash[OBJECT_HASH_SIZE], int *out_is_new);
+                          uint8_t out_hash[OBJECT_HASH_SIZE], int *out_is_new,
+                          uint64_t *out_stored);
     status_t (*has_snapshot_at)(void *ctx, int64_t snapshot_id, int64_t ts,
                                 int *out_present);
 } replica_sink_vtbl_t;
