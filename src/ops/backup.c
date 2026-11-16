@@ -15,6 +15,7 @@
 #include "store_pool.h"
 #include "small_files.h"
 #include "settle.h"
+#include "open_scanned.h"
 #include "read_budget.h"
 #include "db_txn.h"
 #include "phase_timer.h"
@@ -140,6 +141,9 @@ typedef struct {
     small_pool_t  *spool;
     small_batch_t *sbatch;
     uint64_t       spool_taken;
+    /* Each source root, opened once for the store phase: every file is
+     * opened beneath its root, never by its whole path (open_scanned.h). */
+    scan_roots_t  *roots;
 } pipeline_t;
 
 /*
@@ -215,6 +219,19 @@ static void skip_file(pipeline_t *p, uint32_t i, const char *reason)
     r->skipped[r->skipped_listed].path   = path;
     r->skipped[r->skipped_listed].reason = why;
     r->skipped_listed++;
+}
+
+/*
+ * Open scan entry i beneath its source root (open_scanned.h, B128), or
+ * leave it out with the reason (skip_file) and return -1.
+ */
+static int open_for_store(pipeline_t *p, uint32_t i, struct stat *fst)
+{
+    char why[320];
+    int fd = open_scanned(p->roots, &p->scan->entries[i],
+                          p->opts->one_filesystem, fst, why, sizeof(why));
+    if (fd == -1) skip_file(p, i, why);
+    return fd;
 }
 
 void backup_result_free(backup_result_t *r)
@@ -1082,7 +1099,7 @@ static status_t small_queue(pipeline_t *p, batch_t *b, uint32_t index)
     if (!p->sbatch && !(p->sbatch = small_batch_new()))
         return set_error(ERR_NOMEM, "backup: small-file batch");
     const scan_entry_t *e = &p->scan->entries[index];
-    if (small_batch_add(p->sbatch, index, e->path, e->node.size, &e->st))
+    if (small_batch_add(p->sbatch, index, e))
         return small_submit(p, b);
     return OK;
 }
@@ -1193,6 +1210,7 @@ static status_t store_content(pipeline_t *p)
         unsigned sw = workers > SMALL_POOL_MAX ? SMALL_POOL_MAX : workers;
         if (scp && small_pool_start(p->store, scp, sw, sw * 2,
                                     p->opts ? p->opts->cancel : NULL,
+                                    p->roots, p->opts->one_filesystem,
                                     &p->spool) == OK) {
             log_info("backup: small files stored on %u threads, up to %u to a batch",
                      sw, SMALL_BATCH_FILES);
@@ -1491,34 +1509,12 @@ static status_t store_content_loop(pipeline_t *p)
 
         /* Open is part of reading: over NFS it is a round trip per file. */
         uint64_t _tr = phase_now(), _trn = phase_nested(p->timers);
-        /* Never through a symlink (B128): one swapped in for the file
-         * since the scan was followed, and stored whatever it named. */
-        int fd = open(e->path, SETTLE_OPEN_FLAGS);
-        if (fd == -1) {
-            /* A file that vanished between scan and store is normal on a live
-             * filesystem; it is a warning, not a failed backup. */
-            char why[160];
-            skip_file(p, i, settle_open_reason(errno, why, sizeof(why)));
-            continue;
-        }
-        /* Replaced by something else since the scan (OWN-41). settle_store_fd
-         * refuses it too; this keeps a directory off the file workers. */
+        /* Beneath its source root, never through a symlink, and only the
+         * regular file it still is (open_scanned.h, B128). A renamed file
+         * is a change, which settle_store_fd stores as read (OWN-45). */
         struct stat fst;
-        int fst_ok = fstat(fd, &fst) == 0;
-        if (!fst_ok || !S_ISREG(fst.st_mode)) {
-            int was_dir = fst_ok && S_ISDIR(fst.st_mode);
-            close(fd);
-            skip_file(p, i, was_dir ? "no longer a regular file (now a directory)"
-                                    : "no longer a regular file");
-            continue;
-        }
-        /* And the inode the scan saw (B128), before a file worker gets it;
-         * settle_store_fd checks it again on every path. */
-        if (fst.st_dev != e->st.st_dev || fst.st_ino != e->st.st_ino) {
-            close(fd);
-            skip_file(p, i, "replaced by another file since the scan");
-            continue;
-        }
+        int fd = open_for_store(p, i, &fst);
+        if (fd == -1) continue;
 
         if (to_pool) {
             status_t sst = store_pool_submit(p->pool, i, fd, e->node.size);
@@ -2289,7 +2285,10 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     uint8_t root_hash[OBJECT_HASH_SIZE];
     struct timespec t0, t1, t2, t3;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    st = store_content(&p);
+    st = scan_roots_new(scan, &p.roots);
+    if (st == OK) st = store_content(&p);
+    scan_roots_free(p.roots);
+    p.roots = NULL;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     uint64_t _ttr = phase_now(), _ttrn = phase_nested(&timers);
     if (st == OK) st = build_trees(&p, root_hash);

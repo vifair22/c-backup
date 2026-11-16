@@ -118,16 +118,27 @@ status_t repo_key_from_hex(const char *hex, repo_key_t *out)
 {
     if (!hex || !out) return set_error(ERR_INVALID, "repo_key_from_hex: null");
     /* Tolerate trailing whitespace: an escrowed key is usually pasted. */
+    /*
+     * Every character is counted and checked. The copy used to stop at 64,
+     * so a longer paste was cut to its first 64 and accepted, and sscanf's
+     * %x took a sign or "0x" as part of a byte. The fingerprint check behind
+     * this kept a wrong key out, but a key is either exactly right or
+     * refused, and saying which is this function's job.
+     */
     char trimmed[REPO_KEY_BYTES * 2 + 1];
     size_t n = 0;
-    for (const char *p = hex; *p && n < sizeof(trimmed) - 1; p++) {
+    for (const char *p = hex; *p; p++) {
         if (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') continue;
-        trimmed[n++] = *p;
+        int digit = (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') ||
+                    (*p >= 'A' && *p <= 'F');
+        if (!digit) return set_error(ERR_INVALID, "key is not valid hex");
+        if (n < sizeof(trimmed) - 1) trimmed[n] = *p;
+        n++;
     }
-    trimmed[n] = '\0';
     if (n != REPO_KEY_BYTES * 2)
         return set_error(ERR_INVALID, "key must be %d hex characters, got %zu",
                          REPO_KEY_BYTES * 2, n);
+    trimmed[n] = '\0';
     if (from_hex(trimmed, out->key, REPO_KEY_BYTES) != 0)
         return set_error(ERR_INVALID, "key is not valid hex");
     repo_key_compute_id(out);

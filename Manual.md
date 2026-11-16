@@ -593,6 +593,21 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
   format: `<path> is repository format 2; this build reads only format 3
   ...`, or `... written by a newer c-backup` for a newer one. Nothing in it
   is read or written. See section 17.4.
+- **Registering a repository whose snapshots the index does not hold
+  starts a reindex.** That is the case on a new host, after `state.db` is
+  lost (section 17.1), for a replica, or for a repository removed and added
+  back: the repository holds the snapshot records, and the database is an
+  index built from them. Until the reindex runs, `snapshots` lists nothing
+  and a `verify` passes having checked nothing, so registration counts the
+  records under `<repo>/snapshots` against the index and, when some are
+  missing, queues a `reindex` job itself. The reply says so,
+  `"snapshots_unindexed":3,"reindex_job":17`; the log reads `repo 4 holds
+  3 snapshot(s) the index does not; reindex job 17 queued`; the job and its
+  journal entry carry origin `register`. Wait for that job before trusting
+  a listing or a verify. An encrypted repository registered without its
+  key cannot be read yet: the reply carries `snapshots_unindexed` and the
+  key warning, nothing is queued, and `reindex` is for after the key is
+  loaded (registering it again with the passphrase queues it then).
 - Adding a repository that is already registered succeeds and says so
   (`"already_registered":true`, HTTP 200 rather than 201). A label given
   that differs from the stored one replaces it; leaving the label out keeps
@@ -798,16 +813,12 @@ A file inside a source that cannot be read is logged and skipped; the backup
 continues. Skipped means left out: the file is not in the snapshot's trees
 or its index, so the snapshot never lists a file it cannot restore. That
 covers a file that vanished between the scan and the read, one the daemon
-may not open, one replaced by a directory or anything else that is not a
-regular file, one whose read fails partway (an I/O error), and, with
-`backup.unsettled: skip`, one still changing on a second read (below). A
-file replaced by a symlink is left
-out too, and the link is never followed: every store path opens with
-`O_NOFOLLOW` and checks the open file is the inode the scan saw, so a
-symlink to `/etc/shadow` swapped in mid-backup cannot put the shadow file
-in a snapshot (B128); a file something else was renamed over is left out
-the same way. A backup
-with skipped files still ends `completed`, but not silently:
+may not open, one replaced by a symlink, a directory or anything else that
+is not a regular file, one whose path now runs through a symlink or (for a
+one-filesystem backup) a mount point, one whose read fails partway (an I/O
+error), and, with `backup.unsettled: skip`, one still changing on a second
+read (below). A backup with skipped files still ends `completed`, but not
+silently:
 
 - each file is a `WARN` line naming it and the reason, `backup: skipping
   /data/x, it is not in this snapshot: cannot open: Permission denied`,
@@ -824,9 +835,10 @@ under a backup, and a file can be a different size by the time it is read
 than when the scan listed it. The backup stores the file as it is when it
 is read, never as the scan saw it: its size, times and content all come
 from that read, so it is not cut short when it grew and not padded with
-zeros when it shrank. Change is detected by size, mtime and ctime (and
-inode), compared between the scan and the open, and again between the
-start and end of the read:
+zeros when it shrank. Change is detected by size, mtime, ctime and inode,
+compared between the scan and the open, and again between the start and
+end of the read. A file replaced by rename, as editors save, is a change
+like any other:
 
 - changed since the scan, steady while read: stored as read, logged at
   `info`, and counted;
@@ -890,8 +902,31 @@ Every store path applies all of this the same way: the backup thread, the
 chunk workers, the file workers that cut several large files at once, and
 the small-file workers (`src/ops/settle.c`).
 
-The next backup tries every skipped file again. Before 1.0.0's fix for
-B118 a skipped file stayed in the snapshot with no content: the backup
+**Symlinks inside a source are never followed.** The daemon runs as root;
+without this, anyone able to write inside a source could have `ln -s
+/etc/shadow` put the host's shadow file into the snapshot. Each source is
+opened once at the start of the store phase and must still be the
+directory the scan saw (its own path may run through symlinks: it is
+yours). Every file is then opened beneath it with `openat2`
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, plus `RESOLVE_NO_XDEV` for a
+one-filesystem backup, and `O_NOFOLLOW | O_NONBLOCK`; it must be a regular
+file. A file swapped for a symlink is skipped with `no longer a regular
+file (now a symlink)`; one whose directory became a symlink with `a
+directory on its path is now a symlink; not followed`; one behind a mount
+that appeared with `its path now crosses a mount point or leaves the
+source; not followed`. The link's target is never opened. On a kernel
+without `openat2` (before 5.6, or a container whose seccomp profile
+predates it) the same rules are applied one path component at a time.
+Files are opened beneath the source rather than from a descriptor held
+for each directory, because that would hold one descriptor per directory
+of the tree for the whole store phase. The scan walks the same way, each
+directory opened from its parent's descriptor and refused if it has become
+a symlink, and reads extended attributes and ACLs through a pinned
+descriptor (via `/proc/self/fd`, so `/proc` must be mounted for that
+guarantee).
+
+The next backup tries every skipped file again. Before 1.0.0 a skipped
+file stayed in the snapshot with no content: the backup
 reported success, verify passed, and every full restore failed on it.
 Verify now reports any such entry an older build left (section 11).
 
@@ -1059,12 +1094,27 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
   the restore. `--overwrite` replaces existing files instead, by renaming
   the verified file over them; a symlink at the path is replaced, not
   followed.
+- **Nothing in the destination is followed.** Every entry is created
+  through its parent directory, opened beneath the destination with no
+  symlink anywhere on the way, and its ownership, mode, times, extended
+  attributes and ACLs are applied through that or through the entry's own
+  descriptor. A symlink (or a file) standing where the snapshot has a
+  directory fails that directory and everything under it, with
+  `restore: <path> not restored: a symlink is there where the directory
+  belongs; not followed or replaced`; the link's target is never chmod'd,
+  chown'd or written into, with or without `--overwrite`. The rest of the
+  tree restores. The destination path itself may run through symlinks;
+  only what is below it is protected.
 - Hardlinks are restored as hardlinks, including across a resumed restore.
 - Sparse files come back sparse: holes of 64 KiB or more are recorded as
   holes and never written; shorter ones are stored as zeroes and come back
   as allocated zeroes.
 - Modes, times (directories included), extended attributes and ACLs are
-  restored. Ownership is restored when the daemon runs as root.
+  restored. Ownership is restored when the daemon runs as root. ACLs come
+  back exactly as recorded: an entry backed up without one has none after
+  the restore, even inside a directory whose restored default ACL the
+  kernel would otherwise have handed down to it, and its mode is the
+  backed-up mode.
 - Device nodes need root and a kernel that allows them; one that cannot be
   created is skipped and counted, not failed.
 - Sockets are skipped: they have no content.
@@ -1228,6 +1278,10 @@ fires. A `pack` schedule carried over from an earlier build is disabled at
 start with a `disabled_reason`, since there is no pack job to run; delete
 it.
 
+A schedule has one trigger: an interval in seconds, or a calendar with
+`--every`. Giving both, or `--at`, `--on`, `--on-day` or `--on-month`
+without `--every`, is refused by the CLI rather than one half being dropped.
+
 **Interval** triggers anchor to the last successful run, not to wall-clock
 multiples: a long backup does not make the next one due the moment it ends.
 
@@ -1369,13 +1423,19 @@ What a run counts:
 
 | Count | Meaning |
 |---|---|
+| `checked` | Everything examined: each indexed object, and each regular-file entry that names no content. Always the sum of the five counts below |
+| `ok` | Intact. Never includes a failure, so a run with anything missing or unrecoverable shows `ok` below `checked` |
 | `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` or `--dry-run` |
 | `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
 | `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
 | `missing` | Indexed but absent, including every object in a pack file that has gone, and every index entry of a regular file that names no content at all. **Data loss** |
 
 **Loss fails the verify.** Any `unrecoverable` or `missing` object ends the
-job `failed`, with an error naming the run and the counts, and
+job `failed`, with an error naming the run and the counts (`verify run 7
+found data loss: 52 of 54 checked ok, 0 unrecoverable and 2 missing,
+affecting 2 file(s) in 1 snapshot(s)`; the log line starts `verify (deep)
+FAILED:`), and the job `result` carries the same counts with
+`"failed":true`, and
 `c-backup verify` exits 1, so a scheduler or script that checks the exit
 status sees it. The run and its findings are still recorded and still
 printed on stdout (the failed job goes to stderr); `verify show <id> <run>`
@@ -1397,12 +1457,12 @@ paths and snapshots across every lost object. The CLI prints the run and its
 findings as one JSON document.
 
 Every level also checks the index for regular files that name no content
-object. A backup before 1.0.0's fix for B118 recorded a file it skipped
+object. A backup by a c-backup older than 1.0.0 recorded a file it skipped
 that way: the snapshot listed the file, no restore could produce it, and
 every object check passed because no object was damaged. These are one
 finding, status `missing: file entry has no content` with an empty hash,
-naming the files and snapshots; each counts in `missing` and fails the
-run. Such a snapshot restores everything else; delete it once a newer one
+naming the files and snapshots; each counts once in `checked` and once in
+`missing`, and fails the run. Such a snapshot restores everything else; delete it once a newer one
 covers the files, or keep it and expect its restore to report them.
 
 A checking verify takes the read lock; a repairing one takes the write lock.
@@ -1689,6 +1749,24 @@ plaintext, so they, the trees and deduplication carry over unchanged. Snapshot i
 backups of its own: a snapshot number it already uses for a different tree
 fails the run rather than being overwritten.
 
+**Removing encryption has to be asked for.** Copying an encrypted repository
+into an unencrypted one writes every file out in plaintext, so it is refused
+unless `--to-plaintext` is also given (`"allow_plaintext": true` over the
+API):
+
+```sh
+sudo c-backup repo add /srv/backup/plain "Plain"
+sudo c-backup replicate 1 /srv/backup/plain --reencrypt --to-plaintext
+```
+
+Without it the run is refused before anything is written, naming the flag.
+With it, the daemon logs a warning and journals `replicated encrypted repo
+N into plaintext at <path>` on the source repository, so the one place its
+data leaves its encryption is on the record. Copying an unencrypted
+repository into another unencrypted one drops nothing and needs no flag.
+`--to-plaintext` without `--reencrypt` is refused, since a plain replica
+keeps the source's encryption.
+
 Unlike a plain replica, this is not for an untrusted target: the daemon
 doing it holds both keys, and so must the host the destination is used on.
 Refused when the destination is not a repository, is a replica of the source
@@ -1943,16 +2021,20 @@ configured: <title>: <body>` without.
 ### 17.1 The database is lost or corrupt
 
 Backups are intact; the index is not. Start the daemon with an empty
-database, register each repository again (its marker identifies it), and
-rebuild:
+database and register each repository again (its marker identifies it).
+Registration sees snapshots the index does not hold and queues the reindex
+itself (section 5.1); wait for the `reindex_job` it names:
 
 ```sh
 sudo systemctl stop c-backupd
 sudo mv /var/lib/c-backupd/state.db /var/lib/c-backupd/state.db.bad
 sudo systemctl start c-backupd
-sudo c-backup repo add /srv/backup/main "Main"
-sudo c-backup reindex 1
+sudo c-backup repo add /srv/backup/main "Main"     # {"id":1,...,"reindex_job":1}
+sudo c-backup jobs 1                               # until "state":"completed"
 ```
+
+`c-backup reindex 1` runs the same job by hand, for an encrypted repository
+whose key was loaded after it was registered, or to rebuild again.
 
 Reindex walks every snapshot's trees, at roughly 764,000 rows per second.
 It fails, rather than completing, if any snapshot or pack cannot be read: the
@@ -2228,7 +2310,7 @@ the underlying disk.
 | Backup logs `key not escrowed` | System key not acknowledged | Section 13 |
 | Job `cancelled` after a restart | `systemctl stop` cancels running jobs (section 2.2) | Run it again |
 | Job `failed: interrupted by daemon restart` | The daemon died mid-job: crash, `kill -9`, power loss | Run it again; nothing partial is kept |
-| `restore incomplete: N entries could not be restored` | Some entries failed | The error quotes the first, the log names each (`restore: <path> not restored: <reason>`); check permissions and space at the destination. `regular file has no content` is a snapshot written before the B118 fix; verify reports the same entries |
+| `restore incomplete: N entries could not be restored` | Some entries failed | The error quotes the first, the log names each (`restore: <path> not restored: <reason>`); check permissions and space at the destination. `regular file has no content in the snapshot (written by a c-backup older than 1.0.0, ...)` is a file an older build recorded without being able to read it; verify reports the same entries |
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
 | `<path> is repository format 2; this build reads only format 3 ...` | The repository was written by an earlier build | No migration: restore from it with the build that wrote it and back up again into a new repository (section 17.4) |
@@ -2279,39 +2361,60 @@ command, or `C_BACKUP_SOCKET`, overrides the default. Output is the daemon's
 JSON, one document per command, on stdout (a remove prints what it removed,
 `{"removed":true,...}`); errors go to stderr. `jobs watch` is the one command
 that prints several: one document per line until the job ends. The exit
-status is 0 on success and 1 otherwise. Flags may appear anywhere after the
-command. Commands that start a job wait for it unless given `--no-wait`.
-The listing and lookup commands refuse an argument they do not take, a
-stray positional or an unknown option, with `unexpected argument` and their
-usage, rather than ignore it: `grep runs 1 2` is an error, not repository
-1's runs.
+status is 0 on success and 1 otherwise. Commands that start a job wait for
+it unless given `--no-wait`.
+
+Arguments follow one set of rules for every command, checked before
+anything is sent to the daemon:
+
+- Options may appear anywhere after the command. A value option is written
+  `--name VALUE` or `--name=VALUE`.
+- `--` ends the options: everything after it is a positional, even if it
+  starts with `-`. That is how to pass a label, pattern or note that starts
+  with a dash: `repo add /srv/backup/x -- -scratch`. A value that starts
+  with a dash uses the `=` form: `backup 1 --label=-nightly`.
+- A value option needs a value. One at the end of the line, one followed by
+  another option (`--encrypt --passphrase ...`) and an empty one
+  (`--encrypt=`) are all refused, naming the option. Before 1.0 a missing
+  `--encrypt` value created an unencrypted repository labelled
+  `--encrypt` (B127).
+- An option the command does not take is refused with `unknown option`, and
+  a positional past the ones it takes with `unexpected argument`:
+  `grep runs 1 2` is an error, not repository 1's runs.
+- Only `--exclude` and `--source` repeat. Any other option given twice is
+  refused rather than one copy being picked.
+
+Each refusal prints the reason and the command's usage to stderr and exits
+1; nothing reaches the daemon. `c-backup <command> --help` (or `-h`, before
+any `--`) prints the usage without running anything, and `c-backup help`
+lists every command with all of its arguments.
 
 | Command | Purpose |
 |---|---|
 | `repo list` | Registered repositories |
-| `repo add <path> [label] [--encrypt system\|passphrase] [--passphrase TEXT]` | Create or register |
+| `repo add <path> [label] [--encrypt system\|passphrase\|none] [--passphrase TEXT]` | Create or register |
 | `repo show <id>` | One repository |
 | `repo remove <id>` | Deregister; the directory is kept |
 | `repo key export\|ack <id>`, `repo key import <id> <key-hex>` | Encryption key escrow and recovery |
-| `sources list <id>`, `sources set <id> <path>... [--exclude PAT]...` | What a repository backs up |
+| `sources list <id>`, `sources set <id> [path...] [--exclude PAT]...` | What a repository backs up; `set` with no paths clears the list |
 | `backup <id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT]` | Back up |
 | `restore <id> <snapshot> <dest> [--subpath PATH] [--overwrite]` | Restore |
 | `snapshots <id> [--limit N] [--offset N]` | List snapshots |
 | `snapshot delete <id> <snapshot> [--force]` | Delete one; a tagged one only with `--force` (section 12) |
 | `snapshot note <id> <snapshot> [text]` | Read or write a note |
-| `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
-| `search <id> <text> [--snapshot N] [--limit N]` | File names, one result per path and content |
+| `ls <id> <snapshot> [node-id] [--limit N] [--offset N]`, `snapshot tree` (the same) | One directory level; the root when no node is given |
+| `search <id> <text> [--snapshot N] [--limit N] [--offset N]` | File names, one result per path and content |
 | `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i]` | File contents |
 | `grep runs <id> [--limit N] [--offset N]`, `grep show <id> <run> [--limit N] [--offset N]` | Past content searches, and one search's hits |
-| `diff <id> <from> <to>` | Compare two snapshots |
+| `diff <id> <from> <to> [--limit N] [--offset N]` | Compare two snapshots |
 | `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id> [--limit N] [--offset N]`, `verify show <id> <run> [--limit N] [--offset N]` | Integrity |
 | `gc <id> [--dry-run]` | Garbage collection |
 | `gfs <id> [--dry-run]` | Retention |
 | `reindex <id>` | Rebuild the index |
-| `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
+| `replicate <id> <dest> [--reencrypt] [--to-plaintext]` | Copy into another directory; `--reencrypt` into another repository under its own encryption; `--to-plaintext` to allow that repository to be unencrypted (section 14.1) |
 | `stats <id> [--scope staged]`, `summary <id>`, `fanout <id>` | Repository statistics; `staged` is objects in packs a running backup has not sealed |
-| `objects <id> [--location staged\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
-| `packs <id> [pack-id]` | Packs |
+| `objects <id> [--location staged\|packed] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
+| `packs <id> [pack-id] [--limit N] [--offset N]` | Packs, or one pack's entries |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--result STATE]` | Operation history |
@@ -2321,7 +2424,7 @@ usage, rather than ignore it: `grep runs 1 2` is an error, not repository
 | `auth setup\|password` | Set or change the admin password (prompts) |
 | `auth logout --all` | Revoke every remote session (section 4.3) |
 | `health [live]`, `metrics`, `version` | The daemon |
-| `help` | This list, from the binary |
+| `help [command] [subcommand]` | This list, from the binary; with a command, its usage |
 
 Policy keys: `retention.keep_snaps`, `retention.keep_daily`,
 `retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly`.

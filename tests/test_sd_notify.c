@@ -32,10 +32,10 @@
 #include <cmocka.h>
 
 #include "sd_notify.h"
+#include "test_port.h"
 #include "test_tmp.h"
 
 #define DAEMON_BIN  "build/bins/c-backupd"
-#define DAEMON_PORT 18741
 
 /* A datagram socket bound to `addr` (a path, or '@name' for abstract). */
 static int bind_dgram(const char *addr)
@@ -194,6 +194,12 @@ static void test_daemon_ready_after_bind(void **state)
         skip();
     }
 
+    /* Chosen by the kernel (FLAKE-13). A fixed 18741 failed this test
+     * whenever another run on the host held it: the daemon could not bind,
+     * never sent READY=1, and the wait timed out. */
+    const int daemon_port = test_free_port();
+    assert_true(daemon_port > 0);
+
     char dir[] = TEST_TMP "/cb_sdn_daemon_XXXXXX";
     assert_non_null(mkdtemp(dir));
     char cfg[256], db[256], sock[256], keys[256], ntf[256];
@@ -206,7 +212,7 @@ static void test_daemon_ready_after_bind(void **state)
     FILE *f = fopen(cfg, "w");
     assert_non_null(f);
     fprintf(f, "db:\n  path: %s\nhttp:\n  socket: %s\n  port: %d\n  bind: 127.0.0.1\n"
-               "log:\n  level: warn\n", db, sock, DAEMON_PORT);
+               "log:\n  level: warn\n", db, sock, daemon_port);
     fclose(f);
     chmod(cfg, 0600);
 
@@ -226,7 +232,7 @@ static void test_daemon_ready_after_bind(void **state)
     char buf[128];
     ssize_t n = recv_within(nfd, buf, sizeof(buf), 30000);
     int unix_ok = unix_connects(sock);
-    int tcp_ok = tcp_connects(DAEMON_PORT);
+    int tcp_ok = tcp_connects(daemon_port);
 
     kill(pid, SIGTERM);
     char buf2[128];

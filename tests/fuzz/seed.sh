@@ -25,12 +25,14 @@ printf 'data at the end' | dd of="$W/src/sparse.bin" bs=1 seek=1048000 conv=notr
 setfattr -n user.seed -v "seedvalue" "$W/src/sub/small.txt" 2>/dev/null || true
 setfacl -m u:"$(id -u)":rwx "$W/src/sub" 2>/dev/null || true
 
+# No TCP listener: everything below goes over the socket, and a fixed port
+# here collided with any other daemon on the host (FLAKE-13).
 cat > "$W/config.yaml" <<YAML
 db:
   path: $W/state.db
 http:
   socket: $W/sock
-  port: 19771
+  port: 0
   bind: 127.0.0.1
 security:
   key_dir: $W/keys

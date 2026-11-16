@@ -21,6 +21,8 @@ struct small_pool {
     store_t            *store;
     const cdc_params_t *cp;
     atomic_int         *cancel;
+    scan_roots_t       *roots;    /* open beneath the source root (B128) */
+    int                 one_fs;
 
     pthread_mutex_t     mu;
     pthread_cond_t      work;     /* a batch was queued, or stop */
@@ -49,15 +51,15 @@ small_batch_t *small_batch_new(void)
     return b;
 }
 
-int small_batch_add(small_batch_t *b, uint32_t index, const char *path,
-                    uint64_t size, const struct stat *scan_st)
+int small_batch_add(small_batch_t *b, uint32_t index, const scan_entry_t *e)
 {
     small_file_t *f = &b->files[b->n++];
     memset(f, 0, sizeof(*f));
+    uint64_t size = e->node.size;
     f->index = index;
-    f->path = path;
+    f->path = e->path;
     f->size = size;
-    f->scan_st = scan_st;
+    f->entry = e;
     b->bytes += size;
     return b->n >= b->cap || b->bytes >= SMALL_BATCH_BYTES;
 }
@@ -137,11 +139,13 @@ static void discard_objs(void *ctx)
 static void store_one(small_pool_t *pool, small_file_t *f)
 {
     f->ran = 1;
-    /* Never through a symlink (B128); see SETTLE_OPEN_FLAGS. */
-    int fd = open(f->path, SETTLE_OPEN_FLAGS);
+    /* Beneath the source root, never through a symlink, and only the
+     * regular file it still is (open_scanned.h, B128). */
+    struct stat fst;
+    int fd = open_scanned(pool->roots, f->entry, pool->one_fs, &fst,
+                          f->err, sizeof(f->err));
     if (fd == -1) {
         f->skipped = 1;
-        settle_open_reason(errno, f->err, sizeof(f->err));
         return;
     }
     keep_ctx_t k = { pool->store, f };
@@ -156,7 +160,7 @@ static void store_one(small_pool_t *pool, small_file_t *f)
     cdc_result_t r;
     settle_result_t sr;
     err_clear();
-    f->st = settle_store_fd(pool->cp, fd, f->scan_st, &sink, &o,
+    f->st = settle_store_fd(pool->cp, fd, &f->entry->st, &sink, &o,
                             discard_objs, f, &r, &sr);
     close(fd);
     if (f->st != OK) {
@@ -213,6 +217,7 @@ static void *worker_main(void *arg)
 
 status_t small_pool_start(store_t *store, const cdc_params_t *cp, unsigned n,
                           unsigned inflight, atomic_int *cancel,
+                          scan_roots_t *roots, int one_fs,
                           small_pool_t **out)
 {
     *out = NULL;
@@ -225,6 +230,8 @@ status_t small_pool_start(store_t *store, const cdc_params_t *cp, unsigned n,
     pool->store = store;
     pool->cp = cp;
     pool->cancel = cancel;
+    pool->roots = roots;
+    pool->one_fs = one_fs;
     pool->n = n;
     pool->inflight = inflight;
     pthread_mutex_init(&pool->mu, NULL);

@@ -660,7 +660,7 @@ static void test_replica_of_another_format_is_refused(void **state)
     assert_int_equal(replica_sink_local_open(TEST_REPLICA, &m, &sink), ERR_INVALID);
     assert_non_null(strstr(err_msg(), "is repository format 2; this build reads only format 3"));
     err_clear();
-    assert_int_equal(replica_sink_local_open_reencrypt(TEST_REPLICA, &m, &sink), ERR_INVALID);
+    assert_int_equal(replica_sink_local_open_reencrypt(TEST_REPLICA, &m, 0, &sink), ERR_INVALID);
     assert_non_null(strstr(err_msg(), "is repository format 2"));
     err_clear();
     replica_reader_t *rd = NULL;
