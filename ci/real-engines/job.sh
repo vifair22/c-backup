@@ -55,8 +55,8 @@ done
 
 # ---- the fixed image --------------------------------------------------------
 # Tagged by the content of this directory, so an unchanged Dockerfile and
-# run.sh is a cache hit on the runner, and old tags are dangling once
-# replaced: pruned below, scoped by our label.
+# run.sh is a cache hit on the runner; the tags it replaces are removed
+# below.
 TAG=$(cd "$HERE" && cat Dockerfile run.sh | sha256sum | cut -c1-16)
 IMAGE="cbk-real-engines:$TAG"
 log "image $IMAGE"
@@ -70,6 +70,11 @@ for attempt in 1 2 3; do
     sleep 5
 done
 [ "$built" = 1 ] || { log "cannot build $IMAGE"; exit 1; }
+# Superseded tags keep their names, so they are never dangling and a prune
+# alone would keep every one: remove each other cbk-real-engines tag. One in
+# use by a live sibling refuses removal, which is the right answer.
+docker images cbk-real-engines --format '{{.Repository}}:{{.Tag}}' | grep -vxF "$IMAGE" |
+    while read -r old; do docker rmi "$old" >/dev/null 2>&1 && log "removed superseded image $old"; done || true
 docker image prune -f --filter label=cbk.ci=real-engines >/dev/null || true
 
 # ---- c-utils at the pinned version -----------------------------------------
