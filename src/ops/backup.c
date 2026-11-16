@@ -121,6 +121,9 @@ typedef struct {
     store_pool_t  *pool;
     /* Where every object the backup produces goes; see bsink_t. */
     struct bsink  *sink;
+    /* Names being written, shared by this thread's writer and the file
+     * workers' while they run, so no two store one chunk (OWN-46). */
+    pack_claims_t *claims;
 } pipeline_t;
 
 /*
@@ -606,9 +609,10 @@ static int store_cancelled_cb(void *ctx)
  * a wait behind the backup thread's batch: a mixed tree on NVMe took twice
  * as long as the format 2 writer.
  *
- * Writers do not see each other's unsealed packs, so a chunk two workers
- * stage at once is stored twice; readers take the first, and gc counts the
- * other as dead weight. The B086 write-once proposal accepted the same.
+ * Writers do not see each other's unsealed packs, so they share a claim
+ * set (pack_claims_t): a chunk one writer is storing is referenced, not
+ * stored again, by the others. Without it twins on two workers were stored
+ * once each, the same name twice on disk (OWN-46).
  */
 typedef struct {
     pipeline_t           *p;
@@ -633,6 +637,7 @@ static status_t fpool_begin(void *ctx, void **wstate)
     if (!w->sink) { pack_backup_abort(w->pw); free(w); return set_error(ERR_NOMEM, "backup: sink"); }
     w->sink->may_rollover = 1;
     w->sink->no_rows = 1;
+    pack_backup_share_claims(w->pw, p->claims);
     *wstate = w;
     return OK;
 }
@@ -826,6 +831,11 @@ static status_t store_content(pipeline_t *p)
     unsigned fw = workers / 4;
     if ((uint64_t)fw > n_large) fw = (unsigned)n_large;
     if (fw >= 2 && p->cdc_w) {
+        p->claims = pack_claims_new();
+        if (p->claims) pack_backup_share_claims(p->pack_w, p->claims);
+        else fw = 0;     /* no claim set: one file at a time, never twice */
+    }
+    if (fw >= 2 && p->cdc_w) {
         store_pool_ops_t ops = {
             .begin = fpool_begin, .store = fpool_store, .end = fpool_end,
             .out_free = free, .ctx = p,
@@ -861,6 +871,27 @@ static status_t store_content(pipeline_t *p)
     if (st == OK && pst != OK) {
         st = pst;
         snprintf(why, sizeof(why), "%s", err_msg());
+    }
+    /*
+     * Every file worker's packs are committed or abandoned by now. A claim
+     * that was abandoned may have been referenced by another writer as
+     * stored, so a snapshot made from this run could name a chunk that never
+     * landed: the run fails instead. This thread's writer leaves the set;
+     * its own staged names are known to it, and nothing else is writing.
+     */
+    if (p->claims) {
+        uint64_t lost = pack_claims_abandoned(p->claims);
+        if (pack_claims_deferred(p->claims))
+            log_info("backup: %llu chunk(s) met by two writers at once, stored once",
+                     (unsigned long long)pack_claims_deferred(p->claims));
+        pack_backup_share_claims(p->pack_w, NULL);
+        pack_claims_free(p->claims);
+        p->claims = NULL;
+        if (st == OK && lost) {
+            st = set_error(ERR_IO, "backup: %llu chunk(s) another writer was storing "
+                           "were never committed", (unsigned long long)lost);
+            snprintf(why, sizeof(why), "%s", err_msg());
+        }
     }
     cdc_workers_stop(p->cdc_w);
     p->cdc_w = NULL;

@@ -382,7 +382,12 @@ not parsed, and its parity is never applied.
   with its codec).
 - the **rewriter** in gc and coalescing: live entries of old packs copied,
   corrected from parity on the way, into new packs; the old ones removed
-  only once the new ones are installed, synced and announced.
+  only once the new ones are installed, synced and announced. An entry is
+  live when its name is referenced and it is the copy `pack_objects` names.
+  Another copy of a referenced name (a duplicate, OWN-22) is dropped only
+  after the named copy has been read and found to be that name at that
+  offset, within its pack; when it cannot be confirmed, the duplicate is
+  kept, since it may be the only good copy (`pack_gc_stats_loc`).
 
 A pack installs with one `rename` from `tmp/`, after `fsync`. Its contents
 reach the daemon's index through the pack-commit callback; a store with no
@@ -828,8 +833,14 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
    and seals its own packs. Pack numbers come from one allocator on the
    store handle (`store_alloc_pack_num`), since writers staging at once
    cannot see each other's packs in `tmp/`. Writers do not see each other's
-   unsealed entries either, so a chunk two of them stage at the same moment
-   is stored twice; readers take the first and gc counts the other dead.
+   unsealed entries either, so they share a claim set (`pack_claims_t`,
+   OWN-46): a writer claims a name before writing it, a writer that finds
+   it claimed references it without writing it, and the claims clear when
+   the owner's pack commits, after which the index answers. A claim whose
+   pack never commits is counted as abandoned and fails the backup, since a
+   reference may have been made on its strength. Without it, identical
+   files on two workers were stored once each: 22 names twice and twice the
+   payload on the twins fixture in `test_cdc_backup`.
 5. Index rows. A pack's commit creates the object row of every entry that
    has none (`db_pack_commit` upserts with the entry's type), in the same
    transaction as the pack's own rows, so no writer races its own seal: a
