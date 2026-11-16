@@ -125,7 +125,7 @@ static void test_policy_inline_comments(void **state)
         "[helper]\n"
         "daemon_uid = 990              # the only peer uid accepted (non-root)\n"
         "daemon_id = 7f3a09c1          # the daemon id artefacts are named with\n"
-        "max_pause_s = 30\t# watchdog bound\n"
+        "max_pause_s = 30\t; watchdog bound, the other comment style\n"
         "allow_restore = 1             # restore.stage, restore.swap\n"
         "state_dir = /mnt/cache/system/c-backup-helper   # on a pool\n"
         "[units]\n"
@@ -137,7 +137,7 @@ static void test_policy_inline_comments(void **state)
         "kind = dump                    # dump: stdout comes back as a pipe fd\n"
         "argv.0 = /bin/sh\n"
         "argv.1 = -c\n"
-        "argv.2 = echo a # not a comment here\n";
+        "argv.2 = echo a # not a comment here ; nor this\n";
     helper_policy_t p;
     assert_int_equal(helper_policy_parse(text, &p), OK);
     assert_int_equal(p.daemon_uid, 990);
@@ -146,7 +146,7 @@ static void test_policy_inline_comments(void **state)
     assert_true(p.allow_restore);
     assert_string_equal(p.state_dir, "/mnt/cache/system/c-backup-helper");
     assert_int_equal(p.n_hooks, 1);
-    assert_string_equal(p.hooks[0].argv[2], "echo a # not a comment here");
+    assert_string_equal(p.hooks[0].argv[2], "echo a # not a comment here ; nor this");
     helper_policy_free(&p);
     /* A value that is wrong is still refused, comment or not. */
     assert_int_not_equal(helper_policy_parse("[helper]\ndaemon_uid = 0   # root\n"
