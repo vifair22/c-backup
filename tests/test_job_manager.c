@@ -634,10 +634,21 @@ static status_t polling_job(void *arg, atomic_int *cancel,
     pthread_mutex_lock(&g_mu);
     g_polling_runs++;
     pthread_mutex_unlock(&g_mu);
-    for (int i = 0; i < 2000; i++) {
+    /*
+     * Runs until cancelled. The bound only stops a broken test hanging for
+     * ever, so it is wall-clock and far past any test's own work: it was
+     * 2000 sleeps of 5 ms, about 10 s, and under load the 256 submits of
+     * test_full_queue_refuses_and_spares_running_jobs took 14 to 37 s, so
+     * both jobs gave up, their workers took queued jobs and the submit
+     * meant to find the queue full found room (FLAKE-18).
+     */
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    do {
         if (atomic_load(cancel)) return set_error(ERR_IO, "cancelled");
         usleep(5000);
-    }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    } while (now.tv_sec - t0.tv_sec < 120);
     return set_error(ERR_IO, "polling_job: never cancelled");
 }
 
