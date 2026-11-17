@@ -1,6 +1,7 @@
 /*
  * A stand-in qemu-guest-agent, run as /init of a tiny initramfs booted with
- * the host's kernel, for the libvirt suites (test_virt_offline). It gives a
+ * the host's kernel, for the libvirt suites (test_virt_offline). It lives
+ * under fake_host/, not tests/, because every tests/*.c is a suite. It gives a
  * guest with no OS a real agent on the virtio port libvirt talks to, whose
  * freeze can be made to hang like a slow fsfreeze hook: qga_freeze_s=N on
  * the kernel command line sleeps N seconds inside the first
@@ -23,10 +24,15 @@
 #include <time.h>
 #include <unistd.h>
 
-static void say(const char *fmt, int n)
+static void say(const char *text)
+{
+    (void)!write(1, text, strlen(text));
+}
+
+static void say_n(const char *what, int n)
 {
     char line[96];
-    int len = snprintf(line, sizeof(line), fmt, n);
+    int len = snprintf(line, sizeof(line), "fake-qga: %s %d\n", what, n);
     if (len > 0) (void)!write(1, line, (size_t)len);
 }
 
@@ -102,10 +108,10 @@ int main(void)
     int con = open("/dev/console", O_WRONLY);
     if (con >= 0) { dup2(con, 1); dup2(con, 2); }
     int delay = freeze_delay();
-    say("fake-qga: booted%s\n", 0);
+    say("fake-qga: booted\n");
     int fd = open_port();
-    if (fd < 0) { say("fake-qga: no agent port%s\n", 0); for (;;) pause(); }
-    say("fake-qga: ready (freeze takes %d s)\n", delay);
+    if (fd < 0) { say("fake-qga: no agent port\n"); for (;;) pause(); }
+    say_n("ready, first freeze takes (s)", delay);
 
     char buf[8192];
     size_t have = 0;
@@ -141,16 +147,16 @@ int main(void)
             } else if (strstr(cmd, "\"guest-ping\"")) {
                 snprintf(out, sizeof(out), "{\"return\": {}}\n");
             } else if (strstr(cmd, "\"guest-fsfreeze-freeze")) {
-                say("fake-qga: freezing%s\n", 0);
+                say("fake-qga: freezing\n");
                 for (int i = 0; i < delay * 10; i++) nap_ms(100);
                 delay = 0;
                 frozen = 1;
-                say("fake-qga: frozen%s\n", 0);
+                say("fake-qga: frozen\n");
                 snprintf(out, sizeof(out), "{\"return\": 1}\n");
             } else if (strstr(cmd, "\"guest-fsfreeze-thaw\"")) {
                 int was = frozen;
                 frozen = 0;
-                say("fake-qga: thawed %d\n", was);
+                say_n("thawed", was);
                 snprintf(out, sizeof(out), "{\"return\": %d}\n", was);
             } else if (strstr(cmd, "\"guest-fsfreeze-status\"")) {
                 snprintf(out, sizeof(out), "{\"return\": \"%s\"}\n", frozen ? "frozen" : "thawed");

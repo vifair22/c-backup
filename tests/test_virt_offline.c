@@ -509,7 +509,7 @@ static void test_qemu_nbd_error_reported(void **state)
  * the helper serves meanwhile.
  *
  * The guest is the host's kernel and an initramfs whose /init is a fake
- * qemu-ga (tests/fake_qga.c) taking QGA_FREEZE_S over each freeze. The
+ * qemu-ga (tests/fake_host/qga/init.c) taking QGA_FREEZE_S over each freeze. The
  * helper that dies is this binary re-run as --qga-child, so it shares no
  * libvirt connection or threads with the suite.
  */
@@ -579,7 +579,7 @@ static void test_freeze_killed_helper(void **state)
     char src[PATH_MAX];
     snprintf(src, sizeof(src), "%s", __FILE__);
     char *slash = strrchr(src, '/');
-    snprintf(slash ? slash + 1 : src, sizeof(src) - (size_t)(slash ? slash + 1 - src : 0), "fake_qga.c");
+    snprintf(slash ? slash + 1 : src, sizeof(src) - (size_t)(slash ? slash + 1 - src : 0), "fake_host/qga/init.c");
     if (system(pf("mkdir -p '%s/qga/root/dev' '%s/qga/root/proc' '%s/qga/root/sys' '%s/hkill' && "
                   "cc -static -O2 -o '%s/qga/root/init' '%s' 2>/dev/null && "
                   "cd '%s/qga/root' && find . | cpio -o -H newc --quiet > '%s/qga/initrd.img' && "
