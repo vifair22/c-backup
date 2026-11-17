@@ -309,8 +309,8 @@ static void max_pack_num_cb(uint32_t pack_num, void *ctx) {
  * The scan alone reissued the number of a pack dropped as missing, and when
  * the original came back the index described the wrong file.
  *
- * The scan cannot see a pack still staging in tmp/, because it is not named
- * until it is installed, so writers open at once on one handle (a backup's
+ * The scan cannot see a pack still in packs/.staging, because it is not
+ * named until it is installed, so writers open at once on one handle (a backup's
  * and the store's own) never share a number only because the handle
  * remembers what it issued. Across handles, every writer - backup, gc,
  * replicate - is a repo-scoped job holding the repo write lock, and that
@@ -1816,10 +1816,16 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
 static status_t open_new_pack_buf(store_t *store, FILE **dat_f, char *dat_tmp,
                                   pack_dat_hdr_t *dat_hdr, size_t bufsz)
 {
-    if (path_fmt(dat_tmp, PATH_MAX, "%s/tmp/pack-dat.XXXXXX", store_root(store)) != 0)
-        return set_error(ERR_IO, "open_new_pack: tmp path too long");
+    /* Staged in packs/ itself, never tmp/: packs/ may be a mount of its
+     * own, and the install's rename cannot cross filesystems (B163). */
+    char staging[PATH_MAX];
+    if (store_pack_staging(store, staging, sizeof(staging)) != 0)
+        return set_error_errno(ERR_IO, "open_new_pack: cannot create %s/" STORE_PACK_STAGING,
+                               store_root(store));
+    if (path_fmt(dat_tmp, PATH_MAX, "%s/pack-dat.XXXXXX", staging) != 0)
+        return set_error(ERR_IO, "open_new_pack: staging path too long");
 
-    /* Staging is about to exist here: claim tmp/, so a sweep by another
+    /* Staging is about to exist here: claim it, so a sweep by another
      * handle meanwhile leaves it alone (store_claim_tmp). */
     (void)store_claim_tmp(store);
     int dat_fd = mkstemp(dat_tmp);
@@ -3988,9 +3994,11 @@ static int pack_hdr_read_file(FILE *f, pack_dat_hdr_t *out)
  *
  * pack_resume_deleting replays a marker by deleting every pack it names, so
  * a marker cut short by a crash is worse than none: "123" truncated to "12"
- * names some other pack. Written in tmp/ and renamed into packs/, it is
- * either whole or absent. The staging name must not itself look like a
- * marker, which is why it does not live in packs/.
+ * names some other pack. Written in packs/.staging and renamed into
+ * packs/, it is either whole or absent; staged in packs/ rather than tmp/
+ * because packs/ may be a mount of its own (B163). The staging name must
+ * not itself look like a marker, and pack_resume_deleting reads only
+ * packs/ itself, never the staging directory.
  *
  * On failure after the rename the marker stays where it is, and that is
  * safe: it is written only once everything it would let a resume delete is
@@ -4000,15 +4008,17 @@ static status_t write_deleting_marker(store_t *store, uint32_t key,
                                       const uint32_t *nums, size_t n,
                                       char *out_path, size_t out_sz)
 {
-    char tmp[PATH_MAX], packs_dir[PATH_MAX];
-    if (path_fmt(tmp, sizeof(tmp), "%s/tmp/deleting.XXXXXX", store_root(store)) != 0 ||
+    char tmp[PATH_MAX], packs_dir[PATH_MAX], staging[PATH_MAX];
+    if (store_pack_staging(store, staging, sizeof(staging)) != 0)
+        return set_error_errno(ERR_IO, "pack marker: cannot create %s/" STORE_PACK_STAGING,
+                               store_root(store));
+    if (path_fmt(tmp, sizeof(tmp), "%s/deleting.XXXXXX", staging) != 0 ||
         path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0 ||
         path_fmt(out_path, out_sz, "%s/.deleting-" PACK_NUM_FMT, packs_dir, key) != 0)
         return set_error(ERR_IO, "pack marker: path too long");
 
     int fd = mkstemp(tmp);
-    if (fd == -1) return set_error_errno(ERR_IO, "pack marker: mkstemp in %s/tmp",
-                                         store_root(store));
+    if (fd == -1) return set_error_errno(ERR_IO, "pack marker: mkstemp in %s", staging);
     FILE *f = fdopen(fd, "w");
     if (!f) {
         int err = errno;
@@ -4039,8 +4049,8 @@ static status_t write_deleting_marker(store_t *store, uint32_t key,
     return OK;
 }
 
-/* One sealed output of a rewrite, still in tmp/. Its entries are a slice
- * of the rewriter's shared array. */
+/* One sealed output of a rewrite, still in packs/.staging. Its entries are
+ * a slice of the rewriter's shared array. */
 typedef struct {
     char     tmp[PATH_MAX];
     uint32_t first;
@@ -4058,8 +4068,8 @@ typedef struct {
  * pack_rw_replace carries out:
  *
  *   1. Copy (pack_rw_copy, pack_rw_seal). Entries go into outputs staged in
- *      tmp/, each sealed - parity written, fsynced - when the next entry
- *      would pass the seal. Nothing in packs/ changes, so this phase, the
+ *      packs/.staging, each sealed - parity written, fsynced - when the next
+ *      entry would pass the seal. Nothing in packs/ changes, so this phase, the
  *      long one, can fail, be cancelled or be killed and leave only staging
  *      files, which the next backup or gc sweeps.
  *   2. Install. Each output is renamed to a fresh pack number and its shard
@@ -4249,7 +4259,8 @@ static status_t pack_rw_append(pack_rw_t *rw, uint8_t *buf, size_t len)
 }
 
 /* Remove outputs: the first `installed` from packs/ under base onward (with
- * the removal callback, though none was announced yet), the rest from tmp/. */
+ * the removal callback, though none was announced yet), the rest from
+ * packs/.staging. */
 static void pack_rw_discard(pack_rw_t *rw, uint32_t base, size_t installed)
 {
     if (rw->cur) { fclose(rw->cur); rw->cur = NULL; }

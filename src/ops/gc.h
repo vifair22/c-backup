@@ -44,8 +44,8 @@ typedef struct {
      * files that left: 20 merged into 3 is 20 and 17. */
     uint32_t packs_coalesced;
     uint32_t packs_removed_by_coalesce;
-    /* Staging files an interrupted run left in tmp/, removed by this run.
-     * A dry run removes none. */
+    /* Staging files an interrupted run left in tmp/ or packs/.staging,
+     * removed by this run. A dry run removes none. */
     uint32_t tmp_files_removed;
     uint64_t tmp_bytes_removed;
     /* Entries a rewrite or coalesce copied with damage beyond parity, and

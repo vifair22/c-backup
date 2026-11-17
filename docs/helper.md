@@ -7,12 +7,13 @@ root-equivalent on the host (sockets, devices, capabilities, the host's own
 operations over a unix socket. The daemon, which faces the network, holds
 none of it.
 
-What this build has: the protocol, the policy, the leases and watchdogs, the
-peer check, fd passing for dump hooks, restore staging and swap, and two
-backends: the fake provider (tests only) and `dir_domains` (a directory
-"snapshot domain" for tests and for `capture.begin_paths`). libvirt, Docker
-and LXC operations are validated and held to the policy and then answered
-`unsupported` until those providers exist.
+It carries the protocol, the policy, the leases and watchdogs, the peer
+check, fd passing for dump hooks, restore staging and swap, and these
+backends, each enabled by its policy section: Docker and LXC (below),
+libvirt (`vm-backup.md`), the fake provider (tests only, `fake_spec`) and
+`dir_domains` (a directory "snapshot domain" for tests and for
+`capture.begin_paths`). A provider whose section is off answers
+`unsupported`.
 
 ## Deployment (Docker, Unraid)
 
@@ -146,8 +147,15 @@ Notes that matter:
 - **A unit job while the helper is away fails and alerts**, scheduled or
   not, with the socket path and the reason in the error, the journal and
   the push alert; it is never skipped quietly. A job in flight when the
-  helper restarts fails cleanly (no snapshot, the helper's own start-up
-  sweep releases what the old process held), and the next one reconnects.
+  helper restarts loses its capture: the new process's start-up sweep
+  releases what the old one held and destroys its snapshots. A unit that
+  still needed the helper (its begin, or a read through a snapshot that is
+  now gone) fails cleanly with no snapshot. A unit whose reads had all
+  finished keeps its snapshot, which is whole, since everything in it was
+  read from the capture before it went; its end could not reach the old
+  capture, and that is a warning on the job. The fake provider's trees are
+  read from live directories, so there a restart mid-read shows the second
+  case. The next job reconnects.
   `GET /providers` shows the link (`helper.state`: `connected`,
   `disconnected` or `never-connected`, `since`, `last_error`,
   `reconnects`) and, per provider behind it, `connection.state`.
@@ -191,10 +199,33 @@ timeout_s = 900
 on_fail = continue
 ```
 
-Allow globs match `<provider>:<id>` and `<provider>:<name>`, the name from
-the helper's own inspect. `c-backup-helper --policy PATH --check` validates a
-policy and prints its SHA-256, the digest the helper's `hello` reports and
-`GET /providers` shows.
+Allow globs (`fnmatch(3)`, so `*`, `?` and `[...]`) match the whole unit
+key `<provider>:<id>`, or `<provider>:<name>` with the name from the
+helper's own inspect. The id is per provider:
+
+| Unit | Key | Glob for the UAT units |
+|------|-----|------------------------|
+| compose project | `docker:compose:<project>` | `docker:compose:cbk-uat-*` |
+| standalone container | `docker:<container name>` | `docker:cbk-uat-*` |
+| LXC container | `lxc:<name>` | `lxc:cbk-uat-*` |
+| libvirt domain | `libvirt:<uuid>` (id), `libvirt:<name>` (name) | `libvirt:cbk-uat-*` |
+
+A compose project is one unit whose id starts `compose:`, so
+`docker:cbk-uat-*` does **not** reach the project `cbk-uat-compose`, nor any
+container in it (a member is backed up through its project, never alone);
+list `docker:compose:cbk-uat-*` as well. Compose project names are always
+lowercase (compose lowercases the directory name it derives one from, and
+refuses `-p` with capitals), so the project part of a `docker:compose:` or
+`compose:` glob is folded to lowercase when the policy is read:
+`docker:compose:Immich` allows the project `immich`. Container and LXC
+names keep their case. `pause_always` globs are folded the same way, and a
+hook's `unit` must already be lowercase (it is a key, not a glob). The
+daemon's `units.allow` (`source-providers.md` 8.3) takes the same keys and
+folds the same way.
+
+`c-backup-helper --policy PATH --check` validates a policy and prints its
+SHA-256, the digest the helper's `hello` reports and `GET /providers`
+shows.
 
 ## The protocol
 
@@ -220,7 +251,17 @@ the 19 of section 11.3 (`hello`, `units.list`, `units.describe`,
 
 The daemon (`src/providers/remote_provider.c`) opens one connection per
 request, says hello, sends it, and closes, so concurrent jobs never queue
-behind each other and a helper restart costs nothing. Data never crosses the
+behind each other and a helper restart costs nothing. Every hello carries
+`session`, a token the daemon makes at start, and the daemon keeps one more
+connection open for as long as it runs, the anchor (`hello` with `anchor`).
+When a session's last anchor closes, as the kernel closes it for a daemon
+that is killed, the helper ends the captures that session began as
+aborted, releasing their pauses, freezes, exports and snapshots then rather
+than at `capture_max_s`. A capture still in its begin ends itself when it
+finds its session gone, so a hold is never released from outside before
+it is taken. `hello` answers `holds` and `captures`, what the helper has
+journalled and open; `GET /providers` adds the helper's holds to
+`holds_open` and shows both under `helper`. Data never crosses the
 socket: the daemon reads trees through the read roots the helper returns,
 and disks through its own mounts (for the fake, its run map).
 
@@ -295,10 +336,10 @@ What a capture of one unit does, in order:
    (`system`, `remote-volume`, `outside-include-roots`).
 2. Each included mount is resolved to where its bytes are (`/mnt/user` to
    the one pool or disk holding the share, symlinks in the host's
-   namespace) and to its snapshot domain: the dataset at the longest
-   mountpoint if the policy lists it (never a parent dataset), or a btrfs
-   pool root. A mount in no domain is read live and the unit's level is
-   `inconsistent`.
+   namespace, then bind mounts through the host's mount table, below) and
+   to its snapshot domain: the dataset at the longest mountpoint if the
+   policy lists it (never a parent dataset), or a btrfs pool root. A mount
+   in no domain is read live and the unit's level is `inconsistent`.
 3. Pre hooks run through `docker exec` (`lxc-attach` for LXC), live, one
    at a time; `on_fail = fail` fails the unit before anything is held.
 4. Docker: a pause only when it adds something, which under `pause = auto`
@@ -322,6 +363,31 @@ The daemon needs the pools mounted read-only with `rslave`
 btrfs snapshot directory are visible to it; the file scanner never enters
 `.zfs` or `.cbackup-snapshots` itself, so a file backup of a pool does not
 read capture snapshots.
+
+**Bind mounts on the host, and named volumes.** Unraid mounts
+`/var/lib/docker` as a bind of a pool directory (FS1:
+`/mnt/cache/system/docker`, the `cache/system` dataset), so a named
+volume's `Source`, `/var/lib/docker/volumes/<v>/_data`, names no snapshot
+domain and is not a path the daemon has. After `realpath`, the helper looks
+the path up in the host's mount table (`/proc/1/mountinfo`; a mount's
+major:minor, root and mount point): a mount whose root is below `/` is a
+bind of that directory of its filesystem, and the path is rewritten
+through another mount of the same filesystem, a pool path under `mnt_root`
+first. The volume above becomes
+`/mnt/cache/system/docker/volumes/<v>/_data`: in `cache/system`'s domain
+when the policy lists it, read from that dataset's snapshot, and under
+`/mnt/cache` either way, which the daemon already mounts. The recorded path
+stays `/var/lib/docker/volumes/<v>/_data`. When Docker's directory is on a
+user share (`/mnt/user/system/docker`), the rewrite lands on shfs and is
+resolved to the one pool or disk holding it, as any `/mnt/user` bind is. A
+table that names a source the host does not have fails the unit rather
+than guessing. Docker in a
+`docker.img` (a loop-mounted image, Unraid's default) has no pool path:
+such a volume is noted `loop-image` in `mounts.json`, is read live at
+`/var/lib/docker/volumes/...` (level `inconsistent`), and needs
+`-v /var/lib/docker/volumes:/var/lib/docker/volumes:ro,rslave` on the
+daemon. Docker in a directory on a pool is what makes volumes
+snapshot-consistent.
 
 ### Hooks: logs and dumps
 
@@ -427,14 +493,29 @@ the include roots, need `allow_privileged_define`.
 The daemon's side is `mode: unit` (`c-backup unit restore <repo> <snap>
 --define ...`):
 
+- **Every refusal comes first.** The definition is built and sent to the
+  helper as a check (`unit.define` with `check`) before anything is
+  written: a policy without `allow_define`, a privileged definition
+  without `allow_privileged_define`, a provider not behind the helper, an
+  in-place restore without `allow_restore`, or a VM still running for an
+  in-place restore, is refused with the unit untouched.
 - **In place** needs `--replace`: the unit is stopped, each mount staged,
   restored and swapped in, the old data left at `<mount>.cbackup-old-<job>`,
-  then the definition applied with replace.
+  then the definition applied with replace. The mount root takes the
+  snapshot's owner, mode, times, xattrs and ACLs, not the staging
+  directory's. If a step fails after the unit was stopped (a restore into
+  staging, a swap, or the define itself), each swap is undone with
+  `restore.swap` `undo`, newest first, and the unit is started again if it
+  was running; the error says so, and where the restored copy was kept in
+  staging. A swap that cannot be undone leaves the unit stopped and says
+  which data is still at `<mount>.cbackup-old-<job>`.
 - **Under a new name** needs `--target-root DIR`: each mount is restored to
   `DIR/<its original path>` and the definition's bind sources (Docker,
   compose volumes), rootfs and mount entries (LXC) are rewritten there; the
   original's paths are never written. `DIR` must lie inside an include root,
-  since the helper refuses binds outside them.
+  since the helper refuses binds outside them. A define that fails after the
+  data was written leaves it under `DIR`, and the error says to remove it
+  or give another target root before trying again.
 - The definition travels to the helper as a sealed memfd (no size limit);
   the helper's warnings land in the job result and the journal.
 
@@ -639,8 +720,10 @@ scripted UAT step on FS1 (below).
 
 ## UAT: real ZFS (FS1) and btrfs (FS2)
 
-Disposable containers only, `units.allow = docker:cbk-uat-*` in the
-daemon and the same globs in the helper's `[units] allow`. Run each step
+Disposable containers only, `units.allow =
+docker:cbk-uat-*,docker:compose:cbk-uat-*` in the daemon and the same globs
+in the helper's `[units] allow` (the second is what reaches the compose
+project; see the key table under The policy). Run each step
 on the host named, from a shell that can reach both containers.
 
 **FS2 (btrfs, no subvolumes).** Policy: `btrfs_domains = /mnt/cache`,

@@ -3,6 +3,7 @@
 #include "prune.h"
 #include "sync_latch.h"
 #include "db_txn.h"
+#include "repo.h"
 #include "repo_tags.h"
 #include "snap_record.h"
 #include "db_write.h"
@@ -243,10 +244,10 @@ status_t prune_finish_pending(cutils_db_t *db, int64_t repo_id, unsigned *out_fi
     const char *p1[] = { repo, NULL };
     db_result_t *r = NULL;
     if (db_execute(db, repo_id > 0
-            ? "SELECT m.repo_id, m.key, m.value, r.path FROM recovery_state m"
+            ? "SELECT m.repo_id, m.key, m.value, r.path, r.uuid FROM recovery_state m"
               " JOIN repos r ON r.id = m.repo_id"
               " WHERE m.key LIKE 'prune-pending-%' AND m.repo_id = ?"
-            : "SELECT m.repo_id, m.key, m.value, r.path FROM recovery_state m"
+            : "SELECT m.repo_id, m.key, m.value, r.path, r.uuid FROM recovery_state m"
               " JOIN repos r ON r.id = m.repo_id WHERE m.key LIKE 'prune-pending-%'",
             repo_id > 0 ? p1 : NULL, &r) != 0) {
         db_result_free(r);
@@ -265,6 +266,14 @@ status_t prune_finish_pending(cutils_db_t *db, int64_t repo_id, unsigned *out_fi
         if (snprintf(dir, sizeof(dir), "%s/snapshots", path) >= (int)sizeof(dir) ||
             stat(dir, &sb) != 0 || !S_ISDIR(sb.st_mode))
             continue;
+        /* So does one whose path now holds another repository (B164):
+         * finishing the prune there would delete that one's record of the
+         * same number. */
+        if (repo_identity_check(path, r->rows[i][4]) != OK) {
+            log_warn("prune: snapshot %s of repo %s not finished: %s", snap, rid, err_msg());
+            err_clear();
+            continue;
+        }
 
         /* The marker was committed with the deletion of the rows. Rows
          * there now were put back by something that did not know (a

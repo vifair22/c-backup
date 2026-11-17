@@ -213,7 +213,7 @@ handled whole:
    nonce, and the type and name as associated data, so a ciphertext moved
    under another name fails authentication where it is read.
 5. **Append.** The 51-byte entry header and the payload are appended to the
-   pack's staging file in `<repo>/tmp/`, and the same bytes go to the pack's
+   pack's staging file in `<repo>/packs/.staging/`, and the same bytes go to the pack's
    stripe encoder: each 15,296-byte group of the body is Reed-Solomon encoded
    on a small pool as soon as it is complete. The entry's CRC was computed
    with its encryption; the seal writes the parity, the CRC table and the
@@ -387,7 +387,7 @@ find the entry's CRCs in the trailer's table.
 commit callback, which begins one, and the write lock is not recursive. In
 `store_content` that is the batch boundary and nowhere else.
 
-Crash ordering is: staging file in `tmp/`, install by rename, then rows,
+Crash ordering is: staging file in `packs/.staging/`, install by rename, then rows,
 then the snapshot record. A crash before the rename leaves a staging file
 the next start sweeps, along with any `staged` rows; a crash after it
 leaves an installed pack the index may not know, which a reindex picks up.
@@ -625,7 +625,7 @@ never outlive their pack.
   referenced. `pack_gc` rewrites only packs that contain dead entries,
   copying the live ones into new packs that roll over at the seal. The
   copies are
-  staged in `tmp/` and sealed, then installed under new numbers and
+  staged in `packs/.staging/` and sealed, then installed under new numbers and
   synced, then announced, and only then is the old pack removed behind a
   `.deleting` marker: a crash anywhere leaves every object readable, at
   worst beside a duplicate copy. Coalescing goes through the same code

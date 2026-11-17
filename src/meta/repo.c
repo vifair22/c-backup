@@ -180,6 +180,21 @@ static void marker_read_v3_fields(const cutils_json_req_t *req, repo_marker_t *o
         snprintf(out->incompat_first, sizeof(out->incompat_first), "(not a string)");
 }
 
+status_t repo_identity_check(const char *path, const char *uuid)
+{
+    if (!path || !uuid || !uuid[0])
+        return set_error(ERR_INVALID, "repo_identity_check: no path or uuid");
+    repo_marker_t m;
+    status_t st = repo_marker_read(path, &m);
+    if (st != OK) return st;
+    if (strcmp(m.uuid, uuid) != 0)
+        return set_error(ERR_UNAVAILABLE,
+                         "%s holds repository %s, not %s, the one registered at this "
+                         "path: swapped with another repository, or the wrong disk "
+                         "or share mounted there", path, m.uuid, uuid);
+    return OK;
+}
+
 status_t repo_format_check(const char *path, const repo_marker_t *m)
 {
     if (!m) return set_error(ERR_INVALID, "repo_format_check: no marker");
@@ -995,7 +1010,7 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
 
     /*
      * Staging a killed writer left behind (a replicate SIGKILLed mid-copy
-     * leaves a pack of up to 2 GB in tmp/, B133) goes now, if no handle is
+     * leaves a pack of up to 2 GB in packs/.staging, B133) goes now, if no handle is
      * writing here; see store_claim_tmp. Failing to open or sweep is not a
      * reason to refuse the registration.
      */

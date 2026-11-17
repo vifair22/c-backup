@@ -16,9 +16,10 @@ typedef enum {
     /* Contended: another job holds the repo write lock. Distinct from ERR_IO
      * so callers can retry or report "busy" rather than treat it as failure. */
     ERR_BUSY,
-    /* The repository is not there to work on: its root has no marker, its
-     * packs/ cannot be read or is not the directory it was, or none of its
-     * packs is present (pack_presence.h). Nothing was read or written, and
+    /* The repository is not there to work on: its root has no marker or
+     * another repository's, its packs/ cannot be read or is not the
+     * directory it was, or none of its packs is present (pack_presence.h).
+     * Nothing was read or written, and
      * nothing about its data may be concluded. */
     ERR_UNAVAILABLE
 } status_t;

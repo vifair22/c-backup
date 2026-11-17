@@ -111,6 +111,19 @@ static int count_files(const char *dir)
     return n;
 }
 
+/* Installed packs: packs/ less its staging directory, where a pack being
+ * written lives until it is sealed (B163). */
+static int count_installed(void)
+{
+    FILE *f = popen("find '" TEST_REPO "/packs' -type f -name 'pack-*.dat'"
+                    " ! -path '*/.staging/*' 2>/dev/null | wc -l", "r");
+    if (!f) return -1;
+    int n = -1;
+    if (fscanf(f, "%d", &n) != 1) n = -1;
+    pclose(f);
+    return n;
+}
+
 /* Flip a byte deep inside a pack payload, past every header. */
 static int corrupt_pack_byte(long offset)
 {
@@ -142,7 +155,7 @@ static int corrupt_pack_byte(long offset)
 static void test_flush_seals_staged_objects(void **state)
 {
     (void)state;
-    assert_int_equal(count_files(TEST_REPO "/packs"), 0);
+    assert_int_equal(count_installed(), 0);
     assert_int_equal((int)fake_index_count(), 0);
     for (int i = 0; i < NOBJ; i++)
         assert_true(object_exists(store, hashes[i]));
@@ -152,8 +165,9 @@ static void test_flush_seals_staged_objects(void **state)
     /* Every object announced through the commit callback is what the daemon
      * would have written to pack_objects. */
     assert_int_equal((int)fake_index_count(), NOBJ);
-    assert_int_equal(count_files(TEST_REPO "/packs"), 1);
+    assert_int_equal(count_installed(), 1);
     assert_int_equal(count_files(TEST_REPO "/tmp"), 0);
+    assert_int_equal(count_files(TEST_REPO "/" STORE_PACK_STAGING), 0);
 }
 
 static void test_every_packed_object_reads_back(void **state)

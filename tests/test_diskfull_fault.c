@@ -58,7 +58,7 @@
 #define TEST_REPO TEST_DIR "/repo"
 #define TEST_SRC  TEST_DIR "/src"
 #define TEST_DST  TEST_DIR "/dst"
-#define STAGING   TEST_REPO "/tmp/pack-dat"
+#define STAGING   TEST_REPO "/packs/.staging/pack-dat"   /* B163 */
 #define MIB (1u << 20)
 
 extern const db_migration_t app_migrations[];
@@ -202,7 +202,7 @@ static void expect_backup_left_nothing(unsigned workers, uint64_t files)
 {
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots"), 0);
     assert_int_equal(count_named(TEST_REPO "/snapshots", ""), 2);   /* . and .. */
-    assert_int_equal(count_named(TEST_REPO "/tmp", "pack-dat"), 0);
+    assert_int_equal(count_named(TEST_REPO "/packs/.staging", "pack-dat"), 0);
     verify_result_t vr;
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
                                 NULL, NULL, NULL, &vr), OK);

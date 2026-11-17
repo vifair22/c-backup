@@ -271,7 +271,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     /*
      * Staging files from a killed writer. gc holds the write lock, so no
-     * other job is writing this repository and anything already in tmp/
+     * other job is writing this repository and anything already staged
      * belongs to a process that is gone; see store_sweep_tmp_before. A dry
      * run promises to change nothing, and keeps that promise here too.
      */

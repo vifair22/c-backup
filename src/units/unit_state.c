@@ -195,6 +195,12 @@ int units_allow_match(const char *allow, const char *provider,
         if (n >= sizeof(glob)) continue;
         memcpy(glob, s, n);
         glob[n] = '\0';
+        /* Compose project names are lowercase (unit keys follow compose),
+         * so a glob's project part is too: compose:Immich is immich. */
+        char *pj = glob;
+        if (strncmp(pj, "docker:", 7) == 0) pj += 7;
+        if (strncmp(pj, "compose:", 8) == 0)
+            for (pj += 8; *pj; pj++) if (*pj >= 'A' && *pj <= 'Z') *pj = (char)(*pj - 'A' + 'a');
         if ((name && fnmatch(glob, name, 0) == 0) ||
             (unit_id && fnmatch(glob, unit_id, 0) == 0) ||
             fnmatch(glob, key_name, 0) == 0 || fnmatch(glob, key_id, 0) == 0)

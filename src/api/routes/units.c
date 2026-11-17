@@ -187,10 +187,17 @@ static api_response_t providers_list(void)
     if (root) {
         cJSON_AddStringToObject(root, "daemon_id", units_daemon8());
         cJSON_AddStringToObject(root, "allow", units_config()->allow ? units_config()->allow : "");
-        cJSON_AddNumberToObject(root, "holds_open", (double)units_intents_open(g_db, NULL));
-        /* The helper, as its hello said (source-providers.md 11.2). */
+        /* Holds open anywhere: the daemon's journal, and what the helper
+         * journals for the providers behind it, asked now. It used to be
+         * the daemon's alone, so a hold a killed daemon left in the helper
+         * showed as 0 (B169). */
         remote_link_info_t li;
         remote_link_info(&li);
+        long hholds = 0, hcaps = 0;
+        int asked = li.configured && li.state == REMOTE_CONNECTED && remote_helper_holds(&hholds, &hcaps) == OK;
+        if (li.configured && !asked) err_clear();
+        cJSON_AddNumberToObject(root, "holds_open", (double)(units_intents_open(g_db, NULL) + (asked ? hholds : 0)));
+        /* The helper, as its hello said (source-providers.md 11.2). */
         if (li.configured) {
             cJSON *ho = cJSON_AddObjectToObject(root, "helper");
             if (ho) {
@@ -204,6 +211,10 @@ static api_response_t providers_list(void)
                 cJSON_AddStringToObject(ho, "daemon_id", li.hello.daemon_id);
                 cJSON_AddStringToObject(ho, "policy", li.hello.policy);
                 cJSON_AddStringToObject(ho, "providers", li.hello.providers);
+                if (asked) {
+                    cJSON_AddNumberToObject(ho, "holds", (double)hholds);
+                    cJSON_AddNumberToObject(ho, "captures", (double)hcaps);
+                }
             }
         }
         cJSON_AddBoolToObject(root, "privileges_dropped", privs_dropped());
@@ -458,8 +469,11 @@ const api_path_t *routes_units_paths(size_t *n)
 
 /* The key a request names: the provider and the unit's id, resolved from
  * the history when it is a name. */
-static void key_for(int64_t repo_id, const char *prov, const char *unit, char *key, size_t ksz)
+/* The unit's key: the one its snapshots carry if it has any (1), else
+ * prov:unit as given (0). */
+static int key_for(int64_t repo_id, const char *prov, const char *unit, char *key, size_t ksz)
 {
+    int found = 0;
     unit_key_format(key, ksz, prov, unit);
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -467,9 +481,70 @@ static void key_for(int64_t repo_id, const char *prov, const char *unit, char *k
     if (db_execute(g_db,
             "SELECT unit_key FROM snapshot_units WHERE repo_id = ? AND provider = ?"
             " AND (unit_id = ? OR unit_name = ?) ORDER BY snap_id DESC LIMIT 1",
-            (const char *[]){ repo, prov, unit, unit, NULL }, &r) == 0 && r && r->nrows == 1)
+            (const char *[]){ repo, prov, unit, unit, NULL }, &r) == 0 && r && r->nrows == 1) {
         snprintf(key, ksz, "%s", r->rows[0][0]);
+        found = 1;
+    }
     db_result_free(r);
+    return found;
+}
+
+typedef struct { const char *want; char id[SP_UNIT_ID_MAX]; char name[256]; int hit; } find_unit_t;
+
+static status_t find_unit_cb(void *ctx, const char *id, const char *name, int state)
+{
+    (void)state;
+    find_unit_t *f = ctx;
+    if (f->hit || (strcmp(id, f->want) != 0 && strcmp(name, f->want) != 0)) return OK;
+    snprintf(f->id, sizeof(f->id), "%s", id);
+    snprintf(f->name, sizeof(f->name), "%s", name);
+    f->hit = 1;
+    return OK;
+}
+
+/*
+ * A unit policy is for a unit the daemon backs up or has backed up. PUT
+ * accepted any provider and unit, in units.allow or not, existing or not,
+ * and left rows no backup would ever read; a unit named by its name was
+ * also stored under the name where its snapshots use the id. A unit with
+ * snapshots here keeps their key; otherwise its provider must list it now,
+ * and units.allow must take it, and the key is made from its id. 0 with
+ * key set, or the HTTP status with why.
+ */
+static int policy_unit(int64_t repo_id, const char *prov, const char *unit, char *key, size_t ksz,
+                       char *why, size_t wsz)
+{
+    if (key_for(repo_id, prov, unit, key, ksz)) return 0;
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *ctx = NULL;
+    char hwhy[512];
+    if (remote_unusable(prov, hwhy, sizeof(hwhy))) {
+        snprintf(why, wsz, "%.500s; a unit with no snapshot here is checked against its provider", hwhy);
+        return 409;
+    }
+    if (sp_registry_get(prov, &ops, &ctx) != OK) {
+        snprintf(why, wsz, "%.500s", err_msg());
+        err_clear();
+        return 404;
+    }
+    find_unit_t f;
+    memset(&f, 0, sizeof(f));
+    f.want = unit;
+    if (!ops->list_units || ops->list_units(ctx, find_unit_cb, &f) != OK) {
+        snprintf(why, wsz, "cannot list provider %s: %.400s", prov, err_msg());
+        err_clear();
+        return 409;
+    }
+    if (!f.hit) {
+        snprintf(why, wsz, "provider %s lists no unit %s, and this repository has no snapshot of one", prov, unit);
+        return 404;
+    }
+    if (!units_allowed(prov, f.id, f.name)) {
+        snprintf(why, wsz, "unit %s is not in units.allow", unit);
+        return 403;
+    }
+    unit_key_format(key, ksz, prov, f.id);
+    return 0;
 }
 
 static api_response_t repo_units(const api_request_t *req, int64_t repo_id)
@@ -813,6 +888,7 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
         cJSON_AddNumberToObject(root, "ok", (double)res.ok);
         cJSON_AddNumberToObject(root, "failed", (double)res.failed);
         cJSON_AddNumberToObject(root, "filtered", (double)res.filtered);
+        if (res.scope_note[0]) cJSON_AddStringToObject(root, "note", res.scope_note);
         char *txt = cJSON_PrintUnformatted(root);
         if (txt) { job_set_result(progress_ctx, txt); cJSON_free(txt); }
         cJSON_Delete(root);
@@ -821,6 +897,7 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
     snprintf(summary, sizeof(summary), "%s: %zu unit(s) backed up, %zu failed, %zu left out "
              "by units.allow", j->provider, res.ok, res.failed, res.filtered);
     job_set_summary(progress_ctx, summary);
+    if (!warn[0] && res.scope_note[0]) snprintf(warn, sizeof(warn), "%s", res.scope_note);
     if (warn[0]) job_set_warning(progress_ctx, warn);
     unit_backup_result_free(&res);
     store_index_free(idx);
@@ -967,10 +1044,12 @@ static status_t submit_units(int64_t repo_id, const char *body, size_t len,
      * would leave a schedule failing with only a log line to show. */
     char hwhy[512];
     if (!sp_registry_enabled(j->provider) && !remote_unusable(j->provider, hwhy, sizeof(hwhy))) {
+        /* A provider named in the body: a bad request, said as a units
+         * schedule says it (it was 409 here and 400 there, worded apart). */
         status_t st = sp_registry_get(j->provider, NULL, NULL);
         units_job_free(j);
         free(canon);
-        *http = 409;
+        *http = 400;
         return st;
     }
     j->db = g_db;
@@ -1116,6 +1195,8 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     else if (strcmp(mode, "files") == 0 && item) bad = "item applies only to mode item";
     else if (fmt && strcmp(fmt, "raw") != 0) bad = "format must be raw; qcow2 comes with the libvirt provider";
     else if (ow && !cJSON_IsBool(ow)) bad = "overwrite must be true or false";
+    /* Accepted here, it was refused only when the job ran. */
+    else if (item_mode && cJSON_IsTrue(ow)) bad = "overwrite does not apply to mode item: an item is restored to a new path, never over one";
     if (bad) { cJSON_Delete(o); return api_error(400, bad); }
 
     char key[UNIT_KEY_MAX];
@@ -1128,7 +1209,8 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     if (unit_mode) {
         unit_define_opts_t chk;
         memset(&chk, 0, sizeof(chk));
-        chk.name = uname;
+        const char *colon0 = strchr(key, ':');
+        chk.name = unit_define_name(g_db, repo_id, snap_id, colon0 ? colon0 + 1 : key, uname);
         chk.target_root = troot;
         chk.replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "replace"));
         char why[512];
@@ -1257,7 +1339,7 @@ api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const 
     const char *suffix = NULL;
     if (!split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix))
         return api_error(404, "not found");
-    key_for(repo_id, prov, unit, key, sizeof(key));
+    (void)key_for(repo_id, prov, unit, key, sizeof(key));
     if (strcmp(suffix, "snapshots") == 0) return unit_history(req, repo_id, key);
     if (strcmp(suffix, "checkpoints") == 0) return unit_checkpoints_get(repo_id, key);
     if (strcmp(suffix, "reset-incremental") == 0) return api_error(405, "method not allowed");
@@ -1271,7 +1353,9 @@ api_response_t units_route_put(const api_request_t *req, int64_t repo_id, const 
     if (!split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) ||
         strcmp(suffix, "policy") != 0)
         return api_error(404, "not found");
-    key_for(repo_id, prov, unit, key, sizeof(key));
+    char why[768];
+    int code = policy_unit(repo_id, prov, unit, key, sizeof(key), why, sizeof(why));
+    if (code) return api_error(code, why);
     return unit_policy_put(req, repo_id, key);
 }
 
@@ -1291,7 +1375,7 @@ api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const
     const char *suffix = NULL;
     if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) &&
         strcmp(suffix, "reset-incremental") == 0) {
-        key_for(repo_id, prov, unit, key, sizeof(key));
+        (void)key_for(repo_id, prov, unit, key, sizeof(key));
         return unit_reset_post(repo_id, key);
     }
     if (strncmp(rest, "/snapshots/", 11) == 0) {

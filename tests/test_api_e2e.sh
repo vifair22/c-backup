@@ -915,11 +915,14 @@ check "a negative offset is out of range" \
 # NIT-8: a number too large to represent is out of range, as it is in a
 # body; these were read as the maximum and answered 200.
 LRANGE='limit is out of range; it must be from 1 to 1000 (a larger one, up to 9007199254740992, is reduced to 1000)'
-for v in 1e999 99999999999999999999 9007199254740994; do
+# UAT low: 2^53 + 1 rounds to 2^53 through a double and was accepted.
+for v in 1e999 99999999999999999999 9007199254740994 9007199254740993 00009007199254740993; do
     check "limit=$v is out of range" "{\"error\":\"$LRANGE\"} 400" "$(sock_send GET "/jobs?limit=$v")"
 done
 check "limit=9007199254740992 is still clamped" 200 "$(sock_code '/jobs?limit=9007199254740992')"
 check "an unrepresentable offset is out of range" 400 "$(sock_code '/jobs?offset=1e999')"
+check "offset=2^53+1 is out of range" 400 "$(sock_code '/jobs?offset=9007199254740993')"
+check "offset=2^53 is still an empty page" 200 "$(sock_code '/jobs?offset=9007199254740992')"
 # NIT-8: an id in the path is parsed, not routed. These were a 405, a 404
 # and a 404, while /repos/-1 was already a 400.
 for v in 99999999999999999999 1e999 -1 0 1.5 abc; do
@@ -1295,6 +1298,55 @@ check "still nothing in the mountpoint"   ""                       "$(ls -A "$WO
 rmdir "$WORK/gonerepo"
 mv "$WORK/gonerepo.mounted" "$WORK/gonerepo"
 contains "mounted again, it is ok"        '"state":"ok"'           "$(sock_body "/repos/$GONE")"
+
+# B164: two repositories' roots swapped. Each path holds a marker, and
+# used to pass for the right repository; now each is unavailable naming the
+# repository its path holds, every job and every write is refused, and
+# neither directory is touched.
+echo "swapped repositories"
+GJ=$(job_id "$(sock_send POST "/repos/$GONE/backup" "{\"paths\":[\"$WORK/src\"]}")")
+wait_job "$GJ"
+contains "a backup before the swap"       '"state":"completed"'    "$(sock_body "/jobs/$GJ")"
+R=$(sock_send POST /repos "{\"path\":\"$WORK/swaprepo\",\"label\":\"swap\"}")
+SWAP=$(printf '%s' "$R" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+SJ=$(job_id "$(sock_send POST "/repos/$SWAP/backup" "{\"paths\":[\"$WORK/src\"]}")")
+wait_job "$SJ"
+contains "and one into the other"         '"state":"completed"'    "$(sock_body "/jobs/$SJ")"
+GUUID=$(sock_body "/repos/$GONE" | grep -oE '"uuid":"[^"]*"' | head -1 | cut -d'"' -f4)
+SUUID=$(sock_body "/repos/$SWAP" | grep -oE '"uuid":"[^"]*"' | head -1 | cut -d'"' -f4)
+mv "$WORK/gonerepo" "$WORK/swap.tmp"
+mv "$WORK/swaprepo" "$WORK/gonerepo"
+mv "$WORK/swap.tmp" "$WORK/swaprepo"
+LIST_G=$(cd "$WORK/gonerepo" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)
+LIST_S=$(cd "$WORK/swaprepo" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)
+GB=$(sock_body "/repos/$GONE")
+contains "a swapped root is unavailable"  '"state":"unavailable"'  "$GB"
+contains "naming the repository it holds" "holds repository $SUUID, not $GUUID" "$GB"
+contains "and so is the other"            "holds repository $GUUID, not $SUUID" \
+    "$(sock_body "/repos/$SWAP")"
+GJ=$(job_id "$(sock_send POST "/repos/$GONE/backup" "{\"paths\":[\"$WORK/src\"]}")")
+wait_job "$GJ"
+GJB=$(sock_body "/jobs/$GJ")
+contains "a backup into it is refused"    '"state":"failed"'       "$GJB"
+contains "as unavailable"                 'is unavailable'         "$GJB"
+GV=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" "http://localhost/repos/$SWAP/verify?level=deep")")
+wait_job "$GV"
+contains "a verify of the other is refused" 'is unavailable'       "$(sock_body "/jobs/$GV")"
+check "a tag is refused, not written into the other" 409 \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+         -d '{"name":"swapped","snap_id":1}' "http://localhost/repos/$GONE/tags")"
+check "the repair cannot accept it"       409 \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+         -d '{"accept_missing":true}' "http://localhost/repos/$GONE/repair")"
+check "nothing written to one"            "$LIST_G" \
+    "$(cd "$WORK/gonerepo" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)"
+check "nor to the other"                  "$LIST_S" \
+    "$(cd "$WORK/swaprepo" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)"
+mv "$WORK/gonerepo" "$WORK/swap.tmp"
+mv "$WORK/swaprepo" "$WORK/gonerepo"
+mv "$WORK/swap.tmp" "$WORK/swaprepo"
+contains "swapped back, one is ok"        '"state":"ok"'           "$(sock_body "/repos/$GONE")"
+contains "and so is the other"            '"state":"ok"'           "$(sock_body "/repos/$SWAP")"
 contains "an unset label is null"         '"label":null'          "$(sock_body /repos/2)"
 TREE=$(sock_body "/repos/1/snapshots/$NEWEST/tree?parent=0")
 contains "a tree type is a number"        '"type":2,'             "$TREE"

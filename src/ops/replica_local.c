@@ -744,11 +744,12 @@ static status_t sink_finish_open(local_ctx_t *c, const char *path,
     if (st != OK) { store_close(c->store); repo_key_wipe(&c->dst_key); free(c->tcdc); free(c); return st; }
 
     /*
-     * A replicate killed mid-copy leaves its staging pack in tmp/ (B133):
-     * up to the size of the object it was copying. This sink is about to
-     * write here; if it holds tmp/ (store_claim_tmp), nothing else is
-     * staging, and every staging file there is a dead writer's. Packs in
-     * packs/ are never touched: the sweep reads tmp/ only.
+     * A replicate killed mid-copy leaves its staging pack in
+     * packs/.staging (tmp/ before B163): up to the size of the object it
+     * was copying. This sink is about to write here; if it holds the
+     * staging claim (store_claim_tmp), nothing else is staging, and every
+     * staging file there is a dead writer's. Installed packs are never
+     * touched: the sweep reads the two staging directories only.
      */
     (void)store_sweep_tmp_before(c->store, time(NULL), NULL);
 
