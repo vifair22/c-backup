@@ -966,6 +966,22 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
      * any data is read. Snapshots and exports stay until end. */
     for (size_t i = s->nheld; st == OK && i-- > 0;) {
         if (!held_kind(s, i, SP_HOLD_FREEZE) && !held_kind(s, i, SP_HOLD_PAUSE)) continue;
+        if (held_kind(s, i, SP_HOLD_FREEZE) && !watchdog) {
+            /* A freeze the watchdog released after the hang above, or with
+             * no hang at all, was gone before the point in time: the guest
+             * ran while the rest was taken. A real provider learns this
+             * from its thaw finding the guest already thawed. */
+            pthread_mutex_lock(&c->mu);
+            int still = c->holds[s->held[i].hold].held;
+            pthread_mutex_unlock(&c->mu);
+            if (!still) {
+                watchdog = 1;
+                pthread_mutex_lock(&c->mu);
+                c->st.watchdog_released++;
+                pthread_mutex_unlock(&c->mu);
+                s->held[i].intent = 0;
+            }
+        }
         st = release_one(s, i);
         if (st == OK) {
             memmove(&s->held[i], &s->held[i + 1], (s->nheld - i - 1) * sizeof(s->held[0]));
@@ -1211,19 +1227,22 @@ static status_t f_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
     for (size_t k = 0; k < req->n_intents; k++) {
         const sp_intent_t *in = &req->intents[k];
         fake_fail_t fail = fail_for(c, in->unit_id, &arg);
-        int ok = 1;
+        int ok = 1, found = 0;
         for (size_t i = 0; i < c->nh; i++) {
             fhold_t *h = &c->holds[i];
             if (!h->held || strcmp(h->unit_id, in->unit_id) != 0 ||
                 strcmp(h->kind, in->kind) != 0 || strcmp(h->detail, in->detail) != 0)
                 continue;
+            found = 1;
             if (hold_release(c, i, fail) != OK) { ok = 0; err_clear(); }
             else out->released++;
         }
         /* Nothing held under that name: releasing it is a no-op that
-         * succeeds, as thawing a guest that is not frozen does. */
+         * succeeds, as thawing a guest that is not frozen does, and is
+         * reported as such so the watchdog can tell it from a release. */
         if (!ok) out->failed++;
         if (req->released) req->released[k] = ok;
+        if (req->absent) req->absent[k] = !found;
     }
     if (req->scan_artefacts) {
         for (size_t i = 0; i < c->na; i++) {

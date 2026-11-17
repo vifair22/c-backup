@@ -687,6 +687,42 @@ static void test_watchdog_bounds_freeze(void **state)
     fake_fail_clear(fk);
 }
 
+/*
+ * The journal row is written before its hold is taken. A watchdog tick in
+ * between finds nothing held; it must keep the row, or the freeze that
+ * lands a moment later is unjournalled and the watchdog never bounds it
+ * (the CI failure of test_watchdog_bounds_freeze, pipeline 5213).
+ */
+static void test_watchdog_waits_for_take(void **state)
+{
+    (void)state;
+    units_shutdown();
+    init_units("", 1);
+    units_journal_t jr = { db, "fake", "u1", 77 };
+    sp_holds_t h = units_journal_holds(&jr);
+    int64_t id = 0;
+    assert_int_equal(h.record(h.ctx, SP_HOLD_FREEZE, "agent:u1", &id), OK);
+
+    unsigned n = 9;
+    assert_int_equal(units_watchdog_tick(db, time(NULL) + 5, &n), OK);
+    assert_int_equal(n, 0);
+    assert_int_equal(units_intents_open(db, NULL), 1);
+
+    /* The take lands; the next tick releases it and only then the row. */
+    assert_int_equal(fake_hold_plant(fk, "u1", SP_HOLD_FREEZE, "agent:u1"), OK);
+    assert_int_equal(units_watchdog_tick(db, time(NULL) + 5, &n), OK);
+    assert_int_equal(n, 1);
+    assert_false(fake_hold_held(fk, "u1", SP_HOLD_FREEZE, NULL));
+    assert_int_equal(units_intents_open(db, NULL), 0);
+
+    /* A sweep of a finished job still deletes a row with nothing held. */
+    assert_int_equal(h.record(h.ctx, SP_HOLD_FREEZE, "agent:u1", &id), OK);
+    units_sweep_result_t sw;
+    assert_int_equal(units_sweep(db, 0, &sw), OK);
+    assert_int_equal(sw.released, 1);
+    assert_int_equal(units_intents_open(db, NULL), 0);
+}
+
 static void test_daemon_id(void **state)
 {
     (void)state;
@@ -727,6 +763,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_retention_groups, setup, teardown),
         cmocka_unit_test_setup_teardown(test_crash_sweep, setup, teardown),
         cmocka_unit_test_setup_teardown(test_watchdog_bounds_freeze, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_watchdog_waits_for_take, setup, teardown),
         cmocka_unit_test_setup_teardown(test_daemon_id, setup, teardown),
     };
     return cmocka_run_group_tests(tests, group_setup, group_teardown);
