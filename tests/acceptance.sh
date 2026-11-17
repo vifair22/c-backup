@@ -76,6 +76,17 @@ check() {  # check <id> <note> <condition-command...>
     if "$@"; then row "$id" PASS "$MS" "$note"; else row "$id" FAIL "$MS" "$note"; fi
 }
 
+# The config below is the whole of this run's settings, and a C_BACKUP_*
+# variable in the environment wins over the file. The shipped image sets
+# C_BACKUP_SECURITY_KEY_DIR, so inside it the daemon wrote keys to the
+# image's directory, $WORK/keys stayed empty and A4 failed (NIT-34); an
+# operator's own overrides would skew any other check the same way. Neither
+# daemon this script starts sees any of them: each is given its config path
+# and nothing else.
+for v in $(compgen -e); do
+    case "$v" in C_BACKUP_*) unset "$v" ;; esac
+done
+
 start_daemon() {
     C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
     DAEMON_PID=$!

@@ -49,6 +49,40 @@ Directory listings are ordered by name because the index carries `name` as its
 trailing column, making the query a range scan rather than a sort of every
 child.
 
+Every list route, with its page size and order. Each order ends in a unique
+key, so a page is the same page on every request and paging from offset 0
+to the end visits every row once (while nothing is added or removed).
+
+| Route | Default | Maximum | Order |
+|---|---|---|---|
+| `/repos` | 1000 | 1000 | id |
+| `/repos/<id>/snapshots` | 200 | 1000 | id, newest first |
+| `/repos/<id>/snapshots/<sid>/tree` | 200 | 1000 | name |
+| `/repos/<id>/search` | 200 | 1000 | see Snapshots and browsing |
+| `/repos/<id>/grep`, `/repos/<id>/verify` | 20 | 1000 | id, newest first |
+| `/repos/<id>/grep/<run>`, `/repos/<id>/verify/<run>` | 200 | 1000 | id |
+| `/repos/<id>/objects` | 500 | 5000 | hash |
+| `/repos/<id>/objects/<hash>/refs` | 500 | 5000 | snapshot, node |
+| `/repos/<id>/packs` | 500 | 5000 | pack number |
+| `/repos/<id>/packs/<pid>/entries` | 500 | 5000 | offset in the pack |
+| `/repos/<id>/diff` | 2000 | 5000 | tree walk (see Introspection) |
+| `/repos/<id>/tags` | 1000 | 1000 | name |
+| `/repos/<id>/schedules` | 1000 | 1000 | id |
+| `/repos/<id>/journal` | 100 | 1000 | time then id, newest first |
+| `/repos/<id>/units`, `/repos/<id>/units/<key>` | 100 | 1000 | unit name; snapshot id, newest first |
+| `/providers/<p>/units` | 100 | 1000 | the provider's enumeration |
+| `/jobs` | 50 | 1000 | id, newest first |
+
+`packs`, `diff`, `objects/<hash>/refs`, `search`, `tags`, `schedules`
+and `/repos` read no `offset` (the first two not even a `limit`), and the
+journal no `offset`, before B154: the CLI sent them and the daemon answered
+the whole list or the first page again. `/repos`, `tags` and `schedules`
+default to their maximum so a client that does not page sees every row any
+real deployment has. Lists that are bounded by construction do not page:
+`/fanout` (at most 256 buckets), `/stats` (one row per object type),
+`/policy` (the fixed key set), `/sources` (what the operator configured)
+and `/providers`.
+
 A path the API serves, asked with a method it does not answer, is a `405`
 with an `Allow` header listing the methods that work there (`PATCH
 /repos/1` gives `405`, `Allow: GET, DELETE`). Any method other than GET,
@@ -234,9 +268,10 @@ host always has a way in.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/repos` | List |
+| GET | `/repos` | List, by id; `limit` (default and maximum 1000) and `offset` |
 | POST | `/repos` | Register: `{path, label}`; `label` follows the snapshot label rule (at most 256 bytes of printable UTF-8) |
-| GET | `/repos/<id>` | One repository, the same object as each entry of the list |
+| GET | `/repos/<id>` | One repository, the same object as each entry of the list. `degraded` is null, or why the repository refuses backups (too many packs missing at once; Manual section 17.6) |
+| POST | `/repos/<id>/repair` | `{"accept_missing":true}`: accept a degraded repository's missing packs as lost, marking their objects absent so the next backup stores them again. Without `accept_missing` a 400; 503 while a job holds the repository; 409 when its `packs/` cannot be read. Answers `{packs_checked, packs_missing, packs_unknown, packs_dropped, objects_absent, degraded}` |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it. `{"removed":true,"id"}` |
 
 `POST /repos` normalises the path (no `//`, `.`, `..` or trailing slash) and
@@ -381,7 +416,12 @@ thirty times. A file whose content changed is a different hash and a
 separate result, so the versions of a file stay visible. To keep a page
 cheap the search reads at most eight matching rows per result asked for
 (8,000 at most) and does not sort; when it stopped there, `partial` is
-`true` and the counts cover what was read. With `snapshot=<sid>` only that
+`true` and the counts cover what was read. `offset` skips results: with
+`snapshot` it skips matching rows, and without one it skips collapsed
+results, reading from the first row enough for `offset + limit` of them
+under the same 8,000-row bound. Results come in first-seen order, so result
+N is the same result on every page; an offset past what the bound can
+reach is an empty page with `partial` true. With `snapshot=<sid>` only that
 snapshot is searched (`snapshots` is 1); one that does not exist is a 404.
 The CLI is `search <id> <text> [--snapshot N]`.
 
@@ -686,6 +726,7 @@ plain verify, with the same counts on a healthy repository. The job's
 {"run_id":12,"level":"deep","repair":false,"dry_run":true,"checked":52,
  "ok":52,"repaired":0,"recoverable":0,"unrecoverable":0,"missing":0,
  "failed":false,"unsettled_files":0,
+ "pack_structures_repaired":0,"pack_structures_recoverable":0,
  "packs_unwalkable":0,"packs_restored":0,"packs_salvaged":0,
  "unreferenced_dropped_bytes":0,"unreferenced_dropped_ranges":0,"unreferenced_dropped":[]}
 ```
@@ -700,13 +741,18 @@ possibly torn (below); a notice, never a failure.
 whose own header, tail copies or CRC table disagreed with their redundancy
 (within parity, so not loss): found by every level, each a `pack-NNNNNNNNNN`
 finding with status `recoverable`, or `repaired` when a repairing run
-rewrote them.
+rewrote them. Each such pack is also one item in the run's totals: it adds
+one to `checked` and one to `recoverable` or `repaired`, so the counts on
+the run record (`GET /repos/<id>/verify`, what `c-backup verify` prints and
+the verify metrics read) agree with its findings. These two fields say how
+much of those totals is pack structure rather than objects.
 
 `packs_unwalkable` counts packs whose entry headers cannot be walked even
 with parity (the packs gc leaves as they are); each is a finding named
 `pack-NNNNNNNNNN` with status `unwalkable pack`, at every level, and fails
 the run. `packs_restored` counts those a repairing run made walkable again
-by rebuilding their headers from the index; each is a `repaired` finding.
+by rebuilding their headers from the index; each is a `repaired` finding,
+and counted like one: one in `checked` and one in `repaired`.
 `packs_salvaged` counts packs that could not be rebuilt (a damaged header
 had no index row) and were salvaged instead: every indexed entry copied into
 a new pack, a `salvaged` finding, and the bytes no row covers dropped and
@@ -732,10 +778,10 @@ A run (`GET /repos/<id>/verify`) carries these counts:
 
 | Field | Meaning |
 |---|---|
-| `checked` | Items examined: every indexed object, plus every regular-file entry that names no content. Always `ok + repaired + recoverable + unrecoverable + missing` |
+| `checked` | Items examined: every indexed object, plus every regular-file entry that names no content, plus each `pack-NNNNNNNNNN` finding counted as `recoverable` or `repaired` (a pack whose header, tails or CRC table were damaged, or whose headers were restored). Always `ok + repaired + recoverable + unrecoverable + missing` |
 | `ok` | Intact on disk. Never counts a failure: a run with anything missing or unrecoverable has `ok` below `checked` |
-| `repaired` | Damaged, corrected from parity, and the correction written to disk. Always 0 with `repair=0` |
-| `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed |
+| `repaired` | Damaged, corrected from parity, and the correction written to disk; or an object whose indexed copy is beyond parity, moved by the run to another copy proven to be it (below). Always 0 with `repair=0` |
+| `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed. Also an object whose indexed copy is beyond parity while another copy of it is proven intact, with repair off |
 | `unrecoverable` | Damaged beyond what parity can rebuild. Data loss |
 | `missing` | Indexed but absent: no pack entry, or a pack file that has gone. Also each index row of a regular file that names no file content: no object, or one that is neither `FILE` nor `CHUNKLIST` (see below). Data loss |
 | `affected_files` | Distinct file paths referencing a lost object |
@@ -763,6 +809,19 @@ they are gone.) Each finding also carries:
 
 An object no file references - a manifest tree, or one from an evicted
 snapshot - reports zero files; that is not a claim the loss is harmless.
+
+An object whose indexed copy cannot be read even with parity is not loss
+if the repository holds another copy of it: two backups can store one
+object before either commits it, and gc keeps the other copy and moves the
+index to it once proven (`index_relocated`). Verify runs the same search
+before it calls anything lost: every pack's entry headers are walked and a
+copy that is not the indexed one is read and checked against its name, as
+gc proves one. With such a copy the object is `recoverable` (repair off;
+the log names the pack and offset of the good copy) or `repaired` (the run
+moved the index to it and read the object back through it). Without one it
+is lost as before. The search runs only when the walk found something
+unreadable, so a clean run pays nothing for it. An encrypted copy cannot be
+proven without the key.
 
 Every level also checks the index for regular files that name no content
 object: a file a snapshot lists and no restore can produce. Backups by a
@@ -1059,7 +1118,10 @@ logged after the backup's phase profile.
 
 Gc and replicate also put a one-line summary in their journal entry, such
 as `swept 12 objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale
-temp files removed` or `target already up to date (3 snapshots present)`. A
+temp files removed` or `target already up to date (3 snapshots present)`.
+A verify that passes journals its run's totals, such as `deep verify (check
+only), run 12: 53 checked, 52 ok, 0 repaired, 1 recoverable (1 of them pack
+structure)`; one that fails journals its error, which carries them. A
 dry-run gc removes nothing, temp files included; its pack figures are zero
 because compaction does not run.
 
@@ -1103,13 +1165,13 @@ header_size`, which equals `phys_size`. An object that reports `phys_size`
 
 | GET | `/repos/<id>/objects` | Paginated; `?location=staged`, `?location=pack` (or `packed`), or `?location=all` |
 | GET | `/repos/<id>/objects/<hash>` | Where one object lives |
-| GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it |
+| GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it; `limit` (default 500, at most 5000) and `offset` |
 | GET | `/repos/<id>/objects/<hash>/layout` | Header fields and on-disk footprint |
 | GET | `/repos/<id>/objects/<hash>/content` | Base64, capped at 2 MiB |
-| GET | `/repos/<id>/packs` | Pack listing with entry counts |
+| GET | `/repos/<id>/packs` | Pack listing with entry counts, by pack number; `limit` (default 500, at most 5000) and `offset` |
 | GET | `/repos/<id>/packs/<pid>/entries` | Contents of one pack, paginated |
 | GET | `/repos/<id>/fanout` | Hash-prefix histogram |
-| GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots |
+| GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots; `limit` (default 2000, at most 5000) and `offset` page the changes |
 
 An object's `refcount` is the number of references to it as the last `gc`
 or `reindex` counted them, not a live count: a backup records the objects it
@@ -1156,6 +1218,18 @@ with the same hash have identical contents by construction, so an unchanged
 subtree is pruned in a single comparison instead of being read. That is the
 same property that makes incremental backups cheap, applied to reading.
 
+`/diff` pages its `changes`. The walk is deterministic (both trees merged
+in name order, depth first), so the Nth change is the same change on every
+request for the same two snapshots. A page is cut from the walk as it runs:
+changes before `offset` are counted and dropped, and changes past `offset +
+limit` are counted and set `truncated`. So `added`, `removed` and
+`modified` always cover the whole comparison, `truncated` is `true` exactly
+when more changes follow this page, and neither the response nor the walk
+holds more than a page of changes and one tree per directory level. Each
+page walks the changed part of the trees again; the unchanged part is
+pruned as always. The default page is 2000, the cap the route had before it
+paged, so a client that does not page sees what it always did.
+
 ## Metadata
 
 | Method | Path | Purpose |
@@ -1164,7 +1238,16 @@ same property that makes incremental backups cheap, applied to reading.
 | DELETE | `/repos/<id>/tags/<name>` | Remove; `{"removed":true,"name"}`, 404 if there is no such tag |
 | GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}`; 404 for a snapshot that does not exist |
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
-| GET | `/repos/<id>/journal` | Operation history: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded |
+| GET | `/repos/<id>/journal` | Operation history, newest first: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded. `limit` (default 100, at most 1000), `offset`, and `result` |
+
+`result` filters the journal on one of the values anything journals:
+`success`, `failed` and `cancelled` for how a job ended, `warning` and
+`alert` for advisories. Anything else is a 400 `result must be one of:
+success, failed, cancelled, warning, alert`; it used to answer an empty
+list, which reads as a clean history (NIT-32).
+
+`/tags` pages by name and `/schedules` by id, each `limit` (default and
+maximum 1000) and `offset`.
 
 Setting a tag or a note on a snapshot that does not exist is a 404, and a tag
 with no name is a 400. Removing a tag that is not there is a 404 `no such
@@ -1302,15 +1385,18 @@ time:
 {"action":"gc","trigger":{"type":"calendar","every":"year","on_month":1,"on_day":1,"at":"05:00"}}
 ```
 
-`every` is `day`, `week` (with `on`, a weekday name), `month` (with
+`every` is `day`, `week` (with `on`, a weekday: the full name or its first
+three letters, in any case, stored and served as the full lowercase name),
+`month` (with
 `on_day`, 1-31) or `year` (with `on_month` and `on_day`, a day that month
 has: 30 February and 31 April are refused, 29 February is accepted). There
 is no cron syntax. The CLI builds the same with `--every`, `--at`, `--on`, `--on-day`
 and `--on-month`, or takes a number of seconds for an interval.
 
-Interval triggers anchor to the last successful fire, not to wall-clock
-multiples: a four-hour backup that runs long should not be due the moment it
-finishes.
+Interval triggers anchor to the last time the schedule fired, or until its
+first fire to when it was created, not to wall-clock multiples: a four-hour
+backup that runs long should not be due the moment it finishes. A daemon
+restart does not move the anchor.
 
 Calendar triggers use local time, which is what someone means by "02:00".
 That choice creates the DST cases, all handled: a time that does not exist on

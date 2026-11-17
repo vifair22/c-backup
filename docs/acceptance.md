@@ -156,12 +156,50 @@ Legend: **CLI** = the command. **UI** = where it lives in the app.
 | J5 | Acknowledge | `repo key ack <id>` | I have saved it | Warning clears |
 | J6 | Import a key | `repo key import` | Restore a key from a copy | Repository opens with the imported key |
 
+### K. Remote access
+
+Driven over TCP with `curl`, since the CLI talks to the unix socket. The
+UI's remote connection is the same routes behind the same token.
+
+| # | Function | CLI | UI | Proof |
+|---|----------|-----|----|-------|
+| K1 | TCP before a password is set | `curl http://127.0.0.1:<port>/repos` | Connections > Add remote | 403: nothing is served over TCP until a password exists |
+| K2 | Set a password, log in | `auth setup` (socket), then `POST /api/auth/login` | Remote login | Login answers with a session token |
+| K3 | Browse with the token | `GET /repos/<id>/snapshots` with `Authorization: Bearer` | Snapshot list over a remote connection | Snapshots listed, under the interactive budget |
+| K4 | Wrong password | `POST /api/auth/login` with another password | Remote login | 401 |
+| K5 | Setup is socket-only | `POST /api/auth/setup` over TCP | - | 403: a password cannot be set or replaced over the network |
+
+### L. Replication and recovery
+
+| # | Function | CLI | UI | Proof |
+|---|----------|-----|----|-------|
+| L1 | Replicate to a path | `replicate <id> <dest>` | Replicate | Job completes |
+| L2 | Replicate again, nothing changed | `replicate <id> <dest>` | Replicate | Completes, and quickly: only what is new is copied |
+| L3 | Recover on another host | a second daemon with its own state: `repo add <replica>`, `reindex`, `restore` | Connections > Add Repo on the second daemon | The newest snapshot restores from the replica byte-identical to the source |
+
+### M. Shutdown and crash
+
+Each stop is made to land mid-backup: the script waits until the job is
+running in its store phase with files both behind and ahead of it, and a
+check that never saw that state fails rather than passing untested.
+
+| # | Function | CLI | UI | Proof |
+|---|----------|-----|----|-------|
+| M1 | SIGTERM mid-backup | `kill -TERM` the daemon | Daemon status | The daemon stops in order and removes its socket |
+| M2 | The stopped job's record | `jobs <job>` after a restart | Tasks | The interrupted backup reads `cancelled` |
+| M3 | `kill -9` mid-backup | `kill -KILL`, restart, `backup`, `verify --level index --no-repair` | Run Backup, Verify | The next backup completes and the index verify finds nothing missing |
+
 ## Out of scope
 
-- **Replication.** Paused: the engine and local sink exist, the network path
-  is deliberately disabled.
-- **Auth.** A unix-socket connection needs no password; it matters only for
-  the TCP path, which is paused with the rest of the remote work.
+- **Network replication.** Replication targets a path (L); a remote target
+  means mounting it. A native network transport is post-1.0.
+- **Native TLS.** K runs plain HTTP on loopback; a reverse proxy or tunnel
+  terminates TLS in a real deployment.
+
+`tests/acceptance.sh` runs the CLI half of A to M. It starts its own daemon
+from its own config and clears every `C_BACKUP_*` variable first, so the
+image's `C_BACKUP_SECURITY_KEY_DIR` (or an operator's override) cannot
+redirect what a check looks at.
 
 ---
 

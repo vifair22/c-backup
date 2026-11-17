@@ -33,7 +33,7 @@ endif
 # need no OpenSSL. Skipped when pkg-config cannot see OpenSSL at all, in which
 # case repo_key.c's own #error is the backstop.
 OPENSSL_MIN := 3.2
-ifneq ($(filter _build,$(MAKECMDGOALS)),)
+ifneq ($(filter _build _san_test _san_bins,$(MAKECMDGOALS)),)
 OPENSSL_PC_VERSION := $(shell pkg-config --modversion openssl 2>/dev/null)
 ifneq ($(OPENSSL_PC_VERSION),)
 ifneq ($(shell pkg-config --atleast-version=$(OPENSSL_MIN) openssl && echo ok),ok)
@@ -68,8 +68,9 @@ export C_BACKUP_TEST_DIR C_BACKUP_SCRATCH_BUDGET
 SCRATCH_GUARD  := ./$(TESTS)/scratch-guard.sh
 TEST_DIR_DEF   := -DC_BACKUP_TEST_DIR='"$(C_BACKUP_TEST_DIR)"'
 # Rewritten only when the directory changes, so the suites relink then and
-# not on every run.
-TEST_DIR_STAMP := $(BUILD)/test_dir.stamp
+# not on every run. One per build type, so the asan and tsan suites can each
+# run in a scratch directory of their own without relinking each other's.
+TEST_DIR_STAMP := $(BUILD)/$(BUILD_TYPE)/test_dir.stamp
 
 # ---- Flags ------------------------------------------------------------
 WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
@@ -100,10 +101,25 @@ ARCH_CFLAGS := -march=$(MARCH) -mtune=$(MTUNE)
 RELEASE_CFLAGS := $(COMMON_CFLAGS) -O3 -flto=auto $(ARCH_CFLAGS)
 STATIC_CFLAGS  := $(COMMON_CFLAGS) -O3 -flto=auto $(ARCH_CFLAGS)
 DEBUG_CFLAGS   := $(COMMON_CFLAGS) -Og -g $(ARCH_CFLAGS)
-ASAN_CFLAGS    := $(COMMON_CFLAGS) -O1 -g -fsanitize=address -fno-omit-frame-pointer $(ARCH_CFLAGS)
+# The sanitizer builds. ASan and UBSan share one build, since they compose;
+# TSan has its own, because it cannot be combined with ASan. UBSan does not
+# recover: a report that lets the process carry on is a report a passing
+# suite hides.
+ASAN_SAN       := -fsanitize=address,undefined -fno-sanitize-recover=undefined
+TSAN_SAN       := -fsanitize=thread
+ASAN_CFLAGS    := $(COMMON_CFLAGS) -O1 -g $(ASAN_SAN) -fno-omit-frame-pointer $(ARCH_CFLAGS)
+TSAN_CFLAGS    := $(COMMON_CFLAGS) -O1 -g $(TSAN_SAN) -fno-omit-frame-pointer $(ARCH_CFLAGS)
 
 CUTILS_LIB     := -L$(CUTILS_DIR)/build -lc-utils
 LDFLAGS        := $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -pthread -lm
+
+# A sanitizer runtime is linked statically where the toolchain ships the
+# archive, so a sanitized daemon still runs on a host with no libasan.so
+# (Unraid has none). Where it does not, the shared runtime: Arch's gcc ships
+# only libasan.so, and -static-libasan there failed the link outright with
+# "cannot find -lasan". gcc prints the bare name back when it has no such
+# file, so an absolute path is the test.
+static_rt = $(if $(filter /%,$(shell $(CC) -print-file-name=$(1))),$(2))
 
 # Per-type CFLAGS/LDFLAGS selection
 ifeq ($(BUILD_TYPE),release)
@@ -120,8 +136,15 @@ else ifeq ($(BUILD_TYPE),debug)
   BIN_SUFFIX   := -debug
 else ifeq ($(BUILD_TYPE),asan)
   TYPE_CFLAGS  := $(ASAN_CFLAGS)
-  TYPE_LDFLAGS := -static-libasan $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -pthread -lm
+  TYPE_LDFLAGS := $(call static_rt,libasan.a,-static-libasan) \
+                  $(call static_rt,libubsan.a,-static-libubsan) $(LDFLAGS)
+  SAN_CFLAGS   := $(ASAN_SAN)
   BIN_SUFFIX   := -asan
+else ifeq ($(BUILD_TYPE),tsan)
+  TYPE_CFLAGS  := $(TSAN_CFLAGS)
+  TYPE_LDFLAGS := $(call static_rt,libtsan.a,-static-libtsan) $(LDFLAGS)
+  SAN_CFLAGS   := $(TSAN_SAN)
+  BIN_SUFFIX   := -tsan
 endif
 
 DAEMON_TARGET := $(BINS)/c-backupd$(BIN_SUFFIX)
@@ -187,14 +210,56 @@ OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ) $(HELPER_OBJ)
 # drop the strict warnings, since nobody edits it by hand.
 ifeq ($(BUILD_TYPE),debug)
   GEN_CFLAGS := -std=c11 -pthread -Og -g $(SRC_INCLUDES) $(VERSION_DEF)
-else ifeq ($(BUILD_TYPE),asan)
-  GEN_CFLAGS := -std=c11 -pthread -O1 -g $(SRC_INCLUDES) $(VERSION_DEF)
+else ifneq ($(SAN_CFLAGS),)
+  GEN_CFLAGS := -std=c11 -pthread -O1 -g $(SAN_CFLAGS) $(SRC_INCLUDES) $(VERSION_DEF)
 else
   GEN_CFLAGS := -std=c11 -pthread -O3 -flto=auto -march=$(MARCH) $(SRC_INCLUDES) $(VERSION_DEF)
 endif
 
+# ---- Compile-flag tracking --------------------------------------------
+# -MMD records the headers an object read, not what it was compiled with, so
+# on its own it keeps an object built under other flags. Most of all under a
+# different CUTILS_DIR: 1.0.0 and v3 build against different c-utils trees,
+# whose headers keep their old mtimes, so a switch between them rebuilt
+# nothing and linked objects compiled against one c-utils with the other's
+# archive. Each object tree keeps the flags it was built with in flags.stamp,
+# rewritten only when they change, and every object and binary in the tree
+# depends on it. The version defines are left out: they carry the build
+# minute and would rebuild everything every minute.
+FLAG_SIG_STRIP := $(VERSION_DEF) $(CUTILS_VERSION_DEF)
+flag_sig = $(strip $(CC) $(shell $(CC) -dumpfullversion) $(filter-out $(FLAG_SIG_STRIP),$(1)))
+
+# $(1) the object directory, $(2) the name of the variable holding its
+# signature (by name, so a comma in the flags cannot split the ifneq).
+define track_flags
+ifeq ($$(filter clean,$$(MAKECMDGOALS)),)
+ifneq ($$(file < $(1)/flags.stamp),$$($(2)))
+$$(shell mkdir -p $(1))
+$$(file > $(1)/flags.stamp,$$($(2)))
+endif
+endif
+endef
+
+# A tree whose stamp was not written at parse time (its goal was reached
+# some other way) gets one written when something first needs it.
+define stamp_rule
+$(1)/flags.stamp:
+	@mkdir -p $$(@D)
+	$$(file > $$@,$$($(2)))
+endef
+
+FLAGS_STAMP := $(OBJ_DIR)/flags.stamp
+FLAGS_SIG   := $(call flag_sig,$(TYPE_CFLAGS) $(TYPE_LDFLAGS) $(GEN_CFLAGS))
+$(eval $(call track_flags,$(OBJ_DIR),FLAGS_SIG))
+$(eval $(call stamp_rule,$(OBJ_DIR),FLAGS_SIG))
+
+# The headers only the suites include. A suite is compiled in the same
+# command that links it, so these are its whole header dependency on the
+# test side; the library side comes through the objects it links.
+TEST_HDRS := $(wildcard $(TESTS)/*.h)
+
 # ---- Phony targets ----------------------------------------------------
-.PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse bench-nbd analyze lint check-conflict-markers
+.PHONY: all static asan tsan debug clean test bench bench-micro bench-phases bench-browse bench-nbd analyze lint check-conflict-markers
 
 # In the top-level make, which is the release build unless told otherwise,
 # `all` is built here rather than by a sub-make (BUILD-1). The test binaries
@@ -220,6 +285,9 @@ debug:
 asan:
 	$(MAKE) BUILD_TYPE=asan _build
 
+tsan:
+	$(MAKE) BUILD_TYPE=tsan _build
+
 # ---- Internal build target (called via recursive make) ----------------
 .PHONY: _build
 _build: $(MIGRATE_SRC) $(TARGETS)
@@ -233,7 +301,7 @@ $(OBJ_DIR):
 $(BINS):
 	mkdir -p $(BINS)
 
-$(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
+$(OBJ_DIR)/%.o: %.c $(FLAGS_STAMP) | $(OBJ_DIR)
 	$(CC) $(TYPE_CFLAGS) -MMD -MP -c $< -o $@
 
 # ---- Embedded SQL migrations ------------------------------------------
@@ -248,15 +316,15 @@ MIGRATE_SRC := $(BUILD)/app_migrations.c
 $(MIGRATE_SRC): migrations $(wildcard migrations/*.sql) | $(BUILD)
 	$(CUTILS_DIR)/tools/embed_sql.sh migrations/ app_migrations > $@
 
-$(OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(OBJ_DIR)
+$(OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) $(FLAGS_STAMP) | $(OBJ_DIR)
 	$(CC) $(GEN_CFLAGS) -MMD -MP -c $< -o $@
 
 .PHONY: embed-migrations
 embed-migrations: $(MIGRATE_SRC)
 
-$(DAEMON_OBJ): $(DAEMON_MAIN) | $(OBJ_DIR)
+$(DAEMON_OBJ): $(DAEMON_MAIN) $(FLAGS_STAMP) | $(OBJ_DIR)
 	$(CC) $(TYPE_CFLAGS) -MMD -MP -c $< -o $@
-$(CLI_OBJ): $(CLI_MAIN) | $(OBJ_DIR)
+$(CLI_OBJ): $(CLI_MAIN) $(FLAGS_STAMP) | $(OBJ_DIR)
 	$(CC) $(TYPE_CFLAGS) -MMD -MP -c $< -o $@
 
 -include $(wildcard $(OBJ_DIR)/*.d)
@@ -267,14 +335,14 @@ $(CLI_OBJ): $(CLI_MAIN) | $(OBJ_DIR)
 # linker's own error.
 CUTILS_ARCHIVE := $(wildcard $(CUTILS_DIR)/build/libc-utils.a)
 
-$(DAEMON_TARGET): $(LIB_OBJS) $(DAEMON_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
-	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
+$(DAEMON_TARGET): $(LIB_OBJS) $(DAEMON_OBJ) $(CUTILS_ARCHIVE) $(FLAGS_STAMP) | $(BINS)
+	$(CC) $(TYPE_CFLAGS) $(filter %.o %.a,$^) -o $@ $(TYPE_LDFLAGS)
 
-$(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
-	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
+$(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) $(CUTILS_ARCHIVE) $(FLAGS_STAMP) | $(BINS)
+	$(CC) $(TYPE_CFLAGS) $(filter %.o %.a,$^) -o $@ $(TYPE_LDFLAGS)
 
-$(HELPER_TARGET): $(LIB_OBJS) $(VIRT_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
-	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS) $(VIRT_LIBS)
+$(HELPER_TARGET): $(LIB_OBJS) $(VIRT_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) $(FLAGS_STAMP) | $(BINS)
+	$(CC) $(TYPE_CFLAGS) $(filter %.o %.a,$^) -o $@ $(TYPE_LDFLAGS) $(VIRT_LIBS)
 
 # ---- Tests (link against release lib objects) -------------------------
 REL_OBJ_DIR := $(BUILD)/release
@@ -306,8 +374,8 @@ $(TEST_DIR_STAMP): FORCE
 .PHONY: FORCE
 FORCE:
 
-$(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
-	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(TEST_LDFLAGS)
+$(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_HDRS) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o,$^) -o $@ $(TEST_LDFLAGS)
 
 # Suites of the libvirt provider link it and libvirt; they exist only where
 # libvirt does.
@@ -326,15 +394,15 @@ endif
 # names its targets, so nothing else can build them.
 VIRT_TEST_BINS := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(wildcard $(TESTS)/test_virt*.c))
 ifeq ($(HAVE_LIBVIRT),1)
-$(VIRT_TEST_BINS): $(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(REL_VIRT_OBJS) $(TEST_DIR_STAMP) | $(BINS)
-	$(CC) $(TEST_CFLAGS) $(VIRT_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(TEST_LDFLAGS) $(VIRT_LIBS)
+$(VIRT_TEST_BINS): $(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(REL_VIRT_OBJS) $(TEST_HDRS) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(TEST_CFLAGS) $(VIRT_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o,$^) -o $@ $(TEST_LDFLAGS) $(VIRT_LIBS)
 else
 $(VIRT_TEST_BINS):
 	@echo "$@ needs libvirt's and libxml2's development files (pkg-config libvirt libxml-2.0)" >&2; exit 1
 endif
 
-$(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
-	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(FAULT_WRAP) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(TEST_LDFLAGS)
+$(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_HDRS) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(FAULT_WRAP) $(filter %.c %.o,$^) -o $@ $(TEST_LDFLAGS)
 
 # The shell suite drives a real daemon over HTTP. The unit tests cover the
 # code behind the routes; nothing else covers the routes themselves, the auth
@@ -415,31 +483,97 @@ test-ui: all
 test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli test-units test-ui
 	@for t in $(TEST_BINS) $(FAULT_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
 
-# ---- ASAN tests -------------------------------------------------------
-ASAN_OBJ_DIR := $(BUILD)/asan
-ASAN_LIB_OBJS = $(patsubst %.c, $(ASAN_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
-                $(ASAN_OBJ_DIR)/app_migrations.o
+# ---- Sanitizer tests --------------------------------------------------
+#
+# make test-asan (ASan + UBSan) and make test-tsan: every unit and fault
+# suite, then the API, CLI, units and helper end-to-end suites against a
+# daemon, CLI and helper built with the same sanitizer.
+#
+# The suites are built by the sanitizer's own sub-make, the one with rules
+# and .d files for its objects (BUILD-3). They used to be linked by this
+# make, which has no rule for anything under build/asan: it never rebuilt an
+# object there, so `make asan-test-bins` after a branch switch compiled each
+# suite against today's headers and linked it to objects compiled against
+# last week's. A struct that had grown in between read as a
+# stack-buffer-overflow that was not there.
+SAN_TYPES := asan tsan
 
-ASAN_TEST_CFLAGS := -std=c11 -pthread -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
-# The libvirt suites are linked by their own rule and left out here.
-ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(filter-out $(wildcard $(TESTS)/test_virt*.c), $(TEST_SRCS)))
+# One suite, or a few, by name: make test-tsan SAN_ONLY='test_db_txn test_api_e2e.sh'
+SAN_ONLY ?=
 
-$(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
-	$(CC) $(ASAN_TEST_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ -static-libasan \
-	    $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -pthread -lm -lcmocka
+ifneq ($(filter $(BUILD_TYPE),$(SAN_TYPES)),)
+SAN_TEST_CFLAGS := -std=c11 -pthread -Wall -Wextra -O1 -g -fno-omit-frame-pointer $(SAN_CFLAGS) \
+                   -Wno-unused-result $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
+SAN_VIRT_SRCS   := $(filter $(TESTS)/test_virt%,$(TEST_SRCS))
+SAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%$(BIN_SUFFIX), $(filter-out $(SAN_VIRT_SRCS),$(TEST_SRCS)))
+SAN_VIRT_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%$(BIN_SUFFIX), $(SAN_VIRT_SRCS))
+SAN_FAULT_BINS  := $(patsubst $(TESTS)/%.c, $(BINS)/%$(BIN_SUFFIX), $(FAULT_SRCS))
 
-# In sequence, not as two prerequisites: the asan objects are built by the
-# `asan` sub-make and this make has no rule for them, so in parallel a suite
-# linked them while that sub-make was still writing them, or found none on a
-# clean tree (BUILD-1).
+# Static pattern rules, so nothing else in this file can claim the targets.
+$(SAN_TEST_BINS): $(BINS)/%$(BIN_SUFFIX): $(TESTS)/%.c $(TESTS)/fake_index.c $(LIB_OBJS) $(CUTILS_ARCHIVE) \
+                  $(TEST_HDRS) $(FLAGS_STAMP) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(SAN_TEST_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o %.a,$^) -o $@ $(TYPE_LDFLAGS) -lcmocka
+
+# The libvirt suites, like their release rule, link the provider and libvirt.
+$(SAN_VIRT_BINS): $(BINS)/%$(BIN_SUFFIX): $(TESTS)/%.c $(TESTS)/fake_index.c $(LIB_OBJS) $(VIRT_OBJS) $(CUTILS_ARCHIVE) \
+                  $(TEST_HDRS) $(FLAGS_STAMP) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(SAN_TEST_CFLAGS) $(VIRT_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o %.a,$^) -o $@ $(TYPE_LDFLAGS) $(VIRT_LIBS) -lcmocka
+
+$(SAN_FAULT_BINS): $(BINS)/%$(BIN_SUFFIX): $(TESTS)/%.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(LIB_OBJS) \
+                   $(CUTILS_ARCHIVE) $(TEST_HDRS) $(FLAGS_STAMP) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(SAN_TEST_CFLAGS) $(TEST_DIR_DEF) $(FAULT_WRAP) $(filter %.c %.o %.a,$^) -o $@ $(TYPE_LDFLAGS) -lcmocka
+
+# Reports go to files, one directory per suite, as well as failing the
+# suite. The end-to-end suites write a daemon's output into a scratch
+# directory they delete, and compare what a CLI printed against what they
+# expect, so a report on stderr was either lost or read as a wrong answer.
+# A directory left non-empty fails the suite even when the suite passed: a
+# TSan race or a leak at a daemon's exit does not change its exit status.
+#
+# UBSan is the exception: gcc links it as a second runtime beside libasan,
+# with its own copy of the report plumbing that never reads log_path, so its
+# reports go to stderr whatever the options say. It does not recover, so the
+# process it fires in exits non-zero and the suite fails; in an end-to-end
+# suite that is a daemon dying mid-run, and its report is in the daemon log.
+SAN_REPORTS := $(abspath $(OBJ_DIR))/reports
+SAN_ENV_asan := ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1:log_path=$$d/asan \
+                UBSAN_OPTIONS=print_stacktrace=1:log_path=$$d/ubsan
+SAN_ENV_tsan := TSAN_OPTIONS=second_deadlock_stack=1:history_size=4:log_path=$$d/tsan
+SAN_RUN_UNIT := $(if $(SAN_ONLY),$(filter $(addprefix $(BINS)/,$(addsuffix $(BIN_SUFFIX),$(SAN_ONLY))),$(SAN_TEST_BINS) $(SAN_VIRT_BINS) $(SAN_FAULT_BINS)),$(SAN_TEST_BINS) $(SAN_VIRT_BINS) $(SAN_FAULT_BINS))
+san_e2e = $(if $(SAN_ONLY),$(filter $(1),$(SAN_ONLY)),$(1))
+
+.PHONY: _san_bins _san_test
+_san_bins: $(SAN_TEST_BINS) $(SAN_VIRT_BINS) $(SAN_FAULT_BINS)
+
+# Every suite runs, and the target fails at the end naming each one that
+# failed: a sweep that stops at its first finding hides the rest.
+_san_test: _build $(SAN_RUN_UNIT) $(FREE_PORT)
+	@rm -rf $(SAN_REPORTS); fail=""; \
+	run() { n=$$1; shift; d=$(SAN_REPORTS)/$$n; mkdir -p "$$d"; rc=0; \
+	    env $(SAN_ENV_$(BUILD_TYPE)) $(SCRATCH_GUARD) "$$n" "$$@" || rc=1; \
+	    if [ -n "$$(ls -A "$$d")" ]; then echo "$(BUILD_TYPE): $$n left reports in $$d"; rc=1; fi; \
+	    [ $$rc -eq 0 ] || fail="$$fail $$n"; }; \
+	for t in $(SAN_RUN_UNIT); do run $$(basename $$t $(BIN_SUFFIX)) $$t; done; \
+	for s in $(call san_e2e,test_api_e2e.sh); do run $$s ./$(TESTS)/$$s $(DAEMON_TARGET); done; \
+	for s in $(call san_e2e,test_cli_e2e.sh test_units_e2e.sh); do run $$s ./$(TESTS)/$$s $(DAEMON_TARGET) $(CLI_TARGET); done; \
+	for s in $(call san_e2e,test_helper_e2e.sh); do run $$s ./$(TESTS)/$$s $(DAEMON_TARGET) $(CLI_TARGET) $(HELPER_TARGET); done; \
+	if [ -n "$$fail" ]; then echo "$(BUILD_TYPE) failed:$$fail"; exit 1; fi; \
+	echo "$(BUILD_TYPE): every suite clean"
+endif
+
 test-asan:
-	$(MAKE) asan
-	$(MAKE) asan-test-bins
-	@for t in $(ASAN_TEST_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
+	$(MAKE) BUILD_TYPE=asan _san_test
 
-asan-test-bins: $(ASAN_TEST_BINS)
+test-tsan:
+	$(MAKE) BUILD_TYPE=tsan _san_test
 
-.PHONY: test-asan asan-test-bins
+asan-test-bins:
+	$(MAKE) BUILD_TYPE=asan _san_bins
+
+tsan-test-bins:
+	$(MAKE) BUILD_TYPE=tsan _san_bins
+
+.PHONY: test-asan test-tsan asan-test-bins tsan-test-bins
 
 # ---- Fuzzing ----------------------------------------------------------
 #
@@ -480,23 +614,32 @@ FUZZ_LDFLAGS := -fsanitize=fuzzer,address,undefined \
 $(FUZZ_OBJ_DIR) $(FUZZ_BIN_DIR):
 	mkdir -p $@
 
+FUZZ_STAMP := $(FUZZ_OBJ_DIR)/flags.stamp
+FUZZ_SIG   := $(call flag_sig,$(FUZZ_CC) $(FUZZ_CFLAGS) $(FUZZ_LDFLAGS))
+ifneq ($(filter fuzz%,$(MAKECMDGOALS)),)
+$(eval $(call track_flags,$(FUZZ_OBJ_DIR),FUZZ_SIG))
+endif
+$(eval $(call stamp_rule,$(FUZZ_OBJ_DIR),FUZZ_SIG))
+
 define FUZZ_OBJ_RULE
-$(FUZZ_OBJ_DIR)/$(notdir $(basename $(1))).o: $(1) | $(FUZZ_OBJ_DIR)
-	$$(FUZZ_CC) $$(FUZZ_CFLAGS) -c $$< -o $$@
+$(FUZZ_OBJ_DIR)/$(notdir $(basename $(1))).o: $(1) $(FUZZ_STAMP) | $(FUZZ_OBJ_DIR)
+	$$(FUZZ_CC) $$(FUZZ_CFLAGS) -MMD -MP -c $$< -o $$@
 endef
 $(foreach s,$(SRCS),$(eval $(call FUZZ_OBJ_RULE,$(s))))
 
-$(FUZZ_OBJ_DIR)/cJSON.o: $(CUTILS_CJSON_SRC) | $(FUZZ_OBJ_DIR)
-	$(FUZZ_CC) $(FUZZ_CFLAGS) -DCUTILS_CJSON_ALLOW -Wno-everything -c $< -o $@
+$(FUZZ_OBJ_DIR)/cJSON.o: $(CUTILS_CJSON_SRC) $(FUZZ_STAMP) | $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -DCUTILS_CJSON_ALLOW -Wno-everything -MMD -MP -c $< -o $@
 
-$(FUZZ_OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(FUZZ_OBJ_DIR)
-	$(FUZZ_CC) $(FUZZ_CFLAGS) -c $< -o $@
+$(FUZZ_OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) $(FUZZ_STAMP) | $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -MMD -MP -c $< -o $@
 
-$(FUZZ_OBJ_DIR)/fake_index.o: $(TESTS)/fake_index.c | $(FUZZ_OBJ_DIR)
-	$(FUZZ_CC) $(FUZZ_CFLAGS) -I $(TESTS) -c $< -o $@
+$(FUZZ_OBJ_DIR)/fake_index.o: $(TESTS)/fake_index.c $(FUZZ_STAMP) | $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -I $(TESTS) -MMD -MP -c $< -o $@
 
-$(FUZZ_BIN_DIR)/%: $(TESTS)/fuzz/%.c $(FUZZ_LIB_OBJS) $(TEST_DIR_STAMP) | $(FUZZ_BIN_DIR)
-	$(FUZZ_CC) $(FUZZ_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(FUZZ_LDFLAGS)
+-include $(wildcard $(FUZZ_OBJ_DIR)/*.d)
+
+$(FUZZ_BIN_DIR)/%: $(TESTS)/fuzz/%.c $(FUZZ_LIB_OBJS) $(TEST_HDRS) $(FUZZ_STAMP) $(TEST_DIR_STAMP) | $(FUZZ_BIN_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o,$^) -o $@ $(FUZZ_LDFLAGS)
 
 .PHONY: fuzz
 fuzz: $(MIGRATE_SRC) $(FUZZ_BINS)
@@ -803,20 +946,29 @@ COV_CLI    := $(COV_DIR)/bins/c-backup
 $(COV_DIR):
 	mkdir -p $(COV_DIR)
 
-$(COV_DIR)/%.o: $(SRC)/%.c | $(COV_DIR)
-	@mkdir -p $(dir $@)
-	$(CC) $(COV_CFLAGS) -c $< -o $@
+COV_STAMP := $(COV_DIR)/flags.stamp
+COV_SIG   := $(call flag_sig,$(COV_CFLAGS) $(COV_LDFLAGS))
+ifneq ($(filter coverage $(COV_DIR)/%,$(MAKECMDGOALS)),)
+$(eval $(call track_flags,$(COV_DIR),COV_SIG))
+endif
+$(eval $(call stamp_rule,$(COV_DIR),COV_SIG))
 
-$(COV_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(COV_DIR)
+$(COV_DIR)/%.o: $(SRC)/%.c $(COV_STAMP) | $(COV_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(COV_CFLAGS) -MMD -MP -c $< -o $@
+
+$(COV_DIR)/app_migrations.o: $(MIGRATE_SRC) $(COV_STAMP) | $(COV_DIR)
 	$(CC) -std=c11 -pthread -O0 -g --coverage $(COV_PROFILE) $(SRC_INCLUDES) -c $< -o $@
 
-$(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) $(TEST_DIR_STAMP) | $(COV_DIR)
-	$(CC) $(COV_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(COV_LDFLAGS) -lcmocka
+$(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) $(TEST_HDRS) $(TEST_DIR_STAMP) | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o,$^) -o $@ $(COV_LDFLAGS) -lcmocka
 
-$(COV_DIR)/daemon_main.o: $(DAEMON_MAIN) | $(COV_DIR)
-	$(CC) $(COV_CFLAGS) -c $< -o $@
-$(COV_DIR)/cli_main.o: $(CLI_MAIN) | $(COV_DIR)
-	$(CC) $(COV_CFLAGS) -c $< -o $@
+$(COV_DIR)/daemon_main.o: $(DAEMON_MAIN) $(COV_STAMP) | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) -MMD -MP -c $< -o $@
+$(COV_DIR)/cli_main.o: $(CLI_MAIN) $(COV_STAMP) | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) -MMD -MP -c $< -o $@
+
+-include $(shell find $(COV_DIR) -name '*.d' 2>/dev/null)
 
 $(COV_DAEMON): $(COV_DIR)/daemon_main.o $(COV_LIB)
 	@mkdir -p $(dir $@)
@@ -827,8 +979,8 @@ $(COV_CLI): $(COV_DIR)/cli_main.o $(COV_LIB)
 
 # Shorter stem, so make prefers this over the rule above for the fault
 # suites - the same way the release build already resolves them.
-$(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(COV_LIB) $(TEST_DIR_STAMP) | $(COV_DIR)
-	$(CC) $(COV_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(COV_LDFLAGS) $(FAULT_WRAP) -lcmocka
+$(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(COV_LIB) $(TEST_HDRS) $(TEST_DIR_STAMP) | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o,$^) -o $@ $(COV_LDFLAGS) $(FAULT_WRAP) -lcmocka
 
 # Two gates. The whole repository holds the 80% standard. src/store/ has a
 # ratchet of its own because it is the code that survives: the floor is what

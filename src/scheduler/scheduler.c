@@ -47,7 +47,7 @@ static status_t recompute(cutils_db_t *db, int64_t schedule_id, time_t now,
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT trigger_spec, last_fired_at, catchup, next_due_at"
+            "SELECT trigger_spec, last_fired_at, catchup, next_due_at, created_at"
             "  FROM schedules WHERE id = ?",
             (const char *[]){ id, NULL }, &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
@@ -60,8 +60,28 @@ static status_t recompute(cutils_db_t *db, int64_t schedule_id, time_t now,
     time_t last = r->rows[0][1] ? (time_t)strtoll(r->rows[0][1], NULL, 10) : 0;
     int run_once = r->rows[0][2] && strcmp(r->rows[0][2], "run_once") == 0;
     time_t stored_due = r->rows[0][3] ? (time_t)strtoll(r->rows[0][3], NULL, 10) : 0;
+    /* NULL comes back as "", which strtoll reads as 0: no creation time. */
+    time_t created = r->rows[0][4] ? (time_t)strtoll(r->rows[0][4], NULL, 10) : 0;
     db_result_free(r);
     if (st != OK) return st;
+
+    /*
+     * The interval anchor: the last fire, or before the first one, the
+     * moment the schedule was created (B155). It was the last fire or
+     * nothing, and nothing made trigger_next_fire count from `now`. Every
+     * daemon start recomputes every schedule, so a never-fired one was
+     * re-anchored to each start: `schedule add 1 backup 86400` on a host
+     * restarted daily was always a day away and never ran. Only a row from
+     * before created_at existed, and not backfilled, falls back to `now`.
+     *
+     * A fire, not a successful job. The anchor only fixes the phase of the
+     * interval grid; the next fire is the first grid point after now
+     * either way. A fire whose job then failed sits on that grid already
+     * (it fired at its due time), so anchoring to it or to the success
+     * before it differs by the tick latency and nothing more, and a failed
+     * run is not retried before the next window in either reading.
+     */
+    time_t anchor = last > 0 ? last : created;
 
     /*
      * A schedule that has never fired has no last fire to measure a missed
@@ -77,7 +97,7 @@ static status_t recompute(cutils_db_t *db, int64_t schedule_id, time_t now,
         return OK;
     }
 
-    time_t next = trigger_next_fire(&t, now, last);
+    time_t next = trigger_next_fire(&t, now, anchor);
     if (next <= 0) return set_error(ERR_INVALID, "scheduler: trigger never fires");
 
     /*
@@ -100,6 +120,20 @@ static status_t recompute(cutils_db_t *db, int64_t schedule_id, time_t now,
 status_t scheduler_recompute(cutils_db_t *db, int64_t schedule_id, time_t now)
 {
     return recompute(db, schedule_id, now, 0);
+}
+
+/* Recompute everything at startup: next_due_at values were written by a
+ * previous process and may be long past. */
+void scheduler_recompute_startup(cutils_db_t *db, time_t now)
+{
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT id FROM schedules WHERE enabled = 1", NULL, &r) == 0 && r) {
+        for (int i = 0; i < r->nrows; i++) {
+            int64_t sid = strtoll(r->rows[i][0], NULL, 10);
+            if (recompute(db, sid, now, 1) != OK) err_clear();
+        }
+    }
+    db_result_free(r);
 }
 
 /* Off, with the reason recorded where the schedule list shows it. The log
@@ -417,17 +451,7 @@ status_t scheduler_open(cutils_db_t *db, schedule_dispatch_fn dispatch,
     pthread_mutex_init(&s->mu, NULL);
     pthread_cond_init(&s->cv, NULL);
 
-    /* Recompute everything at startup: next_due_at values were written by a
-     * previous process and may be long past. */
-    db_result_t *r = NULL;
-    if (db_execute(db, "SELECT id FROM schedules WHERE enabled = 1", NULL, &r) == 0 && r) {
-        time_t now = time(NULL);
-        for (int i = 0; i < r->nrows; i++) {
-            int64_t sid = strtoll(r->rows[i][0], NULL, 10);
-            if (recompute(db, sid, now, 1) != OK) err_clear();
-        }
-    }
-    db_result_free(r);
+    scheduler_recompute_startup(db, time(NULL));
 
     *out = s;
     return OK;

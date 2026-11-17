@@ -63,3 +63,11 @@ status_t scheduler_tick(scheduler_t *sched, time_t now);
 
 /* Recompute next_due_at for one schedule, applying its catchup policy. */
 status_t scheduler_recompute(cutils_db_t *db, int64_t schedule_id, time_t now);
+
+/*
+ * What scheduler_open does to every enabled schedule before the loop
+ * starts, with a chosen `now`: the previous process's due times are
+ * recomputed, and a missed window is caught up per the schedule's catchup.
+ * Exposed so tests can model a restart at a given instant.
+ */
+void     scheduler_recompute_startup(cutils_db_t *db, time_t now);

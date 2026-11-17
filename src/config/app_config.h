@@ -150,6 +150,17 @@ static const config_key_t app_file_keys[] = {
       "state.db pages written between automatic checkpoints (1000 to 1048576)",
       CFG_STORE_FILE, 0 },
 
+    /* The mass-loss brake (B150): more packs than this missing at once and
+     * nothing is marked absent until an operator's repair accepts it. */
+    { "index.missing_brake_pct", CFG_INT, "5",
+      "Missing packs, as a percentage of a repository's, above which none is marked "
+      "absent without 'repo repair --accept-missing'; counts from two missing (0 to 100)",
+      CFG_STORE_FILE, 0 },
+    { "index.missing_brake_packs", CFG_INT, "10",
+      "Missing packs above which none is marked absent without 'repo repair "
+      "--accept-missing' (0 to 1000000)",
+      CFG_STORE_FILE, 0 },
+
     /* What a retention pass keeps for a repository that has not set its own
      * with the policy API (retention.* policy keys override these). */
     { "retention.keep_snaps",   CFG_INT, "1",  "Newest snapshots always kept, whatever their tier", CFG_STORE_FILE, 0 },
@@ -243,6 +254,7 @@ static const config_section_t app_sections[] = {
     { "units",      "Units (VMs and containers)" },
     { "vm",         "Virtual Machines" },
     { "containers", "Containers" },
+    { "index",      "Index Integrity" },
     { NULL, NULL }
 };
 

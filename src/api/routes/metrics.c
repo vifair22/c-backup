@@ -256,13 +256,13 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                 "or found missing, summed over repositories.", "gauge",
                 "SELECT COALESCE(SUM(v.unrecoverable + v.missing), 0)" LATEST_RUNS);
     emit_scalar(&m, "cbackup_verify_repaired_objects",
-                "Objects repaired from parity by each repository's latest completed verify, "
-                "summed.", "gauge",
+                "Objects (and packs' own structures) repaired by each repository's latest "
+                "completed verify, summed.", "gauge",
                 "SELECT COALESCE(SUM(v.repaired), 0)" LATEST_RUNS);
     emit_scalar(&m, "cbackup_verify_recoverable_objects",
-                "Objects each repository's latest completed verify found damaged on disk "
-                "and readable only through parity (repair off, or the write-back failed), "
-                "summed.", "gauge",
+                "Objects (and packs' own structures) each repository's latest completed "
+                "verify found damaged on disk and recoverable but not repaired (repair off, "
+                "or the write-back failed), summed.", "gauge",
                 "SELECT COALESCE(SUM(v.recoverable), 0)" LATEST_RUNS);
     emit_scalar(&m, "cbackup_verify_affected_files",
                 "Files affected by damage each repository's latest completed verify could "

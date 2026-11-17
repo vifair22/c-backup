@@ -1062,11 +1062,14 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     const char *bad = NULL;
     if (!mode) mode = item ? "item" : "files";
     int unit_mode = strcmp(mode, "unit") == 0;
-    if (strcmp(mode, "files") != 0 && strcmp(mode, "item") != 0 && !unit_mode)
+    /* Settled now: mode points into o, which is freed before the job is
+     * submitted. */
+    int item_mode = strcmp(mode, "item") == 0;
+    if (strcmp(mode, "files") != 0 && !item_mode && !unit_mode)
         bad = "mode must be files, item or unit";
     else if (!unit_mode && (!dest || dest[0] != '/')) bad = "dest must be an absolute path";
     else if (unit_mode && dest) bad = "mode unit restores to the unit's own paths, or under target_root; it takes no dest";
-    else if (strcmp(mode, "item") == 0 && (!item || !*item)) bad = "item is required for mode item";
+    else if (item_mode && (!item || !*item)) bad = "item is required for mode item";
     else if (strcmp(mode, "files") == 0 && item) bad = "item applies only to mode item";
     else if (fmt && strcmp(fmt, "raw") != 0) bad = "format must be raw; qcow2 comes with the libvirt provider";
     else if (ow && !cJSON_IsBool(ow)) bad = "overwrite must be true or false";
@@ -1099,7 +1102,7 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     j->snap_id = snap_id;
     j->repo_path = repo_path_of(repo_id);
     j->dest = dest ? strdup(dest) : NULL;
-    j->item = (strcmp(mode, "item") == 0 && item) ? strdup(item) : NULL;
+    j->item = (item_mode && item) ? strdup(item) : NULL;
     j->overwrite = ow && cJSON_IsTrue(ow);
     j->unit_mode = unit_mode;
     if (unit_mode) {
@@ -1112,7 +1115,7 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
         if (!j->dest) j->dest = strdup("/");
     }
     cJSON_Delete(o);
-    if (!j->repo_path || !j->dest || (strcmp(mode, "item") == 0 && !j->item)) {
+    if (!j->repo_path || !j->dest || (item_mode && !j->item)) {
         urestore_free(j);
         return api_error(500, "out of memory");
     }

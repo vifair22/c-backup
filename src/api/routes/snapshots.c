@@ -665,9 +665,11 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
             return api_error(404, "no such snapshot");
     }
 
-    int limit = 0;
+    /* offset was sent by the CLI's --offset and dropped here, so a second
+     * page was the first page again (B154). */
+    int limit = 0, offset = 0;
     api_response_t page_err;
-    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, NULL, &page_err) != 0) return page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
 
     char *mq = fts_quote(q);
     if (!mq) return api_error(500, "out of memory");
@@ -678,15 +680,30 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
      * repository to fill one page: a scan past SEARCH_SCAN_FACTOR rows per
      * result stops and says the counts are partial.
      */
+    /*
+     * Paging. With a snapshot every row is a result, so the database skips
+     * `offset` rows itself. Without one, results are collapsed rows, and
+     * which rows collapse into which result depends on every row before
+     * them, so a page is cut from the collapsed stream: the scan starts at
+     * the first row and reads enough for offset + limit results, under the
+     * same bound. Results appear in first-seen order, which more rows read
+     * does not reorder, so result N is the same result on every page; past
+     * the bound a page is empty and `partial`.
+     */
     enum { SEARCH_SCAN_FACTOR = 8, SEARCH_SCAN_MAX = 8000 };
-    int scan = only_snap ? limit : limit * SEARCH_SCAN_FACTOR;
-    if (scan > SEARCH_SCAN_MAX) scan = SEARCH_SCAN_MAX;
-    if (scan < limit) scan = limit;
+    int want = only_snap ? limit
+             : (offset > SEARCH_SCAN_MAX - limit ? SEARCH_SCAN_MAX : offset + limit);
+    int scan = only_snap ? limit
+             : (want > SEARCH_SCAN_MAX / SEARCH_SCAN_FACTOR ? SEARCH_SCAN_MAX
+                                                            : want * SEARCH_SCAN_FACTOR);
+    if (scan < want) scan = want;
+    int skip = only_snap ? 0 : offset;   /* results to drop before the page */
 
-    char repo[32], lim[16], snap[32];
+    char repo[32], lim[16], snap[32], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(lim,  sizeof(lim),  "%d", scan);
     snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
+    snprintf(off,  sizeof(off),  "%d", only_snap ? offset : 0);
 
     /*
      * Through the trigram index, not LIKE: a scan of the nodes table loses to
@@ -709,8 +726,8 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
     int rc;
     if (only_snap)
         rc = db_execute(g_ctx.db, oldest_first
-            ? NODE_SQL_SEARCH_SNAP_OLDEST : NODE_SQL_SEARCH_SNAP_NEWEST,
-            (const char *[]){ repo, repo, mq, snap, lim, NULL }, &r);
+            ? NODE_SQL_SEARCH_SNAP_OLDEST " OFFSET ?" : NODE_SQL_SEARCH_SNAP_NEWEST " OFFSET ?",
+            (const char *[]){ repo, repo, mq, snap, lim, off, NULL }, &r);
     else
         rc = db_execute(g_ctx.db, NODE_SQL_SEARCH_ALL,
             (const char *[]){ repo, repo, mq, lim, NULL }, &r);
@@ -745,7 +762,8 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
      * search is often after. Results stay in first-seen order.
      */
     typedef struct { char *key; int row; int64_t snap; uint32_t count; } hit_t;
-    hit_t *hits = calloc((size_t)limit, sizeof(*hits));
+    int cap = want < nrows ? want : nrows;   /* no more results than rows */
+    hit_t *hits = calloc((size_t)(cap > 0 ? cap : 1), sizeof(*hits));
     char **paths = calloc((size_t)(nrows > 0 ? nrows : 1), sizeof(*paths));
     int nhits = 0;
     if (!hits || !paths) {
@@ -770,7 +788,7 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
             hits[found].count++;
             if (sid > hits[found].snap) { hits[found].snap = sid; hits[found].row = i; }
             free(key);
-        } else if (nhits < limit) {
+        } else if (nhits < cap) {
             hits[nhits++] = (hit_t){ key, i, sid, 1 };
         } else {
             free(key);
@@ -778,7 +796,7 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
     }
     int partial = !only_snap && nrows == scan;
 
-    for (int k = 0; k < nhits; k++) {
+    for (int k = skip; k < nhits; k++) {
         char **row = r->rows[hits[k].row];
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
@@ -1335,6 +1353,26 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                                    (unsigned long long)vr.dropped[d].length);
         if (vo < sizeof(vj)) snprintf(vj + vo, sizeof(vj) - vo, "]}");
         job_set_result(progress_ctx, vj);
+        /* The journal's line for a run that passed, in the run's own totals
+         * (a failed one journals the error, which carries them). Without it
+         * a verify that repaired or found recoverable damage journalled an
+         * empty message (NIT-30). */
+        if (st == OK && vr.run_id > 0) {
+            char vs[320];
+            int sn = snprintf(vs, sizeof(vs),
+                     "%s verify%s, run %lld: %llu checked, %llu ok, %llu repaired, "
+                     "%llu recoverable", lvl, j->verify_repair ? "" : " (check only)",
+                     (long long)vr.run_id, (unsigned long long)vr.checked,
+                     (unsigned long long)vr.ok, (unsigned long long)vr.repaired,
+                     (unsigned long long)vr.recoverable);
+            uint64_t ps = vr.pack_structures_repaired + vr.pack_structures_recoverable +
+                          vr.packs_restored;
+            if (ps > 0 && sn > 0 && (size_t)sn < sizeof(vs))
+                snprintf(vs + sn, sizeof(vs) - (size_t)sn,
+                         " (%llu of them pack structure%s)", (unsigned long long)ps,
+                         ps == 1 ? "" : "s");
+            job_set_summary(progress_ctx, vs);
+        }
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*
          * A replica carries the source's identity, so the source's marker is

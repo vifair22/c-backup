@@ -33,6 +33,8 @@
 #include "file_cache.h"
 #include "settle.h"
 #include "index_reconcile.h"
+#include "index_startup.h"
+#include "phase_timer.h"
 #include "job_manager.h"
 #include "lock.h"
 #include "repo_purge.h"
@@ -42,6 +44,7 @@
 #include "sd_notify.h"
 #include "server.h"
 #include "state_db.h"
+#include "pack_presence.h"
 #include "prune.h"
 #include "store_index.h"
 #include "fake_provider.h"
@@ -193,8 +196,10 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
     }
 
     units_sweep_result_t sw;
+    uint64_t t0 = phase_now();
     st = units_sweep(db, 0, &sw);
     if (st != OK) return st;
+    log_info("start-up: units sweep: %.3f s", (double)(phase_now() - t0) / 1e9);
     if (sw.released || sw.failed || sw.removed)
         log_warn("units: start-up sweep released %u hold(s), %u could not be, removed "
                  "%u leftover artefact(s), left %u not this daemon's",
@@ -346,31 +351,11 @@ int main(int argc, char *argv[])
         log_error("cannot initialise auth");
         goto out_locks;
     }
-    /* Nothing is running yet, so any staged object rows belong to a backup
-     * that died with the last process, along with the pack they were in. */
-    /* First the rows of a pack commit a crash cut between its batches, back
-     * to staged, so the drop below takes them with the rest (B144). */
-    if (store_index_drop_unannounced(db, 0) != OK)
-        log_warn("cannot drop the rows of an interrupted pack commit: %s", err_msg());
-    /* Rows of packs removed just before a power cut took the commit that
-     * dropped them (B147). */
-    if (store_index_drop_vanished_packs(db, 0) != OK) {
-        log_warn("%s", err_msg());
-        err_clear();
-    }
-    /* Objects an interrupted reindex left marked absent (B149). */
-    if (store_index_fix_absent(db, 0) != OK) {
-        log_warn("%s", err_msg());
-        err_clear();
-    }
-    /* Prunes a crash or power cut interrupted, before reconcile can take
-     * their records for snapshots the index lost (B148). */
-    if (prune_finish_pending(db, 0, NULL) != OK) {
-        log_warn("%s", err_msg());
-        err_clear();
-    }
-    if (store_index_drop_staged(db, 0) != OK)
-        log_warn("cannot drop staged objects left by an interrupted backup");
+    /* The index's start-up repairs, each timed and logged (index_startup.h).
+     * The brake first: pack presence reads it. */
+    pack_presence_set_brake((unsigned)config_get_int(cfg, "index.missing_brake_pct", 5),
+                            (unsigned)config_get_int(cfg, "index.missing_brake_packs", 10));
+    (void)index_startup_cleanup(db, NULL);
 
     /* Removed repositories whose rows are not all gone yet, including any
      * an earlier build left behind; the thread resumes them in the
@@ -488,6 +473,7 @@ int main(int argc, char *argv[])
      * the repository. Cheap when nothing is missing (index_reconcile.h). */
     {
         reconcile_result_t rr;
+        uint64_t t0 = phase_now();
         if (index_reconcile(db, startup_reindex, jm, &rr) != OK) {
             log_warn("reconcile: %s", err_msg());
             err_clear();
@@ -495,6 +481,7 @@ int main(int argc, char *argv[])
             log_info("reconcile: %u repositor%s checked, index complete",
                      rr.repos_checked, rr.repos_checked == 1 ? "y" : "ies");
         }
+        log_info("start-up: reconcile: %.3f s", (double)(phase_now() - t0) / 1e9);
     }
     routes_schedules_init(db, sched);
     routes_exports_init(db, config_get_str(cfg, "vm.export_dir"),

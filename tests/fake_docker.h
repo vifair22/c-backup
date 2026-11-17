@@ -14,6 +14,7 @@
 #include "cJSON.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +33,7 @@ typedef struct {
     char sock[108];
     int  lfd;
     pthread_t th;
-    volatile int stop;
+    atomic_int stop;  /* read by the server thread, set by stop */
     pthread_mutex_t mu;
     fd_container_t c[FD_MAX];
     int  n;
@@ -208,7 +209,7 @@ static void fd_serve(fake_docker_t *f, int fd)
 static void *fd_main(void *arg)
 {
     fake_docker_t *f = arg;
-    while (!f->stop) {
+    while (!atomic_load(&f->stop)) {
         int fd = accept(f->lfd, NULL, NULL);
         if (fd < 0) continue;
         fd_serve(f, fd);
@@ -234,7 +235,7 @@ static int fake_docker_start(fake_docker_t *f, const char *sock)
 
 static void fake_docker_stop(fake_docker_t *f)
 {
-    f->stop = 1;
+    atomic_store(&f->stop, 1);
     shutdown(f->lfd, SHUT_RDWR);
     /* Wake accept with one last connection. */
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);

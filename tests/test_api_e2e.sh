@@ -1252,6 +1252,15 @@ done
 REPO1=$(sock_body /repos/1)
 contains "a repo id is a number"          '"id":1,'               "$REPO1"
 contains "key_escrowed is a boolean"      '"key_escrowed":false'  "$REPO1"
+contains "a whole repository is not degraded" '"degraded":null'   "$REPO1"
+# B150: repair is only ever an explicit acceptance, and a whole repository
+# has nothing to accept.
+check "repair without accept_missing is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' \
+     -X POST --unix-socket "$SOCK" http://localhost/repos/1/repair)"
+contains "repair of a whole repository drops nothing" '"packs_missing":0' \
+    "$(curl -s -X POST --unix-socket "$SOCK" -d '{"accept_missing":true}' \
+         http://localhost/repos/1/repair)"
+check "GET the repair"           "405 POST"        "$(sock_method GET /repos/1/repair)"
 contains "an unset label is null"         '"label":null'          "$(sock_body /repos/2)"
 TREE=$(sock_body "/repos/1/snapshots/$NEWEST/tree?parent=0")
 contains "a tree type is a number"        '"type":2,'             "$TREE"
@@ -1274,8 +1283,8 @@ contains "an object type is a number"     '"type":1,'             "$LOC"
 # on first append, so a query with no rows used to serialise as {} and every
 # client had to handle two shapes depending on whether data happened to exist.
 echo "empty collections"
-contains "empty journal filter keeps its key" '"entries"' \
-    "$(sock_body '/repos/1/journal?result=nonesuch')"
+contains "empty journal filter keeps its key" '"entries":[]' \
+    "$(sock_body '/repos/1/journal?result=alert')"
 contains "empty search keeps its key" '"results"' \
     "$(sock_body '/repos/1/search?q=zzzznotathing')"
 contains "empty object refs keep their key" '"refs"' \
@@ -1515,6 +1524,127 @@ check "the socket is never locked out" 200 "$(curl -s -o /dev/null -w '%{http_co
 wait_retry_after "$LAST"
 check "the right password works once it lapses" 200 \
     "$(tcp_code /api/auth/login -X POST -d '{"password":"brandnewpassword"}')"
+
+# B154: packs and diff read no limit or offset and the journal no offset, so
+# `packs --limit 1 --offset 1` answered every pack and every journal page
+# was the first. A repository of its own, three backups that each change
+# every file: several packs, a six-change diff and several journal entries.
+echo "every collection pages (B154)"
+mkdir -p "$WORK/pgsrc"
+pg_files() { for i in 1 2 3 4 5 6; do echo "$1 $i" > "$WORK/pgsrc/pgfile$i"; done; }
+PG_BODY=$(curl -s -X POST --unix-socket "$SOCK" \
+          -d "{\"path\":\"$WORK/pgrepo\",\"label\":\"paging\"}" http://localhost/repos)
+PG=$(printf '%s' "$PG_BODY" | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
+contains "paging repository registered" '"id":' "$PG_BODY"
+for gen in one two three; do
+    pg_files "$gen"
+    wait_job "$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
+        -d "{\"paths\":[\"$WORK/pgsrc\"]}" "http://localhost/repos/$PG/backup")")"
+done
+PG_SNAPS=$(sock_body "/repos/$PG/snapshots?limit=10" | grep -oE '"id":[0-9]+' | tr -dc '0-9\n')
+PG_S1=$(printf '%s\n' "$PG_SNAPS" | sort -n | head -1)
+PG_S2=$(printf '%s\n' "$PG_SNAPS" | sort -n | sed -n 2p)
+
+# nth_field <body> <field> <n>: the field of the nth element, 1-based.
+nth_field() { printf '%s' "$1" | grep -oE "\"$2\":(\"[^\"]*\"|[0-9]+)" | sed -n "${3}p"; }
+count_of() { printf '%s' "$1" | grep -oE "\"$2\":" | grep -c .; }
+
+PG_PACKS=$(sock_body "/repos/$PG/packs?limit=5000")
+PG_NP=$(count_of "$PG_PACKS" filename)
+check "the paging repository has at least two packs" yes "$([ "$PG_NP" -ge 2 ] && echo yes || echo "$PG_NP")"
+PG_P1=$(sock_body "/repos/$PG/packs?limit=1&offset=1")
+check "packs: limit caps the page" 1 "$(count_of "$PG_P1" filename)"
+check "packs: offset skips to the second pack" "$(nth_field "$PG_PACKS" filename 2)" \
+    "$(nth_field "$PG_P1" filename 1)"
+contains "packs: an offset past the end is an empty page" '"packs":[]' \
+    "$(sock_body "/repos/$PG/packs?offset=$PG_NP")"
+check "packs: the maximum is 5000" \
+    '{"error":"limit is out of range; it must be from 1 to 5000 (a larger one, up to 9007199254740992, is reduced to 5000)"} 400' \
+    "$(sock_send GET "/repos/$PG/packs?limit=0")"
+check "packs: a limit over the maximum is clamped" "$PG_NP" \
+    "$(count_of "$(sock_body "/repos/$PG/packs?limit=99999")" filename)"
+check "packs: a malformed offset is a 400" 400 "$(sock_code "/repos/$PG/packs?offset=x")"
+
+PG_DIFF=$(sock_body "/repos/$PG/diff?from=$PG_S1&to=$PG_S2")
+check "diff: six files changed" 6 "$(count_of "$PG_DIFF" change)"
+contains "diff: the counts cover the comparison" '"modified":6' "$PG_DIFF"
+PG_D=$(sock_body "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&limit=2&offset=3")
+check "diff: limit caps the page" 2 "$(count_of "$PG_D" change)"
+check "diff: offset skips three changes" "$(nth_field "$PG_DIFF" path 4)" "$(nth_field "$PG_D" path 1)"
+check "diff: and the page holds the next" "$(nth_field "$PG_DIFF" path 5)" "$(nth_field "$PG_D" path 2)"
+contains "diff: a page still counts every change" '"modified":6' "$PG_D"
+contains "diff: truncated says more follow the page" '"truncated":true' "$PG_D"
+contains "diff: the last page is not truncated" '"truncated":false' \
+    "$(sock_body "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&limit=2&offset=4")"
+contains "diff: an offset past the end is an empty page" '"changes":[]' \
+    "$(sock_body "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&offset=6")"
+check "diff: the maximum is 5000" \
+    '{"error":"limit is out of range; it must be from 1 to 5000 (a larger one, up to 9007199254740992, is reduced to 5000)"} 400' \
+    "$(sock_send GET "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&limit=0")"
+check "diff: a malformed offset is a 400" 400 \
+    "$(sock_code "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&offset=-1")"
+
+PG_J=$(sock_body "/repos/$PG/journal?limit=1000")
+PG_NJ=$(count_of "$PG_J" operation)
+check "the paging repository has three journal entries" yes "$([ "$PG_NJ" -ge 3 ] && echo yes || echo "$PG_NJ")"
+PG_J2=$(sock_body "/repos/$PG/journal?limit=2&offset=1")
+check "journal: limit caps the page" 2 "$(count_of "$PG_J2" operation)"
+check "journal: offset skips the newest entry" "$(nth_field "$PG_J" id 2)" "$(nth_field "$PG_J2" id 1)"
+check "journal: and the page holds the next" "$(nth_field "$PG_J" id 3)" "$(nth_field "$PG_J2" id 2)"
+check "journal: the maximum is 1000" \
+    '{"error":"limit is out of range; it must be from 1 to 1000 (a larger one, up to 9007199254740992, is reduced to 1000)"} 400' \
+    "$(sock_send GET "/repos/$PG/journal?limit=0")"
+check "journal: a malformed offset is a 400" 400 "$(sock_code "/repos/$PG/journal?offset=x")"
+# NIT-32: a result nothing journals answered [] like a clean history.
+for v in bogus completed SUCCESS; do
+    check "journal: result=$v is refused" \
+        '{"error":"result must be one of: success, failed, cancelled, warning, alert"} 400' \
+        "$(sock_send GET "/repos/$PG/journal?result=$v")"
+done
+contains "journal: a valid result filters" '"result":"success"' \
+    "$(sock_body "/repos/$PG/journal?result=success&limit=1")"
+
+# Refs, search, tags, schedules and repos: offset was dropped or the list
+# was unbounded. Each now skips and caps like the rest.
+PG_OBJ=$(sock_body "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&limit=1" \
+         | sed -n 's/.*"old_hash":"\([a-f0-9]*\)".*/\1/p')
+PG_R=$(sock_body "/repos/$PG/objects/$PG_OBJ/refs")
+check "refs: the old content is in one snapshot" 1 "$(count_of "$PG_R" snap_id)"
+contains "refs: offset skips it" '"refs":[]' "$(sock_body "/repos/$PG/objects/$PG_OBJ/refs?offset=1")"
+PG_SR=$(sock_body "/repos/$PG/search?q=pgfile&snapshot=$PG_S1")
+PG_SR1=$(sock_body "/repos/$PG/search?q=pgfile&snapshot=$PG_S1&limit=1&offset=1")
+check "search in a snapshot finds its six files" 6 "$(count_of "$PG_SR" node_id)"
+check "search in a snapshot: limit caps the page" 1 "$(count_of "$PG_SR1" node_id)"
+check "search in a snapshot: offset skips" "$(nth_field "$PG_SR" path 2)" "$(nth_field "$PG_SR1" path 1)"
+PG_SA=$(sock_body "/repos/$PG/search?q=pgfile")
+PG_SA1=$(sock_body "/repos/$PG/search?q=pgfile&limit=1&offset=1")
+check "search everywhere finds every version" 18 "$(count_of "$PG_SA" node_id)"
+check "search everywhere: limit caps the page" 1 "$(count_of "$PG_SA1" node_id)"
+check "search everywhere: offset skips a collapsed result" \
+    "$(nth_field "$PG_SA" hash 2)" "$(nth_field "$PG_SA1" hash 1)"
+contains "search: an offset past the scan is an empty page" '"results":[]' \
+    "$(sock_body "/repos/$PG/search?q=pgfile&offset=99999")"
+for n in a b c; do
+    sock_send POST "/repos/$PG/tags" "{\"name\":\"pg-$n\",\"snap_id\":$PG_S1}" >/dev/null
+done
+check "tags: paged by name" '"name":"pg-b"' \
+    "$(nth_field "$(sock_body "/repos/$PG/tags?limit=1&offset=1")" name 1)"
+check "tags: limit caps the page" 2 "$(count_of "$(sock_body "/repos/$PG/tags?limit=2")" name)"
+check "tags: the maximum is 1000" 400 "$(sock_code "/repos/$PG/tags?limit=0")"
+for t in 3600 7200; do
+    sock_send POST "/repos/$PG/schedules" \
+        "{\"action\":\"gc\",\"trigger\":{\"type\":\"interval\",\"seconds\":$t}}" >/dev/null
+done
+PG_SC=$(sock_body "/repos/$PG/schedules")
+check "schedules: two to page" 2 "$(count_of "$PG_SC" overlap)"
+check "schedules: offset skips one" "$(nth_field "$PG_SC" id 2)" \
+    "$(nth_field "$(sock_body "/repos/$PG/schedules?limit=1&offset=1")" id 1)"
+check "schedules: a malformed limit is a 400" 400 "$(sock_code "/repos/$PG/schedules?limit=x")"
+PG_RP=$(sock_body /repos)
+check "repos: offset skips one" "$(nth_field "$PG_RP" id 2)" \
+    "$(nth_field "$(sock_body '/repos?limit=1&offset=1')" id 1)"
+check "repos: limit caps the page" 1 "$(count_of "$(sock_body '/repos?limit=1')" uuid)"
+check "repos: a malformed offset is a 400" 400 "$(sock_code '/repos?offset=-1')"
 
 echo "shutdown"
 kill -TERM "$DAEMON_PID" 2>/dev/null

@@ -189,6 +189,11 @@ unix socket and TCP listener are bound, so `systemctl start` (and
 `enable --now`) returns when the CLI can connect, and a unit ordered
 `After=c-backupd.service` starts no earlier. Startup applies any schema
 migrations first; the unit allows ten minutes for that (`TimeoutStartSec`).
+It then repairs whatever a crash or power cut left in the index, before the
+API binds, and logs one `start-up:` line per step with the time it took
+(`start-up: pack presence: 0.055 s`), so a slow start names the step that
+was slow. Each step is linear in the size of the index; at 300,000 objects
+they take well under a second together.
 On stop it reports `deactivating` while running jobs are cancelled. The
 daemon implements the notification protocol itself and does not link
 libsystemd; run outside systemd it simply skips it.
@@ -389,6 +394,8 @@ are different: they live in the database and change through the policy API
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
 | `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. Files of 1 MiB or less are read and prepared, many to a batch, on up to four of them. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
+| `index.missing_brake_pct` | `5` | Missing packs, as a percentage of a repository's, above which none is marked lost without `repo repair --accept-missing`; counts only from two missing (section 17.6). 0 to 100 |
+| `index.missing_brake_packs` | `10` | Missing packs above which none is marked lost without `repo repair --accept-missing` (section 17.6). 0 to 1000000 |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
 | `retention.keep_daily` | `7` | Daily snapshots kept |
 | `retention.keep_weekly` | `4` | Weekly snapshots kept |
@@ -1385,14 +1392,22 @@ than ignored. Every option with a fixed set of values (`--every`, `--level`,
 `--location`, `--encrypt`, `--on-overlap`, `--catchup`, `--scope`) refuses
 anything else before a request is sent.
 
-**Interval** triggers anchor to the last successful run, not to wall-clock
+**Interval** triggers anchor to the schedule's last fire, not to wall-clock
 multiples: a long backup does not make the next one due the moment it ends.
+Before its first fire the anchor is the moment the schedule was created, so
+`schedule add 1 backup 86400` first runs a day after it was added however
+often the daemon restarts in between. The anchor is the fire, not the job's
+outcome: a run that failed was still that window's run, the next one is due
+one interval after it, and a restart does not retry it (only a window the
+daemon was down for counts as missed, below).
 
 **Calendar** triggers use the daemon's local time: the host's under systemd,
 UTC in the Docker image unless `TZ` is set (section 2.3). `schedule list`
 names the zone (`timezone`) and gives each next fire with its offset
 (`next_due_iso`). `every` is `day`, `week`
-(with `--on <weekday>`), `month` (with `--on-day 1-31`) or `year` (with
+(with `--on <weekday>`: the full name or its first three letters, in any
+case, so `sunday`, `Sun` and `SUN` are one day, listed as `sunday`), `month`
+(with `--on-day 1-31`) or `year` (with
 `--on-month` and `--on-day`). The edge cases are handled: a time that does
 not exist on a spring-forward day still fires once, a time that occurs twice
 on a fall-back day fires once, the 31st clamps to the last day of shorter
@@ -1404,7 +1419,7 @@ Two policies per schedule:
 | Option | Values | Meaning |
 |---|---|---|
 | `--on-overlap` | `skip` (default), `queue`, `cancel_running` | The schedule comes due while its previous run is still going |
-| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next, or fire once now. Applies to a schedule's first window too |
+| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next window on the schedule's own interval or calendar, or fire once at start and count on from that fire. Never once per missed window. Applies to a schedule's first window too |
 
 Any other value is refused when the schedule is created.
 
@@ -1526,10 +1541,10 @@ What a run counts:
 
 | Count | Meaning |
 |---|---|
-| `checked` | Everything examined: each indexed object, and each regular-file entry that names no content. Always the sum of the five counts below |
+| `checked` | Everything examined: each indexed object, each regular-file entry that names no content, and each pack whose own header, tails or CRC table were damaged or whose headers were restored. Always the sum of the five counts below |
 | `ok` | Intact. Never includes a failure, so a run with anything missing or unrecoverable shows `ok` below `checked` |
-| `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` or `--dry-run` |
-| `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
+| `repaired` | Corrected from parity and written back, or moved by the index to an intact duplicate copy. Always 0 with `--no-repair` or `--dry-run` |
+| `recoverable` | Readable only through parity and still wrong on disk, or damaged beyond parity with an intact duplicate copy elsewhere in the repository. Run a repairing verify |
 | `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
 | `missing` | Indexed but absent, including every object in a pack file that has gone, and every index entry of a regular file that names no content at all. **Data loss** |
 
@@ -1588,7 +1603,13 @@ per-repository journal (`c-backup journal 1`) is the
 permanent record of what ran and how it ended. A journal entry's `source`
 says who asked: `api` for a job run by hand (the CLI and the app both go
 through the API), `schedule` for one a schedule fired, with the message
-starting `schedule <id>`.
+starting `schedule <id>`. Its `result` is how a job ended (`success`,
+`failed`, `cancelled`) or an advisory written beside one (`warning`, for an
+unconfirmed key escrow, a plaintext replica or a unit definition that needs
+attention; `alert`, for a missing pack). `journal --result` filters on
+exactly those five and refuses anything else, so a misspelt filter is an
+error rather than an empty history. The journal is newest first and pages
+with `--limit` (default 100, at most 1000) and `--offset`.
 
 **Deleting a snapshot** is not a job: it removes a few rows and one file and
 answers at once, `{"removed":true,"id":12,"tags_removed":0}`. It is
@@ -2008,8 +2029,8 @@ the repository).
 | `cbackup_stalest_verify_repo_info` | gauge | Always 1; its `repo_id` and `label` labels name the repository the verify age measures |
 | `cbackup_repos_never_verified` | gauge | Repositories with no completed verify |
 | `cbackup_verify_unrecoverable_objects` | gauge | Objects the last verify found unrecoverable or missing |
-| `cbackup_verify_repaired_objects` | gauge | Objects the last verify repaired and wrote back |
-| `cbackup_verify_recoverable_objects` | gauge | Objects the last verify found damaged but did not write back |
+| `cbackup_verify_repaired_objects` | gauge | Objects, and packs' own structures, the last verify repaired |
+| `cbackup_verify_recoverable_objects` | gauge | Objects, and packs' own structures, the last verify found damaged but did not repair |
 | `cbackup_verify_affected_files` | gauge | Distinct paths referencing lost objects |
 | `cbackup_alerts_sent_total` | counter | Push notifications Pushover accepted |
 | `cbackup_alerts_failed_total` | counter | Push notifications given up on: rejected by Pushover (bad token or user key), or expired after 24 hours of failed retries |
@@ -2304,6 +2325,63 @@ or may not have taken effect: check, and make it again if not.
 
 ---
 
+### 17.6 A pack file is missing
+
+The index records, for every object, the pack file that holds it. If that
+file is gone - an operator deleted it, the repository was put back from an
+older copy, or a power cut on a build before 1.0.0 lost a pack the index
+had already recorded - the index would still vouch for its objects, and a
+backup would deduplicate against them, store nothing and report success
+over data that no longer exists.
+
+So every pack the index names is checked against its file, one `stat` per
+pack, at every start and at the start of every backup. A pack whose file is
+missing is taken out of the index: the objects it held are marked
+**absent**, which the next backup treats as not there, so it reads those
+files again and stores whatever it still finds. Each such pack raises an
+alert (an error in the log, a push notification, and a journal entry with
+operation `missing-pack`):
+
+```
+repo 1 (/srv/backup/main): pack-0000000000.dat is missing; its 297 object(s) are now marked absent, the next backup stores again whatever it still finds, and verify reports the rest missing
+```
+
+Until a backup has stored them again, `c-backup verify <id>` reports
+exactly those objects missing, with the files and snapshots they affect. A
+snapshot whose own trees were in the missing pack stays unrestorable unless
+a later backup of the same unchanged source makes those trees again; the
+objects a newer backup did store again make every older snapshot that
+names them restorable once more.
+
+Two things are never taken for missing packs:
+
+- **An unavailable repository.** When the repository's `packs/` directory
+  is missing or cannot be read - a share that is not mounted - nothing is
+  checked or changed, the repository is reported unavailable, and a backup
+  into it is refused. Only a pack file that does not exist (`ENOENT`) in a
+  readable `packs/` counts as missing; any other error leaves its pack as
+  it is.
+- **A mass disappearance.** Two or more missing packs that are more than
+  `index.missing_brake_pct` percent of the repository's (default 5), or more
+  than `index.missing_brake_packs` of them (default 10), looks far more like
+  a wrong path, a half-mounted share or a mistake than real loss. Nothing is
+  marked absent. The repository becomes **degraded** instead: an alert says
+  so, `c-backup repo show <id>` shows why in `degraded`, and every backup
+  into it is refused, because dedup cannot trust its index. Check the path
+  and the mount first; when every pack is back, the next start or backup
+  clears the degraded state on its own. If the packs really are gone, accept
+  the loss explicitly:
+
+  ```sh
+  sudo c-backup repo repair 1 --accept-missing
+  ```
+
+  which marks their objects absent as above and takes backups again.
+
+A single missing pack never trips the percentage, however small the
+repository: one pack out of one heals on its own, with its alert, while
+two out of three go through the repair.
+
 ## 18. Capacity planning and performance
 
 Figures here were measured: on a development workstation against 6.8 GB and
@@ -2516,9 +2594,10 @@ lists every command with all of its arguments.
 
 | Command | Purpose |
 |---|---|
-| `repo list` | Registered repositories |
+| `repo list [--limit N] [--offset N]` | Registered repositories |
 | `repo add <path> [label] [--encrypt system\|passphrase\|none] [--passphrase TEXT]` | Create or register |
-| `repo show <id>` | One repository |
+| `repo show <id>` | One repository; `degraded` says why it takes no backups, when it does not |
+| `repo repair <id> --accept-missing` | Accept a degraded repository's missing packs as lost (section 17.6) |
 | `repo remove <id>` | Deregister; the directory is kept |
 | `repo key export\|ack <id>`, `repo key import <id> <key-hex>` | Encryption key escrow and recovery |
 | `sources list <id>`, `sources set <id> [path...] [--exclude PAT]...` | What a repository backs up; `set` with no paths clears the list |
@@ -2538,12 +2617,12 @@ lists every command with all of its arguments.
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt] [--to-plaintext]` | Copy into another directory; `--reencrypt` into another repository under its own encryption; `--to-plaintext` to allow that repository to be unencrypted (section 14.1) |
 | `stats <id> [--scope staged]`, `summary <id>`, `fanout <id>` | Repository statistics; `staged` is objects in packs a running backup has not sealed |
-| `objects <id> [--location staged\|packed\|all] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
+| `objects <id> [--location staged\|packed\|all] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content] [--limit N] [--offset N]` | Objects; `--limit` and `--offset` page `refs` and are refused for the other views. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
 | `packs <id> [pack-id] [--limit N] [--offset N]` | Packs, or one pack's entries |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
-| `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
-| `journal <id> [--limit N] [--result STATE]` | Operation history |
-| `schedule list\|add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
+| `tag list <id> [--limit N] [--offset N]`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
+| `journal <id> [--limit N] [--offset N] [--result success\|failed\|cancelled\|warning\|alert]` | Operation history, newest first; any other `--result` is refused |
+| `schedule list <id> [--limit N] [--offset N]`, `schedule add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
 | `jobs [--limit N] [--offset N]`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
 | `auth status` | Whether an admin password is set |
 | `auth setup\|password` | Set or change the admin password (prompts) |
