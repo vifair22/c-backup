@@ -286,6 +286,8 @@ typedef struct {
     unit_json_t               uj;
     char                     *uj_text;
     uint64_t                  bytes_read;
+    size_t                    streams_failed;   /* dumps not stored */
+    char                      stream_failed[256]; /* the first's path, for the warning */
     int                       held;      /* begin kept a pause for pass 2 */
     int                       cap_hit;   /* and the watchdog let it go first */
     /* Incremental reads. */
@@ -624,8 +626,11 @@ static void part_close(void *ctx, size_t index, status_t st, const cdc_result_t 
         p->stream_ok = st == OK && ok;
         p->stream_open = 0;
         if (st == OK && cr) p->bytes_read = cr->size;
-        if (!p->stream_ok)
+        if (!p->stream_ok) {
             log_warn("unit %s: %s failed; it is not stored", u->desc->unit_id, it->tree_path);
+            if (!u->streams_failed++)
+                snprintf(u->stream_failed, sizeof(u->stream_failed), "%.250s", it->tree_path);
+        }
         free(p->pipe.buf);
         p->pipe.buf = NULL;
     }
@@ -1147,9 +1152,15 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (st == OK) {
             snap = br.snapshot_id;
             res->files = br.files;
-            if (br.files_skipped && !res->warning[0])
+            /* A failed dump is one of the entries left out; it is named as
+             * the dump it is, not counted as a file that could not be read. */
+            uint64_t unread = br.files_skipped > u.streams_failed ? br.files_skipped - u.streams_failed : 0;
+            if (u.streams_failed && !res->warning[0])
+                snprintf(res->warning, sizeof(res->warning), "%zu dump(s) failed and are not in "
+                         "snapshot %lld; first: %s", u.streams_failed, (long long)snap, u.stream_failed);
+            else if (unread && !res->warning[0])
                 snprintf(res->warning, sizeof(res->warning), "%llu file(s) could not be read "
-                         "and are not in snapshot %lld", (unsigned long long)br.files_skipped,
+                         "and are not in snapshot %lld", (unsigned long long)unread,
                          (long long)snap);
         }
         backup_result_free(&br);

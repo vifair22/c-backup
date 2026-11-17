@@ -364,6 +364,9 @@ static void test_dumps_through_helper(void **state)
     unit_backup_result_t res;
     assert_int_equal(backup_one("cbk-uat-one", &res), OK);
     int64_t snap = res.units[0].snapshot_id;
+    /* The failed dump is named as one, not counted as an unreadable file. */
+    if (!strstr(res.units[0].warning, "1 dump(s) failed")) fail_msg("warning: %s", res.units[0].warning);
+    assert_non_null(strstr(res.units[0].warning, "baddump.dump"));
     unit_backup_result_free(&res);
     restore_opts_t ro;
     memset(&ro, 0, sizeof(ro));
