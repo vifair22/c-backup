@@ -37,7 +37,8 @@ ARG VARIANT=release
 RUN if [ "$VARIANT" = asan ]; then \
         make CUTILS_DIR=/c-utils MARCH=x86-64-v2 MTUNE=generic asan \
         && mv build/bins/c-backupd-asan build/bins/c-backupd \
-        && mv build/bins/c-backup-asan build/bins/c-backup; \
+        && mv build/bins/c-backup-asan build/bins/c-backup \
+        && mv build/bins/c-backup-helper-asan build/bins/c-backup-helper; \
     else \
         make CUTILS_DIR=/c-utils MARCH=x86-64-v2 MTUNE=generic; \
     fi
@@ -55,6 +56,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /build/build/bins/c-backupd /usr/local/bin/c-backupd
 COPY --from=build /build/build/bins/c-backup  /usr/local/bin/c-backup
+# The host helper ships in the same image and runs as a second container
+# with its own entrypoint (docs/helper.md): one artefact to version, and the
+# daemon and its helper always speak the same protocol.
+COPY --from=build /build/build/bins/c-backup-helper /usr/local/bin/c-backup-helper
 COPY packaging/config.yaml /etc/c-backupd/config.yaml
 # 0600 in the image itself, the mode the daemon requires, so a read-only root
 # filesystem never needs a chmod at start.

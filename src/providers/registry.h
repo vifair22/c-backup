@@ -25,6 +25,11 @@ size_t                   sp_registry_compiled(const sp_provider_ops_t *const **o
  */
 status_t sp_registry_enable(const sp_provider_ops_t *ops, const sp_config_t *cfg);
 
+/* Enable a provider whose context is already made: the helper's remote
+ * providers, one ops table per provider the helper offers. Shutdown calls
+ * its fini. */
+status_t sp_registry_add(const sp_provider_ops_t *ops, sp_ctx_t *ctx);
+
 /* The enabled provider of that name. ERR_NOT_FOUND names the providers
  * that are enabled, so a typo and a disabled provider read differently. */
 status_t sp_registry_get(const char *name, const sp_provider_ops_t **ops,

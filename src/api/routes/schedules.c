@@ -4,6 +4,7 @@
 #include "routes.h"
 
 #include "registry.h"
+#include "remote_provider.h"
 #include "reserved.h"
 #include "scheduler.h"
 #include "trigger.h"
@@ -521,7 +522,10 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
         if (rc != 0) return api_error(400, why);
         cJSON *c = cJSON_Parse(canon);
         const char *prov = c ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(c, "provider")) : NULL;
-        int on = prov && sp_registry_enabled(prov);
+        /* Behind a helper that is away right now still counts: the
+         * schedule's runs will fail and alert until it is back. */
+        char hwhy[512];
+        int on = prov && (sp_registry_enabled(prov) || remote_unusable(prov, hwhy, sizeof(hwhy)));
         cJSON_Delete(c);
         if (!on) {
             free(canon);

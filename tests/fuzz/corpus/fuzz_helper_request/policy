@@ -1,0 +1,9 @@
+[helper]
+daemon_uid = 990
+daemon_id = 7f3a09c1
+state_dir = /mnt/cache/system/c-backup-helper
+[units]
+allow = docker:cbk-*
+[hook h]
+unit = docker:Grafana
+argv.0 = /bin/true

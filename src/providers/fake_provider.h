@@ -130,6 +130,23 @@ void fake_stats(sp_ctx_t *ctx, fake_stats_t *out);
 status_t fake_artefact_plant(sp_ctx_t *ctx, const char *name, const char *owner);
 int      fake_artefact_exists(sp_ctx_t *ctx, const char *name);
 
+/*
+ * The data plane, for the helper split (source-providers.md 11.1): the
+ * helper holds the unit and the control calls; the daemon reads the bytes
+ * itself. For the fake that means the daemon rebuilds a disk's stream from
+ * its run map, the way it would read a real export through its own mount.
+ */
+status_t fake_disk_runs(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
+                        uint64_t *size, fake_run_t **runs, size_t *n_runs,
+                        fake_alloc_t *alloc);
+status_t fake_blob_data(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
+                        void **data, size_t *len);
+/* A block stream over a run map, owning a copy; close frees it. */
+status_t fake_stream_from_runs(uint64_t size, const fake_run_t *runs, size_t n_runs,
+                               fake_alloc_t alloc, sp_block_stream_t *out);
+/* Units' state, for unit.stop / unit.start behind the helper. */
+int      fake_unit_state(sp_ctx_t *ctx, const char *unit_id);
+
 /* A hold as if a previous daemon died holding it: present in the fake's
  * table, released only by a sweep naming it. */
 status_t fake_hold_plant(sp_ctx_t *ctx, const char *unit_id, const char *kind,

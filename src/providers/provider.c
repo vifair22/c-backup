@@ -66,7 +66,7 @@ const char *sp_read_mode_name(sp_read_mode_t m)
 }
 
 /* Section 6.4. Bounded so a reason can label a metric. */
-int sp_reason_known(const char *reason)
+const char *sp_reason_canonical(const char *reason)
 {
     static const char *const k[] = {
         "first", "no-incremental-support", "no-base", "base-pruned",
@@ -74,11 +74,13 @@ int sp_reason_known(const char *reason)
         "item-source-changed", "unit-redefined", "audit", "delta-too-costly",
         "forced", "unchanged-offline", "incremental",
     };
-    if (!reason) return 0;
+    if (!reason) return NULL;
     for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++)
-        if (strcmp(reason, k[i]) == 0) return 1;
-    return 0;
+        if (strcmp(reason, k[i]) == 0) return k[i];
+    return NULL;
 }
+
+int sp_reason_known(const char *reason) { return sp_reason_canonical(reason) != NULL; }
 
 void sp_session_info_free(sp_session_info_t *info)
 {
