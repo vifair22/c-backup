@@ -3,12 +3,15 @@
 #include "db_txn.h"
 
 #include "phase_timer.h"
+#include "wal_sync.h"
 
 #include <cutils/log.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
+#include <strings.h>
 
 /*
  * Static rather than per-handle because the thing being guarded is not the
@@ -145,30 +148,73 @@ int db_txn_batch_should_end(db_txn_batch_t *b)
            now - b->opened_ns >= (uint64_t)DB_TXN_BATCH_HOLD_MS * 1000000ULL;
 }
 
+int db_txn_wal_path(cutils_db_t *db, char *out, size_t outsz)
+{
+    if (!db || !out || outsz == 0) return -1;
+    out[0] = '\0';
+    db_result_t *r = NULL;
+    int wal = db_execute(db, "PRAGMA journal_mode", NULL, &r) == 0 && r &&
+              r->nrows == 1 && r->ncols >= 1 && strcasecmp(r->rows[0][0], "wal") == 0;
+    db_result_free(r);
+    if (!wal) return 0;
+    r = NULL;
+    /* seq, name, file: the main database's file, "" for an in-memory or
+     * temporary one, which has no WAL on disk to sync. */
+    if (db_execute(db, "PRAGMA database_list", NULL, &r) != 0 || !r) {
+        db_result_free(r);
+        return -1;
+    }
+    int rc = 0;
+    for (int i = 0; i < r->nrows; i++) {
+        if (r->ncols < 3 || strcmp(r->rows[i][1], "main") != 0) continue;
+        if (r->rows[i][2][0] &&
+            snprintf(out, outsz, "%s-wal", r->rows[i][2]) >= (int)outsz) {
+            out[0] = '\0';
+            rc = -1;
+        }
+        break;
+    }
+    db_result_free(r);
+    return rc;
+}
+
 status_t db_txn_make_durable(cutils_db_t *db)
 {
     if (!db) return set_error(ERR_INVALID, "db_txn_make_durable: null handle");
     if (tls_held)
         return set_error(ERR_BUSY, "db_txn_make_durable: this thread holds the write "
-                                   "lock (a checkpoint cannot run inside a transaction)");
+                                   "lock (its own transaction is not committed yet)");
     status_t (*gate)(void) = g_durable_gate;
     if (gate && gate() != OK) return ERR_IO;
     uint64_t t0 = phase_now();
+
+    /*
+     * A barrier, not a hold: wait for whatever transaction is open to
+     * commit, then let go before syncing. A write issued outside db_txn -
+     * notes, policy, jobs, sessions all do - runs on the one shared
+     * connection and so lands inside any transaction another thread has
+     * open; it is committed only when that transaction is. Taking the lock
+     * means that transaction is over. A batch holder sees the waiter and
+     * commits at its next safe point (db_txn_batch_should_end), so this
+     * waits for a commit, not for a backup.
+     */
     write_lock();
-    db_result_t *r = NULL;
-    int rc = db_execute(db, "PRAGMA wal_checkpoint(FULL)", NULL, &r);
-    /* busy, log frames, checkpointed frames: busy 0 is a complete
-     * checkpoint, log -1 a database that is not in WAL mode, where every
-     * commit was synced as it was made. */
-    int ok = rc == 0 && r && r->nrows == 1 && r->ncols >= 1 &&
-             strcmp(r->rows[0][0], "0") == 0;
-    db_result_free(r);
+    write_unlock();
+
+    char wal[PATH_MAX];
+    if (db_txn_wal_path(db, wal, sizeof(wal)) != 0)
+        return set_error(ERR_IO, "state.db: cannot find its WAL to make the index durable");
+
+    /* No lock held, so no writer waits for the sync. wal_sync also syncs
+     * the directory the first time a given -wal is made durable, and checks
+     * it syncs the live file (wal_sync.h). */
+    if (wal[0]) {
+        status_t st = wal_sync(wal);
+        if (st != OK) return st;
+    }
     phase_add_commit(phase_current, t0);
     void (*done)(void) = g_durable_done;
-    if (ok && done) done();
-    write_unlock();
-    if (!ok) return set_error(ERR_IO, "state.db: cannot make the index durable "
-                                      "(checkpoint did not complete)");
+    if (done) done();
     atomic_fetch_add_explicit(&g_durable, 1, memory_order_relaxed);
     return OK;
 }

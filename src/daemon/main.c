@@ -44,6 +44,7 @@
 #include "sd_notify.h"
 #include "server.h"
 #include "state_db.h"
+#include "wal_sync.h"
 #include "pack_presence.h"
 #include "prune.h"
 #include "store_index.h"
@@ -544,6 +545,9 @@ out_locks:
     /* After every writer has stopped: one last sync of the WAL. A no-op
      * when it was never started. */
     state_db_flusher_stop();
+    /* Let go of the kept WAL descriptor before the close deletes the file,
+     * so the process does not pin a deleted inode on its way out. */
+    wal_sync_reset();
 out_guard:
     appguard_shutdown(guard);
     return rc;
