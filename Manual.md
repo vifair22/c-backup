@@ -3112,8 +3112,10 @@ start. A bind source that does not exist makes `docker run` fail.
 > the host's stacked mounts of that path: 2^n - 1 copies after n starts
 > (FS1 reached 16383). `df`, `docker` and `runc` then stall for tens of
 > seconds on the mount table, load climbs, and `fs.mount-max` (100000) is a
-> few restarts away. Builds with the B186 start-up check refuse to start on
-> that layout. To check a host (it must print 0, or 1 if the state
+> few restarts away. The helper refuses to start on that layout, and on any
+> stacked copies already there, naming the path, the count and this cleanup;
+> `c-backup-helper --policy PATH --check` runs the same check without
+> starting. To check a host (it must print 0, or 1 if the state
 > directory is a dataset's own mountpoint):
 >
 > ```sh

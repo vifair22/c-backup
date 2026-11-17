@@ -226,6 +226,80 @@ static void test_classify_bind(void **state)
     assert_string_equal(mi, "/proc/1/mountinfo");
 }
 
+/* ---- the helper's own layout (B186) ---- */
+
+static void put_file(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "w");
+    assert_non_null(f);
+    fputs(text, f);
+    fclose(f);
+}
+
+#define SELF D "/self.mi"
+#define HOST D "/host.mi"
+#define ROOTLN "22 1 0:21 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+
+static void test_layout(void **state)
+{
+    (void)state;
+    const char *paths[] = { "/mnt/cache/system/c-backup-helper", "/run/c-backup-helper", "", NULL };
+    const size_t np = 4;
+
+    /* The documented layout: the pool rslave, nothing bound under it. */
+    put_file(SELF, "1 0 0:50 / / rw - overlay overlay rw\n"
+                   "2 1 0:45 / /mnt/cache rw master:5 - zfs cache rw\n"
+                   "3 2 0:46 / /mnt/cache/system rw master:6 - zfs cache/system rw\n"
+                   "4 1 0:30 /c-backup-helper /run/c-backup-helper rw - tmpfs tmpfs rw\n");
+    put_file(HOST, ROOTLN "30 22 0:45 / /mnt/cache rw shared:5 - zfs cache rw\n"
+                   "31 30 0:46 / /mnt/cache/system rw shared:6 - zfs cache/system rw\n");
+    assert_int_equal(mount_layout_check(SELF, HOST, 1, paths, np), OK);
+    /* The state directory as a dataset's own mountpoint, once: fine. */
+    put_file(HOST, ROOTLN "30 22 0:45 / /mnt/cache rw shared:5 - zfs cache rw\n"
+                   "31 30 0:47 / /mnt/cache/system/c-backup-helper rw shared:7 - zfs cache/system/h rw\n");
+    assert_int_equal(mount_layout_check(SELF, HOST, 1, paths, np), OK);
+
+    /* The old layout: the state directory bound under an rshared pool. */
+    put_file(SELF, "1 0 0:50 / / rw shared:9 - overlay overlay rw\n"
+                   "2 1 0:45 / /mnt/cache rw shared:5 - zfs cache rw\n"
+                   "5 2 0:46 /c-backup-helper /mnt/cache/system/c-backup-helper rw shared:6 - zfs cache/system rw\n");
+    put_file(HOST, ROOTLN "30 22 0:45 / /mnt/cache rw shared:5 - zfs cache rw\n");
+    assert_int_equal(mount_layout_check(SELF, HOST, 1, paths, np), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "bound separately under /mnt/cache, which is mounted rshared"));
+    assert_non_null(strstr(err_msg(), "-v /mnt/cache:/mnt/cache:rslave"));
+    err_clear();
+    /* On the host itself the same table is a dataset under a shared pool. */
+    assert_int_equal(mount_layout_check(SELF, NULL, 0, paths, np), OK);
+
+    /* Stacked on the host after three starts: refused, with the cleanup. */
+    put_file(SELF, "1 0 0:50 / / rw - overlay overlay rw\n"
+                   "2 1 0:45 / /mnt/cache rw master:5 - zfs cache rw\n");
+    put_file(HOST, ROOTLN "30 22 0:45 / /mnt/cache rw shared:5 - zfs cache rw\n"
+                   "40 30 0:46 /c-backup-helper /mnt/cache/system/c-backup-helper rw shared:6 - zfs cache/system rw\n"
+                   "41 40 0:46 /c-backup-helper /mnt/cache/system/c-backup-helper rw shared:6 - zfs cache/system rw\n"
+                   "42 41 0:46 /c-backup-helper /mnt/cache/system/c-backup-helper rw shared:6 - zfs cache/system rw\n");
+    assert_int_equal(mount_layout_check(SELF, HOST, 1, paths, np), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "/mnt/cache/system/c-backup-helper is mounted 3 times in the host's mount table"));
+    assert_non_null(strstr(err_msg(), "umount -l"));
+    err_clear();
+    /* Stacked in the helper's own table, host unread: refused too. */
+    put_file(SELF, "1 0 0:50 / / rw - overlay overlay rw\n"
+                   "4 1 0:30 /x /run/c-backup-helper rw - tmpfs tmpfs rw\n"
+                   "5 4 0:30 /x /run/c-backup-helper rw - tmpfs tmpfs rw\n");
+    assert_int_equal(mount_layout_check(SELF, NULL, 0, paths, np), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "mounted 2 times in the helper's mount table"));
+    err_clear();
+    /* An unreadable host table is warned about, the helper's own checked. */
+    put_file(SELF, "1 0 0:50 / / rw - overlay overlay rw\n");
+    assert_int_equal(mount_layout_check(SELF, D "/none.mi", 1, paths, np), OK);
+    /* The helper's own table that cannot be read fails rather than passing. */
+    assert_int_not_equal(mount_layout_check(D "/none.mi", NULL, 0, paths, np), OK);
+    err_clear();
+    /* The process's own namespace answers something. */
+    int c = mount_in_container();
+    assert_true(c == 0 || c == 1);
+}
+
 /* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
  * that leaves anything behind (SCRATCH-1). Setup removes it too, so a
  * killed run is no obstacle to the next. */
@@ -244,6 +318,7 @@ int main(void)
         cmocka_unit_test_setup(test_exclusions, setup),
         cmocka_unit_test_setup(test_unbind, setup),
         cmocka_unit_test_setup(test_classify_bind, setup),
+        cmocka_unit_test_setup(test_layout, setup),
     };
     return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }

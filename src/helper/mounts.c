@@ -2,6 +2,8 @@
 
 #include "mounts.h"
 
+#include <cutils/log.h>
+
 #include <dirent.h>
 #include <errno.h>
 #include <stdint.h>
@@ -67,6 +69,7 @@ typedef struct {
     unsigned maj, min;
     char *root, *mp;
     int loop;
+    int shared;       /* a "shared:N" optional field: propagates to its peers */
 } minfo_t;
 
 /* mountinfo escapes space, tab, newline and backslash as \ooo. */
@@ -98,7 +101,10 @@ static int minfo_line(char *l, minfo_t *e)
     for (int i = 0; i < 5; i++) if (!(f[i] = strtok_r(i ? NULL : l, " \n", &save))) return -1;
     if (sscanf(f[2], "%u:%u", &e->maj, &e->min) != 2) return -1;
     char *t;
-    while ((t = strtok_r(NULL, " \n", &save)) != NULL && strcmp(t, "-") != 0) {}
+    e->shared = 0;
+    /* f[5] is the options; then optional fields up to "-". */
+    while ((t = strtok_r(NULL, " \n", &save)) != NULL && strcmp(t, "-") != 0)
+        if (strncmp(t, "shared:", 7) == 0) e->shared = 1;
     char *fstype = t ? strtok_r(NULL, " \n", &save) : NULL;
     char *src = fstype ? strtok_r(NULL, " \n", &save) : NULL;
     unescape(f[3]);
@@ -292,4 +298,87 @@ status_t mount_classify(const mount_cfg_t *c, const char *type, const char *sour
     set(out, MOUNT_INCLUDED, "");
 
     return resolve(c, source, out, 0);
+}
+
+/* ---- the helper's own mount layout (B186) ---- */
+
+static size_t count_at(const minfo_t *m, size_t n, const char *p)
+{
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) k += strcmp(m[i].mp, p) == 0;
+    return k;
+}
+
+static status_t stacked(const char *table, const char *which, const minfo_t *m, size_t n,
+                        const char *const *paths, size_t np)
+{
+    for (size_t j = 0; j < np; j++) {
+        if (!paths[j] || paths[j][0] != '/') continue;
+        size_t k = count_at(m, n, paths[j]);
+        if (k <= 1) continue;
+        return set_error(ERR_INVALID,
+            "%s is mounted %zu times in %s (%s): stacked binds, which a bind under an rshared "
+            "bind multiplies at every start (B186). Refusing to start, which would add more. "
+            "Bind the pool as -v /mnt/cache:/mnt/cache:rslave with no separate bind under it "
+            "(docs/helper.md, Deployment), then remove the copies on the host: "
+            "p=%s; while [ \"$(awk -v p=\"$p\" '$5==p' /proc/self/mountinfo | wc -l)\" -gt KEEP ]; "
+            "do umount -l \"$p\" || break; done  (KEEP: 1 if p is a dataset's own mountpoint, else 0)",
+            paths[j], k, which, table, paths[j]);
+    }
+    return OK;
+}
+
+status_t mount_layout_check(const char *self_mi, const char *host_mi, int in_container,
+                            const char *const *paths, size_t np)
+{
+    minfo_t *m = NULL;
+    size_t n = 0;
+    status_t st = minfo_read(self_mi, &m, &n);
+    if (st != OK) return st;
+    st = stacked(self_mi, "the helper's mount table", m, n, paths, np);
+    /* In a container, a configured path that is a mount point of its own
+     * under a shared mount is a bind under an rshared bind: Docker's bind of
+     * it propagates back to the host at every start. On the host itself a
+     * dataset mounted under a shared pool is normal, so only there. */
+    for (size_t j = 0; st == OK && in_container && j < np; j++) {
+        const char *p = paths[j];
+        if (!p || p[0] != '/' || count_at(m, n, p) == 0) continue;
+        for (size_t i = 0; i < n; i++) {
+            if (!m[i].shared || strcmp(m[i].mp, p) == 0 || !under(p, m[i].mp) || strcmp(m[i].mp, "/") == 0) continue;
+            st = set_error(ERR_INVALID,
+                "%s is bound separately under %s, which is mounted rshared: each start of the helper "
+                "propagates that bind back to the host and doubles its stacked mounts there (B186). "
+                "Refusing to start. Bind the pool as -v %s:%s:rslave and drop the separate bind of %s; "
+                "it is reached through the pool (docs/helper.md, Deployment)",
+                p, m[i].mp, m[i].mp, m[i].mp, p);
+            break;
+        }
+    }
+    if (st == OK && in_container)
+        for (size_t i = 0; i < n; i++)
+            if (m[i].shared && strcmp(m[i].mp, "/") != 0 && strncmp(m[i].mp, "/proc", 5) != 0 &&
+                strncmp(m[i].mp, "/sys", 4) != 0 && strncmp(m[i].mp, "/dev", 4) != 0) {
+                log_warn("helper: %s is mounted rshared; every start leaks a mount to the host that "
+                         "way. Use rslave (docs/helper.md, Deployment, B186)", m[i].mp);
+                break;
+            }
+    minfo_free(m, n);
+    if (st != OK || !host_mi || !host_mi[0] || strcmp(host_mi, self_mi) == 0) return st;
+    if (minfo_read(host_mi, &m, &n) != OK) {
+        /* Without the host's table only the helper's own is checked: say
+         * so, and do not refuse a start for what cannot be read. */
+        log_warn("helper: %s; the host's mounts are not checked for stacking (B186)", err_msg());
+        err_clear();
+        return OK;
+    }
+    st = stacked(host_mi, "the host's mount table", m, n, paths, np);
+    minfo_free(m, n);
+    return st;
+}
+
+int mount_in_container(void)
+{
+    struct stat a, b;
+    if (stat("/proc/self/ns/mnt", &a) != 0 || stat("/proc/1/ns/mnt", &b) != 0) return 0;
+    return a.st_ino != b.st_ino || a.st_dev != b.st_dev;
 }

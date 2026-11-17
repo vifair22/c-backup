@@ -122,6 +122,58 @@ OUT=$("$HELPER" --policy "$WORK/policy.ini" --check); RC=$?
 check    "--check accepts the policy" 0 "$RC"
 contains "and prints its digest" '"policy":"' "$OUT"
 
+# B186: in a user and mount namespace of its own, the old helper layout (a
+# bind under an rshared bind, as Docker makes it) doubles the stacked mounts
+# of the state dir at every start; the helper refuses to start on that;
+# the documented layout (rslave, no nested bind) leaves the table alone.
+# Skipped where unprivileged namespaces are not allowed.
+echo "B186 mount layout"
+if unshare -Urm true 2>/dev/null; then
+    B=$WORK/b186
+    mkdir -p "$B"
+    sed -e "s|^state_dir = .*|state_dir = $B/h/pool/state|" "$WORK/policy.ini" > "$B/policy.ini"
+    chmod 0600 "$B/policy.ini"
+    cat > "$B/sim.sh" <<'SIM'
+#!/bin/bash
+# Docker's steps for one container start, in a namespace that dies after:
+# rootfs propagation, the pool bound at the container's path, then (old
+# layout) the state dir bound under it.
+B=$1 HELPER=$2
+mount -t tmpfs h "$B/h" && mount --make-shared "$B/h"
+mount -t tmpfs r "$B/r" && mount --make-shared "$B/r"
+mkdir -p "$B/h/pool/state"
+at() { awk -v p="$1" '$5==p' /proc/self/mountinfo | wc -l; }
+start() {   # <layout> <n>
+    mkdir -p "$B/r/c$2/pool"
+    if [ "$1" = old ]; then
+        unshare -m --propagation unchanged sh -c "mount --make-rshared / &&
+            mount --rbind $B/h/pool $B/r/c$2/pool && mount --make-rshared $B/r/c$2/pool &&
+            mount --bind $B/h/pool/state $B/r/c$2/pool/state"
+    else
+        unshare -m --propagation unchanged sh -c "mount --make-rslave / &&
+            mount --rbind $B/h/pool $B/r/c$2/pool && mount --make-rslave $B/r/c$2/pool"
+    fi
+}
+t0=$(wc -l </proc/self/mountinfo)
+for i in 1 2 3 4 5; do start new "n$i"; done
+echo "documented: state=$(at "$B/h/pool/state") table=$(( $(wc -l </proc/self/mountinfo) - t0 ))"
+"$HELPER" --policy "$B/policy.ini" --check >/dev/null 2>&1; echo "documented-check: $?"
+for i in 1 2 3; do start old "o$i"; done
+echo "old: state=$(at "$B/h/pool/state")"
+"$HELPER" --policy "$B/policy.ini" --check 2>&1 | tail -1
+echo "old-after-refusal: state=$(at "$B/h/pool/state")"
+SIM
+    mkdir -p "$B/h" "$B/r"
+    OUT=$(unshare -Urm --propagation unchanged bash "$B/sim.sh" "$B" "$HELPER" 2>&1)
+    contains "B186: five starts of the documented layout stack nothing" "documented: state=0 table=0" "$OUT"
+    contains "B186: and the helper accepts it" "documented-check: 0" "$OUT"
+    contains "B186: three starts of the old layout leave 2^3-1 copies" "old: state=7" "$OUT"
+    contains "B186: the helper refuses to start on them" "$B/h/pool/state is mounted 7 times" "$OUT"
+    contains "B186: and adds none" "old-after-refusal: state=7" "$OUT"
+else
+    echo "  skip unprivileged user namespaces are not available here"
+fi
+
 cat > "$WORK/config.yaml" <<EOF
 db:
   path: $WORK/state.db

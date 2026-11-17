@@ -99,8 +99,10 @@ bind of its own.
 > the host's stacked mounts of that path: 2^n - 1 copies after n starts
 > (FS1 reached 16383). `df`, `docker` and `runc` then stall for tens of
 > seconds on the mount table, load climbs, and `fs.mount-max` (100000) is a
-> few restarts away. Builds with the B186 start-up check refuse to start on
-> that layout. To check a host (it must print 0, or 1 if the state
+> few restarts away. The helper refuses to start on that layout, and on any
+> stacked copies already there, naming the path, the count and this cleanup;
+> `c-backup-helper --policy PATH --check` runs the same check without
+> starting. To check a host (it must print 0, or 1 if the state
 > directory is a dataset's own mountpoint):
 >
 > ```sh
@@ -121,6 +123,26 @@ bind of its own.
 >
 > then recreate the helper with the layout above. Repeat for any other path
 > that was bound under `/mnt/cache` beside an `rshared` bind.
+
+**The start-up check (B186).** Before anything else, the helper reads its
+own mount table (`/proc/self/mountinfo`) and the host's (`[host]
+mountinfo`, by default `/proc/1/mountinfo` when `host_root` is set) and
+refuses to start when any path it is configured with (`state_dir`, the
+socket's directory, `nbd_dir`, `staging_root`, `scratch_dir`,
+`btrfs_snapshot_dir`, the LXC path, `restore_staging_dirs`) is mounted more
+than once in either table, or, inside a container, is a mount point of its
+own under a mount that is `shared` (a bind under an `rshared` bind). A
+`shared` mount alone is only warned about: with no bind under it, each
+start leaks one mount to the host rather than doubling them. A host table
+that cannot be read is warned about and not checked.
+
+**Mounts the helper makes.** None in its own namespace. Snapshots are made
+by the host's `zfs` and `btrfs` through `nsenter` in the host's namespace
+and are not mounts (a `.zfs` snapshot directory is automounted on access
+and expires by itself); `qemu-nbd` serves a socket; staging and swaps are
+directories and renames. So there is nothing for it to unmount at exit or
+after a crash; its snapshots and holds are released by the start-up sweep
+(`holds.json`).
 
 Notes that matter:
 
