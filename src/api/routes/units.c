@@ -786,6 +786,7 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
         cJSON_AddNumberToObject(root, "ok", (double)res.ok);
         cJSON_AddNumberToObject(root, "failed", (double)res.failed);
         cJSON_AddNumberToObject(root, "filtered", (double)res.filtered);
+        if (res.scope_note[0]) cJSON_AddStringToObject(root, "note", res.scope_note);
         char *txt = cJSON_PrintUnformatted(root);
         if (txt) { job_set_result(progress_ctx, txt); cJSON_free(txt); }
         cJSON_Delete(root);
@@ -794,6 +795,7 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
     snprintf(summary, sizeof(summary), "%s: %zu unit(s) backed up, %zu failed, %zu left out "
              "by units.allow", j->provider, res.ok, res.failed, res.filtered);
     job_set_summary(progress_ctx, summary);
+    if (!warn[0] && res.scope_note[0]) snprintf(warn, sizeof(warn), "%s", res.scope_note);
     if (warn[0]) job_set_warning(progress_ctx, warn);
     unit_backup_result_free(&res);
     store_index_free(idx);

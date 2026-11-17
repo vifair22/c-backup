@@ -78,6 +78,7 @@ typedef struct {
     size_t             n;
     size_t             ok, failed;
     size_t             filtered;     /* left out by units.allow under --all */
+    char               scope_note[256]; /* a pause scope the provider could not honour, or "" */
 } unit_backup_result_t;
 
 /*

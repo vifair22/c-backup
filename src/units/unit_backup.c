@@ -1506,6 +1506,15 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     char (*grp)[64] = calloc(np ? np : 1, sizeof(*grp));
     int *done = calloc(np ? np : 1, sizeof(*done));
     if (!grp || !done) st = set_error(ERR_NOMEM, "unit backup");
+    /* Group and job scope need a provider that captures units together.
+     * One that cannot (an in-process provider) takes each unit alone, and
+     * says so: it used to do that without a word. */
+    if (st == OK && !ops->begin_group && o->pause_scope != UNIT_SCOPE_UNIT && np > 1) {
+        snprintf(out->scope_note, sizeof(out->scope_note), "pause scope %s needs a provider that captures "
+                 "units together; provider %s does not, so each unit was its own capture",
+                 o->pause_scope == UNIT_SCOPE_JOB ? "job" : "group", ops->name);
+        log_warn("unit backup: %s", out->scope_note);
+    }
     if (st == OK && ops->begin_group && o->pause_scope != UNIT_SCOPE_UNIT) {
         for (size_t k = 0; k < np; k++) {
             if (o->pause_scope == UNIT_SCOPE_JOB) { snprintf(grp[k], sizeof(grp[k]), "job"); continue; }
