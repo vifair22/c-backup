@@ -569,11 +569,17 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
          * schedule's runs will fail and alert until it is back. */
         char hwhy[512];
         int on = prov && (sp_registry_enabled(prov) || remote_unusable(prov, hwhy, sizeof(hwhy)));
-        cJSON_Delete(c);
         if (!on) {
+            /* The registry's words, as a units job gives them: the
+             * provider named and what is enabled. */
+            char why2[512] = "that provider is not enabled in this daemon";
+            if (prov && sp_registry_get(prov, NULL, NULL) != OK) snprintf(why2, sizeof(why2), "%.500s", err_msg());
+            err_clear();
+            cJSON_Delete(c);
             free(canon);
-            return api_error(400, "that provider is not enabled in this daemon");
+            return api_error(400, why2);
         }
+        cJSON_Delete(c);
         params = canon;
     }
 

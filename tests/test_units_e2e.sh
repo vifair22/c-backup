@@ -266,6 +266,13 @@ contains "a units schedule naming a unit" '"id"' "$(cb schedule add 1 units 3600
 contains "is stored canonically" '"provider":"fake"' "$(cb schedule list 1)"
 OUT=$(cb schedule add 1 units 3600 --provider libvirt --all 2>&1); RC=$?
 check    "a provider that is not enabled is refused" 1 "$RC"
+contains "naming it and what is enabled" "provider 'libvirt' is not enabled (enabled: fake)" "$OUT"
+OUT=$(cb unit backup 1 --provider libvirt --all 2>&1); RC=$?
+check    "a unit backup with it is refused the same way" 1 "$RC"
+contains "in the same words" "provider 'libvirt' is not enabled (enabled: fake)" "$OUT"
+if command -v curl >/dev/null 2>&1; then
+    check "both answer 400" "400 400" "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" -X POST http://x/repos/1/units/backup -d '{"provider":"libvirt","all":true}') $(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" -X POST http://x/repos/1/schedules -d '{"action":"units","trigger":{"type":"interval","seconds":3600},"provider":"libvirt","all":true}')"
+fi
 OUT=$(cb schedule add 1 units 3600 --provider fake 2>&1); RC=$?
 check    "a units schedule without units or --all is refused" 1 "$RC"
 OUT=$(cb schedule add 1 gc 3600 --provider fake 2>&1); RC=$?

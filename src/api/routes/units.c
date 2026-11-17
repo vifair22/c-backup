@@ -1006,10 +1006,12 @@ static status_t submit_units(int64_t repo_id, const char *body, size_t len,
      * would leave a schedule failing with only a log line to show. */
     char hwhy[512];
     if (!sp_registry_enabled(j->provider) && !remote_unusable(j->provider, hwhy, sizeof(hwhy))) {
+        /* A provider named in the body: a bad request, said as a units
+         * schedule says it (it was 409 here and 400 there, worded apart). */
         status_t st = sp_registry_get(j->provider, NULL, NULL);
         units_job_free(j);
         free(canon);
-        *http = 409;
+        *http = 400;
         return st;
     }
     j->db = g_db;
