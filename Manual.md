@@ -189,6 +189,11 @@ unix socket and TCP listener are bound, so `systemctl start` (and
 `enable --now`) returns when the CLI can connect, and a unit ordered
 `After=c-backupd.service` starts no earlier. Startup applies any schema
 migrations first; the unit allows ten minutes for that (`TimeoutStartSec`).
+It then repairs whatever a crash or power cut left in the index, before the
+API binds, and logs one `start-up:` line per step with the time it took
+(`start-up: pack presence: 0.055 s`), so a slow start names the step that
+was slow. Each step is linear in the size of the index; at 300,000 objects
+they take well under a second together.
 On stop it reports `deactivating` while running jobs are cancelled. The
 daemon implements the notification protocol itself and does not link
 libsystemd; run outside systemd it simply skips it.
