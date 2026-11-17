@@ -634,6 +634,8 @@ static int       g_units;        /* the scenario's world has units */
 static char      g_unit_cp[128]; /* u1's checkpoint as the pristine state left it */
 static int       g_unit_ver;     /* what u1 shows now */
 static int64_t   g_unit_job = 1000;
+static int       g_two;          /* u2 too, both in one job-scoped capture */
+#define UNIT_STREAM ((uint64_t)100000)
 
 static void unit_runs(int ver, fake_run_t runs[3])
 {
@@ -667,6 +669,18 @@ static void define_unit(int ver)
     assert_int_equal(fake_disk_set_changed(g_fk, "u1", "vda", ver > 1 ? chg : NULL,
                                            ver > 1 ? 1 : 0), OK);
     assert_int_equal(fake_tree_add(g_fk, "u1", "vol:data", H_SRC, H_SRC), OK);
+    /* A dump hook's output, a STREAM item: stored at its real size. */
+    assert_int_equal(fake_stream_add(g_fk, "u1", "dump:db", ".cbackup-unit/hooks/db.dump",
+                                     UNIT_STREAM, 1), OK);
+    if (g_two) {
+        char cfg[64];
+        snprintf(cfg, sizeof(cfg), "lxc.u2 = %d\n", ver);
+        assert_int_equal(fake_unit_add(g_fk, "u2", "cbk-pc-two", SP_STATE_STOPPED, 0), OK);
+        assert_int_equal(fake_blob_add(g_fk, "u2", "cfg", ".cbackup-unit/config/lxc.config",
+                                       cfg, strlen(cfg)), OK);
+    } else {
+        (void)fake_unit_remove(g_fk, "u2");
+    }
     g_unit_ver = ver;
 }
 
@@ -676,24 +690,49 @@ static void units_up(cutils_db_t *db)
     assert_int_equal(units_init(db, H_DIR, &uc), OK);
 }
 
-static status_t unit_backup_once(store_t *st, cutils_db_t *db, int64_t *out_snap)
+/*
+ * One unit job: u1, and with g_two u2 as well under the job pause scope,
+ * so a cut can fall between the two units' snapshots. snaps[k] and
+ * which[k] (1 or 2) say what each unit's session made, *n how many.
+ * The fake has no begin_group, so each unit is still its own capture;
+ * one capture across units is the helper's, which this cannot drive.
+ */
+static status_t unit_backup_job(store_t *st, cutils_db_t *db, int64_t snaps[2], int which[2],
+                                size_t *n)
 {
-    const char *names[] = { "cbk-pc-unit" };
+    const char *names[] = { "cbk-pc-unit", "cbk-pc-two" };
     unit_backup_opts_t o;
     memset(&o, 0, sizeof(o));
     o.provider = "fake";
     o.units = names;
-    o.n_units = 1;
+    o.n_units = g_two ? 2 : 1;
+    o.pause_scope = g_two ? UNIT_SCOPE_JOB : UNIT_SCOPE_UNIT;
     o.require = SP_CONSIST_INCONSISTENT;
     o.job_id = ++g_unit_job;
     o.store_workers = 1;
     unit_backup_result_t res;
     memset(&res, 0, sizeof(res));
     status_t s = unit_backup_run(st, db, g_repo_id, &o, &res);
-    if (out_snap) *out_snap = res.n ? res.units[0].snapshot_id : 0;
-    if (s == OK && (res.n != 1 || res.units[0].st != OK))
-        s = set_error(ERR_IO, "unit backup: %s", res.n ? res.units[0].error : "no unit");
+    *n = 0;
+    for (size_t i = 0; i < res.n && i < 2; i++) {
+        snaps[*n] = res.units[i].snapshot_id;
+        which[*n] = strcmp(res.units[i].unit_key, "fake:u2") == 0 ? 2 : 1;
+        (*n)++;
+        if (s == OK && res.units[i].st != OK)
+            s = set_error(ERR_IO, "unit backup: %s", res.units[i].error);
+    }
+    if (s == OK && res.n != o.n_units) s = set_error(ERR_IO, "unit backup: %zu units", res.n);
     unit_backup_result_free(&res);
+    return s;
+}
+
+static status_t unit_backup_once(store_t *st, cutils_db_t *db, int64_t *out_snap)
+{
+    int64_t snaps[2] = { 0, 0 };
+    int which[2] = { 0, 0 };
+    size_t n = 0;
+    status_t s = unit_backup_job(st, db, snaps, which, &n);
+    if (out_snap) *out_snap = n ? snaps[0] : 0;
     return s;
 }
 
@@ -702,6 +741,7 @@ static status_t unit_backup_once(store_t *st, cutils_db_t *db, int64_t *out_snap
 static int64_t  g_repo_id, g_srepo_id;
 static int      g_ver_of[MAX_SNAPS];     /* snapshot id -> source version; 0 for none */
 static int      g_required[MAX_SNAPS];   /* listed after any cut */
+static int      g_unit_of[MAX_SNAPS];    /* unit snapshots: 2 for u2's, else u1's */
 static uint8_t *g_pre;                   /* every object readable before */
 static size_t   g_npre, g_cap_pre;
 
@@ -913,6 +953,7 @@ static void begin_build(ctx_t *c)
     rm_tree(PRISTINE);
     memset(g_ver_of, 0, sizeof(g_ver_of));
     memset(g_required, 0, sizeof(g_required));
+    memset(g_unit_of, 0, sizeof(g_unit_of));
     g_npre = 0;
     g_srepo_id = 0;
     assert_int_equal(__real_mkdir(H_DIR, 0700), 0);
@@ -1244,6 +1285,38 @@ static void check_unit_items(int id, int ver)
     if (f) { n = fread(buf, 1, sizeof(buf), f); fclose(f); }
     if (n != strlen(blob) || memcmp(buf, blob, n) != 0)
         violation("unit snapshot %d: its config is not version %d's", id, ver);
+
+    unsigned char *sbuf = malloc((size_t)UNIT_STREAM + 1);
+    assert_non_null(sbuf);
+    f = fopen(H_OUT "/.cbackup-unit/hooks/db.dump", "rb");
+    n = 0;
+    if (f) { n = fread(sbuf, 1, (size_t)UNIT_STREAM + 1, f); fclose(f); }
+    int same = n == UNIT_STREAM;
+    for (size_t i = 0; same && i < n; i++) same = sbuf[i] == fake_byte(91, i);
+    if (!same) violation("unit snapshot %d: its dump stream differs", id);
+    free(sbuf);
+}
+
+static void check_unit2_items(int id, int ver)
+{
+    char cfg[64], buf[128];
+    snprintf(cfg, sizeof(cfg), "lxc.u2 = %d\n", ver);
+    FILE *f = fopen(H_OUT "/.cbackup-unit/config/lxc.config", "rb");
+    size_t n = 0;
+    if (f) { n = fread(buf, 1, sizeof(buf), f); fclose(f); }
+    if (n != strlen(cfg) || memcmp(buf, cfg, n) != 0)
+        violation("u2's snapshot %d: its config is not version %d's", id, ver);
+}
+
+/* One snapshot restored into H_OUT and checked as what it was taken of. */
+static void check_restored(int id, int ver, int unit)
+{
+    if (g_units && unit == 2) { check_unit2_items(id, ver); return; }
+    char want[PATH_MAX], got[PATH_MAX];
+    snprintf(want, sizeof(want), H_VER "/%d", ver);
+    snprintf(got, sizeof(got), H_OUT "%s", H_SRC);
+    compare_trees(want, got);
+    if (g_units) check_unit_items(id, ver);
 }
 
 static void check_restores(store_t *st, cutils_db_t *db)
@@ -1263,11 +1336,7 @@ static void check_restores(store_t *st, cutils_db_t *db)
             violation("snapshot %d does not restore: %s", id, err_msg());
             continue;
         }
-        char want[PATH_MAX], got[PATH_MAX];
-        snprintf(want, sizeof(want), H_VER "/%d", g_ver_of[id]);
-        snprintf(got, sizeof(got), H_OUT "%s", H_SRC);
-        compare_trees(want, got);
-        if (g_units) check_unit_items(id, g_ver_of[id]);
+        check_restored(id, g_ver_of[id], g_unit_of[id]);
     }
 }
 
@@ -1338,14 +1407,16 @@ static void start_and_check(void)
         fake_stats_t fs;
         fake_stats(g_fk, &fs);
         if (fs.holds_now != 0) violation("%u hold(s) still taken after the start", fs.holds_now);
-        int64_t next = 0;
-        if (unit_backup_once(st, db, &next) != OK || next <= 0 || next >= MAX_SNAPS) {
+        int64_t snaps[2] = { 0, 0 };
+        int which[2] = { 0, 0 };
+        size_t ns = 0;
+        if (unit_backup_job(st, db, snaps, which, &ns) != OK) {
             violation("the first unit session after the start fails: %s", err_msg());
-        } else {
-            /* A cut that took the operation's snapshot whole hands its id
-             * to this session; what the id meant before comes back after. */
-            int was = g_ver_of[next];
-            g_ver_of[next] = g_unit_ver;
+            ns = 0;
+        }
+        for (size_t k = 0; k < ns; k++) {
+            int64_t next = snaps[k];
+            if (next <= 0 || next >= MAX_SNAPS) { violation("session made snapshot %lld", (long long)next); continue; }
             rm_tree(H_OUT);
             assert_int_equal(__real_mkdir(H_OUT, 0700), 0);
             restore_opts_t o;
@@ -1353,16 +1424,10 @@ static void start_and_check(void)
             o.overwrite = 1;
             restore_result_t rres;
             memset(&rres, 0, sizeof(rres));
-            if (restore_run(st, db, g_repo_id, next, H_OUT, &o, &rres) != OK) {
+            if (restore_run(st, db, g_repo_id, next, H_OUT, &o, &rres) != OK)
                 violation("the session after the start does not restore: %s", err_msg());
-            } else {
-                char want[PATH_MAX], got[PATH_MAX];
-                snprintf(want, sizeof(want), H_VER "/%d", g_unit_ver);
-                snprintf(got, sizeof(got), H_OUT "%s", H_SRC);
-                compare_trees(want, got);
-                check_unit_items((int)next, g_unit_ver);
-            }
-            g_ver_of[next] = was;
+            else
+                check_restored((int)next, g_unit_ver, which[k]);
         }
         units_shutdown();
     }
@@ -1458,6 +1523,7 @@ static void every_cut(const scenario_t *s)
 {
     g_scenario = s->name;
     g_units = s->units;
+    g_two = s->units == 2;
     double t0 = now_s();
     ctx_t c;
     s->build(&c);
@@ -1484,6 +1550,7 @@ static void every_cut(const scenario_t *s)
            t.count[K_DURABLE], t.trials, t.checks, now_s() - t1, t1 - t0);
     (void)skipped;
     g_units = 0;
+    g_two = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1850,6 +1917,49 @@ static void build_unit_second(ctx_t *c)
     end_build(c);
 }
 
+/* unit backup, two units: u1 and u2 in one job, under the job pause scope,
+ * after a first job of both; a cut can land between their snapshots. */
+static void build_unit_two(ctx_t *c)
+{
+    begin_build(c);
+    open_target(c);
+    units_up(c->db);
+    define_unit(1);
+    int64_t snaps[2];
+    int which[2];
+    size_t n = 0;
+    if (unit_backup_job(c->store, c->db, snaps, which, &n) != OK) fail_msg("unit job: %s", err_msg());
+    assert_int_equal(n, 2);
+    for (size_t k = 0; k < n; k++) {
+        g_ver_of[snaps[k]] = 1;
+        g_unit_of[snaps[k]] = which[k];
+        g_required[snaps[k]] = 1;
+    }
+    /* The next job's two, in the order the first ran. */
+    for (size_t k = 0; k < n; k++) {
+        g_ver_of[3 + k] = 2;
+        g_unit_of[3 + k] = which[k];
+    }
+    g_unit_ver = 2;
+    assert_int_equal(fake_unit_checkpoint(g_fk, "u1", g_unit_cp, sizeof(g_unit_cp)), OK);
+    end_build(c);
+}
+
+static status_t op_unit_two(ctx_t *c, int counting)
+{
+    int64_t snaps[2];
+    int which[2];
+    size_t n = 0;
+    store_index_set_pack_batch_rows(2);
+    status_t st = unit_backup_job(c->store, c->db, snaps, which, &n);
+    store_index_set_pack_batch_rows(0);
+    if (counting && st == OK) {
+        assert_int_equal(n, 2);
+        for (size_t k = 0; k < n; k++) assert_int_equal(g_unit_of[snaps[k]], which[k]);
+    }
+    return st;
+}
+
 /* On this branch the second session reads the disk incrementally, against
  * the first's checkpoint: the case where trusting a base the cut erased
  * would restore the wrong bytes. */
@@ -1887,6 +1997,8 @@ static const scenario_t S_UNIT_FIRST   = { "unit backup, first", build_unit_firs
                                            op_unit_first, 0, 0, 1 };
 static const scenario_t S_UNIT_SECOND  = { "unit backup, second", build_unit_second,
                                            op_unit_second, 0, 0, 1 };
+static const scenario_t S_UNIT_TWO     = { "unit backup, two units", build_unit_two,
+                                           op_unit_two, 0, 0, 2 };
 
 static void test_backup_first(void **state)  { (void)state; every_cut(&S_BACKUP_FIRST); }
 static void test_backup_incr(void **state)   { (void)state; every_cut(&S_BACKUP_INCR); }
@@ -1899,6 +2011,7 @@ static void test_prune(void **state)         { (void)state; every_cut(&S_PRUNE);
 static void test_reindex(void **state)       { (void)state; every_cut(&S_REINDEX); }
 static void test_unit_first(void **state)    { (void)state; every_cut(&S_UNIT_FIRST); }
 static void test_unit_second(void **state)   { (void)state; every_cut(&S_UNIT_SECOND); }
+static void test_unit_two(void **state)      { (void)state; every_cut(&S_UNIT_TWO); }
 
 /* ------------------------------------------------------------------ */
 /* Snapshot records (prune), by the order of its steps                 */
@@ -2068,6 +2181,7 @@ int main(void)
         cmocka_unit_test(test_reindex),
         cmocka_unit_test(test_unit_first),
         cmocka_unit_test(test_unit_second),
+        cmocka_unit_test(test_unit_two),
         cmocka_unit_test(test_prune_unlinks_the_record_after_the_commit_is_durable),
         cmocka_unit_test(test_start_finishes_an_interrupted_prune),
         cmocka_unit_test(test_reindex_finishes_an_interrupted_prune),
