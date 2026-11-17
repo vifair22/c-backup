@@ -84,8 +84,7 @@ typedef struct {
 typedef struct {
     int      in_txn;
     uint32_t since_commit;
-    uint64_t opened_ns;           /* phase_now() at the batch's BEGIN */
-    uint64_t contended_until_ns;  /* B107's rules apply until then */
+    db_txn_batch_t rule;          /* when to let the lock go (db_txn.h) */
 } batch_t;
 
 typedef struct {
@@ -632,8 +631,8 @@ static void scan_progress(uint32_t scanned, void *ctx)
  *     before B107, and is held across large files and pool waits.
  *   - A writer queues: the batch ends at the next check, so it waits for
  *     one entry or one read at most, and the batch becomes contended for
- *     BATCH_CONTENDED_MS from the last time a waiter was seen.
- *   - Contended: B107's rules - commit after BATCH_CONTENDED_HOLD_MS, and
+ *     DB_TXN_BATCH_CONTENDED_MS from the last time a waiter was seen.
+ *   - Contended: B107's rules - commit after DB_TXN_BATCH_HOLD_MS, and
  *     let go before reading a file of BATCH_YIELD_BYTES or more and before
  *     waiting on the workers - rather than letting go at every check.
  *
@@ -646,8 +645,9 @@ static void scan_progress(uint32_t scanned, void *ctx)
  * so of B107's, not a sync per large file for the rest of the backup.
  */
 #define BATCH_ENTRIES           2000
-#define BATCH_CONTENDED_MS      1000
-#define BATCH_CONTENDED_HOLD_MS 200
+/* The waiter and contended rules themselves are db_txn's
+ * (db_txn_batch_should_end), shared with the pack commit, so the two
+ * holders that run side by side in a backup cannot drift apart. */
 #define BATCH_YIELD_BYTES       ((uint64_t)4 << 20)
 
 static void batch_open(pipeline_t *p, batch_t *b)
@@ -656,12 +656,12 @@ static void batch_open(pipeline_t *p, batch_t *b)
     if (db_txn_begin(p->db) == OK) b->in_txn = 1;
     else err_clear();
     b->since_commit = 0;
-    b->opened_ns = phase_now();
+    db_txn_batch_opened(&b->rule);
 }
 
 static int batch_contended(const batch_t *b)
 {
-    return b->contended_until_ns > phase_now();
+    return db_txn_batch_contended(&b->rule);
 }
 
 static void batch_close(pipeline_t *p, batch_t *b)
@@ -675,21 +675,13 @@ static void batch_close(pipeline_t *p, batch_t *b)
 
 /*
  * A check point: let the batch go if somebody newly wants the lock, or if it
- * is contended and has been held for BATCH_CONTENDED_HOLD_MS. A waiter's
+ * is contended and has been held for DB_TXN_BATCH_HOLD_MS. A waiter's
  * transaction runs next, and this thread's next batch_open queues behind it.
  */
 static void batch_yield(pipeline_t *p, batch_t *b)
 {
     if (!b->in_txn) return;
-    uint64_t now = phase_now();
-    if (db_txn_waiters() > 0) {
-        int was = b->contended_until_ns > now;
-        b->contended_until_ns = now + (uint64_t)BATCH_CONTENDED_MS * 1000000ULL;
-        if (!was) { batch_close(p, b); return; }
-    }
-    if (b->contended_until_ns > now &&
-        now - b->opened_ns >= (uint64_t)BATCH_CONTENDED_HOLD_MS * 1000000ULL)
-        batch_close(p, b);
+    if (db_txn_batch_should_end(&b->rule)) batch_close(p, b);
 }
 
 /* One entry recorded: end the batch at its size, or for a waiter. */
