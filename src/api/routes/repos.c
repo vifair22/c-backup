@@ -71,7 +71,7 @@ static int repo_row_add(cutils_db_t *db, cutils_json_elem_t *e, cutils_json_resp
     const char *enc = (row[5] && row[5][0]) ? row[5] : "none";
     const char *esc = (row[6] && row[6][0]) ? row[6] : "0";
     const char *deg = row[7] ? row[7] : "";
-    char why[PATH_MAX + 256] = "";
+    char why[PACK_PRESENCE_WHY_MAX] = "";
     int avail = pack_presence_available(db, strtoll(row[0], NULL, 10), why, sizeof(why));
     if (avail == 1) why[0] = '\0';
     const char *state = avail != 1 ? "unavailable" : deg[0] ? "degraded" : "ok";

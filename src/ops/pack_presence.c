@@ -226,7 +226,7 @@ typedef struct {
     int      identity_changed;  /* differs from the recorded one */
     uint32_t total;             /* packs rows */
     uint32_t missing;           /* of them, ENOENT; counted only when needed */
-    char     why[PATH_MAX + 256];
+    char     why[PACK_PRESENCE_WHY_MAX];
 } probe_t;
 
 static status_t repo_root_of(cutils_db_t *db, const char *repo, probe_t *p)
@@ -374,7 +374,7 @@ int pack_presence_available(cutils_db_t *db, int64_t repo_id, char *why, size_t 
 
 status_t pack_presence_require(cutils_db_t *db, int64_t repo_id)
 {
-    char why[PATH_MAX + 256];
+    char why[PACK_PRESENCE_WHY_MAX];
     int rc = pack_presence_available(db, repo_id, why, sizeof(why));
     if (rc < 0) return set_error(ERR_IO, "repository %lld: %s", (long long)repo_id, why);
     if (rc == 0)

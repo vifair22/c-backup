@@ -55,7 +55,11 @@
 #include "error.h"
 
 #include <cutils/db.h>
+#include <limits.h>
 #include <stdint.h>
+
+/* Room for a reason naming a full path and two device:inode pairs. */
+#define PACK_PRESENCE_WHY_MAX (PATH_MAX + 512)
 
 typedef struct {
     int      unavailable;       /* packs/ missing or unreadable: nothing checked */
@@ -70,7 +74,7 @@ typedef struct {
     uint32_t packs_unreadable;  /* dropped earlier and back, but unreadable: left out */
     uint64_t objects_restored;  /* absent objects present again from those */
     uint64_t entries_unproven;  /* their entries that failed the proof: left out */
-    char     why[4352];         /* why unavailable, when it is */
+    char     why[PACK_PRESENCE_WHY_MAX];   /* why unavailable, when it is */
 } pack_presence_t;
 
 /* The brake: two or more missing that are more than pct percent of the
