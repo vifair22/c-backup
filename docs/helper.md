@@ -24,10 +24,9 @@ One image carries both binaries. Two containers run from it.
 docker run -d --name c-backup-helper --restart unless-stopped \
   --privileged --pid=host --network=none \
   -v /boot/config/c-backup-helper.ini:/etc/c-backup-helper.ini:ro \
-  -v /mnt/cache/system/c-backup-helper:/mnt/cache/system/c-backup-helper \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /mnt/cache:/mnt/cache:rshared \
+  -v /mnt/cache:/mnt/cache:rslave \
   -v /var/run/libvirt:/var/run/libvirt \
   --label net.cbackup.role=helper \
   --entrypoint /usr/local/bin/c-backup-helper \
@@ -63,10 +62,9 @@ services:
     restart: unless-stopped
     volumes:
       - /boot/config/c-backup-helper.ini:/etc/c-backup-helper.ini:ro
-      - /mnt/cache/system/c-backup-helper:/mnt/cache/system/c-backup-helper
       - /run/c-backup-helper:/run/c-backup-helper
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/cache:/mnt/cache:rshared
+      - /mnt/cache:/mnt/cache:rslave
       - /var/run/libvirt:/var/run/libvirt
   c-backupd:
     image: c-backup:latest
@@ -84,6 +82,45 @@ services:
       - /mnt/cache/appdata/c-backupd:/var/lib/c-backupd
     ports: ["8765:8765"]
 ```
+
+**The helper's pool mount is `rslave`, and nothing under it is bound
+separately.** `rslave` lets mounts the host makes later (new datasets, a
+remounted pool) appear in the helper; nothing the helper does needs to
+propagate back, because every mount c-backup causes is made in the host's
+own namespace (`zfs` and `btrfs` run there through `nsenter`). The state
+directory (`state_dir`) is reached through that same pool mount, with no
+bind of its own.
+
+> **Warning: never bind a path under `/mnt/cache` separately, and never
+> use `rshared` (B186).** Earlier versions of this document bound the state
+> directory (`-v /mnt/cache/system/c-backup-helper:...`) next to
+> `-v /mnt/cache:/mnt/cache:rshared`. A bind under an `rshared` bind
+> propagates back into the host's peer group, so every helper start doubles
+> the host's stacked mounts of that path: 2^n - 1 copies after n starts
+> (FS1 reached 16383). `df`, `docker` and `runc` then stall for tens of
+> seconds on the mount table, load climbs, and `fs.mount-max` (100000) is a
+> few restarts away. Builds with the B186 start-up check refuse to start on
+> that layout. To check a host (it must print 0, or 1 if the state
+> directory is a dataset's own mountpoint):
+>
+> ```sh
+> awk '$5=="/mnt/cache/system/c-backup-helper"' /proc/self/mountinfo | wc -l
+> ```
+>
+> To clean up, as root on the host:
+>
+> ```sh
+> docker rm -f c-backup-helper
+> p=/mnt/cache/system/c-backup-helper     # the state_dir that was bound
+> keep=$(zfs list -H -o mountpoint 2>/dev/null | grep -cxF "$p")  # 1: p is a dataset
+> while [ "$(awk -v p="$p" '$5==p' /proc/self/mountinfo | wc -l)" -gt "$keep" ]; do
+>     umount -l "$p" || break
+> done
+> awk -v p="$p" '$5==p' /proc/self/mountinfo | wc -l   # now equals $keep
+> ```
+>
+> then recreate the helper with the layout above. Repeat for any other path
+> that was bound under `/mnt/cache` beside an `rshared` bind.
 
 Notes that matter:
 
@@ -524,7 +561,7 @@ and back again if the second rename fails. However the share's contents
 are changed in between, the root helper renames only what it created and
 never writes outside the share.
 The helper does this itself, so it needs the pools at their host paths in
-its own mount namespace, which `-v /mnt/cache:/mnt/cache:rshared` above
+its own mount namespace, which `-v /mnt/cache:/mnt/cache:rslave` above
 provides (add one per pool). The daemon writes into the staging directory
 through its own read-write mount of each dataset's `.cbackup-restore`
 (see the daemon's `docker run` in the design, 9.2).

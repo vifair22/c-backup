@@ -3032,11 +3032,10 @@ docker run -d --name c-backup-helper --restart unless-stopped \
   --privileged --pid=host --network=none \
   --label net.cbackup.role=helper \
   -v /boot/config/c-backup-helper.ini:/etc/c-backup-helper.ini:ro \
-  -v /mnt/cache/system/c-backup-helper:/mnt/cache/system/c-backup-helper \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/run/libvirt:/var/run/libvirt \
-  -v /mnt/cache:/mnt/cache:rshared \
+  -v /mnt/cache:/mnt/cache:rslave \
   --entrypoint /usr/local/bin/c-backup-helper \
   <registry>/vifair22/c-backup:<tag> --policy /etc/c-backup-helper.ini
 
@@ -3105,6 +3104,37 @@ Without them a restore fails at its first write, naming the path. `/run` is RAM 
 (the `go` file, or a User Scripts "at startup" script) before the containers
 start. A bind source that does not exist makes `docker run` fail.
 
+> **Warning: never bind a path under `/mnt/cache` separately, and never
+> use `rshared` (B186).** Earlier versions of this chapter and `docs/helper.md` bound the state
+> directory (`-v /mnt/cache/system/c-backup-helper:...`) next to
+> `-v /mnt/cache:/mnt/cache:rshared`. A bind under an `rshared` bind
+> propagates back into the host's peer group, so every helper start doubles
+> the host's stacked mounts of that path: 2^n - 1 copies after n starts
+> (FS1 reached 16383). `df`, `docker` and `runc` then stall for tens of
+> seconds on the mount table, load climbs, and `fs.mount-max` (100000) is a
+> few restarts away. Builds with the B186 start-up check refuse to start on
+> that layout. To check a host (it must print 0, or 1 if the state
+> directory is a dataset's own mountpoint):
+>
+> ```sh
+> awk '$5=="/mnt/cache/system/c-backup-helper"' /proc/self/mountinfo | wc -l
+> ```
+>
+> To clean up, as root on the host:
+>
+> ```sh
+> docker rm -f c-backup-helper
+> p=/mnt/cache/system/c-backup-helper     # the state_dir that was bound
+> keep=$(zfs list -H -o mountpoint 2>/dev/null | grep -cxF "$p")  # 1: p is a dataset
+> while [ "$(awk -v p="$p" '$5==p' /proc/self/mountinfo | wc -l)" -gt "$keep" ]; do
+>     umount -l "$p" || break
+> done
+> awk -v p="$p" '$5==p' /proc/self/mountinfo | wc -l   # now equals $keep
+> ```
+>
+> then recreate the helper with the layout above. Repeat for any other path
+> that was bound under `/mnt/cache` beside an `rshared` bind.
+
 What each piece is for:
 
 | Mount or setting | Container | Why |
@@ -3113,8 +3143,8 @@ What each piece is for:
 | `--network=none` | helper | no listener of any kind; its only interface is the socket |
 | `/var/run/docker.sock` | helper | inspect, pause, unpause, exec for hooks, create and pull for restore |
 | `/var/run/libvirt` | helper (FS1) | the libvirt API, read-write (the read-only socket cannot start a backup). Bind the **directory**, never the `libvirt-sock` file: a file bind keeps the socket's old inode, so after any libvirtd restart (stopping and starting the VM service) every VM job fails `Connection refused` until the helper container is recreated. The helper logs that case by name (22.2.4) |
-| `/mnt/cache:/mnt/cache:rshared` (read-write) | helper | restore staging and swap act on host paths in the helper's own namespace: it creates the staging directories and renames them into place, so this mount must not be `:ro`; add one per pool that holds unit data |
-| `/mnt/cache/system/c-backup-helper` | helper | its state directory: `holds.json`, every hold it has taken, released at its next start after a crash. On a pool, never the RAM rootfs |
+| `/mnt/cache:/mnt/cache:rslave` (read-write) | helper | restore staging and swap act on host paths in the helper's own namespace: it creates the staging directories and renames them into place, so this mount must not be `:ro`; add one per pool that holds unit data. `rslave`, never `rshared`, and nothing under it bound separately (the warning below) |
+| `state_dir` (`/mnt/cache/system/c-backup-helper`) | helper | its state directory: `holds.json`, every hold it has taken, released at its next start after a crash. On a pool, never the RAM rootfs. Reached through the pool mount above; **no bind of its own** |
 | `/boot/config/c-backup-helper.ini` | helper | the policy, on the flash, root-owned (22.2.3) |
 | `/run/c-backup-helper` | both | the helper's socket (created `0660` with group `daemon_gid`, 22.2.3), and `nbd/` (the policy's `nbd_dir`), where VM exports and `qemu-nbd` sockets are made; the same path on both sides. The helper makes `nbd/` itself when it is missing, at start and before each VM read, `0750` with group `daemon_gid`, so the daemon can enter it after it drops to uid 990; nothing needs creating by hand. A `qemu-nbd` that cannot serve a disk fails the unit at once with its own error |
 | `/mnt/cache:ro,rslave` | daemon | reads container data from capture snapshots and VM images; `rslave` lets the `.zfs` snapshot automounts and new btrfs snapshots appear inside the daemon's view |
