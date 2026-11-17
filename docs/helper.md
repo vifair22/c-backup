@@ -101,7 +101,9 @@ Notes that matter:
   `holds.json` records every hold it has taken, and its next start releases
   what a crash left held.
 - **The socket directory** `/run/c-backup-helper` should be `0750
-  root:990`; the helper creates the socket `0660`. On every connection the
+  root:990`; the helper creates the socket `0660`, group `daemon_uid`
+  (the daemon runs with that uid as its gid too), so the daemon can connect
+  after it drops to uid 990. On every connection the
   helper reads `SO_PEERCRED` and refuses any uid but the policy's
   `daemon_uid`, so the socket is safe to bind-mount into the daemon and
   nowhere else.
