@@ -418,13 +418,43 @@ static status_t marker_emit(const char *mp, repo_marker_t *mp_in)
         close(fd); unlink(mp);
         return set_error(ERR_IO, "marker would be truncated");
     }
-    if (n < 0 || write(fd, body, (size_t)n) != n) {
-        close(fd);
-        unlink(mp);
+    /*
+     * Every step checked, and a marker that did not make it whole is taken
+     * away again (B182). The sync's result used to be thrown away, so a
+     * full or failing disk produced a repository whose identity was not on
+     * disk while the registration reported success. A torn marker left by
+     * a crash is still refused on the next registration - it does not
+     * parse - but nothing here may claim one was written when it was not.
+     */
+    if (n < 0) {
+        close(fd); unlink(mp);
+        return set_error(ERR_IO, "cannot format %s", mp);
+    }
+    if (snapshot_write_all(fd, body, (size_t)n) != 0) {
+        int err = errno;
+        close(fd); unlink(mp);
+        errno = err;
         return set_error_errno(ERR_IO, "cannot write %s", mp);
     }
-    fsync(fd);
-    close(fd);
+    if (fsync(fd) != 0) {
+        int err = errno;
+        close(fd); unlink(mp);
+        errno = err;
+        return set_error_errno(ERR_IO, "cannot sync %s", mp);
+    }
+    if (close(fd) != 0) {
+        int err = errno;
+        unlink(mp);
+        errno = err;
+        return set_error_errno(ERR_IO, "cannot close %s", mp);
+    }
+    /* The name is durable once the directory holding it is. */
+    if (snapshot_fsync_parent(mp) != 0) {
+        int err = errno;
+        unlink(mp);
+        errno = err;
+        return set_error_errno(ERR_IO, "cannot sync the directory of %s", mp);
+    }
     return OK;
 }
 

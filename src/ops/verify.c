@@ -652,10 +652,22 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
                     " WHERE po.repo_id = ? AND po.pack_id = ? ORDER BY po.offset",
                     (const char *[]){ repo, pk, NULL }, &r) == 0 && r && r->nrows > 0) {
                 pack_hdr_hint_t *hints = hints_from_rows(r);
-                if (hints) {
-                    (void)pack_restore_headers(store, pnum, hints, (size_t)r->nrows);
-                    free(hints);
+                int rh = hints ? pack_restore_headers(store, pnum, hints, (size_t)r->nrows)
+                               : -1;
+                free(hints);
+                if (rh == -2) {
+                    /* The headers may read back right from the page cache
+                     * and still not be on disk: not a repair (B182). */
+                    log_error("verify: %s.dat: restoring its entry headers failed: %s",
+                              name, err_msg());
+                    record_finding(db, repo_id, res->run_id, name,
+                                   "unwalkable pack: its restored headers could not be written");
+                    err_clear();
+                    db_result_free(r);
+                    res->packs_unwalkable++;
+                    continue;
                 }
+                err_clear();
             }
             if (pack_walk_check(store, pnum, why, sizeof(why)) == OK) {
                 db_result_free(r);
@@ -1235,6 +1247,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
              * actually fix it. Damage parity can carry but that is still on
              * disk is "recoverable".
              */
+            err_clear();
             int fixed = repair ? (packed ? pack_object_repair(store, hash) : -1)
                                : 0;
             if (fixed > 0) {
@@ -1245,10 +1258,12 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             } else {
                 if (repair)
                     log_warn("verify: %s was silently corrected on read but the "
-                             "correction could not be written back", hex);
+                             "correction could not be written back%s%s", hex,
+                             err_msg()[0] ? ": " : "", err_msg());
                 else
                     log_warn("verify: %s is damaged on disk and was corrected in "
                              "memory only (repair disabled)", hex);
+                err_clear();
                 res.recoverable++;
                 record_finding(db, repo_id, res.run_id, hex, "recoverable");
             }

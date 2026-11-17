@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "repo_key.h"
+#include "snap_record.h"
 
 #include <cutils/log.h>
 
@@ -200,16 +201,25 @@ status_t repo_key_save(const char *key_dir, const char *uuid, const repo_key_t *
     hex[len++] = '\n';
 
     status_t rc = OK;
-    if (write(fd, hex, len) != (ssize_t)len) rc = set_error_errno(ERR_IO, "cannot write %s", tmp);
-    else if (fsync(fd) != 0)                 rc = set_error_errno(ERR_IO, "cannot flush %s", tmp);
+    if (snapshot_write_all(fd, hex, len) != 0) rc = set_error_errno(ERR_IO, "cannot write %s", tmp);
+    else if (fsync(fd) != 0)                   rc = set_error_errno(ERR_IO, "cannot flush %s", tmp);
     OPENSSL_cleanse(hex, sizeof(hex));
-    close(fd);
+    if (close(fd) != 0 && rc == OK) rc = set_error_errno(ERR_IO, "cannot close %s", tmp);
 
     if (rc != OK) { unlink(tmp); return rc; }
     if (rename(tmp, path) != 0) {
+        int err = errno;
         unlink(tmp);
+        errno = err;
         return set_error_errno(ERR_IO, "cannot install %s", path);
     }
+    /*
+     * The rename is durable only once the directory is. Without this the
+     * marker naming the key could survive a power cut and the key not,
+     * which is the lockout the temp file exists to prevent (B182).
+     */
+    if (snapshot_fsync_dir(key_dir) != 0)
+        return set_error_errno(ERR_IO, "cannot sync key directory %s", key_dir);
     return OK;
 }
 

@@ -63,3 +63,7 @@ int snapshot_write_all(int fd, const void *buf, size_t len);
 /* fsync a directory, so an entry renamed or linked into it survives a
  * power cut. 0, or -1 with errno set. */
 int snapshot_fsync_dir(const char *path);
+
+/* fsync the directory holding path (its parent), for the same reason. 0,
+ * or -1 with errno set. */
+int snapshot_fsync_parent(const char *path);

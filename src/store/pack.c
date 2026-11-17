@@ -144,12 +144,17 @@ int pack_dat_path_resolve(char *buf, size_t sz, const char *store,
     return pack_dat_path(buf, sz, store, pack_num);
 }
 
-/* Ensure the shard directory exists for a pack_num. */
-static void pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
+/* Ensure the shard directory exists for a pack_num. A failure is the
+ * install's: on a full disk the mkdir is what fails, and the rename after
+ * it would only say ENOENT. */
+static status_t pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
     char shard[PATH_MAX];
     if (path_fmt(shard, sizeof(shard), "%s/packs/" PACK_SHARD_FMT,
-                 store, PACK_SHARD_OF(pack_num)) == 0)
-        (void)mkdir(shard, 0755);  /* EEXIST is fine */
+                 store, PACK_SHARD_OF(pack_num)) != 0)
+        return set_error(ERR_IO, "pack: shard path too long under %s", store);
+    if (mkdir(shard, 0755) != 0 && errno != EEXIST)
+        return set_error_errno(ERR_IO, "pack: cannot create %s", shard);
+    return OK;
 }
 
 /* fsync a directory, so the entries renamed into it survive a power cut.
@@ -1022,8 +1027,8 @@ status_t pack_walk_check(store_t *store, uint32_t pack_num, char *reason, size_t
  * header is written only when the table proves it is the one the writer
  * wrote. A header the stripe can still correct is written back as
  * corrected; one already right is left alone. Returns how many headers were
- * written, or -1 when the pack has no usable trailer to prove anything
- * against or a write fails.
+ * written, -1 when the pack has no usable trailer to prove anything
+ * against, or -2 when a write, the sync or the close failed (error set).
  */
 int pack_restore_headers(store_t *store, uint32_t pack_num,
                          const pack_hdr_hint_t *hints, size_t n)
@@ -1082,17 +1087,29 @@ int pack_restore_headers(store_t *store, uint32_t pack_num,
                           : 0;
         free(pay);
         if (!ok || crc != want_e) continue;
-        if (pwrite_full(fd, &h, sizeof(h), (off_t)hi->offset) != 0) { failed = 1; break; }
+        if (pwrite_full(fd, &h, sizeof(h), (off_t)hi->offset) != 0) {
+            set_error_errno(ERR_IO, "pack-%010u.dat: write a restored entry header", pack_num);
+            failed = 2;
+            break;
+        }
         written++;
     }
-    if (written > 0 && !failed && fsync(fd) != 0) failed = 1;
-    close(fd);
-    if (written > 0) {
+    if (written > 0 && !failed && fsync(fd) != 0) {
+        set_error_errno(ERR_IO, "pack-%010u.dat: sync the restored entry headers", pack_num);
+        failed = 2;
+    }
+    if (close(fd) != 0 && written > 0 && !failed) {
+        set_error_errno(ERR_IO, "pack-%010u.dat: close after restoring entry headers", pack_num);
+        failed = 2;
+    }
+    /* Written or not, the bytes in the page cache may have changed. */
+    if (written > 0) pack_cache_invalidate(store);
+    if (failed == 2) return -2;
+    if (failed) return -1;
+    if (written > 0)
         log_warn("pack: restored %d entry header(s) in pack-%010u.dat from the index",
                  written, pack_num);
-        pack_cache_invalidate(store);
-    }
-    return failed ? -1 : written;
+    return written;
 }
 
 /* Entry offsets and stored sizes from a walk, for rebuilding CRC slots. */
@@ -2330,8 +2347,14 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
         *out_size = (uint64_t)body_end + tsize;
     }
 
-    if (fsync(fileno(*dat_f)) != 0) { st = ERR_IO; goto fail; }
-    fclose(*dat_f); *dat_f = NULL;
+    if (fsync(fileno(*dat_f)) != 0) { st = set_error_errno(ERR_IO, "pack seal: sync the pack"); goto fail; }
+    /* A filesystem that defers write errors (NFS, FUSE) reports them here,
+     * and a pack whose close failed is not known to hold its bytes. */
+    {
+        int crc = fclose(*dat_f);
+        *dat_f = NULL;
+        if (crc != 0) { st = set_error_errno(ERR_IO, "pack seal: close the pack"); goto fail; }
+    }
 
     /* Every writer seals here - backup, pack, gc, coalescing, replication -
      * so this is the one place a pack's bytes need counting. */
@@ -2365,7 +2388,8 @@ static status_t install_pack_file(store_t *store, const char *dat_tmp,
     if (pack_dat_path(dat_final, sizeof(dat_final), store_root(store), pack_num) != 0)
         return set_error(ERR_IO, "install_pack_file: path too long");
 
-    pack_ensure_shard_dir(store_root(store), pack_num);
+    status_t sst = pack_ensure_shard_dir(store_root(store), pack_num);
+    if (sst != OK) return sst;
 
     /* Numbers are never reissued (issue_pack_nums), so this should never trigger, but if
      * it does we would silently destroy data. Fail loudly instead. */
@@ -4890,8 +4914,15 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
         else fixed += (int64_t)sizeof(ph);
     }
 
-    if (fixed > 0 && !failed && fsync(fd) != 0) failed = 1;
-    close(fd);
+    if (failed) set_error_errno(ERR_IO, "pack-%010u.dat: write the correction", found.pack_num);
+    if (fixed > 0 && !failed && fsync(fd) != 0) {
+        set_error_errno(ERR_IO, "pack-%010u.dat: sync the correction", found.pack_num);
+        failed = 1;
+    }
+    if (close(fd) != 0 && fixed > 0 && !failed) {
+        set_error_errno(ERR_IO, "pack-%010u.dat: close after the correction", found.pack_num);
+        failed = 1;
+    }
     /* Open .dat handles may hold the damaged bytes in their stdio buffers. */
     if (fixed > 0) pack_cache_invalidate(store);
     if (failed) return -1;

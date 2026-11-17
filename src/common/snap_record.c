@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -176,4 +177,18 @@ int snapshot_fsync_dir(const char *path)
     close(fd);
     errno = err;
     return rc;
+}
+
+int snapshot_fsync_parent(const char *path)
+{
+    char dir[PATH_MAX];
+    if (snprintf(dir, sizeof(dir), "%s", path) >= (int)sizeof(dir)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char *slash = strrchr(dir, '/');
+    if (!slash) return snapshot_fsync_dir(".");
+    if (slash == dir) slash[1] = '\0';
+    else *slash = '\0';
+    return snapshot_fsync_dir(dir);
 }
