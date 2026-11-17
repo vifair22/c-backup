@@ -30,6 +30,11 @@ void disk_stream_nbd_tuning(unsigned depth, unsigned request_kb);
 
 /* An NBD export on a unix socket, expected to be size bytes. watch: the
  * image behind it (an offline qemu-nbd), held to the same rule as an
- * offline file; NULL for a running VM's export. */
+ * offline file; NULL for a running VM's export. bitmap: the export's dirty
+ * bitmap (vm-backup.md 4.1, an incremental item), asked for as the
+ * qemu:dirty-bitmap context; NULL for none. The stream's changed() then
+ * walks it in 1 GiB windows. A server that does not acknowledge it is not
+ * an error: *has_bitmap (may be NULL) says 0 and the item reads in full. */
 status_t disk_stream_nbd(const char *socket, const char *export_name, uint64_t size,
-                         const char *watch, sp_block_stream_t *out);
+                         const char *watch, const char *bitmap, int *has_bitmap,
+                         sp_block_stream_t *out);

@@ -95,7 +95,7 @@ static status_t s_open(void *ctx, size_t i, cdc_source_t *src, uint64_t *size)
     (void)ctx;
     memset(&gens[i], 0, sizeof(gens[i]));
     gens[i].len = i == 0 ? 3 * 1048576 + 12345 : 777;
-    *src = (cdc_source_t){ gen_span, gen_read, &gens[i], gen_piece };
+    *src = (cdc_source_t){ gen_span, gen_read, &gens[i], gen_piece, NULL };
     *size = CDC_SIZE_STREAM;
     return OK;
 }
@@ -129,7 +129,7 @@ static void test_stream_and_drop(void **state)
         { "/.cbackup-unit/hooks/pg.dump", 0600, 0, 0, 0, 0 },
         { "/.cbackup-unit/hooks/bad.dump", 0600, 0, 0, 0, 0 },
     };
-    backup_synth_ops_t ops = { s_open, NULL, NULL, s_keep };
+    backup_synth_ops_t ops = { s_open, NULL, NULL, s_keep, NULL };
     backup_opts_t o;
     memset(&o, 0, sizeof(o));
     o.unit_snapshot = 1;

@@ -32,6 +32,21 @@ typedef struct {
     char     read_mode[16];     /* full, incremental, unchanged */
     char     reason[32];
     uint64_t bytes_read;
+    /*
+     * A disk's incremental detail (vm-backup.md 5.3, 5.4), written as an
+     * "incremental" object when have_incr is set: the checkpoint the
+     * session ran under and the base it read against, the read estimate
+     * and the threshold that decided full or incremental, what the delta
+     * re-read past the changed ranges, and an audit's result. Informational:
+     * readers ignore it, and nothing is ever rebuilt from it.
+     */
+    int      have_incr;
+    char     checkpoint[128];
+    int64_t  base_snapshot;
+    uint64_t estimate, data_bytes, clusters, ranges, dirty_bytes, resync_bytes;
+    unsigned delta_full_pct;
+    int      audited, audit_bad;
+    uint64_t audit_leaves, audit_bad_bytes, audit_first_bad;
 } unit_json_item_t;
 
 typedef struct {

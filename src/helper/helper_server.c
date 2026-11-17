@@ -731,6 +731,23 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         /* pause: a pause may be held for the daemon's second pass over
          * mounts on no snapshot domain, released with lease.release. */
         q.hold_pause = r->hold;
+        /* vm.backup_begin (vm-backup.md 5.8): the disks that take part in
+         * the chain, against base where base covers them; base alone, with
+         * no disk taking part, is only retired. The backend accepts base
+         * only if its own records say it made it for this daemon. */
+        sp_item_base_t vb[HELPER_DISKS_MAX];
+        size_t nvb = 0;
+        if (r->op == HOP_VM_BACKUP_BEGIN) {
+            for (size_t k = 0; k < r->n_disks && nvb < HELPER_DISKS_MAX; k++) {
+                if (!r->disks[k].incremental) continue;
+                vb[nvb].item_id = r->disks[k].target;
+                vb[nvb].base_token = r->base[0] ? r->base : NULL;
+                nvb++;
+            }
+            q.bases = vb;
+            q.n_bases = nvb;
+            q.retire_token = nvb == 0 && r->base[0] ? r->base : NULL;
+        }
         st = b->ops->begin(b->ctx, d, &q, &sess, &info);
         /* The journal context outlives begin: end releases through it, so
          * it lives with the member and goes after end. */
@@ -758,6 +775,8 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         cJSON *w = cJSON_AddArrayToObject(o, "warnings");
         for (size_t k = 0; w && k < info->n_warnings; k++)
             cJSON_AddItemToArray(w, cJSON_CreateString(info->warnings[k]));
+        if (info->new_token) cJSON_AddStringToObject(o, "new_token", info->new_token);
+        if (info->new_token_blob) cJSON_AddStringToObject(o, "token_blob", info->new_token_blob);
         cJSON *pl = cJSON_AddArrayToObject(o, "plans");
         for (size_t k = 0; pl && k < info->n_plans; k++) {
             cJSON *p = cJSON_CreateObject();
@@ -947,8 +966,11 @@ static char *op_capture_end(helper_server_t *s, const helper_req_t *r)
 {
     capture_t c;
     if (!capture_take(s, r->token, &c))
-        return resp_error(r->id, HELPER_E_INVALID, "no such capture");
-    capture_finish(s, &c, SP_END_COMMITTED);
+        return resp_error(r->id, HELPER_E_INVALID, r->op == HOP_VM_BACKUP_END ? "no such session" : "no such capture");
+    /* vm.backup_end says how the snapshot went, which settles the
+     * checkpoints (vm-backup.md 5.8); a capture always ends as committed. */
+    int aborted = r->op == HOP_VM_BACKUP_END && strcmp(r->outcome, "aborted") == 0;
+    capture_finish(s, &c, aborted ? SP_END_ABORTED : SP_END_COMMITTED);
     cJSON *res = cJSON_CreateObject();
     if (res) cJSON_AddBoolToObject(res, "ended", 1);
     return resp_ok(r->id, res);
@@ -1567,19 +1589,29 @@ static char *op_vm_backup(helper_server_t *s, const helper_req_t *r, int *pass_f
     return op_capture_begin(s, &q, pass_fd);
 }
 
-/* vm.*: validated and held to the policy here; libvirt is not built yet. */
+/*
+ * vm.checkpoint_redefine (vm-backup.md 5.8): re-create a checkpoint libvirt
+ * has lost (Unraid keeps their metadata on the RAM rootfs) from the XML
+ * this helper stored when it made it. Only a checkpoint of its own records
+ * for that domain; the daemon names it and nothing else.
+ */
 static char *op_vm(helper_server_t *s, const helper_req_t *r)
 {
-    if (r->unit[0]) {
-        char why[256];
-        helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
-        if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
-        if (strncmp(r->unit, "libvirt:", 8) != 0)
-            return resp_error(r->id, HELPER_E_INVALID, "%s is for libvirt units", helper_op_name(r->op));
-        return resp_error(r->id, HELPER_E_UNSUPPORTED, "%s comes with incremental backups (V3)", helper_op_name(r->op));
+    char why[256];
+    helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
+    if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
+    if (strncmp(r->unit, "libvirt:", 8) != 0)
+        return resp_error(r->id, HELPER_E_INVALID, "%s is for libvirt units", helper_op_name(r->op));
+    const char *uid = NULL;
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK) return resp_error(r->id, e, "%s", why);
+    if (!b->redefine) return resp_error(r->id, HELPER_E_UNSUPPORTED, "provider %s keeps no checkpoints", b->name);
+    cJSON *res = NULL;
+    if (b->redefine(b->ctx, uid, r->checkpoint, &res) != OK) {
+        cJSON_Delete(res);
+        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
     }
-    /* A token-only operation: no session was ever issued. */
-    return resp_error(r->id, HELPER_E_INVALID, "no such session");
+    return resp_ok(r->id, res ? res : cJSON_CreateObject());
 }
 
 /* ------------------------------------------------------------------ */

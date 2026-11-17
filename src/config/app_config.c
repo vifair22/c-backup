@@ -37,6 +37,9 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
     config_check_int_range(chk, "security.run_as_uid", 0, 2147483646);
     config_check_int_range(chk, "vm.freeze_timeout_s", 1, 600);
     config_check_int_range(chk, "vm.trust_zero_status", 0, 1);
+    config_check_int_range(chk, "vm.incremental", 0, 1);
+    config_check_int_range(chk, "vm.delta_full_pct", 0, 100);
+    config_check_int_range(chk, "vm.audit_days", 0, 3650);
     config_check_int_range(chk, "containers.max_pause_s", 1, 600);
 
     /* The floor has its own message: "not between 16 and ..." would not say

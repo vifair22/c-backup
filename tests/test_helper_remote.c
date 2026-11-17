@@ -87,7 +87,7 @@ static int setup_base(void)
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     if (repo_store_open(REPO, NULL, &store) != OK) return -1;
     if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
-    units_config_t uc = { "", 2, 10, 30, 1 };
+    units_config_t uc = { "", 2, 10, 30, 1, 0, 75, 30 };
     return units_init(db, NULL, &uc) == OK ? 0 : -1;
 }
 
@@ -122,7 +122,7 @@ static int setup(void **state)
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     if (repo_store_open(REPO, NULL, &store) != OK) return -1;
     if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
-    units_config_t uc = { "", 2, 10, 30, 1 };
+    units_config_t uc = { "", 2, 10, 30, 1, 0, 75, 30 };
     if (units_init(db, NULL, &uc) != OK) return -1;
     return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
 }

@@ -47,6 +47,7 @@
 #include "registry.h"
 #include "disk_stream.h"
 #include "remote_provider.h"
+#include "unit_backup.h"
 #include "unit_state.h"
 
 #ifndef VERSION_STRING
@@ -136,6 +137,9 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
         .freeze_timeout_s = (unsigned)config_get_int(cfg, "vm.freeze_timeout_s", (int)UNITS_FREEZE_DEFAULT_S),
         .max_pause_s      = (unsigned)config_get_int(cfg, "containers.max_pause_s", (int)UNITS_PAUSE_DEFAULT_S),
         .trust_zero       = config_get_int(cfg, "vm.trust_zero_status", 1),
+        .incremental      = config_get_int(cfg, "vm.incremental", 0),
+        .delta_full_pct   = (unsigned)config_get_int(cfg, "vm.delta_full_pct", (int)UNITS_DELTA_PCT_DEFAULT),
+        .audit_days       = (unsigned)config_get_int(cfg, "vm.audit_days", (int)UNITS_AUDIT_DAYS_DEFAULT),
     };
     status_t st = units_init(db, dir[0] ? dir : NULL, &uc);
     if (st != OK) return st;
@@ -160,6 +164,17 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
     if (hs && *hs && remote_start(hs, units_daemon8(), NULL) != OK) {
         log_warn("units: %s; retrying in the background", err_msg());
         err_clear();
+    } else if (hs && *hs && !remote_unusable("libvirt", NULL, 0)) {
+        /* vm-backup.md 5.8: the checkpoints the tokens name, put back
+         * before the scheduler starts. A helper that is not up yet does
+         * the same at its own start, and every session checks again. */
+        unsigned n = 0, redone = 0, refused = 0;
+        if (unit_checkpoints_redefine(db, &n, &redone, &refused) != OK) {
+            log_warn("units: checkpoint redefine: %s", err_msg());
+            err_clear();
+        } else if (n) {
+            log_info("units: %u checkpoint(s) checked, %u redefined, %u could not be", n, redone, refused);
+        }
     }
 
     units_sweep_result_t sw;

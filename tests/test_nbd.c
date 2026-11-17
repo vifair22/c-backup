@@ -208,7 +208,15 @@ static void test_fuzz(void **state)
 }
 
 /* qemu-nbd, when this host has it: a raw and a qcow2 image read back. */
+static pid_t start_qemu_nbd_b(const char *img, const char *fmt, const char *sock, const char *bitmap);
+
 static pid_t start_qemu_nbd(const char *img, const char *fmt, const char *sock)
+{
+    return start_qemu_nbd_b(img, fmt, sock, NULL);
+}
+
+/* The same, exporting a persistent dirty bitmap of the image (-B). */
+static pid_t start_qemu_nbd_b(const char *img, const char *fmt, const char *sock, const char *bitmap)
 {
     /* --force-share is gone from this qemu-nbd; file.locking=off is what
      * it did. */
@@ -216,8 +224,12 @@ static pid_t start_qemu_nbd(const char *img, const char *fmt, const char *sock)
     snprintf(opts, sizeof(opts), "driver=%s,file.driver=file,file.filename=%s,file.locking=off", fmt, img);
     pid_t p = fork();
     if (p == 0) {
-        execlp("qemu-nbd", "qemu-nbd", "--read-only", "--persistent", "--cache=none",
-               "-k", sock, "-x", "disk", "--image-opts", opts, (char *)NULL);
+        if (bitmap)
+            execlp("qemu-nbd", "qemu-nbd", "--read-only", "--persistent", "--cache=none",
+                   "-k", sock, "-x", "disk", "-B", bitmap, "--image-opts", opts, (char *)NULL);
+        else
+            execlp("qemu-nbd", "qemu-nbd", "--read-only", "--persistent", "--cache=none",
+                   "-k", sock, "-x", "disk", "--image-opts", opts, (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 100; i++) {
@@ -328,6 +340,69 @@ static status_t drain(sp_block_stream_t *b, uint64_t size, int write_at_half, co
  * and its unit fail rather than store a torn image as consistent. The same
  * image read as a running VM's would be (offline 0) is not held to it.
  */
+/*
+ * The dirty bitmap as a disk stream's changed ranges (vm-backup.md 4.1,
+ * 10.2): a qcow2 with a persistent bitmap, written through qemu-io, exported
+ * by qemu-nbd -B. The ranges come back rounded to the bitmap's granularity,
+ * merged, and the walk can start over from 0, as the estimate, the delta
+ * and the audit each do. A bitmap the server does not have is no bitmap.
+ */
+static void test_qemu_nbd_bitmap(void **state)
+{
+    (void)state;
+    if (system("command -v qemu-nbd >/dev/null 2>&1 && command -v qemu-img >/dev/null 2>&1 && "
+               "command -v qemu-io >/dev/null 2>&1") != 0) {
+        print_message("qemu-nbd, qemu-img or qemu-io not found: skipped\n");
+        skip();
+    }
+    const char *img = D "/bm.qcow2";
+    assert_int_equal(system("qemu-img create -q -f qcow2 '" D "/bm.qcow2' 16M && "
+                            "qemu-img bitmap --add '" D "/bm.qcow2' cbk-vda && "
+                            "qemu-io -f qcow2 -c 'write -P 1 1048576 4096' -c 'write -P 2 9437184 131072' "
+                            "-c 'write -P 3 9568256 4096' '" D "/bm.qcow2' >/dev/null"), 0);
+    const char *sock = D "/bm.sock";
+    unlink(sock);
+    pid_t p = start_qemu_nbd_b(img, "qcow2", sock, "cbk-vda");
+    assert_true(p > 0);
+    sp_block_stream_t b;
+    int hb = 0;
+    assert_int_equal(disk_stream_nbd(sock, "disk", 16 * M, NULL, "cbk-vda", &hb, &b), OK);
+    assert_true(hb);
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t rs = 0, re = 0, from = 0;
+        int done = 0;
+        assert_int_equal(b.changed(b.ctx, from, &rs, &re, &done), OK);
+        assert_false(done);
+        assert_int_equal(rs, 1 * M);
+        assert_int_equal(re, 1 * M + 65536);
+        from = re;
+        assert_int_equal(b.changed(b.ctx, from, &rs, &re, &done), OK);
+        assert_false(done);
+        assert_int_equal(rs, 9 * M);
+        assert_int_equal(re, 9 * M + 196608);         /* two writes, one merged range */
+        assert_int_equal(b.changed(b.ctx, re, &rs, &re, &done), OK);
+        assert_true(done);
+    }
+    /* The extent walk may go back too. */
+    sp_ext_type_t t;
+    uint64_t len = 0;
+    int done = 0;
+    assert_int_equal(b.extent(b.ctx, 12 * M, &t, &len, &done), OK);
+    assert_int_equal(t, SP_EXT_ZERO);
+    assert_int_equal(b.extent(b.ctx, 1 * M, &t, &len, &done), OK);
+    assert_int_equal(t, SP_EXT_DATA);
+    b.close(b.ctx);
+    /* Asked for a bitmap the export does not have: none, and no ranges. */
+    assert_int_equal(disk_stream_nbd(sock, "disk", 16 * M, NULL, "other", &hb, &b), OK);
+    assert_false(hb);
+    uint64_t rs, re;
+    assert_int_not_equal(b.changed(b.ctx, 0, &rs, &re, &done), OK);
+    err_clear();
+    b.close(b.ctx);
+    kill(p, SIGTERM);
+    waitpid(p, NULL, 0);
+}
+
 static void test_offline_image_changed(void **state)
 {
     (void)state;
@@ -386,6 +461,7 @@ int main(void)
         cmocka_unit_test_setup(test_faults, setup),
         cmocka_unit_test_setup(test_fuzz, setup),
         cmocka_unit_test_setup(test_qemu_nbd, setup),
+        cmocka_unit_test_setup(test_qemu_nbd_bitmap, setup),
         cmocka_unit_test_setup(test_offline_image_changed, setup),
     };
     return cmocka_run_group_tests(tests, NULL, group_cleanup);

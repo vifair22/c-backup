@@ -248,7 +248,7 @@ static int setup(void **state)
     if (repo_register(db, D "/repo", "t", &repo_id) != OK) return -1;
     if (repo_store_open(D "/repo", NULL, &store) != OK) return -1;
     if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
-    units_config_t uc = { "", 2, 10, 30, 1 };
+    units_config_t uc = { "", 2, 10, 30, 1, 0, 75, 30 };
     if (units_init(db, NULL, &uc) != OK) return -1;
     const remote_backoff_t bo = { 50, 200, 200 };
     return remote_start(SOCK, units_daemon8(), &bo) == OK ? 0 : -1;
