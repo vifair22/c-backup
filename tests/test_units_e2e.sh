@@ -155,6 +155,9 @@ if cmp -s "$WORK/vda.raw" "$WORK/out/.cbackup-unit/disks/vda"; then ok "the raw 
 check    "no partial file is left" "no" "$([ -e "$WORK/vda.raw.cbk-partial" ] && echo yes || echo no)"
 OUT=$(cb unit restore 1 1 "$WORK/vda.raw" --item vda 2>&1); RC=$?
 check    "an item never lands on an existing file" 1 "$RC"
+OUT=$(cb unit restore 1 999 "$WORK/nope" 2>&1); RC=$?
+check    "a snapshot that does not exist is refused" 1 "$RC"
+contains "as missing, not as not a unit snapshot" "has no snapshot 999" "$OUT"
 OUT=$(cb unit restore 1 1 "$WORK/vda2.raw" --item vda --overwrite 2>&1); RC=$?
 check    "--overwrite with --item is refused by the CLI" 1 "$RC"
 contains "saying why" "an item is restored to a new path" "$OUT"
