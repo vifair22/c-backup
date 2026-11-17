@@ -747,6 +747,40 @@ virsh -q -c "$VIRT_URI" undefine cbk-uat-vm >/dev/null 2>&1
 }
 test_vm
 
+# ---- the privilege drop and the helper suites, as root -------------------
+# The CI job containers are root with Docker's default capabilities, which
+# hold no CAP_DAC_READ_SEARCH, so there test_root_drop can only check that
+# privs_drop refuses and changes nothing. This sibling is privileged: the
+# real drop to uid 990, and the helper suites' own root paths (hf_unroot,
+# the e2e's uid-990 daemon and socket group), run here for real.
+
+suite_root() {   # <label> <logfile> <command...>
+    local label=$1 logf=$2 rc
+    shift 2
+    (cd "$SRC" && C_BACKUP_TEST_DIR="$TSCR" "$@") >"$logf" 2>&1
+    rc=$?
+    check "$label passes as root" 0 "$rc"
+    [ "$rc" -eq 0 ] || tail -30 "$logf"
+}
+
+log "suites as root: test_privs, test_helper, test_helper_remote, test_helper_e2e.sh"
+TSCR="$WORK/test-scratch"
+mkdir -p "$TSCR"
+if make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic C_BACKUP_TEST_DIR="$TSCR" \
+        -j"$JOBS" build/bins/test_privs build/bins/test_helper build/bins/test_helper_remote \
+        >"$WORK/build-suites.log" 2>&1; then
+    suite_root test_privs "$WORK/test_privs.log" build/bins/test_privs
+    contains "test_root_drop ran the real drop" "[       OK ] test_root_drop" "$(cat "$WORK/test_privs.log")"
+    check "and not only the refusal" 0 "$(grep -c 'the drop is not' "$WORK/test_privs.log")"
+    suite_root test_helper "$WORK/test_helper.log" build/bins/test_helper
+    suite_root test_helper_remote "$WORK/test_helper_remote.log" build/bins/test_helper_remote
+    suite_root test_helper_e2e.sh "$WORK/test_helper_e2e.log" \
+        tests/test_helper_e2e.sh build/bins/c-backupd build/bins/c-backup build/bins/c-backup-helper
+else
+    tail -40 "$WORK/build-suites.log"
+    bad "the root suites build" "built" "make failed"
+fi
+
 # ---- the end -------------------------------------------------------------
 
 log "final leftovers"
