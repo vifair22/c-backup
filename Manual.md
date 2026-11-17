@@ -3087,7 +3087,9 @@ restarting the helper, which the daemon notices on its own (22.2.4).
 
 The daemon opens one connection to the helper per request, so concurrent
 jobs never wait for each other and a helper restart costs nothing beyond
-the requests in flight. While the helper is away the daemon retries with a
+the requests in flight. It also keeps one connection open for as long as
+it runs, its session's anchor; when the daemon dies, killed or not, the
+kernel closes it, and the helper ends every capture that daemon began. While the helper is away the daemon retries with a
 backoff from 0.5 s doubling to 30 s; when it answers, the daemon says hello
 again (logging a policy whose digest changed) and enables the providers the
 helper offers, with no daemon restart. While connected it checks every 15 s,
@@ -3096,9 +3098,17 @@ and a request that finds the helper gone marks the link down at once.
 - A unit job that needs the helper while it is away **fails and alerts**,
   scheduled or not, with the socket path and the reason in the error, the
   journal and the push alert. It is never skipped quietly.
-- A job in flight when the helper restarts fails cleanly: no snapshot is
-  written, and the helper's start-up sweep releases whatever the old
-  process held (pauses, freezes, snapshots, exports).
+- A job in flight when the helper restarts loses its capture: the
+  helper's start-up sweep releases whatever the old process held (pauses,
+  freezes, snapshots, exports). A unit that still needed it (its begin, or
+  a read through a snapshot now gone) fails with no snapshot; a unit whose
+  reads had all finished keeps its snapshot, which is whole, and carries a
+  warning that its end could not reach the helper.
+- A daemon that dies mid-backup (a crash, `kill -9`, an OOM kill) leaves
+  nothing held for long: its anchor closes with it, and within a second the
+  helper ends that daemon's captures as aborted, releasing their pauses,
+  freezes, exports and snapshots, as `capture.end` would. Before 1.0 such a
+  hold lasted until a helper restart or `capture_max_s`.
 - If libvirt cannot be reached when the helper starts (libvirtd down, or
   its socket not mounted), the sweep logs it and **keeps** every hold that
   names a domain, a guest freeze included, for the next sweep, which its
@@ -3114,7 +3124,8 @@ and a request that finds the helper gone marks the link down at once.
 | `helper.policy`, `helper.daemon_id`, `helper.providers` | the policy digest, the daemon id and the providers, as the helper's hello said |
 | `daemon_id` | this daemon's id; it must equal the policy's `daemon_id` |
 | `allow` | the daemon's `units.allow` |
-| `holds_open` | holds journalled and not yet released; 0 when nothing is held |
+| `holds_open` | holds journalled and not yet released, the daemon's own and the helper's together (asked of the helper when the request is made); 0 when nothing is held |
+| `helper.holds`, `helper.captures` | what the helper has journalled and open right now, when it answered |
 | `privileges_dropped` | whether the drop of 22.2.2 happened |
 
 ### 22.3 Configuration keys
@@ -3434,7 +3445,9 @@ nothing the container could not do to itself.
   consistent at its own instant (it is the database's own export), and
   running it then holds nothing. If it exits non-zero or times out, the dump
   is **not stored** (a truncated dump looks valid); its log says why and the
-  unit carries a warning.
+  unit carries a warning naming it: `N dump(s) failed and are not in
+  snapshot S; first: <path>`. A dump's bytes count toward its item's size,
+  not toward the unit's disk bytes read.
 
 Dumps should be uncompressed (no `--gzip`, `pg_dump -Z0`): c-backup
 compresses per chunk, and a compressed dump defeats what little a dump
@@ -3540,6 +3553,14 @@ c-backup schedule add 1 units --every day --at 05:00 --provider docker \
   --unit reverse-proxy --unit authelia --pause-scope group
 ```
 
+Pause scope counts **units**, not services: a compose project is one unit,
+and its services are always captured together, at any scope. Group and job
+scope need a provider that captures units together (Docker through the
+helper does). One that cannot, such as an in-process provider, takes each
+unit as its own capture and says so in the job's result (`note`) and as its
+warning: `pause scope job needs a provider that captures units together;
+provider P does not, so each unit was its own capture`.
+
 Each unit of a shared capture is then read and stored on its own, and the
 shared snapshots are destroyed after the last. A shared capture keeps its
 snapshots for the whole job, which is why per-unit capture is the default.
@@ -3586,7 +3607,9 @@ c-backup unit restore 1 4127 /mnt/disk3/restore/vda.raw --item vda
 ```
 
 One disk, written through `<dest>.cbk-partial` and renamed when complete,
-never over an existing path.
+never over an existing path; `--overwrite` with `--item` is refused before
+any job. A tree item restores with the directories above it given their
+recorded modes, as a whole restore gives them.
 
 **Every disk restores as a sparse raw image, including disks that were
 qcow2.** A qcow2 disk comes back raw; nothing in this build writes qcow2.
@@ -3610,6 +3633,37 @@ c-backup unit restore 1 5120 --define --name immich-test \
 | Data | each mount staged in `<staging>/<job>-<random>/` (below) and swapped in, the old directory kept as `<mount>.cbackup-old-<job>`; each VM image restored into `<image dir>/.cbackup-restore/` and swapped in only after every disk is in, the old image kept as `<image>.cbackup-old-<job>` | each mount, each VM image, at `DIR/<its original path>`; the original's paths are never written |
 | Definition | re-applied with the same name (and for a VM the same UUID) | the name changed; bind sources, volumes, rootfs and mount entries rewritten under `DIR`; a VM's `<uuid>` removed (libvirt makes a new one), MACs regenerated unless `--keep-macs`, disks pointing at the new images, excluded passthrough disks dropped and listed |
 | Never | a delete: old data is moved aside, never removed | |
+
+**Every refusal comes first.** Before anything is written or stopped, the
+daemon builds the definition and has the helper check it (`unit.define` in
+check mode): the policy's `allow_define`, a privileged definition without
+`allow_privileged_define`, a provider not behind the helper, an in-place
+restore without `allow_restore`, and, in place, a VM that is still running,
+all refuse the restore with the unit untouched and `refused, nothing
+written` in the error. A new name whose target root already holds one of
+the unit's paths is refused the same way. `--name` with the unit's own name
+is the unit in place, and asks for `--replace`.
+
+**A failure after the unit was stopped is rolled back.** If a restore into
+staging, a swap, or the define itself fails in place, each swap is undone,
+newest first (the restored copy back to its staging directory, the old data
+back to the mount), and the unit is started again if it was running. The
+error says `rolled back` and where the restored copy was kept in staging,
+to look at or delete. A swap that cannot be undone leaves the unit stopped
+and says so; its original is still at `<mount>.cbackup-old-<job>`. For a VM,
+a failure from the first swap through the define is undone the same way;
+once the define has succeeded the domain and its disks agree, and nothing
+is undone. Under a new name, a define that fails after the data was written
+leaves the data under `DIR` and says to remove it, or give another target
+root, before trying again.
+
+**The mount root** comes back with the snapshot's owner, mode, times,
+xattrs and ACLs, like everything below it, not the staging directory's
+`0700`. Once swapped, an emptied `.cbackup-restore` the helper made is
+removed.
+
+The job's byte progress covers every mount and disk of the restore: done
+only grows, and the total ends at the whole restore's.
 
 **Where a restore in place stages.** The swap is a rename, so the staging
 directory sits in the mount's own snapshot domain: the first `[snapshot]
