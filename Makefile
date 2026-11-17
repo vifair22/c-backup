@@ -174,8 +174,20 @@ endif
 # ---- Phony targets ----------------------------------------------------
 .PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse analyze lint check-conflict-markers
 
+# In the top-level make, which is the release build unless told otherwise,
+# `all` is built here rather than by a sub-make (BUILD-1). The test binaries
+# link build/release objects through this make's own pattern rule, so a
+# recursive `all` gave two make processes a rule for the same objects:
+# `make -j test` on a dirty tree compiled one twice at once, and an LTO link
+# reading it while it was rewritten failed with "lto1: internal compiler
+# error: resolution sub id ... not in object file". One make, one rule per
+# object, and the jobserver orders the rest.
+ifeq ($(BUILD_TYPE),release)
+all: _build
+else
 all:
 	$(MAKE) BUILD_TYPE=release _build
+endif
 
 static:
 	$(MAKE) BUILD_TYPE=static _build
@@ -365,10 +377,18 @@ $(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) $(TEST_DIR_S
 	$(CC) $(ASAN_TEST_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ -static-libasan \
 	    $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -pthread -lm -lcmocka
 
-test-asan: asan $(ASAN_TEST_BINS)
+# In sequence, not as two prerequisites: the asan objects are built by the
+# `asan` sub-make and this make has no rule for them, so in parallel a suite
+# linked them while that sub-make was still writing them, or found none on a
+# clean tree (BUILD-1).
+test-asan:
+	$(MAKE) asan
+	$(MAKE) asan-test-bins
 	@for t in $(ASAN_TEST_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
 
-.PHONY: test-asan
+asan-test-bins: $(ASAN_TEST_BINS)
+
+.PHONY: test-asan asan-test-bins
 
 # ---- Fuzzing ----------------------------------------------------------
 #
