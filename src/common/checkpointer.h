@@ -45,7 +45,8 @@
  *
  *   The hard cap (16 x the threshold, 1 GiB by default; B181). Past it the
  *   thread goes straight to the lock, with no unlocked rounds first, and
- *   writers help: each one, before it queues for the write lock, looks at
+ *   bulk writers help: each one (db_txn_begin_bulk), before it queues for
+ *   the write lock, looks at
  *   the WAL (at most every 5 ms across all writers) and, past the cap and
  *   not fully copied, wakes the thread and waits, holding no lock, until
  *   the copy is complete. On a slow device the thread alone let a writer
@@ -105,7 +106,7 @@ void checkpointer_stop(void);
 
 void checkpointer_stats(checkpointer_stats_t *out);
 
-/* Called by db_txn_begin before it queues for the write lock: past the
+/* Called by db_txn_begin_bulk before it queues for the write lock: past the
  * hard cap, wait for the checkpointer to complete a copy (B181; the design
  * is at the function). Returns at once when the checkpointer is not
  * running. */
@@ -114,6 +115,10 @@ void checkpointer_throttle(void);
 /* Tests: sleep this long before every PASSIVE, a device whose syncs are
  * slow. */
 void checkpointer_set_test_pause_ms(unsigned ms);
+
+/* Tests: the thread does nothing at its ticks while on, so a WAL past the
+ * hard cap stays uncopied for as long as a test needs. */
+void checkpointer_set_test_idle(int on);
 
 /*
  * The WAL's frame count and how many of them are copied back, from the

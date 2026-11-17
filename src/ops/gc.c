@@ -278,7 +278,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         err_clear();
     }
 
-    if (db_txn_begin(db) != OK)
+    if (db_txn_begin_bulk(db) != OK)
         return set_error(ERR_IO, "gc: begin");
 
     /* Clear every mark first. Anything still at zero after the walk is

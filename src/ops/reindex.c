@@ -405,7 +405,7 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
 
-    if (db_txn_begin(db) != OK) {
+    if (db_txn_begin_bulk(db) != OK) {
         free(label);
         return set_error(ERR_IO, "reindex: begin");
     }
@@ -708,7 +708,7 @@ static status_t rebuild_pack_index(store_t *store, cutils_db_t *db, int64_t repo
      * its time in SQLite's per-statement bookkeeping rather than in the work.
      * It is also the correct scope: a half-rebuilt pack index should never be
      * observable. */
-    if (db_txn_begin(db) != OK)
+    if (db_txn_begin_bulk(db) != OK)
         return set_error(ERR_IO, "reindex: cannot begin pack index rebuild");
 
     pack_scan_ctx_t c;
@@ -776,7 +776,7 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
      * pack_objects was just rebuilt from those same headers and already holds
      * the sizes, so the answer is a join rather than a file read.
      */
-    if (db_txn_begin(db) != OK)
+    if (db_txn_begin_bulk(db) != OK)
         return set_error(ERR_IO, "reindex: cannot begin object sizing");
 
     if (db_write(db,
@@ -896,7 +896,7 @@ static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
         db_result_free(r);
         return set_error(ERR_IO, "reindex: cannot list chunk lists");
     }
-    if (db_txn_begin(db) != OK) {
+    if (db_txn_begin_bulk(db) != OK) {
         db_result_free(r);
         return set_error(ERR_IO, "reindex: cannot begin chunk lists");
     }
@@ -963,7 +963,7 @@ static status_t recompute_refcounts(cutils_db_t *db, int64_t repo_id)
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
-    if (db_txn_begin(db) != OK)
+    if (db_txn_begin_bulk(db) != OK)
         return set_error(ERR_IO, "reindex: cannot begin refcount pass");
     int failed =
         db_write(db, "UPDATE objects SET refcount = 0 WHERE repo_id = ?",

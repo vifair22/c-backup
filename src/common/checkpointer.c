@@ -63,6 +63,12 @@ static atomic_int    g_active;            /* the thread is running */
 static atomic_ullong g_blocked_until_ns;  /* an escalation could not finish */
 static atomic_ullong g_last_probe_ns;     /* writers' last look at the WAL */
 static atomic_uint   g_test_pause_ms;
+static atomic_int    g_test_idle;
+
+void checkpointer_set_test_idle(int on)
+{
+    atomic_store(&g_test_idle, on ? 1 : 0);
+}
 
 void checkpointer_set_test_pause_ms(unsigned ms)
 {
@@ -125,6 +131,7 @@ static status_t locked_passive(void *arg)
 
 static void tick(void)
 {
+    if (atomic_load(&g_test_idle)) return;
     uint32_t frames = 0, backfilled = 0;
     if (checkpointer_wal_frames(g_path, &frames, &backfilled) != 0) return;
     pthread_mutex_lock(&g_mu);
@@ -202,8 +209,9 @@ locked:;
 /*
  * Writers' half of the hard cap (B181). The checkpointer alone cannot hold
  * the WAL to the cap on a slow device: between two of its looks a writer
- * that never syncs appends tens of thousands of frames. So every writer,
- * before it queues for the write lock (db_txn_begin), looks at the WAL -
+ * that never syncs appends tens of thousands of frames. So every bulk
+ * writer, before it queues for the write lock (db_txn_begin_bulk, and each
+ * db_write_batch), looks at the WAL -
  * at most every CKPT_PROBE_NS across all writers, a stat and a pread - and
  * once it is past the hard cap and not fully copied, wakes the
  * checkpointer and waits for the copy to complete. Holding no lock while
@@ -211,6 +219,11 @@ locked:;
  * waiting when the copy is complete (the first writer after it restarts
  * the WAL), when the checkpointer has found it cannot complete one
  * (g_blocked_until_ns), or after CKPT_THROTTLE_MAX_NS whatever happens.
+ *
+ * Only bulk writers: a request's write (db_txn_begin, db_write) never
+ * waits here. Those writes are a few pages each and cannot carry the WAL
+ * past the cap; the writers that can are the ones that write without
+ * pause, and holding them is enough.
  */
 void checkpointer_throttle(void)
 {

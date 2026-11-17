@@ -91,8 +91,6 @@ status_t db_txn_begin(cutils_db_t *db)
         return set_error(ERR_BUSY, "db_txn_begin: this thread already holds "
                                    "the write lock (nested transaction)");
 
-    /* Past the WAL's hard cap, wait for the checkpointer first (B181). */
-    checkpointer_throttle();
     uint64_t t0 = phase_now();
     write_lock();
     int rc = db_exec_raw(db, "BEGIN");
@@ -102,6 +100,14 @@ status_t db_txn_begin(cutils_db_t *db)
         return set_error(ERR_IO, "cannot begin");
     }
     return OK;
+}
+
+status_t db_txn_begin_bulk(cutils_db_t *db)
+{
+    /* Past the WAL's hard cap, wait for the checkpointer first (B181).
+     * Only here: a request's short write never waits for a checkpoint. */
+    if (!tls_held) checkpointer_throttle();
+    return db_txn_begin(db);
 }
 
 status_t db_txn_commit(cutils_db_t *db)
@@ -341,6 +347,8 @@ int db_write_batch_open(db_write_batch_t *b, cutils_db_t *db)
 {
     b->db = db;
     b->since = 0;
+    /* A loop writing many rows is a bulk writer (B181). */
+    if (!db_txn_held()) checkpointer_throttle();
     b->began = db_write_enter(db);
     return b->began < 0 ? -1 : 0;
 }

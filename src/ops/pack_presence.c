@@ -497,7 +497,7 @@ static status_t adopt_pack(cutils_db_t *db, int64_t repo_id, const char *repo,
     uint64_t restored = 0;
     size_t i = 0;
     while (st == OK && i < l.n) {
-        if (db_txn_begin(db) != OK) { st = set_error(ERR_IO, "pack presence: begin"); break; }
+        if (db_txn_begin_bulk(db) != OK) { st = set_error(ERR_IO, "pack presence: begin"); break; }
         size_t end = i + ADOPT_BATCH < l.n ? i + ADOPT_BATCH : l.n;
         for (; i < end && st == OK; i++) {
             if (act[i] == ADOPT_SKIP) continue;

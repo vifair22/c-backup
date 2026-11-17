@@ -35,6 +35,7 @@
 
 #include "checkpointer.h"
 #include "db_txn.h"
+#include "db_write.h"
 #include "state_db.h"
 #include "test_tmp.h"
 
@@ -83,6 +84,8 @@ static int setup(void **state)
 static int teardown(void **state)
 {
     (void)state;
+    checkpointer_set_test_idle(0);
+    checkpointer_set_test_pause_ms(0);
     checkpointer_stop();
     db_close(db); db = NULL;
     rmrf(TEST_DIR);
@@ -94,9 +97,9 @@ static int teardown(void **state)
  * while the database file stays a few MiB. */
 static atomic_uint g_row;
 
-static int commit_rows(int n)
+static int commit_rows_with(status_t (*begin)(cutils_db_t *), int n)
 {
-    if (db_txn_begin(db) != OK) return -1;
+    if (begin(db) != OK) return -1;
     for (int i = 0; i < n; i++) {
         char id[16];
         snprintf(id, sizeof(id), "%u", atomic_fetch_add(&g_row, 1) % 512u);
@@ -107,6 +110,13 @@ static int commit_rows(int n)
         }
     }
     return db_txn_commit(db) == OK ? 0 : -1;
+}
+
+/* The writers here stand for a backup's batches, which are bulk writers
+ * (db_txn_begin_bulk, B181). */
+static int commit_rows(int n)
+{
+    return commit_rows_with(db_txn_begin_bulk, n);
 }
 
 static uint32_t wal_frames(void)
@@ -310,6 +320,66 @@ static void test_pinned_reader_holds_nobody_up(void **state)
     assert_true(f <= THRESHOLD * CKPT_CAP_FACTOR);
 }
 
+/*
+ * B181: at the hard cap only bulk writers wait. With the WAL past the cap
+ * and its copy held incomplete (the thread idle), a bulk writer's BEGIN is
+ * held, while a request-style write - a plain db_write - goes straight
+ * through: a tag or a note never waits for a checkpoint. Once the thread
+ * works again the copy completes and the bulk writer is let go.
+ */
+typedef struct {
+    atomic_int done;
+    uint64_t   waited_ms;
+    int        rc;
+} bulk_t;
+
+static void *bulk_main(void *arg)
+{
+    bulk_t *b = arg;
+    uint64_t t0 = now_ms();
+    b->rc = commit_rows_with(db_txn_begin_bulk, 1);
+    b->waited_ms = now_ms() - t0;
+    atomic_store(&b->done, 1);
+    return NULL;
+}
+
+static void test_only_bulk_writers_wait_at_the_hard_cap(void **state)
+{
+    (void)state;
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    checkpointer_set_test_idle(1);
+    /* Past the cap with plain writes, which nothing holds back. */
+    while (wal_frames() <= (uint32_t)THRESHOLD * CKPT_HARD_FACTOR)
+        assert_int_equal(commit_rows_with(db_txn_begin, 8), 0);
+    sleep_ms(10);                     /* past the writers' probe interval */
+
+    bulk_t b;
+    memset(&b, 0, sizeof(b));
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, bulk_main, &b), 0);
+    sleep_ms(100);
+    assert_int_equal(atomic_load(&b.done), 0);       /* held */
+
+    uint64_t t0 = now_ms();
+    assert_int_equal(db_write(db, "INSERT INTO t (v) VALUES ('a tag')", NULL, NULL), 0);
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_txn_commit(db), OK);
+    uint64_t api_ms = now_ms() - t0;
+    assert_int_equal(atomic_load(&b.done), 0);       /* still held */
+
+    checkpointer_set_test_idle(0);
+    pthread_join(th, NULL);
+    checkpointer_stats_t s;
+    checkpointer_stats(&s);
+    print_message("  request writes took %llu ms while a bulk writer waited %llu ms; "
+                  "%lu held\n", (unsigned long long)api_ms,
+                  (unsigned long long)b.waited_ms, s.throttled);
+    assert_true(api_ms < 100);
+    assert_int_equal(b.rc, 0);
+    assert_true(b.waited_ms >= 100);
+    assert_true(s.throttled >= 1);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -317,6 +387,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_wal_stays_near_the_cap_under_a_long_writer, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_is_bounded_under_a_writer_faster_than_checkpoints, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_hard_cap_holds_on_a_slow_device, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_only_bulk_writers_wait_at_the_hard_cap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pinned_reader_holds_nobody_up, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
