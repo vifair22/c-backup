@@ -6,6 +6,7 @@
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
 #include "db_txn.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -236,7 +237,7 @@ status_t repo_tags_restore(cutils_db_t *db, int64_t repo_id, const char *repo_pa
         if (!match) { skipped++; continue; }
 
         int affected = 0;
-        if (db_execute_non_query(db,
+        if (db_write(db,
                 "INSERT INTO tags (repo_id, name, snap_id, created_at)"
                 " VALUES (?, ?, ?, ?) ON CONFLICT(repo_id, name) DO NOTHING",
                 (const char *[]){ repo, name->valuestring, sid, created, NULL },

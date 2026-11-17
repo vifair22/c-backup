@@ -11,6 +11,7 @@
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "db_write.h"
 
 #include <openssl/crypto.h>
 
@@ -356,9 +357,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         /* From the marker, not the request: an adopted repository brings
          * its own mode, and recording what was asked for would be wrong. */
         if (reg.enc_mode != REPO_ENC_NONE &&
-            db_execute_non_query(db, "UPDATE repos SET encryption = ? WHERE id = ?",
-                                 (const char *[]){ repo_enc_mode_name(reg.enc_mode),
-                                                   idbuf, NULL }, NULL) != 0)
+            db_write(db, "UPDATE repos SET encryption = ? WHERE id = ?",
+                     (const char *[]){ repo_enc_mode_name(reg.enc_mode),
+                                       idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: cannot record encryption mode", (long long)id);
 
         char *body = NULL;
@@ -394,8 +395,8 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         /* A passphrase repository is recoverable from the repository itself,
          * so there is nothing for the operator to file away. */
         if (reg.enc_mode == REPO_ENC_PASSPHRASE &&
-            db_execute_non_query(db, "UPDATE repos SET key_escrowed = 1 WHERE id = ?",
-                                 (const char *[]){ idbuf, NULL }, NULL) != 0)
+            db_write(db, "UPDATE repos SET key_escrowed = 1 WHERE id = ?",
+                     (const char *[]){ idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: cannot record escrow state", (long long)id);
 
         log_info("registered repo %lld at %s (%s)", (long long)id, path,
@@ -823,7 +824,7 @@ static api_response_t key_ack(const api_request_t *req, int64_t repo_id)
         return api_error(400, "repository is not encrypted; there is no key to escrow");
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)repo_id);
-    if (db_execute_non_query(g_db_for_keys,
+    if (db_write(g_db_for_keys,
             "UPDATE repos SET key_escrowed = 1 WHERE id = ?",
             (const char *[]){ id, NULL }, NULL) != 0)
         return api_error(500, "cannot record escrow state");

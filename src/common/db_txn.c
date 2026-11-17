@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "db_txn.h"
+#include "db_write.h"
 
 #include "phase_timer.h"
 #include "wal_sync.h"
@@ -8,6 +9,8 @@
 #include <cutils/log.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sqlite3.h>
+#include <stdlib.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
@@ -235,4 +238,155 @@ status_t db_txn_exclusive(status_t (*fn)(void *), void *arg)
 unsigned long db_txn_durable_count(void)
 {
     return atomic_load_explicit(&g_durable, memory_order_relaxed);
+}
+
+/* ---- Writes outside a transaction (B157) ------------------------------ */
+
+int db_txn_held(void)
+{
+    return tls_held;
+}
+
+int db_write_enter(cutils_db_t *db)
+{
+    if (tls_held) return 0;
+    if (db_txn_begin(db) != OK) {
+        log_error("db_write: %s", err_msg());
+        err_clear();
+        return -1;
+    }
+    return 1;
+}
+
+int db_write_leave(cutils_db_t *db, int began, int ok)
+{
+    if (began != 1) return ok ? 0 : -1;
+    if (!ok) {
+        db_txn_rollback(db);
+        return -1;
+    }
+    if (db_txn_commit(db) != OK) {
+        log_error("db_write: %s", err_msg());
+        err_clear();
+        return -1;
+    }
+    return 0;
+}
+
+int db_write(cutils_db_t *db, const char *sql, const char **params, int *affected)
+{
+    int began = db_write_enter(db);
+    if (began < 0) return -1;
+    int rc = db_execute_non_query(db, sql, params, affected);
+    return db_write_leave(db, began, rc == 0);
+}
+
+int db_write_returning(cutils_db_t *db, const char *sql, const char **params,
+                       db_result_t **out)
+{
+    *out = NULL;
+    int began = db_write_enter(db);
+    if (began < 0) return -1;
+    int rc = db_execute(db, sql, params, out);
+    if (db_write_leave(db, began, rc == 0) != 0) {
+        db_result_free(*out);
+        *out = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+int db_write_batch_open(db_write_batch_t *b, cutils_db_t *db)
+{
+    b->db = db;
+    b->since = 0;
+    b->began = db_write_enter(db);
+    return b->began < 0 ? -1 : 0;
+}
+
+int db_write_batch_next(db_write_batch_t *b)
+{
+    if (b->began != 1) return b->began < 0 ? -1 : 0;
+    if (++b->since < DB_WRITE_BATCH_ROWS && db_txn_waiters() == 0) return 0;
+    b->began = 0;
+    if (db_write_leave(b->db, 1, 1) != 0) { b->began = -1; return -1; }
+    return db_write_batch_open(b, b->db);
+}
+
+int db_write_batch_close(db_write_batch_t *b, int ok)
+{
+    if (b->began < 0) return -1;
+    int rc = db_write_leave(b->db, b->began, ok);
+    b->began = -1;
+    return rc;
+}
+
+/*
+ * The update hook fires on the thread running the statement, once per row
+ * changed in a rowid table, which every table in the schema is. It does not
+ * fire for SQLite's own tables (sqlite_sequence) or for the rows an FTS5
+ * table writes on behalf of a statement that was itself checked, so it
+ * reports exactly the statements this module is about. tls_held is the
+ * calling thread's, so the test is one load.
+ */
+static atomic_int   g_guard_armed;
+static atomic_ulong g_guard_violations;
+static int          g_guard_abort = -1;   /* -1: environment not read yet */
+
+#define GUARD_LOG_MAX 64
+
+static void guard_hook(void *arg, int op, const char *dbname, const char *table,
+                       sqlite3_int64 rowid)
+{
+    (void)arg;
+    (void)rowid;
+    if (!atomic_load_explicit(&g_guard_armed, memory_order_relaxed) || tls_held) return;
+    if (!dbname || strcmp(dbname, "main") != 0) return;
+    /* c-utils' own tables, written by c-utils' own threads on this same
+     * connection: the log writer inserts every log line into logs, the push
+     * worker queues and retires alerts in push, and config is seeded at
+     * open. None of them can go through db_write from here, and all three
+     * share the hazard; it is c-utils' to fix (B157 report), and reporting
+     * every log line would bury the violations this guard is for. */
+    if (table && (strcmp(table, "logs") == 0 || strcmp(table, "push") == 0 ||
+                  strcmp(table, "config") == 0))
+        return;
+    unsigned long n = atomic_fetch_add_explicit(&g_guard_violations, 1,
+                                                memory_order_relaxed) + 1;
+    if (n <= GUARD_LOG_MAX)
+        log_error("db_txn guard: %s on %s outside a write transaction (B157); "
+                  "it would commit or roll back with another thread's work",
+                  op == SQLITE_INSERT ? "INSERT" : op == SQLITE_DELETE ? "DELETE" : "UPDATE",
+                  table ? table : "?");
+    if (g_guard_abort == 1) abort();
+}
+
+static int guard_ext(sqlite3 *conn, char **err, const sqlite3_api_routines *api)
+{
+    (void)err;
+    (void)api;
+    sqlite3_update_hook(conn, guard_hook, NULL);
+    return SQLITE_OK;
+}
+
+void db_txn_guard_install(void)
+{
+    if (g_guard_abort < 0) {
+        const char *e = getenv("C_BACKUP_TXN_GUARD");
+        g_guard_abort = e && strcmp(e, "abort") == 0;
+    }
+    /* Registering the same entry point twice is a no-op in SQLite. */
+    if (sqlite3_auto_extension((void (*)(void))guard_ext) != SQLITE_OK)
+        log_warn("db_txn guard: cannot register; writes outside a transaction "
+                 "will not be reported");
+}
+
+void db_txn_guard_arm(int on)
+{
+    atomic_store_explicit(&g_guard_armed, on ? 1 : 0, memory_order_relaxed);
+}
+
+unsigned long db_txn_guard_violations(void)
+{
+    return atomic_load_explicit(&g_guard_violations, memory_order_relaxed);
 }
