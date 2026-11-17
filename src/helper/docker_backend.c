@@ -797,11 +797,12 @@ static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, struct sp_s
         hooklog_t log;
         memset(&log, 0, sizeof(log));
         int code = run_hook(c, unit_id, h, tail, sizeof(tail), &log);
-        if (code != 0) {
-            char line[64];
-            snprintf(line, sizeof(line), "\n[c-backup: exit status %d]\n", code);
-            (void)hooklog_append(&log, line, strlen(line));
-        }
+        /* Always, 0 included, as the LXC and dump hooks do: a run hook that
+         * succeeded silently left an empty log, where the Manual promises
+         * one that is never empty (B174). */
+        char line[64];
+        snprintf(line, sizeof(line), "\n[c-backup: exit status %d]\n", code);
+        (void)hooklog_append(&log, line, strlen(line));
         size_t llen = 0;
         char *ltxt = hooklog_render(&log, &llen);
         hooklog_free(&log);
