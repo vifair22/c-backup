@@ -225,9 +225,33 @@ fi
 
 log "build: c-utils"
 make -s -C "$CUTILS" -j"$JOBS" >"$WORK/build-cutils.log" 2>&1 || { tail -40 "$WORK/build-cutils.log"; die "c-utils build failed"; }
-log "build: c-backupd, c-backup, c-backup-helper"
-make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic -j"$JOBS" all \
-    >"$WORK/build.log" 2>&1 || { tail -60 "$WORK/build.log"; die "build failed"; }
+# CBK_SANITIZE=1 (the real-engines-asan job, B192): the ASan+UBSan build
+# of the three programs, put where the release ones would be, so every step
+# below runs them unchanged. UBSan does not recover (-fno-sanitize-recover)
+# and ASan halts on its first error, so a finding kills the program at the
+# fault and the run fails there; each report also lands in $SAN_DIR, which
+# the end of the run checks is empty. Leaks are left to the unit suites'
+# ASan job: the programs here are stopped by signal at teardown, after the
+# summary.
+SAN_DIR="$WORK/sanitizer"
+if [ "${CBK_SANITIZE:-0}" = 1 ]; then
+    log "build: c-backupd, c-backup, c-backup-helper with ASan and UBSan"
+    make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic -j"$JOBS" BUILD_TYPE=asan _build \
+        >"$WORK/build.log" 2>&1 || { tail -60 "$WORK/build.log"; die "sanitizer build failed"; }
+    for b in c-backupd c-backup c-backup-helper; do
+        [ -x "$SRC/build/bins/$b-asan" ] || die "build produced no $b-asan"
+        cp -f "$SRC/build/bins/$b-asan" "$SRC/build/bins/$b"
+    done
+    # 1777: the daemon writes its reports after it drops to uid 990, and a
+    # report it cannot open goes nowhere (ASan says only "Can't open file").
+    mkdir -p "$SAN_DIR" && chmod 1777 "$SAN_DIR"
+    export ASAN_OPTIONS="halt_on_error=1:detect_leaks=0:detect_stack_use_after_return=1:log_path=$SAN_DIR/asan"
+    export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:log_path=$SAN_DIR/ubsan"
+else
+    log "build: c-backupd, c-backup, c-backup-helper"
+    make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic -j"$JOBS" all \
+        >"$WORK/build.log" 2>&1 || { tail -60 "$WORK/build.log"; die "build failed"; }
+fi
 for b in c-backupd c-backup c-backup-helper; do
     [ -x "$SRC/build/bins/$b" ] || die "build produced no $b"
 done
@@ -792,6 +816,18 @@ else
 fi
 
 # ---- the end -------------------------------------------------------------
+
+if [ "${CBK_SANITIZE:-0}" = 1 ]; then
+    log "sanitizer reports"
+    reports=$(ls -A "$SAN_DIR" 2>/dev/null)
+    check "no ASan or UBSan report from the daemon, the CLI or the helper" "" "$reports"
+    for f in $reports; do echo "---- $f"; head -60 "$SAN_DIR/$f"; done
+    # A report that could not be written, or one a program printed itself,
+    # is in its log instead.
+    check "no sanitizer finding in the daemon's or the helper's log" 0 \
+        "$(cat "$WORK/daemon.log" "$WORK/helper.log" 2>/dev/null |
+           grep -cE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|Can.t open file: .*/sanitizer/')"
+fi
 
 log "final leftovers"
 check "the daemon is still running" 0 "$(kill -0 "$DAEMON_PID" 2>/dev/null; echo $?)"

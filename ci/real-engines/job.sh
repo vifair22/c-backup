@@ -115,6 +115,7 @@ docker create --rm --init --privileged --network none \
     --label "cbk.ci.started=$(date +%s)" \
     -e "CBK_LIFETIME_S=$LIFETIME" \
     ${CBK_POOL_MB:+-e "CBK_POOL_MB=$CBK_POOL_MB"} \
+    ${CBK_SANITIZE:+-e "CBK_SANITIZE=$CBK_SANITIZE"} \
     --name "$NAME" "$IMAGE" >/dev/null
 
 # The tree as it is checked out (the merged result in an MR pipeline),
