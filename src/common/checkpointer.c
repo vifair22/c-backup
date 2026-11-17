@@ -3,6 +3,7 @@
 #include "checkpointer.h"
 
 #include "db_txn.h"
+#include "thread_name.h"
 #include "walidx.h"
 
 #include <cutils/db.h>
@@ -296,6 +297,7 @@ void checkpointer_throttle(void)
 
 static void *main_loop(void *arg)
 {
+    thread_name("cb-checkpoint");
     (void)arg;
     pthread_mutex_lock(&g_mu);
     while (!g_stop) {

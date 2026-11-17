@@ -6,6 +6,7 @@
 #include "db_txn.h"
 #include "registry.h"
 #include "db_write.h"
+#include "thread_name.h"
 
 #include <cutils/log.h>
 
@@ -478,6 +479,7 @@ static struct {
 
 static void *wd_main(void *arg)
 {
+    thread_name("cb-units-wd");
     (void)arg;
     pthread_mutex_lock(&g_wd.mu);
     while (!g_wd.stop) {

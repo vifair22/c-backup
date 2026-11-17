@@ -76,6 +76,10 @@ status_t store_index_fix_absent(cutils_db_t *db, int64_t repo_id);
  * a power cut there, with no further commits and no cleanup. */
 void store_index_set_pack_batch_rows(uint32_t rows);
 void store_index_set_commit_gate(status_t (*gate)(void));
+/* For tests: asked before a pack commit's final COMMIT; non-zero makes it a
+ * commit that failed (not a power cut): rolled back, cleaned up, and
+ * reported to the seal through store_pack_commit_failed. */
+void store_index_set_commit_fault(int (*fault)(void));
 
 /* Record an object the repository already holds in an installed pack, as a
  * backup meets one it deduplicated against. A row already there is left as

@@ -340,7 +340,16 @@ typedef struct {
  */
 typedef void (*store_pack_commit_fn)(void *user, const pack_commit_info_t *info);
 void store_set_pack_commit_cb(store_t *st, store_pack_commit_fn cb, void *user);
-void store_emit_pack_commit(store_t *st, const pack_commit_info_t *info);
+/*
+ * ERR_IO when the callback reported, through store_pack_commit_failed on the
+ * thread it ran on, that the rows did not commit. The seal that emitted it
+ * then fails like any other seal: its claims are abandoned, so nothing that
+ * referenced its names can end up in a snapshot (B184). Before, a commit
+ * that failed was logged and the seal reported success, and a backup could
+ * complete naming objects the index did not hold.
+ */
+status_t store_emit_pack_commit(store_t *st, const pack_commit_info_t *info);
+void     store_pack_commit_failed(void);
 
 /*
  * Called when a pack file is removed or about to be replaced wholesale, so

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "store_pool.h"
+#include "thread_name.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -189,6 +190,7 @@ static void pool_io(uint64_t bytes, void *ctx)
 
 static void *worker_main(void *arg)
 {
+    thread_name("cb-file-worker");
     worker_t *wk = arg;
     store_pool_t *pool = wk->pool;
 

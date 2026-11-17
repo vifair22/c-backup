@@ -9,6 +9,7 @@
 #include "store.h"
 #include "progress.h"
 #include "util.h"
+#include "thread_name.h"
 #include <cutils/log.h>
 
 #include <dirent.h>
@@ -1944,6 +1945,7 @@ uint64_t pack_test_encoder_threads(void)
 
 static void *enc_thread(void *arg)
 {
+    thread_name("cb-parity");
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&g_enc.mu);
@@ -2467,9 +2469,9 @@ static status_t announce_pack(store_t *store, uint32_t pack_num, uint64_t size,
         .entry_count = packed,
         .entries     = ce,
     };
-    store_emit_pack_commit(store, &info);
+    status_t st = store_emit_pack_commit(store, &info);
     free(ce);
-    return OK;
+    return st;
 }
 
 /*
@@ -3081,8 +3083,27 @@ static status_t pw_emit(pack_writer_t *pw,
 struct pack_backup_writer {
     pack_writer_t pw;
     staged_set_t  seen;      /* over pw.idx_entries[0 .. pw.packed) */
-    uint32_t      sealed;    /* objects in packs already installed */
+    uint32_t      sealed;    /* objects in packs already installed (atomic) */
     pack_claims_t *claims;   /* shared with other writers, or NULL */
+    /* Whose claims the open pack's names are under; see claim_token. */
+    uintptr_t     owner;
+};
+
+/*
+ * A full pack taken off its writer to be sealed without the writer's lock
+ * (B184): the pack, its staged set, and the claim token its names are under.
+ * The writer carries on with a new pack and a new token, so its later
+ * meetings with these names find them claimed by "another writer" - this
+ * one - and reference them, exactly as other writers do, until the seal's
+ * commit indexes them and drops the claims.
+ */
+struct pack_backup_sealing {
+    pack_writer_t         pw;
+    staged_set_t          seen;
+    pack_backup_writer_t *w;
+    pack_claims_t        *claims;
+    uintptr_t             owner;
+    uint32_t              n;
 };
 
 /* ------------------------------------------------------------------ */
@@ -3100,10 +3121,23 @@ struct pack_backup_writer {
 #define CLAIM_BUCKETS 4096u
 
 typedef struct claim {
-    struct claim               *next;
-    const pack_backup_writer_t *owner;
-    uint8_t                     hash[OBJECT_HASH_SIZE];
+    struct claim *next;
+    uintptr_t     owner;     /* a claim token, see claim_token */
+    uint8_t       hash[OBJECT_HASH_SIZE];
 } claim_t;
+
+/*
+ * Claims are held by a pack, not by a writer: a writer that hands its full
+ * pack to be sealed outside its lock (pack_backup_rollover_begin) starts its
+ * next pack under a new token while the old one's names stay claimed. Tokens
+ * are never reused, so no two live packs can share one; a pointer would be,
+ * once freed and handed back by malloc.
+ */
+static uintptr_t claim_token(void)
+{
+    static _Atomic uintptr_t next = 1;
+    return atomic_fetch_add_explicit(&next, 1, memory_order_relaxed);
+}
 
 struct pack_claims {
     pthread_mutex_t mu;
@@ -3148,7 +3182,7 @@ static unsigned claim_bucket(const uint8_t hash[OBJECT_HASH_SIZE])
 
 /* 1: w owns the claim now (or already did); 0: another writer holds it;
  * -1: out of memory. */
-static int claim_take(pack_claims_t *c, const pack_backup_writer_t *w,
+static int claim_take(pack_claims_t *c, uintptr_t w,
                       const uint8_t hash[OBJECT_HASH_SIZE])
 {
     unsigned k = claim_bucket(hash);
@@ -3172,7 +3206,7 @@ static int claim_take(pack_claims_t *c, const pack_backup_writer_t *w,
 }
 
 /* Drop w's claim on one name, if it holds one. */
-static void claim_drop(pack_claims_t *c, const pack_backup_writer_t *w,
+static void claim_drop(pack_claims_t *c, uintptr_t w,
                        const uint8_t hash[OBJECT_HASH_SIZE])
 {
     unsigned k = claim_bucket(hash);
@@ -3188,15 +3222,21 @@ static void claim_drop(pack_claims_t *c, const pack_backup_writer_t *w,
     pthread_mutex_unlock(&c->mu);
 }
 
-/* Drop w's claims on the n entries of the pack it just sealed or gave up;
- * an abandoned pack's claims are counted, see pack.h. */
+/* Drop a pack's claims on its n entries once it is sealed or given up; an
+ * abandoned pack's claims are counted, see pack.h. */
+static void claims_drop_pack(pack_claims_t *c, uintptr_t owner,
+                             const pack_idx_disk_entry_t *entries, uint32_t n, int abandoned)
+{
+    if (!c) return;
+    for (uint32_t i = 0; i < n; i++)
+        claim_drop(c, owner, entries[i].hash);
+    if (abandoned && n)
+        __atomic_fetch_add(&c->abandoned, (uint64_t)n, __ATOMIC_RELAXED);
+}
+
 static void claims_release(pack_backup_writer_t *w, uint32_t n, int abandoned)
 {
-    if (!w->claims) return;
-    for (uint32_t i = 0; i < n; i++)
-        claim_drop(w->claims, w, w->pw.idx_entries[i].hash);
-    if (abandoned && n)
-        __atomic_fetch_add(&w->claims->abandoned, (uint64_t)n, __ATOMIC_RELAXED);
+    claims_drop_pack(w->claims, w->owner, w->pw.idx_entries, n, abandoned);
 }
 
 void pack_backup_share_claims(pack_backup_writer_t *w, pack_claims_t *c)
@@ -3349,6 +3389,7 @@ status_t pack_backup_open(store_t *store, pack_backup_writer_t **out)
     if (!w) return set_error(ERR_NOMEM, "pack_backup_open: alloc");
 
     w->pw.store = store;
+    w->owner = claim_token();
 
     rs_init();
     *out = w;
@@ -3410,9 +3451,55 @@ status_t pack_backup_rollover(pack_backup_writer_t *w)
     claims_release(w, n, st != OK);
     if (st != OK) return st;
 
-    w->sealed += n;
+    __atomic_fetch_add(&w->sealed, n, __ATOMIC_RELAXED);
     staged_set_free(&w->seen);   /* sealed objects resolve through the index now */
     return OK;
+}
+
+status_t pack_backup_rollover_begin(pack_backup_writer_t *w, pack_backup_sealing_t **out)
+{
+    if (!out) return set_error(ERR_INVALID, "pack_backup_rollover_begin: null argument");
+    *out = NULL;
+    if (!w || !w->pw.dat_f || w->pw.packed == 0) return OK;
+    /* Without a claim set nothing would cover the names between here and
+     * the commit, so this writer's next meeting with one would store it
+     * again: seal in place, as before. */
+    if (!w->claims) return pack_backup_rollover(w);
+    pack_backup_sealing_t *s = calloc(1, sizeof(*s));
+    if (!s) return pack_backup_rollover(w);
+
+    s->pw = w->pw;
+    s->seen = w->seen;
+    s->w = w;
+    s->claims = w->claims;
+    s->owner = w->owner;
+    s->n = w->pw.packed;
+
+    store_t *store = w->pw.store;
+    memset(&w->pw, 0, sizeof(w->pw));
+    w->pw.store = store;
+    memset(&w->seen, 0, sizeof(w->seen));
+    w->owner = claim_token();
+    *out = s;
+    return OK;
+}
+
+status_t pack_backup_rollover_end(pack_backup_sealing_t *s)
+{
+    if (!s) return OK;
+    uint32_t n = s->n;
+    status_t st = pw_finalize(&s->pw);
+    /* After the commit, as in pack_backup_rollover: from here the index
+     * answers for these names. */
+    claims_drop_pack(s->claims, s->owner, s->pw.idx_entries, n, st != OK);
+    if (st == OK) __atomic_fetch_add(&s->w->sealed, n, __ATOMIC_RELAXED);
+    staged_set_free(&s->seen);
+    /* The staging file is gone either way, renamed into place or unlinked
+     * by the failed seal; its name may already be another writer's. */
+    s->pw.dat_tmp[0] = '\0';
+    pw_destroy(&s->pw);
+    free(s);
+    return st;
 }
 
 /*
@@ -3528,13 +3615,13 @@ status_t pack_backup_add_prepared(pack_backup_writer_t *w, const pack_prepared_t
      */
     int claimed = 0;
     if (w->claims) {
-        int c = claim_take(w->claims, w, out_hash);
+        int c = claim_take(w->claims, w->owner, out_hash);
         if (c < 0) return set_error(ERR_NOMEM, "pack_backup_add: claim");
         if (c == 0) return OK;           /* another writer is storing it */
         claimed = 1;
     }
     if (pack_object_exists(w->pw.store, out_hash)) {
-        if (claimed) claim_drop(w->claims, w, out_hash);
+        if (claimed) claim_drop(w->claims, w->owner, out_hash);
         return OK;
     }
 
@@ -3566,7 +3653,7 @@ status_t pack_backup_add_prepared(pack_backup_writer_t *w, const pack_prepared_t
                      pp->payload, pp->payload_len, pp->compression);
     if (st != OK) {
         /* Not written: another writer may store it after all. */
-        if (claimed) claim_drop(w->claims, w, out_hash);
+        if (claimed) claim_drop(w->claims, w->owner, out_hash);
         return st;
     }
 
@@ -3611,7 +3698,7 @@ status_t pack_backup_finish(pack_backup_writer_t *w, uint32_t *out_packed)
         uint32_t n = w->pw.packed;
         st = pw_finalize(&w->pw);
         claims_release(w, n, st != OK);
-        if (st == OK) w->sealed += n;
+        if (st == OK) __atomic_fetch_add(&w->sealed, n, __ATOMIC_RELAXED);
     } else if (w->pw.dat_f) {
         /* Opened and nothing arrived. An empty pack is a file every later
          * enumeration has to open to learn it holds nothing. */
@@ -3621,7 +3708,7 @@ status_t pack_backup_finish(pack_backup_writer_t *w, uint32_t *out_packed)
         w->pw.dat_tmp[0] = '\0';
     }
 
-    if (out_packed) *out_packed = w->sealed;
+    if (out_packed) *out_packed = __atomic_load_n(&w->sealed, __ATOMIC_RELAXED);
     pack_backup_free(w);
     return st;
 }

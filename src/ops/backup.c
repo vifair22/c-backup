@@ -788,10 +788,20 @@ static status_t bsink_add_prepared(bsink_t *s, const pack_prepared_t *pp,
                                    int *out_is_new, uint64_t *out_phys)
 {
     status_t st = OK;
+    /*
+     * A full pack is sealed after the lock is let go (B184). Every chunk
+     * worker of the file appends through this lock, and the seal - parity,
+     * fsyncs, the install and the index commit - used to run inside it, so
+     * they all waited for the disk: 387 s of chunk-thread waits on this
+     * mutex for a 16 GiB backup on NVMe, 541 s with syncs at 40 ms. Now the
+     * full pack is taken off the writer here and sealed below, by the
+     * thread that filled it, while the others append to the next one.
+     */
+    pack_backup_sealing_t *sealing = NULL;
     pthread_mutex_lock(&s->mu);
     if (s->may_rollover && pack_backup_full(s->pw, pp->payload_len)) {
         st = bsink_flush(s, 1);
-        if (st == OK) st = pack_backup_rollover(s->pw);
+        if (st == OK) st = pack_backup_rollover_begin(s->pw, &sealing);
     }
     int is_new = 0;
     uint64_t phys = 0;
@@ -824,6 +834,23 @@ static status_t bsink_add_prepared(bsink_t *s, const pack_prepared_t *pp,
                  err_msg()[0] ? err_msg() : "the repository write failed (no detail recorded)");
     }
     pthread_mutex_unlock(&s->mu);
+    if (sealing) {
+        /* A seal that fails here is the sink's failure like any other: the
+         * file fails with it (B182) whatever its settle makes of the error,
+         * and the pack's claims are abandoned, so every file that referenced
+         * one of its names fails the run (store_content). */
+        status_t sst = pack_backup_rollover_end(sealing);
+        if (sst != OK) {
+            pthread_mutex_lock(&s->mu);
+            if (s->failed == OK) {
+                s->failed = sst;
+                snprintf(s->failed_msg, sizeof(s->failed_msg), "%s",
+                         err_msg()[0] ? err_msg() : "a pack seal failed (no detail recorded)");
+            }
+            pthread_mutex_unlock(&s->mu);
+            if (st == OK) st = sst;
+        }
+    }
     *out_is_new = is_new;
     *out_phys = phys;
     return st;
@@ -1535,10 +1562,15 @@ static status_t store_content(pipeline_t *p)
         pack_backup_share_claims(p->pack_w, NULL);
         pack_claims_free(p->claims);
         p->claims = NULL;
-        if (st == OK && lost) {
-            st = set_error(ERR_IO, "backup: %llu chunk(s) another writer was storing "
-                           "were never committed", (unsigned long long)lost);
-            snprintf(why, sizeof(why), "%s", err_msg());
+        if (lost) {
+            /* Files recorded this run may name those chunks; their cache rows
+             * would let the next run reuse them unread (B184). */
+            file_cache_forget_run(p->db, p->repo_id, p->cache_stamp);
+            if (st == OK) {
+                st = set_error(ERR_IO, "backup: %llu chunk(s) another writer was storing "
+                               "were never committed", (unsigned long long)lost);
+                snprintf(why, sizeof(why), "%s", err_msg());
+            }
         }
     }
     cdc_workers_stop(p->cdc_w);
