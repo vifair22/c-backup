@@ -1314,6 +1314,41 @@ static void *wd_main(void *arg)
 /* Start and stop                                                      */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The socket's owner, group and mode, logged at start; and a loud warning
+ * when the daemon could not reach it: each directory on the way must let a
+ * member of daemon_gid (or daemon_uid itself) search it, and the socket
+ * must be writable by that group. Nothing here fails the start, because
+ * the helper cannot know every group the daemon's uid holds; it says what
+ * it sees instead of leaving a refused connect as the only symptom.
+ */
+static void socket_report(const char *path, uid_t uid, gid_t gid)
+{
+    struct stat sb;
+    if (stat(path, &sb) != 0) { log_warn("helper: cannot stat %s: %s", path, strerror(errno)); return; }
+    log_info("helper: socket %s owner %u group %u mode %04o", path, (unsigned)sb.st_uid,
+             (unsigned)sb.st_gid, (unsigned)(sb.st_mode & 07777));
+    if (!(sb.st_gid == gid && (sb.st_mode & S_IWGRP)) && !(sb.st_uid == uid && (sb.st_mode & S_IWUSR)) &&
+        !(sb.st_mode & S_IWOTH))
+        log_warn("helper: WARNING: the daemon (uid %u, gid %u) cannot write to socket %s (owner %u "
+                 "group %u mode %04o); it will be refused at connect", (unsigned)uid, (unsigned)gid, path,
+                 (unsigned)sb.st_uid, (unsigned)sb.st_gid, (unsigned)(sb.st_mode & 07777));
+    char p[4096];
+    snprintf(p, sizeof(p), "%s", path);
+    for (char *c = strrchr(p, '/'); c && c > p; c = strrchr(p, '/')) {
+        *c = '\0';
+        struct stat d;
+        if (stat(p, &d) != 0) continue;
+        int ok = (d.st_mode & S_IXOTH) || (d.st_gid == gid && (d.st_mode & S_IXGRP)) ||
+                 (d.st_uid == uid && (d.st_mode & S_IXUSR));
+        if (!ok)
+            log_warn("helper: WARNING: no member of group %u (nor uid %u) can enter %s (owner %u "
+                     "group %u mode %04o), so the daemon cannot reach socket %s; give the "
+                     "directory to that group or make it searchable", (unsigned)gid, (unsigned)uid, p,
+                     (unsigned)d.st_uid, (unsigned)d.st_gid, (unsigned)(d.st_mode & 07777), path);
+    }
+}
+
 static status_t listen_on(helper_server_t *s)
 {
     const char *path = s->pol->socket;
@@ -1333,17 +1368,20 @@ static status_t listen_on(helper_server_t *s)
         return set_error_errno(ERR_IO, "helper: bind %s", path);
     }
     /* 0660 root:root let nobody but root connect: the daemon, running as
-     * daemon_uid with its own gid (security.run_as_uid sets both), had no
-     * write permission on the socket and connect failed with EACCES.
-     * The group is the daemon's; SO_PEERCRED still refuses every uid but
-     * daemon_uid on each connection. */
-    if (geteuid() == 0 && chown(path, (uid_t)-1, (gid_t)s->pol->daemon_uid) != 0) {
+     * daemon_uid with its own gid, had no write permission on the socket
+     * and connect failed with EACCES. The group is daemon_gid (default
+     * daemon_uid, what security.run_as_uid gives the daemon); SO_PEERCRED
+     * still refuses every uid but daemon_uid on each connection. Root may
+     * give any group; anyone else only one of their own, which is all a
+     * helper run unprivileged (tests) can serve anyway. */
+    if (chown(path, (uid_t)-1, s->pol->daemon_gid) != 0 && (geteuid() == 0 || errno != EPERM)) {
         int err = errno;
         close(fd);
         (void)unlink(path);
         errno = err;
-        return set_error_errno(ERR_IO, "helper: chown %s to group %u", path, (unsigned)s->pol->daemon_uid);
+        return set_error_errno(ERR_IO, "helper: chown %s to group %u", path, (unsigned)s->pol->daemon_gid);
     }
+    socket_report(path, s->pol->daemon_uid, s->pol->daemon_gid);
     s->lfd = fd;
     return OK;
 }
