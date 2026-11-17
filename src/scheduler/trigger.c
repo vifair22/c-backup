@@ -2,12 +2,12 @@
 
 #include "trigger.h"
 #include "json_row.h"
+#include "weekday.h"
 
 #include <cutils/json.h>
 
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>   /* strcasecmp */
 
 static int days_in_month(int year, int month)   /* month 1-12 */
 {
@@ -170,15 +170,6 @@ time_t trigger_next_fire(const trigger_t *t, time_t after, time_t last_fired)
     return 0;
 }
 
-static int weekday_from_name(const char *s)
-{
-    static const char *names[] = { "sunday", "monday", "tuesday", "wednesday",
-                                   "thursday", "friday", "saturday" };
-    for (int i = 0; i < 7; i++)
-        if (strcasecmp(s, names[i]) == 0) return i;
-    return -1;
-}
-
 /* "HH:MM", 24-hour. */
 static int parse_at(const char *s, int *hour, int *min)
 {
@@ -278,8 +269,9 @@ status_t trigger_parse_at(const struct cutils_json_req *creq, const char *prefix
         out->every = CAL_WEEK;
         path_of(path, sizeof(path), prefix, "on");
         if (json_req_get_str(req, path, &on) != 0 || !on ||
-            (out->on_weekday = weekday_from_name(on)) < 0) {
-            st = set_error(ERR_INVALID, "weekly trigger: on must be a weekday name");
+            (out->on_weekday = weekday_parse(on)) < 0) {
+            st = set_error(ERR_INVALID, "weekly trigger: on must be a weekday name"
+                                        " or its first three letters (sunday or sun)");
             goto done;
         }
     } else if (strcmp(every, "month") == 0) {
@@ -358,8 +350,6 @@ status_t trigger_serialise(const trigger_t *t, char *buf, size_t bufsz)
         n = snprintf(buf, bufsz, "{\"type\":\"interval\",\"seconds\":%lld}",
                      (long long)t->seconds);
     } else {
-        static const char *days[] = { "sunday","monday","tuesday","wednesday",
-                                      "thursday","friday","saturday" };
         switch (t->every) {
             case CAL_DAY:
                 n = snprintf(buf, bufsz,
@@ -370,7 +360,7 @@ status_t trigger_serialise(const trigger_t *t, char *buf, size_t bufsz)
                 n = snprintf(buf, bufsz,
                     "{\"type\":\"calendar\",\"every\":\"week\",\"on\":\"%s\","
                     "\"at\":\"%02d:%02d\"}",
-                    days[t->on_weekday % 7], t->at_hour, t->at_min);
+                    weekday_name(t->on_weekday % 7), t->at_hour, t->at_min);
                 break;
             case CAL_MONTH:
                 n = snprintf(buf, bufsz,

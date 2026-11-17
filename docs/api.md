@@ -1303,15 +1303,18 @@ time:
 {"action":"gc","trigger":{"type":"calendar","every":"year","on_month":1,"on_day":1,"at":"05:00"}}
 ```
 
-`every` is `day`, `week` (with `on`, a weekday name), `month` (with
+`every` is `day`, `week` (with `on`, a weekday: the full name or its first
+three letters, in any case, stored and served as the full lowercase name),
+`month` (with
 `on_day`, 1-31) or `year` (with `on_month` and `on_day`, a day that month
 has: 30 February and 31 April are refused, 29 February is accepted). There
 is no cron syntax. The CLI builds the same with `--every`, `--at`, `--on`, `--on-day`
 and `--on-month`, or takes a number of seconds for an interval.
 
-Interval triggers anchor to the last successful fire, not to wall-clock
-multiples: a four-hour backup that runs long should not be due the moment it
-finishes.
+Interval triggers anchor to the last time the schedule fired, or until its
+first fire to when it was created, not to wall-clock multiples: a four-hour
+backup that runs long should not be due the moment it finishes. A daemon
+restart does not move the anchor.
 
 Calendar triggers use local time, which is what someone means by "02:00".
 That choice creates the DST cases, all handled: a time that does not exist on

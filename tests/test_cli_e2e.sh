@@ -1935,7 +1935,7 @@ CHOICE_SWEEP=(
     "schedule add|1 backup --every day --at 24:00|--at takes a 24-hour HH:MM, not '24:00'"
     "schedule add|1 backup --every day --at noon|--at takes a 24-hour HH:MM"
     "schedule add|1 backup --every week --at 01:00|--every week needs --on WEEKDAY"
-    "schedule add|1 backup --every week --at 01:00 --on someday|--on takes a weekday name"
+    "schedule add|1 backup --every week --at 01:00 --on someday|--on takes a weekday, full or three letters"
     "schedule add|1 backup --every day --at 01:00 --on monday|--on names a weekday, which only --every week uses"
     "schedule add|1 backup --every month --at 01:00|--every month needs --on-day N"
     "schedule add|1 backup --every day --at 01:00 --on-day 3|--on-day is for --every month or year, not day"
@@ -1959,6 +1959,17 @@ check "and the state did not move for those either" "$STATE_BEFORE" "$(b127_stat
 # `all`, the daemon's default, is now in the CLI's list.
 contains "a weekday in capitals is accepted" '"id"' \
     "$(cb schedule add 1 gfs --every week --on Sunday --at 03:00)"
+# NIT-28: the three-letter form in any case, by the CLI and the daemon, and
+# stored as the full lowercase name the list serves back.
+contains "a three-letter weekday is accepted" '"id"' \
+    "$(cb schedule add 1 verify --every week --at 03:00 --on FRI)"
+contains "a mixed-case abbreviation is accepted" '"id"' \
+    "$(cb schedule add 1 verify --every week --at 03:00 --on Tue)"
+NIT28_LIST=$(cb schedule list 1)
+contains "an abbreviation is stored as the full name" '"on":"friday"' "$NIT28_LIST"
+contains "and in lowercase" '"on":"tuesday"' "$NIT28_LIST"
+contains "four letters is not an abbreviation" 'three letters in any case' \
+    "$(cb schedule add 1 verify --every week --at 03:00 --on tues 2>&1)"
 contains "objects --location all answers" '"objects"' "$(cb objects 1 --location all --limit 1)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

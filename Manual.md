@@ -1292,14 +1292,22 @@ than ignored. Every option with a fixed set of values (`--every`, `--level`,
 `--location`, `--encrypt`, `--on-overlap`, `--catchup`, `--scope`) refuses
 anything else before a request is sent.
 
-**Interval** triggers anchor to the last successful run, not to wall-clock
+**Interval** triggers anchor to the schedule's last fire, not to wall-clock
 multiples: a long backup does not make the next one due the moment it ends.
+Before its first fire the anchor is the moment the schedule was created, so
+`schedule add 1 backup 86400` first runs a day after it was added however
+often the daemon restarts in between. The anchor is the fire, not the job's
+outcome: a run that failed was still that window's run, the next one is due
+one interval after it, and a restart does not retry it (only a window the
+daemon was down for counts as missed, below).
 
 **Calendar** triggers use the daemon's local time: the host's under systemd,
 UTC in the Docker image unless `TZ` is set (section 2.3). `schedule list`
 names the zone (`timezone`) and gives each next fire with its offset
 (`next_due_iso`). `every` is `day`, `week`
-(with `--on <weekday>`), `month` (with `--on-day 1-31`) or `year` (with
+(with `--on <weekday>`: the full name or its first three letters, in any
+case, so `sunday`, `Sun` and `SUN` are one day, listed as `sunday`), `month`
+(with `--on-day 1-31`) or `year` (with
 `--on-month` and `--on-day`). The edge cases are handled: a time that does
 not exist on a spring-forward day still fires once, a time that occurs twice
 on a fall-back day fires once, the 31st clamps to the last day of shorter
@@ -1311,7 +1319,7 @@ Two policies per schedule:
 | Option | Values | Meaning |
 |---|---|---|
 | `--on-overlap` | `skip` (default), `queue`, `cancel_running` | The schedule comes due while its previous run is still going |
-| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next, or fire once now. Applies to a schedule's first window too |
+| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next window on the schedule's own interval or calendar, or fire once at start and count on from that fire. Never once per missed window. Applies to a schedule's first window too |
 
 Any other value is refused when the schedule is created.
 

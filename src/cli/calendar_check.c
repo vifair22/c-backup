@@ -1,11 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "calendar_check.h"
+#include "weekday.h"
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>
 
 #if defined(__GNUC__)
 __attribute__((format(printf, 3, 4)))
@@ -17,16 +17,6 @@ static int why(char *msg, size_t n, const char *fmt, ...)
     vsnprintf(msg, n, fmt, ap);
     va_end(ap);
     return -1;
-}
-
-/* The names trigger_parse_at accepts, in any case. */
-static int is_weekday(const char *s)
-{
-    static const char *const days[] = { "sunday", "monday", "tuesday", "wednesday",
-                                        "thursday", "friday", "saturday" };
-    for (size_t i = 0; i < sizeof(days) / sizeof(days[0]); i++)
-        if (strcasecmp(s, days[i]) == 0) return 1;
-    return 0;
 }
 
 int calendar_check(const char *every, const char *at, const char *on,
@@ -57,8 +47,9 @@ int calendar_check(const char *every, const char *at, const char *on,
         return why(msg, n, "--every week needs --on WEEKDAY");
     if (!week && on)
         return why(msg, n, "--on names a weekday, which only --every week uses");
-    if (on && !is_weekday(on))
-        return why(msg, n, "--on takes a weekday name (monday to sunday), not '%s'", on);
+    if (on && weekday_parse(on) < 0)
+        return why(msg, n, "--on takes a weekday, full or three letters in any "
+                           "case (sunday, Sun, MON), not '%s'", on);
     if ((month || year) && !on_day)
         return why(msg, n, "--every %s needs --on-day N", every);
     if (!month && !year && on_day)
