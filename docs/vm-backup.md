@@ -945,6 +945,23 @@ would redefine as a side effect); and a sweep of checkpoints that carry our
 description but that no record names, which arise only when the helper's
 state directory is lost (their bitmaps then stay in the images).
 
+**Known gap: a checkpoint orphaned by a power cut.** The helper commits a
+session's new checkpoint on the domain before the daemon's `unit_tokens`
+commit is durable: state.db runs `synchronous=normal`, and the token is
+written in an ordinary commit after the snapshot, not behind a
+`make_durable`. A power cut on the daemon's host in that window keeps the
+checkpoint on the domain and loses the binding, so the token still names
+the previous checkpoint. The next session is safe - its base is not the
+domain's current checkpoint, so it reads in full (`token-invalid`) and
+binds a new one - but nothing retires the orphan: the session retires only
+the base its token named, and the sweep of unnamed `cbk-*` checkpoints is
+not built (above). Its bitmap stays in the images until an operator deletes
+it with `virsh checkpoint-delete`. The power-cut harness
+(`tests/test_powercut_fault.c`, the unit scenarios) proves the restores and
+the next session correct at every cut, but its fake provider keeps one
+checkpoint per unit, so it cannot see the orphan; the sweep, or a
+`make_durable` before the session commits, closes it.
+
 **Tests.** `test_vm_delta` (2,100 randomised sessions equal to a full read,
 wrong changed sets, the estimate, the resync bound), `test_units_incremental`
 (the daemon's chain and every staleness case through the fake provider) and
