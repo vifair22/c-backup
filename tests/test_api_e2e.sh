@@ -915,11 +915,14 @@ check "a negative offset is out of range" \
 # NIT-8: a number too large to represent is out of range, as it is in a
 # body; these were read as the maximum and answered 200.
 LRANGE='limit is out of range; it must be from 1 to 1000 (a larger one, up to 9007199254740992, is reduced to 1000)'
-for v in 1e999 99999999999999999999 9007199254740994; do
+# UAT low: 2^53 + 1 rounds to 2^53 through a double and was accepted.
+for v in 1e999 99999999999999999999 9007199254740994 9007199254740993 00009007199254740993; do
     check "limit=$v is out of range" "{\"error\":\"$LRANGE\"} 400" "$(sock_send GET "/jobs?limit=$v")"
 done
 check "limit=9007199254740992 is still clamped" 200 "$(sock_code '/jobs?limit=9007199254740992')"
 check "an unrepresentable offset is out of range" 400 "$(sock_code '/jobs?offset=1e999')"
+check "offset=2^53+1 is out of range" 400 "$(sock_code '/jobs?offset=9007199254740993')"
+check "offset=2^53 is still an empty page" 200 "$(sock_code '/jobs?offset=9007199254740992')"
 # NIT-8: an id in the path is parsed, not routed. These were a 405, a 404
 # and a 404, while /repos/-1 was already a 400.
 for v in 99999999999999999999 1e999 -1 0 1.5 abc; do

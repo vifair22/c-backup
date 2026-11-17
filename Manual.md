@@ -292,8 +292,13 @@ docker run -d --name c-backupd \
   `-v /etc/localtime:/etc/localtime:ro`; `TZ` wins if both are given.
   `c-backup schedule list` reports the zone in use (`timezone`) and each
   schedule's next fire with its offset (`next_due_iso`), so a wrong zone is
-  visible before anything fires at the wrong hour. Changing the zone takes
-  effect at the next daemon start.
+  visible before anything fires at the wrong hour. The daemon also logs
+  the zone at start (`time zone: America/Chicago`). With the bind mount
+  there is no name in the file itself, so the zone is reported by its
+  abbreviation (`CST`) unless `/etc/timezone` names the same zone. A `TZ`
+  the system has no zone for, such as a misspelt `America/Chicgo`, makes
+  the C library run in UTC: the daemon warns at start and `timezone` reads
+  `UTC`. Changing the zone takes effect at the next daemon start.
 - Run the CLI inside the container: `docker exec c-backupd c-backup ...`.
 - Override configuration by mounting a file over
   `/etc/c-backupd/config.yaml`; a read-only mount (`:ro`) is fine. Keep the
@@ -1419,7 +1424,7 @@ Two policies per schedule:
 | Option | Values | Meaning |
 |---|---|---|
 | `--on-overlap` | `skip` (default), `queue`, `cancel_running` | The schedule comes due while its previous run is still going |
-| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next window on the schedule's own interval or calendar, or fire once at start and count on from that fire. Never once per missed window. Applies to a schedule's first window too |
+| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next window on the schedule's own interval or calendar, or fire once at start and count on from that fire. Never once per missed window. Applies to a schedule's first window too. Only daemon downtime counts: a window skipped for an overlap, or passed while the schedule was disabled, is not caught up |
 
 Any other value is refused when the schedule is created.
 
