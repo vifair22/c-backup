@@ -21,6 +21,7 @@ _Thread_local int fault_fseeko_at  = -1;
 _Thread_local int fault_fsync_at   = -1;
 _Thread_local int fault_pread_at   = -1;
 _Thread_local int fault_pwrite_at  = -1;
+_Thread_local int fault_fflush_at  = -1;
 _Thread_local size_t fault_malloc_peak = 0;
 _Thread_local long long fault_fwrite_bytes_left = -1;
 _Thread_local long long fault_fwrite_bytes_seen = 0;
@@ -105,6 +106,12 @@ size_t __wrap_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
     if (fault_fwrite_at == 0) { fault_fwrite_at = -1; errno = EIO; return 0; }
     fault_fwrite_at--;
     return __real_fwrite(ptr, size, nmemb, stream);
+}
+
+int __wrap_fflush(FILE *stream) {
+    if (fault_fflush_at == 0) { fault_fflush_at = -1; errno = ENOSPC; return EOF; }
+    if (fault_fflush_at > 0) fault_fflush_at--;
+    return __real_fflush(stream);
 }
 
 int __wrap_fseeko(FILE *stream, off_t offset, int whence) {

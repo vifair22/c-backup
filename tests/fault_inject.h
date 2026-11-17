@@ -24,6 +24,8 @@ extern _Thread_local int fault_fsync_at;
  * through stdio, so these are where their I/O can fail. */
 extern _Thread_local int fault_pread_at;
 extern _Thread_local int fault_pwrite_at;
+/* fflush fails with ENOSPC: a full disk met by a flush, not by fwrite. */
+extern _Thread_local int fault_fflush_at;
 
 /*
  * Largest single allocation seen since the last reset, across every
@@ -59,6 +61,7 @@ extern void   *__real_calloc(size_t, size_t);
 extern void   *__real_realloc(void *, size_t);
 extern size_t  __real_fread(void *, size_t, size_t, FILE *);
 extern size_t  __real_fwrite(const void *, size_t, size_t, FILE *);
+extern int     __real_fflush(FILE *);
 extern int     __real_fseeko(FILE *, off_t, int);
 extern int     __real_fsync(int);
 extern int     __real_fdatasync(int);
@@ -96,6 +99,7 @@ static inline void fault_reset_all(void) {
     fault_fsync_at  = -1;
     fault_pread_at  = -1;
     fault_pwrite_at = -1;
+    fault_fflush_at = -1;
     fault_malloc_peak = 0;
     fault_fwrite_bytes_left = -1;
     fault_fwrite_bytes_seen = 0;
