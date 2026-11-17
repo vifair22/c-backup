@@ -32,6 +32,9 @@ static uint64_t        g_now_serving;
  * g_ticket_mu, read without it by db_txn_waiters. */
 static atomic_uint     g_waiting;
 
+/* Completed make_durable calls, for tests. */
+static atomic_ulong    g_durable;
+
 /*
  * Whether this thread holds the lock. A second begin on the holding thread
  * would queue behind its own ticket and never return; with this it fails
@@ -131,5 +134,11 @@ status_t db_txn_make_durable(cutils_db_t *db)
     write_unlock();
     if (!ok) return set_error(ERR_IO, "state.db: cannot make the index durable "
                                       "(checkpoint did not complete)");
+    atomic_fetch_add_explicit(&g_durable, 1, memory_order_relaxed);
     return OK;
+}
+
+unsigned long db_txn_durable_count(void)
+{
+    return atomic_load_explicit(&g_durable, memory_order_relaxed);
 }
