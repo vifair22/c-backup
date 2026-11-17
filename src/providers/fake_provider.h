@@ -158,6 +158,9 @@ status_t fake_disk_set_changed(sp_ctx_t *ctx, const char *unit_id, const char *i
                                const uint64_t *ranges, size_t n);
 status_t fake_unit_checkpoint(sp_ctx_t *ctx, const char *unit_id, char *buf, size_t sz);
 status_t fake_unit_break_chain(sp_ctx_t *ctx, const char *unit_id, int lose, int refuse);
+/* Make cp the unit's checkpoint again ("" for none): a hypervisor that
+ * kept it, for a test replaying sessions from one saved state. */
+status_t fake_unit_set_checkpoint(sp_ctx_t *ctx, const char *unit_id, const char *cp);
 
 /* A block stream over a run map, owning a copy; close frees it. */
 status_t fake_stream_from_runs(uint64_t size, const fake_run_t *runs, size_t n_runs,

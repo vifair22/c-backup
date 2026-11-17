@@ -1499,6 +1499,16 @@ status_t fake_unit_checkpoint(sp_ctx_t *c, const char *unit_id, char *buf, size_
     return st;
 }
 
+status_t fake_unit_set_checkpoint(sp_ctx_t *c, const char *unit_id, const char *cp)
+{
+    pthread_mutex_lock(&c->mu);
+    funit_t *u = find_unit(c, unit_id);
+    status_t st = u ? OK : set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+    if (st == OK) snprintf(u->cp, sizeof(u->cp), "%s", cp ? cp : "");
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
 status_t fake_unit_break_chain(sp_ctx_t *c, const char *unit_id, int lose, int refuse)
 {
     pthread_mutex_lock(&c->mu);
