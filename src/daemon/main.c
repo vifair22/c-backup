@@ -42,6 +42,7 @@
 #include "sd_notify.h"
 #include "server.h"
 #include "state_db.h"
+#include "prune.h"
 #include "store_index.h"
 #include "fake_provider.h"
 #include "registry.h"
@@ -307,6 +308,12 @@ int main(int argc, char *argv[])
     /* Rows of packs removed just before a power cut took the commit that
      * dropped them (B147). */
     if (store_index_drop_vanished_packs(db, 0) != OK) {
+        log_warn("%s", err_msg());
+        err_clear();
+    }
+    /* Prunes a crash or power cut interrupted, before reconcile can take
+     * their records for snapshots the index lost (B148). */
+    if (prune_finish_pending(db, 0, NULL) != OK) {
         log_warn("%s", err_msg());
         err_clear();
     }

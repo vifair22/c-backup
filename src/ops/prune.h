@@ -43,3 +43,17 @@ typedef struct {
  */
 status_t prune_snapshot_checked(store_t *store, cutils_db_t *db, int64_t repo_id,
                                 int64_t snap_id, int force, prune_info_t *out);
+
+/*
+ * Finish every prune a crash or power cut interrupted (B148), for one
+ * repository or, with 0, all. A prune commits the removal of the rows with
+ * a prune-pending-<id> marker in recovery_state, unlinks the record, syncs
+ * snapshots/ and clears the marker. Until the marker is cleared the record
+ * may still be there, and it is not a snapshot the index lost: reconcile or
+ * reindex taking it for one would bring back a snapshot whose objects gc
+ * has swept. So this deletes the record, syncs, and clears the marker, and
+ * runs at start before reconcile and at the start of every reindex.
+ * Repositories that cannot be read keep their markers. *out_finished (may
+ * be NULL) counts the records removed.
+ */
+status_t prune_finish_pending(cutils_db_t *db, int64_t repo_id, unsigned *out_finished);

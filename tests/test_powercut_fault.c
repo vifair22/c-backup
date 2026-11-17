@@ -1139,6 +1139,8 @@ static void start_and_check(void)
         violation("drop_staged: %s", err_msg());
     if (store_index_drop_vanished_packs(db, 0) != OK)
         violation("drop_vanished_packs: %s", err_msg());
+    if (prune_finish_pending(db, 0, NULL) != OK)
+        violation("prune_finish_pending: %s", err_msg());
     submitted_t sub = { .n = 0 };
     reconcile_result_t rr;
     if (index_reconcile(db, submit_inline, &sub, &rr) != OK)
@@ -1671,6 +1673,79 @@ static void test_prune_unlinks_the_record_after_the_commit_is_durable(void **sta
     ctx_close(&c, 1);
 }
 
+/*
+ * The same prune with no power cut: the process dies between the commit
+ * and the unlink, which a failing unlink stands in for. The marker stays,
+ * and both ways back - the daemon's start and a reindex - finish the prune
+ * instead of resurrecting the snapshot (B148).
+ */
+static int hook_fail_record_unlink(const char *path)
+{
+    if (strstr(path, H_REPO "/snapshots/")) { errno = EIO; return -1; }
+    return FAULT_FS_PASS;
+}
+
+static long long pending_markers(void)
+{
+    cutils_db_t *db = NULL;
+    db_open_at(H_DB, &db);
+    db_result_t *r = NULL;
+    long long n = -1;
+    if (db_execute(db, "SELECT COUNT(*) FROM recovery_state WHERE key LIKE 'prune-pending-%'",
+                   NULL, &r) == 0 && r && r->nrows == 1)
+        n = atoll(r->rows[0][0]);
+    db_result_free(r);
+    db_close(db);
+    return n;
+}
+
+static void interrupted_prune(void)
+{
+    ctx_t c;
+    build_prune(&c);
+    g_scenario = "interrupted prune";
+    restore_pristine();
+    ctx_open(&c, &S_PRUNE);
+    fault_unlink_hook = hook_fail_record_unlink;
+    assert_int_equal(prune_snapshot(c.store, c.db, g_repo_id, 1), OK);
+    fault_unlink_hook = NULL;
+    ctx_close(&c, 1);
+    struct stat sb;
+    assert_int_equal(stat(H_REPO "/snapshots/1", &sb), 0);
+    assert_int_equal(pending_markers(), 1);
+}
+
+static void test_start_finishes_an_interrupted_prune(void **state)
+{
+    (void)state;
+    interrupted_prune();
+    snprintf(g_where, sizeof(g_where), "interrupted prune, at the start");
+    start_and_check();
+    struct stat sb;
+    assert_int_not_equal(stat(H_REPO "/snapshots/1", &sb), 0);
+    assert_int_equal(pending_markers(), 0);
+}
+
+static void test_reindex_finishes_an_interrupted_prune(void **state)
+{
+    (void)state;
+    interrupted_prune();
+    ctx_t c;
+    ctx_open(&c, &S_PRUNE);
+    reindex_result_t rx;
+    memset(&rx, 0, sizeof(rx));
+    assert_int_equal(reindex_repo(c.store, c.db, g_repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.snapshots, 1);
+    int listed[MAX_SNAPS];
+    listed_ids(c.db, listed);
+    assert_false(listed[1]);
+    assert_true(listed[2]);
+    ctx_close(&c, 1);
+    struct stat sb;
+    assert_int_not_equal(stat(H_REPO "/snapshots/1", &sb), 0);
+    assert_int_equal(pending_markers(), 0);
+}
+
 /* ------------------------------------------------------------------ */
 
 static int group_setup(void **state)
@@ -1720,6 +1795,8 @@ int main(void)
         cmocka_unit_test(test_prune),
         cmocka_unit_test(test_reindex),
         cmocka_unit_test(test_prune_unlinks_the_record_after_the_commit_is_durable),
+        cmocka_unit_test(test_start_finishes_an_interrupted_prune),
+        cmocka_unit_test(test_reindex_finishes_an_interrupted_prune),
     };
     return cmocka_run_group_tests_name("powercut", tests, group_setup, group_teardown);
 }
