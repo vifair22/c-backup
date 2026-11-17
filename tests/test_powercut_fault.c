@@ -2151,9 +2151,12 @@ static status_t op_backup_after_drop(ctx_t *c, int counting)
  */
 
 /* What c-backupd's after-write hook does (main.c). */
-static void api_after_write(void *db)
+static int api_after_write(void *db, char *why, size_t why_sz)
 {
-    if (db_txn_make_durable(db) != OK) err_clear();
+    if (db_txn_make_durable(db) == OK) return 0;
+    snprintf(why, why_sz, "%s", err_msg());
+    err_clear();
+    return -1;
 }
 
 static status_t api_call(ctx_t *c, api_method_t m, const char *path, const char *body)

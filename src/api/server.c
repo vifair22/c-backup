@@ -567,8 +567,21 @@ static api_response_t run_buffered(api_server_t *srv, const route_entry_t *route
     api_response_t resp = route->handler.buffered(req, route->userdata);
     if (req->method != API_GET && resp.status >= 200 && resp.status < 300 &&
         srv->after_write_fn &&
-        route_class(srv, route, req->url, req->method) == API_DURABLE)
-        srv->after_write_fn(srv->after_write_ud);
+        route_class(srv, route, req->url, req->method) == API_DURABLE) {
+        char why[512] = "";
+        if (srv->after_write_fn(srv->after_write_ud, why, sizeof(why)) != 0) {
+            char msg[640];
+            snprintf(msg, sizeof(msg), "the change is committed but could not be made "
+                     "durable, and may not survive a power cut: %s",
+                     why[0] ? why : "no detail recorded");
+            /* The cookie stays: it reflects what was committed (a
+             * logout's cleared session is revoked either way). */
+            char *cookie = resp.set_cookie;
+            free(resp.body);
+            resp = api_error(500, msg);
+            resp.set_cookie = cookie;
+        }
+    }
     return resp;
 }
 

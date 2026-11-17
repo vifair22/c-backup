@@ -204,6 +204,9 @@ the daemon refuses to start with a write route that has neither, and
 - **Durable**: the answer waits for a sync of the database's write-ahead
   log (an `fdatasync`). Tags, registering and removing a repository, every
   `DELETE`, and the few other writes that revoke or discard something.
+  If that sync fails (a full or failing disk), the answer is a `500` whose
+  error says the change is committed but could not be made durable: it is
+  in the database, and may not survive a power cut.
 - **Commit-only**: the answer comes as soon as the change is committed. The
   daemon's once-a-second flush puts it on disk, so a power cut within about
   a second of the answer can lose that last edit. It cannot corrupt

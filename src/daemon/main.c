@@ -134,12 +134,15 @@ static status_t startup_reindex(int64_t repo_id, void *ctx, int64_t *out_job_id)
  * once-a-second flush, which synchronous=NORMAL relies on anyway: its
  * reply would otherwise wait out a WAL fdatasync that takes seconds on a
  * saturated pool (B144, api_write_class_t). */
-static void after_write(void *userdata)
+static int after_write(void *userdata, char *why, size_t why_sz)
 {
     if (db_txn_make_durable(userdata) != OK) {
         log_warn("state.db: an API edit may not survive a power cut yet: %s", err_msg());
+        snprintf(why, why_sz, "%s", err_msg());
         err_clear();
+        return -1;
     }
+    return 0;
 }
 
 /*
