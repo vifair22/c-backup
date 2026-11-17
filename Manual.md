@@ -2124,7 +2124,7 @@ the repository).
 | `cbackup_alerts_failed_total` | counter | Push notifications given up on: rejected by Pushover (bad token or user key), or expired after 24 hours of failed retries |
 | `cbackup_alerts_pending` | gauge | Push notifications queued and not yet sent |
 | `cbackup_storage_sync_failed` | gauge | 1 once a sync of `state.db` or the key directory has failed, until a restart (section 17.7) |
-| `cbackup_repos_sync_failed` | gauge | Repositories whose own syncs failed and which refuse backups, gc and prune until repaired or restarted; which ones is in `/readyz` and `repo show` (section 17.7) |
+| `cbackup_repos_sync_failed` | gauge | Repositories whose own syncs failed and which refuse backups, gc and prune until `repo repair` passes (a restart does not clear them); which ones is in `/readyz` and `repo show` (section 17.7) |
 | `cbackup_storage_sync_failed_timestamp_seconds` | gauge | Unix time of that first failure; 0 when none |
 | `cbackup_vm_bitmap_audit_failures_total` | counter | Audit reads that found a VM disk changed outside its dirty bitmap (section 6.5) |
 | `cbackup_vm_resync_bytes_total` | counter | Bytes incremental VM reads re-read past the changed ranges to bring the chunker back in step |
@@ -2597,7 +2597,13 @@ daemon latches until it is restarted:
 `snapshot-ids` or `pack-ids` file, the `.cbackup` marker, the tags file, or
 a directory one of them was renamed into. That repository alone latches; its
 state in `repo show` and `repo list` is `sync_failed`, with `sync_failed`
-(the file and the error) and `sync_failed_at`, and until it is cleared:
+(the file and the error) and `sync_failed_at`. The latch is recorded in
+`state.db` the moment it trips and is not cleared by a restart: after a
+failed pack-seal sync the pack on disk may be short or corrupt while the
+index trusts it, and a restart checks nothing, so the repository comes
+back up `sync_failed` and stays so until `repo repair` passes. (If the
+record itself cannot be written, the whole daemon latches instead.) Until
+then:
 
 - a backup into it, or a replication into it, fails, as does its pack seal;
 - gc (except `--dry-run`), compaction and prune refuse, and a gc already
@@ -2610,9 +2616,9 @@ state in `repo show` and `repo list` is `sync_failed`, with `sync_failed`
 - `/readyz` stays 200 but says `"status":"degraded"` and lists each latched
   repository with its id, path, error and time. It is not a 503 because
   what acts on readiness - a container health check, an orchestrator -
-  restarts or routes around the whole daemon: that would stop the healthy
-  repositories' backups, and a restart clears the latch without the check
-  below. `cbackup_repos_sync_failed` counts the latched repositories.
+  restarts or routes around the whole daemon, which would stop the healthy
+  repositories' backups and achieve nothing for the latched one.
+  `cbackup_repos_sync_failed` counts the latched repositories.
 
 Either kind logs one `ERROR` line and sends one alert (Pushover, when
 configured) naming the file and the error. A restore destination that fails
@@ -2623,14 +2629,15 @@ filesystem, a target that was unplugged) and fix it. Then:
 
 - for `state.db` or the key directory, restart the daemon. It reads
   everything back from disk, which is the only copy to trust;
-- for a repository, either restart the daemon or run `c-backup repo repair
-  <id>`. Repair drops the repository's files from the page cache, so what
+- for a repository, run `c-backup repo repair <id>`; a restart does not
+  clear it. Repair drops the repository's files from the page cache, so what
   follows reads the disk and not what the failed sync left in memory, runs
   a deep verify that writes nothing, and clears the latch only if the
   verify finds nothing at all. If it finds damage it says how much and
   leaves the repository `sync_failed`: run `c-backup verify <id>` (deep and
-  repairing) to fix what parity can, then `repo repair` again. After a
-  restart, run that deep verify yourself before trusting the repository.
+  repairing) to fix what parity can, then `repo repair` again. A passing
+  repair removes the record, so the repository stays clear across later
+  restarts.
 
 ## 18. Capacity planning and performance
 

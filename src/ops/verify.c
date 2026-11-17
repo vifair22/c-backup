@@ -1459,7 +1459,8 @@ status_t repo_sync_repair(store_t *store, cutils_db_t *db, int64_t repo_id, atom
     uint64_t found = out->unrecoverable + out->missing + out->recoverable +
                      out->packs_unwalkable + out->pack_structures_recoverable;
     if (st == OK && found == 0) {
-        sync_latch_repo_clear(root);
+        st = sync_latch_repo_clear(root);
+        if (st != OK) return st;
         log_warn("repair: %s verified clean from disk (%llu checked); its failed sync is "
                  "cleared and it takes backups again", root, (unsigned long long)out->checked);
         return OK;

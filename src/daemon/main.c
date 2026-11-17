@@ -156,7 +156,8 @@ static void sync_latch_alert(const char *msg)
     char body[1400];
     snprintf(body, sizeof(body), "A storage sync failed: %s. Durable writes, backups, gc "
              "and prune are refused where it failed (the whole daemon for state.db, one "
-             "repository for its own files) until a restart or `c-backup repo repair`.", msg);
+             "repository for its own files) until a restart (state.db) or a passing "
+             "`c-backup repo repair` (a repository).", msg);
     log_error("alert: c-backupd storage sync failed: %s", msg);
     if (atomic_load(&g_alerts_on) && push_send("c-backupd: storage sync failed", body) != 0)
         log_warn("alert: could not queue the storage sync alert");
@@ -438,6 +439,14 @@ int main(int argc, char *argv[])
         goto out_purge;
     }
 
+    /* Repositories whose syncs failed in an earlier run come up refusing,
+     * before any job can start (sync_latch.h): a restart checks nothing. */
+    sync_latch_set_db(db);
+    if (sync_latch_load(db) < 0) {
+        log_error("cannot read the repositories' failed-sync records from state.db");
+        goto out_purge;
+    }
+
     int max_parallel = config_get_int(cfg, "jobs.max_parallel", 2);
     if (job_manager_start(db, max_parallel, &jm) != OK) {
         log_error("cannot start job manager");
@@ -648,6 +657,7 @@ out_locks:
     /* After every writer has stopped: one last sync of the WAL. A no-op
      * when it was never started. */
     checkpointer_stop();
+    sync_latch_persist_drain();
     state_db_flusher_stop();
     /* Let go of the kept WAL descriptor before the close deletes the file,
      * so the process does not pin a deleted inode on its way out. */

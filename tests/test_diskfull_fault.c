@@ -111,6 +111,7 @@ static int setup(void **state)
     if (db_open(&db, TEST_DB) != 0) return -1;
     if (db_run_lib_migrations(db) != 0) return -1;
     if (db_run_compiled_migrations(db, app_migrations) != 0) return -1;
+    sync_latch_set_db(db);   /* repository latches are kept in state.db */
     if (repo_register(db, TEST_REPO, "test", &repo_id) != OK) return -1;
     if (store_open(TEST_REPO, NULL, &store) != OK) return -1;
     if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
@@ -126,6 +127,7 @@ static int teardown(void **state)
     (void)state;
     fault_full_disarm();
     sync_latch_reset_for_test();
+    sync_latch_set_db(NULL);
     fault_reset_all();
     store_index_free(idx); idx = NULL;
     store_close(store);    store = NULL;
@@ -724,13 +726,23 @@ static int body_has(api_server_t *srv, const char *url, const char *needle, int 
     return has;
 }
 
+/* The daemon restarting, as far as the latch can tell: memory gone, then
+ * what state.db kept loaded back. Returns what sync_latch_load says. */
+static int restart_latches(void)
+{
+    sync_latch_persist_drain();
+    sync_latch_reset_for_test();
+    return sync_latch_load(db);
+}
+
 /*
  * Two repositories, as on separate disks. One EIO on a pack seal's fsync
  * in the first latches that repository and nothing else: it refuses
  * backup, gc, compaction, prune and its durable routes, and shows
- * sync_failed; the second backs up and gcs as before. A repair refuses
- * while its deep verify finds damage, and once the disk is "fixed"
- * verifies from disk and clears the latch.
+ * sync_failed, across a restart too; the second backs up and gcs as
+ * before. A repair refuses while its deep verify finds damage, and once
+ * the disk is "fixed" verifies from disk and clears the latch, which stays
+ * clear across another restart.
  */
 static void test_pack_sync_failure_latches_only_its_repo(void **state)
 {
@@ -773,6 +785,19 @@ static void test_pack_sync_failure_latches_only_its_repo(void **state)
     assert_int_equal(prune_snapshot(store, db, repo_id, 2), ERR_UNAVAILABLE);
     assert_int_equal(count_packs(TEST_REPO "/packs"), packs);
     assert_int_equal(gc_run(store, db, repo_id, 1, NULL, &gr), OK);   /* dry run */
+
+    /* A restart does not clear it: after a failed pack seal the pack on
+     * disk may be short while the index trusts it, and a restart checks
+     * nothing. The record in state.db brings the latch back. */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM recovery_state WHERE key = 'sync-failed'"), 1);
+    assert_int_equal(restart_latches(), 1);
+    assert_true(sync_latch_repo_tripped(TEST_REPO));
+    assert_false(sync_latch_repo_tripped(repo2));
+    assert_false(sync_latch_tripped());
+    assert_int_equal(backup_into(store, repo_id, &res), ERR_UNAVAILABLE);
+    backup_result_free(&res);
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), ERR_UNAVAILABLE);
+    assert_int_equal(count_packs(TEST_REPO "/packs"), packs);
 
     /* The other one does not notice. */
     assert_int_equal(backup_into(st2, id2, &res), OK);
@@ -829,6 +854,12 @@ static void test_pack_sync_failure_latches_only_its_repo(void **state)
     /* Nothing left to clear. */
     assert_int_equal(repo_sync_repair(store, db, repo_id, NULL, NULL, NULL, &vr), ERR_INVALID);
     api_server_stop(srv);
+
+    /* Cleared for good: the record went with it, and a restart keeps it
+     * clear. */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM recovery_state WHERE key = 'sync-failed'"), 0);
+    assert_int_equal(restart_latches(), 0);
+    assert_false(sync_latch_repo_tripped(TEST_REPO));
 
     assert_int_equal(backup_into(store, repo_id, &res), OK);
     backup_result_free(&res);

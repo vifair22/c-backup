@@ -279,8 +279,9 @@ dropped the bytes, and a later sync can succeed over the loss.
   and replication jobs fail; `/readyz` stays 200 with `"status":"degraded"`
   and `repos_sync_failed: [{"id","path","error","at"}]`;
   `cbackup_repos_sync_failed` counts such repositories. Other repositories
-  are unaffected. `POST /repos/<id>/verify?clear_sync=1` (CLI `repo repair
-  <id>`) is the way back short of a restart: a job running a deep verify
+  are unaffected. The latch is recorded in `state.db` and survives a
+  restart. `POST /repos/<id>/verify?clear_sync=1` (CLI `repo repair <id>`)
+  is the only way back: a job running a deep verify
   that writes nothing, after dropping the repository's pages from the cache;
   it clears the latch only if the verify finds nothing, and fails saying
   what it found otherwise. `409` when the repository has no failed sync.

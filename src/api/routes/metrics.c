@@ -161,7 +161,7 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
         /* A count, not a series per repository (daemon-wide aggregates
          * only); which ones is in /readyz and `repo show`. */
         mb_addf(&m, "# HELP cbackup_repos_sync_failed Repositories whose own syncs failed "
-                    "and which refuse backups, gc and prune until repaired or restarted.\n"
+                    "and which refuse backups, gc and prune until `repo repair` passes.\n"
                     "# TYPE cbackup_repos_sync_failed gauge\n"
                     "cbackup_repos_sync_failed %u\n", sync_latch_repo_count());
     }

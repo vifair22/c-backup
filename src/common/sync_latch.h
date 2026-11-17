@@ -24,9 +24,10 @@
  * was renamed into) latches that repository, keyed by its root. Its
  * repository state is "sync_failed"; its pack seals (backups and
  * replication into it), gc, compaction, prune and durable routes refuse
- * with ERR_UNAVAILABLE. Other repositories carry on. Cleared by a restart,
- * or by a repair (repo_sync_repair) whose deep verify, read from disk
- * rather than the page cache, finds nothing wrong.
+ * with ERR_UNAVAILABLE. Other repositories carry on. Kept in state.db, so
+ * a restart brings it back; cleared only by a repair (repo_sync_repair)
+ * whose deep verify, read from disk rather than the page cache, finds
+ * nothing wrong.
  *
  * A restore's destination is not storage the daemon depends on and trips
  * neither. EINVAL and EBADF say the call was wrong, not that data was
@@ -34,6 +35,8 @@
  */
 
 #include "error.h"
+
+#include <cutils/db.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -72,8 +75,29 @@ unsigned sync_latch_repo_count(void);
  * must not call back into this module. */
 void sync_latch_repo_foreach(void (*fn)(const char *root, const char *msg, int64_t at,
                                         void *ctx), void *ctx);
-/* Forget root's latch (repo_sync_repair, after a clean deep verify). */
-void sync_latch_repo_clear(const char *root);
+/* Forget root's latch (repo_sync_repair, after a clean deep verify): its
+ * row first, durably, then memory. ERR_IO, latch kept, when the row cannot
+ * be removed. */
+status_t sync_latch_repo_clear(const char *root);
+
+/* ---- persistence (state.db's recovery_state, key "sync-failed") ----
+ *
+ * A repository latch outlives a restart: after a failed pack-seal sync the
+ * pack on disk may be short while the index trusts it, and a restart
+ * checks nothing. Each trip is written to its repository's recovery_state
+ * row and made durable, on a thread of its own (the tripping thread may
+ * hold the transaction or a pack lock); if that cannot be done the
+ * daemon-wide latch trips, which a restart does clear, by re-reading
+ * state.db. Only repo_sync_repair removes the row. A repository not yet
+ * registered (a marker being written at creation) has no row to keep. */
+
+/* The database rows are kept in; NULL (the default) keeps nothing. */
+void sync_latch_set_db(cutils_db_t *db);
+/* Every persisted latch into memory, at start: those repositories come up
+ * sync_failed. Returns how many, or -1 when they cannot be read. */
+int  sync_latch_load(cutils_db_t *db);
+/* Wait until every trip so far is written (shutdown, tests). */
+void sync_latch_persist_drain(void);
 
 /* ---- wiring ---- */
 
