@@ -1661,6 +1661,28 @@ if command -v sqlite3 > /dev/null 2>&1; then
     contains "and the next backup numbers past it" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
     check "to the id after it" "$((LOST + 1))" \
         "$(cb snapshots 1 | grep -o '"id":[0-9]*' | cut -d: -f2 | sort -n | tail -1)"
+
+    # B139 and V3-12: a tag set just before a power cut. By the time the API
+    # answers, the repository's tag list holds it, 0600 (NIT-27), and the
+    # database commit is synced. A lost commit is made by hand - the daemon
+    # killed at once, the tag row deleted - and the next start puts the row
+    # back from the repository's list.
+    contains "a tag to lose" '"ok"' "$(cb tag set 1 pc-tag "$LOST")"
+    kill -KILL "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=
+    contains "the repository's tag list has it when the API answers" '"name":"pc-tag"' \
+        "$(cat "$WORK/repo/tags" 2>/dev/null)"
+    check "and the list is 0600" "600" "$(stat -c %a "$WORK/repo/tags" 2>/dev/null)"
+    sqlite3 "$WORK/state.db" "DELETE FROM tags WHERE repo_id = 1 AND name = 'pc-tag'"
+    : > "$WORK/daemon.log"
+    C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    # The killed daemon left its socket behind, so wait for an answer, not
+    # for the file.
+    for _ in $(seq 1 100); do cb health 2>/dev/null | grep -q ready && break; sleep 0.1; done
+    contains "the start restores the lost tag and says so" \
+        "reconcile: repo 1 ($WORK/repo): 1 tag(s) missing from the index were restored" \
+        "$(cat "$WORK/daemon.log")"
+    contains "the tag is listed again" 'pc-tag' "$(cb tag list 1)"
 else
     C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
     DAEMON_PID=$!
