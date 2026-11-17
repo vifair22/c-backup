@@ -835,8 +835,21 @@ static status_t bsink_add_prepared(bsink_t *s, const pack_prepared_t *pp,
     }
     pthread_mutex_unlock(&s->mu);
     if (sealing) {
+        /* A seal that fails here is the sink's failure like any other: the
+         * file fails with it (B182) whatever its settle makes of the error,
+         * and the pack's claims are abandoned, so every file that referenced
+         * one of its names fails the run (store_content). */
         status_t sst = pack_backup_rollover_end(sealing);
-        if (st == OK) st = sst;
+        if (sst != OK) {
+            pthread_mutex_lock(&s->mu);
+            if (s->failed == OK) {
+                s->failed = sst;
+                snprintf(s->failed_msg, sizeof(s->failed_msg), "%s",
+                         err_msg()[0] ? err_msg() : "a pack seal failed (no detail recorded)");
+            }
+            pthread_mutex_unlock(&s->mu);
+            if (st == OK) st = sst;
+        }
     }
     *out_is_new = is_new;
     *out_phys = phys;
@@ -1545,10 +1558,15 @@ static status_t store_content(pipeline_t *p)
         pack_backup_share_claims(p->pack_w, NULL);
         pack_claims_free(p->claims);
         p->claims = NULL;
-        if (st == OK && lost) {
-            st = set_error(ERR_IO, "backup: %llu chunk(s) another writer was storing "
-                           "were never committed", (unsigned long long)lost);
-            snprintf(why, sizeof(why), "%s", err_msg());
+        if (lost) {
+            /* Files recorded this run may name those chunks; their cache rows
+             * would let the next run reuse them unread (B184). */
+            file_cache_forget_run(p->db, p->repo_id, p->cache_stamp);
+            if (st == OK) {
+                st = set_error(ERR_IO, "backup: %llu chunk(s) another writer was storing "
+                               "were never committed", (unsigned long long)lost);
+                snprintf(why, sizeof(why), "%s", err_msg());
+            }
         }
     }
     cdc_workers_stop(p->cdc_w);

@@ -175,6 +175,13 @@ void store_index_set_commit_gate(status_t (*gate)(void))
     g_commit_gate = gate;
 }
 
+static int (*volatile g_commit_fault)(void);
+
+void store_index_set_commit_fault(int (*fault)(void))
+{
+    g_commit_fault = fault;
+}
+
 /* The test's power cut: the commit that would come next never happens, and
  * neither does anything after it, cleanup included. */
 static int cut_before_commit(void)
@@ -257,6 +264,7 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
     uint8_t *later = calloc(info->entry_count ? info->entry_count : 1, 1);
     if (!later) {
         log_error("pack commit: out of memory for pack %s", pack);
+        store_pack_commit_failed();
         return;
     }
 
@@ -353,13 +361,20 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
 
     if (!failed) {
         if (cut_before_commit()) { db_txn_rollback(idx->db); return; }
-        if (db_txn_commit(idx->db) == OK) return;
-        in_txn = 0;
-        failed = 1;
+        int (*fault)(void) = g_commit_fault;
+        if (fault && fault()) {
+            failed = 1;                 /* in_txn: rolled back below */
+        } else {
+            if (db_txn_commit(idx->db) == OK) return;
+            in_txn = 0;
+            failed = 1;
+        }
     }
     if (in_txn) db_txn_rollback(idx->db);
     log_error("pack commit: pack %s (%u objects) did not commit", pack, info->entry_count);
     if (wrote) drop_unannounced(idx, repo, pack);
+    /* The seal fails with it, so its claims are abandoned (store.h). */
+    store_pack_commit_failed();
 }
 
 /*

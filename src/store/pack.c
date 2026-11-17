@@ -2469,9 +2469,9 @@ static status_t announce_pack(store_t *store, uint32_t pack_num, uint64_t size,
         .entry_count = packed,
         .entries     = ce,
     };
-    store_emit_pack_commit(store, &info);
+    status_t st = store_emit_pack_commit(store, &info);
     free(ce);
-    return OK;
+    return st;
 }
 
 /*

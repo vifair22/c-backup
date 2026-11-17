@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -38,6 +39,7 @@
 
 #include "db_txn.h"
 #include "db_readers.h"
+#include "sync_latch.h"
 #include "db_write.h"
 #include "object.h"
 #include "pack.h"
@@ -104,6 +106,8 @@ static int teardown(void **state)
     store_index_set_pack_batch_rows(0);
     db_txn_guard_arm(0);
     db_readers_close();
+    store_index_set_commit_fault(NULL);
+    sync_latch_reset_for_test();
     if (store) { store_close(store); store = NULL; }
     if (idx) { store_index_free(idx); idx = NULL; }
     if (db) { db_close(db); db = NULL; }
@@ -677,6 +681,79 @@ static void test_lookup_does_not_wait_for_a_writer(void **state)
     assert_int_equal(db_txn_guard_violations(), v0);
 }
 
+static int always_fail(void) { return 1; }
+
+/*
+ * A pack taken off its writer whose seal then fails, after a second writer
+ * has referenced one of its names through the pack's claim. The seal says
+ * so, its claims are counted abandoned - the count backup_run fails a run
+ * on (store_content) - and no index row names the chunk, so nothing can
+ * resolve it. Two ways a seal fails: its index commit (reported through
+ * store_pack_commit_failed; before B184 this was logged and the seal still
+ * reported success), and the repository's sync latch refusing it (B182).
+ */
+static void seal_fails_after_a_reference(int latch)
+{
+    const size_t len = 9000;
+    char *buf = malloc(len);
+    assert_non_null(buf);
+    fill((uint8_t *)buf, len, latch ? 0xB185 : 0xB186);
+
+    pack_claims_t *c = pack_claims_new();
+    assert_non_null(c);
+    pack_backup_writer_t *a = NULL, *b = NULL;
+    assert_int_equal(pack_backup_open(store, &a), OK);
+    assert_int_equal(pack_backup_open(store, &b), OK);
+    pack_backup_share_claims(a, c);
+    pack_backup_share_claims(b, c);
+
+    uint8_t h[OBJECT_HASH_SIZE];
+    int is_new = -1;
+    assert_int_equal(pack_backup_add(a, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 1);
+    pack_backup_sealing_t *seal = NULL;
+    assert_int_equal(pack_backup_rollover_begin(a, &seal), OK);
+    assert_non_null(seal);
+    /* b references it: claimed by the pack being sealed. */
+    assert_int_equal(pack_backup_add(b, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 0);
+    assert_int_equal(pack_claims_deferred(c), 1);
+
+    if (latch) sync_latch_repo_trip(TEST_REPO, "pack-test.dat", EIO);
+    else       store_index_set_commit_fault(always_fail);
+    assert_int_not_equal(pack_backup_rollover_end(seal), OK);
+    err_clear();
+    store_index_set_commit_fault(NULL);
+    sync_latch_reset_for_test();
+
+    assert_int_equal(pack_claims_abandoned(c), 1);
+    assert_false(pack_object_exists(store, h));
+    err_clear();
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    for (int i = 0; i < OBJECT_HASH_SIZE; i++) snprintf(hex + i * 2, 3, "%02x", h[i]);
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM pack_objects WHERE repo_id = ? AND hash = '%s'",
+             hex);
+    assert_int_equal(count(sql), 0);
+
+    pack_backup_abort(a);
+    pack_backup_abort(b);
+    pack_claims_free(c);
+    free(buf);
+}
+
+static void test_failed_commit_abandons_a_referenced_claim(void **state)
+{
+    (void)state;
+    seal_fails_after_a_reference(0);
+}
+
+static void test_refused_seal_abandons_a_referenced_claim(void **state)
+{
+    (void)state;
+    seal_fails_after_a_reference(1);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -691,6 +768,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_drop_unannounced_is_linear, setup, teardown),
         cmocka_unit_test_setup_teardown(test_dedup_race_stores_one_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_lookup_does_not_wait_for_a_writer, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_failed_commit_abandons_a_referenced_claim,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_refused_seal_abandons_a_referenced_claim,
+                                        setup, teardown),
     };
     /* Before any test opens a connection, so each carries the guard's hook. */
     db_txn_guard_install();

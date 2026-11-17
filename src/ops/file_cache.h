@@ -94,5 +94,14 @@ void file_cache_put(cutils_db_t *db, int64_t repo_id, const char *path,
  *
  * `paths` must be sorted by strcmp.
  */
+/*
+ * Drop the rows a run wrote (seen_at = its stamp). For a run that must not be
+ * trusted after the fact: one whose files referenced chunks another writer
+ * was storing and never committed (B184). Their rows would let the next run
+ * skip reading those files and reuse content naming the lost chunks. Best
+ * effort, logged on failure.
+ */
+void file_cache_forget_run(cutils_db_t *db, int64_t repo_id, int64_t seen_at);
+
 void file_cache_sweep(cutils_db_t *db, int64_t repo_id,
                       const char *const *paths, size_t n_paths);
