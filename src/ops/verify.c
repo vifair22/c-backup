@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 
 #include "verify.h"
+#include "sync_latch.h"
 
 #include "chunklist.h"
 #include "read_budget.h"
@@ -13,6 +15,7 @@
 #include <cutils/log.h>
 
 #include <errno.h>
+#include <ftw.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -652,10 +655,22 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
                     " WHERE po.repo_id = ? AND po.pack_id = ? ORDER BY po.offset",
                     (const char *[]){ repo, pk, NULL }, &r) == 0 && r && r->nrows > 0) {
                 pack_hdr_hint_t *hints = hints_from_rows(r);
-                if (hints) {
-                    (void)pack_restore_headers(store, pnum, hints, (size_t)r->nrows);
-                    free(hints);
+                int rh = hints ? pack_restore_headers(store, pnum, hints, (size_t)r->nrows)
+                               : -1;
+                free(hints);
+                if (rh == -2) {
+                    /* The headers may read back right from the page cache
+                     * and still not be on disk: not a repair (B182). */
+                    log_error("verify: %s.dat: restoring its entry headers failed: %s",
+                              name, err_msg());
+                    record_finding(db, repo_id, res->run_id, name,
+                                   "unwalkable pack: its restored headers could not be written");
+                    err_clear();
+                    db_result_free(r);
+                    res->packs_unwalkable++;
+                    continue;
                 }
+                err_clear();
             }
             if (pack_walk_check(store, pnum, why, sizeof(why)) == OK) {
                 db_result_free(r);
@@ -1235,6 +1250,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
              * actually fix it. Damage parity can carry but that is still on
              * disk is "recoverable".
              */
+            err_clear();
             int fixed = repair ? (packed ? pack_object_repair(store, hash) : -1)
                                : 0;
             if (fixed > 0) {
@@ -1245,10 +1261,12 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             } else {
                 if (repair)
                     log_warn("verify: %s was silently corrected on read but the "
-                             "correction could not be written back", hex);
+                             "correction could not be written back%s%s", hex,
+                             err_msg()[0] ? ": " : "", err_msg());
                 else
                     log_warn("verify: %s is damaged on disk and was corrected in "
                              "memory only (repair disabled)", hex);
+                err_clear();
                 res.recoverable++;
                 record_finding(db, repo_id, res.run_id, hex, "recoverable");
             }
@@ -1399,4 +1417,61 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                          "run verify with repair",
                          (long long)res.run_id, (unsigned long long)res.packs_unwalkable);
     return OK;
+}
+
+/* ---- clearing a repository's sync latch ---- */
+
+/* nftw's callback: every regular file's clean pages out of the cache. A
+ * file that will not open is left to the verify to find. */
+static int drop_pages(const char *path, const struct stat *sb, int flag, struct FTW *ftw)
+{
+    (void)ftw;
+    if (flag != FTW_F || !S_ISREG(sb->st_mode)) return 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return 0;
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+    return 0;
+}
+
+status_t repo_sync_repair(store_t *store, cutils_db_t *db, int64_t repo_id, atomic_int *cancel,
+                          void (*progress)(const char *phase, uint64_t done,
+                                           uint64_t total, void *ctx),
+                          void *progress_ctx, verify_result_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    const char *root = store_root(store);
+    status_t st = sync_latch_check("repair");
+    if (st != OK) return st;
+    if (!sync_latch_repo_tripped(root))
+        return set_error(ERR_INVALID, "repository %s has no failed sync to clear", root);
+
+    /* After a failed sync the cache may hold pages the disk does not: they
+     * were marked clean when the write-back failed. Dropping the clean
+     * pages makes the verify read the disk. */
+    if (nftw(root, drop_pages, 32, FTW_PHYS) != 0)
+        log_warn("repair: could not walk all of %s to drop its cached pages", root);
+    pack_cache_invalidate(store);
+
+    st = verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0, cancel, progress,
+                    progress_ctx, out);
+    if (st == ERR_BUSY) return st;
+    uint64_t found = out->unrecoverable + out->missing + out->recoverable +
+                     out->packs_unwalkable + out->pack_structures_recoverable;
+    if (st == OK && found == 0) {
+        st = sync_latch_repo_clear(root);
+        if (st != OK) return st;
+        log_warn("repair: %s verified clean from disk (%llu checked); its failed sync is "
+                 "cleared and it takes backups again", root, (unsigned long long)out->checked);
+        return OK;
+    }
+    if (found == 0) return st;   /* the verify itself failed; its error stands */
+    return set_error(ERR_CORRUPT, "repair: the deep verify of %s found %llu unrecoverable, "
+                     "%llu missing, %llu recoverable, %llu unwalkable pack(s) and %llu pack "
+                     "structure(s) to fix, so its failed sync is not cleared; run a repairing "
+                     "`c-backup verify` first, then `c-backup repo repair` again",
+                     root, (unsigned long long)out->unrecoverable,
+                     (unsigned long long)out->missing, (unsigned long long)out->recoverable,
+                     (unsigned long long)out->packs_unwalkable,
+                     (unsigned long long)out->pack_structures_recoverable);
 }

@@ -943,14 +943,16 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
                              const char *full, uint64_t size, uint32_t mode,
                              uint32_t uid, uint32_t gid, int64_t mtime,
                              const char *xhash, const char *ahash,
-                             char *tmp, size_t tmpsz, uint64_t *out_sz)
+                             char *tmp, size_t tmpsz, uint64_t *out_sz,
+                             int *out_dest_err)
 {
     uint8_t hash[OBJECT_HASH_SIZE];
     hex_to_hash(chash, hash);
     *out_sz = 0;
+    *out_dest_err = 0;
 
     int fd = make_partial_at(pfd, full, tmp, tmpsz);
-    if (fd == -1) return ERR_IO;
+    if (fd == -1) { *out_dest_err = 1; return ERR_IO; }
 
     /*
      * One FILE object or a chunk list. Every object is bounded, so each is
@@ -962,7 +964,7 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
      */
     (void)size;
     uint64_t sz = 0;
-    status_t st = content_restore_fd(store, hash, fd, &sz);
+    status_t st = content_restore_fd_ex(store, hash, fd, &sz, out_dest_err);
 
     /* Metadata goes on before the rename, so the file is final the moment
      * it has its name: the resume rule relies on the mtime being right.
@@ -974,8 +976,10 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
         apply_xattrs(store, &t, xhash);
         apply_acls(store, &t, ahash, 0);
     }
-    if (close(fd) != 0 && st == OK)
+    if (close(fd) != 0 && st == OK) {
         st = set_error_errno(ERR_IO, "restore: cannot close %s", full);
+        *out_dest_err = 1;
+    }
     if (st != OK) {
         if (unlinkat(pfd, tmp, 0) != 0 && errno != ENOENT)
             log_warn("restore: cannot remove partial file %s for %s: %s",
@@ -1650,8 +1654,9 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         store_get_io_progress(store, &prev_io, &prev_io_ctx);
         if (opts->bytes_cb || opts->progress_cb)
             store_set_io_progress(store, restore_bytes, &io);
+        int dest_err = 0;
         status_t lst = restore_file(store, chash, pfd, full, nsize, mode, uid, gid,
-                                    mtime, xhash, ahash, tmp, sizeof(tmp), &sz);
+                                    mtime, xhash, ahash, tmp, sizeof(tmp), &sz, &dest_err);
         store_set_io_progress(store, prev_io, prev_io_ctx);
 
         if (lst != OK && cancelled(opts)) {
@@ -1659,6 +1664,14 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
              * final path was never touched. */
             st = set_error(ERR_BUSY, "restore cancelled");
             break;
+        }
+        if (lst != OK && dest_err) {
+            /* The destination's fault this time - a full disk, a quota, a
+             * mount gone read-only - and said as such (B182). */
+            restore_fail(&res, full, "cannot write it: %s",
+                         err_msg()[0] ? err_msg() : status_reason(lst));
+            err_clear();
+            continue;
         }
         if (lst != OK) {
             /* The fault is the repository's, not the destination's: name

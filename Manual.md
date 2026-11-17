@@ -871,6 +871,13 @@ silently:
 - the journal entry, the permanent record, reads `snapshot 12: 50 files, 1
   skipped (not in the snapshot); first: /data/x: ...`.
 
+Skipping is for the source's faults only. A write to the repository that
+fails - a full disk, an I/O error, a failed sync or close - fails the whole
+backup, naming the file being stored and the error (`backup: storing
+/data/x: pack: write to <staging>: No space left on device`). No snapshot
+is recorded, the partly written pack is discarded, and nothing it held is
+left for a later run to trust.
+
 **A file that changes while it is backed up.** A live filesystem changes
 under a backup, and a file can be a different size by the time it is read
 than when the scan listed it. The backup stores the file as it is when it
@@ -1318,6 +1325,12 @@ batches of 512 files took 12.4 s and spent 9 s of it in 196 calls to
 on that filesystem, once per batch, and a crash redoes at most one batch:
 its files are still under temporary names, which the next restore sweeps
 and writes again.
+
+A write the destination refuses - a full disk, a quota, a filesystem gone
+read-only - fails that file with "cannot write it: <reason>", naming the
+destination rather than the repository, and its temporary file is removed;
+the restore goes on with the rest and fails at the end, as for any failed
+file. Running it again once there is room writes what is missing.
 
 ---
 
@@ -2072,8 +2085,8 @@ daemon as a whole.
 
 | Route | Meaning |
 |---|---|
-| `/healthz` | The process answers |
-| `/readyz` | The database is open; the daemon can do work |
+| `/healthz` | The process answers; says `storage_sync: failed` after a failed sync of `state.db`, and counts repositories whose own syncs failed (section 17.7) |
+| `/readyz` | The database is open and its syncs have not failed; the daemon can do work. 200 with `"status":"degraded"` and a list when only repositories' syncs have failed (section 17.7) |
 
 Both are public, on the socket and on TCP.
 
@@ -2110,6 +2123,9 @@ the repository).
 | `cbackup_alerts_sent_total` | counter | Push notifications Pushover accepted |
 | `cbackup_alerts_failed_total` | counter | Push notifications given up on: rejected by Pushover (bad token or user key), or expired after 24 hours of failed retries |
 | `cbackup_alerts_pending` | gauge | Push notifications queued and not yet sent |
+| `cbackup_storage_sync_failed` | gauge | 1 once a sync of `state.db` or the key directory has failed, until a restart (section 17.7) |
+| `cbackup_repos_sync_failed` | gauge | Repositories whose own syncs failed and which refuse backups, gc and prune until `repo repair` passes (a restart does not clear them); which ones is in `/readyz` and `repo show` (section 17.7) |
+| `cbackup_storage_sync_failed_timestamp_seconds` | gauge | Unix time of that first failure; 0 when none |
 | `cbackup_vm_bitmap_audit_failures_total` | counter | Audit reads that found a VM disk changed outside its dirty bitmap (section 6.5) |
 | `cbackup_vm_resync_bytes_total` | counter | Bytes incremental VM reads re-read past the changed ranges to bring the chunker back in step |
 
@@ -2338,7 +2354,9 @@ reach the disk at different times:
 - **The durable API edits** - registering or removing a repository, a tag
   set or removed, every delete, a logout or password change - are synced to
   disk before the request is answered. Once the CLI or the app reports
-  success, a power cut cannot take them.
+  success, a power cut cannot take them. If the sync itself fails (a full
+  or failing disk under `state.db`), the request fails with an error saying
+  the change is committed but could not be made durable.
 - **Every other write** - the other API edits (a note, sources, a policy
   value, a schedule added or changed, a job submitted), and the daemon's
   own writes (a backup's index rows, job records and progress, journal
@@ -2551,6 +2569,75 @@ A single missing pack never trips the percentage, however small the
 repository, as long as other packs are present: one of two heals on its
 own, with its alert, while two out of three go through the repair. One out
 of one is every pack, and that is an unavailable repository, above.
+
+### 17.7 A sync to disk fails
+
+When the kernel reports that a sync failed - an `fsync` or `fdatasync` -
+c-backupd stops promising that what it covered is on disk. On Linux a failed
+sync can mark the unwritten pages clean and report the error once: the next
+sync of the same file succeeds while the bytes the first one covered are
+gone, and carrying on would hand out success for writes that may not exist.
+This is what PostgreSQL does with `data_sync_retry = off`. How far it
+reaches depends on where the sync failed, because repositories sit on disks
+of their own and one failing disk must not stop the rest.
+
+**The daemon's own storage** - `state.db`'s write-ahead log or its
+directory (the once-a-second flush, or the sync before a durable API
+answer), or the key directory. Nothing works without it, so the whole
+daemon latches until it is restarted:
+
+- every durable API write (section 6.4) is refused with a `500` saying `a
+  previous sync failed (<file>: <error>); restart the daemon to re-read
+  from disk`, before anything is committed;
+- every backup fails at its pack seal, and gc and prune refuse;
+- `/readyz` answers 503, `/healthz` reports `storage_sync: failed` with the
+  file and the time, and `cbackup_storage_sync_failed` is 1.
+
+**A file in one repository** - a pack, a snapshot record, the
+`snapshot-ids` or `pack-ids` file, the `.cbackup` marker, the tags file, or
+a directory one of them was renamed into. That repository alone latches; its
+state in `repo show` and `repo list` is `sync_failed`, with `sync_failed`
+(the file and the error) and `sync_failed_at`. The latch is recorded in
+`state.db` the moment it trips and is not cleared by a restart: after a
+failed pack-seal sync the pack on disk may be short or corrupt while the
+index trusts it, and a restart checks nothing, so the repository comes
+back up `sync_failed` and stays so until `repo repair` passes. (If the
+record itself cannot be written, the whole daemon latches instead.) Until
+then:
+
+- a backup into it, or a replication into it, fails, as does its pack seal;
+- gc (except `--dry-run`), compaction and prune refuse, and a gc already
+  running stops before deleting anything more: nothing is unlinked on the
+  strength of a sync that cannot be trusted;
+- its durable API writes (a tag, deleting a snapshot or the repository) are
+  refused with a `500`;
+- every other repository carries on as before. Browsing, restores and a
+  verify of the latched one still work;
+- `/readyz` stays 200 but says `"status":"degraded"` and lists each latched
+  repository with its id, path, error and time. It is not a 503 because
+  what acts on readiness - a container health check, an orchestrator -
+  restarts or routes around the whole daemon, which would stop the healthy
+  repositories' backups and achieve nothing for the latched one.
+  `cbackup_repos_sync_failed` counts the latched repositories.
+
+Either kind logs one `ERROR` line and sends one alert (Pushover, when
+configured) naming the file and the error. A restore destination that fails
+to sync fails that restore's files (section 8) and latches nothing.
+
+What to do: find out why the disk failed (`dmesg`, `smartctl`, a full
+filesystem, a target that was unplugged) and fix it. Then:
+
+- for `state.db` or the key directory, restart the daemon. It reads
+  everything back from disk, which is the only copy to trust;
+- for a repository, run `c-backup repo repair <id>`; a restart does not
+  clear it. Repair drops the repository's files from the page cache, so what
+  follows reads the disk and not what the failed sync left in memory, runs
+  a deep verify that writes nothing, and clears the latch only if the
+  verify finds nothing at all. If it finds damage it says how much and
+  leaves the repository `sync_failed`: run `c-backup verify <id>` (deep and
+  repairing) to fix what parity can, then `repo repair` again. A passing
+  repair removes the record, so the repository stays clear across later
+  restarts.
 
 ## 18. Capacity planning and performance
 

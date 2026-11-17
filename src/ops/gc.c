@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 
 #include "gc.h"
+#include "sync_latch.h"
 
 #include "chunklist.h"
 #include "manifest.h"
@@ -237,6 +238,12 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 int dry_run, atomic_int *cancel, gc_result_t *out)
 {
     if (!store || !db) return set_error(ERR_INVALID, "gc_run: null argument");
+    /* gc deletes once its commits are durable; a latched daemon's are not
+     * known to be (sync_latch.h). A dry run deletes nothing. */
+    if (!dry_run) {
+        status_t lst = sync_latch_repo_check(store_root(store), "gc");
+        if (lst != OK) return lst;
+    }
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);

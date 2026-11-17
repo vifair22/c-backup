@@ -360,7 +360,7 @@ status_t pack_resolve_location(store_t *store,
  * bytes (and its CRC slot, when that was the damage), and only once they
  * match the entry's CRC.
  * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error or
- * damage beyond parity.
+ * damage beyond parity. A failed write, sync or close sets the error.
  */
 int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 
@@ -517,8 +517,10 @@ typedef struct {
  * Rewrite entry headers damaged beyond parity from the index's rows, each
  * only once its header CRC and its whole-entry CRC prove it right. This is
  * what makes a pack gc could not walk walkable again: verify with repair
- * calls it. Returns headers written, or -1 when the pack has no usable
- * trailer or a write fails.
+ * calls it. Returns headers written, -1 when the pack has no usable
+ * trailer to prove a header against, or -2 when a write, its sync or the
+ * close failed (the error set names it): the pack is then not known to
+ * hold what was written, however it reads back from the page cache.
  */
 int pack_restore_headers(store_t *store, uint32_t pack_num,
                          const pack_hdr_hint_t *hints, size_t n);

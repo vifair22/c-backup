@@ -503,14 +503,20 @@ static int h_repo_show(const args_t *a)
 }
 
 /*
- * The operator accepting that a degraded repository's missing packs are
- * gone (B150). The flag is the point, so there is no form without it.
+ * Two repairs. With --accept-missing, the operator accepting that a
+ * degraded repository's missing packs are gone (B150); the flag is the
+ * point. Without it, clearing a failed sync (sync_latch.h) once the disk is
+ * fixed: a deep verify that writes nothing, read from disk, and the
+ * repository takes backups again only if it finds nothing. The daemon says
+ * when there is no failed sync to clear.
  */
+static int maintenance_ex(const char *action, const char *repo, const char *query,
+                          int no_wait, int quiet, long *out_job);
+
 static int h_repo_repair(const args_t *a)
 {
     if (!args_flag(a, "--accept-missing"))
-        return refuse(a, "repair marks the missing packs' objects as lost, so the next "
-                         "backup stores them again; say so with --accept-missing");
+        return maintenance_ex("verify", a->pos[0], "clear_sync=1", 0, 0, NULL);
     sbuf_t p = { 0 };
     sb_puts(&p, "/repos/"); sb_puts(&p, a->pos[0]); sb_puts(&p, "/repair");
     return call_path_sb("POST", &p, "{\"accept_missing\":true}");
@@ -1896,7 +1902,9 @@ static const command_t COMMANDS[] = {
       h_repo_add, 0 },
     { { "repo show",       P_REPO,     NULL, NULL }, h_repo_show, 0 },
     { { "repo repair",     P_REPO,     O_ACCEPT_MISSING,
-        "a degraded repository: accept its missing packs as lost" }, h_repo_repair, 0 },
+        "clear a repository's failed sync after a clean deep verify; with "
+        "--accept-missing, accept a degraded repository's missing packs as lost" },
+        h_repo_repair, 0 },
     { { "repo remove",     P_REPO,     NULL, NULL }, h_repo_remove, 0 },
     { { "repo key export", P_REPO,     NULL, NULL }, h_repo_key_export, 0 },
     { { "repo key import", P_KEY_IMP,  NULL, NULL }, h_repo_key_import, 0 },
