@@ -22,6 +22,10 @@ typedef struct {
     size_t n_include;
     char   user_root[PATH_MAX];              /* /mnt/user */
     char   mnt_root[PATH_MAX];               /* /mnt: pools and array disks below it */
+    /* The host's mount table, read by the helper itself: /proc/1/mountinfo
+     * under --pid=host, /proc/self/mountinfo when the helper already sees
+     * the host's tree. "" skips the bind resolution (tests of the rest). */
+    char   mountinfo[PATH_MAX];
 } mount_cfg_t;
 
 typedef enum { MOUNT_INCLUDED = 1, MOUNT_EXCLUDED = 2 } mount_verdict_t;
@@ -31,8 +35,26 @@ typedef struct {
     char recorded[PATH_MAX];   /* as the container binds it */
     char real[PATH_MAX];       /* where its bytes are, symlinks and shfs resolved */
     char reason[32];           /* excluded: remote-volume, outside-include-roots,
-                                  system; included: "" or share-split, array */
+                                  system; included: "" or share-split, array,
+                                  loop-image */
 } mount_class_t;
+
+/* The mount table path for tools: /proc/1/mountinfo when host_root is set
+ * (the helper reads the host through pid 1), else /proc/self/mountinfo. */
+void mount_default_mountinfo(const host_tools_t *t, char *buf, size_t sz);
+
+/*
+ * Where path's bytes are reachable outside any bind mount (B170). A bind
+ * mount, such as Unraid's /var/lib/docker over /mnt/cache/system/docker,
+ * shows in mountinfo as the same major:minor as the filesystem's own mount
+ * with a root below "/"; path is rewritten through that mount, preferring
+ * one under mnt_root. A path on no bind is copied unchanged, and so is one
+ * whose filesystem is mounted nowhere else; either way *loop is set when
+ * that filesystem is a loop device (Unraid's docker.img). Symlinks must
+ * already be resolved.
+ */
+status_t mount_unbind(const char *mountinfo, const char *mnt_root, const char *path,
+                      char *out, size_t sz, int *loop);
 
 /*
  * type is Docker's Mounts[].Type ("bind", "volume", "tmpfs", ...), driver

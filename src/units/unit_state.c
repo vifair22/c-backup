@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "unit_state.h"
+#include "snap_record.h"
 #include "db_txn.h"
 #include "registry.h"
 #include "db_write.h"
@@ -73,11 +74,16 @@ static status_t write_id_file(const char *path, const char *id)
         unlink(tmp);
         return set_error_errno(ERR_IO, "daemon id: write %s", tmp);
     }
-    close(fd);
+    if (close(fd) != 0) {
+        unlink(tmp);
+        return set_error_errno(ERR_IO, "daemon id: close %s", tmp);
+    }
     if (rename(tmp, path) != 0) {
         unlink(tmp);
         return set_error_errno(ERR_IO, "daemon id: rename to %s", path);
     }
+    if (snapshot_fsync_parent(path) != 0)
+        return set_error_errno(ERR_IO, "daemon id: sync the directory of %s", path);
     return OK;
 }
 
@@ -189,6 +195,12 @@ int units_allow_match(const char *allow, const char *provider,
         if (n >= sizeof(glob)) continue;
         memcpy(glob, s, n);
         glob[n] = '\0';
+        /* Compose project names are lowercase (unit keys follow compose),
+         * so a glob's project part is too: compose:Immich is immich. */
+        char *pj = glob;
+        if (strncmp(pj, "docker:", 7) == 0) pj += 7;
+        if (strncmp(pj, "compose:", 8) == 0)
+            for (pj += 8; *pj; pj++) if (*pj >= 'A' && *pj <= 'Z') *pj = (char)(*pj - 'A' + 'a');
         if ((name && fnmatch(glob, name, 0) == 0) ||
             (unit_id && fnmatch(glob, unit_id, 0) == 0) ||
             fnmatch(glob, key_name, 0) == 0 || fnmatch(glob, key_id, 0) == 0)

@@ -46,6 +46,8 @@
 #include "server.h"
 #include "state_db.h"
 #include "wal_sync.h"
+#include "sync_latch.h"
+#include "walidx.h"
 #include "checkpointer.h"
 #include "pack_presence.h"
 #include "prune.h"
@@ -57,6 +59,7 @@
 #include "remote_provider.h"
 #include "unit_backup.h"
 #include "unit_state.h"
+#include "tzinfo.h"
 
 #ifndef VERSION_STRING
 #define VERSION_STRING "0.0.0-dev"
@@ -126,17 +129,38 @@ static status_t startup_reindex(int64_t repo_id, void *ctx, int64_t *out_job_id)
     return routes_submit_startup_reindex(ctx, repo_id, out_job_id);
 }
 
-/* Every API request that changed something - a tag, a note, a policy, a
- * registered repository - is durable before its answer is sent (B139,
+/* Every API request of the durable class - a tag, a registered or removed
+ * repository, any delete - is durable before its answer is sent (B139,
  * B140), by the same means gc and prune use before removing what a commit
- * describes (db_txn_make_durable, B142), where synchronous=NORMAL would
- * otherwise leave it for the next once-a-second flush. */
-static void after_write(void *userdata)
+ * describes (db_txn_make_durable, B142). The commit-only class (notes,
+ * sources, policy, schedules, job submissions) is left to the
+ * once-a-second flush, which synchronous=NORMAL relies on anyway: its
+ * reply would otherwise wait out a WAL fdatasync that takes seconds on a
+ * saturated pool (B144, api_write_class_t). */
+static int after_write(void *userdata, char *why, size_t why_sz)
 {
     if (db_txn_make_durable(userdata) != OK) {
         log_warn("state.db: an API edit may not survive a power cut yet: %s", err_msg());
+        snprintf(why, why_sz, "%s", err_msg());
         err_clear();
+        return -1;
     }
+    return 0;
+}
+
+/* Whether Pushover is configured, for the latch's one alert. */
+static atomic_int g_alerts_on;
+
+static void sync_latch_alert(const char *msg)
+{
+    char body[1400];
+    snprintf(body, sizeof(body), "A storage sync failed: %s. Durable writes, backups, gc "
+             "and prune are refused where it failed (the whole daemon for state.db, one "
+             "repository for its own files) until a restart (state.db) or a passing "
+             "`c-backup repo repair` (a repository).", msg);
+    log_error("alert: c-backupd storage sync failed: %s", msg);
+    if (atomic_load(&g_alerts_on) && push_send("c-backupd: storage sync failed", body) != 0)
+        log_warn("alert: could not queue the storage sync alert");
 }
 
 /*
@@ -285,6 +309,23 @@ int main(int argc, char *argv[])
     log_info("c-backupd %s", VERSION_STRING);
     log_info("c-utils %s", cutils_version());
 
+    /*
+     * The zone calendar schedules run in, and a TZ the C library cannot
+     * resolve said aloud: glibc treats one as UTC without a word, so a typo
+     * such as TZ=America/Chicgo moved every calendar schedule by hours and
+     * nothing anywhere said so.
+     */
+    {
+        const char *tzv = getenv("TZ");
+        if (!tz_known(tzv, tz_zonedir()))
+            log_warn("TZ '%s' is not a zone this system has (nothing under %s, and "
+                     "not a POSIX TZ rule); the C library is using UTC, and "
+                     "calendar schedules fire in UTC", tzv, tz_zonedir());
+        char tzn[128];
+        tz_name(tzn, sizeof(tzn));
+        log_info("time zone: %s (calendar schedules and GFS day boundaries)", tzn);
+    }
+
     cutils_config_t *cfg = appguard_config(guard);
     cutils_db_t *db = appguard_db(guard);
 
@@ -398,6 +439,14 @@ int main(int argc, char *argv[])
         goto out_purge;
     }
 
+    /* Repositories whose syncs failed in an earlier run come up refusing,
+     * before any job can start (sync_latch.h): a restart checks nothing. */
+    sync_latch_set_db(db);
+    if (sync_latch_load(db) < 0) {
+        log_error("cannot read the repositories' failed-sync records from state.db");
+        goto out_purge;
+    }
+
     int max_parallel = config_get_int(cfg, "jobs.max_parallel", 2);
     if (job_manager_start(db, max_parallel, &jm) != OK) {
         log_error("cannot start job manager");
@@ -409,7 +458,9 @@ int main(int argc, char *argv[])
         const char *tok = config_get_str(cfg, PUSH_CONFIG_TOKEN);
         const char *usr = config_get_str(cfg, PUSH_CONFIG_USER);
         job_manager_set_alerts(jm, tok && tok[0] && usr && usr[0]);
+        atomic_store(&g_alerts_on, tok && tok[0] && usr && usr[0]);
     }
+    sync_latch_set_alert(sync_latch_alert);
 
     /*
      * Units (source-providers.md): the daemon id, the providers, then the
@@ -529,6 +580,9 @@ int main(int argc, char *argv[])
      * permissions on the socket are the access control there. */
     api_server_set_auth(srv, auth_check, db);
     api_server_set_after_write(srv, after_write, db);
+    /* Durable writes refused once a storage sync has failed: a later
+     * sync's success proves nothing about what the failed one held. */
+    api_server_set_durable_gate(srv, sync_latch_api_gate, db);
 
     if (api_server_start(srv) != 0) {
         log_error("cannot start API server: %s", api_server_error());
@@ -603,11 +657,15 @@ out_locks:
     /* After every writer has stopped: one last sync of the WAL. A no-op
      * when it was never started. */
     checkpointer_stop();
+    sync_latch_persist_drain();
     state_db_flusher_stop();
     /* Let go of the kept WAL descriptor before the close deletes the file,
      * so the process does not pin a deleted inode on its way out. */
     wal_sync_reset();
 out_guard:
     appguard_shutdown(guard);
+    /* After the database is closed: closing -shm sooner would drop the
+     * locks its connections hold (B173). */
+    walidx_close_all();
     return rc;
 }

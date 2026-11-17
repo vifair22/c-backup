@@ -286,6 +286,8 @@ typedef struct {
     unit_json_t               uj;
     char                     *uj_text;
     uint64_t                  bytes_read;
+    size_t                    streams_failed;   /* dumps not stored */
+    char                      stream_failed[256]; /* the first's path, for the warning */
     int                       held;      /* begin kept a pause for pass 2 */
     int                       cap_hit;   /* and the watchdog let it go first */
     /* Incremental reads. */
@@ -624,13 +626,18 @@ static void part_close(void *ctx, size_t index, status_t st, const cdc_result_t 
         p->stream_ok = st == OK && ok;
         p->stream_open = 0;
         if (st == OK && cr) p->bytes_read = cr->size;
-        if (!p->stream_ok)
+        if (!p->stream_ok) {
             log_warn("unit %s: %s failed; it is not stored", u->desc->unit_id, it->tree_path);
+            if (!u->streams_failed++)
+                snprintf(u->stream_failed, sizeof(u->stream_failed), "%.250s", it->tree_path);
+        }
         free(p->pipe.buf);
         p->pipe.buf = NULL;
     }
     part_release(p);
-    u->bytes_read += p->bytes_read;
+    /* Disk bytes only: a dump's bytes are its item's size, not a read of
+     * a disk, and the result calls this disk bytes read. */
+    if (p->item < 0 || u->desc->items[p->item].kind != SP_ITEM_STREAM) u->bytes_read += p->bytes_read;
 }
 
 /* A failed dump is never stored: it looks valid and is not (6.6). */
@@ -1147,9 +1154,15 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (st == OK) {
             snap = br.snapshot_id;
             res->files = br.files;
-            if (br.files_skipped && !res->warning[0])
+            /* A failed dump is one of the entries left out; it is named as
+             * the dump it is, not counted as a file that could not be read. */
+            uint64_t unread = br.files_skipped > u.streams_failed ? br.files_skipped - u.streams_failed : 0;
+            if (u.streams_failed && !res->warning[0])
+                snprintf(res->warning, sizeof(res->warning), "%zu dump(s) failed and are not in "
+                         "snapshot %lld; first: %s", u.streams_failed, (long long)snap, u.stream_failed);
+            else if (unread && !res->warning[0])
                 snprintf(res->warning, sizeof(res->warning), "%llu file(s) could not be read "
-                         "and are not in snapshot %lld", (unsigned long long)br.files_skipped,
+                         "and are not in snapshot %lld", (unsigned long long)unread,
                          (long long)snap);
         }
         backup_result_free(&br);
@@ -1521,6 +1534,15 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     char (*grp)[64] = calloc(np ? np : 1, sizeof(*grp));
     int *done = calloc(np ? np : 1, sizeof(*done));
     if (!grp || !done) st = set_error(ERR_NOMEM, "unit backup");
+    /* Group and job scope need a provider that captures units together.
+     * One that cannot (an in-process provider) takes each unit alone, and
+     * says so: it used to do that without a word. */
+    if (st == OK && !ops->begin_group && o->pause_scope != UNIT_SCOPE_UNIT && np > 1) {
+        snprintf(out->scope_note, sizeof(out->scope_note), "pause scope %s needs a provider that captures "
+                 "units together; provider %s does not, so each unit was its own capture",
+                 o->pause_scope == UNIT_SCOPE_JOB ? "job" : "group", ops->name);
+        log_warn("unit backup: %s", out->scope_note);
+    }
     if (st == OK && ops->begin_group && o->pause_scope != UNIT_SCOPE_UNIT) {
         for (size_t k = 0; k < np; k++) {
             if (o->pause_scope == UNIT_SCOPE_JOB) { snprintf(grp[k], sizeof(grp[k]), "job"); continue; }

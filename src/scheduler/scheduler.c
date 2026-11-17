@@ -107,8 +107,20 @@ static status_t recompute(cutils_db_t *db, int64_t schedule_id, time_t now,
      * stampede of catch-up runs after a three-day outage. run_once fires
      * immediately and then resumes, which is right for hygiene work like gc
      * or verify that should happen if it was missed.
+     *
+     * Only at startup, for the same reason as the never-fired case above: a
+     * window is missed only while the daemon was down. Every other recompute
+     * also sees a last fire one window back, and read it as missed (B172).
+     * A tick that skipped the fire for an overlap does not move
+     * last_fired_at, so the recompute after it set next = now, the next
+     * tick skipped again, and the schedule spun at the loop's 100 ms floor
+     * logging "skipping this fire" and rewriting its row on the shared
+     * handle until the overlap ended, then fired late instead of skipping.
+     * Enabling a disabled schedule took the same path and fired a catch-up
+     * run although the daemon had been up throughout. A failed dispatch did
+     * too, retrying every tick.
      */
-    if (run_once && last > 0) {
+    if (run_once && last > 0 && at_startup) {
         time_t due_had_it_not_missed = trigger_next_fire(&t, last, last);
         if (due_had_it_not_missed > 0 && due_had_it_not_missed <= now)
             next = now;

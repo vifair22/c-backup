@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "sync_latch.h"
 #include "repo.h"
 #include "repo_key.h"
 #include "repo_purge.h"
@@ -75,20 +76,31 @@ static int repo_row_add(cutils_db_t *db, cutils_json_elem_t *e, cutils_json_resp
     char why[PACK_PRESENCE_WHY_MAX] = "";
     int avail = pack_presence_available(db, strtoll(row[0], NULL, 10), why, sizeof(why));
     if (avail == 1) why[0] = '\0';
-    const char *state = avail != 1 ? "unavailable" : deg[0] ? "degraded" : "ok";
+    /* A failed sync in this repository (sync_latch.h) wins over the rest:
+     * it refuses backups, gc and prune until a repair or a restart. */
+    char sync_err[1024] = "", sync_at[32] = "";
+    int64_t at = 0;
+    int synced_bad = sync_latch_repo_info(row[2], sync_err, sizeof(sync_err), &at);
+    if (synced_bad) snprintf(sync_at, sizeof(sync_at), "%lld", (long long)at);
+    const char *state = synced_bad ? "sync_failed"
+                      : avail != 1 ? "unavailable" : deg[0] ? "degraded" : "ok";
     if (e)
         return jrow_elem_add_row(e, k_repo_cols, JROW_N(k_repo_cols), row) != 0
             || jrow_elem_add(e, "encryption", JCOL_STR, enc) != 0
             || jrow_elem_add(e, "key_escrowed", JCOL_BOOL, esc) != 0
             || jrow_elem_add(e, "state", JCOL_STR, state) != 0
             || jrow_elem_add(e, "degraded", JCOL_STR_NULL, deg) != 0
-            || jrow_elem_add(e, "unavailable", JCOL_STR_NULL, why) != 0;
+            || jrow_elem_add(e, "unavailable", JCOL_STR_NULL, why) != 0
+            || jrow_elem_add(e, "sync_failed", JCOL_STR_NULL, sync_err) != 0
+            || jrow_elem_add(e, "sync_failed_at", JCOL_INT, sync_at) != 0;
     return jrow_resp_add_row(r, k_repo_cols, JROW_N(k_repo_cols), row) != 0
         || jrow_resp_add(r, "encryption", JCOL_STR, enc) != 0
         || jrow_resp_add(r, "key_escrowed", JCOL_BOOL, esc) != 0
         || jrow_resp_add(r, "state", JCOL_STR, state) != 0
         || jrow_resp_add(r, "degraded", JCOL_STR_NULL, deg) != 0
-        || jrow_resp_add(r, "unavailable", JCOL_STR_NULL, why) != 0;
+        || jrow_resp_add(r, "unavailable", JCOL_STR_NULL, why) != 0
+        || jrow_resp_add(r, "sync_failed", JCOL_STR_NULL, sync_err) != 0
+        || jrow_resp_add(r, "sync_failed_at", JCOL_INT, sync_at) != 0;
 }
 
 static api_response_t list_repos(const api_request_t *req, void *userdata)
@@ -600,7 +612,8 @@ static int repo_path_bad_id(const char *rest, api_response_t *out)
 }
 
 /*
- * Every resource under /repos/<id>, and the methods it answers.
+ * Every resource under /repos/<id>, the methods it answers, and for each
+ * write what its answer waits for (api_write_class_t, B144).
  *
  * The four repo-scoped handlers each dispatch on the path for their own
  * method, so none of them could say whether a path it did not serve existed
@@ -609,71 +622,121 @@ static int repo_path_bad_id(const char *rest, api_response_t *out)
  * that knows the whole tree, and each handler consults it before
  * dispatching, so a path is either served, refused with 405 and the methods
  * that would work, or 404. A route added to a handler has to be added here
- * or it answers 405; tests/test_api_e2e.sh exercises the table.
+ * or it answers 405, and it cannot be added without a class, because the
+ * class is what says the method is served. tests/test_api_e2e.sh exercises
+ * the table and tests/test_route_classes.c holds it to having classes.
+ *
+ * Durable: tags (retention protection), and every delete, which a client
+ * acts on as gone. repair too: it is the operator accepting packs as lost,
+ * the one write here that deletes index rows. Commit-only: DB-only edits
+ * an operator can repeat (sources, policy, schedules, notes, key escrow)
+ * and job submissions, whose job a power cut leaves interrupted or never
+ * started. gc and gfs delete, but in their jobs, which make each commit
+ * durable before removing what it describes (B142); the request only
+ * queues them. Fixed paths first, then shapes, matched in repo_path_entry.
  */
-static const char *repo_path_allow(const char *rest)
+#define D_ API_DURABLE
+#define C_ API_COMMIT_ONLY
+static const api_path_t k_repo_paths[] = {
+    /* path                        GET  POST  PUT  DELETE */
+    { "",                            1,  0,    0,   D_ },
+    { "/key",                        1,  0,    0,   0  },
+    { "/key/import",                 0,  C_,   0,   0  },
+    { "/key/ack",                    0,  C_,   0,   0  },
+    { "/repair",                     0,  D_,   0,   0  },
+    { "/tags",                       1,  D_,   0,   0  },
+    { "/schedules",                  1,  C_,   0,   0  },
+    { "/policy",                     1,  0,    C_,  0  },
+    { "/sources",                    1,  0,    C_,  0  },
+    { "/journal",                    1,  0,    0,   0  },
+    { "/summary",                    1,  0,    0,   0  },
+    { "/stats",                      1,  0,    0,   0  },
+    { "/diff",                       1,  0,    0,   0  },
+    { "/fanout",                     1,  0,    0,   0  },
+    { "/objects",                    1,  0,    0,   0  },
+    { "/packs",                      1,  0,    0,   0  },
+    { "/snapshots",                  1,  0,    0,   0  },
+    { "/search",                     1,  0,    0,   0  },
+    { "/grep",                       1,  C_,   0,   0  },
+    { "/verify",                     1,  C_,   0,   0  },
+    { "/backup",                     0,  C_,   0,   0  },
+    { "/gc",                         0,  C_,   0,   0  },
+    { "/gfs",                        0,  C_,   0,   0  },
+    { "/reindex",                    0,  C_,   0,   0  },
+    { "/replicate",                  0,  C_,   0,   0  },
+    /* Shapes: the path names a sample. */
+    { "/tags/<name>",                0,  0,    0,   D_ },
+    { "/schedules/<id>",             0,  0,    C_,  D_ },
+    { "/grep/<id>",                  1,  0,    0,   0  },
+    { "/verify/<id>",                1,  0,    0,   0  },
+    { "/packs/<n>/entries",          1,  0,    0,   0  },
+    { "/objects/<hash>",             1,  0,    0,   0  },
+    { "/snapshots/<id>",             0,  0,    0,   D_ },
+    { "/snapshots/<id>/note",        1,  0,    C_,  0  },
+    { "/snapshots/<id>/tree",        1,  0,    0,   0  },
+    { "/snapshots/<id>/restore",     0,  C_,   0,   0  },
+};
+#undef D_
+#undef C_
+
+static const api_path_t *repo_path_named(const char *path)
 {
-    static const struct { const char *path; const char *allow; } fixed[] = {
-        { "",            "GET, DELETE" },
-        { "/key",        "GET" },
-        { "/key/import", "POST" },
-        { "/key/ack",    "POST" },
-        { "/repair",     "POST" },
-        { "/tags",       "GET, POST" },
-        { "/schedules",  "GET, POST" },
-        { "/policy",     "GET, PUT" },
-        { "/sources",    "GET, PUT" },
-        { "/journal",    "GET" },
-        { "/summary",    "GET" },
-        { "/stats",      "GET" },
-        { "/diff",       "GET" },
-        { "/fanout",     "GET" },
-        { "/objects",    "GET" },
-        { "/packs",      "GET" },
-        { "/snapshots",  "GET" },
-        { "/search",     "GET" },
-        { "/grep",       "GET, POST" },
-        { "/verify",     "GET, POST" },
-        { "/backup",     "POST" },
-        { "/gc",         "POST" },
-        { "/gfs",        "POST" },
-        { "/reindex",    "POST" },
-        { "/replicate",  "POST" },
-    };
-    for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)
-        if (strcmp(rest, fixed[i].path) == 0) return fixed[i].allow;
+    for (size_t i = 0; i < sizeof(k_repo_paths) / sizeof(k_repo_paths[0]); i++)
+        if (strcmp(k_repo_paths[i].path, path) == 0) return &k_repo_paths[i];
+    return NULL;
+}
+
+const api_path_t *routes_repo_paths(size_t *n)
+{
+    *n = sizeof(k_repo_paths) / sizeof(k_repo_paths[0]);
+    return k_repo_paths;
+}
+
+static const api_path_t *repo_path_entry(const char *rest)
+{
+    /* A fixed path: no shape sample holds a '<', and no request path can,
+     * since every shape is matched below and never by name. */
+    if (!strchr(rest, '<')) {
+        const api_path_t *f = repo_path_named(rest);
+        if (f) return f;
+    }
 
     /* Units (units.c) keep their own part of the table. */
-    const char *ua = units_path_allow(rest);
+    const api_path_t *ua = units_path_entry(rest);
     if (ua) return ua;
 
     const char *e;
-    if (strncmp(rest, "/tags/", 6) == 0 && rest[6]) return "DELETE";
+    if (strncmp(rest, "/tags/", 6) == 0 && rest[6]) return repo_path_named("/tags/<name>");
     if (strncmp(rest, "/schedules/", 11) == 0 &&
-        (e = skip_id(rest + 11)) && *e == '\0') return "PUT, DELETE";
+        (e = skip_id(rest + 11)) && *e == '\0') return repo_path_named("/schedules/<id>");
     if (strncmp(rest, "/grep/", 6) == 0 &&
-        (e = skip_id(rest + 6)) && *e == '\0') return "GET";
+        (e = skip_id(rest + 6)) && *e == '\0') return repo_path_named("/grep/<id>");
     if (strncmp(rest, "/verify/", 8) == 0 &&
-        (e = skip_id(rest + 8)) && *e == '\0') return "GET";
+        (e = skip_id(rest + 8)) && *e == '\0') return repo_path_named("/verify/<id>");
     /* Pack numbers start at 0, unlike every other id here. */
     int64_t pnum = 0;
     if (strncmp(rest, "/packs/", 7) == 0 &&
         routes_path_id(rest + 7, 0, &pnum, &e) == 1 && strcmp(e, "/entries") == 0)
-        return "GET";
+        return repo_path_named("/packs/<n>/entries");
     if (strncmp(rest, "/objects/", 9) == 0 && rest[9] && rest[9] != '/') {
         const char *slash = strchr(rest + 9, '/');
         if (!slash || strcmp(slash, "/refs") == 0 || strcmp(slash, "/layout") == 0 ||
             strcmp(slash, "/content") == 0)
-            return "GET";
+            return repo_path_named("/objects/<hash>");
         return NULL;
     }
     if (strncmp(rest, "/snapshots/", 11) == 0 && (e = skip_id(rest + 11))) {
-        if (*e == '\0')                    return "DELETE";
-        if (strcmp(e, "/note") == 0)       return "GET, PUT";
-        if (strcmp(e, "/tree") == 0)       return "GET";
-        if (strcmp(e, "/restore") == 0)    return "POST";
+        if (*e == '\0')                 return repo_path_named("/snapshots/<id>");
+        if (strcmp(e, "/note") == 0)    return repo_path_named("/snapshots/<id>/note");
+        if (strcmp(e, "/tree") == 0)    return repo_path_named("/snapshots/<id>/tree");
+        if (strcmp(e, "/restore") == 0) return repo_path_named("/snapshots/<id>/restore");
     }
     return NULL;
+}
+
+static const char *repo_path_allow(const char *rest)
+{
+    return api_path_allow(repo_path_entry(rest));
 }
 
 /* Whether `method` is one of the comma-separated names in `allow`. */
@@ -698,6 +761,15 @@ static int repo_path_refused(const char *rest, const char *method,
     if (!allow) { *out = api_error(404, "not found"); return 1; }
     if (!allow_has(allow, method)) { *out = api_method_not_allowed(allow); return 1; }
     return 0;
+}
+
+/* For the router: what a 2xx write under /repos/<id> waits for. */
+static api_write_class_t repo_class_for_url(const char *url, api_method_t method, void *ud)
+{
+    (void)ud;
+    const char *rest = NULL;
+    if (split_repo_url(url, &rest) < 0) return API_CLASS_NONE;
+    return api_path_class(repo_path_entry(rest), method);
 }
 
 /* For the router: a method no handler is registered for (PATCH, OPTIONS). */
@@ -1011,13 +1083,17 @@ static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
 int routes_register_repos(api_server_t *srv, cutils_db_t *db)
 {
     g_db_for_keys = db;
-    if (api_server_route(srv, "/repos",   API_GET,    list_repos,       db) != 0) return -1;
-    if (api_server_route(srv, "/repos",   API_POST,   create_repo,      db) != 0) return -1;
-    if (api_server_route(srv, "/repos/*", API_GET,    repo_scoped_get,  db) != 0) return -1;
-    if (api_server_route(srv, "/repos/*", API_POST,   repo_scoped_post, db) != 0) return -1;
-    if (api_server_route(srv, "/repos/*", API_PUT,    repo_scoped_put,  db) != 0) return -1;
-    if (api_server_route(srv, "/repos/*", API_DELETE, repo_scoped_delete, db) != 0) return -1;
+    /* Registering a repository is durable: a client told it exists acts
+     * on that (B140). Everything under /repos/<id> is classed per path in
+     * k_repo_paths. */
+    if (api_server_route(srv, "/repos",   API_GET,    API_CLASS_NONE,    list_repos,       db) != 0) return -1;
+    if (api_server_route(srv, "/repos",   API_POST,   API_DURABLE,       create_repo,      db) != 0) return -1;
+    if (api_server_route(srv, "/repos/*", API_GET,    API_CLASS_NONE,    repo_scoped_get,  db) != 0) return -1;
+    if (api_server_route(srv, "/repos/*", API_POST,   API_CLASS_BY_PATH, repo_scoped_post, db) != 0) return -1;
+    if (api_server_route(srv, "/repos/*", API_PUT,    API_CLASS_BY_PATH, repo_scoped_put,  db) != 0) return -1;
+    if (api_server_route(srv, "/repos/*", API_DELETE, API_CLASS_BY_PATH, repo_scoped_delete, db) != 0) return -1;
     if (api_server_route_allow(srv, "/repos/*", repo_allow_for_url, db) != 0) return -1;
+    if (api_server_route_class(srv, "/repos/*", repo_class_for_url, db) != 0) return -1;
     return 0;
 }
 

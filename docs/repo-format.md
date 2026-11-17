@@ -16,17 +16,30 @@ There is no reader for any other format (see "Format version" below).
   tags                the tag list, which reindex restores (absent until a tag is set)
   packs/XXXXXX/pack-NNNNNNNNNN.dat   every object, in packs, 256 per directory
   packs/.deleting-NNNNNNNNNN         pending pack removals
-  tmp/                staging for atomic writes; never read back
+  packs/.staging/     staging for packs and removal markers; never read back
+  tmp/                staging for every other atomic write; never read back
 ```
 
 There is no `objects/` directory. Every object lives in a pack (see "No
 loose objects").
 
-## Why `tmp/` is inside the repository
+## Why `tmp/` is inside the repository, and pack staging inside `packs/`
 
 Every durable write is `mkstemp`, `fsync`, `rename`, and `rename` only works
 within a filesystem. A staging directory in `/tmp` would silently become a
 copy across a device boundary, losing atomicity exactly when it matters.
+
+`packs/` may be a mount of its own (Manual section 5.3), so a pack staged in
+`tmp/` would cross a device boundary on its way in: until B163 every backup
+into such a repository failed at its first pack with `EXDEV`. Packs and
+`.deleting-` markers are staged in `packs/.staging/` instead, created on
+first use; everything that lands in the root or `snapshots/` is staged in
+`tmp/`. So `packs/` is the one directory that may sit on another
+filesystem; the root, `snapshots/` and `tmp/` share one. The staging
+directory's name is neither a shard (six hex digits) nor a marker, so
+nothing that walks `packs/` for those reads it. Both staging directories
+are swept by the same rules (Manual section 2.2), and the claim lock that
+lets a sweep remove young staging stays at `tmp/.lock`.
 
 ## Format version
 
@@ -475,7 +488,8 @@ encodes the stripe as the body grows, a group at a time on a small pool,
 and its seal reads nothing back; the other writers' seals read the body
 back a window of groups at a time (64 groups), computing parity and the CRC
 table in one pass. Neither needs memory that grows with the pack beyond its
-parity. A pack installs with one `rename` from `tmp/`, after `fsync`. Its contents
+parity. A pack installs with one `rename` from `packs/.staging/`, after `fsync`,
+and its shard directory and `packs/` are synced before the index names it. Its contents
 reach the daemon's index through the pack-commit callback; a store with no
 resolver indexes its packs itself (`store_scan_packs`).
 
@@ -948,7 +962,7 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
    cuts its files into a pack writer of its own, sharing the chunk workers,
    and seals its own packs. Pack numbers come from one allocator on the
    store handle (`store_alloc_pack_num`), since writers staging at once
-   cannot see each other's packs in `tmp/`. Writers do not see each other's
+   cannot see each other's packs in staging. Writers do not see each other's
    unsealed entries either, so they share a claim set (`pack_claims_t`,
    OWN-46): a writer claims a name before writing it, a writer that finds
    it claimed references it without writing it, and the claims clear when
@@ -985,7 +999,7 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
 7. Directories: `manifest_store_tree` through the backup thread's sink,
    fragmenting above 256 KiB serialised. The tree phase never seals.
 
-Crash safety is the backup pack's, unchanged: staging in `tmp/`, install by
+Crash safety is the backup pack's, unchanged: staging in `packs/.staging/`, install by
 rename, rows with or after install, sweep of staging and staged rows at the
 next start. Nothing is written loose and the pack pass finds nothing to do.
 

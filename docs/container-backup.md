@@ -158,7 +158,16 @@ resolve(/mnt/user/<share>/<rest>):
 ```
 
 Symlinks are resolved too (`/mnt/user/domains` is a symlink to
-`../cache/domains` on FS1). The **recorded** path is always the source as
+`../cache/domains` on FS1), and then bind mounts on the host, through the
+host's mount table (B170): `/var/lib/docker` is a bind of
+`/mnt/cache/system/docker`, so a named volume's
+`/var/lib/docker/volumes/<v>/_data` is read as
+`/mnt/cache/system/docker/volumes/<v>/_data`, in `cache/system`'s domain.
+A mount table entry whose root is below `/` is a bind of that directory of
+its filesystem; the path is rewritten through another mount of the same
+major:minor, preferring one under `/mnt`. Docker in a loop-mounted
+`docker.img` has no such mount: its volumes are read live and noted
+`loop-image` (`helper.md`, Docker and LXC providers). The **recorded** path is always the source as
 the container binds it, so a plain file restore puts data back where
 Docker expects it; the read path is the snapshot's copy of the resolved
 path.

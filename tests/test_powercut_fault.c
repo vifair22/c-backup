@@ -20,9 +20,9 @@
  *
  *   - Steps are the repository's renames, unlinks, mkdirs, fsyncs and
  *     writes (fault_inject.h), each index commit (an SQLite WAL hook), and
- *     each make_durable (db_txn.h). A write to a staging file in tmp/ is
- *     counted but not cut at: the disk after it is the disk before it,
- *     because nothing unsynced in tmp/ survives.
+ *     each make_durable (db_txn.h). A write to a staging file in tmp/ or
+ *     packs/.staging is counted but not cut at: the disk after it is the
+ *     disk before it, because nothing unsynced in staging survives.
  *   - At the cut, every directory change whose directory was never synced
  *     afterwards is undone, newest first; a file whose content is not what
  *     its last fsync saw goes back to what it was before the operation, or
@@ -70,6 +70,7 @@
 
 #include "backup.h"
 #include "db_txn.h"
+#include "db_write.h"
 #include "fake_provider.h"
 #include "fault_inject.h"
 #include "gc.h"
@@ -81,6 +82,8 @@
 #include "prune.h"
 #include "reindex.h"
 #include "registry.h"
+#include "routes.h"
+#include "server.h"
 #include "replicate.h"
 #include "repo.h"
 #include "repo_key.h"
@@ -278,9 +281,12 @@ static int in_scope(const char *p)
     return strncmp(p, H_REPO "/", sizeof(H_REPO)) == 0 || strcmp(p, H_REPO) == 0;
 }
 
+/* Staging: tmp/, and packs/.staging where packs are staged (B163). */
 static int in_scratch(const char *p)
 {
-    return strncmp(p, H_REPO "/tmp/", sizeof(H_REPO "/tmp")) == 0;
+    return strncmp(p, H_REPO "/tmp/", sizeof(H_REPO "/tmp")) == 0 ||
+           strncmp(p, H_REPO "/" STORE_PACK_STAGING "/",
+                   sizeof(H_REPO "/" STORE_PACK_STAGING)) == 0;
 }
 
 /* One step: 1 when it happens, 0 when the cut came first. g_mu held. */
@@ -531,6 +537,10 @@ static int hook_nosync(int fd, int data_only)
 
 static void model_off(void)
 {
+    /* What follows a cut is a restart reading back from disk: syncs after
+     * the cut failed as a dead machine's would, and the latch they tripped
+     * (sync_latch.h) belongs to the process that died. */
+    sync_latch_reset_for_test();
     fault_write_hook  = NULL;
     fault_rename_hook = NULL;
     fault_unlink_hook = NULL;
@@ -637,6 +647,10 @@ typedef struct scenario {
      * snapshot checked item by item, and after the checks one more session
      * has to store and restore the unit as it is (unit_check_next). */
     int         units;
+    /* An API request: called with the index as the cut left it (started 0)
+     * and again after the start (started 1), to hold the request's own
+     * edit to what its durability class promises. */
+    void      (*check)(int crash_at, int kept, int started);
 } scenario_t;
 
 /* ---- units --------------------------------------------------------- */
@@ -1553,6 +1567,9 @@ typedef struct {
     unsigned count[K_KINDS];
 } tally_t;
 
+/* make_durable calls the trial's operation made before the cut. */
+static unsigned g_trial_durables;
+
 /* One run of the operation with the cut before step crash_at (0: after
  * the operation finished), and the start and checks for each way the
  * index can come back. */
@@ -1567,6 +1584,9 @@ static int trial(const scenario_t *s, int crash_at, int total, int counting, tal
         fail_msg("%s: fails with no cut: %s", s->name, err_msg());
     err_clear();
     model_cut();
+    pthread_mutex_lock(&g_mu);
+    g_trial_durables = g_count[K_DURABLE];
+    pthread_mutex_unlock(&g_mu);
 
     int steps = g_steps;
     step_kind_t at = crash_at && crash_at <= MAX_STEPS ? (step_kind_t)g_kind[crash_at] : 0;
@@ -1612,7 +1632,9 @@ static int trial(const scenario_t *s, int crash_at, int total, int counting, tal
         else
             snprintf(g_where, sizeof(g_where), "%s, cut after it finished, %s", s->name,
                      v ? "every commit kept" : "commits since the last make_durable lost");
+        if (s->check) s->check(crash_at, v, 0);
         start_and_check();
+        if (s->check) s->check(crash_at, v, 1);
         t->checks++;
     }
     t->trials++;
@@ -2123,27 +2145,223 @@ static status_t op_backup_after_drop(ctx_t *c, int counting)
     return op_backup(c, counting, 2, 3);
 }
 
+/* ---- API requests ---------------------------------------------------
+ *
+ * A request through the daemon's own router, handler and after-write rule
+ * (api_server_dispatch), so a route's durability class is the one it is
+ * registered with (B144). A durable route's edit has to be in the index a
+ * cut right after the answer leaves, with the commits since the last
+ * make_durable lost; a commit-only route's edit may be lost there, and
+ * whatever the cut keeps, nothing may be corrupt: the start and every
+ * check hold for each cut, and the edit is either wholly there or wholly
+ * not.
+ */
+
+/* What c-backupd's after-write hook does (main.c). */
+static int api_after_write(void *db, char *why, size_t why_sz)
+{
+    if (db_txn_make_durable(db) == OK) return 0;
+    snprintf(why, why_sz, "%s", err_msg());
+    err_clear();
+    return -1;
+}
+
+static status_t api_call(ctx_t *c, api_method_t m, const char *path, const char *body)
+{
+    routes_metadata_init(c->db);
+    routes_schedules_init(c->db, NULL);
+    api_server_t *srv = api_server_create(0, NULL, NULL, NULL);
+    assert_non_null(srv);
+    assert_int_equal(routes_register_repos(srv, c->db), 0);
+    api_server_set_after_write(srv, api_after_write, c->db);
+    char url[160];
+    snprintf(url, sizeof(url), "/repos/%lld%s", (long long)g_repo_id, path);
+    api_request_t req = { .method = m, .url = url, .body = body,
+                          .body_len = body ? strlen(body) : 0, .is_local = 1,
+                          .client_addr = "" };
+    api_response_t r = api_server_dispatch(srv, &req);
+    status_t st = r.status >= 200 && r.status < 300
+                ? OK : set_error(ERR_IO, "%s %s: %d %s", m == API_PUT ? "PUT" : "POST/DELETE",
+                                 url, r.status, r.body ? r.body : "");
+    free(r.body);
+    free(r.set_cookie);
+    api_server_stop(srv);
+    return st;
+}
+
+static long long index_count(const char *sql)
+{
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, H_DB), 0);
+    long long n = count_of(db, sql);
+    db_close(db);
+    return n;
+}
+
+static char *index_text(const char *sql)
+{
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, H_DB), 0);
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)g_repo_id);
+    db_result_t *r = NULL;
+    char *out = NULL;
+    if (db_execute(db, sql, (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        out = strdup(r->rows[0][0]);
+    db_result_free(r);
+    db_close(db);
+    return out ? out : strdup("");
+}
+
+/* Two snapshots, a schedule, sources and a note, so each request below
+ * changes something already there. */
+static void build_api(ctx_t *c)
+{
+    begin_build(c);
+    open_target(c);
+    g_required[backup_into(c->store, c->db, g_repo_id, 1)] = 1;
+    g_required[backup_into(c->store, c->db, g_repo_id, 2)] = 1;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)g_repo_id);
+    assert_int_equal(db_txn_begin(c->db), OK);
+    assert_int_equal(db_write(c->db,
+        "INSERT INTO schedules (repo_id, action, params, trigger_type, trigger_spec,"
+        " on_overlap, catchup, enabled, next_due_at, created_at)"
+        " VALUES (?, 'gc', '', 'interval', '86400', 'skip', 'skip', 1, 0, 0)",
+        (const char *[]){ repo, NULL }, NULL), 0);
+    assert_int_equal(db_write(c->db,
+        "INSERT INTO repo_backup_paths (repo_id, kind, value) VALUES (?, 'source', '/old')",
+        (const char *[]){ repo, NULL }, NULL), 0);
+    assert_int_equal(db_write(c->db,
+        "INSERT INTO notes (repo_id, snap_id, body, updated_at) VALUES (?, 1, 'old', 0)",
+        (const char *[]){ repo, NULL }, NULL), 0);
+    assert_int_equal(db_txn_commit(c->db), OK);
+    end_build(c);
+}
+
+/* Durable, and in the repository too: the tags file first, the commit
+ * after, then the sync before the answer. */
+static status_t op_api_tag(ctx_t *c, int counting)
+{
+    (void)counting;
+    return api_call(c, API_POST, "/tags", "{\"name\":\"keep\",\"snap_id\":1}");
+}
+
+static void check_api_tag(int crash_at, int kept, int started)
+{
+    long long n = index_count("SELECT COUNT(*) FROM tags WHERE repo_id = ? AND name = 'keep'");
+    if (n < 0 || n > 1) violation("%lld rows for tag keep", n);
+    if (crash_at == 0 && n != 1)
+        violation("tag set was answered and is not in the index%s",
+                  started ? " after the start" : (kept ? "" : " the cut left"));
+    if (started && n == 1 &&
+        index_count("SELECT snap_id FROM tags WHERE repo_id = ? AND name = 'keep'") != 1)
+        violation("tag keep names the wrong snapshot");
+}
+
+/* Durable and DB-only: nothing in the repository puts a schedule back, so
+ * only the sync before the answer keeps it deleted. */
+static status_t op_api_schedule_delete(ctx_t *c, int counting)
+{
+    (void)counting;
+    return api_call(c, API_DELETE, "/schedules/1", NULL);
+}
+
+static void check_api_schedule_delete(int crash_at, int kept, int started)
+{
+    (void)kept;
+    long long n = index_count("SELECT COUNT(*) FROM schedules WHERE repo_id = ?");
+    if (n < 0 || n > 1) violation("%lld schedules", n);
+    if (crash_at == 0 && n != 0)
+        violation("schedule delete was answered and the schedule is back%s",
+                  started ? " after the start" : "");
+}
+
+/* Commit-only: the answer does not wait for the sync, so a cut right after
+ * it loses the edit unless the flusher got there first. Either way the
+ * note is the old one or the new one. */
+static status_t op_api_note(ctx_t *c, int counting)
+{
+    (void)counting;
+    return api_call(c, API_PUT, "/snapshots/1/note", "{\"body\":\"new\"}");
+}
+
+static void check_api_note(int crash_at, int kept, int started)
+{
+    char *b = index_text("SELECT body FROM notes WHERE repo_id = ? AND snap_id = 1");
+    if (strcmp(b, "old") != 0 && strcmp(b, "new") != 0)
+        violation("note is '%s', neither the old one nor the new", b);
+    if (crash_at == 0) {
+        if (g_trial_durables != 0)
+            violation("a commit-only note waited for %u make_durable", g_trial_durables);
+        /* The model's two outcomes: the flusher synced it, or it did not. */
+        if (kept && strcmp(b, "new") != 0) violation("note lost with every commit kept");
+        if (!kept && !started && strcmp(b, "old") != 0)
+            violation("note survived a cut before any sync: the model is wrong");
+    }
+    free(b);
+}
+
+/* Commit-only, several rows in one transaction: never a mixture. */
+static status_t op_api_sources(ctx_t *c, int counting)
+{
+    (void)counting;
+    return api_call(c, API_PUT, "/sources", "{\"sources\":[\"/new1\",\"/new2\"]}");
+}
+
+static void check_api_sources(int crash_at, int kept, int started)
+{
+    char *v = index_text("SELECT COALESCE(GROUP_CONCAT(value, ','), '') FROM"
+                         " (SELECT value FROM repo_backup_paths WHERE repo_id = ?"
+                         "  AND kind = 'source' ORDER BY value)");
+    if (strcmp(v, "/old") != 0 && strcmp(v, "/new1,/new2") != 0)
+        violation("sources are '%s', neither the old set nor the new", v);
+    if (crash_at == 0) {
+        if (g_trial_durables != 0)
+            violation("commit-only sources waited for %u make_durable", g_trial_durables);
+        if (kept && strcmp(v, "/new1,/new2") != 0) violation("sources lost with every commit kept");
+        if (!kept && !started && strcmp(v, "/old") != 0)
+            violation("sources survived a cut before any sync: the model is wrong");
+    }
+    free(v);
+}
+
 static const scenario_t S_BACKUP_FIRST = { "backup, first", build_backup_first,
-                                           op_backup_first, 0, 0, 0 };
+                                           op_backup_first, 0, 0, 0, NULL };
 static const scenario_t S_BACKUP_INCR  = { "backup, incremental", build_backup_incr,
-                                           op_backup_incr, 0, 0, 0 };
+                                           op_backup_incr, 0, 0, 0, NULL };
 static const scenario_t S_REPLICATE    = { "replicate-in", build_replicate, op_replicate,
-                                           1, 1, 0 };
-static const scenario_t S_GC           = { "gc", build_gc, op_gc, 0, 0, 0 };
-static const scenario_t S_COALESCE     = { "coalesce", build_coalesce, op_coalesce, 0, 0, 0 };
-static const scenario_t S_SALVAGE      = { "salvage", build_salvage, op_salvage, 0, 0, 0 };
+                                           1, 1, 0, NULL };
+static const scenario_t S_GC           = { "gc", build_gc, op_gc, 0, 0, 0, NULL };
+static const scenario_t S_COALESCE     = { "coalesce", build_coalesce, op_coalesce, 0, 0, 0, NULL };
+static const scenario_t S_SALVAGE      = { "salvage", build_salvage, op_salvage, 0, 0, 0, NULL };
 static const scenario_t S_REPOINT      = { "OWN-22 repoint", build_repoint, op_repoint,
-                                           0, 0, 0 };
-static const scenario_t S_PRUNE        = { "prune", build_prune, op_prune, 0, 0, 0 };
-static const scenario_t S_REINDEX      = { "reindex", build_reindex, op_reindex, 0, 0, 0 };
+                                           0, 0, 0, NULL };
+static const scenario_t S_PRUNE        = { "prune", build_prune, op_prune, 0, 0, 0, NULL };
+static const scenario_t S_REINDEX      = { "reindex", build_reindex, op_reindex, 0, 0, 0, NULL };
 static const scenario_t S_UNIT_FIRST   = { "unit backup, first", build_unit_first,
-                                           op_unit_first, 0, 0, 1 };
+                                           op_unit_first, 0, 0, 1, NULL };
 static const scenario_t S_UNIT_SECOND  = { "unit backup, second", build_unit_second,
-                                           op_unit_second, 0, 0, 1 };
+                                           op_unit_second, 0, 0, 1, NULL };
 static const scenario_t S_UNIT_TWO     = { "unit backup, two units", build_unit_two,
-                                           op_unit_two, 0, 0, 2 };
+                                           op_unit_two, 0, 0, 2, NULL };
 static const scenario_t S_AFTER_DROP   = { "backup after a drop", build_backup_after_drop,
-                                           op_backup_after_drop, 0, 0, 0 };
+                                           op_backup_after_drop, 0, 0, 0, NULL };
+
+static const scenario_t S_API_TAG      = { "API tag set (durable)", build_api, op_api_tag,
+                                           0, 0, 0, check_api_tag };
+static const scenario_t S_API_SCHED_DEL = { "API schedule delete (durable)", build_api,
+                                            op_api_schedule_delete, 0, 0, 0,
+                                            check_api_schedule_delete };
+static const scenario_t S_API_NOTE     = { "API note (commit-only)", build_api, op_api_note,
+                                           0, 0, 0, check_api_note };
+static const scenario_t S_API_SOURCES  = { "API sources (commit-only)", build_api,
+                                           op_api_sources, 0, 0, 0, check_api_sources };
+
+static void test_api_tag(void **state)        { (void)state; every_cut(&S_API_TAG); }
+static void test_api_sched_del(void **state)  { (void)state; every_cut(&S_API_SCHED_DEL); }
+static void test_api_note(void **state)       { (void)state; every_cut(&S_API_NOTE); }
+static void test_api_sources(void **state)    { (void)state; every_cut(&S_API_SOURCES); }
 
 static void test_backup_first(void **state)  { (void)state; every_cut(&S_BACKUP_FIRST); }
 static void test_backup_incr(void **state)   { (void)state; every_cut(&S_BACKUP_INCR); }
@@ -2329,6 +2547,10 @@ int main(void)
         cmocka_unit_test(test_unit_second),
         cmocka_unit_test(test_unit_two),
         cmocka_unit_test(test_after_drop),
+        cmocka_unit_test(test_api_tag),
+        cmocka_unit_test(test_api_sched_del),
+        cmocka_unit_test(test_api_note),
+        cmocka_unit_test(test_api_sources),
         cmocka_unit_test(test_prune_unlinks_the_record_after_the_commit_is_durable),
         cmocka_unit_test(test_start_finishes_an_interrupted_prune),
         cmocka_unit_test(test_reindex_finishes_an_interrupted_prune),

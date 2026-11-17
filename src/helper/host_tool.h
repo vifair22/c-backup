@@ -34,6 +34,17 @@ typedef struct {
 /* host_root + path into buf. -1 if it does not fit. */
 int host_path(const host_tools_t *t, const char *path, char *buf, size_t sz);
 
+/*
+ * Write len bytes of data as a new file at the host path hp (which must not
+ * exist), synced before it counts as written. shown is the path for
+ * messages. On any failure the partial file is removed and, when aside_hp
+ * is set (the file that used to be at hp, moved aside first), it is put
+ * back, so a failed define leaves the host as it found it rather than with
+ * a truncated config and the original under another name (B182).
+ */
+status_t host_write_new_file(const char *hp, const char *shown, const char *data, size_t len,
+                             const char *aside_hp);
+
 /* Defaults: nsenter on, /usr/bin/nsenter, /usr/sbin/zfs, /sbin/btrfs,
  * /usr/bin, host_root /proc/1/root. */
 void host_tools_defaults(host_tools_t *t);

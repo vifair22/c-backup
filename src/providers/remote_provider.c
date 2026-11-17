@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -95,6 +96,9 @@ static cJSON *vm_begin_args(const struct sp_ctx *c, const sp_unit_desc_t *unit, 
 
 static remote_hello_t g_hello;
 static atomic_long    g_req_id;
+/* This process's session, named in every hello; set at remote_start
+ * before any thread that reads it runs. */
+static char           g_session[HELPER_TOKEN_HEX + 1];
 
 const remote_hello_t *remote_last_hello(void) { return &g_hello; }
 
@@ -104,10 +108,11 @@ static struct {
     pthread_cond_t     cv;
     pthread_t          th;
     int                running, stop, wake;
+    int                anchor;          /* the anchor connection, or -1 (link thread) */
     char               daemon8[16];
     remote_backoff_t   bo;
     remote_link_info_t info;
-} g_link = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+} g_link = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .anchor = -1 };
 
 /* The helper went away under a request: say so at once and wake the
  * reconnect thread, rather than waiting for its next health check. */
@@ -228,6 +233,7 @@ static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON 
     }
     cJSON *hargs = cJSON_CreateObject();
     if (hargs) cJSON_AddNumberToObject(hargs, "client_version", HELPER_PROTO_VERSION);
+    if (hargs && g_session[0]) cJSON_AddStringToObject(hargs, "session", g_session);
     cJSON *hres = NULL;
     int transport = 0;
     status_t st = exchange(fd, "hello", hargs, &hres, NULL, &transport);
@@ -883,9 +889,15 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
     remote_hello_t h;
     memset(&h, 0, sizeof(h));
     h.version = (int)num(res, "version");
+    h.holds = (long)num(res, "holds");
+    h.captures = (long)num(res, "captures");
     snprintf(h.daemon_id, sizeof(h.daemon_id), "%s", jstr(res, "daemon_id"));
     snprintf(h.policy, sizeof(h.policy), "%s", jstr(res, "policy"));
-    if (daemon8 && strcmp(h.daemon_id, daemon8) != 0)
+    /* Said when it is news: this ran at every health check, so a daemon id
+     * that differs from the helper's was warned about every 15 s. */
+    int news = strcmp(g_hello.daemon_id, h.daemon_id) != 0 || strcmp(g_hello.policy, h.policy) != 0 ||
+               g_hello.version != h.version;
+    if (news && daemon8 && strcmp(h.daemon_id, daemon8) != 0)
         log_warn("helper: configured for daemon %s, this daemon is %s; artefacts are named "
                  "with the helper's", h.daemon_id, daemon8);
     const cJSON *p;
@@ -933,9 +945,11 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
     if (g_hello.policy[0] && strcmp(g_hello.policy, h.policy) != 0)
         log_warn("helper: its policy changed (%.16s to %.16s) while this daemon ran",
                  g_hello.policy, h.policy);
+    news |= strcmp(g_hello.providers, h.providers) != 0;
     g_hello = h;
-    log_info("helper: %s, version %d, daemon %s, policy %.16s, providers %s", socket_path,
-             h.version, h.daemon_id, h.policy, h.providers[0] ? h.providers : "none");
+    if (news)
+        log_info("helper: %s, version %d, daemon %s, policy %.16s, providers %s", socket_path,
+                 h.version, h.daemon_id, h.policy, h.providers[0] ? h.providers : "none");
     if (out) *out = h;
     return OK;
 }
@@ -943,6 +957,55 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
 /* ------------------------------------------------------------------ */
 /* The supervised link                                                 */
 /* ------------------------------------------------------------------ */
+
+/* The anchor (B169): a connection whose hello names this session and asks
+ * the helper to tie the session's captures to it. Nothing is sent on it
+ * after the hello; its closing is the message. -1 when it cannot be made. */
+static int anchor_open(const char *sock)
+{
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s", sock);
+    struct timeval tv = { REMOTE_TIMEOUT_S, 0 };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return -1; }
+    cJSON *h = cJSON_CreateObject();
+    if (h) {
+        cJSON_AddNumberToObject(h, "client_version", HELPER_PROTO_VERSION);
+        cJSON_AddStringToObject(h, "session", g_session);
+        cJSON_AddBoolToObject(h, "anchor", 1);
+    }
+    int transport = 0;
+    if (exchange(fd, "hello", h, NULL, NULL, &transport) != OK) {
+        log_warn("helper: cannot hold the session's anchor at %s: %s; a capture this daemon "
+                 "leaves behind lasts to its lease", sock, err_msg());
+        err_clear();
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Still open at the helper's end? The helper never writes to it, so
+ * anything readable, or a hang-up, means it is gone. */
+static int anchor_alive(int fd)
+{
+    struct pollfd p = { fd, POLLIN | POLLRDHUP, 0 };
+    return fd >= 0 && poll(&p, 1, 0) == 0;
+}
+
+/* Link thread (or remote_start before it runs): the anchor open, reopened
+ * when the helper it was held with went away. */
+static void anchor_keep(const char *sock)
+{
+    if (anchor_alive(g_link.anchor)) return;
+    if (g_link.anchor >= 0) close(g_link.anchor);
+    g_link.anchor = anchor_open(sock);
+}
 
 static void link_set(remote_state_t s, const char *err, const remote_hello_t *h)
 {
@@ -985,6 +1048,7 @@ static void *link_main(void *arg)
         pthread_mutex_unlock(&g_link.mu);
         remote_hello_t h;
         status_t st = attach_once(sock, d8, &h);
+        if (st == OK) anchor_keep(sock);
         if (st == OK) {
             int was = 0;
             pthread_mutex_lock(&g_link.mu);
@@ -1026,8 +1090,13 @@ status_t remote_start(const char *socket_path, const char *daemon8, const remote
     g_link.wake = 0;
     pthread_mutex_unlock(&g_link.mu);
 
+    /* A new session for each start: what an earlier one began ended
+     * with its anchor at remote_stop. */
+    if (helper_random_hex(g_session, HELPER_TOKEN_HEX / 2) != OK) g_session[0] = '\0';
+    err_clear();
     remote_hello_t h;
     status_t st = attach_once(socket_path, daemon8, &h);
+    if (st == OK) anchor_keep(socket_path);
     char why[256] = "";
     if (st != OK) snprintf(why, sizeof(why), "%.250s", err_msg());
     link_set(st == OK ? REMOTE_CONNECTED : REMOTE_DISCONNECTED, st == OK ? NULL : why,
@@ -1050,6 +1119,27 @@ void remote_stop(void)
     pthread_mutex_lock(&g_link.mu);
     g_link.running = 0;
     pthread_mutex_unlock(&g_link.mu);
+    /* The session ends here: the helper ends whatever captures it still
+     * has open, as it would for a daemon that died. */
+    if (g_link.anchor >= 0) close(g_link.anchor);
+    g_link.anchor = -1;
+}
+
+status_t remote_helper_holds(long *holds, long *captures)
+{
+    remote_link_info_t li;
+    remote_link_info(&li);
+    if (!li.configured) return set_error(ERR_INVALID, "no helper is configured");
+    cJSON *a = cJSON_CreateObject();
+    if (a) cJSON_AddNumberToObject(a, "client_version", HELPER_PROTO_VERSION);
+    cJSON *res = NULL;
+    status_t st = rcall(li.socket, "hello", a, &res);
+    if (st == OK) {
+        *holds = (long)num(res, "holds");
+        *captures = (long)num(res, "captures");
+    }
+    cJSON_Delete(res);
+    return st;
 }
 
 status_t remote_attach(const char *socket_path, const char *daemon8, remote_hello_t *out)

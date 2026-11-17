@@ -3,6 +3,7 @@
 #define _XOPEN_SOURCE 700
 
 #include "repo.h"
+#include "sync_latch.h"
 #include "db_txn.h"
 #include "snapshot_ids.h"
 #include "pack_ids.h"
@@ -177,6 +178,21 @@ static void marker_read_v3_fields(const cutils_json_req_t *req, repo_marker_t *o
     json_iter_end(&it);
     if (!out->incompat_first[0])
         snprintf(out->incompat_first, sizeof(out->incompat_first), "(not a string)");
+}
+
+status_t repo_identity_check(const char *path, const char *uuid)
+{
+    if (!path || !uuid || !uuid[0])
+        return set_error(ERR_INVALID, "repo_identity_check: no path or uuid");
+    repo_marker_t m;
+    status_t st = repo_marker_read(path, &m);
+    if (st != OK) return st;
+    if (strcmp(m.uuid, uuid) != 0)
+        return set_error(ERR_UNAVAILABLE,
+                         "%s holds repository %s, not %s, the one registered at this "
+                         "path: swapped with another repository, or the wrong disk "
+                         "or share mounted there", path, m.uuid, uuid);
+    return OK;
 }
 
 status_t repo_format_check(const char *path, const repo_marker_t *m)
@@ -418,13 +434,49 @@ static status_t marker_emit(const char *mp, repo_marker_t *mp_in)
         close(fd); unlink(mp);
         return set_error(ERR_IO, "marker would be truncated");
     }
-    if (n < 0 || write(fd, body, (size_t)n) != n) {
-        close(fd);
-        unlink(mp);
+    /*
+     * Every step checked, and a marker that did not make it whole is taken
+     * away again (B182). The sync's result used to be thrown away, so a
+     * full or failing disk produced a repository whose identity was not on
+     * disk while the registration reported success. A torn marker left by
+     * a crash is still refused on the next registration - it does not
+     * parse - but nothing here may claim one was written when it was not.
+     */
+    if (n < 0) {
+        close(fd); unlink(mp);
+        return set_error(ERR_IO, "cannot format %s", mp);
+    }
+    if (snapshot_write_all(fd, body, (size_t)n) != 0) {
+        int err = errno;
+        close(fd); unlink(mp);
+        errno = err;
         return set_error_errno(ERR_IO, "cannot write %s", mp);
     }
-    fsync(fd);
-    close(fd);
+    /* The marker's repository is the directory holding it. */
+    char root[PATH_MAX];
+    snprintf(root, sizeof(root), "%s", mp);
+    char *rs = strrchr(root, '/');
+    if (rs && rs != root) *rs = '\0';
+    if (sync_latch_repo_fsync(root, fd, mp) != 0) {
+        int err = errno;
+        close(fd); unlink(mp);
+        errno = err;
+        return set_error_errno(ERR_IO, "cannot sync %s", mp);
+    }
+    if (close(fd) != 0) {
+        int err = errno;
+        unlink(mp);
+        errno = err;
+        return set_error_errno(ERR_IO, "cannot close %s", mp);
+    }
+    /* The name is durable once the directory holding it is. */
+    if (snapshot_fsync_parent(mp) != 0) {
+        int err = errno;
+        if (err != EINVAL && err != EBADF) sync_latch_repo_trip(root, mp, err);
+        unlink(mp);
+        errno = err;
+        return set_error_errno(ERR_IO, "cannot sync the directory of %s", mp);
+    }
     return OK;
 }
 
@@ -958,7 +1010,7 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
 
     /*
      * Staging a killed writer left behind (a replicate SIGKILLed mid-copy
-     * leaves a pack of up to 2 GB in tmp/, B133) goes now, if no handle is
+     * leaves a pack of up to 2 GB in packs/.staging, B133) goes now, if no handle is
      * writing here; see store_claim_tmp. Failing to open or sweep is not a
      * reason to refuse the registration.
      */

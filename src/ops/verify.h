@@ -105,5 +105,21 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     void *progress_ctx,
                     verify_result_t *out);
 
+/*
+ * Clear a repository's storage sync latch (sync_latch.h) once its disk has
+ * been fixed: drop the repository's clean pages from the page cache, so
+ * what follows reads the disk and not what a failed sync left in memory,
+ * run a deep verify that writes nothing, and clear the latch only if it
+ * found nothing at all - no loss, nothing recoverable, no pack structure
+ * to fix, no unwalkable pack. Anything found leaves the latch in place and
+ * fails, saying so: a repairing verify comes first. ERR_INVALID when the
+ * repository is not latched; the daemon-wide latch refuses outright. *out
+ * is the verify's result. The caller holds the repo write lock.
+ */
+status_t repo_sync_repair(store_t *store, cutils_db_t *db, int64_t repo_id, atomic_int *cancel,
+                          void (*progress)(const char *phase, uint64_t done,
+                                           uint64_t total, void *ctx),
+                          void *progress_ctx, verify_result_t *out);
+
 /* Parse a level name from the API. Unknown names return -1. */
 int verify_level_from_string(const char *s, verify_level_t *out);

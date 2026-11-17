@@ -84,6 +84,20 @@ static int allow_ok(const char *g)
     return helper_provider_known(prov) && c[1] != '\0';
 }
 
+/* Compose project names are lowercase: compose lowercases the directory it
+ * derives one from and refuses -p with capitals, and unit keys follow. A
+ * glob spelling the project with capitals could never match, so its
+ * project part is folded (docker:compose:Immich means project immich). */
+static void fold_compose(char **g, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        char *p = g[i];
+        if (strncmp(p, "docker:", 7) == 0) p += 7;
+        if (strncmp(p, "compose:", 8) != 0) continue;
+        for (p += 8; *p; p++) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+    }
+}
+
 static int dir_ok(const char *d) { return helper_path_clean(d) && strcmp(d, "/") != 0; }
 static int dataset_ok(const char *d) { return d[0] && d[0] != '/' && !strstr(d, "..") && !strchr(d, '@'); }
 
@@ -217,6 +231,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
                 st = bad(line, "[units] takes allow = <provider>:<glob>, ...", v);
                 break;
             }
+            fold_compose(out->allow, out->n_allow);
         } else if (sec == S_HOST) {
             struct { const char *k; char *dst; size_t sz; } paths[] = {
                 { "nsenter_bin", out->host_nsenter_bin, sizeof(out->host_nsenter_bin) },
@@ -260,6 +275,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
                 else { st = bad(line, "pause is auto, always or never", v); break; }
             } else if (strcmp(k, "pause_always") == 0) {
                 if (to_list(v, out->pause_always, &out->n_pause_always, NULL)) { st = bad(line, "bad pause_always", v); break; }
+                fold_compose(out->pause_always, out->n_pause_always);
             } else if (strcmp(k, "never_pause") == 0) {
                 if (to_list(v, out->never_pause, &out->n_never_pause, NULL)) { st = bad(line, "bad never_pause", v); break; }
             } else if (strcmp(k, "pause_timeout_s") == 0) {

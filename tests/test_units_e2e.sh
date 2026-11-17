@@ -134,6 +134,12 @@ OUT=$(cb unit history 1 --provider fake cbk-uat-a)
 contains "a unit's snapshots" '"read_mode":"full"' "$OUT"
 check    "two of them" 2 "$(printf '%s' "$OUT" | grep -o '"name":"cbk-uat-a"' | wc -l)"
 
+# The in-process fake cannot capture units together: job scope is taken
+# unit by unit, and the job says so rather than nothing.
+OUT=$(cb unit backup 1 --provider fake cbk-uat-a cbk-uat-b --pause-scope job)
+contains "a job scope the provider cannot honour completes" '"state":"completed"' "$OUT"
+contains "and says each unit was its own capture" "each unit was its own capture" "$OUT"
+
 echo "restore"
 OUT=$(cb unit restore 1 1 "$WORK/out")
 contains "files restore completes" '"state":"completed"' "$OUT"
@@ -149,6 +155,25 @@ if cmp -s "$WORK/vda.raw" "$WORK/out/.cbackup-unit/disks/vda"; then ok "the raw 
 check    "no partial file is left" "no" "$([ -e "$WORK/vda.raw.cbk-partial" ] && echo yes || echo no)"
 OUT=$(cb unit restore 1 1 "$WORK/vda.raw" --item vda 2>&1); RC=$?
 check    "an item never lands on an existing file" 1 "$RC"
+# The directories above a tree item take their recorded modes, as in a
+# whole restore; made on the way under the daemon's 0077 umask they were 0700.
+OUT=$(cb unit restore 1 1 "$WORK/itemvol" --item vol)
+contains "a tree item restore completes" '"state":"completed"' "$OUT"
+check    "the tree item's data is there" alpha "$(cat "$WORK/itemvol$WORK/live/a/a.txt")"
+check    "a directory above it has the mode a whole restore gives it" \
+         "$(stat -c %a "$WORK/out$WORK/live")" "$(stat -c %a "$WORK/itemvol$WORK/live")"
+lacks    "and not the umask's 0700" 700 "$(stat -c %a "$WORK/itemvol$WORK/live")"
+OUT=$(cb unit restore 1 999 "$WORK/nope" 2>&1); RC=$?
+check    "a snapshot that does not exist is refused" 1 "$RC"
+contains "as missing, not as not a unit snapshot" "has no snapshot 999" "$OUT"
+OUT=$(cb unit restore 1 1 "$WORK/vda2.raw" --item vda --overwrite 2>&1); RC=$?
+check    "--overwrite with --item is refused by the CLI" 1 "$RC"
+contains "saying why" "an item is restored to a new path" "$OUT"
+if command -v curl >/dev/null 2>&1; then
+    OUT=$(curl -s --unix-socket "$SOCK" -X POST http://x/repos/1/snapshots/1/unit/restore \
+          -d "{\"mode\":\"item\",\"item\":\"vda\",\"dest\":\"$WORK/vda2.raw\",\"overwrite\":true}")
+    contains "and by the API, before any job" "overwrite does not apply to mode item" "$OUT"
+fi
 
 
 echo "nbd export"
@@ -225,6 +250,16 @@ contains "a unit's own retention" '"retention.keep_daily":"3"' "$OUT"
 contains "shows what is in force" '"effective"' "$(cb unit policy show 1 --provider fake cbk-uat-a)"
 OUT=$(cb unit policy set 1 --provider fake cbk-uat-a retention.bogus 3 2>&1); RC=$?
 check    "an unknown key is refused" 1 "$RC"
+# A policy row no backup would read was accepted for any unit.
+OUT=$(cb unit policy set 1 --provider fake prod-db retention.keep_daily 3 2>&1); RC=$?
+check    "a policy for a unit outside units.allow is refused" 1 "$RC"
+contains "saying why" "units.allow" "$OUT"
+OUT=$(cb unit policy set 1 --provider fake nosuch retention.keep_daily 3 2>&1); RC=$?
+check    "a policy for a unit that does not exist is refused" 1 "$RC"
+contains "saying why" "lists no unit nosuch" "$OUT"
+OUT=$(cb unit policy set 1 --provider bogus x retention.keep_daily 3 2>&1); RC=$?
+check    "a policy for an unknown provider is refused" 1 "$RC"
+contains "naming what is enabled" "enabled: fake" "$OUT"
 contains "gfs runs over every group" '"state":"completed"' "$(cb gfs 1)"
 check    "each unit keeps its head" 2 "$(cb unit history 1 | grep -o '"unit_key"' | wc -l)"
 
@@ -242,6 +277,13 @@ contains "a units schedule naming a unit" '"id"' "$(cb schedule add 1 units 3600
 contains "is stored canonically" '"provider":"fake"' "$(cb schedule list 1)"
 OUT=$(cb schedule add 1 units 3600 --provider libvirt --all 2>&1); RC=$?
 check    "a provider that is not enabled is refused" 1 "$RC"
+contains "naming it and what is enabled" "provider 'libvirt' is not enabled (enabled: fake)" "$OUT"
+OUT=$(cb unit backup 1 --provider libvirt --all 2>&1); RC=$?
+check    "a unit backup with it is refused the same way" 1 "$RC"
+contains "in the same words" "provider 'libvirt' is not enabled (enabled: fake)" "$OUT"
+if command -v curl >/dev/null 2>&1; then
+    check "both answer 400" "400 400" "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" -X POST http://x/repos/1/units/backup -d '{"provider":"libvirt","all":true}') $(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" -X POST http://x/repos/1/schedules -d '{"action":"units","trigger":{"type":"interval","seconds":3600},"provider":"libvirt","all":true}')"
+fi
 OUT=$(cb schedule add 1 units 3600 --provider fake 2>&1); RC=$?
 check    "a units schedule without units or --all is refused" 1 "$RC"
 OUT=$(cb schedule add 1 gc 3600 --provider fake 2>&1); RC=$?

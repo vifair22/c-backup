@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include "pack.h"
+#include "sync_latch.h"
 #include "read_budget.h"
 #include "parity.h"
 #include "object.h"
@@ -144,12 +145,37 @@ int pack_dat_path_resolve(char *buf, size_t sz, const char *store,
     return pack_dat_path(buf, sz, store, pack_num);
 }
 
-/* Ensure the shard directory exists for a pack_num. */
-static void pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
+/* Ensure the shard directory exists for a pack_num. A failure is the
+ * install's: on a full disk the mkdir is what fails, and the rename after
+ * it would only say ENOENT. */
+static status_t pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
     char shard[PATH_MAX];
     if (path_fmt(shard, sizeof(shard), "%s/packs/" PACK_SHARD_FMT,
-                 store, PACK_SHARD_OF(pack_num)) == 0)
-        (void)mkdir(shard, 0755);  /* EEXIST is fine */
+                 store, PACK_SHARD_OF(pack_num)) != 0)
+        return set_error(ERR_IO, "pack: shard path too long under %s", store);
+    if (mkdir(shard, 0755) != 0 && errno != EEXIST)
+        return set_error_errno(ERR_IO, "pack: cannot create %s", shard);
+    return OK;
+}
+
+/* The repository a path under packs/ belongs to: everything before its
+ * last "/packs" component. Every path this file syncs is one. */
+static void repo_root_of(const char *path, char *out, size_t sz)
+{
+    snprintf(out, sz, "%s", path);
+    char *cut = NULL;
+    for (char *p = strstr(out, "/packs"); p; p = strstr(p + 1, "/packs"))
+        if (p[6] == '\0' || p[6] == '/') cut = p;
+    if (cut) *cut = '\0';
+}
+
+/* fsync, latching the repository the path is in on a failure that counts
+ * (sync_latch.h). */
+static int latch_fsync_in_repo(int fd, const char *path)
+{
+    char root[PATH_MAX];
+    repo_root_of(path, root, sizeof(root));
+    return sync_latch_repo_fsync(root, fd, path);
 }
 
 /* fsync a directory, so the entries renamed into it survive a power cut.
@@ -157,7 +183,7 @@ static void pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
 static int fsync_dir_path(const char *path) {
     int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd == -1) return -1;
-    int rc = fsync(fd);
+    int rc = latch_fsync_in_repo(fd, path);
     int err = errno;
     close(fd);
     errno = err;
@@ -283,8 +309,8 @@ static void max_pack_num_cb(uint32_t pack_num, void *ctx) {
  * The scan alone reissued the number of a pack dropped as missing, and when
  * the original came back the index described the wrong file.
  *
- * The scan cannot see a pack still staging in tmp/, because it is not named
- * until it is installed, so writers open at once on one handle (a backup's
+ * The scan cannot see a pack still in packs/.staging, because it is not
+ * named until it is installed, so writers open at once on one handle (a backup's
  * and the store's own) never share a number only because the handle
  * remembers what it issued. Across handles, every writer - backup, gc,
  * replicate - is a repo-scoped job holding the repo write lock, and that
@@ -1022,8 +1048,8 @@ status_t pack_walk_check(store_t *store, uint32_t pack_num, char *reason, size_t
  * header is written only when the table proves it is the one the writer
  * wrote. A header the stripe can still correct is written back as
  * corrected; one already right is left alone. Returns how many headers were
- * written, or -1 when the pack has no usable trailer to prove anything
- * against or a write fails.
+ * written, -1 when the pack has no usable trailer to prove anything
+ * against, or -2 when a write, the sync or the close failed (error set).
  */
 int pack_restore_headers(store_t *store, uint32_t pack_num,
                          const pack_hdr_hint_t *hints, size_t n)
@@ -1082,17 +1108,29 @@ int pack_restore_headers(store_t *store, uint32_t pack_num,
                           : 0;
         free(pay);
         if (!ok || crc != want_e) continue;
-        if (pwrite_full(fd, &h, sizeof(h), (off_t)hi->offset) != 0) { failed = 1; break; }
+        if (pwrite_full(fd, &h, sizeof(h), (off_t)hi->offset) != 0) {
+            set_error_errno(ERR_IO, "pack-%010u.dat: write a restored entry header", pack_num);
+            failed = 2;
+            break;
+        }
         written++;
     }
-    if (written > 0 && !failed && fsync(fd) != 0) failed = 1;
-    close(fd);
-    if (written > 0) {
+    if (written > 0 && !failed && latch_fsync_in_repo(fd, path) != 0) {
+        set_error_errno(ERR_IO, "pack-%010u.dat: sync the restored entry headers", pack_num);
+        failed = 2;
+    }
+    if (close(fd) != 0 && written > 0 && !failed) {
+        set_error_errno(ERR_IO, "pack-%010u.dat: close after restoring entry headers", pack_num);
+        failed = 2;
+    }
+    /* Written or not, the bytes in the page cache may have changed. */
+    if (written > 0) pack_cache_invalidate(store);
+    if (failed == 2) return -2;
+    if (failed) return -1;
+    if (written > 0)
         log_warn("pack: restored %d entry header(s) in pack-%010u.dat from the index",
                  written, pack_num);
-        pack_cache_invalidate(store);
-    }
-    return failed ? -1 : written;
+    return written;
 }
 
 /* Entry offsets and stored sizes from a walk, for rebuilding CRC slots. */
@@ -1263,7 +1301,7 @@ status_t pack_check_structure(store_t *store, uint32_t pack_num, int repair,
             }
         }
     }
-    if (wrote && st == OK && fsync(fd) != 0)
+    if (wrote && st == OK && latch_fsync_in_repo(fd, path) != 0)
         st = set_error_errno(ERR_IO, "pack-%010u.dat: sync", pack_num);
     close(fd);
     if (wrote) pack_cache_invalidate(store);
@@ -1778,10 +1816,16 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
 static status_t open_new_pack_buf(store_t *store, FILE **dat_f, char *dat_tmp,
                                   pack_dat_hdr_t *dat_hdr, size_t bufsz)
 {
-    if (path_fmt(dat_tmp, PATH_MAX, "%s/tmp/pack-dat.XXXXXX", store_root(store)) != 0)
-        return set_error(ERR_IO, "open_new_pack: tmp path too long");
+    /* Staged in packs/ itself, never tmp/: packs/ may be a mount of its
+     * own, and the install's rename cannot cross filesystems (B163). */
+    char staging[PATH_MAX];
+    if (store_pack_staging(store, staging, sizeof(staging)) != 0)
+        return set_error_errno(ERR_IO, "open_new_pack: cannot create %s/" STORE_PACK_STAGING,
+                               store_root(store));
+    if (path_fmt(dat_tmp, PATH_MAX, "%s/pack-dat.XXXXXX", staging) != 0)
+        return set_error(ERR_IO, "open_new_pack: staging path too long");
 
-    /* Staging is about to exist here: claim tmp/, so a sweep by another
+    /* Staging is about to exist here: claim it, so a sweep by another
      * handle meanwhile leaves it alone (store_claim_tmp). */
     (void)store_claim_tmp(store);
     int dat_fd = mkstemp(dat_tmp);
@@ -2178,8 +2222,9 @@ static status_t write_pack_trailer(int fd, uint64_t body_len,
         pos += sizeof(pack_dat_entry_hdr_t) + by_offset[i].compressed_size;
     }
     if (pos != body_len)
-        return set_error(ERR_CORRUPT, "pack seal: entries end at %llu, body at %llu",
-                         (unsigned long long)pos, (unsigned long long)body_len);
+        return set_error(ERR_CORRUPT, "pack seal: entries end at %llu, body at %llu%s",
+                         (unsigned long long)pos, (unsigned long long)body_len,
+                         body_len < pos ? " (writes to the pack were lost: is the disk full?)" : "");
 
     rs_init();
     /*
@@ -2297,11 +2342,14 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
 
     /* Patch the object count into the dat header: the header is body, so
      * this happens before parity is computed over it. */
-    if (fseeko(*dat_f, 0, SEEK_SET) != 0) { st = ERR_IO; goto fail; }
+    /* A write that failed unseen (a buffer glibc dropped) says so here,
+     * before the trailer finds the body short of its entries. */
+    if (ferror(*dat_f)) { st = set_error(ERR_IO, "pack seal: an earlier write to the pack failed (is the disk full?)"); goto fail; }
+    if (fseeko(*dat_f, 0, SEEK_SET) != 0) { st = set_error_errno(ERR_IO, "pack seal: write"); goto fail; }
     dat_hdr->count = packed;
-    if (fwrite(dat_hdr, sizeof(*dat_hdr), 1, *dat_f) != 1) { st = ERR_IO; goto fail; }
+    if (fwrite(dat_hdr, sizeof(*dat_hdr), 1, *dat_f) != 1) { st = set_error_errno(ERR_IO, "pack seal: write the header"); goto fail; }
 
-    if (fseeko(*dat_f, 0, SEEK_END) != 0) { st = ERR_IO; goto fail; }
+    if (fseeko(*dat_f, 0, SEEK_END) != 0) { st = set_error_errno(ERR_IO, "pack seal: write"); goto fail; }
     off_t body_end = ftello(*dat_f);
     /* The format's bounds, enforced where every writer passes. Past them the
      * trailer's 32-bit sizes could wrap, and the readers refuse the pack. */
@@ -2326,8 +2374,14 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
         *out_size = (uint64_t)body_end + tsize;
     }
 
-    if (fsync(fileno(*dat_f)) != 0) { st = ERR_IO; goto fail; }
-    fclose(*dat_f); *dat_f = NULL;
+    if (sync_latch_repo_fsync(store_root(store), fileno(*dat_f), "a staging pack") != 0) { st = set_error_errno(ERR_IO, "pack seal: sync the pack"); goto fail; }
+    /* A filesystem that defers write errors (NFS, FUSE) reports them here,
+     * and a pack whose close failed is not known to hold its bytes. */
+    {
+        int crc = fclose(*dat_f);
+        *dat_f = NULL;
+        if (crc != 0) { st = set_error_errno(ERR_IO, "pack seal: close the pack"); goto fail; }
+    }
 
     /* Every writer seals here - backup, pack, gc, coalescing, replication -
      * so this is the one place a pack's bytes need counting. */
@@ -2361,7 +2415,8 @@ static status_t install_pack_file(store_t *store, const char *dat_tmp,
     if (pack_dat_path(dat_final, sizeof(dat_final), store_root(store), pack_num) != 0)
         return set_error(ERR_IO, "install_pack_file: path too long");
 
-    pack_ensure_shard_dir(store_root(store), pack_num);
+    status_t sst = pack_ensure_shard_dir(store_root(store), pack_num);
+    if (sst != OK) return sst;
 
     /* Numbers are never reissued (issue_pack_nums), so this should never trigger, but if
      * it does we would silently destroy data. Fail loudly instead. */
@@ -2434,6 +2489,10 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
                               pack_idx_disk_entry_t *idx_entries,
                               uint32_t packed, uint32_t pack_num, stripe_enc_t *enc)
 {
+    /* A seal ends in a sync whose success a latched daemon cannot trust:
+     * refused, and the staging discarded (sync_latch.h). */
+    status_t lst = sync_latch_repo_check(store_root(store), "pack seal");
+    if (lst != OK) { unlink(dat_tmp); return lst; }
     uint64_t dat_size = 0;
     status_t st = seal_pack_file(store, dat_f, dat_hdr, idx_entries,
                                  packed, enc, &dat_size);
@@ -2824,16 +2883,25 @@ typedef struct {
  */
 #define PACK_WB_STEP ((uint64_t)8 * 1024 * 1024)
 
-static void pw_writeback(pack_writer_t *pw)
+/*
+ * The flush fails as any write does: a full disk here is a failed append.
+ * It used to be ignored, and glibc drops the buffered bytes a failed flush
+ * could not write, so the entries after them landed short of the offsets
+ * recorded for them. The append went on as if nothing had happened, and a
+ * full repository surfaced only at the seal, as "entries end at 267926002,
+ * body at 67096576", with nothing about the disk.
+ */
+static status_t pw_writeback(pack_writer_t *pw)
 {
     uint64_t end = sizeof(pack_dat_hdr_t) + pw->body_offset;
-    if (!pw->dat_f || end < pw->wb_done + PACK_WB_STEP) return;
+    if (!pw->dat_f || end < pw->wb_done + PACK_WB_STEP) return OK;
 #ifdef __linux__
-    if (fflush(pw->dat_f) != 0) return;
+    if (fflush(pw->dat_f) != 0) return set_error_errno(ERR_IO, "pack: write to %s", pw->dat_tmp);
     (void)sync_file_range(fileno(pw->dat_f), (off_t)pw->wb_done,
                           (off_t)(end - pw->wb_done), SYNC_FILE_RANGE_WRITE);
 #endif
     pw->wb_done = end;
+    return OK;
 }
 
 static int pw_ensure_capacity(pack_writer_t *pw, uint32_t need) {
@@ -2987,8 +3055,7 @@ static status_t pw_append_sealed(pack_writer_t *pw,
 
     pw->body_offset += sizeof(ehdr) + se->stored_size;
     pw->packed++;
-    pw_writeback(pw);
-    return OK;
+    return pw_writeback(pw);
 }
 
 /* Seal and append in one step, on the writer's thread. */
@@ -3927,9 +3994,11 @@ static int pack_hdr_read_file(FILE *f, pack_dat_hdr_t *out)
  *
  * pack_resume_deleting replays a marker by deleting every pack it names, so
  * a marker cut short by a crash is worse than none: "123" truncated to "12"
- * names some other pack. Written in tmp/ and renamed into packs/, it is
- * either whole or absent. The staging name must not itself look like a
- * marker, which is why it does not live in packs/.
+ * names some other pack. Written in packs/.staging and renamed into
+ * packs/, it is either whole or absent; staged in packs/ rather than tmp/
+ * because packs/ may be a mount of its own (B163). The staging name must
+ * not itself look like a marker, and pack_resume_deleting reads only
+ * packs/ itself, never the staging directory.
  *
  * On failure after the rename the marker stays where it is, and that is
  * safe: it is written only once everything it would let a resume delete is
@@ -3939,15 +4008,17 @@ static status_t write_deleting_marker(store_t *store, uint32_t key,
                                       const uint32_t *nums, size_t n,
                                       char *out_path, size_t out_sz)
 {
-    char tmp[PATH_MAX], packs_dir[PATH_MAX];
-    if (path_fmt(tmp, sizeof(tmp), "%s/tmp/deleting.XXXXXX", store_root(store)) != 0 ||
+    char tmp[PATH_MAX], packs_dir[PATH_MAX], staging[PATH_MAX];
+    if (store_pack_staging(store, staging, sizeof(staging)) != 0)
+        return set_error_errno(ERR_IO, "pack marker: cannot create %s/" STORE_PACK_STAGING,
+                               store_root(store));
+    if (path_fmt(tmp, sizeof(tmp), "%s/deleting.XXXXXX", staging) != 0 ||
         path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0 ||
         path_fmt(out_path, out_sz, "%s/.deleting-" PACK_NUM_FMT, packs_dir, key) != 0)
         return set_error(ERR_IO, "pack marker: path too long");
 
     int fd = mkstemp(tmp);
-    if (fd == -1) return set_error_errno(ERR_IO, "pack marker: mkstemp in %s/tmp",
-                                         store_root(store));
+    if (fd == -1) return set_error_errno(ERR_IO, "pack marker: mkstemp in %s", staging);
     FILE *f = fdopen(fd, "w");
     if (!f) {
         int err = errno;
@@ -3959,7 +4030,7 @@ static status_t write_deleting_marker(store_t *store, uint32_t key,
     int ok = 1;
     for (size_t i = 0; i < n; i++)
         if (fprintf(f, "%u\n", nums[i]) < 0) ok = 0;
-    if (fflush(f) != 0 || fsync(fileno(f)) != 0) ok = 0;
+    if (fflush(f) != 0 || sync_latch_repo_fsync(store_root(store), fileno(f), tmp) != 0) ok = 0;
     if (fclose(f) != 0) ok = 0;
     if (!ok) {
         int err = errno;
@@ -3978,8 +4049,8 @@ static status_t write_deleting_marker(store_t *store, uint32_t key,
     return OK;
 }
 
-/* One sealed output of a rewrite, still in tmp/. Its entries are a slice
- * of the rewriter's shared array. */
+/* One sealed output of a rewrite, still in packs/.staging. Its entries are
+ * a slice of the rewriter's shared array. */
 typedef struct {
     char     tmp[PATH_MAX];
     uint32_t first;
@@ -3997,8 +4068,8 @@ typedef struct {
  * pack_rw_replace carries out:
  *
  *   1. Copy (pack_rw_copy, pack_rw_seal). Entries go into outputs staged in
- *      tmp/, each sealed - parity written, fsynced - when the next entry
- *      would pass the seal. Nothing in packs/ changes, so this phase, the
+ *      packs/.staging, each sealed - parity written, fsynced - when the next
+ *      entry would pass the seal. Nothing in packs/ changes, so this phase, the
  *      long one, can fail, be cancelled or be killed and leave only staging
  *      files, which the next backup or gc sweeps.
  *   2. Install. Each output is renamed to a fresh pack number and its shard
@@ -4188,7 +4259,8 @@ static status_t pack_rw_append(pack_rw_t *rw, uint8_t *buf, size_t len)
 }
 
 /* Remove outputs: the first `installed` from packs/ under base onward (with
- * the removal callback, though none was announced yet), the rest from tmp/. */
+ * the removal callback, though none was announced yet), the rest from
+ * packs/.staging. */
 static void pack_rw_discard(pack_rw_t *rw, uint32_t base, size_t installed)
 {
     if (rw->cur) { fclose(rw->cur); rw->cur = NULL; }
@@ -4226,7 +4298,9 @@ static status_t pack_rw_replace(pack_rw_t *rw, const uint32_t *old_nums, size_t 
                                 uint32_t *out_base, size_t *out_n)
 {
     store_t *store = rw->store;
-    status_t st = pack_rw_seal(rw);
+    status_t st = sync_latch_repo_check(store_root(store), "pack rewrite");
+    if (st != OK) return st;
+    st = pack_rw_seal(rw);
     if (st != OK) return st;
     /* Removing the old packs with nothing written would lose whatever the
      * caller meant to keep. */
@@ -4293,6 +4367,7 @@ static status_t pack_rw_replace(pack_rw_t *rw, const uint32_t *old_nums, size_t 
      * made durable now, the old packs stay; the next gc finds the
      * duplicates and drops them. */
     st = store_emit_index_sync(store);
+    if (st == OK) st = sync_latch_repo_check(store_root(store), "removing compacted packs");
     if (st != OK) return st;
     char marker[PATH_MAX];
     st = write_deleting_marker(store, base, old_nums, n_old, marker, sizeof(marker));
@@ -4878,8 +4953,15 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
         else fixed += (int64_t)sizeof(ph);
     }
 
-    if (fixed > 0 && !failed && fsync(fd) != 0) failed = 1;
-    close(fd);
+    if (failed) set_error_errno(ERR_IO, "pack-%010u.dat: write the correction", found.pack_num);
+    if (fixed > 0 && !failed && latch_fsync_in_repo(fd, dat_path) != 0) {
+        set_error_errno(ERR_IO, "pack-%010u.dat: sync the correction", found.pack_num);
+        failed = 1;
+    }
+    if (close(fd) != 0 && fixed > 0 && !failed) {
+        set_error_errno(ERR_IO, "pack-%010u.dat: close after the correction", found.pack_num);
+        failed = 1;
+    }
     /* Open .dat handles may hold the damaged bytes in their stdio buffers. */
     if (fixed > 0) pack_cache_invalidate(store);
     if (failed) return -1;
@@ -4998,6 +5080,8 @@ status_t pack_gc_stats_loc(store_t *store,
                            size_t refs_cnt,
                            uint32_t *out_kept, uint32_t *out_deleted,
                            pack_gc_stats_t *stats) {
+    status_t lst = sync_latch_repo_check(store_root(store), "pack compaction");
+    if (lst != OK) return lst;
     gc_live_t live = { store, refs, locs, refs_cnt, 0, 0, 0, 0 };
     pack_gc_stats_t scratch_stats;
     if (!stats) stats = &scratch_stats;
@@ -5122,7 +5206,14 @@ status_t pack_gc_stats_loc(store_t *store,
             /* Every entry is dead - delete the whole pack, once the commit
              * that declared them dead (gc's sweep, and any repoint) is
              * durable: rolled back, it would bring back rows naming this
-             * pack (B142). If it cannot be made durable, the pack stays. */
+             * pack (B142). If it cannot be made durable, the pack stays.
+             * Nor while latched: a sync's success proves nothing then. */
+            if (sync_latch_tripped() || sync_latch_repo_tripped(store_root(store))) {
+                total_kept += count;
+                free(live_marks);
+                free(disk_idx);
+                continue;
+            }
             if (store_emit_index_sync(store) != OK) {
                 log_warn("pack_gc: cannot make the index durable; pack %u left in place: %s",
                          pnum, err_msg());
@@ -5179,6 +5270,16 @@ status_t pack_gc_stats_loc(store_t *store,
         if (out_deleted) *out_deleted = total_deleted;
         free(pack_nums);
         return set_error(ERR_BUSY, "pack compaction cancelled");
+    }
+
+    /* A sync failed during the pass: whatever was not deleted stays, and
+     * the job fails rather than report a compaction it did not finish. */
+    if (sync_latch_tripped() || sync_latch_repo_tripped(store_root(store))) {
+        if (total_deleted > 0) pack_cache_invalidate(store);
+        if (out_kept)    *out_kept    = total_kept;
+        if (out_deleted) *out_deleted = total_deleted;
+        free(pack_nums);
+        return sync_latch_repo_check(store_root(store), "pack compaction");
     }
 
     status_t coalesce_st = maybe_coalesce_packs(store, &live, stats);
