@@ -4,7 +4,9 @@
 #include "db_write.h"
 
 #include "phase_timer.h"
+#include "checkpointer.h"
 #include "wal_sync.h"
+#include "sync_latch.h"
 #include "walidx.h"
 
 #include <cutils/log.h>
@@ -248,7 +250,8 @@ static void write_unlock(void)
     pthread_mutex_unlock(&g_ticket_mu);
 }
 
-status_t db_txn_begin(cutils_db_t *db)
+/* caller: whose call site the commit budget learns for (db_txn.c). */
+static status_t begin_at(cutils_db_t *db, uintptr_t caller)
 {
     if (!db) return set_error(ERR_INVALID, "db_txn_begin: null handle");
     if (tls_held)
@@ -257,7 +260,7 @@ status_t db_txn_begin(cutils_db_t *db)
 
     uint64_t t0 = phase_now();
     write_lock();
-    budget_open((uintptr_t)__builtin_return_address(0));
+    budget_open(caller);
     int rc = db_exec_raw(db, "BEGIN");
     phase_add_nested(phase_current, PHASE_TXN_WAIT, t0);
     if (rc != 0) {
@@ -266,6 +269,20 @@ status_t db_txn_begin(cutils_db_t *db)
         return set_error(ERR_IO, "cannot begin");
     }
     return OK;
+}
+
+status_t db_txn_begin(cutils_db_t *db)
+{
+    return begin_at(db, (uintptr_t)__builtin_return_address(0));
+}
+
+status_t db_txn_begin_bulk(cutils_db_t *db)
+{
+    /* Past the WAL's hard cap, wait for the checkpointer first (B181).
+     * Only here: a request's short write never waits for a checkpoint.
+     * The budget keys on the bulk writer's own call site, not this one. */
+    if (!tls_held) checkpointer_throttle();
+    return begin_at(db, (uintptr_t)__builtin_return_address(0));
 }
 
 status_t db_txn_commit(cutils_db_t *db)
@@ -364,6 +381,10 @@ status_t db_txn_make_durable(cutils_db_t *db)
                                    "lock (its own transaction is not committed yet)");
     status_t (*gate)(void) = g_durable_gate;
     if (gate && gate() != OK) return ERR_IO;
+    /* After a failed sync a later one can succeed over lost frames: no
+     * durability is promised again until a restart (sync_latch.h). */
+    status_t lst = sync_latch_check("making the index durable");
+    if (lst != OK) return lst;
     uint64_t t0 = phase_now();
 
     /*
@@ -513,6 +534,8 @@ int db_write_batch_open(db_write_batch_t *b, cutils_db_t *db)
 {
     b->db = db;
     b->since = 0;
+    /* A loop writing many rows is a bulk writer (B181). */
+    if (!db_txn_held()) checkpointer_throttle();
     b->began = db_write_enter(db);
     return b->began < 0 ? -1 : 0;
 }

@@ -76,7 +76,20 @@ typedef struct {
     time_t   deadline;
     member_t members[HELPER_UNITS_MAX];
     size_t   n_members;
+    /* The daemon session that began it, and whether that session held an
+     * anchor connection then: only such a capture ends with its session
+     * (B169); one begun with no anchor (a client that keeps none) lives
+     * to its lease as before. */
+    char     session[HELPER_TOKEN_HEX + 1];
+    int      anchored;
 } capture_t;
+
+/* A daemon session: the daemon process, by the token its hellos carry,
+ * and how many anchor connections it has open. */
+typedef struct {
+    char     token[HELPER_TOKEN_HEX + 1];
+    int      anchors;
+} dsession_t;
 
 typedef struct {
     int      used;
@@ -97,7 +110,9 @@ typedef struct {
     char     mount[HELPER_PATH_MAX + 1];
     char     path[HELPER_PATH_MAX + 1];
     int64_t  job;
-    int      swapped;
+    int      swapped;         /* swapped in: kept for an undo until the slot is wanted */
+    int      had;             /* the mount existed, and was moved to old */
+    char     old[HELPER_PATH_MAX + 1];
     int      file;            /* the mount is a disk image: <path>/image replaces it */
 } staging_t;
 
@@ -109,6 +124,7 @@ struct helper_server {
     capture_t              caps[CAPTURES_MAX];
     run_t                  runs[RUNS_MAX];
     staging_t              stages[STAGINGS_MAX];
+    dsession_t             sessions[CONNS_MAX];
     time_t                 recent[3600];  /* capture start times, a ring */
     size_t                 n_recent;
     int64_t                seq;
@@ -133,8 +149,10 @@ struct helper_server {
 /* The hold journal, persisted                                         */
 /* ------------------------------------------------------------------ */
 
-/* Caller holds jmu. Written whole through a temporary and a rename. */
-static void journal_save(helper_server_t *s)
+/* Caller holds jmu. Written whole through a temporary and a rename, and
+ * the rename synced: a hold the journal does not list is one a restarted
+ * helper cannot release. Returns OK, or the failure (also logged). */
+static status_t journal_save(helper_server_t *s)
 {
     cJSON *a = cJSON_CreateArray();
     for (size_t i = 0; a && i < s->n_holds; i++) {
@@ -149,17 +167,43 @@ static void journal_save(helper_server_t *s)
     }
     char *txt = a ? cJSON_PrintUnformatted(a) : NULL;
     cJSON_Delete(a);
-    if (!txt) { log_error("helper: cannot serialise the hold journal"); return; }
+    if (!txt) {
+        log_error("helper: cannot serialise the hold journal");
+        return set_error(ERR_NOMEM, "helper: cannot serialise the hold journal");
+    }
     char path[PATH_MAX + 32], tmp[PATH_MAX + 32];
     snprintf(path, sizeof(path), "%s/holds.json", s->pol->state_dir);
     snprintf(tmp, sizeof(tmp), "%s/holds.json.tmp", s->pol->state_dir);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     size_t n = strlen(txt);
-    int ok = fd >= 0 && write(fd, txt, n) == (ssize_t)n && fsync(fd) == 0;
-    if (fd >= 0) close(fd);
-    if (!ok || rename(tmp, path) != 0)
-        log_error("helper: cannot write %s: %s", path, strerror(errno));
+    const char *step = "create";
+    int ok = fd >= 0;
+    for (size_t done = 0; ok && done < n; ) {
+        ssize_t w = write(fd, txt + done, n - done);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) { if (w == 0) errno = EIO; ok = 0; step = "write"; break; }
+        done += (size_t)w;
+    }
+    if (ok && fsync(fd) != 0) { ok = 0; step = "sync"; }
+    int err = errno;
+    if (fd >= 0 && close(fd) != 0 && ok) { ok = 0; step = "close"; err = errno; }
+    if (ok && rename(tmp, path) != 0) { ok = 0; step = "rename"; err = errno; }
+    if (ok) {
+        int dfd = open(s->pol->state_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd < 0 || fsync(dfd) != 0) { ok = 0; step = "sync the directory of"; err = errno; }
+        if (dfd >= 0) close(dfd);
+    }
     cJSON_free(txt);
+    if (ok) return OK;
+    if (strcmp(step, "rename") != 0 && strcmp(step, "sync the directory of") != 0)
+        (void)unlink(tmp);
+    errno = err;
+    status_t st = set_error_errno(ERR_IO, "helper: cannot %s %s", step,
+                                  strcmp(step, "create") == 0 || strcmp(step, "write") == 0 ||
+                                  strcmp(step, "sync") == 0 || strcmp(step, "close") == 0
+                                  ? tmp : path);
+    log_error("%s", err_msg());
+    return st;
 }
 
 typedef struct jctx {
@@ -185,8 +229,15 @@ static status_t j_record(void *ctx, const char *kind, const char *detail, int64_
     snprintf(h->detail, sizeof(h->detail), "%s", detail);
     h->created_ms = now_ms();
     h->capture = j->capture;
+    /* Recorded before the hold is taken, and a hold the journal could not
+     * keep is not taken at all: after a crash nothing would release it. */
+    status_t st = journal_save(s);
+    if (st != OK) {
+        s->n_holds--;
+        pthread_mutex_unlock(&s->jmu);
+        return st;
+    }
     *out = h->id;
-    journal_save(s);
     pthread_mutex_unlock(&s->jmu);
     return OK;
 }
@@ -199,7 +250,9 @@ static status_t j_clear(void *ctx, int64_t id)
     for (size_t i = 0; i < s->n_holds; i++) {
         if (s->holds[i].id != id) continue;
         s->holds[i] = s->holds[--s->n_holds];
-        journal_save(s);
+        /* Released already; a journal still naming it costs a redundant
+         * release after a crash, nothing more. Logged by journal_save. */
+        if (journal_save(s) != OK) err_clear();
         break;
     }
     pthread_mutex_unlock(&s->jmu);
@@ -619,6 +672,70 @@ static int capture_take(helper_server_t *s, const char *token, capture_t *out)
     return c != NULL;
 }
 
+/*
+ * Daemon sessions (B169). A daemon killed mid-backup never sends
+ * capture.end, so its capture, and every hold under it (a pause, an
+ * export), lasted until capture_max_s (a day) or a helper restart, and the
+ * daemon's own holds_open said 0 meanwhile. The daemon keeps one anchor
+ * connection open for as long as it runs; when the last anchor of a
+ * session closes, which the kernel does for a killed process, the
+ * session's captures are ended as aborted, releasing their holds through
+ * the backend the way capture.end would. A capture still in its begin is
+ * left to that begin, which ends it itself on finding its session gone,
+ * so a hold recorded and not yet taken is never released from outside
+ * (the record-before-take rule, B151). Caller holds mu for the first two.
+ */
+static int session_anchored(const helper_server_t *s, const char *tok)
+{
+    if (!tok[0]) return 0;
+    for (size_t i = 0; i < CONNS_MAX; i++)
+        if (s->sessions[i].anchors > 0 && strcmp(s->sessions[i].token, tok) == 0) return 1;
+    return 0;
+}
+
+static void anchor_add(helper_server_t *s, const char *tok)
+{
+    pthread_mutex_lock(&s->mu);
+    dsession_t *free_slot = NULL, *have = NULL;
+    for (size_t i = 0; i < CONNS_MAX && !have; i++) {
+        if (s->sessions[i].anchors > 0 && strcmp(s->sessions[i].token, tok) == 0) have = &s->sessions[i];
+        else if (!free_slot && s->sessions[i].anchors == 0) free_slot = &s->sessions[i];
+    }
+    if (!have && free_slot) {
+        have = free_slot;
+        snprintf(have->token, sizeof(have->token), "%s", tok);
+    }
+    if (have) have->anchors++;
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* The anchor closed: on the session's last, end its captures. */
+static void anchor_drop(helper_server_t *s, const char *tok)
+{
+    pthread_mutex_lock(&s->cmu);
+    int stopping = s->stop;
+    pthread_mutex_unlock(&s->cmu);
+    capture_t *ended = calloc(CAPTURES_MAX, sizeof(*ended));
+    size_t n = 0;
+    pthread_mutex_lock(&s->mu);
+    int last = 0;
+    for (size_t i = 0; i < CONNS_MAX; i++)
+        if (s->sessions[i].anchors > 0 && strcmp(s->sessions[i].token, tok) == 0)
+            last = --s->sessions[i].anchors == 0;
+    /* At a helper stop the stop ends every capture itself. */
+    for (size_t i = 0; last && !stopping && ended && i < CAPTURES_MAX; i++)
+        if (s->caps[i].used == 1 && s->caps[i].anchored && strcmp(s->caps[i].session, tok) == 0) {
+            ended[n++] = s->caps[i];
+            s->caps[i].used = 0;
+        }
+    pthread_mutex_unlock(&s->mu);
+    if (n)
+        log_warn("helper: the daemon's session %.8s... ended (its connection closed) with %zu capture(s) "
+                 "open; ending them and releasing their holds", tok, n);
+    for (size_t i = 0; i < n; i++) capture_finish(s, &ended[i], SP_END_ABORTED);
+    free(ended);
+}
+
 static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pass_fd)
 {
     int lfd = -1;             /* items only known after begin: hook logs */
@@ -643,6 +760,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         slot->used = 2;       /* reserved: not findable until filled */
         slot->seq = seq;
     }
+    int anchored = session_anchored(s, r->conn_session);
     pthread_mutex_unlock(&s->mu);
     if (!ok) return resp_error(r->id, HELPER_E_BUSY, "more than %u captures in the last hour",
                                s->pol->max_captures_per_hour);
@@ -651,6 +769,8 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
     capture_t c;
     memset(&c, 0, sizeof(c));
     c.seq = seq;
+    snprintf(c.session, sizeof(c.session), "%s", r->conn_session);
+    c.anchored = anchored;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     cJSON *res = cJSON_CreateObject();
@@ -893,8 +1013,18 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
     c.deadline = now + (time_t)s->pol->capture_max_s;
     c.used = 1;
     pthread_mutex_lock(&s->mu);
-    *slot = c;
+    /* Its session may have ended while it began: nobody will end it now. */
+    int orphan = c.anchored && !session_anchored(s, c.session);
+    if (orphan) slot->used = 0;
+    else *slot = c;
     pthread_mutex_unlock(&s->mu);
+    if (orphan) {
+        log_warn("helper: the daemon's session %.8s... ended during a capture's begin; ending it", c.session);
+        cJSON_Delete(res);
+        capture_finish(s, &c, SP_END_ABORTED);
+        if (lfd >= 0) close(lfd);
+        return resp_error(r->id, HELPER_E_FAILED, "the daemon's session ended during the begin");
+    }
     cJSON_AddStringToObject(res, "capture", c.token);
     cJSON_AddNumberToObject(res, "snapshot_ms",
                             (double)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
@@ -924,6 +1054,8 @@ static char *op_capture_begin_paths(helper_server_t *s, const helper_req_t *r)
         memset(slot, 0, sizeof(*slot));
         slot->seq = seq;
         slot->deadline = now + (time_t)s->pol->capture_max_s;
+        snprintf(slot->session, sizeof(slot->session), "%s", r->conn_session);
+        slot->anchored = session_anchored(s, r->conn_session);
         if (helper_random_hex(slot->token, 16) == OK) slot->used = 1;
         else slot = NULL;
     }
@@ -1357,20 +1489,28 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     if (snprintf(path, sizeof(path), "%s/%lld-%s", base, (long long)r->job, uniq) >= (int)sizeof(path))
         return resp_error(r->id, HELPER_E_INVALID, "path too long");
     /* Made down to the staging base, which may be a share directory not
-     * there yet (system/), each level the helper's own except the last. */
+     * there yet (system/), each level the helper's own except the last.
+     * Under mu: a swap removes the base once it is empty (staging_tidy),
+     * and must not do so between this mkdir of it and the one of path. */
     {
         char p[PATH_MAX];
         snprintf(p, sizeof(p), "%s", base);
+        pthread_mutex_lock(&s->mu);
         for (char *c = p + strlen(dom) + 1; *c; c++) {
             if (*c != '/') continue;
             *c = '\0';
-            if (mkdir(p, 0755) != 0 && errno != EEXIST)
-                return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", p, strerror(errno));
+            if (mkdir(p, 0755) != 0 && errno != EEXIST) {
+                int err = errno;
+                pthread_mutex_unlock(&s->mu);
+                return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", p, strerror(err));
+            }
             *c = '/';
         }
+        int bad = mkdir_owned(base, s->pol->daemon_uid) != 0 || mkdir_owned(path, s->pol->daemon_uid) != 0;
+        int err = errno;
+        pthread_mutex_unlock(&s->mu);
+        if (bad) return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", path, strerror(err));
     }
-    if (mkdir_owned(base, s->pol->daemon_uid) != 0 || mkdir_owned(path, s->pol->daemon_uid) != 0)
-        return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", path, strerror(errno));
     /* The swap is a rename: the staging must be on the mount's filesystem
      * (a btrfs subvolume or another dataset would be EXDEV at the swap,
      * after the whole restore was written). */
@@ -1388,10 +1528,15 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     pthread_mutex_lock(&s->mu);
     staging_t *slot = NULL;
     for (size_t i = 0; i < STAGINGS_MAX && !slot; i++) if (!s->stages[i].used) slot = &s->stages[i];
+    /* A swapped staging is only kept for an undo: the first to go when
+     * the table is full. */
+    for (size_t i = 0; i < STAGINGS_MAX && !slot; i++) if (s->stages[i].swapped) slot = &s->stages[i];
     char token[HELPER_TOKEN_HEX + 1] = "";
     if (slot && helper_random_hex(slot->token, 16) == OK) {
         slot->used = 1;
         slot->swapped = 0;
+        slot->had = 0;
+        slot->old[0] = '\0';
         slot->job = r->job;
         snprintf(slot->unit, sizeof(slot->unit), "%s", r->unit);
         snprintf(slot->mount, sizeof(slot->mount), "%s", r->mount);
@@ -1411,6 +1556,80 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     return resp_ok(r->id, res);
 }
 
+/*
+ * After a swap, what of the staging is empty goes (B168: an empty
+ * <domain>/.cbackup-restore was left at the top of the domain): the
+ * staging directory of a disk image, whose image moved out of it, and the
+ * base when it is the helper's own .cbackup-restore with nothing else in
+ * it. An operator's restore_staging_dirs entry is theirs and stays. rmdir
+ * only, so anything another restore still has there is safe, and under mu
+ * against a stage making the base at the same time.
+ */
+static void staging_tidy(helper_server_t *s, const char *dir, int file)
+{
+    char base[HELPER_PATH_MAX + 1];
+    if (snprintf(base, sizeof(base), "%s", dir) >= (int)sizeof(base)) return;
+    char *sl = strrchr(base, '/');
+    if (!sl || sl == base) return;
+    *sl = '\0';
+    const char *leaf = strrchr(base, '/');
+    pthread_mutex_lock(&s->mu);
+    if (file == 2) (void)rmdir(dir);
+    if (leaf && strcmp(leaf, "/.cbackup-restore") == 0) (void)rmdir(base);
+    pthread_mutex_unlock(&s->mu);
+}
+
+/*
+ * restore.swap with undo (B167): what a swap did, reversed, for a restore
+ * that failed after it. The unit must still be stopped. The restored copy
+ * goes back to its staging directory, out of sight as it was, and the data
+ * moved aside comes back to the mount. A staging whose slot a later stage
+ * has taken has no undo; its data is still at <mount>.cbackup-old-<job>.
+ */
+static char *swap_undo(helper_server_t *s, const helper_req_t *r, const staging_t *st)
+{
+    if (!st->swapped) return resp_error(r->id, HELPER_E_INVALID, "not swapped; nothing to undo");
+    const char *suid = NULL;
+    const helper_backend_t *sb_ = backend_of(s, st->unit, &suid);
+    int state = sb_ && sb_->unit_state ? sb_->unit_state(sb_->ctx, suid) : -1;
+    if (state < 0)
+        return resp_error(r->id, HELPER_E_FAILED, "cannot tell whether %s is running", st->unit);
+    if (state == SP_STATE_RUNNING || state == SP_STATE_PAUSED)
+        return resp_error(r->id, HELPER_E_BUSY, "%s is running; stop it first", st->unit);
+    /* The staging directory again, and its base, which the swap may have
+     * removed as empty. */
+    char base[HELPER_PATH_MAX + 1], back[HELPER_PATH_MAX + 8];
+    snprintf(base, sizeof(base), "%s", st->path);
+    char *sl = strrchr(base, '/');
+    if (sl && sl != base) *sl = '\0';
+    pthread_mutex_lock(&s->mu);
+    int bad = mkdir_owned(base, s->pol->daemon_uid) != 0 ||
+              (st->file == 2 && mkdir_owned(st->path, s->pol->daemon_uid) != 0);
+    int err = errno;
+    pthread_mutex_unlock(&s->mu);
+    if (bad) return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", st->path, strerror(err));
+    snprintf(back, sizeof(back), st->file == 2 ? "%.4000s/image" : "%.4000s", st->path);
+    struct stat sb;
+    if (lstat(back, &sb) == 0) return resp_error(r->id, HELPER_E_BUSY, "%.300s already exists", back);
+    if (rename(st->mount, back) != 0)
+        return resp_error(r->id, HELPER_E_FAILED, "move the restored copy back: %s", strerror(errno));
+    if (st->had && rename(st->old, st->mount) != 0) {
+        err = errno;
+        (void)rename(back, st->mount);
+        return resp_error(r->id, HELPER_E_FAILED, "put %.300s back: %s", st->old, strerror(err));
+    }
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < STAGINGS_MAX; i++)
+        if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) s->stages[i].used = s->stages[i].swapped = 0;
+    pthread_mutex_unlock(&s->mu);
+    cJSON *res = cJSON_CreateObject();
+    if (res) {
+        cJSON_AddStringToObject(res, "mount", st->mount);
+        cJSON_AddStringToObject(res, "restored_copy", back);
+    }
+    return resp_ok(r->id, res);
+}
+
 static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
 {
     if (!s->pol->allow_restore) return resp_error(r->id, HELPER_E_DENIED, "the policy does not allow restore");
@@ -1421,8 +1640,11 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     if (x) st = *x;
     pthread_mutex_unlock(&s->mu);
     if (!x) return resp_error(r->id, HELPER_E_INVALID, "no such staging");
+    if (r->undo) return swap_undo(s, r, &st);
     if (st.swapped) return resp_error(r->id, HELPER_E_INVALID, "already swapped");
     if (st.file == 3) return resp_error(r->id, HELPER_E_INVALID, "this staging is for vm.install_state");
+    char sdir[HELPER_PATH_MAX + 1];
+    snprintf(sdir, sizeof(sdir), "%s", st.path);
     /* A disk image is replaced by the image the daemon wrote in staging. */
     if (st.file == 2) {
         char img[PATH_MAX + 8];
@@ -1447,13 +1669,42 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
         return resp_error(r->id, HELPER_E_FAILED, "move aside: %s", strerror(errno));
     if (rename(st.path, st.mount) != 0) {
         int e = errno;
-        if (had) (void)rename(old, st.mount);
+        if (had && rename(old, st.mount) != 0) {
+            int e2 = errno;
+            log_error("helper: swap of %s failed and the original could not be put back; "
+                      "it is at %s: %s", st.mount, old, strerror(e2));
+            return resp_error(r->id, HELPER_E_FAILED, "swap in: %s; the original could not be "
+                              "put back and is at %.300s (%s)", strerror(e), old, strerror(e2));
+        }
         return resp_error(r->id, HELPER_E_FAILED, "swap in: %s", strerror(e));
     }
     pthread_mutex_lock(&s->mu);
     for (size_t i = 0; i < STAGINGS_MAX; i++)
-        if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) s->stages[i].used = 0;
+        if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) {
+            s->stages[i].swapped = 1;
+            s->stages[i].had = had;
+            snprintf(s->stages[i].old, sizeof(s->stages[i].old), "%s", old);
+        }
     pthread_mutex_unlock(&s->mu);
+    staging_tidy(s, sdir, st.file);
+    /* Durable before it is reported: a power cut must not undo a swap the
+     * daemon was told happened. The staging is tidied first either way. */
+    {
+        char parent[PATH_MAX];
+        snprintf(parent, sizeof(parent), "%.4000s", st.mount);
+        char *sl = strrchr(parent, '/');
+        if (sl && sl != parent) *sl = '\0';
+        else if (sl) sl[1] = '\0';
+        int dfd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        int ok = dfd >= 0 && fsync(dfd) == 0;
+        int e = errno;
+        if (dfd >= 0) close(dfd);
+        if (!ok)
+            return resp_error(r->id, HELPER_E_FAILED, "swapped in, but %.300s could not be "
+                              "synced, so the swap may not survive a power cut: %s%s%.300s",
+                              parent, strerror(e), had ? "; the original is at " : "",
+                              had ? old : "");
+    }
     cJSON *res = cJSON_CreateObject();
     if (res) {
         cJSON_AddStringToObject(res, "mount", st.mount);
@@ -1474,10 +1725,13 @@ static char *op_unit_stop_start(helper_server_t *s, const helper_req_t *r, int s
         return resp_error(r->id, e, "%s", why);
     if (!b->set_running)
         return resp_error(r->id, HELPER_E_UNSUPPORTED, "%s cannot be stopped or started here", r->unit);
+    /* What it was before, so a restore that fails can put that back. */
+    int was = b->unit_state ? b->unit_state(b->ctx, uid) : -1;
     if (b->set_running(b->ctx, uid, start) != OK)
         return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
     cJSON *res = cJSON_CreateObject();
     if (res) cJSON_AddStringToObject(res, "state", start ? "running" : "stopped");
+    if (res && was >= 0) cJSON_AddBoolToObject(res, "was_running", was == SP_STATE_RUNNING || was == SP_STATE_PAUSED);
     return resp_ok(r->id, res);
 }
 
@@ -1520,6 +1774,7 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd
     cJSON *d = cJSON_Parse(r->definition ? r->definition : "{}");
     int priv = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "privileged"));
     int by_fd = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "memfd"));
+    int check = by_fd && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "check"));
     cJSON_Delete(d);
     char *passed = NULL;
     if (by_fd) {
@@ -1546,6 +1801,21 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd
     if (!b->define) {
         free(passed);
         return resp_error(r->id, HELPER_E_UNSUPPORTED, "provider %s does not define units", b->name);
+    }
+    /* {"memfd": true, "check": true}: every refusal above, and nothing
+     * defined (B167). A restore asks before it writes anything, so a
+     * policy that would refuse the define refuses the restore instead of
+     * leaving its data swapped in; it learns here too whether it may
+     * stage and swap, and whether the unit runs. */
+    if (check) {
+        free(passed);
+        cJSON *cr = cJSON_CreateObject();
+        if (cr) {
+            cJSON_AddBoolToObject(cr, "checked", 1);
+            cJSON_AddBoolToObject(cr, "allow_restore", s->pol->allow_restore);
+            cJSON_AddNumberToObject(cr, "state", b->unit_state ? b->unit_state(b->ctx, uid) : -1);
+        }
+        return resp_ok(r->id, cr);
     }
     cJSON *res = NULL;
     status_t dst = b->define(b->ctx, uid, passed ? passed : (r->definition ? r->definition : "{}"), s->pol, &res);
@@ -1701,6 +1971,9 @@ static char *op_hello(helper_server_t *s, const helper_req_t *r)
     cJSON_AddNumberToObject(res, "version", HELPER_PROTO_VERSION);
     cJSON_AddStringToObject(res, "daemon_id", s->pol->daemon_id);
     cJSON_AddStringToObject(res, "policy", s->pol->digest);
+    /* What the helper holds now, for the daemon's holds_open (B169). */
+    cJSON_AddNumberToObject(res, "holds", (double)helper_server_holds(s));
+    cJSON_AddNumberToObject(res, "captures", (double)helper_server_captures(s));
     cJSON *p = cJSON_AddArrayToObject(res, "providers");
     for (size_t i = 0; p && i < s->nb; i++)
         cJSON_AddItemToArray(p, cJSON_CreateString(s->backends[i].name));
@@ -1740,16 +2013,24 @@ void helper_server_handle(helper_server_t *s, const char *req, size_t len,
     helper_server_handle_fd(s, req, len, -1, resp, pass_fd);
 }
 
-void helper_server_handle_fd(helper_server_t *s, const char *req, size_t len, int in_fd,
-                             char **resp, int *pass_fd)
+/* One request on a connection whose hello named session ("" for none). */
+static void handle_in_session(helper_server_t *s, const char *req, size_t len, int in_fd,
+                              const char *session, char **resp, int *pass_fd)
 {
     *pass_fd = -1;
     helper_req_t r;
     char why[512];
     helper_err_t e = helper_request_parse(req, len, &r, why, sizeof(why));
+    snprintf(r.conn_session, sizeof(r.conn_session), "%s", session);
     *resp = e == HELPER_OK ? dispatch(s, &r, pass_fd, in_fd) : resp_error(r.id, e, "%s", why);
     helper_req_free(&r);
     err_clear();
+}
+
+void helper_server_handle_fd(helper_server_t *s, const char *req, size_t len, int in_fd,
+                             char **resp, int *pass_fd)
+{
+    handle_in_session(s, req, len, in_fd, "", resp, pass_fd);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1763,7 +2044,8 @@ static void *conn_main(void *arg)
     conn_arg_t *c = arg;
     helper_server_t *s = c->s;
     char *buf = malloc(HELPER_PACKET_MAX + 2);
-    int greeted = 0;
+    int greeted = 0, anchor = 0;
+    char session[HELPER_TOKEN_HEX + 1] = "";
     while (buf) {
         size_t got = 0;
         int rfd = -1;
@@ -1786,13 +2068,15 @@ static void *conn_main(void *arg)
             if (e == HELPER_OK && r.op == HOP_HELLO) {
                 resp = dispatch(s, &r, &pfd, -1);
                 greeted = 1;
+                snprintf(session, sizeof(session), "%s", r.token);
+                if (r.anchor && session[0]) { anchor = 1; anchor_add(s, session); }
             } else {
                 resp = resp_error(r.id, e != HELPER_OK ? e : HELPER_E_DENIED,
                                   "%s", e != HELPER_OK ? why : "the first request must be hello");
             }
             helper_req_free(&r);
         } else {
-            helper_server_handle_fd(s, buf, got, rfd, &resp, &pfd);
+            handle_in_session(s, buf, got, rfd, session, &resp, &pfd);
         }
         if (rfd >= 0) close(rfd);
         if (resp) (void)helper_send(c->fd, resp, strlen(resp), pfd);
@@ -1801,6 +2085,8 @@ static void *conn_main(void *arg)
         if (pfd >= 0) close(pfd);
     }
     free(buf);
+    /* The daemon gone, killed or stopped: its captures go with it. */
+    if (anchor) anchor_drop(s, session);
     pthread_mutex_lock(&s->cmu);
     close(c->fd);
     s->conns[c->slot] = -1;
@@ -2027,7 +2313,7 @@ status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **o
     if (rel || rep.removed)
         log_warn("helper: start-up sweep released %u hold(s), removed %u artefact(s)", rel, rep.removed);
     pthread_mutex_lock(&s->jmu);
-    journal_save(s);
+    if (journal_save(s) != OK) err_clear();   /* logged; holds are still in memory */
     pthread_mutex_unlock(&s->jmu);
 
     if (cfg->listen) {

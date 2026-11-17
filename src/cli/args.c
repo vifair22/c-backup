@@ -35,11 +35,12 @@ void args_usage(const arg_spec_t *spec, FILE *out)
     for (int i = 0; spec->pos && spec->pos[i]; i++) fprintf(out, " %s", spec->pos[i]);
     for (int i = 0; spec->opts && spec->opts[i].name; i++) {
         const arg_opt_t *o = &spec->opts[i];
-        fputs(" [", out);
+        int req = o->kind == ARG_REQUIRED;
+        fputs(req ? " " : " [", out);
         fputs(o->name, out);
         if (o->alias) fprintf(out, "|%s", o->alias);
         if (o->kind != ARG_FLAG) fprintf(out, " %s", o->meta ? o->meta : "VALUE");
-        fputc(']', out);
+        if (!req) fputc(']', out);
         if (o->kind == ARG_MULTI) fputs("...", out);
     }
     if (spec->note) fprintf(out, "  (%s)", spec->note);
@@ -185,7 +186,7 @@ int args_parse(const arg_spec_t *spec, int argc, char **argv, args_t *a, FILE *e
         }
 
         a->count[k]++;
-        if (o->kind == ARG_VALUE || o->kind == ARG_CHOICE) {
+        if (o->kind == ARG_VALUE || o->kind == ARG_CHOICE || o->kind == ARG_REQUIRED) {
             a->value[k] = val;
         } else {
             if (a->nmulti == ARG_MAX_MULTI)
@@ -197,6 +198,10 @@ int args_parse(const arg_spec_t *spec, int argc, char **argv, args_t *a, FILE *e
         }
     }
     a->npos = w;
+
+    for (int k = 0; spec->opts && spec->opts[k].name; k++)
+        if (spec->opts[k].kind == ARG_REQUIRED && a->count[k] == 0)
+            return refuse(spec, err, "%s is required", spec->opts[k].name);
 
     int min, max;
     args_pos_bounds(spec, &min, &max);
@@ -214,7 +219,7 @@ static int opt_index(const args_t *a, const char *name, arg_kind_t kind)
     int k = find_opt(a->spec, name, strlen(name));
     arg_kind_t have = k < 0 ? kind : a->spec->opts[k].kind;
     /* A choice is a value that has been checked; it reads the same way. */
-    if (have == ARG_CHOICE && kind == ARG_VALUE) have = ARG_VALUE;
+    if ((have == ARG_CHOICE || have == ARG_REQUIRED) && kind == ARG_VALUE) have = ARG_VALUE;
     if (k < 0 || have != kind) {
         fprintf(stderr, "c-backup: internal error: '%s' is not a %s option of '%s'\n",
                 name, kind == ARG_FLAG ? "flag" : kind == ARG_VALUE ? "value" : "repeatable",

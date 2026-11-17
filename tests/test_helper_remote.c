@@ -8,6 +8,7 @@
  * is read on the daemon's side, as source-providers.md 11.1 lays out.
  */
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <time.h>
@@ -22,6 +23,8 @@
 
 #include <cmocka.h>
 #include <cutils/db.h>
+#include <cutils/log.h>
+#include <stdatomic.h>
 
 #include "helper_fixture.h"
 #include "registry.h"
@@ -159,6 +162,22 @@ static int setup_define(void **state)
     if (setup_base() != 0) return -1;
     char text[8192];
     hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
+    char *p = strstr(text, "allow_define = 0");
+    if (!p) return -1;
+    p[15] = '1';
+    helper_policy_free(&pol);
+    if (helper_policy_parse(text, &pol) != OK) return -1;
+    if (helper_up() != 0) return -1;
+    return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
+}
+
+/* As setup_define, with restore not allowed. */
+static int setup_define_norestore(void **state)
+{
+    (void)state;
+    if (setup_base() != 0) return -1;
+    char text[8192];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 0);
     char *p = strstr(text, "allow_define = 0");
     if (!p) return -1;
     p[15] = '1';
@@ -345,6 +364,11 @@ static void test_dumps_through_helper(void **state)
     unit_backup_result_t res;
     assert_int_equal(backup_one("cbk-uat-one", &res), OK);
     int64_t snap = res.units[0].snapshot_id;
+    /* The failed dump is named as one, not counted as an unreadable file. */
+    if (!strstr(res.units[0].warning, "1 dump(s) failed")) fail_msg("warning: %s", res.units[0].warning);
+    assert_non_null(strstr(res.units[0].warning, "baddump.dump"));
+    /* The disk's data runs alone: the dump's bytes are not disk bytes. */
+    assert_int_equal(res.units[0].bytes_read, 1048576 + 300000);
     unit_backup_result_free(&res);
     restore_opts_t ro;
     memset(&ro, 0, sizeof(ro));
@@ -373,6 +397,11 @@ static void test_dumps_through_helper(void **state)
 static void test_unit_restore(void **state)
 {
     (void)state;
+    /* The tree's root as it is read: a mode and a time the staging
+     * directory never has, so B168 shows if the swap brings those in. */
+    assert_int_equal(chmod(HF_SNAP, 0751), 0);
+    struct timespec rt[2] = { { 1500000000, 0 }, { 1500000000, 0 } };
+    assert_int_equal(utimensat(AT_FDCWD, HF_SNAP, rt, 0), 0);
     unit_backup_result_t res;
     assert_int_equal(backup_one("cbk-uat-one", &res), OK);
     int64_t snap = res.units[0].snapshot_id;
@@ -382,6 +411,10 @@ static void test_unit_restore(void **state)
     memset(&o, 0, sizeof(o));
     unit_define_result_t dr;
     /* In place without replace, and a new name without target_root. */
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "pass replace"));
+    /* Its own name is the unit in place, not a new name. */
+    o.name = "cbk-uat-one";
     assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), ERR_INVALID);
     assert_non_null(strstr(err_msg(), "pass replace"));
     o.name = "u1-copy";
@@ -417,6 +450,263 @@ static void test_unit_restore(void **state)
     assert_non_null(strstr(dr.json, "cbackup-old-33"));
     assert_true(file_has(HF_DIR "/state/fake-define-u1.json", "\"replace\":true"));
     unit_define_result_free(&dr);
+    /* B168: the mount root is the snapshot's, not the staging directory's
+     * 0700 and today's date; and the emptied staging base is gone. */
+    assert_int_equal(stat(HF_MOUNT, &sb), 0);
+    assert_int_equal(sb.st_mode & 07777, 0751);
+    assert_int_equal((long long)sb.st_mtim.tv_sec, 1500000000LL);
+    assert_int_not_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
+}
+
+/* No .cbackup-old-* beside the mount: nothing was moved aside. */
+static int moved_aside(void)
+{
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "ls -d '%s'.cbackup-old-* >/dev/null 2>&1", HF_MOUNT);
+    return system(cmd) == 0;
+}
+
+/* B167: a policy that refuses the define refuses the restore before
+ * anything is touched. It used to stop the unit, swap the data in, and
+ * only then fail at the define, the unit left down. */
+static void test_define_refused_first(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    unit_define_result_t dr;
+    o.replace = 1;
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 41, &o, &dr), OK);
+    assert_non_null(strstr(err_msg(), "nothing written"));
+    assert_non_null(strstr(err_msg(), "does not allow define"));
+    err_clear();
+    struct stat sb;
+    assert_int_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_int_not_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+    assert_false(moved_aside());
+    assert_int_equal(fake_unit_state(fk, "u1"), SP_STATE_RUNNING);
+    assert_int_not_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
+    /* A new name: refused before the target root is written, so a retry
+     * once the policy allows it is not refused for what the first left. */
+    o.replace = 0;
+    o.name = "u1-copy";
+    o.target_root = HF_DIR "/target";
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 42, &o, &dr), OK);
+    assert_non_null(strstr(err_msg(), "nothing written"));
+    err_clear();
+    assert_int_not_equal(stat(HF_DIR "/target", &sb), 0);
+}
+
+/* B167: in place needs allow_restore; refused before the unit stops. */
+static void test_in_place_needs_restore(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.replace = 1;
+    unit_define_result_t dr;
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 43, &o, &dr), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "allow_restore"));
+    err_clear();
+    struct stat sb;
+    assert_int_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_false(moved_aside());
+    assert_int_equal(fake_unit_state(fk, "u1"), SP_STATE_RUNNING);
+}
+
+/* B167: a define that fails after the swap (here the fake cannot write
+ * its record) puts the original data back and starts the unit again. */
+static void test_define_fails_rolls_back(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    assert_int_equal(mkdir(HF_DIR "/state/fake-define-u1.json", 0700), 0);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.replace = 1;
+    unit_define_result_t dr;
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 44, &o, &dr), OK);
+    assert_non_null(strstr(err_msg(), "rolled back"));
+    assert_non_null(strstr(err_msg(), "running again"));
+    err_clear();
+    struct stat sb;
+    assert_int_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_int_not_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+    assert_false(moved_aside());
+    assert_int_equal(fake_unit_state(fk, "u1"), SP_STATE_RUNNING);
+    /* Once the define can succeed, the same restore goes through. */
+    assert_int_equal(rmdir(HF_DIR "/state/fake-define-u1.json"), 0);
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 45, &o, &dr), OK);
+    unit_define_result_free(&dr);
+    assert_int_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+    assert_int_equal(stat(HF_MOUNT ".cbackup-old-45/live.txt", &sb), 0);
+}
+
+/* Wait up to 5 s for the helper to hold no capture and no hold. */
+static int helper_drained(void)
+{
+    for (int i = 0; i < 500; i++) {
+        fake_stats_t fs;
+        fake_stats(fk, &fs);
+        if (helper_server_captures(srv) == 0 && helper_server_holds(srv) == 0 && fs.holds_now == 0) return 1;
+        struct timespec ts = { 0, 10 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+/* Begin a session on fake:u1 through the remote provider, as a unit
+ * backup does, and leave it open. */
+static status_t begin_open(sp_session_t **sess)
+{
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *ctx = NULL;
+    if (sp_registry_get("fake", &ops, &ctx) != OK) return ERR_INVALID;
+    sp_unit_desc_t *d = NULL;
+    status_t st = ops->describe(ctx, "u1", &d);
+    if (st != OK) return st;
+    sp_begin_req_t q;
+    memset(&q, 0, sizeof(q));
+    q.job_id = 77;
+    q.want = SP_CONSIST_APPLICATION;
+    q.require = SP_CONSIST_CRASH;
+    q.daemon8 = units_daemon8();
+    const sp_session_info_t *info = NULL;
+    st = ops->begin(ctx, d, &q, sess, &info);
+    ops->desc_free(d);
+    return st;
+}
+
+/* B169: the daemon's session ends (here remote_stop closes the anchor, as
+ * the kernel does for a killed daemon) with a capture open: the helper
+ * ends it and releases its holds at once, not at capture_max_s. */
+static void test_session_end_releases(void **state)
+{
+    (void)state;
+    sp_session_t *sess = NULL;
+    assert_int_equal(begin_open(&sess), OK);
+    assert_int_equal(helper_server_captures(srv), 1);
+    assert_true(helper_server_holds(srv) > 0);
+    /* holds_open counts the helper's holds too: what GET /providers asks. */
+    long hh = 0, hc = 0;
+    assert_int_equal(remote_helper_holds(&hh, &hc), OK);
+    assert_true(hh > 0);
+    assert_int_equal(hc, 1);
+    remote_stop();
+    assert_true(helper_drained());
+    /* The session is gone, so its end finds no capture; nothing leaks. */
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *ctx = NULL;
+    assert_int_equal(sp_registry_get("fake", &ops, &ctx), OK);
+    (void)ops->end(sess, SP_END_ABORTED, 0);
+    err_clear();
+}
+
+typedef struct { status_t st; char err[512]; } begin_job_t;
+
+static void *bg_begin(void *arg)
+{
+    begin_job_t *j = arg;
+    sp_session_t *sess = NULL;
+    j->st = begin_open(&sess);
+    snprintf(j->err, sizeof(j->err), "%s", err_msg());
+    return NULL;
+}
+
+/* B169: the session ends while a capture is still in its begin, holding a
+ * freeze it recorded: the begin, not the session's end, releases it (the
+ * record-before-take rule), and nothing is left. */
+static void test_session_end_during_begin(void **state)
+{
+    (void)state;
+    fake_fail_set(fk, "u1", FAKE_HANG_IN_HOLD, 800);
+    begin_job_t j;
+    memset(&j, 0, sizeof(j));
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, bg_begin, &j), 0);
+    struct timespec ts = { 0, 300 * 1000000L };
+    nanosleep(&ts, NULL);
+    remote_stop();
+    pthread_join(th, NULL);
+    fake_fail_clear(fk);
+    assert_int_not_equal(j.st, OK);
+    assert_non_null(strstr(j.err, "session ended"));
+    assert_true(helper_drained());
+}
+
+typedef struct { uint64_t last_done, last_total; int backwards; } bytes_seen_t;
+
+static void seen_bytes(void *ctx, uint64_t done, uint64_t total)
+{
+    bytes_seen_t *b = ctx;
+    if (done < b->last_done || total < b->last_total) b->backwards = 1;
+    b->last_done = done;
+    b->last_total = total;
+}
+
+/* A unit restore over two mounts reports bytes over both: its total was
+ * one mount's, and its done went back to 0 at the second. */
+static void test_define_bytes_over_mounts(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(HF_DIR "/snap2", 0700), 0);
+    hf_write(HF_DIR "/snap2/b.txt", "bravo-bravo\n");
+    assert_int_equal(fake_tree_add(fk, "u1", "vol2", HF_DIR "/snap2", HF_POOL "/app/u1b"), OK);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    bytes_seen_t seen;
+    memset(&seen, 0, sizeof(seen));
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.name = "u1-copy";
+    o.target_root = HF_DIR "/target";
+    o.ropts.bytes_cb = seen_bytes;
+    o.ropts.progress_ctx = &seen;
+    unit_define_result_t dr;
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 51, &o, &dr), OK);
+    unit_define_result_free(&dr);
+    assert_false(seen.backwards);
+    assert_int_equal(seen.last_total, 6 + 12);      /* alpha\n and bravo-bravo\n */
+    assert_int_equal(seen.last_done, 6 + 12);
+}
+
+static atomic_int id_warnings;
+
+static void count_id_warning(const char *ts, const char *level, const char *func, const char *msg, void *ud)
+{
+    (void)ts; (void)level; (void)func; (void)ud;
+    if (strstr(msg, "configured for daemon")) atomic_fetch_add(&id_warnings, 1);
+}
+
+/* A daemon id that differs from the helper's is said once, not at every
+ * health check (it was every 15 s; here the checks are every 200 ms). */
+static void test_id_mismatch_said_once(void **state)
+{
+    (void)state;
+    assert_string_not_equal(units_daemon8(), "0badf00d");
+    remote_stop();
+    atomic_store(&id_warnings, 0);
+    int h = log_stream_register(count_id_warning, NULL);
+    assert_true(h >= 0);
+    assert_int_equal(remote_start(HF_SOCK, units_daemon8(), &k_fast), OK);
+    struct timespec ts = { 1, 200 * 1000000L };
+    nanosleep(&ts, NULL);
+    remote_stop();
+    log_stream_unregister(h);
+    assert_true(atomic_load(&id_warnings) <= 1);
 }
 
 /* A compose project's definition as the daemon assembles it from a
@@ -580,6 +870,13 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_large_blob, setup, teardown),
         cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
         cmocka_unit_test_setup_teardown(test_unit_restore, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_define_refused_first, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_in_place_needs_restore, setup_define_norestore, teardown),
+        cmocka_unit_test_setup_teardown(test_define_fails_rolls_back, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_session_end_releases, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_session_end_during_begin, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_id_mismatch_said_once, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_bytes_over_mounts, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_compose_definition, setup, teardown),
         cmocka_unit_test_setup_teardown(test_group_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),

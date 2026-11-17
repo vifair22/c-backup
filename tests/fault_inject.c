@@ -6,6 +6,7 @@
  */
 
 #include "fault_inject.h"
+#include <fcntl.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <sys/syscall.h>
@@ -21,6 +22,7 @@ _Thread_local int fault_fseeko_at  = -1;
 _Thread_local int fault_fsync_at   = -1;
 _Thread_local int fault_pread_at   = -1;
 _Thread_local int fault_pwrite_at  = -1;
+_Thread_local int fault_fflush_at  = -1;
 _Thread_local size_t fault_malloc_peak = 0;
 _Thread_local long long fault_fwrite_bytes_left = -1;
 _Thread_local long long fault_fwrite_bytes_seen = 0;
@@ -61,10 +63,122 @@ static int fault_pread_countdown(void) {
     return 0;
 }
 
+
+/* ---- the full disk under one directory (fault_inject.h) ---- */
+const char *volatile fault_full_prefix = NULL;
+volatile unsigned fault_full_ops = 0;
+volatile int fault_full_errno = 0;
+volatile int fault_full_skip = 0;
+volatile int fault_full_count = -1;
+volatile int fault_full_hits = 0;
+
+void fault_full_arm(const char *prefix, unsigned ops, int skip, int count)
+{
+    __atomic_store_n(&fault_full_prefix, NULL, __ATOMIC_SEQ_CST);
+    fault_full_ops = ops;
+    fault_full_skip = skip;
+    fault_full_count = count;
+    fault_full_hits = 0;
+    if (fault_full_errno == 0) fault_full_errno = ENOSPC;
+    __atomic_store_n(&fault_full_prefix, prefix, __ATOMIC_SEQ_CST);
+}
+
+void fault_full_disarm(void)
+{
+    __atomic_store_n(&fault_full_prefix, NULL, __ATOMIC_SEQ_CST);
+    fault_full_ops = 0;
+}
+
+static int full_path_matches(const char *path)
+{
+    const char *want = fault_full_prefix;
+    return want && path && strncmp(path, want, strlen(want)) == 0;
+}
+
+/* Whether this call is to fail: the op is selected and the path matches,
+ * past the skip and within the count. Sets errno when it is. */
+static int full_take(unsigned op, const char *path)
+{
+    if (!(fault_full_ops & op) || !full_path_matches(path)) return 0;
+    if (__atomic_load_n(&fault_full_skip, __ATOMIC_SEQ_CST) > 0 &&
+        __atomic_sub_fetch(&fault_full_skip, 1, __ATOMIC_SEQ_CST) >= 0)
+        return 0;
+    int left = __atomic_load_n(&fault_full_count, __ATOMIC_SEQ_CST);
+    if (left == 0) return 0;
+    if (left > 0 && __atomic_sub_fetch(&fault_full_count, 1, __ATOMIC_SEQ_CST) < 0) return 0;
+    __atomic_add_fetch(&fault_full_hits, 1, __ATOMIC_SEQ_CST);
+    errno = fault_full_errno ? fault_full_errno : ENOSPC;
+    return 1;
+}
+
+static int full_fd_path(int fd, char *out, size_t sz)
+{
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t len = readlink(link, out, sz - 1);
+    if (len <= 0) return -1;
+    out[len] = '\0';
+    return 0;
+}
+
+static int full_fd(unsigned op, int fd)
+{
+    if (!fault_full_prefix || !(fault_full_ops & op) || fd < 0) return 0;
+    char path[PATH_MAX];
+    if (full_fd_path(fd, path, sizeof(path)) != 0) return 0;
+    return full_take(op, path);
+}
+
+/* The destination of a renameat as a path: dirfd's own path and the name. */
+static int full_at(unsigned op, int dirfd, const char *name)
+{
+    if (!fault_full_prefix || !(fault_full_ops & op)) return 0;
+    if (name[0] == '/' || dirfd == AT_FDCWD) return full_take(op, name);
+    char path[PATH_MAX];
+    if (full_fd_path(dirfd, path, sizeof(path)) != 0) return 0;
+    size_t l = strlen(path);
+    if (l + 1 + strlen(name) >= sizeof(path)) return 0;
+    path[l] = '/';
+    strcpy(path + l + 1, name);
+    return full_take(op, path);
+}
+
+int __wrap_fclose(FILE *stream) {
+    int fail = stream && full_fd(FAULT_FULL_CLOSE, fileno(stream));
+    int err = errno;
+    int rc = __real_fclose(stream);
+    if (fail) { errno = err; return EOF; }
+    return rc;
+}
+
+int __wrap_close(int fd) {
+    int fail = full_fd(FAULT_FULL_CLOSE, fd);
+    int err = errno;
+    int rc = __real_close(fd);
+    if (fail) { errno = err; return -1; }
+    return rc;
+}
+
+int __wrap_renameat(int olddirfd, const char *from, int newdirfd, const char *to) {
+    if (full_at(FAULT_FULL_RENAME, newdirfd, to)) return -1;
+    return __real_renameat(olddirfd, from, newdirfd, to);
+}
+
+int __wrap_ftruncate(int fd, off_t len) {
+    if (full_fd(FAULT_FULL_TRUNC, fd)) return -1;
+    return __real_ftruncate(fd, len);
+}
+
+int __wrap_syncfs(int fd) {
+    if (full_fd(FAULT_FULL_SYNC, fd)) return -1;
+    return __real_syncfs(fd);
+}
+
 int (*volatile fault_write_hook)(int fd) = NULL;
 int (*volatile fault_mkdir_hook)(const char *path, mode_t mode) = NULL;
 
 ssize_t __wrap_write(int fd, const void *buf, size_t n) {
+    if (full_fd(FAULT_FULL_WRITE, fd)) return -1;
     int (*h)(int) = fault_write_hook;
     if (h && h(fd) != FAULT_FS_PASS) return -1;
     return __real_write(fd, buf, n);
@@ -77,6 +191,7 @@ int __wrap_mkdir(const char *path, mode_t mode) {
 }
 
 ssize_t __wrap_pwrite(int fd, const void *buf, size_t n, off_t off) {
+    if (full_fd(FAULT_FULL_WRITE, fd)) return -1;
     int (*h)(int) = fault_write_hook;
     if (h && h(fd) != FAULT_FS_PASS) return -1;
     if (fault_pwrite_at < 0) return __real_pwrite(fd, buf, n, off);
@@ -93,6 +208,7 @@ size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 }
 
 size_t __wrap_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    if (full_fd(FAULT_FULL_WRITE, fileno(stream))) return 0;
     int (*h)(int) = fault_write_hook;
     if (h && h(fileno(stream)) != FAULT_FS_PASS) return 0;
     if (fault_fwrite_bytes_left >= 0) {
@@ -105,6 +221,13 @@ size_t __wrap_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
     if (fault_fwrite_at == 0) { fault_fwrite_at = -1; errno = EIO; return 0; }
     fault_fwrite_at--;
     return __real_fwrite(ptr, size, nmemb, stream);
+}
+
+int __wrap_fflush(FILE *stream) {
+    if (stream && full_fd(FAULT_FULL_FLUSH, fileno(stream))) return EOF;
+    if (fault_fflush_at == 0) { fault_fflush_at = -1; errno = ENOSPC; return EOF; }
+    if (fault_fflush_at > 0) fault_fflush_at--;
+    return __real_fflush(stream);
 }
 
 int __wrap_fseeko(FILE *stream, off_t offset, int whence) {
@@ -125,6 +248,7 @@ int __wrap_unlink(const char *path) {
 }
 
 int __wrap_fsync(int fd) {
+    if (full_fd(FAULT_FULL_SYNC, fd)) return -1;
     int (*h)(int, int) = fault_sync_hook;
     if (h) { int r = h(fd, 0); if (r != FAULT_FS_PASS) return r; }
     if (fault_fsync_at < 0) return __real_fsync(fd);
@@ -134,6 +258,7 @@ int __wrap_fsync(int fd) {
 }
 
 int __wrap_fdatasync(int fd) {
+    if (full_fd(FAULT_FULL_SYNC, fd)) return -1;
     int (*h)(int, int) = fault_sync_hook;
     if (h) { int r = h(fd, 1); if (r != FAULT_FS_PASS) return r; }
     if (fault_fsync_at < 0) return __real_fdatasync(fd);
@@ -207,6 +332,7 @@ volatile int fault_rename_die_skip = 0;
 volatile int fault_rename_die_after = 0;
 
 int __wrap_rename(const char *from, const char *to) {
+    if (fault_full_prefix && full_take(FAULT_FULL_RENAME, to)) return -1;
     int (*h)(const char *, const char *) = fault_rename_hook;
     if (h) { int r = h(from, to); if (r != FAULT_FS_PASS) return r; }
     gate_wait(to);

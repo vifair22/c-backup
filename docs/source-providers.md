@@ -668,10 +668,26 @@ enrolled uses defaults.
 `units.allow` is a glob list in the config file (comma-separated, the YAML
 subset has no lists) of unit names the daemon may touch at all, for any
 operation including describe-and-begin. Default empty means all. During
-UAT it is set to `cbk-uat-*`, which enforces "no production VMs or
-containers" in the daemon itself rather than in the operator's care. It
+UAT it is set to the `cbk-uat-*` units, which enforces "no production VMs
+or containers" in the daemon itself rather than in the operator's care. It
 lives in the root-owned config file, not the API, so a session token cannot
 widen it.
+
+Each glob (`fnmatch(3)`) is tried against the unit's id, its name,
+`<provider>:<id>` and `<provider>:<name>`. Ids are per provider: a compose
+project is `compose:<project>` (key `docker:compose:<project>`), a
+standalone container its name (`docker:<name>`), an LXC container its name,
+a libvirt domain its UUID (its name matches through `<provider>:<name>`).
+So a bare `cbk-uat-*` reaches containers, LXC containers and VMs named
+`cbk-uat-...` but **not** the compose project `cbk-uat-compose`, whose id
+and name are `compose:cbk-uat-compose`; that takes
+`docker:compose:cbk-uat-*` (or `compose:cbk-uat-*`). The FS1 UAT value is
+`docker:cbk-uat-*,docker:compose:cbk-uat-*,libvirt:cbk-uat-*,lxc:cbk-uat-*`.
+Compose project names are lowercase (compose lowercases the directory name
+it derives one from), so the project part of a `compose:` or
+`docker:compose:` glob is matched lowercased: `compose:Immich` is the
+project `immich`. Every other name keeps its case. The helper's
+`[units] allow` uses the same keys (`helper.md`, The policy).
 
 ## 9. Jobs, locking, parallelism
 
@@ -826,7 +842,7 @@ snapshot name, raw XML for libvirt, or a raw create body for Docker.
 
 | Operation | Arguments (typed) | What the helper does |
 |---|---|---|
-| `hello` | `client_version` int | handshake |
+| `hello` | `client_version` int; `session` token, optional; `anchor` bool, optional | handshake; answers the policy digest, daemon id, providers, and the `holds` and `captures` the helper has now. `session` names the daemon process; `anchor` keeps the connection as that session's anchor, and when its last anchor closes the helper ends the captures the session began (a daemon killed mid-backup) |
 | `units.list` | `provider` enum | enumerate, filtered by the policy's unit allowlist |
 | `units.describe` | `unit` unit key | inspect / domain XML / LXC config, templates and compose files, read by the helper and returned as data |
 | `capture.begin` | `units` 1 to 32 unit keys; `pause` bool | resolves every included mount itself, computes snapshot domains itself and intersects them with the policy's domains; pauses or freezes members if asked, `syncfs`, one atomic snapshot per pool with names it generates, unpauses; returns an opaque capture token, the read root of each mount, timings and per-member outcomes. Holds a lease with a deadline |
@@ -839,9 +855,9 @@ snapshot name, raw XML for libvirt, or a raw create body for Docker.
 | `vm.checkpoint_redefine` | `unit`; `checkpoint` name | redefines from the XML the helper itself stored when it created the checkpoint. The helper also runs this for every recorded checkpoint at its own start, because Unraid keeps checkpoint metadata on the RAM rootfs (`vm-backup.md` 5.8) |
 | `vm.install_state` | `unit` (the domain just defined or replaced); `staging` token | installs the staged NVRAM file at the path the domain's XML names and the TPM state directory at `tpm-states/<that domain's uuid>/`, with recorded owners and modes; refuses any other UUID and an existing state directory for a new UUID; never lists or touches other UUIDs' state (`vm-backup.md` 7.2) |
 | `restore.stage` | `unit`; `mount` (a source path as recorded); `job` int | creates `<dataset root>/.cbackup-restore/<job>/` for that mount, owned by the daemon uid; returns a staging token and the path |
-| `restore.swap` | `staging` token | with the unit stopped, renames the staged restore into place and moves the old data aside (11.6); never deletes |
-| `unit.stop`, `unit.start` | `unit` | for restore; policy `allow_restore` |
-| `unit.define` | `unit`; `definition` (the snapshot's inspect, template, compose files, or domain XML) | policy `allow_define` only. The helper parses the definition field by field, rejects privileged settings unless `allow_privileged_define`, rewrites names, UUIDs and MACs itself, and serialises its own document; the daemon's bytes are never passed through |
+| `restore.swap` | `staging` token; `undo` bool, optional | with the unit stopped, renames the staged restore into place and moves the old data aside (11.6); never deletes. With `undo`, reverses a swap it made: the restored copy back to its staging directory, the old data back to the mount (a restore that failed after the swap) |
+| `unit.stop`, `unit.start` | `unit` | for restore; policy `allow_restore`. `unit.stop` says whether the unit was running, so a failed restore can start it again |
+| `unit.define` | `unit`; `definition` (the snapshot's inspect, template, compose files, or domain XML) | policy `allow_define` only. The helper parses the definition field by field, rejects privileged settings unless `allow_privileged_define`, rewrites names, UUIDs and MACs itself, and serialises its own document; the daemon's bytes are never passed through. A passed definition with `check: true` beside `memfd` runs every refusal and defines nothing, answering `allow_restore` and the unit's state: a restore asks it before it writes anything |
 | `lease.release` | `capture` or `session` token | early release |
 | `sweep` | none | releases everything its own records say is held; destroys its own leftover artefacts |
 

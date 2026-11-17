@@ -223,6 +223,7 @@ typedef enum {
 
 typedef struct {
     char     root[PATH_MAX];
+    char     uuid[CBACKUP_UUID_LEN];   /* the one registered for this id */
     char     packs_dir[PATH_MAX];
     char     identity[64];      /* packs/ as it is now */
     int      identity_changed;  /* differs from the recorded one */
@@ -234,12 +235,13 @@ typedef struct {
 static status_t repo_root_of(cutils_db_t *db, const char *repo, probe_t *p)
 {
     db_result_t *r = NULL;
-    if (db_execute(db, "SELECT path FROM repos WHERE id = ?",
+    if (db_execute(db, "SELECT path, uuid FROM repos WHERE id = ?",
                    (const char *[]){ repo, NULL }, &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
         return set_error(ERR_NOT_FOUND, "pack presence: no repository %s", repo);
     }
     int toolong = snprintf(p->root, sizeof(p->root), "%s", r->rows[0][0]) >= (int)sizeof(p->root) ||
+                  snprintf(p->uuid, sizeof(p->uuid), "%s", r->rows[0][1]) >= (int)sizeof(p->uuid) ||
                   snprintf(p->packs_dir, sizeof(p->packs_dir), "%s/packs", p->root) >=
                       (int)sizeof(p->packs_dir);
     db_result_free(r);
@@ -281,7 +283,14 @@ static status_t count_missing(cutils_db_t *db, const char *repo, const char *roo
  * Is the repository there at all? Read-only: nothing is recorded. Three
  * things say it is not, whatever the index thinks of its packs:
  *
- *   - no marker at its root: an empty mountpoint, or the wrong path;
+ *   - no marker at its root, or another repository's: an empty mountpoint,
+ *     the wrong path, or two roots swapped (B164). Two repositories of one
+ *     pack each, swapped, each found pack-0000000000.dat where its index
+ *     expected one, stayed ok, and accepted the other's packs/ as its own
+ *     moved one; verify then called most of each unrecoverable and
+ *     restores failed their hashes. The marker's uuid is the repository's
+ *     identity, so it is compared with the registered one before anything
+ *     else, and a mismatch is never accept_missing's to override;
  *   - packs/ missing or unreadable: an unmounted share;
  *   - packs/ is not the directory it was (its device or inode changed:
  *     something was mounted or unmounted over it) and a pack the index
@@ -304,12 +313,19 @@ static status_t probe(cutils_db_t *db, const char *repo, probe_t *p, avail_t *ou
     status_t st = repo_root_of(db, repo, p);
     if (st != OK) return st;
 
-    char marker[PATH_MAX + 16];
     struct stat sb;
-    snprintf(marker, sizeof(marker), "%s/" CBACKUP_MARKER, p->root);
-    if (stat(marker, &sb) != 0) {
-        snprintf(p->why, sizeof(p->why), "%s has no " CBACKUP_MARKER " marker (%s); is it mounted?",
-                 p->root, strerror(errno));
+    st = repo_identity_check(p->root, p->uuid);
+    if (st != OK) {
+        if (st == ERR_NOT_FOUND)
+            snprintf(p->why, sizeof(p->why), "%s has no " CBACKUP_MARKER " marker (%s); "
+                     "is it mounted?", p->root, strerror(ENOENT));
+        else {
+            /* Cut to fit, deliberately: the message buffer is larger. */
+            size_t n = strnlen(err_msg(), sizeof(p->why) - 1);
+            memcpy(p->why, err_msg(), n);
+            p->why[n] = '\0';
+        }
+        err_clear();
         *out = AV_GONE;
         return OK;
     }
@@ -497,7 +513,7 @@ static status_t adopt_pack(cutils_db_t *db, int64_t repo_id, const char *repo,
     uint64_t restored = 0;
     size_t i = 0;
     while (st == OK && i < l.n) {
-        if (db_txn_begin(db) != OK) { st = set_error(ERR_IO, "pack presence: begin"); break; }
+        if (db_txn_begin_bulk(db) != OK) { st = set_error(ERR_IO, "pack presence: begin"); break; }
         size_t end = i + ADOPT_BATCH < l.n ? i + ADOPT_BATCH : l.n;
         for (; i < end && st == OK; i++) {
             if (act[i] == ADOPT_SKIP) continue;
@@ -644,28 +660,17 @@ status_t pack_presence_check(cutils_db_t *db, int64_t repo_id, int accept_missin
     /*
      * packs/ moved for real - a rebuilt pool, packs restored to a new disk -
      * and some did not come with it. Only the operator can say so, and only
-     * for this repository: the marker at the root must be the one the index
-     * registered. Then the missing packs are dropped as below and the new
-     * device:inode recorded at the end, so the next check is ordinary.
+     * for this repository: probe has already refused a root whose marker is
+     * not the one the index registered (AV_GONE, which nothing overrides),
+     * so every accept_missing path - this one and every pack missing alike
+     * (B165) - acts only on the registered repository. The missing packs
+     * are dropped as below and the new device:inode recorded at the end, so
+     * the next check is ordinary.
      */
     if (av == AV_MOVED && accept_missing) {
-        repo_marker_t m;
-        db_result_t *u = NULL;
-        int same = repo_marker_read(pr->root, &m) == OK &&
-                   db_execute(db, "SELECT uuid FROM repos WHERE id = ?",
-                              (const char *[]){ repo, NULL }, &u) == 0 &&
-                   u && u->nrows == 1 && strcmp(u->rows[0][0], m.uuid) == 0;
-        db_result_free(u);
-        err_clear();
-        if (same) {
-            log_warn("repo %lld: accepting %s as packs/ at its new device:inode %s",
-                     (long long)repo_id, pr->packs_dir, pr->identity);
-            av = AV_OK;
-        } else {
-            snprintf(pr->why, sizeof(pr->why),
-                     "%s/" CBACKUP_MARKER " is not this repository's marker; packs/'s new "
-                     "identity is not accepted", pr->root);
-        }
+        log_warn("repo %lld: accepting %s as packs/ at its new device:inode %s",
+                 (long long)repo_id, pr->packs_dir, pr->identity);
+        av = AV_OK;
     }
 
     /* An unmounted share looks like every pack gone. Nothing is checked or

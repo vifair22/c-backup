@@ -31,8 +31,26 @@ static int parse_count(const char *name, const char *s, long lo, long hi,
     double d = 0.0;
     /* Leading zeros were always accepted on a plain count; JSON's grammar
      * alone would refuse "010". */
-    if (strspn(s, "0123456789") == strlen(s))
+    if (s[0] && strspn(s, "0123456789") == strlen(s)) {
         while (s[0] == '0' && s[1]) s++;
+        /*
+         * A plain run of digits is read as the integer it is. Through a
+         * double, 9007199254740993 (2^53 + 1) rounds to 2^53 and passed the
+         * bound below: a number past 2^53 accepted as if it were 2^53
+         * (UAT). Seventeen digits or more is past 2^53 whatever they say.
+         */
+        unsigned long long v = 0;
+        int over = strlen(s) > 16;
+        for (const char *q = s; !over && *q; q++)
+            v = v * 10u + (unsigned long long)(*q - '0');
+        if (over || v > 9007199254740992ULL || v < (unsigned long long)(lo < 0 ? 0 : lo)) {
+            snprintf(msg, sizeof(msg), "%s is out of range; it must be %s", name, range);
+            *bad = api_error(400, msg);
+            return -1;
+        }
+        *out = v >= (unsigned long long)hi ? hi : (long)v;
+        return 0;
+    }
     if (jquery_number(s, &d) != 0 || (isfinite(d) && d != floor(d))) {
         snprintf(msg, sizeof(msg), "%s must be a whole number", name);
         *bad = api_error(400, msg);

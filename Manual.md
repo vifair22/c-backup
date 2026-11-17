@@ -226,25 +226,27 @@ same cancellation for one job, and prints the job record with `"cancel_requested
 waiting in the queue never starts: it is `cancelled` in that record already,
 and in the journal as "cancelled before it started".
 
-A daemon that dies without stopping (a crash, `kill -9`, `docker kill`, power
-loss) marks whatever was running as `failed: interrupted by daemon restart` on
-its next start, and journals each such job then, since the killed process
-could not. A power cut can also cost the database about its last second of
-the daemon's own writes (never an edit the API had answered); the next start
-puts back any snapshot or tag that went with them on its own (section 17.5). Either way the repository is consistent: a backup's partial pack
-and the index rows staged into it are discarded, and the next backup stores
-those files again. Staging files a killed writer left in the repository's
-`tmp/` are removed by the next backup, gc or reindex, by registering the
-repository, and in a replica by the next replicate into it. Each of these
-first takes an exclusive lock on `tmp/.lock`, which every process staging
-a pack there also holds. Getting it means no other writer of pack, snapshot
-record, snapshot-id or deletion-marker staging can be live (those are
-written only under that lock or the repository's write lock), so all of
-those go whatever their age; when another process holds it, only staging
-an hour old goes. The tag mirror's staging (`tags.*`) is written by tag
-commands, which hold neither and may run during a backup or gc, so it is
-only ever removed once it is an hour old. Opening a repository also removes
-any staging an hour old. Installed packs, in `packs/`, are never touched.
+A daemon that dies without stopping (a crash, `kill -9`, `docker kill`,
+power loss) marks whatever was running as `failed: interrupted by daemon
+restart` on its next start, and journals each such job then, since the
+killed process could not. A power cut can also cost the database about its
+last second of the daemon's own writes (never an edit the API had answered);
+the next start puts back any snapshot or tag that went with them on its own
+(section 17.5). Either way the repository is consistent: a backup's partial
+pack and the index rows staged into it are discarded, and the next backup
+stores those files again. Staging files a killed writer left in the
+repository's `tmp/`, or in `packs/.staging/` where packs are staged, are
+removed by the next backup, gc or reindex, by registering the repository,
+and in a replica by the next replicate into it. Each of these first takes an
+exclusive lock on `tmp/.lock`, which every process staging a pack also
+holds. Getting it means no other writer of pack, snapshot record,
+snapshot-id or deletion-marker staging can be live (those are written only
+under that lock or the repository's write lock), so all of those go whatever
+their age; when another process holds it, only staging an hour old goes. The
+tag mirror's staging (`tags.*`) is written by tag commands, which hold
+neither and may run during a backup or gc, so it is only ever removed once
+it is an hour old. Opening a repository also removes any staging an hour
+old. Installed packs, in `packs/`, are never touched.
 
 A restore killed this way redoes more than the file it was inside. Verified
 files wait under temporary names (`.c-backup-partial.XXXXXX`) until one
@@ -293,8 +295,13 @@ docker run -d --name c-backupd \
   `-v /etc/localtime:/etc/localtime:ro`; `TZ` wins if both are given.
   `c-backup schedule list` reports the zone in use (`timezone`) and each
   schedule's next fire with its offset (`next_due_iso`), so a wrong zone is
-  visible before anything fires at the wrong hour. Changing the zone takes
-  effect at the next daemon start.
+  visible before anything fires at the wrong hour. The daemon also logs
+  the zone at start (`time zone: America/Chicago`). With the bind mount
+  there is no name in the file itself, so the zone is reported by its
+  abbreviation (`CST`) unless `/etc/timezone` names the same zone. A `TZ`
+  the system has no zone for, such as a misspelt `America/Chicgo`, makes
+  the C library run in UTC: the daemon warns at start and `timezone` reads
+  `UTC`. Changing the zone takes effect at the next daemon start.
 - Run the CLI inside the container: `docker exec c-backupd c-backup ...`.
 - Override configuration by mounting a file over
   `/etc/c-backupd/config.yaml`; a read-only mount (`:ro`) is fine. Keep the
@@ -375,7 +382,7 @@ are different: they live in the database and change through the policy API
 | Key | Default | Meaning |
 |---|---|---|
 | `db.path` | none, required | The daemon database. The shipped config sets `/var/lib/c-backupd/state.db`; a file without it stops the daemon |
-| `db.synchronous` | `normal` | When a database commit reaches the disk. `normal`: anything changed through the API is synced before the API answers, and the daemon's own writes (backup index rows, job records, the journal) once a second, so a power cut can lose about their last second (section 17.5); `full`: every commit is synced before it returns, as SQLite does by default, at a large cost on many small files (section 18.2). `normal` or `full` |
+| `db.synchronous` | `normal` | When a database commit reaches the disk. `normal`: the durable API edits (tags, registering or removing a repository, every delete) are synced before the API answers, and everything else - other API edits such as notes, sources, policy and schedules, and the daemon's own writes (backup index rows, job records, the journal) - once a second, so a power cut can lose about their last second, never corrupt them (sections 6.4 and 17.5); `full`: every commit is synced before it returns, as SQLite does by default, at a large cost on many small files (section 18.2). `normal` or `full` |
 | `db.cache_mb` | `64` | MiB of page cache for the database. 2 to 65536 |
 | `db.wal_autocheckpoint` | `16384` | Database pages (4 KiB) waiting in its log that start a checkpoint, each of which costs two syncs. Checkpoints run on a background thread with a connection of its own, never inside a commit, so no request waits for one; the log is restarted about once per this many pages and held under 16 times it, and its file is trimmed back to 4 times it. 1000 to 1048576 |
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
@@ -582,7 +589,8 @@ A repository is a directory the daemon registers and then owns.
   snapshots/<id>                    snapshot records: root tree name and metadata
   tags                              the tag list, kept so a reindex can restore it
   packs/XXXXXX/pack-NNNNNNNNNN.dat  every object, manifest trees included
-  tmp/                              staging for atomic writes
+  packs/.staging/                   staging for packs, created on first use
+  tmp/                              staging for every other atomic write
 ```
 
 There is no `objects/` directory: every object lives in a pack. Packs are
@@ -686,8 +694,24 @@ the index never hands their numbers out again (section 17).
 ### 5.3 Where to put a repository
 
 Anywhere the daemon can write with ordinary POSIX semantics: `rename` within
-the repository must be atomic, so `tmp/` lives inside it. Local disks, ZFS,
-XFS, ext4 and NFS mounts all work.
+the repository must be atomic, so its staging lives inside it. Local disks,
+ZFS, XFS, ext4 and NFS mounts all work.
+
+`packs/` may be a filesystem of its own: a dataset, a share or a disk
+mounted at `<repo>/packs`, with the rest of the repository elsewhere. Packs
+are staged in `packs/.staging/`, on the same filesystem as the packs, so
+installing one never crosses a mount; everything else is staged in `tmp/`,
+beside the root. Before 1.0.0 packs were staged in `tmp/`, and with
+`packs/` mounted every backup failed at its first pack with `Invalid
+cross-device link`. Only `packs/` may be split off this way: the root,
+`snapshots/` and `tmp/` must share one filesystem, and a `snapshots/`
+mounted on its own fails every backup at its snapshot record.
+
+A separate `packs/` is what the daemon's availability checks are built
+around (section 17.6): unmounted, it is an empty directory, and the daemon
+reports the repository unavailable rather than reading that as every pack
+lost. Mount it before the daemon starts, or expect the repository to be
+unavailable until it is; nothing is written into an unmounted `packs/`.
 
 Which disk is fastest for a repository depends on the hardware, not on the
 kind of storage, so measure before assuming. On one Unraid server a
@@ -847,6 +871,13 @@ silently:
 - the journal entry, the permanent record, reads `snapshot 12: 50 files, 1
   skipped (not in the snapshot); first: /data/x: ...`.
 
+Skipping is for the source's faults only. A write to the repository that
+fails - a full disk, an I/O error, a failed sync or close - fails the whole
+backup, naming the file being stored and the error (`backup: storing
+/data/x: pack: write to <staging>: No space left on device`). No snapshot
+is recorded, the partly written pack is discarded, and nothing it held is
+left for a later run to trust.
+
 **A file that changes while it is backed up.** A live filesystem changes
 under a backup, and a file can be a different size by the time it is read
 than when the scan listed it. The backup stores the file as it is when it
@@ -985,10 +1016,51 @@ write lock across batches of up to 2,000 files, and lets it go as soon as
 another write is queued for it: at the next file, the next read of the file
 it is storing, the next directory tree, or the next row of the snapshot's
 node index, which it writes last. A write that is waiting goes before the
-backup's next batch, so it returns in well under a second however long the
-backup runs. A backup nobody interrupts commits once per 2,000 files and
-once per sealed pack, which matters on storage where each commit's sync is
-slow.
+backup's next batch. A backup nobody interrupts commits once per 2,000 files
+and once per sealed pack, which matters on storage where each commit's sync
+is slow.
+
+What happens after the commit depends on the edit:
+
+- **Durable when the answer returns**: setting or removing a tag,
+  registering or removing a repository, and every delete (a snapshot, a
+  schedule, an export), plus logging out and changing the admin password.
+  Once the CLI or the app reports success, a power cut cannot undo them.
+- **Committed when the answer returns, on disk within about a second**:
+  notes, sources and excludes, retention policy, schedules added or
+  changed, unit policy, and job submissions (backup, restore, verify, gc,
+  retention and the rest). A power cut within about a second of the answer
+  can lose that last edit. It never corrupts anything: the daemon starts,
+  the repository and its index agree, and the edit is either wholly there
+  or wholly absent, so making it again is all a lost edit costs.
+
+A commit-only edit returns in well under a second however long the backup
+runs. A durable edit also waits for the database's write-ahead log to be
+synced (one `fdatasync`), and that sync costs whatever the disk under
+`state.db` makes it cost, and it waits behind the backup's own writes. As
+measured: about 25 ms at the median on an idle NVMe drive; during a 13 GiB
+backup on the same kind of drive, a tag write took 0.15 s at the median and
+0.9 s at the 99th percentile, and 0.6 s and 1.3 s with other programs
+saturating the disk; on a saturated local disk the sync alone reached 2.7 s
+at the 99th percentile, and tag writes took seconds.
+
+On slower storage the same costs grow. Measured on a btrfs RAID10 pool on
+dm-crypt over four Crucial BX500 SATA SSDs (Unraid, image M5), with
+`state.db` on that pool:
+
+| Condition | Tag write, median | 90th percentile | Worst |
+|-----------|-------------------|-----------------|-------|
+| Idle pool | 11-15 ms | - | 32 ms |
+| During a 16 GiB first backup | 267 ms | 2.24 s | 9.1 s |
+| Same, with other programs loading the pool | 334 ms | 10.2 s | 15.6 s |
+
+One write-ahead-log sync on that pool took 0.9-3.8 s with a backup running,
+and up to about 6 s with other load as well (57 and 53 tag writes sampled,
+so the table gives the 90th percentile, not the 99th). Faster storage
+scales these down roughly with its sync latency. Keep `state.db`
+(`db.path`) off a disk that other work saturates if tag and delete latency
+matters. Which class every API
+route has is listed in `docs/api.md`.
 
 A change to a repository's sources applies to backups submitted after it. A
 backup takes its sources from the configuration when it is submitted, so a
@@ -1254,6 +1326,12 @@ on that filesystem, once per batch, and a crash redoes at most one batch:
 its files are still under temporary names, which the next restore sweeps
 and writes again.
 
+A write the destination refuses - a full disk, a quota, a filesystem gone
+read-only - fails that file with "cannot write it: <reason>", naming the
+destination rather than the repository, and its temporary file is removed;
+the restore goes on with the rest and fails at the end, as for any failed
+file. Running it again once there is room writes what is missing.
+
 ---
 
 ## 9. Retention
@@ -1425,7 +1503,7 @@ Two policies per schedule:
 | Option | Values | Meaning |
 |---|---|---|
 | `--on-overlap` | `skip` (default), `queue`, `cancel_running` | The schedule comes due while its previous run is still going |
-| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next window on the schedule's own interval or calendar, or fire once at start and count on from that fire. Never once per missed window. Applies to a schedule's first window too |
+| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next window on the schedule's own interval or calendar, or fire once at start and count on from that fire. Never once per missed window. Applies to a schedule's first window too. Only daemon downtime counts: a window skipped for an overlap, or passed while the schedule was disabled, is not caught up |
 
 Any other value is refused when the schedule is created.
 
@@ -2007,8 +2085,8 @@ daemon as a whole.
 
 | Route | Meaning |
 |---|---|
-| `/healthz` | The process answers |
-| `/readyz` | The database is open; the daemon can do work |
+| `/healthz` | The process answers; says `storage_sync: failed` after a failed sync of `state.db`, and counts repositories whose own syncs failed (section 17.7) |
+| `/readyz` | The database is open and its syncs have not failed; the daemon can do work. 200 with `"status":"degraded"` and a list when only repositories' syncs have failed (section 17.7) |
 
 Both are public, on the socket and on TCP.
 
@@ -2045,6 +2123,9 @@ the repository).
 | `cbackup_alerts_sent_total` | counter | Push notifications Pushover accepted |
 | `cbackup_alerts_failed_total` | counter | Push notifications given up on: rejected by Pushover (bad token or user key), or expired after 24 hours of failed retries |
 | `cbackup_alerts_pending` | gauge | Push notifications queued and not yet sent |
+| `cbackup_storage_sync_failed` | gauge | 1 once a sync of `state.db` or the key directory has failed, until a restart (section 17.7) |
+| `cbackup_repos_sync_failed` | gauge | Repositories whose own syncs failed and which refuse backups, gc and prune until `repo repair` passes (a restart does not clear them); which ones is in `/readyz` and `repo show` (section 17.7) |
+| `cbackup_storage_sync_failed_timestamp_seconds` | gauge | Unix time of that first failure; 0 when none |
 | `cbackup_vm_bitmap_audit_failures_total` | counter | Audit reads that found a VM disk changed outside its dirty bitmap (section 6.5) |
 | `cbackup_vm_resync_bytes_total` | counter | Bytes incremental VM reads re-read past the changed ranges to bring the chunker back in step |
 
@@ -2270,14 +2351,20 @@ affects repository data.
 (section 3), which never corrupts it on a power cut. Two kinds of write
 reach the disk at different times:
 
-- **Anything changed through the API** - registering or removing a
-  repository, a tag, a note, a policy value, sources, a schedule, a
-  password - is synced to disk before the request is answered. Once the
-  CLI or the app reports success, a power cut cannot take it.
-- **The daemon's own writes** - a backup's index rows, job records and
-  progress, journal entries - are synced by a once-a-second flush (and by
-  checkpoints and a clean stop). A power cut can lose about the last second
-  of them.
+- **The durable API edits** - registering or removing a repository, a tag
+  set or removed, every delete, a logout or password change - are synced to
+  disk before the request is answered. Once the CLI or the app reports
+  success, a power cut cannot take them. If the sync itself fails (a full
+  or failing disk under `state.db`), the request fails with an error saying
+  the change is committed but could not be made durable.
+- **Every other write** - the other API edits (a note, sources, a policy
+  value, a schedule added or changed, a job submitted), and the daemon's
+  own writes (a backup's index rows, job records and progress, journal
+  entries) - is synced by a once-a-second flush (and by checkpoints and a
+  clean stop). A power cut can lose about the last second of them: an edit
+  answered less than a second before the cut may be gone after it, whole,
+  and has to be made again. Nothing is left half-written. Section 6.4 lists
+  which edit is which.
 
 `db.synchronous: full` syncs every commit instead, at the cost section 18.2
 measures.
@@ -2379,14 +2466,18 @@ its content.
 A dropped pack keeps its number. Pack numbers are never issued twice: the
 repository records the next free one in `pack-ids` (docs/repo-format.md),
 raised before any pack takes a number, and the index keeps a tombstone for
-every dropped pack. So the next backup writes its pack under a new number,
-never the dropped one's, and if the missing pack comes back - a share
-remounted, a copy put back - nothing collides. The next start or backup
-finds it, reads every entry and checks each against its name, and takes it
-back into the index: objects marked absent are present again, and where a
-later backup stored an object again, whichever copy proves good is the one
-the index keeps. An entry that fails the check is left out and the journal
-entry (operation `pack-returned`) says how many.
+every dropped pack. The mark is raised 64 numbers at a time, and numbers a
+run took and did not use - a backup that failed, or one that wrote fewer
+packs - are left as a gap: harmless, since a gap costs only numbers, and
+there are enough for a failed backup every minute for over a century. So the
+next backup writes its pack under a new number, never the dropped one's, and
+if the missing pack comes back - a share remounted, a copy put back -
+nothing collides. The next start or backup finds it, reads every entry and
+checks each against its name, and takes it back into the index: objects
+marked absent are present again, and where a later backup stored an object
+again, whichever copy proves good is the one the index keeps. An entry that
+fails the check is left out and the journal entry (operation
+`pack-returned`) says how many.
 
 Two things are never taken for missing packs:
 
@@ -2401,6 +2492,23 @@ Two things are never taken for missing packs:
 
   - its root has no `.cbackup` marker: an empty mountpoint, or the wrong
     path;
+  - its root's `.cbackup` marker is another repository's: two
+    repositories' directories swapped, or the wrong disk or share mounted
+    at the path. A repository's identity is the UUID in its marker, not its
+    path, and the index's offsets into one repository's packs mean nothing
+    in another's, even where the pack file names match. The reason names
+    both:
+
+    ```
+    repository 1 is unavailable: /srv/backup/main holds repository 7c1e...e2, not 3f0a...91, the one registered at this path: swapped with another repository, or the wrong disk or share mounted there; nothing was read or written
+    ```
+
+    Nothing overrides this, `repo repair --accept-missing` included. Put the
+    right repository back at the path; or, if it really did move, register
+    its new path (section 5.1: the UUID links it back to its history). Tag
+    changes are refused the same way (HTTP 409), and the start-up checks
+    that read a repository by its path - reconcile, finishing an
+    interrupted prune - pass it by with a warning;
   - its `packs/` directory is missing or cannot be read: a share that is
     not mounted;
   - `packs/` is not the directory it was - its device or inode changed,
@@ -2429,9 +2537,10 @@ Two things are never taken for missing packs:
   sudo c-backup repo repair 1 --accept-missing
   ```
 
-  The repair accepts a replaced `packs/` only when the repository root's
-  `.cbackup` marker is the one registered for that id; otherwise it stays
-  unavailable and says the marker is not this repository's. It marks the
+  The repair acts only when the repository root's `.cbackup` marker is the
+  one registered for that id, for a replaced `packs/` and for every pack
+  missing alike; otherwise the repository stays unavailable with the
+  reason above, naming the repository the path holds. It marks the
   missing packs' objects absent (section 17.6, above), records the new
   device:inode so later checks are ordinary, and the next backup stores
   again whatever its sources still hold. A `packs/` that moved with every
@@ -2460,6 +2569,75 @@ A single missing pack never trips the percentage, however small the
 repository, as long as other packs are present: one of two heals on its
 own, with its alert, while two out of three go through the repair. One out
 of one is every pack, and that is an unavailable repository, above.
+
+### 17.7 A sync to disk fails
+
+When the kernel reports that a sync failed - an `fsync` or `fdatasync` -
+c-backupd stops promising that what it covered is on disk. On Linux a failed
+sync can mark the unwritten pages clean and report the error once: the next
+sync of the same file succeeds while the bytes the first one covered are
+gone, and carrying on would hand out success for writes that may not exist.
+This is what PostgreSQL does with `data_sync_retry = off`. How far it
+reaches depends on where the sync failed, because repositories sit on disks
+of their own and one failing disk must not stop the rest.
+
+**The daemon's own storage** - `state.db`'s write-ahead log or its
+directory (the once-a-second flush, or the sync before a durable API
+answer), or the key directory. Nothing works without it, so the whole
+daemon latches until it is restarted:
+
+- every durable API write (section 6.4) is refused with a `500` saying `a
+  previous sync failed (<file>: <error>); restart the daemon to re-read
+  from disk`, before anything is committed;
+- every backup fails at its pack seal, and gc and prune refuse;
+- `/readyz` answers 503, `/healthz` reports `storage_sync: failed` with the
+  file and the time, and `cbackup_storage_sync_failed` is 1.
+
+**A file in one repository** - a pack, a snapshot record, the
+`snapshot-ids` or `pack-ids` file, the `.cbackup` marker, the tags file, or
+a directory one of them was renamed into. That repository alone latches; its
+state in `repo show` and `repo list` is `sync_failed`, with `sync_failed`
+(the file and the error) and `sync_failed_at`. The latch is recorded in
+`state.db` the moment it trips and is not cleared by a restart: after a
+failed pack-seal sync the pack on disk may be short or corrupt while the
+index trusts it, and a restart checks nothing, so the repository comes
+back up `sync_failed` and stays so until `repo repair` passes. (If the
+record itself cannot be written, the whole daemon latches instead.) Until
+then:
+
+- a backup into it, or a replication into it, fails, as does its pack seal;
+- gc (except `--dry-run`), compaction and prune refuse, and a gc already
+  running stops before deleting anything more: nothing is unlinked on the
+  strength of a sync that cannot be trusted;
+- its durable API writes (a tag, deleting a snapshot or the repository) are
+  refused with a `500`;
+- every other repository carries on as before. Browsing, restores and a
+  verify of the latched one still work;
+- `/readyz` stays 200 but says `"status":"degraded"` and lists each latched
+  repository with its id, path, error and time. It is not a 503 because
+  what acts on readiness - a container health check, an orchestrator -
+  restarts or routes around the whole daemon, which would stop the healthy
+  repositories' backups and achieve nothing for the latched one.
+  `cbackup_repos_sync_failed` counts the latched repositories.
+
+Either kind logs one `ERROR` line and sends one alert (Pushover, when
+configured) naming the file and the error. A restore destination that fails
+to sync fails that restore's files (section 8) and latches nothing.
+
+What to do: find out why the disk failed (`dmesg`, `smartctl`, a full
+filesystem, a target that was unplugged) and fix it. Then:
+
+- for `state.db` or the key directory, restart the daemon. It reads
+  everything back from disk, which is the only copy to trust;
+- for a repository, run `c-backup repo repair <id>`; a restart does not
+  clear it. Repair drops the repository's files from the page cache, so what
+  follows reads the disk and not what the failed sync left in memory, runs
+  a deep verify that writes nothing, and clears the latch only if the
+  verify finds nothing at all. If it finds damage it says how much and
+  leaves the repository `sync_failed`: run `c-backup verify <id>` (deep and
+  repairing) to fix what parity can, then `repo repair` again. A passing
+  repair removes the record, so the repository stays clear across later
+  restarts.
 
 ## 18. Capacity planning and performance
 
@@ -2873,7 +3051,7 @@ docker run -d --name c-backupd --restart unless-stopped \
   -e TZ=America/Chicago \
   -e C_BACKUP_SECURITY_RUN_AS_UID=990 \
   -e C_BACKUP_UNITS_HELPER_SOCKET=/run/c-backup-helper/helper.sock \
-  -e 'C_BACKUP_UNITS_ALLOW=docker:cbk-uat-*,libvirt:cbk-uat-*,lxc:cbk-uat-*' \
+  -e 'C_BACKUP_UNITS_ALLOW=docker:cbk-uat-*,docker:compose:cbk-uat-*,libvirt:cbk-uat-*,lxc:cbk-uat-*' \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /run/c-backupd:/run/c-backupd \
   -v /mnt/cache:/mnt/cache:ro,rslave \
@@ -2912,7 +3090,14 @@ chown root:990 /run/c-backup-helper && chmod 0750 /run/c-backup-helper
 ```
 
 On FS2 create `/mnt/cache/system/.cbackup-restore` (owned by 990) instead
-of the appdata one. `/run` is RAM on Unraid too: recreate the two `/run` directories at boot
+of the appdata one. **Restore needs writable mounts the backup does not.**
+The helper's pool mounts must be read-write (it stages and swaps); the
+daemon needs read-write the staging directory of each domain it restores
+into in place (above), for an in-place VM restore the `.cbackup-restore`
+of each image directory (`-v /mnt/cache/domains/<vm>/.cbackup-restore:/mnt/cache/domains/<vm>/.cbackup-restore`,
+created and owned by 990 first), and for a restore under a new name the
+target root (`-v /mnt/cache/appdata/restore-test:/mnt/cache/appdata/restore-test`).
+Without them a restore fails at its first write, naming the path. `/run` is RAM on Unraid too: recreate the two `/run` directories at boot
 (the `go` file, or a User Scripts "at startup" script) before the containers
 start. A bind source that does not exist makes `docker run` fail.
 
@@ -2924,7 +3109,7 @@ What each piece is for:
 | `--network=none` | helper | no listener of any kind; its only interface is the socket |
 | `/var/run/docker.sock` | helper | inspect, pause, unpause, exec for hooks, create and pull for restore |
 | `/var/run/libvirt/libvirt-sock` | helper (FS1) | the libvirt API, read-write (the read-only socket cannot start a backup) |
-| `/mnt/cache:/mnt/cache:rshared` | helper | restore staging and swap act on host paths in the helper's own namespace; add one per pool that holds unit data |
+| `/mnt/cache:/mnt/cache:rshared` (read-write) | helper | restore staging and swap act on host paths in the helper's own namespace: it creates the staging directories and renames them into place, so this mount must not be `:ro`; add one per pool that holds unit data |
 | `/mnt/cache/system/c-backup-helper` | helper | its state directory: `holds.json`, every hold it has taken, released at its next start after a crash. On a pool, never the RAM rootfs |
 | `/boot/config/c-backup-helper.ini` | helper | the policy, on the flash, root-owned (22.2.3) |
 | `/run/c-backup-helper` | both | the helper's socket (created `0660` with group `daemon_gid`, 22.2.3), and `nbd/` where VM exports and `qemu-nbd` sockets appear; the same path on both sides. The directory is `0750 root:990`, so the daemon can enter it after it drops to uid 990 |
@@ -2933,6 +3118,8 @@ What each piece is for:
 | `/etc/libvirt/qemu/nvram`, `/etc/libvirt/qemu/swtpm/tpm-states`, read-only | daemon (FS1) | the TPM state of a VM is read by the daemon at its real path |
 | `/mnt/cache/system/cbackup-vmstate` | daemon (FS1) | the helper policy's `staging_root`: NVRAM and TPM state staged for a VM restore |
 | `<domain>/.cbackup-restore` (FS2: `/mnt/cache/system/.cbackup-restore`), read-write | daemon | where a container restore into place is staged before the helper swaps it in (22.7.3) |
+| `<image directory>/.cbackup-restore`, read-write, one per directory of VM images (FS1, only to restore a VM in place) | daemon | where an in-place VM restore writes each disk before the swap; created and owned by 990 beforehand |
+| the target root of a restore under a new name, read-write (only while restoring) | daemon | `--target-root DIR` (22.7.3): the daemon writes the unit's data there itself |
 | `/run/c-backupd` | daemon | the API socket, and `exports/` for NBD exports, which the host must reach (22.8) |
 | `--label net.cbackup.role=...` | both | a container carrying this label is never paused |
 | `C_BACKUP_UNITS_ALLOW` | daemon | the safety rail (22.9) |
@@ -3020,8 +3207,10 @@ state_dir = /mnt/cache/system/c-backup-helper
 socket = /run/c-backup-helper/helper.sock
 
 [units]
-# Globs over <provider>:<id> and <provider>:<name>. Nothing else is touched.
-allow = docker:cbk-uat-*, libvirt:cbk-uat-*, lxc:cbk-uat-*
+# Globs over <provider>:<id> and <provider>:<name> (22.9 has the key
+# table). A compose project is docker:compose:<project>, which
+# docker:cbk-uat-* does not reach. Nothing else is touched.
+allow = docker:cbk-uat-*, docker:compose:cbk-uat-*, libvirt:cbk-uat-*, lxc:cbk-uat-*
 
 [snapshot]
 # ZFS datasets the helper may snapshot, by name (never a parent of these).
@@ -3087,7 +3276,9 @@ restarting the helper, which the daemon notices on its own (22.2.4).
 
 The daemon opens one connection to the helper per request, so concurrent
 jobs never wait for each other and a helper restart costs nothing beyond
-the requests in flight. While the helper is away the daemon retries with a
+the requests in flight. It also keeps one connection open for as long as
+it runs, its session's anchor; when the daemon dies, killed or not, the
+kernel closes it, and the helper ends every capture that daemon began. While the helper is away the daemon retries with a
 backoff from 0.5 s doubling to 30 s; when it answers, the daemon says hello
 again (logging a policy whose digest changed) and enables the providers the
 helper offers, with no daemon restart. While connected it checks every 15 s,
@@ -3096,9 +3287,17 @@ and a request that finds the helper gone marks the link down at once.
 - A unit job that needs the helper while it is away **fails and alerts**,
   scheduled or not, with the socket path and the reason in the error, the
   journal and the push alert. It is never skipped quietly.
-- A job in flight when the helper restarts fails cleanly: no snapshot is
-  written, and the helper's start-up sweep releases whatever the old
-  process held (pauses, freezes, snapshots, exports).
+- A job in flight when the helper restarts loses its capture: the
+  helper's start-up sweep releases whatever the old process held (pauses,
+  freezes, snapshots, exports). A unit that still needed it (its begin, or
+  a read through a snapshot now gone) fails with no snapshot; a unit whose
+  reads had all finished keeps its snapshot, which is whole, and carries a
+  warning that its end could not reach the helper.
+- A daemon that dies mid-backup (a crash, `kill -9`, an OOM kill) leaves
+  nothing held for long: its anchor closes with it, and within a second the
+  helper ends that daemon's captures as aborted, releasing their pauses,
+  freezes, exports and snapshots, as `capture.end` would. Before 1.0 such a
+  hold lasted until a helper restart or `capture_max_s`.
 - If libvirt cannot be reached when the helper starts (libvirtd down, or
   its socket not mounted), the sweep logs it and **keeps** every hold that
   names a domain, a guest freeze included, for the next sweep, which its
@@ -3114,7 +3313,8 @@ and a request that finds the helper gone marks the link down at once.
 | `helper.policy`, `helper.daemon_id`, `helper.providers` | the policy digest, the daemon id and the providers, as the helper's hello said |
 | `daemon_id` | this daemon's id; it must equal the policy's `daemon_id` |
 | `allow` | the daemon's `units.allow` |
-| `holds_open` | holds journalled and not yet released; 0 when nothing is held |
+| `holds_open` | holds journalled and not yet released, the daemon's own and the helper's together (asked of the helper when the request is made); 0 when nothing is held |
+| `helper.holds`, `helper.captures` | what the helper has journalled and open right now, when it answered |
 | `privileges_dropped` | whether the drop of 22.2.2 happened |
 
 ### 22.3 Configuration keys
@@ -3316,6 +3516,21 @@ A bind of `/mnt/user/<share>/...` is resolved to the one pool or disk
 holding it, in the host's namespace; the recorded path stays the
 `/mnt/user` one.
 
+**Bind mounts on the host and named volumes.** Unraid mounts
+`/var/lib/docker` as a bind of a pool directory (FS1:
+`/mnt/cache/system/docker`, dataset `cache/system`), so a named volume's
+source `/var/lib/docker/volumes/<v>/_data` is not where a snapshot domain
+or the daemon can see it. The helper looks every resolved path up in the
+host's mount table and reads a path on a bind through its filesystem's own
+mount: that volume is read as `/mnt/cache/system/docker/volumes/<v>/_data`,
+from `cache/system`'s snapshot when `zfs_domains` lists `cache/system`, and
+under the daemon's existing `/mnt/cache` mount either way. `mounts.json`
+shows it as `real`; the recorded path is unchanged. Docker in a
+`docker.img` (a loop-mounted image) has no pool path: its volumes are read
+live, noted `loop-image`, the unit is `inconsistent`, and the daemon needs
+`-v /var/lib/docker/volumes:/var/lib/docker/volumes:ro,rslave`. Run
+Docker from a directory on a pool to back volumes up from a snapshot.
+
 #### 22.5.2 Capture, step by step
 
 1. The members are inspected and the mounts classified (22.5.1).
@@ -3434,7 +3649,9 @@ nothing the container could not do to itself.
   consistent at its own instant (it is the database's own export), and
   running it then holds nothing. If it exits non-zero or times out, the dump
   is **not stored** (a truncated dump looks valid); its log says why and the
-  unit carries a warning.
+  unit carries a warning naming it: `N dump(s) failed and are not in
+  snapshot S; first: <path>`. A dump's bytes count toward its item's size,
+  not toward the unit's disk bytes read.
 
 Dumps should be uncompressed (no `--gzip`, `pg_dump -Z0`): c-backup
 compresses per chunk, and a compressed dump defeats what little a dump
@@ -3540,6 +3757,14 @@ c-backup schedule add 1 units --every day --at 05:00 --provider docker \
   --unit reverse-proxy --unit authelia --pause-scope group
 ```
 
+Pause scope counts **units**, not services: a compose project is one unit,
+and its services are always captured together, at any scope. Group and job
+scope need a provider that captures units together (Docker through the
+helper does). One that cannot, such as an in-process provider, takes each
+unit as its own capture and says so in the job's result (`note`) and as its
+warning: `pause scope job needs a provider that captures units together;
+provider P does not, so each unit was its own capture`.
+
 Each unit of a shared capture is then read and stored on its own, and the
 shared snapshots are destroyed after the last. A shared capture keeps its
 snapshots for the whole job, which is why per-unit capture is the default.
@@ -3586,7 +3811,9 @@ c-backup unit restore 1 4127 /mnt/disk3/restore/vda.raw --item vda
 ```
 
 One disk, written through `<dest>.cbk-partial` and renamed when complete,
-never over an existing path.
+never over an existing path; `--overwrite` with `--item` is refused before
+any job. A tree item restores with the directories above it given their
+recorded modes, as a whole restore gives them.
 
 **Every disk restores as a sparse raw image, including disks that were
 qcow2.** A qcow2 disk comes back raw; nothing in this build writes qcow2.
@@ -3610,6 +3837,37 @@ c-backup unit restore 1 5120 --define --name immich-test \
 | Data | each mount staged in `<staging>/<job>-<random>/` (below) and swapped in, the old directory kept as `<mount>.cbackup-old-<job>`; each VM image restored into `<image dir>/.cbackup-restore/` and swapped in only after every disk is in, the old image kept as `<image>.cbackup-old-<job>` | each mount, each VM image, at `DIR/<its original path>`; the original's paths are never written |
 | Definition | re-applied with the same name (and for a VM the same UUID) | the name changed; bind sources, volumes, rootfs and mount entries rewritten under `DIR`; a VM's `<uuid>` removed (libvirt makes a new one), MACs regenerated unless `--keep-macs`, disks pointing at the new images, excluded passthrough disks dropped and listed |
 | Never | a delete: old data is moved aside, never removed | |
+
+**Every refusal comes first.** Before anything is written or stopped, the
+daemon builds the definition and has the helper check it (`unit.define` in
+check mode): the policy's `allow_define`, a privileged definition without
+`allow_privileged_define`, a provider not behind the helper, an in-place
+restore without `allow_restore`, and, in place, a VM that is still running,
+all refuse the restore with the unit untouched and `refused, nothing
+written` in the error. A new name whose target root already holds one of
+the unit's paths is refused the same way. `--name` with the unit's own name
+is the unit in place, and asks for `--replace`.
+
+**A failure after the unit was stopped is rolled back.** If a restore into
+staging, a swap, or the define itself fails in place, each swap is undone,
+newest first (the restored copy back to its staging directory, the old data
+back to the mount), and the unit is started again if it was running. The
+error says `rolled back` and where the restored copy was kept in staging,
+to look at or delete. A swap that cannot be undone leaves the unit stopped
+and says so; its original is still at `<mount>.cbackup-old-<job>`. For a VM,
+a failure from the first swap through the define is undone the same way;
+once the define has succeeded the domain and its disks agree, and nothing
+is undone. Under a new name, a define that fails after the data was written
+leaves the data under `DIR` and says to remove it, or give another target
+root, before trying again.
+
+**The mount root** comes back with the snapshot's owner, mode, times,
+xattrs and ACLs, like everything below it, not the staging directory's
+`0700`. Once swapped, an emptied `.cbackup-restore` the helper made is
+removed.
+
+The job's byte progress covers every mount and disk of the restore: done
+only grows, and the total ends at the whole restore's.
 
 **Where a restore in place stages.** The swap is a rename, so the staging
 directory sits in the mount's own snapshot domain: the first `[snapshot]
@@ -3666,10 +3924,28 @@ container names `<project>-<service>`. Then `docker compose -p <project> up
 -d --no-build`, with `--no-start` unless `--start`. Replacing a project needs
 its containers stopped; they are renamed aside rather than removed.
 
-**LXC.** The config is rewritten with the new name, rootfs path and MAC
-addresses and written with the rootfs under the LXC
-path; a name in use is refused unless `--replace`, which needs the container
-stopped and moves the old one aside.
+**LXC.** In place (`--replace`), the container is stopped, its rootfs and
+each mount entry's source staged and swapped like any mount, and its
+config written back to `<[lxc] path>/<name>/config`, the old config moved
+aside to `config.cbackup-old-<time>`, never deleted.
+
+Under a new name (`--name N --target-root DIR`):
+
+1. The rootfs is restored to `DIR/<its recorded path>` (for the default
+   layout `DIR/mnt/cache/lxc/<old name>/rootfs`), and each `lxc.mount.entry`
+   source to `DIR/<its recorded path>`. Nothing is written under the LXC
+   path, and the original's directories are never touched.
+2. The helper writes the recorded config to `<[lxc] path>/N/config`
+   (creating `<[lxc] path>/N/`), with `lxc.uts.name = N`, `lxc.rootfs.path =
+   dir:DIR/<recorded rootfs path>` (the rootfs stays under `DIR`; move it
+   and edit that line to put it under the LXC path), each mount entry's
+   source rewritten to its place under `DIR`, and every `lxc.net.*.hwaddr`
+   dropped so LXC generates new MAC addresses (`--keep-macs` keeps them;
+   then do not run both containers on one bridge).
+3. With `--start`, `lxc-start N`; otherwise it is left defined and stopped.
+
+A name already defined is refused unless `--replace`, which needs that
+container stopped. `DIR` must be writable by the daemon (22.2.1).
 
 ### 22.8 Read-only NBD export of a VM disk
 
@@ -3735,7 +4011,22 @@ Or copy the disk out without a kernel device:
 
 `units.allow` in the daemon's configuration is a comma-separated list of
 globs; a glob matches a unit's name, its id, `<provider>:<name>` or
-`<provider>:<id>`. A unit that matches none is invisible to the daemon: it is
+`<provider>:<id>`. The ids, and the glob that reaches the UAT units:
+
+| Unit | Id (key) | UAT glob |
+|---|---|---|
+| compose project | `compose:<project>` (`docker:compose:<project>`) | `docker:compose:cbk-uat-*` |
+| standalone container | its name (`docker:<name>`) | `docker:cbk-uat-*` |
+| LXC container | its name (`lxc:<name>`) | `lxc:cbk-uat-*` |
+| VM | its UUID (`libvirt:<uuid>`); the name matches as `libvirt:<name>` | `libvirt:cbk-uat-*` |
+
+A compose project's id and name both start `compose:`, so neither
+`cbk-uat-*` nor `docker:cbk-uat-*` reaches the project `cbk-uat-compose`
+(and its containers are backed up only through it). Compose project names
+are always lowercase (compose lowercases the directory name it derives one
+from), so the project part of a `compose:` or `docker:compose:` glob is
+matched lowercased in both lists: `docker:compose:Immich` is the project
+`immich`. Every other name keeps its case. A unit that matches none is invisible to the daemon: it is
 not listed, cannot be described, backed up or restored, and a `--all` run
 skips it (the job result counts what was filtered). Empty allows everything.
 
@@ -3745,7 +4036,7 @@ helper's `[units] allow` is a second, independent rail on the host side; a
 unit must pass both.
 
 **During UAT both are set to `cbk-uat-*` globs**
-(`docker:cbk-uat-*,libvirt:cbk-uat-*,lxc:cbk-uat-*`), so the daemon cannot
+(`docker:cbk-uat-*,docker:compose:cbk-uat-*,libvirt:cbk-uat-*,lxc:cbk-uat-*`), so the daemon cannot
 touch a production VM or container whatever is asked of it. Enrolling
 production units means changing both lists, deliberately, on the host.
 
@@ -3758,7 +4049,7 @@ production units means changing both lists, deliberately, on the host.
 | `GET /providers`: `helper.state` `never-connected` or `disconnected` | the helper is not running, the socket path differs, or `/run/c-backup-helper` is not mounted into both | `docker logs c-backup-helper`; same path both sides; the daemon reconnects by itself within 30 s |
 | hello refused: daemon ids differ | the policy's `daemon_id` is not this daemon's | copy `daemon_id` from `GET /providers` into the policy; restart the helper |
 | connection refused by the helper, peer uid | the daemon is not running as 990, or the policy's `daemon_uid` differs | `privileges_dropped` true and `security.run_as_uid` 990; the same uid in the policy |
-| a unit is not listed | `units.allow` (daemon) or `[units] allow` (helper) excludes it | widen the right list on the host |
+| a unit is not listed | `units.allow` (daemon) or `[units] allow` (helper) excludes it; a compose project needs a `docker:compose:` glob (22.9) | widen the right list on the host |
 | `achieved inconsistent, below the required crash` | mounts on no snapshot domain with `pause = never`, a group capture, several instants without a pause or with a pause the watchdog let go (`watchdog-released` in `consist_flags`), or a dataset missing from `zfs_domains` | add the dataset to the policy, allow the pause (and enough `max_pause_s` for it), or pass `--require inconsistent` knowingly |
 | a VM disk refused: format mismatch | the image's header disagrees with the XML's `<driver type>` | correct the domain XML; the extension does not matter |
 | a VM unit fails on NVRAM or TPM state | the file or directory named by the XML is missing or unreadable to uid 990 | check the two read-only `/etc/libvirt` mounts and that the path exists on the host |

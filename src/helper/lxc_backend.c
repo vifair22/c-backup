@@ -548,16 +548,21 @@ static status_t x_define(sp_ctx_t *c, const char *unit_id, const char *definitio
     cJSON *res = cJSON_CreateObject();
     if (st == OK && !res) st = set_error(ERR_NOMEM, "lxc: define");
     struct stat sb;
+    /* Where the old config went, so a failed write can put it back. */
+    char ha[PATH_MAX + HOST_TOOL_PATH_MAX + 64] = "";
     if (st == OK && host_path(&c->tools, conf, hp, sizeof(hp)) == 0 && lstat(hp, &sb) == 0) {
         int state = state_of(c, name);
         if (!replace) st = set_error(ERR_BUSY, "lxc: a container named %s exists; pass replace, or a new name", name);
         else if (state != SP_STATE_STOPPED) st = set_error(ERR_BUSY, "lxc: %s is not stopped; stop it before replacing it", name);
         else {
-            char aside[PATH_MAX + 64], ha[PATH_MAX + HOST_TOOL_PATH_MAX + 64];
+            char aside[PATH_MAX + 64];
             snprintf(aside, sizeof(aside), "%s.cbackup-old-%lld", conf, (long long)time(NULL));
-            if (host_path(&c->tools, aside, ha, sizeof(ha)) != 0 || rename(hp, ha) != 0)
+            if (host_path(&c->tools, aside, ha, sizeof(ha)) != 0 || rename(hp, ha) != 0) {
+                ha[0] = '\0';
                 st = set_error_errno(ERR_IO, "lxc: moving %s aside", conf);
-            else cJSON_AddStringToObject(res, "previous_config", aside);
+            } else {
+                cJSON_AddStringToObject(res, "previous_config", aside);
+            }
         }
     }
     /* Rewrite line by line; everything else is kept as recorded. */
@@ -602,12 +607,7 @@ static status_t x_define(sp_ctx_t *c, const char *unit_id, const char *definitio
             host_path(&c->tools, conf, hp, sizeof(hp)) != 0)
             st = set_error_errno(ERR_IO, "lxc: creating %s", dir);
     }
-    FILE *f = st == OK ? fopen(hp, "wxe") : NULL;
-    if (st == OK && !f) st = set_error_errno(ERR_IO, "lxc: writing %s", conf);
-    if (f) {
-        if (fwrite(out, 1, o, f) != o) st = set_error_errno(ERR_IO, "lxc: writing %s", conf);
-        if (fclose(f) != 0 && st == OK) st = set_error_errno(ERR_IO, "lxc: writing %s", conf);
-    }
+    if (st == OK) st = host_write_new_file(hp, conf, out, o, ha);
     free(out);
     if (st == OK && start) st = lxc(c, "lxc-start", name, NULL, NULL);
     if (st == OK) {
@@ -633,6 +633,7 @@ status_t lxc_backend_init(const helper_policy_t *pol, helper_backend_t *out)
     for (size_t i = 0; i < pol->n_include && i < MOUNT_ROOTS_MAX; i++) c->mounts.include_roots[c->mounts.n_include++] = pol->include_roots[i];
     snprintf(c->mounts.user_root, sizeof(c->mounts.user_root), "%s", pol->user_root);
     snprintf(c->mounts.mnt_root, sizeof(c->mounts.mnt_root), "%s", pol->mnt_root);
+    mount_default_mountinfo(&c->tools, c->mounts.mountinfo, sizeof(c->mounts.mountinfo));
     *out = (helper_backend_t){
         .name = "lxc", .ops = &k_lxc_ops, .ctx = c,
         .blob_data = x_blob_data, .unit_state = x_unit_state, .set_running = x_set_running,

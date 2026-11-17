@@ -190,6 +190,20 @@ static void test_policy(void **state)
     assert_true(helper_policy_unit_allowed(&p, "fake:x", "cbk-a"));
     assert_false(helper_policy_unit_allowed(&p, "fake:x", "prod"));
     assert_false(helper_policy_unit_allowed(&p, "docker:cbk-a", "cbk-a"));
+    {
+        /* Compose project globs fold to lowercase, as project names are;
+         * container names keep their case. */
+        helper_policy_t c;
+        assert_int_equal(helper_policy_parse("[helper]\ndaemon_uid = 990\ndaemon_id = 7f3a09c1\nstate_dir = /x\n"
+                                             "[units]\nallow = docker:compose:CBK-UAT-*, docker:Plex\n"
+                                             "[docker]\npause_always = compose:GitLab\n", &c), OK);
+        assert_true(helper_policy_unit_allowed(&c, "docker:compose:cbk-uat-x", NULL));
+        assert_false(helper_policy_unit_allowed(&c, "docker:cbk-uat-x", NULL));
+        assert_true(helper_policy_unit_allowed(&c, "docker:Plex", NULL));
+        assert_false(helper_policy_unit_allowed(&c, "docker:plex", NULL));
+        assert_string_equal(c.pause_always[0], "compose:gitlab");
+        helper_policy_free(&c);
+    }
     assert_string_equal(helper_policy_dir_domain(&p, HF_POOL "/a/b"), HF_POOL);
     assert_null(helper_policy_dir_domain(&p, HF_DIR "/poolx"));
     const policy_hook_t *h = helper_policy_hook(&p, "dump-one");

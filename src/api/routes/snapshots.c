@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "sync_latch.h"
 #include "pack_presence.h"
 
 #include "job_manager.h"
@@ -857,6 +858,7 @@ typedef struct {
     int             dry_run;
     verify_level_t  verify_level;
     int             verify_repair;
+    int             clear_sync;   /* repo repair: clear a sync latch if clean */
     char           *pattern;
     char           *path_prefix;
     int             ignore_case;
@@ -959,8 +961,9 @@ static int snap_job_needs_key(snap_job_kind_t kind)
  */
 static job_lock_t snap_job_lock(const snap_job_t *j)
 {
-    return (j->kind == SNAP_JOB_VERIFY && !j->verify_repair) ? JOB_LOCK_READ
-                                                             : JOB_LOCK_WRITE;
+    /* Clearing a sync latch lets writers back in: the write lock. */
+    return (j->kind == SNAP_JOB_VERIFY && !j->verify_repair && !j->clear_sync)
+           ? JOB_LOCK_READ : JOB_LOCK_WRITE;
 }
 
 /*
@@ -1312,7 +1315,9 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
     } else if (j->kind == SNAP_JOB_VERIFY) {
         verify_result_t vr;
         memset(&vr, 0, sizeof(vr));
-        st = verify_run(store, j->db, j->repo_id, j->verify_level,
+        st = j->clear_sync
+           ? repo_sync_repair(store, j->db, j->repo_id, cancel, progress, progress_ctx, &vr)
+           : verify_run(store, j->db, j->repo_id, j->verify_level,
                         j->verify_repair, cancel, progress, progress_ctx, &vr);
         /*
          * What kind of run it was, on the job (B106). The run record holds
@@ -1621,6 +1626,20 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         /* A dry run is a check that must not write, whatever else was
          * asked for. */
         if (j->dry_run) j->verify_repair = 0;
+        /* repo repair for a failed sync (sync_latch.h): deep, writing
+         * nothing, and the latch cleared only if it finds nothing. */
+        if (query_bool(req, "clear_sync", &j->clear_sync) != 0) {
+            snap_job_free(j);
+            return api_error(400, "clear_sync must be 1, true, 0 or false");
+        }
+        if (j->clear_sync) {
+            if (!sync_latch_repo_tripped(j->repo_path)) {
+                snap_job_free(j);
+                return api_error(409, "this repository has no failed sync to clear");
+            }
+            j->verify_level  = VERIFY_LEVEL_DEEP;
+            j->verify_repair = 0;
+        }
     }
 
     if (kind == SNAP_JOB_GREP) {

@@ -503,14 +503,20 @@ static int h_repo_show(const args_t *a)
 }
 
 /*
- * The operator accepting that a degraded repository's missing packs are
- * gone (B150). The flag is the point, so there is no form without it.
+ * Two repairs. With --accept-missing, the operator accepting that a
+ * degraded repository's missing packs are gone (B150); the flag is the
+ * point. Without it, clearing a failed sync (sync_latch.h) once the disk is
+ * fixed: a deep verify that writes nothing, read from disk, and the
+ * repository takes backups again only if it finds nothing. The daemon says
+ * when there is no failed sync to clear.
  */
+static int maintenance_ex(const char *action, const char *repo, const char *query,
+                          int no_wait, int quiet, long *out_job);
+
 static int h_repo_repair(const args_t *a)
 {
     if (!args_flag(a, "--accept-missing"))
-        return refuse(a, "repair marks the missing packs' objects as lost, so the next "
-                         "backup stores them again; say so with --accept-missing");
+        return maintenance_ex("verify", a->pos[0], "clear_sync=1", 0, 0, NULL);
     sbuf_t p = { 0 };
     sb_puts(&p, "/repos/"); sb_puts(&p, a->pos[0]); sb_puts(&p, "/repair");
     return call_path_sb("POST", &p, "{\"accept_missing\":true}");
@@ -1402,7 +1408,6 @@ static int h_unit_backup(const args_t *a)
     const char *scope = args_value(a, "--pause-scope");
     int all     = args_flag(a, "--all");
     int no_wait = args_flag(a, "--no-wait");
-    if (!prov) return refuse(a, "--provider is required");
     if (all && a->npos != 1) return refuse(a, "--all backs up every unit; name none with it");
     if (!all && a->npos < 2) return refuse(a, "name the units, or give --all");
     if (!all && args_multi_count(a, "--exclude") > 0)
@@ -1467,6 +1472,8 @@ static int h_unit_restore(const args_t *a)
         return refuse(a, "--name, --target-root, --replace, --pin-digest, --start and --keep-macs need --define");
     if (define && (item || overwrite))
         return refuse(a, "--item and --overwrite do not apply with --define");
+    if (item && overwrite)
+        return refuse(a, "--overwrite does not apply with --item: an item is restored to a new path, never over one");
     sbuf_t b = { 0 };
     if (define) {
         sb_puts(&b, "{\"mode\":\"unit\"");
@@ -1568,7 +1575,6 @@ static int h_vm_unexport(const args_t *a)    { return vm_export_by_id(a, "DELETE
 static int h_unit_policy_show(const args_t *a)
 {
     const char *prov = args_value(a, "--provider");
-    if (!prov) return refuse(a, "--provider is required");
     sbuf_t p = { 0 };
     unit_path(&p, a->pos[0], prov, a->pos[1], "/policy");
     return call_path_sb("GET", &p, NULL);
@@ -1577,7 +1583,6 @@ static int h_unit_policy_show(const args_t *a)
 static int h_unit_policy_set(const args_t *a)
 {
     const char *prov = args_value(a, "--provider");
-    if (!prov) return refuse(a, "--provider is required");
     sbuf_t p = { 0 };
     unit_path(&p, a->pos[0], prov, a->pos[1], "/policy");
     sbuf_t b = { 0 };
@@ -1855,7 +1860,7 @@ static const arg_opt_t O_SCHED_ADD[] = {
     OPT_END,
 };
 static const arg_opt_t O_UNIT_BACKUP[] = {
-    { "--provider",    NULL, ARG_VALUE, "P" },
+    { "--provider",    NULL, ARG_REQUIRED, "P" },
     { "--all",         NULL, ARG_FLAG,  NULL },
     { "--exclude",     NULL, ARG_MULTI, "GLOB" },
     { "--require",     NULL, ARG_VALUE, "LEVEL" },
@@ -1878,7 +1883,7 @@ static const arg_opt_t O_UNIT_RESTORE[] = {
     OPT_NOWAIT, OPT_END,
 };
 static const arg_opt_t O_VM_EXPORT[] = { { "--ttl", NULL, ARG_VALUE, "N[s|m|h|d]" }, OPT_END };
-static const arg_opt_t O_PROVIDER[] = { { "--provider", NULL, ARG_VALUE, "P" }, OPT_END };
+static const arg_opt_t O_PROVIDER[] = { { "--provider", NULL, ARG_REQUIRED, "P" }, OPT_END };
 static const arg_opt_t O_ALL[] = { { "--all", NULL, ARG_FLAG, NULL }, OPT_END };
 static const arg_opt_t O_ACCEPT_MISSING[] = {
     { "--accept-missing", NULL, ARG_FLAG, NULL }, OPT_END,
@@ -1897,7 +1902,9 @@ static const command_t COMMANDS[] = {
       h_repo_add, 0 },
     { { "repo show",       P_REPO,     NULL, NULL }, h_repo_show, 0 },
     { { "repo repair",     P_REPO,     O_ACCEPT_MISSING,
-        "a degraded repository: accept its missing packs as lost" }, h_repo_repair, 0 },
+        "clear a repository's failed sync after a clean deep verify; with "
+        "--accept-missing, accept a degraded repository's missing packs as lost" },
+        h_repo_repair, 0 },
     { { "repo remove",     P_REPO,     NULL, NULL }, h_repo_remove, 0 },
     { { "repo key export", P_REPO,     NULL, NULL }, h_repo_key_export, 0 },
     { { "repo key import", P_KEY_IMP,  NULL, NULL }, h_repo_key_import, 0 },
