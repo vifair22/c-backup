@@ -20,9 +20,9 @@
  *
  *   - Steps are the repository's renames, unlinks, mkdirs, fsyncs and
  *     writes (fault_inject.h), each index commit (an SQLite WAL hook), and
- *     each make_durable (db_txn.h). A write to a staging file in tmp/ is
- *     counted but not cut at: the disk after it is the disk before it,
- *     because nothing unsynced in tmp/ survives.
+ *     each make_durable (db_txn.h). A write to a staging file in tmp/ or
+ *     packs/.staging is counted but not cut at: the disk after it is the
+ *     disk before it, because nothing unsynced in staging survives.
  *   - At the cut, every directory change whose directory was never synced
  *     afterwards is undone, newest first; a file whose content is not what
  *     its last fsync saw goes back to what it was before the operation, or
@@ -278,9 +278,12 @@ static int in_scope(const char *p)
     return strncmp(p, H_REPO "/", sizeof(H_REPO)) == 0 || strcmp(p, H_REPO) == 0;
 }
 
+/* Staging: tmp/, and packs/.staging where packs are staged (B163). */
 static int in_scratch(const char *p)
 {
-    return strncmp(p, H_REPO "/tmp/", sizeof(H_REPO "/tmp")) == 0;
+    return strncmp(p, H_REPO "/tmp/", sizeof(H_REPO "/tmp")) == 0 ||
+           strncmp(p, H_REPO "/" STORE_PACK_STAGING "/",
+                   sizeof(H_REPO "/" STORE_PACK_STAGING)) == 0;
 }
 
 /* One step: 1 when it happens, 0 when the cut came first. g_mu held. */
