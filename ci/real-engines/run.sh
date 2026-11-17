@@ -47,6 +47,11 @@ if [ -z "${CBK_UNDER_TIMEOUT:-}" ]; then
     exec timeout --kill-after=30 "$LIFETIME" "$0" "$@"
 fi
 
+# Every daemon started here, this script's own and the e2e suite's, aborts
+# on a database write made outside the write lock (B157), so a violation
+# fails the run at the statement instead of surfacing later as a symptom.
+export C_BACKUP_TXN_GUARD=abort
+
 SRC=/src
 CUTILS=/c-utils
 WORK=/work
@@ -784,6 +789,8 @@ fi
 # ---- the end -------------------------------------------------------------
 
 log "final leftovers"
+check "the daemon is still running" 0 "$(kill -0 "$DAEMON_PID" 2>/dev/null; echo $?)"
+check "the daemon logged no write outside the write lock" 0 "$(grep -c 'db_txn guard:' "$WORK/daemon.log")"
 leftovers "at the end"
 check "no cbk-uat domain left" "" "$(virsh -q -c "$VIRT_URI" list --all --name 2>/dev/null | grep '^cbk-uat-')"
 check "the daemon reports no hold open" 0 "$(cb unit providers | jq '[.. | .holds_open? // empty] | add // 0')"

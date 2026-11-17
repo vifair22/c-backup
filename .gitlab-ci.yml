@@ -384,6 +384,7 @@ real-engines:
           - tests/test_providers.c
           - tests/test_helper*
           - tests/test_virt*
+          - tests/test_vm*
           - tests/test_docker.c
           - tests/test_lxc.c
           - tests/test_snap*
