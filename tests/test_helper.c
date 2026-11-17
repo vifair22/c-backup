@@ -761,6 +761,226 @@ static void test_socket(void **state)
     hstop();
 }
 
+/* ------------------------------------------------------------------ */
+/* Refusals, by their message                                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Every value the policy parser refuses, each named by what it says: a
+ * policy that is wrong has to stop the helper with a reason an operator
+ * can act on, and test_policy only checked that the bad ones fail. These
+ * are the refusals the slice's coverage showed had never run: the hook
+ * keys, the domain checks, the define switches, and the file loader's
+ * own errors.
+ */
+static void test_policy_refusals_say_why(void **state)
+{
+    (void)state;
+#define PBASE "[helper]\ndaemon_uid = 990\ndaemon_id = 0badf00d\nstate_dir = /x\n"
+#define PHOOK PBASE "[hook h]\nunit = fake:u\nargv.0 = /bin/true\n"
+    static const struct { const char *text; const char *why; } cases[] = {
+        { PBASE "allow_privileged_define = maybe\n", "allow_privileged_define is 0 or 1" },
+        { PBASE "fake_spec = relative\n",            "fake_spec must be a clean absolute path" },
+        { PBASE "[snapshot]\nzfs_domains = /tank\n", "bad domain list" },
+        { PBASE "[snapshot]\nzfs_domains = tank/../x\n", "bad domain list" },
+        { PBASE "[snapshot]\nzfs_domains = tank@snap\n", "bad domain list" },
+        { PBASE "[snapshot]\nlvm_domains = vg0\n",   "unknown key in [snapshot]" },
+        { PBASE "[hook bad name]\nunit = fake:u\nargv.0 = /bin/true\n", "bad hook name" },
+        { PHOOK "kind = maybe\n",                    "kind is dump or run" },
+        { PHOOK "phase = during\n",                  "phase is pre or post" },
+        { PHOOK "container =\n",                     "bad container" },
+        { PHOOK "argv.5 = x\n",                      "argv.N must count up from 0 without gaps" },
+        { PHOOK "timeout_s = 0\n",                   "timeout_s is 1 to 86400" },
+        { PHOOK "on_fail = shrug\n",                 "on_fail is continue or fail" },
+        { PHOOK "shell = 1\n",                       "unknown key in a hook" },
+        { PBASE "[hook h]\nunit = not-a-key\nargv.0 = /bin/true\n", "hook unit must be a unit key" },
+    };
+#undef PHOOK
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        helper_policy_t p;
+        if (helper_policy_parse(cases[i].text, &p) == OK)
+            fail_msg("case %zu accepted: %s", i, cases[i].text);
+        if (!strstr(err_msg(), cases[i].why))
+            fail_msg("case %zu: '%s' does not say '%s'", i, err_msg(), cases[i].why);
+        err_clear();
+    }
+
+    /* The loader names the file it refused, ahead of the parser's reason,
+     * and does not read one too large to be a policy. */
+    mkdir(HF_DIR, 0700);
+    const char *path = HF_DIR "/bad-policy.ini";
+    hf_write(path, PBASE "max_pause_s = 0\n");
+    chmod(path, 0600);
+    helper_policy_t p;
+    assert_int_not_equal(helper_policy_load(path, &p), OK);
+    assert_non_null(strstr(err_msg(), path));
+    assert_non_null(strstr(err_msg(), "max_pause_s"));
+    err_clear();
+    FILE *f = fopen(path, "w");
+    assert_non_null(f);
+    char line[1024];
+    memset(line, '#', sizeof(line) - 2);
+    line[sizeof(line) - 2] = '\n';
+    line[sizeof(line) - 1] = '\0';
+    for (int i = 0; i < 1100; i++) fputs(line, f);   /* past 1 MiB of comments */
+    fclose(f);
+    chmod(path, 0600);
+    assert_int_equal(helper_policy_load(path, &p), ERR_TOO_LARGE);
+    assert_non_null(strstr(err_msg(), "over 1 MiB"));
+    err_clear();
+    assert_int_not_equal(helper_policy_load(HF_DIR "/no-such-policy.ini", &p), OK);
+    err_clear();
+    unlink(path);
+#undef PBASE
+}
+
+/*
+ * Request arguments the parser refuses, by message, without a server: the
+ * list, path, checkpoint and disk shapes the fuzz cases did not reach.
+ */
+static void test_request_refusals_say_why(void **state)
+{
+    (void)state;
+    char units33[4096] = "[";
+    for (int i = 0; i < 33; i++) {
+        char one[24];
+        snprintf(one, sizeof(one), "%s\"fake:u%d\"", i ? "," : "", i);
+        strcat(units33, one);
+    }
+    strcat(units33, "]");
+    char paths65[8192] = "[";
+    for (int i = 0; i < 65; i++) {
+        char one[24];
+        snprintf(one, sizeof(one), "%s\"/p%d\"", i ? "," : "", i);
+        strcat(paths65, one);
+    }
+    strcat(paths65, "]");
+    char big[8400];
+    snprintf(big, sizeof(big), "{\"units\":%s,\"pause\":false}", units33);
+    char bigp[8400];
+    snprintf(bigp, sizeof(bigp), "{\"paths\":%s}", paths65);
+#define VMU "\"unit\":\"libvirt:5c1fb2a4-0e8d-4a3f-9d2e-1b2c3d4e5f60\""
+    struct { const char *op; const char *args; const char *why; } cases[] = {
+        { "capture.begin", "{\"units\":[\"fake:ok\",\"no-provider\"],\"pause\":false}",
+          "holds a malformed unit key" },
+        { "capture.begin", "{\"units\":[7],\"pause\":false}", "holds a malformed unit key" },
+        { "capture.begin", big, "must list 1 to 32 unit keys" },
+        { "capture.begin_paths", "{\"paths\":[]}", "must list 1 to 64 absolute paths" },
+        { "capture.begin_paths", "{\"paths\":\"/a\"}", "must list 1 to 64 absolute paths" },
+        { "capture.begin_paths", bigp, "must list 1 to 64 absolute paths" },
+        { "vm.backup_begin", "{" VMU ",\"disks\":[],\"base\":null,\"freeze\":\"auto\"}",
+          "must list 1 to 32 disks" },
+        { "vm.backup_begin", "{" VMU ",\"disks\":[{\"target\":\"vda\",\"mode\":\"full\"}],"
+          "\"base\":\"no spaces allowed\",\"freeze\":\"auto\"}",
+          "must be a checkpoint name or null" },
+        { "vm.backup_begin", "{" VMU ",\"disks\":[{\"target\":\"vda\",\"mode\":\"full\"}],"
+          "\"base\":7,\"freeze\":\"auto\"}", "must be a checkpoint name or null" },
+        { "vm.backup_begin", "{" VMU ",\"disks\":[{\"target\":\"vda\",\"mode\":\"full\"}],"
+          "\"base\":null,\"freeze\":\"sometimes\"}", "must be auto, off or required" },
+    };
+#undef VMU
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *r = req(cases[i].op, cases[i].args);
+        helper_req_t q;
+        char why[512] = "";
+        helper_err_t e = helper_request_parse(r, strlen(r), &q, why, sizeof(why));
+        if (e == HELPER_OK) fail_msg("case %zu accepted", i);
+        if (!strstr(why, cases[i].why)) fail_msg("case %zu: '%s' does not say '%s'", i, why, cases[i].why);
+        assert_int_equal(q.id, 7);   /* the id still comes back for the response */
+        helper_req_free(&q);
+    }
+
+    /* A null base is no base, and is taken. */
+    const char *ok = req("vm.backup_begin", "{\"unit\":\"libvirt:5c1fb2a4-0e8d-4a3f-9d2e-1b2c3d4e5f60\","
+                         "\"disks\":[{\"target\":\"vda\",\"mode\":\"full\"}],\"base\":null,"
+                         "\"freeze\":\"off\"}");
+    helper_req_t q;
+    char why[512] = "";
+    assert_int_equal(helper_request_parse(ok, strlen(ok), &q, why, sizeof(why)), HELPER_OK);
+    assert_string_equal(q.base, "");
+    assert_string_equal(q.freeze, "off");
+    helper_req_free(&q);
+
+    /* The error names round-trip, and an unknown one is refused. */
+    helper_err_t e = HELPER_OK;
+    assert_int_equal(helper_err_parse(helper_err_name(HELPER_E_DENIED), &e), 0);
+    assert_int_equal(e, HELPER_E_DENIED);
+    assert_int_equal(helper_err_parse("no-such-error", &e), -1);
+    assert_int_equal(helper_err_parse(NULL, &e), -1);
+}
+
+/*
+ * The framing over a SOCK_SEQPACKET pair, at its edges: a peer that has
+ * gone, a packet larger than the buffer (and the descriptor that came with
+ * it, which must not leak), and a socket with nothing to read or no room
+ * to write within its timeout.
+ */
+static void test_framing_edges(void **state)
+{
+    (void)state;
+    int sp[2];
+    assert_int_equal(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sp), 0);
+    char buf[64];
+    size_t got = 0;
+    int rfd = -1;
+
+    /* Too large: refused, and the passed descriptor closed, not handed on. */
+    char packet[200];
+    memset(packet, 'x', sizeof(packet));
+    int passed = dup(0);
+    assert_true(passed >= 0);
+    assert_int_equal(helper_send(sp[0], packet, sizeof(packet), passed), OK);
+    close(passed);
+    assert_int_equal(helper_recv(sp[1], buf, sizeof(buf), &got, &rfd), ERR_TOO_LARGE);
+    assert_non_null(strstr(err_msg(), "packet over 63 bytes"));
+    assert_int_equal(rfd, -1);
+    err_clear();
+
+    /* A descriptor passed to a caller that asked for none is closed. */
+    passed = dup(0);
+    assert_int_equal(helper_send(sp[0], "{}", 2, passed), OK);
+    close(passed);
+    assert_int_equal(helper_recv(sp[1], buf, sizeof(buf), &got, NULL), OK);
+    assert_int_equal(got, 2);
+    assert_string_equal(buf, "{}");
+
+    /* Nothing to read in time. */
+    struct timeval tv = { 0, 50 * 1000 };
+    assert_int_equal(setsockopt(sp[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)), 0);
+    assert_int_equal(helper_recv(sp[1], buf, sizeof(buf), &got, &rfd), ERR_BUSY);
+    assert_non_null(strstr(err_msg(), "no answer in time"));
+    err_clear();
+
+    /* No room to write in time: fill the peer's queue, then one more. */
+    assert_int_equal(setsockopt(sp[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)), 0);
+    status_t st = OK;
+    for (int i = 0; i < 100000 && st == OK; i++) st = helper_send(sp[0], packet, sizeof(packet), -1);
+    assert_int_equal(st, ERR_BUSY);
+    assert_non_null(strstr(err_msg(), "send timed out"));
+    err_clear();
+
+    /* The peer gone: a closed connection, and a send that fails. */
+    close(sp[0]);
+    for (;;) {   /* drain what was queued */
+        status_t r = helper_recv(sp[1], buf, sizeof(buf), &got, NULL);
+        err_clear();
+        if (r != OK && r != ERR_TOO_LARGE) {
+            assert_int_equal(r, ERR_NOT_FOUND);
+            break;
+        }
+    }
+    assert_int_equal(helper_send(sp[1], "{}", 2, -1), ERR_IO);
+    err_clear();
+    close(sp[1]);
+
+    /* A token longer than the random buffer is refused, not truncated. */
+    char tok[300];
+    assert_int_equal(helper_random_hex(tok, 65), ERR_INVALID);
+    err_clear();
+    assert_int_equal(helper_random_hex(tok, 16), OK);
+    assert_int_equal(strlen(tok), 32);
+}
+
 int main(void)
 {
     if (hf_unroot() != 0) { perror("cannot leave root for the helper suites"); return 1; }
@@ -769,6 +989,9 @@ int main(void)
         cmocka_unit_test(test_policy_inline_comments),
         cmocka_unit_test_setup_teardown(test_restore_staging_place, setup, teardown),
         cmocka_unit_test(test_unit_key_grammar),
+        cmocka_unit_test(test_policy_refusals_say_why),
+        cmocka_unit_test(test_request_refusals_say_why),
+        cmocka_unit_test(test_framing_edges),
         cmocka_unit_test_setup_teardown(test_malformed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_fuzz_requests, setup, teardown),
         cmocka_unit_test_setup_teardown(test_compromised_daemon, setup, teardown),
