@@ -382,6 +382,9 @@ static int file_is(const char *path, const void *want, size_t n)
 static void test_sweep_freeze_absent(void **state)
 {
     (void)state;
+    /* The backend is built only once the private virtqemud runs; without
+     * one, test_virt_down covers the sweep with libvirt unreachable. */
+    if (!have_libvirt) skip();
     sp_intent_t in[2] = { { 1, UUID, SP_HOLD_FREEZE, "freeze:" UUID, 3 },
                           { 2, "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1cff", SP_HOLD_FREEZE,
                             "freeze:8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1cff", 3 } };

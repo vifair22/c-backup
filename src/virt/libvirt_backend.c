@@ -238,8 +238,15 @@ static status_t domain(struct sp_ctx *c, const char *uuid, virDomainPtr *out)
     status_t st = conn_ok(c);
     if (st != OK) return st;
     *out = virDomainLookupByUUIDString(c->conn, uuid);
-    if (!*out && conn_lost(c)) *out = virDomainLookupByUUIDString(c->conn, uuid);
-    if (!*out) return set_error(ERR_NOT_FOUND, "libvirt: no domain %s: %s", uuid, verr());
+    /* Read before conn_lost: every libvirt call resets the last error. */
+    int code = *out ? 0 : virGetLastErrorCode();
+    if (!*out && conn_lost(c)) {
+        *out = virDomainLookupByUUIDString(c->conn, uuid);
+        code = *out ? 0 : virGetLastErrorCode();
+    }
+    /* Not found only when libvirt said so; a failed call is not an answer. */
+    if (!*out) return set_error(code == VIR_ERR_NO_DOMAIN ? ERR_NOT_FOUND : ERR_IO,
+                                "libvirt: no domain %s", uuid);
     return OK;
 }
 
@@ -1467,9 +1474,26 @@ static void kill_by_socket(const char *sock)
     closedir(d);
 }
 
+/*
+ * Only a lookup libvirt answered proves a domain gone. A connection that
+ * cannot be made (no libvirt on this host, libvirtd down or restarting)
+ * proves nothing: a hold it names is kept for the next sweep, not dropped
+ * as if its domain had gone, which left a frozen guest frozen and threw
+ * away checkpoint records.
+ */
 static status_t v_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_t *out)
 {
     memset(out, 0, sizeof(*out));
+    int down = 0;
+    for (size_t i = 0; i < req->n_intents && !down; i++) {
+        if (strncmp(req->intents[i].detail, "qemu-nbd:", 9) == 0) continue;
+        if (conn_ok(c) != OK) {
+            log_warn("libvirt: sweep: %s; its holds are kept for the next sweep", err_msg());
+            err_clear();
+            down = 1;
+        }
+        break;
+    }
     for (size_t i = 0; i < req->n_intents; i++) {
         const sp_intent_t *in = &req->intents[i];
         status_t st = OK;
@@ -1486,12 +1510,15 @@ static status_t v_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
             if (!colon || (size_t)(colon - u) >= sizeof(uuid)) st = set_error(ERR_INVALID, "libvirt: bad hold %s", in->detail);
             else {
                 snprintf(uuid, sizeof(uuid), "%.*s", (int)(colon - u), u);
-                if (domain(c, uuid, &dom) == OK) {
+                status_t ds = down ? ERR_IO : domain(c, uuid, &dom);
+                if (ds == OK) {
                     st = cp_delete(c, dom, uuid, colon + 1);
                     virDomainFree(dom);
-                } else {
+                } else if (ds == ERR_NOT_FOUND) {
                     err_clear();
                     rec_drop(c, uuid, colon + 1);
+                } else {
+                    st = ds;
                 }
             }
         } else if (strncmp(in->detail, "libvirt-backup:", 15) == 0 || strncmp(in->detail, "freeze:", 7) == 0) {
@@ -1502,7 +1529,8 @@ static status_t v_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
              * watchdog then keeps it, as it may be frozen in a moment
              * (provider.h). A gone domain holds nothing. */
             if (freeze && req->absent) req->absent[i] = 1;
-            if (domain(c, uuid, &dom) == OK) {
+            status_t ds = down ? ERR_IO : domain(c, uuid, &dom);
+            if (ds == OK) {
                 if (freeze) {
                     if (virDomainFSThaw(dom, NULL, 0, 0) > 0 && req->absent) req->absent[i] = 0;
                 } else {
@@ -1510,8 +1538,10 @@ static status_t v_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
                     if (virDomainGetJobInfo(dom, &ji) == 0 && ji.type != VIR_DOMAIN_JOB_NONE) (void)virDomainAbortJob(dom);
                 }
                 virDomainFree(dom);
-            } else {
+            } else if (ds == ERR_NOT_FOUND) {
                 err_clear();         /* the domain is gone: nothing held */
+            } else {
+                st = ds;             /* libvirt unreachable: kept */
             }
         } else {
             st = set_error(ERR_INVALID, "libvirt: unknown hold %s", in->detail);
