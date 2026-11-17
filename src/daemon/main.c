@@ -30,6 +30,7 @@
 #include "app_config.h"
 #include "auth.h"
 #include "db_txn.h"
+#include "db_write.h"
 #include "file_cache.h"
 #include "settle.h"
 #include "index_reconcile.h"
@@ -230,6 +231,10 @@ int main(int argc, char *argv[])
     tighten_umask();
     appguard_set_argv(argc, argv);
 
+    /* Before AppGuard opens the database, so its connection carries the
+     * hook that reports a write made outside the write lock (B157). */
+    db_txn_guard_install();
+
     appguard_config_t ag_cfg = app_appguard_config();
     ag_cfg.on_signal = on_signal;
     appguard_t *guard = appguard_init(&ag_cfg);
@@ -362,6 +367,12 @@ int main(int argc, char *argv[])
     }
     if (store_index_drop_staged(db, 0) != OK)
         log_warn("cannot drop staged objects left by an interrupted backup");
+
+    /* The purge thread below is the first that runs beside this one. Until
+     * now every write above was the only thing on the connection; from here
+     * on a write outside the write lock could land in another thread's
+     * transaction, and the guard reports it (db_write.h). */
+    db_txn_guard_arm(1);
 
     /* Removed repositories whose rows are not all gone yet, including any
      * an earlier build left behind; the thread resumes them in the

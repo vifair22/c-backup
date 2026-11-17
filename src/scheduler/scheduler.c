@@ -2,6 +2,7 @@
 
 #include "scheduler.h"
 #include "trigger.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -33,7 +34,7 @@ static void set_next_due(cutils_db_t *db, int64_t schedule_id, time_t when)
     char id[32], due[32];
     snprintf(id,  sizeof(id),  "%lld", (long long)schedule_id);
     snprintf(due, sizeof(due), "%lld", (long long)when);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "UPDATE schedules SET next_due_at = ? WHERE id = ?",
             (const char *[]){ due, id, NULL }, NULL) != 0)
         log_warn("scheduler: cannot update next_due_at for schedule %s", id);
@@ -144,7 +145,7 @@ static void disable_schedule(cutils_db_t *db, int64_t schedule_id, const char *w
     log_warn("scheduler: disabling schedule %lld: %s", (long long)schedule_id, why);
     char idb[32];
     snprintf(idb, sizeof(idb), "%lld", (long long)schedule_id);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "UPDATE schedules SET enabled = 0, disabled_reason = ? WHERE id = ?",
             (const char *[]){ why, idb, NULL }, NULL) != 0)
         log_warn("scheduler: cannot disable schedule %s", idb);
@@ -344,7 +345,7 @@ status_t scheduler_tick(scheduler_t *sched, time_t now)
                 char idb[32], nb[32];
                 snprintf(idb, sizeof(idb), "%lld", (long long)sid);
                 snprintf(nb,  sizeof(nb),  "%lld", (long long)now);
-                if (db_execute_non_query(sched->db,
+                if (db_write(sched->db,
                         "UPDATE schedules SET last_fired_at = ? WHERE id = ?",
                         (const char *[]){ nb, idb, NULL }, NULL) != 0)
                     log_warn("scheduler: cannot record fire time for %s", idb);

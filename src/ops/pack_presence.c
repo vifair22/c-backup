@@ -4,6 +4,7 @@
 #include "db_txn.h"
 #include "pack.h"
 #include "routes.h"   /* journal_record */
+#include "db_write.h"
 
 #include <cutils/log.h>
 #include <cutils/push.h>
@@ -59,7 +60,7 @@ int pack_presence_degraded(cutils_db_t *db, int64_t repo_id, char *why, size_t w
 
 static status_t set_degraded(cutils_db_t *db, const char *repo, const char *why)
 {
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT OR REPLACE INTO recovery_state (repo_id, key, value) VALUES (?, ?, ?)",
             (const char *[]){ repo, DEGRADED_KEY, why, NULL }, NULL) != 0)
         return set_error(ERR_IO, "cannot record repository %s as degraded", repo);
@@ -68,8 +69,8 @@ static status_t set_degraded(cutils_db_t *db, const char *repo, const char *why)
 
 static status_t clear_degraded(cutils_db_t *db, const char *repo)
 {
-    if (db_execute_non_query(db, "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
-                             (const char *[]){ repo, DEGRADED_KEY, NULL }, NULL) != 0)
+    if (db_write(db, "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
+                 (const char *[]){ repo, DEGRADED_KEY, NULL }, NULL) != 0)
         return set_error(ERR_IO, "cannot clear the degraded state of repository %s", repo);
     return OK;
 }
@@ -86,12 +87,12 @@ static status_t drop_pack(cutils_db_t *db, const char *repo, const char *pack,
     int n = 0, m = 0;
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "pack presence: begin");
     int bad =
-        db_execute_non_query(db,
+        db_write(db,
             "UPDATE objects SET location = 'absent', phys_size = NULL"
             " WHERE repo_id = ? AND hash IN"
             " (SELECT hash FROM pack_objects WHERE repo_id = ? AND pack_id = ?)",
             (const char *[]){ repo, repo, pack, NULL }, &n) != 0 ||
-        db_execute_non_query(db,
+        db_write(db,
             "UPDATE objects SET location ="
             " (SELECT CAST(po.pack_id AS TEXT) FROM pack_objects po"
             "   WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)"
@@ -99,17 +100,17 @@ static status_t drop_pack(cutils_db_t *db, const char *repo, const char *pack,
             " (SELECT 1 FROM pack_objects po WHERE po.repo_id = objects.repo_id"
             "   AND po.hash = objects.hash)",
             (const char *[]){ repo, pack, NULL }, NULL) != 0 ||
-        db_execute_non_query(db,
+        db_write(db,
             "UPDATE objects SET location = 'absent', phys_size = NULL"
             " WHERE repo_id = ? AND location = ?",
             (const char *[]){ repo, pack, NULL }, &m) != 0 ||
-        db_execute_non_query(db, "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
+        db_write(db, "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
             (const char *[]){ repo, pack, NULL }, NULL) != 0 ||
-        db_execute_non_query(db, "DELETE FROM packs WHERE repo_id = ? AND id = ?",
+        db_write(db, "DELETE FROM packs WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, pack, NULL }, NULL) != 0 ||
         /* The file cache would match paths whose content was in it and skip
          * reading them, chunks and all; the next backup reads everything. */
-        db_execute_non_query(db, "DELETE FROM file_cache WHERE repo_id = ?",
+        db_write(db, "DELETE FROM file_cache WHERE repo_id = ?",
             (const char *[]){ repo, NULL }, NULL) != 0;
     if (bad) {
         db_txn_rollback(db);

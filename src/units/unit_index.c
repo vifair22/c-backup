@@ -4,6 +4,7 @@
 #include "chunklist.h"
 #include "manifest.h"
 #include "reserved.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -21,10 +22,10 @@ status_t unit_index_delete(cutils_db_t *db, int64_t repo_id, int64_t snap_id)
     char repo[32], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-    if (db_execute_non_query(db, "DELETE FROM snapshot_unit_items WHERE repo_id = ? AND snap_id = ?",
-                             (const char *[]){ repo, snap, NULL }, NULL) != 0 ||
-        db_execute_non_query(db, "DELETE FROM snapshot_units WHERE repo_id = ? AND snap_id = ?",
-                             (const char *[]){ repo, snap, NULL }, NULL) != 0)
+    if (db_write(db, "DELETE FROM snapshot_unit_items WHERE repo_id = ? AND snap_id = ?",
+                 (const char *[]){ repo, snap, NULL }, NULL) != 0 ||
+        db_write(db, "DELETE FROM snapshot_units WHERE repo_id = ? AND snap_id = ?",
+                 (const char *[]){ repo, snap, NULL }, NULL) != 0)
         return set_error(ERR_IO, "unit index: cannot drop snapshot %lld", (long long)snap_id);
     return OK;
 }
@@ -35,7 +36,7 @@ static status_t put_row(cutils_db_t *db, const char *repo, const char *snap,
 {
     char cons[16];
     snprintf(cons, sizeof(cons), "%d", consistency);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO snapshot_units (repo_id, snap_id, unit_key, provider, unit_id,"
             " unit_name, consistency) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (const char *[]){ repo, snap, key, provider, unit_id, name, cons, NULL },
@@ -60,12 +61,12 @@ status_t unit_index_put(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
         char size[32], br[32];
         snprintf(size, sizeof(size), "%llu", (unsigned long long)it->size);
         snprintf(br, sizeof(br), "%llu", (unsigned long long)it->bytes_read);
-        if (db_execute_non_query(db,
+        if (db_write(db,
                 "INSERT INTO snapshot_unit_items (repo_id, snap_id, item_id, kind, path,"
                 " size, read_mode, reason, bytes_read) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (const char *[]){ repo, snap, it->id, it->kind, it->path ? it->path : "",
-                                  size, it->read_mode[0] ? it->read_mode : "full",
-                                  it->reason, br, NULL }, NULL) != 0)
+                      size, it->read_mode[0] ? it->read_mode : "full",
+                      it->reason, br, NULL }, NULL) != 0)
             st = set_error(ERR_IO, "unit index: cannot record item %s of snapshot %s",
                            it->id, snap);
     }

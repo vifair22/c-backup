@@ -38,6 +38,7 @@
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -649,10 +650,10 @@ static api_response_t unit_policy_put(const api_request_t *req, int64_t repo_id,
         const char *val = cJSON_IsNumber(e) ? (snprintf(num, sizeof(num), "%.0f", e->valuedouble), num)
                         : (cJSON_IsString(e) && e->valuestring) ? e->valuestring : "";
         int rc = (!*val)
-            ? db_execute_non_query(g_db, "DELETE FROM unit_policy WHERE repo_id = ? AND unit_key = ?"
-                                         " AND key = ?",
-                                   (const char *[]){ repo, key, e->string, NULL }, NULL)
-            : db_execute_non_query(g_db,
+            ? db_write(g_db, "DELETE FROM unit_policy WHERE repo_id = ? AND unit_key = ?"
+                             " AND key = ?",
+                       (const char *[]){ repo, key, e->string, NULL }, NULL)
+            : db_write(g_db,
                   "INSERT INTO unit_policy (repo_id, unit_key, key, value) VALUES (?, ?, ?, ?)"
                   " ON CONFLICT(repo_id, unit_key, key) DO UPDATE SET value = excluded.value",
                   (const char *[]){ repo, key, e->string, val, NULL }, NULL);
