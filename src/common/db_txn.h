@@ -108,6 +108,15 @@ int  db_txn_batch_should_end(db_txn_batch_t *b);
 int  db_txn_batch_contended(const db_txn_batch_t *b);
 
 /*
+ * Give c-utils this lock (c-utils 1.8.0, db_set_write_lock), so its log
+ * writer, push queue and transaction scopes queue for it like every other
+ * writer instead of landing inside another thread's transaction. Call once,
+ * right after the handle is opened and before anything begins a
+ * transaction.
+ */
+status_t db_txn_install_cutils_lock(cutils_db_t *db);
+
+/*
  * Make every commit so far durable before returning (B142).
  *
  * state.db runs synchronous=NORMAL: a commit is in the WAL but not synced,

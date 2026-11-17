@@ -227,6 +227,44 @@ unsigned long db_txn_durable_count(void)
     return atomic_load_explicit(&g_durable, memory_order_relaxed);
 }
 
+/* ---- c-utils' own writers (CUTILS-2) ----------------------------------- */
+
+/*
+ * c-utils writes this connection from threads of its own: the log writer
+ * puts every log line in logs, push_send and the push worker keep push,
+ * and its cutils_db_tx_* scopes begin transactions. Before c-utils 1.8.0
+ * none of them could see this lock, so a log line written while a backup
+ * batch was open joined the batch and rolled back with it, and a multi-part
+ * alert's BEGIN failed outright. 1.8.0 takes an application lock before
+ * its handle mutex for every such scope; this hands it the ticket lock.
+ *
+ * A thread that already holds the lock is told so and joins its own
+ * transaction (a push_send from inside one); anyone else queues for a
+ * ticket like any writer here, and is counted by db_txn_waiters, so a
+ * batch holder lets go for a log line the same way it does for a route.
+ */
+static int cutils_lock(void *ctx)
+{
+    (void)ctx;
+    if (tls_held) return DB_WRITE_LOCK_HELD;
+    write_lock();
+    return DB_WRITE_LOCK_ACQUIRED;
+}
+
+static void cutils_unlock(void *ctx)
+{
+    (void)ctx;
+    write_unlock();
+}
+
+status_t db_txn_install_cutils_lock(cutils_db_t *db)
+{
+    if (!db) return set_error(ERR_INVALID, "db_txn_install_cutils_lock: null handle");
+    if (db_set_write_lock(db, cutils_lock, cutils_unlock, NULL) != 0)
+        return set_error(ERR_IO, "cannot give c-utils the write lock");
+    return OK;
+}
+
 /* ---- Writes outside a transaction (B157) ------------------------------ */
 
 int db_txn_held(void)
@@ -329,15 +367,6 @@ static void guard_hook(void *arg, int op, const char *dbname, const char *table,
     (void)rowid;
     if (!atomic_load_explicit(&g_guard_armed, memory_order_relaxed) || tls_held) return;
     if (!dbname || strcmp(dbname, "main") != 0) return;
-    /* c-utils' own tables, written by c-utils' own threads on this same
-     * connection: the log writer inserts every log line into logs, the push
-     * worker queues and retires alerts in push, and config is seeded at
-     * open. None of them can go through db_write from here, and all three
-     * share the hazard; it is c-utils' to fix (B157 report), and reporting
-     * every log line would bury the violations this guard is for. */
-    if (table && (strcmp(table, "logs") == 0 || strcmp(table, "push") == 0 ||
-                  strcmp(table, "config") == 0))
-        return;
     unsigned long n = atomic_fetch_add_explicit(&g_guard_violations, 1,
                                                 memory_order_relaxed) + 1;
     if (n <= GUARD_LOG_MAX)
