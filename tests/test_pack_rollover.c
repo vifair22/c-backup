@@ -49,6 +49,7 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "cdc.h"
 #include "gc.h"
 #include "pack.h"
 #include "repo.h"
@@ -305,6 +306,305 @@ static void never_settles(unsigned workers)
 static void test_never_settling_file_on_the_backup_thread(void **s) { (void)s; never_settles(1); }
 static void test_never_settling_file_with_chunk_workers(void **s)   { (void)s; never_settles(4); }
 
+/* ------------------------------------------------------------------ */
+/* Unit content: a disk (store_source_cdc) and its incremental         */
+/* (store_delta_cdc), B166                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * B166: the unit path kept the test B134 removed from the file path, so
+ * a disk could seal mid-content only when pack_backup_full guessed it
+ * might not fit. UAT met it as a VM disk of more than ~286 MB of new data
+ * into a repository that already held packs, failing with "pack is at its
+ * bound; roll over before adding". Each case below fails that way on the
+ * old test: a disk into an empty writer after earlier backups (every entry
+ * before it deduplicated), the same with a new blob staged first, and an
+ * incremental with more than the bound changed.
+ */
+
+/* A disk of incompressible bytes, the word at each 8-byte index drawn from
+ * a seed; bytes in [alt_s, alt_e) use alt_seed, which is how an incremental
+ * is given changed content. One span (random bytes hold no zero run), with
+ * seek, as cdc_store_delta needs. */
+typedef struct {
+    uint64_t size, seed, alt_seed, alt_s, alt_e;
+    uint64_t pos;
+    int      emitted;
+} disk_t;
+
+static uint8_t disk_byte(const disk_t *d, uint64_t o)
+{
+    uint64_t z = (o >= d->alt_s && o < d->alt_e ? d->alt_seed : d->seed) ^ (o >> 3);
+    z += 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    return (uint8_t)(z >> ((o & 7) * 8));
+}
+
+static status_t disk_span(void *ctx, uint64_t *s, uint64_t *e, int *got)
+{
+    disk_t *d = ctx;
+    *got = 0;
+    if (d->emitted || d->pos >= d->size) return OK;
+    *s = d->pos;
+    *e = d->size;
+    *got = 1;
+    d->emitted = 1;
+    return OK;
+}
+
+static status_t disk_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
+{
+    disk_t *d = ctx;
+    if (off + n > d->size) return set_error(ERR_IO, "read past the disk");
+    for (size_t i = 0; i < n; i++) buf[i] = disk_byte(d, off + i);
+    return OK;
+}
+
+static status_t disk_seek(void *ctx, uint64_t off)
+{
+    disk_t *d = ctx;
+    d->pos = off;
+    d->emitted = 0;
+    return OK;
+}
+
+/* One unit backup's entries: blobs (small, in memory) and at most one disk.
+ * Every entry is stored in full unless delta is set, which stores the disk
+ * against base with [alt_s, alt_e) as its changed range. */
+#define UNIT_MAX 4
+typedef struct {
+    backup_synth_t synth[UNIT_MAX];
+    const char    *blob[UNIT_MAX];   /* NULL: the disk */
+    disk_t         disk;
+    size_t         n;
+    int            delta;
+    uint8_t        base[OBJECT_HASH_SIZE];
+    uint8_t        disk_hash[OBJECT_HASH_SIZE];
+    size_t         blob_off;
+} unit_t;
+
+static const char *blob_now;
+
+static status_t blob_span(void *ctx, uint64_t *s, uint64_t *e, int *got)
+{
+    unit_t *u = ctx;
+    *got = 0;
+    if (u->blob_off) return OK;
+    u->blob_off = 1;
+    *s = 0;
+    *e = strlen(blob_now);
+    *got = 1;
+    return OK;
+}
+
+static status_t blob_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
+{
+    (void)ctx;
+    memcpy(buf, blob_now + off, n);
+    return OK;
+}
+
+static status_t u_open(void *ctx, size_t i, cdc_source_t *src, uint64_t *size)
+{
+    unit_t *u = ctx;
+    if (u->blob[i]) {
+        blob_now = u->blob[i];
+        u->blob_off = 0;
+        *src = (cdc_source_t){ blob_span, blob_read, u, NULL, NULL };
+        *size = strlen(u->blob[i]);
+        return OK;
+    }
+    u->disk.pos = 0;
+    u->disk.emitted = 0;
+    *src = (cdc_source_t){ disk_span, disk_read, &u->disk, NULL, disk_seek };
+    *size = u->disk.size;
+    return OK;
+}
+
+static void u_close(void *ctx, size_t i, status_t st, const cdc_result_t *cr)
+{
+    unit_t *u = ctx;
+    if (!u->blob[i] && st == OK && cr) memcpy(u->disk_hash, cr->hash, OBJECT_HASH_SIZE);
+}
+
+static status_t u_changed(void *ctx, uint64_t from, uint64_t *s, uint64_t *e, int *done)
+{
+    const disk_t *d = ctx;
+    if (from >= d->alt_e || d->alt_s == d->alt_e) { *done = 1; return OK; }
+    *s = d->alt_s;
+    *e = d->alt_e;
+    *done = 0;
+    return OK;
+}
+
+static status_t u_method(void *ctx, size_t i, backup_synth_method_t *out)
+{
+    unit_t *u = ctx;
+    memset(out, 0, sizeof(*out));
+    if (u->blob[i] || !u->delta) return OK;
+    out->how = BACKUP_SYNTH_DELTA;
+    memcpy(out->base, u->base, OBJECT_HASH_SIZE);
+    out->changed = u_changed;
+    out->changed_ctx = &u->disk;
+    return OK;
+}
+
+static void unit_add(unit_t *u, const char *path, const char *blob)
+{
+    assert_true(u->n < UNIT_MAX);
+    u->synth[u->n] = (backup_synth_t){ path, 0600, 0, 0, 0,
+                                       blob ? strlen(blob) : u->disk.size };
+    u->blob[u->n] = blob;
+    u->n++;
+}
+
+/* The restored disk, byte for byte against the generator. */
+static void check_disk(const char *path, const disk_t *d)
+{
+    FILE *f = fopen(path, "rb");
+    assert_non_null(f);
+    uint8_t *buf = malloc(MiB);
+    assert_non_null(buf);
+    uint64_t off = 0;
+    size_t n;
+    while ((n = fread(buf, 1, MiB, f)) > 0) {
+        for (size_t i = 0; i < n; i++)
+            if (buf[i] != disk_byte(d, off + i))
+                fail_msg("disk byte %llu differs", (unsigned long long)(off + i));
+        off += n;
+    }
+    free(buf);
+    fclose(f);
+    assert_int_equal(off, d->size);
+}
+
+#define DISK_PATH "/.cbackup-unit/disks/vda.img"
+
+/* Back up u and check it all went in, within the bound, restoring the
+ * disk byte for byte. */
+static void unit_backup(unit_t *u, unsigned workers)
+{
+    backup_synth_ops_t ops = { u_open, u_close, u, NULL, u_method };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.unit_snapshot = 1;
+    o.synth = u->synth;
+    o.n_synth = u->n;
+    o.synth_ops = &ops;
+    o.store_workers = workers;
+    backup_result_t r;
+    memset(&r, 0, sizeof(r));
+    status_t st = backup_run(store, db, repo_id, &o, &r);
+    if (st != OK) fail_msg("unit backup: %s", err_msg());
+    (void)packs_within_bound();
+    verify_clean();
+    rmrf(TEST_OUT);
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, r.snapshot_id, TEST_OUT, NULL, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    check_disk(TEST_OUT DISK_PATH, &u->disk);
+    rmrf(TEST_OUT);
+    backup_result_free(&r);
+}
+
+static const char *META = "{\"name\":\"vm\",\"disks\":[\"vda\"]}";
+
+/* A repository that already holds packs: one file backup, one unit backup
+ * with a small disk. */
+static void seed_repo(unsigned workers)
+{
+    write_rand(TEST_SRC "/small.bin", 64 * 1024, 1660, "wb");
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.store_workers = workers;
+    backup_result_t r;
+    memset(&r, 0, sizeof(r));
+    assert_int_equal(backup_run(store, db, repo_id, &o, &r), OK);
+    backup_result_free(&r);
+
+    unit_t u;
+    memset(&u, 0, sizeof(u));
+    u.disk = (disk_t){ .size = 2 * MiB + 17, .seed = 1661 };
+    unit_add(&u, DISK_PATH, NULL);
+    unit_add(&u, "/.cbackup-unit/unit.json", META);
+    unit_backup(&u, workers);
+    assert_true(packs_within_bound() >= 1);
+}
+
+/* UAT's case: a disk of five seals of new data, every entry before it
+ * deduplicated, so the writer is empty when the disk begins. */
+static void disk_into_empty_writer(unsigned workers)
+{
+    seed_repo(workers);
+    int before = packs_within_bound();
+    unit_t u;
+    memset(&u, 0, sizeof(u));
+    u.disk = (disk_t){ .size = 5 * SEAL + 4093, .seed = 1662 };
+    unit_add(&u, "/.cbackup-unit/unit.json", META);   /* stored before: dedups */
+    unit_add(&u, DISK_PATH, NULL);
+    unit_backup(&u, workers);
+    assert_true(packs_within_bound() - before >= (int)(u.disk.size / pack_hard_bound()));
+}
+static void test_unit_disk_into_empty_writer(void **s)              { (void)s; disk_into_empty_writer(1); }
+static void test_unit_disk_into_empty_writer_chunk_workers(void **s) { (void)s; disk_into_empty_writer(4); }
+
+/* The same disk with a pack partly filled by a new blob first. */
+static void test_unit_disk_into_partly_full_writer(void **s)
+{
+    (void)s;
+    seed_repo(4);
+    unit_t u;
+    memset(&u, 0, sizeof(u));
+    u.disk = (disk_t){ .size = 5 * SEAL + 4093, .seed = 1663 };
+    unit_add(&u, "/.cbackup-unit/config.xml", "<domain>new, so it is staged</domain>");
+    unit_add(&u, DISK_PATH, NULL);
+    unit_backup(&u, 4);
+}
+
+/* An incremental with four seals changed, into an empty writer: the base
+ * goes in behind a new blob, the incremental after a blob that dedups. */
+static void test_unit_disk_incremental_into_empty_writer(void **s)
+{
+    (void)s;
+    seed_repo(4);
+    unit_t u;
+    memset(&u, 0, sizeof(u));
+    u.disk = (disk_t){ .size = 6 * SEAL + 1021, .seed = 1664 };
+    unit_add(&u, "/.cbackup-unit/config.xml", "<domain>base</domain>");
+    unit_add(&u, DISK_PATH, NULL);
+    unit_backup(&u, 4);
+
+    unit_t v;
+    memset(&v, 0, sizeof(v));
+    v.disk = u.disk;
+    v.disk.alt_seed = 1665;
+    v.disk.alt_s = SEAL + 4096;
+    v.disk.alt_e = 5 * SEAL + 4096;
+    v.delta = 1;
+    memcpy(v.base, u.disk_hash, OBJECT_HASH_SIZE);
+    unit_add(&v, "/.cbackup-unit/config.xml", "<domain>base</domain>");   /* dedups */
+    unit_add(&v, DISK_PATH, NULL);
+    unit_backup(&v, 4);
+}
+
+/* The file path's form of the same case (B134 covers a fresh repository):
+ * a large new file in a later backup, its writer empty because every
+ * other file is unchanged. */
+static void test_file_into_repo_with_packs(void **s)
+{
+    (void)s;
+    seed_repo(1);
+    size_t n = (size_t)(SEAL / 4) * 20 + 7;
+    write_rand(TEST_SRC "/big.bin", n, 1666, "wb");
+    backup_all(1, 2, 64 * 1024 + n);
+}
+
 /* UAT's sizes at the production seal (ROLLOVER_FULL only). */
 static void full_one_file(unsigned workers, size_t mb)
 {
@@ -339,6 +639,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_small_file_workers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_never_settling_file_on_the_backup_thread, setup, teardown),
         cmocka_unit_test_setup_teardown(test_never_settling_file_with_chunk_workers, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unit_disk_into_empty_writer, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unit_disk_into_empty_writer_chunk_workers, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unit_disk_into_partly_full_writer, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unit_disk_incremental_into_empty_writer, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_into_repo_with_packs, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
