@@ -79,6 +79,15 @@ extern int (*volatile fault_unlink_hook)(const char *path);
 extern int (*volatile fault_sync_hook)(int fd, int data_only);
 extern int __real_unlink(const char *);
 
+/* Every write(2), pwrite(2) and fwrite(3) asks this first with the
+ * descriptor; anything but FAULT_FS_PASS fails the write with errno as the
+ * hook set it. mkdir(2) likewise, the hook doing the work itself when it
+ * answers anything but FAULT_FS_PASS. */
+extern int (*volatile fault_write_hook)(int fd);
+extern int (*volatile fault_mkdir_hook)(const char *path, mode_t mode);
+extern ssize_t __real_write(int, const void *, size_t);
+extern int __real_mkdir(const char *, mode_t);
+
 static inline void fault_reset_all(void) {
     fault_malloc_at = -1;
     fault_fread_at  = -1;

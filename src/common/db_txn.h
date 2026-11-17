@@ -78,9 +78,9 @@ unsigned db_txn_waiters(void);
  * When a holder that commits in batches should let the lock go: at the
  * first check after a writer queues, and then, while writers keep coming
  * (contended, for DB_TXN_BATCH_CONTENDED_MS after the last one seen), once
- * a batch has been open DB_TXN_BATCH_HOLD_MS. The backup's store batch
- * applies the same rules (backup.c) and should move onto this; the pack
- * commit uses it (store_index.c). Contended mode is what keeps two writers
+ * a batch has been open DB_TXN_BATCH_HOLD_MS. The one copy of the rule:
+ * the backup's batches (backup.c) and the pack commit (store_index.c) both
+ * ask it. Contended mode is what keeps two writers
  * that never go away, such as a backup's store batch and its pack workers,
  * from trading the lock, and a commit, at every row.
  *
@@ -96,6 +96,9 @@ typedef struct {
 
 void db_txn_batch_opened(db_txn_batch_t *b);
 int  db_txn_batch_should_end(db_txn_batch_t *b);
+/* Whether writers have kept coming lately, so B107's rules apply: a holder
+ * also lets go before long waits of its own (backup.c). */
+int  db_txn_batch_contended(const db_txn_batch_t *b);
 
 /*
  * Make every commit so far durable before returning (B142).
@@ -121,6 +124,14 @@ status_t db_txn_make_durable(cutils_db_t *db);
 /* Completed db_txn_make_durable calls since the process started; for tests
  * proving an irreversible step came after one. */
 unsigned long db_txn_durable_count(void);
+
+/*
+ * For the power-cut tests: a gate asked before every make_durable, whose
+ * non-OK answer fails it with nothing checkpointed (the cut came first),
+ * and a callback after each one completes, still under the write lock, so
+ * the database file it sees is exactly what was made durable. NULL clears.
+ */
+void db_txn_set_durable_hooks(status_t (*gate)(void), void (*done)(void));
 
 /*
  * Time spent in this module is attributed to the calling thread's phase
