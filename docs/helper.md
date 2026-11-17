@@ -492,7 +492,7 @@ enabled = 1
 ; nvram_dir = /etc/libvirt/qemu/nvram
 ; qemu_nbd = /usr/bin/qemu-nbd                 ; the host's, run through nsenter
 ; freeze = auto                                ; auto | off | required
-; freeze_timeout_s = 10
+; freeze_timeout_s = 20                        ; 3x FS1's worst freeze, 6.6 s
 ```
 
 A unit is a persistent domain, keyed by UUID (`libvirt:<uuid>`) and

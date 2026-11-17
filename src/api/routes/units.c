@@ -763,6 +763,7 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
             cJSON_AddStringToObject(x, "consistency", sp_consistency_name(u->achieved));
             cJSON_AddNumberToObject(x, "bytes_read", (double)u->bytes_read);
             cJSON_AddNumberToObject(x, "files", (double)u->files);
+            if (u->freeze_ms) cJSON_AddNumberToObject(x, "freeze_ms", (double)u->freeze_ms);
         } else {
             cJSON_AddStringToObject(x, "error", u->error);
         }

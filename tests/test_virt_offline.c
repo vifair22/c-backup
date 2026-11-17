@@ -685,6 +685,7 @@ static void test_freeze_killed_helper(void **state)
     if (st != OK) print_message("backup of the agent's guest: %s\n", res.n ? res.units[0].error : err_msg());
     assert_int_equal(st, OK);
     assert_int_equal(res.units[0].achieved, SP_CONSIST_QUIESCED);
+    assert_true(res.units[0].freeze_ms > 0);              /* in the job result too */
     int64_t snap = res.units[0].snapshot_id;
     unit_backup_result_free(&res);
     if (system(pf("virsh -q -c '%s' destroy %s >/dev/null 2>&1", URI, V4)) != 0) { /* already off */ }

@@ -183,6 +183,7 @@ static void test_policy(void **state)
     assert_int_equal(p.daemon_uid, 990);
     assert_int_equal(p.daemon_gid, 990);          /* defaults to daemon_uid */
     assert_string_equal(p.daemon_id, "0badf00d");
+    assert_int_equal(p.vm_freeze_timeout_s, 20);  /* 3x FS1's worst freeze, 6.6 s */
     assert_int_equal(p.n_hooks, 3);
     assert_int_equal(p.n_allow, 2);
     assert_true(p.allow_restore);

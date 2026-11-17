@@ -3057,8 +3057,12 @@ path = /mnt/cache/lxc
 enabled = 1
 # freeze: auto (when the agent is connected) | off | required.
 freeze = auto
-freeze_timeout_s = 10
-# scratch_dir = /mnt/cache/system/cbackup-scratch
+# 20 s is 3x the worst freeze measured on FS1 (22.4.3, Freeze).
+freeze_timeout_s = 20
+# On the cache pool, never the array or the RAM rootfs: libvirt creates the
+# scratch images here inside the frozen backup-start call, so their speed is
+# the freeze's length.
+scratch_dir = /mnt/cache/system/cbackup-scratch
 # staging_root = /mnt/cache/system/cbackup-vmstate
 
 [hook immich-pg_dumpall]
@@ -3153,7 +3157,7 @@ settings are in its policy, not here.
 | `vm.nbd_request_kb` | `256` | Size of each NBD read of a VM disk, 64 to 32768 KiB. 256 KiB at depth 8 measured 2.3 times the throughput of 4 MiB requests against qemu-nbd (PERF.md) |
 | `vm.nbd_queue_depth` | `8` | NBD reads in flight per disk, 1 to 64 |
 | `vm.trust_zero_status` | `1` | Skip reading disk extents the server reports as zero; 0 reads them too |
-| `vm.freeze_timeout_s` | `10` | Watchdog on a guest freeze for in-process providers; behind the helper, the policy's `freeze_timeout_s` governs |
+| `vm.freeze_timeout_s` | `20` | Watchdog on a guest freeze for in-process providers; behind the helper, the policy's `freeze_timeout_s` (also 20) governs. 3x the worst freeze measured on FS1 |
 | `containers.max_pause_s` | `30` | Watchdog on a container pause for in-process providers; behind the helper, the policy's `max_pause_s` governs |
 | `vm.export_dir` | `/run/c-backupd/exports` | Directory (0700) of NBD export sockets; the same path on the host and in the container |
 | `vm.export_ttl_s` | `14400` | Default export lifetime, 60 to 604800 seconds |
@@ -3266,7 +3270,16 @@ transaction) runs frozen: the XML is built beforehand, and an incremental
 libvirt refuses is cleaned up thawed and started again under a new freeze.
 What remains is libvirt's own work in that call, mostly creating the
 scratch images, so a slow `scratch_dir` lengthens the freeze; put it on
-fast storage. `freeze_ms` in `unit.json` records the window. Two watchdogs bound it
+fast storage (the cache pool, as in the policy of 22.2.3). The helper logs each
+VM's frozen window (`was frozen for N ms around its backup start`), and the
+job result and `unit.json` carry it as `freeze_ms`.
+
+The watchdog's default, `freeze_timeout_s = 20`, is sized from measurement:
+the worst window seen on FS1 was 6.6 s (2.5 s typical) with its pool busy,
+and the default is three times that, so a slow begin is not thawed early
+and a stuck one still is within seconds. A thaw before the backup start
+makes the snapshot `crash`, not `quiesced` (below), so a margin too small
+costs consistency, not data. Two watchdogs bound it
 whatever the helper is doing: the libvirt provider's at the policy's
 `freeze_timeout_s`, and the helper's own over every hold at `max_pause_s`.
 Both time holds in milliseconds, so a 1 s bound never fires early. Frozen:

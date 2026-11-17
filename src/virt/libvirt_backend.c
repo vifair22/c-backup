@@ -1424,7 +1424,13 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
     /* What the point in time had: the window of the begin that took. */
     int frozen = fz.frozen, lost = fz.lost;
     struct { int thawed; } wd = { fz.wd_thawed };
-    if (frozen) s->info.freeze_ms = fz.ms;
+    if (frozen) {
+        s->info.freeze_ms = fz.ms;
+        /* Per backup, so slow scratch storage shows (B180): the window is
+         * libvirt's backup-begin, which creates the scratch images. */
+        log_info("libvirt: %s was frozen for %llu ms around its backup start (watchdog at %u s)",
+                 unit->name ? unit->name : s->uuid, (unsigned long long)fz.ms, c->pol->vm_freeze_timeout_s);
+    }
     if (began) s->online = 1;
     /* The new checkpoint, recorded with the XML it has now before anything
      * is read: from here on it can be redefined, and is the base of the

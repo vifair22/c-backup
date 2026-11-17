@@ -259,7 +259,8 @@ the point-in-time export.
 timeout. c-backup does not change it (`virDomainAgentSetResponseTimeout`
 alters the domain's runtime settings, which is touching the VM). Instead:
 
-- the freeze runs with a watchdog at `vm.freeze_timeout_s` (default 10);
+- the freeze runs with a watchdog at `vm.freeze_timeout_s` (default 20,
+  three times the worst window measured on FS1, 6.6 s);
 - if the freeze call itself has not returned by then, the watchdog issues
   `virDomainFSThaw`. libvirt serialises agent commands, so that thaw queues
   behind the freeze and runs the moment it returns, whatever its result;
@@ -1128,7 +1129,7 @@ phase (`--attach <vm>`), because it modifies that VM's live definition.
 | `vm.scratch_dir` | empty (libvirt default) | Host path for copy-before-write scratch files. On Unraid, on the cache pool, not in RAM |
 | `vm.scratch_reserve_pct` | `25` | Free space required in `scratch_dir`, as a percentage of the session's allocated disk bytes |
 | `vm.freeze` | `auto` | `auto`, `off`, `required`; per-unit override in enrolment |
-| `vm.freeze_timeout_s` | `10` | Watchdog bound on the freeze window |
+| `vm.freeze_timeout_s` | `20` | Watchdog bound on the freeze window (3x FS1's worst, 6.6 s) |
 | `vm.nbd_request_kb` | `4096` | NBD read size, 64 to 32768 |
 | `vm.nbd_queue_depth` | `8` | Reads in flight per disk, 1 to 64 |
 | `vm.nbd_timeout_s` | `120` | Per-request timeout |

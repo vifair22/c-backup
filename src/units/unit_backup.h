@@ -69,6 +69,7 @@ typedef struct {
     sp_consistency_t achieved;
     uint64_t         bytes_read;     /* disk bytes read */
     uint64_t         files;
+    uint64_t         freeze_ms;      /* how long the unit was frozen; 0 when it was not */
     unsigned         n_warnings;
     char             warning[512];   /* the first */
 } unit_backup_one_t;

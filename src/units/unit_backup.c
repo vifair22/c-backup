@@ -1249,6 +1249,7 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         err_clear();
     }
     res->snapshot_id = snap;
+    res->freeze_ms = (u.info->consist_flags & SP_CF_FROZEN) ? u.info->freeze_ms : 0;
     if (u.cap_hit) res->achieved = SP_CONSIST_INCONSISTENT;
     res->bytes_read = u.bytes_read;
     if (st == OK)
