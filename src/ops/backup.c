@@ -1109,6 +1109,47 @@ static status_t small_queue(pipeline_t *p, batch_t *b, uint32_t index)
 }
 
 /*
+ * Every content store on the backup thread (a file, a unit's blob or disk,
+ * an incremental of a disk) goes through this pair, so the rule for when
+ * the sink may seal a pack mid-content lives in one place. It drifted
+ * once: B134 fixed it for files and the unit path kept the old test, so
+ * every VM disk was exposed (B166).
+ *
+ * Content over one object's bound may seal mid-content, so the batch is
+ * let go first: sealing begins a transaction (OWN-16). That is every such
+ * content, and a stream of unknown length, never only content that looks
+ * as if it will not fit. The old test asked pack_backup_full, which
+ * answers "not full" for a writer holding nothing, so large content into
+ * an empty writer (a fresh repository, or one whose earlier entries all
+ * deduplicated) was cut with no way to seal, and at the pack bound the
+ * append refused the next chunk. A size known before the read is a guess
+ * anyway: a file can grow while it is read. Smaller content never needs
+ * it, because the callers seal before each entry with a whole object's
+ * headroom. Whether the next chunk fits is the sink's call, chunk by chunk
+ * (bsink_add_prepared).
+ *
+ * Also fills the chunker's options: workers for content over one object.
+ */
+static void sink_begin(pipeline_t *p, batch_t *b, uint64_t size, cdc_opts_t *o)
+{
+    int large = size == CDC_SIZE_STREAM || size > OBJECT_MAX_BYTES;
+    if (large) batch_close(p, b);
+    memset(o, 0, sizeof(*o));
+    o->workers = large ? p->cdc_w : NULL;
+    o->cancel = p->opts ? p->opts->cancel : NULL;
+    o->cancelled = store_cancelled_cb;
+    o->cancelled_ctx = p->store;
+    o->progress = store_bytes;
+    o->progress_ctx = p;
+    p->sink->may_rollover = large;
+}
+
+static void sink_end(pipeline_t *p)
+{
+    p->sink->may_rollover = 0;
+}
+
+/*
  * Store one regular file's content (format 3): content-defined chunks into
  * the backup pack, and a chunk list when there is more than one chunk or a
  * hole. A file over one object's bound gets the chunk workers and has the
@@ -1128,38 +1169,14 @@ static status_t store_file_cdc(pipeline_t *p, batch_t *b, int fd, uint64_t size,
     struct stat now;
     if (fstat(fd, &now) == 0 && (uint64_t)now.st_size > size)
         size = (uint64_t)now.st_size;
-    int large = size > OBJECT_MAX_BYTES;
-    /*
-     * A file over one object's bound may seal the pack mid-file, so the
-     * batch is let go first: sealing begins a transaction (OWN-16). Every
-     * such file, not only one that looks as if it will not fit (B134).
-     * That test asked pack_backup_full, which answers "not full" for a
-     * pack with nothing in it - so the first large file into a fresh writer
-     * was cut with no way to seal, and at the pack bound the append refused
-     * the next chunk and the file was left out. And a size known before
-     * the read is a guess: the read is the file's own size (settle), and a
-     * file that grows while it is read, or is read twice, is larger than
-     * any figure taken here. Smaller files never need it: the loop seals
-     * before each entry with a whole object's headroom.
-     */
-    int may_seal = large;
-    if (may_seal) batch_close(p, b);
-
     obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
-    cdc_opts_t o = {
-        .workers = large ? p->cdc_w : NULL,
-        .cancel = p->opts ? p->opts->cancel : NULL,
-        .cancelled = store_cancelled_cb,
-        .cancelled_ctx = p->store,
-        .progress = store_bytes,
-        .progress_ctx = p,
-    };
-    p->sink->may_rollover = may_seal;
+    cdc_opts_t o;
+    sink_begin(p, b, size, &o);
     /* The sink writes straight into the pack, so a discarded read needs no
      * undoing: its objects get rows with the next flush, unreferenced, for
      * gc, as a failed file's always have. */
     status_t st = settle_store_fd(cp, fd, scan_st, &sink, &o, NULL, NULL, out, sr);
-    p->sink->may_rollover = 0;
+    sink_end(p);
     return st;
 }
 
@@ -1178,23 +1195,11 @@ static status_t store_source_cdc(pipeline_t *p, batch_t *b, const cdc_source_t *
     if (!cp)
         return set_error(ERR_INVALID, "repository is encrypted and no key is "
                          "loaded: its chunk boundaries need the key");
-    int large = size > OBJECT_MAX_BYTES;
-    /* A stream may be any length: let the pack roll over under it. */
-    int may_seal = size == CDC_SIZE_STREAM ||
-        (large && pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES));
-    if (may_seal) batch_close(p, b);
     obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
-    cdc_opts_t o = {
-        .workers = large ? p->cdc_w : NULL,
-        .cancel = p->opts ? p->opts->cancel : NULL,
-        .cancelled = store_cancelled_cb,
-        .cancelled_ctx = p->store,
-        .progress = store_bytes,
-        .progress_ctx = p,
-    };
-    p->sink->may_rollover = may_seal;
+    cdc_opts_t o;
+    sink_begin(p, b, size, &o);
     status_t st = cdc_store_source(cp, src, size, &sink, &o, out);
-    p->sink->may_rollover = 0;
+    sink_end(p);
     return st;
 }
 
@@ -1210,24 +1215,14 @@ static status_t store_delta_cdc(pipeline_t *p, batch_t *b, const cdc_source_t *s
                          "loaded: its chunk boundaries need the key");
     if (size == CDC_SIZE_STREAM || size == 0)
         return set_error(ERR_INVALID, "backup: an incremental needs a disk of known size");
-    int large = size > OBJECT_MAX_BYTES;
-    int may_seal = large && pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES);
-    if (may_seal) batch_close(p, b);
     obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
     obj_loader_t ld = obj_loader_store(p->store);
-    cdc_opts_t o = {
-        .workers = large ? p->cdc_w : NULL,
-        .cancel = p->opts ? p->opts->cancel : NULL,
-        .cancelled = store_cancelled_cb,
-        .cancelled_ctx = p->store,
-        .progress = store_bytes,
-        .progress_ctx = p,
-    };
+    cdc_opts_t o;
+    sink_begin(p, b, size, &o);
     cdc_delta_result_t dr;
-    p->sink->may_rollover = may_seal;
     status_t st = cdc_store_delta(cp, &ld, how->base, src, size, how->changed, how->changed_ctx,
                                   &sink, &o, &dr);
-    p->sink->may_rollover = 0;
+    sink_end(p);
     *out = dr.r;
     if (how->delta) *how->delta = dr;
     return st;
