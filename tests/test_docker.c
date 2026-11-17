@@ -772,6 +772,17 @@ static void test_demux(void **state)
     assert_int_equal(docker_demux_feed(&m, bad, sizeof(bad), sink, &out), -1);
 }
 
+/* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
+ * that leaves anything behind (SCRATCH-1). Setup removes it too, so a
+ * killed run is no obstacle to the next. */
+static int group_cleanup(void **state)
+{
+    (void)state;
+    int rc = system("rm -rf '" D "'");
+    (void)rc;
+    return 0;
+}
+
 int main(void)
 {
     /* As c-backup-helper does (helper_main.c): a write to a pipe or socket
@@ -797,5 +808,5 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),
         cmocka_unit_test(test_demux),
     };
-    return cmocka_run_group_tests(tests, NULL, NULL);
+    return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }
