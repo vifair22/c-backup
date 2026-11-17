@@ -266,7 +266,7 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
     uint32_t rows = 0;
     for (uint32_t i = 0; !failed && i < info->entry_count; i++) {
         if (!in_txn) {
-            if (db_txn_begin(idx->db) != OK) { failed = 1; break; }
+            if (db_txn_begin_bulk(idx->db) != OK) { failed = 1; break; }
             in_txn = 1;
             rows = 0;
             db_txn_batch_opened(&batch);
@@ -320,7 +320,7 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
 
     /* The marker, with the rows that replace what readers use now. */
     if (!failed && !in_txn) {
-        if (db_txn_begin(idx->db) != OK) failed = 1;
+        if (db_txn_begin_bulk(idx->db) != OK) failed = 1;
         else in_txn = 1;
     }
     if (!failed && db_write(idx->db,

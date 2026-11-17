@@ -150,8 +150,10 @@ struct helper_server {
 /* The hold journal, persisted                                         */
 /* ------------------------------------------------------------------ */
 
-/* Caller holds jmu. Written whole through a temporary and a rename. */
-static void journal_save(helper_server_t *s)
+/* Caller holds jmu. Written whole through a temporary and a rename, and
+ * the rename synced: a hold the journal does not list is one a restarted
+ * helper cannot release. Returns OK, or the failure (also logged). */
+static status_t journal_save(helper_server_t *s)
 {
     cJSON *a = cJSON_CreateArray();
     for (size_t i = 0; a && i < s->n_holds; i++) {
@@ -166,17 +168,43 @@ static void journal_save(helper_server_t *s)
     }
     char *txt = a ? cJSON_PrintUnformatted(a) : NULL;
     cJSON_Delete(a);
-    if (!txt) { log_error("helper: cannot serialise the hold journal"); return; }
+    if (!txt) {
+        log_error("helper: cannot serialise the hold journal");
+        return set_error(ERR_NOMEM, "helper: cannot serialise the hold journal");
+    }
     char path[PATH_MAX + 32], tmp[PATH_MAX + 32];
     snprintf(path, sizeof(path), "%s/holds.json", s->pol->state_dir);
     snprintf(tmp, sizeof(tmp), "%s/holds.json.tmp", s->pol->state_dir);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     size_t n = strlen(txt);
-    int ok = fd >= 0 && write(fd, txt, n) == (ssize_t)n && fsync(fd) == 0;
-    if (fd >= 0) close(fd);
-    if (!ok || rename(tmp, path) != 0)
-        log_error("helper: cannot write %s: %s", path, strerror(errno));
+    const char *step = "create";
+    int ok = fd >= 0;
+    for (size_t done = 0; ok && done < n; ) {
+        ssize_t w = write(fd, txt + done, n - done);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) { if (w == 0) errno = EIO; ok = 0; step = "write"; break; }
+        done += (size_t)w;
+    }
+    if (ok && fsync(fd) != 0) { ok = 0; step = "sync"; }
+    int err = errno;
+    if (fd >= 0 && close(fd) != 0 && ok) { ok = 0; step = "close"; err = errno; }
+    if (ok && rename(tmp, path) != 0) { ok = 0; step = "rename"; err = errno; }
+    if (ok) {
+        int dfd = open(s->pol->state_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd < 0 || fsync(dfd) != 0) { ok = 0; step = "sync the directory of"; err = errno; }
+        if (dfd >= 0) close(dfd);
+    }
     cJSON_free(txt);
+    if (ok) return OK;
+    if (strcmp(step, "rename") != 0 && strcmp(step, "sync the directory of") != 0)
+        (void)unlink(tmp);
+    errno = err;
+    status_t st = set_error_errno(ERR_IO, "helper: cannot %s %s", step,
+                                  strcmp(step, "create") == 0 || strcmp(step, "write") == 0 ||
+                                  strcmp(step, "sync") == 0 || strcmp(step, "close") == 0
+                                  ? tmp : path);
+    log_error("%s", err_msg());
+    return st;
 }
 
 typedef struct jctx {
@@ -202,8 +230,15 @@ static status_t j_record(void *ctx, const char *kind, const char *detail, int64_
     snprintf(h->detail, sizeof(h->detail), "%s", detail);
     h->created_ms = now_ms();
     h->capture = j->capture;
+    /* Recorded before the hold is taken, and a hold the journal could not
+     * keep is not taken at all: after a crash nothing would release it. */
+    status_t st = journal_save(s);
+    if (st != OK) {
+        s->n_holds--;
+        pthread_mutex_unlock(&s->jmu);
+        return st;
+    }
     *out = h->id;
-    journal_save(s);
     pthread_mutex_unlock(&s->jmu);
     return OK;
 }
@@ -216,7 +251,9 @@ static status_t j_clear(void *ctx, int64_t id)
     for (size_t i = 0; i < s->n_holds; i++) {
         if (s->holds[i].id != id) continue;
         s->holds[i] = s->holds[--s->n_holds];
-        journal_save(s);
+        /* Released already; a journal still naming it costs a redundant
+         * release after a crash, nothing more. Logged by journal_save. */
+        if (journal_save(s) != OK) err_clear();
         break;
     }
     pthread_mutex_unlock(&s->jmu);
@@ -1633,7 +1670,13 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
         return resp_error(r->id, HELPER_E_FAILED, "move aside: %s", strerror(errno));
     if (rename(st.path, st.mount) != 0) {
         int e = errno;
-        if (had) (void)rename(old, st.mount);
+        if (had && rename(old, st.mount) != 0) {
+            int e2 = errno;
+            log_error("helper: swap of %s failed and the original could not be put back; "
+                      "it is at %s: %s", st.mount, old, strerror(e2));
+            return resp_error(r->id, HELPER_E_FAILED, "swap in: %s; the original could not be "
+                              "put back and is at %.300s (%s)", strerror(e), old, strerror(e2));
+        }
         return resp_error(r->id, HELPER_E_FAILED, "swap in: %s", strerror(e));
     }
     pthread_mutex_lock(&s->mu);
@@ -1645,6 +1688,24 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
         }
     pthread_mutex_unlock(&s->mu);
     staging_tidy(s, sdir, st.file);
+    /* Durable before it is reported: a power cut must not undo a swap the
+     * daemon was told happened. The staging is tidied first either way. */
+    {
+        char parent[PATH_MAX];
+        snprintf(parent, sizeof(parent), "%.4000s", st.mount);
+        char *sl = strrchr(parent, '/');
+        if (sl && sl != parent) *sl = '\0';
+        else if (sl) sl[1] = '\0';
+        int dfd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        int ok = dfd >= 0 && fsync(dfd) == 0;
+        int e = errno;
+        if (dfd >= 0) close(dfd);
+        if (!ok)
+            return resp_error(r->id, HELPER_E_FAILED, "swapped in, but %.300s could not be "
+                              "synced, so the swap may not survive a power cut: %s%s%.300s",
+                              parent, strerror(e), had ? "; the original is at " : "",
+                              had ? old : "");
+    }
     cJSON *res = cJSON_CreateObject();
     if (res) {
         cJSON_AddStringToObject(res, "mount", st.mount);
@@ -2256,7 +2317,7 @@ status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **o
     if (rel || rep.removed)
         log_warn("helper: start-up sweep released %u hold(s), removed %u artefact(s)", rel, rep.removed);
     pthread_mutex_lock(&s->jmu);
-    journal_save(s);
+    if (journal_save(s) != OK) err_clear();   /* logged; holds are still in memory */
     pthread_mutex_unlock(&s->jmu);
 
     if (cfg->listen) {

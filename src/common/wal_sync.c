@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "wal_sync.h"
+#include "sync_latch.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -56,7 +57,7 @@ static status_t sync_dir_of(const char *path)
     else snprintf(dir, sizeof(dir), ".");
     int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dfd < 0) return set_error_errno(ERR_IO, "state.db: cannot open %s to sync it", dir);
-    int rc = fsync(dfd);
+    int rc = sync_latch_fsync(dfd, dir);
     int saved = errno;
     close(dfd);
     if (rc != 0) {
@@ -124,7 +125,7 @@ status_t wal_sync(const char *wal_path)
     if (hook) hook();
 
     status_t st = OK;
-    if (fdatasync(fd) != 0)
+    if (sync_latch_fdatasync(fd, wal_path) != 0)
         st = set_error_errno(ERR_IO, "state.db: cannot sync %s; the index is not "
                                      "durable yet", wal_path);
     close(fd);

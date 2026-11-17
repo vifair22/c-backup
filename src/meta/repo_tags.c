@@ -1,12 +1,14 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "repo_tags.h"
+#include "sync_latch.h"
 
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
 #include "db_txn.h"
 #include "db_write.h"
+#include "snap_record.h"
 
 #include <cutils/log.h>
 
@@ -139,11 +141,12 @@ status_t repo_tags_save_with(cutils_db_t *db, int64_t repo_id, const char *repo_
     /* 0600, as the rest of a repository's files are (mkstemp's mode):
      * the list names snapshots and when they were taken. */
     if (fchmod(fd, 0600) != 0 ||
-        write(fd, body, len) != (ssize_t)len || write(fd, "\n", 1) != 1)
+        snapshot_write_all(fd, body, len) != 0 || snapshot_write_all(fd, "\n", 1) != 0)
         st = set_error_errno(ERR_IO, "cannot write %s", tmp);
-    else if (fsync(fd) != 0)
+    else if (sync_latch_repo_fsync(repo_path, fd, tmp) != 0)
         st = set_error_errno(ERR_IO, "cannot flush %s", tmp);
-    close(fd);
+    if (close(fd) != 0 && st == OK)
+        st = set_error_errno(ERR_IO, "cannot close %s", tmp);
     free(body);
     if (st == OK && rename(tmp, final) != 0)
         st = set_error_errno(ERR_IO, "cannot install %s", final);
@@ -158,7 +161,7 @@ status_t repo_tags_save_with(cutils_db_t *db, int64_t repo_id, const char *repo_
      */
     int dfd = open(repo_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dfd < 0) return set_error_errno(ERR_IO, "cannot open %s to sync it", repo_path);
-    if (fsync(dfd) != 0) st = set_error_errno(ERR_IO, "cannot sync %s", repo_path);
+    if (sync_latch_repo_fsync(repo_path, dfd, repo_path) != 0) st = set_error_errno(ERR_IO, "cannot sync %s", repo_path);
     close(dfd);
     return st;
 }

@@ -176,6 +176,9 @@ status_t unit_restore_item(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st == OK && rename(partial, dest) != 0)
         st = set_error_errno(ERR_IO, "item restore: rename to %s", dest);
     if (st != OK) { unlink(partial); return st; }
+    /* The rename is durable only once its directory is. */
+    if (snapshot_fsync_parent(dest) != 0)
+        return set_error_errno(ERR_IO, "item restore: sync the directory of %s", dest);
     out->bytes = got;
     return OK;
 }
