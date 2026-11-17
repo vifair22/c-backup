@@ -1,0 +1,13 @@
+# LeakSanitizer suppressions for make test-asan.
+#
+# Only proven third-party false positives belong here, each with the
+# evidence. A leak in this repository's code is fixed, never listed.
+
+# libvirt registers its object classes (virConnect, virDomain and the rest)
+# once per process, in a virOnce/pthread_once initialiser that
+# virConnectOpen runs on first use, and never frees them: they live as
+# long as the process. Every libvirt suite reports the same 8 allocations,
+# 263 bytes, whether it opens one connection or many, all under
+# virClassNew <- virOnce <- virGetConnect <- virConnectOpen. A leak per
+# connection would grow with the connections.
+leak:virClassNew
