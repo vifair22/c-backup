@@ -394,7 +394,10 @@ static status_t vm_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, 
     if (st == OK && !u) st = set_error(ERR_CORRUPT, "unit restore: unit.json does not parse");
     cJSON *disks = cJSON_CreateObject(), *done = cJSON_GetObjectItemCaseSensitive(res, "trees");
     const char *nvram = NULL, *tpm = NULL;
-    struct { char token[64]; } swaps[64];
+    /* Staging tokens, swapped in once every disk is restored. A plain 2D
+     * array: cppcheck 2.17 (Debian trixie) reads an snprintf into a member
+     * of an array-of-struct element as a use of uninitialised memory. */
+    char swaps[64][64];
     size_t nsw = 0;
     const cJSON *it;
     cJSON_ArrayForEach(it, cJSON_GetObjectItemCaseSensitive(u, "items")) {
@@ -425,7 +428,7 @@ static status_t vm_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, 
                 st = restore_file(store, db, repo_id, snap_id, o, rel, dest);
             }
             if (st == OK) {
-                snprintf(swaps[nsw++].token, sizeof(swaps[0].token), "%s", tok);
+                snprintf(swaps[nsw++], sizeof(swaps[0]), "%s", tok);
                 cJSON_AddStringToObject(disks, id, src);
             }
             cJSON_Delete(sr);
@@ -442,7 +445,7 @@ static status_t vm_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, 
     /* Every disk is in: only now do the originals move aside. */
     for (size_t i = 0; st == OK && i < nsw; i++) {
         cJSON *b = cJSON_CreateObject(), *sw = NULL;
-        if (b) cJSON_AddStringToObject(b, "staging", swaps[i].token);
+        if (b) cJSON_AddStringToObject(b, "staging", swaps[i]);
         st = remote_op("libvirt", "restore.swap", b, -1, &sw);
         const char *prev = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(sw, "previous"));
         if (st == OK && prev) cJSON_AddItemToArray(cJSON_AddArrayToObject(res, "previous"), cJSON_CreateString(prev));
