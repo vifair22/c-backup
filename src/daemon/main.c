@@ -46,6 +46,7 @@
 #include "server.h"
 #include "state_db.h"
 #include "wal_sync.h"
+#include "walidx.h"
 #include "checkpointer.h"
 #include "pack_presence.h"
 #include "prune.h"
@@ -630,5 +631,8 @@ out_locks:
     wal_sync_reset();
 out_guard:
     appguard_shutdown(guard);
+    /* After the database is closed: closing -shm sooner would drop the
+     * locks its connections hold (B173). */
+    walidx_close_all();
     return rc;
 }
