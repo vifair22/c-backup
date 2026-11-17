@@ -59,6 +59,11 @@ typedef struct {
      * leaves untouched and reports (B119): a finding at every level, and a
      * failed run, until a repairing run restores them from the index. */
     uint64_t packs_unwalkable;
+    /* Packs whose own header, tail copies or CRC table disagreed with their
+     * redundancy (B136): rewritten by a repairing run, otherwise counted as
+     * recoverable. Not loss. */
+    uint64_t pack_structures_repaired;
+    uint64_t pack_structures_recoverable;
     /* Packs a repairing run made walkable again by rebuilding headers. */
     uint64_t packs_restored;
     /* Packs a repairing run could not rebuild - a damaged header had no

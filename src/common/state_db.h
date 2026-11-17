@@ -71,3 +71,8 @@ void     state_db_flusher_stop(void);
 
 /* Syncs the flusher has issued since it started; for tests. */
 unsigned long state_db_flusher_syncs(void);
+
+/* 1 when the WAL on disk is the WAL the flusher last synced, so nothing
+ * written so far is waiting for a sync; for tests, which need that settled
+ * before they can say an idle WAL is not synced again. */
+int state_db_flusher_current(void);

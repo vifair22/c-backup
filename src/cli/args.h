@@ -33,6 +33,8 @@
  *     as "none" at the daemon, the same silent downgrade as a missing one;
  *   - only ARG_MULTI options repeat; any other option given twice is an
  *     error rather than a guess at which one was meant;
+ *   - an ARG_CHOICE value must be one of the words its meta lists, so a
+ *     misspelt --level or --location is refused here rather than sent;
  *   - a lone "-" is a positional, never an option.
  */
 
@@ -42,6 +44,11 @@ typedef enum {
     ARG_FLAG,   /* present or not */
     ARG_VALUE,  /* one value, at most once */
     ARG_MULTI,  /* one value per occurrence, repeatable */
+    /* One value, at most once, which must be one of the words of meta,
+     * "index|structure|deep", compared exactly. The usage line and the
+     * check read the same string, so they cannot disagree. Read with
+     * args_value. */
+    ARG_CHOICE,
 } arg_kind_t;
 
 typedef struct {

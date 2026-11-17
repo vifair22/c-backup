@@ -18,6 +18,13 @@
  * and only those ids: a mark ahead of every record is normal (the newest
  * snapshots were pruned, and ids are never reused).
  *
+ * Tags too (V3-12): the repository keeps its own copy of the tag list,
+ * written and synced before a tag change is answered, so a tag the
+ * database lost is still in <repo>/tags. Each start puts any such tag back
+ * (repo_tags_restore: a tag already in the database wins), inline, since
+ * it is a handful of rows and reads one small file. A tag on a snapshot
+ * that is itself missing comes back with that snapshot's reindex.
+ *
  * It finds and reports; it does not reindex inline. For each repository
  * with missing snapshots it calls submit, which the daemon points at the
  * job manager, so the reindex runs as an ordinary job: under the
@@ -40,6 +47,7 @@ typedef struct {
     uint64_t snapshots_missing; /* records with no index row, all repos */
     unsigned jobs_submitted;
     unsigned repos_need_key;    /* missing snapshots, but encrypted and no key */
+    uint64_t tags_restored;     /* rows put back from <repo>/tags */
 } reconcile_result_t;
 
 /*

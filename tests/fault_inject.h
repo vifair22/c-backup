@@ -66,6 +66,19 @@ extern int     __real_sync_file_range(int, off_t, off_t, unsigned int);
 extern ssize_t __real_pread(int, void *, size_t, off_t);
 extern ssize_t __real_pwrite(int, const void *, size_t, off_t);
 
+/*
+ * A model of the disk under the process, for power-cut tests: when set,
+ * every rename, unlink, fsync and fdatasync goes to the hook instead of to
+ * libc, and the hook decides what reaches the disk and when (it calls the
+ * __real_ functions). A hook returning FAULT_FS_PASS hands the call on to
+ * the usual wrapper. Process-wide; NULL disables it.
+ */
+#define FAULT_FS_PASS (-2)
+extern int (*volatile fault_rename_hook)(const char *from, const char *to);
+extern int (*volatile fault_unlink_hook)(const char *path);
+extern int (*volatile fault_sync_hook)(int fd, int data_only);
+extern int __real_unlink(const char *);
+
 static inline void fault_reset_all(void) {
     fault_malloc_at = -1;
     fault_fread_at  = -1;

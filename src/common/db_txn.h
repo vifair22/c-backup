@@ -75,6 +75,54 @@ void db_txn_rollback(cutils_db_t *db);
 unsigned db_txn_waiters(void);
 
 /*
+ * When a holder that commits in batches should let the lock go: at the
+ * first check after a writer queues, and then, while writers keep coming
+ * (contended, for DB_TXN_BATCH_CONTENDED_MS after the last one seen), once
+ * a batch has been open DB_TXN_BATCH_HOLD_MS. The backup's store batch
+ * applies the same rules (backup.c) and should move onto this; the pack
+ * commit uses it (store_index.c). Contended mode is what keeps two writers
+ * that never go away, such as a backup's store batch and its pack workers,
+ * from trading the lock, and a commit, at every row.
+ *
+ * Call db_txn_batch_opened right after each db_txn_begin of the batch.
+ */
+#define DB_TXN_BATCH_CONTENDED_MS 1000
+#define DB_TXN_BATCH_HOLD_MS      200
+
+typedef struct {
+    uint64_t opened_ns;
+    uint64_t contended_until_ns;
+} db_txn_batch_t;
+
+void db_txn_batch_opened(db_txn_batch_t *b);
+int  db_txn_batch_should_end(db_txn_batch_t *b);
+
+/*
+ * Make every commit so far durable before returning (B142).
+ *
+ * state.db runs synchronous=NORMAL: a commit is in the WAL but not synced,
+ * and the flusher syncs it within about a second. That is fine for edits
+ * whose loss the next start repairs, and fatal for a commit that something
+ * irreversible then depends on: gc committed rows moving objects into the
+ * packs it wrote, unlinked the packs they came from, synced the directory
+ * so the unlinks stuck - and a power cut inside that second took the rows
+ * back, leaving the index naming packs that were gone. Anything that is
+ * about to remove the only other copy of what a commit describes calls
+ * this first.
+ *
+ * A full WAL checkpoint, under the write lock so no transaction is open on
+ * the shared connection: SQLite syncs the WAL before copying it into the
+ * database and syncs the database after. ERR_IO when the checkpoint could
+ * not complete, which callers treat as "do not remove anything yet". Must
+ * not be called while this thread holds the write lock.
+ */
+status_t db_txn_make_durable(cutils_db_t *db);
+
+/* Completed db_txn_make_durable calls since the process started; for tests
+ * proving an irreversible step came after one. */
+unsigned long db_txn_durable_count(void);
+
+/*
  * Time spent in this module is attributed to the calling thread's phase
  * timers (phase_timer.h), when it has any: lock wait and BEGIN as txn-wait,
  * COMMIT and ROLLBACK, WAL sync included, as txn-commit. Both are recorded as

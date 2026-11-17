@@ -49,6 +49,19 @@ status_t store_index_put_staged(cutils_db_t *db, int64_t repo_id,
  * repository when repo_id is 0. Only safe when no backup is running on it. */
 status_t store_index_drop_staged(cutils_db_t *db, int64_t repo_id);
 
+/*
+ * Drop the rows of pack commits that never reached their packs row (a crash
+ * between db_pack_commit's batches), for one repository or, with 0, all.
+ * Call before store_index_drop_staged; see store_index.c.
+ */
+status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id);
+
+/* For tests: rows per batch of a pack commit's new-row phase (0 restores the
+ * default), and a gate asked before each of its commits; a non-OK answer is
+ * a power cut there, with no further commits and no cleanup. */
+void store_index_set_pack_batch_rows(uint32_t rows);
+void store_index_set_commit_gate(status_t (*gate)(void));
+
 /* Record an object the repository already holds in an installed pack, as a
  * backup meets one it deduplicated against. A row already there is left as
  * it is; the pack commit is what set its size. */

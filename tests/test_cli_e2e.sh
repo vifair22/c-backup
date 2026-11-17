@@ -331,7 +331,14 @@ if command -v sqlite3 > /dev/null 2>&1; then
         'store')"
     "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2> "$WORK/watch.err" &
     WPID=$!
-    sleep 1
+    # The row stays running until this test completes it, so whatever the
+    # watch prints before then arrived while the job ran, which is what B058
+    # is about. A fixed sleep 1 guessed how long the CLI takes to start and
+    # connect, and lost under load (FLAKE-17); this waits up to 10 s for it.
+    for _ in $(seq 1 100); do
+        grep -q '"state":"running"' "$WORK/watch.out" 2>/dev/null && break
+        sleep 0.1
+    done
     contains "jobs watch prints a running job at once" '"state":"running"' \
         "$(cat "$WORK/watch.out")"
     sqlite3 -cmd ".timeout 10000" "$WORK/state.db" "UPDATE jobs SET state = 'completed',
@@ -460,7 +467,7 @@ contains "weekly schedule from the CLI" '"id"' \
 contains "monthly schedule from the CLI" '"id"' \
     "$(cb schedule add 1 verify --every month --on-day 31 --at 02:30)"
 contains "calendar schedules listed" 'calendar' "$(cb schedule list 1)"
-contains "a weekly schedule needs its day" 'weekday' \
+contains "a weekly schedule needs its day" 'needs --on WEEKDAY' \
     "$(cb schedule add 1 gc --every week --at 03:00 2>&1)"
 contains "a non-numeric day is refused before sending" 'positive number' \
     "$(cb schedule add 1 gc --every month --on-day first --at 03:00 2>&1)"
@@ -1426,9 +1433,20 @@ sed -i "s/  bind: not-an-address/  bind: 127.0.0.1/; s/  port: $BINDPORT/  port:
 C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind3.log" 2>&1
 check    "a port already taken stops the daemon" 1 "$?"
 contains "and says it cannot start" "cannot start API server" "$(cat "$WORK/bind3.log")"
+contains "naming the address" "failed to start HTTP server on 127.0.0.1:$MAIN_PORT" \
+    "$(cat "$WORK/bind3.log")"
 check    "and unwinds without a leak too" 0 \
     "$(grep -c 'LeakSanitizer\|AddressSanitizer' "$WORK/bind3.log")"
 contains "and leaves the running daemon alone" '"repos"' "$(cb repo list)"
+# NIT-19: a socket in a directory that does not exist said only "cannot
+# start API server". The line now carries the path and the reason.
+sed -i "s|  socket: $WORK/bind.sock|  socket: $WORK/no-such-dir/bind.sock|; s/  port: $MAIN_PORT/  port: 0/" \
+    "$WORK/bindcfg.yaml"
+C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind4.log" 2>&1
+check    "a socket in a missing directory stops the daemon" 1 "$?"
+contains "and names the path and the reason" \
+    "cannot start API server: cannot bind the unix socket at $WORK/no-such-dir/bind.sock (http.socket): No such file or directory" \
+    "$(cat "$WORK/bind4.log")"
 
 # sun_path is 108 bytes and the daemon used to strncpy into it, so a longer
 # socket path was silently truncated: bind and listen succeeded against a
@@ -1577,7 +1595,7 @@ if [ -n "$GCD_DAT" ] && damage_beyond_parity "$WORK/gcdsrc/keep.bin" "$GCD_DAT";
     check    "gc that copies damage beyond parity exits non-zero" 1 "$RC"
     contains "the gc job is failed"           '"state":"failed"' "$ERR"
     contains "the gc failure says what happened" \
-        "1 pack entry damaged beyond parity were copied as damaged" "$ERR"
+        "1 pack entry damaged beyond parity was copied as damaged" "$ERR"
     contains "the gc result lists the entry"  "$KEEP_HASH" "$OUT$ERR"
     contains "and counts it"                  '"pack_entries_damaged":1' "$OUT$ERR"
     GJ=$(job_of "$ERR")
@@ -1650,6 +1668,28 @@ if command -v sqlite3 > /dev/null 2>&1; then
     contains "and the next backup numbers past it" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
     check "to the id after it" "$((LOST + 1))" \
         "$(cb snapshots 1 | grep -o '"id":[0-9]*' | cut -d: -f2 | sort -n | tail -1)"
+
+    # B139 and V3-12: a tag set just before a power cut. By the time the API
+    # answers, the repository's tag list holds it, 0600 (NIT-27), and the
+    # database commit is synced. A lost commit is made by hand - the daemon
+    # killed at once, the tag row deleted - and the next start puts the row
+    # back from the repository's list.
+    contains "a tag to lose" '"ok"' "$(cb tag set 1 pc-tag "$LOST")"
+    kill -KILL "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=
+    contains "the repository's tag list has it when the API answers" '"name":"pc-tag"' \
+        "$(cat "$WORK/repo/tags" 2>/dev/null)"
+    check "and the list is 0600" "600" "$(stat -c %a "$WORK/repo/tags" 2>/dev/null)"
+    sqlite3 "$WORK/state.db" "DELETE FROM tags WHERE repo_id = 1 AND name = 'pc-tag'"
+    : > "$WORK/daemon.log"
+    C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    # The killed daemon left its socket behind, so wait for an answer, not
+    # for the file.
+    for _ in $(seq 1 100); do cb health 2>/dev/null | grep -q ready && break; sleep 0.1; done
+    contains "the start restores the lost tag and says so" \
+        "reconcile: repo 1 ($WORK/repo): 1 tag(s) missing from the index were restored" \
+        "$(cat "$WORK/daemon.log")"
+    contains "the tag is listed again" 'pc-tag' "$(cb tag list 1)"
 else
     C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
     DAEMON_PID=$!
@@ -1877,6 +1917,49 @@ for row in "${VALUE_SWEEP[@]}"; do
 done
 check "every value option refuses a missing value, sending nothing" 0 "$SWEEP_BAD"
 check "and the state still did not move" "$STATE_BEFORE" "$(b127_state 2>&1)"
+
+# NIT-26: a value outside an option's fixed set, and a calendar missing what
+# its period needs or carrying what it would drop. `verify --level bogus`,
+# `objects --location bogus` and `--every day` without --at were sent and
+# refused by the daemon, unlike `stats --scope bogus`.
+SWEEP_BAD=0
+CHOICE_SWEEP=(
+    "verify|1 --level bogus|option '--level' takes index, structure or deep, not 'bogus'"
+    "objects|1 --location bogus|option '--location' takes staged, packed or all, not 'bogus'"
+    "stats|1 --scope bogus|option '--scope' takes staged, not 'bogus'"
+    "repo add|$WORK/sweep --encrypt SYSTEM|option '--encrypt' takes system, passphrase or none"
+    "schedule add|1 backup --every fortnight --at 01:00|option '--every' takes day, week, month or year"
+    "schedule add|1 backup 60 --on-overlap later|option '--on-overlap' takes skip, queue or cancel_running"
+    "schedule add|1 backup 60 --catchup always|option '--catchup' takes skip or run_once"
+    "schedule add|1 backup --every day|--every day needs --at HH:MM"
+    "schedule add|1 backup --every day --at 24:00|--at takes a 24-hour HH:MM, not '24:00'"
+    "schedule add|1 backup --every day --at noon|--at takes a 24-hour HH:MM"
+    "schedule add|1 backup --every week --at 01:00|--every week needs --on WEEKDAY"
+    "schedule add|1 backup --every week --at 01:00 --on someday|--on takes a weekday name"
+    "schedule add|1 backup --every day --at 01:00 --on monday|--on names a weekday, which only --every week uses"
+    "schedule add|1 backup --every month --at 01:00|--every month needs --on-day N"
+    "schedule add|1 backup --every day --at 01:00 --on-day 3|--on-day is for --every month or year, not day"
+    "schedule add|1 backup --every year --at 01:00 --on-day 3|--every year needs --on-month N"
+    "schedule add|1 backup --every month --at 01:00 --on-day 3 --on-month 2|--on-month is for --every year, not month"
+    "schedule add|1 backup 60 --at 01:00|they need --every"
+)
+for row in "${CHOICE_SWEEP[@]}"; do
+    CMD="${row%%|*}"
+    rest="${row#*|}"
+    msg="${rest#*|}"
+    read -ra W <<< "$CMD ${rest%%|*}"
+    for sock in "$WORK/absent.sock" "$SOCK"; do
+        sweep_one "$sock" "$CMD" "$msg" "${W[@]}"
+    done
+done
+check "every bad option value and calendar shape is refused locally, sending nothing" \
+    0 "$SWEEP_BAD"
+check "and the state did not move for those either" "$STATE_BEFORE" "$(b127_state 2>&1)"
+# Case is the daemon's to ignore for a weekday, so the CLI does too; and
+# `all`, the daemon's default, is now in the CLI's list.
+contains "a weekday in capitals is accepted" '"id"' \
+    "$(cb schedule add 1 gfs --every week --on Sunday --at 03:00)"
+contains "objects --location all answers" '"objects"' "$(cb objects 1 --location all --limit 1)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

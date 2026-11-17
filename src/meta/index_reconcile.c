@@ -3,6 +3,7 @@
 #include "index_reconcile.h"
 
 #include "repo.h"
+#include "repo_tags.h"
 #include "snapshot_ids.h"
 
 #include <cutils/log.h>
@@ -131,6 +132,18 @@ status_t index_reconcile(cutils_db_t *db, reconcile_submit_fn submit, void *ctx,
             out->repos_unreadable++;
             continue;
         }
+        uint64_t restored = 0, skipped = 0;
+        if (repo_tags_restore(db, repo_id, path, &restored, &skipped) != OK) {
+            log_warn("reconcile: repo %lld (%s): tags not checked: %s",
+                     (long long)repo_id, path, err_msg());
+            err_clear();
+        } else if (restored > 0) {
+            out->tags_restored += restored;
+            log_warn("reconcile: repo %lld (%s): %llu tag(s) missing from the index "
+                     "were restored from the repository's tag list",
+                     (long long)repo_id, path, (unsigned long long)restored);
+        }
+
         if (missing == 0) continue;
 
         out->repos_missing++;
