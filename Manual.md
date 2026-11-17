@@ -2950,25 +2950,18 @@ Before the first start, as root on the host:
 ```sh
 mkdir -p /mnt/cache/system/c-backup-helper /mnt/cache/appdata/c-backupd \
          /mnt/cache/system/cbackup-vmstate /run/c-backup-helper /run/c-backupd
-install -d -o root -g root -m 0700 /mnt/cache/appdata/.cbackup-restore
+install -d -m 0700 /mnt/cache/appdata/.cbackup-restore
 chown 990:990 /mnt/cache/appdata/c-backupd \
               /mnt/cache/system/cbackup-vmstate /run/c-backupd /mnt/disk3/cbackup
 chown root:990 /run/c-backup-helper && chmod 0750 /run/c-backup-helper
 ```
 
-The staging directory is **root:root, mode 0700**, not the daemon's: FS1's
-`appdata` share is exported over SMB, and there the helper stages only in a
-dot directory of its own that no SMB user can enter (22.7.3). The daemon
-reaches the per-restore directory inside it, which the helper gives to
-990, through `CAP_DAC_READ_SEARCH`. Recommended, not required: add
-`veto files = /.cbackup-restore/` to the `[global]` section of
-`/boot/config/smb-extra.conf`, so SMB clients neither see the name nor can
-create or rename it.
+The helper makes each restore's directory inside it, owned by 990; the
+daemon reaches it through `CAP_DAC_READ_SEARCH` whoever owns the parent
+(22.7.3).
 
-On FS2 create `/mnt/cache/system/.cbackup-restore` the same way
-(`install -d -o root -g root -m 0700`) instead of the appdata one; an
-existing one owned by 990 still works there, since `system` is not
-exported. `/run` is RAM on Unraid too: recreate the two `/run` directories at boot
+On FS2 create `/mnt/cache/system/.cbackup-restore` the same way instead of
+the appdata one. `/run` is RAM on Unraid too: recreate the two `/run` directories at boot
 (the `go` file, or a User Scripts "at startup" script) before the containers
 start. A bind source that does not exist makes `docker run` fail.
 
@@ -3695,20 +3688,17 @@ refuses it:
 | Where | Why |
 |---|---|
 | the top of a pool | visible over the network |
-| a share exported over NFS | an NFS client can claim any uid, so no mode keeps it out |
 | a share with `shareUseCache="yes"` | the mover would carry staged files to the array mid-restore |
 | another filesystem from the mount (a btrfs subvolume, another dataset) | the swap could not be a rename |
-| a share exported over SMB, unless it is a dot directory that is root:root 0700 | anything else an SMB user might read |
-| a symlink, or a directory owned by someone else | not followed, not used |
+| a path through a symlink | never followed, so the helper cannot be steered outside the share |
 
-Each refusal says what to change. In an SMB-exported share (FS1's
-`appdata`) the helper creates the directory root:root 0700 itself and
-tightens a looser one it owns; the restored tree inside is what sits at the
-mount after the swap, so behind that directory it is less exposed than the
-result. The staging is pinned: the swap renames through directory handles
-the helper opened at stage, checks that the path still names them, and
-refuses (nothing moved) if the directory was renamed, replaced or loosened
-in between. The swap is one atomic exchange where the filesystem supports
+Each refusal says what to change. Whether the share is exported over SMB
+or NFS does not matter (FS1's `appdata` is): anyone who can write the share
+can already edit the data in it. The helper creates the directory 0700 and
+uses an existing one whoever owns it. The staging is pinned: the swap
+renames through directory handles the helper opened at stage, checks that
+the path still names them, and refuses (nothing moved) if the directory was
+renamed or replaced in between. The swap is one atomic exchange where the filesystem supports
 it (ZFS 2.2 and later, btrfs), so the mount is never missing. VM images stage beside the
 image (`<image dir>/.cbackup-restore/`) under the same refusals, and NVRAM
 and TPM state under `staging_root`.
@@ -3718,8 +3708,7 @@ refuses binds outside them, and the daemon must be able to write it: add a
 read-write mount of `DIR` to the daemon's container for the restore. An
 in-place VM restore likewise needs `<image directory>/.cbackup-restore`
 writable by the daemon (a read-write mount of that one directory, created
-beforehand: owned by 990, or root:root 0700 when the image directory is in
-an SMB-exported share); without it, restore the VM under a new name. Restore needs `allow_restore = 1` and
+beforehand, mode 0700); without it, restore the VM under a new name. Restore needs `allow_restore = 1` and
 `allow_define = 1` in the policy; a definition with privileged settings,
 devices, `<hostdev>` or `<filesystem>` devices, or binds of host paths
 outside the include roots also needs `allow_privileged_define = 1`. The

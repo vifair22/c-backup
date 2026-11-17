@@ -100,7 +100,6 @@ typedef struct {
     int      swapped;
     int      busy;            /* a swap is in progress on it */
     int      file;            /* the mount is a disk image: <path>/image replaces it */
-    int      smb;             /* in an SMB-exported share (B171) */
     /* Pinned at stage (B171): the swap renames through these fds and
      * checks the path still names them, so nothing done to the path in
      * between can redirect it. Open exactly while used. */
@@ -1280,28 +1279,16 @@ static int cfg_is(const char *v, const char *want)
  * 4, B171). The first restore_staging_dirs entry inside the domain; else,
  * for a pool-top domain (mnt_root/<pool>), <pool>/system/.cbackup-restore,
  * beside the snapshot directory; else <domain>/.cbackup-restore. Then,
- * wherever it came from, against the share holding it
- * (<boot_config>/shares/<share>.cfg):
- *
- *   the top of a pool             refused: visible over the network
- *   exported over NFS             refused: AUTH_SYS lets a client claim
- *                                 any uid, so no mode keeps it out
- *   shareUseCache=yes             refused: the mover would carry staged
- *                                 files to the array mid-restore
- *   exported over SMB             only a dot directory, and *smb set: the
- *                                 caller then insists the directory is the
- *                                 helper's own, mode 0700, which no SMB
- *                                 user (never root on Unraid) can enter
- *
- * A staged tree is what sits at the mount after the swap, with its own
- * modes; behind a 0700 directory it is less exposed than the result. -1
- * with why on a refusal.
+ * wherever it came from, refused at the top of a pool, and in a share
+ * whose mover sends files to the array (<boot_config>/shares/<share>.cfg
+ * shareUseCache="yes"), which could carry staged files off the pool
+ * mid-restore. Whether the share is exported does not matter: anyone who
+ * can write the share can already edit the data in it. -1 with why.
  */
 static int staging_base(const helper_server_t *s, const char *dom, char *out, size_t sz,
-                        int *smb, char *why, size_t wsz)
+                        char *why, size_t wsz)
 {
     const helper_policy_t *p = s->pol;
-    *smb = 0;
     out[0] = '\0';
     for (size_t i = 0; i < p->n_staging && !out[0]; i++)
         if (path_under(p->restore_staging_dirs[i], dom) && strcmp(p->restore_staging_dirs[i], dom) != 0)
@@ -1314,10 +1301,10 @@ static int staging_base(const helper_server_t *s, const char *dom, char *out, si
         }
     }
     int d = depth_below(out, p->mnt_root);
-    if (d < 0) return 0;                       /* not an Unraid pool path: nothing exports it */
+    if (d < 0) return 0;                       /* not an Unraid pool path */
     if (d < 3) {
-        snprintf(why, wsz, "restore staging %.300s would sit at the top of a pool, visible over the "
-                 "network; set [snapshot] restore_staging_dirs to a directory inside a share", out);
+        snprintf(why, wsz, "restore staging %.300s would sit at the top of a pool; set [snapshot] "
+                 "restore_staging_dirs to a directory inside a share", out);
         return -1;
     }
     /* mnt_root/<pool>/<share>/...: the share is the second component. */
@@ -1332,34 +1319,17 @@ static int staging_base(const helper_server_t *s, const char *dom, char *out, si
     FILE *f = fopen(cfg, "re");
     if (!f) return 0;                          /* not an Unraid share */
     char line[512];
-    int smb_e = 0, nfs_e = 0, mover = 0;
+    int mover = 0;
     while (fgets(line, sizeof(line), f)) {
-        const char *v;
-        if ((v = cfg_value(line, "shareExport")) != NULL) smb_e = *v && !cfg_is(v, "-") && !cfg_is(v, "");
-        else if ((v = cfg_value(line, "shareExportNFS")) != NULL) nfs_e = *v && !cfg_is(v, "-") && !cfg_is(v, "");
-        else if ((v = cfg_value(line, "shareUseCache")) != NULL) mover = cfg_is(v, "yes");
+        const char *v = cfg_value(line, "shareUseCache");
+        if (v) mover = cfg_is(v, "yes");
     }
     fclose(f);
-    if (nfs_e) {
-        snprintf(why, wsz, "restore staging %.300s is in share %.*s, which is exported over NFS, where a "
-                 "client can claim any uid; set [snapshot] restore_staging_dirs to a directory on the "
-                 "mount's filesystem in a share NFS does not export", out, k, sh);
-        return -1;
-    }
     if (mover) {
         snprintf(why, wsz, "restore staging %.300s is in share %.*s, which the mover moves to the array "
                  "(shareUseCache=yes); a staged restore could be split across devices. Keep the share "
                  "on the pool, or set [snapshot] restore_staging_dirs", out, k, sh);
         return -1;
-    }
-    if (smb_e) {
-        const char *last = strrchr(out, '/');
-        if (!last || last[1] != '.') {
-            snprintf(why, wsz, "restore staging %.300s is in share %.*s, which is exported over SMB; only "
-                     "a dot directory (such as %.200s/.cbackup-restore) is accepted there", out, k, sh, dom);
-            return -1;
-        }
-        *smb = 1;
     }
     return 0;
 }
@@ -1406,42 +1376,6 @@ static int open_base(const char *dom, const char *base, int *out, char *why, siz
     return 0;
 }
 
-/*
- * Whether the opened base is fit to stage in. The helper's own (root on a
- * host), mode 0700, tightened when it is ours and looser. Outside an
- * exported share the daemon's own directory is also accepted, as the FS2
- * recipe made it before B171; inside one, only the helper's. -1 with why.
- */
-static int base_ok(const helper_server_t *s, int bfd, const char *base, int smb, int fix,
-                   char *why, size_t wsz)
-{
-    struct stat b;
-    if (fstat(bfd, &b) != 0 || !S_ISDIR(b.st_mode)) {
-        snprintf(why, wsz, "restore staging %.300s: cannot stat it", base);
-        return -1;
-    }
-    uid_t me = geteuid();
-    if (b.st_uid == me) {
-        if ((b.st_mode & 077) != 0) {
-            if (!fix || fchmod(bfd, 0700) != 0) {
-                snprintf(why, wsz, "restore staging %.300s has mode %04o, not 0700", base, (unsigned)(b.st_mode & 07777));
-                return -1;
-            }
-            log_warn("helper: restore staging %s had mode %04o; now 0700", base, (unsigned)(b.st_mode & 07777));
-        }
-        if (smb && fix && b.st_gid != getegid() && fchown(bfd, (uid_t)-1, getegid()) != 0) {
-            snprintf(why, wsz, "restore staging %.300s: cannot set its group: %s", base, strerror(errno));
-            return -1;
-        }
-        return 0;
-    }
-    if (!smb && b.st_uid == (uid_t)s->pol->daemon_uid) return 0;
-    snprintf(why, wsz, "restore staging %.300s exists and is owned by uid %u, not %s (uid %u); something "
-             "else made it, so it is not used. Remove it, or set [snapshot] restore_staging_dirs",
-             base, (unsigned)b.st_uid, me == 0 ? "root" : "the helper's", (unsigned)me);
-    return -1;
-}
-
 static void stage_close(staging_t *x)
 {
     if (x->base_fd >= 0) close(x->base_fd);
@@ -1486,19 +1420,14 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is in no snapshot domain of the policy", r->mount);
     /* One directory per staging: a VM's disks share a job and a domain. */
     char base[PATH_MAX], path[PATH_MAX], swhy[600], uniq[HELPER_TOKEN_HEX + 1], jname[64];
-    int smb = 0;
     if (helper_random_hex(uniq, 4) != OK) return resp_error(r->id, HELPER_E_FAILED, "no randomness");
-    if (staging_base(s, dom, base, sizeof(base), &smb, swhy, sizeof(swhy)) != 0)
+    if (staging_base(s, dom, base, sizeof(base), swhy, sizeof(swhy)) != 0)
         return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
     snprintf(jname, sizeof(jname), "%lld-%s", (long long)r->job, uniq);
     if (snprintf(path, sizeof(path), "%s/%s", base, jname) >= (int)sizeof(path))
         return resp_error(r->id, HELPER_E_INVALID, "path too long");
     int bfd = -1;
     if (open_base(dom, base, &bfd, swhy, sizeof(swhy)) != 0) return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
-    if (base_ok(s, bfd, base, smb, 1, swhy, sizeof(swhy)) != 0) {
-        close(bfd);
-        return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
-    }
     if (mkdirat(bfd, jname, 0700) != 0) {
         int er = errno;
         close(bfd);
@@ -1532,7 +1461,6 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
                               "restore_staging_dirs to a directory on its filesystem", base, r->mount);
         return resp_error(r->id, HELPER_E_FAILED, "restore staging %s: %s", path, fail);
     }
-    if (smb) log_info("helper: restore staging %s in an SMB-exported share (the helper's, 0700)", path);
     pthread_mutex_lock(&s->mu);
     staging_t *slot = NULL;
     for (size_t i = 0; i < STAGINGS_MAX && !slot; i++) if (!s->stages[i].used) slot = &s->stages[i];
@@ -1548,7 +1476,6 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
         snprintf(slot->base, sizeof(slot->base), "%s", base);
         snprintf(slot->job_name, sizeof(slot->job_name), "%s", jname);
         slot->file = kind;
-        slot->smb = smb;
         slot->base_fd = bfd;
         slot->job_fd = jfd;
         slot->base_dev = bs.st_dev;
@@ -1586,19 +1513,18 @@ static int rename_noreplace(int ofd, const char *on, int nfd, const char *nn)
 
 /*
  * Whether what was staged is still what the fds hold: the base at its path
- * is the pinned directory, the job directory inside it is the pinned one,
- * and the base is still the helper's 0700 (or, outside a share, the
- * daemon's). Planting a directory at the path, renaming the base away or
- * swapping the job directory all fail here. -1 with why.
+ * is the pinned directory and the job directory inside it is the pinned
+ * one. Planting a directory or a symlink at the path, renaming the base
+ * away or swapping the job directory all fail here, so the helper never
+ * renames anything it did not create. -1 with why.
  */
-static int stage_intact(const helper_server_t *s, const staging_t *x, char *why, size_t wsz)
+static int stage_intact(const staging_t *x, char *why, size_t wsz)
 {
-    struct stat ps, bs, js, es;
+    struct stat ps, js, es;
     if (lstat(x->base, &ps) != 0 || !S_ISDIR(ps.st_mode) || ps.st_dev != x->base_dev || ps.st_ino != x->base_ino) {
         snprintf(why, wsz, "restore staging %.300s was replaced or moved after it was staged; not swapped", x->base);
         return -1;
     }
-    if (fstat(x->base_fd, &bs) != 0 || base_ok(s, x->base_fd, x->base, x->smb, 0, why, wsz) != 0) return -1;
     if (fstatat(x->base_fd, x->job_name, &es, AT_SYMLINK_NOFOLLOW) != 0 || fstat(x->job_fd, &js) != 0 ||
         es.st_dev != x->job_dev || es.st_ino != x->job_ino || js.st_ino != x->job_ino || !S_ISDIR(es.st_mode)) {
         snprintf(why, wsz, "restore staging %.300s was replaced after it was staged; not swapped", x->path);
@@ -1653,7 +1579,7 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
         code = HELPER_E_BUSY;
         goto refuse;
     }
-    if (stage_intact(s, &st, why, sizeof(why)) != 0) { code = HELPER_E_DENIED; goto refuse; }
+    if (stage_intact(&st, why, sizeof(why)) != 0) { code = HELPER_E_DENIED; goto refuse; }
     if (st.file == 2 && (fstatat(src_fd, src_name, &sb, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(sb.st_mode))) {
         snprintf(why, sizeof(why), "restore staging %.300s/image is not a regular file; not swapped", st.path);
         code = HELPER_E_DENIED;
