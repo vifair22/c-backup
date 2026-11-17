@@ -270,7 +270,7 @@ host always has a way in.
 |---|---|---|
 | GET | `/repos` | List, by id; `limit` (default and maximum 1000) and `offset` |
 | POST | `/repos` | Register: `{path, label}`; `label` follows the snapshot label rule (at most 256 bytes of printable UTF-8) |
-| GET | `/repos/<id>` | One repository, the same object as each entry of the list. `degraded` is null, or why the repository refuses backups (too many packs missing at once; Manual section 17.6) |
+| GET | `/repos/<id>` | One repository, the same object as each entry of the list. `state` is `ok`, `degraded` or `unavailable`. `degraded` is null, or why the repository refuses backups (too many packs missing at once); `unavailable` is null, or why the repository is not there to work on (no marker, `packs/` unreadable or replaced, every pack missing), checked when asked. Manual section 17.6 |
 | POST | `/repos/<id>/repair` | `{"accept_missing":true}`: accept a degraded repository's missing packs as lost, marking their objects absent so the next backup stores them again. Without `accept_missing` a 400; 503 while a job holds the repository; 409 when the repository is unavailable (no marker, `packs/` unreadable or replaced with packs missing from it; every pack missing does not stop the repair). Answers `{packs_checked, packs_missing, packs_unknown, packs_dropped, objects_absent, packs_returned, objects_restored, degraded}`, where `packs_returned` counts dropped packs that were back and indexed again |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it. `{"removed":true,"id"}` |
 
@@ -334,9 +334,12 @@ Pack numbers have the same guarantee through `<repo>/pack-ids`, and the
 reindex result reports it as `pack_mark` and `pack_ids_repaired`.
 
 A repository is `{id, uuid, path, label, added_at, encryption,
-key_escrowed}`: `label` is `null` when none was given, `encryption` is
-`none`, `system` or `passphrase`, and `key_escrowed` is a boolean that is
-`false` while a system-managed key exists only on this host.
+key_escrowed, state, degraded, unavailable}`: `label` is `null` when none
+was given, `encryption` is `none`, `system` or `passphrase`, and
+`key_escrowed` is a boolean that is `false` while a system-managed key
+exists only on this host. `state` is `ok`, `degraded` or `unavailable`
+(unavailable winning), and `degraded` and `unavailable` are null or the
+reason (Manual section 17.6).
 
 Re-registering is a success rather than a 409 because it is how a moved
 repository re-links. A non-empty `label` that differs from the stored one is

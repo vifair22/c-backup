@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "pack_presence.h"
 
 #include "job_manager.h"
 #include "lock.h"
@@ -1237,9 +1238,16 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
      * snap_job_lock chose, for the whole of this call. */
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    status_t st = snap_job_needs_key(j->kind)
-                      ? repo_store_open_keyed(j->repo_path, NULL, &store)
-                      : repo_store_open(j->repo_path, NULL, &store);
+    /*
+     * Every kind refuses an unavailable repository before it opens it. A
+     * verify there used to report every object missing as data loss, and
+     * a reindex would have read the empty packs/ as every pack gone.
+     */
+    status_t st = pack_presence_require(j->db, j->repo_id);
+    if (st != OK) return st;
+    st = snap_job_needs_key(j->kind)
+             ? repo_store_open_keyed(j->repo_path, NULL, &store)
+             : repo_store_open(j->repo_path, NULL, &store);
     if (st != OK) return st;
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) { store_close(store); return st; }

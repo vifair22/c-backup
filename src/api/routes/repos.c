@@ -56,22 +56,38 @@ static const jcol_t k_repo_cols[] = {
     { "added_at", 4, JCOL_INT },
 };
 
-/* degraded is null, or why the repository takes no backups until an
- * operator repairs it (pack_presence.h, B150). */
-static int repo_row_add(cutils_json_elem_t *e, cutils_json_resp_t *r, char **row)
+/*
+ * degraded is null, or why the repository takes no backups until an
+ * operator repairs it (pack_presence.h, B150). unavailable is null, or why
+ * the repository is not there to work on - an empty mountpoint, an
+ * unmounted packs/ - checked live, because nothing else would say so: a
+ * repository that is not there is not degraded either, and showed as
+ * "degraded": null (NIT-37). state is the one word for both: "ok",
+ * "degraded" or "unavailable", unavailable winning.
+ */
+static int repo_row_add(cutils_db_t *db, cutils_json_elem_t *e, cutils_json_resp_t *r,
+                        char **row)
 {
     const char *enc = (row[5] && row[5][0]) ? row[5] : "none";
     const char *esc = (row[6] && row[6][0]) ? row[6] : "0";
     const char *deg = row[7] ? row[7] : "";
+    char why[PATH_MAX + 256] = "";
+    int avail = pack_presence_available(db, strtoll(row[0], NULL, 10), why, sizeof(why));
+    if (avail == 1) why[0] = '\0';
+    const char *state = avail != 1 ? "unavailable" : deg[0] ? "degraded" : "ok";
     if (e)
         return jrow_elem_add_row(e, k_repo_cols, JROW_N(k_repo_cols), row) != 0
             || jrow_elem_add(e, "encryption", JCOL_STR, enc) != 0
             || jrow_elem_add(e, "key_escrowed", JCOL_BOOL, esc) != 0
-            || jrow_elem_add(e, "degraded", JCOL_STR_NULL, deg) != 0;
+            || jrow_elem_add(e, "state", JCOL_STR, state) != 0
+            || jrow_elem_add(e, "degraded", JCOL_STR_NULL, deg) != 0
+            || jrow_elem_add(e, "unavailable", JCOL_STR_NULL, why) != 0;
     return jrow_resp_add_row(r, k_repo_cols, JROW_N(k_repo_cols), row) != 0
         || jrow_resp_add(r, "encryption", JCOL_STR, enc) != 0
         || jrow_resp_add(r, "key_escrowed", JCOL_BOOL, esc) != 0
-        || jrow_resp_add(r, "degraded", JCOL_STR_NULL, deg) != 0;
+        || jrow_resp_add(r, "state", JCOL_STR, state) != 0
+        || jrow_resp_add(r, "degraded", JCOL_STR_NULL, deg) != 0
+        || jrow_resp_add(r, "unavailable", JCOL_STR_NULL, why) != 0;
 }
 
 static api_response_t list_repos(const api_request_t *req, void *userdata)
@@ -127,7 +143,7 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
          * Prometheus is not where somebody finds out their key was never
          * written down.
          */
-        int bad = repo_row_add(&e, NULL, r->rows[i]) != 0;
+        int bad = repo_row_add(db, &e, NULL, r->rows[i]) != 0;
         /* Committing a partially built element would emit a row missing
          * fields the client requires; drop it and stop instead. */
         if (bad) break;
@@ -437,7 +453,7 @@ static api_response_t get_repo(const api_request_t *req, void *userdata)
      * spliced path and label in unescaped, so a path holding a quote or a
      * backslash produced a body no client could parse. */
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
-    int bad = json_resp_new(&resp) != 0 || repo_row_add(NULL, resp, r->rows[0]) != 0;
+    int bad = json_resp_new(&resp) != 0 || repo_row_add(db, NULL, resp, r->rows[0]) != 0;
     db_result_free(r);
     if (bad) return api_error(500, "out of memory");
     char *body = NULL; size_t blen = 0;

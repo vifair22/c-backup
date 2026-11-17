@@ -221,6 +221,19 @@ void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
                   title, title_sz, body, body_sz);
 }
 
+void job_alert_retitle_unavailable(char *title, size_t title_sz)
+{
+    /* "c-backup: <action> of <repo> failed" -> "... refused: repository
+     * unavailable"; the composed title always ends in " failed". */
+    size_t n = strlen(title);
+    static const char tail[] = " failed";
+    if (n >= sizeof(tail) - 1 && strcmp(title + n - (sizeof(tail) - 1), tail) == 0) {
+        title[n - (sizeof(tail) - 1)] = '\0';
+        size_t m = strlen(title);
+        snprintf(title + m, title_sz - m, " refused: repository unavailable");
+    }
+}
+
 void job_warning_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
                          const char *action, const char *warning,
                          char *title, size_t title_sz, char *body, size_t body_sz)
@@ -792,6 +805,9 @@ static void *worker_main(void *arg)
             job_alert_compose(jm->db, slot.repo_id, slot.job_id, slot.action,
                               detail, title, sizeof(title), body, sizeof(body));
             pthread_mutex_unlock(&jm->db_mu);
+            /* A repository that is not there is not a failed job: nothing
+             * was tried, and the title says what to look at (NIT-37). */
+            if (st == ERR_UNAVAILABLE) job_alert_retitle_unavailable(title, sizeof(title));
             /* c-utils logs a send only when it is rejected, and then only
              * the title, so the log never said an alert went out or what
              * it said. Nor does it say when it drops one for want of
