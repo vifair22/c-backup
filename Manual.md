@@ -3879,6 +3879,23 @@ c-backup unit restore 1 5120 --define --name immich-test \
 | Definition | re-applied with the same name (and for a VM the same UUID) | the name changed; bind sources, volumes, rootfs and mount entries rewritten under `DIR`; a VM's `<uuid>` removed (libvirt makes a new one), MACs regenerated unless `--keep-macs`, disks pointing at the new images, excluded passthrough disks dropped and listed |
 | Never | a delete: old data is moved aside, never removed | |
 
+**A copy never touches the original's data.** A restore under a new name
+makes a second container beside the original, and it mounts only what the
+restore wrote under `DIR`: every bind source and every volume, named or
+anonymous (an image's `VOLUME`), becomes a bind of its restored copy at
+`DIR/<the path the backup read it from>` (a volume's is under Docker's
+`volumes/` directory). Host facilities the backup never treats as data (the
+Docker socket, `/etc/localtime`, anything under `/dev`, `/proc`, `/sys`,
+`/run`, `/etc`, `/boot`) stay as they are. Anything else refuses the
+restore before the container is created, with `refused, nothing created`
+naming it: a mount with no restored copy (an excluded bind, a remote
+volume's), a volume still named, `VolumesFrom`, or a `DIR` inside one of
+the original's mounts. The helper checks the container Docker actually
+created too, before anything starts it: one that mounts a volume that
+existed before the restore, or a bind outside `DIR`, is removed and the
+restore refused. A compose copy is created with `--no-start`, checked the
+same way, and only then started.
+
 **Every refusal comes first.** Before anything is written or stopped, the
 daemon builds the definition and has the helper check it (`unit.define` in
 check mode): the policy's `allow_define`, a privileged definition without
@@ -3986,9 +4003,11 @@ with the Compose Manager plugin; the image does not carry one. The recorded
 compose files and `.env` are written back to the project directory (under
 the target root for a new name), any file they replace moved aside, and a
 `cbackup-override.yaml` pins each service's image by digest (tag fallback
-with a warning) and, under a new name, rewrites the services' binds and sets
+with a warning) and, under a new name, replaces every bind and volume of
+each service with its restored copy under the target root (above) and sets
 container names `<project>-<service>`. Then `docker compose -p <project> up
--d --no-build`, with `--no-start` unless `--start`. Replacing a project needs
+-d --no-build`, with `--no-start` unless `--start` (under a new name always,
+then `docker compose start` once the copy is checked). Replacing a project needs
 its containers stopped; they are renamed aside rather than removed.
 
 **LXC.** In place (`--replace`), the container is stopped, its rootfs and

@@ -17,7 +17,7 @@ static int under(const char *path, const char *root)
     return n && strncmp(path, root, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 
-static int is_system(const char *src)
+int mount_is_system(const char *src)
 {
     static const char *const sys[] = { "/dev", "/proc", "/sys", "/run", "/var/run", "/etc", "/boot" };
     for (size_t i = 0; i < sizeof(sys) / sizeof(sys[0]); i++)
@@ -281,7 +281,7 @@ status_t mount_classify(const mount_cfg_t *c, const char *type, const char *sour
     if (strcmp(type, "volume") == 0) {
         if (driver && *driver && strcmp(driver, "local") != 0) { set(out, MOUNT_EXCLUDED, "remote-volume"); return OK; }
     } else if (strcmp(type, "bind") == 0) {
-        if (is_system(source)) { set(out, MOUNT_EXCLUDED, "system"); return OK; }
+        if (mount_is_system(source)) { set(out, MOUNT_EXCLUDED, "system"); return OK; }
         int inc = 0;
         for (size_t i = 0; i < c->n_include && !inc; i++) inc = under(source, c->include_roots[i]);
         if (!inc) { set(out, MOUNT_EXCLUDED, "outside-include-roots"); return OK; }

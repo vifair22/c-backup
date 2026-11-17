@@ -56,6 +56,10 @@ void mount_default_mountinfo(const host_tools_t *t, char *buf, size_t sz);
 status_t mount_unbind(const char *mountinfo, const char *mnt_root, const char *path,
                       char *out, size_t sz, int *loop);
 
+/* A host facility rather than data (/dev, /proc, /sys, /run, /etc, /boot,
+ * the Docker socket): never backed up, and never a unit's own data. */
+int mount_is_system(const char *src);
+
 /*
  * type is Docker's Mounts[].Type ("bind", "volume", "tmpfs", ...), driver
  * a volume's driver ("local" or a plugin). A bind source that does not

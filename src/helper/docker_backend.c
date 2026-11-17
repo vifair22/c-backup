@@ -1540,6 +1540,170 @@ static status_t move_aside(struct sp_ctx *c, const char *path, char *moved, size
     return OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* A copy under a new name (B188)                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A restore under a new name makes a second container beside the
+ * original, from the original's recorded definition. Copied as recorded,
+ * that definition names the original's volumes and bind paths, so the copy
+ * mounted the original's live data: a restore meant as a look at old data
+ * wrote to, and served, production. The daemon rewrites every mount onto
+ * the restored copy under target_root; the helper is the one that creates
+ * the container, so it holds the rule itself and refuses anything else
+ * before creating: every bind under target_root (and inside nothing the
+ * original mounts), no volume by name, no VolumesFrom, and every mount of
+ * the original replaced by one. Host facilities (mount_is_system: the
+ * Docker socket, /etc/localtime) are not the original's data and stay.
+ * After the create, and before any start, the container Docker actually
+ * made is checked again, so a mount the definition does not show (an
+ * image's VOLUME, a compose service nobody recorded) cannot reach a
+ * volume that existed before the restore either.
+ */
+
+/* "src:dst[:opts]" into its source and destination. */
+static void bind_parts(const char *v, char *src, size_t ssz, char *dst, size_t dsz)
+{
+    size_t sl = strcspn(v, ":");
+    snprintf(src, ssz, "%.*s", (int)sl, v);
+    const char *d = v[sl] ? v + sl + 1 : "";
+    snprintf(dst, dsz, "%.*s", (int)strcspn(d, ":"), d);
+}
+
+/* Why the copy may not bind src, or NULL. orig: the original's Mounts. */
+static const char *copy_source_bad(const cJSON *orig, const char *src, const char *troot, char *why, size_t wsz)
+{
+    if (mount_is_system(src)) return NULL;
+    if (!under_root(src, troot)) {
+        snprintf(why, wsz, "%.300s, which is not under the target root %.300s", src, troot);
+        return why;
+    }
+    const cJSON *m;
+    cJSON_ArrayForEach(m, orig) {
+        const char *os = jstr(m, "Source");
+        if (os[0] == '/' && !mount_is_system(os) && under_root(src, os)) {
+            snprintf(why, wsz, "%.300s, which is inside %.300s that the original mounts", src, os);
+            return why;
+        }
+    }
+    return NULL;
+}
+
+/* The copy's HostConfig against the rule above; orig is the original's
+ * Mounts as recorded. */
+static status_t copy_definition_ok(const cJSON *orig, const cJSON *hc, const char *troot)
+{
+    char why[700], src[PATH_MAX], dst[PATH_MAX];
+    if (troot[0] != '/' || !helper_path_clean(troot))
+        return set_error(ERR_INVALID, "docker: a container under a new name needs a target_root: its data "
+                         "is the restored copy there, never the original's");
+    if (cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(hc, "VolumesFrom")) > 0)
+        return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would take VolumesFrom, "
+                         "another container's volumes");
+    const cJSON *b;
+    cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Binds")) {
+        const char *v = cJSON_GetStringValue(b);
+        if (!v) continue;
+        bind_parts(v, src, sizeof(src), dst, sizeof(dst));
+        if (src[0] != '/')
+            return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would mount the "
+                             "volume %.200s, not a restored copy", src);
+        if (copy_source_bad(orig, src, troot, why, sizeof(why)))
+            return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would bind %s", why);
+    }
+    cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Mounts")) {
+        const char *type = jstr(b, "Type"), *ms = jstr(b, "Source");
+        if (strcmp(type, "volume") == 0)
+            return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would mount the "
+                             "volume %.200s, not a restored copy", ms[0] ? ms : "(anonymous)");
+        if (strcmp(type, "bind") == 0 && copy_source_bad(orig, ms, troot, why, sizeof(why)))
+            return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would bind %s", why);
+    }
+    /* Every mount of the original replaced: one left out keeps whatever
+     * Docker gives it (a fresh volume, nothing) and the copy runs without
+     * the data the restore wrote for it. */
+    const cJSON *m;
+    cJSON_ArrayForEach(m, orig) {
+        const char *type = jstr(m, "Type"), *os = jstr(m, "Source"), *od = jstr(m, "Destination");
+        if (!od[0] || (strcmp(type, "bind") != 0 && strcmp(type, "volume") != 0)) continue;
+        if (strcmp(type, "bind") == 0 && mount_is_system(os)) continue;
+        int covered = 0;
+        cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Binds")) {
+            const char *v = cJSON_GetStringValue(b);
+            if (!v) continue;
+            bind_parts(v, src, sizeof(src), dst, sizeof(dst));
+            covered |= strcmp(dst, od) == 0;
+        }
+        cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Mounts"))
+            covered |= strcmp(jstr(b, "Target"), od) == 0;
+        if (!covered)
+            return set_error(ERR_INVALID, "docker: refused, nothing created: the original's %s at %.200s "
+                             "has no restored copy in the definition", type, od);
+    }
+    return OK;
+}
+
+/* The names of the volumes that exist now. */
+static status_t volumes_now(struct sp_ctx *c, cJSON **out)
+{
+    *out = NULL;
+    status_t st = docker_call(&c->api, "GET", "/volumes", NULL, 0, NULL, out);
+    if (st == OK && !cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(*out, "Volumes"))) {
+        cJSON_Delete(*out);
+        *out = NULL;
+        st = set_error(ERR_IO, "docker: the volume list has no Volumes");
+    }
+    return st;
+}
+
+static int volume_listed(const cJSON *vols, const char *name)
+{
+    const cJSON *v;
+    cJSON_ArrayForEach(v, cJSON_GetObjectItemCaseSensitive(vols, "Volumes"))
+        if (strcmp(jstr(v, "Name"), name) == 0) return 1;
+    return 0;
+}
+
+/*
+ * The created copy, before anything starts it: a volume that existed
+ * before the restore, or a bind outside target_root or inside the
+ * original's, and it is removed (its volumes are not: one could be
+ * someone's) and the restore refused.
+ */
+static status_t copy_created_ok(struct sp_ctx *c, const char *cid, const cJSON *before,
+                                const cJSON *orig, const char *troot)
+{
+    char path[160], why[700] = "";
+    snprintf(path, sizeof(path), "/containers/%.79s/json", cid);
+    cJSON *in = NULL;
+    status_t st = docker_call(&c->api, "GET", path, NULL, 0, NULL, &in);
+    const cJSON *m;
+    cJSON_ArrayForEach(m, cJSON_GetObjectItemCaseSensitive(in, "Mounts")) {
+        if (st != OK || why[0]) break;
+        const char *type = jstr(m, "Type"), *name = jstr(m, "Name"), *ms = jstr(m, "Source");
+        if (strcmp(type, "volume") == 0 && name[0] && volume_listed(before, name)) {
+            snprintf(why, sizeof(why), "it mounts the volume %.200s at %.200s, which existed before the "
+                     "restore", name, jstr(m, "Destination"));
+        } else if (strcmp(type, "bind") == 0) {
+            char w2[600];
+            if (copy_source_bad(orig, ms, troot, w2, sizeof(w2))) snprintf(why, sizeof(why), "it binds %s", w2);
+        }
+    }
+    cJSON_Delete(in);
+    if (st != OK) return st;
+    if (!why[0]) return OK;
+    snprintf(path, sizeof(path), "/containers/%.79s", cid);
+    if (docker_call(&c->api, "DELETE", path, NULL, 0, NULL, NULL) != OK) {
+        char rw[300];
+        snprintf(rw, sizeof(rw), "%.290s", err_msg());
+        err_clear();
+        return set_error(ERR_INVALID, "docker: refused the copy %.79s: %s; it was never started, and "
+                         "removing it failed (%s): remove it by hand", cid, why, rw);
+    }
+    return set_error(ERR_INVALID, "docker: refused the copy: %s; it was removed before it ever started", why);
+}
+
 /*
  * The definition, as the daemon read it from the snapshot:
  *   {"inspect": {...}, "image": {"RepoDigests": [...], "RepoTags": [...]},
@@ -1550,6 +1714,50 @@ static status_t move_aside(struct sp_ctx *c, const char *path, char *moved, size
  */
 static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
                                const helper_policy_t *pol, cJSON **result);
+
+/* Every refusal of a standalone define that needs no Docker call: the
+ * name, privileged settings and binds, and for a copy the B188 rule. */
+static status_t solo_refusals(const struct sp_ctx *c, const cJSON *d, const helper_policy_t *pol,
+                              char *name, size_t nsz, int *copy)
+{
+    const cJSON *in = cJSON_GetObjectItemCaseSensitive(d, "inspect");
+    const cJSON *cfg = cJSON_GetObjectItemCaseSensitive(in, "Config");
+    const cJSON *hc = cJSON_GetObjectItemCaseSensitive(in, "HostConfig");
+    if (!cJSON_IsObject(in) || !cJSON_IsObject(cfg))
+        return set_error(ERR_INVALID, "docker: the definition has no inspect with a Config");
+    const char *want = jstr(d, "name");
+    const char *orig = jstr(in, "Name");
+    if (orig[0] == '/') orig++;
+    snprintf(name, nsz, "%s", want[0] ? want : orig);
+    *copy = strcmp(name, orig) != 0;
+    if (!name_ok(name)) return set_error(ERR_INVALID, "docker: bad container name %.100s", name);
+    const char *why = privileged_reason(hc);
+    if (!why) why = bind_outside(c, hc);
+    if (why && !pol->allow_privileged_define)
+        return set_error(ERR_INVALID, "docker: the definition sets %s, and allow_privileged_define is off", why);
+    /* A copy beside the original mounts nothing of the original's (B188). */
+    if (*copy) return copy_definition_ok(cJSON_GetObjectItemCaseSensitive(in, "Mounts"), hc, jstr(d, "target_root"));
+    return OK;
+}
+
+static status_t compose_refusals(const char *unit_id, const cJSON *d, const helper_policy_t *pol,
+                                 char *project, size_t psz, char *wd, size_t wsz, int *new_name);
+
+/* unit.define's check (B167, B188): the refusals of a real define, with no
+ * change made anywhere. */
+static status_t d_define_check(sp_ctx_t *c, const char *unit_id, const char *definition,
+                               const helper_policy_t *pol)
+{
+    cJSON *d = cJSON_Parse(definition);
+    if (!cJSON_IsObject(d)) { cJSON_Delete(d); return set_error(ERR_INVALID, "docker: the definition is not JSON"); }
+    char name[PATH_MAX], wd[PATH_MAX];
+    int copy = 0;
+    status_t st = strncmp(unit_id, "compose:", 8) == 0
+                ? compose_refusals(unit_id, d, pol, name, 72, wd, sizeof(wd), &copy)
+                : solo_refusals(c, d, pol, name, 160, &copy);
+    cJSON_Delete(d);
+    return st;
+}
 
 static status_t d_define(sp_ctx_t *c, const char *unit_id, const char *definition,
                          const helper_policy_t *pol, cJSON **result)
@@ -1566,23 +1774,15 @@ static status_t d_define(sp_ctx_t *c, const char *unit_id, const char *definitio
     const cJSON *in = cJSON_GetObjectItemCaseSensitive(d, "inspect");
     const cJSON *cfg = cJSON_GetObjectItemCaseSensitive(in, "Config");
     const cJSON *hc = cJSON_GetObjectItemCaseSensitive(in, "HostConfig");
-    if (!cJSON_IsObject(in) || !cJSON_IsObject(cfg)) {
-        cJSON_Delete(d);
-        return set_error(ERR_INVALID, "docker: the definition has no inspect with a Config");
-    }
     int replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "replace"));
     int pin = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "pin_digest"));
     int start = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "start"));
     char name[160];
-    const char *want = jstr(d, "name");
-    const char *orig = jstr(in, "Name");
-    snprintf(name, sizeof(name), "%s", want[0] ? want : (orig[0] == '/' ? orig + 1 : orig));
-    status_t st = OK;
-    if (!name_ok(name)) st = set_error(ERR_INVALID, "docker: bad container name %.100s", name);
-    const char *why = st == OK ? privileged_reason(hc) : NULL;
-    if (st == OK && !why) why = bind_outside(c, hc);
-    if (st == OK && why && !pol->allow_privileged_define)
-        st = set_error(ERR_INVALID, "docker: the definition sets %s, and allow_privileged_define is off", why);
+    int copy = 0;
+    status_t st = solo_refusals(c, d, pol, name, sizeof(name), &copy);
+    if (st != OK) { cJSON_Delete(d); return st; }
+    const cJSON *orig_mounts = cJSON_GetObjectItemCaseSensitive(in, "Mounts");
+    const char *troot = jstr(d, "target_root");
 
     /* A name in use is refused unless replacing; the one replaced must be
      * stopped, and is renamed aside, never removed. */
@@ -1648,13 +1848,16 @@ static status_t d_define(sp_ctx_t *c, const char *unit_id, const char *definitio
         cJSON_Delete(b);
         if (!body) st = set_error(ERR_NOMEM, "docker: create body");
     }
-    cJSON *made = NULL;
+    cJSON *made = NULL, *vols_before = NULL;
+    if (st == OK && copy) st = volumes_now(c, &vols_before);
     if (st == OK) {
         snprintf(path, sizeof(path), "/containers/create?name=%s", name);
         st = docker_call(&c->api, "POST", path, body, 0, NULL, &made);
     }
     free(body);
     const char *id = jstr(made, "Id");
+    if (st == OK && copy) st = copy_created_ok(c, id, vols_before, orig_mounts, troot);
+    cJSON_Delete(vols_before);
 
     /* The Unraid template, so Unraid's UI knows the container. */
     const char *tmpl = jstr(d, "template");
@@ -1739,29 +1942,112 @@ static status_t write_host_file(struct sp_ctx *c, const char *path, const char *
  *    "name": "", "target_root": "", "replace": false, "start": false,
  *    "pin_digest": false}
  */
-__attribute__((noinline))
-static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
-                               const helper_policy_t *pol, cJSON **result)
+/* Every mount any of the original project's services had, as recorded. */
+static cJSON *compose_orig_mounts(const cJSON *cp)
+{
+    cJSON *all = cJSON_CreateArray();
+    const cJSON *svc, *m;
+    cJSON_ArrayForEach(svc, cJSON_GetObjectItemCaseSensitive(cp, "services"))
+        cJSON_ArrayForEach(m, cJSON_GetObjectItemCaseSensitive(svc, "mounts"))
+            if (all) cJSON_AddItemToArray(all, cJSON_Duplicate(m, 1));
+    return all;
+}
+
+/* A compose copy (B188): each service's volumes are binds under the target
+ * root, inside nothing the original mounts, and replace every mount the
+ * service had (compose merges volumes by container path). */
+static status_t compose_copy_ok(const cJSON *cp, const char *troot)
+{
+    cJSON *orig = compose_orig_mounts(cp);
+    if (!orig) return set_error(ERR_NOMEM, "docker: define");
+    char why[700], src[PATH_MAX], dst[PATH_MAX];
+    status_t st = OK;
+    const cJSON *svc;
+    cJSON_ArrayForEach(svc, cJSON_GetObjectItemCaseSensitive(cp, "services")) {
+        if (st != OK) break;
+        const char *sname = jstr(svc, "service");
+        const cJSON *v, *m;
+        cJSON_ArrayForEach(v, cJSON_GetObjectItemCaseSensitive(svc, "volumes")) {
+            const char *b = cJSON_GetStringValue(v);
+            if (!b) continue;
+            bind_parts(b, src, sizeof(src), dst, sizeof(dst));
+            if (src[0] != '/') {
+                st = set_error(ERR_INVALID, "docker: refused, nothing created: service %.64s of the copy would "
+                               "mount the volume %.200s, not a restored copy", sname, src);
+                break;
+            }
+            if (copy_source_bad(orig, src, troot, why, sizeof(why))) {
+                st = set_error(ERR_INVALID, "docker: refused, nothing created: service %.64s of the copy "
+                               "would bind %s", sname, why);
+                break;
+            }
+        }
+        cJSON_ArrayForEach(m, cJSON_GetObjectItemCaseSensitive(svc, "mounts")) {
+            if (st != OK) break;
+            const char *type = jstr(m, "Type"), *os = jstr(m, "Source"), *od = jstr(m, "Destination");
+            if (!od[0] || (strcmp(type, "bind") != 0 && strcmp(type, "volume") != 0)) continue;
+            if (strcmp(type, "bind") == 0 && mount_is_system(os)) continue;
+            int covered = 0;
+            cJSON_ArrayForEach(v, cJSON_GetObjectItemCaseSensitive(svc, "volumes")) {
+                const char *b = cJSON_GetStringValue(v);
+                if (!b) continue;
+                bind_parts(b, src, sizeof(src), dst, sizeof(dst));
+                covered |= strcmp(dst, od) == 0;
+            }
+            if (!covered)
+                st = set_error(ERR_INVALID, "docker: refused, nothing created: the original %.64s's %s at "
+                               "%.200s has no restored copy in the definition", sname, type, od);
+        }
+    }
+    cJSON_Delete(orig);
+    return st;
+}
+
+/* The copy's containers as compose created them, each checked by
+ * copy_created_ok; on a refusal every one of them is removed, none having
+ * started. */
+static status_t compose_copy_created_ok(struct sp_ctx *c, const char *pkey, const cJSON *before,
+                                        const cJSON *cp, const char *troot)
+{
+    member_t m[MEMBERS_MAX];
+    size_t n = 0;
+    status_t st = members_of(c, pkey, m, &n);
+    if (st == ERR_NOT_FOUND) { err_clear(); return OK; }
+    if (st != OK) return st;
+    cJSON *orig = compose_orig_mounts(cp);
+    if (!orig) return set_error(ERR_NOMEM, "docker: define");
+    for (size_t i = 0; st == OK && i < n; i++) st = copy_created_ok(c, m[i].id, before, orig, troot);
+    cJSON_Delete(orig);
+    if (st == OK) return OK;
+    char why[800];
+    snprintf(why, sizeof(why), "%.790s", err_msg());
+    err_clear();
+    for (size_t i = 0; i < n; i++) {
+        char path[160];
+        snprintf(path, sizeof(path), "/containers/%.79s", m[i].id);
+        if (docker_call(&c->api, "DELETE", path, NULL, 0, NULL, NULL) != OK) err_clear();
+    }
+    return set_error(st, "%s (every container of project %s removed)", why, pkey + 8);
+}
+
+/* Every refusal of a compose define that needs no Docker call. */
+static status_t compose_refusals(const char *unit_id, const cJSON *d, const helper_policy_t *pol,
+                                 char *project, size_t psz, char *wd, size_t wsz, int *new_name)
 {
     const cJSON *cp = cJSON_GetObjectItemCaseSensitive(d, "compose");
     const cJSON *files = cJSON_GetObjectItemCaseSensitive(cp, "files");
     const char *wd0 = jstr(cp, "working_dir");
     const char *want = jstr(d, "name");
     const char *troot = jstr(d, "target_root");
-    int replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "replace"));
-    int start = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "start"));
-    int pin = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "pin_digest"));
     const char *orig = unit_id + 8;
-    char project[72];
-    snprintf(project, sizeof(project), "%s", want[0] ? want : orig);
-    int new_name = strcmp(project, orig) != 0;
+    snprintf(project, psz, "%s", want[0] ? want : orig);
+    *new_name = strcmp(project, orig) != 0;
     if (!project_ok(project)) return set_error(ERR_INVALID, "docker: bad compose project name %.80s", project);
     if (!cJSON_IsObject(files) || !files->child) return set_error(ERR_INVALID, "docker: the definition has no compose files");
     if (wd0[0] != '/' || !helper_path_clean(wd0)) return set_error(ERR_INVALID, "docker: bad compose working_dir");
-    if (new_name && (troot[0] != '/' || !helper_path_clean(troot)))
+    if (*new_name && (troot[0] != '/' || !helper_path_clean(troot)))
         return set_error(ERR_INVALID, "docker: a compose project under a new name needs a target_root");
-    char wd[PATH_MAX];
-    snprintf(wd, sizeof(wd), "%s%s", new_name ? troot : "", wd0);
+    snprintf(wd, wsz, "%s%s", *new_name ? troot : "", wd0);
     int inc = 0;
     for (size_t i = 0; i < pol->n_include && !inc; i++) inc = under_root(wd, pol->include_roots[i]);
     if (!inc && !pol->allow_privileged_define)
@@ -1779,6 +2065,24 @@ static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
                 return set_error(ERR_INVALID, "docker: a bind of %.200s outside the include roots", src);
         }
     }
+    return *new_name ? compose_copy_ok(cp, troot) : OK;
+}
+
+__attribute__((noinline))
+static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
+                               const helper_policy_t *pol, cJSON **result)
+{
+    const cJSON *cp = cJSON_GetObjectItemCaseSensitive(d, "compose");
+    const cJSON *files = cJSON_GetObjectItemCaseSensitive(cp, "files");
+    const char *troot = jstr(d, "target_root");
+    int replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "replace"));
+    int start = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "start"));
+    int pin = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "pin_digest"));
+    char project[72], wd[PATH_MAX];
+    int new_name = 0;
+    status_t rst = compose_refusals(unit_id, d, pol, project, sizeof(project), wd, sizeof(wd), &new_name);
+    if (rst != OK) return rst;
+    const cJSON *svc;
 
     /* The project's own containers: refused unless replacing, stopped, and
      * renamed aside rather than left for compose to remove. */
@@ -1880,17 +2184,28 @@ static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
         argv[na++] = "up";
         argv[na++] = "-d";
         argv[na++] = "--no-build";
-        if (!start) argv[na++] = "--no-start";
+        /* A copy is checked as created before anything starts it (B188). */
+        if (!start || new_name) argv[na++] = "--no-start";
         argv[na] = NULL;
+        cJSON *vols_before = NULL;
+        if (new_name) st = volumes_now(c, &vols_before);
         char *out = NULL;
-        st = host_run(&c->tools, 0, argv, 1800, &out, 65536);
-        free(out);
-        if (st != OK) {
+        if (st == OK && (st = host_run(&c->tools, 0, argv, 1800, &out, 65536)) != OK) {
             char why[512];
             snprintf(why, sizeof(why), "%.500s", err_msg());
             err_clear();
             st = set_error(ERR_IO, "docker: compose up failed (is the compose plugin installed on the host, "
                            "as [host] docker names it?): %s", why);
+        }
+        free(out);
+        out = NULL;
+        if (st == OK && new_name) st = compose_copy_created_ok(c, pkey, vols_before, cp, troot);
+        cJSON_Delete(vols_before);
+        if (st == OK && new_name && start) {
+            argv[na - 4] = "start";
+            argv[na - 3] = NULL;
+            st = host_run(&c->tools, 0, argv, 1800, &out, 65536);
+            free(out);
         }
     }
     free(fpaths);
@@ -1931,6 +2246,7 @@ status_t docker_backend_init(const helper_policy_t *pol, helper_backend_t *out)
         .blob_data = d_blob_data, .unit_state = d_unit_state, .set_running = d_set_running,
         .mount_root = d_mount_root, .hook_start = d_hook_start, .hook_poll = d_hook_poll,
         .hook_kill = d_hook_kill, .hook_free = d_hook_free, .define = d_define,
+        .define_check = d_define_check,
     };
     return OK;
 }

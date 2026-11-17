@@ -255,12 +255,21 @@ chmod 0750 "$HRUN"; chgrp "$DUID" "$HRUN"
 # ---- the private Docker engine and a local registry ----------------------
 
 log "dind: starting a private dockerd"
-mkdir -p "$WORK/docker" "$WORK/docker-exec" /etc/docker
-# vfs: the data root is on this container's own overlay, where overlay2
-# cannot nest, and the test images are a few MiB. No volume, so nothing of
-# this engine outlives the container. No bridge, no iptables: the sibling
-# has no network and every test container runs with network none.
-dockerd --data-root "$WORK/docker" --exec-root "$WORK/docker-exec" \
+mkdir -p "$WORK/docker-exec" /etc/docker
+# vfs: overlay2 cannot nest on this container's own overlay, and the test
+# images are a few MiB. The data root is on the pool the way Unraid's is,
+# /var/lib/docker a bind of /mnt/cache/system/docker, so a volume is in the
+# pool's snapshot domain (the helper reads it through the pool, B170) and
+# can be captured and restored in place; the pool goes with the container,
+# so nothing of this engine outlives it. A data root that is not already a
+# mount point dockerd bind-mounts onto itself, which would put a mount
+# boundary between the volumes and the rest of the pool that Unraid does
+# not have. No bridge, no iptables: the sibling has no network and every
+# test container runs with network none.
+DOCKER_ROOT=/var/lib/docker
+mkdir -p "$CACHE/system/docker" "$DOCKER_ROOT"
+mount --bind "$CACHE/system/docker" "$DOCKER_ROOT" || die "cannot bind the docker data root"
+dockerd --data-root "$DOCKER_ROOT" --exec-root "$WORK/docker-exec" \
     --storage-driver vfs --bridge none --iptables=false --ip6tables=false \
     -H unix:///var/run/docker.sock >"$WORK/dockerd.log" 2>&1 &
 DOCKERD_PID=$!
@@ -338,6 +347,17 @@ head -c 2097152 /dev/urandom > "$SOLO/dump-source.bin"
 printf 'id,value\n1,alpha\n2,beta\n' > "$PROJ/db/table.csv"
 docker run -d --name cbk-uat-solo --network none -v "$SOLO:/data" "$IMG" \
     sh -c 'trap "exit 0" TERM; while :; do sleep 1; done' >/dev/null || die "cannot start cbk-uat-solo"
+# A container whose data is in volumes, one named and one anonymous (the
+# image's VOLUME, as most images declare): a restore has to reach both.
+VOLS_NAMED=cbk-uat-vols-data
+docker volume create "$VOLS_NAMED" >/dev/null || die "cannot create $VOLS_NAMED"
+docker run -d --name cbk-uat-vols --network none -v "$VOLS_NAMED:/named" -v /anon "$IMG" \
+    sh -c 'echo named-v1 > /named/f; head -c 262144 /dev/urandom > /named/r.bin; mkdir -p /named/d;
+           echo deep > /named/d/x; echo anon-v1 > /anon/f; head -c 131072 /dev/urandom > /anon/r.bin; sync;
+           trap "exit 0" TERM; while :; do sleep 1; done' >/dev/null || die "cannot start cbk-uat-vols"
+VOLS_ANON=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/anon"}}{{.Name}}{{end}}{{end}}' cbk-uat-vols)
+[ -n "$VOLS_ANON" ] || die "cbk-uat-vols has no anonymous volume"
+for _ in $(seq 1 50); do docker exec cbk-uat-vols cat /anon/f >/dev/null 2>&1 && break; sleep 0.2; done
 cat > "$PROJ/compose.yaml" <<EOF
 services:
   app:
@@ -352,10 +372,16 @@ services:
     command: ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"]
     volumes:
       - ./db:/data
+      - dbvol:/vol
+volumes:
+  dbvol:
 EOF
 printf 'CBK_UAT=1\n' > "$PROJ/.env"
 docker compose -p cbk-uat-proj --project-directory "$PROJ" -f "$PROJ/compose.yaml" up -d --no-build >"$WORK/compose-up.log" 2>&1 ||
     { cat "$WORK/compose-up.log"; die "compose up failed"; }
+PROJ_VOL=cbk-uat-proj_dbvol
+docker exec cbk-uat-proj-db-1 sh -c 'echo vol-v1 > /vol/f; head -c 65536 /dev/urandom > /vol/r.bin; sync' ||
+    die "cannot fill $PROJ_VOL"
 
 # ---- helper and daemon ---------------------------------------------------
 
@@ -599,6 +625,53 @@ leftovers "after the solo new-name define"
 }
 test_solo
 
+# ---- Docker: data in volumes (B188) ---------------------------------------
+
+# Every file's path and hash under a volume's mount point, as one sum.
+vol_sum() {
+    local mp
+    mp=$(docker volume inspect -f '{{.Mountpoint}}' "$1" 2>/dev/null) || { echo "no volume $1"; return; }
+    (cd "$mp" && find . -printf '%p %y %m\n' | sort && find . -type f -exec sha256sum {} + | sort) | sha256sum
+}
+# The containers, running or not, that mount a volume.
+vol_users() { docker ps -a --filter "volume=$1" --format '{{.Names}}' | sort | tr '\n' ' ' | sed 's/ $//'; }
+
+test_vols() {
+log "docker: cbk-uat-vols, a named and an anonymous volume"
+OUT_B=$(cb unit backup 1 --provider docker cbk-uat-vols 2>&1)
+job_ok "unit backup of a container with volumes" "$OUT_B"
+contains "the volumes are in the pool's domain: crash consistency" '"consistency":"crash"' "$OUT_B"
+SNAP_VOLS=$(snap_of "$OUT_B")
+leftovers "after the volumes backup"
+have_snap "the volumes backup" "$SNAP_VOLS" || return 0
+
+log "docker: volumes, a restore under a new name never touches the original's (B188)"
+SUM_N=$(vol_sum "$VOLS_NAMED")
+SUM_A=$(vol_sum "$VOLS_ANON")
+TRV="$APPS/restored-vols"
+OUT_N=$(cb unit restore 1 "$SNAP_VOLS" --define --name cbk-uat-vols2 --target-root "$TRV" --start 2>&1)
+job_ok "new-name restore of a container with volumes" "$OUT_N"
+check "the copy runs" running "$(docker inspect -f '{{.State.Status}}' cbk-uat-vols2 2>/dev/null)"
+MOUNTS=$(docker inspect -f '{{range .Mounts}}{{.Type}}:{{.Name}}:{{.Source}}:{{.Destination}} {{end}}' cbk-uat-vols2 2>/dev/null)
+lacks "the copy mounts no volume at all" "volume:" "$MOUNTS"
+lacks "the copy does not mount the original's named volume" ":$VOLS_NAMED:" "$MOUNTS"
+lacks "the copy does not mount the original's anonymous volume" ":$VOLS_ANON:" "$MOUNTS"
+contains "the copy binds the named volume's restored copy" "bind::$TRV$DOCKER_ROOT/volumes/$VOLS_NAMED/_data:/named" "$MOUNTS"
+contains "the copy binds the anonymous volume's restored copy" "bind::$TRV$DOCKER_ROOT/volumes/$VOLS_ANON/_data:/anon" "$MOUNTS"
+check "the copy has the named volume's data" named-v1 "$(docker exec cbk-uat-vols2 cat /named/f 2>/dev/null)"
+check "the copy has the anonymous volume's data" anon-v1 "$(docker exec cbk-uat-vols2 cat /anon/f 2>/dev/null)"
+check "only the original mounts the named volume" cbk-uat-vols "$(vol_users "$VOLS_NAMED")"
+check "only the original mounts the anonymous volume" cbk-uat-vols "$(vol_users "$VOLS_ANON")"
+# The copy writes; the original's bytes do not move.
+docker exec cbk-uat-vols2 sh -c 'echo copy-wrote > /named/f; echo copy-wrote > /anon/f; rm -f /named/r.bin; sync' >/dev/null 2>&1
+check "the original's named volume is byte-identical" "$SUM_N" "$(vol_sum "$VOLS_NAMED")"
+check "the original's anonymous volume is byte-identical" "$SUM_A" "$(vol_sum "$VOLS_ANON")"
+check "the original still reads its own data" named-v1 "$(docker exec cbk-uat-vols cat /named/f 2>/dev/null)"
+docker rm -f cbk-uat-vols2 >/dev/null 2>&1
+leftovers "after the volumes new-name define"
+}
+test_vols
+
 # ---- Docker: a compose project -------------------------------------------
 
 test_project() {
@@ -634,6 +707,22 @@ check "app is the snapshot's again" "$MAN_APP" "$(manifest "$PROJ/app")"
 check "db is the snapshot's again" "$MAN_DB" "$(manifest "$PROJ/db")"
 check "the project's services run again" "running running" "$(docker inspect -f '{{.State.Status}}' cbk-uat-proj-app-1 cbk-uat-proj-db-1 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
 leftovers "after the project define"
+
+log "docker: compose project under a new name never touches the original's (B188)"
+SUM_P=$(vol_sum "$PROJ_VOL")
+TRP="$APPS/restored-proj"
+OUT_N=$(cb unit restore 1 "$SNAP_PROJ" --define --name cbk-uat-projcopy --target-root "$TRP" --start 2>&1)
+job_ok "new-name restore of the project" "$OUT_N"
+check "the copy's services run" "running running" "$(docker inspect -f '{{.State.Status}}' cbk-uat-projcopy-app cbk-uat-projcopy-db 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+OUTSIDE=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' cbk-uat-projcopy-app cbk-uat-projcopy-db 2>/dev/null | grep -v '^$' | grep -cv "^$TRP/")
+check "every mount of the copy is under its target root" 0 "$OUTSIDE"
+check "the copy has the volume's data" vol-v1 "$(docker exec cbk-uat-projcopy-db cat /vol/f 2>/dev/null)"
+check "only the original mounts the project's volume" cbk-uat-proj-db-1 "$(vol_users "$PROJ_VOL")"
+docker exec cbk-uat-projcopy-db sh -c 'echo copy-wrote > /vol/f; echo copy-wrote > /data/table.csv; sync' >/dev/null 2>&1
+check "the original's volume is byte-identical" "$SUM_P" "$(vol_sum "$PROJ_VOL")"
+check "the original's bind is untouched" "$MAN_DB" "$(manifest "$PROJ/db")"
+docker rm -f cbk-uat-projcopy-app cbk-uat-projcopy-db >/dev/null 2>&1
+leftovers "after the project new-name define"
 }
 test_project
 
