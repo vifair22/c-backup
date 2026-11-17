@@ -189,6 +189,11 @@ unix socket and TCP listener are bound, so `systemctl start` (and
 `enable --now`) returns when the CLI can connect, and a unit ordered
 `After=c-backupd.service` starts no earlier. Startup applies any schema
 migrations first; the unit allows ten minutes for that (`TimeoutStartSec`).
+It then repairs whatever a crash or power cut left in the index, before the
+API binds, and logs one `start-up:` line per step with the time it took
+(`start-up: pack presence: 0.055 s`), so a slow start names the step that
+was slow. Each step is linear in the size of the index; at 300,000 objects
+they take well under a second together.
 On stop it reports `deactivating` while running jobs are cancelled. The
 daemon implements the notification protocol itself and does not link
 libsystemd; run outside systemd it simply skips it.
@@ -1441,10 +1446,10 @@ What a run counts:
 
 | Count | Meaning |
 |---|---|
-| `checked` | Everything examined: each indexed object, and each regular-file entry that names no content. Always the sum of the five counts below |
+| `checked` | Everything examined: each indexed object, each regular-file entry that names no content, and each pack whose own header, tails or CRC table were damaged or whose headers were restored. Always the sum of the five counts below |
 | `ok` | Intact. Never includes a failure, so a run with anything missing or unrecoverable shows `ok` below `checked` |
-| `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` or `--dry-run` |
-| `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
+| `repaired` | Corrected from parity and written back, or moved by the index to an intact duplicate copy. Always 0 with `--no-repair` or `--dry-run` |
+| `recoverable` | Readable only through parity and still wrong on disk, or damaged beyond parity with an intact duplicate copy elsewhere in the repository. Run a repairing verify |
 | `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
 | `missing` | Indexed but absent, including every object in a pack file that has gone, and every index entry of a regular file that names no content at all. **Data loss** |
 
@@ -1929,8 +1934,8 @@ the repository).
 | `cbackup_stalest_verify_repo_info` | gauge | Always 1; its `repo_id` and `label` labels name the repository the verify age measures |
 | `cbackup_repos_never_verified` | gauge | Repositories with no completed verify |
 | `cbackup_verify_unrecoverable_objects` | gauge | Objects the last verify found unrecoverable or missing |
-| `cbackup_verify_repaired_objects` | gauge | Objects the last verify repaired and wrote back |
-| `cbackup_verify_recoverable_objects` | gauge | Objects the last verify found damaged but did not write back |
+| `cbackup_verify_repaired_objects` | gauge | Objects, and packs' own structures, the last verify repaired |
+| `cbackup_verify_recoverable_objects` | gauge | Objects, and packs' own structures, the last verify found damaged but did not repair |
 | `cbackup_verify_affected_files` | gauge | Distinct paths referencing lost objects |
 | `cbackup_alerts_sent_total` | counter | Push notifications Pushover accepted |
 | `cbackup_alerts_failed_total` | counter | Push notifications given up on: rejected by Pushover (bad token or user key), or expired after 24 hours of failed retries |

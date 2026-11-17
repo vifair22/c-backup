@@ -42,12 +42,21 @@ copy of its own.
 ```sh
 make            # c-backupd and c-backup into build/bins/
 make debug      # -Og -g
-make asan       # -fsanitize=address
+make asan       # -fsanitize=address,undefined (make tsan: -fsanitize=thread)
 make analyze    # stack-usage (64 KiB limit), gcc -fanalyzer, cppcheck
 make test       # unit suites, then the HTTP and CLI end-to-end suites
 make coverage   # gcovr; fails under 80% whole-repo, or the src/store floor
 make bench      # microbenchmarks and browse-path benchmarks
+make test-asan  # every unit and fault suite plus the end-to-end suites, ASan + UBSan
+make test-tsan  # the same under TSan
 ```
+
+The sanitizer runs keep going past a failing suite and name every one at the
+end. Reports are written to `build/<asan|tsan>/reports/<suite>/` as well,
+and a suite that leaves one there fails even if it passed, since a race or a
+leak at a daemon's exit does not change its status. `SAN_ONLY='test_db_txn
+test_api_e2e.sh'` runs just those. The sanitizer runtime is linked
+statically when the toolchain ships the archive, and dynamically otherwise.
 
 ### Test scratch
 

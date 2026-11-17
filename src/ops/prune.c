@@ -22,14 +22,19 @@
  * resurrection by the next reindex, after gc swept what only it used.
  * OK when there was no record.
  */
-static status_t unlink_record(const char *repo_path, int64_t snap_id)
+/* removed, when not NULL, says whether there was a record to unlink. */
+static status_t unlink_record(const char *repo_path, int64_t snap_id, int *removed)
 {
+    if (removed) *removed = 0;
     char dir[PATH_MAX], path[PATH_MAX];
     if (snprintf(dir, sizeof(dir), "%s/snapshots", repo_path) >= (int)sizeof(dir) ||
         snprintf(path, sizeof(path), "%s/%lld", dir, (long long)snap_id) >= (int)sizeof(path))
         return set_error(ERR_INVALID, "prune: path too long");
-    if (unlink(path) != 0 && errno != ENOENT)
+    if (unlink(path) == 0) {
+        if (removed) *removed = 1;
+    } else if (errno != ENOENT) {
         return set_error_errno(ERR_IO, "prune: cannot unlink %s", path);
+    }
     if (snapshot_fsync_dir(dir) != 0)
         return set_error_errno(ERR_IO, "prune: cannot sync %s", dir);
     return OK;
@@ -181,7 +186,7 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* The marker goes only once the record is gone for good: until then it
      * is what lets the next start, or a reindex, finish this prune rather
      * than mistake the record for a snapshot the index lost (B148). */
-    if (unlink_record(store_root(store), snap_id) != OK) {
+    if (unlink_record(store_root(store), snap_id, NULL) != OK) {
         log_warn("prune: snapshot %lld removed from the index; its record stays until "
                  "the next start finishes the removal: %s", (long long)snap_id, err_msg());
         err_clear();
@@ -236,11 +241,18 @@ status_t prune_finish_pending(cutils_db_t *db, int64_t repo_id, unsigned *out_fi
                                 (const char *[]){ rid, snap, NULL }, &q) == 0 &&
                      q && q->nrows > 0;
         db_result_free(q);
+        /*
+         * No record left means the prune had finished and only the
+         * marker's removal was lost: it is not durable until the WAL
+         * syncs, and a power cut within that window rolls it back
+         * (NIT-35). Nothing was interrupted, so nothing is reported.
+         */
+        int removed = 0;
         if (listed) {
             log_warn("prune: snapshot %s of repo %s was pruned and is listed again; "
                      "keeping it", snap, rid);
         } else {
-            st = unlink_record(path, snap_id);
+            st = unlink_record(path, snap_id, &removed);
             if (st != OK) break;
         }
         if (db_execute_non_query(db, "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
@@ -248,10 +260,13 @@ status_t prune_finish_pending(cutils_db_t *db, int64_t repo_id, unsigned *out_fi
             st = set_error(ERR_IO, "prune: cannot clear the marker of snapshot %s", snap);
             break;
         }
-        if (!listed) {
+        if (!listed && removed) {
             log_warn("prune: finished the removal of snapshot %s of repo %s, which a crash "
                      "or power cut interrupted", snap, rid);
             if (out_finished) (*out_finished)++;
+        } else if (!listed) {
+            log_debug("prune: cleared the stale marker of snapshot %s of repo %s, whose "
+                      "removal had completed", snap, rid);
         }
     }
     db_result_free(r);

@@ -430,6 +430,59 @@ static void test_failed_commit_cleans_up_without_a_restart(void **state)
     free(cap.entries);
 }
 
+/* ------------------------------------------------------------------ */
+/* 5. The start-up cleanup stays linear in the index                   */
+/* ------------------------------------------------------------------ */
+
+static double mono_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/*
+ * PERF-GC: the UPDATE's subquery named objects.repo_id, so SQLite reran it
+ * per objects row, a scan of pack_objects each time. 14k objects made every
+ * daemon start take 40 s, which is what UAT saw as a 40 s gc. At this size
+ * that shape takes about 10 s; the uncorrelated one, milliseconds. The bound
+ * is loose enough for a sanitizer build on a loaded runner.
+ */
+#define LINEAR_ROWS "10000"
+static void test_drop_unannounced_is_linear(void **state)
+{
+    (void)state;
+    const char *p[] = { repo_s, NULL };
+    /* One announced pack holding every row, and an unannounced pack 999
+     * holding a tenth of them under hashes of their own. */
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO packs (repo_id, id, filename, size, sealed_at, version)"
+        " VALUES (?1, 1, 'pack-0000000001.dat', 0, 0, 1)", p, NULL), 0);
+    assert_int_equal(db_execute_non_query(db,
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < " LINEAR_ROWS ")"
+        " INSERT INTO pack_objects (repo_id, hash, pack_id, offset, comp_size, orig_size,"
+        "                           entry_index)"
+        " SELECT ?1, printf('%064d', i), CASE WHEN i % 10 = 0 THEN 999 ELSE 1 END, i, 1, 1, i"
+        " FROM n", p, NULL), 0);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size, location, type)"
+        " SELECT repo_id, hash, 1, 1, 1, CAST(pack_id AS TEXT), 0 FROM pack_objects"
+        " WHERE repo_id = ?1", p, NULL), 0);
+
+    for (int whole = 0; whole <= 1; whole++) {
+        double t0 = mono_s();
+        assert_int_equal(store_index_drop_unannounced(db, whole ? 0 : repo_id), OK);
+        double took = mono_s() - t0;
+        if (took > 3.0) fail_msg("drop_unannounced took %.1f s over " LINEAR_ROWS " rows", took);
+    }
+    assert_int_equal(count("SELECT COUNT(*) FROM objects WHERE repo_id = ?"
+                           " AND location = 'staged'"), 1000);
+    assert_int_equal(count("SELECT COUNT(*) FROM objects WHERE repo_id = ?"
+                           " AND location = '1'"), 9000);
+    assert_int_equal(count("SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?"
+                           " AND pack_id = 999"), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -441,6 +494,7 @@ int main(void)
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_failed_commit_cleans_up_without_a_restart,
                                         setup, teardown),
+        cmocka_unit_test_setup_teardown(test_drop_unannounced_is_linear, setup, teardown),
     };
     return cmocka_run_group_tests_name("store_index", tests, NULL, NULL);
 }

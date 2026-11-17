@@ -3581,20 +3581,22 @@ static status_t entry_decode(store_t *store, pack_dat_entry_hdr_t *ehdr,
  * whole read a restore would do. An encrypted copy with no key loaded
  * cannot be proven.
  */
-static int gc_copy_proven(store_t *store, uint32_t pnum, const pack_idx_disk_entry_t *e)
+static int copy_proven_at(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                          uint32_t pnum, uint64_t offset, uint32_t entry_index,
+                          uint64_t comp_size, const char *what)
 {
     pack_cache_entry_t where;
     memset(&where, 0, sizeof(where));
-    memcpy(where.hash, e->hash, OBJECT_HASH_SIZE);
-    where.dat_offset   = e->dat_offset;
+    memcpy(where.hash, hash, OBJECT_HASH_SIZE);
+    where.dat_offset   = offset;
     where.pack_num     = pnum;
     where.pack_version = PACK_VERSION;
-    where.entry_index  = e->entry_index;
-    where.comp_size    = e->compressed_size;
+    where.entry_index  = entry_index;
+    where.comp_size    = comp_size;
     pack_dat_entry_hdr_t h = { 0 };
     uint8_t *buf = NULL;
     int damaged = 0;
-    if (entry_read_at(store, e->hash, &where, "pack-gc", &h, &buf, &damaged) != OK ||
+    if (entry_read_at(store, hash, &where, what, &h, &buf, &damaged) != OK ||
         damaged) {
         free(buf);
         err_clear();
@@ -3602,12 +3604,25 @@ static int gc_copy_proven(store_t *store, uint32_t pnum, const pack_idx_disk_ent
     }
     void *data = NULL;
     size_t sz = 0;
-    if (entry_decode(store, &h, e->hash, buf, &data, &sz, "pack-gc") != OK) {
+    if (entry_decode(store, &h, hash, buf, &data, &sz, what) != OK) {
         err_clear();
         return 0;
     }
     free(data);
     return 1;
+}
+
+static int gc_copy_proven(store_t *store, uint32_t pnum, const pack_idx_disk_entry_t *e)
+{
+    return copy_proven_at(store, e->hash, pnum, e->dat_offset, e->entry_index,
+                          e->compressed_size, "pack-gc");
+}
+
+int pack_entry_proven(store_t *store, uint32_t pnum, const pack_entry_info_t *e)
+{
+    if (!store || !e) return 0;
+    return copy_proven_at(store, e->hash, pnum, e->entry_offset, e->entry_index,
+                          e->compressed_size, "verify");
 }
 
 /*
@@ -3632,6 +3647,9 @@ static int ref_cmp(const void *key, const void *entry);
 
 static int gc_entry_live(gc_live_t *g, uint32_t pnum, const pack_idx_disk_entry_t *e)
 {
+    /* bsearch's base is declared nonnull, and with nothing referenced it is
+     * NULL: undefined even at a count of zero (UBSan). */
+    if (g->cnt == 0) return 0;
     const uint8_t *hit = bsearch(e->hash, g->refs, g->cnt, OBJECT_HASH_SIZE, ref_cmp);
     if (!hit) return 0;
     if (!g->locs) return 1;
