@@ -63,3 +63,18 @@ status_t mount_unbind(const char *mountinfo, const char *mnt_root, const char *p
  */
 status_t mount_classify(const mount_cfg_t *c, const char *type, const char *source,
                         const char *driver, mount_class_t *out);
+
+/*
+ * The helper's own layout, checked before it starts (B186). Refused
+ * (ERR_INVALID, the message naming the fix and the cleanup): any of paths
+ * mounted more than once, in the helper's table (self_mi) or the host's
+ * (host_mi, may be NULL or the same); and, when in_container, any of paths
+ * that is a mount point of its own under a shared mount, the bind under an
+ * rshared bind that doubles the host's stacked mounts at every start. A
+ * shared mount in a container is only warned about.
+ */
+status_t mount_layout_check(const char *self_mi, const char *host_mi, int in_container,
+                            const char *const *paths, size_t np);
+
+/* 1 when this process's mount namespace is not pid 1's. */
+int mount_in_container(void);
