@@ -27,7 +27,7 @@ docker run -d --name c-backup-helper --restart unless-stopped \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /mnt/cache:/mnt/cache:rshared \
-  -v /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock \
+  -v /var/run/libvirt:/var/run/libvirt \
   --label net.cbackup.role=helper \
   --entrypoint /usr/local/bin/c-backup-helper \
   c-backup:latest --policy /etc/c-backup-helper.ini
@@ -66,7 +66,7 @@ services:
       - /run/c-backup-helper:/run/c-backup-helper
       - /var/run/docker.sock:/var/run/docker.sock
       - /mnt/cache:/mnt/cache:rshared
-      - /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock
+      - /var/run/libvirt:/var/run/libvirt
   c-backupd:
     image: c-backup:latest
     depends_on: [c-backup-helper]
@@ -86,10 +86,15 @@ services:
 
 Notes that matter:
 
-- **libvirt's socket is mounted into the helper.** The helper connects to
-  `qemu:///system` from its own mount namespace, so without
-  `/var/run/libvirt/libvirt-sock` it cannot reach libvirtd and the libvirt
-  provider reports itself unavailable. Leave it out only on a host with no
+- **libvirt's socket directory is mounted into the helper.** The helper
+  connects to `qemu:///system` from its own mount namespace, so without
+  `/var/run/libvirt` it cannot reach libvirtd and the libvirt provider
+  reports itself unavailable. Bind the directory, not the
+  `libvirt-sock` file: a file bind pins the inode the socket had when the
+  container started, and libvirtd makes a new one at every restart
+  (stopping and starting Unraid's VM service), after which every VM job
+  fails `Connection refused` until the helper container is recreated. The
+  helper detects a stale file bind and says so in its log (B179). Leave it out only on a host with no
   VMs to back up (`[libvirt] enabled = 0`). `nbd_dir`
   (`/run/c-backup-helper/nbd` here) sits under the helper's socket
   directory, so the daemon's existing mount of `/run/c-backup-helper`

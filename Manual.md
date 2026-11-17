@@ -2857,7 +2857,7 @@ docker run -d --name c-backup-helper --restart unless-stopped \
   -v /mnt/cache/system/c-backup-helper:/mnt/cache/system/c-backup-helper \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock \
+  -v /var/run/libvirt:/var/run/libvirt \
   -v /mnt/cache:/mnt/cache:rshared \
   --entrypoint /usr/local/bin/c-backup-helper \
   <registry>/vifair22/c-backup:<tag> --policy /etc/c-backup-helper.ini
@@ -2923,11 +2923,11 @@ What each piece is for:
 | `--privileged --pid=host` | helper | `nsenter -t 1` runs the host's own `zfs`, `btrfs`, `lxc-*`, `qemu-nbd` and `docker`, so there is no version skew between the image's tools and the host's kernel modules (FS1 and FS2 run ZFS 2.4.4; Debian's userland is older). It also reads host paths through `/proc/1/root` |
 | `--network=none` | helper | no listener of any kind; its only interface is the socket |
 | `/var/run/docker.sock` | helper | inspect, pause, unpause, exec for hooks, create and pull for restore |
-| `/var/run/libvirt/libvirt-sock` | helper (FS1) | the libvirt API, read-write (the read-only socket cannot start a backup) |
+| `/var/run/libvirt` | helper (FS1) | the libvirt API, read-write (the read-only socket cannot start a backup). Bind the **directory**, never the `libvirt-sock` file: a file bind keeps the socket's old inode, so after any libvirtd restart (stopping and starting the VM service) every VM job fails `Connection refused` until the helper container is recreated. The helper logs that case by name (22.2.4) |
 | `/mnt/cache:/mnt/cache:rshared` | helper | restore staging and swap act on host paths in the helper's own namespace; add one per pool that holds unit data |
 | `/mnt/cache/system/c-backup-helper` | helper | its state directory: `holds.json`, every hold it has taken, released at its next start after a crash. On a pool, never the RAM rootfs |
 | `/boot/config/c-backup-helper.ini` | helper | the policy, on the flash, root-owned (22.2.3) |
-| `/run/c-backup-helper` | both | the helper's socket (created `0660` with group `daemon_gid`, 22.2.3), and `nbd/` where VM exports and `qemu-nbd` sockets appear; the same path on both sides. The directory is `0750 root:990`, so the daemon can enter it after it drops to uid 990 |
+| `/run/c-backup-helper` | both | the helper's socket (created `0660` with group `daemon_gid`, 22.2.3), and `nbd/` (the policy's `nbd_dir`), where VM exports and `qemu-nbd` sockets are made; the same path on both sides. The helper makes `nbd/` itself when it is missing, at start and before each VM read, `0750` with group `daemon_gid`, so the daemon can enter it after it drops to uid 990; nothing needs creating by hand. A `qemu-nbd` that cannot serve a disk fails the unit at once with its own error |
 | `/mnt/cache:ro,rslave` | daemon | reads container data from capture snapshots and VM images; `rslave` lets the `.zfs` snapshot automounts and new btrfs snapshots appear inside the daemon's view |
 | `/mnt/user/domains:ro` | daemon (FS1) | domain XML names some images by their `/mnt/user/domains` path; on FS1 that is a symlink to `/mnt/cache/domains`, and binding it makes both spellings resolve |
 | `/etc/libvirt/qemu/nvram`, `/etc/libvirt/qemu/swtpm/tpm-states`, read-only | daemon (FS1) | the TPM state of a VM is read by the daemon at its real path |
@@ -3091,14 +3091,36 @@ the requests in flight. While the helper is away the daemon retries with a
 backoff from 0.5 s doubling to 30 s; when it answers, the daemon says hello
 again (logging a policy whose digest changed) and enables the providers the
 helper offers, with no daemon restart. While connected it checks every 15 s,
-and a request that finds the helper gone marks the link down at once.
+and a request that finds the helper gone marks the link down at once. A
+unit job that starts while the link is down tries to connect once itself
+before failing, so the first job after a helper restart runs rather than
+waiting out the backoff.
 
 - A unit job that needs the helper while it is away **fails and alerts**,
   scheduled or not, with the socket path and the reason in the error, the
   journal and the push alert. It is never skipped quietly.
-- A job in flight when the helper restarts fails cleanly: no snapshot is
-  written, and the helper's start-up sweep releases whatever the old
+- A job in flight when the helper restarts never completes silently. If
+  the unit still needs the helper (a capture being taken, a configuration
+  blob or a dump still to read, an export the new helper's start-up sweep
+  tears down), it fails and no snapshot is written. If every part was
+  already read to its end (exports and `qemu-nbd` outlive the helper; raw
+  disks are read by the daemon itself), the snapshot is written and is
+  whole, and the unit carries the warning `the session could not be ended
+  ... Snapshot N is whole`, which the job's warning and alert repeat. A
+  part is never cut short and committed: a read error, an NBD connection
+  closed mid-read, or an image changed under an offline read each fail the
+  unit. Either way the helper's start-up sweep releases whatever the old
   process held (pauses, freezes, snapshots, exports).
+- The start-up sweep runs beside the helper's requests, not before them: a
+  release can block (a guest thaw waits up to 30 s behind a freeze still
+  pending in libvirt), and the helper answers meanwhile. A release that
+  fails is never counted as done: the hold stays journalled and the
+  watchdog retries it, 1 s after the failure and then doubling to a minute
+  apart, logging each failure. A guest freeze is dropped only on a thaw
+  libvirt confirmed, a guest agent saying nothing is frozen, or a domain
+  that is shut off or gone. While any release keeps failing, every unit
+  job ends with the warning `the helper cannot release <kind> on <unit>
+  after N tries (<reason>)`, which alerts.
 - If libvirt cannot be reached when the helper starts (libvirtd down, or
   its socket not mounted), the sweep logs it and **keeps** every hold that
   names a domain, a guest freeze included, for the next sweep, which its
@@ -3238,8 +3260,13 @@ sequenceDiagram
 **Freeze.** When the domain's guest-agent channel is connected
 (`org.qemu.guest_agent.0`, `state='connected'`), the guest is frozen for the
 backup start alone and thawed in every path out of it, including failures;
-the data is read afterwards from the frozen instant, so the freeze lasts
-well under a second (`freeze_ms` in `unit.json`). Two watchdogs bound it
+the data is read afterwards from the frozen instant. Only the call that
+starts the backup job (and with it the checkpoint and the export, one QEMU
+transaction) runs frozen: the XML is built beforehand, and an incremental
+libvirt refuses is cleaned up thawed and started again under a new freeze.
+What remains is libvirt's own work in that call, mostly creating the
+scratch images, so a slow `scratch_dir` lengthens the freeze; put it on
+fast storage. `freeze_ms` in `unit.json` records the window. Two watchdogs bound it
 whatever the helper is doing: the libvirt provider's at the policy's
 `freeze_timeout_s`, and the helper's own over every hold at `max_pause_s`.
 Both time holds in milliseconds, so a 1 s bound never fires early. Frozen:

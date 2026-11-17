@@ -1240,7 +1240,7 @@ VMs and appdata it protects.
 ```sh
 docker run -d --name c-backupd-fs1 --restart unless-stopped \
   -v /mnt/cache/appdata/c-backupd:/var/lib/c-backupd \
-  -v /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock \
+  -v /var/run/libvirt:/var/run/libvirt \
   -v /run/c-backupd:/run/c-backupd \
   -v /mnt/cache/domains:/mnt/cache/domains:ro \
   -v /mnt/user/domains:/mnt/user/domains:ro \
