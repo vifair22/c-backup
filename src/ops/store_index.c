@@ -487,23 +487,30 @@ status_t store_index_put_staged(cutils_db_t *db, int64_t repo_id,
  * an objects row naming a pack for any other reason is left to reindex as
  * before. Runs before store_index_drop_staged, which then drops the rows
  * this returns to 'staged'.
+ *
+ * The subquery must stay uncorrelated (PERF-GC). It used to name
+ * objects.repo_id, which made SQLite rerun it for every objects row: a scan
+ * of the repository's pack_objects per object, quadratic, 40 s of daemon
+ * start-up at 14k objects and hours at the 622k-file scale. Matching on
+ * (repo_id, location) as a row value lets it run once into a lookup table,
+ * and the outer filter on repo_id narrows the scan to one repository.
  */
 status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    const char *only = repo_id > 0 ? " AND po.repo_id = ?" : "";
-    char upd[512], del[256];
+    char upd[640], del[256];
     snprintf(upd, sizeof(upd),
-             "UPDATE objects SET location = 'staged' WHERE location IN"
-             " (SELECT DISTINCT CAST(po.pack_id AS TEXT) FROM pack_objects po"
-             "   WHERE po.repo_id = objects.repo_id%s AND NOT EXISTS"
-             "   (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id AND p.id = po.pack_id))",
-             only);
+             "UPDATE objects SET location = 'staged' WHERE%s (repo_id, location) IN"
+             " (SELECT DISTINCT po.repo_id, CAST(po.pack_id AS TEXT) FROM pack_objects po"
+             "   WHERE NOT EXISTS"
+             "   (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id AND p.id = po.pack_id)%s)",
+             repo_id > 0 ? " repo_id = ?1 AND" : "",
+             repo_id > 0 ? " AND po.repo_id = ?1" : "");
     snprintf(del, sizeof(del),
              "DELETE FROM pack_objects AS po WHERE NOT EXISTS"
              " (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id AND p.id = po.pack_id)%s",
-             only);
+             repo_id > 0 ? " AND po.repo_id = ?" : "");
     const char *p1[] = { repo, NULL };
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "cannot drop unannounced pack rows");
     if (db_execute_non_query(db, upd, repo_id > 0 ? p1 : NULL, NULL) != 0 ||
