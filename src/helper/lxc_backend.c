@@ -633,7 +633,8 @@ status_t lxc_backend_init(const helper_policy_t *pol, helper_backend_t *out)
     for (size_t i = 0; i < pol->n_include && i < MOUNT_ROOTS_MAX; i++) c->mounts.include_roots[c->mounts.n_include++] = pol->include_roots[i];
     snprintf(c->mounts.user_root, sizeof(c->mounts.user_root), "%s", pol->user_root);
     snprintf(c->mounts.mnt_root, sizeof(c->mounts.mnt_root), "%s", pol->mnt_root);
-    mount_default_mountinfo(&c->tools, c->mounts.mountinfo, sizeof(c->mounts.mountinfo));
+    if (pol->mountinfo[0]) snprintf(c->mounts.mountinfo, sizeof(c->mounts.mountinfo), "%s", pol->mountinfo);
+    else mount_default_mountinfo(&c->tools, c->mounts.mountinfo, sizeof(c->mounts.mountinfo));
     *out = (helper_backend_t){
         .name = "lxc", .ops = &k_lxc_ops, .ctx = c,
         .blob_data = x_blob_data, .unit_state = x_unit_state, .set_running = x_set_running,

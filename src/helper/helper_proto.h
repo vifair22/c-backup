@@ -121,6 +121,9 @@ typedef struct {
     /* restore.stage */
     char        mount[HELPER_PATH_MAX + 1];
     int64_t     job;
+    /* Where the backup found the mount's bytes (unit.json's source), ""
+     * when the daemon sent none; checked against where it is now (B178). */
+    char        real[HELPER_PATH_MAX + 1];
     /* unit.define: the definition, still JSON text, parsed by the backend */
     char       *definition;
 } helper_req_t;

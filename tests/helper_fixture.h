@@ -137,6 +137,7 @@ static inline void hf_units(sp_ctx_t *fk)
     };
     fake_disk_add(fk, "u1", "vda", 4 * 1048576, runs, 2, FAKE_ALLOC_EXACT);
     fake_tree_add(fk, "u1", "vol", HF_SNAP, HF_MOUNT);
+    fake_tree_set_source(fk, "u1", "vol", HF_MOUNT);
     fake_unit_add(fk, "prod", "prod-db", SP_STATE_RUNNING, 0);
     fake_blob_add(fk, "prod", "x", ".cbackup-unit/config/x", "secret", 6);
 }

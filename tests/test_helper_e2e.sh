@@ -65,7 +65,7 @@ cat > "$WORK/units.json" <<EOF
  {"id":"a","name":"cbk-uat-a","state":"running","caps":["quiesce","snapshot"],
   "blobs":[{"id":"domain.xml","path":".cbackup-unit/config/domain.xml","text":"<domain>a</domain>"}],
   "disks":[{"id":"vda","size":4194304,"runs":[{"off":0,"len":1048576,"kind":"data","seed":3}]}],
-  "trees":[{"id":"vol","read_root":"$WORK/snap","path":"$WORK/pool/app/a"}]},
+  "trees":[{"id":"vol","read_root":"$WORK/snap","path":"$WORK/pool/app/a","source":"$WORK/pool/app/a"}]},
  {"id":"c","name":"cbk-uat-c","state":"running","caps":["quiesce"],
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}]},
  {"id":"p","name":"prod-db","state":"running",

@@ -46,10 +46,19 @@ typedef struct {
     size_t       n_chg;
 } fdisk_t;
 
+/*
+ * A tree's three paths, which a real provider keeps apart (B178): path is
+ * where it is recorded (as a container binds it), read_root where a
+ * capture reads it (the snapshot's copy), source where its bytes live on
+ * the host (the item's source: read live by a fallback, staged beside and
+ * swapped by an in-place restore). source defaults to read_root, the data
+ * the fake stands in with, so a fallback read finds it.
+ */
 typedef struct {
     char  id[SP_ITEM_ID_MAX];
     char *read_root;
     char *path;
+    char *source;     /* NULL: read_root */
 } ftree_t;
 
 typedef struct {
@@ -165,7 +174,7 @@ static void funit_clear(funit_t *u)
     if (!u) return;
     for (size_t i = 0; i < u->nb; i++) { free(u->blobs[i].path); free(u->blobs[i].data); }
     for (size_t i = 0; i < u->nd; i++) { free(u->disks[i].runs); free(u->disks[i].chg); }
-    for (size_t i = 0; i < u->nt; i++) { free(u->trees[i].read_root); free(u->trees[i].path); }
+    for (size_t i = 0; i < u->nt; i++) { free(u->trees[i].read_root); free(u->trees[i].path); free(u->trees[i].source); }
     free(u->blobs); free(u->disks); free(u->trees); free(u->name);
     memset(u, 0, sizeof(*u));
 }
@@ -207,7 +216,11 @@ static status_t funit_copy(const funit_t *in, funit_t *out)
         out->trees[i] = in->trees[i];
         out->trees[i].read_root = strdup(in->trees[i].read_root);
         out->trees[i].path = strdup(in->trees[i].path);
-        if (!out->trees[i].read_root || !out->trees[i].path) { out->nt++; goto oom; }
+        out->trees[i].source = in->trees[i].source ? strdup(in->trees[i].source) : NULL;
+        if (!out->trees[i].read_root || !out->trees[i].path || (in->trees[i].source && !out->trees[i].source)) {
+            out->nt++;
+            goto oom;
+        }
     }
     return OK;
 oom:
@@ -452,6 +465,26 @@ status_t fake_tree_add(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
     return st;
 }
 
+status_t fake_tree_set_source(sp_ctx_t *ctx, const char *unit_id, const char *item_id, const char *source)
+{
+    if (!source || source[0] != '/') return set_error(ERR_INVALID, "fake: a tree's source is an absolute path");
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    status_t st = set_error(ERR_NOT_FOUND, "fake: no tree %s in %s", item_id, unit_id);
+    for (size_t i = 0; u && i < u->nt; i++) {
+        if (strcmp(u->trees[i].id, item_id) != 0) continue;
+        char *c = strdup(source);
+        if (!c) { st = set_error(ERR_NOMEM, "fake: tree"); break; }
+        free(u->trees[i].source);
+        u->trees[i].source = c;
+        err_clear();
+        st = OK;
+        break;
+    }
+    pthread_mutex_unlock(&ctx->mu);
+    return st;
+}
+
 /* ------------------------------------------------------------------ */
 /* Holds and artefacts                                                 */
 /* ------------------------------------------------------------------ */
@@ -655,6 +688,8 @@ static status_t load_unit(sp_ctx_t *ctx, const cJSON *ju)
         const char *tid = jstr(t, "id"), *rr = jstr(t, "read_root"), *path = jstr(t, "path");
         if (!tid || !rr || !path) return set_error(ERR_INVALID, "fake spec: tree needs id, read_root, path");
         st = fake_tree_add(ctx, id, tid, rr, path);
+        const char *src = jstr(t, "source");
+        if (st == OK && src) st = fake_tree_set_source(ctx, id, tid, src);
     }
     return st;
 }
@@ -862,7 +897,7 @@ static status_t f_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
             it->kind = SP_ITEM_TREE;
             it->caps = u->caps & SP_CAP_SNAPSHOT;
             if (!(it->tree_path = strdup(u->trees[i].path)) ||
-                !(it->source = strdup(u->trees[i].read_root)))
+                !(it->source = strdup(u->trees[i].source ? u->trees[i].source : u->trees[i].read_root)))
                 st = set_error(ERR_NOMEM, "fake");
         }
     }
