@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "prune.h"
+#include "sync_latch.h"
 #include "db_txn.h"
 #include "repo.h"
 #include "repo_tags.h"
@@ -37,7 +38,7 @@ static status_t unlink_record(const char *repo_path, int64_t snap_id, int *remov
     } else if (errno != ENOENT) {
         return set_error_errno(ERR_IO, "prune: cannot unlink %s", path);
     }
-    if (snapshot_fsync_dir(dir) != 0)
+    if (snapshot_fsync_dir(repo_path, dir) != 0)
         return set_error_errno(ERR_IO, "prune: cannot sync %s", dir);
     return OK;
 }
@@ -78,6 +79,10 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
                            int64_t snap_id, int checked, int force,
                            prune_info_t *info)
 {
+    /* A prune deletes on the strength of a durable commit, which a latched
+     * daemon cannot make (sync_latch.h). */
+    status_t lst = sync_latch_repo_check(store_root(store), "prune");
+    if (lst != OK) return lst;
     char repo[32], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
@@ -232,6 +237,8 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
 status_t prune_finish_pending(cutils_db_t *db, int64_t repo_id, unsigned *out_finished)
 {
     if (out_finished) *out_finished = 0;
+    status_t lst = sync_latch_check("prune");
+    if (lst != OK) return lst;
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     const char *p1[] = { repo, NULL };
@@ -253,7 +260,9 @@ status_t prune_finish_pending(cutils_db_t *db, int64_t repo_id, unsigned *out_fi
         int64_t snap_id = strtoll(snap, NULL, 10);
         char dir[PATH_MAX];
         struct stat sb;
-        /* An offline repository keeps its marker for the next start. */
+        /* An offline repository keeps its marker for the next start, and
+         * so does one whose syncs are latched (sync_latch.h). */
+        if (sync_latch_repo_tripped(path)) continue;
         if (snprintf(dir, sizeof(dir), "%s/snapshots", path) >= (int)sizeof(dir) ||
             stat(dir, &sb) != 0 || !S_ISDIR(sb.st_mode))
             continue;

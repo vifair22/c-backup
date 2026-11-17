@@ -607,6 +607,12 @@ static status_t pwrite_full(int fd, const void *buf, size_t n, uint64_t off)
             return set_error_errno(ERR_IO, "restore: pwrite at %llu",
                                    (unsigned long long)off);
         }
+        if (w == 0) {
+            /* No progress and no error would loop for ever. */
+            errno = EIO;
+            return set_error_errno(ERR_IO, "restore: pwrite at %llu wrote nothing",
+                                   (unsigned long long)off);
+        }
         p += w;
         n -= (size_t)w;
         off += (uint64_t)w;
@@ -617,6 +623,15 @@ static status_t pwrite_full(int fd, const void *buf, size_t n, uint64_t off)
 status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                             int out_fd, uint64_t *out_size)
 {
+    return content_restore_fd_ex(store, hash, out_fd, out_size, NULL);
+}
+
+status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                               int out_fd, uint64_t *out_size, int *out_write_failed)
+{
+    int wf_local = 0;
+    int *wf = out_write_failed ? out_write_failed : &wf_local;
+    *wf = 0;
     uint64_t size = 0;
     uint8_t type = 0;
     status_t st = object_get_info(store, hash, &size, &type);
@@ -630,7 +645,10 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
         st = object_load_budgeted(store, hash, &data, &len, &otype, &taken);
         if (st == OK && otype != OBJECT_TYPE_FILE)
             st = set_error(ERR_CORRUPT, "object is of type %u, not file content", otype);
-        if (st == OK && len) st = pwrite_full(out_fd, data, len, 0);
+        if (st == OK && len) {
+            st = pwrite_full(out_fd, data, len, 0);
+            if (st != OK) *wf = 1;
+        }
         if (st == OK) store_io_progress(store, len);
         free(data);
         read_budget_release(taken);
@@ -658,16 +676,18 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
         if (st != OK) break;
         st = pwrite_full(out_fd, data, (size_t)x.length, x.offset);
         leaf_free(data, x.length);
-        if (st != OK) break;
+        if (st != OK) { *wf = 1; break; }
         store_io_progress(store, x.length);
     }
     chunklist_iter_close(it);
     if (st != OK) return st;
     /* Extends over any trailing hole, and leaves interior gaps unwritten,
      * which on a fresh file is what makes them holes. */
-    if (ftruncate(out_fd, (off_t)total) != 0)
+    if (ftruncate(out_fd, (off_t)total) != 0) {
+        *wf = 1;
         return set_error_errno(ERR_IO, "restore: ftruncate to %llu",
                                (unsigned long long)total);
+    }
     if (out_size) *out_size = total;
     return OK;
 }

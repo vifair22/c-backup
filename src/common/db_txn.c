@@ -6,6 +6,7 @@
 #include "phase_timer.h"
 #include "checkpointer.h"
 #include "wal_sync.h"
+#include "sync_latch.h"
 
 #include <cutils/log.h>
 #include <limits.h>
@@ -198,6 +199,10 @@ status_t db_txn_make_durable(cutils_db_t *db)
                                    "lock (its own transaction is not committed yet)");
     status_t (*gate)(void) = g_durable_gate;
     if (gate && gate() != OK) return ERR_IO;
+    /* After a failed sync a later one can succeed over lost frames: no
+     * durability is promised again until a restart (sync_latch.h). */
+    status_t lst = sync_latch_check("making the index durable");
+    if (lst != OK) return lst;
     uint64_t t0 = phase_now();
 
     /*

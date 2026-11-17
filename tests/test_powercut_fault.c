@@ -537,6 +537,10 @@ static int hook_nosync(int fd, int data_only)
 
 static void model_off(void)
 {
+    /* What follows a cut is a restart reading back from disk: syncs after
+     * the cut failed as a dead machine's would, and the latch they tripped
+     * (sync_latch.h) belongs to the process that died. */
+    sync_latch_reset_for_test();
     fault_write_hook  = NULL;
     fault_rename_hook = NULL;
     fault_unlink_hook = NULL;
@@ -2154,9 +2158,12 @@ static status_t op_backup_after_drop(ctx_t *c, int counting)
  */
 
 /* What c-backupd's after-write hook does (main.c). */
-static void api_after_write(void *db)
+static int api_after_write(void *db, char *why, size_t why_sz)
 {
-    if (db_txn_make_durable(db) != OK) err_clear();
+    if (db_txn_make_durable(db) == OK) return 0;
+    snprintf(why, why_sz, "%s", err_msg());
+    err_clear();
+    return -1;
 }
 
 static status_t api_call(ctx_t *c, api_method_t m, const char *path, const char *body)

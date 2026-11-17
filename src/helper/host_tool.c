@@ -194,3 +194,31 @@ status_t host_run(const host_tools_t *t, int netns, const char *const *argv,
     }
     return OK;
 }
+
+status_t host_write_new_file(const char *hp, const char *shown, const char *data, size_t len,
+                             const char *aside_hp)
+{
+    FILE *f = fopen(hp, "wxe");
+    int bad = 0, err = 0;
+    if (!f) {
+        bad = 1;
+        err = errno;
+    } else {
+        if (len && fwrite(data, 1, len, f) != len) { bad = 1; err = errno; }
+        if (!bad && fflush(f) != 0) { bad = 1; err = errno; }
+        if (!bad && fsync(fileno(f)) != 0) { bad = 1; err = errno; }
+        if (fclose(f) != 0 && !bad) { bad = 1; err = errno; }
+        if (bad) (void)unlink(hp);
+    }
+    if (!bad) return OK;
+    if (aside_hp && aside_hp[0] && rename(aside_hp, hp) != 0) {
+        int rerr = errno;
+        errno = err;
+        char what[512];
+        snprintf(what, sizeof(what), "%s", strerror(err));
+        return set_error(ERR_IO, "cannot write %s: %s; the previous copy could not be put "
+                         "back and is still at %s (%s)", shown, what, aside_hp, strerror(rerr));
+    }
+    errno = err;
+    return set_error_errno(ERR_IO, "cannot write %s", shown);
+}

@@ -3,6 +3,7 @@
 
 #include "routes.h"
 #include "unit_state.h"
+#include "sync_latch.h"
 
 #include <cutils/log.h>
 #include <cutils/push.h>
@@ -144,6 +145,26 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
 
     mbuf_t m = { 0 };
 
+    /* Not a query: the latch is the process's own state (sync_latch.h). */
+    {
+        int64_t at = 0;
+        int failed = sync_latch_info(NULL, 0, &at);
+        mb_addf(&m, "# HELP cbackup_storage_sync_failed 1 once a sync of state.db or the "
+                    "key directory failed; durable writes are refused until a restart.\n"
+                    "# TYPE cbackup_storage_sync_failed gauge\n"
+                    "cbackup_storage_sync_failed %d\n", failed);
+        mb_addf(&m, "# HELP cbackup_storage_sync_failed_timestamp_seconds When the first "
+                    "failed sync happened (unix time); 0 when none has.\n"
+                    "# TYPE cbackup_storage_sync_failed_timestamp_seconds gauge\n"
+                    "cbackup_storage_sync_failed_timestamp_seconds %lld\n",
+                (long long)(failed ? at : 0));
+        /* A count, not a series per repository (daemon-wide aggregates
+         * only); which ones is in /readyz and `repo show`. */
+        mb_addf(&m, "# HELP cbackup_repos_sync_failed Repositories whose own syncs failed "
+                    "and which refuse backups, gc and prune until `repo repair` passes.\n"
+                    "# TYPE cbackup_repos_sync_failed gauge\n"
+                    "cbackup_repos_sync_failed %u\n", sync_latch_repo_count());
+    }
     emit_scalar(&m, "cbackup_repos_total", "Registered repositories.", "gauge",
                 "SELECT COUNT(*) FROM repos");
     emit_scalar(&m, "cbackup_snapshots_total", "Snapshots across all repositories.",
