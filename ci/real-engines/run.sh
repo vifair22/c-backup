@@ -687,6 +687,30 @@ leftovers "after the volumes new-name define"
 }
 test_vols
 
+# ---- Docker: a host block device bound in (B188) --------------------------
+
+test_blk() {
+log "docker: cbk-uat-blk, the pool's loop device bound in"
+mkdir -p "$APPS/cbk-uat-blk"
+echo blk-data > "$APPS/cbk-uat-blk/f"
+docker run -d --name cbk-uat-blk --network none -v "$APPS/cbk-uat-blk:/data" -v "$LOOPDEV:/disk" \
+    -v /etc/localtime:/etc/localtime:ro "$IMG" \
+    sh -c 'trap "exit 0" TERM; while :; do sleep 1; done' >/dev/null || { bad "cbk-uat-blk starts" started failed; return 0; }
+OUT_B=$(cb unit backup 1 --provider docker cbk-uat-blk 2>&1)
+job_ok "unit backup of a container with a block device bound" "$OUT_B"
+SNAP_BLK=$(snap_of "$OUT_B")
+have_snap "the block-device backup" "$SNAP_BLK" || { docker rm -f cbk-uat-blk >/dev/null 2>&1; return 0; }
+TRB="$APPS/restored-blk"
+OUT_N=$(cb unit restore 1 "$SNAP_BLK" --define --name cbk-uat-blk2 --target-root "$TRB" --start 2>&1)
+contains "a copy with a block device bound is refused" '"state":"failed"' "$OUT_N"
+contains "the refusal names the bind and why" "$LOOPDEV -> /disk: a block device" "$OUT_N"
+check "no copy was created" "" "$(docker ps -aq --filter name=cbk-uat-blk2)"
+check "nothing was written under the target root" no "$([ -e "$TRB" ] && echo yes || echo no)"
+docker rm -f cbk-uat-blk >/dev/null 2>&1
+leftovers "after the block-device refusal"
+}
+test_blk
+
 # ---- Docker: a compose project -------------------------------------------
 
 test_project() {

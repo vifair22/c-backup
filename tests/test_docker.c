@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include <cmocka.h>
@@ -483,13 +484,13 @@ static void test_define(void **state)
     res = NULL;
     char def[2048];
     snprintf(def, sizeof(def), "{\"inspect\":{\"Name\":\"/x\",\"Config\":{},\"HostConfig\":{\"Privileged\":true}},"
-             "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"solo3\"}");
+             "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"\"}");
     assert_int_not_equal(be.define(be.ctx, "solo", def, &pol, &res), OK);
     assert_non_null(strstr(err_msg(), "Privileged"));
     err_clear();
     /* So does a bind of a host path outside the include roots. */
     snprintf(def, sizeof(def), "{\"inspect\":{\"Name\":\"/x\",\"Config\":{},\"HostConfig\":{\"Binds\":[\"/etc:/x\"]}},"
-             "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"solo4\"}");
+             "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"\"}");
     assert_int_not_equal(be.define(be.ctx, "solo", def, &pol, &res), OK);
     assert_non_null(strstr(err_msg(), "outside the include roots"));
     err_clear();
@@ -510,12 +511,14 @@ static const char *k_copy =
 #define GOOD_BINDS "\"" TR APPS "/web/www:/a\",\"" TR "/var/lib/docker/volumes/solodata/_data:/v\"," \
                    "\"" TR "/var/lib/docker/volumes/9e1d/_data:/anon\",\"/var/run/docker.sock:/var/run/docker.sock\""
 
+static const helper_policy_t *cpol = &pol;
+
 static status_t copy_define_as(const char *name, const char *hc, const char *extra, int check, cJSON **res)
 {
     char def[4096];
     snprintf(def, sizeof(def), k_copy, hc, name, extra);
     *res = NULL;
-    return check ? be.define_check(be.ctx, "solo", def, &pol) : be.define(be.ctx, "solo", def, &pol, res);
+    return check ? be.define_check(be.ctx, "solo", def, cpol) : be.define(be.ctx, "solo", def, cpol, res);
 }
 
 static status_t copy_define(const char *hc, const char *extra, int check, cJSON **res)
@@ -543,7 +546,7 @@ static void test_define_copy(void **state)
           ",\"target_root\":\"" TR "\"", "volume at /anon has no restored copy" },
         /* a target root inside the original's bind */
         { "{\"Binds\":[\"" APPS "/web/www/r" APPS "/web/www:/a\"]}", ",\"target_root\":\"" APPS "/web/www/r\"",
-          "that the original mounts" },
+          "which the original mounts" },
         /* a volume through HostConfig.Mounts, and another container's volumes */
         { "{\"Binds\":[" GOOD_BINDS "],\"Mounts\":[{\"Type\":\"volume\",\"Source\":\"solodata\",\"Target\":\"/w\"}]}",
           ",\"target_root\":\"" TR "\"", "volume solodata" },
@@ -611,6 +614,85 @@ static void test_define_in_place_volumes(void **state)
     assert_string_equal(binds, "[\"" APPS "/web/www:/a\",\"solodata:/v\",\"/var/run/docker.sock:/var/run/docker.sock\","
                                "\"9e1d:/anon\"]");
     free(binds);
+}
+
+/* A block device to bind: one made here (root), else the host's first. */
+static int block_device(char *out, size_t sz)
+{
+    if (mknod(D "/blk", S_IFBLK | 0600, makedev(7, 250)) == 0) { snprintf(out, sz, D "/blk"); return 1; }
+    static const char *const cand[] = { "/dev/loop0", "/dev/sda", "/dev/vda", "/dev/nvme0n1", "/dev/dm-0", "/dev/zram0" };
+    struct stat sb;
+    for (size_t i = 0; i < sizeof(cand) / sizeof(cand[0]); i++)
+        if (stat(cand[i], &sb) == 0 && S_ISBLK(sb.st_mode)) { snprintf(out, sz, "%s", cand[i]); return 1; }
+    return 0;
+}
+
+/*
+ * B188, the host-bind rule as decided: a copy keeps /proc, /sys,
+ * /etc/localtime, /etc/timezone, the Docker socket and character devices
+ * as recorded, and is refused, before anything is created, a block
+ * device (by st_mode, through a by-id style link), anything under /run,
+ * anything else under /etc, and /boot. The refusal names the bind and
+ * why. With allow_privileged_define on, so it is this rule that decides
+ * and not the include-roots gate.
+ */
+static void test_define_copy_host_binds(void **state)
+{
+    (void)state;
+    helper_policy_t p2 = pol;
+    p2.allow_privileged_define = 1;
+    cpol = &p2;
+    char blk[PATH_MAX], hc[2048];
+    int have_blk = block_device(blk, sizeof(blk));
+    if (have_blk) assert_int_equal(symlink(blk, D "/by-id-disk"), 0);
+    else print_message("no block device to bind here; that case is not run\n");
+    static const struct { const char *bind, *why; } refused[] = {
+        { D "/by-id-disk:/disk", "a block device" },
+        { "/run/udev:/run/udev", "under /run" },
+        { "/var/run/app.pid:/x", "under /run" },
+        { "/etc/myapp:/etc/myapp", "under /etc" },
+        { "/boot/config:/cfg", "/boot" },
+    };
+    int n0 = fdk.n;
+    cJSON *res = NULL;
+    for (size_t i = have_blk ? 0 : 1; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        snprintf(hc, sizeof(hc), "{\"Binds\":[" GOOD_BINDS ",\"%s\"]}", refused[i].bind);
+        for (int check = 0; check <= 1; check++) {
+            assert_int_not_equal(copy_define(hc, ",\"target_root\":\"" TR "\"", check, &res), OK);
+            const char *m = err_msg();
+            if (!strstr(m, refused[i].why) || !strstr(m, "nothing created")) fail_msg("%s: %s", refused[i].bind, m);
+            /* The bind named, host path to container path. */
+            char named[PATH_MAX + 64];
+            snprintf(named, sizeof(named), "%.*s", (int)strcspn(refused[i].bind, ":"), refused[i].bind);
+            assert_non_null(strstr(m, named));
+            assert_non_null(strstr(m, strchr(refused[i].bind, ':') + 1));
+            err_clear();
+            assert_int_equal(fdk.n, n0);
+        }
+    }
+    /* Kept: /etc/localtime, the Docker socket, character devices. */
+    struct stat sb;
+    const char *chr = stat("/dev/fuse", &sb) == 0 && S_ISCHR(sb.st_mode) ? "/dev/fuse" : "/dev/null";
+    snprintf(hc, sizeof(hc), "{\"Binds\":[" GOOD_BINDS ",\"/etc/localtime:/etc/localtime:ro\",\"%s:%s\"]}", chr, chr);
+    assert_int_equal(copy_define(hc, ",\"target_root\":\"" TR "\"", 1, &res), OK);
+    assert_int_equal(copy_define(hc, ",\"target_root\":\"" TR "\"", 0, &res), OK);
+    cJSON_Delete(res);
+    assert_int_equal(fdk.n, n0 + 1);
+    assert_non_null(strstr(fdk.created_body, "/etc/localtime:/etc/localtime:ro"));
+    assert_non_null(strstr(fdk.created_body, chr));
+
+    /* The backstop: Docker made the copy with a forbidden bind. */
+    snprintf(fdk.create_mounts, sizeof(fdk.create_mounts),
+             "[{\"Type\":\"bind\",\"Source\":\"/etc/myapp\",\"Destination\":\"/etc/myapp\"}]");
+    int deletes = fdk.deletes;
+    snprintf(hc, sizeof(hc), "{\"Binds\":[" GOOD_BINDS "]}");
+    assert_int_not_equal(copy_define_as("solocopy3", hc, ",\"target_root\":\"" TR "\"", 0, &res), OK);
+    assert_non_null(strstr(err_msg(), "/etc/myapp -> /etc/myapp: host configuration under /etc"));
+    assert_non_null(strstr(err_msg(), "removed before it ever started"));
+    err_clear();
+    assert_int_equal(fdk.deletes, deletes + 1);
+    fdk.create_mounts[0] = '\0';
+    cpol = &pol;
 }
 
 /* B188 for compose: a service volume naming a volume, or a recorded mount
@@ -1090,6 +1172,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define_compose, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_in_place_volumes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_copy_host_binds, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_compose_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pause_read, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_scope_job, setup_units, teardown_units),

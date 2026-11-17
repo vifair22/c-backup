@@ -10,12 +10,15 @@
 
 #include <cutils/log.h>
 
+#include <dirent.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1554,8 +1557,9 @@ static status_t move_aside(struct sp_ctx *c, const char *path, char *moved, size
  * the container, so it holds the rule itself and refuses anything else
  * before creating: every bind under target_root (and inside nothing the
  * original mounts), no volume by name, no VolumesFrom, and every mount of
- * the original replaced by one. Host facilities (mount_is_system: the
- * Docker socket, /etc/localtime) are not the original's data and stay.
+ * the original replaced by one. Host binds follow host_bind_class: a few
+ * facilities stay as recorded, block devices and the rest of /etc, /run
+ * and /boot are refused.
  * After the create, and before any start, the container Docker actually
  * made is checked again, so a mount the definition does not show (an
  * image's VOLUME, a compose service nobody recorded) cannot reach a
@@ -1571,19 +1575,186 @@ static void bind_parts(const char *v, char *src, size_t ssz, char *dst, size_t d
     snprintf(dst, dsz, "%.*s", (int)strcspn(d, ":"), d);
 }
 
-/* Why the copy may not bind src, or NULL. orig: the original's Mounts. */
-static const char *copy_source_bad(const cJSON *orig, const char *src, const char *troot, char *why, size_t wsz)
+/* snprintf for messages that may be cut: vsnprintf, which truncates
+ * quietly where a long path would only lose its tail. */
+static void fmt_why(char *buf, size_t sz, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void fmt_why(char *buf, size_t sz, const char *fmt, ...)
 {
-    if (mount_is_system(src)) return NULL;
-    if (!under_root(src, troot)) {
-        snprintf(why, wsz, "%.300s, which is not under the target root %.300s", src, troot);
-        return why;
+    va_list ap;
+    va_start(ap, fmt);
+    (void)vsnprintf(buf, sz, fmt, ap);
+    va_end(ap);
+}
+
+/*
+ * A host path resolved in the host's tree, symlinks followed one component
+ * at a time through host_path, so an absolute link (/var/run -> /run,
+ * /dev/disk/by-id/x -> /dev/sda) resolves on the host and never in the
+ * helper's own container. -1 when a component does not exist (yet: a
+ * define check runs before the restore writes target_root).
+ */
+static int resolve_host(const host_tools_t *t, const char *in, char *out, size_t sz)
+{
+    char todo[PATH_MAX * 2], done[PATH_MAX] = "", rest[PATH_MAX * 2];
+    snprintf(todo, sizeof(todo), "%s", in);
+    const char *p = todo;
+    int hops = 0;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        size_t l = strcspn(p, "/");
+        char comp[NAME_MAX + 1];
+        if (l > NAME_MAX) return -1;
+        memcpy(comp, p, l);
+        comp[l] = '\0';
+        p += l;
+        if (strcmp(comp, ".") == 0) continue;
+        if (strcmp(comp, "..") == 0) { char *sl = strrchr(done, '/'); if (sl) *sl = '\0'; continue; }
+        char cand[PATH_MAX], hp[PATH_MAX + HOST_TOOL_PATH_MAX];
+        if (snprintf(cand, sizeof(cand), "%s/%s", done, comp) >= (int)sizeof(cand)) return -1;
+        struct stat sb;
+        if (host_path(t, cand, hp, sizeof(hp)) != 0 || lstat(hp, &sb) != 0) return -1;
+        if (S_ISLNK(sb.st_mode)) {
+            char tgt[PATH_MAX];
+            ssize_t n = ++hops > 40 ? -1 : readlink(hp, tgt, sizeof(tgt) - 1);
+            if (n < 0) return -1;
+            tgt[n] = '\0';
+            if (snprintf(rest, sizeof(rest), "%s/%s", tgt, p) >= (int)sizeof(rest)) return -1;
+            if (tgt[0] == '/') done[0] = '\0';
+            snprintf(todo, sizeof(todo), "%s", rest);
+            p = todo;
+            continue;
+        }
+        snprintf(done, sizeof(done), "%s", cand);
     }
+    snprintf(out, sz, "%s", done[0] ? done : "/");
+    return 0;
+}
+
+/* stat of a resolved host path; 0 on success. */
+static int host_stat(const host_tools_t *t, const char *real, struct stat *sb)
+{
+    char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
+    return host_path(t, real, hp, sizeof(hp)) == 0 && stat(hp, sb) == 0 ? 0 : -1;
+}
+
+/* A block device under dir (resolved, on the host), into found; 1 if one
+ * is, or if the walk cannot finish (too deep, too many entries, unreadable),
+ * since then it cannot be said that none is. */
+static int holds_block(const host_tools_t *t, const char *dir, int depth, int *budget, char *found, size_t fsz)
+{
+    char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
+    if (depth > 4 || host_path(t, dir, hp, sizeof(hp)) != 0) { fmt_why(found, fsz, "%.300s (too deep)", dir); return 1; }
+    DIR *d = opendir(hp);
+    if (!d) { fmt_why(found, fsz, "%.300s (unreadable)", dir); return 1; }
+    int hit = 0;
+    struct dirent *de;
+    while (!hit && (de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (--*budget < 0) { fmt_why(found, fsz, "%.300s (too many entries)", dir); hit = 1; break; }
+        char p[PATH_MAX], real[PATH_MAX];
+        struct stat sb;
+        if (snprintf(p, sizeof(p), "%s/%s", dir, de->d_name) >= (int)sizeof(p)) continue;
+        if (resolve_host(t, p, real, sizeof(real)) != 0 || host_stat(t, real, &sb) != 0) continue;  /* dangling */
+        if (S_ISBLK(sb.st_mode)) { fmt_why(found, fsz, "%.300s", p); hit = 1; }
+        else if (S_ISDIR(sb.st_mode) && strncmp(real, dir, strlen(dir)) == 0 && real[strlen(dir)] == '/')
+            hit = holds_block(t, real, depth + 1, budget, found, fsz);
+    }
+    closedir(d);
+    return hit;
+}
+
+typedef enum { HB_DATA = 0, HB_KEEP = 1, HB_REFUSE = 2 } host_bind_t;
+
+/*
+ * Host facilities a copy keeps as recorded, and host paths it never gets
+ * (B188, as decided). Kept: /proc, /sys, /etc/localtime, /etc/timezone,
+ * the Docker socket, and character devices under /dev (a directory of
+ * them, /dev/dri, if it holds no block device). Refused: anything else
+ * under /etc, /run or /boot, and anything under /dev that is not a
+ * character device or such a directory. Block devices are refused before
+ * this, wherever they are, by st_mode. Anything else is data: it must be
+ * the restored copy. sb: the resolved path's stat, NULL when it has none.
+ */
+static host_bind_t host_bind_class(const host_tools_t *t, const char *p, const struct stat *sb,
+                                   char *why, size_t wsz)
+{
+    if (strcmp(p, "/run/docker.sock") == 0 || strcmp(p, "/var/run/docker.sock") == 0) return HB_KEEP;
+    if (under_root(p, "/proc") || under_root(p, "/sys")) return HB_KEEP;
+    if (strcmp(p, "/etc/localtime") == 0 || strcmp(p, "/etc/timezone") == 0) return HB_KEEP;
+    if (under_root(p, "/etc")) { fmt_why(why, wsz, "host configuration under /etc"); return HB_REFUSE; }
+    if (under_root(p, "/run") || under_root(p, "/var/run")) { fmt_why(why, wsz, "host runtime state under /run"); return HB_REFUSE; }
+    if (under_root(p, "/boot")) { fmt_why(why, wsz, "the host's /boot"); return HB_REFUSE; }
+    if (!under_root(p, "/dev")) return HB_DATA;
+    if (sb && S_ISCHR(sb->st_mode)) return HB_KEEP;
+    if (sb && S_ISDIR(sb->st_mode)) {
+        char found[400];
+        int budget = 4096;
+        if (!holds_block(t, p, 0, &budget, found, sizeof(found))) return HB_KEEP;
+        fmt_why(why, wsz, "a /dev directory holding the block device %s", found);
+        return HB_REFUSE;
+    }
+    fmt_why(why, wsz, "%s under /dev that is not a character device", sb ? "a file" : "a path that does not exist");
+    return HB_REFUSE;
+}
+
+/*
+ * What a copy's bind of src (to the container's dst) is: HB_KEEP, HB_DATA
+ * when it is the restored copy (under target_root, inside nothing the
+ * original mounts), or HB_REFUSE with why naming the bind and the reason.
+ * Resolved on the host where it exists: a block device behind a by-id or
+ * mapper link is still one, and a restored symlink cannot point a data
+ * bind out of target_root. orig: the original's Mounts; troot NULL to
+ * classify a host facility alone.
+ */
+static host_bind_t copy_bind(const struct sp_ctx *c, const cJSON *orig, const char *src, const char *dst,
+                             const char *troot, char *why, size_t wsz)
+{
+    char real[PATH_MAX], r1[300] = "", r2[300] = "";
+    struct stat sb;
+    int have = resolve_host(&c->tools, src, real, sizeof(real)) == 0;
+    int st_ok = have && host_stat(&c->tools, real, &sb) == 0;
+    const char *shown = have && strcmp(real, src) != 0 ? real : NULL;
+#define REFUSE_BIND(...) do { char rr_[400]; fmt_why(rr_, sizeof(rr_), __VA_ARGS__); \
+        fmt_why(why, wsz, "%.300s%s%.300s%s -> %.300s: %s", src, shown ? " (" : "", shown ? shown : "", \
+                 shown ? ")" : "", dst[0] ? dst : "?", rr_); return HB_REFUSE; } while (0)
+    if (st_ok && S_ISBLK(sb.st_mode)) REFUSE_BIND("a block device");
+    host_bind_t f1 = host_bind_class(&c->tools, src, st_ok ? &sb : NULL, r1, sizeof(r1));
+    host_bind_t f2 = have ? host_bind_class(&c->tools, real, st_ok ? &sb : NULL, r2, sizeof(r2)) : f1;
+    if (f1 == HB_REFUSE) REFUSE_BIND("%s", r1);
+    if (f2 == HB_REFUSE) REFUSE_BIND("%s", r2);
+    if (f1 == HB_KEEP) return HB_KEEP;
+    if (!troot) return HB_DATA;
+    /* Data: the restored copy, judged where it really is when it exists. */
+    char rt[PATH_MAX];
+    const char *q = have ? real : src;
+    const char *root = have && resolve_host(&c->tools, troot, rt, sizeof(rt)) == 0 ? rt : troot;
+    if (!under_root(q, root)) REFUSE_BIND("not under the target root %s, so not the restored copy", troot);
     const cJSON *m;
     cJSON_ArrayForEach(m, orig) {
         const char *os = jstr(m, "Source");
-        if (os[0] == '/' && !mount_is_system(os) && under_root(src, os)) {
-            snprintf(why, wsz, "%.300s, which is inside %.300s that the original mounts", src, os);
+        char ros[PATH_MAX], w[8];
+        if (os[0] != '/' || (strcmp(jstr(m, "Type"), "bind") != 0 && strcmp(jstr(m, "Type"), "volume") != 0)) continue;
+        if (host_bind_class(&c->tools, os, NULL, w, sizeof(w)) != HB_DATA) continue;
+        if (under_root(q, os) || (resolve_host(&c->tools, os, ros, sizeof(ros)) == 0 && under_root(q, ros)))
+            REFUSE_BIND("inside %s, which the original mounts", os);
+    }
+#undef REFUSE_BIND
+    return HB_DATA;
+}
+
+/* A device (HostConfig.Devices) the copy would get: a block one is
+ * refused like a bind of it. */
+static const char *copy_device_bad(const struct sp_ctx *c, const cJSON *hc, char *why, size_t wsz)
+{
+    const cJSON *d;
+    cJSON_ArrayForEach(d, cJSON_GetObjectItemCaseSensitive(hc, "Devices")) {
+        const char *ph = jstr(d, "PathOnHost");
+        char real[PATH_MAX];
+        struct stat sb;
+        if (ph[0] == '/' && resolve_host(&c->tools, ph, real, sizeof(real)) == 0 &&
+            host_stat(&c->tools, real, &sb) == 0 && S_ISBLK(sb.st_mode)) {
+            fmt_why(why, wsz, "device %.300s -> %.300s: a block device", ph, jstr(d, "PathInContainer"));
             return why;
         }
     }
@@ -1592,9 +1763,9 @@ static const char *copy_source_bad(const cJSON *orig, const char *src, const cha
 
 /* The copy's HostConfig against the rule above; orig is the original's
  * Mounts as recorded. */
-static status_t copy_definition_ok(const cJSON *orig, const cJSON *hc, const char *troot)
+static status_t copy_definition_ok(const struct sp_ctx *c, const cJSON *orig, const cJSON *hc, const char *troot)
 {
-    char why[700], src[PATH_MAX], dst[PATH_MAX];
+    char why[1200], src[PATH_MAX], dst[PATH_MAX];
     if (troot[0] != '/' || !helper_path_clean(troot))
         return set_error(ERR_INVALID, "docker: a container under a new name needs a target_root: its data "
                          "is the restored copy there, never the original's");
@@ -1609,7 +1780,7 @@ static status_t copy_definition_ok(const cJSON *orig, const cJSON *hc, const cha
         if (src[0] != '/')
             return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would mount the "
                              "volume %.200s, not a restored copy", src);
-        if (copy_source_bad(orig, src, troot, why, sizeof(why)))
+        if (copy_bind(c, orig, src, dst, troot, why, sizeof(why)) == HB_REFUSE)
             return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would bind %s", why);
     }
     cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Mounts")) {
@@ -1617,9 +1788,11 @@ static status_t copy_definition_ok(const cJSON *orig, const cJSON *hc, const cha
         if (strcmp(type, "volume") == 0)
             return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would mount the "
                              "volume %.200s, not a restored copy", ms[0] ? ms : "(anonymous)");
-        if (strcmp(type, "bind") == 0 && copy_source_bad(orig, ms, troot, why, sizeof(why)))
+        if (strcmp(type, "bind") == 0 && copy_bind(c, orig, ms, jstr(b, "Target"), troot, why, sizeof(why)) == HB_REFUSE)
             return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would bind %s", why);
     }
+    if (copy_device_bad(c, hc, why, sizeof(why)))
+        return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would get %s", why);
     /* Every mount of the original replaced: one left out keeps whatever
      * Docker gives it (a fresh volume, nothing) and the copy runs without
      * the data the restore wrote for it. */
@@ -1627,7 +1800,8 @@ static status_t copy_definition_ok(const cJSON *orig, const cJSON *hc, const cha
     cJSON_ArrayForEach(m, orig) {
         const char *type = jstr(m, "Type"), *os = jstr(m, "Source"), *od = jstr(m, "Destination");
         if (!od[0] || (strcmp(type, "bind") != 0 && strcmp(type, "volume") != 0)) continue;
-        if (strcmp(type, "bind") == 0 && mount_is_system(os)) continue;
+        char w[300];
+        if (strcmp(type, "bind") == 0 && copy_bind(c, orig, os, od, NULL, w, sizeof(w)) == HB_KEEP) continue;
         int covered = 0;
         cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Binds")) {
             const char *v = cJSON_GetStringValue(b);
@@ -1674,7 +1848,7 @@ static int volume_listed(const cJSON *vols, const char *name)
 static status_t copy_created_ok(struct sp_ctx *c, const char *cid, const cJSON *before,
                                 const cJSON *orig, const char *troot)
 {
-    char path[160], why[700] = "";
+    char path[160], why[1300] = "";
     snprintf(path, sizeof(path), "/containers/%.79s/json", cid);
     cJSON *in = NULL;
     status_t st = docker_call(&c->api, "GET", path, NULL, 0, NULL, &in);
@@ -1686,9 +1860,15 @@ static status_t copy_created_ok(struct sp_ctx *c, const char *cid, const cJSON *
             snprintf(why, sizeof(why), "it mounts the volume %.200s at %.200s, which existed before the "
                      "restore", name, jstr(m, "Destination"));
         } else if (strcmp(type, "bind") == 0) {
-            char w2[600];
-            if (copy_source_bad(orig, ms, troot, w2, sizeof(w2))) snprintf(why, sizeof(why), "it binds %s", w2);
+            char w2[1100];
+            if (copy_bind(c, orig, ms, jstr(m, "Destination"), troot, w2, sizeof(w2)) == HB_REFUSE)
+                snprintf(why, sizeof(why), "it binds %s", w2);
         }
+    }
+    if (st == OK && !why[0]) {
+        char w2[1100];
+        if (copy_device_bad(c, cJSON_GetObjectItemCaseSensitive(in, "HostConfig"), w2, sizeof(w2)))
+            snprintf(why, sizeof(why), "it gets %s", w2);
     }
     cJSON_Delete(in);
     if (st != OK) return st;
@@ -1771,17 +1951,22 @@ static status_t solo_refusals(const struct sp_ctx *c, const cJSON *d, const help
     snprintf(name, nsz, "%s", want[0] ? want : orig);
     *copy = strcmp(name, orig) != 0;
     if (!name_ok(name)) return set_error(ERR_INVALID, "docker: bad container name %.100s", name);
+    /* A copy beside the original mounts nothing of the original's (B188);
+     * first, so its refusal names the bind and why. */
+    if (*copy) {
+        status_t st = copy_definition_ok(c, cJSON_GetObjectItemCaseSensitive(in, "Mounts"), hc, jstr(d, "target_root"));
+        if (st != OK) return st;
+    }
     const char *why = privileged_reason(hc);
     if (!why) why = bind_outside(c, hc);
     if (why && !pol->allow_privileged_define)
         return set_error(ERR_INVALID, "docker: the definition sets %s, and allow_privileged_define is off", why);
-    /* A copy beside the original mounts nothing of the original's (B188). */
-    if (*copy) return copy_definition_ok(cJSON_GetObjectItemCaseSensitive(in, "Mounts"), hc, jstr(d, "target_root"));
     return OK;
 }
 
-static status_t compose_refusals(const char *unit_id, const cJSON *d, const helper_policy_t *pol,
-                                 char *project, size_t psz, char *wd, size_t wsz, int *new_name);
+static status_t compose_refusals(const struct sp_ctx *c, const char *unit_id, const cJSON *d,
+                                 const helper_policy_t *pol, char *project, size_t psz, char *wd,
+                                 size_t wsz, int *new_name);
 
 /* unit.define's check (B167, B188): the refusals of a real define, with no
  * change made anywhere. */
@@ -1793,7 +1978,7 @@ static status_t d_define_check(sp_ctx_t *c, const char *unit_id, const char *def
     char name[PATH_MAX], wd[PATH_MAX];
     int copy = 0;
     status_t st = strncmp(unit_id, "compose:", 8) == 0
-                ? compose_refusals(unit_id, d, pol, name, 72, wd, sizeof(wd), &copy)
+                ? compose_refusals(c, unit_id, d, pol, name, 72, wd, sizeof(wd), &copy)
                 : solo_refusals(c, d, pol, name, 160, &copy);
     cJSON_Delete(d);
     return st;
@@ -1999,11 +2184,11 @@ static cJSON *compose_orig_mounts(const cJSON *cp)
 /* A compose copy (B188): each service's volumes are binds under the target
  * root, inside nothing the original mounts, and replace every mount the
  * service had (compose merges volumes by container path). */
-static status_t compose_copy_ok(const cJSON *cp, const char *troot)
+static status_t compose_copy_ok(const struct sp_ctx *c, const cJSON *cp, const char *troot)
 {
     cJSON *orig = compose_orig_mounts(cp);
     if (!orig) return set_error(ERR_NOMEM, "docker: define");
-    char why[700], src[PATH_MAX], dst[PATH_MAX];
+    char why[1200], src[PATH_MAX], dst[PATH_MAX];
     status_t st = OK;
     const cJSON *svc;
     cJSON_ArrayForEach(svc, cJSON_GetObjectItemCaseSensitive(cp, "services")) {
@@ -2019,7 +2204,7 @@ static status_t compose_copy_ok(const cJSON *cp, const char *troot)
                                "mount the volume %.200s, not a restored copy", sname, src);
                 break;
             }
-            if (copy_source_bad(orig, src, troot, why, sizeof(why))) {
+            if (copy_bind(c, orig, src, dst, troot, why, sizeof(why)) == HB_REFUSE) {
                 st = set_error(ERR_INVALID, "docker: refused, nothing created: service %.64s of the copy "
                                "would bind %s", sname, why);
                 break;
@@ -2029,7 +2214,17 @@ static status_t compose_copy_ok(const cJSON *cp, const char *troot)
             if (st != OK) break;
             const char *type = jstr(m, "Type"), *os = jstr(m, "Source"), *od = jstr(m, "Destination");
             if (!od[0] || (strcmp(type, "bind") != 0 && strcmp(type, "volume") != 0)) continue;
-            if (strcmp(type, "bind") == 0 && mount_is_system(os)) continue;
+            /* A host path the compose file binds stays in the copy unless
+             * replaced: kept if a facility, refused if a forbidden one. */
+            if (strcmp(type, "bind") == 0) {
+                host_bind_t hb = copy_bind(c, orig, os, od, NULL, why, sizeof(why));
+                if (hb == HB_KEEP) continue;
+                if (hb == HB_REFUSE) {
+                    st = set_error(ERR_INVALID, "docker: refused, nothing created: service %.64s of the copy "
+                                   "would bind %s", sname, why);
+                    break;
+                }
+            }
             int covered = 0;
             cJSON_ArrayForEach(v, cJSON_GetObjectItemCaseSensitive(svc, "volumes")) {
                 const char *b = cJSON_GetStringValue(v);
@@ -2074,8 +2269,9 @@ static status_t compose_copy_created_ok(struct sp_ctx *c, const char *pkey, cons
 }
 
 /* Every refusal of a compose define that needs no Docker call. */
-static status_t compose_refusals(const char *unit_id, const cJSON *d, const helper_policy_t *pol,
-                                 char *project, size_t psz, char *wd, size_t wsz, int *new_name)
+static status_t compose_refusals(const struct sp_ctx *c, const char *unit_id, const cJSON *d,
+                                 const helper_policy_t *pol, char *project, size_t psz, char *wd,
+                                 size_t wsz, int *new_name)
 {
     const cJSON *cp = cJSON_GetObjectItemCaseSensitive(d, "compose");
     const cJSON *files = cJSON_GetObjectItemCaseSensitive(cp, "files");
@@ -2108,7 +2304,7 @@ static status_t compose_refusals(const char *unit_id, const cJSON *d, const help
                 return set_error(ERR_INVALID, "docker: a bind of %.200s outside the include roots", src);
         }
     }
-    return *new_name ? compose_copy_ok(cp, troot) : OK;
+    return *new_name ? compose_copy_ok(c, cp, troot) : OK;
 }
 
 __attribute__((noinline))
@@ -2123,7 +2319,7 @@ static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
     int pin = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "pin_digest"));
     char project[72], wd[PATH_MAX];
     int new_name = 0;
-    status_t rst = compose_refusals(unit_id, d, pol, project, sizeof(project), wd, sizeof(wd), &new_name);
+    status_t rst = compose_refusals(c, unit_id, d, pol, project, sizeof(project), wd, sizeof(wd), &new_name);
     if (rst != OK) return rst;
     const cJSON *svc;
 
