@@ -29,6 +29,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -73,6 +74,19 @@ static int teardown(void **state)
 }
 
 /* ------------------------------------------------------------------ */
+
+typedef struct {
+    atomic_int done;
+    int        rc;
+} worker_t;
+
+static void *durable_worker(void *arg)
+{
+    worker_t *w = arg;
+    w->rc = db_txn_make_durable(db);
+    atomic_store(&w->done, 1);
+    return NULL;
+}
 
 /*
  * The forced interleaving: the second writer begins while the first is
@@ -325,15 +339,19 @@ static void test_repeated_cycles_do_not_leak_the_lock(void **state)
 }
 
 /*
- * B142: making the index durable is a full checkpoint of the WAL, so after
- * it the committed rows are in the database file itself, synced, and the
- * WAL holds nothing a power cut could take back. It needs the write lock
- * and refuses to run inside a transaction rather than deadlock or
- * checkpoint half a transaction.
+ * B142, B144: making the index durable syncs the WAL, the file every
+ * commit so far has written its frames into. It does not checkpoint
+ * (copying the WAL into the database is not needed for durability and was
+ * seconds of every writer's time under the write lock), and refuses to run
+ * inside a transaction, whose commit has not happened yet.
  */
-static void test_make_durable_checkpoints_everything(void **state)
+static void test_make_durable_syncs_the_wal(void **state)
 {
     (void)state;
+    char wal[512];
+    assert_int_equal(db_txn_wal_path(db, wal, sizeof(wal)), 0);
+    assert_string_equal(wal, TEST_DB "-wal");
+
     assert_int_equal(db_txn_begin(db), OK);
     assert_int_equal(db_execute_non_query(db,
         "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/x', 'x', 'u-x', 1)", NULL, NULL), 0);
@@ -341,18 +359,69 @@ static void test_make_durable_checkpoints_everything(void **state)
     err_clear();
     assert_int_equal(db_txn_commit(db), OK);
 
+    struct stat before, after;
+    assert_int_equal(stat(TEST_DB, &before), 0);
+    unsigned long n = db_txn_durable_count();
     assert_int_equal(db_txn_make_durable(db), OK);
+    assert_int_equal(db_txn_durable_count(), n + 1);
+    assert_int_equal(stat(TEST_DB, &after), 0);
+    /* Nothing was copied into the database file: the commit is durable
+     * where it is, in the WAL. */
+    assert_true(before.st_size == after.st_size &&
+                before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
+                before.st_mtim.tv_nsec == after.st_mtim.tv_nsec);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db, "PRAGMA wal_checkpoint(PASSIVE)", NULL, &r), 0);
     assert_non_null(r);
     assert_int_equal(r->nrows, 1);
-    /* Nothing left in the WAL to copy: everything was checkpointed. */
-    assert_string_equal(r->rows[0][0], "0");
-    assert_string_equal(r->rows[0][1], r->rows[0][2]);
+    assert_true(strtol(r->rows[0][1], NULL, 10) > 0);    /* frames were in the WAL */
     db_result_free(r);
-    /* And the lock was released. */
-    assert_int_equal(db_txn_begin(db), OK);
+}
+
+/*
+ * make_durable waits for an open transaction to commit and then syncs with
+ * no lock held (B144). The wait is what makes a write issued outside
+ * db_txn durable: on the one shared connection it joins whatever
+ * transaction another thread has open, here the main thread's, and is not
+ * committed until that is. The sync used to be a checkpoint taken under
+ * the write lock, which every writer queued behind.
+ */
+static int g_begin_in_done = -1;
+
+static void begin_in_done(void)
+{
+    /* With the lock still held by this thread, begin would refuse as a
+     * nested transaction (ERR_BUSY); held by another, it would hang. */
+    g_begin_in_done = db_txn_begin(db);
+    if (g_begin_in_done == OK) db_txn_rollback(db);
+}
+
+static void test_make_durable_waits_for_the_open_transaction(void **state)
+{
+    (void)state;
+    worker_t w;
+    memset(&w, 0, sizeof(w));
+    w.rc = -1;
+    pthread_t th;
+    assert_int_equal(db_txn_begin(db), OK);        /* a backup's batch */
+    /* A bare write from the API thread: it joins the open transaction. */
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/y', 'y', 'u-y', 1)", NULL, NULL), 0);
+    db_txn_set_durable_hooks(NULL, begin_in_done);
+    assert_int_equal(pthread_create(&th, NULL, durable_worker, &w), 0);
+    for (int i = 0; i < 1000 && db_txn_waiters() == 0; i++) {
+        struct timespec ts = { 0, 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    assert_int_equal(db_txn_waiters(), 1);
+    struct timespec ts = { 0, 100 * 1000000L };
+    nanosleep(&ts, NULL);
+    assert_int_equal(atomic_load(&w.done), 0);     /* not before the commit */
     assert_int_equal(db_txn_commit(db), OK);
+    pthread_join(th, NULL);
+    db_txn_set_durable_hooks(NULL, NULL);
+    assert_int_equal(w.rc, OK);
+    assert_int_equal(g_begin_in_done, OK);         /* the sync held no lock */
 }
 
 int main(void)
@@ -364,7 +433,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_nested_begin_fails_instead_of_hanging, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rollback_releases_the_lock, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repeated_cycles_do_not_leak_the_lock, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_make_durable_checkpoints_everything, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_make_durable_syncs_the_wal, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_make_durable_waits_for_the_open_transaction, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
