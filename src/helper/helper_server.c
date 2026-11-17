@@ -1890,6 +1890,18 @@ static status_t listen_on(helper_server_t *s)
         close(fd);
         return set_error_errno(ERR_IO, "helper: bind %s", path);
     }
+    /* 0660 root:root let nobody but root connect: the daemon, running as
+     * daemon_uid with its own gid (security.run_as_uid sets both), had no
+     * write permission on the socket and connect failed with EACCES.
+     * The group is the daemon's; SO_PEERCRED still refuses every uid but
+     * daemon_uid on each connection. */
+    if (geteuid() == 0 && chown(path, (uid_t)-1, (gid_t)s->pol->daemon_uid) != 0) {
+        int err = errno;
+        close(fd);
+        (void)unlink(path);
+        errno = err;
+        return set_error_errno(ERR_IO, "helper: chown %s to group %u", path, (unsigned)s->pol->daemon_uid);
+    }
     s->lfd = fd;
     return OK;
 }
