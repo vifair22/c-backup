@@ -86,6 +86,27 @@ static void test_root_drop(void **state)
 {
     (void)state;
     if (geteuid() != 0) skip();
+    /*
+     * Root without CAP_DAC_READ_SEARCH: Docker's default capability set has
+     * none (a CI job's container), and privs_drop refuses rather than drop
+     * to a uid that could not read the sources, naming the --cap-add. That
+     * refusal is the behaviour here, and the drop itself cannot be shown.
+     */
+    if (prctl(PR_CAPBSET_READ, CAP_DAC_READ_SEARCH, 0, 0, 0) != 1) {
+        pid_t c = fork();
+        assert_true(c >= 0);
+        if (c == 0) {
+            status_t st = privs_drop(990, 990);
+            _exit(st != OK && strstr(err_msg(), "CAP_DAC_READ_SEARCH") ? 0 : 1);
+        }
+        int cs = 0;
+        waitpid(c, &cs, 0);
+        assert_true(WIFEXITED(cs));
+        assert_int_equal(WEXITSTATUS(cs), 0);
+        print_message("no CAP_DAC_READ_SEARCH in this process's bounding set: the refusal is "
+                      "checked, the drop is not\n");
+        skip();
+    }
     pid_t pid = fork();
     assert_true(pid >= 0);
     if (pid == 0) {
