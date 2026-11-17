@@ -1570,7 +1570,7 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     const helper_backend_t *b = NULL;
     if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
         return resp_error(r->id, e, "%s", why);
-    char real[PATH_MAX];
+    char real[HELPER_PATH_MAX + 1];
     int kind = unit_has_mount(b, uid, r->mount, real, sizeof(real));
     if (!kind)
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is not a mount of %s", r->mount, r->unit);
