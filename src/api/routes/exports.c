@@ -560,9 +560,10 @@ static const char *exports_allow(const char *url, void *ud)
 
 int routes_register_exports(api_server_t *srv)
 {
-    if (api_server_route(srv, "/exports", API_GET, exports_get, NULL) != 0) return -1;
-    if (api_server_route(srv, "/exports/*", API_GET, exports_get, NULL) != 0) return -1;
-    if (api_server_route(srv, "/exports/*", API_DELETE, exports_delete, NULL) != 0) return -1;
+    if (api_server_route(srv, "/exports", API_GET, API_CLASS_NONE, exports_get, NULL) != 0) return -1;
+    if (api_server_route(srv, "/exports/*", API_GET, API_CLASS_NONE, exports_get, NULL) != 0) return -1;
+    /* Every delete is durable (B144): the revocation is journalled. */
+    if (api_server_route(srv, "/exports/*", API_DELETE, API_DURABLE, exports_delete, NULL) != 0) return -1;
     if (api_server_route_allow(srv, "/exports*", exports_allow, NULL) != 0) return -1;
     return 0;
 }

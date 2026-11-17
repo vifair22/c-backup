@@ -153,18 +153,96 @@ api_server_t *api_server_create(int tcp_port, const char *bind_addr,
                                 const char *socket_path,
                                 const char *static_dir);
 
+/*
+ * What a successful write owes its client before the answer is sent (B144).
+ *
+ * state.db runs synchronous=NORMAL, so a commit is in the WAL when it
+ * returns and the once-a-second flusher puts it on disk. A durable route
+ * also waits for db_txn_make_durable (the after-write hook) before
+ * answering, which is a WAL fdatasync and costs seconds on a saturated
+ * pool; a commit-only route answers as soon as it has committed, and a
+ * power cut within about a second of the answer can lose its edit, never
+ * corrupt anything.
+ *
+ * Every route that is not a GET names one, with no default: a write
+ * registered with API_CLASS_NONE is refused at registration, and that
+ * fails the daemon's start. Which routes are which, and why, is in
+ * docs/api.md.
+ */
+typedef enum {
+    API_CLASS_NONE = 0,  /* a GET: changes nothing */
+    API_DURABLE,         /* synced before the answer: tags, registration, every delete */
+    API_COMMIT_ONLY,     /* committed before the answer, synced within about a second */
+    API_CLASS_BY_PATH,   /* a wildcard route whose api_class_fn decides per path */
+} api_write_class_t;
+
+/* The class of a write under a wildcard registered API_CLASS_BY_PATH:
+ * API_DURABLE or API_COMMIT_ONLY for every path and method the route's
+ * handler can answer 2xx. Anything else is treated as API_DURABLE and
+ * logged, since syncing what did not need it only costs time. */
+typedef api_write_class_t (*api_class_fn)(const char *url, api_method_t method,
+                                          void *userdata);
+
+/*
+ * One resource under a wildcard, as a module's path table lists it: the
+ * methods it answers and, for each write, its class. A method whose slot
+ * is API_CLASS_NONE is not served there (405), so a write cannot be added
+ * to a table without saying what its answer waits for. `path` is a sample
+ * ("/tags/<name>") for tests and messages.
+ */
+typedef struct {
+    const char        *path;
+    int                get;      /* 1: answers GET */
+    api_write_class_t  post, put, del;
+} api_path_t;
+
+/* The Allow value for an entry ("GET, PUT"), static. */
+const char *api_path_allow(const api_path_t *p);
+/* The entry's class for a method: API_CLASS_NONE for GET and for a method
+ * it does not answer. NULL p gives API_CLASS_NONE. */
+api_write_class_t api_path_class(const api_path_t *p, api_method_t method);
+
 /* Register a route handler.
  * pattern: URL pattern (exact match, e.g., "/api/status").
  * method: HTTP method to match.
+ * cls: API_CLASS_NONE for a GET; for any other method, what a 2xx answer
+ *      waits for (api_write_class_t). A mismatch is refused (-1).
  * handler: function to call.
  * userdata: passed to handler on each request. */
 int api_server_route(api_server_t *srv, const char *pattern,
-                     api_method_t method, api_handler_fn handler,
-                     void *userdata);
+                     api_method_t method, api_write_class_t cls,
+                     api_handler_fn handler, void *userdata);
+
+/* The resolver for routes under `pattern` (ending in '*') registered
+ * API_CLASS_BY_PATH. api_server_start refuses a BY_PATH route that has
+ * none. */
+int api_server_route_class(api_server_t *srv, const char *pattern,
+                           api_class_fn fn, void *userdata);
+
+/* The class a 2xx answer to `method` on `url` would wait for, resolved as a
+ * request is: API_CLASS_NONE for a GET or when no route matches. */
+api_write_class_t api_server_class_for(const api_server_t *srv, const char *url,
+                                       api_method_t method);
+
+/* The registered routes, for tests that hold every one to having a class. */
+int api_server_route_count(const api_server_t *srv);
+int api_server_route_at(const api_server_t *srv, int i, const char **pattern,
+                        api_method_t *method, api_write_class_t *cls);
+
+/*
+ * Serve one request in-process, as a connection would after auth: route,
+ * handler, and the after-write hook for a durable class. For the power-cut
+ * suite, which runs the routes under its disk model with no socket. No
+ * query parameters or cookies (req->_conn is NULL). The caller frees the
+ * response's body and set_cookie.
+ */
+api_response_t api_server_dispatch(api_server_t *srv, const api_request_t *req);
 
 /* Register a streaming route. Same matching rules as api_server_route,
  * but the handler returns an api_stream_response_t whose reader/cleanup
- * are driven by the server until end-of-stream. */
+ * are driven by the server until end-of-stream. GET only: a streaming
+ * answer has no point at which a write could be made durable, so another
+ * method is refused. */
 int api_server_route_streaming(api_server_t *srv, const char *pattern,
                                api_method_t method,
                                api_stream_handler_fn handler,
@@ -186,11 +264,12 @@ int api_server_route_allow(api_server_t *srv, const char *pattern,
 typedef int (*api_auth_fn)(const api_request_t *req, const char *url, void *userdata);
 void api_server_set_auth(api_server_t *srv, api_auth_fn fn, void *userdata);
 
-/* Called after a buffered handler for a request that is not a GET or HEAD
- * answers 2xx, before the response is sent. c-backupd makes the database
- * durable there (db_txn_make_durable), so an edit the client was told
- * succeeded - a tag, a note, a registered repository - survives a power
- * cut that follows (B139, B140). Not called for streaming routes. */
+/* Called after a buffered handler for a route of class API_DURABLE answers
+ * 2xx, before the response is sent. c-backupd makes the database durable
+ * there (db_txn_make_durable), so an edit the client was told succeeded - a
+ * tag, a registered repository, a delete - survives a power cut that
+ * follows (B139, B140). Not called for API_COMMIT_ONLY routes (B144), a
+ * GET, or a streaming route. */
 typedef void (*api_after_write_fn)(void *userdata);
 void api_server_set_after_write(api_server_t *srv, api_after_write_fn fn, void *userdata);
 

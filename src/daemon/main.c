@@ -126,11 +126,14 @@ static status_t startup_reindex(int64_t repo_id, void *ctx, int64_t *out_job_id)
     return routes_submit_startup_reindex(ctx, repo_id, out_job_id);
 }
 
-/* Every API request that changed something - a tag, a note, a policy, a
- * registered repository - is durable before its answer is sent (B139,
+/* Every API request of the durable class - a tag, a registered or removed
+ * repository, any delete - is durable before its answer is sent (B139,
  * B140), by the same means gc and prune use before removing what a commit
- * describes (db_txn_make_durable, B142), where synchronous=NORMAL would
- * otherwise leave it for the next once-a-second flush. */
+ * describes (db_txn_make_durable, B142). The commit-only class (notes,
+ * sources, policy, schedules, job submissions) is left to the
+ * once-a-second flush, which synchronous=NORMAL relies on anyway: its
+ * reply would otherwise wait out a WAL fdatasync that takes seconds on a
+ * saturated pool (B144, api_write_class_t). */
 static void after_write(void *userdata)
 {
     if (db_txn_make_durable(userdata) != OK) {

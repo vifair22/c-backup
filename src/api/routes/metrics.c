@@ -317,5 +317,5 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
 int routes_register_metrics(api_server_t *srv, cutils_db_t *db)
 {
     g_db = db;
-    return api_server_route(srv, "/metrics", API_GET, handle_metrics, NULL) == 0 ? 0 : -1;
+    return api_server_route(srv, "/metrics", API_GET, API_CLASS_NONE, handle_metrics, NULL) == 0 ? 0 : -1;
 }

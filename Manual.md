@@ -374,7 +374,7 @@ are different: they live in the database and change through the policy API
 | Key | Default | Meaning |
 |---|---|---|
 | `db.path` | none, required | The daemon database. The shipped config sets `/var/lib/c-backupd/state.db`; a file without it stops the daemon |
-| `db.synchronous` | `normal` | When a database commit reaches the disk. `normal`: anything changed through the API is synced before the API answers, and the daemon's own writes (backup index rows, job records, the journal) once a second, so a power cut can lose about their last second (section 17.5); `full`: every commit is synced before it returns, as SQLite does by default, at a large cost on many small files (section 18.2). `normal` or `full` |
+| `db.synchronous` | `normal` | When a database commit reaches the disk. `normal`: the durable API edits (tags, registering or removing a repository, every delete) are synced before the API answers, and everything else - other API edits such as notes, sources, policy and schedules, and the daemon's own writes (backup index rows, job records, the journal) - once a second, so a power cut can lose about their last second, never corrupt them (sections 6.4 and 17.5); `full`: every commit is synced before it returns, as SQLite does by default, at a large cost on many small files (section 18.2). `normal` or `full` |
 | `db.cache_mb` | `64` | MiB of page cache for the database. 2 to 65536 |
 | `db.wal_autocheckpoint` | `16384` | Database pages (4 KiB) waiting in its log that start a checkpoint, each of which costs two syncs. Checkpoints run on a background thread with a connection of its own, never inside a commit, so no request waits for one; the log is restarted about once per this many pages and held under 16 times it, and its file is trimmed back to 4 times it. 1000 to 1048576 |
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
@@ -980,10 +980,33 @@ write lock across batches of up to 2,000 files, and lets it go as soon as
 another write is queued for it: at the next file, the next read of the file
 it is storing, the next directory tree, or the next row of the snapshot's
 node index, which it writes last. A write that is waiting goes before the
-backup's next batch, so it returns in well under a second however long the
-backup runs. A backup nobody interrupts commits once per 2,000 files and
-once per sealed pack, which matters on storage where each commit's sync is
-slow.
+backup's next batch. A backup nobody interrupts commits once per 2,000 files
+and once per sealed pack, which matters on storage where each commit's sync
+is slow.
+
+What happens after the commit depends on the edit:
+
+- **Durable when the answer returns**: setting or removing a tag,
+  registering or removing a repository, and every delete (a snapshot, a
+  schedule, an export), plus logging out and changing the admin password.
+  Once the CLI or the app reports success, a power cut cannot undo them.
+- **Committed when the answer returns, on disk within about a second**:
+  notes, sources and excludes, retention policy, schedules added or
+  changed, unit policy, and job submissions (backup, restore, verify, gc,
+  retention and the rest). A power cut within about a second of the answer
+  can lose that last edit. It never corrupts anything: the daemon starts,
+  the repository and its index agree, and the edit is either wholly there
+  or wholly absent, so making it again is all a lost edit costs.
+
+A commit-only edit returns in well under a second however long the backup
+runs. A durable edit also waits for the database's write-ahead log to be
+synced (one `fdatasync`), and that sync costs whatever the disk under
+`state.db` makes it cost. Measured during a backup: about 25 ms at the
+median on an idle NVMe drive, and up to 2.7 s at the 99th percentile on a
+local disk saturated by other programs' writes; under that kind of load a
+tag write took seconds. Keep `state.db` (`db.path`) off a disk that other
+work saturates if tag and delete latency matters. Which class every API
+route has is listed in `docs/api.md`.
 
 A change to a repository's sources applies to backups submitted after it. A
 backup takes its sources from the configuration when it is submitted, so a
@@ -2264,14 +2287,18 @@ affects repository data.
 (section 3), which never corrupts it on a power cut. Two kinds of write
 reach the disk at different times:
 
-- **Anything changed through the API** - registering or removing a
-  repository, a tag, a note, a policy value, sources, a schedule, a
-  password - is synced to disk before the request is answered. Once the
-  CLI or the app reports success, a power cut cannot take it.
-- **The daemon's own writes** - a backup's index rows, job records and
-  progress, journal entries - are synced by a once-a-second flush (and by
-  checkpoints and a clean stop). A power cut can lose about the last second
-  of them.
+- **The durable API edits** - registering or removing a repository, a tag
+  set or removed, every delete, a logout or password change - are synced to
+  disk before the request is answered. Once the CLI or the app reports
+  success, a power cut cannot take them.
+- **Every other write** - the other API edits (a note, sources, a policy
+  value, a schedule added or changed, a job submitted), and the daemon's
+  own writes (a backup's index rows, job records and progress, journal
+  entries) - is synced by a once-a-second flush (and by checkpoints and a
+  clean stop). A power cut can lose about the last second of them: an edit
+  answered less than a second before the cut may be gone after it, whole,
+  and has to be made again. Nothing is left half-written. Section 6.4 lists
+  which edit is which.
 
 `db.synchronous: full` syncs every commit instead, at the cost section 18.2
 measures.
