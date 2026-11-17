@@ -1068,31 +1068,55 @@ static void test_unwalkable_pack_is_reported_until_repaired(void **state)
     uint32_t pnum = 0;
     uint64_t off = 0;
     assert_int_equal(pack_resolve_location(store, h200, &pnum, &off), OK);
-    uint64_t g = e.entry / PARITY_GROUP_DATA;
 
-    /* The headers in f200's group, every one of a file still in snapshot 2,
-     * so the index keeps a row for each through the first gc's sweep. */
+    /*
+     * The headers of one group, every one of a file still in snapshot 2, so
+     * the index keeps a row for each through the first gc's sweep and the
+     * repair can rebuild them. Which group: the one holding the most such
+     * headers. The pack's order follows the scan's inode order, which
+     * depends on the filesystem and on which inodes earlier tests freed, so
+     * f200's own group could hold a file snapshot 2 deleted, or a tree, and
+     * asserting it did not failed on a CI runner whose layout differed.
+     * Only snapshot 2's headers are damaged; anything else in the group is
+     * left as it is.
+     */
     char pk[32];
     snprintf(pk, sizeof(pk), "%u", pnum);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
         "SELECT hash, offset FROM pack_objects WHERE pack_id = ? ORDER BY offset",
         (const char *[]){ pk, NULL }, &r), 0);
+    assert_true(r->nrows > 0);
+    uint64_t ngroups = strtoull(r->rows[r->nrows - 1][1], NULL, 10) / PARITY_GROUP_DATA + 1;
+    uint32_t *live = calloc((size_t)ngroups, sizeof(*live));
+    uint8_t  *in_s2 = calloc((size_t)r->nrows, 1);
+    assert_non_null(live);
+    assert_non_null(in_s2);
+    for (int i = 0; i < r->nrows; i++) {
+        uint64_t o = strtoull(r->rows[i][1], NULL, 10);
+        if (o / PARITY_GROUP_DATA != (o + sizeof(pack_dat_entry_hdr_t) - 1) / PARITY_GROUP_DATA)
+            continue;
+        if (snap_count_of(s2, r->rows[i][0]) == 0) continue;
+        in_s2[i] = 1;
+        live[o / PARITY_GROUP_DATA]++;
+    }
+    uint64_t g = 0;
+    for (uint64_t k = 1; k < ngroups; k++)
+        if (live[k] > live[g]) g = k;
+    free(live);
     int fd = open(e.path, O_RDWR);
     assert_true(fd >= 0);
     size_t damaged_bytes = 0;
     for (int i = 0; i < r->nrows; i++) {
         uint64_t o = strtoull(r->rows[i][1], NULL, 10);
-        if (o / PARITY_GROUP_DATA != g ||
-            (o + sizeof(pack_dat_entry_hdr_t) - 1) / PARITY_GROUP_DATA != g)
-            continue;
-        assert_true(snap_count_of(s2, r->rows[i][0]) > 0);
+        if (!in_s2[i] || o / PARITY_GROUP_DATA != g) continue;
         uint8_t b[sizeof(pack_dat_entry_hdr_t)];
         assert_int_equal(pread(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
         for (size_t k = 0; k < sizeof(b); k++) b[k] ^= 0x5A;
         assert_int_equal(pwrite(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
         damaged_bytes += sizeof(b);
     }
+    free(in_s2);
     close(fd);
     db_result_free(r);
     /* Far past the 512 bytes a group corrects. */

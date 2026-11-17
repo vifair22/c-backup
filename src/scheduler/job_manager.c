@@ -2,6 +2,7 @@
 
 #include "job_manager.h"
 
+#include "db_txn.h"
 #include "lock.h"
 #include "routes.h"
 
@@ -260,6 +261,48 @@ static void set_job_state(job_manager_t *jm, int64_t job_id,
             log_error("job %s: cannot record state %s", id, state);
     }
     pthread_mutex_unlock(&jm->db_mu);
+}
+
+/*
+ * A job's end: its journal entry and its final state, in one transaction,
+ * the entry first (B159).
+ *
+ * The state used to be written first and the entry after it, as two
+ * statements, so a client polling the job saw "completed" and could read
+ * the journal in between and not find the entry; the CLI end-to-end suite
+ * did exactly that, intermittently. One transaction also means a crash
+ * cannot keep one without the other: state without entry lost the job from
+ * the permanent record, and entry without state had the next start journal
+ * it a second time as interrupted. Every handle shares one connection, so
+ * the order inside the transaction is what a concurrent reader sees.
+ *
+ * The transaction lock is taken before db_mu, never inside it: a job
+ * holding a transaction reports progress, which takes db_mu.
+ */
+static void finish_job(job_manager_t *jm, int64_t job_id, const char *state,
+                       const char *error, int64_t repo_id, int64_t schedule_id,
+                       const char *origin, const char *action, const char *outcome,
+                       int64_t took_ms, const char *message)
+{
+    /* error and message must not be the thread's error buffer (err_msg()),
+     * which a failed begin overwrites; the worker passes a copy. */
+    int txn = db_txn_begin(jm->db) == OK;
+    if (!txn) {
+        log_warn("job %lld: cannot open a transaction for its end (%s); recording "
+                 "the journal entry and then the state", (long long)job_id, err_msg());
+        err_clear();
+    }
+    if (repo_id > 0) {
+        pthread_mutex_lock(&jm->db_mu);
+        journal_job(jm->db, repo_id, schedule_id, origin, action, outcome, took_ms,
+                    message);
+        pthread_mutex_unlock(&jm->db_mu);
+    }
+    set_job_state(jm, job_id, state, error);
+    if (txn && db_txn_commit(jm->db) != OK) {
+        log_error("job %lld: cannot commit its end: %s", (long long)job_id, err_msg());
+        err_clear();
+    }
 }
 
 /*
@@ -685,20 +728,37 @@ static void *worker_main(void *arg)
          * knows the job was accepted.
          */
         const char *outcome;
+        const char *state;
+        /* A copy: the transaction below may overwrite the error buffer, and
+         * the alert after it still needs the reason. */
+        char detail_buf[ERR_MSG_MAX];
         const char *detail = NULL;
         int cancelled = atomic_load_explicit(&ws->cancel, memory_order_relaxed);
         if (st == OK) {
             outcome = "success";
-            set_job_state(jm, slot.job_id, "completed", NULL);
+            state   = "completed";
         } else if (cancelled) {
             outcome = "cancelled";
-            set_job_state(jm, slot.job_id, "cancelled", NULL);
+            state   = "cancelled";
         } else {
             outcome = "failed";
-            detail = err_msg();
-            set_job_state(jm, slot.job_id, "failed", detail);
+            state   = "failed";
+            snprintf(detail_buf, sizeof(detail_buf), "%s", err_msg());
+            detail = detail_buf;
             log_warn("job %lld (%s) failed: %s",
                      (long long)slot.job_id, slot.action, detail);
+        }
+        {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t took = (int64_t)(now.tv_sec - began.tv_sec) * 1000
+                         + (now.tv_nsec - began.tv_nsec) / 1000000;
+            /* A success journalled an empty message, so the entry for a
+             * retention pass could not say what it deleted - the one thing
+             * anybody reading a journal of deletions wants. */
+            finish_job(jm, slot.job_id, state, detail, slot.repo_id, slot.schedule_id,
+                       slot.origin, slot.action, outcome, took,
+                       st == OK ? pc.summary : detail);
         }
         {
             struct timespec fin;
@@ -713,19 +773,6 @@ static void *worker_main(void *arg)
                      (unsigned long long)pc.seen_total);
         }
 
-        if (slot.repo_id > 0) {
-            pthread_mutex_lock(&jm->db_mu);
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            int64_t took = (int64_t)(now.tv_sec - began.tv_sec) * 1000
-                         + (now.tv_nsec - began.tv_nsec) / 1000000;
-            /* A success journalled an empty message, so the entry for a
-             * retention pass could not say what it deleted - the one thing
-             * anybody reading a journal of deletions wants. */
-            journal_job(jm->db, slot.repo_id, slot.schedule_id, slot.origin, slot.action,
-                        outcome, took, st == OK ? pc.summary : detail);
-            pthread_mutex_unlock(&jm->db_mu);
-        }
         free(pc.summary);
         pc.summary = NULL;
         pthread_mutex_lock(&jm->db_mu);
@@ -834,12 +881,25 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
      * absent from the permanent record for ever. This is the only point that
      * knows those jobs ended, so it writes their entries.
      */
+    /* Entries and states in one transaction (B159), so a crash here cannot
+     * leave the jobs marked failed and unjournalled, or journalled and still
+     * running, to be journalled again at the next start. */
+    int txn = db_txn_begin(db) == OK;
+    if (!txn) {
+        log_warn("job manager: cannot open a transaction to close interrupted jobs: %s",
+                 err_msg());
+        err_clear();
+    }
     journal_interrupted(db);
     if (db_execute_non_query(db,
             "UPDATE jobs SET state = 'failed', ended = strftime('%s','now'),"
             " error = 'interrupted by daemon restart'"
             " WHERE state IN ('running','queued')", NULL, NULL) != 0)
         log_warn("job manager: cannot clear stale jobs");
+    if (txn && db_txn_commit(db) != OK) {
+        log_warn("job manager: cannot commit the interrupted jobs: %s", err_msg());
+        err_clear();
+    }
     prune_finished_jobs(jm);
 
     jm->workers = calloc((size_t)max_parallel, sizeof(pthread_t));
@@ -872,16 +932,10 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
  */
 static void finish_unstarted(job_manager_t *jm, job_slot_t *taken)
 {
-    set_job_state(jm, taken->job_id, "cancelled", NULL);
+    finish_job(jm, taken->job_id, "cancelled", NULL, taken->repo_id, taken->schedule_id,
+               taken->origin, taken->action, "cancelled", 0, "cancelled before it started");
     log_info("job %lld cancelled before it started: %s, repo %lld",
              (long long)taken->job_id, taken->action, (long long)taken->repo_id);
-    if (taken->repo_id > 0) {
-        pthread_mutex_lock(&jm->db_mu);
-        journal_job(jm->db, taken->repo_id, taken->schedule_id, taken->origin,
-                    taken->action,
-                    "cancelled", 0, "cancelled before it started");
-        pthread_mutex_unlock(&jm->db_mu);
-    }
     if (taken->arg_free) taken->arg_free(taken->arg);
     free(taken->action);
     taken->action = NULL;
