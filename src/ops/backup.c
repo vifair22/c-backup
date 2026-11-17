@@ -195,6 +195,17 @@ typedef struct bsink {
     int             no_rows;
     pending_row_t  *rows;
     size_t          n, cap;
+    /*
+     * The first failure of the sink itself - a write to the pack, a seal,
+     * a row - with its message. A sink failure is the repository's, never
+     * the file's: before B182 it came back through the file's store like a
+     * read error, the file was skipped as unreadable, and the backup went
+     * on writing to a disk that had just said it was full. The settle can
+     * also swallow it (a file that changed under the read is read again),
+     * so it is kept here and checked after every file.
+     */
+    status_t        failed;
+    char            failed_msg[ERR_MSG_MAX];
 } bsink_t;
 
 /*
@@ -806,9 +817,25 @@ static status_t bsink_add_prepared(bsink_t *s, const pack_prepared_t *pp,
             r->orig = pp->len;
         }
     }
+    if (st != OK && s->failed == OK) {
+        s->failed = st;
+        snprintf(s->failed_msg, sizeof(s->failed_msg), "%s",
+                 err_msg()[0] ? err_msg() : "the repository write failed (no detail recorded)");
+    }
     pthread_mutex_unlock(&s->mu);
     *out_is_new = is_new;
     *out_phys = phys;
+    return st;
+}
+
+/* The sink's failure, set as the current error, or OK. */
+static status_t bsink_failure(bsink_t *s)
+{
+    if (!s) return OK;
+    pthread_mutex_lock(&s->mu);
+    status_t st = s->failed;
+    if (st != OK) set_error(st, "%s", s->failed_msg);
+    pthread_mutex_unlock(&s->mu);
     return st;
 }
 
@@ -844,6 +871,7 @@ typedef struct {
 typedef struct {
     cdc_result_t    cr;
     settle_result_t sr;
+    status_t        sink_st;   /* the worker's sink failed: the backup fails */
 } fpool_out_t;
 
 static void store_io_forward(uint64_t bytes, void *ctx)
@@ -890,6 +918,9 @@ static status_t fpool_store(void *ctx, void *wstate, store_pool_job_t *j)
     const scan_entry_t *e = &p->scan->entries[j->index];
     status_t st = settle_store_fd(cp, j->fd, &e->st, &sink, &o, NULL, NULL,
                                   &r->cr, &r->sr);
+    /* A failed write is the repository's, whatever the settle made of it. */
+    r->sink_st = bsink_failure(w->sink);
+    if (r->sink_st != OK) st = r->sink_st;
     j->out = r;
     return st;
 }
@@ -917,6 +948,8 @@ static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
     p->bytes_done += e->node.size;
     if (j->st != OK && cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
     const fpool_out_t *o = j->out;
+    if (o && o->sink_st != OK)
+        return set_error(o->sink_st, "backup: storing %s: %s", e->path, j->err);
     if (o) {
         /* A discarded or failed read's objects are in the worker's packs
          * all the same. */
@@ -1816,6 +1849,16 @@ static status_t store_content_loop(pipeline_t *p)
              * moving on to the next one. */
             batch_close(p, b);
             return set_error(ERR_BUSY, "backup cancelled");
+        }
+        /* The repository failed, not the file: the backup fails (B182). */
+        {
+            status_t sfail = bsink_failure(p->sink);
+            if (sfail != OK) {
+                char why[ERR_MSG_MAX];
+                snprintf(why, sizeof(why), "%s", err_msg());
+                batch_close(p, b);
+                return set_error(sfail, "backup: storing %s: %s", e->path, why);
+            }
         }
         /* Chunks a failed or discarded read staged are in the open pack;
          * their rows go in with the next flush, unreferenced, for gc. */
