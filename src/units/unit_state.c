@@ -198,12 +198,24 @@ int units_allowed(const char *provider, const char *unit_id, const char *name)
 /* Hold journal                                                        */
 /* ------------------------------------------------------------------ */
 
+int64_t units_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* created_at is milliseconds (002_units.sql predates that and says no
+ * unit). In whole seconds a hold recorded late in one second was overdue
+ * up to a second early, which with a 1 s limit meant at once. Only the
+ * watchdog reads the column; a row from a daemon that stored seconds
+ * reads as long overdue, and belongs to a job that is gone. */
 static status_t j_record(void *ctx, const char *kind, const char *detail, int64_t *out)
 {
     units_journal_t *j = ctx;
     char job[32], now[32];
     snprintf(job, sizeof(job), "%lld", (long long)j->job_id);
-    snprintf(now, sizeof(now), "%lld", (long long)time(NULL));
+    snprintf(now, sizeof(now), "%lld", (long long)units_now_ms());
     if (db_txn_begin(j->db) != OK) return set_error(ERR_IO, "hold journal: begin");
     db_result_t *r = NULL;
     int ok = db_execute(j->db,
@@ -404,11 +416,11 @@ status_t units_sweep(cutils_db_t *db, int64_t self_job, units_sweep_result_t *ou
 /* Watchdog                                                            */
 /* ------------------------------------------------------------------ */
 
-status_t units_watchdog_tick(cutils_db_t *db, time_t now, unsigned *released)
+status_t units_watchdog_tick(cutils_db_t *db, int64_t now_ms, unsigned *released)
 {
     char f[32], pz[32];
-    snprintf(f, sizeof(f), "%lld", (long long)(now - (time_t)g_cfg.freeze_timeout_s));
-    snprintf(pz, sizeof(pz), "%lld", (long long)(now - (time_t)g_cfg.max_pause_s));
+    snprintf(f, sizeof(f), "%lld", (long long)(now_ms - (int64_t)g_cfg.freeze_timeout_s * 1000));
+    snprintf(pz, sizeof(pz), "%lld", (long long)(now_ms - (int64_t)g_cfg.max_pause_s * 1000));
     db_result_t *r = NULL;
     if (db_execute(db,
             "SELECT id, provider, unit_id, kind, detail, COALESCE(job_id, 0)"
@@ -457,7 +469,7 @@ static void *wd_main(void *arg)
         if (g_wd.stop) break;
         pthread_mutex_unlock(&g_wd.mu);
         unsigned n = 0;
-        if (units_watchdog_tick(g_wd.db, time(NULL), &n) != OK) {
+        if (units_watchdog_tick(g_wd.db, units_now_ms(), &n) != OK) {
             log_warn("%s", err_msg());
             err_clear();
         }
