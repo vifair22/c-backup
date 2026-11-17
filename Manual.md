@@ -2287,8 +2287,10 @@ Two things are never taken for missing packs:
   repository is reported unavailable (`state` is `unavailable` in
   `c-backup repo show` and `repo list`, with the reason in `unavailable`),
   and every job on it - backup, verify, reindex, retention, restore - is
-  refused. The alert says the job was refused because the repository is
-  unavailable; it claims no data loss. A repository is unavailable when:
+  refused before the repository is touched, so a refused backup does not
+  even create `tmp/` in an empty mountpoint. The alert says the job was
+  refused because the repository is unavailable; it claims no data loss.
+  A repository is unavailable when:
 
   - its root has no `.cbackup` marker: an empty mountpoint, or the wrong
     path;

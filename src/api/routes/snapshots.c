@@ -1239,9 +1239,10 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
     store_t *store = NULL;
     store_index_t *idx = NULL;
     /*
-     * Every kind refuses an unavailable repository before it opens it. A
-     * verify there used to report every object missing as data loss, and
-     * a reindex would have read the empty packs/ as every pack gone.
+     * Every kind refuses an unavailable repository before it opens it,
+     * which would create tmp/ in an empty mountpoint (NIT-38). A verify
+     * there used to report every object missing as data loss, and a
+     * reindex would have read the empty packs/ as every pack gone (NIT-37).
      */
     status_t st = pack_presence_require(j->db, j->repo_id);
     if (st != OK) return st;
@@ -2198,6 +2199,12 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
 
     status_t st = repo_trylock_write(repo_id);
     if (st != OK) { free(repo_path); return api_error(503, "repo is busy"); }
+
+    if (pack_presence_require(g_ctx.db, repo_id) != OK) {
+        repo_unlock(repo_id);
+        free(repo_path);
+        return api_error(409, err_msg());
+    }
 
     store_t *store = NULL;
     st = repo_store_open(repo_path, NULL, &store);

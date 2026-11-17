@@ -20,6 +20,7 @@
  */
 
 #include "routes.h"
+#include "pack_presence.h"
 #include "json_row.h"
 
 #include "db_txn.h"
@@ -696,7 +697,10 @@ static void units_job_free(void *p)
 static status_t open_store(const char *path, cutils_db_t *db, int64_t repo_id,
                            atomic_int *cancel, store_t **store, store_index_t **idx)
 {
-    status_t st = repo_store_open_keyed(path, NULL, store);
+    /* Before the open, which creates tmp/ (NIT-38). */
+    status_t st = pack_presence_require(db, repo_id);
+    if (st != OK) return st;
+    st = repo_store_open_keyed(path, NULL, store);
     if (st != OK) return st;
     st = store_index_bind(*store, db, repo_id, idx);
     if (st != OK) { store_close(*store); *store = NULL; return st; }

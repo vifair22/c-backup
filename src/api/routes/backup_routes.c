@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "pack_presence.h"
 #include "json_row.h"
 
 #include "backup.h"
@@ -278,7 +279,11 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
      * it. A request holding it at dispatch defers the job, never fails it. */
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    status_t st = repo_store_open_keyed(j->repo_path, NULL, &store);
+    /* Before the open, which creates tmp/: a backup refused because the
+     * repository is an empty mountpoint leaves nothing in it (NIT-38). */
+    status_t st = pack_presence_require(j->db, j->repo_id);
+    if (st != OK) return st;
+    st = repo_store_open_keyed(j->repo_path, NULL, &store);
     if (st != OK) return st;
 
     st = store_index_bind(store, j->db, j->repo_id, &idx);

@@ -1264,8 +1264,9 @@ check "GET the repair"           "405 POST"        "$(sock_method GET /repos/1/r
 contains "a whole repository's state is ok" '"state":"ok"'      "$REPO1"
 contains "and it is not unavailable"      '"unavailable":null'    "$REPO1"
 
-# NIT-37, B156: a repository whose root is an empty mountpoint is
-# unavailable: shown so, and a verify on it refused, claiming no data loss.
+# NIT-37/38, B156: a repository whose root is an empty mountpoint is
+# unavailable: shown so, and every job on it refused before it is touched -
+# a backup creates nothing there, and a verify claims no data loss.
 echo "unavailable repository"
 R=$(sock_send POST /repos "{\"path\":\"$WORK/gonerepo\",\"label\":\"gone\"}")
 GONE=$(printf '%s' "$R" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
@@ -1275,13 +1276,19 @@ GB=$(sock_body "/repos/$GONE")
 contains "an empty mountpoint is unavailable" '"state":"unavailable"' "$GB"
 contains "saying why"                     '.cbackup marker'        "$GB"
 contains "and listed so"                  '"state":"unavailable"'  "$(sock_body /repos)"
+GJ=$(job_id "$(sock_send POST "/repos/$GONE/backup" "{\"paths\":[\"$WORK/src\"]}")")
+wait_job "$GJ"
+GJB=$(sock_body "/jobs/$GJ")
+contains "the backup is refused"          '"state":"failed"'       "$GJB"
+contains "as unavailable"                 'is unavailable'         "$GJB"
+check "and nothing is created in the mountpoint" "" "$(ls -A "$WORK/gonerepo")"
 GV=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" "http://localhost/repos/$GONE/verify?level=deep")")
 wait_job "$GV"
 GVB=$(sock_body "/jobs/$GV")
 contains "a verify is refused as unavailable" 'is unavailable'     "$GVB"
 case "$GVB" in *"data loss"*|*MISSING*) bad "and claims no data loss" "no loss" "$GVB" ;;
                *) ok "and claims no data loss" ;; esac
-check "nothing is created in the mountpoint" ""                     "$(ls -A "$WORK/gonerepo")"
+check "still nothing in the mountpoint"   ""                       "$(ls -A "$WORK/gonerepo")"
 rmdir "$WORK/gonerepo"
 mv "$WORK/gonerepo.mounted" "$WORK/gonerepo"
 contains "mounted again, it is ok"        '"state":"ok"'           "$(sock_body "/repos/$GONE")"
