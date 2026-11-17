@@ -45,7 +45,9 @@
 #include "prune.h"
 #include "store_index.h"
 #include "fake_provider.h"
+#include "privs.h"
 #include "registry.h"
+#include "remote_provider.h"
 #include "unit_state.h"
 
 #ifndef VERSION_STRING
@@ -162,6 +164,16 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
         log_warn("units: the fake provider is enabled from %s; this is for tests", spec);
     }
 
+    /* Through the helper: it holds the sockets, the caps and the holds. A
+     * helper that is not up yet is not fatal: the link keeps trying with a
+     * bounded backoff and enables its providers when it answers, and a unit
+     * job meanwhile fails naming the socket (remote_provider.h). */
+    const char *hs = config_get_str(cfg, "units.helper_socket");
+    if (hs && *hs && remote_start(hs, units_daemon8(), NULL) != OK) {
+        log_warn("units: %s; retrying in the background", err_msg());
+        err_clear();
+    }
+
     units_sweep_result_t sw;
     st = units_sweep(db, 0, &sw);
     if (st != OK) return st;
@@ -273,6 +285,23 @@ int main(int argc, char *argv[])
         goto out_guard;
     }
     int sync_normal = strcmp(tuning.synchronous, "normal") == 0;
+
+    /*
+     * Down to the configured uid before anything else is opened: no repo
+     * lock, job, socket or provider exists yet (source-providers.md 11.6).
+     * AppGuard has the config and the database open already, which is why
+     * the image owns the state volume by that uid.
+     */
+    {
+        int run_as = config_get_int(cfg, "security.run_as_uid", 0);
+        if (privs_drop((uid_t)run_as, (gid_t)run_as) != OK) {
+            log_error("security.run_as_uid: %s", err_msg());
+            goto out_guard;
+        }
+        if (run_as > 0)
+            log_info("running as uid %d with CAP_DAC_READ_SEARCH; restores raise their own "
+                     "capabilities", run_as);
+    }
     log_info("state database: synchronous=%s, cache %d MiB, checkpoint every %d pages",
              tuning.synchronous, tuning.cache_mb, tuning.wal_autocheckpoint);
 
@@ -519,6 +548,7 @@ out_jm:
     /* After the jobs: none is in a session any more. Both are safe when
      * startup failed before they were set up. */
     units_shutdown();
+    remote_stop();
     sp_registry_shutdown();
 out_purge:
     repo_purge_stop();

@@ -78,7 +78,7 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
 SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/scheduler -I src/common \
-                -I src/providers -I src/units \
+                -I src/providers -I src/units -I src/helper \
                 -I src/config -I src/daemon -I $(CUTILS_DIR)/include \
                 -I $(CUTILS_DIR)/lib/cJSON
 COMMON_CFLAGS := -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
@@ -126,7 +126,10 @@ endif
 
 DAEMON_TARGET := $(BINS)/c-backupd$(BIN_SUFFIX)
 CLI_TARGET    := $(BINS)/c-backup$(BIN_SUFFIX)
-TARGETS       := $(DAEMON_TARGET) $(CLI_TARGET)
+# The host helper (docs/source-providers.md 11): a separate privileged
+# sidecar, built from the same objects with its own main.
+HELPER_TARGET := $(BINS)/c-backup-helper$(BIN_SUFFIX)
+TARGETS       := $(DAEMON_TARGET) $(CLI_TARGET) $(HELPER_TARGET)
 
 # ---- Sources and objects ----------------------------------------------
 # Sources live under src/{cli,ops,store,api,common}.  Object files are
@@ -137,8 +140,9 @@ TARGETS       := $(DAEMON_TARGET) $(CLI_TARGET)
 # with distinct object names rather than going through the pattern rule.
 DAEMON_MAIN := $(SRC)/daemon/main.c
 CLI_MAIN    := $(SRC)/cli/main.c
+HELPER_MAIN := $(SRC)/helper/helper_main.c
 ALL_SRCS    := $(shell find $(SRC) -name '*.c')
-SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN), $(ALL_SRCS))
+SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN) $(HELPER_MAIN), $(ALL_SRCS))
 SRC_DIRS    := $(sort $(dir $(ALL_SRCS)))
 VPATH       := $(SRC_DIRS)
 # cJSON is not compiled here. c-utils carries it and libc-utils.a holds its
@@ -159,7 +163,8 @@ endif
 
 DAEMON_OBJ  := $(OBJ_DIR)/daemon_main.o
 CLI_OBJ     := $(OBJ_DIR)/cli_main.o
-OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ)
+HELPER_OBJ  := $(OBJ_DIR)/helper_main.o
+OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ) $(HELPER_OBJ)
 
 # Generated code (the embedded migrations): match the optimisation level but
 # drop the strict warnings, since nobody edits it by hand.
@@ -251,6 +256,9 @@ $(DAEMON_TARGET): $(LIB_OBJS) $(DAEMON_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
 $(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
 	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
 
+$(HELPER_TARGET): $(LIB_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
+	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
+
 # ---- Tests (link against release lib objects) -------------------------
 REL_OBJ_DIR := $(BUILD)/release
 REL_LIB_OBJS = $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
@@ -325,6 +333,7 @@ test-cli: all $(FREE_PORT)
 .PHONY: test-units
 test-units: all
 	@$(SCRATCH_GUARD) test_units_e2e.sh ./$(TESTS)/test_units_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
+	@$(SCRATCH_GUARD) test_helper_e2e.sh ./$(TESTS)/test_helper_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/c-backup-helper
 
 # The shell suites each start a daemon and poll jobs on a wall-clock budget,
 # so anything running beside them under -j competes for CPU and disk and makes
@@ -814,9 +823,21 @@ GCOVR_FLAGS := $(shell gcovr --help 2>/dev/null | grep -q -- --gcov-suspicious-h
 # Counters from an earlier run are cleared first. gcov adds to whatever .gcda
 # it finds, so a second local run reported the sum of both, and a few runs in
 # the hit counts on parity.c's SIMD loop grew past what gcovr will believe.
+#
+# As root (CI), the suites that leave root still count. The helper suites
+# drop to a fixed non-root uid for good (helper_fixture.h hf_unroot), and
+# gcov writes their counters at exit, as that uid, into .gcda files the
+# root-run suites before them had already created 0644 and root's: every
+# write failed, and helper_server.c, helper_proto.c, helper_policy.c and
+# remote_provider.c read 0% while their suites ran and passed (pipeline
+# 5214: 79.3% against 80%; 86.8% measured as a normal user). So, as root
+# only, the coverage tree's directories take any writer and the suites run
+# under umask 000, which makes the counter files gcov creates 0666.
 coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI) $(FREE_PORT)
 	@find $(COV_DIR) -name '*.gcda' -delete
-	@over=0; \
+	@if [ "$$(id -u)" = 0 ]; then find $(COV_DIR) -type d -exec chmod a+rwx {} +; fi
+	@if [ "$$(id -u)" = 0 ]; then umask 000; fi; \
+	over=0; \
 	run() { n=$$1; shift; \
 	    C_BACKUP_SCRATCH_QUIET=1 $(SCRATCH_GUARD) "$$n" "$$@"; rc=$$?; \
 	    [ $$rc -eq 99 ] && over=1; \
@@ -826,6 +847,7 @@ coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI) $(FREE_PORT)
 	done; \
 	run test_api_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_api_e2e.sh $(COV_DAEMON); \
 	run test_cli_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI); \
+	run test_units_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_units_e2e.sh $(COV_DAEMON) $(COV_CLI); \
 	if [ $$over -ne 0 ]; then echo "coverage: a suite went over its scratch budget" >&2; exit 1; fi
 	@gcovr $(GCOVR_FLAGS) -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="

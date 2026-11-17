@@ -4,6 +4,7 @@
 #include "backup.h"
 #include "block_source.h"
 #include "registry.h"
+#include "remote_provider.h"
 #include "reserved.h"
 #include "unit_index.h"
 #include "unit_json.h"
@@ -551,6 +552,12 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     memset(out, 0, sizeof(*out));
     if (!o || !o->provider || (!o->all && o->n_units == 0))
         return set_error(ERR_INVALID, "unit backup: name a provider and units, or all");
+    /* A provider behind a helper that is not there now: the job fails,
+     * and its failure (and alert) names the helper's socket. Never a
+     * quiet skip. */
+    char hwhy[512];
+    if (remote_unusable(o->provider, hwhy, sizeof(hwhy)))
+        return set_error(ERR_IO, "%s", hwhy);
     const sp_provider_ops_t *ops = NULL;
     sp_ctx_t *pctx = NULL;
     status_t st = sp_registry_get(o->provider, &ops, &pctx);

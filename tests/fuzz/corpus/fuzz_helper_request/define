@@ -1,0 +1,1 @@
+{"v":1,"id":5,"op":"unit.define","args":{"unit":"lxc:cbk-uat-1","definition":{"privileged":false}}}

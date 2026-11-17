@@ -1,0 +1,57 @@
+#pragma once
+
+/*
+ * c-backup-helper's server (docs/source-providers.md 11): the control half
+ * of the provider vtable, behind a typed protocol, with the policy, the
+ * leases and the watchdogs held here rather than in the network-facing
+ * daemon, so a dead or compromised daemon cannot leave a guest frozen or a
+ * container paused, or act outside the policy.
+ *
+ * Backends: the fake provider (enabled by the policy's test-only
+ * fake_spec) for units, and dir_domains for capture.begin_paths and
+ * restore staging. libvirt, docker and lxc operations are validated and
+ * policy-checked and then answered `unsupported` until their providers
+ * exist.
+ */
+
+#include "error.h"
+#include "helper_policy.h"
+#include "provider.h"
+
+#include <stddef.h>
+#include <time.h>
+
+typedef struct helper_server helper_server_t;
+
+typedef struct {
+    const helper_policy_t *policy;
+    sp_ctx_t              *fake;          /* NULL: no fake backend */
+    /* Bind the policy's socket (1) or serve no socket at all (0: tests
+     * drive helper_server_handle directly). */
+    int                    listen;
+    unsigned               watchdog_ms;   /* 0: 1000 */
+} helper_server_cfg_t;
+
+/*
+ * Start: read the state directory's records, release every hold they name
+ * and sweep this daemon id's leftover artefacts, then listen and run the
+ * watchdog. Holds and leases are recorded in <state_dir>/holds.json.
+ */
+status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **out);
+void     helper_server_stop(helper_server_t *s);
+
+/*
+ * One request as if it came over a connection from the daemon's uid, after
+ * hello. *resp is malloc'd JSON; *pass_fd is an fd to send with it, or -1.
+ * The caller owns both.
+ */
+void helper_server_handle(helper_server_t *s, const char *req, size_t len,
+                          char **resp, int *pass_fd);
+
+/* One watchdog pass at now: holds past max_pause_s, captures past their
+ * lease, hook runs past their timeout. Returns how many it released. */
+unsigned helper_server_tick(helper_server_t *s, time_t now);
+
+/* Live captures and journalled holds, for tests. */
+size_t helper_server_captures(helper_server_t *s);
+size_t helper_server_holds(helper_server_t *s);

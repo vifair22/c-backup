@@ -345,6 +345,9 @@ const char *sp_read_mode_name(sp_read_mode_t m);
 
 /* Whether a read-mode reason is in the bounded vocabulary of section 6.4. */
 int         sp_reason_known(const char *reason);
+/* The vocabulary's own static string for reason, or NULL: for a reason
+ * that arrived as text (from the helper) and has to outlive it. */
+const char *sp_reason_canonical(const char *reason);
 
 /* Free a session info a provider built with the helpers below. */
 void        sp_session_info_free(sp_session_info_t *info);

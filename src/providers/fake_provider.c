@@ -265,6 +265,15 @@ status_t fake_unit_rename(sp_ctx_t *ctx, const char *unit_id, const char *name)
     return n ? OK : set_error(ERR_NOMEM, "fake: rename");
 }
 
+int fake_unit_state(sp_ctx_t *ctx, const char *unit_id)
+{
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    int s = u ? u->state : -1;
+    pthread_mutex_unlock(&ctx->mu);
+    return s;
+}
+
 status_t fake_unit_set_state(sp_ctx_t *ctx, const char *unit_id, int state)
 {
     pthread_mutex_lock(&ctx->mu);
@@ -1161,6 +1170,84 @@ static status_t f_block_open(sp_session_t *s, const sp_item_desc_t *item,
     out->close = fs_close;
     out->ctx = f;
     return OK;
+}
+
+/* A stream that owns its disk, for the daemon side of the helper split. */
+typedef struct {
+    fstream_t f;
+    fdisk_t   d;
+} owned_stream_t;
+
+static void owned_close(void *ctx)
+{
+    owned_stream_t *o = ctx;
+    free(o->d.runs);
+    free(o);
+}
+
+status_t fake_stream_from_runs(uint64_t size, const fake_run_t *runs, size_t n_runs,
+                               fake_alloc_t alloc, sp_block_stream_t *out)
+{
+    owned_stream_t *o = calloc(1, sizeof(*o));
+    if (!o) return set_error(ERR_NOMEM, "fake: stream");
+    o->d.size = size;
+    o->d.alloc = alloc;
+    o->d.n_runs = n_runs;
+    o->d.runs = dupmem(runs, n_runs * sizeof(*runs));
+    if (!o->d.runs) { free(o); return set_error(ERR_NOMEM, "fake: stream"); }
+    for (size_t i = 0; i < n_runs; i++)
+        if (runs[i].off + runs[i].len > size || runs[i].len == 0 ||
+            (i && runs[i].off < runs[i - 1].off + runs[i - 1].len)) {
+            owned_close(o);
+            return set_error(ERR_INVALID, "fake: runs out of order or range");
+        }
+    o->f.d = &o->d;
+    /* The fstream_t is the first member, so its callbacks take o as ctx. */
+    out->extent = fs_extent;
+    out->changed = fs_changed;
+    out->read = fs_read;
+    out->close = owned_close;
+    out->ctx = o;
+    return OK;
+}
+
+status_t fake_disk_runs(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
+                        uint64_t *size, fake_run_t **runs, size_t *n_runs,
+                        fake_alloc_t *alloc)
+{
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    status_t st = set_error(ERR_NOT_FOUND, "fake: no disk %s/%s", unit_id, item_id);
+    for (size_t i = 0; u && i < u->nd; i++) {
+        if (strcmp(u->disks[i].id, item_id) != 0) continue;
+        *size = u->disks[i].size;
+        *alloc = u->disks[i].alloc;
+        *n_runs = u->disks[i].n_runs;
+        *runs = dupmem(u->disks[i].runs, u->disks[i].n_runs * sizeof(fake_run_t));
+        st = *runs ? OK : set_error(ERR_NOMEM, "fake: runs");
+        if (st == OK) err_clear();
+        break;
+    }
+    pthread_mutex_unlock(&ctx->mu);
+    return st;
+}
+
+status_t fake_blob_data(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
+                        void **data, size_t *len)
+{
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    status_t st = set_error(ERR_NOT_FOUND, "fake: no blob %s/%s", unit_id, item_id);
+    for (size_t i = 0; u && i < u->nb; i++) {
+        if (strcmp(u->blobs[i].id, item_id) != 0) continue;
+        *data = dupmem(u->blobs[i].data, u->blobs[i].len);
+        *len = u->blobs[i].len;
+        st = *data ? OK : set_error(ERR_NOMEM, "fake: blob");
+        if (st == OK) err_clear();
+        break;
+    }
+    pthread_mutex_unlock(&ctx->mu);
+    return st;
 }
 
 static status_t f_tree_root(sp_session_t *s, const sp_item_desc_t *item,
