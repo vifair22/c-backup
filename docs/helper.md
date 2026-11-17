@@ -101,15 +101,24 @@ Notes that matter:
   directory, so the daemon's existing mount of `/run/c-backup-helper`
   already shows it at the same path, which libvirt's exports need.
 
-- **Restore staging stays out of sight.** An in-place restore stages in
+- **Where restore staging goes.** An in-place restore stages in
   the mount's own domain and swaps by rename. The directory is the first
   `[snapshot] restore_staging_dirs` entry inside the domain; with none, a
   whole-pool domain (FS2's `/mnt/cache`) stages in
   `<pool>/system/.cbackup-restore`, beside the snapshot directory, and a
-  share domain in `<domain>/.cbackup-restore`. Either way it is refused at
-  the top of a pool or in a share exported over SMB or NFS, and refused
-  when it is on another filesystem from the mount (a btrfs subvolume or
-  another dataset), since the swap could not be a rename.
+  share domain in `<domain>/.cbackup-restore`. Either way (B171) it is
+  refused at the top of a pool, in a share whose mover sends files to the
+  array (`shareUseCache="yes"`: a staged restore could be split across
+  devices), and on another filesystem from the mount (a btrfs subvolume or
+  another dataset), since the swap could not be a rename. Whether the share
+  is exported over SMB or NFS does not matter: anyone who can write the
+  share can already edit the data in it. The helper creates the base and
+  each restore's directory 0700, owned by the daemon, which writes inside
+  them as uid 990 with no write capability on directories it does not own;
+  a base root owns (made by hand) is given to the daemon too. A base owned
+  by anyone else is used as it is, as long as it is a real directory.
+  What it never does is follow a symlink to one (Restore staging and
+  define, below).
 
 - **The policy lives on the flash** (`/boot/config/`), root-owned, mode 0600
   or 0644. The helper refuses to start on a file anybody but its owner can
@@ -476,9 +485,25 @@ pool's capture directory and counted as one more instant.
 
 ### Restore staging and define
 
-`restore.stage` creates `<domain>/.cbackup-restore/<job>` inside the
-mount's snapshot domain and `restore.swap` renames the old directory to
-`<mount>.cbackup-old-<job>` and the staged one into place: never a delete.
+`restore.stage` creates `<domain>/.cbackup-restore/<job>-<random>` inside
+the mount's snapshot domain and `restore.swap` puts the staged one in place
+and the old directory at `<mount>.cbackup-old-<job>`: never a delete.
+
+The staging is pinned (B171). At stage the helper opens the base and the
+job directory with `O_DIRECTORY|O_NOFOLLOW`, one component at a time from
+the domain, and keeps both fds and their device and inode. At swap it
+checks that the base's path still names the pinned directory, that the job
+directory inside it is the pinned one; any mismatch is refused (`denied`,
+logged at ERROR:
+`restore staging ... was replaced or moved after it was staged; not
+swapped`) and nothing moves. The swap itself is `renameat2` on the pinned
+fds: `RENAME_EXCHANGE` of the staged directory with the mount, one atomic
+step with no instant where the mount is missing, then the old tree from
+the staging to `<mount>.cbackup-old-<job>` with `RENAME_NOREPLACE`. Where
+the filesystem lacks `RENAME_EXCHANGE`, the old directory moves aside first
+and back again if the second rename fails. However the share's contents
+are changed in between, the root helper renames only what it created and
+never writes outside the share.
 The helper does this itself, so it needs the pools at their host paths in
 its own mount namespace, which `-v /mnt/cache:/mnt/cache:rshared` above
 provides (add one per pool). The daemon writes into the staging directory
@@ -657,7 +682,7 @@ running.
 The NVRAM and TPM state are staged by the daemon under `staging_root`
 (writable by the daemon), and disk staging sits in
 `<image directory>/.cbackup-restore/`, which the daemon needs writable for
-in-place restores.
+in-place restores, under the same rules.
 
 ## Testing
 
@@ -777,6 +802,12 @@ Policy: `zfs_domains = cache/appdata`. Repeat steps 1, 2, 4 and 5 under
 8. That the daemon container sees `.zfs/snapshot/<name>` through its
    `rslave` mount. If not, record it: the helper would have to mount the
    snapshot explicitly (not built).
+9. **In-place restore on FS1 (B171).** With the Manual's
+   `/mnt/cache/appdata/.cbackup-restore` (exported share and all), restore
+   a `cbk-uat-*` unit in place: it stages, swaps, and the container starts
+   on the restored data, the old directory at `<mount>.cbackup-old-<job>`.
+   Then a scratch share with `shareUseCache="yes"` as
+   `restore_staging_dirs`: the stage is refused naming the mover.
 
 **LXC (FS1).** A disposable `cbk-uat-lxc` (busybox template) under
 `/mnt/cache/lxc`, policy `[lxc] enabled = 1`, `zfs_domains` including
