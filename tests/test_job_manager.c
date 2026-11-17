@@ -53,6 +53,13 @@ static int g_peak[8];         /* highest simultaneous count seen per repo */
 static int g_total_running;
 static int g_peak_total;
 static int g_completed;
+/* The rendezvous below (FLAKE-21), under the same mutex. */
+#define RV_NEED      2
+#define RV_BOUND_S   60
+static pthread_cond_t g_rv_cv = PTHREAD_COND_INITIALIZER;
+static int g_rv_arrived;      /* rendezvous jobs that have started */
+static int g_rv_met;          /* of those, how many saw all RV_NEED running */
+static int g_rv_timed_out;
 
 static void rmrf(const char *p)
 {
@@ -75,6 +82,9 @@ static int setup(void **state)
     g_total_running = 0;
     g_peak_total = 0;
     g_completed = 0;
+    g_rv_arrived = 0;
+    g_rv_met = 0;
+    g_rv_timed_out = 0;
 
     if (job_manager_start(db, 2, &jm) != OK) return -1;
     return 0;
@@ -113,6 +123,68 @@ static status_t probe_job(void *arg, atomic_int *cancel,
     g_completed++;
     pthread_mutex_unlock(&g_mu);
     return OK;
+}
+
+/*
+ * A rendezvous, for proving two jobs run at once without timing them
+ * (FLAKE-21). Each rendezvous job arrives, then waits until RV_NEED have
+ * arrived: they can all return only if they were all running together, so
+ * a dispatcher that serialised them leaves the first waiting and the test
+ * fails at the bound, while one that overlaps them passes however slowly
+ * the host schedules the second. Measuring overlap by wall time (two
+ * 120 ms sleeps) failed on a loaded host, where the second job could start
+ * after the first had finished its sleep.
+ */
+
+static status_t rendezvous_job(void *arg, atomic_int *cancel,
+                               void (*progress)(const char *, uint64_t, uint64_t, void *),
+                               void *progress_ctx)
+{
+    (void)cancel; (void)progress; (void)progress_ctx;
+    int repo = (int)(intptr_t)arg;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += RV_BOUND_S;
+
+    pthread_mutex_lock(&g_mu);
+    g_running[repo]++;
+    if (g_running[repo] > g_peak[repo]) g_peak[repo] = g_running[repo];
+    g_rv_arrived++;
+    pthread_cond_broadcast(&g_rv_cv);
+    int rc = 0;
+    while (g_rv_arrived < RV_NEED && rc == 0)
+        rc = pthread_cond_timedwait(&g_rv_cv, &g_mu, &deadline);
+    if (g_rv_arrived >= RV_NEED) g_rv_met++;
+    else                         g_rv_timed_out++;
+    g_running[repo]--;
+    g_completed++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+static void submit_rendezvous(int64_t repo_id)
+{
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, repo_id, "gc", NULL, rendezvous_job,
+                                (void *)(intptr_t)repo_id, NULL, &id), OK);
+    assert_true(id > 0);
+}
+
+/* Wait until n jobs have returned, bounded past the rendezvous bound so a
+ * rendezvous that times out is what the test reports. */
+static int wait_completed(int n)
+{
+    for (int i = 0; i < (RV_BOUND_S + 30) * 100; i++) {
+        pthread_mutex_lock(&g_mu);
+        int done = g_completed;
+        pthread_mutex_unlock(&g_mu);
+        if (done >= n) return done;
+        usleep(10000);
+    }
+    pthread_mutex_lock(&g_mu);
+    int done = g_completed;
+    pthread_mutex_unlock(&g_mu);
+    return done;
 }
 
 static void submit(int64_t repo_id, const char *action)
@@ -197,42 +269,50 @@ static void test_queued_jobs_all_complete(void **state)
 
 /*
  * The counterweight: serialising every job would pass the test above and
- * halve the daemon's throughput. Two repositories must still overlap.
+ * halve the daemon's throughput. Two repositories must still overlap: each
+ * job waits for the other to be running, so both return only if they ran
+ * at once (FLAKE-21).
  */
 static void test_different_repos_still_run_in_parallel(void **state)
 {
     (void)state;
-    submit(1, "gc");
-    submit(2, "gc");
-    wait_for(2);
+    submit_rendezvous(1);
+    submit_rendezvous(2);
+    assert_int_equal(wait_completed(2), 2);
 
     pthread_mutex_lock(&g_mu);
-    int peak_total = g_peak_total;
+    int met = g_rv_met, timed_out = g_rv_timed_out;
     pthread_mutex_unlock(&g_mu);
-
-    assert_int_equal(peak_total, 2);
+    assert_int_equal(timed_out, 0);
+    assert_int_equal(met, 2);
 }
 
 /*
  * A repository with a long queue must not stall an unrelated one behind it.
  * The dispatcher scans past a blocked job rather than waiting on the head.
+ *
+ * Repo 1's first job will not finish until repo 2's is running, and repo
+ * 2's is queued behind two more for repo 1. A dispatcher that waited on the
+ * head of the queue would never start it while repo 1's first job held the
+ * repository, so the rendezvous would time out (FLAKE-21: this measured
+ * overlap by wall time and failed on a loaded host).
  */
 static void test_a_busy_repo_does_not_block_another(void **state)
 {
     (void)state;
+    submit_rendezvous(1);
     submit(1, "gc");
     submit(1, "gc");
-    submit(1, "gc");
-    submit(2, "gc");   /* queued last, behind three for repo 1 */
-    wait_for(4);
+    submit_rendezvous(2);   /* queued last, behind three for repo 1 */
+    assert_int_equal(wait_completed(4), 4);
 
     pthread_mutex_lock(&g_mu);
-    int peak_total = g_peak_total;
+    int met = g_rv_met, timed_out = g_rv_timed_out, peak1 = g_peak[1];
     pthread_mutex_unlock(&g_mu);
-
-    /* Repo 2's job ran alongside one of repo 1's rather than after all of
-     * them, which only happens if the scan skipped the blocked entries. */
-    assert_int_equal(peak_total, 2);
+    assert_int_equal(timed_out, 0);
+    assert_int_equal(met, 2);
+    /* And repo 1 still ran one job at a time. */
+    assert_int_equal(peak1, 1);
 }
 
 /*
