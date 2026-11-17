@@ -826,7 +826,7 @@ snapshot name, raw XML for libvirt, or a raw create body for Docker.
 
 | Operation | Arguments (typed) | What the helper does |
 |---|---|---|
-| `hello` | `client_version` int | handshake |
+| `hello` | `client_version` int; `session` token, optional; `anchor` bool, optional | handshake; answers the policy digest, daemon id, providers, and the `holds` and `captures` the helper has now. `session` names the daemon process; `anchor` keeps the connection as that session's anchor, and when its last anchor closes the helper ends the captures the session began (a daemon killed mid-backup) |
 | `units.list` | `provider` enum | enumerate, filtered by the policy's unit allowlist |
 | `units.describe` | `unit` unit key | inspect / domain XML / LXC config, templates and compose files, read by the helper and returned as data |
 | `capture.begin` | `units` 1 to 32 unit keys; `pause` bool | resolves every included mount itself, computes snapshot domains itself and intersects them with the policy's domains; pauses or freezes members if asked, `syncfs`, one atomic snapshot per pool with names it generates, unpauses; returns an opaque capture token, the read root of each mount, timings and per-member outcomes. Holds a lease with a deadline |

@@ -183,7 +183,8 @@ typedef struct {
 } schema_t;
 
 static const schema_t k_schema[HOP_COUNT] = {
-    [HOP_HELLO]                  = { { { "client_version", A_INT } }, 1, 0 },
+    [HOP_HELLO]                  = { { { "client_version", A_INT }, { "session", A_TOKEN },
+                                       { "anchor", A_BOOL } }, 3, 0, 2 },
     [HOP_UNITS_LIST]             = { { { "provider", A_PROVIDER } }, 1, 0 },
     [HOP_UNITS_DESCRIBE]         = { { { "unit", A_UNIT } }, 1, 0 },
     [HOP_CAPTURE_BEGIN]          = { { { "units", A_UNITS }, { "pause", A_BOOL }, { "hold", A_BOOL } }, 3, 0, 1 },
@@ -248,6 +249,7 @@ static int take_arg(helper_req_t *r, const akey_t *k, const cJSON *v, char *why,
         if (!cJSON_IsBool(v)) return set_bad(why, wsz, "%s: %s must be true or false", op, k->key);
         if (strcmp(k->key, "hold") == 0) r->hold = cJSON_IsTrue(v);
         else if (strcmp(k->key, "undo") == 0) r->undo = cJSON_IsTrue(v);
+        else if (strcmp(k->key, "anchor") == 0) r->anchor = cJSON_IsTrue(v);
         else r->pause = cJSON_IsTrue(v);
         return 0;
     case A_PROVIDER:

@@ -220,7 +220,17 @@ the 19 of section 11.3 (`hello`, `units.list`, `units.describe`,
 
 The daemon (`src/providers/remote_provider.c`) opens one connection per
 request, says hello, sends it, and closes, so concurrent jobs never queue
-behind each other and a helper restart costs nothing. Data never crosses the
+behind each other and a helper restart costs nothing. Every hello carries
+`session`, a token the daemon makes at start, and the daemon keeps one more
+connection open for as long as it runs, the anchor (`hello` with `anchor`).
+When a session's last anchor closes, as the kernel closes it for a daemon
+that is killed, the helper ends the captures that session began as
+aborted, releasing their pauses, freezes, exports and snapshots then rather
+than at `capture_max_s`. A capture still in its begin ends itself when it
+finds its session gone, so a hold is never released from outside before
+it is taken. `hello` answers `holds` and `captures`, what the helper has
+journalled and open; `GET /providers` adds the helper's holds to
+`holds_open` and shows both under `helper`. Data never crosses the
 socket: the daemon reads trees through the read roots the helper returns,
 and disks through its own mounts (for the fake, its run map).
 

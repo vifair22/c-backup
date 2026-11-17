@@ -69,6 +69,8 @@ cat > "$WORK/units.json" <<EOF
   "blobs":[{"id":"domain.xml","path":".cbackup-unit/config/domain.xml","text":"<domain>a</domain>"}],
   "disks":[{"id":"vda","size":4194304,"runs":[{"off":0,"len":1048576,"kind":"data","seed":3}]}],
   "trees":[{"id":"vol","read_root":"$WORK/snap","path":"$WORK/pool/app/a"}]},
+ {"id":"k","name":"cbk-uat-k","state":"running","caps":["quiesce"],
+  "disks":[{"id":"vda","size":8589934592,"runs":[{"off":0,"len":8589934592,"kind":"data","seed":9}]}]},
  {"id":"c","name":"cbk-uat-c","state":"running","caps":["quiesce"],
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}]},
  {"id":"p","name":"prod-db","state":"running",
@@ -273,6 +275,33 @@ if command -v curl >/dev/null 2>&1; then
           -d '{"provider":"fake","all":true,"pausescope":"job"}')
     contains "and in a units job" "unknown key 'pausescope'" "$OUT"
 fi
+
+echo "a daemon killed mid-backup"
+# B169: the helper held the backup's export hold until its own restart or
+# capture_max_s, and holds_open said 0 meanwhile. Now the daemon's anchor
+# closes with it, and the helper ends the capture at once.
+cb unit backup 1 --provider fake cbk-uat-k > /dev/null 2>&1 &
+BG=$!
+for _ in $(seq 1 100); do
+    [ "$(cat "$WORK/hstate/holds.json" 2>/dev/null)" != "[]" ] && break; sleep 0.1
+done
+contains "the helper journals the running backup's hold" '"kind":"export"' "$(cat "$WORK/hstate/holds.json")"
+OUT=$(cb unit providers)
+lacks    "and holds_open counts it" '"holds_open":0' "$OUT"
+contains "the helper's holds are shown" '"holds":' "$OUT"
+kill -9 "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=
+wait "$BG" 2>/dev/null
+for _ in $(seq 1 50); do
+    [ "$(cat "$WORK/hstate/holds.json")" = "[]" ] && break; sleep 0.1
+done
+check    "the helper releases it within seconds of the kill" "[]" "$(cat "$WORK/hstate/holds.json")"
+contains "and says why" "session" "$(grep "ended (its connection closed)" "$WORK/helper.log")"
+C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "${AS_DAEMON[@]}" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+DAEMON_PID=$!
+for _ in $(seq 1 100); do
+    cb unit providers 2>/dev/null | grep -q '"state":"connected"' && break; sleep 0.1
+done
+contains "the restarted daemon sees no hold open" '"holds_open":0' "$(cb unit providers)"
 
 echo "helper gone"
 kill "$HELPER_PID"; wait "$HELPER_PID" 2>/dev/null; HELPER_PID=

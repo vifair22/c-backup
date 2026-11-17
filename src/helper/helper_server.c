@@ -76,7 +76,20 @@ typedef struct {
     time_t   deadline;
     member_t members[HELPER_UNITS_MAX];
     size_t   n_members;
+    /* The daemon session that began it, and whether that session held an
+     * anchor connection then: only such a capture ends with its session
+     * (B169); one begun with no anchor (a client that keeps none) lives
+     * to its lease as before. */
+    char     session[HELPER_TOKEN_HEX + 1];
+    int      anchored;
 } capture_t;
+
+/* A daemon session: the daemon process, by the token its hellos carry,
+ * and how many anchor connections it has open. */
+typedef struct {
+    char     token[HELPER_TOKEN_HEX + 1];
+    int      anchors;
+} dsession_t;
 
 typedef struct {
     int      used;
@@ -111,6 +124,7 @@ struct helper_server {
     capture_t              caps[CAPTURES_MAX];
     run_t                  runs[RUNS_MAX];
     staging_t              stages[STAGINGS_MAX];
+    dsession_t             sessions[CONNS_MAX];
     time_t                 recent[3600];  /* capture start times, a ring */
     size_t                 n_recent;
     int64_t                seq;
@@ -621,6 +635,70 @@ static int capture_take(helper_server_t *s, const char *token, capture_t *out)
     return c != NULL;
 }
 
+/*
+ * Daemon sessions (B169). A daemon killed mid-backup never sends
+ * capture.end, so its capture, and every hold under it (a pause, an
+ * export), lasted until capture_max_s (a day) or a helper restart, and the
+ * daemon's own holds_open said 0 meanwhile. The daemon keeps one anchor
+ * connection open for as long as it runs; when the last anchor of a
+ * session closes, which the kernel does for a killed process, the
+ * session's captures are ended as aborted, releasing their holds through
+ * the backend the way capture.end would. A capture still in its begin is
+ * left to that begin, which ends it itself on finding its session gone,
+ * so a hold recorded and not yet taken is never released from outside
+ * (the record-before-take rule, B151). Caller holds mu for the first two.
+ */
+static int session_anchored(const helper_server_t *s, const char *tok)
+{
+    if (!tok[0]) return 0;
+    for (size_t i = 0; i < CONNS_MAX; i++)
+        if (s->sessions[i].anchors > 0 && strcmp(s->sessions[i].token, tok) == 0) return 1;
+    return 0;
+}
+
+static void anchor_add(helper_server_t *s, const char *tok)
+{
+    pthread_mutex_lock(&s->mu);
+    dsession_t *free_slot = NULL, *have = NULL;
+    for (size_t i = 0; i < CONNS_MAX && !have; i++) {
+        if (s->sessions[i].anchors > 0 && strcmp(s->sessions[i].token, tok) == 0) have = &s->sessions[i];
+        else if (!free_slot && s->sessions[i].anchors == 0) free_slot = &s->sessions[i];
+    }
+    if (!have && free_slot) {
+        have = free_slot;
+        snprintf(have->token, sizeof(have->token), "%s", tok);
+    }
+    if (have) have->anchors++;
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* The anchor closed: on the session's last, end its captures. */
+static void anchor_drop(helper_server_t *s, const char *tok)
+{
+    pthread_mutex_lock(&s->cmu);
+    int stopping = s->stop;
+    pthread_mutex_unlock(&s->cmu);
+    capture_t *ended = calloc(CAPTURES_MAX, sizeof(*ended));
+    size_t n = 0;
+    pthread_mutex_lock(&s->mu);
+    int last = 0;
+    for (size_t i = 0; i < CONNS_MAX; i++)
+        if (s->sessions[i].anchors > 0 && strcmp(s->sessions[i].token, tok) == 0)
+            last = --s->sessions[i].anchors == 0;
+    /* At a helper stop the stop ends every capture itself. */
+    for (size_t i = 0; last && !stopping && ended && i < CAPTURES_MAX; i++)
+        if (s->caps[i].used == 1 && s->caps[i].anchored && strcmp(s->caps[i].session, tok) == 0) {
+            ended[n++] = s->caps[i];
+            s->caps[i].used = 0;
+        }
+    pthread_mutex_unlock(&s->mu);
+    if (n)
+        log_warn("helper: the daemon's session %.8s... ended (its connection closed) with %zu capture(s) "
+                 "open; ending them and releasing their holds", tok, n);
+    for (size_t i = 0; i < n; i++) capture_finish(s, &ended[i], SP_END_ABORTED);
+    free(ended);
+}
+
 static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pass_fd)
 {
     int lfd = -1;             /* items only known after begin: hook logs */
@@ -645,6 +723,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         slot->used = 2;       /* reserved: not findable until filled */
         slot->seq = seq;
     }
+    int anchored = session_anchored(s, r->conn_session);
     pthread_mutex_unlock(&s->mu);
     if (!ok) return resp_error(r->id, HELPER_E_BUSY, "more than %u captures in the last hour",
                                s->pol->max_captures_per_hour);
@@ -653,6 +732,8 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
     capture_t c;
     memset(&c, 0, sizeof(c));
     c.seq = seq;
+    snprintf(c.session, sizeof(c.session), "%s", r->conn_session);
+    c.anchored = anchored;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     cJSON *res = cJSON_CreateObject();
@@ -895,8 +976,18 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
     c.deadline = now + (time_t)s->pol->capture_max_s;
     c.used = 1;
     pthread_mutex_lock(&s->mu);
-    *slot = c;
+    /* Its session may have ended while it began: nobody will end it now. */
+    int orphan = c.anchored && !session_anchored(s, c.session);
+    if (orphan) slot->used = 0;
+    else *slot = c;
     pthread_mutex_unlock(&s->mu);
+    if (orphan) {
+        log_warn("helper: the daemon's session %.8s... ended during a capture's begin; ending it", c.session);
+        cJSON_Delete(res);
+        capture_finish(s, &c, SP_END_ABORTED);
+        if (lfd >= 0) close(lfd);
+        return resp_error(r->id, HELPER_E_FAILED, "the daemon's session ended during the begin");
+    }
     cJSON_AddStringToObject(res, "capture", c.token);
     cJSON_AddNumberToObject(res, "snapshot_ms",
                             (double)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
@@ -926,6 +1017,8 @@ static char *op_capture_begin_paths(helper_server_t *s, const helper_req_t *r)
         memset(slot, 0, sizeof(*slot));
         slot->seq = seq;
         slot->deadline = now + (time_t)s->pol->capture_max_s;
+        snprintf(slot->session, sizeof(slot->session), "%s", r->conn_session);
+        slot->anchored = session_anchored(s, r->conn_session);
         if (helper_random_hex(slot->token, 16) == OK) slot->used = 1;
         else slot = NULL;
     }
@@ -1817,6 +1910,9 @@ static char *op_hello(helper_server_t *s, const helper_req_t *r)
     cJSON_AddNumberToObject(res, "version", HELPER_PROTO_VERSION);
     cJSON_AddStringToObject(res, "daemon_id", s->pol->daemon_id);
     cJSON_AddStringToObject(res, "policy", s->pol->digest);
+    /* What the helper holds now, for the daemon's holds_open (B169). */
+    cJSON_AddNumberToObject(res, "holds", (double)helper_server_holds(s));
+    cJSON_AddNumberToObject(res, "captures", (double)helper_server_captures(s));
     cJSON *p = cJSON_AddArrayToObject(res, "providers");
     for (size_t i = 0; p && i < s->nb; i++)
         cJSON_AddItemToArray(p, cJSON_CreateString(s->backends[i].name));
@@ -1856,16 +1952,24 @@ void helper_server_handle(helper_server_t *s, const char *req, size_t len,
     helper_server_handle_fd(s, req, len, -1, resp, pass_fd);
 }
 
-void helper_server_handle_fd(helper_server_t *s, const char *req, size_t len, int in_fd,
-                             char **resp, int *pass_fd)
+/* One request on a connection whose hello named session ("" for none). */
+static void handle_in_session(helper_server_t *s, const char *req, size_t len, int in_fd,
+                              const char *session, char **resp, int *pass_fd)
 {
     *pass_fd = -1;
     helper_req_t r;
     char why[512];
     helper_err_t e = helper_request_parse(req, len, &r, why, sizeof(why));
+    snprintf(r.conn_session, sizeof(r.conn_session), "%s", session);
     *resp = e == HELPER_OK ? dispatch(s, &r, pass_fd, in_fd) : resp_error(r.id, e, "%s", why);
     helper_req_free(&r);
     err_clear();
+}
+
+void helper_server_handle_fd(helper_server_t *s, const char *req, size_t len, int in_fd,
+                             char **resp, int *pass_fd)
+{
+    handle_in_session(s, req, len, in_fd, "", resp, pass_fd);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1879,7 +1983,8 @@ static void *conn_main(void *arg)
     conn_arg_t *c = arg;
     helper_server_t *s = c->s;
     char *buf = malloc(HELPER_PACKET_MAX + 2);
-    int greeted = 0;
+    int greeted = 0, anchor = 0;
+    char session[HELPER_TOKEN_HEX + 1] = "";
     while (buf) {
         size_t got = 0;
         int rfd = -1;
@@ -1902,13 +2007,15 @@ static void *conn_main(void *arg)
             if (e == HELPER_OK && r.op == HOP_HELLO) {
                 resp = dispatch(s, &r, &pfd, -1);
                 greeted = 1;
+                snprintf(session, sizeof(session), "%s", r.token);
+                if (r.anchor && session[0]) { anchor = 1; anchor_add(s, session); }
             } else {
                 resp = resp_error(r.id, e != HELPER_OK ? e : HELPER_E_DENIED,
                                   "%s", e != HELPER_OK ? why : "the first request must be hello");
             }
             helper_req_free(&r);
         } else {
-            helper_server_handle_fd(s, buf, got, rfd, &resp, &pfd);
+            handle_in_session(s, buf, got, rfd, session, &resp, &pfd);
         }
         if (rfd >= 0) close(rfd);
         if (resp) (void)helper_send(c->fd, resp, strlen(resp), pfd);
@@ -1917,6 +2024,8 @@ static void *conn_main(void *arg)
         if (pfd >= 0) close(pfd);
     }
     free(buf);
+    /* The daemon gone, killed or stopped: its captures go with it. */
+    if (anchor) anchor_drop(s, session);
     pthread_mutex_lock(&s->cmu);
     close(c->fd);
     s->conns[c->slot] = -1;

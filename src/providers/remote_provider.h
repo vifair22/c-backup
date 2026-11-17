@@ -10,6 +10,12 @@
  * provider the helper offers, under the same name. Every request opens its
  * own connection (one hello, one request), so concurrent jobs never queue
  * behind each other on one socket, and a helper restart costs nothing.
+ *
+ * Every hello names this daemon process's session (a random token made at
+ * remote_start), and the link keeps one more connection open, the anchor,
+ * for as long as it runs. When the process dies, killed or not, the kernel
+ * closes the anchor and the helper ends the captures that session began,
+ * releasing their holds then rather than at capture_max_s (B169).
  */
 
 #include "error.h"
@@ -23,6 +29,7 @@ typedef struct {
     char daemon_id[16];
     char policy[72];
     char providers[128];        /* comma separated */
+    long holds, captures;       /* what the helper held when it answered */
 } remote_hello_t;
 
 /*
@@ -85,6 +92,10 @@ status_t remote_op(const char *provider, const char *op, struct cJSON *args, int
  * naming the socket; else 0.
  */
 int      remote_unusable(const char *provider, char *why, size_t wsz);
+
+/* What the helper holds now (a fresh hello): its journalled holds and open
+ * captures. Fails when no helper is configured or it does not answer. */
+status_t remote_helper_holds(long *holds, long *captures);
 
 /* The last hello, for GET /providers; empty before an attach. */
 const remote_hello_t *remote_last_hello(void);

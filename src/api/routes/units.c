@@ -187,10 +187,17 @@ static api_response_t providers_list(void)
     if (root) {
         cJSON_AddStringToObject(root, "daemon_id", units_daemon8());
         cJSON_AddStringToObject(root, "allow", units_config()->allow ? units_config()->allow : "");
-        cJSON_AddNumberToObject(root, "holds_open", (double)units_intents_open(g_db, NULL));
-        /* The helper, as its hello said (source-providers.md 11.2). */
+        /* Holds open anywhere: the daemon's journal, and what the helper
+         * journals for the providers behind it, asked now. It used to be
+         * the daemon's alone, so a hold a killed daemon left in the helper
+         * showed as 0 (B169). */
         remote_link_info_t li;
         remote_link_info(&li);
+        long hholds = 0, hcaps = 0;
+        int asked = li.configured && li.state == REMOTE_CONNECTED && remote_helper_holds(&hholds, &hcaps) == OK;
+        if (li.configured && !asked) err_clear();
+        cJSON_AddNumberToObject(root, "holds_open", (double)(units_intents_open(g_db, NULL) + (asked ? hholds : 0)));
+        /* The helper, as its hello said (source-providers.md 11.2). */
         if (li.configured) {
             cJSON *ho = cJSON_AddObjectToObject(root, "helper");
             if (ho) {
@@ -204,6 +211,10 @@ static api_response_t providers_list(void)
                 cJSON_AddStringToObject(ho, "daemon_id", li.hello.daemon_id);
                 cJSON_AddStringToObject(ho, "policy", li.hello.policy);
                 cJSON_AddStringToObject(ho, "providers", li.hello.providers);
+                if (asked) {
+                    cJSON_AddNumberToObject(ho, "holds", (double)hholds);
+                    cJSON_AddNumberToObject(ho, "captures", (double)hcaps);
+                }
             }
         }
         cJSON_AddBoolToObject(root, "privileges_dropped", privs_dropped());

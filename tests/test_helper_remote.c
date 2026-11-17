@@ -542,6 +542,98 @@ static void test_define_fails_rolls_back(void **state)
     assert_int_equal(stat(HF_MOUNT ".cbackup-old-45/live.txt", &sb), 0);
 }
 
+/* Wait up to 5 s for the helper to hold no capture and no hold. */
+static int helper_drained(void)
+{
+    for (int i = 0; i < 500; i++) {
+        fake_stats_t fs;
+        fake_stats(fk, &fs);
+        if (helper_server_captures(srv) == 0 && helper_server_holds(srv) == 0 && fs.holds_now == 0) return 1;
+        struct timespec ts = { 0, 10 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+/* Begin a session on fake:u1 through the remote provider, as a unit
+ * backup does, and leave it open. */
+static status_t begin_open(sp_session_t **sess)
+{
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *ctx = NULL;
+    if (sp_registry_get("fake", &ops, &ctx) != OK) return ERR_INVALID;
+    sp_unit_desc_t *d = NULL;
+    status_t st = ops->describe(ctx, "u1", &d);
+    if (st != OK) return st;
+    sp_begin_req_t q;
+    memset(&q, 0, sizeof(q));
+    q.job_id = 77;
+    q.want = SP_CONSIST_APPLICATION;
+    q.require = SP_CONSIST_CRASH;
+    q.daemon8 = units_daemon8();
+    const sp_session_info_t *info = NULL;
+    st = ops->begin(ctx, d, &q, sess, &info);
+    ops->desc_free(d);
+    return st;
+}
+
+/* B169: the daemon's session ends (here remote_stop closes the anchor, as
+ * the kernel does for a killed daemon) with a capture open: the helper
+ * ends it and releases its holds at once, not at capture_max_s. */
+static void test_session_end_releases(void **state)
+{
+    (void)state;
+    sp_session_t *sess = NULL;
+    assert_int_equal(begin_open(&sess), OK);
+    assert_int_equal(helper_server_captures(srv), 1);
+    assert_true(helper_server_holds(srv) > 0);
+    /* holds_open counts the helper's holds too: what GET /providers asks. */
+    long hh = 0, hc = 0;
+    assert_int_equal(remote_helper_holds(&hh, &hc), OK);
+    assert_true(hh > 0);
+    assert_int_equal(hc, 1);
+    remote_stop();
+    assert_true(helper_drained());
+    /* The session is gone, so its end finds no capture; nothing leaks. */
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *ctx = NULL;
+    assert_int_equal(sp_registry_get("fake", &ops, &ctx), OK);
+    (void)ops->end(sess, SP_END_ABORTED, 0);
+    err_clear();
+}
+
+typedef struct { status_t st; char err[512]; } begin_job_t;
+
+static void *bg_begin(void *arg)
+{
+    begin_job_t *j = arg;
+    sp_session_t *sess = NULL;
+    j->st = begin_open(&sess);
+    snprintf(j->err, sizeof(j->err), "%s", err_msg());
+    return NULL;
+}
+
+/* B169: the session ends while a capture is still in its begin, holding a
+ * freeze it recorded: the begin, not the session's end, releases it (the
+ * record-before-take rule), and nothing is left. */
+static void test_session_end_during_begin(void **state)
+{
+    (void)state;
+    fake_fail_set(fk, "u1", FAKE_HANG_IN_HOLD, 800);
+    begin_job_t j;
+    memset(&j, 0, sizeof(j));
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, bg_begin, &j), 0);
+    struct timespec ts = { 0, 300 * 1000000L };
+    nanosleep(&ts, NULL);
+    remote_stop();
+    pthread_join(th, NULL);
+    fake_fail_clear(fk);
+    assert_int_not_equal(j.st, OK);
+    assert_non_null(strstr(j.err, "session ended"));
+    assert_true(helper_drained());
+}
+
 /* A compose project's definition as the daemon assembles it from a
  * snapshot: files, .env, services with their image records, and under a new
  * name the binds remapped under the target root. */
@@ -706,6 +798,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define_refused_first, setup, teardown),
         cmocka_unit_test_setup_teardown(test_in_place_needs_restore, setup_define_norestore, teardown),
         cmocka_unit_test_setup_teardown(test_define_fails_rolls_back, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_session_end_releases, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_session_end_during_begin, setup, teardown),
         cmocka_unit_test_setup_teardown(test_compose_definition, setup, teardown),
         cmocka_unit_test_setup_teardown(test_group_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
