@@ -496,6 +496,20 @@ static int h_repo_show(const args_t *a)
     return get_repo_scoped(a->pos[0], "", NULL);
 }
 
+/*
+ * The operator accepting that a degraded repository's missing packs are
+ * gone (B150). The flag is the point, so there is no form without it.
+ */
+static int h_repo_repair(const args_t *a)
+{
+    if (!args_flag(a, "--accept-missing"))
+        return refuse(a, "repair marks the missing packs' objects as lost, so the next "
+                         "backup stores them again; say so with --accept-missing");
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/repos/"); sb_puts(&p, a->pos[0]); sb_puts(&p, "/repair");
+    return call_path_sb("POST", &p, "{\"accept_missing\":true}");
+}
+
 static int h_repo_remove(const args_t *a)
 {
     /* Deregisters. The repository directory stays where it is. */
@@ -1727,6 +1741,9 @@ static const arg_opt_t O_UNIT_RESTORE[] = {
 };
 static const arg_opt_t O_PROVIDER[] = { { "--provider", NULL, ARG_VALUE, "P" }, OPT_END };
 static const arg_opt_t O_ALL[] = { { "--all", NULL, ARG_FLAG, NULL }, OPT_END };
+static const arg_opt_t O_ACCEPT_MISSING[] = {
+    { "--accept-missing", NULL, ARG_FLAG, NULL }, OPT_END,
+};
 
 typedef struct {
     arg_spec_t spec;
@@ -1740,6 +1757,8 @@ static const command_t COMMANDS[] = {
         "--encrypt is fixed at creation; a passphrase alone implies passphrase" },
       h_repo_add, 0 },
     { { "repo show",       P_REPO,     NULL, NULL }, h_repo_show, 0 },
+    { { "repo repair",     P_REPO,     O_ACCEPT_MISSING,
+        "a degraded repository: accept its missing packs as lost" }, h_repo_repair, 0 },
     { { "repo remove",     P_REPO,     NULL, NULL }, h_repo_remove, 0 },
     { { "repo key export", P_REPO,     NULL, NULL }, h_repo_key_export, 0 },
     { { "repo key import", P_KEY_IMP,  NULL, NULL }, h_repo_key_import, 0 },
