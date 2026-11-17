@@ -645,6 +645,44 @@ static void test_session_end_during_begin(void **state)
     assert_true(helper_drained());
 }
 
+typedef struct { uint64_t last_done, last_total; int backwards; } bytes_seen_t;
+
+static void seen_bytes(void *ctx, uint64_t done, uint64_t total)
+{
+    bytes_seen_t *b = ctx;
+    if (done < b->last_done || total < b->last_total) b->backwards = 1;
+    b->last_done = done;
+    b->last_total = total;
+}
+
+/* A unit restore over two mounts reports bytes over both: its total was
+ * one mount's, and its done went back to 0 at the second. */
+static void test_define_bytes_over_mounts(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(HF_DIR "/snap2", 0700), 0);
+    hf_write(HF_DIR "/snap2/b.txt", "bravo-bravo\n");
+    assert_int_equal(fake_tree_add(fk, "u1", "vol2", HF_DIR "/snap2", HF_POOL "/app/u1b"), OK);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    bytes_seen_t seen;
+    memset(&seen, 0, sizeof(seen));
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.name = "u1-copy";
+    o.target_root = HF_DIR "/target";
+    o.ropts.bytes_cb = seen_bytes;
+    o.ropts.progress_ctx = &seen;
+    unit_define_result_t dr;
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 51, &o, &dr), OK);
+    unit_define_result_free(&dr);
+    assert_false(seen.backwards);
+    assert_int_equal(seen.last_total, 6 + 12);      /* alpha\n and bravo-bravo\n */
+    assert_int_equal(seen.last_done, 6 + 12);
+}
+
 static atomic_int id_warnings;
 
 static void count_id_warning(const char *ts, const char *level, const char *func, const char *msg, void *ud)
@@ -838,6 +876,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_session_end_releases, setup, teardown),
         cmocka_unit_test_setup_teardown(test_session_end_during_begin, setup, teardown),
         cmocka_unit_test_setup_teardown(test_id_mismatch_said_once, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_bytes_over_mounts, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_compose_definition, setup, teardown),
         cmocka_unit_test_setup_teardown(test_group_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),

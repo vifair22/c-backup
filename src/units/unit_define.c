@@ -354,6 +354,36 @@ status_t unit_define_build(store_t *store, cutils_db_t *db, int64_t repo_id, int
     return st;
 }
 
+/*
+ * Byte progress over every restore_run of a unit restore. Each run reports
+ * its own done and total, so the job's bytes_total was one mount's, and
+ * its done went back to 0 at each. A run that starts (its total changes, or
+ * its done goes back) has the one before it folded into a base: done only
+ * grows, and the total is every mount so far plus the current one.
+ */
+typedef struct {
+    restore_opts_t orig;
+    uint64_t base_done, base_total, cur_done, cur_total;
+} bytes_agg_t;
+
+static void agg_progress(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    const bytes_agg_t *a = ctx;
+    if (a->orig.progress_cb) a->orig.progress_cb(phase, done, total, a->orig.progress_ctx);
+}
+
+static void agg_bytes(void *ctx, uint64_t done, uint64_t total)
+{
+    bytes_agg_t *a = ctx;
+    if (total != a->cur_total || done < a->cur_done) {
+        a->base_done += a->cur_done;
+        a->base_total += a->cur_total;
+    }
+    a->cur_done = done;
+    a->cur_total = total;
+    if (a->orig.bytes_cb) a->orig.bytes_cb(a->orig.progress_ctx, a->base_done + done, a->base_total + total);
+}
+
 /* One file of the snapshot (a disk image, the NVRAM) restored to dest. */
 static status_t restore_file(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                              const unit_define_opts_t *o, const char *rel, const char *dest)
@@ -699,6 +729,14 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
      * for a new name, compared with the id alone. */
     unit_define_opts_t own = *o;
     own.name = unit_define_name(db, repo_id, snap_id, unit, o->name);
+    bytes_agg_t agg;
+    memset(&agg, 0, sizeof(agg));
+    agg.orig = o->ropts;
+    if (o->ropts.bytes_cb || o->ropts.progress_cb) {
+        own.ropts.progress_cb = o->ropts.progress_cb ? agg_progress : NULL;
+        own.ropts.bytes_cb = o->ropts.bytes_cb ? agg_bytes : NULL;
+        own.ropts.progress_ctx = &agg;
+    }
     o = &own;
     char why[512];
     if (unit_define_check(unit, o, why, sizeof(why)) != 0) return set_error(ERR_INVALID, "%s", why);
