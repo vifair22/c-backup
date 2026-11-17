@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# A stand-in for the host's docker CLI, for the helper's compose define:
+# records each invocation and the override it was given, and succeeds.
+#   $FAKE_HOST_STATE/compose.log   every invocation
+#   $FAKE_HOST_STATE/override.yaml the last -f cbackup-override.yaml
+#   FAKE_COMPOSE_FAIL=1            exit 1, as without the compose plugin
+set -u
+S=${FAKE_HOST_STATE:?FAKE_HOST_STATE is not set}
+echo "docker $*" >> "$S/compose.log"
+if [ "${FAKE_COMPOSE_FAIL:-}" = 1 ]; then echo "docker: 'compose' is not a docker command." >&2; exit 1; fi
+[ "${1:-}" = compose ] || { echo "fake docker: only compose" >&2; exit 2; }
+prev=""
+for a in "$@"; do
+    if [ "$prev" = "-f" ]; then
+        [ -f "$a" ] || { echo "open $a: no such file" >&2; exit 1; }
+        case "$a" in *cbackup-override.yaml) cp "$a" "$S/override.yaml" ;; esac
+    fi
+    prev=$a
+done
+exit 0

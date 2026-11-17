@@ -43,7 +43,10 @@ typedef enum {
     SP_CONSIST_OFFLINE      = 4, /* the unit was not running while read */
 } sp_consistency_t;
 
-typedef enum { SP_ITEM_BLOB = 1, SP_ITEM_BLOCK = 2, SP_ITEM_TREE = 3 } sp_item_kind_t;
+/* STREAM: bytes of unknown length produced while the unit is read (a dump
+ * hook's stdout), stored like a BLOB under the unit directory but never held
+ * in memory, and left out of the snapshot when its producer fails. */
+typedef enum { SP_ITEM_BLOB = 1, SP_ITEM_BLOCK = 2, SP_ITEM_TREE = 3, SP_ITEM_STREAM = 4 } sp_item_kind_t;
 
 typedef enum {
     SP_STATE_UNKNOWN   = 0,
@@ -145,6 +148,11 @@ typedef struct {
     const sp_holds_t      *holds;
     /* The per-daemon id artefacts are named with (section 6.3), 8 hex. */
     const char            *daemon8;
+    /* pause-read (container-backup.md section 7): when the unit has mounts
+     * on no snapshot domain, pause it and keep the pause past begin
+     * (SP_CF_PAUSE_HELD) until release, so the caller's second pass over
+     * those mounts is consistent with the snapshot. */
+    int                    hold_pause;
 } sp_begin_req_t;
 
 typedef struct {
@@ -159,6 +167,7 @@ typedef struct {
 #define SP_CF_PAUSED            0x04u
 #define SP_CF_FS_SNAPSHOT       0x08u
 #define SP_CF_WATCHDOG_RELEASED 0x10u
+#define SP_CF_PAUSE_HELD        0x20u  /* begin returned with the unit still paused */
 
 /* Filled by begin, read by the job, owned by the session. */
 typedef struct {
@@ -237,7 +246,10 @@ typedef struct {
  * and the start-up and end-of-job sweeps delete the row. The watchdog
  * keeps it: it sweeps holds of live jobs, and a row is recorded before its
  * hold is taken, so nothing held may mean not taken yet. Deleting the row
- * then would leave the hold, once taken, unjournalled and unbounded.
+ * then would leave the hold, once taken, unjournalled and unbounded. The
+ * helper's watchdog does the same with its own journal. Only freezes and
+ * pauses are timed, so a provider must fill it for those kinds; for the
+ * rest it may leave 0.
  */
 typedef struct {
     const char        *daemon8;
@@ -340,6 +352,28 @@ typedef struct sp_provider_ops {
                                   sp_restore_plan_t *out);
     status_t (*define)(sp_ctx_t *ctx, const sp_restore_req_t *req,
                        const sp_restore_plan_t *plan, sp_define_result_t *out);
+
+    /* STREAM items. stream_open hands over a pipe the bytes arrive on, read
+     * to EOF by the caller and closed by it; stream_close then says whether
+     * the producer succeeded (*ok), and only then is the item kept. NULL
+     * when the provider has no streams. */
+    /* One capture over several units (pause scope group or job,
+     * container-backup.md 6.2): every member of every unit paused together
+     * when a pause is called for, one atomic snapshot per pool for all of
+     * them, then one session per unit, read and ended separately; the
+     * shared snapshots go with the last end. NULL: each unit begins on its
+     * own. */
+    status_t (*begin_group)(sp_ctx_t *ctx, const sp_unit_desc_t *const *units, size_t n,
+                            const sp_begin_req_t *req, sp_session_t **out,
+                            const sp_session_info_t **infos);
+
+    /* Let go a pause begin kept (SP_CF_PAUSE_HELD). *cap_hit 1 when it had
+     * already been released by the watchdog at the pause cap, so what was
+     * read under it is not all from one instant. NULL: never held. */
+    status_t (*release)(sp_session_t *s, int *cap_hit);
+
+    status_t (*stream_open)(sp_session_t *s, const sp_item_desc_t *item, int *fd);
+    status_t (*stream_close)(sp_session_t *s, const sp_item_desc_t *item, int *ok);
 } sp_provider_ops_t;
 
 /* Names, for unit.json, the API and the index. NULL for a value outside

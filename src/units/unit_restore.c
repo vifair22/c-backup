@@ -1,6 +1,7 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include "unit_restore.h"
+#include "unit_define.h"
 #include "chunklist.h"
 #include "manifest.h"
 #include "snap_record.h"
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -165,5 +167,36 @@ status_t unit_restore_item(store_t *store, cutils_db_t *db, int64_t repo_id,
         st = set_error_errno(ERR_IO, "item restore: rename to %s", dest);
     if (st != OK) { unlink(partial); return st; }
     out->bytes = got;
+    return OK;
+}
+
+status_t unit_read_file(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                        const char *rel, size_t max, char **data, size_t *len)
+{
+    uint8_t root[OBJECT_HASH_SIZE], content[OBJECT_HASH_SIZE], type = 0;
+    uint64_t size = 0;
+    status_t st = root_of(db, repo_id, snap_id, root);
+    if (st == OK) st = walk(store, root, rel, &type, &size, content);
+    if (st != OK) return st;
+    if (type != NODE_TYPE_REG) return set_error(ERR_NOT_FOUND, "%s is not a file in the snapshot", rel);
+    if (size > max) return set_error(ERR_TOO_LARGE, "%s is %llu bytes, over %zu", rel, (unsigned long long)size, max);
+    int fd = memfd_create("cbk-read", MFD_CLOEXEC);
+    if (fd < 0) return set_error_errno(ERR_IO, "unit read: memfd");
+    uint64_t got = 0;
+    st = content_restore_fd(store, content, fd, &got);
+    char *buf = st == OK ? malloc((size_t)got + 1) : NULL;
+    if (st == OK && !buf) st = set_error(ERR_NOMEM, "unit read: %s", rel);
+    size_t done = 0;
+    while (st == OK && done < got) {
+        ssize_t n = pread(fd, buf + done, (size_t)got - done, (off_t)done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { st = set_error_errno(ERR_IO, "unit read: %s", rel); break; }
+        done += (size_t)n;
+    }
+    close(fd);
+    if (st != OK) { free(buf); return st; }
+    buf[done] = '\0';
+    *data = buf;
+    *len = done;
     return OK;
 }

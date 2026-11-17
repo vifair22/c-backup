@@ -31,6 +31,7 @@
 #include "store.h"
 #include "store_index.h"
 #include "unit_backup.h"
+#include "unit_define.h"
 #include "unit_state.h"
 
 #define DB_PATH HF_DIR "/state.db"
@@ -60,7 +61,7 @@ static long long scalar(const char *sql)
 
 static int helper_up(void)
 {
-    helper_server_cfg_t cfg = { &pol, fk, 1, 50 };
+    helper_server_cfg_t cfg = { &pol, fk, 1, 50, NULL, 0 };
     return helper_server_start(&cfg, &srv) == OK ? 0 : -1;
 }
 
@@ -112,7 +113,7 @@ static int setup(void **state)
     char text[4096];
     hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
     if (helper_policy_parse(text, &pol) != OK) return -1;
-    helper_server_cfg_t cfg = { &pol, fk, 1, 50 };
+    helper_server_cfg_t cfg = { &pol, fk, 1, 50, NULL, 0 };
     if (helper_server_start(&cfg, &srv) != OK) return -1;
 
     if (db_open(&db, DB_PATH) != 0 || db_run_lib_migrations(db) != 0 ||
@@ -123,6 +124,47 @@ static int setup(void **state)
     if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
     units_config_t uc = { "", 2, 10, 30, 1 };
     if (units_init(db, NULL, &uc) != OK) return -1;
+    return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
+}
+
+/* As setup, with two dump hooks on fake:u1 in the helper's policy. */
+static int setup_dumps(void **state)
+{
+    (void)state;
+    if (setup_base() != 0) return -1;
+    char text[8192];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
+    size_t l = strlen(text);
+    snprintf(text + l, sizeof(text) - l,
+             "[hook pgdump]\nunit = fake:u1\nkind = dump\nargv.0 = /bin/sh\nargv.1 = -c\n"
+             "argv.2 = printf DUMP-%%s ok; echo noise >&2\n"
+             "[hook baddump]\nunit = fake:u1\nkind = dump\nargv.0 = /bin/sh\nargv.1 = -c\n"
+             "argv.2 = printf partial; echo broke >&2; exit 3\n");
+    helper_policy_free(&pol);
+    if (helper_policy_parse(text, &pol) != OK) return -1;
+    if (fake_stream_add(fk, "u1", "dump:pgdump", ".cbackup-unit/hooks/pgdump.dump", 0, 1) != OK ||
+        fake_stream_add(fk, "u1", "dump:baddump", ".cbackup-unit/hooks/baddump.dump", 0, 1) != OK) return -1;
+    /* Each dump's log, as the container providers describe them: empty at
+     * describe, filled once the hook has run. */
+    if (fake_blob_add(fk, "u1", "log:pgdump", ".cbackup-unit/hooks/pgdump.log", "", 0) != OK ||
+        fake_blob_add(fk, "u1", "log:baddump", ".cbackup-unit/hooks/baddump.log", "", 0) != OK) return -1;
+    if (helper_up() != 0) return -1;
+    return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
+}
+
+/* As setup, with restore and define allowed in the helper's policy. */
+static int setup_define(void **state)
+{
+    (void)state;
+    if (setup_base() != 0) return -1;
+    char text[8192];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
+    char *p = strstr(text, "allow_define = 0");
+    if (!p) return -1;
+    p[15] = '1';
+    helper_policy_free(&pol);
+    if (helper_policy_parse(text, &pol) != OK) return -1;
+    if (helper_up() != 0) return -1;
     return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
 }
 
@@ -254,6 +296,193 @@ static void test_failure_through_helper(void **state)
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
 }
 
+/* A configuration blob far past one 64 KiB packet crosses in the describe
+ * memfd and restores byte for byte. */
+static void test_large_blob(void **state)
+{
+    (void)state;
+    size_t n = 1048576;
+    char *big = malloc(n);
+    assert_non_null(big);
+    for (size_t i = 0; i < n; i++) big[i] = (char)('a' + (i * 7 + i / 977) % 26);
+    assert_int_equal(fake_blob_add(fk, "u1", "inspect.json", ".cbackup-unit/config/inspect.json",
+                                   big, n), OK);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, DEST, &ro, &rr), OK);
+    FILE *f = fopen(DEST "/.cbackup-unit/config/inspect.json", "rb");
+    assert_non_null(f);
+    char *got = malloc(n + 1);
+    assert_non_null(got);
+    assert_int_equal(fread(got, 1, n + 1, f), n);
+    fclose(f);
+    assert_memory_equal(got, big, n);
+    free(got);
+    free(big);
+}
+
+/* Dump hooks through the helper: hook.run's pipe stored, hook.wait's exit
+ * deciding; the failed one never lands. */
+static int file_has(const char *path, const char *text)
+{
+    char buf[8192] = "";
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, text) != NULL;
+}
+
+static void test_dumps_through_helper(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, DEST, &ro, &rr), OK);
+    FILE *f = fopen(DEST "/.cbackup-unit/hooks/pgdump.dump", "r");
+    assert_non_null(f);
+    char buf[64] = "";
+    assert_non_null(fgets(buf, sizeof(buf), f));
+    fclose(f);
+    assert_string_equal(buf, "DUMP-ok");
+    struct stat sb;
+    assert_int_not_equal(stat(DEST "/.cbackup-unit/hooks/baddump.dump", &sb), 0);
+    /* B141: the failed dump is not stored, and its log says why: what it
+     * wrote to stderr and how it exited. It used to be stored empty. */
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/baddump.log", "broke"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/baddump.log", "exit status 3"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/pgdump.log", "noise"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/pgdump.log", "exit status 0"));
+    assert_int_equal(helper_server_holds(srv), 0);
+}
+
+
+/* mode unit: the refusals, a new name under target_root that leaves the
+ * original untouched, and in place with replace through stage and swap. */
+static void test_unit_restore(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    unit_define_result_t dr;
+    /* In place without replace, and a new name without target_root. */
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "pass replace"));
+    o.name = "u1-copy";
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "needs target_root"));
+    err_clear();
+
+    /* A new name: data under the target root, the original's untouched. */
+    o.target_root = HF_DIR "/target";
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), OK);
+    struct stat sb;
+    assert_int_equal(stat(HF_DIR "/target" HF_MOUNT "/a.txt", &sb), 0);
+    assert_int_not_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+    assert_int_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_true(file_has(HF_DIR "/state/fake-define-u1.json", "\"u1-copy\""));
+    assert_true(file_has(HF_DIR "/state/fake-define-u1.json", HF_DIR "/target" HF_MOUNT));
+    assert_int_equal(dr.n_warnings, 1);
+    assert_non_null(strstr(dr.warnings[0], "fake define"));
+    assert_non_null(strstr(dr.json, "restored_to"));
+    unit_define_result_free(&dr);
+    /* Again into the same target root: refused, nothing merged. */
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 32, &o, &dr), ERR_INVALID);
+    err_clear();
+
+    /* In place: stopped, staged, swapped, the old data kept beside it. */
+    memset(&o, 0, sizeof(o));
+    o.replace = 1;
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 33, &o, &dr), OK);
+    assert_int_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+    assert_int_not_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_int_equal(stat(HF_MOUNT ".cbackup-old-33/live.txt", &sb), 0);
+    assert_int_equal(fake_unit_state(fk, "u1"), SP_STATE_STOPPED);
+    assert_non_null(strstr(dr.json, "cbackup-old-33"));
+    assert_true(file_has(HF_DIR "/state/fake-define-u1.json", "\"replace\":true"));
+    unit_define_result_free(&dr);
+}
+
+/* A compose project's definition as the daemon assembles it from a
+ * snapshot: files, .env, services with their image records, and under a new
+ * name the binds remapped under the target root. */
+static void test_compose_definition(void **state)
+{
+    (void)state;
+    static const char inspect[] =
+        "{\"Name\":\"/web-db\",\"Config\":{\"Labels\":{\"com.docker.compose.service\":\"db\","
+        "\"com.docker.compose.project.working_dir\":\"" HF_POOL "/proj\"}},"
+        "\"HostConfig\":{\"Binds\":[\"" HF_MOUNT "/pg:/var/lib/pg:rw\",\"/etc/localtime:/etc/localtime:ro\"]}}";
+    static const char image[] = "{\"RepoDigests\":[\"postgres@sha256:feed\"],\"RepoTags\":[\"postgres:16\"]}";
+    assert_int_equal(fake_blob_add(fk, "u1", "c1", ".cbackup-unit/config/compose/compose.yaml", "services: {}\n", 13), OK);
+    assert_int_equal(fake_blob_add(fk, "u1", "c2", ".cbackup-unit/config/compose/.env", "A=1\n", 4), OK);
+    assert_int_equal(fake_blob_add(fk, "u1", "c3", ".cbackup-unit/config/containers/web-db/inspect.json",
+                                   inspect, strlen(inspect)), OK);
+    assert_int_equal(fake_blob_add(fk, "u1", "c4", ".cbackup-unit/config/containers/web-db/image.json",
+                                   image, strlen(image)), OK);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.name = "webcopy";
+    o.target_root = "/restore";
+    char *txt = NULL;
+    assert_int_equal(unit_define_build(store, db, repo_id, snap, "docker", "compose:web", &o, &txt), OK);
+    assert_non_null(strstr(txt, "\"compose.yaml\":\"services: {}"));
+    assert_non_null(strstr(txt, "\"env\":\"A=1"));
+    assert_non_null(strstr(txt, "\"working_dir\":\"" HF_POOL "/proj\""));
+    assert_non_null(strstr(txt, "\"service\":\"db\""));
+    assert_non_null(strstr(txt, "postgres@sha256:feed"));
+    assert_non_null(strstr(txt, "/restore" HF_MOUNT "/pg:/var/lib/pg:rw"));
+    assert_null(strstr(txt, "/restore/etc/localtime"));     /* in no tree: not remapped */
+    assert_non_null(strstr(txt, "\"target_root\":\"/restore\""));
+    free(txt);
+}
+
+/* pause_scope job through the helper: one capture for both units, each
+ * its own snapshot, the capture ended with the last of them. */
+static void test_group_through_helper(void **state)
+{
+    (void)state;
+    assert_int_equal(fake_unit_add(fk, "u2", "cbk-uat-two", SP_STATE_RUNNING, SP_CAP_QUIESCE | SP_CAP_SNAPSHOT), OK);
+    assert_int_equal(fake_blob_add(fk, "u2", "conf", ".cbackup-unit/config/conf", "two", 3), OK);
+    const char *names[] = { "cbk-uat-one", "cbk-uat-two" };
+    unit_backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.provider = "fake";
+    o.units = names;
+    o.n_units = 2;
+    o.require = SP_CONSIST_CRASH;
+    o.job_id = 81;
+    o.pause_scope = UNIT_SCOPE_JOB;
+    unit_backup_result_t res;
+    assert_int_equal(unit_backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.ok, 2);
+    assert_true(res.units[0].snapshot_id > 0 && res.units[1].snapshot_id > 0);
+    unit_backup_result_free(&res);
+    assert_int_equal(helper_server_captures(srv), 0);
+    assert_int_equal(helper_server_holds(srv), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshot_units WHERE repo_id = ?"), 2);
+}
+
 /* Wait up to 5 s for the link to be connected with fake enabled. */
 static int wait_connected(void)
 {
@@ -348,6 +577,11 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_starts_before_helper, setup_late, teardown),
         cmocka_unit_test_setup_teardown(test_helper_restarts_mid_job, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_large_blob, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
+        cmocka_unit_test_setup_teardown(test_unit_restore, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_compose_definition, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_group_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),

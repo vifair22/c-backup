@@ -51,6 +51,34 @@
  * Matching stops at a path boundary: a plain prefix test would let a subpath
  * of "src/doc" pull in "src/documents" too.
  */
+/*
+ * With strip_subpath, the subpath's contents go straight into dest: rel is
+ * cut to what lies below the subpath, in place, so every write beneath the
+ * destination's directory fds (dest_parent) lands there. Returns 1 when
+ * rel is the subpath itself, which is dest and is not written.
+ */
+static int strip_rel(char *rel, const restore_opts_t *o)
+{
+    if (!o || !o->strip_subpath || !o->subpath) return 0;
+    const char *sp = o->subpath;
+    while (*sp == '/') sp++;
+    char *r = rel;
+    while (*r == '/') r++;
+    size_t n = strlen(sp);
+    while (n > 0 && sp[n - 1] == '/') n--;
+    if (strncmp(r, sp, n) == 0 && (r[n] == '\0' || r[n] == '/')) r += n;
+    while (*r == '/') r++;
+    memmove(rel, r, strlen(r) + 1);
+    return rel[0] == '\0';
+}
+
+/* Where rel lands under dest. -1 if too long. */
+static int dest_path(char *full, size_t sz, const char *dest, const char *rel, const restore_opts_t *o)
+{
+    (void)o;
+    return snprintf(full, sz, "%s/%s", dest, rel) >= (int)sz ? -1 : 0;
+}
+
 static int path_within(const char *rel, const char *subpath)
 {
     while (*subpath == '/') subpath++;
@@ -1191,6 +1219,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 continue;
             }
             if (opts->subpath && !path_within(rel, opts->subpath)) continue;
+            if (strip_rel(rel, opts)) continue;
             /* Only a member the resume rule would skip anchors the group:
              * linking later members to a file that is not the snapshot's
              * would hand them its content. */
@@ -1285,9 +1314,17 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         if (ntype == NODE_TYPE_REG) bytes_pending = strtoull(r->rows[i][6], NULL, 10);
         matched++;
+        if (strip_rel(rel, opts)) {
+            /* The subpath itself is dest, which exists; a file cannot be
+             * stripped onto it. */
+            if (ntype != NODE_TYPE_DIR)
+                restore_fail(&res, rel[0] ? rel : opts->subpath,
+                             "a single file cannot be restored as the destination itself");
+            continue;
+        }
 
         char full[PATH_MAX];
-        if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full)) {
+        if (dest_path(full, sizeof(full), dest, rel, opts) != 0) {
             restore_fail(&res, rel, "the destination path is too long");
             continue;
         }
@@ -1649,7 +1686,8 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         }
         if (opts->subpath && !path_within(rel, opts->subpath)) continue;
-        if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full))
+        if (strip_rel(rel, opts)) continue;
+        if (dest_path(full, sizeof(full), dest, rel, opts) != 0)
             continue;
 
         /* Just the timestamp: nothing else about a directory changes after

@@ -23,6 +23,9 @@
 
 typedef struct helper_server helper_server_t;
 
+struct helper_backend;
+#define HELPER_BACKENDS_MAX 8
+
 typedef struct {
     const helper_policy_t *policy;
     sp_ctx_t              *fake;          /* NULL: no fake backend */
@@ -30,6 +33,10 @@ typedef struct {
      * drive helper_server_handle directly). */
     int                    listen;
     unsigned               watchdog_ms;   /* 0: 1000 */
+    /* Further backends (Docker, LXC), copied in; the fake is added from
+     * `fake` above. */
+    const struct helper_backend *backends;
+    size_t                 n_backends;
 } helper_server_cfg_t;
 
 /*
@@ -47,11 +54,20 @@ void     helper_server_stop(helper_server_t *s);
  */
 void helper_server_handle(helper_server_t *s, const char *req, size_t len,
                           char **resp, int *pass_fd);
+/* The same with an fd that came with the request (-1: none); the caller
+ * still owns it. unit.define reads a passed definition from it. */
+void helper_server_handle_fd(helper_server_t *s, const char *req, size_t len, int in_fd,
+                             char **resp, int *pass_fd);
 
-/* One watchdog pass at now: holds past max_pause_s, captures past their
- * lease, hook runs past their timeout. Returns how many it released. */
-unsigned helper_server_tick(helper_server_t *s, time_t now);
+/* One watchdog pass at now_ms (wall-clock milliseconds): holds past
+ * max_pause_s, captures past their lease, hook runs past their timeout.
+ * Returns how many it released. */
+unsigned helper_server_tick(helper_server_t *s, int64_t now_ms);
 
 /* Live captures and journalled holds, for tests. */
 size_t helper_server_captures(helper_server_t *s);
 size_t helper_server_holds(helper_server_t *s);
+
+/* For tests: journal a hold as a capture's begin does, before taking it. */
+status_t helper_server_record(helper_server_t *s, const char *unit, const char *kind,
+                              const char *detail);

@@ -43,6 +43,14 @@ typedef struct {
     status_t (*open)(void *ctx, size_t index, cdc_source_t *src, uint64_t *size);
     void     (*close)(void *ctx, size_t index, status_t st, const cdc_result_t *cr);
     void      *ctx;
+    /*
+     * Optional, asked after close of an entry that stored: 0 leaves the
+     * entry out of the snapshot (its chunks become garbage for gc). For
+     * content whose producer can fail after its bytes are all read: a dump
+     * hook that exits non-zero wrote a dump that looks valid and is not.
+     * open may also say CDC_SIZE_STREAM, and the size is then what stored.
+     */
+    int      (*keep)(void *ctx, size_t index);
 } backup_synth_ops_t;
 
 typedef struct {
@@ -55,6 +63,26 @@ typedef struct {
     /* A file_cache_match_t: how strictly an unchanged file is recognised.
      * Zero is auto, which is right everywhere it can tell. */
     int          file_cache_match;
+
+    /*
+     * The fallback's two passes (container-backup.md section 7).
+     *
+     * content_only: store every file's content and its file cache row, seal
+     * the pack, and stop: no trees, no snapshot record. Pass 1 of
+     * pause-read, read live, so that the paused pass only re-reads what
+     * changed since.
+     *
+     * held_roots / held_done: the first held_roots paths are read under a
+     * hold (a pause the caller took). They are scanned and their files
+     * stored, then held_done(held_ctx) is called once, and only then are
+     * the other roots scanned and stored, then the synthetic entries: the
+     * hold covers the held roots alone, neither the other roots' directory
+     * walk nor their content.
+     */
+    int          content_only;
+    int          held_roots;
+    void       (*held_done)(void *ctx);
+    void        *held_ctx;
 
     /* Cooperative cancellation. The job manager sets this; the pipeline
      * checks it between entries, and backup_run lends it to the store for

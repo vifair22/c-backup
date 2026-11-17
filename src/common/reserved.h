@@ -22,6 +22,18 @@
 #define RESERVED_UNIT_DIR     ".cbackup-unit"
 #define RESERVED_CAPTURES_DIR  ".cbackup-captures"
 
+/* Directories holding filesystem snapshots, never descended into at any
+ * depth (docs/container-backup.md 8.1, 8.2): ZFS's `.zfs` control directory
+ * and the btrfs capture directory. Under /mnt/user the btrfs one is a FUSE
+ * alias with the share's device number, so --one-filesystem would not stop
+ * there; the name rule is what does. */
+#define RESERVED_ZFS_CTL_DIR       ".zfs"
+#define RESERVED_SNAPSHOTS_DIR     ".cbackup-snapshots"
+
+/* 1 when name (one path component) is a snapshot directory the scanner
+ * never enters. */
+int reserved_snapshot_dir(const char *name);
+
 /* 1 when name (one path component) is a reserved top-level name. */
 int reserved_top_name(const char *name);
 

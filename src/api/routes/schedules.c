@@ -277,7 +277,20 @@ static const struct {
     { "all",         "units"     },
     { "units",       "units"     },
     { "require",     "units"     },
+    { "exclude",     "units"     },
+    { "pause_scope", "units"     },
 };
+
+/* Every key a schedule's body may carry; anything else is refused rather
+ * than dropped (a key accepted and not honoured). */
+static int schedule_key_known(const char *k)
+{
+    static const char *const own[] = { "action", "trigger", "on_overlap", "catchup", NULL };
+    for (int i = 0; own[i]; i++) if (strcmp(k, own[i]) == 0) return 1;
+    for (size_t i = 0; i < sizeof(k_param_owner) / sizeof(k_param_owner[0]); i++)
+        if (strcmp(k, k_param_owner[i].key) == 0) return 1;
+    return 0;
+}
 
 /*
  * A grep schedule's parameters: the pattern it exists for, and the options
@@ -380,6 +393,24 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     if (!routes_action_is_schedulable(action))
         return api_error(400, "that action cannot be scheduled; "
                               "use " SCHEDULABLE_ACTIONS);
+
+    {
+        cJSON *all = cJSON_ParseWithLength(req->body, req->body_len);
+        const cJSON *it = NULL;
+        char unknown[96] = "";
+        cJSON_ArrayForEach(it, all) {
+            if (it->string && !schedule_key_known(it->string)) {
+                snprintf(unknown, sizeof(unknown), "%.80s", it->string);
+                break;
+            }
+        }
+        cJSON_Delete(all);
+        if (unknown[0]) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "unknown key '%s' in a schedule", unknown);
+            return api_error(400, msg);
+        }
+    }
 
     for (size_t k = 0; k < sizeof(k_param_owner) / sizeof(k_param_owner[0]); k++) {
         if (!json_req_has(body, k_param_owner[k].key)) continue;
@@ -506,7 +537,10 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     if (strcmp(action, "units") == 0) {
         cJSON *in = cJSON_ParseWithLength(req->body, req->body_len);
         cJSON *p = cJSON_CreateObject();
-        static const char *const keys[] = { "provider", "all", "exclude", "units", "require" };
+        /* pause_scope too: it was dropped here, so a scheduled group or
+         * job scope ran unit by unit without a word. */
+        static const char *const keys[] = { "provider", "all", "exclude", "units", "require",
+                                            "pause_scope" };
         for (size_t k = 0; in && p && k < sizeof(keys) / sizeof(keys[0]); k++) {
             cJSON *v = cJSON_GetObjectItemCaseSensitive(in, keys[k]);
             if (v) cJSON_AddItemToObject(p, keys[k], cJSON_Duplicate(v, 1));

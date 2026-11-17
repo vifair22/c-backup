@@ -76,6 +76,31 @@ status_t scan_roots_new(const scan_result_t *scan, scan_roots_t **out)
     return OK;
 }
 
+status_t scan_roots_extend(scan_roots_t *t, const scan_result_t *scan, uint32_t from)
+{
+    unsigned add = 0;
+    for (uint32_t i = from; i < scan->count; i++) {
+        const scan_entry_t *e = &scan->entries[i];
+        if (e->root_len && strlen(SRC_PATH(e)) == e->root_len) add++;
+    }
+    if (!add) return OK;
+    source_root_t *g = realloc(t->r, (size_t)(t->n + add) * sizeof(*g));
+    if (!g) return set_error(ERR_NOMEM, "backup: source root table");
+    t->r = g;
+    for (uint32_t i = from; i < scan->count; i++) {
+        const scan_entry_t *e = &scan->entries[i];
+        if (!e->root_len || strlen(SRC_PATH(e)) != e->root_len) continue;
+        source_root_t *r = &t->r[t->n++];
+        memset(r, 0, sizeof(*r));
+        r->path = SRC_PATH(e);
+        r->len  = e->root_len;
+        r->dev  = e->st.st_dev;
+        r->ino  = e->st.st_ino;
+        r->fd   = -1;
+    }
+    return OK;
+}
+
 void scan_roots_free(scan_roots_t *t)
 {
     if (!t) return;

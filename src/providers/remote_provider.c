@@ -11,12 +11,14 @@
 #include <cutils/log.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -32,7 +34,14 @@ struct sp_ctx {
 struct sp_session {
     struct sp_ctx    *ctx;
     char              token[HELPER_TOKEN_HEX + 1];
-    cJSON            *desc;        /* units.describe at begin: blobs, run maps */
+    char              unit_id[SP_UNIT_ID_MAX];
+    struct rgroup    *grp;          /* a group capture's shared count, or NULL */
+    cJSON            *desc;        /* units.describe at begin: blob offsets, run maps */
+    int               blob_fd;     /* the sealed memfd describe passed, or -1 */
+    int               late_fd;     /* capture.begin's memfd: hook logs, or -1 */
+    cJSON            *late;        /* item id -> [offset, length] in late_fd */
+    struct { char hook[72]; char run[HELPER_TOKEN_HEX + 1]; char *log; size_t log_len; } dumps[4];
+    size_t            n_dumps;
     cJSON            *roots;       /* read_roots */
     sp_session_info_t info;
 };
@@ -88,8 +97,17 @@ static status_t map_error(const char *code, const char *msg)
     return set_error(st, "helper: %s: %.400s", helper_err_name(e), msg ? msg : "");
 }
 
+static status_t exchange_fd(int fd, const char *op, cJSON *args, cJSON **result, int send_fd,
+                            int *recv_fd, int *transport);
+
 static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, int *recv_fd,
                          int *transport)
+{
+    return exchange_fd(fd, op, args, result, -1, recv_fd, transport);
+}
+
+static status_t exchange_fd(int fd, const char *op, cJSON *args, cJSON **result, int send_fd,
+                            int *recv_fd, int *transport)
 {
     long id = atomic_fetch_add(&g_req_id, 1) + 1;
     cJSON *o = cJSON_CreateObject();
@@ -101,7 +119,7 @@ static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, in
     char *txt = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!txt) return set_error(ERR_NOMEM, "helper: request");
-    status_t st = helper_send(fd, txt, strlen(txt), -1);
+    status_t st = helper_send(fd, txt, strlen(txt), send_fd);
     cJSON_free(txt);
     if (st != OK) { *transport = 1; return st; }
     char *buf = malloc(HELPER_PACKET_MAX + 2);
@@ -129,10 +147,22 @@ static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, in
     return OK;
 }
 
-/* Connect, hello, one request. *result (may be NULL) is the result. */
-static status_t rcall(const char *sock, const char *op, cJSON *args, cJSON **result)
+/* Connect, hello, one request. *result (may be NULL) is the result; an fd
+ * passed with the answer lands in *recv_fd (NULL: closed), -1 if none. */
+static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON **result,
+                           int send_fd, int *recv_fd);
+
+static status_t rcall_fd(const char *sock, const char *op, cJSON *args, cJSON **result,
+                         int *recv_fd)
+{
+    return rcall_full(sock, op, args, result, -1, recv_fd);
+}
+
+static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON **result,
+                           int send_fd, int *recv_fd)
 {
     if (result) *result = NULL;
+    if (recv_fd) *recv_fd = -1;
     int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0) { cJSON_Delete(args); return set_error_errno(ERR_IO, "helper: socket"); }
     struct sockaddr_un a;
@@ -155,9 +185,10 @@ static status_t rcall(const char *sock, const char *op, cJSON *args, cJSON **res
     int transport = 0;
     status_t st = exchange(fd, "hello", hargs, &hres, NULL, &transport);
     cJSON_Delete(hres);
-    if (st == OK) st = exchange(fd, op, args, result, NULL, &transport);
+    if (st == OK) st = exchange_fd(fd, op, args, result, send_fd, recv_fd, &transport);
     else cJSON_Delete(args);
     close(fd);
+    if (st != OK && recv_fd && *recv_fd >= 0) { close(*recv_fd); *recv_fd = -1; }
     if (st != OK && transport) {
         /* Not the helper refusing: the helper gone mid-request. */
         char why[512];
@@ -166,6 +197,11 @@ static status_t rcall(const char *sock, const char *op, cJSON *args, cJSON **res
         set_error(st, "helper at %s: %s", sock, why);
     }
     return st;
+}
+
+static status_t rcall(const char *sock, const char *op, cJSON *args, cJSON **result)
+{
+    return rcall_fd(sock, op, args, result, NULL);
 }
 
 static cJSON *args_unit(const struct sp_ctx *c, const char *unit_id)
@@ -303,6 +339,10 @@ static void session_free(struct sp_session *s)
     if (!s) return;
     cJSON_Delete(s->desc);
     cJSON_Delete(s->roots);
+    if (s->blob_fd >= 0) close(s->blob_fd);
+    if (s->late_fd >= 0) close(s->late_fd);
+    cJSON_Delete(s->late);
+    for (size_t i = 0; i < s->n_dumps; i++) free(s->dumps[i].log);
     sp_session_info_free(&s->info);
     free(s);
 }
@@ -313,9 +353,13 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     struct sp_session *s = calloc(1, sizeof(*s));
     if (!s) return set_error(ERR_NOMEM, "helper: session");
     s->ctx = c;
+    s->blob_fd = -1;
+    s->late_fd = -1;
+    snprintf(s->unit_id, sizeof(s->unit_id), "%s", unit->unit_id);
     /* The configuration and data-plane facts as of now; the capture is the
      * point in time for the trees. */
-    status_t st = rcall(c->socket, "units.describe", args_unit(c, unit->unit_id), &s->desc);
+    status_t st = rcall_fd(c->socket, "units.describe", args_unit(c, unit->unit_id), &s->desc,
+                           &s->blob_fd);
     cJSON *res = NULL;
     if (st == OK) {
         cJSON *a = cJSON_CreateObject();
@@ -324,7 +368,8 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(key, sizeof(key), "%s:%s", c->provider, unit->unit_id);
         if (u) cJSON_AddItemToArray(u, cJSON_CreateString(key));
         if (a) cJSON_AddBoolToObject(a, "pause", (unit->caps & SP_CAP_PAUSE) != 0);
-        st = rcall(c->socket, "capture.begin", a, &res);
+        if (a && req->hold_pause) cJSON_AddBoolToObject(a, "hold", 1);
+        st = rcall_fd(c->socket, "capture.begin", a, &res, &s->late_fd);
     }
     const char *tok = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture")) : NULL;
     const cJSON *m = st == OK ? cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(res, "members"), 0) : NULL;
@@ -333,6 +378,7 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     if (st == OK) {
         snprintf(s->token, sizeof(s->token), "%s", tok);
         s->roots = cJSON_DetachItemFromObjectCaseSensitive((cJSON *)(uintptr_t)m, "read_roots");
+        s->late = cJSON_DetachItemFromObjectCaseSensitive((cJSON *)(uintptr_t)m, "late_blobs");
         s->info.achieved = (sp_consistency_t)num(m, "achieved");
         s->info.consist_flags = (uint32_t)num(m, "flags");
         s->info.freeze_ms = num(m, "freeze_ms");
@@ -391,15 +437,73 @@ static const cJSON *item_json(const struct sp_session *s, const char *id)
     return NULL;
 }
 
+/* n bytes at off of a sealed memfd the helper passed, bounds-checked. */
+static status_t read_passed(int fd, uint64_t off, uint64_t n, const char *what, void **data, size_t *len)
+{
+    struct stat sb;
+    if (fd < 0 || fstat(fd, &sb) != 0 || n > HELPER_BLOB_MAX || off + n < off || off + n > (uint64_t)sb.st_size)
+        return set_error(ERR_IO, "helper: data for %s lies outside what was passed", what);
+    uint8_t *buf = malloc(n ? (size_t)n : 1);
+    if (!buf) return set_error(ERR_NOMEM, "helper: blob");
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = pread(fd, buf + done, (size_t)n - done, (off_t)(off + done));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { free(buf); return set_error_errno(ERR_IO, "helper: reading %s", what); }
+        done += (size_t)r;
+    }
+    *data = buf;
+    *len = (size_t)n;
+    return OK;
+}
+
+static const char *hook_of(const sp_item_desc_t *item)
+{
+    return item->source && strncmp(item->source, "hook:", 5) == 0 ? item->source + 5 : NULL;
+}
+
 static status_t r_blob_read(sp_session_t *s, const sp_item_desc_t *item, void **data, size_t *len)
 {
-    const char *hex = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(item_json(s, item->id), "data"));
-    if (!hex) return set_error(ERR_IO, "helper: no data for %s", item->id);
-    size_t cap = strlen(hex) / 2 + 1;
-    uint8_t *buf = malloc(cap);
+    /* A dump hook's log, from its hook.wait; then logs capture.begin
+     * passed; then what describe passed. */
+    const char *hk = hook_of(item);
+    for (size_t i = 0; hk && i < s->n_dumps; i++) {
+        if (strcmp(s->dumps[i].hook, hk) != 0 || !s->dumps[i].log) continue;
+        void *cp = malloc(s->dumps[i].log_len ? s->dumps[i].log_len : 1);
+        if (!cp) return set_error(ERR_NOMEM, "helper: hook log");
+        memcpy(cp, s->dumps[i].log, s->dumps[i].log_len);
+        *data = cp;
+        *len = s->dumps[i].log_len;
+        return OK;
+    }
+    const cJSON *lp = cJSON_GetObjectItemCaseSensitive(s->late, item->id);
+    if (cJSON_GetArraySize(lp) == 2) {
+        const cJSON *o = cJSON_GetArrayItem(lp, 0), *n = cJSON_GetArrayItem(lp, 1);
+        if (!cJSON_IsNumber(o) || !cJSON_IsNumber(n) || o->valuedouble < 0 || n->valuedouble < 0)
+            return set_error(ERR_IO, "helper: a malformed late blob for %s", item->id);
+        return read_passed(s->late_fd, (uint64_t)o->valuedouble, (uint64_t)n->valuedouble, item->id, data, len);
+    }
+    /* The bytes are in the sealed memfd describe passed: the helper could
+     * not change them under us, and any size fits. */
+    const cJSON *it = item_json(s, item->id);
+    const cJSON *jo = cJSON_GetObjectItemCaseSensitive(it, "data_off");
+    const cJSON *jl = cJSON_GetObjectItemCaseSensitive(it, "data_len");
+    if (!cJSON_IsNumber(jo) || !cJSON_IsNumber(jl) || s->blob_fd < 0)
+        return set_error(ERR_IO, "helper: no data for %s", item->id);
+    uint64_t off = num(it, "data_off"), n = num(it, "data_len");
+    struct stat sb;
+    if (fstat(s->blob_fd, &sb) != 0 || n > HELPER_BLOB_MAX || off + n < off ||
+        off + n > (uint64_t)sb.st_size)
+        return set_error(ERR_IO, "helper: data for %s lies outside what was passed", item->id);
+    uint8_t *buf = malloc(n ? (size_t)n : 1);
     if (!buf) return set_error(ERR_NOMEM, "helper: blob");
-    long n = helper_hex_decode(hex, buf, cap);
-    if (n < 0) { free(buf); return set_error(ERR_IO, "helper: bad data for %s", item->id); }
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = pread(s->blob_fd, buf + done, (size_t)n - done, (off_t)(off + done));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { free(buf); return set_error_errno(ERR_IO, "helper: reading %s", item->id); }
+        done += (size_t)r;
+    }
     *data = buf;
     *len = (size_t)n;
     return OK;
@@ -444,9 +548,173 @@ static status_t r_tree_root(sp_session_t *s, const sp_item_desc_t *item, char *r
     return OK;
 }
 
+/* A dump hook: hook.run passes its stdout as a pipe; the helper's watchdog
+ * kills it at its timeout, which ends the pipe. */
+static status_t r_stream_open(sp_session_t *s, const sp_item_desc_t *item, int *fd)
+{
+    const char *hk = hook_of(item);
+    if (!hk || strlen(hk) >= sizeof(s->dumps[0].hook)) return set_error(ERR_INVALID, "helper: %s names no hook", item->id);
+    if (s->n_dumps >= sizeof(s->dumps) / sizeof(s->dumps[0])) return set_error(ERR_INVALID, "helper: too many dumps");
+    cJSON *a = args_unit(s->ctx, s->unit_id);
+    if (a) cJSON_AddStringToObject(a, "hook", hk);
+    cJSON *res = NULL;
+    int pfd = -1;
+    status_t st = rcall_fd(s->ctx->socket, "hook.run", a, &res, &pfd);
+    const char *run = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "run")) : NULL;
+    if (st == OK && (!run || strlen(run) != HELPER_TOKEN_HEX || pfd < 0))
+        st = set_error(ERR_IO, "helper: hook.run for %s gave no run or no pipe", hk);
+    if (st == OK) {
+        memset(&s->dumps[s->n_dumps], 0, sizeof(s->dumps[0]));
+        snprintf(s->dumps[s->n_dumps].hook, sizeof(s->dumps[0].hook), "%s", hk);
+        snprintf(s->dumps[s->n_dumps].run, sizeof(s->dumps[0].run), "%s", run);
+        s->n_dumps++;
+        *fd = pfd;
+        pfd = -1;
+    }
+    if (pfd >= 0) close(pfd);
+    cJSON_Delete(res);
+    return st;
+}
+
+static status_t r_stream_close(sp_session_t *s, const sp_item_desc_t *item, int *ok)
+{
+    const char *hk = hook_of(item);
+    for (size_t i = 0; hk && i < s->n_dumps; i++) {
+        if (strcmp(s->dumps[i].hook, hk) != 0 || !s->dumps[i].run[0]) continue;
+        cJSON *a = cJSON_CreateObject();
+        if (a) cJSON_AddStringToObject(a, "run", s->dumps[i].run);
+        cJSON *res = NULL;
+        int lfd = -1;
+        status_t st = rcall_fd(s->ctx->socket, "hook.wait", a, &res, &lfd);
+        s->dumps[i].run[0] = '\0';
+        if (st != OK) { if (lfd >= 0) close(lfd); return st; }
+        int code = (int)num(res, "exit");
+        *ok = code == 0 && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "timed_out"));
+        void *log = NULL;
+        size_t len = 0;
+        if (lfd >= 0 && read_passed(lfd, 0, num(res, "log_bytes"), hk, &log, &len) == OK) {
+            s->dumps[i].log = log;
+            s->dumps[i].log_len = len;
+        } else {
+            err_clear();
+        }
+        if (lfd >= 0) close(lfd);
+        if (!*ok) (void)sp_session_info_warn(&s->info, "dump hook %s exited %d; not stored", hk, code);
+        cJSON_Delete(res);
+        return OK;
+    }
+    return set_error(ERR_NOT_FOUND, "helper: dump %s was not open", item->id);
+}
+
+/* The pause the helper kept for the second pass, let go (lease.release). */
+static status_t r_release(sp_session_t *s, int *cap_hit)
+{
+    *cap_hit = 0;
+    cJSON *a = cJSON_CreateObject();
+    if (a) cJSON_AddStringToObject(a, "capture", s->token);
+    cJSON *res = NULL;
+    status_t st = rcall(s->ctx->socket, "lease.release", a, &res);
+    if (st == OK) *cap_hit = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "cap_hit"));
+    cJSON_Delete(res);
+    return st;
+}
+
+/* A group capture (begin_group): one capture, ended with its last session. */
+struct rgroup { pthread_mutex_t mu; int refs; };
+
+static status_t r_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, size_t n,
+                              const sp_begin_req_t *req, sp_session_t **out,
+                              const sp_session_info_t **infos)
+{
+    if (n == 0 || n > HELPER_UNITS_MAX) return set_error(ERR_INVALID, "helper: a group capture is 1 to %d units", HELPER_UNITS_MAX);
+    struct sp_session **ss = calloc(n, sizeof(*ss));
+    struct rgroup *g = calloc(1, sizeof(*g));
+    if (!ss || !g) { free(ss); free(g); return set_error(ERR_NOMEM, "helper: group"); }
+    pthread_mutex_init(&g->mu, NULL);
+    status_t st = OK;
+    for (size_t k = 0; st == OK && k < n; k++) {
+        struct sp_session *s = ss[k] = calloc(1, sizeof(*s));
+        if (!s) { st = set_error(ERR_NOMEM, "helper: group"); break; }
+        s->ctx = c;
+        s->blob_fd = -1;
+        s->late_fd = -1;
+        snprintf(s->unit_id, sizeof(s->unit_id), "%s", units[k]->unit_id);
+        st = rcall_fd(c->socket, "units.describe", args_unit(c, units[k]->unit_id), &s->desc, &s->blob_fd);
+    }
+    cJSON *res = NULL;
+    int late = -1;
+    if (st == OK) {
+        cJSON *a = cJSON_CreateObject();
+        cJSON *u = a ? cJSON_AddArrayToObject(a, "units") : NULL;
+        for (size_t k = 0; u && k < n; k++) {
+            char key[HELPER_UNIT_KEY_MAX + 1];
+            snprintf(key, sizeof(key), "%s:%s", c->provider, units[k]->unit_id);
+            cJSON_AddItemToArray(u, cJSON_CreateString(key));
+        }
+        if (a) cJSON_AddBoolToObject(a, "pause", (units[0]->caps & SP_CAP_PAUSE) != 0);
+        st = rcall_fd(c->socket, "capture.begin", a, &res, &late);
+    }
+    const char *tok = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture")) : NULL;
+    const cJSON *mem = cJSON_GetObjectItemCaseSensitive(res, "members");
+    if (st == OK && (!tok || strlen(tok) != HELPER_TOKEN_HEX || cJSON_GetArraySize(mem) != (int)n))
+        st = set_error(ERR_IO, "helper: a malformed group capture");
+    for (size_t k = 0; st == OK && k < n; k++) {
+        struct sp_session *s = ss[k];
+        cJSON *m = cJSON_GetArrayItem(mem, (int)k);
+        snprintf(s->token, sizeof(s->token), "%s", tok);
+        s->grp = g;
+        g->refs++;
+        s->roots = cJSON_DetachItemFromObjectCaseSensitive(m, "read_roots");
+        s->late = cJSON_DetachItemFromObjectCaseSensitive(m, "late_blobs");
+        if (late >= 0) s->late_fd = fcntl(late, F_DUPFD_CLOEXEC, 0);
+        s->info.achieved = (sp_consistency_t)num(m, "achieved");
+        s->info.consist_flags = (uint32_t)num(m, "flags");
+        s->info.freeze_ms = num(m, "freeze_ms");
+        s->info.pause_ms = num(m, "pause_ms");
+        const cJSON *w;
+        cJSON_ArrayForEach(w, cJSON_GetObjectItemCaseSensitive(m, "warnings"))
+            if (cJSON_IsString(w) && st == OK) st = sp_session_info_warn(&s->info, "%s", w->valuestring);
+        if (st == OK && !(s->info.plans = calloc(1, sizeof(*s->info.plans)))) st = set_error(ERR_NOMEM, "helper: plans");
+        if (st == OK && req && s->info.achieved < req->require)
+            st = set_error(ERR_INVALID, "unit %s: achieved %s, below the required %s", units[k]->unit_id,
+                           str_or(sp_consistency_name(s->info.achieved), "?"),
+                           str_or(sp_consistency_name(req->require), "?"));
+    }
+    if (late >= 0) close(late);
+    if (st != OK && tok && strlen(tok) == HELPER_TOKEN_HEX) {
+        char why[512];
+        snprintf(why, sizeof(why), "%.500s", err_msg());
+        cJSON *ea = cJSON_CreateObject();
+        if (ea) cJSON_AddStringToObject(ea, "capture", tok);
+        (void)rcall(c->socket, "capture.end", ea, NULL);
+        set_error(st, "%s", why);
+    }
+    cJSON_Delete(res);
+    if (st != OK) {
+        for (size_t k = 0; k < n; k++) if (ss[k]) { ss[k]->grp = NULL; session_free(ss[k]); }
+        pthread_mutex_destroy(&g->mu);
+        free(g);
+        free(ss);
+        return st;
+    }
+    for (size_t k = 0; k < n; k++) { out[k] = ss[k]; infos[k] = &ss[k]->info; }
+    free(ss);
+    return OK;
+}
+
 static status_t r_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapshot_id)
 {
     (void)outcome; (void)snapshot_id;
+    if (s->grp) {
+        /* Only the last unit of a group capture ends it. */
+        pthread_mutex_lock(&s->grp->mu);
+        int last = --s->grp->refs == 0;
+        pthread_mutex_unlock(&s->grp->mu);
+        if (!last) { s->grp = NULL; session_free(s); return OK; }
+        pthread_mutex_destroy(&s->grp->mu);
+        free(s->grp);
+        s->grp = NULL;
+    }
     cJSON *a = cJSON_CreateObject();
     if (a) cJSON_AddStringToObject(a, "capture", s->token);
     /* The lease bounds it either way: a capture.end that does not arrive
@@ -476,6 +744,21 @@ static sp_provider_ops_t g_ops[REMOTE_MAX];
 static char              g_names[REMOTE_MAX][SP_PROVIDER_MAX];
 
 int remote_is_remote(const sp_provider_ops_t *ops) { return ops && ops->init == r_init; }
+
+status_t remote_op(const char *provider, const char *op, cJSON *args, int send_fd, cJSON **result)
+{
+    if (result) *result = NULL;
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *c = NULL;
+    if (sp_registry_get(provider, &ops, &c) != OK || !remote_is_remote(ops)) {
+        cJSON_Delete(args);
+        err_clear();
+        char why[512];
+        if (remote_unusable(provider, why, sizeof(why))) return set_error(ERR_IO, "%s", why);
+        return set_error(ERR_INVALID, "provider %s is not behind the helper", provider);
+    }
+    return rcall_full(c->socket, op, args, result, send_fd, NULL);
+}
 
 /* One hello; enable any provider offered that is not enabled yet. */
 static status_t attach_once(const char *socket_path, const char *daemon8, remote_hello_t *out)
@@ -527,6 +810,8 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
             .describe = r_describe, .desc_free = r_desc_free, .begin = r_begin,
             .blob_read = r_blob_read, .block_open = r_block_open, .tree_root = r_tree_root,
             .end = r_end, .sweep = r_sweep,
+            .stream_open = r_stream_open, .stream_close = r_stream_close, .release = r_release,
+            .begin_group = r_begin_group,
         };
         st = sp_registry_add(o, c);
         if (st != OK) { free(c); break; }

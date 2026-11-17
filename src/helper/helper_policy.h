@@ -10,7 +10,13 @@
  *               capture_max_s, allow_restore, allow_define,
  *               allow_privileged_define, state_dir, socket, fake_spec
  *   [units]     allow = <provider>:<glob>, ...
- *   [snapshot]  zfs_domains, btrfs_domains, dir_domains
+ *   [snapshot]  zfs_domains, btrfs_domains, dir_domains, btrfs_snapshot_dir
+ *   [host]      nsenter, nsenter_bin, zfs, btrfs, realpath, docker, lxc_dir,
+ *               host_root, user_root, mnt_root, boot_config
+ *   [docker]    enabled, socket, include_roots, pause (auto|always|never),
+ *               pause_always, never_pause (unit name globs), pause_timeout_s,
+ *               templates_dir
+ *   [lxc]       enabled, path
  *   [hook NAME] unit, kind (dump|run), phase (pre|post), container,
  *               argv.0 .. argv.N, timeout_s, on_fail (continue|fail)
  *
@@ -63,6 +69,38 @@ typedef struct {
     size_t   n_btrfs;
     char    *dir_domains[POLICY_LIST_MAX];
     size_t   n_dir;
+
+    char     btrfs_snapshot_dir[4096];
+    /* Where restore.stage stages, per domain: the first of these inside the
+     * mount's domain. With none, a pool-top domain stages in
+     * <pool>/system/.cbackup-restore (beside the snapshot directory) and any
+     * other in <domain>/.cbackup-restore. */
+    char    *restore_staging_dirs[POLICY_LIST_MAX];
+    size_t   n_staging;
+
+    /* [host]: how host tools run (host_tool.h); "" keeps the default. */
+    int      host_nsenter;           /* default 1 */
+    char     host_nsenter_bin[256], host_zfs[256], host_btrfs[256], host_realpath[256];
+    char     host_docker[256];      /* the host's docker CLI, for compose up */
+    char     host_lxc_dir[256], host_root[256];
+    char     user_root[4096], mnt_root[4096], boot_config[4096];
+
+    /* [docker] */
+    int      docker_enabled;
+    char     docker_socket[108];
+    char    *include_roots[POLICY_LIST_MAX];
+    size_t   n_include;
+    int      docker_pause;           /* 0 auto, 1 always, 2 never */
+    char    *pause_always[POLICY_LIST_MAX];
+    size_t   n_pause_always;
+    char    *never_pause[POLICY_LIST_MAX];
+    size_t   n_never_pause;
+    unsigned pause_timeout_s;
+    char     templates_dir[4096];
+
+    /* [lxc] */
+    int      lxc_enabled;
+    char     lxc_path[4096];
 
     policy_hook_t hooks[POLICY_HOOKS_MAX];
     size_t   n_hooks;

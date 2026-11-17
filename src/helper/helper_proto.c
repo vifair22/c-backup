@@ -179,13 +179,14 @@ typedef struct {
     akey_t keys[4];
     int    n;
     int    one_of;      /* exactly one of the keys (lease.release) */
+    int    n_opt;       /* the last n_opt keys may be left out */
 } schema_t;
 
 static const schema_t k_schema[HOP_COUNT] = {
     [HOP_HELLO]                  = { { { "client_version", A_INT } }, 1, 0 },
     [HOP_UNITS_LIST]             = { { { "provider", A_PROVIDER } }, 1, 0 },
     [HOP_UNITS_DESCRIBE]         = { { { "unit", A_UNIT } }, 1, 0 },
-    [HOP_CAPTURE_BEGIN]          = { { { "units", A_UNITS }, { "pause", A_BOOL } }, 2, 0 },
+    [HOP_CAPTURE_BEGIN]          = { { { "units", A_UNITS }, { "pause", A_BOOL }, { "hold", A_BOOL } }, 3, 0, 1 },
     [HOP_CAPTURE_BEGIN_PATHS]    = { { { "paths", A_PATHS } }, 1, 0 },
     [HOP_CAPTURE_END]            = { { { "capture", A_TOKEN } }, 1, 0 },
     [HOP_HOOK_RUN]               = { { { "unit", A_UNIT }, { "hook", A_NAME } }, 2, 0 },
@@ -245,7 +246,8 @@ static int take_arg(helper_req_t *r, const akey_t *k, const cJSON *v, char *why,
     }
     case A_BOOL:
         if (!cJSON_IsBool(v)) return set_bad(why, wsz, "%s: %s must be true or false", op, k->key);
-        r->pause = cJSON_IsTrue(v);
+        if (strcmp(k->key, "hold") == 0) r->hold = cJSON_IsTrue(v);
+        else r->pause = cJSON_IsTrue(v);
         return 0;
     case A_PROVIDER:
         if (!cJSON_IsString(v) || !helper_provider_known(v->valuestring))
@@ -434,7 +436,7 @@ helper_err_t helper_request_parse(const void *buf, size_t len, helper_req_t *req
         }
     }
     if (cJSON_GetArraySize(args) != present ||
-        (s->one_of ? present != 1 : present != s->n)) {
+        (s->one_of ? present != 1 : (present < s->n - s->n_opt || present > s->n))) {
         snprintf(why, wsz, "%s: wrong arguments; it takes %s", k_ops[found],
                  s->one_of ? "exactly one of its token keys" : "exactly its listed keys");
         goto out;
