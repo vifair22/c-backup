@@ -278,12 +278,16 @@ static api_response_t handle_logout_all(const api_request_t *req, void *ud)
 int routes_register_auth(api_server_t *srv, cutils_db_t *db)
 {
     g_ctx.db = db;
-    if (api_server_route(srv, "/api/auth/setup",    API_GET,  handle_setup_get,  &g_ctx) != 0) return -1;
-    if (api_server_route(srv, "/api/auth/setup",    API_POST, handle_setup_post, &g_ctx) != 0) return -1;
-    if (api_server_route(srv, "/api/auth/login",    API_POST, handle_login,      &g_ctx) != 0) return -1;
-    if (api_server_route(srv, "/api/auth/logout",   API_POST, handle_logout,     &g_ctx) != 0) return -1;
-    if (api_server_route(srv, "/api/auth/logout-all", API_POST, handle_logout_all, &g_ctx) != 0) return -1;
-    if (api_server_route(srv, "/api/auth/password", API_POST, handle_password,   &g_ctx) != 0) return -1;
+    /* Durable where a power cut losing the edit would hand back a
+     * credential the operator revoked: a logout, a logout-all and a
+     * password change are deletes of what authenticates (B144). Setup and
+     * login lost to a cut are simply done again. */
+    if (api_server_route(srv, "/api/auth/setup",    API_GET,  API_CLASS_NONE,  handle_setup_get,  &g_ctx) != 0) return -1;
+    if (api_server_route(srv, "/api/auth/setup",    API_POST, API_COMMIT_ONLY, handle_setup_post, &g_ctx) != 0) return -1;
+    if (api_server_route(srv, "/api/auth/login",    API_POST, API_COMMIT_ONLY, handle_login,      &g_ctx) != 0) return -1;
+    if (api_server_route(srv, "/api/auth/logout",   API_POST, API_DURABLE,     handle_logout,     &g_ctx) != 0) return -1;
+    if (api_server_route(srv, "/api/auth/logout-all", API_POST, API_DURABLE,   handle_logout_all, &g_ctx) != 0) return -1;
+    if (api_server_route(srv, "/api/auth/password", API_POST, API_DURABLE,     handle_password,   &g_ctx) != 0) return -1;
     return 0;
 }
 

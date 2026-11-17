@@ -214,14 +214,15 @@ static void note_error(writer_t *w, const char *what, const api_response_t *r)
                  what, r ? r->status : 0, (r && r->body) ? r->body : "");
 }
 
-/* As the server answers a request: a write that succeeded is made durable
- * before the client hears so (api_server_set_after_write), and that wait
- * is part of what the client sees. */
-static int call(writer_t *w, const char *what, api_response_t r)
+/* As the server answers a request: a durable write that succeeded is made
+ * durable before the client hears so (api_server_set_after_write), and
+ * that wait is part of what the client sees; a commit-only one answers from
+ * its commit (api_write_class_t, B144). */
+static int call(writer_t *w, const char *what, api_write_class_t cls, api_response_t r)
 {
     int ok = r.status >= 200 && r.status < 300;
     if (!ok) note_error(w, what, &r);
-    if (ok && db_txn_make_durable(db) != OK) {
+    if (ok && cls == API_DURABLE && db_txn_make_durable(db) != OK) {
         note_error(w, "make durable", NULL);
         err_clear();
         ok = 0;
@@ -255,14 +256,14 @@ static void one_write(writer_t *w, int i)
             snprintf(body, sizeof(body), "{\"sources\":[\"%s\",\"%s\"],"
                      "\"exclude\":[\"*.tmp\"]}", TEST_SRC, TEST_SRC2);
         api_request_t q = req_with(API_PUT, body);
-        call(w, "sources put", metadata_sources_put(&q, repo_id));
+        call(w, "sources put", API_COMMIT_ONLY, metadata_sources_put(&q, repo_id));
         break;
     }
     case W_POLICY: {
         snprintf(body, sizeof(body),
                  "{\"key\":\"retention.keep_daily\",\"value\":%d}", i + 1);
         api_request_t q = req_with(API_PUT, body);
-        call(w, "policy put", metadata_policy_put(&q, repo_id));
+        call(w, "policy put", API_COMMIT_ONLY, metadata_policy_put(&q, repo_id));
         break;
     }
     case W_TAGS: {
@@ -270,9 +271,9 @@ static void one_write(writer_t *w, int i)
         snprintf(name, sizeof(name), "s%d", i);
         snprintf(body, sizeof(body), "{\"name\":\"%s\",\"snap_id\":1}", name);
         api_request_t q = req_with(API_POST, body);
-        if (call(w, "tag set", metadata_tags_post(&q, repo_id)) && (i % 2)) {
+        if (call(w, "tag set", API_DURABLE, metadata_tags_post(&q, repo_id)) && (i % 2)) {
             api_request_t d = req_with(API_DELETE, NULL);
-            call(w, "tag remove", metadata_tags_delete(&d, repo_id, name));
+            call(w, "tag remove", API_DURABLE, metadata_tags_delete(&d, repo_id, name));
         }
         break;
     }

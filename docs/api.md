@@ -192,6 +192,52 @@ the repository: missing configured sources (400), a key that is not loaded
 repository with no sources is reported as the trigger error. A path or id
 in the URL that names nothing is still a 404 before the body is read.
 
+### When a write's answer comes back
+
+Every request that changes something answers once its change is committed
+to `state.db`. Some also wait until the change is on disk, so that a power
+cut the moment the answer arrives cannot take it back. Which ones is fixed
+per route, and every route that is not a `GET` has one of the two classes;
+the daemon refuses to start with a write route that has neither, and
+`tests/test_route_classes.c` holds each route below to its class.
+
+- **Durable**: the answer waits for a sync of the database's write-ahead
+  log (an `fdatasync`). Tags, registering and removing a repository, every
+  `DELETE`, and the few other writes that revoke or discard something.
+- **Commit-only**: the answer comes as soon as the change is committed. The
+  daemon's once-a-second flush puts it on disk, so a power cut within about
+  a second of the answer can lose that last edit. It cannot corrupt
+  anything: the database opens and the repository and its index agree
+  after the next start, with the edit either wholly there or wholly not.
+
+The sync is the only cost the durable class adds, and it depends on the
+disk under `state.db` and what else is writing to it: about 25 ms at the
+median on an idle NVMe drive, and up to 2.7 s (p99) on a saturated local
+disk (Manual section 6.4 has the numbers measured during a backup).
+
+| Method | Route | Class | Why |
+|---|---|---|---|
+| POST | `/api/auth/setup` | commit-only | Lost to a cut, setup is simply run again |
+| POST | `/api/auth/login` | commit-only | Lost to a cut, the client logs in again |
+| POST | `/api/auth/logout`, `/api/auth/logout-all` | durable | Revokes credentials: a lost revocation would hand a session back |
+| POST | `/api/auth/password` | durable | Same: the old password must not come back |
+| POST | `/repos` | durable | A client told a repository exists acts on it |
+| DELETE | `/repos/<id>` | durable | Every delete |
+| POST | `/repos/<id>/tags` | durable | A tag is retention protection |
+| DELETE | `/repos/<id>/tags/<name>` | durable | Every delete |
+| DELETE | `/repos/<id>/snapshots/<sid>` | durable | Every delete |
+| DELETE | `/repos/<id>/schedules/<sid>` | durable | Every delete |
+| DELETE | `/exports/<id>` | durable | Every delete |
+| POST | `/repos/<id>/repair` | durable | Accepts missing packs as lost: deletes index rows |
+| PUT | `/repos/<id>/sources`, `/repos/<id>/policy` | commit-only | DB-only edit; repeat it if a cut takes it |
+| POST, PUT | `/repos/<id>/schedules`, `/repos/<id>/schedules/<sid>` | commit-only | DB-only edit |
+| PUT | `/repos/<id>/snapshots/<sid>/note` | commit-only | DB-only edit |
+| POST | `/repos/<id>/key/import`, `/repos/<id>/key/ack` | commit-only | The key file is written by its own path; the escrow flag is DB-only |
+| PUT | `/repos/<id>/units/<p>/<u>/policy` | commit-only | DB-only edit |
+| POST | `/repos/<id>/units/<p>/<u>/reset-incremental` | commit-only | DB-only edit; the next session reads in full either way |
+| POST | `/jobs/<id>` (cancel) | commit-only | A cut interrupts the job anyway |
+| POST | `/repos/<id>/backup`, `grep`, `verify`, `gc`, `gfs`, `reindex`, `replicate`, `snapshots/<sid>/restore`, `units/backup`, `snapshots/<sid>/unit/restore`, `snapshots/<sid>/unit/export` | commit-only | Job submissions: a job a cut catches is reported interrupted, or never started. `gc` and `gfs` delete in their jobs, which make each commit durable before removing what it describes |
+
 ## Public
 
 | Method | Path | Purpose |

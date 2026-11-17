@@ -146,10 +146,11 @@ status_t db_txn_install_cutils_lock(cutils_db_t *db);
  * It used to be a FULL checkpoint taken under the write lock: up to the
  * whole WAL (64 MiB by default) copied into the database, with two syncs,
  * while every writer, a running backup's batches and each API edit
- * included, queued behind it. Since every API write calls this before
+ * included, queued behind it. Since every API write called this before
  * answering (api_server_set_after_write), that put a checkpoint on the
  * request path of every tag, note and sources edit, and a seconds-long
- * wait on every other writer during a backup on slow storage.
+ * wait on every other writer during a backup on slow storage. Only the
+ * durable class of API writes calls it now (api_write_class_t).
  *
  * ERR_IO when the WAL could not be synced, which callers treat as "do not
  * remove anything yet". Must not be called while this thread holds the
