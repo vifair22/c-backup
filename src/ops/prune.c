@@ -176,18 +176,26 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
                          (long long)snap_id);
     }
 
-    /* The repository's copy of the tags (repo_tags.h) loses them too, in the
-     * same transaction, as every other tag change does. Left behind, a
-     * reindex would skip them only because the timestamp no longer matches. */
-    if (ntags > 0 && repo_tags_save(db, repo_id, store_root(store)) != OK) {
-        char why[ERR_MSG_MAX];
-        snprintf(why, sizeof(why), "%s", err_msg());
-        db_txn_rollback(db);
-        return set_error(ERR_IO, "prune: cannot record tags in the repository: %s", why);
-    }
-
     if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "prune: commit");
+
+    /*
+     * The repository's copy of the tags (repo_tags.h) loses them too, after
+     * the commit and outside the write lock: its two syncs inside the
+     * transaction held up every other writer (B144). This direction is safe
+     * where a tag edit's is not: a tag left in the file for a snapshot that
+     * is gone is never restored, since reindex matches id and timestamp and
+     * snapshot ids are never reused. So a failure here is a warning.
+     */
+    if (ntags > 0) {
+        repo_tags_lock();
+        if (repo_tags_save(db, repo_id, store_root(store)) != OK) {
+            log_warn("prune: snapshot %lld's tags stay in the repository's tag file, "
+                     "where they match nothing: %s", (long long)snap_id, err_msg());
+            err_clear();
+        }
+        repo_tags_unlock();
+    }
 
     /* The record file is the snapshot's authoritative copy; it goes only
      * once the commit removing the snapshot's rows is durable, or a power
