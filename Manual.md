@@ -406,8 +406,9 @@ are different: they live in the database and change through the policy API
 The `retention.*` keys are defaults for repositories that have not set their
 own (section 9). Each is a whole number, 0 or more.
 
-The keys for virtual machines and containers (`security.run_as_uid`,
-`units.*`, `vm.*`, `containers.*`) are in section 22.3.
+The other keys for virtual machines and containers (`security.run_as_uid`,
+`units.*`, the remaining `vm.*`, `containers.*`) are in section 22.3, which
+repeats the four `vm.*` keys above.
 
 The daemon refuses to start on a file it cannot honour, rather than running
 on defaults nobody chose. Each problem is printed with the file and line,
@@ -2296,6 +2297,8 @@ Where each kind of state lives decides what such a loss can cost:
 | | The file cache (the next backup reads those files again) |
 | | Resumable retention state, and pending repository removals |
 | | The daemon's own log lines (30 days) and queued push notifications |
+| | Unit policy (per-unit retention, `capture.exclude`, `capture.group`) and NBD export records |
+| | VM checkpoint bindings (section 6.5): losing them costs each VM disk one full read |
 
 The index itself - snapshots, browse and search rows, the object and pack
 tables - is in `state.db` too, and a backup's index rows are its last
@@ -2617,10 +2620,10 @@ Known limits:
 - **No resumable jobs.** A job interrupted by a restart is marked failed and
   run again. Backups skip what is unchanged; restores skip what they
   already finished (section 8).
-- **Units (section 22).** Every VM disk is read in full on every run
-  (incremental reads through libvirt checkpoints are coming); passthrough
-  disks are not read; disks restore as raw images only; a `units` schedule
-  does not keep `pause_scope`. Database detection is coming.
+- **Units (section 22).** Incremental VM reads (section 6.5) are off by
+  default until they have been through UAT, and raw disks are always read
+  in full; passthrough disks are not read; disks restore as raw images
+  only. Database detection is coming.
 
 Not in 1.0, by decision:
 
@@ -2702,14 +2705,15 @@ lists every command with all of its arguments.
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id> [--limit N] [--offset N]`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--offset N] [--result success\|failed\|cancelled\|warning\|alert]` | Operation history, newest first; any other `--result` is refused |
-| `schedule list <id> [--limit N] [--offset N]`, `schedule add\|remove\|enable\|disable <id> ...` | Schedules (section 10); `add <id> units ... --provider P (--all [--exclude GLOB]... \| --unit NAME...) [--require LEVEL]` for units (section 22.6) |
+| `schedule list <id> [--limit N] [--offset N]`, `schedule add\|remove\|enable\|disable <id> ...` | Schedules (section 10); `add <id> units ... --provider P (--all [--exclude GLOB]... \| --unit NAME...) [--require LEVEL] [--pause-scope unit\|group\|job]` for units (section 22.6) |
 | `unit providers`, `unit list <provider> [--limit N] [--offset N]`, `unit show <provider> <unit>` | Providers and the helper link; live units; one unit's items (section 22) |
-| `unit backup <id> --provider P (<unit>... \| --all [--exclude GLOB]...) [--require LEVEL]` | Back up units, one snapshot each |
+| `unit backup <id> --provider P (<unit>... \| --all [--exclude GLOB]...) [--require LEVEL] [--pause-scope unit\|group\|job]` | Back up units, one snapshot each; `--pause-scope` shares one capture across units (section 22.6.1) |
 | `unit history <id> [--provider P <unit>] [--limit N] [--offset N]` | Units with history here, or one unit's snapshots |
 | `unit restore <id> <snapshot> <dest> [--item ID] [--overwrite]` | A unit snapshot as files, or one disk as a sparse raw image |
 | `unit restore <id> <snapshot> --define [--replace \| --name N --target-root DIR] [--pin-digest] [--start] [--keep-macs]` | Re-create the unit (section 22.7.3) |
 | `unit policy show\|set <id> --provider P <unit> [key value]` | Per-unit retention, `capture.exclude`, `capture.group` |
 | `vm export <id> <snapshot> <disk> [--ttl N[s\|m\|h\|d]]`, `vm exports`, `vm export-show <export-id>`, `vm unexport <export-id>` | Read-only NBD export of a VM disk (section 22.8) |
+| `vm checkpoints <id> <vm>`, `vm reset-incremental <id> <vm>` | A VM's incremental chain; incrementals back on after a failed audit (section 6.5) |
 | `jobs [--limit N] [--offset N]`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
 | `auth status` | Whether an admin password is set |
 | `auth setup\|password` | Set or change the admin password (prompts) |
@@ -2734,11 +2738,11 @@ designs behind it are `docs/source-providers.md`, `docs/vm-backup.md` and
 `docs/container-backup.md`; `docs/helper.md` is the helper's reference and
 `docs/api.md` ("Units") the routes.
 
-**Coming, not in this build:** incremental VM reads through libvirt
-checkpoints and dirty bitmaps (`vm-backup.md` 5, phase V3), and database
-detection with suggested capture methods (`docs/db-detection.md`). Every VM
-disk is read in full on every run today; a full read still stores only the
-chunks that changed (22.4.6).
+Incremental reads of running VMs' qcow2 disks through libvirt checkpoints
+are built and off by default (`vm.incremental: 0`); section 6.5 describes
+them, and 22.4.3 says where they fit. **Coming, not in this build:**
+database detection with suggested capture methods
+(`docs/db-detection.md`).
 
 ### 22.1 Concepts
 
@@ -2887,11 +2891,13 @@ docker run -d --name c-backupd --restart unless-stopped \
 **FS2** (btrfs cache pool with no subvolumes; Docker only, no VMs): the
 same two commands without the libvirt socket, `/mnt/user/domains`, the two
 `/etc/libvirt` mounts and `cbackup-vmstate`, and with the restore staging
-mount at the pool root, because on a pool with no subvolumes the snapshot
-domain is the pool itself:
+mount in the `system` share. On a pool with no subvolumes the snapshot
+domain is the pool itself, and the helper never stages at a pool's top
+level (22.7.3), so a whole-pool domain stages in
+`<pool>/system/.cbackup-restore`, beside the snapshot directory:
 
 ```sh
-  -v /mnt/cache/.cbackup-restore:/mnt/cache/.cbackup-restore \
+  -v /mnt/cache/system/.cbackup-restore:/mnt/cache/system/.cbackup-restore \
 ```
 
 Before the first start, as root on the host:
@@ -2905,8 +2911,8 @@ chown 990:990 /mnt/cache/appdata/c-backupd /mnt/cache/appdata/.cbackup-restore \
 chown root:990 /run/c-backup-helper && chmod 0750 /run/c-backup-helper
 ```
 
-On FS2 create `/mnt/cache/.cbackup-restore` (owned by 990) instead of the
-appdata one. `/run` is RAM on Unraid too: recreate the two `/run` directories at boot
+On FS2 create `/mnt/cache/system/.cbackup-restore` (owned by 990) instead
+of the appdata one. `/run` is RAM on Unraid too: recreate the two `/run` directories at boot
 (the `go` file, or a User Scripts "at startup" script) before the containers
 start. A bind source that does not exist makes `docker run` fail.
 
@@ -2921,18 +2927,28 @@ What each piece is for:
 | `/mnt/cache:/mnt/cache:rshared` | helper | restore staging and swap act on host paths in the helper's own namespace; add one per pool that holds unit data |
 | `/mnt/cache/system/c-backup-helper` | helper | its state directory: `holds.json`, every hold it has taken, released at its next start after a crash. On a pool, never the RAM rootfs |
 | `/boot/config/c-backup-helper.ini` | helper | the policy, on the flash, root-owned (22.2.3) |
-| `/run/c-backup-helper` | both | the helper's socket, and `nbd/` where VM exports and `qemu-nbd` sockets appear; the same path on both sides |
+| `/run/c-backup-helper` | both | the helper's socket (created `0660` with group `daemon_gid`, 22.2.3), and `nbd/` where VM exports and `qemu-nbd` sockets appear; the same path on both sides. The directory is `0750 root:990`, so the daemon can enter it after it drops to uid 990 |
 | `/mnt/cache:ro,rslave` | daemon | reads container data from capture snapshots and VM images; `rslave` lets the `.zfs` snapshot automounts and new btrfs snapshots appear inside the daemon's view |
 | `/mnt/user/domains:ro` | daemon (FS1) | domain XML names some images by their `/mnt/user/domains` path; on FS1 that is a symlink to `/mnt/cache/domains`, and binding it makes both spellings resolve |
 | `/etc/libvirt/qemu/nvram`, `/etc/libvirt/qemu/swtpm/tpm-states`, read-only | daemon (FS1) | the TPM state of a VM is read by the daemon at its real path |
 | `/mnt/cache/system/cbackup-vmstate` | daemon (FS1) | the helper policy's `staging_root`: NVRAM and TPM state staged for a VM restore |
-| `<domain>/.cbackup-restore`, read-write | daemon | where a container restore into place is staged before the helper swaps it in (22.7.3) |
+| `<domain>/.cbackup-restore` (FS2: `/mnt/cache/system/.cbackup-restore`), read-write | daemon | where a container restore into place is staged before the helper swaps it in (22.7.3) |
 | `/run/c-backupd` | daemon | the API socket, and `exports/` for NBD exports, which the host must reach (22.8) |
 | `--label net.cbackup.role=...` | both | a container carrying this label is never paused |
 | `C_BACKUP_UNITS_ALLOW` | daemon | the safety rail (22.9) |
 
 The image runs the CLI inside the daemon's container:
 `docker exec c-backupd c-backup unit list docker`.
+
+The helper logs to its console (stdout, errors to stderr), where `docker
+logs c-backup-helper` and the journal find it; it keeps no log database. At
+start it logs each provider it enabled, then the socket's owner, group and
+mode, and a **WARNING** when the daemon could not reach the socket: a
+directory on the way that no member of `daemon_gid` (nor `daemon_uid`) may
+enter, or a socket the group may not write. It warns rather than refusing to
+start, since it cannot know every group the daemon holds. Its last start-up
+line is `helper: serving <socket> for uid 990, daemon <id>, policy <first
+12 hex digits of the digest>`.
 
 #### 22.2.2 The daemon's privileges
 
@@ -2957,7 +2973,7 @@ read without `CAP_SYS_ADMIN` and are skipped (appdata does not use them).
 #### 22.2.3 The policy
 
 The policy is read once at the helper's start. It is refused (the helper
-does not start) when the file is writable by anyone but its owner, owned by
+does not start) when the file is writable by group or others, owned by
 anyone but root, or has an unknown section or key, a duplicate hook name, or
 a value out of range. Check one before installing it:
 
@@ -2966,12 +2982,14 @@ docker run --rm -v /boot/config/c-backup-helper.ini:/p.ini:ro \
   --entrypoint /usr/local/bin/c-backup-helper <image> --policy /p.ini --check
 ```
 
-`--check` prints the policy's SHA-256, the digest the helper reports to the
-daemon and `GET /providers` shows.
+`--check` prints `{"ok":true,"policy":"<sha256>",...}`: the policy's
+SHA-256, the digest the helper reports to the daemon and `GET /providers`
+shows.
 
-**Comments are whole lines only**, starting `#` or `;`. A comment after a
-value on the same line becomes part of the value and is refused (`daemon_uid
-= 990  # uid` is not a number).
+**Comments.** A line starting with `#` or `;` is a comment, and so is `#` or
+`;` after whitespace in a value: `daemon_uid = 990  # uid` is 990. An
+`argv.N` value is the exception, taken verbatim with any `#` and `;` in it,
+so a hook's arguments can contain them.
 
 An annotated policy for FS1:
 
@@ -2979,6 +2997,9 @@ An annotated policy for FS1:
 [helper]
 # The only peer uid the socket accepts (non-root).
 daemon_uid = 990
+# The socket's group (it is created 0660); defaults to daemon_uid, which is
+# the gid security.run_as_uid gives the daemon.
+# daemon_gid = 990
 # The daemon's id, 8 hex digits: GET /providers "daemon_id", or the daemon's
 # start-up log line "units: daemon id ...". A mismatch refuses the hello.
 daemon_id = 7f3a09c1
@@ -3008,6 +3029,9 @@ zfs_domains = cache/appdata, cache/system, cache/Photos, cache/lxc
 # btrfs pool roots (FS2: /mnt/cache) and where their snapshots go.
 btrfs_domains =
 # btrfs_snapshot_dir = /mnt/cache/system/.cbackup-snapshots
+# Where an in-place restore stages, per domain: the first entry inside the
+# mount's domain wins (22.7.3). Empty: the defaults described there.
+# restore_staging_dirs = /mnt/cache/appdata/.cbackup-restore
 
 [host]
 # Run zfs, btrfs, lxc-*, qemu-nbd and docker as the host's binaries.
@@ -3075,6 +3099,11 @@ and a request that finds the helper gone marks the link down at once.
 - A job in flight when the helper restarts fails cleanly: no snapshot is
   written, and the helper's start-up sweep releases whatever the old
   process held (pauses, freezes, snapshots, exports).
+- If libvirt cannot be reached when the helper starts (libvirtd down, or
+  its socket not mounted), the sweep logs it and **keeps** every hold that
+  names a domain, a guest freeze included, for the next sweep, which its
+  watchdog runs; it never drops a record it could not act on, so a guest
+  left frozen is thawed once libvirt is back.
 
 `c-backup unit providers` (`GET /providers`) shows the state of all of it:
 
@@ -3106,7 +3135,11 @@ settings are in its policy, not here.
 | `containers.max_pause_s` | `30` | Watchdog on a container pause for in-process providers; behind the helper, the policy's `max_pause_s` governs |
 | `vm.export_dir` | `/run/c-backupd/exports` | Directory (0700) of NBD export sockets; the same path on the host and in the container |
 | `vm.export_ttl_s` | `14400` | Default export lifetime, 60 to 604800 seconds |
-| `vm.export_idle_s` | `1800` | An export with no connection for this long is closed |
+| `vm.export_idle_s` | `1800` | An export with no connection for this long is closed, 1 to 86400 |
+| `vm.export_max_conns` | `4` | NBD export connections open at once across every export, 0 to 64; 0 turns exports off. The daemon refuses to start unless `jobs.read_budget_mb` >= this x 16 MiB + 48 MiB (section 3) |
+| `vm.incremental` | `0` | `1` reads running VMs' qcow2 disks incrementally through libvirt checkpoints (section 6.5) |
+| `vm.delta_full_pct` | `75` | Read a disk in full when an incremental would read more than this share of it, 0 to 100 (section 6.5) |
+| `vm.audit_days` | `30` | Days between audit reads of each VM, 0 to 3650; 0 never audits (section 6.5) |
 
 ### 22.4 Virtual machines
 
@@ -3162,8 +3195,15 @@ disk state belongs with a memory image c-backup does not capture).
   started by the helper with `file.locking=off` over a socket in the
   helper's `nbd_dir` (`/run/c-backup-helper/nbd`) handed to uid 990, and
   read by the daemon's native NBD client. With locking off, a backup never
-  stops the VM being started; a change to the image during the read is
-  logged.
+  stops the VM being started.
+
+Either way the daemon records the image's size, mtime and ctime when it
+opens the disk (for qcow2, the image behind `qemu-nbd`) and compares them
+once the last byte is read. A change **fails that disk and its unit**,
+`disk: <image> changed while it was read offline (was the VM started, or
+the image written?); not stored as a consistent image`, so a VM started
+mid-read never leaves a torn image stored as `offline`. Run it again once
+the VM is settled.
 
 #### 22.4.3 Running VMs
 
@@ -3199,15 +3239,36 @@ sequenceDiagram
 (`org.qemu.guest_agent.0`, `state='connected'`), the guest is frozen for the
 backup start alone and thawed in every path out of it, including failures;
 the data is read afterwards from the frozen instant, so the freeze lasts
-well under a second. A watchdog thaws at the policy's `freeze_timeout_s`
-whatever the helper is doing. Frozen: `quiesced`. No agent, or `freeze =
-off`: `crash`. `freeze = required` fails a unit that cannot be frozen.
+well under a second (`freeze_ms` in `unit.json`). Two watchdogs bound it
+whatever the helper is doing: the libvirt provider's at the policy's
+`freeze_timeout_s`, and the helper's own over every hold at `max_pause_s`.
+Both time holds in milliseconds, so a 1 s bound never fires early. Frozen:
+`quiesced`. No agent, or `freeze = off`: `crash`. `freeze = required` fails
+a unit that cannot be frozen.
 
-**Raw disks are read in full on every run**, online or offline: libvirt's
-checkpoints (and so incremental reads) need qcow2, and incremental reads are
-not built yet for any format. A full read stores only chunks that are new.
-On FS1 that is Noah MC (256 GiB, 77.6 GiB allocated) and DLBox (127 GiB,
-32.9 GiB): at about 1 GB/s, roughly 80 and 35 seconds of reading per run.
+**A freeze a watchdog let go is not `quiesced`.** If a watchdog thawed the
+guest before the backup start (the thaw finds nothing still frozen), the
+point in time is not the frozen one: the unit is `crash`, with a warning
+(`freeze released by the watchdog ... consistency is crash, not quiesced`,
+or `freeze held past N s; thawed before backup start`) and the
+`watchdog-released` flag in `consist_flags`.
+
+**Which disks are read in full.** With `vm.incremental: 0`, the default,
+every disk is read in full on every run. With `1`, a running VM's qcow2
+disks are read incrementally against a libvirt checkpoint made with the
+previous backup (section 6.5); raw disks have no bitmap through libvirt and
+a shut-off VM has no bitmap to ask, so those are always read in full. A full
+read stores only chunks that are new. On FS1 the raw disks are Noah MC
+(256 GiB, 77.6 GiB allocated) and DLBox (127 GiB, 32.9 GiB): at about
+1 GB/s, roughly 80 and 35 seconds of reading per run.
+
+**A checkpoint is bound before it is settled.** When an incremental-capable
+backup commits, the rows binding each disk to its new checkpoint are made
+durable in `state.db` before the helper settles that checkpoint on the
+domain and retires the old one. If they cannot be, the session ends
+aborted, the new checkpoint is discarded and the next backup reads in full,
+so a power cut never leaves a checkpoint on the domain that the index does
+not know about.
 
 **Holes.** A hole is any run of zero bytes of 64 KiB or more, found by
 looking at the bytes; extents the server reports as zero are skipped without
@@ -3295,10 +3356,21 @@ never several at once; a nested subvolume is its own domain), or both.
 A member that does not pause within `pause_timeout_s` (default 5) leaves the
 others unpaused again; a unit that needed the pause then fails. The policy's
 `max_pause_s` (default 30) bounds every pause: the helper's watchdog
-unpauses at that bound whatever else is happening.
+unpauses at that bound whatever else is happening. The pause's length is
+`pause_ms` in `unit.json`, timed in milliseconds like the watchdog.
 
-A paused or snapshotted container unit is `crash`; with every pre hook
-exiting 0 it is `application`; stopped, `offline`.
+A paused or snapshotted container unit is `crash`; with pre hooks that all
+exited 0 it is `application`; stopped, `offline`.
+
+**A pause a watchdog let go does not count.** If the watchdog unpaused a
+member before the snapshots were taken (the unpause finds it running), the
+pause no longer ties the snapshot instants together: a capture with more
+than one instant is then `inconsistent`, with a warning (`the pause on N
+member(s) was released by the watchdog within M ms; consistency is ...`)
+and the `watchdog-released` flag in `consist_flags`. A capture with one
+instant stays `crash`, since one atomic snapshot needed no pause. LXC
+freezes are judged the same way: a container found no longer frozen at
+thaw is not counted as frozen.
 
 #### 22.5.4 ZFS and btrfs capture, and the hidden snapshot directories
 
@@ -3351,7 +3423,10 @@ nothing the container could not do to itself.
 
 - **Logs.** Every hook becomes `.cbackup-unit/hooks/<name>.log`: stdout and
   stderr, capped at 1 MiB with the first and last halves kept around a line
-  counting what was dropped, and the exit status appended.
+  counting what was dropped. It always ends with how the hook ended,
+  `[c-backup: exit status N]` or `[c-backup: killed at its timeout, exit
+  status N]`, so a hook log is never empty; for a dump hook it is what says
+  why a dump was not stored.
 - **Dumps.** A `kind = dump` hook also becomes `.cbackup-unit/hooks/<name>.dump`.
   Its stdout streams from the helper through a pipe straight into the
   repository: any size, no temporary file anywhere. A dump runs while the
@@ -3397,7 +3472,10 @@ sequenceDiagram
 The pause is capped at the policy's `max_pause_s` (30 s). Within the cap
 the unit is `crash`-consistent. At the cap the helper's watchdog unpauses,
 the snapshot is **kept**, and the unit is flagged `inconsistent` with a
-warning. A `pause = never` unit, a stopped unit, and a unit captured in a
+warning and the `watchdog-released` flag. The cap is judged by the release
+finding a member already unpaused, not only by the clock, since the
+watchdog measures from the hold's journal entry, a little before the
+pause. A `pause = never` unit, a stopped unit, and a unit captured in a
 group (22.6.1) read fallback mounts live and are flagged. Remember that
 such a unit needs `--require inconsistent` (22.1).
 
@@ -3445,7 +3523,9 @@ added last week is included. `--exclude` globs match unit names. A units
 schedule's overlap is keyed by repository, action and unit set.
 
 **Pause scope.** By default each unit is its own capture (`pause_scope:
-unit`). `POST /repos/<id>/units/backup` also takes:
+unit`). `--pause-scope` on `unit backup` and `schedule add ... units`
+(`"pause_scope"` in `POST /repos/<id>/units/backup` and in a schedule's
+body) also takes:
 
 - `"pause_scope": "job"`: every unit of the job in one capture, one
   snapshot per pool for all of them, every member paused together if the
@@ -3454,12 +3534,18 @@ unit`). `POST /repos/<id>/units/backup` also takes:
   `c-backup unit policy set 1 --provider docker reverse-proxy capture.group
   proxy`) captured together, the rest alone.
 
+```sh
+c-backup unit backup 1 --provider docker --all --pause-scope job
+c-backup schedule add 1 units --every day --at 05:00 --provider docker \
+  --unit reverse-proxy --unit authelia --pause-scope group
+```
+
 Each unit of a shared capture is then read and stored on its own, and the
 shared snapshots are destroyed after the last. A shared capture keeps its
 snapshots for the whole job, which is why per-unit capture is the default.
-In this build the CLI has no flag for it, and **a `units` schedule does not
-keep `pause_scope`**: scheduled runs always use per-unit capture. Use the
-API for a job-scope or group-scope run.
+A `units` schedule stores its pause scope and every run it fires uses it.
+A units job body or schedule body with a key it does not know is refused
+(`unknown key '...'`), rather than the key being dropped.
 
 #### 22.6.2 Retention per unit
 
@@ -3521,9 +3607,21 @@ c-backup unit restore 1 5120 --define --name immich-test \
 | | `--replace` | `--name N --target-root DIR` |
 |---|---|---|
 | Needs | the unit stopped (a VM shut off) | a name not in use |
-| Data | each mount staged in `<domain>/.cbackup-restore/<job>-<random>/` and swapped in, the old directory kept as `<mount>.cbackup-old-<job>`; each VM image restored into `<image dir>/.cbackup-restore/` and swapped in only after every disk is in, the old image kept as `<image>.cbackup-old-<job>` | each mount, each VM image, at `DIR/<its original path>`; the original's paths are never written |
+| Data | each mount staged in `<staging>/<job>-<random>/` (below) and swapped in, the old directory kept as `<mount>.cbackup-old-<job>`; each VM image restored into `<image dir>/.cbackup-restore/` and swapped in only after every disk is in, the old image kept as `<image>.cbackup-old-<job>` | each mount, each VM image, at `DIR/<its original path>`; the original's paths are never written |
 | Definition | re-applied with the same name (and for a VM the same UUID) | the name changed; bind sources, volumes, rootfs and mount entries rewritten under `DIR`; a VM's `<uuid>` removed (libvirt makes a new one), MACs regenerated unless `--keep-macs`, disks pointing at the new images, excluded passthrough disks dropped and listed |
 | Never | a delete: old data is moved aside, never removed | |
+
+**Where a restore in place stages.** The swap is a rename, so the staging
+directory sits in the mount's own snapshot domain: the first `[snapshot]
+restore_staging_dirs` entry inside that domain; with none, for a whole-pool
+domain (FS2's `/mnt/cache`) `<pool>/system/.cbackup-restore`, beside the
+snapshot directory, and otherwise `<domain>/.cbackup-restore` (FS1:
+`/mnt/cache/appdata/.cbackup-restore`). Wherever it comes from, the helper
+refuses it at the top of a pool, in a share exported over SMB or NFS, and on
+another filesystem from the mount (a btrfs subvolume, another dataset); each
+refusal names `restore_staging_dirs` as the fix. VM images stage beside the
+image (`<image dir>/.cbackup-restore/`) under the same refusals, and NVRAM
+and TPM state under `staging_root`.
 
 `DIR` must lie inside an include root for containers, because the helper
 refuses binds outside them, and the daemon must be able to write it: add a
@@ -3610,13 +3708,25 @@ Or copy the disk out without a kernel device:
 - **Lifetime.** `--ttl` (`N`, `Ns`, `Nm`, `Nh`, `Nd`; 60 s to 7 days,
   default `vm.export_ttl_s`, 4 h); an export with no connection for
   `vm.export_idle_s` (30 min) closes; `vm unexport` revokes it and
-  disconnects every client; a daemon stop closes all. `vm export-show <id>`
+  disconnects every client; removing the repository (`repo remove`) revokes
+  its exports first; a daemon stop closes all. `vm export-show <id>`
   shows a closed one's `close_reason`: `revoked`, `expired`, `idle`,
-  `daemon stopped`, `daemon restarted`.
+  `repository removed`, `daemon stopped`, `daemon restarted`.
+- **Connections and memory.** `vm.export_max_conns` (default 4) caps
+  connections across every export; one past it is refused, naming the key,
+  and 0 turns exports off. Each connection holds at most one verified
+  object, up to 16 MiB, of `jobs.read_budget_mb` while it reads, and lets it
+  go after a second idle; `vm exports` shows each export's `cache_bytes`.
+  The daemon refuses to start unless `jobs.read_budget_mb` >=
+  `vm.export_max_conns` x 16 MiB + 48 MiB (112 MiB at the defaults), and
+  says which key to change.
 - **Pins.** While open, an export pins its snapshot: deleting it is refused
-  even with `--force` (the message names the export), retention keeps it as
-  if tagged, and a `gc` on its repository fails with "gc deferred" and runs
-  again at its next schedule. Backups and other restores run normally.
+  even with `--force` (the message names the export), and retention keeps
+  it as if tagged. A `gc` on its repository **waits** rather than fails: the
+  job stays queued and cancellable with phase `waiting for an NBD export to
+  close`, checked every second, and runs once the export closes; the
+  export's ttl, at most 7 days, bounds the wait. Backups and other restores
+  run normally.
 - **Audit.** Opening and closing are journalled with the caller; the server
   speaks `READ`, `BLOCK_STATUS` (the snapshot's holes are holes to the
   client) and `DISC`, and refuses writes.
@@ -3643,12 +3753,13 @@ production units means changing both lists, deliberately, on the host.
 
 | Symptom | Cause | What to do |
 |---|---|---|
-| The helper exits at start: `policy line N: ...` | an unknown key or section, a value out of range, an inline comment after a value, or the file writable by others | fix the line named; comments on lines of their own; `chmod 0600` and `chown root`; `--check` before restarting |
+| The helper exits at start: `policy line N: ...` | an unknown key or section, a value out of range, or the file writable by group or others | fix the line named; `chmod 0600` and `chown root`; `--check` before restarting |
+| The helper's log: `WARNING: the daemon ... cannot write to socket` or `WARNING: no member of group ... can enter` | the socket's group (`daemon_gid`) or a directory's mode keeps the daemon out | `chown root:990 /run/c-backup-helper && chmod 0750 /run/c-backup-helper`; `daemon_gid` the daemon's gid |
 | `GET /providers`: `helper.state` `never-connected` or `disconnected` | the helper is not running, the socket path differs, or `/run/c-backup-helper` is not mounted into both | `docker logs c-backup-helper`; same path both sides; the daemon reconnects by itself within 30 s |
 | hello refused: daemon ids differ | the policy's `daemon_id` is not this daemon's | copy `daemon_id` from `GET /providers` into the policy; restart the helper |
 | connection refused by the helper, peer uid | the daemon is not running as 990, or the policy's `daemon_uid` differs | `privileges_dropped` true and `security.run_as_uid` 990; the same uid in the policy |
 | a unit is not listed | `units.allow` (daemon) or `[units] allow` (helper) excludes it | widen the right list on the host |
-| `achieved inconsistent, below the required crash` | mounts on no snapshot domain with `pause = never`, a group capture, several instants without a pause, or a dataset missing from `zfs_domains` | add the dataset to the policy, allow the pause, or pass `--require inconsistent` knowingly |
+| `achieved inconsistent, below the required crash` | mounts on no snapshot domain with `pause = never`, a group capture, several instants without a pause or with a pause the watchdog let go (`watchdog-released` in `consist_flags`), or a dataset missing from `zfs_domains` | add the dataset to the policy, allow the pause (and enough `max_pause_s` for it), or pass `--require inconsistent` knowingly |
 | a VM disk refused: format mismatch | the image's header disagrees with the XML's `<driver type>` | correct the domain XML; the extension does not matter |
 | a VM unit fails on NVRAM or TPM state | the file or directory named by the XML is missing or unreadable to uid 990 | check the two read-only `/etc/libvirt` mounts and that the path exists on the host |
 | a VM disk is not in the snapshot | it is excluded: see its `outcome` in `disks.json` (`passthrough`, `removable`, `readonly`, `shareable`, `format`) | by design; passthrough disks are not read in this build |
@@ -3659,5 +3770,8 @@ production units means changing both lists, deliberately, on the host.
 | compose restore fails: `docker compose` not found | the host has no compose plugin | install Unraid's Compose Manager plugin |
 | restore warns: image digest no longer available | the registry dropped the digest; the tag was pulled instead | check the application's version; rerun with `--pin-digest` to refuse the fallback |
 | `vm export` answers 503 | gc or another writer holds the repository | retry after it finishes |
-| `gc deferred` in a gc job | an export is open on the repository | `vm exports`; `vm unexport <id>` if finished |
+| a gc job stays queued, phase `waiting for an NBD export to close` | an export is open on the repository | `vm exports`; `vm unexport <id>` if finished, or let its ttl run out |
+| the daemon will not start: `vm.export_max_conns ... needs jobs.read_budget_mb of at least ...` | the read budget cannot hold every export connection's object beside a job's 48 MiB | raise `jobs.read_budget_mb` as the message says, or lower `vm.export_max_conns` |
+| a VM unit fails: `disk: ... changed while it was read offline` | the VM was started, or the image written, during an offline read | run it again; the snapshot was not written |
+| `restore staging ... would sit at the top of a pool` or `... is exported over the network` or `... on another filesystem` | the default staging directory is not usable for that domain | set `[snapshot] restore_staging_dirs` to a directory inside the domain, in an unexported share, on the mount's filesystem |
 | `docker run` of the daemon fails: bind source does not exist | a `/run` directory or a `.cbackup-restore` directory was not created | create them (22.2.1); `/run` is RAM on Unraid, recreate at boot |
