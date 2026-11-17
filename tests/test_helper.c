@@ -183,6 +183,7 @@ static void test_policy(void **state)
     assert_int_equal(p.daemon_uid, 990);
     assert_int_equal(p.daemon_gid, 990);          /* defaults to daemon_uid */
     assert_string_equal(p.daemon_id, "0badf00d");
+    assert_int_equal(p.vm_freeze_timeout_s, 20);  /* 3x FS1's worst freeze, 6.6 s */
     assert_int_equal(p.n_hooks, 3);
     assert_int_equal(p.n_allow, 2);
     assert_true(p.allow_restore);
@@ -646,6 +647,41 @@ static void test_watchdog_waits_for_take(void **state)
     hstop();
 }
 
+/* A release that keeps failing is retried with a backoff, never dropped,
+ * and the sweep reports it for the daemon to alert on (B175). */
+static int stuck_tries(cJSON *o)
+{
+    const cJSON *st = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(o, "result"), "stuck");
+    const cJSON *h = cJSON_GetArrayItem(st, 0);
+    int n = h ? (int)cJSON_GetObjectItemCaseSensitive(h, "tries")->valuedouble : 0;
+    cJSON_Delete(o);
+    return n;
+}
+
+static void test_failed_release_backs_off(void **state)
+{
+    (void)state;
+    hstart((unsigned)getuid(), 30, 86400, 1000, 0, 0);
+    assert_int_equal(helper_server_record(srv, "fake:u1", SP_HOLD_EXPORT, "export:u1"), OK);
+    assert_int_equal(fake_hold_plant(fk, "u1", SP_HOLD_EXPORT, "export:u1"), OK);
+    fake_fail_set(fk, "u1", FAKE_FAIL_RELEASE, 0);
+    assert_int_equal(stuck_tries(call(req("sweep", "{}"), NULL)), 1);
+    /* Not again at once: the next try is a second away, then two. */
+    assert_int_equal(stuck_tries(call(req("sweep", "{}"), NULL)), 1);
+    struct timespec ts = { 1, 100 * 1000000L };
+    nanosleep(&ts, NULL);
+    assert_int_equal(stuck_tries(call(req("sweep", "{}"), NULL)), 2);
+    assert_int_equal(helper_server_holds(srv), 1);
+    assert_true(fake_hold_held(fk, "u1", SP_HOLD_EXPORT, NULL));
+    fake_fail_clear(fk);
+    ts.tv_sec = 2;
+    nanosleep(&ts, NULL);
+    assert_int_equal(stuck_tries(call(req("sweep", "{}"), NULL)), 0);
+    assert_int_equal(helper_server_holds(srv), 0);
+    assert_false(fake_hold_held(fk, "u1", SP_HOLD_EXPORT, NULL));
+    hstop();
+}
+
 /* What a dead helper held is released by the next one, from its records. */
 static void test_restart_sweep(void **state)
 {
@@ -1017,6 +1053,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_leases_and_rate, setup, teardown),
         cmocka_unit_test_setup_teardown(test_watchdog, setup, teardown),
         cmocka_unit_test_setup_teardown(test_watchdog_waits_for_take, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_failed_release_backs_off, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restart_sweep, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_stage_swap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_socket, setup, teardown),

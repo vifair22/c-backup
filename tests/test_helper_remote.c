@@ -106,6 +106,19 @@ static int setup_late(void **state)
     return 0;
 }
 
+/* As setup_late, the link retrying only every 30 s: a job finds the
+ * helper back before the link thread does. */
+static const remote_backoff_t k_slow = { 30000, 30000, 30000 };
+
+static int setup_late_slow(void **state)
+{
+    (void)state;
+    if (setup_base() != 0) return -1;
+    if (remote_start(HF_SOCK, units_daemon8(), &k_slow) == OK) return -1;
+    err_clear();
+    return 0;
+}
+
 static int setup(void **state)
 {
     (void)state;
@@ -313,6 +326,23 @@ static void test_failure_through_helper(void **state)
     assert_non_null(strstr(err_msg(), "helper"));
     unit_backup_result_free(&res);
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
+}
+
+/* A hold the helper cannot release reaches the job as its warning, which
+ * is what alerts (B175): the backup itself succeeds. */
+static void test_stuck_hold_warns(void **state)
+{
+    (void)state;
+    assert_int_equal(helper_server_record(srv, "fake:u9", SP_HOLD_EXPORT, "export:u9"), OK);
+    assert_int_equal(fake_hold_plant(fk, "u9", SP_HOLD_EXPORT, "export:u9"), OK);
+    fake_fail_set(fk, "u9", FAKE_FAIL_RELEASE, 0);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    fake_fail_clear(fk);
+    assert_non_null(strstr(res.warning, "cannot release export on fake:u9"));
+    assert_non_null(strstr(res.warning, "injected"));
+    unit_backup_result_free(&res);
+    assert_int_equal(helper_server_holds(srv), 1);
 }
 
 /* A configuration blob far past one 64 KiB packet crosses in the describe
@@ -786,6 +816,24 @@ static int wait_connected(void)
     return 0;
 }
 
+/* B180: the first job after the helper is back runs, rather than failing
+ * "unreachable since" until the link thread's next try. */
+static void test_job_reconnects_on_demand(void **state)
+{
+    (void)state;
+    remote_link_info_t li;
+    remote_link_info(&li);
+    assert_int_equal(li.state, REMOTE_DISCONNECTED);
+    assert_int_equal(helper_up(), 0);
+    unit_backup_result_t res;
+    status_t st = backup_one("cbk-uat-one", &res);
+    if (st != OK) fail_msg("the first job after the helper came back: %s", err_msg());
+    assert_true(res.units[0].snapshot_id > 0);
+    unit_backup_result_free(&res);
+    remote_link_info(&li);
+    assert_int_equal(li.state, REMOTE_CONNECTED);
+}
+
 /* The daemon first, the helper later: providers come up with no restart. */
 static void test_starts_before_helper(void **state)
 {
@@ -822,6 +870,74 @@ static void *bg_backup(void *arg)
     snprintf(j->err, sizeof(j->err), "%s", err_msg());
     unit_backup_result_free(&res);
     return NULL;
+}
+
+/*
+ * B177: the helper goes away while a unit is being read. Either the read
+ * needs it again and the unit fails with no snapshot, or the read was
+ * whole and the snapshot commits flagged, its session unended; it never
+ * completes silently, and never with a part cut short.
+ */
+typedef struct { const char *at; int done; } kill_at_t;
+
+static void kill_helper_at(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)done; (void)total;
+    kill_at_t *k = ctx;
+    if (k->done || !strstr(phase, k->at)) return;
+    k->done = 1;
+    helper_down();
+}
+
+static status_t backup_killing(const char *at, unit_backup_result_t *res)
+{
+    static kill_at_t k;
+    k.at = at;
+    k.done = 0;
+    const char *names[] = { "cbk-uat-one" };
+    unit_backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.provider = "fake";
+    o.units = names;
+    o.n_units = 1;
+    o.require = SP_CONSIST_CRASH;
+    o.job_id = 9;
+    o.progress_cb = kill_helper_at;
+    o.progress_ctx = &k;
+    status_t st = unit_backup_run(store, db, repo_id, &o, res);
+    assert_true(k.done);
+    return st;
+}
+
+static void test_helper_killed_mid_read(void **state)
+{
+    (void)state;
+    /* Read whole before it went: committed, and flagged. */
+    unit_backup_result_t res;
+    assert_int_equal(backup_killing("trees", &res), OK);
+    assert_true(res.units[0].snapshot_id > 0);
+    assert_non_null(strstr(res.units[0].warning, "session could not be ended"));
+    assert_non_null(strstr(res.units[0].warning, "is whole"));
+    unit_backup_result_free(&res);
+    err_clear();
+    assert_int_equal(helper_up(), 0);
+    assert_true(wait_connected());
+
+    /* Gone before the parts are read: the fake's data plane needs no
+     * helper, so this one commits too; whichever way, flagged or failed,
+     * never a quiet success. */
+    long before = scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?");
+    status_t st = backup_killing("scan", &res);
+    if (st == OK) {
+        assert_true(res.units[0].snapshot_id > 0);
+        assert_non_null(strstr(res.units[0].warning, "session could not be ended"));
+    } else {
+        assert_int_equal(res.units[0].snapshot_id, 0);
+        assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), before);
+    }
+    unit_backup_result_free(&res);
+    err_clear();
+    assert_int_equal(helper_up(), 0);
 }
 
 /* The helper restarts under a running job: the job fails cleanly, the link
@@ -866,6 +982,7 @@ int main(void)
     if (hf_unroot() != 0) { perror("cannot leave root for the helper suites"); return 1; }
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_starts_before_helper, setup_late, teardown),
+        cmocka_unit_test_setup_teardown(test_job_reconnects_on_demand, setup_late_slow, teardown),
         cmocka_unit_test_setup_teardown(test_helper_restarts_mid_job, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_blob, setup, teardown),
         cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
@@ -882,6 +999,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_stuck_hold_warns, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_helper_killed_mid_read, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

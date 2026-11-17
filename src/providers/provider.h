@@ -275,6 +275,9 @@ typedef struct {
     unsigned removed;        /* artefacts deleted */
     unsigned left_foreign;   /* artefacts seen and left alone */
     unsigned failed;         /* releases or deletions that failed */
+    /* Holds whose release keeps failing, said in a line for the job's
+     * warning and alert; empty when none. A helper reports its own. */
+    char     stuck[400];
 } sp_sweep_report_t;
 
 /*

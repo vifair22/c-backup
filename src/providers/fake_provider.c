@@ -1577,7 +1577,11 @@ static status_t f_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
                 strcmp(h->kind, in->kind) != 0 || strcmp(h->detail, in->detail) != 0)
                 continue;
             found = 1;
-            if (hold_release(c, i, fail) != OK) { ok = 0; err_clear(); }
+            if (hold_release(c, i, fail) != OK) {
+                ok = 0;
+                if (!out->stuck[0]) snprintf(out->stuck, sizeof(out->stuck), "%.390s", err_msg());
+                err_clear();
+            }
             else out->released++;
         }
         /* Nothing held under that name: releasing it is a no-op that

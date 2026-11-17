@@ -69,6 +69,7 @@ typedef struct {
     sp_consistency_t achieved;
     uint64_t         bytes_read;     /* disk bytes read */
     uint64_t         files;
+    uint64_t         freeze_ms;      /* how long the unit was frozen; 0 when it was not */
     unsigned         n_warnings;
     char             warning[512];   /* the first */
 } unit_backup_one_t;
@@ -78,6 +79,9 @@ typedef struct {
     size_t             n;
     size_t             ok, failed;
     size_t             filtered;     /* left out by units.allow under --all */
+    /* The job's own warning, apart from any unit's: a hold the provider
+     * cannot release (the end-of-job sweep). Empty when none. */
+    char               warning[400];
     char               scope_note[256]; /* a pause scope the provider could not honour, or "" */
 } unit_backup_result_t;
 

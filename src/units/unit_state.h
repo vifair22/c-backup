@@ -34,7 +34,7 @@ typedef struct {
 } units_config_t;
 
 #define UNITS_WAIT_DEFAULT_S     3600u
-#define UNITS_FREEZE_DEFAULT_S   10u
+#define UNITS_FREEZE_DEFAULT_S   20u   /* 3x FS1's worst measured freeze, 6.6 s */
 #define UNITS_PAUSE_DEFAULT_S    30u
 #define UNITS_DELTA_PCT_DEFAULT  75u
 #define UNITS_AUDIT_DAYS_DEFAULT 30u
@@ -89,6 +89,7 @@ typedef struct {
     unsigned failed;       /* releases that failed; their rows stay */
     unsigned removed;      /* leftover artefacts deleted */
     unsigned left_foreign; /* artefacts seen and left alone */
+    char     stuck[400];   /* the first provider's report of holds it cannot release */
 } units_sweep_result_t;
 
 /*

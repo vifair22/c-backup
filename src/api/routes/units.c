@@ -876,6 +876,7 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
             cJSON_AddStringToObject(x, "consistency", sp_consistency_name(u->achieved));
             cJSON_AddNumberToObject(x, "bytes_read", (double)u->bytes_read);
             cJSON_AddNumberToObject(x, "files", (double)u->files);
+            if (u->freeze_ms) cJSON_AddNumberToObject(x, "freeze_ms", (double)u->freeze_ms);
         } else {
             cJSON_AddStringToObject(x, "error", u->error);
         }
@@ -898,7 +899,9 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
              "by units.allow", j->provider, res.ok, res.failed, res.filtered);
     job_set_summary(progress_ctx, summary);
     if (!warn[0] && res.scope_note[0]) snprintf(warn, sizeof(warn), "%s", res.scope_note);
-    if (warn[0]) job_set_warning(progress_ctx, warn);
+    /* A hold that cannot be released outranks a unit's own warning. */
+    if (res.warning[0]) job_set_warning(progress_ctx, res.warning);
+    else if (warn[0]) job_set_warning(progress_ctx, warn);
     unit_backup_result_free(&res);
     store_index_free(idx);
     store_close(store);
