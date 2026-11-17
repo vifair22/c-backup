@@ -1747,7 +1747,7 @@ static char *swap_undo(helper_server_t *s, const helper_req_t *r, const staging_
     char why[700];
     helper_err_t code = HELPER_E_FAILED;
     int bfd = -1, jfd = -1, pfd = -1;
-    char parent[PATH_MAX], name[PATH_MAX], oldname[PATH_MAX], back[HELPER_PATH_MAX + 8];
+    char parent[HELPER_PATH_MAX + 1], name[HELPER_PATH_MAX + 1], oldname[HELPER_PATH_MAX + 1], back[HELPER_PATH_MAX + 8];
     snprintf(back, sizeof(back), st->file == 2 ? "%.4000s/image" : "%.4000s", st->path);
     if (st->had < 0) {
         snprintf(why, sizeof(why), "the previous copy stayed at %.300s at the swap; move it back by hand", st->old);
@@ -1850,7 +1850,7 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
      * the image inside it. Both through the fds pinned at stage. */
     int src_fd = st.file == 2 ? st.job_fd : st.base_fd;
     const char *src_name = st.file == 2 ? "image" : st.job_name;
-    char parent[PATH_MAX], name[PATH_MAX], old[PATH_MAX + 40], prev[PATH_MAX + 40] = "";
+    char parent[HELPER_PATH_MAX + 1], name[HELPER_PATH_MAX + 1], old[HELPER_PATH_MAX + 40], prev[HELPER_PATH_MAX + 72] = "";
     int pfd = -1, had = 0, old_aside = 1;
     struct stat sb;
     char sdir[HELPER_PATH_MAX + 1];
@@ -1941,7 +1941,7 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
             s->stages[i].swapped = 1;
             s->stages[i].busy = 0;
             s->stages[i].had = had ? (old_aside ? 1 : -1) : 0;
-            snprintf(s->stages[i].old, sizeof(s->stages[i].old), "%s", prev);
+            snprintf(s->stages[i].old, sizeof(s->stages[i].old), "%.*s", (int)sizeof(s->stages[i].old) - 1, prev);
         }
     pthread_mutex_unlock(&s->mu);
     staging_tidy(s, sdir, st.file);
