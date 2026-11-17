@@ -88,6 +88,13 @@ static status_t find_entry(store_t *store, const uint8_t dir[OBJECT_HASH_SIZE],
         int done = 0;
         st = manifest_iter_next(it, &e, &done);
         if (st != OK || done) break;
+        /* Unreachable: manifest_iter_next sets e on every OK return that is
+         * not the end. But that proof runs through set_error's return, a
+         * variadic function GCC never inlines, so under LTO it sees an "OK"
+         * with e still NULL and reports the read below as an overread of
+         * address zero. Checking here makes it provable, and an error
+         * rather than "not found", which would unclassify the snapshot. */
+        if (!e) { st = set_error(ERR_CORRUPT, "unit index: the tree iterator returned no entry"); break; }
         if (e->name_len == nl && memcmp(e->name, name, nl) == 0) {
             *type = e->type;
             memcpy(out, e->target_hash, OBJECT_HASH_SIZE);
