@@ -696,6 +696,12 @@ The counts are the run's (table below), and `failed` is true exactly when
 `unsettled_files` is how many file entries the run found flagged as
 possibly torn (below); a notice, never a failure.
 
+`pack_structures_recoverable` and `pack_structures_repaired` count packs
+whose own header, tail copies or CRC table disagreed with their redundancy
+(within parity, so not loss): found by every level, each a `pack-NNNNNNNNNN`
+finding with status `recoverable`, or `repaired` when a repairing run
+rewrote them.
+
 `packs_unwalkable` counts packs whose entry headers cannot be walked even
 with parity (the packs gc leaves as they are); each is a finding named
 `pack-NNNNNNNNNN` with status `unwalkable pack`, at every level, and fails
@@ -982,7 +988,7 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `packs_unwalkable`, `unwalkable` (first 16, `{"pack","reason"}`), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` or `packs_unwalkable` is non-zero |
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `dups_dropped`, `dups_kept` and `index_relocated` (OWN-22 duplicate copies dropped behind a confirmed indexed copy, kept because the indexed copy could not be confirmed, and index rows moved off such a copy onto a proven one), `packs_unwalkable`, `unwalkable` (first 16, `{"pack","reason"}`), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` or `packs_unwalkable` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
 | reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten) |
 

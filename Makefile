@@ -196,8 +196,20 @@ endif
 # ---- Phony targets ----------------------------------------------------
 .PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse bench-nbd analyze lint check-conflict-markers
 
+# In the top-level make, which is the release build unless told otherwise,
+# `all` is built here rather than by a sub-make (BUILD-1). The test binaries
+# link build/release objects through this make's own pattern rule, so a
+# recursive `all` gave two make processes a rule for the same objects:
+# `make -j test` on a dirty tree compiled one twice at once, and an LTO link
+# reading it while it was rewritten failed with "lto1: internal compiler
+# error: resolution sub id ... not in object file". One make, one rule per
+# object, and the jobserver orders the rest.
+ifeq ($(BUILD_TYPE),release)
+all: _build
+else
 all:
 	$(MAKE) BUILD_TYPE=release _build
+endif
 
 static:
 	$(MAKE) BUILD_TYPE=static _build
@@ -284,7 +296,7 @@ FAULT_BINS  := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(FAULT_SRCS))
 FAULT_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
               -Wl,--wrap=fread,--wrap=fwrite,--wrap=fseeko,--wrap=fsync,--wrap=fdatasync \
               -Wl,--wrap=sync_file_range,--wrap=mkstemp,--wrap=rename,--wrap=read,--wrap=pread \
-              -Wl,--wrap=pwrite,--wrap=syscall
+              -Wl,--wrap=pwrite,--wrap=unlink,--wrap=syscall
 
 # Ensure release objects exist before linking tests
 $(TEST_DIR_STAMP): FORCE
@@ -345,6 +357,14 @@ test-api: all $(FREE_PORT)
 # The CLI holds no repository logic, so what is worth testing is that each
 # command reaches the right endpoint and that a missing daemon produces a
 # clear message rather than a crash or a hang.
+# B134 at UAT's sizes: one 300 MB, 600 MB and 2 GiB file each into a fresh
+# repository at the production pack seal. About 2.5 GiB of scratch, so it is
+# a nightly target, not part of make test (which runs the same rollover
+# logic at an 8 MiB seal in test_pack_rollover).
+.PHONY: test-rollover-full
+test-rollover-full: $(BINS)/test_pack_rollover
+	@ROLLOVER_FULL=1 $(SCRATCH_GUARD) test_pack_rollover_full $(BINS)/test_pack_rollover
+
 .PHONY: test-cli
 test-cli: all $(FREE_PORT)
 	@$(SCRATCH_GUARD) test_cli_e2e.sh ./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
@@ -408,10 +428,18 @@ $(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) $(TEST_DIR_S
 	$(CC) $(ASAN_TEST_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ -static-libasan \
 	    $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -pthread -lm -lcmocka
 
-test-asan: asan $(ASAN_TEST_BINS)
+# In sequence, not as two prerequisites: the asan objects are built by the
+# `asan` sub-make and this make has no rule for them, so in parallel a suite
+# linked them while that sub-make was still writing them, or found none on a
+# clean tree (BUILD-1).
+test-asan:
+	$(MAKE) asan
+	$(MAKE) asan-test-bins
 	@for t in $(ASAN_TEST_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
 
-.PHONY: test-asan
+asan-test-bins: $(ASAN_TEST_BINS)
+
+.PHONY: test-asan asan-test-bins
 
 # ---- Fuzzing ----------------------------------------------------------
 #

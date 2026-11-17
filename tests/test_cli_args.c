@@ -19,6 +19,7 @@
 #include <cmocka.h>
 
 #include "args.h"
+#include "calendar_check.h"
 
 static const char *const POS_ADD[] = { "<path>", "[label]", NULL };
 static const char *const POS_VAR[] = { "<repo-id>", "[path...]", NULL };
@@ -316,6 +317,118 @@ static void test_usage_line(void **state)
     free(buf);
 }
 
+/* NIT-26: an ARG_CHOICE value outside its meta's words is refused before
+ * any request, naming the words; one inside reads like any value. */
+static const arg_opt_t CHOICE_OPTS[] = {
+    { "--level", NULL, ARG_CHOICE, "index|structure|deep" },
+    { "--scope", NULL, ARG_CHOICE, "staged" },
+    { "--label", NULL, ARG_VALUE, "TEXT" },
+    { NULL, NULL, ARG_FLAG, NULL },
+};
+static const arg_spec_t CHOICE = { "verify", POS_VAR, CHOICE_OPTS, NULL };
+
+static void test_choice(void **state)
+{
+    (void)state;
+    const char *const ok[] = { "index", "structure", "deep" };
+    for (int i = 0; i < 3; i++) {
+        run_t *r = run(&CHOICE, "1", "--level", ok[i], NULL);
+        assert_int_equal(r->rc, 0);
+        assert_string_equal(args_value(&r->a, "--level"), ok[i]);
+        done(r);
+    }
+    run_t *r = run(&CHOICE, "1", "--level=deep", "--scope", "staged", NULL);
+    assert_int_equal(r->rc, 0);
+    assert_string_equal(args_value(&r->a, "--scope"), "staged");
+    done(r);
+
+    /* Exact words only: no prefix, no case folding, no near miss, and a
+     * word that only contains a choice is not one. */
+    const char *const bad[] = { "bogus", "Deep", "dee", "deeper", "index|deep", "|", "x" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        r = run(&CHOICE, "1", "--level", bad[i], NULL);
+        char want[96];
+        snprintf(want, sizeof(want),
+                 "option '--level' takes index, structure or deep, not '%s'", bad[i]);
+        refused(r, want, "usage: c-backup verify <repo-id> [path...] "
+                         "[--level index|structure|deep]");
+        done(r);
+    }
+    r = run(&CHOICE, "1", "--scope=packed", NULL);
+    refused(r, "option '--scope' takes staged, not 'packed'", "usage: c-backup verify");
+    done(r);
+    /* The value rules still come first. */
+    r = run(&CHOICE, "1", "--level", NULL);
+    refused(r, "option '--level' needs a value", "usage: c-backup verify");
+    done(r);
+    r = run(&CHOICE, "1", "--level=", NULL);
+    refused(r, "needs a value, not an empty one", "usage: c-backup verify");
+    done(r);
+    r = run(&CHOICE, "1", "--level", "index", "--level", "deep", NULL);
+    refused(r, "option '--level' given more than once", "usage: c-backup verify");
+    done(r);
+    /* An absent choice reads as not given. */
+    r = run(&CHOICE, "1", NULL);
+    assert_int_equal(r->rc, 0);
+    assert_null(args_value(&r->a, "--level"));
+    done(r);
+}
+
+static void cal_ok(const char *every, const char *at, const char *on,
+                   const char *day, const char *month)
+{
+    char msg[160] = "";
+    if (calendar_check(every, at, on, day, month, msg, sizeof(msg)) != 0)
+        fail_msg("refused (%s): %s", every ? every : "no --every", msg);
+}
+
+static void cal_bad(const char *every, const char *at, const char *on,
+                    const char *day, const char *month, const char *want)
+{
+    char msg[160] = "";
+    assert_int_equal(calendar_check(every, at, on, day, month, msg, sizeof(msg)), -1);
+    if (!strstr(msg, want)) fail_msg("'%s' not in: %s", want, msg);
+}
+
+/* NIT-26: what each period needs and what it would drop, the rules
+ * trigger_parse_at applies, checked before the request is built. */
+static void test_calendar_check(void **state)
+{
+    (void)state;
+    cal_ok(NULL, NULL, NULL, NULL, NULL);
+    cal_ok("day", "02:00", NULL, NULL, NULL);
+    cal_ok("day", "0:0", NULL, NULL, NULL);
+    cal_ok("day", "23:59", NULL, NULL, NULL);
+    cal_ok("week", "03:00", "sunday", NULL, NULL);
+    cal_ok("week", "03:00", "MONDAY", NULL, NULL);
+    cal_ok("month", "05:00", NULL, "1", NULL);
+    cal_ok("year", "05:00", NULL, "29", "2");
+
+    cal_bad(NULL, "01:00", NULL, NULL, NULL, "they need --every");
+    cal_bad(NULL, NULL, "monday", NULL, NULL, "they need --every");
+    cal_bad(NULL, NULL, NULL, "1", NULL, "they need --every");
+    cal_bad(NULL, NULL, NULL, NULL, "1", "they need --every");
+    cal_bad("day", NULL, NULL, NULL, NULL, "--every day needs --at HH:MM");
+    cal_bad("year", NULL, NULL, "1", "1", "--every year needs --at HH:MM");
+    cal_bad("day", "24:00", NULL, NULL, NULL, "--at takes a 24-hour HH:MM, not '24:00'");
+    cal_bad("day", "12:60", NULL, NULL, NULL, "not '12:60'");
+    cal_bad("day", "-1:00", NULL, NULL, NULL, "not '-1:00'");
+    cal_bad("day", "noon", NULL, NULL, NULL, "not 'noon'");
+    cal_bad("day", "12", NULL, NULL, NULL, "not '12'");
+    cal_bad("week", "03:00", NULL, NULL, NULL, "--every week needs --on WEEKDAY");
+    cal_bad("week", "03:00", "funday", NULL, NULL, "--on takes a weekday name");
+    cal_bad("week", "03:00", "sun", NULL, NULL, "not 'sun'");
+    cal_bad("day", "03:00", "monday", NULL, NULL, "only --every week uses");
+    cal_bad("month", "03:00", "monday", "1", NULL, "only --every week uses");
+    cal_bad("month", "03:00", NULL, NULL, NULL, "--every month needs --on-day N");
+    cal_bad("year", "03:00", NULL, NULL, "2", "--every year needs --on-day N");
+    cal_bad("day", "03:00", NULL, "1", NULL, "--on-day is for --every month or year, not day");
+    cal_bad("week", "03:00", "monday", "1", NULL, "not week");
+    cal_bad("year", "03:00", NULL, "1", NULL, "--every year needs --on-month N");
+    cal_bad("month", "03:00", NULL, "1", "2", "--on-month is for --every year, not month");
+    cal_bad("day", "03:00", NULL, NULL, "2", "--on-month is for --every year, not day");
+}
+
 static void test_pos_bounds(void **state)
 {
     (void)state;
@@ -348,6 +461,8 @@ int main(void)
         cmocka_unit_test(test_multi_cap),
         cmocka_unit_test(test_usage_line),
         cmocka_unit_test(test_pos_bounds),
+        cmocka_unit_test(test_choice),
+        cmocka_unit_test(test_calendar_check),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

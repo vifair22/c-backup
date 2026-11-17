@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <string.h>
 
 /*
  * Static rather than per-handle because the thing being guarded is not the
@@ -30,6 +31,9 @@ static uint64_t        g_now_serving;
 /* Threads inside write_lock that have not been served yet. Written under
  * g_ticket_mu, read without it by db_txn_waiters. */
 static atomic_uint     g_waiting;
+
+/* Completed make_durable calls, for tests. */
+static atomic_ulong    g_durable;
 
 /*
  * Whether this thread holds the lock. A second begin on the holding thread
@@ -108,4 +112,50 @@ void db_txn_rollback(cutils_db_t *db)
 unsigned db_txn_waiters(void)
 {
     return atomic_load_explicit(&g_waiting, memory_order_relaxed);
+}
+
+void db_txn_batch_opened(db_txn_batch_t *b)
+{
+    b->opened_ns = phase_now();
+}
+
+int db_txn_batch_should_end(db_txn_batch_t *b)
+{
+    uint64_t now = phase_now();
+    if (db_txn_waiters() > 0) {
+        int was = b->contended_until_ns > now;
+        b->contended_until_ns = now + (uint64_t)DB_TXN_BATCH_CONTENDED_MS * 1000000ULL;
+        if (!was) return 1;
+    }
+    return b->contended_until_ns > now &&
+           now - b->opened_ns >= (uint64_t)DB_TXN_BATCH_HOLD_MS * 1000000ULL;
+}
+
+status_t db_txn_make_durable(cutils_db_t *db)
+{
+    if (!db) return set_error(ERR_INVALID, "db_txn_make_durable: null handle");
+    if (tls_held)
+        return set_error(ERR_BUSY, "db_txn_make_durable: this thread holds the write "
+                                   "lock (a checkpoint cannot run inside a transaction)");
+    uint64_t t0 = phase_now();
+    write_lock();
+    db_result_t *r = NULL;
+    int rc = db_execute(db, "PRAGMA wal_checkpoint(FULL)", NULL, &r);
+    /* busy, log frames, checkpointed frames: busy 0 is a complete
+     * checkpoint, log -1 a database that is not in WAL mode, where every
+     * commit was synced as it was made. */
+    int ok = rc == 0 && r && r->nrows == 1 && r->ncols >= 1 &&
+             strcmp(r->rows[0][0], "0") == 0;
+    db_result_free(r);
+    phase_add_commit(phase_current, t0);
+    write_unlock();
+    if (!ok) return set_error(ERR_IO, "state.db: cannot make the index durable "
+                                      "(checkpoint did not complete)");
+    atomic_fetch_add_explicit(&g_durable, 1, memory_order_relaxed);
+    return OK;
+}
+
+unsigned long db_txn_durable_count(void)
+{
+    return atomic_load_explicit(&g_durable, memory_order_relaxed);
 }
