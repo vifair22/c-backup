@@ -40,11 +40,15 @@ typedef struct {
     uint64_t checked;
     uint64_t ok;
     /* Damaged on disk, corrected from parity, and the correction written
-     * back. Only a repairing run can count anything here. */
+     * back; or beyond parity and the index moved to a proven duplicate
+     * (NIT-31). Only a repairing run can count anything here. Includes
+     * pack_structures_repaired and packs_restored (NIT-30). */
     uint64_t repaired;
     /* Damaged on disk and readable only through parity, with the disk copy
-     * still wrong: repair was off, or the write-back failed. Not loss yet,
-     * but one more bad byte away from it. */
+     * still wrong: repair was off, or the write-back failed; or beyond
+     * parity with a proven duplicate the index does not name yet. Not loss
+     * yet, but one more bad byte away from it. Includes
+     * pack_structures_recoverable. */
     uint64_t recoverable;
     /* Damaged beyond what parity can reconstruct. These are data loss. */
     uint64_t unrecoverable;
@@ -61,7 +65,8 @@ typedef struct {
     uint64_t packs_unwalkable;
     /* Packs whose own header, tail copies or CRC table disagreed with their
      * redundancy (B136): rewritten by a repairing run, otherwise counted as
-     * recoverable. Not loss. */
+     * recoverable. Not loss. Each is also one item in checked and in
+     * repaired or recoverable, which is what the run record keeps. */
     uint64_t pack_structures_repaired;
     uint64_t pack_structures_recoverable;
     /* Packs a repairing run made walkable again by rebuilding headers. */

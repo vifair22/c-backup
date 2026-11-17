@@ -1100,6 +1100,10 @@ static void test_unwalkable_pack_is_reported_until_repaired(void **state)
     assert_int_equal(vr.packs_unwalkable, 0);
     assert_int_equal(vr.unrecoverable, 0);
     assert_int_equal(verify_finding_count(pname, "repaired"), 1);
+    /* The restored pack is a repaired item in the totals (NIT-30). */
+    assert_true(vr.repaired >= 1);
+    assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                 vr.unrecoverable + vr.missing);
 
     memset(&vr, 0, sizeof(vr));
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr),
@@ -1633,6 +1637,21 @@ static void xor_bytes(const char *path, off_t off, size_t n)
     store_dat_cache_flush(store);
 }
 
+/* A column of a run's record, as GET /repos/<id>/verify and the CLI read it. */
+static uint64_t run_count(int64_t run_id, const char *col)
+{
+    char sql[128], run[32];
+    snprintf(sql, sizeof(sql), "SELECT %s FROM verify_runs WHERE id = ?", col);
+    snprintf(run, sizeof(run), "%lld", (long long)run_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, sql, (const char *[]){ run, NULL }, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    uint64_t v = strtoull(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return v;
+}
+
 /* Where the CRC table starts, from the pack's last tail. */
 static uint64_t crc_table_off(const uint8_t *f, size_t len)
 {
@@ -1685,6 +1704,14 @@ static void test_pack_structure_damage_is_reported_and_repaired(void **state)
             assert_int_equal(vr.pack_structures_recoverable, 1);
             assert_int_equal(vr.pack_structures_repaired, 0);
             assert_int_equal(vr.packs_unwalkable, 0);
+            /* The totals the run record, the CLI and the metrics show carry
+             * it, and still add up (NIT-30). */
+            assert_int_equal(vr.recoverable, 1);
+            assert_int_equal(vr.repaired, 0);
+            assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                         vr.unrecoverable + vr.missing);
+            assert_int_equal(run_count(vr.run_id, "recoverable"), 1);
+            assert_int_equal(run_count(vr.run_id, "repaired"), 0);
             char st[64];
             finding_status_of(pname, st, sizeof(st));
             assert_string_equal(st, "recoverable");
@@ -1694,6 +1721,11 @@ static void test_pack_structure_damage_is_reported_and_repaired(void **state)
         assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 1, NULL, NULL, NULL,
                                     &vr), OK);
         assert_int_equal(vr.pack_structures_repaired, 1);
+        assert_int_equal(vr.repaired, 1);
+        assert_int_equal(vr.recoverable, 0);
+        assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                     vr.unrecoverable + vr.missing);
+        assert_int_equal(run_count(vr.run_id, "repaired"), 1);
         assert_file_is(e.path, orig, olen);
         memset(&vr, 0, sizeof(vr));
         assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0, NULL, NULL, NULL,

@@ -686,6 +686,16 @@ typedef struct {
 
 typedef void (*pack_dat_entry_cb)(const pack_entry_info_t *info, void *ctx);
 
+/*
+ * Is the entry e of pack pnum provably its object: header after parity, the
+ * name in it, the payload against its CRC after parity, and the payload
+ * decoded and checked against the name - the proof gc requires before it
+ * moves an index row onto a copy (OWN-22), for a caller that found the copy
+ * by enumeration (verify, NIT-31). 1 or 0; an encrypted copy with no key
+ * loaded cannot be proven.
+ */
+int pack_entry_proven(store_t *store, uint32_t pnum, const pack_entry_info_t *e);
+
 status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                              uint32_t *out_version, uint32_t *out_count,
                              pack_dat_entry_cb cb, void *ctx);
