@@ -14,6 +14,7 @@
 #include "repo_tags.h"
 #include "snap_record.h"
 #include "snapshot_ids.h"
+#include "db_write.h"
 #include "pack_ids.h"
 #include "repo.h"
 
@@ -101,7 +102,7 @@ static status_t note_object(reindex_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_S
     snprintf(repo, sizeof(repo), "%lld", (long long)ctx->repo_id);
     snprintf(t, sizeof(t), "%u", type);
 
-    if (db_execute_non_query(ctx->db,
+    if (db_write(ctx->db,
             "INSERT INTO objects (repo_id, hash, refcount, location, type)"
             " VALUES (?, ?, 0, 'absent', ?)"
             " ON CONFLICT(repo_id, hash) DO NOTHING",
@@ -229,7 +230,7 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
          * rows (OWN-45-LIVE). */
         snprintf(nflags, sizeof(nflags), "%u", (unsigned)e->flags);
 
-        int rc = db_execute_non_query(ctx->db,
+        int rc = db_write(ctx->db,
             "INSERT OR REPLACE INTO nodes"
             " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
             "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
@@ -251,7 +252,7 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
             break;
         }
 
-        if (db_execute_non_query(ctx->db,
+        if (db_write(ctx->db,
                 "INSERT INTO node_fts (name, node_id, snap_id, repo_id)"
                 " VALUES (?, ?, ?, ?)",
                 (const char *[]){ e->name, id, snap, repo, NULL }, NULL) != 0) {
@@ -411,11 +412,11 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
 
     /* Replacing, not merging: a half-reindexed snapshot mixed with stale rows
      * would be worse than either state on its own. */
-    int failed = db_execute_non_query(db,
+    int failed = db_write(db,
         "DELETE FROM nodes WHERE repo_id = ? AND snap_id = ?",
         (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
 
@@ -446,7 +447,7 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
          * a reindex quietly stripped every snapshot of the tiers the last
          * retention pass gave it. Everything the walk derives is
          * overwritten; what it cannot derive is kept. */
-        if (db_execute_non_query(db,
+        if (db_write(db,
                 "INSERT INTO snapshots (repo_id, id, ts, label,"
                 " file_count, total_size, completed_at, root_tree_hash,"
                 " nodes_materialized)"
@@ -459,7 +460,7 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
                 "  root_tree_hash = excluded.root_tree_hash,"
                 "  nodes_materialized = 1",
                 (const char *[]){ repo, snap, tsbuf, label ? label : "",
-                                  files, bytes, tsbuf, rhex, NULL }, NULL) != 0)
+                      files, bytes, tsbuf, rhex, NULL }, NULL) != 0)
             failed = 1;
     }
     /* Which unit it is, if any, from its own .cbackup-unit/unit.json: the
@@ -583,7 +584,7 @@ static void pack_num_seen(uint32_t pack_num, void *vctx)
 
     char pid[32];
     snprintf(pid, sizeof(pid), "%u", pack_num);
-    if (db_execute_non_query(c->db,
+    if (db_write(c->db,
             "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
             (const char *[]){ c->repo, pid, NULL }, NULL) != 0) {
         free(ec.rows);
@@ -599,7 +600,7 @@ static void pack_num_seen(uint32_t pack_num, void *vctx)
         snprintf(comp, sizeof(comp), "%llu", (unsigned long long)r->comp);
         snprintf(orig, sizeof(orig), "%llu", (unsigned long long)r->orig);
         snprintf(eidx, sizeof(eidx), "%u",   r->eidx);
-        if (db_execute_non_query(c->db,
+        if (db_write(c->db,
                 "INSERT OR REPLACE INTO pack_objects"
                 " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -623,12 +624,12 @@ static void pack_num_seen(uint32_t pack_num, void *vctx)
     char szbuf[32], ver[16];
     snprintf(szbuf, sizeof(szbuf), "%llu", (unsigned long long)size);
     snprintf(ver,   sizeof(ver),   "%u", version);
-    if (db_execute_non_query(c->db,
+    if (db_write(c->db,
             "INSERT OR REPLACE INTO packs (repo_id, id, filename, size,"
             " sealed_at, version) VALUES (?, ?, ?, ?, strftime('%s','now'), ?)",
             (const char *[]){ c->repo, pid, name, szbuf, ver, NULL }, NULL) != 0 ||
         /* On disk and indexed: whatever dropped it, it is back. */
-        db_execute_non_query(c->db,
+        db_write(c->db,
             "DELETE FROM pack_tombstones WHERE repo_id = ? AND id = ?",
             (const char *[]){ c->repo, pid, NULL }, NULL) != 0) {
         c->failed = 1;
@@ -656,15 +657,15 @@ static int drop_vanished_packs(pack_scan_ctx_t *c)
             present = (c->seen[k] == id);
         if (present) continue;
         const char *pid = r->rows[i][0];
-        if (db_execute_non_query(c->db,
+        if (db_write(c->db,
                 "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
                 (const char *[]){ c->repo, pid, NULL }, NULL) != 0 ||
             /* Its number stays known (B156), as pack_presence keeps it. */
-            db_execute_non_query(c->db,
+            db_write(c->db,
                 "INSERT OR IGNORE INTO pack_tombstones (repo_id, id, dropped_at)"
                 " VALUES (?, ?, strftime('%s','now'))",
                 (const char *[]){ c->repo, pid, NULL }, NULL) != 0 ||
-            db_execute_non_query(c->db,
+            db_write(c->db,
                 "DELETE FROM packs WHERE repo_id = ? AND id = ?",
                 (const char *[]){ c->repo, pid, NULL }, NULL) != 0)
             rc = -1;
@@ -728,7 +729,7 @@ static status_t rebuild_pack_index(store_t *store, cutils_db_t *db, int64_t repo
      * the files.
      */
     if (st == OK && !c.failed &&
-        db_execute_non_query(db,
+        db_write(db,
             "UPDATE objects SET location ="
             " (SELECT CAST(po.pack_id AS TEXT) FROM pack_objects po"
             "   WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)"
@@ -778,7 +779,7 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
     if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "reindex: cannot begin object sizing");
 
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "UPDATE objects SET"
             "   phys_size = (SELECT po.comp_size FROM pack_objects po"
             "                 WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash),"
@@ -839,7 +840,7 @@ static status_t note_inner(cutils_db_t *db, const char *repo,
     hash_hex(hash, hex);
     snprintf(t, sizeof(t), "%u", type);
     *out_refs = 0;
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO objects (repo_id, hash, refcount, location, type)"
             " VALUES (?, ?, 0, 'loose', ?)"
             " ON CONFLICT(repo_id, hash) DO UPDATE SET type = excluded.type",
@@ -847,7 +848,7 @@ static status_t note_inner(cutils_db_t *db, const char *repo,
         return set_error(ERR_IO, "reindex: cannot record object");
     if (!count) return OK;
     db_result_t *r = NULL;
-    if (db_execute(db,
+    if (db_write_returning(db,
             "UPDATE objects SET refcount = refcount + 1"
             " WHERE repo_id = ? AND hash = ? RETURNING refcount",
             (const char *[]){ repo, hex, NULL }, &r) != 0) {
@@ -965,9 +966,9 @@ static status_t recompute_refcounts(cutils_db_t *db, int64_t repo_id)
     if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "reindex: cannot begin refcount pass");
     int failed =
-        db_execute_non_query(db, "UPDATE objects SET refcount = 0 WHERE repo_id = ?",
-                             (const char *[]){ repo, NULL }, NULL) != 0 ||
-        db_execute_non_query(db,
+        db_write(db, "UPDATE objects SET refcount = 0 WHERE repo_id = ?",
+                 (const char *[]){ repo, NULL }, NULL) != 0 ||
+        db_write(db,
             "WITH refs(hash) AS ("
             "  SELECT root_tree_hash FROM snapshots"
             "   WHERE repo_id = ?1 AND root_tree_hash IS NOT NULL"
@@ -1028,7 +1029,7 @@ static status_t restore_snapshot_mark(store_t *store, cutils_db_t *db, int64_t r
 
     char m[32];
     snprintf(m, sizeof(m), "%lld", (long long)mark);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO snapshot_id_seq (repo_id, last_id) VALUES (?, ?)"
             " ON CONFLICT(repo_id) DO UPDATE SET last_id = MAX(last_id, excluded.last_id)",
             (const char *[]){ repo, m, NULL }, NULL) != 0)

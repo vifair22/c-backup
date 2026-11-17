@@ -6,6 +6,7 @@
 #include "pack.h"
 #include "repo.h"
 #include "routes.h"   /* journal_record */
+#include "db_write.h"
 #include "store.h"
 
 #include <cutils/log.h>
@@ -67,7 +68,7 @@ int pack_presence_degraded(cutils_db_t *db, int64_t repo_id, char *why, size_t w
 
 static status_t set_degraded(cutils_db_t *db, const char *repo, const char *why)
 {
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT OR REPLACE INTO recovery_state (repo_id, key, value) VALUES (?, ?, ?)",
             (const char *[]){ repo, DEGRADED_KEY, why, NULL }, NULL) != 0)
         return set_error(ERR_IO, "cannot record repository %s as degraded", repo);
@@ -76,8 +77,8 @@ static status_t set_degraded(cutils_db_t *db, const char *repo, const char *why)
 
 static status_t clear_degraded(cutils_db_t *db, const char *repo)
 {
-    if (db_execute_non_query(db, "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
-                             (const char *[]){ repo, DEGRADED_KEY, NULL }, NULL) != 0)
+    if (db_write(db, "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
+                 (const char *[]){ repo, DEGRADED_KEY, NULL }, NULL) != 0)
         return set_error(ERR_IO, "cannot clear the degraded state of repository %s", repo);
     return OK;
 }
@@ -106,7 +107,7 @@ static status_t drop_pack(cutils_db_t *db, const char *repo, const char *pack,
     char absent_s[32] = "0";
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "pack presence: begin");
     int bad =
-        db_execute_non_query(db,
+        db_write(db,
             "UPDATE objects SET location = 'absent', phys_size = NULL"
             " WHERE repo_id = ? AND hash IN"
             " (SELECT hash FROM pack_objects WHERE repo_id = ? AND pack_id = ?)",
@@ -119,7 +120,7 @@ static status_t drop_pack(cutils_db_t *db, const char *repo, const char *pack,
         if (at < want) continue;
         if (at > want) break;
         int k = 0;
-        bad = db_execute_non_query(db,
+        bad = db_write(db,
                   "UPDATE objects SET location ="
                   " (SELECT CAST(po.pack_id AS TEXT) FROM pack_objects po"
                   "   WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)"
@@ -127,7 +128,7 @@ static status_t drop_pack(cutils_db_t *db, const char *repo, const char *pack,
                   " (SELECT 1 FROM pack_objects po WHERE po.repo_id = objects.repo_id"
                   "   AND po.hash = objects.hash)",
                   (const char *[]){ repo, hash, pack, NULL }, NULL) != 0 ||
-              db_execute_non_query(db,
+              db_write(db,
                   "UPDATE objects SET location = 'absent', phys_size = NULL"
                   " WHERE repo_id = ? AND hash = ? AND location = ?",
                   (const char *[]){ repo, hash, pack, NULL }, &k) != 0;
@@ -135,20 +136,20 @@ static status_t drop_pack(cutils_db_t *db, const char *repo, const char *pack,
     }
     bad = bad ||
         snprintf(absent_s, sizeof(absent_s), "%d", (n > 0 ? n : 0) + (m > 0 ? m : 0)) < 0 ||
-        db_execute_non_query(db, "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
+        db_write(db, "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
             (const char *[]){ repo, pack, NULL }, NULL) != 0 ||
-        db_execute_non_query(db, "DELETE FROM packs WHERE repo_id = ? AND id = ?",
+        db_write(db, "DELETE FROM packs WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, pack, NULL }, NULL) != 0 ||
         /* The number stays known (B156): a floor under the next pack
          * number even if <repo>/pack-ids is lost, and how the pack is
          * recognised if it comes back. */
-        db_execute_non_query(db,
+        db_write(db,
             "INSERT OR REPLACE INTO pack_tombstones (repo_id, id, dropped_at, objects)"
             " VALUES (?, ?, strftime('%s','now'), ?)",
             (const char *[]){ repo, pack, absent_s, NULL }, NULL) != 0 ||
         /* The file cache would match paths whose content was in it and skip
          * reading them, chunks and all; the next backup reads everything. */
-        db_execute_non_query(db, "DELETE FROM file_cache WHERE repo_id = ?",
+        db_write(db, "DELETE FROM file_cache WHERE repo_id = ?",
             (const char *[]){ repo, NULL }, NULL) != 0;
     if (bad) {
         db_txn_rollback(db);
@@ -205,7 +206,7 @@ static int get_state(cutils_db_t *db, const char *repo, const char *key, char *o
 
 static status_t put_state(cutils_db_t *db, const char *repo, const char *key, const char *v)
 {
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT OR REPLACE INTO recovery_state (repo_id, key, value) VALUES (?, ?, ?)",
             (const char *[]){ repo, key, v, NULL }, NULL) != 0)
         return set_error(ERR_IO, "cannot record %s of repository %s", key, repo);
@@ -508,14 +509,14 @@ static status_t adopt_pack(cutils_db_t *db, int64_t repo_id, const char *repo,
             snprintf(orig, sizeof(orig), "%llu", (unsigned long long)e->uncompressed_size);
             snprintf(eidx, sizeof(eidx), "%u", e->entry_index);
             int n = 0;
-            if (db_execute_non_query(db,
+            if (db_write(db,
                     "INSERT OR REPLACE INTO pack_objects"
                     " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (const char *[]){ repo, hex, pid, off, comp, orig, eidx, NULL }, NULL) != 0 ||
                 /* Absent objects are back; a row that named the copy that
                  * failed its proof follows the good one. */
-                db_execute_non_query(db,
+                db_write(db,
                     "UPDATE objects SET location = ?, phys_size = ?"
                     " WHERE repo_id = ? AND hash = ? AND (location = 'absent' OR ? = 1)",
                     (const char *[]){ pid, comp, repo, hex,
@@ -541,11 +542,11 @@ static status_t adopt_pack(cutils_db_t *db, int64_t repo_id, const char *repo,
     snprintf(szbuf, sizeof(szbuf), "%llu", (unsigned long long)size);
     snprintf(ver, sizeof(ver), "%u", version);
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "pack presence: begin");
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT OR REPLACE INTO packs (repo_id, id, filename, size, sealed_at, version)"
             " VALUES (?, ?, ?, ?, strftime('%s','now'), ?)",
             (const char *[]){ repo, pid, name, szbuf, ver, NULL }, NULL) != 0 ||
-        db_execute_non_query(db, "DELETE FROM pack_tombstones WHERE repo_id = ? AND id = ?",
+        db_write(db, "DELETE FROM pack_tombstones WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, pid, NULL }, NULL) != 0) {
         db_txn_rollback(db);
         return set_error(ERR_IO, "pack presence: cannot record %s as back", name);

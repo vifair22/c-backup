@@ -2,6 +2,7 @@
 
 #include "repo_purge.h"
 #include "db_txn.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -43,7 +44,7 @@ static status_t purge_table(cutils_db_t *db, const char *table, const char *repo
         if (stop && atomic_load_explicit(stop, memory_order_relaxed)) return ERR_BUSY;
         if (db_txn_begin(db) != OK) return set_error(ERR_IO, "purge %s: begin", table);
         int n = 0;
-        if (db_execute_non_query(db, sql, (const char *[]){ repo, NULL }, &n) != 0) {
+        if (db_write(db, sql, (const char *[]){ repo, NULL }, &n) != 0) {
             db_txn_rollback(db);
             return set_error(ERR_IO, "purge %s: delete failed", table);
         }
@@ -57,7 +58,7 @@ static status_t purge_table(cutils_db_t *db, const char *table, const char *repo
 static status_t purge_stmt(cutils_db_t *db, const char *sql, const char *repo)
 {
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "purge: begin");
-    if (db_execute_non_query(db, sql, (const char *[]){ repo, NULL }, NULL) != 0) {
+    if (db_write(db, sql, (const char *[]){ repo, NULL }, NULL) != 0) {
         db_txn_rollback(db);
         return set_error(ERR_IO, "purge: %s", sql);
     }

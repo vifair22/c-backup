@@ -31,6 +31,12 @@
  * only when somebody is queued behind it, so the commits a backup adds are
  * bounded by the number of foreign transactions, not by its own length.
  *
+ * A write made outside a transaction needs the lock just as much: on the
+ * shared connection a plain statement issued while another thread holds a
+ * transaction becomes part of it (B157). db_write.h has the forms every
+ * write outside one of these goes through, and the guard that reports one
+ * that does not.
+ *
  * These wrap the raw statements rather than sitting beside them so the lock
  * cannot drift out of step with the transaction across the many rollback
  * paths. No caller should issue BEGIN, COMMIT or ROLLBACK directly; a grep for
@@ -100,6 +106,15 @@ int  db_txn_batch_should_end(db_txn_batch_t *b);
 /* Whether writers have kept coming lately, so B107's rules apply: a holder
  * also lets go before long waits of its own (backup.c). */
 int  db_txn_batch_contended(const db_txn_batch_t *b);
+
+/*
+ * Give c-utils this lock (c-utils 1.8.0, db_set_write_lock), so its log
+ * writer, push queue and transaction scopes queue for it like every other
+ * writer instead of landing inside another thread's transaction. Call once,
+ * right after the handle is opened and before anything begins a
+ * transaction.
+ */
+status_t db_txn_install_cutils_lock(cutils_db_t *db);
 
 /*
  * Make every commit so far durable before returning (B142).
