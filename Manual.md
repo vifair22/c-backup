@@ -967,7 +967,8 @@ Metadata writes (tags, notes, policy, sources) during a running backup wait
 briefly for the database rather than failing. A backup holds the database's
 write lock across batches of up to 2,000 files, and lets it go as soon as
 another write is queued for it: at the next file, the next read of the file
-it is storing, or the next directory tree. A write that is waiting goes before the
+it is storing, the next directory tree, or the next row of the snapshot's
+node index, which it writes last. A write that is waiting goes before the
 backup's next batch, so it returns in well under a second however long the
 backup runs. A backup nobody interrupts commits once per 2,000 files and
 once per sealed pack, which matters on storage where each commit's sync is
