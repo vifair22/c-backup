@@ -25,6 +25,7 @@
 #include "snapshot_ids.h"
 #include "tree_build.h"
 #include "reserved.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -2099,7 +2100,7 @@ static status_t allocate_snapshot_id(cutils_db_t *db, store_t *store,
 
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)next);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO snapshot_id_seq (repo_id, last_id) VALUES (?, ?)"
             " ON CONFLICT(repo_id) DO UPDATE SET last_id = excluded.last_id",
             (const char *[]){ repo, id, NULL }, NULL) != 0) {
@@ -2295,7 +2296,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         snprintf(dmaj, sizeof(dmaj), "%u", is_dev ? e->node.device.major : 0u);
         snprintf(dmin, sizeof(dmin), "%u", is_dev ? e->node.device.minor : 0u);
 
-        int rc = db_execute_non_query(p->db,
+        int rc = db_write(p->db,
                 "INSERT INTO nodes"
                 " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
                 "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
@@ -2313,7 +2314,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                                    * exactly what an index consistency check
                                    * is looking for. */
                                   (is_dir || hash_is_zero(e->node.content_hash))
-                                      ? "" : chex,
+                          ? "" : chex,
                                   is_dir ? shex : "",
                                   ltarget, hgroup,
                                   hash_is_zero(e->node.xattr_hash) ? "" : xhex,
@@ -2324,7 +2325,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
             return set_error(ERR_IO, "index_nodes: insert failed");
         }
 
-        if (db_execute_non_query(p->db,
+        if (db_write(p->db,
                 "INSERT INTO node_fts (name, node_id, snap_id, repo_id)"
                 " VALUES (?, ?, ?, ?)",
                 (const char *[]){ name, id, snap, repo, NULL }, NULL) != 0) {
@@ -2762,7 +2763,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
             if (db_txn_begin(db) == OK) txn = 1;
             else st = set_error(ERR_IO, "backup_run: cannot begin the snapshot row");
         }
-        if (st == OK && db_execute_non_query(db,
+        if (st == OK && db_write(db,
                 "INSERT INTO snapshots (repo_id, id, ts, label, file_count,"
                 " total_size, completed_at, root_tree_hash, nodes_materialized)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",

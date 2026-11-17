@@ -32,6 +32,7 @@
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -160,9 +161,9 @@ static void close_row(int64_t id, const char *reason)
     char ids[32], now[32];
     snprintf(ids, sizeof(ids), "%lld", (long long)id);
     snprintf(now, sizeof(now), "%lld", (long long)time(NULL));
-    if (db_execute_non_query(g_db, "UPDATE exports SET closed_at = ?, close_reason = ?"
-                                   " WHERE id = ? AND closed_at IS NULL",
-                             (const char *[]){ now, reason, ids, NULL }, NULL) != 0)
+    if (db_write(g_db, "UPDATE exports SET closed_at = ?, close_reason = ?"
+                       " WHERE id = ? AND closed_at IS NULL",
+                 (const char *[]){ now, reason, ids, NULL }, NULL) != 0)
         log_warn("export %lld: cannot record its close", (long long)id);
 }
 
@@ -192,9 +193,9 @@ void routes_exports_init(cutils_db_t *db, const char *dir, unsigned ttl_s, unsig
     /* Nothing serves what a previous run left open. */
     char now[32];
     snprintf(now, sizeof(now), "%lld", (long long)time(NULL));
-    if (db_execute_non_query(db, "UPDATE exports SET closed_at = ?, close_reason = 'daemon restarted'"
-                                 " WHERE closed_at IS NULL",
-                             (const char *[]){ now, NULL }, NULL) != 0)
+    if (db_write(db, "UPDATE exports SET closed_at = ?, close_reason = 'daemon restarted'"
+                     " WHERE closed_at IS NULL",
+                 (const char *[]){ now, NULL }, NULL) != 0)
         log_warn("exports: cannot close the rows a previous run left open");
 }
 
@@ -306,9 +307,9 @@ static status_t insert_row(int64_t repo_id, int64_t snap_id, const char *item, u
     snprintf(exp, sizeof(exp), "%lld", (long long)expires);
     db_result_t *r = NULL;
     status_t st = OK;
-    if (db_execute(g_db, "INSERT INTO exports (repo_id, snap_id, item_id, socket, size, caller,"
-                         " created_at, expires_at) VALUES (?, ?, ?, '', ?, ?, ?, ?) RETURNING id",
-                   (const char *[]){ repo, snap, item, sz, caller, now, exp, NULL }, &r) != 0 ||
+    if (db_write_returning(g_db, "INSERT INTO exports (repo_id, snap_id, item_id, socket, size, caller,"
+                                 " created_at, expires_at) VALUES (?, ?, ?, '', ?, ?, ?, ?) RETURNING id",
+                           (const char *[]){ repo, snap, item, sz, caller, now, exp, NULL }, &r) != 0 ||
         !r || r->nrows != 1) {
         st = set_error(ERR_IO, "export: cannot record it");
     } else {
@@ -408,8 +409,8 @@ api_response_t exports_create(const api_request_t *req, int64_t repo_id, int64_t
     if (st == OK) {
         char ids[32];
         snprintf(ids, sizeof(ids), "%lld", (long long)e->id);
-        if (db_execute_non_query(g_db, "UPDATE exports SET socket = ? WHERE id = ?",
-                                 (const char *[]){ e->socket, ids, NULL }, NULL) != 0)
+        if (db_write(g_db, "UPDATE exports SET socket = ? WHERE id = ?",
+                     (const char *[]){ e->socket, ids, NULL }, NULL) != 0)
             log_warn("export %lld: cannot record its socket", (long long)e->id);
     }
     explicit_bzero(rnd, sizeof(rnd));

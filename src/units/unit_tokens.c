@@ -3,6 +3,7 @@
 #include "unit_tokens.h"
 #include "object.h"
 #include "unit_restore.h"
+#include "db_write.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -91,7 +92,7 @@ status_t unit_token_put(cutils_db_t *db, int64_t repo_id, const char *unit_key,
     id_str(snap_id, snap, sizeof(snap));
     id_str((int64_t)time(NULL), now, sizeof(now));
     object_hash_to_hex(root, hex);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT OR REPLACE INTO unit_tokens (repo_id, unit_key, item_id, token, token_blob,"
             " snap_id, item_root, identity, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (const char *[]){ repo, unit_key, item_id, token, blob ? blob : "", snap, hex, identity, now, NULL },
@@ -104,8 +105,8 @@ status_t unit_tokens_drop(cutils_db_t *db, int64_t repo_id, const char *unit_key
 {
     char repo[32];
     id_str(repo_id, repo, sizeof(repo));
-    if (db_execute_non_query(db, "DELETE FROM unit_tokens WHERE repo_id = ? AND unit_key = ?",
-                             (const char *[]){ repo, unit_key, NULL }, NULL) != 0)
+    if (db_write(db, "DELETE FROM unit_tokens WHERE repo_id = ? AND unit_key = ?",
+                 (const char *[]){ repo, unit_key, NULL }, NULL) != 0)
         return set_error(ERR_IO, "unit tokens: cannot drop those of %s", unit_key);
     return OK;
 }
@@ -127,8 +128,8 @@ status_t unit_tokens_drop_except(cutils_db_t *db, int64_t repo_id, const char *u
         int kept = 0;
         for (size_t k = 0; k < n_keep && !kept; k++) kept = keep[k] && strcmp(keep[k], item) == 0;
         if (kept) continue;
-        if (db_execute_non_query(db, "DELETE FROM unit_tokens WHERE repo_id = ? AND unit_key = ? AND item_id = ?",
-                                 (const char *[]){ repo, unit_key, item, NULL }, NULL) != 0)
+        if (db_write(db, "DELETE FROM unit_tokens WHERE repo_id = ? AND unit_key = ? AND item_id = ?",
+                     (const char *[]){ repo, unit_key, item, NULL }, NULL) != 0)
             st = set_error(ERR_IO, "unit tokens: cannot drop %s %s", unit_key, item);
     }
     db_result_free(r);
@@ -207,8 +208,8 @@ status_t unit_incr_get(cutils_db_t *db, int64_t repo_id, const char *unit_key,
 
 static status_t ensure_row(cutils_db_t *db, const char *repo, const char *unit_key)
 {
-    if (db_execute_non_query(db, "INSERT OR IGNORE INTO unit_incremental (repo_id, unit_key) VALUES (?, ?)",
-                             (const char *[]){ repo, unit_key, NULL }, NULL) != 0)
+    if (db_write(db, "INSERT OR IGNORE INTO unit_incremental (repo_id, unit_key) VALUES (?, ?)",
+                 (const char *[]){ repo, unit_key, NULL }, NULL) != 0)
         return set_error(ERR_IO, "unit tokens: cannot record the state of %s", unit_key);
     return OK;
 }
@@ -219,8 +220,8 @@ status_t unit_incr_set_audit(cutils_db_t *db, int64_t repo_id, const char *unit_
     id_str(repo_id, repo, sizeof(repo));
     id_str(when, w, sizeof(w));
     status_t st = ensure_row(db, repo, unit_key);
-    if (st == OK && db_execute_non_query(db, "UPDATE unit_incremental SET last_audit_at = ? WHERE repo_id = ? AND unit_key = ?",
-                                         (const char *[]){ w, repo, unit_key, NULL }, NULL) != 0)
+    if (st == OK && db_write(db, "UPDATE unit_incremental SET last_audit_at = ? WHERE repo_id = ? AND unit_key = ?",
+                             (const char *[]){ w, repo, unit_key, NULL }, NULL) != 0)
         st = set_error(ERR_IO, "unit tokens: cannot record the audit of %s", unit_key);
     return st;
 }
@@ -231,9 +232,9 @@ status_t unit_incr_disable(cutils_db_t *db, int64_t repo_id, const char *unit_ke
     id_str(repo_id, repo, sizeof(repo));
     id_str((int64_t)time(NULL), now, sizeof(now));
     status_t st = ensure_row(db, repo, unit_key);
-    if (st == OK && db_execute_non_query(db, "UPDATE unit_incremental SET disabled_reason = ?, disabled_at = ?"
-                                             " WHERE repo_id = ? AND unit_key = ?",
-                                         (const char *[]){ reason, now, repo, unit_key, NULL }, NULL) != 0)
+    if (st == OK && db_write(db, "UPDATE unit_incremental SET disabled_reason = ?, disabled_at = ?"
+                                 " WHERE repo_id = ? AND unit_key = ?",
+                             (const char *[]){ reason, now, repo, unit_key, NULL }, NULL) != 0)
         st = set_error(ERR_IO, "unit tokens: cannot turn incrementals off for %s", unit_key);
     return st;
 }
@@ -245,11 +246,11 @@ status_t unit_incr_reset(cutils_db_t *db, int64_t repo_id, const char *unit_key)
     /* The rows stay with no snapshot: never a base again, but their
      * checkpoint is still handed over, and retired when the next session
      * commits, rather than left on the domain. */
-    if (db_execute_non_query(db, "UPDATE unit_incremental SET disabled_reason = '', disabled_at = 0"
-                                 " WHERE repo_id = ? AND unit_key = ?",
-                             (const char *[]){ repo, unit_key, NULL }, NULL) != 0 ||
-        db_execute_non_query(db, "UPDATE unit_tokens SET snap_id = 0 WHERE repo_id = ? AND unit_key = ?",
-                             (const char *[]){ repo, unit_key, NULL }, NULL) != 0)
+    if (db_write(db, "UPDATE unit_incremental SET disabled_reason = '', disabled_at = 0"
+                     " WHERE repo_id = ? AND unit_key = ?",
+                 (const char *[]){ repo, unit_key, NULL }, NULL) != 0 ||
+        db_write(db, "UPDATE unit_tokens SET snap_id = 0 WHERE repo_id = ? AND unit_key = ?",
+                 (const char *[]){ repo, unit_key, NULL }, NULL) != 0)
         return set_error(ERR_IO, "unit tokens: cannot reset %s", unit_key);
     return OK;
 }

@@ -4,6 +4,7 @@
 #include "unit_state.h"
 #include "db_txn.h"
 #include "registry.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -93,7 +94,7 @@ static status_t db_id_get(cutils_db_t *db, char out[33])
 static status_t db_id_put(cutils_db_t *db, const char *id)
 {
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "daemon id: begin");
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO daemon_state (key, value) VALUES ('daemon_id', ?)"
             " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (const char *[]){ id, NULL }, NULL) != 0) {
@@ -225,7 +226,7 @@ static status_t j_record(void *ctx, const char *kind, const char *detail, int64_
     snprintf(now, sizeof(now), "%lld", (long long)units_now_ms());
     if (db_txn_begin(j->db) != OK) return set_error(ERR_IO, "hold journal: begin");
     db_result_t *r = NULL;
-    int ok = db_execute(j->db,
+    int ok = db_write_returning(j->db,
             "INSERT INTO unit_intents (provider, unit_id, kind, detail, job_id, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
             (const char *[]){ j->provider, j->unit_id, kind, detail, job, now, NULL },
@@ -249,8 +250,8 @@ static status_t delete_intent(cutils_db_t *db, int64_t id)
     char ids[32];
     snprintf(ids, sizeof(ids), "%lld", (long long)id);
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "hold journal: begin");
-    if (db_execute_non_query(db, "DELETE FROM unit_intents WHERE id = ?",
-                             (const char *[]){ ids, NULL }, NULL) != 0) {
+    if (db_write(db, "DELETE FROM unit_intents WHERE id = ?",
+                 (const char *[]){ ids, NULL }, NULL) != 0) {
         db_txn_rollback(db);
         return set_error(ERR_IO, "hold journal: cannot clear %lld", (long long)id);
     }

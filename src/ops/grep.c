@@ -7,6 +7,7 @@
 #include "read_budget.h"
 #include "object.h"
 #include "node_queries.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -268,6 +269,12 @@ static void flush_hits(grep_ctx_t *g, const char *node_id, const char *path,
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)g->repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)g->run_id);
+    /* One file's hits, one transaction: bounded by the per-file cap. */
+    int began = n > 0 ? db_write_enter(g->db) : 0;
+    if (began < 0) {
+        log_warn("grep: cannot record hits for %s", path);
+        return;
+    }
     for (uint32_t i = 0; i < n; i++) {
         char ln[32];
         snprintf(ln, sizeof(ln), "%llu", (unsigned long long)g->pending[i].line_no);
@@ -275,10 +282,12 @@ static void flush_hits(grep_ctx_t *g, const char *node_id, const char *path,
                 "INSERT INTO grep_hits (run_id, repo_id, node_id, path, line_no, excerpt)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (const char *[]){ run, repo, node_id, path, ln,
-                                  g->pending[i].excerpt, NULL },
+                      g->pending[i].excerpt, NULL },
                 NULL) != 0)
             log_warn("grep: cannot record hit for %s", path);
     }
+    if (db_write_leave(g->db, began, 1) != 0)
+        log_warn("grep: cannot commit hits for %s", path);
     g->res->hits += n;
 }
 
@@ -575,7 +584,7 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * connection, and every thread shares one: another thread's insert
      * between the two statements handed this caller someone else's id. */
     db_result_t *r = NULL;
-    if (db_execute(db,
+    if (db_write_returning(db,
             "INSERT INTO grep_runs (repo_id, snap_id, pattern, path_prefix,"
             " ignore_case, started_at)"
             " VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
@@ -751,14 +760,14 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     snprintf(hits,    sizeof(hits),    "%llu", (unsigned long long)res.hits);
     snprintf(run,     sizeof(run),     "%lld", (long long)res.run_id);
 
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "UPDATE grep_runs SET finished_at = ?, files_scanned = ?,"
             " files_matched = ?, files_skipped = ?, bytes_scanned = ?, hits = ?,"
             " files_capped = ?, truncated = ?, completed = ?,"
             " skip_reason = NULLIF(?, '') WHERE id = ?",
             (const char *[]){ fin, scanned, matched, skipped, bytes, hits, capped,
-                              res.truncated ? "1" : "0", st == OK ? "1" : "0",
-                              res.skip_reason, run, NULL }, NULL) != 0)
+                  res.truncated ? "1" : "0", st == OK ? "1" : "0",
+                  res.skip_reason, run, NULL }, NULL) != 0)
         log_warn("grep: cannot close run record %s", run);
 
     /* Filled on a cancel too: the run record exists and is closed, and a

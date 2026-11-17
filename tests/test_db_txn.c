@@ -37,6 +37,8 @@
 #include <cutils/db.h>
 
 #include "db_txn.h"
+#include "db_write.h"
+#include "store_index.h"
 #include "test_tmp.h"
 
 #define TEST_DIR TEST_TMP "/c_backup_test_dbtxn"
@@ -349,6 +351,239 @@ static void test_make_durable_checkpoints_everything(void **state)
     assert_int_equal(db_txn_commit(db), OK);
 }
 
+/* ------------------------------------------------------------------ */
+/* B157: writes outside a transaction                                  */
+/* ------------------------------------------------------------------ */
+
+static long count_rows(const char *sql)
+{
+    db_result_t *r = NULL;
+    long n = -1;
+    if (db_execute(db, sql, NULL, &r) == 0 && r && r->nrows == 1)
+        n = strtol(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
+static void seed_staged(int n)
+{
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/r', 'r', 'u-r', 1)",
+        NULL, NULL), 0);
+    for (int i = 0; i < n; i++) {
+        char h[16];
+        snprintf(h, sizeof(h), "s%04d", i);
+        assert_int_equal(db_execute_non_query(db,
+            "INSERT INTO objects (repo_id, hash, location, type) VALUES (1, ?, 'staged', 1)",
+            (const char *[]){ h, NULL }, NULL), 0);
+    }
+    /* And one the drop must leave alone. */
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO objects (repo_id, hash, location, type) VALUES (1, 'packed', '7', 1)",
+        NULL, NULL), 0);
+}
+
+struct dropper {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    int             done;
+    status_t        st;
+};
+
+static void *dropper_main(void *arg)
+{
+    struct dropper *d = arg;
+    status_t st = store_index_drop_staged(db, 1);
+    pthread_mutex_lock(&d->mu);
+    d->st = st;
+    d->done = 1;
+    pthread_cond_broadcast(&d->cv);
+    pthread_mutex_unlock(&d->mu);
+    return NULL;
+}
+
+/*
+ * The bug, forced: a backup drops staged rows while another thread holds a
+ * db_txn transaction that it then rolls back.
+ *
+ * store_index_drop_staged issued a plain DELETE. On the one connection every
+ * thread shares, that statement ran inside the holder's open transaction, so
+ * it returned at once, reported success, and was undone by the holder's
+ * rollback: the staged rows came back, naming bytes in a pack that was
+ * discarded. Through db_write it queues for the lock instead, runs after the
+ * rollback in a transaction of its own, and its effect is all there.
+ *
+ * Three things are asserted, each of which the old code fails: the drop
+ * waited (it is seen queued behind the holder), the holder saw nothing of it
+ * while it waited (not half-applied into someone else's transaction), and
+ * after the rollback every staged row is gone (not lost) while the holder's
+ * own rolled-back row did not survive on the drop's commit.
+ */
+static void test_drop_staged_waits_for_a_foreign_transaction(void **state)
+{
+    (void)state;
+    seed_staged(50);
+
+    struct dropper d;
+    memset(&d, 0, sizeof(d));
+    pthread_mutex_init(&d.mu, NULL);
+    pthread_cond_init(&d.cv, NULL);
+    d.st = ERR_IO;
+
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO objects (repo_id, hash, location, type) VALUES (1, 'holder', '9', 1)",
+        NULL, NULL), 0);
+
+    pthread_t t;
+    assert_int_equal(pthread_create(&t, NULL, dropper_main, &d), 0);
+
+    /* It waited: the old DELETE never queued, it ran in this transaction. */
+    wait_for_waiter();
+    pthread_mutex_lock(&d.mu);
+    int early = d.done;
+    pthread_mutex_unlock(&d.mu);
+    assert_false(early);
+    /* Nothing of it is in this transaction. */
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM objects WHERE location = 'staged'"), 50);
+
+    db_txn_rollback(db);
+    assert_int_equal(pthread_join(t, NULL), 0);
+    assert_int_equal(d.st, OK);
+
+    /* Not lost to the rollback, and complete. */
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM objects WHERE location = 'staged'"), 0);
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM objects WHERE hash = 'packed'"), 1);
+    /* The holder's row went with its rollback; the drop's commit did not
+     * carry it. */
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM objects WHERE hash = 'holder'"), 0);
+
+    pthread_mutex_destroy(&d.mu);
+    pthread_cond_destroy(&d.cv);
+}
+
+/*
+ * A thread that holds the lock asked for its own transaction: db_write
+ * there runs inside it, and rolls back with it. Without that, on_progress
+ * from inside a backup batch, or journal_record from inside a prune, would
+ * try a nested begin and fail.
+ */
+static void test_db_write_joins_the_callers_transaction(void **state)
+{
+    (void)state;
+    assert_false(db_txn_held());
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_true(db_txn_held());
+    assert_int_equal(db_write(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/j', 'j', 'u-j', 1)",
+        NULL, NULL), 0);
+    db_result_t *r = NULL;
+    assert_int_equal(db_write_returning(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/k', 'k', 'u-k', 1)"
+        " RETURNING id", NULL, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    db_result_free(r);
+    db_txn_rollback(db);
+    assert_false(db_txn_held());
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM repos"), 0);
+
+    /* On its own it commits, and leaves the lock free. */
+    assert_int_equal(db_write(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/j', 'j', 'u-j', 1)",
+        NULL, NULL), 0);
+    assert_false(db_txn_held());
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM repos"), 1);
+    /* A failing statement fails the call and rolls back its transaction. */
+    assert_int_not_equal(db_write(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/j', 'j', 'u-j', 1)",
+        NULL, NULL), 0);
+    assert_false(db_txn_held());
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_txn_commit(db), OK);
+}
+
+struct batch_contender {
+    pthread_mutex_t mu;
+    int             done;
+};
+
+static void *batch_contender_main(void *arg)
+{
+    struct batch_contender *c = arg;
+    int rc = db_write(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/c', 'c', 'u-c', 1)",
+        NULL, NULL);
+    pthread_mutex_lock(&c->mu);
+    c->done = rc == 0 ? 1 : -1;
+    pthread_mutex_unlock(&c->mu);
+    return NULL;
+}
+
+/*
+ * A batched loop lets the lock go at its next step once a writer queues,
+ * so a sweep of many rows delays a route by one statement, not by the
+ * whole sweep.
+ */
+static void test_a_write_batch_yields_to_a_waiter(void **state)
+{
+    (void)state;
+    db_write_batch_t wb;
+    assert_int_equal(db_write_batch_open(&wb, db), 0);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/b', 'b', 'u-b', 1)",
+        NULL, NULL), 0);
+
+    struct batch_contender c = { PTHREAD_MUTEX_INITIALIZER, 0 };
+    pthread_t t;
+    assert_int_equal(pthread_create(&t, NULL, batch_contender_main, &c), 0);
+    wait_for_waiter();
+
+    /* Commits, and the reopen queues behind the waiter: the waiter's row is
+     * committed by the time the batch has its lock back. (Its done flag is
+     * set after it lets go, so the row is what is asked, not the flag.) */
+    assert_int_equal(db_write_batch_next(&wb), 0);
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM repos WHERE path = '/c'"), 1);
+    assert_int_equal(db_write_batch_close(&wb, 1), 0);
+    assert_int_equal(pthread_join(t, NULL), 0);
+    assert_int_equal(c.done, 1);
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM repos"), 2);
+    assert_false(db_txn_held());
+}
+
+/*
+ * The guard: once armed, a row changed by a thread that does not hold the
+ * write lock is counted (and in the end-to-end suites, aborts the daemon).
+ * One made through db_write or inside db_txn is not, and nothing is
+ * counted while the guard is not armed, which is start-up.
+ */
+static void test_guard_reports_a_write_outside_the_lock(void **state)
+{
+    (void)state;
+    unsigned long v0 = db_txn_guard_violations();
+
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/1', '1', 'u-1', 1)",
+        NULL, NULL), 0);
+    assert_int_equal(db_txn_guard_violations(), v0);
+
+    db_txn_guard_arm(1);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/2', '2', 'u-2', 1)",
+        NULL, NULL), 0);
+    assert_int_equal(db_txn_guard_violations(), v0 + 1);
+
+    assert_int_equal(db_write(db,
+        "UPDATE repos SET label = 'x'", NULL, NULL), 0);
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_execute_non_query(db,
+        "DELETE FROM repos WHERE path = '/1'", NULL, NULL), 0);
+    assert_int_equal(db_txn_commit(db), OK);
+    assert_int_equal(store_index_drop_staged(db, 1), OK);
+    assert_int_equal(db_txn_guard_violations(), v0 + 1);
+    db_txn_guard_arm(0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -359,6 +594,12 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_rollback_releases_the_lock, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repeated_cycles_do_not_leak_the_lock, setup, teardown),
         cmocka_unit_test_setup_teardown(test_make_durable_checkpoints_everything, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_drop_staged_waits_for_a_foreign_transaction, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_db_write_joins_the_callers_transaction, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_write_batch_yields_to_a_waiter, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_guard_reports_a_write_outside_the_lock, setup, teardown),
     };
+    /* Before any test opens its database, so every connection is hooked. */
+    db_txn_guard_install();
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

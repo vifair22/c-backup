@@ -4,6 +4,7 @@
 #include "db_txn.h"
 #include "repo_tags.h"
 #include "snap_record.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -135,37 +136,37 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
      */
     char marker[64];
     snprintf(marker, sizeof(marker), "prune-pending-%lld", (long long)snap_id);
-    int failed = db_execute_non_query(db,
+    int failed = db_write(db,
             "INSERT OR REPLACE INTO recovery_state (repo_id, key, value)"
             " VALUES (?, ?, ?)",
             (const char *[]){ repo, marker, snap, NULL }, NULL) != 0;
 
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM nodes WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM snapshots WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM tags WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM notes WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM snapshot_unit_items WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM snapshot_units WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
 
@@ -209,7 +210,7 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
         return OK;
     }
 
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
             (const char *[]){ repo, marker, NULL }, NULL) != 0)
         log_warn("prune: cannot clear intent marker for snapshot %lld",
@@ -271,8 +272,8 @@ status_t prune_finish_pending(cutils_db_t *db, int64_t repo_id, unsigned *out_fi
             st = unlink_record(path, snap_id, &removed);
             if (st != OK) break;
         }
-        if (db_execute_non_query(db, "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
-                                 (const char *[]){ rid, key, NULL }, NULL) != 0) {
+        if (db_write(db, "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
+                     (const char *[]){ rid, key, NULL }, NULL) != 0) {
             st = set_error(ERR_IO, "prune: cannot clear the marker of snapshot %s", snap);
             break;
         }

@@ -7,6 +7,7 @@
 #include "reserved.h"
 #include "util.h"
 #include "json_row.h"
+#include "db_write.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -232,7 +233,7 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
     }
     db_result_free(r);
 
-    if (db_execute_non_query(g_db,
+    if (db_write(g_db,
             "INSERT INTO tags (repo_id, name, snap_id, created_at)"
             " VALUES (?, ?, ?, ?)"
             " ON CONFLICT(repo_id, name) DO UPDATE SET snap_id = excluded.snap_id",
@@ -260,7 +261,7 @@ api_response_t metadata_tags_delete(const api_request_t *req, int64_t repo_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     int affected = 0;
     if (db_txn_begin(g_db) != OK) return api_error(500, "cannot begin");
-    if (db_execute_non_query(g_db,
+    if (db_write(g_db,
             "DELETE FROM tags WHERE repo_id = ? AND name = ?",
             (const char *[]){ repo, name, NULL }, &affected) != 0) {
         db_txn_rollback(g_db);
@@ -338,7 +339,7 @@ api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
     if (!snapshot_exists(repo, sid))
         return api_error(404, "no such snapshot");
 
-    if (db_execute_non_query(g_db,
+    if (db_write(g_db,
             "INSERT INTO notes (repo_id, snap_id, body, updated_at)"
             " VALUES (?, ?, ?, ?)"
             " ON CONFLICT(repo_id, snap_id) DO UPDATE SET"
@@ -591,20 +592,20 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
         }
     }
     if (!failed) {
-        if (db_execute_non_query(g_db,
+        if (db_write(g_db,
                 "DELETE FROM repo_backup_paths WHERE repo_id = ?",
                 (const char *[]){ repo, NULL }, NULL) != 0)
             failed = 1;
 
         for (int i = 0; i < n_paths && !failed; i++)
-            if (db_execute_non_query(g_db,
+            if (db_write(g_db,
                     "INSERT OR REPLACE INTO repo_backup_paths (repo_id, kind, value)"
                     " VALUES (?, 'source', ?)",
                     (const char *[]){ repo, paths[i], NULL }, NULL) != 0)
                 failed = 1;
 
         for (int i = 0; i < n_excl && !failed; i++)
-            if (db_execute_non_query(g_db,
+            if (db_write(g_db,
                     "INSERT OR REPLACE INTO repo_backup_paths (repo_id, kind, value)"
                     " VALUES (?, 'exclude', ?)",
                     (const char *[]){ repo, excl[i], NULL }, NULL) != 0)
@@ -801,7 +802,7 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    if (db_execute_non_query(g_db,
+    if (db_write(g_db,
             "INSERT INTO policy_values (repo_id, key, value) VALUES (?, ?, ?)"
             " ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value",
             (const char *[]){ repo, key, store_value, NULL }, NULL) != 0)
@@ -920,20 +921,21 @@ void journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
      * SELECT MAX and then a separate INSERT, and two threads journalling
      * for one repository between them took the same id, so the second
      * insert hit the primary key and that entry was lost with a warning
-     * (OWN-18). One statement runs whole under the handle's lock, and needs
-     * no db_txn, which matters because some callers may already hold one
-     * and db_txn_begin is not reentrant.
+     * (OWN-18). One statement runs whole under the handle's lock. It goes
+     * through db_write (B157): some callers already hold a db_txn
+     * transaction and it joins theirs, and the rest get one of their own
+     * rather than landing in another thread's.
      */
     /* Best effort: failing to journal must never fail the operation being
      * journalled. */
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO journal (repo_id, id, ts, source, operation, result,"
             " duration_ms, message)"
             " SELECT ?1, COALESCE(MAX(id), 0) + 1, strftime('%s','now'),"
             "        ?2, ?3, ?4, ?5, ?6"
             "   FROM journal WHERE repo_id = ?1",
             (const char *[]){ repo, source, operation, result, dur,
-                              message ? message : "", NULL }, NULL) != 0)
+                  message ? message : "", NULL }, NULL) != 0)
         log_warn("journal: cannot record %s/%s", operation, result);
 }
 

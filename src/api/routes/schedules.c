@@ -14,6 +14,7 @@
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "db_write.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -250,7 +251,7 @@ int routes_schedules_audit(cutils_db_t *db)
          * with the reason beside it, is a state the operator can see and
          * decide about.
          */
-        if (db_execute_non_query(db,
+        if (db_write(db,
                 "UPDATE schedules SET enabled = 0, disabled_reason = ? WHERE id = ?",
                 (const char *[]){ why, row[0], NULL }, NULL) != 0) {
             log_warn("schedules: cannot disable invalid schedule %s", row[0]);
@@ -630,7 +631,7 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
      * connection, and every thread shares one: another thread's insert
      * between the two statements handed this caller someone else's id. */
     db_result_t *r = NULL;
-    if (db_execute(g_db,
+    if (db_write_returning(g_db,
             "INSERT INTO schedules (repo_id, action, params, trigger_type, trigger_spec,"
             " on_overlap, catchup, enabled, next_due_at, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?) RETURNING id",
@@ -714,7 +715,7 @@ api_response_t schedules_patch(const api_request_t *req, int64_t repo_id,
      * clears the daemon's reason: off is now someone's decision, and on
      * passed the check above. */
     int changed = 0;
-    if (db_execute_non_query(g_db,
+    if (db_write(g_db,
             "UPDATE schedules SET enabled = ?, disabled_reason = NULL"
             " WHERE repo_id = ? AND id = ?",
             (const char *[]){ en, repo, sid, NULL }, &changed) != 0)
@@ -738,7 +739,7 @@ api_response_t schedules_delete(const api_request_t *req, int64_t repo_id,
     snprintf(sid,  sizeof(sid),  "%lld", (long long)schedule_id);
 
     int removed = 0;
-    if (db_execute_non_query(g_db,
+    if (db_write(g_db,
             "DELETE FROM schedules WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, sid, NULL }, &removed) != 0)
         return api_error(500, "cannot delete schedule");
