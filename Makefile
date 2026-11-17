@@ -537,7 +537,8 @@ $(SAN_FAULT_BINS): $(BINS)/%$(BIN_SUFFIX): $(TESTS)/%.c $(TESTS)/fault_inject.c 
 # suite that is a daemon dying mid-run, and its report is in the daemon log.
 SAN_REPORTS := $(abspath $(OBJ_DIR))/reports
 SAN_ENV_asan := ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1:log_path=$$d/asan \
-                UBSAN_OPTIONS=print_stacktrace=1:log_path=$$d/ubsan
+                UBSAN_OPTIONS=print_stacktrace=1:log_path=$$d/ubsan \
+                LSAN_OPTIONS=suppressions=$(abspath $(TESTS)/lsan.supp):print_suppressions=0
 SAN_ENV_tsan := TSAN_OPTIONS=second_deadlock_stack=1:history_size=4:log_path=$$d/tsan
 SAN_RUN_UNIT := $(if $(SAN_ONLY),$(filter $(addprefix $(BINS)/,$(addsuffix $(BIN_SUFFIX),$(SAN_ONLY))),$(SAN_TEST_BINS) $(SAN_VIRT_BINS) $(SAN_FAULT_BINS)),$(SAN_TEST_BINS) $(SAN_VIRT_BINS) $(SAN_FAULT_BINS))
 san_e2e = $(if $(SAN_ONLY),$(filter $(1),$(SAN_ONLY)),$(1))

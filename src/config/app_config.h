@@ -147,7 +147,7 @@ static const config_key_t app_file_keys[] = {
       "state.db page cache, MiB (2 to 65536)",
       CFG_STORE_FILE, 0 },
     { "db.wal_autocheckpoint", CFG_INT, "16384",
-      "state.db pages written between automatic checkpoints (1000 to 1048576)",
+      "state.db log pages that start a background checkpoint (1000 to 1048576)",
       CFG_STORE_FILE, 0 },
 
     /* The mass-loss brake (B150): more packs than this missing at once and

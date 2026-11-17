@@ -376,7 +376,7 @@ are different: they live in the database and change through the policy API
 | `db.path` | none, required | The daemon database. The shipped config sets `/var/lib/c-backupd/state.db`; a file without it stops the daemon |
 | `db.synchronous` | `normal` | When a database commit reaches the disk. `normal`: anything changed through the API is synced before the API answers, and the daemon's own writes (backup index rows, job records, the journal) once a second, so a power cut can lose about their last second (section 17.5); `full`: every commit is synced before it returns, as SQLite does by default, at a large cost on many small files (section 18.2). `normal` or `full` |
 | `db.cache_mb` | `64` | MiB of page cache for the database. 2 to 65536 |
-| `db.wal_autocheckpoint` | `16384` | Database pages (4 KiB) written to its log between checkpoints, each of which costs two syncs. 1000 to 1048576 |
+| `db.wal_autocheckpoint` | `16384` | Database pages (4 KiB) waiting in its log that start a checkpoint, each of which costs two syncs. Checkpoints run on a background thread with a connection of its own, never inside a commit, so no request waits for one; the log is restarted about once per this many pages and held under 16 times it, and its file is trimmed back to 4 times it. 1000 to 1048576 |
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
 | `http.port` | `8765` | TCP port for remote clients, 0 to 65535. `0` disables TCP |
 | `http.bind` | `127.0.0.1` | TCP bind address, an IPv4 address (not a hostname). `0.0.0.0` for every interface |

@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "state_db.h"
+#include "wal_sync.h"
+#include "checkpointer.h"
 
 #include <cutils/log.h>
 
@@ -63,13 +65,21 @@ status_t state_db_tune(cutils_db_t *db, const state_db_tuning_t *t)
         return set_error(ERR_INVALID, "state.db is not in WAL mode; refusing to "
                          "relax its sync settings");
 
-    /* Negative cache_size is KiB, independent of the page size. */
+    /* Negative cache_size is KiB, independent of the page size.
+     *
+     * wal_autocheckpoint 0: no COMMIT on this handle ever checkpoints. The
+     * configured interval is the checkpointer's threshold instead
+     * (checkpointer.h), which runs off the request path. journal_size_limit
+     * trims the WAL file back to the checkpointer's cap at each restart. */
     long long want_cache = -(long long)t->cache_mb * 1024;
-    char sql[160];
+    long long page = pragma_value(db, "page_size");
+    if (page <= 0) page = 4096;
+    long long want_limit = (long long)t->wal_autocheckpoint * CKPT_CAP_FACTOR * page;
+    char sql[200];
     snprintf(sql, sizeof(sql),
              "PRAGMA synchronous=%lld; PRAGMA cache_size=%lld; "
-             "PRAGMA wal_autocheckpoint=%d;",
-             want_sync, want_cache, t->wal_autocheckpoint);
+             "PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=%lld;",
+             want_sync, want_cache, want_limit);
     if (db_exec_raw(db, sql) != 0)
         return set_error(ERR_IO, "cannot apply state.db settings");
 
@@ -82,9 +92,13 @@ status_t state_db_tune(cutils_db_t *db, const state_db_tuning_t *t)
     if (got_cache != want_cache)
         return set_error(ERR_IO, "state.db cache_size is %lld after setting %lld",
                          got_cache, want_cache);
-    if (got_ckpt != t->wal_autocheckpoint)
-        return set_error(ERR_IO, "state.db wal_autocheckpoint is %lld after setting %d",
-                         got_ckpt, t->wal_autocheckpoint);
+    if (got_ckpt != 0)
+        return set_error(ERR_IO, "state.db wal_autocheckpoint is %lld after setting 0",
+                         got_ckpt);
+    long long got_limit = pragma_value(db, "journal_size_limit");
+    if (got_limit != want_limit)
+        return set_error(ERR_IO, "state.db journal_size_limit is %lld after setting %lld",
+                         got_limit, want_limit);
     return OK;
 }
 
@@ -130,18 +144,18 @@ static void flush_once(void)
     struct stat st;
     if (stat(g_fl_wal, &st) != 0) return;
     if (seen_matches(&st)) return;
-    int fd = open(g_fl_wal, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    if (fdatasync(fd) == 0) {
+    /* wal_sync: the file's data, its directory entry the first time this
+     * -wal is synced, and only ever the live file (wal_sync.h). */
+    if (wal_sync(g_fl_wal) == OK) {
         pthread_mutex_lock(&g_fl_seen_mu);
         g_fl_size  = st.st_size;
         g_fl_mtime = st.st_mtim;
         pthread_mutex_unlock(&g_fl_seen_mu);
         atomic_fetch_add(&g_fl_syncs, 1);
     } else {
-        log_warn("state.db: cannot sync %s: %s", g_fl_wal, strerror(errno));
+        log_warn("state.db: %s", err_msg());
+        err_clear();
     }
-    close(fd);
 }
 
 static void *flusher_main(void *arg)
