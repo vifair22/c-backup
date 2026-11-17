@@ -655,6 +655,72 @@ static void test_shared_claims_store_a_name_once(void **state)
     done(st);
 }
 
+/*
+ * B184: a full pack sealed outside the writer's lock. Between begin and end
+ * the writer has a new pack, and the old pack's names are not in its staged
+ * set nor yet in the index; their claims, under the old pack's token, are
+ * what stop the writer storing them a second time. After end the index
+ * answers. One copy of each name, across both packs.
+ */
+static void test_split_rollover_stores_a_name_once(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+    const size_t len = 9000;
+    char *buf = malloc(len);
+    assert_non_null(buf);
+    pack_claims_t *c = pack_claims_new();
+    assert_non_null(c);
+    pack_backup_writer_t *w = NULL;
+    assert_int_equal(pack_backup_open(st, &w), OK);
+    pack_backup_share_claims(w, c);
+
+    uint8_t h1[OBJECT_HASH_SIZE], h2[OBJECT_HASH_SIZE];
+    int is_new = -1;
+    fill_text(buf, len, 21);
+    assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, buf, len, h1, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 1);
+
+    pack_backup_sealing_t *s = NULL;
+    assert_int_equal(pack_backup_rollover_begin(w, &s), OK);
+    assert_non_null(s);
+    /* In the pack being sealed: claimed, so referenced, not stored. */
+    assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, buf, len, h1, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 0);
+    assert_false(pack_backup_holds(w, h1));
+    /* A new name goes in the new pack. */
+    fill_text(buf, len, 22);
+    assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, buf, len, h2, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 1);
+
+    assert_int_equal(pack_backup_rollover_end(s), OK);
+    assert_true(pack_object_exists(st, h1));
+    fill_text(buf, len, 21);
+    assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, buf, len, h1, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 0);
+
+    uint32_t packed = 0;
+    assert_int_equal(pack_backup_finish(w, &packed), OK);
+    assert_int_equal(packed, 2);
+    assert_int_equal(count_packs(), 2);
+    assert_int_equal(pack_claims_abandoned(c), 0);
+
+    /* Without a claim set, begin seals in place. */
+    pack_backup_writer_t *v = NULL;
+    assert_int_equal(pack_backup_open(st, &v), OK);
+    fill_text(buf, len, 23);
+    assert_int_equal(pack_backup_add(v, OBJECT_TYPE_FILE, buf, len, h2, &is_new, NULL, NULL), OK);
+    s = (pack_backup_sealing_t *)1;
+    assert_int_equal(pack_backup_rollover_begin(v, &s), OK);
+    assert_null(s);
+    assert_true(pack_object_exists(st, h2));
+    assert_int_equal(pack_backup_finish(v, &packed), OK);
+
+    pack_claims_free(c);
+    free(buf);
+    done(st);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -668,6 +734,7 @@ int main(void)
         cmocka_unit_test(test_rollover_seals_and_keeps_going),
         cmocka_unit_test(test_reports_full_near_the_seal),
         cmocka_unit_test(test_shared_claims_store_a_name_once),
+        cmocka_unit_test(test_split_rollover_stores_a_name_once),
         cmocka_unit_test(test_compression_samples_the_whole_object),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
