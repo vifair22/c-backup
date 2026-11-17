@@ -750,6 +750,117 @@ static void test_a_log_line_from_another_thread_waits_for_the_commit(void **stat
     assert_int_equal(db_set_write_lock(db, NULL, NULL, NULL), 0);
 }
 
+/* ---------- B144-REST: the commit budget ---------- */
+
+static char g_blob[3001];
+
+/* Rows of about 3 KB each through one batch that asks should_end at every
+ * row, as the backup's do; returns the rows each commit held. */
+static int run_batches(int total, int *per_commit, int max_commits)
+{
+    memset(g_blob, 'b', sizeof(g_blob) - 1);
+    g_blob[sizeof(g_blob) - 1] = '\0';
+    int n = 0, in = 0;
+    db_txn_batch_t b;
+    memset(&b, 0, sizeof(b));
+    assert_int_equal(db_txn_begin(db), OK);
+    db_txn_batch_opened(&b);
+    for (int i = 0; i < total; i++) {
+        assert_int_equal(db_write(db, "INSERT INTO budget (v) VALUES (?)",
+                                  (const char *[]){ g_blob, NULL }, NULL), 0);
+        in++;
+        if (db_txn_batch_should_end(&b)) {
+            assert_int_equal(db_txn_commit(db), OK);
+            if (n < max_commits) per_commit[n] = in;
+            n++;
+            in = 0;
+            assert_int_equal(db_txn_begin(db), OK);
+            db_txn_batch_opened(&b);
+        }
+    }
+    assert_int_equal(db_txn_commit(db), OK);
+    return n;
+}
+
+static void budget_setup(void)
+{
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE budget (id INTEGER PRIMARY KEY, v TEXT);"
+                                     " PRAGMA wal_autocheckpoint=0;"), 0);
+    db_txn_commit_stats_reset();
+    db_txn_track_wal(db);
+}
+
+static void budget_teardown(void)
+{
+    db_txn_track_wal(NULL);
+    db_txn_set_frame_cost_ns(0);
+    db_txn_commit_stats_reset();
+}
+
+/*
+ * A batch ends at the commit budget. At 1 ms a frame the budget is 150
+ * pages, so the first batch (one frame a row assumed) holds 150 rows; the
+ * ones after learn what a row really costs and stay near 150 frames. At
+ * 100 ms a frame the budget is the 16-page floor.
+ */
+static void test_a_batch_ends_at_the_commit_budget(void **state)
+{
+    (void)state;
+    budget_setup();
+    db_txn_set_frame_cost_ns(1e6);
+    int per[64];
+    int n = run_batches(1500, per, 64);
+    db_txn_commit_stats_t cs;
+    db_txn_commit_stats(&cs);
+    print_message("  1 ms/frame: %d commits, first %d rows, then %d; max %u frames, %lu capped\n",
+                  n, per[0], n > 2 ? per[2] : 0, cs.max_frames, cs.capped);
+    assert_true(n >= 5);
+    assert_int_equal(per[0], 150);
+    assert_true(cs.capped >= 5);
+    assert_true(cs.max_frames <= 150 * 2);
+
+    db_txn_commit_stats_reset();
+    db_txn_set_frame_cost_ns(100e6);
+    n = run_batches(300, per, 64);
+    db_txn_commit_stats(&cs);
+    print_message("  100 ms/frame: %d commits, %d rows each; max %u frames\n",
+                  n, per[1], cs.max_frames);
+    assert_true(per[1] <= DB_TXN_COMMIT_PAGES_MIN);
+    assert_true(cs.max_frames <= DB_TXN_COMMIT_PAGES_MIN * 3);
+    budget_teardown();
+}
+
+/* Measured rather than forced: on this machine's disk a frame costs far
+ * less than 150 ms / 256, so the cap is the page ceiling, which bounds the
+ * COMMIT written just after a load spike. */
+static void test_the_page_ceiling_bounds_every_commit(void **state)
+{
+    (void)state;
+    budget_setup();
+    int per[64];
+    int n = run_batches(3000, per, 64);
+    db_txn_commit_stats_t cs;
+    db_txn_commit_stats(&cs);
+    print_message("  measured: %d commits, max %u frames, %.1f us/frame\n",
+                  n, cs.max_frames, cs.ns_per_frame / 1e3);
+    assert_true(n >= 3000 / (DB_TXN_COMMIT_PAGES_MAX * 2));
+    assert_true(cs.max_frames <= DB_TXN_COMMIT_PAGES_MAX * 2);
+    budget_teardown();
+}
+
+/* Without the wal-index to learn from, nothing is capped: batches end as
+ * they did before (OWN-16's "with nobody waiting, a batch is ended by its
+ * size"). */
+static void test_no_tracking_means_no_cap(void **state)
+{
+    (void)state;
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE budget (id INTEGER PRIMARY KEY, v TEXT)"), 0);
+    db_txn_set_frame_cost_ns(100e6);
+    int per[4];
+    assert_int_equal(run_batches(500, per, 4), 0);
+    db_txn_set_frame_cost_ns(0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -767,6 +878,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_guard_reports_a_write_outside_the_lock, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_log_line_waits_out_a_rolled_back_transaction, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_log_line_from_another_thread_waits_for_the_commit, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_batch_ends_at_the_commit_budget, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_the_page_ceiling_bounds_every_commit, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_no_tracking_means_no_cap, setup, teardown),
     };
     /* Before any test opens its database, so every connection is hooked.
      * The guard test counts violations rather than aborting on one, so the

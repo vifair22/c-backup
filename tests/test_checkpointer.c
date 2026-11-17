@@ -78,7 +78,11 @@ static int setup(void **state)
     memset(g_blob, 'x', ROW_BYTES);
     g_blob[ROW_BYTES] = '\0';
     /* Each row its own pages, so a commit always adds frames. */
-    return db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == 0 ? 0 : -1;
+    /* daemon_state: where the checkpointer writes the row that restarts
+     * the WAL (B144-REST), as migration 002 creates it. */
+    return db_exec_raw(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);"
+                           " CREATE TABLE daemon_state (key TEXT PRIMARY KEY,"
+                           " value TEXT NOT NULL);") == 0 ? 0 : -1;
 }
 
 static int teardown(void **state)
@@ -228,6 +232,11 @@ static void test_wal_stays_near_the_cap_under_a_long_writer(void **state)
     assert_true((uint64_t)w.commits * 4 * 4 > (uint64_t)THRESHOLD * CKPT_CAP_FACTOR * 3);
     assert_true(peak < THRESHOLD * 3);
     assert_true(s.passive > 0);
+    /* The restarts were the checkpointer's own: the header sync landed on
+     * its thread, not on the writer's next commit. */
+    print_message("  restarts made by the checkpointer: %lu (%lu missed), longest %.1f ms\n",
+                  s.pre_restarts, s.pre_restart_misses, (double)s.max_restart_ns / 1e6);
+    assert_true(s.pre_restarts > 0);
     assert_true(w.max_ms < 2000);
 }
 

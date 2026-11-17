@@ -362,10 +362,13 @@ typedef struct {
     char          *summary;
     /* job_set_warning: alerted for a job that succeeds anyway. */
     char          *warning;
+    /* The phase whose done == total has been written, so a phase that
+     * reports its end repeatedly writes it once. */
+    int            finished_written;
 } progress_ctx_t;
 
 /* How often a running job's progress reaches the database. */
-#define PROGRESS_INTERVAL_MS 250
+#define PROGRESS_INTERVAL_MS 500
 
 static int64_t mono_ms(void)
 {
@@ -384,6 +387,13 @@ static int64_t mono_ms(void)
  * 82,604-entry snapshot took 5 minutes 46 seconds, nearly all of it writing
  * a progress row per skipped entry. Nobody reads progress faster than a few
  * times a second; the CLI polls every 100 ms and the app less often.
+ *
+ * 500 ms rather than 250 since B144-REST: each tick is a write transaction
+ * of its own whenever the job is not inside a batch, queued on the one write
+ * lock with every other writer, and FS2 measured the one that happened to
+ * be the first write after a WAL restart paying 0.3 to 1.5 s for SQLite's
+ * header sync. A phase's end (done == total) is written once per phase,
+ * not at every report that repeats it.
  */
 static void on_progress(const char *phase, uint64_t done, uint64_t total, void *ctx)
 {
@@ -393,9 +403,11 @@ static void on_progress(const char *phase, uint64_t done, uint64_t total, void *
     pc->seen_total = total;
     int64_t now = mono_ms();
     int phase_changed = strncmp(pc->last_phase, ph, sizeof(pc->last_phase) - 1) != 0;
-    int finished = total > 0 && done >= total;
+    if (phase_changed) pc->finished_written = 0;
+    int finished = total > 0 && done >= total && !pc->finished_written;
     if (!phase_changed && !finished && now - pc->last_ms < PROGRESS_INTERVAL_MS)
         return;
+    if (total > 0 && done >= total) pc->finished_written = 1;
     pc->last_ms = now;
     snprintf(pc->last_phase, sizeof(pc->last_phase), "%s", ph);
 
@@ -725,7 +737,7 @@ static void *worker_main(void *arg)
         struct timespec began;
         clock_gettime(CLOCK_MONOTONIC, &began);
 
-        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL, NULL };
+        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL, NULL, 0 };
         /* A lock error that is not contention (the lock table is full) fails
          * the job through the same reporting as any other failure. */
         status_t st = slot.lock_err != OK
