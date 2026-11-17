@@ -52,7 +52,7 @@
 #define TEST_DIR  TEST_TMP "/c_backup_test_store_index"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_REPO TEST_DIR "/repo"
-#define MAX_OBJ   2048
+#define MAX_OBJ   8192
 
 extern const db_migration_t app_migrations[];
 
@@ -107,6 +107,8 @@ static int teardown(void **state)
     db_txn_guard_arm(0);
     db_readers_close();
     store_index_set_commit_fault(NULL);
+    db_txn_set_frame_cost_ns(0);
+    db_txn_track_wal(NULL);
     sync_latch_reset_for_test();
     if (store) { store_close(store); store = NULL; }
     if (idx) { store_index_free(idx); idx = NULL; }
@@ -754,6 +756,196 @@ static void test_refused_seal_abandons_a_referenced_claim(void **state)
     seal_fails_after_a_reference(1);
 }
 
+/* ------------------------------------------------------------------ */
+/* B193: the marker in parts, and a request ahead of bulk commits      */
+/* ------------------------------------------------------------------ */
+
+/* n new objects stored and their pack's commit captured, not applied. */
+static size_t capture_pack(size_t n, capture_t *cap)
+{
+    memset(cap, 0, sizeof(*cap));
+    store_set_pack_commit_cb(store, capture_cb, cap);
+    size_t first = nobj;
+    for (size_t k = 0; k < n; k++) {
+        size_t i = nobj++;
+        assert_true(i < MAX_OBJ);
+        lens[i] = 200 + (i * 613) % 1500;
+        datas[i] = malloc(lens[i]);
+        assert_non_null(datas[i]);
+        fill(datas[i], lens[i], (uint32_t)(0xB193 + i * 6151));
+        assert_int_equal(object_store(store, OBJECT_TYPE_FILE, datas[i], lens[i], hashes[i]),
+                         OK);
+    }
+    assert_int_equal(object_store_flush(store), OK);
+    assert_true(cap->got);
+    assert_int_equal(cap->info.entry_count, n);
+    store_index_free(idx);
+    idx = NULL;
+    assert_int_equal(store_index_bind(store, db, repo_id, &idx), OK);
+    return first;
+}
+
+/*
+ * A pack whose every entry duplicates one already indexed elsewhere (what
+ * FS2's 16.7 s commit was: chunks another thread had packed first) sets all
+ * its rows aside for the marker. They now commit in parts after the packs
+ * row, and at every part boundary every object is readable, the old copies
+ * through their packs and the replaced ones through the new pack.
+ */
+static void test_set_aside_rows_commit_in_parts(void **state)
+{
+    (void)state;
+    pack_of(40);                                  /* 0..39 in pack A */
+    capture_t cap;
+    memset(&cap, 0, sizeof(cap));
+    store_set_locate_cb(store, locate_nothing, NULL);
+    store_set_pack_commit_cb(store, capture_cb, &cap);
+    for (size_t i = 0; i < 40; i++) {
+        uint8_t h[OBJECT_HASH_SIZE];
+        assert_int_equal(object_store(store, OBJECT_TYPE_FILE, datas[i], lens[i], h), OK);
+    }
+    assert_int_equal(object_store_flush(store), OK);
+    assert_true(cap.got);
+    store_index_free(idx);
+    idx = NULL;
+    assert_int_equal(store_index_bind(store, db, repo_id, &idx), OK);
+
+    store_index_set_pack_batch_rows(4);
+    g_gate_calls = g_gate_unreadable = 0;
+    g_watch_lo = 0;
+    g_watch_hi = 40;
+    store_index_set_commit_gate(readable_gate);
+    assert_int_equal(store_emit_pack_commit(store, &cap.info), OK);
+    store_index_set_commit_gate(NULL);
+    free(cap.entries);
+    /* The packs row and 40 replacing rows, four to a part. */
+    assert_true(g_gate_calls >= 10);
+    assert_int_equal(g_gate_unreadable, 0);
+    assert_int_equal(count("SELECT COUNT(*) FROM packs WHERE repo_id = ?"), 2);
+    for (size_t i = 0; i < 40; i++) assert_true(readable(i));
+    assert_no_orphans();
+}
+
+/* A cut after the packs row and some of the replacing rows: every object
+ * is still readable, and nothing names a pack that is gone. */
+static int g_cut_after;
+static status_t cut_after_gate(void)
+{
+    return --g_cut_after < 0 ? ERR_IO : OK;
+}
+
+static void test_cut_between_marker_parts_leaves_everything_readable(void **state)
+{
+    (void)state;
+    pack_of(24);
+    capture_t cap;
+    memset(&cap, 0, sizeof(cap));
+    store_set_locate_cb(store, locate_nothing, NULL);
+    store_set_pack_commit_cb(store, capture_cb, &cap);
+    for (size_t i = 0; i < 24; i++) {
+        uint8_t h[OBJECT_HASH_SIZE];
+        assert_int_equal(object_store(store, OBJECT_TYPE_FILE, datas[i], lens[i], h), OK);
+    }
+    assert_int_equal(object_store_flush(store), OK);
+    store_index_free(idx);
+    idx = NULL;
+    assert_int_equal(store_index_bind(store, db, repo_id, &idx), OK);
+
+    store_index_set_pack_batch_rows(4);
+    g_cut_after = 2;                /* the packs row's part and one more commit */
+    store_index_set_commit_gate(cut_after_gate);
+    store_emit_pack_commit(store, &cap.info);
+    store_index_set_commit_gate(NULL);
+    err_clear();
+    free(cap.entries);
+    assert_int_equal(count("SELECT COUNT(*) FROM packs WHERE repo_id = ?"), 2);
+    /* Some hashes moved, some did not: both packs are there, so all read. */
+    long long moved = count("SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?"
+                            " AND pack_id = (SELECT MAX(id) FROM packs WHERE repo_id = ?1)");
+    assert_true(moved > 0 && moved < 24);
+    for (size_t i = 0; i < 24; i++) assert_true(readable(i));
+    assert_no_orphans();
+}
+
+/*
+ * A request ahead of bulk commits (B193). Three pack commits of 2,000
+ * objects each - well over 1,000 WAL pages apiece - run at once, with every
+ * WAL page priced at 40 ms, so the budget is its 16-page floor and each
+ * part is a few rows. A tag-style write (db_txn_begin) that queues while
+ * they run waits for the part holding the lock and nothing else: no bulk
+ * transaction begins between its queueing and its turn, though three bulk
+ * writers are waiting.
+ */
+typedef struct {
+    capture_t *cap;
+    status_t   st;
+} replay_t;
+
+static void *replay_main(void *arg)
+{
+    replay_t *r = arg;
+    r->st = store_emit_pack_commit(store, &r->cap->info);
+    return NULL;
+}
+
+static void test_a_request_goes_before_waiting_bulk_commits(void **state)
+{
+    (void)state;
+    capture_t caps[3];
+    for (int k = 0; k < 3; k++) capture_pack(2000, &caps[k]);
+    db_txn_track_wal(db);
+    db_txn_set_frame_cost_ns(40e6);
+
+    replay_t rp[3];
+    pthread_t th[3];
+    unsigned long b_start = db_txn_bulk_count();
+    for (int k = 0; k < 3; k++) {
+        rp[k].cap = &caps[k];
+        rp[k].st = ERR_IO;
+        assert_int_equal(pthread_create(&th[k], NULL, replay_main, &rp[k]), 0);
+    }
+    /* Well into the bulk commits, all three running. */
+    while (db_txn_bulk_count() < b_start + 30) {
+        struct timespec ts = { 0, 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    int checks = 0, worst_between = 0;
+    double worst_ms = 0;
+    for (int t = 0; t < 20; t++) {
+        unsigned long before = db_txn_bulk_count();
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        assert_int_equal(db_txn_begin(db), OK);
+        unsigned long after = db_txn_bulk_count();
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        assert_int_equal(db_write(db, "INSERT OR REPLACE INTO config (key, value)"
+                                      " VALUES ('b193tag', '1')", NULL, NULL), 0);
+        assert_int_equal(db_txn_commit(db), OK);
+        int between = (int)(after - before);
+        double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (between > worst_between) worst_between = between;
+        if (ms > worst_ms) worst_ms = ms;
+        checks++;
+        struct timespec ts = { 0, 5 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    for (int k = 0; k < 3; k++) {
+        pthread_join(th[k], NULL);
+        assert_int_equal(rp[k].st, OK);
+        free(caps[k].entries);
+    }
+    db_txn_commit_stats_t cs;
+    db_txn_commit_stats(&cs);
+    print_message("  %d request writes: worst lock wait %.1f ms, at most %d bulk transactions "
+                  "begun meanwhile; bulk commits wrote at most %u WAL pages, %lu ended by the "
+                  "budget\n", checks, worst_ms, worst_between, cs.max_frames, cs.capped);
+    assert_int_equal(worst_between, 0);
+    assert_true(cs.max_frames <= DB_TXN_COMMIT_PAGES_MIN * 4);
+    assert_int_equal(count("SELECT COUNT(*) FROM packs WHERE repo_id = ?"), 3);
+    for (size_t i = 0; i < nobj; i++) assert_true(readable(i));
+    assert_no_orphans();
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -771,6 +963,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_failed_commit_abandons_a_referenced_claim,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_refused_seal_abandons_a_referenced_claim,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_set_aside_rows_commit_in_parts, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_cut_between_marker_parts_leaves_everything_readable,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_request_goes_before_waiting_bulk_commits,
                                         setup, teardown),
     };
     /* Before any test opens a connection, so each carries the guard's hook. */

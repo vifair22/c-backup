@@ -799,7 +799,7 @@ static void budget_teardown(void)
 
 /*
  * A batch ends at the commit budget. At 1 ms a frame the budget is 150
- * pages, so the first batch (one frame a row assumed) holds 150 rows; the
+ * pages, so the first batch (two frames a row assumed) holds 75 rows; the
  * ones after learn what a row really costs and stay near 150 frames. At
  * 100 ms a frame the budget is the 16-page floor.
  */
@@ -815,7 +815,7 @@ static void test_a_batch_ends_at_the_commit_budget(void **state)
     print_message("  1 ms/frame: %d commits, first %d rows, then %d; max %u frames, %lu capped\n",
                   n, per[0], n > 2 ? per[2] : 0, cs.max_frames, cs.capped);
     assert_true(n >= 5);
-    assert_int_equal(per[0], 150);
+    assert_int_equal(per[0], 75);
     assert_true(cs.capped >= 5);
     assert_true(cs.max_frames <= 150 * 2);
 
