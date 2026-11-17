@@ -45,6 +45,27 @@ static inline int hf_unroot(void)
     if (geteuid() != 0) return 0;
     hf_rmrf(HF_DIR);
     if (mkdir(TEST_TMP, 0755) != 0 && errno != EEXIST) return -1;
+    /* The uid has to reach TEST_TMP: a checkout under a directory only root
+     * may enter (CI job 19985) gets search permission added on the way
+     * down, nothing else. Only as root, which means a throwaway CI
+     * container or a deliberate run. */
+    {
+        char p[4096];
+        snprintf(p, sizeof(p), "%s", TEST_TMP);
+        for (char *c = p + 1;; c++) {
+            int end = *c == '\0';
+            if (*c == '/' || end) {
+                char keep = *c;
+                *c = '\0';
+                struct stat sb;
+                if (stat(p, &sb) == 0 && S_ISDIR(sb.st_mode) && !(sb.st_mode & S_IXOTH) &&
+                    chmod(p, (sb.st_mode & 07777) | S_IXOTH) != 0)
+                    return -1;
+                *c = keep;
+            }
+            if (end) break;
+        }
+    }
     if (chown(TEST_TMP, HF_UNROOT_UID, HF_UNROOT_UID) != 0) return -1;
     if (setgroups(0, NULL) != 0) return -1;
     if (setresgid(HF_UNROOT_UID, HF_UNROOT_UID, HF_UNROOT_UID) != 0) return -1;

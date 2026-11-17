@@ -14,6 +14,13 @@ CLI="${2:-build/bins/c-backup}"
 HELPER="${3:-build/bins/c-backup-helper}"
 TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
 mkdir -p "$TEST_ROOT"
+# As root (CI) the daemon runs as uid 990 (below), which has to reach its
+# work tree: a checkout under a directory only root may enter (CI job 19985:
+# the daemon could not even see its config.yaml) gets a work tree under
+# /tmp instead, which every uid may traverse.
+if [ "$(id -u)" = 0 ] && ! setpriv --reuid=990 --regid=990 --clear-groups -- test -x "$TEST_ROOT"; then
+    TEST_ROOT=/tmp
+fi
 WORK="$(mktemp -d "$TEST_ROOT/c_backup_helper_e2e.XXXXXX")"
 PORTBASE=$((20000 + ($$ % 15000) * 3))
 port_busy() { ss -Htan "( sport = :$1 )" 2>/dev/null | grep -q .; }
