@@ -22,6 +22,7 @@
 #include <cmocka.h>
 
 #include "trigger.h"
+#include "weekday.h"
 
 static void set_tz(const char *tz)
 {
@@ -94,6 +95,55 @@ static void test_parse_calendar_forms(void **state)
         "{\"type\":\"calendar\",\"every\":\"year\",\"on_month\":1,\"on_day\":1,\"at\":\"05:00\"}", &t), OK);
     assert_int_equal(t.every, CAL_YEAR);
     assert_int_equal(t.on_month, 1);
+}
+
+/*
+ * NIT-28: a weekday by full name or its three letters, in any case, stored
+ * as the full lowercase name. Only full lowercase-insensitive names worked,
+ * so `--on sun` was refused by the daemon and the CLI alike.
+ */
+static void test_weekday_names_and_abbreviations(void **state)
+{
+    (void)state;
+    static const char *const ok[] = { "sunday", "Sunday", "SUNDAY", "sun", "Sun",
+                                      "SUN", "sUn", NULL };
+    for (int i = 0; ok[i]; i++) {
+        char json[160], out[160];
+        snprintf(json, sizeof(json),
+                 "{\"type\":\"calendar\",\"every\":\"week\",\"on\":\"%s\",\"at\":\"03:00\"}",
+                 ok[i]);
+        trigger_t t;
+        if (trigger_parse(json, &t) != OK) fail_msg("'%s' refused: %s", ok[i], err_msg());
+        assert_int_equal(t.on_weekday, 0);
+        assert_int_equal(trigger_serialise(&t, out, sizeof(out)), OK);
+        assert_non_null(strstr(out, "\"on\":\"sunday\""));
+    }
+    static const char *const days[][2] = {
+        { "mon", "monday" }, { "TUE", "tuesday" }, { "Wed", "wednesday" },
+        { "thu", "thursday" }, { "FRI", "friday" }, { "sat", "saturday" },
+    };
+    for (int i = 0; i < 6; i++) {
+        assert_int_equal(weekday_parse(days[i][0]), i + 1);
+        assert_int_equal(weekday_parse(days[i][1]), i + 1);
+        assert_string_equal(weekday_name(i + 1), days[i][1]);
+    }
+
+    static const char *const bad[] = { "su", "sund", "tues", "thurs", "", "sunday ",
+                                       "funday", NULL };
+    for (int i = 0; bad[i]; i++) {
+        assert_int_equal(weekday_parse(bad[i]), -1);
+        char json[160];
+        snprintf(json, sizeof(json),
+                 "{\"type\":\"calendar\",\"every\":\"week\",\"on\":\"%s\",\"at\":\"03:00\"}",
+                 bad[i]);
+        trigger_t t;
+        assert_int_equal(trigger_parse(json, &t), ERR_INVALID);
+        assert_non_null(strstr(err_msg(), "first three letters"));
+        err_clear();
+    }
+    assert_int_equal(weekday_parse(NULL), -1);
+    assert_null(weekday_name(7));
+    assert_null(weekday_name(-1));
 }
 
 static void test_parse_rejects_nonsense(void **state)
@@ -386,6 +436,7 @@ int main(void)
         cmocka_unit_test(test_dst_spring_forward_lands_on_a_real_instant),
         cmocka_unit_test(test_dst_fall_back_fires_once_per_day),
         cmocka_unit_test(test_weekly_finds_the_weekday),
+        cmocka_unit_test(test_weekday_names_and_abbreviations),
         cmocka_unit_test(test_weekly_same_day_before_time),
         cmocka_unit_test(test_monthly_clamps_to_end_of_february),
         cmocka_unit_test(test_monthly_advances_to_next_month),

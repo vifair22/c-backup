@@ -18,6 +18,7 @@
 
 #include "args.h"
 #include "calendar_check.h"
+#include "weekday.h"
 #include "http.h"
 #include "sse.h"
 #include "snap_record.h"
@@ -1314,7 +1315,10 @@ static int h_schedule_add(const args_t *a)
         sb_puts(&b, ",\"trigger\":{\"type\":\"calendar\",\"every\":");
         sb_json_str(&b, every);
         if (at)       { sb_puts(&b, ",\"at\":");       sb_json_str(&b, at); }
-        if (on)       { sb_puts(&b, ",\"on\":");       sb_json_str(&b, on); }
+        /* Sent as the canonical name, which is what the daemon stores;
+         * calendar_check has already refused anything weekday_parse does
+         * not know. */
+        if (on)       { sb_puts(&b, ",\"on\":");       sb_json_str(&b, weekday_name(weekday_parse(on))); }
         if (on_day)   { sb_puts(&b, ",\"on_day\":");   sb_puts(&b, on_day); }
         if (on_month) { sb_puts(&b, ",\"on_month\":"); sb_puts(&b, on_month); }
         sb_puts(&b, "}}");
