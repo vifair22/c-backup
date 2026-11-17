@@ -21,6 +21,7 @@
 #endif
 #include "helper_policy.h"
 #include "helper_server.h"
+#include "mounts.h"
 
 #include <cutils/log.h>
 
@@ -62,6 +63,34 @@ int main(int argc, char **argv)
         fprintf(stderr, "c-backup-helper: %s\n", err_msg());
         return 1;
     }
+    /* Never start on a layout that multiplies the host's mounts (B186): a
+     * stacked path, or a bind under an rshared bind, is refused before
+     * anything else, and nothing is added. --check runs it too, so a
+     * layout can be checked without starting. */
+    {
+        char sock_dir[sizeof(pol.socket)];
+        snprintf(sock_dir, sizeof(sock_dir), "%s", pol.socket);
+        char *sl = strrchr(sock_dir, '/');
+        if (sl && sl != sock_dir) *sl = '\0';
+        const char *paths[8 + POLICY_LIST_MAX];
+        size_t np = 0;
+        paths[np++] = pol.state_dir;
+        paths[np++] = sock_dir;
+        paths[np++] = pol.nbd_dir;
+        paths[np++] = pol.staging_root;
+        paths[np++] = pol.scratch_dir;
+        paths[np++] = pol.btrfs_snapshot_dir;
+        paths[np++] = pol.lxc_path;
+        for (size_t i = 0; i < pol.n_staging && np < sizeof(paths) / sizeof(paths[0]); i++)
+            paths[np++] = pol.restore_staging_dirs[i];
+        const char *host_mi = pol.mountinfo[0] ? pol.mountinfo : pol.host_root[0] ? "/proc/1/mountinfo" : NULL;
+        if (mount_layout_check("/proc/self/mountinfo", host_mi, mount_in_container(), paths, np) != OK) {
+            fprintf(stderr, "c-backup-helper: %s\n", err_msg());
+            helper_policy_free(&pol);
+            return 1;
+        }
+    }
+
     if (check) {
         printf("{\"ok\":true,\"policy\":\"%s\",\"daemon_uid\":%u,\"daemon_id\":\"%s\",\"hooks\":%zu}\n",
                pol.digest, (unsigned)pol.daemon_uid, pol.daemon_id, pol.n_hooks);
