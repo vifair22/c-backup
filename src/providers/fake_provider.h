@@ -68,6 +68,7 @@ typedef enum {
     FAKE_FAIL_RELEASE,           /* releasing a hold fails, anywhere */
     FAKE_CRASH_IN_HOLD,          /* begin "dies" holding: no release, no clear */
     FAKE_HANG_IN_HOLD,           /* begin holds the freeze up to `arg` ms */
+    FAKE_HANG_IN_PAUSE,          /* begin holds the pause up to `arg` ms */
 } fake_fail_t;
 
 /* One failure, for one unit id (NULL: every unit). Replaces any set. */
@@ -158,6 +159,13 @@ status_t fake_disk_set_changed(sp_ctx_t *ctx, const char *unit_id, const char *i
                                const uint64_t *ranges, size_t n);
 status_t fake_unit_checkpoint(sp_ctx_t *ctx, const char *unit_id, char *buf, size_t sz);
 status_t fake_unit_break_chain(sp_ctx_t *ctx, const char *unit_id, int lose, int refuse);
+/* Make cp the unit's checkpoint again ("" for none): a hypervisor that
+ * kept it, for a test replaying sessions from one saved state. */
+status_t fake_unit_set_checkpoint(sp_ctx_t *ctx, const char *unit_id, const char *cp);
+/* Call fn at the start of every session's end, before a commit settles its
+ * checkpoint; committed says which way it ends. NULL stops. For tests of
+ * what has to be true by then. */
+void fake_end_observe(sp_ctx_t *ctx, void (*fn)(void *ctx, int committed), void *fnctx);
 
 /* A block stream over a run map, owning a copy; close frees it. */
 status_t fake_stream_from_runs(uint64_t size, const fake_run_t *runs, size_t n_runs,

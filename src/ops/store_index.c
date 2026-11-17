@@ -4,12 +4,16 @@
 
 #include "pack.h"   /* PACK_VERSION: the format new packs are written in */
 #include "db_txn.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 struct store_index {
     cutils_db_t *db;
@@ -151,11 +155,11 @@ static void drop_unannounced(store_index_t *idx, const char *repo, const char *p
         return;
     }
     int failed =
-        db_execute_non_query(idx->db,
+        db_write(idx->db,
             "UPDATE objects SET location = 'staged' WHERE repo_id = ? AND location = ?"
             " AND NOT EXISTS (SELECT 1 FROM packs WHERE repo_id = ? AND id = ?)",
             (const char *[]){ repo, pack, repo, pack, NULL }, NULL) != 0 ||
-        db_execute_non_query(idx->db,
+        db_write(idx->db,
             "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?"
             " AND NOT EXISTS (SELECT 1 FROM packs WHERE repo_id = ? AND id = ?)",
             (const char *[]){ repo, pack, repo, pack, NULL }, NULL) != 0;
@@ -230,7 +234,7 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         entry_args(&info->entries[i], &a);
 
         int n = 0;
-        if (db_execute_non_query(idx->db,
+        if (db_write(idx->db,
                 "INSERT INTO pack_objects"
                 " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -252,7 +256,7 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
          * and refcount.
          */
         n = 0;
-        if (db_execute_non_query(idx->db,
+        if (db_write(idx->db,
                 "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
                 "                     location, type)"
                 " VALUES (?, ?, 0, ?, ?, ?, ?)"
@@ -278,7 +282,7 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         if (db_txn_begin(idx->db) != OK) failed = 1;
         else in_txn = 1;
     }
-    if (!failed && db_execute_non_query(idx->db,
+    if (!failed && db_write(idx->db,
             "INSERT OR REPLACE INTO packs (repo_id, id, filename, size, sealed_at, version)"
             " VALUES (?, ?, ?, ?, strftime('%s','now'), ?)",
             (const char *[]){ repo, pack, info->filename, size, ver, NULL }, NULL) != 0)
@@ -287,14 +291,14 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         if (!later[i]) continue;
         entry_args_t a;
         entry_args(&info->entries[i], &a);
-        if ((later[i] & 1) && db_execute_non_query(idx->db,
+        if ((later[i] & 1) && db_write(idx->db,
                 "INSERT OR REPLACE INTO pack_objects"
                 " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (const char *[]){ repo, a.hex, pack, a.off, a.comp, a.orig, a.eidx, NULL },
                 NULL) != 0)
             failed = 1;
-        if (!failed && (later[i] & 2) && db_execute_non_query(idx->db,
+        if (!failed && (later[i] & 2) && db_write(idx->db,
                 "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
                 "                     location, type)"
                 " VALUES (?, ?, 0, ?, ?, ?, ?)"
@@ -356,7 +360,7 @@ static void pack_removed(void *user, uint64_t pack_id)
      * stale-row bug in a new shape: a pack_objects row whose packs row is
      * gone still resolves, to bytes that now belong to something else.
      */
-    if (db_execute_non_query(idx->db,
+    if (db_write(idx->db,
             "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
             (const char *[]){ repo, pack, NULL }, NULL) != 0) {
         log_error("pack removed: cannot clear pack_objects for pack %s", pack);
@@ -364,7 +368,7 @@ static void pack_removed(void *user, uint64_t pack_id)
         return;
     }
 
-    if (db_execute_non_query(idx->db,
+    if (db_write(idx->db,
             "DELETE FROM packs WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, pack, NULL }, NULL) != 0) {
         log_error("pack removed: cannot delete packs row %s", pack);
@@ -398,11 +402,11 @@ static status_t pack_relocate(void *user, uint64_t pack_id, const pack_commit_en
     if (db_txn_begin(idx->db) != OK)
         return set_error(ERR_IO, "relocate %s: cannot begin", hex);
     int failed =
-        db_execute_non_query(idx->db,
+        db_write(idx->db,
             "UPDATE pack_objects SET pack_id = ?, offset = ?, comp_size = ?,"
             " orig_size = ?, entry_index = ? WHERE repo_id = ? AND hash = ?",
             (const char *[]){ pack, off, comp, orig, eidx, repo, hex, NULL }, NULL) != 0 ||
-        db_execute_non_query(idx->db,
+        db_write(idx->db,
             "UPDATE objects SET location = ?, phys_size = ? WHERE repo_id = ? AND hash = ?",
             (const char *[]){ pack, comp, repo, hex, NULL }, NULL) != 0;
     if (failed) {
@@ -432,6 +436,20 @@ status_t store_index_bind(store_t *store, cutils_db_t *db, int64_t repo_id,
     store_set_pack_removed_cb(store, pack_removed, idx);
     store_set_pack_relocate_cb(store, pack_relocate, idx);
     store_set_index_sync_cb(store, index_sync, idx);
+
+    /* A floor under the next pack number from everything the index knows
+     * was ever issued, a dropped pack's tombstone included (B156). The
+     * repository's pack-ids file is what normally decides; this covers a
+     * file lost or damaged while the index lived. */
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT MAX(COALESCE((SELECT MAX(id) FROM packs WHERE repo_id = ?1), -1),"
+            "           COALESCE((SELECT MAX(id) FROM pack_tombstones WHERE repo_id = ?1), -1))",
+            (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1 && r->rows[0][0][0])
+        store_raise_pack_floor(store, strtoll(r->rows[0][0], NULL, 10) + 1);
+    db_result_free(r);
     *out = idx;
     return OK;
 }
@@ -459,7 +477,7 @@ status_t store_index_put_packed(cutils_db_t *db, int64_t repo_id,
     char repo[32], t[8];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(t, sizeof(t), "%u", type);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
             "                     location, type)"
             " SELECT repo_id, hash, 0, comp_size, orig_size, CAST(pack_id AS TEXT), ?"
@@ -484,6 +502,17 @@ status_t store_index_put_staged(cutils_db_t *db, int64_t repo_id,
  * an objects row naming a pack for any other reason is left to reindex as
  * before. Runs before store_index_drop_staged, which then drops the rows
  * this returns to 'staged'.
+ *
+ * The set of unannounced packs is one uncorrelated subquery, matched as a
+ * (repo, location) pair (B153). It used to correlate on objects.repo_id,
+ * which made SQLite rebuild the DISTINCT b-tree over the repository's whole
+ * pack_objects for every objects row: sum(n^2) per repository, 4.5 minutes
+ * of start-up at 56k objects with nothing to change, and hours beyond that.
+ * Now pack_objects is read once and an objects row is only visited when its
+ * repository has an unannounced pack. location holds a pack number as the
+ * decimal text db_pack_commit writes, which is what CAST(... AS TEXT) gives;
+ * every column in the pair is NOT NULL, so IN cannot meet a NULL.
+ * tests/test_startup_plans.c holds the plan to that shape.
  */
 status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id)
 {
@@ -492,10 +521,10 @@ status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id)
     const char *only = repo_id > 0 ? " AND po.repo_id = ?" : "";
     char upd[512], del[256];
     snprintf(upd, sizeof(upd),
-             "UPDATE objects SET location = 'staged' WHERE location IN"
-             " (SELECT DISTINCT CAST(po.pack_id AS TEXT) FROM pack_objects po"
-             "   WHERE po.repo_id = objects.repo_id%s AND NOT EXISTS"
-             "   (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id AND p.id = po.pack_id))",
+             "UPDATE objects SET location = 'staged' WHERE (repo_id, location) IN"
+             " (SELECT DISTINCT po.repo_id, CAST(po.pack_id AS TEXT) FROM pack_objects po"
+             "   WHERE NOT EXISTS"
+             "   (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id AND p.id = po.pack_id)%s)",
              only);
     snprintf(del, sizeof(del),
              "DELETE FROM pack_objects AS po WHERE NOT EXISTS"
@@ -503,8 +532,8 @@ status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id)
              only);
     const char *p1[] = { repo, NULL };
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "cannot drop unannounced pack rows");
-    if (db_execute_non_query(db, upd, repo_id > 0 ? p1 : NULL, NULL) != 0 ||
-        db_execute_non_query(db, del, repo_id > 0 ? p1 : NULL, NULL) != 0) {
+    if (db_write(db, upd, repo_id > 0 ? p1 : NULL, NULL) != 0 ||
+        db_write(db, del, repo_id > 0 ? p1 : NULL, NULL) != 0) {
         db_txn_rollback(db);
         return set_error(ERR_IO, "cannot drop unannounced pack rows");
     }
@@ -512,15 +541,108 @@ status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id)
     return OK;
 }
 
+/*
+ * A packs row whose file is gone and which nothing locates through (B147).
+ * Removing a pack unlinks it, syncs the directory, and only then commits
+ * the row's removal - the unlink waits for the commits that moved the
+ * pack's contents (B142), not the other way round - so a power cut can keep
+ * the unlink and lose that last commit. The row names a pack that is not
+ * there and nothing but a reindex ever removed it.
+ *
+ * Only rows with no pack_objects row: one that still locates objects in a
+ * missing pack is a loss for verify and reindex to report, not garbage.
+ * And only when the repository's packs/ is there, so an offline mount
+ * loses nothing.
+ */
+status_t store_index_drop_vanished_packs(cutils_db_t *db, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT p.repo_id, p.id, r.path FROM packs p JOIN repos r ON r.id = p.repo_id"
+             " WHERE NOT EXISTS (SELECT 1 FROM pack_objects po"
+             "   WHERE po.repo_id = p.repo_id AND po.pack_id = p.id)%s",
+             repo_id > 0 ? " AND p.repo_id = ?" : "");
+    const char *p1[] = { repo, NULL };
+    db_result_t *r = NULL;
+    if (db_execute(db, sql, repo_id > 0 ? p1 : NULL, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "cannot list packs with no entries");
+    }
+    status_t st = OK;
+    for (int i = 0; r && i < r->nrows && st == OK; i++) {
+        const char *path = r->rows[i][2];
+        char packs[PATH_MAX], dat[PATH_MAX];
+        struct stat sb;
+        uint32_t num = (uint32_t)strtoul(r->rows[i][1], NULL, 10);
+        if (snprintf(packs, sizeof(packs), "%s/packs", path) >= (int)sizeof(packs) ||
+            stat(packs, &sb) != 0 || !S_ISDIR(sb.st_mode))
+            continue;
+        if (pack_dat_path_resolve(dat, sizeof(dat), path, num) != 0) continue;
+        if (stat(dat, &sb) == 0 || errno != ENOENT) continue;
+        if (db_write(db, "DELETE FROM packs WHERE repo_id = ? AND id = ?",
+                     (const char *[]){ r->rows[i][0], r->rows[i][1], NULL },
+                     NULL) != 0)
+            st = set_error(ERR_IO, "cannot drop the row of vanished pack %u", num);
+        else
+            log_info("index: dropped the row of pack %u of repo %s, which is gone",
+                     num, r->rows[i][0]);
+    }
+    db_result_free(r);
+    return st;
+}
+
+/*
+ * Objects marked absent that a pack holds (B149). reindex records every
+ * object a tree names as 'absent' while it walks, and sets the location
+ * from pack_objects in a later, separate commit: two short transactions,
+ * as the shared handle needs. A crash or power cut between them leaves the
+ * snapshots indexed - so nothing asks for another reindex - and their
+ * objects marked as held by no pack, which verify reports missing.
+ */
+status_t store_index_fix_absent(cutils_db_t *db, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    char sql[1024];
+    snprintf(sql, sizeof(sql),
+             "UPDATE objects SET"
+             "   phys_size = (SELECT po.comp_size FROM pack_objects po"
+             "                 WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash),"
+             "   orig_size = (SELECT po.orig_size FROM pack_objects po"
+             "                 WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash),"
+             "   location  = (SELECT CAST(po.pack_id AS TEXT) FROM pack_objects po"
+             "                 WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)"
+             " WHERE location = 'absent'%s"
+             "   AND EXISTS (SELECT 1 FROM pack_objects po"
+             "                WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)",
+             repo_id > 0 ? " AND repo_id = ?" : "");
+    const char *p1[] = { repo, NULL };
+    if (db_write(db, sql, repo_id > 0 ? p1 : NULL, NULL) != 0)
+        return set_error(ERR_IO, "cannot locate objects marked absent");
+    return OK;
+}
+
+/*
+ * One statement under the write lock (B157). backup_run calls this while
+ * other threads run, and as a plain statement it joined whatever db_txn
+ * transaction another thread had open: it reported success and was undone
+ * by that thread's rollback, leaving rows that name bytes in a discarded
+ * pack. It stays one statement in one transaction rather than batches:
+ * there is no index on location, so each batch would rescan the
+ * repository's objects, and the connection's own mutex already holds every
+ * other thread off for the length of one statement either way.
+ */
 status_t store_index_drop_staged(cutils_db_t *db, int64_t repo_id)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     int rc = repo_id > 0
-        ? db_execute_non_query(db,
+        ? db_write(db,
               "DELETE FROM objects WHERE repo_id = ? AND location = 'staged'",
               (const char *[]){ repo, NULL }, NULL)
-        : db_execute_non_query(db,
+        : db_write(db,
               "DELETE FROM objects WHERE location = 'staged'", NULL, NULL);
     return rc == 0 ? OK : set_error(ERR_IO, "cannot drop staged objects");
 }
@@ -548,7 +670,7 @@ static status_t put_object(cutils_db_t *db, int64_t repo_id,
      * real size when it is offered repairs those rows on the next backup
      * that meets them, and cannot touch a correct one.
      */
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
             "                     location, type)"
             " VALUES (?, ?, 0, ?, ?, ?, ?)"
@@ -568,7 +690,7 @@ status_t store_index_addref(cutils_db_t *db, int64_t repo_id,
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "UPDATE objects SET refcount = refcount + 1"
             " WHERE repo_id = ? AND hash = ?",
             (const char *[]){ repo, hex, NULL }, NULL) != 0)

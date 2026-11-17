@@ -308,7 +308,9 @@ status_t manifest_store_tree(manifest_entry_t *entries, uint32_t count,
     /* Goes through the ordinary object path: an unchanged directory, or an
      * unchanged fragment of one, produces identical bytes, so the store
      * recognises it and writes nothing. That is the whole mechanism. */
-    qsort(entries, count, sizeof(*entries), entry_cmp);
+    /* An empty directory comes with no array at all, and qsort's base is
+     * declared nonnull even for a count of zero (UBSan). */
+    if (count > 1) qsort(entries, count, sizeof(*entries), entry_cmp);
 
     size_t total = MANIFEST_HDR_BYTES;
     for (uint32_t i = 0; i < count; i++) total += entry_wire_size(&entries[i]);

@@ -10,6 +10,8 @@
 #include "pack.h"
 #include "repo.h"
 #include "db_txn.h"
+#include "store_index.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -69,7 +71,7 @@ static status_t mark_object_ex(mark_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_S
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_hex(hash, hex);
     db_result_t *r = NULL;
-    if (db_execute(ctx->db,
+    if (db_write_returning(ctx->db,
             "UPDATE objects SET refcount = refcount + 1"
             " WHERE repo_id = ? AND hash = ? RETURNING refcount, type",
             (const char *[]){ ctx->repo, hex, NULL }, &r) != 0)
@@ -270,13 +272,19 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         res.tmp_files_removed = store_sweep_tmp_before(store, time(NULL),
                                                        &res.tmp_bytes_removed);
 
+    /* A pack removed just before a power cut can leave its row (B147). */
+    if (!dry_run && store_index_drop_vanished_packs(db, repo_id) != OK) {
+        log_warn("gc: %s", err_msg());
+        err_clear();
+    }
+
     if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "gc: begin");
 
     /* Clear every mark first. Anything still at zero after the walk is
      * unreachable from any snapshot. */
-    if (db_execute_non_query(db, "UPDATE objects SET refcount = 0 WHERE repo_id = ?",
-                             (const char *[]){ repo, NULL }, NULL) != 0) {
+    if (db_write(db, "UPDATE objects SET refcount = 0 WHERE repo_id = ?",
+                 (const char *[]){ repo, NULL }, NULL) != 0) {
         db_txn_rollback(db);
         return set_error(ERR_IO, "gc: cannot clear marks");
     }
@@ -332,7 +340,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * later restore resolve an object this sweep declared dead, and once
      * compaction rewrites the pack the row points into bytes that belong to
      * something else. */
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "DELETE FROM pack_objects WHERE repo_id = ? AND hash IN"
             " (SELECT hash FROM objects WHERE repo_id = ? AND refcount = 0)",
             (const char *[]){ repo, repo, NULL }, NULL) != 0) {
@@ -340,7 +348,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_IO, "gc: cannot clear pack locations");
     }
 
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "DELETE FROM objects WHERE repo_id = ? AND refcount = 0",
             (const char *[]){ repo, NULL }, NULL) != 0) {
         db_txn_rollback(db);

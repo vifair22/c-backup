@@ -7,6 +7,7 @@
 #include "reserved.h"
 #include "util.h"
 #include "json_row.h"
+#include "db_write.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -47,12 +48,17 @@ static api_response_t finalise(cutils_json_resp_t *resp)
 /* ---------- tags ---------- */
 
 /*
- * Mirror the repository's tags into its directory, inside the caller's
- * transaction. A failure here fails the request: a tag that exists only in
- * the database is exactly the unprotected-after-recovery state this file
- * was added to close, and saying ok over it would hide that.
+ * Write the repository's tag file as it will be once chg commits, before
+ * the transaction that commits it, and outside it (repo_tags.h, B144). A
+ * failure here fails the request: a tag that exists only in the database
+ * is exactly the unprotected-after-recovery state this file was added to
+ * close, and saying ok over it would hide that. The caller holds
+ * repo_tags_lock.
+ *
+ * *path receives the repository path, for tags_unwind.
  */
-static int tags_mirror(int64_t repo_id, char *err, size_t errsz)
+static int tags_mirror(int64_t repo_id, const repo_tag_change_t *chg,
+                       char *path, size_t pathsz, char *err, size_t errsz)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -63,9 +69,9 @@ static int tags_mirror(int64_t repo_id, char *err, size_t errsz)
         snprintf(err, errsz, "cannot find the repository's path");
         return -1;
     }
-    status_t st = repo_tags_save(g_db, repo_id, r->rows[0][0]);
+    snprintf(path, pathsz, "%s", r->rows[0][0]);
     db_result_free(r);
-    if (st != OK) {
+    if (repo_tags_save_with(g_db, repo_id, path, chg) != OK) {
         snprintf(err, errsz, "cannot record tags in the repository: %s", err_msg());
         err_clear();
         return -1;
@@ -73,17 +79,42 @@ static int tags_mirror(int64_t repo_id, char *err, size_t errsz)
     return 0;
 }
 
+/*
+ * The change was written to the repository and then did not commit: put
+ * the file back to what the database says. Best effort. Left as it is, the
+ * file holds a set tag the database lacks (a reconcile would restore it,
+ * which is the edit the client was told failed) or lacks a tag the database
+ * holds (protection a later recovery would not bring back), and either is
+ * repaired by the next tag edit's rewrite.
+ */
+static void tags_unwind(int64_t repo_id, const char *path)
+{
+    if (repo_tags_save(g_db, repo_id, path) != OK) {
+        log_warn("tags: repository %lld's tag file may not match the index until the "
+                 "next tag change: %s", (long long)repo_id, err_msg());
+        err_clear();
+    }
+}
+
 api_response_t metadata_tags_get(const api_request_t *req, int64_t repo_id)
 {
-    (void)req;
-    char repo[32];
+    /* Paged like every other collection (B154). The default is the
+     * maximum, so a client that does not page still gets every tag a
+     * deployment has in practice; past that it pages rather than answering
+     * an unbounded list. */
+    int nlim = 0, noff = 0;
+    api_response_t page_err;
+    if (routes_paging(req, 1000, 1000, &nlim, &noff, &page_err) != 0) return page_err;
+    char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(lim, sizeof(lim), "%d", nlim);
+    snprintf(off, sizeof(off), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_db,
             "SELECT name, snap_id, created_at FROM tags WHERE repo_id = ?"
-            " ORDER BY name",
-            (const char *[]){ repo, NULL }, &r) != 0) {
+            " ORDER BY name LIMIT ? OFFSET ?",
+            (const char *[]){ repo, lim, off, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list tags");
     }
@@ -201,15 +232,18 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
      * Setting the same snapshot again succeeds, so a retried request is
      * harmless.
      *
-     * The check and the write share a transaction so a concurrent set cannot
-     * land between them and be overwritten unseen.
+     * Every tag writer holds repo_tags_lock from the check to its commit,
+     * so a concurrent set cannot land between them and be overwritten
+     * unseen. The check is outside the transaction, as is the repository
+     * write that follows it: neither holds the write lock that a running
+     * backup's batches queue on (B144).
      */
-    if (db_txn_begin(g_db) != OK) return api_error(500, "cannot begin");
+    repo_tags_lock();
     db_result_t *r = NULL;
     if (db_execute(g_db, "SELECT snap_id FROM tags WHERE repo_id = ? AND name = ?",
                    (const char *[]){ repo, name, NULL }, &r) != 0) {
         db_result_free(r);
-        db_txn_rollback(g_db);
+        repo_tags_unlock();
         return api_error(500, "cannot read tags");
     }
     if (r && r->nrows == 1 && strcmp(r->rows[0][0], sid) != 0 && !move) {
@@ -219,25 +253,40 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
                  " \"move\":true (tag set --move from the CLI)",
                  name, r->rows[0][0]);
         db_result_free(r);
-        db_txn_rollback(g_db);
+        repo_tags_unlock();
         return api_error(409, msg);
     }
     db_result_free(r);
 
-    if (db_execute_non_query(g_db,
+    char merr[ERR_MSG_MAX + 64], path[PATH_MAX];
+    repo_tag_change_t chg = { .name = name, .snap_id = sid,
+                              .created_at = (int64_t)strtoll(now, NULL, 10) };
+    if (tags_mirror(repo_id, &chg, path, sizeof(path), merr, sizeof(merr)) != 0) {
+        repo_tags_unlock();
+        return api_error(500, merr);
+    }
+
+    if (db_txn_begin(g_db) != OK) {
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
+        return api_error(500, "cannot begin");
+    }
+    if (db_write(g_db,
             "INSERT INTO tags (repo_id, name, snap_id, created_at)"
             " VALUES (?, ?, ?, ?)"
             " ON CONFLICT(repo_id, name) DO UPDATE SET snap_id = excluded.snap_id",
             (const char *[]){ repo, name, sid, now, NULL }, NULL) != 0) {
         db_txn_rollback(g_db);
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
         return api_error(500, "cannot set tag");
     }
-    char merr[ERR_MSG_MAX + 64];
-    if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
-        db_txn_rollback(g_db);
-        return api_error(500, merr);
+    if (db_txn_commit(g_db) != OK) {
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
+        return api_error(500, "cannot commit tag");
     }
-    if (db_txn_commit(g_db) != OK) return api_error(500, "cannot commit tag");
+    repo_tags_unlock();
 
     char *out = strdup("{\"ok\":true}");
     return out ? api_ok(out) : api_error(500, "out of memory");
@@ -250,26 +299,45 @@ api_response_t metadata_tags_delete(const api_request_t *req, int64_t repo_id,
     if (!name || !name[0]) return api_error(400, "tag name required");
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    /* As metadata_tags_post: under repo_tags_lock, the repository's file
+     * first and outside the write lock, then the commit (B144). */
+    repo_tags_lock();
+    db_result_t *r = NULL;
+    int found = db_execute(g_db, "SELECT 1 FROM tags WHERE repo_id = ? AND name = ?",
+                           (const char *[]){ repo, name, NULL }, &r) == 0;
+    int exists = found && r && r->nrows == 1;
+    db_result_free(r);
+    if (!found) { repo_tags_unlock(); return api_error(500, "cannot read tags"); }
+    /* A typo used to succeed silently, which reads as "removed" to anybody
+     * checking the exit code, while the tag it meant stayed in place. */
+    if (!exists) { repo_tags_unlock(); return api_error(404, "no such tag"); }
+
+    char merr[ERR_MSG_MAX + 64], path[PATH_MAX];
+    repo_tag_change_t chg = { .name = name, .remove = 1 };
+    if (tags_mirror(repo_id, &chg, path, sizeof(path), merr, sizeof(merr)) != 0) {
+        repo_tags_unlock();
+        return api_error(500, merr);
+    }
     int affected = 0;
-    if (db_txn_begin(g_db) != OK) return api_error(500, "cannot begin");
-    if (db_execute_non_query(g_db,
+    if (db_txn_begin(g_db) != OK) {
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
+        return api_error(500, "cannot begin");
+    }
+    if (db_write(g_db,
             "DELETE FROM tags WHERE repo_id = ? AND name = ?",
             (const char *[]){ repo, name, NULL }, &affected) != 0) {
         db_txn_rollback(g_db);
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
         return api_error(500, "cannot delete tag");
     }
-    /* A typo used to succeed silently, which reads as "removed" to anybody
-     * checking the exit code, while the tag it meant stayed in place. */
-    if (affected == 0) {
-        db_txn_rollback(g_db);
-        return api_error(404, "no such tag");
+    if (db_txn_commit(g_db) != OK) {
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
+        return api_error(500, "cannot commit");
     }
-    char merr[ERR_MSG_MAX + 64];
-    if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
-        db_txn_rollback(g_db);
-        return api_error(500, merr);
-    }
-    if (db_txn_commit(g_db) != OK) return api_error(500, "cannot commit");
+    repo_tags_unlock();
 
     /* A body, not a 204: the CLI's contract is one JSON document per
      * command, and an empty success printed nothing at all (B095). */
@@ -330,7 +398,7 @@ api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
     if (!snapshot_exists(repo, sid))
         return api_error(404, "no such snapshot");
 
-    if (db_execute_non_query(g_db,
+    if (db_write(g_db,
             "INSERT INTO notes (repo_id, snap_id, body, updated_at)"
             " VALUES (?, ?, ?, ?)"
             " ON CONFLICT(repo_id, snap_id) DO UPDATE SET"
@@ -583,20 +651,20 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
         }
     }
     if (!failed) {
-        if (db_execute_non_query(g_db,
+        if (db_write(g_db,
                 "DELETE FROM repo_backup_paths WHERE repo_id = ?",
                 (const char *[]){ repo, NULL }, NULL) != 0)
             failed = 1;
 
         for (int i = 0; i < n_paths && !failed; i++)
-            if (db_execute_non_query(g_db,
+            if (db_write(g_db,
                     "INSERT OR REPLACE INTO repo_backup_paths (repo_id, kind, value)"
                     " VALUES (?, 'source', ?)",
                     (const char *[]){ repo, paths[i], NULL }, NULL) != 0)
                 failed = 1;
 
         for (int i = 0; i < n_excl && !failed; i++)
-            if (db_execute_non_query(g_db,
+            if (db_write(g_db,
                     "INSERT OR REPLACE INTO repo_backup_paths (repo_id, kind, value)"
                     " VALUES (?, 'exclude', ?)",
                     (const char *[]){ repo, excl[i], NULL }, NULL) != 0)
@@ -793,7 +861,7 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    if (db_execute_non_query(g_db,
+    if (db_write(g_db,
             "INSERT INTO policy_values (repo_id, key, value) VALUES (?, ?, ?)"
             " ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value",
             (const char *[]){ repo, key, store_value, NULL }, NULL) != 0)
@@ -805,28 +873,61 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
 
 /* ---------- journal ---------- */
 
+/*
+ * Every result anything journals: a job's outcome (success, failed,
+ * cancelled), and the advisories written beside it (warning for an
+ * unescrowed key, a plaintext replica or a unit definition that needed
+ * attention; alert for a missing pack). The CLI's --result lists the same.
+ */
+static const char *const k_journal_results[] = {
+    "success", "failed", "cancelled", "warning", "alert",
+};
+#define N_JOURNAL_RESULTS (sizeof(k_journal_results) / sizeof(k_journal_results[0]))
+
 api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id)
 {
     const char *result = api_query_param(req, "result");
-    int nlim = 0;
+    /* A filter on a value nothing writes used to answer [], which reads as
+     * "nothing like that happened" when the question was misspelt (NIT-32):
+     * `--result completed` and `--result bogus` both looked like a clean
+     * history. */
+    if (result) {
+        size_t k = 0;
+        while (k < N_JOURNAL_RESULTS && strcmp(result, k_journal_results[k]) != 0) k++;
+        if (k == N_JOURNAL_RESULTS) {
+            char msg[256];
+            int off = snprintf(msg, sizeof(msg), "result must be one of:");
+            for (size_t i = 0; i < N_JOURNAL_RESULTS && off > 0 && (size_t)off < sizeof(msg); i++)
+                off += snprintf(msg + off, sizeof(msg) - (size_t)off, "%s %s",
+                                i ? "," : "", k_journal_results[i]);
+            return api_error(400, msg);
+        }
+    }
+    /* offset as well as limit (B154): it was sent by the CLI and dropped
+     * here, so every page after the first was the first page again. */
+    int nlim = 0, noff = 0;
     api_response_t page_err;
-    if (routes_paging(req, 100, 1000, &nlim, NULL, &page_err) != 0) return page_err;
+    if (routes_paging(req, 100, 1000, &nlim, &noff, &page_err) != 0) return page_err;
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    char limit[16];
+    char limit[16], offset[16];
     snprintf(limit, sizeof(limit), "%d", nlim);
+    snprintf(offset, sizeof(offset), "%d", noff);
 
+    /* Newest first, with the per-repo id breaking ties: timestamps are
+     * whole seconds, and two entries in one second could swap places
+     * between pages, one served twice and the other never. */
     db_result_t *r = NULL;
     int rc = result
         ? db_execute(g_db,
             "SELECT id, ts, source, operation, result, duration_ms, message"
             "  FROM journal WHERE repo_id = ? AND result = ?"
-            " ORDER BY ts DESC LIMIT ?",
-            (const char *[]){ repo, result, limit, NULL }, &r)
+            " ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
+            (const char *[]){ repo, result, limit, offset, NULL }, &r)
         : db_execute(g_db,
             "SELECT id, ts, source, operation, result, duration_ms, message"
-            "  FROM journal WHERE repo_id = ? ORDER BY ts DESC LIMIT ?",
-            (const char *[]){ repo, limit, NULL }, &r);
+            "  FROM journal WHERE repo_id = ? ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
+            (const char *[]){ repo, limit, offset, NULL }, &r);
     if (rc != 0) {
         db_result_free(r);
         return api_error(500, "cannot read journal");
@@ -879,20 +980,21 @@ void journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
      * SELECT MAX and then a separate INSERT, and two threads journalling
      * for one repository between them took the same id, so the second
      * insert hit the primary key and that entry was lost with a warning
-     * (OWN-18). One statement runs whole under the handle's lock, and needs
-     * no db_txn, which matters because some callers may already hold one
-     * and db_txn_begin is not reentrant.
+     * (OWN-18). One statement runs whole under the handle's lock. It goes
+     * through db_write (B157): some callers already hold a db_txn
+     * transaction and it joins theirs, and the rest get one of their own
+     * rather than landing in another thread's.
      */
     /* Best effort: failing to journal must never fail the operation being
      * journalled. */
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO journal (repo_id, id, ts, source, operation, result,"
             " duration_ms, message)"
             " SELECT ?1, COALESCE(MAX(id), 0) + 1, strftime('%s','now'),"
             "        ?2, ?3, ?4, ?5, ?6"
             "   FROM journal WHERE repo_id = ?1",
             (const char *[]){ repo, source, operation, result, dur,
-                              message ? message : "", NULL }, NULL) != 0)
+                  message ? message : "", NULL }, NULL) != 0)
         log_warn("journal: cannot record %s/%s", operation, result);
 }
 

@@ -10,6 +10,9 @@
 set -u
 
 DAEMON="${1:-build/bins/c-backupd}"
+# A write made outside the write lock aborts the daemon here rather than
+# landing in another thread's transaction unnoticed (B157, db_write.h).
+export C_BACKUP_TXN_GUARD=abort
 CLI="${2:-build/bins/c-backup}"
 # Scratch goes where the Makefile says (C_BACKUP_TEST_DIR), and on disk when
 # run by hand: /tmp is often a tmpfs, so dense scratch there is RAM.
@@ -295,7 +298,7 @@ VERIFY_OUT=$(cb verify 1 --level deep)
 contains "deep verify reports its run" '"level":"deep"' "$VERIFY_OUT"
 contains "deep verify checked objects" '"checked"'      "$VERIFY_OUT"
 contains "gc dry run" '"state":"completed"' "$(cb gc 1 --dry-run)"
-contains "journal result filter" '"entries"' "$(cb journal 1 --result ok --limit 5)"
+contains "journal result filter" '"entries"' "$(cb journal 1 --result success --limit 5)"
 
 echo "job reporting"
 # B062: gc and its dry run printed a bare job; the counts were only logged.
@@ -1927,6 +1930,8 @@ CHOICE_SWEEP=(
     "verify|1 --level bogus|option '--level' takes index, structure or deep, not 'bogus'"
     "objects|1 --location bogus|option '--location' takes staged, packed or all, not 'bogus'"
     "stats|1 --scope bogus|option '--scope' takes staged, not 'bogus'"
+    "journal|1 --result bogus|option '--result' takes success, failed, cancelled, warning or alert, not 'bogus'"
+    "journal|1 --result completed|option '--result' takes success, failed, cancelled, warning or alert, not 'completed'"
     "repo add|$WORK/sweep --encrypt SYSTEM|option '--encrypt' takes system, passphrase or none"
     "schedule add|1 backup --every fortnight --at 01:00|option '--every' takes day, week, month or year"
     "schedule add|1 backup 60 --on-overlap later|option '--on-overlap' takes skip, queue or cancel_running"
@@ -1935,7 +1940,7 @@ CHOICE_SWEEP=(
     "schedule add|1 backup --every day --at 24:00|--at takes a 24-hour HH:MM, not '24:00'"
     "schedule add|1 backup --every day --at noon|--at takes a 24-hour HH:MM"
     "schedule add|1 backup --every week --at 01:00|--every week needs --on WEEKDAY"
-    "schedule add|1 backup --every week --at 01:00 --on someday|--on takes a weekday name"
+    "schedule add|1 backup --every week --at 01:00 --on someday|--on takes a weekday, full or three letters"
     "schedule add|1 backup --every day --at 01:00 --on monday|--on names a weekday, which only --every week uses"
     "schedule add|1 backup --every month --at 01:00|--every month needs --on-day N"
     "schedule add|1 backup --every day --at 01:00 --on-day 3|--on-day is for --every month or year, not day"
@@ -1959,7 +1964,79 @@ check "and the state did not move for those either" "$STATE_BEFORE" "$(b127_stat
 # `all`, the daemon's default, is now in the CLI's list.
 contains "a weekday in capitals is accepted" '"id"' \
     "$(cb schedule add 1 gfs --every week --on Sunday --at 03:00)"
+# NIT-28: the three-letter form in any case, by the CLI and the daemon, and
+# stored as the full lowercase name the list serves back.
+contains "a three-letter weekday is accepted" '"id"' \
+    "$(cb schedule add 1 verify --every week --at 03:00 --on FRI)"
+contains "a mixed-case abbreviation is accepted" '"id"' \
+    "$(cb schedule add 1 verify --every week --at 03:00 --on Tue)"
+NIT28_LIST=$(cb schedule list 1)
+contains "an abbreviation is stored as the full name" '"on":"friday"' "$NIT28_LIST"
+contains "and in lowercase" '"on":"tuesday"' "$NIT28_LIST"
+contains "four letters is not an abbreviation" 'three letters in any case' \
+    "$(cb schedule add 1 verify --every week --at 03:00 --on tues 2>&1)"
 contains "objects --location all answers" '"objects"' "$(cb objects 1 --location all --limit 1)"
+
+# B154: packs and diff sent --limit and --offset and the daemon read
+# neither; journal dropped --offset. Its own repository, three backups each
+# changing every file, so there is more than one of everything to page.
+echo "every collection pages (B154)"
+mkdir -p "$WORK/pgsrc"
+PG=$(cb repo add "$WORK/pgrepo" paging | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
+for gen in one two three; do
+    for i in 1 2 3 4 5 6; do echo "$gen $i" > "$WORK/pgsrc/pgfile$i"; done
+    cb backup "$PG" "$WORK/pgsrc" >/dev/null
+done
+PG_S=$(cb snapshots "$PG" | grep -oE '"id":[0-9]+' | tr -dc '0-9\n' | sort -n)
+PG_S1=$(printf '%s\n' "$PG_S" | sed -n 1p)
+PG_S2=$(printf '%s\n' "$PG_S" | sed -n 2p)
+nth() { printf '%s' "$1" | grep -oE "\"$2\":(\"[^\"]*\"|[0-9]+)" | sed -n "${3}p"; }
+cnt() { printf '%s' "$1" | grep -oE "\"$2\":" | grep -c .; }
+
+PG_PK=$(cb packs "$PG" --limit 5000)
+PG_PK1=$(cb packs "$PG" --limit 1 --offset 1)
+check "packs --limit caps the page" 1 "$(cnt "$PG_PK1" filename)"
+check "packs --offset skips a pack" "$(nth "$PG_PK" filename 2)" "$(nth "$PG_PK1" filename 1)"
+OUT=$(cb packs "$PG" --limit 0 2>&1)
+contains "packs --limit names the maximum" 'from 1 to 5000' "$OUT"
+
+PG_DF=$(cb diff "$PG" "$PG_S1" "$PG_S2")
+PG_DF1=$(cb diff "$PG" "$PG_S1" "$PG_S2" --limit 1 --offset 2)
+check "diff --limit caps the page" 1 "$(cnt "$PG_DF1" change)"
+check "diff --offset skips two changes" "$(nth "$PG_DF" path 3)" "$(nth "$PG_DF1" path 1)"
+contains "diff counts every change on a page" '"modified":6' "$PG_DF1"
+OUT=$(cb diff "$PG" "$PG_S1" "$PG_S2" --limit 0 2>&1)
+contains "diff --limit names the maximum" 'from 1 to 5000' "$OUT"
+
+PG_J=$(cb journal "$PG" --limit 100)
+PG_J1=$(cb journal "$PG" --limit 2 --offset 1)
+check "journal --limit caps the page" 2 "$(cnt "$PG_J1" operation)"
+check "journal --offset skips the newest" "$(nth "$PG_J" id 2)" "$(nth "$PG_J1" id 1)"
+OUT=$(cb journal "$PG" --limit 0 2>&1)
+contains "journal --limit names the maximum" 'from 1 to 1000' "$OUT"
+contains "journal --result success filters" '"result":"success"' \
+    "$(cb journal "$PG" --result success --limit 1)"
+
+PG_OBJ=$(printf '%s' "$PG_DF1" | sed -n 's/.*"old_hash":"\([a-f0-9]*\)".*/\1/p')
+contains "object refs --offset skips" '"refs":[]' "$(cb object "$PG" "$PG_OBJ" refs --offset 1)"
+check "object refs --limit caps" 1 "$(cnt "$(cb object "$PG" "$PG_OBJ" refs --limit 1)" snap_id)"
+OUT=$(cb object "$PG" "$PG_OBJ" layout --limit 1 2>&1); RC=$?
+check "--limit on an object view that is not a list fails" 1 "$RC"
+contains "and says what it pages" 'page an object' "$OUT"
+PG_SR=$(cb search "$PG" pgfile --snapshot "$PG_S1")
+check "search finds the six files" 6 "$(cnt "$PG_SR" node_id)"
+check "search --offset skips" "$(nth "$PG_SR" path 2)" \
+    "$(nth "$(cb search "$PG" pgfile --snapshot "$PG_S1" --limit 1 --offset 1)" path 1)"
+for n in a b c; do cb tag set "$PG" "pg-$n" "$PG_S1" >/dev/null; done
+check "tag list --offset skips" '"name":"pg-b"' "$(nth "$(cb tag list "$PG" --limit 1 --offset 1)" name 1)"
+cb schedule add "$PG" gc 3600 >/dev/null
+cb schedule add "$PG" gc 7200 >/dev/null
+PG_SC=$(cb schedule list "$PG")
+check "schedule list --offset skips" "$(nth "$PG_SC" id 2)" \
+    "$(nth "$(cb schedule list "$PG" --limit 1 --offset 1)" id 1)"
+PG_RL=$(cb repo list)
+check "repo list --offset skips" "$(nth "$PG_RL" id 2)" "$(nth "$(cb repo list --limit 1 --offset 1)" id 1)"
+check "repo list --limit caps" 1 "$(cnt "$(cb repo list --limit 1)" uuid)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

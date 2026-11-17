@@ -38,6 +38,10 @@
 #include "store_index.h"
 #include "test_tmp.h"
 
+/* The prune markers, not packs/'s recorded identity (B156), which every
+ * backup's pack check writes. */
+#define NOT_IDENTITY " AND key <> 'packs-identity'"
+
 #define TEST_DIR  TEST_TMP "/c_backup_test_maint"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_REPO TEST_DIR "/repo"
@@ -227,7 +231,64 @@ static void test_prune_clears_its_marker(void **state)
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
     assert_int_equal(prune_snapshot(store, db, repo_id, br.snapshot_id), OK);
-    assert_int_equal(count("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?"), 0);
+    assert_int_equal(count("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?" NOT_IDENTITY), 0);
+}
+
+static void put_marker(int64_t snap)
+{
+    char repo[32], key[64], val[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(key, sizeof(key), "prune-pending-%lld", (long long)snap);
+    snprintf(val, sizeof(val), "%lld", (long long)snap);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO recovery_state (repo_id, key, value) VALUES (?, ?, ?)",
+        (const char *[]){ repo, key, val, NULL }, NULL), 0);
+}
+
+/*
+ * NIT-35: a power cut just after a prune returned can roll back the marker's
+ * removal, which was not durable yet, while the record is already gone. The
+ * next start must clear that marker without counting, or reporting, an
+ * interrupted prune.
+ */
+static void test_stale_prune_marker_is_cleared_quietly(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    assert_int_equal(prune_snapshot(store, db, repo_id, br.snapshot_id), OK);
+    put_marker(br.snapshot_id);
+
+    unsigned finished = 99;
+    assert_int_equal(prune_finish_pending(db, repo_id, &finished), OK);
+    assert_int_equal(finished, 0);
+    assert_int_equal(count("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?" NOT_IDENTITY), 0);
+}
+
+/* The case the marker exists for still counts: rows gone, record left. */
+static void test_interrupted_prune_is_finished_and_counted(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)br.snapshot_id);
+    assert_int_equal(db_execute_non_query(db,
+        "DELETE FROM snapshots WHERE repo_id = ? AND id = ?",
+        (const char *[]){ repo, snap, NULL }, NULL), 0);
+    put_marker(br.snapshot_id);
+
+    unsigned finished = 0;
+    assert_int_equal(prune_finish_pending(db, repo_id, &finished), OK);
+    assert_int_equal(finished, 1);
+    assert_int_equal(count("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?" NOT_IDENTITY), 0);
+    struct stat sb;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/snapshots/%s", TEST_REPO, snap);
+    assert_int_not_equal(stat(path, &sb), 0);
 }
 
 static void test_prune_of_unknown_snapshot_is_harmless(void **state)
@@ -480,7 +541,7 @@ static void test_checked_delete(void **state)
     err_clear();
     assert_int_equal(count_rows("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 1);
     assert_int_equal(count_rows("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 2);
-    assert_int_equal(count_rows("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?"), 0);
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?" NOT_IDENTITY), 0);
     char rec[256];
     snprintf(rec, sizeof(rec), TEST_REPO "/snapshots/%lld", (long long)br.snapshot_id);
     struct stat sb;
@@ -515,6 +576,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_gc_keeps_objects_shared_by_snapshots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_prune_removes_snapshot_and_rows, setup, teardown),
         cmocka_unit_test_setup_teardown(test_prune_clears_its_marker, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_stale_prune_marker_is_cleared_quietly, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_interrupted_prune_is_finished_and_counted, setup, teardown),
         cmocka_unit_test_setup_teardown(test_prune_of_unknown_snapshot_is_harmless, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_clears_pack_locations_for_swept_objects, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_refuses_to_sweep_on_unreadable_tree, setup, teardown),

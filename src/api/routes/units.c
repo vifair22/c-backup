@@ -22,6 +22,7 @@
  */
 
 #include "routes.h"
+#include "pack_presence.h"
 #include "json_row.h"
 
 #include "db_txn.h"
@@ -41,6 +42,7 @@
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -656,10 +658,10 @@ static api_response_t unit_policy_put(const api_request_t *req, int64_t repo_id,
         const char *val = cJSON_IsNumber(e) ? (snprintf(num, sizeof(num), "%.0f", e->valuedouble), num)
                         : (cJSON_IsString(e) && e->valuestring) ? e->valuestring : "";
         int rc = (!*val)
-            ? db_execute_non_query(g_db, "DELETE FROM unit_policy WHERE repo_id = ? AND unit_key = ?"
-                                         " AND key = ?",
-                                   (const char *[]){ repo, key, e->string, NULL }, NULL)
-            : db_execute_non_query(g_db,
+            ? db_write(g_db, "DELETE FROM unit_policy WHERE repo_id = ? AND unit_key = ?"
+                             " AND key = ?",
+                       (const char *[]){ repo, key, e->string, NULL }, NULL)
+            : db_write(g_db,
                   "INSERT INTO unit_policy (repo_id, unit_key, key, value) VALUES (?, ?, ?, ?)"
                   " ON CONFLICT(repo_id, unit_key, key) DO UPDATE SET value = excluded.value",
                   (const char *[]){ repo, key, e->string, val, NULL }, NULL);
@@ -703,7 +705,10 @@ static void units_job_free(void *p)
 static status_t open_store(const char *path, cutils_db_t *db, int64_t repo_id,
                            atomic_int *cancel, store_t **store, store_index_t **idx)
 {
-    status_t st = repo_store_open_keyed(path, NULL, store);
+    /* Before the open, which creates tmp/ (NIT-38). */
+    status_t st = pack_presence_require(db, repo_id);
+    if (st != OK) return st;
+    st = repo_store_open_keyed(path, NULL, store);
     if (st != OK) return st;
     st = store_index_bind(*store, db, repo_id, idx);
     if (st != OK) { store_close(*store); *store = NULL; return st; }
@@ -1062,11 +1067,14 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     const char *bad = NULL;
     if (!mode) mode = item ? "item" : "files";
     int unit_mode = strcmp(mode, "unit") == 0;
-    if (strcmp(mode, "files") != 0 && strcmp(mode, "item") != 0 && !unit_mode)
+    /* Settled now: mode points into o, which is freed before the job is
+     * submitted. */
+    int item_mode = strcmp(mode, "item") == 0;
+    if (strcmp(mode, "files") != 0 && !item_mode && !unit_mode)
         bad = "mode must be files, item or unit";
     else if (!unit_mode && (!dest || dest[0] != '/')) bad = "dest must be an absolute path";
     else if (unit_mode && dest) bad = "mode unit restores to the unit's own paths, or under target_root; it takes no dest";
-    else if (strcmp(mode, "item") == 0 && (!item || !*item)) bad = "item is required for mode item";
+    else if (item_mode && (!item || !*item)) bad = "item is required for mode item";
     else if (strcmp(mode, "files") == 0 && item) bad = "item applies only to mode item";
     else if (fmt && strcmp(fmt, "raw") != 0) bad = "format must be raw; qcow2 comes with the libvirt provider";
     else if (ow && !cJSON_IsBool(ow)) bad = "overwrite must be true or false";
@@ -1099,7 +1107,7 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     j->snap_id = snap_id;
     j->repo_path = repo_path_of(repo_id);
     j->dest = dest ? strdup(dest) : NULL;
-    j->item = (strcmp(mode, "item") == 0 && item) ? strdup(item) : NULL;
+    j->item = (item_mode && item) ? strdup(item) : NULL;
     j->overwrite = ow && cJSON_IsTrue(ow);
     j->unit_mode = unit_mode;
     if (unit_mode) {
@@ -1112,7 +1120,7 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
         if (!j->dest) j->dest = strdup("/");
     }
     cJSON_Delete(o);
-    if (!j->repo_path || !j->dest || (strcmp(mode, "item") == 0 && !j->item)) {
+    if (!j->repo_path || !j->dest || (item_mode && !j->item)) {
         urestore_free(j);
         return api_error(500, "out of memory");
     }

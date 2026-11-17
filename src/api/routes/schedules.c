@@ -14,6 +14,7 @@
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "db_write.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -109,16 +110,24 @@ static void add_stored_json(cJSON *obj, const char *key, const char *text)
 
 api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
 {
-    (void)req;
-    char repo[32];
+    /* Paged like every other collection (B154). The default is the
+     * maximum, so a client that does not page still gets every schedule a
+     * deployment has in practice; past that it pages rather than answering
+     * an unbounded list. */
+    int nlim = 0, noff = 0;
+    api_response_t page_err;
+    if (routes_paging(req, 1000, 1000, &nlim, &noff, &page_err) != 0) return page_err;
+    char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(lim, sizeof(lim), "%d", nlim);
+    snprintf(off, sizeof(off), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_db,
             "SELECT id, action, trigger_type, trigger_spec, on_overlap, catchup,"
             "       enabled, last_fired_at, next_due_at, params, disabled_reason"
-            "  FROM schedules WHERE repo_id = ? ORDER BY id",
-            (const char *[]){ repo, NULL }, &r) != 0) {
+            "  FROM schedules WHERE repo_id = ? ORDER BY id LIMIT ? OFFSET ?",
+            (const char *[]){ repo, lim, off, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list schedules");
     }
@@ -242,7 +251,7 @@ int routes_schedules_audit(cutils_db_t *db)
          * with the reason beside it, is a state the operator can see and
          * decide about.
          */
-        if (db_execute_non_query(db,
+        if (db_write(db,
                 "UPDATE schedules SET enabled = 0, disabled_reason = ? WHERE id = ?",
                 (const char *[]){ why, row[0], NULL }, NULL) != 0) {
             log_warn("schedules: cannot disable invalid schedule %s", row[0]);
@@ -608,9 +617,12 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
             return api_error(400, why);
     }
 
-    char due[32];
+    char due[32], created[32];
     time_t now = time(NULL);
-    snprintf(due, sizeof(due), "%lld", (long long)trigger_next_fire(&t, now, 0));
+    snprintf(due, sizeof(due), "%lld", (long long)trigger_next_fire(&t, now, now));
+    /* The interval anchor until the first fire (B155): without it every
+     * daemon start counted a never-fired schedule from that start. */
+    snprintf(created, sizeof(created), "%lld", (long long)now);
 
     /* A NULL in a c-utils params array terminates it rather than binding a
      * NULL column, so an absent params value is bound as an empty string and
@@ -619,14 +631,14 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
      * connection, and every thread shares one: another thread's insert
      * between the two statements handed this caller someone else's id. */
     db_result_t *r = NULL;
-    if (db_execute(g_db,
+    if (db_write_returning(g_db,
             "INSERT INTO schedules (repo_id, action, params, trigger_type, trigger_spec,"
-            " on_overlap, catchup, enabled, next_due_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?) RETURNING id",
+            " on_overlap, catchup, enabled, next_due_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?) RETURNING id",
             (const char *[]){ repo, action, params ? params : "",
                               t.type == TRIGGER_INTERVAL ? "interval" : "calendar",
                               spec, overlap ? overlap : "skip",
-                              catchup ? catchup : "skip", due, NULL }, &r) != 0 ||
+                              catchup ? catchup : "skip", due, created, NULL }, &r) != 0 ||
         !r || r->nrows != 1) {
         db_result_free(r);
         return api_error(500, "cannot create schedule");
@@ -703,7 +715,7 @@ api_response_t schedules_patch(const api_request_t *req, int64_t repo_id,
      * clears the daemon's reason: off is now someone's decision, and on
      * passed the check above. */
     int changed = 0;
-    if (db_execute_non_query(g_db,
+    if (db_write(g_db,
             "UPDATE schedules SET enabled = ?, disabled_reason = NULL"
             " WHERE repo_id = ? AND id = ?",
             (const char *[]){ en, repo, sid, NULL }, &changed) != 0)
@@ -727,7 +739,7 @@ api_response_t schedules_delete(const api_request_t *req, int64_t repo_id,
     snprintf(sid,  sizeof(sid),  "%lld", (long long)schedule_id);
 
     int removed = 0;
-    if (db_execute_non_query(g_db,
+    if (db_write(g_db,
             "DELETE FROM schedules WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, sid, NULL }, &removed) != 0)
         return api_error(500, "cannot delete schedule");

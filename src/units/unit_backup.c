@@ -3,6 +3,7 @@
 #include "unit_backup.h"
 #include "backup.h"
 #include "block_source.h"
+#include "db_txn.h"
 #include "registry.h"
 #include "remote_provider.h"
 #include "reserved.h"
@@ -1205,7 +1206,25 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     snprintf(why, sizeof(why), "%s", st != OK ? err_msg() : "");
     /* Committed is about the snapshot: one that a failed audit then fails
      * is still committed, and its checkpoint settles as such. */
-    status_t est = ops->end(u.sess, snap > 0 ? SP_END_COMMITTED : SP_END_ABORTED, snap);
+    sp_end_outcome_t outcome = snap > 0 ? SP_END_COMMITTED : SP_END_ABORTED;
+    /*
+     * Committing settles the session's new checkpoint on the domain and
+     * retires the old one, which no power cut on this host undoes, and the
+     * token rows binding the new one are only in the WAL (B152). A cut
+     * between the two kept the checkpoint and lost its binding: the next
+     * session read in full, safely, and nothing ever retired the orphan.
+     * So the binding is made durable first. If it cannot be, the new
+     * checkpoint is not settled: the rows naming it then name nothing, and
+     * the next session reads in full and makes another.
+     */
+    if (outcome == SP_END_COMMITTED && u.info->new_token && *u.info->new_token &&
+        db_txn_make_durable(db) != OK) {
+        log_warn("unit %s: the checkpoint binding is not durable (%s); its new checkpoint is "
+                 "discarded and the next session reads in full", key, err_msg());
+        err_clear();
+        outcome = SP_END_ABORTED;
+    }
+    status_t est = ops->end(u.sess, outcome, snap);
     if (est != OK) {
         /* Never fails a snapshot that committed: the sweep has the rows. */
         log_warn("unit %s: releasing the session failed: %s; the sweep will retry",

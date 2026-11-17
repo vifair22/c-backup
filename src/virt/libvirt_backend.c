@@ -238,8 +238,15 @@ static status_t domain(struct sp_ctx *c, const char *uuid, virDomainPtr *out)
     status_t st = conn_ok(c);
     if (st != OK) return st;
     *out = virDomainLookupByUUIDString(c->conn, uuid);
-    if (!*out && conn_lost(c)) *out = virDomainLookupByUUIDString(c->conn, uuid);
-    if (!*out) return set_error(ERR_NOT_FOUND, "libvirt: no domain %s: %s", uuid, verr());
+    /* Read before conn_lost: every libvirt call resets the last error. */
+    int code = *out ? 0 : virGetLastErrorCode();
+    if (!*out && conn_lost(c)) {
+        *out = virDomainLookupByUUIDString(c->conn, uuid);
+        code = *out ? 0 : virGetLastErrorCode();
+    }
+    /* Not found only when libvirt said so; a failed call is not an answer. */
+    if (!*out) return set_error(code == VIR_ERR_NO_DOMAIN ? ERR_NOT_FOUND : ERR_IO,
+                                "libvirt: no domain %s", uuid);
     return OK;
 }
 
@@ -1160,7 +1167,7 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
     /* Freeze for the begin alone, with a watchdog, thawed in every path. */
     int want_freeze = agent && c->pol->vm_freeze != 1;
     if (!agent && c->pol->vm_freeze == 2) { st = set_error(ERR_INVALID, "libvirt: freeze is required and the guest agent is not connected"); goto out; }
-    int frozen = 0;
+    int frozen = 0, lost = 0;
     int64_t fhold = 0;
     freeze_wd_t wd = { s->dom, c->pol->vm_freeze_timeout_s, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0 };
     pthread_t wth;
@@ -1170,7 +1177,7 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
         if (s->has_holds && (st = s->holds.record(s->holds.ctx, SP_HOLD_FREEZE, detail, &fhold)) != OK) goto out;
         wd_on = pthread_create(&wth, NULL, freeze_watchdog, &wd) == 0;
         int n = virDomainFSFreeze(s->dom, NULL, 0, 0);
-        if (n >= 0) frozen = 1;
+        if (n >= 0) frozen = n > 0 ? 2 : 1;   /* 2: filesystems a thaw can count */
         else {
             (void)sp_session_info_warn(&s->info, "the guest agent did not freeze: %.300s", verr());
             if (c->pol->vm_freeze == 2) st = set_error(ERR_IO, "libvirt: freeze is required and failed: %s", verr());
@@ -1216,9 +1223,13 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
         pthread_cond_broadcast(&wd.cv);
         pthread_mutex_unlock(&wd.mu);
         if (wd_on) pthread_join(wth, NULL);
-        /* Always thaw: harmless on a guest that is not frozen. */
-        if (virDomainFSThaw(s->dom, NULL, 0, 0) < 0 && frozen)
+        /* Always thaw: harmless on a guest that is not frozen. One that
+         * froze filesystems and now thaws none was thawed already, by the
+         * helper's watchdog, perhaps before the backup began. */
+        int t = virDomainFSThaw(s->dom, NULL, 0, 0);
+        if (t < 0 && frozen)
             log_warn("libvirt: thaw of %s: %s", s->uuid, verr());
+        lost = frozen == 2 && !wd.thawed && t == 0;
         if (s->has_holds && fhold && s->holds.clear(s->holds.ctx, fhold) != OK) err_clear();
     }
     if (began) s->online = 1;
@@ -1269,11 +1280,15 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
         set_error(st, "%s", keep);
         goto out;
     }
-    int quiesced = frozen && !wd.thawed;
+    int quiesced = frozen && !wd.thawed && !lost;
     if (frozen && wd.thawed)
         (void)sp_session_info_warn(&s->info, "freeze held past %u s; thawed before backup start", c->pol->vm_freeze_timeout_s);
+    if (lost)
+        (void)sp_session_info_warn(&s->info, "freeze released by the watchdog at %u s, perhaps before backup "
+                                   "start; consistency is crash, not quiesced", c->pol->max_pause_s);
     s->info.achieved = quiesced ? SP_CONSIST_QUIESCED : SP_CONSIST_CRASH;
     s->info.consist_flags |= quiesced ? SP_CF_FROZEN : 0;
+    s->info.consist_flags |= frozen && (wd.thawed || lost) ? SP_CF_WATCHDOG_RELEASED : 0;
     if (!agent) (void)sp_session_info_warn(&s->info, "no guest agent connected; crash-consistent");
 out:
     if (st != OK) {
@@ -1459,9 +1474,26 @@ static void kill_by_socket(const char *sock)
     closedir(d);
 }
 
+/*
+ * Only a lookup libvirt answered proves a domain gone. A connection that
+ * cannot be made (no libvirt on this host, libvirtd down or restarting)
+ * proves nothing: a hold it names is kept for the next sweep, not dropped
+ * as if its domain had gone, which left a frozen guest frozen and threw
+ * away checkpoint records.
+ */
 static status_t v_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_t *out)
 {
     memset(out, 0, sizeof(*out));
+    int down = 0;
+    for (size_t i = 0; i < req->n_intents && !down; i++) {
+        if (strncmp(req->intents[i].detail, "qemu-nbd:", 9) == 0) continue;
+        if (conn_ok(c) != OK) {
+            log_warn("libvirt: sweep: %s; its holds are kept for the next sweep", err_msg());
+            err_clear();
+            down = 1;
+        }
+        break;
+    }
     for (size_t i = 0; i < req->n_intents; i++) {
         const sp_intent_t *in = &req->intents[i];
         status_t st = OK;
@@ -1478,26 +1510,38 @@ static status_t v_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
             if (!colon || (size_t)(colon - u) >= sizeof(uuid)) st = set_error(ERR_INVALID, "libvirt: bad hold %s", in->detail);
             else {
                 snprintf(uuid, sizeof(uuid), "%.*s", (int)(colon - u), u);
-                if (domain(c, uuid, &dom) == OK) {
+                status_t ds = down ? ERR_IO : domain(c, uuid, &dom);
+                if (ds == OK) {
                     st = cp_delete(c, dom, uuid, colon + 1);
                     virDomainFree(dom);
-                } else {
+                } else if (ds == ERR_NOT_FOUND) {
                     err_clear();
                     rec_drop(c, uuid, colon + 1);
+                } else {
+                    st = ds;
                 }
             }
         } else if (strncmp(in->detail, "libvirt-backup:", 15) == 0 || strncmp(in->detail, "freeze:", 7) == 0) {
             const char *uuid = strchr(in->detail, ':') + 1;
+            int freeze = strncmp(in->detail, "freeze:", 7) == 0;
             virDomainPtr dom = NULL;
-            if (domain(c, uuid, &dom) == OK) {
-                if (strncmp(in->detail, "freeze:", 7) == 0) (void)virDomainFSThaw(dom, NULL, 0, 0);
-                else {
+            /* A freeze is absent unless a thaw counted filesystems: the
+             * watchdog then keeps it, as it may be frozen in a moment
+             * (provider.h). A gone domain holds nothing. */
+            if (freeze && req->absent) req->absent[i] = 1;
+            status_t ds = down ? ERR_IO : domain(c, uuid, &dom);
+            if (ds == OK) {
+                if (freeze) {
+                    if (virDomainFSThaw(dom, NULL, 0, 0) > 0 && req->absent) req->absent[i] = 0;
+                } else {
                     virDomainJobInfo ji;
                     if (virDomainGetJobInfo(dom, &ji) == 0 && ji.type != VIR_DOMAIN_JOB_NONE) (void)virDomainAbortJob(dom);
                 }
                 virDomainFree(dom);
-            } else {
+            } else if (ds == ERR_NOT_FOUND) {
                 err_clear();         /* the domain is gone: nothing held */
+            } else {
+                st = ds;             /* libvirt unreachable: kept */
             }
         } else {
             st = set_error(ERR_INVALID, "libvirt: unknown hold %s", in->detail);

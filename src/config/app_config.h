@@ -147,7 +147,18 @@ static const config_key_t app_file_keys[] = {
       "state.db page cache, MiB (2 to 65536)",
       CFG_STORE_FILE, 0 },
     { "db.wal_autocheckpoint", CFG_INT, "16384",
-      "state.db pages written between automatic checkpoints (1000 to 1048576)",
+      "state.db log pages that start a background checkpoint (1000 to 1048576)",
+      CFG_STORE_FILE, 0 },
+
+    /* The mass-loss brake (B150): more packs than this missing at once and
+     * nothing is marked absent until an operator's repair accepts it. */
+    { "index.missing_brake_pct", CFG_INT, "5",
+      "Missing packs, as a percentage of a repository's, above which none is marked "
+      "absent without 'repo repair --accept-missing'; counts from two missing (0 to 100)",
+      CFG_STORE_FILE, 0 },
+    { "index.missing_brake_packs", CFG_INT, "10",
+      "Missing packs above which none is marked absent without 'repo repair "
+      "--accept-missing' (0 to 1000000)",
       CFG_STORE_FILE, 0 },
 
     /* What a retention pass keeps for a repository that has not set its own
@@ -243,6 +254,7 @@ static const config_section_t app_sections[] = {
     { "units",      "Units (VMs and containers)" },
     { "vm",         "Virtual Machines" },
     { "containers", "Containers" },
+    { "index",      "Index Integrity" },
     { NULL, NULL }
 };
 

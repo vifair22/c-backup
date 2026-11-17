@@ -259,6 +259,48 @@ static void test_clean_repo_verifies_clean(void **state)
     assert_true(res.bytes_read > 0);
 }
 
+typedef struct {
+    char     phase[32];
+    uint64_t done, total;
+    int      calls;
+} last_progress_t;
+
+static void record_progress(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    last_progress_t *lp = ctx;
+    snprintf(lp->phase, sizeof(lp->phase), "%s", phase);
+    lp->done = done;
+    lp->total = total;
+    lp->calls++;
+}
+
+/*
+ * A finished run's last progress report is N of N at every level. The
+ * object walk reported each object before checking it, so an index verify,
+ * which has no later phase, ended every job at N-1 of N (NIT-33).
+ */
+static void test_progress_ends_at_total(void **state)
+{
+    (void)state;
+    run_backup();
+    const verify_level_t levels[3] = { VERIFY_LEVEL_INDEX, VERIFY_LEVEL_STRUCTURE,
+                                       VERIFY_LEVEL_DEEP };
+    for (int l = 0; l < 3; l++) {
+        last_progress_t lp;
+        memset(&lp, 0, sizeof(lp));
+        verify_result_t res;
+        assert_int_equal(verify_run(store, db, repo_id, levels[l], 0, NULL,
+                                    record_progress, &lp, &res), OK);
+        assert_true(lp.calls > 0);
+        assert_true(lp.total > 0);
+        assert_int_equal(lp.done, lp.total);
+        if (levels[l] == VERIFY_LEVEL_INDEX) {
+            assert_string_equal(lp.phase, "index");
+            assert_int_equal(lp.total, res.checked);
+        }
+    }
+}
+
 /*
  * The point of the whole feature: damage that nothing has read yet is found,
  * corrected from parity, and the correction is written to disk.
@@ -1026,31 +1068,55 @@ static void test_unwalkable_pack_is_reported_until_repaired(void **state)
     uint32_t pnum = 0;
     uint64_t off = 0;
     assert_int_equal(pack_resolve_location(store, h200, &pnum, &off), OK);
-    uint64_t g = e.entry / PARITY_GROUP_DATA;
 
-    /* The headers in f200's group, every one of a file still in snapshot 2,
-     * so the index keeps a row for each through the first gc's sweep. */
+    /*
+     * The headers of one group, every one of a file still in snapshot 2, so
+     * the index keeps a row for each through the first gc's sweep and the
+     * repair can rebuild them. Which group: the one holding the most such
+     * headers. The pack's order follows the scan's inode order, which
+     * depends on the filesystem and on which inodes earlier tests freed, so
+     * f200's own group could hold a file snapshot 2 deleted, or a tree, and
+     * asserting it did not failed on a CI runner whose layout differed.
+     * Only snapshot 2's headers are damaged; anything else in the group is
+     * left as it is.
+     */
     char pk[32];
     snprintf(pk, sizeof(pk), "%u", pnum);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
         "SELECT hash, offset FROM pack_objects WHERE pack_id = ? ORDER BY offset",
         (const char *[]){ pk, NULL }, &r), 0);
+    assert_true(r->nrows > 0);
+    uint64_t ngroups = strtoull(r->rows[r->nrows - 1][1], NULL, 10) / PARITY_GROUP_DATA + 1;
+    uint32_t *live = calloc((size_t)ngroups, sizeof(*live));
+    uint8_t  *in_s2 = calloc((size_t)r->nrows, 1);
+    assert_non_null(live);
+    assert_non_null(in_s2);
+    for (int i = 0; i < r->nrows; i++) {
+        uint64_t o = strtoull(r->rows[i][1], NULL, 10);
+        if (o / PARITY_GROUP_DATA != (o + sizeof(pack_dat_entry_hdr_t) - 1) / PARITY_GROUP_DATA)
+            continue;
+        if (snap_count_of(s2, r->rows[i][0]) == 0) continue;
+        in_s2[i] = 1;
+        live[o / PARITY_GROUP_DATA]++;
+    }
+    uint64_t g = 0;
+    for (uint64_t k = 1; k < ngroups; k++)
+        if (live[k] > live[g]) g = k;
+    free(live);
     int fd = open(e.path, O_RDWR);
     assert_true(fd >= 0);
     size_t damaged_bytes = 0;
     for (int i = 0; i < r->nrows; i++) {
         uint64_t o = strtoull(r->rows[i][1], NULL, 10);
-        if (o / PARITY_GROUP_DATA != g ||
-            (o + sizeof(pack_dat_entry_hdr_t) - 1) / PARITY_GROUP_DATA != g)
-            continue;
-        assert_true(snap_count_of(s2, r->rows[i][0]) > 0);
+        if (!in_s2[i] || o / PARITY_GROUP_DATA != g) continue;
         uint8_t b[sizeof(pack_dat_entry_hdr_t)];
         assert_int_equal(pread(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
         for (size_t k = 0; k < sizeof(b); k++) b[k] ^= 0x5A;
         assert_int_equal(pwrite(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
         damaged_bytes += sizeof(b);
     }
+    free(in_s2);
     close(fd);
     db_result_free(r);
     /* Far past the 512 bytes a group corrects. */
@@ -1100,6 +1166,10 @@ static void test_unwalkable_pack_is_reported_until_repaired(void **state)
     assert_int_equal(vr.packs_unwalkable, 0);
     assert_int_equal(vr.unrecoverable, 0);
     assert_int_equal(verify_finding_count(pname, "repaired"), 1);
+    /* The restored pack is a repaired item in the totals (NIT-30). */
+    assert_true(vr.repaired >= 1);
+    assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                 vr.unrecoverable + vr.missing);
 
     memset(&vr, 0, sizeof(vr));
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr),
@@ -1633,6 +1703,21 @@ static void xor_bytes(const char *path, off_t off, size_t n)
     store_dat_cache_flush(store);
 }
 
+/* A column of a run's record, as GET /repos/<id>/verify and the CLI read it. */
+static uint64_t run_count(int64_t run_id, const char *col)
+{
+    char sql[128], run[32];
+    snprintf(sql, sizeof(sql), "SELECT %s FROM verify_runs WHERE id = ?", col);
+    snprintf(run, sizeof(run), "%lld", (long long)run_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, sql, (const char *[]){ run, NULL }, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    uint64_t v = strtoull(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return v;
+}
+
 /* Where the CRC table starts, from the pack's last tail. */
 static uint64_t crc_table_off(const uint8_t *f, size_t len)
 {
@@ -1685,6 +1770,14 @@ static void test_pack_structure_damage_is_reported_and_repaired(void **state)
             assert_int_equal(vr.pack_structures_recoverable, 1);
             assert_int_equal(vr.pack_structures_repaired, 0);
             assert_int_equal(vr.packs_unwalkable, 0);
+            /* The totals the run record, the CLI and the metrics show carry
+             * it, and still add up (NIT-30). */
+            assert_int_equal(vr.recoverable, 1);
+            assert_int_equal(vr.repaired, 0);
+            assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                         vr.unrecoverable + vr.missing);
+            assert_int_equal(run_count(vr.run_id, "recoverable"), 1);
+            assert_int_equal(run_count(vr.run_id, "repaired"), 0);
             char st[64];
             finding_status_of(pname, st, sizeof(st));
             assert_string_equal(st, "recoverable");
@@ -1694,6 +1787,11 @@ static void test_pack_structure_damage_is_reported_and_repaired(void **state)
         assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 1, NULL, NULL, NULL,
                                     &vr), OK);
         assert_int_equal(vr.pack_structures_repaired, 1);
+        assert_int_equal(vr.repaired, 1);
+        assert_int_equal(vr.recoverable, 0);
+        assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                     vr.unrecoverable + vr.missing);
+        assert_int_equal(run_count(vr.run_id, "repaired"), 1);
         assert_file_is(e.path, orig, olen);
         memset(&vr, 0, sizeof(vr));
         assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0, NULL, NULL, NULL,
@@ -1709,6 +1807,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_clean_repo_verifies_clean, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_progress_ends_at_total, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deep_verify_repairs_payload_damage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_without_repair_leaves_disk_untouched, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unrecoverable_damage_names_the_affected_files, setup, teardown),

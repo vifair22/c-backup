@@ -38,6 +38,7 @@
 #include <cmocka.h>
 #include <cutils/db.h>
 
+#include "db_txn.h"
 #include "fake_provider.h"
 #include "prune.h"
 #include "registry.h"
@@ -274,6 +275,60 @@ static void force_audit(void)
                                           (const char *[]){ repo, KEY, NULL }, NULL), 0);
 }
 
+/*
+ * B152: committing a session settles its new checkpoint on the domain,
+ * which a power cut on the daemon's host cannot undo, so the token rows
+ * binding it have to be durable first. The fake cannot show the orphan a
+ * lost binding leaves (it keeps one checkpoint), so this checks the order:
+ * by the time end commits, a make_durable has completed since the
+ * session's token rows, and those rows name the checkpoint end settles.
+ */
+typedef struct {
+    unsigned long durable;   /* make_durable calls completed at end */
+    int           committed;
+    int           calls;
+    char          token[128];
+} end_seen_t;
+
+static void at_end(void *ctx, int committed)
+{
+    end_seen_t *e = ctx;
+    e->calls++;
+    e->committed = committed;
+    e->durable = db_txn_durable_count();
+    db_result_t *r = NULL;
+    e->token[0] = '\0';
+    if (db_execute(db, "SELECT token FROM unit_tokens WHERE repo_id = ? AND unit_key = ?"
+                       " AND item_id = 'vdb'", (const char *[]){ repo, KEY, NULL }, &r) == 0 &&
+        r && r->nrows == 1)
+        snprintf(e->token, sizeof(e->token), "%s", r->rows[0][0]);
+    db_result_free(r);
+}
+
+static void test_binding_durable_before_commit(void **state)
+{
+    (void)state;
+    end_seen_t e;
+    for (int session = 0; session < 2; session++) {
+        if (session == 1) write_and_define(5 * M + 100, 4096, 902);
+        memset(&e, 0, sizeof(e));
+        unsigned long before = db_txn_durable_count();
+        fake_end_observe(fk, at_end, &e);
+        sess_t s = expect(session == 0 ? "full" : "incremental", NULL);
+        fake_end_observe(fk, NULL, NULL);
+        assert_int_equal(e.calls, 1);
+        assert_true(e.committed);
+        if (e.durable <= before)
+            fail_msg("session %d: end committed with no make_durable since the token rows", session);
+        /* The binding end's commit relies on is the one already in the
+         * index: the checkpoint it settles. */
+        char cp[64];
+        assert_int_equal(fake_unit_checkpoint(fk, "v1", cp, sizeof(cp)), OK);
+        assert_string_equal(e.token, cp);
+        verify(s.snap);
+    }
+}
+
 static void test_chain(void **state)
 {
     (void)state;
@@ -508,6 +563,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_chain, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_binding_durable_before_commit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_staleness, setup, teardown),
         cmocka_unit_test_setup_teardown(test_off_and_offline, setup, teardown),
         cmocka_unit_test_setup_teardown(test_audit_failure, setup, teardown),

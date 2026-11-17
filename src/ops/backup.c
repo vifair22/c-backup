@@ -12,6 +12,7 @@
 #include "object.h"
 #include "scan.h"
 #include "store_index.h"
+#include "pack_presence.h"
 #include "store_pool.h"
 #include "small_files.h"
 #include "settle.h"
@@ -24,6 +25,7 @@
 #include "snapshot_ids.h"
 #include "tree_build.h"
 #include "reserved.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -84,8 +86,7 @@ typedef struct {
 typedef struct {
     int      in_txn;
     uint32_t since_commit;
-    uint64_t opened_ns;           /* phase_now() at the batch's BEGIN */
-    uint64_t contended_until_ns;  /* B107's rules apply until then */
+    db_txn_batch_t rule;          /* when to let the lock go (db_txn.h) */
 } batch_t;
 
 typedef struct {
@@ -639,8 +640,8 @@ static void scan_progress(uint32_t scanned, void *ctx)
  *     before B107, and is held across large files and pool waits.
  *   - A writer queues: the batch ends at the next check, so it waits for
  *     one entry or one read at most, and the batch becomes contended for
- *     BATCH_CONTENDED_MS from the last time a waiter was seen.
- *   - Contended: B107's rules - commit after BATCH_CONTENDED_HOLD_MS, and
+ *     DB_TXN_BATCH_CONTENDED_MS from the last time a waiter was seen.
+ *   - Contended: B107's rules - commit after DB_TXN_BATCH_HOLD_MS, and
  *     let go before reading a file of BATCH_YIELD_BYTES or more and before
  *     waiting on the workers - rather than letting go at every check.
  *
@@ -653,8 +654,9 @@ static void scan_progress(uint32_t scanned, void *ctx)
  * so of B107's, not a sync per large file for the rest of the backup.
  */
 #define BATCH_ENTRIES           2000
-#define BATCH_CONTENDED_MS      1000
-#define BATCH_CONTENDED_HOLD_MS 200
+/* The waiter and contended rules themselves are db_txn's
+ * (db_txn_batch_should_end), shared with the pack commit, so the two
+ * holders that run side by side in a backup cannot drift apart. */
 #define BATCH_YIELD_BYTES       ((uint64_t)4 << 20)
 
 static void batch_open(pipeline_t *p, batch_t *b)
@@ -663,12 +665,12 @@ static void batch_open(pipeline_t *p, batch_t *b)
     if (db_txn_begin(p->db) == OK) b->in_txn = 1;
     else err_clear();
     b->since_commit = 0;
-    b->opened_ns = phase_now();
+    db_txn_batch_opened(&b->rule);
 }
 
 static int batch_contended(const batch_t *b)
 {
-    return b->contended_until_ns > phase_now();
+    return db_txn_batch_contended(&b->rule);
 }
 
 static void batch_close(pipeline_t *p, batch_t *b)
@@ -681,31 +683,14 @@ static void batch_close(pipeline_t *p, batch_t *b)
 }
 
 /*
- * Whether an open batch should end at this check point: somebody newly wants
- * the lock, or it is contended and has been held for BATCH_CONTENDED_HOLD_MS.
- * Updates the contended state. Shared by batch_yield and index_nodes, which
- * commits through its own path because it has to return a failed commit.
- */
-static int batch_should_end(batch_t *b)
-{
-    uint64_t now = phase_now();
-    if (db_txn_waiters() > 0) {
-        int was = b->contended_until_ns > now;
-        b->contended_until_ns = now + (uint64_t)BATCH_CONTENDED_MS * 1000000ULL;
-        if (!was) return 1;
-    }
-    return b->contended_until_ns > now &&
-           now - b->opened_ns >= (uint64_t)BATCH_CONTENDED_HOLD_MS * 1000000ULL;
-}
-
-/*
- * A check point: let the batch go if batch_should_end says so. A waiter's
+ * A check point: let the batch go if somebody newly wants the lock, or if it
+ * is contended and has been held for DB_TXN_BATCH_HOLD_MS. A waiter's
  * transaction runs next, and this thread's next batch_open queues behind it.
  */
 static void batch_yield(pipeline_t *p, batch_t *b)
 {
     if (!b->in_txn) return;
-    if (batch_should_end(b)) batch_close(p, b);
+    if (db_txn_batch_should_end(&b->rule)) batch_close(p, b);
 }
 
 /* One entry recorded: end the batch at its size, or for a waiter. */
@@ -2115,7 +2100,7 @@ static status_t allocate_snapshot_id(cutils_db_t *db, store_t *store,
 
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)next);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO snapshot_id_seq (repo_id, last_id) VALUES (?, ?)"
             " ON CONFLICT(repo_id) DO UPDATE SET last_id = excluded.last_id",
             (const char *[]){ repo, id, NULL }, NULL) != 0) {
@@ -2227,10 +2212,11 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
      * rows that no snapshot claims - index garbage a reindex rebuilds, which
      * is the state eviction already produces deliberately.
      *
-     * And it yields to a queued writer by the store batch's rules, at every
-     * row (B144). It only ended at NODE_BATCH rows, so a tag or sources write
-     * that queued during indexing waited for up to 2,000 node and FTS
-     * inserts: about 80 ms on an idle host, 700 ms with the CPU contended,
+     * And it yields to a queued writer by the rule every batch uses
+     * (db_txn_batch_should_end), at every row (B144). It only ended at
+     * NODE_BATCH rows, so a tag or sources write that queued during
+     * indexing waited for up to 2,000 node and FTS inserts: about 80 ms
+     * on an idle host, 700 ms with the CPU contended,
      * and past the 2 s test bound under disk pressure, against Manual 6.3's
      * "well under a second". Each extra commit is one more batch boundary of
      * the kind above, so nothing about nodes_materialized changes.
@@ -2241,7 +2227,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
     p->timers->txn_site = PHASE_COMMIT_INDEX;
     status_t bst = db_txn_begin(p->db);
     if (bst != OK) return bst;
-    nb.opened_ns = phase_now();
+    db_txn_batch_opened(&nb.rule);
 
     for (uint32_t i = 0; i < p->count; i++) {
         /* In no tree, so in no index row either: the index is derived from
@@ -2310,7 +2296,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         snprintf(dmaj, sizeof(dmaj), "%u", is_dev ? e->node.device.major : 0u);
         snprintf(dmin, sizeof(dmin), "%u", is_dev ? e->node.device.minor : 0u);
 
-        int rc = db_execute_non_query(p->db,
+        int rc = db_write(p->db,
                 "INSERT INTO nodes"
                 " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
                 "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
@@ -2328,7 +2314,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                                    * exactly what an index consistency check
                                    * is looking for. */
                                   (is_dir || hash_is_zero(e->node.content_hash))
-                                      ? "" : chex,
+                          ? "" : chex,
                                   is_dir ? shex : "",
                                   ltarget, hgroup,
                                   hash_is_zero(e->node.xattr_hash) ? "" : xhex,
@@ -2339,7 +2325,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
             return set_error(ERR_IO, "index_nodes: insert failed");
         }
 
-        if (db_execute_non_query(p->db,
+        if (db_write(p->db,
                 "INSERT INTO node_fts (name, node_id, snap_id, repo_id)"
                 " VALUES (?, ?, ?, ?)",
                 (const char *[]){ name, id, snap, repo, NULL }, NULL) != 0) {
@@ -2347,13 +2333,13 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
             return set_error(ERR_IO, "index_nodes: fts insert failed");
         }
 
-        if (++nb.since_commit >= NODE_BATCH || batch_should_end(&nb)) {
+        if (++nb.since_commit >= NODE_BATCH || db_txn_batch_should_end(&nb.rule)) {
             status_t cst = db_txn_commit(p->db);
             if (cst != OK) return cst;
             nb.since_commit = 0;
             cst = db_txn_begin(p->db);
             if (cst != OK) return cst;
-            nb.opened_ns = phase_now();
+            db_txn_batch_opened(&nb.rule);
         }
     }
 
@@ -2438,6 +2424,30 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_INVALID, "%s", SNAPSHOT_LABEL_RULE);
 
     status_t st = check_sources(opts);
+    if (st != OK) return st;
+
+    /*
+     * Before dedup can trust the index, every pack it names has to be there
+     * (B150): a missing pack's objects are marked absent here, so this run
+     * stores them again rather than referencing bytes that are gone. An
+     * unavailable or degraded repository takes no backup at all.
+     */
+    pack_presence_t pp;
+    st = pack_presence_check(db, repo_id, 0, &pp);
+    if (st != OK) return st;
+    if (pp.unavailable)
+        return set_error(ERR_UNAVAILABLE, PACK_PRESENCE_UNAVAILABLE_FMT,
+                         (long long)repo_id, pp.why);
+    if (pp.degraded) {
+        char why[256] = "";
+        (void)pack_presence_degraded(db, repo_id, why, sizeof(why));
+        return set_error(ERR_INVALID, PACK_PRESENCE_DEGRADED_ADVICE,
+                         (long long)repo_id, why, (long long)repo_id);
+    }
+
+    /* The pack-number mark's write, now rather than at the first pack,
+     * which opens while an index batch holds the database's write lock. */
+    st = pack_reserve_numbers(store);
     if (st != OK) return st;
 
     /*
@@ -2758,7 +2768,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
             if (db_txn_begin(db) == OK) txn = 1;
             else st = set_error(ERR_IO, "backup_run: cannot begin the snapshot row");
         }
-        if (st == OK && db_execute_non_query(db,
+        if (st == OK && db_write(db,
                 "INSERT INTO snapshots (repo_id, id, ts, label, file_count,"
                 " total_size, completed_at, root_tree_hash, nodes_materialized)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",

@@ -401,6 +401,11 @@ static void test_calendar_check(void **state)
     cal_ok("day", "23:59", NULL, NULL, NULL);
     cal_ok("week", "03:00", "sunday", NULL, NULL);
     cal_ok("week", "03:00", "MONDAY", NULL, NULL);
+    /* NIT-28: three letters, any case. */
+    cal_ok("week", "03:00", "sun", NULL, NULL);
+    cal_ok("week", "03:00", "Sun", NULL, NULL);
+    cal_ok("week", "03:00", "SUN", NULL, NULL);
+    cal_ok("week", "03:00", "sat", NULL, NULL);
     cal_ok("month", "05:00", NULL, "1", NULL);
     cal_ok("year", "05:00", NULL, "29", "2");
 
@@ -416,8 +421,9 @@ static void test_calendar_check(void **state)
     cal_bad("day", "noon", NULL, NULL, NULL, "not 'noon'");
     cal_bad("day", "12", NULL, NULL, NULL, "not '12'");
     cal_bad("week", "03:00", NULL, NULL, NULL, "--every week needs --on WEEKDAY");
-    cal_bad("week", "03:00", "funday", NULL, NULL, "--on takes a weekday name");
-    cal_bad("week", "03:00", "sun", NULL, NULL, "not 'sun'");
+    cal_bad("week", "03:00", "funday", NULL, NULL, "--on takes a weekday, full or three letters");
+    cal_bad("week", "03:00", "sund", NULL, NULL, "not 'sund'");
+    cal_bad("week", "03:00", "su", NULL, NULL, "three letters in any case");
     cal_bad("day", "03:00", "monday", NULL, NULL, "only --every week uses");
     cal_bad("month", "03:00", "monday", "1", NULL, "only --every week uses");
     cal_bad("month", "03:00", NULL, NULL, NULL, "--every month needs --on-day N");

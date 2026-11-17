@@ -945,6 +945,23 @@ would redefine as a side effect); and a sweep of checkpoints that carry our
 description but that no record names, which arise only when the helper's
 state directory is lost (their bitmaps then stay in the images).
 
+**The binding is durable before the checkpoint settles (B152).** Ending a
+session committed settles its new checkpoint on the domain and retires the
+old one, which nothing on the daemon's host can undo, while the
+`unit_tokens` rows binding the new one were an ordinary commit: state.db
+runs `synchronous=normal`, so they sat in the WAL. A power cut between the
+two kept the checkpoint and lost the binding. The next session was safe -
+its base was not the domain's checkpoint, so it read in full
+(`token-invalid`) - but nothing retired the orphan, and its bitmap stayed in
+the images. So the session calls `db_txn_make_durable` after the token rows
+commit and before `end(COMMITTED)`: one checkpoint of state.db per unit
+backup that makes a checkpoint. If the index cannot be made durable the
+session ends aborted instead, the new checkpoint is discarded, and the rows
+naming it name nothing, so the next session reads in full and makes
+another. `test_units_incremental` checks the order (the fake keeps one
+checkpoint per unit, so it cannot show an orphan), and the power-cut
+harness's unit scenarios cut at the new step as at every other.
+
 **Tests.** `test_vm_delta` (2,100 randomised sessions equal to a full read,
 wrong changed sets, the estimate, the resync bound), `test_units_incremental`
 (the daemon's chain and every staleness case through the fake provider) and

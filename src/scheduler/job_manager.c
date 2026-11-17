@@ -2,8 +2,10 @@
 
 #include "job_manager.h"
 
+#include "db_txn.h"
 #include "lock.h"
 #include "routes.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 #include <cutils/push.h>
@@ -91,11 +93,11 @@ struct job_manager {
      * request holding one is found by take_runnable's try instead.
      */
     worker_state_t *running;
-    /* Guards DB writes from worker threads. c-utils serialises internally,
-     * but progress updates are frequent enough that batching them behind one
-     * lock keeps them from interleaving mid-transaction with a job's own
-     * writes. */
-    pthread_mutex_t db_mu;
+    /* There was a db_mu here, meant to keep progress writes from landing
+     * inside a job's transaction. It could not: a job's transactions are
+     * db_txn's, which it never took, so a progress row written while a
+     * backup batch was open joined that batch (B157). Every jobs write now
+     * goes through db_write, under the write lock itself. */
     /* Whether a failure alert goes anywhere: Pushover has a token and a
      * user (job_manager_set_alerts). push_send accepts and drops a message
      * when it has not, so this is only what the log line may claim. */
@@ -225,6 +227,19 @@ void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
                   title, title_sz, body, body_sz);
 }
 
+void job_alert_retitle_unavailable(char *title, size_t title_sz)
+{
+    /* "c-backup: <action> of <repo> failed" -> "... refused: repository
+     * unavailable"; the composed title always ends in " failed". */
+    size_t n = strlen(title);
+    static const char tail[] = " failed";
+    if (n >= sizeof(tail) - 1 && strcmp(title + n - (sizeof(tail) - 1), tail) == 0) {
+        title[n - (sizeof(tail) - 1)] = '\0';
+        size_t m = strlen(title);
+        snprintf(title + m, title_sz - m, " refused: repository unavailable");
+    }
+}
+
 void job_warning_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
                          const char *action, const char *warning,
                          char *title, size_t title_sz, char *body, size_t body_sz)
@@ -238,9 +253,8 @@ static void set_job_state(job_manager_t *jm, int64_t job_id,
 {
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)job_id);
-    pthread_mutex_lock(&jm->db_mu);
     if (error) {
-        if (db_execute_non_query(jm->db,
+        if (db_write(jm->db,
                 "UPDATE jobs SET state = ?, ended = strftime('%s','now'), error = ?"
                 " WHERE id = ?",
                 (const char *[]){ state, error, id, NULL }, NULL) != 0)
@@ -251,7 +265,7 @@ static void set_job_state(job_manager_t *jm, int64_t job_id,
          * start time anyway; it now reads "started": null. */
         /* A job starting clears the phase it may have shown while it was
          * deferred; it has reported nothing of its own yet. */
-        if (db_execute_non_query(jm->db,
+        if (db_write(jm->db,
                 "UPDATE jobs SET state = ?,"
                 " progress_phase = CASE WHEN ? = 'running' THEN ''"
                 "                       ELSE progress_phase END,"
@@ -264,7 +278,44 @@ static void set_job_state(job_manager_t *jm, int64_t job_id,
                 (const char *[]){ state, state, state, state, id, NULL }, NULL) != 0)
             log_error("job %s: cannot record state %s", id, state);
     }
-    pthread_mutex_unlock(&jm->db_mu);
+}
+
+/*
+ * A job's end: its journal entry and its final state, in one transaction,
+ * the entry first (B159).
+ *
+ * The state used to be written first and the entry after it, as two
+ * statements, so a client polling the job saw "completed" and could read
+ * the journal in between and not find the entry; the CLI end-to-end suite
+ * did exactly that, intermittently. One transaction also means a crash
+ * cannot keep one without the other: state without entry lost the job from
+ * the permanent record, and entry without state had the next start journal
+ * it a second time as interrupted. Every handle shares one connection, so
+ * the order inside the transaction is what a concurrent reader sees.
+ *
+ * The writes inside go through db_write and join this transaction (B157).
+ */
+static void finish_job(job_manager_t *jm, int64_t job_id, const char *state,
+                       const char *error, int64_t repo_id, int64_t schedule_id,
+                       const char *origin, const char *action, const char *outcome,
+                       int64_t took_ms, const char *message)
+{
+    /* error and message must not be the thread's error buffer (err_msg()),
+     * which a failed begin overwrites; the worker passes a copy. */
+    int txn = db_txn_begin(jm->db) == OK;
+    if (!txn) {
+        log_warn("job %lld: cannot open a transaction for its end (%s); recording "
+                 "the journal entry and then the state", (long long)job_id, err_msg());
+        err_clear();
+    }
+    if (repo_id > 0)
+        journal_job(jm->db, repo_id, schedule_id, origin, action, outcome, took_ms,
+                    message);
+    set_job_state(jm, job_id, state, error);
+    if (txn && db_txn_commit(jm->db) != OK) {
+        log_error("job %lld: cannot commit its end: %s", (long long)job_id, err_msg());
+        err_clear();
+    }
 }
 
 /*
@@ -287,7 +338,7 @@ static void prune_finished_jobs(job_manager_t *jm)
     char cutoff[32];
     snprintf(cutoff, sizeof(cutoff), "%lld",
              (long long)time(NULL) - JOB_RETAIN_SECONDS);
-    if (db_execute_non_query(jm->db,
+    if (db_write(jm->db,
             "DELETE FROM jobs WHERE state IN ('completed','failed','cancelled')"
             " AND ended IS NOT NULL AND ended < ?",
             (const char *[]){ cutoff, NULL }, NULL) != 0)
@@ -354,14 +405,12 @@ static void on_progress(const char *phase, uint64_t done, uint64_t total, void *
     snprintf(t,  sizeof(t),  "%llu", (unsigned long long)total);
     snprintf(bd, sizeof(bd), "%llu", (unsigned long long)pc->bytes_done);
     snprintf(bt, sizeof(bt), "%llu", (unsigned long long)pc->bytes_total);
-    pthread_mutex_lock(&pc->jm->db_mu);
     /* Best effort: losing a progress tick must never fail the job. */
-    if (db_execute_non_query(pc->jm->db,
+    if (db_write(pc->jm->db,
             "UPDATE jobs SET progress_phase = ?, progress_current = ?,"
             " progress_total = ?, bytes_done = ?, bytes_total = ? WHERE id = ?",
             (const char *[]){ ph, d, t, bd, bt, id, NULL }, NULL) != 0)
         { /* ignored deliberately */ }
-    pthread_mutex_unlock(&pc->jm->db_mu);
 }
 
 void job_progress_bytes(void *progress_ctx, uint64_t done, uint64_t total)
@@ -600,12 +649,10 @@ static void mark_waiting(job_manager_t *jm, int64_t job_id, const char *phase)
 {
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)job_id);
-    pthread_mutex_lock(&jm->db_mu);
-    if (db_execute_non_query(jm->db,
+    if (db_write(jm->db,
             "UPDATE jobs SET progress_phase = ? WHERE id = ? AND state = 'queued'",
             (const char *[]){ phase, id, NULL }, NULL) != 0)
         { /* a report, not the job's outcome */ }
-    pthread_mutex_unlock(&jm->db_mu);
 }
 
 static void *worker_main(void *arg)
@@ -703,22 +750,24 @@ static void *worker_main(void *arg)
             snprintf(bt, sizeof(bt), "%llu", (unsigned long long)pc.bytes_total);
             snprintf(d,  sizeof(d),  "%llu", (unsigned long long)pc.seen_done);
             snprintf(t,  sizeof(t),  "%llu", (unsigned long long)pc.seen_total);
-            pthread_mutex_lock(&jm->db_mu);
-            if (db_execute_non_query(jm->db,
+            /* Three rows that land together, in one transaction. */
+            int wscope = db_write_enter(jm->db);
+            if (db_write(jm->db,
                     "UPDATE jobs SET bytes_done = ?, bytes_total = ? WHERE id = ?",
                     (const char *[]){ bd, bt, id, NULL }, NULL) != 0)
                 log_warn("job %s: cannot record its byte count", id);
             /* A job that never reported keeps the empty progress it has. */
-            if (pc.last_phase[0] && db_execute_non_query(jm->db,
+            if (pc.last_phase[0] && db_write(jm->db,
                     "UPDATE jobs SET progress_phase = ?, progress_current = ?,"
                     " progress_total = ? WHERE id = ?",
                     (const char *[]){ pc.last_phase, d, t, id, NULL }, NULL) != 0)
                 log_warn("job %s: cannot record its final progress", id);
-            if (pc.result && db_execute_non_query(jm->db,
+            if (pc.result && db_write(jm->db,
                     "UPDATE jobs SET result = ? WHERE id = ?",
                     (const char *[]){ pc.result, id, NULL }, NULL) != 0)
                 log_warn("job %s: cannot record its result", id);
-            pthread_mutex_unlock(&jm->db_mu);
+            if (db_write_leave(jm->db, wscope, 1) != 0)
+                log_warn("job %s: cannot commit its result", id);
             free(pc.result);
             pc.result = NULL;
         }
@@ -729,20 +778,37 @@ static void *worker_main(void *arg)
          * knows the job was accepted.
          */
         const char *outcome;
+        const char *state;
+        /* A copy: the transaction below may overwrite the error buffer, and
+         * the alert after it still needs the reason. */
+        char detail_buf[ERR_MSG_MAX];
         const char *detail = NULL;
         int cancelled = atomic_load_explicit(&ws->cancel, memory_order_relaxed);
         if (st == OK) {
             outcome = "success";
-            set_job_state(jm, slot.job_id, "completed", NULL);
+            state   = "completed";
         } else if (cancelled) {
             outcome = "cancelled";
-            set_job_state(jm, slot.job_id, "cancelled", NULL);
+            state   = "cancelled";
         } else {
             outcome = "failed";
-            detail = err_msg();
-            set_job_state(jm, slot.job_id, "failed", detail);
+            state   = "failed";
+            snprintf(detail_buf, sizeof(detail_buf), "%s", err_msg());
+            detail = detail_buf;
             log_warn("job %lld (%s) failed: %s",
                      (long long)slot.job_id, slot.action, detail);
+        }
+        {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t took = (int64_t)(now.tv_sec - began.tv_sec) * 1000
+                         + (now.tv_nsec - began.tv_nsec) / 1000000;
+            /* A success journalled an empty message, so the entry for a
+             * retention pass could not say what it deleted - the one thing
+             * anybody reading a journal of deletions wants. */
+            finish_job(jm, slot.job_id, state, detail, slot.repo_id, slot.schedule_id,
+                       slot.origin, slot.action, outcome, took,
+                       st == OK ? pc.summary : detail);
         }
         {
             struct timespec fin;
@@ -757,24 +823,9 @@ static void *worker_main(void *arg)
                      (unsigned long long)pc.seen_total);
         }
 
-        if (slot.repo_id > 0) {
-            pthread_mutex_lock(&jm->db_mu);
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            int64_t took = (int64_t)(now.tv_sec - began.tv_sec) * 1000
-                         + (now.tv_nsec - began.tv_nsec) / 1000000;
-            /* A success journalled an empty message, so the entry for a
-             * retention pass could not say what it deleted - the one thing
-             * anybody reading a journal of deletions wants. */
-            journal_job(jm->db, slot.repo_id, slot.schedule_id, slot.origin, slot.action,
-                        outcome, took, st == OK ? pc.summary : detail);
-            pthread_mutex_unlock(&jm->db_mu);
-        }
         free(pc.summary);
         pc.summary = NULL;
-        pthread_mutex_lock(&jm->db_mu);
         prune_finished_jobs(jm);
-        pthread_mutex_unlock(&jm->db_mu);
 
         /*
          * A failed backup that nobody hears about is the whole reason
@@ -785,10 +836,11 @@ static void *worker_main(void *arg)
         if (st != OK && !cancelled) {
             /* Pushover's limits: 250 for the title, 1024 for the body. */
             char title[250], body[1024];
-            pthread_mutex_lock(&jm->db_mu);
             job_alert_compose(jm->db, slot.repo_id, slot.job_id, slot.action,
                               detail, title, sizeof(title), body, sizeof(body));
-            pthread_mutex_unlock(&jm->db_mu);
+            /* A repository that is not there is not a failed job: nothing
+             * was tried, and the title says what to look at (NIT-37). */
+            if (st == ERR_UNAVAILABLE) job_alert_retitle_unavailable(title, sizeof(title));
             /* c-utils logs a send only when it is rejected, and then only
              * the title, so the log never said an alert went out or what
              * it said. Nor does it say when it drops one for want of
@@ -814,10 +866,8 @@ static void *worker_main(void *arg)
          */
         if (st == OK && pc.warning) {
             char title[250], body[1024];
-            pthread_mutex_lock(&jm->db_mu);
             job_warning_compose(jm->db, slot.repo_id, slot.job_id, slot.action,
                                 pc.warning, title, sizeof(title), body, sizeof(body));
-            pthread_mutex_unlock(&jm->db_mu);
             /* Logged either way, at warning, and only called "sending"
              * when there is somewhere to send it (NIT-11). */
             if (atomic_load(&jm->alerts)) {
@@ -858,7 +908,6 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
     if (!jm) return set_error(ERR_NOMEM, "job_manager_start: alloc");
     jm->db = db;
     pthread_mutex_init(&jm->mu, NULL);
-    pthread_mutex_init(&jm->db_mu, NULL);
     /* Monotonic, because a deferred job's retry is a timed wait and a wall
      * clock step must neither stretch nor skip it. */
     pthread_condattr_t ca;
@@ -878,12 +927,25 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
      * absent from the permanent record for ever. This is the only point that
      * knows those jobs ended, so it writes their entries.
      */
+    /* Entries and states in one transaction (B159), so a crash here cannot
+     * leave the jobs marked failed and unjournalled, or journalled and still
+     * running, to be journalled again at the next start. */
+    int txn = db_txn_begin(db) == OK;
+    if (!txn) {
+        log_warn("job manager: cannot open a transaction to close interrupted jobs: %s",
+                 err_msg());
+        err_clear();
+    }
     journal_interrupted(db);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "UPDATE jobs SET state = 'failed', ended = strftime('%s','now'),"
             " error = 'interrupted by daemon restart'"
             " WHERE state IN ('running','queued')", NULL, NULL) != 0)
         log_warn("job manager: cannot clear stale jobs");
+    if (txn && db_txn_commit(db) != OK) {
+        log_warn("job manager: cannot commit the interrupted jobs: %s", err_msg());
+        err_clear();
+    }
     prune_finished_jobs(jm);
 
     jm->workers = calloc((size_t)max_parallel, sizeof(pthread_t));
@@ -916,16 +978,10 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
  */
 static void finish_unstarted(job_manager_t *jm, job_slot_t *taken)
 {
-    set_job_state(jm, taken->job_id, "cancelled", NULL);
+    finish_job(jm, taken->job_id, "cancelled", NULL, taken->repo_id, taken->schedule_id,
+               taken->origin, taken->action, "cancelled", 0, "cancelled before it started");
     log_info("job %lld cancelled before it started: %s, repo %lld",
              (long long)taken->job_id, taken->action, (long long)taken->repo_id);
-    if (taken->repo_id > 0) {
-        pthread_mutex_lock(&jm->db_mu);
-        journal_job(jm->db, taken->repo_id, taken->schedule_id, taken->origin,
-                    taken->action,
-                    "cancelled", 0, "cancelled before it started");
-        pthread_mutex_unlock(&jm->db_mu);
-    }
     if (taken->arg_free) taken->arg_free(taken->arg);
     free(taken->action);
     taken->action = NULL;
@@ -978,7 +1034,6 @@ void job_manager_stop(job_manager_t *jm)
     free(jm->workers);
     free(jm->running);
     pthread_mutex_destroy(&jm->mu);
-    pthread_mutex_destroy(&jm->db_mu);
     pthread_cond_destroy(&jm->cv);
     free(jm);
 }
@@ -1087,24 +1142,23 @@ static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
      */
     /*
      * The id comes back from the INSERT itself. last_insert_rowid() is per
-     * connection, and every thread shares one; db_mu only orders this
-     * module's own writes, so a grep or verify inserting its run row in
-     * between handed the submitter that row's id as its job id.
+     * connection, and every thread shares one, so a grep or verify
+     * inserting its run row in between handed the submitter that row's id
+     * as its job id.
      *
      * A daemon-wide job has no repository: bound as "" and stored as NULL,
      * because a NULL in the list would end it there.
      */
-    pthread_mutex_lock(&jm->db_mu);
     db_result_t *r = NULL;
     int rc;
     if (schedule_id > 0)
-        rc = db_execute(jm->db,
+        rc = db_write_returning(jm->db,
             "INSERT INTO jobs (repo_id, action, params, state, origin, schedule_id)"
             " VALUES (NULLIF(?, ''), ?, ?, 'queued', 'schedule', ?) RETURNING id",
             (const char *[]){ repo_id > 0 ? repo : "", action,
                               params_json ? params_json : "", sched, NULL }, &r);
     else
-        rc = db_execute(jm->db,
+        rc = db_write_returning(jm->db,
             "INSERT INTO jobs (repo_id, action, params, state, origin)"
             " VALUES (NULLIF(?, ''), ?, ?, 'queued', ?) RETURNING id",
             (const char *[]){ repo_id > 0 ? repo : "", action,
@@ -1113,7 +1167,6 @@ static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
     if (rc == 0 && r && r->nrows == 1)
         job_id = strtoll(r->rows[0][0], NULL, 10);
     db_result_free(r);
-    pthread_mutex_unlock(&jm->db_mu);
 
     /* The argument is ours from the call on, as the header says, so every
      * refusal from here releases it; no caller frees it after a failure. */

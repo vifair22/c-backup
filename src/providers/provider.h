@@ -248,12 +248,23 @@ typedef struct {
  * live job owns and that pass the provider's ownership proof. released
  * (caller's, n_intents long, may be NULL) gets 1 for each intent whose
  * release succeeded, so the core deletes exactly those rows.
+ *
+ * absent (caller's, n_intents long, may be NULL) gets 1 for each intent
+ * under which nothing was held. That release still succeeds, as a no-op,
+ * and the start-up and end-of-job sweeps delete the row. The watchdog
+ * keeps it: it sweeps holds of live jobs, and a row is recorded before its
+ * hold is taken, so nothing held may mean not taken yet. Deleting the row
+ * then would leave the hold, once taken, unjournalled and unbounded. The
+ * helper's watchdog does the same with its own journal. Only freezes and
+ * pauses are timed, so a provider must fill it for those kinds; for the
+ * rest it may leave 0.
  */
 typedef struct {
     const char        *daemon8;
     const sp_intent_t *intents;
     size_t             n_intents;
     int               *released;
+    int               *absent;
     int                scan_artefacts;
     const int64_t     *live_jobs;
     size_t             n_live_jobs;

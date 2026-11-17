@@ -74,7 +74,10 @@ static void test_defaults_are_applied(void **state)
     assert_int_equal(state_db_tune(db, &t), OK);
     assert_int_equal(pragma("synchronous"), 1);                 /* NORMAL */
     assert_int_equal(pragma("cache_size"), -64 * 1024);
-    assert_int_equal(pragma("wal_autocheckpoint"), 16384);
+    /* The handle never checkpoints; 16384 is the checkpointer's threshold,
+     * and the WAL file is trimmed to its cap (SPEED-3). */
+    assert_int_equal(pragma("wal_autocheckpoint"), 0);
+    assert_int_equal(pragma("journal_size_limit"), 16384LL * 4 * pragma("page_size"));
 }
 
 static void test_full_and_other_values(void **state)
@@ -84,7 +87,8 @@ static void test_full_and_other_values(void **state)
     assert_int_equal(state_db_tune(db, &t), OK);
     assert_int_equal(pragma("synchronous"), 2);
     assert_int_equal(pragma("cache_size"), -8 * 1024);
-    assert_int_equal(pragma("wal_autocheckpoint"), 2000);
+    assert_int_equal(pragma("wal_autocheckpoint"), 0);
+    assert_int_equal(pragma("journal_size_limit"), 2000LL * 4 * pragma("page_size"));
 }
 
 static void test_bad_values_are_refused(void **state)

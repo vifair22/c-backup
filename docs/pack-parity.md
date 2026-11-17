@@ -135,14 +135,18 @@ Verify checks those structures for every pack the index names, at every
 level (B136): the pack header against the stripe and the tail, each tail
 copy against its CRC and the file, and the CRC table against its own
 parity. Damage within their redundancy is reported as recoverable and, by a
-repairing run, rewritten; a table group past its parity is rebuilt from the
+repairing run, rewritten (each such pack one item in the run's
+`recoverable` or `repaired` total, NIT-30); a table group past its parity is rebuilt from the
 entries the stripe vouches for. With the pack header and both tails damaged
 at once the trailer is still found - the body's end is the one point where
 the entries stepped over and the file size agree - so even that is a
 repair, not a salvage. And when an entry's header is past the stripe but
 the index knows all its fields, readers rebuild it, proven by the header
 CRC and the entry CRC, so a check-only verify counts it recoverable rather
-than lost (B137).
+than lost (B137). An entry past all of that whose object has another copy
+elsewhere, proven against its name the way gc proves one (OWN-22), is not
+lost either: verify finds the copy, reports the object recoverable, and a
+repairing run moves the index to it (NIT-31).
 
 ## Headers are never a single point of failure (B119)
 

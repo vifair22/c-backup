@@ -10,6 +10,9 @@
 set -u
 
 DAEMON="${1:-build/bins/c-backupd}"
+# A write made outside the write lock aborts the daemon here rather than
+# landing in another thread's transaction unnoticed (B157, db_write.h).
+export C_BACKUP_TXN_GUARD=abort
 CLI="${2:-build/bins/c-backup}"
 TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
 mkdir -p "$TEST_ROOT"

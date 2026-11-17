@@ -5,8 +5,10 @@
 #include "repo.h"
 #include "db_txn.h"
 #include "snapshot_ids.h"
+#include "pack_ids.h"
 #include "snap_record.h"
 #include "store.h"
+#include "db_write.h"
 
 #include <cutils/json.h>
 #include <stdbool.h>
@@ -69,6 +71,7 @@ status_t repo_store_open(const char *path, const store_config_t *cfg,
         return OK;
     }
     st = repo_format_check(path, &m);
+    if (st == OK) st = store_set_uuid(*out, m.uuid);   /* the pack-ids mark */
     if (st != OK) {
         store_close(*out);
         *out = NULL;
@@ -727,7 +730,7 @@ static status_t insert_repo_row(cutils_db_t *db, const char *uuid,
     snprintf(now, sizeof(now), "%lld", (long long)time(NULL));
 
     const char *params[] = { uuid, path, label ? label : "", now, NULL };
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO repos (uuid, path, label, added_at) VALUES (?, ?, ?, ?)",
             params, NULL) != 0)
         return set_error(ERR_IO, "cannot insert repo row for %s", path);
@@ -932,6 +935,7 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
         /* Created with the repository, so a format 3 repository without
          * one is damaged rather than old. */
         st = snapshot_ids_write(path, marker.uuid, 0);
+        if (st == OK) st = pack_ids_write(path, marker.uuid, 0);
         if (st != OK) return st;
         out->created  = 1;
         out->inserted = 1;
@@ -1062,12 +1066,12 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
         }
         char idbuf[32];
         snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
-        if (db_execute_non_query(db, "UPDATE repos SET path = ? WHERE id = ?",
-                                 (const char *[]){ path, idbuf, NULL }, NULL) != 0)
+        if (db_write(db, "UPDATE repos SET path = ? WHERE id = ?",
+                     (const char *[]){ path, idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: path update to %s failed", (long long)id, path);
         if (relabel) {
-            if (db_execute_non_query(db, "UPDATE repos SET label = ? WHERE id = ?",
-                                     (const char *[]){ label, idbuf, NULL }, NULL) != 0)
+            if (db_write(db, "UPDATE repos SET label = ? WHERE id = ?",
+                         (const char *[]){ label, idbuf, NULL }, NULL) != 0)
                 return set_error(ERR_IO, "cannot update label of repo %lld",
                                  (long long)id);
             out->label_updated = 1;
@@ -1124,9 +1128,9 @@ status_t repo_deregister(cutils_db_t *db, int64_t repo_id)
      */
     if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "cannot delete repo %lld: begin", (long long)repo_id);
-    if (db_execute_non_query(db, "DELETE FROM repos WHERE id = ?",
-                             (const char *[]){ idbuf, NULL }, NULL) != 0 ||
-        db_execute_non_query(db,
+    if (db_write(db, "DELETE FROM repos WHERE id = ?",
+                 (const char *[]){ idbuf, NULL }, NULL) != 0 ||
+        db_write(db,
             "INSERT OR IGNORE INTO repo_purge_pending (repo_id, queued_at) VALUES (?, ?)",
             (const char *[]){ idbuf, now, NULL }, NULL) != 0) {
         db_txn_rollback(db);

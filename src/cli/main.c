@@ -18,6 +18,7 @@
 
 #include "args.h"
 #include "calendar_check.h"
+#include "weekday.h"
 #include "http.h"
 #include "sse.h"
 #include "snap_record.h"
@@ -469,8 +470,13 @@ static int h_metrics(const args_t *a)
 
 static int h_repo_list(const args_t *a)
 {
-    (void)a;
-    return call("GET", "/repos", NULL);
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/repos");
+    sbuf_t q = { 0 };
+    paging(a, &q);
+    if (q.buf) { sb_puts(&p, "?"); sb_puts(&p, q.buf); }
+    free(q.buf);
+    return call_path_sb("GET", &p, NULL);
 }
 
 static int h_repo_add(const args_t *a)
@@ -494,6 +500,20 @@ static int h_repo_add(const args_t *a)
 static int h_repo_show(const args_t *a)
 {
     return get_repo_scoped(a->pos[0], "", NULL);
+}
+
+/*
+ * The operator accepting that a degraded repository's missing packs are
+ * gone (B150). The flag is the point, so there is no form without it.
+ */
+static int h_repo_repair(const args_t *a)
+{
+    if (!args_flag(a, "--accept-missing"))
+        return refuse(a, "repair marks the missing packs' objects as lost, so the next "
+                         "backup stores them again; say so with --accept-missing");
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/repos/"); sb_puts(&p, a->pos[0]); sb_puts(&p, "/repair");
+    return call_path_sb("POST", &p, "{\"accept_missing\":true}");
 }
 
 static int h_repo_remove(const args_t *a)
@@ -1085,10 +1105,22 @@ static int h_object(const args_t *a)
     if (a->npos > 2 && strcmp(a->pos[2], "refs") != 0 &&
         strcmp(a->pos[2], "layout") != 0 && strcmp(a->pos[2], "content") != 0)
         return refuse(a, "object view must be refs, layout or content, not '%s'", a->pos[2]);
+    /* Only the references are a list; paging anything else would be an
+     * option accepted and not honoured. */
+    int refs = a->npos > 2 && strcmp(a->pos[2], "refs") == 0;
+    if (!refs && (args_value(a, "--limit") || args_value(a, "--offset")))
+        return refuse(a, "--limit and --offset page an object's refs, not its %s",
+                      a->npos > 2 ? a->pos[2] : "location");
     sbuf_t p = { 0 };
     sb_puts(&p, "/repos/"); sb_puts(&p, a->pos[0]);
     sb_puts(&p, "/objects/"); sb_puts(&p, a->pos[1]);
     if (a->npos > 2) { sb_puts(&p, "/"); sb_puts(&p, a->pos[2]); }
+    if (refs) {
+        sbuf_t q = { 0 };
+        paging(a, &q);
+        if (q.buf) { sb_puts(&p, "?"); sb_puts(&p, q.buf); }
+        free(q.buf);
+    }
     return call_path_sb("GET", &p, NULL);
 }
 
@@ -1126,7 +1158,7 @@ static int h_policy_set(const args_t *a)
 
 static int h_tag_list(const args_t *a)
 {
-    return get_repo_scoped(a->pos[0], "/tags", NULL);
+    return get_repo_paged(a, a->pos[0], "/tags");
 }
 
 static int h_tag_set(const args_t *a)
@@ -1177,7 +1209,7 @@ static int h_journal(const args_t *a)
 
 static int h_schedule_list(const args_t *a)
 {
-    return get_repo_scoped(a->pos[0], "/schedules", NULL);
+    return get_repo_paged(a, a->pos[0], "/schedules");
 }
 
 /*
@@ -1283,7 +1315,10 @@ static int h_schedule_add(const args_t *a)
         sb_puts(&b, ",\"trigger\":{\"type\":\"calendar\",\"every\":");
         sb_json_str(&b, every);
         if (at)       { sb_puts(&b, ",\"at\":");       sb_json_str(&b, at); }
-        if (on)       { sb_puts(&b, ",\"on\":");       sb_json_str(&b, on); }
+        /* Sent as the canonical name, which is what the daemon stores;
+         * calendar_check has already refused anything weekday_parse does
+         * not know. */
+        if (on)       { sb_puts(&b, ",\"on\":");       sb_json_str(&b, weekday_name(weekday_parse(on))); }
         if (on_day)   { sb_puts(&b, ",\"on_day\":");   sb_puts(&b, on_day); }
         if (on_month) { sb_puts(&b, ",\"on_month\":"); sb_puts(&b, on_month); }
         sb_puts(&b, "}}");
@@ -1793,7 +1828,10 @@ static const arg_opt_t O_OBJECTS[] = {
 };
 static const arg_opt_t O_MOVE[] = { { "--move", NULL, ARG_FLAG, NULL }, OPT_END };
 static const arg_opt_t O_JOURNAL[] = {
-    OPT_LIMIT, OPT_OFFSET, { "--result", NULL, ARG_VALUE, "STATE" }, OPT_END,
+    OPT_LIMIT, OPT_OFFSET,
+    /* Every result the daemon journals (metadata.c), so a misspelt one is
+     * refused here rather than answering an empty history (NIT-32). */
+    { "--result", NULL, ARG_CHOICE, "success|failed|cancelled|warning|alert" }, OPT_END,
 };
 static const arg_opt_t O_SCHED_ADD[] = {
     { "--every",       NULL, ARG_CHOICE, "day|week|month|year" },
@@ -1842,6 +1880,9 @@ static const arg_opt_t O_UNIT_RESTORE[] = {
 static const arg_opt_t O_VM_EXPORT[] = { { "--ttl", NULL, ARG_VALUE, "N[s|m|h|d]" }, OPT_END };
 static const arg_opt_t O_PROVIDER[] = { { "--provider", NULL, ARG_VALUE, "P" }, OPT_END };
 static const arg_opt_t O_ALL[] = { { "--all", NULL, ARG_FLAG, NULL }, OPT_END };
+static const arg_opt_t O_ACCEPT_MISSING[] = {
+    { "--accept-missing", NULL, ARG_FLAG, NULL }, OPT_END,
+};
 
 typedef struct {
     arg_spec_t spec;
@@ -1850,11 +1891,13 @@ typedef struct {
 } command_t;
 
 static const command_t COMMANDS[] = {
-    { { "repo list",       P_NONE,     NULL, NULL }, h_repo_list, 0 },
+    { { "repo list",       P_NONE,     O_PAGING, NULL }, h_repo_list, 0 },
     { { "repo add",        P_REPO_ADD, O_REPO_ADD,
         "--encrypt is fixed at creation; a passphrase alone implies passphrase" },
       h_repo_add, 0 },
     { { "repo show",       P_REPO,     NULL, NULL }, h_repo_show, 0 },
+    { { "repo repair",     P_REPO,     O_ACCEPT_MISSING,
+        "a degraded repository: accept its missing packs as lost" }, h_repo_repair, 0 },
     { { "repo remove",     P_REPO,     NULL, NULL }, h_repo_remove, 0 },
     { { "repo key export", P_REPO,     NULL, NULL }, h_repo_key_export, 0 },
     { { "repo key import", P_KEY_IMP,  NULL, NULL }, h_repo_key_import, 0 },
@@ -1915,16 +1958,16 @@ static const command_t COMMANDS[] = {
     { { "stats",           P_REPO,     O_STATS, NULL }, h_stats, 0 },
     { { "summary",         P_REPO,     NULL, NULL }, h_summary, 0 },
     { { "objects",         P_REPO,     O_OBJECTS, NULL }, h_objects, 0 },
-    { { "object",          P_OBJECT,   NULL, NULL }, h_object, 0 },
+    { { "object",          P_OBJECT,   O_PAGING, "--limit and --offset page refs" }, h_object, 0 },
     { { "packs",           P_PACKS,    O_PAGING, NULL }, h_packs, 0 },
     { { "fanout",          P_REPO,     NULL, NULL }, h_fanout, 0 },
     { { "policy list",     P_REPO,     NULL, NULL }, h_policy_list, 0 },
     { { "policy set",      P_POLICY,   NULL, NULL }, h_policy_set, 0 },
-    { { "tag list",        P_REPO,     NULL, NULL }, h_tag_list, 0 },
+    { { "tag list",        P_REPO,     O_PAGING, NULL }, h_tag_list, 0 },
     { { "tag set",         P_TAG_SET,  O_MOVE, NULL }, h_tag_set, 0 },
     { { "tag remove",      P_TAG_RM,   NULL, NULL }, h_tag_remove, 0 },
     { { "journal",         P_REPO,     O_JOURNAL, NULL }, h_journal, 0 },
-    { { "schedule list",   P_REPO,     NULL, NULL }, h_schedule_list, 0 },
+    { { "schedule list",   P_REPO,     O_PAGING, NULL }, h_schedule_list, 0 },
     { { "schedule add",    P_SCHED_ADD, O_SCHED_ADD,
         "either [seconds] for an interval, or --every with --at and the --on fields "
         "for a calendar" },

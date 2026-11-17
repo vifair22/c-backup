@@ -210,6 +210,11 @@ void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
                        const char *action, const char *detail,
                        char *title, size_t title_sz, char *body, size_t body_sz);
 
+/* A failed job's title, rewritten for a job refused because its repository
+ * is unavailable (ERR_UNAVAILABLE): "... refused: repository unavailable"
+ * rather than "... failed", since nothing was tried. Exposed for its test. */
+void job_alert_retitle_unavailable(char *title, size_t title_sz);
+
 /* The same for a job that completed with a warning (job_set_warning). */
 void job_warning_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
                          const char *action, const char *warning,

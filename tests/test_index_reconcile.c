@@ -16,7 +16,9 @@
  * tests/test_cli_e2e.sh runs the same case against a real daemon start.
  */
 
+#include <pthread.h>
 #include <setjmp.h>
+#include <time.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -30,6 +32,8 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "db_txn.h"
+#include "routes.h"
 #include "index_reconcile.h"
 #include "reindex.h"
 #include "repo.h"
@@ -347,6 +351,165 @@ static void test_database_tag_wins(void **state)
     assert_int_equal(scalar("SELECT snap_id FROM tags WHERE repo_id = ? AND name = 'keep'"), 2);
 }
 
+/* ---------- B144: the tag file is written outside the write lock ---------- */
+
+static char *read_tags_file(void)
+{
+    FILE *f = fopen(TEST_REPO "/" REPO_TAGS_FILE, "rb");
+    if (!f) return NULL;
+    static char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return buf;
+}
+
+static api_request_t tag_req(api_method_t m, const char *body)
+{
+    api_request_t q;
+    memset(&q, 0, sizeof(q));
+    q.method = m;
+    q.url = "/";
+    q.body = body;
+    q.body_len = body ? strlen(body) : 0;
+    q.is_local = 1;
+    q.client_addr = "";
+    return q;
+}
+
+typedef struct {
+    int         del;
+    const char *body;
+    const char *name;
+    int         status;
+} tag_call_t;
+
+static void *tag_thread(void *arg)
+{
+    tag_call_t *c = arg;
+    api_request_t q = tag_req(c->del ? API_DELETE : API_POST, c->body);
+    api_response_t r = c->del ? metadata_tags_delete(&q, repo_id, c->name)
+                              : metadata_tags_post(&q, repo_id);
+    c->status = r.status;
+    free(r.body);
+    return NULL;
+}
+
+/* Whether the tag file comes to contain (or lose) needle within 5 s. */
+static int tags_file_becomes(const char *needle, int present)
+{
+    for (int i = 0; i < 500; i++) {
+        const char *t = read_tags_file();
+        int has = t && strstr(t, needle) != NULL;
+        if (has == present) return 1;
+        struct timespec ts = { 0, 10 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+/*
+ * A tag edit writes and syncs the repository's file before it queues for
+ * the write lock, not inside its transaction (B144): with another writer
+ * holding the lock, as a backup's batch does, the file already shows the
+ * change while the edit waits, and the row lands once the lock is free.
+ * Before the fix the file was written inside the transaction, so it could
+ * not change until the holder let go, and every writer behind the edit
+ * waited out its two fsyncs.
+ */
+static void test_tag_file_is_written_before_the_write_lock(void **state)
+{
+    (void)state;
+    backup_once("one\n");
+    backup_once("two\n");
+    routes_metadata_init(db);
+
+    assert_int_equal(db_txn_begin(db), OK);           /* the backup's batch */
+    tag_call_t set = { .body = "{\"name\":\"keep\",\"snap_id\":2}" };
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, tag_thread, &set), 0);
+    assert_true(tags_file_becomes("\"keep\"", 1));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 0);
+    assert_int_equal(db_txn_commit(db), OK);
+    pthread_join(th, NULL);
+    assert_int_equal(set.status, 200);
+    assert_int_equal(scalar("SELECT snap_id FROM tags WHERE repo_id = ? AND name = 'keep'"), 2);
+
+    /* The file holds the tagged snapshot's timestamp, which is what lets
+     * a reconcile put the tag back. */
+    exec_repo("DELETE FROM tags WHERE repo_id = ?");
+    reconcile_result_t rr;
+    assert_int_equal(index_reconcile(db, NULL, NULL, &rr), OK);
+    assert_int_equal(rr.tags_restored, 1);
+    assert_int_equal(scalar("SELECT snap_id FROM tags WHERE repo_id = ? AND name = 'keep'"), 2);
+
+    /* Removing it: the same order. */
+    assert_int_equal(db_txn_begin(db), OK);
+    tag_call_t del = { .del = 1, .name = "keep" };
+    assert_int_equal(pthread_create(&th, NULL, tag_thread, &del), 0);
+    assert_true(tags_file_becomes("\"keep\"", 0));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 1);
+    assert_int_equal(db_txn_commit(db), OK);
+    pthread_join(th, NULL);
+    assert_int_equal(del.status, 200);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 0);
+}
+
+/* The file is the list as it will be after the commit: other tags kept in
+ * name order, a moved tag on its new snapshot with its first created_at,
+ * and a refused edit (409) leaves the file alone. */
+static void test_tag_file_tracks_every_edit(void **state)
+{
+    (void)state;
+    backup_once("one\n");
+    backup_once("two\n");
+    routes_metadata_init(db);
+
+    const char *bodies[] = {
+        "{\"name\":\"m\",\"snap_id\":1}",
+        "{\"name\":\"a\",\"snap_id\":1}",
+        "{\"name\":\"z\",\"snap_id\":2}",
+    };
+    for (size_t i = 0; i < 3; i++) {
+        tag_call_t c = { .body = bodies[i] };
+        tag_thread(&c);
+        assert_int_equal(c.status, 200);
+    }
+    long long created_m = scalar("SELECT created_at FROM tags WHERE repo_id = ? AND name = 'm'");
+    const char *t = read_tags_file();
+    assert_non_null(t);
+    const char *a = strstr(t, "\"a\""), *m = strstr(t, "\"m\""), *z = strstr(t, "\"z\"");
+    assert_true(a && m && z && a < m && m < z);
+
+    char before[4096];
+    snprintf(before, sizeof(before), "%s", t);
+    tag_call_t refused = { .body = "{\"name\":\"m\",\"snap_id\":2}" };
+    tag_thread(&refused);
+    assert_int_equal(refused.status, 409);
+    assert_string_equal(read_tags_file(), before);
+
+    tag_call_t moved = { .body = "{\"name\":\"m\",\"snap_id\":2,\"move\":true}" };
+    tag_thread(&moved);
+    assert_int_equal(moved.status, 200);
+    char want[128];
+    snprintf(want, sizeof(want), "{\"name\":\"m\",\"snapshot\":2,");
+    assert_non_null(strstr(read_tags_file(), want));
+    snprintf(want, sizeof(want), "\"created_at\":%lld}", created_m);
+    const char *mm = strstr(read_tags_file(), "\"m\"");
+    assert_non_null(mm);
+    assert_non_null(strstr(mm, want));
+
+    /* What the routes wrote is exactly what a rewrite from the rows gives. */
+    snprintf(before, sizeof(before), "%s", read_tags_file());
+    assert_int_equal(repo_tags_save(db, repo_id, TEST_REPO), OK);
+    assert_string_equal(read_tags_file(), before);
+
+    tag_call_t gone = { .del = 1, .name = "nosuch" };
+    tag_thread(&gone);
+    assert_int_equal(gone.status, 404);
+    assert_string_equal(read_tags_file(), before);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -358,6 +521,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_unreadable_repo_is_skipped, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repo_being_removed_is_skipped, setup, teardown),
         cmocka_unit_test_setup_teardown(test_lost_tag_is_restored_from_the_repository, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tag_file_is_written_before_the_write_lock, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tag_file_tracks_every_edit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_database_tag_wins, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

@@ -2,6 +2,7 @@
 
 #include "file_cache.h"
 #include "util.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -109,12 +110,14 @@ int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
      * collects objects no live snapshot references, so a path whose only
      * snapshot was pruned can match here with its bytes already reclaimed.
      * Trusting the cache alone would write a snapshot referencing an object
-     * that does not exist, and nothing would notice until a restore.
+     * that does not exist, and nothing would notice until a restore. An
+     * absent object is one a tree names and no pack holds (B150): the next
+     * backup has to read the file to store it again.
      */
     db_result_t *o = NULL;
     int present = db_execute(db,
             "SELECT 1 FROM objects WHERE repo_id = ? AND hash = ?"
-            " AND location <> 'staged'",
+            " AND location NOT IN ('staged', 'absent')",
             (const char *[]){ repo, hex, NULL }, &o) == 0 && o && o->nrows == 1;
     db_result_free(o);
     if (!present) return 0;
@@ -141,7 +144,7 @@ void file_cache_put(cutils_db_t *db, int64_t repo_id, const char *path,
     snprintf(ct,   sizeof(ct),   "%lld", (long long)ctime_ns_of(st));
     snprintf(seen, sizeof(seen), "%lld", (long long)seen_at);
 
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO file_cache"
             " (repo_id, path, dev, inode, size, mtime_ns, ctime_ns,"
             "  content_hash, seen_at)"
@@ -179,8 +182,12 @@ void file_cache_sweep(cutils_db_t *db, int64_t repo_id,
     }
 
     /* Collect first, delete after: deleting while holding the result set
-     * open would invalidate what we are iterating. */
+     * open would invalidate what we are iterating. The deletes are batched
+     * (B157): each used to be a plain statement, which on the shared
+     * connection joined whatever transaction another thread had open. */
     int removed = 0;
+    db_write_batch_t wb;
+    int open = 0;
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         const char *path = r->rows[i][0];
         if (!path) continue;
@@ -188,13 +195,27 @@ void file_cache_sweep(cutils_db_t *db, int64_t repo_id,
             bsearch(&path, paths, n_paths, sizeof(*paths), path_cmp))
             continue;
 
+        if (!open) {
+            if (db_write_batch_open(&wb, db) != 0) {
+                log_warn("file cache: cannot begin the sweep");
+                break;
+            }
+            open = 1;
+        }
         if (db_execute_non_query(db,
                 "DELETE FROM file_cache WHERE repo_id = ? AND path = ?",
                 (const char *[]){ repo, path, NULL }, NULL) != 0)
             log_warn("file cache: cannot drop %s", path);
         else
             removed++;
+        if (db_write_batch_next(&wb) != 0) {
+            open = 0;
+            log_warn("file cache: cannot commit the sweep");
+            break;
+        }
     }
+    if (open && db_write_batch_close(&wb, 1) != 0)
+        log_warn("file cache: cannot commit the sweep");
     db_result_free(r);
     if (removed > 0)
         log_info("file cache: dropped %d entry(ies) for paths no longer present",

@@ -11,6 +11,7 @@
 #include "repo_key.h"
 #include "snap_record.h"
 #include "snapshot_ids.h"
+#include "pack_ids.h"
 #include "util.h"
 
 #include <cutils/log.h>
@@ -693,6 +694,7 @@ status_t replica_sink_local_open(const char *path,
         st = repo_marker_write_fixed(path, source_marker, &m);
         if (st != OK) { free(c); return st; }
         st = snapshot_ids_write(path, m.uuid, 0);
+        if (st == OK) st = pack_ids_write(path, m.uuid, 0);
         if (st != OK) { free(c); return st; }
     } else {
         st = repo_format_check(path, &m);
@@ -733,6 +735,9 @@ static status_t sink_finish_open(local_ctx_t *c, const char *path,
     if (st != OK) { repo_key_wipe(&c->dst_key); free(c); return st; }
     c->owns_store = 1;
     snprintf(c->uuid, sizeof(c->uuid), "%s", m->uuid);
+    /* The target numbers its packs from its own mark, as any repository. */
+    st = store_set_uuid(c->store, m->uuid);
+    if (st != OK) { store_close(c->store); repo_key_wipe(&c->dst_key); free(c->tcdc); free(c); return st; }
 
     /*
      * A replicate killed mid-copy leaves its staging pack in tmp/ (B133):

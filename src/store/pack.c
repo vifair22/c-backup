@@ -273,28 +273,47 @@ static void max_pack_num_cb(uint32_t pack_num, void *ctx) {
 }
 
 /*
- * The number the next pack written to this repository should take.
+ * count numbers for packs about to be written to this repository, the first
+ * in *out_first.
  *
- * Returns max + 1: max_pack_num_cb increments as it scans, so the result is
- * already the free slot rather than the highest used one. Every writer takes
- * it the same way and none of them adds to it - pack_stored_open used to,
- * which left a gap in the numbering for no reason.
+ * The directory scan is one floor among several: max_pack_num_cb gives the
+ * free slot above the highest pack present, and store_issue_pack_nums adds
+ * the repository's pack-ids mark, the index's floor and what this handle has
+ * already issued, then raises the mark past them before returning (B156).
+ * The scan alone reissued the number of a pack dropped as missing, and when
+ * the original came back the index described the wrong file.
  *
  * The scan cannot see a pack still staging in tmp/, because it is not named
  * until it is installed, so writers open at once on one handle (a backup's
- * and the store's own) reserve through store_reserve_pack_num and never
- * share a number. Across handles, every writer - backup, gc, replicate - is
- * a repo-scoped job holding the repo write lock, and that lock rejects
- * rather than queues, so two of them cannot be open on one repository at
- * the same time.
+ * and the store's own) never share a number only because the handle
+ * remembers what it issued. Across handles, every writer - backup, gc,
+ * replicate - is a repo-scoped job holding the repo write lock, and that
+ * lock rejects rather than queues, so two of them cannot be open on one
+ * repository at the same time.
  */
-static uint32_t next_pack_num(store_t *store) {
+static status_t scan_next_free(store_t *store, uint32_t *out) {
     uint32_t pack_num = 0;
     char packs_dir[PATH_MAX];
     if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0)
-        return 0;
+        return set_error(ERR_IO, "pack number: path too long");
     pack_for_each_num(packs_dir, max_pack_num_cb, &pack_num);
-    return store_reserve_pack_num(store, pack_num);
+    *out = pack_num;
+    return OK;
+}
+
+static status_t issue_pack_nums(store_t *store, uint32_t count, uint32_t *out_first) {
+    uint32_t scanned = 0;
+    status_t st = scan_next_free(store, &scanned);
+    if (st != OK) return st;
+    return store_issue_pack_nums(store, scanned, count, out_first);
+}
+
+status_t pack_reserve_numbers(store_t *store) {
+    if (!store) return set_error(ERR_INVALID, "pack_reserve_numbers: null store");
+    uint32_t scanned = 0;
+    status_t st = scan_next_free(store, &scanned);
+    if (st != OK) return st;
+    return store_reserve_pack_nums(store, scanned);
 }
 
 
@@ -2344,7 +2363,7 @@ static status_t install_pack_file(store_t *store, const char *dat_tmp,
 
     pack_ensure_shard_dir(store_root(store), pack_num);
 
-    /* next_pack_num() returns max+1 so this should never trigger, but if
+    /* Numbers are never reissued (issue_pack_nums), so this should never trigger, but if
      * it does we would silently destroy data. Fail loudly instead. */
     struct stat st_chk;
     if (stat(dat_final, &st_chk) == 0)
@@ -2575,9 +2594,10 @@ status_t pack_stored_open(store_t *store, pack_stored_writer_t **out)
     pack_stored_writer_t *w = calloc(1, sizeof(*w));
     if (!w) return set_error(ERR_NOMEM, "pack_stored_open: alloc");
     w->store = store;
-    w->pack_num = store_alloc_pack_num(store, next_pack_num(store));
+    status_t st = issue_pack_nums(store, 1, &w->pack_num);
+    if (st != OK) { free(w); return st; }
 
-    status_t st = open_new_pack(store, w->pack_num, &w->dat_f, w->dat_tmp, &w->dat_hdr);
+    st = open_new_pack(store, w->pack_num, &w->dat_f, w->dat_tmp, &w->dat_hdr);
     if (st != OK) { free(w); return st; }
 
     *out = w;
@@ -3272,7 +3292,8 @@ status_t pack_backup_open(store_t *store, pack_backup_writer_t **out)
 static status_t pb_ensure_open(pack_backup_writer_t *w)
 {
     if (w->pw.dat_f) return OK;
-    w->pw.pack_num = store_alloc_pack_num(w->pw.store, next_pack_num(w->pw.store));
+    status_t ist = issue_pack_nums(w->pw.store, 1, &w->pw.pack_num);
+    if (ist != OK) return ist;
     w->pw.packed = 0;
     w->pw.body_offset = 0;
     w->pw.wb_done = 0;
@@ -3581,20 +3602,22 @@ static status_t entry_decode(store_t *store, pack_dat_entry_hdr_t *ehdr,
  * whole read a restore would do. An encrypted copy with no key loaded
  * cannot be proven.
  */
-static int gc_copy_proven(store_t *store, uint32_t pnum, const pack_idx_disk_entry_t *e)
+static int copy_proven_at(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                          uint32_t pnum, uint64_t offset, uint32_t entry_index,
+                          uint64_t comp_size, const char *what)
 {
     pack_cache_entry_t where;
     memset(&where, 0, sizeof(where));
-    memcpy(where.hash, e->hash, OBJECT_HASH_SIZE);
-    where.dat_offset   = e->dat_offset;
+    memcpy(where.hash, hash, OBJECT_HASH_SIZE);
+    where.dat_offset   = offset;
     where.pack_num     = pnum;
     where.pack_version = PACK_VERSION;
-    where.entry_index  = e->entry_index;
-    where.comp_size    = e->compressed_size;
+    where.entry_index  = entry_index;
+    where.comp_size    = comp_size;
     pack_dat_entry_hdr_t h = { 0 };
     uint8_t *buf = NULL;
     int damaged = 0;
-    if (entry_read_at(store, e->hash, &where, "pack-gc", &h, &buf, &damaged) != OK ||
+    if (entry_read_at(store, hash, &where, what, &h, &buf, &damaged) != OK ||
         damaged) {
         free(buf);
         err_clear();
@@ -3602,12 +3625,25 @@ static int gc_copy_proven(store_t *store, uint32_t pnum, const pack_idx_disk_ent
     }
     void *data = NULL;
     size_t sz = 0;
-    if (entry_decode(store, &h, e->hash, buf, &data, &sz, "pack-gc") != OK) {
+    if (entry_decode(store, &h, hash, buf, &data, &sz, what) != OK) {
         err_clear();
         return 0;
     }
     free(data);
     return 1;
+}
+
+static int gc_copy_proven(store_t *store, uint32_t pnum, const pack_idx_disk_entry_t *e)
+{
+    return copy_proven_at(store, e->hash, pnum, e->dat_offset, e->entry_index,
+                          e->compressed_size, "pack-gc");
+}
+
+int pack_entry_proven(store_t *store, uint32_t pnum, const pack_entry_info_t *e)
+{
+    if (!store || !e) return 0;
+    return copy_proven_at(store, e->hash, pnum, e->entry_offset, e->entry_index,
+                          e->compressed_size, "verify");
 }
 
 /*
@@ -3632,6 +3668,9 @@ static int ref_cmp(const void *key, const void *entry);
 
 static int gc_entry_live(gc_live_t *g, uint32_t pnum, const pack_idx_disk_entry_t *e)
 {
+    /* bsearch's base is declared nonnull, and with nothing referenced it is
+     * NULL: undefined even at a count of zero (UBSan). */
+    if (g->cnt == 0) return 0;
     const uint8_t *hit = bsearch(e->hash, g->refs, g->cnt, OBJECT_HASH_SIZE, ref_cmp);
     if (!hit) return 0;
     if (!g->locs) return 1;
@@ -4194,7 +4233,12 @@ static status_t pack_rw_replace(pack_rw_t *rw, const uint32_t *old_nums, size_t 
     if (rw->nouts == 0) return set_error(ERR_INVALID, "pack rewrite: nothing to install");
 
     /* ---- 2. install, and make the installs durable ---- */
-    uint32_t base = next_pack_num(store);
+    /* Every output's number at once: the scan cannot see the ones this
+     * loop has not installed yet, so taking one and counting up from it
+     * could run into a number another writer on the handle was given. */
+    uint32_t base = 0;
+    st = issue_pack_nums(store, (uint32_t)rw->nouts, &base);
+    if (st != OK) return st;
     *out_base = base;
     *out_n = rw->nouts;
     size_t installed = 0;

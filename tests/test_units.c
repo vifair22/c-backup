@@ -13,6 +13,7 @@
 
 #include <pthread.h>
 #include <setjmp.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -705,14 +706,14 @@ static void test_crash_sweep(void **state)
     assert_true(sw.left_foreign >= 3);
 }
 
-typedef struct { volatile int stop; unsigned released; } wd_t;
+typedef struct { atomic_int stop; unsigned released; } wd_t;
 
 static void *wd_loop(void *arg)
 {
     wd_t *w = arg;
-    while (!w->stop) {
+    while (!atomic_load(&w->stop)) {
         unsigned n = 0;
-        (void)units_watchdog_tick(db, time(NULL) + 1, &n);
+        (void)units_watchdog_tick(db, units_now_ms() + 1000, &n);
         w->released += n;
         struct timespec ts = { 0, 10 * 1000000L };
         nanosleep(&ts, NULL);
@@ -734,7 +735,7 @@ static void test_watchdog_bounds_freeze(void **state)
     const char *names[] = { "cbk-uat-one" };
     unit_backup_result_t res;
     status_t st = run_units(names, 1, 0, &res);
-    w.stop = 1;
+    atomic_store(&w.stop, 1);
     pthread_join(th, NULL);
     assert_int_equal(st, OK);
     assert_true(w.released >= 1);
@@ -744,6 +745,85 @@ static void test_watchdog_bounds_freeze(void **state)
     assert_int_equal(scalar("SELECT consistency FROM snapshot_units WHERE repo_id = ?"), SP_CONSIST_CRASH);
     assert_int_equal(units_intents_open(db, NULL), 0);
     fake_fail_clear(fk);
+}
+
+/*
+ * A pause the watchdog lets go before the point in time leaves the unit
+ * running while the rest is taken. With nothing else to fix an instant (no
+ * snapshot, no export) the capture has no single point in time: it is
+ * inconsistent, not the crash a pause that lasted would give.
+ */
+static void test_watchdog_bounds_pause(void **state)
+{
+    (void)state;
+    units_shutdown();
+    units_config_t uc = { .allow = "", .unit_wait_s = 2, .freeze_timeout_s = 10, .max_pause_s = 1,
+                          .trust_zero = 1 };
+    assert_int_equal(units_init(db, TEST_DIR, &uc), OK);
+    assert_int_equal(fake_unit_add(fk, "u3", "cbk-uat-three", SP_STATE_RUNNING, SP_CAP_PAUSE), OK);
+    assert_int_equal(fake_blob_add(fk, "u3", "cfg", ".cbackup-unit/config/app.conf",
+                                   "port = 80\n", 10), OK);
+    const char *names[] = { "cbk-uat-three" };
+    unit_backup_result_t res;
+
+    fake_fail_set(fk, "u3", FAKE_HANG_IN_PAUSE, 20000);
+    wd_t w = { 0, 0 };
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, wd_loop, &w), 0);
+    status_t st = run_units(names, 1, 0, &res);
+    atomic_store(&w.stop, 1);
+    pthread_join(th, NULL);
+    fake_fail_clear(fk);
+    assert_int_equal(st, OK);
+    assert_true(w.released >= 1);
+    assert_int_equal(res.units[0].achieved, SP_CONSIST_INCONSISTENT);
+    assert_non_null(strstr(res.units[0].warning, "pause"));
+    assert_non_null(strstr(res.units[0].warning, "watchdog"));
+    unit_backup_result_free(&res);
+    assert_int_equal(scalar("SELECT consistency FROM snapshot_units WHERE repo_id = ?"),
+                     SP_CONSIST_INCONSISTENT);
+    assert_int_equal(units_intents_open(db, NULL), 0);
+
+    /* The same unit with its pause lasting is one instant. */
+    assert_int_equal(run_units(names, 1, 0, &res), OK);
+    assert_int_equal(res.units[0].achieved, SP_CONSIST_CRASH);
+    unit_backup_result_free(&res);
+}
+
+/*
+ * The journal row is written before its hold is taken. A watchdog tick in
+ * between finds nothing held; it must keep the row, or the freeze that
+ * lands a moment later is unjournalled and the watchdog never bounds it
+ * (the CI failure of test_watchdog_bounds_freeze, pipeline 5213).
+ */
+static void test_watchdog_waits_for_take(void **state)
+{
+    (void)state;
+    units_shutdown();
+    init_units("", 1);
+    units_journal_t jr = { db, "fake", "u1", 77 };
+    sp_holds_t h = units_journal_holds(&jr);
+    int64_t id = 0;
+    assert_int_equal(h.record(h.ctx, SP_HOLD_FREEZE, "agent:u1", &id), OK);
+
+    unsigned n = 9;
+    assert_int_equal(units_watchdog_tick(db, units_now_ms() + 5000, &n), OK);
+    assert_int_equal(n, 0);
+    assert_int_equal(units_intents_open(db, NULL), 1);
+
+    /* The take lands; the next tick releases it and only then the row. */
+    assert_int_equal(fake_hold_plant(fk, "u1", SP_HOLD_FREEZE, "agent:u1"), OK);
+    assert_int_equal(units_watchdog_tick(db, units_now_ms() + 5000, &n), OK);
+    assert_int_equal(n, 1);
+    assert_false(fake_hold_held(fk, "u1", SP_HOLD_FREEZE, NULL));
+    assert_int_equal(units_intents_open(db, NULL), 0);
+
+    /* A sweep of a finished job still deletes a row with nothing held. */
+    assert_int_equal(h.record(h.ctx, SP_HOLD_FREEZE, "agent:u1", &id), OK);
+    units_sweep_result_t sw;
+    assert_int_equal(units_sweep(db, 0, &sw), OK);
+    assert_int_equal(sw.released, 1);
+    assert_int_equal(units_intents_open(db, NULL), 0);
 }
 
 static void test_daemon_id(void **state)
@@ -788,6 +868,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_retention_groups, setup, teardown),
         cmocka_unit_test_setup_teardown(test_crash_sweep, setup, teardown),
         cmocka_unit_test_setup_teardown(test_watchdog_bounds_freeze, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_watchdog_bounds_pause, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_watchdog_waits_for_take, setup, teardown),
         cmocka_unit_test_setup_teardown(test_daemon_id, setup, teardown),
     };
     return cmocka_run_group_tests(tests, group_setup, group_teardown);
