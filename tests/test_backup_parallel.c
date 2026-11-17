@@ -633,8 +633,10 @@ static void test_failing_file_is_skipped_as_it_is_serially(void **state)
         o.progress_ctx = &fired;
         assert_int_equal(backup_run(e[k].store, e[k].db, e[k].repo_id, &o, &r[k]), OK);
         assert_true(fired);
-        char tmp[PATH_MAX + 16];
+        char tmp[PATH_MAX + 32];
         snprintf(tmp, sizeof(tmp), "%s/repo/tmp", e[k].dir);
+        assert_int_equal(dir_entries(tmp), 0);
+        snprintf(tmp, sizeof(tmp), "%s/repo/" STORE_PACK_STAGING, e[k].dir);
         assert_int_equal(dir_entries(tmp), 0);
 
         assert_int_equal(rmdir(TEST_SRC "/b.bin"), 0);
@@ -692,8 +694,9 @@ static void test_cancel_stops_the_workers(void **state)
 
     env_t e;
     env_open(&e, "cancel");
-    char tmp[PATH_MAX + 16];
-    snprintf(tmp, sizeof(tmp), "%s/repo/tmp", e.dir);
+    char tmp[PATH_MAX + 32];
+    /* Where the workers stage packs (B163): the canceller waits for one. */
+    snprintf(tmp, sizeof(tmp), "%s/repo/" STORE_PACK_STAGING, e.dir);
     atomic_int cancel = 0;
     canceller_t c = { &cancel, tmp, 0 };
     backup_opts_t o = opts_for(4);
@@ -714,7 +717,7 @@ static void test_cancel_stops_the_workers(void **state)
     /* Within a read of each file, not at the end of 384 MiB; generous for
      * a sanitizer build on a loaded runner. */
     assert_true(secs < 10.0);
-    /* Workers abandoned what they were staging: nothing left in tmp/. */
+    /* Workers abandoned what they were staging: nothing left there. */
     assert_int_equal(dir_entries(tmp), 0);
     /* OWN-12: a failed run used to leave this aimed at its stack frame. */
     assert_null(phase_current);

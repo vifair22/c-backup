@@ -225,8 +225,10 @@ status_t store_init_dirs(const char *path) {
 
     status_t st = OK;
     /* Section 5's contract, plus tmp/. Everything the engine writes goes
-     * through mkstemp there and is renamed into place, so the staging
-     * directory has to be on the same filesystem as its destination.
+     * through mkstemp and is renamed into place, so staging has to be on
+     * the same filesystem as its destination: tmp/ for what goes in the
+     * root and snapshots/, packs/.staging (created on first use) for
+     * packs, since packs/ may be a mount of its own (B163).
      *
      * Gone with the one-shot CLI: format and HEAD (identity now lives in
      * .cbackup, written by the daemon), refs/ (the snapshot pointer is a
@@ -288,19 +290,20 @@ static int engine_tmp_kind(const char *name)
 }
 
 /*
- * Unlink regular files in <root>/tmp whose mtime is before `cutoff`.
+ * Unlink regular files in dir (<root>/tmp or <root>/packs/.staging) whose
+ * mtime is before `cutoff`.
  * `engine_only` limits it to the engine's own staging names, and holds the
  * tag mirror's (kind 2) to the hour rule whatever `cutoff` says: the
  * invariant an age-free sweep relies on is that nothing it may remove can
  * have a live writer, and only kind 1 staging is written exclusively by
  * holders of the claim or the write lock the sweeper holds.
  */
-static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
-                              uint64_t *out_bytes)
+static unsigned sweep_staging_dir(const char *root, const char *sub, time_t cutoff,
+                                  int engine_only, uint64_t *out_bytes)
 {
     const time_t hour_ago = time(NULL) - 60 * 60;
     char tmp_dir[PATH_MAX];
-    if (snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", root) >= (int)sizeof(tmp_dir))
+    if (snprintf(tmp_dir, sizeof(tmp_dir), "%s/%s", root, sub) >= (int)sizeof(tmp_dir))
         return 0;
 
     DIR *d = opendir(tmp_dir);
@@ -335,15 +338,39 @@ static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
 
     if (out_bytes) *out_bytes += bytes;
     if (swept)
-        log_info("store: swept %u stale staging file(s) from tmp (%llu bytes)",
-                 swept, (unsigned long long)bytes);
+        log_info("store: swept %u stale staging file(s) from %s (%llu bytes)",
+                 swept, sub, (unsigned long long)bytes);
     return swept;
+}
+
+/*
+ * Both staging directories. packs/.staging holds pack files and deletion
+ * markers since B163; tmp/ holds everything else, and the pack staging an
+ * older build left there, which the same names and the same rules cover.
+ */
+static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
+                              uint64_t *out_bytes)
+{
+    return sweep_staging_dir(root, "tmp", cutoff, engine_only, out_bytes) +
+           sweep_staging_dir(root, STORE_PACK_STAGING, cutoff, engine_only, out_bytes);
 }
 
 static void store_sweep_tmp(const char *root)
 {
     const time_t stale_after = 60 * 60;   /* one hour, see above */
     (void)sweep_tmp_dir(root, time(NULL) - stale_after, 0, NULL);
+}
+
+int store_pack_staging(const store_t *st, char *buf, size_t sz)
+{
+    if (!st || !buf || sz == 0) { errno = EINVAL; return -1; }
+    int n = snprintf(buf, sz, "%s/" STORE_PACK_STAGING, st->path);
+    if (n < 0 || (size_t)n >= sz) { errno = ENAMETOOLONG; return -1; }
+    /* Its own entry in packs/ need not be synced here: whatever installs a
+     * pack syncs packs/ afterwards (finalize_pack, write_deleting_marker),
+     * and a staging directory lost to a power cut held only staging. */
+    if (mkdir(buf, 0755) != 0 && errno != EEXIST) return -1;
+    return 0;
 }
 
 /*

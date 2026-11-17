@@ -29,6 +29,10 @@
  *               accepted by the repair; an empty root; a copy
  *               that fails its proof losing to one that passes; the
  *               pack-ids mark after a lost index and a lost file
+ *   B164/B165   two roots swapped: each unavailable naming the other's
+ *               uuid, no repair overriding it, nothing recorded or
+ *               written; the all-missing repair refused under another
+ *               repository's marker
  */
 
 #include <setjmp.h>
@@ -49,7 +53,9 @@
 #include "object.h"
 #include "pack.h"
 #include "pack_ids.h"
+#include "index_reconcile.h"
 #include "pack_presence.h"
+#include "prune.h"
 #include "reindex.h"
 #include "repo.h"
 #include "restore.h"
@@ -1069,7 +1075,8 @@ static void test_a_moved_packs_dir_is_accepted_by_repair(void **state)
                                           (const char *[]){ repo, NULL }, NULL), 0);
     assert_int_equal(pack_presence_check(db, repo_id, 1, &pp), OK);
     assert_true(pp.unavailable);
-    assert_non_null(strstr(pp.why, "not this repository's marker"));
+    assert_non_null(strstr(pp.why, "not someone-else"));
+    assert_non_null(strstr(pp.why, "holds repository"));
     assert_int_equal(pp.packs_dropped, 0);
     assert_int_equal(db_execute_non_query(db, "UPDATE repos SET uuid = ? WHERE id = ?",
                                           (const char *[]){ uuid, repo, NULL }, NULL), 0);
@@ -1086,6 +1093,243 @@ static void test_a_moved_packs_dir_is_accepted_by_repair(void **state)
     assert_int_equal(scalar("SELECT COUNT(*) FROM objects o JOIN nodes n ON n.content_hash = o.hash"
                             " WHERE o.repo_id = ? AND n.name = 'c' AND o.location = 'absent'"), 0);
     assert_restores(s4);
+}
+
+/* ---- a path that holds another repository (B164, B165) ----------- */
+
+#define TEST_REPO2 TEST_DIR "/repo2"
+#define TEST_SRC2  TEST_DIR "/src2"
+
+static void uuid_of(int64_t id, char *out, size_t n)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT uuid FROM repos WHERE id = ?",
+                                (const char *[]){ repo, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    snprintf(out, n, "%s", r->rows[0][0]);
+    db_result_free(r);
+}
+
+static void identity_of(int64_t id, char *out, size_t n)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT COALESCE(MAX(value), '') FROM recovery_state"
+                                    " WHERE repo_id = ? AND key = 'packs-identity'",
+                                (const char *[]){ repo, NULL }, &r), 0);
+    snprintf(out, n, "%s", r && r->nrows == 1 ? r->rows[0][0] : "");
+    db_result_free(r);
+}
+
+/* Every file under dir with its size, mtime and inode: what "nothing was
+ * written" is checked against. */
+static char *listing(const char *dir)
+{
+    char cmd[600];
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && find . -printf '%%p %%y %%s %%T@ %%i\n' | LC_ALL=C sort", dir);
+    FILE *f = popen(cmd, "r");
+    assert_non_null(f);
+    size_t cap = 4096, len = 0;
+    char *buf = malloc(cap);
+    assert_non_null(buf);
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len - 1, f)) > 0) {
+        len += n;
+        if (cap - len < 1024) { cap *= 2; buf = realloc(buf, cap); assert_non_null(buf); }
+    }
+    pclose(f);
+    buf[len] = '\0';
+    return buf;
+}
+
+static status_t backup_into(store_t *st, int64_t id, const char *src)
+{
+    const char *paths[] = { src };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.store_workers = 1;
+    backup_result_t br;
+    memset(&br, 0, sizeof(br));
+    status_t s = backup_run(st, db, id, &o, &br);
+    backup_result_free(&br);
+    return s;
+}
+
+static void swap_roots(void)
+{
+    assert_int_equal(rename(TEST_REPO, TEST_DIR "/swap"), 0);
+    assert_int_equal(rename(TEST_REPO2, TEST_REPO), 0);
+    assert_int_equal(rename(TEST_DIR "/swap", TEST_REPO2), 0);
+}
+
+/*
+ * Two repositories of one pack each, their roots swapped on disk: both
+ * found a pack-0000000000.dat where the index expected one and stayed ok,
+ * and each accepted the other's packs/ as its own moved one. Verify then
+ * called most of each unrecoverable and restores failed their hashes.
+ * Now each is unavailable, saying whose repository its path holds; the
+ * repair cannot override that; nothing is recorded and neither repository
+ * is written to; swapped back, both are as they were.
+ */
+static void test_swapped_roots_are_unavailable(void **state)
+{
+    (void)state;
+    write_file("a", 1, 40000);
+    int64_t s1 = backup_ok();
+
+    int64_t id2 = 0;
+    store_t *st2 = NULL;
+    store_index_t *idx2 = NULL;
+    assert_int_equal(repo_register(db, TEST_REPO2, "t2", &id2), OK);
+    assert_int_equal(repo_store_open(TEST_REPO2, NULL, &st2), OK);
+    assert_int_equal(store_index_bind(st2, db, id2, &idx2), OK);
+    assert_int_equal(mkdir(TEST_SRC2, 0700), 0);
+    sh("head -c 50000 /dev/urandom > '%s/z' #%s", TEST_SRC2);
+    assert_int_equal(backup_into(st2, id2, TEST_SRC2), OK);
+    sh("head -c 100 /dev/urandom > '%s/y' #%s", TEST_SRC2);
+    assert_int_equal(backup_into(st2, id2, TEST_SRC2), OK);   /* its snapshot 2 */
+
+    pack_presence_t pp;
+    assert_int_equal(pack_presence_check(db, repo_id, 0, &pp), OK);
+    assert_false(pp.unavailable);
+    assert_int_equal(pp.packs_checked, 1);
+    assert_int_equal(pack_presence_check(db, id2, 0, &pp), OK);
+    assert_false(pp.unavailable);
+
+    char u1[64], u2[64], i1[64], i2[64], j1[64], j2[64];
+    uuid_of(repo_id, u1, sizeof(u1));
+    uuid_of(id2, u2, sizeof(u2));
+    identity_of(repo_id, i1, sizeof(i1));
+    identity_of(id2, i2, sizeof(i2));
+    assert_true(i1[0] && i2[0]);
+
+    swap_roots();
+    pack_cache_invalidate(store);
+    pack_cache_invalidate(st2);
+    char *l1 = listing(TEST_REPO), *l2 = listing(TEST_REPO2);
+
+    const struct { int64_t id; const char *mine, *theirs; } cases[2] = {
+        { repo_id, u1, u2 }, { id2, u2, u1 },
+    };
+    for (int k = 0; k < 2; k++) {
+        char want[200];
+        snprintf(want, sizeof(want), "holds repository %s, not %s", cases[k].theirs, cases[k].mine);
+        assert_int_equal(pack_presence_check(db, cases[k].id, 0, &pp), OK);
+        assert_true(pp.unavailable);
+        assert_non_null(strstr(pp.why, want));
+        /* The operator's repair does not get to accept another repository. */
+        assert_int_equal(pack_presence_check(db, cases[k].id, 1, &pp), OK);
+        assert_true(pp.unavailable);
+        assert_int_equal(pp.packs_dropped, 0);
+        char why[PACK_PRESENCE_WHY_MAX];
+        assert_int_equal(pack_presence_available(db, cases[k].id, why, sizeof(why)), 0);
+        assert_non_null(strstr(why, want));
+        assert_int_equal(pack_presence_require(db, cases[k].id), ERR_UNAVAILABLE);
+        assert_non_null(strstr(err_msg(), want));
+        err_clear();
+    }
+    assert_int_equal(backup(NULL), ERR_UNAVAILABLE);
+    err_clear();
+    assert_int_equal(backup_into(st2, id2, TEST_SRC2), ERR_UNAVAILABLE);
+    err_clear();
+
+    /*
+     * The start-up paths that read or write a repository by its path pass
+     * it by too: reconcile would have read repo2's snapshot 2 as one this
+     * repository's index lost and queued a reindex of the wrong data, and
+     * finishing an interrupted prune would have unlinked repo2's record.
+     */
+    reconcile_result_t rec;
+    assert_int_equal(index_reconcile(db, NULL, NULL, &rec), OK);
+    assert_int_equal(rec.repos_unreadable, 2);
+    assert_int_equal(rec.repos_missing, 0);
+    assert_int_equal(rec.tags_restored, 0);
+    char rid[32];
+    snprintf(rid, sizeof(rid), "%lld", (long long)repo_id);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO recovery_state (repo_id, key, value) VALUES (?, 'prune-pending-9', '9')",
+        (const char *[]){ rid, NULL }, NULL), 0);
+    sh("cp '%s/snapshots/1' '%s/snapshots/9'", TEST_REPO);
+    free(l1);
+    l1 = listing(TEST_REPO);   /* with the planted record */
+    assert_int_equal(prune_finish_pending(db, repo_id, NULL), OK);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?"
+                            " AND key = 'prune-pending-9'"), 1);
+
+    /* Nothing recorded, nothing dropped, nothing written. */
+    identity_of(repo_id, j1, sizeof(j1));
+    identity_of(id2, j2, sizeof(j2));
+    assert_string_equal(i1, j1);
+    assert_string_equal(i2, j2);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE location = 'absent'"), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM pack_tombstones"), 0);
+    char *m1 = listing(TEST_REPO), *m2 = listing(TEST_REPO2);
+    assert_string_equal(l1, m1);
+    assert_string_equal(l2, m2);
+    free(l1); free(l2); free(m1); free(m2);
+
+    swap_roots();
+    pack_cache_invalidate(store);
+    pack_cache_invalidate(st2);
+    assert_int_equal(unlink(TEST_REPO2 "/snapshots/9"), 0);
+    assert_int_equal(pack_presence_available(db, repo_id, NULL, 0), 1);
+    assert_int_equal(pack_presence_available(db, id2, NULL, 0), 1);
+    assert_restores(s1);
+    verify_result_t v = verify();
+    assert_int_equal(v.missing, 0);
+    assert_int_equal(v.unrecoverable, 0);
+    assert_int_equal(v.checked, v.ok);
+
+    store_index_free(idx2);
+    store_close(st2);
+}
+
+/*
+ * Every pack missing, and the root's marker is another repository's: the
+ * all-missing repair checked no marker and would have dropped every pack
+ * of this one on the strength of a path (B165). Refused, nothing dropped;
+ * with this repository's marker back, the same repair goes through.
+ */
+static void test_all_missing_repair_needs_this_marker(void **state)
+{
+    (void)state;
+    write_file("a", 1, 40000);
+    int64_t s1 = backup_ok();
+    (void)s1;
+    remove_pack(pack_of("a"));
+
+    char own[PATH_MAX];
+    snprintf(own, sizeof(own), "%s/" CBACKUP_MARKER, TEST_DIR);
+    assert_int_equal(rename(TEST_REPO "/" CBACKUP_MARKER, own), 0);
+    repo_marker_t other, m;
+    memset(&other, 0, sizeof(other));
+    assert_int_equal(mkdir(TEST_REPO2, 0700), 0);
+    assert_int_equal(repo_marker_write(TEST_REPO2, &other), OK);
+    assert_int_equal(rename(TEST_REPO2 "/" CBACKUP_MARKER, TEST_REPO "/" CBACKUP_MARKER), 0);
+    assert_int_equal(repo_marker_read(TEST_REPO, &m), OK);
+
+    pack_presence_t pp;
+    assert_int_equal(pack_presence_check(db, repo_id, 1, &pp), OK);
+    assert_true(pp.unavailable);
+    assert_non_null(strstr(pp.why, "holds repository"));
+    assert_non_null(strstr(pp.why, m.uuid));
+    assert_int_equal(pp.packs_dropped, 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM packs WHERE repo_id = ?"), 1);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ? AND location = 'absent'"), 0);
+
+    assert_int_equal(rename(own, TEST_REPO "/" CBACKUP_MARKER), 0);
+    assert_int_equal(pack_presence_check(db, repo_id, 0, &pp), OK);
+    assert_true(pp.unavailable);
+    assert_non_null(strstr(pp.why, "none of the 1 packs"));
+    assert_int_equal(pack_presence_check(db, repo_id, 1, &pp), OK);
+    assert_false(pp.unavailable);
+    assert_int_equal(pp.packs_dropped, 1);
 }
 
 int main(void)
@@ -1114,6 +1358,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_an_empty_repository_root, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_mark_survives_a_lost_index, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_tombstone_floors_a_lost_mark, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_swapped_roots_are_unavailable, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_all_missing_repair_needs_this_marker, setup, teardown),
     };
     return cmocka_run_group_tests_name("pack_presence", tests, NULL, NULL);
 }
