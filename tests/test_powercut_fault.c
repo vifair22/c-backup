@@ -493,13 +493,21 @@ static void model_start(int crash_at)
     db_txn_set_durable_hooks(durable_gate, durable_done);
 }
 
+/* Outside the model nothing needs the real disk to be durable - the model
+ * is the disk - and real syncs were nearly all of the suite's time. */
+static int hook_nosync(int fd, int data_only)
+{
+    (void)fd; (void)data_only;
+    return 0;
+}
+
 static void model_off(void)
 {
     fault_write_hook  = NULL;
     fault_rename_hook = NULL;
     fault_unlink_hook = NULL;
     fault_mkdir_hook  = NULL;
-    fault_sync_hook   = NULL;
+    fault_sync_hook   = hook_nosync;
     db_txn_set_durable_hooks(NULL, NULL);
     pthread_mutex_lock(&g_mu);
     g_active = 0;
@@ -611,6 +619,9 @@ static void db_open_at(const char *path, cutils_db_t **out)
     assert_int_equal(db_open(out, path), 0);
     assert_non_null(g_last_conn);
     sqlite3_wal_hook(g_last_conn, wal_hook, NULL);
+    /* Which commits are durable is the model's to say, and the real syncs
+     * cost seconds; a checkpoint still copies the WAL in exactly the same. */
+    assert_int_equal(db_exec_raw(*out, "PRAGMA synchronous=OFF"), 0);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(*out, "PRAGMA page_size", NULL, &r), 0);
     g_page_size = atoi(r->rows[0][0]);
@@ -859,7 +870,6 @@ static void end_build(ctx_t *c)
     }
     g_npre = keep;
     ctx_close(c, 1);
-    sync();
     copy_tree(H_DIR, PRISTINE);
 }
 
@@ -1617,11 +1627,13 @@ static const scenario_t S_BACKUP_FIRST = { "backup, first", build_backup_first,
                                            op_backup_first, 0, 0 };
 static const scenario_t S_BACKUP_INCR  = { "backup, incremental", build_backup_incr,
                                            op_backup_incr, 0, 0 };
-static const scenario_t S_REPLICATE    = { "replicate-in", build_replicate, op_replicate, 1, 1 };
+static const scenario_t S_REPLICATE    = { "replicate-in", build_replicate, op_replicate,
+                                           1, 1 };
 static const scenario_t S_GC           = { "gc", build_gc, op_gc, 0, 0 };
 static const scenario_t S_COALESCE     = { "coalesce", build_coalesce, op_coalesce, 0, 0 };
 static const scenario_t S_SALVAGE      = { "salvage", build_salvage, op_salvage, 0, 0 };
-static const scenario_t S_REPOINT      = { "OWN-22 repoint", build_repoint, op_repoint, 0, 0 };
+static const scenario_t S_REPOINT      = { "OWN-22 repoint", build_repoint, op_repoint,
+                                           0, 0 };
 static const scenario_t S_PRUNE        = { "prune", build_prune, op_prune, 0, 0 };
 static const scenario_t S_REINDEX      = { "reindex", build_reindex, op_reindex, 0, 0 };
 
@@ -1760,6 +1772,7 @@ static int group_setup(void **state)
     rm_tree(H_KEEP);
     if (__real_mkdir(H_KEEP, 0700) != 0) return -1;
     repo_key_dir_set(H_KEYS);
+    fault_sync_hook = hook_nosync;
     make_versions();
     return 0;
 }
