@@ -72,6 +72,21 @@ static int strip_rel(char *rel, const restore_opts_t *o)
     return rel[0] == '\0';
 }
 
+static int path_within(const char *rel, const char *subpath);
+
+/*
+ * Is rel a directory strictly above the subpath, on the way to it? Not
+ * with strip_subpath, where nothing above the subpath is written. The
+ * root itself (rel empty) is dest.
+ */
+static int is_above_subpath(const char *rel, const restore_opts_t *o)
+{
+    if (o->strip_subpath) return 0;
+    while (*rel == '/') rel++;
+    if (!*rel) return 0;
+    return path_within(o->subpath, rel) && !path_within(rel, o->subpath);
+}
+
 /* Where rel lands under dest. -1 if too long. */
 static int dest_path(char *full, size_t sz, const char *dest, const char *rel, const restore_opts_t *o)
 {
@@ -1311,16 +1326,35 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         }
 
-        if (opts->subpath && !path_within(rel, opts->subpath))
+        /* A directory above the subpath is made on the way to it; it takes
+         * its recorded metadata, as in a whole restore, rather than a mode
+         * from the daemon's 0077 umask (an item restore's parents came back
+         * 0700 where a whole restore gives 0755). Not counted as matched. */
+        int above = opts->subpath && ntype == NODE_TYPE_DIR && is_above_subpath(rel, opts);
+        if (opts->subpath && !above && !path_within(rel, opts->subpath))
             continue;
         if (ntype == NODE_TYPE_REG) bytes_pending = strtoull(r->rows[i][6], NULL, 10);
-        matched++;
-        if (strip_rel(rel, opts)) {
+        if (!above) matched++;
+        if (!above && strip_rel(rel, opts)) {
             /* The subpath itself is dest, which exists; a file cannot be
              * stripped onto it. */
-            if (ntype != NODE_TYPE_DIR)
+            if (ntype != NODE_TYPE_DIR) {
                 restore_fail(&res, rel[0] ? rel : opts->subpath,
                              "a single file cannot be restored as the destination itself");
+                continue;
+            }
+            /* A directory can, and dest takes its metadata. dest is the
+             * staging directory an in-place unit restore swaps in as the
+             * mount (B168): left alone it kept the helper's 0700, root's
+             * group and the time of the restore, and the swap made that the
+             * live mount's. The mtime comes in the pass below, as for every
+             * directory. */
+            meta_target_t t = { dest_fd, NULL, 0, dest };
+            clear_acls(&t, 1);
+            apply_metadata_fd(dest_fd, dest, mode, uid, gid, mtime);
+            apply_xattrs(store, &t, xhash);
+            apply_acls(store, &t, ahash, 1);
+            res.dirs++;
             continue;
         }
 
@@ -1686,8 +1720,16 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             err_clear();
             continue;
         }
-        if (opts->subpath && !path_within(rel, opts->subpath)) continue;
-        if (strip_rel(rel, opts)) continue;
+        int above = opts->subpath && is_above_subpath(rel, opts);
+        if (opts->subpath && !above && !path_within(rel, opts->subpath)) continue;
+        if (!above && strip_rel(rel, opts)) {
+            struct timespec times[2];
+            times[0] = ns_to_timespec(strtoll(r->rows[i][5], NULL, 10));
+            times[1] = times[0];
+            if (futimens(dest_fd, times) != 0)
+                log_warn("restore: utimensat %s: %s", dest, strerror(errno));
+            continue;
+        }
         if (dest_path(full, sizeof(full), dest, rel, opts) != 0)
             continue;
 

@@ -2178,8 +2178,9 @@ static status_t write_pack_trailer(int fd, uint64_t body_len,
         pos += sizeof(pack_dat_entry_hdr_t) + by_offset[i].compressed_size;
     }
     if (pos != body_len)
-        return set_error(ERR_CORRUPT, "pack seal: entries end at %llu, body at %llu",
-                         (unsigned long long)pos, (unsigned long long)body_len);
+        return set_error(ERR_CORRUPT, "pack seal: entries end at %llu, body at %llu%s",
+                         (unsigned long long)pos, (unsigned long long)body_len,
+                         body_len < pos ? " (writes to the pack were lost: is the disk full?)" : "");
 
     rs_init();
     /*
@@ -2297,11 +2298,14 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
 
     /* Patch the object count into the dat header: the header is body, so
      * this happens before parity is computed over it. */
-    if (fseeko(*dat_f, 0, SEEK_SET) != 0) { st = ERR_IO; goto fail; }
+    /* A write that failed unseen (a buffer glibc dropped) says so here,
+     * before the trailer finds the body short of its entries. */
+    if (ferror(*dat_f)) { st = set_error(ERR_IO, "pack seal: an earlier write to the pack failed (is the disk full?)"); goto fail; }
+    if (fseeko(*dat_f, 0, SEEK_SET) != 0) { st = set_error_errno(ERR_IO, "pack seal: write"); goto fail; }
     dat_hdr->count = packed;
-    if (fwrite(dat_hdr, sizeof(*dat_hdr), 1, *dat_f) != 1) { st = ERR_IO; goto fail; }
+    if (fwrite(dat_hdr, sizeof(*dat_hdr), 1, *dat_f) != 1) { st = set_error_errno(ERR_IO, "pack seal: write the header"); goto fail; }
 
-    if (fseeko(*dat_f, 0, SEEK_END) != 0) { st = ERR_IO; goto fail; }
+    if (fseeko(*dat_f, 0, SEEK_END) != 0) { st = set_error_errno(ERR_IO, "pack seal: write"); goto fail; }
     off_t body_end = ftello(*dat_f);
     /* The format's bounds, enforced where every writer passes. Past them the
      * trailer's 32-bit sizes could wrap, and the readers refuse the pack. */
@@ -2824,16 +2828,25 @@ typedef struct {
  */
 #define PACK_WB_STEP ((uint64_t)8 * 1024 * 1024)
 
-static void pw_writeback(pack_writer_t *pw)
+/*
+ * The flush fails as any write does: a full disk here is a failed append.
+ * It used to be ignored, and glibc drops the buffered bytes a failed flush
+ * could not write, so the entries after them landed short of the offsets
+ * recorded for them. The append went on as if nothing had happened, and a
+ * full repository surfaced only at the seal, as "entries end at 267926002,
+ * body at 67096576", with nothing about the disk.
+ */
+static status_t pw_writeback(pack_writer_t *pw)
 {
     uint64_t end = sizeof(pack_dat_hdr_t) + pw->body_offset;
-    if (!pw->dat_f || end < pw->wb_done + PACK_WB_STEP) return;
+    if (!pw->dat_f || end < pw->wb_done + PACK_WB_STEP) return OK;
 #ifdef __linux__
-    if (fflush(pw->dat_f) != 0) return;
+    if (fflush(pw->dat_f) != 0) return set_error_errno(ERR_IO, "pack: write to %s", pw->dat_tmp);
     (void)sync_file_range(fileno(pw->dat_f), (off_t)pw->wb_done,
                           (off_t)(end - pw->wb_done), SYNC_FILE_RANGE_WRITE);
 #endif
     pw->wb_done = end;
+    return OK;
 }
 
 static int pw_ensure_capacity(pack_writer_t *pw, uint32_t need) {
@@ -2987,8 +3000,7 @@ static status_t pw_append_sealed(pack_writer_t *pw,
 
     pw->body_offset += sizeof(ehdr) + se->stored_size;
     pw->packed++;
-    pw_writeback(pw);
-    return OK;
+    return pw_writeback(pw);
 }
 
 /* Seal and append in one step, on the writer's thread. */

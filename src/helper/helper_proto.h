@@ -92,8 +92,12 @@ typedef struct {
 typedef struct {
     helper_op_t op;
     int64_t     id;
-    /* hello */
+    /* hello; its session token lands in token */
     int64_t     client_version;
+    int         anchor;      /* this connection stays open for the daemon's life (B169) */
+    /* Not parsed: the session the connection's hello named, set by the
+     * server for every request on it ("" for none). */
+    char        conn_session[HELPER_TOKEN_HEX + 1];
     /* units.list */
     char        provider[16];
     /* unit, units */
@@ -102,6 +106,7 @@ typedef struct {
     size_t      n_units;
     int         pause;
     int         hold;        /* capture.begin: keep a pause for the daemon's second pass */
+    int         undo;        /* restore.swap: put back what a swap replaced */
     /* capture.begin_paths */
     char       *paths[HELPER_PATHS_MAX];
     size_t      n_paths;
