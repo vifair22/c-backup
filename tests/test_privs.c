@@ -96,15 +96,31 @@ static void test_root_drop(void **state)
         pid_t c = fork();
         assert_true(c >= 0);
         if (c == 0) {
+            gid_t g0[64], g1[64];
+            int n0 = getgroups(64, g0);
+            uint64_t e0 = 0, p0 = 0, e1 = 0, p1 = 0;
+            (void)privs_current(&e0, &p0);
+            int ssh0 = prctl(PR_CAPBSET_READ, CAP_SYS_ADMIN, 0, 0, 0);
             status_t st = privs_drop(990, 990);
-            _exit(st != OK && strstr(err_msg(), "CAP_DAC_READ_SEARCH") ? 0 : 1);
+            int bad = !(st != OK && strstr(err_msg(), "CAP_DAC_READ_SEARCH"));
+            /* A refusal leaves the process exactly as it was. */
+            uid_t r, e, sv;
+            gid_t gr, ge, gs;
+            if (getresuid(&r, &e, &sv) != 0 || r != 0 || e != 0 || sv != 0) bad |= 2;
+            if (getresgid(&gr, &ge, &gs) != 0 || gr != 0 || ge != 0 || gs != 0) bad |= 4;
+            int n1 = getgroups(64, g1);
+            if (n1 != n0 || (n0 > 0 && memcmp(g0, g1, (size_t)n0 * sizeof(gid_t)) != 0)) bad |= 8;
+            (void)privs_current(&e1, &p1);
+            if (e1 != e0 || p1 != p0) bad |= 16;
+            if (prctl(PR_CAPBSET_READ, CAP_SYS_ADMIN, 0, 0, 0) != ssh0) bad |= 32;
+            _exit(bad);
         }
         int cs = 0;
         waitpid(c, &cs, 0);
         assert_true(WIFEXITED(cs));
         assert_int_equal(WEXITSTATUS(cs), 0);
-        print_message("no CAP_DAC_READ_SEARCH in this process's bounding set: the refusal is "
-                      "checked, the drop is not\n");
+        print_message("no CAP_DAC_READ_SEARCH in this process's bounding set: the refusal, and "
+                      "that it changed nothing, are checked; the drop is not\n");
         skip();
     }
     pid_t pid = fork();
