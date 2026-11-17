@@ -10,6 +10,7 @@
 #include "trigger.h"
 #include "json_row.h"
 #include "snap_record.h"
+#include "tzinfo.h"
 
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
@@ -34,52 +35,10 @@ static scheduler_t *g_sched;
 
 /*
  * The zone calendar triggers are evaluated in, by name where one can be
- * found. A Docker image with no TZ runs in UTC, so "--at 03:00" fired at
- * 03:00 UTC while the operator read it as their own 03:00, and nothing in
- * the API said which zone the daemon was in.
- *
- * TZ first, since it overrides everything; then the /etc/localtime link,
- * whose target names the zone; then Debian's /etc/timezone; and the
- * abbreviation localtime reports ("UTC", "CST") when none of those say.
+ * found (tzinfo.h). A Docker image with no TZ runs in UTC, so "--at 03:00"
+ * fired at 03:00 UTC while the operator read it as their own 03:00, and
+ * nothing in the API said which zone the daemon was in.
  */
-static void daemon_timezone(char *out, size_t outsz)
-{
-    const char *tz = getenv("TZ");
-    char link[PATH_MAX];
-    const char *name = NULL;
-
-    if (tz && *tz) {
-        name = tz[0] == ':' ? tz + 1 : tz;
-    } else {
-        ssize_t n = readlink("/etc/localtime", link, sizeof(link) - 1);
-        if (n > 0) {
-            link[n] = '\0';
-            name = link;
-        } else {
-            FILE *f = fopen("/etc/timezone", "r");
-            if (f) {
-                if (fgets(link, sizeof(link), f)) {
-                    link[strcspn(link, "\r\n")] = '\0';
-                    if (link[0]) name = link;
-                }
-                fclose(f);
-            }
-        }
-    }
-    if (name) {
-        const char *zi = strstr(name, "zoneinfo/");
-        if (zi) name = zi + 9;
-        /* A name that does not fit is not a name; fall through to the
-         * abbreviation rather than report half of one. */
-        if (*name && strlen(name) < outsz) { memcpy(out, name, strlen(name) + 1); return; }
-    }
-
-    time_t now = time(NULL);
-    struct tm tm;
-    localtime_r(&now, &tm);
-    if (strftime(out, outsz, "%Z", &tm) == 0) snprintf(out, outsz, "UTC");
-}
-
 /* Local time with its offset, "2026-11-16T03:00:00-06:00", or "" for no
  * instant. strftime's %z has no colon; ISO 8601 readers want one. */
 static void iso_local(time_t t, char *out, size_t outsz)
@@ -139,7 +98,7 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
     if (!arr) { cJSON_Delete(root); db_result_free(r); return api_error(500, "out of memory"); }
 
     char tz[128];
-    daemon_timezone(tz, sizeof(tz));
+    tz_name(tz, sizeof(tz));
     cJSON_AddStringToObject(root, "timezone", tz);
 
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
