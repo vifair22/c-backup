@@ -22,7 +22,7 @@
  *   - raw:     db_txn_begin/insert/commit, the shape every other writer has
  *
  * The backup covers files up to near the 16 MiB object bound (two of 6 MiB
- * and one of 15 MiB) and 12,000 small ones, past the 2,000-entry
+ * and one of 15 MiB) and 60,000 small ones, past the 2,000-entry
  * batch, so it crosses count commits, commits for a waiter mid-file and pack
  * seals.
  *
@@ -31,7 +31,9 @@
  * and sources writers sync a file per write, and the backup over 3,000 files
  * finished inside eight of their writes. More small files make the backup
  * long enough to overlap MIN_DURING of them at the cost of a few MiB of
- * scratch, rather than loosening what overlap means.
+ * scratch, rather than loosening what overlap means. 12,000 was enough
+ * while the suite ran at c-utils' synchronous=FULL; at the daemon's
+ * NORMAL (B144) that backup took under a second, inside five tag writes.
  *
  * What is asserted: no handler returns anything but success, every write is
  * in the final state, no single write waited longer than the bound, the
@@ -65,6 +67,7 @@
 #include "repo.h"
 #include "routes.h"
 #include "server.h"
+#include "state_db.h"
 #include "store.h"
 #include "store_index.h"
 #include "verify.h"
@@ -76,7 +79,7 @@
 #define TEST_SRC  TEST_DIR "/src"     /* what the stressed backup reads */
 #define TEST_SRC2 TEST_DIR "/src2"    /* snapshot 1, for the tags */
 
-#define N_SMALL   12000             /* past CACHE_BATCH, so count commits too */
+#define N_SMALL   60000             /* past CACHE_BATCH, so count commits too */
 #define N_FILES   (N_SMALL + 3)       /* plus two 6 MiB and one 15 MiB */
 #define MIN_ITERS 40                  /* per writer, backup or no backup */
 #define MIN_DURING 10                 /* per writer, while the backup runs */
@@ -159,6 +162,14 @@ static int setup(void **state)
     if (db_open(&db, TEST_DB) != 0) return -1;
     if (db_run_lib_migrations(db) != 0) return -1;
     if (db_run_compiled_migrations(db, app_migrations) != 0) return -1;
+    /* The daemon's settings, not c-utils' defaults: synchronous=NORMAL with
+     * the once-a-second WAL flusher, the cache and the autocheckpoint
+     * interval. At c-utils' synchronous=FULL every commit synced the WAL
+     * under the write lock, which the daemon never does. */
+    state_db_tuning_t tune = { STATE_DB_SYNC_DEFAULT, STATE_DB_CACHE_MB_DEFAULT,
+                               STATE_DB_AUTOCKPT_DEFAULT };
+    if (state_db_tune(db, &tune) != OK) return -1;
+    if (state_db_flusher_start(TEST_DB, 1000) != OK) return -1;
     if (repo_register(db, TEST_REPO, "stress", &repo_id) != OK) return -1;
     if (store_open(TEST_REPO, NULL, &store) != OK) return -1;
     if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
@@ -175,6 +186,7 @@ static int teardown(void **state)
     (void)state;
     store_index_free(idx); idx = NULL;
     store_close(store);    store = NULL;
+    state_db_flusher_stop();
     db_close(db);          db = NULL;
     rmrf(TEST_DIR);
     return 0;
@@ -189,10 +201,18 @@ static void note_error(writer_t *w, const char *what, const api_response_t *r)
                  what, r ? r->status : 0, (r && r->body) ? r->body : "");
 }
 
+/* As the server answers a request: a write that succeeded is made durable
+ * before the client hears so (api_server_set_after_write), and that wait
+ * is part of what the client sees. */
 static int call(writer_t *w, const char *what, api_response_t r)
 {
     int ok = r.status >= 200 && r.status < 300;
     if (!ok) note_error(w, what, &r);
+    if (ok && db_txn_make_durable(db) != OK) {
+        note_error(w, "make durable", NULL);
+        err_clear();
+        ok = 0;
+    }
     free(r.body);
     free(r.set_cookie);
     return ok;
@@ -386,7 +406,7 @@ static void test_writes_during_a_backup_all_land(void **state)
 
     for (int i = 0; i < N_SMALL; i++) {
         char path[128], body[96];
-        snprintf(path, sizeof(path), TEST_SRC "/small%03d.txt", i);
+        snprintf(path, sizeof(path), TEST_SRC "/small%05d.txt", i);
         snprintf(body, sizeof(body), "small file %d of the stress backup\n", i);
         write_file(path, body);
     }

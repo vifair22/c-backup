@@ -50,6 +50,7 @@
  */
 
 #include <cutils/db.h>
+#include <stddef.h>
 
 #include "error.h"
 
@@ -119,13 +120,39 @@ int  db_txn_batch_contended(const db_txn_batch_t *b);
  * about to remove the only other copy of what a commit describes calls
  * this first.
  *
- * A full WAL checkpoint, under the write lock so no transaction is open on
- * the shared connection: SQLite syncs the WAL before copying it into the
- * database and syncs the database after. ERR_IO when the checkpoint could
- * not complete, which callers treat as "do not remove anything yet". Must
- * not be called while this thread holds the write lock.
+ * An fdatasync of the WAL, with no lock held during it (B144). It first
+ * takes the write lock and lets it straight go, so a transaction open on
+ * the shared connection has committed: a write made outside db_txn lands
+ * in whatever transaction another thread has open, and is only committed
+ * with it. In WAL mode a commit
+ * is durable once its frames are: recovery replays every WAL frame up to
+ * the last commit whose checksums hold, and the copy into the database
+ * file is a cache, not part of durability. Every commit that returned
+ * before this was called has written its frames into the WAL file (NORMAL
+ * leaves out only the sync), so one sync of that file, from any
+ * descriptor, covers them all, whatever other threads commit meanwhile.
+ * The frames a later WAL restart overwrites were checkpointed first, and a
+ * complete checkpoint syncs the database before the WAL is reused.
+ *
+ * It used to be a FULL checkpoint taken under the write lock: up to the
+ * whole WAL (64 MiB by default) copied into the database, with two syncs,
+ * while every writer, a running backup's batches and each API edit
+ * included, queued behind it. Since every API write calls this before
+ * answering (api_server_set_after_write), that put a checkpoint on the
+ * request path of every tag, note and sources edit, and a seconds-long
+ * wait on every other writer during a backup on slow storage.
+ *
+ * ERR_IO when the WAL could not be synced, which callers treat as "do not
+ * remove anything yet". Must not be called while this thread holds the
+ * write lock: its own transaction is not committed, so there is nothing
+ * of it to make durable.
  */
 status_t db_txn_make_durable(cutils_db_t *db);
+
+/* The WAL file db_txn_make_durable syncs: "<main database file>-wal" when
+ * the database is in WAL mode and on disk, "" when there is none (rollback
+ * journal, in memory). 0, or -1 when it cannot be determined. */
+int db_txn_wal_path(cutils_db_t *db, char *out, size_t outsz);
 
 /* Completed db_txn_make_durable calls since the process started; for tests
  * proving an irreversible step came after one. */
@@ -133,9 +160,11 @@ unsigned long db_txn_durable_count(void);
 
 /*
  * For the power-cut tests: a gate asked before every make_durable, whose
- * non-OK answer fails it with nothing checkpointed (the cut came first),
- * and a callback after each one completes, still under the write lock, so
- * the database file it sees is exactly what was made durable. NULL clears.
+ * non-OK answer fails it with nothing synced (the cut came first), and a
+ * callback after each one completes. Every commit that returned before the
+ * gate was asked is durable once the callback runs; a commit made between
+ * the two may or may not be, so a model has to take the WAL as of the gate.
+ * NULL clears.
  */
 void db_txn_set_durable_hooks(status_t (*gate)(void), void (*done)(void));
 

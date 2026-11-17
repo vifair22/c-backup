@@ -28,8 +28,11 @@
  *     its last fsync saw goes back to what it was before the operation, or
  *     is emptied if it is new.
  *   - The index comes back two ways: as of the last make_durable (the WAL
- *     was never synced), and with every commit made before the cut (the
- *     flusher synced it just in time). The disk is the same in both.
+ *     cut back to what that sync covered, B144), and with every commit made
+ *     before the cut (the flusher synced it just in time). The disk is the
+ *     same in both. The database file itself never changes during an
+ *     operation: nothing checkpoints, so a commit is durable exactly when
+ *     the WAL frames holding it are, which is what make_durable syncs.
  *   - Then the daemon's start runs as it does after an outage: drop the
  *     rows of interrupted pack commits and staged rows, reconcile (with any
  *     reindex it asks for run inline), resume interrupted pack removals.
@@ -261,8 +264,10 @@ static int      g_crash_at;      /* 0: never; else the step that does not happen
 static int      g_steps;
 static int      g_crashed;
 static int      g_graves;
-static int      g_commit_since_durable;
 static uint64_t g_wal_bytes;     /* the WAL as of the last commit before the cut */
+static uint64_t g_gate_wal;      /* the WAL when the latest make_durable began */
+static uint64_t g_durable_wal;   /* the WAL a completed make_durable covers */
+static int      g_wal_dir_synced; /* H_DIR synced since the -wal was created */
 static int      g_page_size;
 static char     g_model_err[256];   /* set under g_mu, reported outside it */
 
@@ -403,7 +408,20 @@ static int hook_sync(int fd, int data_only)
 {
     (void)data_only;
     char p[PATH_MAX];
-    if (fd_path(fd, p, sizeof(p)) != 0 || !in_scope(p)) return FAULT_FS_PASS;
+    if (fd_path(fd, p, sizeof(p)) != 0) return FAULT_FS_PASS;
+    /* state.db's directory: the -wal is created when the database is first
+     * read in a trial, so its name is durable only once this is synced
+     * (wal_sync.h). A step like any other, so a cut can land before it. */
+    if (strcmp(p, H_DIR) == 0) {
+        pthread_mutex_lock(&g_mu);
+        if (g_active) {
+            if (!step_locked(K_FS)) { pthread_mutex_unlock(&g_mu); errno = EIO; return -1; }
+            g_wal_dir_synced = 1;
+        }
+        pthread_mutex_unlock(&g_mu);
+        return FAULT_FS_PASS;
+    }
+    if (!in_scope(p)) return FAULT_FS_PASS;
     pthread_mutex_lock(&g_mu);
     if (!step_locked(K_FS)) { pthread_mutex_unlock(&g_mu); errno = EIO; return -1; }
     struct stat sb;
@@ -425,28 +443,30 @@ static int hook_sync(int fd, int data_only)
     return 0;
 }
 
+/* make_durable syncs the WAL with no lock held, so a commit another
+ * thread makes while it runs may or may not be covered. The model takes
+ * the WAL as it was when the sync began, the most a power cut is
+ * guaranteed to leave. */
 static status_t durable_gate(void)
 {
     pthread_mutex_lock(&g_mu);
     int ok = step_locked(K_DURABLE);
+    if (ok) g_gate_wal = g_wal_bytes;
     pthread_mutex_unlock(&g_mu);
     return ok ? OK : set_error(ERR_IO, "power cut");
 }
 
-/* Under db_txn's write lock, straight after a full checkpoint: the
- * database file is everything durable, and is what a cut from here on
- * leaves when the WAL never got synced. */
 static void durable_done(void)
 {
-    copy_file(H_DB, DB_LOST);
     pthread_mutex_lock(&g_mu);
-    g_commit_since_durable = 0;
+    if (g_gate_wal > g_durable_wal) g_durable_wal = g_gate_wal;
     pthread_mutex_unlock(&g_mu);
 }
 
 /* Every commit, on every connection; only state.db's are steps. Replacing
  * the WAL hook also turns off SQLite's automatic checkpoint, so the
- * database file changes only at make_durable, which the gate controls. */
+ * database file does not change during an operation and the WAL is never
+ * restarted: a WAL prefix is exactly the commits made up to that point. */
 static int wal_hook(void *user, sqlite3 *db, const char *name, int pages)
 {
     (void)user;
@@ -455,7 +475,6 @@ static int wal_hook(void *user, sqlite3 *db, const char *name, int pages)
     pthread_mutex_lock(&g_mu);
     if (g_active && step_locked(K_COMMIT)) {
         g_wal_bytes = 32 + (uint64_t)pages * (24 + (uint64_t)g_page_size);
-        g_commit_since_durable = 1;
     }
     pthread_mutex_unlock(&g_mu);
     return SQLITE_OK;
@@ -485,8 +504,10 @@ static void model_start(int crash_at)
     g_crashed = 0;
     g_graves = 0;
     g_crash_at = crash_at;
-    g_commit_since_durable = 0;
     g_wal_bytes = 0;
+    g_gate_wal = 0;
+    g_durable_wal = 0;
+    g_wal_dir_synced = 0;
     memset(g_count, 0, sizeof(g_count));
     g_active = 1;
     pthread_mutex_unlock(&g_mu);
@@ -1438,7 +1459,9 @@ static void install_index(int kept)
     (void)remove(H_DB "-wal");
     (void)remove(H_DB "-shm");
     copy_file(kept ? DB_KEPT : DB_LOST, H_DB);
-    if (kept) copy_file(DB_KEPT "-wal", H_DB "-wal");
+    struct stat sb;
+    if (stat(kept ? DB_KEPT "-wal" : DB_LOST "-wal", &sb) == 0)
+        copy_file(kept ? DB_KEPT "-wal" : DB_LOST "-wal", H_DB "-wal");
 }
 
 static void restore_pristine(void)
@@ -1446,6 +1469,7 @@ static void restore_pristine(void)
     rm_tree(H_DIR);
     copy_tree(PRISTINE, H_DIR);
     copy_file(H_DB, DB_LOST);
+    (void)remove(DB_LOST "-wal");
 }
 
 typedef struct {
@@ -1470,7 +1494,23 @@ static int trial(const scenario_t *s, int crash_at, int total, int counting, tal
 
     int steps = g_steps;
     step_kind_t at = crash_at && crash_at <= MAX_STEPS ? (step_kind_t)g_kind[crash_at] : 0;
-    int kept = g_commit_since_durable;
+    /* Lost: the database file, which nothing changed, and the WAL up to
+     * the last make_durable's sync; an unsynced tail is gone, and so is the
+     * whole -wal if its directory entry was never synced: the file was
+     * created in this trial and its name would not survive the cut. */
+    if (!g_wal_dir_synced) g_durable_wal = 0;
+    {
+        /* Which the model depends on: had anything checkpointed, a cut
+         * could keep database pages without the WAL frames they came from. */
+        uint64_t n0 = 0, n1 = 0;
+        uint64_t h0 = file_sum(PRISTINE "/state.db", &n0), h1 = file_sum(H_DB, &n1);
+        if (h0 != h1 || n0 != n1)
+            fail_msg("%s: state.db changed during the operation (a checkpoint ran)", s->name);
+    }
+    copy_file(H_DB, DB_LOST);
+    (void)remove(DB_LOST "-wal");
+    if (g_durable_wal > 0) copy_file_n(H_DB "-wal", DB_LOST "-wal", g_durable_wal);
+    int kept = g_wal_bytes > g_durable_wal;
     if (kept) {
         copy_file(H_DB, DB_KEPT);
         copy_file_n(H_DB "-wal", DB_KEPT "-wal", g_wal_bytes);
