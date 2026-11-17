@@ -406,6 +406,10 @@ static void test_unit_restore(void **state)
     /* In place without replace, and a new name without target_root. */
     assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), ERR_INVALID);
     assert_non_null(strstr(err_msg(), "pass replace"));
+    /* Its own name is the unit in place, not a new name. */
+    o.name = "cbk-uat-one";
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "pass replace"));
     o.name = "u1-copy";
     assert_int_equal(unit_define_run(store, db, repo_id, snap, 31, &o, &dr), ERR_INVALID);
     assert_non_null(strstr(err_msg(), "needs target_root"));

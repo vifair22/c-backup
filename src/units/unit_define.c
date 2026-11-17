@@ -51,6 +51,21 @@ int unit_define_check(const char *unit_id, const unit_define_opts_t *o, char *wh
     return 0;
 }
 
+const char *unit_define_name(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                             const char *unit_id, const char *name)
+{
+    if (!name || !*name || strcmp(name, unit_id) == 0) return NULL;
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    db_result_t *r = NULL;
+    int same = db_execute(db, "SELECT unit_name FROM snapshot_units WHERE repo_id = ? AND snap_id = ?",
+                          (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1 &&
+               strcmp(r->rows[0][0], name) == 0;
+    db_result_free(r);
+    return same ? NULL : name;
+}
+
 void unit_define_result_free(unit_define_result_t *r)
 {
     if (!r) return;
@@ -680,6 +695,11 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
     if (!colon || (size_t)(colon - key) >= sizeof(prov)) return set_error(ERR_CORRUPT, "unit restore: bad unit key %s", key);
     snprintf(prov, sizeof(prov), "%.*s", (int)(colon - key), key);
     const char *unit = colon + 1;
+    /* --name with the unit's own name is the unit in place: it was taken
+     * for a new name, compared with the id alone. */
+    unit_define_opts_t own = *o;
+    own.name = unit_define_name(db, repo_id, snap_id, unit, o->name);
+    o = &own;
     char why[512];
     if (unit_define_check(unit, o, why, sizeof(why)) != 0) return set_error(ERR_INVALID, "%s", why);
     int new_name = o->name && *o->name && strcmp(o->name, unit) != 0;

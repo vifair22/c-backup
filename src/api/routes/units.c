@@ -1101,7 +1101,8 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     if (unit_mode) {
         unit_define_opts_t chk;
         memset(&chk, 0, sizeof(chk));
-        chk.name = uname;
+        const char *colon0 = strchr(key, ':');
+        chk.name = unit_define_name(g_db, repo_id, snap_id, colon0 ? colon0 + 1 : key, uname);
         chk.target_root = troot;
         chk.replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "replace"));
         char why[512];

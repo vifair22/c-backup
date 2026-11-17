@@ -222,6 +222,9 @@ echo "restore as a unit"
 OUT=$(cb unit restore 1 1 --define 2>&1); RC=$?
 check    "in place without --replace is refused" 1 "$RC"
 contains "and says to pass replace" "pass replace" "$OUT"
+OUT=$(cb unit restore 1 1 --define --name cbk-uat-a 2>&1); RC=$?
+check    "its own name is in place, so without --replace it is refused" 1 "$RC"
+contains "asking for replace, not a target root" "pass replace" "$OUT"
 OUT=$(cb unit restore 1 1 --define --name cbk-uat-b 2>&1); RC=$?
 check    "a new name without a target root is refused" 1 "$RC"
 contains "and says so" "needs target_root" "$OUT"
