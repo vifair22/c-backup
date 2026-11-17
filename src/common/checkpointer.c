@@ -3,6 +3,7 @@
 #include "checkpointer.h"
 
 #include "db_txn.h"
+#include "thread_name.h"
 
 #include <cutils/db.h>
 #include <cutils/log.h>
@@ -192,6 +193,7 @@ static void tick(void)
 
 static void *main_loop(void *arg)
 {
+    thread_name("cb-checkpoint");
     (void)arg;
     pthread_mutex_lock(&g_mu);
     while (!g_stop) {

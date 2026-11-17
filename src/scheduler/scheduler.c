@@ -3,6 +3,7 @@
 #include "scheduler.h"
 #include "trigger.h"
 #include "db_write.h"
+#include "thread_name.h"
 
 #include <cutils/log.h>
 
@@ -412,6 +413,7 @@ static int seconds_until_next(scheduler_t *sched, time_t now)
 
 static void *scheduler_main(void *arg)
 {
+    thread_name("cb-scheduler");
     scheduler_t *s = arg;
 
     while (1) {

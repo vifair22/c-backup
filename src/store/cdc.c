@@ -4,6 +4,7 @@
 #include "cdc.h"
 #include "read_budget.h"
 #include "types.h"
+#include "thread_name.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -290,6 +291,7 @@ static void buf_put(cdc_workers_t *w, uint8_t *b, size_t size)
 
 static void *worker_main(void *arg)
 {
+    thread_name("cb-chunk");
     cdc_workers_t *w = arg;
     pthread_mutex_lock(&w->mu);
     for (;;) {
@@ -811,6 +813,7 @@ typedef struct {
 
 static void *ra_main(void *arg)
 {
+    thread_name("cb-readahead");
     fd_src_t *f = arg;
     pthread_mutex_lock(&f->mu);
     for (;;) {

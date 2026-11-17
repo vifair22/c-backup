@@ -6,6 +6,7 @@
 #include "hooklog.h"
 #include "mounts.h"
 #include "snap.h"
+#include "thread_name.h"
 
 #include <cutils/log.h>
 
@@ -617,6 +618,7 @@ static void on_exec(void *ctx, int stream, const unsigned char *d, size_t n)
 
 static void *exec_main(void *arg)
 {
+    thread_name("cbh-docker-exec");
     struct helper_run *r = arg;
     status_t st = docker_exec_stream(&r->api, r->exec_id, on_exec, r);
     int code = 255;
@@ -848,6 +850,7 @@ typedef struct {
 
 static void *pause_main(void *arg)
 {
+    thread_name("cbh-docker-pause");
     pause_job_t *j = arg;
     j->st = pause_one(j->c, j->m, 1, NULL);
     if (j->st != OK) snprintf(j->why, sizeof(j->why), "%.250s", err_msg());

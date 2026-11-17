@@ -776,10 +776,20 @@ static status_t bsink_add_prepared(bsink_t *s, const pack_prepared_t *pp,
                                    int *out_is_new, uint64_t *out_phys)
 {
     status_t st = OK;
+    /*
+     * A full pack is sealed after the lock is let go (B184). Every chunk
+     * worker of the file appends through this lock, and the seal - parity,
+     * fsyncs, the install and the index commit - used to run inside it, so
+     * they all waited for the disk: 387 s of chunk-thread waits on this
+     * mutex for a 16 GiB backup on NVMe, 541 s with syncs at 40 ms. Now the
+     * full pack is taken off the writer here and sealed below, by the
+     * thread that filled it, while the others append to the next one.
+     */
+    pack_backup_sealing_t *sealing = NULL;
     pthread_mutex_lock(&s->mu);
     if (s->may_rollover && pack_backup_full(s->pw, pp->payload_len)) {
         st = bsink_flush(s, 1);
-        if (st == OK) st = pack_backup_rollover(s->pw);
+        if (st == OK) st = pack_backup_rollover_begin(s->pw, &sealing);
     }
     int is_new = 0;
     uint64_t phys = 0;
@@ -807,6 +817,10 @@ static status_t bsink_add_prepared(bsink_t *s, const pack_prepared_t *pp,
         }
     }
     pthread_mutex_unlock(&s->mu);
+    if (sealing) {
+        status_t sst = pack_backup_rollover_end(sealing);
+        if (st == OK) st = sst;
+    }
     *out_is_new = is_new;
     *out_phys = phys;
     return st;

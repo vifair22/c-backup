@@ -10,6 +10,7 @@
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "thread_name.h"
 
 #include <cutils/log.h>
 
@@ -1980,6 +1981,7 @@ typedef struct { helper_server_t *s; int fd; int slot; } conn_arg_t;
 
 static void *conn_main(void *arg)
 {
+    thread_name("cbh-session");
     conn_arg_t *c = arg;
     helper_server_t *s = c->s;
     char *buf = malloc(HELPER_PACKET_MAX + 2);
@@ -2037,6 +2039,7 @@ static void *conn_main(void *arg)
 
 static void *accept_main(void *arg)
 {
+    thread_name("cbh-accept");
     helper_server_t *s = arg;
     for (;;) {
         int fd = accept4(s->lfd, NULL, NULL, SOCK_CLOEXEC);
@@ -2128,6 +2131,7 @@ unsigned helper_server_tick(helper_server_t *s, int64_t now_ms)
 
 static void *wd_main(void *arg)
 {
+    thread_name("cbh-watchdog");
     helper_server_t *s = arg;
     pthread_mutex_lock(&s->cmu);
     while (!s->stop) {

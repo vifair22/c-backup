@@ -312,6 +312,23 @@ int pack_backup_full(const pack_backup_writer_t *w, uint64_t bytes);
  */
 status_t pack_backup_rollover(pack_backup_writer_t *w);
 
+/*
+ * Rollover in two halves, so a writer shared by several threads seals its
+ * full pack without holding their lock (B184). begin, under the caller's
+ * lock, takes the full pack off the writer and leaves it ready for the next
+ * one; end, with the lock released, seals what begin took - parity, fsync,
+ * install, the commit callback, then the claims - and frees it. Other
+ * threads keep appending to the writer's new pack meanwhile. Names in the
+ * pack being sealed stay claimed until its commit, under a claim token of
+ * their own, so the writer references rather than restores them, like any
+ * other writer would. A writer without a claim set has nothing to cover
+ * that window, and begin seals in place instead (*out is NULL); so does
+ * begin when it cannot allocate.
+ */
+typedef struct pack_backup_sealing pack_backup_sealing_t;
+status_t pack_backup_rollover_begin(pack_backup_writer_t *w, pack_backup_sealing_t **out);
+status_t pack_backup_rollover_end(pack_backup_sealing_t *s);
+
 /* Is this object staged in the writer's open pack, which is not on disk as a
  * pack until it is sealed? The index records such objects as staged. */
 int pack_backup_holds(const pack_backup_writer_t *w, const uint8_t hash[OBJECT_HASH_SIZE]);
