@@ -306,6 +306,32 @@ static int file_is(const char *path, const void *want, size_t n)
     return same;
 }
 
+/* The sweep thaws a journalled freeze; one it cannot count thawed
+ * filesystems for (a guest not running, a domain gone) is reported absent,
+ * so the watchdog keeps its record rather than drop a freeze that may
+ * still land (B151). */
+static void test_sweep_freeze_absent(void **state)
+{
+    (void)state;
+    sp_intent_t in[2] = { { 1, UUID, SP_HOLD_FREEZE, "freeze:" UUID, 3 },
+                          { 2, "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1cff", SP_HOLD_FREEZE,
+                            "freeze:8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1cff", 3 } };
+    int rel[2] = { 0, 0 }, absent[2] = { 0, 0 };
+    sp_sweep_req_t rq;
+    memset(&rq, 0, sizeof(rq));
+    rq.daemon8 = "0badf00d";
+    rq.intents = in;
+    rq.n_intents = 2;
+    rq.released = rel;
+    rq.absent = absent;
+    sp_sweep_report_t rep;
+    assert_int_equal(be.ops->sweep(be.ctx, &rq, &rep), OK);
+    assert_int_equal(rel[0], 1);
+    assert_int_equal(rel[1], 1);
+    assert_int_equal(absent[0], 1);
+    assert_int_equal(absent[1], 1);
+}
+
 static void test_offline_backup(void **state)
 {
     (void)state;
@@ -520,6 +546,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_offline_backup),
+        cmocka_unit_test(test_sweep_freeze_absent),
         cmocka_unit_test(test_restore_define),
         cmocka_unit_test(test_missing_state_refused),
         cmocka_unit_test(test_online_backup),
