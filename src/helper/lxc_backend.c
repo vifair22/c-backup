@@ -319,14 +319,22 @@ static status_t x_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     st = s->snaps.n ? snap_take(&c->snap, &s->snaps, c->pol->daemon_id, req->job_id, s->has_holds ? &s->holds : NULL) : OK;
     char why[512] = "";
     if (st != OK) snprintf(why, sizeof(why), "%.500s", err_msg());
+    int lost = 0;
     if (frozen) {
-        if (lxc(c, "lxc-unfreeze", s->name, NULL, NULL) == OK) {
+        /* No longer frozen: the watchdog thawed it, perhaps before the
+         * snapshot, which then saw a running container. Its journal row
+         * went with that release. */
+        lost = state_of(c, s->name) != SP_STATE_PAUSED;
+        if (lost) {
+            if (s->has_holds && hold && s->holds.clear(s->holds.ctx, hold) != OK) err_clear();
+        } else if (lxc(c, "lxc-unfreeze", s->name, NULL, NULL) == OK) {
             if (s->has_holds && hold && s->holds.clear(s->holds.ctx, hold) != OK) err_clear();
         } else {
             log_error("lxc: cannot unfreeze %s: %s; the watchdog retries", s->name, err_msg());
             err_clear();
         }
         s->info.freeze_ms = ms_now() - t0;
+        if (lost) frozen = 0;
     }
     if (st != OK) { session_free(s); return set_error(st, "%s", why); }
     int after = state_of(c, s->name);
@@ -336,8 +344,13 @@ static status_t x_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     else if (fallback || (instants > 1 && !frozen)) lvl = SP_CONSIST_INCONSISTENT;
     else lvl = SP_CONSIST_CRASH;
     if (fallback) (void)sp_session_info_warn(&s->info, "%zu mount(s) on no snapshot domain read live (fallback-live)", fallback);
+    if (lost)
+        (void)sp_session_info_warn(&s->info, "freeze on %s released by the watchdog within %llu ms; "
+                                   "consistency is %s", s->name,
+                                   (unsigned long long)s->info.freeze_ms, sp_consistency_name(lvl));
     s->info.achieved = lvl;
-    s->info.consist_flags = (frozen ? SP_CF_FROZEN : 0) | (s->snaps.n ? SP_CF_FS_SNAPSHOT : 0);
+    s->info.consist_flags = (frozen ? SP_CF_FROZEN : 0) | (s->snaps.n ? SP_CF_FS_SNAPSHOT : 0) |
+                            (lost ? SP_CF_WATCHDOG_RELEASED : 0);
     if (lvl < req->require) {
         (void)snap_release(&c->snap, &s->snaps, c->pol->daemon_id, s->has_holds ? &s->holds : NULL);
         session_free(s);
@@ -382,8 +395,11 @@ static status_t x_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
         const sp_intent_t *in = &req->intents[i];
         status_t st;
         if (strcmp(in->kind, SP_HOLD_FREEZE) == 0 && strncmp(in->detail, "lxc:", 4) == 0 && valid_name(in->detail + 4)) {
-            /* Unfreezing a container that is not frozen is harmless. */
-            st = state_of(c, in->detail + 4) == SP_STATE_PAUSED ? lxc(c, "lxc-unfreeze", in->detail + 4, NULL, NULL) : OK;
+            /* Unfreezing a container that is not frozen is harmless, and
+             * reported absent: it may be frozen in a moment (provider.h). */
+            int was = state_of(c, in->detail + 4) == SP_STATE_PAUSED;
+            st = was ? lxc(c, "lxc-unfreeze", in->detail + 4, NULL, NULL) : OK;
+            if (req->absent) req->absent[i] = !was;
         } else if (strcmp(in->kind, SP_HOLD_FS_SNAPSHOT) == 0) {
             st = snap_release_detail(&c->snap, in->detail, d8);
         } else {

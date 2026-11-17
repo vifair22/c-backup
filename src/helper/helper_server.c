@@ -47,11 +47,20 @@ typedef struct {
     char    unit[HELPER_UNIT_KEY_MAX + 1];  /* provider:id */
     char    kind[16];
     char    detail[192];
-    time_t  created;
+    int64_t created_ms;                     /* wall clock; 0 after a restart */
     int64_t capture;                        /* the capture's sequence number */
 } hold_t;
 
 struct jctx;
+
+/* Wall-clock milliseconds: a hold's age against max_pause_s. In whole
+ * seconds the watchdog fired up to a second early. */
+static int64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 typedef struct {
     char    unit[HELPER_UNIT_KEY_MAX + 1];
@@ -136,7 +145,7 @@ static void journal_save(helper_server_t *s)
         cJSON_AddStringToObject(o, "unit", s->holds[i].unit);
         cJSON_AddStringToObject(o, "kind", s->holds[i].kind);
         cJSON_AddStringToObject(o, "detail", s->holds[i].detail);
-        cJSON_AddNumberToObject(o, "created", (double)s->holds[i].created);
+        cJSON_AddNumberToObject(o, "created", (double)(s->holds[i].created_ms / 1000));
     }
     char *txt = a ? cJSON_PrintUnformatted(a) : NULL;
     cJSON_Delete(a);
@@ -174,7 +183,7 @@ static status_t j_record(void *ctx, const char *kind, const char *detail, int64_
     snprintf(h->unit, sizeof(h->unit), "%s", j->unit);
     snprintf(h->kind, sizeof(h->kind), "%s", kind);
     snprintf(h->detail, sizeof(h->detail), "%s", detail);
-    h->created = time(NULL);
+    h->created_ms = now_ms();
     h->capture = j->capture;
     *out = h->id;
     journal_save(s);
@@ -224,7 +233,7 @@ static void journal_load(helper_server_t *s)
         snprintf(h->unit, sizeof(h->unit), "%s", u);
         snprintf(h->kind, sizeof(h->kind), "%s", k);
         snprintf(h->detail, sizeof(h->detail), "%s", d);
-        h->created = 0;
+        h->created_ms = 0;
         h->capture = -1;              /* nobody's: the process that took it is gone */
         if (h->id > s->next_hold) s->next_hold = h->id;
     }
@@ -233,7 +242,10 @@ static void journal_load(helper_server_t *s)
 
 /*
  * Release the holds that select() picks, through the backend, and drop the
- * ones released. Returns how many were. Caller holds nothing.
+ * ones released. Returns how many were. Caller holds nothing. With
+ * keep_absent a hold the backend found nothing under stays journalled:
+ * the watchdog acts on live captures, whose holds are recorded before they
+ * are taken, so nothing held may mean not taken yet (sp_sweep_req_t).
  */
 typedef int (*hold_pick_fn)(const hold_t *h, void *ctx);
 
@@ -252,7 +264,8 @@ static const helper_backend_t *backend_of(const helper_server_t *s, const char *
     return NULL;
 }
 
-static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx, const char *why)
+static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx, int keep_absent,
+                              const char *why)
 {
     hold_t *picked = calloc(HOLDS_MAX, sizeof(*picked));
     if (!picked) return 0;
@@ -267,15 +280,18 @@ static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx,
         const char *uid = NULL;
         const helper_backend_t *b = backend_of(s, picked[i].unit, &uid);
         sp_intent_t in = { picked[i].id, uid, picked[i].kind, picked[i].detail, 0 };
-        int rel = 0;
+        int rel = 0, absent = 0;
         sp_sweep_req_t rq;
         memset(&rq, 0, sizeof(rq));
         rq.daemon8 = s->pol->daemon_id;
         rq.intents = &in;
         rq.n_intents = 1;
         rq.released = &rel;
+        rq.absent = &absent;
         sp_sweep_report_t rep;
-        if (b && b->ops->sweep && b->ops->sweep(b->ctx, &rq, &rep) == OK && rel) {
+        status_t st = b && b->ops->sweep ? b->ops->sweep(b->ctx, &rq, &rep) : ERR_INVALID;
+        if (st == OK && rel && absent && keep_absent) continue;
+        if (st == OK && rel) {
             jctx_t j = { s, "", 0 };
             (void)j_clear(&j, picked[i].id);
             released++;
@@ -292,13 +308,13 @@ static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx,
 
 static int pick_all(const hold_t *h, void *ctx) { (void)h; (void)ctx; return 1; }
 
-typedef struct { time_t now; unsigned pause_s; } age_t;
+typedef struct { int64_t now_ms; unsigned pause_s; } age_t;
 
 static int pick_old(const hold_t *h, void *ctx)
 {
     const age_t *a = ctx;
     int timed = strcmp(h->kind, SP_HOLD_FREEZE) == 0 || strcmp(h->kind, SP_HOLD_PAUSE) == 0;
-    return timed && h->created + (time_t)a->pause_s <= a->now;
+    return timed && h->created_ms + (int64_t)a->pause_s * 1000 <= a->now_ms;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1661,7 +1677,7 @@ static void sweep_artefacts(helper_server_t *s, sp_sweep_report_t *rep)
 
 static char *op_sweep(helper_server_t *s, const helper_req_t *r)
 {
-    unsigned rel = release_holds(s, pick_unowned, s, "sweep");
+    unsigned rel = release_holds(s, pick_unowned, s, 0, "sweep");
     sp_sweep_report_t rep;
     sweep_artefacts(s, &rep);
     cJSON *res = cJSON_CreateObject();
@@ -1857,10 +1873,11 @@ static void *accept_main(void *arg)
 /* Watchdog                                                            */
 /* ------------------------------------------------------------------ */
 
-unsigned helper_server_tick(helper_server_t *s, time_t now)
+unsigned helper_server_tick(helper_server_t *s, int64_t now_ms)
 {
-    age_t a = { now, s->pol->max_pause_s };
-    unsigned n = release_holds(s, pick_old, &a, "watchdog");
+    time_t now = (time_t)(now_ms / 1000);
+    age_t a = { now_ms, s->pol->max_pause_s };
+    unsigned n = release_holds(s, pick_old, &a, 1, "watchdog");
     /* Captures past their lease: ended, their snapshots destroyed. */
     for (;;) {
         capture_t c;
@@ -1897,7 +1914,7 @@ static void *wd_main(void *arg)
         pthread_cond_timedwait(&s->wcv, &s->cmu, &ts);
         if (s->stop) break;
         pthread_mutex_unlock(&s->cmu);
-        (void)helper_server_tick(s, time(NULL));
+        (void)helper_server_tick(s, now_ms());
         pthread_mutex_lock(&s->cmu);
     }
     pthread_mutex_unlock(&s->cmu);
@@ -2004,7 +2021,7 @@ status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **o
     /* Whatever the last helper process held is released before anything
      * new is taken, and leftovers of this daemon id are destroyed. */
     journal_load(s);
-    unsigned rel = release_holds(s, pick_all, NULL, "start-up sweep");
+    unsigned rel = release_holds(s, pick_all, NULL, 0, "start-up sweep");
     sp_sweep_report_t rep;
     sweep_artefacts(s, &rep);
     if (rel || rep.removed)
@@ -2077,4 +2094,13 @@ size_t helper_server_holds(helper_server_t *s)
     size_t n = s->n_holds;
     pthread_mutex_unlock(&s->jmu);
     return n;
+}
+
+status_t helper_server_record(helper_server_t *s, const char *unit, const char *kind,
+                              const char *detail)
+{
+    jctx_t j = { s, "", 0 };
+    snprintf(j.unit, sizeof(j.unit), "%s", unit);
+    int64_t id = 0;
+    return j_record(&j, kind, detail, &id);
 }
