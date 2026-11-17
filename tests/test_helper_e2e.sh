@@ -230,6 +230,20 @@ check    "the data is under the target root" alpha "$(cat "$WORK/target$WORK/poo
 check    "the original's path is untouched" "" "$(ls "$WORK/pool/app/a")"
 contains "the helper got the remapped paths" "$WORK/target$WORK/pool/app/a" "$(cat "$WORK/hstate/fake-define-a.json")"
 contains "its warning is in the journal" "fake define" "$(cb journal 1)"
+# B167: a define that fails after the swap puts the original back and
+# starts the unit again; it used to leave the new data in and the unit down.
+rm -f "$WORK/hstate/fake-define-a.json"
+mkdir "$WORK/hstate/fake-define-a.json"
+OUT=$(cb unit restore 1 1 --define --replace 2>&1); RC=$?
+check    "an in-place restore whose define fails fails" 1 "$RC"
+contains "and says it was rolled back" "rolled back" "$OUT"
+check    "the original data is still in place" "" "$(ls "$WORK/pool/app/a")"
+check    "nothing is left moved aside" "" "$(ls -d "$WORK/pool/app/a.cbackup-old-"* 2>/dev/null)"
+contains "and the unit runs again" '"state":"running"' "$(cb unit show fake cbk-uat-a)"
+contains "the error says where the restored copy was kept" "$WORK/pool/.cbackup-restore/" "$OUT"
+check    "and it is there" alpha "$(cat "$WORK/pool/.cbackup-restore/"*/a.txt 2>/dev/null)"
+rmdir "$WORK/hstate/fake-define-a.json"
+rm -rf "$WORK/pool/.cbackup-restore"
 OUT=$(cb unit restore 1 1 --define --replace)
 contains "an in-place restore completes" '"state":"completed"' "$OUT"
 check    "the data is back in place" alpha "$(cat "$WORK/pool/app/a/a.txt")"

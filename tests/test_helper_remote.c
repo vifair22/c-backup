@@ -169,6 +169,22 @@ static int setup_define(void **state)
     return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
 }
 
+/* As setup_define, with restore not allowed. */
+static int setup_define_norestore(void **state)
+{
+    (void)state;
+    if (setup_base() != 0) return -1;
+    char text[8192];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 0);
+    char *p = strstr(text, "allow_define = 0");
+    if (!p) return -1;
+    p[15] = '1';
+    helper_policy_free(&pol);
+    if (helper_policy_parse(text, &pol) != OK) return -1;
+    if (helper_up() != 0) return -1;
+    return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
+}
+
 static int teardown(void **state)
 {
     (void)state;
@@ -431,6 +447,101 @@ static void test_unit_restore(void **state)
     assert_int_not_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
 }
 
+/* No .cbackup-old-* beside the mount: nothing was moved aside. */
+static int moved_aside(void)
+{
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "ls -d '%s'.cbackup-old-* >/dev/null 2>&1", HF_MOUNT);
+    return system(cmd) == 0;
+}
+
+/* B167: a policy that refuses the define refuses the restore before
+ * anything is touched. It used to stop the unit, swap the data in, and
+ * only then fail at the define, the unit left down. */
+static void test_define_refused_first(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    unit_define_result_t dr;
+    o.replace = 1;
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 41, &o, &dr), OK);
+    assert_non_null(strstr(err_msg(), "nothing written"));
+    assert_non_null(strstr(err_msg(), "does not allow define"));
+    err_clear();
+    struct stat sb;
+    assert_int_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_int_not_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+    assert_false(moved_aside());
+    assert_int_equal(fake_unit_state(fk, "u1"), SP_STATE_RUNNING);
+    assert_int_not_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
+    /* A new name: refused before the target root is written, so a retry
+     * once the policy allows it is not refused for what the first left. */
+    o.replace = 0;
+    o.name = "u1-copy";
+    o.target_root = HF_DIR "/target";
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 42, &o, &dr), OK);
+    assert_non_null(strstr(err_msg(), "nothing written"));
+    err_clear();
+    assert_int_not_equal(stat(HF_DIR "/target", &sb), 0);
+}
+
+/* B167: in place needs allow_restore; refused before the unit stops. */
+static void test_in_place_needs_restore(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.replace = 1;
+    unit_define_result_t dr;
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 43, &o, &dr), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "allow_restore"));
+    err_clear();
+    struct stat sb;
+    assert_int_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_false(moved_aside());
+    assert_int_equal(fake_unit_state(fk, "u1"), SP_STATE_RUNNING);
+}
+
+/* B167: a define that fails after the swap (here the fake cannot write
+ * its record) puts the original data back and starts the unit again. */
+static void test_define_fails_rolls_back(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    assert_int_equal(mkdir(HF_DIR "/state/fake-define-u1.json", 0700), 0);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.replace = 1;
+    unit_define_result_t dr;
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 44, &o, &dr), OK);
+    assert_non_null(strstr(err_msg(), "rolled back"));
+    assert_non_null(strstr(err_msg(), "running again"));
+    err_clear();
+    struct stat sb;
+    assert_int_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_int_not_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+    assert_false(moved_aside());
+    assert_int_equal(fake_unit_state(fk, "u1"), SP_STATE_RUNNING);
+    /* Once the define can succeed, the same restore goes through. */
+    assert_int_equal(rmdir(HF_DIR "/state/fake-define-u1.json"), 0);
+    assert_int_equal(unit_define_run(store, db, repo_id, snap, 45, &o, &dr), OK);
+    unit_define_result_free(&dr);
+    assert_int_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+    assert_int_equal(stat(HF_MOUNT ".cbackup-old-45/live.txt", &sb), 0);
+}
+
 /* A compose project's definition as the daemon assembles it from a
  * snapshot: files, .env, services with their image records, and under a new
  * name the binds remapped under the target root. */
@@ -592,6 +703,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_large_blob, setup, teardown),
         cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
         cmocka_unit_test_setup_teardown(test_unit_restore, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_define_refused_first, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_in_place_needs_restore, setup_define_norestore, teardown),
+        cmocka_unit_test_setup_teardown(test_define_fails_rolls_back, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_compose_definition, setup, teardown),
         cmocka_unit_test_setup_teardown(test_group_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),

@@ -102,6 +102,7 @@ typedef struct {
     size_t      n_units;
     int         pause;
     int         hold;        /* capture.begin: keep a pause for the daemon's second pass */
+    int         undo;        /* restore.swap: put back what a swap replaced */
     /* capture.begin_paths */
     char       *paths[HELPER_PATHS_MAX];
     size_t      n_paths;

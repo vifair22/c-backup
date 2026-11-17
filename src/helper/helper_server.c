@@ -97,7 +97,9 @@ typedef struct {
     char     mount[HELPER_PATH_MAX + 1];
     char     path[HELPER_PATH_MAX + 1];
     int64_t  job;
-    int      swapped;
+    int      swapped;         /* swapped in: kept for an undo until the slot is wanted */
+    int      had;             /* the mount existed, and was moved to old */
+    char     old[HELPER_PATH_MAX + 1];
     int      file;            /* the mount is a disk image: <path>/image replaces it */
 } staging_t;
 
@@ -1396,10 +1398,15 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     pthread_mutex_lock(&s->mu);
     staging_t *slot = NULL;
     for (size_t i = 0; i < STAGINGS_MAX && !slot; i++) if (!s->stages[i].used) slot = &s->stages[i];
+    /* A swapped staging is only kept for an undo: the first to go when
+     * the table is full. */
+    for (size_t i = 0; i < STAGINGS_MAX && !slot; i++) if (s->stages[i].swapped) slot = &s->stages[i];
     char token[HELPER_TOKEN_HEX + 1] = "";
     if (slot && helper_random_hex(slot->token, 16) == OK) {
         slot->used = 1;
         slot->swapped = 0;
+        slot->had = 0;
+        slot->old[0] = '\0';
         slot->job = r->job;
         snprintf(slot->unit, sizeof(slot->unit), "%s", r->unit);
         snprintf(slot->mount, sizeof(slot->mount), "%s", r->mount);
@@ -1442,6 +1449,57 @@ static void staging_tidy(helper_server_t *s, const char *dir, int file)
     pthread_mutex_unlock(&s->mu);
 }
 
+/*
+ * restore.swap with undo (B167): what a swap did, reversed, for a restore
+ * that failed after it. The unit must still be stopped. The restored copy
+ * goes back to its staging directory, out of sight as it was, and the data
+ * moved aside comes back to the mount. A staging whose slot a later stage
+ * has taken has no undo; its data is still at <mount>.cbackup-old-<job>.
+ */
+static char *swap_undo(helper_server_t *s, const helper_req_t *r, const staging_t *st)
+{
+    if (!st->swapped) return resp_error(r->id, HELPER_E_INVALID, "not swapped; nothing to undo");
+    const char *suid = NULL;
+    const helper_backend_t *sb_ = backend_of(s, st->unit, &suid);
+    int state = sb_ && sb_->unit_state ? sb_->unit_state(sb_->ctx, suid) : -1;
+    if (state < 0)
+        return resp_error(r->id, HELPER_E_FAILED, "cannot tell whether %s is running", st->unit);
+    if (state == SP_STATE_RUNNING || state == SP_STATE_PAUSED)
+        return resp_error(r->id, HELPER_E_BUSY, "%s is running; stop it first", st->unit);
+    /* The staging directory again, and its base, which the swap may have
+     * removed as empty. */
+    char base[HELPER_PATH_MAX + 1], back[HELPER_PATH_MAX + 8];
+    snprintf(base, sizeof(base), "%s", st->path);
+    char *sl = strrchr(base, '/');
+    if (sl && sl != base) *sl = '\0';
+    pthread_mutex_lock(&s->mu);
+    int bad = mkdir_owned(base, s->pol->daemon_uid) != 0 ||
+              (st->file == 2 && mkdir_owned(st->path, s->pol->daemon_uid) != 0);
+    int err = errno;
+    pthread_mutex_unlock(&s->mu);
+    if (bad) return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", st->path, strerror(err));
+    snprintf(back, sizeof(back), st->file == 2 ? "%.4000s/image" : "%.4000s", st->path);
+    struct stat sb;
+    if (lstat(back, &sb) == 0) return resp_error(r->id, HELPER_E_BUSY, "%.300s already exists", back);
+    if (rename(st->mount, back) != 0)
+        return resp_error(r->id, HELPER_E_FAILED, "move the restored copy back: %s", strerror(errno));
+    if (st->had && rename(st->old, st->mount) != 0) {
+        err = errno;
+        (void)rename(back, st->mount);
+        return resp_error(r->id, HELPER_E_FAILED, "put %.300s back: %s", st->old, strerror(err));
+    }
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < STAGINGS_MAX; i++)
+        if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) s->stages[i].used = s->stages[i].swapped = 0;
+    pthread_mutex_unlock(&s->mu);
+    cJSON *res = cJSON_CreateObject();
+    if (res) {
+        cJSON_AddStringToObject(res, "mount", st->mount);
+        cJSON_AddStringToObject(res, "restored_copy", back);
+    }
+    return resp_ok(r->id, res);
+}
+
 static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
 {
     if (!s->pol->allow_restore) return resp_error(r->id, HELPER_E_DENIED, "the policy does not allow restore");
@@ -1452,6 +1510,7 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     if (x) st = *x;
     pthread_mutex_unlock(&s->mu);
     if (!x) return resp_error(r->id, HELPER_E_INVALID, "no such staging");
+    if (r->undo) return swap_undo(s, r, &st);
     if (st.swapped) return resp_error(r->id, HELPER_E_INVALID, "already swapped");
     if (st.file == 3) return resp_error(r->id, HELPER_E_INVALID, "this staging is for vm.install_state");
     char sdir[HELPER_PATH_MAX + 1];
@@ -1485,7 +1544,11 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     }
     pthread_mutex_lock(&s->mu);
     for (size_t i = 0; i < STAGINGS_MAX; i++)
-        if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) s->stages[i].used = 0;
+        if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) {
+            s->stages[i].swapped = 1;
+            s->stages[i].had = had;
+            snprintf(s->stages[i].old, sizeof(s->stages[i].old), "%s", old);
+        }
     pthread_mutex_unlock(&s->mu);
     staging_tidy(s, sdir, st.file);
     cJSON *res = cJSON_CreateObject();
@@ -1508,10 +1571,13 @@ static char *op_unit_stop_start(helper_server_t *s, const helper_req_t *r, int s
         return resp_error(r->id, e, "%s", why);
     if (!b->set_running)
         return resp_error(r->id, HELPER_E_UNSUPPORTED, "%s cannot be stopped or started here", r->unit);
+    /* What it was before, so a restore that fails can put that back. */
+    int was = b->unit_state ? b->unit_state(b->ctx, uid) : -1;
     if (b->set_running(b->ctx, uid, start) != OK)
         return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
     cJSON *res = cJSON_CreateObject();
     if (res) cJSON_AddStringToObject(res, "state", start ? "running" : "stopped");
+    if (res && was >= 0) cJSON_AddBoolToObject(res, "was_running", was == SP_STATE_RUNNING || was == SP_STATE_PAUSED);
     return resp_ok(r->id, res);
 }
 
@@ -1554,6 +1620,7 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd
     cJSON *d = cJSON_Parse(r->definition ? r->definition : "{}");
     int priv = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "privileged"));
     int by_fd = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "memfd"));
+    int check = by_fd && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "check"));
     cJSON_Delete(d);
     char *passed = NULL;
     if (by_fd) {
@@ -1580,6 +1647,21 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd
     if (!b->define) {
         free(passed);
         return resp_error(r->id, HELPER_E_UNSUPPORTED, "provider %s does not define units", b->name);
+    }
+    /* {"memfd": true, "check": true}: every refusal above, and nothing
+     * defined (B167). A restore asks before it writes anything, so a
+     * policy that would refuse the define refuses the restore instead of
+     * leaving its data swapped in; it learns here too whether it may
+     * stage and swap, and whether the unit runs. */
+    if (check) {
+        free(passed);
+        cJSON *cr = cJSON_CreateObject();
+        if (cr) {
+            cJSON_AddBoolToObject(cr, "checked", 1);
+            cJSON_AddBoolToObject(cr, "allow_restore", s->pol->allow_restore);
+            cJSON_AddNumberToObject(cr, "state", b->unit_state ? b->unit_state(b->ctx, uid) : -1);
+        }
+        return resp_ok(r->id, cr);
     }
     cJSON *res = NULL;
     status_t dst = b->define(b->ctx, uid, passed ? passed : (r->definition ? r->definition : "{}"), s->pol, &res);

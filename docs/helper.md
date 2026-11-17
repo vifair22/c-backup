@@ -427,14 +427,29 @@ the include roots, need `allow_privileged_define`.
 The daemon's side is `mode: unit` (`c-backup unit restore <repo> <snap>
 --define ...`):
 
+- **Every refusal comes first.** The definition is built and sent to the
+  helper as a check (`unit.define` with `check`) before anything is
+  written: a policy without `allow_define`, a privileged definition
+  without `allow_privileged_define`, a provider not behind the helper, an
+  in-place restore without `allow_restore`, or a VM still running for an
+  in-place restore, is refused with the unit untouched.
 - **In place** needs `--replace`: the unit is stopped, each mount staged,
   restored and swapped in, the old data left at `<mount>.cbackup-old-<job>`,
-  then the definition applied with replace.
+  then the definition applied with replace. The mount root takes the
+  snapshot's owner, mode, times, xattrs and ACLs, not the staging
+  directory's. If a step fails after the unit was stopped (a restore into
+  staging, a swap, or the define itself), each swap is undone with
+  `restore.swap` `undo`, newest first, and the unit is started again if it
+  was running; the error says so, and where the restored copy was kept in
+  staging. A swap that cannot be undone leaves the unit stopped and says
+  which data is still at `<mount>.cbackup-old-<job>`.
 - **Under a new name** needs `--target-root DIR`: each mount is restored to
   `DIR/<its original path>` and the definition's bind sources (Docker,
   compose volumes), rootfs and mount entries (LXC) are rewritten there; the
   original's paths are never written. `DIR` must lie inside an include root,
-  since the helper refuses binds outside them.
+  since the helper refuses binds outside them. A define that fails after the
+  data was written leaves it under `DIR`, and the error says to remove it
+  or give another target root before trying again.
 - The definition travels to the helper as a sealed memfd (no size limit);
   the helper's warnings land in the job result and the journal.
 
