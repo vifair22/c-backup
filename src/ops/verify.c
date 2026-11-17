@@ -590,11 +590,19 @@ static void verify_pack_structure(store_t *store, cutils_db_t *db, int64_t repo_
              (unsigned long long)c.table_groups_bad);
     char name[32];
     snprintf(name, sizeof(name), "pack-%010u", pnum);
+    /* Counted in the run's totals as well as its own field, one item per
+     * finding: the totals are what every client, the run record and the
+     * metrics show, and a pack-NNNNNNNNNN finding with no count behind it
+     * read as "recoverable 0" beside a recoverable finding (NIT-30). It is
+     * an item checked, so checked = ok + repaired + recoverable + ... holds. */
+    res->checked++;
     if (c.repaired) {
+        res->repaired++;
         res->pack_structures_repaired++;
         log_warn("verify: pack %s.dat: damaged structure rewritten (%s)", name, what);
         record_finding(db, repo_id, res->run_id, name, "repaired");
     } else {
+        res->recoverable++;
         res->pack_structures_recoverable++;
         log_warn("verify: pack %s.dat: damaged structure, %s (%s)", name,
                  repair ? "and the repair could not finish" :
@@ -651,6 +659,8 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
                 log_warn("verify: %s.dat could not be walked; its headers were restored "
                          "from the index", name);
                 res->packs_restored++;
+                res->checked++;      /* a repaired finding, counted as one (NIT-30) */
+                res->repaired++;
                 record_finding(db, repo_id, res->run_id, name, "repaired");
                 verify_pack_structure(store, db, repo_id, pnum, repair, res);
                 continue;
@@ -826,6 +836,197 @@ static status_t verify_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
     return st;
 }
 
+/*
+ * Objects the per-object pass could not read as their indexed copy, held
+ * until the search for another copy has run (NIT-31). status is the
+ * finding each gets if none is found.
+ */
+typedef struct {
+    uint8_t     hash[OBJECT_HASH_SIZE];
+    const char *status;
+} unread_t;
+
+typedef struct {
+    unread_t *v;
+    size_t    n, cap;
+} unread_vec_t;
+
+/* 0 once added; -1 when out of memory, and the caller counts the object
+ * lost at once, as it did before the search existed. */
+static int unread_add(unread_vec_t *u, const uint8_t hash[OBJECT_HASH_SIZE],
+                      const char *status)
+{
+    if (u->n == u->cap) {
+        size_t nc = u->cap ? u->cap * 2 : 16;
+        unread_t *t = realloc(u->v, nc * sizeof(*t));
+        if (!t) return -1;
+        u->v = t;
+        u->cap = nc;
+    }
+    memcpy(u->v[u->n].hash, hash, OBJECT_HASH_SIZE);
+    u->v[u->n].status = status;
+    u->n++;
+    return 0;
+}
+
+static int unread_cmp(const void *a, const void *b)
+{
+    return memcmp(((const unread_t *)a)->hash, ((const unread_t *)b)->hash, OBJECT_HASH_SIZE);
+}
+
+/* The search's state: for each unread object, sorted by hash, the first
+ * other copy proven to be it. */
+typedef struct {
+    store_t           *store;
+    unread_t          *want;
+    size_t             n;
+    uint8_t           *found;
+    uint32_t          *copy_pack;
+    pack_entry_info_t *copy;
+    uint32_t           cur;
+} dup_search_t;
+
+static void dup_entry_cb(const pack_entry_info_t *info, void *ctx)
+{
+    dup_search_t *d = ctx;
+    unread_t key = { .status = NULL };
+    memcpy(key.hash, info->hash, OBJECT_HASH_SIZE);
+    const unread_t *hit = bsearch(&key, d->want, d->n, sizeof(*d->want), unread_cmp);
+    if (!hit) return;
+    size_t k = (size_t)(hit - d->want);
+    if (d->found[k]) return;
+    uint32_t ip = 0;
+    uint64_t io = 0;
+    if (pack_resolve_location(d->store, info->hash, &ip, &io) == OK &&
+        ip == d->cur && io == info->entry_offset)
+        return;   /* the indexed copy itself, which the pass already failed */
+    err_clear();
+    if (!pack_entry_proven(d->store, d->cur, info)) return;
+    d->found[k]     = 1;
+    d->copy_pack[k] = d->cur;
+    d->copy[k]      = *info;
+}
+
+static void dup_pack_cb(uint32_t pack_num, void *ctx)
+{
+    dup_search_t *d = ctx;
+    char name[64];
+    snprintf(name, sizeof(name), "pack-%010u.dat", pack_num);
+    d->cur = pack_num;
+    if (pack_enumerate_dat(d->store, name, NULL, NULL, dup_entry_cb, d) != OK)
+        err_clear();   /* an unreadable pack offers no copy; verify_packs reports it */
+}
+
+/*
+ * Another copy of an object whose indexed copy is beyond parity (NIT-31).
+ *
+ * Duplicates exist: two backups can store one object before either commits
+ * it, and replication or salvage can write a second copy. gc finds one when
+ * it rewrites the packs and, having proven it, moves the index to it
+ * (OWN-22) - so before a gc, verify called that object lost when the bytes
+ * a restore needs were sitting intact in another pack. This is the same
+ * search and the same proof: every pack's entries are walked (headers
+ * only), and a copy that is not the indexed one is read and decoded against
+ * its name. A check-only run counts a proven copy recoverable; a repairing
+ * one moves the index to it, as gc would, and reads the object back through
+ * the new row before calling it repaired. What has no proven copy is loss,
+ * as before.
+ *
+ * Runs only when something was unreadable, so a healthy repository pays
+ * nothing for it; when it runs it is one walk of entry headers, linear in
+ * entries, plus one decode per candidate.
+ */
+static void rescue_from_duplicates(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                   verify_level_t level, int repair, unread_vec_t *u,
+                                   verify_result_t *res, hash_vec_t *lost)
+{
+    if (!u->n) return;
+    qsort(u->v, u->n, sizeof(*u->v), unread_cmp);
+    dup_search_t d = { .store = store, .want = u->v, .n = u->n };
+    d.found     = calloc(u->n, 1);
+    d.copy_pack = calloc(u->n, sizeof(*d.copy_pack));
+    d.copy      = calloc(u->n, sizeof(*d.copy));
+    if (d.found && d.copy_pack && d.copy) {
+        if (pack_list(store, dup_pack_cb, &d) != OK) err_clear();
+    } else {
+        log_warn("verify: no memory to search for other copies of %zu unreadable "
+                 "object(s); counting them lost", u->n);
+        free(d.found);
+        d.found = NULL;
+    }
+
+    for (size_t k = 0; k < u->n; k++) {
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        hash_to_hex(u->v[k].hash, hex);
+        if (d.found && d.found[k]) {
+            uint32_t cp = d.copy_pack[k];
+            const pack_entry_info_t *c = &d.copy[k];
+            if (repair) {
+                pack_commit_entry_t ce;
+                memset(&ce, 0, sizeof(ce));
+                memcpy(ce.hash, c->hash, OBJECT_HASH_SIZE);
+                ce.offset      = c->entry_offset;
+                ce.comp_size   = c->compressed_size;
+                ce.orig_size   = c->uncompressed_size;
+                ce.entry_index = c->entry_index;
+                ce.type        = c->type;
+                uint64_t bytes = 0;
+                status_t mst = store_emit_pack_relocate(store, cp, &ce);
+                if (mst == OK) pack_cache_invalidate(store);
+                if (mst == OK &&
+                    (level != VERIFY_LEVEL_DEEP ||
+                     read_whole_object(store, u->v[k].hash, &bytes) == OK)) {
+                    res->repaired++;
+                    res->bytes_read += bytes;
+                    log_warn("verify: %s: the indexed copy is beyond parity; the index now "
+                             "names the proven copy in pack %u at %llu", hex, cp,
+                             (unsigned long long)c->entry_offset);
+                    record_finding(db, repo_id, res->run_id, hex, "repaired");
+                    continue;
+                }
+                log_warn("verify: %s: the indexed copy is beyond parity and the index "
+                         "could not be moved to the proven copy in pack %u: %s", hex, cp,
+                         mst == OK ? "it does not read back" : err_msg());
+                err_clear();
+                if (mst == OK) {
+                    /* Moved, and still unreadable: loss, whatever the proof said. */
+                    res->unrecoverable++;
+                    record_finding(db, repo_id, res->run_id, hex, u->v[k].status);
+                    hv_add(lost, u->v[k].hash);
+                    continue;
+                }
+            } else {
+                log_warn("verify: %s: the indexed copy is beyond parity, and a proven copy "
+                         "is in pack %u at %llu; a repairing verify (or gc) points the "
+                         "index at it", hex, cp, (unsigned long long)c->entry_offset);
+            }
+            res->recoverable++;
+            record_finding(db, repo_id, res->run_id, hex, "recoverable");
+            continue;
+        }
+        res->unrecoverable++;
+        record_finding(db, repo_id, res->run_id, hex, u->v[k].status);
+        hv_add(lost, u->v[k].hash);
+    }
+    free(d.found);
+    free(d.copy_pack);
+    free(d.copy);
+}
+
+/* Hold an unreadable object for the duplicate search, or, with no memory
+ * to hold it, count it lost now. */
+static void lose_or_defer(unread_vec_t *u, const uint8_t hash[OBJECT_HASH_SIZE],
+                          const char *status, cutils_db_t *db, int64_t repo_id,
+                          verify_result_t *res, hash_vec_t *lost)
+{
+    if (unread_add(u, hash, status) == 0) return;
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    hash_to_hex(hash, hex);
+    res->unrecoverable++;
+    record_finding(db, repo_id, res->run_id, hex, status);
+    hv_add(lost, hash);
+}
+
 status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     verify_level_t level, int repair, atomic_int *cancel,
                     void (*progress)(const char *phase, uint64_t done,
@@ -928,6 +1129,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     uint64_t total = (uint64_t)objs->nrows;
     status_t st = OK;
     hash_vec_t lost = { 0 };
+    unread_vec_t unread = { 0 };
 
     /* Rows arrive grouped by pack, so remembering the last pack's answer
      * stats each pack file once rather than once per object. */
@@ -972,9 +1174,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             uint8_t  type = 0;
             if (object_get_info(store, hash, &sz, &type) != OK) {
                 err_clear();
-                res.unrecoverable++;
-                record_finding(db, repo_id, res.run_id, hex, "unreadable header");
-                hv_add(&lost, hash);
+                lose_or_defer(&unread, hash, "unreadable header", db, repo_id, &res, &lost);
             } else {
                 res.ok++;
             }
@@ -1009,11 +1209,10 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 record_finding(db, repo_id, res.run_id, hex, "repaired");
             } else {
                 err_clear();
-                res.unrecoverable++;
                 /* The read corrects from parity in memory, so a read that
-                 * still fails is beyond parity: loss. */
-                record_finding(db, repo_id, res.run_id, hex, "unrecoverable");
-                hv_add(&lost, hash);
+                 * still fails is beyond parity: loss, unless another copy
+                 * of the object is intact (NIT-31). */
+                lose_or_defer(&unread, hash, "unrecoverable", db, repo_id, &res, &lost);
             }
             continue;
         }
@@ -1051,15 +1250,31 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 record_finding(db, repo_id, res.run_id, hex, "recoverable");
             }
         } else if (after.uncorrectable > before.uncorrectable) {
-            res.unrecoverable++;
-            record_finding(db, repo_id, res.run_id, hex, "uncorrectable parity");
-            hv_add(&lost, hash);
+            lose_or_defer(&unread, hash, "uncorrectable parity", db, repo_id, &res, &lost);
         } else {
             res.ok++;
         }
     }
 
     db_result_free(objs);
+
+    /* The loop reports each object before checking it, so its last report
+     * is total - 1: an index verify, which has no later phase, ended every
+     * job one short (NIT-33, as restore once did). Say the walk finished. */
+    if (st == OK && progress) progress(level_name(level), total, total, progress_ctx);
+
+    /* Before the lists, which ask what was lost. A cancelled walk reports
+     * what it held back as it found it, without the search. */
+    if (st == OK)
+        rescue_from_duplicates(store, db, repo_id, level, repair, &unread, &res, &lost);
+    else
+        for (size_t k = 0; k < unread.n; k++) {
+            char uhex[OBJECT_HASH_SIZE * 2 + 1];
+            hash_to_hex(unread.v[k].hash, uhex);
+            res.unrecoverable++;
+            record_finding(db, repo_id, res.run_id, uhex, unread.v[k].status);
+        }
+    free(unread.v);
 
     /* Structure and deep both read headers or more, which is what walking a
      * list needs; without the key its payload cannot be read at all. */

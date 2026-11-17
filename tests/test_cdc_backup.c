@@ -1582,6 +1582,7 @@ typedef struct {
     const uint8_t *hash;
     uint32_t       not_pack, cur, found_pack, found_index;
     int            found;
+    uint64_t       found_offset;
 } copy_find_t;
 
 static void copy_find_entry(const pack_entry_info_t *info, void *ctx)
@@ -1591,6 +1592,7 @@ static void copy_find_entry(const pack_entry_info_t *info, void *ctx)
     f->found = 1;
     f->found_pack = f->cur;
     f->found_index = info->entry_index;
+    f->found_offset = info->entry_offset;
 }
 
 static void copy_find_pack(uint32_t num, void *ctx)
@@ -1624,7 +1626,7 @@ static void test_gc_repoints_to_a_copy_deep_in_its_pack(void **state)
     uint32_t pnum = 0;
     uint64_t off = 0;
     plant_duplicate(hash, &pnum, &off);
-    copy_find_t f = { hash, pnum, 0, 0, 0, 0 };
+    copy_find_t f = { hash, pnum, 0, 0, 0, 0, 0 };
     assert_int_equal(pack_list(store, copy_find_pack, &f), OK);
     assert_true(f.found);
     assert_true(f.found_index > 0);
@@ -1641,6 +1643,136 @@ static void test_gc_repoints_to_a_copy_deep_in_its_pack(void **state)
     restore_and_diff(latest_snapshot());
 }
 
+/* A finding's status for an object in a run, or "" when it has none. */
+static void finding_of(int64_t run_id, const uint8_t hash[OBJECT_HASH_SIZE],
+                       char *out, size_t cap)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1], run[32];
+    object_hash_to_hex(hash, hex);
+    snprintf(run, sizeof(run), "%lld", (long long)run_id);
+    db_result_t *q = NULL;
+    assert_int_equal(db_execute(db, "SELECT status FROM verify_findings"
+                                    " WHERE run_id = ? AND hash = ?",
+                                (const char *[]){ run, hex, NULL }, &q), 0);
+    snprintf(out, cap, "%s", q && q->nrows ? q->rows[0][0] : "");
+    db_result_free(q);
+}
+
+/*
+ * Before any gc, the indexed copy is damaged past its parity and a proven
+ * copy sits deep in another pack. That object is not lost: a check-only
+ * verify, at structure and deep, says recoverable and names no loss; a
+ * repairing one moves the index to the proven copy itself, as gc would
+ * (OWN-22), and the restore and the next verify find nothing wrong
+ * (NIT-31, the UAT's M3-B138 shape).
+ */
+static void test_verify_finds_a_proven_duplicate(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 6; i++) {
+        char p[600];
+        snprintf(p, sizeof(p), TEST_SRC "/a%d.bin", i);
+        uint8_t *d = rand_buf(40 * 1024, 900 + (uint64_t)i);
+        write_buf(p, d, 40 * 1024);
+        free(d);
+    }
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    plant_duplicate(hash, &pnum, &off);
+    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+
+    char st[64];
+    const verify_level_t levels[2] = { VERIFY_LEVEL_DEEP, VERIFY_LEVEL_STRUCTURE };
+    for (int l = 0; l < 2; l++) {
+        verify_result_t v;
+        memset(&v, 0, sizeof(v));
+        assert_int_equal(verify_run(store, db, repo_id, levels[l], 0,
+                                    NULL, NULL, NULL, &v), OK);
+        assert_int_equal(v.unrecoverable + v.missing, 0);
+        assert_int_equal(v.affected_files, 0);
+        assert_int_equal(v.checked, v.ok + v.repaired + v.recoverable +
+                                    v.unrecoverable + v.missing);
+        if (levels[l] == VERIFY_LEVEL_DEEP) {
+            assert_int_equal(v.recoverable, 1);
+            assert_int_equal(v.repaired, 0);
+            finding_of(v.run_id, hash, st, sizeof(st));
+            assert_string_equal(st, "recoverable");
+        }
+        /* Check only: the index still names the damaged copy. */
+        uint32_t p2 = 0;
+        uint64_t o2 = 0;
+        assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+        assert_int_equal(p2, pnum);
+        assert_true(o2 == off);
+    }
+
+    verify_result_t v;
+    memset(&v, 0, sizeof(v));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
+                                NULL, NULL, NULL, &v), OK);
+    assert_int_equal(v.repaired, 1);
+    assert_int_equal(v.recoverable + v.unrecoverable + v.missing, 0);
+    finding_of(v.run_id, hash, st, sizeof(st));
+    assert_string_equal(st, "repaired");
+    uint32_t p2 = 0;
+    uint64_t o2 = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+    assert_true(p2 != pnum);
+    restore_and_diff(latest_snapshot());
+
+    memset(&v, 0, sizeof(v));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &v), OK);
+    assert_int_equal(v.ok, v.checked);
+
+    /* gc then finds the damaged copy unnamed and the named one confirmed. */
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_int_equal(g.index_relocated, 0);
+    size_t dup = 0;
+    pack_census_t c;
+    census(store, &c, &dup);
+    assert_int_equal(dup, 0);
+    restore_and_diff(latest_snapshot());
+}
+
+/*
+ * With both copies damaged past parity there is nothing to move to: the
+ * object is loss, as before the search, and a repairing run moves nothing.
+ */
+static void test_verify_duplicate_damaged_too_is_loss(void **state)
+{
+    (void)state;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    plant_duplicate(hash, &pnum, &off);
+    copy_find_t f = { hash, pnum, 0, 0, 0, 0, 0 };
+    assert_int_equal(pack_list(store, copy_find_pack, &f), OK);
+    assert_true(f.found);
+    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+    ruin(f.found_pack, f.found_offset + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+
+    for (int repair = 0; repair < 2; repair++) {
+        verify_result_t v;
+        memset(&v, 0, sizeof(v));
+        assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, repair,
+                                    NULL, NULL, NULL, &v), ERR_CORRUPT);
+        err_clear();
+        assert_int_equal(v.unrecoverable, 1);
+        assert_int_equal(v.recoverable + v.repaired, 0);
+        char st[64];
+        finding_of(v.run_id, hash, st, sizeof(st));
+        assert_string_equal(st, "unrecoverable");
+        uint32_t p2 = 0;
+        uint64_t o2 = 0;
+        assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+        assert_int_equal(p2, pnum);
+    }
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1650,6 +1782,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_gc_moves_the_index_off_a_ruined_header, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_moves_the_index_off_a_damaged_payload, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_repoints_to_a_copy_deep_in_its_pack, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_verify_finds_a_proven_duplicate, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_verify_duplicate_damaged_too_is_loss, setup, teardown),
         cmocka_unit_test_setup_teardown(test_small_files_on_workers_match_serial, setup, teardown),
         cmocka_unit_test_setup_teardown(test_append_and_edit_write_little, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_keeps_chunks_of_live_lists, setup, teardown),
