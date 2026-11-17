@@ -8,6 +8,7 @@
 #include "pack.h"
 #include "parity.h"
 #include "repo.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -179,7 +180,7 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     /* A pack's own finding names no content and no file; its caller logs
      * what it is and why. */
     if (strncmp(hex, "pack-", 5) == 0) {
-        if (db_execute_non_query(db,
+        if (db_write(db,
                 "INSERT INTO verify_findings (run_id, repo_id, hash, status)"
                 " VALUES (?, ?, ?, ?)",
                 (const char *[]){ run, repo, hex, status, NULL }, NULL) != 0)
@@ -221,14 +222,14 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     snprintf(nv, sizeof(nv), "%llu", (unsigned long long)n_versions);
     snprintf(ns, sizeof(ns), "%llu", (unsigned long long)n_snaps);
     const char *trunc = n_snaps > FINDING_SNAPSHOT_IDS ? "1" : "0";
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO verify_findings"
             " (run_id, repo_id, hash, status, affected_files, sample_paths,"
             "  affected_snapshots, affected_versions, affected_snapshot_count,"
             "  snapshots_truncated)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (const char *[]){ run, repo, hex, status, nf, paths, snaps,
-                              nv, ns, trunc, NULL },
+                  nv, ns, trunc, NULL },
             NULL) != 0)
         log_warn("verify: cannot record finding for %s", hex);
 
@@ -382,14 +383,14 @@ static uint64_t record_node_rule(cutils_db_t *db, int64_t repo_id, int64_t run_i
     snprintf(nf, sizeof(nf), "%llu", (unsigned long long)n_files);
     snprintf(nv, sizeof(nv), "%llu", (unsigned long long)n_versions);
     snprintf(ns, sizeof(ns), "%llu", (unsigned long long)n_snaps);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO verify_findings"
             " (run_id, repo_id, hash, status, affected_files, sample_paths,"
             "  affected_snapshots, affected_versions, affected_snapshot_count,"
             "  snapshots_truncated)"
             " VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?)",
             (const char *[]){ run, repo, status, nf, paths, snaps, nv, ns,
-                              n_snaps > FINDING_SNAPSHOT_IDS ? "1" : "0", NULL },
+                  n_snaps > FINDING_SNAPSHOT_IDS ? "1" : "0", NULL },
             NULL) != 0)
         log_warn("verify: cannot record the finding \"%s\"", status);
     *snaps_out = n_snaps;
@@ -750,7 +751,7 @@ static void attribute_chunk(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     char nf[32], nv[32];
     snprintf(nf, sizeof(nf), "%llu", (unsigned long long)n_files);
     snprintf(nv, sizeof(nv), "%llu", (unsigned long long)n_versions);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "UPDATE verify_findings SET affected_files = affected_files + ?,"
             " affected_versions = affected_versions + ?,"
             " sample_paths = CASE WHEN COALESCE(sample_paths, '') = '' THEN ?"
@@ -1055,7 +1056,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * connection, and every thread shares one: another thread's insert
      * between the two statements handed this caller someone else's id. */
     db_result_t *r = NULL;
-    if (db_execute(db,
+    if (db_write_returning(db,
             "INSERT INTO verify_runs (repo_id, started_at, level)"
             " VALUES (?, ?, ?) RETURNING id",
             (const char *[]){ repo, started_s, level_name(level), NULL }, &r) != 0 ||
@@ -1320,14 +1321,14 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* The run row is closed even when the walk was cancelled or failed, with
      * whatever it managed to check. A half-finished scrub that reports
      * nothing is indistinguishable from one that never ran. */
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "UPDATE verify_runs SET finished_at = ?, checked = ?, ok = ?,"
             " repaired = ?, recoverable = ?, unrecoverable = ?, missing = ?,"
             " bytes_read = ?, affected_files = ?, affected_snapshots = ?,"
             " completed = ?"
             " WHERE id = ?",
             (const char *[]){ fin, checked, ok, rep, recov, unrec, miss, bytes_s,
-                              afff, affs, st == OK ? "1" : "0", run, NULL },
+                  afff, affs, st == OK ? "1" : "0", run, NULL },
             NULL) != 0)
         log_warn("verify: cannot close run record %s", run);
 

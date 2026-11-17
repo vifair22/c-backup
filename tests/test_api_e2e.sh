@@ -12,6 +12,9 @@
 set -u
 
 BIN="${1:-build/bins/c-backupd}"
+# A write made outside the write lock aborts the daemon here rather than
+# landing in another thread's transaction unnoticed (B157, db_write.h).
+export C_BACKUP_TXN_GUARD=abort
 # Scratch goes where the Makefile says (C_BACKUP_TEST_DIR), and on disk when
 # run by hand: /tmp is often a tmpfs, so dense scratch there is RAM.
 TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
