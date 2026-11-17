@@ -305,8 +305,21 @@ ifneq ($(HAVE_LIBVIRT),1)
 TEST_SRCS := $(filter-out $(wildcard $(TESTS)/test_virt*.c), $(TEST_SRCS))
 TEST_BINS := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(TEST_SRCS))
 endif
-$(BINS)/test_virt%: $(TESTS)/test_virt%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(REL_VIRT_OBJS) $(TEST_DIR_STAMP) | $(BINS)
+# A static pattern rule, not a pattern one (BUILD-2). As `$(BINS)/test_virt%`
+# it competed with the generic `$(BINS)/%` above: make takes a pattern rule
+# only if it can settle every prerequisite during its rule search, and when
+# it could not settle the libvirt objects it fell back to the generic rule,
+# which links neither them nor libvirt, so a clean parallel build failed to
+# link test_virt_offline and test_virt_incremental. A static pattern rule
+# names its targets, so nothing else can build them.
+VIRT_TEST_BINS := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(wildcard $(TESTS)/test_virt*.c))
+ifeq ($(HAVE_LIBVIRT),1)
+$(VIRT_TEST_BINS): $(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(REL_VIRT_OBJS) $(TEST_DIR_STAMP) | $(BINS)
 	$(CC) $(TEST_CFLAGS) $(VIRT_CFLAGS) $(TEST_DIR_DEF) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(TEST_LDFLAGS) $(VIRT_LIBS)
+else
+$(VIRT_TEST_BINS):
+	@echo "$@ needs libvirt's and libxml2's development files (pkg-config libvirt libxml-2.0)" >&2; exit 1
+endif
 
 $(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_DIR_STAMP) | $(BINS)
 	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(FAULT_WRAP) $(filter-out $(TEST_DIR_STAMP),$^) -o $@ $(TEST_LDFLAGS)
