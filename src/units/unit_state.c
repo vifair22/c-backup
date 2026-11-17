@@ -383,6 +383,7 @@ static status_t sweep_provider(cutils_db_t *db, const sp_provider_ops_t *ops,
     }
     out->removed += rep.removed;
     out->left_foreign += rep.left_foreign;
+    if (rep.stuck[0] && !out->stuck[0]) snprintf(out->stuck, sizeof(out->stuck), "%s", rep.stuck);
     free(in);
     free(rel);
     free(absent);

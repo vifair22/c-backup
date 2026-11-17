@@ -89,6 +89,7 @@ typedef struct {
     unsigned failed;       /* releases that failed; their rows stay */
     unsigned removed;      /* leftover artefacts deleted */
     unsigned left_foreign; /* artefacts seen and left alone */
+    char     stuck[400];   /* the first provider's report of holds it cannot release */
 } units_sweep_result_t;
 
 /*

@@ -783,7 +783,9 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
     snprintf(summary, sizeof(summary), "%s: %zu unit(s) backed up, %zu failed, %zu left out "
              "by units.allow", j->provider, res.ok, res.failed, res.filtered);
     job_set_summary(progress_ctx, summary);
-    if (warn[0]) job_set_warning(progress_ctx, warn);
+    /* A hold that cannot be released outranks a unit's own warning. */
+    if (res.warning[0]) job_set_warning(progress_ctx, res.warning);
+    else if (warn[0]) job_set_warning(progress_ctx, warn);
     unit_backup_result_free(&res);
     store_index_free(idx);
     store_close(store);

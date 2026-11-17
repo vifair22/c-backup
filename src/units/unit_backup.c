@@ -1226,12 +1226,26 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
     status_t est = ops->end(u.sess, outcome, snap);
     if (est != OK) {
-        /* Never fails a snapshot that committed: the sweep has the rows. */
+        /*
+         * Never fails a snapshot that committed: the sweep has the rows. A
+         * helper killed or restarted mid-read lands here (B177). The read
+         * itself could not have been cut short and still commit: every
+         * part is read to its end or the backup fails (backup.c, a read
+         * error aborts it; nbd_client, a closed connection is an error;
+         * disk_stream, an image changed under an offline read fails it).
+         * So the snapshot is whole, read from exports that outlived the
+         * helper, and flagged: this warning outranks any other, so the job
+         * warns and alerts with it.
+         */
         log_warn("unit %s: releasing the session failed: %s; the sweep will retry",
                  key, err_msg());
-        if (st == OK && !res->warning[0])
-            snprintf(res->warning, sizeof(res->warning), "session release failed: %.400s",
-                     err_msg());
+        if (st == OK) {
+            snprintf(res->warning, sizeof(res->warning),
+                     "the session could not be ended (%.200s): the provider went away or restarted during "
+                     "the backup. Snapshot %lld is whole, every part read to its end; what the session held "
+                     "is released by its sweep", err_msg(), (long long)snap);
+            res->n_warnings++;
+        }
         err_clear();
     }
     res->snapshot_id = snap;
@@ -1447,7 +1461,7 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * and its failure (and alert) names the helper's socket. Never a
      * quiet skip. */
     char hwhy[512];
-    if (remote_unusable(o->provider, hwhy, sizeof(hwhy)))
+    if (remote_unusable_for_job(o->provider, hwhy, sizeof(hwhy)))
         return set_error(ERR_IO, "%s", hwhy);
     const sp_provider_ops_t *ops = NULL;
     sp_ctx_t *pctx = NULL;
@@ -1563,6 +1577,8 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (units_sweep(db, o->job_id, &sw) != OK) {
         log_warn("unit backup: sweep: %s", err_msg());
         err_clear();
+    } else if (sw.stuck[0]) {
+        snprintf(out->warning, sizeof(out->warning), "%s", sw.stuck);
     }
     if (st != OK) return st;
     if (o->all && np == 0 && out->failed == 0)
