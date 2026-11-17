@@ -126,7 +126,7 @@ static status_t no_changes(void *ctx, uint64_t from, uint64_t *s, uint64_t *e, i
 {
     (void)ctx; (void)from; (void)s; (void)e;
     *done = 1;
-    return set_error(ERR_INVALID, "disk: no changed ranges in this build");
+    return set_error(ERR_INVALID, "disk: no changed ranges: this disk has no dirty bitmap");
 }
 
 status_t disk_stream_file(const char *path, uint64_t size, int offline, sp_block_stream_t *out)
@@ -159,6 +159,11 @@ typedef struct {
     nbd_extent_t    ext[NBD_EXT_MAX];
     size_t          n, at;          /* extents of the current window, the next to hand out */
     uint64_t        win_off;        /* where ext[at] starts */
+    /* The dirty bitmap, the same way, in its own window: changed() may
+     * start again from 0 (the estimate, then the delta, then the audit). */
+    nbd_extent_t    bext[NBD_EXT_MAX];
+    size_t          bn, bat;
+    uint64_t        bwin_off;
     watch_t         w;              /* the image behind a qemu-nbd, offline */
 } nstream_t;
 
@@ -169,7 +174,9 @@ static status_t n_extent(void *ctx, uint64_t from, sp_ext_type_t *type, uint64_t
     if (*done) return OK;
     pthread_mutex_lock(&s->mu);
     status_t st = OK;
-    /* Forward only: skip what lies before from, refill past the window. */
+    /* Forward: skip what lies before from, refill past the window, and
+     * start over at from if it lies before the window (a seek back). */
+    if (s->at < s->n && from < s->win_off) s->n = s->at = 0;
     while (st == OK) {
         while (s->at < s->n && s->win_off + s->ext[s->at].len <= from) {
             s->win_off += s->ext[s->at].len;
@@ -202,6 +209,51 @@ static status_t n_read(void *ctx, void *buf, size_t n, uint64_t off)
     return st;
 }
 
+/* The next dirty range at or after from, merged across the window's
+ * consecutive dirty extents. */
+static status_t n_changed(void *ctx, uint64_t from, uint64_t *rs, uint64_t *re, int *done)
+{
+    nstream_t *s = ctx;
+    *done = 0;
+    if (!nbd_has_bitmap(s->c)) return set_error(ERR_INVALID, "disk: the export has no dirty bitmap");
+    pthread_mutex_lock(&s->mu);
+    status_t st = OK;
+    int found = 0;
+    uint64_t pos = from;
+    if (s->bat < s->bn && pos < s->bwin_off) s->bn = s->bat = 0;
+    while (st == OK && pos < s->size) {
+        while (s->bat < s->bn && s->bwin_off + s->bext[s->bat].len <= pos) {
+            s->bwin_off += s->bext[s->bat].len;
+            s->bat++;
+        }
+        if (s->bat >= s->bn) {
+            if (found) break;       /* a range ending at the window's end: done with it */
+            uint64_t w = s->size - pos < NBD_WINDOW ? s->size - pos : NBD_WINDOW;
+            st = nbd_block_status(s->c, pos, w, 1, s->bext, NBD_EXT_MAX, &s->bn);
+            s->bat = 0;
+            s->bwin_off = pos;
+            if (st == OK && s->bn == 0) st = set_error(ERR_IO, "disk: the dirty bitmap described nothing at %llu",
+                                                       (unsigned long long)pos);
+            continue;
+        }
+        const nbd_extent_t *x = &s->bext[s->bat];
+        uint64_t xs = s->bwin_off > pos ? s->bwin_off : pos;
+        uint64_t xe = s->bwin_off + x->len;
+        if (xe > s->size) xe = s->size;
+        int dirty = (x->flags & NBD_STATE_DIRTY) != 0;
+        if (dirty) {
+            if (!found) { *rs = xs; found = 1; }
+            *re = xe;
+        } else if (found) {
+            break;
+        }
+        pos = xe;
+    }
+    pthread_mutex_unlock(&s->mu);
+    if (st == OK && !found) *done = 1;
+    return st;
+}
+
 static void n_close(void *ctx)
 {
     nstream_t *s = ctx;
@@ -220,9 +272,12 @@ void disk_stream_nbd_tuning(unsigned depth, unsigned request_kb)
 }
 
 status_t disk_stream_nbd(const char *socket, const char *export_name, uint64_t size,
-                         const char *watch, sp_block_stream_t *out)
+                         const char *watch, const char *bitmap, int *has_bitmap,
+                         sp_block_stream_t *out)
 {
-    nbd_open_opts_t o = { socket, export_name ? export_name : "", NULL, 0, g_depth, g_request_kb };
+    if (has_bitmap) *has_bitmap = 0;
+    nbd_open_opts_t o = { socket, export_name ? export_name : "", bitmap && *bitmap ? bitmap : NULL,
+                          0, g_depth, g_request_kb };
     nbd_client_t *c = NULL;
     status_t st = nbd_open(&o, &c);
     if (st != OK) return st;
@@ -239,6 +294,8 @@ status_t disk_stream_nbd(const char *socket, const char *export_name, uint64_t s
     st = watch_open(&s->w, watch);
     if (st != OK) { nbd_close(c); free(s); return st; }
     pthread_mutex_init(&s->mu, NULL);
-    *out = (sp_block_stream_t){ n_extent, no_changes, n_read, n_close, s };
+    int hb = nbd_has_bitmap(c);
+    if (has_bitmap) *has_bitmap = hb;
+    *out = (sp_block_stream_t){ n_extent, hb ? n_changed : no_changes, n_read, n_close, s };
     return OK; // cppcheck-suppress memleak
 }

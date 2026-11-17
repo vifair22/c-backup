@@ -1509,6 +1509,22 @@ static int vm_export_by_id(const args_t *a, const char *method)
     return call_path_sb(method, &p, NULL);
 }
 
+/* A VM's incremental chain (vm-backup.md 5.4, 8.3): the token rows and
+ * whether incrementals are on; and reset-incremental after a failed audit. */
+static int h_vm_checkpoints(const args_t *a)
+{
+    sbuf_t p = { 0 };
+    unit_path(&p, a->pos[0], "libvirt", a->pos[1], "/checkpoints");
+    return call_path_sb("GET", &p, NULL);
+}
+
+static int h_vm_reset_incremental(const args_t *a)
+{
+    sbuf_t p = { 0 };
+    unit_path(&p, a->pos[0], "libvirt", a->pos[1], "/reset-incremental");
+    return call_path_sb("POST", &p, NULL);
+}
+
 static int h_vm_export_show(const args_t *a) { return vm_export_by_id(a, "GET"); }
 static int h_vm_unexport(const args_t *a)    { return vm_export_by_id(a, "DELETE"); }
 
@@ -1867,6 +1883,11 @@ static const command_t COMMANDS[] = {
     { { "vm exports",      P_NONE,     NULL, NULL }, h_vm_exports, 0 },
     { { "vm export-show",  P_EXPORT,   NULL, NULL }, h_vm_export_show, 0 },
     { { "vm unexport",     P_EXPORT,   NULL, NULL }, h_vm_unexport, 0 },
+    { { "vm checkpoints",  P_UPOL,     NULL, "the VM's incremental chain: a checkpoint per disk, and whether incrementals are on" },
+      h_vm_checkpoints, 0 },
+    { { "vm reset-incremental", P_UPOL, NULL,
+        "after a failed bitmap audit: incrementals back on, the next backup a full read" },
+      h_vm_reset_incremental, 0 },
     { { "snapshots",       P_REPO,     O_PAGING, NULL }, h_snapshots, 0 },
     { { "snapshot delete", P_SNAP,     O_FORCE, NULL }, h_snapshot_delete, 0 },
     { { "snapshot note",   P_NOTE,     NULL, "reads the note, or writes [text]" },

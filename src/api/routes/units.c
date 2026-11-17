@@ -12,6 +12,8 @@
  *   GET  /repos/<id>/units/<p>/<u>/snapshots          that unit's snapshots, newest first
  *   GET  /repos/<id>/units/<p>/<u>/policy             per-unit retention
  *   PUT  /repos/<id>/units/<p>/<u>/policy
+ *   GET  /repos/<id>/units/<p>/<u>/checkpoints        the unit's incremental chain (vm-backup.md 8.2)
+ *   POST /repos/<id>/units/<p>/<u>/reset-incremental  incrementals back on after a failed audit
  *   POST /repos/<id>/units/backup                     a job
  *   POST /repos/<id>/snapshots/<sid>/unit/restore     a job: files or one item, raw
  *
@@ -35,6 +37,7 @@
 #include "unit_restore.h"
 #include "unit_define.h"
 #include "unit_state.h"
+#include "unit_tokens.h"
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
@@ -389,7 +392,8 @@ static int split_unit_path(const char *rest, char *prov, size_t psz, char *unit,
     memcpy(unit, s1 + 1, ul);
     unit[ul] = '\0';
     *suffix = last + 1;
-    return strcmp(*suffix, "snapshots") == 0 || strcmp(*suffix, "policy") == 0;
+    return strcmp(*suffix, "snapshots") == 0 || strcmp(*suffix, "policy") == 0 ||
+           strcmp(*suffix, "checkpoints") == 0 || strcmp(*suffix, "reset-incremental") == 0;
 }
 
 const char *units_path_allow(const char *rest)
@@ -398,8 +402,10 @@ const char *units_path_allow(const char *rest)
     if (strcmp(rest, "/units/backup") == 0) return "POST";
     char prov[SP_PROVIDER_MAX], unit[SP_UNIT_ID_MAX];
     const char *suffix = NULL;
-    if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix))
+    if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix)) {
+        if (strcmp(suffix, "reset-incremental") == 0) return "POST";
         return strcmp(suffix, "policy") == 0 ? "GET, PUT" : "GET";
+    }
     if (strncmp(rest, "/snapshots/", 11) == 0) {
         int64_t sid = 0;
         const char *end = NULL;
@@ -1124,6 +1130,80 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
 /* Dispatch from repos.c                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The unit's chain (vm-backup.md 8.2): each disk's token row and whether
+ * incrementals are on for it, for diagnosis. The token rows are what the
+ * daemon holds; whether libvirt still has each checkpoint is the helper's
+ * to say, and every session checks it before it reads.
+ */
+static api_response_t unit_checkpoints_get(int64_t repo_id, const char *key)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(g_db, "SELECT item_id, token, snap_id, identity, created_at FROM unit_tokens"
+                         " WHERE repo_id = ? AND unit_key = ? ORDER BY item_id",
+                   (const char *[]){ repo, key, NULL }, &r) != 0) {
+        db_result_free(r);
+        return api_error(500, "cannot read the unit's checkpoints");
+    }
+    unit_incr_state_t is;
+    if (unit_incr_get(g_db, repo_id, key, &is) != OK) {
+        db_result_free(r);
+        return api_error(500, err_msg());
+    }
+    const units_config_t *cfg = units_config();
+    cJSON *root = cJSON_CreateObject();
+    if (root) {
+        cJSON_AddStringToObject(root, "unit_key", key);
+        cJSON *inc = cJSON_AddObjectToObject(root, "incremental");
+        if (inc) {
+            cJSON_AddBoolToObject(inc, "enabled", cfg->incremental && !is.disabled_reason[0] && cfg->delta_full_pct > 0);
+            cJSON_AddStringToObject(inc, "disabled_reason", is.disabled_reason);
+            cJSON_AddNumberToObject(inc, "disabled_at", (double)is.disabled_at);
+            cJSON_AddNumberToObject(inc, "last_audit_at", (double)is.last_audit_at);
+            cJSON_AddNumberToObject(inc, "audit_days", cfg->audit_days);
+            cJSON_AddNumberToObject(inc, "delta_full_pct", cfg->delta_full_pct);
+        }
+        cJSON *arr = cJSON_AddArrayToObject(root, "tokens");
+        for (int i = 0; arr && r && i < r->nrows; i++) {
+            cJSON *o = cJSON_CreateObject();
+            if (!o) break;
+            cJSON_AddItemToArray(arr, o);
+            cJSON_AddStringToObject(o, "item", r->rows[i][0]);
+            cJSON_AddStringToObject(o, "checkpoint", r->rows[i][1]);
+            int64_t sn = strtoll(r->rows[i][2], NULL, 10);
+            cJSON_AddNumberToObject(o, "snapshot", (double)sn);
+            cJSON_AddBoolToObject(o, "usable", sn > 0 && !is.disabled_reason[0]);
+            cJSON_AddStringToObject(o, "identity", r->rows[i][3]);
+            cJSON_AddNumberToObject(o, "created_at", (double)strtoll(r->rows[i][4], NULL, 10));
+        }
+    }
+    db_result_free(r);
+    return json_out(root);
+}
+
+/* reset-incremental (5.4): after a failed audit, back on; the next session
+ * is a full read that starts a fresh chain and retires the old checkpoint.
+ * Journalled: it is an operator deciding a bitmap is to be trusted again. */
+static api_response_t unit_reset_post(int64_t repo_id, const char *key)
+{
+    unit_incr_state_t is;
+    if (unit_incr_get(g_db, repo_id, key, &is) != OK) return api_error(500, err_msg());
+    if (unit_incr_reset(g_db, repo_id, key) != OK) return api_error(500, err_msg());
+    char msg[700];
+    snprintf(msg, sizeof(msg), "incrementals reset for %s%s%.500s", key,
+             is.disabled_reason[0] ? "; they were off: " : "", is.disabled_reason);
+    journal_record(g_db, repo_id, "units", "reset-incremental", "success", 0, msg);
+    log_info("units: %s", msg);
+    cJSON *root = cJSON_CreateObject();
+    if (root) {
+        cJSON_AddStringToObject(root, "unit_key", key);
+        cJSON_AddStringToObject(root, "was_disabled", is.disabled_reason);
+    }
+    return json_out(root);
+}
+
 api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const char *rest)
 {
     if (strcmp(rest, "/units") == 0) return repo_units(req, repo_id);
@@ -1133,6 +1213,8 @@ api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const 
         return api_error(404, "not found");
     key_for(repo_id, prov, unit, key, sizeof(key));
     if (strcmp(suffix, "snapshots") == 0) return unit_history(req, repo_id, key);
+    if (strcmp(suffix, "checkpoints") == 0) return unit_checkpoints_get(repo_id, key);
+    if (strcmp(suffix, "reset-incremental") == 0) return api_error(405, "method not allowed");
     return unit_policy_get(repo_id, key);
 }
 
@@ -1147,6 +1229,7 @@ api_response_t units_route_put(const api_request_t *req, int64_t repo_id, const 
     return unit_policy_put(req, repo_id, key);
 }
 
+/* Not in units_route_get: POST-only, refused there with 405 above. */
 api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const char *rest)
 {
     if (strcmp(rest, "/units/backup") == 0) {
@@ -1157,6 +1240,13 @@ api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const
         char *out = NULL;
         if (asprintf(&out, "{\"job_id\":%lld}", (long long)job) < 0) return api_error(500, "out of memory");
         return api_ok_status(202, out);
+    }
+    char prov[SP_PROVIDER_MAX], unit[SP_UNIT_ID_MAX], key[UNIT_KEY_MAX];
+    const char *suffix = NULL;
+    if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) &&
+        strcmp(suffix, "reset-incremental") == 0) {
+        key_for(repo_id, prov, unit, key, sizeof(key));
+        return unit_reset_post(repo_id, key);
     }
     if (strncmp(rest, "/snapshots/", 11) == 0) {
         int64_t sid = 0;

@@ -9,11 +9,16 @@
 #include "unit_index.h"
 #include "unit_json.h"
 #include "unit_state.h"
+#include "unit_tokens.h"
 
 #include <cutils/log.h>
 
+#define CUTILS_CJSON_ALLOW
+#include "cJSON.h"
+
 #include <errno.h>
 #include <fnmatch.h>
+#include <stdarg.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -242,7 +247,33 @@ typedef struct {
     uint64_t          bytes_read;
     pipesrc_t         pipe;
     int               stream_open, stream_ok;
+    /* A disk's read (vm-backup.md 5.3, 5.4): how it was stored and why,
+     * what the estimate and the delta said, an audit's result, and the
+     * content hash it ended with. */
+    int               vb;              /* index into uctx_t.bases, -1 for none */
+    backup_synth_how_t how;
+    const char       *read_mode, *reason;
+    cdc_delta_estimate_t est;
+    int               have_est;
+    cdc_delta_result_t dres;
+    cdc_audit_t      *audit;
+    cdc_audit_result_t ares;
+    int               audited;
+    uint8_t           hash[OBJECT_HASH_SIZE];
+    int               stored;
 } part_t;
+
+/*
+ * What the daemon knows about a disk's chain before begin (5.4, the token
+ * row layer): whether its token binds, and why not when it does not.
+ */
+typedef struct {
+    char        item[SP_ITEM_ID_MAX];
+    char        identity[UNIT_IDENTITY_MAX];
+    int         found, usable, covered;
+    const char *reason;        /* when not usable */
+    unit_token_t t;
+} vbase_t;
 
 typedef struct {
     const sp_provider_ops_t  *ops;
@@ -256,7 +287,39 @@ typedef struct {
     uint64_t                  bytes_read;
     int                       held;      /* begin kept a pause for pass 2 */
     int                       cap_hit;   /* and the watchdog let it go first */
+    /* Incremental reads. */
+    store_t                  *store;
+    cutils_db_t              *db;
+    int64_t                   repo_id;
+    const char               *key;
+    vbase_t                  *bases;
+    size_t                    n_bases;
+    int                       audit_due;
+    char                    **warn;      /* the daemon's own, after the provider's */
+    size_t                    n_warn;
 } uctx_t;
+
+static void uwarn(uctx_t *u, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void uwarn(uctx_t *u, const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    log_warn("unit %s: %s", u->key ? u->key : "?", buf);
+    char **g = realloc(u->warn, (u->n_warn + 1) * sizeof(*g));
+    if (!g) return;
+    u->warn = g;
+    if ((g[u->n_warn] = strdup(buf)) != NULL) u->n_warn++;
+}
+
+static vbase_t *vbase_for(uctx_t *u, const char *item)
+{
+    for (size_t i = 0; i < u->n_bases; i++)
+        if (strcmp(u->bases[i].item, item) == 0) return &u->bases[i];
+    return NULL;
+}
 
 static const sp_item_plan_t *plan_for(const uctx_t *u, const char *item)
 {
@@ -280,7 +343,7 @@ static status_t build_unit_json(uctx_t *u)
     j->freeze_ms = u->info->freeze_ms;
     j->pause_ms = u->info->pause_ms;
     j->items = calloc(u->desc->n_items ? u->desc->n_items : 1, sizeof(*j->items));
-    j->warnings = calloc(u->info->n_warnings ? u->info->n_warnings : 1, sizeof(char *));
+    j->warnings = calloc(u->info->n_warnings + u->n_warn + 1, sizeof(char *));
     if (!j->name || !j->items || !j->warnings) return set_error(ERR_NOMEM, "unit.json");
     for (size_t i = 0; i < u->desc->n_items; i++) {
         const sp_item_desc_t *it = &u->desc->items[i];
@@ -292,15 +355,39 @@ static status_t build_unit_json(uctx_t *u)
         if (!o->path || (it->source && !o->source)) return set_error(ERR_NOMEM, "unit.json");
         o->size = it->size;
         snprintf(o->format, sizeof(o->format), "%s", it->format);
-        /* This build reads everything in full; a plan for more is noted as
-         * forced, never claimed. */
+        /* What each item actually did: a disk's part says how it was read
+         * and why; anything else is a full read, its plan's reason if it
+         * had one the vocabulary knows. */
         const sp_item_plan_t *pl = plan_for(u, it->id);
         snprintf(o->read_mode, sizeof(o->read_mode), "full");
         const char *why = pl && pl->mode == SP_READ_FULL && sp_reason_known(pl->reason)
                         ? pl->reason : "forced";
         snprintf(o->reason, sizeof(o->reason), "%s", why);
-        for (size_t p = 0; p < u->n_parts; p++)
-            if (u->parts[p].item == (int)i) o->bytes_read = u->parts[p].bytes_read;
+        for (size_t p = 0; p < u->n_parts; p++) {
+            const part_t *pt = &u->parts[p];
+            if (pt->item != (int)i) continue;
+            o->bytes_read = pt->bytes_read;
+            if (pt->read_mode) snprintf(o->read_mode, sizeof(o->read_mode), "%s", pt->read_mode);
+            if (pt->reason) snprintf(o->reason, sizeof(o->reason), "%s", pt->reason);
+            const vbase_t *vb = pt->vb >= 0 ? &u->bases[pt->vb] : NULL;
+            if (vb && (pt->have_est || pt->audited || pt->how != BACKUP_SYNTH_FULL)) {
+                o->have_incr = 1;
+                snprintf(o->checkpoint, sizeof(o->checkpoint), "%s", u->info->new_token ? u->info->new_token : "");
+                o->base_snapshot = vb->usable ? vb->t.snap_id : 0;
+                o->estimate = pt->est.estimate;
+                o->data_bytes = pt->est.data_bytes;
+                o->clusters = pt->est.clusters;
+                o->ranges = pt->est.ranges;
+                o->dirty_bytes = pt->est.dirty_bytes;
+                o->resync_bytes = pt->dres.resync_bytes;
+                o->delta_full_pct = units_config()->delta_full_pct;
+                o->audited = pt->audited;
+                o->audit_bad = pt->ares.bad;
+                o->audit_leaves = pt->ares.leaves_checked;
+                o->audit_bad_bytes = pt->ares.bad_bytes;
+                o->audit_first_bad = pt->ares.first_bad;
+            }
+        }
         if (it->kind == SP_ITEM_BLOB) o->size = 0;
     }
     for (size_t p = 0; p < u->n_parts; p++)
@@ -308,6 +395,10 @@ static status_t build_unit_json(uctx_t *u)
             j->items[u->parts[p].item].size = u->parts[p].blob_len;
     for (size_t i = 0; i < u->info->n_warnings; i++) {
         if (!(j->warnings[i] = strdup(u->info->warnings[i]))) return set_error(ERR_NOMEM, "unit.json");
+        j->n_warnings++;
+    }
+    for (size_t i = 0; i < u->n_warn; i++) {
+        if (!(j->warnings[j->n_warnings] = strdup(u->warn[i]))) return set_error(ERR_NOMEM, "unit.json");
         j->n_warnings++;
     }
     if (u->cap_hit) {
@@ -342,6 +433,77 @@ static status_t build_unit_json(uctx_t *u)
     return OK;
 }
 
+static status_t audit_tap(void *ctx, uint64_t off, const uint8_t *buf, size_t len)
+{
+    return cdc_audit_feed(ctx, off, buf, len);
+}
+
+/*
+ * Full, incremental or unchanged, for a disk the provider has opened
+ * (5.3, 5.4): incremental only when the daemon's token binds and the
+ * provider can give the changed ranges since it; then the estimate decides,
+ * an empty changed set is the base's content as it is, and an audit that
+ * is due or a read the estimate says costs too much is a full read checked
+ * against the bitmap. Anything that goes wrong here is a full read, never a
+ * failed backup: the incremental is an optimisation.
+ */
+static void decide_read(uctx_t *u, part_t *p, const sp_item_desc_t *it)
+{
+    p->how = BACKUP_SYNTH_FULL;
+    p->read_mode = "full";
+    vbase_t *vb = vbase_for(u, it->id);
+    p->vb = vb ? (int)(vb - u->bases) : -1;
+    const sp_item_plan_t *pl = plan_for(u, it->id);
+    if (vb && !vb->usable) { p->reason = vb->reason; return; }
+    if (!vb || !pl) return;
+    if (pl->mode != SP_READ_INCREMENTAL) {
+        if (sp_reason_known(pl->reason)) p->reason = pl->reason;
+        return;
+    }
+    p->reason = "token-invalid";
+    if (!p->bs.changed) {
+        uwarn(u, "disk %s: the provider offered an incremental and no changed ranges; read in full", it->id);
+        return;
+    }
+    obj_loader_t ld = obj_loader_store(u->store);
+    status_t st = cdc_delta_estimate(&ld, vb->t.root, it->size, p->bs.changed, p->bs.ctx, &p->est);
+    if (st != OK) {
+        uwarn(u, "disk %s: the incremental's estimate failed (%.300s); read in full", it->id, err_msg());
+        err_clear();
+        memset(&p->est, 0, sizeof(p->est));
+        return;
+    }
+    p->have_est = 1;
+    unsigned pct = units_config()->delta_full_pct;
+    int audit = u->audit_due;
+    const char *why = NULL;
+    if (audit) why = "audit";
+    else if (p->est.ranges == 0) {
+        p->how = BACKUP_SYNTH_REUSE;
+        p->read_mode = "unchanged";
+        p->reason = "incremental";
+        return;
+    } else if ((double)p->est.estimate * 100.0 > (double)pct * (double)p->est.data_bytes) {
+        why = "delta-too-costly";
+        audit = 1;          /* a full read with the bitmap in hand is a free audit */
+    }
+    if (why) {
+        p->reason = why;
+        if (audit) {
+            st = cdc_audit_open(&ld, vb->t.root, it->size, p->bs.changed, p->bs.ctx, &p->audit);
+            if (st != OK) {
+                uwarn(u, "disk %s: the audit could not start (%.300s)", it->id, err_msg());
+                err_clear();
+                p->audit = NULL;
+            }
+        }
+        return;
+    }
+    p->how = BACKUP_SYNTH_DELTA;
+    p->read_mode = "incremental";
+    p->reason = "incremental";
+}
+
 static status_t part_open(void *ctx, size_t index, cdc_source_t *src, uint64_t *size)
 {
     uctx_t *u = ctx;
@@ -353,7 +515,7 @@ static status_t part_open(void *ctx, size_t index, cdc_source_t *src, uint64_t *
         size_t len = 0;
         if (!(u->uj_text = unit_json_encode(&u->uj, &len))) return ERR_NOMEM;
         p->mem = (memsrc_t){ (const uint8_t *)u->uj_text, len, 0 };
-        *src = (cdc_source_t){ mem_next, mem_read, &p->mem, NULL };
+        *src = (cdc_source_t){ mem_next, mem_read, &p->mem, NULL, NULL };
         *size = len;
         return OK;
     }
@@ -367,7 +529,7 @@ static status_t part_open(void *ctx, size_t index, cdc_source_t *src, uint64_t *
         status_t st = u->ops->stream_open(u->sess, it, &p->pipe.fd);
         if (st != OK) return st;
         p->stream_open = 1;
-        *src = (cdc_source_t){ pipe_span, pipe_read, &p->pipe, pipe_piece };
+        *src = (cdc_source_t){ pipe_span, pipe_read, &p->pipe, pipe_piece, NULL };
         *size = CDC_SIZE_STREAM;
         return OK;
     }
@@ -377,14 +539,20 @@ static status_t part_open(void *ctx, size_t index, cdc_source_t *src, uint64_t *
         if (p->blob_len > SP_BLOB_MAX)
             return set_error(ERR_TOO_LARGE, "blob %s is %zu bytes, over 16 MiB", it->id, p->blob_len);
         p->mem = (memsrc_t){ p->blob, p->blob_len, 0 };
-        *src = (cdc_source_t){ mem_next, mem_read, &p->mem, NULL };
+        *src = (cdc_source_t){ mem_next, mem_read, &p->mem, NULL, NULL };
         *size = p->blob_len;
         return OK;
     }
     status_t st = u->ops->block_open(u->sess, it, &p->bs);
     if (st != OK) return st;
     p->bs_open = 1;
-    block_source_opts_t bo = { 1, units_config()->trust_zero, 0 };
+    decide_read(u, p, it);
+    block_source_opts_t bo = { 1, units_config()->trust_zero, 0, NULL, NULL };
+    if (p->audit) { bo.tap = audit_tap; bo.tap_ctx = p->audit; }
+    /* An incremental restarts the read at every changed range: a window of
+     * one mean chunk keeps what it reads past a resync to that, where the
+     * default 4 MiB would read four times as much around each range. */
+    if (p->how == BACKUP_SYNTH_DELTA) bo.window = (size_t)1024 * 1024;
     st = block_source_open(&p->bs, it->size, &bo, &p->src);
     if (st != OK) return st;
     *src = block_source_iface(p->src);
@@ -392,8 +560,25 @@ static status_t part_open(void *ctx, size_t index, cdc_source_t *src, uint64_t *
     return OK;
 }
 
+/* How a part is stored, for the backup engine. */
+static status_t part_method(void *ctx, size_t index, backup_synth_method_t *out)
+{
+    uctx_t *u = ctx;
+    part_t *p = &u->parts[index];
+    memset(out, 0, sizeof(*out));
+    out->how = p->how;
+    if (p->how == BACKUP_SYNTH_FULL || p->vb < 0) { out->how = BACKUP_SYNTH_FULL; return OK; }
+    memcpy(out->base, u->bases[p->vb].t.root, OBJECT_HASH_SIZE);
+    out->changed = p->bs.changed;
+    out->changed_ctx = p->bs.ctx;
+    out->delta = &p->dres;
+    return OK;
+}
+
 static void part_release(part_t *p)
 {
+    cdc_audit_close(p->audit);
+    p->audit = NULL;
     if (p->src) {
         block_source_stats_t bs;
         block_source_stats(p->src, &bs);
@@ -411,6 +596,15 @@ static void part_close(void *ctx, size_t index, status_t st, const cdc_result_t 
 {
     uctx_t *u = ctx;
     part_t *p = &u->parts[index];
+    if (st == OK && cr) {
+        memcpy(p->hash, cr->hash, OBJECT_HASH_SIZE);
+        p->stored = 1;
+    }
+    if (st == OK && p->audit) {
+        if (cdc_audit_finish(p->audit, &p->ares) == OK) p->audited = 1;
+        else { log_warn("unit %s: audit: %s", u->key, err_msg()); err_clear(); }
+    }
+    if (st == OK && p->how == BACKUP_SYNTH_DELTA) units_vm_count_resync(p->dres.resync_bytes);
     if (p->stream_open) {
         /* Drain what is left so the producer is not stuck writing, then
          * ask whether it succeeded: only then is the stream kept. */
@@ -452,10 +646,63 @@ typedef struct {
     int64_t      repo_id;
 } hook_t;
 
+/*
+ * Tokens settle with the snapshot, in its transaction (5.8): with a new
+ * checkpoint, every disk it covers is bound to it with the content just
+ * stored, and rows of disks it does not cover are dropped; without one
+ * (a shut-off VM, or incrementals off) the chain's rows stay as they are,
+ * still a valid base, and only rows of disks that are gone are dropped. A
+ * failed audit turns incrementals off for the unit in the same
+ * transaction; its rows still name the new checkpoint, so later sessions
+ * retire it rather than leave it behind.
+ */
+static status_t bind_tokens(uctx_t *u, cutils_db_t *db, int64_t repo_id, int64_t snap)
+{
+    const char *keep[UNIT_ITEMS_MAX];
+    size_t nk = 0;
+    status_t st = OK;
+    const char *nt = u->info->new_token && *u->info->new_token ? u->info->new_token : NULL;
+    int bound = 0, all_full = 1;
+    for (size_t p = 0; st == OK && p < u->n_parts; p++) {
+        const part_t *pt = &u->parts[p];
+        if (pt->vb < 0 || nk >= UNIT_ITEMS_MAX) continue;
+        const vbase_t *vb = &u->bases[pt->vb];
+        if (!nt) { keep[nk++] = vb->item; continue; }
+        const sp_item_plan_t *pl = plan_for(u, vb->item);
+        int covered = vb->covered && pt->stored &&
+                      !(pl && pl->reason && strcmp(pl->reason, "no-incremental-support") == 0);
+        if (!covered) continue;
+        st = unit_token_put(db, repo_id, u->key, vb->item, nt, u->info->new_token_blob, snap,
+                            pt->hash, vb->identity);
+        keep[nk++] = vb->item;
+        bound = 1;
+        if (pt->how != BACKUP_SYNTH_FULL) all_full = 0;
+    }
+    if (st == OK) st = unit_tokens_drop_except(db, repo_id, u->key, keep, nk);
+    /* Every disk the chain starts from or continues with was read in full
+     * (a first read, a broken chain, an audit): that is the point the next
+     * audit counts from. */
+    if (st == OK && bound && all_full) st = unit_incr_set_audit(db, repo_id, u->key, (int64_t)time(NULL));
+    for (size_t p = 0; st == OK && p < u->n_parts; p++) {
+        const part_t *pt = &u->parts[p];
+        if (!pt->audited || !pt->ares.bad) continue;
+        char why[400];
+        snprintf(why, sizeof(why), "bitmap audit failed on disk %s in snapshot %lld: %llu bytes of chunks "
+                 "changed outside the dirty bitmap, the first at offset %llu",
+                 u->bases[pt->vb].item, (long long)snap, (unsigned long long)pt->ares.bad_bytes,
+                 (unsigned long long)pt->ares.first_bad);
+        st = unit_incr_disable(db, repo_id, u->key, why);
+        break;
+    }
+    return st;
+}
+
 static status_t index_hook(void *ctx, cutils_db_t *db, int64_t snap_id)
 {
     hook_t *h = ctx;
-    return unit_index_put(db, h->repo_id, snap_id, &h->u->uj);
+    status_t st = unit_index_put(db, h->repo_id, snap_id, &h->u->uj);
+    if (st == OK && h->u->bases) st = bind_tokens(h->u, db, h->repo_id, snap_id);
+    return st;
 }
 
 /* Progress, with the unit in the phase: "unit 3/12 win11-test: store". */
@@ -591,9 +838,114 @@ typedef struct {
     sp_holds_t               holds;
     sp_session_t            *sess;
     const sp_session_info_t *info;
+    /* Incremental chain (vm-backup.md 5.4, 5.8). */
+    vbase_t                 *bases;
+    size_t                   n_bases;
+    sp_item_base_t          *ib;
+    size_t                   n_ib;
+    char                     retire[UNIT_TOKEN_MAX];
+    int                      audit_due;
+    char                     off_why[600];   /* incrementals off for this unit, and why */
 } unit_prep_t;
 
-static status_t unit_prepare(cutils_db_t *db, const unit_backup_opts_t *o,
+/*
+ * The chain before begin. With vm.incremental on and the unit not
+ * disabled, every disk that can carry a checkpoint takes part: it goes to
+ * the provider as a base entry with the chain's token (NULL at the start
+ * of a chain), so the new checkpoint covers it. Whether the daemon will
+ * trust the changed ranges since that token is decided here, from the
+ * token row alone (5.4): the snapshot still names the content, the disk is
+ * the same disk, every disk's row names the same checkpoint. A provider
+ * that offers an incremental for a disk whose token does not bind is read
+ * in full anyway. With incrementals off, no disk takes part, and a token
+ * left from before is handed over to be retired.
+ */
+static status_t bases_prepare(store_t *store, cutils_db_t *db, int64_t repo_id, unit_prep_t *pp)
+{
+    const sp_unit_desc_t *d = pp->d;
+    const units_config_t *cfg = units_config();
+    size_t nb = 0;
+    for (size_t i = 0; i < d->n_items; i++) nb += d->items[i].kind == SP_ITEM_BLOCK;
+    if (nb == 0) return OK;
+    pp->bases = calloc(nb, sizeof(*pp->bases));
+    pp->ib = calloc(nb, sizeof(*pp->ib));
+    if (!pp->bases || !pp->ib) return set_error(ERR_NOMEM, "unit backup: bases");
+    unit_incr_state_t is;
+    status_t st = unit_incr_get(db, repo_id, pp->key, &is);
+    if (st != OK) return st;
+    int on = cfg->incremental && cfg->delta_full_pct > 0;
+    if (on && is.disabled_reason[0]) {
+        snprintf(pp->off_why, sizeof(pp->off_why), "incrementals are off for this unit until reset-incremental: %.500s",
+                 is.disabled_reason);
+        on = 0;
+    }
+    /* Has the unit ever been backed up here? "first" against "no-base". */
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int seen = 0;
+    if (db_execute(db, "SELECT 1 FROM snapshot_units WHERE repo_id = ? AND unit_key = ? LIMIT 1",
+                   (const char *[]){ repo, pp->key, NULL }, &r) == 0 && r && r->nrows > 0) seen = 1;
+    db_result_free(r);
+    char chain[UNIT_TOKEN_MAX] = "";
+    int mixed = 0;
+    for (size_t i = 0; st == OK && i < d->n_items; i++) {
+        const sp_item_desc_t *it = &d->items[i];
+        if (it->kind != SP_ITEM_BLOCK) continue;
+        vbase_t *vb = &pp->bases[pp->n_bases++];
+        snprintf(vb->item, sizeof(vb->item), "%s", it->id);
+        unit_identity(it, vb->identity, sizeof(vb->identity));
+        st = unit_token_get(db, repo_id, pp->key, it->id, &vb->t, &vb->found);
+        if (st != OK) break;
+        if (vb->found) {
+            if (!chain[0]) snprintf(chain, sizeof(chain), "%s", vb->t.token);
+            else if (strcmp(chain, vb->t.token) != 0) mixed = 1;
+        }
+        if (!on) { vb->reason = pp->off_why[0] ? "forced" : NULL; continue; }
+        if (!(it->caps & SP_CAP_INCREMENTAL)) { vb->reason = "no-incremental-support"; continue; }
+        vb->covered = 1;
+        if (!vb->found) { vb->reason = seen ? "no-base" : "first"; continue; }
+        if (vb->t.snap_id <= 0) { vb->reason = "forced"; continue; }      /* reset-incremental */
+        int ok = 0;
+        const char *why = NULL;
+        st = unit_token_binds(store, db, repo_id, &vb->t, vb->identity, &ok, &why);
+        vb->usable = st == OK && ok;
+        vb->reason = why;
+    }
+    if (st != OK) return st;
+    if (mixed) {
+        /* One checkpoint per session covers every disk: rows naming two
+         * cannot both be right. */
+        for (size_t i = 0; i < pp->n_bases; i++)
+            if (pp->bases[i].usable) { pp->bases[i].usable = 0; pp->bases[i].reason = "token-invalid"; }
+    }
+    int any = 0;
+    for (size_t i = 0; i < pp->n_bases; i++) {
+        if (!pp->bases[i].covered) continue;
+        pp->ib[pp->n_ib].item_id = pp->bases[i].item;
+        pp->ib[pp->n_ib].base_token = chain[0] && !mixed ? pp->bases[i].t.token : NULL;
+        pp->n_ib++;
+        any = 1;
+    }
+    if (!any && chain[0]) snprintf(pp->retire, sizeof(pp->retire), "%s", chain);
+    for (size_t i = 0; any && i < pp->n_bases && !pp->audit_due; i++) {
+        if (!pp->bases[i].usable) continue;
+        pp->audit_due = cfg->audit_days > 0 &&
+            (int64_t)time(NULL) - is.last_audit_at >= (int64_t)cfg->audit_days * 86400;
+    }
+    return OK;
+}
+
+static void bases_free(unit_prep_t *pp)
+{
+    free(pp->bases);
+    free(pp->ib);
+    pp->bases = NULL;
+    pp->ib = NULL;
+    pp->n_bases = pp->n_ib = 0;
+}
+
+static status_t unit_prepare(store_t *store, cutils_db_t *db, int64_t repo_id, const unit_backup_opts_t *o,
                              const sp_provider_ops_t *ops, sp_ctx_t *pctx, const listed_t *lu,
                              unit_backup_one_t *res, unit_prep_t *pp)
 {
@@ -613,13 +965,18 @@ static status_t unit_prepare(cutils_db_t *db, const unit_backup_opts_t *o,
         st = set_error(ERR_INVALID, "unit %s (%s) is not in units.allow", d->name, key);
     }
     if (st == OK) st = validate(d);
+    if (st == OK) {
+        pp->d = d;
+        st = bases_prepare(store, db, repo_id, pp);
+    }
     if (st != OK) {
+        bases_free(pp);
+        pp->d = NULL;
         if (d) ops->desc_free(d);
         units_unlock(key);
         return st;
     }
     if (d->name) snprintf(res->name, sizeof(res->name), "%s", d->name);
-    pp->d = d;
     pp->jr.db = db;
     snprintf(pp->jr.provider, sizeof(pp->jr.provider), "%s", ops->name);
     snprintf(pp->jr.unit_id, sizeof(pp->jr.unit_id), "%s", d->unit_id);
@@ -631,14 +988,21 @@ static status_t unit_prepare(cutils_db_t *db, const unit_backup_opts_t *o,
 /* Undo unit_prepare for a unit that never began. */
 static void unit_unprepare(const sp_provider_ops_t *ops, unit_prep_t *pp)
 {
+    bases_free(pp);
     if (pp->d) ops->desc_free(pp->d);
     pp->d = NULL;
     units_unlock(pp->key);
 }
 
-static void begin_req(const unit_backup_opts_t *o, sp_holds_t *holds, sp_begin_req_t *req)
+static void begin_req(const unit_backup_opts_t *o, sp_holds_t *holds, const unit_prep_t *pp,
+                      sp_begin_req_t *req)
 {
     memset(req, 0, sizeof(*req));
+    if (pp) {
+        req->bases = pp->ib;
+        req->n_bases = pp->n_ib;
+        req->retire_token = pp->retire[0] ? pp->retire : NULL;
+    }
     req->job_id = o->job_id;
     req->want = SP_CONSIST_APPLICATION;
     req->require = o->require;
@@ -664,6 +1028,14 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     u.sess = pp->sess;
     u.info = pp->info;
     u.held = (u.info->consist_flags & SP_CF_PAUSE_HELD) != 0;
+    u.store = store;
+    u.db = db;
+    u.repo_id = repo_id;
+    u.key = key;
+    u.bases = pp->bases;
+    u.n_bases = pp->n_bases;
+    u.audit_due = pp->audit_due;
+    if (pp->off_why[0]) uwarn(&u, "%s", pp->off_why);
     res->achieved = u.info->achieved;
     res->n_warnings = (unsigned)u.info->n_warnings;
     if (u.info->n_warnings) snprintf(res->warning, sizeof(res->warning), "%s", u.info->warnings[0]);
@@ -716,12 +1088,14 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
          * a disk carries its image's mtime, which is real metadata. */
         syn[ns].mtime_sec = it->kind == SP_ITEM_BLOCK ? it->mtime_sec : 0;
         u.parts[ns].item = (int)i;
+        u.parts[ns].vb = -1;
         ns++;
     }
     if (st == OK) {
         syn[ns].path = UNIT_JSON_PATH;
         syn[ns].perm = 0600;
         u.parts[ns].item = -1;
+        u.parts[ns].vb = -1;
         ns++;
         u.n_parts = ns;
     }
@@ -734,7 +1108,7 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         memset(&pg, 0, sizeof(pg));
         pg.o = o;
         snprintf(pg.prefix, sizeof(pg.prefix), "unit %zu/%zu %s", index + 1, total, res->name);
-        backup_synth_ops_t sops = { part_open, part_close, &u, part_keep };
+        backup_synth_ops_t sops = { part_open, part_close, &u, part_keep, part_method };
         hook_t hk = { &u, repo_id };
         backup_opts_t bo;
         memset(&bo, 0, sizeof(bo));
@@ -782,9 +1156,56 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* Parts a failure left open. */
     for (size_t i = 0; u.parts && i < n_synth; i++) part_release(&u.parts[i]);
 
+    /*
+     * A bitmap that missed a change (5.4). The snapshot is right (it was a
+     * full read) and stays; the unit fails so the job does, which is what
+     * raises the alert, and the suspects are named.
+     */
+    for (size_t i = 0; st == OK && u.parts && i < n_synth; i++) {
+        const part_t *pt = &u.parts[i];
+        if (!pt->audited || !pt->ares.bad) continue;
+        units_vm_count_audit_failure();
+        char suspects[256] = "";
+        size_t so = 0;
+        char repo[32];
+        snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+        db_result_t *r = NULL;
+        /* Suspect: what was read incrementally since the chain's last full
+         * read (a first read, a broken chain, an audit that passed). */
+        char sn[32];
+        snprintf(sn, sizeof(sn), "%lld", (long long)snap);
+        if (db_execute(db, "SELECT DISTINCT i.snap_id FROM snapshot_unit_items i JOIN snapshot_units s"
+                           " ON s.repo_id = i.repo_id AND s.snap_id = i.snap_id WHERE s.repo_id = ?1"
+                           " AND s.unit_key = ?2 AND i.read_mode IN ('incremental', 'unchanged')"
+                           " AND i.snap_id > COALESCE((SELECT MAX(j.snap_id) FROM snapshot_unit_items j"
+                           " JOIN snapshot_units t ON t.repo_id = j.repo_id AND t.snap_id = j.snap_id"
+                           " WHERE t.repo_id = ?1 AND t.unit_key = ?2 AND j.kind = 'block'"
+                           " AND j.read_mode = 'full' AND j.reason NOT IN ('no-incremental-support', 'forced')"
+                           " AND j.snap_id < ?3), 0) ORDER BY i.snap_id LIMIT 20",
+                       (const char *[]){ repo, key, sn, NULL }, &r) == 0 && r) {
+            for (int k = 0; k < r->nrows && so + 24 < sizeof(suspects); k++)
+                so += (size_t)snprintf(suspects + so, sizeof(suspects) - so, "%s%s", k ? ", " : "", r->rows[k][0]);
+        }
+        db_result_free(r);
+        const char *item = u.bases[pt->vb].item;
+        log_error("unit %s: bitmap audit failed on disk %s: %llu bytes of chunks changed outside the dirty "
+                  "bitmap, the first at offset %llu; incrementals are off for this unit until reset-incremental; "
+                  "snapshots read incrementally that are now suspect: %s", key, item,
+                  (unsigned long long)pt->ares.bad_bytes, (unsigned long long)pt->ares.first_bad,
+                  suspects[0] ? suspects : "none");
+        st = set_error(ERR_CORRUPT, "bitmap audit failed: %llu bytes of chunks changed outside the dirty bitmap, "
+                       "the first at offset %llu (disk %s); snapshot %lld is a full read and correct; incrementals are off until "
+                       "reset-incremental; suspect incremental snapshots: %s",
+                       (unsigned long long)pt->ares.bad_bytes, (unsigned long long)pt->ares.first_bad, item,
+                       (long long)snap, suspects[0] ? suspects : "none");
+        break;
+    }
+
     char why[ERR_MSG_MAX];
     snprintf(why, sizeof(why), "%s", st != OK ? err_msg() : "");
-    status_t est = ops->end(u.sess, st == OK ? SP_END_COMMITTED : SP_END_ABORTED, snap);
+    /* Committed is about the snapshot: one that a failed audit then fails
+     * is still committed, and its checkpoint settles as such. */
+    status_t est = ops->end(u.sess, snap > 0 ? SP_END_COMMITTED : SP_END_ABORTED, snap);
     if (est != OK) {
         /* Never fails a snapshot that committed: the sweep has the rows. */
         log_warn("unit %s: releasing the session failed: %s; the sweep will retry",
@@ -804,6 +1225,9 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     unit_json_free(&u.uj);
     free(u.uj_text);
     free(u.parts);
+    for (size_t i = 0; i < u.n_warn; i++) free(u.warn[i]);
+    free(u.warn);
+    bases_free(pp);
     free(syn);
     for (size_t i = 0; synpath && i < n_synth; i++) free(synpath[i]);
     free(synpath);
@@ -824,10 +1248,10 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
                         unit_backup_one_t *res)
 {
     unit_prep_t pp;
-    status_t st = unit_prepare(db, o, ops, pctx, lu, res, &pp);
+    status_t st = unit_prepare(store, db, repo_id, o, ops, pctx, lu, res, &pp);
     if (st != OK) return st;
     sp_begin_req_t req;
-    begin_req(o, &pp.holds, &req);
+    begin_req(o, &pp.holds, &pp, &req);
     size_t n_fb = 0;
     for (size_t i = 0; i < pp.d->n_items; i++) n_fb += is_fallback(&pp.d->items[i]) ? 1u : 0u;
     req.hold_pause = n_fb > 0 && ops->release && pp.d->state == SP_STATE_RUNNING;
@@ -841,6 +1265,58 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
 }
 
 /* ------------------------------------------------------------------ */
+
+typedef struct {
+    unsigned checked, redefined, refused;
+    char     last[UNIT_KEY_MAX + UNIT_TOKEN_MAX];   /* (unit, token) pairs come sorted: one call each */
+} redef_t;
+
+static status_t redefine_one(void *ctx, int64_t repo_id, const char *unit_id, const char *token)
+{
+    (void)repo_id;
+    redef_t *r = ctx;
+    char pair[sizeof(r->last)];
+    snprintf(pair, sizeof(pair), "%s %s", unit_id, token);
+    if (strcmp(pair, r->last) == 0) return OK;
+    snprintf(r->last, sizeof(r->last), "%s", pair);
+    cJSON *a = cJSON_CreateObject();
+    char key[UNIT_KEY_MAX];
+    unit_key_format(key, sizeof(key), "libvirt", unit_id);
+    if (a) {
+        cJSON_AddStringToObject(a, "unit", key);
+        cJSON_AddStringToObject(a, "checkpoint", token);
+    }
+    cJSON *res = NULL;
+    r->checked++;
+    if (remote_op("libvirt", "vm.checkpoint_redefine", a, -1, &res) != OK) {
+        log_warn("units: checkpoint %s of %s: %s", token, key, err_msg());
+        err_clear();
+        r->refused++;
+        return OK;
+    }
+    const char *state = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "state"));
+    if (state && strcmp(state, "redefined") == 0) r->redefined++;
+    else if (state && strcmp(state, "present") != 0) {
+        r->refused++;
+        const char *why = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "why"));
+        log_warn("units: checkpoint %s of %s is %s%s%s; its disks read in full next time", token, key, state,
+                 why ? ": " : "", why ? why : "");
+    }
+    cJSON_Delete(res);
+    return OK;
+}
+
+status_t unit_checkpoints_redefine(cutils_db_t *db, unsigned *checked, unsigned *redefined,
+                                   unsigned *refused)
+{
+    redef_t r;
+    memset(&r, 0, sizeof(r));
+    status_t st = unit_tokens_each(db, "libvirt", redefine_one, &r);
+    if (checked) *checked = r.checked;
+    if (redefined) *redefined = r.redefined;
+    if (refused) *refused = r.refused;
+    return st;
+}
 
 void unit_backup_result_free(unit_backup_result_t *r)
 {
@@ -911,7 +1387,7 @@ static void run_group(store_t *store, cutils_db_t *db, int64_t repo_id, const un
     }
     size_t m = 0;
     for (size_t k = 0; k < n; k++) {
-        status_t st = unit_prepare(db, o, ops, pctx, lus[k], rs[k], &pp[m]);
+        status_t st = unit_prepare(store, db, repo_id, o, ops, pctx, lus[k], rs[k], &pp[m]);
         if (st != OK) { tally(out, rs[k], st, first_st, first_err, fsz); continue; }
         who[m] = k;
         descs[m] = pp[m].d;
@@ -920,7 +1396,7 @@ static void run_group(store_t *store, cutils_db_t *db, int64_t repo_id, const un
     if (m) {
         log_info("unit backup: %zu unit(s) in one capture", m);
         sp_begin_req_t req;
-        begin_req(o, &pp[0].holds, &req);
+        begin_req(o, &pp[0].holds, NULL, &req);
         status_t st = ops->begin_group(pctx, descs, m, &req, sess, infos);
         if (st != OK) {
             char why[ERR_MSG_MAX];

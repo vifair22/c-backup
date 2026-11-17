@@ -25,11 +25,25 @@ typedef struct {
     unsigned    freeze_timeout_s;   /* vm.freeze_timeout_s: freeze watchdog */
     unsigned    max_pause_s;        /* containers.max_pause_s: pause watchdog */
     int         trust_zero;         /* vm.trust_zero_status */
+    /* Incremental disk reads (vm-backup.md 5): off, the daemon gives no
+     * provider a base and every disk reads in full (R3: on by default only
+     * after UAT). */
+    int         incremental;        /* vm.incremental */
+    unsigned    delta_full_pct;     /* vm.delta_full_pct: read in full above this share */
+    unsigned    audit_days;         /* vm.audit_days: 0 never audits */
 } units_config_t;
 
 #define UNITS_WAIT_DEFAULT_S     3600u
 #define UNITS_FREEZE_DEFAULT_S   10u
 #define UNITS_PAUSE_DEFAULT_S    30u
+#define UNITS_DELTA_PCT_DEFAULT  75u
+#define UNITS_AUDIT_DAYS_DEFAULT 30u
+
+/* Counters for GET /metrics (vm-backup.md 8.5). */
+void     units_vm_count_audit_failure(void);
+void     units_vm_count_resync(uint64_t bytes);
+uint64_t units_vm_audit_failures(void);
+uint64_t units_vm_resync_bytes(void);
 
 /*
  * Load (or create) the daemon id and take the configuration. The id is 32

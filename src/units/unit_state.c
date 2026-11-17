@@ -22,8 +22,15 @@
 static char           g_id[33];
 static char           g_id8[9];
 static units_config_t g_cfg = { "", UNITS_WAIT_DEFAULT_S, UNITS_FREEZE_DEFAULT_S,
-                                UNITS_PAUSE_DEFAULT_S, 1 };
+                                UNITS_PAUSE_DEFAULT_S, 1, 0, UNITS_DELTA_PCT_DEFAULT,
+                                UNITS_AUDIT_DAYS_DEFAULT };
 static char          *g_allow;
+static _Atomic uint64_t g_audit_failures, g_resync_bytes;
+
+void     units_vm_count_audit_failure(void) { atomic_fetch_add(&g_audit_failures, 1); }
+void     units_vm_count_resync(uint64_t bytes) { atomic_fetch_add(&g_resync_bytes, bytes); }
+uint64_t units_vm_audit_failures(void) { return atomic_load(&g_audit_failures); }
+uint64_t units_vm_resync_bytes(void) { return atomic_load(&g_resync_bytes); }
 
 /* ------------------------------------------------------------------ */
 /* Daemon id                                                           */

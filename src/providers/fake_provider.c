@@ -37,6 +37,13 @@ typedef struct {
     size_t       n_runs;
     fake_alloc_t alloc;
     int64_t      mtime;
+    /* Incremental (vm-backup.md 5): the disk can carry a checkpoint, and
+     * what its bitmap reports as changed since the unit's checkpoint, as
+     * [s, e) pairs, scripted by the test (and deliberately wrong when it
+     * wants the audit to catch it). */
+    int          incremental;
+    uint64_t    *chg;
+    size_t       n_chg;
 } fdisk_t;
 
 typedef struct {
@@ -53,6 +60,8 @@ typedef struct {
     fblob_t *blobs; size_t nb;
     fdisk_t *disks; size_t nd;
     ftree_t *trees; size_t nt;
+    char     cp[ARTEFACT_NAME_MAX];   /* the unit's checkpoint, "" for none */
+    int      refuse;                  /* its bitmap is inconsistent: refused once */
 } funit_t;
 
 typedef struct {
@@ -111,6 +120,8 @@ struct sp_session {
     int64_t           job;
     fake_fail_t       fail;
     uint64_t          fail_arg;
+    char              new_cp[ARTEFACT_NAME_MAX];   /* made by this session */
+    char              old_cp[ARTEFACT_NAME_MAX];   /* retired if it commits */
 };
 
 /* ------------------------------------------------------------------ */
@@ -150,7 +161,7 @@ static void funit_clear(funit_t *u)
 {
     if (!u) return;
     for (size_t i = 0; i < u->nb; i++) { free(u->blobs[i].path); free(u->blobs[i].data); }
-    for (size_t i = 0; i < u->nd; i++) free(u->disks[i].runs);
+    for (size_t i = 0; i < u->nd; i++) { free(u->disks[i].runs); free(u->disks[i].chg); }
     for (size_t i = 0; i < u->nt; i++) { free(u->trees[i].read_root); free(u->trees[i].path); }
     free(u->blobs); free(u->disks); free(u->trees); free(u->name);
     memset(u, 0, sizeof(*u));
@@ -180,10 +191,14 @@ static status_t funit_copy(const funit_t *in, funit_t *out)
         out->blobs[i].data = dupmem(in->blobs[i].data, in->blobs[i].len);
         if (!out->blobs[i].path || !out->blobs[i].data) { out->nb++; goto oom; }
     }
+    memcpy(out->cp, in->cp, sizeof(out->cp));
+    out->refuse = in->refuse;
     for (size_t i = 0; i < in->nd; i++, out->nd++) {
         out->disks[i] = in->disks[i];
         out->disks[i].runs = dupmem(in->disks[i].runs, in->disks[i].n_runs * sizeof(fake_run_t));
-        if (!out->disks[i].runs) { out->nd++; goto oom; }
+        /* An empty set is a set (nothing changed), not "none scripted". */
+        out->disks[i].chg = in->disks[i].chg ? dupmem(in->disks[i].chg, (in->disks[i].n_chg + 1) * 2 * sizeof(uint64_t)) : NULL;
+        if (!out->disks[i].runs || (in->disks[i].chg && !out->disks[i].chg)) { out->nd++; goto oom; }
     }
     for (size_t i = 0; i < in->nt; i++, out->nt++) {
         out->trees[i] = in->trees[i];
@@ -237,7 +252,13 @@ status_t fake_unit_add(sp_ctx_t *ctx, const char *unit_id, const char *name,
         return set_error(ERR_INVALID, "fake: bad unit id or name");
     pthread_mutex_lock(&ctx->mu);
     funit_t *u = find_unit(ctx, unit_id);
+    char cp[ARTEFACT_NAME_MAX] = "";
+    int refuse = 0;
     if (u) {
+        /* The same unit, redefined: its checkpoint stays, as libvirt keeps
+         * a domain's across a define of the same UUID. */
+        memcpy(cp, u->cp, sizeof(cp));
+        refuse = u->refuse;
         funit_clear(u);
     } else {
         funit_t *g = realloc(ctx->units, (ctx->nu + 1) * sizeof(*g));
@@ -247,6 +268,8 @@ status_t fake_unit_add(sp_ctx_t *ctx, const char *unit_id, const char *name,
         memset(u, 0, sizeof(*u));
     }
     snprintf(u->id, sizeof(u->id), "%s", unit_id);
+    memcpy(u->cp, cp, sizeof(u->cp));
+    u->refuse = refuse;
     u->name = strdup(name);
     u->state = state;
     u->caps = caps;
@@ -361,12 +384,17 @@ status_t fake_disk_add(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
     pthread_mutex_lock(&ctx->mu);
     funit_t *u = find_unit(ctx, unit_id);
     status_t st = OK;
-    fdisk_t *g = u ? realloc(u->disks, (u->nd + 1) * sizeof(*g)) : NULL;
+    /* A disk of the same id is replaced: how a test writes into it. */
+    size_t at = u ? u->nd : 0;
+    for (size_t i = 0; u && i < u->nd; i++) if (strcmp(u->disks[i].id, item_id) == 0) at = i;
+    fdisk_t *g = u ? (at < u->nd ? u->disks : realloc(u->disks, (u->nd + 1) * sizeof(*g))) : NULL;
     if (!u) st = set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
     else if (!g) st = set_error(ERR_NOMEM, "fake: disk");
     else {
         u->disks = g;
-        fdisk_t *d = &g[u->nd];
+        fdisk_t *d = &g[at];
+        int replace = at < u->nd;
+        if (replace) { free(d->runs); free(d->chg); }
         memset(d, 0, sizeof(*d));
         snprintf(d->id, sizeof(d->id), "%s", item_id);
         d->size = size;
@@ -374,7 +402,7 @@ status_t fake_disk_add(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
         d->runs = dupmem(runs, n_runs * sizeof(*runs));
         d->n_runs = n_runs;
         if (!d->runs) st = set_error(ERR_NOMEM, "fake: disk");
-        else u->nd++;
+        else if (!replace) u->nd++;
     }
     pthread_mutex_unlock(&ctx->mu);
     return st;
@@ -820,7 +848,8 @@ static status_t f_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
             memcpy(it->id, u->disks[i].id, sizeof(it->id));
             it->kind = SP_ITEM_BLOCK;
             it->size = u->disks[i].size;
-            snprintf(it->format, sizeof(it->format), "raw");
+            snprintf(it->format, sizeof(it->format), "%s", u->disks[i].incremental ? "qcow2" : "raw");
+            if (u->disks[i].incremental) it->caps |= SP_CAP_INCREMENTAL;
             it->mtime_sec = u->disks[i].mtime;
             if (!(it->tree_path = disk_path(u->disks[i].id))) st = set_error(ERR_NOMEM, "fake");
         }
@@ -1058,10 +1087,43 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
         for (size_t i = 0; st == OK && i < su->nb; i++)
             s->info.plans[s->info.n_plans++] =
                 (sp_item_plan_t){ su->blobs[i].id, SP_READ_FULL, "no-incremental-support" };
-        for (size_t i = 0; st == OK && i < su->nd; i++)
-            s->info.plans[s->info.n_plans++] =
-                (sp_item_plan_t){ su->disks[i].id, SP_READ_FULL,
-                                  req && req->n_bases ? "no-base" : "first" };
+        /* The chain, as libvirt's would behave (5.8): a disk that takes
+         * part is incremental against base when base is the unit's
+         * checkpoint and its bitmap is good; a new checkpoint covers every
+         * disk that takes part; offline there is no bitmap. */
+        const char *base = NULL;
+        int any = 0;
+        for (size_t k = 0; req && k < req->n_bases; k++) {
+            if (req->bases[k].base_token && !base) base = req->bases[k].base_token;
+        }
+        int base_ok = base && running && su->cp[0] && strcmp(base, su->cp) == 0 && !su->refuse;
+        for (size_t i = 0; st == OK && i < su->nd; i++) {
+            const char *why = "no-incremental-support";
+            sp_read_mode_t mode = SP_READ_FULL;
+            int part = 0;
+            for (size_t k = 0; req && k < req->n_bases; k++)
+                if (strcmp(req->bases[k].item_id, su->disks[i].id) == 0) part = 1;
+            if (part && su->disks[i].incremental && running) {
+                any = 1;
+                if (base_ok) { mode = SP_READ_INCREMENTAL; why = "incremental"; }
+                else why = !base ? "no-base" : "token-invalid";
+            } else if (!req || !req->n_bases) {
+                why = "first";
+            }
+            s->info.plans[s->info.n_plans++] = (sp_item_plan_t){ su->disks[i].id, mode, why };
+        }
+        if (st == OK && base && su->refuse)
+            st = sp_session_info_warn(&s->info, "the incremental against %s was refused; read in full", base);
+        const char *old = any ? base : (req ? req->retire_token : NULL);
+        if (st == OK && running && old && su->cp[0] && strcmp(old, su->cp) == 0)
+            snprintf(s->old_cp, sizeof(s->old_cp), "%s", old);
+        if (st == OK && any && running) {
+            if (artefact_name(s->new_cp, sizeof(s->new_cp), c->daemon8, s->job, (int64_t)time(NULL) % 100000) != 0)
+                st = set_error(ERR_INVALID, "fake: checkpoint name");
+            else if (!(s->info.new_token = strdup(s->new_cp)) ||
+                     !(s->info.new_token_blob = strdup("<domaincheckpoint/>")))
+                st = set_error(ERR_NOMEM, "fake: token");
+        }
         for (size_t i = 0; st == OK && i < su->nt; i++)
             s->info.plans[s->info.n_plans++] =
                 (sp_item_plan_t){ su->trees[i].id, SP_READ_FULL, "no-incremental-support" };
@@ -1220,13 +1282,23 @@ static status_t fs_extent(void *ctx, uint64_t from, sp_ext_type_t *type,
 
 static status_t fs_changed(void *ctx, uint64_t from, uint64_t *s, uint64_t *e, int *done)
 {
-    /* No base is ever given in this build, so no plan says incremental;
-     * the whole disk is the honest answer if anything asks. */
+    /* The scripted changed set, as a bitmap query would answer: the first
+     * range ending after from. With none scripted, the whole disk. */
     fstream_t *f = ctx;
-    if (from >= f->d->size) { *done = 1; return OK; }
-    *s = from;
-    *e = f->d->size;
-    *done = 0;
+    const fdisk_t *d = f->d;
+    if (!d->chg) {
+        if (from >= d->size) { *done = 1; return OK; }
+        *s = from; *e = d->size; *done = 0;
+        return OK;
+    }
+    for (size_t i = 0; i < d->n_chg; i++) {
+        if (d->chg[2 * i + 1] <= from) continue;
+        *s = d->chg[2 * i] < from ? from : d->chg[2 * i];
+        *e = d->chg[2 * i + 1];
+        *done = 0;
+        return OK;
+    }
+    *done = 1;
     return OK;
 }
 
@@ -1382,8 +1454,59 @@ static status_t f_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapsho
     pthread_mutex_lock(&c->mu);
     if (outcome == SP_END_COMMITTED) c->st.ends_committed++;
     else c->st.ends_aborted++;
+    /* Checkpoints settle with the snapshot (5.8). */
+    funit_t *u = find_unit(c, s->unit->id);
+    if (u && outcome == SP_END_COMMITTED) {
+        if (s->new_cp[0]) { snprintf(u->cp, sizeof(u->cp), "%s", s->new_cp); u->refuse = 0; }
+        else if (s->old_cp[0] && strcmp(u->cp, s->old_cp) == 0) u->cp[0] = '\0';
+        /* A committed session's bitmaps start over from its checkpoint. */
+        for (size_t i = 0; s->new_cp[0] && i < u->nd; i++) { free(u->disks[i].chg); u->disks[i].chg = NULL; u->disks[i].n_chg = 0; }
+    }
     pthread_mutex_unlock(&c->mu);
     session_free(s);
+    return st;
+}
+
+status_t fake_disk_set_changed(sp_ctx_t *c, const char *unit_id, const char *item_id,
+                               const uint64_t *ranges, size_t n)
+{
+    pthread_mutex_lock(&c->mu);
+    funit_t *u = find_unit(c, unit_id);
+    fdisk_t *d = NULL;
+    for (size_t i = 0; u && i < u->nd; i++) if (strcmp(u->disks[i].id, item_id) == 0) d = &u->disks[i];
+    status_t st = d ? OK : set_error(ERR_NOT_FOUND, "fake: no disk %s of %s", item_id, unit_id);
+    uint64_t *g = NULL;
+    /* One pair more than given, so an empty set is still a set. */
+    if (st == OK && !(g = calloc(n + 1, 2 * sizeof(uint64_t)))) st = set_error(ERR_NOMEM, "fake");
+    if (st == OK) {
+        if (n) memcpy(g, ranges, n * 2 * sizeof(uint64_t));
+        free(d->chg);
+        d->chg = g;
+        d->n_chg = n;
+        d->incremental = 1;
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+status_t fake_unit_checkpoint(sp_ctx_t *c, const char *unit_id, char *buf, size_t sz)
+{
+    pthread_mutex_lock(&c->mu);
+    funit_t *u = find_unit(c, unit_id);
+    status_t st = u ? OK : set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+    if (st == OK) snprintf(buf, sz, "%s", u->cp);
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+status_t fake_unit_break_chain(sp_ctx_t *c, const char *unit_id, int lose, int refuse)
+{
+    pthread_mutex_lock(&c->mu);
+    funit_t *u = find_unit(c, unit_id);
+    status_t st = u ? OK : set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+    if (st == OK && lose) u->cp[0] = '\0';
+    if (st == OK) u->refuse = refuse;
+    pthread_mutex_unlock(&c->mu);
     return st;
 }
 
