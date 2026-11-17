@@ -146,8 +146,15 @@ Notes that matter:
 - **A unit job while the helper is away fails and alerts**, scheduled or
   not, with the socket path and the reason in the error, the journal and
   the push alert; it is never skipped quietly. A job in flight when the
-  helper restarts fails cleanly (no snapshot, the helper's own start-up
-  sweep releases what the old process held), and the next one reconnects.
+  helper restarts loses its capture: the new process's start-up sweep
+  releases what the old one held and destroys its snapshots. A unit that
+  still needed the helper (its begin, or a read through a snapshot that is
+  now gone) fails cleanly with no snapshot. A unit whose reads had all
+  finished keeps its snapshot, which is whole, since everything in it was
+  read from the capture before it went; its end could not reach the old
+  capture, and that is a warning on the job. The fake provider's trees are
+  read from live directories, so there a restart mid-read shows the second
+  case. The next job reconnects.
   `GET /providers` shows the link (`helper.state`: `connected`,
   `disconnected` or `never-connected`, `since`, `last_error`,
   `reconnects`) and, per provider behind it, `connection.state`.
