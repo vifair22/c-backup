@@ -68,6 +68,7 @@ typedef enum {
     FAKE_FAIL_RELEASE,           /* releasing a hold fails, anywhere */
     FAKE_CRASH_IN_HOLD,          /* begin "dies" holding: no release, no clear */
     FAKE_HANG_IN_HOLD,           /* begin holds the freeze up to `arg` ms */
+    FAKE_HANG_IN_PAUSE,          /* begin holds the pause up to `arg` ms */
 } fake_fail_t;
 
 /* One failure, for one unit id (NULL: every unit). Replaces any set. */

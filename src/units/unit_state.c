@@ -198,12 +198,24 @@ int units_allowed(const char *provider, const char *unit_id, const char *name)
 /* Hold journal                                                        */
 /* ------------------------------------------------------------------ */
 
+int64_t units_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* created_at is milliseconds (002_units.sql predates that and says no
+ * unit). In whole seconds a hold recorded late in one second was overdue
+ * up to a second early, which with a 1 s limit meant at once. Only the
+ * watchdog reads the column; a row from a daemon that stored seconds
+ * reads as long overdue, and belongs to a job that is gone. */
 static status_t j_record(void *ctx, const char *kind, const char *detail, int64_t *out)
 {
     units_journal_t *j = ctx;
     char job[32], now[32];
     snprintf(job, sizeof(job), "%lld", (long long)j->job_id);
-    snprintf(now, sizeof(now), "%lld", (long long)time(NULL));
+    snprintf(now, sizeof(now), "%lld", (long long)units_now_ms());
     if (db_txn_begin(j->db) != OK) return set_error(ERR_IO, "hold journal: begin");
     db_result_t *r = NULL;
     int ok = db_execute(j->db,
@@ -294,16 +306,24 @@ static int in_list(const int64_t *l, size_t n, int64_t v)
 /*
  * Release the rows of r (columns id, provider, unit_id, kind, detail, job)
  * that belong to provider, through its sweep, and delete those released.
+ * With keep_absent a row whose release found nothing held stays: see
+ * sp_sweep_req_t.absent for why the watchdog must not delete it.
  */
 static status_t sweep_provider(cutils_db_t *db, const sp_provider_ops_t *ops,
                                sp_ctx_t *ctx, db_result_t *r, const int64_t *live,
-                               size_t nlive, int scan, units_sweep_result_t *out,
-                               const char *why)
+                               size_t nlive, int scan, int keep_absent,
+                               units_sweep_result_t *out, const char *why)
 {
     size_t cap = (size_t)(r && r->nrows ? r->nrows : 1);
     sp_intent_t *in = calloc(cap, sizeof(*in));
     int *rel = calloc(cap, sizeof(*rel));
-    if (!in || !rel) { free(in); free(rel); return set_error(ERR_NOMEM, "units: sweep"); }
+    int *absent = calloc(cap, sizeof(*absent));
+    if (!in || !rel || !absent) {
+        free(in);
+        free(rel);
+        free(absent);
+        return set_error(ERR_NOMEM, "units: sweep");
+    }
     size_t n = 0;
     for (int i = 0; r && i < r->nrows; i++) {
         char **row = r->rows[i];
@@ -317,13 +337,14 @@ static status_t sweep_provider(cutils_db_t *db, const sp_provider_ops_t *ops,
         in[n].job_id = job;
         n++;
     }
-    if (n == 0 && !scan) { free(in); free(rel); return OK; }
+    if (n == 0 && !scan) { free(in); free(rel); free(absent); return OK; }
     sp_sweep_req_t req;
     memset(&req, 0, sizeof(req));
     req.daemon8 = g_id8;
     req.intents = in;
     req.n_intents = n;
     req.released = rel;
+    req.absent = absent;
     req.scan_artefacts = scan;
     req.live_jobs = live;
     req.n_live_jobs = nlive;
@@ -335,6 +356,7 @@ static status_t sweep_provider(cutils_db_t *db, const sp_provider_ops_t *ops,
         err_clear();
     }
     for (size_t i = 0; i < n; i++) {
+        if (st == OK && rel[i] && keep_absent && absent[i]) continue;
         if (st == OK && rel[i]) {
             if (delete_intent(db, in[i].id) == OK) {
                 out->released++;
@@ -355,6 +377,7 @@ static status_t sweep_provider(cutils_db_t *db, const sp_provider_ops_t *ops,
     out->left_foreign += rep.left_foreign;
     free(in);
     free(rel);
+    free(absent);
     return OK;
 }
 
@@ -381,7 +404,7 @@ status_t units_sweep(cutils_db_t *db, int64_t self_job, units_sweep_result_t *ou
         const sp_provider_ops_t *ops = NULL;
         sp_ctx_t *ctx = NULL;
         sp_registry_at(p, &ops, &ctx);
-        if (ops) (void)sweep_provider(db, ops, ctx, r, live, nlive, 1, &res, "sweep");
+        if (ops) (void)sweep_provider(db, ops, ctx, r, live, nlive, 1, 0, &res, "sweep");
     }
     db_result_free(r);
     free(live);
@@ -393,11 +416,11 @@ status_t units_sweep(cutils_db_t *db, int64_t self_job, units_sweep_result_t *ou
 /* Watchdog                                                            */
 /* ------------------------------------------------------------------ */
 
-status_t units_watchdog_tick(cutils_db_t *db, time_t now, unsigned *released)
+status_t units_watchdog_tick(cutils_db_t *db, int64_t now_ms, unsigned *released)
 {
     char f[32], pz[32];
-    snprintf(f, sizeof(f), "%lld", (long long)(now - (time_t)g_cfg.freeze_timeout_s));
-    snprintf(pz, sizeof(pz), "%lld", (long long)(now - (time_t)g_cfg.max_pause_s));
+    snprintf(f, sizeof(f), "%lld", (long long)(now_ms - (int64_t)g_cfg.freeze_timeout_s * 1000));
+    snprintf(pz, sizeof(pz), "%lld", (long long)(now_ms - (int64_t)g_cfg.max_pause_s * 1000));
     db_result_t *r = NULL;
     if (db_execute(db,
             "SELECT id, provider, unit_id, kind, detail, COALESCE(job_id, 0)"
@@ -415,7 +438,7 @@ status_t units_watchdog_tick(cutils_db_t *db, time_t now, unsigned *released)
             const sp_provider_ops_t *ops = NULL;
             sp_ctx_t *ctx = NULL;
             sp_registry_at(p, &ops, &ctx);
-            if (ops) (void)sweep_provider(db, ops, ctx, r, NULL, 0, 0, &res, "watchdog");
+            if (ops) (void)sweep_provider(db, ops, ctx, r, NULL, 0, 0, 1, &res, "watchdog");
         }
     }
     db_result_free(r);
@@ -446,7 +469,7 @@ static void *wd_main(void *arg)
         if (g_wd.stop) break;
         pthread_mutex_unlock(&g_wd.mu);
         unsigned n = 0;
-        if (units_watchdog_tick(g_wd.db, time(NULL), &n) != OK) {
+        if (units_watchdog_tick(g_wd.db, units_now_ms(), &n) != OK) {
             log_warn("%s", err_msg());
             err_clear();
         }
