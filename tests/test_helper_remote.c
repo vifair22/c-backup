@@ -8,6 +8,7 @@
  * is read on the daemon's side, as source-providers.md 11.1 lays out.
  */
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <time.h>
@@ -373,6 +374,11 @@ static void test_dumps_through_helper(void **state)
 static void test_unit_restore(void **state)
 {
     (void)state;
+    /* The tree's root as it is read: a mode and a time the staging
+     * directory never has, so B168 shows if the swap brings those in. */
+    assert_int_equal(chmod(HF_SNAP, 0751), 0);
+    struct timespec rt[2] = { { 1500000000, 0 }, { 1500000000, 0 } };
+    assert_int_equal(utimensat(AT_FDCWD, HF_SNAP, rt, 0), 0);
     unit_backup_result_t res;
     assert_int_equal(backup_one("cbk-uat-one", &res), OK);
     int64_t snap = res.units[0].snapshot_id;
@@ -417,6 +423,12 @@ static void test_unit_restore(void **state)
     assert_non_null(strstr(dr.json, "cbackup-old-33"));
     assert_true(file_has(HF_DIR "/state/fake-define-u1.json", "\"replace\":true"));
     unit_define_result_free(&dr);
+    /* B168: the mount root is the snapshot's, not the staging directory's
+     * 0700 and today's date; and the emptied staging base is gone. */
+    assert_int_equal(stat(HF_MOUNT, &sb), 0);
+    assert_int_equal(sb.st_mode & 07777, 0751);
+    assert_int_equal((long long)sb.st_mtim.tv_sec, 1500000000LL);
+    assert_int_not_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
 }
 
 /* A compose project's definition as the daemon assembles it from a

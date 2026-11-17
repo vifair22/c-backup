@@ -1357,20 +1357,28 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     if (snprintf(path, sizeof(path), "%s/%lld-%s", base, (long long)r->job, uniq) >= (int)sizeof(path))
         return resp_error(r->id, HELPER_E_INVALID, "path too long");
     /* Made down to the staging base, which may be a share directory not
-     * there yet (system/), each level the helper's own except the last. */
+     * there yet (system/), each level the helper's own except the last.
+     * Under mu: a swap removes the base once it is empty (staging_tidy),
+     * and must not do so between this mkdir of it and the one of path. */
     {
         char p[PATH_MAX];
         snprintf(p, sizeof(p), "%s", base);
+        pthread_mutex_lock(&s->mu);
         for (char *c = p + strlen(dom) + 1; *c; c++) {
             if (*c != '/') continue;
             *c = '\0';
-            if (mkdir(p, 0755) != 0 && errno != EEXIST)
-                return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", p, strerror(errno));
+            if (mkdir(p, 0755) != 0 && errno != EEXIST) {
+                int err = errno;
+                pthread_mutex_unlock(&s->mu);
+                return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", p, strerror(err));
+            }
             *c = '/';
         }
+        int bad = mkdir_owned(base, s->pol->daemon_uid) != 0 || mkdir_owned(path, s->pol->daemon_uid) != 0;
+        int err = errno;
+        pthread_mutex_unlock(&s->mu);
+        if (bad) return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", path, strerror(err));
     }
-    if (mkdir_owned(base, s->pol->daemon_uid) != 0 || mkdir_owned(path, s->pol->daemon_uid) != 0)
-        return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", path, strerror(errno));
     /* The swap is a rename: the staging must be on the mount's filesystem
      * (a btrfs subvolume or another dataset would be EXDEV at the swap,
      * after the whole restore was written). */
@@ -1411,6 +1419,29 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     return resp_ok(r->id, res);
 }
 
+/*
+ * After a swap, what of the staging is empty goes (B168: an empty
+ * <domain>/.cbackup-restore was left at the top of the domain): the
+ * staging directory of a disk image, whose image moved out of it, and the
+ * base when it is the helper's own .cbackup-restore with nothing else in
+ * it. An operator's restore_staging_dirs entry is theirs and stays. rmdir
+ * only, so anything another restore still has there is safe, and under mu
+ * against a stage making the base at the same time.
+ */
+static void staging_tidy(helper_server_t *s, const char *dir, int file)
+{
+    char base[HELPER_PATH_MAX + 1];
+    if (snprintf(base, sizeof(base), "%s", dir) >= (int)sizeof(base)) return;
+    char *sl = strrchr(base, '/');
+    if (!sl || sl == base) return;
+    *sl = '\0';
+    const char *leaf = strrchr(base, '/');
+    pthread_mutex_lock(&s->mu);
+    if (file == 2) (void)rmdir(dir);
+    if (leaf && strcmp(leaf, "/.cbackup-restore") == 0) (void)rmdir(base);
+    pthread_mutex_unlock(&s->mu);
+}
+
 static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
 {
     if (!s->pol->allow_restore) return resp_error(r->id, HELPER_E_DENIED, "the policy does not allow restore");
@@ -1423,6 +1454,8 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     if (!x) return resp_error(r->id, HELPER_E_INVALID, "no such staging");
     if (st.swapped) return resp_error(r->id, HELPER_E_INVALID, "already swapped");
     if (st.file == 3) return resp_error(r->id, HELPER_E_INVALID, "this staging is for vm.install_state");
+    char sdir[HELPER_PATH_MAX + 1];
+    snprintf(sdir, sizeof(sdir), "%s", st.path);
     /* A disk image is replaced by the image the daemon wrote in staging. */
     if (st.file == 2) {
         char img[PATH_MAX + 8];
@@ -1454,6 +1487,7 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     for (size_t i = 0; i < STAGINGS_MAX; i++)
         if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) s->stages[i].used = 0;
     pthread_mutex_unlock(&s->mu);
+    staging_tidy(s, sdir, st.file);
     cJSON *res = cJSON_CreateObject();
     if (res) {
         cJSON_AddStringToObject(res, "mount", st.mount);

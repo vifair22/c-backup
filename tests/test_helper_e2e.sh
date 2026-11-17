@@ -60,6 +60,9 @@ cb() { "$CLI" --socket "$SOCK" "$@"; }
 
 mkdir -p "$WORK/snap" "$WORK/pool/app/a"
 echo alpha > "$WORK/snap/a.txt"
+# The tree root as read: a mode and a time no staging directory has (B168).
+chmod 0751 "$WORK/snap"
+touch -d @1500000000 "$WORK/snap"
 cat > "$WORK/units.json" <<EOF
 {"units":[
  {"id":"a","name":"cbk-uat-a","state":"running","caps":["quiesce","snapshot"],
@@ -230,6 +233,9 @@ contains "its warning is in the journal" "fake define" "$(cb journal 1)"
 OUT=$(cb unit restore 1 1 --define --replace)
 contains "an in-place restore completes" '"state":"completed"' "$OUT"
 check    "the data is back in place" alpha "$(cat "$WORK/pool/app/a/a.txt")"
+check    "the mount root has the snapshot's mode, not the staging's" 751 "$(stat -c %a "$WORK/pool/app/a")"
+check    "and its time" 1500000000 "$(stat -c %Y "$WORK/pool/app/a")"
+check    "no empty staging directory is left in the domain" no "$([ -e "$WORK/pool/.cbackup-restore" ] && echo yes || echo no)"
 
 echo "a scheduled pause scope"
 # pause_scope used to be dropped from a units schedule's parameters, so a

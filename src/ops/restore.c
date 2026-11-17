@@ -1318,9 +1318,23 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         if (strip_rel(rel, opts)) {
             /* The subpath itself is dest, which exists; a file cannot be
              * stripped onto it. */
-            if (ntype != NODE_TYPE_DIR)
+            if (ntype != NODE_TYPE_DIR) {
                 restore_fail(&res, rel[0] ? rel : opts->subpath,
                              "a single file cannot be restored as the destination itself");
+                continue;
+            }
+            /* A directory can, and dest takes its metadata. dest is the
+             * staging directory an in-place unit restore swaps in as the
+             * mount (B168): left alone it kept the helper's 0700, root's
+             * group and the time of the restore, and the swap made that the
+             * live mount's. The mtime comes in the pass below, as for every
+             * directory. */
+            meta_target_t t = { dest_fd, NULL, 0, dest };
+            clear_acls(&t, 1);
+            apply_metadata_fd(dest_fd, dest, mode, uid, gid, mtime);
+            apply_xattrs(store, &t, xhash);
+            apply_acls(store, &t, ahash, 1);
+            res.dirs++;
             continue;
         }
 
@@ -1687,7 +1701,14 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         }
         if (opts->subpath && !path_within(rel, opts->subpath)) continue;
-        if (strip_rel(rel, opts)) continue;
+        if (strip_rel(rel, opts)) {
+            struct timespec times[2];
+            times[0] = ns_to_timespec(strtoll(r->rows[i][5], NULL, 10));
+            times[1] = times[0];
+            if (futimens(dest_fd, times) != 0)
+                log_warn("restore: utimensat %s: %s", dest, strerror(errno));
+            continue;
+        }
         if (dest_path(full, sizeof(full), dest, rel, opts) != 0)
             continue;
 
