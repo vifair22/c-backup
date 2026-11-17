@@ -367,7 +367,7 @@ TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(TEST_SRCS))
 FAULT_BINS  := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(FAULT_SRCS))
 
 FAULT_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
-              -Wl,--wrap=fread,--wrap=fwrite,--wrap=fseeko,--wrap=fsync,--wrap=fdatasync \
+              -Wl,--wrap=fread,--wrap=fwrite,--wrap=fflush,--wrap=fseeko,--wrap=fsync,--wrap=fdatasync \
               -Wl,--wrap=sync_file_range,--wrap=mkstemp,--wrap=rename,--wrap=read,--wrap=pread \
               -Wl,--wrap=pwrite,--wrap=unlink,--wrap=syscall,--wrap=write,--wrap=mkdir
 

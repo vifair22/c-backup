@@ -264,6 +264,39 @@ static void test_pack_write_fwrite_fail(void **state)
     assert_all_readable();
 }
 
+/*
+ * A flush the disk refuses at the writeback step fails the add that met
+ * it, naming the error. It used to be ignored; glibc drops what a failed
+ * flush could not write, so a full repository surfaced only at the seal,
+ * as "entries end at X, body at Y", with nothing about the disk.
+ */
+static void test_pack_writeback_flush_fail(void **state)
+{
+    (void)state;
+    pack_backup_writer_t *w = NULL;
+    assert_int_equal(pack_backup_open(store, &w), OK);
+    size_t len = 65536;
+    unsigned char *buf = malloc(len);
+    assert_non_null(buf);
+    uint32_t x = 2463534242u;
+    status_t rc = OK;
+    fault_reset_all();
+    fault_fflush_at = 0;
+    for (int i = 0; i < 400 && rc == OK; i++) {
+        for (size_t k = 0; k < len; k++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; buf[k] = (unsigned char)x; }
+        uint8_t h[OBJECT_HASH_SIZE];
+        int is_new = 0;
+        rc = pack_backup_add(w, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL);
+    }
+    fault_reset_all();
+    assert_int_not_equal(rc, OK);
+    assert_non_null(strstr(err_msg(), "pack: write to"));
+    assert_non_null(strstr(err_msg(), strerror(ENOSPC)));
+    err_clear();
+    pack_backup_abort(w);
+    free(buf);
+}
+
 static void test_pack_finalize_fsync_fail(void **state)
 {
     (void)state;
@@ -446,6 +479,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_pack_seal_reads_nothing_back, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_seal_pwrite_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_finalize_fsync_fail, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_writeback_flush_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_gc_malloc_fail, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_backwards_parity_offsets_do_not_allocate, setup_packed, teardown),
     };
