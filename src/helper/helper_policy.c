@@ -97,6 +97,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
 {
     memset(out, 0, sizeof(*out));
     out->daemon_uid = (uid_t)-1;
+    out->daemon_gid = (gid_t)-1;
     out->max_pause_s = 30;
     out->max_captures_per_hour = 60;
     out->capture_max_s = 86400;
@@ -181,6 +182,9 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
             if (strcmp(k, "daemon_uid") == 0) {
                 if (to_uint(v, 1, 2147483646u, &u)) { st = bad(line, "daemon_uid must be a non-root uid", v); break; }
                 out->daemon_uid = (uid_t)u;
+            } else if (strcmp(k, "daemon_gid") == 0) {
+                if (to_uint(v, 1, 2147483646u, &u)) { st = bad(line, "daemon_gid must be a non-root gid", v); break; }
+                out->daemon_gid = (gid_t)u;
             } else if (strcmp(k, "daemon_id") == 0) {
                 if (strlen(v) != 8 || strspn(v, "0123456789abcdef") != 8) { st = bad(line, "daemon_id is 8 lowercase hex digits", v); break; }
                 snprintf(out->daemon_id, sizeof(out->daemon_id), "%s", v);
@@ -349,6 +353,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
     }
     free(buf);
     if (st == OK && out->daemon_uid == (uid_t)-1) st = set_error(ERR_INVALID, "policy: [helper] daemon_uid is required");
+    if (st == OK && out->daemon_gid == (gid_t)-1) out->daemon_gid = (gid_t)out->daemon_uid;
     if (st == OK && !out->daemon_id[0]) st = set_error(ERR_INVALID, "policy: [helper] daemon_id is required");
     if (st == OK && !out->state_dir[0]) st = set_error(ERR_INVALID, "policy: [helper] state_dir is required");
     for (size_t h = 0; st == OK && h < out->n_hooks; h++)

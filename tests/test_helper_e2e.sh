@@ -16,10 +16,15 @@ TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
 mkdir -p "$TEST_ROOT"
 # As root (CI) the daemon runs as uid 990 (below), which has to reach its
 # work tree: a checkout under a directory only root may enter (CI job 19985:
-# the daemon could not even see its config.yaml) gets a work tree under
-# /tmp instead, which every uid may traverse.
-if [ "$(id -u)" = 0 ] && ! setpriv --reuid=990 --regid=990 --clear-groups -- test -x "$TEST_ROOT"; then
-    TEST_ROOT=/tmp
+# the daemon could not even see its config.yaml). Search permission for
+# others is added on the way down to the test directory, nothing else, as
+# hf_unroot does for the C suites.
+if [ "$(id -u)" = 0 ]; then
+    d="$TEST_ROOT"
+    while [ -n "$d" ] && [ "$d" != / ]; do
+        [ -d "$d" ] && chmod o+x "$d"
+        d="${d%/*}"
+    done
 fi
 WORK="$(mktemp -d "$TEST_ROOT/c_backup_helper_e2e.XXXXXX")"
 PORTBASE=$((20000 + ($$ % 15000) * 3))
@@ -72,14 +77,17 @@ EOF
 # root's.)
 if [ "$(id -u)" = 0 ]; then
     DUID=990
+    DGID=990
     AS_DAEMON=(setpriv --reuid="$DUID" --regid="$DUID" --clear-groups --)
 else
     DUID=$(id -u)
+    DGID=$(id -g)
     AS_DAEMON=()
 fi
 cat > "$WORK/policy.ini" <<EOF
 [helper]
 daemon_uid = $DUID
+daemon_gid = $DGID
 daemon_id = 0badf00d
 max_pause_s = 30
 capture_max_s = 3600
@@ -158,6 +166,23 @@ HELPER_PID=$!
 for _ in $(seq 1 50); do [ -S "$HSOCK" ] && break; sleep 0.1; done
 if [ ! -S "$HSOCK" ]; then echo "helper did not start"; cat "$WORK/helper.log"; exit 1; fi
 check "the socket is 0660" 660 "$(stat -c %a "$HSOCK")"
+check "its group is the daemon's" "$DGID" "$(stat -c %g "$HSOCK")"
+contains "the helper logs the socket's owner, group and mode" "group $DGID mode 0660" "$(cat "$WORK/helper.log")"
+if [ "$(id -u)" = 0 ]; then
+    # daemon_gid changes the socket's group (root may give any group); a
+    # directory the group cannot enter is warned about, loudly.
+    mkdir -p "$WORK/shut"
+    chmod 0700 "$WORK/shut"
+    sed -e "s|^socket = .*|socket = $WORK/shut/h2.sock|" -e "s|^daemon_gid = .*|daemon_gid = 4242|" \
+        -e "s|^state_dir = .*|state_dir = $WORK/hstate2|" "$WORK/policy.ini" > "$WORK/policy2.ini"
+    chmod 0600 "$WORK/policy2.ini"
+    "$HELPER" --policy "$WORK/policy2.ini" > "$WORK/helper2.log" 2>&1 &
+    H2=$!
+    for _ in $(seq 1 50); do [ -S "$WORK/shut/h2.sock" ] && break; sleep 0.1; done
+    check "daemon_gid sets the socket's group" 4242 "$(stat -c %g "$WORK/shut/h2.sock" 2>/dev/null)"
+    contains "an unreachable socket directory is warned about" "WARNING: no member of group 4242" "$(cat "$WORK/helper2.log")"
+    kill "$H2"; wait "$H2" 2>/dev/null
+fi
 # The daemon reconnects on its own, within its backoff (at most 30 s).
 for _ in $(seq 1 400); do
     cb unit providers | grep -q '"state":"connected"' && break

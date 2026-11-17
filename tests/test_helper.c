@@ -160,6 +160,15 @@ static void test_policy_inline_comments(void **state)
     assert_string_equal(p.hooks[0].argv[2], "echo a # not a comment here ; nor this");
     helper_policy_free(&p);
     /* A value that is wrong is still refused, comment or not. */
+    {
+        helper_policy_t g;
+        assert_int_equal(helper_policy_parse("[helper]\ndaemon_uid = 990\ndaemon_gid = 4242\n"
+                                             "daemon_id = 7f3a09c1\nstate_dir = /x\n", &g), OK);
+        assert_int_equal(g.daemon_gid, 4242);
+        helper_policy_free(&g);
+        assert_int_not_equal(helper_policy_parse("[helper]\ndaemon_uid = 990\ndaemon_gid = 0\n"
+                                                 "daemon_id = 7f3a09c1\nstate_dir = /x\n", &g), OK);
+    }
     assert_int_not_equal(helper_policy_parse("[helper]\ndaemon_uid = 0   # root\n"
                                              "daemon_id = 7f3a09c1\nstate_dir = /x\n", &p), OK);
 }
@@ -172,6 +181,7 @@ static void test_policy(void **state)
     helper_policy_t p;
     assert_int_equal(helper_policy_parse(text, &p), OK);
     assert_int_equal(p.daemon_uid, 990);
+    assert_int_equal(p.daemon_gid, 990);          /* defaults to daemon_uid */
     assert_string_equal(p.daemon_id, "0badf00d");
     assert_int_equal(p.n_hooks, 3);
     assert_int_equal(p.n_allow, 2);
