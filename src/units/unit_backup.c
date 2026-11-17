@@ -635,7 +635,9 @@ static void part_close(void *ctx, size_t index, status_t st, const cdc_result_t 
         p->pipe.buf = NULL;
     }
     part_release(p);
-    u->bytes_read += p->bytes_read;
+    /* Disk bytes only: a dump's bytes are its item's size, not a read of
+     * a disk, and the result calls this disk bytes read. */
+    if (p->item < 0 || u->desc->items[p->item].kind != SP_ITEM_STREAM) u->bytes_read += p->bytes_read;
 }
 
 /* A failed dump is never stored: it looks valid and is not (6.6). */

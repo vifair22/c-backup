@@ -367,6 +367,8 @@ static void test_dumps_through_helper(void **state)
     /* The failed dump is named as one, not counted as an unreadable file. */
     if (!strstr(res.units[0].warning, "1 dump(s) failed")) fail_msg("warning: %s", res.units[0].warning);
     assert_non_null(strstr(res.units[0].warning, "baddump.dump"));
+    /* The disk's data runs alone: the dump's bytes are not disk bytes. */
+    assert_int_equal(res.units[0].bytes_read, 1048576 + 300000);
     unit_backup_result_free(&res);
     restore_opts_t ro;
     memset(&ro, 0, sizeof(ro));
