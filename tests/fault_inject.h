@@ -91,6 +91,46 @@ extern int (*volatile fault_mkdir_hook)(const char *path, mode_t mode);
 extern ssize_t __real_write(int, const void *, size_t);
 extern int __real_mkdir(const char *, mode_t);
 
+/*
+ * A disk that is full under one directory.
+ *
+ * While fault_full_prefix is set, the calls selected by fault_full_ops fail
+ * with fault_full_errno (ENOSPC when 0) on any descriptor or stream whose
+ * path starts with the prefix - found through /proc/self/fd, so it holds on
+ * every thread, pool workers included - and a rename, renameat or link whose
+ * destination does. The first fault_full_skip matching calls are let
+ * through, then at most fault_full_count fail (-1: every one after), each
+ * counted in fault_full_hits. fclose and close fail after doing their work,
+ * as a deferred write error reported at close does: the descriptor is gone
+ * either way. Process-wide. NULL disables it.
+ *
+ * Keyed by path rather than by a countdown of calls so that a test can aim
+ * at one repository file (the staging pack, the tags file) without every
+ * other write in the process moving the count.
+ */
+#define FAULT_FULL_WRITE  0x01u   /* write, pwrite, fwrite */
+#define FAULT_FULL_FLUSH  0x02u   /* fflush */
+#define FAULT_FULL_SYNC   0x04u   /* fsync, fdatasync, syncfs */
+#define FAULT_FULL_CLOSE  0x08u   /* close, fclose */
+#define FAULT_FULL_RENAME 0x10u   /* rename, renameat (destination) */
+#define FAULT_FULL_TRUNC  0x20u   /* ftruncate */
+#define FAULT_FULL_ALL    0x3fu
+extern const char *volatile fault_full_prefix;
+extern volatile unsigned fault_full_ops;
+extern volatile int fault_full_errno;
+extern volatile int fault_full_skip;
+extern volatile int fault_full_count;
+extern volatile int fault_full_hits;
+extern int __real_fclose(FILE *);
+extern int __real_close(int);
+extern int __real_renameat(int, const char *, int, const char *);
+extern int __real_ftruncate(int, off_t);
+extern int __real_syncfs(int);
+
+/* Arm it: ops on paths under prefix, after skip, count times (-1 always). */
+void fault_full_arm(const char *prefix, unsigned ops, int skip, int count);
+void fault_full_disarm(void);
+
 static inline void fault_reset_all(void) {
     fault_malloc_at = -1;
     fault_fread_at  = -1;
@@ -100,6 +140,9 @@ static inline void fault_reset_all(void) {
     fault_pread_at  = -1;
     fault_pwrite_at = -1;
     fault_fflush_at = -1;
+    fault_full_prefix = NULL;
+    fault_full_ops = 0;
+    fault_full_errno = 0;
     fault_malloc_peak = 0;
     fault_fwrite_bytes_left = -1;
     fault_fwrite_bytes_seen = 0;
