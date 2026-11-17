@@ -701,6 +701,14 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                              pack_dat_entry_cb cb, void *ctx);
 
 /*
+ * Raise the repository's pack-number mark a block ahead (pack_ids.h), so
+ * the packs this handle opens next take their numbers with no I/O. backup
+ * calls it before its index batches take the database's write lock: the
+ * mark's write and two fsyncs must not run inside it (B144).
+ */
+status_t pack_reserve_numbers(store_t *store);
+
+/*
  * Iterate the pack numbers present in the repository. Exposed so a rebuild
  * does not have to reimplement the path rules and drift from them.
  */

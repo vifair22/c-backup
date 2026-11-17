@@ -169,7 +169,11 @@ Rules (`src/store/pack_ids.h`):
 
 1. A writer is given its number by `store_issue_pack_nums`, which raises
    `next` past it durably before returning; only then is anything staged
-   under that number. A power cut after the raise wastes the number. It is
+   under that number. The raise is a block of 64 at a time
+   (`PACK_IDS_BLOCK`), so most numbers need no write, and a backup takes
+   its first block before its index batches hold the database's write
+   lock, so the file's fsyncs never run inside it. A power cut after the
+   raise, or a handle closed with numbers left, wastes them. A number is
    never issued twice.
 2. The number is the largest of `next`, the highest pack file on disk plus
    one, the index's floor (its highest `packs` row or `pack_tombstones` row

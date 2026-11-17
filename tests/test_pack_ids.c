@@ -8,8 +8,9 @@
  *               a bad version, a non-integer and an out-of-range value all
  *               refused; raise never lowers and repairs a damaged file
  *   numbering   a number is never below the mark, never one a pack that
- *               is gone once had, and the mark is past it before any byte
- *               is written; with the file lost, the disk and the index
+ *               is gone once had, and the mark is past it, a block ahead,
+ *               before any byte is written; numbers inside the block need
+ *               no write, and a reservation takes the block early; with the file lost, the disk and the index
  *               floor decide and the file comes back; a bare store keeps
  *               the old behaviour; a range for a rewrite moves the mark
  *               past every number in it
@@ -174,15 +175,31 @@ static void test_numbering_follows_the_mark(void **state)
     assert_int_equal(n, 39);
     int64_t v = 0;
     assert_int_equal(pack_ids_read(TEST_DIR, UUID, &v), OK);
-    assert_int_equal(v, 40);
-    /* The writer was abandoned and never installed: its number is gone. */
+    assert_int_equal(v, 39 + PACK_IDS_BLOCK);     /* a block ahead */
+    /* The writer was abandoned and never installed: its number is gone.
+     * The next comes out of the block, with no write. */
     assert_int_equal(first_pack(st), 40);
+    assert_int_equal(pack_ids_read(TEST_DIR, UUID, &v), OK);
+    assert_int_equal(v, 39 + PACK_IDS_BLOCK);
     store_close(st);
 
-    /* A new handle, with nothing on disk: still above the mark. */
+    /* A new handle, with nothing on disk: above the whole block the last
+     * one may have used. */
     assert_int_equal(store_open(TEST_DIR, NULL, &st), OK);
     assert_int_equal(store_set_uuid(st, UUID), OK);
-    assert_int_equal(first_pack(st), 41);
+    assert_int_equal(first_pack(st), 39 + PACK_IDS_BLOCK);
+    store_close(st);
+
+    /* A reservation ahead of any writer: the first pack then needs no
+     * write, and the mark is already past it. */
+    assert_int_equal(store_open(TEST_DIR, NULL, &st), OK);
+    assert_int_equal(store_set_uuid(st, UUID), OK);
+    assert_int_equal(pack_reserve_numbers(st), OK);
+    assert_int_equal(pack_ids_read(TEST_DIR, UUID, &v), OK);
+    assert_int_equal(v, 39 + 3 * PACK_IDS_BLOCK);
+    assert_int_equal(first_pack(st), 39 + 2 * PACK_IDS_BLOCK);
+    assert_int_equal(pack_ids_read(TEST_DIR, UUID, &v), OK);
+    assert_int_equal(v, 39 + 3 * PACK_IDS_BLOCK);
     store_close(st);
 }
 
@@ -198,7 +215,7 @@ static void test_a_lost_mark_falls_back_to_the_floors(void **state)
     assert_int_equal(first_pack(st), 17);
     int64_t v = 0;
     assert_int_equal(pack_ids_read(TEST_DIR, UUID, &v), OK);
-    assert_int_equal(v, 18);
+    assert_int_equal(v, 17 + PACK_IDS_BLOCK);
     store_close(st);
 
     /* A damaged file: the same. */
@@ -207,7 +224,7 @@ static void test_a_lost_mark_falls_back_to_the_floors(void **state)
     assert_int_equal(store_set_uuid(st, UUID), OK);
     assert_int_equal(first_pack(st), 0);       /* nothing else knows of any */
     assert_int_equal(pack_ids_read(TEST_DIR, UUID, &v), OK);
-    assert_int_equal(v, 1);
+    assert_int_equal(v, PACK_IDS_BLOCK);
     store_close(st);
 }
 
@@ -236,11 +253,21 @@ static void test_a_range(void **state)
     assert_int_equal(first, 3);
     int64_t v = 0;
     assert_int_equal(pack_ids_read(TEST_DIR, UUID, &v), OK);
-    assert_int_equal(v, 7);
+    assert_int_equal(v, 3 + PACK_IDS_BLOCK);
     assert_int_equal(store_reserve_pack_num(st, 0), 7);   /* the other counter agrees */
     assert_int_equal(store_issue_pack_nums(st, 0, 0, &first), ERR_INVALID);
     err_clear();
+    /* A range larger than what is left of the block starts above the mark
+     * (the rest of the block is a gap) and moves it past all of it. */
+    assert_int_equal(store_issue_pack_nums(st, 0, PACK_IDS_BLOCK + 10, &first), OK);
+    assert_int_equal(first, 3 + PACK_IDS_BLOCK);
+    assert_int_equal(pack_ids_read(TEST_DIR, UUID, &v), OK);
+    assert_int_equal(v, 3 + PACK_IDS_BLOCK + PACK_IDS_BLOCK + 10);
+    store_close(st);
+
     /* The last number is reachable; past it is refused. */
+    assert_int_equal(store_open(TEST_DIR, NULL, &st), OK);
+    assert_int_equal(store_set_uuid(st, UUID), OK);
     assert_int_equal(pack_ids_write(TEST_DIR, UUID, PACK_IDS_NEXT_MAX - 1), OK);
     assert_int_equal(store_issue_pack_nums(st, 0, 1, &first), OK);
     assert_int_equal(first, UINT32_MAX);

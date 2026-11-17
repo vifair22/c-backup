@@ -132,6 +132,12 @@ struct store {
      * pack_num_mu. */
     char                uuid[64];
     int64_t             index_floor;
+    /* The mark this handle last wrote: numbers below it are covered with no
+     * further write (issue_locked). 0 until the first. */
+    int64_t             mark_reserved;
+    /* The next number this handle may issue, as an int64 so that issuing
+     * the last u32 number leaves it at 2^32 rather than wrapping to 0. */
+    int64_t             issued_next;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -954,21 +960,27 @@ void store_raise_pack_floor(store_t *st, int64_t floor)
  * (pack_ids.h, rule 1). The mutex is held across the write so that two
  * writers on one handle cannot both read the same mark; across handles the
  * repository write lock rules a second writer out.
+ *
+ * The mark is raised a block at a time (PACK_IDS_BLOCK) and the numbers
+ * under it are handed out with no I/O until the block runs out. A backup
+ * opens packs while its index batch holds the database's write lock, and
+ * a file write with two fsyncs per pack inside that lock is what B144
+ * found stalling every other writer; once per block, and the first block
+ * taken before the batch opens (store_reserve_pack_nums), it is noise. A
+ * block left unused when the handle closes is a gap in the numbering,
+ * which the mark allows: it says which numbers may have been used.
  */
-status_t store_issue_pack_nums(store_t *st, uint32_t scanned, uint32_t count,
-                               uint32_t *out_first)
+static status_t issue_locked(store_t *st, uint32_t scanned, uint32_t count, int take,
+                             uint32_t *out_first)
 {
-    if (!st || !out_first || count == 0)
-        return set_error(ERR_INVALID, "store_issue_pack_nums: bad argument");
-    pthread_mutex_lock(&st->pack_num_mu);
     int64_t floor = scanned;
+    if (st->issued_next > floor) floor = st->issued_next;
     if ((int64_t)st->pack_num_next > floor) floor = st->pack_num_next;
     uint32_t handed = atomic_load(&st->next_pack);
     if ((int64_t)handed > floor) floor = handed;
     if (st->index_floor > floor) floor = st->index_floor;
 
-    status_t rc = OK;
-    if (st->uuid[0]) {
+    if (st->uuid[0] && (st->mark_reserved == 0 || floor + (int64_t)count > st->mark_reserved)) {
         int64_t mark = 0;
         status_t r = pack_ids_read(st->path, st->uuid, &mark);
         if (r == OK) {
@@ -981,22 +993,51 @@ status_t store_issue_pack_nums(store_t *st, uint32_t scanned, uint32_t count,
                      err_msg(), (long long)floor);
             err_clear();
         } else {
-            rc = r;
+            return r;
         }
+        if (floor + (int64_t)count > PACK_IDS_NEXT_MAX)
+            return set_error(ERR_TOO_LARGE, "every pack number has been used");
+        int64_t want = floor + (count > PACK_IDS_BLOCK ? (int64_t)count : PACK_IDS_BLOCK);
+        if (want > PACK_IDS_NEXT_MAX) want = PACK_IDS_NEXT_MAX;
+        status_t w = pack_ids_write(st->path, st->uuid, want);
+        if (w != OK) return w;
+        st->mark_reserved = want;
+    } else if (floor + (int64_t)count > PACK_IDS_NEXT_MAX) {
+        return set_error(ERR_TOO_LARGE, "every pack number has been used");
     }
-    if (rc == OK && floor + (int64_t)count > PACK_IDS_NEXT_MAX)
-        rc = set_error(ERR_TOO_LARGE, "every pack number has been used");
-    if (rc == OK && st->uuid[0])
-        rc = pack_ids_write(st->path, st->uuid, floor + (int64_t)count);
-    if (rc == OK) {
-        /* Both counters, so store_reserve_pack_num never hands out one of
-         * these either. At 2^32 they wrap to 0, and the mark refuses next. */
-        st->pack_num_next = (uint32_t)(floor + (int64_t)count);
-        uint32_t want = st->pack_num_next;
-        uint32_t cur = atomic_load(&st->next_pack);
-        while (cur < want && !atomic_compare_exchange_weak(&st->next_pack, &cur, want)) {}
-        *out_first = (uint32_t)floor;
+    if (!take) {
+        /* Nothing taken, but the floor the file just gave has to be
+         * remembered: the next issue inside the block reads nothing. */
+        if (floor > st->issued_next) st->issued_next = floor;
+        return OK;
     }
+    /* Both counters, so store_reserve_pack_num never hands out one of these
+     * either. At 2^32 they wrap to 0, and the mark refuses the next. */
+    st->issued_next = floor + (int64_t)count;
+    st->pack_num_next = (uint32_t)st->issued_next;
+    uint32_t want = st->pack_num_next;
+    uint32_t cur = atomic_load(&st->next_pack);
+    while (cur < want && !atomic_compare_exchange_weak(&st->next_pack, &cur, want)) {}
+    *out_first = (uint32_t)floor;
+    return OK;
+}
+
+status_t store_issue_pack_nums(store_t *st, uint32_t scanned, uint32_t count,
+                               uint32_t *out_first)
+{
+    if (!st || !out_first || count == 0)
+        return set_error(ERR_INVALID, "store_issue_pack_nums: bad argument");
+    pthread_mutex_lock(&st->pack_num_mu);
+    status_t rc = issue_locked(st, scanned, count, 1, out_first);
+    pthread_mutex_unlock(&st->pack_num_mu);
+    return rc;
+}
+
+status_t store_reserve_pack_nums(store_t *st, uint32_t scanned)
+{
+    if (!st) return set_error(ERR_INVALID, "store_reserve_pack_nums: null store");
+    pthread_mutex_lock(&st->pack_num_mu);
+    status_t rc = issue_locked(st, scanned, 1, 0, NULL);
     pthread_mutex_unlock(&st->pack_num_mu);
     return rc;
 }

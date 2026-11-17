@@ -115,8 +115,8 @@ const struct repo_key *store_key(const store_t *st);
  * tmp/, nor a pack that is gone (B156).
  *
  * With the repository's uuid set (store_set_uuid), the numbers are also
- * above <repo>/pack-ids, and that mark is raised past them, durably, before
- * this returns: a number is never reissued, even after its pack was dropped
+ * above <repo>/pack-ids, and that mark is raised past them (a block at a
+ * time, PACK_IDS_BLOCK), durably, before this returns: a number is never reissued, even after its pack was dropped
  * as missing and even after the index was lost (pack_ids.h). Without one -
  * a bare store in a test or benchmark - only the scan, the index floor and
  * this handle decide. ERR_IO when the mark cannot be written, in which case
@@ -124,6 +124,14 @@ const struct repo_key *store_key(const store_t *st);
  */
 status_t store_issue_pack_nums(store_t *st, uint32_t scanned, uint32_t count,
                                uint32_t *out_first);
+
+/*
+ * Raise the mark a block ahead without taking a number, so that the next
+ * PACK_IDS_BLOCK numbers this handle issues need no I/O. A backup calls it
+ * (through pack_reserve_numbers) before its index batches hold the
+ * database's write lock. A no-op without a uuid.
+ */
+status_t store_reserve_pack_nums(store_t *st, uint32_t scanned);
 
 /* Turn on the pack-ids mark for this store: repo_store_open and the replica
  * sink set it from the marker. */

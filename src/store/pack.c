@@ -291,13 +291,29 @@ static void max_pack_num_cb(uint32_t pack_num, void *ctx) {
  * lock rejects rather than queues, so two of them cannot be open on one
  * repository at the same time.
  */
-static status_t issue_pack_nums(store_t *store, uint32_t count, uint32_t *out_first) {
+static status_t scan_next_free(store_t *store, uint32_t *out) {
     uint32_t pack_num = 0;
     char packs_dir[PATH_MAX];
     if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0)
         return set_error(ERR_IO, "pack number: path too long");
     pack_for_each_num(packs_dir, max_pack_num_cb, &pack_num);
-    return store_issue_pack_nums(store, pack_num, count, out_first);
+    *out = pack_num;
+    return OK;
+}
+
+static status_t issue_pack_nums(store_t *store, uint32_t count, uint32_t *out_first) {
+    uint32_t scanned = 0;
+    status_t st = scan_next_free(store, &scanned);
+    if (st != OK) return st;
+    return store_issue_pack_nums(store, scanned, count, out_first);
+}
+
+status_t pack_reserve_numbers(store_t *store) {
+    if (!store) return set_error(ERR_INVALID, "pack_reserve_numbers: null store");
+    uint32_t scanned = 0;
+    status_t st = scan_next_free(store, &scanned);
+    if (st != OK) return st;
+    return store_reserve_pack_nums(store, scanned);
 }
 
 

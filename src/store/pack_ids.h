@@ -28,8 +28,9 @@
  *
  * Rules (docs/repo-format.md, "pack-ids"):
  *   1. A writer raises the mark past the number it is given, durably,
- *      before anything is written under that number. A cut after the raise
- *      wastes the number; it can never reissue it.
+ *      before anything is written under that number - a block of
+ *      PACK_IDS_BLOCK at a time, so most numbers need no write. A cut
+ *      after the raise wastes the numbers; it can never reissue them.
  *   2. A number is max(mark, highest pack file + 1, the index's floor, what
  *      this handle already issued). The disk and index terms matter only
  *      when the file is missing or damaged (an older repository, a copy
@@ -49,6 +50,10 @@
 #define PACK_IDS_VERSION 1
 /* next can say every u32 number is used. */
 #define PACK_IDS_NEXT_MAX ((int64_t)UINT32_MAX + 1)
+/* How far ahead a store raises the mark when it has to write it: one write
+ * covers this many packs. A handle closed with numbers left wastes them;
+ * at 64 a backup an hour for a century uses under 2% of the space. */
+#define PACK_IDS_BLOCK 64
 
 /*
  * Read the mark. ERR_NOT_FOUND when there is no file; ERR_CORRUPT when it

@@ -2394,6 +2394,11 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                          (long long)repo_id, why, (long long)repo_id);
     }
 
+    /* The pack-number mark's write, now rather than at the first pack,
+     * which opens while an index batch holds the database's write lock. */
+    st = pack_reserve_numbers(store);
+    if (st != OK) return st;
+
     /*
      * Staging files a killed run left behind. store_open only sweeps what is
      * an hour old, because it cannot know who else is writing; a backup holds
