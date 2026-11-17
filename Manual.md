@@ -2912,7 +2912,14 @@ chown root:990 /run/c-backup-helper && chmod 0750 /run/c-backup-helper
 ```
 
 On FS2 create `/mnt/cache/system/.cbackup-restore` (owned by 990) instead
-of the appdata one. `/run` is RAM on Unraid too: recreate the two `/run` directories at boot
+of the appdata one. **Restore needs writable mounts the backup does not.**
+The helper's pool mounts must be read-write (it stages and swaps); the
+daemon needs read-write the staging directory of each domain it restores
+into in place (above), for an in-place VM restore the `.cbackup-restore`
+of each image directory (`-v /mnt/cache/domains/<vm>/.cbackup-restore:/mnt/cache/domains/<vm>/.cbackup-restore`,
+created and owned by 990 first), and for a restore under a new name the
+target root (`-v /mnt/cache/appdata/restore-test:/mnt/cache/appdata/restore-test`).
+Without them a restore fails at its first write, naming the path. `/run` is RAM on Unraid too: recreate the two `/run` directories at boot
 (the `go` file, or a User Scripts "at startup" script) before the containers
 start. A bind source that does not exist makes `docker run` fail.
 
@@ -2924,7 +2931,7 @@ What each piece is for:
 | `--network=none` | helper | no listener of any kind; its only interface is the socket |
 | `/var/run/docker.sock` | helper | inspect, pause, unpause, exec for hooks, create and pull for restore |
 | `/var/run/libvirt/libvirt-sock` | helper (FS1) | the libvirt API, read-write (the read-only socket cannot start a backup) |
-| `/mnt/cache:/mnt/cache:rshared` | helper | restore staging and swap act on host paths in the helper's own namespace; add one per pool that holds unit data |
+| `/mnt/cache:/mnt/cache:rshared` (read-write) | helper | restore staging and swap act on host paths in the helper's own namespace: it creates the staging directories and renames them into place, so this mount must not be `:ro`; add one per pool that holds unit data |
 | `/mnt/cache/system/c-backup-helper` | helper | its state directory: `holds.json`, every hold it has taken, released at its next start after a crash. On a pool, never the RAM rootfs |
 | `/boot/config/c-backup-helper.ini` | helper | the policy, on the flash, root-owned (22.2.3) |
 | `/run/c-backup-helper` | both | the helper's socket (created `0660` with group `daemon_gid`, 22.2.3), and `nbd/` where VM exports and `qemu-nbd` sockets appear; the same path on both sides. The directory is `0750 root:990`, so the daemon can enter it after it drops to uid 990 |
@@ -2933,6 +2940,8 @@ What each piece is for:
 | `/etc/libvirt/qemu/nvram`, `/etc/libvirt/qemu/swtpm/tpm-states`, read-only | daemon (FS1) | the TPM state of a VM is read by the daemon at its real path |
 | `/mnt/cache/system/cbackup-vmstate` | daemon (FS1) | the helper policy's `staging_root`: NVRAM and TPM state staged for a VM restore |
 | `<domain>/.cbackup-restore` (FS2: `/mnt/cache/system/.cbackup-restore`), read-write | daemon | where a container restore into place is staged before the helper swaps it in (22.7.3) |
+| `<image directory>/.cbackup-restore`, read-write, one per directory of VM images (FS1, only to restore a VM in place) | daemon | where an in-place VM restore writes each disk before the swap; created and owned by 990 beforehand |
+| the target root of a restore under a new name, read-write (only while restoring) | daemon | `--target-root DIR` (22.7.3): the daemon writes the unit's data there itself |
 | `/run/c-backupd` | daemon | the API socket, and `exports/` for NBD exports, which the host must reach (22.8) |
 | `--label net.cbackup.role=...` | both | a container carrying this label is never paused |
 | `C_BACKUP_UNITS_ALLOW` | daemon | the safety rail (22.9) |
@@ -3720,10 +3729,28 @@ container names `<project>-<service>`. Then `docker compose -p <project> up
 -d --no-build`, with `--no-start` unless `--start`. Replacing a project needs
 its containers stopped; they are renamed aside rather than removed.
 
-**LXC.** The config is rewritten with the new name, rootfs path and MAC
-addresses and written with the rootfs under the LXC
-path; a name in use is refused unless `--replace`, which needs the container
-stopped and moves the old one aside.
+**LXC.** In place (`--replace`), the container is stopped, its rootfs and
+each mount entry's source staged and swapped like any mount, and its
+config written back to `<[lxc] path>/<name>/config`, the old config moved
+aside to `config.cbackup-old-<time>`, never deleted.
+
+Under a new name (`--name N --target-root DIR`):
+
+1. The rootfs is restored to `DIR/<its recorded path>` (for the default
+   layout `DIR/mnt/cache/lxc/<old name>/rootfs`), and each `lxc.mount.entry`
+   source to `DIR/<its recorded path>`. Nothing is written under the LXC
+   path, and the original's directories are never touched.
+2. The helper writes the recorded config to `<[lxc] path>/N/config`
+   (creating `<[lxc] path>/N/`), with `lxc.uts.name = N`, `lxc.rootfs.path =
+   dir:DIR/<recorded rootfs path>` (the rootfs stays under `DIR`; move it
+   and edit that line to put it under the LXC path), each mount entry's
+   source rewritten to its place under `DIR`, and every `lxc.net.*.hwaddr`
+   dropped so LXC generates new MAC addresses (`--keep-macs` keeps them;
+   then do not run both containers on one bridge).
+3. With `--start`, `lxc-start N`; otherwise it is left defined and stopped.
+
+A name already defined is refused unless `--replace`, which needs that
+container stopped. `DIR` must be writable by the daemon (22.2.1).
 
 ### 22.8 Read-only NBD export of a VM disk
 
