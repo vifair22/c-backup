@@ -213,7 +213,10 @@ export function toEndpoint(req: ApiRequest): Endpoint {
     case 'objectContent':
       return { method: 'GET', path: `/repos/${req.repoId}/objects/${seg(req.hash)}/content` }
     case 'packList':
-      return { method: 'GET', path: `/repos/${req.repoId}/packs` }
+      return {
+        method: 'GET',
+        path: `/repos/${req.repoId}/packs${qs({ limit: req.limit, offset: req.offset })}`,
+      }
     case 'packEntries':
       return {
         method: 'GET',

@@ -24,6 +24,8 @@ import type { WireBucket, WirePack, WirePackEntry } from '../shared/wire'
 const api = window.cbackup
 
 const PAGE_SIZE = 200
+/* The daemon's maximum page for /packs. */
+const PACK_LIST_PAGE = 5000
 
 interface Pack {
   id: number
@@ -91,8 +93,22 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
     let cancelled = false
     setLoading(true)
     setError(null)
-    api.apiCall<{ packs?: WirePack[] }>(connName, { kind: 'packList', repoId })
-      .then(r => { if (!cancelled) setPacks((r.packs ?? []).map(parsePack)) })
+    /* The pack list pages (B154). The totals below are sums over every
+     * pack, so read every page: a pack is hundreds of megabytes, and even a
+     * large repository has a few thousand. */
+    const loadAll = async (): Promise<Pack[]> => {
+      const all: Pack[] = []
+      for (;;) {
+        const r = await api.apiCall<{ packs?: WirePack[] }>(connName, {
+          kind: 'packList', repoId, limit: PACK_LIST_PAGE, offset: all.length,
+        })
+        const page = (r.packs ?? []).map(parsePack)
+        all.push(...page)
+        if (page.length < PACK_LIST_PAGE || cancelled) return all
+      }
+    }
+    loadAll()
+      .then(list => { if (!cancelled) setPacks(list) })
       .catch(err => { if (!cancelled) setError(String(err)) })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }

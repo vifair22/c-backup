@@ -75,15 +75,23 @@ static int tags_mirror(int64_t repo_id, char *err, size_t errsz)
 
 api_response_t metadata_tags_get(const api_request_t *req, int64_t repo_id)
 {
-    (void)req;
-    char repo[32];
+    /* Paged like every other collection (B154). The default is the
+     * maximum, so a client that does not page still gets every tag a
+     * deployment has in practice; past that it pages rather than answering
+     * an unbounded list. */
+    int nlim = 0, noff = 0;
+    api_response_t page_err;
+    if (routes_paging(req, 1000, 1000, &nlim, &noff, &page_err) != 0) return page_err;
+    char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(lim, sizeof(lim), "%d", nlim);
+    snprintf(off, sizeof(off), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_db,
             "SELECT name, snap_id, created_at FROM tags WHERE repo_id = ?"
-            " ORDER BY name",
-            (const char *[]){ repo, NULL }, &r) != 0) {
+            " ORDER BY name LIMIT ? OFFSET ?",
+            (const char *[]){ repo, lim, off, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list tags");
     }
@@ -805,28 +813,61 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
 
 /* ---------- journal ---------- */
 
+/*
+ * Every result anything journals: a job's outcome (success, failed,
+ * cancelled), and the advisories written beside it (warning for an
+ * unescrowed key, a plaintext replica or a unit definition that needed
+ * attention; alert for a missing pack). The CLI's --result lists the same.
+ */
+static const char *const k_journal_results[] = {
+    "success", "failed", "cancelled", "warning", "alert",
+};
+#define N_JOURNAL_RESULTS (sizeof(k_journal_results) / sizeof(k_journal_results[0]))
+
 api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id)
 {
     const char *result = api_query_param(req, "result");
-    int nlim = 0;
+    /* A filter on a value nothing writes used to answer [], which reads as
+     * "nothing like that happened" when the question was misspelt (NIT-32):
+     * `--result completed` and `--result bogus` both looked like a clean
+     * history. */
+    if (result) {
+        size_t k = 0;
+        while (k < N_JOURNAL_RESULTS && strcmp(result, k_journal_results[k]) != 0) k++;
+        if (k == N_JOURNAL_RESULTS) {
+            char msg[256];
+            int off = snprintf(msg, sizeof(msg), "result must be one of:");
+            for (size_t i = 0; i < N_JOURNAL_RESULTS && off > 0 && (size_t)off < sizeof(msg); i++)
+                off += snprintf(msg + off, sizeof(msg) - (size_t)off, "%s %s",
+                                i ? "," : "", k_journal_results[i]);
+            return api_error(400, msg);
+        }
+    }
+    /* offset as well as limit (B154): it was sent by the CLI and dropped
+     * here, so every page after the first was the first page again. */
+    int nlim = 0, noff = 0;
     api_response_t page_err;
-    if (routes_paging(req, 100, 1000, &nlim, NULL, &page_err) != 0) return page_err;
+    if (routes_paging(req, 100, 1000, &nlim, &noff, &page_err) != 0) return page_err;
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    char limit[16];
+    char limit[16], offset[16];
     snprintf(limit, sizeof(limit), "%d", nlim);
+    snprintf(offset, sizeof(offset), "%d", noff);
 
+    /* Newest first, with the per-repo id breaking ties: timestamps are
+     * whole seconds, and two entries in one second could swap places
+     * between pages, one served twice and the other never. */
     db_result_t *r = NULL;
     int rc = result
         ? db_execute(g_db,
             "SELECT id, ts, source, operation, result, duration_ms, message"
             "  FROM journal WHERE repo_id = ? AND result = ?"
-            " ORDER BY ts DESC LIMIT ?",
-            (const char *[]){ repo, result, limit, NULL }, &r)
+            " ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
+            (const char *[]){ repo, result, limit, offset, NULL }, &r)
         : db_execute(g_db,
             "SELECT id, ts, source, operation, result, duration_ms, message"
-            "  FROM journal WHERE repo_id = ? ORDER BY ts DESC LIMIT ?",
-            (const char *[]){ repo, limit, NULL }, &r);
+            "  FROM journal WHERE repo_id = ? ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
+            (const char *[]){ repo, limit, offset, NULL }, &r);
     if (rc != 0) {
         db_result_free(r);
         return api_error(500, "cannot read journal");
