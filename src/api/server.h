@@ -186,6 +186,14 @@ int api_server_route_allow(api_server_t *srv, const char *pattern,
 typedef int (*api_auth_fn)(const api_request_t *req, const char *url, void *userdata);
 void api_server_set_auth(api_server_t *srv, api_auth_fn fn, void *userdata);
 
+/* Called after a buffered handler for a request that is not a GET or HEAD
+ * answers 2xx, before the response is sent. c-backupd makes the database
+ * durable there (db_txn_make_durable), so an edit the client was told
+ * succeeded - a tag, a note, a registered repository - survives a power
+ * cut that follows (B139, B140). Not called for streaming routes. */
+typedef void (*api_after_write_fn)(void *userdata);
+void api_server_set_after_write(api_server_t *srv, api_after_write_fn fn, void *userdata);
+
 /* Start serving (non-blocking - runs in background threads via libmicrohttpd).
  * On failure, api_server_error says what failed, on which address or path,
  * and why. */

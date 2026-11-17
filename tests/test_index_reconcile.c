@@ -34,6 +34,7 @@
 #include "reindex.h"
 #include "repo.h"
 #include "repo_key.h"
+#include "repo_tags.h"
 #include "snapshot_ids.h"
 #include "store.h"
 #include "store_index.h"
@@ -291,6 +292,61 @@ static void test_repo_being_removed_is_skipped(void **state)
     assert_int_equal(log.calls, 0);
 }
 
+/*
+ * V3-12 and B139: a tag the database lost after it was answered - the tag
+ * row gone, the repository's tag list written and synced before the answer
+ * - is put back by the next start. The list is the repository's own copy
+ * and 0600 like the rest of it (NIT-27).
+ */
+static void test_lost_tag_is_restored_from_the_repository(void **state)
+{
+    (void)state;
+    backup_once("one\n");
+    backup_once("two\n");
+    exec_repo("INSERT INTO tags (repo_id, name, snap_id, created_at) VALUES (?, 'keep', 1, 5)");
+    exec_repo("INSERT INTO tags (repo_id, name, snap_id, created_at) VALUES (?, 'also', 2, 6)");
+    assert_int_equal(repo_tags_save(db, repo_id, TEST_REPO), OK);
+
+    struct stat sb;
+    assert_int_equal(stat(TEST_REPO "/" REPO_TAGS_FILE, &sb), 0);
+    assert_int_equal(sb.st_mode & 0777, 0600);
+
+    /* What a power cut takes: the newest commit, here both tag rows. */
+    exec_repo("DELETE FROM tags WHERE repo_id = ?");
+    assert_int_equal(scalar("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 0);
+
+    submit_log_t log = { 0, 0 };
+    reconcile_result_t rr;
+    assert_int_equal(index_reconcile(db, fake_submit, &log, &rr), OK);
+    assert_int_equal(rr.tags_restored, 2);
+    assert_int_equal(rr.repos_missing, 0);
+    assert_int_equal(log.calls, 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM tags WHERE repo_id = ? AND name = 'keep'"
+                            " AND snap_id = 1"), 1);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM tags WHERE repo_id = ? AND name = 'also'"
+                            " AND snap_id = 2"), 1);
+
+    /* Nothing to do the next time: the database wins and is complete. */
+    assert_int_equal(index_reconcile(db, fake_submit, &log, &rr), OK);
+    assert_int_equal(rr.tags_restored, 0);
+}
+
+/* A tag the database still has is never overwritten from the file, which
+ * may be older (the database is the copy every query uses). */
+static void test_database_tag_wins(void **state)
+{
+    (void)state;
+    backup_once("one\n");
+    backup_once("two\n");
+    exec_repo("INSERT INTO tags (repo_id, name, snap_id, created_at) VALUES (?, 'keep', 1, 5)");
+    assert_int_equal(repo_tags_save(db, repo_id, TEST_REPO), OK);
+    exec_repo("UPDATE tags SET snap_id = 2 WHERE repo_id = ? AND name = 'keep'");
+    reconcile_result_t rr;
+    assert_int_equal(index_reconcile(db, NULL, NULL, &rr), OK);
+    assert_int_equal(rr.tags_restored, 0);
+    assert_int_equal(scalar("SELECT snap_id FROM tags WHERE repo_id = ? AND name = 'keep'"), 2);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -301,6 +357,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_damaged_mark_falls_back_to_listing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unreadable_repo_is_skipped, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repo_being_removed_is_skipped, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_lost_tag_is_restored_from_the_repository, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_database_tag_wins, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

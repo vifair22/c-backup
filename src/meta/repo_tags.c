@@ -10,6 +10,7 @@
 #include <cutils/log.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,7 +75,9 @@ status_t repo_tags_save(cutils_db_t *db, int64_t repo_id, const char *repo_path)
     }
     size_t len = strlen(body);
     status_t st = OK;
-    if (fchmod(fd, 0644) != 0 ||
+    /* 0600, as the rest of a repository's files are (mkstemp's mode):
+     * the list names snapshots and when they were taken. */
+    if (fchmod(fd, 0600) != 0 ||
         write(fd, body, len) != (ssize_t)len || write(fd, "\n", 1) != 1)
         st = set_error_errno(ERR_IO, "cannot write %s", tmp);
     else if (fsync(fd) != 0)
@@ -83,7 +86,19 @@ status_t repo_tags_save(cutils_db_t *db, int64_t repo_id, const char *repo_path)
     free(body);
     if (st == OK && rename(tmp, final) != 0)
         st = set_error_errno(ERR_IO, "cannot install %s", final);
-    if (st != OK) unlink(tmp);
+    if (st != OK) { unlink(tmp); return st; }
+
+    /*
+     * The rename is durable only once the directory is. Without this the
+     * file's bytes were on disk and its name was not: a power cut a second
+     * after a tag was set lost it from the repository as well as from the
+     * database (B139), and the repository copy exists precisely to survive
+     * losing the database.
+     */
+    int dfd = open(repo_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return set_error_errno(ERR_IO, "cannot open %s to sync it", repo_path);
+    if (fsync(dfd) != 0) st = set_error_errno(ERR_IO, "cannot sync %s", repo_path);
+    close(dfd);
     return st;
 }
 
