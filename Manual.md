@@ -1006,7 +1006,22 @@ measured: about 25 ms at the median on an idle NVMe drive; during a 13 GiB
 backup on the same kind of drive, a tag write took 0.15 s at the median and
 0.9 s at the 99th percentile, and 0.6 s and 1.3 s with other programs
 saturating the disk; on a saturated local disk the sync alone reached 2.7 s
-at the 99th percentile, and tag writes took seconds. Keep `state.db`
+at the 99th percentile, and tag writes took seconds.
+
+On slower storage the same costs grow. Measured on a btrfs RAID10 pool on
+dm-crypt over four Crucial BX500 SATA SSDs (Unraid, image M5), with
+`state.db` on that pool:
+
+| Condition | Tag write, median | 90th percentile | Worst |
+|-----------|-------------------|-----------------|-------|
+| Idle pool | 11-15 ms | - | 32 ms |
+| During a 16 GiB first backup | 267 ms | 2.24 s | 9.1 s |
+| Same, with other programs loading the pool | 334 ms | 10.2 s | 15.6 s |
+
+One write-ahead-log sync on that pool took 0.9-3.8 s with a backup running,
+and up to about 6 s with other load as well (57 and 53 tag writes sampled,
+so the table gives the 90th percentile, not the 99th). Faster storage
+scales these down roughly with its sync latency. Keep `state.db`
 (`db.path`) off a disk that other work saturates if tag and delete latency
 matters. Which class every API
 route has is listed in `docs/api.md`.
