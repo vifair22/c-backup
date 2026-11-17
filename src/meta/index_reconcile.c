@@ -110,7 +110,7 @@ status_t index_reconcile(cutils_db_t *db, reconcile_submit_fn submit, void *ctx,
      * out, and reindexing it would put them back. */
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT id, path, COALESCE(label, '') FROM repos"
+            "SELECT id, path, COALESCE(label, ''), uuid FROM repos"
             " WHERE id NOT IN (SELECT repo_id FROM repo_purge_pending) ORDER BY id",
             NULL, &r) != 0 || !r) {
         db_result_free(r);
@@ -123,7 +123,14 @@ status_t index_reconcile(cutils_db_t *db, reconcile_submit_fn submit, void *ctx,
         out->repos_checked++;
 
         uint64_t missing = 0;
-        if (index_reconcile_count(db, repo_id, path, &missing) != OK) {
+        /* Snapshot records and tags are read from whatever is at the path,
+         * so it has to be this repository (B164): another's would queue a
+         * reindex of it and put its tags in this one's index. A marker that
+         * cannot be read at all is left to the count below, as before. */
+        status_t idst = repo_identity_check(path, r->rows[i][3]);
+        if (idst != OK && idst != ERR_UNAVAILABLE) err_clear();
+        if (idst == ERR_UNAVAILABLE ||
+            index_reconcile_count(db, repo_id, path, &missing) != OK) {
             /* An offline mount is the usual reason, and the next start
              * checks again. */
             log_warn("reconcile: repo %lld (%s) not checked: %s",

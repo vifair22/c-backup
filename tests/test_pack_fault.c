@@ -220,7 +220,8 @@ static void test_read_stored_fread_fail(void **state)
 /* Is the store's staging directory empty? */
 static int tmp_is_empty(void)
 {
-    FILE *p = popen("find '" TEST_REPO "/tmp' -type f ! -name .lock | wc -l", "r");
+    FILE *p = popen("find '" TEST_REPO "/tmp' '" TEST_REPO "/" STORE_PACK_STAGING "'"
+                    " -type f ! -name .lock 2>/dev/null | wc -l", "r");
     assert_non_null(p);
     int n = -1;
     assert_int_equal(fscanf(p, "%d", &n), 1);

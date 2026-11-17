@@ -25,6 +25,7 @@
 #include "chunklist.h"
 #include "lock.h"
 #include "nbd_server.h"
+#include "pack_presence.h"
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
@@ -118,7 +119,10 @@ static status_t cr_open(void *ctx, void **reader, uint64_t *size)
     conn_reader_t *c = calloc(1, sizeof(*c));
     if (!c) { atomic_fetch_sub(&g_conns, 1); return set_error(ERR_NOMEM, "export reader"); }
     c->e = e;
-    status_t st = repo_store_open_keyed(e->repo_path, NULL, &c->store);
+    /* Each connection, not only the export's creation: the path may hold
+     * another repository by now (B164), or nothing. */
+    status_t st = pack_presence_require(g_db, e->repo_id);
+    if (st == OK) st = repo_store_open_keyed(e->repo_path, NULL, &c->store);
     if (st == OK) st = store_index_bind(c->store, g_db, e->repo_id, &c->idx);
     if (st == OK) st = content_reader_open(c->store, e->hash, &c->r, size);
     if (st == OK && *size != e->size)
@@ -359,7 +363,8 @@ api_response_t exports_create(const api_request_t *req, int64_t repo_id, int64_t
      * missing key fails the request rather than the first client. */
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    status_t st = repo_store_open_keyed(e->repo_path, NULL, &store);
+    status_t st = pack_presence_require(g_db, repo_id);
+    if (st == OK) st = repo_store_open_keyed(e->repo_path, NULL, &store);
     if (st == OK) st = store_index_bind(store, g_db, repo_id, &idx);
     if (g_max_conns == 0) st = set_error(ERR_INVALID, "NBD exports are off (vm.export_max_conns is 0)");
     if (st == OK) st = unit_item_content(store, g_db, repo_id, snap_id, e->item, e->hash, &e->size);
@@ -377,7 +382,8 @@ api_response_t exports_create(const api_request_t *req, int64_t repo_id, int64_t
     if (st != OK) {
         free(e->repo_path);
         free(e);
-        return api_error(st == ERR_NOT_FOUND ? 404 : st == ERR_INVALID ? 400 : 500, err_msg());
+        return api_error(st == ERR_NOT_FOUND ? 404 : st == ERR_INVALID ? 400 :
+                         st == ERR_UNAVAILABLE ? 409 : 500, err_msg());
     }
 
     uint8_t rnd[16];

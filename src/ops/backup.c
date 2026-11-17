@@ -2449,8 +2449,9 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * Staging files a killed run left behind. store_open only sweeps what is
      * an hour old, because it cannot know who else is writing; a backup holds
      * the repository's write lock, so nothing else is, and anything already
-     * in tmp/ belongs to a process that is gone. Measured: 134 MB of obj.*
-     * from one killed backup survived every later backup and gc.
+     * staged (tmp/, packs/.staging) belongs to a process that is gone.
+     * Measured: 134 MB of obj.* from one killed backup survived every later
+     * backup and gc.
      */
     uint64_t swept_bytes = 0;
     unsigned swept = store_sweep_tmp_before(store, time(NULL), &swept_bytes);

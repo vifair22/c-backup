@@ -256,10 +256,27 @@ uint64_t store_write_stats_diff(const store_write_stats_t *after,
                                 store_write_stats_t *out);
 
 /*
- * Remove staging files in tmp/ last modified before `before`, limited to the
- * names the engine itself creates (obj.*, pack-dat.*, pack-idx.*, snap.*,
- * par.*). Returns how many were removed and adds their size to *bytes when
- * that is not NULL.
+ * Where pack files and pack-deletion markers are staged: inside packs/, so
+ * the rename that installs one never crosses a filesystem. packs/ may be a
+ * mount of its own (Manual section 5.3), and staging them in tmp/ made
+ * every install fail with EXDEV there (B163). The name is not a shard's
+ * (six hex digits) nor a marker's (.deleting-N), so nothing that walks
+ * packs/ for those reads it.
+ */
+#define STORE_PACK_STAGING "packs/.staging"
+
+/*
+ * Write <root>/packs/.staging to buf, creating the directory if it is
+ * missing (packs/ itself is not created: a repository without one is
+ * unavailable, not empty). 0, or -1 with errno set.
+ */
+int store_pack_staging(const store_t *st, char *buf, size_t sz);
+
+/*
+ * Remove staging files in tmp/ and packs/.staging last modified before
+ * `before`, limited to the names the engine itself creates (pack-dat.*,
+ * snap.*, snapids.*, deleting.*, and tags.* by the hour rule). Returns how
+ * many were removed and adds their size to *bytes when that is not NULL.
  *
  * store_open sweeps with an hour's margin because it cannot know who else is
  * writing. A caller holding the repository's write lock can: no other job
@@ -271,7 +288,9 @@ unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes);
 
 /*
  * Take this handle's claim on tmp/ (an flock on tmp/.lock, held until
- * store_close); 1 if held. Pack staging takes it, and
+ * store_close); 1 if held. The claim covers packs/.staging as well: the
+ * lock file stays in tmp/, which is always on the root's filesystem. Pack
+ * staging takes it, and
  * store_sweep_tmp_before needs it to remove staging younger than an hour:
  * without it, another handle may be writing, so only the hour rule applies.
  * Callers that sweep with the claim: backup, gc, reindex, a replica sink's

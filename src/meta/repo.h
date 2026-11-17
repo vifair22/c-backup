@@ -153,6 +153,20 @@ status_t repo_marker_read(const char *path, repo_marker_t *out);
  */
 status_t repo_format_check(const char *path, const repo_marker_t *m);
 
+/*
+ * Is the directory at path the repository registered as uuid? OK when its
+ * marker names that uuid. ERR_NOT_FOUND with no marker, ERR_CORRUPT or
+ * ERR_IO when it cannot be read, and ERR_UNAVAILABLE when it is another
+ * repository's: "<path> holds repository <theirs>, not <uuid> ...".
+ *
+ * The path is the only thing the index holds about where a repository is,
+ * and a path can come to hold a different repository: two roots swapped, a
+ * share mounted at the wrong place, a disk restored to another's mount
+ * point (B164). Everything a daemon writes into a repository, or reads out
+ * of it into the index, by its registered path checks this first.
+ */
+status_t repo_identity_check(const char *path, const char *uuid);
+
 /* Fill the marker's chunker with the format defaults; keyed when the
  * marker records encryption. */
 void repo_marker_cdc_default(repo_marker_t *m);

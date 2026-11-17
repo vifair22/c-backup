@@ -278,7 +278,7 @@ static void test_abort_removes_the_staging_file(void **state)
     pack_backup_abort(w);
 
     char tmp_dir[512];
-    snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", TEST_ROOT);
+    snprintf(tmp_dir, sizeof(tmp_dir), "%s/" STORE_PACK_STAGING, TEST_ROOT);
     DIR *d = opendir(tmp_dir);
     assert_non_null(d);
     int leftovers = 0;
