@@ -134,6 +134,14 @@ typedef struct {
      */
     status_t (*next_piece)(void *ctx, uint64_t *s, uint64_t *e, int *got,
                            int *more);
+    /*
+     * Optional: start over at off, as if the content began there with no
+     * span open, so the next span or piece starts at or after off. Only an
+     * incremental store (cdc_store_delta) uses it, to re-chunk the regions
+     * around changed ranges and skip what lies between; off only ever
+     * moves forward.
+     */
+    status_t (*seek)(void *ctx, uint64_t off);
 } cdc_source_t;
 
 /* ------------------------------------------------------------------ */
