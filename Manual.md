@@ -2873,7 +2873,7 @@ docker run -d --name c-backupd --restart unless-stopped \
   -e TZ=America/Chicago \
   -e C_BACKUP_SECURITY_RUN_AS_UID=990 \
   -e C_BACKUP_UNITS_HELPER_SOCKET=/run/c-backup-helper/helper.sock \
-  -e 'C_BACKUP_UNITS_ALLOW=docker:cbk-uat-*,libvirt:cbk-uat-*,lxc:cbk-uat-*' \
+  -e 'C_BACKUP_UNITS_ALLOW=docker:cbk-uat-*,docker:compose:cbk-uat-*,libvirt:cbk-uat-*,lxc:cbk-uat-*' \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /run/c-backupd:/run/c-backupd \
   -v /mnt/cache:/mnt/cache:ro,rslave \
@@ -3020,8 +3020,10 @@ state_dir = /mnt/cache/system/c-backup-helper
 socket = /run/c-backup-helper/helper.sock
 
 [units]
-# Globs over <provider>:<id> and <provider>:<name>. Nothing else is touched.
-allow = docker:cbk-uat-*, libvirt:cbk-uat-*, lxc:cbk-uat-*
+# Globs over <provider>:<id> and <provider>:<name> (22.9 has the key
+# table). A compose project is docker:compose:<project>, which
+# docker:cbk-uat-* does not reach. Nothing else is touched.
+allow = docker:cbk-uat-*, docker:compose:cbk-uat-*, libvirt:cbk-uat-*, lxc:cbk-uat-*
 
 [snapshot]
 # ZFS datasets the helper may snapshot, by name (never a parent of these).
@@ -3315,6 +3317,21 @@ included: an unencrypted repository holds them in the clear.
 A bind of `/mnt/user/<share>/...` is resolved to the one pool or disk
 holding it, in the host's namespace; the recorded path stays the
 `/mnt/user` one.
+
+**Bind mounts on the host and named volumes.** Unraid mounts
+`/var/lib/docker` as a bind of a pool directory (FS1:
+`/mnt/cache/system/docker`, dataset `cache/system`), so a named volume's
+source `/var/lib/docker/volumes/<v>/_data` is not where a snapshot domain
+or the daemon can see it. The helper looks every resolved path up in the
+host's mount table and reads a path on a bind through its filesystem's own
+mount: that volume is read as `/mnt/cache/system/docker/volumes/<v>/_data`,
+from `cache/system`'s snapshot when `zfs_domains` lists `cache/system`, and
+under the daemon's existing `/mnt/cache` mount either way. `mounts.json`
+shows it as `real`; the recorded path is unchanged. Docker in a
+`docker.img` (a loop-mounted image) has no pool path: its volumes are read
+live, noted `loop-image`, the unit is `inconsistent`, and the daemon needs
+`-v /var/lib/docker/volumes:/var/lib/docker/volumes:ro,rslave`. Run
+Docker from a directory on a pool to back volumes up from a snapshot.
 
 #### 22.5.2 Capture, step by step
 
@@ -3735,7 +3752,22 @@ Or copy the disk out without a kernel device:
 
 `units.allow` in the daemon's configuration is a comma-separated list of
 globs; a glob matches a unit's name, its id, `<provider>:<name>` or
-`<provider>:<id>`. A unit that matches none is invisible to the daemon: it is
+`<provider>:<id>`. The ids, and the glob that reaches the UAT units:
+
+| Unit | Id (key) | UAT glob |
+|---|---|---|
+| compose project | `compose:<project>` (`docker:compose:<project>`) | `docker:compose:cbk-uat-*` |
+| standalone container | its name (`docker:<name>`) | `docker:cbk-uat-*` |
+| LXC container | its name (`lxc:<name>`) | `lxc:cbk-uat-*` |
+| VM | its UUID (`libvirt:<uuid>`); the name matches as `libvirt:<name>` | `libvirt:cbk-uat-*` |
+
+A compose project's id and name both start `compose:`, so neither
+`cbk-uat-*` nor `docker:cbk-uat-*` reaches the project `cbk-uat-compose`
+(and its containers are backed up only through it). Compose project names
+are always lowercase (compose lowercases the directory name it derives one
+from), so the project part of a `compose:` or `docker:compose:` glob is
+matched lowercased in both lists: `docker:compose:Immich` is the project
+`immich`. Every other name keeps its case. A unit that matches none is invisible to the daemon: it is
 not listed, cannot be described, backed up or restored, and a `--all` run
 skips it (the job result counts what was filtered). Empty allows everything.
 
@@ -3745,7 +3777,7 @@ helper's `[units] allow` is a second, independent rail on the host side; a
 unit must pass both.
 
 **During UAT both are set to `cbk-uat-*` globs**
-(`docker:cbk-uat-*,libvirt:cbk-uat-*,lxc:cbk-uat-*`), so the daemon cannot
+(`docker:cbk-uat-*,docker:compose:cbk-uat-*,libvirt:cbk-uat-*,lxc:cbk-uat-*`), so the daemon cannot
 touch a production VM or container whatever is asked of it. Enrolling
 production units means changing both lists, deliberately, on the host.
 
@@ -3758,7 +3790,7 @@ production units means changing both lists, deliberately, on the host.
 | `GET /providers`: `helper.state` `never-connected` or `disconnected` | the helper is not running, the socket path differs, or `/run/c-backup-helper` is not mounted into both | `docker logs c-backup-helper`; same path both sides; the daemon reconnects by itself within 30 s |
 | hello refused: daemon ids differ | the policy's `daemon_id` is not this daemon's | copy `daemon_id` from `GET /providers` into the policy; restart the helper |
 | connection refused by the helper, peer uid | the daemon is not running as 990, or the policy's `daemon_uid` differs | `privileges_dropped` true and `security.run_as_uid` 990; the same uid in the policy |
-| a unit is not listed | `units.allow` (daemon) or `[units] allow` (helper) excludes it | widen the right list on the host |
+| a unit is not listed | `units.allow` (daemon) or `[units] allow` (helper) excludes it; a compose project needs a `docker:compose:` glob (22.9) | widen the right list on the host |
 | `achieved inconsistent, below the required crash` | mounts on no snapshot domain with `pause = never`, a group capture, several instants without a pause or with a pause the watchdog let go (`watchdog-released` in `consist_flags`), or a dataset missing from `zfs_domains` | add the dataset to the policy, allow the pause (and enough `max_pause_s` for it), or pass `--require inconsistent` knowingly |
 | a VM disk refused: format mismatch | the image's header disagrees with the XML's `<driver type>` | correct the domain XML; the extension does not matter |
 | a VM unit fails on NVRAM or TPM state | the file or directory named by the XML is missing or unreadable to uid 990 | check the two read-only `/etc/libvirt` mounts and that the path exists on the host |
