@@ -68,6 +68,7 @@
 #include "routes.h"
 #include "server.h"
 #include "state_db.h"
+#include "checkpointer.h"
 #include "store.h"
 #include "store_index.h"
 #include "verify.h"
@@ -153,6 +154,9 @@ static int scalar(const char *sql, const char *p1)
     return v;
 }
 
+static int g_ckpt_min;
+static int g_ckpt_threshold;
+
 static int setup(void **state)
 {
     (void)state;
@@ -166,10 +170,18 @@ static int setup(void **state)
      * the once-a-second WAL flusher, the cache and the autocheckpoint
      * interval. At c-utils' synchronous=FULL every commit synced the WAL
      * under the write lock, which the daemon never does. */
+    /* The shipped checkpoint threshold, with the checkpointer running as
+     * the daemon runs it (SPEED-3). C_BACKUP_STRESS_CKPT_MIN=1 uses the
+     * smallest the config allows instead, so this backup's WAL crosses it
+     * many times: a stress variant for looking at escalation, which logs
+     * what it saw and does not fail on it. */
+    g_ckpt_min = getenv("C_BACKUP_STRESS_CKPT_MIN") != NULL;
+    g_ckpt_threshold = g_ckpt_min ? STATE_DB_AUTOCKPT_MIN : STATE_DB_AUTOCKPT_DEFAULT;
     state_db_tuning_t tune = { STATE_DB_SYNC_DEFAULT, STATE_DB_CACHE_MB_DEFAULT,
-                               STATE_DB_AUTOCKPT_DEFAULT };
+                               g_ckpt_threshold };
     if (state_db_tune(db, &tune) != OK) return -1;
     if (state_db_flusher_start(TEST_DB, 1000) != OK) return -1;
+    if (checkpointer_start(TEST_DB, g_ckpt_threshold, 50) != OK) return -1;
     if (repo_register(db, TEST_REPO, "stress", &repo_id) != OK) return -1;
     if (store_open(TEST_REPO, NULL, &store) != OK) return -1;
     if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
@@ -186,6 +198,7 @@ static int teardown(void **state)
     (void)state;
     store_index_free(idx); idx = NULL;
     store_close(store);    store = NULL;
+    checkpointer_stop();
     state_db_flusher_stop();
     db_close(db);          db = NULL;
     rmrf(TEST_DIR);
@@ -392,6 +405,28 @@ static void test_writer_gets_in_during_node_indexing(void **state)
 
 /* ------------------------------------------------------------------ */
 
+/* The WAL's largest frame count while the backup runs, and how many
+ * times it restarted (the count fell). */
+static atomic_uint g_wal_peak;
+static atomic_uint g_wal_restarts;
+
+static void *wal_sampler(void *arg)
+{
+    (void)arg;
+    uint32_t last = 0;
+    while (!atomic_load(&backup_done)) {
+        uint32_t f = 0, b = 0;
+        if (checkpointer_wal_frames(TEST_DB, &f, &b) == 0) {
+            if (f > atomic_load(&g_wal_peak)) atomic_store(&g_wal_peak, f);
+            if (f < last) atomic_fetch_add(&g_wal_restarts, 1);
+            last = f;
+        }
+        struct timespec ts = { 0, 5 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
 static void test_writes_during_a_backup_all_land(void **state)
 {
     (void)state;
@@ -422,6 +457,10 @@ static void test_writes_during_a_backup_all_land(void **state)
     w[3].kind = W_RAW;
     for (int i = 0; i < 4; i++)
         assert_int_equal(pthread_create(&w[i].thr, NULL, writer_main, &w[i]), 0);
+    atomic_store(&g_wal_peak, 0);
+    atomic_store(&g_wal_restarts, 0);
+    pthread_t sampler;
+    assert_int_equal(pthread_create(&sampler, NULL, wal_sampler, NULL), 0);
 
     static const char *p2[] = { TEST_SRC };
     backup_opts_t o2;
@@ -433,6 +472,23 @@ static void test_writes_during_a_backup_all_land(void **state)
     status_t bst = backup_run(store, db, repo_id, &o2, &res);
     atomic_store(&backup_done, 1);
     for (int i = 0; i < 4; i++) pthread_join(w[i].thr, NULL);
+    pthread_join(sampler, NULL);
+
+    /* SPEED-3: no COMMIT checkpoints, so only the checkpointer bounds the
+     * WAL through the backup. What it guarantees is the hard cap; at the
+     * shipped threshold that is the assertion. The minimum-threshold
+     * variant only reports: its threshold is 4 MiB and this backup writes
+     * its index at well over 50 MiB/s on NVMe, so its peak against the hard
+     * cap depends on the machine. */
+    checkpointer_stats_t cs;
+    checkpointer_stats(&cs);
+    unsigned hard = (unsigned)g_ckpt_threshold * CKPT_HARD_FACTOR;
+    fprintf(stderr, "stress: threshold %d, WAL peak %u frames (hard cap %u), %u restarts; "
+            "%lu checkpoints, %lu escalated, longest hold %.1f ms%s\n", g_ckpt_threshold,
+            atomic_load(&g_wal_peak), hard, atomic_load(&g_wal_restarts), cs.passive,
+            cs.escalations, (double)cs.max_lock_ns / 1e6,
+            g_ckpt_min ? " (stress variant: not asserted)" : "");
+    if (!g_ckpt_min) assert_true(atomic_load(&g_wal_peak) < hard);
 
     const char *env = getenv("C_BACKUP_STRESS_WAIT_MS");
     int64_t bound = env ? atoll(env) : 2000;

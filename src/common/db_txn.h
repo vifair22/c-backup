@@ -158,6 +158,15 @@ status_t db_txn_install_cutils_lock(cutils_db_t *db);
  */
 status_t db_txn_make_durable(cutils_db_t *db);
 
+/*
+ * Run fn holding the write lock, with no transaction open: no db_txn
+ * writer can commit until it returns. For the checkpointer's escalation
+ * (checkpointer.h), which needs a moment when nothing is appended to the
+ * WAL. fn must be short and must not begin a transaction. ERR_BUSY when
+ * this thread already holds the lock; otherwise fn's status.
+ */
+status_t db_txn_exclusive(status_t (*fn)(void *), void *arg);
+
 /* The WAL file db_txn_make_durable syncs: "<main database file>-wal" when
  * the database is in WAL mode and on disk, "" when there is none (rollback
  * journal, in memory). 0, or -1 when it cannot be determined. */
