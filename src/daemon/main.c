@@ -45,6 +45,7 @@
 #include "server.h"
 #include "state_db.h"
 #include "wal_sync.h"
+#include "checkpointer.h"
 #include "pack_presence.h"
 #include "prune.h"
 #include "store_index.h"
@@ -497,6 +498,13 @@ int main(int argc, char *argv[])
         log_error("%s", err_msg());
         goto out_srv;
     }
+    /* Checkpoints off the request path, whatever db.synchronous says: the
+     * shared handle never checkpoints (state_db_tune), so without this the
+     * WAL would only grow (checkpointer.h, SPEED-3). */
+    if (checkpointer_start(db_path, tuning.wal_autocheckpoint, 1000) != OK) {
+        log_error("%s", err_msg());
+        goto out_srv;
+    }
 
     if (sched && scheduler_run(sched) != OK) {
         log_error("cannot start scheduler loop");
@@ -544,6 +552,7 @@ out_locks:
     repo_locks_shutdown();
     /* After every writer has stopped: one last sync of the WAL. A no-op
      * when it was never started. */
+    checkpointer_stop();
     state_db_flusher_stop();
     /* Let go of the kept WAL descriptor before the close deletes the file,
      * so the process does not pin a deleted inode on its way out. */
