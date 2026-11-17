@@ -20,6 +20,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -151,13 +152,30 @@ struct sp_ctx {
      * vm.install_state will write state for (7.2). */
     struct { char uuid[VIR_UUID_STRING_BUFLEN]; int replaced; } defined[DEFINED_MAX];
     size_t       n_defined;
+    /* Every checkpoint this helper made and has not yet deleted, with the
+     * XML it had at creation (vm-backup.md 5.8), persisted in the state
+     * directory: the proof a base is its own, and what a lost checkpoint
+     * is redefined from. Under cmu. */
+    pthread_mutex_t cmu;
+    struct cprec *cps;
+    size_t        ncps;
 };
+
+typedef struct cprec {
+    char    uuid[VIR_UUID_STRING_BUFLEN];
+    char    name[ARTEFACT_NAME_MAX];
+    char   *xml;
+    int64_t created;
+    char    disks[DISKS_MAX][32];   /* the disks its bitmap covers */
+    size_t  ndisks;
+} cprec_t;
 
 typedef struct {
     char     item[SP_ITEM_ID_MAX];
     char     path[PATH_MAX];
     char     socket[PATH_MAX];
     char     export_name[32];
+    char     bitmap[48];        /* the export's dirty bitmap, for an incremental disk */
     int      nbd;               /* read through NBD (qemu-nbd or the backup export) */
     pid_t    qemu_nbd;          /* a qemu-nbd this session started */
     int64_t  hold;
@@ -175,6 +193,12 @@ struct sp_session {
     int               online;
     int64_t           export_hold;
     char              tpm_dir[PATH_MAX];
+    /* Checkpoints (5.8): the one this session made, and the one to delete
+     * once it commits (the base, or a token handed over to retire). */
+    char              new_cp[ARTEFACT_NAME_MAX];
+    char              old_cp[ARTEFACT_NAME_MAX];
+    int64_t           cp_hold;
+    int64_t           job;
     sp_session_info_t info;
 };
 
@@ -193,11 +217,28 @@ static status_t conn_ok(struct sp_ctx *c)
     return OK;
 }
 
+/*
+ * A connection libvirtd dropped (a restart of libvirtd or virtqemud; on
+ * Unraid, a host reboot under a running helper) still says it is alive
+ * until a call fails on it. After a failure, a connection that now admits
+ * it is dead is reopened and the caller tries once more.
+ */
+static int conn_lost(struct sp_ctx *c)
+{
+    if (!c->conn || virConnectIsAlive(c->conn) == 1) return 0;
+    log_warn("libvirt: the connection to %s was lost (%s); reconnecting", c->pol->libvirt_uri, verr());
+    virConnectClose(c->conn);
+    c->conn = NULL;
+    if (conn_ok(c) != OK) { err_clear(); return 0; }
+    return 1;
+}
+
 static status_t domain(struct sp_ctx *c, const char *uuid, virDomainPtr *out)
 {
     status_t st = conn_ok(c);
     if (st != OK) return st;
     *out = virDomainLookupByUUIDString(c->conn, uuid);
+    if (!*out && conn_lost(c)) *out = virDomainLookupByUUIDString(c->conn, uuid);
     if (!*out) return set_error(ERR_NOT_FOUND, "libvirt: no domain %s: %s", uuid, verr());
     return OK;
 }
@@ -271,6 +312,372 @@ static status_t cache_put(struct sp_ctx *c, const char *unit, const char *item, 
 }
 
 /* ------------------------------------------------------------------ */
+/* Checkpoints (5.1, 5.4, 5.8)                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The records are one JSON file in the policy's state directory (on a pool,
+ * never the RAM rootfs), written whole through a temporary and a rename:
+ *   [{"uuid":..., "name":..., "created":..., "disks":["vda"], "xml":"..."}]
+ * A record exists from the moment its checkpoint does until the helper
+ * deletes it; a crash in between leaves a checkpoint_new hold that the
+ * sweep settles.
+ */
+static void rec_path(const struct sp_ctx *c, char *buf, size_t sz, int tmp)
+{
+    snprintf(buf, sz, "%.4000s/libvirt-checkpoints.json%s", c->pol->state_dir, tmp ? ".tmp" : "");
+}
+
+/* Caller holds cmu. */
+static status_t rec_save(struct sp_ctx *c)
+{
+    cJSON *a = cJSON_CreateArray();
+    for (size_t i = 0; a && i < c->ncps; i++) {
+        const cprec_t *r = &c->cps[i];
+        cJSON *o = cJSON_CreateObject();
+        if (!o) break;
+        cJSON_AddItemToArray(a, o);
+        cJSON_AddStringToObject(o, "uuid", r->uuid);
+        cJSON_AddStringToObject(o, "name", r->name);
+        cJSON_AddNumberToObject(o, "created", (double)r->created);
+        cJSON *d = cJSON_AddArrayToObject(o, "disks");
+        for (size_t k = 0; d && k < r->ndisks; k++) cJSON_AddItemToArray(d, cJSON_CreateString(r->disks[k]));
+        cJSON_AddStringToObject(o, "xml", r->xml ? r->xml : "");
+    }
+    char *txt = a ? cJSON_PrintUnformatted(a) : NULL;
+    cJSON_Delete(a);
+    if (!txt) return set_error(ERR_NOMEM, "libvirt: checkpoint records");
+    char path[PATH_MAX], tmp[PATH_MAX];
+    rec_path(c, path, sizeof(path), 0);
+    rec_path(c, tmp, sizeof(tmp), 1);
+    if (mkdir(c->pol->state_dir, 0700) != 0 && errno != EEXIST) {
+        free(txt);
+        return set_error_errno(ERR_IO, "libvirt: state directory %s", c->pol->state_dir);
+    }
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    status_t st = OK;
+    size_t n = strlen(txt), done = 0;
+    if (fd < 0) st = set_error_errno(ERR_IO, "libvirt: %s", tmp);
+    while (st == OK && done < n) {
+        ssize_t w = write(fd, txt + done, n - done);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) st = set_error_errno(ERR_IO, "libvirt: writing %s", tmp);
+        else done += (size_t)w;
+    }
+    if (st == OK && fsync(fd) != 0) st = set_error_errno(ERR_IO, "libvirt: fsync %s", tmp);
+    if (fd >= 0) close(fd);
+    if (st == OK && rename(tmp, path) != 0) st = set_error_errno(ERR_IO, "libvirt: rename %s", tmp);
+    free(txt);
+    return st;
+}
+
+static void rec_free_all(struct sp_ctx *c)
+{
+    for (size_t i = 0; i < c->ncps; i++) free(c->cps[i].xml);
+    free(c->cps);
+    c->cps = NULL;
+    c->ncps = 0;
+}
+
+static void rec_load(struct sp_ctx *c)
+{
+    char path[PATH_MAX];
+    rec_path(c, path, sizeof(path), 0);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    for (;;) {
+        if (len + 65536 > cap) {
+            char *g = realloc(buf, cap + 1048576);
+            if (!g) break;
+            buf = g;
+            cap += 1048576;
+        }
+        size_t r = fread(buf + len, 1, cap - len - 1, f);
+        if (r == 0) break;
+        len += r;
+    }
+    fclose(f);
+    if (!buf) return;
+    buf[len] = '\0';
+    cJSON *a = cJSON_Parse(buf);
+    free(buf);
+    const cJSON *o;
+    cJSON_ArrayForEach(o, a) {
+        const char *u = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(o, "uuid"));
+        const char *n = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(o, "name"));
+        const char *x = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(o, "xml"));
+        if (!u || !n || !x || strlen(u) >= VIR_UUID_STRING_BUFLEN || strlen(n) >= ARTEFACT_NAME_MAX) continue;
+        char d8[9];
+        if (artefact_parse(n, d8, NULL, NULL) != 0 || strcmp(d8, c->pol->daemon_id) != 0) continue;
+        cprec_t *g = realloc(c->cps, (c->ncps + 1) * sizeof(*g));
+        if (!g) break;
+        c->cps = g;
+        cprec_t *r = &g[c->ncps];
+        memset(r, 0, sizeof(*r));
+        snprintf(r->uuid, sizeof(r->uuid), "%s", u);
+        snprintf(r->name, sizeof(r->name), "%s", n);
+        r->created = (int64_t)cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(o, "created"));
+        const cJSON *dk;
+        cJSON_ArrayForEach(dk, cJSON_GetObjectItemCaseSensitive(o, "disks"))
+            if (cJSON_IsString(dk) && r->ndisks < DISKS_MAX && strlen(dk->valuestring) < sizeof(r->disks[0]))
+                snprintf(r->disks[r->ndisks++], sizeof(r->disks[0]), "%s", dk->valuestring);
+        if (!(r->xml = strdup(x))) break;
+        c->ncps++;
+    }
+    cJSON_Delete(a);
+}
+
+/* Caller holds cmu. */
+static cprec_t *rec_find(struct sp_ctx *c, const char *uuid, const char *name)
+{
+    for (size_t i = 0; i < c->ncps; i++)
+        if (strcmp(c->cps[i].uuid, uuid) == 0 && strcmp(c->cps[i].name, name) == 0) return &c->cps[i];
+    return NULL;
+}
+
+static status_t rec_add(struct sp_ctx *c, const char *uuid, const char *name, const char *xml,
+                        char disks[][32], size_t nd)
+{
+    pthread_mutex_lock(&c->cmu);
+    status_t st = OK;
+    cprec_t *g = realloc(c->cps, (c->ncps + 1) * sizeof(*g));
+    if (!g) st = set_error(ERR_NOMEM, "libvirt: records");
+    else {
+        c->cps = g;
+        cprec_t *r = &g[c->ncps];
+        memset(r, 0, sizeof(*r));
+        snprintf(r->uuid, sizeof(r->uuid), "%s", uuid);
+        snprintf(r->name, sizeof(r->name), "%s", name);
+        r->created = (int64_t)time(NULL);
+        for (size_t k = 0; k < nd && k < DISKS_MAX; k++) snprintf(r->disks[r->ndisks++], sizeof(r->disks[0]), "%.31s", disks[k]);
+        if (!(r->xml = strdup(xml))) st = set_error(ERR_NOMEM, "libvirt: records");
+        else { c->ncps++; st = rec_save(c); }
+    }
+    pthread_mutex_unlock(&c->cmu);
+    return st;
+}
+
+static void rec_drop(struct sp_ctx *c, const char *uuid, const char *name)
+{
+    pthread_mutex_lock(&c->cmu);
+    cprec_t *r = rec_find(c, uuid, name);
+    if (r) {
+        free(r->xml);
+        size_t i = (size_t)(r - c->cps);
+        memmove(&c->cps[i], &c->cps[i + 1], (c->ncps - i - 1) * sizeof(c->cps[0]));
+        c->ncps--;
+        if (rec_save(c) != OK) { log_warn("libvirt: %s", err_msg()); err_clear(); }
+    }
+    pthread_mutex_unlock(&c->cmu);
+}
+
+/* The description every checkpoint of this helper carries: the third
+ * ownership proof of source-providers.md 6.3. */
+static void cp_description(const struct sp_ctx *c, int64_t job, char *buf, size_t sz)
+{
+    snprintf(buf, sz, "c-backup daemon %s job %lld", c->pol->daemon_id, (long long)job);
+}
+
+static int cp_ours(const struct sp_ctx *c, virDomainCheckpointPtr cp)
+{
+    char *xml = virDomainCheckpointGetXMLDesc(cp, VIR_DOMAIN_CHECKPOINT_XML_NO_DOMAIN);
+    if (!xml) { err_clear(); return 0; }
+    char want[64];
+    snprintf(want, sizeof(want), "<description>c-backup daemon %s job ", c->pol->daemon_id);
+    int ours = strstr(xml, want) != NULL;
+    free(xml);
+    return ours;
+}
+
+/* The stored XML without its <parent>: the parent a checkpoint had when it
+ * was made may itself be gone, and libvirt makes a root of one without. */
+static char *strip_parent(const char *xml)
+{
+    xmlDocPtr doc = xmlReadMemory(xml, (int)strlen(xml), "checkpoint.xml", NULL,
+                                  XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
+    if (!doc) return NULL;
+    xmlNodePtr root = xmlDocGetRootElement(doc);
+    for (xmlNodePtr n = root ? root->children : NULL; n; ) {
+        xmlNodePtr next = n->next;
+        if (n->type == XML_ELEMENT_NODE && xmlStrcmp(n->name, (const xmlChar *)"parent") == 0) {
+            xmlUnlinkNode(n);
+            xmlFreeNode(n);
+        }
+        n = next;
+    }
+    xmlChar *out = NULL;
+    int len = 0;
+    xmlDocDumpMemory(doc, &out, &len);
+    xmlFreeDoc(doc);
+    char *s = out ? strdup((const char *)out) : NULL;
+    xmlFree(out);
+    return s;
+}
+
+typedef enum { CP_PRESENT = 0, CP_REDEFINED = 1, CP_REFUSED = 2, CP_UNKNOWN = 3, CP_FOREIGN = 4 } cp_state_t;
+
+static const char *cp_state_name(cp_state_t s)
+{
+    static const char *const n[] = { "present", "redefined", "refused", "unknown", "foreign" };
+    return n[s];
+}
+
+/*
+ * Make sure a checkpoint of the records is there (5.8): present and ours,
+ * or redefined from the stored XML with REDEFINE_VALIDATE, which has
+ * libvirt check the bitmap is in every image, recording and consistent.
+ * A refusal drops the record, unless the domain is shut off and refuse
+ * is 0: some libvirt versions cannot validate bitmaps of an inactive
+ * domain, so that is retried before its next session instead of costing a
+ * full read. A same-named checkpoint without our description is foreign:
+ * left alone, and never a base. *why gets libvirt's words for a refusal.
+ */
+static cp_state_t cp_ensure(struct sp_ctx *c, virDomainPtr dom, const char *uuid, const char *name,
+                            int refuse_offline, char *why, size_t wsz)
+{
+    if (why && wsz) why[0] = '\0';
+    pthread_mutex_lock(&c->cmu);
+    cprec_t *r = rec_find(c, uuid, name);
+    char *xml = r && r->xml ? strdup(r->xml) : NULL;
+    pthread_mutex_unlock(&c->cmu);
+    if (!r) return CP_UNKNOWN;
+    virDomainCheckpointPtr cp = virDomainCheckpointLookupByName(dom, name, 0);
+    if (cp) {
+        int ours = cp_ours(c, cp);
+        virDomainCheckpointFree(cp);
+        free(xml);
+        return ours ? CP_PRESENT : CP_FOREIGN;
+    }
+    err_clear();
+    char *x = xml ? strip_parent(xml) : NULL;
+    free(xml);
+    virDomainCheckpointPtr made = x ? virDomainCheckpointCreateXML(dom, x,
+        VIR_DOMAIN_CHECKPOINT_CREATE_REDEFINE | VIR_DOMAIN_CHECKPOINT_CREATE_REDEFINE_VALIDATE) : NULL;
+    free(x);
+    if (made) {
+        virDomainCheckpointFree(made);
+        log_info("libvirt: checkpoint %s of %s redefined from its stored XML", name, uuid);
+        return CP_REDEFINED;
+    }
+    if (why && wsz) snprintf(why, wsz, "%.300s", verr());
+    int running = dom_state(dom) != SP_STATE_STOPPED;
+    if (!running && !refuse_offline) {
+        log_warn("libvirt: checkpoint %s of %s could not be redefined while the domain is shut off "
+                 "(%s); tried again before its next backup", name, uuid, why ? why : verr());
+        return CP_REFUSED;
+    }
+    log_warn("libvirt: checkpoint %s of %s refused on redefine (%s); its record is dropped and the "
+             "next backup of that domain reads in full", name, uuid, why ? why : verr());
+    rec_drop(c, uuid, name);
+    return CP_REFUSED;
+}
+
+/* Delete a checkpoint of ours, by name, and its record: only one the
+ * records name or that carries our description. Metadata already gone is
+ * success; a foreign checkpoint under our name is left alone. broken: the
+ * bitmap is known to be missing or inconsistent (libvirt just refused it),
+ * and a delete that fails on that is completed as metadata only, since
+ * there is no bitmap left for libvirt to remove. */
+static status_t cp_delete_ex(struct sp_ctx *c, virDomainPtr dom, const char *uuid, const char *name, int broken)
+{
+    pthread_mutex_lock(&c->cmu);
+    int recorded = rec_find(c, uuid, name) != NULL;
+    pthread_mutex_unlock(&c->cmu);
+    virDomainCheckpointPtr cp = virDomainCheckpointLookupByName(dom, name, 0);
+    status_t st = OK;
+    if (cp) {
+        if (!cp_ours(c, cp)) {
+            log_warn("libvirt: checkpoint %s of %s does not carry this helper's description; left alone", name, uuid);
+            virDomainCheckpointFree(cp);
+            return OK;
+        }
+        if (virDomainCheckpointDelete(cp, 0) != 0) {
+            char why[320];
+            snprintf(why, sizeof(why), "%.300s", verr());
+            if (broken && virDomainCheckpointDelete(cp, VIR_DOMAIN_CHECKPOINT_DELETE_METADATA_ONLY) == 0)
+                log_warn("libvirt: checkpoint %s of %s deleted as metadata only (%s); a broken bitmap of "
+                         "that name may stay in the image, unused", name, uuid, why);
+            else
+                st = set_error(ERR_IO, "libvirt: deleting checkpoint %s of %s: %s", name, uuid, why);
+        }
+        virDomainCheckpointFree(cp);
+    } else {
+        err_clear();
+        if (!recorded) return OK;
+    }
+    if (st == OK) rec_drop(c, uuid, name);
+    return st;
+}
+
+static status_t cp_delete(struct sp_ctx *c, virDomainPtr dom, const char *uuid, const char *name)
+{
+    return cp_delete_ex(c, dom, uuid, name, 0);
+}
+
+/* A disk of the record, by target. Caller holds cmu. */
+static int rec_covers(const cprec_t *r, const char *target)
+{
+    for (size_t k = 0; r && k < r->ndisks; k++) if (strcmp(r->disks[k], target) == 0) return 1;
+    return 0;
+}
+
+/* The start-up step (5.8): every record on a defined domain looked up and
+ * redefined if missing, oldest first. */
+static void cp_redefine_all(struct sp_ctx *c)
+{
+    if (conn_ok(c) != OK) { err_clear(); return; }
+    pthread_mutex_lock(&c->cmu);
+    size_t n = c->ncps;
+    typedef struct { char uuid[VIR_UUID_STRING_BUFLEN]; char name[ARTEFACT_NAME_MAX]; int64_t t; } ent_t;
+    ent_t *v = calloc(n ? n : 1, sizeof(*v));
+    for (size_t i = 0; v && i < n; i++) {
+        snprintf(v[i].uuid, sizeof(v[i].uuid), "%s", c->cps[i].uuid);
+        snprintf(v[i].name, sizeof(v[i].name), "%s", c->cps[i].name);
+        v[i].t = c->cps[i].created;
+    }
+    pthread_mutex_unlock(&c->cmu);
+    if (!v) return;
+    /* Oldest first: a few records, an insertion sort. */
+    for (size_t i = 1; i < n; i++)
+        for (size_t k = i; k > 0 && v[k].t < v[k - 1].t; k--) {
+            ent_t t = v[k]; v[k] = v[k - 1]; v[k - 1] = t;
+        }
+    unsigned present = 0, redefined = 0, refused = 0;
+    for (size_t i = 0; i < n; i++) {
+        virDomainPtr dom = virDomainLookupByUUIDString(c->conn, v[i].uuid);
+        if (!dom) { err_clear(); continue; }      /* not defined now: kept for when it is */
+        cp_state_t s = cp_ensure(c, dom, v[i].uuid, v[i].name, 0, NULL, 0);
+        present += s == CP_PRESENT;
+        redefined += s == CP_REDEFINED;
+        refused += s == CP_REFUSED || s == CP_FOREIGN;
+        virDomainFree(dom);
+    }
+    if (n) log_info("libvirt: %zu checkpoint record(s): %u present, %u redefined, %u refused", n, present,
+                    redefined, refused);
+    free(v);
+}
+
+static status_t v_redefine(sp_ctx_t *c, const char *unit_id, const char *checkpoint, cJSON **result)
+{
+    *result = NULL;
+    virDomainPtr dom = NULL;
+    status_t st = domain(c, unit_id, &dom);
+    if (st != OK) return st;
+    char why[320];
+    cp_state_t s = cp_ensure(c, dom, unit_id, checkpoint, 1, why, sizeof(why));
+    virDomainFree(dom);
+    cJSON *res = cJSON_CreateObject();
+    if (!res) return set_error(ERR_NOMEM, "libvirt: redefine");
+    cJSON_AddStringToObject(res, "checkpoint", checkpoint);
+    cJSON_AddStringToObject(res, "state", cp_state_name(s));
+    if (why[0]) cJSON_AddStringToObject(res, "why", why);
+    *result = res;
+    return OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* list, describe                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -291,7 +698,7 @@ static status_t v_probe(sp_ctx_t *c, sp_probe_t *out)
         return OK;
     }
     unsigned long lv = 0, hv = 0;
-    (void)virConnectGetLibVersion(c->conn, &lv);
+    if (virConnectGetLibVersion(c->conn, &lv) != 0 && conn_lost(c)) (void)virConnectGetLibVersion(c->conn, &lv);
     (void)virConnectGetVersion(c->conn, &hv);
     out->available = 1;
     char v[128];
@@ -308,6 +715,7 @@ static status_t v_list(sp_ctx_t *c, sp_unit_cb cb, void *cbctx)
     if (st != OK) return st;
     virDomainPtr *doms = NULL;
     int n = virConnectListAllDomains(c->conn, &doms, VIR_CONNECT_LIST_DOMAINS_PERSISTENT);
+    if (n < 0 && conn_lost(c)) n = virConnectListAllDomains(c->conn, &doms, VIR_CONNECT_LIST_DOMAINS_PERSISTENT);
     if (n < 0) return set_error(ERR_IO, "libvirt: listing domains: %s", verr());
     for (int i = 0; i < n; i++) {
         char uuid[VIR_UUID_STRING_BUFLEN];
@@ -369,6 +777,8 @@ static status_t v_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
     /* Every disk, with what became of it (3.4: excluded ones are listed on
      * every snapshot, never quietly missing). */
     cJSON *dj = cJSON_CreateArray();
+    int nsnap = st == OK ? virDomainSnapshotNum(dom, 0) : -1;
+    if (nsnap < 0) err_clear();
     for (size_t i = 0; st == OK && def && i < def->n; i++) {
         vdisk_t *k = &def->disks[i];
         cJSON *o = cJSON_CreateObject();
@@ -391,6 +801,11 @@ static status_t v_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
         char tp[64];
         snprintf(tp, sizeof(tp), ".cbackup-unit/disks/%s", k->target);
         st = add_item(d, &cap, SP_ITEM_BLOCK, k->target, tp, k->source, bi.capacity, k->format);
+        /* 2.1: a qcow2 disk can carry a checkpoint, unless the domain has
+         * snapshots (libvirt refuses checkpoints beside external ones, and
+         * any snapshot is refused here rather than told apart). */
+        if (st == OK && strcmp(k->format, "qcow2") == 0 && nsnap == 0)
+            d->items[d->n_items - 1].caps |= SP_CAP_INCREMENTAL;
     }
     /* Verbatim, secrets included (section 6). */
     if (st == OK) {
@@ -583,39 +998,168 @@ static void *freeze_watchdog(void *arg)
     return NULL;
 }
 
-static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, const sp_begin_req_t *req, int agent)
+/* Append to a growing XML buffer; -1 when it does not fit. */
+static int xadd(char *buf, size_t cap, size_t *o, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static int xadd(char *buf, size_t cap, size_t *o, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *o, cap - *o, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - *o) return -1;
+    *o += (size_t)n;
+    return 0;
+}
+
+static const sp_item_base_t *base_entry(const sp_begin_req_t *req, const char *item)
+{
+    for (size_t i = 0; req && i < req->n_bases; i++)
+        if (req->bases[i].item_id && strcmp(req->bases[i].item_id, item) == 0) return &req->bases[i];
+    return NULL;
+}
+
+/*
+ * The backup XML (2.3): every included disk exported by its target name,
+ * incremental against base where it takes part in the chain and base's
+ * bitmap covers it (5.7: a disk added since is full), and the checkpoint
+ * XML covering every disk that takes part, created atomically with the
+ * backup so its bitmap starts at the export's point in time.
+ */
+static status_t build_xml(struct sp_session *s, const sp_unit_desc_t *unit, const vdef_t *def,
+                          const char *sock, const char *name, const char *cpname, const char *base,
+                          const int *inc, const int *want, int any_want, char **bxml, char **cxml)
+{
+    struct sp_ctx *c = s->c;
+    *bxml = *cxml = NULL;
+    size_t cap = 4096 + unit->n_items * (2 * PATH_MAX + 512);
+    char *x = malloc(cap);
+    if (!x) return set_error(ERR_NOMEM, "libvirt: backup xml");
+    int any_inc = 0;
+    for (size_t i = 0; i < unit->n_items; i++) any_inc |= inc[i];
+    size_t o = 0;
+    int bad = xadd(x, cap, &o, "<domainbackup mode='pull'>");
+    if (any_inc) bad |= xadd(x, cap, &o, "<incremental>%s</incremental>", base);
+    bad |= xadd(x, cap, &o, "<server transport='unix' socket='%s'/><disks>", sock);
+    for (size_t i = 0; i < unit->n_items; i++) {
+        const sp_item_desc_t *it = &unit->items[i];
+        if (it->kind != SP_ITEM_BLOCK) continue;
+        bad |= xadd(x, cap, &o, "<disk name='%s' backup='yes' type='file' exportname='%s'", it->id, it->id);
+        if (inc[i]) bad |= xadd(x, cap, &o, " backupmode='incremental' exportbitmap='cbk-%s'", it->id);
+        else if (any_inc) bad |= xadd(x, cap, &o, " backupmode='full'");
+        bad |= xadd(x, cap, &o, "><scratch file='%s/%s-%s.qcow2'/></disk>", c->pol->scratch_dir, name, it->id);
+    }
+    bad |= xadd(x, cap, &o, "</disks></domainbackup>");
+    if (bad) { free(x); return set_error(ERR_INVALID, "libvirt: the backup XML is too long"); }
+    *bxml = x;
+    if (!any_want) return OK;
+    size_t ccap = 2048 + def->n * 96;
+    char *y = malloc(ccap);
+    if (!y) { free(x); *bxml = NULL; return set_error(ERR_NOMEM, "libvirt: checkpoint xml"); }
+    char desc[128];
+    cp_description(c, s->job, desc, sizeof(desc));
+    o = 0;
+    bad = xadd(y, ccap, &o, "<domaincheckpoint><name>%s</name><description>%s</description><disks>", cpname, desc);
+    /* Every disk of the domain is named, so none gets a bitmap by default:
+     * only those that take part. */
+    for (size_t k = 0; k < def->n; k++) {
+        if (!def->disks[k].target[0]) continue;
+        int on = 0;
+        for (size_t i = 0; i < unit->n_items; i++)
+            if (want[i] && strcmp(unit->items[i].id, def->disks[k].target) == 0) on = 1;
+        bad |= xadd(y, ccap, &o, "<disk name='%s' checkpoint='%s'/>", def->disks[k].target, on ? "bitmap" : "no");
+    }
+    bad |= xadd(y, ccap, &o, "</disks></domaincheckpoint>");
+    if (bad) { free(x); free(y); *bxml = NULL; return set_error(ERR_INVALID, "libvirt: the checkpoint XML is too long"); }
+    *cxml = y;
+    return OK;
+}
+
+static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, const sp_begin_req_t *req,
+                             int agent, const vdef_t *def)
 {
     struct sp_ctx *c = s->c;
     char name[ARTEFACT_NAME_MAX];
     if (artefact_name(name, sizeof(name), c->pol->daemon_id, req->job_id, -1) != 0) return set_error(ERR_INVALID, "libvirt: name");
     char sock[PATH_MAX];
     snprintf(sock, sizeof(sock), "%s/%s.sock", c->pol->nbd_dir, name);
-    /* The backup XML: every included disk exported by its target name. */
-    size_t cap = 4096 + unit->n_items * (2 * PATH_MAX + 256);
-    char *xml = malloc(cap);
-    if (!xml) return set_error(ERR_NOMEM, "libvirt: backup xml");
-    size_t o = (size_t)snprintf(xml, cap, "<domainbackup mode='pull'><server transport='unix' socket='%s'/><disks>", sock);
-    for (size_t i = 0; i < unit->n_items; i++) {
+
+    /* The chain (5.8): which disks take part, and the base they read
+     * against, if it is this helper's and libvirt still has it or takes it
+     * back from the stored XML. */
+    size_t ni = unit->n_items;
+    int *want = calloc(ni ? ni : 1, sizeof(int)), *inc = calloc(ni ? ni : 1, sizeof(int));
+    const char **why = calloc(ni ? ni : 1, sizeof(char *));
+    if (!want || !inc || !why) { free(want); free(inc); free(why); return set_error(ERR_NOMEM, "libvirt: plans"); }
+    const char *base = NULL;
+    int any_want = 0;
+    for (size_t i = 0; i < ni; i++) {
         const sp_item_desc_t *it = &unit->items[i];
         if (it->kind != SP_ITEM_BLOCK) continue;
-        o += (size_t)snprintf(xml + o, cap - o, "<disk name='%s' backup='yes' type='file' exportname='%s'>"
-                              "<scratch file='%s/%s-%s.qcow2'/></disk>", it->id, it->id, c->pol->scratch_dir, name, it->id);
+        const sp_item_base_t *b = base_entry(req, it->id);
+        if (!b) continue;
+        if (!(it->caps & SP_CAP_INCREMENTAL)) { why[i] = "no-incremental-support"; continue; }
+        want[i] = 1;
+        any_want = 1;
+        if (!base && b->base_token && *b->base_token) base = b->base_token;
+    }
+    int base_ok = 0;
+    if (base && any_want) {
+        char w[320];
+        cp_state_t cs = cp_ensure(c, s->dom, s->uuid, base, 1, w, sizeof(w));
+        base_ok = cs == CP_PRESENT || cs == CP_REDEFINED;
+        if (!base_ok)
+            (void)sp_session_info_warn(&s->info, "checkpoint %s is %s%s%s; its disks read in full under a new one",
+                                       base, cp_state_name(cs), w[0] ? ": " : "", w);
+    }
+    /* What to delete once this session commits: the base, or the token
+     * handed over to retire, if it is ours. */
+    const char *old = any_want ? base : req->retire_token;
+    if (old && *old) {
+        pthread_mutex_lock(&c->cmu);
+        int mine = rec_find(c, s->uuid, old) != NULL;
+        pthread_mutex_unlock(&c->cmu);
+        if (mine) snprintf(s->old_cp, sizeof(s->old_cp), "%s", old);
+    }
+    char cpname[ARTEFACT_NAME_MAX] = "";
+    if (any_want && artefact_name(cpname, sizeof(cpname), c->pol->daemon_id, req->job_id, (int64_t)time(NULL)) != 0) {
+        free(want); free(inc); free(why);
+        return set_error(ERR_INVALID, "libvirt: checkpoint name");
+    }
+    pthread_mutex_lock(&c->cmu);
+    const cprec_t *br = base_ok ? rec_find(c, s->uuid, base) : NULL;
+    for (size_t i = 0; i < ni; i++) {
+        if (!want[i]) continue;
+        if (!base) why[i] = "no-base";
+        else if (!base_ok) why[i] = "token-invalid";
+        else if (!rec_covers(br, unit->items[i].id)) why[i] = "item-new";
+        else inc[i] = 1;
+    }
+    pthread_mutex_unlock(&c->cmu);
+
+    for (size_t i = 0; i < ni; i++) {
+        const sp_item_desc_t *it = &unit->items[i];
+        if (it->kind != SP_ITEM_BLOCK) continue;
         vread_t *r = &s->reads[s->n++];
         snprintf(r->item, sizeof(r->item), "%s", it->id);
         snprintf(r->socket, sizeof(r->socket), "%s", sock);
         snprintf(r->export_name, sizeof(r->export_name), "%.31s", it->id);
         r->nbd = 1;
     }
-    snprintf(xml + o, cap - o, "</disks></domainbackup>");
 
     char detail[PATH_MAX + 64];
     snprintf(detail, sizeof(detail), "libvirt-backup:%s", s->uuid);
     status_t st = OK;
-    if (s->has_holds && (st = s->holds.record(s->holds.ctx, SP_HOLD_EXPORT, detail, &s->export_hold)) != OK) { free(xml); return st; }
+    if (s->has_holds && (st = s->holds.record(s->holds.ctx, SP_HOLD_EXPORT, detail, &s->export_hold)) != OK)
+        goto out;
+    if (any_want) {
+        snprintf(detail, sizeof(detail), "checkpoint:%s:%s", s->uuid, cpname);
+        if (s->has_holds && (st = s->holds.record(s->holds.ctx, SP_HOLD_CHECKPOINT_NEW, detail, &s->cp_hold)) != OK)
+            goto out;
+    }
 
     /* Freeze for the begin alone, with a watchdog, thawed in every path. */
     int want_freeze = agent && c->pol->vm_freeze != 1;
-    if (!agent && c->pol->vm_freeze == 2) { free(xml); return set_error(ERR_INVALID, "libvirt: freeze is required and the guest agent is not connected"); }
+    if (!agent && c->pol->vm_freeze == 2) { st = set_error(ERR_INVALID, "libvirt: freeze is required and the guest agent is not connected"); goto out; }
     int frozen = 0;
     int64_t fhold = 0;
     freeze_wd_t wd = { s->dom, c->pol->vm_freeze_timeout_s, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0 };
@@ -623,7 +1167,7 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
     int wd_on = 0;
     if (want_freeze) {
         snprintf(detail, sizeof(detail), "freeze:%s", s->uuid);
-        if (s->has_holds && (st = s->holds.record(s->holds.ctx, SP_HOLD_FREEZE, detail, &fhold)) != OK) { free(xml); return st; }
+        if (s->has_holds && (st = s->holds.record(s->holds.ctx, SP_HOLD_FREEZE, detail, &fhold)) != OK) goto out;
         wd_on = pthread_create(&wth, NULL, freeze_watchdog, &wd) == 0;
         int n = virDomainFSFreeze(s->dom, NULL, 0, 0);
         if (n >= 0) frozen = 1;
@@ -637,11 +1181,35 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
     flags |= VIR_DOMAIN_BACKUP_BEGIN_PRESERVE_SHUTDOWN_DOMAIN;
 #endif
     int began = 0;
-    if (st == OK) {
-        if (virDomainBackupBegin(s->dom, xml, NULL, flags) == 0) began = 1;
-        else st = set_error(ERR_IO, "libvirt: the backup of %s did not begin: %s", unit->name ? unit->name : s->uuid, verr());
+    for (int attempt = 0; st == OK && !began && attempt < 2; attempt++) {
+        char *bxml = NULL, *cxml = NULL;
+        st = build_xml(s, unit, def, sock, name, cpname, base, inc, want, any_want, &bxml, &cxml);
+        if (st != OK) break;
+        int any_inc = 0;
+        for (size_t i = 0; i < ni; i++) any_inc |= inc[i];
+        if (any_want) snprintf(s->new_cp, sizeof(s->new_cp), "%s", cpname);
+        if (virDomainBackupBegin(s->dom, bxml, cxml, flags) == 0) began = 1;
+        else if (any_inc && attempt == 0) {
+            /* 5.5: libvirt refuses an incremental whose bitmap is missing,
+             * not recording or inconsistent (an unclean QEMU stop). The
+             * base is ours and useless: deleted, and the begin repeated
+             * as a full read under a new checkpoint. */
+            char w[320];
+            snprintf(w, sizeof(w), "%.300s", verr());
+            log_warn("libvirt: the incremental backup of %s against %s was refused (%s); reading in full",
+                     s->uuid, base, w);
+            (void)sp_session_info_warn(&s->info, "the incremental against %s was refused (%s); read in full", base, w);
+            if (cp_delete_ex(c, s->dom, s->uuid, base, 1) != OK) { log_warn("%s", err_msg()); err_clear(); }
+            s->old_cp[0] = '\0';
+            for (size_t i = 0; i < ni; i++) if (inc[i]) { inc[i] = 0; why[i] = "token-invalid"; }
+            s->new_cp[0] = '\0';
+        } else {
+            s->new_cp[0] = '\0';
+            st = set_error(ERR_IO, "libvirt: the backup of %s did not begin: %s", unit->name ? unit->name : s->uuid, verr());
+        }
+        free(bxml);
+        free(cxml);
     }
-    free(xml);
     if (want_freeze) {
         pthread_mutex_lock(&wd.mu);
         wd.done = 1;
@@ -653,23 +1221,71 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
             log_warn("libvirt: thaw of %s: %s", s->uuid, verr());
         if (s->has_holds && fhold && s->holds.clear(s->holds.ctx, fhold) != OK) err_clear();
     }
-    if (st == OK && (st = hand_over(c, sock, 10000)) != OK) {
-        (void)virDomainAbortJob(s->dom);
-        began = 0;
+    if (began) s->online = 1;
+    /* The new checkpoint, recorded with the XML it has now before anything
+     * is read: from here on it can be redefined, and is the base of the
+     * next session if this one commits. */
+    if (st == OK && s->new_cp[0]) {
+        virDomainCheckpointPtr cp = virDomainCheckpointLookupByName(s->dom, s->new_cp, 0);
+        char *cx = cp ? virDomainCheckpointGetXMLDesc(cp, VIR_DOMAIN_CHECKPOINT_XML_SECURE) : NULL;
+        if (cp) virDomainCheckpointFree(cp);
+        char covered[DISKS_MAX][32];
+        size_t nc = 0;
+        for (size_t i = 0; i < ni && nc < DISKS_MAX; i++)
+            if (want[i]) snprintf(covered[nc++], sizeof(covered[0]), "%.31s", unit->items[i].id);
+        if (!cx) st = set_error(ERR_IO, "libvirt: the new checkpoint %s of %s: %s", s->new_cp, s->uuid, verr());
+        else st = rec_add(c, s->uuid, s->new_cp, cx, covered, nc);
+        if (st == OK && (!(s->info.new_token = strdup(s->new_cp)) || !(s->info.new_token_blob = strdup(cx))))
+            st = set_error(ERR_NOMEM, "libvirt: token");
+        free(cx);
     }
-    if (!began && s->has_holds && s->export_hold) {
-        if (s->holds.clear(s->holds.ctx, s->export_hold) != OK) err_clear();
-        s->export_hold = 0;
+    if (st == OK) st = hand_over(c, sock, 10000);
+    if (st == OK) {
+        /* The export's bitmap for each incremental disk. */
+        for (size_t i = 0, k = 0; i < ni; i++) {
+            if (unit->items[i].kind != SP_ITEM_BLOCK) continue;
+            if (inc[i]) snprintf(s->reads[k].bitmap, sizeof(s->reads[k].bitmap), "cbk-%.40s", unit->items[i].id);
+            k++;
+        }
+        s->info.plans = calloc(ni ? ni : 1, sizeof(*s->info.plans));
+        if (!s->info.plans) st = set_error(ERR_NOMEM, "libvirt: plans");
+        for (size_t i = 0; st == OK && i < ni; i++) {
+            if (unit->items[i].kind != SP_ITEM_BLOCK) continue;
+            sp_item_plan_t *pl = &s->info.plans[s->info.n_plans++];
+            pl->item_id = unit->items[i].id;
+            pl->mode = inc[i] ? SP_READ_INCREMENTAL : SP_READ_FULL;
+            pl->reason = inc[i] ? "incremental" : why[i] ? why[i] : "no-incremental-support";
+        }
     }
-    if (st != OK) return st;
-    s->online = 1;
+    if (st != OK) {
+        /* Nothing from this session stays: the job, its checkpoint, its record. */
+        char keep[512];
+        snprintf(keep, sizeof(keep), "%.500s", err_msg());
+        if (s->online) (void)virDomainAbortJob(s->dom);
+        s->online = 0;
+        if (s->new_cp[0] && cp_delete(c, s->dom, s->uuid, s->new_cp) != OK) err_clear();
+        s->new_cp[0] = '\0';
+        s->old_cp[0] = '\0';
+        set_error(st, "%s", keep);
+        goto out;
+    }
     int quiesced = frozen && !wd.thawed;
     if (frozen && wd.thawed)
         (void)sp_session_info_warn(&s->info, "freeze held past %u s; thawed before backup start", c->pol->vm_freeze_timeout_s);
     s->info.achieved = quiesced ? SP_CONSIST_QUIESCED : SP_CONSIST_CRASH;
     s->info.consist_flags |= quiesced ? SP_CF_FROZEN : 0;
     if (!agent) (void)sp_session_info_warn(&s->info, "no guest agent connected; crash-consistent");
-    return OK;
+out:
+    if (st != OK) {
+        if (s->has_holds && s->export_hold && s->holds.clear(s->holds.ctx, s->export_hold) != OK) err_clear();
+        s->export_hold = 0;
+        if (s->has_holds && s->cp_hold && s->holds.clear(s->holds.ctx, s->cp_hold) != OK) err_clear();
+        s->cp_hold = 0;
+    }
+    free(want);
+    free(inc);
+    free(why);
+    return st;
 }
 
 /* ------------------------------------------------------------------ */
@@ -692,6 +1308,7 @@ static status_t v_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     if (!s) return set_error(ERR_NOMEM, "libvirt: session");
     s->c = c;
     snprintf(s->uuid, sizeof(s->uuid), "%.36s", unit->unit_id);
+    s->job = req->job_id;
     if (req->holds) { s->holds = *req->holds; s->has_holds = 1; }
     status_t st = domain(c, unit->unit_id, &s->dom);
     int state = st == OK ? dom_state(s->dom) : -1;
@@ -700,16 +1317,29 @@ static status_t v_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         int managed = virDomainHasManagedSaveImage(s->dom, 0) == 1;
         s->info.achieved = managed ? SP_CONSIST_CRASH : SP_CONSIST_OFFLINE;
         if (managed) (void)sp_session_info_warn(&s->info, "a managed save image exists; the disks belong with a memory state not captured");
+        /* No QEMU, no bitmap: a shut-off disk reads in full, and the chain
+         * is left as it is (its bitmaps keep recording from where they
+         * were, so it is still a valid base). */
+        s->info.plans = st == OK ? calloc(unit->n_items ? unit->n_items : 1, sizeof(*s->info.plans)) : NULL;
+        for (size_t i = 0; s->info.plans && i < unit->n_items; i++) {
+            if (unit->items[i].kind != SP_ITEM_BLOCK) continue;
+            sp_item_plan_t *pl = &s->info.plans[s->info.n_plans++];
+            pl->item_id = unit->items[i].id;
+            pl->mode = SP_READ_FULL;
+            pl->reason = "no-incremental-support";
+        }
     } else if (st == OK) {
-        /* The live XML says whether the agent is connected. */
+        /* The live XML says whether the agent is connected, and names every
+         * disk the checkpoint has to account for. */
         char *live = virDomainGetXMLDesc(s->dom, 0);
         vdef_t *ld = calloc(1, sizeof(*ld));
         int agent = 0;
-        if (live && ld && parse_def(live, ld) == OK) agent = ld->agent_connected && state == SP_STATE_RUNNING;
-        err_clear();
+        if (!ld) st = set_error(ERR_NOMEM, "libvirt: session");
+        else if (live && parse_def(live, ld) == OK) agent = ld->agent_connected && state == SP_STATE_RUNNING;
+        else { err_clear(); memset(ld, 0, sizeof(*ld)); }
         free(live);
+        if (st == OK) st = online_begin(s, unit, req, agent, ld);
         free(ld);
-        st = online_begin(s, unit, req, agent);
     }
     /* TPM state is read live from its own UUID's directory. */
     snprintf(s->tpm_dir, sizeof(s->tpm_dir), "%.4000s/%.36s", c->pol->tpm_dir, s->uuid);
@@ -720,11 +1350,13 @@ static status_t v_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         char why[512];
         snprintf(why, sizeof(why), "%.500s", err_msg());
         if (s->online) (void)virDomainAbortJob(s->dom);
+        if (s->new_cp[0] && cp_delete(c, s->dom, s->uuid, s->new_cp) != OK) err_clear();
         for (size_t i = 0; i < s->n; i++) {
             kill_qemu_nbd(&s->reads[i]);
             if (s->has_holds && s->reads[i].hold && s->holds.clear(s->holds.ctx, s->reads[i].hold) != OK) err_clear();
         }
         if (s->has_holds && s->export_hold && s->holds.clear(s->holds.ctx, s->export_hold) != OK) err_clear();
+        if (s->has_holds && s->cp_hold && s->holds.clear(s->holds.ctx, s->cp_hold) != OK) err_clear();
         session_free(s);
         return set_error(st, "%s", why);
     }
@@ -745,6 +1377,7 @@ static status_t v_block_where(sp_session_t *s, const sp_item_desc_t *item, cJSON
             cJSON_AddStringToObject(obj, "kind", "nbd");
             cJSON_AddStringToObject(obj, "socket", r->socket);
             cJSON_AddStringToObject(obj, "export", r->export_name);
+            if (r->bitmap[0]) cJSON_AddStringToObject(obj, "bitmap", r->bitmap);
             if (!s->online && r->path[0]) cJSON_AddStringToObject(obj, "watch", r->path);
         } else {
             cJSON_AddStringToObject(obj, "kind", "file");
@@ -766,11 +1399,31 @@ static status_t v_tree_root(sp_session_t *s, const sp_item_desc_t *item, char *b
 
 static status_t v_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapshot_id)
 {
-    (void)outcome; (void)snapshot_id;
+    (void)snapshot_id;
     if (s->online) {
         if (virDomainAbortJob(s->dom) != 0) log_warn("libvirt: ending the backup of %s: %s", s->uuid, verr());
         if (s->has_holds && s->export_hold && s->holds.clear(s->holds.ctx, s->export_hold) != OK) err_clear();
     }
+    /*
+     * Checkpoints settle with the snapshot (5.8): committed, the base (or
+     * the token retired) goes and the new one stays as the next base;
+     * aborted, the new one goes and the base stays. A delete that fails
+     * keeps the hold, and the sweep retries it.
+     */
+    int settled = 1;
+    if (outcome == SP_END_COMMITTED && s->old_cp[0]) {
+        if (cp_delete(s->c, s->dom, s->uuid, s->old_cp) != OK) {
+            log_warn("libvirt: %s; the sweep will retry", err_msg());
+            err_clear();
+        }
+    } else if (outcome != SP_END_COMMITTED && s->new_cp[0]) {
+        if (cp_delete(s->c, s->dom, s->uuid, s->new_cp) != OK) {
+            log_warn("libvirt: %s; the sweep will retry", err_msg());
+            err_clear();
+            settled = 0;
+        }
+    }
+    if (settled && s->has_holds && s->cp_hold && s->holds.clear(s->holds.ctx, s->cp_hold) != OK) err_clear();
     for (size_t i = 0; i < s->n; i++) {
         vread_t *r = &s->reads[i];
         /* A change to an image read offline is caught by the daemon as the
@@ -814,6 +1467,25 @@ static status_t v_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
         status_t st = OK;
         if (strncmp(in->detail, "qemu-nbd:", 9) == 0) {
             kill_by_socket(in->detail + 9);
+        } else if (strncmp(in->detail, "checkpoint:", 11) == 0) {
+            /* A session that never settled its new checkpoint: it is not
+             * the base of anything that committed through the helper, so
+             * it goes (the daemon's token for it, if any, then reads in
+             * full). */
+            char uuid[VIR_UUID_STRING_BUFLEN] = "";
+            const char *u = in->detail + 11, *colon = strchr(u, ':');
+            virDomainPtr dom = NULL;
+            if (!colon || (size_t)(colon - u) >= sizeof(uuid)) st = set_error(ERR_INVALID, "libvirt: bad hold %s", in->detail);
+            else {
+                snprintf(uuid, sizeof(uuid), "%.*s", (int)(colon - u), u);
+                if (domain(c, uuid, &dom) == OK) {
+                    st = cp_delete(c, dom, uuid, colon + 1);
+                    virDomainFree(dom);
+                } else {
+                    err_clear();
+                    rec_drop(c, uuid, colon + 1);
+                }
+            }
         } else if (strncmp(in->detail, "libvirt-backup:", 15) == 0 || strncmp(in->detail, "freeze:", 7) == 0) {
             const char *uuid = strchr(in->detail, ':') + 1;
             virDomainPtr dom = NULL;
@@ -1114,16 +1786,23 @@ status_t libvirt_backend_init(const helper_policy_t *pol, helper_backend_t *out)
     if (!c) return set_error(ERR_NOMEM, "libvirt: backend");
     c->pol = pol;
     pthread_mutex_init(&c->mu, NULL);
+    pthread_mutex_init(&c->cmu, NULL);
     snap_host_setup(pol, &c->tools, &c->snap);
+    rec_load(c);
     if (conn_ok(c) != OK) {
         log_warn("libvirt: %s; continuing, the connection is retried on use", err_msg());
         err_clear();
+    } else {
+        /* 5.8: libvirt may have lost checkpoint metadata (a host reboot on
+         * Unraid always does); what the records say should exist is put
+         * back before any session runs. */
+        cp_redefine_all(c);
     }
     *out = (helper_backend_t){
         .name = "libvirt", .ops = &k_libvirt_ops, .ctx = c,
         .blob_data = v_blob_data, .unit_state = v_unit_state, .set_running = v_set_running,
         .block_where = v_block_where, .mount_root = v_mount_root, .define = v_define,
-        .install_state = v_install_state,
+        .install_state = v_install_state, .redefine = v_redefine,
     };
     return OK;
 }
@@ -1135,6 +1814,8 @@ void libvirt_backend_fini(helper_backend_t *b)
     if (c->conn) virConnectClose(c->conn);
     for (size_t i = 0; i < c->nblobs; i++) free(c->blobs[i].data);
     free(c->blobs);
+    rec_free_all(c);
+    pthread_mutex_destroy(&c->cmu);
     pthread_mutex_destroy(&c->mu);
     free(c);
     b->ctx = NULL;
