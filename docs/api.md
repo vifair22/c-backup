@@ -726,6 +726,7 @@ plain verify, with the same counts on a healthy repository. The job's
 {"run_id":12,"level":"deep","repair":false,"dry_run":true,"checked":52,
  "ok":52,"repaired":0,"recoverable":0,"unrecoverable":0,"missing":0,
  "failed":false,"unsettled_files":0,
+ "pack_structures_repaired":0,"pack_structures_recoverable":0,
  "packs_unwalkable":0,"packs_restored":0,"packs_salvaged":0,
  "unreferenced_dropped_bytes":0,"unreferenced_dropped_ranges":0,"unreferenced_dropped":[]}
 ```
@@ -740,13 +741,18 @@ possibly torn (below); a notice, never a failure.
 whose own header, tail copies or CRC table disagreed with their redundancy
 (within parity, so not loss): found by every level, each a `pack-NNNNNNNNNN`
 finding with status `recoverable`, or `repaired` when a repairing run
-rewrote them.
+rewrote them. Each such pack is also one item in the run's totals: it adds
+one to `checked` and one to `recoverable` or `repaired`, so the counts on
+the run record (`GET /repos/<id>/verify`, what `c-backup verify` prints and
+the verify metrics read) agree with its findings. These two fields say how
+much of those totals is pack structure rather than objects.
 
 `packs_unwalkable` counts packs whose entry headers cannot be walked even
 with parity (the packs gc leaves as they are); each is a finding named
 `pack-NNNNNNNNNN` with status `unwalkable pack`, at every level, and fails
 the run. `packs_restored` counts those a repairing run made walkable again
-by rebuilding their headers from the index; each is a `repaired` finding.
+by rebuilding their headers from the index; each is a `repaired` finding,
+and counted like one: one in `checked` and one in `repaired`.
 `packs_salvaged` counts packs that could not be rebuilt (a damaged header
 had no index row) and were salvaged instead: every indexed entry copied into
 a new pack, a `salvaged` finding, and the bytes no row covers dropped and
@@ -772,10 +778,10 @@ A run (`GET /repos/<id>/verify`) carries these counts:
 
 | Field | Meaning |
 |---|---|
-| `checked` | Items examined: every indexed object, plus every regular-file entry that names no content. Always `ok + repaired + recoverable + unrecoverable + missing` |
+| `checked` | Items examined: every indexed object, plus every regular-file entry that names no content, plus each `pack-NNNNNNNNNN` finding counted as `recoverable` or `repaired` (a pack whose header, tails or CRC table were damaged, or whose headers were restored). Always `ok + repaired + recoverable + unrecoverable + missing` |
 | `ok` | Intact on disk. Never counts a failure: a run with anything missing or unrecoverable has `ok` below `checked` |
-| `repaired` | Damaged, corrected from parity, and the correction written to disk. Always 0 with `repair=0` |
-| `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed |
+| `repaired` | Damaged, corrected from parity, and the correction written to disk; or an object whose indexed copy is beyond parity, moved by the run to another copy proven to be it (below). Always 0 with `repair=0` |
+| `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed. Also an object whose indexed copy is beyond parity while another copy of it is proven intact, with repair off |
 | `unrecoverable` | Damaged beyond what parity can rebuild. Data loss |
 | `missing` | Indexed but absent: no pack entry, or a pack file that has gone. Also each index row of a regular file that names no file content: no object, or one that is neither `FILE` nor `CHUNKLIST` (see below). Data loss |
 | `affected_files` | Distinct file paths referencing a lost object |
@@ -803,6 +809,19 @@ they are gone.) Each finding also carries:
 
 An object no file references - a manifest tree, or one from an evicted
 snapshot - reports zero files; that is not a claim the loss is harmless.
+
+An object whose indexed copy cannot be read even with parity is not loss
+if the repository holds another copy of it: two backups can store one
+object before either commits it, and gc keeps the other copy and moves the
+index to it once proven (`index_relocated`). Verify runs the same search
+before it calls anything lost: every pack's entry headers are walked and a
+copy that is not the indexed one is read and checked against its name, as
+gc proves one. With such a copy the object is `recoverable` (repair off;
+the log names the pack and offset of the good copy) or `repaired` (the run
+moved the index to it and read the object back through it). Without one it
+is lost as before. The search runs only when the walk found something
+unreadable, so a clean run pays nothing for it. An encrypted copy cannot be
+proven without the key.
 
 Every level also checks the index for regular files that name no content
 object: a file a snapshot lists and no restore can produce. Backups by a
@@ -1099,7 +1118,10 @@ logged after the backup's phase profile.
 
 Gc and replicate also put a one-line summary in their journal entry, such
 as `swept 12 objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale
-temp files removed` or `target already up to date (3 snapshots present)`. A
+temp files removed` or `target already up to date (3 snapshots present)`.
+A verify that passes journals its run's totals, such as `deep verify (check
+only), run 12: 53 checked, 52 ok, 0 repaired, 1 recoverable (1 of them pack
+structure)`; one that fails journals its error, which carries them. A
 dry-run gc removes nothing, temp files included; its pack figures are zero
 because compaction does not run.
 

@@ -488,6 +488,17 @@ status_t store_index_put_staged(cutils_db_t *db, int64_t repo_id,
  * an objects row naming a pack for any other reason is left to reindex as
  * before. Runs before store_index_drop_staged, which then drops the rows
  * this returns to 'staged'.
+ *
+ * The set of unannounced packs is one uncorrelated subquery, matched as a
+ * (repo, location) pair (B153). It used to correlate on objects.repo_id,
+ * which made SQLite rebuild the DISTINCT b-tree over the repository's whole
+ * pack_objects for every objects row: sum(n^2) per repository, 4.5 minutes
+ * of start-up at 56k objects with nothing to change, and hours beyond that.
+ * Now pack_objects is read once and an objects row is only visited when its
+ * repository has an unannounced pack. location holds a pack number as the
+ * decimal text db_pack_commit writes, which is what CAST(... AS TEXT) gives;
+ * every column in the pair is NOT NULL, so IN cannot meet a NULL.
+ * tests/test_startup_plans.c holds the plan to that shape.
  */
 status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id)
 {
@@ -496,10 +507,10 @@ status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id)
     const char *only = repo_id > 0 ? " AND po.repo_id = ?" : "";
     char upd[512], del[256];
     snprintf(upd, sizeof(upd),
-             "UPDATE objects SET location = 'staged' WHERE location IN"
-             " (SELECT DISTINCT CAST(po.pack_id AS TEXT) FROM pack_objects po"
-             "   WHERE po.repo_id = objects.repo_id%s AND NOT EXISTS"
-             "   (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id AND p.id = po.pack_id))",
+             "UPDATE objects SET location = 'staged' WHERE (repo_id, location) IN"
+             " (SELECT DISTINCT po.repo_id, CAST(po.pack_id AS TEXT) FROM pack_objects po"
+             "   WHERE NOT EXISTS"
+             "   (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id AND p.id = po.pack_id)%s)",
              only);
     snprintf(del, sizeof(del),
              "DELETE FROM pack_objects AS po WHERE NOT EXISTS"

@@ -80,9 +80,20 @@ static status_t clear_degraded(cutils_db_t *db, const char *repo)
  * located only in it become absent; an objects row that names it but
  * resolves to a copy in another pack is pointed at that copy instead, so
  * a surviving copy keeps serving reads.
+ *
+ * Every statement here is keyed: the pack's pack_objects rows through
+ * pack_objects_by_pack, and the strays (rows naming the pack whose
+ * pack_objects row is elsewhere or nowhere) one by one, by primary key,
+ * from the list find_strays made. Finding those by location scanned the
+ * repository's objects twice per missing pack, and a repair accepting
+ * hundreds of lost packs from a large repository is a scan per pack inside
+ * an HTTP request (B153). After the first statement the rows still naming
+ * the pack are exactly the strays, so this is the same change the scans
+ * made; each stray statement also requires the location it was found at,
+ * so a row something else moved since is left alone.
  */
 static status_t drop_pack(cutils_db_t *db, const char *repo, const char *pack,
-                          uint64_t *out_absent)
+                          const db_result_t *strays, int *cursor, uint64_t *out_absent)
 {
     int n = 0, m = 0;
     if (db_txn_begin(db) != OK) return set_error(ERR_IO, "pack presence: begin");
@@ -91,19 +102,30 @@ static status_t drop_pack(cutils_db_t *db, const char *repo, const char *pack,
             "UPDATE objects SET location = 'absent', phys_size = NULL"
             " WHERE repo_id = ? AND hash IN"
             " (SELECT hash FROM pack_objects WHERE repo_id = ? AND pack_id = ?)",
-            (const char *[]){ repo, repo, pack, NULL }, &n) != 0 ||
-        db_write(db,
-            "UPDATE objects SET location ="
-            " (SELECT CAST(po.pack_id AS TEXT) FROM pack_objects po"
-            "   WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)"
-            " WHERE repo_id = ? AND location = ? AND EXISTS"
-            " (SELECT 1 FROM pack_objects po WHERE po.repo_id = objects.repo_id"
-            "   AND po.hash = objects.hash)",
-            (const char *[]){ repo, pack, NULL }, NULL) != 0 ||
-        db_write(db,
-            "UPDATE objects SET location = 'absent', phys_size = NULL"
-            " WHERE repo_id = ? AND location = ?",
-            (const char *[]){ repo, pack, NULL }, &m) != 0 ||
+            (const char *[]){ repo, repo, pack, NULL }, &n) != 0;
+    /* The strays come ordered by pack, as the missing packs do. */
+    unsigned long want = strtoul(pack, NULL, 10);
+    for (; !bad && strays && *cursor < strays->nrows; (*cursor)++) {
+        const char *hash = strays->rows[*cursor][0], *loc = strays->rows[*cursor][1];
+        unsigned long at = strtoul(loc, NULL, 10);
+        if (at < want) continue;
+        if (at > want) break;
+        int k = 0;
+        bad = db_write(db,
+                  "UPDATE objects SET location ="
+                  " (SELECT CAST(po.pack_id AS TEXT) FROM pack_objects po"
+                  "   WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)"
+                  " WHERE repo_id = ? AND hash = ? AND location = ? AND EXISTS"
+                  " (SELECT 1 FROM pack_objects po WHERE po.repo_id = objects.repo_id"
+                  "   AND po.hash = objects.hash)",
+                  (const char *[]){ repo, hash, pack, NULL }, NULL) != 0 ||
+              db_write(db,
+                  "UPDATE objects SET location = 'absent', phys_size = NULL"
+                  " WHERE repo_id = ? AND hash = ? AND location = ?",
+                  (const char *[]){ repo, hash, pack, NULL }, &k) != 0;
+        if (k > 0) m += k;
+    }
+    bad = bad ||
         db_write(db, "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
             (const char *[]){ repo, pack, NULL }, NULL) != 0 ||
         db_write(db, "DELETE FROM packs WHERE repo_id = ? AND id = ?",
@@ -118,6 +140,39 @@ static status_t drop_pack(cutils_db_t *db, const char *repo, const char *pack,
     }
     if (db_txn_commit(db) != OK) return set_error(ERR_IO, "pack presence: commit");
     *out_absent = (uint64_t)(n > 0 ? n : 0) + (uint64_t)(m > 0 ? m : 0);
+    return OK;
+}
+
+/*
+ * The objects rows naming one of the missing packs whose pack_objects row
+ * is not in that pack, ordered by pack: one pass over the repository's
+ * objects for the whole check, not two per pack. There are normally none.
+ * missing is ordered by pack number, as the packs query returns it.
+ */
+static status_t find_strays(cutils_db_t *db, const char *repo, char (*missing)[24],
+                            uint32_t nmissing, db_result_t **out)
+{
+    *out = NULL;
+    size_t cap = 256 + (size_t)nmissing * 16;
+    char *sql = malloc(cap);
+    if (!sql) return set_error(ERR_NOMEM, "pack presence: strays");
+    size_t len = (size_t)snprintf(sql, cap,
+        "SELECT o.hash, o.location FROM objects o"
+        " WHERE o.repo_id = ? AND o.location IN (");
+    for (uint32_t i = 0; i < nmissing; i++)
+        len += (size_t)snprintf(sql + len, cap - len, "%s'%lu'", i ? "," : "",
+                                strtoul(missing[i], NULL, 10));
+    snprintf(sql + len, cap - len,
+        ") AND NOT EXISTS (SELECT 1 FROM pack_objects po WHERE po.repo_id = o.repo_id"
+        "   AND po.hash = o.hash AND CAST(po.pack_id AS TEXT) = o.location)"
+        " ORDER BY CAST(o.location AS INTEGER)");
+    int rc = db_execute_once(db, sql, (const char *[]){ repo, NULL }, out);
+    free(sql);
+    if (rc != 0) {
+        db_result_free(*out);
+        *out = NULL;
+        return set_error(ERR_IO, "pack presence: cannot list the rows naming missing packs");
+    }
     return OK;
 }
 
@@ -222,9 +277,12 @@ status_t pack_presence_check(cutils_db_t *db, int64_t repo_id, int accept_missin
         return st;
     }
 
+    db_result_t *strays = NULL;
+    int cursor = 0;
+    st = find_strays(db, repo, missing, res.packs_missing, &strays);
     for (uint32_t i = 0; i < res.packs_missing && st == OK; i++) {
         uint64_t n = 0;
-        st = drop_pack(db, repo, missing[i], &n);
+        st = drop_pack(db, repo, missing[i], strays, &cursor, &n);
         if (st != OK) break;
         res.packs_dropped++;
         res.objects_absent += n;
@@ -237,6 +295,7 @@ status_t pack_presence_check(cutils_db_t *db, int64_t repo_id, int accept_missin
                  (unsigned long long)n);
         alert(db, repo_id, "c-backup: pack missing", msg);
     }
+    db_result_free(strays);
     if (st == OK && pack_presence_degraded(db, repo_id, NULL, 0)) st = clear_degraded(db, repo);
     res.degraded = pack_presence_degraded(db, repo_id, NULL, 0);
     free(missing);

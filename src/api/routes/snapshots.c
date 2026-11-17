@@ -1353,6 +1353,26 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                                    (unsigned long long)vr.dropped[d].length);
         if (vo < sizeof(vj)) snprintf(vj + vo, sizeof(vj) - vo, "]}");
         job_set_result(progress_ctx, vj);
+        /* The journal's line for a run that passed, in the run's own totals
+         * (a failed one journals the error, which carries them). Without it
+         * a verify that repaired or found recoverable damage journalled an
+         * empty message (NIT-30). */
+        if (st == OK && vr.run_id > 0) {
+            char vs[320];
+            int sn = snprintf(vs, sizeof(vs),
+                     "%s verify%s, run %lld: %llu checked, %llu ok, %llu repaired, "
+                     "%llu recoverable", lvl, j->verify_repair ? "" : " (check only)",
+                     (long long)vr.run_id, (unsigned long long)vr.checked,
+                     (unsigned long long)vr.ok, (unsigned long long)vr.repaired,
+                     (unsigned long long)vr.recoverable);
+            uint64_t ps = vr.pack_structures_repaired + vr.pack_structures_recoverable +
+                          vr.packs_restored;
+            if (ps > 0 && sn > 0 && (size_t)sn < sizeof(vs))
+                snprintf(vs + sn, sizeof(vs) - (size_t)sn,
+                         " (%llu of them pack structure%s)", (unsigned long long)ps,
+                         ps == 1 ? "" : "s");
+            job_set_summary(progress_ctx, vs);
+        }
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*
          * A replica carries the source's identity, so the source's marker is
