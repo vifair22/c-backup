@@ -267,6 +267,7 @@ static int      g_graves;
 static uint64_t g_wal_bytes;     /* the WAL as of the last commit before the cut */
 static uint64_t g_gate_wal;      /* the WAL when the latest make_durable began */
 static uint64_t g_durable_wal;   /* the WAL a completed make_durable covers */
+static int      g_wal_dir_synced; /* H_DIR synced since the -wal was created */
 static int      g_page_size;
 static char     g_model_err[256];   /* set under g_mu, reported outside it */
 
@@ -407,7 +408,20 @@ static int hook_sync(int fd, int data_only)
 {
     (void)data_only;
     char p[PATH_MAX];
-    if (fd_path(fd, p, sizeof(p)) != 0 || !in_scope(p)) return FAULT_FS_PASS;
+    if (fd_path(fd, p, sizeof(p)) != 0) return FAULT_FS_PASS;
+    /* state.db's directory: the -wal is created when the database is first
+     * read in a trial, so its name is durable only once this is synced
+     * (wal_sync.h). A step like any other, so a cut can land before it. */
+    if (strcmp(p, H_DIR) == 0) {
+        pthread_mutex_lock(&g_mu);
+        if (g_active) {
+            if (!step_locked(K_FS)) { pthread_mutex_unlock(&g_mu); errno = EIO; return -1; }
+            g_wal_dir_synced = 1;
+        }
+        pthread_mutex_unlock(&g_mu);
+        return FAULT_FS_PASS;
+    }
+    if (!in_scope(p)) return FAULT_FS_PASS;
     pthread_mutex_lock(&g_mu);
     if (!step_locked(K_FS)) { pthread_mutex_unlock(&g_mu); errno = EIO; return -1; }
     struct stat sb;
@@ -493,6 +507,7 @@ static void model_start(int crash_at)
     g_wal_bytes = 0;
     g_gate_wal = 0;
     g_durable_wal = 0;
+    g_wal_dir_synced = 0;
     memset(g_count, 0, sizeof(g_count));
     g_active = 1;
     pthread_mutex_unlock(&g_mu);
@@ -1480,7 +1495,10 @@ static int trial(const scenario_t *s, int crash_at, int total, int counting, tal
     int steps = g_steps;
     step_kind_t at = crash_at && crash_at <= MAX_STEPS ? (step_kind_t)g_kind[crash_at] : 0;
     /* Lost: the database file, which nothing changed, and the WAL up to
-     * the last make_durable's sync; an unsynced tail is gone. */
+     * the last make_durable's sync; an unsynced tail is gone, and so is the
+     * whole -wal if its directory entry was never synced: the file was
+     * created in this trial and its name would not survive the cut. */
+    if (!g_wal_dir_synced) g_durable_wal = 0;
     {
         /* Which the model depends on: had anything checkpointed, a cut
          * could keep database pages without the WAL frames they came from. */

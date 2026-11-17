@@ -3,17 +3,15 @@
 #include "db_txn.h"
 
 #include "phase_timer.h"
+#include "wal_sync.h"
 
 #include <cutils/log.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 #include <strings.h>
-#include <unistd.h>
 
 /*
  * Static rather than per-handle because the thing being guarded is not the
@@ -207,28 +205,12 @@ status_t db_txn_make_durable(cutils_db_t *db)
     if (db_txn_wal_path(db, wal, sizeof(wal)) != 0)
         return set_error(ERR_IO, "state.db: cannot find its WAL to make the index durable");
 
-    /*
-     * No lock held, so no writer waits for the sync: it goes
-     * through a descriptor of our own, as the flusher's does (state_db.c),
-     * and SQLite never replaces the WAL file while the database is open,
-     * only rewrites it in place. A missing WAL (the database not in WAL
-     * mode, in memory, or never written since it was opened) holds nothing
-     * uncheckpointed.
-     */
+    /* No lock held, so no writer waits for the sync. wal_sync also syncs
+     * the directory the first time a given -wal is made durable, and checks
+     * it syncs the live file (wal_sync.h). */
     if (wal[0]) {
-        int fd = open(wal, O_RDONLY | O_CLOEXEC);
-        if (fd < 0 && errno != ENOENT)
-            return set_error_errno(ERR_IO, "state.db: cannot open %s to make the index durable", wal);
-        if (fd >= 0) {
-            int rc = fdatasync(fd);
-            int saved = errno;
-            close(fd);
-            if (rc != 0) {
-                errno = saved;
-                return set_error_errno(ERR_IO, "state.db: cannot sync %s; the index is "
-                                               "not durable yet", wal);
-            }
-        }
+        status_t st = wal_sync(wal);
+        if (st != OK) return st;
     }
     phase_add_commit(phase_current, t0);
     void (*done)(void) = g_durable_done;

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "state_db.h"
+#include "wal_sync.h"
 
 #include <cutils/log.h>
 
@@ -130,18 +131,18 @@ static void flush_once(void)
     struct stat st;
     if (stat(g_fl_wal, &st) != 0) return;
     if (seen_matches(&st)) return;
-    int fd = open(g_fl_wal, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    if (fdatasync(fd) == 0) {
+    /* wal_sync: the file's data, its directory entry the first time this
+     * -wal is synced, and only ever the live file (wal_sync.h). */
+    if (wal_sync(g_fl_wal) == OK) {
         pthread_mutex_lock(&g_fl_seen_mu);
         g_fl_size  = st.st_size;
         g_fl_mtime = st.st_mtim;
         pthread_mutex_unlock(&g_fl_seen_mu);
         atomic_fetch_add(&g_fl_syncs, 1);
     } else {
-        log_warn("state.db: cannot sync %s: %s", g_fl_wal, strerror(errno));
+        log_warn("state.db: %s", err_msg());
+        err_clear();
     }
-    close(fd);
 }
 
 static void *flusher_main(void *arg)
