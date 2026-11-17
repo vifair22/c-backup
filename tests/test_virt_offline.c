@@ -44,6 +44,7 @@
 
 #define UUID   "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1c2d"
 #define UUID2  "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1c2e"
+#define UUID4  "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1c30"
 #define M      ((uint64_t)1024 * 1024)
 
 /*
@@ -61,7 +62,7 @@
  */
 static char g_rid[8];
 static char D[200], SOCK[220], DEST[220], XDG[200], URI[300];
-static char V1[40], V2[40], V3[40], V1R[40], V3_PAT[48];
+static char V1[40], V2[40], V3[40], V1R[40], V3_PAT[48], V4[40];
 static char DB_PATH[220], REPO_PATH[220], TR_PATH[220];
 
 /* A formatted string in one of a ring of buffers, for a call's argument. */
@@ -107,6 +108,7 @@ static void run_names(void)
     snprintf(V2, sizeof(V2), "cbk-uat-v2-%s", g_rid);
     snprintf(V3, sizeof(V3), "cbk-uat-v3-%s", g_rid);
     snprintf(V1R, sizeof(V1R), "cbk-uat-v1r-%s", g_rid);
+    snprintf(V4, sizeof(V4), "cbk-uat-v4-%s", g_rid);
     snprintf(V3_PAT, sizeof(V3_PAT), "guest=[c]bk-uat-v3-%s,", g_rid);
     snprintf(DB_PATH, sizeof(DB_PATH), "%s/state.db", D);
     snprintf(REPO_PATH, sizeof(REPO_PATH), "%s/repo", D);
@@ -236,7 +238,7 @@ static void undefine(const char *uuid);
 /* Every domain this suite makes, gone: destroyed, undefined with NVRAM. */
 static void clean_domains(void)
 {
-    const char *const ids[] = { UUID, UUID2, UUID3_, V1R };
+    const char *const ids[] = { UUID, UUID2, UUID3_, V1R, UUID4 };
     for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
         char cmd[512];
         snprintf(cmd, sizeof(cmd), "virsh -q -c '%s' destroy %s >/dev/null 2>&1", URI, ids[i]);
@@ -449,6 +451,262 @@ static void test_offline_backup(void **state)
     assert_true((uint64_t)sb.st_blocks * 512 < 4 * M);
 }
 
+/* nbd_dir is the helper's to make, 0750 (B176): a backup of a shut-off
+ * VM's qcow2 disk works with it missing, as on a fresh /run. */
+static void test_nbd_dir_made(void **state)
+{
+    (void)state;
+    if (!have_libvirt) skip();
+    assert_int_equal(system(pf("rm -rf '%s/nbd'", D)), 0);
+    unit_backup_result_t res;
+    status_t st = backup(V1, &res);
+    if (st != OK) fail_msg("backup: %s", res.n ? res.units[0].error : err_msg());
+    unit_backup_result_free(&res);
+    struct stat sb;
+    assert_int_equal(stat(pf("%s/nbd", D), &sb), 0);
+    assert_true(S_ISDIR(sb.st_mode));
+    assert_int_equal(sb.st_mode & 07777, 0750);
+}
+
+/* A qemu-nbd that cannot serve says why, at once: its stderr reaches the
+ * error, not a socket that did not appear after 10 s (B176). */
+static void test_qemu_nbd_error_reported(void **state)
+{
+    (void)state;
+    if (!have_libvirt) skip();
+    char keep[sizeof(pol.qemu_nbd)];
+    snprintf(keep, sizeof(keep), "%s", pol.qemu_nbd);
+    char fake[PATH_MAX];
+    snprintf(fake, sizeof(fake), "%s", pf("%s/qemu-nbd-broken", D));
+    FILE *f = fopen(fake, "w");
+    assert_non_null(f);
+    fputs("#!/bin/sh\necho \"qemu-nbd: Failed to blk_new_open: injected for the test\" >&2\nexit 1\n", f);
+    fclose(f);
+    assert_int_equal(chmod(fake, 0755), 0);
+    snprintf(pol.qemu_nbd, sizeof(pol.qemu_nbd), "%s", fake);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    unit_backup_result_t res;
+    status_t st = backup(V1, &res);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    snprintf(pol.qemu_nbd, sizeof(pol.qemu_nbd), "%s", keep);
+    assert_int_not_equal(st, OK);
+    assert_non_null(strstr(res.units[0].error, "injected for the test"));
+    assert_true(t1.tv_sec - t0.tv_sec < 8);
+    unit_backup_result_free(&res);
+    err_clear();
+    assert_int_equal(helper_server_holds(srv), 0);
+}
+
+/*
+ * B175. A guest whose freeze is slow (a fsfreeze hook that takes a while)
+ * and a helper killed while that freeze is pending. libvirt goes on
+ * waiting for the agent and holds the domain's state lock, so the next
+ * helper's start-up thaw waits 30 s and fails. That failure used to count
+ * as released: the hold was dropped and the guest stayed frozen until
+ * someone thawed it by hand, and the helper answered nothing for those
+ * 30 s. Now the hold stays, the watchdog thaws once the freeze lands, and
+ * the helper serves meanwhile.
+ *
+ * The guest is the host's kernel and an initramfs whose /init is a fake
+ * qemu-ga (tests/fake_qga.c) taking QGA_FREEZE_S over each freeze. The
+ * helper that dies is this binary re-run as --qga-child, so it shares no
+ * libvirt connection or threads with the suite.
+ */
+#define QGA_FREEZE_S 40
+
+static const char *qga_kernel(void)
+{
+    static const char *const k[] = { "/boot/vmlinuz-linux-cachyos-lts", "/boot/vmlinuz-linux-lts",
+                                     "/boot/vmlinuz-linux", "/boot/vmlinuz-linux-cachyos" };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) if (access(k[i], R_OK) == 0) return k[i];
+    return NULL;
+}
+
+static int file_has(const char *path, const char *needle)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[512];
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f)) found = strstr(line, needle) != NULL;
+    fclose(f);
+    return found;
+}
+
+static const char *qga_policy(const char *dir, const char *uri, const char *state)
+{
+    static char text[2048];
+    snprintf(text, sizeof(text),
+             "[helper]\ndaemon_uid = %u\ndaemon_id = 0badf00d\nstate_dir = %s\nmax_pause_s = 1\n"
+             "[units]\nallow = libvirt:cbk-uat-*\n[host]\nnsenter = 0\nhost_root =\n"
+             "[libvirt]\nenabled = 1\nuri = %s\nnbd_dir = %s/nbd\ntpm_dir = %s/tpm-states\n"
+             "scratch_dir = %s/scratch\nstaging_root = %s/staging\n",
+             (unsigned)getuid(), state, uri, dir, dir, dir, dir);
+    return text;
+}
+
+/* The helper that is killed: begins a backup of the guest, which freezes
+ * it, and never gets further. */
+static int qga_child(const char *dir, const char *uri)
+{
+    helper_policy_t p;
+    memset(&p, 0, sizeof(p));
+    char state[300];
+    snprintf(state, sizeof(state), "%s/hkill", dir);
+    if (helper_policy_parse(qga_policy(dir, uri, state), &p) != OK) { fprintf(stderr, "child: %s\n", err_msg()); return 2; }
+    helper_backend_t b;
+    if (libvirt_backend_init(&p, &b) != OK) { fprintf(stderr, "child: %s\n", err_msg()); return 2; }
+    helper_server_cfg_t cfg = { &p, NULL, 0, 1000, &b, 1 };
+    helper_server_t *s = NULL;
+    if (helper_server_start(&cfg, &s) != OK) { fprintf(stderr, "child: %s\n", err_msg()); return 2; }
+    char rq[512];
+    snprintf(rq, sizeof(rq), "{\"v\":1,\"id\":3,\"op\":\"vm.backup_begin\",\"args\":{\"unit\":\"libvirt:" UUID4
+             "\",\"disks\":[{\"target\":\"vda\",\"mode\":\"full\"}],\"base\":null,\"freeze\":\"auto\"}}");
+    char *resp = NULL;
+    int fd = -1;
+    helper_server_handle(s, rq, strlen(rq), &resp, &fd);
+    fprintf(stderr, "child: the begin returned, which it should not have: %s\n", resp ? resp : "");
+    return 3;
+}
+
+static void test_freeze_killed_helper(void **state)
+{
+    (void)state;
+    if (!have_libvirt || access("/dev/kvm", R_OK | W_OK) != 0) skip();
+    const char *kernel = qga_kernel();
+    if (!kernel) { print_message("no host kernel to boot: skipped\n"); skip(); }
+    char src[PATH_MAX];
+    snprintf(src, sizeof(src), "%s", __FILE__);
+    char *slash = strrchr(src, '/');
+    snprintf(slash ? slash + 1 : src, sizeof(src) - (size_t)(slash ? slash + 1 - src : 0), "fake_qga.c");
+    if (system(pf("mkdir -p '%s/qga/root/dev' '%s/qga/root/proc' '%s/qga/root/sys' '%s/hkill' && "
+                  "cc -static -O2 -o '%s/qga/root/init' '%s' 2>/dev/null && "
+                  "cd '%s/qga/root' && find . | cpio -o -H newc --quiet > '%s/qga/initrd.img' && "
+                  "truncate -s 1M '%s/qga/vda.img'", D, D, D, D, D, src, D, D, D)) != 0) {
+        print_message("cannot build the fake agent's initramfs (cc -static, cpio): skipped\n");
+        skip();
+    }
+    char xml[4096];
+    snprintf(xml, sizeof(xml),
+        "<domain type='kvm'><name>%s</name><uuid>" UUID4 "</uuid><memory unit='MiB'>256</memory><vcpu>1</vcpu>"
+        "<os><type arch='x86_64' machine='pc'>hvm</type><kernel>%s</kernel><initrd>%s/qga/initrd.img</initrd>"
+        "<cmdline>console=ttyS0 panic=-1 quiet qga_freeze_s=%d</cmdline></os><features><acpi/></features><devices>"
+        "<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='%s/qga/vda.img'/>"
+        "<target dev='vda' bus='virtio'/></disk>"
+        "<serial type='file'><source path='%s/qga/console.log'/><target port='0'/></serial>"
+        "<channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>"
+        "</devices></domain>", V4, kernel, D, QGA_FREEZE_S, D, D);
+    put(pf("%s/qga/dom.xml", D), xml, strlen(xml));
+    sh(pf("virsh -q -c '%s' define '%s/qga/dom.xml' >/dev/null && virsh -q -c '%s' start %s >/dev/null", URI, D, URI, V4));
+    /* Booted, and the agent answering libvirt. */
+    int up = 0;
+    for (int i = 0; i < 600 && !up; i++) {
+        up = file_has(pf("%s/qga/console.log", D), "fake-qga: ready") &&
+             system(pf("virsh -q -c '%s' qemu-agent-command %s '{\"execute\":\"guest-ping\"}' >/dev/null 2>&1", URI, V4)) == 0;
+        if (!up) { struct timespec ts = { 0, 100 * 1000000L }; nanosleep(&ts, NULL); }
+    }
+    if (!up) {
+        FILE *dp = popen(pf("{ tail -c 1000 '%s/qga/console.log'; virsh -q -c '%s' qemu-agent-command %s "
+                            "'{\"execute\":\"guest-ping\"}'; virsh -q -c '%s' domstate %s; "
+                            "tail -c 1500 '%s/cache/libvirt/qemu/log/%s.log'; } 2>&1",
+                            D, URI, V4, URI, V4, XDG, V4), "r");
+        char diag[4096] = "";
+        size_t dn = dp ? fread(diag, 1, sizeof(diag) - 1, dp) : 0;
+        diag[dn] = '\0';
+        if (dp) pclose(dp);
+        print_message("%s\n", diag);
+        fail_msg("the fake agent's guest did not come up");
+    }
+
+    /* The helper that dies, mid-freeze. */
+    pid_t child = fork();
+    if (child == 0) {
+        execl("/proc/self/exe", "test_virt_offline", "--qga-child", D, URI, (char *)NULL);
+        _exit(127);
+    }
+    assert_true(child > 0);
+    int freezing = 0;
+    for (int i = 0; i < 300 && !freezing; i++) {
+        freezing = file_has(pf("%s/qga/console.log", D), "fake-qga: freezing") &&
+                   file_has(pf("%s/hkill/holds.json", D), "\"freeze\"");
+        if (!freezing) { struct timespec ts = { 0, 100 * 1000000L }; nanosleep(&ts, NULL); }
+    }
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    assert_true(freezing);
+
+    /* The next helper: it starts at once and answers, the thaw it cannot
+     * do yet still journalled. */
+    helper_policy_t p2;
+    memset(&p2, 0, sizeof(p2));
+    assert_int_equal(helper_policy_parse(qga_policy(D, URI, pf("%s/hkill", D)), &p2), OK);
+    helper_backend_t b2;
+    assert_int_equal(libvirt_backend_init(&p2, &b2), OK);
+    helper_server_cfg_t cfg = { &p2, NULL, 0, 200, &b2, 1 };
+    helper_server_t *s2 = NULL;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    assert_int_equal(helper_server_start(&cfg, &s2), OK);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    assert_true(t1.tv_sec - t0.tv_sec < 6);
+    assert_int_equal(helper_server_holds(s2), 1);
+    const char *hello = "{\"v\":1,\"id\":1,\"op\":\"hello\",\"args\":{\"client_version\":1}}";
+    char *resp = NULL;
+    int fd = -1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    helper_server_handle(s2, hello, strlen(hello), &resp, &fd);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    assert_non_null(resp);
+    free(resp);
+    assert_true(t1.tv_sec - t0.tv_sec < 3);
+
+    /* Past libvirt's 30 s lock wait and the freeze's own QGA_FREEZE_S: the
+     * guest is thawed by the helper and the hold is gone. */
+    int thawed = 0;
+    for (int i = 0; i < (QGA_FREEZE_S + 60) * 10 && !thawed; i++) {
+        thawed = helper_server_holds(s2) == 0 && file_has(pf("%s/qga/console.log", D), "fake-qga: thawed 1");
+        if (!thawed) { struct timespec ts = { 0, 100 * 1000000L }; nanosleep(&ts, NULL); }
+    }
+    helper_server_stop(s2);
+    libvirt_backend_fini(&b2);
+    helper_policy_free(&p2);
+    assert_true(file_has(pf("%s/qga/console.log", D), "fake-qga: frozen"));
+    if (!thawed) {
+        if (system(pf("virsh -q -c '%s' destroy %s >/dev/null 2>&1", URI, V4)) != 0) { /* already off */ }
+        undefine(UUID4);
+        fail_msg("the guest was left frozen, or its hold dropped; console in %s/qga/console.log", D);
+    }
+
+    /* The same guest backed up normally now that its freezes are quick:
+     * quiesced, and the frozen window measured, a little over the begin. */
+    unit_backup_result_t res;
+    status_t st = backup(V4, &res);
+    if (st != OK) print_message("backup of the agent's guest: %s\n", res.n ? res.units[0].error : err_msg());
+    assert_int_equal(st, OK);
+    assert_int_equal(res.units[0].achieved, SP_CONSIST_QUIESCED);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    if (system(pf("virsh -q -c '%s' destroy %s >/dev/null 2>&1", URI, V4)) != 0) { /* already off */ }
+    undefine(UUID4);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, pf("%s4", DEST), &ro, &rr), OK);
+    FILE *f = fopen(pf("%s4/.cbackup-unit/unit.json", DEST), "r");
+    assert_non_null(f);
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    const char *fm = strstr(buf, "\"freeze_ms\":");
+    assert_non_null(fm);
+    long ms = strtol(fm + 12, NULL, 10);
+    print_message("frozen for %ld ms\n", ms);
+    assert_true(ms > 0);
+    assert_true(ms < 10000);
+}
+
 static void test_missing_state_refused(void **state)
 {
     (void)state;
@@ -619,15 +877,19 @@ static void test_restore_define(void **state)
     err_clear();
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc >= 4 && strcmp(argv[1], "--qga-child") == 0) return qga_child(argv[2], argv[3]);
     run_names();
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_offline_backup),
+        cmocka_unit_test(test_nbd_dir_made),
+        cmocka_unit_test(test_qemu_nbd_error_reported),
         cmocka_unit_test(test_sweep_freeze_absent),
         cmocka_unit_test(test_restore_define),
         cmocka_unit_test(test_missing_state_refused),
         cmocka_unit_test(test_online_backup),
+        cmocka_unit_test(test_freeze_killed_helper),
     };
     return cmocka_run_group_tests(tests, setup, teardown);
 }

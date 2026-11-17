@@ -24,6 +24,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -178,6 +181,7 @@ typedef struct {
     char     bitmap[48];        /* the export's dirty bitmap, for an incremental disk */
     int      nbd;               /* read through NBD (qemu-nbd or the backup export) */
     pid_t    qemu_nbd;          /* a qemu-nbd this session started */
+    int      qemu_nbd_err;      /* its stderr, a memfd: no pipe to fill or break */
     int64_t  hold;
     struct stat before;
 } vread_t;
@@ -208,12 +212,66 @@ static const char *verr(void)
     return m ? m : "unknown libvirt error";
 }
 
+/*
+ * Why a connection was refused, when the socket says (B179). The usual
+ * deployment mistake is binding libvirt's socket into the helper's
+ * container as a file: the bind keeps the inode the socket had when the
+ * container started, and libvirtd makes a new socket at every restart, so
+ * from then on every connect is refused although libvirtd runs. Seen from
+ * the host's root (host_root), the socket is a different inode; seen only
+ * from here, it is a socket nobody listens on. Empty when neither.
+ */
+static void socket_hint(struct sp_ctx *c, char *out, size_t sz)
+{
+    out[0] = '\0';
+    char path[PATH_MAX] = "";
+    const char *q = strstr(c->pol->libvirt_uri, "socket=");
+    if (q) {
+        snprintf(path, sizeof(path), "%s", q + 7);
+        path[strcspn(path, "&")] = '\0';
+    } else if (strncmp(c->pol->libvirt_uri, "qemu:///system", 14) == 0) {
+        static const char *const cand[] = { "/var/run/libvirt/virtqemud-sock", "/var/run/libvirt/libvirt-sock" };
+        for (size_t i = 0; i < 2 && !path[0]; i++)
+            if (access(cand[i], F_OK) == 0) snprintf(path, sizeof(path), "%s", cand[i]);
+    }
+    struct stat here;
+    if (!path[0] || stat(path, &here) != 0 || !S_ISSOCK(here.st_mode)) return;
+    char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
+    struct stat host;
+    if (c->tools.host_root[0] && host_path(&c->tools, path, hp, sizeof(hp)) == 0 && stat(hp, &host) == 0 &&
+        (host.st_ino != here.st_ino || host.st_dev != here.st_dev)) {
+        snprintf(out, sz, "%.200s is not the host's socket any more: it is bind-mounted as a file, and libvirtd "
+                 "has restarted since. Bind the directory (/var/run/libvirt) instead and recreate the helper's "
+                 "container (Manual 22.2.1)", path);
+        return;
+    }
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return;
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    int fits = strlen(path) < sizeof(sa.sun_path);
+    if (fits) memcpy(sa.sun_path, path, strlen(path) + 1);
+    int refused = fits && connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 && errno == ECONNREFUSED;
+    close(fd);
+    if (refused)
+        snprintf(out, sz, "%.200s refuses connections: libvirtd is down, or the socket is bind-mounted as a file "
+                 "and libvirtd has restarted since; bind the directory (/var/run/libvirt) and recreate the "
+                 "helper's container (Manual 22.2.1)", path);
+}
+
 static status_t conn_ok(struct sp_ctx *c)
 {
     if (c->conn && virConnectIsAlive(c->conn) == 1) return OK;
     if (c->conn) { virConnectClose(c->conn); c->conn = NULL; }
     c->conn = virConnectOpen(c->pol->libvirt_uri);
-    if (!c->conn) return set_error(ERR_IO, "libvirt: cannot connect to %s: %s", c->pol->libvirt_uri, verr());
+    if (!c->conn) {
+        char why[320], hint[512];
+        snprintf(why, sizeof(why), "%.300s", verr());
+        socket_hint(c, hint, sizeof(hint));
+        return set_error(ERR_IO, "libvirt: cannot connect to %s: %s%s%s", c->pol->libvirt_uri, why,
+                         hint[0] ? "; " : "", hint);
+    }
     return OK;
 }
 
@@ -893,8 +951,36 @@ static status_t v_blob_read(sp_session_t *s, const sp_item_desc_t *item, void **
 /* Offline reads (2.4)                                                 */
 /* ------------------------------------------------------------------ */
 
+/*
+ * nbd_dir, where qemu-nbd and libvirt's exports make their sockets, made
+ * if it is missing (a fresh /run): 0750 and the daemon's group, so the
+ * daemon can reach the sockets after it drops to its uid (helper.md, the
+ * Manual 22.2.1). Nothing made it before, and every qcow2 read of a
+ * shut-off VM failed after 10 s with a socket that did not appear (B176).
+ */
+static status_t nbd_dir_ready(struct sp_ctx *c)
+{
+    char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
+    if (host_path(&c->tools, c->pol->nbd_dir, hp, sizeof(hp)) != 0)
+        return set_error(ERR_INVALID, "libvirt: nbd_dir too long");
+    struct stat sb;
+    if (stat(hp, &sb) == 0) {
+        if (!S_ISDIR(sb.st_mode)) return set_error(ERR_INVALID, "libvirt: nbd_dir %s is not a directory", c->pol->nbd_dir);
+        return OK;
+    }
+    if (mkdir(hp, 0750) != 0 && errno != EEXIST)
+        return set_error_errno(ERR_IO, "libvirt: cannot make nbd_dir %s", c->pol->nbd_dir);
+    if (geteuid() == 0 && chown(hp, 0, c->pol->daemon_gid) != 0)
+        return set_error_errno(ERR_IO, "libvirt: nbd_dir %s to group %u", c->pol->nbd_dir,
+                               (unsigned)c->pol->daemon_gid);
+    if (chmod(hp, 0750) != 0) return set_error_errno(ERR_IO, "libvirt: chmod %s", c->pol->nbd_dir);
+    log_info("libvirt: made nbd_dir %s (0750, group %u)", c->pol->nbd_dir, (unsigned)c->pol->daemon_gid);
+    return OK;
+}
+
 static void kill_qemu_nbd(vread_t *r)
 {
+    if (r->qemu_nbd_err > 0) { close(r->qemu_nbd_err); r->qemu_nbd_err = 0; }
     if (r->qemu_nbd <= 0) return;
     kill(r->qemu_nbd, SIGTERM);
     for (int i = 0; i < 50; i++) {
@@ -907,15 +993,48 @@ static void kill_qemu_nbd(vread_t *r)
     r->qemu_nbd = 0;
 }
 
-/* A socket path the daemon can connect to: owned by its uid, 0600. */
-static status_t hand_over(struct sp_ctx *c, const char *path, unsigned wait_ms)
+/* What a qemu-nbd wrote to stderr, its last line or so, for an error. */
+static void nbd_stderr(int fd, char *out, size_t sz)
+{
+    out[0] = '\0';
+    if (fd <= 0) return;
+    off_t end = lseek(fd, 0, SEEK_END);
+    if (end <= 0) return;
+    off_t from = end > (off_t)(sz - 1) ? end - (off_t)(sz - 1) : 0;
+    ssize_t n = pread(fd, out, (size_t)(end - from), from);
+    if (n <= 0) { out[0] = '\0'; return; }
+    out[n] = '\0';
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = '\0';
+    for (ssize_t i = 0; i < n; i++) if (out[i] == '\n') out[i] = ' ';
+}
+
+/*
+ * A socket path the daemon can connect to: owned by its uid, 0600. With
+ * r, a qemu-nbd of ours is to create it: one that exits first fails at
+ * once with what it said, rather than after the whole wait with nothing.
+ */
+static status_t hand_over(struct sp_ctx *c, const char *path, unsigned wait_ms, vread_t *r)
 {
     char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
     if (host_path(&c->tools, path, hp, sizeof(hp)) != 0) return set_error(ERR_INVALID, "libvirt: path too long");
     struct stat sb;
     unsigned waited = 0;
     while (stat(hp, &sb) != 0) {
-        if (waited >= wait_ms) return set_error(ERR_IO, "libvirt: %s did not appear", path);
+        int status = 0;
+        if (r && r->qemu_nbd > 0 && waitpid(r->qemu_nbd, &status, WNOHANG) == r->qemu_nbd) {
+            r->qemu_nbd = 0;
+            char said[512];
+            nbd_stderr(r->qemu_nbd_err, said, sizeof(said));
+            return set_error(ERR_IO, "libvirt: qemu-nbd for %s exited (%s %d) before its socket %s appeared: %s",
+                             r->path, WIFEXITED(status) ? "status" : "signal",
+                             WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status), path,
+                             said[0] ? said : "it said nothing");
+        }
+        if (waited >= wait_ms) {
+            char said[512] = "";
+            if (r) nbd_stderr(r->qemu_nbd_err, said, sizeof(said));
+            return set_error(ERR_IO, "libvirt: %s did not appear%s%s", path, said[0] ? "; qemu-nbd said: " : "", said);
+        }
         struct timespec ts = { 0, 20 * 1000000L };
         nanosleep(&ts, NULL);
         waited += 20;
@@ -972,9 +1091,12 @@ static status_t offline_reads(struct sp_session *s, const sp_unit_desc_t *unit, 
         snprintf(opts, sizeof(opts), "driver=%s,file.driver=file,file.filename=%s,file.locking=off", it->format, it->source);
         const char *argv[] = { c->pol->qemu_nbd, "--read-only", "--persistent", "--cache=none", "-k", r->socket,
                                "-x", "disk", "--image-opts", opts, NULL };
-        if ((st = host_spawn(&c->tools, argv, -1, &r->qemu_nbd)) != OK) break;
+        if ((st = nbd_dir_ready(c)) != OK) break;
+        r->qemu_nbd_err = memfd_create("qemu-nbd-stderr", MFD_CLOEXEC);
+        if (r->qemu_nbd_err < 0) r->qemu_nbd_err = 0;
+        if ((st = host_spawn(&c->tools, argv, r->qemu_nbd_err > 0 ? r->qemu_nbd_err : -1, &r->qemu_nbd)) != OK) break;
         r->nbd = 1;
-        if ((st = hand_over(c, r->socket, 10000)) != OK) break;
+        if ((st = hand_over(c, r->socket, 10000, r)) != OK) break;
     }
     return st;
 }
@@ -1003,6 +1125,85 @@ static void *freeze_watchdog(void *arg)
         (void)virDomainFSThaw(w->dom, NULL, 0, 0);
     }
     return NULL;
+}
+
+/*
+ * One frozen window around virDomainBackupBegin: the freeze journalled
+ * first, a watchdog thread that thaws at vm_freeze_timeout_s whatever the
+ * begin is doing, and on the way out a thaw that also learns whether the
+ * helper's own watchdog thawed first. A thaw that fails keeps the hold for
+ * the watchdog to retry (B175). Fields describe the last window.
+ */
+typedef struct {
+    int      frozen;       /* 0, 1 froze nothing countable, 2 froze filesystems */
+    int      lost;         /* thawed by someone else before our thaw */
+    int      wd_thawed;    /* our freeze watchdog fired */
+    uint64_t ms;           /* how long it was frozen */
+    int64_t  hold;
+    freeze_wd_t wd;
+    pthread_t wth;
+    int      wd_on;
+    int      armed;        /* freeze_on got as far as the watchdog */
+    struct timespec t0;
+} fwin_t;
+
+static status_t freeze_on(struct sp_session *s, fwin_t *f)
+{
+    struct sp_ctx *c = s->c;
+    f->frozen = f->lost = f->wd_thawed = 0;
+    f->ms = 0;
+    f->hold = 0;
+    f->wd_on = 0;
+    f->armed = 0;
+    char detail[PATH_MAX + 64];
+    snprintf(detail, sizeof(detail), "freeze:%s", s->uuid);
+    status_t st = OK;
+    if (s->has_holds && (st = s->holds.record(s->holds.ctx, SP_HOLD_FREEZE, detail, &f->hold)) != OK) return st;
+    memset(&f->wd, 0, sizeof(f->wd));
+    f->wd.dom = s->dom;
+    f->wd.timeout_s = c->pol->vm_freeze_timeout_s;
+    pthread_mutex_init(&f->wd.mu, NULL);
+    pthread_cond_init(&f->wd.cv, NULL);
+    f->armed = 1;
+    f->wd_on = pthread_create(&f->wth, NULL, freeze_watchdog, &f->wd) == 0;
+    clock_gettime(CLOCK_MONOTONIC, &f->t0);
+    int n = virDomainFSFreeze(s->dom, NULL, 0, 0);
+    if (n >= 0) f->frozen = n > 0 ? 2 : 1;
+    else {
+        (void)sp_session_info_warn(&s->info, "the guest agent did not freeze: %.300s", verr());
+        if (c->pol->vm_freeze == 2) st = set_error(ERR_IO, "libvirt: freeze is required and failed: %s", verr());
+    }
+    return st;
+}
+
+static void freeze_off(struct sp_session *s, fwin_t *f)
+{
+    if (!f->armed) return;
+    f->armed = 0;
+    pthread_mutex_lock(&f->wd.mu);
+    f->wd.done = 1;
+    pthread_cond_broadcast(&f->wd.cv);
+    pthread_mutex_unlock(&f->wd.mu);
+    if (f->wd_on) pthread_join(f->wth, NULL);
+    f->wd_thawed = f->wd.thawed;
+    pthread_mutex_destroy(&f->wd.mu);
+    pthread_cond_destroy(&f->wd.cv);
+    /* Always thaw: harmless on a guest that is not frozen. One that froze
+     * filesystems and now thaws none was thawed already, by the helper's
+     * watchdog, perhaps before the backup began. */
+    int t = virDomainFSThaw(s->dom, NULL, 0, 0);
+    int thaw_failed = t < 0 && f->frozen && !f->wd_thawed;
+    if (thaw_failed)
+        log_warn("libvirt: thaw of %s: %s; its hold stays for the watchdog to retry", s->uuid, verr());
+    f->lost = f->frozen == 2 && !f->wd_thawed && t == 0;
+    if (f->frozen) {
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        f->ms = (uint64_t)((t1.tv_sec - f->t0.tv_sec) * 1000 + (t1.tv_nsec - f->t0.tv_nsec) / 1000000);
+    }
+    /* A thaw that failed leaves the guest perhaps frozen: the record stays,
+     * so the watchdog keeps trying, and a restart's sweep. */
+    if (!thaw_failed && s->has_holds && f->hold && s->holds.clear(s->holds.ctx, f->hold) != OK) err_clear();
 }
 
 /* Append to a growing XML buffer; -1 when it does not fit. */
@@ -1089,6 +1290,10 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
     if (artefact_name(name, sizeof(name), c->pol->daemon_id, req->job_id, -1) != 0) return set_error(ERR_INVALID, "libvirt: name");
     char sock[PATH_MAX];
     snprintf(sock, sizeof(sock), "%s/%s.sock", c->pol->nbd_dir, name);
+    {
+        status_t dst = nbd_dir_ready(c);
+        if (dst != OK) return dst;
+    }
 
     /* The chain (5.8): which disks take part, and the base they read
      * against, if it is this helper's and libvirt still has it or takes it
@@ -1167,26 +1372,21 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
     /* Freeze for the begin alone, with a watchdog, thawed in every path. */
     int want_freeze = agent && c->pol->vm_freeze != 1;
     if (!agent && c->pol->vm_freeze == 2) { st = set_error(ERR_INVALID, "libvirt: freeze is required and the guest agent is not connected"); goto out; }
-    int frozen = 0, lost = 0;
-    int64_t fhold = 0;
-    freeze_wd_t wd = { s->dom, c->pol->vm_freeze_timeout_s, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0 };
-    pthread_t wth;
-    int wd_on = 0;
-    if (want_freeze) {
-        snprintf(detail, sizeof(detail), "freeze:%s", s->uuid);
-        if (s->has_holds && (st = s->holds.record(s->holds.ctx, SP_HOLD_FREEZE, detail, &fhold)) != OK) goto out;
-        wd_on = pthread_create(&wth, NULL, freeze_watchdog, &wd) == 0;
-        int n = virDomainFSFreeze(s->dom, NULL, 0, 0);
-        if (n >= 0) frozen = n > 0 ? 2 : 1;   /* 2: filesystems a thaw can count */
-        else {
-            (void)sp_session_info_warn(&s->info, "the guest agent did not freeze: %.300s", verr());
-            if (c->pol->vm_freeze == 2) st = set_error(ERR_IO, "libvirt: freeze is required and failed: %s", verr());
-        }
-    }
     unsigned flags = 0;
 #ifdef VIR_DOMAIN_BACKUP_BEGIN_PRESERVE_SHUTDOWN_DOMAIN
     flags |= VIR_DOMAIN_BACKUP_BEGIN_PRESERVE_SHUTDOWN_DOMAIN;
 #endif
+    /*
+     * The guest is frozen for virDomainBackupBegin alone, which fixes the
+     * point in time (it starts the backup job, the new checkpoint and the
+     * export in one QEMU transaction). Everything else stays outside the
+     * window (B180): the XML is built first, and an incremental libvirt
+     * refuses is cleaned up thawed, the begin repeated under a new freeze.
+     * That begin call is all the window holds; what it costs (scratch
+     * images, the export) is libvirt's.
+     */
+    fwin_t fz;
+    memset(&fz, 0, sizeof(fz));
     int began = 0;
     for (int attempt = 0; st == OK && !began && attempt < 2; attempt++) {
         char *bxml = NULL, *cxml = NULL;
@@ -1195,14 +1395,20 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
         int any_inc = 0;
         for (size_t i = 0; i < ni; i++) any_inc |= inc[i];
         if (any_want) snprintf(s->new_cp, sizeof(s->new_cp), "%s", cpname);
-        if (virDomainBackupBegin(s->dom, bxml, cxml, flags) == 0) began = 1;
-        else if (any_inc && attempt == 0) {
+        if (want_freeze) st = freeze_on(s, &fz);
+        int ok = st == OK && virDomainBackupBegin(s->dom, bxml, cxml, flags) == 0;
+        char w[320];
+        snprintf(w, sizeof(w), "%.300s", ok || st != OK ? "" : verr());
+        if (want_freeze) freeze_off(s, &fz);
+        free(bxml);
+        free(cxml);
+        if (st != OK) break;
+        if (ok) { began = 1; break; }
+        if (any_inc && attempt == 0) {
             /* 5.5: libvirt refuses an incremental whose bitmap is missing,
              * not recording or inconsistent (an unclean QEMU stop). The
              * base is ours and useless: deleted, and the begin repeated
              * as a full read under a new checkpoint. */
-            char w[320];
-            snprintf(w, sizeof(w), "%.300s", verr());
             log_warn("libvirt: the incremental backup of %s against %s was refused (%s); reading in full",
                      s->uuid, base, w);
             (void)sp_session_info_warn(&s->info, "the incremental against %s was refused (%s); read in full", base, w);
@@ -1212,26 +1418,13 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
             s->new_cp[0] = '\0';
         } else {
             s->new_cp[0] = '\0';
-            st = set_error(ERR_IO, "libvirt: the backup of %s did not begin: %s", unit->name ? unit->name : s->uuid, verr());
+            st = set_error(ERR_IO, "libvirt: the backup of %s did not begin: %s", unit->name ? unit->name : s->uuid, w);
         }
-        free(bxml);
-        free(cxml);
     }
-    if (want_freeze) {
-        pthread_mutex_lock(&wd.mu);
-        wd.done = 1;
-        pthread_cond_broadcast(&wd.cv);
-        pthread_mutex_unlock(&wd.mu);
-        if (wd_on) pthread_join(wth, NULL);
-        /* Always thaw: harmless on a guest that is not frozen. One that
-         * froze filesystems and now thaws none was thawed already, by the
-         * helper's watchdog, perhaps before the backup began. */
-        int t = virDomainFSThaw(s->dom, NULL, 0, 0);
-        if (t < 0 && frozen)
-            log_warn("libvirt: thaw of %s: %s", s->uuid, verr());
-        lost = frozen == 2 && !wd.thawed && t == 0;
-        if (s->has_holds && fhold && s->holds.clear(s->holds.ctx, fhold) != OK) err_clear();
-    }
+    /* What the point in time had: the window of the begin that took. */
+    int frozen = fz.frozen, lost = fz.lost;
+    struct { int thawed; } wd = { fz.wd_thawed };
+    if (frozen) s->info.freeze_ms = fz.ms;
     if (began) s->online = 1;
     /* The new checkpoint, recorded with the XML it has now before anything
      * is read: from here on it can be redefined, and is the base of the
@@ -1250,7 +1443,7 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
             st = set_error(ERR_NOMEM, "libvirt: token");
         free(cx);
     }
-    if (st == OK) st = hand_over(c, sock, 10000);
+    if (st == OK) st = hand_over(c, sock, 10000, NULL);
     if (st == OK) {
         /* The export's bitmap for each incremental disk. */
         for (size_t i = 0, k = 0; i < ni; i++) {
@@ -1475,6 +1668,41 @@ static void kill_by_socket(const char *sock)
 }
 
 /*
+ * A journalled freeze, thawed by the sweep. Only an answer settles it: a
+ * thaw that counted filesystems (released), one that counted none (the
+ * agent says nothing is frozen: released, and absent), or a domain that is
+ * not running (nothing can be frozen). A thaw that failed proves nothing:
+ * a freeze still pending in libvirt holds the domain's state lock, and a
+ * thaw behind it fails after libvirt's 30 s wait while the freeze lands.
+ * Counting that as released dropped the hold and left the guest frozen
+ * (B175); kept, the watchdog retries it.
+ */
+static status_t sweep_thaw(virDomainPtr dom, const char *uuid, int *absent)
+{
+    int t = virDomainFSThaw(dom, NULL, 0, 0);
+    if (t > 0) { if (absent) *absent = 0; return OK; }
+    if (t == 0) return OK;
+    char why[320];
+    snprintf(why, sizeof(why), "%.300s", verr());
+    if (dom_state(dom) == SP_STATE_STOPPED) return OK;
+    return set_error(ERR_IO, "libvirt: the thaw of %s failed (%s); the freeze is kept and retried", uuid, why);
+}
+
+/* A journalled backup job, aborted: kept unless libvirt says it is gone. */
+static status_t sweep_abort(virDomainPtr dom, const char *uuid)
+{
+    virDomainJobInfo ji;
+    if (virDomainGetJobInfo(dom, &ji) != 0) {
+        if (dom_state(dom) == SP_STATE_STOPPED) return OK;
+        return set_error(ERR_IO, "libvirt: the backup job of %s cannot be read (%s); kept", uuid, verr());
+    }
+    if (ji.type == VIR_DOMAIN_JOB_NONE) return OK;
+    if (virDomainAbortJob(dom) != 0)
+        return set_error(ERR_IO, "libvirt: the backup job of %s did not abort (%s); kept", uuid, verr());
+    return OK;
+}
+
+/*
  * Only a lookup libvirt answered proves a domain gone. A connection that
  * cannot be made (no libvirt on this host, libvirtd down or restarting)
  * proves nothing: a hold it names is kept for the next sweep, not dropped
@@ -1531,12 +1759,8 @@ static status_t v_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
             if (freeze && req->absent) req->absent[i] = 1;
             status_t ds = down ? ERR_IO : domain(c, uuid, &dom);
             if (ds == OK) {
-                if (freeze) {
-                    if (virDomainFSThaw(dom, NULL, 0, 0) > 0 && req->absent) req->absent[i] = 0;
-                } else {
-                    virDomainJobInfo ji;
-                    if (virDomainGetJobInfo(dom, &ji) == 0 && ji.type != VIR_DOMAIN_JOB_NONE) (void)virDomainAbortJob(dom);
-                }
+                if (freeze) st = sweep_thaw(dom, uuid, req->absent ? &req->absent[i] : NULL);
+                else st = sweep_abort(dom, uuid);
                 virDomainFree(dom);
             } else if (ds == ERR_NOT_FOUND) {
                 err_clear();         /* the domain is gone: nothing held */
@@ -1547,7 +1771,12 @@ static status_t v_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
             st = set_error(ERR_INVALID, "libvirt: unknown hold %s", in->detail);
         }
         if (st == OK) { out->released++; if (req->released) req->released[i] = 1; }
-        else { out->failed++; err_clear(); }
+        else {
+            out->failed++;
+            log_warn("%s", err_msg());
+            if (!out->stuck[0]) snprintf(out->stuck, sizeof(out->stuck), "%.390s", err_msg());
+            err_clear();
+        }
     }
     return OK;
 }
@@ -1833,6 +2062,10 @@ status_t libvirt_backend_init(const helper_policy_t *pol, helper_backend_t *out)
     pthread_mutex_init(&c->cmu, NULL);
     snap_host_setup(pol, &c->tools, &c->snap);
     rec_load(c);
+    if (nbd_dir_ready(c) != OK) {
+        log_warn("%s; tried again before each read", err_msg());
+        err_clear();
+    }
     if (conn_ok(c) != OK) {
         log_warn("libvirt: %s; continuing, the connection is retried on use", err_msg());
         err_clear();
