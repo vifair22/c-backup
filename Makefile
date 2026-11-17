@@ -481,6 +481,12 @@ $(SAN_FAULT_BINS): $(BINS)/%$(BIN_SUFFIX): $(TESTS)/%.c $(TESTS)/fault_inject.c 
 # expect, so a report on stderr was either lost or read as a wrong answer.
 # A directory left non-empty fails the suite even when the suite passed: a
 # TSan race or a leak at a daemon's exit does not change its exit status.
+#
+# UBSan is the exception: gcc links it as a second runtime beside libasan,
+# with its own copy of the report plumbing that never reads log_path, so its
+# reports go to stderr whatever the options say. It does not recover, so the
+# process it fires in exits non-zero and the suite fails; in an end-to-end
+# suite that is a daemon dying mid-run, and its report is in the daemon log.
 SAN_REPORTS := $(abspath $(OBJ_DIR))/reports
 SAN_ENV_asan := ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1:log_path=$$d/asan \
                 UBSAN_OPTIONS=print_stacktrace=1:log_path=$$d/ubsan
