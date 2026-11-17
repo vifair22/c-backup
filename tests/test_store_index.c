@@ -37,6 +37,8 @@
 #include <cutils/db.h>
 
 #include "db_txn.h"
+#include "db_readers.h"
+#include "db_write.h"
 #include "object.h"
 #include "pack.h"
 #include "repo.h"
@@ -100,6 +102,8 @@ static int teardown(void **state)
     (void)state;
     store_index_set_commit_gate(NULL);
     store_index_set_pack_batch_rows(0);
+    db_txn_guard_arm(0);
+    db_readers_close();
     if (store) { store_close(store); store = NULL; }
     if (idx) { store_index_free(idx); idx = NULL; }
     if (db) { db_close(db); db = NULL; }
@@ -483,6 +487,196 @@ static void test_drop_unannounced_is_linear(void **state)
                            " AND pack_id = 999"), 0);
 }
 
+/* ------------------------------------------------------------------ */
+/* B184: dedup lookups from read-only connections                       */
+/* ------------------------------------------------------------------ */
+
+static double now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* A gate that holds a pack commit open, transaction and all, until told. */
+static pthread_mutex_t g_gmu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_gcv = PTHREAD_COND_INITIALIZER;
+static int             g_in_gate, g_release_gate;
+
+static status_t pausing_gate(void)
+{
+    pthread_mutex_lock(&g_gmu);
+    g_in_gate = 1;
+    pthread_cond_broadcast(&g_gcv);
+    while (!g_release_gate) pthread_cond_wait(&g_gcv, &g_gmu);
+    pthread_mutex_unlock(&g_gmu);
+    return OK;
+}
+
+struct roll { pack_backup_writer_t *w; status_t st; };
+
+static void *roll_main(void *arg)
+{
+    struct roll *r = arg;
+    r->st = pack_backup_rollover(r->w);
+    return NULL;
+}
+
+/*
+ * Two writers meet the same chunk while the first one's pack commit is
+ * still open. A read-only connection does not see that commit's rows, so
+ * if the lookup were the only record of a staged name the second writer
+ * would store it again. The claim set is the record: the second writer is
+ * told another writer has it, the reader answers "absent" meanwhile (it
+ * sees only commits), and once the commit lands and the claim goes the
+ * reader answers for it. Exactly one copy is stored, every lookup came
+ * from a reader, and the guard has nothing to report.
+ */
+static void test_dedup_race_stores_one_copy(void **state)
+{
+    (void)state;
+    assert_int_equal(db_readers_open(TEST_DB, 2), OK);
+    unsigned long l0 = db_readers_lookups();
+    unsigned long v0 = db_txn_guard_violations();
+    db_txn_guard_arm(1);
+
+    const size_t len = 9000;
+    char *buf = malloc(len);
+    assert_non_null(buf);
+    fill((uint8_t *)buf, len, 0xB184);
+
+    pack_claims_t *c = pack_claims_new();
+    assert_non_null(c);
+    pack_backup_writer_t *a = NULL, *b = NULL;
+    assert_int_equal(pack_backup_open(store, &a), OK);
+    assert_int_equal(pack_backup_open(store, &b), OK);
+    pack_backup_share_claims(a, c);
+    pack_backup_share_claims(b, c);
+
+    uint8_t h[OBJECT_HASH_SIZE];
+    int is_new = -1;
+    assert_int_equal(pack_backup_add(a, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 1);
+
+    /* a's commit, held open with its rows written and not committed. */
+    g_in_gate = 0;
+    g_release_gate = 0;
+    store_index_set_commit_gate(pausing_gate);
+    struct roll r = { a, ERR_IO };
+    pthread_t t;
+    assert_int_equal(pthread_create(&t, NULL, roll_main, &r), 0);
+    pthread_mutex_lock(&g_gmu);
+    while (!g_in_gate) pthread_cond_wait(&g_gcv, &g_gmu);
+    pthread_mutex_unlock(&g_gmu);
+
+    /* The reader sees only commits, and answers without waiting for a. */
+    double t0 = now_s();
+    assert_false(pack_object_exists(store, h));
+    err_clear();
+    assert_true(now_s() - t0 < 0.5);
+    /* b is covered by a's claim, not by the index. */
+    assert_int_equal(pack_backup_add(b, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 0);
+    assert_false(pack_backup_holds(b, h));
+
+    pthread_mutex_lock(&g_gmu);
+    g_release_gate = 1;
+    pthread_cond_broadcast(&g_gcv);
+    pthread_mutex_unlock(&g_gmu);
+    assert_int_equal(pthread_join(t, NULL), 0);
+    assert_int_equal(r.st, OK);
+    store_index_set_commit_gate(NULL);
+
+    /* Committed and the claim gone: the reader answers for it. */
+    assert_true(pack_object_exists(store, h));
+    assert_int_equal(pack_backup_add(b, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 0);
+
+    uint32_t pa = 0, pb = 0;
+    assert_int_equal(pack_backup_finish(a, &pa), OK);
+    assert_int_equal(pack_backup_finish(b, &pb), OK);
+    assert_int_equal(pb, 0);
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    for (int i = 0; i < OBJECT_HASH_SIZE; i++) snprintf(hex + i * 2, 3, "%02x", h[i]);
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM pack_objects WHERE repo_id = ? AND hash = '%s'",
+             hex);
+    assert_int_equal(count(sql), 1);
+
+    assert_true(db_readers_lookups() - l0 >= 3);
+    db_txn_guard_arm(0);
+    assert_int_equal(db_txn_guard_violations(), v0);
+    pack_claims_free(c);
+    free(buf);
+}
+
+/* A thread holding the write lock and, inside it, the shared connection's
+ * mutex for as long as one heavy statement runs. */
+static atomic_int g_busy_inside;
+static double     g_busy_secs;
+
+static void *busy_main(void *arg)
+{
+    (void)arg;
+    assert_int_equal(db_txn_begin(db), OK);
+    double t0 = now_s();
+    atomic_store(&g_busy_inside, 1);
+    db_result_t *r = NULL;
+    (void)db_execute(db, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c"
+                         " WHERE x < 15000000) SELECT COUNT(*) FROM c", NULL, &r);
+    db_result_free(r);
+    g_busy_secs = now_s() - t0;
+    db_txn_rollback(db);
+    return NULL;
+}
+
+static double timed_locate(size_t i, pthread_t *t)
+{
+    atomic_store(&g_busy_inside, 0);
+    assert_int_equal(pthread_create(t, NULL, busy_main, NULL), 0);
+    while (!atomic_load(&g_busy_inside)) {
+        struct timespec ts = { 0, 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    struct timespec ts = { 0, 100 * 1000000L };   /* into the statement */
+    nanosleep(&ts, NULL);
+    store_location_t loc;
+    double t0 = now_s();
+    assert_int_equal(store_locate(store, hashes[i], &loc), OK);
+    return now_s() - t0;
+}
+
+/*
+ * The point of the readers: a lookup does not wait for another thread's
+ * transaction or for the shared connection's mutex. Timed against the
+ * same lookup through the shared connection, which waits for the whole
+ * statement, so the test shows the difference rather than assuming it.
+ */
+static void test_lookup_does_not_wait_for_a_writer(void **state)
+{
+    (void)state;
+    size_t i = pack_of(1);
+    unsigned long v0 = db_txn_guard_violations();
+    db_txn_guard_arm(1);
+
+    pthread_t t;
+    double shared = timed_locate(i, &t);         /* no readers: shared connection */
+    assert_int_equal(pthread_join(t, NULL), 0);
+
+    assert_int_equal(db_readers_open(TEST_DB, 2), OK);
+    double reader = timed_locate(i, &t);
+    assert_int_equal(pthread_join(t, NULL), 0);
+    fprintf(stderr, "lookup during a %.2f s statement: shared %.3f s, reader %.4f s\n",
+            g_busy_secs, shared, reader);
+    assert_true(g_busy_secs > 0.4);
+    assert_true(shared > 0.25);                  /* the wait the readers remove */
+    assert_true(reader < 0.1);
+
+    db_txn_guard_arm(0);
+    assert_int_equal(db_txn_guard_violations(), v0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -495,6 +689,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_failed_commit_cleans_up_without_a_restart,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_drop_unannounced_is_linear, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_dedup_race_stores_one_copy, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_lookup_does_not_wait_for_a_writer, setup, teardown),
     };
+    /* Before any test opens a connection, so each carries the guard's hook. */
+    db_txn_guard_install();
     return cmocka_run_group_tests_name("store_index", tests, NULL, NULL);
 }

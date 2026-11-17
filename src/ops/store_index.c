@@ -5,6 +5,7 @@
 #include "pack.h"   /* PACK_VERSION: the format new packs are written in */
 #include "db_txn.h"
 #include "db_write.h"
+#include "db_readers.h"
 
 #include <cutils/log.h>
 
@@ -45,6 +46,46 @@ static status_t db_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
     store_index_t *idx = user;
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_to_hex(hash, hex);
+
+    /*
+     * From a read-only connection when this thread holds no transaction
+     * (B184): a file worker asking "already stored?" for every chunk used
+     * to queue on the shared connection's mutex behind whatever commit
+     * held it. A reader sees the last commit and never waits for a writer.
+     *
+     * That view is enough for dedup, and the claim set is why. A name is
+     * only ever stored by the writer holding its claim, the claim is taken
+     * before this lookup, and it is dropped only after the commit that put
+     * the name's rows in the index (pack_backup_add_prepared, claims_release).
+     * So for any name: either its claim is visible to the caller, or the
+     * commit that ended it happened before the caller found the claim gone,
+     * and a reader started after that commit sees the rows. A row committed
+     * between the claim check and this read is seen, and harmless. What a
+     * reader cannot see - rows written by a transaction still open on
+     * another thread - is exactly what the claim covers, so it is never the
+     * only place a staged name is recorded.
+     *
+     * A thread inside a transaction asks the shared connection instead: it
+     * must see its own uncommitted rows (gc, reindex and a pack commit
+     * reading what they have just written), and only that connection does.
+     */
+    if (!db_txn_held() && db_readers_active()) {
+        uint64_t c[6];
+        int f = db_readers_locate(idx->repo_id, hex, c);
+        if (f == 1) {
+            memset(out, 0, sizeof(*out));
+            out->in_pack      = 1;
+            out->pack_id      = c[0];
+            out->offset       = c[1];
+            out->comp_size    = c[2];
+            out->orig_size    = c[3];
+            out->entry_index  = (uint32_t)c[4];
+            out->pack_version = (uint32_t)c[5];
+            return OK;
+        }
+        if (f == 0) return set_error(ERR_NOT_FOUND, "object not in any pack");
+        /* An error: ask the shared connection rather than call it absent. */
+    }
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)idx->repo_id);
