@@ -109,16 +109,24 @@ static void add_stored_json(cJSON *obj, const char *key, const char *text)
 
 api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
 {
-    (void)req;
-    char repo[32];
+    /* Paged like every other collection (B154). The default is the
+     * maximum, so a client that does not page still gets every schedule a
+     * deployment has in practice; past that it pages rather than answering
+     * an unbounded list. */
+    int nlim = 0, noff = 0;
+    api_response_t page_err;
+    if (routes_paging(req, 1000, 1000, &nlim, &noff, &page_err) != 0) return page_err;
+    char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(lim, sizeof(lim), "%d", nlim);
+    snprintf(off, sizeof(off), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_db,
             "SELECT id, action, trigger_type, trigger_spec, on_overlap, catchup,"
             "       enabled, last_fired_at, next_due_at, params, disabled_reason"
-            "  FROM schedules WHERE repo_id = ? ORDER BY id",
-            (const char *[]){ repo, NULL }, &r) != 0) {
+            "  FROM schedules WHERE repo_id = ? ORDER BY id LIMIT ? OFFSET ?",
+            (const char *[]){ repo, lim, off, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list schedules");
     }

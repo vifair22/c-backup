@@ -76,12 +76,22 @@ static int repo_row_add(cutils_json_elem_t *e, cutils_json_resp_t *r, char **row
 
 static api_response_t list_repos(const api_request_t *req, void *userdata)
 {
-    (void)req;
+    /* Paged like every other collection (B154). The default is the
+     * maximum, so a client that does not page still gets every repository a
+     * deployment has in practice; past that it pages rather than answering
+     * an unbounded list. */
     cutils_db_t *db = userdata;
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, 1000, 1000, &limit, &offset, &page_err) != 0) return page_err;
+    char lim[16], off[16];
+    snprintf(lim, sizeof(lim), "%d", limit);
+    snprintf(off, sizeof(off), "%d", offset);
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            REPO_COLUMNS " ORDER BY id", NULL, &r) != 0) {
+            REPO_COLUMNS " ORDER BY id LIMIT ? OFFSET ?",
+            (const char *[]){ lim, off, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list repos");
     }

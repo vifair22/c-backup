@@ -1495,7 +1495,13 @@ per-repository journal (`c-backup journal 1`) is the
 permanent record of what ran and how it ended. A journal entry's `source`
 says who asked: `api` for a job run by hand (the CLI and the app both go
 through the API), `schedule` for one a schedule fired, with the message
-starting `schedule <id>`.
+starting `schedule <id>`. Its `result` is how a job ended (`success`,
+`failed`, `cancelled`) or an advisory written beside one (`warning`, for an
+unconfirmed key escrow, a plaintext replica or a unit definition that needs
+attention; `alert`, for a missing pack). `journal --result` filters on
+exactly those five and refuses anything else, so a misspelt filter is an
+error rather than an empty history. The journal is newest first and pages
+with `--limit` (default 100, at most 1000) and `--offset`.
 
 **Deleting a snapshot** is not a job: it removes a few rows and one file and
 answers at once, `{"removed":true,"id":12,"tags_removed":0}`. It is
@@ -2476,7 +2482,7 @@ lists every command with all of its arguments.
 
 | Command | Purpose |
 |---|---|
-| `repo list` | Registered repositories |
+| `repo list [--limit N] [--offset N]` | Registered repositories |
 | `repo add <path> [label] [--encrypt system\|passphrase\|none] [--passphrase TEXT]` | Create or register |
 | `repo show <id>` | One repository; `degraded` says why it takes no backups, when it does not |
 | `repo repair <id> --accept-missing` | Accept a degraded repository's missing packs as lost (section 17.6) |
@@ -2499,12 +2505,12 @@ lists every command with all of its arguments.
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt] [--to-plaintext]` | Copy into another directory; `--reencrypt` into another repository under its own encryption; `--to-plaintext` to allow that repository to be unencrypted (section 14.1) |
 | `stats <id> [--scope staged]`, `summary <id>`, `fanout <id>` | Repository statistics; `staged` is objects in packs a running backup has not sealed |
-| `objects <id> [--location staged\|packed\|all] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
+| `objects <id> [--location staged\|packed\|all] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content] [--limit N] [--offset N]` | Objects; `--limit` and `--offset` page `refs` and are refused for the other views. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
 | `packs <id> [pack-id] [--limit N] [--offset N]` | Packs, or one pack's entries |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
-| `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
-| `journal <id> [--limit N] [--result STATE]` | Operation history |
-| `schedule list\|add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
+| `tag list <id> [--limit N] [--offset N]`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
+| `journal <id> [--limit N] [--offset N] [--result success\|failed\|cancelled\|warning\|alert]` | Operation history, newest first; any other `--result` is refused |
+| `schedule list <id> [--limit N] [--offset N]`, `schedule add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
 | `jobs [--limit N] [--offset N]`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
 | `auth status` | Whether an admin password is set |
 | `auth setup\|password` | Set or change the admin password (prompts) |
