@@ -89,8 +89,13 @@ status_t units_sweep(cutils_db_t *db, int64_t self_job, units_sweep_result_t *ou
 /* ---- watchdog ---- */
 
 /* One pass: release freezes older than freeze_timeout_s and pauses older
- * than max_pause_s, from this thread, whatever the job thread is doing. */
-status_t units_watchdog_tick(cutils_db_t *db, time_t now, unsigned *released);
+ * than max_pause_s, from this thread, whatever the job thread is doing.
+ * now_ms is wall-clock milliseconds, as units_now_ms() reads it. */
+status_t units_watchdog_tick(cutils_db_t *db, int64_t now_ms, unsigned *released);
+
+/* Wall-clock milliseconds: unit_intents.created_at is in this unit, so a
+ * hold's limit is measured to the millisecond, not to the second. */
+int64_t units_now_ms(void);
 /* A thread running a tick every interval_ms. */
 status_t units_watchdog_start(cutils_db_t *db, unsigned interval_ms);
 void     units_watchdog_stop(void);
