@@ -701,6 +701,124 @@ static void test_catchup_run_once_without_history_fires_at_startup(void **state)
     assert_true(due_of(once) > after);
 }
 
+/*
+ * B155: an interval schedule that had never fired was anchored to whenever
+ * it was last recomputed, and every daemon start recomputes every schedule.
+ * `schedule add 1 backup 86400` on a host restarted more often than daily
+ * was always a day away and never ran. These model the restarts with
+ * scheduler_recompute_startup at chosen instants; no wall clock involved.
+ */
+#define SPEC_DAILY "{\"type\":\"interval\",\"seconds\":86400}"
+#define B155_C ((time_t)1720000000)   /* creation */
+#define B155_I ((time_t)86400)
+
+/* A schedule as the create route stores it: created now, due one interval on. */
+static int64_t add_created(const char *action, const char *catchup)
+{
+    int64_t sid = add_schedule(action, SPEC_DAILY, B155_C + B155_I, "skip", catchup);
+    char id[32], c[32];
+    snprintf(id, sizeof(id), "%lld", (long long)sid);
+    snprintf(c,  sizeof(c),  "%lld", (long long)B155_C);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE schedules SET created_at = ? WHERE id = ?",
+        (const char *[]){ c, id, NULL }, NULL), 0);
+    return sid;
+}
+
+static void test_b155_restart_before_first_run_keeps_creation_anchor(void **state)
+{
+    (void)state;
+    int64_t skip = add_created("backup", "skip");
+    int64_t once = add_created("verify", "run_once");
+
+    /* Two restarts inside the first interval: neither moves the due time.
+     * Before the fix each made it restart + 86400. */
+    scheduler_recompute_startup(db, B155_C + 3600);
+    assert_int_equal(due_of(skip), B155_C + B155_I);
+    assert_int_equal(due_of(once), B155_C + B155_I);
+    scheduler_recompute_startup(db, B155_C + 80000);
+    assert_int_equal(due_of(skip), B155_C + B155_I);
+    assert_int_equal(due_of(once), B155_C + B155_I);
+
+    /* A recompute outside startup (an enable, a tick) anchors the same way. */
+    assert_int_equal(scheduler_recompute(db, skip, B155_C + 80001), OK);
+    assert_int_equal(due_of(skip), B155_C + B155_I);
+
+    /* And so it fires, at creation + interval. */
+    assert_int_equal(scheduler_tick(sched, B155_C + B155_I - 1), OK);
+    assert_int_equal(g_fires, 0);
+    assert_int_equal(scheduler_tick(sched, B155_C + B155_I), OK);
+    assert_int_equal(g_fires, 2);
+}
+
+/* After a fire the fire is the anchor, across a restart, and a job that then
+ * failed does not change that or earn a catch-up run at the next start: the
+ * window was not missed, it ran and failed. */
+static void test_b155_restart_after_a_run_keeps_last_fire_anchor(void **state)
+{
+    (void)state;
+    int64_t skip = add_created("backup", "skip");
+    int64_t once = add_created("verify", "run_once");
+    time_t fired = B155_C + B155_I;
+    assert_int_equal(scheduler_tick(sched, fired), OK);
+    assert_int_equal(g_fires, 2);
+    assert_int_equal(due_of(skip), fired + B155_I);
+    assert_int_equal(due_of(once), fired + B155_I);
+
+    char sid[32];
+    snprintf(sid, sizeof(sid), "%lld", (long long)once);
+    int64_t job = add_job("verify", "failed");
+    char jid[32];
+    snprintf(jid, sizeof(jid), "%lld", (long long)job);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE jobs SET schedule_id = ? WHERE id = ?",
+        (const char *[]){ sid, jid, NULL }, NULL), 0);
+
+    scheduler_recompute_startup(db, fired + 5000);
+    assert_int_equal(due_of(skip), fired + B155_I);
+    assert_int_equal(due_of(once), fired + B155_I);
+    scheduler_recompute_startup(db, fired + 80000);
+    assert_int_equal(due_of(skip), fired + B155_I);
+    assert_int_equal(due_of(once), fired + B155_I);
+    assert_int_equal(scheduler_tick(sched, fired + 80000), OK);
+    assert_int_equal(g_fires, 2);
+}
+
+/* Down across three windows. skip moves to the next window on the creation
+ * grid and fires nothing now; run_once fires exactly once at the start, then
+ * counts from that fire. Both before and after a first fire. */
+static void test_b155_downtime_past_due_follows_catchup(void **state)
+{
+    (void)state;
+    int64_t skip  = add_created("backup", "skip");
+    int64_t never = add_created("verify", "run_once");
+    int64_t fired = add_created("gc", "run_once");
+
+    char id[32], last[32];
+    snprintf(id,   sizeof(id),   "%lld", (long long)fired);
+    snprintf(last, sizeof(last), "%lld", (long long)(B155_C + B155_I));
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE schedules SET last_fired_at = ?, next_due_at = ? + 86400 WHERE id = ?",
+        (const char *[]){ last, last, id, NULL }, NULL), 0);
+
+    time_t up = B155_C + 3 * B155_I + 100;
+    scheduler_recompute_startup(db, up);
+    assert_int_equal(due_of(skip), B155_C + 4 * B155_I);
+    assert_int_equal(due_of(never), up);
+    assert_int_equal(due_of(fired), up);
+
+    assert_int_equal(scheduler_tick(sched, up), OK);
+    assert_int_equal(g_fires, 2);
+    assert_int_equal(due_of(never), up + B155_I);
+    assert_int_equal(due_of(fired), up + B155_I);
+    assert_int_equal(due_of(skip), B155_C + 4 * B155_I);
+
+    /* Once, not once per missed window. */
+    assert_int_equal(scheduler_tick(sched, up + 1), OK);
+    assert_int_equal(scheduler_tick(sched, up + 3600), OK);
+    assert_int_equal(g_fires, 2);
+}
+
 /* An unparseable trigger disables its schedule rather than failing the tick
  * forever: one bad row must not stop every other schedule on the machine. */
 static void test_bad_trigger_disables_schedule(void **state)
@@ -916,6 +1034,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_catchup_skip_moves_forward, setup, teardown),
         cmocka_unit_test_setup_teardown(test_catchup_run_once_fires_now, setup, teardown),
         cmocka_unit_test_setup_teardown(test_catchup_run_once_without_history_fires_at_startup, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_b155_restart_before_first_run_keeps_creation_anchor, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_b155_restart_after_a_run_keeps_last_fire_anchor, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_b155_downtime_past_due_follows_catchup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_bad_trigger_disables_schedule, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_bad_schedule_does_not_block_others, setup, teardown),
         cmocka_unit_test_setup_teardown(test_idle_scheduler_does_not_spin, setup, teardown),

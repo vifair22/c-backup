@@ -85,6 +85,18 @@ static void piece(block_source_t *b, uint64_t s, uint64_t e, int zero, int more,
     else { b->span_open = 0; b->span_emitted = 0; }
 }
 
+/* A zero segment can be terabytes: handed to the tap in bounded pieces. */
+static status_t tap_zero(block_source_t *b, uint64_t s, uint64_t e)
+{
+    while (s < e) {
+        uint64_t n = e - s > ((uint64_t)1 << 30) ? ((uint64_t)1 << 30) : e - s;
+        status_t st = b->o.tap(b->o.tap_ctx, s, NULL, (size_t)n);
+        if (st != OK) return st;
+        s += n;
+    }
+    return OK;
+}
+
 /* Load the segment starting at scan: known zeroes, or the next window. */
 static status_t load_segment(block_source_t *b)
 {
@@ -112,7 +124,7 @@ static status_t load_segment(block_source_t *b)
         b->seg_s = b->scan;
         b->seg_e = b->ext_end;
         b->st.zero_skipped += b->seg_e - b->seg_s;
-        return OK;
+        return b->o.tap ? tap_zero(b, b->seg_s, b->seg_e) : OK;
     }
     uint64_t n = b->ext_end - b->scan;
     if (n > b->cap) n = b->cap;
@@ -122,7 +134,7 @@ static status_t load_segment(block_source_t *b)
     b->seg = SEG_BUF;
     b->seg_s = b->scan;
     b->seg_e = b->scan + n;
-    return OK;
+    return b->o.tap ? b->o.tap(b->o.tap_ctx, b->seg_s, b->win, (size_t)n) : OK;
 }
 
 static status_t bs_next_piece(void *ctx, uint64_t *s, uint64_t *e, int *got, int *more)
@@ -277,6 +289,31 @@ status_t block_source_open(const sp_block_stream_t *bs, uint64_t size,
     return OK;
 }
 
+/*
+ * Start over at off with no span open and no run of zeroes pending. The
+ * window is kept when off lies inside it (a restart just behind where the
+ * last re-chunk stopped reading is common), and so is the extent it was
+ * read from; otherwise both are fetched afresh at off.
+ */
+static status_t bs_seek(void *ctx, uint64_t off)
+{
+    block_source_t *b = ctx;
+    if (off > b->size) return set_error(ERR_INVALID, "block source: seek past the end");
+    int keep = b->seg != SEG_NONE && off >= b->seg_s && off < b->seg_e;
+    if (!keep) {
+        b->seg = SEG_NONE;
+        b->ext_valid = 0;
+    }
+    b->scan = off;
+    b->in_z = 0;
+    b->span_open = 0;
+    b->span_emitted = 0;
+    b->cursor = off;
+    b->finished = 0;
+    b->piece_s = b->piece_e = off;
+    return OK;
+}
+
 cdc_source_t block_source_iface(block_source_t *b)
 {
     cdc_source_t s = {
@@ -284,6 +321,7 @@ cdc_source_t block_source_iface(block_source_t *b)
         .read       = bs_read,
         .ctx        = b,
         .next_piece = bs_next_piece,
+        .seek       = bs_seek,
     };
     return s;
 }

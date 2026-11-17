@@ -823,14 +823,19 @@ static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, struct sp_s
 /* Capture                                                             */
 /* ------------------------------------------------------------------ */
 
-static status_t pause_one(struct sp_ctx *c, const member_t *m, int pause)
+/* *already (may be NULL) 1 when the container was in that state before:
+ * an unpause that finds it running means something else unpaused it. */
+static status_t pause_one(struct sp_ctx *c, const member_t *m, int pause, int *already)
 {
     char path[160];
     snprintf(path, sizeof(path), "/containers/%s/%s", m->id, pause ? "pause" : "unpause");
     docker_api_t a = c->api;
     a.timeout_s = c->pol->pause_timeout_s ? c->pol->pause_timeout_s : 5;
     /* 409: already in that state, which is the state wanted. */
-    return docker_call(&a, "POST", path, NULL, 409, NULL, NULL);
+    long http = 0;
+    status_t st = docker_call(&a, "POST", path, NULL, 409, &http, NULL);
+    if (already) *already = st == OK && http == 409;
+    return st;
 }
 
 typedef struct {
@@ -843,7 +848,7 @@ typedef struct {
 static void *pause_main(void *arg)
 {
     pause_job_t *j = arg;
-    j->st = pause_one(j->c, j->m, 1);
+    j->st = pause_one(j->c, j->m, 1, NULL);
     if (j->st != OK) snprintf(j->why, sizeof(j->why), "%.250s", err_msg());
     err_clear();
     return NULL;
@@ -891,12 +896,17 @@ struct group_snaps {
 
 static snap_set_t *snaps_of(struct sp_session *s) { return s->grp ? &s->grp->set : &s->snaps; }
 
-/* Unpause every member this session paused, clearing each hold. */
-static void unpause_all(struct sp_session *s, int64_t *hold, int *paused)
+/* Unpause every member this session paused, clearing each hold. Returns
+ * how many were found already running: the watchdog unpaused them first,
+ * and their journal rows went with that release. */
+static unsigned unpause_all(struct sp_session *s, int64_t *hold, int *paused)
 {
+    unsigned lost = 0;
     for (size_t i = 0; i < s->n_members; i++) {
         if (!paused[i]) continue;
-        if (pause_one(s->c, &s->members[i], 0) == OK) {
+        int already = 0;
+        if (pause_one(s->c, &s->members[i], 0, &already) == OK) {
+            lost += (unsigned)already;
             paused[i] = 0;
             if (s->has_holds && hold[i] && s->holds.clear(s->holds.ctx, hold[i]) != OK) err_clear();
         } else {
@@ -905,6 +915,7 @@ static void unpause_all(struct sp_session *s, int64_t *hold, int *paused)
             err_clear();
         }
     }
+    return lost;
 }
 
 static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_req_t *req,
@@ -964,7 +975,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         if (!m->running || m->paused || m->never) continue;
         jobs[i] = (pause_job_t){ c, m, ERR_IO, "not attempted" };
         char detail[128];
-        snprintf(detail, sizeof(detail), "docker:%s", m->id);
+        snprintf(detail, sizeof(detail), "docker:%.79s", m->id);
         if (s->has_holds && s->holds.record(s->holds.ctx, SP_HOLD_PAUSE, detail, &hold_ids[i]) != OK) {
             snprintf(jobs[i].why, sizeof(jobs[i].why), "%.250s", err_msg());
             err_clear();
@@ -991,7 +1002,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     if (pause_failed) {
         /* 6.5: unpause what paused and take the snapshot unpaused, which is
          * still crash-consistent in one instant, and fails otherwise. */
-        unpause_all(s, hold_ids, paused);
+        (void)unpause_all(s, hold_ids, paused);
         if (instants > 1) {
             session_free(s);
             return set_error(ERR_IO, "docker: %s did not pause and spans %u snapshot instants", unit->unit_id, instants);
@@ -1007,6 +1018,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     char why[512] = "";
     if (st != OK) snprintf(why, sizeof(why), "%.500s", err_msg());
     int keep = st == OK && hold && any_paused;
+    unsigned lost = 0;
     if (keep) {
         /* Still paused: the journal rows stay, so the watchdog releases it
          * at max_pause_s if the caller never does. */
@@ -1015,9 +1027,12 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         memcpy(s->paused, paused, sizeof(paused));
         memcpy(s->hold, hold_ids, sizeof(hold_ids));
     } else {
-        unpause_all(s, hold_ids, paused);
+        lost = unpause_all(s, hold_ids, paused);
         s->info.pause_ms = any_paused ? ms_now() - t0 : 0;
     }
+    /* A member unpaused before the snapshot ran while it was taken: the
+     * pause no longer fixes the instants together. */
+    int held_through = any_paused && !lost;
     if (st != OK) { session_free(s); return set_error(st, "%s", why); }
 
     /* Post hooks run after the unpause and the snapshot (6.6); a held
@@ -1031,16 +1046,21 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
 
     sp_consistency_t lvl;
     if (!running) lvl = SP_CONSIST_OFFLINE;
-    else if ((fallback && !keep) || (instants > 1 && !any_paused)) lvl = SP_CONSIST_INCONSISTENT;
+    else if ((fallback && !keep) || (instants > 1 && !held_through)) lvl = SP_CONSIST_INCONSISTENT;
     else if (ran && failed == 0) lvl = SP_CONSIST_APPLICATION;
     else lvl = SP_CONSIST_CRASH;
     if (fallback && running && !keep)
         (void)sp_session_info_warn(&s->info, "%zu mount(s) on no snapshot domain read live (fallback-live)", fallback);
     if (instants > 1 && !any_paused && running)
         (void)sp_session_info_warn(&s->info, "%u snapshot instants without a pause", instants);
+    if (lost)
+        (void)sp_session_info_warn(&s->info, "the pause on %u member(s) was released by the watchdog within "
+                                   "%llu ms; consistency is %s", lost,
+                                   (unsigned long long)s->info.pause_ms, sp_consistency_name(lvl));
     s->info.achieved = lvl;
     s->info.consist_flags = (any_paused ? SP_CF_PAUSED : 0) | (s->snaps.n ? SP_CF_FS_SNAPSHOT : 0) |
-                            (ran && failed == 0 ? SP_CF_HOOK_PRE_OK : 0) | (keep ? SP_CF_PAUSE_HELD : 0);
+                            (ran && failed == 0 ? SP_CF_HOOK_PRE_OK : 0) | (keep ? SP_CF_PAUSE_HELD : 0) |
+                            (lost ? SP_CF_WATCHDOG_RELEASED : 0);
     if (lvl < req->require) {
         (void)snap_release(&c->snap, &s->snaps, c->pol->daemon_id, s->has_holds ? &s->holds : NULL);
         session_free(s);
@@ -1060,8 +1080,11 @@ static status_t d_release(sp_session_t *s, int *cap_hit)
     *cap_hit = 0;
     if (!s->held) return OK;
     uint64_t held_ms = ms_now() - s->pause_t0;
-    *cap_hit = held_ms > (uint64_t)s->c->pol->max_pause_s * 1000u;
-    unpause_all(s, s->hold, s->paused);
+    /* The unpause finding a member running is the proof; the clock alone
+     * misses a watchdog that measures from the journal row, a little
+     * before the pause. */
+    unsigned lost = unpause_all(s, s->hold, s->paused);
+    *cap_hit = lost > 0 || held_ms > (uint64_t)s->c->pol->max_pause_s * 1000u;
     s->held = 0;
     s->info.pause_ms = held_ms;
     if (*cap_hit) {
@@ -1127,10 +1150,13 @@ static status_t d_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
             member_t m;
             memset(&m, 0, sizeof(m));
             snprintf(m.id, sizeof(m.id), "%s", in->detail + 7);
+            int already = 0;
             st = strspn(m.id, "0123456789abcdef") == strlen(m.id) && m.id[0]
-                     ? pause_one(c, &m, 0) : set_error(ERR_INVALID, "docker: bad pause detail");
-            /* A container that is gone is not paused. */
-            if (st == ERR_NOT_FOUND) { err_clear(); st = OK; }
+                     ? pause_one(c, &m, 0, &already) : set_error(ERR_INVALID, "docker: bad pause detail");
+            /* A container that is gone is not paused. Either way nothing
+             * was held, which the watchdog must hear (provider.h). */
+            if (st == ERR_NOT_FOUND) { err_clear(); st = OK; already = 1; }
+            if (st == OK && req->absent) req->absent[i] = already;
         } else if (strcmp(in->kind, SP_HOLD_FS_SNAPSHOT) == 0) {
             st = snap_release_detail(&c->snap, in->detail, req->daemon8 ? req->daemon8 : c->pol->daemon_id);
         } else {
@@ -1294,12 +1320,16 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
     if (st == OK && g->set.n) st = snap_take(&c->snap, &g->set, c->pol->daemon_id, req->job_id, g->has_holds ? &g->holds : NULL);
     char why[512] = "";
     if (st != OK) snprintf(why, sizeof(why), "%.500s", err_msg());
-    /* Unpause whatever paused, whatever happened. */
+    /* Unpause whatever paused, whatever happened. One already running was
+     * unpaused by the watchdog, perhaps before the snapshot. */
     m = 0;
+    unsigned lost = 0;
     for (size_t k = 0; k < n && ss[k]; k++)
         for (size_t i = 0; i < ss[k]->n_members && m < nm; i++, m++) {
             if (!pz[m]) continue;
-            if (pause_one(c, &ss[k]->members[i], 0) == OK) {
+            int already = 0;
+            if (pause_one(c, &ss[k]->members[i], 0, &already) == OK) {
+                lost += (unsigned)already;
                 if (g->has_holds && hid[m] && g->holds.clear(g->holds.ctx, hid[m]) != OK) err_clear();
             } else {
                 log_error("docker: cannot unpause %s: %s", ss[k]->members[i].name, err_msg());
@@ -1317,16 +1347,21 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
         }
         sp_consistency_t lvl;
         if (!running[k]) lvl = SP_CONSIST_OFFLINE;
-        else if (fallback[k] || (instants > 1 && !any_paused)) lvl = SP_CONSIST_INCONSISTENT;
+        else if (fallback[k] || (instants > 1 && !(any_paused && !lost))) lvl = SP_CONSIST_INCONSISTENT;
         else if (ran[k] && failed[k] == 0) lvl = SP_CONSIST_APPLICATION;
         else lvl = SP_CONSIST_CRASH;
         if (fallback[k] && running[k])
             (void)sp_session_info_warn(&s->info, "%zu mount(s) on no snapshot domain read live (fallback-live)", fallback[k]);
+        if (lost)
+            (void)sp_session_info_warn(&s->info, "the group's pause on %u member(s) was released by the "
+                                       "watchdog within %llu ms; consistency is %s", lost,
+                                       (unsigned long long)pause_ms, sp_consistency_name(lvl));
         (void)sp_session_info_warn(&s->info, "captured with %zu other unit(s) at one instant", n - 1);
         s->info.achieved = lvl;
         s->info.pause_ms = pause_ms;
         s->info.consist_flags = (any_paused ? SP_CF_PAUSED : 0) | (g->set.n ? SP_CF_FS_SNAPSHOT : 0) |
-                                (ran[k] && failed[k] == 0 ? SP_CF_HOOK_PRE_OK : 0);
+                                (ran[k] && failed[k] == 0 ? SP_CF_HOOK_PRE_OK : 0) |
+                                (lost ? SP_CF_WATCHDOG_RELEASED : 0);
         if (lvl < req->require)
             st = set_error(ERR_IO, "docker: %s reached %s, below the %s required", units[k]->unit_id,
                            sp_consistency_name(lvl), sp_consistency_name(req->require));

@@ -53,7 +53,10 @@ CLI="$(realpath "$BIN/c-backup")"
 # The socket path has to fit in sun_path, which a deep work dir would not.
 SOCK_DIR="$(mktemp -d /tmp/cbacc.XXXXXX)"
 SOCK="$SOCK_DIR/s"
-PORT=$((20000 + $$ % 10000))
+# Chosen by the kernel, so a run beside another suite on this host cannot
+# land on its port (FLAKE-13); it was derived from the pid.
+. "$(dirname "$0")/free_port.sh"
+PORT=$(free_ports 1 "$SOCK_DIR") || { echo "cannot choose a TCP port" >&2; exit 1; }
 PASSWORD="acceptance-$$-password"
 
 PASS=0; FAIL=0
@@ -72,6 +75,17 @@ check() {  # check <id> <note> <condition-command...>
     local id="$1" note="$2"; shift 2
     if "$@"; then row "$id" PASS "$MS" "$note"; else row "$id" FAIL "$MS" "$note"; fi
 }
+
+# The config below is the whole of this run's settings, and a C_BACKUP_*
+# variable in the environment wins over the file. The shipped image sets
+# C_BACKUP_SECURITY_KEY_DIR, so inside it the daemon wrote keys to the
+# image's directory, $WORK/keys stayed empty and A4 failed (NIT-34); an
+# operator's own overrides would skew any other check the same way. Neither
+# daemon this script starts sees any of them: each is given its config path
+# and nothing else.
+for v in $(compgen -e); do
+    case "$v" in C_BACKUP_*) unset "$v" ;; esac
+done
 
 start_daemon() {
     C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
@@ -365,25 +379,47 @@ check L3 "a second daemon restores snapshot $NEWEST from the replica" cmp -s "$S
 kill -TERM "$REC_PID"; wait "$REC_PID" 2>/dev/null
 
 # ---- M. Shutdown and crash -------------------------------------------------------------
+# A stop "mid-backup" has to land mid-backup. A fixed sleep 5 did on a large
+# scale set and a quiet host; on a small set it landed after the job had
+# finished, and on a loaded host before the store had begun, and either way
+# the checks passed without testing what they name (FLAKE-17). This waits,
+# for at most two minutes, until the job is running and storing with files
+# both behind and ahead of it, and records whether it saw that.
+wait_mid_backup() {  # wait_mid_backup <job-id>; sets MID to 1 or 0
+    local i
+    MID=0
+    for i in $(seq 1 1200); do
+        if cb jobs "$1" 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+sys.exit(0 if d["state"] == "running" and d["phase"] == "store"
+         and 0 < d["current"] < d["total"] else 1)' 2>/dev/null; then
+            MID=1; return
+        fi
+        sleep 0.1
+    done
+}
 cb repo add "$WORK/repo-stop" Stop >/dev/null
 ST_ID=$(cb repo list | jget '[r["id"] for r in d["repos"] if r["label"]=="Stop"][0]')
 cb backup "$ST_ID" "$G_PATH" --no-wait > "$WORK/stop.json"
 SJ=$(jget 'd["job_id"]' < "$WORK/stop.json")
-sleep 5
+wait_mid_backup "$SJ"
 T0=$(now_ms); stop_daemon; MS=$(( $(now_ms) - T0 ))
-check M1 "SIGTERM mid-backup stops in order ($MS ms), socket removed" test ! -e "$SOCK"
+check M1 "SIGTERM mid-backup stops in order ($MS ms), socket removed" \
+    test "$MID" = 1 -a ! -e "$SOCK"
 start_daemon
 check M2 "the stopped backup is recorded cancelled" bash -c "'$CLI' --socket '$SOCK' jobs $SJ | grep -q '\"state\":\"cancelled\"'"
 cb repo add "$WORK/repo-crash" Crash >/dev/null
 CR_ID=$(cb repo list | jget '[r["id"] for r in d["repos"] if r["label"]=="Crash"][0]')
-cb backup "$CR_ID" "$G_PATH" --no-wait >/dev/null
-sleep 5
+CJ=$(cb backup "$CR_ID" "$G_PATH" --no-wait | jget 'd["job_id"]')
+wait_mid_backup "$CJ"
+CR_MID=$MID
 kill -KILL "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null
 start_daemon
 timed cb backup "$CR_ID" "$G_PATH"
 timed cb verify "$CR_ID" --level index --no-repair
 check M3 "after kill -9 mid-backup, the next backup is complete" \
-    bash -c "echo \"\$0\" | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"runs\"][0]; sys.exit(0 if r[\"missing\"]==0 else 1)'" "$OUT"
+    bash -c "[ \"\$1\" = 1 ] && echo \"\$0\" | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"runs\"][0]; sys.exit(0 if r[\"missing\"]==0 else 1)'" "$OUT" "$CR_MID"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL" | tee -a "$RESULTS"
 if [ "$KEEP" = 1 ]; then

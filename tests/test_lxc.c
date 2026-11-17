@@ -156,6 +156,34 @@ static void test_capture(void **state)
     be.ops->desc_free(d);
 }
 
+/* A freeze the watchdog undid before the thaw: the snapshot saw a running
+ * container. One instant still makes it crash-consistent, but the flags
+ * and a warning say the freeze did not last, and nothing is unfrozen. */
+static void test_freeze_lost(void **state)
+{
+    (void)state;
+    put(STATE "/lxc-DevBox.thaw", "");
+    sp_unit_desc_t *d = NULL;
+    assert_int_equal(be.ops->describe(be.ctx, "DevBox", &d), OK);
+    sp_begin_req_t q;
+    memset(&q, 0, sizeof(q));
+    q.job_id = 52;
+    q.require = SP_CONSIST_CRASH;
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    status_t bst = be.ops->begin(be.ctx, d, &q, &s, &info);
+    unlink(STATE "/lxc-DevBox.thaw");
+    if (bst != OK) fail_msg("begin: %s", err_msg());
+    assert_int_equal(info->achieved, SP_CONSIST_CRASH);
+    assert_false(info->consist_flags & SP_CF_FROZEN);
+    assert_true(info->consist_flags & SP_CF_WATCHDOG_RELEASED);
+    assert_true(info->n_warnings >= 1);
+    assert_non_null(strstr(info->warnings[info->n_warnings - 1], "watchdog"));
+    assert_int_equal(count(STATE "/lxc.log", "lxc-unfreeze"), 0);
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+}
+
 static void test_sweep_thaws(void **state)
 {
     (void)state;
@@ -168,10 +196,18 @@ static void test_sweep_thaws(void **state)
     rq.intents = &in;
     rq.n_intents = 1;
     rq.released = &rel;
+    int absent = 9;
+    rq.absent = &absent;
     sp_sweep_report_t rep;
     assert_int_equal(be.ops->sweep(be.ctx, &rq, &rep), OK);
     assert_int_equal(rel, 1);
+    assert_int_equal(absent, 0);
     assert_int_equal(be.unit_state(be.ctx, "DevBox"), SP_STATE_RUNNING);
+    /* Again, with nothing frozen: released as a no-op, and said so. */
+    rel = 0;
+    assert_int_equal(be.ops->sweep(be.ctx, &rq, &rep), OK);
+    assert_int_equal(rel, 1);
+    assert_int_equal(absent, 1);
 }
 
 static void test_define(void **state)
@@ -210,12 +246,24 @@ static void test_define(void **state)
     cJSON_Delete(res);
 }
 
+/* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
+ * that leaves anything behind (SCRATCH-1). Setup removes it too, so a
+ * killed run is no obstacle to the next. */
+static int group_cleanup(void **state)
+{
+    (void)state;
+    int rc = system("rm -rf '" D "'");
+    (void)rc;
+    return 0;
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_capture, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_freeze_lost, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_thaws, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
     };
-    return cmocka_run_group_tests(tests, NULL, NULL);
+    return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }

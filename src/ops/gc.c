@@ -8,7 +8,10 @@
 #include "manifest.h"
 #include "object.h"
 #include "pack.h"
+#include "repo.h"
 #include "db_txn.h"
+#include "store_index.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -68,7 +71,7 @@ static status_t mark_object_ex(mark_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_S
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_hex(hash, hex);
     db_result_t *r = NULL;
-    if (db_execute(ctx->db,
+    if (db_write_returning(ctx->db,
             "UPDATE objects SET refcount = refcount + 1"
             " WHERE repo_id = ? AND hash = ? RETURNING refcount, type",
             (const char *[]){ ctx->repo, hex, NULL }, &r) != 0)
@@ -269,13 +272,19 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         res.tmp_files_removed = store_sweep_tmp_before(store, time(NULL),
                                                        &res.tmp_bytes_removed);
 
+    /* A pack removed just before a power cut can leave its row (B147). */
+    if (!dry_run && store_index_drop_vanished_packs(db, repo_id) != OK) {
+        log_warn("gc: %s", err_msg());
+        err_clear();
+    }
+
     if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "gc: begin");
 
     /* Clear every mark first. Anything still at zero after the walk is
      * unreachable from any snapshot. */
-    if (db_execute_non_query(db, "UPDATE objects SET refcount = 0 WHERE repo_id = ?",
-                             (const char *[]){ repo, NULL }, NULL) != 0) {
+    if (db_write(db, "UPDATE objects SET refcount = 0 WHERE repo_id = ?",
+                 (const char *[]){ repo, NULL }, NULL) != 0) {
         db_txn_rollback(db);
         return set_error(ERR_IO, "gc: cannot clear marks");
     }
@@ -331,7 +340,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * later restore resolve an object this sweep declared dead, and once
      * compaction rewrites the pack the row points into bytes that belong to
      * something else. */
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "DELETE FROM pack_objects WHERE repo_id = ? AND hash IN"
             " (SELECT hash FROM objects WHERE repo_id = ? AND refcount = 0)",
             (const char *[]){ repo, repo, NULL }, NULL) != 0) {
@@ -339,7 +348,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_IO, "gc: cannot clear pack locations");
     }
 
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "DELETE FROM objects WHERE repo_id = ? AND refcount = 0",
             (const char *[]){ repo, NULL }, NULL) != 0) {
         db_txn_rollback(db);
@@ -408,6 +417,12 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     res.pack_entries_damaged = pstats.entries_damaged;
     res.damaged_listed       = pstats.damaged_listed;
     memcpy(res.damaged, pstats.damaged, sizeof(res.damaged));
+    res.packs_unwalkable  = pstats.packs_unwalkable;
+    res.dups_dropped      = pstats.dups_dropped;
+    res.dups_kept         = pstats.dups_kept;
+    res.index_relocated   = pstats.index_relocated;
+    res.unwalkable_listed = pstats.unwalkable_listed;
+    memcpy(res.unwalkable, pstats.unwalkable, sizeof(res.unwalkable));
     /* The sweep is committed whatever compaction did, so a caller reporting
      * a failed or cancelled gc can still say what it removed. */
     if (out) *out = res;
@@ -423,10 +438,32 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* Compaction finished; it copied these as they were rather than stop at
      * one lost object. Their new parity covers the damage, so they cannot
      * be corrected any more, and that is a failure to report (OWN-31). */
+    if (res.pack_entries_damaged > 0 && res.packs_unwalkable > 0)
+        return set_error(ERR_CORRUPT, "gc: %llu pack entr%s damaged beyond parity "
+                         "%s copied as damaged, and %u pack(s) could not be walked "
+                         "(first: pack-%010u.dat, %s); run verify with repair",
+                         (unsigned long long)res.pack_entries_damaged,
+                         res.pack_entries_damaged == 1 ? "y" : "ies",
+                         res.pack_entries_damaged == 1 ? "was" : "were",
+                         res.packs_unwalkable, res.unwalkable[0].pack,
+                         res.unwalkable[0].reason);
     if (res.pack_entries_damaged > 0)
         return set_error(ERR_CORRUPT, "gc: %llu pack entr%s damaged beyond parity "
-                         "were copied as damaged",
+                         "%s copied as damaged",
                          (unsigned long long)res.pack_entries_damaged,
-                         res.pack_entries_damaged == 1 ? "y" : "ies");
+                         res.pack_entries_damaged == 1 ? "y" : "ies",
+                         res.pack_entries_damaged == 1 ? "was" : "were");
+    /* A pack left whole because its headers cannot be walked holds space gc
+     * could not reclaim and, worse, damage nobody would otherwise hear
+     * about until a restore: the job fails and says which, as for damage. */
+    if (res.packs_unwalkable > 0 && store_needs_key(store))
+        return set_error(ERR_CORRUPT, "gc: %u pack(s) could not be walked (first: "
+                         "pack-%010u.dat); " REPO_SALVAGE_NEEDS_KEY,
+                         res.packs_unwalkable, res.unwalkable[0].pack);
+    if (res.packs_unwalkable > 0)
+        return set_error(ERR_CORRUPT, "gc: %u pack(s) could not be walked and were left "
+                         "as they are (first: pack-%010u.dat, %s); run verify with repair",
+                         res.packs_unwalkable, res.unwalkable[0].pack,
+                         res.unwalkable[0].reason);
     return OK;
 }

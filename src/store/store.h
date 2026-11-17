@@ -109,13 +109,37 @@ const struct repo_key *store_key(const store_t *st);
  * encrypted store whose key was not loaded (nothing may be written there).
  */
 /*
- * A pack number no other writer on this handle has been given. floor is the
- * next free number by directory scan (next_pack_num), which alone cannot
- * see a pack another writer is still staging in tmp/: two writers open at
- * once (a backup's chunk workers each seal their own packs) would scan the
- * same number and the second install would be refused.
+ * count consecutive pack numbers no writer has ever been given, the first in
+ * *out_first. scanned is the next free number by directory scan, which
+ * alone cannot see a pack another writer on this handle is still staging in
+ * tmp/, nor a pack that is gone (B156).
+ *
+ * With the repository's uuid set (store_set_uuid), the numbers are also
+ * above <repo>/pack-ids, and that mark is raised past them (a block at a
+ * time, PACK_IDS_BLOCK), durably, before this returns: a number is never reissued, even after its pack was dropped
+ * as missing and even after the index was lost (pack_ids.h). Without one -
+ * a bare store in a test or benchmark - only the scan, the index floor and
+ * this handle decide. ERR_IO when the mark cannot be written, in which case
+ * nothing may be written under any number.
  */
-uint32_t store_alloc_pack_num(store_t *st, uint32_t floor);
+status_t store_issue_pack_nums(store_t *st, uint32_t scanned, uint32_t count,
+                               uint32_t *out_first);
+
+/*
+ * Raise the mark a block ahead without taking a number, so that the next
+ * PACK_IDS_BLOCK numbers this handle issues need no I/O. A backup calls it
+ * (through pack_reserve_numbers) before its index batches hold the
+ * database's write lock. A no-op without a uuid.
+ */
+status_t store_reserve_pack_nums(store_t *st, uint32_t scanned);
+
+/* Turn on the pack-ids mark for this store: repo_store_open and the replica
+ * sink set it from the marker. */
+status_t store_set_uuid(store_t *st, const char *uuid);
+
+/* The lowest number the daemon's index says may be issued: its highest pack
+ * row or tombstone plus one. Only ever raises. store_index_bind sets it. */
+void store_raise_pack_floor(store_t *st, int64_t floor);
 
 struct cdc_params;
 status_t store_set_cdc(store_t *st, const struct cdc_params *p);
@@ -245,6 +269,21 @@ uint64_t store_write_stats_diff(const store_write_stats_t *after,
  */
 unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes);
 
+/*
+ * Take this handle's claim on tmp/ (an flock on tmp/.lock, held until
+ * store_close); 1 if held. Pack staging takes it, and
+ * store_sweep_tmp_before needs it to remove staging younger than an hour:
+ * without it, another handle may be writing, so only the hour rule applies.
+ * Callers that sweep with the claim: backup, gc, reindex, a replica sink's
+ * open, and registering an existing repository (B133).
+ *
+ * The invariant: an age-free sweep removes only staging whose every writer
+ * holds this claim or the repository's write lock (pack-dat., snap.,
+ * snapids., deleting.). The tag mirror's tags.* staging is written under
+ * neither, so it is removed by the hour rule alone.
+ */
+int store_claim_tmp(store_t *st);
+
 status_t store_locate(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],
                       store_location_t *out);
 
@@ -256,10 +295,10 @@ typedef struct {
     uint64_t comp_size;
     uint64_t orig_size;
     /* Position in the pack's on-disk entry order, which is what indexes the
-     * parity trailer's offsets table. It is NOT the position of this entry in
-     * the entries array: that array is sorted by hash before it is handed
-     * over. Recording the array position instead makes every parity lookup
-     * read the wrong offsets and silently disables repair. */
+     * trailer's CRC table. It is NOT the position of this entry in the
+     * entries array: that array is sorted by hash before it is handed over.
+     * Recording the array position instead makes every CRC check read
+     * another entry's slot and silently disables repair. */
     uint32_t entry_index;
     /* The object's type, so the commit can create the object's index row
      * when nothing recorded one before the pack was sealed (format 3: a
@@ -309,6 +348,19 @@ void store_emit_pack_removed(store_t *st, uint64_t pack_id);
  */
 typedef status_t (*store_pack_relocate_fn)(void *user, uint64_t pack_id,
                                            const pack_commit_entry_t *e);
+
+/*
+ * Make every index change so far durable (B142). The pack layer calls it
+ * before it removes a pack whose contents an index commit has moved
+ * elsewhere, or declared dead: the commit must be on disk before the only
+ * other copy goes, or a power cut can bring the commit back and leave the
+ * index naming a pack that is gone. OK when nothing is bound (a store that
+ * indexes its own packs reads them from disk at open, so has nothing to
+ * lose); the bound index's error otherwise, and then nothing is removed.
+ */
+typedef status_t (*store_index_sync_fn)(void *user);
+void     store_set_index_sync_cb(store_t *st, store_index_sync_fn cb, void *user);
+status_t store_emit_index_sync(store_t *st);
 void     store_set_pack_relocate_cb(store_t *st, store_pack_relocate_fn cb, void *user);
 status_t store_emit_pack_relocate(store_t *st, uint64_t pack_id,
                                   const pack_commit_entry_t *e);

@@ -74,7 +74,10 @@ static void test_defaults_are_applied(void **state)
     assert_int_equal(state_db_tune(db, &t), OK);
     assert_int_equal(pragma("synchronous"), 1);                 /* NORMAL */
     assert_int_equal(pragma("cache_size"), -64 * 1024);
-    assert_int_equal(pragma("wal_autocheckpoint"), 16384);
+    /* The handle never checkpoints; 16384 is the checkpointer's threshold,
+     * and the WAL file is trimmed to its cap (SPEED-3). */
+    assert_int_equal(pragma("wal_autocheckpoint"), 0);
+    assert_int_equal(pragma("journal_size_limit"), 16384LL * 4 * pragma("page_size"));
 }
 
 static void test_full_and_other_values(void **state)
@@ -84,7 +87,8 @@ static void test_full_and_other_values(void **state)
     assert_int_equal(state_db_tune(db, &t), OK);
     assert_int_equal(pragma("synchronous"), 2);
     assert_int_equal(pragma("cache_size"), -8 * 1024);
-    assert_int_equal(pragma("wal_autocheckpoint"), 2000);
+    assert_int_equal(pragma("wal_autocheckpoint"), 0);
+    assert_int_equal(pragma("journal_size_limit"), 2000LL * 4 * pragma("page_size"));
 }
 
 static void test_bad_values_are_refused(void **state)
@@ -134,6 +138,12 @@ static void test_flusher_syncs_changes_only(void **state)
     unsigned long n = 0;
     for (int i = 0; i < 200 && (n = state_db_flusher_syncs()) == 0; i++) sleep_ms(10);
     assert_true(n >= 1);
+    /* That first sync may have caught the WAL before the insert landed (the
+     * flusher's first tick can beat a slow insert), leaving one more sync
+     * due, which then fell inside the idle window below (FLAKE-17). Wait,
+     * bounded, until the WAL on disk is the one last synced. */
+    for (int i = 0; i < 500 && !state_db_flusher_current(); i++) sleep_ms(10);
+    assert_true(state_db_flusher_current());
 
     /* Idle: the WAL has not changed, so no further sync. */
     sleep_ms(120);

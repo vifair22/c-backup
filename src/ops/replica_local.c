@@ -11,6 +11,7 @@
 #include "repo_key.h"
 #include "snap_record.h"
 #include "snapshot_ids.h"
+#include "pack_ids.h"
 #include "util.h"
 
 #include <cutils/log.h>
@@ -22,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -269,10 +271,11 @@ static const cdc_params_t *local_target_cdc(void *vctx)
  * Present already (in the target or staged this run) means nothing written. */
 static status_t local_put_plain(void *vctx, uint8_t type, const void *data,
                                 size_t len, uint8_t out_hash[OBJECT_HASH_SIZE],
-                                int *out_is_new)
+                                int *out_is_new, uint64_t *out_stored)
 {
     local_ctx_t *c = vctx;
     *out_is_new = 0;
+    if (out_stored) *out_stored = 0;
     if (!c->tcdc)
         return set_error(ERR_INVALID, "replica: this sink only takes objects as stored");
     if (c->w) {
@@ -291,8 +294,10 @@ static status_t local_put_plain(void *vctx, uint8_t type, const void *data,
         if (st != OK) return st;
     }
     uint64_t phys = 0, payload = 0;
-    return pack_backup_add(c->bw, type, data, len, out_hash, out_is_new,
-                           &phys, &payload);
+    status_t st = pack_backup_add(c->bw, type, data, len, out_hash, out_is_new,
+                                  &phys, &payload);
+    if (st == OK && out_stored) *out_stored = phys;
+    return st;
 }
 
 /* Is a snapshot with this id and timestamp already here? A re-chunked
@@ -689,6 +694,7 @@ status_t replica_sink_local_open(const char *path,
         st = repo_marker_write_fixed(path, source_marker, &m);
         if (st != OK) { free(c); return st; }
         st = snapshot_ids_write(path, m.uuid, 0);
+        if (st == OK) st = pack_ids_write(path, m.uuid, 0);
         if (st != OK) { free(c); return st; }
     } else {
         st = repo_format_check(path, &m);
@@ -729,6 +735,18 @@ static status_t sink_finish_open(local_ctx_t *c, const char *path,
     if (st != OK) { repo_key_wipe(&c->dst_key); free(c); return st; }
     c->owns_store = 1;
     snprintf(c->uuid, sizeof(c->uuid), "%s", m->uuid);
+    /* The target numbers its packs from its own mark, as any repository. */
+    st = store_set_uuid(c->store, m->uuid);
+    if (st != OK) { store_close(c->store); repo_key_wipe(&c->dst_key); free(c->tcdc); free(c); return st; }
+
+    /*
+     * A replicate killed mid-copy leaves its staging pack in tmp/ (B133):
+     * up to the size of the object it was copying. This sink is about to
+     * write here; if it holds tmp/ (store_claim_tmp), nothing else is
+     * staging, and every staging file there is a dead writer's. Packs in
+     * packs/ are never touched: the sweep reads tmp/ only.
+     */
+    (void)store_sweep_tmp_before(c->store, time(NULL), NULL);
 
     build_index(c);
 
@@ -739,8 +757,21 @@ static status_t sink_finish_open(local_ctx_t *c, const char *path,
     return OK;
 }
 
+int replica_reencrypt_drops_encryption(const char *path,
+                                       const repo_marker_t *source_marker)
+{
+    if (!path || !source_marker || source_marker->enc_mode == REPO_ENC_NONE) return 0;
+    repo_marker_t m;
+    if (repo_marker_read(path, &m) != OK) {
+        err_clear();
+        return 0;
+    }
+    return m.enc_mode == REPO_ENC_NONE;
+}
+
 status_t replica_sink_local_open_reencrypt(const char *path,
                                            const repo_marker_t *source_marker,
+                                           int allow_plaintext,
                                            replica_sink_t *out)
 {
     if (!path || !source_marker || !out)
@@ -766,6 +797,14 @@ status_t replica_sink_local_open_reencrypt(const char *path,
         return set_error(ERR_INVALID,
                          "%s is a replica of this repository, not a different one; "
                          "replicate into it without --reencrypt", path);
+    /*
+     * Checked here as well as by the route: the route answers before the
+     * job is queued, and this holds when the job runs, after anything that
+     * could have replaced the target in between.
+     */
+    if (source_marker->enc_mode != REPO_ENC_NONE && m.enc_mode == REPO_ENC_NONE &&
+        !allow_plaintext)
+        return set_error(ERR_INVALID, REPLICA_PLAINTEXT_REFUSAL, path);
 
     local_ctx_t *c = calloc(1, sizeof(*c));
     if (!c) return set_error(ERR_NOMEM, "replica: alloc");

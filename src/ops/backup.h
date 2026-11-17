@@ -39,6 +39,23 @@ typedef struct {
  * A failure fails the whole backup: a unit snapshot is committed only when
  * every item stored.
  */
+/*
+ * How one synthetic entry's content is stored, asked once it is open
+ * (docs/vm-backup.md 5.3): read in full (the default), as an incremental
+ * against a base content with the changed ranges the source can give, or
+ * not read at all because it is provably the base's content (REUSE: the
+ * entry names base, which the repository already holds).
+ */
+typedef enum { BACKUP_SYNTH_FULL = 0, BACKUP_SYNTH_DELTA = 1, BACKUP_SYNTH_REUSE = 2 } backup_synth_how_t;
+
+typedef struct {
+    backup_synth_how_t  how;
+    uint8_t             base[OBJECT_HASH_SIZE];
+    cdc_changed_fn      changed;        /* DELTA */
+    void               *changed_ctx;
+    cdc_delta_result_t *delta;          /* DELTA: what it did; may be NULL */
+} backup_synth_method_t;
+
 typedef struct {
     status_t (*open)(void *ctx, size_t index, cdc_source_t *src, uint64_t *size);
     void     (*close)(void *ctx, size_t index, status_t st, const cdc_result_t *cr);
@@ -51,6 +68,8 @@ typedef struct {
      * open may also say CDC_SIZE_STREAM, and the size is then what stored.
      */
     int      (*keep)(void *ctx, size_t index);
+    /* Optional, asked after open: how to store the entry. NULL: in full. */
+    status_t (*method)(void *ctx, size_t index, backup_synth_method_t *out);
 } backup_synth_ops_t;
 
 typedef struct {
@@ -157,6 +176,10 @@ typedef struct {
     /* Chunk workers the run used for files over 16 MiB: 1 when every chunk
      * was stored on the backup thread. */
     unsigned store_workers;
+    /* Large files stored at once, each by a worker with a pack writer of its
+     * own: 1 when they went one at a time. Bounded by the chunk workers and
+     * by how many pack writers the buffer budget covers. */
+    unsigned file_workers;
     /*
      * Index transactions committed, by the phase that held them: the store
      * phase's batches, the trees batch, index_nodes' batches, and the pack

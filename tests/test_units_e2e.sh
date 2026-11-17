@@ -10,6 +10,9 @@
 set -u
 
 DAEMON="${1:-build/bins/c-backupd}"
+# A write made outside the write lock aborts the daemon here rather than
+# landing in another thread's transaction unnoticed (B157, db_write.h).
+export C_BACKUP_TXN_GUARD=abort
 CLI="${2:-build/bins/c-backup}"
 TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
 mkdir -p "$TEST_ROOT"
@@ -173,7 +176,11 @@ lacks    "without its name" "$ENAME" "$OUT"
 OUT=$(cb snapshot delete 1 1 --force 2>&1); RC=$?
 check    "the exported snapshot cannot be deleted, even forced" 1 "$RC"
 contains "and says why" "is exported" "$OUT"
-contains "gc defers while it is open" "gc deferred" "$(cb gc 1 2>&1)"
+GJ=$(cb gc 1 --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+sleep 1.5
+OUT=$(cb jobs "$GJ")
+contains "gc waits in the queue while it is open" '"state":"queued"' "$OUT"
+contains "and says what for" 'waiting for an NBD export to close' "$OUT"
 OUT=$(cb vm export 1 1 domain.xml 2>&1); RC=$?
 check    "only disks are exported" 1 "$RC"
 OUT=$(cb vm export 1 1 vda --ttl 10s 2>&1); RC=$?
@@ -182,6 +189,10 @@ OUT=$(cb vm unexport "$EID"); RC=$?
 check    "revoking it succeeds" 0 "$RC"
 check    "and removes the socket" "no" "$([ -e "$ESOCK" ] && echo yes || echo no)"
 contains "it is recorded as revoked" '"close_reason":"revoked"' "$(cb vm export-show "$EID")"
+for _ in $(seq 1 50); do
+    case "$(cb jobs "$GJ")" in *'"state":"completed"'*) break ;; esac; sleep 0.1
+done
+contains "and the waiting gc runs once it closes" '"state":"completed"' "$(cb jobs "$GJ")"
 contains "gc runs again" '"state":"completed"' "$(cb gc 1)"
 contains "the journal has it" "nbd-export" "$(cb journal 1)"
 OUT=$(cb vm export 1 1 vda --ttl 2m)
@@ -217,6 +228,14 @@ check    "an unknown key is refused" 1 "$RC"
 contains "gfs runs over every group" '"state":"completed"' "$(cb gfs 1)"
 check    "each unit keeps its head" 2 "$(cb unit history 1 | grep -o '"unit_key"' | wc -l)"
 
+echo "incremental chain"
+OUT=$(cb vm checkpoints 1 cbk-uat-a)
+contains "a VM's chain is shown" '"tokens":[]' "$OUT"
+contains "with whether incrementals are on" '"enabled":false' "$OUT"
+contains "reset-incremental answers for the unit" '"unit_key":"libvirt:cbk-uat-a"' "$(cb vm reset-incremental 1 cbk-uat-a)"
+OUT=$(cb vm checkpoints 1 2>&1); RC=$?
+check    "checkpoints without a unit are refused" 1 "$RC"
+
 echo "schedules"
 contains "a units schedule with --all" '"id"' "$(cb schedule add 1 units 3600 --provider fake --all --exclude 'cbk-uat-b')"
 contains "a units schedule naming a unit" '"id"' "$(cb schedule add 1 units 3600 --provider fake --unit cbk-uat-a)"
@@ -240,6 +259,17 @@ contains "reindex completes" '"state":"completed"' "$(cb reindex 1)"
 check    "unit history is rebuilt from the repository" "$BEFORE" "$(cb unit history 1)"
 
 contains "no holds are left open" '"holds_open":0' "$(cb unit providers)"
+
+echo "removing a repository with an export open"
+# Retention has run since: unit a's newest snapshot, not snapshot 1.
+SA=$(cb unit history 1 --provider fake cbk-uat-a --limit 1 | sed -n 's/.*"snapshots":\[{"id":\([0-9]*\).*/\1/p')
+EID4=$(cb vm export 1 "$SA" vda | jget export_id)
+ESOCK4="$WORK/ex/$EID4.sock"
+check    "it is open" "yes" "$([ -S "$ESOCK4" ] && echo yes || echo no)"
+OUT=$(cb repo remove 1); RC=$?
+check    "the repository is removed" 0 "$RC"
+check    "and its export is revoked first, socket gone" "no" "$([ -e "$ESOCK4" ] && echo yes || echo no)"
+contains "it says why" '"close_reason":"repository removed"' "$(cb vm export-show "$EID4" 2>&1)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

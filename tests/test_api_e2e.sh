@@ -12,6 +12,9 @@
 set -u
 
 BIN="${1:-build/bins/c-backupd}"
+# A write made outside the write lock aborts the daemon here rather than
+# landing in another thread's transaction unnoticed (B157, db_write.h).
+export C_BACKUP_TXN_GUARD=abort
 # Scratch goes where the Makefile says (C_BACKUP_TEST_DIR), and on disk when
 # run by hand: /tmp is often a tmpfs, so dense scratch there is RAM.
 TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
@@ -20,14 +23,11 @@ WORK="$(mktemp -d "$TEST_ROOT/c_backup_api_e2e.XXXXXX")"
 SOCK="$WORK/c.sock"
 # Per run, so two suites running at once (CI jobs on one runner, parallel
 # worktrees) cannot answer each other's requests. A fixed port made a second
-# daemon fail to bind, or worse, sent a request to the other run's daemon.
-PORT=$((20000 + ($$ % 20000)))
-# Skip past ports something already holds: the base is derived from the pid,
-# and anything bound there (a listener, or an outgoing connection that drew
-# it from the ephemeral range) made the daemon exit with "cannot start API
-# server" about once in a few dozen runs.
-port_busy() { ss -Htan "( sport = :$1 )" 2>/dev/null | grep -q .; }
-while port_busy "$PORT"; do PORT=$((PORT + 1)); [ "$PORT" -gt 64990 ] && PORT=20000; done
+# daemon fail to bind, or worse, sent a request to the other run's daemon,
+# and a pid-derived one checked with `ss` could still be taken between the
+# check and the bind. The kernel chooses it now (FLAKE-13).
+. "$(dirname "$0")/free_port.sh"
+PORT=$(free_ports 1 "$WORK") || { echo "cannot choose a TCP port"; exit 1; }
 PASS=0
 FAIL=0
 
@@ -159,6 +159,24 @@ refuses "unsettled policy" "backup.unsettled: 'maybe' is not one of store, skip"
     'backup:' '  unsettled: maybe'
 refuses "store workers out of range" "backup.store_workers: '65' is not between 0 and 64" \
     'backup:' '  store_workers: 65'
+# An empty value is not a choice either (NIT-18): c-utils reads it as unset,
+# so `unsettled: ""` started as store and an empty port as 8765.
+refuses "empty unsettled policy" \
+    "bad.yaml:7: error: backup.unsettled: an empty value is not allowed; set one of store, skip" \
+    'backup:' '  unsettled: ""'
+refuses "bare file cache mode" "bad.yaml:7: error: backup.file_cache_match: an empty value" \
+    'backup:' '  file_cache_match:'
+refuses "empty synchronous" "db.synchronous: an empty value is not allowed" \
+    'db:' '  synchronous: ""   # comment'
+refuses "empty integer" \
+    "bad.yaml:7: error: jobs.max_parallel: an empty value is not allowed; set a whole number" \
+    'jobs:' '  max_parallel: ""'
+out=$(printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: 0\n' "$WORK" "$WORK" \
+          > "$WORK/bad.yaml"; chmod 600 "$WORK/bad.yaml"
+      C_BACKUP_BACKUP_UNSETTLED= C_BACKUP_CONFIG_PATH="$WORK/bad.yaml" timeout 10 "$BIN" 2>&1)
+contains "empty unsettled from the environment refused" \
+    "C_BACKUP_BACKUP_UNSETTLED (backup.unsettled): an empty value is not allowed" "$out"
+rm -f "$WORK/bad.db" "$WORK/bad.db-wal" "$WORK/bad.db-shm" "$WORK/bad.sock"
 refuses "tab indentation" "bad.yaml:6: error: tab in the indentation" \
     "$(printf '\tbind: 127.0.0.1')"
 # log.level among other problems: it was dropped from the list.
@@ -306,6 +324,14 @@ if [ -n "$TOKEN" ]; then ok "login returns a token"; else bad "login returns a t
 check "bearer accepted" 200 "$(tcp_code /repos -H "Authorization: Bearer $TOKEN")"
 check "bare token accepted" 200 "$(tcp_code /repos -H "Authorization: $TOKEN")"
 check "bad token refused" 401 "$(tcp_code /repos -H "Authorization: Bearer nonesuch")"
+# B127 follow-up: no empty or wrongly typed credential gets anywhere.
+check "an empty bearer token is refused" 401 "$(tcp_code /repos -H "Authorization: Bearer ")"
+check "an empty cookie is refused" 401 "$(tcp_code /repos -b "auth=")"
+check "an empty password does not log in" 401 \
+    "$(tcp_code /api/auth/login -X POST -d '{"password":""}')"
+check "a numeric password is a 400" 400 "$(tcp_code /api/auth/login -X POST -d '{"password":1}')"
+check "a null password is a 400" 400 "$(tcp_code /api/auth/login -X POST -d '{"password":null}')"
+check "a missing password is a 400" 400 "$(tcp_code /api/auth/login -X POST -d '{}')"
 check "cookie accepted" 200 "$(tcp_code /repos -b "auth=$TOKEN")"
 # B082: the key was read into the route context and then cleared when the
 # routes registered, so the flag was parsed and never honoured.
@@ -1185,13 +1211,17 @@ contains "deep verify completed" '"state":"completed"' "$(sock_body "/jobs/$DEEP
 # B106: the job says what kind of run it was. A dry run's counts on a healthy
 # repository are identical to a repairing run's, so nothing else does.
 contains "a plain verify is deep and repairing" \
-    '"level":"deep","repair":true,"dry_run":false,"unsettled_files":0}' "$(sock_body "/jobs/$DEEP_JOB")"
+    '"level":"deep","repair":true,"dry_run":false,' "$(sock_body "/jobs/$DEEP_JOB")"
 DRY_RESP=$(curl -s -X POST --unix-socket "$SOCK" \
            "http://localhost/repos/1/verify?dry_run=1")
 DRY_JOB=$(job_id "$DRY_RESP")
 wait_job "$DRY_JOB"
 contains "a dry run is the same level, with repair off" \
-    '"level":"deep","repair":false,"dry_run":true,"unsettled_files":0}' "$(sock_body "/jobs/$DRY_JOB")"
+    '"level":"deep","repair":false,"dry_run":true,' "$(sock_body "/jobs/$DRY_JOB")"
+contains "and carries counts that add up, with no failure" \
+    '"missing":0,"failed":false,' "$(sock_body "/jobs/$DRY_JOB")"
+contains "and how many files may be torn, a notice" \
+    '"failed":false,"unsettled_files":0,' "$(sock_body "/jobs/$DRY_JOB")"
 check "unknown verify level rejected" 400 \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
        "http://localhost/repos/1/verify?level=sideways")"
@@ -1225,6 +1255,46 @@ done
 REPO1=$(sock_body /repos/1)
 contains "a repo id is a number"          '"id":1,'               "$REPO1"
 contains "key_escrowed is a boolean"      '"key_escrowed":false'  "$REPO1"
+contains "a whole repository is not degraded" '"degraded":null'   "$REPO1"
+# B150: repair is only ever an explicit acceptance, and a whole repository
+# has nothing to accept.
+check "repair without accept_missing is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' \
+     -X POST --unix-socket "$SOCK" http://localhost/repos/1/repair)"
+contains "repair of a whole repository drops nothing" '"packs_missing":0' \
+    "$(curl -s -X POST --unix-socket "$SOCK" -d '{"accept_missing":true}' \
+         http://localhost/repos/1/repair)"
+check "GET the repair"           "405 POST"        "$(sock_method GET /repos/1/repair)"
+contains "a whole repository's state is ok" '"state":"ok"'      "$REPO1"
+contains "and it is not unavailable"      '"unavailable":null'    "$REPO1"
+
+# NIT-37/38, B156: a repository whose root is an empty mountpoint is
+# unavailable: shown so, and every job on it refused before it is touched -
+# a backup creates nothing there, and a verify claims no data loss.
+echo "unavailable repository"
+R=$(sock_send POST /repos "{\"path\":\"$WORK/gonerepo\",\"label\":\"gone\"}")
+GONE=$(printf '%s' "$R" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+mv "$WORK/gonerepo" "$WORK/gonerepo.mounted"
+mkdir "$WORK/gonerepo"
+GB=$(sock_body "/repos/$GONE")
+contains "an empty mountpoint is unavailable" '"state":"unavailable"' "$GB"
+contains "saying why"                     '.cbackup marker'        "$GB"
+contains "and listed so"                  '"state":"unavailable"'  "$(sock_body /repos)"
+GJ=$(job_id "$(sock_send POST "/repos/$GONE/backup" "{\"paths\":[\"$WORK/src\"]}")")
+wait_job "$GJ"
+GJB=$(sock_body "/jobs/$GJ")
+contains "the backup is refused"          '"state":"failed"'       "$GJB"
+contains "as unavailable"                 'is unavailable'         "$GJB"
+check "and nothing is created in the mountpoint" "" "$(ls -A "$WORK/gonerepo")"
+GV=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" "http://localhost/repos/$GONE/verify?level=deep")")
+wait_job "$GV"
+GVB=$(sock_body "/jobs/$GV")
+contains "a verify is refused as unavailable" 'is unavailable'     "$GVB"
+case "$GVB" in *"data loss"*|*MISSING*) bad "and claims no data loss" "no loss" "$GVB" ;;
+               *) ok "and claims no data loss" ;; esac
+check "still nothing in the mountpoint"   ""                       "$(ls -A "$WORK/gonerepo")"
+rmdir "$WORK/gonerepo"
+mv "$WORK/gonerepo.mounted" "$WORK/gonerepo"
+contains "mounted again, it is ok"        '"state":"ok"'           "$(sock_body "/repos/$GONE")"
 contains "an unset label is null"         '"label":null'          "$(sock_body /repos/2)"
 TREE=$(sock_body "/repos/1/snapshots/$NEWEST/tree?parent=0")
 contains "a tree type is a number"        '"type":2,'             "$TREE"
@@ -1247,8 +1317,8 @@ contains "an object type is a number"     '"type":1,'             "$LOC"
 # on first append, so a query with no rows used to serialise as {} and every
 # client had to handle two shapes depending on whether data happened to exist.
 echo "empty collections"
-contains "empty journal filter keeps its key" '"entries"' \
-    "$(sock_body '/repos/1/journal?result=nonesuch')"
+contains "empty journal filter keeps its key" '"entries":[]' \
+    "$(sock_body '/repos/1/journal?result=alert')"
 contains "empty search keeps its key" '"results"' \
     "$(sock_body '/repos/1/search?q=zzzznotathing')"
 contains "empty object refs keep their key" '"refs"' \
@@ -1489,6 +1559,127 @@ wait_retry_after "$LAST"
 check "the right password works once it lapses" 200 \
     "$(tcp_code /api/auth/login -X POST -d '{"password":"brandnewpassword"}')"
 
+# B154: packs and diff read no limit or offset and the journal no offset, so
+# `packs --limit 1 --offset 1` answered every pack and every journal page
+# was the first. A repository of its own, three backups that each change
+# every file: several packs, a six-change diff and several journal entries.
+echo "every collection pages (B154)"
+mkdir -p "$WORK/pgsrc"
+pg_files() { for i in 1 2 3 4 5 6; do echo "$1 $i" > "$WORK/pgsrc/pgfile$i"; done; }
+PG_BODY=$(curl -s -X POST --unix-socket "$SOCK" \
+          -d "{\"path\":\"$WORK/pgrepo\",\"label\":\"paging\"}" http://localhost/repos)
+PG=$(printf '%s' "$PG_BODY" | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
+contains "paging repository registered" '"id":' "$PG_BODY"
+for gen in one two three; do
+    pg_files "$gen"
+    wait_job "$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
+        -d "{\"paths\":[\"$WORK/pgsrc\"]}" "http://localhost/repos/$PG/backup")")"
+done
+PG_SNAPS=$(sock_body "/repos/$PG/snapshots?limit=10" | grep -oE '"id":[0-9]+' | tr -dc '0-9\n')
+PG_S1=$(printf '%s\n' "$PG_SNAPS" | sort -n | head -1)
+PG_S2=$(printf '%s\n' "$PG_SNAPS" | sort -n | sed -n 2p)
+
+# nth_field <body> <field> <n>: the field of the nth element, 1-based.
+nth_field() { printf '%s' "$1" | grep -oE "\"$2\":(\"[^\"]*\"|[0-9]+)" | sed -n "${3}p"; }
+count_of() { printf '%s' "$1" | grep -oE "\"$2\":" | grep -c .; }
+
+PG_PACKS=$(sock_body "/repos/$PG/packs?limit=5000")
+PG_NP=$(count_of "$PG_PACKS" filename)
+check "the paging repository has at least two packs" yes "$([ "$PG_NP" -ge 2 ] && echo yes || echo "$PG_NP")"
+PG_P1=$(sock_body "/repos/$PG/packs?limit=1&offset=1")
+check "packs: limit caps the page" 1 "$(count_of "$PG_P1" filename)"
+check "packs: offset skips to the second pack" "$(nth_field "$PG_PACKS" filename 2)" \
+    "$(nth_field "$PG_P1" filename 1)"
+contains "packs: an offset past the end is an empty page" '"packs":[]' \
+    "$(sock_body "/repos/$PG/packs?offset=$PG_NP")"
+check "packs: the maximum is 5000" \
+    '{"error":"limit is out of range; it must be from 1 to 5000 (a larger one, up to 9007199254740992, is reduced to 5000)"} 400' \
+    "$(sock_send GET "/repos/$PG/packs?limit=0")"
+check "packs: a limit over the maximum is clamped" "$PG_NP" \
+    "$(count_of "$(sock_body "/repos/$PG/packs?limit=99999")" filename)"
+check "packs: a malformed offset is a 400" 400 "$(sock_code "/repos/$PG/packs?offset=x")"
+
+PG_DIFF=$(sock_body "/repos/$PG/diff?from=$PG_S1&to=$PG_S2")
+check "diff: six files changed" 6 "$(count_of "$PG_DIFF" change)"
+contains "diff: the counts cover the comparison" '"modified":6' "$PG_DIFF"
+PG_D=$(sock_body "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&limit=2&offset=3")
+check "diff: limit caps the page" 2 "$(count_of "$PG_D" change)"
+check "diff: offset skips three changes" "$(nth_field "$PG_DIFF" path 4)" "$(nth_field "$PG_D" path 1)"
+check "diff: and the page holds the next" "$(nth_field "$PG_DIFF" path 5)" "$(nth_field "$PG_D" path 2)"
+contains "diff: a page still counts every change" '"modified":6' "$PG_D"
+contains "diff: truncated says more follow the page" '"truncated":true' "$PG_D"
+contains "diff: the last page is not truncated" '"truncated":false' \
+    "$(sock_body "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&limit=2&offset=4")"
+contains "diff: an offset past the end is an empty page" '"changes":[]' \
+    "$(sock_body "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&offset=6")"
+check "diff: the maximum is 5000" \
+    '{"error":"limit is out of range; it must be from 1 to 5000 (a larger one, up to 9007199254740992, is reduced to 5000)"} 400' \
+    "$(sock_send GET "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&limit=0")"
+check "diff: a malformed offset is a 400" 400 \
+    "$(sock_code "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&offset=-1")"
+
+PG_J=$(sock_body "/repos/$PG/journal?limit=1000")
+PG_NJ=$(count_of "$PG_J" operation)
+check "the paging repository has three journal entries" yes "$([ "$PG_NJ" -ge 3 ] && echo yes || echo "$PG_NJ")"
+PG_J2=$(sock_body "/repos/$PG/journal?limit=2&offset=1")
+check "journal: limit caps the page" 2 "$(count_of "$PG_J2" operation)"
+check "journal: offset skips the newest entry" "$(nth_field "$PG_J" id 2)" "$(nth_field "$PG_J2" id 1)"
+check "journal: and the page holds the next" "$(nth_field "$PG_J" id 3)" "$(nth_field "$PG_J2" id 2)"
+check "journal: the maximum is 1000" \
+    '{"error":"limit is out of range; it must be from 1 to 1000 (a larger one, up to 9007199254740992, is reduced to 1000)"} 400' \
+    "$(sock_send GET "/repos/$PG/journal?limit=0")"
+check "journal: a malformed offset is a 400" 400 "$(sock_code "/repos/$PG/journal?offset=x")"
+# NIT-32: a result nothing journals answered [] like a clean history.
+for v in bogus completed SUCCESS; do
+    check "journal: result=$v is refused" \
+        '{"error":"result must be one of: success, failed, cancelled, warning, alert"} 400' \
+        "$(sock_send GET "/repos/$PG/journal?result=$v")"
+done
+contains "journal: a valid result filters" '"result":"success"' \
+    "$(sock_body "/repos/$PG/journal?result=success&limit=1")"
+
+# Refs, search, tags, schedules and repos: offset was dropped or the list
+# was unbounded. Each now skips and caps like the rest.
+PG_OBJ=$(sock_body "/repos/$PG/diff?from=$PG_S1&to=$PG_S2&limit=1" \
+         | sed -n 's/.*"old_hash":"\([a-f0-9]*\)".*/\1/p')
+PG_R=$(sock_body "/repos/$PG/objects/$PG_OBJ/refs")
+check "refs: the old content is in one snapshot" 1 "$(count_of "$PG_R" snap_id)"
+contains "refs: offset skips it" '"refs":[]' "$(sock_body "/repos/$PG/objects/$PG_OBJ/refs?offset=1")"
+PG_SR=$(sock_body "/repos/$PG/search?q=pgfile&snapshot=$PG_S1")
+PG_SR1=$(sock_body "/repos/$PG/search?q=pgfile&snapshot=$PG_S1&limit=1&offset=1")
+check "search in a snapshot finds its six files" 6 "$(count_of "$PG_SR" node_id)"
+check "search in a snapshot: limit caps the page" 1 "$(count_of "$PG_SR1" node_id)"
+check "search in a snapshot: offset skips" "$(nth_field "$PG_SR" path 2)" "$(nth_field "$PG_SR1" path 1)"
+PG_SA=$(sock_body "/repos/$PG/search?q=pgfile")
+PG_SA1=$(sock_body "/repos/$PG/search?q=pgfile&limit=1&offset=1")
+check "search everywhere finds every version" 18 "$(count_of "$PG_SA" node_id)"
+check "search everywhere: limit caps the page" 1 "$(count_of "$PG_SA1" node_id)"
+check "search everywhere: offset skips a collapsed result" \
+    "$(nth_field "$PG_SA" hash 2)" "$(nth_field "$PG_SA1" hash 1)"
+contains "search: an offset past the scan is an empty page" '"results":[]' \
+    "$(sock_body "/repos/$PG/search?q=pgfile&offset=99999")"
+for n in a b c; do
+    sock_send POST "/repos/$PG/tags" "{\"name\":\"pg-$n\",\"snap_id\":$PG_S1}" >/dev/null
+done
+check "tags: paged by name" '"name":"pg-b"' \
+    "$(nth_field "$(sock_body "/repos/$PG/tags?limit=1&offset=1")" name 1)"
+check "tags: limit caps the page" 2 "$(count_of "$(sock_body "/repos/$PG/tags?limit=2")" name)"
+check "tags: the maximum is 1000" 400 "$(sock_code "/repos/$PG/tags?limit=0")"
+for t in 3600 7200; do
+    sock_send POST "/repos/$PG/schedules" \
+        "{\"action\":\"gc\",\"trigger\":{\"type\":\"interval\",\"seconds\":$t}}" >/dev/null
+done
+PG_SC=$(sock_body "/repos/$PG/schedules")
+check "schedules: two to page" 2 "$(count_of "$PG_SC" overlap)"
+check "schedules: offset skips one" "$(nth_field "$PG_SC" id 2)" \
+    "$(nth_field "$(sock_body "/repos/$PG/schedules?limit=1&offset=1")" id 1)"
+check "schedules: a malformed limit is a 400" 400 "$(sock_code "/repos/$PG/schedules?limit=x")"
+PG_RP=$(sock_body /repos)
+check "repos: offset skips one" "$(nth_field "$PG_RP" id 2)" \
+    "$(nth_field "$(sock_body '/repos?limit=1&offset=1')" id 1)"
+check "repos: limit caps the page" 1 "$(count_of "$(sock_body '/repos?limit=1')" uuid)"
+check "repos: a malformed offset is a 400" 400 "$(sock_code '/repos?offset=-1')"
+
 echo "shutdown"
 kill -TERM "$DAEMON_PID" 2>/dev/null
 for _ in $(seq 1 50); do
@@ -1591,7 +1782,7 @@ check "other jobs journal as they did" 4 "$(sock_body '/repos/1/journal?limit=10
 # read as atoi's 0, which for a tier means unlimited. Written straight into
 # the database, since the route refuses it now.
 if command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$R/state.db" "INSERT INTO policy_values (repo_id, key, value)
+    sqlite3 -cmd ".timeout 10000" "$R/state.db" "INSERT INTO policy_values (repo_id, key, value)
                            VALUES (1, 'retention.keep_daily', 'banana')" 2>/dev/null
     BAD=$(job_id "$(sock_post '/repos/1/gfs?dry_run=1')")
     wait_job "$BAD"
@@ -1608,7 +1799,7 @@ fi
 # Sunday is that year's last daily, weekly, monthly and yearly: 15. Read
 # back through the listing, which is what clients see.
 if command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$R/state.db" "UPDATE snapshots SET ts = 1735387200 WHERE repo_id = 1 AND id = 3;
+    sqlite3 -cmd ".timeout 10000" "$R/state.db" "UPDATE snapshots SET ts = 1735387200 WHERE repo_id = 1 AND id = 3;
                            UPDATE snapshots SET ts = 1735473600 WHERE repo_id = 1 AND id = 4"
     TIERS=$(job_id "$(sock_post /repos/1/gfs)")
     wait_job "$TIERS"
@@ -1630,7 +1821,7 @@ sock_post /repos "{\"path\":\"$R/repo2\",\"label\":\"q\\\"u\\\\o\"}" > /dev/null
 contains "the staler of two is named" \
     'cbackup_stalest_snapshot_repo_info{repo_id="1",label="r"} 1' "$(sock_body /metrics)"
 if command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$R/state.db" "UPDATE repos SET added_at = 0 WHERE id = 2"
+    sqlite3 -cmd ".timeout 10000" "$R/state.db" "UPDATE repos SET added_at = 0 WHERE id = 2"
     METRICS=$(sock_body /metrics)
     contains "and it moves when another becomes staler, label escaped" \
         'cbackup_stalest_snapshot_repo_info{repo_id="2",label="q\"u\\o"} 1' "$METRICS"
@@ -1726,7 +1917,7 @@ contains "an escaped label is listed intact" "\"id\":$LSID,\"ts\":" "$(sock_body
 contains "with its label" "\"label\":\"$LBL_OUT\"" "$(sock_body /repos/1/snapshots)"
 contains "the record holds it escaped" "\"label\":\"$LBL_OUT\"}" "$(cat "$R/repo/snapshots/$LSID")"
 if command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$R/state.db" "DELETE FROM nodes WHERE repo_id = 1;
+    sqlite3 -cmd ".timeout 10000" "$R/state.db" "DELETE FROM nodes WHERE repo_id = 1;
                            DELETE FROM node_fts WHERE repo_id = 1;
                            DELETE FROM snapshots WHERE repo_id = 1"
     check "no snapshots listed once the rows are gone" 0 \
@@ -1789,6 +1980,150 @@ SCH=$(sock_send POST /repos/1/schedules \
     "{\"action\":\"backup\",\"paths\":[\"$R/src\"],\"label\":\"$LBL_JSON\",\"trigger\":{\"type\":\"interval\",\"seconds\":86400}}")
 contains "a labelled backup schedule is created" ' 201' "$SCH"
 contains "and stores the label" "\"label\":\"$LBL_OUT\"" "$(sock_body /repos/1/schedules)"
+
+echo "no silent security downgrade (B127)"
+# An explicit field carries a valid value or is a 400 naming it. Empty or
+# unrecognised never means "none" or "off": "encrypt":"" and
+# "passphrase":"" each registered an unencrypted repository with a 201.
+# Every refusal must leave nothing behind.
+dg_state() {
+    sock_body /repos; sock_body /repos/1/snapshots
+    sock_body '/jobs?limit=1' | grep -o '"id":[0-9]*' | head -1
+    find "$R/keys" -type f -exec sha256sum {} + 2>/dev/null | sort
+}
+DG_BEFORE=$(dg_state)
+dg() {  # dg <name> <expected error> <path> [extra JSON members]
+    local out
+    out=$(sock_send POST /repos "{\"path\":\"$3\"${4:+,$4}}")
+    check "$1" "{\"error\":\"$2\"} 400" "$out"
+}
+ENC_BAD='encrypt must be none, system or passphrase'
+PASS_EMPTY='passphrase must not be empty; leave it out for a repository without one'
+DG="$R/dgrepo"
+dg "encrypt empty"            "$ENC_BAD" "$DG" '"encrypt":""'
+dg "encrypt unknown"          "$ENC_BAD" "$DG" '"encrypt":"aes"'
+dg "encrypt in capitals"      "$ENC_BAD" "$DG" '"encrypt":"SYSTEM"'
+dg "encrypt with a space"     "$ENC_BAD" "$DG" '"encrypt":" system"'
+dg "encrypt empty, with a passphrase" "$ENC_BAD" "$DG" '"encrypt":"","passphrase":"correct horse"'
+dg "encrypt null"             'encrypt must be a string' "$DG" '"encrypt":null'
+dg "encrypt true"             'encrypt must be a string' "$DG" '"encrypt":true'
+dg "encrypt as a list"        'encrypt must be a string' "$DG" '"encrypt":["system"]'
+dg "passphrase empty"         "$PASS_EMPTY" "$DG" '"passphrase":""'
+dg "passphrase empty, encrypt passphrase" "$PASS_EMPTY" "$DG" '"encrypt":"passphrase","passphrase":""'
+dg "passphrase empty, encrypt none" "$PASS_EMPTY" "$DG" '"encrypt":"none","passphrase":""'
+dg "passphrase as a number"   'passphrase must be a string' "$DG" '"passphrase":12345678'
+dg "passphrase null"          'passphrase must be a string' "$DG" '"passphrase":null'
+check "no refused request created the directory" "absent" \
+    "$([ -e "$DG" ] && echo present || echo absent)"
+check "or changed anything" "$DG_BEFORE" "$(dg_state)"
+# Absent is still the documented default.
+contains "encrypt left out is accepted" ' 201' \
+    "$(sock_send POST /repos "{\"path\":\"$R/plainrepo\",\"label\":\"plain\"}")"
+contains "as an unencrypted repository" '"encryption":"none"' \
+    "$(sock_body /repos | tr '}' '\n' | grep plainrepo)"
+
+# Re-registering: the marker decides, and a request naming a different mode,
+# "none" included, is refused rather than read as "not asked".
+ENC_OUT=$(sock_send POST /repos "{\"path\":\"$R/encrepo\",\"label\":\"enc\",\"encrypt\":\"system\"}")
+contains "an encrypted repository is created" ' 201' "$ENC_OUT"
+ENC_ID=$(printf '%s' "$ENC_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+ENC_KEY=$(printf '%s' "$ENC_OUT" | sed -n 's/.*"key":"\([0-9a-fA-F]*\)".*/\1/p')
+DG_BEFORE=$(dg_state)
+contains "re-register saying encrypt none is refused" \
+    "already a repository with encryption system" \
+    "$(sock_send POST /repos "{\"path\":\"$R/encrepo\",\"label\":\"x\",\"encrypt\":\"none\"}")"
+dg "re-register with encrypt empty"   "$ENC_BAD"    "$R/encrepo" '"label":"x","encrypt":""'
+dg "re-register with passphrase empty" "$PASS_EMPTY" "$R/encrepo" '"label":"x","passphrase":""'
+check "and the repository is unchanged, label included" "$DG_BEFORE" "$(dg_state)"
+contains "a plain re-register still works" '"already_registered":true' \
+    "$(sock_send POST /repos "{\"path\":\"$R/encrepo\"}")"
+
+# Key import: exactly 64 hex characters, or a 400.
+ki() { sock_send POST "/repos/$ENC_ID/key/import" "$1"; }
+for body in '{"key":""}' '{"key":"zz"}' "{\"key\":\"${ENC_KEY}00\"}" \
+            "{\"key\":\"+${ENC_KEY:1}\"}" "{\"key\":\"0x${ENC_KEY:2}\"}" \
+            '{"key":1}' '{"key":null}' '{"key":["k"]}' '{}'; do
+    contains "key import refuses $body" ' 400' "$(ki "$body")"
+done
+check "and no key file changed" "$DG_BEFORE" "$(dg_state)"
+contains "the right key is still accepted" '{"ok":true} 200' "$(ki "{\"key\":\"$ENC_KEY\"}")"
+
+# Replicate: reencrypt is true or false, dest a path.
+rp() { sock_send POST /repos/1/replicate "$1"; }
+for v in '"true"' '1' 'null' '""'; do
+    check "reencrypt $v is refused" '{"error":"reencrypt must be true or false"} 400' \
+        "$(rp "{\"dest\":\"$R/encrepo\",\"reencrypt\":$v}")"
+done
+contains "an empty dest is refused" ' 400' "$(rp '{"dest":"","reencrypt":true}')"
+contains "a non-string dest is refused" 'dest must be a string' "$(rp '{"dest":1}')"
+
+# Safety switches in the query: an unrecognised value used to read as off,
+# so "dry_run=yes" ran the real pass and "repair=no" repaired.
+check "gc dry_run=yes is refused" '{"error":"dry_run must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/gc?dry_run=yes')"
+check "gfs dry_run= is refused" '{"error":"dry_run must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/gfs?dry_run=')"
+check "verify repair=no is refused" '{"error":"repair must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/verify?repair=no')"
+check "verify dry_run=on is refused" '{"error":"dry_run must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/verify?dry_run=on')"
+check "snapshot delete force= is refused" '{"error":"force must be 1 or 0"} 400' \
+    "$(sock_send DELETE '/repos/1/snapshots/1?force=')"
+check "none of them started a job or removed anything" "$DG_BEFORE" "$(dg_state)"
+
+echo "re-encrypting into plaintext needs allow_plaintext"
+# reencrypt into a path holding an unencrypted repository wrote the whole
+# encrypted repository out in plaintext, with nothing in the request saying
+# that was meant. It takes "allow_plaintext":true now, and is logged and
+# journalled when it happens.
+wait_job "$(job_id "$(sock_post "/repos/$ENC_ID/backup" "{\"paths\":[\"$R/src\"]}")")"
+PT_OUT=$(sock_send POST /repos "{\"path\":\"$R/ptarget\",\"label\":\"pt\"}")
+contains "an unencrypted target is registered" ' 201' "$PT_OUT"
+pt_files() { find "$R/ptarget" -type f | sort; }
+PT_BEFORE="$(dg_state)
+$(pt_files)"
+PT_REFUSAL="this repository is encrypted and the target is not, so the copy would hold every file in plaintext; to do that deliberately, set allow_plaintext (CLI --to-plaintext) (target at $R/ptarget)"
+rp_enc() { sock_send POST "/repos/$ENC_ID/replicate" "$1"; }
+check "encrypted into plaintext without the flag is refused" \
+    "{\"error\":\"$PT_REFUSAL\"} 400" \
+    "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true}")"
+check "allow_plaintext false is the same refusal" \
+    "{\"error\":\"$PT_REFUSAL\"} 400" \
+    "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":false}")"
+for v in '"true"' '1' 'null' '""'; do
+    check "allow_plaintext $v is refused" \
+        '{"error":"allow_plaintext must be true or false"} 400' \
+        "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":$v}")"
+done
+contains "allow_plaintext without reencrypt is refused" \
+    'allow_plaintext applies only with reencrypt' \
+    "$(rp_enc "{\"dest\":\"$R/ptarget\",\"allow_plaintext\":true}")"
+check "no refusal wrote to the target or changed anything" "$PT_BEFORE" "$(dg_state)
+$(pt_files)"
+PT_JOB=$(job_id "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":true}")")
+wait_job "$PT_JOB"
+contains "with allow_plaintext it runs" '"state":"completed"' "$(sock_body "/jobs/$PT_JOB")"
+PT_MSG="replicated encrypted repo $ENC_ID into plaintext at $R/ptarget"
+for _ in $(seq 1 50); do grep -q "$PT_MSG" "$R/daemon.log" && break; sleep 0.1; done
+# The level, without depending on the log format: plain output carries no
+# level marker, and the <4> prefix appears only when the daemon finds a
+# journal (JOURNAL_STREAM under a systemd scope, not in CI). This daemon
+# runs at log.level warn, so the line being there at all means warning or
+# above - and the run's info-level summary being absent shows the filter is
+# what decided it.
+contains "and logs a warning" "$PT_MSG" "$(cat "$R/daemon.log")"
+check "at warning level: the info-level summary of the same run is filtered" 0 \
+    "$(grep -c "replicate: repo $ENC_ID -> $R/ptarget:" "$R/daemon.log")"
+contains "and journals it" "\"message\":\"$PT_MSG\"" "$(sock_body "/repos/$ENC_ID/journal")"
+# Unencrypted to unencrypted drops nothing, so it needs no flag.
+P2_OUT=$(sock_send POST /repos "{\"path\":\"$R/ptarget2\",\"label\":\"pt2\"}")
+contains "a second unencrypted target" ' 201' "$P2_OUT"
+P2_JOB=$(job_id "$(sock_post /repos/1/replicate "{\"dest\":\"$R/ptarget2\",\"reencrypt\":true}")")
+wait_job "$P2_JOB"
+contains "unencrypted into unencrypted needs no flag" '"state":"completed"' \
+    "$(sock_body "/jobs/$P2_JOB")"
+check "and is not journalled as a plaintext copy" 0 \
+    "$(sock_body /repos/1/journal | grep -c 'into plaintext')"
 
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null

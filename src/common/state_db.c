@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "state_db.h"
+#include "wal_sync.h"
+#include "checkpointer.h"
 
 #include <cutils/log.h>
 
@@ -63,13 +65,21 @@ status_t state_db_tune(cutils_db_t *db, const state_db_tuning_t *t)
         return set_error(ERR_INVALID, "state.db is not in WAL mode; refusing to "
                          "relax its sync settings");
 
-    /* Negative cache_size is KiB, independent of the page size. */
+    /* Negative cache_size is KiB, independent of the page size.
+     *
+     * wal_autocheckpoint 0: no COMMIT on this handle ever checkpoints. The
+     * configured interval is the checkpointer's threshold instead
+     * (checkpointer.h), which runs off the request path. journal_size_limit
+     * trims the WAL file back to the checkpointer's cap at each restart. */
     long long want_cache = -(long long)t->cache_mb * 1024;
-    char sql[160];
+    long long page = pragma_value(db, "page_size");
+    if (page <= 0) page = 4096;
+    long long want_limit = (long long)t->wal_autocheckpoint * CKPT_CAP_FACTOR * page;
+    char sql[200];
     snprintf(sql, sizeof(sql),
              "PRAGMA synchronous=%lld; PRAGMA cache_size=%lld; "
-             "PRAGMA wal_autocheckpoint=%d;",
-             want_sync, want_cache, t->wal_autocheckpoint);
+             "PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=%lld;",
+             want_sync, want_cache, want_limit);
     if (db_exec_raw(db, sql) != 0)
         return set_error(ERR_IO, "cannot apply state.db settings");
 
@@ -82,9 +92,13 @@ status_t state_db_tune(cutils_db_t *db, const state_db_tuning_t *t)
     if (got_cache != want_cache)
         return set_error(ERR_IO, "state.db cache_size is %lld after setting %lld",
                          got_cache, want_cache);
-    if (got_ckpt != t->wal_autocheckpoint)
-        return set_error(ERR_IO, "state.db wal_autocheckpoint is %lld after setting %d",
-                         got_ckpt, t->wal_autocheckpoint);
+    if (got_ckpt != 0)
+        return set_error(ERR_IO, "state.db wal_autocheckpoint is %lld after setting 0",
+                         got_ckpt);
+    long long got_limit = pragma_value(db, "journal_size_limit");
+    if (got_limit != want_limit)
+        return set_error(ERR_IO, "state.db journal_size_limit is %lld after setting %lld",
+                         got_limit, want_limit);
     return OK;
 }
 
@@ -102,9 +116,21 @@ static char            g_fl_wal[PATH_MAX];
 static atomic_ulong    g_fl_syncs;
 
 /* The WAL as last synced: a change in either means there is something new
- * to make durable. */
+ * to make durable. Written by whichever thread syncs (the flusher, or stop
+ * after joining it) and read by state_db_flusher_current, hence the lock. */
+static pthread_mutex_t g_fl_seen_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct timespec g_fl_mtime;
 static off_t           g_fl_size = -1;
+
+static int seen_matches(const struct stat *st)
+{
+    pthread_mutex_lock(&g_fl_seen_mu);
+    int same = st->st_size == g_fl_size &&
+               st->st_mtim.tv_sec == g_fl_mtime.tv_sec &&
+               st->st_mtim.tv_nsec == g_fl_mtime.tv_nsec;
+    pthread_mutex_unlock(&g_fl_seen_mu);
+    return same;
+}
 
 /*
  * Sync the WAL if it changed since the last sync. Through a descriptor of
@@ -117,20 +143,19 @@ static void flush_once(void)
 {
     struct stat st;
     if (stat(g_fl_wal, &st) != 0) return;
-    if (st.st_size == g_fl_size &&
-        st.st_mtim.tv_sec == g_fl_mtime.tv_sec &&
-        st.st_mtim.tv_nsec == g_fl_mtime.tv_nsec)
-        return;
-    int fd = open(g_fl_wal, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    if (fdatasync(fd) == 0) {
+    if (seen_matches(&st)) return;
+    /* wal_sync: the file's data, its directory entry the first time this
+     * -wal is synced, and only ever the live file (wal_sync.h). */
+    if (wal_sync(g_fl_wal) == OK) {
+        pthread_mutex_lock(&g_fl_seen_mu);
         g_fl_size  = st.st_size;
         g_fl_mtime = st.st_mtim;
+        pthread_mutex_unlock(&g_fl_seen_mu);
         atomic_fetch_add(&g_fl_syncs, 1);
     } else {
-        log_warn("state.db: cannot sync %s: %s", g_fl_wal, strerror(errno));
+        log_warn("state.db: %s", err_msg());
+        err_clear();
     }
-    close(fd);
 }
 
 static void *flusher_main(void *arg)
@@ -174,8 +199,10 @@ status_t state_db_flusher_start(const char *db_path, unsigned interval_ms)
     pthread_condattr_destroy(&ca);
     g_fl_interval_ms = interval_ms;
     g_fl_stop = 0;
+    pthread_mutex_lock(&g_fl_seen_mu);
     g_fl_size = -1;
     memset(&g_fl_mtime, 0, sizeof(g_fl_mtime));
+    pthread_mutex_unlock(&g_fl_seen_mu);
     atomic_store(&g_fl_syncs, 0);
     if (pthread_create(&g_fl_th, NULL, flusher_main, NULL) != 0) {
         pthread_cond_destroy(&g_fl_cv);
@@ -205,4 +232,11 @@ void state_db_flusher_stop(void)
 unsigned long state_db_flusher_syncs(void)
 {
     return atomic_load(&g_fl_syncs);
+}
+
+int state_db_flusher_current(void)
+{
+    struct stat st;
+    if (stat(g_fl_wal, &st) != 0) return 0;
+    return seen_matches(&st);
 }

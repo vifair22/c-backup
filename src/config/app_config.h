@@ -96,13 +96,14 @@ static const config_key_t app_file_keys[] = {
     { "jobs.max_parallel",   CFG_INT, "2",
       "Maximum concurrently running jobs across all repos",
       CFG_STORE_FILE, 0 },
-    /* Object buffers every job together may hold while reading (format 3,
+    /* Object and pack-writer buffers every job together may hold (format 3,
      * src/common/read_budget.h): one-shot AEAD holds a whole object, up to
-     * 16 MiB, until its tag verifies, so without a cap the resident total
-     * grows with jobs.max_parallel and each job's workers. Under 16 MiB is
-     * refused: an object that size could never be read. */
+     * 16 MiB, until its tag verifies, and each pack writer holds about
+     * 26 MiB of parity encoder and write buffer, so without a cap the
+     * resident total grows with jobs.max_parallel and each job's workers.
+     * Under 48 MiB is refused: one object and one writer must fit. */
     { "jobs.read_budget_mb", CFG_INT, "256",
-      "MiB of object buffers all jobs may hold at once while reading (16 or more)",
+      "MiB of object and pack-writer buffers all jobs may hold at once (48 or more)",
       CFG_STORE_FILE, 0 },
 
     /* How a backup recognises a file it does not need to read again. "auto"
@@ -146,7 +147,18 @@ static const config_key_t app_file_keys[] = {
       "state.db page cache, MiB (2 to 65536)",
       CFG_STORE_FILE, 0 },
     { "db.wal_autocheckpoint", CFG_INT, "16384",
-      "state.db pages written between automatic checkpoints (1000 to 1048576)",
+      "state.db log pages that start a background checkpoint (1000 to 1048576)",
+      CFG_STORE_FILE, 0 },
+
+    /* The mass-loss brake (B150): more packs than this missing at once and
+     * nothing is marked absent until an operator's repair accepts it. */
+    { "index.missing_brake_pct", CFG_INT, "5",
+      "Missing packs, as a percentage of a repository's, above which none is marked "
+      "absent without 'repo repair --accept-missing'; counts from two missing (0 to 100)",
+      CFG_STORE_FILE, 0 },
+    { "index.missing_brake_packs", CFG_INT, "10",
+      "Missing packs above which none is marked absent without 'repo repair "
+      "--accept-missing' (0 to 1000000)",
       CFG_STORE_FILE, 0 },
 
     /* What a retention pass keeps for a repository that has not set its own
@@ -189,6 +201,12 @@ static const config_key_t app_file_keys[] = {
     { "vm.export_ttl_s", CFG_INT, "14400",
       "Default lifetime of an NBD export, seconds (60 to 604800)",
       CFG_STORE_FILE, 0 },
+    /* Each connection keeps at most one chunk (16 MiB at most) under the
+     * read budget; app_config_check refuses a budget that cannot cover
+     * them beside one job's own floor. 0 turns exports off. */
+    { "vm.export_max_conns", CFG_INT, "4",
+      "NBD export connections open at once across every export (0 to 64; 0: off)",
+      CFG_STORE_FILE, 0 },
     { "vm.export_idle_s", CFG_INT, "1800",
       "An export with no connection for this long is closed, seconds",
       CFG_STORE_FILE, 0 },
@@ -205,6 +223,18 @@ static const config_key_t app_file_keys[] = {
       CFG_STORE_FILE, 0 },
     { "vm.trust_zero_status", CFG_INT, "1",
       "Skip reading disk extents reported as zero (0 reads them too)",
+      CFG_STORE_FILE, 0 },
+    /* Incremental disk reads (docs/vm-backup.md 5). Off until UAT has run
+     * them (5.3 and section 13, R3): the delta is new code on the
+     * correctness path, and every session reads in full until this is 1. */
+    { "vm.incremental", CFG_INT, "0",
+      "Read qcow2 disks of running VMs incrementally through checkpoints (0: every read full)",
+      CFG_STORE_FILE, 0 },
+    { "vm.delta_full_pct", CFG_INT, "75",
+      "Read a disk in full when an incremental would read more than this share of it, % (0 to 100; 0: never incremental)",
+      CFG_STORE_FILE, 0 },
+    { "vm.audit_days", CFG_INT, "30",
+      "Days between audit reads that check a disk's dirty bitmap against a full read (0: never)",
       CFG_STORE_FILE, 0 },
     { "containers.max_pause_s", CFG_INT, "30",
       "Watchdog bound on a container pause, seconds (1 to 600)",
@@ -224,6 +254,7 @@ static const config_section_t app_sections[] = {
     { "units",      "Units (VMs and containers)" },
     { "vm",         "Virtual Machines" },
     { "containers", "Containers" },
+    { "index",      "Index Integrity" },
     { NULL, NULL }
 };
 
@@ -237,8 +268,9 @@ static const config_section_t app_sections[] = {
 
 
 /* jobs.read_budget_mb: at least one object of the largest size format 3
- * allows; at most 1 TiB, past which it is not a budget. */
-#define APP_MIN_READ_BUDGET_MB 16
+ * allows and one pack writer's buffers (READ_BUDGET_MIN); at most 1 TiB,
+ * past which it is not a budget. */
+#define APP_MIN_READ_BUDGET_MB 48
 #define APP_MAX_READ_BUDGET_MB (1024 * 1024)
 
 /* Ranges, enumerations and the bind address, checked during config init

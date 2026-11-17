@@ -32,12 +32,14 @@
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +59,7 @@ typedef struct export_s {
     uint64_t         size;
     int64_t          expires;           /* wall clock */
     nbd_server_t    *srv;
+    atomic_ullong    cache_bytes;       /* read budget its readers hold now */
     struct export_s *next;
 } export_t;
 
@@ -65,21 +68,38 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static export_t       *g_list;
 static char            g_dir[PATH_MAX] = "/run/c-backupd/exports";
 static unsigned        g_ttl = 14400, g_idle = 1800;
+/* Connections across every export, each holding at most one chunk of the
+ * read budget (app_config_check holds the budget to cover them). */
+static unsigned        g_max_conns = 4;
+static atomic_uint     g_conns;
 
 /* ------------------------------------------------------------------ */
 /* The reader each connection gets                                     */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
+    export_t         *e;
     store_t          *store;
     store_index_t    *idx;
     content_reader_t *r;
+    uint64_t          counted;          /* this reader's part of e->cache_bytes */
 } conn_reader_t;
+
+/* Bring the export's count in step with what this reader holds. */
+static void cr_count(conn_reader_t *c)
+{
+    uint64_t now = c->r ? content_reader_cache_bytes(c->r) : 0;
+    if (now >= c->counted) atomic_fetch_add(&c->e->cache_bytes, now - c->counted);
+    else                   atomic_fetch_sub(&c->e->cache_bytes, c->counted - now);
+    c->counted = now;
+}
 
 static void cr_close(void *reader)
 {
     conn_reader_t *c = reader;
     if (!c) return;
+    if (c->r) { content_reader_drop(c->r); cr_count(c); }
+    atomic_fetch_sub(&g_conns, 1);
     content_reader_close(c->r);
     store_index_free(c->idx);
     if (c->store) store_close(c->store);
@@ -88,10 +108,16 @@ static void cr_close(void *reader)
 
 static status_t cr_open(void *ctx, void **reader, uint64_t *size)
 {
-    const export_t *e = ctx;
+    export_t *e = ctx;
     *reader = NULL;
+    if (atomic_fetch_add(&g_conns, 1) >= g_max_conns) {
+        atomic_fetch_sub(&g_conns, 1);
+        return set_error(ERR_BUSY, "export %lld: %u connections are open across every export, "
+                         "the limit (vm.export_max_conns)", (long long)e->id, g_max_conns);
+    }
     conn_reader_t *c = calloc(1, sizeof(*c));
-    if (!c) return set_error(ERR_NOMEM, "export reader");
+    if (!c) { atomic_fetch_sub(&g_conns, 1); return set_error(ERR_NOMEM, "export reader"); }
+    c->e = e;
     status_t st = repo_store_open_keyed(e->repo_path, NULL, &c->store);
     if (st == OK) st = store_index_bind(c->store, g_db, e->repo_id, &c->idx);
     if (st == OK) st = content_reader_open(c->store, e->hash, &c->r, size);
@@ -105,12 +131,25 @@ static status_t cr_open(void *ctx, void **reader, uint64_t *size)
 
 static status_t cr_read(void *reader, uint64_t off, void *buf, size_t len)
 {
-    return content_reader_read(((conn_reader_t *)reader)->r, off, buf, len);
+    conn_reader_t *c = reader;
+    status_t st = content_reader_read(c->r, off, buf, len);
+    cr_count(c);
+    return st;
 }
 
 static status_t cr_extents(void *reader, uint64_t off, uint64_t len, nbd_extent_fn fn, void *fctx)
 {
-    return content_reader_extents(((conn_reader_t *)reader)->r, off, len, fn, fctx);
+    conn_reader_t *c = reader;
+    status_t st = content_reader_extents(c->r, off, len, fn, fctx);
+    cr_count(c);
+    return st;
+}
+
+static void cr_idle(void *reader)
+{
+    conn_reader_t *c = reader;
+    content_reader_drop(c->r);
+    cr_count(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -122,9 +161,9 @@ static void close_row(int64_t id, const char *reason)
     char ids[32], now[32];
     snprintf(ids, sizeof(ids), "%lld", (long long)id);
     snprintf(now, sizeof(now), "%lld", (long long)time(NULL));
-    if (db_execute_non_query(g_db, "UPDATE exports SET closed_at = ?, close_reason = ?"
-                                   " WHERE id = ? AND closed_at IS NULL",
-                             (const char *[]){ now, reason, ids, NULL }, NULL) != 0)
+    if (db_write(g_db, "UPDATE exports SET closed_at = ?, close_reason = ?"
+                       " WHERE id = ? AND closed_at IS NULL",
+                 (const char *[]){ now, reason, ids, NULL }, NULL) != 0)
         log_warn("export %lld: cannot record its close", (long long)id);
 }
 
@@ -143,18 +182,20 @@ static void export_end(export_t *e, const char *reason)
     free(e);
 }
 
-void routes_exports_init(cutils_db_t *db, const char *dir, unsigned ttl_s, unsigned idle_s)
+void routes_exports_init(cutils_db_t *db, const char *dir, unsigned ttl_s, unsigned idle_s,
+                         unsigned max_conns)
 {
     g_db = db;
+    g_max_conns = max_conns;
     if (dir && *dir) snprintf(g_dir, sizeof(g_dir), "%s", dir);
     if (ttl_s) g_ttl = ttl_s > EXPORT_TTL_MAX_S ? EXPORT_TTL_MAX_S : ttl_s;
     if (idle_s) g_idle = idle_s;
     /* Nothing serves what a previous run left open. */
     char now[32];
     snprintf(now, sizeof(now), "%lld", (long long)time(NULL));
-    if (db_execute_non_query(db, "UPDATE exports SET closed_at = ?, close_reason = 'daemon restarted'"
-                                 " WHERE closed_at IS NULL",
-                             (const char *[]){ now, NULL }, NULL) != 0)
+    if (db_write(db, "UPDATE exports SET closed_at = ?, close_reason = 'daemon restarted'"
+                     " WHERE closed_at IS NULL",
+                 (const char *[]){ now, NULL }, NULL) != 0)
         log_warn("exports: cannot close the rows a previous run left open");
 }
 
@@ -173,6 +214,28 @@ void exports_tick(void)
         if (!why) { pp = &e->next; continue; }
         *pp = e->next;
         export_end(e, why);
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
+int exports_repo_open(int64_t repo_id)
+{
+    int open = 0;
+    pthread_mutex_lock(&g_mu);
+    for (export_t *e = g_list; e && !open; e = e->next) open = e->repo_id == repo_id;
+    pthread_mutex_unlock(&g_mu);
+    return open;
+}
+
+void exports_close_repo(int64_t repo_id, const char *reason)
+{
+    pthread_mutex_lock(&g_mu);
+    export_t **pp = &g_list;
+    while (*pp) {
+        export_t *e = *pp;
+        if (e->repo_id != repo_id) { pp = &e->next; continue; }
+        *pp = e->next;
+        export_end(e, reason);
     }
     pthread_mutex_unlock(&g_mu);
 }
@@ -244,9 +307,9 @@ static status_t insert_row(int64_t repo_id, int64_t snap_id, const char *item, u
     snprintf(exp, sizeof(exp), "%lld", (long long)expires);
     db_result_t *r = NULL;
     status_t st = OK;
-    if (db_execute(g_db, "INSERT INTO exports (repo_id, snap_id, item_id, socket, size, caller,"
-                         " created_at, expires_at) VALUES (?, ?, ?, '', ?, ?, ?, ?) RETURNING id",
-                   (const char *[]){ repo, snap, item, sz, caller, now, exp, NULL }, &r) != 0 ||
+    if (db_write_returning(g_db, "INSERT INTO exports (repo_id, snap_id, item_id, socket, size, caller,"
+                                 " created_at, expires_at) VALUES (?, ?, ?, '', ?, ?, ?, ?) RETURNING id",
+                           (const char *[]){ repo, snap, item, sz, caller, now, exp, NULL }, &r) != 0 ||
         !r || r->nrows != 1) {
         st = set_error(ERR_IO, "export: cannot record it");
     } else {
@@ -298,6 +361,7 @@ api_response_t exports_create(const api_request_t *req, int64_t repo_id, int64_t
     store_index_t *idx = NULL;
     status_t st = repo_store_open_keyed(e->repo_path, NULL, &store);
     if (st == OK) st = store_index_bind(store, g_db, repo_id, &idx);
+    if (g_max_conns == 0) st = set_error(ERR_INVALID, "NBD exports are off (vm.export_max_conns is 0)");
     if (st == OK) st = unit_item_content(store, g_db, repo_id, snap_id, e->item, e->hash, &e->size);
     if (st == OK) {
         content_reader_t *r = NULL;
@@ -339,13 +403,14 @@ api_response_t exports_create(const api_request_t *req, int64_t repo_id, int64_t
     if (snprintf(e->socket, sizeof(e->socket), "%.4000s/%lld.sock", g_dir, (long long)e->id) >= (int)sizeof(e->socket))
         e->socket[0] = '\0';
     unlink(e->socket);
-    nbd_server_opts_t so = { e->socket, name, e->size, { cr_open, cr_read, cr_extents, cr_close, e }, 0 };
+    nbd_server_opts_t so = { e->socket, name, e->size,
+                             { cr_open, cr_read, cr_extents, cr_close, cr_idle, e }, 0 };
     st = nbd_server_start(&so, &e->srv);
     if (st == OK) {
         char ids[32];
         snprintf(ids, sizeof(ids), "%lld", (long long)e->id);
-        if (db_execute_non_query(g_db, "UPDATE exports SET socket = ? WHERE id = ?",
-                                 (const char *[]){ e->socket, ids, NULL }, NULL) != 0)
+        if (db_write(g_db, "UPDATE exports SET socket = ? WHERE id = ?",
+                     (const char *[]){ e->socket, ids, NULL }, NULL) != 0)
             log_warn("export %lld: cannot record its socket", (long long)e->id);
     }
     explicit_bzero(rnd, sizeof(rnd));
@@ -356,7 +421,11 @@ api_response_t exports_create(const api_request_t *req, int64_t repo_id, int64_t
         explicit_bzero(name, sizeof(name));
         return api_error(500, err_msg());
     }
-    char msg[512];
+    /* Sized from what it formats: the item, the caller and the socket path
+     * (up to PATH_MAX), plus 128 for the words and three numbers. At 512 a
+     * long socket path cut the end of the journal line off, and
+     * -Wformat-truncation said so in the debug and asan builds. */
+    char msg[sizeof(e->item) + sizeof(caller) + sizeof(e->socket) + 128];
     snprintf(msg, sizeof(msg), "export %lld of snapshot %lld item %s opened by %s for %u s at %s",
              (long long)e->id, (long long)snap_id, e->item, caller, ttl, e->socket);
     journal_record(g_db, repo_id, "export", "nbd-export", "ok", 0, msg);
@@ -392,6 +461,7 @@ static void add_live(cJSON *j, int64_t id)
         if (e->id != id) continue;
         cJSON_AddNumberToObject(j, "connections", nbd_server_conns(e->srv));
         cJSON_AddNumberToObject(j, "bytes_served", (double)nbd_server_bytes_served(e->srv));
+        cJSON_AddNumberToObject(j, "cache_bytes", (double)atomic_load(&e->cache_bytes));
         break;
     }
     pthread_mutex_unlock(&g_mu);

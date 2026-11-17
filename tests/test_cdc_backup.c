@@ -514,7 +514,7 @@ static void ruin(uint32_t pnum, uint64_t off, size_t n)
 
 /*
  * The copy the index names is no longer that object - its header's name is
- * ruined - so gc must keep the other copy rather than drop the only good
+ * ruined past its parity - so gc must keep the other copy rather than drop the only good
  * one, and having proven it (header, name, payload against the name) moves
  * the index to it. The ruined entry, which no name claims now, goes with
  * its pack, and the restore needs nothing of it.
@@ -526,7 +526,11 @@ static void test_gc_moves_the_index_off_a_ruined_header(void **state)
     uint32_t pnum = 0;
     uint64_t off = 0;
     plant_duplicate(hash, &pnum, &off);
+    /* The name alone is within the stripe's parity (a header is ordinary
+     * body, B119), which would put it back; 600 more bytes in the same
+     * group take that group past what its parity carries. */
     ruin(pnum, off + offsetof(pack_dat_entry_hdr_t, hash), OBJECT_HASH_SIZE);
+    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 100, 600);
 
     gc_result_t g;
     memset(&g, 0, sizeof(g));
@@ -566,6 +570,9 @@ static void test_gc_moves_the_index_off_a_damaged_payload(void **state)
     gc_result_t g;
     memset(&g, 0, sizeof(g));
     assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    /* The move is counted and reported (B138). */
+    assert_int_equal(g.index_relocated, 1);
+    assert_int_equal(g.dups_dropped, 0);
     uint32_t p2 = 0;
     uint64_t o2 = 0;
     assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
@@ -1304,19 +1311,24 @@ static void test_replicate_across_keys_rechunks(void **state)
     repo_marker_t m;
     assert_int_equal(repo_marker_read(TEST_REPO, &m), OK);
     replica_sink_t sink;
-    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &m, &sink), OK);
+    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &m, 0, &sink), OK);
     replicate_result_t rr;
     assert_int_equal(replicate_run(store, db, repo_id, &sink, NULL, NULL, NULL, &rr), OK);
     sink.v->close(sink.ctx);
     assert_int_equal(rr.snapshots_sent, 1);
     assert_int_equal(rr.rechunked, 1);
     assert_true(rr.files_rechunked >= 2);
+    /* B135: what reached the target is reported as sent, as a copying run
+     * reports it: every new object, and the bytes the target stored. */
+    assert_true(rr.objects_written > 0);
+    assert_int_equal(rr.objects_sent, rr.objects_written);
+    assert_true(rr.bytes_sent > 0);
     char dst_root[OBJECT_HASH_SIZE * 2 + 1];
     object_hash_to_hex(rr.target_root, dst_root);
     assert_string_not_equal(src_root, dst_root);
 
     /* Again: the target has the snapshot, nothing is rebuilt. */
-    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &m, &sink), OK);
+    assert_int_equal(replica_sink_local_open_reencrypt(DST_REPO, &m, 0, &sink), OK);
     assert_int_equal(replicate_run(store, db, repo_id, &sink, NULL, NULL, NULL, &rr), OK);
     sink.v->close(sink.ctx);
     assert_int_equal(rr.snapshots_sent, 0);
@@ -1345,6 +1357,158 @@ static void test_replicate_across_keys_rechunks(void **state)
  * Replication to a replica of the same repository copies chunks as they
  * are: same root, nothing re-chunked, and the replica reads back.
  */
+/* ------------------------------------------------------------------ */
+/* B133: staging a killed writer left in tmp/ goes at the next open      */
+/* ------------------------------------------------------------------ */
+
+/* A staging pack as a writer killed mid-copy leaves it: fresh, so the hour
+ * rule store_open applies would keep it. */
+static void plant_stale(const char *repo, const char *name)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s/tmp/%s", repo, name);
+    uint8_t *d = rand_buf(256 * 1024, 133);
+    write_buf(path, d, 256 * 1024);
+    free(d);
+}
+
+static int exists_in_tmp(const char *repo, const char *name)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s/tmp/%s", repo, name);
+    struct stat sb;
+    return stat(path, &sb) == 0;
+}
+
+static int count_pack_files(const char *repo)
+{
+    char cmd[700];
+    snprintf(cmd, sizeof(cmd), "find '%s/packs' -name 'pack-*.dat' | wc -l", repo);
+    FILE *f = popen(cmd, "r");
+    assert_non_null(f);
+    int n = -1;
+    assert_int_equal(fscanf(f, "%d", &n), 1);
+    pclose(f);
+    return n;
+}
+
+static void replicate_into(const char *dst)
+{
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_REPO, &m), OK);
+    replica_sink_t sink;
+    assert_int_equal(replica_sink_local_open(dst, &m, &sink), OK);
+    replicate_result_t rr;
+    assert_int_equal(replicate_run(store, db, repo_id, &sink, NULL, NULL, NULL, &rr), OK);
+    sink.v->close(sink.ctx);
+}
+
+static void test_killed_writers_staging_is_swept_on_every_open(void **state)
+{
+    (void)state;
+    uint8_t *d = rand_buf(3 * MiB, 1331);
+    write_buf(TEST_SRC "/f.bin", d, 3 * MiB);
+    free(d);
+    backup(1);
+    replicate_into(DST_REPO);
+    int packs = count_pack_files(DST_REPO);
+    assert_true(packs > 0);
+
+    /* A rerun of the replicate. */
+    plant_stale(DST_REPO, "pack-dat.Kill01");
+    replicate_into(DST_REPO);
+    assert_false(exists_in_tmp(DST_REPO, "pack-dat.Kill01"));
+    assert_int_equal(count_pack_files(DST_REPO), packs);
+
+    /* Registering the replica in another daemon (its own state.db). */
+    cutils_db_t *db2 = NULL;
+    assert_int_equal(db_open(&db2, TEST_DIR "/other.db"), 0);
+    assert_int_equal(db_run_lib_migrations(db2), 0);
+    assert_int_equal(db_run_compiled_migrations(db2, app_migrations), 0);
+    plant_stale(DST_REPO, "pack-dat.Kill02");
+    int64_t rid2 = 0;
+    assert_int_equal(repo_register(db2, DST_REPO, "replica", &rid2), OK);
+    assert_false(exists_in_tmp(DST_REPO, "pack-dat.Kill02"));
+
+    /* Reindex there. */
+    store_t *st2 = NULL;
+    store_index_t *idx2 = NULL;
+    assert_int_equal(repo_store_open(DST_REPO, NULL, &st2), OK);
+    assert_int_equal(store_index_bind(st2, db2, rid2, &idx2), OK);
+    plant_stale(DST_REPO, "pack-dat.Kill03");
+    reindex_result_t ri;
+    memset(&ri, 0, sizeof(ri));
+    assert_int_equal(reindex_repo(st2, db2, rid2, NULL, &ri), OK);
+    assert_false(exists_in_tmp(DST_REPO, "pack-dat.Kill03"));
+
+    /* gc on the registered replica, with a fresh handle as a gc job has. */
+    store_index_free(idx2);
+    store_close(st2);
+    assert_int_equal(repo_store_open(DST_REPO, NULL, &st2), OK);
+    assert_int_equal(store_index_bind(st2, db2, rid2, &idx2), OK);
+    plant_stale(DST_REPO, "pack-dat.Kill04");
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(st2, db2, rid2, 0, NULL, &g), OK);
+    assert_false(exists_in_tmp(DST_REPO, "pack-dat.Kill04"));
+    assert_int_equal(count_pack_files(DST_REPO), packs);
+    store_index_free(idx2);
+    store_close(st2);
+    db_close(db2);
+
+    /* And gc on the source repository. */
+    store_index_free(idx);
+    store_close(store);
+    assert_int_equal(repo_store_open(TEST_REPO, NULL, &store), OK);
+    assert_int_equal(store_index_bind(store, db, repo_id, &idx), OK);
+    plant_stale(TEST_REPO, "pack-dat.Kill05");
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_false(exists_in_tmp(TEST_REPO, "pack-dat.Kill05"));
+}
+
+/*
+ * A writer that is alive keeps its staging: it holds tmp/ (store_claim_tmp)
+ * from the moment it opened a pack, so a sweep by another handle - a
+ * replicate's open here - cannot claim it, falls back to the hour rule, and
+ * leaves the young file alone. Under the daemon's locks this cannot happen
+ * within one daemon (a replica is written by one job at a time, and a
+ * registered repository's jobs serialise); it can from a second process.
+ */
+static void test_a_live_writers_staging_is_left_alone(void **state)
+{
+    (void)state;
+    uint8_t *d = rand_buf(2 * MiB, 1332);
+    write_buf(TEST_SRC "/f.bin", d, 2 * MiB);
+    backup(1);
+    replicate_into(DST_REPO);
+
+    store_t *w = NULL;
+    assert_int_equal(store_open(DST_REPO, NULL, &w), OK);
+    pack_backup_writer_t *pw = NULL;
+    assert_int_equal(pack_backup_open(w, &pw), OK);
+    uint8_t h[OBJECT_HASH_SIZE];
+    int is_new = 0;
+    assert_int_equal(pack_backup_add(pw, OBJECT_TYPE_FILE, d, 9000, h, &is_new, NULL, NULL), OK);
+    free(d);
+    char cmd[700];
+    snprintf(cmd, sizeof(cmd), "ls '%s/tmp' | grep -c '^pack-dat\\.'", DST_REPO);
+    FILE *f = popen(cmd, "r");
+    int n = 0;
+    assert_int_equal(fscanf(f, "%d", &n), 1);
+    pclose(f);
+    assert_int_equal(n, 1);
+
+    replicate_into(DST_REPO);
+    f = popen(cmd, "r");
+    assert_int_equal(fscanf(f, "%d", &n), 1);
+    pclose(f);
+    assert_int_equal(n, 1);
+
+    pack_backup_abort(pw);
+    store_close(w);
+}
+
 static void test_replicate_same_key_copies(void **state)
 {
     (void)state;
@@ -1412,6 +1576,203 @@ static void test_replicate_same_key_copies(void **state)
     free(data);
 }
 
+
+/* Where a copy of hash sits other than in pack `not`: its pack and index. */
+typedef struct {
+    const uint8_t *hash;
+    uint32_t       not_pack, cur, found_pack, found_index;
+    int            found;
+    uint64_t       found_offset;
+} copy_find_t;
+
+static void copy_find_entry(const pack_entry_info_t *info, void *ctx)
+{
+    copy_find_t *f = ctx;
+    if (f->cur == f->not_pack || memcmp(info->hash, f->hash, OBJECT_HASH_SIZE) != 0) return;
+    f->found = 1;
+    f->found_pack = f->cur;
+    f->found_index = info->entry_index;
+    f->found_offset = info->entry_offset;
+}
+
+static void copy_find_pack(uint32_t num, void *ctx)
+{
+    copy_find_t *f = ctx;
+    char name[64];
+    snprintf(name, sizeof(name), "pack-%010u.dat", num);
+    f->cur = num;
+    (void)pack_enumerate_dat(store, name, NULL, NULL, copy_find_entry, f);
+}
+
+/*
+ * The same repoint with the good copy deep in its pack rather than its
+ * first entry: proving it reads its own CRCs, at its own position. The
+ * walk once handed gc every entry as position 0, so a copy anywhere else
+ * was never proven, the row stayed on the damaged copy until a rewrite
+ * happened to carry the good one, and the move was neither made nor
+ * counted (B138).
+ */
+static void test_gc_repoints_to_a_copy_deep_in_its_pack(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 6; i++) {
+        char p[600];
+        snprintf(p, sizeof(p), TEST_SRC "/a%d.bin", i);
+        uint8_t *d = rand_buf(40 * 1024, 900 + (uint64_t)i);
+        write_buf(p, d, 40 * 1024);
+        free(d);
+    }
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    plant_duplicate(hash, &pnum, &off);
+    copy_find_t f = { hash, pnum, 0, 0, 0, 0, 0 };
+    assert_int_equal(pack_list(store, copy_find_pack, &f), OK);
+    assert_true(f.found);
+    assert_true(f.found_index > 0);
+    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_int_equal(g.index_relocated, 1);
+    uint32_t p2 = 0;
+    uint64_t o2 = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+    assert_true(p2 != pnum);
+    restore_and_diff(latest_snapshot());
+}
+
+/* A finding's status for an object in a run, or "" when it has none. */
+static void finding_of(int64_t run_id, const uint8_t hash[OBJECT_HASH_SIZE],
+                       char *out, size_t cap)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1], run[32];
+    object_hash_to_hex(hash, hex);
+    snprintf(run, sizeof(run), "%lld", (long long)run_id);
+    db_result_t *q = NULL;
+    assert_int_equal(db_execute(db, "SELECT status FROM verify_findings"
+                                    " WHERE run_id = ? AND hash = ?",
+                                (const char *[]){ run, hex, NULL }, &q), 0);
+    snprintf(out, cap, "%s", q && q->nrows ? q->rows[0][0] : "");
+    db_result_free(q);
+}
+
+/*
+ * Before any gc, the indexed copy is damaged past its parity and a proven
+ * copy sits deep in another pack. That object is not lost: a check-only
+ * verify, at structure and deep, says recoverable and names no loss; a
+ * repairing one moves the index to the proven copy itself, as gc would
+ * (OWN-22), and the restore and the next verify find nothing wrong
+ * (NIT-31, the UAT's M3-B138 shape).
+ */
+static void test_verify_finds_a_proven_duplicate(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 6; i++) {
+        char p[600];
+        snprintf(p, sizeof(p), TEST_SRC "/a%d.bin", i);
+        uint8_t *d = rand_buf(40 * 1024, 900 + (uint64_t)i);
+        write_buf(p, d, 40 * 1024);
+        free(d);
+    }
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    plant_duplicate(hash, &pnum, &off);
+    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+
+    char st[64];
+    const verify_level_t levels[2] = { VERIFY_LEVEL_DEEP, VERIFY_LEVEL_STRUCTURE };
+    for (int l = 0; l < 2; l++) {
+        verify_result_t v;
+        memset(&v, 0, sizeof(v));
+        assert_int_equal(verify_run(store, db, repo_id, levels[l], 0,
+                                    NULL, NULL, NULL, &v), OK);
+        assert_int_equal(v.unrecoverable + v.missing, 0);
+        assert_int_equal(v.affected_files, 0);
+        assert_int_equal(v.checked, v.ok + v.repaired + v.recoverable +
+                                    v.unrecoverable + v.missing);
+        if (levels[l] == VERIFY_LEVEL_DEEP) {
+            assert_int_equal(v.recoverable, 1);
+            assert_int_equal(v.repaired, 0);
+            finding_of(v.run_id, hash, st, sizeof(st));
+            assert_string_equal(st, "recoverable");
+        }
+        /* Check only: the index still names the damaged copy. */
+        uint32_t p2 = 0;
+        uint64_t o2 = 0;
+        assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+        assert_int_equal(p2, pnum);
+        assert_true(o2 == off);
+    }
+
+    verify_result_t v;
+    memset(&v, 0, sizeof(v));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
+                                NULL, NULL, NULL, &v), OK);
+    assert_int_equal(v.repaired, 1);
+    assert_int_equal(v.recoverable + v.unrecoverable + v.missing, 0);
+    finding_of(v.run_id, hash, st, sizeof(st));
+    assert_string_equal(st, "repaired");
+    uint32_t p2 = 0;
+    uint64_t o2 = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+    assert_true(p2 != pnum);
+    restore_and_diff(latest_snapshot());
+
+    memset(&v, 0, sizeof(v));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &v), OK);
+    assert_int_equal(v.ok, v.checked);
+
+    /* gc then finds the damaged copy unnamed and the named one confirmed. */
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_int_equal(g.index_relocated, 0);
+    size_t dup = 0;
+    pack_census_t c;
+    census(store, &c, &dup);
+    assert_int_equal(dup, 0);
+    restore_and_diff(latest_snapshot());
+}
+
+/*
+ * With both copies damaged past parity there is nothing to move to: the
+ * object is loss, as before the search, and a repairing run moves nothing.
+ */
+static void test_verify_duplicate_damaged_too_is_loss(void **state)
+{
+    (void)state;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    plant_duplicate(hash, &pnum, &off);
+    copy_find_t f = { hash, pnum, 0, 0, 0, 0, 0 };
+    assert_int_equal(pack_list(store, copy_find_pack, &f), OK);
+    assert_true(f.found);
+    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+    ruin(f.found_pack, f.found_offset + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+
+    for (int repair = 0; repair < 2; repair++) {
+        verify_result_t v;
+        memset(&v, 0, sizeof(v));
+        assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, repair,
+                                    NULL, NULL, NULL, &v), ERR_CORRUPT);
+        err_clear();
+        assert_int_equal(v.unrecoverable, 1);
+        assert_int_equal(v.recoverable + v.repaired, 0);
+        char st[64];
+        finding_of(v.run_id, hash, st, sizeof(st));
+        assert_string_equal(st, "unrecoverable");
+        uint32_t p2 = 0;
+        uint64_t o2 = 0;
+        assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+        assert_int_equal(p2, pnum);
+    }
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1420,6 +1781,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_gc_reclaims_a_duplicate_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_moves_the_index_off_a_ruined_header, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_moves_the_index_off_a_damaged_payload, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_repoints_to_a_copy_deep_in_its_pack, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_verify_finds_a_proven_duplicate, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_verify_duplicate_damaged_too_is_loss, setup, teardown),
         cmocka_unit_test_setup_teardown(test_small_files_on_workers_match_serial, setup, teardown),
         cmocka_unit_test_setup_teardown(test_append_and_edit_write_little, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_keeps_chunks_of_live_lists, setup, teardown),
@@ -1430,6 +1794,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_huge_directory, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replicate_across_keys_rechunks, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replicate_same_key_copies, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_killed_writers_staging_is_swept_on_every_open, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_live_writers_staging_is_left_alone, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

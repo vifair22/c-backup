@@ -31,6 +31,8 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "gc.h"
+#include "prune.h"
 #include "chunklist.h"
 #include "object.h"
 #include "pack.h"
@@ -255,6 +257,48 @@ static void test_clean_repo_verifies_clean(void **state)
     assert_int_equal(res.unrecoverable, 0);
     assert_int_equal(res.missing, 0);
     assert_true(res.bytes_read > 0);
+}
+
+typedef struct {
+    char     phase[32];
+    uint64_t done, total;
+    int      calls;
+} last_progress_t;
+
+static void record_progress(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    last_progress_t *lp = ctx;
+    snprintf(lp->phase, sizeof(lp->phase), "%s", phase);
+    lp->done = done;
+    lp->total = total;
+    lp->calls++;
+}
+
+/*
+ * A finished run's last progress report is N of N at every level. The
+ * object walk reported each object before checking it, so an index verify,
+ * which has no later phase, ended every job at N-1 of N (NIT-33).
+ */
+static void test_progress_ends_at_total(void **state)
+{
+    (void)state;
+    run_backup();
+    const verify_level_t levels[3] = { VERIFY_LEVEL_INDEX, VERIFY_LEVEL_STRUCTURE,
+                                       VERIFY_LEVEL_DEEP };
+    for (int l = 0; l < 3; l++) {
+        last_progress_t lp;
+        memset(&lp, 0, sizeof(lp));
+        verify_result_t res;
+        assert_int_equal(verify_run(store, db, repo_id, levels[l], 0, NULL,
+                                    record_progress, &lp, &res), OK);
+        assert_true(lp.calls > 0);
+        assert_true(lp.total > 0);
+        assert_int_equal(lp.done, lp.total);
+        if (levels[l] == VERIFY_LEVEL_INDEX) {
+            assert_string_equal(lp.phase, "index");
+            assert_int_equal(lp.total, res.checked);
+        }
+    }
 }
 
 /*
@@ -949,6 +993,563 @@ static void test_header_and_payload_damage_repaired_in_one_run(void **state)
     free(orig);
 }
 
+/* ------------------------------------------------------------------ */
+/* A pack gc cannot walk (B119 follow-up)                              */
+/* ------------------------------------------------------------------ */
+
+#define UNW_FILES   300
+#define UNW_DELETED 50
+
+static int64_t snap_count_of(int64_t snap, const char *hex)
+{
+    char s[32];
+    snprintf(s, sizeof(s), "%lld", (long long)snap);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM nodes WHERE snap_id = ? AND content_hash = ?",
+        (const char *[]){ s, hex, NULL }, &r), 0);
+    int64_t n = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
+static int64_t verify_finding_count(const char *hash, const char *status)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM verify_findings WHERE hash = ? AND status = ?"
+        "   AND run_id = (SELECT MAX(id) FROM verify_runs)",
+        (const char *[]){ hash, status, NULL }, &r), 0);
+    int64_t n = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
+/*
+ * Every entry header in one parity group overwritten - more damage than the
+ * group's parity carries, payloads untouched - leaves a pack whose headers
+ * cannot be walked: gc must not rewrite it on a guess. That has to be heard:
+ * gc fails naming the pack (the job failure is what alerts), every verify
+ * level reports it and fails, and a repairing verify rebuilds the headers
+ * from the index and the table's CRCs, after which verify passes and gc
+ * compacts the pack like any other.
+ */
+static void test_unwalkable_pack_is_reported_until_repaired(void **state)
+{
+    (void)state;
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/many", TEST_SRC);
+    assert_int_equal(mkdir(dir, 0700), 0);
+    for (int i = 0; i < UNW_FILES; i++) {
+        char p[PATH_MAX + 32], body[200];
+        snprintf(p, sizeof(p), "%s/f%03d", dir, i);
+        int n = snprintf(body, sizeof(body), "file %03d:", i);
+        unsigned x = 0x9E3779B9u * (unsigned)(i + 1);
+        while (n < 150) {
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            body[n++] = (char)('A' + x % 52);
+        }
+        body[n] = '\0';
+        write_file(p, body);
+    }
+    int64_t s1 = run_backup();
+    for (int i = 0; i < UNW_DELETED; i++) {
+        char p[PATH_MAX + 32];
+        snprintf(p, sizeof(p), "%s/f%03d", dir, i);
+        assert_int_equal(unlink(p), 0);
+    }
+    int64_t s2 = run_backup();
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("f200", hex);
+    entry_at_t e = entry_of(hex);
+    uint8_t h200[OBJECT_HASH_SIZE];
+    hash_of_hex(hex, h200);
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    assert_int_equal(pack_resolve_location(store, h200, &pnum, &off), OK);
+
+    /*
+     * The headers of one group, every one of a file still in snapshot 2, so
+     * the index keeps a row for each through the first gc's sweep and the
+     * repair can rebuild them. Which group: the one holding the most such
+     * headers. The pack's order follows the scan's inode order, which
+     * depends on the filesystem and on which inodes earlier tests freed, so
+     * f200's own group could hold a file snapshot 2 deleted, or a tree, and
+     * asserting it did not failed on a CI runner whose layout differed.
+     * Only snapshot 2's headers are damaged; anything else in the group is
+     * left as it is.
+     */
+    char pk[32];
+    snprintf(pk, sizeof(pk), "%u", pnum);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT hash, offset FROM pack_objects WHERE pack_id = ? ORDER BY offset",
+        (const char *[]){ pk, NULL }, &r), 0);
+    assert_true(r->nrows > 0);
+    uint64_t ngroups = strtoull(r->rows[r->nrows - 1][1], NULL, 10) / PARITY_GROUP_DATA + 1;
+    uint32_t *live = calloc((size_t)ngroups, sizeof(*live));
+    uint8_t  *in_s2 = calloc((size_t)r->nrows, 1);
+    assert_non_null(live);
+    assert_non_null(in_s2);
+    for (int i = 0; i < r->nrows; i++) {
+        uint64_t o = strtoull(r->rows[i][1], NULL, 10);
+        if (o / PARITY_GROUP_DATA != (o + sizeof(pack_dat_entry_hdr_t) - 1) / PARITY_GROUP_DATA)
+            continue;
+        if (snap_count_of(s2, r->rows[i][0]) == 0) continue;
+        in_s2[i] = 1;
+        live[o / PARITY_GROUP_DATA]++;
+    }
+    uint64_t g = 0;
+    for (uint64_t k = 1; k < ngroups; k++)
+        if (live[k] > live[g]) g = k;
+    free(live);
+    int fd = open(e.path, O_RDWR);
+    assert_true(fd >= 0);
+    size_t damaged_bytes = 0;
+    for (int i = 0; i < r->nrows; i++) {
+        uint64_t o = strtoull(r->rows[i][1], NULL, 10);
+        if (!in_s2[i] || o / PARITY_GROUP_DATA != g) continue;
+        uint8_t b[sizeof(pack_dat_entry_hdr_t)];
+        assert_int_equal(pread(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
+        for (size_t k = 0; k < sizeof(b); k++) b[k] ^= 0x5A;
+        assert_int_equal(pwrite(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
+        damaged_bytes += sizeof(b);
+    }
+    free(in_s2);
+    close(fd);
+    db_result_free(r);
+    /* Far past the 512 bytes a group corrects. */
+    assert_true(damaged_bytes > 2048);
+    pack_cache_invalidate(store);
+    store_dat_cache_flush(store);
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, s1), OK);
+
+    /* gc: the pack is left whole, and the job fails naming it. */
+    char pname[32];
+    snprintf(pname, sizeof(pname), "pack-%010u", pnum);
+    gc_result_t gr;
+    memset(&gr, 0, sizeof(gr));
+    err_clear();
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), pname));
+    assert_int_equal(gr.packs_unwalkable, 1);
+    assert_int_equal(gr.unwalkable_listed, 1);
+    assert_int_equal(gr.unwalkable[0].pack, pnum);
+    assert_non_null(strstr(gr.unwalkable[0].reason, "beyond parity"));
+    err_clear();
+
+    /* Every level, without repair: a finding and a failed run. */
+    const verify_level_t levels[3] = { VERIFY_LEVEL_INDEX, VERIFY_LEVEL_STRUCTURE,
+                                       VERIFY_LEVEL_DEEP };
+    for (int l = 0; l < 3; l++) {
+        verify_result_t vr;
+        memset(&vr, 0, sizeof(vr));
+        assert_int_equal(verify_run(store, db, repo_id, levels[l], 0, NULL, NULL, NULL, &vr),
+                         ERR_CORRUPT);
+        err_clear();
+        assert_int_equal(vr.packs_unwalkable, 1);
+        assert_int_equal(verify_finding_count(pname, "unwalkable pack"), 1);
+        /* The entries whose headers the index rebuilds are not loss, and a
+         * dry run says so (B137): recoverable, nothing written. */
+        assert_int_equal(vr.unrecoverable, 0);
+        if (levels[l] == VERIFY_LEVEL_DEEP) assert_true(vr.recoverable >= 1);
+    }
+
+    /* A repairing run restores the headers from the index. */
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1, NULL, NULL, NULL, &vr),
+                     OK);
+    assert_int_equal(vr.packs_restored, 1);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(vr.unrecoverable, 0);
+    assert_int_equal(verify_finding_count(pname, "repaired"), 1);
+    /* The restored pack is a repaired item in the totals (NIT-30). */
+    assert_true(vr.repaired >= 1);
+    assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                 vr.unrecoverable + vr.missing);
+
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr),
+                     OK);
+    assert_int_equal(vr.packs_unwalkable, 0);
+
+    /* And gc now compacts it: snapshot 1's files are dead in it. */
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), OK);
+    assert_int_equal(gr.packs_unwalkable, 0);
+    assert_true(gr.packs_rewritten >= 1);
+    assert_true(gr.pack_entries_dropped >= UNW_DELETED);
+
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0, NULL, NULL, NULL, &vr),
+                     OK);
+    assert_int_equal(vr.unrecoverable + vr.missing + vr.recoverable, 0);
+}
+
+/*
+ * The source tree the salvage tests share: UNW_FILES small files, the
+ * first UNW_DELETED of them gone in the second snapshot.
+ */
+static void unw_two_snapshots(int64_t *s1, int64_t *s2)
+{
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/many", TEST_SRC);
+    assert_int_equal(mkdir(dir, 0700), 0);
+    for (int i = 0; i < UNW_FILES; i++) {
+        char p[PATH_MAX + 32], body[200];
+        snprintf(p, sizeof(p), "%s/f%03d", dir, i);
+        int n = snprintf(body, sizeof(body), "file %03d:", i);
+        unsigned x = 0x9E3779B9u * (unsigned)(i + 1);
+        while (n < 150) {
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            body[n++] = (char)('A' + x % 52);
+        }
+        body[n] = '\0';
+        write_file(p, body);
+    }
+    *s1 = run_backup();
+    for (int i = 0; i < UNW_DELETED; i++) {
+        char p[PATH_MAX + 32];
+        snprintf(p, sizeof(p), "%s/f%03d", dir, i);
+        assert_int_equal(unlink(p), 0);
+    }
+    *s2 = run_backup();
+}
+
+/*
+ * Overwrite every entry header in the parity group holding the named file's
+ * entry. Returns the pack, the number of damaged headers belonging to
+ * entries snapshot s2 no longer has (dead) and to ones it has (live), and
+ * the hash of one live file entry in the group.
+ */
+static uint32_t unw_wipe_group_of(const char *name, int64_t s2, int *dead, int *live,
+                                  char live_hex[OBJECT_HASH_SIZE * 2 + 1], entry_at_t *live_at)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of(name, hex);
+    entry_at_t e = entry_of(hex);
+    uint8_t h[OBJECT_HASH_SIZE];
+    hash_of_hex(hex, h);
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    assert_int_equal(pack_resolve_location(store, h, &pnum, &off), OK);
+    uint64_t g = e.entry / PARITY_GROUP_DATA;
+
+    char pk[32];
+    snprintf(pk, sizeof(pk), "%u", pnum);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT hash, offset FROM pack_objects WHERE pack_id = ? ORDER BY offset",
+        (const char *[]){ pk, NULL }, &r), 0);
+    int fd = open(e.path, O_RDWR);
+    assert_true(fd >= 0);
+    *dead = *live = 0;
+    live_hex[0] = '\0';
+    for (int i = 0; i < r->nrows; i++) {
+        uint64_t o = strtoull(r->rows[i][1], NULL, 10);
+        if (o / PARITY_GROUP_DATA != g ||
+            (o + sizeof(pack_dat_entry_hdr_t) - 1) / PARITY_GROUP_DATA != g)
+            continue;
+        if (snap_count_of(s2, r->rows[i][0]) > 0) {
+            (*live)++;
+            if (!live_hex[0] && i + 1 < r->nrows) {
+                snprintf(live_hex, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[i][0]);
+                *live_at = entry_of(live_hex);
+            }
+        } else {
+            (*dead)++;
+        }
+        uint8_t b[sizeof(pack_dat_entry_hdr_t)];
+        assert_int_equal(pread(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
+        for (size_t k = 0; k < sizeof(b); k++) b[k] ^= 0x5A;
+        assert_int_equal(pwrite(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
+    }
+    close(fd);
+    db_result_free(r);
+    pack_cache_invalidate(store);
+    store_dat_cache_flush(store);
+    return pnum;
+}
+
+/* Every file of snapshot 2, restored, byte for byte against the source. */
+static void unw_assert_restores(int64_t s2, const char *skip_hex)
+{
+    char dst[PATH_MAX];
+    snprintf(dst, sizeof(dst), "%s/dst", TEST_DIR);
+    restore_result_t rr;
+    status_t st = restore_run(store, db, repo_id, s2, dst, NULL, &rr);
+    if (skip_hex) {
+        assert_int_equal(st, ERR_CORRUPT);
+        assert_int_equal(rr.failed, 1);
+        err_clear();
+    } else {
+        assert_int_equal(st, OK);
+    }
+    int compared = 0;
+    for (int i = UNW_DELETED; i < UNW_FILES; i++) {
+        char src[PATH_MAX + 32], out[2 * PATH_MAX + 32];
+        snprintf(src, sizeof(src), "%s/many/f%03d", TEST_SRC, i);
+        snprintf(out, sizeof(out), "%s%s/many/f%03d", dst, TEST_SRC, i);
+        char name[16];
+        snprintf(name, sizeof(name), "f%03d", i);
+        if (skip_hex) {
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            content_hash_of(name, hex);
+            if (strcmp(hex, skip_hex) == 0) continue;
+        }
+        size_t a = 0, b = 0;
+        uint8_t *x = slurp(src, &a);
+        uint8_t *y = slurp(out, &b);
+        assert_int_equal(a, b);
+        assert_memory_equal(x, y, a);
+        free(x);
+        free(y);
+        compared++;
+    }
+    assert_true(compared >= UNW_FILES - UNW_DELETED - 1);
+}
+
+/*
+ * Case (a): the wiped group holds headers of entries gc has since swept
+ * along with live ones. The swept ones have no index row, so their headers
+ * cannot be rebuilt and the pack stays unwalkable after a header restore.
+ * Verify with repair salvages instead: every live entry is copied into a
+ * new pack by its indexed offset, and what no row covers is dropped and
+ * reported. Verify then passes, every live file restores byte for byte, and
+ * gc carries on.
+ */
+static void test_unwalkable_pack_with_swept_headers_is_salvaged(void **state)
+{
+    (void)state;
+    int64_t s1 = 0, s2 = 0;
+    unw_two_snapshots(&s1, &s2);
+    int dead = 0, live = 0;
+    char live_hex[OBJECT_HASH_SIZE * 2 + 1];
+    entry_at_t live_at;
+    uint32_t pnum = unw_wipe_group_of("f049", s2, &dead, &live, live_hex, &live_at);
+    assert_true(dead >= 1);
+    assert_true(live >= 1);
+    assert_true((dead + live) * (int)sizeof(pack_dat_entry_hdr_t) > 2048);
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, s1), OK);
+    gc_result_t gr;
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(gr.packs_unwalkable, 1);
+
+    char pname[32];
+    snprintf(pname, sizeof(pname), "pack-%010u", pnum);
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1, NULL, NULL, NULL, &vr),
+                     OK);
+    assert_int_equal(vr.packs_salvaged, 1);
+    assert_int_equal(vr.packs_restored, 0);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(vr.unrecoverable + vr.missing, 0);
+    assert_true(vr.unreferenced_dropped_bytes >= (uint64_t)dead * sizeof(pack_dat_entry_hdr_t));
+    assert_true(vr.unreferenced_dropped_ranges >= 1);
+    assert_true(vr.dropped_listed >= 1);
+    assert_int_equal(vr.dropped[0].pack, pnum);
+    assert_int_equal(verify_finding_count(pname, "salvaged"), 1);
+
+    /* The old pack is gone, through the rewrite path. */
+    char old[PATH_MAX];
+    assert_int_equal(pack_dat_path_resolve(old, sizeof(old), TEST_REPO, pnum), 0);
+    struct stat sb;
+    assert_int_not_equal(stat(old, &sb), 0);
+
+    const verify_level_t levels[3] = { VERIFY_LEVEL_INDEX, VERIFY_LEVEL_STRUCTURE,
+                                       VERIFY_LEVEL_DEEP };
+    for (int l = 0; l < 3; l++) {
+        memset(&vr, 0, sizeof(vr));
+        assert_int_equal(verify_run(store, db, repo_id, levels[l], 0, NULL, NULL, NULL, &vr), OK);
+        assert_int_equal(vr.packs_unwalkable + vr.unrecoverable + vr.missing, 0);
+    }
+    unw_assert_restores(s2, NULL);
+
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), OK);
+    assert_int_equal(gr.packs_unwalkable, 0);
+}
+
+/*
+ * The same, with one live entry in the wiped group also damaged in its
+ * payload - beyond parity, since the group's parity is already spent. It
+ * is carried into the new pack as it is: the unwalkable finding clears and
+ * verify reports that one object's loss, with its file, and nothing else.
+ */
+static void test_salvage_carries_a_damaged_live_entry_and_reports_its_loss(void **state)
+{
+    (void)state;
+    int64_t s1 = 0, s2 = 0;
+    unw_two_snapshots(&s1, &s2);
+    int dead = 0, live = 0;
+    char live_hex[OBJECT_HASH_SIZE * 2 + 1];
+    entry_at_t live_at;
+    uint32_t pnum = unw_wipe_group_of("f049", s2, &dead, &live, live_hex, &live_at);
+    assert_true(dead >= 1);
+    assert_true(live_hex[0] != '\0');
+    flip_byte(live_at.path, (off_t)(live_at.payload + 3));
+    flip_byte(live_at.path, (off_t)(live_at.payload + 4));
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, s1), OK);
+    gc_result_t gr;
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), ERR_CORRUPT);
+    err_clear();
+
+    char pname[32];
+    snprintf(pname, sizeof(pname), "pack-%010u", pnum);
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1, NULL, NULL, NULL, &vr),
+                     ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(vr.packs_salvaged, 1);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(vr.unrecoverable, 1);
+    assert_int_equal(vr.missing, 0);
+    assert_int_equal(vr.affected_files, 1);
+    char status[64];
+    finding_status_of(live_hex, status, sizeof(status));
+    assert_string_equal(status, "unrecoverable");
+
+    /* From now on only the loss: no unwalkable pack at any level. */
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr),
+                     OK);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0, NULL, NULL, NULL, &vr),
+                     ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(vr.unrecoverable, 1);
+    assert_int_equal(verify_finding_count(pname, "unwalkable pack"), 0);
+
+    unw_assert_restores(s2, live_hex);
+}
+
+/*
+ * Case (a) with the trailer gone as well: both tails broken, and the walk
+ * that would derive the trailer is the thing that fails. No CRC can vouch
+ * for anything, but every object vouches for itself - its name is the hash
+ * of its type and content - so salvage decodes each live entry under the
+ * header the index implies, nothing corrected. The intact ones are kept
+ * clean, the one whose payload was also damaged is carried as it is and
+ * reported as the one loss, and the bytes no row covers are dropped.
+ */
+static void test_salvage_without_a_trailer_verifies_by_name(void **state)
+{
+    (void)state;
+    int64_t s1 = 0, s2 = 0;
+    unw_two_snapshots(&s1, &s2);
+    int dead = 0, live = 0;
+    char live_hex[OBJECT_HASH_SIZE * 2 + 1];
+    entry_at_t live_at;
+    uint32_t pnum = unw_wipe_group_of("f049", s2, &dead, &live, live_hex, &live_at);
+    assert_true(dead >= 1);
+    assert_true(live_hex[0] != '\0');
+    flip_byte(live_at.path, (off_t)(live_at.payload + 3));
+
+    /* Both tails' magic, so no copy verifies. Where the body ended is
+     * read first: nothing past it may be reported as dropped entries. */
+    uint64_t body_len = 0;
+    {
+        int fd = open(live_at.path, O_RDWR);
+        assert_true(fd >= 0);
+        off_t end = lseek(fd, 0, SEEK_END);
+        assert_int_equal(pread(fd, &body_len, 8, end - (off_t)PACK_TAIL_BYTES + 8), 8);
+        uint8_t z[4] = { 0 };
+        assert_int_equal(pwrite(fd, z, 4, end - (off_t)PACK_TAIL_BYTES), 4);
+        assert_int_equal(pwrite(fd, z, 4, end - 2 * (off_t)PACK_TAIL_BYTES), 4);
+        close(fd);
+        pack_cache_invalidate(store);
+        store_dat_cache_flush(store);
+    }
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, s1), OK);
+    gc_result_t gr;
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(gr.packs_unwalkable, 1);
+    assert_non_null(strstr(gr.unwalkable[0].reason, "no usable trailer"));
+
+    /*
+     * Encrypted with its key not loaded, salvage cannot decrypt to check
+     * anything, and says what unblocks it - the key, and how to load it -
+     * rather than leaving an operator to read the finding as loss.
+     */
+    store_set_encrypted(store, 1);
+    {
+        verify_result_t kv;
+        memset(&kv, 0, sizeof(kv));
+        err_clear();
+        assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_STRUCTURE, 1, NULL, NULL,
+                                    NULL, &kv), ERR_CORRUPT);
+        assert_non_null(strstr(err_msg(), "salvage needs the repository key"));
+        assert_non_null(strstr(err_msg(), "c-backup repo key import"));
+        assert_non_null(strstr(err_msg(), "--passphrase"));
+        assert_non_null(strstr(err_msg(), "then verify again"));
+        err_clear();
+        assert_int_equal(kv.packs_unwalkable, 1);
+        assert_int_equal(kv.packs_need_key, 1);
+        assert_int_equal(kv.packs_salvaged, 0);
+        char ps[32];
+        snprintf(ps, sizeof(ps), "pack-%010u", pnum);
+        assert_int_equal(verify_finding_count(ps, "unwalkable pack: salvage needs the "
+                                                  "repository key"), 1);
+        /* The repairing deep verify, the documented fix, says to load the
+         * key rather than to use a level that cannot salvage (NIT-25). */
+        memset(&kv, 0, sizeof(kv));
+        err_clear();
+        assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1, NULL, NULL,
+                                    NULL, &kv), ERR_INVALID);
+        assert_non_null(strstr(err_msg(), "repo key import"));
+        assert_null(strstr(err_msg(), "level 'structure'"));
+        err_clear();
+        gc_result_t kg;
+        memset(&kg, 0, sizeof(kg));
+        assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &kg), ERR_CORRUPT);
+        assert_non_null(strstr(err_msg(), "salvage needs the repository key"));
+        err_clear();
+    }
+    store_set_encrypted(store, 0);
+
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1, NULL, NULL, NULL, &vr),
+                     ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(vr.packs_salvaged, 1);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(vr.unrecoverable, 1);
+    assert_int_equal(vr.missing, 0);
+    assert_true(vr.unreferenced_dropped_ranges >= 1);
+    /* The old trailer is not counted as dropped entries (NIT-24). */
+    for (uint32_t d = 0; d < vr.dropped_listed; d++)
+        assert_true(vr.dropped[d].offset + vr.dropped[d].length <= body_len);
+    char status[64];
+    finding_status_of(live_hex, status, sizeof(status));
+    assert_string_equal(status, "unrecoverable");
+
+    char pname[32];
+    snprintf(pname, sizeof(pname), "pack-%010u", pnum);
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_STRUCTURE, 0, NULL, NULL, NULL,
+                                &vr), OK);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(verify_finding_count(pname, "unwalkable pack"), 0);
+
+    unw_assert_restores(s2, live_hex);
+}
+
 /*
  * One chunk of a file's content (format 3): the middle leaf of its chunk
  * list, or the content itself when it is one object. *len gets its length.
@@ -1060,6 +1661,18 @@ static void test_chunk_damage_repaired_and_attributed(void **state)
     assert_string_equal(r->rows[0][1], TEST_SRC "/big.bin");
     db_result_free(r);
 
+    /* And the chunk's own finding names the file it belongs to, not zero
+     * files (NIT-22). */
+    r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT affected_files, sample_paths FROM verify_findings WHERE hash = ?"
+        "   AND run_id = (SELECT MAX(id) FROM verify_runs)",
+        (const char *[]){ hex, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "1");
+    assert_string_equal(r->rows[0][1], TEST_SRC "/big.bin");
+    db_result_free(r);
+
     char dst[PATH_MAX];
     snprintf(dst, sizeof(dst), "%s/dst", TEST_DIR);
     restore_result_t rr;
@@ -1071,10 +1684,130 @@ static void test_chunk_damage_repaired_and_attributed(void **state)
     assert_int_not_equal(lstat(restored, &sb), 0);
 }
 
+/* ------------------------------------------------------------------ */
+/* A pack's own structures (B136)                                      */
+/* ------------------------------------------------------------------ */
+
+static void xor_bytes(const char *path, off_t off, size_t n)
+{
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    if (off < 0) off += lseek(fd, 0, SEEK_END);
+    uint8_t b[64];
+    assert_true(n <= sizeof(b));
+    assert_int_equal(pread(fd, b, n, off), (ssize_t)n);
+    for (size_t i = 0; i < n; i++) b[i] ^= 0x5A;
+    assert_int_equal(pwrite(fd, b, n, off), (ssize_t)n);
+    close(fd);
+    pack_cache_invalidate(store);
+    store_dat_cache_flush(store);
+}
+
+/* A column of a run's record, as GET /repos/<id>/verify and the CLI read it. */
+static uint64_t run_count(int64_t run_id, const char *col)
+{
+    char sql[128], run[32];
+    snprintf(sql, sizeof(sql), "SELECT %s FROM verify_runs WHERE id = ?", col);
+    snprintf(run, sizeof(run), "%lld", (long long)run_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, sql, (const char *[]){ run, NULL }, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    uint64_t v = strtoull(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return v;
+}
+
+/* Where the CRC table starts, from the pack's last tail. */
+static uint64_t crc_table_off(const uint8_t *f, size_t len)
+{
+    uint64_t body_len = 0;
+    memcpy(&body_len, f + len - PACK_TAIL_BYTES + 8, 8);
+    uint64_t groups = (body_len + PARITY_GROUP_DATA - 1) / PARITY_GROUP_DATA;
+    return body_len + groups * PARITY_GROUP_PAR;
+}
+
+/*
+ * Damage within parity to the pack header, the last tail, both tails, the
+ * CRC table, and the pack header with both tails at once: every reader
+ * corrects these in memory, so nothing failed and nothing was written
+ * back, and the damage piled up until the pack could not be walked. Every
+ * level reports the pack as recoverable without repair; a repairing run
+ * rewrites it to exactly what it was; the next run finds nothing.
+ */
+static void test_pack_structure_damage_is_reported_and_repaired(void **state)
+{
+    (void)state;
+    run_backup();
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("target.bin", hex);
+    entry_at_t e = entry_of(hex);
+    uint8_t h[OBJECT_HASH_SIZE];
+    hash_of_hex(hex, h);
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    assert_int_equal(pack_resolve_location(store, h, &pnum, &off), OK);
+    char pname[32];
+    snprintf(pname, sizeof(pname), "pack-%010u", pnum);
+    size_t olen = 0;
+    uint8_t *orig = slurp(e.path, &olen);
+    uint64_t tab = crc_table_off(orig, olen);
+
+    enum { HDR, LAST, BOTH, TABLE, HDR_BOTH, NCASE };
+    const verify_level_t levels[3] = { VERIFY_LEVEL_INDEX, VERIFY_LEVEL_STRUCTURE,
+                                       VERIFY_LEVEL_DEEP };
+    for (int c = 0; c < NCASE; c++) {
+        if (c == HDR || c == HDR_BOTH) xor_bytes(e.path, 0, 8);
+        if (c == LAST || c == BOTH || c == HDR_BOTH) xor_bytes(e.path, -(off_t)PACK_TAIL_BYTES + 4, 8);
+        if (c == BOTH || c == HDR_BOTH) xor_bytes(e.path, -2 * (off_t)PACK_TAIL_BYTES + 4, 8);
+        if (c == TABLE) xor_bytes(e.path, (off_t)tab, 64);
+
+        for (int l = 0; l < 3; l++) {
+            verify_result_t vr;
+            memset(&vr, 0, sizeof(vr));
+            assert_int_equal(verify_run(store, db, repo_id, levels[l], 0, NULL, NULL, NULL,
+                                        &vr), OK);
+            assert_int_equal(vr.pack_structures_recoverable, 1);
+            assert_int_equal(vr.pack_structures_repaired, 0);
+            assert_int_equal(vr.packs_unwalkable, 0);
+            /* The totals the run record, the CLI and the metrics show carry
+             * it, and still add up (NIT-30). */
+            assert_int_equal(vr.recoverable, 1);
+            assert_int_equal(vr.repaired, 0);
+            assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                         vr.unrecoverable + vr.missing);
+            assert_int_equal(run_count(vr.run_id, "recoverable"), 1);
+            assert_int_equal(run_count(vr.run_id, "repaired"), 0);
+            char st[64];
+            finding_status_of(pname, st, sizeof(st));
+            assert_string_equal(st, "recoverable");
+        }
+        verify_result_t vr;
+        memset(&vr, 0, sizeof(vr));
+        assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 1, NULL, NULL, NULL,
+                                    &vr), OK);
+        assert_int_equal(vr.pack_structures_repaired, 1);
+        assert_int_equal(vr.repaired, 1);
+        assert_int_equal(vr.recoverable, 0);
+        assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                     vr.unrecoverable + vr.missing);
+        assert_int_equal(run_count(vr.run_id, "repaired"), 1);
+        assert_file_is(e.path, orig, olen);
+        memset(&vr, 0, sizeof(vr));
+        assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0, NULL, NULL, NULL,
+                                    &vr), OK);
+        assert_int_equal(vr.pack_structures_recoverable + vr.pack_structures_repaired, 0);
+        assert_int_equal(vr.recoverable + vr.unrecoverable, 0);
+    }
+    free(orig);
+}
+
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_clean_repo_verifies_clean, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_progress_ends_at_total, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deep_verify_repairs_payload_damage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_without_repair_leaves_disk_untouched, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unrecoverable_damage_names_the_affected_files, setup, teardown),
@@ -1091,6 +1824,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_failed_restore_leaves_no_plausible_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_grown_header_size_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_header_and_payload_damage_repaired_in_one_run, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unwalkable_pack_is_reported_until_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unwalkable_pack_with_swept_headers_is_salvaged, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_salvage_carries_a_damaged_live_entry_and_reports_its_loss, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_salvage_without_a_trailer_verifies_by_name, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_structure_damage_is_reported_and_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_chunk_damage_repaired_and_attributed, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

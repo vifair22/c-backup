@@ -3,6 +3,8 @@
 #include "prune.h"
 #include "db_txn.h"
 #include "repo_tags.h"
+#include "snap_record.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -12,6 +14,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
+
+/*
+ * The record of snapshot snap_id under repo_path, gone for good: unlinked
+ * and its directory synced. Without the sync a power cut can bring the
+ * record back after its rows went (B148), which is the snapshot's
+ * resurrection by the next reindex, after gc swept what only it used.
+ * OK when there was no record.
+ */
+/* removed, when not NULL, says whether there was a record to unlink. */
+static status_t unlink_record(const char *repo_path, int64_t snap_id, int *removed)
+{
+    if (removed) *removed = 0;
+    char dir[PATH_MAX], path[PATH_MAX];
+    if (snprintf(dir, sizeof(dir), "%s/snapshots", repo_path) >= (int)sizeof(dir) ||
+        snprintf(path, sizeof(path), "%s/%lld", dir, (long long)snap_id) >= (int)sizeof(path))
+        return set_error(ERR_INVALID, "prune: path too long");
+    if (unlink(path) == 0) {
+        if (removed) *removed = 1;
+    } else if (errno != ENOENT) {
+        return set_error_errno(ERR_IO, "prune: cannot unlink %s", path);
+    }
+    if (snapshot_fsync_dir(dir) != 0)
+        return set_error_errno(ERR_IO, "prune: cannot sync %s", dir);
+    return OK;
+}
 
 /* The snapshot's tag names, comma separated, into out. Returns how many. */
 static unsigned collect_tags(cutils_db_t *db, const char *repo, const char *snap,
@@ -108,37 +136,37 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
      */
     char marker[64];
     snprintf(marker, sizeof(marker), "prune-pending-%lld", (long long)snap_id);
-    int failed = db_execute_non_query(db,
+    int failed = db_write(db,
             "INSERT OR REPLACE INTO recovery_state (repo_id, key, value)"
             " VALUES (?, ?, ?)",
             (const char *[]){ repo, marker, snap, NULL }, NULL) != 0;
 
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM nodes WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM snapshots WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM tags WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM notes WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM snapshot_unit_items WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
-        failed = db_execute_non_query(db,
+        failed = db_write(db,
             "DELETE FROM snapshot_units WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
 
@@ -148,27 +176,49 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
                          (long long)snap_id);
     }
 
-    /* The repository's copy of the tags (repo_tags.h) loses them too, in the
-     * same transaction, as every other tag change does. Left behind, a
-     * reindex would skip them only because the timestamp no longer matches. */
-    if (ntags > 0 && repo_tags_save(db, repo_id, store_root(store)) != OK) {
-        char why[ERR_MSG_MAX];
-        snprintf(why, sizeof(why), "%s", err_msg());
-        db_txn_rollback(db);
-        return set_error(ERR_IO, "prune: cannot record tags in the repository: %s", why);
-    }
-
     if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "prune: commit");
 
-    char path[PATH_MAX];
-    if (snprintf(path, sizeof(path), "%s/snapshots/%lld",
-                 store_root(store), (long long)snap_id) < (int)sizeof(path)) {
-        if (unlink(path) != 0 && errno != ENOENT)
-            log_warn("prune: cannot unlink %s: %s", path, strerror(errno));
+    /*
+     * The repository's copy of the tags (repo_tags.h) loses them too, after
+     * the commit and outside the write lock: its two syncs inside the
+     * transaction held up every other writer (B144). This direction is safe
+     * where a tag edit's is not: a tag left in the file for a snapshot that
+     * is gone is never restored, since reindex matches id and timestamp and
+     * snapshot ids are never reused. So a failure here is a warning.
+     */
+    if (ntags > 0) {
+        repo_tags_lock();
+        if (repo_tags_save(db, repo_id, store_root(store)) != OK) {
+            log_warn("prune: snapshot %lld's tags stay in the repository's tag file, "
+                     "where they match nothing: %s", (long long)snap_id, err_msg());
+            err_clear();
+        }
+        repo_tags_unlock();
     }
 
-    if (db_execute_non_query(db,
+    /* The record file is the snapshot's authoritative copy; it goes only
+     * once the commit removing the snapshot's rows is durable, or a power
+     * cut could bring back rows for a snapshot whose record is gone (B142).
+     * A record left behind is what reconcile and reindex expect. */
+    if (db_txn_make_durable(db) != OK) {
+        log_warn("prune: snapshot %lld removed from the index; its record stays until "
+                 "the index is durable: %s", (long long)snap_id, err_msg());
+        err_clear();
+        return OK;
+    }
+
+    /* The marker goes only once the record is gone for good: until then it
+     * is what lets the next start, or a reindex, finish this prune rather
+     * than mistake the record for a snapshot the index lost (B148). */
+    if (unlink_record(store_root(store), snap_id, NULL) != OK) {
+        log_warn("prune: snapshot %lld removed from the index; its record stays until "
+                 "the next start finishes the removal: %s", (long long)snap_id, err_msg());
+        err_clear();
+        return OK;
+    }
+
+    if (db_write(db,
             "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
             (const char *[]){ repo, marker, NULL }, NULL) != 0)
         log_warn("prune: cannot clear intent marker for snapshot %lld",
@@ -176,6 +226,76 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     log_info("prune: removed snapshot %lld", (long long)snap_id);
     return OK;
+}
+
+status_t prune_finish_pending(cutils_db_t *db, int64_t repo_id, unsigned *out_finished)
+{
+    if (out_finished) *out_finished = 0;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    const char *p1[] = { repo, NULL };
+    db_result_t *r = NULL;
+    if (db_execute(db, repo_id > 0
+            ? "SELECT m.repo_id, m.key, m.value, r.path FROM recovery_state m"
+              " JOIN repos r ON r.id = m.repo_id"
+              " WHERE m.key LIKE 'prune-pending-%' AND m.repo_id = ?"
+            : "SELECT m.repo_id, m.key, m.value, r.path FROM recovery_state m"
+              " JOIN repos r ON r.id = m.repo_id WHERE m.key LIKE 'prune-pending-%'",
+            repo_id > 0 ? p1 : NULL, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "prune: cannot list interrupted prunes");
+    }
+    status_t st = OK;
+    for (int i = 0; r && i < r->nrows && st == OK; i++) {
+        const char *rid = r->rows[i][0], *key = r->rows[i][1], *snap = r->rows[i][2];
+        const char *path = r->rows[i][3];
+        int64_t snap_id = strtoll(snap, NULL, 10);
+        char dir[PATH_MAX];
+        struct stat sb;
+        /* An offline repository keeps its marker for the next start. */
+        if (snprintf(dir, sizeof(dir), "%s/snapshots", path) >= (int)sizeof(dir) ||
+            stat(dir, &sb) != 0 || !S_ISDIR(sb.st_mode))
+            continue;
+
+        /* The marker was committed with the deletion of the rows. Rows
+         * there now were put back by something that did not know (a
+         * reindex from before markers were honoured): that snapshot is
+         * listed, so it stays, and only the marker goes. */
+        db_result_t *q = NULL;
+        int listed = db_execute(db, "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+                                (const char *[]){ rid, snap, NULL }, &q) == 0 &&
+                     q && q->nrows > 0;
+        db_result_free(q);
+        /*
+         * No record left means the prune had finished and only the
+         * marker's removal was lost: it is not durable until the WAL
+         * syncs, and a power cut within that window rolls it back
+         * (NIT-35). Nothing was interrupted, so nothing is reported.
+         */
+        int removed = 0;
+        if (listed) {
+            log_warn("prune: snapshot %s of repo %s was pruned and is listed again; "
+                     "keeping it", snap, rid);
+        } else {
+            st = unlink_record(path, snap_id, &removed);
+            if (st != OK) break;
+        }
+        if (db_write(db, "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
+                     (const char *[]){ rid, key, NULL }, NULL) != 0) {
+            st = set_error(ERR_IO, "prune: cannot clear the marker of snapshot %s", snap);
+            break;
+        }
+        if (!listed && removed) {
+            log_warn("prune: finished the removal of snapshot %s of repo %s, which a crash "
+                     "or power cut interrupted", snap, rid);
+            if (out_finished) (*out_finished)++;
+        } else if (!listed) {
+            log_debug("prune: cleared the stale marker of snapshot %s of repo %s, whose "
+                      "removal had completed", snap, rid);
+        }
+    }
+    db_result_free(r);
+    return st;
 }
 
 status_t prune_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,

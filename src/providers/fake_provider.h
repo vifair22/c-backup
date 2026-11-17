@@ -68,6 +68,7 @@ typedef enum {
     FAKE_FAIL_RELEASE,           /* releasing a hold fails, anywhere */
     FAKE_CRASH_IN_HOLD,          /* begin "dies" holding: no release, no clear */
     FAKE_HANG_IN_HOLD,           /* begin holds the freeze up to `arg` ms */
+    FAKE_HANG_IN_PAUSE,          /* begin holds the pause up to `arg` ms */
 } fake_fail_t;
 
 /* One failure, for one unit id (NULL: every unit). Replaces any set. */
@@ -145,6 +146,27 @@ status_t fake_disk_runs(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
                         fake_alloc_t *alloc);
 status_t fake_blob_data(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
                         void **data, size_t *len);
+/*
+ * Incremental (vm-backup.md 5). set_changed makes a disk one that carries
+ * checkpoints (a "qcow2" with SP_CAP_INCREMENTAL) and scripts what its
+ * bitmap says changed since the unit's checkpoint ([s, e) pairs, n of
+ * them; n 0 is "nothing changed"). A committed session that made a
+ * checkpoint becomes the unit's and clears every disk's set. checkpoint
+ * names the unit's current one; break_chain loses it (lose) or marks its
+ * bitmap inconsistent so the next incremental is refused (refuse).
+ */
+status_t fake_disk_set_changed(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
+                               const uint64_t *ranges, size_t n);
+status_t fake_unit_checkpoint(sp_ctx_t *ctx, const char *unit_id, char *buf, size_t sz);
+status_t fake_unit_break_chain(sp_ctx_t *ctx, const char *unit_id, int lose, int refuse);
+/* Make cp the unit's checkpoint again ("" for none): a hypervisor that
+ * kept it, for a test replaying sessions from one saved state. */
+status_t fake_unit_set_checkpoint(sp_ctx_t *ctx, const char *unit_id, const char *cp);
+/* Call fn at the start of every session's end, before a commit settles its
+ * checkpoint; committed says which way it ends. NULL stops. For tests of
+ * what has to be true by then. */
+void fake_end_observe(sp_ctx_t *ctx, void (*fn)(void *ctx, int committed), void *fnctx);
+
 /* A block stream over a run map, owning a copy; close frees it. */
 status_t fake_stream_from_runs(uint64_t size, const fake_run_t *runs, size_t n_runs,
                                fake_alloc_t alloc, sp_block_stream_t *out);

@@ -53,13 +53,25 @@ typedef struct {
     uint64_t pack_entries_damaged;
     uint32_t damaged_listed;
     uint8_t  damaged[PACK_DAMAGED_LIST_MAX][OBJECT_HASH_SIZE];
+    /* Packs compaction could not walk and left as they were, with why: a
+     * failure like damage, until verify with repair restores them. */
+    uint32_t packs_unwalkable;
+    uint32_t unwalkable_listed;
+    pack_unwalkable_t unwalkable[PACK_UNWALKABLE_LIST_MAX];
+    /* Duplicate copies (OWN-22): dropped behind a confirmed indexed copy,
+     * kept because the indexed copy could not be confirmed, and index rows
+     * moved off such a copy onto one proven to be the object. */
+    uint64_t dups_dropped;
+    uint64_t dups_kept;
+    uint64_t index_relocated;
 } gc_result_t;
 
 /*
  * Sweep unreferenced objects and compact packs. A pack entry found damaged
  * beyond parity while being copied is copied as it is and compaction goes
  * on, then gc returns ERR_CORRUPT naming how many: the new pack's parity
- * covers the damage, and reporting OK would hide it (OWN-31).
+ * covers the damage, and reporting OK would hide it (OWN-31). A pack that
+ * cannot be walked is left whole and fails gc the same way, naming it.
  */
 status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 int dry_run, atomic_int *cancel, gc_result_t *out);

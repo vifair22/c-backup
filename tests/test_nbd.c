@@ -26,6 +26,7 @@
 
 #include <cmocka.h>
 
+#include "disk_stream.h"
 #include "nbd_client.h"
 #include "nbd_test_server.h"
 #include "test_tmp.h"
@@ -207,7 +208,15 @@ static void test_fuzz(void **state)
 }
 
 /* qemu-nbd, when this host has it: a raw and a qcow2 image read back. */
+static pid_t start_qemu_nbd_b(const char *img, const char *fmt, const char *sock, const char *bitmap);
+
 static pid_t start_qemu_nbd(const char *img, const char *fmt, const char *sock)
+{
+    return start_qemu_nbd_b(img, fmt, sock, NULL);
+}
+
+/* The same, exporting a persistent dirty bitmap of the image (-B). */
+static pid_t start_qemu_nbd_b(const char *img, const char *fmt, const char *sock, const char *bitmap)
 {
     /* --force-share is gone from this qemu-nbd; file.locking=off is what
      * it did. */
@@ -215,8 +224,12 @@ static pid_t start_qemu_nbd(const char *img, const char *fmt, const char *sock)
     snprintf(opts, sizeof(opts), "driver=%s,file.driver=file,file.filename=%s,file.locking=off", fmt, img);
     pid_t p = fork();
     if (p == 0) {
-        execlp("qemu-nbd", "qemu-nbd", "--read-only", "--persistent", "--cache=none",
-               "-k", sock, "-x", "disk", "--image-opts", opts, (char *)NULL);
+        if (bitmap)
+            execlp("qemu-nbd", "qemu-nbd", "--read-only", "--persistent", "--cache=none",
+                   "-k", sock, "-x", "disk", "-B", bitmap, "--image-opts", opts, (char *)NULL);
+        else
+            execlp("qemu-nbd", "qemu-nbd", "--read-only", "--persistent", "--cache=none",
+                   "-k", sock, "-x", "disk", "--image-opts", opts, (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 100; i++) {
@@ -281,6 +294,164 @@ static void test_qemu_nbd(void **state)
     free(want);
 }
 
+/* Read a whole stream as block_source does: extents forward, data read. */
+static status_t drain(sp_block_stream_t *b, uint64_t size, int write_at_half, const char *path)
+{
+    uint8_t *buf = malloc(M);
+    assert_non_null(buf);
+    status_t st = OK;
+    uint64_t at = 0;
+    while (st == OK && at < size) {
+        sp_ext_type_t t;
+        uint64_t len = 0;
+        int done = 0;
+        st = b->extent(b->ctx, at, &t, &len, &done);
+        if (st != OK || done) break;
+        if (len > size - at) len = size - at;
+        for (uint64_t o = at; st == OK && t == SP_EXT_DATA && o < at + len; o += M) {
+            uint64_t n = at + len - o < M ? at + len - o : M;
+            if (write_at_half && o >= size / 2) {
+                write_at_half = 0;
+                int fd = open(path, O_WRONLY);
+                assert_true(fd >= 0);
+                assert_int_equal(pwrite(fd, "X", 1, 0), 1);
+                close(fd);
+            }
+            st = b->read(b->ctx, buf, (size_t)n, o);
+        }
+        /* The image written after the first half has gone, before the
+         * extents that follow are asked for. */
+        if (write_at_half && at + len >= size / 2) {
+            write_at_half = 0;
+            int fd = open(path, O_WRONLY);
+            assert_true(fd >= 0);
+            assert_int_equal(pwrite(fd, "X", 1, 0), 1);
+            close(fd);
+        }
+        at += len;
+    }
+    free(buf);
+    return st;
+}
+
+/*
+ * A shut-off VM's raw image read offline: unchanged, the read succeeds;
+ * written mid-read (the VM started), the read fails at its end, so the disk
+ * and its unit fail rather than store a torn image as consistent. The same
+ * image read as a running VM's would be (offline 0) is not held to it.
+ */
+/*
+ * The dirty bitmap as a disk stream's changed ranges (vm-backup.md 4.1,
+ * 10.2): a qcow2 with a persistent bitmap, written through qemu-io, exported
+ * by qemu-nbd -B. The ranges come back rounded to the bitmap's granularity,
+ * merged, and the walk can start over from 0, as the estimate, the delta
+ * and the audit each do. A bitmap the server does not have is no bitmap.
+ */
+static void test_qemu_nbd_bitmap(void **state)
+{
+    (void)state;
+    if (system("command -v qemu-nbd >/dev/null 2>&1 && command -v qemu-img >/dev/null 2>&1 && "
+               "command -v qemu-io >/dev/null 2>&1") != 0) {
+        print_message("qemu-nbd, qemu-img or qemu-io not found: skipped\n");
+        skip();
+    }
+    const char *img = D "/bm.qcow2";
+    assert_int_equal(system("qemu-img create -q -f qcow2 '" D "/bm.qcow2' 16M && "
+                            "qemu-img bitmap --add '" D "/bm.qcow2' cbk-vda && "
+                            "qemu-io -f qcow2 -c 'write -P 1 1048576 4096' -c 'write -P 2 9437184 131072' "
+                            "-c 'write -P 3 9568256 4096' '" D "/bm.qcow2' >/dev/null"), 0);
+    const char *sock = D "/bm.sock";
+    unlink(sock);
+    pid_t p = start_qemu_nbd_b(img, "qcow2", sock, "cbk-vda");
+    assert_true(p > 0);
+    sp_block_stream_t b;
+    int hb = 0;
+    assert_int_equal(disk_stream_nbd(sock, "disk", 16 * M, NULL, "cbk-vda", &hb, &b), OK);
+    assert_true(hb);
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t rs = 0, re = 0, from = 0;
+        int done = 0;
+        assert_int_equal(b.changed(b.ctx, from, &rs, &re, &done), OK);
+        assert_false(done);
+        assert_int_equal(rs, 1 * M);
+        assert_int_equal(re, 1 * M + 65536);
+        from = re;
+        assert_int_equal(b.changed(b.ctx, from, &rs, &re, &done), OK);
+        assert_false(done);
+        assert_int_equal(rs, 9 * M);
+        assert_int_equal(re, 9 * M + 196608);         /* two writes, one merged range */
+        assert_int_equal(b.changed(b.ctx, re, &rs, &re, &done), OK);
+        assert_true(done);
+    }
+    /* The extent walk may go back too. */
+    sp_ext_type_t t;
+    uint64_t len = 0;
+    int done = 0;
+    assert_int_equal(b.extent(b.ctx, 12 * M, &t, &len, &done), OK);
+    assert_int_equal(t, SP_EXT_ZERO);
+    assert_int_equal(b.extent(b.ctx, 1 * M, &t, &len, &done), OK);
+    assert_int_equal(t, SP_EXT_DATA);
+    b.close(b.ctx);
+    /* Asked for a bitmap the export does not have: none, and no ranges. */
+    assert_int_equal(disk_stream_nbd(sock, "disk", 16 * M, NULL, "other", &hb, &b), OK);
+    assert_false(hb);
+    uint64_t rs, re;
+    assert_int_not_equal(b.changed(b.ctx, 0, &rs, &re, &done), OK);
+    err_clear();
+    b.close(b.ctx);
+    kill(p, SIGTERM);
+    waitpid(p, NULL, 0);
+}
+
+static void test_offline_image_changed(void **state)
+{
+    (void)state;
+    const char *img = D "/raw.img";
+    int fd = open(img, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    assert_true(fd >= 0);
+    uint8_t blk[4096];
+    memset(blk, 7, sizeof(blk));
+    for (uint64_t o = 0; o < 8 * M; o += 2 * M) assert_int_equal(pwrite(fd, blk, sizeof(blk), (off_t)o), (ssize_t)sizeof(blk));
+    /* Data at the very end too, so the last read is what checks. */
+    assert_int_equal(pwrite(fd, blk, sizeof(blk), (off_t)(8 * M - sizeof(blk))), (ssize_t)sizeof(blk));
+    close(fd);
+
+    sp_block_stream_t b;
+    assert_int_equal(disk_stream_file(img, 8 * M, 1, &b), OK);
+    assert_int_equal(drain(&b, 8 * M, 0, img), OK);
+    b.close(b.ctx);
+
+    assert_int_equal(disk_stream_file(img, 8 * M, 1, &b), OK);
+    struct timespec ts = { 0, 20 * 1000000L };
+    nanosleep(&ts, NULL);       /* a distinct mtime even on coarse clocks */
+    assert_int_not_equal(drain(&b, 8 * M, 1, img), OK);
+    assert_non_null(strstr(err_msg(), "changed while it was read offline"));
+    b.close(b.ctx);
+
+    /* A trailing hole: the zero extent reaching the end is what checks. */
+    assert_int_equal(truncate(img, 16 * M), 0);
+    assert_int_equal(disk_stream_file(img, 16 * M, 1, &b), OK);
+    nanosleep(&ts, NULL);
+    assert_int_not_equal(drain(&b, 16 * M, 1, img), OK);
+    b.close(b.ctx);
+
+    assert_int_equal(disk_stream_file(img, 16 * M, 0, &b), OK);
+    nanosleep(&ts, NULL);
+    assert_int_equal(drain(&b, 16 * M, 1, img), OK);
+    b.close(b.ctx);
+}
+
+/* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
+ * that leaves anything behind (SCRATCH-1). Setup removes it too, so a
+ * killed run is no obstacle to the next. */
+static int group_cleanup(void **state)
+{
+    (void)state;
+    int rc = system("rm -rf '" D "'");
+    (void)rc;
+    return 0;
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -290,6 +461,8 @@ int main(void)
         cmocka_unit_test_setup(test_faults, setup),
         cmocka_unit_test_setup(test_fuzz, setup),
         cmocka_unit_test_setup(test_qemu_nbd, setup),
+        cmocka_unit_test_setup(test_qemu_nbd_bitmap, setup),
+        cmocka_unit_test_setup(test_offline_image_changed, setup),
     };
-    return cmocka_run_group_tests(tests, NULL, NULL);
+    return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }

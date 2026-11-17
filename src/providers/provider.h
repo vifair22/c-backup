@@ -153,6 +153,11 @@ typedef struct {
      * (SP_CF_PAUSE_HELD) until release, so the caller's second pass over
      * those mounts is consistent with the snapshot. */
     int                    hold_pause;
+    /* The token this unit's chain holds when no item can use it as a base
+     * now (vm-backup.md 5.8): the provider retires what it names once the
+     * session commits, as it would a base, so a broken chain leaves no
+     * checkpoint behind. NULL when there is none, or when it is a base. */
+    const char            *retire_token;
 } sp_begin_req_t;
 
 typedef struct {
@@ -177,6 +182,9 @@ typedef struct {
     sp_item_plan_t  *plans;
     size_t           n_plans;
     char            *new_token;     /* to bind if the snapshot commits */
+    /* What the provider recorded for new_token (a checkpoint's XML), for
+     * the daemon's informational copy (vm-backup.md 5.8). May be NULL. */
+    char            *new_token_blob;
     char           **warnings;
     size_t           n_warnings;
 } sp_session_info_t;
@@ -240,12 +248,23 @@ typedef struct {
  * live job owns and that pass the provider's ownership proof. released
  * (caller's, n_intents long, may be NULL) gets 1 for each intent whose
  * release succeeded, so the core deletes exactly those rows.
+ *
+ * absent (caller's, n_intents long, may be NULL) gets 1 for each intent
+ * under which nothing was held. That release still succeeds, as a no-op,
+ * and the start-up and end-of-job sweeps delete the row. The watchdog
+ * keeps it: it sweeps holds of live jobs, and a row is recorded before its
+ * hold is taken, so nothing held may mean not taken yet. Deleting the row
+ * then would leave the hold, once taken, unjournalled and unbounded. The
+ * helper's watchdog does the same with its own journal. Only freezes and
+ * pauses are timed, so a provider must fill it for those kinds; for the
+ * rest it may leave 0.
  */
 typedef struct {
     const char        *daemon8;
     const sp_intent_t *intents;
     size_t             n_intents;
     int               *released;
+    int               *absent;
     int                scan_artefacts;
     const int64_t     *live_jobs;
     size_t             n_live_jobs;

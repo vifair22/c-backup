@@ -15,10 +15,38 @@ typedef struct {
     uint64_t offset;
     uint32_t pack_version;
     uint32_t entry_index;
+    uint64_t comp_size;
+    uint64_t orig_size;
 } row_t;
 
 static row_t  g_rows[FAKE_INDEX_MAX];
 static size_t g_count;
+static row_t  g_durable[FAKE_INDEX_MAX];
+static size_t g_durable_count;
+status_t (*fake_index_sync_gate)(void) = NULL;
+
+void fake_index_mark_durable(void)
+{
+    memcpy(g_durable, g_rows, g_count * sizeof(*g_rows));
+    g_durable_count = g_count;
+}
+
+void fake_index_crash(void)
+{
+    memcpy(g_rows, g_durable, g_durable_count * sizeof(*g_rows));
+    g_count = g_durable_count;
+}
+
+static status_t fake_sync(void *user)
+{
+    (void)user;
+    if (fake_index_sync_gate) {
+        status_t st = fake_index_sync_gate();
+        if (st != OK) return st;
+    }
+    fake_index_mark_durable();
+    return OK;
+}
 
 static void fake_commit(void *user, const pack_commit_info_t *info)
 {
@@ -41,6 +69,8 @@ static void fake_commit(void *user, const pack_commit_info_t *info)
         g_rows[slot].offset       = info->entries[i].offset;
         g_rows[slot].pack_version = PACK_VERSION;
         g_rows[slot].entry_index  = info->entries[i].entry_index;
+        g_rows[slot].comp_size    = info->entries[i].comp_size;
+        g_rows[slot].orig_size    = info->entries[i].orig_size;
         if (slot == g_count) g_count++;
     }
 }
@@ -69,6 +99,8 @@ static status_t fake_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
         out->offset       = g_rows[i].offset;
         out->pack_version = g_rows[i].pack_version;
         out->entry_index  = g_rows[i].entry_index;
+        out->comp_size    = g_rows[i].comp_size;
+        out->orig_size    = g_rows[i].orig_size;
         return OK;
     }
     return ERR_NOT_FOUND;
@@ -79,11 +111,13 @@ void fake_index_attach(store_t *store)
     store_set_pack_commit_cb(store, fake_commit, NULL);
     store_set_pack_removed_cb(store, fake_removed, NULL);
     store_set_locate_cb(store, fake_locate, NULL);
+    store_set_index_sync_cb(store, fake_sync, NULL);
 }
 
 void fake_index_reset(void)
 {
     g_count = 0;
+    g_durable_count = 0;
 }
 
 size_t fake_index_count(void)

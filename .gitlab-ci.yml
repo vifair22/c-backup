@@ -5,6 +5,21 @@
 # target, because a gate set to an aspiration gets overridden until it means
 # nothing, while one set to the current floor catches real regressions.
 
+# Merge requests run merge-request pipelines, which GitLab builds as merged
+# results: the MR's changes merged onto the current target. Two MRs that are
+# each green on their own branch once merged into a red 1.0.0 (FLAKE-14); a
+# merged-results pipeline would have caught it. A branch with an open MR does
+# not also get a branch pipeline, which would only duplicate the work. Every
+# other branch push (1.0.0, v3, master, uat/*, branches without an MR) and
+# every tag still gets a branch pipeline.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
 stages:
   - test
   - analyze
@@ -12,7 +27,18 @@ stages:
   - build
   - deploy
 
+# The FS1 proxy in front of git.airies.net answers 503 now and then. Absorb
+# that inside the job (runner fetches, the c-utils clone, artifacts) rather
+# than failing the pipeline and re-running all of it.
+default:
+  retry:
+    max: 1
+    when: [runner_system_failure, api_failure, stuck_or_timeout_failure]
+
 variables:
+  GET_SOURCES_ATTEMPTS: 3
+  ARTIFACT_DOWNLOAD_ATTEMPTS: 3
+  RESTORE_CACHE_ATTEMPTS: 3
   CUTILS_DIR: /tmp/c-utils
   DEBIAN_FRONTEND: noninteractive
   # The Makefile defaults to the dev machine's znver3. Runners are not
@@ -42,11 +68,21 @@ variables:
 # master, so a change over there cannot break this build without someone
 # choosing to move the pin.
 .fetch_cutils: &fetch_cutils
-  - git clone -q https://git.airies.net/vifair22/c-utils.git "$CUTILS_DIR"
+  - |
+    for delay in 5 15 45 0; do
+      rm -rf "$CUTILS_DIR"
+      git clone -q https://git.airies.net/vifair22/c-utils.git "$CUTILS_DIR" && break
+      [ "$delay" -eq 0 ] && { echo "c-utils clone failed after 4 tries"; exit 1; }
+      echo "c-utils clone failed; retrying in ${delay}s"; sleep "$delay"
+    done
   - git -C "$CUTILS_DIR" checkout -q "$(tr -d '[:space:]' < cutils_version)"
   - make -s -C "$CUTILS_DIR"
 
 test:
+  rules:
+    # The gate job, and also the nightly schedule: ui-e2e there needs the
+    # daemon this job builds.
+    - when: on_success
   stage: test
   image: debian:trixie
   tags: [docker]
@@ -55,6 +91,9 @@ test:
     - *fetch_cutils
   script:
     - make
+    # A bare make must produce the programs: the Docker image build runs
+    # exactly this, and once built nothing because the default goal slipped.
+    - test -x build/bins/c-backupd && test -x build/bins/c-backup && test -x build/bins/c-backup-helper
     # Find somewhere the sparse fixtures can have real holes. Sourced, not
     # run: it exports the directory the suites read. Never fails the job -
     # if nothing here supports holes the suites skip, exactly as before.
@@ -71,6 +110,11 @@ test:
       - build/bins/
 
 analyze:
+  rules:
+    # Gate jobs: every MR and branch pipeline, never the nightly schedule.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
   stage: analyze
   image: debian:trixie
   tags: [docker]
@@ -96,6 +140,12 @@ analyze:
 # still come from the ordinary gcc build in the test stage; this exists to
 # run the parsers against bytes nobody intended.
 fuzz:
+  rules:
+    # Long jobs run nightly and on the image-cut pipelines, not on every MR:
+    # the MR gate is build, tests, coverage and analyze.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH =~ /^uat\//
+    - when: never
   stage: analyze
   image: debian:trixie
   tags: [docker]
@@ -140,6 +190,11 @@ fuzz:
 # TypeScript files it is testing, so there is nothing to fetch and nothing
 # to keep in step with a lockfile.
 ui:
+  rules:
+    # Gate jobs: every MR and branch pipeline, never the nightly schedule.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
   stage: analyze
   # Trixie-based, deliberately. The daemon this suite starts is built in the
   # test job on debian:trixie, and a node image on an older Debian has an
@@ -183,6 +238,12 @@ ui:
 # success. Two clean runs later there is no reason to keep reading the job
 # list by hand to find out whether the app works.
 ui-e2e:
+  rules:
+    # Long jobs run nightly and on the image-cut pipelines, not on every MR:
+    # the MR gate is build, tests, coverage and analyze.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH =~ /^uat\//
+    - when: never
   stage: analyze
   image: node:24-trixie-slim
   tags: [docker]
@@ -222,7 +283,32 @@ ui-e2e:
       # these are the pictures a review looks at.
       - ui/test-results/
 
+# Real-size pack rollover (B134): files of 300 MB, 600 MB and 2 GiB stored at
+# the production seal. About 2.5 GiB of scratch, so it runs nightly rather
+# than on every MR; make test covers the same logic at an 8 MiB test seal.
+# The scratch directory is the job's own and is removed whatever happens.
+nightly-rollover:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  stage: test
+  image: debian:trixie
+  tags: [docker]
+  timeout: 90m
+  before_script:
+    - *debian_deps
+    - *fetch_cutils
+  script:
+    - mkdir -p "$C_BACKUP_TEST_DIR"
+    - make test-rollover-full
+  after_script:
+    - rm -rf "$C_BACKUP_TEST_DIR"
+
 coverage:
+  rules:
+    # Gate jobs: every MR and branch pipeline, never the nightly schedule.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
   stage: coverage
   image: debian:trixie
   tags: [docker]
@@ -268,6 +354,32 @@ build:image:
     - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
   only:
     - master
+
+# Build the release image in a merge request whenever something it depends on
+# changes, so a broken image is caught by the MR rather than at a UAT cut
+# (BUILD-5: a bare make built nothing and only the image build noticed). It
+# builds and smoke-runs the image like build:image, then deletes it; nothing
+# is pushed.
+build:image:check:
+  stage: build
+  needs: []
+  image: docker:cli
+  tags: [docker, unraid]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths: [Makefile, Dockerfile, .dockerignore, cutils_version, .gitlab-ci.yml, packaging/**/*]
+  variables:
+    CHECK_TAG: cbackup-mrcheck:$CI_PIPELINE_ID
+  script:
+    - docker build --provenance=false --sbom=false -t "$CHECK_TAG" .
+    - docker run -d --name "smoke-$CI_JOB_ID" "$CHECK_TAG"
+    - sleep 5
+    - docker ps --filter "name=smoke-$CI_JOB_ID" --filter status=running | grep -q "smoke-$CI_JOB_ID"
+    - docker logs "smoke-$CI_JOB_ID"
+  after_script:
+    - docker rm -f "smoke-$CI_JOB_ID" >/dev/null 2>&1 || true
+    - docker rmi "cbackup-mrcheck:$CI_PIPELINE_ID" >/dev/null 2>&1 || true
 
 # Deploy fans out to one child job per target so a host can be added or
 # removed by editing a CI variable rather than this file. With no targets set

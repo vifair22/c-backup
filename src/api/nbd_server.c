@@ -495,6 +495,14 @@ static void transmit(conn_t *c)
     runs_t *runs = malloc(sizeof(*runs));
     if (!buf || !runs) { free(buf); free(runs); return; }
     for (;;) {
+        /* A quiet connection lets go of its cache, which holds read budget
+         * (content_reader_drop), rather than keep it for hours. */
+        if (c->s->o.ops.idle) {
+            struct pollfd pf = { c->fd, POLLIN, 0 };
+            int pr;
+            while ((pr = poll(&pf, 1, 1000)) == 0) c->s->o.ops.idle(c->reader);
+            if (pr < 0 && errno != EINTR) break;
+        }
         uint8_t h[28];
         if (rd(c->fd, h, sizeof(h)) != 0) break;
         atomic_store(&c->s->last_active, (long long)nbd_server_now());

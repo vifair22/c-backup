@@ -20,8 +20,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/openat2.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <sys/acl.h>
+#include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/xattr.h>
@@ -47,23 +52,31 @@
  * of "src/doc" pull in "src/documents" too.
  */
 /*
- * Where rel lands under dest: dest/rel, or with strip_subpath dest/<rel
- * below the subpath>, the subpath itself being dest. -1 if too long.
+ * With strip_subpath, the subpath's contents go straight into dest: rel is
+ * cut to what lies below the subpath, in place, so every write beneath the
+ * destination's directory fds (dest_parent) lands there. Returns 1 when
+ * rel is the subpath itself, which is dest and is not written.
  */
+static int strip_rel(char *rel, const restore_opts_t *o)
+{
+    if (!o || !o->strip_subpath || !o->subpath) return 0;
+    const char *sp = o->subpath;
+    while (*sp == '/') sp++;
+    char *r = rel;
+    while (*r == '/') r++;
+    size_t n = strlen(sp);
+    while (n > 0 && sp[n - 1] == '/') n--;
+    if (strncmp(r, sp, n) == 0 && (r[n] == '\0' || r[n] == '/')) r += n;
+    while (*r == '/') r++;
+    memmove(rel, r, strlen(r) + 1);
+    return rel[0] == '\0';
+}
+
+/* Where rel lands under dest. -1 if too long. */
 static int dest_path(char *full, size_t sz, const char *dest, const char *rel, const restore_opts_t *o)
 {
-    const char *r = rel;
-    if (o && o->strip_subpath && o->subpath) {
-        const char *sp = o->subpath;
-        while (*sp == '/') sp++;
-        while (*r == '/') r++;
-        size_t n = strlen(sp);
-        while (n > 0 && sp[n - 1] == '/') n--;
-        if (strncmp(r, sp, n) == 0 && (r[n] == '\0' || r[n] == '/')) r += n;
-        while (*r == '/') r++;
-        if (!*r) return snprintf(full, sz, "%s", dest) >= (int)sz ? -1 : 0;
-    }
-    return snprintf(full, sz, "%s/%s", dest, r) >= (int)sz ? -1 : 0;
+    (void)o;
+    return snprintf(full, sz, "%s/%s", dest, rel) >= (int)sz ? -1 : 0;
 }
 
 static int path_within(const char *rel, const char *subpath)
@@ -199,30 +212,208 @@ static int hash_is_zero_hex(const char *hex)
 }
 
 /*
- * Just the timestamp. Directories need theirs applied twice - once when
- * created, and again after their contents are written, because writing an
- * entry into a directory moves its mtime forward. Nothing else about a
- * directory changes in between, so the second pass reapplies only this.
+ * The destination is written relative to directory fds, never by path.
+ *
+ * By path, anything already in the destination was followed: a directory
+ * entry whose name held a symlink got mkdir's EEXIST and then chown/chmod
+ * on the link's target, and every file under it was created wherever the
+ * link pointed - with --overwrite, renamed over what was there. The daemon
+ * runs as root, so a symlink planted in a restore target could have the
+ * restore rewrite /etc (B128's other half). Now every entry's parent is
+ * opened beneath the destination with no symlink anywhere on the way
+ * (dest_parent), and the entry itself is made and changed through that fd
+ * with *at calls that do not follow its last component either.
+ *
+ * The destination path itself is the operator's and may run through
+ * symlinks; nothing below it is followed.
  */
-static void apply_mtime(const char *path, int64_t mtime_ns)
+
+/* Whether openat2 is there: ENOSYS on an old kernel, and in a container
+ * whose seccomp profile predates it. Known after the first call. */
+static _Atomic int openat2_missing = 0;
+
+/* Open the directory `rel` beneath dirfd with no symlink on the way, and no
+ * ".." out of it. */
+static int open_beneath(int dirfd, const char *rel)
 {
-    struct timespec times[2];
-    times[0] = ns_to_timespec(mtime_ns);
-    times[1] = times[0];
-    if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
-        log_warn("restore: utimensat %s: %s", path, strerror(errno));
+    if (!openat2_missing) {
+        struct open_how how;
+        memset(&how, 0, sizeof(how));
+        how.flags   = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+        how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+        long fd = syscall(SYS_openat2, dirfd, rel, &how, sizeof(how));
+        if (fd >= 0) return (int)fd;
+        if (errno != ENOSYS && errno != EPERM) return -1;
+        openat2_missing = 1;
+    }
+    /* One component at a time, each O_NOFOLLOW. "." and ".." are refused
+     * rather than resolved: no snapshot path contains them. */
+    char buf[PATH_MAX];
+    if (snprintf(buf, sizeof(buf), "%s", rel) >= (int)sizeof(buf)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int cur = dup(dirfd);
+    if (cur == -1) return -1;
+    char *save = NULL;
+    for (char *c = strtok_r(buf, "/", &save); c; c = strtok_r(NULL, "/", &save)) {
+        if (strcmp(c, ".") == 0 || strcmp(c, "..") == 0) {
+            close(cur);
+            errno = EXDEV;
+            return -1;
+        }
+        int next = openat(cur, c, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int err = errno;
+        close(cur);
+        if (next == -1) { errno = err; return -1; }
+        cur = next;
+    }
+    return cur;
 }
 
-/* Metadata for something the kernel must not follow: a symlink's own
- * ownership and timestamps, never its target's. */
-static void apply_metadata_nofollow(const char *path, uint32_t uid, uint32_t gid,
-                                    int64_t mtime_ns)
+/* mkdir -p beneath dirfd, never through a symlink. */
+static int make_beneath(int dirfd, const char *rel)
 {
-    if (lchown(path, (uid_t)uid, (gid_t)gid) != 0) { /* best effort */ }
+    char buf[PATH_MAX];
+    if (snprintf(buf, sizeof(buf), "%s", rel) >= (int)sizeof(buf)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int cur = dup(dirfd);
+    if (cur == -1) return -1;
+    char *save = NULL;
+    for (char *c = strtok_r(buf, "/", &save); c; c = strtok_r(NULL, "/", &save)) {
+        if (strcmp(c, ".") == 0 || strcmp(c, "..") == 0) {
+            close(cur);
+            errno = EXDEV;
+            return -1;
+        }
+        if (mkdirat(cur, c, 0755) != 0 && errno != EEXIST) {
+            int err = errno;
+            close(cur);
+            errno = err;
+            return -1;
+        }
+        int next = openat(cur, c, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int err = errno;
+        close(cur);
+        if (next == -1) { errno = err; return -1; }
+        cur = next;
+    }
+    close(cur);
+    return 0;
+}
+
+/*
+ * The parent directory of one entry, as an fd. Entries come in scan order,
+ * so siblings follow each other and the last parent is kept open. Not
+ * owned by the caller; valid until the next call on the same cache.
+ */
+typedef struct {
+    int  dest_fd;
+    int  fd;
+    char rel[PATH_MAX];
+} dir_cache_t;
+
+static void dir_cache_init(dir_cache_t *c, int dest_fd)
+{
+    c->dest_fd = dest_fd;
+    c->fd      = -1;
+    c->rel[0]  = '\0';
+}
+
+static void dir_cache_drop(dir_cache_t *c)
+{
+    if (c->fd != -1) close(c->fd);
+    c->fd = -1;
+    c->rel[0] = '\0';
+}
+
+/* *leaf is set to the last component of rel. With create, missing parents
+ * are made. -1 with errno: ELOOP or ENOTDIR when something in the
+ * destination that is not a directory stands on the way. */
+static int dest_parent(dir_cache_t *c, const char *rel, const char **leaf, int create)
+{
+    const char *slash = strrchr(rel, '/');
+    *leaf = slash ? slash + 1 : rel;
+    if (!**leaf || strcmp(*leaf, ".") == 0 || strcmp(*leaf, "..") == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!slash) return c->dest_fd;
+
+    size_t n = (size_t)(slash - rel);
+    if (n >= sizeof(c->rel)) { errno = ENAMETOOLONG; return -1; }
+    if (c->fd != -1 && strlen(c->rel) == n && memcmp(c->rel, rel, n) == 0)
+        return c->fd;
+    dir_cache_drop(c);
+    memcpy(c->rel, rel, n);
+    c->rel[n] = '\0';
+    int fd = open_beneath(c->dest_fd, c->rel);
+    if (fd == -1 && errno == ENOENT && create) {
+        if (make_beneath(c->dest_fd, c->rel) == 0)
+            fd = open_beneath(c->dest_fd, c->rel);
+    }
+    if (fd == -1) {
+        c->rel[0] = '\0';
+        return -1;
+    }
+    c->fd = fd;
+    return fd;
+}
+
+/* Why an entry's directory could not be reached, for its failure line. */
+static const char *parent_reason(int err)
+{
+    if (err == ELOOP || err == ENOTDIR || err == EXDEV)
+        return "a symlink or non-directory in the destination stands where a "
+               "parent directory belongs; it is not followed";
+    return strerror(err);
+}
+
+static void set_times_at(int pfd, const char *leaf, const char *shown, int64_t mtime_ns)
+{
     struct timespec times[2];
     times[0] = ns_to_timespec(mtime_ns);
     times[1] = times[0];
-    if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0) { /* best effort */ }
+    if (utimensat(pfd, leaf, times, AT_SYMLINK_NOFOLLOW) != 0)
+        log_warn("restore: utimensat %s: %s", shown, strerror(errno));
+}
+
+/* Ownership, mode and times of a thing the restore holds open. */
+static void apply_metadata_fd(int fd, const char *shown, uint32_t mode,
+                              uint32_t uid, uint32_t gid, int64_t mtime_ns)
+{
+    /* Ownership only succeeds as root; a non-root restore keeps the invoking
+     * user's ownership rather than failing the whole operation. chown
+     * first: it clears set-id bits, which the chmod puts back. */
+    if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0 && errno != EPERM)
+        log_warn("restore: chown %s: %s", shown, strerror(errno));
+    if (fchmod(fd, (mode_t)(mode & 07777)) != 0)
+        log_warn("restore: chmod %s: %s", shown, strerror(errno));
+    struct timespec times[2];
+    times[0] = ns_to_timespec(mtime_ns);
+    times[1] = times[0];
+    if (futimens(fd, times) != 0)
+        log_warn("restore: utimensat %s: %s", shown, strerror(errno));
+}
+
+/*
+ * The same for an entry that cannot be opened for it - a symlink, FIFO or
+ * device node - by name in its parent, never following the name. with_mode
+ * is off for a symlink, whose own permissions the kernel ignores.
+ */
+static void apply_metadata_at(int pfd, const char *leaf, const char *shown,
+                              int with_mode, uint32_t mode, uint32_t uid,
+                              uint32_t gid, int64_t mtime_ns)
+{
+    if (fchownat(pfd, leaf, (uid_t)uid, (gid_t)gid, AT_SYMLINK_NOFOLLOW) != 0 &&
+        errno != EPERM)
+        log_warn("restore: chown %s: %s", shown, strerror(errno));
+    if (with_mode &&
+        fchmodat(pfd, leaf, (mode_t)(mode & 07777), AT_SYMLINK_NOFOLLOW) != 0)
+        log_warn("restore: chmod %s: %s", shown, strerror(errno));
+    set_times_at(pfd, leaf, shown, mtime_ns);
 }
 
 static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
@@ -239,27 +430,38 @@ static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
  * running unprivileged cannot set security.* or trusted.* attributes, and
  * that must not fail the file whose content just restored correctly.
  *
- * lsetxattr, never setxattr: the path may be a symlink, and the recorded
- * attributes belong to the link itself, not to whatever it points at.
+ * Through an open fd where there is one. Otherwise lsetxattr on a path,
+ * never setxattr: the entry may be a symlink, and the recorded attributes
+ * belong to the link itself, not to whatever it points at - except on a
+ * /proc/self/fd/N path, which names the pinned inode only when followed.
  *
  * Blob format is defined in types.h and written by scan.c. A malformed blob
  * stops the walk rather than reading past the end; a truncated record can
  * only come from corruption the object layer failed to catch, and quietly
  * applying half of it would be worse than applying none.
  */
-struct xattr_ctx { const char *path; };
+typedef struct {
+    int         fd;      /* >= 0: an fd open for read or write */
+    const char *path;    /* otherwise this */
+    int         follow;  /* path is a /proc/self/fd/N magic link */
+    const char *shown;   /* the destination path, for messages */
+} meta_target_t;
 
 static void apply_one_xattr(const char *name, const void *value, size_t vlen,
                             void *vctx)
 {
-    const struct xattr_ctx *c = vctx;
-    if (lsetxattr(c->path, name, value, vlen, 0) != 0)
+    const meta_target_t *t = vctx;
+    int rc = t->fd >= 0 ? fsetxattr(t->fd, name, value, vlen, 0)
+           : t->follow  ? setxattr(t->path, name, value, vlen, 0)
+                        : lsetxattr(t->path, name, value, vlen, 0);
+    if (rc != 0)
         log_warn("restore: cannot set xattr %s on %s: %s",
-                 name, c->path, strerror(errno));
+                 name, t->shown, strerror(errno));
 }
 
-static void apply_xattrs(store_t *store, const char *path, const char *xhex)
+static void apply_xattrs(store_t *store, const meta_target_t *t, const char *xhex)
 {
+    const char *path = t->shown;
     if (!xhex || !xhex[0] || hash_is_zero_hex(xhex)) return;
 
     uint8_t hash[OBJECT_HASH_SIZE];
@@ -281,8 +483,8 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
         return;
     }
 
-    struct xattr_ctx xctx = { path };
-    if (xattr_blob_foreach(data, len, apply_one_xattr, &xctx) != OK) {
+    meta_target_t tc = *t;
+    if (xattr_blob_foreach(data, len, apply_one_xattr, &tc) != OK) {
         log_warn("restore: malformed xattr blob for %s: %s", path, err_msg());
         err_clear();
     }
@@ -291,14 +493,43 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
 }
 
 /*
+ * Remove whatever ACLs an entry has before its own are applied: the access
+ * ACL, and on a directory the default ACL too.
+ *
+ * A restored directory gets its default ACL before its children are
+ * created, and the kernel hands that default to every child as it is made:
+ * as a file's access ACL, and as a directory's access and default ACL. The
+ * restore only ever set what the snapshot recorded, so a child backed up
+ * with no ACL came back with its parent's (B129), named users and all. So
+ * every entry starts from none; apply_acls then sets exactly what was
+ * recorded. Runs before the chmod, because while an access ACL is present
+ * chmod's group bits set the ACL mask rather than the group class, and the
+ * final mode would not be the backed-up one.
+ */
+static void clear_acls(const meta_target_t *t, int is_dir)
+{
+    static const char *const names[] = {
+        "system.posix_acl_access", "system.posix_acl_default"
+    };
+    for (int i = 0; i < (is_dir ? 2 : 1); i++) {
+        int rc = t->fd >= 0 ? fremovexattr(t->fd, names[i])
+               : t->follow  ? removexattr(t->path, names[i])
+                            : lremovexattr(t->path, names[i]);
+        if (rc != 0 && errno != ENODATA && errno != ENOTSUP)
+            log_warn("restore: cannot clear the inherited %s ACL on %s: %s",
+                     i ? "default" : "access", t->shown, strerror(errno));
+    }
+}
+
+/*
  * Reapply a node's stored ACLs. Runs after chmod on purpose: the access
  * ACL's base entries carry the definitive permissions, and applying it last
  * means the ACL wins over whatever chmod left. Default ACLs only make sense
  * on directories; applying one here, before the directory's children are
- * restored, is harmless because every child's own recorded state is applied
- * over anything it inherits.
+ * restored, is harmless because every child is cleared (clear_acls) and
+ * given its own recorded state over anything it inherits.
  */
-struct acl_ctx { const char *path; int is_dir; };
+struct acl_ctx { meta_target_t t; int is_dir; };
 
 static void apply_one_acl(uint8_t kind, const char *text, void *vctx)
 {
@@ -308,20 +539,34 @@ static void apply_one_acl(uint8_t kind, const char *text, void *vctx)
 
     acl_t acl = acl_from_text(text);
     if (!acl) {
-        log_warn("restore: unparseable ACL text for %s", c->path);
+        log_warn("restore: unparseable ACL text for %s", c->t.shown);
         return;
     }
-    acl_type_t t = (kind == ACL_BLOB_DEFAULT) ? ACL_TYPE_DEFAULT : ACL_TYPE_ACCESS;
-    if (acl_set_file(c->path, t, acl) != 0)
+    int rc;
+    if (c->t.fd >= 0 && kind != ACL_BLOB_DEFAULT) {
+        rc = acl_set_fd(c->t.fd, acl);
+    } else if (c->t.fd >= 0) {
+        /* libacl has no fd call for a default ACL; the fd's magic link
+         * names the same directory and nothing else. */
+        char p[64];
+        snprintf(p, sizeof(p), "/proc/self/fd/%d", c->t.fd);
+        rc = acl_set_file(p, ACL_TYPE_DEFAULT, acl);
+    } else {
+        rc = acl_set_file(c->t.path,
+                          kind == ACL_BLOB_DEFAULT ? ACL_TYPE_DEFAULT : ACL_TYPE_ACCESS,
+                          acl);
+    }
+    if (rc != 0)
         log_warn("restore: cannot set %s ACL on %s: %s",
                  kind == ACL_BLOB_DEFAULT ? "default" : "access",
-                 c->path, strerror(errno));
+                 c->t.shown, strerror(errno));
     acl_free(acl);
 }
 
-static void apply_acls(store_t *store, const char *path, const char *ahex,
+static void apply_acls(store_t *store, const meta_target_t *t, const char *ahex,
                        int is_dir)
 {
+    const char *path = t->shown;
     if (!ahex || !ahex[0] || hash_is_zero_hex(ahex)) return;
 
     uint8_t hash[OBJECT_HASH_SIZE];
@@ -343,7 +588,7 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
         return;
     }
 
-    struct acl_ctx actx = { path, is_dir };
+    struct acl_ctx actx = { *t, is_dir };
     if (acl_blob_foreach(data, len, apply_one_acl, &actx) != OK) {
         log_warn("restore: malformed ACL blob for %s: %s", path, err_msg());
         err_clear();
@@ -364,6 +609,7 @@ static const char *status_reason(status_t st)
     case ERR_NOT_FOUND: return "not found in the repository";
     case ERR_TOO_LARGE: return "too large to load";
     case ERR_BUSY:      return "busy";
+    case ERR_UNAVAILABLE: return "repository unavailable";
     }
     return "unknown error";
 }
@@ -539,64 +785,6 @@ static status_t pt_rel(path_table_t *pt, int i, char *out, size_t outsz, int dep
 }
 
 /*
- * The parent directory make_parents made last, per restore.
- *
- * Restore visits a directory's entries together, and mkdir -p of every
- * entry's whole path cost one mkdir per component per file: 14 for each of
- * 100,000 files in the many-small benchmark, every one EEXIST, 0.3 to 0.5 s
- * of a restore (PERF.md, 2026-11-16). A file whose parent is the one made
- * last needs none. Per restore, not static: two restores run at once on
- * different job workers, and a static would also outlive a destination
- * that was removed between runs.
- */
-typedef struct {
-    char   last[PATH_MAX];
-    size_t len;          /* 0: nothing made yet */
-} parent_cache_t;
-
-/* mkdir -p for the destination side. */
-static status_t make_parents(parent_cache_t *pc, const char *path)
-{
-    const char *slash = strrchr(path, '/');
-    size_t plen = slash ? (size_t)(slash - path) : 0;
-    if (pc && plen && plen == pc->len && memcmp(pc->last, path, plen) == 0)
-        return OK;
-
-    char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p != '/') continue;
-        *p = '\0';
-        if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
-            return set_error_errno(ERR_IO, "restore: mkdir %s", tmp);
-        *p = '/';
-    }
-    if (pc && plen && plen < sizeof(pc->last)) {
-        memcpy(pc->last, path, plen);
-        pc->last[plen] = '\0';
-        pc->len = plen;
-    }
-    return OK;
-}
-
-static void apply_metadata(const char *path, uint32_t mode, uint32_t uid,
-                           uint32_t gid, int64_t mtime_ns)
-{
-    /* Ownership only succeeds as root; a non-root restore keeps the invoking
-     * user's ownership rather than failing the whole operation. */
-    if (chown(path, (uid_t)uid, (gid_t)gid) != 0 && errno != EPERM)
-        log_warn("restore: chown %s: %s", path, strerror(errno));
-    if (chmod(path, (mode_t)(mode & 07777)) != 0)
-        log_warn("restore: chmod %s: %s", path, strerror(errno));
-
-    struct timespec times[2];
-    times[0] = ns_to_timespec(mtime_ns);
-    times[1] = times[0];
-    if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
-        log_warn("restore: utimensat %s: %s", path, strerror(errno));
-}
-
-/*
  * A regular file is restored under a temporary name in its own directory
  * and renamed into place only once the object has read back authentic and
  * whole (OWN-36).
@@ -610,40 +798,47 @@ static void apply_metadata(const char *path, uint32_t mode, uint32_t uid,
  * its metadata, and anything a crash leaves behind is a temporary file
  * under this prefix, which the next restore into that directory removes.
  *
- * The prefix plus mkstemp's six characters, and nothing else, is what the
+ * The prefix plus six random characters, and nothing else, is what the
  * sweep matches, so it cannot take a file of the user's that merely starts
  * the same way unless the name has exactly that shape.
  */
 #define PARTIAL_PREFIX     ".c-backup-partial."
 #define PARTIAL_SUFFIX_LEN 6
 
-/* The directory part of a destination path, which is where its temporary
- * file goes: the same filesystem, so the rename is atomic. */
-static int dir_of(const char *full, char *out, size_t outsz)
+/*
+ * Create a temporary file in the directory pfd, its name (no directory
+ * part) into name. mkostemp's contract, by fd: O_EXCL and mode 0600, so
+ * nothing else can have the name and nobody else can read the bytes before
+ * they are verified and the file's own mode is applied; and O_NOFOLLOW, so
+ * a symlink planted under a guessed name is never opened.
+ */
+static int make_partial_at(int pfd, const char *shown, char *name, size_t namesz)
 {
-    const char *slash = strrchr(full, '/');
-    size_t n = slash ? (size_t)(slash - full) : 0;
-    if (n == 0) { snprintf(out, outsz, "%s", slash ? "/" : "."); return 0; }
-    if (n >= outsz) return -1;
-    memcpy(out, full, n);
-    out[n] = '\0';
-    return 0;
-}
-
-static int make_partial(const char *full, char *tmp, size_t tmpsz)
-{
-    char dir[PATH_MAX];
-    if (dir_of(full, dir, sizeof(dir)) != 0 ||
-        snprintf(tmp, tmpsz, "%s/" PARTIAL_PREFIX "XXXXXX", dir) >= (int)tmpsz) {
-        set_error(ERR_IO, "restore: destination path too long for %s", full);
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    if (namesz < sizeof(PARTIAL_PREFIX) + PARTIAL_SUFFIX_LEN) {
+        set_error(ERR_IO, "restore: temporary name buffer too small for %s", shown);
         return -1;
     }
-    /* mkstemp creates with O_EXCL and mode 0600: nothing else can have the
-     * name, and nobody else can read the bytes before they are verified
-     * and the file's own mode is applied. */
-    int fd = mkostemp(tmp, O_CLOEXEC);
-    if (fd == -1) set_error_errno(ERR_IO, "restore: cannot create a temporary file beside %s", full);
-    return fd;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        unsigned char rnd[PARTIAL_SUFFIX_LEN];
+        if (getrandom(rnd, sizeof(rnd), 0) != (ssize_t)sizeof(rnd)) {
+            set_error_errno(ERR_IO, "restore: no randomness for a temporary file beside %s",
+                            shown);
+            return -1;
+        }
+        memcpy(name, PARTIAL_PREFIX, sizeof(PARTIAL_PREFIX) - 1);
+        for (int i = 0; i < PARTIAL_SUFFIX_LEN; i++)
+            name[sizeof(PARTIAL_PREFIX) - 1 + (size_t)i] =
+                alphabet[rnd[i] % (sizeof(alphabet) - 1)];
+        name[sizeof(PARTIAL_PREFIX) - 1 + PARTIAL_SUFFIX_LEN] = '\0';
+        int fd = openat(pfd, name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                        0600);
+        if (fd != -1) return fd;
+        if (errno != EEXIST) break;
+    }
+    set_error_errno(ERR_IO, "restore: cannot create a temporary file beside %s", shown);
+    return -1;
 }
 
 static int is_partial_name(const char *name)
@@ -655,26 +850,27 @@ static int is_partial_name(const char *name)
 
 /*
  * Remove the temporary files an interrupted restore left in the directory
- * that holds `full`. Called once per directory per run, before the first
+ * pfd (shown as `dir`). Called once per directory per run, before the first
  * file is restored into it, so a resumed restore cleans up exactly where it
  * goes back to work. One readdir per directory a run writes into.
  */
-static void sweep_partials(const char *full)
+static void sweep_partials(int pfd, const char *dir)
 {
-    char dir[PATH_MAX];
-    if (dir_of(full, dir, sizeof(dir)) != 0) return;
-    DIR *d = opendir(dir);
-    if (!d) return;
-    int dfd = dirfd(d);
+    int rfd = openat(pfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    DIR *d = rfd == -1 ? NULL : fdopendir(rfd);
+    if (!d) {
+        if (rfd != -1) close(rfd);
+        return;
+    }
     unsigned removed = 0;
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (!is_partial_name(de->d_name)) continue;
         struct stat sb;
-        if (fstatat(dfd, de->d_name, &sb, AT_SYMLINK_NOFOLLOW) != 0 ||
+        if (fstatat(pfd, de->d_name, &sb, AT_SYMLINK_NOFOLLOW) != 0 ||
             !S_ISREG(sb.st_mode))
             continue;
-        if (unlinkat(dfd, de->d_name, 0) == 0) removed++;
+        if (unlinkat(pfd, de->d_name, 0) == 0) removed++;
         else log_warn("restore: cannot remove partial file %s/%s: %s",
                       dir, de->d_name, strerror(errno));
     }
@@ -721,23 +917,24 @@ static const char *kept_reason(const struct stat *sb, uint64_t size)
 }
 
 /*
- * Restore one regular file's content and metadata under a temporary name.
- * On OK the verified file is complete at `tmp` (closed), waiting for the
- * batch below to make it durable and rename it into place; on any failure
- * the temporary file is removed and the final path is untouched. *out_sz is
- * the object's payload size.
+ * Restore one regular file's content and metadata under a temporary name
+ * in the directory pfd. On OK the verified file is complete under the name
+ * left in tmp (closed), waiting for the batch below to make it durable and
+ * rename it into place; on any failure the temporary file is removed and
+ * the final name is untouched. *out_sz is the object's payload size. full
+ * is the destination path, for messages.
  */
-static status_t restore_file(store_t *store, const char *chash, const char *full,
-                             uint64_t size, uint32_t mode, uint32_t uid,
-                             uint32_t gid, int64_t mtime, const char *xhash,
-                             const char *ahash, char *tmp, size_t tmpsz,
-                             uint64_t *out_sz)
+static status_t restore_file(store_t *store, const char *chash, int pfd,
+                             const char *full, uint64_t size, uint32_t mode,
+                             uint32_t uid, uint32_t gid, int64_t mtime,
+                             const char *xhash, const char *ahash,
+                             char *tmp, size_t tmpsz, uint64_t *out_sz)
 {
     uint8_t hash[OBJECT_HASH_SIZE];
     hex_to_hash(chash, hash);
     *out_sz = 0;
 
-    int fd = make_partial(full, tmp, tmpsz);
+    int fd = make_partial_at(pfd, full, tmp, tmpsz);
     if (fd == -1) return ERR_IO;
 
     /*
@@ -753,17 +950,21 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
     status_t st = content_restore_fd(store, hash, fd, &sz);
 
     /* Metadata goes on before the rename, so the file is final the moment
-     * it has its name: the resume rule relies on the mtime being right. */
+     * it has its name: the resume rule relies on the mtime being right.
+     * Through the fd: the file is never looked up by name again. */
     if (st == OK) {
-        apply_metadata(tmp, mode, uid, gid, mtime);
-        apply_xattrs(store, tmp, xhash);
-        apply_acls(store, tmp, ahash, 0);
+        meta_target_t t = { fd, NULL, 0, full };
+        clear_acls(&t, 0);
+        apply_metadata_fd(fd, full, mode, uid, gid, mtime);
+        apply_xattrs(store, &t, xhash);
+        apply_acls(store, &t, ahash, 0);
     }
     if (close(fd) != 0 && st == OK)
         st = set_error_errno(ERR_IO, "restore: cannot close %s", full);
     if (st != OK) {
-        if (unlink(tmp) != 0 && errno != ENOENT)
-            log_warn("restore: cannot remove partial file %s: %s", tmp, strerror(errno));
+        if (unlinkat(pfd, tmp, 0) != 0 && errno != ENOENT)
+            log_warn("restore: cannot remove partial file %s for %s: %s",
+                     tmp, full, strerror(errno));
         return st;
     }
     *out_sz = sz;
@@ -789,13 +990,19 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
  * and 196 of them were 46% of a 100,000-file restore on btrfs, so it is
  * 4,096 files or 1 GiB now (PERF.md, 2026-11-16). A crash costs at most
  * that much redone work.
+ *
+ * Each item names its directory relative to the destination, not by fd:
+ * 4,096 open directories is a real dent in a daemon's descriptor limit. The
+ * batch keeps its own directory cache, so a flush in the middle of the
+ * main loop cannot close the fd the loop is holding.
  */
 #define BATCH_FILES 4096u
 #define BATCH_BYTES ((uint64_t)1024 * 1024 * 1024)
 
 typedef struct {
-    char    *tmp;
-    char    *full;
+    char    *rel;      /* the final entry, relative to the destination */
+    char    *tmp;      /* the temporary file's name in the same directory */
+    char    *full;     /* the destination path, for messages */
     uint64_t bytes;
 } pending_file_t;
 
@@ -803,44 +1010,49 @@ typedef struct {
     pending_file_t items[BATCH_FILES];
     uint32_t       n;
     uint64_t       bytes;
+    dir_cache_t    dirs;
 } rename_batch_t;
-
-static void batch_discard(rename_batch_t *b, uint32_t i)
-{
-    if (unlink(b->items[i].tmp) != 0 && errno != ENOENT)
-        log_warn("restore: cannot remove partial file %s: %s",
-                 b->items[i].tmp, strerror(errno));
-}
 
 /* Sync the batch, rename each file into place, and count the outcome. */
 static void batch_flush(rename_batch_t *b, restore_result_t *res)
 {
     if (b->n == 0) return;
     int synced = 0;
-    int fd = open(b->items[0].tmp, O_RDONLY | O_CLOEXEC);
-    if (fd != -1) {
-        synced = syncfs(fd) == 0;
+    const char *leaf;
+    int pfd = dest_parent(&b->dirs, b->items[0].rel, &leaf, 0);
+    if (pfd != -1) {
+        synced = syncfs(pfd) == 0;
         if (!synced)
             log_warn("restore: cannot sync %u restored file(s) to disk: %s",
                      b->n, strerror(errno));
-        close(fd);
     } else {
-        log_warn("restore: cannot open %s to sync it: %s", b->items[0].tmp,
-                 strerror(errno));
+        log_warn("restore: cannot open the directory of %s to sync it: %s",
+                 b->items[0].full, strerror(errno));
     }
     for (uint32_t i = 0; i < b->n; i++) {
         pending_file_t *p = &b->items[i];
-        if (!synced) {
+        pfd = dest_parent(&b->dirs, p->rel, &leaf, 0);
+        if (pfd == -1) {
+            /* Its directory was swapped out from under the restore; the
+             * temporary file, wherever it is now, is swept next run. */
+            restore_fail(res, p->full, "its directory cannot be reached to "
+                         "rename it into place: %s", parent_reason(errno));
+        } else if (!synced) {
             restore_fail(res, p->full, "its data could not be synced");
-            batch_discard(b, i);
-        } else if (rename(p->tmp, p->full) != 0) {
+            if (unlinkat(pfd, p->tmp, 0) != 0 && errno != ENOENT)
+                log_warn("restore: cannot remove partial file %s for %s: %s",
+                         p->tmp, p->full, strerror(errno));
+        } else if (renameat(pfd, p->tmp, pfd, leaf) != 0) {
             restore_fail(res, p->full, "cannot rename it into place: %s",
                          strerror(errno));
-            batch_discard(b, i);
+            if (unlinkat(pfd, p->tmp, 0) != 0 && errno != ENOENT)
+                log_warn("restore: cannot remove partial file %s for %s: %s",
+                         p->tmp, p->full, strerror(errno));
         } else {
             res->files++;
             res->bytes += p->bytes;
         }
+        free(p->rel);
         free(p->tmp);
         free(p->full);
     }
@@ -850,15 +1062,16 @@ static void batch_flush(rename_batch_t *b, restore_result_t *res)
 
 /* Queue a verified file; a full batch is flushed. Returns -1 when the
  * paths cannot be held, and the temporary file is removed. */
-static int batch_add(rename_batch_t *b, const char *tmp, const char *full,
-                     uint64_t bytes, restore_result_t *res)
+static int batch_add(rename_batch_t *b, int pfd, const char *rel, const char *tmp,
+                     const char *full, uint64_t bytes, restore_result_t *res)
 {
-    char *t = strdup(tmp), *f = strdup(full);
-    if (!t || !f) {
-        free(t); free(f);
-        if (unlink(tmp) != 0 && errno != ENOENT) { /* swept next run */ }
+    char *r = strdup(rel), *t = strdup(tmp), *f = strdup(full);
+    if (!r || !t || !f) {
+        free(r); free(t); free(f);
+        if (unlinkat(pfd, tmp, 0) != 0 && errno != ENOENT) { /* swept next run */ }
         return -1;
     }
+    b->items[b->n].rel   = r;
     b->items[b->n].tmp   = t;
     b->items[b->n].full  = f;
     b->items[b->n].bytes = bytes;
@@ -869,7 +1082,7 @@ static int batch_add(rename_batch_t *b, const char *tmp, const char *full,
 }
 
 static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
-                                  int64_t snap_id, const char *dest,
+                                  int64_t snap_id, const char *dest, int dest_fd,
                                   const restore_opts_t *opts, restore_result_t *out);
 
 /*
@@ -884,15 +1097,23 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 {
     if (!store || !db || !dest)
         return set_error(ERR_INVALID, "restore_run: missing store, db or dest");
+    if (mkdir(dest, 0755) != 0 && errno != EEXIST)
+        return set_error_errno(ERR_IO, "restore: cannot create %s", dest);
+    /* Everything below is reached from this fd (dest_parent). */
+    int dest_fd = open(dest, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dest_fd == -1)
+        return set_error_errno(ERR_IO, "restore: cannot open %s", dest);
     atomic_int *prev_cancel = store_get_cancel(store);
     if (opts && opts->cancel) store_set_cancel(store, opts->cancel);
-    status_t st = restore_run_inner(store, db, repo_id, snap_id, dest, opts, out);
+    status_t st = restore_run_inner(store, db, repo_id, snap_id, dest, dest_fd,
+                                    opts, out);
     store_set_cancel(store, prev_cancel);
+    close(dest_fd);
     return st;
 }
 
 static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
-                                  int64_t snap_id, const char *dest,
+                                  int64_t snap_id, const char *dest, int dest_fd,
                                   const restore_opts_t *opts, restore_result_t *out)
 {
 
@@ -903,9 +1124,6 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
     char repo[32], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-
-    if (mkdir(dest, 0755) != 0 && errno != EEXIST)
-        return set_error_errno(ERR_IO, "restore: cannot create %s", dest);
 
     /*
      * Directories first, then everything else. A file cannot be written
@@ -959,6 +1177,9 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         db_result_free(r);
         return set_error(ERR_NOMEM, "restore: path table");
     }
+    /* Holds at most one fd; dropped on every return below. */
+    dir_cache_t dirs;
+    dir_cache_init(&dirs, dest_fd);
 
     /*
      * Resume pre-pass. A restore into a partially-populated destination
@@ -999,17 +1220,17 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 continue;
             }
             if (opts->subpath && !path_within(rel, opts->subpath)) continue;
-            char full[PATH_MAX];
-            if (dest_path(full, sizeof(full), dest, rel, opts) != 0)
-                continue;
+            if (strip_rel(rel, opts)) continue;
             /* Only a member the resume rule would skip anchors the group:
              * linking later members to a file that is not the snapshot's
              * would hand them its content. */
+            const char *leaf;
+            int pfd = dest_parent(&dirs, rel, &leaf, 0);
             struct stat sb;
-            if (lstat(full, &sb) == 0 &&
+            if (pfd != -1 && fstatat(pfd, leaf, &sb, AT_SYMLINK_NOFOLLOW) == 0 &&
                 already_restored(&sb, strtoull(r->rows[i][6], NULL, 10),
                                  strtoll(r->rows[i][5], NULL, 10)))
-                hardlink_remember(&hlinks, hgroup, full);
+                hardlink_remember(&hlinks, hgroup, rel);
         }
         groupcount_free(&gcount);
     }
@@ -1042,16 +1263,16 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
      * run has swept it for partial files yet. */
     char *swept = calloc((size_t)r->nrows + 1, 1);
     rename_batch_t *batch = calloc(1, sizeof(*batch));
-    parent_cache_t *pcache = calloc(1, sizeof(*pcache));
-    if (!swept || !batch || !pcache) {
+    if (!swept || !batch) {
         free(swept);
         free(batch);
-        free(pcache);
+        dir_cache_drop(&dirs);
         pt_free(&paths);
         hardlink_map_free(&hlinks);
         db_result_free(r);
         return set_error(ERR_NOMEM, "restore: directory sweep map");
     }
+    dir_cache_init(&batch->dirs, dest_fd);
 
     for (int i = 0; i < r->nrows && st == OK; i++) {
         if (cancelled(opts)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
@@ -1094,6 +1315,14 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         if (ntype == NODE_TYPE_REG) bytes_pending = strtoull(r->rows[i][6], NULL, 10);
         matched++;
+        if (strip_rel(rel, opts)) {
+            /* The subpath itself is dest, which exists; a file cannot be
+             * stripped onto it. */
+            if (ntype != NODE_TYPE_DIR)
+                restore_fail(&res, rel[0] ? rel : opts->subpath,
+                             "a single file cannot be restored as the destination itself");
+            continue;
+        }
 
         char full[PATH_MAX];
         if (dest_path(full, sizeof(full), dest, rel, opts) != 0) {
@@ -1101,11 +1330,41 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         }
 
+        /* The entry's directory, reached with no symlink on the way and
+         * made if missing. Something not a directory in the way fails this
+         * entry; anything else (no space, read-only) fails the restore,
+         * as it always did. */
+        const char *leaf;
+        int pfd = dest_parent(&dirs, rel, &leaf, 1);
+        if (pfd == -1) {
+            int err = errno;
+            if (err == ELOOP || err == ENOTDIR || err == EXDEV || err == EINVAL) {
+                restore_fail(&res, full, "cannot reach its directory: %s",
+                             parent_reason(err));
+                continue;
+            }
+            st = set_error(ERR_IO, "restore: cannot create the directories for %s: %s",
+                           full, strerror(err));
+            break;
+        }
+
         if (ntype == NODE_TYPE_DIR) {
-            if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
-            if (mkdir(full, 0755) != 0 && errno != EEXIST) {
+            if (mkdirat(pfd, leaf, 0755) != 0 && errno != EEXIST) {
                 st = set_error_errno(ERR_IO, "restore: mkdir %s", full);
                 break;
+            }
+            /* What is there is opened, not assumed: a symlink or file
+             * already at the name is never followed, never chmod'd, and
+             * nothing is written beneath it. */
+            int dfd = openat(pfd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (dfd == -1) {
+                struct stat sb;
+                int is_link = fstatat(pfd, leaf, &sb, AT_SYMLINK_NOFOLLOW) == 0 &&
+                              S_ISLNK(sb.st_mode);
+                restore_fail(&res, full, "%s is there where the directory belongs; "
+                             "not followed or replaced",
+                             is_link ? "a symlink" : "something that is not a directory");
+                continue;
             }
             /* Mode and ownership are final here; the mtime is not. Writing
              * a file into a directory updates that directory's mtime, so
@@ -1113,9 +1372,12 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
              * and the restored directory ends up stamped with the time of
              * the restore. It is reapplied in the pass below, after
              * everything has been written. */
-            apply_metadata(full, mode, uid, gid, mtime);
-            apply_xattrs(store, full, xhash);
-            apply_acls(store, full, ahash, 1);
+            meta_target_t t = { dfd, NULL, 0, full };
+            clear_acls(&t, 1);
+            apply_metadata_fd(dfd, full, mode, uid, gid, mtime);
+            apply_xattrs(store, &t, xhash);
+            apply_acls(store, &t, ahash, 1);
+            close(dfd);
             res.dirs++;
             continue;
         }
@@ -1131,20 +1393,36 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 restore_fail(&res, rel, "symlink has no recorded target");
                 continue;
             }
-            if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
-            if (opts->overwrite) unlink(full);
-            if (symlink(ltarget, full) != 0 && errno != EEXIST) {
-                restore_fail(&res, full, "cannot create symlink: %s",
-                             strerror(errno));
-                continue;
+            if (opts->overwrite) unlinkat(pfd, leaf, 0);
+            if (symlinkat(ltarget, pfd, leaf) != 0) {
+                struct stat sb;
+                if (errno != EEXIST) {
+                    restore_fail(&res, full, "cannot create symlink: %s",
+                                 strerror(errno));
+                    continue;
+                }
+                /* A symlink already there is this one from an earlier run;
+                 * anything else is the operator's and is not touched. */
+                if (fstatat(pfd, leaf, &sb, AT_SYMLINK_NOFOLLOW) != 0 ||
+                    !S_ISLNK(sb.st_mode)) {
+                    log_warn("restore: %s already exists and is not the "
+                             "snapshot's symlink; kept, since overwrite is off", full);
+                    res.kept++;
+                    continue;
+                }
             }
             /* Mode is not applied: a symlink's own permissions are ignored by
              * the kernel, and chmod would follow the link and alter its
              * target instead. */
-            apply_metadata_nofollow(full, uid, gid, mtime);
+            apply_metadata_at(pfd, leaf, full, 0, mode, uid, gid, mtime);
             /* No ACL branch: symlinks have none (scan does not collect them,
-             * and acl_set_file would follow the link anyway). */
-            apply_xattrs(store, full, xhash);
+             * and acl_set_file would follow the link anyway). The xattrs go
+             * on through the pinned parent, lsetxattr on the link itself. */
+            char xp[PATH_MAX + 64];
+            int via_proc = pfd != AT_FDCWD &&
+                snprintf(xp, sizeof(xp), "/proc/self/fd/%d/%s", pfd, leaf) < (int)sizeof(xp);
+            meta_target_t t = { -1, via_proc ? xp : full, 0, full };
+            apply_xattrs(store, &t, xhash);
             res.symlinks++;
             continue;
         }
@@ -1162,12 +1440,13 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
          */
         if (ntype == NODE_TYPE_FIFO || ntype == NODE_TYPE_CHR ||
             ntype == NODE_TYPE_BLK) {
-            if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
-            if (opts->overwrite) unlink(full);
+            if (opts->overwrite) unlinkat(pfd, leaf, 0);
 
             int made;
+            mode_t kind = ntype == NODE_TYPE_FIFO ? S_IFIFO
+                        : ntype == NODE_TYPE_CHR  ? S_IFCHR : S_IFBLK;
             if (ntype == NODE_TYPE_FIFO) {
-                made = mkfifo(full, (mode_t)(mode & 07777));
+                made = mkfifoat(pfd, leaf, (mode_t)(mode & 07777));
             } else {
                 /*
                  * Device 0:0 is a device, not a missing one.
@@ -1188,9 +1467,8 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                  * whiteouts and the diff against the source was the only thing
                  * that said so.
                  */
-                mode_t kind = (ntype == NODE_TYPE_CHR) ? S_IFCHR : S_IFBLK;
-                made = mknod(full, kind | (mode_t)(mode & 07777),
-                             makedev(dmajor, dminor));
+                made = mknodat(pfd, leaf, kind | (mode_t)(mode & 07777),
+                               makedev(dmajor, dminor));
             }
 
             if (made != 0 && errno != EEXIST) {
@@ -1198,9 +1476,29 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 res.skipped++;
                 continue;
             }
-            apply_metadata(full, mode, uid, gid, mtime);
-            apply_xattrs(store, full, xhash);
-            apply_acls(store, full, ahash, 0);
+            /* Pinned, and checked to be the kind of node it should be: an
+             * existing entry of another kind (a symlink above all) is the
+             * operator's, and its metadata is not changed. */
+            int ofd = openat(pfd, leaf, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+            struct stat sb;
+            if (ofd == -1 || fstat(ofd, &sb) != 0 || (sb.st_mode & S_IFMT) != kind ||
+                (kind != S_IFIFO && sb.st_rdev != makedev(dmajor, dminor))) {
+                if (ofd != -1) close(ofd);
+                log_warn("restore: %s already exists and is not the snapshot's "
+                         "version; kept, since overwrite is off", full);
+                res.kept++;
+                continue;
+            }
+            /* An O_PATH fd takes no fsetxattr; its magic link, followed,
+             * reaches exactly the node it holds. */
+            char xp[64];
+            snprintf(xp, sizeof(xp), "/proc/self/fd/%d", ofd);
+            meta_target_t t = { -1, xp, 1, full };
+            clear_acls(&t, 0);
+            apply_metadata_at(pfd, leaf, full, 1, mode, uid, gid, mtime);
+            apply_xattrs(store, &t, xhash);
+            apply_acls(store, &t, ahash, 0);
+            close(ofd);
             res.specials++;
             continue;
         }
@@ -1218,12 +1516,22 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 /* The first member may still be waiting in the batch
                  * under its temporary name. */
                 batch_flush(batch, &res);
-                if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
-                if (opts->overwrite) unlink(full);
-                if (link(first, full) == 0) { res.hardlinks++; continue; }
+                if (opts->overwrite) unlinkat(pfd, leaf, 0);
+                const char *fslash = strrchr(first, '/');
+                const char *fleaf = fslash ? fslash + 1 : first;
+                int fpfd = dest_fd;
+                if (fslash) {
+                    char fdir[PATH_MAX];
+                    snprintf(fdir, sizeof(fdir), "%.*s", (int)(fslash - first), first);
+                    fpfd = open_beneath(dest_fd, fdir);
+                }
+                int linked = fpfd != -1 && linkat(fpfd, fleaf, pfd, leaf, 0) == 0;
+                int err = errno;
+                if (fpfd != -1 && fpfd != dest_fd) close(fpfd);
+                if (linked) { res.hardlinks++; continue; }
                 /* Cross-device or unsupported: fall through and copy. */
-                log_warn("restore: cannot hardlink %s to %s, copying: %s",
-                         full, first, strerror(errno));
+                log_warn("restore: cannot hardlink %s to %s/%s, copying: %s",
+                         full, dest, first, strerror(err));
             }
         }
 
@@ -1256,18 +1564,17 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             if (ntype != NODE_TYPE_REG)
                 restore_fail(&res, rel, "unsupported node type %u", ntype);
             else
+                /* B118: a build before 1.0.0 kept files it skipped. */
                 restore_fail(&res, rel, "regular file has no content in the "
-                             "snapshot (a backup recorded a file it could not "
-                             "read; B118)");
+                             "snapshot (written by a c-backup older than "
+                             "1.0.0, which recorded a file it could not read)");
             continue;
         }
-
-        if (make_parents(pcache, full) != OK) { st = ERR_IO; break; }
 
         uint64_t nsize = strtoull(r->rows[i][6], NULL, 10);
         if (!opts->overwrite) {
             struct stat sb;
-            if (lstat(full, &sb) == 0) {
+            if (fstatat(pfd, leaf, &sb, AT_SYMLINK_NOFOLLOW) == 0) {
                 if (already_restored(&sb, nsize, mtime)) {
                     /* Skipped, but still this inode group's anchor. A
                      * resumed restore skips everything an earlier attempt
@@ -1276,7 +1583,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                      * came back as copies: 2,262 links flattened on the
                      * first interrupted 45G run, silently, because the
                      * content was never wrong. */
-                    if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
+                    if (hgroup != 0) hardlink_remember(&hlinks, hgroup, rel);
                     res.skipped++;
                 } else {
                     log_warn("restore: %s already exists and is not the "
@@ -1293,11 +1600,14 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         int     slot   = parent == 0 ? r->nrows : pt_find(&paths, parent);
         if (slot >= 0 && !swept[slot]) {
             swept[slot] = 1;
-            sweep_partials(full);
+            char shown_dir[PATH_MAX];
+            snprintf(shown_dir, sizeof(shown_dir), "%.*s",
+                     (int)(strlen(full) - strlen(leaf) - 1), full);
+            sweep_partials(pfd, shown_dir);
         }
 
         uint64_t sz = 0;
-        char     tmp[PATH_MAX];
+        char     tmp[NAME_MAX + 1];
         err_clear();    /* so a reason below cannot be left over from before */
         restore_io_t io = { opts, bytes_done, bytes_total, nsize, 0,
                             matched - 1, work_total };
@@ -1306,7 +1616,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         store_get_io_progress(store, &prev_io, &prev_io_ctx);
         if (opts->bytes_cb || opts->progress_cb)
             store_set_io_progress(store, restore_bytes, &io);
-        status_t lst = restore_file(store, chash, full, nsize, mode, uid, gid,
+        status_t lst = restore_file(store, chash, pfd, full, nsize, mode, uid, gid,
                                     mtime, xhash, ahash, tmp, sizeof(tmp), &sz);
         store_set_io_progress(store, prev_io, prev_io_ctx);
 
@@ -1331,7 +1641,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         /* First member of its inode group: everything later links here.
          * Later members share this inode, so the attributes restore_file
          * set are already theirs; the link() sites need no reapply. */
-        if (batch_add(batch, tmp, full, sz, &res) != 0) {
+        if (batch_add(batch, pfd, rel, tmp, full, sz, &res) != 0) {
             restore_fail(&res, full, "out of memory");
             continue;
         }
@@ -1341,12 +1651,12 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             log_warn("restore: %s was still changing when it was backed up; "
                      "restored as stored, and it may not be internally "
                      "consistent", full);
-        if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
+        if (hgroup != 0) hardlink_remember(&hlinks, hgroup, rel);
     }
     /* Whatever verified before a stop is still worth keeping. */
     batch_flush(batch, &res);
+    dir_cache_drop(&batch->dirs);
     free(batch);
-    free(pcache);
     free(swept);
 
     hardlink_map_free(&hlinks);
@@ -1377,11 +1687,17 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         }
         if (opts->subpath && !path_within(rel, opts->subpath)) continue;
+        if (strip_rel(rel, opts)) continue;
         if (dest_path(full, sizeof(full), dest, rel, opts) != 0)
             continue;
 
-        apply_mtime(full, strtoll(r->rows[i][5], NULL, 10));
+        /* Just the timestamp: nothing else about a directory changes after
+         * it is made. Through its pinned parent, never following it. */
+        const char *leaf;
+        int pfd = dest_parent(&dirs, rel, &leaf, 0);
+        if (pfd != -1) set_times_at(pfd, leaf, full, strtoll(r->rows[i][5], NULL, 10));
     }
+    dir_cache_drop(&dirs);
 
     if (opts->bytes_cb && st == OK)
         opts->bytes_cb(opts->progress_ctx, bytes_done + bytes_pending, bytes_total);

@@ -362,6 +362,67 @@ static void test_scan_collect_meta_off_and_collect_on_demand(void **state) {
     scan_imap_free(imap);
 }
 
+/*
+ * B128 at the scan: a directory swapped for a symlink after its lstat and
+ * before it is opened was followed by opendir(path), and the scan recorded
+ * whatever the link pointed at under the source's names. The progress
+ * callback fires as each entry is appended, which is exactly that window
+ * for a directory; a first scan finds which callback that is.
+ */
+typedef struct { uint32_t at; int fired; } dirswap_ctx_t;
+
+static void dirswap_cb(uint32_t count, void *vctx) {
+    dirswap_ctx_t *c = vctx;
+    if (c->fired || count != c->at) return;
+    c->fired = 1;
+    mkdir(TEST_MISS, 0755);
+    write_file(TEST_MISS "/secret.txt", "not under the source");
+    assert_int_equal(rename(TEST_ROOT1 "/sub", TEST_ROOT2 "/sub.aside"), 0);
+    assert_int_equal(symlink(TEST_MISS, TEST_ROOT1 "/sub"), 0);
+}
+
+static void test_scan_does_not_follow_a_directory_swapped_for_a_symlink(void **state) {
+    (void)state;
+    scan_imap_t *imap = scan_imap_new();
+    assert_non_null(imap);
+    scan_result_t *res = NULL;
+    assert_int_equal(scan_tree(TEST_ROOT1, imap, NULL, &res), OK);
+    dirswap_ctx_t c = { 0, 0 };
+    for (uint32_t i = 0; i < res->count; i++)
+        if (strcmp(res->entries[i].path, TEST_ROOT1 "/sub") == 0) c.at = i + 1;
+    assert_true(c.at > 0);
+    scan_result_free(res);
+    scan_imap_free(imap);
+
+    imap = scan_imap_new();
+    assert_non_null(imap);
+    scan_opts_t opts = { .progress_cb = dirswap_cb, .progress_ctx = &c,
+                         .progress_every = 1, .collect_meta = 1 };
+    res = NULL;
+    assert_int_equal(scan_tree(TEST_ROOT1, imap, &opts, &res), OK);
+    assert_true(c.fired);
+
+    int saw_sub = 0;
+    for (uint32_t i = 0; i < res->count; i++) {
+        const scan_entry_t *e = &res->entries[i];
+        if (strstr(e->path, "secret.txt") || strstr(e->path, "nested.txt"))
+            fail_msg("scan reached %s through the swapped-in symlink", e->path);
+        if (strcmp(e->path, TEST_ROOT1 "/sub") == 0) {
+            saw_sub = 1;
+            assert_int_equal(e->node.type, NODE_TYPE_DIR);
+        }
+    }
+    assert_true(saw_sub);
+    int warned = 0;
+    for (uint32_t i = 0; i < res->warn_count; i++)
+        if (strstr(res->warnings[i], TEST_ROOT1 "/sub") &&
+            strstr(res->warnings[i], "now a symlink"))
+            warned = 1;
+    assert_true(warned);
+    scan_result_free(res);
+    scan_imap_free(imap);
+}
+
 static void test_scan_warns_on_unreadable_dir(void **state) {
     (void)state;
     /*
@@ -485,6 +546,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_scan_root_excluded_returns_empty, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_collect_meta_off_and_collect_on_demand, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_warns_on_unreadable_dir, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_scan_does_not_follow_a_directory_swapped_for_a_symlink, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_filesystem_is_per_root, setup, teardown),
         cmocka_unit_test(test_scan_entry_collect_metadata_invalid_args),
     };

@@ -63,6 +63,11 @@ typedef struct helper_backend {
      * *result says what went where. */
     status_t (*install_state)(sp_ctx_t *c, const char *unit_id, const char *staging_dir,
                               int64_t job, cJSON **result);
+    /* vm.checkpoint_redefine (vm-backup.md 5.8): a checkpoint of the
+     * backend's own records re-created from the XML it stored, when the
+     * hypervisor no longer has it. *result says whether it was present,
+     * redefined, or refused and dropped. NULL: no checkpoints. */
+    status_t (*redefine)(sp_ctx_t *c, const char *unit_id, const char *checkpoint, cJSON **result);
 } helper_backend_t;
 
 /* The fake provider as a backend, over ctx. */

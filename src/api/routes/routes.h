@@ -172,6 +172,14 @@ status_t routes_submit_scheduled(struct job_manager *jm, int64_t repo_id,
  * routes_snapshots_init first. */
 status_t routes_submit_startup_reindex(struct job_manager *jm, int64_t repo_id,
                                        int64_t *out_job_id);
+/*
+ * Queue a reindex the daemon starts itself, recorded with `origin` (a
+ * string literal) as the job's origin and its journal source. Used by
+ * registration: a repository adopted with snapshots the index has never
+ * seen otherwise lists none and verifies "checked 0" until somebody
+ * thinks to reindex it.
+ */
+status_t routes_submit_reindex(int64_t repo_id, const char *origin, int64_t *out_job_id);
 
 /* Tags, notes, policy and the journal. Repo-scoped sub-handlers, dispatched
  * from repos.c like the snapshot ones. */
@@ -196,7 +204,13 @@ api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id);
 /* NBD exports of a unit disk (src/api/routes/exports.c, vm-backup.md 7.3).
  * init closes rows a previous run left open; tick, from the daemon's main
  * loop, ends expired and idle exports; shutdown ends every one. */
-void           routes_exports_init(cutils_db_t *db, const char *dir, unsigned ttl_s, unsigned idle_s);
+void           routes_exports_init(cutils_db_t *db, const char *dir, unsigned ttl_s, unsigned idle_s,
+                                   unsigned max_conns);
+/* Revoke every open export of a repository (journalled), before it goes. */
+void           exports_close_repo(int64_t repo_id, const char *reason);
+/* Whether a repository has an export open: gc's gate (job_manager_set_gate),
+ * so gc waits in the queue rather than failing. Memory only, never the DB. */
+int            exports_repo_open(int64_t repo_id);
 int            routes_register_exports(api_server_t *srv);
 api_response_t exports_create(const api_request_t *req, int64_t repo_id, int64_t snap_id);
 void           exports_tick(void);

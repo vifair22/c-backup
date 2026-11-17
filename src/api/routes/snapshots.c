@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "pack_presence.h"
 
 #include "job_manager.h"
 #include "lock.h"
@@ -665,9 +666,11 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
             return api_error(404, "no such snapshot");
     }
 
-    int limit = 0;
+    /* offset was sent by the CLI's --offset and dropped here, so a second
+     * page was the first page again (B154). */
+    int limit = 0, offset = 0;
     api_response_t page_err;
-    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, NULL, &page_err) != 0) return page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
 
     char *mq = fts_quote(q);
     if (!mq) return api_error(500, "out of memory");
@@ -678,15 +681,30 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
      * repository to fill one page: a scan past SEARCH_SCAN_FACTOR rows per
      * result stops and says the counts are partial.
      */
+    /*
+     * Paging. With a snapshot every row is a result, so the database skips
+     * `offset` rows itself. Without one, results are collapsed rows, and
+     * which rows collapse into which result depends on every row before
+     * them, so a page is cut from the collapsed stream: the scan starts at
+     * the first row and reads enough for offset + limit results, under the
+     * same bound. Results appear in first-seen order, which more rows read
+     * does not reorder, so result N is the same result on every page; past
+     * the bound a page is empty and `partial`.
+     */
     enum { SEARCH_SCAN_FACTOR = 8, SEARCH_SCAN_MAX = 8000 };
-    int scan = only_snap ? limit : limit * SEARCH_SCAN_FACTOR;
-    if (scan > SEARCH_SCAN_MAX) scan = SEARCH_SCAN_MAX;
-    if (scan < limit) scan = limit;
+    int want = only_snap ? limit
+             : (offset > SEARCH_SCAN_MAX - limit ? SEARCH_SCAN_MAX : offset + limit);
+    int scan = only_snap ? limit
+             : (want > SEARCH_SCAN_MAX / SEARCH_SCAN_FACTOR ? SEARCH_SCAN_MAX
+                                                            : want * SEARCH_SCAN_FACTOR);
+    if (scan < want) scan = want;
+    int skip = only_snap ? 0 : offset;   /* results to drop before the page */
 
-    char repo[32], lim[16], snap[32];
+    char repo[32], lim[16], snap[32], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(lim,  sizeof(lim),  "%d", scan);
     snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
+    snprintf(off,  sizeof(off),  "%d", only_snap ? offset : 0);
 
     /*
      * Through the trigram index, not LIKE: a scan of the nodes table loses to
@@ -709,8 +727,8 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
     int rc;
     if (only_snap)
         rc = db_execute(g_ctx.db, oldest_first
-            ? NODE_SQL_SEARCH_SNAP_OLDEST : NODE_SQL_SEARCH_SNAP_NEWEST,
-            (const char *[]){ repo, repo, mq, snap, lim, NULL }, &r);
+            ? NODE_SQL_SEARCH_SNAP_OLDEST " OFFSET ?" : NODE_SQL_SEARCH_SNAP_NEWEST " OFFSET ?",
+            (const char *[]){ repo, repo, mq, snap, lim, off, NULL }, &r);
     else
         rc = db_execute(g_ctx.db, NODE_SQL_SEARCH_ALL,
             (const char *[]){ repo, repo, mq, lim, NULL }, &r);
@@ -745,7 +763,8 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
      * search is often after. Results stay in first-seen order.
      */
     typedef struct { char *key; int row; int64_t snap; uint32_t count; } hit_t;
-    hit_t *hits = calloc((size_t)limit, sizeof(*hits));
+    int cap = want < nrows ? want : nrows;   /* no more results than rows */
+    hit_t *hits = calloc((size_t)(cap > 0 ? cap : 1), sizeof(*hits));
     char **paths = calloc((size_t)(nrows > 0 ? nrows : 1), sizeof(*paths));
     int nhits = 0;
     if (!hits || !paths) {
@@ -770,7 +789,7 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
             hits[found].count++;
             if (sid > hits[found].snap) { hits[found].snap = sid; hits[found].row = i; }
             free(key);
-        } else if (nhits < limit) {
+        } else if (nhits < cap) {
             hits[nhits++] = (hit_t){ key, i, sid, 1 };
         } else {
             free(key);
@@ -778,7 +797,7 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
     }
     int partial = !only_snap && nrows == scan;
 
-    for (int k = 0; k < nhits; k++) {
+    for (int k = skip; k < nhits; k++) {
         char **row = r->rows[hits[k].row];
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
@@ -844,6 +863,7 @@ typedef struct {
     uint32_t        max_files;
     int             reencrypt;   /* replicate into another repository's key */
     int64_t         dest_repo_id;   /* replicate: registered destination, or 0 */
+    int             allow_plaintext; /* reencrypt may drop encryption */
     uint32_t        max_hits_per_file;   /* 0: the grep default */
     uint64_t        max_hits;            /* 0: the grep default */
     snap_job_kind_t kind;
@@ -1073,14 +1093,15 @@ static int64_t repl_snap_at(const void *list, uint32_t i)
 
 static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
 {
-    char js[640];
-    snprintf(js, sizeof(js),
+    char js[640 + PACK_UNWALKABLE_LIST_MAX * (PACK_UNWALKABLE_REASON_MAX + 48)];
+    int jn = snprintf(js, sizeof(js),
              "{\"dry_run\":%s,\"reachable\":%llu,\"objects_swept\":%llu,"
              "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
              "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
              "\"packs_deleted\":%u,\"packs_coalesced\":%u,"
              "\"packs_removed_by_coalesce\":%u,\"tmp_files_removed\":%u,"
-             "\"tmp_bytes_removed\":%llu,\"content_missing\":%llu",
+             "\"tmp_bytes_removed\":%llu,\"content_missing\":%llu,"
+             "\"dups_dropped\":%llu,\"dups_kept\":%llu,\"index_relocated\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
              (unsigned long long)gr->swept,
@@ -1091,15 +1112,28 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              gr->packs_coalesced, gr->packs_removed_by_coalesce,
              gr->tmp_files_removed,
              (unsigned long long)gr->tmp_bytes_removed,
-             (unsigned long long)gr->content_missing);
+             (unsigned long long)gr->content_missing,
+             (unsigned long long)gr->dups_dropped,
+             (unsigned long long)gr->dups_kept,
+             (unsigned long long)gr->index_relocated);
+    /* Packs compaction could not walk, each with why. Reasons are built by
+     * the pack layer from fixed text and numbers, so need no escaping. */
+    size_t n = jn > 0 ? (size_t)jn : 0;
+    if (n < sizeof(js))
+        n += (size_t)snprintf(js + n, sizeof(js) - n, ",\"packs_unwalkable\":%u,\"unwalkable\":[",
+                              gr->packs_unwalkable);
+    for (uint32_t i = 0; i < gr->unwalkable_listed && n < sizeof(js); i++)
+        n += (size_t)snprintf(js + n, sizeof(js) - n, "%s{\"pack\":%u,\"reason\":\"%s\"}",
+                              i ? "," : "", gr->unwalkable[i].pack, gr->unwalkable[i].reason);
+    if (n < sizeof(js)) snprintf(js + n, sizeof(js) - n, "]");
     char *full = with_damaged(js, "pack_entries_damaged", gr->pack_entries_damaged,
                               gr->damaged_listed, gc_hash_at, NULL, gr);
     if (full) {
         job_set_result(progress_ctx, full);
         free(full);
     } else {
-        size_t n = strlen(js);
-        if (n + 1 < sizeof(js)) { js[n] = '}'; js[n + 1] = '\0'; }
+        size_t e = strlen(js);
+        if (e + 1 < sizeof(js)) { js[e] = '}'; js[e + 1] = '\0'; }
         job_set_result(progress_ctx, js);
     }
 
@@ -1121,10 +1155,15 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
                  gr->packs_coalesced - gr->packs_removed_by_coalesce,
                  gr->tmp_files_removed, gr->tmp_files_removed == 1 ? "" : "s");
     if (gr->pack_entries_damaged > 0) {
-        size_t n = strlen(msg);
-        snprintf(msg + n, sizeof(msg) - n, "; %llu entr%s copied damaged beyond parity",
+        size_t m = strlen(msg);
+        snprintf(msg + m, sizeof(msg) - m, "; %llu entr%s copied damaged beyond parity",
                  (unsigned long long)gr->pack_entries_damaged,
                  gr->pack_entries_damaged == 1 ? "y" : "ies");
+    }
+    if (gr->packs_unwalkable > 0) {
+        size_t m = strlen(msg);
+        snprintf(msg + m, sizeof(msg) - m, "; %u pack%s could not be walked",
+                 gr->packs_unwalkable, gr->packs_unwalkable == 1 ? "" : "s");
     }
     job_set_summary(progress_ctx, msg);
 }
@@ -1199,9 +1238,17 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
      * snap_job_lock chose, for the whole of this call. */
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    status_t st = snap_job_needs_key(j->kind)
-                      ? repo_store_open_keyed(j->repo_path, NULL, &store)
-                      : repo_store_open(j->repo_path, NULL, &store);
+    /*
+     * Every kind refuses an unavailable repository before it opens it,
+     * which would create tmp/ in an empty mountpoint (NIT-38). A verify
+     * there used to report every object missing as data loss, and a
+     * reindex would have read the empty packs/ as every pack gone (NIT-37).
+     */
+    status_t st = pack_presence_require(j->db, j->repo_id);
+    if (st != OK) return st;
+    st = snap_job_needs_key(j->kind)
+             ? repo_store_open_keyed(j->repo_path, NULL, &store)
+             : repo_store_open(j->repo_path, NULL, &store);
     if (st != OK) return st;
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) { store_close(store); return st; }
@@ -1216,17 +1263,19 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         /* What came back, on the job, failed or not: an operator recovering
          * from a lost database needs to see that the tags returned, and a
          * failed run says how much it still managed. */
-        char rj[400];
+        char rj[480];
         snprintf(rj, sizeof(rj),
                  "{\"snapshots\":%llu,\"snapshots_failed\":%llu,\"files\":%llu,"
                  "\"objects\":%llu,\"packs_unreadable\":%llu,"
                  "\"tags_restored\":%llu,\"tags_skipped\":%llu,"
-                 "\"snapshot_mark\":%lld,\"snapshot_ids_repaired\":%s}",
+                 "\"snapshot_mark\":%lld,\"snapshot_ids_repaired\":%s,"
+                 "\"pack_mark\":%lld,\"pack_ids_repaired\":%s}",
                  (unsigned long long)rx.snapshots, (unsigned long long)rx.snapshots_failed,
                  (unsigned long long)rx.files, (unsigned long long)rx.objects,
                  (unsigned long long)rx.packs_unreadable,
                  (unsigned long long)rx.tags_restored, (unsigned long long)rx.tags_skipped,
-                 (long long)rx.snapshot_mark, rx.snapshot_ids_repaired ? "true" : "false");
+                 (long long)rx.snapshot_mark, rx.snapshot_ids_repaired ? "true" : "false",
+                 (long long)rx.pack_mark, rx.pack_ids_repaired ? "true" : "false");
         job_set_result(progress_ctx, rj);
     } else if (j->kind == SNAP_JOB_GREP) {
         grep_opts_t go;
@@ -1277,15 +1326,64 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         char rid[32];
         if (vr.run_id > 0) snprintf(rid, sizeof(rid), "%lld", (long long)vr.run_id);
         else               snprintf(rid, sizeof(rid), "null");
-        char vj[224];
-        snprintf(vj, sizeof(vj),
+        /* The counts too, so the job says what the run found without a
+         * second request, and in the same terms as the run record: ok
+         * excludes every failure, and `failed` states the verdict (NIT-17). */
+        char vj[768 + VERIFY_DROPPED_LIST_MAX * 80];
+        int vn = snprintf(vj, sizeof(vj),
                  "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s,"
-                 "\"unsettled_files\":%llu}",
+                 "\"checked\":%llu,\"ok\":%llu,\"repaired\":%llu,"
+                 "\"recoverable\":%llu,\"unrecoverable\":%llu,\"missing\":%llu,"
+                 "\"failed\":%s,"
+                 "\"unsettled_files\":%llu,"
+                 "\"pack_structures_repaired\":%llu,\"pack_structures_recoverable\":%llu,"
+                 "\"packs_unwalkable\":%llu,\"packs_restored\":%llu,"
+                 "\"packs_salvaged\":%llu,\"unreferenced_dropped_bytes\":%llu,"
+                 "\"unreferenced_dropped_ranges\":%llu,\"unreferenced_dropped\":[",
                  rid, lvl,
                  j->verify_repair ? "true" : "false",
                  j->dry_run ? "true" : "false",
-                 (unsigned long long)vr.unsettled_files);
+                 (unsigned long long)vr.checked, (unsigned long long)vr.ok,
+                 (unsigned long long)vr.repaired, (unsigned long long)vr.recoverable,
+                 (unsigned long long)vr.unrecoverable, (unsigned long long)vr.missing,
+                 vr.unrecoverable || vr.missing ? "true" : "false",
+                 (unsigned long long)vr.unsettled_files,
+                 (unsigned long long)vr.pack_structures_repaired,
+                 (unsigned long long)vr.pack_structures_recoverable,
+                 (unsigned long long)vr.packs_unwalkable,
+                 (unsigned long long)vr.packs_restored,
+                 (unsigned long long)vr.packs_salvaged,
+                 (unsigned long long)vr.unreferenced_dropped_bytes,
+                 (unsigned long long)vr.unreferenced_dropped_ranges);
+        size_t vo = vn > 0 ? (size_t)vn : 0;
+        for (uint32_t d = 0; d < vr.dropped_listed && vo < sizeof(vj); d++)
+            vo += (size_t)snprintf(vj + vo, sizeof(vj) - vo,
+                                   "%s{\"pack\":%u,\"offset\":%llu,\"length\":%llu}",
+                                   d ? "," : "", vr.dropped[d].pack,
+                                   (unsigned long long)vr.dropped[d].offset,
+                                   (unsigned long long)vr.dropped[d].length);
+        if (vo < sizeof(vj)) snprintf(vj + vo, sizeof(vj) - vo, "]}");
         job_set_result(progress_ctx, vj);
+        /* The journal's line for a run that passed, in the run's own totals
+         * (a failed one journals the error, which carries them). Without it
+         * a verify that repaired or found recoverable damage journalled an
+         * empty message (NIT-30). */
+        if (st == OK && vr.run_id > 0) {
+            char vs[320];
+            int sn = snprintf(vs, sizeof(vs),
+                     "%s verify%s, run %lld: %llu checked, %llu ok, %llu repaired, "
+                     "%llu recoverable", lvl, j->verify_repair ? "" : " (check only)",
+                     (long long)vr.run_id, (unsigned long long)vr.checked,
+                     (unsigned long long)vr.ok, (unsigned long long)vr.repaired,
+                     (unsigned long long)vr.recoverable);
+            uint64_t ps = vr.pack_structures_repaired + vr.pack_structures_recoverable +
+                          vr.packs_restored;
+            if (ps > 0 && sn > 0 && (size_t)sn < sizeof(vs))
+                snprintf(vs + sn, sizeof(vs) - (size_t)sn,
+                         " (%llu of them pack structure%s)", (unsigned long long)ps,
+                         ps == 1 ? "" : "s");
+            job_set_summary(progress_ctx, vs);
+        }
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*
          * A replica carries the source's identity, so the source's marker is
@@ -1298,7 +1396,9 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
          * (snap_job_submit), so the job manager holds it already. */
         if (st == OK) {
             replica_sink_t sink;
-            st = j->reencrypt ? replica_sink_local_open_reencrypt(j->dest, &m, &sink)
+            int to_plain = j->reencrypt && replica_reencrypt_drops_encryption(j->dest, &m);
+            st = j->reencrypt ? replica_sink_local_open_reencrypt(j->dest, &m,
+                                                                   j->allow_plaintext, &sink)
                               : replica_sink_local_open(j->dest, &m, &sink);
             if (st == OK) {
                 replicate_result_t rr;
@@ -1306,6 +1406,22 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                 st = replicate_run(store, j->db, j->repo_id, &sink, cancel,
                                    NULL, NULL, &rr);
                 sink.v->close(sink.ctx);
+                if (to_plain) {
+                    /*
+                     * Allowed, and on the record: the one place this
+                     * repository's data leaves its encryption. Recorded
+                     * whatever the outcome, since a run that failed part
+                     * way has still written what it committed.
+                     */
+                    char msg[PATH_MAX + 96];
+                    snprintf(msg, sizeof(msg),
+                             "replicated encrypted repo %lld into plaintext at %s%s",
+                             (long long)j->repo_id, j->dest,
+                             st == OK ? "" : " (the run did not complete)");
+                    log_warn("replicate: %s", msg);
+                    journal_record(j->db, j->repo_id, "replicate", "plaintext-copy",
+                                   "warning", 0, msg);
+                }
                 /* A cancelled run keeps what it committed, so its counts
                  * are true either way. */
                 replicate_report(progress_ctx, &rr, j->reencrypt);
@@ -1428,6 +1544,22 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
     return st;
 }
 
+/*
+ * A boolean query parameter: 1/true or 0/false, or absent, which leaves
+ * *out holding the caller's default. Anything else is -1 for a 400. These
+ * parameters are safety switches (dry_run, repair=0, force), and reading an
+ * unrecognised value as the default turned a typo into the destructive
+ * choice.
+ */
+static int query_bool(const api_request_t *req, const char *name, int *out)
+{
+    const char *v = api_query_param(req, name);
+    if (!v) return 0;
+    if (strcmp(v, "1") == 0 || strcmp(v, "true") == 0)  { *out = 1; return 0; }
+    if (strcmp(v, "0") == 0 || strcmp(v, "false") == 0) { *out = 0; return 0; }
+    return -1;
+}
+
 static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
                                       const api_request_t *req,
                                       snap_job_kind_t kind)
@@ -1455,9 +1587,14 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
     j->repo_path = repo_path;
     j->kind = kind;
 
-    {
-        const char *dry = api_query_param(req, "dry_run");
-        j->dry_run = dry && (strcmp(dry, "1") == 0 || strcmp(dry, "true") == 0);
+    /*
+     * dry_run is the safety catch, so anything but a recognised value is
+     * refused: "dry_run=yes" or "dry_run=" used to read as off and ran the
+     * real gc or retention pass, deleting what the caller meant to preview.
+     */
+    if (query_bool(req, "dry_run", &j->dry_run) != 0) {
+        snap_job_free(j);
+        return api_error(400, "dry_run must be 1, true, 0 or false");
     }
 
     /*
@@ -1475,9 +1612,12 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "level must be index, structure or deep");
         }
-        const char *rep = api_query_param(req, "repair");
-        if (rep && (strcmp(rep, "0") == 0 || strcmp(rep, "false") == 0))
-            j->verify_repair = 0;
+        /* "repair=no" used to mean repair on: a check the caller asked not
+         * to write, writing. */
+        if (query_bool(req, "repair", &j->verify_repair) != 0) {
+            snap_job_free(j);
+            return api_error(400, "repair must be 1, true, 0 or false");
+        }
         /* A dry run is a check that must not write, whatever else was
          * asked for. */
         if (j->dry_run) j->verify_repair = 0;
@@ -1577,10 +1717,41 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, je.msg);
         }
         j->reencrypt = reenc ? 1 : 0;
+        /*
+         * Dropping encryption has to be asked for by name. "reencrypt" into
+         * a path that happens to hold an unencrypted repository wrote the
+         * whole repository out in plaintext, and nothing in the request
+         * said that was the intent.
+         */
+        bool plain = false;
+        if (jreq_bool(body, "allow_plaintext", &plain, &je) == JREQ_BAD) {
+            snap_job_free(j);
+            return api_error(400, je.msg);
+        }
+        if (plain && !j->reencrypt) {
+            snap_job_free(j);
+            return api_error(400, "allow_plaintext applies only with reencrypt: a "
+                                  "plain replica keeps the source's encryption");
+        }
+        j->allow_plaintext = plain ? 1 : 0;
         char why[PATH_MAX + 128];
         if (routes_replicate_dest_check(repo_id, j->dest, why, sizeof(why)) != 0) {
             snap_job_free(j);
             return api_error(400, why);
+        }
+        if (j->reencrypt && !j->allow_plaintext) {
+            repo_marker_t sm;
+            if (repo_marker_read(j->repo_path, &sm) == OK) {
+                if (replica_reencrypt_drops_encryption(j->dest, &sm)) {
+                    char msg[PATH_MAX + 256];
+                    snprintf(msg, sizeof(msg), REPLICA_PLAINTEXT_REFUSAL, j->dest);
+                    snap_job_free(j);
+                    return api_error(400, msg);
+                }
+            } else {
+                /* The job reads it again and fails with the reason. */
+                err_clear();
+            }
         }
     }
 
@@ -2020,18 +2191,20 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
                                       int64_t snap_id)
 {
     int force = 0;
-    const char *fv = api_query_param(req, "force");
-    if (fv) {
-        if (strcmp(fv, "1") == 0 || strcmp(fv, "true") == 0) force = 1;
-        else if (strcmp(fv, "0") == 0 || strcmp(fv, "false") == 0) force = 0;
-        else return api_error(400, "force must be 1 or 0");
-    }
+    if (query_bool(req, "force", &force) != 0)
+        return api_error(400, "force must be 1 or 0");
 
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
 
     status_t st = repo_trylock_write(repo_id);
     if (st != OK) { free(repo_path); return api_error(503, "repo is busy"); }
+
+    if (pack_presence_require(g_ctx.db, repo_id) != OK) {
+        repo_unlock(repo_id);
+        free(repo_path);
+        return api_error(409, err_msg());
+    }
 
     store_t *store = NULL;
     st = repo_store_open(repo_path, NULL, &store);
@@ -2208,6 +2381,21 @@ status_t routes_submit_startup_reindex(job_manager_t *jm, int64_t repo_id,
     j->kind = SNAP_JOB_REINDEX;
     return snap_job_submit_as(jm ? jm : g_ctx.jm, repo_id, j, "reindex", 0, 1,
                               out_job_id);
+}
+
+status_t routes_submit_reindex(int64_t repo_id, const char *origin, int64_t *out_job_id)
+{
+    if (!g_ctx.jm) return set_error(ERR_INVALID, "no job manager to queue a reindex on");
+    char *repo_path = repo_path_for(g_ctx.db, repo_id);
+    if (!repo_path) return set_error(ERR_NOT_FOUND, "no such repo");
+    snap_job_t *j = calloc(1, sizeof(*j));
+    if (!j) { free(repo_path); return set_error(ERR_NOMEM, "reindex job: alloc"); }
+    j->db = g_ctx.db;
+    j->repo_id = repo_id;
+    j->repo_path = repo_path;
+    j->kind = SNAP_JOB_REINDEX;
+    return job_submit_origin(g_ctx.jm, repo_id, snap_job_lock(j), "reindex", origin,
+                             snap_job_run, j, snap_job_free, out_job_id);
 }
 
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)

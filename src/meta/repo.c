@@ -5,8 +5,10 @@
 #include "repo.h"
 #include "db_txn.h"
 #include "snapshot_ids.h"
+#include "pack_ids.h"
 #include "snap_record.h"
 #include "store.h"
+#include "db_write.h"
 
 #include <cutils/json.h>
 #include <stdbool.h>
@@ -69,6 +71,7 @@ status_t repo_store_open(const char *path, const store_config_t *cfg,
         return OK;
     }
     st = repo_format_check(path, &m);
+    if (st == OK) st = store_set_uuid(*out, m.uuid);   /* the pack-ids mark */
     if (st != OK) {
         store_close(*out);
         *out = NULL;
@@ -473,16 +476,24 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
  *
  * A passphrase alongside a mode that cannot use it is refused rather than
  * ignored, for the same reason: ignoring it is how the first bug happened.
- * An empty passphrase counts as absent, so a client that always sends the
- * field does not trip over it.
  */
 status_t repo_enc_resolve(const char *mode, const char *passphrase,
                           repo_enc_mode_t *out)
 {
-    int has_pass = passphrase && *passphrase;
+    /*
+     * Given means given. An empty passphrase used to count as absent and an
+     * empty mode as "not given", so "encrypt":"" or "passphrase":"" made an
+     * unencrypted repository and answered 201: the same silent downgrade as
+     * the CLI's missing --encrypt value (B127), one layer down. A client
+     * that has nothing to say leaves the field out.
+     */
+    if (passphrase && !*passphrase)
+        return set_error(ERR_INVALID, "passphrase must not be empty; leave it out "
+                                      "for a repository without one");
+    int has_pass = passphrase != NULL;
     repo_enc_mode_t m = REPO_ENC_NONE;
 
-    if (!mode || !*mode) {
+    if (!mode) {
         *out = has_pass ? REPO_ENC_PASSPHRASE : REPO_ENC_NONE;
         return OK;
     }
@@ -719,7 +730,7 @@ static status_t insert_repo_row(cutils_db_t *db, const char *uuid,
     snprintf(now, sizeof(now), "%lld", (long long)time(NULL));
 
     const char *params[] = { uuid, path, label ? label : "", now, NULL };
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO repos (uuid, path, label, added_at) VALUES (?, ?, ?, ?)",
             params, NULL) != 0)
         return set_error(ERR_IO, "cannot insert repo row for %s", path);
@@ -924,6 +935,7 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
         /* Created with the repository, so a format 3 repository without
          * one is damaged rather than old. */
         st = snapshot_ids_write(path, marker.uuid, 0);
+        if (st == OK) st = pack_ids_write(path, marker.uuid, 0);
         if (st != OK) return st;
         out->created  = 1;
         out->inserted = 1;
@@ -945,13 +957,32 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
     if (st != OK) return st;
 
     /*
+     * Staging a killed writer left behind (a replicate SIGKILLed mid-copy
+     * leaves a pack of up to 2 GB in tmp/, B133) goes now, if no handle is
+     * writing here; see store_claim_tmp. Failing to open or sweep is not a
+     * reason to refuse the registration.
+     */
+    {
+        store_t *sw = NULL;
+        if (store_open(path, NULL, &sw) == OK) {
+            (void)store_sweep_tmp_before(sw, time(NULL), NULL);
+            store_close(sw);
+        } else {
+            err_clear();
+        }
+    }
+
+    /*
      * Encryption is the marker's to say, not the request's. Asking for a
      * mode an existing repository does not have used to be accepted, and
      * the route then recorded the requested mode against a repository whose
      * objects were written otherwise - a plaintext repository listed as
-     * encrypted is the worst way round for that to be wrong.
+     * encrypted is the worst way round for that to be wrong. An explicit
+     * "none" is a mode too: re-registering an encrypted repository while
+     * saying it is unencrypted is refused, not read as "not asked".
      */
-    if (enc && enc->mode != REPO_ENC_NONE && enc->mode != marker.enc_mode)
+    if (enc && (enc->mode != REPO_ENC_NONE || enc->mode_given) &&
+        enc->mode != marker.enc_mode)
         return set_error(ERR_INVALID,
                          "%s is already a repository with encryption %s; "
                          "encryption is decided when a repository is created",
@@ -1035,12 +1066,12 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
         }
         char idbuf[32];
         snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
-        if (db_execute_non_query(db, "UPDATE repos SET path = ? WHERE id = ?",
-                                 (const char *[]){ path, idbuf, NULL }, NULL) != 0)
+        if (db_write(db, "UPDATE repos SET path = ? WHERE id = ?",
+                     (const char *[]){ path, idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: path update to %s failed", (long long)id, path);
         if (relabel) {
-            if (db_execute_non_query(db, "UPDATE repos SET label = ? WHERE id = ?",
-                                     (const char *[]){ label, idbuf, NULL }, NULL) != 0)
+            if (db_write(db, "UPDATE repos SET label = ? WHERE id = ?",
+                         (const char *[]){ label, idbuf, NULL }, NULL) != 0)
                 return set_error(ERR_IO, "cannot update label of repo %lld",
                                  (long long)id);
             out->label_updated = 1;
@@ -1097,9 +1128,9 @@ status_t repo_deregister(cutils_db_t *db, int64_t repo_id)
      */
     if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "cannot delete repo %lld: begin", (long long)repo_id);
-    if (db_execute_non_query(db, "DELETE FROM repos WHERE id = ?",
-                             (const char *[]){ idbuf, NULL }, NULL) != 0 ||
-        db_execute_non_query(db,
+    if (db_write(db, "DELETE FROM repos WHERE id = ?",
+                 (const char *[]){ idbuf, NULL }, NULL) != 0 ||
+        db_write(db,
             "INSERT OR IGNORE INTO repo_purge_pending (repo_id, queued_at) VALUES (?, ?)",
             (const char *[]){ idbuf, now, NULL }, NULL) != 0) {
         db_txn_rollback(db);

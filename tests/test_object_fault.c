@@ -113,7 +113,7 @@ static void test_store_malloc_fail(void **state) {
  * pack-sized file behind. */
 static int tmp_is_empty(void) {
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "find '%s/tmp' -type f | wc -l", TEST_REPO);
+    snprintf(cmd, sizeof(cmd), "find '%s/tmp' -type f ! -name .lock | wc -l", TEST_REPO);
     FILE *f = popen(cmd, "r");
     assert_non_null(f);
     int n = -1;

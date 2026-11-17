@@ -25,11 +25,25 @@ typedef struct {
     unsigned    freeze_timeout_s;   /* vm.freeze_timeout_s: freeze watchdog */
     unsigned    max_pause_s;        /* containers.max_pause_s: pause watchdog */
     int         trust_zero;         /* vm.trust_zero_status */
+    /* Incremental disk reads (vm-backup.md 5): off, the daemon gives no
+     * provider a base and every disk reads in full (R3: on by default only
+     * after UAT). */
+    int         incremental;        /* vm.incremental */
+    unsigned    delta_full_pct;     /* vm.delta_full_pct: read in full above this share */
+    unsigned    audit_days;         /* vm.audit_days: 0 never audits */
 } units_config_t;
 
 #define UNITS_WAIT_DEFAULT_S     3600u
 #define UNITS_FREEZE_DEFAULT_S   10u
 #define UNITS_PAUSE_DEFAULT_S    30u
+#define UNITS_DELTA_PCT_DEFAULT  75u
+#define UNITS_AUDIT_DAYS_DEFAULT 30u
+
+/* Counters for GET /metrics (vm-backup.md 8.5). */
+void     units_vm_count_audit_failure(void);
+void     units_vm_count_resync(uint64_t bytes);
+uint64_t units_vm_audit_failures(void);
+uint64_t units_vm_resync_bytes(void);
 
 /*
  * Load (or create) the daemon id and take the configuration. The id is 32
@@ -89,8 +103,13 @@ status_t units_sweep(cutils_db_t *db, int64_t self_job, units_sweep_result_t *ou
 /* ---- watchdog ---- */
 
 /* One pass: release freezes older than freeze_timeout_s and pauses older
- * than max_pause_s, from this thread, whatever the job thread is doing. */
-status_t units_watchdog_tick(cutils_db_t *db, time_t now, unsigned *released);
+ * than max_pause_s, from this thread, whatever the job thread is doing.
+ * now_ms is wall-clock milliseconds, as units_now_ms() reads it. */
+status_t units_watchdog_tick(cutils_db_t *db, int64_t now_ms, unsigned *released);
+
+/* Wall-clock milliseconds: unit_intents.created_at is in this unit, so a
+ * hold's limit is measured to the millisecond, not to the second. */
+int64_t units_now_ms(void);
 /* A thread running a tick every interval_ms. */
 status_t units_watchdog_start(cutils_db_t *db, unsigned interval_ms);
 void     units_watchdog_stop(void);

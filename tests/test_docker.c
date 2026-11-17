@@ -15,6 +15,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -294,6 +295,30 @@ static void test_two_instants_pause(void **state)
     be.ops->desc_free(d);
 }
 
+/* A pause the watchdog undid before the snapshots: the two instants were
+ * taken from a running unit, so the level is inconsistent, said so. */
+static void test_pause_lost(void **state)
+{
+    (void)state;
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    sp_unit_desc_t *d = NULL;
+    fdk.lose_pause = 1;
+    status_t st = capture("solo", SP_CONSIST_INCONSISTENT, &s, &info, &d);
+    fdk.lose_pause = 0;
+    assert_int_equal(st, OK);
+    assert_int_equal(fdk.pauses, 1);
+    assert_int_equal(fdk.unpauses, 0);
+    assert_int_equal(info->achieved, SP_CONSIST_INCONSISTENT);
+    assert_true(info->consist_flags & SP_CF_WATCHDOG_RELEASED);
+    int warned = 0;
+    for (size_t i = 0; i < info->n_warnings; i++) warned |= strstr(info->warnings[i], "watchdog") != NULL;
+    assert_true(warned);
+    assert_int_equal(holds_open, 2);                 /* two snapshots; the pause row cleared */
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+}
+
 /* Members paused together, all of them released; a member that will not
  * pause leaves none paused and fails a unit spanning two instants. */
 static void test_parallel_pause(void **state)
@@ -523,7 +548,7 @@ static int setup_units(void **state)
     if (repo_register(udb, D "/repo", "t", &urepo) != OK) return -1;
     if (repo_store_open(D "/repo", NULL, &ustore) != OK) return -1;
     if (store_index_bind(ustore, udb, urepo, &uidx) != OK) return -1;
-    units_config_t uc = { "", 2, 10, 30, 1 };
+    units_config_t uc = { "", 2, 10, 30, 1, 0, 75, 30 };
     if (units_init(udb, NULL, &uc) != OK) return -1;
     return sp_registry_add(be.ops, be.ctx) == OK ? 0 : -1;
 }
@@ -736,10 +761,14 @@ static void test_sweep_unpauses(void **state)
     rq.intents = in;
     rq.n_intents = 2;
     rq.released = released;
+    int absent[2] = { 9, 9 };
+    rq.absent = absent;
     sp_sweep_report_t rep;
     assert_int_equal(be.ops->sweep(be.ctx, &rq, &rep), OK);
     assert_int_equal(released[0], 1);
     assert_int_equal(released[1], 1);
+    assert_int_equal(absent[0], 0);
+    assert_int_equal(absent[1], 1);
     assert_string_equal(fdk.c[0].state, "running");
 }
 
@@ -771,12 +800,30 @@ static void test_demux(void **state)
     assert_int_equal(docker_demux_feed(&m, bad, sizeof(bad), sink, &out), -1);
 }
 
+/* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
+ * that leaves anything behind (SCRATCH-1). Setup removes it too, so a
+ * killed run is no obstacle to the next. */
+static int group_cleanup(void **state)
+{
+    (void)state;
+    int rc = system("rm -rf '" D "'");
+    (void)rc;
+    return 0;
+}
+
 int main(void)
 {
+    /* As c-backup-helper does (helper_main.c): a write to a pipe or socket
+     * whose reader has gone (a dump nobody reads any more, the fake engine
+     * closing first) is an EPIPE to handle, not the end of the process.
+     * Left at the default, a run under load died of SIGPIPE in a later
+     * test, from an exec thread of an earlier one. */
+    signal(SIGPIPE, SIG_IGN);
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_instant_no_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_two_instants_pause, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pause_lost, setup, teardown),
         cmocka_unit_test_setup_teardown(test_parallel_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_hook_logs_and_dumps, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
@@ -790,5 +837,5 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),
         cmocka_unit_test(test_demux),
     };
-    return cmocka_run_group_tests(tests, NULL, NULL);
+    return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }

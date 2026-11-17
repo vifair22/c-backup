@@ -111,7 +111,7 @@ export type ApiRequest =
   | { kind: 'objectRefs'; repoId: number; hash: string }
   | { kind: 'objectLayout'; repoId: number; hash: string }
   | { kind: 'objectContent'; repoId: number; hash: string }
-  | { kind: 'packList'; repoId: number }
+  | { kind: 'packList'; repoId: number; limit?: number; offset?: number }
   | { kind: 'packEntries'; repoId: number; packId: number; limit?: number; offset?: number }
   | { kind: 'fanout'; repoId: number }
 

@@ -47,11 +47,20 @@ typedef struct {
     char    unit[HELPER_UNIT_KEY_MAX + 1];  /* provider:id */
     char    kind[16];
     char    detail[192];
-    time_t  created;
+    int64_t created_ms;                     /* wall clock; 0 after a restart */
     int64_t capture;                        /* the capture's sequence number */
 } hold_t;
 
 struct jctx;
+
+/* Wall-clock milliseconds: a hold's age against max_pause_s. In whole
+ * seconds the watchdog fired up to a second early. */
+static int64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 typedef struct {
     char    unit[HELPER_UNIT_KEY_MAX + 1];
@@ -136,7 +145,7 @@ static void journal_save(helper_server_t *s)
         cJSON_AddStringToObject(o, "unit", s->holds[i].unit);
         cJSON_AddStringToObject(o, "kind", s->holds[i].kind);
         cJSON_AddStringToObject(o, "detail", s->holds[i].detail);
-        cJSON_AddNumberToObject(o, "created", (double)s->holds[i].created);
+        cJSON_AddNumberToObject(o, "created", (double)(s->holds[i].created_ms / 1000));
     }
     char *txt = a ? cJSON_PrintUnformatted(a) : NULL;
     cJSON_Delete(a);
@@ -174,7 +183,7 @@ static status_t j_record(void *ctx, const char *kind, const char *detail, int64_
     snprintf(h->unit, sizeof(h->unit), "%s", j->unit);
     snprintf(h->kind, sizeof(h->kind), "%s", kind);
     snprintf(h->detail, sizeof(h->detail), "%s", detail);
-    h->created = time(NULL);
+    h->created_ms = now_ms();
     h->capture = j->capture;
     *out = h->id;
     journal_save(s);
@@ -224,7 +233,7 @@ static void journal_load(helper_server_t *s)
         snprintf(h->unit, sizeof(h->unit), "%s", u);
         snprintf(h->kind, sizeof(h->kind), "%s", k);
         snprintf(h->detail, sizeof(h->detail), "%s", d);
-        h->created = 0;
+        h->created_ms = 0;
         h->capture = -1;              /* nobody's: the process that took it is gone */
         if (h->id > s->next_hold) s->next_hold = h->id;
     }
@@ -233,7 +242,10 @@ static void journal_load(helper_server_t *s)
 
 /*
  * Release the holds that select() picks, through the backend, and drop the
- * ones released. Returns how many were. Caller holds nothing.
+ * ones released. Returns how many were. Caller holds nothing. With
+ * keep_absent a hold the backend found nothing under stays journalled:
+ * the watchdog acts on live captures, whose holds are recorded before they
+ * are taken, so nothing held may mean not taken yet (sp_sweep_req_t).
  */
 typedef int (*hold_pick_fn)(const hold_t *h, void *ctx);
 
@@ -252,7 +264,8 @@ static const helper_backend_t *backend_of(const helper_server_t *s, const char *
     return NULL;
 }
 
-static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx, const char *why)
+static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx, int keep_absent,
+                              const char *why)
 {
     hold_t *picked = calloc(HOLDS_MAX, sizeof(*picked));
     if (!picked) return 0;
@@ -267,15 +280,18 @@ static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx,
         const char *uid = NULL;
         const helper_backend_t *b = backend_of(s, picked[i].unit, &uid);
         sp_intent_t in = { picked[i].id, uid, picked[i].kind, picked[i].detail, 0 };
-        int rel = 0;
+        int rel = 0, absent = 0;
         sp_sweep_req_t rq;
         memset(&rq, 0, sizeof(rq));
         rq.daemon8 = s->pol->daemon_id;
         rq.intents = &in;
         rq.n_intents = 1;
         rq.released = &rel;
+        rq.absent = &absent;
         sp_sweep_report_t rep;
-        if (b && b->ops->sweep && b->ops->sweep(b->ctx, &rq, &rep) == OK && rel) {
+        status_t st = b && b->ops->sweep ? b->ops->sweep(b->ctx, &rq, &rep) : ERR_INVALID;
+        if (st == OK && rel && absent && keep_absent) continue;
+        if (st == OK && rel) {
             jctx_t j = { s, "", 0 };
             (void)j_clear(&j, picked[i].id);
             released++;
@@ -292,13 +308,13 @@ static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx,
 
 static int pick_all(const hold_t *h, void *ctx) { (void)h; (void)ctx; return 1; }
 
-typedef struct { time_t now; unsigned pause_s; } age_t;
+typedef struct { int64_t now_ms; unsigned pause_s; } age_t;
 
 static int pick_old(const hold_t *h, void *ctx)
 {
     const age_t *a = ctx;
     int timed = strcmp(h->kind, SP_HOLD_FREEZE) == 0 || strcmp(h->kind, SP_HOLD_PAUSE) == 0;
-    return timed && h->created + (time_t)a->pause_s <= a->now;
+    return timed && h->created_ms + (int64_t)a->pause_s * 1000 <= a->now_ms;
 }
 
 /* ------------------------------------------------------------------ */
@@ -640,7 +656,11 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
     cJSON *res = cJSON_CreateObject();
     cJSON *mem = res ? cJSON_AddArrayToObject(res, "members") : NULL;
     helper_err_t fail = mem ? HELPER_OK : HELPER_E_FAILED;
-    char fmsg[512] = "out of memory";
+    /* Room for the longest it is given: a unit key, ": " and 400 bytes of the
+     * error (the others take at most 500), so nothing in it is cut short. It
+     * was 512, under the 563 a full-length key needs, and -Wformat-truncation
+     * said so in the debug and asan builds. */
+    char fmsg[HELPER_UNIT_KEY_MAX + sizeof(": ") + 400] = "out of memory";
     /* Several units of one backend that can capture them together: one
      * pause and one snapshot set for all (6.2), a session each. */
     sp_unit_desc_t *gd[HELPER_UNITS_MAX] = { 0 };
@@ -731,6 +751,23 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         /* pause: a pause may be held for the daemon's second pass over
          * mounts on no snapshot domain, released with lease.release. */
         q.hold_pause = r->hold;
+        /* vm.backup_begin (vm-backup.md 5.8): the disks that take part in
+         * the chain, against base where base covers them; base alone, with
+         * no disk taking part, is only retired. The backend accepts base
+         * only if its own records say it made it for this daemon. */
+        sp_item_base_t vb[HELPER_DISKS_MAX];
+        size_t nvb = 0;
+        if (r->op == HOP_VM_BACKUP_BEGIN) {
+            for (size_t k = 0; k < r->n_disks && nvb < HELPER_DISKS_MAX; k++) {
+                if (!r->disks[k].incremental) continue;
+                vb[nvb].item_id = r->disks[k].target;
+                vb[nvb].base_token = r->base[0] ? r->base : NULL;
+                nvb++;
+            }
+            q.bases = vb;
+            q.n_bases = nvb;
+            q.retire_token = nvb == 0 && r->base[0] ? r->base : NULL;
+        }
         st = b->ops->begin(b->ctx, d, &q, &sess, &info);
         /* The journal context outlives begin: end releases through it, so
          * it lives with the member and goes after end. */
@@ -758,6 +795,8 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         cJSON *w = cJSON_AddArrayToObject(o, "warnings");
         for (size_t k = 0; w && k < info->n_warnings; k++)
             cJSON_AddItemToArray(w, cJSON_CreateString(info->warnings[k]));
+        if (info->new_token) cJSON_AddStringToObject(o, "new_token", info->new_token);
+        if (info->new_token_blob) cJSON_AddStringToObject(o, "token_blob", info->new_token_blob);
         cJSON *pl = cJSON_AddArrayToObject(o, "plans");
         for (size_t k = 0; pl && k < info->n_plans; k++) {
             cJSON *p = cJSON_CreateObject();
@@ -947,8 +986,11 @@ static char *op_capture_end(helper_server_t *s, const helper_req_t *r)
 {
     capture_t c;
     if (!capture_take(s, r->token, &c))
-        return resp_error(r->id, HELPER_E_INVALID, "no such capture");
-    capture_finish(s, &c, SP_END_COMMITTED);
+        return resp_error(r->id, HELPER_E_INVALID, r->op == HOP_VM_BACKUP_END ? "no such session" : "no such capture");
+    /* vm.backup_end says how the snapshot went, which settles the
+     * checkpoints (vm-backup.md 5.8); a capture always ends as committed. */
+    int aborted = r->op == HOP_VM_BACKUP_END && strcmp(r->outcome, "aborted") == 0;
+    capture_finish(s, &c, aborted ? SP_END_ABORTED : SP_END_COMMITTED);
     cJSON *res = cJSON_CreateObject();
     if (res) cJSON_AddBoolToObject(res, "ended", 1);
     return resp_ok(r->id, res);
@@ -1052,6 +1094,35 @@ static void run_drain(run_t *x)
     }
 }
 
+/*
+ * A run has ended: the rest of its stderr, then how it ended, into its log
+ * (B141). A hook inside a unit writes its stderr through the backend (the
+ * docker exec stream is demultiplexed on the backend's own thread), which
+ * may still be writing when the process is reported gone, so the pipe is
+ * read to its end, not to what happens to be there: up to 5 s for the last
+ * writer to close it. The closing line means a log is never empty, and a
+ * failed dump, which is not stored, always says why.
+ */
+static void run_finish(run_t *x)
+{
+    char buf[4096];
+    for (int waited_ms = 0; waited_ms < 5000;) {
+        ssize_t n = read(x->err_fd, buf, sizeof(buf));
+        if (n > 0) { if (hooklog_append(&x->log, buf, (size_t)n) != 0) break; continue; }
+        if (n == 0) break;                         /* every writer is gone */
+        if (errno != EAGAIN && errno != EINTR) break;
+        struct pollfd pf = { x->err_fd, POLLIN, 0 };
+        (void)poll(&pf, 1, 100);
+        waited_ms += 100;
+    }
+    char line[96];
+    if (x->timed_out)
+        snprintf(line, sizeof(line), "\n[c-backup: killed at its timeout, exit status %d]\n", x->status);
+    else
+        snprintf(line, sizeof(line), "\n[c-backup: exit status %d]\n", x->status);
+    (void)hooklog_append(&x->log, line, strlen(line));
+}
+
 /* Reap a run if it ended; kill it if it is past its deadline. Caller
  * holds mu. */
 static void run_poll(run_t *x, time_t now)
@@ -1064,13 +1135,13 @@ static void run_poll(run_t *x, time_t now)
         if (x->b->hook_poll(x->hr, &code)) {
             x->done = 1;
             x->status = code;
-            run_drain(x);
+            run_finish(x);
         } else if (now >= x->deadline) {
             x->b->hook_kill(x->hr);
             x->done = 1;
             x->timed_out = 1;
             x->status = 128 + SIGKILL;
-            run_drain(x);
+            run_finish(x);
         }
         return;
     }
@@ -1078,7 +1149,7 @@ static void run_poll(run_t *x, time_t now)
     if (p == x->pid) {
         x->done = 1;
         x->status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
-        run_drain(x);
+        run_finish(x);
         return;
     }
     if (now >= x->deadline) {
@@ -1087,7 +1158,7 @@ static void run_poll(run_t *x, time_t now)
         x->done = 1;
         x->timed_out = 1;
         x->status = 128 + SIGKILL;
-        run_drain(x);
+        run_finish(x);
     }
 }
 
@@ -1170,6 +1241,89 @@ static int mkdir_owned(const char *path, uid_t uid)
     return 0;
 }
 
+/* Is a under (or equal to) b, on a component boundary? */
+static int path_under(const char *a, const char *b)
+{
+    size_t n = strlen(b);
+    while (n > 1 && b[n - 1] == '/') n--;
+    return strncmp(a, b, n) == 0 && (a[n] == '\0' || a[n] == '/');
+}
+
+/* How many components p has below root, or -1 when it is not under it. */
+static int depth_below(const char *p, const char *root)
+{
+    if (!path_under(p, root)) return -1;
+    const char *rest = p + strlen(root);
+    int d = 0;
+    for (const char *c = rest; *c; c++) if (*c == '/' && c[1] && c[1] != '/') d++;
+    return d;
+}
+
+/*
+ * Where restore.stage stages for a mount in domain dom (Manual review item
+ * 4). On FS2 the domain is the whole pool, and <domain>/.cbackup-restore
+ * was a dot directory at the pool's top, the placement the snapshot
+ * directory avoids: anything at the top of a pool, or in an exported share,
+ * is visible over the network. So: the first restore_staging_dirs entry
+ * inside the domain; else, for a pool-top domain (mnt_root/<pool>),
+ * <pool>/system/.cbackup-restore, beside the snapshot directory; else
+ * <domain>/.cbackup-restore. Then, wherever it came from, it is refused at
+ * the top of a pool or in a share exported over SMB or NFS
+ * (<boot_config>/shares/<share>.cfg). -1 with why on a refusal.
+ */
+static int staging_base(const helper_server_t *s, const char *dom, char *out, size_t sz,
+                        char *why, size_t wsz)
+{
+    const helper_policy_t *p = s->pol;
+    out[0] = '\0';
+    for (size_t i = 0; i < p->n_staging && !out[0]; i++)
+        if (path_under(p->restore_staging_dirs[i], dom) && strcmp(p->restore_staging_dirs[i], dom) != 0)
+            snprintf(out, sz, "%s", p->restore_staging_dirs[i]);
+    if (!out[0]) {
+        int pool_top = depth_below(dom, p->mnt_root) == 1;
+        if (snprintf(out, sz, pool_top ? "%s/system/.cbackup-restore" : "%s/.cbackup-restore", dom) >= (int)sz) {
+            snprintf(why, wsz, "path too long");
+            return -1;
+        }
+    }
+    int d = depth_below(out, p->mnt_root);
+    if (d < 0) return 0;                       /* not an Unraid pool path: nothing exports it */
+    if (d < 3) {
+        snprintf(why, wsz, "restore staging %.300s would sit at the top of a pool, visible over the "
+                 "network; set [snapshot] restore_staging_dirs to a directory inside a share", out);
+        return -1;
+    }
+    /* mnt_root/<pool>/<share>/...: the share is the second component. */
+    const char *rest = out + strlen(p->mnt_root) + 1;
+    const char *sh = strchr(rest, '/');
+    if (!sh) return 0;
+    sh++;
+    size_t k = strcspn(sh, "/");
+    char cfg[PATH_MAX + 512];
+    if (snprintf(cfg, sizeof(cfg), "%s%s/shares/%.*s.cfg", p->host_root, p->boot_config, (int)k, sh) >= (int)sizeof(cfg))
+        return 0;
+    FILE *f = fopen(cfg, "re");
+    if (!f) return 0;                          /* not an Unraid share */
+    char line[512];
+    int exported = 0;
+    while (!exported && fgets(line, sizeof(line), f)) {
+        const char *keys[] = { "shareExport=", "shareExportNFS=" };
+        for (size_t i = 0; i < 2 && !exported; i++) {
+            if (strncmp(line, keys[i], strlen(keys[i])) != 0) continue;
+            const char *v = line + strlen(keys[i]);
+            if (*v == '"') v++;
+            exported = *v && *v != '-' && *v != '"' && *v != '\n';
+        }
+    }
+    fclose(f);
+    if (exported) {
+        snprintf(why, wsz, "restore staging %.300s is in share %.*s, which is exported over the network; "
+                 "set [snapshot] restore_staging_dirs to a directory in a share that is not", out, (int)k, sh);
+        return -1;
+    }
+    return 0;
+}
+
 static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
 {
     if (!s->pol->allow_restore) return resp_error(r->id, HELPER_E_DENIED, "the policy does not allow restore");
@@ -1196,13 +1350,41 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     if (!dom || strcmp(dom, r->mount) == 0)
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is in no snapshot domain of the policy", r->mount);
     /* One directory per staging: a VM's disks share a job and a domain. */
-    char base[PATH_MAX], path[PATH_MAX], uniq[HELPER_TOKEN_HEX + 1];
+    char base[PATH_MAX], path[PATH_MAX], swhy[512], uniq[HELPER_TOKEN_HEX + 1];
     if (helper_random_hex(uniq, 4) != OK) return resp_error(r->id, HELPER_E_FAILED, "no randomness");
-    if (snprintf(base, sizeof(base), "%s/.cbackup-restore", dom) >= (int)sizeof(base) ||
-        snprintf(path, sizeof(path), "%s/%lld-%s", base, (long long)r->job, uniq) >= (int)sizeof(path))
+    if (staging_base(s, dom, base, sizeof(base), swhy, sizeof(swhy)) != 0)
+        return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
+    if (snprintf(path, sizeof(path), "%s/%lld-%s", base, (long long)r->job, uniq) >= (int)sizeof(path))
         return resp_error(r->id, HELPER_E_INVALID, "path too long");
+    /* Made down to the staging base, which may be a share directory not
+     * there yet (system/), each level the helper's own except the last. */
+    {
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s", base);
+        for (char *c = p + strlen(dom) + 1; *c; c++) {
+            if (*c != '/') continue;
+            *c = '\0';
+            if (mkdir(p, 0755) != 0 && errno != EEXIST)
+                return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", p, strerror(errno));
+            *c = '/';
+        }
+    }
     if (mkdir_owned(base, s->pol->daemon_uid) != 0 || mkdir_owned(path, s->pol->daemon_uid) != 0)
         return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", path, strerror(errno));
+    /* The swap is a rename: the staging must be on the mount's filesystem
+     * (a btrfs subvolume or another dataset would be EXDEV at the swap,
+     * after the whole restore was written). */
+    {
+        char parent[PATH_MAX];
+        if (snprintf(parent, sizeof(parent), "%.4000s", r->mount) >= (int)sizeof(parent)) parent[0] = '\0';
+        char *sl = strrchr(parent, '/');
+        if (sl && sl != parent) *sl = '\0';
+        struct stat a1, a2;
+        if (stat(path, &a1) == 0 && stat(parent, &a2) == 0 && a1.st_dev != a2.st_dev)
+            return resp_error(r->id, HELPER_E_DENIED, "restore staging %.300s is on another filesystem "
+                              "from %.300s, so the swap could not be a rename; set [snapshot] "
+                              "restore_staging_dirs to a directory on its filesystem", base, r->mount);
+    }
     pthread_mutex_lock(&s->mu);
     staging_t *slot = NULL;
     for (size_t i = 0; i < STAGINGS_MAX && !slot; i++) if (!s->stages[i].used) slot = &s->stages[i];
@@ -1427,19 +1609,29 @@ static char *op_vm_backup(helper_server_t *s, const helper_req_t *r, int *pass_f
     return op_capture_begin(s, &q, pass_fd);
 }
 
-/* vm.*: validated and held to the policy here; libvirt is not built yet. */
+/*
+ * vm.checkpoint_redefine (vm-backup.md 5.8): re-create a checkpoint libvirt
+ * has lost (Unraid keeps their metadata on the RAM rootfs) from the XML
+ * this helper stored when it made it. Only a checkpoint of its own records
+ * for that domain; the daemon names it and nothing else.
+ */
 static char *op_vm(helper_server_t *s, const helper_req_t *r)
 {
-    if (r->unit[0]) {
-        char why[256];
-        helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
-        if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
-        if (strncmp(r->unit, "libvirt:", 8) != 0)
-            return resp_error(r->id, HELPER_E_INVALID, "%s is for libvirt units", helper_op_name(r->op));
-        return resp_error(r->id, HELPER_E_UNSUPPORTED, "%s comes with incremental backups (V3)", helper_op_name(r->op));
+    char why[256];
+    helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
+    if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
+    if (strncmp(r->unit, "libvirt:", 8) != 0)
+        return resp_error(r->id, HELPER_E_INVALID, "%s is for libvirt units", helper_op_name(r->op));
+    const char *uid = NULL;
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK) return resp_error(r->id, e, "%s", why);
+    if (!b->redefine) return resp_error(r->id, HELPER_E_UNSUPPORTED, "provider %s keeps no checkpoints", b->name);
+    cJSON *res = NULL;
+    if (b->redefine(b->ctx, uid, r->checkpoint, &res) != OK) {
+        cJSON_Delete(res);
+        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
     }
-    /* A token-only operation: no session was ever issued. */
-    return resp_error(r->id, HELPER_E_INVALID, "no such session");
+    return resp_ok(r->id, res ? res : cJSON_CreateObject());
 }
 
 /* ------------------------------------------------------------------ */
@@ -1485,7 +1677,7 @@ static void sweep_artefacts(helper_server_t *s, sp_sweep_report_t *rep)
 
 static char *op_sweep(helper_server_t *s, const helper_req_t *r)
 {
-    unsigned rel = release_holds(s, pick_unowned, s, "sweep");
+    unsigned rel = release_holds(s, pick_unowned, s, 0, "sweep");
     sp_sweep_report_t rep;
     sweep_artefacts(s, &rep);
     cJSON *res = cJSON_CreateObject();
@@ -1681,10 +1873,11 @@ static void *accept_main(void *arg)
 /* Watchdog                                                            */
 /* ------------------------------------------------------------------ */
 
-unsigned helper_server_tick(helper_server_t *s, time_t now)
+unsigned helper_server_tick(helper_server_t *s, int64_t now_ms)
 {
-    age_t a = { now, s->pol->max_pause_s };
-    unsigned n = release_holds(s, pick_old, &a, "watchdog");
+    time_t now = (time_t)(now_ms / 1000);
+    age_t a = { now_ms, s->pol->max_pause_s };
+    unsigned n = release_holds(s, pick_old, &a, 1, "watchdog");
     /* Captures past their lease: ended, their snapshots destroyed. */
     for (;;) {
         capture_t c;
@@ -1721,7 +1914,7 @@ static void *wd_main(void *arg)
         pthread_cond_timedwait(&s->wcv, &s->cmu, &ts);
         if (s->stop) break;
         pthread_mutex_unlock(&s->cmu);
-        (void)helper_server_tick(s, time(NULL));
+        (void)helper_server_tick(s, now_ms());
         pthread_mutex_lock(&s->cmu);
     }
     pthread_mutex_unlock(&s->cmu);
@@ -1731,6 +1924,41 @@ static void *wd_main(void *arg)
 /* ------------------------------------------------------------------ */
 /* Start and stop                                                      */
 /* ------------------------------------------------------------------ */
+
+/*
+ * The socket's owner, group and mode, logged at start; and a loud warning
+ * when the daemon could not reach it: each directory on the way must let a
+ * member of daemon_gid (or daemon_uid itself) search it, and the socket
+ * must be writable by that group. Nothing here fails the start, because
+ * the helper cannot know every group the daemon's uid holds; it says what
+ * it sees instead of leaving a refused connect as the only symptom.
+ */
+static void socket_report(const char *path, uid_t uid, gid_t gid)
+{
+    struct stat sb;
+    if (stat(path, &sb) != 0) { log_warn("helper: cannot stat %s: %s", path, strerror(errno)); return; }
+    log_info("helper: socket %s owner %u group %u mode %04o", path, (unsigned)sb.st_uid,
+             (unsigned)sb.st_gid, (unsigned)(sb.st_mode & 07777));
+    if (!(sb.st_gid == gid && (sb.st_mode & S_IWGRP)) && !(sb.st_uid == uid && (sb.st_mode & S_IWUSR)) &&
+        !(sb.st_mode & S_IWOTH))
+        log_warn("helper: WARNING: the daemon (uid %u, gid %u) cannot write to socket %s (owner %u "
+                 "group %u mode %04o); it will be refused at connect", (unsigned)uid, (unsigned)gid, path,
+                 (unsigned)sb.st_uid, (unsigned)sb.st_gid, (unsigned)(sb.st_mode & 07777));
+    char p[4096];
+    snprintf(p, sizeof(p), "%s", path);
+    for (char *c = strrchr(p, '/'); c && c > p; c = strrchr(p, '/')) {
+        *c = '\0';
+        struct stat d;
+        if (stat(p, &d) != 0) continue;
+        int ok = (d.st_mode & S_IXOTH) || (d.st_gid == gid && (d.st_mode & S_IXGRP)) ||
+                 (d.st_uid == uid && (d.st_mode & S_IXUSR));
+        if (!ok)
+            log_warn("helper: WARNING: no member of group %u (nor uid %u) can enter %s (owner %u "
+                     "group %u mode %04o), so the daemon cannot reach socket %s; give the "
+                     "directory to that group or make it searchable", (unsigned)gid, (unsigned)uid, p,
+                     (unsigned)d.st_uid, (unsigned)d.st_gid, (unsigned)(d.st_mode & 07777), path);
+    }
+}
 
 static status_t listen_on(helper_server_t *s)
 {
@@ -1750,6 +1978,21 @@ static status_t listen_on(helper_server_t *s)
         close(fd);
         return set_error_errno(ERR_IO, "helper: bind %s", path);
     }
+    /* 0660 root:root let nobody but root connect: the daemon, running as
+     * daemon_uid with its own gid, had no write permission on the socket
+     * and connect failed with EACCES. The group is daemon_gid (default
+     * daemon_uid, what security.run_as_uid gives the daemon); SO_PEERCRED
+     * still refuses every uid but daemon_uid on each connection. Root may
+     * give any group; anyone else only one of their own, which is all a
+     * helper run unprivileged (tests) can serve anyway. */
+    if (chown(path, (uid_t)-1, s->pol->daemon_gid) != 0 && (geteuid() == 0 || errno != EPERM)) {
+        int err = errno;
+        close(fd);
+        (void)unlink(path);
+        errno = err;
+        return set_error_errno(ERR_IO, "helper: chown %s to group %u", path, (unsigned)s->pol->daemon_gid);
+    }
+    socket_report(path, s->pol->daemon_uid, s->pol->daemon_gid);
     s->lfd = fd;
     return OK;
 }
@@ -1778,7 +2021,7 @@ status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **o
     /* Whatever the last helper process held is released before anything
      * new is taken, and leftovers of this daemon id are destroyed. */
     journal_load(s);
-    unsigned rel = release_holds(s, pick_all, NULL, "start-up sweep");
+    unsigned rel = release_holds(s, pick_all, NULL, 0, "start-up sweep");
     sp_sweep_report_t rep;
     sweep_artefacts(s, &rep);
     if (rel || rep.removed)
@@ -1851,4 +2094,13 @@ size_t helper_server_holds(helper_server_t *s)
     size_t n = s->n_holds;
     pthread_mutex_unlock(&s->jmu);
     return n;
+}
+
+status_t helper_server_record(helper_server_t *s, const char *unit, const char *kind,
+                              const char *detail)
+{
+    jctx_t j = { s, "", 0 };
+    snprintf(j.unit, sizeof(j.unit), "%s", unit);
+    int64_t id = 0;
+    return j_record(&j, kind, detail, &id);
 }

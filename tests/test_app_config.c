@@ -63,11 +63,15 @@ static void test_edges_pass(void **state)
 {
     (void)state;
     assert_int_equal(load("http:\n  port: 0\n  bind: 0.0.0.0\n"
-                          "jobs:\n  max_parallel: 256\n  read_budget_mb: 16\n"
+                          "jobs:\n  max_parallel: 256\n  read_budget_mb: 48\n"
+                          "vm:\n  export_max_conns: 0\n"
                           "auth:\n  cookie_secure: 1\n"
                           "scheduler:\n  enabled: 0\n"
                           "retention:\n  keep_snaps: 0\n  keep_yearly: 2147483647\n"
-                          "backup:\n  file_cache_match: relaxed\n  unsettled: skip\n"),
+                          "backup:\n  file_cache_match: relaxed\n  unsettled: skip\n"
+                          "index:\n  missing_brake_pct: 100\n  missing_brake_packs: 0\n"),
+                     CUTILS_OK);
+    assert_int_equal(load("index:\n  missing_brake_pct: 0\n  missing_brake_packs: 1000000\n"),
                      CUTILS_OK);
     assert_int_equal(load("http:\n  port: 65535\n  bind: \"\"\n"
                           "jobs:\n  max_parallel: 1\n"
@@ -82,16 +86,27 @@ static void test_ranges_refused(void **state)
     refused("jobs:\n  max_parallel: 0\n", "jobs.max_parallel: '0' is not between 1 and 256");
     refused("jobs:\n  max_parallel: 257\n", "jobs.max_parallel: '257'");
     /* A read budget smaller than one largest object could never read it. */
-    refused("jobs:\n  read_budget_mb: 15\n",
-            "jobs.read_budget_mb: '15' MiB is under 16 MiB, the largest object");
+    refused("jobs:\n  read_budget_mb: 47\n",
+            "jobs.read_budget_mb: '47' MiB is under 48 MiB, the largest object");
     refused("jobs:\n  read_budget_mb: 0\n", "jobs.read_budget_mb: '0' MiB");
     refused("jobs:\n  read_budget_mb: 1048577\n", "jobs.read_budget_mb: '1048577'");
+    /* Each NBD export connection may hold one 16 MiB object of the budget
+     * beside the 48 a job needs: four want 112 MiB, or exports off. */
+    refused("jobs:\n  read_budget_mb: 64\n",
+            "vm.export_max_conns: '4' needs jobs.read_budget_mb of at least 4 x 16 MiB + 48 MiB = 112 MiB");
+    refused("jobs:\n  read_budget_mb: 111\n", "set jobs.read_budget_mb >= 112, or lower vm.export_max_conns");
+    assert_int_equal(load("jobs:\n  read_budget_mb: 112\n"), CUTILS_OK);
+    assert_int_equal(load("jobs:\n  read_budget_mb: 64\nvm:\n  export_max_conns: 1\n"), CUTILS_OK);
+    refused("vm:\n  export_max_conns: 65\n", "vm.export_max_conns: '65'");
     refused("auth:\n  cookie_secure: 2\n", "auth.cookie_secure: '2' is not between 0 and 1");
     refused("scheduler:\n  enabled: -1\n", "scheduler.enabled: '-1'");
     refused("retention:\n  keep_daily: -1\n", "retention.keep_daily: '-1'");
     refused("retention:\n  keep_snaps: -5\n", "retention.keep_snaps: '-5'");
     refused("backup:\n  store_workers: 65\n",
             "backup.store_workers: '65' is not between 0 and 64");
+    refused("index:\n  missing_brake_pct: 101\n",
+            "index.missing_brake_pct: '101' is not between 0 and 100");
+    refused("index:\n  missing_brake_packs: -1\n", "index.missing_brake_packs: '-1'");
 }
 
 static void test_bind_and_mode_refused(void **state)
@@ -104,6 +119,43 @@ static void test_bind_and_mode_refused(void **state)
             "backup.file_cache_match: 'fast' is not one of auto, strict, relaxed");
     refused("backup:\n  unsettled: maybe\n",
             "backup.unsettled: 'maybe' is not one of store, skip");
+}
+
+/* An empty value is unset to c-utils, which reads back the default, so
+ * `unsettled: ""` used to start the daemon as store (NIT-18). Every key
+ * whose values are named or numeric refuses it, however it is spelled. */
+static void test_empty_refused(void **state)
+{
+    (void)state;
+    refused("backup:\n  unsettled: \"\"\n",
+            "backup.unsettled: an empty value is not allowed; set one of store, "
+            "skip, or leave the key out for the default (store)");
+    refused("backup:\n  unsettled:\n", "backup.unsettled: an empty value");
+    refused("backup:\n  unsettled:   # later\n", "backup.unsettled: an empty value");
+    refused("backup:\n  unsettled: \"\"\r\n", "backup.unsettled: an empty value");
+    refused("backup:\n  file_cache_match: \"\"\n",
+            "backup.file_cache_match: an empty value is not allowed; set one of "
+            "auto, strict, relaxed");
+    refused("log:\n  level: \"\"\n", "log.level: an empty value");
+    refused("http:\n  port:\n", "http.port: an empty value is not allowed; set a "
+                                "whole number, or leave the key out for the "
+                                "default (8765)");
+    refused("retention:\n  keep_daily: \"\"\n", "retention.keep_daily: an empty value");
+    refused("backup:\n  store_workers:\n", "backup.store_workers: an empty value");
+    assert_int_equal(load_db("  synchronous: \"\"\n", ""), CUTILS_ERR_CONFIG);
+    if (!strstr(cutils_get_error(), "db.synchronous: an empty value"))
+        fail_msg("error '%s'", cutils_get_error());
+
+    /* Through the environment too: there it reads back as "". */
+    setenv("C_BACKUP_TEST_BACKUP_UNSETTLED", "", 1);
+    refused("", "C_BACKUP_TEST_BACKUP_UNSETTLED (backup.unsettled): an empty value");
+    unsetenv("C_BACKUP_TEST_BACKUP_UNSETTLED");
+
+    /* Where empty has a meaning, or a value merely contains a quote or a
+     * hash, it still starts. */
+    assert_int_equal(load("http:\n  bind: \"\"\npushover:\n  token: \"\"\n"), CUTILS_OK);
+    assert_int_equal(load("backup:\n  unsettled: \"skip\"  # quoted\n"), CUTILS_OK);
+    assert_int_equal(load("backup:\n  unsettled: store # why\n"), CUTILS_OK);
 }
 
 /* One run reports the lot, with log.level among them. */
@@ -150,6 +202,7 @@ int main(void)
         cmocka_unit_test_teardown(test_ranges_refused, teardown),
         cmocka_unit_test_teardown(test_bind_and_mode_refused, teardown),
         cmocka_unit_test_teardown(test_db_settings, teardown),
+        cmocka_unit_test_teardown(test_empty_refused, teardown),
         cmocka_unit_test_teardown(test_every_problem_in_one_run, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

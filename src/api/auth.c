@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "auth.h"
+#include "db_write.h"
 #include <cutils/db.h>
 #include <cutils/log.h>
 #include <cutils/error.h>
@@ -184,7 +185,7 @@ int auth_set_password(cutils_db_t *db, const char *password)
      * updated_at, so the original install timestamp survives password
      * changes. */
     const char *params[] = { hashed, NULL };
-    int rc = db_execute_non_query(db,
+    int rc = db_write(db,
         "INSERT INTO auth_config (key, value) VALUES ('password_hash', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params, NULL);
@@ -240,7 +241,7 @@ char *auth_create_token(cutils_db_t *db, int expire_hours)
     snprintf(created, sizeof(created), "%lld", (long long)now);
 
     const char *params[] = { token, created, expires, NULL };
-    int rc = db_execute_non_query(db,
+    int rc = db_write(db,
         "INSERT INTO sessions (token, kind, created_at, expires_at)"
         " VALUES (?, 'session', ?, ?)",
         params, NULL);
@@ -257,6 +258,9 @@ int auth_validate_token(cutils_db_t *db, const char *token)
     /* Strip "Bearer " prefix if present */
     const char *tok = token;
     if (strncmp(tok, "Bearer ", 7) == 0) tok += 7;
+    /* "Bearer " alone names no token; never look one up by the empty
+     * string. */
+    if (!tok[0]) return 0;
 
     /* Look up kind so we can decide whether to slide the expiry.
      * revoked_at IS NULL filters out soft-deleted rows. */
@@ -284,14 +288,14 @@ int auth_validate_token(cutils_db_t *db, const char *token)
                  (long long)(time(NULL) + (time_t)AUTH_SESSION_TTL_HOURS * 3600));
 
         const char *up_params[] = { new_expires, tok, NULL };
-        CUTILS_UNUSED(db_execute_non_query(db,
+        CUTILS_UNUSED(db_write(db,
             "UPDATE sessions "
             "SET expires_at = ?, last_used_at = strftime('%s','now') "
             "WHERE token = ?",
             up_params, NULL));
     } else {
         const char *up_params[] = { tok, NULL };
-        CUTILS_UNUSED(db_execute_non_query(db,
+        CUTILS_UNUSED(db_write(db,
             "UPDATE sessions SET last_used_at = strftime('%s','now') "
             "WHERE token = ?",
             up_params, NULL));
@@ -309,7 +313,7 @@ void auth_revoke_token(cutils_db_t *db, const char *token)
     /* Hard delete for now - when audit retention is a requirement we'll
      * switch to UPDATE ... SET revoked_at = datetime('now'). The schema
      * already carries revoked_at for that future migration. */
-    CUTILS_UNUSED(db_execute_non_query(db,
+    CUTILS_UNUSED(db_write(db,
         "DELETE FROM sessions WHERE token = ?", params, NULL));
 }
 
@@ -329,10 +333,10 @@ int auth_revoke_all(cutils_db_t *db, const char *keep_token)
     int deleted = 0;
     int rc;
     if (keep && keep[0])
-        rc = db_execute_non_query(db, "DELETE FROM sessions WHERE token <> ?",
-                                  (const char *[]){ keep, NULL }, &deleted);
+        rc = db_write(db, "DELETE FROM sessions WHERE token <> ?",
+                      (const char *[]){ keep, NULL }, &deleted);
     else
-        rc = db_execute_non_query(db, "DELETE FROM sessions", NULL, &deleted);
+        rc = db_write(db, "DELETE FROM sessions", NULL, &deleted);
     if (rc != 0) return -1;
     if (deleted > 0) log_info("auth: revoked %d session(s)", deleted);
     return deleted;
@@ -343,7 +347,7 @@ void auth_cleanup_sessions(cutils_db_t *db)
     int deleted = 0;
     /* Best-effort maintenance; on failure deleted stays 0 so the
      * conditional log below won't produce a misleading "cleaned up N" line. */
-    CUTILS_UNUSED(db_execute_non_query(db,
+    CUTILS_UNUSED(db_write(db,
         "DELETE FROM sessions WHERE expires_at < strftime('%s','now')",
         NULL, &deleted));
     if (deleted > 0)

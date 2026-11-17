@@ -64,6 +64,18 @@ status_t privs_drop(uid_t uid, gid_t gid)
         return set_error(ERR_INVALID, "security.run_as_uid %u: the daemon runs as uid %u, "
                          "not root, and cannot switch", (unsigned)uid, (unsigned)geteuid());
     }
+    /* What the drop must keep is checked before anything changes, so a
+     * refusal leaves the process as it was: root, its groups, its bounding
+     * set. It used to be checked after the uid switch, when a refused
+     * process was already uid 990 (harmless only because the daemon exits
+     * on the refusal). */
+    {
+        uint64_t perm0 = 0;
+        if (cap_get(NULL, &perm0, NULL) != 0) return set_error_errno(ERR_IO, "capget");
+        if (!(perm0 & privs_effective_mask()))
+            return set_error(ERR_INVALID, "CAP_DAC_READ_SEARCH is not available to keep; add it to "
+                             "the container (--cap-add DAC_READ_SEARCH)");
+    }
     /* Only the six may survive anywhere. Dropping from the bounding set
      * needs CAP_SETPCAP; a cap already outside it (docker --cap-drop ALL)
      * is fine as it is. */

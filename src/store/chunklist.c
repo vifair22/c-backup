@@ -500,6 +500,11 @@ status_t chunklist_iter_open(const obj_loader_t *loader,
     return OK;
 }
 
+uint64_t chunklist_iter_total(const chunklist_iter_t *it)
+{
+    return it ? it->st[0].hdr.total_len : 0;
+}
+
 void chunklist_iter_skip(chunklist_iter_t *it)
 {
     if (it) it->pending = 0;
@@ -638,9 +643,10 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
 
     obj_loader_t ld = obj_loader_store(store);
     chunklist_iter_t *it = NULL;
-    chunklist_hdr_t root;
-    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, &root, &it);
+    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, NULL, &it);
     if (st != OK) return st;
+    /* The length from the iterator, which holds the root header it checked. */
+    uint64_t total = chunklist_iter_total(it);
     for (;;) {
         chunklist_item_t x;
         int done = 0;
@@ -659,10 +665,10 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
     if (st != OK) return st;
     /* Extends over any trailing hole, and leaves interior gaps unwritten,
      * which on a fresh file is what makes them holes. */
-    if (ftruncate(out_fd, (off_t)root.total_len) != 0)
+    if (ftruncate(out_fd, (off_t)total) != 0)
         return set_error_errno(ERR_IO, "restore: ftruncate to %llu",
-                               (unsigned long long)root.total_len);
-    if (out_size) *out_size = root.total_len;
+                               (unsigned long long)total);
+    if (out_size) *out_size = total;
     return OK;
 }
 
@@ -706,9 +712,10 @@ status_t content_stream(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
 
     obj_loader_t ld = obj_loader_store(store);
     chunklist_iter_t *it = NULL;
-    chunklist_hdr_t root;
-    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, &root, &it);
+    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, NULL, &it);
     if (st != OK) return st;
+    /* The length from the iterator, which holds the root header it checked. */
+    uint64_t total = chunklist_iter_total(it);
     uint64_t pos = 0;
     for (;;) {
         chunklist_item_t x;
@@ -726,8 +733,8 @@ status_t content_stream(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
         pos = x.offset + x.length;
     }
     chunklist_iter_close(it);
-    if (st == OK) st = emit_zeroes(emit, ctx, root.total_len - pos);
-    if (st == OK && out_size) *out_size = root.total_len;
+    if (st == OK) st = emit_zeroes(emit, ctx, total - pos);
+    if (st == OK && out_size) *out_size = total;
     return st;
 }
 
@@ -772,11 +779,11 @@ status_t content_read_prefix(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE
 
     obj_loader_t ld = obj_loader_store(store);
     chunklist_iter_t *it = NULL;
-    chunklist_hdr_t root;
-    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, &root, &it);
+    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, NULL, &it);
     if (st != OK) return st;
-    size_t want = root.total_len < (uint64_t)max_bytes ? (size_t)root.total_len
-                                                       : max_bytes;
+    /* The length from the iterator, which holds the root header it checked. */
+    uint64_t total = chunklist_iter_total(it);
+    size_t want = total < (uint64_t)max_bytes ? (size_t)total : max_bytes;
     /* One extra byte so a zero-length prefix still returns a buffer. */
     uint8_t *buf = calloc(1, want + 1);
     if (!buf) { chunklist_iter_close(it); return set_error(ERR_NOMEM, "prefix"); }
@@ -797,7 +804,7 @@ status_t content_read_prefix(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE
     if (st != OK) { free(buf); return st; }
     *out_data = buf;
     *out_len = want;
-    if (out_full) *out_full = root.total_len;
+    if (out_full) *out_full = total;
     return OK;
 }
 
@@ -999,16 +1006,25 @@ void content_source_close(content_src_t *cs)
 
 /*
  * An offset resolves to a leaf by descending the list tree: a binary search
- * of each level's entries, at most CHUNKLIST_MAX_LEVEL + 1 lists. Parsed
- * lists and verified leaves are kept in small LRUs, because an NBD client
- * reads a filesystem's metadata over and over and in pieces far smaller
- * than a chunk. Every leaf is the output of object_load, so its hash has
- * been checked before a byte of it is copied out; the parent's promises
- * (type, length, level) are checked on every descent, since one list
- * object can sit under several parents.
+ * of each level's entries, at most CHUNKLIST_MAX_LEVEL + 1 lists. Every leaf
+ * is the output of object_load, so its hash has been checked before a byte
+ * of it is copied out; the parent's promises (type, length, level) are
+ * checked on every descent, since one list object can sit under several
+ * parents.
+ *
+ * What is kept, and under what: one verified leaf, because an NBD client
+ * reads a filesystem's metadata in pieces far smaller than a chunk and
+ * would otherwise load the same chunk for each. That leaf is a buffer in
+ * flight, so it holds its size of the daemon-wide read budget for as long
+ * as it is kept (read_budget.h), and it is let go before anything else is
+ * acquired: before a list is loaded (whose load takes its own slot), before
+ * the next leaf, and when the connection idles (content_reader_drop). That
+ * keeps the reader flat, never two slots at once. The parsed lists are the
+ * walker's index, the same bound chunklist_iter keeps outside the budget:
+ * one per level, CHUNKLIST_MAX_LEVEL + 1.
  */
-#define CR_LISTS 64
-#define CR_LEAVES 4
+#define CR_LISTS (CHUNKLIST_MAX_LEVEL + 1)
+#define CR_LEAVES 1
 
 typedef struct {
     uint8_t         hash[OBJECT_HASH_SIZE];
@@ -1022,6 +1038,7 @@ typedef struct {
     uint8_t *data;             /* NULL: slot free */
     uint64_t len;
     uint64_t used;
+    uint64_t taken;            /* read budget held for data */
 } cr_leaf_t;
 
 struct content_reader {
@@ -1033,6 +1050,28 @@ struct content_reader {
     cr_list_t lists[CR_LISTS];
     cr_leaf_t leaves[CR_LEAVES];
 };
+
+static void cr_leaf_free(cr_leaf_t *l)
+{
+    if (!l->data) return;
+    free(l->data);
+    l->data = NULL;
+    read_budget_release(l->taken);
+    l->taken = 0;
+}
+
+void content_reader_drop(content_reader_t *r)
+{
+    if (!r) return;
+    for (size_t i = 0; i < CR_LEAVES; i++) cr_leaf_free(&r->leaves[i]);
+}
+
+uint64_t content_reader_cache_bytes(const content_reader_t *r)
+{
+    uint64_t n = 0;
+    for (size_t i = 0; i < CR_LEAVES; i++) if (r->leaves[i].data) n += r->leaves[i].taken;
+    return n;
+}
 
 static status_t cr_list(content_reader_t *r, const uint8_t hash[OBJECT_HASH_SIZE],
                         const cr_list_t **out)
@@ -1048,6 +1087,8 @@ static status_t cr_list(content_reader_t *r, const uint8_t hash[OBJECT_HASH_SIZE
         if (!l->buf) victim = l;
         else if (victim->buf && l->used < victim->used) victim = l;
     }
+    /* The list's load takes a budget slot: no leaf may be held then. */
+    content_reader_drop(r);
     obj_loader_t ld = obj_loader_store(r->store);
     uint8_t *buf = NULL;
     chunklist_hdr_t h;
@@ -1076,21 +1117,25 @@ static status_t cr_leaf(content_reader_t *r, const uint8_t hash[OBJECT_HASH_SIZE
         if (!l->data) victim = l;
         else if (victim->data && l->used < victim->used) victim = l;
     }
+    /* Every held leaf goes first: one slot at a time. */
+    content_reader_drop(r);
     void *data = NULL;
     size_t len = 0;
     uint8_t type = 0;
-    status_t st = object_load(r->store, hash, &data, &len, &type);
+    uint64_t taken = 0;
+    status_t st = object_load_budgeted(r->store, hash, &data, &len, &type, &taken);
     if (st != OK) return st;
     if (type != OBJECT_TYPE_FILE || (uint64_t)len != length) {
         free(data);
+        read_budget_release(taken);
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         object_hash_to_hex(hash, hex);
         return set_error(ERR_CORRUPT, "chunk %s: type %u and %zu bytes, list says "
                          "file content of %llu bytes", hex, type, len,
                          (unsigned long long)length);
     }
-    free(victim->data);
     victim->data = data;
+    victim->taken = taken;
     victim->len = len;
     memcpy(victim->hash, hash, OBJECT_HASH_SIZE);
     victim->used = ++r->tick;
@@ -1281,6 +1326,6 @@ void content_reader_close(content_reader_t *r)
 {
     if (!r) return;
     for (size_t i = 0; i < CR_LISTS; i++) free(r->lists[i].buf);
-    for (size_t i = 0; i < CR_LEAVES; i++) free(r->leaves[i].data);
+    content_reader_drop(r);
     free(r);
 }

@@ -4,6 +4,7 @@
 #include "repo_key.h"
 #include "object_crypt.h"
 #include "pack.h"
+#include "pack_ids.h"
 
 #include <openssl/crypto.h>
 #include <cutils/log.h>
@@ -60,6 +61,10 @@ typedef struct {
 struct store {
     char   *path;
     int     dirfd;
+    /* An exclusive flock on tmp/.lock, held from the first time this handle
+     * stages into tmp/ or sweeps it until store_close; -1 when not held.
+     * See store_claim_tmp. */
+    int     tmp_lock_fd;
     /* Dynamic .dat file handle cache (open-addressing hash table) */
     dat_cache_slot_t *dat_cache;
     uint32_t          dat_cache_mask;   /* power-of-2 - 1 */
@@ -91,6 +96,8 @@ struct store {
     void                 *removed_user;
     store_pack_relocate_fn relocate_cb;
     void                 *relocate_user;
+    store_index_sync_fn   sync_cb;
+    void                 *sync_user;
 
     /* Repository key, copied in. has_key is separate from a zero check
      * because an all-zero key is a valid key, just an unlucky one. */
@@ -114,9 +121,23 @@ struct store {
     cdc_params_t       *cdc;
 
     /* Pack numbers handed out to writers open at once; see
-     * store_alloc_pack_num. 0 until the first allocation. */
+     * store_issue_pack_nums. 0 until the first allocation. */
     pthread_mutex_t     pack_num_mu;
     uint32_t            pack_num_next;
+
+    /* The repository's uuid, which turns on the pack-ids mark (pack_ids.h,
+     * store_issue_pack_nums); empty for a bare store. And the floor the
+     * daemon's index puts under every number (store_raise_pack_floor): the
+     * highest pack it has a row or a tombstone for, plus one. Both under
+     * pack_num_mu. */
+    char                uuid[64];
+    int64_t             index_floor;
+    /* The mark this handle last wrote: numbers below it are covered with no
+     * further write (issue_locked). 0 until the first. */
+    int64_t             mark_reserved;
+    /* The next number this handle may issue, as an int64 so that issuing
+     * the last u32 number leaves it at 2^32 rather than wrapping to 0. */
+    int64_t             issued_next;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -249,21 +270,35 @@ done:
  * hand is never the engine's to delete. "tags." is the tag mirror's staging
  * file (repo_tags.c): written by the daemon rather than the store, but a
  * crash between its mkstemp and rename orphans it all the same. */
-static int is_engine_tmp_name(const char *name)
+/*
+ * 1: staging only a holder of tmp/'s claim or of the repository's write
+ * lock ever writes - pack-dat. (every pack writer takes the claim), snap.
+ * and snapids. (backup, a replica sink, reindex and snapshot delete, all
+ * under one or the other), deleting. (gc). 2: staging written under
+ * neither - tags., the tag mirror's, which a tag route writes while a
+ * backup or gc may be running. 0: not the engine's.
+ */
+static int engine_tmp_kind(const char *name)
 {
-    static const char *const prefixes[] = {
-        "pack-dat.", "snap.", "snapids.", "deleting.", "tags.",
-    };
-    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
-        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return 1;
+    static const char *const owned[] = { "pack-dat.", "snap.", "snapids.", "deleting." };
+    for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++)
+        if (strncmp(name, owned[i], strlen(owned[i])) == 0) return 1;
+    if (strncmp(name, "tags.", 5) == 0) return 2;
     return 0;
 }
 
-/* Unlink regular files in <root>/tmp whose mtime is before `cutoff`.
- * `engine_only` limits it to the engine's own staging names. */
+/*
+ * Unlink regular files in <root>/tmp whose mtime is before `cutoff`.
+ * `engine_only` limits it to the engine's own staging names, and holds the
+ * tag mirror's (kind 2) to the hour rule whatever `cutoff` says: the
+ * invariant an age-free sweep relies on is that nothing it may remove can
+ * have a live writer, and only kind 1 staging is written exclusively by
+ * holders of the claim or the write lock the sweeper holds.
+ */
 static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
                               uint64_t *out_bytes)
 {
+    const time_t hour_ago = time(NULL) - 60 * 60;
     char tmp_dir[PATH_MAX];
     if (snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", root) >= (int)sizeof(tmp_dir))
         return 0;
@@ -277,7 +312,10 @@ static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (de->d_name[0] == '.') continue;
-        if (engine_only && !is_engine_tmp_name(de->d_name)) continue;
+        int kind = engine_tmp_kind(de->d_name);
+        if (engine_only && kind == 0) continue;
+        time_t file_cutoff = (engine_only && kind == 2 && cutoff > hour_ago)
+                             ? hour_ago : cutoff;
 
         char path[PATH_MAX];
         if (snprintf(path, sizeof(path), "%s/%s", tmp_dir, de->d_name)
@@ -286,7 +324,7 @@ static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
 
         struct stat sb;
         if (lstat(path, &sb) != 0 || !S_ISREG(sb.st_mode)) continue;
-        if (sb.st_mtime >= cutoff) continue;
+        if (sb.st_mtime >= file_cutoff) continue;
 
         if (unlink(path) == 0) {
             swept++;
@@ -308,9 +346,52 @@ static void store_sweep_tmp(const char *root)
     (void)sweep_tmp_dir(root, time(NULL) - stale_after, 0, NULL);
 }
 
+/*
+ * Claim tmp/ for this handle: an exclusive, non-blocking flock on
+ * tmp/.lock, held until store_close. Every handle that stages into tmp/
+ * (open_new_pack) takes it, and so does every sweep that would remove
+ * staging younger than the hour rule allows. So a sweep that holds the
+ * claim knows no other handle - in this process or another, on this
+ * machine - is writing staging files there: whatever it finds was left
+ * by a writer that is gone. A writer that cannot get the claim writes
+ * anyway (two writers in one repository are the job layer's to prevent);
+ * the claim only decides what a sweep may assume.
+ */
+int store_claim_tmp(store_t *st)
+{
+    if (!st) return 0;
+    if (st->tmp_lock_fd >= 0) return 1;
+    char p[PATH_MAX];
+    if (snprintf(p, sizeof(p), "%s/tmp/.lock", st->path) >= (int)sizeof(p)) return 0;
+    int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return 0;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return 0;
+    }
+    st->tmp_lock_fd = fd;
+    return 1;
+}
+
 unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes)
 {
     if (!st) return 0;
+    /*
+     * Without the claim another handle may be staging right now, so only
+     * what the hour rule would remove anyway goes (store_open's sweep).
+     */
+    if (!store_claim_tmp(st)) {
+        time_t hour_ago = time(NULL) - 60 * 60;
+        if (before > hour_ago) before = hour_ago;
+        log_info("store: another writer holds %s/tmp; sweeping only staging "
+                 "older than an hour", st->path);
+    } else {
+        /* Held: no other handle is staging here, so a file written this
+         * very second is a dead writer's too. The callers sweep before
+         * staging anything themselves. */
+        time_t now = time(NULL);
+        if (before <= now) before = now + 1;
+    }
     return sweep_tmp_dir(st->path, before, 1, bytes);
 }
 
@@ -421,6 +502,7 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->path           = strdup(path);
     if (!r->path) { close(fd); free(r); return set_error(ERR_NOMEM, "store_open: strdup failed"); }
     r->dirfd          = fd;
+    r->tmp_lock_fd    = -1;     /* calloc'd: 0 would be stdin */
     r->dat_cache       = calloc(DAT_CACHE_MIN_SLOTS, sizeof(dat_cache_slot_t));
     r->dat_cache_mask  = DAT_CACHE_MIN_SLOTS - 1;
     r->dat_cache_count = 0;
@@ -436,6 +518,8 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->removed_cb      = NULL;
     r->relocate_cb     = NULL;
     r->relocate_user   = NULL;
+    r->sync_cb         = NULL;
+    r->sync_user       = NULL;
     r->removed_user    = NULL;
     r->cancel          = NULL;
     r->cdc             = NULL;
@@ -480,6 +564,7 @@ void store_close(store_t *st) {
     store_dat_cache_flush(st);
     free(st->dat_cache);
     st->dat_cache = NULL;
+    if (st->tmp_lock_fd >= 0) close(st->tmp_lock_fd);    /* releases the claim */
     close(st->dirfd);
     free(st->path);
     pthread_mutex_destroy(&st->pack_num_mu);
@@ -800,6 +885,17 @@ void store_set_pack_relocate_cb(store_t *st, store_pack_relocate_fn cb, void *us
     st->relocate_user = user;
 }
 
+void store_set_index_sync_cb(store_t *st, store_index_sync_fn cb, void *user) {
+    if (!st) return;
+    st->sync_cb = cb;
+    st->sync_user = user;
+}
+
+status_t store_emit_index_sync(store_t *st) {
+    if (!st || !st->sync_cb) return OK;
+    return st->sync_cb(st->sync_user);
+}
+
 status_t store_emit_pack_relocate(store_t *st, uint64_t pack_id,
                                   const pack_commit_entry_t *e) {
     if (!st || !e) return set_error(ERR_INVALID, "store_emit_pack_relocate: null argument");
@@ -841,11 +937,107 @@ const cdc_params_t *store_cdc(const store_t *st)
     return &g_cdc_defaults;
 }
 
-uint32_t store_alloc_pack_num(store_t *st, uint32_t floor)
+status_t store_set_uuid(store_t *st, const char *uuid)
+{
+    if (!st || !uuid || strlen(uuid) >= sizeof(st->uuid))
+        return set_error(ERR_INVALID, "store_set_uuid: bad uuid");
+    pthread_mutex_lock(&st->pack_num_mu);
+    snprintf(st->uuid, sizeof(st->uuid), "%s", uuid);
+    pthread_mutex_unlock(&st->pack_num_mu);
+    return OK;
+}
+
+void store_raise_pack_floor(store_t *st, int64_t floor)
 {
     pthread_mutex_lock(&st->pack_num_mu);
-    if (st->pack_num_next < floor) st->pack_num_next = floor;
-    uint32_t n = st->pack_num_next++;
+    if (floor > st->index_floor) st->index_floor = floor;
     pthread_mutex_unlock(&st->pack_num_mu);
-    return n;
+}
+
+/*
+ * Every term that can know of a used number, and the mark raised past the
+ * numbers handed out before the caller writes a byte under any of them
+ * (pack_ids.h, rule 1). The mutex is held across the write so that two
+ * writers on one handle cannot both read the same mark; across handles the
+ * repository write lock rules a second writer out.
+ *
+ * The mark is raised a block at a time (PACK_IDS_BLOCK) and the numbers
+ * under it are handed out with no I/O until the block runs out. A backup
+ * opens packs while its index batch holds the database's write lock, and
+ * a file write with two fsyncs per pack inside that lock is what B144
+ * found stalling every other writer; once per block, and the first block
+ * taken before the batch opens (store_reserve_pack_nums), it is noise. A
+ * block left unused when the handle closes is a gap in the numbering,
+ * which the mark allows: it says which numbers may have been used.
+ */
+static status_t issue_locked(store_t *st, uint32_t scanned, uint32_t count, int take,
+                             uint32_t *out_first)
+{
+    int64_t floor = scanned;
+    if (st->issued_next > floor) floor = st->issued_next;
+    if ((int64_t)st->pack_num_next > floor) floor = st->pack_num_next;
+    uint32_t handed = atomic_load(&st->next_pack);
+    if ((int64_t)handed > floor) floor = handed;
+    if (st->index_floor > floor) floor = st->index_floor;
+
+    if (st->uuid[0] && (st->mark_reserved == 0 || floor + (int64_t)count > st->mark_reserved)) {
+        int64_t mark = 0;
+        status_t r = pack_ids_read(st->path, st->uuid, &mark);
+        if (r == OK) {
+            if (mark > floor) floor = mark;
+        } else if (r == ERR_NOT_FOUND || r == ERR_CORRUPT) {
+            /* An older repository, or a file that was lost or damaged: the
+             * disk, the index and this handle are all that is left, and
+             * the file is rewritten from them below. */
+            log_warn("pack-ids: %s; numbering from the packs on disk and the index (%lld)",
+                     err_msg(), (long long)floor);
+            err_clear();
+        } else {
+            return r;
+        }
+        if (floor + (int64_t)count > PACK_IDS_NEXT_MAX)
+            return set_error(ERR_TOO_LARGE, "every pack number has been used");
+        int64_t want = floor + (count > PACK_IDS_BLOCK ? (int64_t)count : PACK_IDS_BLOCK);
+        if (want > PACK_IDS_NEXT_MAX) want = PACK_IDS_NEXT_MAX;
+        status_t w = pack_ids_write(st->path, st->uuid, want);
+        if (w != OK) return w;
+        st->mark_reserved = want;
+    } else if (floor + (int64_t)count > PACK_IDS_NEXT_MAX) {
+        return set_error(ERR_TOO_LARGE, "every pack number has been used");
+    }
+    if (!take) {
+        /* Nothing taken, but the floor the file just gave has to be
+         * remembered: the next issue inside the block reads nothing. */
+        if (floor > st->issued_next) st->issued_next = floor;
+        return OK;
+    }
+    /* Both counters, so store_reserve_pack_num never hands out one of these
+     * either. At 2^32 they wrap to 0, and the mark refuses the next. */
+    st->issued_next = floor + (int64_t)count;
+    st->pack_num_next = (uint32_t)st->issued_next;
+    uint32_t want = st->pack_num_next;
+    uint32_t cur = atomic_load(&st->next_pack);
+    while (cur < want && !atomic_compare_exchange_weak(&st->next_pack, &cur, want)) {}
+    *out_first = (uint32_t)floor;
+    return OK;
+}
+
+status_t store_issue_pack_nums(store_t *st, uint32_t scanned, uint32_t count,
+                               uint32_t *out_first)
+{
+    if (!st || !out_first || count == 0)
+        return set_error(ERR_INVALID, "store_issue_pack_nums: bad argument");
+    pthread_mutex_lock(&st->pack_num_mu);
+    status_t rc = issue_locked(st, scanned, count, 1, out_first);
+    pthread_mutex_unlock(&st->pack_num_mu);
+    return rc;
+}
+
+status_t store_reserve_pack_nums(store_t *st, uint32_t scanned)
+{
+    if (!st) return set_error(ERR_INVALID, "store_reserve_pack_nums: null store");
+    pthread_mutex_lock(&st->pack_num_mu);
+    status_t rc = issue_locked(st, scanned, 1, 0, NULL);
+    pthread_mutex_unlock(&st->pack_num_mu);
+    return rc;
 }

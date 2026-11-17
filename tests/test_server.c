@@ -28,9 +28,14 @@
 #include <cmocka.h>
 
 #include "server.h"
+#include "test_port.h"
 #include "test_tmp.h"
 
-#define TEST_PORT  18731
+/* Chosen by the kernel before each test (FLAKE-13). It was a fixed 18731,
+ * which a second run on the same host - another worktree, another CI job -
+ * already held. */
+static int g_port;
+#define TEST_PORT  g_port
 #define TEST_SOCK  TEST_TMP "/c_backup_test_server.sock"
 
 /* 1 if something accepts a TCP connection on addr:port (host byte order). */
@@ -229,16 +234,97 @@ static void test_empty_bind_means_loopback(void **state)
     api_server_stop(srv);
 }
 
+static int fresh_port(void **state)
+{
+    (void)state;
+    g_port = test_free_port();
+    return g_port > 0 ? 0 : -1;
+}
+
+/* ---------- after-write hook (B139, B140) ---------- */
+
+static int g_after_writes;
+static void count_after_write(void *ud) { (void)ud; g_after_writes++; }
+
+static api_response_t ok_handler(const api_request_t *req, void *ud)
+{
+    (void)req; (void)ud;
+    return api_ok(strdup("{\"ok\":true}"));
+}
+
+static api_response_t fail_handler(const api_request_t *req, void *ud)
+{
+    (void)req; (void)ud;
+    return api_error(400, "no");
+}
+
+/* One request over the unix socket; the status code, or -1. */
+static int unix_request(const char *method, const char *path)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s", TEST_SOCK);
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return -1; }
+    char req[256];
+    int n = snprintf(req, sizeof(req),
+                     "%s %s HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n"
+                     "Content-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                     method, path);
+    if (write(fd, req, (size_t)n) != n) { close(fd); return -1; }
+    char buf[512];
+    ssize_t got = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (got <= 12) return -1;
+    buf[got] = '\0';
+    return atoi(buf + 9);
+}
+
+/*
+ * The hook runs once for each request that changed something and was
+ * answered 2xx, before the answer, and never for a GET or a failure: that
+ * is what makes "the API returned" mean "the edit is on disk".
+ */
+static void test_after_write_runs_for_successful_writes_only(void **state)
+{
+    (void)state;
+    unlink(TEST_SOCK);
+    api_server_t *srv = api_server_create(0, NULL, TEST_SOCK, NULL);
+    assert_non_null(srv);
+    assert_int_equal(api_server_route(srv, "/thing", API_GET, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/thing", API_POST, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/thing", API_PUT, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/thing", API_DELETE, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/bad", API_POST, fail_handler, NULL), 0);
+    g_after_writes = 0;
+    api_server_set_after_write(srv, count_after_write, NULL);
+    assert_int_equal(api_server_start(srv), 0);
+
+    assert_int_equal(unix_request("GET", "/thing"), 200);
+    assert_int_equal(g_after_writes, 0);
+    assert_int_equal(unix_request("POST", "/thing"), 200);
+    assert_int_equal(g_after_writes, 1);
+    assert_int_equal(unix_request("PUT", "/thing"), 200);
+    assert_int_equal(unix_request("DELETE", "/thing"), 200);
+    assert_int_equal(g_after_writes, 3);
+    assert_int_equal(unix_request("POST", "/bad"), 400);
+    assert_int_equal(g_after_writes, 3);
+    api_server_stop(srv);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
-        cmocka_unit_test(test_nothing_listens_until_start),
-        cmocka_unit_test(test_failed_start_leaves_another_socket_alone),
-        cmocka_unit_test(test_second_instance_refused_on_socket_alone),
-        cmocka_unit_test(test_stale_socket_file_is_replaced),
-        cmocka_unit_test(test_restart_rebinds_over_time_wait),
-        cmocka_unit_test(test_create_rejects_what_cannot_work),
-        cmocka_unit_test(test_empty_bind_means_loopback),
+        cmocka_unit_test_setup(test_nothing_listens_until_start, fresh_port),
+        cmocka_unit_test_setup(test_failed_start_leaves_another_socket_alone, fresh_port),
+        cmocka_unit_test_setup(test_second_instance_refused_on_socket_alone, fresh_port),
+        cmocka_unit_test_setup(test_stale_socket_file_is_replaced, fresh_port),
+        cmocka_unit_test_setup(test_restart_rebinds_over_time_wait, fresh_port),
+        cmocka_unit_test_setup(test_create_rejects_what_cannot_work, fresh_port),
+        cmocka_unit_test_setup(test_empty_bind_means_loopback, fresh_port),
+        cmocka_unit_test_setup(test_after_write_runs_for_successful_writes_only, fresh_port),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

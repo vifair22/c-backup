@@ -49,6 +49,40 @@ Directory listings are ordered by name because the index carries `name` as its
 trailing column, making the query a range scan rather than a sort of every
 child.
 
+Every list route, with its page size and order. Each order ends in a unique
+key, so a page is the same page on every request and paging from offset 0
+to the end visits every row once (while nothing is added or removed).
+
+| Route | Default | Maximum | Order |
+|---|---|---|---|
+| `/repos` | 1000 | 1000 | id |
+| `/repos/<id>/snapshots` | 200 | 1000 | id, newest first |
+| `/repos/<id>/snapshots/<sid>/tree` | 200 | 1000 | name |
+| `/repos/<id>/search` | 200 | 1000 | see Snapshots and browsing |
+| `/repos/<id>/grep`, `/repos/<id>/verify` | 20 | 1000 | id, newest first |
+| `/repos/<id>/grep/<run>`, `/repos/<id>/verify/<run>` | 200 | 1000 | id |
+| `/repos/<id>/objects` | 500 | 5000 | hash |
+| `/repos/<id>/objects/<hash>/refs` | 500 | 5000 | snapshot, node |
+| `/repos/<id>/packs` | 500 | 5000 | pack number |
+| `/repos/<id>/packs/<pid>/entries` | 500 | 5000 | offset in the pack |
+| `/repos/<id>/diff` | 2000 | 5000 | tree walk (see Introspection) |
+| `/repos/<id>/tags` | 1000 | 1000 | name |
+| `/repos/<id>/schedules` | 1000 | 1000 | id |
+| `/repos/<id>/journal` | 100 | 1000 | time then id, newest first |
+| `/repos/<id>/units`, `/repos/<id>/units/<key>` | 100 | 1000 | unit name; snapshot id, newest first |
+| `/providers/<p>/units` | 100 | 1000 | the provider's enumeration |
+| `/jobs` | 50 | 1000 | id, newest first |
+
+`packs`, `diff`, `objects/<hash>/refs`, `search`, `tags`, `schedules`
+and `/repos` read no `offset` (the first two not even a `limit`), and the
+journal no `offset`, before B154: the CLI sent them and the daemon answered
+the whole list or the first page again. `/repos`, `tags` and `schedules`
+default to their maximum so a client that does not page sees every row any
+real deployment has. Lists that are bounded by construction do not page:
+`/fanout` (at most 256 buckets), `/stats` (one row per object type),
+`/policy` (the fixed key set), `/sources` (what the operator configured)
+and `/providers`.
+
 A path the API serves, asked with a method it does not answer, is a `405`
 with an `Allow` header listing the methods that work there (`PATCH
 /repos/1` gives `405`, `Allow: GET, DELETE`). Any method other than GET,
@@ -234,9 +268,10 @@ host always has a way in.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/repos` | List |
+| GET | `/repos` | List, by id; `limit` (default and maximum 1000) and `offset` |
 | POST | `/repos` | Register: `{path, label}`; `label` follows the snapshot label rule (at most 256 bytes of printable UTF-8) |
-| GET | `/repos/<id>` | One repository, the same object as each entry of the list |
+| GET | `/repos/<id>` | One repository, the same object as each entry of the list. `state` is `ok`, `degraded` or `unavailable`. `degraded` is null, or why the repository refuses backups (too many packs missing at once); `unavailable` is null, or why the repository is not there to work on (no marker, `packs/` unreadable or replaced, every pack missing), checked when asked. Manual section 17.6 |
+| POST | `/repos/<id>/repair` | `{"accept_missing":true}`: accept a degraded repository's missing packs as lost, marking their objects absent so the next backup stores them again. Without `accept_missing` a 400; 503 while a job holds the repository; 409 when the repository is unavailable (no marker, or `packs/` unreadable). Every pack missing does not stop the repair, and neither does a replaced `packs/` with packs missing from it when the root's marker is the registered one: its new device:inode is recorded (Manual section 17.6). Answers `{packs_checked, packs_missing, packs_unknown, packs_dropped, objects_absent, packs_returned, objects_restored, degraded}`, where `packs_returned` counts dropped packs that were back and indexed again |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it. `{"removed":true,"id"}` |
 
 `POST /repos` normalises the path (no `//`, `.`, `..` or trailing slash) and
@@ -265,6 +300,14 @@ an existing encrypted repository whose key is not on this host still
 succeeds, and the answer carries `key_loaded: false` and a `warning` saying
 `no key loaded for repository <uuid>` and how to supply it.
 
+When the repository holds snapshot records (`<repo>/snapshots/<id>`) that
+the index has no row for - an adopted repository, a replica, one removed
+and added back, or any after `state.db` was lost - either answer carries
+`snapshots_unindexed: N` and, unless the key is missing, `reindex_job: <id>`
+for the reindex the registration queued. That job's `origin` is `register`,
+as is its journal entry's `source`. Until it completes the snapshot list is
+short and a verify checks less than the repository holds.
+
 Repository ids are never reused. Removing the newest repository used to
 make its id the next one handed out, and the new repository inherited the
 old one's schedules, history and index rows, which deregistering does not
@@ -287,11 +330,16 @@ reindex restores it from there rather than resuming above whatever record
 happens to be highest, which would hand an id pruned from the top to the
 next backup. The reindex job's result says what it found
 (`snapshot_mark`, `snapshot_ids_repaired`); see `docs/repo-format.md`.
+Pack numbers have the same guarantee through `<repo>/pack-ids`, and the
+reindex result reports it as `pack_mark` and `pack_ids_repaired`.
 
 A repository is `{id, uuid, path, label, added_at, encryption,
-key_escrowed}`: `label` is `null` when none was given, `encryption` is
-`none`, `system` or `passphrase`, and `key_escrowed` is a boolean that is
-`false` while a system-managed key exists only on this host.
+key_escrowed, state, degraded, unavailable}`: `label` is `null` when none
+was given, `encryption` is `none`, `system` or `passphrase`, and
+`key_escrowed` is a boolean that is `false` while a system-managed key
+exists only on this host. `state` is `ok`, `degraded` or `unavailable`
+(unavailable winning), and `degraded` and `unavailable` are null or the
+reason (Manual section 17.6).
 
 Re-registering is a success rather than a 409 because it is how a moved
 repository re-links. A non-empty `label` that differs from the stored one is
@@ -373,7 +421,12 @@ thirty times. A file whose content changed is a different hash and a
 separate result, so the versions of a file stay visible. To keep a page
 cheap the search reads at most eight matching rows per result asked for
 (8,000 at most) and does not sort; when it stopped there, `partial` is
-`true` and the counts cover what was read. With `snapshot=<sid>` only that
+`true` and the counts cover what was read. `offset` skips results: with
+`snapshot` it skips matching rows, and without one it skips collapsed
+results, reading from the first row enough for `offset + limit` of them
+under the same 8,000-row bound. Results come in first-seen order, so result
+N is the same result on every page; an offset past what the bound can
+reach is an empty page with `partial` true. With `snapshot=<sid>` only that
 snapshot is searched (`snapshots` is 1); one that does not exist is a 404.
 The CLI is `search <id> <text> [--snapshot N]`.
 
@@ -385,11 +438,16 @@ replicating into a fresh repository with `reencrypt` (see Replication) is the
 supported path instead.
 
 `POST /repos` takes `encrypt` (`none`, `system`, `passphrase`) and, for the
-last, a `passphrase`. A non-empty `passphrase` with no `encrypt` means
-`passphrase` mode. A non-empty `passphrase` with `encrypt` `none` or `system`
-is refused with 400 rather than ignored: ignoring it used to create an
-unencrypted repository for somebody who had just typed a passphrase. An empty
-`passphrase` is treated as absent. Creating a repository needs a passphrase
+last, a `passphrase`. A `passphrase` with no `encrypt` means `passphrase`
+mode. A `passphrase` with `encrypt` `none` or `system` is refused with 400
+rather than ignored: ignoring it used to create an unencrypted repository for
+somebody who had just typed a passphrase. Leaving a field out means the
+default (no encryption); a field that is present must carry a valid value.
+An empty or unknown `encrypt` (`""`, `"SYSTEM"`), an empty `passphrase`, and
+either one of the wrong JSON type are each a 400 naming the field, and
+nothing is created: both empty forms used to register an unencrypted
+repository (B127). On an existing repository, an `encrypt` other than its
+own mode is refused, `none` included. Creating a repository needs a passphrase
 of at least 8 characters (400 otherwise); unlocking an existing one accepts
 whatever it was created with.
 
@@ -412,7 +470,7 @@ is deliberately a persistent nag rather than a message shown once.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/repos/<id>/key` | Export the key for escrow |
-| POST | `/repos/<id>/key/import` | Install a key on a host that lacks one: the recovery path after losing the original machine. Refused unless it matches the fingerprint in the marker |
+| POST | `/repos/<id>/key/import` | Install a key on a host that lacks one: the recovery path after losing the original machine. `{key}` is exactly 64 hex characters (whitespace around and between them is ignored); anything longer, shorter or not hex is a 400. Refused unless it matches the fingerprint in the marker |
 | POST | `/repos/<id>/key/ack` | Confirm the key is stored elsewhere; clears the warning |
 
 All three answer 400 `repository is not encrypted` for an unencrypted
@@ -497,7 +555,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/backup` | `{paths:[...], label, exclude:[...], one_filesystem}`; with no `paths`, the repository's configured sources are used. `label` is at most 256 bytes of well-formed UTF-8 with no control characters (C0, DEL or C1); anything else is `400 {"error":"label must be at most 256 bytes of printable text"}` |
 | GET/PUT | `/repos/<id>/sources` | What this repository backs up: `{sources:[...], exclude:[...]}` |
 | POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite, subpath}` |
-| POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only |
+| POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only. On gc, gfs and verify, `dry_run` and `repair` take `1`, `true`, `0` or `false`; any other value, empty included, is a 400 rather than read as off |
 | POST | `/repos/<id>/gfs` | Apply retention |
 | POST | `/repos/<id>/reindex` | Rebuild the index from the repository; the job fails if any snapshot or pack cannot be read, and what could not be read keeps its previous rows |
 | POST | `/repos/<id>/grep` | Content search as a job: `{pattern, snapshot, path_prefix, ignore_case, max_files}` |
@@ -506,7 +564,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing, `?dry_run=1` (or `true`) the same and overriding any `repair` |
 | GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) and `offset` |
 | GET | `/repos/<id>/verify/<run-id>` | The findings from one run, paginated |
-| POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt}` |
+| POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt, allow_plaintext}` |
 
 `subpath` restores one path out of the snapshot instead of all of it, so
 pulling a single file back does not cost a full restore. It accepts the path
@@ -670,11 +728,43 @@ plain verify, with the same counts on a healthy repository. The job's
 `result` says which kind of run it was, since the run record does not:
 
 ```json
-{"run_id":12,"level":"deep","repair":false,"dry_run":true,"unsettled_files":0}
+{"run_id":12,"level":"deep","repair":false,"dry_run":true,"checked":52,
+ "ok":52,"repaired":0,"recoverable":0,"unrecoverable":0,"missing":0,
+ "failed":false,"unsettled_files":0,
+ "pack_structures_repaired":0,"pack_structures_recoverable":0,
+ "packs_unwalkable":0,"packs_restored":0,"packs_salvaged":0,
+ "unreferenced_dropped_bytes":0,"unreferenced_dropped_ranges":0,"unreferenced_dropped":[]}
 ```
+
+The counts are the run's (table below), and `failed` is true exactly when
+`unrecoverable` or `missing` is non-zero, which is when the job fails.
 
 `unsettled_files` is how many file entries the run found flagged as
 possibly torn (below); a notice, never a failure.
+
+`pack_structures_recoverable` and `pack_structures_repaired` count packs
+whose own header, tail copies or CRC table disagreed with their redundancy
+(within parity, so not loss): found by every level, each a `pack-NNNNNNNNNN`
+finding with status `recoverable`, or `repaired` when a repairing run
+rewrote them. Each such pack is also one item in the run's totals: it adds
+one to `checked` and one to `recoverable` or `repaired`, so the counts on
+the run record (`GET /repos/<id>/verify`, what `c-backup verify` prints and
+the verify metrics read) agree with its findings. These two fields say how
+much of those totals is pack structure rather than objects.
+
+`packs_unwalkable` counts packs whose entry headers cannot be walked even
+with parity (the packs gc leaves as they are); each is a finding named
+`pack-NNNNNNNNNN` with status `unwalkable pack`, at every level, and fails
+the run. `packs_restored` counts those a repairing run made walkable again
+by rebuilding their headers from the index; each is a `repaired` finding,
+and counted like one: one in `checked` and one in `repaired`.
+`packs_salvaged` counts packs that could not be rebuilt (a damaged header
+had no index row) and were salvaged instead: every indexed entry copied into
+a new pack, a `salvaged` finding, and the bytes no row covers dropped and
+reported as `unreferenced_dropped_bytes`, `unreferenced_dropped_ranges` and
+`unreferenced_dropped` (first 16, `{"pack","offset","length"}` in the old
+pack). An indexed entry damaged beyond parity is carried as it is and stays
+an `unrecoverable` finding.
 
 `run_id` is null when the walk did not finish (cancelled or aborted); the
 partial run is still in `GET /repos/<id>/verify`, with `completed` false.
@@ -693,10 +783,10 @@ A run (`GET /repos/<id>/verify`) carries these counts:
 
 | Field | Meaning |
 |---|---|
-| `checked` | Objects examined |
-| `ok` | Intact on disk |
-| `repaired` | Damaged, corrected from parity, and the correction written to disk. Always 0 with `repair=0` |
-| `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed |
+| `checked` | Items examined: every indexed object, plus every regular-file entry that names no content, plus each `pack-NNNNNNNNNN` finding counted as `recoverable` or `repaired` (a pack whose header, tails or CRC table were damaged, or whose headers were restored). Always `ok + repaired + recoverable + unrecoverable + missing` |
+| `ok` | Intact on disk. Never counts a failure: a run with anything missing or unrecoverable has `ok` below `checked` |
+| `repaired` | Damaged, corrected from parity, and the correction written to disk; or an object whose indexed copy is beyond parity, moved by the run to another copy proven to be it (below). Always 0 with `repair=0` |
+| `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed. Also an object whose indexed copy is beyond parity while another copy of it is proven intact, with repair off |
 | `unrecoverable` | Damaged beyond what parity can rebuild. Data loss |
 | `missing` | Indexed but absent: no pack entry, or a pack file that has gone. Also each index row of a regular file that names no file content: no object, or one that is neither `FILE` nor `CHUNKLIST` (see below). Data loss |
 | `affected_files` | Distinct file paths referencing a lost object |
@@ -725,13 +815,26 @@ they are gone.) Each finding also carries:
 An object no file references - a manifest tree, or one from an evicted
 snapshot - reports zero files; that is not a claim the loss is harmless.
 
+An object whose indexed copy cannot be read even with parity is not loss
+if the repository holds another copy of it: two backups can store one
+object before either commits it, and gc keeps the other copy and moves the
+index to it once proven (`index_relocated`). Verify runs the same search
+before it calls anything lost: every pack's entry headers are walked and a
+copy that is not the indexed one is read and checked against its name, as
+gc proves one. With such a copy the object is `recoverable` (repair off;
+the log names the pack and offset of the good copy) or `repaired` (the run
+moved the index to it and read the object back through it). Without one it
+is lost as before. The search runs only when the walk found something
+unreadable, so a clean run pays nothing for it. An encrypted copy cannot be
+proven without the key.
+
 Every level also checks the index for regular files that name no content
-object: a file a snapshot lists and no restore can produce. Backups before
-the B118 fix recorded a file that was skipped during the store phase that
-way. These are one finding with `hash` `""` and `status` `missing: file
+object: a file a snapshot lists and no restore can produce. Backups by a
+c-backup older than 1.0.0 recorded a file that was skipped during the store
+phase that way. These are one finding with `hash` `""` and `status` `missing: file
 entry has no content`, its `affected_*` fields and `sample_paths` naming
-the files and snapshots, and each such row counts once in `missing`, so
-the run fails. A backup no longer writes such an entry (see the backup
+the files and snapshots, and each such row counts once in `checked` and
+once in `missing`, so the run fails and `ok` stays below `checked`. A backup no longer writes such an entry (see the backup
 `result` below), and the tree writer refuses one.
 
 Every level also lists the file entries flagged as possibly torn - stored
@@ -817,7 +920,15 @@ comparison and an unchanged repository replicates in one question.
 encryption. `dest` must already be a repository with an identity of its
 own (create it with `POST /repos` and the encryption wanted); each object is
 decrypted with the source key and encrypted under the destination's, or
-written plaintext into an unencrypted destination. Names are of the
+written plaintext into an unencrypted destination. That last case, an
+encrypted source into an unencrypted destination, is a 400 (`this
+repository is encrypted and the target is not, so the copy would hold every
+file in plaintext; ...`) unless the request also sets `"allow_plaintext":
+true`, a JSON boolean (anything else is `allow_plaintext must be true or
+false`; with no `reencrypt` it is `allow_plaintext applies only with
+reencrypt`). The check is repeated when the job runs. An allowed run logs a
+warning and journals `replicated encrypted repo N into plaintext at <path>`
+on the source. Unencrypted into unencrypted needs no flag. Names are of the
 plaintext, so they and the trees carry over unchanged, as do snapshot ids;
 a snapshot id the destination already uses for another tree fails the run
 instead of being overwritten. The job fails, saying which, when `dest` is
@@ -908,9 +1019,10 @@ for a removal) while a job holds the repository.
 
 A job record carries `origin`, who asked for it: `api` for anything submitted
 over the API (the CLI and the app both are), `schedule` for the scheduler, with
-`schedule_id` naming the schedule (null otherwise), or `startup` for a reindex
+`schedule_id` naming the schedule (null otherwise), `startup` for a reindex
 the daemon queued itself at start because the index had lost snapshots the
-repository holds (Manual section 17.5).
+repository holds (Manual section 17.5), or `register` for the reindex a
+repository registration queues (`POST /repos`).
 
 `/jobs/stream/<id>` sends one `data:` frame at once with the job's state as it
 is, then a frame whenever it changes, and the same frame again every 5 seconds
@@ -933,16 +1045,16 @@ stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it, and journalled then with that message:
 a daemon that was killed had no chance to journal it itself.
 
-A journal entry's `source` is the job's origin: `api`, `startup`, or
+A journal entry's `source` is the job's origin: `api`, `startup`, `register`, or
 `schedule` with the message starting `schedule <id>`.
 
 What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `dups_dropped`, `dups_kept` and `index_relocated` (OWN-22 duplicate copies dropped behind a confirmed indexed copy, kept because the indexed copy could not be confirmed, and index rows moved off such a copy onto a proven one), `packs_unwalkable`, `unwalkable` (first 16, `{"pack","reason"}`), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` or `packs_unwalkable` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
-| reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten) |
+| reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten), `pack_mark` (the lowest pack number never issued, as `<repo>/pack-ids` now holds it), `pack_ids_repaired` (`true` when that file was missing, damaged or behind the packs on disk or the index, and was rewritten) |
 
 A backup's `result` has its counts (`snapshot_id`, `files`, `dirs`,
 `files_unchanged`, `bytes_logical`, `objects_new`, `bytes_stored`,
@@ -964,7 +1076,7 @@ small-file workers. The job still completes (Manual section 6.3), and says so:
 | `files_skipped` | Every file left out. Always present; `0` on a clean run |
 | `skipped` | The first 100 of them, in scan order, each `{"path","reason"}`; `[]` when none |
 | `skipped_listed` | How many `skipped` holds; less than `files_skipped` when more than 100 were left out |
-| `files_changed` | Files whose size or times had changed by the time they were read (since the scan, or during a read that was then repeated) and that were stored as read: one whole version, its size and mtime in the snapshot. Always present |
+| `files_changed` | Files whose size, times or inode (a file replaced by rename) had changed by the time they were read (since the scan, or during a read that was then repeated) and that were stored as read: one whole version, its size and mtime in the snapshot. Always present |
 | `changed` | The first 100 of them, as paths; `[]` when none |
 | `changed_listed` | How many `changed` holds |
 | `changed_unsettled` | Files still changing on the second read and stored as it found them, flagged as possibly torn (`backup.unsettled: store`, the default). Not in `files_changed`. Always present |
@@ -977,9 +1089,11 @@ A file is skipped for still changing on its second read only under
 
 `reason` reads `cannot open: it no longer exists`, `cannot open:
 Permission denied` (or another errno text), `no longer a regular file (now
-a directory)`, `no longer a regular file (now a symlink)` (never
-followed: B128), `no longer a regular file`, `replaced by another file since
-the scan` (another inode now holds the path), `changed while it was being
+a symlink)` (or `a directory`, `a FIFO`, `a socket`, `a character device`,
+`a block device`; a symlink is never followed), `a directory on its path is
+now a symlink; not followed`, `its path now crosses a mount point or leaves
+the source; not followed` (a one-filesystem backup; Manual section 6.3),
+`changed while it was being
 read, and again on a second read` (a file still changing when read a second
 time; Manual section 6.3), or `cannot read: ` followed by the store's
 error. Each is also a `WARN` line in the daemon log, `backup:
@@ -1009,7 +1123,10 @@ logged after the backup's phase profile.
 
 Gc and replicate also put a one-line summary in their journal entry, such
 as `swept 12 objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale
-temp files removed` or `target already up to date (3 snapshots present)`. A
+temp files removed` or `target already up to date (3 snapshots present)`.
+A verify that passes journals its run's totals, such as `deep verify (check
+only), run 12: 53 checked, 52 ok, 0 repaired, 1 recoverable (1 of them pack
+structure)`; one that fails journals its error, which carries them. A
 dry-run gc removes nothing, temp files included; its pack figures are zero
 because compaction does not run.
 
@@ -1053,13 +1170,13 @@ header_size`, which equals `phys_size`. An object that reports `phys_size`
 
 | GET | `/repos/<id>/objects` | Paginated; `?location=staged`, `?location=pack` (or `packed`), or `?location=all` |
 | GET | `/repos/<id>/objects/<hash>` | Where one object lives |
-| GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it |
+| GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it; `limit` (default 500, at most 5000) and `offset` |
 | GET | `/repos/<id>/objects/<hash>/layout` | Header fields and on-disk footprint |
 | GET | `/repos/<id>/objects/<hash>/content` | Base64, capped at 2 MiB |
-| GET | `/repos/<id>/packs` | Pack listing with entry counts |
+| GET | `/repos/<id>/packs` | Pack listing with entry counts, by pack number; `limit` (default 500, at most 5000) and `offset` |
 | GET | `/repos/<id>/packs/<pid>/entries` | Contents of one pack, paginated |
 | GET | `/repos/<id>/fanout` | Hash-prefix histogram |
-| GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots |
+| GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots; `limit` (default 2000, at most 5000) and `offset` page the changes |
 
 An object's `refcount` is the number of references to it as the last `gc`
 or `reindex` counted them, not a live count: a backup records the objects it
@@ -1106,6 +1223,18 @@ with the same hash have identical contents by construction, so an unchanged
 subtree is pruned in a single comparison instead of being read. That is the
 same property that makes incremental backups cheap, applied to reading.
 
+`/diff` pages its `changes`. The walk is deterministic (both trees merged
+in name order, depth first), so the Nth change is the same change on every
+request for the same two snapshots. A page is cut from the walk as it runs:
+changes before `offset` are counted and dropped, and changes past `offset +
+limit` are counted and set `truncated`. So `added`, `removed` and
+`modified` always cover the whole comparison, `truncated` is `true` exactly
+when more changes follow this page, and neither the response nor the walk
+holds more than a page of changes and one tree per directory level. Each
+page walks the changed part of the trees again; the unchanged part is
+pruned as always. The default page is 2000, the cap the route had before it
+paged, so a client that does not page sees what it always did.
+
 ## Metadata
 
 | Method | Path | Purpose |
@@ -1114,7 +1243,16 @@ same property that makes incremental backups cheap, applied to reading.
 | DELETE | `/repos/<id>/tags/<name>` | Remove; `{"removed":true,"name"}`, 404 if there is no such tag |
 | GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}`; 404 for a snapshot that does not exist |
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
-| GET | `/repos/<id>/journal` | Operation history: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded |
+| GET | `/repos/<id>/journal` | Operation history, newest first: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded. `limit` (default 100, at most 1000), `offset`, and `result` |
+
+`result` filters the journal on one of the values anything journals:
+`success`, `failed` and `cancelled` for how a job ended, `warning` and
+`alert` for advisories. Anything else is a 400 `result must be one of:
+success, failed, cancelled, warning, alert`; it used to answer an empty
+list, which reads as a clean history (NIT-32).
+
+`/tags` pages by name and `/schedules` by id, each `limit` (default and
+maximum 1000) and `offset`.
 
 Setting a tag or a note on a snapshot that does not exist is a 404, and a tag
 with no name is a 400. Removing a tag that is not there is a 404 `no such
@@ -1252,15 +1390,18 @@ time:
 {"action":"gc","trigger":{"type":"calendar","every":"year","on_month":1,"on_day":1,"at":"05:00"}}
 ```
 
-`every` is `day`, `week` (with `on`, a weekday name), `month` (with
+`every` is `day`, `week` (with `on`, a weekday: the full name or its first
+three letters, in any case, stored and served as the full lowercase name),
+`month` (with
 `on_day`, 1-31) or `year` (with `on_month` and `on_day`, a day that month
 has: 30 February and 31 April are refused, 29 February is accepted). There
 is no cron syntax. The CLI builds the same with `--every`, `--at`, `--on`, `--on-day`
 and `--on-month`, or takes a number of seconds for an interval.
 
-Interval triggers anchor to the last successful fire, not to wall-clock
-multiples: a four-hour backup that runs long should not be due the moment it
-finishes.
+Interval triggers anchor to the last time the schedule fired, or until its
+first fire to when it was created, not to wall-clock multiples: a four-hour
+backup that runs long should not be due the moment it finishes. A daemon
+restart does not move the anchor.
 
 Calendar triggers use local time, which is what someone means by "02:00".
 That choice creates the DST cases, all handled: a time that does not exist on
@@ -1335,7 +1476,9 @@ it); a unit outside it is not listed and cannot be described or backed up.
 | GET | `/repos/<id>/units` | Units with history here: last snapshot, its level, how many, paginated by name |
 | GET | `/repos/<id>/units/<p>/<u>/snapshots` | That unit's snapshots, newest first, each with its level and items (`read_mode`, `reason`, `bytes_read`) |
 | GET/PUT | `/repos/<id>/units/<p>/<u>/policy` | Per-unit policy: `retention.keep_*` keys over the repository's; `capture.exclude` (patterns on recorded paths, one per line, applied only when set); `capture.group` (units captured together under `pause_scope: group`); `null` or `""` drops one; GET shows the unit's own and what is in force |
-| POST | `/repos/<id>/units/backup` | `{"provider":"fake","all":true,"exclude":["x*"]}` or `{"provider":"fake","units":["a"]}`, optional `"require":"crash"` (the default) and `"pause_scope":"unit"` (the default), `"group"` (units sharing a `capture.group` captured together) or `"job"` (every unit at one instant); 202 with a job. The job fails when any unit fails, and its result lists each unit's outcome and snapshot |
+| GET | `/repos/<id>/units/<p>/<u>/checkpoints` | The unit's incremental chain (vm-backup.md 5.8): `incremental` (`enabled`, `disabled_reason` and `disabled_at` after a failed audit, `last_audit_at`, `audit_days`, `delta_full_pct`) and `tokens`, one per disk: `item`, `checkpoint`, the `snapshot` it describes, `usable`, `identity`, `created_at` |
+| POST | `/repos/<id>/units/<p>/<u>/reset-incremental` | After a failed bitmap audit: incrementals back on for the unit, every token made unusable so the next backup is a full read under a new checkpoint (the old one is retired when it commits). Journalled. Answers `unit_key` and `was_disabled`, the reason they were off |
+| POST | `/repos/<id>/units/backup` | `{"provider":"fake","all":true,"exclude":["x*"]}` or `{"provider":"fake","units":["a"]}`, optional `"require":"crash"` (the default) and `"pause_scope":"unit"` (the default; a `units` schedule stores and honours it too, `--pause-scope` from the CLI; any other key is refused), `"group"` (units sharing a `capture.group` captured together) or `"job"` (every unit at one instant); 202 with a job. The job fails when any unit fails, and its result lists each unit's outcome and snapshot |
 | POST | `/repos/<id>/snapshots/<sid>/unit/restore` | `{"mode":"files","dest":"/abs/dir"}`, the whole snapshot with each disk as a sparse raw file; or `{"mode":"item","item":"vda","dest":"/abs/file","format":"raw"}`, one item, written through `<dest>.cbk-partial` and never over an existing path; or `{"mode":"unit","replace":true}` (in place: stopped, staged, swapped, the old data moved aside) or `{"mode":"unit","name":"N","target_root":"/abs"}` (a new unit with its data under the target root), with optional `pin_digest`, `start`, `keep_macs`; the definition is re-created through the helper. 202 with a job |
 
 A retention pass (`POST /repos/<id>/gfs`) runs once per retention group: the
@@ -1350,16 +1493,22 @@ without restoring the image:
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/repos/<id>/snapshots/<sid>/unit/export` | `{"item":"vda","ttl_s":14400}` (`ttl_s` 60 to 604800, default `vm.export_ttl_s`). 201 with `export_id`, `socket`, `name`, `size`, `expires` (wall clock), `idle_timeout_s` and an `attach` command line. The `name` (128 random bits) is returned here only; 400 for an item that is not a disk, 404 for no such snapshot or item, 503 while gc or another writer holds the repository |
-| GET | `/exports` | Open exports: id, repo, snapshot, item, socket, size, caller, created and expiry times, live `connections` and `bytes_served`; never the name |
-| GET | `/exports/<id>` | One, open or closed; a closed one has `closed_at` and `close_reason` (`revoked`, `expired`, `idle`, `daemon stopped`, `daemon restarted`) |
+| GET | `/exports` | Open exports: id, repo, snapshot, item, socket, size, caller, created and expiry times, live `connections`, `bytes_served` and `cache_bytes` (read budget its connections hold); never the name |
+| GET | `/exports/<id>` | One, open or closed; a closed one has `closed_at` and `close_reason` (`revoked`, `expired`, `idle`, `repository removed`, `daemon stopped`, `daemon restarted`) |
 | DELETE | `/exports/<id>` | Revoke: disconnect every client, remove the socket, close. 204 |
 
 An open export pins its snapshot: deleting it is refused even with
 `force` (`ERR_BUSY`, the message names the export) and retention keeps it
-as if tagged; a gc on its repository fails with "gc deferred" and runs
-again on its next schedule. An export closes at its expiry, after
-`vm.export_idle_s` with no connection, when revoked, and when the daemon
-stops; the ids are `AUTOINCREMENT` and opening and closing are journalled
+as if tagged. A gc on its repository waits in the queue, phase "waiting for
+an NBD export to close", and runs once the export closes; the export's ttl
+(at most 7 days) bounds that wait. Removing the repository revokes its
+exports first. Each connection holds at most one chunk of the read budget
+while it reads and none once it idles for a second; `vm.export_max_conns`
+(default 4, 0 turns exports off) caps connections across every export, and
+the daemon refuses to start when `jobs.read_budget_mb` cannot hold that
+many 16 MiB chunks beside a job's 48 MiB. An export closes at its expiry,
+after `vm.export_idle_s` with no connection, when revoked, when its
+repository is removed, and when the daemon stops; the ids are `AUTOINCREMENT` and opening and closing are journalled
 with the caller. The server speaks fixed newstyle with structured replies,
 `NBD_OPT_GO`/`INFO`, `base:allocation` (the snapshot's holes are holes to
 the client), `READ`, `BLOCK_STATUS` and `DISC`; writes are refused with

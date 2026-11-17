@@ -3,6 +3,7 @@
 
 #include "util.h"
 #include "backup.h"
+#include "read_budget.h"
 
 #include "file_cache.h"
 #include "cdc.h"
@@ -11,9 +12,11 @@
 #include "object.h"
 #include "scan.h"
 #include "store_index.h"
+#include "pack_presence.h"
 #include "store_pool.h"
 #include "small_files.h"
 #include "settle.h"
+#include "open_scanned.h"
 #include "read_budget.h"
 #include "db_txn.h"
 #include "phase_timer.h"
@@ -22,6 +25,7 @@
 #include "snapshot_ids.h"
 #include "tree_build.h"
 #include "reserved.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
@@ -82,8 +86,7 @@ typedef struct {
 typedef struct {
     int      in_txn;
     uint32_t since_commit;
-    uint64_t opened_ns;           /* phase_now() at the batch's BEGIN */
-    uint64_t contended_until_ns;  /* B107's rules apply until then */
+    db_txn_batch_t rule;          /* when to let the lock go (db_txn.h) */
 } batch_t;
 
 typedef struct {
@@ -149,6 +152,9 @@ typedef struct {
     int            held_pending;
     scan_imap_t   *imap;
     const scan_opts_t *sopts;
+    /* Each source root, opened once for the store phase: every file is
+     * opened beneath its root, never by its whole path (open_scanned.h). */
+    scan_roots_t  *roots;
 } pipeline_t;
 
 /*
@@ -224,6 +230,19 @@ static void skip_file(pipeline_t *p, uint32_t i, const char *reason)
     r->skipped[r->skipped_listed].path   = path;
     r->skipped[r->skipped_listed].reason = why;
     r->skipped_listed++;
+}
+
+/*
+ * Open scan entry i beneath its source root (open_scanned.h, B128), or
+ * leave it out with the reason (skip_file) and return -1.
+ */
+static int open_for_store(pipeline_t *p, uint32_t i, struct stat *fst)
+{
+    char why[320];
+    int fd = open_scanned(p->roots, &p->scan->entries[i],
+                          p->opts->one_filesystem, fst, why, sizeof(why));
+    if (fd == -1) skip_file(p, i, why);
+    return fd;
 }
 
 void backup_result_free(backup_result_t *r)
@@ -621,8 +640,8 @@ static void scan_progress(uint32_t scanned, void *ctx)
  *     before B107, and is held across large files and pool waits.
  *   - A writer queues: the batch ends at the next check, so it waits for
  *     one entry or one read at most, and the batch becomes contended for
- *     BATCH_CONTENDED_MS from the last time a waiter was seen.
- *   - Contended: B107's rules - commit after BATCH_CONTENDED_HOLD_MS, and
+ *     DB_TXN_BATCH_CONTENDED_MS from the last time a waiter was seen.
+ *   - Contended: B107's rules - commit after DB_TXN_BATCH_HOLD_MS, and
  *     let go before reading a file of BATCH_YIELD_BYTES or more and before
  *     waiting on the workers - rather than letting go at every check.
  *
@@ -635,8 +654,9 @@ static void scan_progress(uint32_t scanned, void *ctx)
  * so of B107's, not a sync per large file for the rest of the backup.
  */
 #define BATCH_ENTRIES           2000
-#define BATCH_CONTENDED_MS      1000
-#define BATCH_CONTENDED_HOLD_MS 200
+/* The waiter and contended rules themselves are db_txn's
+ * (db_txn_batch_should_end), shared with the pack commit, so the two
+ * holders that run side by side in a backup cannot drift apart. */
 #define BATCH_YIELD_BYTES       ((uint64_t)4 << 20)
 
 static void batch_open(pipeline_t *p, batch_t *b)
@@ -645,12 +665,12 @@ static void batch_open(pipeline_t *p, batch_t *b)
     if (db_txn_begin(p->db) == OK) b->in_txn = 1;
     else err_clear();
     b->since_commit = 0;
-    b->opened_ns = phase_now();
+    db_txn_batch_opened(&b->rule);
 }
 
 static int batch_contended(const batch_t *b)
 {
-    return b->contended_until_ns > phase_now();
+    return db_txn_batch_contended(&b->rule);
 }
 
 static void batch_close(pipeline_t *p, batch_t *b)
@@ -664,21 +684,13 @@ static void batch_close(pipeline_t *p, batch_t *b)
 
 /*
  * A check point: let the batch go if somebody newly wants the lock, or if it
- * is contended and has been held for BATCH_CONTENDED_HOLD_MS. A waiter's
+ * is contended and has been held for DB_TXN_BATCH_HOLD_MS. A waiter's
  * transaction runs next, and this thread's next batch_open queues behind it.
  */
 static void batch_yield(pipeline_t *p, batch_t *b)
 {
     if (!b->in_txn) return;
-    uint64_t now = phase_now();
-    if (db_txn_waiters() > 0) {
-        int was = b->contended_until_ns > now;
-        b->contended_until_ns = now + (uint64_t)BATCH_CONTENDED_MS * 1000000ULL;
-        if (!was) { batch_close(p, b); return; }
-    }
-    if (b->contended_until_ns > now &&
-        now - b->opened_ns >= (uint64_t)BATCH_CONTENDED_HOLD_MS * 1000000ULL)
-        batch_close(p, b);
+    if (db_txn_batch_should_end(&b->rule)) batch_close(p, b);
 }
 
 /* One entry recorded: end the batch at its size, or for a waiter. */
@@ -1091,8 +1103,7 @@ static status_t small_queue(pipeline_t *p, batch_t *b, uint32_t index)
     if (!p->sbatch && !(p->sbatch = small_batch_new()))
         return set_error(ERR_NOMEM, "backup: small-file batch");
     const scan_entry_t *e = &p->scan->entries[index];
-    if (small_batch_add(p->sbatch, index, e->read_path ? e->read_path : e->path,
-                        e->node.size, &e->st))
+    if (small_batch_add(p->sbatch, index, e))
         return small_submit(p, b);
     return OK;
 }
@@ -1119,15 +1130,19 @@ static status_t store_file_cdc(pipeline_t *p, batch_t *b, int fd, uint64_t size,
         size = (uint64_t)now.st_size;
     int large = size > OBJECT_MAX_BYTES;
     /*
-     * The batch is let go only when the file may not fit in the open pack:
-     * then the sink has to be able to seal mid-file, and sealing begins a
-     * transaction. A file that fits keeps the batch, so a backup with nobody
-     * waiting commits no more often than it did (OWN-16). The margin covers
-     * an entry header per chunk; stored chunks are never larger than their
-     * plaintext.
+     * A file over one object's bound may seal the pack mid-file, so the
+     * batch is let go first: sealing begins a transaction (OWN-16). Every
+     * such file, not only one that looks as if it will not fit (B134).
+     * That test asked pack_backup_full, which answers "not full" for a
+     * pack with nothing in it - so the first large file into a fresh writer
+     * was cut with no way to seal, and at the pack bound the append refused
+     * the next chunk and the file was left out. And a size known before
+     * the read is a guess: the read is the file's own size (settle), and a
+     * file that grows while it is read, or is read twice, is larger than
+     * any figure taken here. Smaller files never need it: the loop seals
+     * before each entry with a whole object's headroom.
      */
-    int may_seal = large &&
-        pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES);
+    int may_seal = large;
     if (may_seal) batch_close(p, b);
 
     obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
@@ -1183,6 +1198,41 @@ static status_t store_source_cdc(pipeline_t *p, batch_t *b, const cdc_source_t *
     return st;
 }
 
+/* An incremental store of a disk (vm-backup.md 5.3): the same sink and
+ * pack handling as a full one, the base's lists read from the store. */
+static status_t store_delta_cdc(pipeline_t *p, batch_t *b, const cdc_source_t *src,
+                                uint64_t size, const backup_synth_method_t *how,
+                                cdc_result_t *out)
+{
+    const cdc_params_t *cp = store_cdc(p->store);
+    if (!cp)
+        return set_error(ERR_INVALID, "repository is encrypted and no key is "
+                         "loaded: its chunk boundaries need the key");
+    if (size == CDC_SIZE_STREAM || size == 0)
+        return set_error(ERR_INVALID, "backup: an incremental needs a disk of known size");
+    int large = size > OBJECT_MAX_BYTES;
+    int may_seal = large && pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES);
+    if (may_seal) batch_close(p, b);
+    obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
+    obj_loader_t ld = obj_loader_store(p->store);
+    cdc_opts_t o = {
+        .workers = large ? p->cdc_w : NULL,
+        .cancel = p->opts ? p->opts->cancel : NULL,
+        .cancelled = store_cancelled_cb,
+        .cancelled_ctx = p->store,
+        .progress = store_bytes,
+        .progress_ctx = p,
+    };
+    cdc_delta_result_t dr;
+    p->sink->may_rollover = may_seal;
+    status_t st = cdc_store_delta(cp, &ld, how->base, src, size, how->changed, how->changed_ctx,
+                                  &sink, &o, &dr);
+    p->sink->may_rollover = 0;
+    *out = dr.r;
+    if (how->delta) *how->delta = dr;
+    return st;
+}
+
 /*
  * Every synthetic entry, in the order the caller gave them, before any
  * regular file: the caller's last entry (unit.json) describes what the
@@ -1224,13 +1274,28 @@ static status_t store_synth_all(pipeline_t *p)
         e->node.size = stream ? 0 : size;
         e->st.st_size = stream ? 0 : (off_t)size;
 
+        backup_synth_method_t how;
+        memset(&how, 0, sizeof(how));
+        if (o->synth_ops->method && (st = o->synth_ops->method(o->synth_ops->ctx, k, &how)) != OK) {
+            if (o->synth_ops->close) o->synth_ops->close(o->synth_ops->ctx, k, st, NULL);
+            break;
+        }
         cdc_result_t cr;
         memset(&cr, 0, sizeof(cr));
         batch_open(p, b);
         p->file_bytes = 0;
         p->file_size = stream ? 0 : size;
         p->file_index = i;
-        st = store_source_cdc(p, b, &src, size, &cr);
+        if (how.how == BACKUP_SYNTH_REUSE && !stream) {
+            /* Provably the base's content: nothing read, nothing stored. */
+            memcpy(cr.hash, how.base, OBJECT_HASH_SIZE);
+            cr.size = size;
+            st = OK;
+        } else if (how.how == BACKUP_SYNTH_DELTA) {
+            st = store_delta_cdc(p, b, &src, size, &how, &cr);
+        } else {
+            st = store_source_cdc(p, b, &src, size, &cr);
+        }
         p->file_bytes = 0;
         p->res->objects_new  += cr.chunks_new + cr.lists.lists_new;
         p->res->bytes_stored += cr.phys_new;
@@ -1293,9 +1358,8 @@ static status_t store_content(pipeline_t *p)
      * number); each worker holds at most a few max-size chunk buffers.
      */
     unsigned workers = 1;
-    size_t parity_cap = 0;
     store_pool_plan(p->opts->store_workers,
-                    (n_large || small_par) ? UINT32_MAX : 0, &workers, &parity_cap);
+                    (n_large || small_par) ? UINT32_MAX : 0, &workers);
     if (workers > 1 && n_large) {
         if (cdc_workers_start(workers, &p->cdc_w) == OK) {
             log_info("backup: %llu file(s) over %llu MiB, their chunks stored "
@@ -1320,6 +1384,7 @@ static status_t store_content(pipeline_t *p)
         unsigned sw = workers > SMALL_POOL_MAX ? SMALL_POOL_MAX : workers;
         if (scp && small_pool_start(p->store, scp, sw, sw * 2,
                                     p->opts ? p->opts->cancel : NULL,
+                                    p->roots, p->opts->one_filesystem,
                                     &p->spool) == OK) {
             log_info("backup: small files stored on %u threads, up to %u to a batch",
                      sw, SMALL_BATCH_FILES);
@@ -1332,6 +1397,7 @@ static status_t store_content(pipeline_t *p)
     }
     if (!p->cdc_w && !p->spool) workers = 1;
     p->res->store_workers = workers;
+    p->res->file_workers = 1;
 
     /*
      * And files at once, when there are several large ones: one file is
@@ -1341,6 +1407,25 @@ static status_t store_content(pipeline_t *p)
      */
     unsigned fw = workers / 4;
     if ((uint64_t)fw > n_large) fw = (unsigned)n_large;
+    /*
+     * And no more than the buffer budget has writers for: each file worker
+     * opens a pack writer of its own (about 26 MiB of parity encoder and
+     * write buffer, pack_writer_budget_bytes) beside the backup's own. A
+     * writer the budget cannot cover would still work, sealing by reading
+     * its body back, but planning to what fits keeps every writer fast.
+     */
+    uint64_t rb = read_budget_total();
+    if (rb) {
+        uint64_t room = rb > READ_BUDGET_READER_RESERVE ? rb - READ_BUDGET_READER_RESERVE : 0;
+        uint64_t writers = room / pack_writer_budget_bytes();
+        uint64_t files = writers > 1 ? writers - 1 : 0;   /* the backup's own first */
+        if ((uint64_t)fw > files) {
+            log_info("backup: the buffer budget (%llu MiB) has pack writers for %llu "
+                     "large file(s) at once, not %u", (unsigned long long)(rb >> 20),
+                     (unsigned long long)files, fw);
+            fw = (unsigned)files;
+        }
+    }
     if (fw >= 2 && p->cdc_w) {
         p->claims = pack_claims_new();
         if (p->claims) pack_backup_share_claims(p->pack_w, p->claims);
@@ -1352,6 +1437,7 @@ static status_t store_content(pipeline_t *p)
             .out_free = free, .ctx = p,
         };
         if (store_pool_start(p->store, fw, &ops, 1, &p->pool) == OK) {
+            p->res->file_workers = fw;
             log_info("backup: up to %u large files stored at once", fw);
         } else {
             log_warn("backup: cannot start file workers, storing large files "
@@ -1465,6 +1551,7 @@ static status_t scan_rest(pipeline_t *p)
 {
     const backup_opts_t *o = p->opts;
     status_t st = OK;
+    uint32_t first_new = p->scan->count;
     for (int i = o->held_roots; st == OK && i < o->n_paths; i++) {
         scan_result_t *part = NULL;
         const char *rd = (o->read_paths && o->read_paths[i]) ? o->read_paths[i] : NULL;
@@ -1496,6 +1583,8 @@ static status_t scan_rest(pipeline_t *p)
     }
     scan_imap_free(p->imap);
     p->imap = NULL;
+    /* The rest's roots, for opening its files beneath them (B128). */
+    if (st == OK && p->roots) st = scan_roots_extend(p->roots, p->scan, first_new);
     return st;
 }
 
@@ -1694,34 +1783,12 @@ static status_t store_content_loop(pipeline_t *p)
 
         /* Open is part of reading: over NFS it is a round trip per file. */
         uint64_t _tr = phase_now(), _trn = phase_nested(p->timers);
-        /* Never through a symlink (B128): one swapped in for the file
-         * since the scan was followed, and stored whatever it named. */
-        int fd = open(rpath, SETTLE_OPEN_FLAGS);
-        if (fd == -1) {
-            /* A file that vanished between scan and store is normal on a live
-             * filesystem; it is a warning, not a failed backup. */
-            char why[160];
-            skip_file(p, i, settle_open_reason(errno, why, sizeof(why)));
-            continue;
-        }
-        /* Replaced by something else since the scan (OWN-41). settle_store_fd
-         * refuses it too; this keeps a directory off the file workers. */
+        /* Beneath its source root, never through a symlink, and only the
+         * regular file it still is (open_scanned.h, B128). A renamed file
+         * is a change, which settle_store_fd stores as read (OWN-45). */
         struct stat fst;
-        int fst_ok = fstat(fd, &fst) == 0;
-        if (!fst_ok || !S_ISREG(fst.st_mode)) {
-            int was_dir = fst_ok && S_ISDIR(fst.st_mode);
-            close(fd);
-            skip_file(p, i, was_dir ? "no longer a regular file (now a directory)"
-                                    : "no longer a regular file");
-            continue;
-        }
-        /* And the inode the scan saw (B128), before a file worker gets it;
-         * settle_store_fd checks it again on every path. */
-        if (fst.st_dev != e->st.st_dev || fst.st_ino != e->st.st_ino) {
-            close(fd);
-            skip_file(p, i, "replaced by another file since the scan");
-            continue;
-        }
+        int fd = open_for_store(p, i, &fst);
+        if (fd == -1) continue;
 
         if (to_pool) {
             status_t sst = store_pool_submit(p->pool, i, fd, e->node.size);
@@ -2033,7 +2100,7 @@ static status_t allocate_snapshot_id(cutils_db_t *db, store_t *store,
 
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)next);
-    if (db_execute_non_query(db,
+    if (db_write(db,
             "INSERT INTO snapshot_id_seq (repo_id, last_id) VALUES (?, ?)"
             " ON CONFLICT(repo_id) DO UPDATE SET last_id = excluded.last_id",
             (const char *[]){ repo, id, NULL }, NULL) != 0) {
@@ -2144,12 +2211,23 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
      * until every batch has landed. An interrupted run therefore leaves node
      * rows that no snapshot claims - index garbage a reindex rebuilds, which
      * is the state eviction already produces deliberately.
+     *
+     * And it yields to a queued writer by the rule every batch uses
+     * (db_txn_batch_should_end), at every row (B144). It only ended at
+     * NODE_BATCH rows, so a tag or sources write that queued during
+     * indexing waited for up to 2,000 node and FTS inserts: about 80 ms
+     * on an idle host, 700 ms with the CPU contended,
+     * and past the 2 s test bound under disk pressure, against Manual 6.3's
+     * "well under a second". Each extra commit is one more batch boundary of
+     * the kind above, so nothing about nodes_materialized changes.
      */
     #define NODE_BATCH 2000
-    uint32_t since_commit = 0;
+    batch_t nb;
+    memset(&nb, 0, sizeof(nb));
     p->timers->txn_site = PHASE_COMMIT_INDEX;
     status_t bst = db_txn_begin(p->db);
     if (bst != OK) return bst;
+    db_txn_batch_opened(&nb.rule);
 
     for (uint32_t i = 0; i < p->count; i++) {
         /* In no tree, so in no index row either: the index is derived from
@@ -2218,7 +2296,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         snprintf(dmaj, sizeof(dmaj), "%u", is_dev ? e->node.device.major : 0u);
         snprintf(dmin, sizeof(dmin), "%u", is_dev ? e->node.device.minor : 0u);
 
-        int rc = db_execute_non_query(p->db,
+        int rc = db_write(p->db,
                 "INSERT INTO nodes"
                 " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
                 "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
@@ -2236,7 +2314,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                                    * exactly what an index consistency check
                                    * is looking for. */
                                   (is_dir || hash_is_zero(e->node.content_hash))
-                                      ? "" : chex,
+                          ? "" : chex,
                                   is_dir ? shex : "",
                                   ltarget, hgroup,
                                   hash_is_zero(e->node.xattr_hash) ? "" : xhex,
@@ -2247,7 +2325,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
             return set_error(ERR_IO, "index_nodes: insert failed");
         }
 
-        if (db_execute_non_query(p->db,
+        if (db_write(p->db,
                 "INSERT INTO node_fts (name, node_id, snap_id, repo_id)"
                 " VALUES (?, ?, ?, ?)",
                 (const char *[]){ name, id, snap, repo, NULL }, NULL) != 0) {
@@ -2255,12 +2333,13 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
             return set_error(ERR_IO, "index_nodes: fts insert failed");
         }
 
-        if (++since_commit >= NODE_BATCH) {
+        if (++nb.since_commit >= NODE_BATCH || db_txn_batch_should_end(&nb.rule)) {
             status_t cst = db_txn_commit(p->db);
             if (cst != OK) return cst;
-            since_commit = 0;
+            nb.since_commit = 0;
             cst = db_txn_begin(p->db);
             if (cst != OK) return cst;
+            db_txn_batch_opened(&nb.rule);
         }
     }
 
@@ -2345,6 +2424,30 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_INVALID, "%s", SNAPSHOT_LABEL_RULE);
 
     status_t st = check_sources(opts);
+    if (st != OK) return st;
+
+    /*
+     * Before dedup can trust the index, every pack it names has to be there
+     * (B150): a missing pack's objects are marked absent here, so this run
+     * stores them again rather than referencing bytes that are gone. An
+     * unavailable or degraded repository takes no backup at all.
+     */
+    pack_presence_t pp;
+    st = pack_presence_check(db, repo_id, 0, &pp);
+    if (st != OK) return st;
+    if (pp.unavailable)
+        return set_error(ERR_UNAVAILABLE, PACK_PRESENCE_UNAVAILABLE_FMT,
+                         (long long)repo_id, pp.why);
+    if (pp.degraded) {
+        char why[256] = "";
+        (void)pack_presence_degraded(db, repo_id, why, sizeof(why));
+        return set_error(ERR_INVALID, PACK_PRESENCE_DEGRADED_ADVICE,
+                         (long long)repo_id, why, (long long)repo_id);
+    }
+
+    /* The pack-number mark's write, now rather than at the first pack,
+     * which opens while an index batch holds the database's write lock. */
+    st = pack_reserve_numbers(store);
     if (st != OK) return st;
 
     /*
@@ -2558,9 +2661,12 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     uint8_t root_hash[OBJECT_HASH_SIZE];
     struct timespec t0, t1, t2, t3;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    st = store_content(&p);
+    st = scan_roots_new(scan, &p.roots);
+    if (st == OK) st = store_content(&p);
     links = p.links;            /* the rest's scan may have grown it */
     if (p.imap) { scan_imap_free(p.imap); p.imap = NULL; }
+    scan_roots_free(p.roots);
+    p.roots = NULL;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     uint64_t _ttr = phase_now(), _ttrn = phase_nested(&timers);
     if (st == OK && !opts->content_only) st = build_trees(&p, root_hash);
@@ -2662,7 +2768,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
             if (db_txn_begin(db) == OK) txn = 1;
             else st = set_error(ERR_IO, "backup_run: cannot begin the snapshot row");
         }
-        if (st == OK && db_execute_non_query(db,
+        if (st == OK && db_write(db,
                 "INSERT INTO snapshots (repo_id, id, ts, label, file_count,"
                 " total_size, completed_at, root_tree_hash, nodes_materialized)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",

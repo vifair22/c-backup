@@ -1,13 +1,20 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "db_txn.h"
+#include "db_write.h"
 
 #include "phase_timer.h"
+#include "wal_sync.h"
 
 #include <cutils/log.h>
+#include <limits.h>
 #include <pthread.h>
+#include <sqlite3.h>
+#include <stdlib.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <string.h>
+#include <strings.h>
 
 /*
  * Static rather than per-handle because the thing being guarded is not the
@@ -30,6 +37,18 @@ static uint64_t        g_now_serving;
 /* Threads inside write_lock that have not been served yet. Written under
  * g_ticket_mu, read without it by db_txn_waiters. */
 static atomic_uint     g_waiting;
+
+/* Completed make_durable calls, for tests. */
+static atomic_ulong    g_durable;
+
+static status_t (*volatile g_durable_gate)(void);
+static void     (*volatile g_durable_done)(void);
+
+void db_txn_set_durable_hooks(status_t (*gate)(void), void (*done)(void))
+{
+    g_durable_gate = gate;
+    g_durable_done = done;
+}
 
 /*
  * Whether this thread holds the lock. A second begin on the holding thread
@@ -108,4 +127,295 @@ void db_txn_rollback(cutils_db_t *db)
 unsigned db_txn_waiters(void)
 {
     return atomic_load_explicit(&g_waiting, memory_order_relaxed);
+}
+
+void db_txn_batch_opened(db_txn_batch_t *b)
+{
+    b->opened_ns = phase_now();
+}
+
+int db_txn_batch_contended(const db_txn_batch_t *b)
+{
+    return b->contended_until_ns > phase_now();
+}
+
+int db_txn_batch_should_end(db_txn_batch_t *b)
+{
+    uint64_t now = phase_now();
+    if (db_txn_waiters() > 0) {
+        int was = b->contended_until_ns > now;
+        b->contended_until_ns = now + (uint64_t)DB_TXN_BATCH_CONTENDED_MS * 1000000ULL;
+        if (!was) return 1;
+    }
+    return b->contended_until_ns > now &&
+           now - b->opened_ns >= (uint64_t)DB_TXN_BATCH_HOLD_MS * 1000000ULL;
+}
+
+int db_txn_wal_path(cutils_db_t *db, char *out, size_t outsz)
+{
+    if (!db || !out || outsz == 0) return -1;
+    out[0] = '\0';
+    db_result_t *r = NULL;
+    int wal = db_execute(db, "PRAGMA journal_mode", NULL, &r) == 0 && r &&
+              r->nrows == 1 && r->ncols >= 1 && strcasecmp(r->rows[0][0], "wal") == 0;
+    db_result_free(r);
+    if (!wal) return 0;
+    r = NULL;
+    /* seq, name, file: the main database's file, "" for an in-memory or
+     * temporary one, which has no WAL on disk to sync. */
+    if (db_execute(db, "PRAGMA database_list", NULL, &r) != 0 || !r) {
+        db_result_free(r);
+        return -1;
+    }
+    int rc = 0;
+    for (int i = 0; i < r->nrows; i++) {
+        if (r->ncols < 3 || strcmp(r->rows[i][1], "main") != 0) continue;
+        if (r->rows[i][2][0] &&
+            snprintf(out, outsz, "%s-wal", r->rows[i][2]) >= (int)outsz) {
+            out[0] = '\0';
+            rc = -1;
+        }
+        break;
+    }
+    db_result_free(r);
+    return rc;
+}
+
+status_t db_txn_make_durable(cutils_db_t *db)
+{
+    if (!db) return set_error(ERR_INVALID, "db_txn_make_durable: null handle");
+    if (tls_held)
+        return set_error(ERR_BUSY, "db_txn_make_durable: this thread holds the write "
+                                   "lock (its own transaction is not committed yet)");
+    status_t (*gate)(void) = g_durable_gate;
+    if (gate && gate() != OK) return ERR_IO;
+    uint64_t t0 = phase_now();
+
+    /*
+     * A barrier, not a hold: wait for whatever transaction is open to
+     * commit, then let go before syncing. A write issued outside db_txn -
+     * notes, policy, jobs, sessions all do - runs on the one shared
+     * connection and so lands inside any transaction another thread has
+     * open; it is committed only when that transaction is. Taking the lock
+     * means that transaction is over. A batch holder sees the waiter and
+     * commits at its next safe point (db_txn_batch_should_end), so this
+     * waits for a commit, not for a backup.
+     */
+    write_lock();
+    write_unlock();
+
+    char wal[PATH_MAX];
+    if (db_txn_wal_path(db, wal, sizeof(wal)) != 0)
+        return set_error(ERR_IO, "state.db: cannot find its WAL to make the index durable");
+
+    /* No lock held, so no writer waits for the sync. wal_sync also syncs
+     * the directory the first time a given -wal is made durable, and checks
+     * it syncs the live file (wal_sync.h). */
+    if (wal[0]) {
+        status_t st = wal_sync(wal);
+        if (st != OK) return st;
+    }
+    phase_add_commit(phase_current, t0);
+    void (*done)(void) = g_durable_done;
+    if (done) done();
+    atomic_fetch_add_explicit(&g_durable, 1, memory_order_relaxed);
+    return OK;
+}
+
+status_t db_txn_exclusive(status_t (*fn)(void *), void *arg)
+{
+    if (!fn) return set_error(ERR_INVALID, "db_txn_exclusive: no function");
+    if (tls_held)
+        return set_error(ERR_BUSY, "db_txn_exclusive: this thread already holds the write lock");
+    uint64_t t0 = phase_now();
+    write_lock();
+    phase_add_nested(phase_current, PHASE_TXN_WAIT, t0);
+    status_t st = fn(arg);
+    write_unlock();
+    return st;
+}
+
+unsigned long db_txn_durable_count(void)
+{
+    return atomic_load_explicit(&g_durable, memory_order_relaxed);
+}
+
+/* ---- c-utils' own writers (CUTILS-2) ----------------------------------- */
+
+/*
+ * c-utils writes this connection from threads of its own: the log writer
+ * puts every log line in logs, push_send and the push worker keep push,
+ * and its cutils_db_tx_* scopes begin transactions. Before c-utils 1.8.0
+ * none of them could see this lock, so a log line written while a backup
+ * batch was open joined the batch and rolled back with it, and a multi-part
+ * alert's BEGIN failed outright. 1.8.0 takes an application lock before
+ * its handle mutex for every such scope; this hands it the ticket lock.
+ *
+ * A thread that already holds the lock is told so and joins its own
+ * transaction (a push_send from inside one); anyone else queues for a
+ * ticket like any writer here, and is counted by db_txn_waiters, so a
+ * batch holder lets go for a log line the same way it does for a route.
+ */
+static int cutils_lock(void *ctx)
+{
+    (void)ctx;
+    if (tls_held) return DB_WRITE_LOCK_HELD;
+    write_lock();
+    return DB_WRITE_LOCK_ACQUIRED;
+}
+
+static void cutils_unlock(void *ctx)
+{
+    (void)ctx;
+    write_unlock();
+}
+
+status_t db_txn_install_cutils_lock(cutils_db_t *db)
+{
+    if (!db) return set_error(ERR_INVALID, "db_txn_install_cutils_lock: null handle");
+    if (db_set_write_lock(db, cutils_lock, cutils_unlock, NULL) != 0)
+        return set_error(ERR_IO, "cannot give c-utils the write lock");
+    return OK;
+}
+
+/* ---- Writes outside a transaction (B157) ------------------------------ */
+
+int db_txn_held(void)
+{
+    return tls_held;
+}
+
+int db_write_enter(cutils_db_t *db)
+{
+    if (tls_held) return 0;
+    if (db_txn_begin(db) != OK) {
+        log_error("db_write: %s", err_msg());
+        err_clear();
+        return -1;
+    }
+    return 1;
+}
+
+int db_write_leave(cutils_db_t *db, int began, int ok)
+{
+    if (began != 1) return ok ? 0 : -1;
+    if (!ok) {
+        db_txn_rollback(db);
+        return -1;
+    }
+    if (db_txn_commit(db) != OK) {
+        log_error("db_write: %s", err_msg());
+        err_clear();
+        return -1;
+    }
+    return 0;
+}
+
+int db_write(cutils_db_t *db, const char *sql, const char **params, int *affected)
+{
+    int began = db_write_enter(db);
+    if (began < 0) return -1;
+    int rc = db_execute_non_query(db, sql, params, affected);
+    return db_write_leave(db, began, rc == 0);
+}
+
+int db_write_returning(cutils_db_t *db, const char *sql, const char **params,
+                       db_result_t **out)
+{
+    *out = NULL;
+    int began = db_write_enter(db);
+    if (began < 0) return -1;
+    int rc = db_execute(db, sql, params, out);
+    if (db_write_leave(db, began, rc == 0) != 0) {
+        db_result_free(*out);
+        *out = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+int db_write_batch_open(db_write_batch_t *b, cutils_db_t *db)
+{
+    b->db = db;
+    b->since = 0;
+    b->began = db_write_enter(db);
+    return b->began < 0 ? -1 : 0;
+}
+
+int db_write_batch_next(db_write_batch_t *b)
+{
+    if (b->began != 1) return b->began < 0 ? -1 : 0;
+    if (++b->since < DB_WRITE_BATCH_ROWS && db_txn_waiters() == 0) return 0;
+    b->began = 0;
+    if (db_write_leave(b->db, 1, 1) != 0) { b->began = -1; return -1; }
+    return db_write_batch_open(b, b->db);
+}
+
+int db_write_batch_close(db_write_batch_t *b, int ok)
+{
+    if (b->began < 0) return -1;
+    int rc = db_write_leave(b->db, b->began, ok);
+    b->began = -1;
+    return rc;
+}
+
+/*
+ * The update hook fires on the thread running the statement, once per row
+ * changed in a rowid table, which every table in the schema is. It does not
+ * fire for SQLite's own tables (sqlite_sequence) or for the rows an FTS5
+ * table writes on behalf of a statement that was itself checked, so it
+ * reports exactly the statements this module is about. tls_held is the
+ * calling thread's, so the test is one load.
+ */
+static atomic_int   g_guard_armed;
+static atomic_ulong g_guard_violations;
+static int          g_guard_abort = -1;   /* -1: environment not read yet */
+
+#define GUARD_LOG_MAX 64
+
+static void guard_hook(void *arg, int op, const char *dbname, const char *table,
+                       sqlite3_int64 rowid)
+{
+    (void)arg;
+    (void)rowid;
+    if (!atomic_load_explicit(&g_guard_armed, memory_order_relaxed) || tls_held) return;
+    if (!dbname || strcmp(dbname, "main") != 0) return;
+    unsigned long n = atomic_fetch_add_explicit(&g_guard_violations, 1,
+                                                memory_order_relaxed) + 1;
+    if (n <= GUARD_LOG_MAX)
+        log_error("db_txn guard: %s on %s outside a write transaction (B157); "
+                  "it would commit or roll back with another thread's work",
+                  op == SQLITE_INSERT ? "INSERT" : op == SQLITE_DELETE ? "DELETE" : "UPDATE",
+                  table ? table : "?");
+    if (g_guard_abort == 1) abort();
+}
+
+static int guard_ext(sqlite3 *conn, char **err, const sqlite3_api_routines *api)
+{
+    (void)err;
+    (void)api;
+    sqlite3_update_hook(conn, guard_hook, NULL);
+    return SQLITE_OK;
+}
+
+void db_txn_guard_install(void)
+{
+    if (g_guard_abort < 0) {
+        const char *e = getenv("C_BACKUP_TXN_GUARD");
+        g_guard_abort = e && strcmp(e, "abort") == 0;
+    }
+    /* Registering the same entry point twice is a no-op in SQLite. */
+    if (sqlite3_auto_extension((void (*)(void))guard_ext) != SQLITE_OK)
+        log_warn("db_txn guard: cannot register; writes outside a transaction "
+                 "will not be reported");
+}
+
+void db_txn_guard_arm(int on)
+{
+    atomic_store_explicit(&g_guard_armed, on ? 1 : 0, memory_order_relaxed);
+}
+
+unsigned long db_txn_guard_violations(void)
+{
+    return atomic_load_explicit(&g_guard_violations, memory_order_relaxed);
 }

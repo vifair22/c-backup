@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gfs.h"
 #include "prune.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 #include <cutils/log.h>
@@ -361,8 +362,19 @@ static status_t gfs_group(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     /* ---- Flush changed flags to disk ---- */
     if (!dry_run) {
+        /* Batched under the write lock (B157): a plain statement per
+         * snapshot joined whatever transaction another thread had open. */
+        db_write_batch_t wb;
+        int open = 0;
         for (uint32_t i = 0; i < n; i++) {
             if (snaps[i].gfs_flags == orig_flags[i]) continue;
+            if (!open) {
+                if (db_write_batch_open(&wb, db) != 0) {
+                    log_warn("gfs: cannot begin the tier flag update");
+                    break;
+                }
+                open = 1;
+            }
             char repo[32], sid[32], flags[16];
             snprintf(repo,  sizeof(repo),  "%lld", (long long)repo_id);
             snprintf(sid,   sizeof(sid),   "%u", snaps[i].id);
@@ -377,7 +389,14 @@ static status_t gfs_group(store_t *store, cutils_db_t *db, int64_t repo_id,
                 gfs_flags_str(snaps[i].gfs_flags, tbuf, sizeof(tbuf));
                 log_info("gfs: snapshot %u flagged [%s]", snaps[i].id, tbuf);
             }
+            if (db_write_batch_next(&wb) != 0) {
+                open = 0;
+                log_warn("gfs: cannot commit the tier flag update");
+                break;
+            }
         }
+        if (open && db_write_batch_close(&wb, 1) != 0)
+            log_warn("gfs: cannot commit the tier flag update");
     }
 
     /* ---- Prune ----

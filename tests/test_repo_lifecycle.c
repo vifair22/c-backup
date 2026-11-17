@@ -340,18 +340,27 @@ static void test_enc_resolve(void **state)
     repo_enc_mode_t m = REPO_ENC_SYSTEM;
     assert_int_equal(repo_enc_resolve(NULL, NULL, &m), OK);
     assert_int_equal(m, REPO_ENC_NONE);
-    assert_int_equal(repo_enc_resolve(NULL, "", &m), OK);
-    assert_int_equal(m, REPO_ENC_NONE);
     assert_int_equal(repo_enc_resolve(NULL, "secret", &m), OK);
-    assert_int_equal(m, REPO_ENC_PASSPHRASE);
-    assert_int_equal(repo_enc_resolve("", "secret", &m), OK);
     assert_int_equal(m, REPO_ENC_PASSPHRASE);
     assert_int_equal(repo_enc_resolve("passphrase", "secret", &m), OK);
     assert_int_equal(m, REPO_ENC_PASSPHRASE);
     assert_int_equal(repo_enc_resolve("system", NULL, &m), OK);
     assert_int_equal(m, REPO_ENC_SYSTEM);
-    assert_int_equal(repo_enc_resolve("none", "", &m), OK);
+    assert_int_equal(repo_enc_resolve("none", NULL, &m), OK);
     assert_int_equal(m, REPO_ENC_NONE);
+
+    /* B127: a field given empty is not a field left out. Each of these used
+     * to resolve to NONE, or to passphrase with "" read as no mode, and
+     * register an unencrypted repository. m must be left untouched. */
+    m = REPO_ENC_SYSTEM;
+    assert_int_equal(repo_enc_resolve("", NULL, &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve(NULL, "", &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("", "secret", &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("none", "", &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("system", "", &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("NONE", NULL, &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve(" system", NULL, &m), ERR_INVALID);
+    assert_int_equal(m, REPO_ENC_SYSTEM);
 
     assert_int_equal(repo_enc_resolve("none", "secret", &m), ERR_INVALID);
     assert_int_equal(repo_enc_resolve("system", "secret", &m), ERR_INVALID);

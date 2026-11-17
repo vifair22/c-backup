@@ -417,12 +417,20 @@ static status_t rc_put(void *ctx, uint8_t type, const void *data, size_t len,
 {
     rc_ctx_t *r = ctx;
     int is_new = 0;
+    uint64_t stored = 0;
     status_t st = r->sink->v->put_plain(r->sink->ctx, type, data, len,
-                                        out->hash, &is_new);
+                                        out->hash, &is_new, &stored);
     if (st != OK) return st;
     out->is_new = is_new;
-    out->phys_bytes = 0;
-    if (is_new) r->res->objects_written++;
+    out->phys_bytes = stored;
+    /* What reached the target, counted as a copying run counts it: a
+     * re-chunking run reported 0 sent while the replica gained every
+     * object (B135). */
+    if (is_new) {
+        r->res->objects_written++;
+        r->res->objects_sent++;
+        r->res->bytes_sent += stored;
+    }
     return OK;
 }
 

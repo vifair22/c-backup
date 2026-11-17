@@ -137,7 +137,7 @@ static status_t chunk_block(const cdc_params_t *p, const sp_block_stream_t *bs,
                             size_t window, uint8_t out[OBJECT_HASH_SIZE],
                             block_source_stats_t *stats)
 {
-    block_source_opts_t o = { use_extents, trust_zero, window };
+    block_source_opts_t o = { use_extents, trust_zero, window, NULL, NULL };
     block_source_t *b = NULL;
     status_t st = block_source_open(bs, size, &o, &b);
     if (st != OK) return st;
@@ -154,7 +154,7 @@ static void ref_hash(const cdc_params_t *p, const uint8_t *buf, uint64_t size,
                      uint8_t out[OBJECT_HASH_SIZE])
 {
     ref_t r = { buf, size, 0 };
-    cdc_source_t src = { ref_next, ref_read, &r, NULL };
+    cdc_source_t src = { ref_next, ref_read, &r, NULL, NULL };
     cdc_result_t cr;
     assert_int_equal(cdc_store_source(p, &src, size, &g_sink, NULL, &cr), OK);
     memcpy(out, cr.hash, OBJECT_HASH_SIZE);
@@ -346,7 +346,7 @@ static void test_sparse_terabyte(void **state)
     /* The reference: the same three runs as spans, read from the fake.
      * Generated data has no zero run anywhere near 64 KiB long. */
     tb_ref_t r = { &bs, runs, 3, 0 };
-    cdc_source_t src = { tb_next, tb_read, &r, NULL };
+    cdc_source_t src = { tb_next, tb_read, &r, NULL, NULL };
     cdc_result_t cr;
     assert_int_equal(cdc_store_source(&pd, &src, T, &g_sink, NULL, &cr), OK);
     assert_memory_equal(cr.hash, got, OBJECT_HASH_SIZE);

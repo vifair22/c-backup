@@ -7,6 +7,8 @@
 
 #include "fault_inject.h"
 #include <limits.h>
+#include <stdarg.h>
+#include <sys/syscall.h>
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
@@ -17,6 +19,8 @@ _Thread_local int fault_fread_at   = -1;
 _Thread_local int fault_fwrite_at  = -1;
 _Thread_local int fault_fseeko_at  = -1;
 _Thread_local int fault_fsync_at   = -1;
+_Thread_local int fault_pread_at   = -1;
+_Thread_local int fault_pwrite_at  = -1;
 _Thread_local size_t fault_malloc_peak = 0;
 _Thread_local long long fault_fwrite_bytes_left = -1;
 _Thread_local long long fault_fwrite_bytes_seen = 0;
@@ -49,6 +53,38 @@ void *__wrap_realloc(void *ptr, size_t size) {
     return __real_realloc(ptr, size);
 }
 
+/* pread's countdown; the path gate is applied in __wrap_pread below. */
+static int fault_pread_countdown(void) {
+    if (fault_pread_at < 0) return 0;
+    if (fault_pread_at == 0) { fault_pread_at = -1; errno = EIO; return -1; }
+    fault_pread_at--;
+    return 0;
+}
+
+int (*volatile fault_write_hook)(int fd) = NULL;
+int (*volatile fault_mkdir_hook)(const char *path, mode_t mode) = NULL;
+
+ssize_t __wrap_write(int fd, const void *buf, size_t n) {
+    int (*h)(int) = fault_write_hook;
+    if (h && h(fd) != FAULT_FS_PASS) return -1;
+    return __real_write(fd, buf, n);
+}
+
+int __wrap_mkdir(const char *path, mode_t mode) {
+    int (*h)(const char *, mode_t) = fault_mkdir_hook;
+    if (h) { int r = h(path, mode); if (r != FAULT_FS_PASS) return r; }
+    return __real_mkdir(path, mode);
+}
+
+ssize_t __wrap_pwrite(int fd, const void *buf, size_t n, off_t off) {
+    int (*h)(int) = fault_write_hook;
+    if (h && h(fd) != FAULT_FS_PASS) return -1;
+    if (fault_pwrite_at < 0) return __real_pwrite(fd, buf, n, off);
+    if (fault_pwrite_at == 0) { fault_pwrite_at = -1; errno = EIO; return -1; }
+    fault_pwrite_at--;
+    return __real_pwrite(fd, buf, n, off);
+}
+
 size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     if (fault_fread_at < 0) return __real_fread(ptr, size, nmemb, stream);
     if (fault_fread_at == 0) { fault_fread_at = -1; errno = EIO; return 0; }
@@ -57,6 +93,8 @@ size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 }
 
 size_t __wrap_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    int (*h)(int) = fault_write_hook;
+    if (h && h(fileno(stream)) != FAULT_FS_PASS) return 0;
     if (fault_fwrite_bytes_left >= 0) {
         long long want = (long long)(size * nmemb);
         if (want > fault_fwrite_bytes_left) { errno = ENOSPC; return 0; }
@@ -76,7 +114,19 @@ int __wrap_fseeko(FILE *stream, off_t offset, int whence) {
     return __real_fseeko(stream, offset, whence);
 }
 
+int (*volatile fault_rename_hook)(const char *from, const char *to) = NULL;
+int (*volatile fault_unlink_hook)(const char *path) = NULL;
+int (*volatile fault_sync_hook)(int fd, int data_only) = NULL;
+
+int __wrap_unlink(const char *path) {
+    int (*h)(const char *) = fault_unlink_hook;
+    if (h) { int r = h(path); if (r != FAULT_FS_PASS) return r; }
+    return __real_unlink(path);
+}
+
 int __wrap_fsync(int fd) {
+    int (*h)(int, int) = fault_sync_hook;
+    if (h) { int r = h(fd, 0); if (r != FAULT_FS_PASS) return r; }
     if (fault_fsync_at < 0) return __real_fsync(fd);
     if (fault_fsync_at == 0) { fault_fsync_at = -1; errno = EIO; return -1; }
     fault_fsync_at--;
@@ -84,6 +134,8 @@ int __wrap_fsync(int fd) {
 }
 
 int __wrap_fdatasync(int fd) {
+    int (*h)(int, int) = fault_sync_hook;
+    if (h) { int r = h(fd, 1); if (r != FAULT_FS_PASS) return r; }
     if (fault_fsync_at < 0) return __real_fdatasync(fd);
     if (fault_fsync_at == 0) { fault_fsync_at = -1; errno = EIO; return -1; }
     fault_fsync_at--;
@@ -155,6 +207,8 @@ volatile int fault_rename_die_skip = 0;
 volatile int fault_rename_die_after = 0;
 
 int __wrap_rename(const char *from, const char *to) {
+    int (*h)(const char *, const char *) = fault_rename_hook;
+    if (h) { int r = h(from, to); if (r != FAULT_FS_PASS) return r; }
     gate_wait(to);
     const char *die = fault_rename_die_dst;
     if (die && strncmp(to, die, strlen(die)) == 0) {
@@ -213,6 +267,30 @@ ssize_t __wrap_read(int fd, void *buf, size_t count) {
 }
 
 ssize_t __wrap_pread(int fd, void *buf, size_t count, off_t off) {
+    if (fault_pread_countdown() != 0) return -1;
     if (fault_read_gate(fd) != 0) return -1;
     return __real_pread(fd, buf, count, off);
+}
+
+volatile int fault_openat2_errno = 0;
+volatile int fault_openat2_refused = 0;
+
+/*
+ * syscall() is variadic and the wrapper cannot know how many arguments the
+ * caller passed, so it forwards six, as glibc's own syscall() reads six
+ * registers whatever the number. Extra ones are ignored by the kernel.
+ */
+long __wrap_syscall(long number, ...) {
+    va_list ap;
+    va_start(ap, number);
+    long a1 = va_arg(ap, long), a2 = va_arg(ap, long), a3 = va_arg(ap, long);
+    long a4 = va_arg(ap, long), a5 = va_arg(ap, long), a6 = va_arg(ap, long);
+    va_end(ap);
+    int e = fault_openat2_errno;
+    if (number == SYS_openat2 && e != 0) {
+        __atomic_add_fetch(&fault_openat2_refused, 1, __ATOMIC_SEQ_CST);
+        errno = e;
+        return -1;
+    }
+    return __real_syscall(number, a1, a2, a3, a4, a5, a6);
 }

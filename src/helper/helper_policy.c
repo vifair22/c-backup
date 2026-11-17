@@ -24,6 +24,7 @@ void helper_policy_free(helper_policy_t *p)
     for (size_t i = 0; i < p->n_never_pause; i++) free(p->never_pause[i]);
     for (size_t i = 0; i < p->n_btrfs; i++) free(p->btrfs_domains[i]);
     for (size_t i = 0; i < p->n_dir; i++) free(p->dir_domains[i]);
+    for (size_t i = 0; i < p->n_staging; i++) free(p->restore_staging_dirs[i]);
     for (size_t h = 0; h < p->n_hooks; h++)
         for (int i = 0; i < p->hooks[h].argc; i++) free(p->hooks[h].argv[i]);
     memset(p, 0, sizeof(*p));
@@ -96,6 +97,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
 {
     memset(out, 0, sizeof(*out));
     out->daemon_uid = (uid_t)-1;
+    out->daemon_gid = (gid_t)-1;
     out->max_pause_s = 30;
     out->max_captures_per_hour = 60;
     out->capture_max_s = 86400;
@@ -163,11 +165,26 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
         if (!eq) { st = bad(line, "expected key = value", s); break; }
         *eq = '\0';
         char *k = trim(s), *v = trim(eq + 1);
+        /* An inline comment, whitespace then '#' or ';', ends the value,
+         * as the examples in docs/helper.md write them. Not for argv.N: an
+         * argument is taken verbatim, '#' and ';' and all. */
+        if (strncmp(k, "argv.", 5) != 0) {
+            for (char *c = v; *c; c++) {
+                if ((*c == '#' || *c == ';') && (c == v || c[-1] == ' ' || c[-1] == '\t')) {
+                    *c = '\0';
+                    v = trim(v);
+                    break;
+                }
+            }
+        }
         unsigned u = 0;
         if (sec == S_HELPER) {
             if (strcmp(k, "daemon_uid") == 0) {
                 if (to_uint(v, 1, 2147483646u, &u)) { st = bad(line, "daemon_uid must be a non-root uid", v); break; }
                 out->daemon_uid = (uid_t)u;
+            } else if (strcmp(k, "daemon_gid") == 0) {
+                if (to_uint(v, 1, 2147483646u, &u)) { st = bad(line, "daemon_gid must be a non-root gid", v); break; }
+                out->daemon_gid = (gid_t)u;
             } else if (strcmp(k, "daemon_id") == 0) {
                 if (strlen(v) != 8 || strspn(v, "0123456789abcdef") != 8) { st = bad(line, "daemon_id is 8 lowercase hex digits", v); break; }
                 snprintf(out->daemon_id, sizeof(out->daemon_id), "%s", v);
@@ -294,6 +311,8 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
             int rc = strcmp(k, "zfs_domains") == 0   ? to_list(v, out->zfs_domains, &out->n_zfs, dataset_ok)
                    : strcmp(k, "btrfs_domains") == 0 ? to_list(v, out->btrfs_domains, &out->n_btrfs, dir_ok)
                    : strcmp(k, "dir_domains") == 0   ? to_list(v, out->dir_domains, &out->n_dir, dir_ok)
+                   : strcmp(k, "restore_staging_dirs") == 0
+                         ? to_list(v, out->restore_staging_dirs, &out->n_staging, dir_ok)
                    : -2;
             if (rc == -2) { st = bad(line, "unknown key in [snapshot]", k); break; }
             if (rc) { st = bad(line, "bad domain list", v); break; }
@@ -334,6 +353,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
     }
     free(buf);
     if (st == OK && out->daemon_uid == (uid_t)-1) st = set_error(ERR_INVALID, "policy: [helper] daemon_uid is required");
+    if (st == OK && out->daemon_gid == (gid_t)-1) out->daemon_gid = (gid_t)out->daemon_uid;
     if (st == OK && !out->daemon_id[0]) st = set_error(ERR_INVALID, "policy: [helper] daemon_id is required");
     if (st == OK && !out->state_dir[0]) st = set_error(ERR_INVALID, "policy: [helper] state_dir is required");
     for (size_t h = 0; st == OK && h < out->n_hooks; h++)

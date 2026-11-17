@@ -78,7 +78,7 @@ static void test_migrations_apply(void **state)
         "policy_values", "repo_backup_paths", "journal", "recovery_state",
         "file_cache", "verify_runs", "verify_findings", "grep_runs",
         "grep_hits", "snapshot_units", "snapshot_unit_items", "unit_policy",
-        "unit_intents", "daemon_state", NULL
+        "unit_intents", "daemon_state", "pack_tombstones", NULL
     };
     for (int i = 0; tables[i]; i++)
         assert_true(object_exists(db, "table", tables[i]));
@@ -138,6 +138,8 @@ static void test_units_migration_keeps_baseline_data(void **state)
     assert_int_equal(db_run_compiled_migrations(db, app_migrations), CUTILS_OK);
     assert_true(object_exists(db, "table", "snapshot_units"));
     assert_true(object_exists(db, "table", "unit_intents"));
+    assert_true(object_exists(db, "table", "unit_tokens"));
+    assert_true(object_exists(db, "table", "unit_incremental"));
     assert_int_equal(count_rows(db, "SELECT 1 FROM tags WHERE name = 'keep' AND snap_id = 7"), 1);
     assert_int_equal(count_rows(db, "SELECT 1 FROM policy_values WHERE value = '9'"), 1);
     assert_int_equal(count_rows(db, "SELECT 1 FROM schedules WHERE action = 'gc'"), 1);
@@ -153,6 +155,44 @@ static void test_units_migration_keeps_baseline_data(void **state)
     unlink_db();
 }
 
+/*
+ * B155: a schedule stored before created_at existed. A never-fired interval
+ * schedule is given the instant its stored due time was counted from; one
+ * that has fired, and a calendar one, keep NULL, since neither anchors to
+ * its creation.
+ */
+static void test_created_at_backfill(void **state)
+{
+    (void)state;
+    unlink_db();
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
+    const db_migration_t before[] = { app_migrations[0], app_migrations[1], { NULL, NULL } };
+    assert_string_equal(before[1].name, "002_units.sql");
+    assert_int_equal(db_run_compiled_migrations(db, before), CUTILS_OK);
+
+    static const char *const fill[] = {
+        "INSERT INTO repos (id, uuid, path, label, added_at) VALUES (1, 'u-1', '/r', 'main', 1)",
+        "INSERT INTO schedules (id, repo_id, action, trigger_type, trigger_spec, next_due_at)"
+        " VALUES (1, 1, 'backup', 'interval', '{\"type\":\"interval\",\"seconds\":86400}', 1086400)",
+        "INSERT INTO schedules (id, repo_id, action, trigger_type, trigger_spec, last_fired_at, next_due_at)"
+        " VALUES (2, 1, 'gc', 'interval', '{\"type\":\"interval\",\"seconds\":60}', 500, 560)",
+        "INSERT INTO schedules (id, repo_id, action, trigger_type, trigger_spec, next_due_at)"
+        " VALUES (3, 1, 'verify', 'calendar',"
+        " '{\"type\":\"calendar\",\"every\":\"day\",\"at\":\"03:00\"}', 900)",
+        NULL,
+    };
+    for (int i = 0; fill[i]; i++) assert_int_equal(db_exec_raw(db, fill[i]), CUTILS_OK);
+
+    assert_int_equal(db_run_compiled_migrations(db, app_migrations), CUTILS_OK);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM schedules WHERE id = 1 AND created_at = 1000000"), 1);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM schedules WHERE id = 2 AND created_at IS NULL"), 1);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM schedules WHERE id = 3 AND created_at IS NULL"), 1);
+    db_close(db);
+    unlink_db();
+}
+
 static void test_one_baseline_migration(void **state)
 {
     (void)state;
@@ -164,7 +204,16 @@ static void test_one_baseline_migration(void **state)
     /* NBD exports of unit disks (vm-backup.md 7.3). */
     assert_non_null(app_migrations[2].name);
     assert_string_equal(app_migrations[2].name, "003_exports.sql");
-    assert_null(app_migrations[3].name);
+    /* Incremental VM backup's tokens (vm-backup.md 5.8). */
+    assert_non_null(app_migrations[3].name);
+    assert_string_equal(app_migrations[3].name, "004_unit_tokens.sql");
+    /* B155: the schedule creation time, the never-fired interval anchor. */
+    assert_non_null(app_migrations[4].name);
+    assert_string_equal(app_migrations[4].name, "006_schedule_created_at.sql");
+    /* Dropped packs' numbers (B156). */
+    assert_non_null(app_migrations[5].name);
+    assert_string_equal(app_migrations[5].name, "007_pack_tombstones.sql");
+    assert_null(app_migrations[6].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */
@@ -627,6 +676,7 @@ int main(void)
         cmocka_unit_test(test_repo_ids_are_not_reused),
         cmocka_unit_test(test_migrations_apply),
         cmocka_unit_test(test_one_baseline_migration),
+        cmocka_unit_test(test_created_at_backfill),
         cmocka_unit_test(test_units_migration_keeps_baseline_data),
         cmocka_unit_test(test_migrations_are_idempotent),
         cmocka_unit_test(test_child_index_includes_name),

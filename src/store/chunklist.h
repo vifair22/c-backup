@@ -134,6 +134,14 @@ typedef struct {
      */
     status_t (*next_piece)(void *ctx, uint64_t *s, uint64_t *e, int *got,
                            int *more);
+    /*
+     * Optional: start over at off, as if the content began there with no
+     * span open, so the next span or piece starts at or after off. Only an
+     * incremental store (cdc_store_delta) uses it, to re-chunk the regions
+     * around changed ranges and skip what lies between; off only ever
+     * moves forward.
+     */
+    status_t (*seek)(void *ctx, uint64_t off);
 } cdc_source_t;
 
 /* ------------------------------------------------------------------ */
@@ -272,6 +280,8 @@ status_t chunklist_iter_open(const obj_loader_t *loader,
 status_t chunklist_iter_next(chunklist_iter_t *it, chunklist_item_t *item,
                              int *done);
 void     chunklist_iter_skip(chunklist_iter_t *it);
+/* The root list's total_len: the content's logical length. */
+uint64_t chunklist_iter_total(const chunklist_iter_t *it);
 void     chunklist_iter_close(chunklist_iter_t *it);
 
 /* ------------------------------------------------------------------ */
@@ -346,10 +356,11 @@ status_t content_collect(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
  * Random access to file content, for the NBD export (vm-backup.md 7.3).
  * read() fills [off, off + len) with holes as zeroes; extents() reports
  * the data and hole runs over a range, adjacent runs of one kind merged,
- * stopping early when fn returns non-zero. A reader keeps up to 64 parsed
- * lists and 4 verified leaves (up to 4 chunks, 32 MiB at the default CDC
- * maximum) outside the read budget, and is not thread-safe: one per
- * connection.
+ * stopping early when fn returns non-zero. A reader keeps one verified
+ * leaf, holding its size of the read budget until drop() or the next load
+ * (never two slots at once), and the parsed lists of one path down the
+ * tree. Not thread-safe: one per connection. cache_bytes is what it holds
+ * of the budget now.
  */
 typedef struct content_reader content_reader_t;
 typedef int (*content_extent_fn)(void *ctx, uint64_t off, uint64_t len, int is_hole);
@@ -359,4 +370,6 @@ uint64_t content_reader_size(const content_reader_t *r);
 status_t content_reader_read(content_reader_t *r, uint64_t off, void *buf, size_t len);
 status_t content_reader_extents(content_reader_t *r, uint64_t off, uint64_t len,
                                 content_extent_fn fn, void *ctx);
+void     content_reader_drop(content_reader_t *r);
+uint64_t content_reader_cache_bytes(const content_reader_t *r);
 void     content_reader_close(content_reader_t *r);

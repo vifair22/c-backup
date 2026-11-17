@@ -14,6 +14,7 @@
 #include "cJSON.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +33,7 @@ typedef struct {
     char sock[108];
     int  lfd;
     pthread_t th;
-    volatile int stop;
+    atomic_int stop;  /* read by the server thread, set by stop */
     pthread_mutex_t mu;
     fd_container_t c[FD_MAX];
     int  n;
@@ -40,6 +41,7 @@ typedef struct {
     char exec_cmd[16][256];
     int  n_exec;
     int  digest_gone;          /* image pulls by digest fail, as a registry that dropped it */
+    int  lose_pause;           /* a pause is undone at once, as a watchdog's unpause would */
     char pulled[512];          /* the last fromImage */
     char created_body[8192];   /* the last create body */
 } fake_docker_t;
@@ -161,7 +163,11 @@ static void fd_serve(fake_docker_t *f, int fd)
         else if (strcmp(verb, "pause") == 0) {
             if (strcmp(c->state, "running") != 0) fd_reply(fd, 409, "{\"message\":\"not running\"}");
             else if (strstr(c->name, "stuck")) fd_reply(fd, 500, "{\"message\":\"freezer timed out\"}");
-            else { snprintf(c->state, sizeof(c->state), "paused"); f->pauses++; fd_reply(fd, 204, ""); }
+            else {
+                snprintf(c->state, sizeof(c->state), "%s", f->lose_pause ? "running" : "paused");
+                f->pauses++;
+                fd_reply(fd, 204, "");
+            }
         } else if (strcmp(verb, "unpause") == 0) {
             if (strcmp(c->state, "paused") != 0) fd_reply(fd, 409, "{\"message\":\"Container is not paused\"}");
             else { snprintf(c->state, sizeof(c->state), "running"); f->unpauses++; fd_reply(fd, 204, ""); }
@@ -203,7 +209,7 @@ static void fd_serve(fake_docker_t *f, int fd)
 static void *fd_main(void *arg)
 {
     fake_docker_t *f = arg;
-    while (!f->stop) {
+    while (!atomic_load(&f->stop)) {
         int fd = accept(f->lfd, NULL, NULL);
         if (fd < 0) continue;
         fd_serve(f, fd);
@@ -229,7 +235,7 @@ static int fake_docker_start(fake_docker_t *f, const char *sock)
 
 static void fake_docker_stop(fake_docker_t *f)
 {
-    f->stop = 1;
+    atomic_store(&f->stop, 1);
     shutdown(f->lfd, SHUT_RDWR);
     /* Wake accept with one last connection. */
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);

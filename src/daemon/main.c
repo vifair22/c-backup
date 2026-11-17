@@ -29,9 +29,13 @@
 
 #include "app_config.h"
 #include "auth.h"
+#include "db_txn.h"
+#include "db_write.h"
 #include "file_cache.h"
 #include "settle.h"
 #include "index_reconcile.h"
+#include "index_startup.h"
+#include "phase_timer.h"
 #include "job_manager.h"
 #include "lock.h"
 #include "repo_purge.h"
@@ -41,12 +45,17 @@
 #include "sd_notify.h"
 #include "server.h"
 #include "state_db.h"
+#include "wal_sync.h"
+#include "checkpointer.h"
+#include "pack_presence.h"
+#include "prune.h"
 #include "store_index.h"
 #include "fake_provider.h"
 #include "privs.h"
 #include "registry.h"
 #include "disk_stream.h"
 #include "remote_provider.h"
+#include "unit_backup.h"
 #include "unit_state.h"
 
 #ifndef VERSION_STRING
@@ -117,6 +126,19 @@ static status_t startup_reindex(int64_t repo_id, void *ctx, int64_t *out_job_id)
     return routes_submit_startup_reindex(ctx, repo_id, out_job_id);
 }
 
+/* Every API request that changed something - a tag, a note, a policy, a
+ * registered repository - is durable before its answer is sent (B139,
+ * B140), by the same means gc and prune use before removing what a commit
+ * describes (db_txn_make_durable, B142), where synchronous=NORMAL would
+ * otherwise leave it for the next once-a-second flush. */
+static void after_write(void *userdata)
+{
+    if (db_txn_make_durable(userdata) != OK) {
+        log_warn("state.db: an API edit may not survive a power cut yet: %s", err_msg());
+        err_clear();
+    }
+}
+
 /*
  * Daemon id, unit settings, providers and the start-up sweep. The fake
  * provider is enabled only by units.fake_spec, which only the end-to-end
@@ -136,6 +158,9 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
         .freeze_timeout_s = (unsigned)config_get_int(cfg, "vm.freeze_timeout_s", (int)UNITS_FREEZE_DEFAULT_S),
         .max_pause_s      = (unsigned)config_get_int(cfg, "containers.max_pause_s", (int)UNITS_PAUSE_DEFAULT_S),
         .trust_zero       = config_get_int(cfg, "vm.trust_zero_status", 1),
+        .incremental      = config_get_int(cfg, "vm.incremental", 0),
+        .delta_full_pct   = (unsigned)config_get_int(cfg, "vm.delta_full_pct", (int)UNITS_DELTA_PCT_DEFAULT),
+        .audit_days       = (unsigned)config_get_int(cfg, "vm.audit_days", (int)UNITS_AUDIT_DAYS_DEFAULT),
     };
     status_t st = units_init(db, dir[0] ? dir : NULL, &uc);
     if (st != OK) return st;
@@ -160,11 +185,24 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
     if (hs && *hs && remote_start(hs, units_daemon8(), NULL) != OK) {
         log_warn("units: %s; retrying in the background", err_msg());
         err_clear();
+    } else if (hs && *hs && !remote_unusable("libvirt", NULL, 0)) {
+        /* vm-backup.md 5.8: the checkpoints the tokens name, put back
+         * before the scheduler starts. A helper that is not up yet does
+         * the same at its own start, and every session checks again. */
+        unsigned n = 0, redone = 0, refused = 0;
+        if (unit_checkpoints_redefine(db, &n, &redone, &refused) != OK) {
+            log_warn("units: checkpoint redefine: %s", err_msg());
+            err_clear();
+        } else if (n) {
+            log_info("units: %u checkpoint(s) checked, %u redefined, %u could not be", n, redone, refused);
+        }
     }
 
     units_sweep_result_t sw;
+    uint64_t t0 = phase_now();
     st = units_sweep(db, 0, &sw);
     if (st != OK) return st;
+    log_info("start-up: units sweep: %.3f s", (double)(phase_now() - t0) / 1e9);
     if (sw.released || sw.failed || sw.removed)
         log_warn("units: start-up sweep released %u hold(s), %u could not be, removed "
                  "%u leftover artefact(s), left %u not this daemon's",
@@ -217,11 +255,30 @@ int main(int argc, char *argv[])
     tighten_umask();
     appguard_set_argv(argc, argv);
 
+    /* Before AppGuard opens the database, so its connection carries the
+     * hook that reports a write made outside the write lock (B157). */
+    db_txn_guard_install();
+
     appguard_config_t ag_cfg = app_appguard_config();
     ag_cfg.on_signal = on_signal;
     appguard_t *guard = appguard_init(&ag_cfg);
     if (!guard)
         return 1;
+
+    /*
+     * Startup acquires in order and teardown releases in reverse, through
+     * one ladder of labels: every failure jumps to the label that undoes
+     * exactly what was set up before it, and a clean shutdown falls through
+     * the whole ladder. Each early return used to carry its own hand-written
+     * list, and they drifted: a port that could not be bound returned with
+     * the scheduler open and the job manager's workers still running (B132),
+     * and none of them released the lock table. Everything is declared here
+     * so no jump passes an initialisation.
+     */
+    int rc = 1;
+    job_manager_t *jm = NULL;
+    scheduler_t *sched = NULL;
+    api_server_t *srv = NULL;
 
     /* Pin both version stamps into the journal at startup so a misbehaving
      * host can be identified without grepping the binary. */
@@ -238,8 +295,15 @@ int main(int argc, char *argv[])
 
     if (!db) {
         log_error("database handle unavailable after init");
-        appguard_shutdown(guard);
-        return 1;
+        goto out_guard;
+    }
+
+    /* Before anything begins a transaction: from here c-utils' log writer,
+     * push queue and transaction scopes take the same write lock as
+     * everything else (CUTILS-2). */
+    if (db_txn_install_cutils_lock(db) != OK) {
+        log_error("%s", err_msg());
+        goto out_guard;
     }
 
     pin_sqlite_temp_dir(db_path);
@@ -256,8 +320,7 @@ int main(int argc, char *argv[])
         tuning.synchronous = STATE_DB_SYNC_DEFAULT;
     if (state_db_tune(db, &tuning) != OK) {
         log_error("%s", err_msg());
-        appguard_shutdown(guard);
-        return 1;
+        goto out_guard;
     }
     int sync_normal = strcmp(tuning.synchronous, "normal") == 0;
 
@@ -271,8 +334,7 @@ int main(int argc, char *argv[])
         int run_as = config_get_int(cfg, "security.run_as_uid", 0);
         if (privs_drop((uid_t)run_as, (gid_t)run_as) != OK) {
             log_error("security.run_as_uid: %s", err_msg());
-            appguard_shutdown(guard);
-            return 1;
+            goto out_guard;
         }
         if (run_as > 0)
             log_info("running as uid %d with CAP_DAC_READ_SEARCH; restores raise their own "
@@ -297,23 +359,29 @@ int main(int argc, char *argv[])
 
     if (repo_locks_init() != OK) {
         log_error("cannot initialise repo locks");
-        appguard_shutdown(guard);
-        return 1;
+        goto out_guard;
     }
 
     if (auth_init(db) != 0) {
         log_error("cannot initialise auth");
-        appguard_shutdown(guard);
-        return 1;
+        goto out_locks;
     }
-    /* Nothing is running yet, so any staged object rows belong to a backup
-     * that died with the last process, along with the pack they were in. */
-    if (store_index_drop_staged(db, 0) != OK)
-        log_warn("cannot drop staged objects left by an interrupted backup");
+    /* The index's start-up repairs, each timed and logged (index_startup.h).
+     * The brake first: pack presence reads it. */
+    pack_presence_set_brake((unsigned)config_get_int(cfg, "index.missing_brake_pct", 5),
+                            (unsigned)config_get_int(cfg, "index.missing_brake_packs", 10));
+    (void)index_startup_cleanup(db, NULL);
+
+    /* The purge thread below is the first that runs beside this one. Until
+     * now every write above was the only thing on the connection; from here
+     * on a write outside the write lock could land in another thread's
+     * transaction, and the guard reports it (db_write.h). */
+    db_txn_guard_arm(1);
 
     /* Removed repositories whose rows are not all gone yet, including any
      * an earlier build left behind; the thread resumes them in the
-     * background and waits for the next removal. */
+     * background and waits for the next removal. Not fatal, and
+     * repo_purge_stop is a no-op for a thread that never started. */
     if (repo_purge_start(db) != OK)
         log_warn("%s; removed repositories keep their index rows until next start",
                  err_msg());
@@ -327,18 +395,13 @@ int main(int argc, char *argv[])
     int rb_mb = config_get_int(cfg, "jobs.read_budget_mb", 256);
     if (read_budget_init((uint64_t)rb_mb * 1024 * 1024) != OK) {
         log_error("%s", err_msg());
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_purge;
     }
 
-    job_manager_t *jm = NULL;
     int max_parallel = config_get_int(cfg, "jobs.max_parallel", 2);
     if (job_manager_start(db, max_parallel, &jm) != OK) {
         log_error("cannot start job manager");
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_purge;
     }
     /* The same test push_init makes before it starts its worker: without
      * both, push_send drops every message. */
@@ -355,10 +418,7 @@ int main(int argc, char *argv[])
      */
     if (start_units(db, cfg, db_path) != OK) {
         log_error("%s", err_msg());
-        job_manager_stop(jm);
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_jm;
     }
     routes_units_init(db, jm);
 
@@ -367,7 +427,6 @@ int main(int argc, char *argv[])
      * it: firing a schedule and executing it are different concerns, and
      * keeping them apart means a slow job cannot delay the next tick.
      */
-    scheduler_t *sched = NULL;
     /* Before the scheduler computes due times from rows the route would no
      * longer accept, and with the scheduler off as well, so the list is
      * right whichever way it is configured. */
@@ -375,10 +434,7 @@ int main(int argc, char *argv[])
     if (config_get_int(cfg, "scheduler.enabled", 1)) {
         if (scheduler_open(db, schedule_dispatch, jm, &sched) != OK) {
             log_error("cannot create scheduler");
-            job_manager_stop(jm);
-            repo_purge_stop();
-            appguard_shutdown(guard);
-            return 1;
+            goto out_jm;
         }
         scheduler_set_canceller(sched, schedule_cancel);
     } else {
@@ -392,12 +448,10 @@ int main(int argc, char *argv[])
     /* static_dir is NULL: the daemon serves an API, not a web UI. The
      * lifted server retains its static-file path so it stays diffable
      * against airies-ups, but nothing reaches it here. */
-    api_server_t *srv = api_server_create(tcp_port, bind_addr, socket_path, NULL);
+    srv = api_server_create(tcp_port, bind_addr, socket_path, NULL);
     if (!srv) {
         log_error("cannot create API server");
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_sched;
     }
 
     routes_auth_set_config(cfg);
@@ -440,18 +494,25 @@ int main(int argc, char *argv[])
      * the repository. Cheap when nothing is missing (index_reconcile.h). */
     {
         reconcile_result_t rr;
+        uint64_t t0 = phase_now();
         if (index_reconcile(db, startup_reindex, jm, &rr) != OK) {
             log_warn("reconcile: %s", err_msg());
             err_clear();
-        } else if (rr.repos_missing == 0) {
+        } else if (rr.repos_missing == 0 && rr.tags_restored == 0) {
             log_info("reconcile: %u repositor%s checked, index complete",
                      rr.repos_checked, rr.repos_checked == 1 ? "y" : "ies");
         }
+        log_info("start-up: reconcile: %.3f s", (double)(phase_now() - t0) / 1e9);
     }
     routes_schedules_init(db, sched);
     routes_exports_init(db, config_get_str(cfg, "vm.export_dir"),
                         (unsigned)config_get_int(cfg, "vm.export_ttl_s", 14400),
-                        (unsigned)config_get_int(cfg, "vm.export_idle_s", 1800));
+                        (unsigned)config_get_int(cfg, "vm.export_idle_s", 1800),
+                        (unsigned)config_get_int(cfg, "vm.export_max_conns", 4));
+    /* gc moves objects between packs under a reader: it waits in the queue
+     * while an export is open on its repository. The export's ttl bounds
+     * the wait (vm.export_ttl_s, at most 7 days). */
+    job_manager_set_gate(jm, "gc", exports_repo_open, JOB_PHASE_EXPORT_OPEN);
     if (routes_register_health(srv, db) != 0 ||
         routes_register_auth(srv, db) != 0 ||
         routes_register_repos(srv, db) != 0 ||
@@ -461,22 +522,17 @@ int main(int argc, char *argv[])
         routes_register_providers(srv) != 0 ||
         routes_register_exports(srv) != 0) {
         log_error("cannot register routes");
-        api_server_stop(srv);
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_srv;
     }
 
     /* The unix socket bypasses this entirely; see auth_check. Filesystem
      * permissions on the socket are the access control there. */
     api_server_set_auth(srv, auth_check, db);
+    api_server_set_after_write(srv, after_write, db);
 
     if (api_server_start(srv) != 0) {
-        log_error("cannot start API server");
-        api_server_stop(srv);
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        log_error("cannot start API server: %s", api_server_error());
+        goto out_srv;
     }
 
     log_info("listening on %s and port %d", socket_path ? socket_path : "(no socket)", tcp_port);
@@ -486,23 +542,19 @@ int main(int argc, char *argv[])
      * which syncs every commit itself. */
     if (sync_normal && state_db_flusher_start(db_path, 1000) != OK) {
         log_error("%s", err_msg());
-        api_server_stop(srv);
-        if (sched) scheduler_stop(sched);
-        job_manager_stop(jm);
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_srv;
+    }
+    /* Checkpoints off the request path, whatever db.synchronous says: the
+     * shared handle never checkpoints (state_db_tune), so without this the
+     * WAL would only grow (checkpointer.h, SPEED-3). */
+    if (checkpointer_start(db_path, tuning.wal_autocheckpoint, 1000) != OK) {
+        log_error("%s", err_msg());
+        goto out_srv;
     }
 
     if (sched && scheduler_run(sched) != OK) {
         log_error("cannot start scheduler loop");
-        api_server_stop(srv);
-        scheduler_stop(sched);
-        job_manager_stop(jm);
-        state_db_flusher_stop();
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_srv;
     }
     log_info("c-backupd ready");
     /* Only now: api_server_start returns with the unix socket and the TCP
@@ -520,27 +572,42 @@ int main(int argc, char *argv[])
     /*
      * Outside in: stop taking requests, stop firing schedules, then cancel
      * and join running jobs - they stop between files and record how they
-     * ended, which needs the database AppGuard closes last.
+     * ended, which needs the database AppGuard closes last. That is the
+     * ladder below, which a failed startup enters part way down.
      */
     log_info("shutting down");
     /* Joining running jobs can take a while; STOPPING=1 lets systemctl show
      * "deactivating" for it rather than a service that looks healthy. */
     if (sd_notify_state("STOPPING=1") != OK)
         log_warn("cannot notify the service manager: %s", err_msg());
+    rc = 0;
+
+out_srv:
     api_server_stop(srv);
     /* No route can open one now; close every export while the database
      * is there to record it. */
     exports_shutdown();
-    if (sched) scheduler_stop(sched);
+out_sched:
+    scheduler_stop(sched);      /* NULL when disabled by config */
+out_jm:
     job_manager_stop(jm);
-    /* After the jobs: none is in a session any more. */
+    /* After the jobs: none is in a session any more. Both are safe when
+     * startup failed before they were set up. */
     units_shutdown();
     remote_stop();
     sp_registry_shutdown();
+out_purge:
     repo_purge_stop();
+out_locks:
     repo_locks_shutdown();
-    /* After every writer has stopped: one last sync of the WAL. */
+    /* After every writer has stopped: one last sync of the WAL. A no-op
+     * when it was never started. */
+    checkpointer_stop();
     state_db_flusher_stop();
+    /* Let go of the kept WAL descriptor before the close deletes the file,
+     * so the process does not pin a deleted inode on its way out. */
+    wal_sync_reset();
+out_guard:
     appguard_shutdown(guard);
-    return 0;
+    return rc;
 }

@@ -95,7 +95,7 @@ static status_t s_open(void *ctx, size_t i, cdc_source_t *src, uint64_t *size)
     (void)ctx;
     memset(&gens[i], 0, sizeof(gens[i]));
     gens[i].len = i == 0 ? 3 * 1048576 + 12345 : 777;
-    *src = (cdc_source_t){ gen_span, gen_read, &gens[i], gen_piece };
+    *src = (cdc_source_t){ gen_span, gen_read, &gens[i], gen_piece, NULL };
     *size = CDC_SIZE_STREAM;
     return OK;
 }
@@ -129,7 +129,7 @@ static void test_stream_and_drop(void **state)
         { "/.cbackup-unit/hooks/pg.dump", 0600, 0, 0, 0, 0 },
         { "/.cbackup-unit/hooks/bad.dump", 0600, 0, 0, 0, 0 },
     };
-    backup_synth_ops_t ops = { s_open, NULL, NULL, s_keep };
+    backup_synth_ops_t ops = { s_open, NULL, NULL, s_keep, NULL };
     backup_opts_t o;
     memset(&o, 0, sizeof(o));
     o.unit_snapshot = 1;
@@ -185,7 +185,7 @@ static void test_cdc_stream_sizes(void **state)
         gen_t *g = calloc(1, sizeof(*g));
         assert_non_null(g);
         g->len = lens[k];
-        cdc_source_t src = { gen_span, gen_read, g, gen_piece };
+        cdc_source_t src = { gen_span, gen_read, g, gen_piece, NULL };
         cdc_result_t cr;
         assert_int_equal(cdc_store_source(&p, &src, CDC_SIZE_STREAM, &sink, NULL, &cr), OK);
         assert_int_equal(cr.size, lens[k]);
@@ -341,6 +341,17 @@ static void test_hold_excludes_rest_scan(void **state)
     assert_true(b < 2 * a + 0.5);
 }
 
+/* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
+ * that leaves anything behind (SCRATCH-1). Setup removes it too, so a
+ * killed run is no obstacle to the next. */
+static int group_cleanup(void **state)
+{
+    (void)state;
+    int rc = system("rm -rf '" D "'");
+    (void)rc;
+    return 0;
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -349,5 +360,5 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_content_only_and_hold, setup, teardown),
         cmocka_unit_test_setup_teardown(test_hold_excludes_rest_scan, setup, teardown),
     };
-    return cmocka_run_group_tests(tests, NULL, NULL);
+    return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }

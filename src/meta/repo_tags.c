@@ -6,11 +6,14 @@
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
 #include "db_txn.h"
+#include "db_write.h"
 
 #include <cutils/log.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,9 +24,40 @@
  * file cannot make the daemon allocate without bound. */
 #define REPO_TAGS_MAX_BYTES (64u * 1024u * 1024u)
 
+/* Serialises every writer of a tags file; see repo_tags_lock. One for the
+ * process rather than one per repository: tag edits are rare and the time
+ * it is held is one small file's sync, so per-repository locks would buy
+ * nothing worth the bookkeeping. */
+static pthread_mutex_t g_tags_mu = PTHREAD_MUTEX_INITIALIZER;
+
+void repo_tags_lock(void)   { pthread_mutex_lock(&g_tags_mu); }
+void repo_tags_unlock(void) { pthread_mutex_unlock(&g_tags_mu); }
+
+/* Append one tag object to arr. 0 on success, -1 out of memory. */
+static int add_tag(cJSON *arr, const char *name, const char *snap, const char *ts,
+                   const char *created_at)
+{
+    cJSON *t = cJSON_CreateObject();
+    if (!t) return -1;
+    cJSON_AddItemToArray(arr, t);
+    return !cJSON_AddStringToObject(t, "name", name) ||
+           !cJSON_AddNumberToObject(t, "snapshot", (double)strtoll(snap, NULL, 10)) ||
+           !cJSON_AddNumberToObject(t, "ts", (double)strtoll(ts, NULL, 10)) ||
+           !cJSON_AddNumberToObject(t, "created_at", (double)strtoll(created_at, NULL, 10))
+           ? -1 : 0;
+}
+
 status_t repo_tags_save(cutils_db_t *db, int64_t repo_id, const char *repo_path)
 {
+    return repo_tags_save_with(db, repo_id, repo_path, NULL);
+}
+
+status_t repo_tags_save_with(cutils_db_t *db, int64_t repo_id, const char *repo_path,
+                             const repo_tag_change_t *chg)
+{
     if (!db || !repo_path) return set_error(ERR_INVALID, "repo_tags_save: null argument");
+    if (chg && (!chg->name || (!chg->remove && !chg->snap_id)))
+        return set_error(ERR_INVALID, "repo_tags_save: incomplete change");
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -41,18 +75,46 @@ status_t repo_tags_save(cutils_db_t *db, int64_t repo_id, const char *repo_path)
         return set_error(ERR_IO, "cannot read tags of repo %lld", (long long)repo_id);
     }
 
+    /*
+     * The change being made, as the file must show it once it commits:
+     * the tagged snapshot's timestamp, and the created_at the upsert keeps
+     * for a tag that already exists (it only moves snap_id).
+     */
+    char chg_ts[32] = "0", chg_created[32] = "0";
+    int chg_set = chg && !chg->remove;
+    if (chg_set) {
+        snprintf(chg_created, sizeof(chg_created), "%lld", (long long)chg->created_at);
+        db_result_t *s = NULL;
+        if (db_execute(db, "SELECT ts FROM snapshots WHERE repo_id = ? AND id = ?",
+                       (const char *[]){ repo, chg->snap_id, NULL }, &s) != 0) {
+            db_result_free(s);
+            db_result_free(r);
+            return set_error(ERR_IO, "cannot read snapshot %s of repo %lld",
+                             chg->snap_id, (long long)repo_id);
+        }
+        if (s && s->nrows == 1) snprintf(chg_ts, sizeof(chg_ts), "%s", s->rows[0][0]);
+        db_result_free(s);
+    }
+
     cJSON *root = cJSON_CreateObject();
     cJSON *arr  = root ? cJSON_AddArrayToObject(root, "tags") : NULL;
     int oom = !root || !arr || !cJSON_AddNumberToObject(root, "version", 1);
+    int chg_done = !chg_set;
     for (int i = 0; !oom && r && i < r->nrows; i++) {
-        cJSON *t = cJSON_CreateObject();
-        if (!t) { oom = 1; break; }
-        cJSON_AddItemToArray(arr, t);
-        oom = !cJSON_AddStringToObject(t, "name", r->rows[i][0]) ||
-              !cJSON_AddNumberToObject(t, "snapshot", (double)strtoll(r->rows[i][1], NULL, 10)) ||
-              !cJSON_AddNumberToObject(t, "ts", (double)strtoll(r->rows[i][2], NULL, 10)) ||
-              !cJSON_AddNumberToObject(t, "created_at", (double)strtoll(r->rows[i][3], NULL, 10));
+        const char *name = r->rows[i][0];
+        int cmp = chg ? strcmp(name, chg->name) : -1;
+        /* Kept in name order, as the query returns them, with the change
+         * slotted in where its name falls. */
+        if (!chg_done && cmp >= 0) {
+            if (cmp == 0) snprintf(chg_created, sizeof(chg_created), "%s", r->rows[i][3]);
+            oom = add_tag(arr, chg->name, chg->snap_id, chg_ts, chg_created) != 0;
+            chg_done = 1;
+        }
+        if (!oom && cmp != 0)
+            oom = add_tag(arr, name, r->rows[i][1], r->rows[i][2], r->rows[i][3]) != 0;
     }
+    if (!oom && !chg_done)
+        oom = add_tag(arr, chg->name, chg->snap_id, chg_ts, chg_created) != 0;
     db_result_free(r);
     char *body = oom ? NULL : cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -74,7 +136,9 @@ status_t repo_tags_save(cutils_db_t *db, int64_t repo_id, const char *repo_path)
     }
     size_t len = strlen(body);
     status_t st = OK;
-    if (fchmod(fd, 0644) != 0 ||
+    /* 0600, as the rest of a repository's files are (mkstemp's mode):
+     * the list names snapshots and when they were taken. */
+    if (fchmod(fd, 0600) != 0 ||
         write(fd, body, len) != (ssize_t)len || write(fd, "\n", 1) != 1)
         st = set_error_errno(ERR_IO, "cannot write %s", tmp);
     else if (fsync(fd) != 0)
@@ -83,7 +147,19 @@ status_t repo_tags_save(cutils_db_t *db, int64_t repo_id, const char *repo_path)
     free(body);
     if (st == OK && rename(tmp, final) != 0)
         st = set_error_errno(ERR_IO, "cannot install %s", final);
-    if (st != OK) unlink(tmp);
+    if (st != OK) { unlink(tmp); return st; }
+
+    /*
+     * The rename is durable only once the directory is. Without this the
+     * file's bytes were on disk and its name was not: a power cut a second
+     * after a tag was set lost it from the repository as well as from the
+     * database (B139), and the repository copy exists precisely to survive
+     * losing the database.
+     */
+    int dfd = open(repo_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return set_error_errno(ERR_IO, "cannot open %s to sync it", repo_path);
+    if (fsync(dfd) != 0) st = set_error_errno(ERR_IO, "cannot sync %s", repo_path);
+    close(dfd);
     return st;
 }
 
@@ -161,7 +237,7 @@ status_t repo_tags_restore(cutils_db_t *db, int64_t repo_id, const char *repo_pa
         if (!match) { skipped++; continue; }
 
         int affected = 0;
-        if (db_execute_non_query(db,
+        if (db_write(db,
                 "INSERT INTO tags (repo_id, name, snap_id, created_at)"
                 " VALUES (?, ?, ?, ?) ON CONFLICT(repo_id, name) DO NOTHING",
                 (const char *[]){ repo, name->valuestring, sid, created, NULL },

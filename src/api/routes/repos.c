@@ -6,10 +6,12 @@
 #include "repo_key.h"
 #include "repo_purge.h"
 #include "lock.h"
+#include "pack_presence.h"
 #include "json_row.h"
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "db_write.h"
 
 #include <openssl/crypto.h>
 
@@ -17,6 +19,9 @@
 #include <cutils/json.h>
 #include <cutils/log.h>
 
+#include <dirent.h>
+#include <stdbool.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,7 +45,9 @@ static const char *url_tail(const char *url, const char *prefix)
  * escrowed".
  */
 #define REPO_COLUMNS \
-    "SELECT id, uuid, path, label, added_at, encryption, key_escrowed FROM repos"
+    "SELECT id, uuid, path, label, added_at, encryption, key_escrowed," \
+    " COALESCE((SELECT value FROM recovery_state WHERE repo_id = repos.id" \
+    "           AND key = 'missing-packs'), '') FROM repos"
 
 static const jcol_t k_repo_cols[] = {
     { "id",       0, JCOL_INT },
@@ -50,27 +57,58 @@ static const jcol_t k_repo_cols[] = {
     { "added_at", 4, JCOL_INT },
 };
 
-static int repo_row_add(cutils_json_elem_t *e, cutils_json_resp_t *r, char **row)
+/*
+ * degraded is null, or why the repository takes no backups until an
+ * operator repairs it (pack_presence.h, B150). unavailable is null, or why
+ * the repository is not there to work on - an empty mountpoint, an
+ * unmounted packs/ - checked live, because nothing else would say so: a
+ * repository that is not there is not degraded either, and showed as
+ * "degraded": null (NIT-37). state is the one word for both: "ok",
+ * "degraded" or "unavailable", unavailable winning.
+ */
+static int repo_row_add(cutils_db_t *db, cutils_json_elem_t *e, cutils_json_resp_t *r,
+                        char **row)
 {
     const char *enc = (row[5] && row[5][0]) ? row[5] : "none";
     const char *esc = (row[6] && row[6][0]) ? row[6] : "0";
+    const char *deg = row[7] ? row[7] : "";
+    char why[PACK_PRESENCE_WHY_MAX] = "";
+    int avail = pack_presence_available(db, strtoll(row[0], NULL, 10), why, sizeof(why));
+    if (avail == 1) why[0] = '\0';
+    const char *state = avail != 1 ? "unavailable" : deg[0] ? "degraded" : "ok";
     if (e)
         return jrow_elem_add_row(e, k_repo_cols, JROW_N(k_repo_cols), row) != 0
             || jrow_elem_add(e, "encryption", JCOL_STR, enc) != 0
-            || jrow_elem_add(e, "key_escrowed", JCOL_BOOL, esc) != 0;
+            || jrow_elem_add(e, "key_escrowed", JCOL_BOOL, esc) != 0
+            || jrow_elem_add(e, "state", JCOL_STR, state) != 0
+            || jrow_elem_add(e, "degraded", JCOL_STR_NULL, deg) != 0
+            || jrow_elem_add(e, "unavailable", JCOL_STR_NULL, why) != 0;
     return jrow_resp_add_row(r, k_repo_cols, JROW_N(k_repo_cols), row) != 0
         || jrow_resp_add(r, "encryption", JCOL_STR, enc) != 0
-        || jrow_resp_add(r, "key_escrowed", JCOL_BOOL, esc) != 0;
+        || jrow_resp_add(r, "key_escrowed", JCOL_BOOL, esc) != 0
+        || jrow_resp_add(r, "state", JCOL_STR, state) != 0
+        || jrow_resp_add(r, "degraded", JCOL_STR_NULL, deg) != 0
+        || jrow_resp_add(r, "unavailable", JCOL_STR_NULL, why) != 0;
 }
 
 static api_response_t list_repos(const api_request_t *req, void *userdata)
 {
-    (void)req;
+    /* Paged like every other collection (B154). The default is the
+     * maximum, so a client that does not page still gets every repository a
+     * deployment has in practice; past that it pages rather than answering
+     * an unbounded list. */
     cutils_db_t *db = userdata;
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, 1000, 1000, &limit, &offset, &page_err) != 0) return page_err;
+    char lim[16], off[16];
+    snprintf(lim, sizeof(lim), "%d", limit);
+    snprintf(off, sizeof(off), "%d", offset);
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            REPO_COLUMNS " ORDER BY id", NULL, &r) != 0) {
+            REPO_COLUMNS " ORDER BY id LIMIT ? OFFSET ?",
+            (const char *[]){ lim, off, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list repos");
     }
@@ -106,7 +144,7 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
          * Prometheus is not where somebody finds out their key was never
          * written down.
          */
-        int bad = repo_row_add(&e, NULL, r->rows[i]) != 0;
+        int bad = repo_row_add(db, &e, NULL, r->rows[i]) != 0;
         /* Committing a partially built element would emit a row missing
          * fields the client requires; drop it and stop instead. */
         if (bad) break;
@@ -152,6 +190,81 @@ static int repo_uuid_of(cutils_db_t *db, int64_t repo_id, char *out, size_t outs
     return 0;
 }
 
+/*
+ * Snapshot records in the repository that the index has no row for.
+ *
+ * The repository is the source of truth and the database a derived index,
+ * so registering a repository that already has snapshots - on a new host,
+ * after losing state.db, or adopting a replica - registers it with an
+ * empty index: `snapshots` listed nothing and `verify` passed with
+ * "checked 0" until somebody ran a reindex (NIT-16). The records are
+ * counted the way reindex finds them, one numeric name each under
+ * <repo>/snapshots.
+ */
+static long long unindexed_snapshots(cutils_db_t *db, int64_t repo_id)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT path, (SELECT COUNT(*) FROM snapshots WHERE repo_id = repos.id)"
+            "  FROM repos WHERE id = ?",
+            (const char *[]){ id, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return 0;
+    }
+    char dir[PATH_MAX];
+    int w = snprintf(dir, sizeof(dir), "%s/snapshots", r->rows[0][0]);
+    long long indexed = strtoll(r->rows[0][1], NULL, 10);
+    db_result_free(r);
+    if (w < 0 || (size_t)w >= sizeof(dir)) return 0;
+
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    long long on_disk = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        char *end = NULL;
+        long long n = strtoll(e->d_name, &end, 10);
+        if (n > 0 && end && *end == '\0') on_disk++;
+    }
+    closedir(d);
+    return on_disk > indexed ? on_disk - indexed : 0;
+}
+
+/*
+ * After a registration: queue the reindex an adopted repository needs, and
+ * say so in the reply (`snapshots_unindexed`, `reindex_job`). Without its
+ * key an encrypted repository cannot be reindexed yet; the reply counts the
+ * snapshots and the key warning beside it says what to supply.
+ */
+static void reindex_if_needed(cutils_db_t *db, int64_t repo_id, int key_missing,
+                              char *frag, size_t fragsz)
+{
+    frag[0] = '\0';
+    long long missing = unindexed_snapshots(db, repo_id);
+    if (missing <= 0) return;
+    if (key_missing) {
+        snprintf(frag, fragsz, ",\"snapshots_unindexed\":%lld", missing);
+        log_warn("repo %lld holds %lld snapshot(s) the index does not; reindex "
+                 "it once its key is loaded", (long long)repo_id, missing);
+        return;
+    }
+    int64_t job_id = 0;
+    if (routes_submit_reindex(repo_id, "register", &job_id) != OK) {
+        log_warn("repo %lld holds %lld snapshot(s) the index does not, and a "
+                 "reindex could not be queued: %s; run c-backup reindex %lld",
+                 (long long)repo_id, missing, err_msg(), (long long)repo_id);
+        err_clear();
+        snprintf(frag, fragsz, ",\"snapshots_unindexed\":%lld", missing);
+        return;
+    }
+    log_info("repo %lld holds %lld snapshot(s) the index does not; reindex job "
+             "%lld queued", (long long)repo_id, missing, (long long)job_id);
+    snprintf(frag, fragsz, ",\"snapshots_unindexed\":%lld,\"reindex_job\":%lld",
+             missing, (long long)job_id);
+}
+
 static api_response_t create_repo(const api_request_t *req, void *userdata)
 {
     cutils_db_t *db = userdata;
@@ -194,6 +307,7 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
     repo_enc_request_t enc;
     memset(&enc, 0, sizeof(enc));
     enc.key_dir = repo_key_dir();
+    enc.mode_given = encstr != NULL;
     if (repo_enc_resolve(encstr, passphrase, &enc.mode) != OK) {
         api_response_t bad = api_error(400, err_msg());
         free(path); free(label); free(encstr); free(passphrase);
@@ -226,6 +340,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         err_clear();
     }
     const char *unlocked = reg.key_unlocked ? ",\"key_unlocked\":true" : "";
+    char reidx[128] = "";
+    if (st == OK && !reg.created) reindex_if_needed(db, id, reg.key_missing,
+                                                    reidx, sizeof(reidx));
 
     api_response_t out;
     if (st != OK) {
@@ -244,9 +361,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         char *body = NULL;
         int n = asprintf(&body,
             "{\"id\":%lld,\"already_registered\":true,\"label_updated\":%s,"
-            "\"encryption\":\"%s\"%s%s}",
+            "\"encryption\":\"%s\"%s%s%s}",
             (long long)id, reg.label_updated ? "true" : "false",
-            repo_enc_mode_name(reg.enc_mode), unlocked, keywarn);
+            repo_enc_mode_name(reg.enc_mode), unlocked, keywarn, reidx);
         out = n < 0 ? api_error(500, "out of memory") : api_ok(body);
         log_info("repo %lld at %s was already registered%s", (long long)id, path,
                  reg.label_updated ? "; label updated" : "");
@@ -256,9 +373,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         /* From the marker, not the request: an adopted repository brings
          * its own mode, and recording what was asked for would be wrong. */
         if (reg.enc_mode != REPO_ENC_NONE &&
-            db_execute_non_query(db, "UPDATE repos SET encryption = ? WHERE id = ?",
-                                 (const char *[]){ repo_enc_mode_name(reg.enc_mode),
-                                                   idbuf, NULL }, NULL) != 0)
+            db_write(db, "UPDATE repos SET encryption = ? WHERE id = ?",
+                     (const char *[]){ repo_enc_mode_name(reg.enc_mode),
+                                       idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: cannot record encryption mode", (long long)id);
 
         char *body = NULL;
@@ -279,12 +396,12 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
                 (long long)id, enc.key_hex, (long long)id);
         } else if (reg.enc_mode != REPO_ENC_NONE) {
             n = asprintf(&body,
-                "{\"id\":%lld,\"encryption\":\"%s\",\"key_escrowed\":%s%s%s}",
+                "{\"id\":%lld,\"encryption\":\"%s\",\"key_escrowed\":%s%s%s%s}",
                 (long long)id, repo_enc_mode_name(reg.enc_mode),
                 reg.enc_mode == REPO_ENC_PASSPHRASE ? "true" : "false",
-                unlocked, keywarn);
+                unlocked, keywarn, reidx);
         } else {
-            n = asprintf(&body, "{\"id\":%lld}", (long long)id);
+            n = asprintf(&body, "{\"id\":%lld%s}", (long long)id, reidx);
         }
         if (n < 0)
             out = api_error(500, "out of memory");
@@ -294,8 +411,8 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         /* A passphrase repository is recoverable from the repository itself,
          * so there is nothing for the operator to file away. */
         if (reg.enc_mode == REPO_ENC_PASSPHRASE &&
-            db_execute_non_query(db, "UPDATE repos SET key_escrowed = 1 WHERE id = ?",
-                                 (const char *[]){ idbuf, NULL }, NULL) != 0)
+            db_write(db, "UPDATE repos SET key_escrowed = 1 WHERE id = ?",
+                     (const char *[]){ idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: cannot record escrow state", (long long)id);
 
         log_info("registered repo %lld at %s (%s)", (long long)id, path,
@@ -337,7 +454,7 @@ static api_response_t get_repo(const api_request_t *req, void *userdata)
      * spliced path and label in unescaped, so a path holding a quote or a
      * backslash produced a body no client could parse. */
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
-    int bad = json_resp_new(&resp) != 0 || repo_row_add(NULL, resp, r->rows[0]) != 0;
+    int bad = json_resp_new(&resp) != 0 || repo_row_add(db, NULL, resp, r->rows[0]) != 0;
     db_result_free(r);
     if (bad) return api_error(500, "out of memory");
     char *body = NULL; size_t blen = 0;
@@ -379,6 +496,9 @@ static api_response_t delete_repo(const api_request_t *req, void *userdata)
         return api_error(409, "repo is busy: a job is running against it; "
                               "cancel it or wait, then remove the repository");
     }
+    /* Its NBD exports go first, revoked and journalled, rather than left
+     * serving a repository whose index is about to be purged under them. */
+    exports_close_repo(id, "repository removed");
     status_t st = repo_deregister(db, id);
     repo_unlock(id);
     if (st != OK) return api_error(500, err_msg());
@@ -498,6 +618,7 @@ static const char *repo_path_allow(const char *rest)
         { "/key",        "GET" },
         { "/key/import", "POST" },
         { "/key/ack",    "POST" },
+        { "/repair",     "POST" },
         { "/tags",       "GET, POST" },
         { "/schedules",  "GET, POST" },
         { "/policy",     "GET, PUT" },
@@ -722,12 +843,57 @@ static api_response_t key_ack(const api_request_t *req, int64_t repo_id)
         return api_error(400, "repository is not encrypted; there is no key to escrow");
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)repo_id);
-    if (db_execute_non_query(g_db_for_keys,
+    if (db_write(g_db_for_keys,
             "UPDATE repos SET key_escrowed = 1 WHERE id = ?",
             (const char *[]){ id, NULL }, NULL) != 0)
         return api_error(500, "cannot record escrow state");
     log_info("repo %lld: key acknowledged as escrowed", (long long)repo_id);
     return api_ok(strdup("{\"ok\":true}"));
+}
+
+/*
+ * The operator accepts that the packs a degraded repository is missing are
+ * gone (B150): their objects are marked absent, so the next backup stores
+ * what it still finds, and backups are taken again. Only with
+ * accept_missing, which is the whole point: the brake exists because a
+ * wrong path looks exactly like loss.
+ */
+static api_response_t repo_repair(const api_request_t *req, int64_t repo_id)
+{
+    bool accept = false;
+    if (req->body && req->body_len) {
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *jr = NULL;
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &jr, &pje) != JREQ_OK)
+            return api_error(400, pje.msg);
+        if (json_req_get_bool(jr, "accept_missing", &accept) != 0) accept = false;
+    }
+    if (!accept)
+        return api_error(400, "repair marks a degraded repository's missing packs as "
+                              "lost; it needs accept_missing (CLI --accept-missing)");
+    if (repo_trylock_write(repo_id) != OK)
+        return api_error(503, "repository is busy; try again when its job finishes");
+    pack_presence_t p;
+    status_t st = pack_presence_check(g_db_for_keys, repo_id, 1, &p);
+    repo_unlock(repo_id);
+    if (st != OK) return api_error(500, err_msg());
+    if (p.unavailable) {
+        char msg[sizeof(p.why) + 96];
+        snprintf(msg, sizeof(msg), PACK_PRESENCE_UNAVAILABLE_FMT, (long long)repo_id, p.why);
+        return api_error(409, msg);
+    }
+    char *body = NULL;
+    if (asprintf(&body,
+                 "{\"packs_checked\":%u,\"packs_missing\":%u,\"packs_unknown\":%u,"
+                 "\"packs_dropped\":%u,\"objects_absent\":%llu,\"packs_returned\":%u,"
+                 "\"objects_restored\":%llu,\"degraded\":%s}",
+                 p.packs_checked, p.packs_missing, p.packs_unknown, p.packs_dropped,
+                 (unsigned long long)p.objects_absent, p.packs_returned,
+                 (unsigned long long)p.objects_restored, p.degraded ? "true" : "false") < 0)
+        return api_error(500, "out of memory");
+    journal_record(g_db_for_keys, repo_id, "api", "repair", "success", 0,
+                   p.packs_dropped ? "missing packs accepted as lost" : "nothing missing");
+    return api_ok(body);
 }
 
 static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
@@ -828,6 +994,7 @@ static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
     if (repo_path_refused(rest, "POST", &refused)) return refused;
     if (strcmp(rest, "/key/import") == 0) return key_import(req, repo_id);
     if (strcmp(rest, "/key/ack") == 0)    return key_ack(req, repo_id);
+    if (strcmp(rest, "/repair") == 0)     return repo_repair(req, repo_id);
     if (strcmp(rest, "/backup") == 0)
         return backup_route_post(req, repo_id, rest);
     if (strcmp(rest, "/tags") == 0)
