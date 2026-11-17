@@ -72,6 +72,12 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+    /* Without this every log_* line went nowhere: the helper said nothing
+     * at all, warnings included, which a socket nobody can reach made
+     * plain. To the console (stdout, errors to stderr), where Docker and
+     * the journal collect it; no database. */
+    if (log_init(NULL, LOG_INFO, 0) != 0)
+        fprintf(stderr, "c-backup-helper: cannot start logging; continuing without it\n");
 
     sp_ctx_t *fake = NULL;
     if (pol.fake_spec[0]) {
@@ -131,5 +137,6 @@ int main(int argc, char **argv)
     if (have_lxc) lxc_backend_fini(&be[have_lxc - 1]);
     if (fake) fake_provider_ops.fini(fake);
     helper_policy_free(&pol);
+    log_shutdown();
     return 0;
 }

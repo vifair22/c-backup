@@ -6,7 +6,7 @@
  * start. The daemon cannot change it; nothing on the wire names a path,
  * dataset, snapshot or command the policy did not.
  *
- *   [helper]    daemon_uid, daemon_id, max_pause_s, max_captures_per_hour,
+ *   [helper]    daemon_uid, daemon_gid, daemon_id, max_pause_s, max_captures_per_hour,
  *               capture_max_s, allow_restore, allow_define,
  *               allow_privileged_define, state_dir, socket, fake_spec
  *   [units]     allow = <provider>:<glob>, ...
@@ -49,6 +49,9 @@ typedef struct {
 
 typedef struct {
     uid_t    daemon_uid;
+    /* The socket's group: the daemon's gid. Defaults to daemon_uid, which
+     * is what security.run_as_uid gives the daemon as its gid. */
+    gid_t    daemon_gid;
     char     daemon_id[9];
     unsigned max_pause_s;
     unsigned max_captures_per_hour;
