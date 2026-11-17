@@ -757,6 +757,61 @@ virsh -q -c "$VIRT_URI" undefine cbk-uat-vm >/dev/null 2>&1
 }
 test_vm
 
+# ---- B186: the helper's container layout does not multiply host mounts ---
+# A bind under an rshared bind propagates back into the host's peer group,
+# so with the old documented layout (state_dir bound separately beside
+# -v /mnt/cache:/mnt/cache:rshared) every helper start doubled the host's
+# stacked mounts of the state dir: 16383 on FS1 after 14 starts. Here the
+# pool is made shared, as Unraid's is, and a container with the documented
+# layout is started and stopped repeatedly: the mount table must not move.
+# Then the old layout on a scratch directory shows the doubling is real
+# under this Docker, the helper refuses to start on the result, and the
+# documented cleanup removes every copy.
+# CBK_B186_LAYOUT=old runs the main loop on the old layout instead, which
+# must fail it (run locally to prove the test catches the bug).
+
+test_b186_layout() {
+    local starts=5 i lay="$CACHE/system/cbk-b186-state" olds="$CACHE/system/cbk-b186-old"
+    local layout="${CBK_B186_LAYOUT:-documented}" args t0 s0 out rc keep
+    mi_at() { awk -v p="$1" '$5==p' /proc/self/mountinfo | wc -l; }
+    mkdir -p "$lay" "$olds"
+    mount --make-rshared "$CACHE"
+    if [ "$layout" = old ]; then
+        args="-v $lay:$lay -v $CACHE:$CACHE:rshared"
+    else
+        args="-v $CACHE:$CACHE:rslave"
+    fi
+    log "B186: $starts starts of a helper-layout container ($layout layout)"
+    t0=$(wc -l </proc/self/mountinfo)
+    s0=$(mi_at "$lay")
+    for i in $(seq 1 $starts); do
+        # shellcheck disable=SC2086
+        docker run --rm --network none $args -v "$HRUN:$HRUN" "$IMG" true >/dev/null 2>&1 ||
+            bad "B186 start $i runs" "exit 0" "docker run failed"
+        check "B186 start $i ($layout): the state dir's host mounts unchanged" "$s0" "$(mi_at "$lay")"
+        check "B186 start $i ($layout): the host mount table unchanged" "$t0" "$(wc -l </proc/self/mountinfo)"
+    done
+
+    log "B186: the old layout on a scratch state dir, the refusal and the cleanup"
+    for i in 1 2 3; do
+        docker run --rm --network none -v "$olds:$olds" -v "$CACHE:$CACHE:rshared" "$IMG" true >/dev/null 2>&1
+    done
+    check "B186: the old layout doubles at each start (2^3-1 after 3)" 7 "$(mi_at "$olds")"
+    sed -e "s|^state_dir = .*|state_dir = $olds|" "$WORK/helper.ini" > "$WORK/helper-b186.ini"
+    chmod 0600 "$WORK/helper-b186.ini"
+    out=$("$SRC/build/bins/c-backup-helper" --policy "$WORK/helper-b186.ini" 2>&1); rc=$?
+    check "B186: the helper refuses to start on stacked mounts" 1 "$rc"
+    contains "B186: and says how many and what to do" "$olds is mounted 7 times" "$out"
+    check "B186: and adds none" 7 "$(mi_at "$olds")"
+    # The cleanup as docs/helper.md gives it (the scratch dir is no dataset).
+    keep=0
+    while [ "$(mi_at "$olds")" -gt "$keep" ]; do umount -l "$olds" || break; done
+    check "B186: the documented cleanup removes every copy" 0 "$(mi_at "$olds")"
+    mount --make-rprivate "$CACHE"
+    rmdir "$lay" "$olds" 2>/dev/null
+}
+test_b186_layout
+
 # ---- the privilege drop and the helper suites, as root -------------------
 # The CI job containers are root with Docker's default capabilities, which
 # hold no CAP_DAC_READ_SEARCH, so there test_root_drop can only check that
