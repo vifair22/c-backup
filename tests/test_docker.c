@@ -295,6 +295,30 @@ static void test_two_instants_pause(void **state)
     be.ops->desc_free(d);
 }
 
+/* A pause the watchdog undid before the snapshots: the two instants were
+ * taken from a running unit, so the level is inconsistent, said so. */
+static void test_pause_lost(void **state)
+{
+    (void)state;
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    sp_unit_desc_t *d = NULL;
+    fdk.lose_pause = 1;
+    status_t st = capture("solo", SP_CONSIST_INCONSISTENT, &s, &info, &d);
+    fdk.lose_pause = 0;
+    assert_int_equal(st, OK);
+    assert_int_equal(fdk.pauses, 1);
+    assert_int_equal(fdk.unpauses, 0);
+    assert_int_equal(info->achieved, SP_CONSIST_INCONSISTENT);
+    assert_true(info->consist_flags & SP_CF_WATCHDOG_RELEASED);
+    int warned = 0;
+    for (size_t i = 0; i < info->n_warnings; i++) warned |= strstr(info->warnings[i], "watchdog") != NULL;
+    assert_true(warned);
+    assert_int_equal(holds_open, 2);                 /* two snapshots; the pause row cleared */
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+}
+
 /* Members paused together, all of them released; a member that will not
  * pause leaves none paused and fails a unit spanning two instants. */
 static void test_parallel_pause(void **state)
@@ -737,10 +761,14 @@ static void test_sweep_unpauses(void **state)
     rq.intents = in;
     rq.n_intents = 2;
     rq.released = released;
+    int absent[2] = { 9, 9 };
+    rq.absent = absent;
     sp_sweep_report_t rep;
     assert_int_equal(be.ops->sweep(be.ctx, &rq, &rep), OK);
     assert_int_equal(released[0], 1);
     assert_int_equal(released[1], 1);
+    assert_int_equal(absent[0], 0);
+    assert_int_equal(absent[1], 1);
     assert_string_equal(fdk.c[0].state, "running");
 }
 
@@ -795,6 +823,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_instant_no_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_two_instants_pause, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pause_lost, setup, teardown),
         cmocka_unit_test_setup_teardown(test_parallel_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_hook_logs_and_dumps, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),

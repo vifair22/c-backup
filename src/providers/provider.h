@@ -246,7 +246,10 @@ typedef struct {
  * and the start-up and end-of-job sweeps delete the row. The watchdog
  * keeps it: it sweeps holds of live jobs, and a row is recorded before its
  * hold is taken, so nothing held may mean not taken yet. Deleting the row
- * then would leave the hold, once taken, unjournalled and unbounded.
+ * then would leave the hold, once taken, unjournalled and unbounded. The
+ * helper's watchdog does the same with its own journal. Only freezes and
+ * pauses are timed, so a provider must fill it for those kinds; for the
+ * rest it may leave 0.
  */
 typedef struct {
     const char        *daemon8;

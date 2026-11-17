@@ -59,10 +59,15 @@ void helper_server_handle(helper_server_t *s, const char *req, size_t len,
 void helper_server_handle_fd(helper_server_t *s, const char *req, size_t len, int in_fd,
                              char **resp, int *pass_fd);
 
-/* One watchdog pass at now: holds past max_pause_s, captures past their
- * lease, hook runs past their timeout. Returns how many it released. */
-unsigned helper_server_tick(helper_server_t *s, time_t now);
+/* One watchdog pass at now_ms (wall-clock milliseconds): holds past
+ * max_pause_s, captures past their lease, hook runs past their timeout.
+ * Returns how many it released. */
+unsigned helper_server_tick(helper_server_t *s, int64_t now_ms);
 
 /* Live captures and journalled holds, for tests. */
 size_t helper_server_captures(helper_server_t *s);
 size_t helper_server_holds(helper_server_t *s);
+
+/* For tests: journal a hold as a capture's begin does, before taking it. */
+status_t helper_server_record(helper_server_t *s, const char *unit, const char *kind,
+                              const char *detail);

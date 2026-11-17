@@ -567,7 +567,7 @@ static void test_leases_and_rate(void **state)
     hstart((unsigned)getuid(), 30, 1, 2, 0, 0);
     expect(req("capture.begin", "{\"units\":[\"fake:u1\"],\"pause\":false}"), "ok");
     assert_int_equal(helper_server_captures(srv), 1);
-    assert_true(helper_server_tick(srv, time(NULL) + 5) >= 1);
+    assert_true(helper_server_tick(srv, ((int64_t)time(NULL) + 5) * 1000) >= 1);
     assert_int_equal(helper_server_captures(srv), 0);
     assert_int_equal(helper_server_holds(srv), 0);
     expect(req("capture.begin_paths", "{\"paths\":[\"" HF_MOUNT "\"]}"), "ok");
@@ -607,6 +607,28 @@ static void test_watchdog(void **state)
     assert_int_equal(st.watchdog_released, 1);
     cJSON_Delete(b.out);
     expect(req("sweep", "{}"), "ok");
+    hstop();
+}
+
+/* A hold is journalled before it is taken. A watchdog pass between the two
+ * finds nothing held and must keep the record, or the freeze that lands a
+ * moment later is bounded by nothing (B151). */
+static void test_watchdog_waits_for_take(void **state)
+{
+    (void)state;
+    hstart((unsigned)getuid(), 1, 86400, 1000, 0, 0);
+    assert_int_equal(helper_server_record(srv, "fake:u1", SP_HOLD_FREEZE, "agent:u1"), OK);
+    int64_t later = ((int64_t)time(NULL) + 5) * 1000;
+    assert_int_equal(helper_server_tick(srv, later), 0);
+    assert_int_equal(helper_server_holds(srv), 1);
+    assert_int_equal(fake_hold_plant(fk, "u1", SP_HOLD_FREEZE, "agent:u1"), OK);
+    assert_int_equal(helper_server_tick(srv, later), 1);
+    assert_false(fake_hold_held(fk, "u1", SP_HOLD_FREEZE, NULL));
+    assert_int_equal(helper_server_holds(srv), 0);
+    /* A sweep still drops a record with nothing under it. */
+    assert_int_equal(helper_server_record(srv, "fake:u1", SP_HOLD_FREEZE, "agent:u1"), OK);
+    expect(req("sweep", "{}"), "ok");
+    assert_int_equal(helper_server_holds(srv), 0);
     hstop();
 }
 
@@ -753,6 +775,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_capture_lifecycle, setup, teardown),
         cmocka_unit_test_setup_teardown(test_leases_and_rate, setup, teardown),
         cmocka_unit_test_setup_teardown(test_watchdog, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_watchdog_waits_for_take, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restart_sweep, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_stage_swap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_socket, setup, teardown),
