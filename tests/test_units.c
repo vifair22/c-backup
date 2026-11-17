@@ -13,6 +13,7 @@
 
 #include <pthread.h>
 #include <setjmp.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -705,12 +706,12 @@ static void test_crash_sweep(void **state)
     assert_true(sw.left_foreign >= 3);
 }
 
-typedef struct { volatile int stop; unsigned released; } wd_t;
+typedef struct { atomic_int stop; unsigned released; } wd_t;
 
 static void *wd_loop(void *arg)
 {
     wd_t *w = arg;
-    while (!w->stop) {
+    while (!atomic_load(&w->stop)) {
         unsigned n = 0;
         (void)units_watchdog_tick(db, units_now_ms() + 1000, &n);
         w->released += n;
@@ -734,7 +735,7 @@ static void test_watchdog_bounds_freeze(void **state)
     const char *names[] = { "cbk-uat-one" };
     unit_backup_result_t res;
     status_t st = run_units(names, 1, 0, &res);
-    w.stop = 1;
+    atomic_store(&w.stop, 1);
     pthread_join(th, NULL);
     assert_int_equal(st, OK);
     assert_true(w.released >= 1);
@@ -770,7 +771,7 @@ static void test_watchdog_bounds_pause(void **state)
     pthread_t th;
     assert_int_equal(pthread_create(&th, NULL, wd_loop, &w), 0);
     status_t st = run_units(names, 1, 0, &res);
-    w.stop = 1;
+    atomic_store(&w.stop, 1);
     pthread_join(th, NULL);
     fake_fail_clear(fk);
     assert_int_equal(st, OK);
