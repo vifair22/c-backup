@@ -225,25 +225,27 @@ same cancellation for one job, and prints the job record with `"cancel_requested
 waiting in the queue never starts: it is `cancelled` in that record already,
 and in the journal as "cancelled before it started".
 
-A daemon that dies without stopping (a crash, `kill -9`, `docker kill`, power
-loss) marks whatever was running as `failed: interrupted by daemon restart` on
-its next start, and journals each such job then, since the killed process
-could not. A power cut can also cost the database about its last second of
-the daemon's own writes (never an edit the API had answered); the next start
-puts back any snapshot or tag that went with them on its own (section 17.5). Either way the repository is consistent: a backup's partial pack
-and the index rows staged into it are discarded, and the next backup stores
-those files again. Staging files a killed writer left in the repository's
-`tmp/` are removed by the next backup, gc or reindex, by registering the
-repository, and in a replica by the next replicate into it. Each of these
-first takes an exclusive lock on `tmp/.lock`, which every process staging
-a pack there also holds. Getting it means no other writer of pack, snapshot
-record, snapshot-id or deletion-marker staging can be live (those are
-written only under that lock or the repository's write lock), so all of
-those go whatever their age; when another process holds it, only staging
-an hour old goes. The tag mirror's staging (`tags.*`) is written by tag
-commands, which hold neither and may run during a backup or gc, so it is
-only ever removed once it is an hour old. Opening a repository also removes
-any staging an hour old. Installed packs, in `packs/`, are never touched.
+A daemon that dies without stopping (a crash, `kill -9`, `docker kill`,
+power loss) marks whatever was running as `failed: interrupted by daemon
+restart` on its next start, and journals each such job then, since the
+killed process could not. A power cut can also cost the database about its
+last second of the daemon's own writes (never an edit the API had answered);
+the next start puts back any snapshot or tag that went with them on its own
+(section 17.5). Either way the repository is consistent: a backup's partial
+pack and the index rows staged into it are discarded, and the next backup
+stores those files again. Staging files a killed writer left in the
+repository's `tmp/`, or in `packs/.staging/` where packs are staged, are
+removed by the next backup, gc or reindex, by registering the repository,
+and in a replica by the next replicate into it. Each of these first takes an
+exclusive lock on `tmp/.lock`, which every process staging a pack also
+holds. Getting it means no other writer of pack, snapshot record,
+snapshot-id or deletion-marker staging can be live (those are written only
+under that lock or the repository's write lock), so all of those go whatever
+their age; when another process holds it, only staging an hour old goes. The
+tag mirror's staging (`tags.*`) is written by tag commands, which hold
+neither and may run during a backup or gc, so it is only ever removed once
+it is an hour old. Opening a repository also removes any staging an hour
+old. Installed packs, in `packs/`, are never touched.
 
 A restore killed this way redoes more than the file it was inside. Verified
 files wait under temporary names (`.c-backup-partial.XXXXXX`) until one
@@ -577,7 +579,8 @@ A repository is a directory the daemon registers and then owns.
   snapshots/<id>                    snapshot records: root tree name and metadata
   tags                              the tag list, kept so a reindex can restore it
   packs/XXXXXX/pack-NNNNNNNNNN.dat  every object, manifest trees included
-  tmp/                              staging for atomic writes
+  packs/.staging/                   staging for packs, created on first use
+  tmp/                              staging for every other atomic write
 ```
 
 There is no `objects/` directory: every object lives in a pack. Packs are
@@ -681,8 +684,24 @@ the index never hands their numbers out again (section 17).
 ### 5.3 Where to put a repository
 
 Anywhere the daemon can write with ordinary POSIX semantics: `rename` within
-the repository must be atomic, so `tmp/` lives inside it. Local disks, ZFS,
-XFS, ext4 and NFS mounts all work.
+the repository must be atomic, so its staging lives inside it. Local disks,
+ZFS, XFS, ext4 and NFS mounts all work.
+
+`packs/` may be a filesystem of its own: a dataset, a share or a disk
+mounted at `<repo>/packs`, with the rest of the repository elsewhere. Packs
+are staged in `packs/.staging/`, on the same filesystem as the packs, so
+installing one never crosses a mount; everything else is staged in `tmp/`,
+beside the root. Before 1.0.0 packs were staged in `tmp/`, and with
+`packs/` mounted every backup failed at its first pack with `Invalid
+cross-device link`. Only `packs/` may be split off this way: the root,
+`snapshots/` and `tmp/` must share one filesystem, and a `snapshots/`
+mounted on its own fails every backup at its snapshot record.
+
+A separate `packs/` is what the daemon's availability checks are built
+around (section 17.6): unmounted, it is an empty directory, and the daemon
+reports the repository unavailable rather than reading that as every pack
+lost. Mount it before the daemon starts, or expect the repository to be
+unavailable until it is; nothing is written into an unmounted `packs/`.
 
 Which disk is fastest for a repository depends on the hardware, not on the
 kind of storage, so measure before assuming. On one Unraid server a
@@ -2371,14 +2390,18 @@ its content.
 A dropped pack keeps its number. Pack numbers are never issued twice: the
 repository records the next free one in `pack-ids` (docs/repo-format.md),
 raised before any pack takes a number, and the index keeps a tombstone for
-every dropped pack. So the next backup writes its pack under a new number,
-never the dropped one's, and if the missing pack comes back - a share
-remounted, a copy put back - nothing collides. The next start or backup
-finds it, reads every entry and checks each against its name, and takes it
-back into the index: objects marked absent are present again, and where a
-later backup stored an object again, whichever copy proves good is the one
-the index keeps. An entry that fails the check is left out and the journal
-entry (operation `pack-returned`) says how many.
+every dropped pack. The mark is raised 64 numbers at a time, and numbers a
+run took and did not use - a backup that failed, or one that wrote fewer
+packs - are left as a gap: harmless, since a gap costs only numbers, and
+there are enough for a failed backup every minute for over a century. So the
+next backup writes its pack under a new number, never the dropped one's, and
+if the missing pack comes back - a share remounted, a copy put back -
+nothing collides. The next start or backup finds it, reads every entry and
+checks each against its name, and takes it back into the index: objects
+marked absent are present again, and where a later backup stored an object
+again, whichever copy proves good is the one the index keeps. An entry that
+fails the check is left out and the journal entry (operation
+`pack-returned`) says how many.
 
 Two things are never taken for missing packs:
 
@@ -2393,6 +2416,23 @@ Two things are never taken for missing packs:
 
   - its root has no `.cbackup` marker: an empty mountpoint, or the wrong
     path;
+  - its root's `.cbackup` marker is another repository's: two
+    repositories' directories swapped, or the wrong disk or share mounted
+    at the path. A repository's identity is the UUID in its marker, not its
+    path, and the index's offsets into one repository's packs mean nothing
+    in another's, even where the pack file names match. The reason names
+    both:
+
+    ```
+    repository 1 is unavailable: /srv/backup/main holds repository 7c1e...e2, not 3f0a...91, the one registered at this path: swapped with another repository, or the wrong disk or share mounted there; nothing was read or written
+    ```
+
+    Nothing overrides this, `repo repair --accept-missing` included. Put the
+    right repository back at the path; or, if it really did move, register
+    its new path (section 5.1: the UUID links it back to its history). Tag
+    changes are refused the same way (HTTP 409), and the start-up checks
+    that read a repository by its path - reconcile, finishing an
+    interrupted prune - pass it by with a warning;
   - its `packs/` directory is missing or cannot be read: a share that is
     not mounted;
   - `packs/` is not the directory it was - its device or inode changed,
@@ -2421,9 +2461,10 @@ Two things are never taken for missing packs:
   sudo c-backup repo repair 1 --accept-missing
   ```
 
-  The repair accepts a replaced `packs/` only when the repository root's
-  `.cbackup` marker is the one registered for that id; otherwise it stays
-  unavailable and says the marker is not this repository's. It marks the
+  The repair acts only when the repository root's `.cbackup` marker is the
+  one registered for that id, for a replaced `packs/` and for every pack
+  missing alike; otherwise the repository stays unavailable with the
+  reason above, naming the repository the path holds. It marks the
   missing packs' objects absent (section 17.6, above), records the new
   device:inode so later checks are ordinary, and the next backup stores
   again whatever its sources still hold. A `packs/` that moved with every
