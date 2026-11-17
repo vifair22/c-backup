@@ -6,6 +6,7 @@
 #include "repo_key.h"
 #include "repo_purge.h"
 #include "lock.h"
+#include "pack_presence.h"
 #include "json_row.h"
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
@@ -18,6 +19,7 @@
 #include <cutils/log.h>
 
 #include <dirent.h>
+#include <stdbool.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +44,9 @@ static const char *url_tail(const char *url, const char *prefix)
  * escrowed".
  */
 #define REPO_COLUMNS \
-    "SELECT id, uuid, path, label, added_at, encryption, key_escrowed FROM repos"
+    "SELECT id, uuid, path, label, added_at, encryption, key_escrowed," \
+    " COALESCE((SELECT value FROM recovery_state WHERE repo_id = repos.id" \
+    "           AND key = 'missing-packs'), '') FROM repos"
 
 static const jcol_t k_repo_cols[] = {
     { "id",       0, JCOL_INT },
@@ -52,17 +56,22 @@ static const jcol_t k_repo_cols[] = {
     { "added_at", 4, JCOL_INT },
 };
 
+/* degraded is null, or why the repository takes no backups until an
+ * operator repairs it (pack_presence.h, B150). */
 static int repo_row_add(cutils_json_elem_t *e, cutils_json_resp_t *r, char **row)
 {
     const char *enc = (row[5] && row[5][0]) ? row[5] : "none";
     const char *esc = (row[6] && row[6][0]) ? row[6] : "0";
+    const char *deg = row[7] ? row[7] : "";
     if (e)
         return jrow_elem_add_row(e, k_repo_cols, JROW_N(k_repo_cols), row) != 0
             || jrow_elem_add(e, "encryption", JCOL_STR, enc) != 0
-            || jrow_elem_add(e, "key_escrowed", JCOL_BOOL, esc) != 0;
+            || jrow_elem_add(e, "key_escrowed", JCOL_BOOL, esc) != 0
+            || jrow_elem_add(e, "degraded", JCOL_STR_NULL, deg) != 0;
     return jrow_resp_add_row(r, k_repo_cols, JROW_N(k_repo_cols), row) != 0
         || jrow_resp_add(r, "encryption", JCOL_STR, enc) != 0
-        || jrow_resp_add(r, "key_escrowed", JCOL_BOOL, esc) != 0;
+        || jrow_resp_add(r, "key_escrowed", JCOL_BOOL, esc) != 0
+        || jrow_resp_add(r, "degraded", JCOL_STR_NULL, deg) != 0;
 }
 
 static api_response_t list_repos(const api_request_t *req, void *userdata)
@@ -579,6 +588,7 @@ static const char *repo_path_allow(const char *rest)
         { "/key",        "GET" },
         { "/key/import", "POST" },
         { "/key/ack",    "POST" },
+        { "/repair",     "POST" },
         { "/tags",       "GET, POST" },
         { "/schedules",  "GET, POST" },
         { "/policy",     "GET, PUT" },
@@ -811,6 +821,47 @@ static api_response_t key_ack(const api_request_t *req, int64_t repo_id)
     return api_ok(strdup("{\"ok\":true}"));
 }
 
+/*
+ * The operator accepts that the packs a degraded repository is missing are
+ * gone (B150): their objects are marked absent, so the next backup stores
+ * what it still finds, and backups are taken again. Only with
+ * accept_missing, which is the whole point: the brake exists because a
+ * wrong path looks exactly like loss.
+ */
+static api_response_t repo_repair(const api_request_t *req, int64_t repo_id)
+{
+    bool accept = false;
+    if (req->body && req->body_len) {
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *jr = NULL;
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &jr, &pje) != JREQ_OK)
+            return api_error(400, pje.msg);
+        if (json_req_get_bool(jr, "accept_missing", &accept) != 0) accept = false;
+    }
+    if (!accept)
+        return api_error(400, "repair marks a degraded repository's missing packs as "
+                              "lost; it needs accept_missing (CLI --accept-missing)");
+    if (repo_trylock_write(repo_id) != OK)
+        return api_error(503, "repository is busy; try again when its job finishes");
+    pack_presence_t p;
+    status_t st = pack_presence_check(g_db_for_keys, repo_id, 1, &p);
+    repo_unlock(repo_id);
+    if (st != OK) return api_error(500, err_msg());
+    if (p.unavailable)
+        return api_error(409, "repository is unavailable: its packs/ cannot be read; "
+                              "nothing was changed");
+    char *body = NULL;
+    if (asprintf(&body,
+                 "{\"packs_checked\":%u,\"packs_missing\":%u,\"packs_unknown\":%u,"
+                 "\"packs_dropped\":%u,\"objects_absent\":%llu,\"degraded\":%s}",
+                 p.packs_checked, p.packs_missing, p.packs_unknown, p.packs_dropped,
+                 (unsigned long long)p.objects_absent, p.degraded ? "true" : "false") < 0)
+        return api_error(500, "out of memory");
+    journal_record(g_db_for_keys, repo_id, "api", "repair", "success", 0,
+                   p.packs_dropped ? "missing packs accepted as lost" : "nothing missing");
+    return api_ok(body);
+}
+
 static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
 {
     const char *rest = NULL;
@@ -909,6 +960,7 @@ static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
     if (repo_path_refused(rest, "POST", &refused)) return refused;
     if (strcmp(rest, "/key/import") == 0) return key_import(req, repo_id);
     if (strcmp(rest, "/key/ack") == 0)    return key_ack(req, repo_id);
+    if (strcmp(rest, "/repair") == 0)     return repo_repair(req, repo_id);
     if (strcmp(rest, "/backup") == 0)
         return backup_route_post(req, repo_id, rest);
     if (strcmp(rest, "/tags") == 0)

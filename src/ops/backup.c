@@ -12,6 +12,7 @@
 #include "object.h"
 #include "scan.h"
 #include "store_index.h"
+#include "pack_presence.h"
 #include "store_pool.h"
 #include "small_files.h"
 #include "settle.h"
@@ -2262,6 +2263,25 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     status_t st = check_sources(opts);
     if (st != OK) return st;
+
+    /*
+     * Before dedup can trust the index, every pack it names has to be there
+     * (B150): a missing pack's objects are marked absent here, so this run
+     * stores them again rather than referencing bytes that are gone. An
+     * unavailable or degraded repository takes no backup at all.
+     */
+    pack_presence_t pp;
+    st = pack_presence_check(db, repo_id, 0, &pp);
+    if (st != OK) return st;
+    if (pp.unavailable)
+        return set_error(ERR_IO, "repository %lld is unavailable: its packs/ cannot be "
+                         "read (is it mounted?)", (long long)repo_id);
+    if (pp.degraded) {
+        char why[256] = "";
+        (void)pack_presence_degraded(db, repo_id, why, sizeof(why));
+        return set_error(ERR_INVALID, PACK_PRESENCE_DEGRADED_ADVICE,
+                         (long long)repo_id, why, (long long)repo_id);
+    }
 
     /*
      * Staging files a killed run left behind. store_open only sweeps what is

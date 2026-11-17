@@ -236,7 +236,8 @@ host always has a way in.
 |---|---|---|
 | GET | `/repos` | List |
 | POST | `/repos` | Register: `{path, label}`; `label` follows the snapshot label rule (at most 256 bytes of printable UTF-8) |
-| GET | `/repos/<id>` | One repository, the same object as each entry of the list |
+| GET | `/repos/<id>` | One repository, the same object as each entry of the list. `degraded` is null, or why the repository refuses backups (too many packs missing at once; Manual section 17.6) |
+| POST | `/repos/<id>/repair` | `{"accept_missing":true}`: accept a degraded repository's missing packs as lost, marking their objects absent so the next backup stores them again. Without `accept_missing` a 400; 503 while a job holds the repository; 409 when its `packs/` cannot be read. Answers `{packs_checked, packs_missing, packs_unknown, packs_dropped, objects_absent, degraded}` |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it. `{"removed":true,"id"}` |
 
 `POST /repos` normalises the path (no `//`, `.`, `..` or trailing slash) and

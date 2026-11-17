@@ -103,6 +103,8 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
     config_check_int_range(chk, "vm.freeze_timeout_s", 1, 600);
     config_check_int_range(chk, "vm.trust_zero_status", 0, 1);
     config_check_int_range(chk, "containers.max_pause_s", 1, 600);
+    config_check_int_range(chk, "index.missing_brake_pct", 0, 100);
+    config_check_int_range(chk, "index.missing_brake_packs", 0, 1000000);
 
     /* The floor has its own message: "not between 16 and ..." would not say
      * why a smaller budget cannot work. */

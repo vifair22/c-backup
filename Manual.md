@@ -385,6 +385,8 @@ are different: they live in the database and change through the policy API
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
 | `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. Files of 1 MiB or less are read and prepared, many to a batch, on up to four of them. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
+| `index.missing_brake_pct` | `5` | Missing packs, as a percentage of a repository's, above which none is marked lost without `repo repair --accept-missing`; counts only from two missing (section 17.6). 0 to 100 |
+| `index.missing_brake_packs` | `10` | Missing packs above which none is marked lost without `repo repair --accept-missing` (section 17.6). 0 to 1000000 |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
 | `retention.keep_daily` | `7` | Daily snapshots kept |
 | `retention.keep_weekly` | `4` | Weekly snapshots kept |
@@ -2205,6 +2207,63 @@ or may not have taken effect: check, and make it again if not.
 
 ---
 
+### 17.6 A pack file is missing
+
+The index records, for every object, the pack file that holds it. If that
+file is gone - an operator deleted it, the repository was put back from an
+older copy, or a power cut on a build before 1.0.0 lost a pack the index
+had already recorded - the index would still vouch for its objects, and a
+backup would deduplicate against them, store nothing and report success
+over data that no longer exists.
+
+So every pack the index names is checked against its file, one `stat` per
+pack, at every start and at the start of every backup. A pack whose file is
+missing is taken out of the index: the objects it held are marked
+**absent**, which the next backup treats as not there, so it reads those
+files again and stores whatever it still finds. Each such pack raises an
+alert (an error in the log, a push notification, and a journal entry with
+operation `missing-pack`):
+
+```
+repo 1 (/srv/backup/main): pack-0000000000.dat is missing; its 297 object(s) are now marked absent, the next backup stores again whatever it still finds, and verify reports the rest missing
+```
+
+Until a backup has stored them again, `c-backup verify <id>` reports
+exactly those objects missing, with the files and snapshots they affect. A
+snapshot whose own trees were in the missing pack stays unrestorable unless
+a later backup of the same unchanged source makes those trees again; the
+objects a newer backup did store again make every older snapshot that
+names them restorable once more.
+
+Two things are never taken for missing packs:
+
+- **An unavailable repository.** When the repository's `packs/` directory
+  is missing or cannot be read - a share that is not mounted - nothing is
+  checked or changed, the repository is reported unavailable, and a backup
+  into it is refused. Only a pack file that does not exist (`ENOENT`) in a
+  readable `packs/` counts as missing; any other error leaves its pack as
+  it is.
+- **A mass disappearance.** Two or more missing packs that are more than
+  `index.missing_brake_pct` percent of the repository's (default 5), or more
+  than `index.missing_brake_packs` of them (default 10), looks far more like
+  a wrong path, a half-mounted share or a mistake than real loss. Nothing is
+  marked absent. The repository becomes **degraded** instead: an alert says
+  so, `c-backup repo show <id>` shows why in `degraded`, and every backup
+  into it is refused, because dedup cannot trust its index. Check the path
+  and the mount first; when every pack is back, the next start or backup
+  clears the degraded state on its own. If the packs really are gone, accept
+  the loss explicitly:
+
+  ```sh
+  sudo c-backup repo repair 1 --accept-missing
+  ```
+
+  which marks their objects absent as above and takes backups again.
+
+A single missing pack never trips the percentage, however small the
+repository: one pack out of one heals on its own, with its alert, while
+two out of three go through the repair.
+
 ## 18. Capacity planning and performance
 
 Figures here were measured: on a development workstation against 6.8 GB and
@@ -2419,7 +2478,8 @@ lists every command with all of its arguments.
 |---|---|
 | `repo list` | Registered repositories |
 | `repo add <path> [label] [--encrypt system\|passphrase\|none] [--passphrase TEXT]` | Create or register |
-| `repo show <id>` | One repository |
+| `repo show <id>` | One repository; `degraded` says why it takes no backups, when it does not |
+| `repo repair <id> --accept-missing` | Accept a degraded repository's missing packs as lost (section 17.6) |
 | `repo remove <id>` | Deregister; the directory is kept |
 | `repo key export\|ack <id>`, `repo key import <id> <key-hex>` | Encryption key escrow and recovery |
 | `sources list <id>`, `sources set <id> [path...] [--exclude PAT]...` | What a repository backs up; `set` with no paths clears the list |
