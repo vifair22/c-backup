@@ -857,15 +857,19 @@ static api_response_t repo_repair(const api_request_t *req, int64_t repo_id)
     status_t st = pack_presence_check(g_db_for_keys, repo_id, 1, &p);
     repo_unlock(repo_id);
     if (st != OK) return api_error(500, err_msg());
-    if (p.unavailable)
-        return api_error(409, "repository is unavailable: its packs/ cannot be read; "
-                              "nothing was changed");
+    if (p.unavailable) {
+        char msg[sizeof(p.why) + 96];
+        snprintf(msg, sizeof(msg), PACK_PRESENCE_UNAVAILABLE_FMT, (long long)repo_id, p.why);
+        return api_error(409, msg);
+    }
     char *body = NULL;
     if (asprintf(&body,
                  "{\"packs_checked\":%u,\"packs_missing\":%u,\"packs_unknown\":%u,"
-                 "\"packs_dropped\":%u,\"objects_absent\":%llu,\"degraded\":%s}",
+                 "\"packs_dropped\":%u,\"objects_absent\":%llu,\"packs_returned\":%u,"
+                 "\"objects_restored\":%llu,\"degraded\":%s}",
                  p.packs_checked, p.packs_missing, p.packs_unknown, p.packs_dropped,
-                 (unsigned long long)p.objects_absent, p.degraded ? "true" : "false") < 0)
+                 (unsigned long long)p.objects_absent, p.packs_returned,
+                 (unsigned long long)p.objects_restored, p.degraded ? "true" : "false") < 0)
         return api_error(500, "out of memory");
     journal_record(g_db_for_keys, repo_id, "api", "repair", "success", 0,
                    p.packs_dropped ? "missing packs accepted as lost" : "nothing missing");

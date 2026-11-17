@@ -271,7 +271,7 @@ host always has a way in.
 | GET | `/repos` | List, by id; `limit` (default and maximum 1000) and `offset` |
 | POST | `/repos` | Register: `{path, label}`; `label` follows the snapshot label rule (at most 256 bytes of printable UTF-8) |
 | GET | `/repos/<id>` | One repository, the same object as each entry of the list. `degraded` is null, or why the repository refuses backups (too many packs missing at once; Manual section 17.6) |
-| POST | `/repos/<id>/repair` | `{"accept_missing":true}`: accept a degraded repository's missing packs as lost, marking their objects absent so the next backup stores them again. Without `accept_missing` a 400; 503 while a job holds the repository; 409 when its `packs/` cannot be read. Answers `{packs_checked, packs_missing, packs_unknown, packs_dropped, objects_absent, degraded}` |
+| POST | `/repos/<id>/repair` | `{"accept_missing":true}`: accept a degraded repository's missing packs as lost, marking their objects absent so the next backup stores them again. Without `accept_missing` a 400; 503 while a job holds the repository; 409 when the repository is unavailable (no marker, `packs/` unreadable or replaced with packs missing from it; every pack missing does not stop the repair). Answers `{packs_checked, packs_missing, packs_unknown, packs_dropped, objects_absent, packs_returned, objects_restored, degraded}`, where `packs_returned` counts dropped packs that were back and indexed again |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it. `{"removed":true,"id"}` |
 
 `POST /repos` normalises the path (no `//`, `.`, `..` or trailing slash) and
@@ -330,6 +330,8 @@ reindex restores it from there rather than resuming above whatever record
 happens to be highest, which would hand an id pruned from the top to the
 next backup. The reindex job's result says what it found
 (`snapshot_mark`, `snapshot_ids_repaired`); see `docs/repo-format.md`.
+Pack numbers have the same guarantee through `<repo>/pack-ids`, and the
+reindex result reports it as `pack_mark` and `pack_ids_repaired`.
 
 A repository is `{id, uuid, path, label, added_at, encryption,
 key_escrowed}`: `label` is `null` when none was given, `encryption` is
@@ -1049,7 +1051,7 @@ What some jobs report in `result`, beyond the backup and restore counts:
 |---|---|
 | gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `dups_dropped`, `dups_kept` and `index_relocated` (OWN-22 duplicate copies dropped behind a confirmed indexed copy, kept because the indexed copy could not be confirmed, and index rows moved off such a copy onto a proven one), `packs_unwalkable`, `unwalkable` (first 16, `{"pack","reason"}`), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` or `packs_unwalkable` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
-| reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten) |
+| reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten), `pack_mark` (the lowest pack number never issued, as `<repo>/pack-ids` now holds it), `pack_ids_repaired` (`true` when that file was missing, damaged or behind the packs on disk or the index, and was rewritten) |
 
 A backup's `result` has its counts (`snapshot_id`, `files`, `dirs`,
 `files_unchanged`, `bytes_logical`, `objects_new`, `bytes_stored`,

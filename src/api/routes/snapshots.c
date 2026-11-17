@@ -1254,17 +1254,19 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         /* What came back, on the job, failed or not: an operator recovering
          * from a lost database needs to see that the tags returned, and a
          * failed run says how much it still managed. */
-        char rj[400];
+        char rj[480];
         snprintf(rj, sizeof(rj),
                  "{\"snapshots\":%llu,\"snapshots_failed\":%llu,\"files\":%llu,"
                  "\"objects\":%llu,\"packs_unreadable\":%llu,"
                  "\"tags_restored\":%llu,\"tags_skipped\":%llu,"
-                 "\"snapshot_mark\":%lld,\"snapshot_ids_repaired\":%s}",
+                 "\"snapshot_mark\":%lld,\"snapshot_ids_repaired\":%s,"
+                 "\"pack_mark\":%lld,\"pack_ids_repaired\":%s}",
                  (unsigned long long)rx.snapshots, (unsigned long long)rx.snapshots_failed,
                  (unsigned long long)rx.files, (unsigned long long)rx.objects,
                  (unsigned long long)rx.packs_unreadable,
                  (unsigned long long)rx.tags_restored, (unsigned long long)rx.tags_skipped,
-                 (long long)rx.snapshot_mark, rx.snapshot_ids_repaired ? "true" : "false");
+                 (long long)rx.snapshot_mark, rx.snapshot_ids_repaired ? "true" : "false",
+                 (long long)rx.pack_mark, rx.pack_ids_repaired ? "true" : "false");
         job_set_result(progress_ctx, rj);
     } else if (j->kind == SNAP_JOB_GREP) {
         grep_opts_t go;

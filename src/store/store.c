@@ -4,6 +4,7 @@
 #include "repo_key.h"
 #include "object_crypt.h"
 #include "pack.h"
+#include "pack_ids.h"
 
 #include <openssl/crypto.h>
 #include <cutils/log.h>
@@ -120,9 +121,17 @@ struct store {
     cdc_params_t       *cdc;
 
     /* Pack numbers handed out to writers open at once; see
-     * store_alloc_pack_num. 0 until the first allocation. */
+     * store_issue_pack_nums. 0 until the first allocation. */
     pthread_mutex_t     pack_num_mu;
     uint32_t            pack_num_next;
+
+    /* The repository's uuid, which turns on the pack-ids mark (pack_ids.h,
+     * store_issue_pack_nums); empty for a bare store. And the floor the
+     * daemon's index puts under every number (store_raise_pack_floor): the
+     * highest pack it has a row or a tombstone for, plus one. Both under
+     * pack_num_mu. */
+    char                uuid[64];
+    int64_t             index_floor;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -922,11 +931,72 @@ const cdc_params_t *store_cdc(const store_t *st)
     return &g_cdc_defaults;
 }
 
-uint32_t store_alloc_pack_num(store_t *st, uint32_t floor)
+status_t store_set_uuid(store_t *st, const char *uuid)
+{
+    if (!st || !uuid || strlen(uuid) >= sizeof(st->uuid))
+        return set_error(ERR_INVALID, "store_set_uuid: bad uuid");
+    pthread_mutex_lock(&st->pack_num_mu);
+    snprintf(st->uuid, sizeof(st->uuid), "%s", uuid);
+    pthread_mutex_unlock(&st->pack_num_mu);
+    return OK;
+}
+
+void store_raise_pack_floor(store_t *st, int64_t floor)
 {
     pthread_mutex_lock(&st->pack_num_mu);
-    if (st->pack_num_next < floor) st->pack_num_next = floor;
-    uint32_t n = st->pack_num_next++;
+    if (floor > st->index_floor) st->index_floor = floor;
     pthread_mutex_unlock(&st->pack_num_mu);
-    return n;
+}
+
+/*
+ * Every term that can know of a used number, and the mark raised past the
+ * numbers handed out before the caller writes a byte under any of them
+ * (pack_ids.h, rule 1). The mutex is held across the write so that two
+ * writers on one handle cannot both read the same mark; across handles the
+ * repository write lock rules a second writer out.
+ */
+status_t store_issue_pack_nums(store_t *st, uint32_t scanned, uint32_t count,
+                               uint32_t *out_first)
+{
+    if (!st || !out_first || count == 0)
+        return set_error(ERR_INVALID, "store_issue_pack_nums: bad argument");
+    pthread_mutex_lock(&st->pack_num_mu);
+    int64_t floor = scanned;
+    if ((int64_t)st->pack_num_next > floor) floor = st->pack_num_next;
+    uint32_t handed = atomic_load(&st->next_pack);
+    if ((int64_t)handed > floor) floor = handed;
+    if (st->index_floor > floor) floor = st->index_floor;
+
+    status_t rc = OK;
+    if (st->uuid[0]) {
+        int64_t mark = 0;
+        status_t r = pack_ids_read(st->path, st->uuid, &mark);
+        if (r == OK) {
+            if (mark > floor) floor = mark;
+        } else if (r == ERR_NOT_FOUND || r == ERR_CORRUPT) {
+            /* An older repository, or a file that was lost or damaged: the
+             * disk, the index and this handle are all that is left, and
+             * the file is rewritten from them below. */
+            log_warn("pack-ids: %s; numbering from the packs on disk and the index (%lld)",
+                     err_msg(), (long long)floor);
+            err_clear();
+        } else {
+            rc = r;
+        }
+    }
+    if (rc == OK && floor + (int64_t)count > PACK_IDS_NEXT_MAX)
+        rc = set_error(ERR_TOO_LARGE, "every pack number has been used");
+    if (rc == OK && st->uuid[0])
+        rc = pack_ids_write(st->path, st->uuid, floor + (int64_t)count);
+    if (rc == OK) {
+        /* Both counters, so store_reserve_pack_num never hands out one of
+         * these either. At 2^32 they wrap to 0, and the mark refuses next. */
+        st->pack_num_next = (uint32_t)(floor + (int64_t)count);
+        uint32_t want = st->pack_num_next;
+        uint32_t cur = atomic_load(&st->next_pack);
+        while (cur < want && !atomic_compare_exchange_weak(&st->next_pack, &cur, want)) {}
+        *out_first = (uint32_t)floor;
+    }
+    pthread_mutex_unlock(&st->pack_num_mu);
+    return rc;
 }

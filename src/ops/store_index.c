@@ -435,6 +435,20 @@ status_t store_index_bind(store_t *store, cutils_db_t *db, int64_t repo_id,
     store_set_pack_removed_cb(store, pack_removed, idx);
     store_set_pack_relocate_cb(store, pack_relocate, idx);
     store_set_index_sync_cb(store, index_sync, idx);
+
+    /* A floor under the next pack number from everything the index knows
+     * was ever issued, a dropped pack's tombstone included (B156). The
+     * repository's pack-ids file is what normally decides; this covers a
+     * file lost or damaged while the index lived. */
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT MAX(COALESCE((SELECT MAX(id) FROM packs WHERE repo_id = ?1), -1),"
+            "           COALESCE((SELECT MAX(id) FROM pack_tombstones WHERE repo_id = ?1), -1))",
+            (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1 && r->rows[0][0][0])
+        store_raise_pack_floor(store, strtoll(r->rows[0][0], NULL, 10) + 1);
+    db_result_free(r);
     *out = idx;
     return OK;
 }

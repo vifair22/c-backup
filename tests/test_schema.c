@@ -78,7 +78,7 @@ static void test_migrations_apply(void **state)
         "policy_values", "repo_backup_paths", "journal", "recovery_state",
         "file_cache", "verify_runs", "verify_findings", "grep_runs",
         "grep_hits", "snapshot_units", "snapshot_unit_items", "unit_policy",
-        "unit_intents", "daemon_state", NULL
+        "unit_intents", "daemon_state", "pack_tombstones", NULL
     };
     for (int i = 0; tables[i]; i++)
         assert_true(object_exists(db, "table", tables[i]));

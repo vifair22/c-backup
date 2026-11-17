@@ -109,13 +109,29 @@ const struct repo_key *store_key(const store_t *st);
  * encrypted store whose key was not loaded (nothing may be written there).
  */
 /*
- * A pack number no other writer on this handle has been given. floor is the
- * next free number by directory scan (next_pack_num), which alone cannot
- * see a pack another writer is still staging in tmp/: two writers open at
- * once (a backup's chunk workers each seal their own packs) would scan the
- * same number and the second install would be refused.
+ * count consecutive pack numbers no writer has ever been given, the first in
+ * *out_first. scanned is the next free number by directory scan, which
+ * alone cannot see a pack another writer on this handle is still staging in
+ * tmp/, nor a pack that is gone (B156).
+ *
+ * With the repository's uuid set (store_set_uuid), the numbers are also
+ * above <repo>/pack-ids, and that mark is raised past them, durably, before
+ * this returns: a number is never reissued, even after its pack was dropped
+ * as missing and even after the index was lost (pack_ids.h). Without one -
+ * a bare store in a test or benchmark - only the scan, the index floor and
+ * this handle decide. ERR_IO when the mark cannot be written, in which case
+ * nothing may be written under any number.
  */
-uint32_t store_alloc_pack_num(store_t *st, uint32_t floor);
+status_t store_issue_pack_nums(store_t *st, uint32_t scanned, uint32_t count,
+                               uint32_t *out_first);
+
+/* Turn on the pack-ids mark for this store: repo_store_open and the replica
+ * sink set it from the marker. */
+status_t store_set_uuid(store_t *st, const char *uuid);
+
+/* The lowest number the daemon's index says may be issued: its highest pack
+ * row or tombstone plus one. Only ever raises. store_index_bind sets it. */
+void store_raise_pack_floor(store_t *st, int64_t floor);
 
 struct cdc_params;
 status_t store_set_cdc(store_t *st, const struct cdc_params *p);

@@ -2079,7 +2079,9 @@ nothing outside the repository that names a snapshot by id (a tag, a note,
 a script, a replica) ends up pointing at a different backup. The job's
 result reports `snapshot_mark`, and `snapshot_ids_repaired` is true when the
 file was missing, damaged, copied from another repository or behind, and
-was rewritten. Tags come back too: the repository keeps its own copy of the
+was rewritten. Pack numbering is kept the same way, in `pack-ids`: the
+result reports `pack_mark` and `pack_ids_repaired`, and a pack dropped as
+missing never has its number reused (section 17.6). Tags come back too: the repository keeps its own copy of the
 tag list (a `tags` file beside `snapshots/`), and the reindex job's result
 reports `tags_restored`. A reindex that cannot read that file fails rather than
 leaving tagged snapshots silently unprotected. Lost for good: schedules,
@@ -2254,14 +2256,41 @@ a later backup of the same unchanged source makes those trees again; the
 objects a newer backup did store again make every older snapshot that
 names them restorable once more.
 
+A dropped pack keeps its number. Pack numbers are never issued twice: the
+repository records the next free one in `pack-ids` (docs/repo-format.md),
+raised before any pack takes a number, and the index keeps a tombstone for
+every dropped pack. So the next backup writes its pack under a new number,
+never the dropped one's, and if the missing pack comes back - a share
+remounted, a copy put back - nothing collides. The next start or backup
+finds it, reads every entry and checks each against its name, and takes it
+back into the index: objects marked absent are present again, and where a
+later backup stored an object again, whichever copy proves good is the one
+the index keeps. An entry that fails the check is left out and the journal
+entry (operation `pack-returned`) says how many.
+
 Two things are never taken for missing packs:
 
-- **An unavailable repository.** When the repository's `packs/` directory
-  is missing or cannot be read - a share that is not mounted - nothing is
-  checked or changed, the repository is reported unavailable, and a backup
-  into it is refused. Only a pack file that does not exist (`ENOENT`) in a
-  readable `packs/` counts as missing; any other error leaves its pack as
-  it is.
+- **An unavailable repository.** Nothing is checked or changed, the
+  repository is reported unavailable, and a backup into it is refused. A
+  repository is unavailable when:
+
+  - its root has no `.cbackup` marker: an empty mountpoint, or the wrong
+    path;
+  - its `packs/` directory is missing or cannot be read: a share that is
+    not mounted;
+  - `packs/` is not the directory it was - its device or inode changed,
+    because something was mounted or unmounted over it - and a pack the
+    index names is missing from it. `packs/` is itself a mountpoint in some
+    deployments, and unmounted it is an empty directory, so existing proves
+    nothing. A changed `packs/` that holds every pack (a device renumbered
+    across a reboot) is simply recorded;
+  - every pack the index names is missing, however many there are, one of
+    one included.
+
+  Only the last yields to `repo repair --accept-missing`, for the operator
+  who has checked and knows every pack is gone. Only a pack file that does
+  not exist (`ENOENT`) in a readable `packs/` counts as missing; any other
+  error leaves its pack as it is.
 - **A mass disappearance.** Two or more missing packs that are more than
   `index.missing_brake_pct` percent of the repository's (default 5), or more
   than `index.missing_brake_packs` of them (default 10), looks far more like
@@ -2280,8 +2309,9 @@ Two things are never taken for missing packs:
   which marks their objects absent as above and takes backups again.
 
 A single missing pack never trips the percentage, however small the
-repository: one pack out of one heals on its own, with its alert, while
-two out of three go through the repair.
+repository, as long as other packs are present: one of two heals on its
+own, with its alert, while two out of three go through the repair. One out
+of one is every pack, and that is an unavailable repository, above.
 
 ## 18. Capacity planning and performance
 

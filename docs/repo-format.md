@@ -11,6 +11,7 @@ There is no reader for any other format (see "Format version" below).
 <repo>/
   .cbackup            identity marker: format version, uuid, chunker, encryption
   snapshot-ids        snapshot-id high-water mark
+  pack-ids            pack-number high-water mark
   snapshots/<id>      snapshot records: root tree name plus metadata
   tags                the tag list, which reindex restores (absent until a tag is set)
   packs/XXXXXX/pack-NNNNNNNNNN.dat   every object, in packs, 256 per directory
@@ -138,6 +139,61 @@ id pruned from the top came back, and anything outside the repository still
 naming it - a tag, a note, a client, a replica - moved to a different tree.
 The timestamp check on tags stays: it protects a repository whose
 `snapshot-ids` was lost at the same time as the database.
+
+## `pack-ids`
+
+The lowest pack number never issued in this repository (B156):
+
+```json
+{"format":"cbackup-pack-ids","version":1,"uuid":"d4011a91-...","next":40,"crc32c":"5e1f0c2a"}
+```
+
+- `next` is an integer in [0, 2^32]: every pack number below it may have
+  been used, by a pack that is present, missing, removed by gc, or never
+  installed because its writer died. It never decreases. It is parsed digit
+  for digit, like `last_issued`.
+- `crc32c` is CRC-32C, eight lowercase hex digits, over the ASCII bytes
+  `<uuid>:<next>`, binding the file to this repository as for
+  `snapshot-ids`.
+- Created with `next` 0 when the repository is created and when a replica
+  target is initialised. A repository created before it existed has none;
+  it is written the first time a pack number is issued.
+- Written atomically: `mkstemp` in `tmp/` (prefix `packids.`), write,
+  `fsync`, `rename` to `<repo>/pack-ids`, `fsync` of `<repo>`.
+- An addition, not an incompatible change: a build that does not know the
+  file ignores it, and the repository format stays 3. Such a build numbers
+  from the packs on disk again, which is the bug the file fixes, so a
+  repository should not go back to one.
+
+Rules (`src/store/pack_ids.h`):
+
+1. A writer is given its number by `store_issue_pack_nums`, which raises
+   `next` past it durably before returning; only then is anything staged
+   under that number. A power cut after the raise wastes the number. It is
+   never issued twice.
+2. The number is the largest of `next`, the highest pack file on disk plus
+   one, the index's floor (its highest `packs` row or `pack_tombstones` row
+   plus one), and what the handle has already issued. The disk and index
+   terms matter only when the file is missing or damaged; the file is then
+   rewritten from them, with a warning.
+3. Reindex raises `next` to at least the highest pack on disk plus one and
+   the index's floor, and rewrites a missing, damaged or lagging file (the
+   job result says so: `pack_ids_repaired`, `pack_mark`).
+4. Dropping a missing pack (Manual 17.6), gc and pack removal never lower
+   it.
+
+Why it exists: pack numbers came from the highest pack file on disk plus
+one. Once the highest pack was dropped as missing - B150's heal, or
+`repo repair --accept-missing` - the next backup wrote a new pack under the
+old name. When the original came back (a remount, a copy put back), the
+index's rows for that number described the other file: backups
+deduplicated against bytes that were not there, verify found objects
+unrecoverable and missing, and restores failed on a hash mismatch. The
+daemon's `pack_tombstones` table keeps dropped numbers too, but it dies
+with the database; this file does not. With both lost at once - the
+database and this file - while the highest packs are also away, a number
+can be issued again; the unavailability checks (Manual 17.6) are what stand
+between an unmounted `packs/` and that.
 
 ## `snapshots/<id>`
 
@@ -1037,8 +1093,8 @@ format 3; a repository that needed one is rebuilt by backing up again.
 
 ## Recovery
 
-Because the trees and the snapshot-id mark are in the repository, the
-database can be rebuilt:
+Because the trees and both marks are in the repository, the database can
+be rebuilt:
 
 ```sh
 c-backup reindex <repo-id>
@@ -1046,8 +1102,9 @@ c-backup reindex <repo-id>
 
 This rebuilds the pack index from the packs, walks each snapshot record's
 root tree to repopulate the node index, restores the snapshot-id mark from
-`snapshot-ids` (rewriting it if it was missing or behind), and brings tags
-back from `tags`. Measured at roughly 764k rows per second, so a
+`snapshot-ids` (rewriting it if it was missing or behind), raises
+`pack-ids` to at least every pack on disk, and brings tags back from
+`tags`. Measured at roughly 764k rows per second, so a
 million-file snapshot takes about a second and a half.
 
 What reindexing cannot recover is daemon-only state: job history, sessions,
