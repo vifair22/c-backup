@@ -674,22 +674,31 @@ static void batch_close(pipeline_t *p, batch_t *b)
 }
 
 /*
- * A check point: let the batch go if somebody newly wants the lock, or if it
- * is contended and has been held for BATCH_CONTENDED_HOLD_MS. A waiter's
+ * Whether an open batch should end at this check point: somebody newly wants
+ * the lock, or it is contended and has been held for BATCH_CONTENDED_HOLD_MS.
+ * Updates the contended state. Shared by batch_yield and index_nodes, which
+ * commits through its own path because it has to return a failed commit.
+ */
+static int batch_should_end(batch_t *b)
+{
+    uint64_t now = phase_now();
+    if (db_txn_waiters() > 0) {
+        int was = b->contended_until_ns > now;
+        b->contended_until_ns = now + (uint64_t)BATCH_CONTENDED_MS * 1000000ULL;
+        if (!was) return 1;
+    }
+    return b->contended_until_ns > now &&
+           now - b->opened_ns >= (uint64_t)BATCH_CONTENDED_HOLD_MS * 1000000ULL;
+}
+
+/*
+ * A check point: let the batch go if batch_should_end says so. A waiter's
  * transaction runs next, and this thread's next batch_open queues behind it.
  */
 static void batch_yield(pipeline_t *p, batch_t *b)
 {
     if (!b->in_txn) return;
-    uint64_t now = phase_now();
-    if (db_txn_waiters() > 0) {
-        int was = b->contended_until_ns > now;
-        b->contended_until_ns = now + (uint64_t)BATCH_CONTENDED_MS * 1000000ULL;
-        if (!was) { batch_close(p, b); return; }
-    }
-    if (b->contended_until_ns > now &&
-        now - b->opened_ns >= (uint64_t)BATCH_CONTENDED_HOLD_MS * 1000000ULL)
-        batch_close(p, b);
+    if (batch_should_end(b)) batch_close(p, b);
 }
 
 /* One entry recorded: end the batch at its size, or for a waiter. */
@@ -2056,12 +2065,22 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
      * until every batch has landed. An interrupted run therefore leaves node
      * rows that no snapshot claims - index garbage a reindex rebuilds, which
      * is the state eviction already produces deliberately.
+     *
+     * And it yields to a queued writer by the store batch's rules, at every
+     * row (B144). It only ended at NODE_BATCH rows, so a tag or sources write
+     * that queued during indexing waited for up to 2,000 node and FTS
+     * inserts: about 80 ms on an idle host, 700 ms with the CPU contended,
+     * and past the 2 s test bound under disk pressure, against Manual 6.3's
+     * "well under a second". Each extra commit is one more batch boundary of
+     * the kind above, so nothing about nodes_materialized changes.
      */
     #define NODE_BATCH 2000
-    uint32_t since_commit = 0;
+    batch_t nb;
+    memset(&nb, 0, sizeof(nb));
     p->timers->txn_site = PHASE_COMMIT_INDEX;
     status_t bst = db_txn_begin(p->db);
     if (bst != OK) return bst;
+    nb.opened_ns = phase_now();
 
     for (uint32_t i = 0; i < p->count; i++) {
         /* In no tree, so in no index row either: the index is derived from
@@ -2167,12 +2186,13 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
             return set_error(ERR_IO, "index_nodes: fts insert failed");
         }
 
-        if (++since_commit >= NODE_BATCH) {
+        if (++nb.since_commit >= NODE_BATCH || batch_should_end(&nb)) {
             status_t cst = db_txn_commit(p->db);
             if (cst != OK) return cst;
-            since_commit = 0;
+            nb.since_commit = 0;
             cst = db_txn_begin(p->db);
             if (cst != OK) return cst;
+            nb.opened_ns = phase_now();
         }
     }
 
