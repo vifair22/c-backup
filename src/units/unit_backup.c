@@ -1237,6 +1237,8 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         err_clear();
         outcome = SP_END_ABORTED;
     }
+    /* u.info lives in the session, which end frees (remote_provider). */
+    const uint64_t freeze_ms = (u.info->consist_flags & SP_CF_FROZEN) ? u.info->freeze_ms : 0;
     status_t est = ops->end(u.sess, outcome, snap);
     if (est != OK) {
         /*
@@ -1262,7 +1264,7 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         err_clear();
     }
     res->snapshot_id = snap;
-    res->freeze_ms = (u.info->consist_flags & SP_CF_FROZEN) ? u.info->freeze_ms : 0;
+    res->freeze_ms = freeze_ms;
     if (u.cap_hit) res->achieved = SP_CONSIST_INCONSISTENT;
     res->bytes_read = u.bytes_read;
     if (st == OK)
