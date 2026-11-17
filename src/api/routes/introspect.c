@@ -390,12 +390,16 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
 {
     if (!hex_ok(hex)) return api_error(400, "hash must be 64 lowercase hex characters");
 
-    int limit = 0;
+    /* offset as well as limit: a limit alone made every reference past
+     * the first page unreachable, and an offset sent was silently dropped
+     * (B154). */
+    int limit = 0, offset = 0;
     api_response_t page_err;
-    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, NULL, &page_err) != 0) return page_err;
-    char repo[32], lim[16];
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
+    char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     /*
      * The full path of each referencing node, climbed in SQL one primary-key
@@ -410,7 +414,7 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
             " refs(snap_id, nid) AS ("
             "   SELECT snap_id, id FROM nodes"
             "    WHERE repo_id = ? AND content_hash = ?"
-            "    ORDER BY snap_id, id LIMIT ?),"
+            "    ORDER BY snap_id, id LIMIT ? OFFSET ?),"
             " up(nid, parent, path, depth) AS ("
             "   SELECT n.id, n.parent_node_id, n.name, 0"
             "     FROM refs JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
@@ -424,7 +428,7 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
             "   LEFT JOIN up ON up.nid = refs.nid"
             "             AND (up.parent IS NULL OR up.parent = 0)"
             "  ORDER BY refs.snap_id, refs.nid",
-            (const char *[]){ repo, hex, lim, repo, repo, repo, NULL }, &r) != 0) {
+            (const char *[]){ repo, hex, lim, off, repo, repo, repo, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot read object references");
     }
@@ -607,19 +611,29 @@ api_response_t introspect_object_content(const api_request_t *req, int64_t repo_
 
 /* ---------- packs ---------- */
 
+/*
+ * Ordered by pack number, which is unique per repository, so a page is the
+ * same page however often it is asked for. The CLI and the docs offered
+ * limit and offset and the route read neither (B154): one request answered
+ * every pack in the repository.
+ */
 api_response_t introspect_packs(const api_request_t *req, int64_t repo_id)
 {
-    (void)req;
-    char repo[32];
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
+    char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     if (db_execute(g_db,
             "SELECT p.id, p.filename, COALESCE(p.size,0), p.sealed_at,"
             "       p.version, (SELECT COUNT(*) FROM pack_objects po"
             "                    WHERE po.repo_id = p.repo_id AND po.pack_id = p.id)"
-            "  FROM packs p WHERE p.repo_id = ? ORDER BY p.id",
-            (const char *[]){ repo, NULL }, &r) != 0) {
+            "  FROM packs p WHERE p.repo_id = ? ORDER BY p.id LIMIT ? OFFSET ?",
+            (const char *[]){ repo, lim, off, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list packs");
     }
@@ -787,13 +801,29 @@ typedef struct {
     cutils_json_resp_t *resp;
     store_t            *store;
     uint32_t            added, removed, modified;
-    uint32_t            emitted;
-    int                 truncated;
+    uint64_t            emitted;     /* changes seen so far, in walk order */
+    uint64_t            offset;      /* first change to serialise */
+    uint64_t            limit;       /* at most this many serialised */
+    int                 truncated;   /* changes exist past this page */
 } diff_ctx_t;
 
-/* A diff of ten thousand changes is not something anyone reads; the counts
- * still reflect the whole comparison. */
-#define DIFF_MAX_ENTRIES 2000
+/*
+ * Paging a diff (B154).
+ *
+ * The walk order is deterministic: both trees are merged in name order and
+ * the walk is depth-first, so the Nth change is the same change on every
+ * request for the same pair of snapshots, and an offset means something.
+ * A page is cut from the walk as it goes - changes before `offset` are
+ * counted and dropped, changes past `offset + limit` are counted and set
+ * `truncated` - so the response holds at most `limit` changes and the walk
+ * itself holds one tree per directory level. Nothing materialises the full
+ * change list. Each page re-walks the changed part of the trees, which it
+ * has to anyway: the counts cover the whole comparison, not the page.
+ *
+ * The default is the 2000 the route used to cap at, so a client that does
+ * not page sees what it always did.
+ */
+#define DIFF_PAGE_DEFAULT 2000
 
 /*
  * One changed path.
@@ -809,8 +839,9 @@ static void diff_emit(diff_ctx_t *ctx, const char *change, const char *path,
                       uint64_t old_size, uint64_t new_size,
                       const uint8_t *old_hash, const uint8_t *new_hash)
 {
-    ctx->emitted++;
-    if (ctx->emitted > DIFF_MAX_ENTRIES) { ctx->truncated = 1; return; }
+    uint64_t pos = ctx->emitted++;
+    if (pos < ctx->offset) return;
+    if (pos - ctx->offset >= ctx->limit) { ctx->truncated = 1; return; }
 
     cutils_json_elem_t e;
     if (json_resp_array_append_begin(ctx->resp, "changes", &e) != 0) return;
@@ -951,6 +982,10 @@ api_response_t introspect_diff(const api_request_t *req, int64_t repo_id)
     const char *from = api_query_param(req, "from");
     const char *to   = api_query_param(req, "to");
     if (!from || !to) return api_error(400, "from and to are required");
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, DIFF_PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0)
+        return page_err;
     /* Snapshot ids, read like every other numeric parameter: "abc" or
      * 1e999 used to be looked up as text and answered 404 (B112). */
     int64_t fid = 0, tid = 0;
@@ -983,6 +1018,11 @@ api_response_t introspect_diff(const api_request_t *req, int64_t repo_id)
     memset(&ctx, 0, sizeof(ctx));
     ctx.resp = resp;
     ctx.store = store;
+    ctx.offset = (uint64_t)offset;
+    ctx.limit = (uint64_t)limit;
+    /* The array exists even when this page is empty, as on every other
+     * collection route. */
+    if (json_resp_ensure_array(resp, "changes") != 0) { /* alloc only */ }
 
     diff_walk(&ctx, hfrom, hto, "", 0);
     close_bound_store(store, idx);

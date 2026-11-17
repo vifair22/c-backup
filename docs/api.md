@@ -49,6 +49,40 @@ Directory listings are ordered by name because the index carries `name` as its
 trailing column, making the query a range scan rather than a sort of every
 child.
 
+Every list route, with its page size and order. Each order ends in a unique
+key, so a page is the same page on every request and paging from offset 0
+to the end visits every row once (while nothing is added or removed).
+
+| Route | Default | Maximum | Order |
+|---|---|---|---|
+| `/repos` | 1000 | 1000 | id |
+| `/repos/<id>/snapshots` | 200 | 1000 | id, newest first |
+| `/repos/<id>/snapshots/<sid>/tree` | 200 | 1000 | name |
+| `/repos/<id>/search` | 200 | 1000 | see Snapshots and browsing |
+| `/repos/<id>/grep`, `/repos/<id>/verify` | 20 | 1000 | id, newest first |
+| `/repos/<id>/grep/<run>`, `/repos/<id>/verify/<run>` | 200 | 1000 | id |
+| `/repos/<id>/objects` | 500 | 5000 | hash |
+| `/repos/<id>/objects/<hash>/refs` | 500 | 5000 | snapshot, node |
+| `/repos/<id>/packs` | 500 | 5000 | pack number |
+| `/repos/<id>/packs/<pid>/entries` | 500 | 5000 | offset in the pack |
+| `/repos/<id>/diff` | 2000 | 5000 | tree walk (see Introspection) |
+| `/repos/<id>/tags` | 1000 | 1000 | name |
+| `/repos/<id>/schedules` | 1000 | 1000 | id |
+| `/repos/<id>/journal` | 100 | 1000 | time then id, newest first |
+| `/repos/<id>/units`, `/repos/<id>/units/<key>` | 100 | 1000 | unit name; snapshot id, newest first |
+| `/providers/<p>/units` | 100 | 1000 | the provider's enumeration |
+| `/jobs` | 50 | 1000 | id, newest first |
+
+`packs`, `diff`, `objects/<hash>/refs`, `search`, `tags`, `schedules`
+and `/repos` read no `offset` (the first two not even a `limit`), and the
+journal no `offset`, before B154: the CLI sent them and the daemon answered
+the whole list or the first page again. `/repos`, `tags` and `schedules`
+default to their maximum so a client that does not page sees every row any
+real deployment has. Lists that are bounded by construction do not page:
+`/fanout` (at most 256 buckets), `/stats` (one row per object type),
+`/policy` (the fixed key set), `/sources` (what the operator configured)
+and `/providers`.
+
 A path the API serves, asked with a method it does not answer, is a `405`
 with an `Allow` header listing the methods that work there (`PATCH
 /repos/1` gives `405`, `Allow: GET, DELETE`). Any method other than GET,
@@ -234,7 +268,7 @@ host always has a way in.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/repos` | List |
+| GET | `/repos` | List, by id; `limit` (default and maximum 1000) and `offset` |
 | POST | `/repos` | Register: `{path, label}`; `label` follows the snapshot label rule (at most 256 bytes of printable UTF-8) |
 | GET | `/repos/<id>` | One repository, the same object as each entry of the list. `degraded` is null, or why the repository refuses backups (too many packs missing at once; Manual section 17.6) |
 | POST | `/repos/<id>/repair` | `{"accept_missing":true}`: accept a degraded repository's missing packs as lost, marking their objects absent so the next backup stores them again. Without `accept_missing` a 400; 503 while a job holds the repository; 409 when its `packs/` cannot be read. Answers `{packs_checked, packs_missing, packs_unknown, packs_dropped, objects_absent, degraded}` |
@@ -382,7 +416,12 @@ thirty times. A file whose content changed is a different hash and a
 separate result, so the versions of a file stay visible. To keep a page
 cheap the search reads at most eight matching rows per result asked for
 (8,000 at most) and does not sort; when it stopped there, `partial` is
-`true` and the counts cover what was read. With `snapshot=<sid>` only that
+`true` and the counts cover what was read. `offset` skips results: with
+`snapshot` it skips matching rows, and without one it skips collapsed
+results, reading from the first row enough for `offset + limit` of them
+under the same 8,000-row bound. Results come in first-seen order, so result
+N is the same result on every page; an offset past what the bound can
+reach is an empty page with `partial` true. With `snapshot=<sid>` only that
 snapshot is searched (`snapshots` is 1); one that does not exist is a 404.
 The CLI is `search <id> <text> [--snapshot N]`.
 
@@ -1104,13 +1143,13 @@ header_size`, which equals `phys_size`. An object that reports `phys_size`
 
 | GET | `/repos/<id>/objects` | Paginated; `?location=staged`, `?location=pack` (or `packed`), or `?location=all` |
 | GET | `/repos/<id>/objects/<hash>` | Where one object lives |
-| GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it |
+| GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it; `limit` (default 500, at most 5000) and `offset` |
 | GET | `/repos/<id>/objects/<hash>/layout` | Header fields and on-disk footprint |
 | GET | `/repos/<id>/objects/<hash>/content` | Base64, capped at 2 MiB |
-| GET | `/repos/<id>/packs` | Pack listing with entry counts |
+| GET | `/repos/<id>/packs` | Pack listing with entry counts, by pack number; `limit` (default 500, at most 5000) and `offset` |
 | GET | `/repos/<id>/packs/<pid>/entries` | Contents of one pack, paginated |
 | GET | `/repos/<id>/fanout` | Hash-prefix histogram |
-| GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots |
+| GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots; `limit` (default 2000, at most 5000) and `offset` page the changes |
 
 An object's `refcount` is the number of references to it as the last `gc`
 or `reindex` counted them, not a live count: a backup records the objects it
@@ -1157,6 +1196,18 @@ with the same hash have identical contents by construction, so an unchanged
 subtree is pruned in a single comparison instead of being read. That is the
 same property that makes incremental backups cheap, applied to reading.
 
+`/diff` pages its `changes`. The walk is deterministic (both trees merged
+in name order, depth first), so the Nth change is the same change on every
+request for the same two snapshots. A page is cut from the walk as it runs:
+changes before `offset` are counted and dropped, and changes past `offset +
+limit` are counted and set `truncated`. So `added`, `removed` and
+`modified` always cover the whole comparison, `truncated` is `true` exactly
+when more changes follow this page, and neither the response nor the walk
+holds more than a page of changes and one tree per directory level. Each
+page walks the changed part of the trees again; the unchanged part is
+pruned as always. The default page is 2000, the cap the route had before it
+paged, so a client that does not page sees what it always did.
+
 ## Metadata
 
 | Method | Path | Purpose |
@@ -1165,7 +1216,16 @@ same property that makes incremental backups cheap, applied to reading.
 | DELETE | `/repos/<id>/tags/<name>` | Remove; `{"removed":true,"name"}`, 404 if there is no such tag |
 | GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}`; 404 for a snapshot that does not exist |
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
-| GET | `/repos/<id>/journal` | Operation history: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded |
+| GET | `/repos/<id>/journal` | Operation history, newest first: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded. `limit` (default 100, at most 1000), `offset`, and `result` |
+
+`result` filters the journal on one of the values anything journals:
+`success`, `failed` and `cancelled` for how a job ended, `warning` and
+`alert` for advisories. Anything else is a 400 `result must be one of:
+success, failed, cancelled, warning, alert`; it used to answer an empty
+list, which reads as a clean history (NIT-32).
+
+`/tags` pages by name and `/schedules` by id, each `limit` (default and
+maximum 1000) and `offset`.
 
 Setting a tag or a note on a snapshot that does not exist is a 404, and a tag
 with no name is a 400. Removing a tag that is not there is a 404 `no such
