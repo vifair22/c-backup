@@ -847,6 +847,13 @@ silently:
 - the journal entry, the permanent record, reads `snapshot 12: 50 files, 1
   skipped (not in the snapshot); first: /data/x: ...`.
 
+Skipping is for the source's faults only. A write to the repository that
+fails - a full disk, an I/O error, a failed sync or close - fails the whole
+backup, naming the file being stored and the error (`backup: storing
+/data/x: pack: write to <staging>: No space left on device`). No snapshot
+is recorded, the partly written pack is discarded, and nothing it held is
+left for a later run to trust.
+
 **A file that changes while it is backed up.** A live filesystem changes
 under a backup, and a file can be a different size by the time it is read
 than when the scan listed it. The backup stores the file as it is when it
@@ -1294,6 +1301,12 @@ batches of 512 files took 12.4 s and spent 9 s of it in 196 calls to
 on that filesystem, once per batch, and a crash redoes at most one batch:
 its files are still under temporary names, which the next restore sweeps
 and writes again.
+
+A write the destination refuses - a full disk, a quota, a filesystem gone
+read-only - fails that file with "cannot write it: <reason>", naming the
+destination rather than the repository, and its temporary file is removed;
+the restore goes on with the rest and fails at the end, as for any failed
+file. Running it again once there is room writes what is missing.
 
 ---
 
@@ -2314,7 +2327,9 @@ reach the disk at different times:
 - **The durable API edits** - registering or removing a repository, a tag
   set or removed, every delete, a logout or password change - are synced to
   disk before the request is answered. Once the CLI or the app reports
-  success, a power cut cannot take them.
+  success, a power cut cannot take them. If the sync itself fails (a full
+  or failing disk under `state.db`), the request fails with an error saying
+  the change is committed but could not be made durable.
 - **Every other write** - the other API edits (a note, sources, a policy
   value, a schedule added or changed, a job submitted), and the daemon's
   own writes (a backup's index rows, job records and progress, journal
