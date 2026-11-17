@@ -351,6 +351,32 @@ build:image:
   only:
     - master
 
+# Build the release image in a merge request whenever something it depends on
+# changes, so a broken image is caught by the MR rather than at a UAT cut
+# (BUILD-5: a bare make built nothing and only the image build noticed). It
+# builds and smoke-runs the image like build:image, then deletes it; nothing
+# is pushed.
+build:image:check:
+  stage: build
+  needs: []
+  image: docker:cli
+  tags: [docker, unraid]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths: [Makefile, Dockerfile, .dockerignore, cutils_version, .gitlab-ci.yml, packaging/**/*]
+  variables:
+    CHECK_TAG: cbackup-mrcheck:$CI_PIPELINE_ID
+  script:
+    - docker build --provenance=false --sbom=false -t "$CHECK_TAG" .
+    - docker run -d --name "smoke-$CI_JOB_ID" "$CHECK_TAG"
+    - sleep 5
+    - docker ps --filter "name=smoke-$CI_JOB_ID" --filter status=running | grep -q "smoke-$CI_JOB_ID"
+    - docker logs "smoke-$CI_JOB_ID"
+  after_script:
+    - docker rm -f "smoke-$CI_JOB_ID" >/dev/null 2>&1 || true
+    - docker rmi "cbackup-mrcheck:$CI_PIPELINE_ID" >/dev/null 2>&1 || true
+
 # Deploy fans out to one child job per target so a host can be added or
 # removed by editing a CI variable rather than this file. With no targets set
 # the generator would emit a child pipeline containing no jobs, which GitLab
