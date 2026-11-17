@@ -329,6 +329,76 @@ coverage:
     paths:
       - build/coverage/coverage.html
 
+# Unit backup against real engines: Docker (a standalone container and a
+# compose project, with hooks and a dump), LXC, and one libvirt VM offline
+# and online, through the real helper and daemon, every restore compared
+# byte for byte and every step checked for leftovers. The unit suites in
+# `test` run the same code against stand-ins; this is what proves the
+# stand-ins tell the truth.
+#
+# The runner is unprivileged, so the job starts ONE privileged sibling
+# container through the bound socket, from the fixed image in
+# ci/real-engines/ (built here, cached by content). The sibling runs only
+# ci/real-engines/run.sh: its own dockerd (the runner's engine never sees a
+# test container), a btrfs pool on a loop device, a private libvirtd with
+# 1-vCPU cbk-uat-* domains, no network. ci/real-engines/job.sh reaps it three
+# ways: stale labelled siblings at start, a trap on every exit, and the
+# sibling's own timeout plus --rm when the job dies without its trap.
+#
+# ZFS is not here: the runner has no zfs module. It stays a scripted UAT
+# step on FS1 (docs/helper.md, "UAT: real ZFS").
+#
+# Sized to leave the runner's other slots alone: one CPU and 2.5 GiB for the
+# sibling, and one run at a time across all pipelines (resource_group).
+# Only where it can find something: an MR touching the units code, its
+# tests or this job's files, and the scheduled pipeline. Never a plain push.
+real-engines:
+  stage: analyze
+  image: docker:cli
+  tags: [docker]
+  needs: []
+  resource_group: cbackup-real-engines
+  timeout: 50m
+  variables:
+    CBK_LIFETIME_S: "2700"
+    CBK_REAP_AFTER_MIN: "55"
+    CBK_SIBLING_CPUS: "1"
+    CBK_SIBLING_MEMORY: "2560m"
+  before_script:
+    - apk add --no-cache -q bash git tar coreutils
+  script:
+    - ./ci/real-engines/job.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths:
+          - src/providers/**/*
+          - src/helper/**/*
+          - src/virt/**/*
+          - src/units/**/*
+          - src/api/routes/units.c
+          - src/api/routes/exports.c
+          - src/common/privs.*
+          - tests/test_units*
+          - tests/test_providers.c
+          - tests/test_helper*
+          - tests/test_virt*
+          - tests/test_vm*
+          - tests/test_docker.c
+          - tests/test_lxc.c
+          - tests/test_snap*
+          - tests/test_mounts.c
+          - tests/test_hooklog.c
+          - tests/test_block_source.c
+          - tests/test_nbd*
+          - tests/test_privs.c
+          - tests/fake_docker.h
+          - tests/fake_host/**/*
+          - tests/helper_fixture.h
+          - tests/nbd_test_server.h
+          - ci/real-engines/**/*
+
 # The runner binds the host's Docker socket into the job, so builds and pushes
 # run on the host daemon. The dind service this job used to declare was never
 # reached: nothing set DOCKER_HOST to point at it.
