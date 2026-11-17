@@ -1076,7 +1076,11 @@ static status_t small_apply(pipeline_t *p, batch_t *b, small_batch_t *sb)
         if (st != OK) break;
         cache_put(p, f->index);
         /* Not counted into the batch again: the loop counted the entry when
-         * it queued it. */
+         * it queued it. But a pool batch is up to 256 files' rows, so a
+         * queued writer or the commit budget (B144-REST) ends the batch
+         * between two of them rather than after the last; the next file's
+         * batch_open begins the next one. */
+        batch_yield(p, b);
     }
     p->spool_taken -= sb->taken;
     small_batch_free(sb);

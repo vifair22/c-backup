@@ -36,6 +36,7 @@
 #include "backup.h"
 #include "cdc.h"
 #include "db_txn.h"
+#include "db_write.h"
 #include "manifest.h"
 #include "pack.h"
 #include "prune.h"
@@ -1836,14 +1837,22 @@ static void test_metadata_write_is_not_held_by_a_slow_batch(void **state)
 }
 
 /*
- * OWN-16: with nobody waiting, a batch is ended by its size and nothing else.
+ * OWN-16: with nobody waiting, a batch is ended by its size or its commit
+ * budget, and nothing else.
  *
  * B107 committed every 200 ms and around every file of 4 MiB or more whether
  * or not another writer wanted the lock, and on the UAT host's storage that
  * cost a WAL sync per large file: 60 s of a 400 s backup. Here the batch is
  * kept open well past 200 ms by a slow progress callback, and three files sit
- * over the old 4 MiB line, and the store phase must still commit exactly
- * once per 2,000 files.
+ * over the old 4 MiB line, and none of that may end a batch.
+ *
+ * Since B144-REST a batch also ends at the commit budget, so that no COMMIT
+ * writes more WAL pages than the device takes in about 150 ms and never more
+ * than DB_TXN_COMMIT_PAGES_MAX: one pack commit on FS2 wrote 730 pages and
+ * held the lock for 13.2 s. So the test runs with the budget on, as the
+ * daemon does, and asserts what it promises: every commit within the page
+ * ceiling, and no more commits than the budget needs - not one per large
+ * file or per 200 ms.
  */
 static void slow_store_progress(const char *phase, uint64_t done, uint64_t total,
                                 void *ctx)
@@ -1875,17 +1884,32 @@ static void test_no_waiter_means_no_extra_commits(void **state)
     o.progress_cb  = slow_store_progress;
     o.progress_ctx = &calls;
 
+    db_txn_commit_stats_reset();
+    db_txn_track_wal(db);
     backup_result_t res;
     memset(&res, 0, sizeof(res));
-    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    status_t st = backup_run(store, db, repo_id, &o, &res);
+    db_txn_commit_stats_t cs;
+    db_txn_commit_stats(&cs);
+    db_txn_track_wal(NULL);
+    assert_int_equal(st, OK);
     assert_int_equal(calls, 3);
     assert_int_equal(res.files, 4506);
-    /* Batches end at files 2,000 and 4,000, and the last at the end. B107
-     * added one per large file and one per 200 ms on top. */
-    assert_int_equal(res.commits_store, 3);
+    print_message("  commits: store %u, trees %u, index %u, pack %u; largest %u WAL pages, "
+                  "%lu ended by the budget\n", res.commits_store, res.commits_trees,
+                  res.commits_index, res.commits_pack, cs.max_frames, cs.capped);
+    /* What the budget promises. */
+    assert_true(cs.commits > 0);
+    assert_true(cs.max_frames <= DB_TXN_COMMIT_PAGES_MAX);
+    /* And no more commits than it needs: past the two size boundaries and
+     * the last, every store commit is one the budget ended. B107's rules
+     * would have added one per large file and one per 200 ms of slow
+     * progress on top. (The pack's rows are split by the budget too, so
+     * commits_pack counts budget commits as well as the one seal.) */
+    assert_true(res.commits_store >= 3);
+    assert_true(cs.capped >= res.commits_store - 3);
+    assert_true(res.commits_store <= cs.capped + 3);
     assert_int_equal(res.commits_trees, 1);
-    /* 25 MiB packed: no seal in the loop, one at the end. */
-    assert_int_equal(res.commits_pack, 1);
 }
 
 /*
@@ -2070,6 +2094,9 @@ static void test_orphaned_snapshot_record_keeps_its_id(void **state)
 
 int main(void)
 {
+    /* The update hook the commit budget counts rows with (OWN-16's test
+     * turns the budget on), on every connection opened from here. */
+    db_txn_guard_install();
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_backup_runs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deleted_newest_snapshot_id_is_not_reused, setup, teardown),

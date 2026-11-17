@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "state_db.h"
+#include "db_txn.h"
 #include "wal_sync.h"
 #include "sync_latch.h"
 #include "checkpointer.h"
@@ -100,6 +101,8 @@ status_t state_db_tune(cutils_db_t *db, const state_db_tuning_t *t)
     if (got_limit != want_limit)
         return set_error(ERR_IO, "state.db journal_size_limit is %lld after setting %lld",
                          got_limit, want_limit);
+    /* The commit budget learns from what each COMMIT writes (db_txn.h). */
+    db_txn_track_wal(db);
     return OK;
 }
 

@@ -60,6 +60,13 @@
  *   the daemon holds one for long) stops any checkpoint from completing;
  *   the WAL then grows until it lets go, and writers are never held for it.
  *
+ * The restart is made here too: with the copy complete and the lock still
+ * held, the thread writes one row (daemon_state 'wal_restart') on its own
+ * connection, which restarts the WAL and pays SQLite's header sync on this
+ * thread rather than on whoever writes next (B144-REST). This connection is
+ * not the shared handle, and the write is made holding the write lock, so
+ * the db_write rule (db_write.h) is kept.
+ *
  * journal_size_limit on the shared handle trims the WAL file back to 4 x
  * the threshold (CKPT_CAP_FACTOR) at each restart, so its size on disk
  * follows its contents.
@@ -89,6 +96,9 @@ typedef struct {
     unsigned long busy;             /* checkpoints that could not start */
     uint32_t      max_wal_frames;   /* the most frames the WAL was seen holding */
     uint64_t      max_lock_ns;      /* the longest escalation hold */
+    unsigned long pre_restarts;     /* WAL restarts this thread made itself */
+    unsigned long pre_restart_misses; /* restart writes that did not restart */
+    uint64_t      max_restart_ns;   /* the longest of them (the header sync) */
     unsigned long throttled;        /* writers held at BEGIN past the hard cap (B181) */
     uint64_t      max_throttle_ns;  /* the longest of those waits */
 } checkpointer_stats_t;
