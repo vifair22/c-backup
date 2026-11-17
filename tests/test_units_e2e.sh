@@ -149,6 +149,14 @@ if cmp -s "$WORK/vda.raw" "$WORK/out/.cbackup-unit/disks/vda"; then ok "the raw 
 check    "no partial file is left" "no" "$([ -e "$WORK/vda.raw.cbk-partial" ] && echo yes || echo no)"
 OUT=$(cb unit restore 1 1 "$WORK/vda.raw" --item vda 2>&1); RC=$?
 check    "an item never lands on an existing file" 1 "$RC"
+OUT=$(cb unit restore 1 1 "$WORK/vda2.raw" --item vda --overwrite 2>&1); RC=$?
+check    "--overwrite with --item is refused by the CLI" 1 "$RC"
+contains "saying why" "an item is restored to a new path" "$OUT"
+if command -v curl >/dev/null 2>&1; then
+    OUT=$(curl -s --unix-socket "$SOCK" -X POST http://x/repos/1/snapshots/1/unit/restore \
+          -d "{\"mode\":\"item\",\"item\":\"vda\",\"dest\":\"$WORK/vda2.raw\",\"overwrite\":true}")
+    contains "and by the API, before any job" "overwrite does not apply to mode item" "$OUT"
+fi
 
 
 echo "nbd export"

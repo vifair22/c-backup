@@ -1089,6 +1089,8 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     else if (strcmp(mode, "files") == 0 && item) bad = "item applies only to mode item";
     else if (fmt && strcmp(fmt, "raw") != 0) bad = "format must be raw; qcow2 comes with the libvirt provider";
     else if (ow && !cJSON_IsBool(ow)) bad = "overwrite must be true or false";
+    /* Accepted here, it was refused only when the job ran. */
+    else if (item_mode && cJSON_IsTrue(ow)) bad = "overwrite does not apply to mode item: an item is restored to a new path, never over one";
     if (bad) { cJSON_Delete(o); return api_error(400, bad); }
 
     char key[UNIT_KEY_MAX];

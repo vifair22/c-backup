@@ -1467,6 +1467,8 @@ static int h_unit_restore(const args_t *a)
         return refuse(a, "--name, --target-root, --replace, --pin-digest, --start and --keep-macs need --define");
     if (define && (item || overwrite))
         return refuse(a, "--item and --overwrite do not apply with --define");
+    if (item && overwrite)
+        return refuse(a, "--overwrite does not apply with --item: an item is restored to a new path, never over one");
     sbuf_t b = { 0 };
     if (define) {
         sb_puts(&b, "{\"mode\":\"unit\"");
