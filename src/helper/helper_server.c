@@ -1428,6 +1428,20 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
         return resp_error(r->id, HELPER_E_INVALID, "path too long");
     int bfd = -1;
     if (open_base(dom, base, &bfd, swhy, sizeof(swhy)) != 0) return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
+    /* The daemon creates and writes inside the staging (the restore makes
+     * its root directory's entries and fixes its metadata), and it runs as
+     * daemon_uid with no write capability on directories it does not own.
+     * A base the helper made, or one root made by hand, is given to it; one
+     * somebody else owns is used as it is (real-engines job 20955). */
+    {
+        struct stat bs0;
+        if (fstat(bfd, &bs0) == 0 && geteuid() == 0 && bs0.st_uid == 0 &&
+            bs0.st_uid != (uid_t)s->pol->daemon_uid && fchown(bfd, (uid_t)s->pol->daemon_uid, (gid_t)-1) != 0) {
+            int er = errno;
+            close(bfd);
+            return resp_error(r->id, HELPER_E_FAILED, "cannot give %s to the daemon: %s", base, strerror(er));
+        }
+    }
     if (mkdirat(bfd, jname, 0700) != 0) {
         int er = errno;
         close(bfd);

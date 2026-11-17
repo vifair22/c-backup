@@ -108,8 +108,10 @@ Notes that matter:
   another dataset), since the swap could not be a rename. Whether the share
   is exported over SMB or NFS does not matter: anyone who can write the
   share can already edit the data in it. The helper creates the base and
-  each restore's directory 0700 (the latter owned by the daemon); an
-  existing base is used whoever owns it, as long as it is a real directory.
+  each restore's directory 0700, owned by the daemon, which writes inside
+  them as uid 990 with no write capability on directories it does not own;
+  a base root owns (made by hand) is given to the daemon too. A base owned
+  by anyone else is used as it is, as long as it is a real directory.
   What it never does is follow a symlink to one (Restore staging and
   define, below).
 

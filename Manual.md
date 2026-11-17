@@ -2961,8 +2961,8 @@ chown 990:990 /mnt/cache/appdata/c-backupd \
 chown root:990 /run/c-backup-helper && chmod 0750 /run/c-backup-helper
 ```
 
-The helper makes each restore's directory inside it, owned by 990; the
-daemon reaches it through `CAP_DAC_READ_SEARCH` whoever owns the parent
+The helper gives it to 990 at the first restore, and makes each restore's
+directory inside it, also owned by 990: the daemon writes there as uid 990
 (22.7.3).
 
 On FS2 create `/mnt/cache/system/.cbackup-restore` the same way instead of
@@ -3699,8 +3699,9 @@ refuses it:
 
 Each refusal says what to change. Whether the share is exported over SMB
 or NFS does not matter (FS1's `appdata` is): anyone who can write the share
-can already edit the data in it. The helper creates the directory 0700 and
-uses an existing one whoever owns it. The staging is pinned: the swap
+can already edit the data in it. The helper creates the directory 0700,
+owned by 990, gives a root-owned one to 990, and uses one anybody else owns
+as it is. The staging is pinned: the swap
 renames through directory handles the helper opened at stage, checks that
 the path still names them, and refuses (nothing moved) if the directory was
 renamed or replaced in between. The swap is one atomic exchange where the filesystem supports
