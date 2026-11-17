@@ -576,7 +576,11 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r)
     cJSON *res = cJSON_CreateObject();
     cJSON *mem = res ? cJSON_AddArrayToObject(res, "members") : NULL;
     helper_err_t fail = mem ? HELPER_OK : HELPER_E_FAILED;
-    char fmsg[512] = "out of memory";
+    /* Room for the longest it is given: a unit key, ": " and 400 bytes of the
+     * error (the others take at most 500), so nothing in it is cut short. It
+     * was 512, under the 563 a full-length key needs, and -Wformat-truncation
+     * said so in the debug and asan builds. */
+    char fmsg[HELPER_UNIT_KEY_MAX + sizeof(": ") + 400] = "out of memory";
     for (size_t i = 0; fail == HELPER_OK && i < r->n_units; i++) {
         const char *uid = r->units[i] + 5;
         sp_unit_desc_t *d = NULL;
