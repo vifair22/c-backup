@@ -23,6 +23,8 @@
 
 #include <cmocka.h>
 #include <cutils/db.h>
+#include <cutils/log.h>
+#include <stdatomic.h>
 
 #include "helper_fixture.h"
 #include "registry.h"
@@ -638,6 +640,32 @@ static void test_session_end_during_begin(void **state)
     assert_true(helper_drained());
 }
 
+static atomic_int id_warnings;
+
+static void count_id_warning(const char *ts, const char *level, const char *func, const char *msg, void *ud)
+{
+    (void)ts; (void)level; (void)func; (void)ud;
+    if (strstr(msg, "configured for daemon")) atomic_fetch_add(&id_warnings, 1);
+}
+
+/* A daemon id that differs from the helper's is said once, not at every
+ * health check (it was every 15 s; here the checks are every 200 ms). */
+static void test_id_mismatch_said_once(void **state)
+{
+    (void)state;
+    assert_string_not_equal(units_daemon8(), "0badf00d");
+    remote_stop();
+    atomic_store(&id_warnings, 0);
+    int h = log_stream_register(count_id_warning, NULL);
+    assert_true(h >= 0);
+    assert_int_equal(remote_start(HF_SOCK, units_daemon8(), &k_fast), OK);
+    struct timespec ts = { 1, 200 * 1000000L };
+    nanosleep(&ts, NULL);
+    remote_stop();
+    log_stream_unregister(h);
+    assert_true(atomic_load(&id_warnings) <= 1);
+}
+
 /* A compose project's definition as the daemon assembles it from a
  * snapshot: files, .env, services with their image records, and under a new
  * name the binds remapped under the target root. */
@@ -804,6 +832,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define_fails_rolls_back, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_session_end_releases, setup, teardown),
         cmocka_unit_test_setup_teardown(test_session_end_during_begin, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_id_mismatch_said_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_compose_definition, setup, teardown),
         cmocka_unit_test_setup_teardown(test_group_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),

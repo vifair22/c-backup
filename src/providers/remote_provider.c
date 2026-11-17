@@ -878,7 +878,11 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
     h.captures = (long)num(res, "captures");
     snprintf(h.daemon_id, sizeof(h.daemon_id), "%s", jstr(res, "daemon_id"));
     snprintf(h.policy, sizeof(h.policy), "%s", jstr(res, "policy"));
-    if (daemon8 && strcmp(h.daemon_id, daemon8) != 0)
+    /* Said when it is news: this ran at every health check, so a daemon id
+     * that differs from the helper's was warned about every 15 s. */
+    int news = strcmp(g_hello.daemon_id, h.daemon_id) != 0 || strcmp(g_hello.policy, h.policy) != 0 ||
+               g_hello.version != h.version;
+    if (news && daemon8 && strcmp(h.daemon_id, daemon8) != 0)
         log_warn("helper: configured for daemon %s, this daemon is %s; artefacts are named "
                  "with the helper's", h.daemon_id, daemon8);
     const cJSON *p;
@@ -926,9 +930,11 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
     if (g_hello.policy[0] && strcmp(g_hello.policy, h.policy) != 0)
         log_warn("helper: its policy changed (%.16s to %.16s) while this daemon ran",
                  g_hello.policy, h.policy);
+    news |= strcmp(g_hello.providers, h.providers) != 0;
     g_hello = h;
-    log_info("helper: %s, version %d, daemon %s, policy %.16s, providers %s", socket_path,
-             h.version, h.daemon_id, h.policy, h.providers[0] ? h.providers : "none");
+    if (news)
+        log_info("helper: %s, version %d, daemon %s, policy %.16s, providers %s", socket_path,
+                 h.version, h.daemon_id, h.policy, h.providers[0] ? h.providers : "none");
     if (out) *out = h;
     return OK;
 }
