@@ -280,6 +280,8 @@ status_t chunklist_iter_open(const obj_loader_t *loader,
 status_t chunklist_iter_next(chunklist_iter_t *it, chunklist_item_t *item,
                              int *done);
 void     chunklist_iter_skip(chunklist_iter_t *it);
+/* The root list's total_len: the content's logical length. */
+uint64_t chunklist_iter_total(const chunklist_iter_t *it);
 void     chunklist_iter_close(chunklist_iter_t *it);
 
 /* ------------------------------------------------------------------ */
