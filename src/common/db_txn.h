@@ -75,6 +75,29 @@ void db_txn_rollback(cutils_db_t *db);
 unsigned db_txn_waiters(void);
 
 /*
+ * When a holder that commits in batches should let the lock go: at the
+ * first check after a writer queues, and then, while writers keep coming
+ * (contended, for DB_TXN_BATCH_CONTENDED_MS after the last one seen), once
+ * a batch has been open DB_TXN_BATCH_HOLD_MS. The backup's store batch
+ * applies the same rules (backup.c) and should move onto this; the pack
+ * commit uses it (store_index.c). Contended mode is what keeps two writers
+ * that never go away, such as a backup's store batch and its pack workers,
+ * from trading the lock, and a commit, at every row.
+ *
+ * Call db_txn_batch_opened right after each db_txn_begin of the batch.
+ */
+#define DB_TXN_BATCH_CONTENDED_MS 1000
+#define DB_TXN_BATCH_HOLD_MS      200
+
+typedef struct {
+    uint64_t opened_ns;
+    uint64_t contended_until_ns;
+} db_txn_batch_t;
+
+void db_txn_batch_opened(db_txn_batch_t *b);
+int  db_txn_batch_should_end(db_txn_batch_t *b);
+
+/*
  * Make every commit so far durable before returning (B142).
  *
  * state.db runs synchronous=NORMAL: a commit is in the WAL but not synced,

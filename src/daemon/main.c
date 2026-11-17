@@ -300,6 +300,10 @@ int main(int argc, char *argv[])
     }
     /* Nothing is running yet, so any staged object rows belong to a backup
      * that died with the last process, along with the pack they were in. */
+    /* First the rows of a pack commit a crash cut between its batches, back
+     * to staged, so the drop below takes them with the rest (B144). */
+    if (store_index_drop_unannounced(db, 0) != OK)
+        log_warn("cannot drop the rows of an interrupted pack commit: %s", err_msg());
     if (store_index_drop_staged(db, 0) != OK)
         log_warn("cannot drop staged objects left by an interrupted backup");
 

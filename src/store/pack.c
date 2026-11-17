@@ -2420,6 +2420,24 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
                                  packed, enc, &dat_size);
     if (st == OK) st = install_pack_file(store, dat_tmp, pack_num, &dat_size);
     if (st != OK) { unlink(dat_tmp); return st; }
+
+    /*
+     * The rename durable before the index names the pack (B142's rule). The
+     * file's data is synced by seal_pack_file; its directory entry was not,
+     * and the commit that announce_pack starts reaches the disk on its own
+     * within a second. A power cut in between kept index rows naming a pack
+     * the disk no longer had: lost objects for a new pack, and for a pack
+     * that took over a duplicate's row, an object that had been readable
+     * from its old pack and no longer was (test_powercut_fault). The shard
+     * may have been created for this pack, so packs/ is synced as well.
+     */
+    char dir[PATH_MAX];
+    if (path_fmt(dir, sizeof(dir), "%s/packs/" PACK_SHARD_FMT, store_root(store),
+                 PACK_SHARD_OF(pack_num)) != 0 || fsync_dir_path(dir) != 0)
+        return set_error_errno(ERR_IO, "finalize_pack: sync %s", dir);
+    if (path_fmt(dir, sizeof(dir), "%s/packs", store_root(store)) != 0 ||
+        fsync_dir_path(dir) != 0)
+        return set_error_errno(ERR_IO, "finalize_pack: sync %s", dir);
     return announce_pack(store, pack_num, dat_size, idx_entries, packed);
 }
 

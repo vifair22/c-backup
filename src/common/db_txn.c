@@ -114,6 +114,23 @@ unsigned db_txn_waiters(void)
     return atomic_load_explicit(&g_waiting, memory_order_relaxed);
 }
 
+void db_txn_batch_opened(db_txn_batch_t *b)
+{
+    b->opened_ns = phase_now();
+}
+
+int db_txn_batch_should_end(db_txn_batch_t *b)
+{
+    uint64_t now = phase_now();
+    if (db_txn_waiters() > 0) {
+        int was = b->contended_until_ns > now;
+        b->contended_until_ns = now + (uint64_t)DB_TXN_BATCH_CONTENDED_MS * 1000000ULL;
+        if (!was) return 1;
+    }
+    return b->contended_until_ns > now &&
+           now - b->opened_ns >= (uint64_t)DB_TXN_BATCH_HOLD_MS * 1000000ULL;
+}
+
 status_t db_txn_make_durable(cutils_db_t *db)
 {
     if (!db) return set_error(ERR_INVALID, "db_txn_make_durable: null handle");
