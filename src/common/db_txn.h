@@ -126,6 +126,14 @@ status_t db_txn_make_durable(cutils_db_t *db);
 unsigned long db_txn_durable_count(void);
 
 /*
+ * For the power-cut tests: a gate asked before every make_durable, whose
+ * non-OK answer fails it with nothing checkpointed (the cut came first),
+ * and a callback after each one completes, still under the write lock, so
+ * the database file it sees is exactly what was made durable. NULL clears.
+ */
+void db_txn_set_durable_hooks(status_t (*gate)(void), void (*done)(void));
+
+/*
  * Time spent in this module is attributed to the calling thread's phase
  * timers (phase_timer.h), when it has any: lock wait and BEGIN as txn-wait,
  * COMMIT and ROLLBACK, WAL sync included, as txn-commit. Both are recorded as
