@@ -949,6 +949,33 @@ static int held_kind(sp_session_t *s, size_t i, const char *kind)
     return r;
 }
 
+/* held[i] already released by someone else (the watchdog): counted,
+ * and its journal row known gone with that release. */
+static int hold_lost(sp_session_t *s, size_t i)
+{
+    sp_ctx_t *c = s->ctx;
+    pthread_mutex_lock(&c->mu);
+    int lost = !c->holds[s->held[i].hold].held;
+    if (lost) c->st.watchdog_released++;
+    pthread_mutex_unlock(&c->mu);
+    if (lost) s->held[i].intent = 0;
+    return lost;
+}
+
+/* The guest agent or the runtime does not answer: wait, as a stuck call
+ * would, up to fail_arg ms or until something releases held[i] from
+ * outside. 1 when something did. */
+static int hang_in_hold(sp_session_t *s, const sp_begin_req_t *req, size_t i)
+{
+    for (uint64_t waited = 0; waited < s->fail_arg; waited += 5) {
+        if (req && req->cancel && atomic_load(req->cancel)) break;
+        if (hold_lost(s, i)) return 1;
+        struct timespec ts = { 0, 5 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
 static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
                         const sp_begin_req_t *req, sp_session_t **out,
                         const sp_session_info_t **info)
@@ -976,7 +1003,10 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
 
     funit_t *su = s->unit;
     int running = su->state == SP_STATE_RUNNING || su->state == SP_STATE_PAUSED;
-    int froze = 0, watchdog = 0, paused = 0, snapped = 0, exported = 0;
+    int froze = 0, paused = 0, snapped = 0, exported = 0;
+    /* A freeze or pause something else let go before the point in time:
+     * the unit ran while the rest was taken. */
+    int freeze_lost = 0, pause_lost = 0;
     char detail[192];
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -996,28 +1026,8 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
             session_free(s);
             return st;
         }
-        if (st == OK && s->fail == FAKE_HANG_IN_HOLD) {
-            /* The guest agent does not answer: wait, as a stuck libvirt
-             * call would, until the deadline or until something releases
-             * the freeze from outside. */
-            size_t h = s->held[s->nheld - 1].hold;
-            for (uint64_t waited = 0; waited < s->fail_arg; waited += 5) {
-                if (req && req->cancel && atomic_load(req->cancel)) break;
-                pthread_mutex_lock(&c->mu);
-                int still = c->holds[h].held;
-                pthread_mutex_unlock(&c->mu);
-                if (!still) { watchdog = 1; break; }
-                struct timespec ts = { 0, 5 * 1000000L };
-                nanosleep(&ts, NULL);
-            }
-            if (watchdog) {
-                pthread_mutex_lock(&c->mu);
-                c->st.watchdog_released++;
-                pthread_mutex_unlock(&c->mu);
-                /* Its journal row went with the release. */
-                s->held[s->nheld - 1].intent = 0;
-            }
-        }
+        if (st == OK && s->fail == FAKE_HANG_IN_HOLD)
+            freeze_lost = hang_in_hold(s, req, s->nheld - 1);
         if (st == OK && s->fail == FAKE_FAIL_BEGIN_AFTER_HOLD)
             st = set_error(ERR_IO, "fake: begin %s failed after the freeze (injected)", su->id);
     }
@@ -1025,6 +1035,8 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
         snprintf(detail, sizeof(detail), "pause:%s", su->id);
         st = take_journalled(s, SP_HOLD_PAUSE, detail);
         if (st == OK) paused = 1;
+        if (st == OK && s->fail == FAKE_HANG_IN_PAUSE)
+            pause_lost = hang_in_hold(s, req, s->nheld - 1);
     }
     int want_snap = 0;
     for (size_t i = 0; i < su->nt; i++) want_snap = 1;
@@ -1047,9 +1059,15 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
     }
 
     /* The point in time is established: freeze and pause go now, before
-     * any data is read. Snapshots and exports stay until end. */
+     * any data is read. Snapshots and exports stay until end. One found
+     * already released was gone before that point, after a hang above or
+     * with none: a real provider learns it from its thaw or unpause
+     * finding the unit already running. */
     for (size_t i = s->nheld; st == OK && i-- > 0;) {
-        if (!held_kind(s, i, SP_HOLD_FREEZE) && !held_kind(s, i, SP_HOLD_PAUSE)) continue;
+        int fr = held_kind(s, i, SP_HOLD_FREEZE), pa = held_kind(s, i, SP_HOLD_PAUSE);
+        if (!fr && !pa) continue;
+        if (fr && !freeze_lost) freeze_lost = hold_lost(s, i);
+        if (pa && !pause_lost) pause_lost = hold_lost(s, i);
         st = release_one(s, i);
         if (st == OK) {
             memmove(&s->held[i], &s->held[i + 1], (s->nheld - i - 1) * sizeof(s->held[0]));
@@ -1061,20 +1079,26 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
 
     if (st == OK) {
         sp_session_info_t *in = &s->info;
-        if (!running)              in->achieved = SP_CONSIST_OFFLINE;
-        else if (froze && !watchdog) in->achieved = SP_CONSIST_QUIESCED;
-        else if (paused || snapped || exported) in->achieved = SP_CONSIST_CRASH;
-        else                       in->achieved = SP_CONSIST_INCONSISTENT;
+        /* A snapshot or export is one instant by itself; a pause only
+         * counts if it lasted until they were taken. */
+        if (!running)                        in->achieved = SP_CONSIST_OFFLINE;
+        else if (froze && !freeze_lost)      in->achieved = SP_CONSIST_QUIESCED;
+        else if ((paused && !pause_lost) || snapped || exported) in->achieved = SP_CONSIST_CRASH;
+        else                                 in->achieved = SP_CONSIST_INCONSISTENT;
         if (froze)    { in->consist_flags |= SP_CF_FROZEN; in->freeze_ms = ms; }
         if (paused)   { in->consist_flags |= SP_CF_PAUSED; in->pause_ms = ms; }
         if (snapped)  in->consist_flags |= SP_CF_FS_SNAPSHOT;
-        if (watchdog) {
-            in->consist_flags |= SP_CF_WATCHDOG_RELEASED;
+        if (freeze_lost || pause_lost) in->consist_flags |= SP_CF_WATCHDOG_RELEASED;
+        if (freeze_lost)
             st = sp_session_info_warn(in, "freeze on %s released by the watchdog after "
                                       "%llu ms; consistency is %s, not quiesced",
                                       su->name, (unsigned long long)ms,
                                       sp_consistency_name(in->achieved));
-        }
+        if (st == OK && pause_lost)
+            st = sp_session_info_warn(in, "pause on %s released by the watchdog after "
+                                      "%llu ms; consistency is %s",
+                                      su->name, (unsigned long long)ms,
+                                      sp_consistency_name(in->achieved));
         if (st == OK && req && in->achieved < req->require)
             st = set_error(ERR_INVALID, "unit %s: achieved %s, below the required %s",
                            su->name, sp_consistency_name(in->achieved),
@@ -1525,19 +1549,22 @@ static status_t f_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
     for (size_t k = 0; k < req->n_intents; k++) {
         const sp_intent_t *in = &req->intents[k];
         fake_fail_t fail = fail_for(c, in->unit_id, &arg);
-        int ok = 1;
+        int ok = 1, found = 0;
         for (size_t i = 0; i < c->nh; i++) {
             fhold_t *h = &c->holds[i];
             if (!h->held || strcmp(h->unit_id, in->unit_id) != 0 ||
                 strcmp(h->kind, in->kind) != 0 || strcmp(h->detail, in->detail) != 0)
                 continue;
+            found = 1;
             if (hold_release(c, i, fail) != OK) { ok = 0; err_clear(); }
             else out->released++;
         }
         /* Nothing held under that name: releasing it is a no-op that
-         * succeeds, as thawing a guest that is not frozen does. */
+         * succeeds, as thawing a guest that is not frozen does, and is
+         * reported as such so the watchdog can tell it from a release. */
         if (!ok) out->failed++;
         if (req->released) req->released[k] = ok;
+        if (req->absent) req->absent[k] = !found;
     }
     if (req->scan_artefacts) {
         for (size_t i = 0; i < c->na; i++) {
