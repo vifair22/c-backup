@@ -25,7 +25,8 @@
  *               backup, the original back - no collision, indexed again,
  *               everything restorable; every pack missing (one of one,
  *               the UAT's unmounted packs/) unavailable and never healed;
- *               packs/ replaced under the index; an empty root; a copy
+ *               packs/ replaced under the index, and a real move
+ *               accepted by the repair; an empty root; a copy
  *               that fails its proof losing to one that passes; the
  *               pack-ids mark after a lost index and a lost file
  */
@@ -1019,6 +1020,74 @@ static void test_the_tombstone_floors_a_lost_mark(void **state)
     assert_true(mark_now() > (int64_t)top);
 }
 
+/*
+ * packs/ really moved - a rebuilt pool, packs restored to a new disk - and
+ * one pack did not come with it. Unavailable, with a reason naming the
+ * cause and the repair; the repair refuses while the root's marker is not
+ * the registered one, then accepts the new device:inode and the loss; the
+ * next check is ordinary and the next backup stores the lost file again.
+ */
+static void test_a_moved_packs_dir_is_accepted_by_repair(void **state)
+{
+    (void)state;
+    pack_presence_set_brake(100, 1000);
+    int64_t ids[3];
+    three_packs(ids);
+    pack_presence_t pp;
+    assert_int_equal(pack_presence_check(db, repo_id, 0, &pp), OK);   /* records packs/ */
+
+    /* The new filesystem: a copy of packs/ (a new inode), without c's pack. */
+    sh("cp -a '%s/packs' '%s/packs-new'", TEST_REPO);
+    char p[512], moved[700];
+    pack_path(pack_of("c"), p, sizeof(p));
+    snprintf(moved, sizeof(moved), TEST_REPO "/packs-new/%s", strstr(p, "/packs/") + strlen("/packs/"));
+    assert_int_equal(unlink(moved), 0);
+    assert_int_equal(rename(TEST_REPO "/packs", TEST_DIR "/packs-old"), 0);
+    assert_int_equal(rename(TEST_REPO "/packs-new", TEST_REPO "/packs"), 0);
+    pack_cache_invalidate(store);
+
+    assert_int_equal(pack_presence_check(db, repo_id, 0, &pp), OK);
+    assert_true(pp.unavailable);
+    assert_non_null(strstr(pp.why, "not the directory it was"));
+    assert_non_null(strstr(pp.why, "really moved"));
+    char fix[96];
+    snprintf(fix, sizeof(fix), "c-backup repo repair %lld --accept-missing", (long long)repo_id);
+    assert_non_null(strstr(pp.why, fix));
+    assert_int_equal(backup(NULL), ERR_UNAVAILABLE);
+    err_clear();
+
+    /* Not this repository's marker: still refused, nothing dropped. */
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT uuid FROM repos WHERE id = ?",
+                                (const char *[]){ repo, NULL }, &r), 0);
+    char uuid[64];
+    snprintf(uuid, sizeof(uuid), "%s", r->rows[0][0]);
+    db_result_free(r);
+    assert_int_equal(db_execute_non_query(db, "UPDATE repos SET uuid = 'someone-else' WHERE id = ?",
+                                          (const char *[]){ repo, NULL }, NULL), 0);
+    assert_int_equal(pack_presence_check(db, repo_id, 1, &pp), OK);
+    assert_true(pp.unavailable);
+    assert_non_null(strstr(pp.why, "not this repository's marker"));
+    assert_int_equal(pp.packs_dropped, 0);
+    assert_int_equal(db_execute_non_query(db, "UPDATE repos SET uuid = ? WHERE id = ?",
+                                          (const char *[]){ uuid, repo, NULL }, NULL), 0);
+
+    /* The operator's repair: the loss and the new identity accepted. */
+    assert_int_equal(pack_presence_check(db, repo_id, 1, &pp), OK);
+    assert_false(pp.unavailable);
+    assert_int_equal(pp.packs_dropped, 1);
+    assert_int_equal(pack_presence_check(db, repo_id, 0, &pp), OK);
+    assert_false(pp.unavailable);
+    assert_int_equal(pack_presence_available(db, repo_id, NULL, 0), 1);
+
+    int64_t s4 = backup_ok();                    /* stores c again */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects o JOIN nodes n ON n.content_hash = o.hash"
+                            " WHERE o.repo_id = ? AND n.name = 'c' AND o.location = 'absent'"), 0);
+    assert_restores(s4);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1041,6 +1110,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_verify_catches_a_pack_that_is_not_what_the_index_says, setup, teardown),
         cmocka_unit_test_setup_teardown(test_uat_e6_unmounted_packs_mountpoint, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_replaced_packs_dir, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_moved_packs_dir_is_accepted_by_repair, setup, teardown),
         cmocka_unit_test_setup_teardown(test_an_empty_repository_root, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_mark_survives_a_lost_index, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_tombstone_floors_a_lost_mark, setup, teardown),

@@ -215,7 +215,8 @@ static status_t put_state(cutils_db_t *db, const char *repo, const char *key, co
 /* What a probe of the repository's directories found. */
 typedef enum {
     AV_OK = 0,
-    AV_GONE,          /* no marker, packs/ unreadable, or packs/ replaced with packs missing */
+    AV_GONE,          /* no marker, or packs/ unreadable */
+    AV_MOVED,         /* packs/ replaced, packs missing from it: accept_missing may proceed */
     AV_ALL_MISSING    /* every pack the index names is missing: accept_missing may proceed */
 } avail_t;
 
@@ -333,8 +334,12 @@ static status_t probe(cutils_db_t *db, const char *repo, probe_t *p, avail_t *ou
         snprintf(p->why, sizeof(p->why),
                  "%s is not the directory it was (device:inode %s, was %s) and %u of the "
                  "%u packs the index names are not in it; something was mounted or "
-                 "unmounted there", p->packs_dir, p->identity, was, p->missing, p->total);
-        *out = AV_GONE;
+                 "unmounted there. If packs/ really moved (a rebuilt pool, packs "
+                 "restored to a new disk), check that this is the right mount, then run "
+                 "'c-backup repo repair %s --accept-missing' to record its new identity "
+                 "and accept the missing packs as lost",
+                 p->packs_dir, p->identity, was, p->missing, p->total, repo);
+        *out = AV_MOVED;
     } else if (p->total && !any) {
         snprintf(p->why, sizeof(p->why),
                  "none of the %u packs the index names is in %s; is it mounted?",
@@ -635,9 +640,36 @@ status_t pack_presence_check(cutils_db_t *db, int64_t repo_id, int accept_missin
     status_t st = probe(db, repo, pr, &av);
     if (st != OK) { free(pr); return st; }
 
+    /*
+     * packs/ moved for real - a rebuilt pool, packs restored to a new disk -
+     * and some did not come with it. Only the operator can say so, and only
+     * for this repository: the marker at the root must be the one the index
+     * registered. Then the missing packs are dropped as below and the new
+     * device:inode recorded at the end, so the next check is ordinary.
+     */
+    if (av == AV_MOVED && accept_missing) {
+        repo_marker_t m;
+        db_result_t *u = NULL;
+        int same = repo_marker_read(pr->root, &m) == OK &&
+                   db_execute(db, "SELECT uuid FROM repos WHERE id = ?",
+                              (const char *[]){ repo, NULL }, &u) == 0 &&
+                   u && u->nrows == 1 && strcmp(u->rows[0][0], m.uuid) == 0;
+        db_result_free(u);
+        err_clear();
+        if (same) {
+            log_warn("repo %lld: accepting %s as packs/ at its new device:inode %s",
+                     (long long)repo_id, pr->packs_dir, pr->identity);
+            av = AV_OK;
+        } else {
+            snprintf(pr->why, sizeof(pr->why),
+                     "%s/" CBACKUP_MARKER " is not this repository's marker; packs/'s new "
+                     "identity is not accepted", pr->root);
+        }
+    }
+
     /* An unmounted share looks like every pack gone. Nothing is checked or
      * changed until the repository is shown to be there. */
-    if (av == AV_GONE || (av == AV_ALL_MISSING && !accept_missing)) {
+    if (av == AV_GONE || av == AV_MOVED || (av == AV_ALL_MISSING && !accept_missing)) {
         res.unavailable = 1;
         res.degraded = pack_presence_degraded(db, repo_id, NULL, 0);
         snprintf(res.why, sizeof(res.why), "%s", pr->why);

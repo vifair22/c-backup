@@ -2305,10 +2305,33 @@ Two things are never taken for missing packs:
   - every pack the index names is missing, however many there are, one of
     one included.
 
-  Only the last yields to `repo repair --accept-missing`, for the operator
-  who has checked and knows every pack is gone. Only a pack file that does
-  not exist (`ENOENT`) in a readable `packs/` counts as missing; any other
-  error leaves its pack as it is.
+  The last two yield to `repo repair --accept-missing`, for the operator
+  who has checked. Every pack missing: they really are all gone. A
+  replaced `packs/`: it really moved - the pool was rebuilt, the packs were
+  restored to a new disk - and the packs the reason counts did not come
+  with it. The reason says so and names the command:
+
+  ```
+  repository 1 is unavailable: /srv/backup/main/packs is not the directory it was (device:inode 66306:256, was 2049:131) and 1 of the 3 packs the index names are not in it; something was mounted or unmounted there. If packs/ really moved (a rebuilt pool, packs restored to a new disk), check that this is the right mount, then run 'c-backup repo repair 1 --accept-missing' to record its new identity and accept the missing packs as lost; nothing was read or written
+  ```
+
+  Check the mount first: the wrong share mounted at `packs/` reads exactly
+  like this. Then:
+
+  ```sh
+  sudo c-backup repo repair 1 --accept-missing
+  ```
+
+  The repair accepts a replaced `packs/` only when the repository root's
+  `.cbackup` marker is the one registered for that id; otherwise it stays
+  unavailable and says the marker is not this repository's. It marks the
+  missing packs' objects absent (section 17.6, above), records the new
+  device:inode so later checks are ordinary, and the next backup stores
+  again whatever its sources still hold. A `packs/` that moved with every
+  pack in it needs nothing: its new device:inode is recorded on its own.
+
+  Only a pack file that does not exist (`ENOENT`) in a readable `packs/`
+  counts as missing; any other error leaves its pack as it is.
 - **A mass disappearance.** Two or more missing packs that are more than
   `index.missing_brake_pct` percent of the repository's (default 5), or more
   than `index.missing_brake_packs` of them (default 10), looks far more like

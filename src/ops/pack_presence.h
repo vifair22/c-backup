@@ -28,8 +28,9 @@
  *     (device or inode changed) and a pack is missing from it, and when
  *     every pack the index names is missing, whatever their number (B156:
  *     packs/ can itself be a mountpoint, and unmounted it is an empty
- *     directory; one pack of one used to heal into it). Only the last
- *     yields to accept_missing. Only ENOENT for a pack file in a readable
+ *     directory; one pack of one used to heal into it). The last two yield
+ *     to accept_missing: a replaced packs/ only when the root's marker is
+ *     the one registered, and its new device:inode is then recorded. Only ENOENT for a pack file in a readable
  *     packs/ counts; EIO, EACCES and the rest leave the row alone.
  *   - A mass disappearance. More missing packs than the brake allows
  *     (pack_presence_set_brake: by default two or more that are more than
@@ -59,7 +60,7 @@
 #include <stdint.h>
 
 /* Room for a reason naming a full path and two device:inode pairs. */
-#define PACK_PRESENCE_WHY_MAX (PATH_MAX + 512)
+#define PACK_PRESENCE_WHY_MAX (PATH_MAX + 1024)
 
 typedef struct {
     int      unavailable;       /* packs/ missing or unreadable: nothing checked */
