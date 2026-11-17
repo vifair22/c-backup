@@ -49,6 +49,12 @@ typedef struct {
     char    detail[192];
     int64_t created_ms;                     /* wall clock; 0 after a restart */
     int64_t capture;                        /* the capture's sequence number */
+    int     busy;                           /* a release in flight; not persisted */
+    /* Releases that failed: retried with a backoff, never dropped, and
+     * reported to the daemon by the sweep (B175). Not persisted. */
+    int     tries;
+    int64_t next_ms, fail_since_ms;
+    char    last_err[200];
 } hold_t;
 
 struct jctx;
@@ -135,8 +141,9 @@ struct helper_server {
     int64_t                next_hold;
 
     int                    lfd;
-    pthread_t              accept_th, wd_th;
-    int                    accept_on, wd_on, stop;
+    pthread_t              accept_th, wd_th, boot_th;
+    int                    accept_on, wd_on, boot_on, stop;
+    int                    boot_done;   /* the start-up sweep finished; under cmu */
     pthread_mutex_t        cmu;
     pthread_cond_t         wcv;
     int                    conns[CONNS_MAX];
@@ -323,10 +330,16 @@ static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx,
     hold_t *picked = calloc(HOLDS_MAX, sizeof(*picked));
     if (!picked) return 0;
     size_t n = 0;
+    /* A hold another thread is releasing is left to it: a thaw can wait
+     * 30 s on libvirt, and the watchdog and a sweep must not stack. */
+    int64_t now = now_ms();
     pthread_mutex_lock(&s->jmu);
     for (size_t i = 0; i < s->n_holds; i++)
-        if (backend_of(s, s->holds[i].unit, NULL) && pick(&s->holds[i], pctx))
+        if (!s->holds[i].busy && s->holds[i].next_ms <= now && backend_of(s, s->holds[i].unit, NULL) &&
+            pick(&s->holds[i], pctx)) {
+            s->holds[i].busy = 1;
             picked[n++] = s->holds[i];
+        }
     pthread_mutex_unlock(&s->jmu);
     unsigned released = 0;
     for (size_t i = 0; i < n; i++) {
@@ -342,7 +355,30 @@ static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx,
         rq.released = &rel;
         rq.absent = &absent;
         sp_sweep_report_t rep;
+        memset(&rep, 0, sizeof(rep));
         status_t st = b && b->ops->sweep ? b->ops->sweep(b->ctx, &rq, &rep) : ERR_INVALID;
+        int failed = !(st == OK && rel);
+        char why_failed[200];
+        snprintf(why_failed, sizeof(why_failed), "%.190s",
+                 st != OK && err_msg()[0] ? err_msg() : st == OK && rep.stuck[0] ? rep.stuck : "the release failed");
+        int tries = 0;
+        int64_t delay = 0;
+        pthread_mutex_lock(&s->jmu);
+        for (size_t k = 0; k < s->n_holds; k++) {
+            hold_t *h = &s->holds[k];
+            if (h->id != picked[i].id) continue;
+            h->busy = 0;
+            if (!failed) break;
+            /* 1 s, doubling, at most a minute apart: a stuck thaw is tried
+             * again soon, and a libvirt that is down is not hammered. */
+            tries = ++h->tries;
+            delay = (int64_t)1000 << (tries - 1 < 6 ? tries - 1 : 6);
+            if (delay > 60000) delay = 60000;
+            h->next_ms = now_ms() + delay;
+            if (!h->fail_since_ms) h->fail_since_ms = now_ms();
+            snprintf(h->last_err, sizeof(h->last_err), "%s", why_failed);
+        }
+        pthread_mutex_unlock(&s->jmu);
         if (st == OK && rel && absent && keep_absent) continue;
         if (st == OK && rel) {
             jctx_t j = { s, "", 0 };
@@ -352,14 +388,18 @@ static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx,
                      picked[i].unit, picked[i].detail);
         } else {
             err_clear();
-            log_warn("helper: %s could not release %s on %s; kept", why, picked[i].kind, picked[i].unit);
+            if (tries <= 1)
+                log_warn("helper: %s could not release %s on %s (%s); kept, retried in %lld s", why,
+                         picked[i].kind, picked[i].unit, why_failed, (long long)(delay / 1000));
+            else
+                log_error("helper: %s could not release %s on %s, %d tries (%s); kept, retried in %lld s",
+                          why, picked[i].kind, picked[i].unit, tries, why_failed, (long long)(delay / 1000));
         }
     }
     free(picked);
     return released;
 }
 
-static int pick_all(const hold_t *h, void *ctx) { (void)h; (void)ctx; return 1; }
 
 typedef struct { int64_t now_ms; unsigned pause_s; } age_t;
 
@@ -1956,6 +1996,23 @@ static char *op_sweep(helper_server_t *s, const helper_req_t *r)
         cJSON_AddNumberToObject(res, "removed", rep.removed);
         cJSON_AddNumberToObject(res, "left_foreign", rep.left_foreign);
         cJSON_AddNumberToObject(res, "holds", (double)helper_server_holds(s));
+        /* Holds whose release keeps failing, for the daemon to alert on. */
+        cJSON *stuck = cJSON_AddArrayToObject(res, "stuck");
+        pthread_mutex_lock(&s->jmu);
+        for (size_t i = 0; stuck && i < s->n_holds; i++) {
+            const hold_t *h = &s->holds[i];
+            if (!h->tries) continue;
+            cJSON *o = cJSON_CreateObject();
+            if (!o) break;
+            cJSON_AddItemToArray(stuck, o);
+            cJSON_AddStringToObject(o, "unit", h->unit);
+            cJSON_AddStringToObject(o, "kind", h->kind);
+            cJSON_AddStringToObject(o, "detail", h->detail);
+            cJSON_AddNumberToObject(o, "tries", h->tries);
+            cJSON_AddNumberToObject(o, "since", (double)(h->fail_since_ms / 1000));
+            cJSON_AddStringToObject(o, "error", h->last_err);
+        }
+        pthread_mutex_unlock(&s->jmu);
     }
     return resp_ok(r->id, res);
 }
@@ -2283,6 +2340,34 @@ static status_t listen_on(helper_server_t *s)
     return OK;
 }
 
+/*
+ * What the last helper process held is released, and leftovers of this
+ * daemon id destroyed, on a thread of its own: a release can block (a
+ * thaw waits up to 30 s for a freeze still pending in libvirt, B175), and
+ * the helper answers meanwhile. Only holds no live capture owns are
+ * picked, so a capture begun meanwhile is never touched. One that fails
+ * stays journalled and the watchdog retries it.
+ */
+static void *boot_main(void *arg)
+{
+    helper_server_t *s = arg;
+    unsigned rel = release_holds(s, pick_unowned, s, 0, "start-up sweep");
+    sp_sweep_report_t rep;
+    sweep_artefacts(s, &rep);
+    if (rel || rep.removed)
+        log_warn("helper: start-up sweep released %u hold(s), removed %u artefact(s)", rel, rep.removed);
+    size_t left = helper_server_holds(s);
+    pthread_mutex_lock(&s->jmu);
+    if (journal_save(s) != OK) err_clear();   /* logged; holds are still in memory */
+    pthread_mutex_unlock(&s->jmu);
+    if (left) log_warn("helper: %zu hold(s) still journalled after the start-up sweep; the watchdog retries them", left);
+    pthread_mutex_lock(&s->cmu);
+    s->boot_done = 1;
+    pthread_cond_broadcast(&s->wcv);
+    pthread_mutex_unlock(&s->cmu);
+    return NULL;
+}
+
 status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **out)
 {
     helper_server_t *s = calloc(1, sizeof(*s));
@@ -2304,17 +2389,25 @@ status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **o
         return st;
     }
 
-    /* Whatever the last helper process held is released before anything
-     * new is taken, and leftovers of this daemon id are destroyed. */
+    /* Whatever the last helper process held is released, on its own
+     * thread (boot_main). Start waits for it a moment, which is all a
+     * sweep that does not block takes, so a quick one is done before the
+     * first request; a slow one goes on while the helper serves. */
     journal_load(s);
-    unsigned rel = release_holds(s, pick_all, NULL, 0, "start-up sweep");
-    sp_sweep_report_t rep;
-    sweep_artefacts(s, &rep);
-    if (rel || rep.removed)
-        log_warn("helper: start-up sweep released %u hold(s), removed %u artefact(s)", rel, rep.removed);
-    pthread_mutex_lock(&s->jmu);
-    if (journal_save(s) != OK) err_clear();   /* logged; holds are still in memory */
-    pthread_mutex_unlock(&s->jmu);
+    if (pthread_create(&s->boot_th, NULL, boot_main, s) == 0) {
+        s->boot_on = 1;
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += 2;
+        pthread_mutex_lock(&s->cmu);
+        while (!s->boot_done)
+            if (pthread_cond_timedwait(&s->wcv, &s->cmu, &dl) != 0) break;
+        int done = s->boot_done;
+        pthread_mutex_unlock(&s->cmu);
+        if (!done) log_warn("helper: the start-up sweep is still running; serving meanwhile");
+    } else {
+        boot_main(s);
+    }
 
     if (cfg->listen) {
         status_t st = listen_on(s);
@@ -2342,6 +2435,7 @@ void helper_server_stop(helper_server_t *s)
         if (s->pol) (void)unlink(s->pol->socket);
     }
     if (s->wd_on) pthread_join(s->wd_th, NULL);
+    if (s->boot_on) pthread_join(s->boot_th, NULL);
     for (int i = 0; i < CONNS_MAX; i++) if (s->conn_th[i]) pthread_join(s->conn_th[i], NULL);
     /* Captures still held are ended; their holds go with them. */
     for (size_t i = 0; i < CAPTURES_MAX; i++)

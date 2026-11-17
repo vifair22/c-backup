@@ -695,7 +695,7 @@ docker run -d --name c-backup-helper --restart unless-stopped \
   --privileged --pid=host --network=none \
   --label net.cbackup.role=helper \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock \
+  -v /var/run/libvirt:/var/run/libvirt \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /boot/config/c-backup-helper.ini:/etc/c-backup-helper.ini:ro \
   <image> c-backupd --helper

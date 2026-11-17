@@ -92,6 +92,8 @@ status_t remote_op(const char *provider, const char *op, struct cJSON *args, int
  * naming the socket; else 0.
  */
 int      remote_unusable(const char *provider, char *why, size_t wsz);
+/* The same for a job about to run: tries to connect once first (B180). */
+int      remote_unusable_for_job(const char *provider, char *why, size_t wsz);
 
 /* What the helper holds now (a fresh hello): its journalled holds and open
  * captures. Fails when no helper is configured or it does not answer. */

@@ -218,7 +218,7 @@ static const config_key_t app_file_keys[] = {
     { "units.fake_spec", CFG_STRING, "",
       "Test only: JSON file of fake units; enables the fake provider",
       CFG_STORE_FILE, 0 },
-    { "vm.freeze_timeout_s", CFG_INT, "10",
+    { "vm.freeze_timeout_s", CFG_INT, "20",
       "Watchdog bound on a guest freeze, seconds (1 to 600)",
       CFG_STORE_FILE, 0 },
     { "vm.trust_zero_status", CFG_INT, "1",

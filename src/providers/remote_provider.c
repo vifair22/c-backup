@@ -838,6 +838,21 @@ static status_t r_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
         out->released = (unsigned)num(res, "released");
         out->removed = (unsigned)num(res, "removed");
         out->left_foreign = (unsigned)num(res, "left_foreign");
+        /* A hold the helper keeps failing to release (a guest it cannot
+         * thaw): said in the job's warning, so it alerts (B175). */
+        const cJSON *stuck = cJSON_GetObjectItemCaseSensitive(res, "stuck");
+        int n = cJSON_GetArraySize(stuck);
+        const cJSON *h = n > 0 ? cJSON_GetArrayItem(stuck, 0) : NULL;
+        if (h) {
+            const char *kind = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(h, "kind"));
+            const char *unit = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(h, "unit"));
+            const char *err = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(h, "error"));
+            snprintf(out->stuck, sizeof(out->stuck),
+                     "the helper cannot release %s on %s after %d tries (%.200s)%s; it keeps retrying",
+                     kind ? kind : "?", unit ? unit : "?", (int)num(h, "tries"), err ? err : "",
+                     n > 1 ? ", and other holds" : "");
+            log_error("units: %s", out->stuck);
+        }
     }
     cJSON_Delete(res);
     return st;
@@ -857,7 +872,7 @@ status_t remote_op(const char *provider, const char *op, cJSON *args, int send_f
         cJSON_Delete(args);
         err_clear();
         char why[512];
-        if (remote_unusable(provider, why, sizeof(why))) return set_error(ERR_IO, "%s", why);
+        if (remote_unusable_for_job(provider, why, sizeof(why))) return set_error(ERR_IO, "%s", why);
         return set_error(ERR_INVALID, "provider %s is not behind the helper", provider);
     }
     return rcall_full(c->socket, op, args, result, send_fd, NULL);
@@ -1163,4 +1178,32 @@ int remote_unusable(const char *provider, char *why, size_t wsz)
                  "since %s: %s", provider, li.socket, when,
                  li.last_error[0] ? li.last_error : "never connected");
     return 1;
+}
+
+/*
+ * remote_unusable for a job about to run: not connected now, it tries
+ * once, here, before failing. The link thread retries on a backoff of up
+ * to 30 s, so a helper back a moment ago was still "unreachable since" to
+ * the first job after it, which failed for nothing (B180). Status paths
+ * keep remote_unusable, which never blocks on a connect.
+ */
+int remote_unusable_for_job(const char *provider, char *why, size_t wsz)
+{
+    remote_link_info_t li;
+    remote_link_info(&li);
+    if (li.configured && li.state != REMOTE_CONNECTED) {
+        char sock[108], d8[16];
+        pthread_mutex_lock(&g_link.mu);
+        snprintf(sock, sizeof(sock), "%s", g_link.info.socket);
+        snprintf(d8, sizeof(d8), "%s", g_link.daemon8);
+        pthread_mutex_unlock(&g_link.mu);
+        remote_hello_t h;
+        if (attach_once(sock, d8, &h) == OK) {
+            log_info("helper: connected to %s (on demand, for a job)", sock);
+            link_set(REMOTE_CONNECTED, NULL, &h);
+        } else {
+            err_clear();
+        }
+    }
+    return remote_unusable(provider, why, wsz);
 }

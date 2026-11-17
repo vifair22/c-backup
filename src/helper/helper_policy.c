@@ -132,7 +132,9 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
     snprintf(out->nvram_dir, sizeof(out->nvram_dir), "/etc/libvirt/qemu/nvram");
     snprintf(out->qemu_nbd, sizeof(out->qemu_nbd), "/usr/bin/qemu-nbd");
     snprintf(out->staging_root, sizeof(out->staging_root), "/mnt/cache/system/cbackup-vmstate");
-    out->vm_freeze_timeout_s = 10;
+    /* 3x the worst freeze measured on FS1 (6.6 s, a busy pool): the
+     * window is libvirt's backup-begin, scratch images included (B180). */
+    out->vm_freeze_timeout_s = 20;
     snprintf(out->socket, sizeof(out->socket), "/run/c-backup-helper/helper.sock");
 
     char *buf = strdup(text ? text : "");
