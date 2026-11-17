@@ -66,15 +66,68 @@
 #include "unit_state.h"
 #include "unit_tokens.h"
 
-#define D      TEST_TMP "/c_backup_test_vinc"
-#define SOCK   D "/h.sock"
 #define UUID   "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1c3a"
-#define NAME   "cbk-uat-v3i"
 #define KEY    "libvirt:" UUID
 #define M      ((uint64_t)1024 * 1024)
-#define XDG    TEST_TMP "/vi"
-#define URI    "qemu:///session?socket=" XDG "/run/libvirt/virtqemud-sock"
-#define VSH    "virsh -q -c '" URI "' "
+
+/*
+ * Everything this run owns is named for it (VIRT-COLLIDE): the scratch
+ * tree, the private virtqemud's directory and the guest. They were fixed
+ * names, so two runs on one machine shared them: a second run's pgrep found
+ * the first run's QEMU ("guest=cbk-uat-v3i", another bench.slice scope),
+ * and its pkill would have killed it. The run id is the pid in base 36, so
+ * unique among live processes and short: the virtqemud directory holds
+ * QEMU's monitor sockets, which must fit sun_path's 108 bytes.
+ */
+static char g_rid[8];
+static char D[200], SOCK[220], XDG[200], URI[300], VSH[340], NAME[40];
+static char NAME_PAT[48];   /* NAME for pgrep -f: first letter bracketed, ended by QEMU's ',' */
+static char DB_PATH[220], REPO_PATH[220];
+
+/* A formatted string in one of a ring of buffers, for a call's argument. */
+static const char *pf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static const char *pf(const char *fmt, ...)
+{
+    static char ring[16][4096];
+    static unsigned next;
+    char *b = ring[next++ % 16];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof(ring[0]), fmt, ap);
+    va_end(ap);
+    return b;
+}
+
+static void run_names(void)
+{
+    static const char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    char rev[8];
+    int n = 0;
+    for (unsigned long v = (unsigned long)getpid(); v && n < 7; v /= 36) rev[n++] = digits[v % 36];
+    for (int i = 0; i < n; i++) g_rid[i] = rev[n - 1 - i];
+    g_rid[n] = '\0';
+    snprintf(D, sizeof(D), "%s/c_backup_test_vinc-%s", TEST_TMP, g_rid);
+    snprintf(SOCK, sizeof(SOCK), "%s/h.sock", D);
+    /* The private daemon's directory holds QEMU's monitor sockets, under
+     * its XDG_CONFIG_HOME, and libvirt refuses a path past 107 bytes: the
+     * run id on the directory and the guest name took the scratch-rooted
+     * path to 112 here, and CI's scratch path is longer. Only sockets,
+     * small config and logs live there (the disk images stay in D), so it
+     * goes where runtime sockets belong: XDG_RUNTIME_DIR, /run as root,
+     * the scratch directory only when neither is writable. */
+    {
+        const char *rt = getenv("XDG_RUNTIME_DIR");
+        const char *base = (rt && *rt && access(rt, W_OK) == 0) ? rt
+                         : access("/run", W_OK) == 0 ? "/run" : TEST_TMP;
+        snprintf(XDG, sizeof(XDG), "%s/cbk-vi%s", base, g_rid);
+    }
+    snprintf(URI, sizeof(URI), "qemu:///session?socket=%s/run/libvirt/virtqemud-sock", XDG);
+    snprintf(VSH, sizeof(VSH), "virsh -q -c '%s' ", URI);
+    snprintf(NAME, sizeof(NAME), "cbk-uat-v3i-%s", g_rid);
+    snprintf(NAME_PAT, sizeof(NAME_PAT), "guest=[c]bk-uat-v3i-%s,", g_rid);
+    snprintf(DB_PATH, sizeof(DB_PATH), "%s/state.db", D);
+    snprintf(REPO_PATH, sizeof(REPO_PATH), "%s/repo", D);
+}
 
 extern const db_migration_t app_migrations[];
 
@@ -100,15 +153,15 @@ static int daemon_up(void)
 {
     daemon_pid = fork();
     if (daemon_pid == 0) {
-        setenv("XDG_RUNTIME_DIR", XDG "/run", 1);
-        setenv("XDG_CONFIG_HOME", XDG "/config", 1);
-        setenv("XDG_CACHE_HOME", XDG "/cache", 1);
+        setenv("XDG_RUNTIME_DIR", pf("%s/run", XDG), 1);
+        setenv("XDG_CONFIG_HOME", pf("%s/config", XDG), 1);
+        setenv("XDG_CACHE_HOME", pf("%s/cache", XDG), 1);
         execlp("virtqemud", "virtqemud", "--timeout", "900", (char *)NULL);
         _exit(127);
     }
     if (daemon_pid < 0) return -1;
     for (int i = 0; i < 100; i++) {
-        if (system(VSH "uri >/dev/null 2>&1") == 0) return 0;
+        if (system(pf("%suri >/dev/null 2>&1", VSH)) == 0) return 0;
         struct timespec ts = { 0, 100 * 1000000L };
         nanosleep(&ts, NULL);
     }
@@ -126,7 +179,8 @@ static void daemon_down(void)
 static int start_daemon(void)
 {
     if (system("command -v virtqemud >/dev/null 2>&1") != 0) return -1;
-    if (system("rm -rf '" XDG "' && mkdir -p '" XDG "/run' '" XDG "/config' '" XDG "/cache' && chmod 700 '" XDG "/run'") != 0) return -1;
+    if (system(pf("rm -rf '%s' && mkdir -p '%s/run' '%s/config' '%s/cache' && chmod 700 '%s/run'",
+                  XDG, XDG, XDG, XDG, XDG)) != 0) return -1;
     return daemon_up();
 }
 
@@ -163,8 +217,8 @@ static void exp_write(uint64_t off, uint64_t len, uint8_t pat)
  * (the format node alone is not shared for writing). */
 static void vdb_dev(char *buf, size_t sz)
 {
-    SH(VSH "qemu-monitor-command --hmp " NAME " 'info block'");
-    char *p = strstr(g_out, D "/vdb.qcow2");
+    SH("%sqemu-monitor-command --hmp %s 'info block'", VSH, NAME);
+    char *p = strstr(g_out, pf("%s/vdb.qcow2", D));
     char *a = p ? strstr(p, "Attached to:") : NULL;
     if (!a) fail_msg("vdb's device is not in info block: %s", g_out);
     a += strlen("Attached to:");
@@ -180,27 +234,27 @@ static void guest_write(uint64_t off, uint64_t len, uint8_t pat)
 {
     char dev[256];
     vdb_dev(dev, sizeof(dev));
-    SH(VSH "qemu-monitor-command --hmp " NAME " 'qemu-io -d %s \"write -P 0x%02x %llu %llu\"'",
-       dev, pat, (unsigned long long)off, (unsigned long long)len);
+    SH("%sqemu-monitor-command --hmp %s 'qemu-io -d %s \"write -P 0x%02x %llu %llu\"'",
+       VSH, NAME, dev, pat, (unsigned long long)off, (unsigned long long)len);
     if (strstr(g_out, "rror") || strstr(g_out, "failed")) fail_msg("qemu-io: %s", g_out);
     exp_write(off, len, pat);
 }
 
 static void vm_start(void)
 {
-    SH(VSH "start " NAME);
+    SH("%sstart %s", VSH, NAME);
 }
 
 /* QEMU told to quit (SIGTERM): it closes the image cleanly, persistent
  * bitmaps stored, as a guest shutdown would leave them. */
 static void vm_stop_clean(void)
 {
-    SH(VSH "destroy --graceful " NAME);
+    SH("%sdestroy --graceful %s", VSH, NAME);
 }
 
 static int checkpoints(char names[][96], int max)
 {
-    if (shq(VSH "checkpoint-list --name " NAME) != 0) return -1;
+    if (shq("%scheckpoint-list --name %s", VSH, NAME) != 0) return -1;
     int n = 0;
     char *save = NULL;
     for (char *l = strtok_r(g_out, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {
@@ -252,9 +306,9 @@ static void put(const char *path, const void *data, size_t n)
 
 static void undefine(void)
 {
-    if (system(VSH "destroy " NAME " >/dev/null 2>&1") != 0) { /* not running */ }
-    if (system(VSH "undefine --checkpoints-metadata " NAME " >/dev/null 2>&1") != 0 &&
-        system(VSH "undefine " NAME " >/dev/null 2>&1") != 0) { /* already gone */ }
+    if (system(pf("%sdestroy %s >/dev/null 2>&1", VSH, NAME)) != 0) { /* not running */ }
+    if (system(pf("%sundefine --checkpoints-metadata %s >/dev/null 2>&1", VSH, NAME)) != 0 &&
+        system(pf("%sundefine %s >/dev/null 2>&1", VSH, NAME)) != 0) { /* already gone */ }
 }
 
 static int setup(void **state)
@@ -266,7 +320,8 @@ static int setup(void **state)
     have_vm = start_daemon() == 0 && system("command -v qemu-img >/dev/null") == 0;
     if (!have_vm) return 0;
     undefine();
-    if (system("rm -rf '" D "' && mkdir -p '" D "/nbd' '" D "/scratch' '" D "/staging' '" D "/tpm'") != 0) return -1;
+    if (system(pf("rm -rf '%s' && mkdir -p '%s/nbd' '%s/scratch' '%s/staging' '%s/tpm'",
+                  D, D, D, D, D)) != 0) return -1;
     /* vdb: 48 MiB virtual, 24 MiB of incompressible data, then a hole. */
     exp_size = 48 * M;
     exp_vdb = calloc(1, 128 * M);
@@ -278,19 +333,20 @@ static int setup(void **state)
         exp_vdb[i] = (uint8_t)x;
     }
     for (size_t i = 0; i < M; i++) raw_vda[i] = (uint8_t)(i * 7 + 1);
-    put(D "/vdb.raw", exp_vdb, (size_t)exp_size);
-    put(D "/vda.img", raw_vda, 4 * M);
-    if (system("qemu-img convert -q -f raw -O qcow2 '" D "/vdb.raw' '" D "/vdb.qcow2' && rm -f '" D "/vdb.raw'") != 0) return -1;
+    put(pf("%s/vdb.raw", D), exp_vdb, (size_t)exp_size);
+    put(pf("%s/vda.img", D), raw_vda, 4 * M);
+    if (system(pf("qemu-img convert -q -f raw -O qcow2 '%s/vdb.raw' '%s/vdb.qcow2' && rm -f '%s/vdb.raw'",
+                  D, D, D)) != 0) return -1;
     int kvm = access("/dev/kvm", R_OK | W_OK) == 0;
     char xml[4096];
     snprintf(xml, sizeof(xml),
-        "<domain type='%s'><name>" NAME "</name><uuid>" UUID "</uuid><memory unit='MiB'>64</memory><vcpu>1</vcpu>"
+        "<domain type='%s'><name>%s</name><uuid>" UUID "</uuid><memory unit='MiB'>64</memory><vcpu>1</vcpu>"
         "<os><type arch='x86_64' machine='pc'>hvm</type></os><devices>"
-        "<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='" D "/vda.img'/><target dev='vda' bus='virtio'/></disk>"
-        "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='" D "/vdb.qcow2'/><target dev='vdb' bus='virtio'/></disk>"
-        "</devices></domain>", kvm ? "kvm" : "qemu");
-    put(D "/dom.xml", xml, strlen(xml));
-    if (shq(VSH "define '" D "/dom.xml'") != 0 || shq(VSH "start " NAME) != 0) {
+        "<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='%s/vda.img'/><target dev='vda' bus='virtio'/></disk>"
+        "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='%s/vdb.qcow2'/><target dev='vdb' bus='virtio'/></disk>"
+        "</devices></domain>", kvm ? "kvm" : "qemu", NAME, D, D);
+    put(pf("%s/dom.xml", D), xml, strlen(xml));
+    if (shq("%sdefine '%s/dom.xml'", VSH, D) != 0 || shq("%sstart %s", VSH, NAME) != 0) {
         print_message("the test VM did not start here: %s\n", g_out);
         undefine();
         have_vm = 0;
@@ -299,18 +355,18 @@ static int setup(void **state)
 
     char text[4096];
     snprintf(text, sizeof(text),
-             "[helper]\ndaemon_uid = %u\ndaemon_id = 0badf00d\nstate_dir = " D "/hstate\nsocket = " SOCK "\n"
+             "[helper]\ndaemon_uid = %u\ndaemon_id = 0badf00d\nstate_dir = %s/hstate\nsocket = %s\n"
              "[units]\nallow = libvirt:cbk-uat-*\n"
              "[host]\nnsenter = 0\nhost_root =\n"
-             "[libvirt]\nenabled = 1\nuri = " URI "\nnbd_dir = " D "/nbd\ntpm_dir = " D "/tpm\n"
-             "scratch_dir = " D "/scratch\nstaging_root = " D "/staging\n",
-             (unsigned)getuid());
+             "[libvirt]\nenabled = 1\nuri = %s\nnbd_dir = %s/nbd\ntpm_dir = %s/tpm\n"
+             "scratch_dir = %s/scratch\nstaging_root = %s/staging\n",
+             (unsigned)getuid(), D, SOCK, URI, D, D, D, D);
     memset(&pol, 0, sizeof(pol));
     if (helper_policy_parse(text, &pol) != OK || helper_up() != 0) return -1;
-    if (db_open(&db, D "/state.db") != 0 || db_run_lib_migrations(db) != 0 ||
+    if (db_open(&db, DB_PATH) != 0 || db_run_lib_migrations(db) != 0 ||
         db_run_compiled_migrations(db, app_migrations) != 0) return -1;
-    if (repo_register(db, D "/repo", "t", &repo_id) != OK) return -1;
-    if (repo_store_open(D "/repo", NULL, &store) != OK) return -1;
+    if (repo_register(db, REPO_PATH, "t", &repo_id) != OK) return -1;
+    if (repo_store_open(REPO_PATH, NULL, &store) != OK) return -1;
     if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
     units_config_t uc = { "", 2, 10, 30, 1, 1, 75, 30 };
     if (units_init(db, NULL, &uc) != OK) return -1;
@@ -321,7 +377,7 @@ static int setup(void **state)
 static int teardown(void **state)
 {
     (void)state;
-    if (!have_vm) { daemon_down(); if (system("rm -rf '" XDG "'") != 0) {} return 0; }
+    if (!have_vm) { daemon_down(); if (system(pf("rm -rf '%s'", XDG)) != 0) {} return 0; }
     units_shutdown();
     remote_stop();
     sp_registry_shutdown();
@@ -331,12 +387,12 @@ static int teardown(void **state)
     store_close(store);
     db_close(db);
     undefine();
-    int left = shq(VSH "list --all --name") == 0 && strstr(g_out, "cbk-uat-") != NULL;
+    int left = shq("%slist --all --name", VSH) == 0 && strstr(g_out, NAME) != NULL;
     daemon_down();
-    if (system("rm -rf '" D "' '" XDG "'") != 0) fprintf(stderr, "cannot remove the scratch\n");
+    if (system(pf("rm -rf '%s' '%s'", D, XDG)) != 0) fprintf(stderr, "cannot remove the scratch\n");
     free(exp_vdb);
     free(raw_vda);
-    if (left) { fprintf(stderr, "test_virt_incremental: a cbk-uat-* domain was left behind\n"); return -1; }
+    if (left) { fprintf(stderr, "test_virt_incremental: %s was left behind\n", NAME); return -1; }
     return 0;
 }
 
@@ -372,7 +428,7 @@ static sess_t backup(void)
 {
     sess_t s;
     memset(&s, 0, sizeof(s));
-    const char *names[] = { NAME };
+    const char *names[] = { NAME };   /* this run's guest */
     unit_backup_opts_t o;
     memset(&o, 0, sizeof(o));
     o.provider = "libvirt";
@@ -413,7 +469,7 @@ static sess_t backup_ok(void)
 static void verify(int64_t snap)
 {
     char dest[256];
-    snprintf(dest, sizeof(dest), D "/r%lld", (long long)snap);
+    snprintf(dest, sizeof(dest), "%s/r%lld", D, (long long)snap);
     restore_opts_t ro;
     memset(&ro, 0, sizeof(ro));
     restore_result_t rr;
@@ -476,7 +532,7 @@ static void test_chain(void **state)
     char self[512] = "", qcg[512] = "";
     FILE *cf = fopen("/proc/self/cgroup", "r");
     if (cf) { if (!fgets(self, sizeof(self), cf)) self[0] = '\0'; fclose(cf); }
-    if (shq("pgrep -f 'guest=cbk-uat-[v]3i' | head -1") == 0 && g_out[0]) {
+    if (shq("pgrep -f '%s' | head -1", NAME_PAT) == 0 && g_out[0]) {
         g_out[strcspn(g_out, "\n")] = '\0';
         char path[64];
         snprintf(path, sizeof(path), "/proc/%.20s/cgroup", g_out);
@@ -559,7 +615,7 @@ static void fallback(const char *reason)
 static void restart_virtqemud(int wipe_checkpoints)
 {
     daemon_down();
-    if (wipe_checkpoints) SH("rm -rf '" XDG "/config/libvirt/qemu/checkpoint'");
+    if (wipe_checkpoints) SH("rm -rf '%s/config/libvirt/qemu/checkpoint'", XDG);
     assert_int_equal(daemon_up(), 0);
 }
 
@@ -570,7 +626,7 @@ static void test_fallbacks(void **state)
     char cps[4][96];
 
     /* Resized: the base has the old length. */
-    SH(VSH "blockresize " NAME " vdb 64M");
+    SH("%sblockresize %s vdb 64M", VSH, NAME);
     memset(exp_vdb + exp_size, 0, (size_t)(64 * M - exp_size));
     exp_size = 64 * M;
     fallback("item-resized");
@@ -579,7 +635,7 @@ static void test_fallbacks(void **state)
      * reboot does on Unraid): put back from the helper's XML before the
      * session, the bitmap still good, so still incremental. */
     assert_int_equal(checkpoints(cps, 4), 1);
-    SH(VSH "checkpoint-delete --metadata " NAME " %s", cps[0]);
+    SH("%scheckpoint-delete --metadata %s %s", VSH, NAME, cps[0]);
     assert_int_equal(checkpoints(cps, 4), 0);
     guest_write(4 * M, 65536, 0x41);
     sess_t s = backup_ok();
@@ -608,7 +664,7 @@ static void test_fallbacks(void **state)
      * prove the daemon's base, so a full read under a new checkpoint. */
     vm_stop_clean();
     helper_down();
-    SH("rm -f '" D "/hstate/libvirt-checkpoints.json'");
+    SH("rm -f '%s/hstate/libvirt-checkpoints.json'", D);
     restart_virtqemud(1);
     assert_int_equal(helper_up(), 0);
     vm_start();
@@ -616,8 +672,8 @@ static void test_fallbacks(void **state)
 
     /* QEMU killed: the bitmap was not saved cleanly, libvirt refuses the
      * incremental, the base is deleted and the begin repeated as full. */
-    SH("pkill -KILL -f 'guest=cbk-uat-[v]3i'");
-    for (int i = 0; i < 50 && shq(VSH "domstate " NAME) == 0 && !strstr(g_out, "shut off"); i++) {
+    SH("pkill -KILL -f '%s'", NAME_PAT);
+    for (int i = 0; i < 50 && shq("%sdomstate %s", VSH, NAME) == 0 && !strstr(g_out, "shut off"); i++) {
         struct timespec ts = { 0, 100 * 1000000L };
         nanosleep(&ts, NULL);
     }
@@ -627,13 +683,13 @@ static void test_fallbacks(void **state)
     /* The image replaced by a copy of itself (bitmaps and all): another
      * file, so the token no longer binds. */
     vm_stop_clean();
-    SH("cp --reflink=never '" D "/vdb.qcow2' '" D "/vdb.new' && mv '" D "/vdb.new' '" D "/vdb.qcow2'");
+    SH("cp --reflink=never '%s/vdb.qcow2' '%s/vdb.new' && mv '%s/vdb.new' '%s/vdb.qcow2'", D, D, D, D);
     vm_start();
     fallback("item-source-changed");
 
     /* The checkpoint deleted with its bitmap: the redefine is refused. */
     assert_int_equal(checkpoints(cps, 4), 1);
-    SH(VSH "checkpoint-delete " NAME " %s", cps[0]);
+    SH("%scheckpoint-delete %s %s", VSH, NAME, cps[0]);
     fallback("token-invalid");
 
     /* A token whose base no longer names the content recorded (a pruned
@@ -656,9 +712,9 @@ static void test_audit_failure(void **state)
     /* Written with the VM off, then the bitmap cleared: an image changed
      * behind its bitmap, which nothing but the audit can see. */
     vm_stop_clean();
-    SH("qemu-io -f qcow2 -c 'write -P 0x5a %llu 65536' '" D "/vdb.qcow2'", (unsigned long long)(10 * M));
+    SH("qemu-io -f qcow2 -c 'write -P 0x5a %llu 65536' '%s/vdb.qcow2'", (unsigned long long)(10 * M), D);
     exp_write(10 * M, 65536, 0x5a);
-    SH("qemu-img bitmap --clear '" D "/vdb.qcow2' %s", cps[0]);
+    SH("qemu-img bitmap --clear '%s/vdb.qcow2' %s", D, cps[0]);
     vm_start();
     force_audit();
     sess_t s = backup();
@@ -690,6 +746,7 @@ static void test_audit_failure(void **state)
 
 int main(void)
 {
+    run_names();
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_chain),
         cmocka_unit_test(test_fallbacks),
