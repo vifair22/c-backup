@@ -283,21 +283,23 @@ static int unix_request(const char *method, const char *path)
 }
 
 /*
- * The hook runs once for each request that changed something and was
- * answered 2xx, before the answer, and never for a GET or a failure: that
- * is what makes "the API returned" mean "the edit is on disk".
+ * The hook runs once for each durable write answered 2xx, before the
+ * answer, and never for a commit-only write, a GET or a failure: that is
+ * what makes "a durable route returned" mean "the edit is on disk", and
+ * what keeps a note or a sources edit off a saturated pool's fdatasync
+ * (B144).
  */
-static void test_after_write_runs_for_successful_writes_only(void **state)
+static void test_after_write_runs_for_durable_writes_only(void **state)
 {
     (void)state;
     unlink(TEST_SOCK);
     api_server_t *srv = api_server_create(0, NULL, TEST_SOCK, NULL);
     assert_non_null(srv);
-    assert_int_equal(api_server_route(srv, "/thing", API_GET, ok_handler, NULL), 0);
-    assert_int_equal(api_server_route(srv, "/thing", API_POST, ok_handler, NULL), 0);
-    assert_int_equal(api_server_route(srv, "/thing", API_PUT, ok_handler, NULL), 0);
-    assert_int_equal(api_server_route(srv, "/thing", API_DELETE, ok_handler, NULL), 0);
-    assert_int_equal(api_server_route(srv, "/bad", API_POST, fail_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/thing", API_GET, API_CLASS_NONE, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/thing", API_POST, API_DURABLE, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/thing", API_PUT, API_COMMIT_ONLY, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/thing", API_DELETE, API_DURABLE, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/bad", API_POST, API_DURABLE, fail_handler, NULL), 0);
     g_after_writes = 0;
     api_server_set_after_write(srv, count_after_write, NULL);
     assert_int_equal(api_server_start(srv), 0);
@@ -307,10 +309,99 @@ static void test_after_write_runs_for_successful_writes_only(void **state)
     assert_int_equal(unix_request("POST", "/thing"), 200);
     assert_int_equal(g_after_writes, 1);
     assert_int_equal(unix_request("PUT", "/thing"), 200);
+    assert_int_equal(g_after_writes, 1);
     assert_int_equal(unix_request("DELETE", "/thing"), 200);
-    assert_int_equal(g_after_writes, 3);
+    assert_int_equal(g_after_writes, 2);
     assert_int_equal(unix_request("POST", "/bad"), 400);
-    assert_int_equal(g_after_writes, 3);
+    assert_int_equal(g_after_writes, 2);
+    api_server_stop(srv);
+}
+
+/* Per path: the resolver decides, and a path it cannot class is synced as
+ * durable rather than left to the flusher. */
+static api_write_class_t by_path(const char *url, api_method_t method, void *ud)
+{
+    (void)ud; (void)method;
+    if (strcmp(url, "/w/durable") == 0) return API_DURABLE;
+    if (strcmp(url, "/w/commit") == 0)  return API_COMMIT_ONLY;
+    return API_CLASS_NONE;
+}
+
+static void test_after_write_follows_a_per_path_class(void **state)
+{
+    (void)state;
+    unlink(TEST_SOCK);
+    api_server_t *srv = api_server_create(0, NULL, TEST_SOCK, NULL);
+    assert_non_null(srv);
+    assert_int_equal(api_server_route(srv, "/w/*", API_POST, API_CLASS_BY_PATH, ok_handler, NULL), 0);
+    /* No resolver yet: start refuses rather than syncing everything. */
+    assert_int_not_equal(api_server_start(srv), 0);
+    assert_int_equal(api_server_route_class(srv, "/w/*", by_path, NULL), 0);
+    g_after_writes = 0;
+    api_server_set_after_write(srv, count_after_write, NULL);
+    assert_int_equal(api_server_start(srv), 0);
+
+    assert_int_equal(api_server_class_for(srv, "/w/durable", API_POST), API_DURABLE);
+    assert_int_equal(api_server_class_for(srv, "/w/commit", API_POST), API_COMMIT_ONLY);
+    assert_int_equal(api_server_class_for(srv, "/w/durable", API_GET), API_CLASS_NONE);
+    assert_int_equal(unix_request("POST", "/w/commit"), 200);
+    assert_int_equal(g_after_writes, 0);
+    assert_int_equal(unix_request("POST", "/w/durable"), 200);
+    assert_int_equal(g_after_writes, 1);
+    assert_int_equal(unix_request("POST", "/w/unknown"), 200);
+    assert_int_equal(g_after_writes, 2);
+    api_server_stop(srv);
+}
+
+/* No default: a write without a class, or a GET with one, is refused at
+ * registration, and so is a streaming write, which has no point at which
+ * it could be made durable. */
+static api_stream_response_t no_stream(const api_request_t *req, void *ud)
+{
+    (void)req; (void)ud;
+    api_stream_response_t r;
+    memset(&r, 0, sizeof(r));
+    return r;
+}
+
+static void test_a_write_needs_a_class(void **state)
+{
+    (void)state;
+    api_server_t *srv = api_server_create(0, NULL, NULL, NULL);
+    assert_non_null(srv);
+    assert_int_not_equal(api_server_route(srv, "/x", API_POST, API_CLASS_NONE, ok_handler, NULL), 0);
+    assert_int_not_equal(api_server_route(srv, "/x", API_PUT, (api_write_class_t)99, ok_handler, NULL), 0);
+    assert_int_not_equal(api_server_route(srv, "/x", API_GET, API_DURABLE, ok_handler, NULL), 0);
+    assert_int_not_equal(api_server_route(srv, "/x", API_DELETE, API_CLASS_BY_PATH, ok_handler, NULL), 0);
+    assert_int_not_equal(api_server_route_streaming(srv, "/s", API_POST, no_stream, NULL), 0);
+    assert_int_equal(api_server_route_count(srv), 0);
+    api_server_stop(srv);
+}
+
+/* An in-process dispatch runs the same hook rule as a connection. */
+static void test_dispatch_runs_the_hook_by_class(void **state)
+{
+    (void)state;
+    api_server_t *srv = api_server_create(0, NULL, NULL, NULL);
+    assert_non_null(srv);
+    assert_int_equal(api_server_route(srv, "/d", API_POST, API_DURABLE, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/c", API_POST, API_COMMIT_ONLY, ok_handler, NULL), 0);
+    g_after_writes = 0;
+    api_server_set_after_write(srv, count_after_write, NULL);
+    api_request_t req = { .method = API_POST, .url = "/c", .client_addr = "" };
+    api_response_t r = api_server_dispatch(srv, &req);
+    assert_int_equal(r.status, 200);
+    free(r.body);
+    assert_int_equal(g_after_writes, 0);
+    req.url = "/d";
+    r = api_server_dispatch(srv, &req);
+    free(r.body);
+    assert_int_equal(g_after_writes, 1);
+    req.url = "/none";
+    r = api_server_dispatch(srv, &req);
+    assert_int_equal(r.status, 404);
+    free(r.body);
+    assert_int_equal(g_after_writes, 1);
     api_server_stop(srv);
 }
 
@@ -324,7 +415,10 @@ int main(void)
         cmocka_unit_test_setup(test_restart_rebinds_over_time_wait, fresh_port),
         cmocka_unit_test_setup(test_create_rejects_what_cannot_work, fresh_port),
         cmocka_unit_test_setup(test_empty_bind_means_loopback, fresh_port),
-        cmocka_unit_test_setup(test_after_write_runs_for_successful_writes_only, fresh_port),
+        cmocka_unit_test_setup(test_after_write_runs_for_durable_writes_only, fresh_port),
+        cmocka_unit_test_setup(test_after_write_follows_a_per_path_class, fresh_port),
+        cmocka_unit_test(test_a_write_needs_a_class),
+        cmocka_unit_test(test_dispatch_runs_the_hook_by_class),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

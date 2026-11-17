@@ -367,8 +367,8 @@ static const char *providers_allow(const char *url, void *ud)
 
 int routes_register_providers(api_server_t *srv)
 {
-    if (api_server_route(srv, "/providers", API_GET, providers_get, NULL) != 0) return -1;
-    if (api_server_route(srv, "/providers/*", API_GET, providers_get, NULL) != 0) return -1;
+    if (api_server_route(srv, "/providers", API_GET, API_CLASS_NONE, providers_get, NULL) != 0) return -1;
+    if (api_server_route(srv, "/providers/*", API_GET, API_CLASS_NONE, providers_get, NULL) != 0) return -1;
     if (api_server_route_allow(srv, "/providers*", providers_allow, NULL) != 0) return -1;
     return 0;
 }
@@ -398,24 +398,62 @@ static int split_unit_path(const char *rest, char *prov, size_t psz, char *unit,
            strcmp(*suffix, "checkpoints") == 0 || strcmp(*suffix, "reset-incremental") == 0;
 }
 
-const char *units_path_allow(const char *rest)
+/*
+ * The units' part of the /repos/<id> path table, each write with its class
+ * (api_write_class_t). All commit-only: a unit backup, restore or export
+ * is a job or an export whose row a power cut would leave interrupted or
+ * absent, and a unit policy or an incrementals reset is a DB-only edit an
+ * operator can repeat. None deletes anything a client was told is gone.
+ */
+#define C_ API_COMMIT_ONLY
+static const api_path_t k_unit_paths[] = {
+    /* path                                   GET  POST  PUT  DELETE */
+    { "/units",                                 1,  0,    0,   0 },
+    { "/units/backup",                          0,  C_,   0,   0 },
+    { "/units/<p>/<u>/snapshots",               1,  0,    0,   0 },
+    { "/units/<p>/<u>/checkpoints",             1,  0,    0,   0 },
+    { "/units/<p>/<u>/policy",                  1,  0,    C_,  0 },
+    { "/units/<p>/<u>/reset-incremental",       0,  C_,   0,   0 },
+    { "/snapshots/<id>/unit/restore",           0,  C_,   0,   0 },
+    { "/snapshots/<id>/unit/export",            0,  C_,   0,   0 },
+};
+#undef C_
+
+static const api_path_t *unit_path_named(const char *path)
 {
-    if (strcmp(rest, "/units") == 0) return "GET";
-    if (strcmp(rest, "/units/backup") == 0) return "POST";
+    for (size_t i = 0; i < sizeof(k_unit_paths) / sizeof(k_unit_paths[0]); i++)
+        if (strcmp(k_unit_paths[i].path, path) == 0) return &k_unit_paths[i];
+    return NULL;
+}
+
+const api_path_t *units_path_entry(const char *rest)
+{
+    if (strcmp(rest, "/units") == 0 || strcmp(rest, "/units/backup") == 0)
+        return unit_path_named(rest);
     char prov[SP_PROVIDER_MAX], unit[SP_UNIT_ID_MAX];
     const char *suffix = NULL;
     if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix)) {
-        if (strcmp(suffix, "reset-incremental") == 0) return "POST";
-        return strcmp(suffix, "policy") == 0 ? "GET, PUT" : "GET";
+        char name[64];
+        snprintf(name, sizeof(name), "/units/<p>/<u>/%s", suffix);
+        return unit_path_named(name);
     }
     if (strncmp(rest, "/snapshots/", 11) == 0) {
         int64_t sid = 0;
         const char *end = NULL;
-        if (routes_path_id(rest + 11, 1, &sid, &end) == 1 &&
-            (strcmp(end, "/unit/restore") == 0 || strcmp(end, "/unit/export") == 0))
-            return "POST";
+        if (routes_path_id(rest + 11, 1, &sid, &end) == 1) {
+            if (strcmp(end, "/unit/restore") == 0)
+                return unit_path_named("/snapshots/<id>/unit/restore");
+            if (strcmp(end, "/unit/export") == 0)
+                return unit_path_named("/snapshots/<id>/unit/export");
+        }
     }
     return NULL;
+}
+
+const api_path_t *routes_units_paths(size_t *n)
+{
+    *n = sizeof(k_unit_paths) / sizeof(k_unit_paths[0]);
+    return k_unit_paths;
 }
 
 /* The key a request names: the provider and the unit's id, resolved from
