@@ -669,7 +669,7 @@ static void test_catchup_run_once_fires_now(void **state)
         "UPDATE schedules SET last_fired_at = ? WHERE id = ?",
         (const char *[]){ last, id, NULL }, NULL), 0);
 
-    assert_int_equal(scheduler_recompute(db, sid, now), OK);
+    scheduler_recompute_startup(db, now);
     assert_int_equal(due_of(sid), now);
 }
 
@@ -964,6 +964,112 @@ static api_request_t body_req(const char *body)
     return req;
 }
 
+/*
+ * B172: a run_once schedule that comes due while its overlap is running,
+ * with on-overlap skip. The skip leaves last_fired_at a window back, and
+ * the recompute after it read that as a missed window and set next = now,
+ * so every tick (the loop's 100 ms floor) skipped and logged again, and the
+ * schedule fired late once the overlap ended. A skip has to move the
+ * schedule to its next window: one skip line per window, and no late fire.
+ */
+static int g_skip_lines;
+
+static void count_skip_lines(const char *ts, const char *level, const char *func,
+                             const char *message, void *userdata)
+{
+    (void)ts; (void)level; (void)func; (void)userdata;
+    if (strstr(message, "skipping this fire")) g_skip_lines++;
+}
+
+static void test_b172_run_once_skip_moves_to_next_window(void **state)
+{
+    (void)state;
+    time_t t = 1720000000;
+    int64_t sid = add_schedule("gc", SPEC_HOURLY, t, "skip", "run_once");
+    char id[32], last[32];
+    snprintf(id,   sizeof(id),   "%lld", (long long)sid);
+    snprintf(last, sizeof(last), "%lld", (long long)(t - 3600));
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE schedules SET last_fired_at = ? WHERE id = ?",
+        (const char *[]){ last, id, NULL }, NULL), 0);
+    int64_t job = add_job("gc", "running");
+
+    g_skip_lines = 0;
+    int h = log_stream_register(count_skip_lines, NULL);
+    /* Ten minutes of ticks at the loop's floor would be 6000; 600 at one a
+     * second is plenty to show a spin. */
+    for (time_t now = t; now < t + 600; now++)
+        assert_int_equal(scheduler_tick(sched, now), OK);
+    log_stream_unregister(h);
+
+    assert_int_equal(g_fires, 0);
+    assert_int_equal(g_skip_lines, 1);
+    assert_int_equal(due_of(sid), t + 3600);
+
+    /* The overlap ends inside the window: nothing fires late. */
+    char jid[32];
+    snprintf(jid, sizeof(jid), "%lld", (long long)job);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE jobs SET state = 'completed' WHERE id = ?",
+        (const char *[]){ jid, NULL }, NULL), 0);
+    assert_int_equal(scheduler_tick(sched, t + 601), OK);
+    assert_int_equal(scheduler_tick(sched, t + 3599), OK);
+    assert_int_equal(g_fires, 0);
+    assert_int_equal(scheduler_tick(sched, t + 3600), OK);
+    assert_int_equal(g_fires, 1);
+}
+
+/* A calendar run_once schedule skipped for an overlap goes to its next
+ * window too: the bug was in catch-up, not in the interval arithmetic. */
+static void test_b172_calendar_run_once_skip_moves_to_next_window(void **state)
+{
+    (void)state;
+    time_t t = 1720000800;   /* 2024-07-03 10:00 UTC; TZ is pinned to UTC */
+    static const char spec[] =
+        "{\"type\":\"calendar\",\"every\":\"day\",\"at\":\"10:00\"}";
+    int64_t sid = add_schedule("verify", spec, t, "skip", "run_once");
+    char id[32], last[32];
+    snprintf(id,   sizeof(id),   "%lld", (long long)sid);
+    snprintf(last, sizeof(last), "%lld", (long long)(t - 86400));
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE schedules SET trigger_type = 'calendar', last_fired_at = ? WHERE id = ?",
+        (const char *[]){ last, id, NULL }, NULL), 0);
+    add_job("verify", "queued");
+
+    g_skip_lines = 0;
+    int h = log_stream_register(count_skip_lines, NULL);
+    for (time_t now = t; now < t + 120; now++)
+        assert_int_equal(scheduler_tick(sched, now), OK);
+    log_stream_unregister(h);
+    assert_int_equal(g_fires, 0);
+    assert_int_equal(g_skip_lines, 1);
+    assert_int_equal(due_of(sid), t + 86400);
+}
+
+/* UAT low: enabling a disabled run_once schedule fired a catch-up although
+ * the daemon was up throughout. Catch-up covers daemon downtime only. */
+static void test_enable_does_not_catch_up(void **state)
+{
+    (void)state;
+    time_t now = time(NULL);
+    int64_t sid = add_schedule("gc", SPEC_HOURLY, now - 50000, "skip", "run_once");
+    char id[32], last[32];
+    snprintf(id,   sizeof(id),   "%lld", (long long)sid);
+    snprintf(last, sizeof(last), "%lld", (long long)(now - 100000));
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE schedules SET last_fired_at = ?, enabled = 0 WHERE id = ?",
+        (const char *[]){ last, id, NULL }, NULL), 0);
+    routes_schedules_init(db, sched);
+
+    api_request_t on = body_req("{\"enabled\":true}");
+    api_response_t resp = schedules_patch(&on, 1, sid);
+    assert_int_equal(resp.status, 200);
+    free(resp.body);
+    assert_true(due_of(sid) > time(NULL));
+    assert_true(due_of(sid) <= time(NULL) + 3600);
+    routes_schedules_init(NULL, NULL);
+}
+
 /* The list shows the reason, enabling one still broken is refused, and a
  * change by hand clears what the daemon recorded. */
 static void test_disabled_reason_is_listed_and_enable_refused(void **state)
@@ -1033,6 +1139,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_overlap_is_per_action, setup, teardown),
         cmocka_unit_test_setup_teardown(test_catchup_skip_moves_forward, setup, teardown),
         cmocka_unit_test_setup_teardown(test_catchup_run_once_fires_now, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_b172_run_once_skip_moves_to_next_window, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_b172_calendar_run_once_skip_moves_to_next_window, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_enable_does_not_catch_up, setup, teardown),
         cmocka_unit_test_setup_teardown(test_catchup_run_once_without_history_fires_at_startup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_b155_restart_before_first_run_keeps_creation_anchor, setup, teardown),
         cmocka_unit_test_setup_teardown(test_b155_restart_after_a_run_keeps_last_fire_anchor, setup, teardown),

@@ -57,6 +57,7 @@
 #include "remote_provider.h"
 #include "unit_backup.h"
 #include "unit_state.h"
+#include "tzinfo.h"
 
 #ifndef VERSION_STRING
 #define VERSION_STRING "0.0.0-dev"
@@ -287,6 +288,23 @@ int main(int argc, char *argv[])
      * host can be identified without grepping the binary. */
     log_info("c-backupd %s", VERSION_STRING);
     log_info("c-utils %s", cutils_version());
+
+    /*
+     * The zone calendar schedules run in, and a TZ the C library cannot
+     * resolve said aloud: glibc treats one as UTC without a word, so a typo
+     * such as TZ=America/Chicgo moved every calendar schedule by hours and
+     * nothing anywhere said so.
+     */
+    {
+        const char *tzv = getenv("TZ");
+        if (!tz_known(tzv, tz_zonedir()))
+            log_warn("TZ '%s' is not a zone this system has (nothing under %s, and "
+                     "not a POSIX TZ rule); the C library is using UTC, and "
+                     "calendar schedules fire in UTC", tzv, tz_zonedir());
+        char tzn[128];
+        tz_name(tzn, sizeof(tzn));
+        log_info("time zone: %s (calendar schedules and GFS day boundaries)", tzn);
+    }
 
     cutils_config_t *cfg = appguard_config(guard);
     cutils_db_t *db = appguard_db(guard);
