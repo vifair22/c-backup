@@ -3082,20 +3082,24 @@ Before the first start, as root on the host:
 
 ```sh
 mkdir -p /mnt/cache/system/c-backup-helper /mnt/cache/appdata/c-backupd \
-         /mnt/cache/appdata/.cbackup-restore /mnt/cache/system/cbackup-vmstate \
-         /run/c-backup-helper /run/c-backupd
-chown 990:990 /mnt/cache/appdata/c-backupd /mnt/cache/appdata/.cbackup-restore \
+         /mnt/cache/system/cbackup-vmstate /run/c-backup-helper /run/c-backupd
+install -d -m 0700 /mnt/cache/appdata/.cbackup-restore
+chown 990:990 /mnt/cache/appdata/c-backupd \
               /mnt/cache/system/cbackup-vmstate /run/c-backupd /mnt/disk3/cbackup
 chown root:990 /run/c-backup-helper && chmod 0750 /run/c-backup-helper
 ```
 
-On FS2 create `/mnt/cache/system/.cbackup-restore` (owned by 990) instead
-of the appdata one. **Restore needs writable mounts the backup does not.**
+The helper gives it to 990 at the first restore, and makes each restore's
+directory inside it, also owned by 990: the daemon writes there as uid 990
+(22.7.3).
+
+On FS2 create `/mnt/cache/system/.cbackup-restore` the same way instead of
+the appdata one. **Restore needs writable mounts the backup does not.**
 The helper's pool mounts must be read-write (it stages and swaps); the
 daemon needs read-write the staging directory of each domain it restores
 into in place (above), for an in-place VM restore the `.cbackup-restore`
 of each image directory (`-v /mnt/cache/domains/<vm>/.cbackup-restore:/mnt/cache/domains/<vm>/.cbackup-restore`,
-created and owned by 990 first), and for a restore under a new name the
+created mode 0700 first; the helper gives it to 990), and for a restore under a new name the
 target root (`-v /mnt/cache/appdata/restore-test:/mnt/cache/appdata/restore-test`).
 Without them a restore fails at its first write, naming the path. `/run` is RAM on Unraid too: recreate the two `/run` directories at boot
 (the `go` file, or a User Scripts "at startup" script) before the containers
@@ -3118,7 +3122,7 @@ What each piece is for:
 | `/etc/libvirt/qemu/nvram`, `/etc/libvirt/qemu/swtpm/tpm-states`, read-only | daemon (FS1) | the TPM state of a VM is read by the daemon at its real path |
 | `/mnt/cache/system/cbackup-vmstate` | daemon (FS1) | the helper policy's `staging_root`: NVRAM and TPM state staged for a VM restore |
 | `<domain>/.cbackup-restore` (FS2: `/mnt/cache/system/.cbackup-restore`), read-write | daemon | where a container restore into place is staged before the helper swaps it in (22.7.3) |
-| `<image directory>/.cbackup-restore`, read-write, one per directory of VM images (FS1, only to restore a VM in place) | daemon | where an in-place VM restore writes each disk before the swap; created and owned by 990 beforehand |
+| `<image directory>/.cbackup-restore`, read-write, one per directory of VM images (FS1, only to restore a VM in place) | daemon | where an in-place VM restore writes each disk before the swap; created mode 0700 beforehand (the helper gives it to 990) |
 | the target root of a restore under a new name, read-write (only while restoring) | daemon | `--target-root DIR` (22.7.3): the daemon writes the unit's data there itself |
 | `/run/c-backupd` | daemon | the API socket, and `exports/` for NBD exports, which the host must reach (22.8) |
 | `--label net.cbackup.role=...` | both | a container carrying this label is never paused |
@@ -3912,9 +3916,24 @@ restore_staging_dirs` entry inside that domain; with none, for a whole-pool
 domain (FS2's `/mnt/cache`) `<pool>/system/.cbackup-restore`, beside the
 snapshot directory, and otherwise `<domain>/.cbackup-restore` (FS1:
 `/mnt/cache/appdata/.cbackup-restore`). Wherever it comes from, the helper
-refuses it at the top of a pool, in a share exported over SMB or NFS, and on
-another filesystem from the mount (a btrfs subvolume, another dataset); each
-refusal names `restore_staging_dirs` as the fix. VM images stage beside the
+refuses it:
+
+| Where | Why |
+|---|---|
+| the top of a pool | visible over the network |
+| a share with `shareUseCache="yes"` | the mover would carry staged files to the array mid-restore |
+| another filesystem from the mount (a btrfs subvolume, another dataset) | the swap could not be a rename |
+| a path through a symlink | never followed, so the helper cannot be steered outside the share |
+
+Each refusal says what to change. Whether the share is exported over SMB
+or NFS does not matter (FS1's `appdata` is): anyone who can write the share
+can already edit the data in it. The helper creates the directory 0700,
+owned by 990, gives a root-owned one to 990, and uses one anybody else owns
+as it is. The staging is pinned: the swap
+renames through directory handles the helper opened at stage, checks that
+the path still names them, and refuses (nothing moved) if the directory was
+renamed or replaced in between. The swap is one atomic exchange where the filesystem supports
+it (ZFS 2.2 and later, btrfs), so the mount is never missing. VM images stage beside the
 image (`<image dir>/.cbackup-restore/`) under the same refusals, and NVRAM
 and TPM state under `staging_root`.
 
@@ -3923,7 +3942,7 @@ refuses binds outside them, and the daemon must be able to write it: add a
 read-write mount of `DIR` to the daemon's container for the restore. An
 in-place VM restore likewise needs `<image directory>/.cbackup-restore`
 writable by the daemon (a read-write mount of that one directory, created
-and owned by 990 beforehand); without it, restore the VM under a new name. Restore needs `allow_restore = 1` and
+beforehand, mode 0700); without it, restore the VM under a new name. Restore needs `allow_restore = 1` and
 `allow_define = 1` in the policy; a definition with privileged settings,
 devices, `<hostdev>` or `<filesystem>` devices, or binds of host paths
 outside the include roots also needs `allow_privileged_define = 1`. The
@@ -4101,5 +4120,6 @@ production units means changing both lists, deliberately, on the host.
 | a gc job stays queued, phase `waiting for an NBD export to close` | an export is open on the repository | `vm exports`; `vm unexport <id>` if finished, or let its ttl run out |
 | the daemon will not start: `vm.export_max_conns ... needs jobs.read_budget_mb of at least ...` | the read budget cannot hold every export connection's object beside a job's 48 MiB | raise `jobs.read_budget_mb` as the message says, or lower `vm.export_max_conns` |
 | a VM unit fails: `disk: ... changed while it was read offline` | the VM was started, or the image written, during an offline read | run it again; the snapshot was not written |
-| `restore staging ... would sit at the top of a pool` or `... is exported over the network` or `... on another filesystem` | the default staging directory is not usable for that domain | set `[snapshot] restore_staging_dirs` to a directory inside the domain, in an unexported share, on the mount's filesystem |
+| `restore staging ... would sit at the top of a pool`, `... which the mover moves to the array` or `... on another filesystem` | the default staging directory is not usable for that domain | set `[snapshot] restore_staging_dirs` to a directory inside the domain, in a share the mover keeps on the pool, on the mount's filesystem |
+| `restore staging ... is a symlink or not a directory; not followed`, or `... was replaced or moved after it was staged; not swapped` | something put a symlink in the staging path, or replaced the staging directory between stage and swap | remove what was planted; the helper never follows or renames anything it did not make |
 | `docker run` of the daemon fails: bind source does not exist | a `/run` directory or a `.cbackup-restore` directory was not created | create them (22.2.1); `/run` is RAM on Unraid, recreate at boot |
