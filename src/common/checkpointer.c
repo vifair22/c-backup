@@ -3,12 +3,12 @@
 #include "checkpointer.h"
 
 #include "db_txn.h"
+#include "walidx.h"
 
 #include <cutils/db.h>
 #include <cutils/log.h>
 
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -21,40 +21,12 @@
 /* The wal-index header                                                */
 /* ------------------------------------------------------------------ */
 
-/* walformat.md: WalIndexHdr (48 bytes) twice, then WalCkptInfo, whose
- * first field is nBackfill. Native byte order. */
-#define WALIDX_VERSION   3007000u
-#define WALIDX_HDR_SIZE  48
-#define WALIDX_MXFRAME   16
-#define WALIDX_ISINIT    12
-#define WALIDX_BACKFILL  96
-#define WALIDX_READ      (WALIDX_BACKFILL + 4)
-
-static uint32_t u32_at(const unsigned char *b, size_t off)
-{
-    uint32_t v;
-    memcpy(&v, b + off, sizeof(v));
-    return v;
-}
-
 int checkpointer_wal_frames(const char *db_path, uint32_t *frames, uint32_t *backfilled)
 {
-    char shm[PATH_MAX];
-    if (!db_path || snprintf(shm, sizeof(shm), "%s-shm", db_path) >= (int)sizeof(shm))
-        return -1;
-    int fd = open(shm, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-    unsigned char b[WALIDX_READ];
-    ssize_t n = pread(fd, b, sizeof(b), 0);
-    close(fd);
-    if (n != (ssize_t)sizeof(b)) return -1;
-    if (u32_at(b, 0) != WALIDX_VERSION || b[WALIDX_ISINIT] != 1) return -1;
-    if (memcmp(b, b + WALIDX_HDR_SIZE, WALIDX_HDR_SIZE) != 0) return -1;
-    uint32_t mx = u32_at(b, WALIDX_MXFRAME);
-    uint32_t bf = u32_at(b, WALIDX_BACKFILL);
-    if (bf > mx) bf = mx;     /* read between a restart and its backfill reset */
-    if (frames) *frames = mx;
-    if (backfilled) *backfilled = bf;
+    walidx_t w;
+    if (walidx_read(db_path, &w) != 0) return -1;
+    if (frames) *frames = w.frames;
+    if (backfilled) *backfilled = w.backfilled;
     return 0;
 }
 

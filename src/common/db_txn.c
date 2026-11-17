@@ -5,10 +5,9 @@
 
 #include "phase_timer.h"
 #include "wal_sync.h"
+#include "walidx.h"
 
 #include <cutils/log.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sqlite3.h>
@@ -77,7 +76,7 @@ static _Thread_local int tls_held;
  * this thread holds the lock), and learnt from what commits really wrote:
  *
  *   - frames per COMMIT, from the wal-index header before BEGIN and after
- *     COMMIT (the same read checkpointer_wal_frames does);
+ *     COMMIT (walidx.h, which reads it without dropping SQLite's locks);
  *   - the device's cost per frame, an average of COMMIT time per frame
  *     that rises at once and falls slowly, so a load spike shrinks the
  *     next batch rather than the one after several more;
@@ -107,7 +106,7 @@ static _Thread_local uint32_t tls_mx0, tls_salt0;
 #define SITES_MAX 32
 static struct { uintptr_t addr; double frames_per_row; } g_sites[SITES_MAX];
 static int      g_nsites;
-static char     g_shm[PATH_MAX];
+static char     g_dbpath[PATH_MAX];
 static double   g_ns_per_frame;          /* 0: not measured yet */
 static double   g_forced_ns_per_frame;   /* tests */
 static db_txn_commit_stats_t g_cstats;
@@ -115,16 +114,11 @@ static atomic_int g_hook_seen;
 
 static int read_walidx(uint32_t *mx, uint32_t *salt)
 {
-    if (!g_shm[0]) return -1;
-    int fd = open(g_shm, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-    unsigned char b[96];
-    ssize_t n = pread(fd, b, sizeof(b), 0);
-    close(fd);
-    /* walformat.md: WalIndexHdr twice; mxFrame at 16, aSalt at 32. */
-    if (n != (ssize_t)sizeof(b) || memcmp(b, b + 48, 48) != 0) return -1;
-    memcpy(mx, b + 16, 4);
-    memcpy(salt, b + 32, 4);
+    if (!g_dbpath[0]) return -1;
+    walidx_t w;
+    if (walidx_read(g_dbpath, &w) != 0) return -1;
+    *mx = w.frames;
+    *salt = w.salt;
     return 0;
 }
 
@@ -144,7 +138,7 @@ static void budget_open(uintptr_t caller)
     tls_cap = UINT32_MAX;
     tls_site = -1;
     tls_tracked = 0;
-    if (!g_shm[0] || !atomic_load_explicit(&g_hook_seen, memory_order_relaxed)) return;
+    if (!g_dbpath[0] || !atomic_load_explicit(&g_hook_seen, memory_order_relaxed)) return;
     if (read_walidx(&tls_mx0, &tls_salt0) != 0) return;
     tls_tracked = 1;
     tls_site = site_of(caller);
@@ -191,7 +185,7 @@ void db_txn_track_wal(cutils_db_t *db)
 {
     if (!db) {
         write_lock();
-        g_shm[0] = '\0';
+        g_dbpath[0] = '\0';
         write_unlock();
         return;
     }
@@ -199,7 +193,7 @@ void db_txn_track_wal(cutils_db_t *db)
     if (db_txn_wal_path(db, wal, sizeof(wal)) != 0 || !wal[0]) return;
     size_t n = strlen(wal);
     write_lock();
-    snprintf(g_shm, sizeof(g_shm), "%.*s-shm", (int)(n - 4), wal);
+    snprintf(g_dbpath, sizeof(g_dbpath), "%.*s", (int)(n - 4), wal);
     write_unlock();
 }
 
