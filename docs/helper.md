@@ -7,12 +7,13 @@ root-equivalent on the host (sockets, devices, capabilities, the host's own
 operations over a unix socket. The daemon, which faces the network, holds
 none of it.
 
-What this build has: the protocol, the policy, the leases and watchdogs, the
-peer check, fd passing for dump hooks, restore staging and swap, and two
-backends: the fake provider (tests only) and `dir_domains` (a directory
-"snapshot domain" for tests and for `capture.begin_paths`). libvirt, Docker
-and LXC operations are validated and held to the policy and then answered
-`unsupported` until those providers exist.
+It carries the protocol, the policy, the leases and watchdogs, the peer
+check, fd passing for dump hooks, restore staging and swap, and these
+backends, each enabled by its policy section: Docker and LXC (below),
+libvirt (`vm-backup.md`), the fake provider (tests only, `fake_spec`) and
+`dir_domains` (a directory "snapshot domain" for tests and for
+`capture.begin_paths`). A provider whose section is off answers
+`unsupported`.
 
 ## Deployment (Docker, Unraid)
 
@@ -191,10 +192,33 @@ timeout_s = 900
 on_fail = continue
 ```
 
-Allow globs match `<provider>:<id>` and `<provider>:<name>`, the name from
-the helper's own inspect. `c-backup-helper --policy PATH --check` validates a
-policy and prints its SHA-256, the digest the helper's `hello` reports and
-`GET /providers` shows.
+Allow globs (`fnmatch(3)`, so `*`, `?` and `[...]`) match the whole unit
+key `<provider>:<id>`, or `<provider>:<name>` with the name from the
+helper's own inspect. The id is per provider:
+
+| Unit | Key | Glob for the UAT units |
+|------|-----|------------------------|
+| compose project | `docker:compose:<project>` | `docker:compose:cbk-uat-*` |
+| standalone container | `docker:<container name>` | `docker:cbk-uat-*` |
+| LXC container | `lxc:<name>` | `lxc:cbk-uat-*` |
+| libvirt domain | `libvirt:<uuid>` (id), `libvirt:<name>` (name) | `libvirt:cbk-uat-*` |
+
+A compose project is one unit whose id starts `compose:`, so
+`docker:cbk-uat-*` does **not** reach the project `cbk-uat-compose`, nor any
+container in it (a member is backed up through its project, never alone);
+list `docker:compose:cbk-uat-*` as well. Compose project names are always
+lowercase (compose lowercases the directory name it derives one from, and
+refuses `-p` with capitals), so the project part of a `docker:compose:` or
+`compose:` glob is folded to lowercase when the policy is read:
+`docker:compose:Immich` allows the project `immich`. Container and LXC
+names keep their case. `pause_always` globs are folded the same way, and a
+hook's `unit` must already be lowercase (it is a key, not a glob). The
+daemon's `units.allow` (`source-providers.md` 8.3) takes the same keys and
+folds the same way.
+
+`c-backup-helper --policy PATH --check` validates a policy and prints its
+SHA-256, the digest the helper's `hello` reports and `GET /providers`
+shows.
 
 ## The protocol
 
@@ -295,10 +319,10 @@ What a capture of one unit does, in order:
    (`system`, `remote-volume`, `outside-include-roots`).
 2. Each included mount is resolved to where its bytes are (`/mnt/user` to
    the one pool or disk holding the share, symlinks in the host's
-   namespace) and to its snapshot domain: the dataset at the longest
-   mountpoint if the policy lists it (never a parent dataset), or a btrfs
-   pool root. A mount in no domain is read live and the unit's level is
-   `inconsistent`.
+   namespace, then bind mounts through the host's mount table, below) and
+   to its snapshot domain: the dataset at the longest mountpoint if the
+   policy lists it (never a parent dataset), or a btrfs pool root. A mount
+   in no domain is read live and the unit's level is `inconsistent`.
 3. Pre hooks run through `docker exec` (`lxc-attach` for LXC), live, one
    at a time; `on_fail = fail` fails the unit before anything is held.
 4. Docker: a pause only when it adds something, which under `pause = auto`
@@ -322,6 +346,31 @@ The daemon needs the pools mounted read-only with `rslave`
 btrfs snapshot directory are visible to it; the file scanner never enters
 `.zfs` or `.cbackup-snapshots` itself, so a file backup of a pool does not
 read capture snapshots.
+
+**Bind mounts on the host, and named volumes.** Unraid mounts
+`/var/lib/docker` as a bind of a pool directory (FS1:
+`/mnt/cache/system/docker`, the `cache/system` dataset), so a named
+volume's `Source`, `/var/lib/docker/volumes/<v>/_data`, names no snapshot
+domain and is not a path the daemon has. After `realpath`, the helper looks
+the path up in the host's mount table (`/proc/1/mountinfo`; a mount's
+major:minor, root and mount point): a mount whose root is below `/` is a
+bind of that directory of its filesystem, and the path is rewritten
+through another mount of the same filesystem, a pool path under `mnt_root`
+first. The volume above becomes
+`/mnt/cache/system/docker/volumes/<v>/_data`: in `cache/system`'s domain
+when the policy lists it, read from that dataset's snapshot, and under
+`/mnt/cache` either way, which the daemon already mounts. The recorded path
+stays `/var/lib/docker/volumes/<v>/_data`. When Docker's directory is on a
+user share (`/mnt/user/system/docker`), the rewrite lands on shfs and is
+resolved to the one pool or disk holding it, as any `/mnt/user` bind is. A
+table that names a source the host does not have fails the unit rather
+than guessing. Docker in a
+`docker.img` (a loop-mounted image, Unraid's default) has no pool path:
+such a volume is noted `loop-image` in `mounts.json`, is read live at
+`/var/lib/docker/volumes/...` (level `inconsistent`), and needs
+`-v /var/lib/docker/volumes:/var/lib/docker/volumes:ro,rslave` on the
+daemon. Docker in a directory on a pool is what makes volumes
+snapshot-consistent.
 
 ### Hooks: logs and dumps
 
@@ -639,8 +688,10 @@ scripted UAT step on FS1 (below).
 
 ## UAT: real ZFS (FS1) and btrfs (FS2)
 
-Disposable containers only, `units.allow = docker:cbk-uat-*` in the
-daemon and the same globs in the helper's `[units] allow`. Run each step
+Disposable containers only, `units.allow =
+docker:cbk-uat-*,docker:compose:cbk-uat-*` in the daemon and the same globs
+in the helper's `[units] allow` (the second is what reaches the compose
+project; see the key table under The policy). Run each step
 on the host named, from a shell that can reach both containers.
 
 **FS2 (btrfs, no subvolumes).** Policy: `btrfs_domains = /mnt/cache`,
