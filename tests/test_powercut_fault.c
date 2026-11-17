@@ -22,6 +22,10 @@
  * was durable. The repository is reopened, interrupted removals are
  * resumed as gc would resume them, and every live object must still load,
  * byte for byte.
+ *
+ * The same rule beyond packs: anything irreversible that depends on an
+ * index commit - here prune's unlink of a snapshot record - comes after the
+ * commit is durable.
  */
 
 #include <setjmp.h>
@@ -39,11 +43,18 @@
 
 #include <cmocka.h>
 
+#include <cutils/db.h>
+
+#include "backup.h"
+#include "db_txn.h"
 #include "fake_index.h"
 #include "fault_inject.h"
 #include "object.h"
 #include "pack.h"
+#include "prune.h"
+#include "repo.h"
 #include "store.h"
+#include "store_index.h"
 #include "types.h"
 #include "test_tmp.h"
 
@@ -444,6 +455,79 @@ static void test_salvage_survives_every_cut(void **state)
     every_cut(build_salvage, op_salvage);
 }
 
+/* ------------------------------------------------------------------ */
+/* Snapshot records (prune)                                            */
+/* ------------------------------------------------------------------ */
+
+#define PRUNE_DIR  TEST_TMP "/c_backup_test_powercut_prune"
+#define PRUNE_SRC  PRUNE_DIR "/src"
+#define PRUNE_REPO PRUNE_DIR "/repo"
+
+extern const db_migration_t app_migrations[];
+
+static unsigned long g_durable_at_unlink;
+static int           g_record_unlinks;
+
+static int hook_record_unlink(const char *path)
+{
+    if (strstr(path, PRUNE_REPO "/snapshots/")) {
+        g_durable_at_unlink = db_txn_durable_count();
+        g_record_unlinks++;
+    }
+    return FAULT_FS_PASS;
+}
+
+/*
+ * A snapshot's record is its authoritative copy in the repository. prune
+ * commits the removal of the snapshot's rows and then unlinks the record;
+ * with the commit only in the WAL, a power cut could keep the unlink and
+ * lose the commit, leaving rows for a snapshot whose record is gone. The
+ * unlink has to come after the commit was made durable.
+ */
+static void test_prune_unlinks_the_record_after_the_commit_is_durable(void **state)
+{
+    (void)state;
+    rmrf(PRUNE_DIR);
+    assert_int_equal(mkdir(PRUNE_DIR, 0700), 0);
+    assert_int_equal(mkdir(PRUNE_SRC, 0700), 0);
+    FILE *f = fopen(PRUNE_SRC "/a.txt", "w");
+    assert_non_null(f);
+    fputs("a snapshot to prune\n", f);
+    fclose(f);
+
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, PRUNE_DIR "/state.db"), 0);
+    assert_int_equal(db_run_lib_migrations(db), 0);
+    assert_int_equal(db_run_compiled_migrations(db, app_migrations), 0);
+    int64_t repo_id = 0;
+    assert_int_equal(repo_register(db, PRUNE_REPO, "p", &repo_id), OK);
+    store_t *st = NULL;
+    assert_int_equal(store_open(PRUNE_REPO, NULL, &st), OK);
+    store_index_t *idx = NULL;
+    assert_int_equal(store_index_bind(st, db, repo_id, &idx), OK);
+
+    static const char *paths[] = { PRUNE_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    backup_result_t br;
+    assert_int_equal(backup_run(st, db, repo_id, &o, &br), OK);
+
+    unsigned long before = db_txn_durable_count();
+    g_record_unlinks = 0;
+    fault_unlink_hook = hook_record_unlink;
+    assert_int_equal(prune_snapshot(st, db, repo_id, br.snapshot_id), OK);
+    fault_unlink_hook = NULL;
+    assert_int_equal(g_record_unlinks, 1);
+    assert_true(g_durable_at_unlink > before);
+
+    store_index_free(idx);
+    store_close(st);
+    db_close(db);
+    rmrf(PRUNE_DIR);
+}
+
 static int teardown(void **state)
 {
     (void)state;
@@ -462,6 +546,8 @@ int main(void)
         cmocka_unit_test_teardown(test_gc_rewrite_survives_every_cut, teardown),
         cmocka_unit_test_teardown(test_coalesce_survives_every_cut, teardown),
         cmocka_unit_test_teardown(test_salvage_survives_every_cut, teardown),
+        cmocka_unit_test_teardown(test_prune_unlinks_the_record_after_the_commit_is_durable,
+                                  teardown),
     };
     return cmocka_run_group_tests_name("powercut", tests, NULL, NULL);
 }

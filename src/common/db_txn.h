@@ -95,6 +95,10 @@ unsigned db_txn_waiters(void);
  */
 status_t db_txn_make_durable(cutils_db_t *db);
 
+/* Completed db_txn_make_durable calls since the process started; for tests
+ * proving an irreversible step came after one. */
+unsigned long db_txn_durable_count(void);
+
 /*
  * Time spent in this module is attributed to the calling thread's phase
  * timers (phase_timer.h), when it has any: lock wait and BEGIN as txn-wait,
