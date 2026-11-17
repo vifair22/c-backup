@@ -101,10 +101,23 @@ Notes that matter:
   `[snapshot] restore_staging_dirs` entry inside the domain; with none, a
   whole-pool domain (FS2's `/mnt/cache`) stages in
   `<pool>/system/.cbackup-restore`, beside the snapshot directory, and a
-  share domain in `<domain>/.cbackup-restore`. Either way it is refused at
-  the top of a pool or in a share exported over SMB or NFS, and refused
-  when it is on another filesystem from the mount (a btrfs subvolume or
-  another dataset), since the swap could not be a rename.
+  share domain in `<domain>/.cbackup-restore`. Either way (B171) it is
+  refused at the top of a pool, in a share exported over **NFS** (AUTH_SYS
+  lets a client claim any uid, so no mode keeps it out), in a share whose
+  mover sends files to the array (`shareUseCache="yes"`: a staged restore
+  could be split across devices), and on another filesystem from the
+  mount (a btrfs subvolume or another dataset), since the swap could not be
+  a rename. In a share exported over **SMB** it is accepted only as a dot
+  directory (`.cbackup-restore`) that is the helper's own (root:root on a
+  host) at mode 0700, reached without symlinks: Unraid's SMB users are
+  never root, so none can enter it, and the tree inside is what sits at the
+  mount after the swap, with its own modes. The helper creates it so, and
+  tightens a looser one it owns; one owned by anyone else, or a symlink, is
+  refused. Outside an exported share the daemon-owned directory earlier
+  recipes made (`chown 990`) is still accepted. Recommended, not required:
+  `veto files = /.cbackup-restore/` in `/boot/config/smb-extra.conf`'s
+  `[global]`, which hides the name from SMB clients and stops them creating
+  or renaming it.
 
 - **The policy lives on the flash** (`/boot/config/`), root-owned, mode 0600
   or 0644. The helper refuses to start on a file anybody but its owner can
@@ -454,9 +467,23 @@ pool's capture directory and counted as one more instant.
 
 ### Restore staging and define
 
-`restore.stage` creates `<domain>/.cbackup-restore/<job>` inside the
-mount's snapshot domain and `restore.swap` renames the old directory to
-`<mount>.cbackup-old-<job>` and the staged one into place: never a delete.
+`restore.stage` creates `<domain>/.cbackup-restore/<job>-<random>` inside
+the mount's snapshot domain and `restore.swap` puts the staged one in place
+and the old directory at `<mount>.cbackup-old-<job>`: never a delete.
+
+The staging is pinned (B171). At stage the helper opens the base and the
+job directory with `O_DIRECTORY|O_NOFOLLOW`, one component at a time from
+the domain, and keeps both fds and their device and inode. At swap it
+checks that the base's path still names the pinned directory, that the job
+directory inside it is the pinned one, and that the base is still the
+helper's at 0700; any mismatch is refused (`denied`, logged at ERROR:
+`restore staging ... was replaced or moved after it was staged; not
+swapped`) and nothing moves. The swap itself is `renameat2` on the pinned
+fds: `RENAME_EXCHANGE` of the staged directory with the mount, one atomic
+step with no instant where the mount is missing, then the old tree from
+the staging to `<mount>.cbackup-old-<job>` with `RENAME_NOREPLACE`. Where
+the filesystem lacks `RENAME_EXCHANGE`, the old directory moves aside first
+and back again if the second rename fails.
 The helper does this itself, so it needs the pools at their host paths in
 its own mount namespace, which `-v /mnt/cache:/mnt/cache:rshared` above
 provides (add one per pool). The daemon writes into the staging directory
@@ -620,7 +647,9 @@ running.
 The NVRAM and TPM state are staged by the daemon under `staging_root`
 (writable by the daemon), and disk staging sits in
 `<image directory>/.cbackup-restore/`, which the daemon needs writable for
-in-place restores.
+in-place restores, under the same rules: in an SMB-exported share it must
+be root:root 0700 (the daemon reaches the job directory inside through
+`CAP_DAC_READ_SEARCH`).
 
 ## Testing
 
@@ -740,6 +769,21 @@ Policy: `zfs_domains = cache/appdata`. Repeat steps 1, 2, 4 and 5 under
 8. That the daemon container sees `.zfs/snapshot/<name>` through its
    `rslave` mount. If not, record it: the helper would have to mount the
    snapshot explicitly (not built).
+9. **Staging in the SMB-exported appdata share (B171).** On the host:
+   `testparm -s 2>/dev/null | grep -Ei 'force user|force group|admin users'`
+   prints nothing for `[global]` or `[appdata]` (none of them may map a
+   client to root); `awk -F: '$3==990' /etc/passwd` names no SMB user;
+   `stat -c '%U:%G %a' /mnt/cache/appdata/.cbackup-restore` says
+   `root:root 700`. Stage an in-place restore of a `cbk-uat-*` unit and,
+   while it is staged, from an SMB client logged in as a normal user:
+   `smbclient //FS1/appdata -U <user> -c 'ls .cbackup-restore\*'` is
+   refused (`NT_STATUS_ACCESS_DENIED`), and so is the same listing as the
+   guest if the share allows one. With the recommended veto line the
+   directory is not listed at all. The swap then completes and the
+   container starts on the restored data.
+10. Rule checks on FS1: a scratch share exported over NFS, and one with
+   `shareUseCache="yes"`, as `restore_staging_dirs`; each stage is refused
+   with a message naming NFS or the mover.
 
 **LXC (FS1).** A disposable `cbk-uat-lxc` (busybox template) under
 `/mnt/cache/lxc`, policy `[lxc] enabled = 1`, `zfs_domains` including

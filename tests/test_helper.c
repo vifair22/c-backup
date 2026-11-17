@@ -480,58 +480,172 @@ static const char *msg_of(const cJSON *o)
 }
 
 /*
- * Where a restore stages (Manual review item 4). Here the pool is
+ * Where a restore stages (Manual review item 4, B171). Here the pool is
  * HF_DIR/pool under mnt_root HF_DIR, a whole-pool domain like FS2's
  * /mnt/cache: staging defaults beside the snapshot directory, in
- * <pool>/system/.cbackup-restore, never at the pool's top; an exported
- * share and the top of a pool are refused, configured or not; a configured
- * directory inside an unexported share is used.
+ * <pool>/system/.cbackup-restore, never at the pool's top. A share
+ * exported over SMB is accepted only for a dot directory that is the
+ * helper's own at 0700; NFS export and a mover to the array are refused;
+ * so is a symlinked base.
  */
+static const char *staged_path(const cJSON *o)
+{
+    return cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(o, "result"), "path"));
+}
+
+#define STAGE_HOST "\n[host]\nmnt_root = " HF_DIR "\nboot_config = " HF_DIR "/boot\nhost_root =\n"
+#define SYS_BASE   HF_POOL "/system/.cbackup-restore"
+
+static void stage_expect(const char *code, const char *msg_part)
+{
+    cJSON *o = call(req("restore.stage", "{\"unit\":\"fake:u1\",\"mount\":\"" HF_MOUNT "\",\"job\":9}"), NULL);
+    assert_string_equal(code_of(o), code);
+    if (msg_part) assert_non_null(strstr(msg_of(o), msg_part));
+    if (strcmp(code, "ok") == 0) {
+        const char *path = staged_path(o);
+        assert_non_null(path);
+        assert_int_equal(strncmp(path, SYS_BASE "/", strlen(SYS_BASE "/")), 0);
+    }
+    cJSON_Delete(o);
+}
+
 static void test_restore_staging_place(void **state)
 {
     (void)state;
-    const char *host = "\n[host]\nmnt_root = " HF_DIR "\nboot_config = " HF_DIR "/boot\nhost_root =\n";
-    const char *stage = "{\"unit\":\"fake:u1\",\"mount\":\"" HF_MOUNT "\",\"job\":9}";
-    hstart_plus(host);
-    cJSON *o = call(req("restore.stage", stage), NULL);
-    assert_string_equal(code_of(o), "ok");
-    const char *path = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
-        cJSON_GetObjectItemCaseSensitive(o, "result"), "path"));
-    assert_non_null(path);
-    assert_int_equal(strncmp(path, HF_POOL "/system/.cbackup-restore/", strlen(HF_POOL "/system/.cbackup-restore/")), 0);
-    cJSON_Delete(o);
     struct stat sb;
+    hstart_plus(STAGE_HOST);
+    stage_expect("ok", NULL);
     assert_int_not_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
+    /* The base is the helper's own, 0700. */
+    assert_int_equal(lstat(SYS_BASE, &sb), 0);
+    assert_int_equal(sb.st_uid, geteuid());
+    assert_int_equal(sb.st_mode & 07777, 0700);
 
-    /* The system share exported over SMB: refused, and said why. */
+    /* The system share exported over SMB: a dot directory of the helper's,
+     * 0700, is accepted, and a looser one is tightened first. */
     assert_int_equal(mkdir(HF_DIR "/boot", 0755), 0);
     assert_int_equal(mkdir(HF_DIR "/boot/shares", 0755), 0);
-    hf_write(HF_DIR "/boot/shares/system.cfg", "shareComment=\"\"\nshareExport=\"e\"\nshareExportNFS=\"-\"\n");
-    o = call(req("restore.stage", stage), NULL);
-    assert_string_equal(code_of(o), "denied");
-    assert_non_null(strstr(msg_of(o), "exported"));
-    cJSON_Delete(o);
+    hf_write(HF_DIR "/boot/shares/system.cfg", "shareComment=\"\"\nshareExport=\"e\"\nshareExportNFS=\"-\"\n"
+             "shareUseCache=\"only\"\n");
+    assert_int_equal(chmod(SYS_BASE, 0755), 0);
+    stage_expect("ok", NULL);
+    assert_int_equal(lstat(SYS_BASE, &sb), 0);
+    assert_int_equal(sb.st_mode & 07777, 0700);
+
+    /* A symlink in place of the base: never followed. */
+    hf_rmrf(SYS_BASE);
+    assert_int_equal(mkdir(HF_POOL "/elsewhere", 0700), 0);
+    assert_int_equal(symlink(HF_POOL "/elsewhere", SYS_BASE), 0);
+    stage_expect("denied", "symlink");
+    assert_int_equal(unlink(SYS_BASE), 0);
+
+    /* NFS export: refused whatever the mode, a client claims any uid. */
+    hf_write(HF_DIR "/boot/shares/system.cfg", "shareExport=\"-\"\nshareExportNFS=\"e\"\n");
+    stage_expect("denied", "NFS");
+    /* The mover to the array: refused. */
+    hf_write(HF_DIR "/boot/shares/system.cfg", "shareExport=\"-\"\nshareExportNFS=\"-\"\nshareUseCache=\"yes\"\n");
+    stage_expect("denied", "mover");
+    hstop();
+
+    /* SMB, configured to a directory that is not a dot directory: refused. */
+    hf_write(HF_DIR "/boot/shares/system.cfg", "shareExport=\"e\"\nshareExportNFS=\"-\"\n");
+    hstart_plus("\n[snapshot]\nrestore_staging_dirs = " HF_POOL "/system/staging\n" STAGE_HOST);
+    stage_expect("denied", "only a dot directory");
     hstop();
 
     /* Configured at the top of the pool: refused like the default would be. */
-    hstart_plus("\n[snapshot]\nrestore_staging_dirs = " HF_POOL "/.staging\n" "\n[host]\nmnt_root = " HF_DIR
-                "\nboot_config = " HF_DIR "/boot\nhost_root =\n");
-    o = call(req("restore.stage", stage), NULL);
-    assert_string_equal(code_of(o), "denied");
-    assert_non_null(strstr(msg_of(o), "top of a pool"));
-    cJSON_Delete(o);
+    hstart_plus("\n[snapshot]\nrestore_staging_dirs = " HF_POOL "/.staging\n" STAGE_HOST);
+    stage_expect("denied", "top of a pool");
     hstop();
 
     /* Configured inside a share nobody exports: used. */
-    hstart_plus("\n[snapshot]\nrestore_staging_dirs = " HF_POOL "/app/.cbackup-restore\n" "\n[host]\nmnt_root = " HF_DIR
-                "\nboot_config = " HF_DIR "/boot\nhost_root =\n");
-    o = call(req("restore.stage", stage), NULL);
+    hstart_plus("\n[snapshot]\nrestore_staging_dirs = " HF_POOL "/app/.cbackup-restore\n" STAGE_HOST);
+    cJSON *o = call(req("restore.stage", "{\"unit\":\"fake:u1\",\"mount\":\"" HF_MOUNT "\",\"job\":9}"), NULL);
     assert_string_equal(code_of(o), "ok");
-    path = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
-        cJSON_GetObjectItemCaseSensitive(o, "result"), "path"));
+    const char *path = staged_path(o);
     assert_non_null(path);
     assert_int_equal(strncmp(path, HF_POOL "/app/.cbackup-restore/", strlen(HF_POOL "/app/.cbackup-restore/")), 0);
     cJSON_Delete(o);
+    hstop();
+}
+
+/* Stage job for HF_MOUNT and return the staging token in tok, the path in
+ * path, with one restored file written into it. */
+static void stage_one(int job, char *tok, size_t tsz, char *path, size_t psz)
+{
+    char a[160];
+    snprintf(a, sizeof(a), "{\"unit\":\"fake:u1\",\"mount\":\"" HF_MOUNT "\",\"job\":%d}", job);
+    cJSON *o = call(req("restore.stage", a), NULL);
+    assert_string_equal(code_of(o), "ok");
+    const cJSON *res = cJSON_GetObjectItemCaseSensitive(o, "result");
+    snprintf(tok, tsz, "{\"staging\":\"%s\"}", cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "staging")));
+    snprintf(path, psz, "%s", cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "path")));
+    cJSON_Delete(o);
+    char rf[600];
+    snprintf(rf, sizeof(rf), "%s/restored.txt", path);
+    hf_write(rf, "restored\n");
+}
+
+static void swap_expect(const char *a, const char *code, const char *msg_part)
+{
+    cJSON *o = call(req("restore.swap", a), NULL);
+    assert_string_equal(code_of(o), code);
+    if (msg_part) assert_non_null(strstr(msg_of(o), msg_part));
+    cJSON_Delete(o);
+}
+
+/*
+ * The swap goes through the fds pinned at stage, and refuses when the path
+ * no longer names them (B171): a base renamed away with another planted
+ * at its path, a job directory replaced, a base loosened. Each refusal
+ * leaves the mount as it was; undoing the change lets the swap go ahead.
+ */
+static void test_restore_swap_pinned(void **state)
+{
+    (void)state;
+    hstart((unsigned)getuid(), 30, 86400, 1000, 1, 0);
+    expect(req("unit.stop", "{\"unit\":\"fake:u1\"}"), "ok");
+    char a[160], path[512];
+    struct stat sb;
+    const char *base = HF_POOL "/.cbackup-restore";
+
+    /* The base renamed away and another planted in its place. */
+    stage_one(5, a, sizeof(a), path, sizeof(path));
+    assert_int_equal(rename(base, HF_POOL "/.moved"), 0);
+    assert_int_equal(mkdir(base, 0700), 0);
+    char planted[600];
+    snprintf(planted, sizeof(planted), "%s", path);
+    assert_int_equal(mkdir(planted, 0700), 0);       /* the same job name, the attacker's */
+    swap_expect(a, "denied", "replaced or moved");
+    assert_int_equal(stat(HF_MOUNT "/live.txt", &sb), 0);
+    assert_int_not_equal(stat(HF_MOUNT "/restored.txt", &sb), 0);
+    /* Renamed away with nothing planted: refused too. */
+    hf_rmrf(base);
+    swap_expect(a, "denied", "replaced or moved");
+    /* Put back: the pinned directory goes in. */
+    assert_int_equal(rename(HF_POOL "/.moved", base), 0);
+    swap_expect(a, "ok", NULL);
+    assert_int_equal(stat(HF_MOUNT "/restored.txt", &sb), 0);
+    assert_int_equal(stat(HF_MOUNT ".cbackup-old-5/live.txt", &sb), 0);
+
+    /* The job directory replaced inside the base. */
+    stage_one(6, a, sizeof(a), path, sizeof(path));
+    char moved[600];
+    snprintf(moved, sizeof(moved), "%s.x", path);
+    assert_int_equal(rename(path, moved), 0);
+    assert_int_equal(mkdir(path, 0700), 0);
+    swap_expect(a, "denied", "replaced after it was staged");
+    assert_int_equal(rmdir(path), 0);
+    assert_int_equal(rename(moved, path), 0);
+
+    /* The base loosened after staging. */
+    assert_int_equal(chmod(base, 0755), 0);
+    swap_expect(a, "denied", "not 0700");
+    assert_int_equal(chmod(base, 0700), 0);
+    swap_expect(a, "ok", NULL);
+    assert_int_equal(stat(HF_MOUNT ".cbackup-old-6/restored.txt", &sb), 0);
+    swap_expect(a, "invalid", NULL);
     hstop();
 }
 
@@ -1019,6 +1133,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_watchdog_waits_for_take, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restart_sweep, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_stage_swap, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_swap_pinned, setup, teardown),
         cmocka_unit_test_setup_teardown(test_socket, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

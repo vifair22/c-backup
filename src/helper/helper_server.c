@@ -98,7 +98,17 @@ typedef struct {
     char     path[HELPER_PATH_MAX + 1];
     int64_t  job;
     int      swapped;
+    int      busy;            /* a swap is in progress on it */
     int      file;            /* the mount is a disk image: <path>/image replaces it */
+    int      smb;             /* in an SMB-exported share (B171) */
+    /* Pinned at stage (B171): the swap renames through these fds and
+     * checks the path still names them, so nothing done to the path in
+     * between can redirect it. Open exactly while used. */
+    int      base_fd, job_fd;
+    dev_t    base_dev, job_dev;
+    ino_t    base_ino, job_ino;
+    char     base[HELPER_PATH_MAX + 1];
+    char     job_name[64];
 } staging_t;
 
 struct helper_server {
@@ -1232,15 +1242,6 @@ static int unit_has_mount(const helper_backend_t *b, const char *uid, const char
     return ok;
 }
 
-static int mkdir_owned(const char *path, uid_t uid)
-{
-    if (mkdir(path, 0700) != 0 && errno != EEXIST) return -1;
-    struct stat sb;
-    if (lstat(path, &sb) != 0 || !S_ISDIR(sb.st_mode)) return -1;
-    if (sb.st_uid != uid && geteuid() == 0 && chown(path, uid, (gid_t)-1) != 0) return -1;
-    return 0;
-}
-
 /* Is a under (or equal to) b, on a component boundary? */
 static int path_under(const char *a, const char *b)
 {
@@ -1259,22 +1260,48 @@ static int depth_below(const char *p, const char *root)
     return d;
 }
 
+/* The value of key= on a share .cfg line, quotes dropped; NULL if another key. */
+static const char *cfg_value(const char *line, const char *key)
+{
+    size_t n = strlen(key);
+    if (strncmp(line, key, n) != 0 || line[n] != '=') return NULL;
+    const char *v = line + n + 1;
+    return *v == '"' ? v + 1 : v;
+}
+
+static int cfg_is(const char *v, const char *want)
+{
+    size_t n = strlen(want);
+    return strncmp(v, want, n) == 0 && (v[n] == '"' || v[n] == '\n' || v[n] == '\r' || v[n] == '\0');
+}
+
 /*
  * Where restore.stage stages for a mount in domain dom (Manual review item
- * 4). On FS2 the domain is the whole pool, and <domain>/.cbackup-restore
- * was a dot directory at the pool's top, the placement the snapshot
- * directory avoids: anything at the top of a pool, or in an exported share,
- * is visible over the network. So: the first restore_staging_dirs entry
- * inside the domain; else, for a pool-top domain (mnt_root/<pool>),
- * <pool>/system/.cbackup-restore, beside the snapshot directory; else
- * <domain>/.cbackup-restore. Then, wherever it came from, it is refused at
- * the top of a pool or in a share exported over SMB or NFS
- * (<boot_config>/shares/<share>.cfg). -1 with why on a refusal.
+ * 4, B171). The first restore_staging_dirs entry inside the domain; else,
+ * for a pool-top domain (mnt_root/<pool>), <pool>/system/.cbackup-restore,
+ * beside the snapshot directory; else <domain>/.cbackup-restore. Then,
+ * wherever it came from, against the share holding it
+ * (<boot_config>/shares/<share>.cfg):
+ *
+ *   the top of a pool             refused: visible over the network
+ *   exported over NFS             refused: AUTH_SYS lets a client claim
+ *                                 any uid, so no mode keeps it out
+ *   shareUseCache=yes             refused: the mover would carry staged
+ *                                 files to the array mid-restore
+ *   exported over SMB             only a dot directory, and *smb set: the
+ *                                 caller then insists the directory is the
+ *                                 helper's own, mode 0700, which no SMB
+ *                                 user (never root on Unraid) can enter
+ *
+ * A staged tree is what sits at the mount after the swap, with its own
+ * modes; behind a 0700 directory it is less exposed than the result. -1
+ * with why on a refusal.
  */
 static int staging_base(const helper_server_t *s, const char *dom, char *out, size_t sz,
-                        char *why, size_t wsz)
+                        int *smb, char *why, size_t wsz)
 {
     const helper_policy_t *p = s->pol;
+    *smb = 0;
     out[0] = '\0';
     for (size_t i = 0; i < p->n_staging && !out[0]; i++)
         if (path_under(p->restore_staging_dirs[i], dom) && strcmp(p->restore_staging_dirs[i], dom) != 0)
@@ -1298,30 +1325,138 @@ static int staging_base(const helper_server_t *s, const char *dom, char *out, si
     const char *sh = strchr(rest, '/');
     if (!sh) return 0;
     sh++;
-    size_t k = strcspn(sh, "/");
+    int k = (int)strcspn(sh, "/");
     char cfg[PATH_MAX + 512];
-    if (snprintf(cfg, sizeof(cfg), "%s%s/shares/%.*s.cfg", p->host_root, p->boot_config, (int)k, sh) >= (int)sizeof(cfg))
+    if (snprintf(cfg, sizeof(cfg), "%s%s/shares/%.*s.cfg", p->host_root, p->boot_config, k, sh) >= (int)sizeof(cfg))
         return 0;
     FILE *f = fopen(cfg, "re");
     if (!f) return 0;                          /* not an Unraid share */
     char line[512];
-    int exported = 0;
-    while (!exported && fgets(line, sizeof(line), f)) {
-        const char *keys[] = { "shareExport=", "shareExportNFS=" };
-        for (size_t i = 0; i < 2 && !exported; i++) {
-            if (strncmp(line, keys[i], strlen(keys[i])) != 0) continue;
-            const char *v = line + strlen(keys[i]);
-            if (*v == '"') v++;
-            exported = *v && *v != '-' && *v != '"' && *v != '\n';
-        }
+    int smb_e = 0, nfs_e = 0, mover = 0;
+    while (fgets(line, sizeof(line), f)) {
+        const char *v;
+        if ((v = cfg_value(line, "shareExport")) != NULL) smb_e = *v && !cfg_is(v, "-") && !cfg_is(v, "");
+        else if ((v = cfg_value(line, "shareExportNFS")) != NULL) nfs_e = *v && !cfg_is(v, "-") && !cfg_is(v, "");
+        else if ((v = cfg_value(line, "shareUseCache")) != NULL) mover = cfg_is(v, "yes");
     }
     fclose(f);
-    if (exported) {
-        snprintf(why, wsz, "restore staging %.300s is in share %.*s, which is exported over the network; "
-                 "set [snapshot] restore_staging_dirs to a directory in a share that is not", out, (int)k, sh);
+    if (nfs_e) {
+        snprintf(why, wsz, "restore staging %.300s is in share %.*s, which is exported over NFS, where a "
+                 "client can claim any uid; set [snapshot] restore_staging_dirs to a directory on the "
+                 "mount's filesystem in a share NFS does not export", out, k, sh);
         return -1;
     }
+    if (mover) {
+        snprintf(why, wsz, "restore staging %.300s is in share %.*s, which the mover moves to the array "
+                 "(shareUseCache=yes); a staged restore could be split across devices. Keep the share "
+                 "on the pool, or set [snapshot] restore_staging_dirs", out, k, sh);
+        return -1;
+    }
+    if (smb_e) {
+        const char *last = strrchr(out, '/');
+        if (!last || last[1] != '.') {
+            snprintf(why, wsz, "restore staging %.300s is in share %.*s, which is exported over SMB; only "
+                     "a dot directory (such as %.200s/.cbackup-restore) is accepted there", out, k, sh, dom);
+            return -1;
+        }
+        *smb = 1;
+    }
     return 0;
+}
+
+/*
+ * Open base below dom one component at a time, never following a
+ * symlink, creating what is missing (0755 on the way, 0700 for the base
+ * itself). The fd is what the swap renames through later, so nothing done
+ * to the path in between can redirect it.
+ */
+static int open_base(const char *dom, const char *base, int *out, char *why, size_t wsz)
+{
+    int fd = open(dom, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(why, wsz, "cannot open %.300s: %s", dom, strerror(errno));
+        return -1;
+    }
+    char rest[PATH_MAX];
+    snprintf(rest, sizeof(rest), "%s", base + strlen(dom));
+    char *save = NULL;
+    char *c = strtok_r(rest, "/", &save);
+    while (c) {
+        char *next = strtok_r(NULL, "/", &save);
+        if (mkdirat(fd, c, next ? 0755 : 0700) != 0 && errno != EEXIST) {
+            snprintf(why, wsz, "cannot create %.300s (at %.100s): %s", base, c, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        int nfd = openat(fd, c, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (nfd < 0) {
+            int e = errno;
+            close(fd);
+            if (e == ELOOP || e == ENOTDIR)
+                snprintf(why, wsz, "restore staging %.300s: %.100s is a symlink or not a directory; not followed", base, c);
+            else
+                snprintf(why, wsz, "cannot open %.300s (at %.100s): %s", base, c, strerror(e));
+            return -1;
+        }
+        close(fd);
+        fd = nfd;
+        c = next;
+    }
+    *out = fd;
+    return 0;
+}
+
+/*
+ * Whether the opened base is fit to stage in. The helper's own (root on a
+ * host), mode 0700, tightened when it is ours and looser. Outside an
+ * exported share the daemon's own directory is also accepted, as the FS2
+ * recipe made it before B171; inside one, only the helper's. -1 with why.
+ */
+static int base_ok(const helper_server_t *s, int bfd, const char *base, int smb, int fix,
+                   char *why, size_t wsz)
+{
+    struct stat b;
+    if (fstat(bfd, &b) != 0 || !S_ISDIR(b.st_mode)) {
+        snprintf(why, wsz, "restore staging %.300s: cannot stat it", base);
+        return -1;
+    }
+    uid_t me = geteuid();
+    if (b.st_uid == me) {
+        if ((b.st_mode & 077) != 0) {
+            if (!fix || fchmod(bfd, 0700) != 0) {
+                snprintf(why, wsz, "restore staging %.300s has mode %04o, not 0700", base, (unsigned)(b.st_mode & 07777));
+                return -1;
+            }
+            log_warn("helper: restore staging %s had mode %04o; now 0700", base, (unsigned)(b.st_mode & 07777));
+        }
+        if (smb && fix && b.st_gid != getegid() && fchown(bfd, (uid_t)-1, getegid()) != 0) {
+            snprintf(why, wsz, "restore staging %.300s: cannot set its group: %s", base, strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+    if (!smb && b.st_uid == (uid_t)s->pol->daemon_uid) return 0;
+    snprintf(why, wsz, "restore staging %.300s exists and is owned by uid %u, not %s (uid %u); something "
+             "else made it, so it is not used. Remove it, or set [snapshot] restore_staging_dirs",
+             base, (unsigned)b.st_uid, me == 0 ? "root" : "the helper's", (unsigned)me);
+    return -1;
+}
+
+static void stage_close(staging_t *x)
+{
+    if (x->base_fd >= 0) close(x->base_fd);
+    if (x->job_fd >= 0) close(x->job_fd);
+    x->base_fd = x->job_fd = -1;
+}
+
+/* Caller holds mu. */
+static void stage_drop(helper_server_t *s, const char *token)
+{
+    for (size_t i = 0; i < STAGINGS_MAX; i++)
+        if (s->stages[i].used && strcmp(s->stages[i].token, token) == 0) {
+            stage_close(&s->stages[i]);
+            s->stages[i].used = 0;
+        }
 }
 
 static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
@@ -1350,41 +1485,54 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     if (!dom || strcmp(dom, r->mount) == 0)
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is in no snapshot domain of the policy", r->mount);
     /* One directory per staging: a VM's disks share a job and a domain. */
-    char base[PATH_MAX], path[PATH_MAX], swhy[512], uniq[HELPER_TOKEN_HEX + 1];
+    char base[PATH_MAX], path[PATH_MAX], swhy[600], uniq[HELPER_TOKEN_HEX + 1], jname[64];
+    int smb = 0;
     if (helper_random_hex(uniq, 4) != OK) return resp_error(r->id, HELPER_E_FAILED, "no randomness");
-    if (staging_base(s, dom, base, sizeof(base), swhy, sizeof(swhy)) != 0)
+    if (staging_base(s, dom, base, sizeof(base), &smb, swhy, sizeof(swhy)) != 0)
         return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
-    if (snprintf(path, sizeof(path), "%s/%lld-%s", base, (long long)r->job, uniq) >= (int)sizeof(path))
+    snprintf(jname, sizeof(jname), "%lld-%s", (long long)r->job, uniq);
+    if (snprintf(path, sizeof(path), "%s/%s", base, jname) >= (int)sizeof(path))
         return resp_error(r->id, HELPER_E_INVALID, "path too long");
-    /* Made down to the staging base, which may be a share directory not
-     * there yet (system/), each level the helper's own except the last. */
-    {
-        char p[PATH_MAX];
-        snprintf(p, sizeof(p), "%s", base);
-        for (char *c = p + strlen(dom) + 1; *c; c++) {
-            if (*c != '/') continue;
-            *c = '\0';
-            if (mkdir(p, 0755) != 0 && errno != EEXIST)
-                return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", p, strerror(errno));
-            *c = '/';
-        }
+    int bfd = -1;
+    if (open_base(dom, base, &bfd, swhy, sizeof(swhy)) != 0) return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
+    if (base_ok(s, bfd, base, smb, 1, swhy, sizeof(swhy)) != 0) {
+        close(bfd);
+        return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
     }
-    if (mkdir_owned(base, s->pol->daemon_uid) != 0 || mkdir_owned(path, s->pol->daemon_uid) != 0)
-        return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", path, strerror(errno));
+    if (mkdirat(bfd, jname, 0700) != 0) {
+        int er = errno;
+        close(bfd);
+        return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", path, strerror(er));
+    }
+    int jfd = openat(bfd, jname, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat bs, js;
+    const char *fail = NULL;
+    if (jfd < 0) fail = "cannot open it";
+    else if (geteuid() == 0 && fchown(jfd, (uid_t)s->pol->daemon_uid, (gid_t)-1) != 0) fail = "cannot give it to the daemon";
+    else if (fstat(bfd, &bs) != 0 || fstat(jfd, &js) != 0) fail = "cannot stat it";
     /* The swap is a rename: the staging must be on the mount's filesystem
      * (a btrfs subvolume or another dataset would be EXDEV at the swap,
      * after the whole restore was written). */
-    {
+    int other_fs = 0;
+    if (!fail) {
         char parent[PATH_MAX];
         if (snprintf(parent, sizeof(parent), "%.4000s", r->mount) >= (int)sizeof(parent)) parent[0] = '\0';
         char *sl = strrchr(parent, '/');
         if (sl && sl != parent) *sl = '\0';
-        struct stat a1, a2;
-        if (stat(path, &a1) == 0 && stat(parent, &a2) == 0 && a1.st_dev != a2.st_dev)
+        struct stat ps;
+        other_fs = stat(parent, &ps) == 0 && ps.st_dev != js.st_dev;
+    }
+    if (fail || other_fs) {
+        if (jfd >= 0) close(jfd);
+        (void)unlinkat(bfd, jname, AT_REMOVEDIR);
+        close(bfd);
+        if (other_fs)
             return resp_error(r->id, HELPER_E_DENIED, "restore staging %.300s is on another filesystem "
                               "from %.300s, so the swap could not be a rename; set [snapshot] "
                               "restore_staging_dirs to a directory on its filesystem", base, r->mount);
+        return resp_error(r->id, HELPER_E_FAILED, "restore staging %s: %s", path, fail);
     }
+    if (smb) log_info("helper: restore staging %s in an SMB-exported share (the helper's, 0700)", path);
     pthread_mutex_lock(&s->mu);
     staging_t *slot = NULL;
     for (size_t i = 0; i < STAGINGS_MAX && !slot; i++) if (!s->stages[i].used) slot = &s->stages[i];
@@ -1392,23 +1540,79 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     if (slot && helper_random_hex(slot->token, 16) == OK) {
         slot->used = 1;
         slot->swapped = 0;
+        slot->busy = 0;
         slot->job = r->job;
         snprintf(slot->unit, sizeof(slot->unit), "%s", r->unit);
         snprintf(slot->mount, sizeof(slot->mount), "%s", r->mount);
         snprintf(slot->path, sizeof(slot->path), "%s", path);
+        snprintf(slot->base, sizeof(slot->base), "%s", base);
+        snprintf(slot->job_name, sizeof(slot->job_name), "%s", jname);
         slot->file = kind;
+        slot->smb = smb;
+        slot->base_fd = bfd;
+        slot->job_fd = jfd;
+        slot->base_dev = bs.st_dev;
+        slot->base_ino = bs.st_ino;
+        slot->job_dev = js.st_dev;
+        slot->job_ino = js.st_ino;
         memcpy(token, slot->token, sizeof(token));
     } else {
         slot = NULL;
     }
     pthread_mutex_unlock(&s->mu);
-    if (!slot) return resp_error(r->id, HELPER_E_BUSY, "too many restores staged");
+    if (!slot) {
+        close(jfd);
+        close(bfd);
+        return resp_error(r->id, HELPER_E_BUSY, "too many restores staged");
+    }
     cJSON *res = cJSON_CreateObject();
     if (res) {
         cJSON_AddStringToObject(res, "staging", token);
         cJSON_AddStringToObject(res, "path", path);
     }
     return resp_ok(r->id, res);
+}
+
+/* renameat2 with RENAME_NOREPLACE; where the filesystem has no flags, a
+ * check then a plain rename (the window is the helper's own). */
+static int rename_noreplace(int ofd, const char *on, int nfd, const char *nn)
+{
+    if (renameat2(ofd, on, nfd, nn, RENAME_NOREPLACE) == 0) return 0;
+    if (errno != EINVAL && errno != ENOSYS) return -1;
+    struct stat sb;
+    if (fstatat(nfd, nn, &sb, AT_SYMLINK_NOFOLLOW) == 0) { errno = EEXIST; return -1; }
+    return renameat(ofd, on, nfd, nn);
+}
+
+/*
+ * Whether what was staged is still what the fds hold: the base at its path
+ * is the pinned directory, the job directory inside it is the pinned one,
+ * and the base is still the helper's 0700 (or, outside a share, the
+ * daemon's). Planting a directory at the path, renaming the base away or
+ * swapping the job directory all fail here. -1 with why.
+ */
+static int stage_intact(const helper_server_t *s, const staging_t *x, char *why, size_t wsz)
+{
+    struct stat ps, bs, js, es;
+    if (lstat(x->base, &ps) != 0 || !S_ISDIR(ps.st_mode) || ps.st_dev != x->base_dev || ps.st_ino != x->base_ino) {
+        snprintf(why, wsz, "restore staging %.300s was replaced or moved after it was staged; not swapped", x->base);
+        return -1;
+    }
+    if (fstat(x->base_fd, &bs) != 0 || base_ok(s, x->base_fd, x->base, x->smb, 0, why, wsz) != 0) return -1;
+    if (fstatat(x->base_fd, x->job_name, &es, AT_SYMLINK_NOFOLLOW) != 0 || fstat(x->job_fd, &js) != 0 ||
+        es.st_dev != x->job_dev || es.st_ino != x->job_ino || js.st_ino != x->job_ino || !S_ISDIR(es.st_mode)) {
+        snprintf(why, wsz, "restore staging %.300s was replaced after it was staged; not swapped", x->path);
+        return -1;
+    }
+    return 0;
+}
+
+static void swap_unclaim(helper_server_t *s, const char *token)
+{
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < STAGINGS_MAX; i++)
+        if (s->stages[i].used && strcmp(s->stages[i].token, token) == 0) s->stages[i].busy = 0;
+    pthread_mutex_unlock(&s->mu);
 }
 
 static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
@@ -1418,48 +1622,109 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     staging_t st, *x = NULL;
     for (size_t i = 0; i < STAGINGS_MAX && !x; i++)
         if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) x = &s->stages[i];
+    int busy = x && x->busy;
+    if (x && !busy && !x->swapped && x->file != 3) x->busy = 1;
     if (x) st = *x;
     pthread_mutex_unlock(&s->mu);
     if (!x) return resp_error(r->id, HELPER_E_INVALID, "no such staging");
+    if (busy) return resp_error(r->id, HELPER_E_BUSY, "this staging is being swapped");
     if (st.swapped) return resp_error(r->id, HELPER_E_INVALID, "already swapped");
     if (st.file == 3) return resp_error(r->id, HELPER_E_INVALID, "this staging is for vm.install_state");
-    /* A disk image is replaced by the image the daemon wrote in staging. */
-    if (st.file == 2) {
-        char img[PATH_MAX + 8];
-        snprintf(img, sizeof(img), "%.4000s/image", st.path);
-        snprintf(st.path, sizeof(st.path), "%.4090s", img);
-    }
+    char why[700];
+    helper_err_t code = HELPER_E_FAILED;
     const char *suid = NULL;
     const helper_backend_t *sb_ = backend_of(s, st.unit, &suid);
     int state = sb_ && sb_->unit_state ? sb_->unit_state(sb_->ctx, suid) : -1;
-    if (state < 0)
-        return resp_error(r->id, HELPER_E_FAILED, "cannot tell whether %s is running", st.unit);
-    if (state == SP_STATE_RUNNING || state == SP_STATE_PAUSED)
-        return resp_error(r->id, HELPER_E_BUSY, "%s is running; stop it first", st.unit);
-    /* Moved aside, never deleted: the operator can reverse it. */
-    char old[PATH_MAX];
-    if (snprintf(old, sizeof(old), "%s.cbackup-old-%lld", st.mount, (long long)st.job) >= (int)sizeof(old))
-        return resp_error(r->id, HELPER_E_INVALID, "path too long");
+    /* What moves in: the job directory from the base, or for a disk image
+     * the image inside it. Both through the fds pinned at stage. */
+    int src_fd = st.file == 2 ? st.job_fd : st.base_fd;
+    const char *src_name = st.file == 2 ? "image" : st.job_name;
+    char parent[PATH_MAX], name[PATH_MAX], old[PATH_MAX + 40], prev[PATH_MAX + 40] = "";
+    int pfd = -1, had = 0;
     struct stat sb;
-    if (lstat(old, &sb) == 0) return resp_error(r->id, HELPER_E_BUSY, "%.300s already exists", old);
-    int had = lstat(st.mount, &sb) == 0;
-    if (had && rename(st.mount, old) != 0)
-        return resp_error(r->id, HELPER_E_FAILED, "move aside: %s", strerror(errno));
-    if (rename(st.path, st.mount) != 0) {
-        int e = errno;
-        if (had) (void)rename(old, st.mount);
-        return resp_error(r->id, HELPER_E_FAILED, "swap in: %s", strerror(e));
+    snprintf(parent, sizeof(parent), "%s", st.mount);
+    char *sl = strrchr(parent, '/');
+    if (!sl || !sl[1]) { snprintf(why, sizeof(why), "%.300s has no parent", st.mount); code = HELPER_E_INVALID; goto refuse; }
+    snprintf(name, sizeof(name), "%s", sl + 1);
+    if (sl == parent) sl[1] = '\0'; else *sl = '\0';
+    if (state < 0) { snprintf(why, sizeof(why), "cannot tell whether %s is running", st.unit); goto refuse; }
+    if (state == SP_STATE_RUNNING || state == SP_STATE_PAUSED) {
+        snprintf(why, sizeof(why), "%s is running; stop it first", st.unit);
+        code = HELPER_E_BUSY;
+        goto refuse;
     }
+    if (stage_intact(s, &st, why, sizeof(why)) != 0) { code = HELPER_E_DENIED; goto refuse; }
+    if (st.file == 2 && (fstatat(src_fd, src_name, &sb, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(sb.st_mode))) {
+        snprintf(why, sizeof(why), "restore staging %.300s/image is not a regular file; not swapped", st.path);
+        code = HELPER_E_DENIED;
+        goto refuse;
+    }
+    pfd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (pfd < 0) { snprintf(why, sizeof(why), "cannot open %.300s: %s", parent, strerror(errno)); goto refuse; }
+    if (fstat(pfd, &sb) != 0 || sb.st_dev != st.job_dev) {
+        snprintf(why, sizeof(why), "%.300s is no longer on the staging's filesystem; not swapped", parent);
+        code = HELPER_E_DENIED;
+        goto refuse;
+    }
+    /* Moved aside, never deleted: the operator can reverse it. */
+    if (snprintf(old, sizeof(old), "%s.cbackup-old-%lld", name, (long long)st.job) >= (int)sizeof(old) ||
+        strlen(old) > NAME_MAX) {
+        snprintf(why, sizeof(why), "path too long");
+        code = HELPER_E_INVALID;
+        goto refuse;
+    }
+    if (fstatat(pfd, old, &sb, AT_SYMLINK_NOFOLLOW) == 0) {
+        snprintf(why, sizeof(why), "%.300s.cbackup-old-%lld already exists", st.mount, (long long)st.job);
+        code = HELPER_E_BUSY;
+        goto refuse;
+    }
+    had = fstatat(pfd, name, &sb, AT_SYMLINK_NOFOLLOW) == 0;
+    if (!had) {
+        if (rename_noreplace(src_fd, src_name, pfd, name) != 0) {
+            snprintf(why, sizeof(why), "swap in: %s", strerror(errno));
+            goto refuse;
+        }
+    } else if (renameat2(src_fd, src_name, pfd, name, RENAME_EXCHANGE) == 0) {
+        /* One atomic step: the mount is the restored tree, and the old one
+         * sits where the staging was; then it goes beside the mount. */
+        if (rename_noreplace(src_fd, src_name, pfd, old) == 0) {
+            snprintf(prev, sizeof(prev), "%s.cbackup-old-%lld", st.mount, (long long)st.job);
+        } else {
+            snprintf(prev, sizeof(prev), "%s/%s", st.file == 2 ? st.path : st.base, src_name);
+            log_warn("helper: %s is swapped in; the previous copy stays at %s (%s)", st.mount, prev, strerror(errno));
+        }
+    } else if (errno == EINVAL || errno == ENOSYS) {
+        /* No RENAME_EXCHANGE here: aside, then in, and back on failure. */
+        if (rename_noreplace(pfd, name, pfd, old) != 0) {
+            snprintf(why, sizeof(why), "move aside: %s", strerror(errno));
+            goto refuse;
+        }
+        if (rename_noreplace(src_fd, src_name, pfd, name) != 0) {
+            int er = errno;
+            (void)rename_noreplace(pfd, old, pfd, name);
+            snprintf(why, sizeof(why), "swap in: %s", strerror(er));
+            goto refuse;
+        }
+        snprintf(prev, sizeof(prev), "%s.cbackup-old-%lld", st.mount, (long long)st.job);
+    } else {
+        snprintf(why, sizeof(why), "swap: %s", strerror(errno));
+        goto refuse;
+    }
+    close(pfd);
     pthread_mutex_lock(&s->mu);
-    for (size_t i = 0; i < STAGINGS_MAX; i++)
-        if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) s->stages[i].used = 0;
+    stage_drop(s, r->token);
     pthread_mutex_unlock(&s->mu);
     cJSON *res = cJSON_CreateObject();
     if (res) {
         cJSON_AddStringToObject(res, "mount", st.mount);
-        if (had) cJSON_AddStringToObject(res, "previous", old);
+        if (prev[0]) cJSON_AddStringToObject(res, "previous", prev);
     }
     return resp_ok(r->id, res);
+refuse:
+    if (pfd >= 0) close(pfd);
+    swap_unclaim(s, r->token);
+    if (code == HELPER_E_DENIED) log_error("helper: %s", why);
+    return resp_error(r->id, code, "%s", why);
 }
 
 static char *op_unit_stop_start(helper_server_t *s, const helper_req_t *r, int start)
@@ -1582,8 +1847,7 @@ static char *op_vm_install_state(helper_server_t *s, const helper_req_t *r)
         return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
     }
     pthread_mutex_lock(&s->mu);
-    for (size_t i = 0; i < STAGINGS_MAX; i++)
-        if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) s->stages[i].used = 0;
+    stage_drop(s, r->token);
     pthread_mutex_unlock(&s->mu);
     return resp_ok(r->id, res ? res : cJSON_CreateObject());
 }
@@ -2072,6 +2336,7 @@ void helper_server_stop(helper_server_t *s)
             close(s->runs[i].err_fd);
             hooklog_free(&s->runs[i].log);
         }
+    for (size_t i = 0; i < STAGINGS_MAX; i++) if (s->stages[i].used) stage_close(&s->stages[i]);
     pthread_cond_destroy(&s->wcv);
     pthread_mutex_destroy(&s->cmu);
     pthread_mutex_destroy(&s->jmu);
