@@ -3,6 +3,12 @@
 #include <stdio.h>
 #include <string.h>
 
+int reserved_snapshot_dir(const char *name)
+{
+    return name && (strcmp(name, RESERVED_ZFS_CTL_DIR) == 0 ||
+                    strcmp(name, RESERVED_SNAPSHOTS_DIR) == 0);
+}
+
 int reserved_top_name(const char *name)
 {
     return name && (strcmp(name, RESERVED_UNIT_DIR) == 0 ||

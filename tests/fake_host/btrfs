@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# A stand-in for the host's btrfs(8), for the helper's tests: a snapshot of
+# a pool root is a copy of it (without its snapshot directory), read-only
+# flags and uuids live in a state file. Only what the helper uses.
+#
+#   $FAKE_HOST_STATE/subvols    "<path>\t<uuid>\t<parent uuid>\t<ro>" per line
+#   $FAKE_HOST_STATE/btrfs.log  every invocation
+#   FAKE_BTRFS_FAIL=<word>      "snapshot" or "delete" exits 1
+set -u
+S=${FAKE_HOST_STATE:?FAKE_HOST_STATE is not set}
+touch "$S/subvols"
+echo "btrfs $*" >> "$S/btrfs.log"
+[ "$1" = subvolume ] || [ "$1" = property ] || { echo "fake btrfs: $1 not understood" >&2; exit 2; }
+if [ "${FAKE_BTRFS_FAIL:-}" = "${2:-}" ]; then echo "ERROR: injected failure" >&2; exit 1; fi
+field() { awk -F'\t' -v p="$1" -v f="$2" '$1 == p { print $f }' "$S/subvols"; }
+
+case "$1 $2" in
+"subvolume snapshot")
+    [ "$3" = "-r" ] || { echo "fake btrfs: snapshot without -r" >&2; exit 2; }
+    src=$4 dst=$5
+    [ -e "$dst" ] && { echo "ERROR: target path already exists: $dst" >&2; exit 1; }
+    mkdir -p "$dst"
+    rel=${dst#"$src"/}
+    # The snapshot directory itself appears empty, as a nested subvolume
+    # would; the fake simply leaves it out of the copy.
+    snapdir=./$(dirname "$rel")
+    (cd "$src" && tar cf - --exclude="$snapdir" .) | (cd "$dst" && tar xf -)
+    puuid=$(field "$src" 2); [ -n "$puuid" ] || puuid="top-$(echo "$src" | md5sum | cut -c1-8)"
+    grep -q "^$src	" "$S/subvols" || printf '%s\t%s\t-\tfalse\n' "$src" "$puuid" >> "$S/subvols"
+    printf '%s\tsnap-%s\t%s\ttrue\n' "$dst" "$RANDOM$RANDOM" "$puuid" >> "$S/subvols" ;;
+"subvolume show")
+    if [ "$3" = "-u" ]; then
+        awk -F'\t' -v u="$4" '$2 == u { f = 1 } END { exit !f }' "$S/subvols" || { echo "ERROR: no subvolume with uuid $4" >&2; exit 1; }
+        exit 0
+    fi
+    p=$3
+    u=$(field "$p" 2)
+    if [ -z "$u" ]; then
+        [ -d "$p" ] || { echo "ERROR: cannot access '$p': No such file or directory" >&2; exit 1; }
+        u="top-$(echo "$p" | md5sum | cut -c1-8)"
+        printf '%s\t%s\t-\tfalse\n' "$p" "$u" >> "$S/subvols"
+    fi
+    printf '%s\n\tName: \t\t\t%s\n\tUUID: \t\t\t%s\n\tParent UUID: \t\t%s\n' "$p" "$(basename "$p")" "$u" "$(field "$p" 3)" ;;
+"subvolume delete")
+    p=$3
+    [ -n "$(field "$p" 2)" ] || { echo "ERROR: Not a Btrfs subvolume: $p" >&2; exit 1; }
+    rm -rf "${p:?}"
+    awk -F'\t' -v p="$p" '$1 != p' "$S/subvols" > "$S/subvols.new" && mv "$S/subvols.new" "$S/subvols" ;;
+"property get")
+    [ "$3 $5" = "-ts ro" ] || { echo "fake btrfs: property get $* not understood" >&2; exit 2; }
+    r=$(field "$4" 4); echo "ro=${r:-false}" ;;
+*)
+    echo "fake btrfs: $1 $2 not understood" >&2; exit 2 ;;
+esac

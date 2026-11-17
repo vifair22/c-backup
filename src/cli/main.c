@@ -1222,6 +1222,7 @@ static int h_schedule_add(const args_t *a)
      * less --exclude globs) or each --unit by name. */
     const char *uprov = args_value(a, "--provider");
     const char *ureq  = args_value(a, "--require");
+    const char *uscope = args_value(a, "--pause-scope");
     int uall = args_flag(a, "--all");
 
     /* An interval and a calendar are two triggers, and either one alone.
@@ -1274,6 +1275,7 @@ static int h_schedule_add(const args_t *a)
     if (gicase)  sb_puts(&b, ",\"ignore_case\":true");
     if (uprov) { sb_puts(&b, ",\"provider\":"); sb_json_str(&b, uprov); }
     if (ureq)  { sb_puts(&b, ",\"require\":");  sb_json_str(&b, ureq); }
+    if (uscope) { sb_puts(&b, ",\"pause_scope\":"); sb_json_str(&b, uscope); }
     if (uall)  sb_puts(&b, ",\"all\":true");
     if (args_multi_count(a, "--unit") > 0) {
         sb_puts(&b, ",\"units\":");
@@ -1376,6 +1378,7 @@ static int h_unit_backup(const args_t *a)
 {
     const char *prov = args_value(a, "--provider");
     const char *req  = args_value(a, "--require");
+    const char *scope = args_value(a, "--pause-scope");
     int all     = args_flag(a, "--all");
     int no_wait = args_flag(a, "--no-wait");
     if (!prov) return refuse(a, "--provider is required");
@@ -1394,6 +1397,7 @@ static int h_unit_backup(const args_t *a)
         sb_puts(&b, "]");
     }
     if (req) { sb_puts(&b, ",\"require\":"); sb_json_str(&b, req); }
+    if (scope) { sb_puts(&b, ",\"pause_scope\":"); sb_json_str(&b, scope); }
     sb_puts(&b, "}");
     sbuf_t p = { 0 };
     sb_puts(&p, "/repos/"); sb_path_seg(&p, a->pos[0]); sb_puts(&p, "/units/backup");
@@ -1423,14 +1427,40 @@ static int h_unit_history(const args_t *a)
 
 static int h_unit_restore(const args_t *a)
 {
-    const char *item = args_value(a, "--item");
+    const char *item  = args_value(a, "--item");
+    const char *name  = args_value(a, "--name");
+    const char *troot = args_value(a, "--target-root");
+    int define    = args_flag(a, "--define");
+    int replace   = args_flag(a, "--replace");
+    int pin       = args_flag(a, "--pin-digest");
+    int start     = args_flag(a, "--start");
+    int keep_macs = args_flag(a, "--keep-macs");
     int overwrite = args_flag(a, "--overwrite");
     int no_wait   = args_flag(a, "--no-wait");
+    /* --define re-creates the unit itself, at its own paths or under
+     * --target-root; the other forms write into [dest]. */
+    if (define && a->npos != 2)
+        return refuse(a, "--define restores to the unit's own paths or --target-root; it takes no [dest]");
+    if (!define && a->npos != 3) return refuse(a, "missing [dest]");
+    if (!define && (name || troot || replace || pin || start || keep_macs))
+        return refuse(a, "--name, --target-root, --replace, --pin-digest, --start and --keep-macs need --define");
+    if (define && (item || overwrite))
+        return refuse(a, "--item and --overwrite do not apply with --define");
     sbuf_t b = { 0 };
-    sb_puts(&b, item ? "{\"mode\":\"item\",\"format\":\"raw\",\"item\":" : "{\"mode\":\"files\"");
-    if (item) sb_json_str(&b, item);
-    sb_puts(&b, ",\"dest\":"); sb_json_str(&b, a->pos[2]);
-    if (overwrite) sb_puts(&b, ",\"overwrite\":true");
+    if (define) {
+        sb_puts(&b, "{\"mode\":\"unit\"");
+        if (name)  { sb_puts(&b, ",\"name\":"); sb_json_str(&b, name); }
+        if (troot) { sb_puts(&b, ",\"target_root\":"); sb_json_str(&b, troot); }
+        if (replace)   sb_puts(&b, ",\"replace\":true");
+        if (pin)       sb_puts(&b, ",\"pin_digest\":true");
+        if (start)     sb_puts(&b, ",\"start\":true");
+        if (keep_macs) sb_puts(&b, ",\"keep_macs\":true");
+    } else {
+        sb_puts(&b, item ? "{\"mode\":\"item\",\"format\":\"raw\",\"item\":" : "{\"mode\":\"files\"");
+        if (item) sb_json_str(&b, item);
+        sb_puts(&b, ",\"dest\":"); sb_json_str(&b, a->pos[2]);
+        if (overwrite) sb_puts(&b, ",\"overwrite\":true");
+    }
     sb_puts(&b, "}");
     sbuf_t p = { 0 };
     sb_puts(&p, "/repos/");     sb_path_seg(&p, a->pos[0]);
@@ -1644,6 +1674,7 @@ static const char *const P_PROV[]     = { "<provider>", NULL };
 static const char *const P_PROV_UNIT[] = { "<provider>", "<unit>", NULL };
 static const char *const P_UBACKUP[]  = { "<repo-id>", "[unit...]", NULL };
 static const char *const P_UHIST[]    = { "<repo-id>", "[unit]", NULL };
+static const char *const P_URESTORE[] = { "<repo-id>", "<snapshot-id>", "[dest]", NULL };
 static const char *const P_UPOL[]     = { "<repo-id>", "<unit>", NULL };
 static const char *const P_UPOL_SET[] = { "<repo-id>", "<unit>", "<key>", "<value>", NULL };
 
@@ -1722,21 +1753,30 @@ static const arg_opt_t O_SCHED_ADD[] = {
     { "--unit",        NULL, ARG_MULTI, "NAME" },
     { "--exclude",     NULL, ARG_MULTI, "GLOB" },
     { "--require",     NULL, ARG_VALUE, "LEVEL" },
+    { "--pause-scope", NULL, ARG_VALUE, "unit|group|job" },
     OPT_END,
 };
 static const arg_opt_t O_UNIT_BACKUP[] = {
-    { "--provider", NULL, ARG_VALUE, "P" },
-    { "--all",      NULL, ARG_FLAG,  NULL },
-    { "--exclude",  NULL, ARG_MULTI, "GLOB" },
-    { "--require",  NULL, ARG_VALUE, "LEVEL" },
+    { "--provider",    NULL, ARG_VALUE, "P" },
+    { "--all",         NULL, ARG_FLAG,  NULL },
+    { "--exclude",     NULL, ARG_MULTI, "GLOB" },
+    { "--require",     NULL, ARG_VALUE, "LEVEL" },
+    { "--pause-scope", NULL, ARG_VALUE, "unit|group|job" },
     OPT_NOWAIT, OPT_END,
 };
 static const arg_opt_t O_UNIT_HISTORY[] = {
     { "--provider", NULL, ARG_VALUE, "P" }, OPT_LIMIT, OPT_OFFSET, OPT_END,
 };
 static const arg_opt_t O_UNIT_RESTORE[] = {
-    { "--item",      NULL, ARG_VALUE, "ID" },
-    { "--overwrite", NULL, ARG_FLAG,  NULL },
+    { "--item",        NULL, ARG_VALUE, "ID" },
+    { "--overwrite",   NULL, ARG_FLAG,  NULL },
+    { "--define",      NULL, ARG_FLAG,  NULL },
+    { "--replace",     NULL, ARG_FLAG,  NULL },
+    { "--name",        NULL, ARG_VALUE, "N" },
+    { "--target-root", NULL, ARG_VALUE, "DIR" },
+    { "--pin-digest",  NULL, ARG_FLAG,  NULL },
+    { "--start",       NULL, ARG_FLAG,  NULL },
+    { "--keep-macs",   NULL, ARG_FLAG,  NULL },
     OPT_NOWAIT, OPT_END,
 };
 static const arg_opt_t O_PROVIDER[] = { { "--provider", NULL, ARG_VALUE, "P" }, OPT_END };
@@ -1777,8 +1817,9 @@ static const command_t COMMANDS[] = {
     { { "unit history",    P_UHIST,    O_UNIT_HISTORY,
         "every unit with history, or one unit's snapshots with --provider" },
       h_unit_history, 0 },
-    { { "unit restore",    P_RESTORE,  O_UNIT_RESTORE,
-        "the whole snapshot, disks as sparse raw files; or one --item into <dest>" },
+    { { "unit restore",    P_URESTORE, O_UNIT_RESTORE,
+        "into [dest]: the whole snapshot, disks as sparse raw files, or one --item; "
+        "or --define to re-create the unit, --replace in place or --name with --target-root" },
       h_unit_restore, 0 },
     { { "unit policy show", P_UPOL,    O_PROVIDER, NULL }, h_unit_policy_show, 0 },
     { { "unit policy set", P_UPOL_SET, O_PROVIDER, NULL }, h_unit_policy_set, 0 },

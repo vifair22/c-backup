@@ -947,8 +947,10 @@ status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
     if (!p || !src || !src->next_span || !src->read || !sink || !sink->put || !out)
         return set_error(ERR_INVALID, "cdc_store_source: bad arguments");
     memset(out, 0, sizeof(*out));
+    int stream = size == CDC_SIZE_STREAM;
 
     if (size == 0) {
+        out->size = 0;
         obj_put_t put;
         memset(&put, 0, sizeof(put));
         static const uint8_t empty = 0;
@@ -1009,6 +1011,8 @@ status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
         st = chunk_span(&d, src, s, e, more, &cur, &spare, &ss);
         if (st != OK) break;
     }
+    /* A stream's size is where it ended. */
+    if (stream) size = last_end;
     if (covered != size) whole = 0;
 
     /* Every job this file put out has to be back before anything it points
@@ -1023,6 +1027,22 @@ status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
     buf_put(d.w, cur, d.cur_cap);
     buf_put(d.w, spare, d.spare_cap);
 
+    if (st == OK && stream && size == 0) {
+        /* An empty stream: the empty file object, as for a size of 0. */
+        obj_put_t put;
+        memset(&put, 0, sizeof(put));
+        static const uint8_t none = 0;
+        st = sink->put(sink->ctx, OBJECT_TYPE_FILE, &none, 0, &put);
+        if (st == OK) {
+            memcpy(out->hash, put.hash, OBJECT_HASH_SIZE);
+            out->type = OBJECT_TYPE_FILE;
+            out->chunks = 1;
+            if (put.is_new) { out->chunks_new = 1; out->phys_new = put.phys_bytes; }
+        }
+        out->size = 0;
+        return st;
+    }
+    out->size = size;
     if (st == OK && whole && out->chunks == 1) {
         /* One chunk, no holes: the chunk is the file. Nothing was stored
          * for the builder, which only stores when a run closes. */

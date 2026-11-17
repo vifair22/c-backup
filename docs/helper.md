@@ -25,6 +25,9 @@ docker run -d --name c-backup-helper --restart unless-stopped \
   -v /boot/config/c-backup-helper.ini:/etc/c-backup-helper.ini:ro \
   -v /mnt/cache/system/c-backup-helper:/mnt/cache/system/c-backup-helper \
   -v /run/c-backup-helper:/run/c-backup-helper \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /mnt/cache:/mnt/cache:rshared \
+  --label net.cbackup.role=helper \
   --entrypoint /usr/local/bin/c-backup-helper \
   c-backup:latest --policy /etc/c-backup-helper.ini
 
@@ -78,6 +81,16 @@ services:
 ```
 
 Notes that matter:
+
+- **Restore staging stays out of sight.** An in-place restore stages in
+  the mount's own domain and swaps by rename. The directory is the first
+  `[snapshot] restore_staging_dirs` entry inside the domain; with none, a
+  whole-pool domain (FS2's `/mnt/cache`) stages in
+  `<pool>/system/.cbackup-restore`, beside the snapshot directory, and a
+  share domain in `<domain>/.cbackup-restore`. Either way it is refused at
+  the top of a pool or in a share exported over SMB or NFS, and refused
+  when it is on another filesystem from the mount (a btrfs subvolume or
+  another dataset), since the swap could not be a rename.
 
 - **The policy lives on the flash** (`/boot/config/`), root-owned, mode 0600
   or 0644. The helper refuses to start on a file anybody but its owner can
@@ -206,12 +219,311 @@ the policy allows succeed; tokens it did not get from the helper are
 `invalid`; a sweep it asks for never removes an artefact the helper cannot
 prove is its own.
 
+## Configuration blobs
+
+`units.describe` does not carry BLOB bytes in its JSON. The helper writes
+every BLOB of the unit into one memfd, seals it (`F_SEAL_SHRINK`,
+`F_SEAL_GROW`, `F_SEAL_WRITE`, `F_SEAL_SEAL`) and passes it with the
+answer; each BLOB item names `data_off` and `data_len` in it, and the
+answer carries `blob_bytes`. The daemon refuses a range outside the memfd.
+One BLOB may be up to 16 MiB (`HELPER_BLOB_MAX`), which covers a
+container's inspect JSON, an LXC config and UEFI NVRAM alike.
+
+## Docker and LXC providers
+
+Enabled by the policy, never by the daemon (`docs/container-backup.md`):
+
+```ini
+[snapshot]
+zfs_domains = cache/appdata, cache/system, cache/Photos, cache/lxc
+btrfs_domains = /mnt/cache                 ; FS2: the pool's top level
+btrfs_snapshot_dir = /mnt/cache/system/.cbackup-snapshots
+; restore_staging_dirs = /mnt/cache/system/.cbackup-restore   ; per domain, see below
+
+[host]
+nsenter = 1                ; zfs, btrfs, lxc-* run as the host's binaries
+host_root = /proc/1/root   ; how the helper reads host paths itself
+; zfs = /usr/sbin/zfs, btrfs = /sbin/btrfs, realpath = /usr/bin/realpath,
+; lxc_dir = /usr/bin, user_root = /mnt/user, mnt_root = /mnt,
+; boot_config = /boot/config (all defaults)
+
+[docker]
+enabled = 1
+; socket = /var/run/docker.sock
+; include_roots = /mnt/cache/appdata, /mnt/user/appdata
+; pause = auto             ; auto | always | never
+; pause_always = compose:gitlab_server
+; never_pause = adguard*
+; pause_timeout_s = 5
+; templates_dir = /boot/config/plugins/dockerMan/templates-user
+
+[lxc]
+enabled = 1
+; path = /mnt/cache/lxc
+
+[hook pg-flush]
+unit = docker:compose:immich
+container = immich_postgres
+argv.0 = psql
+argv.1 = -c
+argv.2 = CHECKPOINT
+phase = pre
+on_fail = continue
+```
+
+What a capture of one unit does, in order:
+
+1. Members are found by the `com.docker.compose.project` label (unit
+   `compose:<project>`) or by name. Each member's inspect is stored
+   verbatim, with its image record (`Id`, `RepoTags`, `RepoDigests`), its
+   Unraid template and the project's compose files and `.env`, under
+   `.cbackup-unit/config/`. `mounts.json` lists every mount with its
+   outcome: `snapshot`, `fallback-live` or `excluded:<reason>`
+   (`system`, `remote-volume`, `outside-include-roots`).
+2. Each included mount is resolved to where its bytes are (`/mnt/user` to
+   the one pool or disk holding the share, symlinks in the host's
+   namespace) and to its snapshot domain: the dataset at the longest
+   mountpoint if the policy lists it (never a parent dataset), or a btrfs
+   pool root. A mount in no domain is read live and the unit's level is
+   `inconsistent`.
+3. Pre hooks run through `docker exec` (`lxc-attach` for LXC), live, one
+   at a time; `on_fail = fail` fails the unit before anything is held.
+4. Docker: a pause only when it adds something, which under `pause = auto`
+   means more than one snapshot instant (several pools, several btrfs
+   domains); `pause_always` units always; never the helper or daemon
+   (label `net.cbackup.role`) or `never_pause` names. LXC: a running
+   container is always frozen. Each pause or freeze is journalled first.
+5. `syncfs` on each domain, then one `zfs snapshot -o
+   com.cbackup:owner=<daemon id>` per pool, or `btrfs subvolume snapshot
+   -r` into `btrfs_snapshot_dir`, each journalled before it runs. The
+   btrfs directory is refused inside an exported share or at the top of a
+   pool.
+6. Unpause or thaw, post hooks, and the daemon reads from
+   `<mountpoint>/.zfs/snapshot/<name>/...` or `<snapdir>/<name>/...`.
+7. `capture.end` destroys each snapshot after proving it ours (the name
+   grammar and the owner property; for btrfs read-only, the name and the
+   parent uuid), and the sweep does the same for leftovers of dead jobs.
+
+The daemon needs the pools mounted read-only with `rslave`
+(`-v /mnt/cache:/mnt/cache:ro,rslave`) so the `.zfs` automount and the
+btrfs snapshot directory are visible to it; the file scanner never enters
+`.zfs` or `.cbackup-snapshots` itself, so a file backup of a pool does not
+read capture snapshots.
+
+### Hooks: logs and dumps
+
+Every policy hook of a unit becomes `.cbackup-unit/hooks/<name>.log` in
+its snapshot: stdout and stderr, capped at 1 MiB with the first and last
+halves kept around a line counting what was dropped, and the exit status
+appended. A `kind = dump` hook also becomes `.cbackup-unit/hooks/<name>.dump`:
+its stdout streams from `hook.run`'s pipe straight into the repository, any
+size, no temporary file. When the hook exits non-zero or times out, the
+dump is not stored (a truncated dump looks valid); its log says why and
+the unit carries a warning. A dump runs while the unit is read, after the
+snapshot, rather than with the pre hooks: a dump is consistent at its own
+instant, and running it then lets its bytes stream with nothing held.
+
+### Exclusions
+
+Nothing is excluded unless enrolled (C7). `mounts.json` in each snapshot
+lists `suggested_excludes` (directories such as `cache`, `ml_cache`,
+`Codecs`, `transcode`, `logs` found in an included mount). To apply some:
+
+```sh
+curl --unix-socket /run/c-backupd/api.sock -X PUT \
+  http://localhost/repos/1/units/docker/compose:immich/policy \
+  -d '{"capture.exclude": "/mnt/cache/appdata/Immich/ml_cache"}'
+```
+
+Up to 64 patterns, one per line, naming the paths as the container binds
+them; `null` or `""` removes them.
+
+### Mounts on no snapshot domain: pause-read
+
+A mount on an array disk, an unassigned device or a split share cannot be
+snapshotted (container-backup.md section 7). For a running unit with such
+mounts the daemon makes two passes:
+
+1. **Pass 1, live**: those mounts are read with the unit running, their
+   content and file cache rows stored, no snapshot written.
+2. `capture.begin` with `hold: true`: the helper pauses the unit, takes the
+   snapshots of every other mount in the same pause, and returns with the
+   unit **still paused** (`SP_CF_PAUSE_HELD`).
+3. **Pass 2, paused**: the unit job scans those mounts again and re-reads
+   only files whose metadata changed since pass 1, then sends
+   `lease.release`; the helper unpauses and runs the post hooks. The other
+   mounts' files and the configuration are stored after, unpaused.
+
+The pause is capped by the policy's `max_pause_s` (30 s by default): the
+helper's watchdog unpauses at the cap whatever the daemon does, and
+`lease.release` then reports `cap_hit`, the snapshot is kept, and the unit
+is flagged `inconsistent` with a warning. Within the cap the unit is
+`crash`-consistent like a fully snapshotted one. The work
+is split: the held mounts are scanned and stored, the pause let go, and
+only then are the snapshot mounts walked and read, so neither their
+directory walk nor their content falls inside the pause.
+`pause = never` units, and stopped ones, are read live and flagged.
+
+### Pause scope: unit, group, job
+
+By default every unit is its own capture (`pause_scope: unit`). A units
+job or schedule can ask for `"pause_scope": "job"`, every unit of the job
+in one capture, or `"group"`, units sharing a `capture.group` (unit
+policy, `PUT .../units/<p>/<unit>/policy {"capture.group": "proxy"}`) in
+one capture each and the rest alone (container-backup.md 6.2). A capture
+over several units takes their pre hooks, pauses every member of every
+unit together when the combined capture needs it (`pause: auto`: more
+than one snapshot instant over all of them; any unit in `pause_always`),
+takes one snapshot per pool for all of them, unpauses and runs the post
+hooks; each unit is then read and stored on its own, and the shared
+snapshots go with the last. A unit that cannot be described fails alone;
+a begin that fails fails the group. pause-read's held pause applies to
+unit scope only; in a group, mounts on no snapshot domain are read live
+and flagged.
+
+### Pausing
+
+Members of a unit are paused together (each pause journalled first), so
+the window is the slowest member's freeze. A member that will not pause
+within `pause_timeout_s` leaves every other member unpaused again; a unit
+spanning more than one snapshot instant then fails. A nested btrfs
+subvolume (inode 256) is its own snapshot domain, snapshotted into the
+pool's capture directory and counted as one more instant.
+
+### Restore staging and define
+
+`restore.stage` creates `<domain>/.cbackup-restore/<job>` inside the
+mount's snapshot domain and `restore.swap` renames the old directory to
+`<mount>.cbackup-old-<job>` and the staged one into place: never a delete.
+The helper does this itself, so it needs the pools at their host paths in
+its own mount namespace, which `-v /mnt/cache:/mnt/cache:rshared` above
+provides (add one per pool). The daemon writes into the staging directory
+through its own read-write mount of each dataset's `.cbackup-restore`
+(see the daemon's `docker run` in the design, 9.2).
+
+`unit.define` re-creates a unit from its recorded definition: for Docker
+the inspect, image record and template, built into a create body by the
+helper, the image pulled by digest and by tag with a warning when the
+registry no longer has the digest (`pin_digest` refuses that), the
+template written back; for LXC the config with its name, rootfs path and
+MAC addresses rewritten. A name in use is refused unless `replace`, which
+needs the container stopped and moves the old one aside (renamed, or its
+config renamed). Privileged settings, and binds of host paths outside
+the include roots, need `allow_privileged_define`.
+
+The daemon's side is `mode: unit` (`c-backup unit restore <repo> <snap>
+--define ...`):
+
+- **In place** needs `--replace`: the unit is stopped, each mount staged,
+  restored and swapped in, the old data left at `<mount>.cbackup-old-<job>`,
+  then the definition applied with replace.
+- **Under a new name** needs `--target-root DIR`: each mount is restored to
+  `DIR/<its original path>` and the definition's bind sources (Docker,
+  compose volumes), rootfs and mount entries (LXC) are rewritten there; the
+  original's paths are never written. `DIR` must lie inside an include root,
+  since the helper refuses binds outside them.
+- The definition travels to the helper as a sealed memfd (no size limit);
+  the helper's warnings land in the job result and the journal.
+
+**Compose projects** are re-created with the host's own docker CLI and
+its compose plugin, run in the host's mount namespace (`[host] docker`,
+default `/usr/bin/docker`). That plugin is a host requirement: on Unraid
+it comes with the Compose Manager plugin; the helper image does not carry
+one. The recorded compose files and `.env` are written back to the
+project directory (under the target root for a new name), any file they
+replace moved aside; `cbackup-override.yaml` pins each service's image by
+digest (tag fallback with a warning), and under a new name rewrites the
+services' binds and sets container names `<project>-<service>`; then
+`docker compose -p <project> up -d --no-build` (`--no-start` unless
+`--start`). Replacing a project needs its containers stopped; they are
+renamed aside rather than removed by compose.
+
+## Testing
+
+The unit suites run everything above against stand-ins: `tests/fake_host`
+holds scripts standing in for the host's `zfs`, `btrfs` and `lxc-*` (a
+snapshot is a copy, properties live in a state file), and
+`tests/fake_docker.h` is an Engine API on a unix socket. `test_snap`,
+`test_mounts`, `test_docker` and `test_lxc` need no privileges and run in
+the ordinary CI job.
+
+A real-Docker CI job is not added. The runners are Debian containers on a
+docker executor; a Docker-in-Docker service needs a privileged runner, and
+neither ZFS (a kernel module) nor btrfs snapshots of a real pool can be
+exercised inside one in any case. The real paths are covered by UAT.
+
+## UAT: real ZFS (FS1) and btrfs (FS2)
+
+Disposable containers only, `units.allow = docker:cbk-uat-*` in the
+daemon and the same globs in the helper's `[units] allow`. Run each step
+on the host named, from a shell that can reach both containers.
+
+**FS2 (btrfs, no subvolumes).** Policy: `btrfs_domains = /mnt/cache`,
+`btrfs_snapshot_dir = /mnt/cache/system/.cbackup-snapshots`, `[docker]
+enabled = 1`, include roots `/mnt/cache/appdata`.
+
+1. Create the fixtures:
+   `docker run -d --name cbk-uat-pg -e POSTGRES_PASSWORD=x -v
+   /mnt/cache/appdata/cbk-uat-pg:/var/lib/postgresql/data postgres:16`;
+   `docker run -d --name cbk-uat-sqlite -v
+   /mnt/cache/appdata/cbk-uat-sqlite:/data alpine sh -c 'apk add sqlite;
+   while :; do sqlite3 /data/t.db "create table if not exists t(x);
+   insert into t values(random());"; done'`; a two-service compose
+   project `cbk-uat-compose` with both services binding
+   `/mnt/cache/appdata/cbk-uat-compose/<svc>`.
+2. Start a pgbench load in `cbk-uat-pg`, then
+   `c-backup unit backup <repo> --provider docker cbk-uat-pg`. Expect
+   `completed`, level `crash`, `consist_flags` with FS_SNAPSHOT and
+   without PAUSED (one btrfs domain is one instant), and the job's
+   `snapshot_ms` in `unit.json`.
+3. While it runs, `ls /mnt/cache/system/.cbackup-snapshots` shows one
+   `cbk-<d8>-<seq>-0`; after it, none. `btrfs subvolume list /mnt/cache`
+   shows no leftover.
+4. `docker kill c-backup-helper` while a capture is held: the job fails
+   cleanly if it still needed the helper, and is kept if its read had
+   finished; `docker start c-backup-helper` then reports its sweep
+   destroying the snapshot, and the next backup succeeds without a daemon
+   restart.
+5. Restore `cbk-uat-pg`'s mount to a scratch path and start a throwaway
+   PostgreSQL on it: it recovers; `pg_amcheck --all` passes. SQLite:
+   `PRAGMA integrity_check` says `ok`. The compose project:
+   `docker compose up` on the restored files comes up.
+
+**FS1 (ZFS), after the user approves disposable containers there.**
+Policy: `zfs_domains = cache/appdata`. Repeat steps 1, 2, 4 and 5 under
+`/mnt/cache/appdata/cbk-uat-*`; expect one `zfs snapshot` per capture
+(`zpool history cache | tail`), the snapshot owned by the daemon id
+(`zfs get com.cbackup:owner`), and none left after the job. Then:
+
+6. Add a second dataset (`cache/Photos`, or a scratch dataset) to one
+   fixture's mounts and the policy: the capture now pauses (two pools, or
+   check that one pool stays unpaused) and `pause_ms` is reported.
+7. U3: from a container binding `/mnt/cache` read-only, check whether
+   `/mnt/cache/appdata/.zfs/snapshot/` lists the capture while a job runs,
+   and whether `/mnt/user/appdata/.zfs` resolves through shfs.
+8. That the daemon container sees `.zfs/snapshot/<name>` through its
+   `rslave` mount. If not, record it: the helper would have to mount the
+   snapshot explicitly (not built).
+
+**LXC (FS1).** A disposable `cbk-uat-lxc` (busybox template) under
+`/mnt/cache/lxc`, policy `[lxc] enabled = 1`, `zfs_domains` including
+`cache/lxc`: back it up running (expect `lxc-freeze`/`lxc-unfreeze` in the
+helper log, level `crash`) and stopped (`offline`), then restore the
+rootfs to a scratch path and compare.
+
+Exit: every restore verified; zero leftover snapshots, pauses, freezes or
+journal rows after every fault (`GET /providers` `holds_open` 0, helper
+`holds.json` empty).
+
 ## Known limits in this build
 
-- A BLOB is returned in `units.describe` as hex inside the 64 KiB packet, so
-  one larger than about 30 KiB is `failed`. UEFI NVRAM (128 KiB to 4 MiB)
-  needs the daemon to read the file through its own mount, or an fd.
 - `capture.begin_paths` and `restore.stage` over `dir_domains` take no real
-  snapshot; ZFS and btrfs domains come with the container provider.
+  snapshot.
 - `pause: false` is passed to the backend as the wanted level; the fake
-  pauses whenever the unit can.
+  pauses whenever the unit can. The Docker provider decides from its
+  policy (`pause`, `pause_always`) instead.
+- Not built yet (container-backup.md): the `containers.fallback` modes other than `pause-read` (`live` is what
+  `pause = never` gives; `stop` and `fail` are not offered).
+- `restore.stage` and `restore.swap` act on host paths directly, so for a
+  container provider they need the helper to see the pools at their host
+  paths (bind them in as well as using `host_root`).

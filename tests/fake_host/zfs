@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# A stand-in for the host's zfs(8), for the helper's tests: datasets are
+# directories, a snapshot is a copy under <mountpoint>/.zfs/snapshot/<name>,
+# and user properties live in a state file. Only the subcommands and flags
+# the helper uses are understood; anything else fails loudly.
+#
+#   $FAKE_HOST_STATE/datasets   "<name>\t<mountpoint>" per line
+#   $FAKE_HOST_STATE/snaps      "<ds>@<name>\t<owner>" per line
+#   $FAKE_HOST_STATE/zfs.log    every invocation, one per line
+#   FAKE_ZFS_FAIL=<subcommand>  that subcommand exits 1
+set -u
+S=${FAKE_HOST_STATE:?FAKE_HOST_STATE is not set}
+touch "$S/datasets" "$S/snaps"
+echo "zfs $*" >> "$S/zfs.log"
+if [ "${FAKE_ZFS_FAIL:-}" = "$1" ]; then echo "cannot $1: injected failure" >&2; exit 1; fi
+
+mountpoint_of() { awk -F'\t' -v d="$1" '$1 == d { print $2 }' "$S/datasets"; }
+
+case "$1" in
+list)
+    shift
+    if [ "$*" = "-H -o name,mountpoint -t filesystem" ]; then cat "$S/datasets"; exit 0; fi
+    if [ "$*" = "-H -t snapshot -o name,com.cbackup:owner" ]; then cat "$S/snaps"; exit 0; fi
+    echo "fake zfs: list $* not understood" >&2; exit 2 ;;
+snapshot)
+    shift
+    [ "$1" = "-o" ] || { echo "fake zfs: snapshot without -o" >&2; exit 2; }
+    owner=${2#com.cbackup:owner=}; shift 2
+    pool=""
+    for t in "$@"; do
+        p=${t%%/*}; p=${p%%@*}
+        [ -z "$pool" ] && pool=$p
+        [ "$p" = "$pool" ] || { echo "cannot create snapshots: snapshots must be in the same pool" >&2; exit 1; }
+        ds=${t%@*}
+        [ -n "$(mountpoint_of "$ds")" ] || { echo "cannot open '$ds': dataset does not exist" >&2; exit 1; }
+    done
+    for t in "$@"; do
+        ds=${t%@*}; name=${t#*@}; mp=$(mountpoint_of "$ds")
+        mkdir -p "$mp/.zfs/snapshot/$name"
+        (cd "$mp" && tar cf - --exclude=./.zfs .) | (cd "$mp/.zfs/snapshot/$name" && tar xf -)
+        printf '%s\t%s\n' "$t" "$owner" >> "$S/snaps"
+    done ;;
+get)
+    shift
+    [ "$1 $2 $3 $4" = "-H -o value com.cbackup:owner" ] || { echo "fake zfs: get $* not understood" >&2; exit 2; }
+    v=$(awk -F'\t' -v t="$5" '$1 == t { print $2 }' "$S/snaps")
+    if [ -z "$v" ] && ! grep -q "^$5	" "$S/snaps"; then
+        echo "cannot open '$5': dataset does not exist" >&2; exit 1
+    fi
+    echo "${v:--}" ;;
+destroy)
+    t=$2; ds=${t%@*}; name=${t#*@}; mp=$(mountpoint_of "$ds")
+    grep -q "^$t	" "$S/snaps" || { echo "could not find any snapshots to destroy; check snapshot names." >&2; exit 1; }
+    rm -rf "${mp:?}/.zfs/snapshot/$name"
+    awk -F'\t' -v t="$t" '$1 != t' "$S/snaps" > "$S/snaps.new" && mv "$S/snaps.new" "$S/snaps" ;;
+*)
+    echo "fake zfs: $1 not understood" >&2; exit 2 ;;
+esac

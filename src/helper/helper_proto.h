@@ -101,6 +101,7 @@ typedef struct {
     char        units[HELPER_UNITS_MAX][HELPER_UNIT_KEY_MAX + 1];
     size_t      n_units;
     int         pause;
+    int         hold;        /* capture.begin: keep a pause for the daemon's second pass */
     /* capture.begin_paths */
     char       *paths[HELPER_PATHS_MAX];
     size_t      n_paths;
@@ -143,6 +144,10 @@ int helper_unit_key_ok(const char *key, char *provider, size_t psz,
 int helper_path_clean(const char *p);
 
 /* ---- transport ---- */
+
+/* The largest configuration blob units.describe passes in its sealed memfd
+ * (items carry data_off and data_len into it). */
+#define HELPER_BLOB_MAX ((size_t)16 * 1024 * 1024)
 
 /* One packet, and optionally one fd as SCM_RIGHTS. ERR_IO on failure. */
 status_t helper_send(int fd, const void *buf, size_t len, int pass_fd);

@@ -39,7 +39,18 @@ static void hstart(unsigned uid, unsigned pause_s, unsigned capture_s, unsigned 
     char text[4096];
     hf_policy_text(text, sizeof(text), uid, pause_s, capture_s, per_hour, restore);
     assert_int_equal(helper_policy_parse(text, &pol), OK);
-    helper_server_cfg_t cfg = { &pol, fk, listen, 50 };
+    helper_server_cfg_t cfg = { &pol, fk, listen, 50, NULL, 0 };
+    assert_int_equal(helper_server_start(&cfg, &srv), OK);
+}
+
+/* hstart with the fixture policy and extra text after it. */
+static void hstart_plus(const char *extra)
+{
+    char text[8192];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
+    strncat(text, extra, sizeof(text) - strlen(text) - 1);
+    assert_int_equal(helper_policy_parse(text, &pol), OK);
+    helper_server_cfg_t cfg = { &pol, fk, 0, 50, NULL, 0 };
     assert_int_equal(helper_server_start(&cfg, &srv), OK);
 }
 
@@ -446,6 +457,70 @@ static void test_compromised_daemon(void **state)
     hstop();
 }
 
+/* The error message of a response, "" for none. */
+static const char *msg_of(const cJSON *o)
+{
+    const char *m = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(o, "error"), "msg"));
+    return m ? m : "";
+}
+
+/*
+ * Where a restore stages (Manual review item 4). Here the pool is
+ * HF_DIR/pool under mnt_root HF_DIR, a whole-pool domain like FS2's
+ * /mnt/cache: staging defaults beside the snapshot directory, in
+ * <pool>/system/.cbackup-restore, never at the pool's top; an exported
+ * share and the top of a pool are refused, configured or not; a configured
+ * directory inside an unexported share is used.
+ */
+static void test_restore_staging_place(void **state)
+{
+    (void)state;
+    const char *host = "\n[host]\nmnt_root = " HF_DIR "\nboot_config = " HF_DIR "/boot\nhost_root =\n";
+    const char *stage = "{\"unit\":\"fake:u1\",\"mount\":\"" HF_MOUNT "\",\"job\":9}";
+    hstart_plus(host);
+    cJSON *o = call(req("restore.stage", stage), NULL);
+    assert_string_equal(code_of(o), "ok");
+    const char *path = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(o, "result"), "path"));
+    assert_non_null(path);
+    assert_int_equal(strncmp(path, HF_POOL "/system/.cbackup-restore/", strlen(HF_POOL "/system/.cbackup-restore/")), 0);
+    cJSON_Delete(o);
+    struct stat sb;
+    assert_int_not_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
+
+    /* The system share exported over SMB: refused, and said why. */
+    assert_int_equal(mkdir(HF_DIR "/boot", 0755), 0);
+    assert_int_equal(mkdir(HF_DIR "/boot/shares", 0755), 0);
+    hf_write(HF_DIR "/boot/shares/system.cfg", "shareComment=\"\"\nshareExport=\"e\"\nshareExportNFS=\"-\"\n");
+    o = call(req("restore.stage", stage), NULL);
+    assert_string_equal(code_of(o), "denied");
+    assert_non_null(strstr(msg_of(o), "exported"));
+    cJSON_Delete(o);
+    hstop();
+
+    /* Configured at the top of the pool: refused like the default would be. */
+    hstart_plus("\n[snapshot]\nrestore_staging_dirs = " HF_POOL "/.staging\n" "\n[host]\nmnt_root = " HF_DIR
+                "\nboot_config = " HF_DIR "/boot\nhost_root =\n");
+    o = call(req("restore.stage", stage), NULL);
+    assert_string_equal(code_of(o), "denied");
+    assert_non_null(strstr(msg_of(o), "top of a pool"));
+    cJSON_Delete(o);
+    hstop();
+
+    /* Configured inside a share nobody exports: used. */
+    hstart_plus("\n[snapshot]\nrestore_staging_dirs = " HF_POOL "/app/.cbackup-restore\n" "\n[host]\nmnt_root = " HF_DIR
+                "\nboot_config = " HF_DIR "/boot\nhost_root =\n");
+    o = call(req("restore.stage", stage), NULL);
+    assert_string_equal(code_of(o), "ok");
+    path = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(o, "result"), "path"));
+    assert_non_null(path);
+    assert_int_equal(strncmp(path, HF_POOL "/app/.cbackup-restore/", strlen(HF_POOL "/app/.cbackup-restore/")), 0);
+    cJSON_Delete(o);
+    hstop();
+}
+
 static void test_capture_lifecycle(void **state)
 {
     (void)state;
@@ -492,7 +567,7 @@ static void test_leases_and_rate(void **state)
     hstart((unsigned)getuid(), 30, 1, 2, 0, 0);
     expect(req("capture.begin", "{\"units\":[\"fake:u1\"],\"pause\":false}"), "ok");
     assert_int_equal(helper_server_captures(srv), 1);
-    assert_true(helper_server_tick(srv, time(NULL) + 5) >= 1);
+    assert_true(helper_server_tick(srv, ((int64_t)time(NULL) + 5) * 1000) >= 1);
     assert_int_equal(helper_server_captures(srv), 0);
     assert_int_equal(helper_server_holds(srv), 0);
     expect(req("capture.begin_paths", "{\"paths\":[\"" HF_MOUNT "\"]}"), "ok");
@@ -532,6 +607,28 @@ static void test_watchdog(void **state)
     assert_int_equal(st.watchdog_released, 1);
     cJSON_Delete(b.out);
     expect(req("sweep", "{}"), "ok");
+    hstop();
+}
+
+/* A hold is journalled before it is taken. A watchdog pass between the two
+ * finds nothing held and must keep the record, or the freeze that lands a
+ * moment later is bounded by nothing (B151). */
+static void test_watchdog_waits_for_take(void **state)
+{
+    (void)state;
+    hstart((unsigned)getuid(), 1, 86400, 1000, 0, 0);
+    assert_int_equal(helper_server_record(srv, "fake:u1", SP_HOLD_FREEZE, "agent:u1"), OK);
+    int64_t later = ((int64_t)time(NULL) + 5) * 1000;
+    assert_int_equal(helper_server_tick(srv, later), 0);
+    assert_int_equal(helper_server_holds(srv), 1);
+    assert_int_equal(fake_hold_plant(fk, "u1", SP_HOLD_FREEZE, "agent:u1"), OK);
+    assert_int_equal(helper_server_tick(srv, later), 1);
+    assert_false(fake_hold_held(fk, "u1", SP_HOLD_FREEZE, NULL));
+    assert_int_equal(helper_server_holds(srv), 0);
+    /* A sweep still drops a record with nothing under it. */
+    assert_int_equal(helper_server_record(srv, "fake:u1", SP_HOLD_FREEZE, "agent:u1"), OK);
+    expect(req("sweep", "{}"), "ok");
+    assert_int_equal(helper_server_holds(srv), 0);
     hstop();
 }
 
@@ -890,6 +987,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_policy),
         cmocka_unit_test(test_policy_inline_comments),
+        cmocka_unit_test_setup_teardown(test_restore_staging_place, setup, teardown),
         cmocka_unit_test(test_unit_key_grammar),
         cmocka_unit_test(test_policy_refusals_say_why),
         cmocka_unit_test(test_request_refusals_say_why),
@@ -900,6 +998,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_capture_lifecycle, setup, teardown),
         cmocka_unit_test_setup_teardown(test_leases_and_rate, setup, teardown),
         cmocka_unit_test_setup_teardown(test_watchdog, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_watchdog_waits_for_take, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restart_sweep, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_stage_swap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_socket, setup, teardown),

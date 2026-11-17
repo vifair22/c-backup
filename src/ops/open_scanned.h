@@ -46,6 +46,10 @@ typedef struct scan_roots scan_roots_t;
 /* The source roots of a scan: one entry per entry whose path is its root. */
 status_t scan_roots_new(const scan_result_t *scan, scan_roots_t **out);
 void     scan_roots_free(scan_roots_t *r);
+/* Add the roots of entries from index `from` on, scanned after the table
+ * was made (a held capture scans the rest of its roots once the hold is let
+ * go). Not concurrent with any open: the caller has drained every reader. */
+status_t scan_roots_extend(scan_roots_t *r, const scan_result_t *scan, uint32_t from);
 
 /*
  * Open e for reading. On success the fd, with *fst its fstat (a regular

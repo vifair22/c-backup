@@ -12,11 +12,13 @@
 
 #include <cutils/log.h>
 
+#include <errno.h>
 #include <fnmatch.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define UNIT_ITEMS_MAX 64u
 
@@ -116,7 +118,7 @@ static status_t validate(const sp_unit_desc_t *d)
         const char *tp = it->tree_path;
         if (!path_clean(tp))
             return set_error(ERR_INVALID, "unit %s: item %s has no clean path", d->unit_id, it->id);
-        if (it->kind == SP_ITEM_BLOB || it->kind == SP_ITEM_BLOCK) {
+        if (it->kind == SP_ITEM_BLOB || it->kind == SP_ITEM_BLOCK || it->kind == SP_ITEM_STREAM) {
             if (strncmp(tp, unit_dir, sizeof(unit_dir) - 1) != 0 || tp[sizeof(unit_dir) - 1] == '\0' ||
                 strcmp(tp, RESERVED_UNIT_DIR "/unit.json") == 0)
                 return set_error(ERR_INVALID, "unit %s: item %s would land at %s, outside "
@@ -171,6 +173,64 @@ static status_t mem_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
     return OK;
 }
 
+/* A STREAM item's pipe as a chunker source: one span handed over in
+ * pieces as the bytes arrive, closed by an empty piece at EOF. Memory is
+ * the one buffer, whatever the dump's size. */
+#define PIPE_BUF_BYTES ((size_t)1024 * 1024)
+
+typedef struct {
+    int      fd;
+    uint8_t *buf;
+    uint64_t off, buf_off;
+    size_t   buf_len;
+    int      open, eof;
+} pipesrc_t;
+
+static status_t pipe_piece(void *ctx, uint64_t *s, uint64_t *e, int *got, int *more)
+{
+    pipesrc_t *p = ctx;
+    *got = 0;
+    if (p->eof) return OK;
+    size_t n = 0;
+    while (n < PIPE_BUF_BYTES) {
+        ssize_t r = read(p->fd, p->buf + n, PIPE_BUF_BYTES - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) return set_error_errno(ERR_IO, "unit backup: reading a stream");
+        if (r == 0) break;
+        n += (size_t)r;
+        if (n >= PIPE_BUF_BYTES / 4) break;     /* enough for one piece */
+    }
+    p->buf_off = p->off;
+    p->buf_len = n;
+    if (n > 0) {
+        *s = p->off;
+        *e = p->off + n;
+        *got = 1;
+        *more = 1;
+        p->open = 1;
+        p->off += n;
+        return OK;
+    }
+    p->eof = 1;
+    if (p->open) { *s = *e = p->off; *got = 1; *more = 0; }
+    return OK;
+}
+
+static status_t pipe_span(void *ctx, uint64_t *s, uint64_t *e, int *got)
+{
+    (void)ctx; (void)s; (void)e; (void)got;
+    return set_error(ERR_INVALID, "unit backup: a stream is read in pieces");
+}
+
+static status_t pipe_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
+{
+    pipesrc_t *p = ctx;
+    if (off < p->buf_off || off - p->buf_off + n > p->buf_len)
+        return set_error(ERR_IO, "unit backup: a stream read outside its piece");
+    memcpy(buf, p->buf + (off - p->buf_off), n);
+    return OK;
+}
+
 typedef struct {
     int               item;        /* index into desc->items; -1 for unit.json */
     void             *blob;
@@ -180,6 +240,8 @@ typedef struct {
     int               bs_open;
     block_source_t   *src;
     uint64_t          bytes_read;
+    pipesrc_t         pipe;
+    int               stream_open, stream_ok;
 } part_t;
 
 typedef struct {
@@ -192,6 +254,8 @@ typedef struct {
     unit_json_t               uj;
     char                     *uj_text;
     uint64_t                  bytes_read;
+    int                       held;      /* begin kept a pause for pass 2 */
+    int                       cap_hit;   /* and the watchdog let it go first */
 } uctx_t;
 
 static const sp_item_plan_t *plan_for(const uctx_t *u, const char *item)
@@ -246,6 +310,35 @@ static status_t build_unit_json(uctx_t *u)
         if (!(j->warnings[i] = strdup(u->info->warnings[i]))) return set_error(ERR_NOMEM, "unit.json");
         j->n_warnings++;
     }
+    if (u->cap_hit) {
+        /* The second pass outlived the pause cap: what it read after the
+         * watchdog unpaused the unit is not from the snapshot's instant. */
+        j->consistency = SP_CONSIST_INCONSISTENT;
+        char **g = realloc(j->warnings, (j->n_warnings + 1) * sizeof(*g));
+        if (!g) return set_error(ERR_NOMEM, "unit.json");
+        j->warnings = g;
+        if (!(g[j->n_warnings] = strdup("the pause hit its cap before the second pass over mounts on no "
+                                        "snapshot domain finished; those mounts are flagged inconsistent")))
+            return set_error(ERR_NOMEM, "unit.json");
+        j->n_warnings++;
+    }
+    size_t dropped = 0;
+    for (size_t p = 0; p < u->n_parts; p++) {
+        if (u->parts[p].item < 0) continue;
+        const sp_item_desc_t *it = &u->desc->items[u->parts[p].item];
+        if (it->kind != SP_ITEM_STREAM) continue;
+        j->items[u->parts[p].item].size = u->parts[p].bytes_read;
+        if (!u->parts[p].stream_ok) dropped++;
+    }
+    if (dropped) {
+        char **g = realloc(j->warnings, (j->n_warnings + 1) * sizeof(*g));
+        if (!g) return set_error(ERR_NOMEM, "unit.json");
+        j->warnings = g;
+        char msg[96];
+        snprintf(msg, sizeof(msg), "%zu stream(s) failed and were not stored", dropped);
+        if (!(g[j->n_warnings] = strdup(msg))) return set_error(ERR_NOMEM, "unit.json");
+        j->n_warnings++;
+    }
     return OK;
 }
 
@@ -265,6 +358,19 @@ static status_t part_open(void *ctx, size_t index, cdc_source_t *src, uint64_t *
         return OK;
     }
     const sp_item_desc_t *it = &u->desc->items[p->item];
+    if (it->kind == SP_ITEM_STREAM) {
+        if (!u->ops->stream_open || !u->ops->stream_close)
+            return set_error(ERR_INVALID, "provider %s has no streams for %s", u->desc->provider, it->id);
+        memset(&p->pipe, 0, sizeof(p->pipe));
+        p->pipe.fd = -1;
+        if (!(p->pipe.buf = malloc(PIPE_BUF_BYTES))) return set_error(ERR_NOMEM, "unit backup: stream");
+        status_t st = u->ops->stream_open(u->sess, it, &p->pipe.fd);
+        if (st != OK) return st;
+        p->stream_open = 1;
+        *src = (cdc_source_t){ pipe_span, pipe_read, &p->pipe, pipe_piece };
+        *size = CDC_SIZE_STREAM;
+        return OK;
+    }
     if (it->kind == SP_ITEM_BLOB) {
         status_t st = u->ops->blob_read(u->sess, it, &p->blob, &p->blob_len);
         if (st != OK) return st;
@@ -303,10 +409,42 @@ static void part_release(part_t *p)
 
 static void part_close(void *ctx, size_t index, status_t st, const cdc_result_t *cr)
 {
-    (void)st; (void)cr;
     uctx_t *u = ctx;
-    part_release(&u->parts[index]);
-    u->bytes_read += u->parts[index].bytes_read;
+    part_t *p = &u->parts[index];
+    if (p->stream_open) {
+        /* Drain what is left so the producer is not stuck writing, then
+         * ask whether it succeeded: only then is the stream kept. */
+        if (p->pipe.fd >= 0) {
+            if (st != OK) { char sink[4096]; while (read(p->pipe.fd, sink, sizeof(sink)) > 0) {} }
+            close(p->pipe.fd);
+            p->pipe.fd = -1;
+        }
+        int ok = 0;
+        const sp_item_desc_t *it = &u->desc->items[p->item];
+        if (u->ops->stream_close(u->sess, it, &ok) != OK) {
+            log_warn("unit %s: stream %s: %s", u->desc->unit_id, it->id, err_msg());
+            err_clear();
+            ok = 0;
+        }
+        p->stream_ok = st == OK && ok;
+        p->stream_open = 0;
+        if (st == OK && cr) p->bytes_read = cr->size;
+        if (!p->stream_ok)
+            log_warn("unit %s: %s failed; it is not stored", u->desc->unit_id, it->tree_path);
+        free(p->pipe.buf);
+        p->pipe.buf = NULL;
+    }
+    part_release(p);
+    u->bytes_read += p->bytes_read;
+}
+
+/* A failed dump is never stored: it looks valid and is not (6.6). */
+static int part_keep(void *ctx, size_t index)
+{
+    uctx_t *u = ctx;
+    const part_t *p = &u->parts[index];
+    if (p->item < 0 || u->desc->items[p->item].kind != SP_ITEM_STREAM) return 1;
+    return p->stream_ok;
 }
 
 typedef struct {
@@ -344,13 +482,124 @@ static void prog_bytes(void *ctx, uint64_t done, uint64_t total)
 /* One unit                                                            */
 /* ------------------------------------------------------------------ */
 
-static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
-                        const unit_backup_opts_t *o, const sp_provider_ops_t *ops,
-                        sp_ctx_t *pctx, const listed_t *lu, size_t index, size_t total,
-                        unit_backup_one_t *res)
+/*
+ * The unit's enrolled exclusions (unit_policy capture.exclude, one pattern
+ * per line), never applied unless enrolled (container-backup.md 4.2, C7).
+ * Patterns name recorded paths; the scan walks read roots (a snapshot), so
+ * a pattern under a tree's recorded path is rewritten onto its read root.
+ * Patterns without a leading '/' match anywhere and pass as they are.
+ */
+#define UNIT_EXCLUDE_MAX 64
+
+static size_t unit_excludes(cutils_db_t *db, int64_t repo_id, const char *key,
+                            const char *const *paths, const char *const *rpaths, size_t nt,
+                            char **out)
 {
-    char key[UNIT_KEY_MAX];
-    unit_key_format(key, sizeof(key), ops->name, lu->id);
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    size_t n = 0;
+    if (db_execute(db, "SELECT value FROM unit_policy WHERE repo_id = ? AND unit_key = ?"
+                       " AND key = 'capture.exclude'",
+                   (const char *[]){ repo, key, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return 0;
+    }
+    char *copy = strdup(r->rows[0][0]);
+    db_result_free(r);
+    char *save = NULL;
+    for (char *pat = copy ? strtok_r(copy, "\n", &save) : NULL; pat && n < UNIT_EXCLUDE_MAX;
+         pat = strtok_r(NULL, "\n", &save)) {
+        if (!*pat) continue;
+        const char *base = NULL, *rest = NULL;
+        for (size_t i = 0; i < nt && !base; i++) {
+            size_t l = strlen(paths[i]);
+            if (strncmp(pat, paths[i], l) == 0 && (pat[l] == '/' || pat[l] == '\0')) { base = rpaths[i]; rest = pat + l; }
+        }
+        size_t need = (base ? strlen(base) + strlen(rest) : strlen(pat)) + 1;
+        if (!(out[n] = malloc(need))) break;
+        if (base) snprintf(out[n], need, "%s%s", base, rest);
+        else snprintf(out[n], need, "%s", pat);
+        n++;
+    }
+    free(copy);
+    return n;
+}
+
+/* Trees on no snapshot domain: read live, so pause-read re-reads them. */
+static int is_fallback(const sp_item_desc_t *it)
+{
+    return it->kind == SP_ITEM_TREE && !(it->caps & SP_CAP_SNAPSHOT);
+}
+
+/*
+ * pause-read, pass 1 (container-backup.md section 7): every fallback tree
+ * read live and its content and cache rows stored, no snapshot written, so
+ * the paused pass re-reads only what changed since.
+ */
+static status_t fallback_pass1(store_t *store, cutils_db_t *db, int64_t repo_id,
+                               const unit_backup_opts_t *o, const sp_unit_desc_t *d, const char *key)
+{
+    const char **paths = calloc(d->n_items ? d->n_items : 1, sizeof(*paths));
+    const char **rpaths = calloc(d->n_items ? d->n_items : 1, sizeof(*rpaths));
+    if (!paths || !rpaths) { free(paths); free(rpaths); return set_error(ERR_NOMEM, "unit backup"); }
+    int n = 0;
+    for (size_t i = 0; i < d->n_items; i++) {
+        if (!is_fallback(&d->items[i])) continue;
+        paths[n] = d->items[i].tree_path;
+        rpaths[n] = d->items[i].source && d->items[i].source[0] == '/' ? d->items[i].source : d->items[i].tree_path;
+        n++;
+    }
+    backup_opts_t bo;
+    memset(&bo, 0, sizeof(bo));
+    bo.paths = paths;
+    bo.n_paths = n;
+    bo.read_paths = rpaths;
+    bo.content_only = 1;
+    bo.cancel = o->cancel;
+    bo.store_workers = o->store_workers;
+    bo.file_cache_match = o->file_cache_match;
+    log_info("unit %s: pause-read pass 1 over %d mount(s) on no snapshot domain", key, n);
+    backup_result_t br;
+    memset(&br, 0, sizeof(br));
+    status_t st = backup_run(store, db, repo_id, &bo, &br);
+    backup_result_free(&br);
+    free(paths);
+    free(rpaths);
+    return st;
+}
+
+/* The held roots are stored: the pause goes. */
+static void held_done(void *ctx)
+{
+    uctx_t *u = ctx;
+    int cap = 0;
+    if (!u->ops->release || u->ops->release(u->sess, &cap) != OK) {
+        log_warn("unit %s: releasing the pause: %s; the helper's watchdog will", u->desc->unit_id, err_msg());
+        err_clear();
+        cap = 1;
+    }
+    u->held = 0;
+    u->cap_hit = cap;
+}
+
+/* A unit made ready for begin: locked, described, checked, journalled. */
+typedef struct {
+    char                     key[UNIT_KEY_MAX];
+    sp_unit_desc_t          *d;
+    units_journal_t          jr;
+    sp_holds_t               holds;
+    sp_session_t            *sess;
+    const sp_session_info_t *info;
+} unit_prep_t;
+
+static status_t unit_prepare(cutils_db_t *db, const unit_backup_opts_t *o,
+                             const sp_provider_ops_t *ops, sp_ctx_t *pctx, const listed_t *lu,
+                             unit_backup_one_t *res, unit_prep_t *pp)
+{
+    memset(pp, 0, sizeof(*pp));
+    unit_key_format(pp->key, sizeof(pp->key), ops->name, lu->id);
+    const char *key = pp->key;
     snprintf(res->unit_key, sizeof(res->unit_key), "%s", key);
     snprintf(res->name, sizeof(res->name), "%s", lu->name);
 
@@ -370,35 +619,51 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
         return st;
     }
     if (d->name) snprintf(res->name, sizeof(res->name), "%s", d->name);
+    pp->d = d;
+    pp->jr.db = db;
+    snprintf(pp->jr.provider, sizeof(pp->jr.provider), "%s", ops->name);
+    snprintf(pp->jr.unit_id, sizeof(pp->jr.unit_id), "%s", d->unit_id);
+    pp->jr.job_id = o->job_id;
+    pp->holds = units_journal_holds(&pp->jr);
+    return OK;
+}
 
-    units_journal_t jr;
-    memset(&jr, 0, sizeof(jr));
-    jr.db = db;
-    snprintf(jr.provider, sizeof(jr.provider), "%s", ops->name);
-    snprintf(jr.unit_id, sizeof(jr.unit_id), "%s", d->unit_id);
-    jr.job_id = o->job_id;
-    sp_holds_t holds = units_journal_holds(&jr);
-    sp_begin_req_t req;
-    memset(&req, 0, sizeof(req));
-    req.job_id = o->job_id;
-    req.want = SP_CONSIST_APPLICATION;
-    req.require = o->require;
-    req.freeze_timeout_s = units_config()->freeze_timeout_s;
-    req.pause_max_s = units_config()->max_pause_s;
-    req.cancel = o->cancel;
-    req.holds = &holds;
-    req.daemon8 = units_daemon8();
+/* Undo unit_prepare for a unit that never began. */
+static void unit_unprepare(const sp_provider_ops_t *ops, unit_prep_t *pp)
+{
+    if (pp->d) ops->desc_free(pp->d);
+    pp->d = NULL;
+    units_unlock(pp->key);
+}
 
+static void begin_req(const unit_backup_opts_t *o, sp_holds_t *holds, sp_begin_req_t *req)
+{
+    memset(req, 0, sizeof(*req));
+    req->job_id = o->job_id;
+    req->want = SP_CONSIST_APPLICATION;
+    req->require = o->require;
+    req->freeze_timeout_s = units_config()->freeze_timeout_s;
+    req->pause_max_s = units_config()->max_pause_s;
+    req->cancel = o->cancel;
+    req->holds = holds;
+    req->daemon8 = units_daemon8();
+}
+
+/* After begin: the unit's content from its session, then end and unlock. */
+static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
+                           const unit_backup_opts_t *o, const sp_provider_ops_t *ops,
+                           unit_prep_t *pp, size_t index, size_t total, unit_backup_one_t *res)
+{
+    const char *key = pp->key;
+    sp_unit_desc_t *d = pp->d;
+    status_t st = OK;
     uctx_t u;
     memset(&u, 0, sizeof(u));
     u.ops = ops;
     u.desc = d;
-    st = ops->begin(pctx, d, &req, &u.sess, &u.info);
-    if (st != OK) {
-        ops->desc_free(d);
-        units_unlock(key);
-        return st;
-    }
+    u.sess = pp->sess;
+    u.info = pp->info;
+    u.held = (u.info->consist_flags & SP_CF_PAUSE_HELD) != 0;
     res->achieved = u.info->achieved;
     res->n_warnings = (unsigned)u.info->n_warnings;
     if (u.info->n_warnings) snprintf(res->warning, sizeof(res->warning), "%s", u.info->warnings[0]);
@@ -419,9 +684,15 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
     int have_all = u.parts && syn && synpath && paths && rpaths && rbuf;
     if (!have_all) st = set_error(ERR_NOMEM, "unit backup");
     size_t ns = 0, nt = 0;
-    for (size_t i = 0; have_all && st == OK && i < d->n_items; i++) {
-        const sp_item_desc_t *it = &d->items[i];
-        if (it->kind == SP_ITEM_TREE) {
+    /* Trees first, and under a held pause the fallback ones before the
+     * rest, so the pause covers them alone (backup_opts_t.held_roots). */
+    size_t held_roots = 0;
+    for (int pass = 0; have_all && st == OK && pass < 2; pass++) {
+        for (size_t i = 0; st == OK && i < d->n_items; i++) {
+            const sp_item_desc_t *it = &d->items[i];
+            if (it->kind != SP_ITEM_TREE) continue;
+            int first = u.held && is_fallback(it);
+            if ((pass == 0) != first) continue;
             if (!(rbuf[nt] = malloc(PATH_MAX))) { st = set_error(ERR_NOMEM, "unit backup"); break; }
             st = ops->tree_root(u.sess, it, rbuf[nt], PATH_MAX);
             if (st == OK && rbuf[nt][0] != '/')
@@ -429,8 +700,12 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
             paths[nt] = it->tree_path;
             rpaths[nt] = rbuf[nt];
             nt++;
-            continue;
+            if (first) held_roots++;
         }
+    }
+    for (size_t i = 0; have_all && st == OK && i < d->n_items; i++) {
+        const sp_item_desc_t *it = &d->items[i];
+        if (it->kind == SP_ITEM_TREE) continue;
         size_t n = strlen(it->tree_path) + 2;
         if (!(synpath[ns] = malloc(n))) { st = set_error(ERR_NOMEM, "unit backup"); break; }
         snprintf(synpath[ns], n, "/%s", it->tree_path);
@@ -452,18 +727,31 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     int64_t snap = 0;
+    char *excl[UNIT_EXCLUDE_MAX];
+    size_t n_excl = 0;
     if (st == OK) {
         prog_t pg;
         memset(&pg, 0, sizeof(pg));
         pg.o = o;
         snprintf(pg.prefix, sizeof(pg.prefix), "unit %zu/%zu %s", index + 1, total, res->name);
-        backup_synth_ops_t sops = { part_open, part_close, &u };
+        backup_synth_ops_t sops = { part_open, part_close, &u, part_keep };
         hook_t hk = { &u, repo_id };
         backup_opts_t bo;
         memset(&bo, 0, sizeof(bo));
         bo.paths = paths;
         bo.n_paths = (int)nt;
         bo.read_paths = rpaths;
+        if (u.held && held_roots) {
+            bo.held_roots = (int)held_roots;
+            bo.held_done = held_done;
+            bo.held_ctx = &u;
+        }
+        n_excl = unit_excludes(db, repo_id, key, paths, rpaths, nt, excl);
+        if (n_excl) {
+            bo.exclude = (const char **)(void *)excl;
+            bo.n_exclude = (int)n_excl;
+            log_info("unit %s: %zu enrolled exclusion(s)", key, n_excl);
+        }
         bo.synth = syn;
         bo.n_synth = ns;
         bo.synth_ops = &sops;
@@ -507,6 +795,7 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
         err_clear();
     }
     res->snapshot_id = snap;
+    if (u.cap_hit) res->achieved = SP_CONSIST_INCONSISTENT;
     res->bytes_read = u.bytes_read;
     if (st == OK)
         log_info("unit %s: snapshot %lld, %s, %llu disk bytes read", key, (long long)snap,
@@ -519,6 +808,7 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
     for (size_t i = 0; synpath && i < n_synth; i++) free(synpath[i]);
     free(synpath);
     for (size_t i = 0; rbuf && i < n_trees; i++) free(rbuf[i]);
+    for (size_t i = 0; i < n_excl; i++) free(excl[i]);
     free(rbuf);
     free(paths);
     free(rpaths);
@@ -526,6 +816,28 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
     units_unlock(key);
     if (st != OK) return set_error(st, "%s", why);
     return OK;
+}
+
+static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
+                        const unit_backup_opts_t *o, const sp_provider_ops_t *ops,
+                        sp_ctx_t *pctx, const listed_t *lu, size_t index, size_t total,
+                        unit_backup_one_t *res)
+{
+    unit_prep_t pp;
+    status_t st = unit_prepare(db, o, ops, pctx, lu, res, &pp);
+    if (st != OK) return st;
+    sp_begin_req_t req;
+    begin_req(o, &pp.holds, &req);
+    size_t n_fb = 0;
+    for (size_t i = 0; i < pp.d->n_items; i++) n_fb += is_fallback(&pp.d->items[i]) ? 1u : 0u;
+    req.hold_pause = n_fb > 0 && ops->release && pp.d->state == SP_STATE_RUNNING;
+    if (req.hold_pause && (st = fallback_pass1(store, db, repo_id, o, pp.d, pp.key)) != OK) {
+        unit_unprepare(ops, &pp);
+        return st;
+    }
+    st = ops->begin(pctx, pp.d, &req, &pp.sess, &pp.info);
+    if (st != OK) { unit_unprepare(ops, &pp); return st; }
+    return unit_store(store, db, repo_id, o, ops, &pp, index, total, res);
 }
 
 /* ------------------------------------------------------------------ */
@@ -544,6 +856,90 @@ static unit_backup_one_t *result_add(unit_backup_result_t *r)
     r->units = g;
     memset(&g[r->n], 0, sizeof(g[r->n]));
     return &g[r->n++];
+}
+
+/* A unit's capture group (unit_policy capture.group), "" for none. */
+static void group_of(cutils_db_t *db, int64_t repo_id, const char *key, char *buf, size_t sz)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    buf[0] = '\0';
+    if (db_execute(db, "SELECT value FROM unit_policy WHERE repo_id = ? AND unit_key = ? AND key = 'capture.group'",
+                   (const char *[]){ repo, key, NULL }, &r) == 0 && r && r->nrows == 1)
+        snprintf(buf, sz, "%s", r->rows[0][0]);
+    db_result_free(r);
+}
+
+/* What one unit's attempt leaves in the job's result. */
+static void tally(unit_backup_result_t *out, unit_backup_one_t *r, status_t one,
+                  status_t *first_st, char *first_err, size_t fsz)
+{
+    r->st = one;
+    if (one == OK) { out->ok++; return; }
+    snprintf(r->error, sizeof(r->error), "%.500s", err_msg());
+    log_warn("unit backup: %s: %s", r->unit_key, r->error);
+    err_clear();
+    out->failed++;
+    if (*first_st == OK) {
+        *first_st = one;
+        snprintf(first_err, fsz, "%.150s: %.350s", r->unit_key, r->error);
+    }
+}
+
+/*
+ * Several units in one capture (pause scope group or job, 6.2): each
+ * prepared, then one begin_group, then each read from its own session. A
+ * unit that cannot be prepared fails alone; a begin that fails fails them
+ * all.
+ */
+static void run_group(store_t *store, cutils_db_t *db, int64_t repo_id, const unit_backup_opts_t *o,
+                      const sp_provider_ops_t *ops, sp_ctx_t *pctx, const listed_t *const *lus,
+                      unit_backup_one_t **rs, size_t n, size_t first_index, size_t total,
+                      unit_backup_result_t *out, status_t *first_st, char *first_err, size_t fsz)
+{
+    unit_prep_t *pp = calloc(n, sizeof(*pp));
+    size_t *who = calloc(n, sizeof(*who));
+    const sp_unit_desc_t **descs = calloc(n, sizeof(*descs));
+    sp_session_t **sess = calloc(n, sizeof(*sess));
+    const sp_session_info_t **infos = calloc(n, sizeof(*infos));
+    if (!pp || !who || !descs || !sess || !infos) {
+        set_error(ERR_NOMEM, "unit backup: group");
+        for (size_t k = 0; k < n; k++) tally(out, rs[k], ERR_NOMEM, first_st, first_err, fsz);
+        free(pp); free(who); free(descs); free(sess); free(infos);
+        return;
+    }
+    size_t m = 0;
+    for (size_t k = 0; k < n; k++) {
+        status_t st = unit_prepare(db, o, ops, pctx, lus[k], rs[k], &pp[m]);
+        if (st != OK) { tally(out, rs[k], st, first_st, first_err, fsz); continue; }
+        who[m] = k;
+        descs[m] = pp[m].d;
+        m++;
+    }
+    if (m) {
+        log_info("unit backup: %zu unit(s) in one capture", m);
+        sp_begin_req_t req;
+        begin_req(o, &pp[0].holds, &req);
+        status_t st = ops->begin_group(pctx, descs, m, &req, sess, infos);
+        if (st != OK) {
+            char why[ERR_MSG_MAX];
+            snprintf(why, sizeof(why), "%s", err_msg());
+            for (size_t q = 0; q < m; q++) {
+                unit_unprepare(ops, &pp[q]);
+                set_error(st, "%s", why);
+                tally(out, rs[who[q]], st, first_st, first_err, fsz);
+            }
+        } else {
+            for (size_t q = 0; q < m; q++) {
+                pp[q].sess = sess[q];
+                pp[q].info = infos[q];
+                status_t one = unit_store(store, db, repo_id, o, ops, &pp[q], first_index + who[q], total, rs[who[q]]);
+                tally(out, rs[who[q]], one, first_st, first_err, fsz);
+            }
+        }
+    }
+    free(pp); free(who); free(descs); free(sess); free(infos);
 }
 
 status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -610,7 +1006,44 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
     }
 
-    for (size_t k = 0; st == OK && k < np; k++) {
+    /* Capture groups: everything under job scope, units sharing a
+     * capture.group under group scope; a group of one is a unit. */
+    char (*grp)[64] = calloc(np ? np : 1, sizeof(*grp));
+    int *done = calloc(np ? np : 1, sizeof(*done));
+    if (!grp || !done) st = set_error(ERR_NOMEM, "unit backup");
+    if (st == OK && ops->begin_group && o->pause_scope != UNIT_SCOPE_UNIT) {
+        for (size_t k = 0; k < np; k++) {
+            if (o->pause_scope == UNIT_SCOPE_JOB) { snprintf(grp[k], sizeof(grp[k]), "job"); continue; }
+            char key[UNIT_KEY_MAX];
+            unit_key_format(key, sizeof(key), ops->name, l.v[pick[k]].id);
+            group_of(db, repo_id, key, grp[k], sizeof(grp[k]));
+        }
+    }
+    for (size_t k = 0; st == OK && grp && done && k < np; k++) {
+        if (done[k]) continue;
+        size_t members = 0;
+        for (size_t q = k; grp[k][0] && q < np; q++) members += !done[q] && strcmp(grp[q], grp[k]) == 0;
+        if (members > 1 && !(o->cancel && atomic_load(o->cancel))) {
+            const listed_t **lus = calloc(members, sizeof(*lus));
+            unit_backup_one_t **rs = calloc(members, sizeof(*rs));
+            size_t g = 0;
+            for (size_t q = k; lus && rs && q < np; q++) {
+                if (done[q] || strcmp(grp[q], grp[k]) != 0) continue;
+                unit_backup_one_t *r = result_add(out);
+                if (!r) break;
+                lus[g] = &l.v[pick[q]];
+                rs[g++] = r;
+                done[q] = 1;
+            }
+            /* result_add may move the array: take the pointers afresh. */
+            for (size_t q = 0; rs && q < g; q++) rs[q] = &out->units[out->n - g + q];
+            if (!lus || !rs || g != members) st = set_error(ERR_NOMEM, "unit backup");
+            else run_group(store, db, repo_id, o, ops, pctx, lus, rs, g, k, np, out, &first_st, first_err, sizeof(first_err));
+            free(lus);
+            free(rs);
+            continue;
+        }
+        done[k] = 1;
         unit_backup_one_t *r = result_add(out);
         if (!r) { st = set_error(ERR_NOMEM, "unit backup"); break; }
         if (o->cancel && atomic_load(o->cancel)) {
@@ -622,20 +1055,10 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             continue;
         }
         status_t one = run_one(store, db, repo_id, o, ops, pctx, &l.v[pick[k]], k, np, r);
-        r->st = one;
-        if (one == OK) {
-            out->ok++;
-        } else {
-            snprintf(r->error, sizeof(r->error), "%.500s", err_msg());
-            log_warn("unit backup: %s: %s", r->unit_key, r->error);
-            err_clear();
-            out->failed++;
-            if (first_st == OK) {
-                first_st = one;
-                snprintf(first_err, sizeof(first_err), "%.150s: %.350s", r->unit_key, r->error);
-            }
-        }
+        tally(out, r, one, &first_st, first_err, sizeof(first_err));
     }
+    free(grp);
+    free(done);
     free(pick);
     listing_free(&l);
 

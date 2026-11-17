@@ -72,6 +72,13 @@ void     remote_link_info(remote_link_info_t *out);
 /* Whether ops is a provider behind the helper. */
 int      remote_is_remote(const sp_provider_ops_t *ops);
 
+/* One helper operation on a provider behind the helper (restore.stage,
+ * restore.swap, unit.stop, unit.define), with send_fd passed along (-1:
+ * none). args is consumed; *result (may be NULL) is the caller's. */
+struct cJSON;
+status_t remote_op(const char *provider, const char *op, struct cJSON *args, int send_fd,
+                   struct cJSON **result);
+
 /*
  * When a helper is configured and provider is not usable through it right
  * now (never offered yet, or the link is down), 1 with the reason in why,

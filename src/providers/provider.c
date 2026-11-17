@@ -31,6 +31,7 @@ const char *sp_item_kind_name(sp_item_kind_t k)
     case SP_ITEM_BLOB:  return "blob";
     case SP_ITEM_BLOCK: return "block";
     case SP_ITEM_TREE:  return "tree";
+    case SP_ITEM_STREAM: return "stream";
     }
     return NULL;
 }
@@ -41,6 +42,7 @@ int sp_item_kind_parse(const char *name, sp_item_kind_t *out)
     if (strcmp(name, "blob") == 0)  { *out = SP_ITEM_BLOB;  return 0; }
     if (strcmp(name, "block") == 0) { *out = SP_ITEM_BLOCK; return 0; }
     if (strcmp(name, "tree") == 0)  { *out = SP_ITEM_TREE;  return 0; }
+    if (strcmp(name, "stream") == 0) { *out = SP_ITEM_STREAM; return 0; }
     return -1;
 }
 
