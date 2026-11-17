@@ -795,9 +795,21 @@ GCOVR_FLAGS := $(shell gcovr --help 2>/dev/null | grep -q -- --gcov-suspicious-h
 # Counters from an earlier run are cleared first. gcov adds to whatever .gcda
 # it finds, so a second local run reported the sum of both, and a few runs in
 # the hit counts on parity.c's SIMD loop grew past what gcovr will believe.
+#
+# As root (CI), the suites that leave root still count. The helper suites
+# drop to a fixed non-root uid for good (helper_fixture.h hf_unroot), and
+# gcov writes their counters at exit, as that uid, into .gcda files the
+# root-run suites before them had already created 0644 and root's: every
+# write failed, and helper_server.c, helper_proto.c, helper_policy.c and
+# remote_provider.c read 0% while their suites ran and passed (pipeline
+# 5214: 79.3% against 80%; 86.8% measured as a normal user). So, as root
+# only, the coverage tree's directories take any writer and the suites run
+# under umask 000, which makes the counter files gcov creates 0666.
 coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI) $(FREE_PORT)
 	@find $(COV_DIR) -name '*.gcda' -delete
-	@over=0; \
+	@if [ "$$(id -u)" = 0 ]; then find $(COV_DIR) -type d -exec chmod a+rwx {} +; fi
+	@if [ "$$(id -u)" = 0 ]; then umask 000; fi; \
+	over=0; \
 	run() { n=$$1; shift; \
 	    C_BACKUP_SCRATCH_QUIET=1 $(SCRATCH_GUARD) "$$n" "$$@"; rc=$$?; \
 	    [ $$rc -eq 99 ] && over=1; \
@@ -807,6 +819,7 @@ coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI) $(FREE_PORT)
 	done; \
 	run test_api_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_api_e2e.sh $(COV_DAEMON); \
 	run test_cli_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI); \
+	run test_units_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_units_e2e.sh $(COV_DAEMON) $(COV_CLI); \
 	if [ $$over -ne 0 ]; then echo "coverage: a suite went over its scratch budget" >&2; exit 1; fi
 	@gcovr $(GCOVR_FLAGS) -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="
