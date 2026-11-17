@@ -632,7 +632,7 @@ static void db_close_clean(cutils_db_t *db)
 {
     if (!db) return;
     db_result_t *r = NULL;
-    (void)db_execute(db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, &r);
+    if (db_execute(db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, &r) != 0) err_clear();
     db_result_free(r);
     db_close(db);
 }
