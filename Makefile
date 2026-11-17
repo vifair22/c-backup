@@ -1,5 +1,10 @@
 MAKEFLAGS += -j$(shell nproc)
 
+# A bare `make` builds the programs. The per-build-type flags.stamp rules are
+# defined before `all`, and without this the first of them became the default
+# goal, so `make` (as the Dockerfile runs it) built nothing at all.
+.DEFAULT_GOAL := all
+
 CC      := gcc
 
 # ---- c-utils ----------------------------------------------------------
