@@ -254,7 +254,10 @@ contains "an in-place restore completes" '"state":"completed"' "$OUT"
 check    "the data is back in place" alpha "$(cat "$WORK/pool/app/a/a.txt")"
 check    "the mount root has the snapshot's mode, not the staging's" 751 "$(stat -c %a "$WORK/pool/app/a")"
 check    "and its time" 1500000000 "$(stat -c %Y "$WORK/pool/app/a")"
-check    "no empty staging directory is left in the domain" no "$([ -e "$WORK/pool/.cbackup-restore" ] && echo yes || echo no)"
+# B187: the staging base is the daemon's bind in a deployment, so it stays;
+# what the restore staged in it does not.
+check    "the staging base stays, for the next restore" yes "$([ -d "$WORK/pool/.cbackup-restore" ] && echo yes || echo no)"
+check    "and nothing is left in it" "" "$(ls -A "$WORK/pool/.cbackup-restore" 2>/dev/null)"
 
 echo "a scheduled pause scope"
 # pause_scope used to be dropped from a units schedule's parameters, so a

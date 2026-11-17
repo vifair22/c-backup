@@ -3879,6 +3879,13 @@ c-backup unit restore 1 5120 --define --name immich-test \
 | Definition | re-applied with the same name (and for a VM the same UUID) | the name changed; bind sources, volumes, rootfs and mount entries rewritten under `DIR`; a VM's `<uuid>` removed (libvirt makes a new one), MACs regenerated unless `--keep-macs`, disks pointing at the new images, excluded passthrough disks dropped and listed |
 | Never | a delete: old data is moved aside, never removed | |
 
+**In place, the container gets back the volumes that were restored.** A
+volume's data is swapped in where the volume lives, and the re-created
+container is given that same volume by name, an anonymous one included
+(B188): one named only by the image's `VOLUME` used to come back as a new,
+empty volume, with the restored data left in the old one and the job
+reported completed.
+
 **A copy never touches the original's data.** A restore under a new name
 makes a second container beside the original, and it mounts only what the
 restore wrote under `DIR`: every bind source and every volume, named or
@@ -3932,8 +3939,13 @@ nothing is staged. Restore to a new location then.
 
 **The mount root** comes back with the snapshot's owner, mode, times,
 xattrs and ACLs, like everything below it, not the staging directory's
-`0700`. Once swapped, an emptied `.cbackup-restore` the helper made is
-removed.
+`0700`. The staging base itself (`.cbackup-restore`) is never removed,
+emptied or not (B187): it is the directory the daemon has bound, and
+removing it detached the bind, so the next in-place restore into that
+domain, or the second mount of a unit with two in one domain, failed
+`EROFS`. Only a VM image's per-job staging directory goes once its image
+has moved out, chosen by the identity the helper pinned at stage, never by
+its name.
 
 The job's byte progress covers every mount and disk of the restore: done
 only grows, and the total ends at the whole restore's.
@@ -3950,10 +3962,14 @@ refuses it:
 |---|---|
 | the top of a pool | visible over the network |
 | a share with `shareUseCache="yes"` | the mover would carry staged files to the array mid-restore |
-| another filesystem from the mount (a btrfs subvolume, another dataset) | the swap could not be a rename |
+| another filesystem or mount from the mount (a btrfs subvolume, another dataset, a bind mount between them) | the swap could not be a rename |
 | a path through a symlink | never followed, so the helper cannot be steered outside the share |
 
-Each refusal says what to change. Whether the share is exported over SMB
+Each refusal says what to change, and comes before the unit is stopped
+(B189): the daemon asks the helper to check every mount's staging
+(`restore.stage` with `check`, which creates nothing) first, so a refused
+restore leaves the unit running as it was, with `refused, nothing written`
+in the error. Whether the share is exported over SMB
 or NFS does not matter (FS1's `appdata` is): anyone who can write the share
 can already edit the data in it. The helper creates the directory 0700,
 owned by 990, gives a root-owned one to 990, and uses one anybody else owns
@@ -4011,7 +4027,9 @@ then `docker compose start` once the copy is checked). Replacing a project needs
 its containers stopped; they are renamed aside rather than removed.
 
 **LXC.** In place (`--replace`), the container is stopped, its rootfs and
-each mount entry's source staged and swapped like any mount, and its
+each bind `lxc.mount.entry` source staged in its own snapshot domain (the
+ZFS dataset or btrfs pool holding it, as for a Docker mount, B191) and
+swapped like any mount, and its
 config written back to `<[lxc] path>/<name>/config`, the old config moved
 aside to `config.cbackup-old-<time>`, never deleted.
 
