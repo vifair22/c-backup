@@ -222,6 +222,19 @@ status_t db_txn_make_durable(cutils_db_t *db)
     return OK;
 }
 
+status_t db_txn_exclusive(status_t (*fn)(void *), void *arg)
+{
+    if (!fn) return set_error(ERR_INVALID, "db_txn_exclusive: no function");
+    if (tls_held)
+        return set_error(ERR_BUSY, "db_txn_exclusive: this thread already holds the write lock");
+    uint64_t t0 = phase_now();
+    write_lock();
+    phase_add_nested(phase_current, PHASE_TXN_WAIT, t0);
+    status_t st = fn(arg);
+    write_unlock();
+    return st;
+}
+
 unsigned long db_txn_durable_count(void)
 {
     return atomic_load_explicit(&g_durable, memory_order_relaxed);

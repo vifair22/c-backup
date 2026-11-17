@@ -22,7 +22,11 @@
  *   cache_size           64 MiB of page cache, so a batch's index pages are
  *                        written once rather than read back and rewritten.
  *   wal_autocheckpoint   16,384 pages (64 MiB at 4 KiB) between checkpoints,
- *                        so the two syncs a checkpoint costs are rare.
+ *                        so the two syncs a checkpoint costs are rare. Since
+ *                        SPEED-3 this is the checkpointer thread's threshold
+ *                        (checkpointer.h); the handle itself runs with
+ *                        SQLite's wal_autocheckpoint at 0, so no COMMIT ever
+ *                        checkpoints under the write lock.
  *
  * What NORMAL can lose is bounded here rather than left to the kernel's
  * writeback, which on Linux defaults to 30 seconds: a thread syncs the WAL
@@ -39,7 +43,7 @@
 typedef struct {
     const char *synchronous;      /* "normal" or "full" */
     int         cache_mb;         /* page cache, MiB */
-    int         wal_autocheckpoint; /* pages between automatic checkpoints */
+    int         wal_autocheckpoint; /* uncopied pages that start a checkpoint */
 } state_db_tuning_t;
 
 /* The shipped defaults, as the config keys default them. */
@@ -54,7 +58,9 @@ typedef struct {
 #define STATE_DB_AUTOCKPT_MAX       1048576
 
 /*
- * Apply the settings to the handle and read each one back. A value SQLite
+ * Apply the settings to the handle and read each one back. The handle gets
+ * wal_autocheckpoint 0 and a journal_size_limit of the checkpointer's cap;
+ * the caller starts the checkpointer with t->wal_autocheckpoint. A value SQLite
  * did not take is an error naming it, rather than a daemon that believes it
  * runs on settings it does not: the commonest bug in this codebase is a key
  * that is accepted and not honoured.
