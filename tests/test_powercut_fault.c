@@ -67,6 +67,7 @@
 
 #include "backup.h"
 #include "db_txn.h"
+#include "fake_provider.h"
 #include "fault_inject.h"
 #include "gc.h"
 #include "index_reconcile.h"
@@ -74,6 +75,7 @@
 #include "pack.h"
 #include "prune.h"
 #include "reindex.h"
+#include "registry.h"
 #include "replicate.h"
 #include "repo.h"
 #include "repo_key.h"
@@ -81,6 +83,8 @@
 #include "store.h"
 #include "store_index.h"
 #include "types.h"
+#include "unit_backup.h"
+#include "unit_state.h"
 #include "test_tmp.h"
 
 #define H_DIR    TEST_TMP "/c_backup_test_powercut"
@@ -604,7 +608,87 @@ typedef struct scenario {
     status_t  (*op)(ctx_t *c, int counting);
     int         source;      /* the operation reads a second repository */
     int         no_target;   /* the operation writes the repository without opening it */
+    /* A unit backup through the fake provider: the units layer is set up
+     * in the operation's world and at the start, every snapshot is a unit
+     * snapshot checked item by item, and after the checks one more session
+     * has to store and restore the unit as it is (unit_check_next). */
+    int         units;
 } scenario_t;
+
+/* ---- units --------------------------------------------------------- */
+
+/*
+ * One fake unit, u1, as a version shows it: a disk whose data runs move
+ * with the version, a config blob naming it, and a tree item over the
+ * source directory, so its files compare as a file backup's do. The fake
+ * provider is in memory and outlives a cut, as a hypervisor outlives the
+ * daemon's host losing power.
+ */
+#define UNIT_DISK  ((uint64_t)2 * 1024 * 1024)
+
+static void    set_source(int ver);
+static int64_t g_repo_id;
+
+static sp_ctx_t *g_fk;
+static int       g_units;        /* the scenario's world has units */
+static int       g_unit_ver;     /* what u1 shows now */
+static int64_t   g_unit_job = 1000;
+
+static void unit_runs(int ver, fake_run_t runs[3])
+{
+    runs[0] = (fake_run_t){ 0, 256 * 1024, FAKE_RUN_DATA, 31 };
+    runs[1] = (fake_run_t){ 512 * 1024, 300 * 1024, FAKE_RUN_DATA, (uint64_t)(40 + ver) };
+    runs[2] = (fake_run_t){ 1024 * 1024, 64 * 1024, FAKE_RUN_FILL, (uint64_t)(0x10 + ver) };
+}
+
+static void unit_blob(int ver, char *out, size_t n)
+{
+    snprintf(out, n, "<domain>u1 version %d</domain>", ver);
+}
+
+static void define_unit(int ver)
+{
+    fake_run_t runs[3];
+    unit_runs(ver, runs);
+    char blob[64];
+    unit_blob(ver, blob, sizeof(blob));
+    set_source(ver);
+    assert_int_equal(fake_unit_add(g_fk, "u1", "cbk-pc-unit", SP_STATE_RUNNING,
+                                   SP_CAP_QUIESCE | SP_CAP_SNAPSHOT), OK);
+    assert_int_equal(fake_blob_add(g_fk, "u1", "domain.xml", ".cbackup-unit/config/domain.xml",
+                                   blob, strlen(blob)), OK);
+    assert_int_equal(fake_disk_add(g_fk, "u1", "vda", UNIT_DISK, runs, 3, FAKE_ALLOC_EXACT), OK);
+    assert_int_equal(fake_tree_add(g_fk, "u1", "vol:data", H_SRC, H_SRC), OK);
+    g_unit_ver = ver;
+}
+
+static void units_up(cutils_db_t *db)
+{
+    units_config_t uc = { "", 2, 10, 30, 1 };
+    assert_int_equal(units_init(db, H_DIR, &uc), OK);
+}
+
+static status_t unit_backup_once(store_t *st, cutils_db_t *db, int64_t *out_snap)
+{
+    const char *names[] = { "cbk-pc-unit" };
+    unit_backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.provider = "fake";
+    o.units = names;
+    o.n_units = 1;
+    o.require = SP_CONSIST_INCONSISTENT;
+    o.job_id = ++g_unit_job;
+    o.store_workers = 1;
+    unit_backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    status_t s = unit_backup_run(st, db, g_repo_id, &o, &res);
+    if (out_snap) *out_snap = res.n ? res.units[0].snapshot_id : 0;
+    if (s == OK && (res.n != 1 || res.units[0].st != OK))
+        s = set_error(ERR_IO, "unit backup: %s", res.n ? res.units[0].error : "no unit");
+    unit_backup_result_free(&res);
+    return s;
+}
+
 
 /* What the pristine state promises, set by each build. */
 static int64_t  g_repo_id, g_srepo_id;
@@ -645,6 +729,10 @@ static void ctx_open(ctx_t *c, const scenario_t *s)
         assert_int_equal(repo_store_open(H_REPO, NULL, &c->store), OK);
         assert_int_equal(store_index_bind(c->store, c->db, g_repo_id, &c->idx), OK);
     }
+    if (g_units) {
+        units_up(c->db);
+        define_unit(g_unit_ver);
+    }
     if (s && s->source) {
         assert_int_equal(db_open(&c->sdb, H_SDB), 0);
         assert_int_equal(repo_store_open(H_SREPO, NULL, &c->sstore), OK);
@@ -654,6 +742,7 @@ static void ctx_open(ctx_t *c, const scenario_t *s)
 
 static void ctx_close(ctx_t *c, int clean)
 {
+    if (g_units && c->db) units_shutdown();
     if (c->idx) store_index_free(c->idx);
     if (c->store) store_close(c->store);
     if (c->sidx) store_index_free(c->sidx);
@@ -1114,6 +1203,38 @@ static void compare_trees(const char *want, const char *got)
                                 ngot, nwant);
 }
 
+/* A unit snapshot's disk and config, as restored into H_OUT, against the
+ * version it was taken of. */
+static void check_unit_items(int id, int ver)
+{
+    fake_run_t runs[3];
+    unit_runs(ver, runs);
+    unsigned char *want = calloc(1, (size_t)UNIT_DISK);
+    unsigned char *got = malloc((size_t)UNIT_DISK + 1);
+    assert_non_null(want);
+    assert_non_null(got);
+    for (int i = 0; i < 3; i++)
+        for (uint64_t o = 0; o < runs[i].len; o++)
+            want[runs[i].off + o] = runs[i].kind == FAKE_RUN_DATA
+                ? fake_byte(runs[i].seed, runs[i].off + o) : (unsigned char)(runs[i].seed & 0xff);
+    FILE *f = fopen(H_OUT "/.cbackup-unit/disks/vda", "rb");
+    size_t n = 0;
+    if (f) { n = fread(got, 1, (size_t)UNIT_DISK + 1, f); fclose(f); }
+    if (!f) violation("unit snapshot %d restored no disk", id);
+    else if (n != UNIT_DISK || memcmp(got, want, (size_t)UNIT_DISK) != 0)
+        violation("unit snapshot %d: its disk differs from version %d", id, ver);
+    free(want);
+    free(got);
+
+    char blob[64], buf[128];
+    unit_blob(ver, blob, sizeof(blob));
+    f = fopen(H_OUT "/.cbackup-unit/config/domain.xml", "rb");
+    n = 0;
+    if (f) { n = fread(buf, 1, sizeof(buf), f); fclose(f); }
+    if (n != strlen(blob) || memcmp(buf, blob, n) != 0)
+        violation("unit snapshot %d: its config is not version %d's", id, ver);
+}
+
 static void check_restores(store_t *st, cutils_db_t *db)
 {
     int listed[MAX_SNAPS];
@@ -1135,6 +1256,7 @@ static void check_restores(store_t *st, cutils_db_t *db)
         snprintf(want, sizeof(want), H_VER "/%d", g_ver_of[id]);
         snprintf(got, sizeof(got), H_OUT "%s", H_SRC);
         compare_trees(want, got);
+        if (g_units) check_unit_items(id, g_ver_of[id]);
     }
 }
 
@@ -1153,6 +1275,11 @@ static void start_and_check(void)
         violation("fix_absent: %s", err_msg());
     if (prune_finish_pending(db, 0, NULL) != OK)
         violation("prune_finish_pending: %s", err_msg());
+    if (g_units) {
+        units_up(db);
+        units_sweep_result_t sw;
+        if (units_sweep(db, 0, &sw) != OK) violation("units sweep: %s", err_msg());
+    }
     submitted_t sub = { .n = 0 };
     reconcile_result_t rr;
     if (index_reconcile(db, submit_inline, &sub, &rr) != OK)
@@ -1188,6 +1315,43 @@ static void start_and_check(void)
     check_no_stray_packs(db, H_REPO "/packs");
     check_snapshots(db);
     check_restores(st, db);
+
+    if (g_units) {
+        /* The session after the outage: whatever the cut left, the unit as
+         * it is now has to be stored whole, by whatever the index and the
+         * units layer still believe. A base the cut erased must not be
+         * read against. */
+        fake_stats_t fs;
+        fake_stats(g_fk, &fs);
+        if (fs.holds_now != 0) violation("%u hold(s) still taken after the start", fs.holds_now);
+        int64_t next = 0;
+        if (unit_backup_once(st, db, &next) != OK || next <= 0 || next >= MAX_SNAPS) {
+            violation("the first unit session after the start fails: %s", err_msg());
+        } else {
+            /* A cut that took the operation's snapshot whole hands its id
+             * to this session; what the id meant before comes back after. */
+            int was = g_ver_of[next];
+            g_ver_of[next] = g_unit_ver;
+            rm_tree(H_OUT);
+            assert_int_equal(__real_mkdir(H_OUT, 0700), 0);
+            restore_opts_t o;
+            memset(&o, 0, sizeof(o));
+            o.overwrite = 1;
+            restore_result_t rres;
+            memset(&rres, 0, sizeof(rres));
+            if (restore_run(st, db, g_repo_id, next, H_OUT, &o, &rres) != OK) {
+                violation("the session after the start does not restore: %s", err_msg());
+            } else {
+                char want[PATH_MAX], got[PATH_MAX];
+                snprintf(want, sizeof(want), H_VER "/%d", g_unit_ver);
+                snprintf(got, sizeof(got), H_OUT "%s", H_SRC);
+                compare_trees(want, got);
+                check_unit_items((int)next, g_unit_ver);
+            }
+            g_ver_of[next] = was;
+        }
+        units_shutdown();
+    }
 
     store_index_free(idx);
     store_close(st);
@@ -1279,6 +1443,7 @@ static double now_s(void)
 static void every_cut(const scenario_t *s)
 {
     g_scenario = s->name;
+    g_units = s->units;
     double t0 = now_s();
     ctx_t c;
     s->build(&c);
@@ -1304,6 +1469,7 @@ static void every_cut(const scenario_t *s)
            s->name, total, t.count[K_FS], t.count[K_SCRATCH], t.count[K_COMMIT],
            t.count[K_DURABLE], t.trials, t.checks, now_s() - t1, t1 - t0);
     (void)skipped;
+    g_units = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1623,19 +1789,72 @@ static status_t op_reindex(ctx_t *c, int counting)
     return st;
 }
 
+/* unit backup, first: u1's first session into an empty repository. */
+static void build_unit_first(ctx_t *c)
+{
+    begin_build(c);
+    open_target(c);
+    units_up(c->db);
+    define_unit(1);
+    g_ver_of[1] = 1;
+    end_build(c);
+}
+
+static status_t op_unit_session(ctx_t *c, int counting, int64_t want)
+{
+    int64_t snap = 0;
+    store_index_set_pack_batch_rows(2);
+    status_t st = unit_backup_once(c->store, c->db, &snap);
+    store_index_set_pack_batch_rows(0);
+    if (counting && st == OK) assert_int_equal(snap, want);
+    return st;
+}
+
+static status_t op_unit_first(ctx_t *c, int counting)
+{
+    return op_unit_session(c, counting, 1);
+}
+
+/* unit backup, second: u1 changed - disk, config and files - since its
+ * first session. */
+static void build_unit_second(ctx_t *c)
+{
+    begin_build(c);
+    open_target(c);
+    units_up(c->db);
+    define_unit(1);
+    int64_t s1 = 0;
+    if (unit_backup_once(c->store, c->db, &s1) != OK) fail_msg("unit backup: %s", err_msg());
+    assert_int_equal(s1, 1);
+    g_ver_of[1] = 1;
+    g_required[1] = 1;
+    g_ver_of[2] = 2;
+    g_unit_ver = 2;
+    end_build(c);
+}
+
+static status_t op_unit_second(ctx_t *c, int counting)
+{
+    return op_unit_session(c, counting, 2);
+}
+
 static const scenario_t S_BACKUP_FIRST = { "backup, first", build_backup_first,
-                                           op_backup_first, 0, 0 };
+                                           op_backup_first, 0, 0, 0 };
 static const scenario_t S_BACKUP_INCR  = { "backup, incremental", build_backup_incr,
-                                           op_backup_incr, 0, 0 };
+                                           op_backup_incr, 0, 0, 0 };
 static const scenario_t S_REPLICATE    = { "replicate-in", build_replicate, op_replicate,
-                                           1, 1 };
-static const scenario_t S_GC           = { "gc", build_gc, op_gc, 0, 0 };
-static const scenario_t S_COALESCE     = { "coalesce", build_coalesce, op_coalesce, 0, 0 };
-static const scenario_t S_SALVAGE      = { "salvage", build_salvage, op_salvage, 0, 0 };
+                                           1, 1, 0 };
+static const scenario_t S_GC           = { "gc", build_gc, op_gc, 0, 0, 0 };
+static const scenario_t S_COALESCE     = { "coalesce", build_coalesce, op_coalesce, 0, 0, 0 };
+static const scenario_t S_SALVAGE      = { "salvage", build_salvage, op_salvage, 0, 0, 0 };
 static const scenario_t S_REPOINT      = { "OWN-22 repoint", build_repoint, op_repoint,
-                                           0, 0 };
-static const scenario_t S_PRUNE        = { "prune", build_prune, op_prune, 0, 0 };
-static const scenario_t S_REINDEX      = { "reindex", build_reindex, op_reindex, 0, 0 };
+                                           0, 0, 0 };
+static const scenario_t S_PRUNE        = { "prune", build_prune, op_prune, 0, 0, 0 };
+static const scenario_t S_REINDEX      = { "reindex", build_reindex, op_reindex, 0, 0, 0 };
+static const scenario_t S_UNIT_FIRST   = { "unit backup, first", build_unit_first,
+                                           op_unit_first, 0, 0, 1 };
+static const scenario_t S_UNIT_SECOND  = { "unit backup, second", build_unit_second,
+                                           op_unit_second, 0, 0, 1 };
 
 static void test_backup_first(void **state)  { (void)state; every_cut(&S_BACKUP_FIRST); }
 static void test_backup_incr(void **state)   { (void)state; every_cut(&S_BACKUP_INCR); }
@@ -1646,6 +1865,8 @@ static void test_salvage(void **state)       { (void)state; every_cut(&S_SALVAGE
 static void test_repoint(void **state)       { (void)state; every_cut(&S_REPOINT); }
 static void test_prune(void **state)         { (void)state; every_cut(&S_PRUNE); }
 static void test_reindex(void **state)       { (void)state; every_cut(&S_REINDEX); }
+static void test_unit_first(void **state)    { (void)state; every_cut(&S_UNIT_FIRST); }
+static void test_unit_second(void **state)   { (void)state; every_cut(&S_UNIT_SECOND); }
 
 /* ------------------------------------------------------------------ */
 /* Snapshot records (prune), by the order of its steps                 */
@@ -1772,6 +1993,9 @@ static int group_setup(void **state)
     rm_tree(H_KEEP);
     if (__real_mkdir(H_KEEP, 0700) != 0) return -1;
     repo_key_dir_set(H_KEYS);
+    sp_config_t pc = { NULL, "0badf00d" };
+    if (sp_registry_enable(&fake_provider_ops, &pc) != OK ||
+        sp_registry_get("fake", NULL, &g_fk) != OK) return -1;
     fault_sync_hook = hook_nosync;
     make_versions();
     return 0;
@@ -1781,6 +2005,7 @@ static int group_teardown(void **state)
 {
     (void)state;
     model_off();
+    sp_registry_shutdown();
     if (!getenv("PC_KEEP")) {
         rm_tree(H_DIR);
         rm_tree(H_KEEP);
@@ -1809,6 +2034,8 @@ int main(void)
         cmocka_unit_test(test_repoint),
         cmocka_unit_test(test_prune),
         cmocka_unit_test(test_reindex),
+        cmocka_unit_test(test_unit_first),
+        cmocka_unit_test(test_unit_second),
         cmocka_unit_test(test_prune_unlinks_the_record_after_the_commit_is_durable),
         cmocka_unit_test(test_start_finishes_an_interrupted_prune),
         cmocka_unit_test(test_reindex_finishes_an_interrupted_prune),
