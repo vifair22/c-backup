@@ -307,6 +307,16 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
                             int out_fd, uint64_t *out_size);
 
 /*
+ * The same, and *out_write_failed (may be NULL) set to 1 when the failure
+ * was a write to out_fd rather than a read of the repository. A full
+ * destination is the destination's fault, and a restore that said
+ * "object could not be read" sent the operator to a repository that was
+ * fine (B182).
+ */
+status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                               int out_fd, uint64_t *out_size, int *out_write_failed);
+
+/*
  * Hand the content to emit() in order, holes as zeroes, in pieces of at most
  * one chunk. For readers that consume a stream (grep, an HTTP body). A
  * non-OK return from emit stops the walk and is returned.

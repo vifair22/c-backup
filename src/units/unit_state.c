@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "unit_state.h"
+#include "snap_record.h"
 #include "db_txn.h"
 #include "registry.h"
 #include "db_write.h"
@@ -73,11 +74,16 @@ static status_t write_id_file(const char *path, const char *id)
         unlink(tmp);
         return set_error_errno(ERR_IO, "daemon id: write %s", tmp);
     }
-    close(fd);
+    if (close(fd) != 0) {
+        unlink(tmp);
+        return set_error_errno(ERR_IO, "daemon id: close %s", tmp);
+    }
     if (rename(tmp, path) != 0) {
         unlink(tmp);
         return set_error_errno(ERR_IO, "daemon id: rename to %s", path);
     }
+    if (snapshot_fsync_parent(path) != 0)
+        return set_error_errno(ERR_IO, "daemon id: sync the directory of %s", path);
     return OK;
 }
 

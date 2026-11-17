@@ -3,6 +3,7 @@
 #include "unit_define.h"
 #include "remote_provider.h"
 #include "unit_restore.h"
+#include "snap_record.h"
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
@@ -355,6 +356,10 @@ static status_t restore_file(store_t *store, cutils_db_t *db, int64_t repo_id, i
     status_t st = restore_run(store, db, repo_id, snap_id, tmp, &ro, &rr);
     if (st == OK && rr.files == 0 && rr.dirs == 0) st = set_error(ERR_NOT_FOUND, "unit restore: %s is not in the snapshot", rel);
     if (st == OK && rename(at, dest) != 0) st = set_error_errno(ERR_IO, "unit restore: moving %s into place", rel);
+    /* The restore synced the file; the move out of tmp is durable once the
+     * directory it landed in is. */
+    if (st == OK && snapshot_fsync_parent(dest) != 0)
+        st = set_error_errno(ERR_IO, "unit restore: sync the directory of %s", dest);
     /* Empty directories of the path inside tmp, deepest first. */
     for (char *p2 = strrchr(at, '/'); p2 && p2 > at + strlen(tmp); p2 = strrchr(at, '/')) {
         *p2 = '\0';
