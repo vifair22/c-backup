@@ -299,9 +299,14 @@ contains "the test image has a digest from the local registry" "$REG/cbk-uat/bb@
 # Content, mode, size, owner and link target of every entry, and a hash of
 # every regular file. mtimes are left out: a restore puts them back, but the
 # pre hook rewrites a marker and the comparison is about bytes.
+# A directory's size is the filesystem's own bookkeeping (btrfs counts name
+# bytes, ext4 and overlay a block), not something a restore carries, and the
+# restore lands on a different filesystem from the btrfs source. It is
+# blanked; every other entry's size is compared.
 manifest() {
     local d="$1"
-    ( cd "$d" && find . -mindepth 1 -printf '%P\t%y\t%m\t%U:%G\t%s\t%l\n' | sort &&
+    ( cd "$d" && find . -mindepth 1 -printf '%P\t%y\t%m\t%U:%G\t%s\t%l\n' |
+          awk -F'\t' -v OFS='\t' '$2 == "d" { $5 = "-" } 1' | sort &&
       find . -type f -print0 | sort -z | xargs -0 -r sha256sum ) 2>/dev/null
 }
 
