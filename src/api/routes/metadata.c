@@ -47,12 +47,17 @@ static api_response_t finalise(cutils_json_resp_t *resp)
 /* ---------- tags ---------- */
 
 /*
- * Mirror the repository's tags into its directory, inside the caller's
- * transaction. A failure here fails the request: a tag that exists only in
- * the database is exactly the unprotected-after-recovery state this file
- * was added to close, and saying ok over it would hide that.
+ * Write the repository's tag file as it will be once chg commits, before
+ * the transaction that commits it, and outside it (repo_tags.h, B144). A
+ * failure here fails the request: a tag that exists only in the database
+ * is exactly the unprotected-after-recovery state this file was added to
+ * close, and saying ok over it would hide that. The caller holds
+ * repo_tags_lock.
+ *
+ * *path receives the repository path, for tags_unwind.
  */
-static int tags_mirror(int64_t repo_id, char *err, size_t errsz)
+static int tags_mirror(int64_t repo_id, const repo_tag_change_t *chg,
+                       char *path, size_t pathsz, char *err, size_t errsz)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -63,14 +68,31 @@ static int tags_mirror(int64_t repo_id, char *err, size_t errsz)
         snprintf(err, errsz, "cannot find the repository's path");
         return -1;
     }
-    status_t st = repo_tags_save(g_db, repo_id, r->rows[0][0]);
+    snprintf(path, pathsz, "%s", r->rows[0][0]);
     db_result_free(r);
-    if (st != OK) {
+    if (repo_tags_save_with(g_db, repo_id, path, chg) != OK) {
         snprintf(err, errsz, "cannot record tags in the repository: %s", err_msg());
         err_clear();
         return -1;
     }
     return 0;
+}
+
+/*
+ * The change was written to the repository and then did not commit: put
+ * the file back to what the database says. Best effort. Left as it is, the
+ * file holds a set tag the database lacks (a reconcile would restore it,
+ * which is the edit the client was told failed) or lacks a tag the database
+ * holds (protection a later recovery would not bring back), and either is
+ * repaired by the next tag edit's rewrite.
+ */
+static void tags_unwind(int64_t repo_id, const char *path)
+{
+    if (repo_tags_save(g_db, repo_id, path) != OK) {
+        log_warn("tags: repository %lld's tag file may not match the index until the "
+                 "next tag change: %s", (long long)repo_id, err_msg());
+        err_clear();
+    }
 }
 
 api_response_t metadata_tags_get(const api_request_t *req, int64_t repo_id)
@@ -209,15 +231,18 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
      * Setting the same snapshot again succeeds, so a retried request is
      * harmless.
      *
-     * The check and the write share a transaction so a concurrent set cannot
-     * land between them and be overwritten unseen.
+     * Every tag writer holds repo_tags_lock from the check to its commit,
+     * so a concurrent set cannot land between them and be overwritten
+     * unseen. The check is outside the transaction, as is the repository
+     * write that follows it: neither holds the write lock that a running
+     * backup's batches queue on (B144).
      */
-    if (db_txn_begin(g_db) != OK) return api_error(500, "cannot begin");
+    repo_tags_lock();
     db_result_t *r = NULL;
     if (db_execute(g_db, "SELECT snap_id FROM tags WHERE repo_id = ? AND name = ?",
                    (const char *[]){ repo, name, NULL }, &r) != 0) {
         db_result_free(r);
-        db_txn_rollback(g_db);
+        repo_tags_unlock();
         return api_error(500, "cannot read tags");
     }
     if (r && r->nrows == 1 && strcmp(r->rows[0][0], sid) != 0 && !move) {
@@ -227,25 +252,40 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
                  " \"move\":true (tag set --move from the CLI)",
                  name, r->rows[0][0]);
         db_result_free(r);
-        db_txn_rollback(g_db);
+        repo_tags_unlock();
         return api_error(409, msg);
     }
     db_result_free(r);
 
+    char merr[ERR_MSG_MAX + 64], path[PATH_MAX];
+    repo_tag_change_t chg = { .name = name, .snap_id = sid,
+                              .created_at = (int64_t)strtoll(now, NULL, 10) };
+    if (tags_mirror(repo_id, &chg, path, sizeof(path), merr, sizeof(merr)) != 0) {
+        repo_tags_unlock();
+        return api_error(500, merr);
+    }
+
+    if (db_txn_begin(g_db) != OK) {
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
+        return api_error(500, "cannot begin");
+    }
     if (db_execute_non_query(g_db,
             "INSERT INTO tags (repo_id, name, snap_id, created_at)"
             " VALUES (?, ?, ?, ?)"
             " ON CONFLICT(repo_id, name) DO UPDATE SET snap_id = excluded.snap_id",
             (const char *[]){ repo, name, sid, now, NULL }, NULL) != 0) {
         db_txn_rollback(g_db);
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
         return api_error(500, "cannot set tag");
     }
-    char merr[ERR_MSG_MAX + 64];
-    if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
-        db_txn_rollback(g_db);
-        return api_error(500, merr);
+    if (db_txn_commit(g_db) != OK) {
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
+        return api_error(500, "cannot commit tag");
     }
-    if (db_txn_commit(g_db) != OK) return api_error(500, "cannot commit tag");
+    repo_tags_unlock();
 
     char *out = strdup("{\"ok\":true}");
     return out ? api_ok(out) : api_error(500, "out of memory");
@@ -258,26 +298,45 @@ api_response_t metadata_tags_delete(const api_request_t *req, int64_t repo_id,
     if (!name || !name[0]) return api_error(400, "tag name required");
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    /* As metadata_tags_post: under repo_tags_lock, the repository's file
+     * first and outside the write lock, then the commit (B144). */
+    repo_tags_lock();
+    db_result_t *r = NULL;
+    int found = db_execute(g_db, "SELECT 1 FROM tags WHERE repo_id = ? AND name = ?",
+                           (const char *[]){ repo, name, NULL }, &r) == 0;
+    int exists = found && r && r->nrows == 1;
+    db_result_free(r);
+    if (!found) { repo_tags_unlock(); return api_error(500, "cannot read tags"); }
+    /* A typo used to succeed silently, which reads as "removed" to anybody
+     * checking the exit code, while the tag it meant stayed in place. */
+    if (!exists) { repo_tags_unlock(); return api_error(404, "no such tag"); }
+
+    char merr[ERR_MSG_MAX + 64], path[PATH_MAX];
+    repo_tag_change_t chg = { .name = name, .remove = 1 };
+    if (tags_mirror(repo_id, &chg, path, sizeof(path), merr, sizeof(merr)) != 0) {
+        repo_tags_unlock();
+        return api_error(500, merr);
+    }
     int affected = 0;
-    if (db_txn_begin(g_db) != OK) return api_error(500, "cannot begin");
+    if (db_txn_begin(g_db) != OK) {
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
+        return api_error(500, "cannot begin");
+    }
     if (db_execute_non_query(g_db,
             "DELETE FROM tags WHERE repo_id = ? AND name = ?",
             (const char *[]){ repo, name, NULL }, &affected) != 0) {
         db_txn_rollback(g_db);
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
         return api_error(500, "cannot delete tag");
     }
-    /* A typo used to succeed silently, which reads as "removed" to anybody
-     * checking the exit code, while the tag it meant stayed in place. */
-    if (affected == 0) {
-        db_txn_rollback(g_db);
-        return api_error(404, "no such tag");
+    if (db_txn_commit(g_db) != OK) {
+        tags_unwind(repo_id, path);
+        repo_tags_unlock();
+        return api_error(500, "cannot commit");
     }
-    char merr[ERR_MSG_MAX + 64];
-    if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
-        db_txn_rollback(g_db);
-        return api_error(500, merr);
-    }
-    if (db_txn_commit(g_db) != OK) return api_error(500, "cannot commit");
+    repo_tags_unlock();
 
     /* A body, not a 204: the CLI's contract is one JSON document per
      * command, and an empty success printed nothing at all (B095). */

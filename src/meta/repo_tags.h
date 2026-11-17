@@ -33,11 +33,43 @@
 #define REPO_TAGS_FILE "tags"
 
 /*
- * Rewrite <repo_path>/tags from the database's tags for repo_id. Meant to be
- * called inside the transaction that changed them, so the file and the rows
- * cannot disagree about a change the caller was told succeeded.
+ * Rewrite <repo_path>/tags from the database's tags for repo_id, and sync
+ * the file and the repository directory.
+ *
+ * Never call this inside a db_txn transaction: the two syncs would hold the
+ * one write lock every other writer, a running backup's batches included,
+ * queues on. On a busy pool that was seconds per tag edit, and every writer
+ * waited out each one (B144). The repository's file is the copy that
+ * survives losing the database, so it goes first and the commit after,
+ * the safe direction for anything reconcile can rebuild from the
+ * repository: repo_tags_save_with writes the file as it will be once the
+ * change commits, and the caller commits afterwards.
+ *
+ * Every caller holds repo_tags_lock from reading the rows through its own
+ * commit (if it has one), so two writers cannot each write a file that
+ * misses the other's change. Lock order: repo_tags_lock, then db_txn.
  */
+void repo_tags_lock(void);
+void repo_tags_unlock(void);
+
 status_t repo_tags_save(cutils_db_t *db, int64_t repo_id, const char *repo_path);
+
+/*
+ * One tag change not yet committed: name set on snap_id (a decimal string),
+ * or name removed. created_at applies only to a name that is new; an
+ * existing tag keeps its own, as the upsert does.
+ */
+typedef struct {
+    const char *name;
+    const char *snap_id;
+    int64_t     created_at;
+    int         remove;
+} repo_tag_change_t;
+
+/* repo_tags_save, with chg applied over the database's rows. NULL chg is
+ * plain repo_tags_save. */
+status_t repo_tags_save_with(cutils_db_t *db, int64_t repo_id, const char *repo_path,
+                             const repo_tag_change_t *chg);
 
 /*
  * Insert the file's tags into the database, for snapshots whose id and
