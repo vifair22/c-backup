@@ -756,7 +756,8 @@ static void test_watchdog_bounds_pause(void **state)
 {
     (void)state;
     units_shutdown();
-    units_config_t uc = { "", 2, 10, 1, 1 };
+    units_config_t uc = { .allow = "", .unit_wait_s = 2, .freeze_timeout_s = 10, .max_pause_s = 1,
+                          .trust_zero = 1 };
     assert_int_equal(units_init(db, TEST_DIR, &uc), OK);
     assert_int_equal(fake_unit_add(fk, "u3", "cbk-uat-three", SP_STATE_RUNNING, SP_CAP_PAUSE), OK);
     assert_int_equal(fake_blob_add(fk, "u3", "cfg", ".cbackup-unit/config/app.conf",
