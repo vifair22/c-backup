@@ -385,7 +385,7 @@ are different: they live in the database and change through the policy API
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
 | `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. Files of 1 MiB or less are read and prepared, many to a batch, on up to four of them. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
-| `index.missing_brake_pct` | `5` | Missing packs, as a percentage of a repository's, above which none is marked lost without `repo repair --accept-missing` (section 17.6). 0 to 100 |
+| `index.missing_brake_pct` | `5` | Missing packs, as a percentage of a repository's, above which none is marked lost without `repo repair --accept-missing`; counts only from two missing (section 17.6). 0 to 100 |
 | `index.missing_brake_packs` | `10` | Missing packs above which none is marked lost without `repo repair --accept-missing` (section 17.6). 0 to 1000000 |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
 | `retention.keep_daily` | `7` | Daily snapshots kept |
@@ -2243,7 +2243,7 @@ Two things are never taken for missing packs:
   into it is refused. Only a pack file that does not exist (`ENOENT`) in a
   readable `packs/` counts as missing; any other error leaves its pack as
   it is.
-- **A mass disappearance.** More missing packs than
+- **A mass disappearance.** Two or more missing packs that are more than
   `index.missing_brake_pct` percent of the repository's (default 5), or more
   than `index.missing_brake_packs` of them (default 10), looks far more like
   a wrong path, a half-mounted share or a mistake than real loss. Nothing is
@@ -2260,8 +2260,9 @@ Two things are never taken for missing packs:
 
   which marks their objects absent as above and takes backups again.
 
-On a small repository one missing pack is already more than 5% of its
-packs, so a single loss there goes through the repair too.
+A single missing pack never trips the percentage, however small the
+repository: one pack out of one heals on its own, with its alert, while
+two out of three go through the repair.
 
 ## 18. Capacity planning and performance
 

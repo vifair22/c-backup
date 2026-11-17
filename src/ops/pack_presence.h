@@ -26,9 +26,11 @@
  *     repository is reported unavailable. Only ENOENT for a pack file in a
  *     readable packs/ counts; EIO, EACCES and the rest leave the row alone.
  *   - A mass disappearance. More missing packs than the brake allows
- *     (pack_presence_set_brake: by default more than 5% of the packs, or
- *     more than 10) is a wrong path, a half-mounted share or an operator
- *     error far more often than real loss. Nothing is marked; the
+ *     (pack_presence_set_brake: by default two or more that are more than
+ *     5% of the packs, or more than 10) is a wrong path, a half-mounted
+ *     share or an operator error far more often than real loss. A lone
+ *     missing pack never trips the percentage, however small the
+ *     repository. Nothing is marked; the
  *     repository is degraded instead, which refuses backups into it, an
  *     alert says so, and only an explicit repair with accept_missing marks
  *     the objects absent.
@@ -54,9 +56,10 @@ typedef struct {
     uint64_t objects_absent;    /* objects marked absent by this call */
 } pack_presence_t;
 
-/* The brake: more than pct percent of the packs missing, or more than
- * packs of them, and nothing is marked without accept_missing. Defaults 5
- * and 10 (index.missing_brake_pct, index.missing_brake_packs). */
+/* The brake: two or more missing that are more than pct percent of the
+ * packs, or more than packs of them, and nothing is marked without
+ * accept_missing. Defaults 5 and 10 (index.missing_brake_pct,
+ * index.missing_brake_packs). */
 void pack_presence_set_brake(unsigned pct, unsigned packs);
 
 /*

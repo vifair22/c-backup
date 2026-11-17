@@ -193,7 +193,11 @@ status_t pack_presence_check(cutils_db_t *db, int64_t repo_id, int accept_missin
     }
 
     unsigned pct = atomic_load(&g_brake_pct), cap = atomic_load(&g_brake_packs);
-    int brake = (uint64_t)res.packs_missing * 100u > (uint64_t)pct * total ||
+    /* The percentage only counts from two missing packs: on a small
+     * repository one pack is already more than 5%, and a lone missing pack
+     * is the ordinary loss this exists to heal, not a mount gone wrong. */
+    int brake = (res.packs_missing >= 2 &&
+                 (uint64_t)res.packs_missing * 100u > (uint64_t)pct * total) ||
                 res.packs_missing > cap;
     if (brake && !accept_missing) {
         char why[256], msg[PATH_MAX + 1024];
@@ -205,7 +209,7 @@ status_t pack_presence_check(cutils_db_t *db, int64_t repo_id, int accept_missin
         res.degraded = st == OK;
         if (st == OK && !was) {
             snprintf(msg, sizeof(msg),
-                     "repo %lld (%s): %s, more than the brake allows (%u%% or %u packs); "
+                     "repo %lld (%s): %s, more than the brake allows (over %u%% of them, from two, or over %u); "
                      "nothing was marked absent and backups into it are refused, as this "
                      "looks like a wrong path or a half-mounted share. If the packs really "
                      "are gone, run 'c-backup repo repair %lld --accept-missing'",

@@ -144,7 +144,7 @@ static const config_key_t app_file_keys[] = {
      * nothing is marked absent until an operator's repair accepts it. */
     { "index.missing_brake_pct", CFG_INT, "5",
       "Missing packs, as a percentage of a repository's, above which none is marked "
-      "absent without 'repo repair --accept-missing' (0 to 100)",
+      "absent without 'repo repair --accept-missing'; counts from two missing (0 to 100)",
       CFG_STORE_FILE, 0 },
     { "index.missing_brake_packs", CFG_INT, "10",
       "Missing packs above which none is marked absent without 'repo repair "

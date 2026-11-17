@@ -19,7 +19,8 @@
  *               row is in another: it keeps resolving
  *   brake       more missing than the brake allows: nothing marked, the
  *               repository degraded and backups refused, until a repair
- *               accepts the loss; the thresholds as set, at their edges
+ *               accepts the loss; the thresholds as set, at their edges,
+ *               and a lone missing pack healing whatever its share
  */
 
 #include <setjmp.h>
@@ -380,7 +381,8 @@ static void test_brake_degrades_until_repaired(void **state)
     (void)state;
     int64_t ids[3];
     three_packs(ids);
-    remove_pack(pack_of("c"));       /* 1 of 3: over 5% */
+    remove_pack(pack_of("c"));
+    remove_pack(pack_of("b"));       /* 2 of 3: two, and over 5% */
     uint64_t alerts = pack_presence_alerts();
     pack_presence_t pp;
     assert_int_equal(pack_presence_check(db, repo_id, 0, &pp), OK);
@@ -391,7 +393,7 @@ static void test_brake_degrades_until_repaired(void **state)
     assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ? AND location = 'absent'"), 0);
     char why[256] = "";
     assert_true(pack_presence_degraded(db, repo_id, why, sizeof(why)));
-    assert_non_null(strstr(why, "1 of 3 packs missing"));
+    assert_non_null(strstr(why, "2 of 3 packs missing"));
 
     /* Backups are refused, and a second check does not alert again. */
     assert_int_equal(backup(NULL), ERR_INVALID);
@@ -401,14 +403,37 @@ static void test_brake_degrades_until_repaired(void **state)
 
     /* The repair accepts the loss; the next backup stores b again. */
     assert_int_equal(pack_presence_check(db, repo_id, 1, &pp), OK);
-    assert_int_equal(pp.packs_dropped, 1);
+    assert_int_equal(pp.packs_dropped, 2);
     assert_false(pp.degraded);
     assert_false(pack_presence_degraded(db, repo_id, NULL, 0));
     int64_t s4 = backup_ok();
     assert_restores(s4);
     assert_restores(ids[2]);
+    /* The second snapshot's own trees went with its pack; verify names
+     * exactly what stayed lost. */
+    long long gone = scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ? AND location = 'absent'");
+    verify_result_t v = verify();
+    assert_int_equal(v.missing, (uint64_t)gone);
+}
+
+/* The floor: a lone missing pack heals on its own, whatever share of the
+ * repository it is - here all of it, the UAT's case. */
+static void test_a_lone_missing_pack_heals(void **state)
+{
+    (void)state;
+    write_file("a", 1, 40000);
+    int64_t s1 = backup_ok();
+    assert_int_equal(scalar("SELECT COUNT(*) FROM packs WHERE repo_id = ?"), 1);
+    remove_pack(pack_of("a"));        /* 1 of 1 */
+    uint64_t alerts = pack_presence_alerts();
+    int64_t s2 = backup_ok();
+    assert_int_equal(pack_presence_alerts(), alerts + 1);
+    assert_false(pack_presence_degraded(db, repo_id, NULL, 0));
+    assert_restores(s2);
+    assert_restores(s1);
     verify_result_t v = verify();
     assert_int_equal(v.missing, 0);
+    assert_int_equal(v.ok, v.checked);
 }
 
 /* A remount: every pack back, and the degraded state goes on its own. */
@@ -417,14 +442,18 @@ static void test_degraded_clears_when_the_packs_return(void **state)
     (void)state;
     int64_t ids[3];
     three_packs(ids);
-    char p[512], away[600];
+    char p[512], q[512], away[600], away2[600];
     pack_path(pack_of("b"), p, sizeof(p));
+    pack_path(pack_of("c"), q, sizeof(q));
     snprintf(away, sizeof(away), TEST_DIR "/away.dat");
+    snprintf(away2, sizeof(away2), TEST_DIR "/away2.dat");
     assert_int_equal(rename(p, away), 0);
+    assert_int_equal(rename(q, away2), 0);
     pack_presence_t pp;
     assert_int_equal(pack_presence_check(db, repo_id, 0, &pp), OK);
     assert_true(pp.degraded);
     assert_int_equal(rename(away, p), 0);
+    assert_int_equal(rename(away2, q), 0);
     assert_int_equal(pack_presence_check(db, repo_id, 0, &pp), OK);
     assert_false(pp.degraded);
     backup_ok();
@@ -482,6 +511,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_another_copy_still_resolves, setup, teardown),
         cmocka_unit_test_setup_teardown(test_brake_degrades_until_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_degraded_clears_when_the_packs_return, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_lone_missing_pack_heals, setup, teardown),
         cmocka_unit_test_setup_teardown(test_brake_thresholds, setup, teardown),
         cmocka_unit_test_setup_teardown(test_brake_count_threshold, setup, teardown),
     };
