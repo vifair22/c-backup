@@ -240,7 +240,10 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
                  (unsigned long long)n_files, (unsigned long long)n_snaps);
     else if (n_files == 0)
         log_error("verify: %s %s (no file names it directly: a tree, a chunk or a "
-                  "chunk list; the list pass names the files a lost chunk belongs to)",
+                  "chunk list; the list pass names the files a lost chunk belongs to. "
+                  "A lost tree does not stop a restore, which reads the index; a "
+                  "reindex after a lost database would need it, and the next backup "
+                  "of the unchanged directory stores it again)",
                   status, hex);
     else
         log_error("verify: %s %s affects %llu file(s) in %llu snapshot(s): %s",
@@ -257,10 +260,14 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
  * and distinct snapshots across the whole run are the numbers that mean
  * something, and the findings rows already name every lost hash.
  *
- * A lost tree is loss too (B150: a missing pack takes its snapshot's trees
- * with it). No file names a tree, so a directory's tree counts its
- * directory, and a root tree its snapshot; nothing beneath either can be
- * restored, which the count of snapshots is what says.
+ * Files, not trees (NIT-36). A lost tree is a finding and is loss - a
+ * reindex after a lost database, or faulting an evicted snapshot back in,
+ * needs it - but a restore reads the index's node rows, not the trees, and
+ * restores every file beneath it exactly while those rows are resident.
+ * Counting a lost tree's directory here, as this once did, made the run say
+ * "affecting 2 file(s)" over findings that each said 0. So the total is
+ * over the same thing the findings count, content a node names: the run's
+ * total and its findings agree, and the tree findings say what they are.
  */
 static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
                              uint64_t *out_files, uint64_t *out_snaps)
@@ -280,9 +287,6 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
             " up(snap, parent, path, depth) AS ("
             "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
             "    FROM lost JOIN nodes n ON n.repo_id = ?1 AND n.content_hash = lost.h"
-            "  UNION ALL"
-            "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
-            "    FROM lost JOIN nodes n ON n.repo_id = ?1 AND n.subtree_hash = lost.h"
             /* Contentless file entries are loss too, with no hash to join
              * on; they are seeded only when this run recorded them. */
             "  UNION ALL"
@@ -293,9 +297,7 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
             VERIFY_CONTENTLESS_STATUS "')"
             VERIFY_PATH_WALK
             " SELECT COUNT(DISTINCT path),"
-            "  (SELECT COUNT(*) FROM (SELECT snap FROM up WHERE COALESCE(up.parent, 0) = 0"
-            "   UNION SELECT id FROM snapshots WHERE repo_id = ?1"
-            "     AND root_tree_hash IN (SELECT h FROM lost)))"
+            "  (SELECT COUNT(DISTINCT snap) FROM up WHERE COALESCE(up.parent, 0) = 0)"
             VERIFY_ROOTED,
             (const char *[]){ repo, run, NULL }, &r) == 0 && r && r->nrows == 1) {
         *out_files = strtoull(r->rows[0][0], NULL, 10);

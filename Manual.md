@@ -1476,7 +1476,11 @@ how many versions of them across snapshots (`affected_versions`), up to
 three full paths, and up to ten snapshot ids beside the exact count
 (`affected_snapshot_count`, with `snapshots_truncated` set when the list is
 short). The run's `affected_files` and `affected_snapshots` are distinct
-paths and snapshots across every lost object. The CLI prints the run and its
+paths and snapshots across every lost object, counted the same way, so the
+run and its findings agree. A lost tree names no file: its finding shows 0,
+and it adds nothing to the run's totals, because a restore reads the
+index's record of the snapshot rather than its trees and still restores
+every file beneath it (section 17.6). The CLI prints the run and its
 findings as one JSON document.
 
 Every level also checks the index for regular files that name no content
@@ -2250,11 +2254,20 @@ repo 1 (/srv/backup/main): pack-0000000000.dat is missing; its 297 object(s) are
 ```
 
 Until a backup has stored them again, `c-backup verify <id>` reports
-exactly those objects missing, with the files and snapshots they affect. A
-snapshot whose own trees were in the missing pack stays unrestorable unless
-a later backup of the same unchanged source makes those trees again; the
-objects a newer backup did store again make every older snapshot that
-names them restorable once more.
+exactly those objects missing, with the files and snapshots they affect;
+the run's totals count the same files its findings do. The objects a newer
+backup did store again make every older snapshot that names them
+restorable once more.
+
+A snapshot whose own trees were in the missing pack still restores, and
+exactly: a restore reads the index's record of the snapshot, not its trees.
+verify reports those trees missing, as findings that name no file, and the
+run's file and snapshot totals do not count them. They matter when the
+index has to be rebuilt from the repository - a lost database
+(section 17.1), a reindex - because that reads the trees; a snapshot whose
+trees are gone then cannot be indexed again. The next backup of the same
+unchanged directories stores the same trees again, since a tree's name is
+its content.
 
 A dropped pack keeps its number. Pack numbers are never issued twice: the
 repository records the next free one in `pack-ids` (docs/repo-format.md),

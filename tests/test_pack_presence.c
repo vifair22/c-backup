@@ -265,6 +265,12 @@ static void test_missing_pack_is_stored_again(void **state)
  * backup of a changed source makes again: that loss stays, and verify
  * names exactly the objects still absent, while the newest snapshot and
  * everything its source still has are whole.
+ *
+ * And that snapshot still restores, exactly: a restore reads the index's
+ * nodes, not the trees (NIT-36). So the loss is trees alone, which no file
+ * names, and the run's totals say what its findings say: no file, no
+ * snapshot. They used to say "affecting 2 file(s)" over findings that each
+ * said 0.
  */
 static void test_an_older_snapshots_loss_is_reported(void **state)
 {
@@ -276,11 +282,26 @@ static void test_an_older_snapshots_loss_is_reported(void **state)
     int64_t s4 = backup_ok();
     assert_restores(s4);
     assert_restores(ids[2]);
+    {   /* its trees are gone; its files are not */
+        sh("rm -rf '%s'; mkdir '%s'", TEST_OUT);
+        restore_opts_t ro;
+        memset(&ro, 0, sizeof(ro));
+        restore_result_t rr;
+        memset(&rr, 0, sizeof(rr));
+        if (restore_run(store, db, repo_id, ids[1], TEST_OUT, &ro, &rr) != OK)
+            fail_msg("snapshot %lld does not restore: %s", (long long)ids[1], err_msg());
+    }
     long long gone = scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ? AND location = 'absent'");
     assert_true(gone > 0);
     verify_result_t v = verify();
     assert_int_equal(v.missing, (uint64_t)gone);
-    assert_true(v.affected_snapshots >= 1);
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "SELECT COALESCE(SUM(affected_files), 0) FROM verify_findings WHERE run_id = %lld",
+             (long long)v.run_id);
+    assert_int_equal(scalar(sql), 0);
+    assert_int_equal(v.affected_files, 0);
+    assert_int_equal(v.affected_snapshots, 0);
 }
 
 /* The backup does the check itself, before its dedup. */
