@@ -259,6 +259,48 @@ static void test_clean_repo_verifies_clean(void **state)
     assert_true(res.bytes_read > 0);
 }
 
+typedef struct {
+    char     phase[32];
+    uint64_t done, total;
+    int      calls;
+} last_progress_t;
+
+static void record_progress(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    last_progress_t *lp = ctx;
+    snprintf(lp->phase, sizeof(lp->phase), "%s", phase);
+    lp->done = done;
+    lp->total = total;
+    lp->calls++;
+}
+
+/*
+ * A finished run's last progress report is N of N at every level. The
+ * object walk reported each object before checking it, so an index verify,
+ * which has no later phase, ended every job at N-1 of N (NIT-33).
+ */
+static void test_progress_ends_at_total(void **state)
+{
+    (void)state;
+    run_backup();
+    const verify_level_t levels[3] = { VERIFY_LEVEL_INDEX, VERIFY_LEVEL_STRUCTURE,
+                                       VERIFY_LEVEL_DEEP };
+    for (int l = 0; l < 3; l++) {
+        last_progress_t lp;
+        memset(&lp, 0, sizeof(lp));
+        verify_result_t res;
+        assert_int_equal(verify_run(store, db, repo_id, levels[l], 0, NULL,
+                                    record_progress, &lp, &res), OK);
+        assert_true(lp.calls > 0);
+        assert_true(lp.total > 0);
+        assert_int_equal(lp.done, lp.total);
+        if (levels[l] == VERIFY_LEVEL_INDEX) {
+            assert_string_equal(lp.phase, "index");
+            assert_int_equal(lp.total, res.checked);
+        }
+    }
+}
+
 /*
  * The point of the whole feature: damage that nothing has read yet is found,
  * corrected from parity, and the correction is written to disk.
@@ -1741,6 +1783,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_clean_repo_verifies_clean, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_progress_ends_at_total, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deep_verify_repairs_payload_damage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_without_repair_leaves_disk_untouched, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unrecoverable_damage_names_the_affected_files, setup, teardown),

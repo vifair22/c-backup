@@ -1258,6 +1258,11 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     db_result_free(objs);
 
+    /* The loop reports each object before checking it, so its last report
+     * is total - 1: an index verify, which has no later phase, ended every
+     * job one short (NIT-33, as restore once did). Say the walk finished. */
+    if (st == OK && progress) progress(level_name(level), total, total, progress_ctx);
+
     /* Before the lists, which ask what was lost. A cancelled walk reports
      * what it held back as it found it, without the search. */
     if (st == OK)
