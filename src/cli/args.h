@@ -49,6 +49,10 @@ typedef enum {
      * check read the same string, so they cannot disagree. Read with
      * args_value. */
     ARG_CHOICE,
+    /* One value, exactly once: an option the command cannot do without,
+     * shown in the usage line without brackets so it does not read as
+     * optional. Read with args_value. */
+    ARG_REQUIRED,
 } arg_kind_t;
 
 typedef struct {

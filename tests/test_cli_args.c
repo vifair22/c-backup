@@ -374,6 +374,37 @@ static void test_choice(void **state)
     done(r);
 }
 
+/* An option the command needs is shown without brackets, and refused
+ * when absent; usage showed [--provider P] for commands that need it. */
+static const arg_opt_t REQ_OPTS[] = {
+    { "--provider", NULL, ARG_REQUIRED, "P" },
+    { "--all",      NULL, ARG_FLAG, NULL },
+    { NULL, NULL, ARG_FLAG, NULL },
+};
+static const arg_spec_t REQ = { "unit backup", POS_VAR, REQ_OPTS, NULL };
+
+static void test_required_option(void **state)
+{
+    (void)state;
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *out = open_memstream(&buf, &len);
+    args_usage(&REQ, out);
+    fclose(out);
+    assert_string_equal(buf, "unit backup <repo-id> [path...] --provider P [--all]");
+    free(buf);
+    run_t *r = run(&REQ, "1", "--all", NULL);
+    refused(r, "--provider is required", "usage: c-backup unit backup <repo-id> [path...] --provider P");
+    done(r);
+    r = run(&REQ, "1", "--provider=fake", NULL);
+    assert_int_equal(r->rc, 0);
+    assert_string_equal(args_value(&r->a, "--provider"), "fake");
+    done(r);
+    r = run(&REQ, "1", "--provider", "a", "--provider", "b", NULL);
+    refused(r, "given more than once", "usage: c-backup unit backup");
+    done(r);
+}
+
 static void cal_ok(const char *every, const char *at, const char *on,
                    const char *day, const char *month)
 {
@@ -468,6 +499,7 @@ int main(void)
         cmocka_unit_test(test_usage_line),
         cmocka_unit_test(test_pos_bounds),
         cmocka_unit_test(test_choice),
+        cmocka_unit_test(test_required_option),
         cmocka_unit_test(test_calendar_check),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
