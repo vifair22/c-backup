@@ -169,11 +169,12 @@ int snapshot_write_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
-int snapshot_fsync_dir(const char *path)
+int snapshot_fsync_dir(const char *repo_root, const char *path)
 {
     int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd == -1) return -1;
-    int rc = sync_latch_fsync(fd, path);
+    int rc = repo_root ? sync_latch_repo_fsync(repo_root, fd, path)
+                       : sync_latch_fsync(fd, path);
     int err = errno;
     close(fd);
     errno = err;

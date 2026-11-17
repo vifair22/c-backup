@@ -65,11 +65,11 @@ static int write_all(int fd, const char *buf, size_t n)
     return 0;
 }
 
-static int fsync_dir(const char *path)
+static int fsync_dir(const char *repo_root, const char *path)
 {
     int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd == -1) return -1;
-    int rc = sync_latch_fsync(fd, path);
+    int rc = sync_latch_repo_fsync(repo_root, fd, path);
     int err = errno;
     close(fd);
     errno = err;
@@ -169,12 +169,12 @@ status_t pack_ids_write(const char *repo_root, const char *uuid, int64_t next)
     if (fd == -1) return set_error_errno(ERR_IO, "pack-ids: mkstemp in %s/tmp", repo_root);
     status_t st = OK;
     if (write_all(fd, body, (size_t)n) != 0) st = set_error_errno(ERR_IO, "pack-ids: write");
-    if (st == OK && sync_latch_fsync(fd, tmp) != 0) st = set_error_errno(ERR_IO, "pack-ids: fsync");
+    if (st == OK && sync_latch_repo_fsync(repo_root, fd, tmp) != 0) st = set_error_errno(ERR_IO, "pack-ids: fsync");
     if (close(fd) != 0 && st == OK) st = set_error_errno(ERR_IO, "pack-ids: close");
     if (st == OK && rename(tmp, final) != 0)
         st = set_error_errno(ERR_IO, "pack-ids: rename into %s", repo_root);
     if (st != OK) { unlink(tmp); return st; }
-    if (fsync_dir(repo_root) != 0)
+    if (fsync_dir(repo_root, repo_root) != 0)
         return set_error_errno(ERR_IO, "pack-ids: sync %s", repo_root);
     return OK;
 }

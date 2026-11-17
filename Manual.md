@@ -2061,8 +2061,8 @@ daemon as a whole.
 
 | Route | Meaning |
 |---|---|
-| `/healthz` | The process answers; says `storage_sync: failed` after a failed sync (section 17.7) |
-| `/readyz` | The database is open, no storage sync has failed; the daemon can do work |
+| `/healthz` | The process answers; says `storage_sync: failed` after a failed sync of `state.db`, and counts repositories whose own syncs failed (section 17.7) |
+| `/readyz` | The database is open and its syncs have not failed; the daemon can do work. 200 with `"status":"degraded"` and a list when only repositories' syncs have failed (section 17.7) |
 
 Both are public, on the socket and on TCP.
 
@@ -2099,7 +2099,8 @@ the repository).
 | `cbackup_alerts_sent_total` | counter | Push notifications Pushover accepted |
 | `cbackup_alerts_failed_total` | counter | Push notifications given up on: rejected by Pushover (bad token or user key), or expired after 24 hours of failed retries |
 | `cbackup_alerts_pending` | gauge | Push notifications queued and not yet sent |
-| `cbackup_storage_sync_failed` | gauge | 1 once a sync of `state.db` or a repository has failed, until a restart (section 17.7) |
+| `cbackup_storage_sync_failed` | gauge | 1 once a sync of `state.db` or the key directory has failed, until a restart (section 17.7) |
+| `cbackup_repos_sync_failed` | gauge | Repositories whose own syncs failed and which refuse backups, gc and prune until repaired or restarted; which ones is in `/readyz` and `repo show` (section 17.7) |
 | `cbackup_storage_sync_failed_timestamp_seconds` | gauge | Unix time of that first failure; 0 when none |
 | `cbackup_vm_bitmap_audit_failures_total` | counter | Audit reads that found a VM disk changed outside its dirty bitmap (section 6.5) |
 | `cbackup_vm_resync_bytes_total` | counter | Bytes incremental VM reads re-read past the changed ranges to bring the chunker back in step |
@@ -2525,38 +2526,65 @@ of one is every pack, and that is an unavailable repository, above.
 
 ### 17.7 A sync to disk fails
 
-When the kernel reports that a sync failed - an `fsync` or `fdatasync` of
-`state.db`'s write-ahead log, or of a pack, a snapshot record, the
-`snapshot-ids` or `pack-ids` file, the `.cbackup` marker, a key file, the
-tags file, or a directory one of them was renamed into - c-backupd stops
-promising that anything is on disk until it is restarted. On Linux a failed
+When the kernel reports that a sync failed - an `fsync` or `fdatasync` -
+c-backupd stops promising that what it covered is on disk. On Linux a failed
 sync can mark the unwritten pages clean and report the error once: the next
 sync of the same file succeeds while the bytes the first one covered are
-gone. Carrying on would hand out success for writes that may not exist.
-This is what PostgreSQL does with `data_sync_retry = off`.
+gone, and carrying on would hand out success for writes that may not exist.
+This is what PostgreSQL does with `data_sync_retry = off`. How far it
+reaches depends on where the sync failed, because repositories sit on disks
+of their own and one failing disk must not stop the rest.
 
-From the first failure until a restart:
+**The daemon's own storage** - `state.db`'s write-ahead log or its
+directory (the once-a-second flush, or the sync before a durable API
+answer), or the key directory. Nothing works without it, so the whole
+daemon latches until it is restarted:
 
 - every durable API write (section 6.4) is refused with a `500` saying `a
   previous sync failed (<file>: <error>); restart the daemon to re-read
   from disk`, before anything is committed;
-- a backup fails at its pack seal, and gc and prune refuse to start (a gc
-  already running stops before deleting anything more): nothing is
-  unlinked on the strength of a sync that cannot be trusted. A dry-run gc,
-  verify without repair, browsing and restores still work;
+- every backup fails at its pack seal, and gc and prune refuse;
 - `/readyz` answers 503, `/healthz` reports `storage_sync: failed` with the
-  file and the time, and `cbackup_storage_sync_failed` is 1;
-- one `ERROR` log line and one alert (Pushover, when configured) say which
-  file failed and how.
+  file and the time, and `cbackup_storage_sync_failed` is 1.
+
+**A file in one repository** - a pack, a snapshot record, the
+`snapshot-ids` or `pack-ids` file, the `.cbackup` marker, the tags file, or
+a directory one of them was renamed into. That repository alone latches; its
+state in `repo show` and `repo list` is `sync_failed`, with `sync_failed`
+(the file and the error) and `sync_failed_at`, and until it is cleared:
+
+- a backup into it, or a replication into it, fails, as does its pack seal;
+- gc (except `--dry-run`), compaction and prune refuse, and a gc already
+  running stops before deleting anything more: nothing is unlinked on the
+  strength of a sync that cannot be trusted;
+- its durable API writes (a tag, deleting a snapshot or the repository) are
+  refused with a `500`;
+- every other repository carries on as before. Browsing, restores and a
+  verify of the latched one still work;
+- `/readyz` stays 200 but says `"status":"degraded"` and lists each latched
+  repository with its id, path, error and time. It is not a 503 because
+  what acts on readiness - a container health check, an orchestrator -
+  restarts or routes around the whole daemon: that would stop the healthy
+  repositories' backups, and a restart clears the latch without the check
+  below. `cbackup_repos_sync_failed` counts the latched repositories.
+
+Either kind logs one `ERROR` line and sends one alert (Pushover, when
+configured) naming the file and the error. A restore destination that fails
+to sync fails that restore's files (section 8) and latches nothing.
 
 What to do: find out why the disk failed (`dmesg`, `smartctl`, a full
-filesystem, an NFS server that went away) and fix it, then restart the
-daemon. It reads `state.db` and the repositories back from disk, which is
-the only trustworthy copy. Then run a deep verify of the repository named
-in the error (section 11) and a reindex if it reports anything the index
-claims and the disk does not hold (section 17.1). A restore destination
-that fails to sync fails that restore's files (section 8) and does not
-trip this.
+filesystem, a target that was unplugged) and fix it. Then:
+
+- for `state.db` or the key directory, restart the daemon. It reads
+  everything back from disk, which is the only copy to trust;
+- for a repository, either restart the daemon or run `c-backup repo repair
+  <id>`. Repair drops the repository's files from the page cache, so what
+  follows reads the disk and not what the failed sync left in memory, runs
+  a deep verify that writes nothing, and clears the latch only if the
+  verify finds nothing at all. If it finds damage it says how much and
+  leaves the repository `sync_failed`: run `c-backup verify <id>` (deep and
+  repairing) to fix what parity can, then `repo repair` again. After a
+  restart, run that deep verify yourself before trusting the repository.
 
 ## 18. Capacity planning and performance
 

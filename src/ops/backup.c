@@ -2194,7 +2194,7 @@ static status_t write_snapshot_record(store_t *store, int64_t snap_id,
         return set_error_errno(ERR_IO, "snapshot record: write");
     }
     free(body);
-    if (sync_latch_fsync(fd, tmp) != 0) { close(fd); unlink(tmp); return set_error_errno(ERR_IO, "snapshot record: fsync"); }
+    if (sync_latch_repo_fsync(store_root(store), fd, tmp) != 0) { close(fd); unlink(tmp); return set_error_errno(ERR_IO, "snapshot record: fsync"); }
     if (close(fd) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "snapshot record: close"); }
 
     if (rename(tmp, final) != 0) {
@@ -2205,7 +2205,7 @@ static status_t write_snapshot_record(store_t *store, int64_t snap_id,
      * power cut could lose the record while the database row, committed
      * after this returns, survives - an index naming a snapshot the
      * repository does not have. */
-    if (snapshot_fsync_dir(snap_dir) != 0)
+    if (snapshot_fsync_dir(store_root(store), snap_dir) != 0)
         return set_error_errno(ERR_IO, "snapshot record: sync %s", snap_dir);
     return OK;
 }
@@ -2467,7 +2467,12 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (snapshot_label_check(opts->label) != 0)
         return set_error(ERR_INVALID, "%s", SNAPSHOT_LABEL_RULE);
 
-    status_t st = check_sources(opts);
+    /* A repository whose syncs failed takes no backup until it is
+     * repaired or the daemon restarts (sync_latch.h). Before the scan, as
+     * the label check is. */
+    status_t st = sync_latch_repo_check(store_root(store), "backup");
+    if (st != OK) return st;
+    st = check_sources(opts);
     if (st != OK) return st;
 
     /*

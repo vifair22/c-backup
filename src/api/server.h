@@ -279,11 +279,12 @@ typedef int (*api_after_write_fn)(void *userdata, char *why, size_t why_sz);
 void api_server_set_after_write(api_server_t *srv, api_after_write_fn fn, void *userdata);
 
 /* Asked before a buffered handler for a route of class API_DURABLE runs (a
- * GET never asks). Returns 0 to go ahead, or -1 with the reason in why: the
- * request is answered 500 with it and the handler never runs, so nothing is
- * committed. c-backupd refuses here once a storage sync has failed
- * (sync_latch.h). */
-typedef int (*api_durable_gate_fn)(void *userdata, char *why, size_t why_sz);
+ * GET never asks), with the request's url. Returns 0 to go ahead, or -1
+ * with the reason in why: the request is answered 500 with it and the
+ * handler never runs, so nothing is committed. c-backupd refuses here once
+ * a storage sync has failed, daemon-wide or in the repository the url
+ * names (sync_latch.h). */
+typedef int (*api_durable_gate_fn)(void *userdata, const char *url, char *why, size_t why_sz);
 void api_server_set_durable_gate(api_server_t *srv, api_durable_gate_fn fn, void *userdata);
 
 /* Start serving (non-blocking - runs in background threads via libmicrohttpd).

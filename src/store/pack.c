@@ -158,12 +158,32 @@ static status_t pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
     return OK;
 }
 
+/* The repository a path under packs/ belongs to: everything before its
+ * last "/packs" component. Every path this file syncs is one. */
+static void repo_root_of(const char *path, char *out, size_t sz)
+{
+    snprintf(out, sz, "%s", path);
+    char *cut = NULL;
+    for (char *p = strstr(out, "/packs"); p; p = strstr(p + 1, "/packs"))
+        if (p[6] == '\0' || p[6] == '/') cut = p;
+    if (cut) *cut = '\0';
+}
+
+/* fsync, latching the repository the path is in on a failure that counts
+ * (sync_latch.h). */
+static int latch_fsync_in_repo(int fd, const char *path)
+{
+    char root[PATH_MAX];
+    repo_root_of(path, root, sizeof(root));
+    return sync_latch_repo_fsync(root, fd, path);
+}
+
 /* fsync a directory, so the entries renamed into it survive a power cut.
  * Returns 0 or -1 with errno set. */
 static int fsync_dir_path(const char *path) {
     int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd == -1) return -1;
-    int rc = sync_latch_fsync(fd, path);
+    int rc = latch_fsync_in_repo(fd, path);
     int err = errno;
     close(fd);
     errno = err;
@@ -1095,7 +1115,7 @@ int pack_restore_headers(store_t *store, uint32_t pack_num,
         }
         written++;
     }
-    if (written > 0 && !failed && sync_latch_fsync(fd, path) != 0) {
+    if (written > 0 && !failed && latch_fsync_in_repo(fd, path) != 0) {
         set_error_errno(ERR_IO, "pack-%010u.dat: sync the restored entry headers", pack_num);
         failed = 2;
     }
@@ -1281,7 +1301,7 @@ status_t pack_check_structure(store_t *store, uint32_t pack_num, int repair,
             }
         }
     }
-    if (wrote && st == OK && sync_latch_fsync(fd, path) != 0)
+    if (wrote && st == OK && latch_fsync_in_repo(fd, path) != 0)
         st = set_error_errno(ERR_IO, "pack-%010u.dat: sync", pack_num);
     close(fd);
     if (wrote) pack_cache_invalidate(store);
@@ -2348,7 +2368,7 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
         *out_size = (uint64_t)body_end + tsize;
     }
 
-    if (sync_latch_fsync(fileno(*dat_f), "a staging pack") != 0) { st = set_error_errno(ERR_IO, "pack seal: sync the pack"); goto fail; }
+    if (sync_latch_repo_fsync(store_root(store), fileno(*dat_f), "a staging pack") != 0) { st = set_error_errno(ERR_IO, "pack seal: sync the pack"); goto fail; }
     /* A filesystem that defers write errors (NFS, FUSE) reports them here,
      * and a pack whose close failed is not known to hold its bytes. */
     {
@@ -2465,7 +2485,7 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
 {
     /* A seal ends in a sync whose success a latched daemon cannot trust:
      * refused, and the staging discarded (sync_latch.h). */
-    status_t lst = sync_latch_check("pack seal");
+    status_t lst = sync_latch_repo_check(store_root(store), "pack seal");
     if (lst != OK) { unlink(dat_tmp); return lst; }
     uint64_t dat_size = 0;
     status_t st = seal_pack_file(store, dat_f, dat_hdr, idx_entries,
@@ -4000,7 +4020,7 @@ static status_t write_deleting_marker(store_t *store, uint32_t key,
     int ok = 1;
     for (size_t i = 0; i < n; i++)
         if (fprintf(f, "%u\n", nums[i]) < 0) ok = 0;
-    if (fflush(f) != 0 || sync_latch_fsync(fileno(f), tmp) != 0) ok = 0;
+    if (fflush(f) != 0 || sync_latch_repo_fsync(store_root(store), fileno(f), tmp) != 0) ok = 0;
     if (fclose(f) != 0) ok = 0;
     if (!ok) {
         int err = errno;
@@ -4267,7 +4287,7 @@ static status_t pack_rw_replace(pack_rw_t *rw, const uint32_t *old_nums, size_t 
                                 uint32_t *out_base, size_t *out_n)
 {
     store_t *store = rw->store;
-    status_t st = sync_latch_check("pack rewrite");
+    status_t st = sync_latch_repo_check(store_root(store), "pack rewrite");
     if (st != OK) return st;
     st = pack_rw_seal(rw);
     if (st != OK) return st;
@@ -4336,7 +4356,7 @@ static status_t pack_rw_replace(pack_rw_t *rw, const uint32_t *old_nums, size_t 
      * made durable now, the old packs stay; the next gc finds the
      * duplicates and drops them. */
     st = store_emit_index_sync(store);
-    if (st == OK) st = sync_latch_check("removing compacted packs");
+    if (st == OK) st = sync_latch_repo_check(store_root(store), "removing compacted packs");
     if (st != OK) return st;
     char marker[PATH_MAX];
     st = write_deleting_marker(store, base, old_nums, n_old, marker, sizeof(marker));
@@ -4923,7 +4943,7 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     }
 
     if (failed) set_error_errno(ERR_IO, "pack-%010u.dat: write the correction", found.pack_num);
-    if (fixed > 0 && !failed && sync_latch_fsync(fd, dat_path) != 0) {
+    if (fixed > 0 && !failed && latch_fsync_in_repo(fd, dat_path) != 0) {
         set_error_errno(ERR_IO, "pack-%010u.dat: sync the correction", found.pack_num);
         failed = 1;
     }
@@ -5049,7 +5069,7 @@ status_t pack_gc_stats_loc(store_t *store,
                            size_t refs_cnt,
                            uint32_t *out_kept, uint32_t *out_deleted,
                            pack_gc_stats_t *stats) {
-    status_t lst = sync_latch_check("pack compaction");
+    status_t lst = sync_latch_repo_check(store_root(store), "pack compaction");
     if (lst != OK) return lst;
     gc_live_t live = { store, refs, locs, refs_cnt, 0, 0, 0, 0 };
     pack_gc_stats_t scratch_stats;
@@ -5177,7 +5197,7 @@ status_t pack_gc_stats_loc(store_t *store,
              * durable: rolled back, it would bring back rows naming this
              * pack (B142). If it cannot be made durable, the pack stays.
              * Nor while latched: a sync's success proves nothing then. */
-            if (sync_latch_tripped()) {
+            if (sync_latch_tripped() || sync_latch_repo_tripped(store_root(store))) {
                 total_kept += count;
                 free(live_marks);
                 free(disk_idx);
@@ -5243,12 +5263,12 @@ status_t pack_gc_stats_loc(store_t *store,
 
     /* A sync failed during the pass: whatever was not deleted stays, and
      * the job fails rather than report a compaction it did not finish. */
-    if (sync_latch_tripped()) {
+    if (sync_latch_tripped() || sync_latch_repo_tripped(store_root(store))) {
         if (total_deleted > 0) pack_cache_invalidate(store);
         if (out_kept)    *out_kept    = total_kept;
         if (out_deleted) *out_deleted = total_deleted;
         free(pack_nums);
-        return sync_latch_check("pack compaction");
+        return sync_latch_repo_check(store_root(store), "pack compaction");
     }
 
     status_t coalesce_st = maybe_coalesce_packs(store, &live, stats);

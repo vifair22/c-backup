@@ -518,7 +518,7 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
     if (snapshot_write_all(fd, body, len) != 0)
         st = set_error_errno(ERR_IO, "replica: write snapshot record");
     free(body);
-    if (st == OK && sync_latch_fsync(fd, tmp) != 0)
+    if (st == OK && sync_latch_repo_fsync(c->root, fd, tmp) != 0)
         st = set_error_errno(ERR_IO, "replica: fsync snapshot record");
     if (close(fd) != 0 && st == OK)
         st = set_error_errno(ERR_IO, "replica: close snapshot record");
@@ -537,7 +537,7 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
         int err = errno;
         unlink(tmp);
         if (rc == 0) {
-            if (snapshot_fsync_dir(snap_dir) != 0)
+            if (snapshot_fsync_dir(c->root, snap_dir) != 0)
                 return set_error_errno(ERR_IO, "replica: sync %s", snap_dir);
             return OK;
         }
@@ -555,7 +555,7 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
         return set_error_errno(ERR_IO, "replica: rename snapshot record");
     }
     /* replicate_run counts the snapshot as sent once this returns. */
-    if (snapshot_fsync_dir(snap_dir) != 0)
+    if (snapshot_fsync_dir(c->root, snap_dir) != 0)
         return set_error_errno(ERR_IO, "replica: sync %s", snap_dir);
     return OK;
 }
@@ -672,6 +672,9 @@ status_t replica_sink_local_open(const char *path,
 {
     if (!path || !source_marker || !out)
         return set_error(ERR_INVALID, "replica_sink_local_open: null argument");
+    /* Nothing replicates into a repository whose syncs failed. */
+    status_t lst = sync_latch_repo_check(path, "replication");
+    if (lst != OK) return lst;
 
     local_ctx_t *c = calloc(1, sizeof(*c));
     if (!c) return set_error(ERR_NOMEM, "replica: alloc");
@@ -777,6 +780,8 @@ status_t replica_sink_local_open_reencrypt(const char *path,
 {
     if (!path || !source_marker || !out)
         return set_error(ERR_INVALID, "replica_sink_local_open_reencrypt: null argument");
+    status_t lst = sync_latch_repo_check(path, "replication");
+    if (lst != OK) return lst;
 
     /*
      * The target has to exist already. Its encryption is the whole point of

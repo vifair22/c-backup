@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 
 #include "verify.h"
+#include "sync_latch.h"
 
 #include "chunklist.h"
 #include "read_budget.h"
@@ -13,6 +15,7 @@
 #include <cutils/log.h>
 
 #include <errno.h>
+#include <ftw.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -1414,4 +1417,60 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                          "run verify with repair",
                          (long long)res.run_id, (unsigned long long)res.packs_unwalkable);
     return OK;
+}
+
+/* ---- clearing a repository's sync latch ---- */
+
+/* nftw's callback: every regular file's clean pages out of the cache. A
+ * file that will not open is left to the verify to find. */
+static int drop_pages(const char *path, const struct stat *sb, int flag, struct FTW *ftw)
+{
+    (void)ftw;
+    if (flag != FTW_F || !S_ISREG(sb->st_mode)) return 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return 0;
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+    return 0;
+}
+
+status_t repo_sync_repair(store_t *store, cutils_db_t *db, int64_t repo_id, atomic_int *cancel,
+                          void (*progress)(const char *phase, uint64_t done,
+                                           uint64_t total, void *ctx),
+                          void *progress_ctx, verify_result_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    const char *root = store_root(store);
+    status_t st = sync_latch_check("repair");
+    if (st != OK) return st;
+    if (!sync_latch_repo_tripped(root))
+        return set_error(ERR_INVALID, "repository %s has no failed sync to clear", root);
+
+    /* After a failed sync the cache may hold pages the disk does not: they
+     * were marked clean when the write-back failed. Dropping the clean
+     * pages makes the verify read the disk. */
+    if (nftw(root, drop_pages, 32, FTW_PHYS) != 0)
+        log_warn("repair: could not walk all of %s to drop its cached pages", root);
+    pack_cache_invalidate(store);
+
+    st = verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0, cancel, progress,
+                    progress_ctx, out);
+    if (st == ERR_BUSY) return st;
+    uint64_t found = out->unrecoverable + out->missing + out->recoverable +
+                     out->packs_unwalkable + out->pack_structures_recoverable;
+    if (st == OK && found == 0) {
+        sync_latch_repo_clear(root);
+        log_warn("repair: %s verified clean from disk (%llu checked); its failed sync is "
+                 "cleared and it takes backups again", root, (unsigned long long)out->checked);
+        return OK;
+    }
+    if (found == 0) return st;   /* the verify itself failed; its error stands */
+    return set_error(ERR_CORRUPT, "repair: the deep verify of %s found %llu unrecoverable, "
+                     "%llu missing, %llu recoverable, %llu unwalkable pack(s) and %llu pack "
+                     "structure(s) to fix, so its failed sync is not cleared; run a repairing "
+                     "`c-backup verify` first, then `c-backup repo repair` again",
+                     root, (unsigned long long)out->unrecoverable,
+                     (unsigned long long)out->missing, (unsigned long long)out->recoverable,
+                     (unsigned long long)out->packs_unwalkable,
+                     (unsigned long long)out->pack_structures_recoverable);
 }

@@ -151,14 +151,14 @@ status_t snapshot_ids_write(const char *repo_root, const char *uuid, int64_t las
     status_t st = OK;
     if (snapshot_write_all(fd, body, (size_t)n) != 0)
         st = set_error_errno(ERR_IO, "snapshot-ids: write");
-    if (st == OK && sync_latch_fsync(fd, tmp) != 0)
+    if (st == OK && sync_latch_repo_fsync(repo_root, fd, tmp) != 0)
         st = set_error_errno(ERR_IO, "snapshot-ids: fsync");
     if (close(fd) != 0 && st == OK)
         st = set_error_errno(ERR_IO, "snapshot-ids: close");
     if (st == OK && rename(tmp, final) != 0)
         st = set_error_errno(ERR_IO, "snapshot-ids: rename into %s", repo_root);
     if (st != OK) { unlink(tmp); return st; }
-    if (snapshot_fsync_dir(repo_root) != 0)
+    if (snapshot_fsync_dir(repo_root, repo_root) != 0)
         return set_error_errno(ERR_IO, "snapshot-ids: sync %s", repo_root);
     return OK;
 }

@@ -241,7 +241,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* gc deletes once its commits are durable; a latched daemon's are not
      * known to be (sync_latch.h). A dry run deletes nothing. */
     if (!dry_run) {
-        status_t lst = sync_latch_check("gc");
+        status_t lst = sync_latch_repo_check(store_root(store), "gc");
         if (lst != OK) return lst;
     }
 

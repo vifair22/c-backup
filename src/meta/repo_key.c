@@ -219,7 +219,8 @@ status_t repo_key_save(const char *key_dir, const char *uuid, const repo_key_t *
      * marker naming the key could survive a power cut and the key not,
      * which is the lockout the temp file exists to prevent (B182).
      */
-    if (snapshot_fsync_dir(key_dir) != 0)
+    /* The key directory is the daemon's storage, not a repository's. */
+    if (snapshot_fsync_dir(NULL, key_dir) != 0)
         return set_error_errno(ERR_IO, "cannot sync key directory %s", key_dir);
     return OK;
 }

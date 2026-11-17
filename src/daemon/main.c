@@ -152,8 +152,9 @@ static atomic_int g_alerts_on;
 static void sync_latch_alert(const char *msg)
 {
     char body[1400];
-    snprintf(body, sizeof(body), "A storage sync failed: %s. The daemon refuses durable "
-             "writes, backups, gc and prune until it is restarted.", msg);
+    snprintf(body, sizeof(body), "A storage sync failed: %s. Durable writes, backups, gc "
+             "and prune are refused where it failed (the whole daemon for state.db, one "
+             "repository for its own files) until a restart or `c-backup repo repair`.", msg);
     log_error("alert: c-backupd storage sync failed: %s", msg);
     if (atomic_load(&g_alerts_on) && push_send("c-backupd: storage sync failed", body) != 0)
         log_warn("alert: could not queue the storage sync alert");
@@ -553,7 +554,7 @@ int main(int argc, char *argv[])
     api_server_set_after_write(srv, after_write, db);
     /* Durable writes refused once a storage sync has failed: a later
      * sync's success proves nothing about what the failed one held. */
-    api_server_set_durable_gate(srv, sync_latch_api_gate, NULL);
+    api_server_set_durable_gate(srv, sync_latch_api_gate, db);
 
     if (api_server_start(srv) != 0) {
         log_error("cannot start API server: %s", api_server_error());

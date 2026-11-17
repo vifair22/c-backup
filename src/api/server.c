@@ -569,7 +569,7 @@ static api_response_t run_buffered(api_server_t *srv, const route_entry_t *route
     if (req->method != API_GET && srv->durable_gate_fn &&
         route_class(srv, route, req->url, req->method) == API_DURABLE) {
         char why[1024] = "";
-        if (srv->durable_gate_fn(srv->durable_gate_ud, why, sizeof(why)) != 0)
+        if (srv->durable_gate_fn(srv->durable_gate_ud, req->url, why, sizeof(why)) != 0)
             return api_error(500, why[0] ? why : "durable writes are refused");
     }
     api_response_t resp = route->handler.buffered(req, route->userdata);

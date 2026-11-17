@@ -143,7 +143,7 @@ status_t repo_tags_save_with(cutils_db_t *db, int64_t repo_id, const char *repo_
     if (fchmod(fd, 0600) != 0 ||
         snapshot_write_all(fd, body, len) != 0 || snapshot_write_all(fd, "\n", 1) != 0)
         st = set_error_errno(ERR_IO, "cannot write %s", tmp);
-    else if (sync_latch_fsync(fd, tmp) != 0)
+    else if (sync_latch_repo_fsync(repo_path, fd, tmp) != 0)
         st = set_error_errno(ERR_IO, "cannot flush %s", tmp);
     if (close(fd) != 0 && st == OK)
         st = set_error_errno(ERR_IO, "cannot close %s", tmp);
@@ -161,7 +161,7 @@ status_t repo_tags_save_with(cutils_db_t *db, int64_t repo_id, const char *repo_
      */
     int dfd = open(repo_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dfd < 0) return set_error_errno(ERR_IO, "cannot open %s to sync it", repo_path);
-    if (sync_latch_fsync(dfd, repo_path) != 0) st = set_error_errno(ERR_IO, "cannot sync %s", repo_path);
+    if (sync_latch_repo_fsync(repo_path, dfd, repo_path) != 0) st = set_error_errno(ERR_IO, "cannot sync %s", repo_path);
     close(dfd);
     return st;
 }
