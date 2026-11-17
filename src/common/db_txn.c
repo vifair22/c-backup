@@ -119,6 +119,11 @@ void db_txn_batch_opened(db_txn_batch_t *b)
     b->opened_ns = phase_now();
 }
 
+int db_txn_batch_contended(const db_txn_batch_t *b)
+{
+    return b->contended_until_ns > phase_now();
+}
+
 int db_txn_batch_should_end(db_txn_batch_t *b)
 {
     uint64_t now = phase_now();
