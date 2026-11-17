@@ -155,6 +155,14 @@ if cmp -s "$WORK/vda.raw" "$WORK/out/.cbackup-unit/disks/vda"; then ok "the raw 
 check    "no partial file is left" "no" "$([ -e "$WORK/vda.raw.cbk-partial" ] && echo yes || echo no)"
 OUT=$(cb unit restore 1 1 "$WORK/vda.raw" --item vda 2>&1); RC=$?
 check    "an item never lands on an existing file" 1 "$RC"
+# The directories above a tree item take their recorded modes, as in a
+# whole restore; made on the way under the daemon's 0077 umask they were 0700.
+OUT=$(cb unit restore 1 1 "$WORK/itemvol" --item vol)
+contains "a tree item restore completes" '"state":"completed"' "$OUT"
+check    "the tree item's data is there" alpha "$(cat "$WORK/itemvol$WORK/live/a/a.txt")"
+check    "a directory above it has the mode a whole restore gives it" \
+         "$(stat -c %a "$WORK/out$WORK/live")" "$(stat -c %a "$WORK/itemvol$WORK/live")"
+lacks    "and not the umask's 0700" 700 "$(stat -c %a "$WORK/itemvol$WORK/live")"
 OUT=$(cb unit restore 1 999 "$WORK/nope" 2>&1); RC=$?
 check    "a snapshot that does not exist is refused" 1 "$RC"
 contains "as missing, not as not a unit snapshot" "has no snapshot 999" "$OUT"
