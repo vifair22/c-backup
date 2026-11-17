@@ -616,9 +616,12 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
             return api_error(400, why);
     }
 
-    char due[32];
+    char due[32], created[32];
     time_t now = time(NULL);
-    snprintf(due, sizeof(due), "%lld", (long long)trigger_next_fire(&t, now, 0));
+    snprintf(due, sizeof(due), "%lld", (long long)trigger_next_fire(&t, now, now));
+    /* The interval anchor until the first fire (B155): without it every
+     * daemon start counted a never-fired schedule from that start. */
+    snprintf(created, sizeof(created), "%lld", (long long)now);
 
     /* A NULL in a c-utils params array terminates it rather than binding a
      * NULL column, so an absent params value is bound as an empty string and
@@ -629,12 +632,12 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     db_result_t *r = NULL;
     if (db_execute(g_db,
             "INSERT INTO schedules (repo_id, action, params, trigger_type, trigger_spec,"
-            " on_overlap, catchup, enabled, next_due_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?) RETURNING id",
+            " on_overlap, catchup, enabled, next_due_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?) RETURNING id",
             (const char *[]){ repo, action, params ? params : "",
                               t.type == TRIGGER_INTERVAL ? "interval" : "calendar",
                               spec, overlap ? overlap : "skip",
-                              catchup ? catchup : "skip", due, NULL }, &r) != 0 ||
+                              catchup ? catchup : "skip", due, created, NULL }, &r) != 0 ||
         !r || r->nrows != 1) {
         db_result_free(r);
         return api_error(500, "cannot create schedule");

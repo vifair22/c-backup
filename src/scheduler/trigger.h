@@ -78,7 +78,9 @@ status_t trigger_serialise(const trigger_t *t, char *buf, size_t bufsz);
 /*
  * When should this fire next, strictly after `after`?
  *
- * `last_fired` anchors interval triggers and is ignored by calendar ones. A
+ * `last_fired` anchors interval triggers and is ignored by calendar ones; 0
+ * counts from `after`. The scheduler passes the schedule's creation time for
+ * one that has never fired (B155), never 0, so a restart cannot re-anchor it. A
  * return of 0 means the trigger can never fire again, which no current
  * trigger type produces but callers should not assume away.
  */
