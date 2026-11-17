@@ -35,6 +35,15 @@ static atomic_uint     g_waiting;
 /* Completed make_durable calls, for tests. */
 static atomic_ulong    g_durable;
 
+static status_t (*volatile g_durable_gate)(void);
+static void     (*volatile g_durable_done)(void);
+
+void db_txn_set_durable_hooks(status_t (*gate)(void), void (*done)(void))
+{
+    g_durable_gate = gate;
+    g_durable_done = done;
+}
+
 /*
  * Whether this thread holds the lock. A second begin on the holding thread
  * would queue behind its own ticket and never return; with this it fails
@@ -137,6 +146,8 @@ status_t db_txn_make_durable(cutils_db_t *db)
     if (tls_held)
         return set_error(ERR_BUSY, "db_txn_make_durable: this thread holds the write "
                                    "lock (a checkpoint cannot run inside a transaction)");
+    status_t (*gate)(void) = g_durable_gate;
+    if (gate && gate() != OK) return ERR_IO;
     uint64_t t0 = phase_now();
     write_lock();
     db_result_t *r = NULL;
@@ -148,6 +159,8 @@ status_t db_txn_make_durable(cutils_db_t *db)
              strcmp(r->rows[0][0], "0") == 0;
     db_result_free(r);
     phase_add_commit(phase_current, t0);
+    void (*done)(void) = g_durable_done;
+    if (ok && done) done();
     write_unlock();
     if (!ok) return set_error(ERR_IO, "state.db: cannot make the index durable "
                                       "(checkpoint did not complete)");

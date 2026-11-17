@@ -61,7 +61,24 @@ static int fault_pread_countdown(void) {
     return 0;
 }
 
+int (*volatile fault_write_hook)(int fd) = NULL;
+int (*volatile fault_mkdir_hook)(const char *path, mode_t mode) = NULL;
+
+ssize_t __wrap_write(int fd, const void *buf, size_t n) {
+    int (*h)(int) = fault_write_hook;
+    if (h && h(fd) != FAULT_FS_PASS) return -1;
+    return __real_write(fd, buf, n);
+}
+
+int __wrap_mkdir(const char *path, mode_t mode) {
+    int (*h)(const char *, mode_t) = fault_mkdir_hook;
+    if (h) { int r = h(path, mode); if (r != FAULT_FS_PASS) return r; }
+    return __real_mkdir(path, mode);
+}
+
 ssize_t __wrap_pwrite(int fd, const void *buf, size_t n, off_t off) {
+    int (*h)(int) = fault_write_hook;
+    if (h && h(fd) != FAULT_FS_PASS) return -1;
     if (fault_pwrite_at < 0) return __real_pwrite(fd, buf, n, off);
     if (fault_pwrite_at == 0) { fault_pwrite_at = -1; errno = EIO; return -1; }
     fault_pwrite_at--;
@@ -76,6 +93,8 @@ size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 }
 
 size_t __wrap_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    int (*h)(int) = fault_write_hook;
+    if (h && h(fileno(stream)) != FAULT_FS_PASS) return 0;
     if (fault_fwrite_bytes_left >= 0) {
         long long want = (long long)(size * nmemb);
         if (want > fault_fwrite_bytes_left) { errno = ENOSPC; return 0; }
