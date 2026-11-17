@@ -281,6 +281,95 @@ static void *writer_main(void *arg)
     return NULL;
 }
 
+/*
+ * B144: a writer that queues while the node index is being written gets in
+ * at the next row, not after the batch. index_nodes ended a transaction only
+ * every 2,000 rows, so a tag or sources write that queued during indexing
+ * waited for all of them, and under load that broke Manual 6.3's "well under
+ * a second". Fewer files than one batch, so before the fix the writer could
+ * only get in once indexing was over.
+ *
+ * The writer watches for the backup's first node rows. They are uncommitted,
+ * but one handle serves every thread, so a read on it sees the open
+ * transaction's rows: once there are some, index_nodes holds the lock
+ * mid-batch. It then queues, and inside its own transaction records how many
+ * node rows exist and whether the snapshot row, written only after the last
+ * batch, is there yet.
+ */
+#define B144_FILES 1500
+
+typedef struct {
+    pthread_t thr;
+    int       saw;        /* node rows when it decided to queue, -1 never */
+    int       nodes_in;   /* node rows once inside its transaction */
+    int       snap_in;    /* snapshot rows for snapshot 1 at that point */
+    int       ok;
+} b144_writer_t;
+
+static void *b144_writer(void *arg)
+{
+    b144_writer_t *w = arg;
+    w->saw = -1;
+    /* Up to a minute for the backup to reach indexing; each poll takes the
+     * shared handle's mutex, so it sleeps between them rather than spin. */
+    for (int i = 0; i < 60000 && !atomic_load(&backup_done); i++) {
+        int n = scalar("SELECT COUNT(*) FROM nodes WHERE snap_id = 1", NULL);
+        if (n > 0) { w->saw = n; break; }
+        struct timespec ts = { 0, 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    if (w->saw < 0) return NULL;
+    if (db_txn_begin(db) != OK) return NULL;
+    w->nodes_in = scalar("SELECT COUNT(*) FROM nodes WHERE snap_id = 1", NULL);
+    w->snap_in  = scalar("SELECT COUNT(*) FROM snapshots WHERE id = 1", NULL);
+    int rc = db_execute_non_query(db, "INSERT INTO config (key, value) VALUES ('b144', '1')",
+                                  NULL, NULL);
+    if (db_txn_commit(db) == OK && rc == 0) w->ok = 1;
+    return NULL;
+}
+
+static void test_writer_gets_in_during_node_indexing(void **state)
+{
+    (void)state;
+    for (int i = 0; i < B144_FILES; i++) {
+        char path[128], body[64];
+        snprintf(path, sizeof(path), TEST_SRC "/n%04d.txt", i);
+        snprintf(body, sizeof(body), "node index file %d\n", i);
+        write_file(path, body);
+    }
+
+    b144_writer_t w;
+    memset(&w, 0, sizeof(w));
+    assert_int_equal(pthread_create(&w.thr, NULL, b144_writer, &w), 0);
+
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    status_t bst = backup_run(store, db, repo_id, &o, &res);
+    atomic_store(&backup_done, 1);
+    pthread_join(w.thr, NULL);
+    assert_int_equal(bst, OK);
+    assert_int_equal(res.snapshot_id, 1);
+
+    int total = scalar("SELECT COUNT(*) FROM nodes WHERE snap_id = 1", NULL);
+    fprintf(stderr, "b144: writer saw %d node rows, got in at %d of %d, snapshot row %d\n",
+            w.saw, w.nodes_in, total, w.snap_in);
+    assert_true(total > B144_FILES);
+    assert_true(w.saw > 0);
+    assert_int_equal(w.ok, 1);
+    /* In before indexing finished, so before the batch would have ended... */
+    assert_true(w.nodes_in < total);
+    /* ...and before the snapshot claims its nodes: nodes_materialized is
+     * still written last. */
+    assert_int_equal(w.snap_in, 0);
+    assert_int_equal(scalar("SELECT nodes_materialized FROM snapshots WHERE id = 1", NULL), 1);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM config WHERE key = 'b144'", NULL), 1);
+}
+
 /* ------------------------------------------------------------------ */
 
 static void test_writes_during_a_backup_all_land(void **state)
@@ -383,6 +472,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_writes_during_a_backup_all_land, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_writer_gets_in_during_node_indexing, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
