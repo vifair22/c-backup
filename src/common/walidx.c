@@ -63,7 +63,7 @@ static int shm_fd(const char *shm)
         } else {
             g_nslots++;
         }
-        if (g_slot[i].fd > 0 && i < g_nslots && g_slot[i].path[0]) close(g_slot[i].fd);
+        if (i < g_nslots && g_slot[i].fd > 0 && g_slot[i].path[0]) close(g_slot[i].fd);
         snprintf(g_slot[i].path, sizeof(g_slot[i].path), "%s", shm);
     } else if (g_slot[i].fd >= 0) {
         /* The path names another file now: the old one is deleted or
