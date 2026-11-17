@@ -280,6 +280,14 @@ int main(int argc, char *argv[])
         goto out_guard;
     }
 
+    /* Before anything begins a transaction: from here c-utils' log writer,
+     * push queue and transaction scopes take the same write lock as
+     * everything else (CUTILS-2). */
+    if (db_txn_install_cutils_lock(db) != OK) {
+        log_error("%s", err_msg());
+        goto out_guard;
+    }
+
     pin_sqlite_temp_dir(db_path);
 
     /* Before anything writes: every statement after this runs on the

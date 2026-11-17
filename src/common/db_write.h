@@ -88,8 +88,9 @@ int db_write_batch_close(db_write_batch_t *b, int ok);
  * C_BACKUP_TXN_GUARD=abort is set in the environment the process aborts, so
  * the end-to-end suites fail at the statement rather than at a symptom.
  *
- * c-utils' own tables (logs, push, config) are not checked: c-utils writes
- * them from its own threads and cannot be routed through here.
+ * c-utils' own writers are covered too: with db_txn_install_cutils_lock
+ * they take this lock before writing, so a log line or a queued alert
+ * that did not would be reported like any other write.
  *
  * The daemon arms it as the first background thread starts. Before that
  * nothing else can be inside a transaction, so start-up's plain writes are
