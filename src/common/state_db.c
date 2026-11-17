@@ -5,6 +5,7 @@
 #include "wal_sync.h"
 #include "sync_latch.h"
 #include "checkpointer.h"
+#include "thread_name.h"
 
 #include <cutils/log.h>
 
@@ -167,6 +168,7 @@ static void flush_once(void)
 
 static void *flusher_main(void *arg)
 {
+    thread_name("cb-wal-flush");
     (void)arg;
     pthread_mutex_lock(&g_fl_mu);
     while (!g_fl_stop) {

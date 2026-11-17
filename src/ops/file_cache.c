@@ -221,3 +221,18 @@ void file_cache_sweep(cutils_db_t *db, int64_t repo_id,
         log_info("file cache: dropped %d entry(ies) for paths no longer present",
                  removed);
 }
+
+void file_cache_forget_run(cutils_db_t *db, int64_t repo_id, int64_t seen_at)
+{
+    if (!db) return;
+    char repo[32], seen[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(seen, sizeof(seen), "%lld", (long long)seen_at);
+    int n = 0;
+    if (db_write(db, "DELETE FROM file_cache WHERE repo_id = ? AND seen_at = ?",
+                 (const char *[]){ repo, seen, NULL }, &n) != 0)
+        log_warn("file cache: cannot drop the rows of a failed run; its files are "
+                 "read again only when they change");
+    else if (n > 0)
+        log_info("file cache: dropped %d row(s) a failed run wrote", n);
+}

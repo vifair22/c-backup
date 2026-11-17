@@ -31,6 +31,7 @@
 #include "auth.h"
 #include "db_txn.h"
 #include "db_write.h"
+#include "db_readers.h"
 #include "file_cache.h"
 #include "settle.h"
 #include "index_reconcile.h"
@@ -365,6 +366,16 @@ int main(int argc, char *argv[])
     }
     int sync_normal = strcmp(tuning.synchronous, "normal") == 0;
 
+    /* The store's dedup lookups read from connections of their own, so a
+     * file worker never waits on a commit (B184). After the tuning, which
+     * put the database in WAL mode, and before any thread exists. A slot
+     * per worker the daemon may run at once is plenty; failing to open them
+     * only loses the speed, so it is a warning. */
+    if (db_readers_open(db_path, DB_READERS_MAX) != OK) {
+        log_warn("%s; dedup lookups share the main connection", err_msg());
+        err_clear();
+    }
+
     /*
      * Down to the configured uid before anything else is opened: no repo
      * lock, job, socket or provider exists yet (source-providers.md 11.6).
@@ -663,6 +674,9 @@ out_locks:
      * so the process does not pin a deleted inode on its way out. */
     wal_sync_reset();
 out_guard:
+    /* Every thread that could look an object up has stopped by here; on a
+     * path that never opened them this does nothing. */
+    db_readers_close();
     appguard_shutdown(guard);
     /* After the database is closed: closing -shm sooner would drop the
      * locks its connections hold (B173). */

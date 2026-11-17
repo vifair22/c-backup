@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "nbd_server.h"
+#include "thread_name.h"
 
 #include <cutils/log.h>
 
@@ -541,6 +542,7 @@ static void transmit(conn_t *c)
 
 static void *conn_main(void *arg)
 {
+    thread_name("cb-nbd-conn");
     conn_t *c = arg;
     if (negotiate(c) == 0) transmit(c);
     if (c->reader) c->s->o.ops.close(c->reader);
@@ -569,6 +571,7 @@ static void reap(nbd_server_t *s, int all)
 
 static void *accept_main(void *arg)
 {
+    thread_name("cb-nbd-accept");
     nbd_server_t *s = arg;
     unsigned cap = s->o.max_conns ? s->o.max_conns : 8;
     if (cap > CONN_MAX) cap = CONN_MAX;

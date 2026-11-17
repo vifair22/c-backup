@@ -5,6 +5,7 @@
 #include "helper_proto.h"
 #include "host_tool.h"
 #include "snap.h"
+#include "thread_name.h"
 
 #include <cutils/log.h>
 
@@ -1110,6 +1111,7 @@ typedef struct { virDomainPtr dom; unsigned timeout_s; pthread_mutex_t mu; pthre
 /* Thaws at the deadline whatever the freeze or the begin is doing. */
 static void *freeze_watchdog(void *arg)
 {
+    thread_name("cbh-freeze-wd");
     freeze_wd_t *w = arg;
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);

@@ -6,6 +6,7 @@
 #include "lock.h"
 #include "routes.h"
 #include "db_write.h"
+#include "thread_name.h"
 
 #include <cutils/log.h>
 #include <cutils/push.h>
@@ -669,6 +670,7 @@ static void mark_waiting(job_manager_t *jm, int64_t job_id, const char *phase)
 
 static void *worker_main(void *arg)
 {
+    thread_name("cb-job");
     job_manager_t *jm = arg;
 
     /* Each worker claims the first free entry on entry, so it has a stable

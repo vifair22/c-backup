@@ -39,6 +39,8 @@
 #include <openssl/evp.h>
 
 #include "backup.h"
+#include "pack.h"
+#include "verify.h"
 #include "read_budget.h"
 #include "object.h"
 #include "parity.h"
@@ -191,6 +193,9 @@ static int setup(void **state)
 static int teardown(void **state)
 {
     (void)state;
+    store_index_set_commit_fault(NULL);
+    store_index_set_commit_gate(NULL);
+    pack_test_set_seal(0);
     rmrf(TEST_DIR);
     rmrf(TEST_ENVS);
     return 0;
@@ -854,6 +859,157 @@ static void test_small_budget_runs_fewer_writers(void **state)
     env_close(&b);
 }
 
+/* ------------------------------------------------------------------ */
+/* B184: packs sealed outside the sink lock                             */
+/* ------------------------------------------------------------------ */
+
+/* Twins over the pool threshold (16 MiB) on four workers, with a small seal so every writer rolls over many
+ * times: each writer meets the others' chunks while their packs are open or
+ * being sealed, and references them through the claims. */
+static void twins_source(void)
+{
+    assert_int_equal(mkdir(TEST_SRC, 0700), 0);
+    char p[PATH_MAX];
+    for (int i = 0; i < 4; i++) {
+        snprintf(p, sizeof(p), TEST_SRC "/twin%d.bin", i);
+        write_random(p, 20, 77);
+    }
+    write_random(TEST_SRC "/other.bin", 20, 78);
+    pack_test_set_seal(2u * MIB);
+}
+
+static long long q1(env_t *e, const char *sql)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)e->repo_id);
+    db_result_t *r = NULL;
+    long long v = -1;
+    if (db_execute(e->db, sql, (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        v = atoll(r->rows[0][0]);
+    db_result_free(r);
+    return v;
+}
+
+static int snapshot_records(env_t *e)
+{
+    char d[PATH_MAX + 32];
+    snprintf(d, sizeof(d), "%s/repo/snapshots", e->dir);
+    DIR *dir = opendir(d);
+    if (!dir) return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        char *end = NULL;
+        long v = strtol(de->d_name, &end, 10);
+        if (v > 0 && end && *end == '\0') n++;
+    }
+    closedir(dir);
+    return n;
+}
+
+static atomic_int g_commits;
+static int        g_fail_at;
+
+static int fail_one_commit(void)
+{
+    return atomic_fetch_add(&g_commits, 1) + 1 == g_fail_at;
+}
+
+/*
+ * A pack whose seal fails, off the sink lock, after other writers may have
+ * referenced its chunks through its claims. Its claims are abandoned, so the
+ * run fails: no snapshot row, no snapshot record, and no file-cache row that
+ * would let the next run reuse a file naming a chunk that never landed. The
+ * next run stores everything again, and a deep verify finds nothing. The
+ * failure here is the index commit (store_pack_commit_failed), which before
+ * this was logged and reported as a successful seal.
+ */
+static void test_failed_seal_fails_the_run_and_leaves_nothing(void **state)
+{
+    (void)state;
+    twins_source();
+    env_t e;
+    env_open(&e, "sealfail");
+    backup_opts_t o = opts_for(4);
+
+    atomic_store(&g_commits, 0);
+    g_fail_at = 9;
+    store_index_set_commit_fault(fail_one_commit);
+    backup_result_t r;
+    memset(&r, 0, sizeof(r));
+    assert_int_not_equal(backup_run(e.store, e.db, e.repo_id, &o, &r), OK);
+    err_clear();
+    backup_result_free(&r);
+    store_index_set_commit_fault(NULL);
+    assert_true(atomic_load(&g_commits) >= 9);
+
+    assert_int_equal(q1(&e, "SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
+    assert_int_equal(snapshot_records(&e), 0);
+    assert_int_equal(q1(&e, "SELECT COUNT(*) FROM file_cache WHERE repo_id = ?"), 0);
+
+    memset(&r, 0, sizeof(r));
+    assert_int_equal(backup_run(e.store, e.db, e.repo_id, &o, &r), OK);
+    assert_int_equal(r.files_unchanged, 0);
+    backup_result_free(&r);
+    assert_int_equal(snapshot_records(&e), 1);
+
+    verify_result_t v;
+    memset(&v, 0, sizeof(v));
+    assert_int_equal(verify_run(e.store, e.db, e.repo_id, VERIFY_LEVEL_DEEP, 0, NULL,
+                                NULL, NULL, &v), OK);
+    assert_int_equal(v.missing, 0);
+    assert_int_equal(v.unrecoverable, 0);
+    env_close(&e);
+}
+
+/* Each pack commit waits here before its COMMIT, the first few for long
+ * enough that a snapshot record written early would land meanwhile, and
+ * checks that none has been written yet. */
+static env_t     *g_env;
+static atomic_int g_gate_calls, g_record_too_early;
+
+static status_t slow_gate(void)
+{
+    int n = atomic_fetch_add(&g_gate_calls, 1);
+    if (n < 6) {
+        struct timespec ts = { 0, 150 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    if (snapshot_records(g_env) != 0) atomic_store(&g_record_too_early, 1);
+    return OK;
+}
+
+/*
+ * The snapshot record is written only after every pack the run wrote is
+ * sealed and its rows committed: the record is written after store_content
+ * returns, which is after store_pool_finish has joined every file worker,
+ * and each worker's seals, the off-lock ones included, run to their commit
+ * inside the chunk put that triggered them, which cdc_store waits for
+ * (drain) before the file's store returns. Delaying the commits shows it:
+ * no commit, slowed or not, ever finds a record already on disk.
+ */
+static void test_snapshot_record_waits_for_every_pack_commit(void **state)
+{
+    (void)state;
+    twins_source();
+    env_t e;
+    env_open(&e, "order");
+    g_env = &e;
+    atomic_store(&g_gate_calls, 0);
+    atomic_store(&g_record_too_early, 0);
+    store_index_set_commit_gate(slow_gate);
+    backup_opts_t o = opts_for(4);
+    backup_result_t r;
+    memset(&r, 0, sizeof(r));
+    assert_int_equal(backup_run(e.store, e.db, e.repo_id, &o, &r), OK);
+    backup_result_free(&r);
+    store_index_set_commit_gate(NULL);
+    assert_true(atomic_load(&g_gate_calls) >= 6);
+    assert_int_equal(atomic_load(&g_record_too_early), 0);
+    assert_int_equal(snapshot_records(&e), 1);
+    env_close(&e);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -864,6 +1020,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_failing_file_is_skipped_as_it_is_serially, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_stops_the_workers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_write_counters_match_the_disk, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_failed_seal_fails_the_run_and_leaves_nothing,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_snapshot_record_waits_for_every_pack_commit,
+                                        setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

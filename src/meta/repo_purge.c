@@ -3,6 +3,7 @@
 #include "repo_purge.h"
 #include "db_txn.h"
 #include "db_write.h"
+#include "thread_name.h"
 
 #include <cutils/log.h>
 
@@ -130,6 +131,7 @@ static struct {
 
 static void *purge_main(void *arg)
 {
+    thread_name("cb-purge");
     (void)arg;
     for (;;) {
         (void)repo_purge_run(g_purge.db, &g_purge.stop);

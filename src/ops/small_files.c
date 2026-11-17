@@ -6,6 +6,7 @@
 #include "phase_timer.h"
 #include "read_budget.h"
 #include "settle.h"
+#include "thread_name.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -191,6 +192,7 @@ static void run_batch(small_pool_t *pool, small_batch_t *b)
 
 static void *worker_main(void *arg)
 {
+    thread_name("cb-small-worker");
     small_pool_t *pool = arg;
     pthread_mutex_lock(&pool->mu);
     for (;;) {

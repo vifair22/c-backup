@@ -8,6 +8,7 @@
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "thread_name.h"
 
 #include <cutils/log.h>
 
@@ -1035,6 +1036,7 @@ static void link_wait(unsigned ms)
 
 static void *link_main(void *arg)
 {
+    thread_name("cb-helper-link");
     (void)arg;
     unsigned delay = g_link.bo.initial_ms;
     pthread_mutex_lock(&g_link.mu);
