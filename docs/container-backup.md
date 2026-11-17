@@ -879,8 +879,16 @@ bind of its restored copy under `target_root`, and passes `target_root`
 with the definition (for compose, each service's recorded `mounts` too).
 The helper creates the container, so it holds the rule itself: every bind
 source under `target_root` and inside none of the original's mounts, no
-volume by name, no `VolumesFrom`, every recorded mount replaced, host
-facilities (`mount_is_system`) excepted. It refuses otherwise, in the
+volume by name, no `VolumesFrom`, every recorded mount replaced. Host
+binds follow a fixed rule: `/proc`, `/sys`, `/etc/localtime`,
+`/etc/timezone`, the Docker socket and `/dev` character devices (or a
+`/dev` directory with no block device in it) are kept as recorded; a
+block device anywhere, judged by `S_ISBLK` on the host path after
+following links (by-id, mapper), as a bind or in `Devices`, and anything
+else under `/etc`, under `/run` or `/var/run`, or under `/boot`, is
+refused, the error naming `<host path> -> <container path>` and the
+reason. Paths are resolved in the host's tree one component at a time, so
+a restored symlink cannot point a data bind out of `target_root` either. It refuses otherwise, in the
 define check too, so before the daemon writes anything. After the create
 and before any start it inspects what Docker made and removes a container
 that mounts a volume that existed before the restore or a bind outside
