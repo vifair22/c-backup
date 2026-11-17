@@ -3,6 +3,7 @@
 #define _XOPEN_SOURCE 700
 
 #include "repo.h"
+#include "sync_latch.h"
 #include "db_txn.h"
 #include "snapshot_ids.h"
 #include "pack_ids.h"
@@ -436,7 +437,7 @@ static status_t marker_emit(const char *mp, repo_marker_t *mp_in)
         errno = err;
         return set_error_errno(ERR_IO, "cannot write %s", mp);
     }
-    if (fsync(fd) != 0) {
+    if (sync_latch_fsync(fd, mp) != 0) {
         int err = errno;
         close(fd); unlink(mp);
         errno = err;
@@ -451,6 +452,7 @@ static status_t marker_emit(const char *mp, repo_marker_t *mp_in)
     /* The name is durable once the directory holding it is. */
     if (snapshot_fsync_parent(mp) != 0) {
         int err = errno;
+        if (err != EINVAL && err != EBADF) sync_latch_trip(mp, err);
         unlink(mp);
         errno = err;
         return set_error_errno(ERR_IO, "cannot sync the directory of %s", mp);

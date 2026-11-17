@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "replicate.h"
+#include "sync_latch.h"
 
 #include "cdc.h"
 #include "object.h"
@@ -517,7 +518,7 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
     if (snapshot_write_all(fd, body, len) != 0)
         st = set_error_errno(ERR_IO, "replica: write snapshot record");
     free(body);
-    if (st == OK && fsync(fd) != 0)
+    if (st == OK && sync_latch_fsync(fd, tmp) != 0)
         st = set_error_errno(ERR_IO, "replica: fsync snapshot record");
     if (close(fd) != 0 && st == OK)
         st = set_error_errno(ERR_IO, "replica: close snapshot record");

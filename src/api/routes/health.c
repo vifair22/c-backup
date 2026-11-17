@@ -2,6 +2,9 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#define CUTILS_CJSON_ALLOW
+#include "cJSON.h"
+#include "sync_latch.h"
 
 #include <cutils/db.h>
 #include <stdio.h>
@@ -17,7 +20,22 @@
 static api_response_t handle_healthz(const api_request_t *req, void *userdata)
 {
     (void)req; (void)userdata;
-    char *body = strdup("{\"status\":\"ok\"}");
+    /* Still alive after a failed storage sync, and still answering reads,
+     * but it says so: restarting it is what clears the state. */
+    char msg[1024];
+    int64_t at = 0;
+    if (sync_latch_info(msg, sizeof(msg), &at)) {
+        cJSON *o = cJSON_CreateObject();
+        if (!o) return api_error(500, "out of memory");
+        cJSON_AddStringToObject(o, "status", "ok");
+        cJSON_AddStringToObject(o, "storage_sync", "failed");
+        cJSON_AddStringToObject(o, "storage_sync_error", msg);
+        cJSON_AddNumberToObject(o, "storage_sync_failed_at", (double)at);
+        char *body = cJSON_PrintUnformatted(o);
+        cJSON_Delete(o);
+        return body ? api_ok(body) : api_error(500, "out of memory");
+    }
+    char *body = strdup("{\"status\":\"ok\",\"storage_sync\":\"ok\"}");
     return body ? api_ok(body) : api_error(500, "out of memory");
 }
 
@@ -31,6 +49,15 @@ static api_response_t handle_readyz(const api_request_t *req, void *userdata)
     (void)req;
     cutils_db_t *db = userdata;
     if (!db) return api_error(503, "database not open");
+    /* Not ready: durable writes and the jobs that need them are refused
+     * until a restart (sync_latch.h). */
+    char msg[1024];
+    if (sync_latch_info(msg, sizeof(msg), NULL)) {
+        char why[1200];
+        snprintf(why, sizeof(why), "not ready: a storage sync failed (%s); restart the "
+                 "daemon to re-read from disk", msg);
+        return api_error(503, why);
+    }
 
     db_result_t *r = NULL;
     if (db_execute(db, "SELECT 1", NULL, &r) != 0) {

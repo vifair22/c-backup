@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "prune.h"
+#include "sync_latch.h"
 #include "db_txn.h"
 #include "repo_tags.h"
 #include "snap_record.h"
@@ -77,6 +78,10 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
                            int64_t snap_id, int checked, int force,
                            prune_info_t *info)
 {
+    /* A prune deletes on the strength of a durable commit, which a latched
+     * daemon cannot make (sync_latch.h). */
+    status_t lst = sync_latch_check("prune");
+    if (lst != OK) return lst;
     char repo[32], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
@@ -231,6 +236,8 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
 status_t prune_finish_pending(cutils_db_t *db, int64_t repo_id, unsigned *out_finished)
 {
     if (out_finished) *out_finished = 0;
+    status_t lst = sync_latch_check("prune");
+    if (lst != OK) return lst;
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     const char *p1[] = { repo, NULL };

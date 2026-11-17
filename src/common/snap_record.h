@@ -61,9 +61,11 @@ char *snapshot_record_encode(int64_t id, int64_t ts, const char *root_hex,
 int snapshot_write_all(int fd, const void *buf, size_t len);
 
 /* fsync a directory, so an entry renamed or linked into it survives a
- * power cut. 0, or -1 with errno set. */
+ * power cut. 0, or -1 with errno set. Every caller is a repository's, so a
+ * failure trips the storage sync latch (sync_latch.h). */
 int snapshot_fsync_dir(const char *path);
 
 /* fsync the directory holding path (its parent), for the same reason. 0,
- * or -1 with errno set. */
+ * or -1 with errno set. Does not trip the latch: restore destinations use
+ * it; a repository caller trips it. */
 int snapshot_fsync_parent(const char *path);

@@ -46,6 +46,7 @@
 #include "server.h"
 #include "state_db.h"
 #include "wal_sync.h"
+#include "sync_latch.h"
 #include "checkpointer.h"
 #include "pack_presence.h"
 #include "prune.h"
@@ -143,6 +144,19 @@ static int after_write(void *userdata, char *why, size_t why_sz)
         return -1;
     }
     return 0;
+}
+
+/* Whether Pushover is configured, for the latch's one alert. */
+static atomic_int g_alerts_on;
+
+static void sync_latch_alert(const char *msg)
+{
+    char body[1400];
+    snprintf(body, sizeof(body), "A storage sync failed: %s. The daemon refuses durable "
+             "writes, backups, gc and prune until it is restarted.", msg);
+    log_error("alert: c-backupd storage sync failed: %s", msg);
+    if (atomic_load(&g_alerts_on) && push_send("c-backupd: storage sync failed", body) != 0)
+        log_warn("alert: could not queue the storage sync alert");
 }
 
 /*
@@ -415,7 +429,9 @@ int main(int argc, char *argv[])
         const char *tok = config_get_str(cfg, PUSH_CONFIG_TOKEN);
         const char *usr = config_get_str(cfg, PUSH_CONFIG_USER);
         job_manager_set_alerts(jm, tok && tok[0] && usr && usr[0]);
+        atomic_store(&g_alerts_on, tok && tok[0] && usr && usr[0]);
     }
+    sync_latch_set_alert(sync_latch_alert);
 
     /*
      * Units (source-providers.md): the daemon id, the providers, then the
@@ -535,6 +551,9 @@ int main(int argc, char *argv[])
      * permissions on the socket are the access control there. */
     api_server_set_auth(srv, auth_check, db);
     api_server_set_after_write(srv, after_write, db);
+    /* Durable writes refused once a storage sync has failed: a later
+     * sync's success proves nothing about what the failed one held. */
+    api_server_set_durable_gate(srv, sync_latch_api_gate, NULL);
 
     if (api_server_start(srv) != 0) {
         log_error("cannot start API server: %s", api_server_error());

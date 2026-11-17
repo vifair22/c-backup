@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "snap_record.h"
+#include "sync_latch.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -172,7 +173,7 @@ int snapshot_fsync_dir(const char *path)
 {
     int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd == -1) return -1;
-    int rc = fsync(fd);
+    int rc = sync_latch_fsync(fd, path);
     int err = errno;
     close(fd);
     errno = err;
@@ -187,8 +188,16 @@ int snapshot_fsync_parent(const char *path)
         return -1;
     }
     char *slash = strrchr(dir, '/');
-    if (!slash) return snapshot_fsync_dir(".");
-    if (slash == dir) slash[1] = '\0';
+    if (!slash) snprintf(dir, sizeof(dir), ".");
+    else if (slash == dir) slash[1] = '\0';
     else *slash = '\0';
-    return snapshot_fsync_dir(dir);
+    /* Not the latch's: a restore destination is not the daemon's storage.
+     * A repository caller trips it itself. */
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd == -1) return -1;
+    int rc = fsync(fd);
+    int err = errno;
+    close(fd);
+    errno = err;
+    return rc;
 }

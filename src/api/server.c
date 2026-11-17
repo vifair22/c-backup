@@ -76,6 +76,8 @@ struct api_server {
     void              *auth_ud;
     api_after_write_fn after_write_fn;
     void              *after_write_ud;
+    api_durable_gate_fn durable_gate_fn;
+    void              *durable_gate_ud;
     void              *_tcp_cls;   /* mhd_cls_t for TCP daemon */
     void              *_unix_cls;  /* mhd_cls_t for unix daemon */
     /* Held for the daemon's lifetime: MHD keeps the pointer it is given
@@ -564,6 +566,12 @@ static enum MHD_Result try_serve_static(struct MHD_Connection *conn,
 static api_response_t run_buffered(api_server_t *srv, const route_entry_t *route,
                                    const api_request_t *req)
 {
+    if (req->method != API_GET && srv->durable_gate_fn &&
+        route_class(srv, route, req->url, req->method) == API_DURABLE) {
+        char why[1024] = "";
+        if (srv->durable_gate_fn(srv->durable_gate_ud, why, sizeof(why)) != 0)
+            return api_error(500, why[0] ? why : "durable writes are refused");
+    }
     api_response_t resp = route->handler.buffered(req, route->userdata);
     if (req->method != API_GET && resp.status >= 200 && resp.status < 300 &&
         srv->after_write_fn &&
@@ -1002,6 +1010,13 @@ void api_server_set_auth(api_server_t *srv, api_auth_fn fn, void *userdata)
 {
     srv->auth_fn = fn;
     srv->auth_ud = userdata;
+}
+
+void api_server_set_durable_gate(api_server_t *srv, api_durable_gate_fn fn, void *userdata)
+{
+    if (!srv) return;
+    srv->durable_gate_fn = fn;
+    srv->durable_gate_ud = userdata;
 }
 
 void api_server_set_after_write(api_server_t *srv, api_after_write_fn fn, void *userdata)

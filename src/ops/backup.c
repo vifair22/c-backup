@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "util.h"
+#include "sync_latch.h"
 #include "backup.h"
 #include "read_budget.h"
 
@@ -2193,7 +2194,7 @@ static status_t write_snapshot_record(store_t *store, int64_t snap_id,
         return set_error_errno(ERR_IO, "snapshot record: write");
     }
     free(body);
-    if (fsync(fd) != 0) { close(fd); unlink(tmp); return set_error_errno(ERR_IO, "snapshot record: fsync"); }
+    if (sync_latch_fsync(fd, tmp) != 0) { close(fd); unlink(tmp); return set_error_errno(ERR_IO, "snapshot record: fsync"); }
     if (close(fd) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "snapshot record: close"); }
 
     if (rename(tmp, final) != 0) {

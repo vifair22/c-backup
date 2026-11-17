@@ -44,6 +44,12 @@
 #include "snapshot_ids.h"
 #include "store.h"
 #include "store_index.h"
+#include "sync_latch.h"
+#include "gc.h"
+#include "prune.h"
+#include "routes.h"
+#include "server.h"
+#include "db_txn.h"
 #include "verify.h"
 #include "test_tmp.h"
 
@@ -99,6 +105,7 @@ static int setup(void **state)
 {
     (void)state;
     fault_reset_all();
+    sync_latch_reset_for_test();
     rmrf(TEST_DIR);
     if (mkdir(TEST_DIR, 0700) != 0) return -1;
     if (db_open(&db, TEST_DB) != 0) return -1;
@@ -118,6 +125,7 @@ static int teardown(void **state)
 {
     (void)state;
     fault_full_disarm();
+    sync_latch_reset_for_test();
     fault_reset_all();
     store_index_free(idx); idx = NULL;
     store_close(store);    store = NULL;
@@ -227,6 +235,7 @@ static void test_pack_write_fails_the_backup(void **state)
     status_t st = run_backup(1, &res);
     int hits = fault_full_hits;
     fault_full_disarm();
+    sync_latch_reset_for_test();
     assert_int_equal(hits, 1);
     assert_int_not_equal(st, OK);
     expect_msg("No space left on device");
@@ -250,6 +259,7 @@ static void test_pack_flush_on_a_pool_worker_fails_the_backup(void **state)
     status_t st = run_backup(2, &res);
     int hits = fault_full_hits;
     fault_full_disarm();
+    sync_latch_reset_for_test();
     assert_int_equal(hits, 1);
     assert_true(res.store_workers > 1 || st != OK);
     assert_int_not_equal(st, OK);
@@ -268,6 +278,8 @@ static void test_pack_sync_failure_is_named(void **state)
     status_t st = run_backup(1, &res);
     int hits = fault_full_hits;
     fault_full_disarm();
+    assert_true(sync_latch_tripped());
+    sync_latch_reset_for_test();
     assert_int_equal(hits, 1);
     assert_int_not_equal(st, OK);
     expect_msg("sync the pack");
@@ -290,6 +302,7 @@ static void test_pack_close_failure_fails_the_backup(void **state)
     status_t st = run_backup(1, &res);
     int hits = fault_full_hits;
     fault_full_disarm();
+    sync_latch_reset_for_test();
     assert_int_equal(hits, 1);
     assert_int_not_equal(st, OK);
     expect_msg("close the pack");
@@ -311,6 +324,8 @@ static void test_snapshot_record_failures_fail_the_backup(void **state)
         backup_result_t res;
         status_t st = run_backup(1, &res);
         fault_full_disarm();
+        sync_latch_reset_for_test();
+    sync_latch_reset_for_test();
         assert_int_not_equal(st, OK);
         expect_msg(cases[i].says);
         backup_result_free(&res);
@@ -330,6 +345,7 @@ static void test_store_writer_write_failure_is_returned(void **state)
     fault_full_arm(STAGING, FAULT_FULL_WRITE, 1, 1);
     status_t st = object_store(store, OBJECT_TYPE_FILE, data, sizeof(data), hash);
     fault_full_disarm();
+    sync_latch_reset_for_test();
     assert_int_not_equal(st, OK);
     expect_msg("No space left on device");
     assert_int_equal(object_store_flush(store), OK);
@@ -360,6 +376,8 @@ static void test_tags_file_failures_fail_the_save(void **state)
         status_t st = repo_tags_save_with(db, repo_id, TEST_REPO, &chg);
         int hits = fault_full_hits;
         fault_full_disarm();
+        sync_latch_reset_for_test();
+    sync_latch_reset_for_test();
         assert_int_equal(hits, 1);
         assert_int_not_equal(st, OK);
         expect_msg("Input/output error");
@@ -383,6 +401,8 @@ static void test_id_files_keep_their_old_value(void **state)
         fault_full_arm(TEST_REPO "/tmp/packids", ops[i], 0, 1);
         status_t st = pack_ids_write(TEST_REPO, m.uuid, before + 5000);
         fault_full_disarm();
+        sync_latch_reset_for_test();
+    sync_latch_reset_for_test();
         assert_int_not_equal(st, OK);
         assert_int_equal(pack_ids_read(TEST_REPO, m.uuid, &after), OK);
         assert_int_equal(after, before);
@@ -391,6 +411,8 @@ static void test_id_files_keep_their_old_value(void **state)
         fault_full_arm(TEST_REPO "/tmp/snapids", ops[i], 0, 1);
         st = snapshot_ids_write(TEST_REPO, m.uuid, 777);
         fault_full_disarm();
+        sync_latch_reset_for_test();
+    sync_latch_reset_for_test();
         assert_int_not_equal(st, OK);
         int64_t last = -1;
         assert_int_equal(snapshot_ids_read(TEST_REPO, m.uuid, &last), OK);
@@ -417,6 +439,8 @@ static void test_marker_sync_failure_fails_the_registration(void **state)
         status_t st = repo_register(db, path, "new", &id);
         int hits = fault_full_hits;
         fault_full_disarm();
+        sync_latch_reset_for_test();
+    sync_latch_reset_for_test();
         assert_int_equal(hits, 1);
         assert_int_not_equal(st, OK);
         expect_msg(marker);
@@ -448,6 +472,7 @@ static void test_key_file_failures_fail_the_save(void **state)
     status_t st = repo_key_save(kdir, uuid, &k);
     int hits = fault_full_hits;
     fault_full_disarm();
+    sync_latch_reset_for_test();
     assert_int_equal(hits, 1);
     assert_int_not_equal(st, OK);
     expect_msg("cannot sync key directory");
@@ -460,6 +485,8 @@ static void test_key_file_failures_fail_the_save(void **state)
         st = repo_key_save(kdir, uuid, &k);
         hits = fault_full_hits;
         fault_full_disarm();
+        sync_latch_reset_for_test();
+    sync_latch_reset_for_test();
         assert_int_equal(hits, 1);
         assert_int_not_equal(st, OK);
         expect_msg("Input/output error");
@@ -491,6 +518,7 @@ static void test_restore_write_failure_is_the_destinations(void **state)
     status_t st = restore_run(store, db, repo_id, snap, TEST_DST, &ro, &rr);
     int hits = fault_full_hits;
     fault_full_disarm();
+    sync_latch_reset_for_test();
     assert_int_equal(hits, 1);
     assert_int_not_equal(st, OK);
     assert_int_equal(rr.failed, 1);
@@ -521,6 +549,7 @@ static void test_restore_sync_failure_installs_nothing(void **state)
     fault_full_arm(TEST_DST, FAULT_FULL_SYNC, 0, 1);
     status_t st = restore_run(store, db, repo_id, snap, TEST_DST, &ro, &rr);
     fault_full_disarm();
+    sync_latch_reset_for_test();
     assert_int_not_equal(st, OK);
     assert_int_equal(rr.files, 0);
     assert_int_equal(rr.failed, 3);
@@ -529,6 +558,169 @@ static void test_restore_sync_failure_installs_nothing(void **state)
     snprintf(p, sizeof(p), "%s%s/a.txt", TEST_DST, TEST_SRC);
     struct stat sb;
     assert_int_not_equal(stat(p, &sb), 0);
+}
+
+
+/* ---- the storage sync latch (sync_latch.h) ---- */
+
+/* Pack files under packs/, shards included. */
+static int count_packs(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+        struct stat sb;
+        if (lstat(p, &sb) != 0) continue;
+        if (S_ISDIR(sb.st_mode)) n += count_packs(p);
+        else if (strncmp(de->d_name, "pack-", 5) == 0) n++;
+    }
+    closedir(d);
+    return n;
+}
+
+static int after_write_durable(void *ud, char *why, size_t why_sz)
+{
+    if (db_txn_make_durable(ud) == OK) return 0;
+    snprintf(why, why_sz, "%s", err_msg());
+    err_clear();
+    return -1;
+}
+
+/* One request through the daemon's own gate and after-write hook. The
+ * response body (malloc'd) into *body when it is not NULL. */
+static int api(api_server_t *srv, api_method_t m, const char *url, const char *body_in,
+               char **body)
+{
+    api_request_t req = { .method = m, .url = url, .body = body_in,
+                          .body_len = body_in ? strlen(body_in) : 0, .is_local = 1,
+                          .client_addr = "" };
+    api_response_t r = api_server_dispatch(srv, &req);
+    if (body) *body = r.body; else free(r.body);
+    free(r.set_cookie);
+    return r.status;
+}
+
+/*
+ * One EIO on the WAL's fdatasync, then a disk that is fine again: the next
+ * sync would succeed, and must not be believed. Every later durable write
+ * is answered 500 without running, /readyz is not ready, /healthz and the
+ * metric say why, until a restart.
+ */
+static void test_wal_sync_failure_latches_durable_writes(void **state)
+{
+    (void)state;
+    backup_result_t res;
+    assert_int_equal(run_backup(1, &res), OK);
+    backup_result_free(&res);
+
+    routes_metadata_init(db);
+    api_server_t *srv = api_server_create(0, NULL, NULL, NULL);
+    assert_non_null(srv);
+    assert_int_equal(routes_register_repos(srv, db), 0);
+    assert_int_equal(routes_register_health(srv, db), 0);
+    assert_int_equal(routes_register_metrics(srv, db), 0);
+    api_server_set_after_write(srv, after_write_durable, db);
+    api_server_set_durable_gate(srv, sync_latch_api_gate, NULL);
+    char url[96];
+    snprintf(url, sizeof(url), "/repos/%lld/tags", (long long)repo_id);
+
+    assert_int_equal(api(srv, API_POST, url, "{\"name\":\"one\",\"snap_id\":1}", NULL) / 100, 2);
+    assert_int_equal(api(srv, API_GET, "/readyz", NULL, NULL), 200);
+
+    /* The failing sync: the edit is committed, the answer is not 2xx. */
+    fault_full_errno = EIO;
+    fault_full_arm(TEST_DB "-wal", FAULT_FULL_SYNC, 0, 1);
+    int code = api(srv, API_POST, url, "{\"name\":\"two\",\"snap_id\":1}", NULL);
+    int hits = fault_full_hits;
+    fault_full_disarm();
+    assert_int_equal(hits, 1);
+    assert_int_equal(code, 500);
+    assert_true(sync_latch_tripped());
+
+    /* The disk is fine now. The next sync would succeed; it is not asked. */
+    char *body = NULL;
+    assert_int_equal(api(srv, API_POST, url, "{\"name\":\"three\",\"snap_id\":1}", &body), 500);
+    assert_non_null(strstr(body, "previous sync failed"));
+    assert_non_null(strstr(body, "restart"));
+    free(body);
+    /* Refused before the handler: nothing committed. */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM tags WHERE name = 'three'"), 0);
+    assert_int_not_equal(db_txn_make_durable(db), OK);
+    expect_msg("previous sync failed");
+
+    assert_int_equal(api(srv, API_GET, "/readyz", NULL, &body), 503);
+    assert_non_null(strstr(body, "-wal"));
+    free(body);
+    assert_int_equal(api(srv, API_GET, "/healthz", NULL, &body), 200);
+    assert_non_null(strstr(body, "\"storage_sync\":\"failed\""));
+    free(body);
+    assert_int_equal(api(srv, API_GET, "/metrics", NULL, &body), 200);
+    assert_non_null(strstr(body, "\ncbackup_storage_sync_failed 1\n"));
+    assert_null(strstr(body, "cbackup_storage_sync_failed_timestamp_seconds 0\n"));
+    free(body);
+    /* A read still works: only promises of durability stop. */
+    assert_int_equal(api(srv, API_GET, url, NULL, NULL), 200);
+    api_server_stop(srv);
+}
+
+/*
+ * One EIO on a pack seal's fsync. The backup fails, and from then on gc
+ * deletes nothing - not even packs whose every entry is dead - and the
+ * jobs that need durability refuse: a backup's seal, a prune.
+ */
+static void test_pack_sync_failure_latches_gc(void **state)
+{
+    (void)state;
+    backup_result_t res;
+    assert_int_equal(run_backup(1, &res), OK);
+    int64_t first = res.snapshot_id;
+    backup_result_free(&res);
+    write_file(TEST_SRC "/d.txt", 0, 0);
+    assert_int_equal(run_backup(1, &res), OK);
+    backup_result_free(&res);
+    /* Garbage for gc: the first snapshot's own trees. */
+    assert_int_equal(prune_snapshot(store, db, repo_id, first), OK);
+
+    write_file(TEST_SRC "/e.txt", 0, 0);
+    fault_full_errno = EIO;
+    fault_full_arm(STAGING, FAULT_FULL_SYNC, 0, 1);
+    status_t st = run_backup(1, &res);
+    int hits = fault_full_hits;
+    fault_full_disarm();
+    backup_result_free(&res);
+    assert_int_equal(hits, 1);
+    assert_int_not_equal(st, OK);
+    assert_true(sync_latch_tripped());
+
+    int packs = count_packs(TEST_REPO "/packs");
+    assert_true(packs > 0);
+    gc_result_t gr;
+    st = gc_run(store, db, repo_id, 0, NULL, &gr);
+    assert_int_not_equal(st, OK);
+    expect_msg("previous sync failed");
+    assert_int_equal(count_packs(TEST_REPO "/packs"), packs);
+    /* The engine's own compaction refuses as well, whoever calls it. */
+    uint32_t kept = 0, deleted = 0;
+    assert_int_not_equal(pack_gc(store, NULL, 0, &kept, &deleted), OK);
+    assert_int_equal(count_packs(TEST_REPO "/packs"), packs);
+
+    /* A dry run deletes nothing and is let through. */
+    assert_int_equal(gc_run(store, db, repo_id, 1, NULL, &gr), OK);
+
+    /* A backup's seal and a prune refuse too. */
+    write_file(TEST_SRC "/f.txt", 0, 0);
+    assert_int_not_equal(run_backup(1, &res), OK);
+    expect_msg("previous sync failed");
+    backup_result_free(&res);
+    assert_int_equal(count_packs(TEST_REPO "/packs"), packs);
+    assert_int_not_equal(prune_snapshot(store, db, repo_id, 2), OK);
+    expect_msg("previous sync failed");
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE id = 2"), 1);
 }
 
 int main(void)
@@ -546,6 +738,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_key_file_failures_fail_the_save, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_write_failure_is_the_destinations, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_sync_failure_installs_nothing, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_wal_sync_failure_latches_durable_writes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_sync_failure_latches_gc, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

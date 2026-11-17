@@ -245,8 +245,8 @@ disk (Manual section 6.4 has the numbers measured during a backup).
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/healthz` | Liveness: the process answers |
-| GET | `/readyz` | Readiness: the database is open |
+| GET | `/healthz` | Liveness: the process answers; `storage_sync` is `ok` or `failed` |
+| GET | `/readyz` | Readiness: the database is open and no storage sync has failed |
 | GET | `/metrics` | Prometheus text exposition |
 | GET | `/api/auth/setup` | Is an admin password configured? |
 
@@ -258,6 +258,20 @@ and label, in `cbackup_stalest_snapshot_repo_info` and
 `cbackup_stalest_verify_repo_info`: one series each, value 1, so an alert on
 the matching age can say which repository it means without a series per
 repository. Label values are escaped per the text exposition format.
+
+**After a failed sync.** Once any sync of `state.db`'s write-ahead log or of
+a file in a repository has failed, the daemon stops promising durability
+until it restarts (Manual section 17.7): Linux may already have dropped the
+bytes that sync covered, and a later sync can succeed over the loss.
+`/healthz` still answers 200 and adds `"storage_sync":"failed"`,
+`storage_sync_error` (the file and the error) and `storage_sync_failed_at`
+(unix time); `/readyz` answers 503 with the same reason;
+`cbackup_storage_sync_failed` is 1 and
+`cbackup_storage_sync_failed_timestamp_seconds` the time of the first
+failure. Every durable-class write is answered `500` with `durable write
+refused: a previous sync failed (<file>: <error>); restart the daemon to
+re-read from disk`, and its handler does not run, so nothing is committed.
+Reads and commit-only writes still work.
 
 ## Auth
 

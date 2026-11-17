@@ -131,7 +131,14 @@ extern int __real_syncfs(int);
 void fault_full_arm(const char *prefix, unsigned ops, int skip, int count);
 void fault_full_disarm(void);
 
+/* The storage sync latch (src/common/sync_latch.h). A tripped latch lasts
+ * until the process restarts; for a suite, resetting the injector stands in
+ * for that restart, so a test that injects one failed sync and then checks
+ * recovery sees the recovery, and the latch tests disarm without it. */
+void sync_latch_reset_for_test(void);
+
 static inline void fault_reset_all(void) {
+    sync_latch_reset_for_test();
     fault_malloc_at = -1;
     fault_fread_at  = -1;
     fault_fwrite_at = -1;
