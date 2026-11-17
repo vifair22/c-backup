@@ -3632,6 +3632,9 @@ static int ref_cmp(const void *key, const void *entry);
 
 static int gc_entry_live(gc_live_t *g, uint32_t pnum, const pack_idx_disk_entry_t *e)
 {
+    /* bsearch's base is declared nonnull, and with nothing referenced it is
+     * NULL: undefined even at a count of zero (UBSan). */
+    if (g->cnt == 0) return 0;
     const uint8_t *hit = bsearch(e->hash, g->refs, g->cnt, OBJECT_HASH_SIZE, ref_cmp);
     if (!hit) return 0;
     if (!g->locs) return 1;
