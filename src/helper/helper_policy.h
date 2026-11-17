@@ -6,7 +6,7 @@
  * start. The daemon cannot change it; nothing on the wire names a path,
  * dataset, snapshot or command the policy did not.
  *
- *   [helper]    daemon_uid, daemon_id, max_pause_s, max_captures_per_hour,
+ *   [helper]    daemon_uid, daemon_gid, daemon_id, max_pause_s, max_captures_per_hour,
  *               capture_max_s, allow_restore, allow_define,
  *               allow_privileged_define, state_dir, socket, fake_spec
  *   [units]     allow = <provider>:<glob>, ...
@@ -52,6 +52,9 @@ typedef struct {
 
 typedef struct {
     uid_t    daemon_uid;
+    /* The socket's group: the daemon's gid. Defaults to daemon_uid, which
+     * is what security.run_as_uid gives the daemon as its gid. */
+    gid_t    daemon_gid;
     char     daemon_id[9];
     unsigned max_pause_s;
     unsigned max_captures_per_hour;
@@ -71,6 +74,12 @@ typedef struct {
     size_t   n_dir;
 
     char     btrfs_snapshot_dir[4096];
+    /* Where restore.stage stages, per domain: the first of these inside the
+     * mount's domain. With none, a pool-top domain stages in
+     * <pool>/system/.cbackup-restore (beside the snapshot directory) and any
+     * other in <domain>/.cbackup-restore. */
+    char    *restore_staging_dirs[POLICY_LIST_MAX];
+    size_t   n_staging;
 
     /* [host]: how host tools run (host_tool.h); "" keeps the default. */
     int      host_nsenter;           /* default 1 */

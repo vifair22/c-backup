@@ -64,6 +64,7 @@ static void test_edges_pass(void **state)
     (void)state;
     assert_int_equal(load("http:\n  port: 0\n  bind: 0.0.0.0\n"
                           "jobs:\n  max_parallel: 256\n  read_budget_mb: 48\n"
+                          "vm:\n  export_max_conns: 0\n"
                           "auth:\n  cookie_secure: 1\n"
                           "scheduler:\n  enabled: 0\n"
                           "retention:\n  keep_snaps: 0\n  keep_yearly: 2147483647\n"
@@ -86,6 +87,14 @@ static void test_ranges_refused(void **state)
             "jobs.read_budget_mb: '47' MiB is under 48 MiB, the largest object");
     refused("jobs:\n  read_budget_mb: 0\n", "jobs.read_budget_mb: '0' MiB");
     refused("jobs:\n  read_budget_mb: 1048577\n", "jobs.read_budget_mb: '1048577'");
+    /* Each NBD export connection may hold one 16 MiB object of the budget
+     * beside the 48 a job needs: four want 112 MiB, or exports off. */
+    refused("jobs:\n  read_budget_mb: 64\n",
+            "vm.export_max_conns: '4' needs jobs.read_budget_mb of at least 4 x 16 MiB + 48 MiB = 112 MiB");
+    refused("jobs:\n  read_budget_mb: 111\n", "set jobs.read_budget_mb >= 112, or lower vm.export_max_conns");
+    assert_int_equal(load("jobs:\n  read_budget_mb: 112\n"), CUTILS_OK);
+    assert_int_equal(load("jobs:\n  read_budget_mb: 64\nvm:\n  export_max_conns: 1\n"), CUTILS_OK);
+    refused("vm:\n  export_max_conns: 65\n", "vm.export_max_conns: '65'");
     refused("auth:\n  cookie_secure: 2\n", "auth.cookie_secure: '2' is not between 0 and 1");
     refused("scheduler:\n  enabled: -1\n", "scheduler.enabled: '-1'");
     refused("retention:\n  keep_daily: -1\n", "retention.keep_daily: '-1'");

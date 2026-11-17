@@ -206,3 +206,101 @@ status_t cdc_store_fd(const cdc_params_t *p, int fd, uint64_t size,
 status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
                           uint64_t size, const obj_sink_t *sink,
                           const cdc_opts_t *opts, cdc_result_t *out);
+
+/* ------------------------------------------------------------------ */
+/* Incremental stores (docs/vm-backup.md 5.3, 5.4)                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Changed ranges of a disk since its base, ascending, from 'from' onward:
+ * [*s, *e) with *done 0, or *done 1 when there are no more. A range may
+ * start before from (it is clipped). Several calls may cover adjacent or
+ * overlapping ranges; callers merge them.
+ */
+typedef status_t (*cdc_changed_fn)(void *ctx, uint64_t from, uint64_t *s,
+                                   uint64_t *e, int *done);
+
+/*
+ * What an incremental would cost, computed from the base's chunk list and
+ * the changed ranges alone, before any byte of the disk is read (5.3, "the
+ * fallback rule"). A leaf of the base is re-read when a changed range
+ * meets [its offset, the next leaf's offset + CDC_HOLE_MIN): that window is
+ * exactly the leaf being at or after some range's restart point and
+ * starting before the range's end. estimate is the sum of those leaves'
+ * lengths, so it never counts a hole and slightly undercounts only when a
+ * re-chunk diverges and runs past the next old boundary.
+ */
+typedef struct {
+    uint64_t data_bytes;   /* F: the base's leaf lengths, what a full read reads */
+    uint64_t estimate;     /* E */
+    uint64_t leaves;       /* in the base */
+    uint64_t leaves_hit;   /* of those, counted in E */
+    uint64_t clusters;     /* runs of consecutive counted leaves */
+    uint64_t ranges;       /* changed ranges, merged */
+    uint64_t dirty_bytes;  /* their total length */
+} cdc_delta_estimate_t;
+
+status_t cdc_delta_estimate(const obj_loader_t *ld, const uint8_t base[OBJECT_HASH_SIZE],
+                            uint64_t size, cdc_changed_fn changed, void *changed_ctx,
+                            cdc_delta_estimate_t *out);
+
+typedef struct {
+    cdc_result_t r;
+    uint64_t rechunked;     /* bytes chunked afresh, read from the source */
+    uint64_t resync_bytes;  /* of those, beyond the changed ranges */
+    uint64_t copied_leaves; /* leaves of the base kept as they were */
+    uint64_t restarts;      /* regions re-chunked */
+    uint64_t ranges;        /* changed ranges, merged */
+    uint64_t dirty_bytes;
+} cdc_delta_result_t;
+
+/*
+ * Store the content of src as cdc_store_source would, given that it equals
+ * the content named by base everywhere outside the ranges changed() yields.
+ * Produces the hash a full cdc_store_source over src would (the proof is
+ * in vm-backup.md 5.3): around each changed range the chunker restarts at
+ * an old chunk start at least CDC_HOLE_MIN before it, runs over the new
+ * bytes, and stops at the first cut past the range that lands on an old
+ * boundary before the next range's restart point; the base's leaves in
+ * between are copied as they are.
+ *
+ * src must be a block source: spans by content (the zero-run rule), with
+ * seek. size is the disk's, and must equal the base's length (a resize is a
+ * full read). The base's lists are walked with the loader, leaves never
+ * loaded; memory is bounded by the walk's depth and the chunker's buffers.
+ * A wrong changed set produces a different hash, never a wrong reading of
+ * the base: that is what the audit catches.
+ */
+status_t cdc_store_delta(const cdc_params_t *p, const obj_loader_t *ld,
+                         const uint8_t base[OBJECT_HASH_SIZE],
+                         const cdc_source_t *src, uint64_t size,
+                         cdc_changed_fn changed, void *changed_ctx,
+                         const obj_sink_t *sink, const cdc_opts_t *opts,
+                         cdc_delta_result_t *out);
+
+/*
+ * The audit (5.4): a full read of a disk checked against the incremental
+ * path's claim. Fed every byte of the disk in order (buf NULL for a range
+ * known to be zero), it checks that every leaf of the base lying wholly
+ * outside the changed ranges hashes to that leaf's name in the new bytes,
+ * and that every byte of a base hole outside them is zero. A mismatch
+ * means the changed set missed a change.
+ */
+typedef struct cdc_audit cdc_audit_t;
+
+typedef struct {
+    uint64_t leaves_checked, bytes_checked;   /* leaves and hole bytes */
+    uint64_t leaves_skipped;                  /* touched by a changed range */
+    uint64_t bad_bytes;                       /* in leaves that did not match, and hole bytes not zero */
+    uint64_t first_bad;                       /* offset of the first */
+    int      bad;
+} cdc_audit_result_t;
+
+status_t cdc_audit_open(const obj_loader_t *ld, const uint8_t base[OBJECT_HASH_SIZE],
+                        uint64_t size, cdc_changed_fn changed, void *changed_ctx,
+                        cdc_audit_t **out);
+/* off must be where the previous feed ended (0 first). */
+status_t cdc_audit_feed(cdc_audit_t *a, uint64_t off, const uint8_t *buf, size_t len);
+/* ERR_INVALID when fewer than size bytes were fed. */
+status_t cdc_audit_finish(cdc_audit_t *a, cdc_audit_result_t *out);
+void     cdc_audit_close(cdc_audit_t *a);

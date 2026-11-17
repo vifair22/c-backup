@@ -210,6 +210,17 @@ static void test_define(void **state)
     cJSON_Delete(res);
 }
 
+/* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
+ * that leaves anything behind (SCRATCH-1). Setup removes it too, so a
+ * killed run is no obstacle to the next. */
+static int group_cleanup(void **state)
+{
+    (void)state;
+    int rc = system("rm -rf '" D "'");
+    (void)rc;
+    return 0;
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -217,5 +228,5 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_sweep_thaws, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
     };
-    return cmocka_run_group_tests(tests, NULL, NULL);
+    return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }

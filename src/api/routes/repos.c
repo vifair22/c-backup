@@ -460,6 +460,9 @@ static api_response_t delete_repo(const api_request_t *req, void *userdata)
         return api_error(409, "repo is busy: a job is running against it; "
                               "cancel it or wait, then remove the repository");
     }
+    /* Its NBD exports go first, revoked and journalled, rather than left
+     * serving a repository whose index is about to be purged under them. */
+    exports_close_repo(id, "repository removed");
     status_t st = repo_deregister(db, id);
     repo_unlock(id);
     if (st != OK) return api_error(500, err_msg());

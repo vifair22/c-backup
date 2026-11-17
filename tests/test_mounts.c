@@ -102,11 +102,22 @@ static void test_exclusions(void **state)
     assert_string_equal(m.real, MNT "/cache/Photos/lib");
 }
 
+/* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
+ * that leaves anything behind (SCRATCH-1). Setup removes it too, so a
+ * killed run is no obstacle to the next. */
+static int group_cleanup(void **state)
+{
+    (void)state;
+    int rc = system("rm -rf '" D "'");
+    (void)rc;
+    return 0;
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup(test_resolution, setup),
         cmocka_unit_test_setup(test_exclusions, setup),
     };
-    return cmocka_run_group_tests(tests, NULL, NULL);
+    return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }

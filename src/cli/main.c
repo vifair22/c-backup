@@ -1209,6 +1209,7 @@ static int h_schedule_add(const args_t *a)
      * less --exclude globs) or each --unit by name. */
     const char *uprov = args_value(a, "--provider");
     const char *ureq  = args_value(a, "--require");
+    const char *uscope = args_value(a, "--pause-scope");
     int uall = args_flag(a, "--all");
 
     /* An interval and a calendar are two triggers, and either one alone.
@@ -1258,6 +1259,7 @@ static int h_schedule_add(const args_t *a)
     if (gicase)  sb_puts(&b, ",\"ignore_case\":true");
     if (uprov) { sb_puts(&b, ",\"provider\":"); sb_json_str(&b, uprov); }
     if (ureq)  { sb_puts(&b, ",\"require\":");  sb_json_str(&b, ureq); }
+    if (uscope) { sb_puts(&b, ",\"pause_scope\":"); sb_json_str(&b, uscope); }
     if (uall)  sb_puts(&b, ",\"all\":true");
     if (args_multi_count(a, "--unit") > 0) {
         sb_puts(&b, ",\"units\":");
@@ -1360,6 +1362,7 @@ static int h_unit_backup(const args_t *a)
 {
     const char *prov = args_value(a, "--provider");
     const char *req  = args_value(a, "--require");
+    const char *scope = args_value(a, "--pause-scope");
     int all     = args_flag(a, "--all");
     int no_wait = args_flag(a, "--no-wait");
     if (!prov) return refuse(a, "--provider is required");
@@ -1378,6 +1381,7 @@ static int h_unit_backup(const args_t *a)
         sb_puts(&b, "]");
     }
     if (req) { sb_puts(&b, ",\"require\":"); sb_json_str(&b, req); }
+    if (scope) { sb_puts(&b, ",\"pause_scope\":"); sb_json_str(&b, scope); }
     sb_puts(&b, "}");
     sbuf_t p = { 0 };
     sb_puts(&p, "/repos/"); sb_path_seg(&p, a->pos[0]); sb_puts(&p, "/units/backup");
@@ -1503,6 +1507,22 @@ static int vm_export_by_id(const args_t *a, const char *method)
     sbuf_t p = { 0 };
     sb_puts(&p, "/exports/"); sb_path_seg(&p, a->pos[0]);
     return call_path_sb(method, &p, NULL);
+}
+
+/* A VM's incremental chain (vm-backup.md 5.4, 8.3): the token rows and
+ * whether incrementals are on; and reset-incremental after a failed audit. */
+static int h_vm_checkpoints(const args_t *a)
+{
+    sbuf_t p = { 0 };
+    unit_path(&p, a->pos[0], "libvirt", a->pos[1], "/checkpoints");
+    return call_path_sb("GET", &p, NULL);
+}
+
+static int h_vm_reset_incremental(const args_t *a)
+{
+    sbuf_t p = { 0 };
+    unit_path(&p, a->pos[0], "libvirt", a->pos[1], "/reset-incremental");
+    return call_path_sb("POST", &p, NULL);
 }
 
 static int h_vm_export_show(const args_t *a) { return vm_export_by_id(a, "GET"); }
@@ -1791,13 +1811,15 @@ static const arg_opt_t O_SCHED_ADD[] = {
     { "--unit",        NULL, ARG_MULTI, "NAME" },
     { "--exclude",     NULL, ARG_MULTI, "GLOB" },
     { "--require",     NULL, ARG_VALUE, "LEVEL" },
+    { "--pause-scope", NULL, ARG_VALUE, "unit|group|job" },
     OPT_END,
 };
 static const arg_opt_t O_UNIT_BACKUP[] = {
-    { "--provider", NULL, ARG_VALUE, "P" },
-    { "--all",      NULL, ARG_FLAG,  NULL },
-    { "--exclude",  NULL, ARG_MULTI, "GLOB" },
-    { "--require",  NULL, ARG_VALUE, "LEVEL" },
+    { "--provider",    NULL, ARG_VALUE, "P" },
+    { "--all",         NULL, ARG_FLAG,  NULL },
+    { "--exclude",     NULL, ARG_MULTI, "GLOB" },
+    { "--require",     NULL, ARG_VALUE, "LEVEL" },
+    { "--pause-scope", NULL, ARG_VALUE, "unit|group|job" },
     OPT_NOWAIT, OPT_END,
 };
 static const arg_opt_t O_UNIT_HISTORY[] = {
@@ -1861,6 +1883,11 @@ static const command_t COMMANDS[] = {
     { { "vm exports",      P_NONE,     NULL, NULL }, h_vm_exports, 0 },
     { { "vm export-show",  P_EXPORT,   NULL, NULL }, h_vm_export_show, 0 },
     { { "vm unexport",     P_EXPORT,   NULL, NULL }, h_vm_unexport, 0 },
+    { { "vm checkpoints",  P_UPOL,     NULL, "the VM's incremental chain: a checkpoint per disk, and whether incrementals are on" },
+      h_vm_checkpoints, 0 },
+    { { "vm reset-incremental", P_UPOL, NULL,
+        "after a failed bitmap audit: incrementals back on, the next backup a full read" },
+      h_vm_reset_incremental, 0 },
     { { "snapshots",       P_REPO,     O_PAGING, NULL }, h_snapshots, 0 },
     { { "snapshot delete", P_SNAP,     O_FORCE, NULL }, h_snapshot_delete, 0 },
     { { "snapshot note",   P_NOTE,     NULL, "reads the note, or writes [text]" },

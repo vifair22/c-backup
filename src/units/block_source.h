@@ -33,6 +33,14 @@ typedef struct {
     int trust_zero;
     /* Read window; 0 for the default (4 MiB). */
     size_t window;
+    /*
+     * Optional: every byte of the disk as it is classified, in order and
+     * contiguous from 0 (buf NULL for a range known to be zero), for the
+     * audit (vm-backup.md 5.4). Only meaningful for a forward read with no
+     * seek; a non-OK return fails the read.
+     */
+    status_t (*tap)(void *ctx, uint64_t off, const uint8_t *buf, size_t len);
+    void      *tap_ctx;
 } block_source_opts_t;
 
 typedef struct {
@@ -45,7 +53,9 @@ typedef struct block_source block_source_t;
 
 status_t block_source_open(const sp_block_stream_t *bs, uint64_t size,
                            const block_source_opts_t *opts, block_source_t **out);
-/* The chunker interface over it; valid until close. */
+/* The chunker interface over it; valid until close. Its seek starts the
+ * zero-run rule afresh at the offset given, which is what an incremental
+ * store restarting at an old chunk start needs (vm-backup.md 5.3). */
 cdc_source_t block_source_iface(block_source_t *b);
 void         block_source_stats(const block_source_t *b, block_source_stats_t *out);
 /* Frees the adapter. Does not close the stream. */

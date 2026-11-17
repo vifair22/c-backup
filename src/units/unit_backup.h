@@ -89,3 +89,14 @@ typedef struct {
 status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                          const unit_backup_opts_t *opts, unit_backup_result_t *out);
 void     unit_backup_result_free(unit_backup_result_t *r);
+
+/*
+ * The daemon's start-up step for checkpoints (vm-backup.md 5.8): every
+ * checkpoint a libvirt token names is checked by the helper, which puts back
+ * any libvirt lost from the XML it stored when it made it (Unraid loses all
+ * of them at every reboot). Best effort: a checkpoint that cannot be put
+ * back costs its disks one full read at their next session, which checks
+ * again. *checked, *redefined and *refused (any may be NULL) count them.
+ */
+status_t unit_checkpoints_redefine(cutils_db_t *db, unsigned *checked, unsigned *redefined,
+                                   unsigned *refused);

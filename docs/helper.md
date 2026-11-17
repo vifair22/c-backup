@@ -27,6 +27,7 @@ docker run -d --name c-backup-helper --restart unless-stopped \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /mnt/cache:/mnt/cache:rshared \
+  -v /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock \
   --label net.cbackup.role=helper \
   --entrypoint /usr/local/bin/c-backup-helper \
   c-backup:latest --policy /etc/c-backup-helper.ini
@@ -63,6 +64,9 @@ services:
       - /boot/config/c-backup-helper.ini:/etc/c-backup-helper.ini:ro
       - /mnt/cache/system/c-backup-helper:/mnt/cache/system/c-backup-helper
       - /run/c-backup-helper:/run/c-backup-helper
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt/cache:/mnt/cache:rshared
+      - /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock
   c-backupd:
     image: c-backup:latest
     depends_on: [c-backup-helper]
@@ -82,6 +86,25 @@ services:
 
 Notes that matter:
 
+- **libvirt's socket is mounted into the helper.** The helper connects to
+  `qemu:///system` from its own mount namespace, so without
+  `/var/run/libvirt/libvirt-sock` it cannot reach libvirtd and the libvirt
+  provider reports itself unavailable. Leave it out only on a host with no
+  VMs to back up (`[libvirt] enabled = 0`). `nbd_dir`
+  (`/run/c-backup-helper/nbd` here) sits under the helper's socket
+  directory, so the daemon's existing mount of `/run/c-backup-helper`
+  already shows it at the same path, which libvirt's exports need.
+
+- **Restore staging stays out of sight.** An in-place restore stages in
+  the mount's own domain and swaps by rename. The directory is the first
+  `[snapshot] restore_staging_dirs` entry inside the domain; with none, a
+  whole-pool domain (FS2's `/mnt/cache`) stages in
+  `<pool>/system/.cbackup-restore`, beside the snapshot directory, and a
+  share domain in `<domain>/.cbackup-restore`. Either way it is refused at
+  the top of a pool or in a share exported over SMB or NFS, and refused
+  when it is on another filesystem from the mount (a btrfs subvolume or
+  another dataset), since the swap could not be a rename.
+
 - **The policy lives on the flash** (`/boot/config/`), root-owned, mode 0600
   or 0644. The helper refuses to start on a file anybody but its owner can
   write, an unknown section or key, or a value out of range. Unraid's root
@@ -91,7 +114,13 @@ Notes that matter:
   `holds.json` records every hold it has taken, and its next start releases
   what a crash left held.
 - **The socket directory** `/run/c-backup-helper` should be `0750
-  root:990`; the helper creates the socket `0660`. On every connection the
+  root:990`; the helper creates the socket `0660` with group
+  `daemon_gid` (`[helper] daemon_gid`, default `daemon_uid`, which is the
+  gid `security.run_as_uid` gives the daemon), so the daemon can connect
+  after it drops to uid 990. At start the helper logs the socket's owner,
+  group and mode, and logs a WARNING when the daemon could not reach it: a
+  directory on the way no member of `daemon_gid` may enter, or a socket the
+  group may not write. On every connection the
   helper reads `SO_PEERCRED` and refuses any uid but the policy's
   `daemon_uid`, so the socket is safe to bind-mount into the daemon and
   nowhere else.
@@ -124,6 +153,10 @@ Notes that matter:
   `reconnects`) and, per provider behind it, `connection.state`.
 
 ## The policy
+
+A line starting with `#` or `;` is a comment, and so is `#` or `;` after
+whitespace at the end of a value, as in the examples; an `argv.N` value is
+taken verbatim, `#` and `;` included.
 
 ```ini
 [helper]
@@ -218,6 +251,7 @@ Enabled by the policy, never by the daemon (`docs/container-backup.md`):
 zfs_domains = cache/appdata, cache/system, cache/Photos, cache/lxc
 btrfs_domains = /mnt/cache                 ; FS2: the pool's top level
 btrfs_snapshot_dir = /mnt/cache/system/.cbackup-snapshots
+; restore_staging_dirs = /mnt/cache/system/.cbackup-restore   ; per domain, see below
 
 [host]
 nsenter = 1                ; zfs, btrfs, lxc-* run as the host's binaries
@@ -524,7 +558,15 @@ c-backup vm unexport 9
 ```
 
 `vm.export_dir` must be the same path on the host and in a container.
-The export pins its snapshot and defers gc until it closes.
+The export pins its snapshot, and gc waits in the queue until it closes.
+
+A shut-off VM's disk is read with nothing to stop the VM starting
+meanwhile. The daemon records the image's size, mtime and ctime as the read
+begins and checks them once the last byte is read (a qcow2's too, behind
+its qemu-nbd); if anything wrote the image, that disk and its unit fail
+with "changed while it was read offline", and nothing torn is stored as
+consistent. Run the backup again once the VM is shut off, or back it up
+running.
 
 The NVRAM and TPM state are staged by the daemon under `staging_root`
 (writable by the daemon), and disk staging sits in

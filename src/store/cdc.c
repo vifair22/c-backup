@@ -486,6 +486,17 @@ typedef struct {
     unsigned            jobs, jobs_max;
     status_t            err;            /* first failure, sticky */
     char                errmsg[ERR_MSG_MAX];
+    /*
+     * Incremental stores only: asked after every chunk end at `end`
+     * (span_end set when the span closed there), and a non-zero answer
+     * stops the chunker there, dropping whatever it had read past the cut.
+     * A cut that falls exactly on a span's end is asked twice, first as a
+     * cut and then as the span's end, because a span handed over in pieces
+     * only learns it ended once its closing piece arrives.
+     */
+    int               (*at_end)(void *ctx, uint64_t end, int span_end);
+    void               *at_ctx;
+    int                 stopped;
 } drv_t;
 
 static void drv_fail(drv_t *d, status_t st, const char *msg)
@@ -731,6 +742,11 @@ static status_t chunk_span(drv_t *d, const cdc_source_t *src,
         chunk_abs += scanned;
         blen = spill;
         scanned = 0;
+        if (d->at_end && d->at_end(d->at_ctx, chunk_abs, 0)) {
+            ss->open = 0;
+            d->stopped = 1;
+            return OK;
+        }
     }
     if (more) {
         ss->cs = cs;
@@ -740,7 +756,12 @@ static status_t chunk_span(drv_t *d, const cdc_source_t *src,
     }
     ss->open = 0;
     /* The span's end is a boundary of its own. */
-    if (blen > 0) return emit_chunk(d, cur, blen, chunk_abs);
+    if (blen > 0) {
+        status_t st = emit_chunk(d, cur, blen, chunk_abs);
+        if (st != OK) return st;
+        chunk_abs += blen;
+    }
+    if (d->at_end && d->at_end(d->at_ctx, chunk_abs, 1)) d->stopped = 1;
     return OK;
 }
 
@@ -1064,4 +1085,607 @@ status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
     }
     chunklist_builder_free(d.b);
     return st;
+}
+
+/* ------------------------------------------------------------------ */
+/* Incremental stores (docs/vm-backup.md 5.3, 5.4)                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The changed ranges, merged: adjacent and overlapping ranges become one,
+ * each clipped to [from, size), and a range that goes backwards is refused
+ * rather than trusted. One range of lookahead.
+ */
+typedef struct {
+    cdc_changed_fn fn;
+    void          *ctx;
+    uint64_t       size;
+    uint64_t       pos;         /* where the next raw query starts */
+    int            have_raw, done;
+    uint64_t       rs, re;      /* the raw range read ahead */
+} chg_t;
+
+static status_t chg_raw(chg_t *c)
+{
+    if (c->have_raw || c->done) return OK;
+    if (c->pos >= c->size) { c->done = 1; return OK; }
+    uint64_t s = 0, e = 0;
+    int done = 0;
+    status_t st = c->fn(c->ctx, c->pos, &s, &e, &done);
+    if (st != OK) return st;
+    if (done) { c->done = 1; return OK; }
+    if (s < c->pos) s = c->pos;
+    if (e > c->size) e = c->size;
+    if (e <= s) {
+        if (s >= c->size) { c->done = 1; return OK; }
+        return set_error(ERR_IO, "changed ranges: an empty or backwards range at %llu",
+                         (unsigned long long)s);
+    }
+    c->rs = s;
+    c->re = e;
+    c->have_raw = 1;
+    c->pos = e;
+    return OK;
+}
+
+static status_t chg_next(chg_t *c, uint64_t *s, uint64_t *e, int *got)
+{
+    *got = 0;
+    status_t st = chg_raw(c);
+    if (st != OK || !c->have_raw) return st;
+    *s = c->rs;
+    *e = c->re;
+    c->have_raw = 0;
+    for (;;) {
+        if ((st = chg_raw(c)) != OK) return st;
+        if (!c->have_raw || c->rs > *e) break;
+        if (c->re > *e) *e = c->re;
+        c->have_raw = 0;
+    }
+    *got = 1;
+    return OK;
+}
+
+/*
+ * The base's leaves, forward, with a few of lookahead. A base that is one
+ * FILE object (a disk of one chunk with no holes) is one leaf.
+ */
+#define PW_AHEAD 4
+
+typedef struct {
+    chunklist_iter_t *it;
+    chunklist_item_t  q[PW_AHEAD];
+    int               nq, done;
+    uint64_t          total;
+} pwalk_t;
+
+static status_t pw_open(pwalk_t *w, const obj_loader_t *ld, const uint8_t base[OBJECT_HASH_SIZE])
+{
+    memset(w, 0, sizeof(*w));
+    void *data = NULL;
+    size_t len = 0;
+    uint8_t type = 0;
+    status_t st = ld->load(ld->ctx, base, &data, &len, &type);
+    if (st != OK) return st;
+    if (type == OBJECT_TYPE_FILE) {
+        free(data);
+        w->total = len;
+        if (len) {
+            w->q[0].offset = 0;
+            w->q[0].length = len;
+            memcpy(w->q[0].hash, base, OBJECT_HASH_SIZE);
+            w->nq = 1;
+        }
+        w->done = 1;
+        return OK;
+    }
+    free(data);
+    if (type != OBJECT_TYPE_CHUNKLIST)
+        return set_error(ERR_CORRUPT, "incremental: the base is an object of type %u, not file content", type);
+    chunklist_hdr_t hdr;
+    st = chunklist_iter_open(ld, base, OBJECT_TYPE_FILE, 0, &hdr, &w->it);
+    if (st != OK) return st;
+    w->total = hdr.total_len;
+    return OK;
+}
+
+/* The k-th leaf ahead, or NULL past the last. */
+static status_t pw_peek(pwalk_t *w, int k, const chunklist_item_t **out)
+{
+    *out = NULL;
+    while (w->nq <= k && !w->done) {
+        chunklist_item_t x;
+        int done = 0;
+        status_t st = chunklist_iter_next(w->it, &x, &done);
+        if (st != OK) return st;
+        if (done) { w->done = 1; break; }
+        if (x.is_list) continue;
+        w->q[w->nq++] = x;
+    }
+    if (k < w->nq) *out = &w->q[k];
+    return OK;
+}
+
+static void pw_pop(pwalk_t *w)
+{
+    if (w->nq == 0) return;
+    memmove(&w->q[0], &w->q[1], (size_t)(w->nq - 1) * sizeof(w->q[0]));
+    w->nq--;
+}
+
+static void pw_close(pwalk_t *w)
+{
+    chunklist_iter_close(w->it);
+    w->it = NULL;
+}
+
+static uint64_t lookbehind(uint64_t ds)
+{
+    return ds > CDC_HOLE_MIN ? ds - CDC_HOLE_MIN : 0;
+}
+
+status_t cdc_delta_estimate(const obj_loader_t *ld, const uint8_t base[OBJECT_HASH_SIZE],
+                            uint64_t size, cdc_changed_fn changed, void *changed_ctx,
+                            cdc_delta_estimate_t *out)
+{
+    if (!ld || !ld->load || !base || !changed || !out)
+        return set_error(ERR_INVALID, "cdc_delta_estimate: bad arguments");
+    memset(out, 0, sizeof(*out));
+    pwalk_t w;
+    status_t st = pw_open(&w, ld, base);
+    if (st != OK) return st;
+    if (w.total != size) {
+        pw_close(&w);
+        return set_error(ERR_INVALID, "incremental: the base is %llu bytes and the disk %llu",
+                         (unsigned long long)w.total, (unsigned long long)size);
+    }
+    chg_t c = { changed, changed_ctx, size, 0, 0, 0, 0, 0 };
+    uint64_t rs = 0, re = 0;
+    int have = 0, prev_hit = 0;
+    st = chg_next(&c, &rs, &re, &have);
+    if (st == OK && have) { out->ranges++; out->dirty_bytes += re - rs; }
+    for (;;) {
+        const chunklist_item_t *l = NULL, *n = NULL;
+        if (st != OK || (st = pw_peek(&w, 0, &l)) != OK || !l) break;
+        if ((st = pw_peek(&w, 1, &n)) != OK) break;
+        uint64_t lo = l->offset, len = l->length;
+        /* W(L) = [L.offset, next.offset + CDC_HOLE_MIN). */
+        uint64_t whi = n ? n->offset + CDC_HOLE_MIN : UINT64_MAX;
+        out->leaves++;
+        out->data_bytes += len;
+        /* Ranges ending at or before this leaf cannot meet a later window. */
+        while (have && re <= lo) {
+            if ((st = chg_next(&c, &rs, &re, &have)) != OK) break;
+            if (have) { out->ranges++; out->dirty_bytes += re - rs; }
+        }
+        if (st != OK) break;
+        int hit = have && rs < whi;
+        if (hit) {
+            out->estimate += len;
+            out->leaves_hit++;
+            if (!prev_hit) out->clusters++;
+        }
+        prev_hit = hit;
+        pw_pop(&w);
+    }
+    /* The rest of the ranges, counted. */
+    while (st == OK && have) {
+        if ((st = chg_next(&c, &rs, &re, &have)) != OK) break;
+        if (have) { out->ranges++; out->dirty_bytes += re - rs; }
+    }
+    pw_close(&w);
+    return st;
+}
+
+/* ---- the delta itself ---- */
+
+typedef struct {
+    pwalk_t  *w;
+    chg_t    *c;
+    uint64_t  size;
+    uint64_t  de;               /* end of the range being re-chunked, absorbed ones included */
+    int       have_next;
+    uint64_t  ns, ne;           /* the next range */
+    cdc_delta_result_t *out;
+    int       eof;              /* a chunk ended at the end of the disk */
+    status_t  err;              /* a failure inside the callback, raised after it */
+    char      errmsg[ERR_MSG_MAX];
+} delta_t;
+
+static void delta_fail(delta_t *x, status_t st)
+{
+    if (x->err != OK) return;
+    x->err = st;
+    snprintf(x->errmsg, sizeof(x->errmsg), "%s", err_msg());
+}
+
+/*
+ * After a chunk of the new content ends at c: drop the base's leaves the
+ * re-chunk has passed, absorb every following range whose restart point is
+ * at or before c, and say whether c is a resync point (5.3):
+ *   c >= de, c ends a leaf of the base, and c is before the next range's
+ *   restart point,
+ * the last meaning some leaf of the base starts in (c, p0 of that range].
+ * Under those, the next data byte of the new content after c is the base's
+ * next leaf start (the proof is in 5.3); the kind of boundary is compared
+ * as well, as a check that costs nothing.
+ */
+static int delta_at_end(void *ctx, uint64_t c, int span_end)
+{
+    delta_t *x = ctx;
+    if (x->err != OK) return 1;
+    if (c >= x->size) { x->eof = 1; return 1; }
+    const chunklist_item_t *l = NULL;
+    status_t st;
+    for (;;) {
+        if ((st = pw_peek(x->w, 0, &l)) != OK) { delta_fail(x, st); return 1; }
+        if (!l || l->offset + l->length >= c) break;
+        pw_pop(x->w);
+    }
+    while (x->have_next) {
+        uint64_t p0n = lookbehind(x->ns);
+        /* The first leaf starting after c. */
+        const chunklist_item_t *f = NULL;
+        for (int k = 0; k < PW_AHEAD; k++) {
+            const chunklist_item_t *q = NULL;
+            if ((st = pw_peek(x->w, k, &q)) != OK) { delta_fail(x, st); return 1; }
+            if (!q) break;
+            if (q->offset > c) { f = q; break; }
+        }
+        if (f && f->offset <= p0n) break;          /* c < r_next */
+        if (x->ne > x->de) x->de = x->ne;
+        x->out->ranges++;
+        x->out->dirty_bytes += x->ne - x->ns;
+        int got = 0;
+        if ((st = chg_next(x->c, &x->ns, &x->ne, &got)) != OK) { delta_fail(x, st); return 1; }
+        x->have_next = got;
+    }
+    if (c < x->de) return 0;
+    if (!l || l->offset + l->length != c) return 0;
+    const chunklist_item_t *n = NULL;
+    if ((st = pw_peek(x->w, 1, &n)) != OK) { delta_fail(x, st); return 1; }
+    int hole_after = n ? n->offset > c : 1;
+    return hole_after == span_end;
+}
+
+/* A leaf of the base, kept as it is. Every job ahead of it is taken back
+ * first, so the list keeps its order. */
+static status_t copy_leaf(drv_t *d, const chunklist_item_t *l)
+{
+    if (d->w) {
+        drain(d, 0, 0);
+        if (d->err != OK) return set_error(d->err, "%s", d->errmsg);
+    }
+    obj_put_t put;
+    memset(&put, 0, sizeof(put));
+    memcpy(put.hash, l->hash, OBJECT_HASH_SIZE);
+    d->r->data_bytes += l->length;
+    return consume(d, l->offset, (size_t)l->length, &put);
+}
+
+status_t cdc_store_delta(const cdc_params_t *p, const obj_loader_t *ld,
+                         const uint8_t base[OBJECT_HASH_SIZE],
+                         const cdc_source_t *src, uint64_t size,
+                         cdc_changed_fn changed, void *changed_ctx,
+                         const obj_sink_t *sink, const cdc_opts_t *opts,
+                         cdc_delta_result_t *out)
+{
+    if (!p || !ld || !ld->load || !base || !src || !src->read || !src->seek ||
+        (!src->next_piece && !src->next_span) || !changed || !sink || !sink->put || !out ||
+        size == 0 || size == CDC_SIZE_STREAM)
+        return set_error(ERR_INVALID, "cdc_store_delta: bad arguments");
+    memset(out, 0, sizeof(*out));
+    cdc_result_t *res = &out->r;
+
+    pwalk_t w;
+    status_t st = pw_open(&w, ld, base);
+    if (st != OK) return st;
+    if (w.total != size) {
+        pw_close(&w);
+        return set_error(ERR_INVALID, "incremental: the base is %llu bytes and the disk %llu",
+                         (unsigned long long)w.total, (unsigned long long)size);
+    }
+
+    drv_t d;
+    memset(&d, 0, sizeof(d));
+    d.p = p;
+    d.sink = sink;
+    d.o = opts;
+    d.w = opts ? opts->workers : NULL;
+    d.r = res;
+    d.inflight_max = (opts && opts->inflight_max) ? opts->inflight_max : (size_t)8 * p->max_size;
+    d.jobs_max = d.w ? cdc_workers_count(d.w) * CDC_JOBS_PER_WORKER : 0;
+    uint8_t *cur = NULL, *spare = NULL;
+
+    chg_t c = { changed, changed_ctx, size, 0, 0, 0, 0, 0 };
+    delta_t x;
+    memset(&x, 0, sizeof(x));
+    x.w = &w;
+    x.c = &c;
+    x.size = size;
+    x.out = out;
+
+    uint64_t ds = 0, de = 0, resume = 0;
+    int have = 0, finished = 0;
+    st = chg_next(&c, &ds, &de, &have);
+    if (st == OK && have) { out->ranges++; out->dirty_bytes += de - ds; }
+    while (st == OK && have && !finished) {
+        /* The restart point: the last leaf starting at or before
+         * p0 = ds - CDC_HOLE_MIN (whether p0 is inside it or in the hole
+         * after it), else where the last resync left off. Every leaf
+         * before it is kept. */
+        uint64_t p0 = lookbehind(ds);
+        const chunklist_item_t *l = NULL, *n = NULL;
+        for (;;) {
+            if ((st = pw_peek(&w, 0, &l)) != OK || !l) break;
+            if ((st = pw_peek(&w, 1, &n)) != OK) break;
+            if (!n || n->offset > p0) break;
+            if ((st = copy_leaf(&d, l)) != OK) break;
+            out->copied_leaves++;
+            pw_pop(&w);
+        }
+        if (st != OK) break;
+        uint64_t r = (l && l->offset <= p0) ? l->offset : resume;
+        if (r < resume) r = resume;
+
+        /* Re-chunk from r until a resync or the end of the disk. */
+        x.de = de;
+        if ((st = chg_next(&c, &x.ns, &x.ne, &x.have_next)) != OK) break;
+        if ((st = src->seek(src->ctx, r)) != OK) break;
+        out->restarts++;
+        d.at_end = delta_at_end;
+        d.at_ctx = &x;
+        d.stopped = 0;
+        uint64_t before = res->data_bytes, last_end = r;
+        span_state_t ss;
+        memset(&ss, 0, sizeof(ss));
+        for (;;) {
+            uint64_t s = 0, e = 0;
+            int got = 0, more = 0;
+            st = src->next_piece ? src->next_piece(src->ctx, &s, &e, &got, &more)
+                                 : src->next_span(src->ctx, &s, &e, &got);
+            if (st != OK) break;
+            if (!got) {
+                if (ss.open) st = set_error(ERR_INVALID, "cdc: the source ended inside a span");
+                else finished = 1;      /* the re-chunk ran to the end of the disk */
+                break;
+            }
+            if (e > size || e < s || s < r || (e == s && (more || !ss.open)) ||
+                (ss.open && s != last_end) || (!ss.open && s < last_end)) {
+                st = set_error(ERR_INVALID, "cdc: span [%llu, %llu) outside %llu bytes or out of order",
+                               (unsigned long long)s, (unsigned long long)e, (unsigned long long)size);
+                break;
+            }
+            last_end = e;
+            st = chunk_span(&d, src, s, e, more, &cur, &spare, &ss);
+            if (st == OK && x.err != OK) st = set_error(x.err, "%s", x.errmsg);
+            if (st != OK || d.stopped) break;
+        }
+        d.at_end = NULL;
+        out->rechunked += res->data_bytes - before;
+        if (st != OK) break;
+        if (x.eof) finished = 1;
+        if (finished) break;
+        /* A resync at an old boundary: the leaf ending there was re-made,
+         * and what follows is the base's until the next range. */
+        const chunklist_item_t *j = NULL;
+        if ((st = pw_peek(&w, 0, &j)) != OK) break;
+        resume = j ? j->offset + j->length : size;
+        if (j) pw_pop(&w);          /* j is not valid past this */
+        ds = x.ns;
+        de = x.ne;
+        have = x.have_next;
+        if (have) { out->ranges++; out->dirty_bytes += de - ds; }
+    }
+    /* The rest of the base, unless a re-chunk ran to the end. */
+    while (st == OK && !finished) {
+        const chunklist_item_t *l = NULL;
+        if ((st = pw_peek(&w, 0, &l)) != OK || !l) break;
+        if ((st = copy_leaf(&d, l)) != OK) break;
+        out->copied_leaves++;
+        pw_pop(&w);
+    }
+    pw_close(&w);
+    out->resync_bytes = out->rechunked > out->dirty_bytes ? out->rechunked - out->dirty_bytes : 0;
+
+    if (d.w) {
+        char keep[ERR_MSG_MAX];
+        snprintf(keep, sizeof(keep), "%s", err_msg());
+        drain(&d, 0, 0);
+        if (st == OK && d.err != OK) st = set_error(d.err, "%s", d.errmsg);
+        else if (st != OK) set_error(st, "%s", keep);
+    }
+    buf_put(d.w, cur, d.cur_cap);
+    buf_put(d.w, spare, d.spare_cap);
+
+    res->size = size;
+    /* Named exactly as cdc_store_source names the same content. */
+    int whole = res->chunks == 1 && d.first_off == 0 && d.first_len == size;
+    if (st == OK && whole) {
+        memcpy(res->hash, d.first, OBJECT_HASH_SIZE);
+        res->type = OBJECT_TYPE_FILE;
+    } else if (st == OK) {
+        if (!d.b) {
+            st = chunklist_builder_new(OBJECT_TYPE_FILE, sink, &d.b);
+            if (st == OK && res->chunks == 1)
+                st = chunklist_builder_add(d.b, d.first_off, d.first_len, d.first);
+        }
+        if (st == OK) st = chunklist_builder_finish(d.b, size, res->hash);
+        if (st == OK) {
+            res->type = OBJECT_TYPE_CHUNKLIST;
+            chunklist_builder_stats(d.b, &res->lists);
+            res->phys_new += res->lists.phys_new;
+        }
+    }
+    chunklist_builder_free(d.b);
+    return st;
+}
+
+/* ---- the audit ---- */
+
+struct cdc_audit {
+    pwalk_t      w;
+    chg_t        c;
+    uint64_t     size, pos;
+    int          have;
+    uint64_t     rs, re;          /* the current changed range */
+    /* The leaf being hashed, when it lies outside every range. */
+    int          in_leaf, check;
+    chunklist_item_t leaf;
+    EVP_MD_CTX  *md;
+    cdc_audit_result_t r;
+};
+
+static void audit_bad(cdc_audit_t *a, uint64_t off, uint64_t n)
+{
+    if (!a->r.bad || off < a->r.first_bad) a->r.first_bad = off;
+    a->r.bad = 1;
+    a->r.bad_bytes += n;
+}
+
+/* Advance the range cursor past ranges ending at or before off. */
+static status_t audit_ranges_to(cdc_audit_t *a, uint64_t off)
+{
+    while (a->have && a->re <= off) {
+        int got = 0;
+        status_t st = chg_next(&a->c, &a->rs, &a->re, &got);
+        if (st != OK) return st;
+        a->have = got;
+    }
+    return OK;
+}
+
+status_t cdc_audit_open(const obj_loader_t *ld, const uint8_t base[OBJECT_HASH_SIZE],
+                        uint64_t size, cdc_changed_fn changed, void *changed_ctx,
+                        cdc_audit_t **out)
+{
+    if (!ld || !ld->load || !base || !changed || !out)
+        return set_error(ERR_INVALID, "cdc_audit_open: bad arguments");
+    cdc_audit_t *a = calloc(1, sizeof(*a));
+    if (!a) return set_error(ERR_NOMEM, "audit");
+    status_t st = pw_open(&a->w, ld, base);
+    if (st != OK) { free(a); return st; }
+    if (a->w.total != size) {
+        uint64_t total = a->w.total;
+        pw_close(&a->w);
+        free(a);
+        return set_error(ERR_INVALID, "audit: the base is %llu bytes and the disk %llu",
+                         (unsigned long long)total, (unsigned long long)size);
+    }
+    a->size = size;
+    a->c = (chg_t){ changed, changed_ctx, size, 0, 0, 0, 0, 0 };
+    if (!(a->md = EVP_MD_CTX_new())) { pw_close(&a->w); free(a); return set_error(ERR_NOMEM, "audit"); }
+    st = chg_next(&a->c, &a->rs, &a->re, &a->have);
+    if (st != OK) { cdc_audit_close(a); return st; }
+    *out = a;
+    return OK;
+}
+
+static status_t audit_hash(cdc_audit_t *a, const uint8_t *buf, size_t n)
+{
+    static const uint8_t zero[65536];
+    if (buf) return EVP_DigestUpdate(a->md, buf, n) == 1 ? OK : set_error(ERR_IO, "audit: sha256");
+    while (n > 0) {
+        size_t k = n < sizeof(zero) ? n : sizeof(zero);
+        if (EVP_DigestUpdate(a->md, zero, k) != 1) return set_error(ERR_IO, "audit: sha256");
+        n -= k;
+    }
+    return OK;
+}
+
+status_t cdc_audit_feed(cdc_audit_t *a, uint64_t off, const uint8_t *buf, size_t len)
+{
+    if (!a || off != a->pos || len > a->size - a->pos)
+        return set_error(ERR_INVALID, "audit: fed [%llu, +%zu) out of order",
+                         (unsigned long long)off, len);
+    uint64_t end = off + len;
+    status_t st = OK;
+    while (st == OK && a->pos < end) {
+        uint64_t at = a->pos;
+        const uint8_t *b = buf ? buf + (at - off) : NULL;
+        if (a->in_leaf) {
+            uint64_t le = a->leaf.offset + a->leaf.length;
+            uint64_t k = (le < end ? le : end) - at;
+            if (a->check) st = audit_hash(a, b, (size_t)k);
+            a->pos += k;
+            if (st == OK && a->pos == le) {
+                if (a->check) {
+                    uint8_t h[OBJECT_HASH_SIZE];
+                    unsigned hn = 0;
+                    if (EVP_DigestFinal_ex(a->md, h, &hn) != 1 || hn != OBJECT_HASH_SIZE)
+                        st = set_error(ERR_IO, "audit: sha256");
+                    else if (memcmp(h, a->leaf.hash, OBJECT_HASH_SIZE) != 0)
+                        audit_bad(a, a->leaf.offset, a->leaf.length);
+                    a->r.leaves_checked++;
+                }
+                a->in_leaf = 0;
+                pw_pop(&a->w);
+            }
+            continue;
+        }
+        const chunklist_item_t *l = NULL;
+        if ((st = pw_peek(&a->w, 0, &l)) != OK) break;
+        if (l && l->offset == at) {
+            if ((st = audit_ranges_to(a, at)) != OK) break;
+            a->leaf = *l;
+            a->in_leaf = 1;
+            a->check = !(a->have && a->rs < l->offset + l->length);
+            if (!a->check) a->r.leaves_skipped++;
+            else if (EVP_DigestInit_ex(a->md, EVP_sha256(), NULL) != 1) st = set_error(ERR_IO, "audit: sha256");
+            else {
+                uint8_t type = OBJECT_TYPE_FILE;
+                st = audit_hash(a, &type, 1);
+            }
+            continue;
+        }
+        /* A hole of the base up to the next leaf: zero outside the ranges. */
+        uint64_t he = l ? l->offset : a->size;
+        if (he > end) he = end;
+        if ((st = audit_ranges_to(a, at)) != OK) break;
+        uint64_t q = at;
+        while (q < he) {
+            uint64_t stop = he;
+            int inr = a->have && a->rs <= q;
+            if (inr) { stop = a->re < he ? a->re : he; }
+            else if (a->have && a->rs < he) stop = a->rs;
+            if (!inr && b) {
+                const uint8_t *p = buf + (q - off);
+                size_t n = (size_t)(stop - q);
+                for (size_t i = 0; i < n; i++) {
+                    if (p[i]) {
+                        /* Every non-zero byte counts, the first sets the offset. */
+                        size_t bad = 0;
+                        for (size_t k = i; k < n; k++) bad += p[k] != 0;
+                        audit_bad(a, q + i, bad);
+                        break;
+                    }
+                }
+                a->r.bytes_checked += n;
+            } else if (!inr) {
+                a->r.bytes_checked += stop - q;
+            }
+            q = stop;
+            if ((st = audit_ranges_to(a, q)) != OK) break;
+        }
+        a->pos = he;
+    }
+    return st;
+}
+
+status_t cdc_audit_finish(cdc_audit_t *a, cdc_audit_result_t *out)
+{
+    if (!a || !out) return set_error(ERR_INVALID, "cdc_audit_finish: bad arguments");
+    if (a->pos != a->size)
+        return set_error(ERR_INVALID, "audit: %llu of %llu bytes seen",
+                         (unsigned long long)a->pos, (unsigned long long)a->size);
+    *out = a->r;
+    return OK;
+}
+
+void cdc_audit_close(cdc_audit_t *a)
+{
+    if (!a) return;
+    pw_close(&a->w);
+    EVP_MD_CTX_free(a->md);
+    free(a);
 }

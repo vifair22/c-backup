@@ -14,6 +14,18 @@ CLI="${2:-build/bins/c-backup}"
 HELPER="${3:-build/bins/c-backup-helper}"
 TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
 mkdir -p "$TEST_ROOT"
+# As root (CI) the daemon runs as uid 990 (below), which has to reach its
+# work tree: a checkout under a directory only root may enter (CI job 19985:
+# the daemon could not even see its config.yaml). Search permission for
+# others is added on the way down to the test directory, nothing else, as
+# hf_unroot does for the C suites.
+if [ "$(id -u)" = 0 ]; then
+    d="$TEST_ROOT"
+    while [ -n "$d" ] && [ "$d" != / ]; do
+        [ -d "$d" ] && chmod o+x "$d"
+        d="${d%/*}"
+    done
+fi
 WORK="$(mktemp -d "$TEST_ROOT/c_backup_helper_e2e.XXXXXX")"
 PORTBASE=$((20000 + ($$ % 15000) * 3))
 port_busy() { ss -Htan "( sport = :$1 )" 2>/dev/null | grep -q .; }
@@ -51,13 +63,31 @@ cat > "$WORK/units.json" <<EOF
   "blobs":[{"id":"domain.xml","path":".cbackup-unit/config/domain.xml","text":"<domain>a</domain>"}],
   "disks":[{"id":"vda","size":4194304,"runs":[{"off":0,"len":1048576,"kind":"data","seed":3}]}],
   "trees":[{"id":"vol","read_root":"$WORK/snap","path":"$WORK/pool/app/a"}]},
+ {"id":"c","name":"cbk-uat-c","state":"running","caps":["quiesce"],
+  "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}]},
  {"id":"p","name":"prod-db","state":"running",
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"secret"}]}
 ]}
 EOF
+# The helper refuses daemon_uid 0 by design, and CI runs as root. There the
+# daemon is started as a fixed non-root uid, which the policy names, and the
+# work tree is that uid's; anywhere else both are the current user. (Started
+# as that uid rather than dropping with security.run_as_uid, because the
+# drop comes after the state database is opened, which would leave it
+# root's.)
+if [ "$(id -u)" = 0 ]; then
+    DUID=990
+    DGID=990
+    AS_DAEMON=(setpriv --reuid="$DUID" --regid="$DUID" --clear-groups --)
+else
+    DUID=$(id -u)
+    DGID=$(id -g)
+    AS_DAEMON=()
+fi
 cat > "$WORK/policy.ini" <<EOF
 [helper]
-daemon_uid = $(id -u)
+daemon_uid = $DUID
+daemon_gid = $DGID
 daemon_id = 0badf00d
 max_pause_s = 30
 capture_max_s = 3600
@@ -98,7 +128,9 @@ security:
 units:
   helper_socket: $HSOCK
 EOF
-C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" > "$WORK/daemon.log" 2>&1 &
+# The policy stays root's: the helper refuses one another uid owns.
+[ "$(id -u)" = 0 ] && chown -R "$DUID" "$WORK" && chown 0 "$WORK/policy.ini"
+C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "${AS_DAEMON[@]}" "$DAEMON" > "$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 if [ ! -S "$SOCK" ]; then echo "daemon did not start"; cat "$WORK/daemon.log"; exit 1; fi
@@ -134,6 +166,23 @@ HELPER_PID=$!
 for _ in $(seq 1 50); do [ -S "$HSOCK" ] && break; sleep 0.1; done
 if [ ! -S "$HSOCK" ]; then echo "helper did not start"; cat "$WORK/helper.log"; exit 1; fi
 check "the socket is 0660" 660 "$(stat -c %a "$HSOCK")"
+check "its group is the daemon's" "$DGID" "$(stat -c %g "$HSOCK")"
+contains "the helper logs the socket's owner, group and mode" "group $DGID mode 0660" "$(cat "$WORK/helper.log")"
+if [ "$(id -u)" = 0 ]; then
+    # daemon_gid changes the socket's group (root may give any group); a
+    # directory the group cannot enter is warned about, loudly.
+    mkdir -p "$WORK/shut"
+    chmod 0700 "$WORK/shut"
+    sed -e "s|^socket = .*|socket = $WORK/shut/h2.sock|" -e "s|^daemon_gid = .*|daemon_gid = 4242|" \
+        -e "s|^state_dir = .*|state_dir = $WORK/hstate2|" "$WORK/policy.ini" > "$WORK/policy2.ini"
+    chmod 0600 "$WORK/policy2.ini"
+    "$HELPER" --policy "$WORK/policy2.ini" > "$WORK/helper2.log" 2>&1 &
+    H2=$!
+    for _ in $(seq 1 50); do [ -S "$WORK/shut/h2.sock" ] && break; sleep 0.1; done
+    check "daemon_gid sets the socket's group" 4242 "$(stat -c %g "$WORK/shut/h2.sock" 2>/dev/null)"
+    contains "an unreachable socket directory is warned about" "WARNING: no member of group 4242" "$(cat "$WORK/helper2.log")"
+    kill "$H2"; wait "$H2" 2>/dev/null
+fi
 # The daemon reconnects on its own, within its backoff (at most 30 s).
 for _ in $(seq 1 400); do
     cb unit providers | grep -q '"state":"connected"' && break
@@ -178,6 +227,29 @@ contains "its warning is in the journal" "fake define" "$(cb journal 1)"
 OUT=$(cb unit restore 1 1 --define --replace)
 contains "an in-place restore completes" '"state":"completed"' "$OUT"
 check    "the data is back in place" alpha "$(cat "$WORK/pool/app/a/a.txt")"
+
+echo "a scheduled pause scope"
+# pause_scope used to be dropped from a units schedule's parameters, so a
+# scheduled job scope ran unit by unit, accepted and not honoured.
+OUT=$(cb schedule add 1 units 1 --provider fake --unit cbk-uat-a --unit cbk-uat-c --pause-scope job)
+SID2=$(printf '%s' "$OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "a units schedule keeps its pause scope" 'pause_scope' "$(cb schedule list 1)"
+for _ in $(seq 1 100); do
+    grep -q "2 unit(s) in one capture" "$WORK/daemon.log" && break; sleep 0.1
+done
+contains "and its run captures both units in one capture" "2 unit(s) in one capture" "$(cat "$WORK/daemon.log")"
+cb schedule remove 1 "$SID2" >/dev/null
+for _ in $(seq 1 100); do
+    case "$(cb jobs --limit 3)" in *'"state":"running"'*|*'"state":"queued"'*) sleep 0.1 ;; *) break ;; esac
+done
+if command -v curl >/dev/null 2>&1; then
+    OUT=$(curl -s --unix-socket "$SOCK" -X POST http://x/repos/1/schedules \
+          -d '{"action":"units","trigger":{"type":"interval","seconds":3600},"provider":"fake","all":true,"pause_scop":"job"}')
+    contains "an unknown key in a schedule is refused" "unknown key 'pause_scop'" "$OUT"
+    OUT=$(curl -s --unix-socket "$SOCK" -X POST http://x/repos/1/units/backup \
+          -d '{"provider":"fake","all":true,"pausescope":"job"}')
+    contains "and in a units job" "unknown key 'pausescope'" "$OUT"
+fi
 
 echo "helper gone"
 kill "$HELPER_PID"; wait "$HELPER_PID" 2>/dev/null; HELPER_PID=

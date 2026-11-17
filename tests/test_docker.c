@@ -15,6 +15,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -523,7 +524,7 @@ static int setup_units(void **state)
     if (repo_register(udb, D "/repo", "t", &urepo) != OK) return -1;
     if (repo_store_open(D "/repo", NULL, &ustore) != OK) return -1;
     if (store_index_bind(ustore, udb, urepo, &uidx) != OK) return -1;
-    units_config_t uc = { "", 2, 10, 30, 1 };
+    units_config_t uc = { "", 2, 10, 30, 1, 0, 75, 30 };
     if (units_init(udb, NULL, &uc) != OK) return -1;
     return sp_registry_add(be.ops, be.ctx) == OK ? 0 : -1;
 }
@@ -771,8 +772,25 @@ static void test_demux(void **state)
     assert_int_equal(docker_demux_feed(&m, bad, sizeof(bad), sink, &out), -1);
 }
 
+/* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
+ * that leaves anything behind (SCRATCH-1). Setup removes it too, so a
+ * killed run is no obstacle to the next. */
+static int group_cleanup(void **state)
+{
+    (void)state;
+    int rc = system("rm -rf '" D "'");
+    (void)rc;
+    return 0;
+}
+
 int main(void)
 {
+    /* As c-backup-helper does (helper_main.c): a write to a pipe or socket
+     * whose reader has gone (a dump nobody reads any more, the fake engine
+     * closing first) is an EPIPE to handle, not the end of the process.
+     * Left at the default, a run under load died of SIGPIPE in a later
+     * test, from an exec thread of an earlier one. */
+    signal(SIGPIPE, SIG_IGN);
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_instant_no_pause, setup, teardown),
@@ -790,5 +808,5 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),
         cmocka_unit_test(test_demux),
     };
-    return cmocka_run_group_tests(tests, NULL, NULL);
+    return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }

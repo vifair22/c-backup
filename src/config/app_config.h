@@ -190,6 +190,12 @@ static const config_key_t app_file_keys[] = {
     { "vm.export_ttl_s", CFG_INT, "14400",
       "Default lifetime of an NBD export, seconds (60 to 604800)",
       CFG_STORE_FILE, 0 },
+    /* Each connection keeps at most one chunk (16 MiB at most) under the
+     * read budget; app_config_check refuses a budget that cannot cover
+     * them beside one job's own floor. 0 turns exports off. */
+    { "vm.export_max_conns", CFG_INT, "4",
+      "NBD export connections open at once across every export (0 to 64; 0: off)",
+      CFG_STORE_FILE, 0 },
     { "vm.export_idle_s", CFG_INT, "1800",
       "An export with no connection for this long is closed, seconds",
       CFG_STORE_FILE, 0 },
@@ -206,6 +212,18 @@ static const config_key_t app_file_keys[] = {
       CFG_STORE_FILE, 0 },
     { "vm.trust_zero_status", CFG_INT, "1",
       "Skip reading disk extents reported as zero (0 reads them too)",
+      CFG_STORE_FILE, 0 },
+    /* Incremental disk reads (docs/vm-backup.md 5). Off until UAT has run
+     * them (5.3 and section 13, R3): the delta is new code on the
+     * correctness path, and every session reads in full until this is 1. */
+    { "vm.incremental", CFG_INT, "0",
+      "Read qcow2 disks of running VMs incrementally through checkpoints (0: every read full)",
+      CFG_STORE_FILE, 0 },
+    { "vm.delta_full_pct", CFG_INT, "75",
+      "Read a disk in full when an incremental would read more than this share of it, % (0 to 100; 0: never incremental)",
+      CFG_STORE_FILE, 0 },
+    { "vm.audit_days", CFG_INT, "30",
+      "Days between audit reads that check a disk's dirty bitmap against a full read (0: never)",
       CFG_STORE_FILE, 0 },
     { "containers.max_pause_s", CFG_INT, "30",
       "Watchdog bound on a container pause, seconds (1 to 600)",

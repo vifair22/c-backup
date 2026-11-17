@@ -1379,7 +1379,9 @@ it); a unit outside it is not listed and cannot be described or backed up.
 | GET | `/repos/<id>/units` | Units with history here: last snapshot, its level, how many, paginated by name |
 | GET | `/repos/<id>/units/<p>/<u>/snapshots` | That unit's snapshots, newest first, each with its level and items (`read_mode`, `reason`, `bytes_read`) |
 | GET/PUT | `/repos/<id>/units/<p>/<u>/policy` | Per-unit policy: `retention.keep_*` keys over the repository's; `capture.exclude` (patterns on recorded paths, one per line, applied only when set); `capture.group` (units captured together under `pause_scope: group`); `null` or `""` drops one; GET shows the unit's own and what is in force |
-| POST | `/repos/<id>/units/backup` | `{"provider":"fake","all":true,"exclude":["x*"]}` or `{"provider":"fake","units":["a"]}`, optional `"require":"crash"` (the default) and `"pause_scope":"unit"` (the default), `"group"` (units sharing a `capture.group` captured together) or `"job"` (every unit at one instant); 202 with a job. The job fails when any unit fails, and its result lists each unit's outcome and snapshot |
+| GET | `/repos/<id>/units/<p>/<u>/checkpoints` | The unit's incremental chain (vm-backup.md 5.8): `incremental` (`enabled`, `disabled_reason` and `disabled_at` after a failed audit, `last_audit_at`, `audit_days`, `delta_full_pct`) and `tokens`, one per disk: `item`, `checkpoint`, the `snapshot` it describes, `usable`, `identity`, `created_at` |
+| POST | `/repos/<id>/units/<p>/<u>/reset-incremental` | After a failed bitmap audit: incrementals back on for the unit, every token made unusable so the next backup is a full read under a new checkpoint (the old one is retired when it commits). Journalled. Answers `unit_key` and `was_disabled`, the reason they were off |
+| POST | `/repos/<id>/units/backup` | `{"provider":"fake","all":true,"exclude":["x*"]}` or `{"provider":"fake","units":["a"]}`, optional `"require":"crash"` (the default) and `"pause_scope":"unit"` (the default; a `units` schedule stores and honours it too, `--pause-scope` from the CLI; any other key is refused), `"group"` (units sharing a `capture.group` captured together) or `"job"` (every unit at one instant); 202 with a job. The job fails when any unit fails, and its result lists each unit's outcome and snapshot |
 | POST | `/repos/<id>/snapshots/<sid>/unit/restore` | `{"mode":"files","dest":"/abs/dir"}`, the whole snapshot with each disk as a sparse raw file; or `{"mode":"item","item":"vda","dest":"/abs/file","format":"raw"}`, one item, written through `<dest>.cbk-partial` and never over an existing path; or `{"mode":"unit","replace":true}` (in place: stopped, staged, swapped, the old data moved aside) or `{"mode":"unit","name":"N","target_root":"/abs"}` (a new unit with its data under the target root), with optional `pin_digest`, `start`, `keep_macs`; the definition is re-created through the helper. 202 with a job |
 
 A retention pass (`POST /repos/<id>/gfs`) runs once per retention group: the
@@ -1394,16 +1396,22 @@ without restoring the image:
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/repos/<id>/snapshots/<sid>/unit/export` | `{"item":"vda","ttl_s":14400}` (`ttl_s` 60 to 604800, default `vm.export_ttl_s`). 201 with `export_id`, `socket`, `name`, `size`, `expires` (wall clock), `idle_timeout_s` and an `attach` command line. The `name` (128 random bits) is returned here only; 400 for an item that is not a disk, 404 for no such snapshot or item, 503 while gc or another writer holds the repository |
-| GET | `/exports` | Open exports: id, repo, snapshot, item, socket, size, caller, created and expiry times, live `connections` and `bytes_served`; never the name |
-| GET | `/exports/<id>` | One, open or closed; a closed one has `closed_at` and `close_reason` (`revoked`, `expired`, `idle`, `daemon stopped`, `daemon restarted`) |
+| GET | `/exports` | Open exports: id, repo, snapshot, item, socket, size, caller, created and expiry times, live `connections`, `bytes_served` and `cache_bytes` (read budget its connections hold); never the name |
+| GET | `/exports/<id>` | One, open or closed; a closed one has `closed_at` and `close_reason` (`revoked`, `expired`, `idle`, `repository removed`, `daemon stopped`, `daemon restarted`) |
 | DELETE | `/exports/<id>` | Revoke: disconnect every client, remove the socket, close. 204 |
 
 An open export pins its snapshot: deleting it is refused even with
 `force` (`ERR_BUSY`, the message names the export) and retention keeps it
-as if tagged; a gc on its repository fails with "gc deferred" and runs
-again on its next schedule. An export closes at its expiry, after
-`vm.export_idle_s` with no connection, when revoked, and when the daemon
-stops; the ids are `AUTOINCREMENT` and opening and closing are journalled
+as if tagged. A gc on its repository waits in the queue, phase "waiting for
+an NBD export to close", and runs once the export closes; the export's ttl
+(at most 7 days) bounds that wait. Removing the repository revokes its
+exports first. Each connection holds at most one chunk of the read budget
+while it reads and none once it idles for a second; `vm.export_max_conns`
+(default 4, 0 turns exports off) caps connections across every export, and
+the daemon refuses to start when `jobs.read_budget_mb` cannot hold that
+many 16 MiB chunks beside a job's 48 MiB. An export closes at its expiry,
+after `vm.export_idle_s` with no connection, when revoked, when its
+repository is removed, and when the daemon stops; the ids are `AUTOINCREMENT` and opening and closing are journalled
 with the caller. The server speaks fixed newstyle with structured replies,
 `NBD_OPT_GO`/`INFO`, `base:allocation` (the snapshot's holes are holes to
 the client), `READ`, `BLOCK_STATUS` and `DISC`; writes are refused with

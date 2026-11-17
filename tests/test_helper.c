@@ -43,6 +43,17 @@ static void hstart(unsigned uid, unsigned pause_s, unsigned capture_s, unsigned 
     assert_int_equal(helper_server_start(&cfg, &srv), OK);
 }
 
+/* hstart with the fixture policy and extra text after it. */
+static void hstart_plus(const char *extra)
+{
+    char text[8192];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
+    strncat(text, extra, sizeof(text) - strlen(text) - 1);
+    assert_int_equal(helper_policy_parse(text, &pol), OK);
+    helper_server_cfg_t cfg = { &pol, fk, 0, 50, NULL, 0 };
+    assert_int_equal(helper_server_start(&cfg, &srv), OK);
+}
+
 static void hstop(void)
 {
     helper_server_stop(srv);
@@ -112,6 +123,56 @@ static char *req(const char *op, const char *args)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * The examples in docs/helper.md put a comment after a value. The parser
+ * used to take the comment as part of the value and refuse it, so a policy
+ * copied from the docs did not start. A '#' after whitespace now ends the
+ * value; a '#' inside a value, and anything in argv.N, is kept.
+ */
+static void test_policy_inline_comments(void **state)
+{
+    (void)state;
+    const char *text =
+        "[helper]\n"
+        "daemon_uid = 990              # the only peer uid accepted (non-root)\n"
+        "daemon_id = 7f3a09c1          # the daemon id artefacts are named with\n"
+        "max_pause_s = 30\t; watchdog bound, the other comment style\n"
+        "allow_restore = 1             # restore.stage, restore.swap\n"
+        "state_dir = /mnt/cache/system/c-backup-helper   # on a pool\n"
+        "[units]\n"
+        "allow = docker:cbk-*   # a glob\n"
+        "[snapshot]\n"
+        "dir_domains =                  # directory domains (tests, begin_paths)\n"
+        "[hook h]\n"
+        "unit = docker:cbk-a   # the unit\n"
+        "kind = dump                    # dump: stdout comes back as a pipe fd\n"
+        "argv.0 = /bin/sh\n"
+        "argv.1 = -c\n"
+        "argv.2 = echo a # not a comment here ; nor this\n";
+    helper_policy_t p;
+    assert_int_equal(helper_policy_parse(text, &p), OK);
+    assert_int_equal(p.daemon_uid, 990);
+    assert_string_equal(p.daemon_id, "7f3a09c1");
+    assert_int_equal(p.max_pause_s, 30);
+    assert_true(p.allow_restore);
+    assert_string_equal(p.state_dir, "/mnt/cache/system/c-backup-helper");
+    assert_int_equal(p.n_hooks, 1);
+    assert_string_equal(p.hooks[0].argv[2], "echo a # not a comment here ; nor this");
+    helper_policy_free(&p);
+    /* A value that is wrong is still refused, comment or not. */
+    {
+        helper_policy_t g;
+        assert_int_equal(helper_policy_parse("[helper]\ndaemon_uid = 990\ndaemon_gid = 4242\n"
+                                             "daemon_id = 7f3a09c1\nstate_dir = /x\n", &g), OK);
+        assert_int_equal(g.daemon_gid, 4242);
+        helper_policy_free(&g);
+        assert_int_not_equal(helper_policy_parse("[helper]\ndaemon_uid = 990\ndaemon_gid = 0\n"
+                                                 "daemon_id = 7f3a09c1\nstate_dir = /x\n", &g), OK);
+    }
+    assert_int_not_equal(helper_policy_parse("[helper]\ndaemon_uid = 0   # root\n"
+                                             "daemon_id = 7f3a09c1\nstate_dir = /x\n", &p), OK);
+}
+
 static void test_policy(void **state)
 {
     (void)state;
@@ -120,6 +181,7 @@ static void test_policy(void **state)
     helper_policy_t p;
     assert_int_equal(helper_policy_parse(text, &p), OK);
     assert_int_equal(p.daemon_uid, 990);
+    assert_int_equal(p.daemon_gid, 990);          /* defaults to daemon_uid */
     assert_string_equal(p.daemon_id, "0badf00d");
     assert_int_equal(p.n_hooks, 3);
     assert_int_equal(p.n_allow, 2);
@@ -395,6 +457,70 @@ static void test_compromised_daemon(void **state)
     hstop();
 }
 
+/* The error message of a response, "" for none. */
+static const char *msg_of(const cJSON *o)
+{
+    const char *m = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(o, "error"), "msg"));
+    return m ? m : "";
+}
+
+/*
+ * Where a restore stages (Manual review item 4). Here the pool is
+ * HF_DIR/pool under mnt_root HF_DIR, a whole-pool domain like FS2's
+ * /mnt/cache: staging defaults beside the snapshot directory, in
+ * <pool>/system/.cbackup-restore, never at the pool's top; an exported
+ * share and the top of a pool are refused, configured or not; a configured
+ * directory inside an unexported share is used.
+ */
+static void test_restore_staging_place(void **state)
+{
+    (void)state;
+    const char *host = "\n[host]\nmnt_root = " HF_DIR "\nboot_config = " HF_DIR "/boot\nhost_root =\n";
+    const char *stage = "{\"unit\":\"fake:u1\",\"mount\":\"" HF_MOUNT "\",\"job\":9}";
+    hstart_plus(host);
+    cJSON *o = call(req("restore.stage", stage), NULL);
+    assert_string_equal(code_of(o), "ok");
+    const char *path = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(o, "result"), "path"));
+    assert_non_null(path);
+    assert_int_equal(strncmp(path, HF_POOL "/system/.cbackup-restore/", strlen(HF_POOL "/system/.cbackup-restore/")), 0);
+    cJSON_Delete(o);
+    struct stat sb;
+    assert_int_not_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
+
+    /* The system share exported over SMB: refused, and said why. */
+    assert_int_equal(mkdir(HF_DIR "/boot", 0755), 0);
+    assert_int_equal(mkdir(HF_DIR "/boot/shares", 0755), 0);
+    hf_write(HF_DIR "/boot/shares/system.cfg", "shareComment=\"\"\nshareExport=\"e\"\nshareExportNFS=\"-\"\n");
+    o = call(req("restore.stage", stage), NULL);
+    assert_string_equal(code_of(o), "denied");
+    assert_non_null(strstr(msg_of(o), "exported"));
+    cJSON_Delete(o);
+    hstop();
+
+    /* Configured at the top of the pool: refused like the default would be. */
+    hstart_plus("\n[snapshot]\nrestore_staging_dirs = " HF_POOL "/.staging\n" "\n[host]\nmnt_root = " HF_DIR
+                "\nboot_config = " HF_DIR "/boot\nhost_root =\n");
+    o = call(req("restore.stage", stage), NULL);
+    assert_string_equal(code_of(o), "denied");
+    assert_non_null(strstr(msg_of(o), "top of a pool"));
+    cJSON_Delete(o);
+    hstop();
+
+    /* Configured inside a share nobody exports: used. */
+    hstart_plus("\n[snapshot]\nrestore_staging_dirs = " HF_POOL "/app/.cbackup-restore\n" "\n[host]\nmnt_root = " HF_DIR
+                "\nboot_config = " HF_DIR "/boot\nhost_root =\n");
+    o = call(req("restore.stage", stage), NULL);
+    assert_string_equal(code_of(o), "ok");
+    path = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(o, "result"), "path"));
+    assert_non_null(path);
+    assert_int_equal(strncmp(path, HF_POOL "/app/.cbackup-restore/", strlen(HF_POOL "/app/.cbackup-restore/")), 0);
+    cJSON_Delete(o);
+    hstop();
+}
+
 static void test_capture_lifecycle(void **state)
 {
     (void)state;
@@ -619,8 +745,11 @@ static void test_socket(void **state)
 
 int main(void)
 {
+    if (hf_unroot() != 0) { perror("cannot leave root for the helper suites"); return 1; }
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_policy),
+        cmocka_unit_test(test_policy_inline_comments),
+        cmocka_unit_test_setup_teardown(test_restore_staging_place, setup, teardown),
         cmocka_unit_test(test_unit_key_grammar),
         cmocka_unit_test_setup_teardown(test_malformed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_fuzz_requests, setup, teardown),

@@ -48,6 +48,26 @@ char *unit_json_encode(const unit_json_t *u, size_t *len)
                      cJSON_AddStringToObject(j, "reason", it->reason);
         if (ok && strcmp(it->kind, "block") == 0)
             ok = cJSON_AddNumberToObject(j, "bytes_read", (double)it->bytes_read) != NULL;
+        if (ok && it->have_incr) {
+            cJSON *x = cJSON_AddObjectToObject(j, "incremental");
+            ok = x && cJSON_AddStringToObject(x, "checkpoint", it->checkpoint) &&
+                 cJSON_AddNumberToObject(x, "base_snapshot", (double)it->base_snapshot) &&
+                 cJSON_AddNumberToObject(x, "estimate", (double)it->estimate) &&
+                 cJSON_AddNumberToObject(x, "data_bytes", (double)it->data_bytes) &&
+                 cJSON_AddNumberToObject(x, "clusters", (double)it->clusters) &&
+                 cJSON_AddNumberToObject(x, "ranges", (double)it->ranges) &&
+                 cJSON_AddNumberToObject(x, "dirty_bytes", (double)it->dirty_bytes) &&
+                 cJSON_AddNumberToObject(x, "resync_bytes", (double)it->resync_bytes) &&
+                 cJSON_AddNumberToObject(x, "delta_full_pct", it->delta_full_pct);
+            if (ok && it->audited) {
+                cJSON *a = cJSON_AddObjectToObject(x, "audit");
+                ok = a && cJSON_AddBoolToObject(a, "passed", !it->audit_bad) &&
+                     cJSON_AddNumberToObject(a, "leaves_checked", (double)it->audit_leaves) &&
+                     cJSON_AddNumberToObject(a, "bad_bytes", (double)it->audit_bad_bytes);
+                if (ok && it->audit_bad)
+                    ok = cJSON_AddNumberToObject(a, "first_bad", (double)it->audit_first_bad) != NULL;
+            }
+        }
         if (!ok) break;
     }
     cJSON *w = ok && items ? cJSON_AddArrayToObject(o, "warnings") : NULL;
