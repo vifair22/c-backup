@@ -404,8 +404,10 @@ static void test_journal_source_says_who_asked(void **state)
     wait_for(1);
     submit(1, "gc");
     wait_for(2);
-    /* Each journal entry is written after its job function returns. */
-    assert_int_equal(wait_db_count("SELECT COUNT(*) FROM journal", 2), 2);
+    /* The worker finishes a job after its function returns, so wait for
+     * what a client sees, the state; the entry is there with it (B159). */
+    assert_int_equal(wait_db_count("SELECT COUNT(*) FROM jobs WHERE state = 'completed'", 2), 2);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal"), 2);
 
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'daemon'"), 0);
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'schedule'"
@@ -438,7 +440,8 @@ static void test_startup_jobs_say_startup(void **state)
     assert_int_equal(job_submit_scheduled(jm, 1, "gc", NULL, -1, probe_job,
                                           (void *)(intptr_t)1, NULL, &id), OK);
     wait_for(2);
-    assert_int_equal(wait_db_count("SELECT COUNT(*) FROM journal", 2), 2);
+    assert_int_equal(wait_db_count("SELECT COUNT(*) FROM jobs WHERE state = 'completed'", 2), 2);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal"), 2);
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'startup'"
                               " AND operation = 'reindex'"), 1);
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'api'"
@@ -460,6 +463,49 @@ static void test_startup_jobs_say_startup(void **state)
     assert_int_equal(job_manager_start(db, 2, &jm), OK);
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'startup'"
                               " AND message = 'interrupted by daemon restart'"), 1);
+}
+
+/* Returns at once: the window under test is the worker's, after it. Even
+ * arguments succeed and odd ones fail, so both outcomes are polled. */
+static status_t instant_job(void *arg, atomic_int *cancel,
+                            void (*progress)(const char *, uint64_t, uint64_t, void *),
+                            void *progress_ctx)
+{
+    (void)cancel; (void)progress; (void)progress_ctx;
+    if ((intptr_t)arg % 2) return set_error(ERR_IO, "instant failure");
+    return OK;
+}
+
+/*
+ * A client that polls a job until it has finished finds its journal entry
+ * at that moment, with no wait (B159). The state was written first and the
+ * entry a moment later, so the CLI suite, polling a startup reindex to
+ * completed and then reading the journal, intermittently found nothing.
+ * Each job is polled as fast as the handle answers, which is what made the
+ * window visible, and the entry is counted on the first read that sees the
+ * job finished.
+ */
+static void test_a_finished_job_is_already_journalled(void **state)
+{
+    (void)state;
+    enum { N = 200 };
+    for (int k = 0; k < N; k++) {
+        int64_t id = 0;
+        assert_int_equal(job_submit(jm, 1, k % 2 ? "verify" : "gc", NULL, instant_job,
+                                    (void *)(intptr_t)k, NULL, &id), OK);
+        char q[160], st[32] = "";
+        snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)id);
+        for (long spin = 0; spin < 50000000L; spin++) {
+            if (db_text(q, st, sizeof(st)) == 0 &&
+                (strcmp(st, "completed") == 0 || strcmp(st, "failed") == 0))
+                break;
+            sched_yield();
+        }
+        assert_string_equal(st, k % 2 ? "failed" : "completed");
+        assert_int_equal(db_count("SELECT COUNT(*) FROM journal"), k + 1);
+    }
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE result = 'failed'"
+                              " AND message = 'instant failure'"), N / 2);
 }
 
 /*
@@ -1486,6 +1532,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_one_repo_never_runs_two_jobs_at_once, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_finished_job_is_already_journalled, setup, teardown),
         cmocka_unit_test_setup_teardown(test_queued_jobs_all_complete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_different_repos_still_run_in_parallel, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_busy_repo_does_not_block_another, setup, teardown),
