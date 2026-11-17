@@ -668,10 +668,26 @@ enrolled uses defaults.
 `units.allow` is a glob list in the config file (comma-separated, the YAML
 subset has no lists) of unit names the daemon may touch at all, for any
 operation including describe-and-begin. Default empty means all. During
-UAT it is set to `cbk-uat-*`, which enforces "no production VMs or
-containers" in the daemon itself rather than in the operator's care. It
+UAT it is set to the `cbk-uat-*` units, which enforces "no production VMs
+or containers" in the daemon itself rather than in the operator's care. It
 lives in the root-owned config file, not the API, so a session token cannot
 widen it.
+
+Each glob (`fnmatch(3)`) is tried against the unit's id, its name,
+`<provider>:<id>` and `<provider>:<name>`. Ids are per provider: a compose
+project is `compose:<project>` (key `docker:compose:<project>`), a
+standalone container its name (`docker:<name>`), an LXC container its name,
+a libvirt domain its UUID (its name matches through `<provider>:<name>`).
+So a bare `cbk-uat-*` reaches containers, LXC containers and VMs named
+`cbk-uat-...` but **not** the compose project `cbk-uat-compose`, whose id
+and name are `compose:cbk-uat-compose`; that takes
+`docker:compose:cbk-uat-*` (or `compose:cbk-uat-*`). The FS1 UAT value is
+`docker:cbk-uat-*,docker:compose:cbk-uat-*,libvirt:cbk-uat-*,lxc:cbk-uat-*`.
+Compose project names are lowercase (compose lowercases the directory name
+it derives one from), so the project part of a `compose:` or
+`docker:compose:` glob is matched lowercased: `compose:Immich` is the
+project `immich`. Every other name keeps its case. The helper's
+`[units] allow` uses the same keys (`helper.md`, The policy).
 
 ## 9. Jobs, locking, parallelism
 

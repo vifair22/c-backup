@@ -444,6 +444,15 @@ static void test_allow(void **state)
     assert_true(units_allow_match(" prod-x , fake:u1 ", "fake", "u1", "prod-db"));
     assert_true(units_allow_match("fake:cbk-*", "fake", "u9", "cbk-a"));
     assert_false(units_allow_match("docker:cbk-*", "fake", "u9", "cbk-a"));
+    /* A compose project is unit id compose:<project>, so a container-name
+     * glob does not reach it; the key form does. Project names are
+     * lowercase, and a glob's project part is matched as such. */
+    assert_false(units_allow_match("docker:cbk-uat-*", "docker", "compose:cbk-uat-c", "compose:cbk-uat-c"));
+    assert_true(units_allow_match("docker:compose:cbk-uat-*", "docker", "compose:cbk-uat-c", "compose:cbk-uat-c"));
+    assert_true(units_allow_match("docker:compose:CBK-UAT-*", "docker", "compose:cbk-uat-c", "compose:cbk-uat-c"));
+    assert_true(units_allow_match("compose:Immich", "docker", "compose:immich", "compose:immich"));
+    /* Container names keep their case. */
+    assert_false(units_allow_match("docker:Plex", "docker", "plex", "plex"));
 
     units_shutdown();
     init_units("cbk-uat-t*", 10);

@@ -4,7 +4,8 @@
  * Mount classification and /mnt/user resolution (src/helper/mounts.c,
  * docs/container-backup.md 4.2) over a fake Unraid layout: a share on one
  * pool, on one array disk, split across both, missing, behind a symlink,
- * plus the exclusions by type, driver and root.
+ * plus the exclusions by type, driver and root; and bind mounts resolved
+ * through a fake mount table to the filesystem's own mount (B170).
  */
 
 #include <limits.h>
@@ -102,6 +103,129 @@ static void test_exclusions(void **state)
     assert_string_equal(m.real, MNT "/cache/Photos/lib");
 }
 
+/* ---- bind mounts through the mount table (B170) ---- */
+
+#define MI D "/mountinfo"
+
+static int write_mountinfo(void)
+{
+    FILE *f = fopen(MI, "w");
+    if (!f) return -1;
+    fputs("22 1 0:21 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+          /* ZFS on FS1: cache/system at its mountpoint, and Unraid's bind of
+           * its docker directory at /var/lib/docker. */
+          "30 22 0:45 / " MNT "/cache/system rw,relatime shared:2 - zfs cache/system rw,xattr\n"
+          "40 22 0:45 /docker " D "/var/lib/docker rw,relatime shared:2 - zfs cache/system rw,xattr\n"
+          /* btrfs: the top level at the pool, a bind of a directory deep in it. */
+          "50 22 0:50 / " MNT "/pool rw,relatime - btrfs /dev/sdb1 rw,subvolid=5,subvol=/\n"
+          "51 22 0:50 /sub/dir " D "/var/b rw,relatime - btrfs /dev/sdb1 rw,subvolid=5,subvol=/\n"
+          /* docker.img: a loop device mounted nowhere else. */
+          "60 22 7:2 / " D "/var/lib/img rw,relatime - btrfs /dev/loop2 rw\n"
+          /* Escaped names. */
+          "70 22 0:45 /with\\040space " D "/var/sp rw - zfs cache/system rw\n"
+          /* A filesystem mounted outside /mnt first and under it second:
+           * the pool path wins. */
+          "80 22 0:60 / /srv/other rw - xfs /dev/sdc1 rw\n"
+          "81 22 0:60 / " MNT "/disk9 rw - xfs /dev/sdc1 rw\n"
+          "82 22 0:60 /a " D "/var/c rw - xfs /dev/sdc1 rw\n"
+          /* A mount stacked over another at one point: the later one counts. */
+          "90 22 0:45 /old " D "/var/stack rw - zfs cache/system rw\n"
+          "91 22 0:50 /new " D "/var/stack rw - btrfs /dev/sdb1 rw\n"
+          /* A bind of a subdirectory of the filesystem's own subvolume mount. */
+          "95 22 0:70 /@data " MNT "/sv rw - btrfs /dev/sdd1 rw,subvol=/@data\n"
+          "96 22 0:70 /@data/x " D "/var/sv rw - btrfs /dev/sdd1 rw,subvol=/@data\n"
+          /* Docker's directory on a user share: a bind of shfs. */
+          "100 22 0:80 / " MNT "/user rw,nosuid - fuse.shfs shfs rw\n"
+          "101 22 0:80 /system/docker " D "/var/lib/d2 rw,nosuid - fuse.shfs shfs rw\n"
+          "garbage line\n",
+          f);
+    return fclose(f);
+}
+
+static void unbind_is(const char *in, const char *want, int want_loop)
+{
+    char out[PATH_MAX];
+    int loop = -1;
+    assert_int_equal(mount_unbind(MI, MNT, in, out, sizeof(out), &loop), OK);
+    assert_string_equal(out, want);
+    assert_int_equal(loop, want_loop);
+}
+
+static void test_unbind(void **state)
+{
+    (void)state;
+    assert_int_equal(write_mountinfo(), 0);
+    unbind_is(D "/var/lib/docker/volumes/v/_data", MNT "/cache/system/docker/volumes/v/_data", 0);
+    unbind_is(D "/var/lib/docker", MNT "/cache/system/docker", 0);
+    unbind_is(D "/var/b/x/y", MNT "/pool/sub/dir/x/y", 0);
+    unbind_is(D "/var/lib/img/volumes/v/_data", D "/var/lib/img/volumes/v/_data", 1);
+    unbind_is(D "/var/sp/f", MNT "/cache/system/with space/f", 0);
+    unbind_is(D "/var/c/q", MNT "/disk9/a/q", 0);
+    unbind_is(D "/var/stack/z", MNT "/pool/new/z", 0);
+    unbind_is(D "/var/sv/k", MNT "/sv/x/k", 0);
+    unbind_is(D "/var/lib/d2/v", MNT "/user/system/docker/v", 0);
+    /* Not on a bind: unchanged, the filesystem's own mount included. */
+    unbind_is(MNT "/cache/system/docker", MNT "/cache/system/docker", 0);
+    unbind_is(D "/var/libx", D "/var/libx", 0);
+    unbind_is("/", "/", 0);
+
+    char out[16];
+    int loop = 0;
+    assert_int_not_equal(mount_unbind(MI, MNT, D "/var/lib/docker/volumes/v/_data", out, sizeof(out), &loop), OK);
+    assert_int_not_equal(mount_unbind(D "/no-such-mountinfo", MNT, "/x", out, sizeof(out), &loop), OK);
+    err_clear();
+}
+
+static void test_classify_bind(void **state)
+{
+    (void)state;
+    assert_int_equal(write_mountinfo(), 0);
+    assert_int_equal(system("mkdir -p '" D "/var/lib/docker/volumes/v/_data' "
+                            "'" MNT "/cache/system/docker/volumes/v/_data' "
+                            "'" D "/var/lib/docker/volumes/orphan/_data' "
+                            "'" D "/var/lib/img/volumes/w/_data' "
+                            "'" D "/var/lib/d2/volumes/x/_data' "
+                            "'" MNT "/user/system/docker/volumes/x/_data' "
+                            "'" MNT "/cache/system/docker/volumes/x/_data'"), 0);
+    mount_cfg_t c = cfg;
+    snprintf(c.mountinfo, sizeof(c.mountinfo), MI);
+    mount_class_t m;
+    /* A named volume under /var/lib/docker: read through the pool. */
+    assert_int_equal(mount_classify(&c, "volume", D "/var/lib/docker/volumes/v/_data", "local", &m), OK);
+    assert_int_equal(m.verdict, MOUNT_INCLUDED);
+    assert_string_equal(m.recorded, D "/var/lib/docker/volumes/v/_data");
+    assert_string_equal(m.real, MNT "/cache/system/docker/volumes/v/_data");
+    assert_string_equal(m.reason, "");
+    /* The table names a source the host does not have: refused, not guessed. */
+    assert_int_not_equal(mount_classify(&c, "volume", D "/var/lib/docker/volumes/orphan/_data", "local", &m), OK);
+    assert_non_null(strstr(err_msg(), "does not exist"));
+    err_clear();
+    /* docker.img: left where it is, and said so. */
+    assert_int_equal(mount_classify(&c, "volume", D "/var/lib/img/volumes/w/_data", "local", &m), OK);
+    assert_string_equal(m.real, D "/var/lib/img/volumes/w/_data");
+    assert_string_equal(m.reason, "loop-image");
+    /* A bind of a share lands on shfs, and goes on to the one pool. */
+    assert_int_equal(mount_classify(&c, "volume", D "/var/lib/d2/volumes/x/_data", "local", &m), OK);
+    assert_string_equal(m.real, MNT "/cache/system/docker/volumes/x/_data");
+    assert_string_equal(m.recorded, D "/var/lib/d2/volumes/x/_data");
+    /* Without a table nothing moves. */
+    assert_int_equal(mount_classify(&cfg, "volume", D "/var/lib/docker/volumes/v/_data", "local", &m), OK);
+    assert_string_equal(m.real, D "/var/lib/docker/volumes/v/_data");
+    /* An unreadable table fails the classification rather than guessing. */
+    snprintf(c.mountinfo, sizeof(c.mountinfo), D "/no-such-mountinfo");
+    assert_int_not_equal(mount_classify(&c, "volume", D "/var/lib/docker/volumes/v/_data", "local", &m), OK);
+    err_clear();
+
+    host_tools_t t;
+    memset(&t, 0, sizeof(t));
+    char mi[64];
+    mount_default_mountinfo(&t, mi, sizeof(mi));
+    assert_string_equal(mi, "/proc/self/mountinfo");
+    snprintf(t.host_root, sizeof(t.host_root), "/proc/1/root");
+    mount_default_mountinfo(&t, mi, sizeof(mi));
+    assert_string_equal(mi, "/proc/1/mountinfo");
+}
+
 /* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
  * that leaves anything behind (SCRATCH-1). Setup removes it too, so a
  * killed run is no obstacle to the next. */
@@ -118,6 +242,8 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup(test_resolution, setup),
         cmocka_unit_test_setup(test_exclusions, setup),
+        cmocka_unit_test_setup(test_unbind, setup),
+        cmocka_unit_test_setup(test_classify_bind, setup),
     };
     return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }
