@@ -97,3 +97,15 @@ int walidx_read(const char *db_path, walidx_t *out)
     out->salt = u32_at(b, WALIDX_SALT);
     return 0;
 }
+
+void walidx_close_all(void)
+{
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_nslots; i++) {
+        if (g_slot[i].fd >= 0) close(g_slot[i].fd);
+        g_slot[i].fd = -1;
+        g_slot[i].path[0] = '\0';
+    }
+    g_nslots = 0;
+    pthread_mutex_unlock(&g_mu);
+}

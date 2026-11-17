@@ -9,6 +9,7 @@
 #include <cutils/log.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -21,6 +22,8 @@
 /* The wal-index header                                                */
 /* ------------------------------------------------------------------ */
 
+/* Through walidx (B173): an open and close of -shm here would drop the
+ * locks SQLite's connections hold on it. */
 int checkpointer_wal_frames(const char *db_path, uint32_t *frames, uint32_t *backfilled)
 {
     walidx_t w;

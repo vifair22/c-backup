@@ -6,16 +6,17 @@
  *
  * SQLite locks -shm with POSIX advisory locks, and POSIX drops every lock a
  * process holds on a file the moment the process closes any descriptor for
- * it. Opening -shm to read it and closing it again therefore released the
- * locks SQLite's connections hold, among them the one that says the
- * wal-index is in use; the next connection to open believed it was the
- * first, truncated -shm under the others' mappings, and the daemon died of
- * SIGBUS inside SQLite (test_cli_e2e's restart, once the commit budget read
- * the header twice per transaction; the checkpointer's once-a-tick read had
- * the same exposure). So the descriptor is opened once and never closed
- * while its file is live. It is checked against the path (device and
- * inode) on each read and replaced only when the path names another file,
- * whose locks, if any, belong to a file nobody uses any more.
+ * it. checkpointer_wal_frames opened -shm, read the header and closed it,
+ * once a second, and each close released the locks SQLite's own connections
+ * hold on -shm, among them the one that says the wal-index is in use (B173).
+ * Another process opening the database (an operator's sqlite3 CLI, or
+ * test_cli_e2e's, which polls the live file) then took itself for the first
+ * connection and truncated -shm under the daemon's mappings, and the daemon
+ * died of SIGBUS inside SQLite. So the descriptor is opened once and never
+ * closed while its database is open. It is checked against the path (device
+ * and inode) on each read and replaced only when the path names another
+ * file, whose locks, if any, belong to a database nobody uses any more.
+ * walidx_close_all is for after the last connection has closed.
  *
  * Layout (SQLite's walformat.md): WalIndexHdr twice (48 bytes each, native
  * byte order), then WalCkptInfo, whose first field is nBackfill. Read
@@ -34,3 +35,8 @@ typedef struct {
 /* 0 on a consistent read of the database at db_path's wal-index; -1 when
  * there is none, it is too short, of another version, or torn. */
 int walidx_read(const char *db_path, walidx_t *out);
+
+/* Close every kept descriptor. Only once no SQLite connection to any of
+ * the databases is open (the daemon's shutdown, after the database is
+ * closed): closing one sooner drops that connection's locks. */
+void walidx_close_all(void);

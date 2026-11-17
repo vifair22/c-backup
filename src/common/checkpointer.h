@@ -67,7 +67,8 @@
  * Reading the WAL's state. The frame counts come from the wal-index header
  * at the start of <db>-shm, whose layout is part of SQLite's documented WAL
  * format (walformat.md: WalIndexHdr twice, then WalCkptInfo; version
- * 3007000 since 3.7.0). It is read without SQLite's locks, so it is only
+ * 3007000 since 3.7.0), through walidx.h, which never closes -shm while the
+ * database is open (B173). It is read without SQLite's locks, so it is only
  * ever a trigger: both copies of the header must agree, and a read that is
  * torn or of an unknown version means "check again next tick", never a
  * checkpoint skipped for good. The checkpoint itself is SQLite's.
