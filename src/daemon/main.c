@@ -311,6 +311,11 @@ int main(int argc, char *argv[])
         log_warn("%s", err_msg());
         err_clear();
     }
+    /* Objects an interrupted reindex left marked absent (B149). */
+    if (store_index_fix_absent(db, 0) != OK) {
+        log_warn("%s", err_msg());
+        err_clear();
+    }
     /* Prunes a crash or power cut interrupted, before reconcile can take
      * their records for snapshots the index lost (B148). */
     if (prune_finish_pending(db, 0, NULL) != OK) {

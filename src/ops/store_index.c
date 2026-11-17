@@ -567,6 +567,37 @@ status_t store_index_drop_vanished_packs(cutils_db_t *db, int64_t repo_id)
     return st;
 }
 
+/*
+ * Objects marked absent that a pack holds (B149). reindex records every
+ * object a tree names as 'absent' while it walks, and sets the location
+ * from pack_objects in a later, separate commit: two short transactions,
+ * as the shared handle needs. A crash or power cut between them leaves the
+ * snapshots indexed - so nothing asks for another reindex - and their
+ * objects marked as held by no pack, which verify reports missing.
+ */
+status_t store_index_fix_absent(cutils_db_t *db, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    char sql[1024];
+    snprintf(sql, sizeof(sql),
+             "UPDATE objects SET"
+             "   phys_size = (SELECT po.comp_size FROM pack_objects po"
+             "                 WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash),"
+             "   orig_size = (SELECT po.orig_size FROM pack_objects po"
+             "                 WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash),"
+             "   location  = (SELECT CAST(po.pack_id AS TEXT) FROM pack_objects po"
+             "                 WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)"
+             " WHERE location = 'absent'%s"
+             "   AND EXISTS (SELECT 1 FROM pack_objects po"
+             "                WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)",
+             repo_id > 0 ? " AND repo_id = ?" : "");
+    const char *p1[] = { repo, NULL };
+    if (db_execute_non_query(db, sql, repo_id > 0 ? p1 : NULL, NULL) != 0)
+        return set_error(ERR_IO, "cannot locate objects marked absent");
+    return OK;
+}
+
 status_t store_index_drop_staged(cutils_db_t *db, int64_t repo_id)
 {
     char repo[32];

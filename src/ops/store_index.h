@@ -63,6 +63,14 @@ status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id);
  */
 status_t store_index_drop_vanished_packs(cutils_db_t *db, int64_t repo_id);
 
+/*
+ * Give objects rows marked 'absent' that have a pack_objects row the pack's
+ * location and sizes: what an interrupted reindex leaves between walking
+ * the trees and sizing the objects (B149). One repository, or every one
+ * with 0. Called at start.
+ */
+status_t store_index_fix_absent(cutils_db_t *db, int64_t repo_id);
+
 /* For tests: rows per batch of a pack commit's new-row phase (0 restores the
  * default), and a gate asked before each of its commits; a non-OK answer is
  * a power cut there, with no further commits and no cleanup. */

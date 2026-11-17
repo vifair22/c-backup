@@ -1139,6 +1139,8 @@ static void start_and_check(void)
         violation("drop_staged: %s", err_msg());
     if (store_index_drop_vanished_packs(db, 0) != OK)
         violation("drop_vanished_packs: %s", err_msg());
+    if (store_index_fix_absent(db, 0) != OK)
+        violation("fix_absent: %s", err_msg());
     if (prune_finish_pending(db, 0, NULL) != OK)
         violation("prune_finish_pending: %s", err_msg());
     submitted_t sub = { .n = 0 };
