@@ -10,6 +10,7 @@
 #include "pack.h"
 #include "repo.h"
 #include "db_txn.h"
+#include "store_index.h"
 
 #include <cutils/log.h>
 
@@ -251,6 +252,12 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (!dry_run)
         res.tmp_files_removed = store_sweep_tmp_before(store, time(NULL),
                                                        &res.tmp_bytes_removed);
+
+    /* A pack removed just before a power cut can leave its row (B147). */
+    if (!dry_run && store_index_drop_vanished_packs(db, repo_id) != OK) {
+        log_warn("gc: %s", err_msg());
+        err_clear();
+    }
 
     if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "gc: begin");
