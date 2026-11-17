@@ -203,13 +203,19 @@ static void test_a_waiting_writer_goes_first(void **state)
 
     assert_int_equal(db_txn_commit(db), OK);
     assert_int_equal(db_txn_begin(db), OK);
-    pthread_mutex_lock(&h.mu);
-    int done = h.contender_done;
-    pthread_mutex_unlock(&h.mu);
+    /* Its row, not its done flag: the contender sets the flag after its
+     * commit has released the lock, so this begin can win the gap and see
+     * the flag still clear although the contender did go first. The row
+     * is in the database before that release, so seeing it here proves the
+     * order. */
+    db_result_t *r = NULL;
+    int rc = db_execute(db, "SELECT value FROM config WHERE key = 'contender'", NULL, &r);
+    int went_first = rc == 0 && r && r->nrows == 1 && strcmp(r->rows[0][0], "1") == 0;
+    db_result_free(r);
     assert_int_equal(db_txn_commit(db), OK);
     assert_int_equal(pthread_join(t, NULL), 0);
 
-    assert_true(done);
+    assert_true(went_first);
     assert_int_equal(h.contender_status, OK);
 
     pthread_mutex_destroy(&h.mu);
