@@ -420,7 +420,11 @@ api_response_t exports_create(const api_request_t *req, int64_t repo_id, int64_t
         explicit_bzero(name, sizeof(name));
         return api_error(500, err_msg());
     }
-    char msg[512];
+    /* Sized from what it formats: the item, the caller and the socket path
+     * (up to PATH_MAX), plus 128 for the words and three numbers. At 512 a
+     * long socket path cut the end of the journal line off, and
+     * -Wformat-truncation said so in the debug and asan builds. */
+    char msg[sizeof(e->item) + sizeof(caller) + sizeof(e->socket) + 128];
     snprintf(msg, sizeof(msg), "export %lld of snapshot %lld item %s opened by %s for %u s at %s",
              (long long)e->id, (long long)snap_id, e->item, caller, ttl, e->socket);
     journal_record(g_db, repo_id, "export", "nbd-export", "ok", 0, msg);
