@@ -304,6 +304,12 @@ int main(int argc, char *argv[])
      * to staged, so the drop below takes them with the rest (B144). */
     if (store_index_drop_unannounced(db, 0) != OK)
         log_warn("cannot drop the rows of an interrupted pack commit: %s", err_msg());
+    /* Rows of packs removed just before a power cut took the commit that
+     * dropped them (B147). */
+    if (store_index_drop_vanished_packs(db, 0) != OK) {
+        log_warn("%s", err_msg());
+        err_clear();
+    }
     if (store_index_drop_staged(db, 0) != OK)
         log_warn("cannot drop staged objects left by an interrupted backup");
 

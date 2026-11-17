@@ -7,9 +7,12 @@
 
 #include <cutils/log.h>
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 struct store_index {
     cutils_db_t *db;
@@ -510,6 +513,58 @@ status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id)
     }
     if (db_txn_commit(db) != OK) return set_error(ERR_IO, "cannot drop unannounced pack rows");
     return OK;
+}
+
+/*
+ * A packs row whose file is gone and which nothing locates through (B147).
+ * Removing a pack unlinks it, syncs the directory, and only then commits
+ * the row's removal - the unlink waits for the commits that moved the
+ * pack's contents (B142), not the other way round - so a power cut can keep
+ * the unlink and lose that last commit. The row names a pack that is not
+ * there and nothing but a reindex ever removed it.
+ *
+ * Only rows with no pack_objects row: one that still locates objects in a
+ * missing pack is a loss for verify and reindex to report, not garbage.
+ * And only when the repository's packs/ is there, so an offline mount
+ * loses nothing.
+ */
+status_t store_index_drop_vanished_packs(cutils_db_t *db, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT p.repo_id, p.id, r.path FROM packs p JOIN repos r ON r.id = p.repo_id"
+             " WHERE NOT EXISTS (SELECT 1 FROM pack_objects po"
+             "   WHERE po.repo_id = p.repo_id AND po.pack_id = p.id)%s",
+             repo_id > 0 ? " AND p.repo_id = ?" : "");
+    const char *p1[] = { repo, NULL };
+    db_result_t *r = NULL;
+    if (db_execute(db, sql, repo_id > 0 ? p1 : NULL, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "cannot list packs with no entries");
+    }
+    status_t st = OK;
+    for (int i = 0; r && i < r->nrows && st == OK; i++) {
+        const char *path = r->rows[i][2];
+        char packs[PATH_MAX], dat[PATH_MAX];
+        struct stat sb;
+        uint32_t num = (uint32_t)strtoul(r->rows[i][1], NULL, 10);
+        if (snprintf(packs, sizeof(packs), "%s/packs", path) >= (int)sizeof(packs) ||
+            stat(packs, &sb) != 0 || !S_ISDIR(sb.st_mode))
+            continue;
+        if (pack_dat_path_resolve(dat, sizeof(dat), path, num) != 0) continue;
+        if (stat(dat, &sb) == 0 || errno != ENOENT) continue;
+        if (db_execute_non_query(db, "DELETE FROM packs WHERE repo_id = ? AND id = ?",
+                                 (const char *[]){ r->rows[i][0], r->rows[i][1], NULL },
+                                 NULL) != 0)
+            st = set_error(ERR_IO, "cannot drop the row of vanished pack %u", num);
+        else
+            log_info("index: dropped the row of pack %u of repo %s, which is gone",
+                     num, r->rows[i][0]);
+    }
+    db_result_free(r);
+    return st;
 }
 
 status_t store_index_drop_staged(cutils_db_t *db, int64_t repo_id)

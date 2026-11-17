@@ -56,6 +56,13 @@ status_t store_index_drop_staged(cutils_db_t *db, int64_t repo_id);
  */
 status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id);
 
+/*
+ * Drop packs rows whose file is gone and through which nothing is located:
+ * the row of a removed pack whose removal commit a power cut lost (B147).
+ * One repository, or every one with 0. Called at start and by gc.
+ */
+status_t store_index_drop_vanished_packs(cutils_db_t *db, int64_t repo_id);
+
 /* For tests: rows per batch of a pack commit's new-row phase (0 restores the
  * default), and a gate asked before each of its commits; a non-OK answer is
  * a power cut there, with no further commits and no cleanup. */

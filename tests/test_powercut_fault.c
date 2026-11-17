@@ -1137,6 +1137,8 @@ static void start_and_check(void)
         violation("drop_unannounced: %s", err_msg());
     if (store_index_drop_staged(db, 0) != OK)
         violation("drop_staged: %s", err_msg());
+    if (store_index_drop_vanished_packs(db, 0) != OK)
+        violation("drop_vanished_packs: %s", err_msg());
     submitted_t sub = { .n = 0 };
     reconcile_result_t rr;
     if (index_reconcile(db, submit_inline, &sub, &rr) != OK)
