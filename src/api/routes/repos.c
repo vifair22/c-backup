@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "sync_latch.h"
 #include "repo.h"
 #include "repo_key.h"
 #include "repo_purge.h"
@@ -75,20 +76,31 @@ static int repo_row_add(cutils_db_t *db, cutils_json_elem_t *e, cutils_json_resp
     char why[PACK_PRESENCE_WHY_MAX] = "";
     int avail = pack_presence_available(db, strtoll(row[0], NULL, 10), why, sizeof(why));
     if (avail == 1) why[0] = '\0';
-    const char *state = avail != 1 ? "unavailable" : deg[0] ? "degraded" : "ok";
+    /* A failed sync in this repository (sync_latch.h) wins over the rest:
+     * it refuses backups, gc and prune until a repair or a restart. */
+    char sync_err[1024] = "", sync_at[32] = "";
+    int64_t at = 0;
+    int synced_bad = sync_latch_repo_info(row[2], sync_err, sizeof(sync_err), &at);
+    if (synced_bad) snprintf(sync_at, sizeof(sync_at), "%lld", (long long)at);
+    const char *state = synced_bad ? "sync_failed"
+                      : avail != 1 ? "unavailable" : deg[0] ? "degraded" : "ok";
     if (e)
         return jrow_elem_add_row(e, k_repo_cols, JROW_N(k_repo_cols), row) != 0
             || jrow_elem_add(e, "encryption", JCOL_STR, enc) != 0
             || jrow_elem_add(e, "key_escrowed", JCOL_BOOL, esc) != 0
             || jrow_elem_add(e, "state", JCOL_STR, state) != 0
             || jrow_elem_add(e, "degraded", JCOL_STR_NULL, deg) != 0
-            || jrow_elem_add(e, "unavailable", JCOL_STR_NULL, why) != 0;
+            || jrow_elem_add(e, "unavailable", JCOL_STR_NULL, why) != 0
+            || jrow_elem_add(e, "sync_failed", JCOL_STR_NULL, sync_err) != 0
+            || jrow_elem_add(e, "sync_failed_at", JCOL_INT, sync_at) != 0;
     return jrow_resp_add_row(r, k_repo_cols, JROW_N(k_repo_cols), row) != 0
         || jrow_resp_add(r, "encryption", JCOL_STR, enc) != 0
         || jrow_resp_add(r, "key_escrowed", JCOL_BOOL, esc) != 0
         || jrow_resp_add(r, "state", JCOL_STR, state) != 0
         || jrow_resp_add(r, "degraded", JCOL_STR_NULL, deg) != 0
-        || jrow_resp_add(r, "unavailable", JCOL_STR_NULL, why) != 0;
+        || jrow_resp_add(r, "unavailable", JCOL_STR_NULL, why) != 0
+        || jrow_resp_add(r, "sync_failed", JCOL_STR_NULL, sync_err) != 0
+        || jrow_resp_add(r, "sync_failed_at", JCOL_INT, sync_at) != 0;
 }
 
 static api_response_t list_repos(const api_request_t *req, void *userdata)

@@ -3,6 +3,7 @@
 
 #include "routes.h"
 #include "db_txn.h"
+#include "repo.h"
 #include "repo_tags.h"
 #include "reserved.h"
 #include "util.h"
@@ -55,7 +56,8 @@ static api_response_t finalise(cutils_json_resp_t *resp)
  * close, and saying ok over it would hide that. The caller holds
  * repo_tags_lock.
  *
- * *path receives the repository path, for tags_unwind.
+ * *path receives the repository path, for tags_unwind. -1 on failure, -2
+ * when the path holds another repository (409, not the server's fault).
  */
 static int tags_mirror(int64_t repo_id, const repo_tag_change_t *chg,
                        char *path, size_t pathsz, char *err, size_t errsz)
@@ -63,14 +65,23 @@ static int tags_mirror(int64_t repo_id, const repo_tag_change_t *chg,
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     db_result_t *r = NULL;
-    if (db_execute(g_db, "SELECT path FROM repos WHERE id = ?",
+    if (db_execute(g_db, "SELECT path, uuid FROM repos WHERE id = ?",
                    (const char *[]){ repo, NULL }, &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
         snprintf(err, errsz, "cannot find the repository's path");
         return -1;
     }
     snprintf(path, pathsz, "%s", r->rows[0][0]);
+    /* The tag list goes into whatever repository is at the path now, so
+     * that has to be this one (B164): two roots swapped would otherwise
+     * write this repository's tags over the other's. */
+    status_t idst = repo_identity_check(path, r->rows[0][1]);
     db_result_free(r);
+    if (idst != OK) {
+        snprintf(err, errsz, "cannot record tags in the repository: %s", err_msg());
+        err_clear();
+        return idst == ERR_UNAVAILABLE ? -2 : -1;
+    }
     if (repo_tags_save_with(g_db, repo_id, path, chg) != OK) {
         snprintf(err, errsz, "cannot record tags in the repository: %s", err_msg());
         err_clear();
@@ -261,9 +272,10 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
     char merr[ERR_MSG_MAX + 64], path[PATH_MAX];
     repo_tag_change_t chg = { .name = name, .snap_id = sid,
                               .created_at = (int64_t)strtoll(now, NULL, 10) };
-    if (tags_mirror(repo_id, &chg, path, sizeof(path), merr, sizeof(merr)) != 0) {
+    int mrc = tags_mirror(repo_id, &chg, path, sizeof(path), merr, sizeof(merr));
+    if (mrc != 0) {
         repo_tags_unlock();
-        return api_error(500, merr);
+        return api_error(mrc == -2 ? 409 : 500, merr);
     }
 
     if (db_txn_begin(g_db) != OK) {
@@ -314,9 +326,10 @@ api_response_t metadata_tags_delete(const api_request_t *req, int64_t repo_id,
 
     char merr[ERR_MSG_MAX + 64], path[PATH_MAX];
     repo_tag_change_t chg = { .name = name, .remove = 1 };
-    if (tags_mirror(repo_id, &chg, path, sizeof(path), merr, sizeof(merr)) != 0) {
+    int mrc = tags_mirror(repo_id, &chg, path, sizeof(path), merr, sizeof(merr));
+    if (mrc != 0) {
         repo_tags_unlock();
-        return api_error(500, merr);
+        return api_error(mrc == -2 ? 409 : 500, merr);
     }
     int affected = 0;
     if (db_txn_begin(g_db) != OK) {

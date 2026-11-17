@@ -52,7 +52,17 @@
 #define PACK_IDS_NEXT_MAX ((int64_t)UINT32_MAX + 1)
 /* How far ahead a store raises the mark when it has to write it: one write
  * covers this many packs. A handle closed with numbers left wastes them;
- * at 64 a backup an hour for a century uses under 2% of the space. */
+ * at 64 a backup an hour for a century uses under 2% of the space.
+ *
+ * A failed run wastes its block too, the same as a successful one: a
+ * backup takes it before its first pack (store_reserve_pack_nums), and
+ * every backup failing at its first install (B163, EXDEV on a packs/
+ * mount) burned 64 numbers each. That is safe and deliberately not
+ * undone: the mark only says which numbers may have been used, so a gap
+ * costs nothing but numbers, and 2^32 / 64 is 67 million handles, one
+ * failing backup a minute for 127 years. Handing the block back would mean
+ * lowering the mark, which rule 4 forbids for good reason: nothing can
+ * prove no file was ever written under a number once it was issued. */
 #define PACK_IDS_BLOCK 64
 
 /*

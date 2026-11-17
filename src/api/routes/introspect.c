@@ -5,6 +5,7 @@
 
 #include "manifest.h"
 #include "object.h"
+#include "pack_presence.h"
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
@@ -72,7 +73,11 @@ static status_t open_bound_store(int64_t repo_id, store_t **out_store,
     char *path = repo_path_of(repo_id);
     if (!path) return set_error(ERR_NOT_FOUND, "no such repo");
 
-    status_t st = repo_store_open(path, NULL, out_store);
+    /* Not an empty mountpoint, nor another repository at this path (B164),
+     * whose packs this index would read at its own offsets. */
+    status_t st = pack_presence_require(g_db, repo_id);
+    if (st != OK) { free(path); return st; }
+    st = repo_store_open(path, NULL, out_store);
     free(path);
     if (st != OK) return st;
 
@@ -475,7 +480,8 @@ api_response_t introspect_object_layout(const api_request_t *req, int64_t repo_i
     store_t *store = NULL;
     store_index_t *idx = NULL;
     status_t st = open_bound_store(repo_id, &store, &idx);
-    if (st != OK) return api_error(st == ERR_NOT_FOUND ? 404 : 500, err_msg());
+    if (st != OK) return api_error(st == ERR_NOT_FOUND ? 404 : st == ERR_UNAVAILABLE ? 409 : 500,
+                                   err_msg());
 
     uint8_t hash[OBJECT_HASH_SIZE];
     hex_to_hash(hex, hash);
@@ -545,7 +551,8 @@ api_response_t introspect_object_content(const api_request_t *req, int64_t repo_
     store_t *store = NULL;
     store_index_t *idx = NULL;
     status_t st = open_bound_store(repo_id, &store, &idx);
-    if (st != OK) return api_error(st == ERR_NOT_FOUND ? 404 : 500, err_msg());
+    if (st != OK) return api_error(st == ERR_NOT_FOUND ? 404 : st == ERR_UNAVAILABLE ? 409 : 500,
+                                   err_msg());
 
     uint8_t hash[OBJECT_HASH_SIZE];
     hex_to_hash(hex, hash);
@@ -1006,7 +1013,8 @@ api_response_t introspect_diff(const api_request_t *req, int64_t repo_id)
     store_t *store = NULL;
     store_index_t *idx = NULL;
     status_t st = open_bound_store(repo_id, &store, &idx);
-    if (st != OK) return api_error(st == ERR_NOT_FOUND ? 404 : 500, err_msg());
+    if (st != OK) return api_error(st == ERR_NOT_FOUND ? 404 : st == ERR_UNAVAILABLE ? 409 : 500,
+                                   err_msg());
 
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) {

@@ -1380,6 +1380,27 @@ static int exists_in_tmp(const char *repo, const char *name)
     return stat(path, &sb) == 0;
 }
 
+/* Pack staging lives in packs/.staging since B163; tmp/ above still holds
+ * what an older build left, and both are swept. */
+static void plant_stale_staging(const char *repo, const char *name)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s/" STORE_PACK_STAGING, repo);
+    (void)mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/" STORE_PACK_STAGING "/%s", repo, name);
+    uint8_t *d = rand_buf(256 * 1024, 134);
+    write_buf(path, d, 256 * 1024);
+    free(d);
+}
+
+static int exists_in_staging(const char *repo, const char *name)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s/" STORE_PACK_STAGING "/%s", repo, name);
+    struct stat sb;
+    return stat(path, &sb) == 0;
+}
+
 static int count_pack_files(const char *repo)
 {
     char cmd[700];
@@ -1462,9 +1483,13 @@ static void test_killed_writers_staging_is_swept_on_every_open(void **state)
     assert_int_equal(repo_store_open(TEST_REPO, NULL, &store), OK);
     assert_int_equal(store_index_bind(store, db, repo_id, &idx), OK);
     plant_stale(TEST_REPO, "pack-dat.Kill05");
+    plant_stale_staging(TEST_REPO, "pack-dat.Kill06");
+    plant_stale_staging(TEST_REPO, "deleting.Kill07");
     memset(&g, 0, sizeof(g));
     assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
     assert_false(exists_in_tmp(TEST_REPO, "pack-dat.Kill05"));
+    assert_false(exists_in_staging(TEST_REPO, "pack-dat.Kill06"));
+    assert_false(exists_in_staging(TEST_REPO, "deleting.Kill07"));
 }
 
 /*
@@ -1492,7 +1517,7 @@ static void test_a_live_writers_staging_is_left_alone(void **state)
     assert_int_equal(pack_backup_add(pw, OBJECT_TYPE_FILE, d, 9000, h, &is_new, NULL, NULL), OK);
     free(d);
     char cmd[700];
-    snprintf(cmd, sizeof(cmd), "ls '%s/tmp' | grep -c '^pack-dat\\.'", DST_REPO);
+    snprintf(cmd, sizeof(cmd), "ls '%s/" STORE_PACK_STAGING "' | grep -c '^pack-dat\\.'", DST_REPO);
     FILE *f = popen(cmd, "r");
     int n = 0;
     assert_int_equal(fscanf(f, "%d", &n), 1);

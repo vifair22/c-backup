@@ -1,9 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "snap_record.h"
+#include "sync_latch.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,9 +169,32 @@ int snapshot_write_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
-int snapshot_fsync_dir(const char *path)
+int snapshot_fsync_dir(const char *repo_root, const char *path)
 {
     int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd == -1) return -1;
+    int rc = repo_root ? sync_latch_repo_fsync(repo_root, fd, path)
+                       : sync_latch_fsync(fd, path);
+    int err = errno;
+    close(fd);
+    errno = err;
+    return rc;
+}
+
+int snapshot_fsync_parent(const char *path)
+{
+    char dir[PATH_MAX];
+    if (snprintf(dir, sizeof(dir), "%s", path) >= (int)sizeof(dir)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char *slash = strrchr(dir, '/');
+    if (!slash) snprintf(dir, sizeof(dir), ".");
+    else if (slash == dir) slash[1] = '\0';
+    else *slash = '\0';
+    /* Not the latch's: a restore destination is not the daemon's storage.
+     * A repository caller trips it itself. */
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd == -1) return -1;
     int rc = fsync(fd);
     int err = errno;

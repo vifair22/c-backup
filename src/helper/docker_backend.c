@@ -797,11 +797,12 @@ static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, struct sp_s
         hooklog_t log;
         memset(&log, 0, sizeof(log));
         int code = run_hook(c, unit_id, h, tail, sizeof(tail), &log);
-        if (code != 0) {
-            char line[64];
-            snprintf(line, sizeof(line), "\n[c-backup: exit status %d]\n", code);
-            (void)hooklog_append(&log, line, strlen(line));
-        }
+        /* Always, 0 included, as the LXC and dump hooks do: a run hook that
+         * succeeded silently left an empty log, where the Manual promises
+         * one that is never empty (B174). */
+        char line[64];
+        snprintf(line, sizeof(line), "\n[c-backup: exit status %d]\n", code);
+        (void)hooklog_append(&log, line, strlen(line));
         size_t llen = 0;
         char *ltxt = hooklog_render(&log, &llen);
         hooklog_free(&log);
@@ -1659,13 +1660,12 @@ static status_t d_define(sp_ctx_t *c, const char *unit_id, const char *definitio
         snprintf(tp, sizeof(tp), "%.3900s/my-%s.xml", pol->templates_dir, name);
         st = move_aside(c, tp, moved, sizeof(moved));
         if (st == OK && moved[0]) cJSON_AddStringToObject(res, "previous_template", moved);
-        FILE *f = st == OK && host_path(&c->tools, tp, hp, sizeof(hp)) == 0 ? fopen(hp, "wxe") : NULL;
-        if (st == OK && !f) st = set_error_errno(ERR_IO, "docker: writing %s", tp);
-        if (f) {
-            if (fputs(tmpl, f) == EOF) st = set_error_errno(ERR_IO, "docker: writing %s", tp);
-            if (fclose(f) != 0 && st == OK) st = set_error_errno(ERR_IO, "docker: writing %s", tp);
-            if (st == OK) cJSON_AddStringToObject(res, "template", tp);
-        }
+        char hm[PATH_MAX + HOST_TOOL_PATH_MAX + 40] = "";
+        if (st == OK && moved[0] && host_path(&c->tools, moved, hm, sizeof(hm)) != 0) hm[0] = '\0';
+        if (st == OK && host_path(&c->tools, tp, hp, sizeof(hp)) != 0)
+            st = set_error(ERR_INVALID, "docker: path too long: %s", tp);
+        if (st == OK) st = host_write_new_file(hp, tp, tmpl, strlen(tmpl), hm);
+        if (st == OK) cJSON_AddStringToObject(res, "template", tp);
     }
     if (st == OK && start) {
         snprintf(path, sizeof(path), "/containers/%s/start", id);
@@ -1717,13 +1717,10 @@ static status_t write_host_file(struct sp_ctx *c, const char *path, const char *
     status_t st = move_aside(c, path, aside, sizeof(aside));
     if (st != OK) return st;
     if (aside[0] && moved) cJSON_AddItemToArray(moved, cJSON_CreateString(aside));
-    char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
+    char hp[PATH_MAX + HOST_TOOL_PATH_MAX], hm[PATH_MAX + HOST_TOOL_PATH_MAX + 40] = "";
     if (host_path(&c->tools, path, hp, sizeof(hp)) != 0) return set_error(ERR_INVALID, "docker: path too long");
-    FILE *f = fopen(hp, "wxe");
-    if (!f) return set_error_errno(ERR_IO, "docker: writing %s", path);
-    int bad = fputs(text, f) == EOF;
-    if (fclose(f) != 0) bad = 1;
-    return bad ? set_error_errno(ERR_IO, "docker: writing %s", path) : OK;
+    if (aside[0] && host_path(&c->tools, aside, hm, sizeof(hm)) != 0) hm[0] = '\0';
+    return host_write_new_file(hp, path, text, strlen(text), hm);
 }
 
 /*

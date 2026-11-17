@@ -1298,6 +1298,55 @@ check "still nothing in the mountpoint"   ""                       "$(ls -A "$WO
 rmdir "$WORK/gonerepo"
 mv "$WORK/gonerepo.mounted" "$WORK/gonerepo"
 contains "mounted again, it is ok"        '"state":"ok"'           "$(sock_body "/repos/$GONE")"
+
+# B164: two repositories' roots swapped. Each path holds a marker, and
+# used to pass for the right repository; now each is unavailable naming the
+# repository its path holds, every job and every write is refused, and
+# neither directory is touched.
+echo "swapped repositories"
+GJ=$(job_id "$(sock_send POST "/repos/$GONE/backup" "{\"paths\":[\"$WORK/src\"]}")")
+wait_job "$GJ"
+contains "a backup before the swap"       '"state":"completed"'    "$(sock_body "/jobs/$GJ")"
+R=$(sock_send POST /repos "{\"path\":\"$WORK/swaprepo\",\"label\":\"swap\"}")
+SWAP=$(printf '%s' "$R" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+SJ=$(job_id "$(sock_send POST "/repos/$SWAP/backup" "{\"paths\":[\"$WORK/src\"]}")")
+wait_job "$SJ"
+contains "and one into the other"         '"state":"completed"'    "$(sock_body "/jobs/$SJ")"
+GUUID=$(sock_body "/repos/$GONE" | grep -oE '"uuid":"[^"]*"' | head -1 | cut -d'"' -f4)
+SUUID=$(sock_body "/repos/$SWAP" | grep -oE '"uuid":"[^"]*"' | head -1 | cut -d'"' -f4)
+mv "$WORK/gonerepo" "$WORK/swap.tmp"
+mv "$WORK/swaprepo" "$WORK/gonerepo"
+mv "$WORK/swap.tmp" "$WORK/swaprepo"
+LIST_G=$(cd "$WORK/gonerepo" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)
+LIST_S=$(cd "$WORK/swaprepo" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)
+GB=$(sock_body "/repos/$GONE")
+contains "a swapped root is unavailable"  '"state":"unavailable"'  "$GB"
+contains "naming the repository it holds" "holds repository $SUUID, not $GUUID" "$GB"
+contains "and so is the other"            "holds repository $GUUID, not $SUUID" \
+    "$(sock_body "/repos/$SWAP")"
+GJ=$(job_id "$(sock_send POST "/repos/$GONE/backup" "{\"paths\":[\"$WORK/src\"]}")")
+wait_job "$GJ"
+GJB=$(sock_body "/jobs/$GJ")
+contains "a backup into it is refused"    '"state":"failed"'       "$GJB"
+contains "as unavailable"                 'is unavailable'         "$GJB"
+GV=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" "http://localhost/repos/$SWAP/verify?level=deep")")
+wait_job "$GV"
+contains "a verify of the other is refused" 'is unavailable'       "$(sock_body "/jobs/$GV")"
+check "a tag is refused, not written into the other" 409 \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+         -d '{"name":"swapped","snap_id":1}' "http://localhost/repos/$GONE/tags")"
+check "the repair cannot accept it"       409 \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+         -d '{"accept_missing":true}' "http://localhost/repos/$GONE/repair")"
+check "nothing written to one"            "$LIST_G" \
+    "$(cd "$WORK/gonerepo" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)"
+check "nor to the other"                  "$LIST_S" \
+    "$(cd "$WORK/swaprepo" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)"
+mv "$WORK/gonerepo" "$WORK/swap.tmp"
+mv "$WORK/swaprepo" "$WORK/gonerepo"
+mv "$WORK/swap.tmp" "$WORK/swaprepo"
+contains "swapped back, one is ok"        '"state":"ok"'           "$(sock_body "/repos/$GONE")"
+contains "and so is the other"            '"state":"ok"'           "$(sock_body "/repos/$SWAP")"
 contains "an unset label is null"         '"label":null'          "$(sock_body /repos/2)"
 TREE=$(sock_body "/repos/1/snapshots/$NEWEST/tree?parent=0")
 contains "a tree type is a number"        '"type":2,'             "$TREE"

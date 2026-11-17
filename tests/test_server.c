@@ -244,7 +244,12 @@ static int fresh_port(void **state)
 /* ---------- after-write hook (B139, B140) ---------- */
 
 static int g_after_writes;
-static void count_after_write(void *ud) { (void)ud; g_after_writes++; }
+static int count_after_write(void *ud, char *why, size_t why_sz)
+{
+    (void)ud; (void)why; (void)why_sz;
+    g_after_writes++;
+    return 0;
+}
 
 static api_response_t ok_handler(const api_request_t *req, void *ud)
 {
@@ -314,6 +319,39 @@ static void test_after_write_runs_for_durable_writes_only(void **state)
     assert_int_equal(g_after_writes, 2);
     assert_int_equal(unix_request("POST", "/bad"), 400);
     assert_int_equal(g_after_writes, 2);
+    api_server_stop(srv);
+}
+
+/*
+ * B182: a durable write whose sync fails is not answered 2xx. The edit is
+ * committed, but "a durable route returned" has to mean "it is on disk",
+ * and a client told 200 after a failed sync was told something untrue.
+ */
+static int failing_after_write(void *ud, char *why, size_t why_sz)
+{
+    (void)ud;
+    g_after_writes++;
+    snprintf(why, why_sz, "state.db: cannot sync the WAL: No space left on device");
+    return -1;
+}
+
+static void test_after_write_failure_is_not_answered_2xx(void **state)
+{
+    (void)state;
+    unlink(TEST_SOCK);
+    api_server_t *srv = api_server_create(0, NULL, TEST_SOCK, NULL);
+    assert_non_null(srv);
+    assert_int_equal(api_server_route(srv, "/thing", API_POST, API_DURABLE, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/thing", API_PUT, API_COMMIT_ONLY, ok_handler, NULL), 0);
+    g_after_writes = 0;
+    api_server_set_after_write(srv, failing_after_write, NULL);
+    assert_int_equal(api_server_start(srv), 0);
+
+    assert_int_equal(unix_request("POST", "/thing"), 500);
+    assert_int_equal(g_after_writes, 1);
+    /* A commit-only write never asks, so it never fails this way. */
+    assert_int_equal(unix_request("PUT", "/thing"), 200);
+    assert_int_equal(g_after_writes, 1);
     api_server_stop(srv);
 }
 
@@ -416,6 +454,7 @@ int main(void)
         cmocka_unit_test_setup(test_create_rejects_what_cannot_work, fresh_port),
         cmocka_unit_test_setup(test_empty_bind_means_loopback, fresh_port),
         cmocka_unit_test_setup(test_after_write_runs_for_durable_writes_only, fresh_port),
+        cmocka_unit_test_setup(test_after_write_failure_is_not_answered_2xx, fresh_port),
         cmocka_unit_test_setup(test_after_write_follows_a_per_path_class, fresh_port),
         cmocka_unit_test(test_a_write_needs_a_class),
         cmocka_unit_test(test_dispatch_runs_the_hook_by_class),
