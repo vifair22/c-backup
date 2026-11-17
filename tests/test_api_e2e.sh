@@ -1252,6 +1252,15 @@ done
 REPO1=$(sock_body /repos/1)
 contains "a repo id is a number"          '"id":1,'               "$REPO1"
 contains "key_escrowed is a boolean"      '"key_escrowed":false'  "$REPO1"
+contains "a whole repository is not degraded" '"degraded":null'   "$REPO1"
+# B150: repair is only ever an explicit acceptance, and a whole repository
+# has nothing to accept.
+check "repair without accept_missing is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' \
+     -X POST --unix-socket "$SOCK" http://localhost/repos/1/repair)"
+contains "repair of a whole repository drops nothing" '"packs_missing":0' \
+    "$(curl -s -X POST --unix-socket "$SOCK" -d '{"accept_missing":true}' \
+         http://localhost/repos/1/repair)"
+check "GET the repair"           "405 POST"        "$(sock_method GET /repos/1/repair)"
 contains "an unset label is null"         '"label":null'          "$(sock_body /repos/2)"
 TREE=$(sock_body "/repos/1/snapshots/$NEWEST/tree?parent=0")
 contains "a tree type is a number"        '"type":2,'             "$TREE"

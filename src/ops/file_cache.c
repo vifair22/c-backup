@@ -109,12 +109,14 @@ int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
      * collects objects no live snapshot references, so a path whose only
      * snapshot was pruned can match here with its bytes already reclaimed.
      * Trusting the cache alone would write a snapshot referencing an object
-     * that does not exist, and nothing would notice until a restore.
+     * that does not exist, and nothing would notice until a restore. An
+     * absent object is one a tree names and no pack holds (B150): the next
+     * backup has to read the file to store it again.
      */
     db_result_t *o = NULL;
     int present = db_execute(db,
             "SELECT 1 FROM objects WHERE repo_id = ? AND hash = ?"
-            " AND location <> 'staged'",
+            " AND location NOT IN ('staged', 'absent')",
             (const char *[]){ repo, hex, NULL }, &o) == 0 && o && o->nrows == 1;
     db_result_free(o);
     if (!present) return 0;

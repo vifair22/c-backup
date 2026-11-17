@@ -72,6 +72,7 @@
 #include "index_reconcile.h"
 #include "object.h"
 #include "pack.h"
+#include "pack_presence.h"
 #include "prune.h"
 #include "reindex.h"
 #include "replicate.h"
@@ -1149,6 +1150,10 @@ static void start_and_check(void)
         violation("drop_staged: %s", err_msg());
     if (store_index_drop_vanished_packs(db, 0) != OK)
         violation("drop_vanished_packs: %s", err_msg());
+    if (pack_presence_check_all(db) != OK)
+        violation("pack_presence_check_all: %s", err_msg());
+    if (pack_presence_degraded(db, g_repo_id, NULL, 0))
+        violation("the repository is degraded: packs the index names are missing");
     if (store_index_fix_absent(db, 0) != OK)
         violation("fix_absent: %s", err_msg());
     if (prune_finish_pending(db, 0, NULL) != OK)

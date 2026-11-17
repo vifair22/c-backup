@@ -42,6 +42,7 @@
 #include "sd_notify.h"
 #include "server.h"
 #include "state_db.h"
+#include "pack_presence.h"
 #include "prune.h"
 #include "store_index.h"
 #include "fake_provider.h"
@@ -342,6 +343,14 @@ int main(int argc, char *argv[])
     }
     /* Objects an interrupted reindex left marked absent (B149). */
     if (store_index_fix_absent(db, 0) != OK) {
+        log_warn("%s", err_msg());
+        err_clear();
+    }
+    /* Every pack the index names, against its file, before anything can
+     * dedup against a pack that is gone (B150). */
+    pack_presence_set_brake((unsigned)config_get_int(cfg, "index.missing_brake_pct", 5),
+                            (unsigned)config_get_int(cfg, "index.missing_brake_packs", 10));
+    if (pack_presence_check_all(db) != OK) {
         log_warn("%s", err_msg());
         err_clear();
     }
