@@ -42,6 +42,7 @@
 #include "sd_notify.h"
 #include "server.h"
 #include "state_db.h"
+#include "prune.h"
 #include "store_index.h"
 #include "fake_provider.h"
 #include "privs.h"
@@ -351,6 +352,23 @@ int main(int argc, char *argv[])
      * to staged, so the drop below takes them with the rest (B144). */
     if (store_index_drop_unannounced(db, 0) != OK)
         log_warn("cannot drop the rows of an interrupted pack commit: %s", err_msg());
+    /* Rows of packs removed just before a power cut took the commit that
+     * dropped them (B147). */
+    if (store_index_drop_vanished_packs(db, 0) != OK) {
+        log_warn("%s", err_msg());
+        err_clear();
+    }
+    /* Objects an interrupted reindex left marked absent (B149). */
+    if (store_index_fix_absent(db, 0) != OK) {
+        log_warn("%s", err_msg());
+        err_clear();
+    }
+    /* Prunes a crash or power cut interrupted, before reconcile can take
+     * their records for snapshots the index lost (B148). */
+    if (prune_finish_pending(db, 0, NULL) != OK) {
+        log_warn("%s", err_msg());
+        err_clear();
+    }
     if (store_index_drop_staged(db, 0) != OK)
         log_warn("cannot drop staged objects left by an interrupted backup");
 

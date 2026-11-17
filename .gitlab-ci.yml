@@ -27,7 +27,18 @@ stages:
   - build
   - deploy
 
+# The FS1 proxy in front of git.airies.net answers 503 now and then. Absorb
+# that inside the job (runner fetches, the c-utils clone, artifacts) rather
+# than failing the pipeline and re-running all of it.
+default:
+  retry:
+    max: 1
+    when: [runner_system_failure, api_failure, stuck_or_timeout_failure]
+
 variables:
+  GET_SOURCES_ATTEMPTS: 3
+  ARTIFACT_DOWNLOAD_ATTEMPTS: 3
+  RESTORE_CACHE_ATTEMPTS: 3
   CUTILS_DIR: /tmp/c-utils
   DEBIAN_FRONTEND: noninteractive
   # The Makefile defaults to the dev machine's znver3. Runners are not
@@ -57,7 +68,13 @@ variables:
 # master, so a change over there cannot break this build without someone
 # choosing to move the pin.
 .fetch_cutils: &fetch_cutils
-  - git clone -q https://git.airies.net/vifair22/c-utils.git "$CUTILS_DIR"
+  - |
+    for delay in 5 15 45 0; do
+      rm -rf "$CUTILS_DIR"
+      git clone -q https://git.airies.net/vifair22/c-utils.git "$CUTILS_DIR" && break
+      [ "$delay" -eq 0 ] && { echo "c-utils clone failed after 4 tries"; exit 1; }
+      echo "c-utils clone failed; retrying in ${delay}s"; sleep "$delay"
+    done
   - git -C "$CUTILS_DIR" checkout -q "$(tr -d '[:space:]' < cutils_version)"
   - make -s -C "$CUTILS_DIR"
 

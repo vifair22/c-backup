@@ -3,6 +3,7 @@
 
 #include "util.h"
 #include "reindex.h"
+#include "prune.h"
 #include "unit_index.h"
 
 #include "chunklist.h"
@@ -379,6 +380,8 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
 status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
                           int64_t snap_id, reindex_result_t *out)
 {
+    status_t fst = prune_finish_pending(db, repo_id, NULL);
+    if (fst != OK) return fst;
     return reindex_snapshot_inner(store, db, repo_id, snap_id, 1, out);
 }
 
@@ -1033,6 +1036,11 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* The job holds the repository's write lock; staging a killed writer
      * left (B133) goes, if no other handle holds tmp/. */
     (void)store_sweep_tmp_before(store, time(NULL), NULL);
+
+    /* A record a prune had not finished removing is no snapshot to bring
+     * back (B148). */
+    status_t fst = prune_finish_pending(db, repo_id, NULL);
+    if (fst != OK) return fst;
 
     DIR *d = opendir(dir);
     if (!d) return set_error_errno(ERR_IO, "reindex: cannot open %s", dir);
