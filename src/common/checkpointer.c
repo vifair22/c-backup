@@ -116,6 +116,41 @@ typedef struct { uint32_t left; int rc; } locked_arg_t;
 #define CKPT_SMALL_FRAMES  1024     /* 4 MiB: always small enough to copy under the lock */
 #define CKPT_LOCK_BUDGET_NS (200ull * 1000000ull)
 
+/*
+ * The WAL restart itself, done here rather than by whoever writes next
+ * (B144-REST). The first frame written after a restart rewrites the WAL
+ * header, and SQLite syncs it before going on (an out-of-order write after a
+ * restart could otherwise corrupt the database), so the first writer pays a
+ * sync while holding the write lock: FS2 measured 0.3 to 1.5 s, landing on a
+ * job's progress UPDATE or on a request. With the copy complete and the
+ * write lock held, one harmless row written on this connection restarts the
+ * WAL and pays that sync on this thread instead; writers already queued for
+ * the escalation wait for it once, and nobody pays it on their own write.
+ * A reader still inside the old WAL keeps the restart from happening; the
+ * row is then an ordinary frame, which the next checkpoint copies.
+ */
+static void pre_restart(void)
+{
+    char v[32];
+    snprintf(v, sizeof(v), "%lu", g_stats.pre_restarts + 1);
+    uint64_t t0 = now_ns();
+    int rc = db_execute_non_query(g_ck,
+            "INSERT INTO daemon_state (key, value) VALUES ('wal_restart', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (const char *[]){ v, NULL }, NULL);
+    uint64_t took = now_ns() - t0;
+    uint32_t f = 0, b = 0;
+    int restarted = rc == 0 && checkpointer_wal_frames(g_path, &f, &b) == 0 && f <= 8;
+    pthread_mutex_lock(&g_mu);
+    if (restarted) {
+        g_stats.pre_restarts++;
+        if (took > g_stats.max_restart_ns) g_stats.max_restart_ns = took;
+    } else {
+        g_stats.pre_restart_misses++;
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
 static status_t locked_passive(void *arg)
 {
     locked_arg_t *a = arg;
@@ -123,7 +158,10 @@ static status_t locked_passive(void *arg)
         a->rc = passive(&a->left);
         if (a->rc != 0) break;
         uint32_t f = 0, b = 0;
-        if (checkpointer_wal_frames(g_path, &f, &b) == 0 && f == b) break;
+        if (checkpointer_wal_frames(g_path, &f, &b) == 0 && f == b) {
+            if (f > 0) pre_restart();
+            break;
+        }
     }
     return OK;
 }

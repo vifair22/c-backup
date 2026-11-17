@@ -70,6 +70,7 @@
 
 #include "backup.h"
 #include "db_txn.h"
+#include "db_write.h"
 #include "fake_provider.h"
 #include "fault_inject.h"
 #include "gc.h"
@@ -800,6 +801,8 @@ static void ctx_open(ctx_t *c, const scenario_t *s)
 {
     memset(c, 0, sizeof(*c));
     db_open_at(H_DB, &c->db);
+    /* The commit budget (B144-REST) on, and small: see main. */
+    db_txn_track_wal(c->db);
     if (!s || !s->no_target) {
         assert_int_equal(repo_store_open(H_REPO, NULL, &c->store), OK);
         assert_int_equal(store_index_bind(c->store, c->db, g_repo_id, &c->idx), OK);
@@ -2315,6 +2318,16 @@ int main(void)
     /* Thousands of runs of each operation; their own logs say nothing here. */
     if (!getenv("PC_DEBUG")) log_set_level((log_level_t)(LOG_ERROR + 1));
     if (getenv("PC_FILTER")) cmocka_set_test_filter(getenv("PC_FILTER"));
+    /*
+     * The commit budget (B144-REST) splits a batch wherever its rows reach
+     * the budget, so every operation here runs with it on and at its floor
+     * (a frame priced at 100 ms makes the budget DB_TXN_COMMIT_PAGES_MIN
+     * pages): store batches, pool batches, node batches and pack commits
+     * all end at boundaries the budget chose, and a cut lands between them.
+     * The update hook that counts rows has to be on every connection.
+     */
+    db_txn_guard_install();
+    db_txn_set_frame_cost_ns(100e6);
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_backup_first),
         cmocka_unit_test(test_backup_incr),

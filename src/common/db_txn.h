@@ -102,6 +102,10 @@ typedef struct {
 } db_txn_batch_t;
 
 void db_txn_batch_opened(db_txn_batch_t *b);
+/* db_txn_batch_should_end also ends a batch that has reached its commit
+ * budget (B144-REST, db_txn.c): about DB_TXN_COMMIT_BUDGET_MS of WAL writes
+ * on this device, learnt from earlier commits, and never more than
+ * DB_TXN_COMMIT_PAGES_MAX pages. */
 int  db_txn_batch_should_end(db_txn_batch_t *b);
 /* Whether writers have kept coming lately, so B107's rules apply: a holder
  * also lets go before long waits of its own (backup.c). */
@@ -115,6 +119,36 @@ int  db_txn_batch_contended(const db_txn_batch_t *b);
  * transaction.
  */
 status_t db_txn_install_cutils_lock(cutils_db_t *db);
+
+/*
+ * The commit budget (B144-REST; the design is in db_txn.c). A batch that
+ * asks db_txn_batch_should_end at each row ends once it has changed enough
+ * rows to fill the budget. Active only once db_txn_track_wal has been given
+ * the database (state_db_tune does) and the update hook is installed
+ * (db_txn_guard_install, before the database is opened).
+ */
+#define DB_TXN_COMMIT_BUDGET_MS   150
+#define DB_TXN_COMMIT_PAGES_MIN   16
+#define DB_TXN_COMMIT_PAGES_MAX   256
+#define DB_TXN_COMMIT_ROWS_MIN    4
+
+/* NULL stops tracking (tests that open another database). */
+void db_txn_track_wal(cutils_db_t *db);
+
+typedef struct {
+    unsigned long commits;       /* measured commits */
+    unsigned long capped;        /* batches ended by the budget */
+    uint32_t      max_frames;    /* most WAL frames one COMMIT wrote */
+    uint64_t      max_commit_ns; /* longest COMMIT */
+    double        ns_per_frame;  /* the device estimate */
+} db_txn_commit_stats_t;
+
+void db_txn_commit_stats(db_txn_commit_stats_t *out);
+void db_txn_commit_stats_reset(void);
+/* Tests: pretend each WAL frame costs ns to write (0: measure). */
+void db_txn_set_frame_cost_ns(double ns);
+/* The calling thread's current row cap, UINT32_MAX when none applies. */
+uint32_t db_txn_row_cap(void);
 
 /*
  * Make every commit so far durable before returning (B142).
