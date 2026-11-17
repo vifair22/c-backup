@@ -631,10 +631,60 @@ snapshot is a copy, properties live in a state file), and
 `test_mounts`, `test_docker` and `test_lxc` need no privileges and run in
 the ordinary CI job.
 
-A real-Docker CI job is not added. The runners are Debian containers on a
-docker executor; a Docker-in-Docker service needs a privileged runner, and
-neither ZFS (a kernel module) nor btrfs snapshots of a real pool can be
-exercised inside one in any case. The real paths are covered by UAT.
+### The real-engines CI job
+
+`real-engines` in `.gitlab-ci.yml` runs the real paths: a real Docker
+engine, btrfs snapshots of a real pool, LXC and libvirt/KVM, through the
+real helper and daemon. The runner is unprivileged, so the job
+(`ci/real-engines/job.sh`, image `docker:cli`) starts one privileged sibling
+container through the bound socket, from the fixed image
+`ci/real-engines/Dockerfile` (Debian trixie, the build dependencies and the
+engines, all from Debian). The sibling runs only `ci/real-engines/run.sh`,
+with no network:
+
+- builds `c-backupd`, `c-backup-helper` and `c-backup` from the copied tree;
+- a 1 GiB btrfs pool on a loop device at `/mnt/cache`, the helper's only
+  snapshot domain (`btrfs_domains = /mnt/cache`);
+- its own `dockerd` (vfs driver, no bridge) on its own socket, so the
+  runner's engine never sees a test container, and a local registry so the
+  test image has a digest a define can pull back;
+- a private libvirt daemon (`libvirtd`: Debian 13 ships no `virtqemud`) and
+  one `cbk-uat-vm` (1 vCPU, 64 MiB, KVM where `/dev/kvm` works, a raw and a
+  qcow2 disk);
+- the helper as root and the daemon started as root and dropping to uid 990
+  itself, as deployed above.
+
+It backs up and restores, comparing every restored tree or disk byte for
+byte with what was there at backup time (content, mode, owner, size, link
+targets, sparse files, hard links): a standalone container (a `run` pre
+hook and a 2 MiB `dump` hook, a files restore, an in-place define with
+`--replace --start` and a define under a new name), a compose project (a
+dump and a post hook, files restore, in-place define), an LXC container
+stopped (`offline`) and running where LXC will start inside the sibling
+(frozen, `crash`), and the VM shut off (raw in place, qcow2 through
+qemu-nbd), restored under a new name with define, then running (pull-mode
+export, `crash`). After every step it checks nothing was left: no capture
+snapshot in `btrfs_snapshot_dir`, `holds.json` empty, no paused container,
+no restore staging, no `qemu-nbd`, no libvirt backup job, no scratch file.
+
+It runs on merge requests that touch the units code (`src/providers`,
+`src/helper`, `src/virt`, `src/units`, the units and exports routes,
+`src/common/privs.*`), their tests, or `ci/real-engines/`, and on the
+scheduled pipeline; never on a plain push. One at a time across pipelines
+(`resource_group: cbackup-real-engines`), the sibling capped at one CPU and
+2.5 GiB. The sibling is labelled `cbk.ci=real-engines` with the pipeline,
+job and start time; a sibling older than `CBK_REAP_AFTER_MIN` is removed at
+the next job's start, the job's trap removes its own on every exit, and the
+sibling's own `timeout` (`CBK_LIFETIME_S`) and `--rm` end an orphan. The
+pool is mounted with `-o loop`, so the loop device is freed by autoclear
+even if the sibling is killed outright.
+
+To run it locally: `./ci/real-engines/job.sh` against a local engine (set
+`CUTILS_DIR` to a scratch path: the script checks out the pinned c-utils
+there).
+
+**ZFS is not in it.** The runner has no zfs module, so ZFS snapshots stay a
+scripted UAT step on FS1 (below).
 
 ## UAT: real ZFS (FS1) and btrfs (FS2)
 
