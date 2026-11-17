@@ -45,23 +45,36 @@ static void put(const char *path, const char *text)
     fclose(f);
 }
 
+/* A setup that fails says why: cmocka alone reports only "Test setup
+ * failed", which is all a CI log showed of the root uid below. */
+#define SETUP_FAIL(...) do { print_error(__VA_ARGS__); print_error("\n"); return -1; } while (0)
+
+/* The helper refuses daemon_uid 0, and CI runs the suites as root. No peer
+ * ever connects here (the server does not listen), so the uid only has to
+ * be a valid non-root one, not this process's. */
+#define DAEMON_UID 990u
+
 static int setup(void **state)
 {
     (void)state;
     if (system("rm -rf '" D "' && mkdir -p '" D "/hstate' '" D "/nbd' '" D "/tpm' '" D "/scratch' '"
                D "/staging'") != 0)
-        return -1;
+        SETUP_FAIL("setup: cannot make %s", D);
     char text[2048];
     snprintf(text, sizeof(text),
              "[helper]\ndaemon_uid = %u\ndaemon_id = 0badf00d\nstate_dir = " D "/hstate\n"
              "[host]\nnsenter = 0\nhost_root =\n"
              "[libvirt]\nenabled = 1\nuri = " URI "\nnbd_dir = " D "/nbd\ntpm_dir = " D "/tpm\n"
              "scratch_dir = " D "/scratch\nstaging_root = " D "/staging\n",
-             (unsigned)getuid());
+             DAEMON_UID);
     memset(&pol, 0, sizeof(pol));
-    if (helper_policy_parse(text, &pol) != OK) return -1;
+    if (helper_policy_parse(text, &pol) != OK) SETUP_FAIL("setup: policy: %s", err_msg());
     /* Unreachable is not an error at init: it is retried on use. */
-    return libvirt_backend_init(&pol, &be) == OK ? 0 : -1;
+    if (libvirt_backend_init(&pol, &be) != OK) {
+        helper_policy_free(&pol);
+        SETUP_FAIL("setup: libvirt backend: %s", err_msg());
+    }
+    return 0;
 }
 
 static int teardown(void **state)
