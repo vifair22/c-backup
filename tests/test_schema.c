@@ -78,7 +78,7 @@ static void test_migrations_apply(void **state)
         "policy_values", "repo_backup_paths", "journal", "recovery_state",
         "file_cache", "verify_runs", "verify_findings", "grep_runs",
         "grep_hits", "snapshot_units", "snapshot_unit_items", "unit_policy",
-        "unit_intents", "daemon_state", NULL
+        "unit_intents", "daemon_state", "pack_tombstones", NULL
     };
     for (int i = 0; tables[i]; i++)
         assert_true(object_exists(db, "table", tables[i]));
@@ -210,7 +210,10 @@ static void test_one_baseline_migration(void **state)
     /* B155: the schedule creation time, the never-fired interval anchor. */
     assert_non_null(app_migrations[4].name);
     assert_string_equal(app_migrations[4].name, "006_schedule_created_at.sql");
-    assert_null(app_migrations[5].name);
+    /* Dropped packs' numbers (B156). */
+    assert_non_null(app_migrations[5].name);
+    assert_string_equal(app_migrations[5].name, "007_pack_tombstones.sql");
+    assert_null(app_migrations[6].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */

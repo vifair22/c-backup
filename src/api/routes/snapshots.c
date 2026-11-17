@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "pack_presence.h"
 
 #include "job_manager.h"
 #include "lock.h"
@@ -1237,9 +1238,17 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
      * snap_job_lock chose, for the whole of this call. */
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    status_t st = snap_job_needs_key(j->kind)
-                      ? repo_store_open_keyed(j->repo_path, NULL, &store)
-                      : repo_store_open(j->repo_path, NULL, &store);
+    /*
+     * Every kind refuses an unavailable repository before it opens it,
+     * which would create tmp/ in an empty mountpoint (NIT-38). A verify
+     * there used to report every object missing as data loss, and a
+     * reindex would have read the empty packs/ as every pack gone (NIT-37).
+     */
+    status_t st = pack_presence_require(j->db, j->repo_id);
+    if (st != OK) return st;
+    st = snap_job_needs_key(j->kind)
+             ? repo_store_open_keyed(j->repo_path, NULL, &store)
+             : repo_store_open(j->repo_path, NULL, &store);
     if (st != OK) return st;
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) { store_close(store); return st; }
@@ -1254,17 +1263,19 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         /* What came back, on the job, failed or not: an operator recovering
          * from a lost database needs to see that the tags returned, and a
          * failed run says how much it still managed. */
-        char rj[400];
+        char rj[480];
         snprintf(rj, sizeof(rj),
                  "{\"snapshots\":%llu,\"snapshots_failed\":%llu,\"files\":%llu,"
                  "\"objects\":%llu,\"packs_unreadable\":%llu,"
                  "\"tags_restored\":%llu,\"tags_skipped\":%llu,"
-                 "\"snapshot_mark\":%lld,\"snapshot_ids_repaired\":%s}",
+                 "\"snapshot_mark\":%lld,\"snapshot_ids_repaired\":%s,"
+                 "\"pack_mark\":%lld,\"pack_ids_repaired\":%s}",
                  (unsigned long long)rx.snapshots, (unsigned long long)rx.snapshots_failed,
                  (unsigned long long)rx.files, (unsigned long long)rx.objects,
                  (unsigned long long)rx.packs_unreadable,
                  (unsigned long long)rx.tags_restored, (unsigned long long)rx.tags_skipped,
-                 (long long)rx.snapshot_mark, rx.snapshot_ids_repaired ? "true" : "false");
+                 (long long)rx.snapshot_mark, rx.snapshot_ids_repaired ? "true" : "false",
+                 (long long)rx.pack_mark, rx.pack_ids_repaired ? "true" : "false");
         job_set_result(progress_ctx, rj);
     } else if (j->kind == SNAP_JOB_GREP) {
         grep_opts_t go;
@@ -2188,6 +2199,12 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
 
     status_t st = repo_trylock_write(repo_id);
     if (st != OK) { free(repo_path); return api_error(503, "repo is busy"); }
+
+    if (pack_presence_require(g_ctx.db, repo_id) != OK) {
+        repo_unlock(repo_id);
+        free(repo_path);
+        return api_error(409, err_msg());
+    }
 
     store_t *store = NULL;
     st = repo_store_open(repo_path, NULL, &store);

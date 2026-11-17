@@ -76,6 +76,7 @@
 #include "index_reconcile.h"
 #include "object.h"
 #include "pack.h"
+#include "pack_ids.h"
 #include "pack_presence.h"
 #include "prune.h"
 #include "reindex.h"
@@ -106,6 +107,7 @@
 #define DB_LOST  H_KEEP "/db-lost"
 #define DB_KEPT  H_KEEP "/db-kept"
 #define H_KEYS   H_KEEP "/keys"
+#define DROPPED  H_KEEP "/dropped.dat"
 
 #define PL        512
 #define MAX_DOPS  4096
@@ -761,6 +763,9 @@ static status_t unit_backup_once(store_t *st, cutils_db_t *db, int64_t *out_snap
 
 /* What the pristine state promises, set by each build. */
 static int64_t  g_repo_id, g_srepo_id;
+/* B156: the number of a pack the build dropped as missing and kept in
+ * DROPPED, put back at every start; -1 for none. */
+static int64_t  g_dropped = -1;
 static int      g_ver_of[MAX_SNAPS];     /* snapshot id -> source version; 0 for none */
 static int      g_required[MAX_SNAPS];   /* listed after any cut */
 static int      g_unit_of[MAX_SNAPS];    /* unit snapshots: 2 for u2's, else u1's */
@@ -978,6 +983,7 @@ static void begin_build(ctx_t *c)
     memset(g_unit_of, 0, sizeof(g_unit_of));
     g_npre = 0;
     g_srepo_id = 0;
+    g_dropped = -1;
     assert_int_equal(__real_mkdir(H_DIR, 0700), 0);
     assert_int_equal(__real_mkdir(H_OUT, 0700), 0);
     memset(c, 0, sizeof(*c));
@@ -1363,10 +1369,65 @@ static void check_restores(store_t *st, cutils_db_t *db)
 }
 
 /* The daemon's start after an outage, and everything that must hold. */
+/*
+ * B156: pack numbers are never issued twice. Every pack on disk, every pack
+ * the index has a row for and every number it has a tombstone for is below
+ * the repository's mark, whatever step the cut fell on: the mark is raised,
+ * durably, before anything is written under a number.
+ */
+static void max_on_disk(uint32_t num, void *ctx)
+{
+    int64_t *m = ctx;
+    if ((int64_t)num > *m) *m = (int64_t)num;
+}
+
+static void check_pack_mark(cutils_db_t *db, store_t *st)
+{
+    repo_marker_t m;
+    if (repo_marker_read(H_REPO, &m) != OK) { err_clear(); return; }
+    int64_t mark = -1;
+    if (pack_ids_read(H_REPO, m.uuid, &mark) != OK) {
+        violation("the pack-number mark cannot be read: %s", err_msg());
+        err_clear();
+        return;
+    }
+    int64_t top = -1;
+    (void)pack_list(st, max_on_disk, &top);
+    err_clear();
+    if (top >= mark)
+        violation("pack %lld is on disk at or above the mark %lld", (long long)top, (long long)mark);
+    char q[256];
+    snprintf(q, sizeof(q),
+             "SELECT COUNT(*) FROM (SELECT id FROM packs WHERE repo_id = ?"
+             " UNION SELECT id FROM pack_tombstones WHERE repo_id = ?1) WHERE id >= %lld",
+             (long long)mark);
+    expect_none(db, "packs or tombstones at or above the mark", q);
+}
+
+/* The pack the build dropped comes back, as a remounted share would. If its
+ * number had been issued again there would be a file in its place. */
+static void return_dropped_pack(void)
+{
+    if (g_dropped < 0) return;
+    char p[PATH_MAX], dir[PATH_MAX];
+    assert_int_equal(pack_dat_path_resolve(p, sizeof(p), H_REPO, (uint32_t)g_dropped), 0);
+    struct stat sb;
+    if (lstat(p, &sb) == 0) {
+        violation("pack %lld, dropped as missing, was written again under its number",
+                  (long long)g_dropped);
+        return;
+    }
+    dir_of(p, dir);
+    if (__real_mkdir(dir, 0755) != 0 && errno != EEXIST)
+        violation("cannot recreate %s", dir);
+    copy_file(DROPPED, p);
+}
+
 static void start_and_check(void)
 {
     cutils_db_t *db = NULL;
     db_open_at(H_DB, &db);
+    return_dropped_pack();
     if (store_index_drop_unannounced(db, 0) != OK)
         violation("drop_unannounced: %s", err_msg());
     if (store_index_drop_staged(db, 0) != OK)
@@ -1412,6 +1473,7 @@ static void start_and_check(void)
     }
     pack_resume_removals(st);
 
+    check_pack_mark(db, st);
     check_objects(st);
     check_rows(db, 0);
     check_snapshots(db);
@@ -2025,6 +2087,42 @@ static status_t op_unit_second(ctx_t *c, int counting)
     return st;
 }
 
+/*
+ * backup after a dropped pack (B156): the highest pack is missing and the
+ * index has dropped it, so its objects are absent and the backup stores
+ * them again. Its pack must not take the dropped number, wherever the cut
+ * falls - between raising the mark and staging, or anywhere after - and at
+ * the start the original comes back and is indexed again without colliding.
+ */
+static void build_backup_after_drop(ctx_t *c)
+{
+    begin_build(c);
+    open_target(c);
+    g_required[backup_into(c->store, c->db, g_repo_id, 1)] = 1;
+    g_required[backup_into(c->store, c->db, g_repo_id, 2)] = 1;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)g_repo_id);
+    long long top = count_of(c->db, "SELECT MAX(id) FROM packs WHERE repo_id = ?");
+    assert_true(top >= 0);
+    char p[PATH_MAX];
+    assert_int_equal(pack_dat_path_resolve(p, sizeof(p), H_REPO, (uint32_t)top), 0);
+    (void)remove(DROPPED);
+    copy_file(p, DROPPED);
+    assert_int_equal(unlink(p), 0);
+    pack_cache_invalidate(c->store);
+    pack_presence_t pp;
+    assert_int_equal(pack_presence_check(c->db, g_repo_id, 1, &pp), OK);
+    assert_int_equal(pp.packs_dropped, 1);
+    g_ver_of[3] = 2;
+    end_build(c);
+    g_dropped = top;
+}
+
+static status_t op_backup_after_drop(ctx_t *c, int counting)
+{
+    return op_backup(c, counting, 2, 3);
+}
+
 static const scenario_t S_BACKUP_FIRST = { "backup, first", build_backup_first,
                                            op_backup_first, 0, 0, 0 };
 static const scenario_t S_BACKUP_INCR  = { "backup, incremental", build_backup_incr,
@@ -2044,6 +2142,8 @@ static const scenario_t S_UNIT_SECOND  = { "unit backup, second", build_unit_sec
                                            op_unit_second, 0, 0, 1 };
 static const scenario_t S_UNIT_TWO     = { "unit backup, two units", build_unit_two,
                                            op_unit_two, 0, 0, 2 };
+static const scenario_t S_AFTER_DROP   = { "backup after a drop", build_backup_after_drop,
+                                           op_backup_after_drop, 0, 0, 0 };
 
 static void test_backup_first(void **state)  { (void)state; every_cut(&S_BACKUP_FIRST); }
 static void test_backup_incr(void **state)   { (void)state; every_cut(&S_BACKUP_INCR); }
@@ -2057,6 +2157,7 @@ static void test_reindex(void **state)       { (void)state; every_cut(&S_REINDEX
 static void test_unit_first(void **state)    { (void)state; every_cut(&S_UNIT_FIRST); }
 static void test_unit_second(void **state)   { (void)state; every_cut(&S_UNIT_SECOND); }
 static void test_unit_two(void **state)      { (void)state; every_cut(&S_UNIT_TWO); }
+static void test_after_drop(void **state)    { (void)state; every_cut(&S_AFTER_DROP); }
 
 /* ------------------------------------------------------------------ */
 /* Snapshot records (prune), by the order of its steps                 */
@@ -2227,6 +2328,7 @@ int main(void)
         cmocka_unit_test(test_unit_first),
         cmocka_unit_test(test_unit_second),
         cmocka_unit_test(test_unit_two),
+        cmocka_unit_test(test_after_drop),
         cmocka_unit_test(test_prune_unlinks_the_record_after_the_commit_is_durable),
         cmocka_unit_test(test_start_finishes_an_interrupted_prune),
         cmocka_unit_test(test_reindex_finishes_an_interrupted_prune),

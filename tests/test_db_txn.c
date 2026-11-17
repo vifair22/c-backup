@@ -36,6 +36,7 @@
 
 #include <cmocka.h>
 #include <cutils/db.h>
+#include <cutils/log.h>
 
 #include "db_txn.h"
 #include "db_write.h"
@@ -659,6 +660,96 @@ static void test_guard_reports_a_write_outside_the_lock(void **state)
     db_txn_guard_arm(0);
 }
 
+/* ------------------------------------------------------------------ */
+/* CUTILS-2: c-utils' own writers take the lock (c-utils 1.8.0)        */
+/* ------------------------------------------------------------------ */
+
+static long marker_rows(const char *marker)
+{
+    char sql[160];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM logs WHERE message = '%s'", marker);
+    return count_rows(sql);
+}
+
+/* Bounded at 10 s: a line that never lands fails the test, not hangs it. */
+static void wait_for_marker(const char *marker)
+{
+    int seen = 0;
+    for (int i = 0; i < 5000 && !seen; i++) {
+        if (marker_rows(marker) == 1) { seen = 1; break; }
+        struct timespec ts = { 0, 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    assert_true(seen);
+}
+
+/*
+ * A log line written while a transaction is open lands after it, whether
+ * that transaction commits or rolls back.
+ *
+ * The log writer is a c-utils thread inserting into logs on this same
+ * connection. Before the lock was handed to c-utils, its INSERT joined
+ * whatever transaction was open: a line logged during a backup batch that
+ * then failed was rolled back with the batch. Now the writer queues for
+ * the lock (it is seen waiting), nothing of it is inside the transaction,
+ * and once the transaction rolls back the line is written on its own.
+ */
+static void test_a_log_line_waits_out_a_rolled_back_transaction(void **state)
+{
+    (void)state;
+    assert_int_equal(db_txn_install_cutils_lock(db), OK);
+    assert_int_equal(log_init(db, LOG_INFO, 0), 0);
+    unsigned long v0 = db_txn_guard_violations();
+    db_txn_guard_arm(1);
+
+    assert_int_equal(db_txn_begin(db), OK);
+    log_info("b157-marker-rollback");
+    wait_for_waiter();                          /* the log writer, queued */
+    assert_int_equal(marker_rows("b157-marker-rollback"), 0);
+    db_txn_rollback(db);
+    wait_for_marker("b157-marker-rollback");    /* not lost with the rollback */
+
+    db_txn_guard_arm(0);
+    assert_int_equal(db_txn_guard_violations(), v0);   /* every row under the lock */
+    log_shutdown();
+    assert_int_equal(db_set_write_lock(db, NULL, NULL, NULL), 0);
+}
+
+static void *log_from_thread(void *arg)
+{
+    (void)arg;
+    log_info("b157-marker-thread");
+    return NULL;
+}
+
+/*
+ * The same from a thread that is not the holder: its line waits for the
+ * holder's commit rather than joining the holder's transaction, and does
+ * not hold the holder up either (logging only queues the line).
+ */
+static void test_a_log_line_from_another_thread_waits_for_the_commit(void **state)
+{
+    (void)state;
+    assert_int_equal(db_txn_install_cutils_lock(db), OK);
+    assert_int_equal(log_init(db, LOG_INFO, 0), 0);
+    unsigned long v0 = db_txn_guard_violations();
+    db_txn_guard_arm(1);
+
+    assert_int_equal(db_txn_begin(db), OK);
+    pthread_t t;
+    assert_int_equal(pthread_create(&t, NULL, log_from_thread, NULL), 0);
+    assert_int_equal(pthread_join(t, NULL), 0);  /* returned while we hold it */
+    wait_for_waiter();
+    assert_int_equal(marker_rows("b157-marker-thread"), 0);
+    assert_int_equal(db_txn_commit(db), OK);
+    wait_for_marker("b157-marker-thread");
+
+    db_txn_guard_arm(0);
+    assert_int_equal(db_txn_guard_violations(), v0);
+    log_shutdown();
+    assert_int_equal(db_set_write_lock(db, NULL, NULL, NULL), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -674,6 +765,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_db_write_joins_the_callers_transaction, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_write_batch_yields_to_a_waiter, setup, teardown),
         cmocka_unit_test_setup_teardown(test_guard_reports_a_write_outside_the_lock, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_log_line_waits_out_a_rolled_back_transaction, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_log_line_from_another_thread_waits_for_the_commit, setup, teardown),
     };
     /* Before any test opens its database, so every connection is hooked.
      * The guard test counts violations rather than aborting on one, so the

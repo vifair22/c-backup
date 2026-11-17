@@ -49,6 +49,10 @@ typedef struct {
      * set when the file was missing, damaged or behind and was rewritten. */
     int64_t  snapshot_mark;
     int      snapshot_ids_repaired;
+    /* The pack-number mark afterwards (<repo>/pack-ids), and whether the
+     * file was missing, damaged or behind and rewritten (B156). */
+    int64_t  pack_mark;
+    int      pack_ids_repaired;
 } reindex_result_t;
 
 /*

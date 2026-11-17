@@ -1571,7 +1571,11 @@ how many versions of them across snapshots (`affected_versions`), up to
 three full paths, and up to ten snapshot ids beside the exact count
 (`affected_snapshot_count`, with `snapshots_truncated` set when the list is
 short). The run's `affected_files` and `affected_snapshots` are distinct
-paths and snapshots across every lost object. The CLI prints the run and its
+paths and snapshots across every lost object, counted the same way, so the
+run and its findings agree. A lost tree names no file: its finding shows 0,
+and it adds nothing to the run's totals, because a restore reads the
+index's record of the snapshot rather than its trees and still restores
+every file beneath it (section 17.6). The CLI prints the run and its
 findings as one JSON document.
 
 Every level also checks the index for regular files that name no content
@@ -2178,7 +2182,9 @@ nothing outside the repository that names a snapshot by id (a tag, a note,
 a script, a replica) ends up pointing at a different backup. The job's
 result reports `snapshot_mark`, and `snapshot_ids_repaired` is true when the
 file was missing, damaged, copied from another repository or behind, and
-was rewritten. Tags come back too: the repository keeps its own copy of the
+was rewritten. Pack numbering is kept the same way, in `pack-ids`: the
+result reports `pack_mark` and `pack_ids_repaired`, and a pack dropped as
+missing never has its number reused (section 17.6). Tags come back too: the repository keeps its own copy of the
 tag list (a `tags` file beside `snapshots/`), and the reindex job's result
 reports `tags_restored`. A reindex that cannot read that file fails rather than
 leaving tagged snapshots silently unprotected. Lost for good: schedules,
@@ -2347,20 +2353,84 @@ repo 1 (/srv/backup/main): pack-0000000000.dat is missing; its 297 object(s) are
 ```
 
 Until a backup has stored them again, `c-backup verify <id>` reports
-exactly those objects missing, with the files and snapshots they affect. A
-snapshot whose own trees were in the missing pack stays unrestorable unless
-a later backup of the same unchanged source makes those trees again; the
-objects a newer backup did store again make every older snapshot that
-names them restorable once more.
+exactly those objects missing, with the files and snapshots they affect;
+the run's totals count the same files its findings do. The objects a newer
+backup did store again make every older snapshot that names them
+restorable once more.
+
+A snapshot whose own trees were in the missing pack still restores, and
+exactly: a restore reads the index's record of the snapshot, not its trees.
+verify reports those trees missing, as findings that name no file, and the
+run's file and snapshot totals do not count them. They matter when the
+index has to be rebuilt from the repository - a lost database
+(section 17.1), a reindex - because that reads the trees; a snapshot whose
+trees are gone then cannot be indexed again. The next backup of the same
+unchanged directories stores the same trees again, since a tree's name is
+its content.
+
+A dropped pack keeps its number. Pack numbers are never issued twice: the
+repository records the next free one in `pack-ids` (docs/repo-format.md),
+raised before any pack takes a number, and the index keeps a tombstone for
+every dropped pack. So the next backup writes its pack under a new number,
+never the dropped one's, and if the missing pack comes back - a share
+remounted, a copy put back - nothing collides. The next start or backup
+finds it, reads every entry and checks each against its name, and takes it
+back into the index: objects marked absent are present again, and where a
+later backup stored an object again, whichever copy proves good is the one
+the index keeps. An entry that fails the check is left out and the journal
+entry (operation `pack-returned`) says how many.
 
 Two things are never taken for missing packs:
 
-- **An unavailable repository.** When the repository's `packs/` directory
-  is missing or cannot be read - a share that is not mounted - nothing is
-  checked or changed, the repository is reported unavailable, and a backup
-  into it is refused. Only a pack file that does not exist (`ENOENT`) in a
-  readable `packs/` counts as missing; any other error leaves its pack as
-  it is.
+- **An unavailable repository.** Nothing is checked or changed, the
+  repository is reported unavailable (`state` is `unavailable` in
+  `c-backup repo show` and `repo list`, with the reason in `unavailable`),
+  and every job on it - backup, verify, reindex, retention, restore - is
+  refused before the repository is touched, so a refused backup does not
+  even create `tmp/` in an empty mountpoint. The alert says the job was
+  refused because the repository is unavailable; it claims no data loss.
+  A repository is unavailable when:
+
+  - its root has no `.cbackup` marker: an empty mountpoint, or the wrong
+    path;
+  - its `packs/` directory is missing or cannot be read: a share that is
+    not mounted;
+  - `packs/` is not the directory it was - its device or inode changed,
+    because something was mounted or unmounted over it - and a pack the
+    index names is missing from it. `packs/` is itself a mountpoint in some
+    deployments, and unmounted it is an empty directory, so existing proves
+    nothing. A changed `packs/` that holds every pack (a device renumbered
+    across a reboot) is simply recorded;
+  - every pack the index names is missing, however many there are, one of
+    one included.
+
+  The last two yield to `repo repair --accept-missing`, for the operator
+  who has checked. Every pack missing: they really are all gone. A
+  replaced `packs/`: it really moved - the pool was rebuilt, the packs were
+  restored to a new disk - and the packs the reason counts did not come
+  with it. The reason says so and names the command:
+
+  ```
+  repository 1 is unavailable: /srv/backup/main/packs is not the directory it was (device:inode 66306:256, was 2049:131) and 1 of the 3 packs the index names are not in it; something was mounted or unmounted there. If packs/ really moved (a rebuilt pool, packs restored to a new disk), check that this is the right mount, then run 'c-backup repo repair 1 --accept-missing' to record its new identity and accept the missing packs as lost; nothing was read or written
+  ```
+
+  Check the mount first: the wrong share mounted at `packs/` reads exactly
+  like this. Then:
+
+  ```sh
+  sudo c-backup repo repair 1 --accept-missing
+  ```
+
+  The repair accepts a replaced `packs/` only when the repository root's
+  `.cbackup` marker is the one registered for that id; otherwise it stays
+  unavailable and says the marker is not this repository's. It marks the
+  missing packs' objects absent (section 17.6, above), records the new
+  device:inode so later checks are ordinary, and the next backup stores
+  again whatever its sources still hold. A `packs/` that moved with every
+  pack in it needs nothing: its new device:inode is recorded on its own.
+
+  Only a pack file that does not exist (`ENOENT`) in a readable `packs/`
+  counts as missing; any other error leaves its pack as it is.
 - **A mass disappearance.** Two or more missing packs that are more than
   `index.missing_brake_pct` percent of the repository's (default 5), or more
   than `index.missing_brake_packs` of them (default 10), looks far more like
@@ -2379,8 +2449,9 @@ Two things are never taken for missing packs:
   which marks their objects absent as above and takes backups again.
 
 A single missing pack never trips the percentage, however small the
-repository: one pack out of one heals on its own, with its alert, while
-two out of three go through the repair.
+repository, as long as other packs are present: one of two heals on its
+own, with its alert, while two out of three go through the repair. One out
+of one is every pack, and that is an unavailable repository, above.
 
 ## 18. Capacity planning and performance
 

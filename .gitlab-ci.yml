@@ -91,6 +91,9 @@ test:
     - *fetch_cutils
   script:
     - make
+    # A bare make must produce the programs: the Docker image build runs
+    # exactly this, and once built nothing because the default goal slipped.
+    - test -x build/bins/c-backupd && test -x build/bins/c-backup && test -x build/bins/c-backup-helper
     # Find somewhere the sparse fixtures can have real holes. Sourced, not
     # run: it exports the directory the suites read. Never fails the job -
     # if nothing here supports holes the suites skip, exactly as before.
