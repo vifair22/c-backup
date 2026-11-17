@@ -842,7 +842,7 @@ snapshot name, raw XML for libvirt, or a raw create body for Docker.
 
 | Operation | Arguments (typed) | What the helper does |
 |---|---|---|
-| `hello` | `client_version` int | handshake |
+| `hello` | `client_version` int; `session` token, optional; `anchor` bool, optional | handshake; answers the policy digest, daemon id, providers, and the `holds` and `captures` the helper has now. `session` names the daemon process; `anchor` keeps the connection as that session's anchor, and when its last anchor closes the helper ends the captures the session began (a daemon killed mid-backup) |
 | `units.list` | `provider` enum | enumerate, filtered by the policy's unit allowlist |
 | `units.describe` | `unit` unit key | inspect / domain XML / LXC config, templates and compose files, read by the helper and returned as data |
 | `capture.begin` | `units` 1 to 32 unit keys; `pause` bool | resolves every included mount itself, computes snapshot domains itself and intersects them with the policy's domains; pauses or freezes members if asked, `syncfs`, one atomic snapshot per pool with names it generates, unpauses; returns an opaque capture token, the read root of each mount, timings and per-member outcomes. Holds a lease with a deadline |
@@ -855,9 +855,9 @@ snapshot name, raw XML for libvirt, or a raw create body for Docker.
 | `vm.checkpoint_redefine` | `unit`; `checkpoint` name | redefines from the XML the helper itself stored when it created the checkpoint. The helper also runs this for every recorded checkpoint at its own start, because Unraid keeps checkpoint metadata on the RAM rootfs (`vm-backup.md` 5.8) |
 | `vm.install_state` | `unit` (the domain just defined or replaced); `staging` token | installs the staged NVRAM file at the path the domain's XML names and the TPM state directory at `tpm-states/<that domain's uuid>/`, with recorded owners and modes; refuses any other UUID and an existing state directory for a new UUID; never lists or touches other UUIDs' state (`vm-backup.md` 7.2) |
 | `restore.stage` | `unit`; `mount` (a source path as recorded); `job` int; optional `real` (where the backup read it) | resolves the mount to where its bytes are now and refuses when that differs from `real` (B178); creates `<dataset root>/.cbackup-restore/<job>-<random>/` on that path's filesystem, owned by the daemon uid, opened without following symlinks and pinned until the swap (`helper.md`, B171); returns a staging token, the path and `real` |
-| `restore.swap` | `staging` token | with the unit stopped, renames the staged restore into place and moves the old data aside (11.6); never deletes |
-| `unit.stop`, `unit.start` | `unit` | for restore; policy `allow_restore` |
-| `unit.define` | `unit`; `definition` (the snapshot's inspect, template, compose files, or domain XML) | policy `allow_define` only. The helper parses the definition field by field, rejects privileged settings unless `allow_privileged_define`, rewrites names, UUIDs and MACs itself, and serialises its own document; the daemon's bytes are never passed through |
+| `restore.swap` | `staging` token; `undo` bool, optional | with the unit stopped, renames the staged restore into place through the fds pinned at stage and moves the old data aside (11.6); never deletes. With `undo`, reverses a swap it made: the restored copy back to its staging directory, the old data back to the mount (a restore that failed after the swap) |
+| `unit.stop`, `unit.start` | `unit` | for restore; policy `allow_restore`. `unit.stop` says whether the unit was running, so a failed restore can start it again |
+| `unit.define` | `unit`; `definition` (the snapshot's inspect, template, compose files, or domain XML) | policy `allow_define` only. The helper parses the definition field by field, rejects privileged settings unless `allow_privileged_define`, rewrites names, UUIDs and MACs itself, and serialises its own document; the daemon's bytes are never passed through. A passed definition with `check: true` beside `memfd` runs every refusal and defines nothing, answering `allow_restore` and the unit's state: a restore asks it before it writes anything |
 | `lease.release` | `capture` or `session` token | early release |
 | `sweep` | none | releases everything its own records say is held; destroys its own leftover artefacts |
 

@@ -20,9 +20,9 @@
  *
  *   - Steps are the repository's renames, unlinks, mkdirs, fsyncs and
  *     writes (fault_inject.h), each index commit (an SQLite WAL hook), and
- *     each make_durable (db_txn.h). A write to a staging file in tmp/ is
- *     counted but not cut at: the disk after it is the disk before it,
- *     because nothing unsynced in tmp/ survives.
+ *     each make_durable (db_txn.h). A write to a staging file in tmp/ or
+ *     packs/.staging is counted but not cut at: the disk after it is the
+ *     disk before it, because nothing unsynced in staging survives.
  *   - At the cut, every directory change whose directory was never synced
  *     afterwards is undone, newest first; a file whose content is not what
  *     its last fsync saw goes back to what it was before the operation, or
@@ -281,9 +281,12 @@ static int in_scope(const char *p)
     return strncmp(p, H_REPO "/", sizeof(H_REPO)) == 0 || strcmp(p, H_REPO) == 0;
 }
 
+/* Staging: tmp/, and packs/.staging where packs are staged (B163). */
 static int in_scratch(const char *p)
 {
-    return strncmp(p, H_REPO "/tmp/", sizeof(H_REPO "/tmp")) == 0;
+    return strncmp(p, H_REPO "/tmp/", sizeof(H_REPO "/tmp")) == 0 ||
+           strncmp(p, H_REPO "/" STORE_PACK_STAGING "/",
+                   sizeof(H_REPO "/" STORE_PACK_STAGING)) == 0;
 }
 
 /* One step: 1 when it happens, 0 when the cut came first. g_mu held. */
@@ -534,6 +537,10 @@ static int hook_nosync(int fd, int data_only)
 
 static void model_off(void)
 {
+    /* What follows a cut is a restart reading back from disk: syncs after
+     * the cut failed as a dead machine's would, and the latch they tripped
+     * (sync_latch.h) belongs to the process that died. */
+    sync_latch_reset_for_test();
     fault_write_hook  = NULL;
     fault_rename_hook = NULL;
     fault_unlink_hook = NULL;
@@ -2151,9 +2158,12 @@ static status_t op_backup_after_drop(ctx_t *c, int counting)
  */
 
 /* What c-backupd's after-write hook does (main.c). */
-static void api_after_write(void *db)
+static int api_after_write(void *db, char *why, size_t why_sz)
 {
-    if (db_txn_make_durable(db) != OK) err_clear();
+    if (db_txn_make_durable(db) == OK) return 0;
+    snprintf(why, why_sz, "%s", err_msg());
+    err_clear();
+    return -1;
 }
 
 static status_t api_call(ctx_t *c, api_method_t m, const char *path, const char *body)

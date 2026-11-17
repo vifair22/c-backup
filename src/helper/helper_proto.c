@@ -183,7 +183,8 @@ typedef struct {
 } schema_t;
 
 static const schema_t k_schema[HOP_COUNT] = {
-    [HOP_HELLO]                  = { { { "client_version", A_INT } }, 1, 0 },
+    [HOP_HELLO]                  = { { { "client_version", A_INT }, { "session", A_TOKEN },
+                                       { "anchor", A_BOOL } }, 3, 0, 2 },
     [HOP_UNITS_LIST]             = { { { "provider", A_PROVIDER } }, 1, 0 },
     [HOP_UNITS_DESCRIBE]         = { { { "unit", A_UNIT } }, 1, 0 },
     [HOP_CAPTURE_BEGIN]          = { { { "units", A_UNITS }, { "pause", A_BOOL }, { "hold", A_BOOL } }, 3, 0, 1 },
@@ -198,7 +199,7 @@ static const schema_t k_schema[HOP_COUNT] = {
     [HOP_VM_INSTALL_STATE]       = { { { "unit", A_UNIT }, { "staging", A_TOKEN } }, 2, 0 },
     [HOP_RESTORE_STAGE]          = { { { "unit", A_UNIT }, { "mount", A_PATH }, { "job", A_JOB },
                                        { "real", A_REAL } }, 4, 0, 1 },
-    [HOP_RESTORE_SWAP]           = { { { "staging", A_TOKEN } }, 1, 0 },
+    [HOP_RESTORE_SWAP]           = { { { "staging", A_TOKEN }, { "undo", A_BOOL } }, 2, 0, 1 },
     [HOP_UNIT_STOP]              = { { { "unit", A_UNIT } }, 1, 0 },
     [HOP_UNIT_START]             = { { { "unit", A_UNIT } }, 1, 0 },
     [HOP_UNIT_DEFINE]            = { { { "unit", A_UNIT }, { "definition", A_OBJECT } }, 2, 0 },
@@ -248,6 +249,8 @@ static int take_arg(helper_req_t *r, const akey_t *k, const cJSON *v, char *why,
     case A_BOOL:
         if (!cJSON_IsBool(v)) return set_bad(why, wsz, "%s: %s must be true or false", op, k->key);
         if (strcmp(k->key, "hold") == 0) r->hold = cJSON_IsTrue(v);
+        else if (strcmp(k->key, "undo") == 0) r->undo = cJSON_IsTrue(v);
+        else if (strcmp(k->key, "anchor") == 0) r->anchor = cJSON_IsTrue(v);
         else r->pause = cJSON_IsTrue(v);
         return 0;
     case A_PROVIDER:

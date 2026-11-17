@@ -42,7 +42,7 @@ static status_t purge_table(cutils_db_t *db, const char *table, const char *repo
     for (;;) {
         /* stopped: not done, not failed */
         if (stop && atomic_load_explicit(stop, memory_order_relaxed)) return ERR_BUSY;
-        if (db_txn_begin(db) != OK) return set_error(ERR_IO, "purge %s: begin", table);
+        if (db_txn_begin_bulk(db) != OK) return set_error(ERR_IO, "purge %s: begin", table);
         int n = 0;
         if (db_write(db, sql, (const char *[]){ repo, NULL }, &n) != 0) {
             db_txn_rollback(db);
@@ -57,7 +57,7 @@ static status_t purge_table(cutils_db_t *db, const char *table, const char *repo
  * filename index, which is FTS5 and cannot range-scan on repo_id at all. */
 static status_t purge_stmt(cutils_db_t *db, const char *sql, const char *repo)
 {
-    if (db_txn_begin(db) != OK) return set_error(ERR_IO, "purge: begin");
+    if (db_txn_begin_bulk(db) != OK) return set_error(ERR_IO, "purge: begin");
     if (db_write(db, sql, (const char *[]){ repo, NULL }, NULL) != 0) {
         db_txn_rollback(db);
         return set_error(ERR_IO, "purge: %s", sql);

@@ -48,6 +48,7 @@
 #include "index_startup.h"
 #include "pack.h"
 #include "pack_presence.h"
+#include "repo.h"
 #include "state_db.h"
 #include "test_tmp.h"
 
@@ -234,13 +235,14 @@ static void build(int scale)
     char packs[4096];
     snprintf(packs, sizeof(packs), "%s/packs", REPO1);
     assert_int_equal(mkdir(packs, 0700), 0);
-    /* A repository root without its marker is unavailable (B156), and the
-     * pack check would then touch nothing; only its presence is tested. */
-    char marker[4096];
-    snprintf(marker, sizeof(marker), "%s/.cbackup", REPO1);
-    FILE *mf = fopen(marker, "w");
-    assert_non_null(mf);
-    fclose(mf);
+    /* A repository root without its marker is unavailable (B156), and so is
+     * one whose marker names another repository (B164): the pack check
+     * would then touch nothing. So it is repository 1's, uuid u1. */
+    repo_marker_t m;
+    memset(&m, 0, sizeof(m));
+    snprintf(m.uuid, sizeof(m.uuid), "u1");
+    repo_marker_cdc_default(&m);
+    assert_int_equal(repo_marker_write_fixed(REPO1, &m, NULL), OK);
     for (int p = 1; p <= npacks(REPO_OBJS[0]); p++)
         if (!is_missing(p)) touch_pack((uint32_t)p);
 }

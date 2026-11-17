@@ -60,12 +60,17 @@ cb() { "$CLI" --socket "$SOCK" "$@"; }
 
 mkdir -p "$WORK/snap" "$WORK/pool/app/a"
 echo alpha > "$WORK/snap/a.txt"
+# The tree root as read: a mode and a time no staging directory has (B168).
+chmod 0751 "$WORK/snap"
+touch -d @1500000000 "$WORK/snap"
 cat > "$WORK/units.json" <<EOF
 {"units":[
  {"id":"a","name":"cbk-uat-a","state":"running","caps":["quiesce","snapshot"],
   "blobs":[{"id":"domain.xml","path":".cbackup-unit/config/domain.xml","text":"<domain>a</domain>"}],
   "disks":[{"id":"vda","size":4194304,"runs":[{"off":0,"len":1048576,"kind":"data","seed":3}]}],
   "trees":[{"id":"vol","read_root":"$WORK/snap","path":"$WORK/pool/app/a","source":"$WORK/pool/app/a"}]},
+ {"id":"k","name":"cbk-uat-k","state":"running","caps":["quiesce"],
+  "disks":[{"id":"vda","size":8589934592,"runs":[{"off":0,"len":8589934592,"kind":"data","seed":9}]}]},
  {"id":"c","name":"cbk-uat-c","state":"running","caps":["quiesce"],
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}]},
  {"id":"p","name":"prod-db","state":"running",
@@ -217,6 +222,9 @@ echo "restore as a unit"
 OUT=$(cb unit restore 1 1 --define 2>&1); RC=$?
 check    "in place without --replace is refused" 1 "$RC"
 contains "and says to pass replace" "pass replace" "$OUT"
+OUT=$(cb unit restore 1 1 --define --name cbk-uat-a 2>&1); RC=$?
+check    "its own name is in place, so without --replace it is refused" 1 "$RC"
+contains "asking for replace, not a target root" "pass replace" "$OUT"
 OUT=$(cb unit restore 1 1 --define --name cbk-uat-b 2>&1); RC=$?
 check    "a new name without a target root is refused" 1 "$RC"
 contains "and says so" "needs target_root" "$OUT"
@@ -227,9 +235,26 @@ check    "the data is under the target root" alpha "$(cat "$WORK/target$WORK/poo
 check    "the original's path is untouched" "" "$(ls "$WORK/pool/app/a")"
 contains "the helper got the remapped paths" "$WORK/target$WORK/pool/app/a" "$(cat "$WORK/hstate/fake-define-a.json")"
 contains "its warning is in the journal" "fake define" "$(cb journal 1)"
+# B167: a define that fails after the swap puts the original back and
+# starts the unit again; it used to leave the new data in and the unit down.
+rm -f "$WORK/hstate/fake-define-a.json"
+mkdir "$WORK/hstate/fake-define-a.json"
+OUT=$(cb unit restore 1 1 --define --replace 2>&1); RC=$?
+check    "an in-place restore whose define fails fails" 1 "$RC"
+contains "and says it was rolled back" "rolled back" "$OUT"
+check    "the original data is still in place" "" "$(ls "$WORK/pool/app/a")"
+check    "nothing is left moved aside" "" "$(ls -d "$WORK/pool/app/a.cbackup-old-"* 2>/dev/null)"
+contains "and the unit runs again" '"state":"running"' "$(cb unit show fake cbk-uat-a)"
+contains "the error says where the restored copy was kept" "$WORK/pool/.cbackup-restore/" "$OUT"
+check    "and it is there" alpha "$(cat "$WORK/pool/.cbackup-restore/"*/a.txt 2>/dev/null)"
+rmdir "$WORK/hstate/fake-define-a.json"
+rm -rf "$WORK/pool/.cbackup-restore"
 OUT=$(cb unit restore 1 1 --define --replace)
 contains "an in-place restore completes" '"state":"completed"' "$OUT"
 check    "the data is back in place" alpha "$(cat "$WORK/pool/app/a/a.txt")"
+check    "the mount root has the snapshot's mode, not the staging's" 751 "$(stat -c %a "$WORK/pool/app/a")"
+check    "and its time" 1500000000 "$(stat -c %Y "$WORK/pool/app/a")"
+check    "no empty staging directory is left in the domain" no "$([ -e "$WORK/pool/.cbackup-restore" ] && echo yes || echo no)"
 
 echo "a scheduled pause scope"
 # pause_scope used to be dropped from a units schedule's parameters, so a
@@ -253,6 +278,33 @@ if command -v curl >/dev/null 2>&1; then
           -d '{"provider":"fake","all":true,"pausescope":"job"}')
     contains "and in a units job" "unknown key 'pausescope'" "$OUT"
 fi
+
+echo "a daemon killed mid-backup"
+# B169: the helper held the backup's export hold until its own restart or
+# capture_max_s, and holds_open said 0 meanwhile. Now the daemon's anchor
+# closes with it, and the helper ends the capture at once.
+cb unit backup 1 --provider fake cbk-uat-k > /dev/null 2>&1 &
+BG=$!
+for _ in $(seq 1 100); do
+    [ "$(cat "$WORK/hstate/holds.json" 2>/dev/null)" != "[]" ] && break; sleep 0.1
+done
+contains "the helper journals the running backup's hold" '"kind":"export"' "$(cat "$WORK/hstate/holds.json")"
+OUT=$(cb unit providers)
+lacks    "and holds_open counts it" '"holds_open":0' "$OUT"
+contains "the helper's holds are shown" '"holds":' "$OUT"
+kill -9 "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=
+wait "$BG" 2>/dev/null
+for _ in $(seq 1 50); do
+    [ "$(cat "$WORK/hstate/holds.json")" = "[]" ] && break; sleep 0.1
+done
+check    "the helper releases it within seconds of the kill" "[]" "$(cat "$WORK/hstate/holds.json")"
+contains "and says why" "session" "$(grep "ended (its connection closed)" "$WORK/helper.log")"
+C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "${AS_DAEMON[@]}" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+DAEMON_PID=$!
+for _ in $(seq 1 100); do
+    cb unit providers 2>/dev/null | grep -q '"state":"connected"' && break; sleep 0.1
+done
+contains "the restarted daemon sees no hold open" '"holds_open":0' "$(cb unit providers)"
 
 echo "helper gone"
 kill "$HELPER_PID"; wait "$HELPER_PID" 2>/dev/null; HELPER_PID=

@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 
 #include "gc.h"
+#include "sync_latch.h"
 
 #include "chunklist.h"
 #include "manifest.h"
@@ -237,6 +238,12 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 int dry_run, atomic_int *cancel, gc_result_t *out)
 {
     if (!store || !db) return set_error(ERR_INVALID, "gc_run: null argument");
+    /* gc deletes once its commits are durable; a latched daemon's are not
+     * known to be (sync_latch.h). A dry run deletes nothing. */
+    if (!dry_run) {
+        status_t lst = sync_latch_repo_check(store_root(store), "gc");
+        if (lst != OK) return lst;
+    }
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -264,7 +271,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     /*
      * Staging files from a killed writer. gc holds the write lock, so no
-     * other job is writing this repository and anything already in tmp/
+     * other job is writing this repository and anything already staged
      * belongs to a process that is gone; see store_sweep_tmp_before. A dry
      * run promises to change nothing, and keeps that promise here too.
      */
@@ -278,7 +285,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         err_clear();
     }
 
-    if (db_txn_begin(db) != OK)
+    if (db_txn_begin_bulk(db) != OK)
         return set_error(ERR_IO, "gc: begin");
 
     /* Clear every mark first. Anything still at zero after the walk is

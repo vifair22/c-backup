@@ -204,6 +204,9 @@ the daemon refuses to start with a write route that has neither, and
 - **Durable**: the answer waits for a sync of the database's write-ahead
   log (an `fdatasync`). Tags, registering and removing a repository, every
   `DELETE`, and the few other writes that revoke or discard something.
+  If that sync fails (a full or failing disk), the answer is a `500` whose
+  error says the change is committed but could not be made durable: it is
+  in the database, and may not survive a power cut.
 - **Commit-only**: the answer comes as soon as the change is committed. The
   daemon's once-a-second flush puts it on disk, so a power cut within about
   a second of the answer can lose that last edit. It cannot corrupt
@@ -242,8 +245,8 @@ disk (Manual section 6.4 has the numbers measured during a backup).
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/healthz` | Liveness: the process answers |
-| GET | `/readyz` | Readiness: the database is open |
+| GET | `/healthz` | Liveness: the process answers; `storage_sync` is `ok` or `failed`, `repos_sync_failed` a count |
+| GET | `/readyz` | Readiness: the database is open and its syncs have not failed (503 if they have); `"status":"degraded"` with `repos_sync_failed` listed when only repositories' have |
 | GET | `/metrics` | Prometheus text exposition |
 | GET | `/api/auth/setup` | Is an admin password configured? |
 
@@ -255,6 +258,35 @@ and label, in `cbackup_stalest_snapshot_repo_info` and
 `cbackup_stalest_verify_repo_info`: one series each, value 1, so an alert on
 the matching age can say which repository it means without a series per
 repository. Label values are escaped per the text exposition format.
+
+**After a failed sync.** Once a sync has failed, the daemon stops promising
+durability for what it covered (Manual section 17.7): Linux may already have
+dropped the bytes, and a later sync can succeed over the loss.
+
+- `state.db` or the key directory: the whole daemon, until it restarts.
+  `/healthz` still answers 200 and adds `"storage_sync":"failed"`,
+  `storage_sync_error` (the file and the error) and `storage_sync_failed_at`
+  (unix time); `/readyz` answers 503 with the same reason;
+  `cbackup_storage_sync_failed` is 1 and
+  `cbackup_storage_sync_failed_timestamp_seconds` the time. Every
+  durable-class write is answered `500` with `durable write refused: a
+  previous sync failed (<file>: <error>); restart the daemon to re-read from
+  disk`, and its handler does not run, so nothing is committed.
+- One repository's own file: that repository only. Its `state` is
+  `sync_failed`, with `sync_failed` (the file and the error) and
+  `sync_failed_at` in `GET /repos` and `GET /repos/<id>`; its durable-class
+  writes get the same `500`, naming the repository; its backup, gc, prune
+  and replication jobs fail; `/readyz` stays 200 with `"status":"degraded"`
+  and `repos_sync_failed: [{"id","path","error","at"}]`;
+  `cbackup_repos_sync_failed` counts such repositories. Other repositories
+  are unaffected. The latch is recorded in `state.db` and survives a
+  restart. `POST /repos/<id>/verify?clear_sync=1` (CLI `repo repair <id>`)
+  is the only way back: a job running a deep verify
+  that writes nothing, after dropping the repository's pages from the cache;
+  it clears the latch only if the verify finds nothing, and fails saying
+  what it found otherwise. `409` when the repository has no failed sync.
+
+Reads and commit-only writes still work in both cases.
 
 ## Auth
 
@@ -607,7 +639,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/grep` | Content search as a job: `{pattern, snapshot, path_prefix, ignore_case, max_files}` |
 | GET | `/repos/<id>/grep` | Recent searches, newest first; `limit` and `offset` |
 | GET | `/repos/<id>/grep/<run-id>` | The hits from one search, paginated |
-| POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing, `?dry_run=1` (or `true`) the same and overriding any `repair` |
+| POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing, `?dry_run=1` (or `true`) the same and overriding any `repair`. `?clear_sync=1`: clear the repository's failed sync if a deep verify that writes nothing finds nothing (409 when there is none; see Public) |
 | GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) and `offset` |
 | GET | `/repos/<id>/verify/<run-id>` | The findings from one run, paginated |
 | POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt, allow_plaintext}` |
@@ -1521,7 +1553,7 @@ it); a unit outside it is not listed and cannot be described or backed up.
 | GET | `/providers/<p>/units/<u>` | Describe one unit (by name or id): items, kinds, sizes, capabilities |
 | GET | `/repos/<id>/units` | Units with history here: last snapshot, its level, how many, paginated by name |
 | GET | `/repos/<id>/units/<p>/<u>/snapshots` | That unit's snapshots, newest first, each with its level and items (`read_mode`, `reason`, `bytes_read`) |
-| GET/PUT | `/repos/<id>/units/<p>/<u>/policy` | Per-unit policy: `retention.keep_*` keys over the repository's; `capture.exclude` (patterns on recorded paths, one per line, applied only when set); `capture.group` (units captured together under `pause_scope: group`); `null` or `""` drops one; GET shows the unit's own and what is in force |
+| GET/PUT | `/repos/<id>/units/<p>/<u>/policy` | Per-unit policy: `retention.keep_*` keys over the repository's; `capture.exclude` (patterns on recorded paths, one per line, applied only when set); `capture.group` (units captured together under `pause_scope: group`); `null` or `""` drops one; GET shows the unit's own and what is in force. PUT takes a unit with snapshots in the repository (under their key), or one its provider lists now and `units.allow` takes (keyed by its id); otherwise 404, or 403 outside `units.allow`, or 409 when its provider cannot be asked |
 | GET | `/repos/<id>/units/<p>/<u>/checkpoints` | The unit's incremental chain (vm-backup.md 5.8): `incremental` (`enabled`, `disabled_reason` and `disabled_at` after a failed audit, `last_audit_at`, `audit_days`, `delta_full_pct`) and `tokens`, one per disk: `item`, `checkpoint`, the `snapshot` it describes, `usable`, `identity`, `created_at` |
 | POST | `/repos/<id>/units/<p>/<u>/reset-incremental` | After a failed bitmap audit: incrementals back on for the unit, every token made unusable so the next backup is a full read under a new checkpoint (the old one is retired when it commits). Journalled. Answers `unit_key` and `was_disabled`, the reason they were off |
 | POST | `/repos/<id>/units/backup` | `{"provider":"fake","all":true,"exclude":["x*"]}` or `{"provider":"fake","units":["a"]}`, optional `"require":"crash"` (the default) and `"pause_scope":"unit"` (the default; a `units` schedule stores and honours it too, `--pause-scope` from the CLI; any other key is refused), `"group"` (units sharing a `capture.group` captured together) or `"job"` (every unit at one instant); 202 with a job. The job fails when any unit fails, and its result lists each unit's outcome and snapshot |

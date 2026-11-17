@@ -23,15 +23,18 @@
  *
  *   - An unavailable repository. Nothing is checked or changed, and the
  *     repository is reported unavailable, when its root has no .cbackup
- *     marker (an empty mountpoint), when packs/ is missing or cannot be
- *     read (an unmounted share), when packs/ is not the directory it was
- *     (device or inode changed) and a pack is missing from it, and when
- *     every pack the index names is missing, whatever their number (B156:
- *     packs/ can itself be a mountpoint, and unmounted it is an empty
- *     directory; one pack of one used to heal into it). The last two yield
- *     to accept_missing: a replaced packs/ only when the root's marker is
- *     the one registered, and its new device:inode is then recorded. Only ENOENT for a pack file in a readable
- *     packs/ counts; EIO, EACCES and the rest leave the row alone.
+ *     marker (an empty mountpoint) or one naming another repository (two
+ *     roots swapped, B164; nothing overrides that), when packs/ is missing
+ *     or cannot be read (an unmounted share), when packs/ is not the
+ *     directory it was (device or inode changed) and a pack is missing
+ *     from it, and when every pack the index names is missing, whatever
+ *     their number (B156: packs/ can itself be a mountpoint, and unmounted
+ *     it is an empty directory; one pack of one used to heal into it). The
+ *     last two yield to accept_missing, which the marker check has by then
+ *     shown to be acting on the registered repository (B165); a replaced
+ *     packs/ has its new device:inode recorded. Only ENOENT for a pack
+ *     file in a readable packs/ counts; EIO, EACCES and the rest leave the
+ *     row alone.
  *   - A mass disappearance. More missing packs than the brake allows
  *     (pack_presence_set_brake: by default two or more that are more than
  *     5% of the packs, or more than 10) is a wrong path, a half-mounted
@@ -102,7 +105,7 @@ status_t pack_presence_check_all(cutils_db_t *db);
  * Whether repo_id is there at all, read-only: 1 available, 0 unavailable
  * with why, -1 when it cannot be told (no such repository, the index cannot
  * be read), with why. The same tests as pack_presence_check's, minus every
- * change it makes. Cheap when the repository is healthy: a stat of the
+ * change it makes. Cheap when the repository is healthy: a read of the
  * marker, an opendir, and a stat of the newest pack.
  */
 int pack_presence_available(cutils_db_t *db, int64_t repo_id, char *why, size_t why_len);

@@ -72,6 +72,21 @@ static int strip_rel(char *rel, const restore_opts_t *o)
     return rel[0] == '\0';
 }
 
+static int path_within(const char *rel, const char *subpath);
+
+/*
+ * Is rel a directory strictly above the subpath, on the way to it? Not
+ * with strip_subpath, where nothing above the subpath is written. The
+ * root itself (rel empty) is dest.
+ */
+static int is_above_subpath(const char *rel, const restore_opts_t *o)
+{
+    if (o->strip_subpath) return 0;
+    while (*rel == '/') rel++;
+    if (!*rel) return 0;
+    return path_within(o->subpath, rel) && !path_within(rel, o->subpath);
+}
+
 /* Where rel lands under dest. -1 if too long. */
 static int dest_path(char *full, size_t sz, const char *dest, const char *rel, const restore_opts_t *o)
 {
@@ -928,14 +943,16 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
                              const char *full, uint64_t size, uint32_t mode,
                              uint32_t uid, uint32_t gid, int64_t mtime,
                              const char *xhash, const char *ahash,
-                             char *tmp, size_t tmpsz, uint64_t *out_sz)
+                             char *tmp, size_t tmpsz, uint64_t *out_sz,
+                             int *out_dest_err)
 {
     uint8_t hash[OBJECT_HASH_SIZE];
     hex_to_hash(chash, hash);
     *out_sz = 0;
+    *out_dest_err = 0;
 
     int fd = make_partial_at(pfd, full, tmp, tmpsz);
-    if (fd == -1) return ERR_IO;
+    if (fd == -1) { *out_dest_err = 1; return ERR_IO; }
 
     /*
      * One FILE object or a chunk list. Every object is bounded, so each is
@@ -947,7 +964,7 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
      */
     (void)size;
     uint64_t sz = 0;
-    status_t st = content_restore_fd(store, hash, fd, &sz);
+    status_t st = content_restore_fd_ex(store, hash, fd, &sz, out_dest_err);
 
     /* Metadata goes on before the rename, so the file is final the moment
      * it has its name: the resume rule relies on the mtime being right.
@@ -959,8 +976,10 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
         apply_xattrs(store, &t, xhash);
         apply_acls(store, &t, ahash, 0);
     }
-    if (close(fd) != 0 && st == OK)
+    if (close(fd) != 0 && st == OK) {
         st = set_error_errno(ERR_IO, "restore: cannot close %s", full);
+        *out_dest_err = 1;
+    }
     if (st != OK) {
         if (unlinkat(pfd, tmp, 0) != 0 && errno != ENOENT)
             log_warn("restore: cannot remove partial file %s for %s: %s",
@@ -1311,16 +1330,35 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         }
 
-        if (opts->subpath && !path_within(rel, opts->subpath))
+        /* A directory above the subpath is made on the way to it; it takes
+         * its recorded metadata, as in a whole restore, rather than a mode
+         * from the daemon's 0077 umask (an item restore's parents came back
+         * 0700 where a whole restore gives 0755). Not counted as matched. */
+        int above = opts->subpath && ntype == NODE_TYPE_DIR && is_above_subpath(rel, opts);
+        if (opts->subpath && !above && !path_within(rel, opts->subpath))
             continue;
         if (ntype == NODE_TYPE_REG) bytes_pending = strtoull(r->rows[i][6], NULL, 10);
-        matched++;
-        if (strip_rel(rel, opts)) {
+        if (!above) matched++;
+        if (!above && strip_rel(rel, opts)) {
             /* The subpath itself is dest, which exists; a file cannot be
              * stripped onto it. */
-            if (ntype != NODE_TYPE_DIR)
+            if (ntype != NODE_TYPE_DIR) {
                 restore_fail(&res, rel[0] ? rel : opts->subpath,
                              "a single file cannot be restored as the destination itself");
+                continue;
+            }
+            /* A directory can, and dest takes its metadata. dest is the
+             * staging directory an in-place unit restore swaps in as the
+             * mount (B168): left alone it kept the helper's 0700, root's
+             * group and the time of the restore, and the swap made that the
+             * live mount's. The mtime comes in the pass below, as for every
+             * directory. */
+            meta_target_t t = { dest_fd, NULL, 0, dest };
+            clear_acls(&t, 1);
+            apply_metadata_fd(dest_fd, dest, mode, uid, gid, mtime);
+            apply_xattrs(store, &t, xhash);
+            apply_acls(store, &t, ahash, 1);
+            res.dirs++;
             continue;
         }
 
@@ -1616,8 +1654,9 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         store_get_io_progress(store, &prev_io, &prev_io_ctx);
         if (opts->bytes_cb || opts->progress_cb)
             store_set_io_progress(store, restore_bytes, &io);
+        int dest_err = 0;
         status_t lst = restore_file(store, chash, pfd, full, nsize, mode, uid, gid,
-                                    mtime, xhash, ahash, tmp, sizeof(tmp), &sz);
+                                    mtime, xhash, ahash, tmp, sizeof(tmp), &sz, &dest_err);
         store_set_io_progress(store, prev_io, prev_io_ctx);
 
         if (lst != OK && cancelled(opts)) {
@@ -1625,6 +1664,14 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
              * final path was never touched. */
             st = set_error(ERR_BUSY, "restore cancelled");
             break;
+        }
+        if (lst != OK && dest_err) {
+            /* The destination's fault this time - a full disk, a quota, a
+             * mount gone read-only - and said as such (B182). */
+            restore_fail(&res, full, "cannot write it: %s",
+                         err_msg()[0] ? err_msg() : status_reason(lst));
+            err_clear();
+            continue;
         }
         if (lst != OK) {
             /* The fault is the repository's, not the destination's: name
@@ -1686,8 +1733,16 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             err_clear();
             continue;
         }
-        if (opts->subpath && !path_within(rel, opts->subpath)) continue;
-        if (strip_rel(rel, opts)) continue;
+        int above = opts->subpath && is_above_subpath(rel, opts);
+        if (opts->subpath && !above && !path_within(rel, opts->subpath)) continue;
+        if (!above && strip_rel(rel, opts)) {
+            struct timespec times[2];
+            times[0] = ns_to_timespec(strtoll(r->rows[i][5], NULL, 10));
+            times[1] = times[0];
+            if (futimens(dest_fd, times) != 0)
+                log_warn("restore: utimensat %s: %s", dest, strerror(errno));
+            continue;
+        }
         if (dest_path(full, sizeof(full), dest, rel, opts) != 0)
             continue;
 

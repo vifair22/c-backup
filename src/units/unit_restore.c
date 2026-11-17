@@ -29,8 +29,18 @@ status_t unit_snapshot_key(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
     if (found && key) snprintf(key, ksz, "%s", r->rows[0][0]);
     int unknown = found && strncmp(r->rows[0][0], "unknown:", 8) == 0;
     db_result_free(r);
-    if (!found)
+    if (!found) {
+        /* Not there at all (or in another repository) is said as such:
+         * both used to read "is not a unit snapshot". */
+        r = NULL;
+        int exists = db_execute(db, "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+                                (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
+        db_result_free(r);
+        if (!exists)
+            return set_error(ERR_NOT_FOUND, "repository %lld has no snapshot %lld",
+                             (long long)repo_id, (long long)snap_id);
         return set_error(ERR_NOT_FOUND, "snapshot %lld is not a unit snapshot", (long long)snap_id);
+    }
     if (unknown)
         return set_error(ERR_NOT_FOUND, "snapshot %lld has a unit directory that cannot be "
                          "classified; restore it as files", (long long)snap_id);
@@ -166,6 +176,9 @@ status_t unit_restore_item(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st == OK && rename(partial, dest) != 0)
         st = set_error_errno(ERR_IO, "item restore: rename to %s", dest);
     if (st != OK) { unlink(partial); return st; }
+    /* The rename is durable only once its directory is. */
+    if (snapshot_fsync_parent(dest) != 0)
+        return set_error_errno(ERR_IO, "item restore: sync the directory of %s", dest);
     out->bytes = got;
     return OK;
 }

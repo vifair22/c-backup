@@ -2,6 +2,7 @@
 
 #include "state_db.h"
 #include "wal_sync.h"
+#include "sync_latch.h"
 #include "checkpointer.h"
 
 #include <cutils/log.h>
@@ -142,6 +143,9 @@ static int seen_matches(const struct stat *st)
 static void flush_once(void)
 {
     struct stat st;
+    /* Latched: syncing on would only report successes that prove nothing,
+     * and the failure is already logged and alerted (sync_latch.h). */
+    if (sync_latch_tripped()) return;
     if (stat(g_fl_wal, &st) != 0) return;
     if (seen_matches(&st)) return;
     /* wal_sync: the file's data, its directory entry the first time this

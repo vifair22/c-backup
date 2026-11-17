@@ -383,6 +383,8 @@ static void test_hook_logs_and_dumps(void **state)
     size_t len = 0;
     assert_int_equal(be.ops->blob_read(s, log, &data, &len), OK);
     assert_non_null(memmem(data, len, "flushed", 7));
+    /* B174: a run hook that exits 0 says so too. */
+    assert_non_null(memmem(data, len, "[c-backup: exit status 0]", 25));
     free(data);
     /* A good dump: its stdout through the pipe, then ok. */
     int fd = -1, ok = -1;

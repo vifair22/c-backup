@@ -3,6 +3,7 @@
 #include "checkpointer.h"
 
 #include "db_txn.h"
+#include "walidx.h"
 
 #include <cutils/db.h>
 #include <cutils/log.h>
@@ -11,6 +12,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,40 +23,14 @@
 /* The wal-index header                                                */
 /* ------------------------------------------------------------------ */
 
-/* walformat.md: WalIndexHdr (48 bytes) twice, then WalCkptInfo, whose
- * first field is nBackfill. Native byte order. */
-#define WALIDX_VERSION   3007000u
-#define WALIDX_HDR_SIZE  48
-#define WALIDX_MXFRAME   16
-#define WALIDX_ISINIT    12
-#define WALIDX_BACKFILL  96
-#define WALIDX_READ      (WALIDX_BACKFILL + 4)
-
-static uint32_t u32_at(const unsigned char *b, size_t off)
-{
-    uint32_t v;
-    memcpy(&v, b + off, sizeof(v));
-    return v;
-}
-
+/* Through walidx (B173): an open and close of -shm here would drop the
+ * locks SQLite's connections hold on it. */
 int checkpointer_wal_frames(const char *db_path, uint32_t *frames, uint32_t *backfilled)
 {
-    char shm[PATH_MAX];
-    if (!db_path || snprintf(shm, sizeof(shm), "%s-shm", db_path) >= (int)sizeof(shm))
-        return -1;
-    int fd = open(shm, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-    unsigned char b[WALIDX_READ];
-    ssize_t n = pread(fd, b, sizeof(b), 0);
-    close(fd);
-    if (n != (ssize_t)sizeof(b)) return -1;
-    if (u32_at(b, 0) != WALIDX_VERSION || b[WALIDX_ISINIT] != 1) return -1;
-    if (memcmp(b, b + WALIDX_HDR_SIZE, WALIDX_HDR_SIZE) != 0) return -1;
-    uint32_t mx = u32_at(b, WALIDX_MXFRAME);
-    uint32_t bf = u32_at(b, WALIDX_BACKFILL);
-    if (bf > mx) bf = mx;     /* read between a restart and its backfill reset */
-    if (frames) *frames = mx;
-    if (backfilled) *backfilled = bf;
+    walidx_t w;
+    if (walidx_read(db_path, &w) != 0) return -1;
+    if (frames) *frames = w.frames;
+    if (backfilled) *backfilled = w.backfilled;
     return 0;
 }
 
@@ -82,8 +58,30 @@ static uint64_t now_ns(void)
 
 /* One PASSIVE checkpoint on the thread's connection. 0 when it ran (busy
  * or not), with the frames left uncopied in *left; -1 when it could not. */
+/* B181: hard-cap state shared with writers (checkpointer_throttle). */
+static atomic_int    g_active;            /* the thread is running */
+static atomic_ullong g_blocked_until_ns;  /* an escalation could not finish */
+static atomic_ullong g_last_probe_ns;     /* writers' last look at the WAL */
+static atomic_uint   g_test_pause_ms;
+static atomic_int    g_test_idle;
+
+void checkpointer_set_test_idle(int on)
+{
+    atomic_store(&g_test_idle, on ? 1 : 0);
+}
+
+void checkpointer_set_test_pause_ms(unsigned ms)
+{
+    atomic_store(&g_test_pause_ms, ms);
+}
+
 static int passive(uint32_t *left)
 {
+    unsigned pause = atomic_load(&g_test_pause_ms);
+    if (pause) {
+        struct timespec ts = { (time_t)(pause / 1000), (long)(pause % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
     db_result_t *r = NULL;
     int rc = db_execute(g_ck, "PRAGMA wal_checkpoint(PASSIVE)", NULL, &r);
     int ok = rc == 0 && r && r->nrows == 1 && r->ncols >= 3;
@@ -114,6 +112,9 @@ typedef struct { uint32_t left; int rc; } locked_arg_t;
 #define CKPT_LOCKED_ROUNDS 4
 #define CKPT_UNLOCKED_ROUNDS 4
 #define CKPT_SMALL_FRAMES  1024     /* 4 MiB: always small enough to copy under the lock */
+#define CKPT_PROBE_NS        (5ull * 1000000ull)      /* writers look at most this often */
+#define CKPT_THROTTLE_MAX_NS (2000ull * 1000000ull)   /* and never wait longer */
+#define CKPT_BLOCKED_NS      (1000ull * 1000000ull)   /* after a copy that could not finish */
 #define CKPT_LOCK_BUDGET_NS (200ull * 1000000ull)
 
 static status_t locked_passive(void *arg)
@@ -130,6 +131,7 @@ static status_t locked_passive(void *arg)
 
 static void tick(void)
 {
+    if (atomic_load(&g_test_idle)) return;
     uint32_t frames = 0, backfilled = 0;
     if (checkpointer_wal_frames(g_path, &frames, &backfilled) != 0) return;
     pthread_mutex_lock(&g_mu);
@@ -137,11 +139,18 @@ static void tick(void)
     if (frames > g_stats.max_wal_frames) g_stats.max_wal_frames = frames;
     pthread_mutex_unlock(&g_mu);
 
-    if (frames - backfilled < g_threshold) return;
-    uint32_t left = 0;
+    uint64_t hard = (uint64_t)g_threshold * CKPT_HARD_FACTOR;
+    uint32_t left = frames - backfilled;
+    uint64_t round_ns = 0;
+    /* Past the hard cap: straight to the lock, no unlocked rounds first.
+     * On a slow device each unlocked PASSIVE takes two syncs and the copy,
+     * and a writer that does not sync appends far faster than that, so the
+     * rounds were where the WAL ran to several times the cap (B181). */
+    if (frames > hard) goto locked;
+    if (left < g_threshold) return;
     uint64_t r0 = now_ns();
     if (passive(&left) != 0) return;
-    uint64_t round_ns = now_ns() - r0;
+    round_ns = now_ns() - r0;
     pthread_mutex_lock(&g_mu);
     g_stats.passive++;
     pthread_mutex_unlock(&g_mu);
@@ -155,12 +164,12 @@ static void tick(void)
      * on a complete copy and restarts the WAL. A large remainder waits for
      * the next tick, unless the WAL is past the hard cap.
      */
-    uint64_t hard = (uint64_t)g_threshold * CKPT_HARD_FACTOR;
     uint32_t small = g_threshold / 4 < CKPT_SMALL_FRAMES ? g_threshold / 4 : CKPT_SMALL_FRAMES;
     for (int round = 0; ; round++) {
         if (checkpointer_wal_frames(g_path, &frames, &backfilled) != 0) return;
         left = frames - backfilled;
         if (frames < g_threshold) return;                   /* restarted meanwhile */
+        if (frames > hard) goto locked;
         if (left <= small || round >= CKPT_UNLOCKED_ROUNDS) break;
         /* Each round copies only what arrived during the last, so the
          * remainder shrinks quickly unless writers outpace the copy. */
@@ -177,6 +186,7 @@ static void tick(void)
      * remainder to shrink below small. */
     if (left > small && round_ns > CKPT_LOCK_BUDGET_NS && frames <= hard) return;
 
+locked:;
     locked_arg_t a = { 0, -1 };
     uint64_t t0 = now_ns();
     if (db_txn_exclusive(locked_passive, &a) != OK) return;
@@ -185,9 +195,65 @@ static void tick(void)
     if (a.rc == 0) g_stats.escalations++;
     if (held > g_stats.max_lock_ns) g_stats.max_lock_ns = held;
     pthread_mutex_unlock(&g_mu);
+    /* A copy that could not complete under the lock (a reader holding an
+     * old snapshot) cannot be helped by holding writers back: let them
+     * through for a while rather than make each wait for another failure. */
+    uint32_t f2 = 0, b2 = 0;
+    if (a.rc != 0 || (checkpointer_wal_frames(g_path, &f2, &b2) == 0 && f2 > hard && f2 != b2))
+        atomic_store(&g_blocked_until_ns, now_ns() + CKPT_BLOCKED_NS);
     if (held > 1000000000ull || frames > hard)
         log_warn("state.db: WAL at %u frames; checkpointed under the write lock in %.0f ms "
                  "(%u frames were left)", frames, (double)held / 1e6, left);
+}
+
+/*
+ * Writers' half of the hard cap (B181). The checkpointer alone cannot hold
+ * the WAL to the cap on a slow device: between two of its looks a writer
+ * that never syncs appends tens of thousands of frames. So every bulk
+ * writer, before it queues for the write lock (db_txn_begin_bulk, and each
+ * db_write_batch), looks at the WAL -
+ * at most every CKPT_PROBE_NS across all writers, a stat and a pread - and
+ * once it is past the hard cap and not fully copied, wakes the
+ * checkpointer and waits for the copy to complete. Holding no lock while
+ * it waits, it cannot hold up the checkpoint it waits for. It stops
+ * waiting when the copy is complete (the first writer after it restarts
+ * the WAL), when the checkpointer has found it cannot complete one
+ * (g_blocked_until_ns), or after CKPT_THROTTLE_MAX_NS whatever happens.
+ *
+ * Only bulk writers: a request's write (db_txn_begin, db_write) never
+ * waits here. Those writes are a few pages each and cannot carry the WAL
+ * past the cap; the writers that can are the ones that write without
+ * pause, and holding them is enough.
+ */
+void checkpointer_throttle(void)
+{
+    if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return;
+    uint64_t now = now_ns();
+    uint64_t last = atomic_load_explicit(&g_last_probe_ns, memory_order_relaxed);
+    if (now - last < CKPT_PROBE_NS) return;
+    atomic_store_explicit(&g_last_probe_ns, now, memory_order_relaxed);
+    if (now < atomic_load(&g_blocked_until_ns)) return;
+    uint64_t hard = (uint64_t)g_threshold * CKPT_HARD_FACTOR;
+    uint32_t f = 0, b = 0;
+    if (checkpointer_wal_frames(g_path, &f, &b) != 0 || f <= hard || f == b) return;
+
+    pthread_mutex_lock(&g_mu);
+    pthread_cond_signal(&g_cv);
+    pthread_mutex_unlock(&g_mu);
+    uint64_t t0 = now;
+    for (;;) {
+        struct timespec ts = { 0, 2 * 1000000L };
+        nanosleep(&ts, NULL);
+        uint64_t t = now_ns();
+        if (!atomic_load(&g_active) || t < atomic_load(&g_blocked_until_ns) ||
+            t - t0 > CKPT_THROTTLE_MAX_NS) break;
+        if (checkpointer_wal_frames(g_path, &f, &b) != 0 || f <= hard || f == b) break;
+    }
+    uint64_t waited = now_ns() - t0;
+    pthread_mutex_lock(&g_mu);
+    g_stats.throttled++;
+    if (waited > g_stats.max_throttle_ns) g_stats.max_throttle_ns = waited;
+    pthread_mutex_unlock(&g_mu);
 }
 
 static void *main_loop(void *arg)
@@ -256,6 +322,8 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
         return set_error(ERR_IO, "cannot start the state.db checkpointer");
     }
     g_running = 1;
+    atomic_store(&g_blocked_until_ns, 0);
+    atomic_store(&g_active, 1);
     pthread_mutex_unlock(&g_mu);
     return OK;
 }
@@ -264,6 +332,7 @@ void checkpointer_stop(void)
 {
     pthread_mutex_lock(&g_mu);
     if (!g_running) { pthread_mutex_unlock(&g_mu); return; }
+    atomic_store(&g_active, 0);
     g_stop = 1;
     pthread_cond_signal(&g_cv);
     pthread_mutex_unlock(&g_mu);

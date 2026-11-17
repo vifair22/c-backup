@@ -43,6 +43,12 @@ typedef struct {
  * a new name needs a target_root). 0, or -1 with why. */
 int unit_define_check(const char *unit_id, const unit_define_opts_t *o, char *why, size_t wsz);
 
+/* name as unit_define_run takes it: NULL when it is the unit's own id or
+ * the name the snapshot recorded for it, which is the unit in place, not a
+ * new name. */
+const char *unit_define_name(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                             const char *unit_id, const char *name);
+
 status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                          int64_t job_id, const unit_define_opts_t *o, unit_define_result_t *out);
 void     unit_define_result_free(unit_define_result_t *r);
