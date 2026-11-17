@@ -4,6 +4,7 @@
 #include "db_write.h"
 
 #include "phase_timer.h"
+#include "checkpointer.h"
 #include "wal_sync.h"
 
 #include <cutils/log.h>
@@ -99,6 +100,14 @@ status_t db_txn_begin(cutils_db_t *db)
         return set_error(ERR_IO, "cannot begin");
     }
     return OK;
+}
+
+status_t db_txn_begin_bulk(cutils_db_t *db)
+{
+    /* Past the WAL's hard cap, wait for the checkpointer first (B181).
+     * Only here: a request's short write never waits for a checkpoint. */
+    if (!tls_held) checkpointer_throttle();
+    return db_txn_begin(db);
 }
 
 status_t db_txn_commit(cutils_db_t *db)
@@ -338,6 +347,8 @@ int db_write_batch_open(db_write_batch_t *b, cutils_db_t *db)
 {
     b->db = db;
     b->since = 0;
+    /* A loop writing many rows is a bulk writer (B181). */
+    if (!db_txn_held()) checkpointer_throttle();
     b->began = db_write_enter(db);
     return b->began < 0 ? -1 : 0;
 }
