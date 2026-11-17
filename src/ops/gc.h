@@ -58,6 +58,12 @@ typedef struct {
     uint32_t packs_unwalkable;
     uint32_t unwalkable_listed;
     pack_unwalkable_t unwalkable[PACK_UNWALKABLE_LIST_MAX];
+    /* Duplicate copies (OWN-22): dropped behind a confirmed indexed copy,
+     * kept because the indexed copy could not be confirmed, and index rows
+     * moved off such a copy onto one proven to be the object. */
+    uint64_t dups_dropped;
+    uint64_t dups_kept;
+    uint64_t index_relocated;
 } gc_result_t;
 
 /*

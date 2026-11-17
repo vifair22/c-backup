@@ -88,6 +88,34 @@ static int find_opt(const arg_spec_t *spec, const char *tok, size_t len)
     return -1;
 }
 
+/* Whether val is one of the '|'-separated words of choices. */
+static int is_choice(const char *choices, const char *val)
+{
+    size_t n = strlen(val);
+    const char *c = choices;
+    while (c && *c) {
+        const char *bar = strchr(c, '|');
+        size_t len = bar ? (size_t)(bar - c) : strlen(c);
+        if (len == n && strncmp(c, val, n) == 0) return 1;
+        c = bar ? bar + 1 : NULL;
+    }
+    return 0;
+}
+
+/* "a, b or c" from "a|b|c", for the refusal. */
+static void print_choices(FILE *out, const char *choices)
+{
+    const char *c = choices;
+    while (*c) {
+        const char *bar = strchr(c, '|');
+        size_t len = bar ? (size_t)(bar - c) : strlen(c);
+        fprintf(out, "%.*s", (int)len, c);
+        if (!bar) break;
+        c = bar + 1;
+        fputs(strchr(c, '|') ? ", " : " or ", out);
+    }
+}
+
 /* Whether a token would be read as an option: a lone "-" is not one. */
 static int looks_like_option(const char *t)
 {
@@ -145,8 +173,19 @@ int args_parse(const arg_spec_t *spec, int argc, char **argv, args_t *a, FILE *e
         if (val[0] == '\0')
             return refuse(spec, err, "option '%s' needs a value, not an empty one", o->name);
 
+        if (o->kind == ARG_CHOICE && !is_choice(o->meta, val)) {
+            /* Built by hand: the list goes between two parts of the
+             * message, and refuse takes one format. */
+            fprintf(err, "c-backup: option '%s' takes ", o->name);
+            print_choices(err, o->meta ? o->meta : "");
+            fprintf(err, ", not '%s'\nusage: c-backup ", val);
+            args_usage(spec, err);
+            fputc('\n', err);
+            return -1;
+        }
+
         a->count[k]++;
-        if (o->kind == ARG_VALUE) {
+        if (o->kind == ARG_VALUE || o->kind == ARG_CHOICE) {
             a->value[k] = val;
         } else {
             if (a->nmulti == ARG_MAX_MULTI)
@@ -173,7 +212,10 @@ int args_parse(const arg_spec_t *spec, int argc, char **argv, args_t *a, FILE *e
 static int opt_index(const args_t *a, const char *name, arg_kind_t kind)
 {
     int k = find_opt(a->spec, name, strlen(name));
-    if (k < 0 || a->spec->opts[k].kind != kind) {
+    arg_kind_t have = k < 0 ? kind : a->spec->opts[k].kind;
+    /* A choice is a value that has been checked; it reads the same way. */
+    if (have == ARG_CHOICE && kind == ARG_VALUE) have = ARG_VALUE;
+    if (k < 0 || have != kind) {
         fprintf(stderr, "c-backup: internal error: '%s' is not a %s option of '%s'\n",
                 name, kind == ARG_FLAG ? "flag" : kind == ARG_VALUE ? "value" : "repeatable",
                 a->spec->cmd);

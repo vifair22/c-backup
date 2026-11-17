@@ -185,7 +185,7 @@ static void test_cdc_stream_sizes(void **state)
         gen_t *g = calloc(1, sizeof(*g));
         assert_non_null(g);
         g->len = lens[k];
-        cdc_source_t src = { gen_span, gen_read, g, gen_piece };
+        cdc_source_t src = { gen_span, gen_read, g, gen_piece, NULL };
         cdc_result_t cr;
         assert_int_equal(cdc_store_source(&p, &src, CDC_SIZE_STREAM, &sink, NULL, &cr), OK);
         assert_int_equal(cr.size, lens[k]);

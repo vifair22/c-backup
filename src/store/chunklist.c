@@ -500,6 +500,11 @@ status_t chunklist_iter_open(const obj_loader_t *loader,
     return OK;
 }
 
+uint64_t chunklist_iter_total(const chunklist_iter_t *it)
+{
+    return it ? it->st[0].hdr.total_len : 0;
+}
+
 void chunklist_iter_skip(chunklist_iter_t *it)
 {
     if (it) it->pending = 0;
@@ -638,9 +643,10 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
 
     obj_loader_t ld = obj_loader_store(store);
     chunklist_iter_t *it = NULL;
-    chunklist_hdr_t root;
-    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, &root, &it);
+    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, NULL, &it);
     if (st != OK) return st;
+    /* The length from the iterator, which holds the root header it checked. */
+    uint64_t total = chunklist_iter_total(it);
     for (;;) {
         chunklist_item_t x;
         int done = 0;
@@ -659,10 +665,10 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
     if (st != OK) return st;
     /* Extends over any trailing hole, and leaves interior gaps unwritten,
      * which on a fresh file is what makes them holes. */
-    if (ftruncate(out_fd, (off_t)root.total_len) != 0)
+    if (ftruncate(out_fd, (off_t)total) != 0)
         return set_error_errno(ERR_IO, "restore: ftruncate to %llu",
-                               (unsigned long long)root.total_len);
-    if (out_size) *out_size = root.total_len;
+                               (unsigned long long)total);
+    if (out_size) *out_size = total;
     return OK;
 }
 
@@ -706,9 +712,10 @@ status_t content_stream(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
 
     obj_loader_t ld = obj_loader_store(store);
     chunklist_iter_t *it = NULL;
-    chunklist_hdr_t root;
-    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, &root, &it);
+    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, NULL, &it);
     if (st != OK) return st;
+    /* The length from the iterator, which holds the root header it checked. */
+    uint64_t total = chunklist_iter_total(it);
     uint64_t pos = 0;
     for (;;) {
         chunklist_item_t x;
@@ -726,8 +733,8 @@ status_t content_stream(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
         pos = x.offset + x.length;
     }
     chunklist_iter_close(it);
-    if (st == OK) st = emit_zeroes(emit, ctx, root.total_len - pos);
-    if (st == OK && out_size) *out_size = root.total_len;
+    if (st == OK) st = emit_zeroes(emit, ctx, total - pos);
+    if (st == OK && out_size) *out_size = total;
     return st;
 }
 
@@ -772,11 +779,11 @@ status_t content_read_prefix(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE
 
     obj_loader_t ld = obj_loader_store(store);
     chunklist_iter_t *it = NULL;
-    chunklist_hdr_t root;
-    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, &root, &it);
+    st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, NULL, &it);
     if (st != OK) return st;
-    size_t want = root.total_len < (uint64_t)max_bytes ? (size_t)root.total_len
-                                                       : max_bytes;
+    /* The length from the iterator, which holds the root header it checked. */
+    uint64_t total = chunklist_iter_total(it);
+    size_t want = total < (uint64_t)max_bytes ? (size_t)total : max_bytes;
     /* One extra byte so a zero-length prefix still returns a buffer. */
     uint8_t *buf = calloc(1, want + 1);
     if (!buf) { chunklist_iter_close(it); return set_error(ERR_NOMEM, "prefix"); }
@@ -797,7 +804,7 @@ status_t content_read_prefix(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE
     if (st != OK) { free(buf); return st; }
     *out_data = buf;
     *out_len = want;
-    if (out_full) *out_full = root.total_len;
+    if (out_full) *out_full = total;
     return OK;
 }
 

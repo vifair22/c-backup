@@ -1182,10 +1182,11 @@ static status_t pw_open(pwalk_t *w, const obj_loader_t *ld, const uint8_t base[O
     free(data);
     if (type != OBJECT_TYPE_CHUNKLIST)
         return set_error(ERR_CORRUPT, "incremental: the base is an object of type %u, not file content", type);
-    chunklist_hdr_t hdr;
-    st = chunklist_iter_open(ld, base, OBJECT_TYPE_FILE, 0, &hdr, &w->it);
+    /* The length from the iterator, which holds the root header it
+     * validated, rather than through a header copied out of it. */
+    st = chunklist_iter_open(ld, base, OBJECT_TYPE_FILE, 0, NULL, &w->it);
     if (st != OK) return st;
-    w->total = hdr.total_len;
+    w->total = chunklist_iter_total(w->it);
     return OK;
 }
 

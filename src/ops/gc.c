@@ -410,6 +410,9 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     res.damaged_listed       = pstats.damaged_listed;
     memcpy(res.damaged, pstats.damaged, sizeof(res.damaged));
     res.packs_unwalkable  = pstats.packs_unwalkable;
+    res.dups_dropped      = pstats.dups_dropped;
+    res.dups_kept         = pstats.dups_kept;
+    res.index_relocated   = pstats.index_relocated;
     res.unwalkable_listed = pstats.unwalkable_listed;
     memcpy(res.unwalkable, pstats.unwalkable, sizeof(res.unwalkable));
     /* The sweep is committed whatever compaction did, so a caller reporting
@@ -429,17 +432,19 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * be corrected any more, and that is a failure to report (OWN-31). */
     if (res.pack_entries_damaged > 0 && res.packs_unwalkable > 0)
         return set_error(ERR_CORRUPT, "gc: %llu pack entr%s damaged beyond parity "
-                         "were copied as damaged, and %u pack(s) could not be walked "
+                         "%s copied as damaged, and %u pack(s) could not be walked "
                          "(first: pack-%010u.dat, %s); run verify with repair",
                          (unsigned long long)res.pack_entries_damaged,
                          res.pack_entries_damaged == 1 ? "y" : "ies",
+                         res.pack_entries_damaged == 1 ? "was" : "were",
                          res.packs_unwalkable, res.unwalkable[0].pack,
                          res.unwalkable[0].reason);
     if (res.pack_entries_damaged > 0)
         return set_error(ERR_CORRUPT, "gc: %llu pack entr%s damaged beyond parity "
-                         "were copied as damaged",
+                         "%s copied as damaged",
                          (unsigned long long)res.pack_entries_damaged,
-                         res.pack_entries_damaged == 1 ? "y" : "ies");
+                         res.pack_entries_damaged == 1 ? "y" : "ies",
+                         res.pack_entries_damaged == 1 ? "was" : "were");
     /* A pack left whole because its headers cannot be walked holds space gc
      * could not reclaim and, worse, damage nobody would otherwise hear
      * about until a restore: the job fails and says which, as for damage. */

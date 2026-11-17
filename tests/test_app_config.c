@@ -115,6 +115,43 @@ static void test_bind_and_mode_refused(void **state)
             "backup.unsettled: 'maybe' is not one of store, skip");
 }
 
+/* An empty value is unset to c-utils, which reads back the default, so
+ * `unsettled: ""` used to start the daemon as store (NIT-18). Every key
+ * whose values are named or numeric refuses it, however it is spelled. */
+static void test_empty_refused(void **state)
+{
+    (void)state;
+    refused("backup:\n  unsettled: \"\"\n",
+            "backup.unsettled: an empty value is not allowed; set one of store, "
+            "skip, or leave the key out for the default (store)");
+    refused("backup:\n  unsettled:\n", "backup.unsettled: an empty value");
+    refused("backup:\n  unsettled:   # later\n", "backup.unsettled: an empty value");
+    refused("backup:\n  unsettled: \"\"\r\n", "backup.unsettled: an empty value");
+    refused("backup:\n  file_cache_match: \"\"\n",
+            "backup.file_cache_match: an empty value is not allowed; set one of "
+            "auto, strict, relaxed");
+    refused("log:\n  level: \"\"\n", "log.level: an empty value");
+    refused("http:\n  port:\n", "http.port: an empty value is not allowed; set a "
+                                "whole number, or leave the key out for the "
+                                "default (8765)");
+    refused("retention:\n  keep_daily: \"\"\n", "retention.keep_daily: an empty value");
+    refused("backup:\n  store_workers:\n", "backup.store_workers: an empty value");
+    assert_int_equal(load_db("  synchronous: \"\"\n", ""), CUTILS_ERR_CONFIG);
+    if (!strstr(cutils_get_error(), "db.synchronous: an empty value"))
+        fail_msg("error '%s'", cutils_get_error());
+
+    /* Through the environment too: there it reads back as "". */
+    setenv("C_BACKUP_TEST_BACKUP_UNSETTLED", "", 1);
+    refused("", "C_BACKUP_TEST_BACKUP_UNSETTLED (backup.unsettled): an empty value");
+    unsetenv("C_BACKUP_TEST_BACKUP_UNSETTLED");
+
+    /* Where empty has a meaning, or a value merely contains a quote or a
+     * hash, it still starts. */
+    assert_int_equal(load("http:\n  bind: \"\"\npushover:\n  token: \"\"\n"), CUTILS_OK);
+    assert_int_equal(load("backup:\n  unsettled: \"skip\"  # quoted\n"), CUTILS_OK);
+    assert_int_equal(load("backup:\n  unsettled: store # why\n"), CUTILS_OK);
+}
+
 /* One run reports the lot, with log.level among them. */
 /* The state.db settings (state_db.h): the documented values pass, the
  * edges of each range pass, and anything else stops the daemon. */
@@ -159,6 +196,7 @@ int main(void)
         cmocka_unit_test_teardown(test_ranges_refused, teardown),
         cmocka_unit_test_teardown(test_bind_and_mode_refused, teardown),
         cmocka_unit_test_teardown(test_db_settings, teardown),
+        cmocka_unit_test_teardown(test_empty_refused, teardown),
         cmocka_unit_test_teardown(test_every_problem_in_one_run, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

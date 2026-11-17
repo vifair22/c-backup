@@ -131,6 +131,19 @@ the CRC, so a miscorrection elsewhere in a shared group is never written.
 While the pack is open it also rewrites the entry's CRC slot, a tail copy
 that failed and a pack header that was wrong, each from what verified.
 
+Verify checks those structures for every pack the index names, at every
+level (B136): the pack header against the stripe and the tail, each tail
+copy against its CRC and the file, and the CRC table against its own
+parity. Damage within their redundancy is reported as recoverable and, by a
+repairing run, rewritten; a table group past its parity is rebuilt from the
+entries the stripe vouches for. With the pack header and both tails damaged
+at once the trailer is still found - the body's end is the one point where
+the entries stepped over and the file size agree - so even that is a
+repair, not a salvage. And when an entry's header is past the stripe but
+the index knows all its fields, readers rebuild it, proven by the header
+CRC and the entry CRC, so a check-only verify counts it recoverable rather
+than lost (B137).
+
 ## Headers are never a single point of failure (B119)
 
 On format 2, two damaged bytes in a loose object's header lost the object,

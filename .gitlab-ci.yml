@@ -63,6 +63,8 @@ variables:
 
 test:
   rules:
+    # The gate job, and also the nightly schedule: ui-e2e there needs the
+    # daemon this job builds.
     - when: on_success
   stage: test
   image: debian:trixie
@@ -89,6 +91,9 @@ test:
 
 analyze:
   rules:
+    # Gate jobs: every MR and branch pipeline, never the nightly schedule.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
     - when: on_success
   stage: analyze
   image: debian:trixie
@@ -116,7 +121,11 @@ analyze:
 # run the parsers against bytes nobody intended.
 fuzz:
   rules:
-    - when: on_success
+    # Long jobs run nightly and on the image-cut pipelines, not on every MR:
+    # the MR gate is build, tests, coverage and analyze.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH =~ /^uat\//
+    - when: never
   stage: analyze
   image: debian:trixie
   tags: [docker]
@@ -162,6 +171,9 @@ fuzz:
 # to keep in step with a lockfile.
 ui:
   rules:
+    # Gate jobs: every MR and branch pipeline, never the nightly schedule.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
     - when: on_success
   stage: analyze
   # Trixie-based, deliberately. The daemon this suite starts is built in the
@@ -207,7 +219,11 @@ ui:
 # list by hand to find out whether the app works.
 ui-e2e:
   rules:
-    - when: on_success
+    # Long jobs run nightly and on the image-cut pipelines, not on every MR:
+    # the MR gate is build, tests, coverage and analyze.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH =~ /^uat\//
+    - when: never
   stage: analyze
   image: node:24-trixie-slim
   tags: [docker]
@@ -247,8 +263,31 @@ ui-e2e:
       # these are the pictures a review looks at.
       - ui/test-results/
 
+# Real-size pack rollover (B134): files of 300 MB, 600 MB and 2 GiB stored at
+# the production seal. About 2.5 GiB of scratch, so it runs nightly rather
+# than on every MR; make test covers the same logic at an 8 MiB test seal.
+# The scratch directory is the job's own and is removed whatever happens.
+nightly-rollover:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  stage: test
+  image: debian:trixie
+  tags: [docker]
+  timeout: 90m
+  before_script:
+    - *debian_deps
+    - *fetch_cutils
+  script:
+    - mkdir -p "$C_BACKUP_TEST_DIR"
+    - make test-rollover-full
+  after_script:
+    - rm -rf "$C_BACKUP_TEST_DIR"
+
 coverage:
   rules:
+    # Gate jobs: every MR and branch pipeline, never the nightly schedule.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
     - when: on_success
   stage: coverage
   image: debian:trixie

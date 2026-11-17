@@ -92,6 +92,19 @@ struct handoff {
     status_t        contender_status;
 };
 
+/* Wait, bounded at 10 s, until another thread is queued in db_txn_begin.
+ * A broken count fails the test rather than hanging it. */
+static void wait_for_waiter(void)
+{
+    int seen = 0;
+    for (int i = 0; i < 5000 && !seen; i++) {
+        if (db_txn_waiters() >= 1) { seen = 1; break; }
+        struct timespec ts = { 0, 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    assert_true(seen);
+}
+
 static void *contender_main(void *arg)
 {
     struct handoff *h = arg;
@@ -139,14 +152,12 @@ static void test_a_second_writer_waits_instead_of_failing(void **state)
     pthread_mutex_unlock(&h.mu);
 
     /*
-     * Give the contender long enough to have reached its begin and, if the
-     * lock is absent, to have failed and recorded that. Waiting on
-     * contender_done instead would deadlock in the fixed build, where it
-     * cannot return until this transaction commits - so the wait is on the
-     * clock, and what the test asserts is the status it eventually reports.
+     * Wait until the contender is queued in its begin. Waiting on
+     * contender_done instead would deadlock, since it cannot return until
+     * this transaction commits; a fixed sleep raced on a loaded runner
+     * (FLAKE-15), so the wait is on the queue itself.
      */
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
-    nanosleep(&ts, NULL);
+    wait_for_waiter();
 
     assert_int_equal(db_txn_commit(db), OK);
     assert_int_equal(pthread_join(t, NULL), 0);
@@ -186,9 +197,9 @@ static void test_a_waiting_writer_goes_first(void **state)
     pthread_cond_broadcast(&h.cv);
     pthread_mutex_unlock(&h.mu);
 
-    /* Long enough for the contender to be queued in its begin. */
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
-    nanosleep(&ts, NULL);
+    /* Until the contender is queued in its begin (FLAKE-15: a fixed sleep
+     * was not always long enough on a loaded runner). */
+    wait_for_waiter();
 
     assert_int_equal(db_txn_commit(db), OK);
     assert_int_equal(db_txn_begin(db), OK);
@@ -307,6 +318,37 @@ static void test_repeated_cycles_do_not_leak_the_lock(void **state)
     db_txn_rollback(db);
 }
 
+/*
+ * B142: making the index durable is a full checkpoint of the WAL, so after
+ * it the committed rows are in the database file itself, synced, and the
+ * WAL holds nothing a power cut could take back. It needs the write lock
+ * and refuses to run inside a transaction rather than deadlock or
+ * checkpoint half a transaction.
+ */
+static void test_make_durable_checkpoints_everything(void **state)
+{
+    (void)state;
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (path, label, uuid, added_at) VALUES ('/x', 'x', 'u-x', 1)", NULL, NULL), 0);
+    assert_int_equal(db_txn_make_durable(db), ERR_BUSY);
+    err_clear();
+    assert_int_equal(db_txn_commit(db), OK);
+
+    assert_int_equal(db_txn_make_durable(db), OK);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "PRAGMA wal_checkpoint(PASSIVE)", NULL, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    /* Nothing left in the WAL to copy: everything was checkpointed. */
+    assert_string_equal(r->rows[0][0], "0");
+    assert_string_equal(r->rows[0][1], r->rows[0][2]);
+    db_result_free(r);
+    /* And the lock was released. */
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_txn_commit(db), OK);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -316,6 +358,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_nested_begin_fails_instead_of_hanging, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rollback_releases_the_lock, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repeated_cycles_do_not_leak_the_lock, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_make_durable_checkpoints_everything, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

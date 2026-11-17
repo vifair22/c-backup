@@ -161,6 +161,17 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "prune: commit");
 
+    /* The record file is the snapshot's authoritative copy; it goes only
+     * once the commit removing the snapshot's rows is durable, or a power
+     * cut could bring back rows for a snapshot whose record is gone (B142).
+     * A record left behind is what reconcile and reindex expect. */
+    if (db_txn_make_durable(db) != OK) {
+        log_warn("prune: snapshot %lld removed from the index; its record stays until "
+                 "the index is durable: %s", (long long)snap_id, err_msg());
+        err_clear();
+        return OK;
+    }
+
     char path[PATH_MAX];
     if (snprintf(path, sizeof(path), "%s/snapshots/%lld",
                  store_root(store), (long long)snap_id) < (int)sizeof(path)) {

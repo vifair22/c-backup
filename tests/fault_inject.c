@@ -95,7 +95,19 @@ int __wrap_fseeko(FILE *stream, off_t offset, int whence) {
     return __real_fseeko(stream, offset, whence);
 }
 
+int (*volatile fault_rename_hook)(const char *from, const char *to) = NULL;
+int (*volatile fault_unlink_hook)(const char *path) = NULL;
+int (*volatile fault_sync_hook)(int fd, int data_only) = NULL;
+
+int __wrap_unlink(const char *path) {
+    int (*h)(const char *) = fault_unlink_hook;
+    if (h) { int r = h(path); if (r != FAULT_FS_PASS) return r; }
+    return __real_unlink(path);
+}
+
 int __wrap_fsync(int fd) {
+    int (*h)(int, int) = fault_sync_hook;
+    if (h) { int r = h(fd, 0); if (r != FAULT_FS_PASS) return r; }
     if (fault_fsync_at < 0) return __real_fsync(fd);
     if (fault_fsync_at == 0) { fault_fsync_at = -1; errno = EIO; return -1; }
     fault_fsync_at--;
@@ -103,6 +115,8 @@ int __wrap_fsync(int fd) {
 }
 
 int __wrap_fdatasync(int fd) {
+    int (*h)(int, int) = fault_sync_hook;
+    if (h) { int r = h(fd, 1); if (r != FAULT_FS_PASS) return r; }
     if (fault_fsync_at < 0) return __real_fdatasync(fd);
     if (fault_fsync_at == 0) { fault_fsync_at = -1; errno = EIO; return -1; }
     fault_fsync_at--;
@@ -174,6 +188,8 @@ volatile int fault_rename_die_skip = 0;
 volatile int fault_rename_die_after = 0;
 
 int __wrap_rename(const char *from, const char *to) {
+    int (*h)(const char *, const char *) = fault_rename_hook;
+    if (h) { int r = h(from, to); if (r != FAULT_FS_PASS) return r; }
     gate_wait(to);
     const char *die = fault_rename_die_dst;
     if (die && strncmp(to, die, strlen(die)) == 0) {
