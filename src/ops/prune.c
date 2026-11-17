@@ -83,7 +83,7 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
     if (info) memset(info, 0, sizeof(*info));
 
-    if (db_txn_begin(db) != OK)
+    if (db_txn_begin_bulk(db) != OK)
         return set_error(ERR_IO, "prune: begin");
 
     /*

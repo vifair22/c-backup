@@ -662,7 +662,7 @@ static void scan_progress(uint32_t scanned, void *ctx)
 static void batch_open(pipeline_t *p, batch_t *b)
 {
     if (b->in_txn) return;
-    if (db_txn_begin(p->db) == OK) b->in_txn = 1;
+    if (db_txn_begin_bulk(p->db) == OK) b->in_txn = 1;
     else err_clear();
     b->since_commit = 0;
     db_txn_batch_opened(&b->rule);
@@ -725,7 +725,7 @@ static status_t bsink_flush(bsink_t *s, int own_txn)
 {
     pipeline_t *p = s->p;
     if (s->n == 0) return OK;
-    if (own_txn && db_txn_begin(p->db) != OK)
+    if (own_txn && db_txn_begin_bulk(p->db) != OK)
         return set_error(ERR_IO, "backup: cannot begin chunk rows");
     status_t st = OK;
     uint64_t _ti = phase_now();
@@ -2220,7 +2220,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
     batch_t nb;
     memset(&nb, 0, sizeof(nb));
     p->timers->txn_site = PHASE_COMMIT_INDEX;
-    status_t bst = db_txn_begin(p->db);
+    status_t bst = db_txn_begin_bulk(p->db);
     if (bst != OK) return bst;
     db_txn_batch_opened(&nb.rule);
 
@@ -2332,7 +2332,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
             status_t cst = db_txn_commit(p->db);
             if (cst != OK) return cst;
             nb.since_commit = 0;
-            cst = db_txn_begin(p->db);
+            cst = db_txn_begin_bulk(p->db);
             if (cst != OK) return cst;
             db_txn_batch_opened(&nb.rule);
         }

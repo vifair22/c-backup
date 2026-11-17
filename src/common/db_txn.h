@@ -61,6 +61,18 @@
  */
 status_t db_txn_begin(cutils_db_t *db);
 
+/*
+ * db_txn_begin for a bulk writer: a backup's batches, index_nodes, a pack
+ * commit's batches, reindex, gc, prune, purge, the pack presence sweep, and
+ * every db_write_batch loop. Past the WAL's hard cap it first waits, holding
+ * no lock, for the checkpointer to complete a copy (checkpointer_throttle,
+ * B181), so a writer that never syncs cannot outrun the checkpoint on slow
+ * storage. Everything else - API requests, job records, schedules, logs -
+ * uses db_txn_begin and never waits for a checkpoint: a tag or a note that
+ * did would bring back the waits B144 removed.
+ */
+status_t db_txn_begin_bulk(cutils_db_t *db);
+
 /* Commit and release the lock. Releases the lock even when the commit fails:
  * there is nothing the caller can do about it and holding it would wedge every
  * other writer. */
