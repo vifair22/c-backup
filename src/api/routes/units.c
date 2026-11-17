@@ -431,8 +431,11 @@ const char *units_path_allow(const char *rest)
 
 /* The key a request names: the provider and the unit's id, resolved from
  * the history when it is a name. */
-static void key_for(int64_t repo_id, const char *prov, const char *unit, char *key, size_t ksz)
+/* The unit's key: the one its snapshots carry if it has any (1), else
+ * prov:unit as given (0). */
+static int key_for(int64_t repo_id, const char *prov, const char *unit, char *key, size_t ksz)
 {
+    int found = 0;
     unit_key_format(key, ksz, prov, unit);
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -440,9 +443,70 @@ static void key_for(int64_t repo_id, const char *prov, const char *unit, char *k
     if (db_execute(g_db,
             "SELECT unit_key FROM snapshot_units WHERE repo_id = ? AND provider = ?"
             " AND (unit_id = ? OR unit_name = ?) ORDER BY snap_id DESC LIMIT 1",
-            (const char *[]){ repo, prov, unit, unit, NULL }, &r) == 0 && r && r->nrows == 1)
+            (const char *[]){ repo, prov, unit, unit, NULL }, &r) == 0 && r && r->nrows == 1) {
         snprintf(key, ksz, "%s", r->rows[0][0]);
+        found = 1;
+    }
     db_result_free(r);
+    return found;
+}
+
+typedef struct { const char *want; char id[SP_UNIT_ID_MAX]; char name[256]; int hit; } find_unit_t;
+
+static status_t find_unit_cb(void *ctx, const char *id, const char *name, int state)
+{
+    (void)state;
+    find_unit_t *f = ctx;
+    if (f->hit || (strcmp(id, f->want) != 0 && strcmp(name, f->want) != 0)) return OK;
+    snprintf(f->id, sizeof(f->id), "%s", id);
+    snprintf(f->name, sizeof(f->name), "%s", name);
+    f->hit = 1;
+    return OK;
+}
+
+/*
+ * A unit policy is for a unit the daemon backs up or has backed up. PUT
+ * accepted any provider and unit, in units.allow or not, existing or not,
+ * and left rows no backup would ever read; a unit named by its name was
+ * also stored under the name where its snapshots use the id. A unit with
+ * snapshots here keeps their key; otherwise its provider must list it now,
+ * and units.allow must take it, and the key is made from its id. 0 with
+ * key set, or the HTTP status with why.
+ */
+static int policy_unit(int64_t repo_id, const char *prov, const char *unit, char *key, size_t ksz,
+                       char *why, size_t wsz)
+{
+    if (key_for(repo_id, prov, unit, key, ksz)) return 0;
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *ctx = NULL;
+    char hwhy[512];
+    if (remote_unusable(prov, hwhy, sizeof(hwhy))) {
+        snprintf(why, wsz, "%.500s; a unit with no snapshot here is checked against its provider", hwhy);
+        return 409;
+    }
+    if (sp_registry_get(prov, &ops, &ctx) != OK) {
+        snprintf(why, wsz, "%.500s", err_msg());
+        err_clear();
+        return 404;
+    }
+    find_unit_t f;
+    memset(&f, 0, sizeof(f));
+    f.want = unit;
+    if (!ops->list_units || ops->list_units(ctx, find_unit_cb, &f) != OK) {
+        snprintf(why, wsz, "cannot list provider %s: %.400s", prov, err_msg());
+        err_clear();
+        return 409;
+    }
+    if (!f.hit) {
+        snprintf(why, wsz, "provider %s lists no unit %s, and this repository has no snapshot of one", prov, unit);
+        return 404;
+    }
+    if (!units_allowed(prov, f.id, f.name)) {
+        snprintf(why, wsz, "unit %s is not in units.allow", unit);
+        return 403;
+    }
+    unit_key_format(key, ksz, prov, f.id);
+    return 0;
 }
 
 static api_response_t repo_units(const api_request_t *req, int64_t repo_id)
@@ -1235,7 +1299,7 @@ api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const 
     const char *suffix = NULL;
     if (!split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix))
         return api_error(404, "not found");
-    key_for(repo_id, prov, unit, key, sizeof(key));
+    (void)key_for(repo_id, prov, unit, key, sizeof(key));
     if (strcmp(suffix, "snapshots") == 0) return unit_history(req, repo_id, key);
     if (strcmp(suffix, "checkpoints") == 0) return unit_checkpoints_get(repo_id, key);
     if (strcmp(suffix, "reset-incremental") == 0) return api_error(405, "method not allowed");
@@ -1249,7 +1313,9 @@ api_response_t units_route_put(const api_request_t *req, int64_t repo_id, const 
     if (!split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) ||
         strcmp(suffix, "policy") != 0)
         return api_error(404, "not found");
-    key_for(repo_id, prov, unit, key, sizeof(key));
+    char why[768];
+    int code = policy_unit(repo_id, prov, unit, key, sizeof(key), why, sizeof(why));
+    if (code) return api_error(code, why);
     return unit_policy_put(req, repo_id, key);
 }
 
@@ -1269,7 +1335,7 @@ api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const
     const char *suffix = NULL;
     if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) &&
         strcmp(suffix, "reset-incremental") == 0) {
-        key_for(repo_id, prov, unit, key, sizeof(key));
+        (void)key_for(repo_id, prov, unit, key, sizeof(key));
         return unit_reset_post(repo_id, key);
     }
     if (strncmp(rest, "/snapshots/", 11) == 0) {

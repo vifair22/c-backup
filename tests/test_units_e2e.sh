@@ -239,6 +239,16 @@ contains "a unit's own retention" '"retention.keep_daily":"3"' "$OUT"
 contains "shows what is in force" '"effective"' "$(cb unit policy show 1 --provider fake cbk-uat-a)"
 OUT=$(cb unit policy set 1 --provider fake cbk-uat-a retention.bogus 3 2>&1); RC=$?
 check    "an unknown key is refused" 1 "$RC"
+# A policy row no backup would read was accepted for any unit.
+OUT=$(cb unit policy set 1 --provider fake prod-db retention.keep_daily 3 2>&1); RC=$?
+check    "a policy for a unit outside units.allow is refused" 1 "$RC"
+contains "saying why" "units.allow" "$OUT"
+OUT=$(cb unit policy set 1 --provider fake nosuch retention.keep_daily 3 2>&1); RC=$?
+check    "a policy for a unit that does not exist is refused" 1 "$RC"
+contains "saying why" "lists no unit nosuch" "$OUT"
+OUT=$(cb unit policy set 1 --provider bogus x retention.keep_daily 3 2>&1); RC=$?
+check    "a policy for an unknown provider is refused" 1 "$RC"
+contains "naming what is enabled" "enabled: fake" "$OUT"
 contains "gfs runs over every group" '"state":"completed"' "$(cb gfs 1)"
 check    "each unit keeps its head" 2 "$(cb unit history 1 | grep -o '"unit_key"' | wc -l)"
 
