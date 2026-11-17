@@ -42,17 +42,76 @@
 #include "unit_define.h"
 #include "unit_state.h"
 
-#define D      TEST_TMP "/c_backup_test_virt"
-#define SOCK   D "/h.sock"
-#define DEST   D "/restore"
 #define UUID   "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1c2d"
 #define UUID2  "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1c2e"
 #define M      ((uint64_t)1024 * 1024)
-/* A private session daemon, started by the suite inside its own cgroup
- * (bench.slice when run as the rules say), so the user's own session
- * daemon is never touched and the test VMs' QEMU is throttled with it. */
-#define XDG    TEST_TMP "/vx"   /* short: QEMU monitor socket paths live under it (108 bytes) */
-#define URI    "qemu:///session?socket=" XDG "/run/libvirt/virtqemud-sock"
+
+/*
+ * Everything this run owns is named for it (VIRT-COLLIDE): the scratch
+ * tree, the private session daemon's directory and the guests. They were
+ * fixed names, so two runs on one machine shared them, and this suite's
+ * pgrep for "guest=cbk-uat-v3" also matched test_virt_incremental's
+ * cbk-uat-v3i. The run id is the pid in base 36: unique among live
+ * processes, and short, because the daemon's directory holds QEMU's
+ * monitor sockets, which must fit sun_path's 108 bytes.
+ *
+ * The session daemon is started by the suite inside its own cgroup
+ * (bench.slice when run as the rules say), so the user's own session daemon
+ * is never touched and the test VMs' QEMU is throttled with it.
+ */
+static char g_rid[8];
+static char D[200], SOCK[220], DEST[220], XDG[200], URI[300];
+static char V1[40], V2[40], V3[40], V1R[40], V3_PAT[48];
+static char DB_PATH[220], REPO_PATH[220], TR_PATH[220];
+
+/* A formatted string in one of a ring of buffers, for a call's argument. */
+static const char *pf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static const char *pf(const char *fmt, ...)
+{
+    static char ring[16][4096];
+    static unsigned next;
+    char *b = ring[next++ % 16];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof(ring[0]), fmt, ap);
+    va_end(ap);
+    return b;
+}
+
+static void run_names(void)
+{
+    static const char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    char rev[8];
+    int n = 0;
+    for (unsigned long v = (unsigned long)getpid(); v && n < 7; v /= 36) rev[n++] = digits[v % 36];
+    for (int i = 0; i < n; i++) g_rid[i] = rev[n - 1 - i];
+    g_rid[n] = '\0';
+    snprintf(D, sizeof(D), "%s/c_backup_test_virt-%s", TEST_TMP, g_rid);
+    snprintf(SOCK, sizeof(SOCK), "%s/h.sock", D);
+    snprintf(DEST, sizeof(DEST), "%s/restore", D);
+    /* The private daemon's directory holds QEMU's monitor sockets, under
+     * its XDG_CONFIG_HOME, and libvirt refuses a path past 107 bytes: the
+     * run id on the directory and the guest name took the scratch-rooted
+     * path to 112 here, and CI's scratch path is longer. Only sockets,
+     * small config and logs live there (the disk images stay in D), so it
+     * goes where runtime sockets belong: XDG_RUNTIME_DIR, /run as root,
+     * the scratch directory only when neither is writable. */
+    {
+        const char *rt = getenv("XDG_RUNTIME_DIR");
+        const char *base = (rt && *rt && access(rt, W_OK) == 0) ? rt
+                         : access("/run", W_OK) == 0 ? "/run" : TEST_TMP;
+        snprintf(XDG, sizeof(XDG), "%s/cbk-vx%s", base, g_rid);
+    }
+    snprintf(URI, sizeof(URI), "qemu:///session?socket=%s/run/libvirt/virtqemud-sock", XDG);
+    snprintf(V1, sizeof(V1), "cbk-uat-v1-%s", g_rid);
+    snprintf(V2, sizeof(V2), "cbk-uat-v2-%s", g_rid);
+    snprintf(V3, sizeof(V3), "cbk-uat-v3-%s", g_rid);
+    snprintf(V1R, sizeof(V1R), "cbk-uat-v1r-%s", g_rid);
+    snprintf(V3_PAT, sizeof(V3_PAT), "guest=[c]bk-uat-v3-%s,", g_rid);
+    snprintf(DB_PATH, sizeof(DB_PATH), "%s/state.db", D);
+    snprintf(REPO_PATH, sizeof(REPO_PATH), "%s/repo", D);
+    snprintf(TR_PATH, sizeof(TR_PATH), "%s/tr", D);
+}
 
 extern const db_migration_t app_migrations[];
 
@@ -72,18 +131,19 @@ static pid_t daemon_pid;
 static int start_daemon(void)
 {
     if (system("command -v virtqemud >/dev/null 2>&1") != 0) return -1;
-    if (system("rm -rf '" XDG "' && mkdir -p '" XDG "/run' '" XDG "/config' '" XDG "/cache' && chmod 700 '" XDG "/run'") != 0) return -1;
+    if (system(pf("rm -rf '%s' && mkdir -p '%s/run' '%s/config' '%s/cache' && chmod 700 '%s/run'",
+                  XDG, XDG, XDG, XDG, XDG)) != 0) return -1;
     daemon_pid = fork();
     if (daemon_pid == 0) {
-        setenv("XDG_RUNTIME_DIR", XDG "/run", 1);
-        setenv("XDG_CONFIG_HOME", XDG "/config", 1);
-        setenv("XDG_CACHE_HOME", XDG "/cache", 1);
+        setenv("XDG_RUNTIME_DIR", pf("%s/run", XDG), 1);
+        setenv("XDG_CONFIG_HOME", pf("%s/config", XDG), 1);
+        setenv("XDG_CACHE_HOME", pf("%s/cache", XDG), 1);
         execlp("virtqemud", "virtqemud", "--timeout", "600", (char *)NULL);
         _exit(127);
     }
     if (daemon_pid < 0) return -1;
     for (int i = 0; i < 100; i++) {
-        if (system("virsh -q -c '" URI "' uri >/dev/null 2>&1") == 0) return 0;
+        if (system(pf("virsh -q -c '%s' uri >/dev/null 2>&1", URI)) == 0) return 0;
         struct timespec ts = { 0, 100 * 1000000L };
         nanosleep(&ts, NULL);
     }
@@ -96,7 +156,7 @@ static void stop_daemon(void)
     kill(daemon_pid, SIGTERM);
     waitpid(daemon_pid, NULL, 0);
     daemon_pid = 0;
-    if (system("rm -rf '" XDG "'") != 0) fprintf(stderr, "cannot remove " XDG "\n");
+    if (system(pf("rm -rf '%s'", XDG)) != 0) fprintf(stderr, "cannot remove %s\n", XDG);
 }
 
 static void sh(const char *cmd)
@@ -129,14 +189,14 @@ static void define(const char *uuid, const char *name, const char *nvram)
          * suite's own cgroup (bench.slice) instead, checked below. */
         ""
         "<os><type arch='x86_64' machine='q35'>hvm</type>%s</os><features><acpi/></features><devices>"
-        "<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='" D "/vda.img'/><target dev='vda' bus='virtio'/></disk>"
-        "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='" D "/vdb.img'/><target dev='vdb' bus='virtio'/></disk>"
-        "<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='" D "/cd.iso'/><target dev='sda' bus='sata'/><readonly/></disk>"
+        "<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='%s/vda.img'/><target dev='vda' bus='virtio'/></disk>"
+        "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='%s/vdb.img'/><target dev='vdb' bus='virtio'/></disk>"
+        "<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='%s/cd.iso'/><target dev='sda' bus='sata'/><readonly/></disk>"
         "<disk type='block' device='disk'><driver name='qemu' type='raw'/><source dev='/dev/null'/><target dev='vdc' bus='virtio'/></disk>"
         "<tpm model='tpm-tis'><backend type='emulator' version='2.0'/></tpm>"
-        "</devices></domain>", name, uuid, nvram);
-    put(D "/dom.xml", xml, strlen(xml));
-    sh("virsh -q -c '" URI "' define '" D "/dom.xml' >/dev/null");
+        "</devices></domain>", name, uuid, nvram, D, D, D);
+    put(pf("%s/dom.xml", D), xml, strlen(xml));
+    sh(pf("virsh -q -c '%s' define '%s/dom.xml' >/dev/null", URI, D));
 }
 
 #define UUID3_ "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1c2f"
@@ -161,7 +221,7 @@ static int test_qemu_nbds(int kill_them)
         int qn = 0, ours = 0;
         for (ssize_t i = 0; i < got; i += (ssize_t)strlen(buf + i) + 1) {
             if (strstr(buf + i, "qemu-nbd")) qn = 1;
-            if (strstr(buf + i, D)) ours = 1;
+            if (strstr(buf + i, pf("%s/", D))) ours = 1;
         }
         if (!qn || !ours) continue;
         n++;
@@ -176,10 +236,10 @@ static void undefine(const char *uuid);
 /* Every domain this suite makes, gone: destroyed, undefined with NVRAM. */
 static void clean_domains(void)
 {
-    static const char *const ids[] = { UUID, UUID2, UUID3_, "cbk-uat-v1r" };
+    const char *const ids[] = { UUID, UUID2, UUID3_, V1R };
     for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "virsh -q -c '" URI "' destroy %s >/dev/null 2>&1", ids[i]);
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd), "virsh -q -c '%s' destroy %s >/dev/null 2>&1", URI, ids[i]);
         if (system(cmd) != 0) { /* not running */ }
         undefine(ids[i]);
     }
@@ -187,10 +247,16 @@ static void clean_domains(void)
 
 static int cbk_uat_domains_left(void)
 {
-    FILE *p = popen("virsh -q -c '" URI "' list --all --name 2>/dev/null", "r");
-    char line[256];
+    /* This run's guests only: the names end in its id. */
+    FILE *p = popen(pf("virsh -q -c '%s' list --all --name 2>/dev/null", URI), "r");
+    char line[256], tail[16];
+    snprintf(tail, sizeof(tail), "-%s", g_rid);
     int n = 0;
-    while (p && fgets(line, sizeof(line), p)) if (strncmp(line, "cbk-uat-", 8) == 0) n++;
+    while (p && fgets(line, sizeof(line), p)) {
+        line[strcspn(line, "\n")] = '\0';
+        size_t l = strlen(line), t = strlen(tail);
+        if (strncmp(line, "cbk-uat-", 8) == 0 && l > t && strcmp(line + l - t, tail) == 0) n++;
+    }
     if (p) pclose(p);
     return n;
 }
@@ -198,8 +264,8 @@ static int cbk_uat_domains_left(void)
 static void undefine(const char *uuid)
 {
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "virsh -q -c '" URI "' undefine --nvram %s >/dev/null 2>&1 || "
-             "virsh -q -c '" URI "' undefine %s >/dev/null 2>&1", uuid, uuid);
+    snprintf(cmd, sizeof(cmd), "virsh -q -c '%s' undefine --nvram %s >/dev/null 2>&1 || "
+             "virsh -q -c '%s' undefine %s >/dev/null 2>&1", URI, uuid, URI, uuid);
     if (system(cmd) != 0) { /* already gone */ }
 }
 
@@ -212,41 +278,43 @@ static int setup(void **state)
     /* Whatever an earlier run left, gone first. */
     clean_domains();
     (void)test_qemu_nbds(1);
-    if (system("rm -rf '" D "' && mkdir -p '" D "/nbd' '" D "/scratch' '" D "/staging' '" D "/tpm-states/" UUID "' '" D "/tpm-states/orphan'") != 0) return -1;
+    if (system(pf("rm -rf '%s' && mkdir -p '%s/nbd' '%s/scratch' '%s/staging' '%s/tpm-states/" UUID "' "
+                  "'%s/tpm-states/orphan'", D, D, D, D, D, D)) != 0) return -1;
     /* vda: raw, data at the start and near the end; vdb: the same as qcow2. */
     raw_bytes = calloc(1, 8 * M);
     if (!raw_bytes) return -1;
     for (size_t i = 0; i < M; i++) raw_bytes[i] = (uint8_t)(i * 7 + 1);
     for (size_t i = 6 * M; i < 6 * M + 50000; i++) raw_bytes[i] = (uint8_t)(i * 3);
-    int fd = open(D "/vda.img", O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    int fd = open(pf("%s/vda.img", D), O_CREAT | O_WRONLY | O_TRUNC, 0600);
     if (fd < 0 || ftruncate(fd, (off_t)(8 * M)) != 0 || pwrite(fd, raw_bytes, M, 0) != (ssize_t)M ||
         pwrite(fd, raw_bytes + 6 * M, 50000, (off_t)(6 * M)) != 50000) return -1;
     close(fd);
-    if (system("qemu-img convert -q -f raw -O qcow2 '" D "/vda.img' '" D "/vdb.img'") != 0) return -1;
-    put(D "/cd.iso", "iso", 3);
-    put(D "/nvram.fd", "NVRAM-CONTENT", 13);
-    put(D "/tpm-states/" UUID "/tpm2-00.permall", "TPM-STATE", 9);
-    put(D "/tpm-states/orphan/keep", "ORPHAN", 6);
-    define(UUID, "cbk-uat-v1", "<loader readonly='yes' type='pflash'>/usr/share/edk2/x64/OVMF_CODE.4m.fd</loader><nvram>" D "/nvram.fd</nvram>");
+    if (system(pf("qemu-img convert -q -f raw -O qcow2 '%s/vda.img' '%s/vdb.img'", D, D)) != 0) return -1;
+    put(pf("%s/cd.iso", D), "iso", 3);
+    put(pf("%s/nvram.fd", D), "NVRAM-CONTENT", 13);
+    put(pf("%s/tpm-states/" UUID "/tpm2-00.permall", D), "TPM-STATE", 9);
+    put(pf("%s/tpm-states/orphan/keep", D), "ORPHAN", 6);
+    define(UUID, V1, pf("<loader readonly='yes' type='pflash'>/usr/share/edk2/x64/OVMF_CODE.4m.fd</loader>"
+                        "<nvram>%s/nvram.fd</nvram>", D));
 
     char text[4096];
     snprintf(text, sizeof(text),
-             "[helper]\ndaemon_uid = %u\ndaemon_id = 0badf00d\nstate_dir = " D "/hstate\nsocket = " SOCK "\n"
+             "[helper]\ndaemon_uid = %u\ndaemon_id = 0badf00d\nstate_dir = %s/hstate\nsocket = %s\n"
              "allow_restore = 1\nallow_define = 1\n"
              "[units]\nallow = libvirt:cbk-uat-*\n"
              "[host]\nnsenter = 0\nhost_root =\n"
-             "[libvirt]\nenabled = 1\nuri = " URI "\nnbd_dir = " D "/nbd\ntpm_dir = " D "/tpm-states\n"
-             "scratch_dir = " D "/scratch\nstaging_root = " D "/staging\n",
-             (unsigned)getuid());
+             "[libvirt]\nenabled = 1\nuri = %s\nnbd_dir = %s/nbd\ntpm_dir = %s/tpm-states\n"
+             "scratch_dir = %s/scratch\nstaging_root = %s/staging\n",
+             (unsigned)getuid(), D, SOCK, URI, D, D, D, D);
     memset(&pol, 0, sizeof(pol));
     if (helper_policy_parse(text, &pol) != OK) return -1;
     if (libvirt_backend_init(&pol, &be) != OK) return -1;
     helper_server_cfg_t cfg = { &pol, NULL, 1, 50, &be, 1 };
     if (helper_server_start(&cfg, &srv) != OK) return -1;
-    if (db_open(&db, D "/state.db") != 0 || db_run_lib_migrations(db) != 0 ||
+    if (db_open(&db, DB_PATH) != 0 || db_run_lib_migrations(db) != 0 ||
         db_run_compiled_migrations(db, app_migrations) != 0) return -1;
-    if (repo_register(db, D "/repo", "t", &repo_id) != OK) return -1;
-    if (repo_store_open(D "/repo", NULL, &store) != OK) return -1;
+    if (repo_register(db, REPO_PATH, "t", &repo_id) != OK) return -1;
+    if (repo_store_open(REPO_PATH, NULL, &store) != OK) return -1;
     if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
     units_config_t uc = { "", 2, 10, 30, 1, 0, 75, 30 };
     if (units_init(db, NULL, &uc) != OK) return -1;
@@ -272,10 +340,11 @@ static int teardown(void **state)
     (void)test_qemu_nbds(1);
     free(raw_bytes);
     int left_dom = cbk_uat_domains_left(), left_nbd = test_qemu_nbds(0);
-    if (system("rm -rf '" D "'") != 0) fprintf(stderr, "cannot remove " D "\n");
+    if (system(pf("rm -rf '%s'", D)) != 0) fprintf(stderr, "cannot remove %s\n", D);
     stop_daemon();
     if (left_dom || left_nbd) {
-        fprintf(stderr, "test_virt_offline: %d cbk-uat-* domain(s) and %d qemu-nbd left behind\n", left_dom, left_nbd);
+        fprintf(stderr, "test_virt_offline: %d cbk-uat-*-%s domain(s) and %d qemu-nbd left behind\n",
+                left_dom, g_rid, left_nbd);
         return -1;
     }
     return 0;
@@ -311,7 +380,7 @@ static void test_offline_backup(void **state)
     (void)state;
     if (!have_libvirt) { print_message("no virtqemud, qemu-nbd or qemu-img: skipped\n"); skip(); }
     unit_backup_result_t res;
-    assert_int_equal(backup("cbk-uat-v1", &res), OK);
+    assert_int_equal(backup(V1, &res), OK);
     assert_int_equal(res.ok, 1);
     assert_int_equal(res.units[0].achieved, SP_CONSIST_OFFLINE);
     int64_t snap = res.units[0].snapshot_id;
@@ -319,20 +388,20 @@ static void test_offline_backup(void **state)
     unit_backup_result_free(&res);
     /* No qemu-nbd left, nothing held. */
     assert_int_equal(helper_server_holds(srv), 0);
-    assert_int_equal(system("pgrep -f '[q]emu-nbd.*c_backup_test_virt' >/dev/null"), 256);
+    assert_int_equal(system(pf("pgrep -f '[q]emu-nbd.*%s/' >/dev/null", D)), 256);
 
     restore_opts_t ro;
     memset(&ro, 0, sizeof(ro));
     restore_result_t rr;
     assert_int_equal(restore_run(store, db, repo_id, snap, DEST, &ro, &rr), OK);
-    assert_true(file_is(DEST "/.cbackup-unit/disks/vda", raw_bytes, 8 * M));
-    assert_true(file_is(DEST "/.cbackup-unit/disks/vdb", raw_bytes, 8 * M));   /* qcow2 read as its contents */
-    assert_true(file_is(DEST "/.cbackup-unit/config/nvram.fd", "NVRAM-CONTENT", 13));
-    assert_true(file_is(DEST D "/tpm-states/" UUID "/tpm2-00.permall", "TPM-STATE", 9));
+    assert_true(file_is(pf("%s/.cbackup-unit/disks/vda", DEST), raw_bytes, 8 * M));
+    assert_true(file_is(pf("%s/.cbackup-unit/disks/vdb", DEST), raw_bytes, 8 * M));   /* qcow2 read as its contents */
+    assert_true(file_is(pf("%s/.cbackup-unit/config/nvram.fd", DEST), "NVRAM-CONTENT", 13));
+    assert_true(file_is(pf("%s%s/tpm-states/" UUID "/tpm2-00.permall", DEST, D), "TPM-STATE", 9));
     struct stat sb;
-    assert_int_not_equal(stat(DEST "/.cbackup-unit/disks/sda", &sb), 0);
-    assert_int_not_equal(stat(DEST "/.cbackup-unit/disks/vdc", &sb), 0);
-    FILE *f = fopen(DEST "/.cbackup-unit/config/disks.json", "r");
+    assert_int_not_equal(stat(pf("%s/.cbackup-unit/disks/sda", DEST), &sb), 0);
+    assert_int_not_equal(stat(pf("%s/.cbackup-unit/disks/vdc", DEST), &sb), 0);
+    FILE *f = fopen(pf("%s/.cbackup-unit/config/disks.json", DEST), "r");
     assert_non_null(f);
     char buf[4096];
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
@@ -340,14 +409,14 @@ static void test_offline_backup(void **state)
     buf[n] = '\0';
     assert_non_null(strstr(buf, "passthrough"));
     assert_non_null(strstr(buf, "removable"));
-    f = fopen(DEST "/.cbackup-unit/config/domain.xml", "r");
+    f = fopen(pf("%s/.cbackup-unit/config/domain.xml", DEST), "r");
     assert_non_null(f);
     n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     buf[n] = '\0';
     assert_non_null(strstr(buf, UUID));
     /* The restored raw disk is sparse: holes stayed holes. */
-    assert_int_equal(stat(DEST "/.cbackup-unit/disks/vda", &sb), 0);
+    assert_int_equal(stat(pf("%s/.cbackup-unit/disks/vda", DEST), &sb), 0);
     assert_true((uint64_t)sb.st_blocks * 512 < 4 * M);
 }
 
@@ -356,13 +425,14 @@ static void test_missing_state_refused(void **state)
     (void)state;
     if (!have_libvirt) skip();
     /* NVRAM named and missing; and a TPM VM with no state: neither backed up. */
-    define(UUID2, "cbk-uat-v2", "<loader readonly='yes' type='pflash'>/usr/share/edk2/x64/OVMF_CODE.4m.fd</loader><nvram>" D "/gone.fd</nvram>");
+    define(UUID2, V2, pf("<loader readonly='yes' type='pflash'>/usr/share/edk2/x64/OVMF_CODE.4m.fd</loader>"
+                         "<nvram>%s/gone.fd</nvram>", D));
     unit_backup_result_t res;
-    assert_int_not_equal(backup("cbk-uat-v2", &res), OK);
+    assert_int_not_equal(backup(V2, &res), OK);
     assert_non_null(strstr(res.units[0].error, "NVRAM"));
     unit_backup_result_free(&res);
-    put(D "/gone.fd", "x", 1);
-    assert_int_not_equal(backup("cbk-uat-v2", &res), OK);
+    put(pf("%s/gone.fd", D), "x", 1);
+    assert_int_not_equal(backup(V2, &res), OK);
     assert_non_null(strstr(res.units[0].error, "TPM"));
     unit_backup_result_free(&res);
     err_clear();
@@ -380,21 +450,25 @@ static void test_online_backup(void **state)
     int kvm = access("/dev/kvm", R_OK | W_OK) == 0;
     char xml[4096];
     snprintf(xml, sizeof(xml),
-        "<domain type='%s'><name>cbk-uat-v3</name><uuid>" UUID3 "</uuid><memory unit='MiB'>64</memory><vcpu>1</vcpu>"
+        "<domain type='%s'><name>%s</name><uuid>" UUID3 "</uuid><memory unit='MiB'>64</memory><vcpu>1</vcpu>"
         /* No <cputune>: session mode refuses CPU tuning; QEMU runs in this
          * suite's own cgroup (bench.slice) instead, checked below. */
         ""
         "<os><type arch='x86_64' machine='pc'>hvm</type></os><devices>"
-        "<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='" D "/vda.img'/><target dev='vda' bus='virtio'/></disk>"
-        "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='" D "/vdb.img'/><target dev='vdb' bus='virtio'/></disk>"
-        "<graphics type='vnc' autoport='yes' listen='127.0.0.1'/></devices></domain>", kvm ? "kvm" : "qemu");
-    put(D "/dom3.xml", xml, strlen(xml));
+        "<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='%s/vda.img'/><target dev='vda' bus='virtio'/></disk>"
+        "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='%s/vdb.img'/><target dev='vdb' bus='virtio'/></disk>"
+        /* VNC on a socket in this run's scratch, not a TCP port: two runs'
+         * private daemons each picked 5900 with autoport, and the second
+         * guest failed to start (VIRT-COLLIDE). */
+        "<graphics type='vnc'><listen type='socket' socket='%s/vnc.sock'/></graphics></devices></domain>",
+        kvm ? "kvm" : "qemu", V3, D, D, D);
+    put(pf("%s/dom3.xml", D), xml, strlen(xml));
     /* The in-place restore above left vdb.img raw: qcow2 again. */
-    sh("rm -f '" D "/vdb.img' && qemu-img convert -q -f raw -O qcow2 '" D "/vda.img' '" D "/vdb.img'");
-    if (system("virsh -q -c '" URI "' destroy " UUID3 " >/dev/null 2>&1") != 0) { /* not running */ }
+    sh(pf("rm -f '%s/vdb.img' && qemu-img convert -q -f raw -O qcow2 '%s/vda.img' '%s/vdb.img'", D, D, D));
+    if (system(pf("virsh -q -c '%s' destroy " UUID3 " >/dev/null 2>&1", URI)) != 0) { /* not running */ }
     undefine(UUID3);
-    sh("virsh -q -c '" URI "' define '" D "/dom3.xml' >/dev/null");
-    FILE *sp = popen("virsh -q -c '" URI "' start cbk-uat-v3 2>&1", "r");
+    sh(pf("virsh -q -c '%s' define '%s/dom3.xml' >/dev/null", URI, D));
+    FILE *sp = popen(pf("virsh -q -c '%s' start %s 2>&1", URI, V3), "r");
     char sout[2048] = "";
     size_t sn = sp ? fread(sout, 1, sizeof(sout) - 1, sp) : 0;
     sout[sn] = '\0';
@@ -408,7 +482,7 @@ static void test_online_backup(void **state)
     char self[512] = "", qcg[512] = "";
     FILE *cf = fopen("/proc/self/cgroup", "r");
     if (cf) { if (!fgets(self, sizeof(self), cf)) self[0] = '\0'; fclose(cf); }
-    FILE *pp = popen("pgrep -f 'guest=cbk-uat-[v]3' | head -1", "r");
+    FILE *pp = popen(pf("pgrep -f '%s' | head -1", V3_PAT), "r");
     char pid[32] = "";
     if (pp) { if (!fgets(pid, sizeof(pid), pp)) pid[0] = '\0'; pclose(pp); }
     pid[strcspn(pid, "\n")] = '\0';
@@ -421,7 +495,7 @@ static void test_online_backup(void **state)
         assert_string_equal(qcg, self);
     }
     unit_backup_result_t res;
-    status_t st = backup("cbk-uat-v3", &res);
+    status_t st = backup(V3, &res);
     if (st != OK) print_message("online backup: %s\n", res.n ? res.units[0].error : err_msg());
     assert_int_equal(st, OK);
     assert_int_equal(res.units[0].achieved, SP_CONSIST_CRASH);
@@ -429,21 +503,21 @@ static void test_online_backup(void **state)
     unit_backup_result_free(&res);
     assert_int_equal(helper_server_holds(srv), 0);
     /* The backup job is over. */
-    assert_int_equal(system("virsh -q -c '" URI "' domjobinfo cbk-uat-v3 2>/dev/null | grep -q 'Backup'"), 256);
-    if (system("virsh -q -c '" URI "' destroy cbk-uat-v3 >/dev/null 2>&1") != 0) { /* already off */ }
+    assert_int_equal(system(pf("virsh -q -c '%s' domjobinfo %s 2>/dev/null | grep -q 'Backup'", URI, V3)), 256);
+    if (system(pf("virsh -q -c '%s' destroy %s >/dev/null 2>&1", URI, V3)) != 0) { /* already off */ }
     undefine(UUID3);
     restore_opts_t ro;
     memset(&ro, 0, sizeof(ro));
     restore_result_t rr;
-    assert_int_equal(restore_run(store, db, repo_id, snap, DEST "3", &ro, &rr), OK);
-    assert_true(file_is(DEST "3/.cbackup-unit/disks/vda", raw_bytes, 8 * M));
-    assert_true(file_is(DEST "3/.cbackup-unit/disks/vdb", raw_bytes, 8 * M));
+    assert_int_equal(restore_run(store, db, repo_id, snap, pf("%s3", DEST), &ro, &rr), OK);
+    assert_true(file_is(pf("%s3/.cbackup-unit/disks/vda", DEST), raw_bytes, 8 * M));
+    assert_true(file_is(pf("%s3/.cbackup-unit/disks/vdb", DEST), raw_bytes, 8 * M));
 }
 
 static char *virsh_out(const char *args)
 {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "virsh -q -c '" URI "' %s 2>/dev/null", args);
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "virsh -q -c '%s' %s 2>/dev/null", URI, args);
     FILE *p = popen(cmd, "r");
     if (!p) return NULL;
     char *buf = calloc(1, 65536);
@@ -461,15 +535,15 @@ static void test_restore_define(void **state)
     assert_true(offline_snap > 0);
     unit_define_opts_t o;
     memset(&o, 0, sizeof(o));
-    o.name = "cbk-uat-v1r";
-    o.target_root = D "/tr";
+    o.name = V1R;
+    o.target_root = TR_PATH;
     unit_define_result_t dr;
     status_t st = unit_define_run(store, db, repo_id, offline_snap, 501, &o, &dr);
     if (st != OK) fail_msg("restore: %s", err_msg());
-    char *xml = virsh_out("dumpxml cbk-uat-v1r");
+    char *xml = virsh_out(pf("dumpxml %s", V1R));
     assert_non_null(xml);
-    assert_non_null(strstr(xml, D "/tr" D "/vda.img"));
-    assert_non_null(strstr(xml, D "/tr" D "/vdb.img"));
+    assert_non_null(strstr(xml, pf("%s%s/vda.img", TR_PATH, D)));
+    assert_non_null(strstr(xml, pf("%s%s/vdb.img", TR_PATH, D)));
     assert_null(strstr(xml, UUID));                  /* a new UUID */
     assert_null(strstr(xml, "/dev/null"));           /* the passthrough disk dropped */
     char *u = strstr(xml, "<uuid>");
@@ -481,21 +555,21 @@ static void test_restore_define(void **state)
     char nvpath[1024] = "";
     if (sscanf(strchr(nv, '>') + 1, "%1023[^<]", nvpath) != 1) fail_msg("no nvram path");
     free(xml);
-    assert_true(file_is(D "/tr" D "/vda.img", raw_bytes, 8 * M));
-    assert_true(file_is(D "/tr" D "/vdb.img", raw_bytes, 8 * M));   /* restored raw */
+    assert_true(file_is(pf("%s%s/vda.img", TR_PATH, D), raw_bytes, 8 * M));
+    assert_true(file_is(pf("%s%s/vdb.img", TR_PATH, D), raw_bytes, 8 * M));   /* restored raw */
     assert_true(file_is(nvpath, "NVRAM-CONTENT", 13));
     char tp[512];
-    snprintf(tp, sizeof(tp), D "/tpm-states/%s/tpm2-00.permall", nuuid);
+    snprintf(tp, sizeof(tp), "%s/tpm-states/%s/tpm2-00.permall", D, nuuid);
     assert_true(file_is(tp, "TPM-STATE", 9));
-    assert_true(file_is(D "/tpm-states/" UUID "/tpm2-00.permall", "TPM-STATE", 9));   /* the original's */
-    assert_true(file_is(D "/tpm-states/orphan/keep", "ORPHAN", 6));                    /* never touched */
+    assert_true(file_is(pf("%s/tpm-states/" UUID "/tpm2-00.permall", D), "TPM-STATE", 9));   /* the original's */
+    assert_true(file_is(pf("%s/tpm-states/orphan/keep", D), "ORPHAN", 6));                    /* never touched */
     assert_non_null(strstr(dr.json, "install") ? dr.json : strstr(dr.json, "state"));
     unit_define_result_free(&dr);
-    if (system("virsh -q -c '" URI "' undefine --nvram cbk-uat-v1r >/dev/null 2>&1") != 0) { /* best effort */ }
+    if (system(pf("virsh -q -c '%s' undefine --nvram %s >/dev/null 2>&1", URI, V1R)) != 0) { /* best effort */ }
 
     /* In place: the live image changed since; replace puts the snapshot's
      * back and keeps the changed one beside it. */
-    int fd = open(D "/vda.img", O_WRONLY);
+    int fd = open(pf("%s/vda.img", D), O_WRONLY);
     assert_true(fd >= 0);
     assert_int_equal(pwrite(fd, "CHANGED", 7, 0), 7);
     close(fd);
@@ -504,11 +578,11 @@ static void test_restore_define(void **state)
     st = unit_define_run(store, db, repo_id, offline_snap, 502, &o, &dr);
     if (st != OK) fail_msg("replace: %s", err_msg());
     unit_define_result_free(&dr);
-    assert_true(file_is(D "/vda.img", raw_bytes, 8 * M));
+    assert_true(file_is(pf("%s/vda.img", D), raw_bytes, 8 * M));
     struct stat sb;
-    assert_int_equal(stat(D "/vda.img.cbackup-old-502", &sb), 0);
-    assert_int_equal(stat(D "/tpm-states/" UUID ".cbackup-old-502", &sb), 0);
-    assert_true(file_is(D "/tpm-states/" UUID "/tpm2-00.permall", "TPM-STATE", 9));
+    assert_int_equal(stat(pf("%s/vda.img.cbackup-old-502", D), &sb), 0);
+    assert_int_equal(stat(pf("%s/tpm-states/" UUID ".cbackup-old-502", D), &sb), 0);
+    assert_true(file_is(pf("%s/tpm-states/" UUID "/tpm2-00.permall", D), "TPM-STATE", 9));
     /* A new name without a target root, and in place without replace. */
     memset(&o, 0, sizeof(o));
     o.name = "other";
@@ -518,6 +592,7 @@ static void test_restore_define(void **state)
 
 int main(void)
 {
+    run_names();
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_offline_backup),
         cmocka_unit_test(test_restore_define),
