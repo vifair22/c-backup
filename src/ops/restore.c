@@ -609,6 +609,7 @@ static const char *status_reason(status_t st)
     case ERR_NOT_FOUND: return "not found in the repository";
     case ERR_TOO_LARGE: return "too large to load";
     case ERR_BUSY:      return "busy";
+    case ERR_UNAVAILABLE: return "repository unavailable";
     }
     return "unknown error";
 }

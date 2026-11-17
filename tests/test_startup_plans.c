@@ -234,6 +234,13 @@ static void build(int scale)
     char packs[4096];
     snprintf(packs, sizeof(packs), "%s/packs", REPO1);
     assert_int_equal(mkdir(packs, 0700), 0);
+    /* A repository root without its marker is unavailable (B156), and the
+     * pack check would then touch nothing; only its presence is tested. */
+    char marker[4096];
+    snprintf(marker, sizeof(marker), "%s/.cbackup", REPO1);
+    FILE *mf = fopen(marker, "w");
+    assert_non_null(mf);
+    fclose(mf);
     for (int p = 1; p <= npacks(REPO_OBJS[0]); p++)
         if (!is_missing(p)) touch_pack((uint32_t)p);
 }

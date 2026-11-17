@@ -5,6 +5,7 @@
 #include "repo.h"
 #include "db_txn.h"
 #include "snapshot_ids.h"
+#include "pack_ids.h"
 #include "snap_record.h"
 #include "store.h"
 #include "db_write.h"
@@ -70,6 +71,7 @@ status_t repo_store_open(const char *path, const store_config_t *cfg,
         return OK;
     }
     st = repo_format_check(path, &m);
+    if (st == OK) st = store_set_uuid(*out, m.uuid);   /* the pack-ids mark */
     if (st != OK) {
         store_close(*out);
         *out = NULL;
@@ -933,6 +935,7 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
         /* Created with the repository, so a format 3 repository without
          * one is damaged rather than old. */
         st = snapshot_ids_write(path, marker.uuid, 0);
+        if (st == OK) st = pack_ids_write(path, marker.uuid, 0);
         if (st != OK) return st;
         out->created  = 1;
         out->inserted = 1;

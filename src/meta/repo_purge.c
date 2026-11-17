@@ -23,7 +23,7 @@
  */
 static const char *const keyed_tables[] = {
     "nodes",
-    "pack_objects", "packs", "objects", "file_cache",
+    "pack_objects", "packs", "pack_tombstones", "objects", "file_cache",
     "tags", "notes", "snapshots", "policy_values", "recovery_state",
     "journal", "repo_backup_paths", "snapshot_id_seq",
     "snapshot_unit_items", "snapshot_units", "unit_policy",
