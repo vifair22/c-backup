@@ -111,12 +111,20 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
     snprintf(out->boot_config, sizeof(out->boot_config), "/boot/config");
     snprintf(out->templates_dir, sizeof(out->templates_dir), "/boot/config/plugins/dockerMan/templates-user");
     snprintf(out->lxc_path, sizeof(out->lxc_path), "/mnt/cache/lxc");
+    snprintf(out->libvirt_uri, sizeof(out->libvirt_uri), "qemu:///system");
+    snprintf(out->nbd_dir, sizeof(out->nbd_dir), "/run/c-backup-helper/nbd");
+    snprintf(out->scratch_dir, sizeof(out->scratch_dir), "/mnt/cache/system/cbackup-scratch");
+    snprintf(out->tpm_dir, sizeof(out->tpm_dir), "/etc/libvirt/qemu/swtpm/tpm-states");
+    snprintf(out->nvram_dir, sizeof(out->nvram_dir), "/etc/libvirt/qemu/nvram");
+    snprintf(out->qemu_nbd, sizeof(out->qemu_nbd), "/usr/bin/qemu-nbd");
+    snprintf(out->staging_root, sizeof(out->staging_root), "/mnt/cache/system/cbackup-vmstate");
+    out->vm_freeze_timeout_s = 10;
     snprintf(out->socket, sizeof(out->socket), "/run/c-backup-helper/helper.sock");
 
     char *buf = strdup(text ? text : "");
     if (!buf) return set_error(ERR_NOMEM, "policy");
     status_t st = OK;
-    enum { S_NONE, S_HELPER, S_UNITS, S_SNAPSHOT, S_HOOK, S_HOST, S_DOCKER, S_LXC } sec = S_NONE;
+    enum { S_NONE, S_HELPER, S_UNITS, S_SNAPSHOT, S_HOOK, S_HOST, S_DOCKER, S_LXC, S_LIBVIRT } sec = S_NONE;
     policy_hook_t *hook = NULL;
     int line = 0;
     char *save = NULL;
@@ -135,6 +143,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
             else if (strcmp(s, "host") == 0) sec = S_HOST;
             else if (strcmp(s, "docker") == 0) sec = S_DOCKER;
             else if (strcmp(s, "lxc") == 0) sec = S_LXC;
+            else if (strcmp(s, "libvirt") == 0) sec = S_LIBVIRT;
             else if (strncmp(s, "hook ", 5) == 0) {
                 const char *nm = trim(s + 5);
                 if (out->n_hooks >= POLICY_HOOKS_MAX) { st = bad(line, "too many hooks", NULL); break; }
@@ -264,6 +273,37 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
                 if (!dir_ok(v) || strlen(v) >= sizeof(out->lxc_path)) { st = bad(line, "path must be a clean absolute path", v); break; }
                 snprintf(out->lxc_path, sizeof(out->lxc_path), "%s", v);
             } else { st = bad(line, "unknown key in [lxc]", k); break; }
+        } else if (sec == S_LIBVIRT) {
+            struct { const char *k; char *dst; size_t sz; } paths[] = {
+                { "nbd_dir", out->nbd_dir, sizeof(out->nbd_dir) },
+                { "scratch_dir", out->scratch_dir, sizeof(out->scratch_dir) },
+                { "tpm_dir", out->tpm_dir, sizeof(out->tpm_dir) },
+                { "nvram_dir", out->nvram_dir, sizeof(out->nvram_dir) },
+                { "qemu_nbd", out->qemu_nbd, sizeof(out->qemu_nbd) },
+                { "staging_root", out->staging_root, sizeof(out->staging_root) },
+            };
+            int done = 0;
+            for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]) && !done; i++) {
+                if (strcmp(k, paths[i].k) != 0) continue;
+                done = 1;
+                if (!dir_ok(v) || strlen(v) >= paths[i].sz) { st = bad(line, "must be a clean absolute path", v); break; }
+                snprintf(paths[i].dst, paths[i].sz, "%s", v);
+            }
+            if (st != OK) break;
+            if (done) continue;
+            if (strcmp(k, "enabled") == 0) {
+                if (to_flag(v, &out->libvirt_enabled)) { st = bad(line, "enabled is 0 or 1", v); break; }
+            } else if (strcmp(k, "uri") == 0) {
+                if (!*v || strlen(v) >= sizeof(out->libvirt_uri) || strchr(v, ' ')) { st = bad(line, "bad uri", v); break; }
+                snprintf(out->libvirt_uri, sizeof(out->libvirt_uri), "%s", v);
+            } else if (strcmp(k, "freeze") == 0) {
+                if (strcmp(v, "auto") == 0) out->vm_freeze = 0;
+                else if (strcmp(v, "off") == 0) out->vm_freeze = 1;
+                else if (strcmp(v, "required") == 0) out->vm_freeze = 2;
+                else { st = bad(line, "freeze is auto, off or required", v); break; }
+            } else if (strcmp(k, "freeze_timeout_s") == 0) {
+                if (to_uint(v, 1, 600, &out->vm_freeze_timeout_s)) { st = bad(line, "freeze_timeout_s is 1 to 600", v); break; }
+            } else { st = bad(line, "unknown key in [libvirt]", k); break; }
         } else if (sec == S_SNAPSHOT && strcmp(k, "btrfs_snapshot_dir") == 0) {
             if (!dir_ok(v) || strlen(v) >= sizeof(out->btrfs_snapshot_dir)) { st = bad(line, "btrfs_snapshot_dir must be a clean absolute path", v); break; }
             snprintf(out->btrfs_snapshot_dir, sizeof(out->btrfs_snapshot_dir), "%s", v);

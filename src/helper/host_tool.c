@@ -60,6 +60,36 @@ static int keep(char **buf, size_t *len, size_t cap, const char *src, size_t n)
     return 0;
 }
 
+status_t host_spawn(const host_tools_t *t, const char *const *argv, int err_fd, pid_t *pid)
+{
+    const char *full[HOST_ARGV_MAX + 8];
+    size_t n = 0;
+    if (t->nsenter) {
+        full[n++] = t->nsenter_bin;
+        full[n++] = "-t";
+        full[n++] = "1";
+        full[n++] = "-m";
+        full[n++] = "--";
+    }
+    for (size_t i = 0; argv[i]; i++) {
+        if (i >= HOST_ARGV_MAX) return set_error(ERR_INVALID, "host: argv too long for %s", argv[0]);
+        full[n++] = argv[i];
+    }
+    full[n] = NULL;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    if (err_fd >= 0) posix_spawn_file_actions_adddup2(&fa, err_fd, 2);
+    else posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    char *const *av;
+    memcpy(&av, &(const char *const *){ full }, sizeof(av));
+    int rc = posix_spawn(pid, full[0], &fa, NULL, av, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) { errno = rc; return set_error_errno(ERR_IO, "host: cannot start %s", argv[0]); }
+    return OK;
+}
+
 status_t host_run(const host_tools_t *t, int netns, const char *const *argv,
                   unsigned timeout_s, char **out, size_t cap)
 {

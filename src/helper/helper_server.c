@@ -98,6 +98,7 @@ typedef struct {
     char     path[HELPER_PATH_MAX + 1];
     int64_t  job;
     int      swapped;
+    int      file;            /* the mount is a disk image: <path>/image replaces it */
 } staging_t;
 
 struct helper_server {
@@ -398,6 +399,19 @@ static const helper_backend_t *backend_named(const helper_server_t *s, const cha
     return NULL;
 }
 
+typedef struct { const char *id; char name[256]; int found; } name_find_t;
+
+static status_t find_name(void *ctx, const char *id, const char *name, int state)
+{
+    (void)state;
+    name_find_t *f = ctx;
+    if (!f->found && strcmp(id, f->id) == 0) {
+        snprintf(f->name, sizeof(f->name), "%s", name ? name : "");
+        f->found = 1;
+    }
+    return OK;
+}
+
 /* Policy first, by key; then by name, which only the helper's own inspect
  * can supply. A unit the policy does not allow is denied whether or not it
  * exists, so the answer says nothing about what lies outside. */
@@ -407,12 +421,13 @@ static helper_err_t unit_allowed(helper_server_t *s, const char *key, char *why,
     const char *uid = NULL;
     const helper_backend_t *b = NULL;
     if (backend_for(s, key, &uid, &b, why, wsz) == HELPER_OK) {
-        sp_unit_desc_t *d = NULL;
-        if (b->ops->describe(b->ctx, uid, &d) == OK) {
-            int ok = helper_policy_unit_allowed(s->pol, key, d->name);
-            b->ops->desc_free(d);
-            if (ok) return HELPER_OK;
-        }
+        /* The name from the enumeration, not a describe: a unit whose
+         * describe fails (a missing NVRAM file, say) is still the unit the
+         * policy allows, and its describe then says what is wrong. */
+        name_find_t nf = { uid, "", 0 };
+        if (b->ops->list_units(b->ctx, find_name, &nf) == OK && nf.found &&
+            helper_policy_unit_allowed(s->pol, key, nf.name))
+            return HELPER_OK;
         err_clear();
     }
     snprintf(why, wsz, "unit %s is not in the policy", key);
@@ -736,6 +751,23 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         /* pause: a pause may be held for the daemon's second pass over
          * mounts on no snapshot domain, released with lease.release. */
         q.hold_pause = r->hold;
+        /* vm.backup_begin (vm-backup.md 5.8): the disks that take part in
+         * the chain, against base where base covers them; base alone, with
+         * no disk taking part, is only retired. The backend accepts base
+         * only if its own records say it made it for this daemon. */
+        sp_item_base_t vb[HELPER_DISKS_MAX];
+        size_t nvb = 0;
+        if (r->op == HOP_VM_BACKUP_BEGIN) {
+            for (size_t k = 0; k < r->n_disks && nvb < HELPER_DISKS_MAX; k++) {
+                if (!r->disks[k].incremental) continue;
+                vb[nvb].item_id = r->disks[k].target;
+                vb[nvb].base_token = r->base[0] ? r->base : NULL;
+                nvb++;
+            }
+            q.bases = vb;
+            q.n_bases = nvb;
+            q.retire_token = nvb == 0 && r->base[0] ? r->base : NULL;
+        }
         st = b->ops->begin(b->ctx, d, &q, &sess, &info);
         /* The journal context outlives begin: end releases through it, so
          * it lives with the member and goes after end. */
@@ -763,6 +795,8 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         cJSON *w = cJSON_AddArrayToObject(o, "warnings");
         for (size_t k = 0; w && k < info->n_warnings; k++)
             cJSON_AddItemToArray(w, cJSON_CreateString(info->warnings[k]));
+        if (info->new_token) cJSON_AddStringToObject(o, "new_token", info->new_token);
+        if (info->new_token_blob) cJSON_AddStringToObject(o, "token_blob", info->new_token_blob);
         cJSON *pl = cJSON_AddArrayToObject(o, "plans");
         for (size_t k = 0; pl && k < info->n_plans; k++) {
             cJSON *p = cJSON_CreateObject();
@@ -784,6 +818,20 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
                 break;
             }
             cJSON_AddStringToObject(rr, d->items[k].id, root);
+        }
+        /* Where each disk is read, as the backend set it up. */
+        cJSON *blk = b->block_where ? cJSON_AddObjectToObject(o, "blocks") : NULL;
+        for (size_t k = 0; blk && fail == HELPER_OK && k < d->n_items; k++) {
+            if (d->items[k].kind != SP_ITEM_BLOCK) continue;
+            cJSON *where = cJSON_CreateObject();
+            if (!where) break;
+            if (b->block_where(sess, &d->items[k], where) != OK) {
+                snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
+                cJSON_Delete(where);
+                fail = HELPER_E_FAILED;
+                break;
+            }
+            cJSON_AddItemToObject(blk, d->items[k].id, where);
         }
         /* Hook logs exist only now that begin ran the hooks. */
         cJSON *late = cJSON_AddObjectToObject(o, "late_blobs");
@@ -938,8 +986,11 @@ static char *op_capture_end(helper_server_t *s, const helper_req_t *r)
 {
     capture_t c;
     if (!capture_take(s, r->token, &c))
-        return resp_error(r->id, HELPER_E_INVALID, "no such capture");
-    capture_finish(s, &c, SP_END_COMMITTED);
+        return resp_error(r->id, HELPER_E_INVALID, r->op == HOP_VM_BACKUP_END ? "no such session" : "no such capture");
+    /* vm.backup_end says how the snapshot went, which settles the
+     * checkpoints (vm-backup.md 5.8); a capture always ends as committed. */
+    int aborted = r->op == HOP_VM_BACKUP_END && strcmp(r->outcome, "aborted") == 0;
+    capture_finish(s, &c, aborted ? SP_END_ABORTED : SP_END_COMMITTED);
     cJSON *res = cJSON_CreateObject();
     if (res) cJSON_AddBoolToObject(res, "ended", 1);
     return resp_ok(r->id, res);
@@ -1163,14 +1214,20 @@ static char *op_hook_wait(helper_server_t *s, const helper_req_t *r, int *pass_f
 
 /* Whether mount is a mount source of the unit in the helper's own inspect:
  * the one path the daemon names, never trusted otherwise. */
+/* Whether mount is the unit's in its own describe: 1 a tree, 2 a disk
+ * image (a BLOCK item's source), 3 a configuration file (a BLOB's source,
+ * staged for vm.install_state, never swapped); 0 not the unit's. */
 static int unit_has_mount(const helper_backend_t *b, const char *uid, const char *mount)
 {
     sp_unit_desc_t *d = NULL;
     if (b->ops->describe(b->ctx, uid, &d) != OK) { err_clear(); return 0; }
     int ok = 0;
-    for (size_t i = 0; i < d->n_items; i++)
-        if (d->items[i].kind == SP_ITEM_TREE && d->items[i].tree_path &&
-            strcmp(d->items[i].tree_path, mount) == 0) ok = 1;
+    for (size_t i = 0; i < d->n_items && !ok; i++) {
+        const sp_item_desc_t *it = &d->items[i];
+        if (it->kind == SP_ITEM_TREE && it->tree_path && strcmp(it->tree_path, mount) == 0) ok = 1;
+        else if (it->kind == SP_ITEM_BLOCK && it->source && strcmp(it->source, mount) == 0) ok = 2;
+        else if (it->kind == SP_ITEM_BLOB && it->source && strcmp(it->source, mount) == 0) ok = 3;
+    }
     b->ops->desc_free(d);
     return ok;
 }
@@ -1277,7 +1334,8 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     const helper_backend_t *b = NULL;
     if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
         return resp_error(r->id, e, "%s", why);
-    if (!unit_has_mount(b, uid, r->mount))
+    int kind = unit_has_mount(b, uid, r->mount);
+    if (!kind)
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is not a mount of %s", r->mount, r->unit);
     /* The staging directory sits in the mount's own snapshot domain, so the
      * swap is a rename within one filesystem. */
@@ -1291,10 +1349,12 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     }
     if (!dom || strcmp(dom, r->mount) == 0)
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is in no snapshot domain of the policy", r->mount);
-    char base[PATH_MAX], path[PATH_MAX], swhy[512];
+    /* One directory per staging: a VM's disks share a job and a domain. */
+    char base[PATH_MAX], path[PATH_MAX], swhy[512], uniq[HELPER_TOKEN_HEX + 1];
+    if (helper_random_hex(uniq, 4) != OK) return resp_error(r->id, HELPER_E_FAILED, "no randomness");
     if (staging_base(s, dom, base, sizeof(base), swhy, sizeof(swhy)) != 0)
         return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
-    if (snprintf(path, sizeof(path), "%s/%lld", base, (long long)r->job) >= (int)sizeof(path))
+    if (snprintf(path, sizeof(path), "%s/%lld-%s", base, (long long)r->job, uniq) >= (int)sizeof(path))
         return resp_error(r->id, HELPER_E_INVALID, "path too long");
     /* Made down to the staging base, which may be a share directory not
      * there yet (system/), each level the helper's own except the last. */
@@ -1336,6 +1396,7 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
         snprintf(slot->unit, sizeof(slot->unit), "%s", r->unit);
         snprintf(slot->mount, sizeof(slot->mount), "%s", r->mount);
         snprintf(slot->path, sizeof(slot->path), "%s", path);
+        slot->file = kind;
         memcpy(token, slot->token, sizeof(token));
     } else {
         slot = NULL;
@@ -1361,6 +1422,13 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     pthread_mutex_unlock(&s->mu);
     if (!x) return resp_error(r->id, HELPER_E_INVALID, "no such staging");
     if (st.swapped) return resp_error(r->id, HELPER_E_INVALID, "already swapped");
+    if (st.file == 3) return resp_error(r->id, HELPER_E_INVALID, "this staging is for vm.install_state");
+    /* A disk image is replaced by the image the daemon wrote in staging. */
+    if (st.file == 2) {
+        char img[PATH_MAX + 8];
+        snprintf(img, sizeof(img), "%.4000s/image", st.path);
+        snprintf(st.path, sizeof(st.path), "%.4090s", img);
+    }
     const char *suid = NULL;
     const helper_backend_t *sb_ = backend_of(s, st.unit, &suid);
     int state = sb_ && sb_->unit_state ? sb_->unit_state(sb_->ctx, suid) : -1;
@@ -1489,19 +1557,81 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd
     return resp_ok(r->id, res ? res : cJSON_CreateObject());
 }
 
-/* vm.*: validated and held to the policy here; libvirt is not built yet. */
+/* vm.install_state (vm-backup.md 7.2): NVRAM and TPM state the daemon
+ * staged, installed for this UUID by the backend. */
+static char *op_vm_install_state(helper_server_t *s, const helper_req_t *r)
+{
+    if (!s->pol->allow_define) return resp_error(r->id, HELPER_E_DENIED, "the policy does not allow define");
+    char why[256];
+    helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
+    if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
+    const char *uid = NULL;
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK) return resp_error(r->id, e, "%s", why);
+    if (!b->install_state) return resp_error(r->id, HELPER_E_UNSUPPORTED, "provider %s installs no state", b->name);
+    pthread_mutex_lock(&s->mu);
+    staging_t st, *x = NULL;
+    for (size_t i = 0; i < STAGINGS_MAX && !x; i++)
+        if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) x = &s->stages[i];
+    if (x) st = *x;
+    pthread_mutex_unlock(&s->mu);
+    if (!x) return resp_error(r->id, HELPER_E_INVALID, "no such staging");
+    cJSON *res = NULL;
+    if (b->install_state(b->ctx, uid, st.path, st.job, &res) != OK) {
+        cJSON_Delete(res);
+        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
+    }
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < STAGINGS_MAX; i++)
+        if (s->stages[i].used && strcmp(s->stages[i].token, r->token) == 0) s->stages[i].used = 0;
+    pthread_mutex_unlock(&s->mu);
+    return resp_ok(r->id, res ? res : cJSON_CreateObject());
+}
+
+/* vm.backup_begin and vm.backup_end: a capture of one libvirt unit, by
+ * another name; the session token is the capture token. */
+static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pass_fd);
+static char *op_capture_end(helper_server_t *s, const helper_req_t *r);
+
+static char *op_vm_backup(helper_server_t *s, const helper_req_t *r, int *pass_fd)
+{
+    if (r->op == HOP_VM_BACKUP_END) {
+        helper_req_t q = *r;
+        return op_capture_end(s, &q);
+    }
+    if (strncmp(r->unit, "libvirt:", 8) != 0)
+        return resp_error(r->id, HELPER_E_INVALID, "vm.backup_begin is for libvirt units");
+    helper_req_t q = *r;
+    q.n_units = 1;
+    snprintf(q.units[0], sizeof(q.units[0]), "%s", r->unit);
+    q.pause = strcmp(r->freeze, "off") != 0;
+    q.hold = 0;
+    return op_capture_begin(s, &q, pass_fd);
+}
+
+/*
+ * vm.checkpoint_redefine (vm-backup.md 5.8): re-create a checkpoint libvirt
+ * has lost (Unraid keeps their metadata on the RAM rootfs) from the XML
+ * this helper stored when it made it. Only a checkpoint of its own records
+ * for that domain; the daemon names it and nothing else.
+ */
 static char *op_vm(helper_server_t *s, const helper_req_t *r)
 {
-    if (r->unit[0]) {
-        char why[256];
-        helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
-        if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
-        if (strncmp(r->unit, "libvirt:", 8) != 0)
-            return resp_error(r->id, HELPER_E_INVALID, "%s is for libvirt units", helper_op_name(r->op));
-        return resp_error(r->id, HELPER_E_UNSUPPORTED, "the libvirt provider is not in this helper");
+    char why[256];
+    helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
+    if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
+    if (strncmp(r->unit, "libvirt:", 8) != 0)
+        return resp_error(r->id, HELPER_E_INVALID, "%s is for libvirt units", helper_op_name(r->op));
+    const char *uid = NULL;
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK) return resp_error(r->id, e, "%s", why);
+    if (!b->redefine) return resp_error(r->id, HELPER_E_UNSUPPORTED, "provider %s keeps no checkpoints", b->name);
+    cJSON *res = NULL;
+    if (b->redefine(b->ctx, uid, r->checkpoint, &res) != OK) {
+        cJSON_Delete(res);
+        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
     }
-    /* A token-only operation: no session was ever issued. */
-    return resp_error(r->id, HELPER_E_INVALID, "no such session");
+    return resp_ok(r->id, res ? res : cJSON_CreateObject());
 }
 
 /* ------------------------------------------------------------------ */
@@ -1589,9 +1719,9 @@ static char *dispatch(helper_server_t *s, const helper_req_t *r, int *pass_fd, i
     case HOP_HOOK_RUN:               return op_hook_run(s, r, pass_fd);
     case HOP_HOOK_WAIT:              return op_hook_wait(s, r, pass_fd);
     case HOP_VM_BACKUP_BEGIN:
-    case HOP_VM_BACKUP_END:
-    case HOP_VM_CHECKPOINT_REDEFINE:
-    case HOP_VM_INSTALL_STATE:       return op_vm(s, r);
+    case HOP_VM_BACKUP_END:          return op_vm_backup(s, r, pass_fd);
+    case HOP_VM_INSTALL_STATE:       return op_vm_install_state(s, r);
+    case HOP_VM_CHECKPOINT_REDEFINE: return op_vm(s, r);
     case HOP_RESTORE_STAGE:          return op_restore_stage(s, r);
     case HOP_RESTORE_SWAP:           return op_restore_swap(s, r);
     case HOP_UNIT_STOP:              return op_unit_stop_start(s, r, 0);

@@ -153,6 +153,11 @@ typedef struct {
      * (SP_CF_PAUSE_HELD) until release, so the caller's second pass over
      * those mounts is consistent with the snapshot. */
     int                    hold_pause;
+    /* The token this unit's chain holds when no item can use it as a base
+     * now (vm-backup.md 5.8): the provider retires what it names once the
+     * session commits, as it would a base, so a broken chain leaves no
+     * checkpoint behind. NULL when there is none, or when it is a base. */
+    const char            *retire_token;
 } sp_begin_req_t;
 
 typedef struct {
@@ -177,6 +182,9 @@ typedef struct {
     sp_item_plan_t  *plans;
     size_t           n_plans;
     char            *new_token;     /* to bind if the snapshot commits */
+    /* What the provider recorded for new_token (a checkpoint's XML), for
+     * the daemon's informational copy (vm-backup.md 5.8). May be NULL. */
+    char            *new_token_blob;
     char           **warnings;
     size_t           n_warnings;
 } sp_session_info_t;

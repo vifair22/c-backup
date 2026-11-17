@@ -84,7 +84,7 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
 SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/scheduler -I src/common \
-                -I src/providers -I src/units -I src/helper \
+                -I src/providers -I src/units -I src/helper -I src/virt \
                 -I src/config -I src/daemon -I $(CUTILS_DIR)/include \
                 -I $(CUTILS_DIR)/lib/cJSON
 COMMON_CFLAGS := -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
@@ -170,7 +170,22 @@ DAEMON_MAIN := $(SRC)/daemon/main.c
 CLI_MAIN    := $(SRC)/cli/main.c
 HELPER_MAIN := $(SRC)/helper/helper_main.c
 ALL_SRCS    := $(shell find $(SRC) -name '*.c')
-SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN) $(HELPER_MAIN), $(ALL_SRCS))
+# The libvirt provider lives in the helper alone (vm-backup.md 9, the
+# approved dependency): src/virt is compiled with libvirt's and libxml2's
+# flags and linked into c-backup-helper and its own tests, never into the
+# daemon or the CLI. Without libvirt's development files it is left out and
+# the helper offers no libvirt provider.
+VIRT_SRCS   := $(wildcard $(SRC)/virt/*.c)
+HAVE_LIBVIRT := $(shell pkg-config --exists libvirt libxml-2.0 2>/dev/null && echo 1)
+ifeq ($(HAVE_LIBVIRT),1)
+VIRT_CFLAGS := $(patsubst -I%,-isystem %,$(shell pkg-config --cflags libvirt libxml-2.0)) -DHAVE_LIBVIRT
+VIRT_LIBS   := $(shell pkg-config --libs libvirt libxml-2.0)
+else
+VIRT_SRCS   :=
+VIRT_CFLAGS :=
+VIRT_LIBS   :=
+endif
+SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN) $(HELPER_MAIN) $(wildcard $(SRC)/virt/*.c), $(ALL_SRCS))
 SRC_DIRS    := $(sort $(dir $(ALL_SRCS)))
 VPATH       := $(SRC_DIRS)
 # cJSON is not compiled here. c-utils carries it and libc-utils.a holds its
@@ -192,6 +207,8 @@ endif
 DAEMON_OBJ  := $(OBJ_DIR)/daemon_main.o
 CLI_OBJ     := $(OBJ_DIR)/cli_main.o
 HELPER_OBJ  := $(OBJ_DIR)/helper_main.o
+VIRT_OBJS   := $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(VIRT_SRCS)))
+$(VIRT_OBJS) $(HELPER_OBJ): TYPE_CFLAGS += $(VIRT_CFLAGS)
 OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ) $(HELPER_OBJ)
 
 # Generated code (the embedded migrations): match the optimisation level but
@@ -247,7 +264,7 @@ $(eval $(call stamp_rule,$(OBJ_DIR),FLAGS_SIG))
 TEST_HDRS := $(wildcard $(TESTS)/*.h)
 
 # ---- Phony targets ----------------------------------------------------
-.PHONY: all static asan tsan debug clean test bench bench-micro bench-phases bench-browse analyze lint check-conflict-markers
+.PHONY: all static asan tsan debug clean test bench bench-micro bench-phases bench-browse bench-nbd analyze lint check-conflict-markers
 
 # In the top-level make, which is the release build unless told otherwise,
 # `all` is built here rather than by a sub-make (BUILD-1). The test binaries
@@ -329,8 +346,8 @@ $(DAEMON_TARGET): $(LIB_OBJS) $(DAEMON_OBJ) $(CUTILS_ARCHIVE) $(FLAGS_STAMP) | $
 $(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) $(CUTILS_ARCHIVE) $(FLAGS_STAMP) | $(BINS)
 	$(CC) $(TYPE_CFLAGS) $(filter %.o %.a,$^) -o $@ $(TYPE_LDFLAGS)
 
-$(HELPER_TARGET): $(LIB_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) $(FLAGS_STAMP) | $(BINS)
-	$(CC) $(TYPE_CFLAGS) $(filter %.o %.a,$^) -o $@ $(TYPE_LDFLAGS)
+$(HELPER_TARGET): $(LIB_OBJS) $(VIRT_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) $(FLAGS_STAMP) | $(BINS)
+	$(CC) $(TYPE_CFLAGS) $(filter %.o %.a,$^) -o $@ $(TYPE_LDFLAGS) $(VIRT_LIBS)
 
 # ---- Tests (link against release lib objects) -------------------------
 REL_OBJ_DIR := $(BUILD)/release
@@ -364,6 +381,30 @@ FORCE:
 
 $(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_HDRS) $(TEST_DIR_STAMP) | $(BINS)
 	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o,$^) -o $@ $(TEST_LDFLAGS)
+
+# Suites of the libvirt provider link it and libvirt; they exist only where
+# libvirt does.
+REL_VIRT_OBJS = $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(VIRT_SRCS)))
+$(REL_VIRT_OBJS): TYPE_CFLAGS += $(VIRT_CFLAGS)
+ifneq ($(HAVE_LIBVIRT),1)
+TEST_SRCS := $(filter-out $(wildcard $(TESTS)/test_virt*.c), $(TEST_SRCS))
+TEST_BINS := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(TEST_SRCS))
+endif
+# A static pattern rule, not a pattern one (BUILD-2). As `$(BINS)/test_virt%`
+# it competed with the generic `$(BINS)/%` above: make takes a pattern rule
+# only if it can settle every prerequisite during its rule search, and when
+# it could not settle the libvirt objects it fell back to the generic rule,
+# which links neither them nor libvirt, so a clean parallel build failed to
+# link test_virt_offline and test_virt_incremental. A static pattern rule
+# names its targets, so nothing else can build them.
+VIRT_TEST_BINS := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(wildcard $(TESTS)/test_virt*.c))
+ifeq ($(HAVE_LIBVIRT),1)
+$(VIRT_TEST_BINS): $(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(REL_VIRT_OBJS) $(TEST_HDRS) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(TEST_CFLAGS) $(VIRT_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o,$^) -o $@ $(TEST_LDFLAGS) $(VIRT_LIBS)
+else
+$(VIRT_TEST_BINS):
+	@echo "$@ needs libvirt's and libxml2's development files (pkg-config libvirt libxml-2.0)" >&2; exit 1
+endif
 
 $(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) $(TEST_HDRS) $(TEST_DIR_STAMP) | $(BINS)
 	$(CC) $(TEST_CFLAGS) $(TEST_DIR_DEF) $(FAULT_WRAP) $(filter %.c %.o,$^) -o $@ $(TEST_LDFLAGS)
@@ -468,13 +509,20 @@ SAN_ONLY ?=
 ifneq ($(filter $(BUILD_TYPE),$(SAN_TYPES)),)
 SAN_TEST_CFLAGS := -std=c11 -pthread -Wall -Wextra -O1 -g -fno-omit-frame-pointer $(SAN_CFLAGS) \
                    -Wno-unused-result $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
-SAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%$(BIN_SUFFIX), $(TEST_SRCS))
+SAN_VIRT_SRCS   := $(filter $(TESTS)/test_virt%,$(TEST_SRCS))
+SAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%$(BIN_SUFFIX), $(filter-out $(SAN_VIRT_SRCS),$(TEST_SRCS)))
+SAN_VIRT_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%$(BIN_SUFFIX), $(SAN_VIRT_SRCS))
 SAN_FAULT_BINS  := $(patsubst $(TESTS)/%.c, $(BINS)/%$(BIN_SUFFIX), $(FAULT_SRCS))
 
 # Static pattern rules, so nothing else in this file can claim the targets.
 $(SAN_TEST_BINS): $(BINS)/%$(BIN_SUFFIX): $(TESTS)/%.c $(TESTS)/fake_index.c $(LIB_OBJS) $(CUTILS_ARCHIVE) \
                   $(TEST_HDRS) $(FLAGS_STAMP) $(TEST_DIR_STAMP) | $(BINS)
 	$(CC) $(SAN_TEST_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o %.a,$^) -o $@ $(TYPE_LDFLAGS) -lcmocka
+
+# The libvirt suites, like their release rule, link the provider and libvirt.
+$(SAN_VIRT_BINS): $(BINS)/%$(BIN_SUFFIX): $(TESTS)/%.c $(TESTS)/fake_index.c $(LIB_OBJS) $(VIRT_OBJS) $(CUTILS_ARCHIVE) \
+                  $(TEST_HDRS) $(FLAGS_STAMP) $(TEST_DIR_STAMP) | $(BINS)
+	$(CC) $(SAN_TEST_CFLAGS) $(VIRT_CFLAGS) $(TEST_DIR_DEF) $(filter %.c %.o %.a,$^) -o $@ $(TYPE_LDFLAGS) $(VIRT_LIBS) -lcmocka
 
 $(SAN_FAULT_BINS): $(BINS)/%$(BIN_SUFFIX): $(TESTS)/%.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(LIB_OBJS) \
                    $(CUTILS_ARCHIVE) $(TEST_HDRS) $(FLAGS_STAMP) $(TEST_DIR_STAMP) | $(BINS)
@@ -497,11 +545,11 @@ SAN_ENV_asan := ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1:chec
                 UBSAN_OPTIONS=print_stacktrace=1:log_path=$$d/ubsan \
                 LSAN_OPTIONS=suppressions=$(abspath $(TESTS)/lsan.supp):print_suppressions=0
 SAN_ENV_tsan := TSAN_OPTIONS=second_deadlock_stack=1:history_size=4:log_path=$$d/tsan
-SAN_RUN_UNIT := $(if $(SAN_ONLY),$(filter $(addprefix $(BINS)/,$(addsuffix $(BIN_SUFFIX),$(SAN_ONLY))),$(SAN_TEST_BINS) $(SAN_FAULT_BINS)),$(SAN_TEST_BINS) $(SAN_FAULT_BINS))
+SAN_RUN_UNIT := $(if $(SAN_ONLY),$(filter $(addprefix $(BINS)/,$(addsuffix $(BIN_SUFFIX),$(SAN_ONLY))),$(SAN_TEST_BINS) $(SAN_VIRT_BINS) $(SAN_FAULT_BINS)),$(SAN_TEST_BINS) $(SAN_VIRT_BINS) $(SAN_FAULT_BINS))
 san_e2e = $(if $(SAN_ONLY),$(filter $(1),$(SAN_ONLY)),$(1))
 
 .PHONY: _san_bins _san_test
-_san_bins: $(SAN_TEST_BINS) $(SAN_FAULT_BINS)
+_san_bins: $(SAN_TEST_BINS) $(SAN_VIRT_BINS) $(SAN_FAULT_BINS)
 
 # Every suite runs, and the target fails at the end naming each one that
 # failed: a sweep that stops at its first finding hides the rest.
@@ -757,6 +805,10 @@ analyze: check-conflict-markers | $(BUILD)
 	    base=$$(basename $$f .c); \
 	    $(CC) $(ANALYZE_CFLAGS) -fstack-usage -c $$f -o $(BUILD)/analyze/$$base.o 2>/dev/null; \
 	done
+	@for f in $(VIRT_SRCS); do \
+	    base=$$(basename $$f .c); \
+	    $(CC) $(ANALYZE_CFLAGS) $(VIRT_CFLAGS) -fstack-usage -c $$f -o $(BUILD)/analyze/$$base.o 2>/dev/null; \
+	done
 	@fail=0; for su in $(BUILD)/analyze/*.su; do \
 	    [ -f "$$su" ] || continue; \
 	    awk -v limit=$(STACK_LIMIT) -v file="$$su" \
@@ -770,6 +822,9 @@ analyze: check-conflict-markers | $(BUILD)
 	@for f in $(SRCS); do \
 	    $(CC) $(ANALYZE_CFLAGS) -fanalyzer -fsyntax-only $$f 2>&1; \
 	done
+	@for f in $(VIRT_SRCS); do \
+	    $(CC) $(ANALYZE_CFLAGS) $(VIRT_CFLAGS) -fanalyzer -fsyntax-only $$f 2>&1; \
+	done
 	@echo "gcc-fanalyzer: OK"
 	@echo "=== cppcheck ==="
 	@cppcheck --enable=warning,performance,portability --error-exitcode=1 \
@@ -780,7 +835,7 @@ analyze: check-conflict-markers | $(BUILD)
 	    --suppress=oppositeInnerCondition:src/store/object.c \
 	    -DVERSION_STRING=\"0.0.0\" \
 	    --inline-suppr \
-	    --quiet $(SRC_INCLUDES) $(SRCS)
+	    --quiet $(SRC_INCLUDES) -DHAVE_LIBVIRT $(SRCS) $(VIRT_SRCS)
 	@echo "cppcheck: OK"
 
 lint:
@@ -823,6 +878,13 @@ $(BINS)/bench_phases: $(BENCH)/phases.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) 
 
 $(BINS)/bench_browse: $(BENCH)/browse.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $(filter %.c %.o,$^) -o $@ -flto=auto $(LDFLAGS)
+
+$(BINS)/bench_nbd: $(BENCH)/nbd.c $(REL_LIB_OBJS) | $(BINS)
+	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS)
+
+# NBD read throughput, depth 1 against 8, through qemu-nbd (PERF.md).
+bench-nbd: $(BINS)/bench_nbd
+	$(BINS)/bench_nbd
 
 # An LD_PRELOAD shim, not linked into anything: it delays fsync and fdatasync
 # under chosen directories so bench_phases can model slow sync storage. See
@@ -871,7 +933,7 @@ COV_OBJS    := $(patsubst $(SRC)/%.c, $(COV_DIR)/%.o, $(SRCS))
 COV_OBJS    += $(COV_DIR)/app_migrations.o
 COV_MAIN    := $(COV_DIR)/main.o
 COV_LIB     := $(filter-out $(COV_MAIN), $(COV_OBJS))
-COV_TESTS   := $(patsubst $(TESTS)/%.c, $(COV_DIR)/%, $(TEST_SRCS))
+COV_TESTS   := $(patsubst $(TESTS)/%.c, $(COV_DIR)/%, $(filter-out $(wildcard $(TESTS)/test_virt*.c), $(TEST_SRCS)))
 # The fault suites too. They were left out because TEST_SRCS filters them -
 # it feeds both TEST_BINS and COV_TESTS, and they need their own link rule
 # for --wrap - so nineteen tests that exercise nothing but error paths in

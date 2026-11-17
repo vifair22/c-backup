@@ -1493,6 +1493,78 @@ static int h_unit_restore(const args_t *a)
     return rc;
 }
 
+/*
+ * NBD exports of a VM disk for file-level recovery (vm-backup.md 7.3). The
+ * export's name is printed once, by `vm export`; nothing shows it again.
+ */
+
+/* "90", "90s", "15m", "4h", "2d" -> seconds; 0 on anything else. */
+static long ttl_seconds(const char *t)
+{
+    char *end = NULL;
+    long v = strtol(t, &end, 10);
+    if (!end || end == t || v <= 0) return 0;
+    long mul = 1;
+    if (*end == 'm') mul = 60;
+    else if (*end == 'h') mul = 3600;
+    else if (*end == 'd') mul = 86400;
+    else if (*end != 's' && *end != '\0') return 0;
+    if (*end && end[1]) return 0;
+    if (v > 604800 / mul) return 0;
+    return v * mul;
+}
+
+static int h_vm_export(const args_t *a)
+{
+    const char *ttl = args_value(a, "--ttl");
+    long secs = ttl ? ttl_seconds(ttl) : 0;
+    if (ttl && secs < 60)
+        return refuse(a, "--ttl must be 60 seconds to 7 days, as N, Ns, Nm, Nh or Nd");
+    sbuf_t b = { 0 };
+    sb_puts(&b, "{\"item\":"); sb_json_str(&b, a->pos[2]);
+    if (secs) { char n[32]; snprintf(n, sizeof(n), ",\"ttl_s\":%ld", secs); sb_puts(&b, n); }
+    sb_puts(&b, "}");
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/repos/"); sb_path_seg(&p, a->pos[0]);
+    sb_puts(&p, "/snapshots/"); sb_path_seg(&p, a->pos[1]); sb_puts(&p, "/unit/export");
+    if (b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+    int rc = call_path_sb("POST", &p, b.buf);
+    free(b.buf);
+    return rc;
+}
+
+static int h_vm_exports(const args_t *a)
+{
+    (void)a;
+    return call("GET", "/exports", NULL);
+}
+
+static int vm_export_by_id(const args_t *a, const char *method)
+{
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/exports/"); sb_path_seg(&p, a->pos[0]);
+    return call_path_sb(method, &p, NULL);
+}
+
+/* A VM's incremental chain (vm-backup.md 5.4, 8.3): the token rows and
+ * whether incrementals are on; and reset-incremental after a failed audit. */
+static int h_vm_checkpoints(const args_t *a)
+{
+    sbuf_t p = { 0 };
+    unit_path(&p, a->pos[0], "libvirt", a->pos[1], "/checkpoints");
+    return call_path_sb("GET", &p, NULL);
+}
+
+static int h_vm_reset_incremental(const args_t *a)
+{
+    sbuf_t p = { 0 };
+    unit_path(&p, a->pos[0], "libvirt", a->pos[1], "/reset-incremental");
+    return call_path_sb("POST", &p, NULL);
+}
+
+static int h_vm_export_show(const args_t *a) { return vm_export_by_id(a, "GET"); }
+static int h_vm_unexport(const args_t *a)    { return vm_export_by_id(a, "DELETE"); }
+
 static int h_unit_policy_show(const args_t *a)
 {
     const char *prov = args_value(a, "--provider");
@@ -1696,6 +1768,8 @@ static const char *const P_PROV_UNIT[] = { "<provider>", "<unit>", NULL };
 static const char *const P_UBACKUP[]  = { "<repo-id>", "[unit...]", NULL };
 static const char *const P_UHIST[]    = { "<repo-id>", "[unit]", NULL };
 static const char *const P_URESTORE[] = { "<repo-id>", "<snapshot-id>", "[dest]", NULL };
+static const char *const P_VM_EXPORT[] = { "<repo-id>", "<snapshot-id>", "<disk>", NULL };
+static const char *const P_EXPORT[]   = { "<export-id>", NULL };
 static const char *const P_UPOL[]     = { "<repo-id>", "<unit>", NULL };
 static const char *const P_UPOL_SET[] = { "<repo-id>", "<unit>", "<key>", "<value>", NULL };
 
@@ -1803,6 +1877,7 @@ static const arg_opt_t O_UNIT_RESTORE[] = {
     { "--keep-macs",   NULL, ARG_FLAG,  NULL },
     OPT_NOWAIT, OPT_END,
 };
+static const arg_opt_t O_VM_EXPORT[] = { { "--ttl", NULL, ARG_VALUE, "N[s|m|h|d]" }, OPT_END };
 static const arg_opt_t O_PROVIDER[] = { { "--provider", NULL, ARG_VALUE, "P" }, OPT_END };
 static const arg_opt_t O_ALL[] = { { "--all", NULL, ARG_FLAG, NULL }, OPT_END };
 static const arg_opt_t O_ACCEPT_MISSING[] = {
@@ -1847,6 +1922,17 @@ static const command_t COMMANDS[] = {
       h_unit_restore, 0 },
     { { "unit policy show", P_UPOL,    O_PROVIDER, NULL }, h_unit_policy_show, 0 },
     { { "unit policy set", P_UPOL_SET, O_PROVIDER, NULL }, h_unit_policy_set, 0 },
+    { { "vm export",       P_VM_EXPORT, O_VM_EXPORT,
+        "serve the disk read-only over NBD; prints the export's name once" },
+      h_vm_export, 0 },
+    { { "vm exports",      P_NONE,     NULL, NULL }, h_vm_exports, 0 },
+    { { "vm export-show",  P_EXPORT,   NULL, NULL }, h_vm_export_show, 0 },
+    { { "vm unexport",     P_EXPORT,   NULL, NULL }, h_vm_unexport, 0 },
+    { { "vm checkpoints",  P_UPOL,     NULL, "the VM's incremental chain: a checkpoint per disk, and whether incrementals are on" },
+      h_vm_checkpoints, 0 },
+    { { "vm reset-incremental", P_UPOL, NULL,
+        "after a failed bitmap audit: incrementals back on, the next backup a full read" },
+      h_vm_reset_incremental, 0 },
     { { "snapshots",       P_REPO,     O_PAGING, NULL }, h_snapshots, 0 },
     { { "snapshot delete", P_SNAP,     O_FORCE, NULL }, h_snapshot_delete, 0 },
     { { "snapshot note",   P_NOTE,     NULL, "reads the note, or writes [text]" },

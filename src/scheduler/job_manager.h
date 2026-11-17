@@ -143,6 +143,21 @@ status_t job_submit_origin(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
 /* The phase a queued job shows while it waits for a synchronous request to
  * let go of its repository, and the bounds of the retry backoff. */
 #define JOB_PHASE_WAITING "waiting for repository"
+
+/*
+ * A gate holds back one action on a repository while something outside the
+ * job system depends on it: fn returns non-zero to defer. It is asked under
+ * the job manager's lock with the job's repository lock set held, so it
+ * must not block, take the database or call into the job manager. A gated
+ * job stays queued and cancellable, shows `phase`, and is asked again every
+ * JOB_GATE_RETRY_MS. action and phase are string literals.
+ */
+typedef int (*job_gate_fn)(int64_t repo_id);
+#define JOB_GATES_MAX     4
+#define JOB_GATE_RETRY_MS 1000
+#define JOB_PHASE_EXPORT_OPEN "waiting for an NBD export to close"
+void job_manager_set_gate(job_manager_t *jm, const char *action, job_gate_fn fn,
+                          const char *phase);
 #define JOB_DEFER_MIN_MS  20
 #define JOB_DEFER_MAX_MS  500
 

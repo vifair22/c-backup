@@ -89,6 +89,7 @@ void sp_session_info_free(sp_session_info_t *info)
     if (!info) return;
     free(info->plans);
     free(info->new_token);
+    free(info->new_token_blob);
     for (size_t i = 0; i < info->n_warnings; i++) free(info->warnings[i]);
     free(info->warnings);
     memset(info, 0, sizeof(*info));

@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates git pkg-config \
         libssl-dev liblz4-dev libacl1-dev libsqlite3-dev \
         libmicrohttpd-dev libcurl4-openssl-dev libcmocka-dev \
+        libvirt-dev libxml2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -51,7 +52,7 @@ FROM debian:trixie-slim
 # to UTC; run it with -e TZ=<zone> to change that.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 liblz4-1 libacl1 libsqlite3-0 \
-        libmicrohttpd12 libcurl4 tzdata \
+        libmicrohttpd12 libcurl4 tzdata libvirt0 libxml2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /build/build/bins/c-backupd /usr/local/bin/c-backupd

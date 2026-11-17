@@ -16,6 +16,9 @@
 #include "docker_backend.h"
 #include "fake_provider.h"
 #include "lxc_backend.h"
+#ifdef HAVE_LIBVIRT
+#include "libvirt_backend.h"
+#endif
 #include "helper_policy.h"
 #include "helper_server.h"
 
@@ -90,9 +93,9 @@ int main(int argc, char **argv)
         log_warn("helper: the fake provider is enabled from %s; this is for tests", pol.fake_spec);
     }
 
-    helper_backend_t be[2];
+    helper_backend_t be[3];
     size_t nbe = 0;
-    int have_docker = 0, have_lxc = 0;
+    int have_docker = 0, have_lxc = 0, have_virt = 0;
     if (pol.docker_enabled) {
         if (docker_backend_init(&pol, &be[nbe]) != OK) {
             fprintf(stderr, "c-backup-helper: %s\n", err_msg());
@@ -115,6 +118,28 @@ int main(int argc, char **argv)
         log_info("helper: lxc provider over %s", pol.lxc_path);
     }
 
+    if (pol.libvirt_enabled) {
+#ifdef HAVE_LIBVIRT
+        if (libvirt_backend_init(&pol, &be[nbe]) != OK) {
+            fprintf(stderr, "c-backup-helper: %s\n", err_msg());
+            if (have_docker) docker_backend_fini(&be[have_docker - 1]);
+            if (have_lxc) lxc_backend_fini(&be[have_lxc - 1]);
+            if (fake) fake_provider_ops.fini(fake);
+            helper_policy_free(&pol);
+            return 1;
+        }
+        have_virt = (int)++nbe;
+        log_info("helper: libvirt provider over %s", pol.libvirt_uri);
+#else
+        fprintf(stderr, "c-backup-helper: [libvirt] enabled, and this helper was built without libvirt\n");
+        if (have_docker) docker_backend_fini(&be[have_docker - 1]);
+        if (have_lxc) lxc_backend_fini(&be[have_lxc - 1]);
+        if (fake) fake_provider_ops.fini(fake);
+        helper_policy_free(&pol);
+        return 1;
+#endif
+    }
+
     helper_server_cfg_t cfg = { &pol, fake, 1, 0, be, nbe };
     helper_server_t *srv = NULL;
     if (helper_server_start(&cfg, &srv) != OK) {
@@ -133,6 +158,9 @@ int main(int argc, char **argv)
     }
     log_info("helper: stopping");
     helper_server_stop(srv);
+#ifdef HAVE_LIBVIRT
+    if (have_virt) libvirt_backend_fini(&be[have_virt - 1]);
+#endif
     if (have_docker) docker_backend_fini(&be[have_docker - 1]);
     if (have_lxc) lxc_backend_fini(&be[have_lxc - 1]);
     if (fake) fake_provider_ops.fini(fake);

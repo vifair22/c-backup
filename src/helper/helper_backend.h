@@ -53,6 +53,21 @@ typedef struct helper_backend {
                        const helper_policy_t *pol, cJSON **result);
     /* (The vtable's release lets a held pause go; nothing extra here.) */
     void     *reserved;
+    /* Where the daemon reads a BLOCK item of a session (vm-backup.md 2.3,
+     * 2.4): fills obj with {"kind":"file","path"} or {"kind":"nbd",
+     * "socket","export"}. NULL: disks come through the data plane's own
+     * means (the fake's run maps). */
+    status_t (*block_where)(sp_session_t *s, const sp_item_desc_t *item, cJSON *obj);
+    /* vm.install_state (7.2): NVRAM and TPM state staged in staging_dir
+     * installed for the unit's UUID only, the old state moved aside.
+     * *result says what went where. */
+    status_t (*install_state)(sp_ctx_t *c, const char *unit_id, const char *staging_dir,
+                              int64_t job, cJSON **result);
+    /* vm.checkpoint_redefine (vm-backup.md 5.8): a checkpoint of the
+     * backend's own records re-created from the XML it stored, when the
+     * hypervisor no longer has it. *result says whether it was present,
+     * redefined, or refused and dropped. NULL: no checkpoints. */
+    status_t (*redefine)(sp_ctx_t *c, const char *unit_id, const char *checkpoint, cJSON **result);
 } helper_backend_t;
 
 /* The fake provider as a backend, over ctx. */

@@ -138,6 +138,8 @@ static void test_units_migration_keeps_baseline_data(void **state)
     assert_int_equal(db_run_compiled_migrations(db, app_migrations), CUTILS_OK);
     assert_true(object_exists(db, "table", "snapshot_units"));
     assert_true(object_exists(db, "table", "unit_intents"));
+    assert_true(object_exists(db, "table", "unit_tokens"));
+    assert_true(object_exists(db, "table", "unit_incremental"));
     assert_int_equal(count_rows(db, "SELECT 1 FROM tags WHERE name = 'keep' AND snap_id = 7"), 1);
     assert_int_equal(count_rows(db, "SELECT 1 FROM policy_values WHERE value = '9'"), 1);
     assert_int_equal(count_rows(db, "SELECT 1 FROM schedules WHERE action = 'gc'"), 1);
@@ -199,13 +201,19 @@ static void test_one_baseline_migration(void **state)
     /* Units (source-providers.md), the first migration after it. */
     assert_non_null(app_migrations[1].name);
     assert_string_equal(app_migrations[1].name, "002_units.sql");
-    /* B155: the schedule creation time, the never-fired interval anchor. */
+    /* NBD exports of unit disks (vm-backup.md 7.3). */
     assert_non_null(app_migrations[2].name);
-    assert_string_equal(app_migrations[2].name, "006_schedule_created_at.sql");
-    /* Dropped packs' numbers (B156). */
+    assert_string_equal(app_migrations[2].name, "003_exports.sql");
+    /* Incremental VM backup's tokens (vm-backup.md 5.8). */
     assert_non_null(app_migrations[3].name);
-    assert_string_equal(app_migrations[3].name, "007_pack_tombstones.sql");
-    assert_null(app_migrations[4].name);
+    assert_string_equal(app_migrations[3].name, "004_unit_tokens.sql");
+    /* B155: the schedule creation time, the never-fired interval anchor. */
+    assert_non_null(app_migrations[4].name);
+    assert_string_equal(app_migrations[4].name, "006_schedule_created_at.sql");
+    /* Dropped packs' numbers (B156). */
+    assert_non_null(app_migrations[5].name);
+    assert_string_equal(app_migrations[5].name, "007_pack_tombstones.sql");
+    assert_null(app_migrations[6].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */
