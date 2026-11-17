@@ -25,6 +25,8 @@
 #include <cmocka.h>
 
 #include "docker_backend.h"
+#include "helper_backend.h"
+#include "helper_server.h"
 #include "registry.h"
 #include "repo.h"
 #include "restore.h"
@@ -97,6 +99,11 @@ static int start(const char *extra_policy)
     put(D "/proj/compose.yaml", "services: {}\n");
     put(D "/proj/.env", "PASSWORD=verbatim\n");
     put(STATE "/datasets", "cache\t" MNT "/cache\ncache/appdata\t" APPS "\nmedia\t" MNT "/media\n");
+    /* The host's mount table: Docker's directory a bind of one inside
+     * cache/appdata, as Unraid binds /var/lib/docker (B170, B178). */
+    put(D "/mountinfo", "22 1 0:21 / / rw - ext4 /dev/sda1 rw\n"
+                        "41 22 0:99 / " APPS " rw - zfs cache/appdata rw\n"
+                        "42 22 0:99 /docker " D "/var/lib/docker rw - zfs cache/appdata rw\n");
     setenv("FAKE_HOST_STATE", STATE, 1);
     unsetenv("FAKE_ZFS_FAIL");
     if (fake_docker_start(&fdk, SOCK) != 0) return -1;
@@ -129,11 +136,13 @@ static int start(const char *extra_policy)
     if (!getcwd(cwd, sizeof(cwd))) return -1;
     char text[8192];
     snprintf(text, sizeof(text),
-             "[helper]\ndaemon_uid = 1000\ndaemon_id = 0badf00d\nstate_dir = " STATE "\n"
+             "[helper]\ndaemon_uid = 1000\ndaemon_id = 0badf00d\nstate_dir = " STATE "\nallow_restore = 1\n"
+             "[units]\nallow = docker:*\n"
              "[snapshot]\nzfs_domains = cache/appdata, media\n"
              "[host]\nnsenter = 0\nhost_root =\nzfs = %s/tests/fake_host/zfs\ndocker = %s/tests/fake_host/docker\nuser_root = " MNT "/user\n"
-             "mnt_root = " MNT "\nboot_config = " D "/boot\n"
-             "[docker]\nenabled = 1\nsocket = " SOCK "\ninclude_roots = " APPS ", " MNT "/media, " MNT "/disk1\n"
+             "mnt_root = " MNT "\nboot_config = " D "/boot\nmountinfo = " D "/mountinfo\n"
+             "[docker]\nenabled = 1\nsocket = " SOCK "\ninclude_roots = " APPS ", " MNT "/media, " MNT "/disk1, "
+             MNT "/user/appdata\n"
              "templates_dir = " D "/tmpl\n%s",
              cwd, cwd, extra_policy ? extra_policy : "");
     memset(&pol, 0, sizeof(pol));
@@ -784,6 +793,88 @@ static void sink(void *ctx, int stream, const unsigned char *p, size_t n)
     s->out[stream][l + n] = '\0';
 }
 
+/*
+ * B178: an in-place restore through the helper of a bind recorded under
+ * /mnt/user and of a named volume under the bind-mounted /var/lib/docker.
+ * Each is staged in its dataset and swapped at its real path; the recorded
+ * paths are never written; a backup that read it elsewhere is refused.
+ */
+static char *hreq(helper_server_t *h, const char *op, const char *args)
+{
+    char buf[2048], *resp = NULL;
+    int fd = -1;
+    snprintf(buf, sizeof(buf), "{\"v\":1,\"id\":1,\"op\":\"%s\",\"args\":%s}", op, args);
+    helper_server_handle(h, buf, strlen(buf), &resp, &fd);
+    if (fd >= 0) close(fd);
+    return resp;
+}
+
+/* Stage mount of unit with the backup's real path, write one file into the
+ * staging, stop the unit, swap; the result's "previous". */
+static void restore_in_place(helper_server_t *h, const char *unit, const char *mount, const char *real, int job)
+{
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"unit\":\"%s\",\"mount\":\"%s\",\"job\":%d,\"real\":\"%s\"}", unit, mount, job, real);
+    char *r = hreq(h, "restore.stage", args);
+    cJSON *o = cJSON_Parse(r);
+    free(r);
+    assert_true(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "ok")));
+    const cJSON *res = cJSON_GetObjectItemCaseSensitive(o, "result");
+    const char *path = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "path"));
+    assert_int_equal(strncmp(path, APPS "/.cbackup-restore/", strlen(APPS "/.cbackup-restore/")), 0);
+    char f[1200];
+    snprintf(f, sizeof(f), "%s/restored", path);
+    put(f, "restored");
+    snprintf(args, sizeof(args), "{\"unit\":\"%s\"}", unit);
+    free(hreq(h, "unit.stop", args));
+    snprintf(args, sizeof(args), "{\"staging\":\"%s\"}", cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "staging")));
+    cJSON_Delete(o);
+    r = hreq(h, "restore.swap", args);
+    o = cJSON_Parse(r);
+    free(r);
+    assert_true(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "ok")));
+    res = cJSON_GetObjectItemCaseSensitive(o, "result");
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "mount")), mount);
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "real")), real);
+    cJSON_Delete(o);
+}
+
+static void test_restore_in_place_real(void **state)
+{
+    (void)state;
+    assert_int_equal(system("mkdir -p '" APPS "/vb' '" D "/var/lib/docker/volumes/v1/_data' "
+                            "'" APPS "/docker/volumes/v1/_data'"), 0);
+    put(APPS "/vb/live", "live");
+    put(APPS "/docker/volumes/v1/_data/live", "live");
+    fake_docker_add(&fdk, "gggg01", "vbind", "running", NULL,
+        "[{\"Type\":\"bind\",\"Source\":\"" MNT "/user/appdata/vb\",\"Destination\":\"/vb\"}]");
+    fake_docker_add(&fdk, "gggg02", "vvol", "running", NULL,
+        "[{\"Type\":\"volume\",\"Source\":\"" D "/var/lib/docker/volumes/v1/_data\",\"Driver\":\"local\",\"Destination\":\"/v\"}]");
+    helper_server_cfg_t cfg = { &pol, NULL, 0, 50, &be, 1 };
+    helper_server_t *h = NULL;
+    assert_int_equal(helper_server_start(&cfg, &h), OK);
+
+    /* The backup read the bind somewhere else: refused, nothing staged. */
+    char *r = hreq(h, "restore.stage", "{\"unit\":\"docker:vbind\",\"mount\":\"" MNT "/user/appdata/vb\","
+                                       "\"job\":3,\"real\":\"" MNT "/disk1/appdata/vb\"}");
+    assert_non_null(strstr(r, "\"denied\""));
+    assert_non_null(strstr(r, "resolves to " APPS "/vb now"));
+    free(r);
+
+    struct stat sb;
+    restore_in_place(h, "docker:vbind", MNT "/user/appdata/vb", APPS "/vb", 3);
+    assert_true(has(APPS "/vb/restored", "restored"));
+    assert_true(has(APPS "/vb.cbackup-old-3/live", "live"));
+    assert_int_not_equal(lstat(MNT "/user/appdata/vb", &sb), 0);
+
+    restore_in_place(h, "docker:vvol", D "/var/lib/docker/volumes/v1/_data", APPS "/docker/volumes/v1/_data", 4);
+    assert_true(has(APPS "/docker/volumes/v1/_data/restored", "restored"));
+    assert_true(has(APPS "/docker/volumes/v1/_data.cbackup-old-4/live", "live"));
+    /* The bind's own directory, not the bound one, was swapped. */
+    assert_int_not_equal(stat(D "/var/lib/docker/volumes/v1/_data/restored", &sb), 0);
+    helper_server_stop(h);
+}
+
 static void test_demux(void **state)
 {
     (void)state;
@@ -837,6 +928,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_fallback_flagged, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failing_hook, setup_failing_hook, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_in_place_real, setup, teardown),
         cmocka_unit_test(test_demux),
     };
     return cmocka_run_group_tests(tests, NULL, group_cleanup);

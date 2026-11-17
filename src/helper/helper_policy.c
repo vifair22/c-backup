@@ -243,6 +243,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
                 { "user_root", out->user_root, sizeof(out->user_root) },
                 { "mnt_root", out->mnt_root, sizeof(out->mnt_root) },
                 { "boot_config", out->boot_config, sizeof(out->boot_config) },
+                { "mountinfo", out->mountinfo, sizeof(out->mountinfo) },
             };
             int done = 0;
             for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]) && !done; i++) {

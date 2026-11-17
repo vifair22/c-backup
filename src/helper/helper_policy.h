@@ -87,6 +87,7 @@ typedef struct {
     char     host_docker[256];      /* the host's docker CLI, for compose up */
     char     host_lxc_dir[256], host_root[256];
     char     user_root[4096], mnt_root[4096], boot_config[4096];
+    char     mountinfo[4096];       /* "": derived from host_root (mounts.h) */
 
     /* [docker] */
     int      docker_enabled;

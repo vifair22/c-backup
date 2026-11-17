@@ -3902,6 +3902,17 @@ is undone. Under a new name, a define that fails after the data was written
 leaves the data under `DIR` and says to remove it, or give another target
 root, before trying again.
 
+**What is swapped is where the data is.** A mount recorded as
+`/mnt/user/appdata/x` is swapped at the pool path holding it
+(`/mnt/cache/appdata/x`), and a named volume recorded under
+`/var/lib/docker/volumes/` at the pool path Docker's directory is bound
+from (22.5.1); `previous` names `<that path>.cbackup-old-<job>`. The helper
+resolves the path again at restore time and compares it with where the
+backup read it (`real` in `mounts.json`, `source` in `unit.json`): if it resolves anywhere else now,
+for example a share moved from the pool to the array, the restore in place
+is refused (`... resolves to ... now, but the backup read it at ...`) and
+nothing is staged. Restore to a new location then.
+
 **The mount root** comes back with the snapshot's owner, mode, times,
 xattrs and ACLs, like everything below it, not the staging directory's
 `0700`. Once swapped, an emptied `.cbackup-restore` the helper made is

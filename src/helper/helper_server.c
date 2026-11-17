@@ -113,7 +113,8 @@ typedef struct {
     int      used;
     char     token[HELPER_TOKEN_HEX + 1];
     char     unit[HELPER_UNIT_KEY_MAX + 1];
-    char     mount[HELPER_PATH_MAX + 1];
+    char     mount[HELPER_PATH_MAX + 1];  /* as recorded */
+    char     real[HELPER_PATH_MAX + 1];   /* where it is on the host: what is swapped (B178) */
     char     path[HELPER_PATH_MAX + 1];
     int64_t  job;
     int      swapped;         /* swapped in: kept for an undo until the slot is wanted */
@@ -1395,19 +1396,32 @@ static char *op_hook_wait(helper_server_t *s, const helper_req_t *r, int *pass_f
 /* Restore                                                             */
 /* ------------------------------------------------------------------ */
 
-/* Whether mount is a mount source of the unit in the helper's own inspect:
- * the one path the daemon names, never trusted otherwise. */
-/* Whether mount is the unit's in its own describe: 1 a tree, 2 a disk
+/*
+ * Whether mount is the unit's in its own describe: 1 a tree, 2 a disk
  * image (a BLOCK item's source), 3 a configuration file (a BLOB's source,
- * staged for vm.install_state, never swapped); 0 not the unit's. */
-static int unit_has_mount(const helper_backend_t *b, const char *uid, const char *mount)
+ * staged for vm.install_state, never swapped); 0 not the unit's. The path
+ * the daemon names is never trusted otherwise.
+ *
+ * real gets where the bytes are now (B178). A tree is recorded where the
+ * container binds it (/mnt/user/appdata/x, /var/lib/docker/volumes/v/_data)
+ * and its describe's source is the same path resolved through shfs,
+ * symlinks and host bind mounts (mounts.c), freshly, so that is what the
+ * domain, the staging and the swap must use. A disk or a file is its own
+ * real path.
+ */
+static int unit_has_mount(const helper_backend_t *b, const char *uid, const char *mount,
+                          char *real, size_t rsz)
 {
     sp_unit_desc_t *d = NULL;
+    snprintf(real, rsz, "%s", mount);
     if (b->ops->describe(b->ctx, uid, &d) != OK) { err_clear(); return 0; }
     int ok = 0;
     for (size_t i = 0; i < d->n_items && !ok; i++) {
         const sp_item_desc_t *it = &d->items[i];
-        if (it->kind == SP_ITEM_TREE && it->tree_path && strcmp(it->tree_path, mount) == 0) ok = 1;
+        if (it->kind == SP_ITEM_TREE && it->tree_path && strcmp(it->tree_path, mount) == 0) {
+            ok = 1;
+            if (it->source && it->source[0] == '/') snprintf(real, rsz, "%s", it->source);
+        }
         else if (it->kind == SP_ITEM_BLOCK && it->source && strcmp(it->source, mount) == 0) ok = 2;
         else if (it->kind == SP_ITEM_BLOB && it->source && strcmp(it->source, mount) == 0) ok = 3;
     }
@@ -1596,21 +1610,37 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     const helper_backend_t *b = NULL;
     if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
         return resp_error(r->id, e, "%s", why);
-    int kind = unit_has_mount(b, uid, r->mount);
+    char real[HELPER_PATH_MAX + 1];
+    int kind = unit_has_mount(b, uid, r->mount, real, sizeof(real));
     if (!kind)
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is not a mount of %s", r->mount, r->unit);
+    /* Where the backup read it must be where it is now: restoring the
+     * bytes of one directory over another that the same recorded path has
+     * come to mean (a share moved pools, Docker's directory moved) is not
+     * a restore in place. */
+    if (r->real[0] && strcmp(r->real, real) != 0) {
+        log_error("helper: %s of %s resolves to %s now, but the backup read it at %s; not staged",
+                  r->mount, r->unit, real, r->real);
+        return resp_error(r->id, HELPER_E_DENIED, "%.300s resolves to %.300s now, but the backup read it "
+                          "at %.300s; not restored in place. Restore it to a new location, or put the "
+                          "data back where it was", r->mount, real, r->real);
+    }
     /* The staging directory sits in the mount's own snapshot domain, so the
      * swap is a rename within one filesystem. */
     char droot[PATH_MAX] = "";
     const char *dom = NULL;
     if (b->mount_root) {
-        if (b->mount_root(b->ctx, r->mount, droot, sizeof(droot)) == OK) dom = droot;
+        if (b->mount_root(b->ctx, real, droot, sizeof(droot)) == OK) dom = droot;
         else err_clear();
     } else {
-        dom = helper_policy_dir_domain(s->pol, r->mount);
+        dom = helper_policy_dir_domain(s->pol, real);
     }
-    if (!dom || strcmp(dom, r->mount) == 0)
+    if (!dom || strcmp(dom, real) == 0) {
+        if (strcmp(real, r->mount) != 0)
+            return resp_error(r->id, HELPER_E_DENIED, "%.300s (on the host %.300s) is in no snapshot domain "
+                              "of the policy", r->mount, real);
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is in no snapshot domain of the policy", r->mount);
+    }
     /* One directory per staging: a VM's disks share a job and a domain. */
     char base[PATH_MAX], path[PATH_MAX], swhy[600], uniq[HELPER_TOKEN_HEX + 1], jname[64];
     if (helper_random_hex(uniq, 4) != OK) return resp_error(r->id, HELPER_E_FAILED, "no randomness");
@@ -1646,7 +1676,7 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     int other_fs = 0;
     if (!fail) {
         char parent[PATH_MAX];
-        if (snprintf(parent, sizeof(parent), "%.4000s", r->mount) >= (int)sizeof(parent)) parent[0] = '\0';
+        if (snprintf(parent, sizeof(parent), "%.4000s", real) >= (int)sizeof(parent)) parent[0] = '\0';
         char *sl = strrchr(parent, '/');
         if (sl && sl != parent) *sl = '\0';
         struct stat ps;
@@ -1659,7 +1689,7 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
         if (other_fs)
             return resp_error(r->id, HELPER_E_DENIED, "restore staging %.300s is on another filesystem "
                               "from %.300s, so the swap could not be a rename; set [snapshot] "
-                              "restore_staging_dirs to a directory on its filesystem", base, r->mount);
+                              "restore_staging_dirs to a directory on its filesystem", base, real);
         return resp_error(r->id, HELPER_E_FAILED, "restore staging %s: %s", path, fail);
     }
     pthread_mutex_lock(&s->mu);
@@ -1679,6 +1709,7 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
         slot->job = r->job;
         snprintf(slot->unit, sizeof(slot->unit), "%s", r->unit);
         snprintf(slot->mount, sizeof(slot->mount), "%s", r->mount);
+        snprintf(slot->real, sizeof(slot->real), "%s", real);
         snprintf(slot->path, sizeof(slot->path), "%s", path);
         snprintf(slot->base, sizeof(slot->base), "%s", base);
         snprintf(slot->job_name, sizeof(slot->job_name), "%s", jname);
@@ -1703,6 +1734,7 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     if (res) {
         cJSON_AddStringToObject(res, "staging", token);
         cJSON_AddStringToObject(res, "path", path);
+        cJSON_AddStringToObject(res, "real", real);
     }
     return resp_ok(r->id, res);
 }
@@ -1802,9 +1834,9 @@ static char *swap_undo(helper_server_t *s, const helper_req_t *r, const staging_
         code = HELPER_E_BUSY;
         goto out;
     }
-    snprintf(parent, sizeof(parent), "%s", st->mount);
+    snprintf(parent, sizeof(parent), "%s", st->real);
     char *sl = strrchr(parent, '/');
-    if (!sl || !sl[1]) { snprintf(why, sizeof(why), "%.300s has no parent", st->mount); code = HELPER_E_INVALID; goto out; }
+    if (!sl || !sl[1]) { snprintf(why, sizeof(why), "%.300s has no parent", st->real); code = HELPER_E_INVALID; goto out; }
     snprintf(name, sizeof(name), "%s", sl + 1);
     if (sl == parent) sl[1] = '\0'; else *sl = '\0';
     const char *on = strrchr(st->old, '/');
@@ -1843,7 +1875,7 @@ static char *swap_undo(helper_server_t *s, const helper_req_t *r, const staging_
         snprintf(why, sizeof(why), "put %.300s back: %s", st->old, strerror(err));
         goto out;
     }
-    if (fsync(pfd) != 0) log_warn("helper: undo of %s: %s could not be synced: %s", st->mount, parent, strerror(errno));
+    if (fsync(pfd) != 0) log_warn("helper: undo of %s: %s could not be synced: %s", st->real, parent, strerror(errno));
     close(pfd);
     if (jfd >= 0) close(jfd);
     close(bfd);
@@ -1854,6 +1886,7 @@ static char *swap_undo(helper_server_t *s, const helper_req_t *r, const staging_
     cJSON *res = cJSON_CreateObject();
     if (res) {
         cJSON_AddStringToObject(res, "mount", st->mount);
+        cJSON_AddStringToObject(res, "real", st->real);
         cJSON_AddStringToObject(res, "restored_copy", back);
     }
     return resp_ok(r->id, res);
@@ -1895,9 +1928,9 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     struct stat sb;
     char sdir[HELPER_PATH_MAX + 1];
     snprintf(sdir, sizeof(sdir), "%s", st.path);
-    snprintf(parent, sizeof(parent), "%s", st.mount);
+    snprintf(parent, sizeof(parent), "%s", st.real);
     char *sl = strrchr(parent, '/');
-    if (!sl || !sl[1]) { snprintf(why, sizeof(why), "%.300s has no parent", st.mount); code = HELPER_E_INVALID; goto refuse; }
+    if (!sl || !sl[1]) { snprintf(why, sizeof(why), "%.300s has no parent", st.real); code = HELPER_E_INVALID; goto refuse; }
     snprintf(name, sizeof(name), "%s", sl + 1);
     if (sl == parent) sl[1] = '\0'; else *sl = '\0';
     if (state < 0) { snprintf(why, sizeof(why), "cannot tell whether %s is running", st.unit); goto refuse; }
@@ -1927,7 +1960,7 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
         goto refuse;
     }
     if (fstatat(pfd, old, &sb, AT_SYMLINK_NOFOLLOW) == 0) {
-        snprintf(why, sizeof(why), "%.300s.cbackup-old-%lld already exists", st.mount, (long long)st.job);
+        snprintf(why, sizeof(why), "%.300s.cbackup-old-%lld already exists", st.real, (long long)st.job);
         code = HELPER_E_BUSY;
         goto refuse;
     }
@@ -1941,11 +1974,11 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
         /* One atomic step: the mount is the restored tree, and the old one
          * sits where the staging was; then it goes beside the mount. */
         if (rename_noreplace(src_fd, src_name, pfd, old) == 0) {
-            snprintf(prev, sizeof(prev), "%s.cbackup-old-%lld", st.mount, (long long)st.job);
+            snprintf(prev, sizeof(prev), "%s.cbackup-old-%lld", st.real, (long long)st.job);
         } else {
             snprintf(prev, sizeof(prev), "%s/%s", st.file == 2 ? st.path : st.base, src_name);
             old_aside = 0;
-            log_warn("helper: %s is swapped in; the previous copy stays at %s (%s)", st.mount, prev, strerror(errno));
+            log_warn("helper: %s is swapped in; the previous copy stays at %s (%s)", st.real, prev, strerror(errno));
         }
     } else if (errno == EINVAL || errno == ENOSYS) {
         /* No RENAME_EXCHANGE here: aside, then in, and back on failure. */
@@ -1958,15 +1991,15 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
             if (rename_noreplace(pfd, old, pfd, name) != 0) {
                 int e2 = errno;
                 log_error("helper: swap of %s failed and the original could not be put back; "
-                          "it is at %s.cbackup-old-%lld: %s", st.mount, st.mount, (long long)st.job, strerror(e2));
+                          "it is at %s.cbackup-old-%lld: %s", st.real, st.real, (long long)st.job, strerror(e2));
                 snprintf(why, sizeof(why), "swap in: %s; the original could not be put back and is at "
-                         "%.300s.cbackup-old-%lld (%s)", strerror(er), st.mount, (long long)st.job, strerror(e2));
+                         "%.300s.cbackup-old-%lld (%s)", strerror(er), st.real, (long long)st.job, strerror(e2));
                 goto refuse;
             }
             snprintf(why, sizeof(why), "swap in: %s", strerror(er));
             goto refuse;
         }
-        snprintf(prev, sizeof(prev), "%s.cbackup-old-%lld", st.mount, (long long)st.job);
+        snprintf(prev, sizeof(prev), "%s.cbackup-old-%lld", st.real, (long long)st.job);
     } else {
         snprintf(why, sizeof(why), "swap: %s", strerror(errno));
         goto refuse;
@@ -1999,6 +2032,7 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     cJSON *res = cJSON_CreateObject();
     if (res) {
         cJSON_AddStringToObject(res, "mount", st.mount);
+        cJSON_AddStringToObject(res, "real", st.real);
         if (prev[0]) cJSON_AddStringToObject(res, "previous", prev);
     }
     return resp_ok(r->id, res);
