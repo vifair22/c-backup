@@ -22,7 +22,9 @@ lxc-ls)
     [ "${1:-}" = "--version" ] && { echo "6.0.0-fake"; exit 0; }
     for d in "$P"/*/; do [ -f "$d/config" ] && basename "$d"; done ;;
 lxc-info) echo "State:          $(st)" ;;
-lxc-freeze) [ "$(st)" = RUNNING ] || { echo "$N is not running" >&2; exit 1; }; echo FROZEN > "$S/lxc-$N" ;;
+lxc-freeze) [ "$(st)" = RUNNING ] || { echo "$N is not running" >&2; exit 1; }
+    # lxc-<name>.thaw: the freeze is undone at once, as a watchdog's thaw would.
+    [ -e "$S/lxc-$N.thaw" ] || echo FROZEN > "$S/lxc-$N" ;;
 lxc-unfreeze) [ "$(st)" = FROZEN ] || { echo "$N is not frozen" >&2; exit 1; }; echo RUNNING > "$S/lxc-$N" ;;
 lxc-start) echo RUNNING > "$S/lxc-$N" ;;
 lxc-stop) echo STOPPED > "$S/lxc-$N" ;;
