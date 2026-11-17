@@ -528,6 +528,168 @@ static void test_prune_unlinks_the_record_after_the_commit_is_durable(void **sta
     rmrf(PRUNE_DIR);
 }
 
+/* ------------------------------------------------------------------ */
+/* A backup's pack commit, in batches (B144)                           */
+/* ------------------------------------------------------------------ */
+
+#define SPLIT_DIR  TEST_TMP "/c_backup_test_powercut_split"
+#define SPLIT_REPO TEST_REPO   /* inside the disk model's reach */
+
+static cutils_db_t   *g_sdb;
+static store_index_t *g_sidx;
+static int64_t        g_srepo;
+
+static status_t split_gate(void)
+{
+    if (!step()) return set_error(ERR_IO, "power cut");
+    return OK;
+}
+
+/* Knows nothing, so a write stores an object the index already has again:
+ * the duplicate whose row the commit has to move. */
+static status_t locate_nothing(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
+                               store_location_t *out)
+{
+    (void)user; (void)hash; (void)out;
+    return set_error(ERR_NOT_FOUND, "not found");
+}
+
+static long long split_count(const char *sql)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)g_srepo);
+    db_result_t *r = NULL;
+    long long v = -1;
+    if (db_execute(g_sdb, sql, (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        v = atoll(r->rows[0][0]);
+    db_result_free(r);
+    return v;
+}
+
+static void split_fresh(void)
+{
+    model_stop();
+    store_index_set_commit_gate(NULL);
+    store_index_set_pack_batch_rows(0);
+    if (store) { store_close(store); store = NULL; }
+    if (g_sidx) { store_index_free(g_sidx); g_sidx = NULL; }
+    if (g_sdb) { db_close(g_sdb); g_sdb = NULL; }
+    for (size_t i = 0; i < nobj; i++) { free(datas[i]); datas[i] = NULL; }
+    nobj = 0;
+    rmrf(TEST_REPO);
+    rmrf(GRAVE);
+    rmrf(SPLIT_DIR);
+    assert_int_equal(mkdir(GRAVE, 0700), 0);
+    assert_int_equal(mkdir(SPLIT_DIR, 0700), 0);
+    assert_int_equal(db_open(&g_sdb, SPLIT_DIR "/state.db"), 0);
+    assert_int_equal(db_run_lib_migrations(g_sdb), 0);
+    assert_int_equal(db_run_compiled_migrations(g_sdb, app_migrations), 0);
+    assert_int_equal(repo_register(g_sdb, SPLIT_REPO, "split", &g_srepo), OK);
+    assert_int_equal(store_open(SPLIT_REPO, NULL, &store), OK);
+    assert_int_equal(store_index_bind(store, g_sdb, g_srepo, &g_sidx), OK);
+}
+
+/* The new pack, written and committed under the model: the duplicate of
+ * object `dup` and `fresh` new objects, each new row its own batch. */
+static void split_op(size_t dup, size_t first, size_t fresh)
+{
+    store_set_locate_cb(store, locate_nothing, NULL);
+    store_index_set_pack_batch_rows(1);
+    store_index_set_commit_gate(split_gate);
+    uint8_t h[OBJECT_HASH_SIZE];
+    (void)object_store(store, OBJECT_TYPE_FILE, datas[dup], lens[dup], h);
+    for (size_t i = first; i < first + fresh; i++)
+        (void)object_store(store, OBJECT_TYPE_FILE, datas[i], lens[i], h);
+    (void)object_store_flush(store);
+    store_index_set_commit_gate(NULL);
+    store_index_set_pack_batch_rows(0);
+    err_clear();
+}
+
+static size_t split_build_fresh(size_t fresh)
+{
+    size_t first = nobj;
+    for (size_t k = 0; k < fresh; k++) {
+        size_t i = nobj++;
+        lens[i] = 1500 + (i * 613) % 9000;
+        datas[i] = malloc(lens[i]);
+        assert_non_null(datas[i]);
+        fill(datas[i], lens[i], (uint32_t)(0xB144 + i * 7919));
+        object_name(OBJECT_TYPE_FILE, datas[i], lens[i], hashes[i]);
+    }
+    return first;
+}
+
+/*
+ * A backup's pack, committed as new rows in batches and the packs row last,
+ * with one entry replacing a mapping readers use. A cut at every step of
+ * writing and committing it - the pack file's sync, its rename, each batch,
+ * the marker - and then what a restart does: reopen, drop the rows of a
+ * commit that never reached its marker. Every object readable before is
+ * readable after, and nothing names a pack that has no packs row. The
+ * index keeps every commit made before the cut, the worst case B142 is
+ * about: commits durable ahead of the files they name.
+ */
+static void test_split_pack_commit_survives_every_cut(void **state)
+{
+    (void)state;
+    const size_t base = 4, fresh = 4, dup = 1;
+    int total = 0;
+    for (int k = 0; ; k++) {
+        split_fresh();
+        pack_of(base);                        /* objects 0..3, committed */
+        sync();
+        size_t first = split_build_fresh(fresh);   /* 4..7, named, not stored */
+        model_start(k);
+        split_op(dup, first, fresh);
+        if (k == 0) {
+            model_stop();
+            total = g_steps;
+            assert_true(total > (int)fresh);  /* several commits to cut between */
+            continue;
+        }
+        model_crash();
+
+        /* The restart. */
+        store_close(store);
+        store = NULL;
+        store_index_free(g_sidx);
+        g_sidx = NULL;
+        assert_int_equal(store_index_drop_unannounced(g_sdb, g_srepo), OK);
+        assert_int_equal(store_index_drop_staged(g_sdb, g_srepo), OK);
+        assert_int_equal(store_open(SPLIT_REPO, NULL, &store), OK);
+        assert_int_equal(store_index_bind(store, g_sdb, g_srepo, &g_sidx), OK);
+
+        for (size_t i = 0; i < base; i++) {
+            void *out = NULL;
+            size_t len = 0;
+            if (object_load(store, hashes[i], &out, &len, NULL) != OK)
+                fail_msg("cut at step %d of %d: object %zu, readable before, is not: %s",
+                         k, total, i, err_msg());
+            assert_int_equal(len, lens[i]);
+            assert_memory_equal(out, datas[i], len);
+            free(out);
+        }
+        assert_int_equal(split_count(
+            "SELECT COUNT(*) FROM pack_objects po WHERE po.repo_id = ? AND NOT EXISTS"
+            " (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id AND p.id = po.pack_id)"), 0);
+        assert_int_equal(split_count(
+            "SELECT COUNT(*) FROM objects o WHERE o.repo_id = ?"
+            " AND o.location NOT IN ('staged', 'absent') AND NOT EXISTS"
+            " (SELECT 1 FROM packs p WHERE p.repo_id = o.repo_id"
+            " AND CAST(p.id AS TEXT) = o.location)"), 0);
+        if (k > total) break;
+    }
+    split_fresh();
+    store_close(store);
+    store = NULL;
+    store_index_free(g_sidx);
+    g_sidx = NULL;
+    db_close(g_sdb);
+    g_sdb = NULL;
+    rmrf(SPLIT_DIR);
+}
+
 static int teardown(void **state)
 {
     (void)state;
@@ -548,6 +710,7 @@ int main(void)
         cmocka_unit_test_teardown(test_salvage_survives_every_cut, teardown),
         cmocka_unit_test_teardown(test_prune_unlinks_the_record_after_the_commit_is_durable,
                                   teardown),
+        cmocka_unit_test_teardown(test_split_pack_commit_survives_every_cut, teardown),
     };
     return cmocka_run_group_tests_name("powercut", tests, NULL, NULL);
 }

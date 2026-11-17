@@ -94,6 +94,110 @@ static status_t db_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
  * db_txn.h.
  */
 
+/*
+ * The rows of one pack entry, as strings for the db layer.
+ */
+typedef struct {
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    char off[32], comp[32], orig[32], eidx[16], type[8];
+} entry_args_t;
+
+static void entry_args(const pack_commit_entry_t *e, entry_args_t *a)
+{
+    hash_to_hex(e->hash, a->hex);
+    snprintf(a->off,  sizeof(a->off),  "%llu", (unsigned long long)e->offset);
+    snprintf(a->comp, sizeof(a->comp), "%llu", (unsigned long long)e->comp_size);
+    snprintf(a->orig, sizeof(a->orig), "%llu", (unsigned long long)e->orig_size);
+    snprintf(a->eidx, sizeof(a->eidx), "%u", e->entry_index);
+    snprintf(a->type, sizeof(a->type), "%u", e->type);
+}
+
+/* No size limit: a batch ends only for a queued writer, so a pack nobody
+ * waits behind is one transaction, as it always was (OWN-16: the commits a
+ * backup adds are bounded by foreign transactions, not by its own size).
+ * Tests set a limit to give a small pack several commits. */
+#define PACK_COMMIT_BATCH UINT32_MAX
+static uint32_t g_pack_batch_rows = PACK_COMMIT_BATCH;
+static status_t (*g_commit_gate)(void);
+
+void store_index_set_pack_batch_rows(uint32_t rows)
+{
+    g_pack_batch_rows = rows ? rows : PACK_COMMIT_BATCH;
+}
+
+void store_index_set_commit_gate(status_t (*gate)(void))
+{
+    g_commit_gate = gate;
+}
+
+/* The test's power cut: the commit that would come next never happens, and
+ * neither does anything after it, cleanup included. */
+static int cut_before_commit(void)
+{
+    return g_commit_gate && g_commit_gate() != OK;
+}
+
+/*
+ * Rows a pack commit wrote without reaching its packs row: back to what they
+ * were before it began. Object rows go back to 'staged' rather than away,
+ * because the only rows the new-row phase writes are new ones and staged
+ * ones (see db_pack_commit); 'staged' is what a failed commit always left,
+ * and what start-up drops.
+ */
+static void drop_unannounced(store_index_t *idx, const char *repo, const char *pack)
+{
+    if (db_txn_begin(idx->db) != OK) {
+        log_error("pack commit: cannot begin cleanup of pack %s", pack);
+        return;
+    }
+    int failed =
+        db_execute_non_query(idx->db,
+            "UPDATE objects SET location = 'staged' WHERE repo_id = ? AND location = ?"
+            " AND NOT EXISTS (SELECT 1 FROM packs WHERE repo_id = ? AND id = ?)",
+            (const char *[]){ repo, pack, repo, pack, NULL }, NULL) != 0 ||
+        db_execute_non_query(idx->db,
+            "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?"
+            " AND NOT EXISTS (SELECT 1 FROM packs WHERE repo_id = ? AND id = ?)",
+            (const char *[]){ repo, pack, repo, pack, NULL }, NULL) != 0;
+    if (failed) {
+        db_txn_rollback(idx->db);
+        log_error("pack commit: cannot clean up pack %s; a restart does", pack);
+        return;
+    }
+    if (db_txn_commit(idx->db) != OK)
+        log_error("pack commit: cleanup of pack %s did not commit; a restart does", pack);
+}
+
+/*
+ * A pack's rows land in two phases, so the lock is not held across a whole
+ * pack while somebody waits (B144). A pack of 2,000 small objects was one
+ * transaction of 6,000 statements: 107 ms on an idle host, 716 ms with the
+ * CPU contended, and the commonest thing a tag or sources write queued
+ * behind during a backup, against Manual 6.3's "well under a second".
+ *
+ *   - New rows, in batches that end for a queued writer by the shared batch
+ *     rules (db_txn_batch_should_end): a pack_objects row for a hash that
+ *     has none, and an objects row that is new or still 'staged'. Neither
+ *     can be read yet: the resolver joins packs, and this pack has no packs
+ *     row. A staged object is not readable either, so moving it changes
+ *     nothing a reader could see.
+ *   - The visibility marker, last and in one transaction: the packs row,
+ *     together with every row the first phase set aside because it would
+ *     have replaced a mapping that a reader can use now - a hash already
+ *     indexed in another pack (gc, coalescing, salvage, a duplicate), or an
+ *     object recorded at another location. Moving one of those before the
+ *     marker would make a readable object unfindable until it lands, and a
+ *     cut in between would lose the old mapping for good. gc, coalescing
+ *     and salvage replace every row they write, so their commit is this one
+ *     transaction, as it always was.
+ *
+ * Batches commit in order and so does the marker after them, so a power cut
+ * keeps a prefix: rows without their packs row, or everything. Start-up
+ * (store_index_drop_unannounced) and a failure here put the former back to
+ * the state a lost single transaction left: the installed pack file and no
+ * rows for it. B142's ordering holds, because the marker is this callback's
+ * last commit and index_sync runs after it returns.
+ */
 static void db_pack_commit(void *user, const pack_commit_info_t *info)
 {
     store_index_t *idx = user;
@@ -103,76 +207,114 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
     snprintf(size, sizeof(size), "%llu", (unsigned long long)info->size);
     snprintf(ver,  sizeof(ver),  "%u",   PACK_VERSION);
 
-    /*
-     * One transaction for the pack row and all of its object rows. A partial
-     * insert would leave objects that the resolver cannot find even though
-     * their bytes are on disk, which reads as data loss.
-     *
-     * The pack file is already installed by the time this runs; that ordering
-     * is deliberate and explained in daemonization-spec.md section 12.
-     */
-    if (db_txn_begin(idx->db) != OK) {
-        log_error("pack commit: cannot begin transaction for pack %s", pack);
+    /* Per entry: bit 0, its pack_objects row is for the marker; bit 1, its
+     * objects row is. */
+    uint8_t *later = calloc(info->entry_count ? info->entry_count : 1, 1);
+    if (!later) {
+        log_error("pack commit: out of memory for pack %s", pack);
         return;
     }
 
-    int failed = 0;
-    if (db_execute_non_query(idx->db,
-            "INSERT OR REPLACE INTO packs (repo_id, id, filename, size, sealed_at, version)"
-            " VALUES (?, ?, ?, ?, strftime('%s','now'), ?)",
-            (const char *[]){ repo, pack, info->filename, size, ver, NULL }, NULL) != 0)
-        failed = 1;
-
+    db_txn_batch_t batch;
+    memset(&batch, 0, sizeof(batch));
+    int in_txn = 0, failed = 0, wrote = 0;
+    uint32_t rows = 0;
     for (uint32_t i = 0; !failed && i < info->entry_count; i++) {
-        char hex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_to_hex(info->entries[i].hash, hex);
-        char off[32], comp[32], orig[32], eidx[16];
-        snprintf(off,  sizeof(off),  "%llu", (unsigned long long)info->entries[i].offset);
-        snprintf(comp, sizeof(comp), "%llu", (unsigned long long)info->entries[i].comp_size);
-        snprintf(orig, sizeof(orig), "%llu", (unsigned long long)info->entries[i].orig_size);
-        snprintf(eidx, sizeof(eidx), "%u", info->entries[i].entry_index);
+        if (!in_txn) {
+            if (db_txn_begin(idx->db) != OK) { failed = 1; break; }
+            in_txn = 1;
+            rows = 0;
+            db_txn_batch_opened(&batch);
+        }
+        entry_args_t a;
+        entry_args(&info->entries[i], &a);
 
+        int n = 0;
         if (db_execute_non_query(idx->db,
-                "INSERT OR REPLACE INTO pack_objects"
+                "INSERT INTO pack_objects"
                 " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (const char *[]){ repo, hex, pack, off, comp, orig, eidx, NULL },
-                NULL) != 0)
-            failed = 1;
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(repo_id, hash) DO NOTHING",
+                (const char *[]){ repo, a.hex, pack, a.off, a.comp, a.orig, a.eidx, NULL },
+                &n) != 0) { failed = 1; break; }
+        if (n == 0) later[i] |= 1;
 
         /*
          * The object moved from staged to installed, so its location and
          * footprint become the pack's. phys_size is the bytes it occupies
          * inside the pack; the pack's own headers and parity trailer are
-         * charged to packs.size rather than split across its entries, so total
-         * bytes on disk is sum(packs.size).
+         * charged to packs.size rather than split across its entries, so
+         * total bytes on disk is sum(packs.size).
          *
-         * Inserted when there is no row yet. A row written after the commit
+         * Created when there is no row yet: a row written after the commit
          * would stay 'staged', be dropped by the next backup, and leave an
-         * object compaction reads as dead; creating it here, in the same
-         * transaction as the pack's rows, means no writer has to win a race
-         * against its own seal (a backup's file workers record no rows of
-         * their own). An existing row keeps its type and refcount.
+         * object compaction reads as dead. An existing row keeps its type
+         * and refcount.
          */
-        char t[8];
-        snprintf(t, sizeof(t), "%u", info->entries[i].type);
-        if (!failed && db_execute_non_query(idx->db,
+        n = 0;
+        if (db_execute_non_query(idx->db,
+                "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
+                "                     location, type)"
+                " VALUES (?, ?, 0, ?, ?, ?, ?)"
+                " ON CONFLICT(repo_id, hash) DO UPDATE SET location = excluded.location,"
+                "   phys_size = excluded.phys_size, orig_size = excluded.orig_size"
+                " WHERE objects.location = 'staged'",
+                (const char *[]){ repo, a.hex, a.comp, a.orig, pack, a.type, NULL },
+                &n) != 0) { failed = 1; break; }
+        if (n == 0) later[i] |= 2;
+        /* An entry with both rows set aside wrote nothing, so it does not
+         * count towards a batch; a queued writer still ends one. */
+        if (later[i] != 3) { wrote = 1; rows++; }
+
+        if (rows >= g_pack_batch_rows || db_txn_batch_should_end(&batch)) {
+            if (cut_before_commit()) { db_txn_rollback(idx->db); free(later); return; }
+            in_txn = 0;
+            if (db_txn_commit(idx->db) != OK) { failed = 1; break; }
+        }
+    }
+
+    /* The marker, with the rows that replace what readers use now. */
+    if (!failed && !in_txn) {
+        if (db_txn_begin(idx->db) != OK) failed = 1;
+        else in_txn = 1;
+    }
+    if (!failed && db_execute_non_query(idx->db,
+            "INSERT OR REPLACE INTO packs (repo_id, id, filename, size, sealed_at, version)"
+            " VALUES (?, ?, ?, ?, strftime('%s','now'), ?)",
+            (const char *[]){ repo, pack, info->filename, size, ver, NULL }, NULL) != 0)
+        failed = 1;
+    for (uint32_t i = 0; !failed && i < info->entry_count; i++) {
+        if (!later[i]) continue;
+        entry_args_t a;
+        entry_args(&info->entries[i], &a);
+        if ((later[i] & 1) && db_execute_non_query(idx->db,
+                "INSERT OR REPLACE INTO pack_objects"
+                " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (const char *[]){ repo, a.hex, pack, a.off, a.comp, a.orig, a.eidx, NULL },
+                NULL) != 0)
+            failed = 1;
+        if (!failed && (later[i] & 2) && db_execute_non_query(idx->db,
                 "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
                 "                     location, type)"
                 " VALUES (?, ?, 0, ?, ?, ?, ?)"
                 " ON CONFLICT(repo_id, hash) DO UPDATE SET location = excluded.location,"
                 "   phys_size = excluded.phys_size, orig_size = excluded.orig_size",
-                (const char *[]){ repo, hex, comp, orig, pack, t, NULL }, NULL) != 0)
+                (const char *[]){ repo, a.hex, a.comp, a.orig, pack, a.type, NULL },
+                NULL) != 0)
             failed = 1;
     }
+    free(later);
 
-    if (failed) {
-        db_txn_rollback(idx->db);
-        log_error("pack commit: rolled back pack %s (%u objects)", pack, info->entry_count);
-        return;
+    if (!failed) {
+        if (cut_before_commit()) { db_txn_rollback(idx->db); return; }
+        if (db_txn_commit(idx->db) == OK) return;
+        in_txn = 0;
+        failed = 1;
     }
-    if (db_txn_commit(idx->db) != OK)
-        log_error("pack commit: commit failed for pack %s", pack);
+    if (in_txn) db_txn_rollback(idx->db);
+    log_error("pack commit: pack %s (%u objects) did not commit", pack, info->entry_count);
+    if (wrote) drop_unannounced(idx, repo, pack);
 }
 
 /*
@@ -333,6 +475,41 @@ status_t store_index_put_staged(cutils_db_t *db, int64_t repo_id,
                                 uint8_t type, uint64_t phys_size, uint64_t orig_size)
 {
     return put_object(db, repo_id, hash, type, phys_size, orig_size, "staged");
+}
+
+/*
+ * Rows of a pack commit that never reached its packs row, from a crash
+ * between its batches: put back to what a lost single transaction left
+ * (db_pack_commit). Only packs with such pack_objects rows are touched, so
+ * an objects row naming a pack for any other reason is left to reindex as
+ * before. Runs before store_index_drop_staged, which then drops the rows
+ * this returns to 'staged'.
+ */
+status_t store_index_drop_unannounced(cutils_db_t *db, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    const char *only = repo_id > 0 ? " AND po.repo_id = ?" : "";
+    char upd[512], del[256];
+    snprintf(upd, sizeof(upd),
+             "UPDATE objects SET location = 'staged' WHERE location IN"
+             " (SELECT DISTINCT CAST(po.pack_id AS TEXT) FROM pack_objects po"
+             "   WHERE po.repo_id = objects.repo_id%s AND NOT EXISTS"
+             "   (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id AND p.id = po.pack_id))",
+             only);
+    snprintf(del, sizeof(del),
+             "DELETE FROM pack_objects AS po WHERE NOT EXISTS"
+             " (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id AND p.id = po.pack_id)%s",
+             only);
+    const char *p1[] = { repo, NULL };
+    if (db_txn_begin(db) != OK) return set_error(ERR_IO, "cannot drop unannounced pack rows");
+    if (db_execute_non_query(db, upd, repo_id > 0 ? p1 : NULL, NULL) != 0 ||
+        db_execute_non_query(db, del, repo_id > 0 ? p1 : NULL, NULL) != 0) {
+        db_txn_rollback(db);
+        return set_error(ERR_IO, "cannot drop unannounced pack rows");
+    }
+    if (db_txn_commit(db) != OK) return set_error(ERR_IO, "cannot drop unannounced pack rows");
+    return OK;
 }
 
 status_t store_index_drop_staged(cutils_db_t *db, int64_t repo_id)
