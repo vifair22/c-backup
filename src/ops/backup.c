@@ -1198,6 +1198,41 @@ static status_t store_source_cdc(pipeline_t *p, batch_t *b, const cdc_source_t *
     return st;
 }
 
+/* An incremental store of a disk (vm-backup.md 5.3): the same sink and
+ * pack handling as a full one, the base's lists read from the store. */
+static status_t store_delta_cdc(pipeline_t *p, batch_t *b, const cdc_source_t *src,
+                                uint64_t size, const backup_synth_method_t *how,
+                                cdc_result_t *out)
+{
+    const cdc_params_t *cp = store_cdc(p->store);
+    if (!cp)
+        return set_error(ERR_INVALID, "repository is encrypted and no key is "
+                         "loaded: its chunk boundaries need the key");
+    if (size == CDC_SIZE_STREAM || size == 0)
+        return set_error(ERR_INVALID, "backup: an incremental needs a disk of known size");
+    int large = size > OBJECT_MAX_BYTES;
+    int may_seal = large && pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES);
+    if (may_seal) batch_close(p, b);
+    obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
+    obj_loader_t ld = obj_loader_store(p->store);
+    cdc_opts_t o = {
+        .workers = large ? p->cdc_w : NULL,
+        .cancel = p->opts ? p->opts->cancel : NULL,
+        .cancelled = store_cancelled_cb,
+        .cancelled_ctx = p->store,
+        .progress = store_bytes,
+        .progress_ctx = p,
+    };
+    cdc_delta_result_t dr;
+    p->sink->may_rollover = may_seal;
+    status_t st = cdc_store_delta(cp, &ld, how->base, src, size, how->changed, how->changed_ctx,
+                                  &sink, &o, &dr);
+    p->sink->may_rollover = 0;
+    *out = dr.r;
+    if (how->delta) *how->delta = dr;
+    return st;
+}
+
 /*
  * Every synthetic entry, in the order the caller gave them, before any
  * regular file: the caller's last entry (unit.json) describes what the
@@ -1239,13 +1274,28 @@ static status_t store_synth_all(pipeline_t *p)
         e->node.size = stream ? 0 : size;
         e->st.st_size = stream ? 0 : (off_t)size;
 
+        backup_synth_method_t how;
+        memset(&how, 0, sizeof(how));
+        if (o->synth_ops->method && (st = o->synth_ops->method(o->synth_ops->ctx, k, &how)) != OK) {
+            if (o->synth_ops->close) o->synth_ops->close(o->synth_ops->ctx, k, st, NULL);
+            break;
+        }
         cdc_result_t cr;
         memset(&cr, 0, sizeof(cr));
         batch_open(p, b);
         p->file_bytes = 0;
         p->file_size = stream ? 0 : size;
         p->file_index = i;
-        st = store_source_cdc(p, b, &src, size, &cr);
+        if (how.how == BACKUP_SYNTH_REUSE && !stream) {
+            /* Provably the base's content: nothing read, nothing stored. */
+            memcpy(cr.hash, how.base, OBJECT_HASH_SIZE);
+            cr.size = size;
+            st = OK;
+        } else if (how.how == BACKUP_SYNTH_DELTA) {
+            st = store_delta_cdc(p, b, &src, size, &how, &cr);
+        } else {
+            st = store_source_cdc(p, b, &src, size, &cr);
+        }
         p->file_bytes = 0;
         p->res->objects_new  += cr.chunks_new + cr.lists.lists_new;
         p->res->bytes_stored += cr.phys_new;

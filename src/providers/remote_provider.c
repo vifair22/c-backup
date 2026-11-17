@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "remote_provider.h"
+#include "disk_stream.h"
 #include "fake_provider.h"
 #include "helper_proto.h"
 #include "registry.h"
@@ -43,8 +44,54 @@ struct sp_session {
     struct { char hook[72]; char run[HELPER_TOKEN_HEX + 1]; char *log; size_t log_len; } dumps[4];
     size_t            n_dumps;
     cJSON            *roots;       /* read_roots */
+    cJSON            *blocks;      /* where each disk is read: a file or an NBD export */
+    int               vm;          /* begun with vm.backup_begin: ended with vm.backup_end */
     sp_session_info_t info;
 };
+
+/* Whether the daemon asked for an incremental of this item: only then is a
+ * plan saying incremental taken at its word. */
+static int asked_incremental(const sp_begin_req_t *req, const char *item)
+{
+    for (size_t i = 0; req && i < req->n_bases; i++)
+        if (req->bases[i].item_id && strcmp(req->bases[i].item_id, item) == 0) return 1;
+    return 0;
+}
+
+/*
+ * vm.backup_begin's arguments (source-providers.md 11.3) from a begin
+ * request: every disk of the unit, "incremental" for those that take part
+ * in the chain (vm-backup.md 5.8: covered by the new checkpoint, read
+ * against base where base covers them), "full" for the rest; base is the
+ * chain's checkpoint, or the token to retire when no disk takes part.
+ */
+static cJSON *vm_begin_args(const struct sp_ctx *c, const sp_unit_desc_t *unit, const sp_begin_req_t *req)
+{
+    cJSON *a = cJSON_CreateObject();
+    if (!a) return NULL;
+    char key[HELPER_UNIT_KEY_MAX + 1];
+    snprintf(key, sizeof(key), "%s:%s", c->provider, unit->unit_id);
+    cJSON_AddStringToObject(a, "unit", key);
+    cJSON *d = cJSON_AddArrayToObject(a, "disks");
+    const char *base = NULL;
+    for (size_t i = 0; d && i < unit->n_items; i++) {
+        const sp_item_desc_t *it = &unit->items[i];
+        if (it->kind != SP_ITEM_BLOCK) continue;
+        cJSON *o = cJSON_CreateObject();
+        if (!o) break;
+        cJSON_AddItemToArray(d, o);
+        cJSON_AddStringToObject(o, "target", it->id);
+        int inc = asked_incremental(req, it->id);
+        cJSON_AddStringToObject(o, "mode", inc ? "incremental" : "full");
+    }
+    for (size_t i = 0; req && i < req->n_bases && !base; i++)
+        if (req->bases[i].base_token && *req->bases[i].base_token) base = req->bases[i].base_token;
+    if (!base && req && req->retire_token && *req->retire_token) base = req->retire_token;
+    if (base) cJSON_AddStringToObject(a, "base", base);
+    else cJSON_AddNullToObject(a, "base");
+    cJSON_AddStringToObject(a, "freeze", "auto");
+    return a;
+}
 
 static remote_hello_t g_hello;
 static atomic_long    g_req_id;
@@ -339,6 +386,7 @@ static void session_free(struct sp_session *s)
     if (!s) return;
     cJSON_Delete(s->desc);
     cJSON_Delete(s->roots);
+    cJSON_Delete(s->blocks);
     if (s->blob_fd >= 0) close(s->blob_fd);
     if (s->late_fd >= 0) close(s->late_fd);
     cJSON_Delete(s->late);
@@ -361,7 +409,17 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     status_t st = rcall_fd(c->socket, "units.describe", args_unit(c, unit->unit_id), &s->desc,
                            &s->blob_fd);
     cJSON *res = NULL;
-    if (st == OK) {
+    /* A VM is begun as a VM backup, so the helper builds the checkpoint
+     * and the backup XML from typed fields (11.3); a disk-less VM has
+     * nothing for it to back up and goes as a capture. */
+    int nblk = 0;
+    for (size_t i = 0; i < unit->n_items; i++) nblk += unit->items[i].kind == SP_ITEM_BLOCK;
+    s->vm = strcmp(c->provider, "libvirt") == 0 && nblk > 0 && nblk <= HELPER_DISKS_MAX;
+    if (st == OK && s->vm) {
+        cJSON *a = vm_begin_args(c, unit, req);
+        st = a ? rcall_fd(c->socket, "vm.backup_begin", a, &res, &s->late_fd)
+               : set_error(ERR_NOMEM, "helper: vm.backup_begin");
+    } else if (st == OK) {
         cJSON *a = cJSON_CreateObject();
         cJSON *u = a ? cJSON_AddArrayToObject(a, "units") : NULL;
         char key[HELPER_UNIT_KEY_MAX + 1];
@@ -379,6 +437,7 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(s->token, sizeof(s->token), "%s", tok);
         s->roots = cJSON_DetachItemFromObjectCaseSensitive((cJSON *)(uintptr_t)m, "read_roots");
         s->late = cJSON_DetachItemFromObjectCaseSensitive((cJSON *)(uintptr_t)m, "late_blobs");
+        s->blocks = cJSON_DetachItemFromObjectCaseSensitive((cJSON *)(uintptr_t)m, "blocks");
         s->info.achieved = (sp_consistency_t)num(m, "achieved");
         s->info.consist_flags = (uint32_t)num(m, "flags");
         s->info.freeze_ms = num(m, "freeze_ms");
@@ -397,14 +456,26 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
             if (st != OK) break;
             const char *item = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(p, "item"));
             const char *why = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(p, "reason"));
+            int mode = (int)num(p, "mode");
             for (size_t k = 0; item && k < unit->n_items; k++) {
                 if (strcmp(unit->items[k].id, item) != 0) continue;
                 sp_item_plan_t *x = &s->info.plans[s->info.n_plans++];
                 x->item_id = unit->items[k].id;
-                x->mode = SP_READ_FULL;
-                x->reason = str_or(sp_reason_canonical(why), "forced");
+                x->mode = mode == SP_READ_INCREMENTAL && asked_incremental(req, item) ? SP_READ_INCREMENTAL : SP_READ_FULL;
+                x->reason = str_or(sp_reason_canonical(why), x->mode == SP_READ_INCREMENTAL ? "incremental" : "forced");
                 break;
             }
+        }
+        /* The checkpoint this session made, to bind if it commits, and its
+         * XML as the helper stored it. Grammar-checked: it goes back to the
+         * helper as a base, which it accepts only if it is its own. */
+        const char *nt = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "new_token"));
+        const char *nb = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "token_blob"));
+        if (st == OK && nt && *nt) {
+            if (strlen(nt) > HELPER_NAME_MAX || strspn(nt, "abcdefghijklmnopqrstuvwxyz0123456789-") != strlen(nt))
+                st = set_error(ERR_IO, "helper: a malformed checkpoint name");
+            else if (!(s->info.new_token = strdup(nt))) st = set_error(ERR_NOMEM, "helper: token");
+            if (st == OK && nb && !(s->info.new_token_blob = strdup(nb))) st = set_error(ERR_NOMEM, "helper: token");
         }
         if (st == OK && req && s->info.achieved < req->require)
             st = set_error(ERR_INVALID, "unit %s: achieved %s, below the required %s",
@@ -416,7 +487,12 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
             snprintf(why, sizeof(why), "%.500s", err_msg());
             cJSON *ea = cJSON_CreateObject();
             if (ea) cJSON_AddStringToObject(ea, "capture", s->token);
-            (void)rcall(c->socket, "capture.end", ea, NULL);
+            if (s->vm && ea) {
+                cJSON_DeleteItemFromObjectCaseSensitive(ea, "capture");
+                cJSON_AddStringToObject(ea, "session", s->token);
+                cJSON_AddStringToObject(ea, "outcome", "aborted");
+            }
+            (void)rcall(c->socket, s->vm ? "vm.backup_end" : "capture.end", ea, NULL);
             set_error(st, "%s", why);
         }
     }
@@ -511,6 +587,20 @@ static status_t r_blob_read(sp_session_t *s, const sp_item_desc_t *item, void **
 
 static status_t r_block_open(sp_session_t *s, const sp_item_desc_t *item, sp_block_stream_t *out)
 {
+    /* Where the helper said this disk is read (vm-backup.md 2.3, 2.4): the
+     * image itself, through the daemon's read-only mount, or an NBD export
+     * on a socket in the shared directory. */
+    const cJSON *rp = cJSON_GetObjectItemCaseSensitive(s->blocks, item->id);
+    if (rp) {
+        const char *kind = jstr(rp, "kind");
+        if (strcmp(kind, "file") == 0 && jstr(rp, "path")[0] == '/')
+            return disk_stream_file(jstr(rp, "path"), item->size, cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(rp, "offline")), out);
+        if (strcmp(kind, "nbd") == 0 && jstr(rp, "socket")[0] == '/')
+            return disk_stream_nbd(jstr(rp, "socket"), jstr(rp, "export"), item->size,
+                                   jstr(rp, "watch")[0] == '/' ? jstr(rp, "watch") : NULL,
+                                   jstr(rp, "bitmap")[0] ? jstr(rp, "bitmap") : NULL, NULL, out);
+        return set_error(ERR_IO, "helper: no usable read path for disk %s", item->id);
+    }
     if (strcmp(s->ctx->provider, "fake") != 0)
         return set_error(ERR_INVALID, "helper: no data plane for %s disks in this build", s->ctx->provider);
     const cJSON *fk = cJSON_GetObjectItemCaseSensitive(item_json(s, item->id), "fake");
@@ -666,6 +756,7 @@ static status_t r_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
         g->refs++;
         s->roots = cJSON_DetachItemFromObjectCaseSensitive(m, "read_roots");
         s->late = cJSON_DetachItemFromObjectCaseSensitive(m, "late_blobs");
+        s->blocks = cJSON_DetachItemFromObjectCaseSensitive(m, "blocks");
         if (late >= 0) s->late_fd = fcntl(late, F_DUPFD_CLOEXEC, 0);
         s->info.achieved = (sp_consistency_t)num(m, "achieved");
         s->info.consist_flags = (uint32_t)num(m, "flags");
@@ -704,7 +795,7 @@ static status_t r_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
 
 static status_t r_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapshot_id)
 {
-    (void)outcome; (void)snapshot_id;
+    (void)snapshot_id;
     if (s->grp) {
         /* Only the last unit of a group capture ends it. */
         pthread_mutex_lock(&s->grp->mu);
@@ -716,10 +807,16 @@ static status_t r_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapsho
         s->grp = NULL;
     }
     cJSON *a = cJSON_CreateObject();
-    if (a) cJSON_AddStringToObject(a, "capture", s->token);
-    /* The lease bounds it either way: a capture.end that does not arrive
-     * expires at capture_max_s in the helper. */
-    status_t st = rcall(s->ctx->socket, "capture.end", a, NULL);
+    /* The lease bounds it either way: an end that does not arrive expires
+     * at capture_max_s in the helper, as aborted, which costs the next
+     * session a full read and nothing else. */
+    if (a && s->vm) {
+        cJSON_AddStringToObject(a, "session", s->token);
+        cJSON_AddStringToObject(a, "outcome", outcome == SP_END_COMMITTED ? "committed" : "aborted");
+    } else if (a) {
+        cJSON_AddStringToObject(a, "capture", s->token);
+    }
+    status_t st = rcall(s->ctx->socket, s->vm ? "vm.backup_end" : "capture.end", a, NULL);
     session_free(s);
     return st;
 }

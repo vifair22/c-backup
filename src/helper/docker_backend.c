@@ -975,7 +975,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         if (!m->running || m->paused || m->never) continue;
         jobs[i] = (pause_job_t){ c, m, ERR_IO, "not attempted" };
         char detail[128];
-        snprintf(detail, sizeof(detail), "docker:%s", m->id);
+        snprintf(detail, sizeof(detail), "docker:%.79s", m->id);
         if (s->has_holds && s->holds.record(s->holds.ctx, SP_HOLD_PAUSE, detail, &hold_ids[i]) != OK) {
             snprintf(jobs[i].why, sizeof(jobs[i].why), "%.250s", err_msg());
             err_clear();

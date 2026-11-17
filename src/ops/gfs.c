@@ -169,6 +169,8 @@ static status_t load_snap_infos(cutils_db_t *db, int64_t repo_id, const char *gr
             "SELECT s.id, s.ts, s.gfs_flags,"
             "       EXISTS(SELECT 1 FROM tags t"
             "               WHERE t.repo_id = s.repo_id AND t.snap_id = s.id)"
+            "    OR EXISTS(SELECT 1 FROM exports e WHERE e.repo_id = s.repo_id"
+            "               AND e.snap_id = s.id AND e.closed_at IS NULL)"
             "  FROM snapshots s JOIN snapshot_units u"
             "    ON u.repo_id = s.repo_id AND u.snap_id = s.id"
             " WHERE s.repo_id = ? AND u.unit_key = ? ORDER BY s.id ASC",
@@ -177,6 +179,8 @@ static status_t load_snap_infos(cutils_db_t *db, int64_t repo_id, const char *gr
             "SELECT s.id, s.ts, s.gfs_flags,"
             "       EXISTS(SELECT 1 FROM tags t"
             "               WHERE t.repo_id = s.repo_id AND t.snap_id = s.id)"
+            "    OR EXISTS(SELECT 1 FROM exports e WHERE e.repo_id = s.repo_id"
+            "               AND e.snap_id = s.id AND e.closed_at IS NULL)"
             "  FROM snapshots s WHERE s.repo_id = ?"
             "   AND NOT EXISTS (SELECT 1 FROM snapshot_units u"
             "                    WHERE u.repo_id = s.repo_id AND u.snap_id = s.id)"
@@ -195,7 +199,8 @@ static status_t load_snap_infos(cutils_db_t *db, int64_t repo_id, const char *gr
         arr[n].id        = (uint32_t)strtoul(r->rows[i][0], NULL, 10);
         arr[n].ts        = strtoull(r->rows[i][1], NULL, 10);
         arr[n].gfs_flags = (uint32_t)strtoul(r->rows[i][2], NULL, 10);
-        /* Any tag protects a snapshot from pruning. Tags are how a user says
+        /* Any tag protects a snapshot from pruning, and so does an open NBD
+         * export (vm-backup.md 7.3). Tags are how a user says
          * "keep this one", and silently deleting a tagged snapshot because a
          * retention window rolled past it would be the worst kind of
          * surprise. */

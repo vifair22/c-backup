@@ -169,7 +169,7 @@ static void test_synthetic_gated(void **state)
     (void)state;
     touch(TEST_SRC "/a", "a");
     const char *paths[] = { TEST_SRC };
-    backup_synth_ops_t ops = { no_open, NULL, NULL, NULL };
+    backup_synth_ops_t ops = { no_open, NULL, NULL, NULL, NULL };
     backup_synth_t s = { "/.cbackup-unit/unit.json", 0600, 0, 0, 0, 1 };
     backup_opts_t o;
     memset(&o, 0, sizeof(o));

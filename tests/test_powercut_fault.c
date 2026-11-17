@@ -655,6 +655,7 @@ static int64_t g_repo_id;
 
 static sp_ctx_t *g_fk;
 static int       g_units;        /* the scenario's world has units */
+static char      g_unit_cp[128]; /* u1's checkpoint as the pristine state left it */
 static int       g_unit_ver;     /* what u1 shows now */
 static int64_t   g_unit_job = 1000;
 static int       g_two;          /* u2 too, both in one job-scoped capture */
@@ -663,7 +664,7 @@ static int       g_two;          /* u2 too, both in one job-scoped capture */
 static void unit_runs(int ver, fake_run_t runs[3])
 {
     runs[0] = (fake_run_t){ 0, 256 * 1024, FAKE_RUN_DATA, 31 };
-    runs[1] = (fake_run_t){ 512 * 1024, 300 * 1024, FAKE_RUN_DATA, (uint64_t)(40 + ver) };
+    runs[1] = (fake_run_t){ 512 * 1024, 300 * 1024, FAKE_RUN_DATA, 41 };
     runs[2] = (fake_run_t){ 1024 * 1024, 64 * 1024, FAKE_RUN_FILL, (uint64_t)(0x10 + ver) };
 }
 
@@ -684,6 +685,13 @@ static void define_unit(int ver)
     assert_int_equal(fake_blob_add(g_fk, "u1", "domain.xml", ".cbackup-unit/config/domain.xml",
                                    blob, strlen(blob)), OK);
     assert_int_equal(fake_disk_add(g_fk, "u1", "vda", UNIT_DISK, runs, 3, FAKE_ALLOC_EXACT), OK);
+    /* Incremental (vm-backup.md 5): what the bitmap says changed since the
+     * checkpoint. Version 1 is a first session; any later one names what
+     * moved from version 1, a superset of what moved since any later base,
+     * which is the only direction a changed set may err in. */
+    static const uint64_t chg[2] = { 1024 * 1024, 1088 * 1024 };
+    assert_int_equal(fake_disk_set_changed(g_fk, "u1", "vda", ver > 1 ? chg : NULL,
+                                           ver > 1 ? 1 : 0), OK);
     assert_int_equal(fake_tree_add(g_fk, "u1", "vol:data", H_SRC, H_SRC), OK);
     /* A dump hook's output, a STREAM item: stored at its real size. */
     assert_int_equal(fake_stream_add(g_fk, "u1", "dump:db", ".cbackup-unit/hooks/db.dump",
@@ -702,7 +710,7 @@ static void define_unit(int ver)
 
 static void units_up(cutils_db_t *db)
 {
-    units_config_t uc = { "", 2, 10, 30, 1 };
+    units_config_t uc = { "", 2, 10, 30, 1, 1, 75, 30 };
     assert_int_equal(units_init(db, H_DIR, &uc), OK);
 }
 
@@ -799,6 +807,9 @@ static void ctx_open(ctx_t *c, const scenario_t *s)
     if (g_units) {
         units_up(c->db);
         define_unit(g_unit_ver);
+        /* The hypervisor's checkpoint as the pristine state left it: the
+         * fake lives in memory, and the last trial's session moved it. */
+        assert_int_equal(fake_unit_set_checkpoint(g_fk, "u1", g_unit_cp), OK);
     }
     if (s && s->source) {
         assert_int_equal(db_open(&c->sdb, H_SDB), 0);
@@ -1433,6 +1444,9 @@ static void start_and_check(void)
         violation("prune_finish_pending: %s", err_msg());
     if (g_units) {
         units_up(db);
+        unsigned checked = 0, redefined = 0, refused = 0;
+        if (unit_checkpoints_redefine(db, &checked, &redefined, &refused) != OK)
+            violation("redefining checkpoints: %s", err_msg());
         units_sweep_result_t sw;
         if (units_sweep(db, 0, &sw) != OK) violation("units sweep: %s", err_msg());
     }
@@ -1970,6 +1984,7 @@ static void build_unit_first(ctx_t *c)
     open_target(c);
     units_up(c->db);
     define_unit(1);
+    g_unit_cp[0] = '\0';
     g_ver_of[1] = 1;
     end_build(c);
 }
@@ -2004,6 +2019,8 @@ static void build_unit_second(ctx_t *c)
     g_required[1] = 1;
     g_ver_of[2] = 2;
     g_unit_ver = 2;
+    assert_int_equal(fake_unit_checkpoint(g_fk, "u1", g_unit_cp, sizeof(g_unit_cp)), OK);
+    assert_true(g_unit_cp[0] != '\0');
     end_build(c);
 }
 
@@ -2031,6 +2048,7 @@ static void build_unit_two(ctx_t *c)
         g_unit_of[3 + k] = which[k];
     }
     g_unit_ver = 2;
+    assert_int_equal(fake_unit_checkpoint(g_fk, "u1", g_unit_cp, sizeof(g_unit_cp)), OK);
     end_build(c);
 }
 
@@ -2049,9 +2067,24 @@ static status_t op_unit_two(ctx_t *c, int counting)
     return st;
 }
 
+/* On this branch the second session reads the disk incrementally, against
+ * the first's checkpoint: the case where trusting a base the cut erased
+ * would restore the wrong bytes. */
 static status_t op_unit_second(ctx_t *c, int counting)
 {
-    return op_unit_session(c, counting, 2);
+    status_t st = op_unit_session(c, counting, 2);
+    if (counting && st == OK) {
+        char repo[32];
+        snprintf(repo, sizeof(repo), "%lld", (long long)g_repo_id);
+        db_result_t *r = NULL;
+        assert_int_equal(db_execute(c->db, "SELECT read_mode || ' ' || reason FROM snapshot_unit_items"
+                                           " WHERE repo_id = ? AND snap_id = 2 AND item_id = 'vda'",
+                                    (const char *[]){ repo, NULL }, &r), 0);
+        assert_int_equal(r->nrows, 1);
+        assert_string_equal(r->rows[0][0], "incremental incremental");
+        db_result_free(r);
+    }
+    return st;
 }
 
 /*

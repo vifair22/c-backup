@@ -386,6 +386,10 @@ are different: they live in the database and change through the policy API
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
 | `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run. `0` or `1` |
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories. 1 to 256 |
+| `vm.export_max_conns` | `4` | NBD export connections open at once across every export (`c-backup vm export`); 0 turns exports off. Each may hold one object, up to 16 MiB, of `jobs.read_budget_mb` while it reads, so the daemon refuses to start unless `jobs.read_budget_mb` >= this x 16 MiB + 48 MiB (112 MiB at the default); the message names both keys. 0 to 64 |
+| `vm.incremental` | `0` | `1` reads the qcow2 disks of running VMs incrementally through libvirt checkpoints (section 6.5). Off until the incremental path has been through UAT; with `0` every VM disk is read in full and no checkpoint is made. `0` or `1` |
+| `vm.delta_full_pct` | `75` | A disk is read in full, not incrementally, when an incremental would read more than this share of what a full read reads (section 6.5). `0` never reads incrementally; `100` only when the incremental would read everything. 0 to 100 |
+| `vm.audit_days` | `30` | Days between audit reads per VM: a full read checked against the dirty bitmap (section 6.5). `0` never audits (not recommended). 0 to 3650 |
 | `jobs.read_budget_mb` | `256` | MiB of object and pack-writer buffers every job together may hold. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, and each backup pack writer holds about 26.3 MiB while its pack is open (section 18.3), so this caps that memory whatever runs at once. 48 to 1048576; under 48 stops the daemon at start, since one object and one writer must fit |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
@@ -985,6 +989,97 @@ A change to a repository's sources applies to backups submitted after it. A
 backup takes its sources from the configuration when it is submitted, so a
 backup already running, or already queued, keeps the sources it was
 submitted with.
+
+### 6.5 Virtual machine disks: incremental reads
+
+With `vm.incremental: 1`, a running VM's qcow2 disks are read incrementally:
+only around what the guest wrote since the last backup into this
+repository. The design is `docs/vm-backup.md` section 5; this is what an
+operator sees.
+
+**What is stored does not change.** Every snapshot holds every disk as a
+complete image, exactly the chunk list a full read of the same disk state
+would produce. An incremental changes what is *read*, never what is stored,
+so restore, export, verify, replication and retention treat it like any
+other snapshot, and pruning any snapshot breaks nothing.
+
+**How it works.** Every backup of a running VM creates a libvirt checkpoint
+(a persistent dirty bitmap in each qcow2 disk, named `cbk-<daemon>-<job>-<n>`)
+together with the backup, so the bitmap starts at the backup's point in
+time. The next backup asks libvirt for the disk's changes since that
+checkpoint, re-reads each changed range from a chunk boundary at least
+64 KiB before it to the first boundary after it where the chunker is back in
+step, and keeps the previous snapshot's chunks for the rest. When the
+snapshot commits, the old checkpoint is deleted: each repository keeps one
+checkpoint per VM. A shut-off VM has no bitmap to ask (its disks are read in
+full) and its checkpoint is left as it is, still a valid base for the next
+running backup. Raw disks have no bitmap through libvirt and are always read
+in full.
+
+**What each disk did** is in the snapshot's `unit.json` and in
+`c-backup unit history <repo> --provider libvirt <vm>`: `read_mode` is
+`full`, `incremental` or `unchanged` (nothing changed: nothing read), and
+`reason` says why:
+
+| Reason | Meaning |
+|---|---|
+| `incremental` | read against the previous snapshot's checkpoint |
+| `first` | the VM's first backup into this repository |
+| `no-base` | no checkpoint for this disk yet (incrementals were just turned on) |
+| `no-incremental-support` | a raw disk, a shut-off VM, or a domain with snapshots |
+| `base-pruned` | the snapshot the checkpoint describes is gone, or no longer holds what was recorded |
+| `item-resized` | the disk's virtual size changed |
+| `item-source-changed` | the image is another file (path, format or inode) |
+| `item-new` | a disk added since the checkpoint |
+| `token-invalid` | libvirt no longer has the checkpoint and it could not be put back, or refused it (an unclean QEMU stop leaves the bitmap inconsistent) |
+| `delta-too-costly` | the incremental would read more than `vm.delta_full_pct` of the disk (scattered writes); read in full, with the audit's checks |
+| `audit` | an audit read (below) |
+| `forced` | incrementals are off for this VM after a failed audit, or were just reset |
+
+Every one of the reasons other than `incremental` is a full read under a new
+checkpoint, so the next backup is incremental again. Nothing in that list
+needs an operator; the cost of each is one full read of that disk.
+
+**Host reboots.** libvirt keeps checkpoint metadata on Unraid's RAM rootfs,
+so a reboot loses all of it while the bitmaps survive in the images. The
+helper stores every checkpoint's XML in its state directory when it makes
+it, and puts back any that libvirt has lost (redefine, with libvirt checking
+the bitmap is present and consistent) when it starts, when the daemon
+starts, and before every backup. A checkpoint that cannot be put back costs
+its disks one full read. If the helper's state directory is lost too, the
+next backup of every VM reads in full.
+
+**Audits.** Every `vm.audit_days`, and whenever an incremental would cost
+too much, a disk is read in full while the dirty bitmap is still asked for:
+every chunk of the previous snapshot that the bitmap says did not change
+must hash the same in the new read. A mismatch means something wrote the
+image without QEMU recording it (an image restored over itself, a tool
+writing it while the VM was off). Then:
+
+- the audit snapshot is kept: it is a full read and correct;
+- the unit fails, so the job fails and alerts, with
+  `bitmap audit failed: N bytes of chunks changed outside the dirty bitmap,
+  the first at offset O (disk vdb)` and the snapshots read incrementally
+  since the last full read, which are now suspect;
+- `cbackup_vm_bitmap_audit_failures_total` increments;
+- incrementals stay off for that VM (every backup is a full read, reason
+  `forced`) until you have found the cause and run
+  `c-backup vm reset-incremental <repo> <vm>`. A bitmap that lied once is a
+  problem to find, not to retry.
+
+`c-backup vm checkpoints <repo> <vm>` shows the chain: each disk's
+checkpoint and the snapshot it describes, whether incrementals are on, why
+not, and when the last audit ran.
+
+**Cost.** Each changed range costs about one mean chunk (1 MiB) of reading
+on either side of it, so a disk with a few scattered small writes reads a
+few MiB, and one with writes in most chunks reads nearly everything (which
+is when `vm.delta_full_pct` switches to a full read). Each checkpoint costs
+QEMU a little work on the guest's write path and 2 MiB of bitmap per TiB of
+disk; two repositories backing up one VM keep two.
+
+**Turning it off.** With `vm.incremental: 0` no checkpoint is made, and the
+next backup of each VM deletes the one it had.
 
 ---
 
@@ -1944,9 +2039,11 @@ the repository).
 | `cbackup_alerts_sent_total` | counter | Push notifications Pushover accepted |
 | `cbackup_alerts_failed_total` | counter | Push notifications given up on: rejected by Pushover (bad token or user key), or expired after 24 hours of failed retries |
 | `cbackup_alerts_pending` | gauge | Push notifications queued and not yet sent |
+| `cbackup_vm_bitmap_audit_failures_total` | counter | Audit reads that found a VM disk changed outside its dirty bitmap (section 6.5) |
+| `cbackup_vm_resync_bytes_total` | counter | Bytes incremental VM reads re-read past the changed ranges to bring the chunker back in step |
 
-The `cbackup_alerts_*` series count from zero each time the daemon starts, and
-read zero when Pushover is not configured.
+The `cbackup_alerts_*` and `cbackup_vm_*` series count from zero each time the
+daemon starts; the alerts read zero when Pushover is not configured.
 
 There are no per-repository series, by decision. A `repo` label on every
 series multiplies the series count by the number of repositories, and the
@@ -1990,6 +2087,8 @@ Alerts worth having:
 - `cbackup_repos_key_unescrowed > 0`.
 - `increase(cbackup_alerts_failed_total[1d]) > 0`: failure notifications are
   not arriving, so the alert above is the only one you will get.
+- `increase(cbackup_vm_bitmap_audit_failures_total[1d]) > 0`: a VM image was
+  written behind its bitmap (section 6.5).
 
 ### 16.3 Push notifications
 

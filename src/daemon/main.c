@@ -53,7 +53,9 @@
 #include "fake_provider.h"
 #include "privs.h"
 #include "registry.h"
+#include "disk_stream.h"
 #include "remote_provider.h"
+#include "unit_backup.h"
 #include "unit_state.h"
 
 #ifndef VERSION_STRING
@@ -156,6 +158,9 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
         .freeze_timeout_s = (unsigned)config_get_int(cfg, "vm.freeze_timeout_s", (int)UNITS_FREEZE_DEFAULT_S),
         .max_pause_s      = (unsigned)config_get_int(cfg, "containers.max_pause_s", (int)UNITS_PAUSE_DEFAULT_S),
         .trust_zero       = config_get_int(cfg, "vm.trust_zero_status", 1),
+        .incremental      = config_get_int(cfg, "vm.incremental", 0),
+        .delta_full_pct   = (unsigned)config_get_int(cfg, "vm.delta_full_pct", (int)UNITS_DELTA_PCT_DEFAULT),
+        .audit_days       = (unsigned)config_get_int(cfg, "vm.audit_days", (int)UNITS_AUDIT_DAYS_DEFAULT),
     };
     status_t st = units_init(db, dir[0] ? dir : NULL, &uc);
     if (st != OK) return st;
@@ -174,10 +179,23 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
      * helper that is not up yet is not fatal: the link keeps trying with a
      * bounded backoff and enables its providers when it answers, and a unit
      * job meanwhile fails naming the socket (remote_provider.h). */
+    disk_stream_nbd_tuning((unsigned)config_get_int(cfg, "vm.nbd_queue_depth", 8),
+                           (unsigned)config_get_int(cfg, "vm.nbd_request_kb", 256));
     const char *hs = config_get_str(cfg, "units.helper_socket");
     if (hs && *hs && remote_start(hs, units_daemon8(), NULL) != OK) {
         log_warn("units: %s; retrying in the background", err_msg());
         err_clear();
+    } else if (hs && *hs && !remote_unusable("libvirt", NULL, 0)) {
+        /* vm-backup.md 5.8: the checkpoints the tokens name, put back
+         * before the scheduler starts. A helper that is not up yet does
+         * the same at its own start, and every session checks again. */
+        unsigned n = 0, redone = 0, refused = 0;
+        if (unit_checkpoints_redefine(db, &n, &redone, &refused) != OK) {
+            log_warn("units: checkpoint redefine: %s", err_msg());
+            err_clear();
+        } else if (n) {
+            log_info("units: %u checkpoint(s) checked, %u redefined, %u could not be", n, redone, refused);
+        }
     }
 
     units_sweep_result_t sw;
@@ -487,13 +505,22 @@ int main(int argc, char *argv[])
         log_info("start-up: reconcile: %.3f s", (double)(phase_now() - t0) / 1e9);
     }
     routes_schedules_init(db, sched);
+    routes_exports_init(db, config_get_str(cfg, "vm.export_dir"),
+                        (unsigned)config_get_int(cfg, "vm.export_ttl_s", 14400),
+                        (unsigned)config_get_int(cfg, "vm.export_idle_s", 1800),
+                        (unsigned)config_get_int(cfg, "vm.export_max_conns", 4));
+    /* gc moves objects between packs under a reader: it waits in the queue
+     * while an export is open on its repository. The export's ttl bounds
+     * the wait (vm.export_ttl_s, at most 7 days). */
+    job_manager_set_gate(jm, "gc", exports_repo_open, JOB_PHASE_EXPORT_OPEN);
     if (routes_register_health(srv, db) != 0 ||
         routes_register_auth(srv, db) != 0 ||
         routes_register_repos(srv, db) != 0 ||
         routes_register_jobs(srv, db, jm) != 0 ||
         routes_register_metrics(srv, db) != 0 ||
         routes_register_stream(srv, db) != 0 ||
-        routes_register_providers(srv) != 0) {
+        routes_register_providers(srv) != 0 ||
+        routes_register_exports(srv) != 0) {
         log_error("cannot register routes");
         goto out_srv;
     }
@@ -539,6 +566,7 @@ int main(int argc, char *argv[])
     while (atomic_load(&running)) {
         struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
         nanosleep(&req, NULL);
+        exports_tick();
     }
 
     /*
@@ -556,6 +584,9 @@ int main(int argc, char *argv[])
 
 out_srv:
     api_server_stop(srv);
+    /* No route can open one now; close every export while the database
+     * is there to record it. */
+    exports_shutdown();
 out_sched:
     scheduler_stop(sched);      /* NULL when disabled by config */
 out_jm:

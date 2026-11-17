@@ -27,6 +27,7 @@ docker run -d --name c-backup-helper --restart unless-stopped \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /mnt/cache:/mnt/cache:rshared \
+  -v /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock \
   --label net.cbackup.role=helper \
   --entrypoint /usr/local/bin/c-backup-helper \
   c-backup:latest --policy /etc/c-backup-helper.ini
@@ -63,6 +64,9 @@ services:
       - /boot/config/c-backup-helper.ini:/etc/c-backup-helper.ini:ro
       - /mnt/cache/system/c-backup-helper:/mnt/cache/system/c-backup-helper
       - /run/c-backup-helper:/run/c-backup-helper
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt/cache:/mnt/cache:rshared
+      - /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock
   c-backupd:
     image: c-backup:latest
     depends_on: [c-backup-helper]
@@ -81,6 +85,15 @@ services:
 ```
 
 Notes that matter:
+
+- **libvirt's socket is mounted into the helper.** The helper connects to
+  `qemu:///system` from its own mount namespace, so without
+  `/var/run/libvirt/libvirt-sock` it cannot reach libvirtd and the libvirt
+  provider reports itself unavailable. Leave it out only on a host with no
+  VMs to back up (`[libvirt] enabled = 0`). `nbd_dir`
+  (`/run/c-backup-helper/nbd` here) sits under the helper's socket
+  directory, so the daemon's existing mount of `/run/c-backup-helper`
+  already shows it at the same path, which libvirt's exports need.
 
 - **Restore staging stays out of sight.** An in-place restore stages in
   the mount's own domain and swaps by rename. The directory is the first
@@ -438,6 +451,128 @@ services' binds and sets container names `<project>-<service>`; then
 `--start`). Replacing a project needs its containers stopped; they are
 renamed aside rather than removed by compose.
 
+## Libvirt provider (VMs)
+
+Built only when libvirt's and libxml2's development files are present
+(`libvirt-dev libxml2-dev` on Debian; the CI image and Dockerfile carry
+them).
+
+**Dependencies.** `c-backup-helper` links `libvirt.so` (the approved
+dependency) and `libxml2`, which libvirt itself already depends on, so it
+adds no runtime package. Neither is ever linked into `c-backupd` or
+`c-backup`: the Makefile builds `src/virt` into the helper and its own
+test suites only (`ldd build/bins/c-backupd` shows neither). libxml2
+parses the domain XML because libvirt's API does not expose what the
+provider needs any other way: there is no call listing a domain's disks
+with their device kind, source type, source path, driver format and
+read-only or shared flags (`virDomainGetBlockInfo` needs the target name
+and gives sizes only), nor the `<os><nvram>` path, whether a `<tpm>`
+has an emulator backend, or the guest agent channel's connection state;
+and restore define has to rewrite the XML (name, UUID, MACs, disk sources,
+NVRAM path) before `virDomainDefineXML`. Sizes come from
+`virDomainGetBlockInfo`, state from `virDomainGetState`, the rest of the
+lifecycle from the API. Enabled by the
+policy:
+
+```ini
+[units]
+allow = libvirt:cbk-uat-*
+
+[libvirt]
+enabled = 1
+; uri = qemu:///system
+; nbd_dir = /run/c-backup-helper/nbd          ; exports and qemu-nbd sockets, shared with the daemon
+; scratch_dir = /mnt/cache/system/cbackup-scratch
+; tpm_dir = /etc/libvirt/qemu/swtpm/tpm-states
+; nvram_dir = /etc/libvirt/qemu/nvram
+; qemu_nbd = /usr/bin/qemu-nbd                 ; the host's, run through nsenter
+; freeze = auto                                ; auto | off | required
+; freeze_timeout_s = 10
+```
+
+A unit is a persistent domain, keyed by UUID (`libvirt:<uuid>`) and
+allowed by name. Its snapshot holds `.cbackup-unit/config/domain.xml`
+(inactive, `VIR_DOMAIN_XML_SECURE`, verbatim), `config/disks.json` (every
+disk and its outcome: `included`, `passthrough`, `removable`, `readonly`,
+`shareable`, ...), `config/nvram.fd` when the XML names NVRAM,
+`disks/<target>` per included disk, and the swtpm state directory of the
+VM's own UUID at its real path. A named NVRAM file or a TPM's state that
+cannot be read fails the unit.
+
+**Shut off** (`offline`, or `crash` with a managed save image): the
+format is the XML's `<driver type>`, checked against the image's first
+bytes (a qcow2 header in a raw disk, or none in a qcow2, is refused);
+raw disks are read by the daemon directly (`SEEK_DATA`/`SEEK_HOLE`),
+qcow2 through the host's `qemu-nbd --read-only` over a socket in
+`nbd_dir`, handed to the daemon's uid. This qemu-nbd has no
+`--force-share`, so the helper passes `--image-opts ...,file.locking=off`,
+which is what it did: a backup never stops the VM starting, and a change
+of the image during the read is logged.
+
+**Running**: a pull-mode `virDomainBackupBegin` exporting every included
+disk by target name over a unix socket in `nbd_dir`, scratch files in
+`scratch_dir`; with a connected guest agent the guest is frozen for the
+begin alone and thawed in every path (a watchdog thaws at
+`freeze_timeout_s`), `quiesced`; without one `crash`. The daemon reads the
+export with its own NBD client.
+
+The daemon needs `nbd_dir` bind-mounted at the same path, read access to
+the images (the pools read-only) and to `nvram_dir` and `tpm_dir`
+read-only (container-backup and vm-backup 9.2).
+
+**Restore** (`c-backup unit restore <repo> <snap> --define ...`, vm-backup
+7.1 and 7.2):
+
+- every disk is restored as a sparse **raw** image (holes stay holes); a
+  qcow2 disk comes back raw and the definition says so;
+- **new name** (`--name N --target-root DIR`): images at
+  `DIR/<original image path>`, the recorded XML defined by the helper with
+  the name changed, the `<uuid>` removed (libvirt makes a new one), MACs
+  regenerated unless `--keep-macs`, the disks pointing at the new images,
+  excluded passthrough disks dropped and listed, the `<nvram>` path left
+  to libvirt; a domain with that name already there is refused;
+- **in place** (`--replace`, the domain shut off): each image restored into
+  a staging directory beside it, and only after every disk is in, swapped
+  in with the old image kept as `<image>.cbackup-old-<job>`; the XML
+  redefined with the same UUID;
+- then `vm.install_state` for the UUID the define returned: the NVRAM goes
+  to the path the defined XML names, the TPM state to
+  `tpm_dir/<that uuid>`; a replaced domain's old state is moved aside, a new
+  UUID that already has a state directory is refused, and no other UUID's
+  directory is listed or touched. A TPM VM with no staged state is refused.
+  The helper only installs state for a domain it has just defined or
+  replaced;
+- `<hostdev>` and `<filesystem>` devices need `allow_privileged_define`;
+  `--start` starts the domain only after its state is installed.
+
+**File-level recovery** needs no helper: the daemon serves a snapshot's
+disk itself as a read-only NBD export (vm-backup.md 7.3, `docs/api.md`):
+
+```sh
+c-backup vm export 1 4127 vda --ttl 4h
+# {"export_id":9,"socket":"/run/c-backupd/exports/9.sock","name":"8f1c...",...}
+qemu-nbd --read-only -c /dev/nbd0 --image-opts \
+  driver=nbd,server.type=unix,server.path=/run/c-backupd/exports/9.sock,export=8f1c...
+mount -o ro,noload /dev/nbd0p1 /mnt/recover   # xfs: ro,norecovery
+c-backup vm unexport 9
+```
+
+`vm.export_dir` must be the same path on the host and in a container.
+The export pins its snapshot, and gc waits in the queue until it closes.
+
+A shut-off VM's disk is read with nothing to stop the VM starting
+meanwhile. The daemon records the image's size, mtime and ctime as the read
+begins and checks them once the last byte is read (a qcow2's too, behind
+its qemu-nbd); if anything wrote the image, that disk and its unit fail
+with "changed while it was read offline", and nothing torn is stored as
+consistent. Run the backup again once the VM is shut off, or back it up
+running.
+
+The NVRAM and TPM state are staged by the daemon under `staging_root`
+(writable by the daemon), and disk staging sits in
+`<image directory>/.cbackup-restore/`, which the daemon needs writable for
+in-place restores.
+
 ## Testing
 
 The unit suites run everything above against stand-ins: `tests/fake_host`
@@ -510,6 +645,31 @@ Policy: `zfs_domains = cache/appdata`. Repeat steps 1, 2, 4 and 5 under
 `cache/lxc`: back it up running (expect `lxc-freeze`/`lxc-unfreeze` in the
 helper log, level `crash`) and stopped (`offline`), then restore the
 rootfs to a scratch path and compare.
+
+**VMs (FS1, disposable `cbk-uat-*` domains only).**
+
+1. Shut off, raw and qcow2 disks (one of each, a qcow2 named `.img`):
+   back up, restore both disks to images, `qemu-img compare` them with the
+   originals (identical), and check `disks.json`.
+2. A passthrough disk on a disposable domain (a spare loop device given as
+   `type='block'`): listed as `passthrough` and not read.
+3. Running with qemu-ga: level `quiesced`, the freeze window in the helper
+   log well under a second; without the agent channel: `crash`.
+4. **R1, scratch fill**: point `scratch_dir` at a small tmpfs (e.g. 256
+   MiB), start a backup of a running `cbk-uat-*` VM, and inside the guest
+   write more than that (`dd if=/dev/urandom of=/big bs=1M count=1024
+   oflag=direct`). Record what happens: the guest's state (paused on
+   ENOSPC or still running), the export (read error or not), what the job
+   reports, and that `virsh domjobinfo` is clear afterwards. The expected
+   outcome is a failed job and a running guest; anything else goes to the
+   design's open risk R1.
+5. **TPM-sealed secret**: a disposable VM with an emulated TPM, NVRAM and a
+   LUKS volume whose key is sealed to the TPM (`systemd-cryptenroll
+   --tpm2-device=auto`), so it unlocks at boot without a passphrase. Back
+   it up shut off, delete the VM and its TPM state directory, restore it
+   with define, `vm.install_state` for the new UUID, start it: it must
+   unlock without the passphrase. Also check that only the restored
+   UUID's directory under `tpm-states/` changed.
 
 Exit: every restore verified; zero leftover snapshots, pauses, freezes or
 journal rows after every fault (`GET /providers` `holds_open` 0, helper

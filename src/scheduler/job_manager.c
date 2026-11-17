@@ -41,6 +41,7 @@ typedef struct {
      * refusal; defer_until_ms is when to try again, on the mono_ms clock. */
     int64_t  defer_until_ms;
     int      defer_ms;
+    int      gated;             /* deferred by a gate, not by contention */
     /* Set on the dequeued copy only: the dispatcher holds the lock set on
      * the job's behalf, or could not take it for a reason other than
      * contention and the job fails with lock_err instead of running. */
@@ -101,6 +102,10 @@ struct job_manager {
      * user (job_manager_set_alerts). push_send accepts and drops a message
      * when it has not, so this is only what the log line may claim. */
     atomic_int      alerts;
+    /* Gates (job_manager_set_gate): an action that must not start on a
+     * repository while something outside the job system reads it. */
+    struct { const char *action; job_gate_fn fn; const char *phase; } gates[JOB_GATES_MAX];
+    int             ngates;
 };
 
 void job_manager_set_alerts(job_manager_t *jm, int enabled)
@@ -556,11 +561,12 @@ static void unlock_set(const job_slot_t *q)
  * phase the caller records once it has let go of jm->mu. Caller holds jm->mu.
  */
 static int take_runnable(job_manager_t *jm, job_slot_t *out,
-                         int64_t *wake_ms, int64_t *mark)
+                         int64_t *wake_ms, int64_t *mark, const char **mark_phase)
 {
     int64_t now = mono_ms();
     *wake_ms = 0;
     *mark = 0;
+    *mark_phase = JOB_PHASE_WAITING;
     for (int k = 0; k < jm->count; k++) {
         job_slot_t *q = &jm->queue[(jm->head + k) % JOB_QUEUE_MAX];
         status_t lst = OK;
@@ -573,11 +579,35 @@ static int take_runnable(job_manager_t *jm, job_slot_t *out,
                 continue;
             }
             lst = try_lock_set(q);
+            /* A gate is asked with the lock set held, so nothing it guards
+             * against can begin between its answer and the job starting:
+             * the export it waits for takes the repository's read lock to
+             * open. Gated, the job lets go and waits as contention does, at
+             * the slower step, since what it waits for lasts minutes. */
+            if (lst == OK) {
+                for (int g = 0; g < jm->ngates; g++) {
+                    if (strcmp(jm->gates[g].action, q->action) != 0) continue;
+                    if (!jm->gates[g].fn(q->repo_id)) continue;
+                    unlock_set(q);
+                    if (!q->gated) {
+                        q->gated = 1;
+                        if (*mark == 0) { *mark = q->job_id; *mark_phase = jm->gates[g].phase; }
+                        log_info("job %lld deferred: %s on repo %lld; it stays queued and retries",
+                                 (long long)q->job_id, jm->gates[g].phase, (long long)q->repo_id);
+                    }
+                    q->defer_until_ms = now + JOB_GATE_RETRY_MS;
+                    if (*wake_ms == 0 || q->defer_until_ms < *wake_ms)
+                        *wake_ms = q->defer_until_ms;
+                    lst = ERR_BUSY;
+                    break;
+                }
+                if (lst == ERR_BUSY) continue;
+            }
             if (lst == ERR_BUSY) {
                 err_clear();
                 if (q->defer_ms == 0) {
                     q->defer_ms = JOB_DEFER_MIN_MS;
-                    if (*mark == 0) *mark = q->job_id;
+                    if (*mark == 0) { *mark = q->job_id; *mark_phase = JOB_PHASE_WAITING; }
                     log_info("job %lld deferred: repo %lld%s is held by a request; "
                              "it stays queued and retries",
                              (long long)q->job_id, (long long)q->repo_id,
@@ -602,13 +632,26 @@ static int take_runnable(job_manager_t *jm, job_slot_t *out,
 
 /* The phase a deferred job shows. Only while it is still queued: a worker
  * may have claimed it, or a cancel finished it, since jm->mu was released. */
-static void mark_waiting(job_manager_t *jm, int64_t job_id)
+void job_manager_set_gate(job_manager_t *jm, const char *action, job_gate_fn fn,
+                          const char *phase)
+{
+    pthread_mutex_lock(&jm->mu);
+    if (jm->ngates < JOB_GATES_MAX) {
+        jm->gates[jm->ngates].action = action;
+        jm->gates[jm->ngates].fn = fn;
+        jm->gates[jm->ngates].phase = phase;
+        jm->ngates++;
+    }
+    pthread_mutex_unlock(&jm->mu);
+}
+
+static void mark_waiting(job_manager_t *jm, int64_t job_id, const char *phase)
 {
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)job_id);
     if (db_write(jm->db,
             "UPDATE jobs SET progress_phase = ? WHERE id = ? AND state = 'queued'",
-            (const char *[]){ JOB_PHASE_WAITING, id, NULL }, NULL) != 0)
+            (const char *[]){ phase, id, NULL }, NULL) != 0)
         { /* a report, not the job's outcome */ }
 }
 
@@ -637,10 +680,11 @@ static void *worker_main(void *arg)
                 return NULL;
             }
             int64_t wake_ms, mark;
-            if (take_runnable(jm, &slot, &wake_ms, &mark)) break;
+            const char *mark_phase = JOB_PHASE_WAITING;
+            if (take_runnable(jm, &slot, &wake_ms, &mark, &mark_phase)) break;
             if (mark) {
                 pthread_mutex_unlock(&jm->mu);
-                mark_waiting(jm, mark);
+                mark_waiting(jm, mark, mark_phase);
                 pthread_mutex_lock(&jm->mu);
                 continue;
             }
@@ -1163,6 +1207,7 @@ static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
     s->nrepos   = nrepos;
     s->defer_until_ms = 0;
     s->defer_ms = 0;
+    s->gated    = 0;
     s->locked   = 0;
     s->lock_err = OK;
     jm->tail = (jm->tail + 1) % JOB_QUEUE_MAX;

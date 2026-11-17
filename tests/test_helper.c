@@ -658,11 +658,15 @@ static void test_restore_stage_swap(void **state)
     assert_string_equal(code_of(o), "ok");
     const cJSON *res = cJSON_GetObjectItemCaseSensitive(o, "result");
     const char *path = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "path"));
-    assert_string_equal(path, HF_POOL "/.cbackup-restore/5");
+    /* One directory per staging: <job>-<random>. */
+    assert_non_null(path);
+    assert_int_equal(strncmp(path, HF_POOL "/.cbackup-restore/5-", strlen(HF_POOL "/.cbackup-restore/5-")), 0);
     char a[160];
     snprintf(a, sizeof(a), "{\"staging\":\"%s\"}",
              cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "staging")));
-    hf_write(HF_POOL "/.cbackup-restore/5/restored.txt", "restored\n");
+    char rf[512];
+    snprintf(rf, sizeof(rf), "%s/restored.txt", path);
+    hf_write(rf, "restored\n");
     expect(req("restore.swap", a), "busy");          /* the unit is running */
     expect(req("unit.stop", "{\"unit\":\"fake:u1\"}"), "ok");
     expect(req("restore.swap", a), "ok");

@@ -1,6 +1,7 @@
 # VM disk backup (libvirt / QEMU)
 
-Design document. Nothing here is built yet. It is the libvirt provider for
+Design document; section 5.9 records how V3 (incremental) was built and
+where it differs. It is the libvirt provider for
 the source-provider interface in `source-providers.md`, which defines the
 vtable, the consistency levels, the session lifecycle, the repository
 representation, retention groups and the common API. This document covers
@@ -882,6 +883,92 @@ plugin), would make libvirt itself remember checkpoints. It changes the host
 and needs the user's approval; the design does not depend on it, and the
 redefine step stays even if it is adopted (it is harmless when every
 checkpoint is already present).
+
+### 5.9 As built (V3)
+
+Built as designed in 5.1 to 5.8, with these decisions and differences.
+
+**The helper protocol is unchanged.** `vm.backup_begin` carries no field
+beyond 11.3's, so its existing ones are read this way: a disk with `mode:
+incremental` takes part in the chain (the new checkpoint covers it, and it
+is exported against `base` where `base`'s bitmap covers it); `mode: full`
+does not. `base` is the chain's checkpoint; it is also what the session
+retires once it commits, and with no disk taking part it is retired only.
+That is how `vm.incremental: 0` or an audit failure retires a checkpoint
+without making a new one.
+
+**The daemon decides trust; the helper decides possibility.** The token
+checks of 5.4 run in the daemon before begin and stay authoritative: a
+helper that exports a disk's bitmap against a base the daemon does not trust
+(a resized disk, a pruned base) has it ignored, and the disk is read in full
+under the new checkpoint. The helper only ever accepts a base its own
+records say it made for this daemon id, and treats any other as no base.
+
+**Names and ownership.** Checkpoints are `cbk-<daemon8>-<seq>-<unix time>`:
+the helper's sequence restarts with it, so the time keeps names unique. The
+`<description>` names the daemon and the job, not the repository (the
+helper is never told it); per-repository chains still hold, because each
+session retires exactly the base its repository's token named.
+
+**State.** `unit_tokens` is as 7.4 sketches, `item_root` as hex text. There
+is no `unit_enrolment` table in 1.0, so the audit time and the disabled
+reason live in `unit_incremental`. A failed audit keeps the unit's rows
+(never a base while disabled) instead of dropping them, so the checkpoint
+they name is retired by the next session rather than left on the domain;
+`reset-incremental` marks them unusable (no snapshot) for the same reason.
+The point the audit cadence counts from is the last session where every
+disk in the chain was read in full: an audit, or the start of a chain.
+
+**Redefine.** A redefine refused while the domain is shut off keeps the
+record and is tried again before that domain's next backup, because some
+libvirt versions cannot validate the bitmaps of an inactive domain; a
+refusal while it runs drops the record. The stored XML's `<parent>` is
+removed before a redefine, since the parent may itself be gone. libvirt
+cannot delete a checkpoint whose bitmap QEMU discarded after an unclean
+stop, so after such a refusal the checkpoint is deleted as metadata only,
+and a broken bitmap of that name may stay in the image, unused.
+
+**A failed audit** fails the unit, so the job fails and the existing job
+alert goes out; the snapshot is kept and named correct in the message, with
+the snapshots read incrementally since the chain's last full read.
+
+**Reads.** An incremental disk reads through a 1 MiB window rather than the
+default 4 MiB, so what is read past each resync stays about one chunk.
+`clusters` in `unit.json` counts runs of consecutive base leaves the
+estimate re-reads. `cdc_store_delta` takes a loader for the base's lists
+rather than a store, so the engine tests run against memory.
+
+**Not built in V3:** the offline unchanged shortcut of 2.4 (a shut-off
+disk is always read in full); splicing whole unchanged sub-lists (5.3, a
+later optimisation); libvirt's own view in `GET .../checkpoints` (asking it
+would redefine as a side effect); and a sweep of checkpoints that carry our
+description but that no record names, which arise only when the helper's
+state directory is lost (their bitmaps then stay in the images).
+
+**The binding is durable before the checkpoint settles (B152).** Ending a
+session committed settles its new checkpoint on the domain and retires the
+old one, which nothing on the daemon's host can undo, while the
+`unit_tokens` rows binding the new one were an ordinary commit: state.db
+runs `synchronous=normal`, so they sat in the WAL. A power cut between the
+two kept the checkpoint and lost the binding. The next session was safe -
+its base was not the domain's checkpoint, so it read in full
+(`token-invalid`) - but nothing retired the orphan, and its bitmap stayed in
+the images. So the session calls `db_txn_make_durable` after the token rows
+commit and before `end(COMMITTED)`: one checkpoint of state.db per unit
+backup that makes a checkpoint. If the index cannot be made durable the
+session ends aborted instead, the new checkpoint is discarded, and the rows
+naming it name nothing, so the next session reads in full and makes
+another. `test_units_incremental` checks the order (the fake keeps one
+checkpoint per unit, so it cannot show an orphan), and the power-cut
+harness's unit scenarios cut at the new step as at every other.
+
+**Tests.** `test_vm_delta` (2,100 randomised sessions equal to a full read,
+wrong changed sets, the estimate, the resync bound), `test_units_incremental`
+(the daemon's chain and every staleness case through the fake provider) and
+`test_virt_incremental` (a real QEMU under a private virtqemud: guest writes
+through QEMU's block layer between sessions, every restore byte-identical,
+and every chain break of 5.4 and 5.8, a simulated host reboot included, a
+full read followed by an incremental again).
 
 ## 6. Representation
 

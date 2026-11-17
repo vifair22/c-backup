@@ -100,6 +100,22 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
             return set_error(ERR_NOT_FOUND, "no such snapshot: %lld", (long long)snap_id);
         }
     }
+    /* An open NBD export pins its snapshot (vm-backup.md 7.3): it is
+     * serving those bytes, and force does not override it. */
+    {
+        db_result_t *r = NULL;
+        int pinned = db_execute(db,
+                "SELECT id FROM exports WHERE repo_id = ? AND snap_id = ? AND closed_at IS NULL",
+                (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows > 0;
+        char eid[32] = "";
+        if (pinned) snprintf(eid, sizeof(eid), "%s", r->rows[0][0]);
+        db_result_free(r);
+        if (pinned) {
+            db_txn_rollback(db);
+            return set_error(ERR_BUSY, "snapshot %lld is exported (export %s); revoke the "
+                             "export first (DELETE /exports/%s)", (long long)snap_id, eid, eid);
+        }
+    }
     unsigned ntags = collect_tags(db, repo, snap, info);
     if (checked && ntags > 0 && !force) {
         db_txn_rollback(db);

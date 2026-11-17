@@ -112,7 +112,7 @@ static void add_u2(void)
 
 static void init_units(const char *allow, unsigned freeze_s)
 {
-    units_config_t uc = { allow, 2, freeze_s, 30, 1 };
+    units_config_t uc = { allow, 2, freeze_s, 30, 1, 0, 75, 30 };
     assert_int_equal(units_init(db, TEST_DIR, &uc), OK);
 }
 
@@ -563,7 +563,7 @@ static status_t junk_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
 static status_t bad_open(void *ctx, size_t i, cdc_source_t *src, uint64_t *size)
 {
     (void)ctx; (void)i;
-    *src = (cdc_source_t){ junk_next, junk_read, junk, NULL };
+    *src = (cdc_source_t){ junk_next, junk_read, junk, NULL, NULL };
     *size = sizeof(junk) - 1;
     return OK;
 }
@@ -575,7 +575,7 @@ static void test_unknown_never_pruned(void **state)
     (void)state;
     junk_done = 0;
     backup_synth_t s = { "/.cbackup-unit/unit.json", 0600, 0, 0, 0, 0 };
-    backup_synth_ops_t ops = { bad_open, NULL, NULL, NULL };
+    backup_synth_ops_t ops = { bad_open, NULL, NULL, NULL, NULL };
     backup_opts_t bo;
     memset(&bo, 0, sizeof(bo));
     bo.synth = &s;

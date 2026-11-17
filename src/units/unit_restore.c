@@ -170,6 +170,36 @@ status_t unit_restore_item(store_t *store, cutils_db_t *db, int64_t repo_id,
     return OK;
 }
 
+status_t unit_item_content(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                           const char *item_id, uint8_t hash[OBJECT_HASH_SIZE], uint64_t *size)
+{
+    status_t st = unit_snapshot_key(db, repo_id, snap_id, NULL, 0);
+    if (st != OK) return st;
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT kind, path FROM snapshot_unit_items"
+                       " WHERE repo_id = ? AND snap_id = ? AND item_id = ?",
+                   (const char *[]){ repo, snap, item_id, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return set_error(ERR_NOT_FOUND, "snapshot %lld has no item %s", (long long)snap_id, item_id);
+    }
+    char kind[8], path[PATH_MAX];
+    snprintf(kind, sizeof(kind), "%s", r->rows[0][0]);
+    snprintf(path, sizeof(path), "%s", r->rows[0][1]);
+    db_result_free(r);
+    if (strcmp(kind, "block") != 0)
+        return set_error(ERR_INVALID, "item %s is a %s, not a disk; only disks are exported", item_id, kind);
+    uint8_t root[OBJECT_HASH_SIZE], type = 0;
+    st = root_of(db, repo_id, snap_id, root);
+    if (st == OK) st = walk(store, root, path, &type, size, hash);
+    if (st != OK) return st;
+    if (type != NODE_TYPE_REG)
+        return set_error(ERR_CORRUPT, "item %s at %s is not a file in the snapshot", item_id, path);
+    return OK;
+}
+
 status_t unit_read_file(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                         const char *rel, size_t max, char **data, size_t *len)
 {

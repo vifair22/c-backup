@@ -244,6 +244,24 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     gc_result_t res;
     memset(&res, 0, sizeof(res));
 
+    /* gc and coalescing move objects between packs, under any reader that
+     * has a pack open. An open NBD export is such a reader for hours, so gc
+     * waits for the next run instead (vm-backup.md 7.3). The export takes
+     * the read lock to record itself, and gc holds the write lock, so one
+     * opened after this check cannot exist while gc runs. */
+    {
+        db_result_t *r = NULL;
+        int open = db_execute(db, "SELECT id FROM exports WHERE repo_id = ? AND closed_at IS NULL",
+                              (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows > 0;
+        char eid[32] = "";
+        if (open) snprintf(eid, sizeof(eid), "%s", r->rows[0][0]);
+        db_result_free(r);
+        if (open)
+            return set_error(ERR_BUSY, "gc deferred: export %s is open on this repository; "
+                             "gc runs again on its next schedule, or after the export is "
+                             "revoked (DELETE /exports/%s)", eid, eid);
+    }
+
     /*
      * Staging files from a killed writer. gc holds the write lock, so no
      * other job is writing this repository and anything already in tmp/
