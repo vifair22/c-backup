@@ -162,6 +162,10 @@ status_t fake_unit_break_chain(sp_ctx_t *ctx, const char *unit_id, int lose, int
 /* Make cp the unit's checkpoint again ("" for none): a hypervisor that
  * kept it, for a test replaying sessions from one saved state. */
 status_t fake_unit_set_checkpoint(sp_ctx_t *ctx, const char *unit_id, const char *cp);
+/* Call fn at the start of every session's end, before a commit settles its
+ * checkpoint; committed says which way it ends. NULL stops. For tests of
+ * what has to be true by then. */
+void fake_end_observe(sp_ctx_t *ctx, void (*fn)(void *ctx, int committed), void *fnctx);
 
 /* A block stream over a run map, owning a copy; close frees it. */
 status_t fake_stream_from_runs(uint64_t size, const fake_run_t *runs, size_t n_runs,

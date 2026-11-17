@@ -90,6 +90,9 @@ struct sp_ctx {
         uint64_t    arg;
     } fail;
     fake_stats_t st;
+    /* Told of each end before it settles anything (fake_end_observe). */
+    void       (*volatile end_observer)(void *ctx, int committed);
+    void        *end_observer_ctx;
     char        *spec;
     struct timespec spec_mtime;
     char         daemon8[9];
@@ -1475,6 +1478,8 @@ static status_t f_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapsho
     } else {
         st = release_all(s);
     }
+    void (*obs)(void *, int) = c->end_observer;
+    if (obs) obs(c->end_observer_ctx, outcome == SP_END_COMMITTED);
     pthread_mutex_lock(&c->mu);
     if (outcome == SP_END_COMMITTED) c->st.ends_committed++;
     else c->st.ends_aborted++;
@@ -1521,6 +1526,12 @@ status_t fake_unit_checkpoint(sp_ctx_t *c, const char *unit_id, char *buf, size_
     if (st == OK) snprintf(buf, sz, "%s", u->cp);
     pthread_mutex_unlock(&c->mu);
     return st;
+}
+
+void fake_end_observe(sp_ctx_t *ctx, void (*fn)(void *ctx, int committed), void *fnctx)
+{
+    ctx->end_observer_ctx = fnctx;
+    ctx->end_observer = fn;
 }
 
 status_t fake_unit_set_checkpoint(sp_ctx_t *c, const char *unit_id, const char *cp)

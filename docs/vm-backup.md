@@ -945,22 +945,22 @@ would redefine as a side effect); and a sweep of checkpoints that carry our
 description but that no record names, which arise only when the helper's
 state directory is lost (their bitmaps then stay in the images).
 
-**Known gap: a checkpoint orphaned by a power cut.** The helper commits a
-session's new checkpoint on the domain before the daemon's `unit_tokens`
-commit is durable: state.db runs `synchronous=normal`, and the token is
-written in an ordinary commit after the snapshot, not behind a
-`make_durable`. A power cut on the daemon's host in that window keeps the
-checkpoint on the domain and loses the binding, so the token still names
-the previous checkpoint. The next session is safe - its base is not the
-domain's current checkpoint, so it reads in full (`token-invalid`) and
-binds a new one - but nothing retires the orphan: the session retires only
-the base its token named, and the sweep of unnamed `cbk-*` checkpoints is
-not built (above). Its bitmap stays in the images until an operator deletes
-it with `virsh checkpoint-delete`. The power-cut harness
-(`tests/test_powercut_fault.c`, the unit scenarios) proves the restores and
-the next session correct at every cut, but its fake provider keeps one
-checkpoint per unit, so it cannot see the orphan; the sweep, or a
-`make_durable` before the session commits, closes it.
+**The binding is durable before the checkpoint settles (B152).** Ending a
+session committed settles its new checkpoint on the domain and retires the
+old one, which nothing on the daemon's host can undo, while the
+`unit_tokens` rows binding the new one were an ordinary commit: state.db
+runs `synchronous=normal`, so they sat in the WAL. A power cut between the
+two kept the checkpoint and lost the binding. The next session was safe -
+its base was not the domain's checkpoint, so it read in full
+(`token-invalid`) - but nothing retired the orphan, and its bitmap stayed in
+the images. So the session calls `db_txn_make_durable` after the token rows
+commit and before `end(COMMITTED)`: one checkpoint of state.db per unit
+backup that makes a checkpoint. If the index cannot be made durable the
+session ends aborted instead, the new checkpoint is discarded, and the rows
+naming it name nothing, so the next session reads in full and makes
+another. `test_units_incremental` checks the order (the fake keeps one
+checkpoint per unit, so it cannot show an orphan), and the power-cut
+harness's unit scenarios cut at the new step as at every other.
 
 **Tests.** `test_vm_delta` (2,100 randomised sessions equal to a full read,
 wrong changed sets, the estimate, the resync bound), `test_units_incremental`
