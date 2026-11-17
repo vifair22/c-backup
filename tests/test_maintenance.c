@@ -38,6 +38,10 @@
 #include "store_index.h"
 #include "test_tmp.h"
 
+/* The prune markers, not packs/'s recorded identity (B156), which every
+ * backup's pack check writes. */
+#define NOT_IDENTITY " AND key <> 'packs-identity'"
+
 #define TEST_DIR  TEST_TMP "/c_backup_test_maint"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_REPO TEST_DIR "/repo"
@@ -227,7 +231,7 @@ static void test_prune_clears_its_marker(void **state)
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
     assert_int_equal(prune_snapshot(store, db, repo_id, br.snapshot_id), OK);
-    assert_int_equal(count("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?"), 0);
+    assert_int_equal(count("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?" NOT_IDENTITY), 0);
 }
 
 static void put_marker(int64_t snap)
@@ -259,7 +263,7 @@ static void test_stale_prune_marker_is_cleared_quietly(void **state)
     unsigned finished = 99;
     assert_int_equal(prune_finish_pending(db, repo_id, &finished), OK);
     assert_int_equal(finished, 0);
-    assert_int_equal(count("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?"), 0);
+    assert_int_equal(count("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?" NOT_IDENTITY), 0);
 }
 
 /* The case the marker exists for still counts: rows gone, record left. */
@@ -280,7 +284,7 @@ static void test_interrupted_prune_is_finished_and_counted(void **state)
     unsigned finished = 0;
     assert_int_equal(prune_finish_pending(db, repo_id, &finished), OK);
     assert_int_equal(finished, 1);
-    assert_int_equal(count("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?"), 0);
+    assert_int_equal(count("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?" NOT_IDENTITY), 0);
     struct stat sb;
     char path[512];
     snprintf(path, sizeof(path), "%s/snapshots/%s", TEST_REPO, snap);
@@ -537,7 +541,7 @@ static void test_checked_delete(void **state)
     err_clear();
     assert_int_equal(count_rows("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 1);
     assert_int_equal(count_rows("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 2);
-    assert_int_equal(count_rows("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?"), 0);
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?" NOT_IDENTITY), 0);
     char rec[256];
     snprintf(rec, sizeof(rec), TEST_REPO "/snapshots/%lld", (long long)br.snapshot_id);
     struct stat sb;

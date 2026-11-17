@@ -942,6 +942,17 @@ static void test_alert_names_repository_and_error(void **state)
                       title, sizeof(title), body, sizeof(body));
     assert_string_equal(title, "c-backup: gc of repo 8 failed");
     assert_non_null(strstr(body, "(no label) (id 8) at /srv/repos/misc"));
+
+    /* A job refused because its repository is not there failed nothing:
+     * the title says so instead (NIT-37), the body keeps the reason. */
+    job_alert_compose(db, 7, 44, "verify",
+                      "repository 7 is unavailable: /srv/repos/photos has no .cbackup "
+                      "marker; nothing was read or written",
+                      title, sizeof(title), body, sizeof(body));
+    job_alert_retitle_unavailable(title, sizeof(title));
+    assert_string_equal(title, "c-backup: verify of photos refused: repository unavailable");
+    assert_non_null(strstr(body, "is unavailable"));
+    assert_null(strstr(body, "data loss"));
 }
 
 /*

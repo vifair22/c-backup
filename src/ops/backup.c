@@ -2386,14 +2386,19 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     st = pack_presence_check(db, repo_id, 0, &pp);
     if (st != OK) return st;
     if (pp.unavailable)
-        return set_error(ERR_IO, "repository %lld is unavailable: its packs/ cannot be "
-                         "read (is it mounted?)", (long long)repo_id);
+        return set_error(ERR_UNAVAILABLE, PACK_PRESENCE_UNAVAILABLE_FMT,
+                         (long long)repo_id, pp.why);
     if (pp.degraded) {
         char why[256] = "";
         (void)pack_presence_degraded(db, repo_id, why, sizeof(why));
         return set_error(ERR_INVALID, PACK_PRESENCE_DEGRADED_ADVICE,
                          (long long)repo_id, why, (long long)repo_id);
     }
+
+    /* The pack-number mark's write, now rather than at the first pack,
+     * which opens while an index batch holds the database's write lock. */
+    st = pack_reserve_numbers(store);
+    if (st != OK) return st;
 
     /*
      * Staging files a killed run left behind. store_open only sweeps what is

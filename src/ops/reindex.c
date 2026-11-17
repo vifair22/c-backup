@@ -15,6 +15,8 @@
 #include "snap_record.h"
 #include "snapshot_ids.h"
 #include "db_write.h"
+#include "pack_ids.h"
+#include "repo.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -625,7 +627,11 @@ static void pack_num_seen(uint32_t pack_num, void *vctx)
     if (db_write(c->db,
             "INSERT OR REPLACE INTO packs (repo_id, id, filename, size,"
             " sealed_at, version) VALUES (?, ?, ?, ?, strftime('%s','now'), ?)",
-            (const char *[]){ c->repo, pid, name, szbuf, ver, NULL }, NULL) != 0) {
+            (const char *[]){ c->repo, pid, name, szbuf, ver, NULL }, NULL) != 0 ||
+        /* On disk and indexed: whatever dropped it, it is back. */
+        db_write(c->db,
+            "DELETE FROM pack_tombstones WHERE repo_id = ? AND id = ?",
+            (const char *[]){ c->repo, pid, NULL }, NULL) != 0) {
         c->failed = 1;
         return;
     }
@@ -653,6 +659,11 @@ static int drop_vanished_packs(pack_scan_ctx_t *c)
         const char *pid = r->rows[i][0];
         if (db_write(c->db,
                 "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
+                (const char *[]){ c->repo, pid, NULL }, NULL) != 0 ||
+            /* Its number stays known (B156), as pack_presence keeps it. */
+            db_write(c->db,
+                "INSERT OR IGNORE INTO pack_tombstones (repo_id, id, dropped_at)"
+                " VALUES (?, ?, strftime('%s','now'))",
                 (const char *[]){ c->repo, pid, NULL }, NULL) != 0 ||
             db_write(c->db,
                 "DELETE FROM packs WHERE repo_id = ? AND id = ?",
@@ -708,6 +719,25 @@ static status_t rebuild_pack_index(store_t *store, cutils_db_t *db, int64_t repo
 
     status_t st = pack_list(store, pack_num_seen, &c);
     if (st == OK && !c.failed && drop_vanished_packs(&c) != 0) c.failed = 1;
+    /*
+     * An object held by two packs - a pack dropped as missing and back,
+     * beside the copy a later backup stored (B156) - gets the pack_objects
+     * row of whichever pack the walk reached last, and an objects row that
+     * named the other would outlive it: gc removes the copy pack_objects
+     * does not name, and the objects row is left locating a pack that is
+     * gone. Where the two disagree, pack_objects is the one just read from
+     * the files.
+     */
+    if (st == OK && !c.failed &&
+        db_write(db,
+            "UPDATE objects SET location ="
+            " (SELECT CAST(po.pack_id AS TEXT) FROM pack_objects po"
+            "   WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)"
+            " WHERE repo_id = ? AND location NOT IN ('absent', 'staged') AND EXISTS"
+            " (SELECT 1 FROM pack_objects po WHERE po.repo_id = objects.repo_id"
+            "   AND po.hash = objects.hash AND CAST(po.pack_id AS TEXT) <> objects.location)",
+            (const char *[]){ repo, NULL }, NULL) != 0)
+        c.failed = 1;
     free(c.seen);
     if (st != OK || c.failed) {
         db_txn_rollback(db);
@@ -1017,6 +1047,62 @@ static status_t restore_snapshot_mark(store_t *store, cutils_db_t *db, int64_t r
     return OK;
 }
 
+static void max_pack_seen(uint32_t pack_num, void *ctx)
+{
+    int64_t *next = ctx;
+    if ((int64_t)pack_num + 1 > *next) *next = (int64_t)pack_num + 1;
+}
+
+/*
+ * The pack-number mark (pack_ids.h, rule 3): at least every pack on disk
+ * and every number the index has a row or tombstone for, so that after a
+ * lost database a pack dropped from the top - and away when the index was
+ * rebuilt - still cannot have its number issued again while the file
+ * lives. A file that is missing, damaged or behind is rewritten, and the
+ * job result says so.
+ */
+static status_t restore_pack_mark(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                  reindex_result_t *total)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    int64_t floor = 0;
+    (void)pack_list(store, max_pack_seen, &floor);
+    err_clear();
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT MAX(COALESCE((SELECT MAX(id) FROM packs WHERE repo_id = ?1), -1),"
+            "           COALESCE((SELECT MAX(id) FROM pack_tombstones WHERE repo_id = ?1), -1))",
+            (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1 && r->rows[0][0][0]) {
+        int64_t idx = strtoll(r->rows[0][0], NULL, 10) + 1;
+        if (idx > floor) floor = idx;
+    }
+    db_result_free(r);
+    store_raise_pack_floor(store, floor);
+
+    repo_marker_t m;
+    if (repo_marker_read(store_root(store), &m) != OK) {   /* a bare store */
+        err_clear();
+        total->pack_mark = floor;
+        return OK;
+    }
+    int64_t now = 0;
+    int repaired = 0, behind = 0;
+    int64_t cur = 0;
+    if (pack_ids_read(store_root(store), m.uuid, &cur) == OK) behind = cur < floor;
+    err_clear();
+    status_t st = pack_ids_raise(store_root(store), m.uuid, floor, &now, &repaired);
+    if (st != OK) return st;
+    if (repaired || behind) {
+        log_warn("reindex: the repository's pack-ids file was %s; rewritten at %lld",
+                 repaired ? "missing or damaged" : "behind its packs or the index",
+                 (long long)now);
+        total->pack_ids_repaired = 1;
+    }
+    total->pack_mark = now;
+    return OK;
+}
+
 status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
                       atomic_int *cancel, reindex_result_t *out)
 {
@@ -1108,6 +1194,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     st = reindex_lists(store, db, repo_id, 1);
     if (st == OK) st = fill_object_sizes(store, db, repo_id);
     if (st == OK) st = restore_snapshot_mark(store, db, repo_id, highest_record, &total);
+    if (st == OK) st = restore_pack_mark(store, db, repo_id, &total);
     if (st != OK) return st;
 
     /* Tags last: they attach to snapshot rows, which now exist. */
