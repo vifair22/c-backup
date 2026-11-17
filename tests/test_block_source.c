@@ -137,7 +137,7 @@ static status_t chunk_block(const cdc_params_t *p, const sp_block_stream_t *bs,
                             size_t window, uint8_t out[OBJECT_HASH_SIZE],
                             block_source_stats_t *stats)
 {
-    block_source_opts_t o = { use_extents, trust_zero, window };
+    block_source_opts_t o = { use_extents, trust_zero, window, NULL, NULL };
     block_source_t *b = NULL;
     status_t st = block_source_open(bs, size, &o, &b);
     if (st != OK) return st;

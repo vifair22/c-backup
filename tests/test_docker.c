@@ -524,7 +524,7 @@ static int setup_units(void **state)
     if (repo_register(udb, D "/repo", "t", &urepo) != OK) return -1;
     if (repo_store_open(D "/repo", NULL, &ustore) != OK) return -1;
     if (store_index_bind(ustore, udb, urepo, &uidx) != OK) return -1;
-    units_config_t uc = { "", 2, 10, 30, 1 };
+    units_config_t uc = { "", 2, 10, 30, 1, 0, 75, 30 };
     if (units_init(udb, NULL, &uc) != OK) return -1;
     return sp_registry_add(be.ops, be.ctx) == OK ? 0 : -1;
 }

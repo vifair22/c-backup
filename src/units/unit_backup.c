@@ -658,7 +658,7 @@ typedef struct {
  */
 static status_t bind_tokens(uctx_t *u, cutils_db_t *db, int64_t repo_id, int64_t snap)
 {
-    const char *keep[UNIT_ITEMS_MAX];
+    const char *keep[UNIT_ITEMS_MAX] = { NULL };
     size_t nk = 0;
     status_t st = OK;
     const char *nt = u->info->new_token && *u->info->new_token ? u->info->new_token : NULL;
