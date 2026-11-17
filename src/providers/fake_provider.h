@@ -95,6 +95,11 @@ status_t fake_disk_set_mtime(sp_ctx_t *ctx, const char *unit_id,
                              const char *item_id, int64_t mtime);
 status_t fake_tree_add(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
                        const char *read_root, const char *tree_path);
+/* Where the tree's bytes live on the host, the item's source (spec key
+ * "source"); without one it is read_root. An in-place restore through the
+ * helper stages beside it and swaps it. */
+status_t fake_tree_set_source(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
+                              const char *source);
 
 /*
  * Load units from a JSON file, replacing all of them:

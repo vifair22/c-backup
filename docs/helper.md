@@ -314,6 +314,8 @@ host_root = /proc/1/root   ; how the helper reads host paths itself
 ; zfs = /usr/sbin/zfs, btrfs = /sbin/btrfs, realpath = /usr/bin/realpath,
 ; lxc_dir = /usr/bin, user_root = /mnt/user, mnt_root = /mnt,
 ; boot_config = /boot/config (all defaults)
+; mountinfo = /proc/1/mountinfo   ; the host's mount table (default: this
+;                                 ; with host_root set, else /proc/self/mountinfo)
 
 [docker]
 enabled = 1
@@ -488,6 +490,23 @@ pool's capture directory and counted as one more instant.
 `restore.stage` creates `<domain>/.cbackup-restore/<job>-<random>` inside
 the mount's snapshot domain and `restore.swap` puts the staged one in place
 and the old directory at `<mount>.cbackup-old-<job>`: never a delete.
+
+**The mount is swapped where its bytes are (B178).** The daemon names the
+mount by its recorded path, as the container binds it
+(`/mnt/user/appdata/x`, `/var/lib/docker/volumes/v/_data`). The helper
+resolves it again, freshly, the way a backup does (the one pool or disk
+holding a `/mnt/user` path, symlinks, then host bind mounts through
+`mountinfo`), and the snapshot domain, the staging filesystem and the swap
+all use that real path: `/mnt/cache/appdata/x` is what is moved aside and
+replaced, and the recorded path is never written. The daemon also sends
+`real`, where the backup read the mount (`unit.json`'s `source`); when the
+path resolves anywhere else now (a share moved between pool and array,
+Docker's directory moved) the stage is refused, `denied`, logged at
+ERROR: `<mount> resolves to <now> now, but the backup read it at <then>;
+not restored in place`. Restore it to a new location instead. A snapshot
+whose `unit.json` has no `source` is staged without that check. The swap's
+answer carries both `mount` (recorded) and `real`, and `previous` is
+`<real>.cbackup-old-<job>`.
 
 The staging is pinned (B171). At stage the helper opens the base and the
 job directory with `O_DIRECTORY|O_NOFOLLOW`, one component at a time from

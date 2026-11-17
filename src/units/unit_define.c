@@ -817,6 +817,19 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
     } else if (st == OK) {
         /* In place: stopped, staged in its own domain, swapped in, the old
          * data kept beside it. */
+        /* Where the backup read each tree (unit.json's source): the helper
+         * refuses a swap when the recorded path resolves elsewhere now
+         * (B178). A snapshot without one is staged without the check. */
+        cJSON *uj = NULL;
+        {
+            char *ujt = NULL;
+            size_t tl = 0;
+            if (unit_read_file(store, db, repo_id, snap_id, ".cbackup-unit/unit.json", DEF_FILE_MAX, &ujt, &tl) == OK)
+                uj = cJSON_ParseWithLength(ujt, tl);
+            else
+                err_clear();
+            free(ujt);
+        }
         cJSON *sr = NULL;
         st = remote_op(prov, "unit.stop", args_unit(prov, unit), -1, &sr);
         if (st == OK) {
@@ -829,7 +842,18 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
         for (size_t i = 0; st == OK && i < n; i++) {
             cJSON *a = args_unit(prov, unit);
             sr = NULL;
-            if (a) { cJSON_AddStringToObject(a, "mount", t[i].path); cJSON_AddNumberToObject(a, "job", (double)job_id); }
+            const char *real = NULL;
+            const cJSON *it;
+            cJSON_ArrayForEach(it, cJSON_GetObjectItemCaseSensitive(uj, "items")) {
+                const char *id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "id"));
+                const char *kd = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "kind"));
+                if (id && kd && strcmp(kd, "tree") == 0 && strcmp(id, t[i].id) == 0) real = abs_of(it, "source");
+            }
+            if (a) {
+                cJSON_AddStringToObject(a, "mount", t[i].path);
+                cJSON_AddNumberToObject(a, "job", (double)job_id);
+                if (real) cJSON_AddStringToObject(a, "real", real);
+            }
             st = remote_op(prov, "restore.stage", a, -1, &sr);
             const char *stok = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(sr, "staging"));
             const char *sp = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(sr, "path"));
@@ -861,6 +885,7 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
             cJSON_Delete(sr);
             cJSON_Delete(sw);
         }
+        cJSON_Delete(uj);
         if (st != OK && stopped) { st = roll_back(prov, unit, tok, nswapped, was_running, st); rolled = 1; }
     }
 

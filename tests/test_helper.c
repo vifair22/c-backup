@@ -838,6 +838,62 @@ static void test_restore_stage_swap(void **state)
     hstop();
 }
 
+/*
+ * B178: a tree recorded at one path whose bytes are at another (a bind of
+ * /mnt/user/..., a volume under a bind-mounted /var/lib/docker) stages and
+ * swaps at the real path, and refuses when the backup read it elsewhere.
+ */
+#define REC2  HF_DIR "/user/app/u2"     /* as the container binds it */
+#define REAL2 HF_POOL "/app/u2"         /* where it is: in the domain */
+
+static void test_restore_real_path(void **state)
+{
+    (void)state;
+    hstart((unsigned)getuid(), 30, 86400, 1000, 1, 0);
+    assert_int_equal(mkdir(REAL2, 0700), 0);
+    hf_write(REAL2 "/live.txt", "live\n");
+    assert_int_equal(fake_unit_add(fk, "u2", "cbk-uat-two", SP_STATE_STOPPED, SP_CAP_SNAPSHOT), OK);
+    assert_int_equal(fake_tree_add(fk, "u2", "vol", HF_SNAP, REC2), OK);
+    assert_int_equal(fake_tree_set_source(fk, "u2", "vol", REAL2), OK);
+
+    /* The backup read it somewhere else: refused, saying both. */
+    cJSON *o = call(req("restore.stage", "{\"unit\":\"fake:u2\",\"mount\":\"" REC2 "\",\"job\":7,"
+                                         "\"real\":\"" HF_POOL "/app/elsewhere\"}"), NULL);
+    assert_string_equal(code_of(o), "denied");
+    assert_non_null(strstr(msg_of(o), "resolves to " REAL2 " now"));
+    cJSON_Delete(o);
+    /* real is optional, job is not. */
+    expect(req("restore.stage", "{\"unit\":\"fake:u2\",\"mount\":\"" REC2 "\",\"real\":\"" REAL2 "\"}"), "invalid");
+
+    o = call(req("restore.stage", "{\"unit\":\"fake:u2\",\"mount\":\"" REC2 "\",\"job\":7,\"real\":\"" REAL2 "\"}"), NULL);
+    assert_string_equal(code_of(o), "ok");
+    const cJSON *res = cJSON_GetObjectItemCaseSensitive(o, "result");
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "real")), REAL2);
+    const char *path = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "path"));
+    assert_int_equal(strncmp(path, HF_POOL "/.cbackup-restore/7-", strlen(HF_POOL "/.cbackup-restore/7-")), 0);
+    char rf[600], a[160];
+    snprintf(rf, sizeof(rf), "%s/restored.txt", path);
+    hf_write(rf, "restored\n");
+    snprintf(a, sizeof(a), "{\"staging\":\"%s\"}", cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "staging")));
+    cJSON_Delete(o);
+    o = call(req("restore.swap", a), NULL);
+    assert_string_equal(code_of(o), "ok");
+    res = cJSON_GetObjectItemCaseSensitive(o, "result");
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "mount")), REC2);
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "previous")), REAL2 ".cbackup-old-7");
+    cJSON_Delete(o);
+    struct stat sb;
+    assert_int_equal(stat(REAL2 "/restored.txt", &sb), 0);
+    assert_int_equal(stat(REAL2 ".cbackup-old-7/live.txt", &sb), 0);
+    assert_int_not_equal(lstat(REC2, &sb), 0);      /* the recorded path is never written */
+
+    /* Without real (an older daemon or snapshot) it stages at the real path. */
+    o = call(req("restore.stage", "{\"unit\":\"fake:u2\",\"mount\":\"" REC2 "\",\"job\":8}"), NULL);
+    assert_string_equal(code_of(o), "ok");
+    cJSON_Delete(o);
+    hstop();
+}
+
 /* ---- over the socket ---- */
 
 static int dial(void)
@@ -1165,6 +1221,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restart_sweep, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_stage_swap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_swap_pinned, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_real_path, setup, teardown),
         cmocka_unit_test_setup_teardown(test_socket, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

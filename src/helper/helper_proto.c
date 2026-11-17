@@ -170,7 +170,7 @@ static int token_ok(const char *s)
 
 typedef enum {
     A_INT, A_BOOL, A_PROVIDER, A_UNIT, A_UNITS, A_PATHS, A_TOKEN, A_NAME,
-    A_DISKS, A_NAME_OR_NULL, A_FREEZE, A_OUTCOME, A_PATH, A_JOB, A_OBJECT,
+    A_DISKS, A_NAME_OR_NULL, A_FREEZE, A_OUTCOME, A_PATH, A_JOB, A_OBJECT, A_REAL,
 } akind_t;
 
 typedef struct { const char *key; akind_t kind; } akey_t;
@@ -197,7 +197,8 @@ static const schema_t k_schema[HOP_COUNT] = {
     [HOP_VM_BACKUP_END]          = { { { "session", A_TOKEN }, { "outcome", A_OUTCOME } }, 2, 0 },
     [HOP_VM_CHECKPOINT_REDEFINE] = { { { "unit", A_UNIT }, { "checkpoint", A_NAME } }, 2, 0 },
     [HOP_VM_INSTALL_STATE]       = { { { "unit", A_UNIT }, { "staging", A_TOKEN } }, 2, 0 },
-    [HOP_RESTORE_STAGE]          = { { { "unit", A_UNIT }, { "mount", A_PATH }, { "job", A_JOB } }, 3, 0 },
+    [HOP_RESTORE_STAGE]          = { { { "unit", A_UNIT }, { "mount", A_PATH }, { "job", A_JOB },
+                                       { "real", A_REAL } }, 4, 0, 1 },
     [HOP_RESTORE_SWAP]           = { { { "staging", A_TOKEN }, { "undo", A_BOOL } }, 2, 0, 1 },
     [HOP_UNIT_STOP]              = { { { "unit", A_UNIT } }, 1, 0 },
     [HOP_UNIT_START]             = { { { "unit", A_UNIT } }, 1, 0 },
@@ -327,6 +328,11 @@ static int take_arg(helper_req_t *r, const akey_t *k, const cJSON *v, char *why,
             return set_bad(why, wsz, "%s: %s must be a clean absolute path", op, k->key);
         snprintf(r->mount, sizeof(r->mount), "%s", v->valuestring);
         return 0;
+    case A_REAL:
+        if (!cJSON_IsString(v) || !helper_path_clean(v->valuestring) || strcmp(v->valuestring, "/") == 0)
+            return set_bad(why, wsz, "%s: %s must be a clean absolute path", op, k->key);
+        snprintf(r->real, sizeof(r->real), "%s", v->valuestring);
+        return 0;
     case A_DISKS: {
         int n = cJSON_IsArray(v) ? cJSON_GetArraySize(v) : -1;
         if (n < 1 || n > HELPER_DISKS_MAX)
@@ -423,7 +429,7 @@ helper_err_t helper_request_parse(const void *buf, size_t len, helper_req_t *req
         goto out;
     }
     const schema_t *s = &k_schema[found];
-    int present = 0;
+    int present = 0, required = 0;
     const cJSON *a;
     cJSON_ArrayForEach(a, args) {
         int known = 0;
@@ -432,6 +438,7 @@ helper_err_t helper_request_parse(const void *buf, size_t len, helper_req_t *req
             known = 1;
             if (take_arg(req, &s->keys[k], a, why, wsz) != 0) goto out;
             present++;
+            required += k < s->n - s->n_opt;
         }
         if (!known) {
             snprintf(why, wsz, "%s: unknown argument '%.60s'", k_ops[found], a->string ? a->string : "");
@@ -439,7 +446,7 @@ helper_err_t helper_request_parse(const void *buf, size_t len, helper_req_t *req
         }
     }
     if (cJSON_GetArraySize(args) != present ||
-        (s->one_of ? present != 1 : (present < s->n - s->n_opt || present > s->n))) {
+        (s->one_of ? present != 1 : (required != s->n - s->n_opt || present > s->n))) {
         snprintf(why, wsz, "%s: wrong arguments; it takes %s", k_ops[found],
                  s->one_of ? "exactly one of its token keys" : "exactly its listed keys");
         goto out;
