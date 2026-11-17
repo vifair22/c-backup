@@ -4,6 +4,7 @@
 #include "db_write.h"
 
 #include "phase_timer.h"
+#include "checkpointer.h"
 #include "wal_sync.h"
 
 #include <cutils/log.h>
@@ -90,6 +91,8 @@ status_t db_txn_begin(cutils_db_t *db)
         return set_error(ERR_BUSY, "db_txn_begin: this thread already holds "
                                    "the write lock (nested transaction)");
 
+    /* Past the WAL's hard cap, wait for the checkpointer first (B181). */
+    checkpointer_throttle();
     uint64_t t0 = phase_now();
     write_lock();
     int rc = db_exec_raw(db, "BEGIN");

@@ -222,24 +222,30 @@ static void test_wal_stays_near_the_cap_under_a_long_writer(void **state)
 }
 
 /*
- * A writer faster than a checkpoint can copy (no pause at all, about a
- * hundred MiB a second here): the small-remainder escalation never gets
- * its chance, and the hard cap takes the lock anyway. The WAL is still
- * bounded - by the hard cap plus what arrives during one checkpoint - and
- * comes back under the cap once the writer stops.
+ * A writer faster than a checkpoint can copy (no pause at all, a few
+ * hundred MiB a second into the page cache), on a fast device and on one
+ * whose syncs take 50 ms: the WAL holds to the hard cap (B181). What it
+ * may pass the cap by is what writers append between two looks at the WAL
+ * (5 ms) and the batch a writer already holds, so the bound asserted is a
+ * quarter over the cap. Before B181 the checkpointer's unlocked rounds let
+ * the WAL run to 2.7 times the cap at 20 ms a sync and 5.6 times at 50,
+ * and this test, asserting twice the cap, failed on the slower CI runner.
+ * Once the writer stops the WAL comes back under four thresholds.
  */
-static void test_wal_is_bounded_under_a_writer_faster_than_checkpoints(void **state)
+static void flat_out(unsigned pause_ms)
 {
-    (void)state;
+    checkpointer_set_test_pause_ms(pause_ms);
     assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
     writer_t w;
     memset(&w, 0, sizeof(w));
     uint32_t peak = run_writer_for(&w, 4000);
-    report("flat out", &w, peak);
+    report(pause_ms ? "flat out, slow syncs" : "flat out", &w, peak);
     checkpointer_stats_t s;
     checkpointer_stats(&s);
+    print_message("  writers held at the hard cap: %lu, longest %.1f ms\n",
+                  s.throttled, (double)s.max_throttle_ns / 1e6);
     assert_true((uint64_t)w.commits * 4 * 4 > (uint64_t)THRESHOLD * CKPT_HARD_FACTOR * 3);
-    assert_true(peak < THRESHOLD * CKPT_HARD_FACTOR * 2);
+    assert_true(peak < THRESHOLD * CKPT_HARD_FACTOR + THRESHOLD * CKPT_HARD_FACTOR / 4);
     assert_true(s.escalations > 0);
     uint32_t f = UINT32_MAX;
     for (int i = 0; i < 300 && f > THRESHOLD * CKPT_CAP_FACTOR; i++) {
@@ -248,6 +254,22 @@ static void test_wal_is_bounded_under_a_writer_faster_than_checkpoints(void **st
         sleep_ms(10);
     }
     assert_true(f <= THRESHOLD * CKPT_CAP_FACTOR);
+    checkpointer_set_test_pause_ms(0);
+}
+
+static void test_wal_is_bounded_under_a_writer_faster_than_checkpoints(void **state)
+{
+    (void)state;
+    flat_out(0);
+}
+
+static void test_the_hard_cap_holds_on_a_slow_device(void **state)
+{
+    (void)state;
+    flat_out(50);
+    checkpointer_stats_t s;
+    checkpointer_stats(&s);
+    assert_true(s.throttled > 0);        /* writers did their half */
 }
 
 /*
@@ -294,6 +316,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_no_commit_checkpoints, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_stays_near_the_cap_under_a_long_writer, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_is_bounded_under_a_writer_faster_than_checkpoints, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_the_hard_cap_holds_on_a_slow_device, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pinned_reader_holds_nobody_up, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

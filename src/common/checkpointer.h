@@ -41,12 +41,18 @@
  *   the last round, so copying it under the lock takes about as long as
  *   that round did: the thread escalates when the remainder is small or
  *   the last round took no more than 200 ms, and otherwise waits for the
- *   next tick. So the lock is held for about one short copy. Past the hard cap (16 x the threshold,
- *   1 GiB by default) it takes the lock whatever the remainder, so a
- *   writer faster than the checkpoint can copy cannot grow the WAL without
- *   bound; the hold is still one PASSIVE, which never waits on a reader or
- *   a writer, and a hold over a second is logged.
+ *   next tick. So the lock is held for about one short copy.
  *
+ *   The hard cap (16 x the threshold, 1 GiB by default; B181). Past it the
+ *   thread goes straight to the lock, with no unlocked rounds first, and
+ *   writers help: each one, before it queues for the write lock, looks at
+ *   the WAL (at most every 5 ms across all writers) and, past the cap and
+ *   not fully copied, wakes the thread and waits, holding no lock, until
+ *   the copy is complete. On a slow device the thread alone let a writer
+ *   that never syncs run the WAL to 5.6 times the cap (50 ms syncs) while
+ *   its unlocked rounds ran. A writer waits at most 2 s, and not at all for
+ *   a second after a copy that could not complete (a reader holding an old
+ *   snapshot), since holding writers back cannot help that. *
  *   Nothing here blocks indefinitely: PASSIVE does not wait for anything,
  *   and the connection's busy timeout is 50 ms. A checkpoint that cannot
  *   start is retried next tick. A reader pinning an old snapshot (none in
@@ -82,6 +88,8 @@ typedef struct {
     unsigned long busy;             /* checkpoints that could not start */
     uint32_t      max_wal_frames;   /* the most frames the WAL was seen holding */
     uint64_t      max_lock_ns;      /* the longest escalation hold */
+    unsigned long throttled;        /* writers held at BEGIN past the hard cap (B181) */
+    uint64_t      max_throttle_ns;  /* the longest of those waits */
 } checkpointer_stats_t;
 
 /*
@@ -96,6 +104,16 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
 void checkpointer_stop(void);
 
 void checkpointer_stats(checkpointer_stats_t *out);
+
+/* Called by db_txn_begin before it queues for the write lock: past the
+ * hard cap, wait for the checkpointer to complete a copy (B181; the design
+ * is at the function). Returns at once when the checkpointer is not
+ * running. */
+void checkpointer_throttle(void);
+
+/* Tests: sleep this long before every PASSIVE, a device whose syncs are
+ * slow. */
+void checkpointer_set_test_pause_ms(unsigned ms);
 
 /*
  * The WAL's frame count and how many of them are copied back, from the
