@@ -69,7 +69,8 @@ static int teardown(void **state)
     (void)state;
     libvirt_backend_fini(&be);
     helper_policy_free(&pol);
-    return 0;
+    /* The scratch guard fails a suite that leaves its directory behind. */
+    return system("rm -rf '" D "'") == 0 ? 0 : -1;
 }
 
 /* Every hold libvirt would have to be asked about is kept, none dropped
