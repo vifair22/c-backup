@@ -211,9 +211,9 @@ the daemon refuses to start with a write route that has neither, and
   after the next start, with the edit either wholly there or wholly not.
 
 The sync is the only cost the durable class adds, and it depends on the
-disk under `state.db`: about 25 ms at the median on an idle NVMe drive, and
-up to 2.7 s (p99) on a local disk saturated by a backup (Manual section
-6.4).
+disk under `state.db` and what else is writing to it: about 25 ms at the
+median on an idle NVMe drive, and up to 2.7 s (p99) on a saturated local
+disk (Manual section 6.4 has the numbers measured during a backup).
 
 | Method | Route | Class | Why |
 |---|---|---|---|

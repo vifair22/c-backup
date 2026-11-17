@@ -1001,11 +1001,14 @@ What happens after the commit depends on the edit:
 A commit-only edit returns in well under a second however long the backup
 runs. A durable edit also waits for the database's write-ahead log to be
 synced (one `fdatasync`), and that sync costs whatever the disk under
-`state.db` makes it cost. Measured during a backup: about 25 ms at the
-median on an idle NVMe drive, and up to 2.7 s at the 99th percentile on a
-local disk saturated by other programs' writes; under that kind of load a
-tag write took seconds. Keep `state.db` (`db.path`) off a disk that other
-work saturates if tag and delete latency matters. Which class every API
+`state.db` makes it cost, and it waits behind the backup's own writes. As
+measured: about 25 ms at the median on an idle NVMe drive; during a 13 GiB
+backup on the same kind of drive, a tag write took 0.15 s at the median and
+0.9 s at the 99th percentile, and 0.6 s and 1.3 s with other programs
+saturating the disk; on a saturated local disk the sync alone reached 2.7 s
+at the 99th percentile, and tag writes took seconds. Keep `state.db`
+(`db.path`) off a disk that other work saturates if tag and delete latency
+matters. Which class every API
 route has is listed in `docs/api.md`.
 
 A change to a repository's sources applies to backups submitted after it. A
