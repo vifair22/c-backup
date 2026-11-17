@@ -599,7 +599,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_write_batch_yields_to_a_waiter, setup, teardown),
         cmocka_unit_test_setup_teardown(test_guard_reports_a_write_outside_the_lock, setup, teardown),
     };
-    /* Before any test opens its database, so every connection is hooked. */
+    /* Before any test opens its database, so every connection is hooked.
+     * The guard test counts violations rather than aborting on one, so the
+     * abort the end-to-end suites ask for must not reach it from a caller's
+     * environment. */
+    unsetenv("C_BACKUP_TXN_GUARD");
     db_txn_guard_install();
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
