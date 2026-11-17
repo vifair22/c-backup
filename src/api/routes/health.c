@@ -47,7 +47,7 @@ static api_response_t handle_readyz(const api_request_t *req, void *userdata)
 
 int routes_register_health(api_server_t *srv, cutils_db_t *db)
 {
-    if (api_server_route(srv, "/healthz", API_GET, handle_healthz, NULL) != 0) return -1;
-    if (api_server_route(srv, "/readyz",  API_GET, handle_readyz,  db)   != 0) return -1;
+    if (api_server_route(srv, "/healthz", API_GET, API_CLASS_NONE, handle_healthz, NULL) != 0) return -1;
+    if (api_server_route(srv, "/readyz",  API_GET, API_CLASS_NONE, handle_readyz,  db)   != 0) return -1;
     return 0;
 }

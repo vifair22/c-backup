@@ -100,12 +100,17 @@ void routes_unit_policy(cutils_db_t *db, int64_t repo_id, const char *unit_key,
                         gfs_retention_t *ret);
 
 /* Units (src/api/routes/units.c). /providers registers its own routes; the
- * repo-scoped ones are dispatched from repos.c, and units_path_allow is
- * their part of the repo path table. */
+ * repo-scoped ones are dispatched from repos.c, and units_path_entry is
+ * their part of the repo path table (NULL for a path that is not theirs). */
 struct job_manager;
 void           routes_units_init(cutils_db_t *db, struct job_manager *jm);
 int            routes_register_providers(api_server_t *srv);
-const char    *units_path_allow(const char *rest);
+const api_path_t *units_path_entry(const char *rest);
+
+/* The /repos/<id> path tables, whole, for the test that holds every write
+ * in them to a durability class (tests/test_route_classes.c). */
+const api_path_t *routes_repo_paths(size_t *n);
+const api_path_t *routes_units_paths(size_t *n);
 api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const char *rest);
 api_response_t units_route_put(const api_request_t *req, int64_t repo_id, const char *rest);
 api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const char *rest);

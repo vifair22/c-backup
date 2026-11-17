@@ -28,6 +28,7 @@ typedef struct {
     char            pattern[128];
     api_method_t    method;
     route_kind_t    kind;
+    api_write_class_t cls;
     union {
         api_handler_fn        buffered;
         api_stream_handler_fn streaming;
@@ -36,6 +37,13 @@ typedef struct {
 } route_entry_t;
 
 #define MAX_ALLOW_FNS 8
+#define MAX_CLASS_FNS 8
+
+typedef struct {
+    char          pattern[128];   /* ends in '*' */
+    api_class_fn  fn;
+    void         *userdata;
+} class_entry_t;
 
 typedef struct {
     char          pattern[128];   /* ends in '*' */
@@ -62,6 +70,8 @@ struct api_server {
     int                nroutes;
     allow_entry_t      allow_fns[MAX_ALLOW_FNS];
     int                nallow;
+    class_entry_t      class_fns[MAX_CLASS_FNS];
+    int                nclass;
     api_auth_fn        auth_fn;
     void              *auth_ud;
     api_after_write_fn after_write_fn;
@@ -163,6 +173,37 @@ static const char *allowed_methods(const api_server_t *srv, const char *url,
         used += (size_t)n;
     }
     return used ? buf : NULL;
+}
+
+/* The resolver for a BY_PATH route's URL: the longest pattern matching. */
+static const class_entry_t *class_fn_for(const api_server_t *srv, const char *url)
+{
+    const class_entry_t *best = NULL;
+    size_t best_len = 0;
+    for (int i = 0; i < srv->nclass; i++) {
+        const char *pat = srv->class_fns[i].pattern;
+        size_t plen = strlen(pat);
+        if (strncmp(url, pat, plen - 1) != 0) continue;
+        if (!best || plen > best_len) { best = &srv->class_fns[i]; best_len = plen; }
+    }
+    return best;
+}
+
+/* What a 2xx answer from `route` to `url` waits for. A BY_PATH resolver
+ * that cannot name a class for a path its handler just served is a bug in
+ * its table; durable is the safe reading, since an unneeded sync costs only
+ * time. */
+static api_write_class_t route_class(const api_server_t *srv, const route_entry_t *route,
+                                     const char *url, api_method_t method)
+{
+    if (method == API_GET) return API_CLASS_NONE;
+    if (route->cls != API_CLASS_BY_PATH) return route->cls;
+    const class_entry_t *c = class_fn_for(srv, url);
+    api_write_class_t cls = c ? c->fn(url, method, c->userdata) : API_CLASS_NONE;
+    if (cls == API_DURABLE || cls == API_COMMIT_ONLY) return cls;
+    log_error("api: %s %s has no durability class; syncing it as durable",
+              METHOD_NAMES[method], url);
+    return API_DURABLE;
 }
 
 static const char *get_header(struct MHD_Connection *conn, const char *name)
@@ -517,6 +558,20 @@ static enum MHD_Result try_serve_static(struct MHD_Connection *conn,
 
 /* --- Request handler (called by libmicrohttpd) --- */
 
+/* A buffered route's handler, then for a 2xx the after-write hook if the
+ * route's class is durable (api_write_class_t, B144). A commit-only route
+ * answers from its commit and leaves the sync to the flusher. */
+static api_response_t run_buffered(api_server_t *srv, const route_entry_t *route,
+                                   const api_request_t *req)
+{
+    api_response_t resp = route->handler.buffered(req, route->userdata);
+    if (req->method != API_GET && resp.status >= 200 && resp.status < 300 &&
+        srv->after_write_fn &&
+        route_class(srv, route, req->url, req->method) == API_DURABLE)
+        srv->after_write_fn(srv->after_write_ud);
+    return resp;
+}
+
 static enum MHD_Result request_handler(void *cls,
                                        struct MHD_Connection *conn,
                                        const char *url,
@@ -670,13 +725,7 @@ static enum MHD_Result request_handler(void *cls,
             return ret;
         }
 
-        api_response_t resp = route->handler.buffered(&req, route->userdata);
-
-        /* A request that changed something is durable before it is
-         * answered (api_server_set_after_write). */
-        if (api_method != API_GET && resp.status >= 200 && resp.status < 300 &&
-            srv->after_write_fn)
-            srv->after_write_fn(srv->after_write_ud);
+        api_response_t resp = run_buffered(srv, route, &req);
 
         enum MHD_Result ret = send_response_full(conn, resp.status,
             resp.content_type ? resp.content_type : "application/json",
@@ -795,15 +844,29 @@ api_server_t *api_server_create(int tcp_port, const char *bind_addr,
 }
 
 int api_server_route(api_server_t *srv, const char *pattern,
-                     api_method_t method, api_handler_fn handler,
-                     void *userdata)
+                     api_method_t method, api_write_class_t cls,
+                     api_handler_fn handler, void *userdata)
 {
     if (srv->nroutes >= MAX_ROUTES)
         return set_error(CUTILS_ERR, "too many API routes");
+    if (method < API_GET || method > API_DELETE)
+        return set_error(CUTILS_ERR, "route %s: no such method", pattern);
+    /* No default: a write that does not say what its answer waits for
+     * would get whichever behaviour a default picked, silently (B144). */
+    if (method == API_GET ? cls != API_CLASS_NONE
+                          : (cls != API_DURABLE && cls != API_COMMIT_ONLY &&
+                             cls != API_CLASS_BY_PATH))
+        return set_error(CUTILS_ERR, "route %s %s: %s", METHOD_NAMES[method], pattern,
+                         method == API_GET ? "a GET has no durability class"
+                                           : "a write needs a durability class");
+    if (cls == API_CLASS_BY_PATH && pattern[strlen(pattern) - 1] != '*')
+        return set_error(CUTILS_ERR, "route %s %s: a per-path class needs a wildcard",
+                         METHOD_NAMES[method], pattern);
 
     route_entry_t *r = &srv->routes[srv->nroutes++];
     snprintf(r->pattern, sizeof(r->pattern), "%s", pattern);
     r->method = method;
+    r->cls = cls;
     r->kind = ROUTE_KIND_BUFFERED;
     r->handler.buffered = handler;
     r->userdata = userdata;
@@ -818,10 +881,13 @@ int api_server_route_streaming(api_server_t *srv, const char *pattern,
 {
     if (srv->nroutes >= MAX_ROUTES)
         return set_error(CUTILS_ERR, "too many API routes");
+    if (method != API_GET)
+        return set_error(CUTILS_ERR, "streaming route %s: GET only", pattern);
 
     route_entry_t *r = &srv->routes[srv->nroutes++];
     snprintf(r->pattern, sizeof(r->pattern), "%s", pattern);
     r->method = method;
+    r->cls = API_CLASS_NONE;
     r->kind = ROUTE_KIND_STREAMING;
     r->handler.streaming = handler;
     r->userdata = userdata;
@@ -842,6 +908,81 @@ int api_server_route_allow(api_server_t *srv, const char *pattern,
     a->fn = fn;
     a->userdata = userdata;
     return CUTILS_OK;
+}
+
+int api_server_route_class(api_server_t *srv, const char *pattern,
+                           api_class_fn fn, void *userdata)
+{
+    size_t plen = strlen(pattern);
+    if (plen == 0 || pattern[plen - 1] != '*')
+        return set_error(CUTILS_ERR, "class resolver pattern must end in '*'");
+    if (srv->nclass >= MAX_CLASS_FNS)
+        return set_error(CUTILS_ERR, "too many class resolvers");
+    class_entry_t *c = &srv->class_fns[srv->nclass++];
+    snprintf(c->pattern, sizeof(c->pattern), "%s", pattern);
+    c->fn = fn;
+    c->userdata = userdata;
+    return CUTILS_OK;
+}
+
+api_write_class_t api_server_class_for(const api_server_t *srv, const char *url,
+                                       api_method_t method)
+{
+    if (method < API_GET || method > API_DELETE) return API_CLASS_NONE;
+    const route_entry_t *r = find_route(srv, url, method);
+    return r ? route_class(srv, r, url, method) : API_CLASS_NONE;
+}
+
+int api_server_route_count(const api_server_t *srv)
+{
+    return srv->nroutes;
+}
+
+int api_server_route_at(const api_server_t *srv, int i, const char **pattern,
+                        api_method_t *method, api_write_class_t *cls)
+{
+    if (i < 0 || i >= srv->nroutes) return -1;
+    if (pattern) *pattern = srv->routes[i].pattern;
+    if (method)  *method  = srv->routes[i].method;
+    if (cls)     *cls     = srv->routes[i].cls;
+    return 0;
+}
+
+api_response_t api_server_dispatch(api_server_t *srv, const api_request_t *req)
+{
+    const route_entry_t *route = req->method >= API_GET && req->method <= API_DELETE
+                                 ? find_route(srv, req->url, req->method) : NULL;
+    if (!route || route->kind != ROUTE_KIND_BUFFERED)
+        return api_error(404, "not found");
+    return run_buffered(srv, route, req);
+}
+
+/* Static: the Allow values a path table can produce, by method bitmask
+ * (GET 1, POST 2, PUT 4, DELETE 8), in the order the router lists them. */
+static const char *const PATH_ALLOW[16] = {
+    NULL, "GET", "POST", "GET, POST", "PUT", "GET, PUT", "POST, PUT",
+    "GET, POST, PUT", "DELETE", "GET, DELETE", "POST, DELETE",
+    "GET, POST, DELETE", "PUT, DELETE", "GET, PUT, DELETE",
+    "POST, PUT, DELETE", "GET, POST, PUT, DELETE",
+};
+
+const char *api_path_allow(const api_path_t *p)
+{
+    if (!p) return NULL;
+    unsigned m = (p->get ? 1u : 0u) | (p->post != API_CLASS_NONE ? 2u : 0u) |
+                 (p->put != API_CLASS_NONE ? 4u : 0u) | (p->del != API_CLASS_NONE ? 8u : 0u);
+    return PATH_ALLOW[m];
+}
+
+api_write_class_t api_path_class(const api_path_t *p, api_method_t method)
+{
+    if (!p) return API_CLASS_NONE;
+    switch (method) {
+    case API_POST:   return p->post;
+    case API_PUT:    return p->put;
+    case API_DELETE: return p->del;
+    default:         return API_CLASS_NONE;
+    }
 }
 
 void api_server_set_auth(api_server_t *srv, api_auth_fn fn, void *userdata)
@@ -875,6 +1016,14 @@ int api_server_start(api_server_t *srv)
 {
     mhd_cls_t *tcp_cls  = srv->_tcp_cls;
     mhd_cls_t *unix_cls = srv->_unix_cls;
+
+    /* A per-path route with no resolver would answer every write as
+     * durable through route_class's fallback, and log an error for each. */
+    for (int i = 0; i < srv->nroutes; i++)
+        if (srv->routes[i].cls == API_CLASS_BY_PATH &&
+            !class_fn_for(srv, srv->routes[i].pattern))
+            return set_error(CUTILS_ERR, "route %s %s: per-path class with no resolver",
+                             METHOD_NAMES[srv->routes[i].method], srv->routes[i].pattern);
 
     if (srv->tcp_port > 0) {
         if (!tcp_cls)
