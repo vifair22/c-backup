@@ -2048,12 +2048,23 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
      * until every batch has landed. An interrupted run therefore leaves node
      * rows that no snapshot claims - index garbage a reindex rebuilds, which
      * is the state eviction already produces deliberately.
+     *
+     * And it yields to a queued writer by the rule every batch uses
+     * (db_txn_batch_should_end), at every row (B144). It only ended at
+     * NODE_BATCH rows, so a tag or sources write that queued during
+     * indexing waited for up to 2,000 node and FTS inserts: about 80 ms
+     * on an idle host, 700 ms with the CPU contended,
+     * and past the 2 s test bound under disk pressure, against Manual 6.3's
+     * "well under a second". Each extra commit is one more batch boundary of
+     * the kind above, so nothing about nodes_materialized changes.
      */
     #define NODE_BATCH 2000
-    uint32_t since_commit = 0;
+    batch_t nb;
+    memset(&nb, 0, sizeof(nb));
     p->timers->txn_site = PHASE_COMMIT_INDEX;
     status_t bst = db_txn_begin(p->db);
     if (bst != OK) return bst;
+    db_txn_batch_opened(&nb.rule);
 
     for (uint32_t i = 0; i < p->count; i++) {
         /* In no tree, so in no index row either: the index is derived from
@@ -2159,12 +2170,13 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
             return set_error(ERR_IO, "index_nodes: fts insert failed");
         }
 
-        if (++since_commit >= NODE_BATCH) {
+        if (++nb.since_commit >= NODE_BATCH || db_txn_batch_should_end(&nb.rule)) {
             status_t cst = db_txn_commit(p->db);
             if (cst != OK) return cst;
-            since_commit = 0;
+            nb.since_commit = 0;
             cst = db_txn_begin(p->db);
             if (cst != OK) return cst;
+            db_txn_batch_opened(&nb.rule);
         }
     }
 
