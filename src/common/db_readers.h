@@ -62,9 +62,14 @@ int db_readers_locate(int64_t repo_id, const char *hex, uint64_t cols[6]);
  * quiesces the readers for its locked round, so its copy completes and the
  * restart lands. A lookup waits for the round, which is milliseconds.
  *
+ * A lookup that arrives while they are held waits at a gate rather than
+ * competing for a slot, so quiescing waits only for the lookups already
+ * running.
+ *
  * Lock order: the checkpointer takes these with the write lock held; a
  * reader holds its slot only around one statement and never reaches for
- * the write lock inside it, so nothing waits the other way round.
+ * the write lock inside it, and holds nothing while it waits at the gate,
+ * so nothing waits the other way round.
  */
 void db_readers_quiesce(void);
 void db_readers_resume(void);

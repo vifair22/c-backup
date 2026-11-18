@@ -44,6 +44,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 
 #include <cmocka.h>
@@ -222,6 +223,8 @@ static void three_packs(int64_t ids[3])
     assert_int_equal(scalar("SELECT COUNT(*) FROM packs WHERE repo_id = ?"), 3);
 }
 
+static void after_the_heal(int64_t s4, int64_t old, int ancestor_touched);
+
 static void test_missing_pack_is_stored_again(void **state)
 {
     (void)state;
@@ -259,12 +262,63 @@ static void test_missing_pack_is_stored_again(void **state)
 
     /* The next backup reads c again and stores it, and the trees. */
     int64_t s4 = backup_ok();
-    assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ? AND location = 'absent'"), 0);
+    after_the_heal(s4, ids[2], 0);
+}
+
+/*
+ * What the backup after a heal can and cannot bring back (FLAKE-24).
+ *
+ * Every object the new snapshot names has to be present: the backup made
+ * each one again. Objects only the old snapshot named stay absent unless the
+ * new one happens to make the same bytes, and the trees of the source's
+ * ancestors - scan_tree records every directory up to / - are only the same
+ * bytes when those directories are unchanged. The scratch root, ~/.cache and
+ * $HOME change whenever anything else on the machine touches them, so the
+ * old snapshot's trees for them were sometimes not made again: three of them
+ * when ~/.cache moved, which is FLAKE-24, and deterministically when the
+ * test touches an ancestor itself. Those stay absent, verify names exactly
+ * them, and the old snapshot is restorable only when none is left.
+ */
+static void after_the_heal(int64_t s4, int64_t old, int ancestor_touched)
+{
+    char sql[1024];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM objects o WHERE o.repo_id = ? AND o.location = 'absent'"
+             " AND (o.hash IN (SELECT content_hash FROM nodes WHERE repo_id = o.repo_id"
+             "                 AND snap_id = %lld)"
+             "   OR o.hash IN (SELECT subtree_hash FROM nodes WHERE repo_id = o.repo_id"
+             "                 AND snap_id = %lld)"
+             "   OR o.hash IN (SELECT root_tree_hash FROM snapshots WHERE repo_id = o.repo_id"
+             "                 AND id = %lld))", (long long)s4, (long long)s4, (long long)s4);
+    assert_int_equal(scalar(sql), 0);
     assert_restores(s4);
-    assert_restores(ids[2]);     /* the old snapshot names the same objects */
-    v = verify();
-    assert_int_equal(v.missing, 0);
-    assert_int_equal(v.ok, v.checked);
+
+    long long left = scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ? AND location = 'absent'");
+    if (ancestor_touched) assert_true(left > 0);
+    verify_result_t v = verify();
+    assert_int_equal(v.missing, (uint64_t)left);
+    if (left == 0) {
+        assert_restores(old);    /* the old snapshot names the same objects */
+        assert_int_equal(v.ok, v.checked);
+    }
+}
+
+static void test_missing_pack_ancestor_changed(void **state)
+{
+    (void)state;
+    pack_presence_set_brake(100, 1000);
+    int64_t ids[3];
+    three_packs(ids);
+    remove_pack(pack_of("c"));
+    pack_presence_t pp;
+    assert_int_equal(pack_presence_check(db, repo_id, 0, &pp), OK);
+    assert_int_equal(pp.packs_dropped, 1);
+    /* An ancestor of the source changes, as ~/.cache does whenever anything
+     * on the machine creates or removes an entry in it. */
+    struct timespec ts[2] = { { 0, UTIME_OMIT }, { 1000000000, 0 } };
+    assert_int_equal(utimensat(AT_FDCWD, TEST_DIR, ts, 0), 0);
+    int64_t s4 = backup_ok();
+    after_the_heal(s4, ids[2], 1);
 }
 
 /*
@@ -1336,6 +1390,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_missing_pack_is_stored_again, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_missing_pack_ancestor_changed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_an_older_snapshots_loss_is_reported, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_checks_before_dedup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unmounted_packs_dir_changes_nothing, setup, teardown),
