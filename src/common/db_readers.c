@@ -26,6 +26,23 @@ static unsigned      g_n;
 static atomic_int    g_active;
 static atomic_uint   g_next;
 static atomic_ulong  g_lookups;
+static atomic_uint   g_test_hold_us;
+
+/*
+ * The quiesce gate. glibc mutexes are not fair: a reader that lets its slot
+ * go and asks for one again at once takes it back before a thread blocked
+ * on it wakes, so with lookups back to back db_readers_quiesce waited 13 s
+ * on average for sixteen slots, under the write lock (B201). While the flag
+ * is up a lookup waits at the gate before it takes a slot, so the quiesce
+ * waits only for the lookups already running, one per slot at most.
+ */
+static pthread_mutex_t g_gate = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int      g_quiescing;
+
+void db_readers_set_test_hold_us(unsigned us)
+{
+    atomic_store(&g_test_hold_us, us);
+}
 
 static const char LOCATE_SQL[] =
     "SELECT po.pack_id, po.offset, po.comp_size, po.orig_size,"
@@ -105,12 +122,21 @@ static slot_t *slot_take(void)
 int db_readers_locate(int64_t repo_id, const char *hex, uint64_t cols[6])
 {
     if (!atomic_load(&g_active) || !hex) return -1;
+    if (atomic_load(&g_quiescing)) {
+        pthread_mutex_lock(&g_gate);
+        pthread_mutex_unlock(&g_gate);
+    }
     slot_t *s = slot_take();
     sqlite3_stmt *st = s->locate;
     int found = -1;
     if (sqlite3_bind_int64(st, 1, repo_id) == SQLITE_OK &&
         sqlite3_bind_text(st, 2, hex, -1, SQLITE_STATIC) == SQLITE_OK) {
         int rc = sqlite3_step(st);
+        unsigned hold = atomic_load_explicit(&g_test_hold_us, memory_order_relaxed);
+        if (hold) {
+            struct timespec ts = { 0, (long)hold * 1000L };
+            nanosleep(&ts, NULL);
+        }
         if (rc == SQLITE_ROW) {
             for (int c = 0; c < 6; c++) cols[c] = (uint64_t)sqlite3_column_int64(st, c);
             found = 1;
@@ -125,9 +151,53 @@ int db_readers_locate(int64_t repo_id, const char *hex, uint64_t cols[6])
      * never reset it and it would grow for as long as the daemon ran. */
     sqlite3_reset(st);
     sqlite3_clear_bindings(st);
+    /* Never let a slot go still inside a read transaction (B201): two calls
+     * that read flags, cheap next to the lookup itself. */
+    if (sqlite3_stmt_busy(st) || !sqlite3_get_autocommit(s->h)) {
+        static atomic_int warned;
+        if (!atomic_exchange(&warned, 1))
+            log_error("state.db reader: a lookup left its connection inside a read "
+                      "transaction; it would pin the WAL");
+    }
     pthread_mutex_unlock(&s->mu);
     atomic_fetch_add_explicit(&g_lookups, 1, memory_order_relaxed);
     return found;
+}
+
+void db_readers_quiesce(void)
+{
+    if (!atomic_load(&g_active)) return;
+    pthread_mutex_lock(&g_gate);
+    atomic_store(&g_quiescing, 1);
+    for (unsigned i = 0; i < g_n; i++) pthread_mutex_lock(&g_slots[i].mu);
+}
+
+void db_readers_resume(void)
+{
+    if (!atomic_load(&g_active)) return;
+    for (unsigned i = g_n; i-- > 0;) pthread_mutex_unlock(&g_slots[i].mu);
+    atomic_store(&g_quiescing, 0);
+    pthread_mutex_unlock(&g_gate);
+}
+
+unsigned db_readers_audit(void)
+{
+    if (!atomic_load(&g_active)) return 0;
+    unsigned bad = 0;
+    for (unsigned i = 0; i < g_n; i++) {
+        slot_t *s = &g_slots[i];
+        pthread_mutex_lock(&s->mu);
+        int busy = sqlite3_stmt_busy(s->locate) != 0;
+        int in_txn = sqlite3_get_autocommit(s->h) == 0;
+        pthread_mutex_unlock(&s->mu);
+        if (busy || in_txn) {
+            bad++;
+            log_error("state.db reader %u is inside a read transaction between lookups "
+                      "(statement %s, autocommit %s): it pins the WAL",
+                      i, busy ? "busy" : "reset", in_txn ? "off" : "on");
+        }
+    }
+    return bad;
 }
 
 unsigned long db_readers_lookups(void)

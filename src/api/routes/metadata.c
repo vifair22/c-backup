@@ -888,7 +888,8 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
 
 /*
  * Every result anything journals: a job's outcome (success, failed,
- * cancelled), and the advisories written beside it (warning for an
+ * cancelled, or warning for one that completed with warnings), and the
+ * advisories written beside it (warning for an
  * unescrowed key, a plaintext replica or a unit definition that needed
  * attention; alert for a missing pack). The CLI's --result lists the same.
  */
@@ -979,9 +980,9 @@ api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id)
     return finalise(resp);
 }
 
-void journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
-                    const char *operation, const char *result,
-                    int64_t duration_ms, const char *message)
+int journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
+                   const char *operation, const char *result,
+                   int64_t duration_ms, const char *message)
 {
     char repo[32], dur[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -1007,8 +1008,11 @@ void journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
             "        ?2, ?3, ?4, ?5, ?6"
             "   FROM journal WHERE repo_id = ?1",
             (const char *[]){ repo, source, operation, result, dur,
-                  message ? message : "", NULL }, NULL) != 0)
-        log_warn("journal: cannot record %s/%s", operation, result);
+                  message ? message : "", NULL }, NULL) != 0) {
+        log_warn("journal: cannot record %s/%s: %s", operation, result, err_msg());
+        return -1;
+    }
+    return 0;
 }
 
 void routes_metadata_init(cutils_db_t *db)

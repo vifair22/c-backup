@@ -51,5 +51,40 @@ int      db_readers_active(void);
  */
 int db_readers_locate(int64_t repo_id, const char *hex, uint64_t cols[6]);
 
+/*
+ * Hold every pooled connection out of the database, and let them back in
+ * (B201). In WAL mode a reader holds a read-mark slot for each read, and
+ * there are only a few; pooled readers that overlap without a gap keep one
+ * held at an old mark, and while one is held the WAL cannot restart and
+ * nothing past the mark can be copied. On FS2, with every file worker
+ * looking objects up and the disk slow, that was continuous: the WAL went
+ * to 1.4 million frames against a 262,144-frame cap. The checkpointer
+ * quiesces the readers for its locked round, so its copy completes and the
+ * restart lands. A lookup waits for the round, which is milliseconds.
+ *
+ * A lookup that arrives while they are held waits at a gate rather than
+ * competing for a slot, so quiescing waits only for the lookups already
+ * running.
+ *
+ * Lock order: the checkpointer takes these with the write lock held; a
+ * reader holds its slot only around one statement and never reaches for
+ * the write lock inside it, and holds nothing while it waits at the gate,
+ * so nothing waits the other way round.
+ */
+void db_readers_quiesce(void);
+void db_readers_resume(void);
+
+/*
+ * Pooled connections caught inside a read transaction between lookups
+ * (a statement not reset, or autocommit off), each logged. Every lookup
+ * resets its statement before it lets its slot go, so this is 0; anything
+ * else is a reader pinning the WAL (B201). Takes each slot's lock.
+ */
+unsigned db_readers_audit(void);
+
+/* For tests: hold each lookup's read transaction this long after its step,
+ * as a slow device does (0 restores the default). */
+void db_readers_set_test_hold_us(unsigned us);
+
 /* Lookups answered by a reader since the process started; for tests. */
 unsigned long db_readers_lookups(void);

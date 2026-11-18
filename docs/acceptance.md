@@ -404,6 +404,24 @@ Comfortable on a 125 GB server. Not comfortable on the 2-4 GB NAS that is a
 perfectly ordinary place to run a backup, and it sits against the design
 constraint that says never assume the data fits in memory.
 
+## state.db's WAL, and what pins it
+
+Measured during M7 on the v3 build, on a test server, with the shipped
+`db.wal_autocheckpoint: 16384` (64 MiB to start a copy, a 1 GiB cap):
+
+| Case | WAL peak |
+|------|----------|
+| Unchanged backup, about 22,000 files | about 380 MB |
+| The same while a `sqlite3` shell held a read transaction on `state.db` | 26 MB growing to 1.04 GB, until the shell closed |
+
+The first is ordinary: plan for the 1 GiB cap on the filesystem that holds
+`state.db`. The second is not the daemon's doing. A checkpoint cannot reuse
+frames that an open read may still need, and the cap works by making bulk
+writers wait for a copy, which cannot complete while the read is held, so
+it stops holding them and the log grows. The daemon's readers let go within
+moments; an outside one may not. Do not
+hold long reads on a live `state.db` (Manual section 18.2).
+
 ## A full reindex holds the write lock
 
 Measured on the development machine (Samsung 990 PRO NVMe, `state.db` and

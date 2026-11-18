@@ -12,6 +12,8 @@
 #include "repo.h"
 #include "db_txn.h"
 #include "store_index.h"
+#include "reindex.h"
+#include "index_reconcile.h"
 #include "db_write.h"
 
 #include <cutils/log.h>
@@ -285,6 +287,37 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         err_clear();
     }
 
+    /*
+     * Marks start from the snapshots table, so a snapshot record the index
+     * lacks would have everything only it holds swept and compacted away
+     * (B200): a complete backup silently destroyed. Checked here, right
+     * before marking, with the repository's write lock held (the job's), so
+     * no record can appear between the listing and the marks. Each one
+     * found is indexed; one that cannot be is a refusal, never a mark
+     * around it. A dry run changes nothing, so it refuses instead.
+     */
+    if (dry_run) {
+        size_t ngaps = 0;
+        int64_t *gaps = NULL;
+        status_t gst = index_snapshot_gaps(db, repo_id, store_root(store), &gaps, &ngaps);
+        if (gst != OK) return set_error_wrap(gst, "gc refused: cannot check the repository "
+                                             "for snapshots the index lacks");
+        if (ngaps > 0) {
+            gst = set_error(ERR_INVALID, "gc --dry-run refused: snapshot %lld (and %zu more) "
+                            "is in the repository but not in the index, so what it holds would "
+                            "count as unreferenced; a real gc indexes it first, or run "
+                            "c-backup reindex %lld", (long long)gaps[0], ngaps - 1,
+                            (long long)repo_id);
+            free(gaps);
+            return gst;
+        }
+    } else {
+        uint64_t indexed = 0;
+        status_t gst = reindex_gaps(store, db, repo_id, "gc", &indexed);
+        if (gst != OK) return gst;
+        res.snapshots_indexed = indexed;
+    }
+
     if (db_txn_begin_bulk(db) != OK)
         return set_error(ERR_IO, "gc: begin");
 
@@ -428,6 +461,11 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     res.dups_dropped      = pstats.dups_dropped;
     res.dups_kept         = pstats.dups_kept;
     res.index_relocated   = pstats.index_relocated;
+    /* What compaction really removed, not what the sweep declared dead: a
+     * compaction that fails part way, a full disk say, frees only what it
+     * finished, and the result said every swept byte was freed (B197). The
+     * rest is reclaimed by the next gc, since the rows are gone. */
+    res.bytes_freed       = pstats.bytes_dropped;
     res.unwalkable_listed = pstats.unwalkable_listed;
     memcpy(res.unwalkable, pstats.unwalkable, sizeof(res.unwalkable));
     /* The sweep is committed whatever compaction did, so a caller reporting

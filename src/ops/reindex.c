@@ -5,6 +5,7 @@
 #include "reindex.h"
 #include "prune.h"
 #include "unit_index.h"
+#include "index_reconcile.h"
 
 #include "chunklist.h"
 #include "manifest.h"
@@ -39,7 +40,37 @@ typedef struct {
     int64_t      snap_id;
     int64_t      next_node_id;
     reindex_result_t *res;
+    /* Commit in batches (B200): set for a snapshot with no index row, the
+     * case a gap, a lost database or reconcile brings. since counts nodes in
+     * the open batch; rule is the shared batch-end rule (db_txn.h). */
+    int          batched;
+    unsigned     since;
+    db_txn_batch_t rule;
 } reindex_ctx_t;
+
+#define REINDEX_NODE_BATCH 2000
+
+/*
+ * A batch boundary, after a node and its name row: like index_nodes, the
+ * walk commits every REINDEX_NODE_BATCH nodes, sooner for a queued writer
+ * or at the commit budget (db_txn_batch_should_end, B144/B193), so a large
+ * snapshot does not hold the write lock for the whole walk. Safe because
+ * the snapshots row that marks it indexed is written only after the last
+ * batch: until then the rows are index garbage a reindex replaces.
+ */
+static status_t batch_point(reindex_ctx_t *ctx)
+{
+    if (!ctx->batched) return OK;
+    if (++ctx->since < REINDEX_NODE_BATCH && !db_txn_batch_should_end(&ctx->rule))
+        return OK;
+    status_t st = db_txn_commit(ctx->db);
+    if (st != OK) return set_error_wrap(st, "reindex: commit a batch");
+    ctx->since = 0;
+    st = db_txn_begin_bulk(ctx->db);
+    if (st != OK) return set_error_wrap(st, "reindex: begin a batch");
+    db_txn_batch_opened(&ctx->rule);
+    return OK;
+}
 
 static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
 {
@@ -260,6 +291,9 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
             break;
         }
 
+        st = batch_point(ctx);
+        if (st != OK) { ctx->batched = -1; break; }
+
         ctx->res->nodes++;
         if (e->type == NODE_TYPE_REG) {
             ctx->res->files++;
@@ -405,6 +439,57 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
 
+    /*
+     * A snapshot with no index row yet - a gap, a lost database - is walked
+     * in batches, its snapshots row written last as index_nodes does: a
+     * failure leaves node rows nothing claims, which the next reindex
+     * replaces. One that has a row keeps the single transaction, so a walk
+     * that fails part way leaves it the rows it had (reindex.h's promise)
+     * rather than half of a new set.
+     */
+    int has_row = 0;
+    {
+        db_result_t *hr = NULL;
+        has_row = db_execute(db, "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+                             (const char *[]){ repo, snap, NULL }, &hr) == 0 &&
+                  hr && hr->nrows > 0;
+        db_result_free(hr);
+    }
+
+    /* With no row, rows an earlier attempt left (an index_nodes that did
+     * not finish, a reindex cut short) can be a whole snapshot's worth:
+     * cleared in batches of their own before the walk, as everything here
+     * is. Nothing claims them, so nothing reads them half gone. */
+    if (!has_row) {
+        static const char *const clear[] = {
+            "DELETE FROM nodes WHERE rowid IN (SELECT rowid FROM nodes"
+            " WHERE repo_id = ? AND snap_id = ? LIMIT 2000)",
+            "DELETE FROM node_fts WHERE rowid IN (SELECT rowid FROM node_fts"
+            " WHERE repo_id = ? AND snap_id = ? LIMIT 2000)",
+        };
+        for (size_t k = 0; k < sizeof(clear) / sizeof(clear[0]); k++) {
+            for (;;) {
+                if (db_txn_begin_bulk(db) != OK) {
+                    free(label);
+                    return set_error_wrap(ERR_IO, "reindex: begin");
+                }
+                int gone = 0;
+                if (db_write(db, clear[k], (const char *[]){ repo, snap, NULL }, &gone) != 0) {
+                    status_t cst = set_error_wrap(ERR_IO, "reindex: clear old rows of "
+                                                  "snapshot %lld", (long long)snap_id);
+                    db_txn_rollback(db);
+                    free(label);
+                    return cst;
+                }
+                if (db_txn_commit(db) != OK) {
+                    free(label);
+                    return set_error_wrap(ERR_IO, "reindex: commit");
+                }
+                if (gone == 0) break;
+            }
+        }
+    }
+
     if (db_txn_begin_bulk(db) != OK) {
         free(label);
         return set_error(ERR_IO, "reindex: begin");
@@ -420,7 +505,8 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
             "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
 
-    reindex_ctx_t ctx = { store, db, repo_id, snap_id, 0, &res };
+    reindex_ctx_t ctx = { store, db, repo_id, snap_id, 0, &res, !has_row, 0, { 0, 0 } };
+    if (ctx.batched) db_txn_batch_opened(&ctx.rule);
     if (!failed) {
         /* Continue the id space rather than restarting it, so ids stay unique
          * per repo across snapshots as the schema's primary key requires. */
@@ -473,7 +559,9 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
     free(label);
 
     if (failed) {
-        db_txn_rollback(db);
+        /* A batch boundary that failed has already let the lock go
+         * (batched -1): nothing is open to roll back. */
+        if (ctx.batched >= 0) db_txn_rollback(db);
         return st != OK ? st : set_error(ERR_IO, "reindex: snapshot %lld failed",
                                          (long long)snap_id);
     }
@@ -1100,6 +1188,65 @@ static status_t restore_pack_mark(store_t *store, cutils_db_t *db, int64_t repo_
         total->pack_ids_repaired = 1;
     }
     total->pack_mark = now;
+    return OK;
+}
+
+status_t reindex_gaps(store_t *store, cutils_db_t *db, int64_t repo_id,
+                      const char *what, uint64_t *out_indexed)
+{
+    if (out_indexed) *out_indexed = 0;
+    if (!store || !db || !what) return set_error(ERR_INVALID, "reindex_gaps: null argument");
+    /* A record a prune had not finished removing is on its way out (B148);
+     * finishing it here means it is not listed below either. */
+    status_t st = prune_finish_pending(db, repo_id, NULL);
+    if (st != OK) return set_error_wrap(st, "%s refused: cannot finish an interrupted prune", what);
+
+    int64_t *gaps = NULL;
+    size_t n = 0;
+    st = index_snapshot_gaps(db, repo_id, store_root(store), &gaps, &n);
+    if (st != OK)
+        return set_error_wrap(st, "%s refused: cannot check the repository for "
+                              "snapshots the index lacks", what);
+    if (n == 0) return OK;
+
+    log_warn("%s: repository %lld holds %zu snapshot record(s) the index lacks "
+             "(first: %lld); indexing them before anything is swept", what,
+             (long long)repo_id, n, (long long)gaps[0]);
+    if (store_needs_key(store)) {
+        st = set_error(ERR_INVALID, "%s refused: snapshot %lld is in the repository but not "
+                       "in the index, and the repository's key is not loaded to index it; "
+                       "%s would delete what only that snapshot holds. Load the key and "
+                       "run c-backup reindex %lld", what, (long long)gaps[0], what,
+                       (long long)repo_id);
+        free(gaps);
+        return st;
+    }
+    for (size_t i = 0; i < n; i++) {
+        st = reindex_snapshot_inner(store, db, repo_id, gaps[i], 0, NULL);
+        if (st != OK) {
+            st = set_error_wrap(st, "%s refused: snapshot %lld is in the repository but "
+                                "could not be indexed, and %s would delete what only it "
+                                "holds; repair or remove its record (snapshots/%lld), "
+                                "then retry", what, (long long)gaps[i], what,
+                                (long long)gaps[i]);
+            free(gaps);
+            return st;
+        }
+    }
+    /* Every chunk a list of theirs names gets its object row: compaction
+     * keeps exactly the entries with rows (reindex_snapshot). */
+    st = reindex_lists(store, db, repo_id, 0);
+    if (st == OK) st = fill_object_sizes(store, db, repo_id);
+    if (st != OK) {
+        st = set_error_wrap(st, "%s refused: the chunk lists of the snapshots just "
+                            "indexed could not be indexed", what);
+        free(gaps);
+        return st;
+    }
+    log_warn("%s: indexed snapshot record(s) the index lacked, %zu of them (first: %lld)",
+             what, n, (long long)gaps[0]);
+    free(gaps);
+    if (out_indexed) *out_indexed = n;
     return OK;
 }
 

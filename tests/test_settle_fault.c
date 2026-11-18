@@ -290,10 +290,8 @@ static void run_never_settles(path_t which)
     assert_int_equal(scalar("SELECT COUNT(*) FROM file_cache WHERE path = ?", busy), 0);
 
     /* The journal message and the alert name the count and the file. */
-    char summary[PATH_MAX * 4], warning[PATH_MAX * 4];
-    routes_backup_describe_doubts(&res, summary, sizeof(summary), warning, sizeof(warning));
-    assert_non_null(strstr(summary, "1 stored while still changing (may be torn); first: "));
-    assert_non_null(strstr(summary, busy));
+    char warning[PATH_MAX * 4];
+    routes_backup_describe_doubts(&res, warning, sizeof(warning));
     assert_non_null(strstr(warning, "1 file(s) were still changing"));
     assert_non_null(strstr(warning, "flagged as possibly torn; first: "));
     assert_non_null(strstr(warning, busy));

@@ -1294,6 +1294,13 @@ GVB=$(sock_body "/jobs/$GV")
 contains "a verify is refused as unavailable" 'is unavailable'     "$GVB"
 case "$GVB" in *"data loss"*|*MISSING*) bad "and claims no data loss" "no loss" "$GVB" ;;
                *) ok "and claims no data loss" ;; esac
+# B204: repo repair said "no failed sync" for a repository that is not
+# there to show one.
+GR=$(curl -s -X POST --unix-socket "$SOCK" "http://localhost/repos/$GONE/verify?clear_sync=1")
+contains "a repair says the repository is unavailable" 'is unavailable' "$GR"
+contains "and why"                         '.cbackup marker'       "$GR"
+case "$GR" in *"no failed sync"*) bad "and not that there is no failed sync" "" "$GR" ;;
+              *) ok "and not that there is no failed sync" ;; esac
 check "still nothing in the mountpoint"   ""                       "$(ls -A "$WORK/gonerepo")"
 rmdir "$WORK/gonerepo"
 mv "$WORK/gonerepo.mounted" "$WORK/gonerepo"
@@ -2003,9 +2010,11 @@ if [ "$(id -u)" != 0 ]; then
     contains "and names it, with the reason" \
         "\"skipped\":[{\"path\":\"$R/src/locked.txt\",\"reason\":\"cannot open: Permission denied\"}],\"skipped_listed\":1," \
         "$SBODY"
-    contains "and the journal says so" \
-        "1 skipped (not in the snapshot); first: $R/src/locked.txt: cannot open: Permission denied" \
-        "$(sock_body '/repos/1/journal?limit=1')"
+    JRN=$(sock_body '/repos/1/journal?limit=1')
+    contains "and the journal says so, as a warning" '"operation":"backup","result":"warning"' "$JRN"
+    contains "naming the count and the first file" \
+        "warning: 1 file(s) could not be read and are not in snapshot " "$JRN"
+    contains "with its reason" "first: $R/src/locked.txt: cannot open: Permission denied" "$JRN"
     # And alerted, as a warning, without anyone opening the job. The worker
     # writes the line after the state, so it is waited for. No Pushover is
     # configured here, so the line must say it was not sent (NIT-11).

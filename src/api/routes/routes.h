@@ -33,13 +33,11 @@ void routes_repos_set_key_dir(const char *dir);
 void routes_backup_set_file_cache_match(int mode);
 
 /*
- * The journal message and the warning alert text for a backup that left
- * files out (B118) or kept files that never settled (OWN-45-LIVE); both
- * empty for a clean backup. Exposed for its test; the backup job is the
- * only caller.
+ * The job warning, journalled and alerted, for a backup that left files out
+ * (B118) or kept files that never settled (OWN-45-LIVE); empty for a clean
+ * backup. Exposed for its test; the backup job is the only caller.
  */
-void routes_backup_describe_doubts(const backup_result_t *res, char *summary,
-                                   size_t ssz, char *warning, size_t wsz);
+void routes_backup_describe_doubts(const backup_result_t *res, char *warning, size_t wsz);
 /* Chunk workers per backup (backup.store_workers): 0 automatic, 1 serial.
  * Set from config at startup. */
 void routes_backup_set_store_workers(unsigned n);
@@ -222,9 +220,12 @@ void           exports_tick(void);
 void           exports_shutdown(void);
 
 /* Record an operation in a repo's journal. Best effort by design. */
-void journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
-                    const char *operation, const char *result,
-                    int64_t duration_ms, const char *message);
+/* 0 when recorded, -1 when not (logged). Most callers ignore it: failing
+ * to journal must not fail what is journalled. A job's end is the
+ * exception, which keeps the entry and its state together (B159, B196). */
+int journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
+                   const char *operation, const char *result,
+                   int64_t duration_ms, const char *message);
 
 /* Schedule CRUD. Repo-scoped sub-handlers, dispatched from repos.c. */
 struct scheduler;

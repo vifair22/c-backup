@@ -471,9 +471,21 @@ const api_path_t *routes_units_paths(size_t *n)
  * the history when it is a name. */
 /* The unit's key: the one its snapshots carry if it has any (1), else
  * prov:unit as given (0). */
+/*
+ * A unit named by its full key ("libvirt:<uuid>") under its provider's path
+ * is the unit: the bare id or name after the prefix. It was taken as an id
+ * of its own and keyed libvirt:libvirt:<uuid> (B203).
+ */
+static const char *bare_unit(const char *prov, const char *unit)
+{
+    size_t pl = strlen(prov);
+    return strncmp(unit, prov, pl) == 0 && unit[pl] == ':' && unit[pl + 1] ? unit + pl + 1 : unit;
+}
+
 static int key_for(int64_t repo_id, const char *prov, const char *unit, char *key, size_t ksz)
 {
     int found = 0;
+    unit = bare_unit(prov, unit);
     unit_key_format(key, ksz, prov, unit);
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -514,6 +526,7 @@ static status_t find_unit_cb(void *ctx, const char *id, const char *name, int st
 static int policy_unit(int64_t repo_id, const char *prov, const char *unit, char *key, size_t ksz,
                        char *why, size_t wsz)
 {
+    unit = bare_unit(prov, unit);
     if (key_for(repo_id, prov, unit, key, ksz)) return 0;
     const sp_provider_ops_t *ops = NULL;
     sp_ctx_t *ctx = NULL;
@@ -862,7 +875,6 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
 
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = root ? cJSON_AddArrayToObject(root, "units") : NULL;
-    char warn[600] = "";
     for (size_t i = 0; arr && i < res.n; i++) {
         const unit_backup_one_t *u = &res.units[i];
         cJSON *x = cJSON_CreateObject();
@@ -882,7 +894,10 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
         }
         if (u->warning[0]) {
             cJSON_AddStringToObject(x, "warning", u->warning);
-            if (!warn[0]) snprintf(warn, sizeof(warn), "unit %.80s: %.500s", u->name, u->warning);
+            /* Every one, not just the first (B202). */
+            cJSON *ws = cJSON_AddArrayToObject(x, "warnings");
+            for (unsigned k = 0; ws && k < u->n_warnings; k++)
+                cJSON_AddItemToArray(ws, cJSON_CreateString(u->warnings[k]));
         }
     }
     if (root) {
@@ -898,10 +913,20 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
     snprintf(summary, sizeof(summary), "%s: %zu unit(s) backed up, %zu failed, %zu left out "
              "by units.allow", j->provider, res.ok, res.failed, res.filtered);
     job_set_summary(progress_ctx, summary);
-    if (!warn[0] && res.scope_note[0]) snprintf(warn, sizeof(warn), "%s", res.scope_note);
-    /* A hold that cannot be released outranks a unit's own warning. */
+    /* Every warning, each unit's included (B202 keeps them all): they are
+     * journalled with the job, and the journal outlives the job's result.
+     * A hold that cannot be released outranks a unit's own warning, so it
+     * comes first; job_set_warning bounds the total and counts the rest. */
     if (res.warning[0]) job_set_warning(progress_ctx, res.warning);
-    else if (warn[0]) job_set_warning(progress_ctx, warn);
+    for (size_t i = 0; i < res.n; i++) {
+        const unit_backup_one_t *u = &res.units[i];
+        for (unsigned k = 0; k < u->n_warnings; k++) {
+            char w[1200];
+            snprintf(w, sizeof(w), "unit %.80s: %.1000s", u->name, u->warnings[k]);
+            job_set_warning(progress_ctx, w);
+        }
+    }
+    if (res.scope_note[0]) job_set_warning(progress_ctx, res.scope_note);
     unit_backup_result_free(&res);
     store_index_free(idx);
     store_close(store);
@@ -1335,6 +1360,30 @@ static api_response_t unit_reset_post(int64_t repo_id, const char *key)
     return json_out(root);
 }
 
+/*
+ * The unit a checkpoints or reset-incremental request names (NIT-41). Both
+ * answered for any provider and unit at all, a made-up one included, with
+ * an empty chain or a journalled "reset" of nothing. A unit with
+ * snapshots here, or with chain rows of its own, is known; anything else is
+ * held to what a policy write is (policy_unit): its provider must list it
+ * now. 0 with key set, or the HTTP status with why.
+ */
+static int chain_unit(int64_t repo_id, const char *prov, const char *unit, char *key,
+                      size_t ksz, char *why, size_t wsz)
+{
+    if (key_for(repo_id, prov, unit, key, ksz)) return 0;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int rows = db_execute(g_db,
+            "SELECT 1 FROM unit_tokens WHERE repo_id = ?1 AND unit_key = ?2"
+            " UNION ALL SELECT 1 FROM unit_incremental WHERE repo_id = ?1 AND unit_key = ?2"
+            " LIMIT 1", (const char *[]){ repo, key, NULL }, &r) == 0 && r && r->nrows > 0;
+    db_result_free(r);
+    if (rows) return 0;
+    return policy_unit(repo_id, prov, unit, key, ksz, why, wsz);
+}
+
 api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const char *rest)
 {
     if (strcmp(rest, "/units") == 0) return repo_units(req, repo_id);
@@ -1342,10 +1391,15 @@ api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const 
     const char *suffix = NULL;
     if (!split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix))
         return api_error(404, "not found");
+    if (strcmp(suffix, "reset-incremental") == 0) return api_error(405, "method not allowed");
+    if (strcmp(suffix, "checkpoints") == 0) {
+        char why[768];
+        int code = chain_unit(repo_id, prov, unit, key, sizeof(key), why, sizeof(why));
+        if (code) return api_error(code, why);
+        return unit_checkpoints_get(repo_id, key);
+    }
     (void)key_for(repo_id, prov, unit, key, sizeof(key));
     if (strcmp(suffix, "snapshots") == 0) return unit_history(req, repo_id, key);
-    if (strcmp(suffix, "checkpoints") == 0) return unit_checkpoints_get(repo_id, key);
-    if (strcmp(suffix, "reset-incremental") == 0) return api_error(405, "method not allowed");
     return unit_policy_get(repo_id, key);
 }
 
@@ -1378,7 +1432,9 @@ api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const
     const char *suffix = NULL;
     if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) &&
         strcmp(suffix, "reset-incremental") == 0) {
-        (void)key_for(repo_id, prov, unit, key, sizeof(key));
+        char why[768];
+        int code = chain_unit(repo_id, prov, unit, key, sizeof(key), why, sizeof(why));
+        if (code) return api_error(code, why);
         return unit_reset_post(repo_id, key);
     }
     if (strncmp(rest, "/snapshots/", 11) == 0) {

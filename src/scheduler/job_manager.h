@@ -195,8 +195,14 @@ int64_t job_progress_id(void *progress_ctx);
  * `completed`, and the warning is not its error; but it goes out through
  * the alert path a failure uses, a WARN log line and a push notification
  * when Pushover is configured, so nobody has to open the job's result to
- * find it. Ignored for a job that fails or is cancelled: that one alerts as
- * a failure or not at all. The text is copied.
+ * find it. And it is journalled: the job's entry says "warning" rather than
+ * "success", with the warnings after its summary, since the job row is
+ * deleted after 30 days and the journal is the permanent record.
+ *
+ * Call it once per warning; they accumulate, "N warnings: a; b", bounded
+ * (each at 1 KiB, all at 2 KiB, the rest counted). Ignored for a job that
+ * fails or is cancelled: that one alerts as a failure or not at all. The
+ * text is copied.
  */
 void job_set_warning(void *progress_ctx, const char *text);
 
@@ -224,3 +230,27 @@ void job_warning_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
  * A queued job is removed from the queue and recorded cancelled before this
  * returns; a running one is flagged and stops at its next check. */
 status_t job_cancel(job_manager_t *jm, int64_t job_id);
+
+/*
+ * A job that has ended whose end is not in the jobs table yet (B196): its
+ * end transaction failed, state.db's filesystem full, say, and it is kept
+ * in memory and retried. The row still reads "running"; anything showing a
+ * job asks this first and shows the end instead. result is a heap copy or
+ * NULL, the caller's to free; the progress fields are the final report's,
+ * valid when has_progress.
+ */
+typedef struct {
+    char     state[16];
+    char     error[1024];
+    int64_t  ended;
+    char    *result;
+    int      has_progress;
+    char     phase[192];
+    uint64_t done, total, bytes_done, bytes_total;
+} job_end_view_t;
+
+/* 1 with *out filled (out may be NULL) when job_id's end on db is held in
+ * memory, 0 when the table has it or the job has not ended. */
+int      job_end_unrecorded(cutils_db_t *db, int64_t job_id, job_end_view_t *out);
+/* How many ends on db are held in memory. */
+unsigned job_ends_unrecorded(cutils_db_t *db);

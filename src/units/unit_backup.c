@@ -1021,6 +1021,27 @@ static void begin_req(const unit_backup_opts_t *o, sp_holds_t *holds, const unit
     req->daemon8 = units_daemon8();
 }
 
+/*
+ * One warning for a unit's result: every one is kept (B202), and the first,
+ * or one that outranks the rest, is also its summary line. Allocation
+ * failures drop the copy, never the summary.
+ */
+static void one_warn(unit_backup_one_t *r, int outranks, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+static void one_warn(unit_backup_one_t *r, int outranks, const char *fmt, ...)
+{
+    char text[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+    if (outranks || !r->warning[0]) snprintf(r->warning, sizeof(r->warning), "%.511s", text);
+    char **g = realloc(r->warnings, (r->n_warnings + 1) * sizeof(*g));
+    if (!g) return;
+    r->warnings = g;
+    if ((g[r->n_warnings] = strdup(text))) r->n_warnings++;
+}
+
 /* After begin: the unit's content from its session, then end and unlock. */
 static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
                            const unit_backup_opts_t *o, const sp_provider_ops_t *ops,
@@ -1045,10 +1066,10 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     u.audit_due = pp->audit_due;
     if (pp->off_why[0]) uwarn(&u, "%s", pp->off_why);
     res->achieved = u.info->achieved;
-    res->n_warnings = (unsigned)u.info->n_warnings;
-    if (u.info->n_warnings) snprintf(res->warning, sizeof(res->warning), "%s", u.info->warnings[0]);
-    for (size_t i = 0; i < u.info->n_warnings; i++)
+    for (size_t i = 0; i < u.info->n_warnings; i++) {
+        one_warn(res, 0, "%s", u.info->warnings[i]);
         log_warn("unit %s: %s", key, u.info->warnings[i]);
+    }
 
     /* Parts: blobs and disks as synthetic files, unit.json last; trees as
      * sources read from the provider's root. */
@@ -1157,13 +1178,12 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
             /* A failed dump is one of the entries left out; it is named as
              * the dump it is, not counted as a file that could not be read. */
             uint64_t unread = br.files_skipped > u.streams_failed ? br.files_skipped - u.streams_failed : 0;
-            if (u.streams_failed && !res->warning[0])
-                snprintf(res->warning, sizeof(res->warning), "%zu dump(s) failed and are not in "
-                         "snapshot %lld; first: %s", u.streams_failed, (long long)snap, u.stream_failed);
-            else if (unread && !res->warning[0])
-                snprintf(res->warning, sizeof(res->warning), "%llu file(s) could not be read "
-                         "and are not in snapshot %lld", (unsigned long long)unread,
-                         (long long)snap);
+            if (u.streams_failed)
+                one_warn(res, 0, "%zu dump(s) failed and are not in snapshot %lld; first: %s",
+                         u.streams_failed, (long long)snap, u.stream_failed);
+            if (unread)
+                one_warn(res, 0, "%llu file(s) could not be read and are not in snapshot %lld",
+                         (unsigned long long)unread, (long long)snap);
         }
         backup_result_free(&br);
     }
@@ -1238,7 +1258,8 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         outcome = SP_END_ABORTED;
     }
     /* u.info lives in the session, which end frees (remote_provider). */
-    const uint64_t freeze_ms = (u.info->consist_flags & SP_CF_FROZEN) ? u.info->freeze_ms : 0;
+    /* Frozen and thawed by a watchdog still counts: the guest was frozen. */
+    const uint64_t freeze_ms = u.info->freeze_ms;
     status_t est = ops->end(u.sess, outcome, snap);
     if (est != OK) {
         /*
@@ -1255,11 +1276,9 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         log_warn("unit %s: releasing the session failed: %s; the sweep will retry",
                  key, err_msg());
         if (st == OK) {
-            snprintf(res->warning, sizeof(res->warning),
-                     "the session could not be ended (%.200s): the provider went away or restarted during "
-                     "the backup. Snapshot %lld is whole, every part read to its end; what the session held "
-                     "is released by its sweep", err_msg(), (long long)snap);
-            res->n_warnings++;
+            one_warn(res, 1, "the session could not be ended (%.200s): the provider went away or restarted "
+                     "during the backup. Snapshot %lld is whole, every part read to its end; what the "
+                     "session held is released by its sweep", err_msg(), (long long)snap);
         }
         err_clear();
     }
@@ -1370,6 +1389,11 @@ status_t unit_checkpoints_redefine(cutils_db_t *db, unsigned *checked, unsigned 
 void unit_backup_result_free(unit_backup_result_t *r)
 {
     if (!r) return;
+    for (size_t i = 0; r->units && i < r->n; i++) {
+        for (unsigned k = 0; r->units[i].warnings && k < r->units[i].n_warnings; k++)
+            free(r->units[i].warnings[k]);
+        free(r->units[i].warnings);
+    }
     free(r->units);
     memset(r, 0, sizeof(*r));
 }

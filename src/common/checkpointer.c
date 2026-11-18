@@ -3,6 +3,7 @@
 #include "checkpointer.h"
 
 #include "db_txn.h"
+#include "db_readers.h"
 #include "thread_name.h"
 #include "walidx.h"
 
@@ -125,18 +126,45 @@ typedef struct { uint32_t left; int rc; } locked_arg_t;
  * restart could otherwise corrupt the database), so the first writer pays a
  * sync while holding the write lock: FS2 measured 0.3 to 1.5 s, landing on a
  * job's progress UPDATE or on a request. With the copy complete and the
- * write lock held, one harmless row written on this connection restarts the
- * WAL and pays that sync on this thread instead; writers already queued for
- * the escalation wait for it once, and nobody pays it on their own write.
- * A reader still inside the old WAL keeps the restart from happening; the
- * row is then an ordinary frame, which the next checkpoint copies.
+ * write lock held, the checkpointer restarts the WAL and then writes one
+ * harmless row on this connection, which pays that sync on this thread
+ * instead; writers already queued for the escalation wait for it once, and
+ * nobody pays it on their own write.
+ *
+ * The restart is a RESTART checkpoint, not the row (B201). A write restarts
+ * the WAL only when no reader holds a read-mark slot, and the shared
+ * connection's reads take one without the write lock: on FS2, requests and
+ * the daemon's own lookups back to back after the backup meant one was
+ * always running when the row was written, so it never restarted the WAL
+ * and was an ordinary frame instead, one more each tick for as long as the
+ * daemon ran. A RESTART checkpoint waits, through the busy timeout
+ * (CKPT_BUSY_MS), for the readers already inside the WAL to finish, while
+ * any reader that starts meanwhile reads the database file alone (slot 0,
+ * the copy being complete), which a restart does not wait for. So the
+ * readers drain and the restart lands with requests running; none of them
+ * waits for any of it, and the round waits at most the busy timeout. Should
+ * a reader outlast it, nothing is written: the next tick tries again.
  */
 static void pre_restart(void)
 {
+    db_result_t *r = NULL;
+    int rc = db_execute(g_ck, "PRAGMA wal_checkpoint(RESTART)", NULL, &r);
+    int reset = rc == 0 && r && r->nrows == 1 && r->ncols >= 3 &&
+                strcmp(r->rows[0][0], "0") == 0;
+    db_result_free(r);
+    if (!reset) {
+        pthread_mutex_lock(&g_mu);
+        g_stats.pre_restart_misses++;
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    /* A value the row has never held: SQLite writes no page for an update
+     * that changes nothing, and with no frame the header sync would fall to
+     * the next writer after all. */
     char v[32];
-    snprintf(v, sizeof(v), "%lu", g_stats.pre_restarts + 1);
+    snprintf(v, sizeof(v), "%lu", g_stats.pre_restarts + g_stats.pre_restart_misses + 1);
     uint64_t t0 = now_ns();
-    int rc = db_execute_non_query(g_ck,
+    rc = db_execute_non_query(g_ck,
             "INSERT INTO daemon_state (key, value) VALUES ('wal_restart', ?)"
             " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (const char *[]){ v, NULL }, NULL);
@@ -156,6 +184,9 @@ static void pre_restart(void)
 static status_t locked_passive(void *arg)
 {
     locked_arg_t *a = arg;
+    /* With the pooled readers held out, none pins an old read mark: the
+     * copy runs to the end and the restart lands (db_readers.h, B201). */
+    db_readers_quiesce();
     for (int i = 0; i < CKPT_LOCKED_ROUNDS; i++) {
         a->rc = passive(&a->left);
         if (a->rc != 0) break;
@@ -165,7 +196,17 @@ static status_t locked_passive(void *arg)
             break;
         }
     }
+    db_readers_resume();
     return OK;
+}
+
+status_t checkpointer_force(void)
+{
+    if (!g_ck) return set_error(ERR_INVALID, "checkpointer_force: not running");
+    locked_arg_t a = { 0, -1 };
+    status_t st = db_txn_exclusive(locked_passive, &a);
+    if (st != OK) return st;
+    return a.rc == 0 ? OK : set_error(ERR_BUSY, "checkpointer_force: the copy did not complete");
 }
 
 static void tick(void)
@@ -240,9 +281,18 @@ locked:;
     uint32_t f2 = 0, b2 = 0;
     if (a.rc != 0 || (checkpointer_wal_frames(g_path, &f2, &b2) == 0 && f2 > hard && f2 != b2))
         atomic_store(&g_blocked_until_ns, now_ns() + CKPT_BLOCKED_NS);
-    if (held > 1000000000ull || frames > hard)
+    /* Once a minute at most while past the cap (B201: this line every
+     * tick was half of an idle daemon's writes), at once for a long hold. */
+    static uint64_t last_warn_ns;
+    uint64_t now = now_ns();
+    if (held > 1000000000ull || (frames > hard && now - last_warn_ns >= 60000000000ull)) {
+        last_warn_ns = now;
+        uint32_t f3 = 0, b3 = 0;
+        (void)checkpointer_wal_frames(g_path, &f3, &b3);
         log_warn("state.db: WAL at %u frames; checkpointed under the write lock in %.0f ms "
-                 "(%u frames were left)", frames, (double)held / 1e6, left);
+                 "(%u frames were left; now %u frames, %u copied, %u readers pinned)",
+                 frames, (double)held / 1e6, left, f3, b3, db_readers_audit());
+    }
 }
 
 /*

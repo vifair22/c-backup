@@ -1104,7 +1104,8 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              "\"packs_deleted\":%u,\"packs_coalesced\":%u,"
              "\"packs_removed_by_coalesce\":%u,\"tmp_files_removed\":%u,"
              "\"tmp_bytes_removed\":%llu,\"content_missing\":%llu,"
-             "\"dups_dropped\":%llu,\"dups_kept\":%llu,\"index_relocated\":%llu",
+             "\"dups_dropped\":%llu,\"dups_kept\":%llu,\"index_relocated\":%llu,"
+             "\"snapshots_indexed\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
              (unsigned long long)gr->swept,
@@ -1118,7 +1119,8 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              (unsigned long long)gr->content_missing,
              (unsigned long long)gr->dups_dropped,
              (unsigned long long)gr->dups_kept,
-             (unsigned long long)gr->index_relocated);
+             (unsigned long long)gr->index_relocated,
+             (unsigned long long)gr->snapshots_indexed);
     /* Packs compaction could not walk, each with why. Reasons are built by
      * the pack layer from fixed text and numbers, so need no escaping. */
     size_t n = jn > 0 ? (size_t)jn : 0;
@@ -1148,7 +1150,7 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
                  (unsigned long long)gr->bytes_freed);
     else
         snprintf(msg, sizeof(msg),
-                 "swept %llu object%s (%llu bytes); %u pack%s rewritten, "
+                 "swept %llu object%s, %llu bytes freed; %u pack%s rewritten, "
                  "%u deleted, %u coalesced into %u; %u stale temp file%s removed",
                  (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
                  (unsigned long long)gr->bytes_freed,
@@ -1388,6 +1390,22 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                          " (%llu of them pack structure%s)", (unsigned long long)ps,
                          ps == 1 ? "" : "s");
             job_set_summary(progress_ctx, vs);
+            /* Damage still in the repository, if recoverable, is a warning:
+             * journalled as one and alerted once, with the count. Damage
+             * beyond repair is not handled here: it fails the run
+             * (verify_run, ERR_CORRUPT) and alerts as a failure. */
+            if (vr.recoverable > 0) {
+                char vw[256];
+                if (j->verify_repair)
+                    snprintf(vw, sizeof(vw), "verify run %lld left %llu recoverable "
+                             "item(s) unrepaired; run verify with repair again",
+                             (long long)vr.run_id, (unsigned long long)vr.recoverable);
+                else
+                    snprintf(vw, sizeof(vw), "verify run %lld found %llu recoverable "
+                             "item(s), not repaired (check only); run verify with repair",
+                             (long long)vr.run_id, (unsigned long long)vr.recoverable);
+                job_set_warning(progress_ctx, vw);
+            }
         }
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*
@@ -1633,6 +1651,17 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "clear_sync must be 1, true, 0 or false");
         }
         if (j->clear_sync) {
+            /* The latch lives in the repository: one that is not there
+             * (an empty mountpoint, packs/ unmounted) cannot show it, and
+             * "no failed sync" said the opposite of the truth (B204). */
+            char why[PACK_PRESENCE_WHY_MAX] = "";
+            if (pack_presence_available(j->db, j->repo_id, why, sizeof(why)) != 1) {
+                snap_job_free(j);
+                char msg[PACK_PRESENCE_WHY_MAX + 128];
+                snprintf(msg, sizeof(msg), "this repository is unavailable: %s; repair needs it present",
+                         why[0] ? why : "it cannot be read");
+                return api_error(409, msg);
+            }
             if (!sync_latch_repo_tripped(j->repo_path)) {
                 snap_job_free(j);
                 return api_error(409, "this repository has no failed sync to clear");
