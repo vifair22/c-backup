@@ -2385,6 +2385,9 @@ OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/preview")
 contains "preview of a file source's finding" ' 200' "$OUT"
 contains "is the daemon's own engine copy" '"kind":"engine-copy"' "$OUT"
 contains "and says where the copy goes" "\"output\":\".cbackup-captures$DBS/app/live.db\"" "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/preview" '{"nope":1}')
+contains "preview refuses an unknown key" ' 400' "$OUT"
+contains "and names it" "unknown key 'nope'" "$OUT"
 OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/enable" '{"template":"pg-dumpall"}')
 contains "a file source takes only sqlite-backup" ' 400' "$OUT"
 contains "and says so" 'takes only sqlite-backup' "$OUT"
@@ -2395,6 +2398,7 @@ contains "allow_rollback_lock is a boolean" ' 400' "$OUT"
 OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/enable" '{"template":"sqlite-backup","params":{"lock":true}}')
 contains "and the only parameter" ' 400' "$OUT"
 OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/enable" '{"template":"sqlite-backup","nope":1}')
+contains "enable refuses an unknown key" ' 400' "$OUT"
 contains "an unknown key is refused" "unknown key 'nope'" "$OUT"
 OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/enable" '{"template":"sqlite-backup","params":{"allow_rollback_lock":true}}')
 contains "enable records the choice" ' 200' "$OUT"
@@ -2414,6 +2418,9 @@ check "nor is GET an action" 405 "$(curl -s -o /dev/null -w '%{http_code}' \
      --unix-socket "$SOCK" "http://localhost/repos/$DB_ID/databases/$FID/enable")"
 OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/dismiss" '{}')
 contains "dismiss needs a reason" ' 400' "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/dismiss" '{"reason":"x","why":"y"}')
+contains "dismiss refuses an unknown key" ' 400' "$OUT"
+contains "and names it" "unknown key 'why'" "$OUT"
 OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/dismiss" '{"reason":"test data"}')
 contains "dismiss records it" '"state":"dismissed"' "$OUT"
 contains "with the reason" '"reason":"test data"' "$OUT"

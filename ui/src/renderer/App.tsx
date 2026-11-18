@@ -116,6 +116,7 @@ export function App(): React.ReactElement {
   const [restoreModal, setRestoreModal] = useState<{ snapId: number; filePath?: string } | null>(null)
   const [restoreDest, setRestoreDest] = useState('')
   const [restoreVerify, setRestoreVerify] = useState(false)
+  const [restorePreferCopy, setRestorePreferCopy] = useState(false)
   const [restoreStarting, setRestoreStarting] = useState(false)
 
   // Backup modal
@@ -475,6 +476,7 @@ export function App(): React.ReactElement {
         snapshotId: restoreModal.snapId,
         dest: restoreDest.trim(),
         subpath: restoreModal.filePath,
+        preferEngineCopy: restorePreferCopy,
       })
       setRestoreModal(null)
       navigateTo({ view: 'tasks' })
@@ -778,7 +780,7 @@ export function App(): React.ReactElement {
                 snapId={currentView.snapId}
                 initialPath={currentView.path}
                 onBack={navBack}
-                onRestore={(sid, fp) => { setRestoreModal({ snapId: sid, filePath: fp }); setRestoreDest(''); setRestoreVerify(false) }}
+                onRestore={(sid, fp) => { setRestoreModal({ snapId: sid, filePath: fp }); setRestoreDest(''); setRestoreVerify(false); setRestorePreferCopy(false) }}
                 onSearchHere={(path) => navigateTo({ view: 'grep', prefix: path })}
               />
             )}
@@ -1029,6 +1031,14 @@ export function App(): React.ReactElement {
                 placeholder="/path/to/restore/destination"
                 className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent font-mono"
                 autoFocus required />
+            </div>
+            <div className="mb-3">
+              <label className="text-xs flex items-center gap-1.5 cursor-pointer text-text-secondary"
+                title="A database with a consistent engine copy in this snapshot (.cbackup-captures) is restored from the copy, and its stale -wal, -shm and -journal are left out">
+                <input type="checkbox" checked={restorePreferCopy}
+                  onChange={e => setRestorePreferCopy(e.target.checked)} />
+                Restore databases from their engine copies
+              </label>
             </div>
             <div className="mb-4">
               <label className="text-xs flex items-center gap-1.5 cursor-pointer text-text-secondary hidden">

@@ -54,6 +54,15 @@ export interface HarnessOptions {
    *             app with none so a spec can add it through the dialog.
    */
   remote?: { password?: string; seed: boolean }
+
+  /*
+   * Live databases for detection (docs/db-detection.md): a WAL-mode SQLite
+   * with its -wal in the backed-up source, which the first backup finds
+   * live and uncovered, and a fake-provider unit `cbk-uat-db` whose tree
+   * holds another, so the unit scope and its Detect action have something
+   * to find. Real SQLite files, so an engine copy can actually be made.
+   */
+  databases?: boolean
 }
 
 export interface Harness {
@@ -76,6 +85,29 @@ export interface Harness {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/*
+ * An empty SQLite database in WAL mode, byte for byte: the 100-byte header
+ * and an empty sqlite_master leaf page. Written rather than made with the
+ * sqlite3 tool, which the CI image does not carry. integrity_check passes
+ * on it and the online backup copies it.
+ */
+export function emptyWalSqlite(): Buffer {
+  const b = Buffer.alloc(4096)
+  b.write('SQLite format 3\0', 0, 'latin1')
+  b.writeUInt16BE(4096, 16)
+  b[18] = 2; b[19] = 2          /* WAL */
+  b[21] = 64; b[22] = 32; b[23] = 32
+  b.writeUInt32BE(1, 24)        /* change counter */
+  b.writeUInt32BE(1, 28)        /* pages */
+  b.writeUInt32BE(4, 44)        /* schema format */
+  b.writeUInt32BE(1, 56)        /* UTF-8 */
+  b.writeUInt32BE(1, 92)
+  b.writeUInt32BE(3046000, 96)
+  b[100] = 0x0d                 /* leaf table page, no cells */
+  b.writeUInt16BE(4096, 105)
+  return b
+}
 
 export function cli(sock: string, args: string[]): string {
   const r = spawnSync(CLI, ['--socket', sock, ...args], { encoding: 'utf-8' })
@@ -123,12 +155,26 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     }
   }
 
+  if (opts.databases) {
+    mkdirSync(join(work, 'src', 'app'), { recursive: true })
+    writeFileSync(join(work, 'src', 'app', 'live.db'), emptyWalSqlite())
+    writeFileSync(join(work, 'src', 'app', 'live.db-wal'), '')
+    mkdirSync(join(work, 'unit-snap'), { recursive: true })
+    writeFileSync(join(work, 'unit-snap', 'grafana.db'), emptyWalSqlite())
+    writeFileSync(join(work, 'unit-snap', 'grafana.db-wal'), '')
+    writeFileSync(join(work, 'units.json'), JSON.stringify({ units: [{
+      id: 'db', name: 'cbk-uat-db', state: 'running', caps: ['snapshot'],
+      trees: [{ id: 'vol', read_root: join(work, 'unit-snap'), path: join(work, 'unit-live') }],
+    }] }))
+  }
+
   const port = opts.remote ? await freePort() : 0
   writeFileSync(join(work, 'config.yaml'),
     `db:\n  path: ${work}/state.db\n` +
     `http:\n  socket: ${sock}\n  port: ${port}\n  bind: 127.0.0.1\n` +
     `security:\n  key_dir: ${work}/keys\n` +
-    `log:\n  level: warn\n`)
+    `log:\n  level: warn\n` +
+    (opts.databases ? `units:\n  allow: cbk-uat-*\n  fake_spec: ${work}/units.json\n` : ''))
 
   const daemon: ChildProcess = spawn(DAEMON, [], {
     env: { ...process.env, C_BACKUP_CONFIG_PATH: join(work, 'config.yaml') },
