@@ -9,6 +9,8 @@
 #include "util.h"
 #include "json_row.h"
 #include "db_write.h"
+#include "remote_provider.h"
+#include "source_snapshot.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -528,11 +530,23 @@ api_response_t metadata_sources_get(const api_request_t *req, int64_t repo_id)
      * with the key and a client can iterate unconditionally. */
     if (json_resp_ensure_array(resp, "sources") != 0) { /* alloc only */ }
     if (json_resp_ensure_array(resp, "exclude") != 0) { /* alloc only */ }
+    if (json_resp_ensure_array(resp, "snapshot") != 0) { /* alloc only */ }
 
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         const char *kind = r->rows[i][0];
         const char *val  = r->rows[i][1];
-        const char *key  = (kind && strcmp(kind, "exclude") == 0) ? "exclude" : "sources";
+        int mode = strcmp(kind, SRC_SNAP_KIND_STRICT) == 0 ? SRC_SNAP_STRICT
+                 : strcmp(kind, SRC_SNAP_KIND_WARN) == 0   ? SRC_SNAP_WARN : SRC_SNAP_OFF;
+        if (mode != SRC_SNAP_OFF) {
+            /* Snapshot mode (db-detection.md 9.4): [{"path","mode"}]. */
+            CUTILS_AUTO_JSON_ELEM cutils_json_elem_t e;
+            if (json_resp_array_append_begin(resp, "snapshot", &e) != 0) break;
+            if (json_elem_add_str(&e, "path", val) != 0 ||
+                json_elem_add_str(&e, "mode", src_snap_mode_name(mode)) != 0) break;
+            json_elem_commit(&e);
+            continue;
+        }
+        const char *key  = strcmp(kind, "exclude") == 0 ? "exclude" : "sources";
         if (json_resp_array_append_str(resp, key, val) != 0) break;
     }
     db_result_free(r);
@@ -657,6 +671,88 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
         }
     }
 
+    /*
+     * Snapshot mode per source (db-detection.md 9.4): "snapshot":
+     * [{"path", "mode": "strict" | "warn"}], each path one of the sources
+     * above, mode strict when left out. Given, it replaces the modes; left
+     * out, the modes of sources that stay are kept, so a client that knows
+     * nothing of snapshot mode (an older desktop app saving its source list)
+     * does not silently turn it off.
+     */
+    char *snap_path[SOURCES_MAX] = { 0 };
+    int   snap_mode[SOURCES_MAX] = { 0 };
+    int   n_snap = 0;
+    int   snap_given = json_req_has(body, "snapshot");
+    size_t n_snap_in = 0;
+    if (!failed && snap_given && (json_req_array_len(body, "snapshot", &n_snap_in) != 0 ||
+                                  n_snap_in > SOURCES_MAX)) {
+        bad = api_error(400, "snapshot must be a list of {\"path\", \"mode\"}, one per source");
+        failed = 1;
+    }
+    CUTILS_AUTO_JSON_ITER cutils_json_iter_t sn;
+    if (!failed && snap_given && json_iter_begin(body, "snapshot", &sn) == 0) {
+        while (json_iter_next(&sn) && !failed) {
+            char *sp = NULL, *mp = NULL;
+            char norm[PATH_MAX] = "";
+            if (json_iter_get_str(&sn, "path", &sp) != 0 || !sp || sp[0] != '/' ||
+                path_normalize(sp, norm, sizeof(norm)) != 0) {
+                bad = api_error(400, "every snapshot entry needs the absolute path of a source");
+                failed = 1;
+            }
+            int m = SRC_SNAP_STRICT;
+            if (!failed && json_iter_get_str(&sn, "mode", &mp) == 0 && mp &&
+                ((m = src_snap_mode_parse(mp)) < 0 || m == SRC_SNAP_OFF)) {
+                bad = api_error(400, "a snapshot mode is \"strict\" or \"warn\" (leave the source "
+                                     "out of the list to turn snapshot mode off)");
+                failed = 1;
+            }
+            int known = 0;
+            for (int k = 0; !failed && k < n_paths && !known; k++) known = strcmp(paths[k], norm) == 0;
+            if (!failed && !known) {
+                char msg[PATH_MAX + 96];
+                snprintf(msg, sizeof(msg), "snapshot mode is for a source; %s is not one", norm);
+                bad = api_error(400, msg);
+                failed = 1;
+            }
+            for (int k = 0; !failed && k < n_snap; k++)
+                if (strcmp(snap_path[k], norm) == 0) {
+                    bad = api_error(400, "a source is listed twice in snapshot");
+                    failed = 1;
+                }
+            if (!failed) {
+                if (!(snap_path[n_snap] = strdup(norm))) { bad = api_error(500, "out of memory"); failed = 1; }
+                else snap_mode[n_snap++] = m;
+            }
+            free(sp);
+            free(mp);
+        }
+    } else if (!failed && !snap_given) {
+        db_result_t *kept = NULL;
+        if (db_execute(g_db, "SELECT kind, value FROM repo_backup_paths WHERE repo_id = ?"
+                             " AND kind IN ('" SRC_SNAP_KIND_STRICT "', '" SRC_SNAP_KIND_WARN "')",
+                       (const char *[]){ repo, NULL }, &kept) != 0) {
+            bad = api_error(500, "cannot read backup sources");
+            failed = 1;
+        }
+        for (int k = 0; !failed && kept && k < kept->nrows; k++) {
+            int stays = 0;
+            for (int q = 0; q < n_paths && !stays; q++) stays = strcmp(paths[q], kept->rows[k][1]) == 0;
+            if (!stays || n_snap >= SOURCES_MAX) continue;
+            if (!(snap_path[n_snap] = strdup(kept->rows[k][1]))) { bad = api_error(500, "out of memory"); failed = 1; break; }
+            snap_mode[n_snap++] = strcmp(kept->rows[k][0], SRC_SNAP_KIND_STRICT) == 0 ? SRC_SNAP_STRICT : SRC_SNAP_WARN;
+        }
+        db_result_free(kept);
+    }
+    if (!failed && n_snap > 0) {
+        remote_link_info_t li;
+        remote_link_info(&li);
+        if (!li.configured &&
+            json_resp_array_append_str(out, "warnings",
+                "no helper is configured (units.helper_socket): only the helper can take a "
+                "snapshot, so a source in strict snapshot mode fails every backup until one is, "
+                "and one in warn mode is read live") != 0) { /* alloc only */ }
+    }
+
     if (!failed) {
         if (db_txn_begin(g_db) != OK) {
             failed = 1;
@@ -683,6 +779,15 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
                     (const char *[]){ repo, excl[i], NULL }, NULL) != 0)
                 failed = 1;
 
+        for (int i = 0; i < n_snap && !failed; i++)
+            if (db_write(g_db,
+                    "INSERT OR REPLACE INTO repo_backup_paths (repo_id, kind, value)"
+                    " VALUES (?, ?, ?)",
+                    (const char *[]){ repo, snap_mode[i] == SRC_SNAP_STRICT ? SRC_SNAP_KIND_STRICT
+                                                                            : SRC_SNAP_KIND_WARN,
+                                      snap_path[i], NULL }, NULL) != 0)
+                failed = 1;
+
         if (failed) {
             db_txn_rollback(g_db);
             bad = api_error(500, "cannot store backup sources");
@@ -694,11 +799,13 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
 
     for (int i = 0; i < n_paths; i++) free(paths[i]);
     for (int i = 0; i < n_excl; i++) free(excl[i]);
+    for (int i = 0; i < n_snap; i++) free(snap_path[i]);
     if (failed) return bad;
 
     /* 200 with a body rather than 204, so a warning has somewhere to go. */
     if (json_resp_add_u32(out, "sources", (uint32_t)n_paths) != 0 ||
-        json_resp_add_u32(out, "exclude", (uint32_t)n_excl) != 0)
+        json_resp_add_u32(out, "exclude", (uint32_t)n_excl) != 0 ||
+        json_resp_add_u32(out, "snapshot", (uint32_t)n_snap) != 0)
         return api_error(500, "out of memory");
     return finalise(out);
 }

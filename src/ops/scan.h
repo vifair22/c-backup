@@ -81,6 +81,11 @@ typedef struct {
     int          verbose;
     int          collect_meta; /* collect xattr/ACL blobs during scan (default: on) */
     int          one_filesystem; /* skip entries on different devices (mount points) */
+    /* scan_tree_as: match excludes against the recorded paths rather than
+     * the paths as read. A file source read from a snapshot keeps the
+     * excludes its operator wrote for the live tree (db-detection.md 9.4);
+     * unit captures rewrite their patterns onto read roots and leave it 0. */
+    int          exclude_on_record;
     void       (*progress_cb)(uint32_t scanned_entries, void *ctx);
     void       (*progress_clear_cb)(void *ctx);
     void        *progress_ctx;
@@ -102,7 +107,8 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
  * Each entry's path is the record path and its read_path the real one; the
  * ancestors synthesised above the root are record_root's, taken from the
  * host where they exist and made up (0755, root, mtime 0) where they do
- * not. Excludes match the paths as read. Entries on the read root's
+ * not. Excludes match the paths as read (the recorded paths with
+ * opts->exclude_on_record). Entries on the read root's
  * device are identified by the record root's live device (rec_dev), so the
  * trees match a live read's whatever device the snapshot was given. Both
  * roots absolute.

@@ -723,12 +723,35 @@ static int pattern_matches(const char *pat, const char *full) {
  * they had excluded something and the only evidence otherwise was the size
  * of the repository months later.
  */
-static int is_excluded(const char *full_path, const scan_opts_t *opts) {
+static int is_excluded_path(const char *full_path, const scan_opts_t *opts) {
     if (!opts || !opts->exclude || opts->n_exclude == 0) return 0;
     for (int i = 0; i < opts->n_exclude; i++) {
         if (pattern_matches(opts->exclude[i], full_path)) return 1;
     }
     return 0;
+}
+
+/*
+ * A scan_tree_as walk with exclude_on_record: the read root and the record
+ * root, so a path as read is matched as it will be recorded. Thread-local
+ * around one walk, like tl_top_read.
+ */
+static _Thread_local const char *tl_xread, *tl_xrec;
+
+static int is_excluded(const char *full_path, const scan_opts_t *opts) {
+    if (!opts || !opts->exclude || opts->n_exclude == 0) return 0;
+    if (!tl_xread) return is_excluded_path(full_path, opts);
+    size_t rl = strlen(tl_xread);
+    if (strncmp(full_path, tl_xread, rl) != 0 || (full_path[rl] != '\0' && full_path[rl] != '/'))
+        return is_excluded_path(full_path, opts);
+    const char *tail = full_path + rl;
+    char rec[PATH_MAX];
+    int n = strcmp(tl_xrec, "/") == 0 && *tail ? snprintf(rec, sizeof(rec), "%s", tail)
+                                               : snprintf(rec, sizeof(rec), "%s%s", tl_xrec, tail);
+    /* A recorded path past PATH_MAX cannot be matched as recorded; matched
+     * as read rather than silently never excluded. */
+    if (n < 0 || (size_t)n >= sizeof(rec)) return is_excluded_path(full_path, opts);
+    return is_excluded_path(rec, opts);
 }
 
 /* Dirent batch entry for inode-sorted readdir.
@@ -973,13 +996,20 @@ static status_t scan_tree_impl(const char *root, const char *record,
         }
     }
 
+    const char *prev_xread = tl_xread, *prev_xrec = tl_xrec;
+    if (as && opts && opts->exclude_on_record) { tl_xread = root; tl_xrec = record; }
+    else { tl_xread = NULL; tl_xrec = NULL; }
     if (is_excluded(root, opts)) {
+        tl_xread = prev_xread;
+        tl_xrec = prev_xrec;
         *out = res;
         return OK;
     }
 
     /* Root may disappear between prefix synthesis and scan entry walk. */
     if (lstat(root, &root_st) != 0) {
+        tl_xread = prev_xread;
+        tl_xrec = prev_xrec;
         if (opts && opts->progress_clear_cb)
             opts->progress_clear_cb(opts->progress_ctx);
         char msg[PATH_MAX + 96];
@@ -1013,6 +1043,8 @@ static status_t scan_tree_impl(const char *root, const char *record,
                                 strip_prefix_len, imap, opts,
                                 root_dev, res);
     tl_top_read = prev_top;
+    tl_xread = prev_xread;
+    tl_xrec = prev_xrec;
     tl_remap = prev_remap;
     tl_remap_from = prev_from;
     tl_remap_to = prev_to;

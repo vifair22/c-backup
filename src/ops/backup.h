@@ -144,6 +144,9 @@ typedef struct {
      * time while keeping inodes and times.
      */
     const char         **read_paths;
+    /* With read_paths: excludes name the recorded paths, as a file source
+     * read from a snapshot needs (scan_opts_t.exclude_on_record). */
+    int                  exclude_on_record;
     const backup_synth_t *synth;
     size_t               n_synth;
     const backup_synth_ops_t *synth_ops;

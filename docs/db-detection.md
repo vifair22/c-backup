@@ -502,6 +502,29 @@ snapshot exactly as a container's mounts are:
 Every database in a snapshot-read source is then `covered-crash` without
 any engine copy, and OWN-45 has nothing left to flag there.
 
+**As built (D4).** `PUT /repos/<id>/sources` takes `snapshot:
+[{path, mode}]` and the CLI `sources set --snapshot PATH` /
+`--snapshot-warn PATH`; the modes are rows of `repo_backup_paths` (kinds
+`snapshot:strict`, `snapshot:warn`), so no migration. **Strict is the
+default** (decided 2026-11-18): a source in snapshot mode that cannot be
+read from a snapshot fails the backup before anything is read, naming each
+path and reason. `warn` is an explicit per-source opt-in that reads it live
+with a job warning naming each path and reason, journalled and alerted as a
+warning, and lists it in the job result's `live_sources`. The point above
+("read live as today, and the job result says so") therefore applies to
+`warn` only. Paths the helper does not snapshot get no action from it at all
+beyond placing them (`helper.md`). A mount below a source shows empty in
+its snapshot, so such a source is read from the snapshot only with
+`one_filesystem`. Excludes match the recorded paths
+(`scan_opts_t.exclude_on_record`); the trees and the file cache are a live
+read's (B229). The capture is ended after the read on every outcome; the
+helper ends it if the daemon dies and sweeps it at its own start. No new
+repository-writing path, so no power-cut scenario: the repository sees an
+ordinary file backup. Detection (D0) is told which sources were read from a
+snapshot (`DB_CAP_ATOMIC`, each its own instant), so their databases are
+judged `covered-crash` rather than `uncovered`; a lost lease drops that.
+Manual 6.6.
+
 ### 9.5 The flag explains, and restore prefers the engine copy
 
 When the unsettled file is a detected database, the flag's explanation
