@@ -240,9 +240,16 @@ status_t unit_detect_run(cutils_db_t *db, int64_t repo_id, const char *prov, con
     db_cap_root_t *roots = calloc(nt ? nt : 1, sizeof(*roots));
     char *excl[UNIT_EXCLUDE_MAX];
     size_t n_excl = 0;
-    if (!rec || !rd || !roots) st = set_error(ERR_NOMEM, "detect");
+    if (!rec || !rd || !roots) {
+        free(rec);
+        free(rd);
+        free(roots);
+        ops->desc_free(desc);
+        db_detect_free(d);
+        return set_error(ERR_NOMEM, "detect");
+    }
     size_t k = 0;
-    for (size_t i = 0; st == OK && i < desc->n_items; i++) {
+    for (size_t i = 0; i < desc->n_items; i++) {
         const sp_item_desc_t *it = &desc->items[i];
         if (it->kind != SP_ITEM_TREE) continue;
         /* Where pause-read's first pass reads a tree on no snapshot domain:
@@ -263,7 +270,7 @@ status_t unit_detect_run(cutils_db_t *db, int64_t repo_id, const char *prov, con
         roots[k].instant = 0;
         k++;
     }
-    if (st == OK) n_excl = unit_backup_excludes(db, repo_id, key, rec, rd, nt, excl);
+    n_excl = unit_backup_excludes(db, repo_id, key, rec, rd, nt, excl);
     for (size_t i = 0; st == OK && i < nt; i++) {
         if (progress) progress("detect", i, nt, progress_ctx);
         status_t ts = detect_tree(d, rd[i], rec[i], (const char *const *)excl, n_excl, cancel, out);
