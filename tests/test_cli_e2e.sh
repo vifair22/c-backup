@@ -1097,9 +1097,14 @@ for _ in $(seq 1 40); do
     sleep 0.25
 done
 contains "a scheduled job journals its schedule" '"message":"schedule ' "$SCHED_J"
-# Stop it before it fires again under the rest of the suite.
-SID=$(cb schedule list "$ENC_ID" 2>/dev/null | tr ',' '\n' | grep -B0 -A0 '"id"' | head -1 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+# Stop it before it fires again under the rest of the suite. By its
+# destination: the first id in the list is the hourly schedule above, and
+# removing that one left this one firing every second to the end of the
+# suite, which the idle check (B201) caught.
+SID=$(cb schedule list "$ENC_ID" 2>/dev/null | sed 's/{"id":/\n{"id":/g' | grep 'fired-replica' | sed -n 's/^{"id":\([0-9]*\),.*/\1/p' | head -1)
+check "the one-second replicate schedule is found" 1 "$([ -n "$SID" ] && echo 1 || echo 0)"
 cb schedule remove "$ENC_ID" "$SID" >/dev/null 2>&1 || true
+contains "and removed" "no such schedule" "$(cb schedule remove "$ENC_ID" "$SID" 2>&1)"
 
 # A relative path would be resolved against the daemon's working directory,
 # which is not where the operator was standing when they typed it.
