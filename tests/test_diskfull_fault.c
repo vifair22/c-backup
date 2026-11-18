@@ -51,7 +51,12 @@
 #include "server.h"
 #include "db_txn.h"
 #include "verify.h"
+#include "job_manager.h"
+#include "http.h"
 #include "test_tmp.h"
+
+#include <stdatomic.h>
+#include <time.h>
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_diskfull_fault"
 #define TEST_DB   TEST_DIR "/state.db"
@@ -869,6 +874,111 @@ static void test_pack_sync_failure_latches_only_its_repo(void **state)
     store_close(st2);
 }
 
+/*
+ * FLAKE-28: `repo repair` for a failed sync is POST /repos/<id>/verify
+ * ?clear_sync=1, a verify job the dispatcher locks for writing, not a
+ * route that tries the repo lock itself. Submitted while another job holds
+ * the repository it is accepted, waits, runs after the holder, and clears
+ * the latch.
+ */
+static atomic_int g_hold_open;
+static atomic_int g_hold_running;
+
+static void sleep_us(long us)
+{
+    struct timespec ts = { us / 1000000, (us % 1000000) * 1000 };
+    nanosleep(&ts, NULL);
+}
+
+static status_t holding_job(void *arg, atomic_int *cancel,
+                            void (*progress)(const char *, uint64_t, uint64_t, void *),
+                            void *progress_ctx)
+{
+    (void)arg; (void)cancel; (void)progress; (void)progress_ctx;
+    g_hold_running = 1;
+    for (int i = 0; i < 1000 && !g_hold_open; i++) sleep_us(10000);
+    return OK;
+}
+
+static int job_reaches(int64_t id, const char *want)
+{
+    char q[96];
+    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM jobs WHERE id = %lld AND state = '%s'",
+             (long long)id, want);
+    for (int i = 0; i < 1000; i++) {
+        if (scalar(q) == 1) return 1;
+        sleep_us(5000);
+    }
+    return 0;
+}
+
+static void test_a_sync_repair_waits_for_the_job_holding_the_repo(void **state)
+{
+    (void)state;
+    backup_result_t res;
+    assert_int_equal(backup_into(store, repo_id, &res), OK);
+    backup_result_free(&res);
+    write_file(TEST_SRC "/e.txt", 0, 0);
+    fault_full_errno = EIO;
+    fault_full_arm(STAGING, FAULT_FULL_SYNC, 0, 1);
+    status_t st = backup_into(store, repo_id, &res);
+    fault_full_disarm();
+    backup_result_free(&res);
+    assert_int_not_equal(st, OK);
+    assert_true(sync_latch_repo_tripped(TEST_REPO));
+
+    job_manager_t *jm = NULL;
+    assert_int_equal(job_manager_start(db, 2, &jm), OK);
+    routes_snapshots_init(db, jm);
+    routes_metadata_init(db);
+    /* A real socket: clear_sync is a query parameter, which only a live
+     * connection carries. */
+    const char *sock = TEST_DIR "/api.sock";
+    api_server_t *srv = api_server_create(0, NULL, sock, NULL);
+    assert_non_null(srv);
+    assert_int_equal(routes_register_repos(srv, db), 0);
+    assert_int_equal(api_server_start(srv), 0);
+
+    g_hold_open = 0;
+    g_hold_running = 0;
+    int64_t holder = 0;
+    assert_int_equal(job_submit(jm, repo_id, "gc", NULL, holding_job, NULL, NULL, &holder), OK);
+    for (int i = 0; i < 1000 && !g_hold_running; i++) sleep_us(5000);
+    assert_true(g_hold_running);
+
+    char url[96];
+    snprintf(url, sizeof(url), "/repos/%lld/verify?clear_sync=1", (long long)repo_id);
+    http_response_t hr;
+    memset(&hr, 0, sizeof(hr));
+    assert_int_equal(http_request(sock, "POST", url, NULL, &hr), OK);
+    assert_int_equal(hr.status, 202);
+    assert_non_null(hr.body);
+    const char *jp = strstr(hr.body, "\"job_id\":");
+    assert_non_null(jp);
+    int64_t repair = strtoll(jp + 9, NULL, 10);
+    http_response_free(&hr);
+
+    /* Queued behind the holder; the latch still set. */
+    assert_true(job_reaches(repair, "queued"));
+    sleep_us(200 * 1000);
+    assert_true(job_reaches(repair, "queued"));
+    assert_true(sync_latch_repo_tripped(TEST_REPO));
+
+    g_hold_open = 1;
+    assert_true(job_reaches(holder, "completed"));
+    assert_true(job_reaches(repair, "completed"));
+    char q[160];
+    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM jobs a, jobs b WHERE a.id = %lld"
+             " AND b.id = %lld AND a.started >= b.ended", (long long)repair, (long long)holder);
+    assert_int_equal(scalar(q), 1);
+    assert_false(sync_latch_repo_tripped(TEST_REPO));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM recovery_state WHERE key = 'sync-failed'"), 0);
+
+    api_server_stop(srv);
+    job_manager_stop(jm);
+    routes_snapshots_init(NULL, NULL);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -886,6 +996,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_sync_failure_installs_nothing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_sync_failure_latches_durable_writes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_sync_failure_latches_only_its_repo, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_sync_repair_waits_for_the_job_holding_the_repo, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -2645,6 +2645,15 @@ Two things are never taken for missing packs:
 
   which marks their objects absent as above and takes backups again.
 
+  The repair is a job (`POST /repos/<id>/repair` with
+  `{"accept_missing":true}` answers 202 `{"job_id":N}`), queued like any
+  other: submitted while a backup, gc or verify holds the repository, it
+  waits for that job and then runs, rather than being refused. The command
+  waits for it and prints the finished job, whose `result` carries the
+  counts: `packs_checked`, `packs_missing`, `packs_unknown`, `packs_dropped`,
+  `objects_absent`, `packs_returned`, `objects_restored` and `degraded`. A
+  repository that is unavailable fails the job, with the reason above.
+
 A single missing pack never trips the percentage, however small the
 repository, as long as other packs are present: one of two heals on its
 own, with its alert, while two out of three go through the repair. One out
@@ -2718,6 +2727,13 @@ filesystem, a target that was unplugged) and fix it. Then:
   repairing) to fix what parity can, then `repo repair` again. A passing
   repair removes the record, so the repository stays clear across later
   restarts.
+
+  This repair is a job too: `POST /repos/<id>/verify?clear_sync=1`, which
+  answers 202 `{"job_id":N}`, or 409 at once when the repository has no
+  failed sync or is unavailable. Submitted while another job holds the
+  repository it waits for that job and then runs. `repo repair <id>` waits
+  for it and prints the finished job; it exits 1 when the verify found
+  damage and left the latch set.
 
 ## 18. Capacity planning and performance
 
@@ -2963,7 +2979,8 @@ lists every command with all of its arguments.
 | `repo list [--limit N] [--offset N]` | Registered repositories |
 | `repo add <path> [label] [--encrypt system\|passphrase\|none] [--passphrase TEXT]` | Create or register |
 | `repo show <id>` | One repository; `degraded` says why it takes no backups, when it does not |
-| `repo repair <id> --accept-missing` | Accept a degraded repository's missing packs as lost (section 17.6) |
+| `repo repair <id>` | Clear a repository's failed sync once a deep verify from disk finds nothing (section 17.7). A job; waits for it |
+| `repo repair <id> --accept-missing` | Accept a degraded repository's missing packs as lost (section 17.6). A job, queued behind any job holding the repository; waits for it and prints its result |
 | `repo remove <id>` | Deregister; the directory is kept |
 | `repo key export\|ack <id>`, `repo key import <id> <key-hex>` | Encryption key escrow and recovery |
 | `sources list <id>`, `sources set <id> [path...] [--exclude PAT]...` | What a repository backs up; `set` with no paths clears the list |

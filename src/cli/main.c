@@ -517,9 +517,14 @@ static int h_repo_repair(const args_t *a)
 {
     if (!args_flag(a, "--accept-missing"))
         return maintenance_ex("verify", a->pos[0], "clear_sync=1", 0, 0, NULL);
+    /* A job (FLAKE-28): waited for like gc, so a repair queued behind a
+     * running backup still prints what it did. */
     sbuf_t p = { 0 };
     sb_puts(&p, "/repos/"); sb_puts(&p, a->pos[0]); sb_puts(&p, "/repair");
-    return call_path_sb("POST", &p, "{\"accept_missing\":true}");
+    if (p.oom) { free(p.buf); return fail("request too large"); }
+    int rc = job_run("POST", p.buf, "{\"accept_missing\":true}", 0, 0, NULL);
+    free(p.buf);
+    return rc;
 }
 
 static int h_repo_remove(const args_t *a)
