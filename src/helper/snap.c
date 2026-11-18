@@ -2,6 +2,7 @@
 
 #include "snap.h"
 #include "artefact.h"
+#include "mounts.h"
 
 #include <cutils/log.h>
 
@@ -535,4 +536,123 @@ status_t snap_check_snapdir(const snap_ctx_t *c, const char *btrfs_root)
     }
     fclose(f);
     return st;
+}
+
+/* ---- what a snapshot would show empty (B231) ---- */
+
+#define PROBE_POOLS_MAX 16
+
+struct snap_probe {
+    const snap_ctx_t *c;
+    char  **mps;               /* the host's mount points */
+    size_t  n_mps;
+    struct {
+        char    pool[PATH_MAX];
+        char  **subvols;       /* absolute paths of the pool's subvolumes */
+        size_t  n;
+    } pools[PROBE_POOLS_MAX];
+    size_t  n_pools;
+};
+
+/* path strictly below root. */
+static int strictly_below(const char *path, const char *root)
+{
+    size_t n = strlen(root);
+    if (n == 1 && root[0] == '/') return path[0] == '/' && path[1] != '\0';
+    return strncmp(path, root, n) == 0 && path[n] == '/';
+}
+
+status_t snap_probe_new(const snap_ctx_t *c, const char *mountinfo, snap_probe_t **out)
+{
+    *out = NULL;
+    snap_probe_t *p = calloc(1, sizeof(*p));
+    if (!p) return set_error(ERR_NOMEM, "snap: probe");
+    p->c = c;
+    if (mountinfo && mountinfo[0]) {
+        status_t st = mount_points(mountinfo, &p->mps, &p->n_mps);
+        if (st != OK) { free(p); return st; }
+    }
+    *out = p;
+    return OK;
+}
+
+void snap_probe_free(snap_probe_t *p)
+{
+    if (!p) return;
+    mount_points_free(p->mps, p->n_mps);
+    for (size_t i = 0; i < p->n_pools; i++) mount_points_free(p->pools[i].subvols, p->pools[i].n);
+    free(p);
+}
+
+/* The pool's subvolumes, listed once: `btrfs subvolume list` gives paths
+ * relative to the top level; the helper's own snapshots are left out. */
+static status_t pool_subvols(snap_probe_t *p, const char *pool, size_t *at)
+{
+    for (size_t i = 0; i < p->n_pools; i++)
+        if (strcmp(p->pools[i].pool, pool) == 0) { *at = i; return OK; }
+    if (p->n_pools >= PROBE_POOLS_MAX) return set_error(ERR_INVALID, "snap: more than %d btrfs pools", PROBE_POOLS_MAX);
+    const char *argv[] = { p->c->tools->btrfs, "subvolume", "list", pool, NULL };
+    char *txt = NULL;
+    status_t st = host_run(p->c->tools, 0, argv, SNAP_TOOL_TIMEOUT_S, &txt, SNAP_LIST_CAP);
+    if (st != OK) return st;
+    size_t lines = 1;
+    for (const char *q = txt; *q; q++) lines += *q == '\n';
+    char **v = calloc(lines, sizeof(*v));
+    if (!v) {
+        free(txt);
+        return set_error(ERR_NOMEM, "snap: subvolumes");
+    }
+    size_t k = 0;
+    char *save = NULL;
+    for (char *l = strtok_r(txt, "\n", &save); l && st == OK; l = strtok_r(NULL, "\n", &save)) {
+        char *rel = strstr(l, " path ");
+        if (!rel) continue;
+        rel += 6;
+        if (strncmp(rel, "<FS_TREE>/", 10) == 0) rel += 10;
+        char full[PATH_MAX];
+        int w = snprintf(full, sizeof(full), "%s/%s", strcmp(pool, "/") == 0 ? "" : pool, rel);
+        if (w < 0 || (size_t)w >= sizeof(full)) continue;
+        char dir[PATH_MAX];
+        btrfs_snapdir(p->c, pool, dir, sizeof(dir));
+        if (strstr(full, "/.cbackup-snapshots/") || strictly_below(full, dir)) continue;
+        if (!(v[k] = strdup(full))) { st = set_error(ERR_NOMEM, "snap: subvolumes"); break; }
+        k++;
+    }
+    free(txt);
+    if (st != OK) { mount_points_free(v, k); return st; }
+    snprintf(p->pools[p->n_pools].pool, sizeof(p->pools[p->n_pools].pool), "%s", pool);
+    p->pools[p->n_pools].subvols = v;
+    p->pools[p->n_pools].n = k;
+    *at = p->n_pools++;
+    return OK;
+}
+
+#define PROBE_NAMES 3
+
+static void name_add(char *names, size_t nsz, size_t total, const char *path)
+{
+    if (!nsz || total > PROBE_NAMES) return;
+    size_t l = strlen(names);
+    if (l + 1 >= nsz) return;
+    snprintf(names + l, nsz - l, "%s%s", l ? ", " : "", path);
+}
+
+status_t snap_probe_below(snap_probe_t *p, const snap_dom_t *dom, const char *real,
+                          size_t *total, char *names, size_t nsz)
+{
+    *total = 0;
+    if (nsz) names[0] = '\0';
+    for (size_t i = 0; i < p->n_mps; i++) {
+        if (!strictly_below(p->mps[i], real)) continue;
+        name_add(names, nsz, ++*total, p->mps[i]);
+    }
+    if (dom->kind != SNAP_BTRFS) return OK;
+    size_t at = 0;
+    status_t st = pool_subvols(p, dom->pool, &at);
+    if (st != OK) return st;
+    for (size_t i = 0; i < p->pools[at].n; i++) {
+        if (!strictly_below(p->pools[at].subvols[i], real)) continue;
+        name_add(names, nsz, ++*total, p->pools[at].subvols[i]);
+    }
+    return OK;
 }

@@ -989,6 +989,40 @@ virsh -q -c "$VIRT_URI" undefine cbk-uat-vm >/dev/null 2>&1
 }
 test_vm
 
+# ---- B231: a btrfs subvolume below a container's mount --------------------
+# A snapshot of the pool shows a nested subvolume as an empty directory. A
+# mount with one below it must not be read from the snapshot (its contents
+# would be silently missing): the helper flags it, the daemon reads it
+# through the fallback, the job warns naming it, and the restore holds the
+# subvolume's files.
+
+test_b231_nested_subvolume() {
+    local n="$APPS/cbk-uat-nest" out snap r="$OUT/b231" man
+    log "B231: a container mount with a btrfs subvolume below it"
+    mkdir -p "$n"
+    echo top > "$n/top.txt"
+    btrfs subvolume create "$n/inner" >/dev/null || { bad "B231: a nested subvolume is created" "created" "btrfs failed"; return 0; }
+    head -c 65536 /dev/urandom > "$n/inner/data.bin"
+    echo inner > "$n/inner/note.txt"
+    man=$(manifest "$n")
+    docker run -d --name cbk-uat-nest --network none -v "$n:/data" "$IMG" \
+        sh -c 'trap "exit 0" TERM; while :; do sleep 1; done' >/dev/null || { bad "B231: the container starts" "started" "docker failed"; return 0; }
+    out=$(cb unit backup 1 --provider docker cbk-uat-nest 2>&1)
+    job_ok "B231: the unit backup" "$out"
+    contains "B231: the job warns naming the mount and what is below it" "$n/inner" "$out"
+    contains "B231: and says it was read live" "read live" "$out"
+    snap=$(snap_of "$out")
+    leftovers "after the B231 backup"
+    if have_snap "B231" "$snap"; then
+        cb unit restore 1 "$snap" "$r" >/dev/null 2>&1
+        check "B231: the subvolume's files are in the snapshot, not an empty directory" "$man" "$(manifest "$r$n")"
+    fi
+    docker rm -f cbk-uat-nest >/dev/null 2>&1
+    btrfs subvolume delete "$n/inner" >/dev/null 2>&1
+    rm -r -- "$n"
+}
+test_b231_nested_subvolume
+
 # ---- B186: the helper's container layout does not multiply host mounts ---
 # A bind under an rshared bind propagates back into the host's peer group,
 # so with the old documented layout (state_dir bound separately beside

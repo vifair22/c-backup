@@ -1084,6 +1084,70 @@ static void test_fallback_flagged(void **state)
     be.ops->desc_free(d);
 }
 
+/*
+ * B231: a mount with child datasets (or any filesystem) below it, as
+ * /mnt/cache/domains has one per VM on FS1, reads empty directories for
+ * them from its parent's snapshot. It is flagged at describe as no snapshot
+ * (so the daemon's fallback reads it, under the pause when it can), its
+ * read root is the live path, the session warns naming the mount, the first
+ * three below it and the count, and the level drops. A volume mount gets
+ * the same; a mount with nothing below it is still read from the snapshot.
+ */
+static void test_nested_below_mount(void **state)
+{
+    (void)state;
+    assert_int_equal(system("mkdir -p '" APPS "/domains/vm1' '" APPS "/domains/vm2' '" APPS "/domains/vm3' "
+                            "'" APPS "/domains/vm4' '" APPS "/vols/anon/_data/inner'"), 0);
+    put(APPS "/domains/vm1/disk.img", "vm1");
+    put(D "/mountinfo", "22 1 0:21 / / rw - ext4 /dev/sda1 rw\n"
+                        "41 22 0:99 / " APPS " rw - zfs cache/appdata rw\n"
+                        "50 41 0:51 / " APPS "/domains/vm1 rw - zfs cache/appdata/domains/vm1 rw\n"
+                        "51 41 0:52 / " APPS "/domains/vm2 rw - zfs cache/appdata/domains/vm2 rw\n"
+                        "52 41 0:53 / " APPS "/domains/vm3 rw - zfs cache/appdata/domains/vm3 rw\n"
+                        "53 41 0:54 / " APPS "/domains/vm4 rw - zfs cache/appdata/domains/vm4 rw\n"
+                        "54 41 0:55 / " APPS "/domains/.zfs/snapshot/x rw - zfs cache/appdata@x rw\n"
+                        "60 41 0:60 / " APPS "/vols/anon/_data/inner rw - tmpfs tmpfs rw\n");
+    fake_docker_add(&fdk, "abab01", "vmhost", "running", NULL,
+        "[{\"Type\":\"bind\",\"Source\":\"" APPS "/domains\",\"Destination\":\"/vms\"},"
+        "{\"Type\":\"volume\",\"Source\":\"" APPS "/vols/anon/_data\",\"Driver\":\"local\",\"Destination\":\"/v\"},"
+        "{\"Type\":\"bind\",\"Source\":\"" APPS "/web/db\",\"Destination\":\"/db\"}]");
+    sp_unit_desc_t *d = NULL;
+    assert_int_equal(be.ops->describe(be.ctx, "vmhost", &d), OK);
+    assert_non_null(item(d, APPS "/domains"));
+    assert_false(item(d, APPS "/domains")->caps & SP_CAP_SNAPSHOT);
+    assert_false(item(d, APPS "/vols/anon/_data")->caps & SP_CAP_SNAPSHOT);
+    assert_true(item(d, APPS "/web/db")->caps & SP_CAP_SNAPSHOT);
+    const sp_item_desc_t *mj = item(d, ".cbackup-unit/config/mounts.json");
+    void *data = NULL;
+    size_t len = 0;
+    assert_int_equal(be.blob_data(be.ctx, "vmhost", mj->id, &data, &len), OK);
+    const char *want = "4 mount(s) or btrfs subvolume(s) below it, which a snapshot shows empty: "
+                       APPS "/domains/vm1, " APPS "/domains/vm2, " APPS "/domains/vm3, ...";
+    assert_non_null(memmem(data, len, want, strlen(want)));
+    assert_null(memmem(data, len, "snapshot/x", 10));
+    free(data);
+    be.ops->desc_free(d);
+
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    assert_int_equal(capture("vmhost", SP_CONSIST_INCONSISTENT, &s, &info, &d), OK);
+    assert_int_equal(info->achieved, SP_CONSIST_INCONSISTENT);
+    int named = 0, vol = 0;
+    for (size_t i = 0; i < info->n_warnings; i++) {
+        if (strstr(info->warnings[i], APPS "/domains has 4 mount(s)") && strstr(info->warnings[i], "vm1")) named = 1;
+        if (strstr(info->warnings[i], APPS "/vols/anon/_data has 1 mount(s)")) vol = 1;
+    }
+    assert_true(named);
+    assert_true(vol);
+    char root[PATH_MAX];
+    assert_int_equal(be.ops->tree_root(s, item(d, APPS "/domains"), root, sizeof(root)), OK);
+    assert_string_equal(root, APPS "/domains");
+    assert_int_equal(be.ops->tree_root(s, item(d, APPS "/web/db"), root, sizeof(root)), OK);
+    assert_non_null(strstr(root, "/.zfs/snapshot/"));
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+}
+
 /* on_fail = fail: the unit fails before any snapshot. */
 static void test_failing_hook(void **state)
 {
@@ -1260,6 +1324,7 @@ int main(void)
     signal(SIGPIPE, SIG_IGN);
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_nested_below_mount, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_instant_no_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_two_instants_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pause_lost, setup, teardown),

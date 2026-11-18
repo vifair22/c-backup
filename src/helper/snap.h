@@ -103,6 +103,27 @@ status_t snap_release_detail(const snap_ctx_t *c, const char *detail, const char
 status_t snap_sweep(const snap_ctx_t *c, const char *daemon8, const int64_t *live, size_t nlive,
                     unsigned *removed, unsigned *foreign);
 
+/*
+ * What a snapshot of a domain would show as empty directories below a path
+ * in it (B231): another filesystem mounted below the path (a ZFS child
+ * dataset, a tmpfs, a disk) and, on btrfs, a subvolume below it, which is no
+ * mount. A path with any is not read from the snapshot: its reader falls
+ * back to reading it live, and says so. One probe serves one describe or
+ * begin, however many mounts: the mount table is read once, and `btrfs
+ * subvolume list` runs once per btrfs pool, on first use.
+ */
+typedef struct snap_probe snap_probe_t;
+
+/* mountinfo: the host's mount table ("": none is checked). */
+status_t snap_probe_new(const snap_ctx_t *c, const char *mountinfo, snap_probe_t **out);
+void     snap_probe_free(snap_probe_t *p);
+
+/* *total gets how many lie below real in dom (0: none), names the first
+ * three of them, ", " between ("" when none). A failure to list is an
+ * error: the caller must not trust a snapshot it could not check. */
+status_t snap_probe_below(snap_probe_t *p, const snap_dom_t *dom, const char *real,
+                          size_t *total, char *names, size_t nsz);
+
 /* Refuse a btrfs snapshot directory inside an exported Unraid share
  * (shareExport or shareExportNFS set, 8.2). OK when allowed. */
 status_t snap_check_snapdir(const snap_ctx_t *c, const char *btrfs_root);
