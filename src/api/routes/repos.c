@@ -597,6 +597,7 @@ static int repo_path_bad_id(const char *rest, api_response_t *out)
         { "/schedules/", 1, "invalid schedule id" },
         { "/grep/",      1, "invalid grep run id" },
         { "/verify/",    1, "invalid verify run id" },
+        { "/databases/", 1, "invalid database finding id" },
         /* Pack numbers start at 0, unlike every other id here. */
         { "/packs/",     0, "invalid pack id" },
     };
@@ -703,9 +704,12 @@ static const api_path_t *repo_path_entry(const char *rest)
         if (f) return f;
     }
 
-    /* Units (units.c) keep their own part of the table. */
+    /* Units (units.c) and database findings (databases.c) keep their own
+     * parts of the table. */
     const api_path_t *ua = units_path_entry(rest);
     if (ua) return ua;
+    const api_path_t *da = databases_path_entry(rest);
+    if (da) return da;
 
     const char *e;
     if (strncmp(rest, "/tags/", 6) == 0 && rest[6]) return repo_path_named("/tags/<name>");
@@ -1063,6 +1067,8 @@ static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
 
     if (strcmp(rest, "/units") == 0 || strncmp(rest, "/units/", 7) == 0)
         return units_route_get(req, repo_id, rest);
+    if (strcmp(rest, "/databases") == 0 || strncmp(rest, "/databases/", 11) == 0)
+        return databases_route_get(req, repo_id, rest);
 
     return snapshots_route_get(req, repo_id, rest);
 }

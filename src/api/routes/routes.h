@@ -105,6 +105,14 @@ void           routes_units_init(cutils_db_t *db, struct job_manager *jm);
 int            routes_register_providers(api_server_t *srv);
 const api_path_t *units_path_entry(const char *rest);
 
+/* Database findings (src/api/routes/databases.c, docs/db-detection.md
+ * 7.4): GET /repos/<id>/databases and /databases/<f>, dispatched from
+ * repos.c like the units' routes. */
+void              routes_databases_init(cutils_db_t *db);
+const api_path_t *databases_path_entry(const char *rest);
+const api_path_t *routes_databases_paths(size_t *n);
+api_response_t    databases_route_get(const api_request_t *req, int64_t repo_id, const char *rest);
+
 /* The /repos/<id> path tables, whole, for the test that holds every write
  * in them to a durability class (tests/test_route_classes.c). */
 const api_path_t *routes_repo_paths(size_t *n);
