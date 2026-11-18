@@ -1234,6 +1234,7 @@ small-file workers. The job still completes (Manual section 6.3), and says so:
 | `changed_unsettled` | Files still changing on the second read and stored as it found them, flagged as possibly torn (`backup.unsettled: store`, the default). Not in `files_changed`. Always present |
 | `unsettled` | The first 100 of them, each `{"path"}`; `[]` when none |
 | `unsettled_listed` | How many `unsettled` holds |
+| `databases` | What database detection found in what the backup read (`db-detection.md`): `{"findings":[...],"listed":N,"total":N,"sqlite_small":N}`. Present on every completed backup while `db_detect.enabled` is 1. Each finding has `id` (its row in `db_findings`), `engine`, `version` (when known), `path`, `confidence` (`live`, `dormant`), and for a live one `coverage` with `coverage_why`, `method` (`live-read` for a file source), `suggestion` and `optional` (template or action names, section 6 of the design), `unsettled` (files under it that changed during their read) and `evidence` (an object: the marker files, links, journal mode). At most 200 are listed; `sqlite_small` counts dormant SQLite files under `db_detect.sqlite_min_kb`, which are not listed |
 
 A file is skipped for still changing on its second read only under
 `backup.unsettled: skip`; by default it is stored and counted in

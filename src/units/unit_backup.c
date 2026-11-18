@@ -301,6 +301,10 @@ typedef struct {
     int                       audit_due;
     char                    **warn;      /* the daemon's own, after the provider's */
     size_t                    n_warn;
+    /* Database detection: fed by the backup, finished when unit.json is
+     * built (it is stored last for that), recorded once the snapshot is. */
+    db_detector_t            *detect;
+    db_findings_t            *findings;
 } uctx_t;
 
 static void uwarn(uctx_t *u, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -335,6 +339,68 @@ static const sp_item_plan_t *plan_for(const uctx_t *u, const char *item)
 }
 
 /* unit.json, from the description, the session and what each part read. */
+static int is_fallback(const sp_item_desc_t *it);
+
+/*
+ * Judge the session's findings (docs/db-detection.md section 5) and put
+ * them in unit.json. A tree read from a filesystem snapshot is atomic; one
+ * on no snapshot domain is read live, or paused when begin held the pause
+ * for it and the watchdog did not let it go first. At crash or better, the
+ * provider guarantees one instant for everything (it pauses exactly when a
+ * plan has more than one, container-backup.md 6.4); below it, each
+ * snapshotted tree is counted as its own instant, which is conservative
+ * for several datasets of one pool. Never fails the unit.
+ */
+static void unit_detect(uctx_t *u, unit_json_t *j)
+{
+    if (!u->detect || u->findings) return;
+    size_t n = 0;
+    for (size_t i = 0; i < u->desc->n_items; i++) n += u->desc->items[i].kind == SP_ITEM_TREE;
+    db_cap_root_t *roots = calloc(n ? n : 1, sizeof(*roots));
+    if (!roots) { log_warn("unit %s: database detection skipped: out of memory", u->key); return; }
+    sp_consistency_t a = u->cap_hit ? SP_CONSIST_INCONSISTENT : u->info->achieved;
+    int one_instant = a >= SP_CONSIST_CRASH;
+    size_t k = 0;
+    for (size_t i = 0; i < u->desc->n_items; i++) {
+        const sp_item_desc_t *it = &u->desc->items[i];
+        if (it->kind != SP_ITEM_TREE) continue;
+        db_cap_root_t *r = &roots[k++];
+        r->root = it->tree_path;
+        if (a == SP_CONSIST_OFFLINE)
+            r->kind = DB_CAP_ATOMIC;
+        else if (!is_fallback(it) && (u->info->consist_flags & SP_CF_FS_SNAPSHOT))
+            r->kind = DB_CAP_ATOMIC;
+        else if (is_fallback(it) && u->held && !u->cap_hit)
+            r->kind = DB_CAP_PAUSED;
+        else
+            r->kind = DB_CAP_LIVE;
+        r->instant = one_instant ? 0 : (int)k;
+    }
+    db_capture_desc_t cap = { roots, k, a == SP_CONSIST_APPLICATION, a == SP_CONSIST_QUIESCED, 1, 1 };
+    if (db_detect_finish(u->detect, &cap, &u->findings) != OK) {
+        log_warn("unit %s: database detection skipped: %s", u->key, err_msg());
+        err_clear();
+        u->findings = NULL;
+    }
+    free(roots);
+    if (!u->findings) return;
+    j->have_dbs = 1;
+    j->dbs_total = u->findings->n;
+    size_t m = u->findings->n < UNIT_JSON_DB_MAX ? u->findings->n : UNIT_JSON_DB_MAX;
+    if (m && !(j->dbs = calloc(m, sizeof(*j->dbs)))) { j->have_dbs = 0; return; }
+    for (size_t i = 0; i < m; i++) {
+        const db_finding_t *f = &u->findings->v[i];
+        unit_json_db_t *d = &j->dbs[i];
+        snprintf(d->engine, sizeof(d->engine), "%s", db_engine_name(f->engine));
+        snprintf(d->version, sizeof(d->version), "%s", f->version);
+        snprintf(d->confidence, sizeof(d->confidence), "%s", db_confidence_name(f->confidence));
+        snprintf(d->coverage, sizeof(d->coverage), "%s", db_coverage_name(f->coverage));
+        snprintf(d->method, sizeof(d->method), "%s", f->method ? f->method : "");
+        if (!(d->path = strdup(f->path))) break;
+        j->n_dbs++;
+    }
+}
+
 static status_t build_unit_json(uctx_t *u)
 {
     unit_json_t *j = &u->uj;
@@ -435,6 +501,7 @@ static status_t build_unit_json(uctx_t *u)
         if (!(g[j->n_warnings] = strdup(msg))) return set_error(ERR_NOMEM, "unit.json");
         j->n_warnings++;
     }
+    unit_detect(u, j);
     return OK;
 }
 
@@ -816,10 +883,14 @@ static status_t fallback_pass1(store_t *store, cutils_db_t *db, int64_t repo_id,
     bo.cancel = o->cancel;
     bo.store_workers = o->store_workers;
     bo.file_cache_match = o->file_cache_match;
+    /* Only so the heads this pass reads are kept: the paused pass finds
+     * their files unchanged and detects from what is kept. */
+    bo.detect = db_detect_start();
     log_info("unit %s: pause-read pass 1 over %d mount(s) on no snapshot domain", key, n);
     backup_result_t br;
     memset(&br, 0, sizeof(br));
     status_t st = backup_run(store, db, repo_id, &bo, &br);
+    db_detect_free(bo.detect);
     backup_result_free(&br);
     free(paths);
     free(rpaths);
@@ -1126,6 +1197,8 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st == OK) {
         syn[ns].path = UNIT_JSON_PATH;
         syn[ns].perm = 0600;
+        /* After the trees, so it can say what reading them found. */
+        syn[ns].late = 1;
         u.parts[ns].item = -1;
         u.parts[ns].vb = -1;
         ns++;
@@ -1167,6 +1240,8 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         bo.cancel = o->cancel;
         bo.store_workers = o->store_workers;
         bo.file_cache_match = o->file_cache_match;
+        u.detect = db_detect_start();
+        bo.detect = u.detect;
         if (o->progress_cb) {
             bo.progress_cb = prog_cb;
             bo.progress_ctx = &pg;
@@ -1175,6 +1250,23 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         backup_result_t br;
         memset(&br, 0, sizeof(br));
         st = backup_run(store, db, repo_id, &bo, &br);
+        if (st == OK && u.findings) {
+            char scope[SP_PROVIDER_MAX + SP_UNIT_ID_MAX + 8];
+            snprintf(scope, sizeof(scope), "unit:%s", key);
+            db_detect_count_uncovered(u.findings);
+            db_record_result_t rr;
+            memset(&rr, 0, sizeof(rr));
+            if (db_findings_record(db, repo_id, br.snapshot_id, u.findings, NULL, 0, scope, &rr) != OK) {
+                log_warn("unit %s: database findings not recorded: %s", key, err_msg());
+                err_clear();
+            }
+            res->databases_json = db_findings_json(u.findings, rr.ids);
+            res->db_events = rr.events;
+            res->n_db_events = rr.n_events;
+            rr.events = NULL;
+            rr.n_events = 0;
+            db_record_result_free(&rr);
+        }
         if (st == OK) {
             snap = br.snapshot_id;
             res->files = br.files;
@@ -1295,6 +1387,8 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     unit_json_free(&u.uj);
     free(u.uj_text);
+    db_findings_free(u.findings);
+    db_detect_free(u.detect);
     free(u.parts);
     for (size_t i = 0; i < u.n_warn; i++) free(u.warn[i]);
     free(u.warn);
@@ -1459,6 +1553,8 @@ void unit_backup_result_free(unit_backup_result_t *r)
         for (unsigned k = 0; r->units[i].warnings && k < r->units[i].n_warnings; k++)
             free(r->units[i].warnings[k]);
         free(r->units[i].warnings);
+        free(r->units[i].databases_json);
+        free(r->units[i].db_events);
     }
     free(r->units);
     memset(r, 0, sizeof(*r));

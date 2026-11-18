@@ -49,6 +49,24 @@ typedef struct {
     uint64_t audit_leaves, audit_bad_bytes, audit_first_bad;
 } unit_json_item_t;
 
+/*
+ * One database the session's detector found (docs/db-detection.md 7.1):
+ * the permanent record, in the repository, of how it was captured at that
+ * instant. Strings, all bounded; coverage and method empty when the
+ * finding was not assessed (dormant).
+ */
+typedef struct {
+    char  engine[16];
+    char  version[32];
+    char *path;
+    char  confidence[12];
+    char  coverage[24];
+    char  method[16];
+} unit_json_db_t;
+
+/* At most this many are written; databases_total says how many there were. */
+#define UNIT_JSON_DB_MAX 64u
+
 typedef struct {
     int               version;
     char              provider[SP_PROVIDER_MAX];
@@ -61,6 +79,11 @@ typedef struct {
     size_t            n_items;
     char            **warnings;
     size_t            n_warnings;
+    /* Written only when have_dbs: detection ran for this session. */
+    int               have_dbs;
+    unit_json_db_t   *dbs;
+    size_t            n_dbs;
+    size_t            dbs_total;
 } unit_json_t;
 
 /* Serialise. Returns a malloc'd document, or NULL with the error set

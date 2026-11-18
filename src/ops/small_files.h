@@ -40,6 +40,7 @@
  */
 
 #include "cdc.h"
+#include "db_detect.h"
 #include "error.h"
 #include "open_scanned.h"
 #include "pack.h"
@@ -119,6 +120,10 @@ status_t small_pool_start(store_t *store, const cdc_params_t *cp, unsigned n,
                           unsigned inflight, atomic_int *cancel,
                           scan_roots_t *roots, int one_fs,
                           small_pool_t **out);
+
+/* Feed each file's head to a database detector (db_detect.h). Set before
+ * the first batch is submitted; NULL (the default) feeds nothing. */
+void small_pool_set_detector(small_pool_t *pool, db_detector_t *d);
 
 /* A new, empty batch, or NULL on allocation failure. */
 small_batch_t *small_batch_new(void);

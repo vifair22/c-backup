@@ -37,6 +37,7 @@
 #include "db_readers.h"
 #include "file_cache.h"
 #include "settle.h"
+#include "db_findings.h"
 #include "index_reconcile.h"
 #include "index_startup.h"
 #include "id_reserve.h"
@@ -624,6 +625,15 @@ int main(int argc, char *argv[])
         settle_set_unsettled_policy(up < 0 ? SETTLE_UNSETTLED_STORE_FLAGGED
                                            : (settle_unsettled_policy_t)up);
         log_info("backup.unsettled: %s", up == SETTLE_UNSETTLED_SKIP ? "skip" : "store");
+
+        /* Range-checked during config init. */
+        db_detect_settings_t dd = {
+            config_get_int(cfg, "db_detect.enabled", 1) != 0,
+            (unsigned)config_get_int(cfg, "db_detect.sqlite_min_kb", 1024),
+            config_get_int(cfg, "db_detect.notify_uncovered", 1) != 0,
+        };
+        db_detect_settings_set(&dd);
+        if (!dd.enabled) log_info("db_detect.enabled: 0 (database detection off)");
     }
     routes_repos_set_key_dir(config_get_str(cfg, "security.key_dir"));
     routes_snapshots_init(db, jm);

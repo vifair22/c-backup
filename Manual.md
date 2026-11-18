@@ -30,6 +30,7 @@ Contents
 20. [Limits and what is not in 1.0](#20-limits-and-what-is-not-in-10)
 21. [Command reference](#21-command-reference)
 22. [Units: virtual machines and containers](#22-units-virtual-machines-and-containers)
+23. [Databases](#23-databases)
 
 ---
 
@@ -442,6 +443,9 @@ are different: they live in the database and change through the policy API
 | `jobs.read_budget_mb` | `256` | MiB of object and pack-writer buffers every job together may hold. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, and each backup pack writer holds about 26.3 MiB while its pack is open (section 18.3), so this caps that memory whatever runs at once. 48 to 1048576; under 48 stops the daemon at start, since one object and one writer must fit |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
+| `db_detect.enabled` | `1` | Detect databases in what each backup reads (chapter 23). Reporting only: it never changes how anything is captured. `0` or `1` |
+| `db_detect.sqlite_min_kb` | `1024` | The smallest dormant SQLite file, in KiB, listed as a finding; smaller dormant ones are counted (`sqlite_small`). A live one is always listed. 0 to 16777216 |
+| `db_detect.notify_uncovered` | `1` | One alert (the job's warning, so a push notification when Pushover is configured) when a live database is first found captured `uncovered` (23.3). `0` or `1` |
 | `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. Files of 1 MiB or less are read and prepared, many to a batch, on up to four of them. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
 | `index.missing_brake_pct` | `5` | Missing packs, as a percentage of a repository's, above which none is marked lost without `repo repair --accept-missing`; counts only from two missing (section 17.6). 0 to 100 |
 | `index.missing_brake_packs` | `10` | Missing packs above which none is marked lost without `repo repair --accept-missing` (section 17.6). 0 to 1000000 |
@@ -2289,6 +2293,8 @@ the repository).
 | `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy |
 | `cbackup_checkpoint_throttle_seconds_total` | counter | Time bulk writers spent so held |
 | `cbackup_wal_frames_max` | gauge | The most frames `state.db`'s log was seen holding since start; the hard cap is 16 times `db.wal_autocheckpoint` |
+| `cbackup_db_findings{coverage}` | gauge | Live database findings not dismissed, by coverage: `covered-crash`, `covered-quiesced`, `covered-application`, `engine-unsafe`, `split`, `uncovered` (chapter 23); every label always present |
+| `cbackup_db_uncovered_reads_total` | counter | Live databases a backup captured `uncovered`, counted once per backup that did |
 | `cbackup_vm_bitmap_audit_failures_total` | counter | Audit reads that found a VM disk changed outside its dirty bitmap (section 6.5) |
 | `cbackup_vm_resync_bytes_total` | counter | Bytes incremental VM reads re-read past the changed ranges to bring the chunker back in step |
 
@@ -4585,3 +4591,118 @@ production units means changing both lists, deliberately, on the host.
 | `restore staging ... would sit at the top of a pool`, `... which the mover moves to the array` or `... on another filesystem` | the default staging directory is not usable for that domain | set `[snapshot] restore_staging_dirs` to a directory inside the domain, in a share the mover keeps on the pool, on the mount's filesystem |
 | `restore staging ... is a symlink or not a directory; not followed`, or `... was replaced or moved after it was staged; not swapped` | something put a symlink in the staging path, or replaced the staging directory between stage and swap | remove what was planted; the helper never follows or renames anything it did not make |
 | `docker run` of the daemon fails: bind source does not exist | a `/run` directory or a `.cbackup-restore` directory was not created | create them (22.2.1); `/run` is RAM on Unraid, recreate at boot |
+
+## 23. Databases
+
+Every backup looks, as it reads, for live databases in what it captures, and
+says whether the capture it made is a consistent copy of each. It is
+reporting only: nothing about how a source or unit is captured changes
+because of a finding. The design, with the reasoning behind each rule, is
+`docs/db-detection.md`.
+
+### 23.1 What detection looks for
+
+Detection uses only what the backup already has: every scanned entry's name,
+type and size, and the first 64 bytes of each file it reads (16 KiB of a
+Nextcloud `config/config.php`). It never opens a file the backup would not
+open, so its cost is a name check per entry and one 64-byte read, of the page
+the backup is about to read anyway, per file read.
+
+| Engine | Recognised by |
+|---|---|
+| PostgreSQL | a directory with `PG_VERSION` (digits: the version), `global/pg_control` and `base/` |
+| MySQL / MariaDB | `ibdata1` or `mysql.ibd`, `ib_logfile0` or `#innodb_redo/`, and `mysql/`; `aria_log_control` says MariaDB |
+| SQLite | the 16-byte `SQLite format 3` header, never the name; bytes 18 and 19 give the journal mode |
+| Redis / Valkey | `dump.rdb` starting `REDIS` and four digits, `appendonly.aof`, or `appendonlydir/` with a `*.manifest` |
+| Prometheus | `wal/`, `chunks_head/`, and block directories (ULID names with `meta.json` and `index`), or `queries.active` before the first block |
+| InfluxDB 1 / 2 | `meta/meta.db`, `data/`, `wal/`; or `influxd.bolt` with `engine/data/` and `engine/wal/` |
+| MongoDB | `WiredTiger`, `WiredTiger.turtle`, `WiredTiger.wt` and `journal/` |
+| Elasticsearch / OpenSearch | `indices/` holding Lucene `segments_N`, with `_state/` or as `nodes/0/` |
+| LevelDB / RocksDB | `CURRENT` naming a `MANIFEST-*`, with `*.ldb` or `*.log`; RocksDB adds `OPTIONS-*` and `*.sst` |
+| LMDB | `data.mdb` with the LMDB magic, and `lock.mdb` |
+| bbolt | the bbolt magic in the first meta page |
+| ClickHouse | `metadata/`, `store/`, and parts holding `columns.txt` and `checksums.txt` |
+| Nextcloud | `config/config.php` naming its `dbtype` (read with a fixed pattern, never evaluated); not an engine, reported so its database can be found |
+
+What a file's header says decides. A file called `*.db` that is not SQLite
+is not a finding; a `PG_VERSION` that is not digits makes no PostgreSQL.
+Where two engines claim one directory the more specific wins (RocksDB over
+LevelDB; an InfluxDB 2's own bbolt file is part of that finding, listed in
+its evidence). An engine nested inside another's directory (GitLab's
+bundled PostgreSQL inside the GitLab mount) is a finding of its own.
+
+A file the file cache vouches for is not read, so its header is not seen;
+the classification from the last read is kept in the cache and used
+instead. One consequence: a file unchanged since before the daemon had
+detection is not classified until it changes. A live database changes, so
+this is the dormant ones; directory engines are found by their names
+regardless.
+
+### 23.2 Confidence
+
+| Confidence | Meaning |
+|---|---|
+| `live` | a signature and a sign of life: `postmaster.pid`, a MySQL `*.pid`, a SQLite `-wal`, `-shm` or hot `-journal` beside it, a non-empty `mongod.lock`, Prometheus's `lock` or `queries.active`, `node.lock`, ClickHouse's `status`, or any file of it that changed while it was being read (it was stored flagged as possibly torn, section 6.3) |
+| `dormant` | a signature and nothing else: at rest, so any capture of it is consistent. Reported, with nothing suggested. A dormant SQLite file under `db_detect.sqlite_min_kb` is counted, not listed |
+
+Process lists, listening ports and files held open by a container's
+processes are the stronger signs of life and are not used yet.
+
+### 23.3 Coverage
+
+For each live finding, whether the capture was consistent for that engine:
+
+| Coverage | Meaning |
+|---|---|
+| `covered-crash` | every one of its files was captured at one instant (a filesystem snapshot, or a fallback mount read with the unit paused at the snapshot's instant): it restores as after a power cut, and the engine recovers |
+| `covered-quiesced` | the same, with the guest's filesystems frozen |
+| `covered-application` | the same, after a pre hook that quiesced or dumped |
+| `engine-unsafe` | one instant, but the engine does not recover from that for all of its data: MySQL or MariaDB with MyISAM or Aria tables outside the system schemas, and Elasticsearch and OpenSearch, which support only their own snapshot API |
+| `split` | its files were captured at different instants (snapshot domains taken separately with no pause, or one read live), or some are outside the capture: a PostgreSQL tablespace or relocated `pg_wal`, or a MongoDB `journal`, whose link points somewhere the backup did not read |
+| `uncovered` | read live while in use: the copy may be torn |
+
+A plain file source is read live, so every live database in one is
+`uncovered`. In a unit, a mount read from a filesystem snapshot is atomic;
+when the unit achieved `crash` or better the provider guarantees one
+instant for all of it (container-backup 6.4), and below that each mount is
+counted as its own instant. The links inside a container's data name
+container paths, not the recorded ones, so in a unit they are listed as
+`unchecked` rather than judged.
+
+Each live finding carries what would help, as a name: a dump template for a
+unit (`pg-dumpall`, `mariadb-dump`, `redis-rdb`, `mongodump`, `sqlite-backup`,
+`influx2-backup`, `prometheus-snapshot`), `sqlite-backup` (an online-backup
+copy by the daemon) or `source-snapshot` for a file source, `pause-always`
+for a split unit, `exclude-rebuild` for a search index. A covered
+PostgreSQL, MySQL or MongoDB in a unit also names its dump as `optional`,
+for portability across major versions.
+
+### 23.4 Where the results go
+
+- **The job result**, `databases` (`docs/api.md`), for every file backup;
+  each unit's entry in a units job has its own.
+- **`unit.json`**, `databases` (`docs/source-providers.md` 7.2): engine,
+  version, path, confidence, coverage, method, in the snapshot itself, so a
+  restore long after can say how each database was captured.
+- **`state.db`**, `db_findings`: the current view per repository, one row
+  per scope (`source:<path>` or `unit:<key>`), path and engine, with a state:
+  `new`, `suggested`, `enabled` or `dismissed`. A row no longer seen by its
+  scope's next backup is dropped unless it is enabled or dismissed. A
+  dismissal holds until the engine's version changes. Losing the table
+  loses only those states and the alert bookkeeping.
+- **The journal**: a live database seen for the first time, and a change in
+  a live finding's coverage, each an `info` entry of operation `db-detect`.
+- **One alert**: a live database first found `uncovered` is the job's
+  warning (logged, journalled, pushed when Pushover is configured), once.
+  It is not raised again on every backup; a finding fixed and then
+  uncovered again alerts once more. `db_detect.notify_uncovered: 0` turns
+  the alert off and leaves the rest.
+- **Metrics**: `cbackup_db_findings{coverage}` and
+  `cbackup_db_uncovered_reads_total` (16.2).
+
+### 23.5 Failure and cost
+
+Detection never fails a backup. A detector that runs out of memory, or
+findings that cannot be recorded, are logged and the backup carries on;
+the result then has no `databases`. `db_detect.enabled: 0` turns it off
+entirely, and a backup then reads and stores exactly as it would have.

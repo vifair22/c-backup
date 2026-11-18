@@ -24,6 +24,7 @@ struct small_pool {
     atomic_int         *cancel;
     scan_roots_t       *roots;    /* open beneath the source root (B128) */
     int                 one_fs;
+    db_detector_t      *detect;   /* may be NULL; set before the first batch */
 
     pthread_mutex_t     mu;
     pthread_cond_t      work;     /* a batch was queued, or stop */
@@ -41,6 +42,11 @@ struct small_pool {
 /* ------------------------------------------------------------------ */
 /* Batches                                                             */
 /* ------------------------------------------------------------------ */
+
+void small_pool_set_detector(small_pool_t *pool, db_detector_t *d)
+{
+    if (pool) pool->detect = d;
+}
 
 small_batch_t *small_batch_new(void)
 {
@@ -149,6 +155,7 @@ static void store_one(small_pool_t *pool, small_file_t *f)
         f->skipped = 1;
         return;
     }
+    db_detect_head_fd(pool->detect, f->entry->path, fd, (uint64_t)fst.st_size);
     keep_ctx_t k = { pool->store, f };
     obj_sink_t sink = { .put = keep_put, .ctx = &k };
     cdc_opts_t o;

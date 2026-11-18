@@ -10,6 +10,7 @@
  */
 
 #include "cdc.h"
+#include "db_detect.h"
 #include "error.h"
 #include "store.h"
 
@@ -29,6 +30,10 @@ typedef struct {
     uint32_t    uid, gid;
     int64_t     mtime_sec;
     uint64_t    size;        /* expected; open() says what it really is */
+    /* Stored after every regular file rather than before, so its content
+     * can say what reading them found (unit.json's `databases`). Late
+     * entries come last in the array. */
+    int         late;
 } backup_synth_t;
 
 /*
@@ -147,6 +152,14 @@ typedef struct {
      * derived row (snapshot_units) lands with it or not at all. */
     status_t           (*index_hook)(void *ctx, cutils_db_t *db, int64_t snap_id);
     void                *index_hook_ctx;
+
+    /*
+     * Database detection (docs/db-detection.md), reporting only: fed every
+     * scanned entry, the head of every file read, each unsettled file, and
+     * a previous run's classification of each file the cache vouches for.
+     * NULL changes nothing. The caller owns it and calls db_detect_finish.
+     */
+    db_detector_t       *detect;
 } backup_opts_t;
 
 /* One file the backup left out, and why. */
