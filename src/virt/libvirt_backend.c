@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1106,25 +1107,59 @@ static status_t offline_reads(struct sp_session *s, const sp_unit_desc_t *unit, 
 /* Online reads (2.3, 2.6)                                             */
 /* ------------------------------------------------------------------ */
 
-typedef struct { virDomainPtr dom; unsigned timeout_s; pthread_mutex_t mu; pthread_cond_t cv; int done, thawed; } freeze_wd_t;
+typedef struct {
+    virDomainPtr    dom;
+    unsigned        timeout_s;
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;            /* on CLOCK_MONOTONIC */
+    int             done, thawed;
+    struct timespec t0, deadline;  /* the freeze request, and t0 + timeout: monotonic */
+    uint64_t        sent_ms;       /* the watchdog's thaw, sent and answered, after t0 */
+    uint64_t        done_ms;
+} freeze_wd_t;
 
-/* Thaws at the deadline whatever the freeze or the begin is doing. */
+static uint64_t ms_since(const struct timespec *t0)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    int64_t ms = (int64_t)(t.tv_sec - t0->tv_sec) * 1000 + (t.tv_nsec - t0->tv_nsec) / 1000000;
+    return ms > 0 ? (uint64_t)ms : 0;
+}
+
+/*
+ * Thaws at the deadline whatever the freeze or the begin is doing (B206).
+ * The deadline is fixed by the caller, on the monotonic clock, at the
+ * moment the freeze is asked for: computed here, it started whenever this
+ * thread first ran, which under heavy load is late, and on the wall clock
+ * it moved with any clock step. The thread asks for real-time priority,
+ * which the helper (root) gets and a test run as a user does not, so a
+ * busy host does not delay the thaw either. What it cannot do is jump a
+ * freeze still pending in the guest agent: libvirt serialises agent
+ * commands, so a thaw sent while the freeze call runs is answered after
+ * it; sent_ms and done_ms say so.
+ */
 static void *freeze_watchdog(void *arg)
 {
     thread_name("cbh-freeze-wd");
     freeze_wd_t *w = arg;
-    struct timespec dl;
-    clock_gettime(CLOCK_REALTIME, &dl);
-    dl.tv_sec += (time_t)w->timeout_s;
+    struct sched_param sp = { .sched_priority = 1 };
+    (void)pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
     pthread_mutex_lock(&w->mu);
     while (!w->done)
-        if (pthread_cond_timedwait(&w->cv, &w->mu, &dl) != 0) break;
+        if (pthread_cond_timedwait(&w->cv, &w->mu, &w->deadline) != 0) break;
     int fire = !w->done;
     if (fire) w->thawed = 1;
     pthread_mutex_unlock(&w->mu);
     if (fire) {
-        log_warn("libvirt: freeze held past %u s; thawing", w->timeout_s);
+        uint64_t sent = ms_since(&w->t0);
+        log_warn("libvirt: freeze held past %u s; thawing (sent %llu ms after the freeze was asked for)",
+                 w->timeout_s, (unsigned long long)sent);
         (void)virDomainFSThaw(w->dom, NULL, 0, 0);
+        uint64_t answered = ms_since(&w->t0);
+        pthread_mutex_lock(&w->mu);
+        w->sent_ms = sent;
+        w->done_ms = answered;
+        pthread_mutex_unlock(&w->mu);
     }
     return NULL;
 }
@@ -1140,7 +1175,9 @@ typedef struct {
     int      frozen;       /* 0, 1 froze nothing countable, 2 froze filesystems */
     int      lost;         /* thawed by someone else before our thaw */
     int      wd_thawed;    /* our freeze watchdog fired */
-    uint64_t ms;           /* how long it was frozen */
+    uint64_t ms;           /* how long it was frozen: to the first thaw that answered */
+    uint64_t freeze_call_ms; /* how long the agent took to answer the freeze */
+    uint64_t wd_sent_ms, wd_done_ms; /* the watchdog's thaw, when it fired */
     int64_t  hold;
     freeze_wd_t wd;
     pthread_t wth;
@@ -1165,11 +1202,20 @@ static status_t freeze_on(struct sp_session *s, fwin_t *f)
     f->wd.dom = s->dom;
     f->wd.timeout_s = c->pol->vm_freeze_timeout_s;
     pthread_mutex_init(&f->wd.mu, NULL);
-    pthread_cond_init(&f->wd.cv, NULL);
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&f->wd.cv, &ca);
+    pthread_condattr_destroy(&ca);
+    /* The deadline is fixed now, before the thread exists (B206). */
+    clock_gettime(CLOCK_MONOTONIC, &f->t0);
+    f->wd.t0 = f->t0;
+    f->wd.deadline = f->t0;
+    f->wd.deadline.tv_sec += (time_t)f->wd.timeout_s;
     f->armed = 1;
     f->wd_on = pthread_create(&f->wth, NULL, freeze_watchdog, &f->wd) == 0;
-    clock_gettime(CLOCK_MONOTONIC, &f->t0);
     int n = virDomainFSFreeze(s->dom, NULL, 0, 0);
+    f->freeze_call_ms = ms_since(&f->t0);
     if (n >= 0) f->frozen = n > 0 ? 2 : 1;
     else {
         (void)sp_session_info_warn(&s->info, "the guest agent did not freeze: %.300s", verr());
@@ -1188,6 +1234,8 @@ static void freeze_off(struct sp_session *s, fwin_t *f)
     pthread_mutex_unlock(&f->wd.mu);
     if (f->wd_on) pthread_join(f->wth, NULL);
     f->wd_thawed = f->wd.thawed;
+    f->wd_sent_ms = f->wd.sent_ms;
+    f->wd_done_ms = f->wd.done_ms;
     pthread_mutex_destroy(&f->wd.mu);
     pthread_cond_destroy(&f->wd.cv);
     /* Always thaw: harmless on a guest that is not frozen. One that froze
@@ -1198,11 +1246,9 @@ static void freeze_off(struct sp_session *s, fwin_t *f)
     if (thaw_failed)
         log_warn("libvirt: thaw of %s: %s; its hold stays for the watchdog to retry", s->uuid, verr());
     f->lost = f->frozen == 2 && !f->wd_thawed && t == 0;
-    if (f->frozen) {
-        struct timespec t1;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        f->ms = (uint64_t)((t1.tv_sec - f->t0.tv_sec) * 1000 + (t1.tv_nsec - f->t0.tv_nsec) / 1000000);
-    }
+    /* The window ends at the first thaw that answered: the watchdog's,
+     * when it fired, not this one after a begin that ran on (B206). */
+    if (f->frozen) f->ms = f->wd_thawed && f->wd_done_ms ? f->wd_done_ms : ms_since(&f->t0);
     /* A thaw that failed leaves the guest perhaps frozen: the record stays,
      * so the watchdog keeps trying, and a restart's sweep. */
     if (!thaw_failed && s->has_holds && f->hold && s->holds.clear(s->holds.ctx, f->hold) != OK) err_clear();
@@ -1482,8 +1528,18 @@ static status_t online_begin(struct sp_session *s, const sp_unit_desc_t *unit, c
         goto out;
     }
     int quiesced = frozen && !wd.thawed && !lost;
-    if (frozen && wd.thawed)
-        (void)sp_session_info_warn(&s->info, "freeze held past %u s; thawed before backup start", c->pol->vm_freeze_timeout_s);
+    if (frozen && wd.thawed) {
+        if (fz.freeze_call_ms > fz.wd_sent_ms)
+            (void)sp_session_info_warn(&s->info, "freeze held past %u s; the watchdog's thaw went at %llu ms but "
+                                       "the guest agent took %llu ms to answer the freeze, and the thaw waited "
+                                       "for it (answered at %llu ms)", c->pol->vm_freeze_timeout_s,
+                                       (unsigned long long)fz.wd_sent_ms, (unsigned long long)fz.freeze_call_ms,
+                                       (unsigned long long)fz.wd_done_ms);
+        else
+            (void)sp_session_info_warn(&s->info, "freeze held past %u s; thawed before backup start (thaw sent "
+                                       "at %llu ms, answered at %llu ms)", c->pol->vm_freeze_timeout_s,
+                                       (unsigned long long)fz.wd_sent_ms, (unsigned long long)fz.wd_done_ms);
+    }
     if (lost)
         (void)sp_session_info_warn(&s->info, "freeze released by the watchdog at %u s, perhaps before backup "
                                    "start; consistency is crash, not quiesced", c->pol->max_pause_s);
