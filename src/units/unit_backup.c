@@ -4,6 +4,7 @@
 #include "msg_clip.h"
 #include "backup.h"
 #include "block_source.h"
+#include "db_template.h"
 #include "db_txn.h"
 #include "unit_detect.h"
 #include "registry.h"
@@ -278,6 +279,217 @@ typedef struct {
     unit_token_t t;
 } vbase_t;
 
+/* ------------------------------------------------------------------ */
+/* Database templates (db-detection.md 7.2, phase D2)                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A unit's enrolment of templates is its enabled findings: db_findings rows
+ * of scope unit:<key> in state enabled with a template, as the enable call
+ * left them. There is no second copy that could disagree. Each becomes a
+ * hook named after its template; when two findings of one unit enable the
+ * same template, the later finding's hook is <template>-<finding id>.
+ */
+#define UNIT_TEMPLATES_MAX 8u
+
+typedef struct {
+    int64_t finding;
+    char    engine[16];
+    char   *path;
+    char   *params;
+    char    name[40];
+    char    hook[48];
+    int     dump_item;          /* desc index of its STREAM item, -1 */
+    int     log_item;
+} utmpl_meta_t;
+
+typedef struct {
+    sp_template_run_t *runs;
+    utmpl_meta_t      *meta;
+    size_t             n;
+    char             **warn;    /* said in the unit's result */
+    size_t             n_warn;
+} utmpl_t;
+
+static void utmpl_warn(utmpl_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void utmpl_warn(utmpl_t *t, const char *fmt, ...)
+{
+    char buf[MSG_CLIP_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    msg_clip_after(buf, sizeof(buf), n);
+    char **g = realloc(t->warn, (t->n_warn + 1) * sizeof(*g));
+    if (!g) return;
+    t->warn = g;
+    if ((g[t->n_warn] = strdup(buf)) != NULL) t->n_warn++;
+}
+
+static void utmpl_free(utmpl_t *t)
+{
+    for (size_t i = 0; i < t->n; i++) {
+        free(t->runs[i].log);
+        free(t->meta[i].path);
+        free(t->meta[i].params);
+    }
+    for (size_t i = 0; i < t->n_warn; i++) free(t->warn[i]);
+    free(t->runs);
+    free(t->meta);
+    free(t->warn);
+    memset(t, 0, sizeof(*t));
+}
+
+static status_t desc_add_item(sp_unit_desc_t *d, sp_item_kind_t kind, const char *id, const char *source,
+                              const char *tree_path)
+{
+    sp_item_desc_t *g = realloc(d->items, (d->n_items + 1) * sizeof(*g));
+    if (!g) return set_error(ERR_NOMEM, "unit backup: template items");
+    d->items = g;
+    sp_item_desc_t *it = &g[d->n_items];
+    memset(it, 0, sizeof(*it));
+    snprintf(it->id, sizeof(it->id), "%s", id);
+    it->kind = kind;
+    it->source = strdup(source);
+    it->tree_path = strdup(tree_path);
+    if (!it->source || !it->tree_path) {
+        free(it->source);
+        free(it->tree_path);
+        return set_error(ERR_NOMEM, "unit backup: template items");
+    }
+    d->n_items++;
+    return OK;
+}
+
+static int desc_has_path(const sp_unit_desc_t *d, const char *tp)
+{
+    for (size_t i = 0; i < d->n_items; i++)
+        if (d->items[i].tree_path && strcmp(d->items[i].tree_path, tp) == 0) return 1;
+    return 0;
+}
+
+/*
+ * The unit's enabled templates, each with its items appended to the
+ * description: a dump's STREAM and every template's log. A template the
+ * provider cannot run, or whose output path a policy hook already writes,
+ * is left out with a warning; nothing here fails the unit.
+ */
+static void templates_load(cutils_db_t *db, int64_t repo_id, const sp_provider_ops_t *ops, const char *key,
+                           sp_unit_desc_t *d, utmpl_t *t)
+{
+    memset(t, 0, sizeof(*t));
+    char repo[32], scope[UNIT_KEY_MAX + 8];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(scope, sizeof(scope), "unit:%s", key);
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT id, template, COALESCE(params, ''), path, engine FROM db_findings"
+                       " WHERE repo_id = ? AND scope = ? AND state = 'enabled'"
+                       " AND template IS NOT NULL AND template <> '' ORDER BY id",
+                   (const char *[]){ repo, scope, NULL }, &r) != 0 || !r) {
+        db_result_free(r);
+        log_warn("unit %s: enabled database templates not read: %s", key, err_msg());
+        err_clear();
+        return;
+    }
+    if (r->nrows == 0) { db_result_free(r); return; }
+    size_t cap = (size_t)r->nrows < UNIT_TEMPLATES_MAX ? (size_t)r->nrows : UNIT_TEMPLATES_MAX;
+    t->runs = calloc(cap, sizeof(*t->runs));
+    t->meta = calloc(cap, sizeof(*t->meta));
+    if (!t->runs || !t->meta) { db_result_free(r); utmpl_free(t); return; }
+    for (int i = 0; i < r->nrows; i++) {
+        const char *const *row = (const char *const *)r->rows[i];
+        long long fid = strtoll(row[0], NULL, 10);
+        const db_template_t *dt = db_template_find(row[1]);
+        if (!dt) {
+            utmpl_warn(t, "database template %s (finding %lld) is not in this build's catalog; not run", row[1], fid);
+            continue;
+        }
+        if (!ops->template_exec || !ops->templates_set) {
+            utmpl_warn(t, "database template %s (finding %lld) not run: provider %s runs no templates",
+                       dt->name, fid, ops->name);
+            continue;
+        }
+        if (t->n >= cap) {
+            utmpl_warn(t, "database template %s (finding %lld) not run: a unit runs at most %u",
+                       dt->name, fid, UNIT_TEMPLATES_MAX);
+            continue;
+        }
+        utmpl_meta_t *m = &t->meta[t->n];
+        memset(m, 0, sizeof(*m));
+        m->finding = fid;
+        m->dump_item = m->log_item = -1;
+        snprintf(m->name, sizeof(m->name), "%s", dt->name);
+        snprintf(m->engine, sizeof(m->engine), "%s", row[4]);
+        int twice = 0;
+        for (size_t k = 0; k < t->n; k++) twice |= strcmp(t->meta[k].name, dt->name) == 0;
+        if (twice) snprintf(m->hook, sizeof(m->hook), "%s-%lld", dt->name, fid);
+        else snprintf(m->hook, sizeof(m->hook), "%s", dt->name);
+        char dump_tp[128], log_tp[128], id[SP_ITEM_ID_MAX], src[96];
+        snprintf(dump_tp, sizeof(dump_tp), RESERVED_UNIT_DIR "/hooks/%s.dump", m->hook);
+        snprintf(log_tp, sizeof(log_tp), RESERVED_UNIT_DIR "/hooks/%s.log", m->hook);
+        if ((dt->kind == DBT_DUMP && desc_has_path(d, dump_tp)) || desc_has_path(d, log_tp)) {
+            utmpl_warn(t, "database template %s (finding %lld) not run: a policy hook already writes %s",
+                       dt->name, fid, dt->kind == DBT_DUMP ? dump_tp : log_tp);
+            continue;
+        }
+        if (!(m->path = strdup(row[3])) || !(m->params = strdup(row[2][0] ? row[2] : "{}"))) {
+            free(m->path);
+            m->path = NULL;
+            continue;
+        }
+        snprintf(src, sizeof(src), SP_TEMPLATE_SOURCE "%s", m->hook);
+        status_t st = OK;
+        if (dt->kind == DBT_DUMP) {
+            snprintf(id, sizeof(id), "tdump:%s", m->hook);
+            m->dump_item = (int)d->n_items;
+            st = desc_add_item(d, SP_ITEM_STREAM, id, src, dump_tp);
+        }
+        if (st == OK) {
+            snprintf(id, sizeof(id), "tlog:%s", m->hook);
+            m->log_item = (int)d->n_items;
+            st = desc_add_item(d, SP_ITEM_BLOB, id, src, log_tp);
+        }
+        if (st != OK) {
+            log_warn("unit %s: template %s left out: %s", key, dt->name, err_msg());
+            err_clear();
+            free(m->path);
+            free(m->params);
+            continue;
+        }
+        sp_template_run_t *x = &t->runs[t->n];
+        memset(x, 0, sizeof(*x));
+        x->name = dt->name;
+        x->hook = m->hook;
+        x->params = m->params;
+        x->path = m->path;
+        x->dump = dt->kind == DBT_DUMP;
+        x->post = dt->post;
+        t->n++;
+        log_info("unit %s: database template %s enabled (finding %lld)", key, m->hook, fid);
+    }
+    db_result_free(r);
+}
+
+/* Every exec template's pre (post 0) or post run, in order, before begin
+ * and after it. A failure is a warning: the capture goes ahead, and the
+ * finding's coverage stays what the capture itself achieved. */
+static void templates_exec(const sp_provider_ops_t *ops, sp_ctx_t *pctx, const char *unit_id, utmpl_t *t,
+                           int post)
+{
+    for (size_t i = 0; i < t->n; i++) {
+        sp_template_run_t *x = &t->runs[i];
+        if (x->dump || (post && (!x->post || !x->pre_ran))) continue;
+        if (ops->template_exec(pctx, unit_id, x, post) != OK) {
+            log_warn("unit %s: template %s: %s", unit_id, x->hook, err_msg());
+            err_clear();
+        }
+        int ok = post ? x->post_ok : x->pre_ok;
+        if (!ok)
+            utmpl_warn(t, "database template %s %s run failed; see .cbackup-unit/hooks/%s.log", x->hook,
+                       post ? "post" : "pre", x->hook);
+    }
+}
+
 typedef struct {
     const sp_provider_ops_t  *ops;
     sp_session_t             *sess;
@@ -311,6 +523,7 @@ typedef struct {
     const char *const        *rec_roots;
     const char *const        *read_roots;
     size_t                    n_roots;
+    utmpl_t                  *tmpl;      /* the unit's enabled templates */
 } uctx_t;
 
 static void uwarn(uctx_t *u, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -357,6 +570,62 @@ static int is_fallback(const sp_item_desc_t *it);
  * snapshotted tree is counted as its own instant, which is conservative
  * for several datasets of one pool. Never fails the unit.
  */
+static const utmpl_meta_t *template_for(const uctx_t *u, const db_finding_t *f, size_t *idx)
+{
+    for (size_t i = 0; u->tmpl && i < u->tmpl->n; i++) {
+        const utmpl_meta_t *m = &u->tmpl->meta[i];
+        if (strcmp(m->engine, db_engine_name(f->engine)) == 0 && m->path && strcmp(m->path, f->path) == 0) {
+            *idx = i;
+            return m;
+        }
+    }
+    return NULL;
+}
+
+/* Whether a finding's enabled template did its part this session: the
+ * dump stored, or an exec template's pre run exited 0. */
+static int template_ok(const uctx_t *u, size_t i)
+{
+    const utmpl_meta_t *m = &u->tmpl->meta[i];
+    if (!u->tmpl->runs[i].dump) return u->tmpl->runs[i].pre_ran && u->tmpl->runs[i].pre_ok;
+    for (size_t k = 0; u->parts && k < u->n_parts; k++)
+        if (u->parts[k].item == m->dump_item) return u->parts[k].stream_ok;
+    return 0;
+}
+
+/*
+ * A live finding's coverage, given its template (db-detection.md 5): a
+ * stored dump is a consistent copy at its own instant, whatever the capture
+ * did, so covered-application. An exec template (a BGSAVE, a TSDB
+ * snapshot, maintenance mode) is only as good as the capture that follows
+ * it: it lifts a capture that was already one instant (covered-crash or
+ * covered-quiesced), and leaves split, uncovered or engine-unsafe alone.
+ * A template that failed changes nothing.
+ */
+static void templates_cover(const uctx_t *u, db_findings_t *fs)
+{
+    for (size_t i = 0; i < fs->n; i++) {
+        db_finding_t *f = &fs->v[i];
+        size_t ti = 0;
+        const utmpl_meta_t *m = template_for(u, f, &ti);
+        if (!m || f->confidence != DB_CONF_LIVE || !template_ok(u, ti)) continue;
+        int dump = u->tmpl->runs[ti].dump;
+        if (!dump && f->coverage != DB_COV_COVERED_CRASH && f->coverage != DB_COV_COVERED_QUIESCED) continue;
+        char why[256];
+        if (dump)
+            snprintf(why, sizeof(why), "its enabled %s dump is a consistent copy at its own instant, in this "
+                     "snapshot at .cbackup-unit/hooks/%s.dump", m->name, m->hook);
+        else
+            snprintf(why, sizeof(why), "captured at one instant after its enabled %s ran", m->name);
+        char *w = strdup(why);
+        if (!w) continue;
+        free(f->coverage_why);
+        f->coverage_why = w;
+        f->coverage = DB_COV_COVERED_APPLICATION;
+        f->suggestion = NULL;
+    }
+}
+
 static void unit_detect(uctx_t *u, unit_json_t *j)
 {
     if (!u->detect || u->findings) return;
@@ -391,6 +660,7 @@ static void unit_detect(uctx_t *u, unit_json_t *j)
     }
     free(roots);
     if (!u->findings) return;
+    templates_cover(u, u->findings);
     j->have_dbs = 1;
     j->dbs_total = u->findings->n;
     size_t m = u->findings->n < UNIT_JSON_DB_MAX ? u->findings->n : UNIT_JSON_DB_MAX;
@@ -403,6 +673,14 @@ static void unit_detect(uctx_t *u, unit_json_t *j)
         snprintf(d->confidence, sizeof(d->confidence), "%s", db_confidence_name(f->confidence));
         snprintf(d->coverage, sizeof(d->coverage), "%s", db_coverage_name(f->coverage));
         snprintf(d->method, sizeof(d->method), "%s", f->method ? f->method : "");
+        size_t ti = 0;
+        const utmpl_meta_t *tm = template_for(u, f, &ti);
+        if (tm) {
+            snprintf(d->tmpl, sizeof(d->tmpl), "%s", tm->name);
+            d->tmpl_ok = template_ok(u, ti);
+            if (d->tmpl_ok && u->tmpl->runs[ti].dump)
+                snprintf(d->dump, sizeof(d->dump), RESERVED_UNIT_DIR "/hooks/%s.dump", tm->hook);
+        }
         if (!(d->path = strdup(f->path))) break;
         j->n_dbs++;
     }
@@ -935,6 +1213,7 @@ typedef struct {
     /* units.probe before begin, while the unit runs unpaused: liveness
      * for detection (db-detection.md 8.1). NULL when there is none. */
     sp_unit_probe_t         *probe;
+    utmpl_t                  tmpl;           /* enabled database templates */
 } unit_prep_t;
 
 /*
@@ -1058,6 +1337,7 @@ static status_t unit_prepare(store_t *store, cutils_db_t *db, int64_t repo_id, c
         pp->d = d;
         st = bases_prepare(store, db, repo_id, pp);
     }
+    if (st == OK) templates_load(db, repo_id, ops, key, d, &pp->tmpl);
     if (st != OK) {
         bases_free(pp);
         pp->d = NULL;
@@ -1081,6 +1361,7 @@ static void unit_unprepare(const sp_provider_ops_t *ops, unit_prep_t *pp)
     sp_unit_probe_free(pp->probe);
     pp->probe = NULL;
     bases_free(pp);
+    utmpl_free(&pp->tmpl);
     if (pp->d) ops->desc_free(pp->d);
     pp->d = NULL;
     units_unlock(pp->key);
@@ -1149,7 +1430,9 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     u.bases = pp->bases;
     u.n_bases = pp->n_bases;
     u.audit_due = pp->audit_due;
+    u.tmpl = &pp->tmpl;
     if (pp->off_why[0]) uwarn(&u, "%s", pp->off_why);
+    for (size_t i = 0; i < pp->tmpl.n_warn; i++) one_warn(res, 0, "%s", pp->tmpl.warn[i]);
     res->achieved = u.info->achieved;
     for (size_t i = 0; i < u.info->n_warnings; i++) {
         one_warn(res, 0, "%s", u.info->warnings[i]);
@@ -1411,6 +1694,7 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     for (size_t i = 0; i < u.n_warn; i++) free(u.warn[i]);
     free(u.warn);
     bases_free(pp);
+    utmpl_free(&pp->tmpl);
     free(syn);
     for (size_t i = 0; synpath && i < n_synth; i++) free(synpath[i]);
     free(synpath);
@@ -1442,8 +1726,23 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
         unit_unprepare(ops, &pp);
         return st;
     }
+    /* Exec templates around begin (db-detection.md 7.2): the pre runs
+     * while the unit is live, the post runs once begin has its point in
+     * time, or has failed (a maintenance mode is never left on). */
+    templates_exec(ops, pctx, pp.d->unit_id, &pp.tmpl, 0);
     st = ops->begin(pctx, pp.d, &req, &pp.sess, &pp.info);
-    if (st != OK) { unit_unprepare(ops, &pp); return st; }
+    if (st != OK) {
+        char why[ERR_MSG_MAX];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        templates_exec(ops, pctx, pp.d->unit_id, &pp.tmpl, 1);
+        unit_unprepare(ops, &pp);
+        return set_error(st, "%s", why);
+    }
+    templates_exec(ops, pctx, pp.d->unit_id, &pp.tmpl, 1);
+    if (pp.tmpl.n && ops->templates_set(pp.sess, pp.tmpl.runs, pp.tmpl.n) != OK) {
+        log_warn("unit %s: templates: %s", pp.key, err_msg());
+        err_clear();
+    }
     return unit_store(store, db, repo_id, o, ops, &pp, index, total, res);
 }
 
@@ -1650,7 +1949,12 @@ static void run_group(store_t *store, cutils_db_t *db, int64_t repo_id, const un
         log_info("unit backup: %zu unit(s) in one capture", m);
         sp_begin_req_t req;
         begin_req(o, &pp[0].holds, NULL, &req);
+        for (size_t q = 0; q < m; q++) templates_exec(ops, pctx, pp[q].d->unit_id, &pp[q].tmpl, 0);
         status_t st = ops->begin_group(pctx, descs, m, &req, sess, infos);
+        char gwhy[ERR_MSG_MAX];
+        snprintf(gwhy, sizeof(gwhy), "%s", err_msg());
+        for (size_t q = 0; q < m; q++) templates_exec(ops, pctx, pp[q].d->unit_id, &pp[q].tmpl, 1);
+        if (st != OK) set_error(st, "%s", gwhy);
         if (st != OK) {
             char why[ERR_MSG_MAX];
             snprintf(why, sizeof(why), "%s", err_msg());
@@ -1663,6 +1967,10 @@ static void run_group(store_t *store, cutils_db_t *db, int64_t repo_id, const un
             for (size_t q = 0; q < m; q++) {
                 pp[q].sess = sess[q];
                 pp[q].info = infos[q];
+                if (pp[q].tmpl.n && ops->templates_set(sess[q], pp[q].tmpl.runs, pp[q].tmpl.n) != OK) {
+                    log_warn("unit %s: templates: %s", pp[q].key, err_msg());
+                    err_clear();
+                }
                 status_t one = unit_store(store, db, repo_id, o, ops, &pp[q], first_index + who[q], total, rs[who[q]]);
                 tally(out, rs[who[q]], one, first_st, first_err, fsz);
             }

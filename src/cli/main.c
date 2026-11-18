@@ -1691,6 +1691,91 @@ static int h_unit_policy_set(const args_t *a)
 }
 
 /*
+ * Database findings (db-detection.md 7.4): preview, enable, dismiss.
+ * --param KEY=VALUE repeats; a value of true or false is a boolean and one
+ * of digits a number, as the template's typed parameters want, and
+ * anything else a string. The daemon checks each against the template.
+ */
+static void sb_db_params(sbuf_t *b, const args_t *a)
+{
+    sb_puts(b, "{");
+    int it = 0, n = 0;
+    for (const char *kv = args_multi_next(a, "--param", &it); kv; kv = args_multi_next(a, "--param", &it)) {
+        const char *eq = strchr(kv, '=');
+        char key[128];
+        size_t kl = eq ? (size_t)(eq - kv) : strlen(kv);
+        if (kl >= sizeof(key)) kl = sizeof(key) - 1;
+        memcpy(key, kv, kl);
+        key[kl] = '\0';
+        const char *v = eq ? eq + 1 : "";
+        if (n++) sb_puts(b, ",");
+        sb_json_str(b, key);
+        sb_puts(b, ":");
+        if (strcmp(v, "true") == 0 || strcmp(v, "false") == 0) sb_puts(b, v);
+        else if (*v && strspn(v, "0123456789") == strlen(v) && strlen(v) < 10) sb_puts(b, v);
+        else sb_json_str(b, v);
+    }
+    sb_puts(b, "}");
+}
+
+static int db_param_check(const args_t *a)
+{
+    int it = 0;
+    for (const char *kv = args_multi_next(a, "--param", &it); kv; kv = args_multi_next(a, "--param", &it))
+        if (!strchr(kv, '=') || kv[0] == '=') return fail("--param takes KEY=VALUE");
+    return 0;
+}
+
+static int db_action(const args_t *a, const char *action, const char *body)
+{
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/repos/"); sb_puts(&p, a->pos[0]); sb_puts(&p, "/databases/");
+    sb_puts(&p, a->pos[1]); sb_puts(&p, "/"); sb_puts(&p, action);
+    return call_path_sb("POST", &p, body);
+}
+
+static int h_db_preview(const args_t *a)
+{
+    if (db_param_check(a) != 0) return 1;
+    const char *t = args_value(a, "--template");
+    sbuf_t b = { 0 };
+    sb_puts(&b, "{");
+    if (t) { sb_puts(&b, "\"template\":"); sb_json_str(&b, t); }
+    if (args_multi_count(a, "--param") > 0) {
+        sb_puts(&b, t ? ",\"params\":" : "\"params\":");
+        sb_db_params(&b, a);
+    }
+    sb_puts(&b, "}");
+    if (b.oom) { free(b.buf); return fail("request too large"); }
+    int rc = db_action(a, "preview", b.buf);
+    free(b.buf);
+    return rc;
+}
+
+static int h_db_enable(const args_t *a)
+{
+    if (db_param_check(a) != 0) return 1;
+    sbuf_t b = { 0 };
+    sb_puts(&b, "{\"template\":"); sb_json_str(&b, args_value(a, "--template"));
+    sb_puts(&b, ",\"params\":"); sb_db_params(&b, a);
+    sb_puts(&b, "}");
+    if (b.oom) { free(b.buf); return fail("request too large"); }
+    int rc = db_action(a, "enable", b.buf);
+    free(b.buf);
+    return rc;
+}
+
+static int h_db_dismiss(const args_t *a)
+{
+    sbuf_t b = { 0 };
+    sb_puts(&b, "{\"reason\":"); sb_json_str(&b, args_value(a, "--reason")); sb_puts(&b, "}");
+    if (b.oom) { free(b.buf); return fail("request too large"); }
+    int rc = db_action(a, "dismiss", b.buf);
+    free(b.buf);
+    return rc;
+}
+
+/*
  * Read a password without putting it on the command line.
  *
  * An argument lands in shell history and, while the command runs, in
@@ -1851,6 +1936,7 @@ static const char *const P_TREE[]     = { "<repo-id>", "<snapshot-id>", "[parent
 static const char *const P_SEARCH[]   = { "<repo-id>", "<query>", NULL };
 static const char *const P_GREP[]     = { "<repo-id>", "<pattern>", NULL };
 static const char *const P_RUN[]      = { "<repo-id>", "<run-id>", NULL };
+static const char *const P_FINDING[]  = { "<repo-id>", "<finding-id>", NULL };
 static const char *const P_DIFF[]     = { "<repo-id>", "<from-snapshot>", "<to-snapshot>", NULL };
 static const char *const P_REPLICATE[] = { "<repo-id>", "<dest-path>", NULL };
 static const char *const P_OBJECT[]   = { "<repo-id>", "<hash>", "[refs|layout|content]", NULL };
@@ -1985,6 +2071,13 @@ static const arg_opt_t O_UNIT_RESTORE[] = {
 };
 static const arg_opt_t O_VM_EXPORT[] = { { "--ttl", NULL, ARG_VALUE, "N[s|m|h|d]" }, OPT_END };
 static const arg_opt_t O_PROVIDER[] = { { "--provider", NULL, ARG_REQUIRED, "P" }, OPT_END };
+static const arg_opt_t O_DB_PREVIEW[] = {
+    { "--template", NULL, ARG_VALUE, "NAME" }, { "--param", NULL, ARG_MULTI, "KEY=VALUE" }, OPT_END,
+};
+static const arg_opt_t O_DB_ENABLE[] = {
+    { "--template", NULL, ARG_REQUIRED, "NAME" }, { "--param", NULL, ARG_MULTI, "KEY=VALUE" }, OPT_END,
+};
+static const arg_opt_t O_DB_DISMISS[] = { { "--reason", NULL, ARG_REQUIRED, "TEXT" }, OPT_END };
 static const arg_opt_t O_ALL[] = { { "--all", NULL, ARG_FLAG, NULL }, OPT_END };
 static const arg_opt_t O_DB_LIST[] = {
     { "--unit",     NULL, ARG_VALUE, "KEY" },
@@ -2041,6 +2134,15 @@ static const command_t COMMANDS[] = {
       h_unit_restore, 0 },
     { { "unit policy show", P_UPOL,    O_PROVIDER, NULL }, h_unit_policy_show, 0 },
     { { "unit policy set", P_UPOL_SET, O_PROVIDER, NULL }, h_unit_policy_set, 0 },
+    { { "db preview",      P_FINDING,  O_DB_PREVIEW,
+        "the exact hook a template would run for the finding, and its probe; the finding's suggestion "
+        "unless --template names another" },
+      h_db_preview, 0 },
+    { { "db enable",       P_FINDING,  O_DB_ENABLE,
+        "run the template from the next backup on; --param KEY=VALUE for its parameters" },
+      h_db_enable, 0 },
+    { { "db dismiss",      P_FINDING,  O_DB_DISMISS, "stop the finding being raised, and anything enabled for it" },
+      h_db_dismiss, 0 },
     { { "vm export",       P_VM_EXPORT, O_VM_EXPORT,
         "serve the disk read-only over NBD; prints the export's name once" },
       h_vm_export, 0 },

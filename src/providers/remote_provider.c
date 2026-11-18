@@ -5,6 +5,7 @@
 #include "disk_stream.h"
 #include "fake_provider.h"
 #include "helper_proto.h"
+#include "db_template.h"
 #include "registry.h"
 #include "unit_probe.h"
 
@@ -45,8 +46,13 @@ struct sp_session {
     int               blob_fd;     /* the sealed memfd describe passed, or -1 */
     int               late_fd;     /* capture.begin's memfd: hook logs, or -1 */
     cJSON            *late;        /* item id -> [offset, length] in late_fd */
-    struct { char hook[72]; char run[HELPER_TOKEN_HEX + 1]; char *log; size_t log_len; } dumps[4];
+    /* Dumps open or done: a policy hook's or a template's. failed: hook.run
+     * refused or could not start it, and log says why. */
+    struct { char hook[72]; char run[HELPER_TOKEN_HEX + 1]; char *log; size_t log_len; int failed; } dumps[8];
     size_t            n_dumps;
+    /* The unit's database templates (templates_set), the core's. */
+    sp_template_run_t *tmpl;
+    size_t            n_tmpl;
     cJSON            *roots;       /* read_roots */
     cJSON            *blocks;      /* where each disk is read: a file or an NBD export */
     int               vm;          /* begun with vm.backup_begin: ended with vm.backup_end */
@@ -104,6 +110,25 @@ static atomic_long    g_req_id;
 static char           g_session[HELPER_TOKEN_HEX + 1];
 
 const remote_hello_t *remote_last_hello(void) { return &g_hello; }
+
+int remote_template_allowed(const char *name, char *allowed, size_t asz)
+{
+    /* The link's copy, under its lock: g_hello is the link thread's. */
+    remote_link_info_t li;
+    remote_link_info(&li);
+    const remote_hello_t h = li.hello;
+    if (allowed && asz) snprintf(allowed, asz, "%s", h.templates);
+    if (!h.have_templates) return -1;
+    size_t n = strlen(name);
+    for (const char *p = h.templates; *p;) {
+        const char *e = strchr(p, ',');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l == n && strncmp(p, name, n) == 0) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
 
 /* The supervised link (remote_start). */
 static struct {
@@ -210,6 +235,8 @@ static status_t exchange_fd(int fd, const char *op, cJSON *args, cJSON **result,
  * passed with the answer lands in *recv_fd (NULL: closed), -1 if none. */
 static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON **result,
                            int send_fd, int *recv_fd);
+static status_t rcall_wait(const char *sock, const char *op, cJSON *args, cJSON **result,
+                           int send_fd, int *recv_fd, unsigned timeout_s);
 
 static status_t rcall_fd(const char *sock, const char *op, cJSON *args, cJSON **result,
                          int *recv_fd)
@@ -220,6 +247,14 @@ static status_t rcall_fd(const char *sock, const char *op, cJSON *args, cJSON **
 static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON **result,
                            int send_fd, int *recv_fd)
 {
+    return rcall_wait(sock, op, args, result, send_fd, recv_fd, REMOTE_TIMEOUT_S);
+}
+
+/* rcall_full with its own answer timeout: hook.wait on an exec template
+ * waits as long as the template may run. */
+static status_t rcall_wait(const char *sock, const char *op, cJSON *args, cJSON **result,
+                           int send_fd, int *recv_fd, unsigned timeout_s)
+{
     if (result) *result = NULL;
     if (recv_fd) *recv_fd = -1;
     int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
@@ -228,7 +263,7 @@ static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON 
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
     snprintf(a.sun_path, sizeof(a.sun_path), "%s", sock);
-    struct timeval tv = { REMOTE_TIMEOUT_S, 0 };
+    struct timeval tv = { (time_t)timeout_s, 0 };
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
@@ -560,7 +595,46 @@ static status_t read_passed(int fd, uint64_t off, uint64_t n, const char *what, 
 
 static const char *hook_of(const sp_item_desc_t *item)
 {
-    return item->source && strncmp(item->source, "hook:", 5) == 0 ? item->source + 5 : NULL;
+    if (!item->source) return NULL;
+    if (strncmp(item->source, "hook:", 5) == 0) return item->source + 5;
+    if (strncmp(item->source, SP_TEMPLATE_SOURCE, strlen(SP_TEMPLATE_SOURCE)) == 0)
+        return item->source + strlen(SP_TEMPLATE_SOURCE);
+    return NULL;
+}
+
+/* The session's template a "template:" item names, or NULL. */
+static sp_template_run_t *template_of(sp_session_t *s, const sp_item_desc_t *item)
+{
+    if (!item->source || strncmp(item->source, SP_TEMPLATE_SOURCE, strlen(SP_TEMPLATE_SOURCE)) != 0) return NULL;
+    const char *h = item->source + strlen(SP_TEMPLATE_SOURCE);
+    for (size_t i = 0; i < s->n_tmpl; i++)
+        if (s->tmpl[i].hook && strcmp(s->tmpl[i].hook, h) == 0) return &s->tmpl[i];
+    return NULL;
+}
+
+/* hook.run's template form (db-detection.md 7.2): the catalog name, its
+ * params and the finding's path; the helper builds the argv. */
+static cJSON *template_args(const struct sp_ctx *c, const char *unit_id, const sp_template_run_t *t, int post)
+{
+    cJSON *a = args_unit(c, unit_id);
+    if (!a) return NULL;
+    cJSON_AddStringToObject(a, "template", t->name);
+    cJSON *p = t->params ? cJSON_Parse(t->params) : NULL;
+    if (cJSON_IsObject(p)) cJSON_AddItemToObject(a, "params", p);
+    else cJSON_Delete(p);
+    if (t->path && t->path[0] == '/') cJSON_AddStringToObject(a, "path", t->path);
+    if (!t->dump) cJSON_AddStringToObject(a, "phase", post ? "post" : "pre");
+    return a;
+}
+
+static void log_append(char **log, size_t *len, const char *data, size_t n)
+{
+    char *g = realloc(*log, *len + n + 1);
+    if (!g) return;
+    memcpy(g + *len, data, n);
+    *len += n;
+    g[*len] = '\0';
+    *log = g;
 }
 
 static status_t r_blob_read(sp_session_t *s, const sp_item_desc_t *item, void **data, size_t *len)
@@ -575,6 +649,20 @@ static status_t r_blob_read(sp_session_t *s, const sp_item_desc_t *item, void **
         memcpy(cp, s->dumps[i].log, s->dumps[i].log_len);
         *data = cp;
         *len = s->dumps[i].log_len;
+        return OK;
+    }
+    /* An exec template's log, from its runs around begin; or one that
+     * never ran. */
+    const sp_template_run_t *t = template_of(s, item);
+    if (t || (item->source && strncmp(item->source, SP_TEMPLATE_SOURCE, strlen(SP_TEMPLATE_SOURCE)) == 0)) {
+        static const char none[] = "c-backup: this template did not run\n";
+        const char *src = t && t->log ? t->log : none;
+        size_t n = t && t->log ? t->log_len : sizeof(none) - 1;
+        void *cp = malloc(n ? n : 1);
+        if (!cp) return set_error(ERR_NOMEM, "helper: template log");
+        memcpy(cp, src, n);
+        *data = cp;
+        *len = n;
         return OK;
     }
     const cJSON *lp = cJSON_GetObjectItemCaseSensitive(s->late, item->id);
@@ -670,14 +758,47 @@ static status_t r_stream_open(sp_session_t *s, const sp_item_desc_t *item, int *
     const char *hk = hook_of(item);
     if (!hk || strlen(hk) >= sizeof(s->dumps[0].hook)) return set_error(ERR_INVALID, "helper: %s names no hook", item->id);
     if (s->n_dumps >= sizeof(s->dumps) / sizeof(s->dumps[0])) return set_error(ERR_INVALID, "helper: too many dumps");
-    cJSON *a = args_unit(s->ctx, s->unit_id);
-    if (a) cJSON_AddStringToObject(a, "hook", hk);
+    const sp_template_run_t *t = template_of(s, item);
+    int tmpl = item->source && strncmp(item->source, SP_TEMPLATE_SOURCE, strlen(SP_TEMPLATE_SOURCE)) == 0;
+    cJSON *a = NULL;
+    if (t) {
+        a = template_args(s->ctx, s->unit_id, t, 0);
+    } else {
+        a = args_unit(s->ctx, s->unit_id);
+        if (a) cJSON_AddStringToObject(a, "hook", hk);
+    }
     cJSON *res = NULL;
     int pfd = -1;
-    status_t st = rcall_fd(s->ctx->socket, "hook.run", a, &res, &pfd);
+    status_t st = tmpl && !t ? set_error(ERR_INVALID, "no template %s was set for this session", hk)
+                             : rcall_fd(s->ctx->socket, "hook.run", a, &res, &pfd);
+    if (tmpl && !t) cJSON_Delete(a);
     const char *run = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "run")) : NULL;
     if (st == OK && (!run || strlen(run) != HELPER_TOKEN_HEX || pfd < 0))
         st = set_error(ERR_IO, "helper: hook.run for %s gave no run or no pipe", hk);
+    if (st != OK && tmpl) {
+        /*
+         * A template dump that cannot start is a failed dump, left out of
+         * the snapshot with a warning, as one that exits non-zero is
+         * (6.6): an empty stream, and its log says why. It never fails
+         * the unit; the snapshot's own capture stands.
+         */
+        int e[2];
+        if (pfd >= 0) close(pfd);
+        cJSON_Delete(res);
+        if (pipe2(e, O_CLOEXEC) != 0) return set_error_errno(ERR_IO, "helper: pipe");
+        close(e[1]);
+        memset(&s->dumps[s->n_dumps], 0, sizeof(s->dumps[0]));
+        snprintf(s->dumps[s->n_dumps].hook, sizeof(s->dumps[0].hook), "%s", hk);
+        s->dumps[s->n_dumps].failed = 1;
+        char line[MSG_CLIP_MAX + 64];
+        int n = snprintf(line, sizeof(line), "c-backup: the template could not start: %s\n", err_msg());
+        log_append(&s->dumps[s->n_dumps].log, &s->dumps[s->n_dumps].log_len, line,
+                   n < 0 ? 0 : (size_t)n >= sizeof(line) ? sizeof(line) - 1 : (size_t)n);
+        s->n_dumps++;
+        err_clear();
+        *fd = e[0];
+        return OK;
+    }
     if (st == OK) {
         memset(&s->dumps[s->n_dumps], 0, sizeof(s->dumps[0]));
         snprintf(s->dumps[s->n_dumps].hook, sizeof(s->dumps[0].hook), "%s", hk);
@@ -695,7 +816,14 @@ static status_t r_stream_close(sp_session_t *s, const sp_item_desc_t *item, int 
 {
     const char *hk = hook_of(item);
     for (size_t i = 0; hk && i < s->n_dumps; i++) {
-        if (strcmp(s->dumps[i].hook, hk) != 0 || !s->dumps[i].run[0]) continue;
+        if (strcmp(s->dumps[i].hook, hk) != 0) continue;
+        if (s->dumps[i].failed) {
+            s->dumps[i].failed = 0;
+            *ok = 0;
+            (void)sp_session_info_warn(&s->info, "dump template %s could not start; not stored", hk);
+            return OK;
+        }
+        if (!s->dumps[i].run[0]) continue;
         cJSON *a = cJSON_CreateObject();
         if (a) cJSON_AddStringToObject(a, "run", s->dumps[i].run);
         cJSON *res = NULL;
@@ -719,6 +847,65 @@ static status_t r_stream_close(sp_session_t *s, const sp_item_desc_t *item, int 
         return OK;
     }
     return set_error(ERR_NOT_FOUND, "helper: dump %s was not open", item->id);
+}
+
+/*
+ * An exec template's pre or post run (db-detection.md 7.2), to its end:
+ * hook.run, then hook.wait for as long as the catalog lets it run. Every
+ * outcome lands in t, and its log, a run that could not start included.
+ */
+static status_t r_template_exec(sp_ctx_t *c, const char *unit_id, sp_template_run_t *t, int post)
+{
+    const db_template_t *d = db_template_find(t->name);
+    unsigned wait_s = (d ? d->timeout_s : 600u) + 60u;
+    char head[160];
+    int hn = snprintf(head, sizeof(head), "== %s run ==\n", post ? "post" : "pre");
+    log_append(&t->log, &t->log_len, head, hn < 0 ? 0 : (size_t)hn);
+    int *ran = post ? &t->post_ran : &t->pre_ran, *ok = post ? &t->post_ok : &t->pre_ok;
+    *ran = 1;
+    *ok = 0;
+    cJSON *res = NULL;
+    status_t st = rcall(c->socket, "hook.run", template_args(c, unit_id, t, post), &res);
+    const char *run = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "run")) : NULL;
+    if (st == OK && (!run || strlen(run) != HELPER_TOKEN_HEX)) st = set_error(ERR_IO, "helper: hook.run gave no run");
+    char token[HELPER_TOKEN_HEX + 1] = "";
+    if (st == OK) snprintf(token, sizeof(token), "%s", run);
+    cJSON_Delete(res);
+    res = NULL;
+    int lfd = -1;
+    if (st == OK) {
+        cJSON *a = cJSON_CreateObject();
+        if (a) cJSON_AddStringToObject(a, "run", token);
+        st = rcall_wait(c->socket, "hook.wait", a, &res, -1, &lfd, wait_s);
+    }
+    if (st != OK) {
+        char line[MSG_CLIP_MAX + 64];
+        int n = snprintf(line, sizeof(line), "c-backup: the template could not run: %s\n", err_msg());
+        log_append(&t->log, &t->log_len, line, n < 0 ? 0 : (size_t)n >= sizeof(line) ? sizeof(line) - 1 : (size_t)n);
+        if (lfd >= 0) close(lfd);
+        return st;
+    }
+    *ok = (int)num(res, "exit") == 0 && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "timed_out"));
+    void *log = NULL;
+    size_t len = 0;
+    if (lfd >= 0 && read_passed(lfd, 0, num(res, "log_bytes"), t->name, &log, &len) == OK) {
+        log_append(&t->log, &t->log_len, log, len);
+        free(log);
+    } else {
+        const char *tail = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "log"));
+        if (tail) log_append(&t->log, &t->log_len, tail, strlen(tail));
+        err_clear();
+    }
+    if (lfd >= 0) close(lfd);
+    cJSON_Delete(res);
+    return OK;
+}
+
+static status_t r_templates_set(sp_session_t *s, sp_template_run_t *t, size_t n)
+{
+    s->tmpl = t;
+    s->n_tmpl = n;
+    return OK;
 }
 
 /* The pause the helper kept for the second pass, let go (lease.release). */
@@ -897,6 +1084,50 @@ status_t remote_op(const char *provider, const char *op, cJSON *args, int send_f
     return rcall_full(c->socket, op, args, result, send_fd, NULL);
 }
 
+status_t remote_db_probe(const char *unit_key, const char *tmpl, const char *params, const char *path,
+                         cJSON **result, char **output, size_t *len)
+{
+    *result = NULL;
+    *output = NULL;
+    *len = 0;
+    char prov[SP_PROVIDER_MAX];
+    const char *colon = strchr(unit_key, ':');
+    if (!colon || (size_t)(colon - unit_key) >= sizeof(prov)) return set_error(ERR_INVALID, "bad unit key %s", unit_key);
+    memcpy(prov, unit_key, (size_t)(colon - unit_key));
+    prov[colon - unit_key] = '\0';
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *c = NULL;
+    if (sp_registry_get(prov, &ops, &c) != OK || !remote_is_remote(ops)) {
+        err_clear();
+        char why[512];
+        if (remote_unusable_for_job(prov, why, sizeof(why))) return set_error(ERR_IO, "%s", why);
+        return set_error(ERR_INVALID, "provider %s is not behind the helper; templates run only there", prov);
+    }
+    cJSON *a = cJSON_CreateObject();
+    if (!a) return set_error(ERR_NOMEM, "db.probe");
+    cJSON_AddStringToObject(a, "unit", unit_key);
+    cJSON_AddStringToObject(a, "template", tmpl);
+    cJSON *pj = params ? cJSON_Parse(params) : NULL;
+    if (cJSON_IsObject(pj)) cJSON_AddItemToObject(a, "params", pj);
+    else cJSON_Delete(pj);
+    if (path && path[0] == '/') cJSON_AddStringToObject(a, "path", path);
+    int fd = -1;
+    status_t st = rcall_wait(c->socket, "db.probe", a, result, -1, &fd, DBT_PROBE_TIMEOUT_S + 60u);
+    if (st == OK) {
+        uint64_t n = num(*result, "output_bytes");
+        void *buf = NULL;
+        size_t got = 0;
+        if (fd >= 0 && n && n <= DBT_PROBE_OUTPUT_MAX && read_passed(fd, 0, n, "probe output", &buf, &got) == OK) {
+            char *t = realloc(buf, got + 1);
+            if (t) { t[got] = '\0'; *output = t; *len = got; }
+            else free(buf);
+        }
+        err_clear();
+    }
+    if (fd >= 0) close(fd);
+    return st;
+}
+
 status_t remote_helper_call(const char *op, cJSON *args, cJSON **result)
 {
     if (result) *result = NULL;
@@ -935,7 +1166,16 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
     if (news && daemon8 && strcmp(h.daemon_id, daemon8) != 0)
         log_warn("helper: configured for daemon %s, this daemon is %s; artefacts are named "
                  "with the helper's", h.daemon_id, daemon8);
+    const cJSON *tl = cJSON_GetObjectItemCaseSensitive(res, "templates");
+    h.have_templates = cJSON_IsArray(tl);
     const cJSON *p;
+    cJSON_ArrayForEach(p, tl) {
+        if (!cJSON_IsString(p) || !db_template_find(p->valuestring)) continue;
+        if (strlen(h.templates) + strlen(p->valuestring) + 2 < sizeof(h.templates)) {
+            if (h.templates[0]) strcat(h.templates, ",");
+            strcat(h.templates, p->valuestring);
+        }
+    }
     cJSON_ArrayForEach(p, cJSON_GetObjectItemCaseSensitive(res, "providers")) {
         if (!cJSON_IsString(p) || !helper_provider_known(p->valuestring)) continue;
         if (strlen(h.providers) + strlen(p->valuestring) + 2 < sizeof(h.providers)) {
@@ -974,6 +1214,7 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
             /* A VM shows no processes or files to the host (db-detection.md
              * 10), so the daemon is never told it could ask. */
             .unit_probe = strcmp(p->valuestring, "libvirt") == 0 ? NULL : r_unit_probe,
+            .template_exec = r_template_exec, .templates_set = r_templates_set,
         };
         st = sp_registry_add(o, c);
         if (st != OK) { free(c); break; }

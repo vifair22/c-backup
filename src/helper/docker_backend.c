@@ -709,6 +709,8 @@ static status_t d_hook_start(sp_ctx_t *c, const char *unit_id, const policy_hook
         cJSON_AddBoolToObject(body, "AttachStdout", 1);
         cJSON_AddBoolToObject(body, "AttachStderr", 1);
         cJSON_AddBoolToObject(body, "Tty", 0);
+        /* A template's user (nextcloud-maintenance), from the catalog. */
+        if (h->user[0]) cJSON_AddStringToObject(body, "User", h->user);
     }
     char *txt = body ? cJSON_PrintUnformatted(body) : NULL;
     cJSON_Delete(body);
@@ -778,6 +780,55 @@ static void d_hook_free(helper_run_t *r)
     if (!r) return;
     pthread_join(r->th, NULL);
     free(r);
+}
+
+/*
+ * Where a database template runs (db-detection.md 7.2): the member whose
+ * included mount holds path, by the recorded path the finding names, and
+ * path as that member sees it, through the mount's destination. Everything
+ * comes from the helper's own inspect; the daemon's path only selects.
+ */
+static status_t d_db_target(sp_ctx_t *c, const char *unit_id, const char *path, char *container,
+                            size_t csz, char *cpath, size_t psz)
+{
+    member_t m[MEMBERS_MAX];
+    size_t n = 0;
+    status_t st = members_of(c, unit_id, m, &n);
+    if (st != OK) return st;
+    container[0] = cpath[0] = '\0';
+    if (!path) {
+        if (n != 1) return set_error(ERR_INVALID, "docker: %s has %zu containers; name the database's path", unit_id, n);
+        snprintf(container, csz, "%s", m[0].name);
+        return OK;
+    }
+    size_t best = 0;
+    for (size_t i = 0; i < n && st == OK; i++) {
+        char ip[256];
+        snprintf(ip, sizeof(ip), "/containers/%.79s/json", m[i].id);
+        cJSON *in = NULL;
+        if ((st = docker_call(&c->api, "GET", ip, NULL, 0, NULL, &in)) != OK) break;
+        const cJSON *mnt;
+        cJSON_ArrayForEach(mnt, cJSON_GetObjectItemCaseSensitive(in, "Mounts")) {
+            mount_class_t mc;
+            if (mount_classify(&c->mounts, jstr(mnt, "Type"), jstr(mnt, "Source"), jstr(mnt, "Driver"), &mc) != OK) {
+                err_clear();
+                continue;
+            }
+            const char *dst = jstr(mnt, "Destination");
+            size_t l = strlen(mc.recorded);
+            if (mc.verdict != MOUNT_INCLUDED || !l || dst[0] != '/' || l <= best ||
+                strncmp(path, mc.recorded, l) != 0 || (path[l] != '\0' && path[l] != '/'))
+                continue;
+            best = l;
+            snprintf(container, csz, "%s", m[i].name);
+            if (snprintf(cpath, psz, "%s%s", strcmp(dst, "/") == 0 && path[l] ? "" : dst, path + l) >= (int)psz)
+                cpath[0] = '\0';
+        }
+        cJSON_Delete(in);
+    }
+    if (st != OK) return st;
+    if (!best) return set_error(ERR_NOT_FOUND, "docker: no container of %s mounts %s", unit_id, path);
+    return OK;
 }
 
 /* Run one policy hook to its end, keeping the tail of its output. */
@@ -2751,7 +2802,7 @@ status_t docker_backend_init(const helper_policy_t *pol, helper_backend_t *out)
         .blob_data = d_blob_data, .unit_state = d_unit_state, .set_running = d_set_running,
         .mount_root = d_mount_root, .hook_start = d_hook_start, .hook_poll = d_hook_poll,
         .hook_kill = d_hook_kill, .hook_free = d_hook_free, .define = d_define,
-        .define_check = d_define_check,
+        .define_check = d_define_check, .db_target = d_db_target,
     };
     return OK;
 }

@@ -6,6 +6,7 @@
 #include "helper_backend.h"
 #include "helper_proto.h"
 #include "hooklog.h"
+#include "db_template.h"
 #include "paths_backend.h"
 #include "unit_probe.h"
 
@@ -1378,56 +1379,154 @@ static char *op_capture_end(helper_server_t *s, const helper_req_t *r)
 /* Hooks                                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * A database template as a hook (db-detection.md 7.2): the catalog's argv
+ * for the phase, run in the member whose mount holds the finding's path,
+ * as the backend's own inspect says. The policy decides which templates
+ * hook.run may build; a probe runs whatever it says (it reads no data).
+ * h borrows av's strings, so av outlives every use of h.
+ */
+static helper_err_t template_hook(helper_server_t *s, const helper_req_t *r, const helper_backend_t *b,
+                                  const char *uid, dbt_phase_t ph, int any_policy, policy_hook_t *h,
+                                  dbt_argv_t *av, char *why, size_t wsz)
+{
+    memset(h, 0, sizeof(*h));
+    memset(av, 0, sizeof(*av));
+    const db_template_t *t = db_template_find(r->tmpl);
+    if (!t) {
+        snprintf(why, wsz, "no template %s in this helper's catalog", r->tmpl);
+        return HELPER_E_INVALID;
+    }
+    if (!b->hook_start && strcmp(b->name, "fake") != 0) {
+        snprintf(why, wsz, "templates run inside a container, and %s units have none", b->name);
+        return HELPER_E_UNSUPPORTED;
+    }
+    if (ph != DBT_PHASE_PROBE && !any_policy && !helper_policy_template_allowed(s->pol, t->name)) {
+        snprintf(why, wsz, "template %s is not allowed by this host's policy; add it to [db] allow_templates",
+                 t->name);
+        return HELPER_E_DENIED;
+    }
+    if (ph == DBT_PHASE_POST && !t->post) {
+        snprintf(why, wsz, "template %s has no post run", t->name);
+        return HELPER_E_INVALID;
+    }
+    cJSON *params = r->params ? cJSON_Parse(r->params) : NULL;
+    if (r->params && !params) {
+        snprintf(why, wsz, "params are not JSON");
+        return HELPER_E_INVALID;
+    }
+    helper_err_t e = HELPER_OK;
+    if (db_template_check(t, params) != OK) {
+        snprintf(why, wsz, "%.400s", err_msg());
+        err_clear();
+        e = HELPER_E_INVALID;
+    }
+    /* The path that picks the container: the database file a template
+     * reads (its DBT_P_PATH parameter), else the finding's path. */
+    const char *pick = NULL;
+    for (size_t i = 0; i < t->n_params; i++)
+        if (t->params[i].type == DBT_P_PATH) pick = db_template_param_str(params, t->params[i].name);
+    int mapped = pick != NULL;
+    if (!pick && r->dbpath[0]) pick = r->dbpath;
+    char cpath[HELPER_PATH_MAX + 1] = "";
+    if (e == HELPER_OK && b->db_target) {
+        status_t st = b->db_target(b->ctx, uid, pick, h->container, sizeof(h->container), cpath, sizeof(cpath));
+        if (st != OK) {
+            snprintf(why, wsz, "template %s: %.400s", t->name, err_msg());
+            err_clear();
+            e = st == ERR_NOT_FOUND || st == ERR_INVALID ? HELPER_E_INVALID : HELPER_E_FAILED;
+        }
+    }
+    if (e == HELPER_OK && db_template_argv(t, ph, params, mapped && cpath[0] ? cpath : NULL, av) != OK) {
+        snprintf(why, wsz, "%.400s", err_msg());
+        err_clear();
+        e = HELPER_E_INVALID;
+    }
+    cJSON_Delete(params);
+    if (e != HELPER_OK) return e;
+    snprintf(h->name, sizeof(h->name), "%s", t->name);
+    snprintf(h->unit, sizeof(h->unit), "%s", r->unit);
+    snprintf(h->user, sizeof(h->user), "%s", t->user);
+    h->dump = t->kind == DBT_DUMP && ph == DBT_PHASE_RUN;
+    h->pre = ph != DBT_PHASE_POST;
+    h->timeout_s = ph == DBT_PHASE_PROBE ? DBT_PROBE_TIMEOUT_S : t->timeout_s;
+    _Static_assert(DBT_ARGV_MAX <= POLICY_ARGV_MAX, "a template's argv fits a hook's");
+    for (int i = 0; i < av->argc && i < DBT_ARGV_MAX; i++) h->argv[i] = av->argv[i];
+    h->argc = av->argc < DBT_ARGV_MAX ? av->argc : DBT_ARGV_MAX;
+    return HELPER_OK;
+}
+
+/*
+ * Start h: inside the unit through the backend, or (the fake, which has no
+ * unit to enter) as a local process with no shell of the helper's own. A
+ * template's argv names its tools by name, so a local one is looked up on
+ * PATH; a policy hook's argv.0 is the path the operator wrote.
+ */
+static status_t hook_spawn(const helper_backend_t *b, const char *uid, const policy_hook_t *h, int by_path,
+                           int out_fd, int err_fd, pid_t *pid, helper_run_t **hr)
+{
+    *pid = -1;
+    *hr = NULL;
+    if (b->hook_start) return b->hook_start(b->ctx, uid, h, out_fd, err_fd, hr);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    if (out_fd >= 0) posix_spawn_file_actions_adddup2(&fa, out_fd, 1);
+    else posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, err_fd, 2);
+    int rc = by_path ? posix_spawnp(pid, h->argv[0], &fa, NULL, h->argv, environ)
+                     : posix_spawn(pid, h->argv[0], &fa, NULL, h->argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) return set_error(ERR_IO, "%s", strerror(rc));
+    return OK;
+}
+
 static char *op_hook_run(helper_server_t *s, const helper_req_t *r, int *pass_fd)
 {
-    char why[256];
+    char why[512];
     helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
     if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
-    const policy_hook_t *h = helper_policy_hook(s->pol, r->hook);
-    if (!h || strcmp(h->unit, r->unit) != 0)
-        return resp_error(r->id, HELPER_E_DENIED, "hook %s is not in the policy for %s", r->hook, r->unit);
     const char *uid = NULL;
     const helper_backend_t *b = NULL;
     if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
         return resp_error(r->id, e, "%s", why);
+    policy_hook_t th;
+    dbt_argv_t av;
+    memset(&av, 0, sizeof(av));
+    const policy_hook_t *h = NULL;
+    const char *what = r->tmpl[0] ? r->tmpl : r->hook;
+    if (r->tmpl[0]) {
+        if ((e = template_hook(s, r, b, uid, r->post ? DBT_PHASE_POST : DBT_PHASE_RUN, 0, &th, &av, why,
+                               sizeof(why))) != HELPER_OK)
+            return resp_error(r->id, e, "%s", why);
+        h = &th;
+    } else {
+        h = helper_policy_hook(s->pol, r->hook);
+        if (!h || strcmp(h->unit, r->unit) != 0)
+            return resp_error(r->id, HELPER_E_DENIED, "hook %s is not in the policy for %s", r->hook, r->unit);
+    }
 
     int out[2] = { -1, -1 }, err[2] = { -1, -1 };
     if (pipe2(err, O_CLOEXEC) != 0 || (h->dump && pipe2(out, O_CLOEXEC) != 0)) {
         if (err[0] >= 0) { close(err[0]); close(err[1]); }
+        dbt_argv_free(&av);
         return resp_error(r->id, HELPER_E_FAILED, "pipe: %s", strerror(errno));
     }
     pid_t pid = -1;
     helper_run_t *hr = NULL;
-    if (b->hook_start) {
-        /* Inside the unit (docker exec, lxc-attach), argv as the policy
-         * gives it and no shell. */
-        status_t hst = b->hook_start(b->ctx, uid, h, h->dump ? out[1] : -1, err[1], &hr);
-        close(err[1]);
-        if (h->dump) close(out[1]);
-        if (hst != OK) {
-            close(err[0]);
-            if (h->dump) close(out[0]);
-            return resp_error(r->id, HELPER_E_FAILED, "hook %s: %s", r->hook, err_msg());
-        }
-    } else {
-    /* No unit to enter (the fake): the policy's argv runs as given, with no
-     * shell. */
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
-    if (h->dump) posix_spawn_file_actions_adddup2(&fa, out[1], 1);
-    else posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_adddup2(&fa, err[1], 2);
-    int rc = posix_spawn(&pid, h->argv[0], &fa, NULL, h->argv, environ);
-    posix_spawn_file_actions_destroy(&fa);
+    /* Inside the unit (docker exec, lxc-attach), argv as given and no
+     * shell; or a local process for the fake. */
+    status_t hst = hook_spawn(b, uid, h, r->tmpl[0] != '\0', h->dump ? out[1] : -1, err[1], &pid, &hr);
     close(err[1]);
     if (h->dump) close(out[1]);
-    if (rc != 0) {
+    unsigned timeout_s = h->timeout_s;
+    dbt_argv_free(&av);
+    if (hst != OK) {
         close(err[0]);
-        if (h->dump) close(out[0]);
-        return resp_error(r->id, HELPER_E_FAILED, "hook %s: %s", r->hook, strerror(rc));
+        if (out[0] >= 0) close(out[0]);
+        return resp_error(r->id, HELPER_E_FAILED, "hook %s: %s", what, err_msg());
     }
-    }
+    int dump = out[0] >= 0;
     (void)fcntl(err[0], F_SETFL, O_NONBLOCK);
     pthread_mutex_lock(&s->mu);
     run_t *slot = NULL;
@@ -1438,7 +1537,7 @@ static char *op_hook_run(helper_server_t *s, const helper_req_t *r, int *pass_fd
         slot->b = hr ? b : NULL;
         slot->hr = hr;
         slot->err_fd = err[0];
-        slot->deadline = time(NULL) + (time_t)h->timeout_s;
+        slot->deadline = time(NULL) + (time_t)timeout_s;
         if (helper_random_hex(slot->token, 16) == OK) slot->used = 1;
         else slot = NULL;
     }
@@ -1449,15 +1548,138 @@ static char *op_hook_run(helper_server_t *s, const helper_req_t *r, int *pass_fd
         if (hr) { b->hook_kill(hr); b->hook_free(hr); }
         else { kill(pid, SIGKILL); waitpid(pid, NULL, 0); }
         close(err[0]);
-        if (h->dump) close(out[0]);
+        if (dump) close(out[0]);
         return resp_error(r->id, HELPER_E_BUSY, "too many hook runs");
     }
     cJSON *res = cJSON_CreateObject();
     if (res) {
         cJSON_AddStringToObject(res, "run", token);
-        cJSON_AddBoolToObject(res, "dump", h->dump);
+        cJSON_AddBoolToObject(res, "dump", dump);
     }
-    if (h->dump) *pass_fd = out[0];
+    if (dump) *pass_fd = out[0];
+    return resp_ok(r->id, res);
+}
+
+/*
+ * db.probe (db-detection.md 8.1): a template's dry run, stdout and stderr
+ * together, capped at DBT_PROBE_OUTPUT_MAX and bounded by
+ * DBT_PROBE_TIMEOUT_S, on this connection's own thread. The output comes
+ * back in a sealed memfd, since 64 KiB of it escaped into JSON would not
+ * fit a packet. Also returned: the argv the template's run (and post run)
+ * would use, and where, for a preview to show exactly what Enable runs.
+ */
+static char *op_db_probe(helper_server_t *s, const helper_req_t *r, int *pass_fd)
+{
+    char why[512];
+    helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
+    if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
+    const char *uid = NULL;
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
+        return resp_error(r->id, e, "%s", why);
+    policy_hook_t h;
+    dbt_argv_t av;
+    if ((e = template_hook(s, r, b, uid, DBT_PHASE_PROBE, 0, &h, &av, why, sizeof(why))) != HELPER_OK)
+        return resp_error(r->id, e, "%s", why);
+    const db_template_t *t = db_template_find(r->tmpl);
+    cJSON *res = cJSON_CreateObject();
+    if (!res) { dbt_argv_free(&av); return resp_error(r->id, HELPER_E_FAILED, "out of memory"); }
+    cJSON_AddStringToObject(res, "template", t->name);
+    cJSON_AddStringToObject(res, "container", h.container);
+    cJSON_AddStringToObject(res, "user", h.user);
+    cJSON_AddBoolToObject(res, "allowed", helper_policy_template_allowed(s->pol, t->name));
+    cJSON_AddItemToObject(res, "probe_argv", dbt_argv_json(&av));
+    /* What Enable would run, built as hook.run builds it; shown even when
+     * the policy would refuse it, beside "allowed". */
+    for (int ph = DBT_PHASE_RUN; ph <= DBT_PHASE_POST; ph++) {
+        if (ph == DBT_PHASE_POST && !t->post) break;
+        policy_hook_t xh;
+        dbt_argv_t xa;
+        char xwhy[256];
+        if (template_hook(s, r, b, uid, (dbt_phase_t)ph, 1, &xh, &xa, xwhy, sizeof(xwhy)) == HELPER_OK)
+            cJSON_AddItemToObject(res, ph == DBT_PHASE_POST ? "post_argv" : "argv", dbt_argv_json(&xa));
+        dbt_argv_free(&xa);
+    }
+
+    int p[2];
+    if (pipe2(p, O_CLOEXEC) != 0) {
+        dbt_argv_free(&av);
+        cJSON_Delete(res);
+        return resp_error(r->id, HELPER_E_FAILED, "pipe: %s", strerror(errno));
+    }
+    pid_t pid = -1;
+    helper_run_t *hr = NULL;
+    status_t hst = hook_spawn(b, uid, &h, 1, p[1], p[1], &pid, &hr);
+    close(p[1]);
+    dbt_argv_free(&av);
+    if (hst != OK) {
+        close(p[0]);
+        cJSON_Delete(res);
+        return resp_error(r->id, HELPER_E_FAILED, "probe %s: %s", r->tmpl, err_msg());
+    }
+    char *out = malloc(DBT_PROBE_OUTPUT_MAX);
+    size_t got = 0;
+    uint64_t total = 0;
+    time_t deadline = time(NULL) + (time_t)DBT_PROBE_TIMEOUT_S;
+    int timed_out = 0, eof = 0, status = 0, done = 0;
+    (void)fcntl(p[0], F_SETFL, O_NONBLOCK);
+    while (!done) {
+        if (!eof) {
+            struct pollfd pf = { p[0], POLLIN, 0 };
+            (void)poll(&pf, 1, 100);
+            char buf[4096];
+            for (;;) {
+                ssize_t n = read(p[0], buf, sizeof(buf));
+                if (n > 0) {
+                    size_t keep = out && got < DBT_PROBE_OUTPUT_MAX ? DBT_PROBE_OUTPUT_MAX - got : 0;
+                    if (keep > (size_t)n) keep = (size_t)n;
+                    if (keep) memcpy(out + got, buf, keep);
+                    got += keep;
+                    total += (uint64_t)n;
+                    continue;
+                }
+                if (n == 0) eof = 1;
+                break;
+            }
+        } else {
+            struct timespec ts = { 0, 20 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        if (hr) {
+            if (b->hook_poll(hr, &status)) done = eof || time(NULL) >= deadline;
+        } else {
+            int st = 0;
+            if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid) {
+                status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+                pid = -1;
+            }
+            /* A child that left something holding the pipe has still ended. */
+            if (pid < 0) done = eof || time(NULL) >= deadline;
+        }
+        if (!done && time(NULL) >= deadline) {
+            timed_out = 1;
+            if (hr) b->hook_kill(hr);
+            else if (pid > 0) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); pid = -1; }
+            status = 128 + SIGKILL;
+            done = 1;
+        }
+    }
+    close(p[0]);
+    if (hr) b->hook_free(hr);
+    cJSON_AddNumberToObject(res, "exit", status);
+    cJSON_AddBoolToObject(res, "timed_out", timed_out);
+    cJSON_AddNumberToObject(res, "output_bytes", (double)got);
+    cJSON_AddBoolToObject(res, "truncated", total > got);
+    int lfd = -1;
+    uint64_t loff = 0;
+    if (out && got && (blob_fd_append(&lfd, &loff, out, got) != 0 ||
+                       fcntl(lfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) != 0)) {
+        if (lfd >= 0) close(lfd);
+        lfd = -1;
+        cJSON_ReplaceItemInObject(res, "output_bytes", cJSON_CreateNumber(0));
+    }
+    free(out);
+    if (lfd >= 0) *pass_fd = lfd;
     return resp_ok(r->id, res);
 }
 
@@ -2601,6 +2823,12 @@ static char *op_hello(helper_server_t *s, const helper_req_t *r)
     /* Whether capture.begin_paths can snapshot anything here (db-detection.md 9.4). */
     cJSON_AddBoolToObject(res, "path_snapshots",
                           paths_backend_any_domain(backend_named(s, PATHS_BACKEND_NAME)));
+    /* The database templates hook.run will build (db-detection.md 7.2),
+     * so the daemon can tell an operator the policy line to add before
+     * enabling one that would be refused. */
+    cJSON *t = cJSON_AddArrayToObject(res, "templates");
+    for (size_t i = 0; t && i < s->pol->n_db_allow; i++)
+        cJSON_AddItemToArray(t, cJSON_CreateString(s->pol->db_allow[i]));
     return resp_ok(r->id, res);
 }
 
@@ -2627,6 +2855,7 @@ static char *dispatch(helper_server_t *s, const helper_req_t *r, int *pass_fd, i
     case HOP_LEASE_RELEASE:          return op_lease_release(s, r);
     case HOP_SWEEP:                  return op_sweep(s, r);
     case HOP_UNITS_PROBE:            return op_units_probe(s, r);
+    case HOP_DB_PROBE:               return op_db_probe(s, r, pass_fd);
     case HOP_COUNT:                  break;
     }
     return resp_error(r->id, HELPER_E_DENIED, "operation does not exist");

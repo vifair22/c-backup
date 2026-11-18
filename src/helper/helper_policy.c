@@ -2,6 +2,7 @@
 
 #include "helper_policy.h"
 #include "helper_proto.h"
+#include "db_template.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -25,6 +26,7 @@ void helper_policy_free(helper_policy_t *p)
     for (size_t i = 0; i < p->n_btrfs; i++) free(p->btrfs_domains[i]);
     for (size_t i = 0; i < p->n_dir; i++) free(p->dir_domains[i]);
     for (size_t i = 0; i < p->n_staging; i++) free(p->restore_staging_dirs[i]);
+    for (size_t i = 0; i < p->n_db_allow; i++) free(p->db_allow[i]);
     for (size_t h = 0; h < p->n_hooks; h++)
         for (int i = 0; i < p->hooks[h].argc; i++) free(p->hooks[h].argv[i]);
     memset(p, 0, sizeof(*p));
@@ -98,6 +100,8 @@ static void fold_compose(char **g, size_t n)
     }
 }
 
+static int template_ok(const char *t) { return db_template_find(t) != NULL; }
+
 static int dir_ok(const char *d) { return helper_path_clean(d) && strcmp(d, "/") != 0; }
 static int dataset_ok(const char *d) { return d[0] && d[0] != '/' && !strstr(d, "..") && !strchr(d, '@'); }
 
@@ -140,7 +144,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
     char *buf = strdup(text ? text : "");
     if (!buf) return set_error(ERR_NOMEM, "policy");
     status_t st = OK;
-    enum { S_NONE, S_HELPER, S_UNITS, S_SNAPSHOT, S_HOOK, S_HOST, S_DOCKER, S_LXC, S_LIBVIRT } sec = S_NONE;
+    enum { S_NONE, S_HELPER, S_UNITS, S_SNAPSHOT, S_HOOK, S_HOST, S_DOCKER, S_LXC, S_LIBVIRT, S_DB } sec = S_NONE;
     policy_hook_t *hook = NULL;
     int line = 0;
     char *save = NULL;
@@ -160,6 +164,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
             else if (strcmp(s, "docker") == 0) sec = S_DOCKER;
             else if (strcmp(s, "lxc") == 0) sec = S_LXC;
             else if (strcmp(s, "libvirt") == 0) sec = S_LIBVIRT;
+            else if (strcmp(s, "db") == 0) sec = S_DB;
             else if (strncmp(s, "hook ", 5) == 0) {
                 const char *nm = trim(s + 5);
                 if (out->n_hooks >= POLICY_HOOKS_MAX) { st = bad(line, "too many hooks", NULL); break; }
@@ -324,6 +329,14 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
             } else if (strcmp(k, "freeze_timeout_s") == 0) {
                 if (to_uint(v, 1, 600, &out->vm_freeze_timeout_s)) { st = bad(line, "freeze_timeout_s is 1 to 600", v); break; }
             } else { st = bad(line, "unknown key in [libvirt]", k); break; }
+        } else if (sec == S_DB) {
+            if (strcmp(k, "allow_templates") != 0) { st = bad(line, "unknown key in [db]", k); break; }
+            if (out->db_allow_set) { st = bad(line, "allow_templates given twice", NULL); break; }
+            if (to_list(v, out->db_allow, &out->n_db_allow, template_ok)) {
+                st = bad(line, "allow_templates names a template the catalog does not have", v);
+                break;
+            }
+            out->db_allow_set = 1;
         } else if (sec == S_SNAPSHOT && strcmp(k, "btrfs_snapshot_dir") == 0) {
             if (!dir_ok(v) || strlen(v) >= sizeof(out->btrfs_snapshot_dir)) { st = bad(line, "btrfs_snapshot_dir must be a clean absolute path", v); break; }
             snprintf(out->btrfs_snapshot_dir, sizeof(out->btrfs_snapshot_dir), "%s", v);
@@ -379,6 +392,11 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
     for (size_t h = 0; st == OK && h < out->n_hooks; h++)
         if (!out->hooks[h].unit[0] || out->hooks[h].argc == 0)
             st = set_error(ERR_INVALID, "policy: hook %s needs a unit and argv.0", out->hooks[h].name);
+    /* No [db] allow_templates: the stdout dumps, which write nothing
+     * inside the application's data (section 13). */
+    if (st == OK && !out->db_allow_set &&
+        to_list(db_template_default_allow(), out->db_allow, &out->n_db_allow, template_ok))
+        st = set_error(ERR_NOMEM, "policy");
     if (st == OK && out->docker_enabled && out->n_include == 0 &&
         to_list("/mnt/cache/appdata,/mnt/user/appdata", out->include_roots, &out->n_include, dir_ok))
         st = set_error(ERR_NOMEM, "policy");
@@ -466,4 +484,11 @@ const policy_hook_t *helper_policy_hook(const helper_policy_t *p, const char *na
     for (size_t i = 0; i < p->n_hooks; i++)
         if (strcmp(p->hooks[i].name, name) == 0) return &p->hooks[i];
     return NULL;
+}
+
+int helper_policy_template_allowed(const helper_policy_t *p, const char *name)
+{
+    for (size_t i = 0; name && i < p->n_db_allow; i++)
+        if (strcmp(p->db_allow[i], name) == 0) return 1;
+    return 0;
 }

@@ -33,6 +33,7 @@
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
+#include "db_write.h"
 #include "registry.h"
 #include "remote_provider.h"
 #include "repo.h"
@@ -174,6 +175,61 @@ static int setup_dumps(void **state)
         fake_blob_add(fk, "u1", "log:baddump", ".cbackup-unit/hooks/baddump.log", "", 0) != OK) return -1;
     if (helper_up() != 0) return -1;
     return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
+}
+
+/*
+ * As setup, with database templates (db-detection.md 7.2, D2): a live
+ * PostgreSQL in u1's tree, the engines' tools on PATH (the fake provider
+ * has no container, so a template runs as a local process found there),
+ * and the policy's [db] allow_templates naming two of them.
+ */
+#define TBIN HF_DIR "/bin"
+static void ttool(const char *name, const char *body)
+{
+    char path[512];
+    snprintf(path, sizeof(path), TBIN "/%s", name);
+    hf_write(path, body);
+    assert_int_equal(chmod(path, 0755), 0);
+}
+
+static int setup_templates(void **state)
+{
+    (void)state;
+    if (setup_base() != 0) return -1;
+    char text[8192];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
+    strncat(text, "\n[db]\nallow_templates = pg-dumpall, redis-bgsave\n", sizeof(text) - strlen(text) - 1);
+    helper_policy_free(&pol);
+    if (helper_policy_parse(text, &pol) != OK) return -1;
+    mkdir(HF_SNAP "/global", 0700);
+    mkdir(HF_SNAP "/base", 0700);
+    mkdir(HF_SNAP "/base/1", 0700);
+    hf_write(HF_SNAP "/PG_VERSION", "16\n");
+    hf_write(HF_SNAP "/global/pg_control", "control");
+    hf_write(HF_SNAP "/base/1/1259", "page");
+    hf_write(HF_SNAP "/postmaster.pid", "42\n");
+    mkdir(TBIN, 0700);
+    ttool("pg_dumpall", "#!/bin/sh\necho \"-- dump as $4\"\necho dumped >&2\n");
+    ttool("redis-cli", "#!/bin/sh\ncase \"$1\" in\n"
+                       "BGSAVE) echo 'Background saving started' ;;\n"
+                       "INFO) printf 'rdb_bgsave_in_progress:0\\r\\nrdb_last_bgsave_status:ok\\r\\n' ;;\n"
+                       "esac\n");
+    const char *old = getenv("PATH");
+    char path[4096];
+    snprintf(path, sizeof(path), TBIN ":%s", old ? old : "/usr/bin:/bin");
+    setenv("PATH", path, 1);
+    if (helper_up() != 0) return -1;
+    return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
+}
+
+/* A finding of fake:u1 enabled with a template, as the enable route leaves it. */
+static void enable_finding(const char *engine, const char *path, const char *tmpl, const char *params)
+{
+    assert_int_equal(db_write(db, "INSERT INTO db_findings (repo_id, scope, engine, path, confidence, state,"
+                                  " evidence, first_seen, last_seen, template, params, decided_by, decided_at)"
+                                  " VALUES (?, 'unit:fake:u1', ?, ?, 'live', 'enabled', '{}', 1, 1, ?, ?,"
+                                  " 'test', 1)",
+                              (const char *[]){ repo, engine, path, tmpl, params, NULL }, NULL), 0);
 }
 
 /* As setup, with restore and define allowed in the helper's policy. */
@@ -496,6 +552,99 @@ static void test_dumps_through_helper(void **state)
     assert_int_equal(helper_server_holds(srv), 0);
 }
 
+
+/*
+ * Enabled templates through the helper (db-detection.md 7.1 to 7.3): the
+ * dump stored at .cbackup-unit/hooks/<template>.dump with its log, the exec
+ * template run before the capture with its log, the finding's coverage
+ * lifted by the dump, and unit.json saying how the database was captured.
+ */
+static void test_templates_through_helper(void **state)
+{
+    (void)state;
+    enable_finding("postgres", HF_MOUNT, "pg-dumpall", "{}");
+    enable_finding("redis", HF_MOUNT "/redis", "redis-bgsave", "{}");
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    if (res.units[0].warning[0]) fail_msg("warning: %s", res.units[0].warning);
+    assert_non_null(res.units[0].databases_json);
+    if (!strstr(res.units[0].databases_json, "\"coverage\":\"covered-application\""))
+        fail_msg("databases: %s", res.units[0].databases_json);
+    assert_non_null(strstr(res.units[0].databases_json, "pg-dumpall dump is a consistent copy"));
+    unit_backup_result_free(&res);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM db_findings WHERE repo_id = ? AND engine = 'postgres'"
+                            " AND coverage = 'covered-application' AND state = 'enabled'"), 1);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, DEST, &ro, &rr), OK);
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/pg-dumpall.dump", "-- dump as postgres"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/pg-dumpall.log", "dumped"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/pg-dumpall.log", "exit status 0"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/redis-bgsave.log", "== pre run =="));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/redis-bgsave.log", "BGSAVE finished"));
+    struct stat sb;
+    assert_int_not_equal(stat(DEST "/.cbackup-unit/hooks/redis-bgsave.dump", &sb), 0);
+    assert_true(file_has(DEST "/.cbackup-unit/unit.json",
+                         "\"template\":{\"name\":\"pg-dumpall\",\"ok\":true,\"dump\":\".cbackup-unit/hooks/pg-dumpall.dump\"}"));
+    assert_true(file_has(DEST "/.cbackup-unit/unit.json", "\"source\":\"template:pg-dumpall\""));
+    assert_int_equal(helper_server_holds(srv), 0);
+}
+
+/*
+ * A template that fails never fails the unit (db-detection.md 7.3, 6.6):
+ * a dump that exits non-zero, one the policy does not allow (refused by the
+ * helper at the backup, as a failed dump), an exec template whose pre run
+ * fails. Each is a warning; no dump is stored; the finding keeps the
+ * coverage the capture itself achieved; and two findings enabling one
+ * template get <template> and <template>-<finding>.
+ */
+static void test_template_failures(void **state)
+{
+    (void)state;
+    ttool("pg_dumpall", "#!/bin/sh\necho 'half a dump'\necho 'connection refused' >&2\nexit 2\n");
+    ttool("redis-cli", "#!/bin/sh\nexit 1\n");
+    enable_finding("postgres", HF_MOUNT, "pg-dumpall", "{}");
+    enable_finding("redis", HF_MOUNT "/redis", "redis-bgsave", "{}");
+    enable_finding("postgres", HF_MOUNT "/other", "pg-dump", "{\"user\":\"a\",\"database\":\"b\"}");
+    enable_finding("postgres", HF_MOUNT "/third", "pg-dumpall", "{}");
+    enable_finding("postgres", HF_MOUNT "/gone", "no-such-template", "{}");
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    const unit_backup_one_t *u = &res.units[0];
+    int saw_dumps = 0, saw_pre = 0, saw_catalog = 0;
+    for (size_t i = 0; i < u->n_warnings; i++) {
+        saw_dumps |= strstr(u->warnings[i], "3 dump(s) failed") != NULL;
+        saw_pre |= strstr(u->warnings[i], "redis-bgsave pre run failed") != NULL;
+        saw_catalog |= strstr(u->warnings[i], "no-such-template") != NULL;
+    }
+    if (!saw_dumps || !saw_pre || !saw_catalog)
+        for (size_t i = 0; i < u->n_warnings; i++) print_message("warning: %s\n", u->warnings[i]);
+    assert_true(saw_dumps);
+    assert_true(saw_pre);
+    assert_true(saw_catalog);
+    if (!strstr(u->databases_json, "\"coverage\":\"covered-quiesced\"")) fail_msg("db: %s", u->databases_json);
+    assert_null(strstr(u->databases_json, "covered-application"));
+    unit_backup_result_free(&res);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, DEST, &ro, &rr), OK);
+    struct stat sb;
+    assert_int_not_equal(stat(DEST "/.cbackup-unit/hooks/pg-dumpall.dump", &sb), 0);
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/pg-dumpall.log", "connection refused"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/pg-dumpall.log", "exit status 2"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/pg-dump.log", "not allowed by this host's policy"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/redis-bgsave.log", "exit status 1"));
+    char third[256];
+    snprintf(third, sizeof(third), DEST "/.cbackup-unit/hooks/pg-dumpall-%lld.log",
+             scalar("SELECT id FROM db_findings WHERE repo_id = ? AND path LIKE '%/third'"));
+    assert_true(file_has(third, "exit status 2"));
+    assert_true(file_has(DEST "/.cbackup-unit/unit.json", "\"template\":{\"name\":\"pg-dumpall\",\"ok\":false}"));
+    assert_int_equal(helper_server_holds(srv), 0);
+}
 
 /*
  * B210: the type each entry of a unit snapshot was recorded with, which the
@@ -1400,6 +1549,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_helper_restarts_mid_job, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_blob, setup, teardown),
         cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
+        cmocka_unit_test_setup_teardown(test_templates_through_helper, setup_templates, teardown),
+        cmocka_unit_test_setup_teardown(test_template_failures, setup_templates, teardown),
         cmocka_unit_test_setup_teardown(test_unit_restore, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_entry_type, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_refusal_reaches_whole, setup_define, teardown),

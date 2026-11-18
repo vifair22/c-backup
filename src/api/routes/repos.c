@@ -710,6 +710,9 @@ static const api_path_t *repo_path_entry(const char *rest)
     if (ua) return ua;
     const api_path_t *da = databases_path_entry(rest);
     if (da) return da;
+    /* So do the database finding actions (db_actions.c). */
+    const api_path_t *dx = db_actions_path_entry(rest);
+    if (dx) return dx;
 
     const char *e;
     if (strncmp(rest, "/tags/", 6) == 0 && rest[6]) return repo_path_named("/tags/<name>");
@@ -1117,6 +1120,8 @@ static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
         return metadata_tags_post(req, repo_id);
     if (strcmp(rest, "/schedules") == 0)
         return schedules_post(req, repo_id);
+    if (db_actions_path_entry(rest))
+        return db_actions_route_post(req, repo_id, rest);
     if (strncmp(rest, "/units/", 7) == 0 ||
         (strncmp(rest, "/snapshots/", 11) == 0 &&
          (strstr(rest, "/unit/restore") || strstr(rest, "/unit/export"))))

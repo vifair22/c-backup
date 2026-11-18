@@ -112,6 +112,13 @@ void              routes_databases_init(cutils_db_t *db);
 const api_path_t *databases_path_entry(const char *rest);
 const api_path_t *routes_databases_paths(size_t *n);
 api_response_t    databases_route_get(const api_request_t *req, int64_t repo_id, const char *rest);
+/* Acting on database findings (src/api/routes/db_actions.c): preview,
+ * enable and dismiss under /repos/<id>/databases/<f>/, dispatched from
+ * repos.c like the units' part of the table. */
+void              routes_db_actions_init(cutils_db_t *db);
+const api_path_t *db_actions_path_entry(const char *rest);
+const api_path_t *routes_db_actions_paths(size_t *n);
+api_response_t    db_actions_route_post(const api_request_t *req, int64_t repo_id, const char *rest);
 
 /* The /repos/<id> path tables, whole, for the test that holds every write
  * in them to a durability class (tests/test_route_classes.c). */

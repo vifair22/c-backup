@@ -36,7 +36,7 @@ static const char *const k_ops[HOP_COUNT] = {
     "capture.end", "hook.run", "hook.wait", "vm.backup_begin", "vm.backup_end",
     "vm.checkpoint_redefine", "vm.install_state", "restore.stage", "restore.swap",
     "unit.stop", "unit.start", "unit.define", "lease.release", "sweep",
-    "units.probe",
+    "units.probe", "db.probe",
 };
 
 const char *helper_op_name(helper_op_t op)
@@ -174,12 +174,13 @@ static int token_ok(const char *s)
 typedef enum {
     A_INT, A_BOOL, A_PROVIDER, A_UNIT, A_UNITS, A_PATHS, A_TOKEN, A_NAME,
     A_DISKS, A_NAME_OR_NULL, A_FREEZE, A_OUTCOME, A_PATH, A_JOB, A_OBJECT, A_REAL,
+    A_TEMPLATE, A_PARAMS, A_DBPATH, A_PHASE,
 } akind_t;
 
 typedef struct { const char *key; akind_t kind; } akey_t;
 
 typedef struct {
-    akey_t keys[5];
+    akey_t keys[6];
     int    n;
     int    one_of;      /* exactly one of the keys (lease.release) */
     int    n_opt;       /* the last n_opt keys may be left out */
@@ -193,7 +194,10 @@ static const schema_t k_schema[HOP_COUNT] = {
     [HOP_CAPTURE_BEGIN]          = { { { "units", A_UNITS }, { "pause", A_BOOL }, { "hold", A_BOOL } }, 3, 0, 1 },
     [HOP_CAPTURE_BEGIN_PATHS]    = { { { "paths", A_PATHS } }, 1, 0 },
     [HOP_CAPTURE_END]            = { { { "capture", A_TOKEN } }, 1, 0 },
-    [HOP_HOOK_RUN]               = { { { "unit", A_UNIT }, { "hook", A_NAME } }, 2, 0 },
+    /* Either form: {unit, hook}, or {unit, template[, params, path, phase]};
+     * which keys go together is checked after the schema. */
+    [HOP_HOOK_RUN]               = { { { "unit", A_UNIT }, { "hook", A_NAME }, { "template", A_TEMPLATE },
+                                       { "params", A_PARAMS }, { "path", A_DBPATH }, { "phase", A_PHASE } }, 6, 0, 5 },
     [HOP_HOOK_WAIT]              = { { { "run", A_TOKEN } }, 1, 0 },
     [HOP_VM_BACKUP_BEGIN]        = { { { "unit", A_UNIT }, { "disks", A_DISKS },
                                        { "base", A_NAME_OR_NULL }, { "freeze", A_FREEZE } }, 4, 0 },
@@ -209,6 +213,8 @@ static const schema_t k_schema[HOP_COUNT] = {
     [HOP_LEASE_RELEASE]          = { { { "capture", A_TOKEN }, { "session", A_TOKEN } }, 2, 1 },
     [HOP_SWEEP]                  = { { { NULL, A_INT } }, 0, 0 },
     [HOP_UNITS_PROBE]            = { { { "unit", A_UNIT } }, 1, 0 },
+    [HOP_DB_PROBE]               = { { { "unit", A_UNIT }, { "template", A_TEMPLATE },
+                                       { "params", A_PARAMS }, { "path", A_DBPATH } }, 4, 0, 2 },
 };
 
 static int name_ok(const char *s) { return str_ok(s, HELPER_NAME_MAX) && ident_ok(s, HELPER_NAME_MAX, "_.:-"); }
@@ -356,6 +362,29 @@ static int take_arg(helper_req_t *r, const akey_t *k, const cJSON *v, char *why,
         }
         return 0;
     }
+    case A_TEMPLATE:
+        if (!cJSON_IsString(v) || !name_ok(v->valuestring))
+            return set_bad(why, wsz, "%s: %s is not a valid name", op, k->key);
+        snprintf(r->tmpl, sizeof(r->tmpl), "%s", v->valuestring);
+        return 0;
+    case A_PARAMS: {
+        if (!cJSON_IsObject(v)) return set_bad(why, wsz, "%s: %s must be an object", op, k->key);
+        char *t = cJSON_PrintUnformatted(v);
+        if (!t) return set_bad(why, wsz, "%s: out of memory%s", op, "");
+        r->params = strdup(t);
+        cJSON_free(t);
+        return r->params ? 0 : set_bad(why, wsz, "%s: out of memory%s", op, "");
+    }
+    case A_DBPATH:
+        if (!cJSON_IsString(v) || !helper_path_clean(v->valuestring) || strcmp(v->valuestring, "/") == 0)
+            return set_bad(why, wsz, "%s: %s must be a clean absolute path", op, k->key);
+        snprintf(r->dbpath, sizeof(r->dbpath), "%s", v->valuestring);
+        return 0;
+    case A_PHASE:
+        if (!cJSON_IsString(v) || (strcmp(v->valuestring, "pre") != 0 && strcmp(v->valuestring, "post") != 0))
+            return set_bad(why, wsz, "%s: %s must be pre or post", op, k->key);
+        r->post = strcmp(v->valuestring, "post") == 0;
+        return 0;
     case A_OBJECT: {
         if (!cJSON_IsObject(v)) return set_bad(why, wsz, "%s: %s must be an object", op, k->key);
         char *t = cJSON_PrintUnformatted(v);
@@ -373,8 +402,10 @@ void helper_req_free(helper_req_t *req)
     if (!req) return;
     for (size_t i = 0; i < req->n_paths; i++) free(req->paths[i]);
     free(req->definition);
+    free(req->params);
     req->n_paths = 0;
     req->definition = NULL;
+    req->params = NULL;
 }
 
 helper_err_t helper_request_parse(const void *buf, size_t len, helper_req_t *req,
@@ -455,6 +486,18 @@ helper_err_t helper_request_parse(const void *buf, size_t len, helper_req_t *req
         snprintf(why, wsz, "%s: wrong arguments; it takes %s", k_ops[found],
                  s->one_of ? "exactly one of its token keys" : "exactly its listed keys");
         goto out;
+    }
+    /* hook.run names a policy hook, or builds a template: one or the
+     * other, and the template's own keys only with a template. */
+    if (req->op == HOP_HOOK_RUN) {
+        int has_t = cJSON_GetObjectItemCaseSensitive(args, "template") != NULL;
+        int has_h = cJSON_GetObjectItemCaseSensitive(args, "hook") != NULL;
+        int extra = cJSON_GetObjectItemCaseSensitive(args, "params") || cJSON_GetObjectItemCaseSensitive(args, "path") ||
+                    cJSON_GetObjectItemCaseSensitive(args, "phase");
+        if (has_t == has_h || (has_h && extra)) {
+            snprintf(why, wsz, "hook.run: takes {unit, hook} or {unit, template[, params, path, phase]}");
+            goto out;
+        }
     }
     e = HELPER_OK;
 out:

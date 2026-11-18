@@ -101,6 +101,30 @@ typedef struct {
     size_t          n_items;
 } sp_unit_desc_t;
 
+/*
+ * An enabled database template of a unit (db-detection.md 7.2, phase D2):
+ * the core fills the inputs from the unit's enabled findings; a provider
+ * that runs templates (the helper's) fills the outputs. A dump template is
+ * a STREAM item, ".cbackup-unit/hooks/<hook>.dump", whose source is
+ * "template:<hook>"; every template's log is a BLOB item,
+ * ".cbackup-unit/hooks/<hook>.log", with the same source.
+ */
+#define SP_TEMPLATE_SOURCE "template:"
+
+typedef struct {
+    const char *name;       /* the catalog's name, "pg-dumpall" */
+    const char *hook;       /* the output name: the template, or <template>-<finding> */
+    const char *params;     /* a JSON object */
+    const char *path;       /* the finding's recorded path: picks the container */
+    int         dump;       /* a STREAM item; else an exec template */
+    int         post;       /* exec: also runs after the capture */
+    /* Outputs: an exec template's runs (template_exec), the log of each
+     * appended. A dump's outcome is its STREAM item's. */
+    int         pre_ran, pre_ok, post_ran, post_ok;
+    char       *log;        /* malloc'd; the core frees it */
+    size_t      log_len;
+} sp_template_run_t;
+
 /* Per-item incremental request and result. */
 typedef enum {
     SP_READ_FULL = 0,      /* every allocated byte is read */
@@ -451,6 +475,15 @@ typedef struct sp_provider_ops {
      * Read-only, needs no session. *out freed with sp_unit_probe_free.
      * NULL when the provider cannot say (libvirt: section 10). */
     status_t (*unit_probe)(sp_ctx_t *ctx, const char *unit_id, sp_unit_probe_t **out);
+    /* Database templates (sp_template_run_t). template_exec runs an exec
+     * template's pre (post 0) or post run to its end inside the unit,
+     * before begin and after it, and records the outcome and the log in
+     * t; an error means it could not be started, and is in the log too.
+     * templates_set hands a session the unit's templates, which its
+     * STREAM and log items then resolve against; t outlives the session.
+     * NULL: the provider runs no templates. */
+    status_t (*template_exec)(sp_ctx_t *ctx, const char *unit_id, sp_template_run_t *t, int post);
+    status_t (*templates_set)(sp_session_t *s, sp_template_run_t *t, size_t n);
 } sp_provider_ops_t;
 
 /* Names, for unit.json, the API and the index. NULL for a value outside

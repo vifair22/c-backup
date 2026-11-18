@@ -570,6 +570,7 @@ int main(int argc, char *argv[])
     }
     routes_units_init(db, jm);
     routes_databases_init(db);
+    routes_db_actions_init(db);
 
     /*
      * The scheduler submits work through the job manager rather than running

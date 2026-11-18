@@ -60,6 +60,18 @@ cb() { "$CLI" --socket "$SOCK" "$@"; }
 
 mkdir -p "$WORK/snap" "$WORK/pool/app/a"
 echo alpha > "$WORK/snap/a.txt"
+# A live PostgreSQL data directory for the database templates (D2): the
+# signature (PG_VERSION, global/pg_control, base/) and postmaster.pid. And
+# the engine's tools as the template scripts call them, on the helper's
+# PATH: the fake provider has no container, so a template runs locally.
+mkdir -p "$WORK/pgsnap/global" "$WORK/pgsnap/base/1" "$WORK/pool/app/d" "$WORK/bin"
+echo 16 > "$WORK/pgsnap/PG_VERSION"
+head -c 8192 /dev/zero > "$WORK/pgsnap/global/pg_control"
+head -c 8192 /dev/zero > "$WORK/pgsnap/base/1/1259"
+printf '42\n%s\n' "$WORK/pgsnap" > "$WORK/pgsnap/postmaster.pid"
+printf '#!/bin/sh\necho "-- fake dump as $4 ($*)"\necho "dumped" >&2\n' > "$WORK/bin/pg_dumpall"
+printf '#!/bin/sh\necho "PostgreSQL 16.4 (fake) $*"\n' > "$WORK/bin/psql"
+chmod 0755 "$WORK/bin/pg_dumpall" "$WORK/bin/psql"
 # The tree root as read: a mode and a time no staging directory has (B168).
 chmod 0751 "$WORK/snap"
 touch -d @1500000000 "$WORK/snap"
@@ -76,6 +88,8 @@ cat > "$WORK/units.json" <<EOF
   "disks":[{"id":"vda","size":8589934592,"runs":[{"off":0,"len":8589934592,"kind":"data","seed":9}]}]},
  {"id":"c","name":"cbk-uat-c","state":"running","caps":["quiesce"],
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}],"probe_fail":true},
+ {"id":"d","name":"cbk-uat-d","state":"running","caps":["quiesce","snapshot"],
+  "trees":[{"id":"pg","read_root":"$WORK/pgsnap","path":"$WORK/pool/app/d","source":"$WORK/pool/app/d"}]},
  {"id":"p","name":"prod-db","state":"running",
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"secret"}]}
 ]}
@@ -113,6 +127,9 @@ allow = fake:cbk-uat-*
 
 [snapshot]
 dir_domains = $WORK/pool
+
+[db]
+allow_templates = pg-dumpall
 EOF
 
 echo "policy"
@@ -224,7 +241,7 @@ contains "and the job failed" '"state":"failed"' "$(cb jobs --limit 5)"
 cb schedule remove 1 "$SID" >/dev/null
 
 echo "the helper arrives"
-"$HELPER" --policy "$WORK/policy.ini" > "$WORK/helper.log" 2>&1 &
+PATH="$WORK/bin:$PATH" "$HELPER" --policy "$WORK/policy.ini" > "$WORK/helper.log" 2>&1 &
 HELPER_PID=$!
 for _ in $(seq 1 50); do [ -S "$HSOCK" ] && break; sleep 0.1; done
 if [ ! -S "$HSOCK" ]; then echo "helper did not start"; cat "$WORK/helper.log"; exit 1; fi
@@ -366,6 +383,63 @@ if command -v curl >/dev/null 2>&1; then
           -d '{"provider":"fake","all":true,"pausescope":"job"}')
     contains "and in a units job" "unknown key 'pausescope'" "$OUT"
 fi
+
+echo "database templates"
+# D2 (db-detection.md 7.2 to 7.4): a unit's finding previewed through the
+# helper's db.probe, enabled, and run by the next backup as a dump hook,
+# stored at .cbackup-unit/hooks/<template>.dump; a template the helper's
+# policy does not allow is refused with the line to add.
+OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
+contains "a unit with a live PostgreSQL backs up" '"state":"completed"' "$OUT"
+contains "and the finding is reported" '"engine":"postgres"' "$OUT"
+contains "captured from a snapshot" '"coverage":"covered-quiesced"' "$OUT"
+FID=$(printf '%s' "$OUT" | sed -n 's/.*"findings":\[{"id":\([0-9]*\).*/\1/p')
+check "with its id" yes "$([ -n "$FID" ] && echo yes || echo no)"
+OUT=$(cb db preview 1 "$FID")
+contains "preview names the template" '"template":"pg-dumpall"' "$OUT"
+contains "the exact argv the helper builds" 'exec pg_dumpall --clean --if-exists -U' "$OUT"
+contains "where its output goes" '"output":".cbackup-unit/hooks/pg-dumpall.dump"' "$OUT"
+contains "the probe ran in the helper" 'PostgreSQL 16.4 (fake)' "$OUT"
+contains "and verified it" '"verified":true' "$OUT"
+contains "the policy allows it" '"allowed":true' "$OUT"
+OUT=$(cb db preview 1 "$FID" --template pg-dump --param user=postgres --param database=app)
+contains "another template previews, though the policy would refuse it" '"allowed":false' "$OUT"
+contains "with the line to add" '"policy_line":"[db] allow_templates = pg-dumpall, pg-dump"' "$OUT"
+contains "and the argv from its params" '"argv":["pg_dump","-Fc","-Z0","-U","postgres","app"]' "$OUT"
+OUT=$(cb db enable 1 "$FID" --template pg-dump --param user=postgres --param database=app 2>&1); RC=$?
+check    "enabling what the policy refuses fails" 1 "$RC"
+contains "and returns the policy line instead" '[db] allow_templates = pg-dumpall, pg-dump' "$OUT"
+OUT=$(cb db enable 1 "$FID" --template pg-dump --param user=Robert --param database=app 2>&1); RC=$?
+check    "a parameter outside its grammar is refused" 1 "$RC"
+contains "naming the grammar" '[a-z_][a-z0-9_]{0,62}' "$OUT"
+OUT=$(cb db enable 1 "$FID" --template redis-rdb 2>&1); RC=$?
+check    "a template for another engine is refused" 1 "$RC"
+OUT=$(cb db enable 1 "$FID" --template pg-dumpall)
+contains "enable records the template" '"state":"enabled"' "$OUT"
+contains "and who chose it" '"decided_by":"local socket"' "$OUT"
+OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
+contains "the next backup runs it" '"state":"completed"' "$OUT"
+contains "and the finding is covered by it" '"coverage":"covered-application"' "$OUT"
+SNAP=$(printf '%s' "$OUT" | sed -n 's/.*"snapshot_id":\([0-9]*\).*/\1/p')
+OUT=$(cb unit restore 1 "$SNAP" "$WORK/outd")
+contains "the unit snapshot restores" '"state":"completed"' "$OUT"
+contains "the dump is in it" '-- fake dump as' "$(cat "$WORK/outd/.cbackup-unit/hooks/pg-dumpall.dump" 2>/dev/null)"
+contains "as the template's own user" 'postgres' "$(cat "$WORK/outd/.cbackup-unit/hooks/pg-dumpall.dump" 2>/dev/null)"
+contains "with its log" 'exit status 0' "$(cat "$WORK/outd/.cbackup-unit/hooks/pg-dumpall.log" 2>/dev/null)"
+contains "unit.json says how the database was captured" '"template":{"name":"pg-dumpall","ok":true,"dump":".cbackup-unit/hooks/pg-dumpall.dump"}' \
+    "$(cat "$WORK/outd/.cbackup-unit/unit.json" 2>/dev/null)"
+contains "the choice is journalled" 'pg-dumpall enabled with params {} by local socket' "$(cb journal 1)"
+# A dump that fails is left out, with a warning, and the finding keeps the
+# coverage the capture itself achieved.
+printf '#!/bin/sh\necho "half a dump"\necho "connection refused" >&2\nexit 2\n' > "$WORK/bin/pg_dumpall"
+OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
+contains "a failed dump does not fail the unit" '"state":"completed"' "$OUT"
+contains "it is named as a failed dump" 'dump(s) failed' "$OUT"
+contains "and the coverage is the capture's" '"coverage":"covered-quiesced"' "$OUT"
+OUT=$(cb db dismiss 1 "$FID" --reason "test data")
+contains "dismiss stops it" '"state":"dismissed"' "$OUT"
+OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
+lacks    "a dismissed finding runs nothing" 'dump(s) failed' "$OUT"
 
 echo "a daemon killed mid-backup"
 # B169: the helper held the backup's export hold until its own restart or

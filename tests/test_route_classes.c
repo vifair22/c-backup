@@ -85,6 +85,10 @@ static const decided_t DECIDED[] = {
     { API_POST,   "/repos/1/units/fake/u1/detect",            C },
     { API_POST,   "/repos/1/snapshots/2/unit/restore",        C },
     { API_POST,   "/repos/1/snapshots/2/unit/export",         C },
+    /* Database findings: DB-only edits; preview writes nothing. */
+    { API_POST,   "/repos/1/databases/2/preview",             C },
+    { API_POST,   "/repos/1/databases/2/enable",              C },
+    { API_POST,   "/repos/1/databases/2/dismiss",             C },
 };
 #define NDECIDED (sizeof(DECIDED) / sizeof(DECIDED[0]))
 
@@ -214,6 +218,7 @@ static void test_every_repo_path_write_resolves_to_its_decision(void **state)
     t = routes_units_paths(&n);
     check_table(srv, t, n, seen);
     t = routes_databases_paths(&n);
+    t = routes_db_actions_paths(&n);
     check_table(srv, t, n, seen);
     for (size_t i = 0; i < NDECIDED; i++) {
         if (seen[i]) continue;
