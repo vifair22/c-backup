@@ -514,6 +514,8 @@ static void test_qemu_nbd_error_reported(void **state)
  * libvirt connection or threads with the suite.
  */
 #define QGA_FREEZE_S 40
+/* The third freeze (B206): slower than a 1 s watchdog, under CPU load. */
+#define QGA_SLOW_S 4
 
 static const char *qga_kernel(void)
 {
@@ -591,12 +593,12 @@ static void test_freeze_killed_helper(void **state)
     snprintf(xml, sizeof(xml),
         "<domain type='kvm'><name>%s</name><uuid>" UUID4 "</uuid><memory unit='MiB'>256</memory><vcpu>1</vcpu>"
         "<os><type arch='x86_64' machine='pc'>hvm</type><kernel>%s</kernel><initrd>%s/qga/initrd.img</initrd>"
-        "<cmdline>console=ttyS0 panic=-1 quiet qga_freeze_s=%d</cmdline></os><features><acpi/></features><devices>"
+        "<cmdline>console=ttyS0 panic=-1 quiet qga_freeze_s=%d,0,%d</cmdline></os><features><acpi/></features><devices>"
         "<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='%s/qga/vda.img'/>"
         "<target dev='vda' bus='virtio'/></disk>"
         "<serial type='file'><source path='%s/qga/console.log'/><target port='0'/></serial>"
         "<channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>"
-        "</devices></domain>", V4, kernel, D, QGA_FREEZE_S, D, D);
+        "</devices></domain>", V4, kernel, D, QGA_FREEZE_S, QGA_SLOW_S, D, D);
     put(pf("%s/qga/dom.xml", D), xml, strlen(xml));
     sh(pf("virsh -q -c '%s' define '%s/qga/dom.xml' >/dev/null && virsh -q -c '%s' start %s >/dev/null", URI, D, URI, V4));
     /* Booted, and the agent answering libvirt. */
@@ -688,6 +690,47 @@ static void test_freeze_killed_helper(void **state)
     assert_true(res.units[0].freeze_ms > 0);              /* in the job result too */
     int64_t snap = res.units[0].snapshot_id;
     unit_backup_result_free(&res);
+
+    /*
+     * B206: a 1 s watchdog, a guest agent that takes QGA_SLOW_S over the
+     * freeze, and every CPU busy. The thaw goes at the deadline, fixed when
+     * the freeze was asked for, however late the watchdog's thread would
+     * have started; it is answered when the agent is free, and the window
+     * ends there, not after the begin. The load is bounded (timeout) and
+     * stopped below whatever happens.
+     */
+    unsigned keep_to = pol.vm_freeze_timeout_s;
+    pol.vm_freeze_timeout_s = 1;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    /* --foreground: timeout otherwise puts each loop in a process group of
+     * its own, out of reach of the kill below. */
+    if (system(pf("setsid sh -c 'for i in $(seq %ld); do timeout --foreground 60 sh -c \"while :; do :; done\" & done; "
+                  "wait' >/dev/null 2>&1 & echo $! > '%s/spin.pid'", ncpu > 0 ? ncpu * 2 : 8, D)) != 0)
+        fail_msg("cannot start the CPU load");
+    st = backup(V4, &res);
+    pol.vm_freeze_timeout_s = keep_to;
+    FILE *pf_ = fopen(pf("%s/spin.pid", D), "r");
+    long spin = 0;
+    if (pf_) { if (fscanf(pf_, "%ld", &spin) != 1) spin = 0; fclose(pf_); }
+    if (spin > 0) kill(-(pid_t)spin, SIGTERM);
+    if (st != OK) print_message("the slow freeze's backup: %s\n", res.n ? res.units[0].error : err_msg());
+    assert_int_equal(st, OK);
+    assert_int_equal(res.units[0].achieved, SP_CONSIST_CRASH);
+    const char *w = NULL;
+    for (unsigned k = 0; k < res.units[0].n_warnings && !w; k++)
+        if (strstr(res.units[0].warnings[k], "freeze held past 1 s")) w = res.units[0].warnings[k];
+    if (!w) fail_msg("no watchdog warning; first: %s", res.units[0].warning);
+    print_message("%s\n", w);
+    const char *went = strstr(w, "thaw went at ");
+    assert_non_null(went);
+    long sent = strtol(went + 13, NULL, 10);
+    assert_true(sent >= 1000 && sent <= 1500);
+    /* The window ends at the watchdog's answered thaw: the agent's freeze
+     * plus a little, never the begin that followed. */
+    assert_true(res.units[0].freeze_ms >= (uint64_t)QGA_SLOW_S * 1000 - 500);
+    assert_true(res.units[0].freeze_ms <= (uint64_t)QGA_SLOW_S * 1000 + 3000);
+    unit_backup_result_free(&res);
+
     if (system(pf("virsh -q -c '%s' destroy %s >/dev/null 2>&1", URI, V4)) != 0) { /* already off */ }
     undefine(UUID4);
     restore_opts_t ro;

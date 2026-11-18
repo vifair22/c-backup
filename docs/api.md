@@ -1126,6 +1126,16 @@ stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it, and journalled then with that message:
 a daemon that was killed had no chance to journal it itself.
 
+A job whose end cannot be written, because `state.db`'s filesystem is full,
+say, is not left reading `running`. Its end (`state`, `error`, `ended`, its
+`result` and final progress) is kept in the daemon's memory, and `/jobs`,
+`/jobs/<id>` and the stream show it from there, with `"end_unrecorded":true`
+on the record while the table does not have it yet. It is written, with its
+journal entry, once the database takes writes again: retried with a backoff
+of 1 to 30 seconds, and straight away whenever another job's end is
+written. A daemon that stops before then records the job as interrupted at
+its next start, as above, and logs the end it could not write.
+
 A journal entry's `source` is the job's origin: `api`, `startup`, `register`, or
 `schedule` with the message starting `schedule <id>`.
 
@@ -1133,7 +1143,7 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `dups_dropped`, `dups_kept` and `index_relocated` (OWN-22 duplicate copies dropped behind a confirmed indexed copy, kept because the indexed copy could not be confirmed, and index rows moved off such a copy onto a proven one), `packs_unwalkable`, `unwalkable` (first 16, `{"pack","reason"}`), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` or `packs_unwalkable` is non-zero |
+| gc | `dry_run`, `reachable`, `objects_swept` (objects removed from the index, or that would be), `bytes_freed` (stored bytes compaction removed from packs, only what it finished when it fails part way; on a dry run, what sweeping would make reclaimable), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `content_missing` (file content a tree names that the repository does not hold, a chunk list included; nothing beneath it can be kept alive), `dups_dropped`, `dups_kept` and `index_relocated` (OWN-22 duplicate copies dropped behind a confirmed indexed copy, kept because the indexed copy could not be confirmed, and index rows moved off such a copy onto a proven one), `packs_unwalkable`, `unwalkable` (first 16, `{"pack","reason"}`), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` or `packs_unwalkable` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
 | reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten), `pack_mark` (the lowest pack number never issued, as `<repo>/pack-ids` now holds it), `pack_ids_repaired` (`true` when that file was missing, damaged or behind the packs on disk or the index, and was rewritten) |
 
@@ -1142,7 +1152,10 @@ A backup's `result` has its counts (`snapshot_id`, `files`, `dirs`,
 `trees_new`, `trees_reused`, `store_workers`), the files it left out, and
 what it wrote into the repository, in bytes. `store_workers` is the number
 of chunk workers the backup used for files over 16 MiB (1 when every chunk
-was stored on the backup thread).
+was stored on the backup thread). A failed backup has no `result`, except
+one that wrote its snapshot record and then could not commit the index
+rows: `{"snapshot_id":12,"indexed":false}`, with an error naming the
+snapshot and how it gets indexed (Manual section 6.3, step 5).
 
 A regular file the scan found and the store could not read is left out of
 the snapshot entirely: not in its trees, not in the index, not in `files`.
@@ -1203,7 +1216,7 @@ is counted twice. The state database is not counted. The same figures are
 logged after the backup's phase profile.
 
 Gc and replicate also put a one-line summary in their journal entry, such
-as `swept 12 objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale
+as `swept 12 objects, 40960 bytes freed; 1 pack rewritten, 0 deleted; 0 stale
 temp files removed` or `target already up to date (3 snapshots present)`.
 A verify that passes journals its run's totals, such as `deep verify (check
 only), run 12: 53 checked, 52 ok, 0 repaired, 1 recoverable (1 of them pack
@@ -1557,9 +1570,9 @@ it); a unit outside it is not listed and cannot be described or backed up.
 | GET | `/repos/<id>/units` | Units with history here: last snapshot, its level, how many, paginated by name |
 | GET | `/repos/<id>/units/<p>/<u>/snapshots` | That unit's snapshots, newest first, each with its level and items (`read_mode`, `reason`, `bytes_read`) |
 | GET/PUT | `/repos/<id>/units/<p>/<u>/policy` | Per-unit policy: `retention.keep_*` keys over the repository's; `capture.exclude` (patterns on recorded paths, one per line, applied only when set); `capture.group` (units captured together under `pause_scope: group`); `null` or `""` drops one; GET shows the unit's own and what is in force. PUT takes a unit with snapshots in the repository (under their key), or one its provider lists now and `units.allow` takes (keyed by its id); otherwise 404, or 403 outside `units.allow`, or 409 when its provider cannot be asked |
-| GET | `/repos/<id>/units/<p>/<u>/checkpoints` | The unit's incremental chain (vm-backup.md 5.8): `incremental` (`enabled`, `disabled_reason` and `disabled_at` after a failed audit, `last_audit_at`, `audit_days`, `delta_full_pct`) and `tokens`, one per disk: `item`, `checkpoint`, the `snapshot` it describes, `usable`, `identity`, `created_at` |
-| POST | `/repos/<id>/units/<p>/<u>/reset-incremental` | After a failed bitmap audit: incrementals back on for the unit, every token made unusable so the next backup is a full read under a new checkpoint (the old one is retired when it commits). Journalled. Answers `unit_key` and `was_disabled`, the reason they were off |
-| POST | `/repos/<id>/units/backup` | `{"provider":"fake","all":true,"exclude":["x*"]}` or `{"provider":"fake","units":["a"]}`, optional `"require":"crash"` (the default) and `"pause_scope":"unit"` (the default; a `units` schedule stores and honours it too, `--pause-scope` from the CLI; any other key is refused), `"group"` (units sharing a `capture.group` captured together) or `"job"` (every unit at one instant); 202 with a job. The job fails when any unit fails, and its result lists each unit's outcome and snapshot |
+| GET | `/repos/<id>/units/<p>/<u>/checkpoints` | The unit's incremental chain (vm-backup.md 5.8): `incremental` (`enabled`, `disabled_reason` and `disabled_at` after a failed audit, `last_audit_at`, `audit_days`, `delta_full_pct`) and `tokens`, one per disk: `item`, `checkpoint`, the `snapshot` it describes, `usable`, `identity`, `created_at`. A unit this repository has no snapshot or chain of must be one its provider lists now, as for a policy write: 404 otherwise (an unknown or disabled provider, a unit it does not list), 403 outside `units.allow` |
+| POST | `/repos/<id>/units/<p>/<u>/reset-incremental` | After a failed bitmap audit: incrementals back on for the unit, every token made unusable so the next backup is a full read under a new checkpoint (the old one is retired when it commits). Journalled. Answers `unit_key` and `was_disabled`, the reason they were off. Refused like `checkpoints` for a unit nothing knows of |
+| POST | `/repos/<id>/units/backup` | `{"provider":"fake","all":true,"exclude":["x*"]}` or `{"provider":"fake","units":["a"]}`, optional `"require":"crash"` (the default) and `"pause_scope":"unit"` (the default; a `units` schedule stores and honours it too, `--pause-scope` from the CLI; any other key is refused), `"group"` (units sharing a `capture.group` captured together) or `"job"` (every unit at one instant); 202 with a job. The job fails when any unit fails, and its result lists each unit's outcome and snapshot, `freeze_ms` when it was frozen, and its `warning` (the first, or the one that outranks the rest) with `warnings`, every one of them; the job's own warning names the first and how many more there are |
 | POST | `/repos/<id>/snapshots/<sid>/unit/restore` | `{"mode":"files","dest":"/abs/dir"}`, the whole snapshot with each disk as a sparse raw file; or `{"mode":"item","item":"vda","dest":"/abs/file","format":"raw"}`, one item, written through `<dest>.cbk-partial` and never over an existing path; or `{"mode":"unit","replace":true}` (in place: stopped, staged, swapped, the old data moved aside) or `{"mode":"unit","name":"N","target_root":"/abs"}` (a new unit with its data under the target root), with optional `pin_digest`, `start`, `keep_macs`; the definition is re-created through the helper. 202 with a job |
 
 A retention pass (`POST /repos/<id>/gfs`) runs once per retention group: the

@@ -220,9 +220,12 @@ void           exports_tick(void);
 void           exports_shutdown(void);
 
 /* Record an operation in a repo's journal. Best effort by design. */
-void journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
-                    const char *operation, const char *result,
-                    int64_t duration_ms, const char *message);
+/* 0 when recorded, -1 when not (logged). Most callers ignore it: failing
+ * to journal must not fail what is journalled. A job's end is the
+ * exception, which keeps the entry and its state together (B159, B196). */
+int journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
+                   const char *operation, const char *result,
+                   int64_t duration_ms, const char *message);
 
 /* Schedule CRUD. Repo-scoped sub-handlers, dispatched from repos.c. */
 struct scheduler;

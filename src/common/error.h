@@ -78,3 +78,35 @@ static inline status_t _set_error_with_errno(status_t code,
     return code;
 }
 #define set_error_errno(code, ...) _set_error_with_errno((code), __VA_ARGS__)
+
+/* Put context in front of the message a deeper call already set, keeping
+ * that message: the deepest function says what failed, and a caller that
+ * wants to say where adds to it rather than replacing it (B194). With no
+ * message set, the context alone.
+ *   return set_error_wrap(ERR_IO, "index_nodes: insert");
+ *   -> "index_nodes: insert: database or disk is full (...)"           */
+static inline status_t _set_error_wrap(status_t code, const char *fmt, ...) {
+    char ctx[ERR_MSG_MAX / 4];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(ctx, sizeof(ctx), fmt, ap);
+    va_end(ap);
+    if (n < 0) return code;
+    size_t clen = strlen(ctx);
+    size_t olen = strlen(_err_buf);
+    if (olen == 0) {
+        memcpy(_err_buf, ctx, clen + 1);
+        return code;
+    }
+    /* "ctx: old", the old message cut short if the two do not fit. */
+    if (clen + 2 >= ERR_MSG_MAX) clen = ERR_MSG_MAX - 3;
+    size_t room = ERR_MSG_MAX - 1 - clen - 2;
+    if (olen > room) olen = room;
+    memmove(_err_buf + clen + 2, _err_buf, olen);
+    _err_buf[clen + 2 + olen] = '\0';
+    memcpy(_err_buf, ctx, clen);
+    _err_buf[clen] = ':';
+    _err_buf[clen + 1] = ' ';
+    return code;
+}
+#define set_error_wrap(code, ...) _set_error_wrap((code), __VA_ARGS__)

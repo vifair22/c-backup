@@ -121,6 +121,13 @@ extern volatile int fault_full_errno;
 extern volatile int fault_full_skip;
 extern volatile int fault_full_count;
 extern volatile int fault_full_hits;
+/*
+ * With this set, an fwrite the full disk takes is not failed by the wrapper:
+ * the stream's descriptor is pointed at /dev/full and the real fwrite runs,
+ * so glibc's own handling of ENOSPC, the buffer it drops and the short count
+ * it returns, is what the caller meets (B197). Cleared by fault_full_disarm.
+ */
+extern volatile int fault_full_devfull;
 extern int __real_fclose(FILE *);
 extern int __real_close(int);
 extern int __real_renameat(int, const char *, int, const char *);

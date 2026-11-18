@@ -349,7 +349,9 @@ void store_set_pack_commit_cb(store_t *st, store_pack_commit_fn cb, void *user);
  * complete naming objects the index did not hold.
  */
 status_t store_emit_pack_commit(store_t *st, const pack_commit_info_t *info);
-void     store_pack_commit_failed(void);
+/* why: the cause, carried into the seal's error (B194); NULL when none is
+ * known. */
+void     store_pack_commit_failed(const char *why);
 
 /*
  * Called when a pack file is removed or about to be replaced wholesale, so

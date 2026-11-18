@@ -123,19 +123,17 @@ void job_manager_set_alerts(job_manager_t *jm, int enabled)
  * daemon queued itself ("startup", "register"). Every entry used to say
  * "daemon", so a scheduled run and a manual one could not be told apart.
  */
-static void journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
-                        const char *origin, const char *action, const char *outcome,
-                        int64_t took_ms, const char *message)
+static int journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
+                       const char *origin, const char *action, const char *outcome,
+                       int64_t took_ms, const char *message)
 {
-    if (schedule_id <= 0) {
-        journal_record(db, repo_id, origin && *origin ? origin : "api", action,
-                       outcome, took_ms, message);
-        return;
-    }
+    if (schedule_id <= 0)
+        return journal_record(db, repo_id, origin && *origin ? origin : "api", action,
+                              outcome, took_ms, message);
     char msg[ERR_MSG_MAX + 64];
     snprintf(msg, sizeof(msg), "schedule %lld%s%s", (long long)schedule_id,
              message && *message ? ": " : "", message ? message : "");
-    journal_record(db, repo_id, "schedule", action, outcome, took_ms, msg);
+    return journal_record(db, repo_id, "schedule", action, outcome, took_ms, msg);
 }
 
 /* See job_manager_start. Runs before any worker exists, so nothing else is
@@ -283,7 +281,7 @@ static void set_job_state(job_manager_t *jm, int64_t job_id,
 
 /*
  * A job's end: its journal entry and its final state, in one transaction,
- * the entry first (B159).
+ * the entry first (B159), with its result and final progress (B196).
  *
  * The state used to be written first and the entry after it, as two
  * statements, so a client polling the job saw "completed" and could read
@@ -294,29 +292,281 @@ static void set_job_state(job_manager_t *jm, int64_t job_id,
  * it a second time as interrupted. Every handle shares one connection, so
  * the order inside the transaction is what a concurrent reader sees.
  *
- * The writes inside go through db_write and join this transaction (B157).
+ * An end that cannot be written - state.db's filesystem is full - is kept
+ * in memory instead and written later (B196). It used to be logged and
+ * lost: the job read "running" until the next start called it interrupted,
+ * and the reason it failed, often the full disk itself, was nowhere a
+ * client could see. Now /jobs and the progress stream show the end from
+ * memory (job_end_unrecorded) and it is retried, with a backoff, by an
+ * idle worker and after every end that does get written. Nothing changes
+ * at a restart: an end still unwritten then is a job the start-up recovery
+ * records as interrupted, as before.
  */
+typedef struct pending_end {
+    struct pending_end *next;
+    cutils_db_t *db;
+    int64_t      job_id, repo_id, schedule_id;
+    const char  *origin, *state, *outcome;   /* string literals */
+    char        *action, *error, *message, *result;
+    int64_t      took_ms;
+    time_t       ended;
+    /* The final progress, written with the end when has_progress. */
+    int          has_progress;
+    uint64_t     bytes_done, bytes_total, done, total;
+    char         phase[192];
+} pending_end_t;
+
+/*
+ * Process-wide rather than per manager, so the routes reach it with the
+ * handle they already have; keyed by handle for the suites that run several
+ * managers. g_pend_mu is never held while taking jm->mu, nor across a
+ * database write.
+ */
+static pthread_mutex_t g_pend_mu = PTHREAD_MUTEX_INITIALIZER;
+static pending_end_t  *g_pend;
+static int64_t         g_pend_due_ms;      /* next retry, mono_ms; 0 now */
+static int             g_pend_backoff_ms;
+static int             g_pend_flushing;
+
+#define PEND_BACKOFF_MIN_MS 1000
+#define PEND_BACKOFF_MAX_MS 30000
+
+static int64_t mono_ms(void);
+
+static void pend_free(pending_end_t *e)
+{
+    if (!e) return;
+    free(e->action);
+    free(e->error);
+    free(e->message);
+    free(e->result);
+    free(e);
+}
+
+static char *dup_or_null(const char *s)
+{
+    return s ? strdup(s) : NULL;
+}
+
+/* NULL when out of memory, which the caller treats as an end it could not
+ * keep: logged, and left to the start-up recovery. */
+static pending_end_t *pend_new(cutils_db_t *db, int64_t job_id, const char *state,
+                               const char *error, int64_t repo_id, int64_t schedule_id,
+                               const char *origin, const char *action, const char *outcome,
+                               int64_t took_ms, const char *message, const char *result)
+{
+    pending_end_t *e = calloc(1, sizeof(*e));
+    if (!e) return NULL;
+    e->db = db;
+    e->job_id = job_id;
+    e->repo_id = repo_id;
+    e->schedule_id = schedule_id;
+    e->origin = origin;
+    e->state = state;
+    e->outcome = outcome;
+    e->action = dup_or_null(action ? action : "");
+    e->error = dup_or_null(error);
+    e->message = dup_or_null(message);
+    e->result = dup_or_null(result);
+    e->took_ms = took_ms;
+    e->ended = time(NULL);
+    if (!e->action || (error && !e->error) || (message && !e->message) ||
+        (result && !e->result)) {
+        pend_free(e);
+        return NULL;
+    }
+    return e;
+}
+
+/* The end in one transaction. 0 when it committed; -1 with the reason in
+ * the error buffer when it did not, having changed nothing. */
+static int write_end(const pending_end_t *e)
+{
+    cutils_db_t *db = e->db;
+    if (db_txn_begin(db) != OK) return -1;
+    char id[32], ended[32];
+    snprintf(id, sizeof(id), "%lld", (long long)e->job_id);
+    snprintf(ended, sizeof(ended), "%lld", (long long)e->ended);
+    int ok = 1;
+    if (e->has_progress) {
+        char bd[32], bt[32], d[32], t[32];
+        snprintf(bd, sizeof(bd), "%llu", (unsigned long long)e->bytes_done);
+        snprintf(bt, sizeof(bt), "%llu", (unsigned long long)e->bytes_total);
+        snprintf(d,  sizeof(d),  "%llu", (unsigned long long)e->done);
+        snprintf(t,  sizeof(t),  "%llu", (unsigned long long)e->total);
+        ok = db_write(db, "UPDATE jobs SET bytes_done = ?, bytes_total = ? WHERE id = ?",
+                      (const char *[]){ bd, bt, id, NULL }, NULL) == 0;
+        /* A job that never reported keeps the empty progress it has. */
+        if (ok && e->phase[0])
+            ok = db_write(db,
+                    "UPDATE jobs SET progress_phase = ?, progress_current = ?,"
+                    " progress_total = ? WHERE id = ?",
+                    (const char *[]){ e->phase, d, t, id, NULL }, NULL) == 0;
+    }
+    if (ok && e->result)
+        ok = db_write(db, "UPDATE jobs SET result = ? WHERE id = ?",
+                      (const char *[]){ e->result, id, NULL }, NULL) == 0;
+    if (ok && e->repo_id > 0)
+        ok = journal_job(db, e->repo_id, e->schedule_id, e->origin, e->action,
+                         e->outcome, e->took_ms, e->message) == 0;
+    /* ended is when the job ended, not when its end was written. */
+    if (ok && e->error)
+        ok = db_write(db, "UPDATE jobs SET state = ?, ended = ?, error = ? WHERE id = ?",
+                      (const char *[]){ e->state, ended, e->error, id, NULL }, NULL) == 0;
+    else if (ok)
+        ok = db_write(db, "UPDATE jobs SET state = ?, ended = ? WHERE id = ?",
+                      (const char *[]){ e->state, ended, id, NULL }, NULL) == 0;
+    if (!ok) {
+        char why[1024];
+        snprintf(why, sizeof(why), "%.1000s", err_msg());
+        db_txn_rollback(db);
+        set_error(ERR_IO, "%s", why);
+        return -1;
+    }
+    return db_txn_commit(db) == OK ? 0 : -1;
+}
+
+/*
+ * Write the ends kept for db, oldest first. Unless force, only once the
+ * backoff has run out. Stops at the first that fails, which sets the next
+ * retry; one that commits resets the backoff. One thread at a time.
+ */
+static void pend_flush(cutils_db_t *db, int force)
+{
+    pthread_mutex_lock(&g_pend_mu);
+    if (g_pend_flushing || (!force && g_pend_due_ms > mono_ms())) {
+        pthread_mutex_unlock(&g_pend_mu);
+        return;
+    }
+    g_pend_flushing = 1;
+    for (;;) {
+        /* The oldest for this handle: the list is newest first. */
+        pending_end_t *e = NULL;
+        for (pending_end_t *p = g_pend; p; p = p->next)
+            if (p->db == db) e = p;
+        if (!e) break;
+        pthread_mutex_unlock(&g_pend_mu);
+        int rc = write_end(e);
+        char why[1024];
+        if (rc != 0) snprintf(why, sizeof(why), "%.1000s", err_msg());
+        err_clear();
+        pthread_mutex_lock(&g_pend_mu);
+        if (rc != 0) {
+            g_pend_backoff_ms = g_pend_backoff_ms == 0 ? PEND_BACKOFF_MIN_MS
+                              : g_pend_backoff_ms * 2 > PEND_BACKOFF_MAX_MS
+                                    ? PEND_BACKOFF_MAX_MS : g_pend_backoff_ms * 2;
+            g_pend_due_ms = mono_ms() + g_pend_backoff_ms;
+            log_debug("job %lld: its end still cannot be recorded: %s; retrying in %d ms",
+                      (long long)e->job_id, why, g_pend_backoff_ms);
+            break;
+        }
+        for (pending_end_t **pp = &g_pend; *pp; pp = &(*pp)->next)
+            if (*pp == e) { *pp = e->next; break; }
+        log_info("job %lld: its end (%s) is recorded now", (long long)e->job_id, e->state);
+        pend_free(e);
+        g_pend_backoff_ms = 0;
+        g_pend_due_ms = 0;
+    }
+    g_pend_flushing = 0;
+    pthread_mutex_unlock(&g_pend_mu);
+}
+
+/* When the next retry for db is due (mono_ms), or 0 when nothing waits. */
+static int64_t pend_due(cutils_db_t *db)
+{
+    int64_t due = 0;
+    pthread_mutex_lock(&g_pend_mu);
+    for (pending_end_t *p = g_pend; p; p = p->next)
+        if (p->db == db) { due = g_pend_due_ms > 0 ? g_pend_due_ms : 1; break; }
+    pthread_mutex_unlock(&g_pend_mu);
+    return due;
+}
+
+/* Record an end, or keep it to retry; takes e. */
+static void end_record(pending_end_t *e)
+{
+    /* Ends are written in order: one queued behind an earlier unwritten
+     * end waits for it, so a job's row never overtakes another's. */
+    int queued = pend_due(e->db) != 0;
+    if (queued) {
+        /* A write is due anyway: try the older ones now rather than at
+         * the timer, and this one straight after if they went in. */
+        pend_flush(e->db, 1);
+        queued = pend_due(e->db) != 0;
+    }
+    if (!queued && write_end(e) == 0) {
+        pend_free(e);
+        return;
+    }
+    if (!queued) {
+        log_error("job %lld: its end (%s%s%.300s) cannot be recorded: %s; it is kept "
+                  "in memory, shown by /jobs, and written once the database takes "
+                  "writes again", (long long)e->job_id, e->state,
+                  e->error ? ": " : "", e->error ? e->error : "", err_msg());
+        err_clear();
+    }
+    pthread_mutex_lock(&g_pend_mu);
+    e->next = g_pend;
+    g_pend = e;
+    if (!queued) {
+        g_pend_backoff_ms = PEND_BACKOFF_MIN_MS;
+        g_pend_due_ms = mono_ms() + g_pend_backoff_ms;
+    }
+    pthread_mutex_unlock(&g_pend_mu);
+}
+
+int job_end_unrecorded(cutils_db_t *db, int64_t job_id, job_end_view_t *out)
+{
+    int found = 0;
+    pthread_mutex_lock(&g_pend_mu);
+    for (pending_end_t *p = g_pend; p; p = p->next) {
+        if (p->db != db || p->job_id != job_id) continue;
+        if (out) {
+            memset(out, 0, sizeof(*out));
+            snprintf(out->state, sizeof(out->state), "%s", p->state);
+            snprintf(out->error, sizeof(out->error), "%s", p->error ? p->error : "");
+            out->ended = (int64_t)p->ended;
+            out->result = p->result ? strdup(p->result) : NULL;
+            if (p->has_progress) {
+                out->has_progress = 1;
+                snprintf(out->phase, sizeof(out->phase), "%s", p->phase);
+                out->done = p->done;
+                out->total = p->total;
+                out->bytes_done = p->bytes_done;
+                out->bytes_total = p->bytes_total;
+            }
+        }
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&g_pend_mu);
+    return found;
+}
+
+unsigned job_ends_unrecorded(cutils_db_t *db)
+{
+    unsigned n = 0;
+    pthread_mutex_lock(&g_pend_mu);
+    for (pending_end_t *p = g_pend; p; p = p->next)
+        if (p->db == db) n++;
+    pthread_mutex_unlock(&g_pend_mu);
+    return n;
+}
+
+/* An end with no progress or result to go with it: a job that never ran. */
 static void finish_job(job_manager_t *jm, int64_t job_id, const char *state,
                        const char *error, int64_t repo_id, int64_t schedule_id,
                        const char *origin, const char *action, const char *outcome,
                        int64_t took_ms, const char *message)
 {
-    /* error and message must not be the thread's error buffer (err_msg()),
-     * which a failed begin overwrites; the worker passes a copy. */
-    int txn = db_txn_begin(jm->db) == OK;
-    if (!txn) {
-        log_warn("job %lld: cannot open a transaction for its end (%s); recording "
-                 "the journal entry and then the state", (long long)job_id, err_msg());
-        err_clear();
+    pending_end_t *e = pend_new(jm->db, job_id, state, error, repo_id, schedule_id,
+                                origin, action, outcome, took_ms, message, NULL);
+    if (!e) {
+        log_error("job %lld: out of memory recording its end (%s); the next start "
+                  "records it as interrupted", (long long)job_id, state);
+        return;
     }
-    if (repo_id > 0)
-        journal_job(jm->db, repo_id, schedule_id, origin, action, outcome, took_ms,
-                    message);
-    set_job_state(jm, job_id, state, error);
-    if (txn && db_txn_commit(jm->db) != OK) {
-        log_error("job %lld: cannot commit its end: %s", (long long)job_id, err_msg());
-        err_clear();
-    }
+    end_record(e);
 }
 
 /*
@@ -766,6 +1016,21 @@ static void *worker_main(void *arg)
                 pthread_mutex_lock(&jm->mu);
                 continue;
             }
+            /* An end that could not be written is retried by an idle
+             * worker once its backoff runs out, and the wait below is
+             * bounded by that time (B196). */
+            int64_t pdue = pend_due(jm->db);
+            if (pdue > 0 && pdue <= mono_ms()) {
+                pthread_mutex_unlock(&jm->mu);
+                pend_flush(jm->db, 0);
+                pthread_mutex_lock(&jm->mu);
+                /* Still due means another thread is flushing: wait for the
+                 * next backoff step rather than spin on it. */
+                pdue = pend_due(jm->db);
+                if (pdue > 0 && pdue <= mono_ms()) pdue = mono_ms() + PEND_BACKOFF_MIN_MS;
+                else continue;
+            }
+            if (pdue > 0 && (wake_ms == 0 || pdue < wake_ms)) wake_ms = pdue;
             /* Nothing queued, or everything queued belongs to a repo another
              * worker is busy with: both resolve on the next signal. A job
              * deferred behind a request has a retry due, and nothing signals
@@ -811,45 +1076,6 @@ static void *worker_main(void *arg)
                           : slot.fn(slot.arg, &ws->cancel, on_progress, &pc);
         if (slot.locked) unlock_set(&slot);
 
-        /* The job's own account of what it did, and the final byte count,
-         * which the throttle may not have written. Before the final state,
-         * so a client that sees the job finished also sees its result.
-         *
-         * The final item count as well, for the same reason. The throttle
-         * writes a phase's first report and then at most every 250 ms, so a
-         * phase finishing inside that window was left at its first count:
-         * /jobs said trees 0/171 for a job whose closing log line, which
-         * reads the latest report, said 170/171 (B093). Both now come from
-         * the same last report. */
-        {
-            char id[32], bd[32], bt[32], d[32], t[32];
-            snprintf(id, sizeof(id), "%lld", (long long)slot.job_id);
-            snprintf(bd, sizeof(bd), "%llu", (unsigned long long)pc.bytes_done);
-            snprintf(bt, sizeof(bt), "%llu", (unsigned long long)pc.bytes_total);
-            snprintf(d,  sizeof(d),  "%llu", (unsigned long long)pc.seen_done);
-            snprintf(t,  sizeof(t),  "%llu", (unsigned long long)pc.seen_total);
-            /* Three rows that land together, in one transaction. */
-            int wscope = db_write_enter(jm->db);
-            if (db_write(jm->db,
-                    "UPDATE jobs SET bytes_done = ?, bytes_total = ? WHERE id = ?",
-                    (const char *[]){ bd, bt, id, NULL }, NULL) != 0)
-                log_warn("job %s: cannot record its byte count", id);
-            /* A job that never reported keeps the empty progress it has. */
-            if (pc.last_phase[0] && db_write(jm->db,
-                    "UPDATE jobs SET progress_phase = ?, progress_current = ?,"
-                    " progress_total = ? WHERE id = ?",
-                    (const char *[]){ pc.last_phase, d, t, id, NULL }, NULL) != 0)
-                log_warn("job %s: cannot record its final progress", id);
-            if (pc.result && db_write(jm->db,
-                    "UPDATE jobs SET result = ? WHERE id = ?",
-                    (const char *[]){ pc.result, id, NULL }, NULL) != 0)
-                log_warn("job %s: cannot record its result", id);
-            if (db_write_leave(jm->db, wscope, 1) != 0)
-                log_warn("job %s: cannot commit its result", id);
-            free(pc.result);
-            pc.result = NULL;
-        }
-
         /*
          * Journalling happens here rather than in each route because this is
          * the one place that knows how every job actually ended. A route only
@@ -857,9 +1083,6 @@ static void *worker_main(void *arg)
          */
         const char *outcome;
         const char *state;
-        /* A copy: the transaction below may overwrite the error buffer, and
-         * the alert after it still needs the reason. */
-        char detail_buf[ERR_MSG_MAX];
         const char *detail = NULL;
         int cancelled = atomic_load_explicit(&ws->cancel, memory_order_relaxed);
         /* A job that did what it was asked but raised warnings stays
@@ -884,22 +1107,58 @@ static void *worker_main(void *arg)
         } else {
             outcome = "failed";
             state   = "failed";
-            snprintf(detail_buf, sizeof(detail_buf), "%s", err_msg());
-            detail = detail_buf;
+            /* The end is a copy (pend_new): writing it may overwrite the
+             * error buffer, and the alert below still needs the reason. */
+            detail = err_msg();
             log_warn("job %lld (%s) failed: %s",
                      (long long)slot.job_id, slot.action, detail);
+        }
+        char detail_buf[ERR_MSG_MAX];
+        if (detail) {
+            snprintf(detail_buf, sizeof(detail_buf), "%s", detail);
+            detail = detail_buf;
         }
         {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             int64_t took = (int64_t)(now.tv_sec - began.tv_sec) * 1000
                          + (now.tv_nsec - began.tv_nsec) / 1000000;
-            /* A success journalled an empty message, so the entry for a
+            /*
+             * One transaction for everything the end writes (write_end):
+             * the job's own account of what it did, the final byte and item
+             * counts, the journal entry and the state. The result comes
+             * before the state, so a client that sees the job finished also
+             * sees its result. The final item count is the last report's,
+             * not the throttle's last write, which could leave a phase that
+             * finished inside its window at its first count: /jobs said
+             * trees 0/171 for a job whose closing log line said 170/171
+             * (B093).
+             *
+             * A success journalled an empty message, so the entry for a
              * retention pass could not say what it deleted - the one thing
-             * anybody reading a journal of deletions wants. */
-            finish_job(jm, slot.job_id, state, detail, slot.repo_id, slot.schedule_id,
-                       slot.origin, slot.action, outcome, took,
-                       st != OK ? detail : warn_msg ? warn_msg : pc.summary);
+             * anybody reading a journal of deletions wants. A job that
+             * completed with warnings journals "warning" and its warnings;
+             * pend_new copies both, so an end held because it could not be
+             * written (B196) carries them when it finally is.
+             */
+            pending_end_t *e = pend_new(jm->db, slot.job_id, state, detail, slot.repo_id,
+                                        slot.schedule_id, slot.origin, slot.action, outcome,
+                                        took, st != OK ? detail : warn_msg ? warn_msg : pc.summary,
+                                        pc.result);
+            if (e) {
+                e->has_progress = 1;
+                e->bytes_done  = pc.bytes_done;
+                e->bytes_total = pc.bytes_total;
+                e->done        = pc.seen_done;
+                e->total       = pc.seen_total;
+                snprintf(e->phase, sizeof(e->phase), "%s", pc.last_phase);
+                end_record(e);
+            } else {
+                log_error("job %lld: out of memory recording its end (%s); the next "
+                          "start records it as interrupted", (long long)slot.job_id, state);
+            }
+            free(pc.result);
+            pc.result = NULL;
         }
         {
             struct timespec fin;
@@ -1123,6 +1382,22 @@ void job_manager_stop(job_manager_t *jm)
 
     for (int i = 0; i < jm->nworkers; i++)
         pthread_join(jm->workers[i], NULL);
+
+    /* A last try for any end not yet written. What is still unwritten is a
+     * job the next start records as interrupted; its real end is logged
+     * here so it is not lost with the process. */
+    pend_flush(jm->db, 1);
+    pthread_mutex_lock(&g_pend_mu);
+    for (pending_end_t **pp = &g_pend; *pp; ) {
+        pending_end_t *e = *pp;
+        if (e->db != jm->db) { pp = &e->next; continue; }
+        *pp = e->next;
+        log_error("job %lld: its end (%s%s%.300s) was never recorded; the next start "
+                  "records it as interrupted", (long long)e->job_id, e->state,
+                  e->error ? ": " : "", e->error ? e->error : "");
+        pend_free(e);
+    }
+    pthread_mutex_unlock(&g_pend_mu);
 
     free(jm->workers);
     free(jm->running);
