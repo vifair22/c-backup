@@ -1512,6 +1512,11 @@ echo "key directory"
 grep -q '^ENV C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys$' "$(dirname "$0")/../Dockerfile" \
     && ok "the image keeps keys on the state volume" \
     || bad "the image keeps keys on the state volume" "ENV C_BACKUP_SECURITY_KEY_DIR" "absent"
+# B205: a VOLUME line made every container start from the image, the
+# helper's included, create an anonymous volume nothing removed.
+grep -q '^VOLUME' "$(dirname "$0")/../Dockerfile" \
+    && bad "the image declares no anonymous volume" "no VOLUME" "$(grep '^VOLUME' "$(dirname "$0")/../Dockerfile")" \
+    || ok "the image declares no anonymous volume"
 cat > "$WORK/envcfg.yaml" <<EOF
 db:
   path: $WORK/env.db

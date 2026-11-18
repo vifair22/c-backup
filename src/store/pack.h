@@ -509,6 +509,13 @@ typedef struct {
     uint64_t dups_dropped;
     uint64_t dups_kept;
     uint64_t index_relocated;
+    /*
+     * Stored bytes (entries' compressed sizes) of the dead entries this
+     * pass really removed: dropped by a rewrite that was installed, or in
+     * a pack deleted whole. A pass that fails part way counts only what it
+     * finished (B197).
+     */
+    uint64_t bytes_dropped;
 } pack_gc_stats_t;
 
 /*
