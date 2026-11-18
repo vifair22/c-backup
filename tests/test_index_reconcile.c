@@ -904,6 +904,83 @@ static void test_tag_file_tracks_every_edit(void **state)
     assert_string_equal(read_tags_file(), before);
 }
 
+/*
+ * B218: the daemon stopping does not wait for a backup's index. The cancel
+ * arrives as the trees are built, after every object is stored and before
+ * the record is written: the record is still written (the work is kept),
+ * and the index stops at its first row, reported the B195 way, as a power
+ * cut there would leave it. A user's cancel at the same point lets the
+ * index finish: the snapshot is complete.
+ */
+static void cancel_after_trees(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    atomic_int *cancel = ctx;
+    if (phase && strcmp(phase, "trees") == 0 && total > 0 && done == total &&
+        atomic_load(&cancel[1]))
+        atomic_store(&cancel[0], atomic_load(&cancel[1]));
+}
+
+static status_t backup_cancelled_after_trees(int how, backup_result_t *res)
+{
+    static const char *paths[] = { TEST_SRC };
+    atomic_int cancel[2];
+    atomic_init(&cancel[0], 0);
+    atomic_init(&cancel[1], how);
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.cancel = &cancel[0];
+    o.progress_cb = cancel_after_trees;
+    o.progress_ctx = (void *)cancel;
+    memset(res, 0, sizeof(*res));
+    err_clear();
+    status_t st = backup_run(store, db, repo_id, &o, res);
+    assert_int_equal(atomic_load(&cancel[0]), how);
+    return st;
+}
+
+static void test_a_stop_does_not_wait_for_the_index(void **state)
+{
+    (void)state;
+    write_file(TEST_SRC "/a.txt", "stopping\n");
+    write_file(TEST_SRC "/b.txt", "stopping too\n");
+    backup_result_t res;
+    status_t st = backup_cancelled_after_trees(CANCEL_SHUTDOWN, &res);
+    print_message("backup: %s\n", err_msg());
+    assert_int_equal(st, ERR_BUSY);
+    assert_non_null(strstr(err_msg(), "the daemon is stopping"));
+    assert_non_null(strstr(err_msg(), "snapshot 1 was written to the repository"));
+    assert_int_equal(res.snapshot_id, 1);
+    assert_int_equal(res.snapshot_unindexed, 1);
+    backup_result_free(&res);
+    struct stat sb;
+    assert_int_equal(stat(TEST_REPO "/snapshots/1", &sb), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
+
+    /* What the next start does with it. */
+    uint64_t missing = 0;
+    assert_int_equal(index_reconcile_count(db, repo_id, TEST_REPO, &missing), OK);
+    assert_int_equal(missing, 1);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 1);
+    assert_true(scalar("SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = 1") > 0);
+}
+
+static void test_a_user_cancel_lets_the_index_finish(void **state)
+{
+    (void)state;
+    write_file(TEST_SRC "/a.txt", "finishing\n");
+    backup_result_t res;
+    status_t st = backup_cancelled_after_trees(CANCEL_USER, &res);
+    assert_int_equal(st, OK);
+    assert_int_equal(res.snapshot_id, 1);
+    backup_result_free(&res);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 1);
+    assert_true(scalar("SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = 1") > 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -919,6 +996,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_gc_refuses_a_gap_it_cannot_index, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_full_disk_in_index_nodes_reports_the_written_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_full_disk_at_the_snapshot_row_reports_the_written_snapshot, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_stop_does_not_wait_for_the_index, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_user_cancel_lets_the_index_finish, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pruned_top_is_not_missing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_mark_falls_back_to_listing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unreadable_repo_is_skipped, setup, teardown),

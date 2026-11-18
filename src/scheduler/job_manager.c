@@ -4,6 +4,7 @@
 
 #include "db_txn.h"
 #include "lock.h"
+#include "store.h"
 #include "routes.h"
 #include "db_write.h"
 #include "thread_name.h"
@@ -14,6 +15,7 @@
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <time.h>
 #include <stdio.h>
@@ -85,6 +87,7 @@ struct job_manager {
     job_slot_t      queue[JOB_QUEUE_MAX];
     int             head, tail, count;
     int             stopping;
+    int             nlive;      /* workers not yet returned; under mu, cv broadcast at 0 */
     /*
      * One entry per worker: the job it is running, if any.
      *
@@ -1055,10 +1058,24 @@ static void mark_waiting(job_manager_t *jm, int64_t job_id, const char *phase)
         { /* a report, not the job's outcome */ }
 }
 
+static void worker_loop(job_manager_t *jm);
+
+/* The worker's whole life, then a count shutdown can wait on with a
+ * deadline, which a join cannot give (B218). */
 static void *worker_main(void *arg)
 {
-    thread_name("cb-job");
     job_manager_t *jm = arg;
+    worker_loop(jm);
+    pthread_mutex_lock(&jm->mu);
+    jm->nlive--;
+    pthread_cond_broadcast(&jm->cv);
+    pthread_mutex_unlock(&jm->mu);
+    return NULL;
+}
+
+static void worker_loop(job_manager_t *jm)
+{
+    thread_name("cb-job");
 
     /* Each worker claims the first free entry on entry, so it has a stable
      * index, and a stable cancel flag, for the life of the thread. */
@@ -1078,7 +1095,7 @@ static void *worker_main(void *arg)
              * stopping worker never claims one. */
             if (jm->stopping) {
                 pthread_mutex_unlock(&jm->mu);
-                return NULL;
+                return;
             }
             int64_t wake_ms, mark;
             const char *mark_phase = JOB_PHASE_WAITING;
@@ -1398,7 +1415,13 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
         atomic_init(&jm->running[i].cancel, 0);
     jm->nworkers = max_parallel;
     for (int i = 0; i < max_parallel; i++) {
+        pthread_mutex_lock(&jm->mu);
+        jm->nlive++;
+        pthread_mutex_unlock(&jm->mu);
         if (pthread_create(&jm->workers[i], NULL, worker_main, jm) != 0) {
+            pthread_mutex_lock(&jm->mu);
+            jm->nlive--;
+            pthread_mutex_unlock(&jm->mu);
             jm->nworkers = i;
             job_manager_stop(jm);
             return set_error(ERR_IO, "job_manager_start: cannot spawn worker");
@@ -1428,7 +1451,39 @@ static void finish_unstarted(job_manager_t *jm, job_slot_t *taken)
 
 void job_manager_stop(job_manager_t *jm)
 {
-    if (!jm) return;
+    (void)job_manager_stop_within(jm, 0);
+}
+
+/* Until every worker has returned, or the deadline (0: none). 1 when they
+ * all have. */
+static int wait_workers(job_manager_t *jm, unsigned grace_ms)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_MONOTONIC, &until);
+    until.tv_sec  += (time_t)(grace_ms / 1000);
+    until.tv_nsec += (long)(grace_ms % 1000) * 1000000L;
+    if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&jm->mu);
+    int timed_out = 0;
+    while (jm->nlive > 0 && !timed_out) {
+        if (grace_ms == 0) pthread_cond_wait(&jm->cv, &jm->mu);
+        else timed_out = pthread_cond_timedwait(&jm->cv, &jm->mu, &until) == ETIMEDOUT;
+    }
+    int all = jm->nlive == 0;
+    if (!all) {
+        for (int i = 0; i < jm->nworkers; i++)
+            if (jm->running[i].job_id)
+                log_error("job manager: job %lld (repo %lld) did not stop within %.1f s of "
+                          "being cancelled by shutdown", (long long)jm->running[i].job_id,
+                          (long long)jm->running[i].repo_id, (double)grace_ms / 1000.0);
+    }
+    pthread_mutex_unlock(&jm->mu);
+    return all;
+}
+
+status_t job_manager_stop_within(job_manager_t *jm, unsigned grace_ms)
+{
+    if (!jm) return OK;
 
     /*
      * Queued jobs are taken out of the queue and recorded cancelled here;
@@ -1448,10 +1503,13 @@ void job_manager_stop(job_manager_t *jm)
      */
     pthread_mutex_lock(&jm->mu);
     jm->stopping = 1;
-    /* Ask anything in flight to wind up rather than waiting for it. */
+    /* Ask anything in flight to wind up rather than waiting for it. As the
+     * daemon stopping, not a user's cancel: a backup past its snapshot
+     * record stops indexing too (CANCEL_SHUTDOWN, store.h). */
     for (int i = 0; i < jm->nworkers; i++)
         if (jm->running[i].job_id)
-            atomic_store_explicit(&jm->running[i].cancel, 1, memory_order_relaxed);
+            atomic_store_explicit(&jm->running[i].cancel, CANCEL_SHUTDOWN,
+                                  memory_order_relaxed);
     pthread_cond_broadcast(&jm->cv);
     pthread_mutex_unlock(&jm->mu);
 
@@ -1467,6 +1525,12 @@ void job_manager_stop(job_manager_t *jm)
     if (ntaken > 0)
         log_info("job manager: %d queued job(s) cancelled by shutdown", ntaken);
 
+    /* A job that has not stopped by the deadline is still using the
+     * database and its repository, so nothing below may run: the caller
+     * gets the manager back as it is and must not free or reuse it. */
+    if (!wait_workers(jm, grace_ms))
+        return set_error(ERR_BUSY, "running jobs did not stop within %.1f s",
+                         (double)grace_ms / 1000.0);
     for (int i = 0; i < jm->nworkers; i++)
         pthread_join(jm->workers[i], NULL);
 
@@ -1491,6 +1555,7 @@ void job_manager_stop(job_manager_t *jm)
     pthread_mutex_destroy(&jm->mu);
     pthread_cond_destroy(&jm->cv);
     free(jm);
+    return OK;
 }
 
 status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
@@ -1703,7 +1768,8 @@ status_t job_cancel(job_manager_t *jm, int64_t job_id)
     if (!dequeued) {
         for (int i = 0; i < jm->nworkers; i++) {
             if (jm->running[i].job_id == job_id) {
-                atomic_store_explicit(&jm->running[i].cancel, 1, memory_order_relaxed);
+                atomic_store_explicit(&jm->running[i].cancel, CANCEL_USER,
+                                      memory_order_relaxed);
                 flagged = 1;
                 break;
             }

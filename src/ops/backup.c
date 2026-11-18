@@ -2318,6 +2318,19 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
     }
 
     for (uint32_t i = 0; i < p->count; i++) {
+        /*
+         * The daemon stopping does not wait for the index (B218): on a large
+         * tree it takes minutes, and Docker kills a stop after 10 s. The
+         * record is written, so this is the state a power cut here leaves,
+         * which the caller reports (B195) and the next start's reconcile
+         * indexes. A user's cancel still lets the index finish: the
+         * snapshot is done, and cancelling now would only make it slower to
+         * browse.
+         */
+        if (shutdown_requested(p->opts ? p->opts->cancel : NULL)) {
+            db_txn_rollback(p->db);
+            return set_error(ERR_BUSY, "backup cancelled: the daemon is stopping");
+        }
         /* In no tree, so in no index row either: the index is derived from
          * the trees, and a reindex would not bring it back. */
         if (p->links[i].skipped) continue;
