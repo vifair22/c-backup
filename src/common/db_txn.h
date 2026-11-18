@@ -75,7 +75,10 @@ status_t db_txn_begin_bulk(cutils_db_t *db);
 
 /* Commit and release the lock. Releases the lock even when the commit fails:
  * there is nothing the caller can do about it and holding it would wedge every
- * other writer. */
+ * other writer. A failed commit is rolled back first, should SQLite have left
+ * the transaction open, so the caller must not call db_txn_rollback after it.
+ * The error names SQLite's reason ("cannot commit: database or disk is full
+ * (SQLite extended code 13)"), as a failed begin does (B194). */
 status_t db_txn_commit(cutils_db_t *db);
 
 /* Roll back and release the lock. Errors are logged rather than returned,

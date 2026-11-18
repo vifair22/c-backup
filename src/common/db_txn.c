@@ -63,6 +63,10 @@ void db_txn_set_durable_hooks(status_t (*gate)(void), void (*done)(void))
  */
 static _Thread_local int tls_held;
 
+/* The connection this thread has written through while holding the lock,
+ * from the update hook, for sqlite_cause; NULL outside the lock. */
+static _Thread_local sqlite3 *tls_conn;
+
 /* ---- The commit budget (B144-REST) -----------------------------------
  *
  * A COMMIT writes every page the transaction dirtied into the WAL, and on a
@@ -239,15 +243,64 @@ static void write_lock(void)
     }
     pthread_mutex_unlock(&g_ticket_mu);
     tls_held = 1;
+    tls_conn = NULL;
 }
 
 static void write_unlock(void)
 {
     tls_held = 0;
+    /* Only meaningful under the lock: a connection seen in an earlier
+     * transaction may since have been closed. */
+    tls_conn = NULL;
     pthread_mutex_lock(&g_ticket_mu);
     g_now_serving++;
     pthread_cond_broadcast(&g_ticket_cv);
     pthread_mutex_unlock(&g_ticket_mu);
+}
+
+/* ---- SQLite's cause (B194) ----------------------------------------------
+ *
+ * A full state filesystem made every write fail with "cannot commit" and
+ * nothing else: c-utils had SQLite's own message in its error buffer, and
+ * this module replaced it. The cause is the deepest thing that knows, so it
+ * goes into the message here and callers add to it (set_error_wrap).
+ *
+ * The message is c-utils' copy of what sqlite3_errmsg said for the failing
+ * call, taken on this thread, so it is the right one whatever other threads
+ * run on the shared connection meanwhile. The extended code is read from
+ * the connection this thread has written through under the lock (the
+ * update hook records it), and a reader on another thread can replace it in
+ * between; it is only added when its primary code is the one the message
+ * names.
+ */
+#ifndef CUTILS_ERROR_H
+const char *cutils_get_error(void);
+#endif
+
+static void sqlite_cause(char *out, size_t sz)
+{
+    const char *m = cutils_get_error();
+    /* c-utils prefixes the call: "exec: ", "step: ", "prepare: ". */
+    static const char *const pre[] = { "exec: ", "step: ", "prepare: " };
+    for (size_t i = 0; m && i < sizeof(pre) / sizeof(pre[0]); i++) {
+        size_t n = strlen(pre[i]);
+        if (strncmp(m, pre[i], n) == 0) { m += n; break; }
+    }
+    if (!m || !m[0]) m = "SQLite gave no reason";
+    int ext = tls_conn ? sqlite3_extended_errcode(tls_conn) : SQLITE_OK;
+    const char *named = ext != SQLITE_OK ? sqlite3_errstr(ext & 0xff) : NULL;
+    if (named && strcmp(named, m) == 0)
+        snprintf(out, sz, "%s (SQLite extended code %d)", m, ext);
+    else
+        snprintf(out, sz, "%s", m);
+}
+
+/* Set the thread's error to what failed and SQLite's reason for it. */
+static status_t sqlite_error(status_t code, const char *what)
+{
+    char cause[512];
+    sqlite_cause(cause, sizeof(cause));
+    return set_error(code, "%s: %s", what, cause);
 }
 
 /* caller: whose call site the commit budget learns for (db_txn.c). */
@@ -265,8 +318,9 @@ static status_t begin_at(cutils_db_t *db, uintptr_t caller)
     phase_add_nested(phase_current, PHASE_TXN_WAIT, t0);
     if (rc != 0) {
         tls_tracked = 0;
+        status_t st = sqlite_error(ERR_IO, "cannot begin");
         write_unlock();
-        return set_error(ERR_IO, "cannot begin");
+        return st;
     }
     return OK;
 }
@@ -295,14 +349,33 @@ status_t db_txn_commit(cutils_db_t *db)
     phase_add_commit(phase_current, t0);
     if (rc == 0) budget_committed(t1 - t0);
     tls_tracked = 0;
+    /* Read before the lock goes: the next holder's statements would
+     * replace the connection's code. */
+    status_t st = rc != 0 ? sqlite_error(ERR_IO, "cannot commit") : OK;
+    /*
+     * A COMMIT that fails with SQLITE_FULL or SQLITE_IOERR may leave the
+     * transaction open (SQLite says it "may or may not" roll back). Left
+     * open on the shared connection, the next holder's BEGIN fails and
+     * every plain write after it joins this transaction, to commit with
+     * whatever commits next, after the caller was told it failed. It is
+     * rolled back here, under the lock; when SQLite already did, the
+     * ROLLBACK fails harmlessly.
+     */
+    if (rc != 0 && db_exec_raw(db, "ROLLBACK") == 0)
+        log_warn("db_txn: a failed commit left its transaction open; rolled back");
     write_unlock();
-    if (rc != 0) return set_error(ERR_IO, "cannot commit");
-    return OK;
+    return st;
 }
 
 void db_txn_rollback(cutils_db_t *db)
 {
     if (!db) return;
+    /* Not this thread's lock to release: a rollback after a failed commit
+     * (which already let it go) would serve a second ticket at once. */
+    if (!tls_held) {
+        log_error("db_txn: rollback without the write lock held; ignored");
+        return;
+    }
 
     uint64_t t0 = phase_now();
     if (db_exec_raw(db, "ROLLBACK") != 0)
@@ -484,9 +557,9 @@ int db_txn_held(void)
 int db_write_enter(cutils_db_t *db)
 {
     if (tls_held) return 0;
+    /* The message stays for the caller to add to (B194). */
     if (db_txn_begin(db) != OK) {
         log_error("db_write: %s", err_msg());
-        err_clear();
         return -1;
     }
     return 1;
@@ -501,7 +574,6 @@ int db_write_leave(cutils_db_t *db, int began, int ok)
     }
     if (db_txn_commit(db) != OK) {
         log_error("db_write: %s", err_msg());
-        err_clear();
         return -1;
     }
     return 0;
@@ -512,6 +584,7 @@ int db_write(cutils_db_t *db, const char *sql, const char **params, int *affecte
     int began = db_write_enter(db);
     if (began < 0) return -1;
     int rc = db_execute_non_query(db, sql, params, affected);
+    if (rc != 0) (void)sqlite_error(ERR_IO, "write");
     return db_write_leave(db, began, rc == 0);
 }
 
@@ -522,6 +595,7 @@ int db_write_returning(cutils_db_t *db, const char *sql, const char **params,
     int began = db_write_enter(db);
     if (began < 0) return -1;
     int rc = db_execute(db, sql, params, out);
+    if (rc != 0) (void)sqlite_error(ERR_IO, "write");
     if (db_write_leave(db, began, rc == 0) != 0) {
         db_result_free(*out);
         *out = NULL;
@@ -574,9 +648,10 @@ static int          g_guard_abort = -1;   /* -1: environment not read yet */
 static void guard_hook(void *arg, int op, const char *dbname, const char *table,
                        sqlite3_int64 rowid)
 {
-    (void)arg;
     (void)rowid;
     if (tls_held) {
+        /* The connection this thread writes through, for sqlite_cause. */
+        tls_conn = arg;
         /* The commit budget's row count (B144-REST). */
         tls_rows++;
         if (!atomic_load_explicit(&g_hook_seen, memory_order_relaxed))
@@ -599,7 +674,7 @@ static int guard_ext(sqlite3 *conn, char **err, const sqlite3_api_routines *api)
 {
     (void)err;
     (void)api;
-    sqlite3_update_hook(conn, guard_hook, NULL);
+    sqlite3_update_hook(conn, guard_hook, conn);
     return SQLITE_OK;
 }
 

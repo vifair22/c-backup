@@ -224,3 +224,27 @@ void job_warning_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
  * A queued job is removed from the queue and recorded cancelled before this
  * returns; a running one is flagged and stops at its next check. */
 status_t job_cancel(job_manager_t *jm, int64_t job_id);
+
+/*
+ * A job that has ended whose end is not in the jobs table yet (B196): its
+ * end transaction failed, state.db's filesystem full, say, and it is kept
+ * in memory and retried. The row still reads "running"; anything showing a
+ * job asks this first and shows the end instead. result is a heap copy or
+ * NULL, the caller's to free; the progress fields are the final report's,
+ * valid when has_progress.
+ */
+typedef struct {
+    char     state[16];
+    char     error[1024];
+    int64_t  ended;
+    char    *result;
+    int      has_progress;
+    char     phase[192];
+    uint64_t done, total, bytes_done, bytes_total;
+} job_end_view_t;
+
+/* 1 with *out filled (out may be NULL) when job_id's end on db is held in
+ * memory, 0 when the table has it or the job has not ended. */
+int      job_end_unrecorded(cutils_db_t *db, int64_t job_id, job_end_view_t *out);
+/* How many ends on db are held in memory. */
+unsigned job_ends_unrecorded(cutils_db_t *db);
