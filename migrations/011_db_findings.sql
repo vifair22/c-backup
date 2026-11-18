@@ -25,7 +25,15 @@ CREATE TABLE db_findings (
     first_seen   INTEGER NOT NULL,
     last_seen    INTEGER NOT NULL,
     last_snap_id INTEGER,
-    alerted_at   INTEGER
+    alerted_at   INTEGER,
+    -- What enabling chose (7.3, 9.2): the template, its typed parameters
+    -- as a JSON object, who and when; and a dismissal's reason. Set only
+    -- by the explicit enable and dismiss calls, never by a backup.
+    template     TEXT,
+    params       TEXT,
+    decided_by   TEXT,
+    decided_at   INTEGER,
+    reason       TEXT
 );
 -- Leads with repo_id, so a purge's `WHERE repo_id = ?` is a range.
 CREATE UNIQUE INDEX db_findings_key ON db_findings (repo_id, scope, path, engine);
