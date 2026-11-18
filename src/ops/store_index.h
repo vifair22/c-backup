@@ -76,6 +76,10 @@ status_t store_index_fix_absent(cutils_db_t *db, int64_t repo_id);
  * a power cut there, with no further commits and no cleanup. */
 void store_index_set_pack_batch_rows(uint32_t rows);
 void store_index_set_commit_gate(status_t (*gate)(void));
+/* For tests: called after each entry of the new-row phase is written, with
+ * the batch open and before it decides whether to end, so a test can hold
+ * the commit there until another writer has queued (FLAKE-29). */
+void store_index_set_row_gate(void (*gate)(void));
 /* For tests: asked before a pack commit's final COMMIT; non-zero makes it a
  * commit that failed (not a power cut): rolled back, cleaned up, and
  * reported to the seal through store_pack_commit_failed. */
