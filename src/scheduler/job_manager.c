@@ -126,17 +126,18 @@ void job_manager_set_alerts(job_manager_t *jm, int enabled)
  * daemon queued itself ("startup", "register"). Every entry used to say
  * "daemon", so a scheduled run and a manual one could not be told apart.
  */
+/* ended: when the job ended, unix seconds; <= 0 is now. */
 static int journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
                        const char *origin, const char *action, const char *outcome,
-                       int64_t took_ms, const char *message)
+                       int64_t took_ms, const char *message, int64_t ended)
 {
     if (schedule_id <= 0)
-        return journal_record(db, repo_id, origin && *origin ? origin : "api", action,
-                              outcome, took_ms, message);
+        return journal_record_at(db, repo_id, ended, origin && *origin ? origin : "api",
+                                 action, outcome, took_ms, message);
     char msg[ERR_MSG_MAX + 64];
     snprintf(msg, sizeof(msg), "schedule %lld%s%s", (long long)schedule_id,
              message && *message ? ": " : "", message ? message : "");
-    return journal_record(db, repo_id, "schedule", action, outcome, took_ms, msg);
+    return journal_record_at(db, repo_id, ended, "schedule", action, outcome, took_ms, msg);
 }
 
 /* See job_manager_start. Runs before any worker exists, so nothing else is
@@ -159,7 +160,8 @@ static void journal_interrupted(cutils_db_t *db)
         /* Duration 0: when the process died is not known, and the time
          * since the job started would count the downtime as work. */
         journal_job(db, repo_id, strtoll(r->rows[i][2], NULL, 10),
-                    r->rows[i][3], r->rows[i][1], "failed", 0, "interrupted by daemon restart");
+                    r->rows[i][3], r->rows[i][1], "failed", 0, "interrupted by daemon restart",
+                    0);
     }
     if (r && r->nrows > 0)
         log_warn("job manager: %d job(s) were interrupted by the last shutdown "
@@ -409,10 +411,12 @@ static int write_end(const pending_end_t *e)
     if (ok && e->result)
         ok = db_write(db, "UPDATE jobs SET result = ? WHERE id = ?",
                       (const char *[]){ e->result, id, NULL }, NULL) == 0;
+    /* ended is when the job ended, not when its end was written, in the
+     * journal as in the row: an end held while state.db was full used to
+     * be journalled at the time it finally went in (NIT-43). */
     if (ok && e->repo_id > 0)
         ok = journal_job(db, e->repo_id, e->schedule_id, e->origin, e->action,
-                         e->outcome, e->took_ms, e->message) == 0;
-    /* ended is when the job ended, not when its end was written. */
+                         e->outcome, e->took_ms, e->message, (int64_t)e->ended) == 0;
     if (ok && e->error)
         ok = db_write(db, "UPDATE jobs SET state = ?, ended = ?, error = ? WHERE id = ?",
                       (const char *[]){ e->state, ended, e->error, id, NULL }, NULL) == 0;
@@ -1526,7 +1530,7 @@ static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
 
     /* The lock set, deduplicated. A job with no repository locks nothing,
      * whatever it names in `also`: the set is anchored on its repository. */
-    int64_t repos[JOB_LOCK_SET_MAX];
+    int64_t repos[JOB_LOCK_SET_MAX] = { 0 };
     int nrepos = 0;
     if (repo_id > 0) {
         repos[nrepos++] = repo_id;

@@ -111,14 +111,15 @@ static void run_writers(const int64_t *repos, int in_txn_every)
     pthread_barrier_destroy(&start);
 }
 
-/* Every entry for one repository, with ids 1..N and no gaps or repeats. */
+/* Every entry for one repository, each with an id of its own. Ids are one
+ * sequence across repositories since B217, so they are unique, not 1..N per
+ * repository. */
 static void assert_complete(const char *repo, long long n)
 {
     assert_int_equal(scalar("SELECT COUNT(*) FROM journal WHERE repo_id = ?", repo), n);
     assert_int_equal(scalar("SELECT COUNT(DISTINCT message) FROM journal WHERE repo_id = ?",
                             repo), n);
-    assert_int_equal(scalar("SELECT MIN(id) FROM journal WHERE repo_id = ?", repo), 1);
-    assert_int_equal(scalar("SELECT MAX(id) FROM journal WHERE repo_id = ?", repo), n);
+    assert_int_equal(scalar("SELECT COUNT(DISTINCT id) FROM journal WHERE repo_id = ?", repo), n);
 }
 
 static void test_concurrent_writers_on_one_repo_lose_nothing(void **state)
@@ -129,9 +130,9 @@ static void test_concurrent_writers_on_one_repo_lose_nothing(void **state)
     assert_complete("1", (long long)WRITERS * PER_WRITER);
 }
 
-/* Two repositories interleaved: each keeps its own unbroken sequence, and
- * writers that journal from inside a transaction neither deadlock nor lose
- * entries beside the ones that do not. */
+/* Two repositories interleaved: neither loses an entry, no id serves two
+ * entries, and writers that journal from inside a transaction neither
+ * deadlock nor lose entries beside the ones that do not. */
 static void test_sequences_stay_per_repo_with_transactions_open(void **state)
 {
     (void)state;
@@ -139,6 +140,8 @@ static void test_sequences_stay_per_repo_with_transactions_open(void **state)
     run_writers(two, 3);
     assert_complete("1", (long long)WRITERS / 2 * PER_WRITER);
     assert_complete("2", (long long)WRITERS / 2 * PER_WRITER);
+    assert_int_equal(scalar("SELECT COUNT(DISTINCT id) FROM journal WHERE repo_id > ?", "0"),
+                     (long long)WRITERS * PER_WRITER);
 }
 
 int main(void)

@@ -8,6 +8,7 @@
 #include "wal_sync.h"
 #include "sync_latch.h"
 #include "walidx.h"
+#include "id_reserve.h"
 
 #include <cutils/log.h>
 #include <limits.h>
@@ -346,6 +347,9 @@ static void write_lock(void)
 
 static void write_unlock(void)
 {
+    /* Inserts seen under a hold that ends without db_txn_commit (a
+     * rollback, c-utils' own scopes) hand nothing out. */
+    id_reserve_discard();
     tls_held = 0;
     /* Only meaningful under the lock: a connection seen in an earlier
      * transaction may since have been closed. */
@@ -451,6 +455,14 @@ status_t db_txn_commit(cutils_db_t *db)
 {
     if (!db) return set_error(ERR_INVALID, "db_txn_commit: null handle");
 
+    /* The id marks this transaction's inserts call for go in with it
+     * (B217, id_reserve.h). */
+    int id_sync = id_reserve_pre_commit(db);
+    if (id_sync < 0) {
+        db_txn_rollback(db);
+        return set_error(ERR_IO, "refused: a new id cannot be made durable, because a "
+                                 "previous sync of state.db failed (restart the daemon)");
+    }
     uint64_t t0 = phase_now();
     int rc = db_exec_raw(db, "COMMIT");
     uint64_t t1 = phase_now();
@@ -473,7 +485,16 @@ status_t db_txn_commit(cutils_db_t *db)
      */
     if (rc != 0 && db_exec_raw(db, "ROLLBACK") == 0)
         log_warn("db_txn: a failed commit left its transaction open; rolled back");
+    id_reserve_committed(rc == 0);
     write_unlock();
+    /*
+     * An id above the durable mark is not handed out until the mark is
+     * durable: a cut before the sync would take the mark back and let the
+     * next start issue the id again. The rows are committed, but the
+     * caller is told it failed, so it answers nobody with the id.
+     */
+    if (st == OK && id_sync && id_reserve_sync(db) != OK)
+        st = set_error_wrap(ERR_IO, "committed, but its new id's reservation is not durable");
     return st;
 }
 
@@ -758,8 +779,9 @@ static int          g_guard_abort = -1;   /* -1: environment not read yet */
 static void guard_hook(void *arg, int op, const char *dbname, const char *table,
                        sqlite3_int64 rowid)
 {
-    (void)rowid;
     if (tls_held) {
+        /* Ids handed out, for the reservation (B217). */
+        if (op == SQLITE_INSERT) id_reserve_on_insert(table, (int64_t)rowid);
         /* The connection this thread writes through, for sqlite_cause. */
         tls_conn = arg;
         /* The commit budget's row count (B144-REST). */

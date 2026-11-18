@@ -230,6 +230,12 @@ void           exports_shutdown(void);
 int journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
                    const char *operation, const char *result,
                    int64_t duration_ms, const char *message);
+/* journal_record with the entry's time given (unix seconds; <= 0 is now):
+ * an entry written after the event, as a job end held by a full state.db
+ * is (B196, NIT-43), carries when it happened. */
+int journal_record_at(cutils_db_t *db, int64_t repo_id, int64_t ts, const char *source,
+                      const char *operation, const char *result,
+                      int64_t duration_ms, const char *message);
 
 /* Schedule CRUD. Repo-scoped sub-handlers, dispatched from repos.c. */
 struct scheduler;
