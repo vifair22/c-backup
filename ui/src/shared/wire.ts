@@ -503,3 +503,50 @@ export interface WireUnitBackupResult {
   filtered: number
   note?: string
 }
+
+/* A unit restore job's result. files: counts; item: bytes; unit: each
+ * tree's new home (restored_to, under a new name) or the old data moved
+ * aside (previous, in place), the name defined and the helper's warnings. */
+export interface WireUnitRestoreResult {
+  mode: 'files' | 'item' | 'unit'
+  files?: number
+  dirs?: number
+  bytes?: number
+  failed?: number
+  trees?: Array<{ path: string; restored_to?: string; previous?: string }>
+  unit?: string
+  name?: string
+  target_root?: string
+  warning?: string
+  warnings?: string[]
+}
+
+/* POST .../unit/export: the export's name is in this answer only. */
+export interface WireExportCreated {
+  export_id: number
+  socket: string
+  name: string
+  size: number
+  expires: number
+  idle_timeout_s: number
+  attach: string
+}
+
+/* GET /exports (open ones) and /exports/<id> (open or closed). Never the
+ * name. connections, bytes_served and cache_bytes only while open. */
+export interface WireExport {
+  id: number
+  repo_id: number
+  snap_id: number
+  item: string
+  socket: string
+  size: number
+  caller: string
+  created_at: number
+  expires: number
+  closed_at: number | null
+  close_reason?: string
+  connections?: number
+  bytes_served?: number
+  cache_bytes?: number
+}

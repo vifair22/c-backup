@@ -2339,6 +2339,45 @@ activity rather than this unit's alone: entries that name the unit, or one
 of its snapshots, are shown brighter, and a tick limits the list to them. A
 backup of several units says how many, not which, so it never names one.
 
+**Restoring a unit from the app.** **Restore** on a snapshot row of the
+unit page opens the four forms of `c-backup unit restore` (22.7):
+
+| In the dialog | The CLI | |
+|---|---|---|
+| Files, to a directory | `unit restore <repo> <snap> <dir> [--overwrite]` | the whole snapshot under the directory, each disk a sparse raw image (22.7.1) |
+| One item, to a file | `... <file> --item ID` | one item to a new file, never over an existing path (22.7.2) |
+| As a new unit, under a new name | `... --define --name N --target-root DIR` | a second unit, its data under `DIR` (22.7.3) |
+| In place, replacing the unit | `... --define --replace` | the unit stopped, its data swapped, the old data moved aside (22.7.3) |
+
+The define forms take **Start it** (`--start`), **Pin the image digest**
+(`--pin-digest`, containers) and **Keep MAC addresses** (`--keep-macs`, VMs
+and LXC). In place asks for the unit's name to be typed before **Restore in
+place** is enabled. The dialog checks nothing the daemon checks: the job is
+followed to its end, and a refusal is shown whole, under `Refused, nothing
+written` when the daemon says nothing was written. That covers the daemon's
+own (a new name without a target root, a target root already holding one of
+the unit's paths, in place without replace) and the helper's, which arrive
+as `unit restore refused, nothing written: helper: failed: ...`: the host
+bind rule for a copy (B188), a block device (B210), and `cannot verify it is
+not a block device`. A refusal that names restoring the files to a path as
+the way round it offers **Restore the files to a path instead**, which
+switches the dialog to the first form. A completed restore lists where each
+tree went (`restored to`, under a new name) or where the old data was moved
+(in place), the name defined, and the helper's warnings.
+
+**NBD exports from the app.** Each disk of a unit snapshot has **Export** on
+its row: the lifetime is `--ttl` (`N`, `Ns`, `Nm`, `Nh` or `Nd`, 60 s to 7
+days; empty for `vm.export_ttl_s`), refused before asking when out of
+range, as the CLI refuses it. The answer is shown once, as `vm export`
+prints it: the export's id, size and expiry, the socket, the **name** (which
+the daemon never lists again, so copy it then) and the `qemu-nbd` line to
+run as root on the daemon's host (22.8). The open exports of the repository
+are listed on the Units screen, and those of the unit's snapshots on its
+page, each with its socket, expiry, connections and bytes served;
+**Revoke** (`vm unexport`) disconnects every client and closes it, and the
+screen then shows the reason the daemon recorded (`revoked`, as `vm
+export-show` reports it).
+
 **Snapshot mode in the backup dialog.** Editing the sources shows, for each
 path, a snapshot mode: Off (read live), Strict or Warn (6.6). Saving sends
 every mode, so a path set back to Off is off; the list then marks each
@@ -4350,6 +4389,7 @@ affects another.
 
 ### 22.7 Restore
 
+The desktop app's unit page offers every form below (section 15.4).
 `c-backup unit restore` (`POST /repos/<id>/snapshots/<sid>/unit/restore`) is
 a job. Three modes:
 
@@ -4609,6 +4649,8 @@ A name already defined is refused unless `--replace`, which needs that
 container stopped. `DIR` must be writable by the daemon (22.2.1).
 
 ### 22.8 Read-only NBD export of a VM disk
+
+The desktop app opens, lists and revokes exports too (section 15.4).
 
 To recover files from a VM disk without restoring the whole image, the
 daemon serves one disk of one snapshot read-only over NBD on a unix socket.

@@ -213,6 +213,15 @@ const SAMPLES: Record<ApiKind, ApiRequest> = {
   unitBackup:      { kind: 'unitBackup', repoId: 1, provider: 'fake', units: ['contract-probe'],
                      require: 'crash', pauseScope: 'unit' },
 
+  /* Snapshot 1 is a file snapshot, not a unit's: the handlers refuse it
+   * by name, and an export id nothing issued is the handler's 404. */
+  unitRestore:     { kind: 'unitRestore', repoId: 1, snapshotId: 1,
+                     restore: { mode: 'files', dest: '/nonexistent/contract-probe' } },
+  exportCreate:    { kind: 'exportCreate', repoId: 1, snapshotId: 1, item: 'vda', ttlS: 600 },
+  exportList:      { kind: 'exportList' },
+  exportShow:      { kind: 'exportShow', exportId: 9999 },
+  exportRevoke:    { kind: 'exportRevoke', exportId: 9999 },
+
   scheduleList:    { kind: 'scheduleList', repoId: 1 },
   scheduleAdd:     { kind: 'scheduleAdd', repoId: 1, action: 'verify',
                      trigger: { type: 'interval', seconds: 86400 } },

@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 
 import {
   mergeUnits, parseGlobs, unitJournal, mentions, isDisk, itemKindLabel,
-  UNIT_LEVELS, DEFAULT_LEVEL, PAUSE_SCOPES,
+  UNIT_LEVELS, DEFAULT_LEVEL, PAUSE_SCOPES, ttlSeconds, suggestsFilesRestore, refusedNothingWritten,
 } from '../src/shared/units.ts'
 import type { WireJournalEntry, WireRepoUnit } from '../src/shared/wire.ts'
 
@@ -104,4 +104,44 @@ test('a name is matched whole, never as part of a longer one', () => {
   assert.equal(mentions('xcbk-uat-vm', 'cbk-uat-vm'), false)
   assert.equal(mentions('(cbk-uat-vm)', 'cbk-uat-vm'), true)
   assert.equal(mentions('anything', ''), false)
+})
+
+test('an export ttl reads as the CLI reads --ttl, 60 s to 7 days', () => {
+  assert.equal(ttlSeconds(''), undefined, 'empty is the daemon default')
+  assert.equal(ttlSeconds('90'), 90)
+  assert.equal(ttlSeconds('90s'), 90)
+  assert.equal(ttlSeconds('15m'), 900)
+  assert.equal(ttlSeconds('4h'), 14400)
+  assert.equal(ttlSeconds('7d'), 604800)
+  for (const bad of ['59', '8d', '1w', '4h30m', '-5m', 'x', '1.5h']) assert.equal(ttlSeconds(bad), 0, bad)
+})
+
+test('a cannot-verify refusal offers the restore to a path; others do not', () => {
+  const b210 = 'unit restore refused, nothing written: docker: refused, nothing created: the copy would bind ' +
+    '/mnt/x -> /data: cannot verify it is not a block device: the original is gone from the host and the ' +
+    'snapshot has no entry for it; restore the files to a path instead (c-backup restore <repo> <snapshot> ' +
+    '<dir> --subpath /mnt/x, or c-backup unit restore <repo> <snapshot> <dir> for the whole unit) and ' +
+    'create the container by hand'
+  assert.equal(suggestsFilesRestore(b210), true)
+  assert.equal(refusedNothingWritten(b210), true)
+  const b188 = 'unit restore refused, nothing written: docker: refused, nothing created: the copy would bind ' +
+    '/etc/ssl -> /etc/ssl: host configuration under /etc'
+  assert.equal(suggestsFilesRestore(b188), false)
+  assert.equal(refusedNothingWritten('unit restore: a failure, rolled back'), false)
+})
+
+test('a restore body is the one `c-backup unit restore` sends for each mode', async () => {
+  const { unitRestoreBody } = await import('../src/main/client.ts')
+  assert.deepEqual(unitRestoreBody({ mode: 'files', dest: '/r' }), { mode: 'files', dest: '/r' })
+  assert.deepEqual(unitRestoreBody({ mode: 'files', dest: '/r', overwrite: true }),
+    { mode: 'files', dest: '/r', overwrite: true })
+  assert.deepEqual(unitRestoreBody({ mode: 'item', item: 'vda', dest: '/r/vda.raw' }),
+    { mode: 'item', format: 'raw', item: 'vda', dest: '/r/vda.raw' })
+  assert.deepEqual(unitRestoreBody({ mode: 'unit', replace: true }), { mode: 'unit', replace: true })
+  assert.deepEqual(unitRestoreBody({ mode: 'unit', name: 'n', targetRoot: '/t', start: true,
+    pinDigest: true, keepMacs: true }),
+    { mode: 'unit', name: 'n', target_root: '/t', pin_digest: true, start: true, keep_macs: true })
+  /* Unset options are left out, never sent as false. */
+  assert.deepEqual(unitRestoreBody({ mode: 'unit', name: 'n', targetRoot: '/t', start: false }),
+    { mode: 'unit', name: 'n', target_root: '/t' })
 })
