@@ -4899,7 +4899,8 @@ exists` when it could not be made.
 **Restoring.** A whole-snapshot or subtree restore puts back the raw
 files as stored, the copies under `.cbackup-captures/` too, and names each
 flagged database that has a copy. `c-backup restore ... --prefer-engine-copy`
-(`"prefer_engine_copy":true`) restores the copy at the original path
+(`"prefer_engine_copy":true`; in the desktop app, the restore dialog's
+"Restore databases from their engine copies") restores the copy at the original path
 instead and leaves that database's `-wal`, `-shm` and `-journal` out: an
 online-backup copy is a complete database, and the old WAL beside it would
 corrupt it. The result counts `engine_copies`, `engine_copies_used` and

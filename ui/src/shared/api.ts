@@ -81,7 +81,10 @@ export type ApiRequest =
   | { kind: 'backup'; repoId: number; paths?: string[]
       label?: string; exclude?: string[]; oneFilesystem?: boolean }
   | { kind: 'restore'; repoId: number; snapshotId: number; dest: string
-      subpath?: string; overwrite?: boolean }
+      subpath?: string; overwrite?: boolean
+      /* A database with an engine copy in the snapshot comes back from the
+       * copy, its stale -wal/-shm/-journal left out (db-detection.md 9.5). */
+      preferEngineCopy?: boolean }
 
   /* --- snapshots and browsing --- */
   | { kind: 'snapshotList'; repoId: number; limit?: number; offset?: number }
