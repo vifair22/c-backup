@@ -17,6 +17,7 @@ let h: Harness
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 interface Finding { id: number; scope: string; engine: string; path: string; state: string
+  coverage?: string | null; method?: string | null; suggestion?: string | null
   template?: string | null; reason?: string | null }
 
 function findings(): Finding[] {
@@ -109,6 +110,22 @@ test('restore: a database comes back from its engine copy, without its stale -wa
   expect(out).toContain('"outcome":"ok"')
   const snap = Number((out.match(/"snapshot_id":(\d+)/) ?? [])[1])
   expect(snap).toBeGreaterThan(0)
+  /* The copy covers the database (B242): the backup's result, the
+   * daemon's finding and the app all stop calling it uncovered. */
+  expect(out).toContain('"coverage":"covered-application"')
+  expect(out).toContain('"method":"engine-copy"')
+  const covered = finding('/app/live.db')
+  expect(covered.coverage).toBe('covered-application')
+  expect(covered.method).toBe('engine-copy')
+  expect(covered.suggestion ?? null).toBeNull()
+  await h.page.getByText('Documents', { exact: true }).first().click()
+  await h.page.getByRole('button', { name: /^databases/i }).first().click()
+  await expect(h.page.getByRole('heading', { name: 'Databases' })).toBeVisible({ timeout: 10_000 })
+  /* The card's coverage, not the filter's option of the same name. */
+  await expect(h.page.locator('span').filter({ hasText: /^application-consistent$/ }).first())
+    .toBeVisible({ timeout: 10_000 })
+  await expect(h.page.getByText('engine copy (SQLite online backup)').first()).toBeVisible()
+  await h.page.screenshot({ path: 'test-results/07-databases-covered.png', fullPage: true })
 
   const { page } = h
   await page.getByText('Documents', { exact: true }).first().click()
@@ -135,4 +152,28 @@ test('restore: a database comes back from its engine copy, without its stale -wa
   const restore = jobs().find(j => JSON.stringify(j).includes('restore'))
   expect(restore).toBeTruthy()
   expect(cli(h.sock, ['jobs', String(restore!.id)])).toContain('"engine_copies_used":1')
+})
+
+/*
+ * B241: a job that completed with warnings says so on its card, with the
+ * warning's text. The fixture's first backup captured the live database
+ * uncovered, which is exactly such a job. The restore above left the app
+ * on its task list.
+ */
+test('task list: a job that completed with warnings shows them', async () => {
+  const { page } = h
+  await expect(page.getByRole('heading', { name: 'Background Tasks' })).toBeVisible({ timeout: 10_000 })
+  const card = page.locator('[data-testid="job-warnings"]', { hasText: 'captured uncovered' }).first()
+  await expect(card).toBeVisible({ timeout: 10_000 })
+  await expect(page.getByText('Completed with warnings').first()).toBeVisible()
+  await expect(card.getByTestId('job-warning').first()).toContainText('live database captured uncovered')
+  /* Every warning on request, when there is more than one. */
+  const all = card.getByRole('button', { name: /^show all/i })
+  if (await all.count()) {
+    await all.click()
+    expect(await card.getByTestId('job-warning').count()).toBeGreaterThan(1)
+  }
+  /* And a job with none still reads plain Completed. */
+  await expect(page.getByText('Completed', { exact: true }).first()).toBeVisible()
+  await page.screenshot({ path: 'test-results/07-job-warnings.png', fullPage: true })
 })

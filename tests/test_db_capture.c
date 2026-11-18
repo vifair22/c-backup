@@ -388,6 +388,8 @@ static run_t run_file_backup(int check_why)
     db_cap_root_t root = { TEST_SRC, DB_CAP_LIVE, 0 };
     db_capture_desc_t cap = { &root, 1, 0, 0, 0, 0 };
     assert_int_equal(db_detect_finish(o.detect, &cap, &r.f), OK);
+    /* What the backup job does before it records them (14.5). */
+    db_captures_judge(caps, r.f);
     r.caps_json = db_captures_json(caps);
     /* The messages, while the plan is alive. */
     char why[1024];
@@ -398,6 +400,14 @@ static run_t run_file_backup(int check_why)
     db_captures_free(caps);
     db_detect_free(o.detect);
     return r;
+}
+
+static const db_finding_t *sqlite_finding(const run_t *r, const char *path)
+{
+    for (size_t i = 0; r->f && i < r->f->n; i++)
+        if (r->f->v[i].engine == DB_ENGINE_SQLITE && strcmp(r->f->v[i].path, path) == 0)
+            return &r->f->v[i];
+    return NULL;
 }
 
 static void run_free(run_t *r)
@@ -435,6 +445,14 @@ static void test_backup_with_engine_copy(void **state)
     assert_non_null(r.caps_json);
     assert_non_null(strstr(r.caps_json, "\"outcome\":\"ok\""));
     assert_non_null(strstr(r.caps_json, "\"copy\":\"/.cbackup-captures" TEST_SRC "/app.db\""));
+    /* The copy covers the database (B242): no longer uncovered, nothing
+     * left to suggest, and the copy named. */
+    const db_finding_t *af = sqlite_finding(&r, TEST_SRC "/app.db");
+    assert_non_null(af);
+    assert_int_equal(af->coverage, DB_COV_COVERED_APPLICATION);
+    assert_string_equal(af->method, "engine-copy");
+    assert_null(af->suggestion);
+    assert_non_null(strstr(af->coverage_why, "/.cbackup-captures" TEST_SRC "/app.db"));
     /* Copies are not files the backup could not read. */
     assert_int_equal(r.res.files_skipped, 0);
     int64_t snap = r.res.snapshot_id;
@@ -489,6 +507,10 @@ static void test_backup_copy_refused(void **state)
     (void)state;
     sqlite3 *h = make_db(TEST_SRC "/r.db", 0);
     sqlite3_close(h);
+    /* An empty journal beside it: live by its sibling, never hot to SQLite. */
+    FILE *jf = fopen(TEST_SRC "/r.db-journal", "w");
+    assert_non_null(jf);
+    fclose(jf);
     enable_copy(TEST_SRC "/r.db", NULL);
     /* And one for a file that is gone: planned out. */
     enable_copy(TEST_SRC "/gone.db", NULL);
@@ -498,6 +520,13 @@ static void test_backup_copy_refused(void **state)
     assert_non_null(strstr(r.caps_json, "\"copy\":null"));
     assert_null(strstr(r.caps_json, "gone.db"));
     assert_int_equal(r.res.files_skipped, 0);
+    /* No copy, so still uncovered, and the reason says why (B242). */
+    const db_finding_t *rf = sqlite_finding(&r, TEST_SRC "/r.db");
+    assert_non_null(rf);
+    assert_int_equal(rf->coverage, DB_COV_UNCOVERED);
+    assert_string_equal(rf->method, "live-read");
+    assert_non_null(strstr(rf->coverage_why, "the online backup was not made"));
+    assert_non_null(strstr(rf->coverage_why, "allow_rollback_lock"));
     int64_t snap = r.res.snapshot_id;
     run_free(&r);
     rmrf(TEST_OUT);
@@ -515,6 +544,7 @@ static void test_backup_copy_refused(void **state)
                                   " WHERE path = '" TEST_SRC "/r.db'", NULL, NULL), 0);
     r = run_file_backup(0);
     assert_non_null(strstr(r.caps_json, "\"outcome\":\"ok\""));
+    assert_int_equal(sqlite_finding(&r, TEST_SRC "/r.db")->coverage, DB_COV_COVERED_APPLICATION);
     run_free(&r);
     assert_true(db_captures_total(SQLITE_COPY_OK) >= 1);
     assert_true(db_captures_total(SQLITE_COPY_REFUSED) >= 1);
@@ -543,6 +573,7 @@ static void test_no_plan(void **state)
     assert_null(c);
     db_detect_free(d);
     db_captures_apply(NULL, NULL);
+    db_captures_judge(NULL, NULL);
     db_captures_free(NULL);
     assert_null(db_captures_json(NULL));
     assert_null(db_captures_find(NULL, "/x"));

@@ -62,6 +62,17 @@ const db_capture_info_t *db_captures_find(const db_captures_t *c, const char *pa
 void db_captures_free(db_captures_t *c);
 
 /*
+ * What an engine copy does to its finding's coverage (db-detection.md
+ * 14.5, B242), applied before the findings are recorded. A copy made
+ * makes the live SQLite finding it is a copy of `covered-application`,
+ * method `engine-copy`, with nothing left to suggest: the snapshot holds a
+ * transactional copy of the database however the raw file read. A copy
+ * refused, abandoned or failed leaves the coverage as the capture judged
+ * it and says why in coverage_why. c and f may be NULL.
+ */
+void db_captures_judge(const db_captures_t *c, db_findings_t *f);
+
+/*
  * The explanation of an unsettled file that is a detected database (9.5),
  * into buf; 0 and buf empty when path is not one. f and c may be NULL.
  */

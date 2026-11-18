@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import { fmtNum, fmtSize, absoluteTime } from './format'
 import { ConfirmDialog } from './ConfirmDialog'
 import type { Job } from '../shared/api'
+import { jobWarnings, jobDisplayState } from '../shared/jobs'
 
 const api = window.cbackup
 
@@ -14,6 +15,7 @@ function fmtElapsed(seconds: number): string {
 const STATE_CONFIG: Record<string, { color: string; bg: string; label: string }> = {
   running:   { color: 'text-blue-400',  bg: 'bg-blue-500/10',  label: 'Running' },
   completed: { color: 'text-green-400', bg: 'bg-green-500/10', label: 'Completed' },
+  warning:   { color: 'text-amber-400', bg: 'bg-amber-500/10', label: 'Completed with warnings' },
   failed:    { color: 'text-red-400',   bg: 'bg-red-500/10',   label: 'Failed' },
 }
 
@@ -36,6 +38,13 @@ interface Props {
 export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React.ReactElement {
   const [error, setError] = useState<string | null>(null)
   const [confirmCancel, setConfirmCancel] = useState<number | null>(null)
+  /* Jobs whose every warning is shown; the card shows the first. */
+  const [openWarnings, setOpenWarnings] = useState<Set<number>>(new Set())
+  const toggleWarnings = (id: number) => setOpenWarnings(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
 
   const handleCancel = async (taskId: number) => {
     setConfirmCancel(null)
@@ -73,7 +82,9 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
       {sorted.length > 0 && (
         <div className="space-y-2">
           {sorted.map(t => {
-            const cfg = STATE_CONFIG[t.state] ?? STATE_CONFIG.running
+            const cfg = STATE_CONFIG[jobDisplayState(t)] ?? STATE_CONFIG.running
+            const warnings = t.state === 'completed' ? jobWarnings(t) : []
+            const allShown = openWarnings.has(t.id)
             const isRunning = t.state === 'running'
             /* Bytes when the job reports them: entry counts crawl through
              * large files and say little about how far along it is. */
@@ -115,6 +126,31 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
                         <div className="h-full bg-accent/50 rounded-full animate-pulse w-1/3" />
                       </div>
                     )}
+                  </div>
+                )}
+
+                {/* What a job that succeeded still needs an operator to
+                  * hear (B241): the first warning on the card, every one
+                  * on request. */}
+                {warnings.length > 0 && (
+                  <div className="text-xs mb-2 rounded border border-amber-500/40 bg-amber-500/10 p-2"
+                    data-testid="job-warnings">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="font-semibold text-amber-400">
+                        {warnings.length === 1 ? 'Warning' : `${warnings.length} warnings`}
+                      </span>
+                      {warnings.length > 1 && (
+                        <button onClick={() => toggleWarnings(t.id)}
+                          className="text-[10px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer p-0 ml-auto">
+                          {allShown ? 'Show first only' : `Show all ${warnings.length}`}
+                        </button>
+                      )}
+                    </div>
+                    <ul className="m-0 pl-4 text-text-primary break-words">
+                      {(allShown ? warnings : warnings.slice(0, 1)).map((w, i) => (
+                        <li key={i} data-testid="job-warning">{w}</li>
+                      ))}
+                    </ul>
                   </div>
                 )}
 

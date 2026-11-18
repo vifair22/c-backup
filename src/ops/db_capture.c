@@ -375,6 +375,40 @@ void db_captures_free(db_captures_t *c)
 }
 
 /* ------------------------------------------------------------------ */
+/* Coverage (14.5)                                                      */
+/* ------------------------------------------------------------------ */
+
+void db_captures_judge(const db_captures_t *c, db_findings_t *f)
+{
+    if (!c || !f) return;
+    for (size_t i = 0; i < f->n; i++) {
+        db_finding_t *x = &f->v[i];
+        if (x->engine != DB_ENGINE_SQLITE || x->coverage == DB_COV_NONE) continue;
+        const db_capture_info_t *ci = db_captures_find(c, x->path);
+        if (!ci || !ci->attempted) continue;
+        char why[PATH_MAX + 256];
+        if (ci->res.outcome == SQLITE_COPY_OK) {
+            snprintf(why, sizeof(why), "a consistent copy made with SQLite's online backup is in "
+                     "this snapshot at %s, whatever the raw file's read caught", ci->copy_path);
+            x->coverage = DB_COV_COVERED_APPLICATION;
+            x->method = "engine-copy";
+            x->suggestion = NULL;
+            x->optional = NULL;
+        } else {
+            snprintf(why, sizeof(why), "%s; the online backup %s (%s)",
+                     x->coverage_why && *x->coverage_why ? x->coverage_why : "read live",
+                     ci->res.outcome == SQLITE_COPY_ABANDONED ? "was abandoned"
+                     : ci->res.outcome == SQLITE_COPY_REFUSED ? "was not made" : "failed",
+                     ci->res.reason[0] ? ci->res.reason : "no reason given");
+        }
+        char *w = strdup(why);
+        if (!w) continue;
+        free(x->coverage_why);
+        x->coverage_why = w;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Messages (9.5)                                                       */
 /* ------------------------------------------------------------------ */
 

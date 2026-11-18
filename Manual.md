@@ -4906,6 +4906,12 @@ it beside the raw file:
 - The copy is made in the repository's `tmp/`, one database at a time,
   never in memory, and removed once stored. It carries the original's
   owner, mode and mtime.
+- **The copy is what covers it.** A backup whose copy was made judges the
+  finding `covered-application`, method `engine-copy`, with nothing left to
+  suggest, so the uncovered badge and the alert go; the raw file's own read
+  no longer matters for consistency. A copy refused, abandoned or failed
+  leaves the finding as the read judged it (`uncovered` for a live read),
+  and its `coverage_why` ends with what happened to the copy.
 - **Both are kept.** The raw file is stored as read and is read once: it is
   not re-read when it moves (the re-read exists to get a consistent
   version, which the copy provides), and it is flagged if it moved.

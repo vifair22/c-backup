@@ -799,3 +799,24 @@ settled something the design left open:
 | Findings detail | Migration 012 adds `coverage_why`, `method` and `optional` to `db_findings`, so the API answers a finding as the job result gave it |
 | Detection run | `POST /repos/<id>/units/<p>/<u>/detect` is a repo job (never beside a backup of the same repository), scans each tree at its host path as pause-read's first pass does, through `open_scanned`, and judges coverage against the capture the next backup would make. It records with `db_findings_record_detect`: `last_snap_id` kept, its own rows told by `last_seen`, no alert (the coverage is a prediction; the next backup alerts). It fills `file_cache.db_head` only for rows whose size, mtime and ctime still match |
 | UI | The app has no unit pages and no sources page; the Databases view is reached from the repository dashboard and grouped by scope, with Detect now on each unit, and the backup dialog marks sources with uncovered findings. The card leaves an empty actions area for D2 |
+
+### 14.5 An engine copy's coverage (B242)
+
+Section 5 judged a plain file source's live database by the read alone, so
+a SQLite finding stayed `uncovered` after its `sqlite-backup` was enabled
+and the copy made: the badge and the "needs attention" count could only be
+cleared by dismissing the finding, which defeats 7.3's "until it is fixed".
+Decided: the copy is the capture that matters.
+
+| The backup's copy | Coverage | Method | Suggestion | coverage_why |
+|---|---|---|---|---|
+| made (`ok`) | `covered-application`, as a dump hook that succeeded makes a unit's finding (5) | `engine-copy` | none | where the copy is |
+| refused, abandoned or failed | as the read judged it (`uncovered` for a live read) | as before | as before | the read's reason, then what happened to the copy and why |
+| not attempted (not enabled, or not this source's) | as the read judged it | as before | as before | as before |
+
+`covered-application` rather than `covered-crash`: the online backup is a
+transactional copy of one commit, as `pg_dumpall` is, not a crash image. It
+is judged per backup: a later backup whose copy fails is `uncovered` again,
+a coverage change (journalled), and alerts once more (7.3). Applied in
+`db_captures_judge` (`src/ops/db_capture.c`) before the findings are
+recorded, so the job result, `db_findings`, the metrics and the app agree.
