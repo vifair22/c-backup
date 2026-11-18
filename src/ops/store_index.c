@@ -157,9 +157,8 @@ static void entry_args(const pack_commit_entry_t *e, entry_args_t *a)
     snprintf(a->type, sizeof(a->type), "%u", e->type);
 }
 
-/* No size limit: a batch ends only for a queued writer, so a pack nobody
- * waits behind is one transaction, as it always was (OWN-16: the commits a
- * backup adds are bounded by foreign transactions, not by its own size).
+/* No row limit of its own: a batch ends for a queued writer or at the commit
+ * budget (db_txn_batch_should_end), the marker's parts included (B193).
  * Tests set a limit to give a small pack several commits. */
 #define PACK_COMMIT_BATCH UINT32_MAX
 static uint32_t g_pack_batch_rows = PACK_COMMIT_BATCH;
@@ -243,8 +242,10 @@ static void drop_unannounced(store_index_t *idx, const char *repo, const char *p
  *     and salvage replace every row they write, so their commit is this one
  *     transaction, as it always was.
  *
- * Batches commit in order and so does the marker after them, so a power cut
- * keeps a prefix: rows without their packs row, or everything. Start-up
+ * Batches commit in order and so do the marker's parts after them, so a
+ * power cut keeps a prefix: rows without their packs row, or the packs row
+ * and some of the replacing rows, or everything (B193: the replacing rows
+ * are split by the budget too; see below). Start-up
  * (store_index_drop_unannounced) and a failure here put the former back to
  * the state a lost single transaction left: the installed pack file and no
  * rows for it. B142's ordering holds, because the marker is this callback's
@@ -326,10 +327,23 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         }
     }
 
-    /* The marker, with the rows that replace what readers use now. */
+    /*
+     * The marker, then the rows that replace what readers use now. The
+     * packs row goes in the first part, with as many set-aside rows as the
+     * budget allows; the rest follow in parts bounded the same way (B193:
+     * a pack of duplicates - chunks another thread had already packed -
+     * set aside hundreds of rows, and that one transaction held the lock
+     * for 16.7 s on FS2). Once the packs row has committed, each set-aside
+     * row switches a hash from a pack readers can use to this one, which
+     * they can use too, so a part boundary, or a cut there, leaves every
+     * object findable: the old mapping stays until its row is replaced,
+     * and the pack it names is removed only after this callback returns
+     * and the index is durable (index_sync, B142).
+     */
+    int marker = 0;                 /* the packs row has committed */
     if (!failed && !in_txn) {
         if (db_txn_begin_bulk(idx->db) != OK) failed = 1;
-        else in_txn = 1;
+        else { in_txn = 1; rows = 0; db_txn_batch_opened(&batch); }
     }
     if (!failed && db_write(idx->db,
             "INSERT OR REPLACE INTO packs (repo_id, id, filename, size, sealed_at, version)"
@@ -338,6 +352,12 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         failed = 1;
     for (uint32_t i = 0; !failed && i < info->entry_count; i++) {
         if (!later[i]) continue;
+        if (!in_txn) {
+            if (db_txn_begin_bulk(idx->db) != OK) { failed = 1; break; }
+            in_txn = 1;
+            rows = 0;
+            db_txn_batch_opened(&batch);
+        }
         entry_args_t a;
         entry_args(&info->entries[i], &a);
         if ((later[i] & 1) && db_write(idx->db,
@@ -356,10 +376,18 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
                 (const char *[]){ repo, a.hex, a.comp, a.orig, pack, a.type, NULL },
                 NULL) != 0)
             failed = 1;
+        if (failed) break;
+        rows++;
+        if (rows >= g_pack_batch_rows || db_txn_batch_should_end(&batch)) {
+            if (cut_before_commit()) { db_txn_rollback(idx->db); free(later); return; }
+            in_txn = 0;
+            if (db_txn_commit(idx->db) != OK) { failed = 1; break; }
+            marker = 1;
+        }
     }
     free(later);
 
-    if (!failed) {
+    if (!failed && in_txn) {
         if (cut_before_commit()) { db_txn_rollback(idx->db); return; }
         int (*fault)(void) = g_commit_fault;
         if (fault && fault()) {
@@ -369,11 +397,19 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
             in_txn = 0;
             failed = 1;
         }
+    } else if (!failed) {
+        return;                         /* the last part committed in the loop */
     }
     if (in_txn) db_txn_rollback(idx->db);
-    log_error("pack commit: pack %s (%u objects) did not commit", pack, info->entry_count);
-    if (wrote) drop_unannounced(idx, repo, pack);
-    /* The seal fails with it, so its claims are abandoned (store.h). */
+    log_error("pack commit: pack %s (%u objects) did not commit%s", pack, info->entry_count,
+              marker ? " in full; it is indexed, and the objects it duplicates still "
+                       "resolve to the packs that held them" : "");
+    /* Rows without their packs row go back to the state a lost commit
+     * leaves. Once the packs row is in, there is nothing to put back: the
+     * pack is a readable duplicate, and gc collects what nothing names. */
+    if (wrote && !marker) drop_unannounced(idx, repo, pack);
+    /* The seal fails with it, so its claims are abandoned (store.h), and
+     * whatever was to remove the packs it replaces does not (B185). */
     store_pack_commit_failed();
 }
 
