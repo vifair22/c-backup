@@ -399,6 +399,76 @@ real-engines:
           - tests/nbd_test_server.h
           - ci/real-engines/**/*
 
+# The units and helper code under ASan and UBSan (B192). A use-after-free in
+# unit_backup.c crashed the daemon on every unit backup through the helper,
+# and no job saw it: `make test-asan` runs the e2e suites under the
+# sanitizers, but nothing in CI ran that target, and real-engines runs a
+# release build. This runs the helper and units unit suites and the two
+# units end-to-end suites with ASan and UBSan, UBSan not recovering and
+# ASan halting at its first error; any report fails the suite. On an MR it
+# runs only where the units code changed, so it gates exactly that class
+# of change; the nightly schedule runs it unfiltered.
+sanitize-units:
+  stage: analyze
+  image: debian:trixie
+  tags: [docker]
+  needs: []
+  timeout: 45m
+  before_script:
+    - *debian_deps
+    - *fetch_cutils
+  script:
+    - mkdir -p "$C_BACKUP_TEST_DIR"
+    - make test-asan SAN_ONLY='test_helper test_helper_remote test_units test_units_incremental
+        test_docker test_lxc test_providers test_mounts test_units_e2e.sh test_helper_e2e.sh'
+  artifacts:
+    when: on_failure
+    expire_in: 1 week
+    paths:
+      - build/asan/reports/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths:
+          - src/helper/**/*
+          - src/units/**/*
+          - src/api/routes/units*
+          - tests/*helper*
+          - tests/*units*
+
+# real-engines with the programs built under ASan and UBSan (B192): the same
+# sibling, run.sh and teardown, with CBK_SANITIZE=1 selecting the sanitizer
+# build, and every report failing the run. Slower and larger than the
+# release run, so more memory and time, and the same resource_group: never
+# two siblings at once. Nightly, on the image-cut (uat/*) pipelines, and on
+# an MR touching the helper or this job's files.
+real-engines-asan:
+  stage: analyze
+  image: docker:cli
+  tags: [docker]
+  needs: []
+  resource_group: cbackup-real-engines
+  timeout: 65m
+  variables:
+    CBK_SANITIZE: "1"
+    CBK_LIFETIME_S: "3500"
+    CBK_REAP_AFTER_MIN: "65"
+    CBK_SIBLING_CPUS: "1"
+    CBK_SIBLING_MEMORY: "4g"
+  before_script:
+    - apk add --no-cache -q bash git tar coreutils
+  script:
+    - ./ci/real-engines/job.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH =~ /^uat\//
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths:
+          - src/helper/**/*
+          - ci/real-engines/**/*
+
 # The runner binds the host's Docker socket into the job, so builds and pushes
 # run on the host daemon. The dind service this job used to declare was never
 # reached: nothing set DOCKER_HOST to point at it.

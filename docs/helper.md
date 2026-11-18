@@ -548,7 +548,15 @@ pool's capture directory and counted as one more instant.
 
 `restore.stage` creates `<domain>/.cbackup-restore/<job>-<random>` inside
 the mount's snapshot domain and `restore.swap` puts the staged one in place
-and the old directory at `<mount>.cbackup-old-<job>`: never a delete.
+and the old directory at `<mount>.cbackup-old-<job>`: never a delete. With
+`check: true` it makes every refusal of a real stage and creates nothing,
+answering `{"checked": true}`; the daemon checks every mount this way
+before it stops the unit, so a refused restore leaves the unit as it was
+(B189). The staging must be on the mount's filesystem and mount: a rename
+across a bind mount is `EXDEV` even within one filesystem. The base is
+never removed, even empty: it is the directory the daemon has bound
+(B187). After a swap only a VM image's job directory goes, through the
+base fd pinned at stage and only while it is still the pinned directory.
 
 **The mount is swapped where its bytes are (B178).** The daemon names the
 mount by its recorded path, as the container binds it
@@ -605,8 +613,10 @@ The daemon's side is `mode: unit` (`c-backup unit restore <repo> <snap>
   helper as a check (`unit.define` with `check`) before anything is
   written: a policy without `allow_define`, a privileged definition
   without `allow_privileged_define`, a provider not behind the helper, an
-  in-place restore without `allow_restore`, or a VM still running for an
-  in-place restore, is refused with the unit untouched.
+  in-place restore without `allow_restore`, a VM still running for an
+  in-place restore, or anything the provider's own define would refuse
+  (for Docker under a new name, a mount of the original's data, B188), is
+  refused with the unit untouched.
 - **In place** needs `--replace`: the unit is stopped, each mount staged,
   restored and swapped in, the old data left at `<mount>.cbackup-old-<job>`,
   then the definition applied with replace. The mount root takes the

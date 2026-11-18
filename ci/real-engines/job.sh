@@ -115,6 +115,7 @@ docker create --rm --init --privileged --network none \
     --label "cbk.ci.started=$(date +%s)" \
     -e "CBK_LIFETIME_S=$LIFETIME" \
     ${CBK_POOL_MB:+-e "CBK_POOL_MB=$CBK_POOL_MB"} \
+    ${CBK_SANITIZE:+-e "CBK_SANITIZE=$CBK_SANITIZE"} \
     ${CBK_B186_LAYOUT:+-e "CBK_B186_LAYOUT=$CBK_B186_LAYOUT"} \
     --name "$NAME" "$IMAGE" >/dev/null
 

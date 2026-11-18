@@ -225,9 +225,33 @@ fi
 
 log "build: c-utils"
 make -s -C "$CUTILS" -j"$JOBS" >"$WORK/build-cutils.log" 2>&1 || { tail -40 "$WORK/build-cutils.log"; die "c-utils build failed"; }
-log "build: c-backupd, c-backup, c-backup-helper"
-make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic -j"$JOBS" all \
-    >"$WORK/build.log" 2>&1 || { tail -60 "$WORK/build.log"; die "build failed"; }
+# CBK_SANITIZE=1 (the real-engines-asan job, B192): the ASan+UBSan build
+# of the three programs, put where the release ones would be, so every step
+# below runs them unchanged. UBSan does not recover (-fno-sanitize-recover)
+# and ASan halts on its first error, so a finding kills the program at the
+# fault and the run fails there; each report also lands in $SAN_DIR, which
+# the end of the run checks is empty. Leaks are left to the unit suites'
+# ASan job: the programs here are stopped by signal at teardown, after the
+# summary.
+SAN_DIR="$WORK/sanitizer"
+if [ "${CBK_SANITIZE:-0}" = 1 ]; then
+    log "build: c-backupd, c-backup, c-backup-helper with ASan and UBSan"
+    make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic -j"$JOBS" BUILD_TYPE=asan _build \
+        >"$WORK/build.log" 2>&1 || { tail -60 "$WORK/build.log"; die "sanitizer build failed"; }
+    for b in c-backupd c-backup c-backup-helper; do
+        [ -x "$SRC/build/bins/$b-asan" ] || die "build produced no $b-asan"
+        cp -f "$SRC/build/bins/$b-asan" "$SRC/build/bins/$b"
+    done
+    # 1777: the daemon writes its reports after it drops to uid 990, and a
+    # report it cannot open goes nowhere (ASan says only "Can't open file").
+    mkdir -p "$SAN_DIR" && chmod 1777 "$SAN_DIR"
+    export ASAN_OPTIONS="halt_on_error=1:detect_leaks=0:detect_stack_use_after_return=1:log_path=$SAN_DIR/asan"
+    export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:log_path=$SAN_DIR/ubsan"
+else
+    log "build: c-backupd, c-backup, c-backup-helper"
+    make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic -j"$JOBS" all \
+        >"$WORK/build.log" 2>&1 || { tail -60 "$WORK/build.log"; die "build failed"; }
+fi
 for b in c-backupd c-backup c-backup-helper; do
     [ -x "$SRC/build/bins/$b" ] || die "build produced no $b"
 done
@@ -255,12 +279,21 @@ chmod 0750 "$HRUN"; chgrp "$DUID" "$HRUN"
 # ---- the private Docker engine and a local registry ----------------------
 
 log "dind: starting a private dockerd"
-mkdir -p "$WORK/docker" "$WORK/docker-exec" /etc/docker
-# vfs: the data root is on this container's own overlay, where overlay2
-# cannot nest, and the test images are a few MiB. No volume, so nothing of
-# this engine outlives the container. No bridge, no iptables: the sibling
-# has no network and every test container runs with network none.
-dockerd --data-root "$WORK/docker" --exec-root "$WORK/docker-exec" \
+mkdir -p "$WORK/docker-exec" /etc/docker
+# vfs: overlay2 cannot nest on this container's own overlay, and the test
+# images are a few MiB. The data root is on the pool the way Unraid's is,
+# /var/lib/docker a bind of /mnt/cache/system/docker, so a volume is in the
+# pool's snapshot domain (the helper reads it through the pool, B170) and
+# can be captured and restored in place; the pool goes with the container,
+# so nothing of this engine outlives it. A data root that is not already a
+# mount point dockerd bind-mounts onto itself, which would put a mount
+# boundary between the volumes and the rest of the pool that Unraid does
+# not have. No bridge, no iptables: the sibling has no network and every
+# test container runs with network none.
+DOCKER_ROOT=/var/lib/docker
+mkdir -p "$CACHE/system/docker" "$DOCKER_ROOT"
+mount --bind "$CACHE/system/docker" "$DOCKER_ROOT" || die "cannot bind the docker data root"
+dockerd --data-root "$DOCKER_ROOT" --exec-root "$WORK/docker-exec" \
     --storage-driver vfs --bridge none --iptables=false --ip6tables=false \
     -H unix:///var/run/docker.sock >"$WORK/dockerd.log" 2>&1 &
 DOCKERD_PID=$!
@@ -338,6 +371,17 @@ head -c 2097152 /dev/urandom > "$SOLO/dump-source.bin"
 printf 'id,value\n1,alpha\n2,beta\n' > "$PROJ/db/table.csv"
 docker run -d --name cbk-uat-solo --network none -v "$SOLO:/data" "$IMG" \
     sh -c 'trap "exit 0" TERM; while :; do sleep 1; done' >/dev/null || die "cannot start cbk-uat-solo"
+# A container whose data is in volumes, one named and one anonymous (the
+# image's VOLUME, as most images declare): a restore has to reach both.
+VOLS_NAMED=cbk-uat-vols-data
+docker volume create "$VOLS_NAMED" >/dev/null || die "cannot create $VOLS_NAMED"
+docker run -d --name cbk-uat-vols --network none -v "$VOLS_NAMED:/named" -v /anon "$IMG" \
+    sh -c 'echo named-v1 > /named/f; head -c 262144 /dev/urandom > /named/r.bin; mkdir -p /named/d;
+           echo deep > /named/d/x; echo anon-v1 > /anon/f; head -c 131072 /dev/urandom > /anon/r.bin; sync;
+           trap "exit 0" TERM; while :; do sleep 1; done' >/dev/null || die "cannot start cbk-uat-vols"
+VOLS_ANON=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/anon"}}{{.Name}}{{end}}{{end}}' cbk-uat-vols)
+[ -n "$VOLS_ANON" ] || die "cbk-uat-vols has no anonymous volume"
+for _ in $(seq 1 50); do docker exec cbk-uat-vols cat /anon/f >/dev/null 2>&1 && break; sleep 0.2; done
 cat > "$PROJ/compose.yaml" <<EOF
 services:
   app:
@@ -352,10 +396,17 @@ services:
     command: ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"]
     volumes:
       - ./db:/data
+      - dbvol:/vol
+      - /anon
+volumes:
+  dbvol:
 EOF
 printf 'CBK_UAT=1\n' > "$PROJ/.env"
 docker compose -p cbk-uat-proj --project-directory "$PROJ" -f "$PROJ/compose.yaml" up -d --no-build >"$WORK/compose-up.log" 2>&1 ||
     { cat "$WORK/compose-up.log"; die "compose up failed"; }
+PROJ_VOL=cbk-uat-proj_dbvol
+docker exec cbk-uat-proj-db-1 sh -c 'echo vol-v1 > /vol/f; head -c 65536 /dev/urandom > /vol/r.bin; echo anon-v1 > /anon/f; sync' ||
+    die "cannot fill $PROJ_VOL"
 
 # ---- helper and daemon ---------------------------------------------------
 
@@ -599,6 +650,91 @@ leftovers "after the solo new-name define"
 }
 test_solo
 
+# ---- Docker: data in volumes (B188) ---------------------------------------
+
+# Every file's path and hash under a volume's mount point, as one sum.
+vol_sum() {
+    local mp
+    mp=$(docker volume inspect -f '{{.Mountpoint}}' "$1" 2>/dev/null) || { echo "no volume $1"; return; }
+    (cd "$mp" && find . -printf '%p %y %m\n' | sort && find . -type f -exec sha256sum {} + | sort) | sha256sum
+}
+# The containers, running or not, that mount a volume.
+vol_users() { docker ps -a --filter "volume=$1" --format '{{.Names}}' | sort | tr '\n' ' ' | sed 's/ $//'; }
+
+test_vols() {
+log "docker: cbk-uat-vols, a named and an anonymous volume"
+OUT_B=$(cb unit backup 1 --provider docker cbk-uat-vols 2>&1)
+job_ok "unit backup of a container with volumes" "$OUT_B"
+contains "the volumes are in the pool's domain: crash consistency" '"consistency":"crash"' "$OUT_B"
+SNAP_VOLS=$(snap_of "$OUT_B")
+leftovers "after the volumes backup"
+have_snap "the volumes backup" "$SNAP_VOLS" || return 0
+
+log "docker: volumes, in place: the restored data is what the container mounts (B188)"
+docker exec cbk-uat-vols sh -c 'echo changed > /named/f; echo changed > /anon/f; sync' >/dev/null 2>&1
+docker stop -t 2 cbk-uat-vols >/dev/null 2>&1
+OUT_D=$(cb unit restore 1 "$SNAP_VOLS" --define --replace --start 2>&1)
+job_ok "in-place restore of a container with volumes" "$OUT_D"
+check "the container runs again" running "$(docker inspect -f '{{.State.Status}}' cbk-uat-vols 2>/dev/null)"
+check "it mounts the same named volume" "$VOLS_NAMED" "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/named"}}{{.Name}}{{end}}{{end}}' cbk-uat-vols 2>/dev/null)"
+check "it mounts the same anonymous volume, not a new one" "$VOLS_ANON" "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/anon"}}{{.Name}}{{end}}{{end}}' cbk-uat-vols 2>/dev/null)"
+check "the named volume holds the restored data" named-v1 "$(docker exec cbk-uat-vols cat /named/f 2>/dev/null)"
+check "the anonymous volume holds the restored data" anon-v1 "$(docker exec cbk-uat-vols cat /anon/f 2>/dev/null)"
+docker ps -aq --filter name=cbk-uat-vols.cbackup-old- | xargs -r docker rm >/dev/null 2>&1
+rm -rf "$DOCKER_ROOT"/volumes/*/_data.cbackup-old-* "$CACHE"/system/docker/volumes/*/_data.cbackup-old-*
+leftovers "after the volumes in-place define"
+
+log "docker: volumes, a restore under a new name never touches the original's (B188)"
+SUM_N=$(vol_sum "$VOLS_NAMED")
+SUM_A=$(vol_sum "$VOLS_ANON")
+TRV="$APPS/restored-vols"
+OUT_N=$(cb unit restore 1 "$SNAP_VOLS" --define --name cbk-uat-vols2 --target-root "$TRV" --start 2>&1)
+job_ok "new-name restore of a container with volumes" "$OUT_N"
+check "the copy runs" running "$(docker inspect -f '{{.State.Status}}' cbk-uat-vols2 2>/dev/null)"
+MOUNTS=$(docker inspect -f '{{range .Mounts}}{{.Type}}:{{.Name}}:{{.Source}}:{{.Destination}} {{end}}' cbk-uat-vols2 2>/dev/null)
+lacks "the copy mounts no volume at all" "volume:" "$MOUNTS"
+lacks "the copy does not mount the original's named volume" ":$VOLS_NAMED:" "$MOUNTS"
+lacks "the copy does not mount the original's anonymous volume" ":$VOLS_ANON:" "$MOUNTS"
+contains "the copy binds the named volume's restored copy" "bind::$TRV$DOCKER_ROOT/volumes/$VOLS_NAMED/_data:/named" "$MOUNTS"
+contains "the copy binds the anonymous volume's restored copy" "bind::$TRV$DOCKER_ROOT/volumes/$VOLS_ANON/_data:/anon" "$MOUNTS"
+check "the copy has the named volume's data" named-v1 "$(docker exec cbk-uat-vols2 cat /named/f 2>/dev/null)"
+check "the copy has the anonymous volume's data" anon-v1 "$(docker exec cbk-uat-vols2 cat /anon/f 2>/dev/null)"
+check "only the original mounts the named volume" cbk-uat-vols "$(vol_users "$VOLS_NAMED")"
+check "only the original mounts the anonymous volume" cbk-uat-vols "$(vol_users "$VOLS_ANON")"
+# The copy writes; the original's bytes do not move.
+docker exec cbk-uat-vols2 sh -c 'echo copy-wrote > /named/f; echo copy-wrote > /anon/f; rm -f /named/r.bin; sync' >/dev/null 2>&1
+check "the original's named volume is byte-identical" "$SUM_N" "$(vol_sum "$VOLS_NAMED")"
+check "the original's anonymous volume is byte-identical" "$SUM_A" "$(vol_sum "$VOLS_ANON")"
+check "the original still reads its own data" named-v1 "$(docker exec cbk-uat-vols cat /named/f 2>/dev/null)"
+docker rm -f cbk-uat-vols2 >/dev/null 2>&1
+leftovers "after the volumes new-name define"
+}
+test_vols
+
+# ---- Docker: a host block device bound in (B188) --------------------------
+
+test_blk() {
+log "docker: cbk-uat-blk, the pool's loop device bound in"
+mkdir -p "$APPS/cbk-uat-blk"
+echo blk-data > "$APPS/cbk-uat-blk/f"
+docker run -d --name cbk-uat-blk --network none -v "$APPS/cbk-uat-blk:/data" -v "$LOOPDEV:/disk" \
+    -v /etc/localtime:/etc/localtime:ro "$IMG" \
+    sh -c 'trap "exit 0" TERM; while :; do sleep 1; done' >/dev/null || { bad "cbk-uat-blk starts" started failed; return 0; }
+OUT_B=$(cb unit backup 1 --provider docker cbk-uat-blk 2>&1)
+job_ok "unit backup of a container with a block device bound" "$OUT_B"
+SNAP_BLK=$(snap_of "$OUT_B")
+have_snap "the block-device backup" "$SNAP_BLK" || { docker rm -f cbk-uat-blk >/dev/null 2>&1; return 0; }
+TRB="$APPS/restored-blk"
+OUT_N=$(cb unit restore 1 "$SNAP_BLK" --define --name cbk-uat-blk2 --target-root "$TRB" --start 2>&1)
+contains "a copy with a block device bound is refused" '"state":"failed"' "$OUT_N"
+contains "the refusal names the bind and why" "$LOOPDEV -> /disk: a block device" "$OUT_N"
+check "no copy was created" "" "$(docker ps -aq --filter name=cbk-uat-blk2)"
+check "nothing was written under the target root" no "$([ -e "$TRB" ] && echo yes || echo no)"
+docker rm -f cbk-uat-blk >/dev/null 2>&1
+leftovers "after the block-device refusal"
+}
+test_blk
+
 # ---- Docker: a compose project -------------------------------------------
 
 test_project() {
@@ -627,13 +763,31 @@ contains "the post hook's log is stored" "post-hook-ran" "$(cat "$R/.cbackup-uni
 check "the compose file is stored verbatim" "$COMPOSE_SUM" "$(sha256sum < "$R/.cbackup-unit/config/compose/compose.yaml" 2>/dev/null)"
 
 log "docker: compose project in place"
+docker exec cbk-uat-proj-db-1 sh -c 'echo changed > /anon/f; sync' >/dev/null 2>&1
 docker compose -p cbk-uat-proj --project-directory "$PROJ" -f "$PROJ/compose.yaml" stop >/dev/null 2>&1
 OUT_D=$(cb unit restore 1 "$SNAP_PROJ" --define --replace --start 2>&1)
 job_ok "in-place restore of the project" "$OUT_D"
 check "app is the snapshot's again" "$MAN_APP" "$(manifest "$PROJ/app")"
 check "db is the snapshot's again" "$MAN_DB" "$(manifest "$PROJ/db")"
+check "db's anonymous volume holds the restored data (B188)" anon-v1 "$(docker exec cbk-uat-proj-db-1 cat /anon/f 2>/dev/null)"
 check "the project's services run again" "running running" "$(docker inspect -f '{{.State.Status}}' cbk-uat-proj-app-1 cbk-uat-proj-db-1 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
 leftovers "after the project define"
+
+log "docker: compose project under a new name never touches the original's (B188)"
+SUM_P=$(vol_sum "$PROJ_VOL")
+TRP="$APPS/restored-proj"
+OUT_N=$(cb unit restore 1 "$SNAP_PROJ" --define --name cbk-uat-projcopy --target-root "$TRP" --start 2>&1)
+job_ok "new-name restore of the project" "$OUT_N"
+check "the copy's services run" "running running" "$(docker inspect -f '{{.State.Status}}' cbk-uat-projcopy-app cbk-uat-projcopy-db 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+OUTSIDE=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' cbk-uat-projcopy-app cbk-uat-projcopy-db 2>/dev/null | grep -v '^$' | grep -cv "^$TRP/")
+check "every mount of the copy is under its target root" 0 "$OUTSIDE"
+check "the copy has the volume's data" vol-v1 "$(docker exec cbk-uat-projcopy-db cat /vol/f 2>/dev/null)"
+check "only the original mounts the project's volume" cbk-uat-proj-db-1 "$(vol_users "$PROJ_VOL")"
+docker exec cbk-uat-projcopy-db sh -c 'echo copy-wrote > /vol/f; echo copy-wrote > /data/table.csv; sync' >/dev/null 2>&1
+check "the original's volume is byte-identical" "$SUM_P" "$(vol_sum "$PROJ_VOL")"
+check "the original's bind is untouched" "$MAN_DB" "$(manifest "$PROJ/db")"
+docker rm -f cbk-uat-projcopy-app cbk-uat-projcopy-db >/dev/null 2>&1
+leftovers "after the project new-name define"
 }
 test_project
 
@@ -659,6 +813,18 @@ if lxc-create -P "$LXCP" -n cbk-uat-lxc -f "$WORK/lxc.conf" -t busybox >"$WORK/l
         job_ok "files restore of the LXC snapshot" "$(cb unit restore 1 "$SNAP_LXC" "$R" 2>&1)"
         check "the rootfs restores byte for byte" "$MAN_LXC" "$(manifest "$R$LXCP/cbk-uat-lxc/rootfs")"
         contains "the LXC config is stored" "lxc.rootfs.path" "$(cat "$R/.cbackup-unit/config/lxc/config" 2>/dev/null)"
+
+        # B191: only Docker located a mount's snapshot domain, so an LXC
+        # restore in place was always refused.
+        log "lxc: in place, stopped"
+        echo changed >> "$LXCP/cbk-uat-lxc/rootfs/payload.bin"
+        OUT_I=$(cb unit restore 1 "$SNAP_LXC" --define --replace 2>&1)
+        job_ok "in-place restore of the stopped LXC container" "$OUT_I"
+        check "the rootfs is the snapshot's again" "$MAN_LXC" "$(manifest "$LXCP/cbk-uat-lxc/rootfs")"
+        check "the replaced rootfs was moved aside" 1 "$(ls -d "$LXCP"/cbk-uat-lxc/rootfs.cbackup-old-* 2>/dev/null | wc -l)"
+        check "it is left stopped, as it was" STOPPED "$(lxc-info -P "$LXCP" -n cbk-uat-lxc -s -H 2>/dev/null)"
+        rm -rf "$LXCP"/cbk-uat-lxc/rootfs.cbackup-old-*
+        leftovers "after the LXC in-place restore"
     fi
 
     if lxc-start -P "$LXCP" -n cbk-uat-lxc >"$WORK/lxc-start.log" 2>&1 &&
@@ -669,6 +835,32 @@ if lxc-create -P "$LXCP" -n cbk-uat-lxc -f "$WORK/lxc.conf" -t busybox >"$WORK/l
         contains "frozen around the snapshot: crash consistency" '"consistency":"crash"' "$OUT_B"
         check "and thawed after" RUNNING "$(lxc-info -P "$LXCP" -n cbk-uat-lxc -s -H 2>/dev/null)"
         leftovers "after the running LXC backup"
+        SNAP_LXC2=$(snap_of "$OUT_B")
+        PAY_SUM=$(sha256sum < "$LXCP/cbk-uat-lxc/rootfs/payload.bin")
+
+        # B189: a staging the helper refuses (here the base replaced by a
+        # symlink) is refused before the unit is stopped.
+        log "lxc: in place, refused before the stop"
+        SB="$CACHE/system/.cbackup-restore"
+        mkdir -p "$SB"
+        mv "$SB" "$SB.held"
+        ln -s "$WORK" "$SB"
+        OUT_X=$(cb unit restore 1 "$SNAP_LXC2" --define --replace --start 2>&1)
+        contains "a refused staging fails the restore" '"state":"failed"' "$OUT_X"
+        contains "and says nothing was written" "nothing written" "$OUT_X"
+        check "the container was never stopped" RUNNING "$(lxc-info -P "$LXCP" -n cbk-uat-lxc -s -H 2>/dev/null)"
+        rm -f "$SB"
+        mv "$SB.held" "$SB"
+
+        log "lxc: in place, running, started again"
+        echo changed >> "$LXCP/cbk-uat-lxc/rootfs/payload.bin"
+        OUT_I=$(cb unit restore 1 "$SNAP_LXC2" --define --replace --start 2>&1)
+        job_ok "in-place restore of the running LXC container" "$OUT_I"
+        check "the payload is the snapshot's again" "$PAY_SUM" "$(sha256sum < "$LXCP/cbk-uat-lxc/rootfs/payload.bin")"
+        lxc-wait -P "$LXCP" -n cbk-uat-lxc -s RUNNING -t 20 >/dev/null 2>&1
+        check "and it runs again" RUNNING "$(lxc-info -P "$LXCP" -n cbk-uat-lxc -s -H 2>/dev/null)"
+        rm -rf "$LXCP"/cbk-uat-lxc/rootfs.cbackup-old-*
+        leftovers "after the running LXC in-place restore"
         lxc-stop -P "$LXCP" -n cbk-uat-lxc -k >/dev/null 2>&1
     else
         log "lxc: the container would not start here; running backup not exercised"
@@ -847,6 +1039,18 @@ else
 fi
 
 # ---- the end -------------------------------------------------------------
+
+if [ "${CBK_SANITIZE:-0}" = 1 ]; then
+    log "sanitizer reports"
+    reports=$(ls -A "$SAN_DIR" 2>/dev/null)
+    check "no ASan or UBSan report from the daemon, the CLI or the helper" "" "$reports"
+    for f in $reports; do echo "---- $f"; head -60 "$SAN_DIR/$f"; done
+    # A report that could not be written, or one a program printed itself,
+    # is in its log instead.
+    check "no sanitizer finding in the daemon's or the helper's log" 0 \
+        "$(cat "$WORK/daemon.log" "$WORK/helper.log" 2>/dev/null |
+           grep -cE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|Can.t open file: .*/sanitizer/')"
+fi
 
 log "final leftovers"
 check "the daemon is still running" 0 "$(kill -0 "$DAEMON_PID" 2>/dev/null; echo $?)"

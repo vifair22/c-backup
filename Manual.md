@@ -1032,9 +1032,16 @@ write lock across batches of up to 2,000 files, and lets it go as soon as
 another write is queued for it: at the next file, the next read of the file
 it is storing, the next directory tree, or the next row of the snapshot's
 node index, which it writes last. A write that is waiting goes before the
-backup's next batch. A backup nobody interrupts commits once per 2,000 files
-and once per sealed pack, which matters on storage where each commit's sync
-is slow.
+backup's next batch, and before every other bulk write that is waiting too
+(the backup's pack commits, a reindex, gc): it waits for the one transaction
+holding the lock and no more. That priority is bounded, so a steady stream
+of edits cannot stall a backup: a bulk write that has waited 150 ms, or
+seen eight edits go first, is served next. That transaction is itself bounded: every bulk
+transaction ends once it has written about as many database pages as the
+disk under `state.db` takes in 150 ms, learnt from the commits before it,
+and never more than 256. A backup nobody interrupts commits once per 2,000
+files, once per sealed pack, and wherever that bound falls, which matters on
+storage where each commit's writes are slow.
 
 What happens after the commit depends on the edit:
 
@@ -1077,6 +1084,16 @@ scales these down roughly with its sync latency. Keep `state.db`
 (`db.path`) off a disk that other work saturates if tag and delete latency
 matters. Which class every API
 route has is listed in `docs/api.md`.
+
+A tag write also writes the repository's own copy of the tag list before it
+touches the database, and makes it durable there: one `fsync` of the file
+and one of the repository's directory, on the repository's storage, outside
+the database's lock. That is what a tag costs on top of any other durable
+edit, and it is the disk's cost, not a wait for the backup: on the M5 pool
+above with a backup and other load running, those two syncs took 5-7 s
+between them (image M7), while the database lock was held for at most one
+bounded transaction. A repository on a busy pool makes tags slow in exactly
+this way; nothing the daemon waits for can shorten it.
 
 A change to a repository's sources applies to backups submitted after it. A
 backup takes its sources from the configuration when it is submitted, so a
@@ -3959,6 +3976,39 @@ c-backup unit restore 1 5120 --define --name immich-test \
 | Definition | re-applied with the same name (and for a VM the same UUID) | the name changed; bind sources, volumes, rootfs and mount entries rewritten under `DIR`; a VM's `<uuid>` removed (libvirt makes a new one), MACs regenerated unless `--keep-macs`, disks pointing at the new images, excluded passthrough disks dropped and listed |
 | Never | a delete: old data is moved aside, never removed | |
 
+**In place, the container gets back the volumes that were restored.** A
+volume's data is swapped in where the volume lives, and the re-created
+container is given that same volume by name, an anonymous one included
+(B188): one named only by the image's `VOLUME` used to come back as a new,
+empty volume, with the restored data left in the old one and the job
+reported completed.
+
+**A copy never touches the original's data.** A restore under a new name
+makes a second container beside the original, and it mounts only what the
+restore wrote under `DIR`: every bind source and every volume, named or
+anonymous (an image's `VOLUME`), becomes a bind of its restored copy at
+`DIR/<the path the backup read it from>` (a volume's is under Docker's
+`volumes/` directory). Binds of the host itself follow one rule:
+
+| Host bind | In the copy |
+|---|---|
+| `/proc`, `/sys`, `/etc/localtime`, `/etc/timezone`, the Docker socket | kept as recorded |
+| a character device under `/dev` (`/dev/dri`, `/dev/net/tun`, `/dev/fuse`, a tty), or a `/dev` directory holding no block device | kept as recorded |
+| a block device, anywhere, decided by its type on the host after following links (`/dev/disk/by-id/...`, `/dev/mapper/...`), as a bind or in `Devices` | refused |
+| anything else under `/etc`, anything under `/run` (and `/var/run`), anything under `/boot` | refused |
+
+Anything else refuses the restore before the container is created, with
+`refused, nothing created` naming the bind (`<host path> -> <container
+path>`) and why: a host path from the table above, a mount with no
+restored copy (an excluded bind, a remote volume's), a volume still named,
+`VolumesFrom`, or a `DIR` inside one of the original's mounts. A kept host
+bind outside the include roots still needs `allow_privileged_define`, as
+for any define. The helper checks the container Docker actually
+created too, before anything starts it: one that mounts a volume that
+existed before the restore, or a bind outside `DIR`, is removed and the
+restore refused. A compose copy is created with `--no-start`, checked the
+same way, and only then started.
+
 **Every refusal comes first.** Before anything is written or stopped, the
 daemon builds the definition and has the helper check it (`unit.define` in
 check mode): the policy's `allow_define`, a privileged definition without
@@ -3995,8 +4045,13 @@ nothing is staged. Restore to a new location then.
 
 **The mount root** comes back with the snapshot's owner, mode, times,
 xattrs and ACLs, like everything below it, not the staging directory's
-`0700`. Once swapped, an emptied `.cbackup-restore` the helper made is
-removed.
+`0700`. The staging base itself (`.cbackup-restore`) is never removed,
+emptied or not (B187): it is the directory the daemon has bound, and
+removing it detached the bind, so the next in-place restore into that
+domain, or the second mount of a unit with two in one domain, failed
+`EROFS`. Only a VM image's per-job staging directory goes once its image
+has moved out, chosen by the identity the helper pinned at stage, never by
+its name.
 
 The job's byte progress covers every mount and disk of the restore: done
 only grows, and the total ends at the whole restore's.
@@ -4013,10 +4068,14 @@ refuses it:
 |---|---|
 | the top of a pool | visible over the network |
 | a share with `shareUseCache="yes"` | the mover would carry staged files to the array mid-restore |
-| another filesystem from the mount (a btrfs subvolume, another dataset) | the swap could not be a rename |
+| another filesystem or mount from the mount (a btrfs subvolume, another dataset, a bind mount between them) | the swap could not be a rename |
 | a path through a symlink | never followed, so the helper cannot be steered outside the share |
 
-Each refusal says what to change. Whether the share is exported over SMB
+Each refusal says what to change, and comes before the unit is stopped
+(B189): the daemon asks the helper to check every mount's staging
+(`restore.stage` with `check`, which creates nothing) first, so a refused
+restore leaves the unit running as it was, with `refused, nothing written`
+in the error. Whether the share is exported over SMB
 or NFS does not matter (FS1's `appdata` is): anyone who can write the share
 can already edit the data in it. The helper creates the directory 0700,
 owned by 990, gives a root-owned one to 990, and uses one anybody else owns
@@ -4066,13 +4125,17 @@ with the Compose Manager plugin; the image does not carry one. The recorded
 compose files and `.env` are written back to the project directory (under
 the target root for a new name), any file they replace moved aside, and a
 `cbackup-override.yaml` pins each service's image by digest (tag fallback
-with a warning) and, under a new name, rewrites the services' binds and sets
+with a warning) and, under a new name, replaces every bind and volume of
+each service with its restored copy under the target root (above) and sets
 container names `<project>-<service>`. Then `docker compose -p <project> up
--d --no-build`, with `--no-start` unless `--start`. Replacing a project needs
+-d --no-build`, with `--no-start` unless `--start` (under a new name always,
+then `docker compose start` once the copy is checked). Replacing a project needs
 its containers stopped; they are renamed aside rather than removed.
 
 **LXC.** In place (`--replace`), the container is stopped, its rootfs and
-each mount entry's source staged and swapped like any mount, and its
+each bind `lxc.mount.entry` source staged in its own snapshot domain (the
+ZFS dataset or btrfs pool holding it, as for a Docker mount, B191) and
+swapped like any mount, and its
 config written back to `<[lxc] path>/<name>/config`, the old config moved
 aside to `config.cbackup-old-<time>`, never deleted.
 

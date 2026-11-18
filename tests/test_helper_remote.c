@@ -27,6 +27,9 @@
 #include <stdatomic.h>
 
 #include "helper_fixture.h"
+
+#define CUTILS_CJSON_ALLOW
+#include "cJSON.h"
 #include "registry.h"
 #include "remote_provider.h"
 #include "repo.h"
@@ -485,6 +488,91 @@ static void test_unit_restore(void **state)
     assert_int_equal(stat(HF_MOUNT, &sb), 0);
     assert_int_equal(sb.st_mode & 07777, 0751);
     assert_int_equal((long long)sb.st_mtim.tv_sec, 1500000000LL);
+    /* B187: the staging base stays, empty, for the next restore. */
+    assert_int_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
+    assert_true(S_ISDIR(sb.st_mode));
+    assert_int_equal(system("[ -z \"$(ls -A '" HF_POOL "/.cbackup-restore')\" ]"), 0);
+}
+
+/*
+ * B187: the staging base is the directory the daemon has bound, and it is
+ * never removed. A swap used to remove it once it was empty, which
+ * detached the daemon's bind: every later in-place restore into the
+ * domain, and the second mount of a unit with two in one domain, failed
+ * EROFS. Here the base is made beforehand, as the deployment makes it, and
+ * held open, as the daemon's bind holds it: two in-place restores in a row
+ * of a unit with two mounts in one domain both succeed, and the held
+ * directory is the base throughout, never unlinked.
+ */
+static void test_staging_base_kept(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(HF_POOL "/app/u1b", 0700), 0);
+    assert_int_equal(mkdir(HF_DIR "/snap2", 0700), 0);
+    hf_write(HF_DIR "/snap2/b.txt", "beta\n");
+    hf_write(HF_POOL "/app/u1b/live2.txt", "live2\n");
+    assert_int_equal(fake_tree_add(fk, "u1", "vol2", HF_DIR "/snap2", HF_POOL "/app/u1b"), OK);
+    assert_int_equal(fake_tree_set_source(fk, "u1", "vol2", HF_POOL "/app/u1b"), OK);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    const char *base = HF_POOL "/.cbackup-restore";
+    assert_int_equal(mkdir(base, 0700), 0);
+    int bfd = open(base, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    assert_true(bfd >= 0);
+    struct stat held, sb;
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.replace = 1;
+    unit_define_result_t dr;
+    for (int64_t job = 61; job <= 62; job++) {
+        if (unit_define_run(store, db, repo_id, snap, job, &o, &dr) != OK) fail_msg("job %lld: %s", (long long)job, err_msg());
+        unit_define_result_free(&dr);
+        assert_int_equal(stat(HF_MOUNT "/a.txt", &sb), 0);
+        assert_int_equal(stat(HF_POOL "/app/u1b/b.txt", &sb), 0);
+        assert_int_not_equal(stat(HF_POOL "/app/u1b/live2.txt", &sb), 0);
+        /* Not unlinked: an unlinked directory takes no new entries
+         * (ENOENT), whatever st_nlink a filesystem reports. */
+        int pf = openat(bfd, "probe", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        assert_true(pf >= 0);
+        close(pf);
+        assert_int_equal(unlinkat(bfd, "probe", 0), 0);
+        assert_int_equal(fstat(bfd, &held), 0);
+        assert_int_equal(stat(base, &sb), 0);
+        assert_true(sb.st_dev == held.st_dev && sb.st_ino == held.st_ino);
+    }
+    assert_int_equal(stat(HF_POOL "/app/u1b.cbackup-old-61/live2.txt", &sb), 0);
+    close(bfd);
+}
+
+/*
+ * B189: a staging the helper refuses is refused before the unit is
+ * stopped. The refusal (here a mount in no snapshot domain) used to come
+ * from restore.stage once the unit was down, and left it down.
+ */
+static void test_stage_refused_before_stop(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(HF_DIR "/nodomain", 0700), 0);
+    hf_write(HF_DIR "/nodomain/live.txt", "live\n");
+    assert_int_equal(fake_tree_set_source(fk, "u1", "vol", HF_DIR "/nodomain"), OK);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.replace = 1;
+    unit_define_result_t dr;
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 71, &o, &dr), OK);
+    assert_non_null(strstr(err_msg(), "nothing written"));
+    assert_non_null(strstr(err_msg(), "left as it was"));
+    assert_non_null(strstr(err_msg(), "no snapshot domain"));
+    err_clear();
+    assert_int_equal(fake_unit_state(fk, "u1"), SP_STATE_RUNNING);
+    struct stat sb;
+    assert_int_equal(stat(HF_DIR "/nodomain/live.txt", &sb), 0);
     assert_int_not_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
 }
 
@@ -748,7 +836,11 @@ static void test_compose_definition(void **state)
     static const char inspect[] =
         "{\"Name\":\"/web-db\",\"Config\":{\"Labels\":{\"com.docker.compose.service\":\"db\","
         "\"com.docker.compose.project.working_dir\":\"" HF_POOL "/proj\"}},"
-        "\"HostConfig\":{\"Binds\":[\"" HF_MOUNT "/pg:/var/lib/pg:rw\",\"/etc/localtime:/etc/localtime:ro\"]}}";
+        "\"HostConfig\":{\"Binds\":[\"" HF_MOUNT "/pg:/var/lib/pg:rw\",\"/etc/localtime:/etc/localtime:ro\"]},"
+        "\"Mounts\":[{\"Type\":\"bind\",\"Source\":\"" HF_MOUNT "/pg\",\"Destination\":\"/var/lib/pg\",\"RW\":true},"
+        "{\"Type\":\"bind\",\"Source\":\"/etc/localtime\",\"Destination\":\"/etc/localtime\",\"RW\":false},"
+        "{\"Type\":\"volume\",\"Name\":\"pgwal\",\"Source\":\"" HF_MOUNT "/v/pgwal/_data\",\"Destination\":\"/wal\",\"RW\":true},"
+        "{\"Type\":\"volume\",\"Name\":\"0f3c9a\",\"Source\":\"" HF_MOUNT "/v/0f3c9a/_data\",\"Destination\":\"/anon\",\"RW\":false}]}";
     static const char image[] = "{\"RepoDigests\":[\"postgres@sha256:feed\"],\"RepoTags\":[\"postgres:16\"]}";
     assert_int_equal(fake_blob_add(fk, "u1", "c1", ".cbackup-unit/config/compose/compose.yaml", "services: {}\n", 13), OK);
     assert_int_equal(fake_blob_add(fk, "u1", "c2", ".cbackup-unit/config/compose/.env", "A=1\n", 4), OK);
@@ -771,10 +863,58 @@ static void test_compose_definition(void **state)
     assert_non_null(strstr(txt, "\"working_dir\":\"" HF_POOL "/proj\""));
     assert_non_null(strstr(txt, "\"service\":\"db\""));
     assert_non_null(strstr(txt, "postgres@sha256:feed"));
-    assert_non_null(strstr(txt, "/restore" HF_MOUNT "/pg:/var/lib/pg:rw"));
+    assert_non_null(strstr(txt, "\"/restore" HF_MOUNT "/pg:/var/lib/pg\""));
     assert_null(strstr(txt, "/restore/etc/localtime"));     /* in no tree: not remapped */
     assert_non_null(strstr(txt, "\"target_root\":\"/restore\""));
+    /* B188: the named and the anonymous volume onto their restored copies,
+     * and the recorded mounts passed for the helper to check against. */
+    assert_non_null(strstr(txt, "\"/restore" HF_MOUNT "/v/pgwal/_data:/wal\""));
+    assert_non_null(strstr(txt, "\"/restore" HF_MOUNT "/v/0f3c9a/_data:/anon:ro\""));
+    assert_non_null(strstr(txt, "\"mounts\":[{\"Type\":\"bind\""));
     free(txt);
+}
+
+/* A standalone container's definition under a new name (B188): every bind
+ * and volume, named in Binds or HostConfig.Mounts or anonymous, rewritten
+ * onto its restored copy under the target root, so nothing the copy is
+ * created with names the original's data. */
+static void test_docker_copy_definition(void **state)
+{
+    (void)state;
+    static const char inspect[] =
+        "{\"Name\":\"/solo\",\"Config\":{\"Image\":\"x\",\"Volumes\":{\"/anon\":{}}},"
+        "\"HostConfig\":{\"Binds\":[\"" HF_MOUNT "/www:/www:rw\",\"pgwal:/wal\"],"
+        "\"Mounts\":[{\"Type\":\"volume\",\"Source\":\"logs\",\"Target\":\"/logs\"}]},"
+        "\"Mounts\":[{\"Type\":\"bind\",\"Source\":\"" HF_MOUNT "/www\",\"Destination\":\"/www\",\"RW\":true},"
+        "{\"Type\":\"volume\",\"Name\":\"pgwal\",\"Source\":\"" HF_MOUNT "/v/pgwal/_data\",\"Destination\":\"/wal\",\"RW\":true},"
+        "{\"Type\":\"volume\",\"Name\":\"logs\",\"Source\":\"" HF_MOUNT "/v/logs/_data\",\"Destination\":\"/logs\",\"RW\":true},"
+        "{\"Type\":\"volume\",\"Name\":\"0f3c9a\",\"Source\":\"" HF_MOUNT "/v/0f3c9a/_data\",\"Destination\":\"/anon\",\"RW\":true}]}";
+    assert_int_equal(fake_blob_add(fk, "u1", "s1", ".cbackup-unit/config/containers/solo/inspect.json",
+                                   inspect, strlen(inspect)), OK);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.name = "solocopy";
+    o.target_root = "/restore";
+    char *txt = NULL;
+    assert_int_equal(unit_define_build(store, db, repo_id, snap, "docker", "solo", &o, &txt), OK);
+    cJSON *d = cJSON_Parse(txt);
+    free(txt);
+    assert_non_null(d);
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(d, "target_root")), "/restore");
+    const cJSON *hc = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(d, "inspect"), "HostConfig");
+    char *b = cJSON_PrintUnformatted(cJSON_GetObjectItemCaseSensitive(hc, "Binds"));
+    assert_non_null(b);
+    assert_string_equal(b, "[\"/restore" HF_MOUNT "/www:/www:rw\","
+                           "\"/restore" HF_MOUNT "/v/pgwal/_data:/wal\","
+                           "\"/restore" HF_MOUNT "/v/logs/_data:/logs\","
+                           "\"/restore" HF_MOUNT "/v/0f3c9a/_data:/anon\"]");
+    free(b);
+    assert_int_equal(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(hc, "Mounts")), 0);
+    cJSON_Delete(d);
 }
 
 /* pause_scope job through the helper: one capture for both units, each
@@ -990,11 +1130,14 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define_refused_first, setup, teardown),
         cmocka_unit_test_setup_teardown(test_in_place_needs_restore, setup_define_norestore, teardown),
         cmocka_unit_test_setup_teardown(test_define_fails_rolls_back, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_staging_base_kept, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_stage_refused_before_stop, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_session_end_releases, setup, teardown),
         cmocka_unit_test_setup_teardown(test_session_end_during_begin, setup, teardown),
         cmocka_unit_test_setup_teardown(test_id_mismatch_said_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_bytes_over_mounts, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_compose_definition, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_docker_copy_definition, setup, teardown),
         cmocka_unit_test_setup_teardown(test_group_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),

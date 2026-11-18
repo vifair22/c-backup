@@ -49,9 +49,15 @@ status_t host_write_new_file(const char *hp, const char *shown, const char *data
  * /usr/bin, host_root /proc/1/root. */
 void host_tools_defaults(host_tools_t *t);
 
+/* Namespaces of pid 1 host_run enters besides the mount namespace. */
+#define HOST_NS_NET    1   /* the network: LXC's abstract command socket, veths */
+#define HOST_NS_CGROUP 2   /* the cgroup: lxc-start places the container in the
+                            * host's cgroup tree (B190) */
+
 /*
  * Run argv (argv[0] a host path, NULL-terminated) with stdin from
- * /dev/null. netns 1 also enters the host's network namespace. stdout is
+ * /dev/null. netns: HOST_NS_* to enter as well, 0 for the mount namespace
+ * alone. stdout is
  * returned in *out (malloc'd, NUL-terminated; out may be NULL to discard),
  * at most cap bytes kept. Killed at timeout_s. OK only for exit 0;
  * otherwise ERR_IO naming the tool, the status and the first line of its

@@ -30,12 +30,44 @@
  * already waiting gets in during that gap: the running thread usually wins
  * the re-lock, so a sources or tag write could keep losing to batch after
  * batch for as long as the backup ran (B107). With tickets the backup's next
- * BEGIN queues behind the write that was already waiting.
+ * BEGIN queues behind the write that was already waiting. Since B193 there
+ * are two ticket queues, below.
  */
 static pthread_mutex_t g_ticket_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_ticket_cv = PTHREAD_COND_INITIALIZER;
-static uint64_t        g_next_ticket;
-static uint64_t        g_now_serving;
+/*
+ * Two queues, one lock (B193). Bulk writers - a backup's batches, pack
+ * commits, reindex, gc - queue on the bulk tickets; everything else (an API
+ * edit, a job record, a log line, the checkpointer, make_durable's barrier)
+ * on the priority tickets. Each queue is first come, first served, and when
+ * the lock is let go a waiting priority writer always goes before the next
+ * bulk one. On FS2 a tag and a note waited 13-16 s behind bulk commits that
+ * had queued before them; now a request waits for at most the transaction
+ * holding the lock, which the commit budget bounds and which ends early
+ * once anybody is waiting (db_txn_waiters).
+ *
+ * Priority is bounded, so a steady stream of priority writers (log rows,
+ * job progress, a client polling edits) cannot hold a bulk writer back for
+ * ever: once a bulk writer has waited DB_TXN_BULK_DUE_MS, or seen
+ * DB_TXN_PRI_STREAK priority writers served in a row ahead of it, it is
+ * served next, and the priority writers then waiting go after it. So a
+ * bulk writer waits at most about one budget's worth, and a request at
+ * most one bulk transaction more than before.
+ */
+static int             g_held;
+static uint64_t        g_pri_next, g_pri_serving;
+static uint64_t        g_bulk_next, g_bulk_serving;
+static unsigned        g_pri_streak;      /* priority grants since a bulk one */
+static uint64_t        g_bulk_head_since; /* when the oldest bulk waiter queued */
+
+/* Under g_ticket_mu: whether a waiting bulk writer is owed the next turn. */
+static int bulk_due(void)
+{
+    if (g_bulk_next == g_bulk_serving) return 0;
+    return g_pri_streak >= DB_TXN_PRI_STREAK ||
+           phase_now() - g_bulk_head_since >= (uint64_t)DB_TXN_BULK_DUE_MS * 1000000ULL;
+}
+static atomic_ulong    g_bulk_txns;    /* bulk transactions begun, for tests */
 
 /* Threads inside write_lock that have not been served yet. Written under
  * g_ticket_mu, read without it by db_txn_waiters. */
@@ -156,7 +188,7 @@ static void budget_open(uintptr_t caller)
         if (pages < DB_TXN_COMMIT_PAGES_MIN) pages = DB_TXN_COMMIT_PAGES_MIN;
     }
     double fpr = tls_site >= 0 && g_sites[tls_site].frames_per_row > 0
-               ? g_sites[tls_site].frames_per_row : 1.0;
+               ? g_sites[tls_site].frames_per_row : DB_TXN_FRAMES_PER_ROW_FIRST;
     double rows = pages / fpr;
     tls_cap = rows < DB_TXN_COMMIT_ROWS_MIN ? DB_TXN_COMMIT_ROWS_MIN
             : rows > (double)UINT32_MAX ? UINT32_MAX : (uint32_t)rows;
@@ -231,19 +263,47 @@ uint32_t db_txn_row_cap(void)
     return tls_held ? tls_cap : UINT32_MAX;
 }
 
-static void write_lock(void)
+static void write_lock_as(int bulk)
 {
     pthread_mutex_lock(&g_ticket_mu);
-    uint64_t mine = g_next_ticket++;
-    if (mine != g_now_serving) {
-        atomic_fetch_add_explicit(&g_waiting, 1, memory_order_relaxed);
-        while (mine != g_now_serving)
-            pthread_cond_wait(&g_ticket_cv, &g_ticket_mu);
-        atomic_fetch_sub_explicit(&g_waiting, 1, memory_order_relaxed);
+    if (bulk) {
+        if (g_bulk_next == g_bulk_serving) g_bulk_head_since = phase_now();
+        uint64_t mine = g_bulk_next++;
+#define BULK_WAITS (g_held || mine != g_bulk_serving || \
+                    (g_pri_next != g_pri_serving && !bulk_due()))
+        if (BULK_WAITS) {
+            atomic_fetch_add_explicit(&g_waiting, 1, memory_order_relaxed);
+            while (BULK_WAITS)
+                pthread_cond_wait(&g_ticket_cv, &g_ticket_mu);
+            atomic_fetch_sub_explicit(&g_waiting, 1, memory_order_relaxed);
+        }
+#undef BULK_WAITS
+        g_bulk_serving++;
+        g_pri_streak = 0;
+        g_bulk_head_since = phase_now();   /* the next bulk waiter's turn starts now */
+        atomic_fetch_add_explicit(&g_bulk_txns, 1, memory_order_relaxed);
+    } else {
+        uint64_t mine = g_pri_next++;
+#define PRI_WAITS (g_held || mine != g_pri_serving || bulk_due())
+        if (PRI_WAITS) {
+            atomic_fetch_add_explicit(&g_waiting, 1, memory_order_relaxed);
+            while (PRI_WAITS)
+                pthread_cond_wait(&g_ticket_cv, &g_ticket_mu);
+            atomic_fetch_sub_explicit(&g_waiting, 1, memory_order_relaxed);
+        }
+#undef PRI_WAITS
+        g_pri_serving++;
+        if (g_bulk_next != g_bulk_serving) g_pri_streak++;
     }
+    g_held = 1;
     pthread_mutex_unlock(&g_ticket_mu);
     tls_held = 1;
     tls_conn = NULL;
+}
+
+static void write_lock(void)
+{
+    write_lock_as(0);
 }
 
 static void write_unlock(void)
@@ -253,7 +313,7 @@ static void write_unlock(void)
      * transaction may since have been closed. */
     tls_conn = NULL;
     pthread_mutex_lock(&g_ticket_mu);
-    g_now_serving++;
+    g_held = 0;
     pthread_cond_broadcast(&g_ticket_cv);
     pthread_mutex_unlock(&g_ticket_mu);
 }
@@ -304,7 +364,7 @@ static status_t sqlite_error(status_t code, const char *what)
 }
 
 /* caller: whose call site the commit budget learns for (db_txn.c). */
-static status_t begin_at(cutils_db_t *db, uintptr_t caller)
+static status_t begin_at(cutils_db_t *db, uintptr_t caller, int bulk)
 {
     if (!db) return set_error(ERR_INVALID, "db_txn_begin: null handle");
     if (tls_held)
@@ -312,7 +372,7 @@ static status_t begin_at(cutils_db_t *db, uintptr_t caller)
                                    "the write lock (nested transaction)");
 
     uint64_t t0 = phase_now();
-    write_lock();
+    write_lock_as(bulk);
     budget_open(caller);
     int rc = db_exec_raw(db, "BEGIN");
     phase_add_nested(phase_current, PHASE_TXN_WAIT, t0);
@@ -327,7 +387,12 @@ static status_t begin_at(cutils_db_t *db, uintptr_t caller)
 
 status_t db_txn_begin(cutils_db_t *db)
 {
-    return begin_at(db, (uintptr_t)__builtin_return_address(0));
+    return begin_at(db, (uintptr_t)__builtin_return_address(0), 0);
+}
+
+unsigned long db_txn_bulk_count(void)
+{
+    return atomic_load_explicit(&g_bulk_txns, memory_order_relaxed);
 }
 
 status_t db_txn_begin_bulk(cutils_db_t *db)
@@ -336,7 +401,7 @@ status_t db_txn_begin_bulk(cutils_db_t *db)
      * Only here: a request's short write never waits for a checkpoint.
      * The budget keys on the bulk writer's own call site, not this one. */
     if (!tls_held) checkpointer_throttle();
-    return begin_at(db, (uintptr_t)__builtin_return_address(0));
+    return begin_at(db, (uintptr_t)__builtin_return_address(0), 1);
 }
 
 status_t db_txn_commit(cutils_db_t *db)
