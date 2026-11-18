@@ -689,6 +689,363 @@ static void test_heads_read(void **state)
     db_detect_free(d);
 }
 
+/* ------------------------------------------------------------------ */
+/* Units (D1): units.probe liveness, hints and the Nextcloud link       */
+/* ------------------------------------------------------------------ */
+
+static void test_engine_maps(void **state)
+{
+    (void)state;
+    const uint32_t PG = 1u << DB_ENGINE_POSTGRES, MY = 1u << DB_ENGINE_MYSQL,
+                   RD = 1u << DB_ENGINE_REDIS, I1 = 1u << DB_ENGINE_INFLUX1,
+                   I2 = 1u << DB_ENGINE_INFLUX2, ES = 1u << DB_ENGINE_ELASTIC,
+                   CH = 1u << DB_ENGINE_CLICKHOUSE, MO = 1u << DB_ENGINE_MONGO,
+                   PR = 1u << DB_ENGINE_PROMETHEUS, NC = 1u << DB_ENGINE_NEXTCLOUD;
+    assert_int_equal(db_detect_process_engines("postgres", "postgres: checkpointer"), PG);
+    assert_int_equal(db_detect_process_engines("postmaster", NULL), PG);
+    assert_int_equal(db_detect_process_engines("mariadbd", ""), MY);
+    assert_int_equal(db_detect_process_engines("mysqld", ""), MY);
+    assert_int_equal(db_detect_process_engines("valkey-server", ""), RD);
+    assert_int_equal(db_detect_process_engines("redis-server", ""), RD);
+    assert_int_equal(db_detect_process_engines("influxd", ""), I1 | I2);
+    assert_int_equal(db_detect_process_engines("mongod", ""), MO);
+    assert_int_equal(db_detect_process_engines("prometheus", ""), PR);
+    assert_int_equal(db_detect_process_engines("clickhouse-serv", ""), CH);
+    assert_int_equal(db_detect_process_engines("java", "/usr/share/opensearch/jdk/bin/java -Xshare:auto"), ES);
+    assert_int_equal(db_detect_process_engines("java", "java -jar app.jar"), 0);
+    assert_int_equal(db_detect_process_engines("java", NULL), 0);
+    assert_int_equal(db_detect_process_engines("nginx", ""), 0);
+    assert_int_equal(db_detect_process_engines("", ""), 0);
+    assert_int_equal(db_detect_process_engines(NULL, ""), 0);
+
+    /* Registries, library/, tags and digests come off before matching. */
+    assert_int_equal(db_detect_image_engines("postgres:16"), PG);
+    assert_int_equal(db_detect_image_engines("docker.io/library/postgres:16-alpine"), PG);
+    assert_int_equal(db_detect_image_engines("ghcr.io/immich-app/postgres:14-vectorchord0.4.3"), PG);
+    assert_int_equal(db_detect_image_engines("tensorchord/pgvecto-rs:pg14-v0.2.0"), PG);
+    assert_int_equal(db_detect_image_engines("timescale/timescaledb:latest-pg16"), PG);
+    assert_int_equal(db_detect_image_engines("postgis/postgis"), PG);
+    assert_int_equal(db_detect_image_engines("localhost:5000/mariadb:11@sha256:abcd"), MY);
+    assert_int_equal(db_detect_image_engines("lscr.io/linuxserver/mariadb"), MY);
+    assert_int_equal(db_detect_image_engines("MySQL:8.4"), MY);
+    assert_int_equal(db_detect_image_engines("valkey/valkey:8"), RD);
+    assert_int_equal(db_detect_image_engines("bitnami/redis"), RD);
+    assert_int_equal(db_detect_image_engines("prom/prometheus"), PR);
+    assert_int_equal(db_detect_image_engines("influxdb:1.8"), I1);
+    assert_int_equal(db_detect_image_engines("influxdb:2.7"), I2);
+    assert_int_equal(db_detect_image_engines("influxdb"), I2);
+    assert_int_equal(db_detect_image_engines("mongo:7"), MO);
+    assert_int_equal(db_detect_image_engines("mongodb/mongodb-community-server"), MO);
+    assert_int_equal(db_detect_image_engines("opensearchproject/opensearch:2"), ES);
+    assert_int_equal(db_detect_image_engines("elasticsearch:8.15.0"), ES);
+    assert_int_equal(db_detect_image_engines("clickhouse/clickhouse-server"), CH);
+    assert_int_equal(db_detect_image_engines("linuxserver/nextcloud"), NC);
+    /* A name only containing an engine's name is not that engine. */
+    assert_int_equal(db_detect_image_engines("redisinsight"), 0);
+    assert_int_equal(db_detect_image_engines("adminer"), 0);
+    assert_int_equal(db_detect_image_engines(""), 0);
+    assert_int_equal(db_detect_image_engines(NULL), 0);
+
+    assert_int_equal(db_detect_port_engines(5432), PG);
+    assert_int_equal(db_detect_port_engines(3306), MY);
+    assert_int_equal(db_detect_port_engines(6379), RD);
+    assert_int_equal(db_detect_port_engines(9090), PR);
+    assert_int_equal(db_detect_port_engines(8086), I1 | I2);
+    assert_int_equal(db_detect_port_engines(27017), MO);
+    assert_int_equal(db_detect_port_engines(9200), ES);
+    assert_int_equal(db_detect_port_engines(8123), CH);
+    assert_int_equal(db_detect_port_engines(9000), 0);
+    assert_int_equal(db_detect_port_engines(80), 0);
+}
+
+/* A probe built by hand: one container per call to pc(). */
+typedef struct { sp_unit_probe_t p; sp_probe_container_t c[4]; sp_probe_proc_t pr[4][4];
+                 uint16_t po[4][4]; sp_probe_open_t op[4][8]; } probe_t;
+
+static sp_probe_container_t *pc(probe_t *t, const char *name, const char *image)
+{
+    sp_probe_container_t *c = &t->c[t->p.n];
+    memset(c, 0, sizeof(*c));
+    snprintf(c->name, sizeof(c->name), "%s", name);
+    snprintf(c->image, sizeof(c->image), "%s", image);
+    c->running = 1;
+    c->procs = t->pr[t->p.n];
+    c->ports = t->po[t->p.n];
+    c->open = t->op[t->p.n];
+    t->p.v = t->c;
+    t->p.n++;
+    return c;
+}
+
+static void pproc(sp_probe_container_t *c, const char *comm, const char *args)
+{
+    snprintf(c->procs[c->n_procs].comm, SP_PROBE_COMM_MAX, "%s", comm);
+    snprintf(c->procs[c->n_procs].args, SP_PROBE_ARGS_MAX, "%s", args);
+    c->n_procs++;
+}
+
+static void popen_(sp_probe_container_t *c, const char *path, const char *comm)
+{
+    c->open[c->n_open].path = (char *)(uintptr_t)path;
+    snprintf(c->open[c->n_open].comm, SP_PROBE_COMM_MAX, "%s", comm);
+    c->n_open++;
+}
+
+static db_findings_t *detect_unit(const sp_unit_probe_t *p, const db_capture_desc_t *cap)
+{
+    db_detect_cfg_t cfg = { 1024 * 1024 };
+    db_detector_t *d = NULL;
+    assert_int_equal(db_detect_begin(&cfg, &d), OK);
+    db_detect_unit(d, p);
+    feed(d, TEST_DIR, NULL);
+    db_findings_t *f = NULL;
+    assert_int_equal(db_detect_finish(d, cap, &f), OK);
+    db_detect_free(d);
+    return f;
+}
+
+static const db_finding_t *find_hint(const db_findings_t *f, db_engine_t e)
+{
+    for (size_t i = 0; i < f->n; i++)
+        if (f->v[i].engine == e && f->v[i].confidence == DB_CONF_HINT) return &f->v[i];
+    return NULL;
+}
+
+/* A running engine process is liveness; once one of its files is seen
+ * held open for writing, only the data directories it holds are live, so
+ * an old copy beside them stays dormant (section 4). */
+static void test_probe_liveness(void **state)
+{
+    (void)state;
+    wtext("pg/PG_VERSION", "16\n");
+    wempty("pg/global/pg_control");
+    wdir("pg/base/1");
+    wbytes("pg/base/1/2619", "x", 1, 8192);
+    wtext("pgdata.bak/PG_VERSION", "16\n");
+    wempty("pgdata.bak/global/pg_control");
+    wdir("pgdata.bak/base");
+    wtext("rd/dump.rdb", "REDIS0011");
+    wsqlite("app/state.db", 2, 4096);
+    wsqlite("app/idle.db", 1, 2 * 1024 * 1024);
+
+    db_cap_root_t r = { TEST_DIR, DB_CAP_ATOMIC, 0 };
+    db_capture_desc_t cap = { &r, 1, 0, 0, 1, 1 };
+
+    /* No probe: the file signals alone, all dormant. */
+    db_findings_t *f = detect_unit(NULL, &cap);
+    assert_int_equal(find(f, DB_ENGINE_POSTGRES, "pg")->confidence, DB_CONF_DORMANT);
+    assert_int_equal(find(f, DB_ENGINE_REDIS, "rd")->confidence, DB_CONF_DORMANT);
+    db_findings_free(f);
+
+    /* Processes only: every finding of their engine is live. */
+    probe_t t;
+    memset(&t, 0, sizeof(t));
+    sp_probe_container_t *c = pc(&t, "immich_postgres", "postgres:16");
+    pproc(c, "postgres", "postgres -c shared_buffers=512MB");
+    sp_probe_container_t *c2 = pc(&t, "immich_redis", "valkey/valkey:8");
+    pproc(c2, "valkey-server", "valkey-server *:6379");
+    f = detect_unit(&t.p, &cap);
+    const db_finding_t *x = find(f, DB_ENGINE_POSTGRES, "pg");
+    assert_int_equal(x->confidence, DB_CONF_LIVE);
+    assert_int_equal(x->coverage, DB_COV_COVERED_CRASH);
+    assert_non_null(strstr(x->evidence, "\"processes\":[{\"container\":\"immich_postgres\",\"comm\":\"postgres\"}]"));
+    assert_int_equal(find(f, DB_ENGINE_POSTGRES, "pgdata.bak")->confidence, DB_CONF_LIVE);
+    assert_int_equal(find(f, DB_ENGINE_REDIS, "rd")->confidence, DB_CONF_LIVE);
+    /* SQLite has no process of its own: only an open file ties it. */
+    assert_int_equal(find(f, DB_ENGINE_SQLITE, "app/idle.db")->confidence, DB_CONF_DORMANT);
+    /* The images and processes matched a signature: no hints. */
+    assert_null(find_hint(f, DB_ENGINE_POSTGRES));
+    assert_null(find_hint(f, DB_ENGINE_REDIS));
+    /* The unit's names go with a database a Nextcloud may name. */
+    assert_non_null(strstr(x->evidence, "\"unit_names\":[\"immich_postgres\",\"immich_redis\"]"));
+    assert_null(strstr(find(f, DB_ENGINE_REDIS, "rd")->evidence, "unit_names"));
+    db_findings_free(f);
+
+    /* With an open file: the held directory is live, the copy dormant, and
+     * a SQLite held through its -wal is live. */
+    popen_(c, abs_of("pg/base/1/2619"), "postgres");
+    popen_(c, abs_of("app/idle.db-wal"), "node");
+    popen_(c, abs_of("elsewhere/file"), "node");
+    f = detect_unit(&t.p, &cap);
+    x = find(f, DB_ENGINE_POSTGRES, "pg");
+    assert_int_equal(x->confidence, DB_CONF_LIVE);
+    assert_non_null(strstr(x->evidence, "\"open_write\":[{\"path\":"));
+    assert_int_equal(find(f, DB_ENGINE_POSTGRES, "pgdata.bak")->confidence, DB_CONF_DORMANT);
+    assert_int_equal(find(f, DB_ENGINE_SQLITE, "app/idle.db")->confidence, DB_CONF_LIVE);
+    assert_int_equal(find(f, DB_ENGINE_SQLITE, "app/state.db") ? 1 : 0, 0);  /* small, dormant: counted */
+    assert_int_equal(f->sqlite_small, 1);
+    db_findings_free(f);
+}
+
+/* An image, port or process with no signature in the included mounts is
+ * a hint, one per engine, with path "" and nothing judged. */
+static void test_probe_hints(void **state)
+{
+    (void)state;
+    wtext("pg/PG_VERSION", "16\n");
+    wempty("pg/global/pg_control");
+    wdir("pg/base");
+    probe_t t;
+    memset(&t, 0, sizeof(t));
+    pc(&t, "pg", "postgres:16");                       /* matched by pg/ */
+    sp_probe_container_t *c = pc(&t, "client", "mariadb:11");   /* a client only */
+    c->ports[c->n_ports++] = 3306;
+    c->ports[c->n_ports++] = 8086;
+    c->ports[c->n_ports++] = 9000;
+    sp_probe_container_t *c3 = pc(&t, "search", "");
+    pproc(c3, "java", "/usr/share/elasticsearch/jdk/bin/java -Xms1g");
+    db_cap_root_t r = { TEST_DIR, DB_CAP_ATOMIC, 0 };
+    db_capture_desc_t cap = { &r, 1, 0, 0, 1, 1 };
+    db_findings_t *f = detect_unit(&t.p, &cap);
+    assert_null(find_hint(f, DB_ENGINE_POSTGRES));
+    const db_finding_t *h = find_hint(f, DB_ENGINE_MYSQL);
+    assert_non_null(h);
+    assert_string_equal(h->path, "");
+    assert_int_equal(h->coverage, DB_COV_NONE);
+    assert_null(h->method);
+    assert_null(h->suggestion);
+    assert_int_equal(h->root, -1);
+    assert_non_null(strstr(h->evidence, "\"images\":[{\"container\":\"client\",\"image\":\"mariadb:11\"}]"));
+    assert_non_null(strstr(h->evidence, "\"ports\":[{\"container\":\"client\",\"port\":\"3306\"}]"));
+    assert_non_null(strstr(h->evidence, "the image of client suggests MySQL/MariaDB"));
+    /* 8086 fits both InfluxDBs; the hint names the current one. */
+    assert_non_null(find_hint(f, DB_ENGINE_INFLUX2));
+    assert_null(find_hint(f, DB_ENGINE_INFLUX1));
+    /* 9000 is too common to mean ClickHouse. */
+    assert_null(find_hint(f, DB_ENGINE_CLICKHOUSE));
+    h = find_hint(f, DB_ENGINE_ELASTIC);
+    assert_non_null(h);
+    assert_non_null(strstr(h->evidence, "a running process of search suggests"));
+    db_findings_free(f);
+
+    /* An InfluxDB 1 data directory answers an InfluxDB 2 hint as well. */
+    wempty("ix/meta/meta.db");
+    wdir("ix/data");
+    wdir("ix/wal");
+    f = detect_unit(&t.p, &cap);
+    assert_non_null(find(f, DB_ENGINE_INFLUX1, "ix"));
+    assert_null(find_hint(f, DB_ENGINE_INFLUX2));
+    db_findings_free(f);
+}
+
+static void wnextcloud(const char *dbtype, const char *dbhost)
+{
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "<?php\n$CONFIG = array (\n  'dbtype' => '%s',\n%s%s%s  'dbname' => 'nc',\n);\n",
+             dbtype, dbhost ? "  'dbhost' => '" : "", dbhost ? dbhost : "", dbhost ? "',\n" : "");
+    wtext("nc/config/config.php", buf);
+}
+
+static const char *nc_evidence(const db_findings_t *f)
+{
+    const db_finding_t *x = find(f, DB_ENGINE_NEXTCLOUD, "nc");
+    assert_non_null(x);
+    return x->evidence;
+}
+
+/* The link (section 3): a dbhost in the same container or another
+ * container of the unit is one capture; anything else is left for the
+ * repository's other units (db_findings_link_nextcloud). */
+static void test_nextcloud_link(void **state)
+{
+    (void)state;
+    probe_t t;
+    memset(&t, 0, sizeof(t));
+    sp_probe_container_t *c = pc(&t, "nextcloud-app-1", "nextcloud:29");
+    snprintf(c->aliases[c->n_aliases++], SP_PROBE_NAME_MAX, "app");
+    sp_probe_container_t *db = pc(&t, "nextcloud-db-1", "mariadb:11");
+    snprintf(db->aliases[db->n_aliases++], SP_PROBE_NAME_MAX, "db");
+    db_cap_root_t r = { TEST_DIR, DB_CAP_ATOMIC, 0 };
+    db_capture_desc_t cap = { &r, 1, 0, 0, 1, 1 };
+
+    wnextcloud("mysql", "db:3306");
+    db_findings_t *f = detect_unit(&t.p, &cap);
+    assert_non_null(strstr(nc_evidence(f), "\"link\":{\"dbtype\":\"mysql\",\"dbhost\":\"db:3306\","
+                                         "\"resolved\":\"this unit\",\"consistent\":true}"));
+    db_findings_free(f);
+
+    wnextcloud("pgsql", "localhost:/run/postgresql");
+    f = detect_unit(&t.p, &cap);
+    assert_non_null(strstr(nc_evidence(f), "\"resolved\":\"this container\""));
+    db_findings_free(f);
+
+    wnextcloud("mysql", "[::1]:3306");
+    f = detect_unit(&t.p, &cap);
+    assert_non_null(strstr(nc_evidence(f), "\"resolved\":\"this container\""));
+    db_findings_free(f);
+
+    wnextcloud("mysql", "mariadb-shared");
+    f = detect_unit(&t.p, &cap);
+    assert_non_null(strstr(nc_evidence(f), "\"resolved\":null,\"host\":\"mariadb-shared\""));
+    db_findings_free(f);
+
+    /* Without the probe, a name cannot be found in the unit. */
+    wnextcloud("mysql", "db:3306");
+    f = detect_unit(NULL, &cap);
+    assert_non_null(strstr(nc_evidence(f), "\"resolved\":null,\"host\":\"db\""));
+    db_findings_free(f);
+
+    /* A dbhost with anything odd in it is not read. */
+    wnextcloud("mysql", "db$(id)");
+    f = detect_unit(&t.p, &cap);
+    assert_non_null(strstr(nc_evidence(f), "\"note\":\"dbhost not read\""));
+    db_findings_free(f);
+
+    /* SQLite needs no link. */
+    wnextcloud("sqlite3", NULL);
+    f = detect_unit(&t.p, &cap);
+    assert_null(strstr(nc_evidence(f), "\"link\""));
+    db_findings_free(f);
+}
+
+static void reread_cb(void *ctx, const char *path)
+{
+    db_detector_t *d = ctx;
+    int fd = open(path, O_RDONLY);
+    assert_true(fd >= 0);
+    struct stat st;
+    assert_int_equal(fstat(fd, &st), 0);
+    db_detect_head_fd(d, path, fd, (uint64_t)st.st_size);
+    close(fd);
+}
+
+static void count_cb(void *ctx, const char *path)
+{
+    (void)path;
+    (*(int *)ctx)++;
+}
+
+/* A config.php the cache vouched for has its code but not its dbhost: the
+ * caller is asked to read it once, and then the link resolves. */
+static void test_nextcloud_unread(void **state)
+{
+    (void)state;
+    wnextcloud("mysql", "db");
+    const char *p = abs_of("nc/config/config.php");
+    db_detector_t *d = NULL;
+    assert_int_equal(db_detect_begin(NULL, &d), OK);
+    db_detect_carry_add(d, p, DB_HEAD_CODE(DB_HEAD_NEXTCLOUD, 2));
+    assert_int_equal(db_detect_cached(d, p, 100), 1);
+    probe_t t;
+    memset(&t, 0, sizeof(t));
+    sp_probe_container_t *c = pc(&t, "nc", "nextcloud");
+    snprintf(c->aliases[c->n_aliases++], SP_PROBE_NAME_MAX, "db");
+    db_detect_unit(d, &t.p);
+    db_detect_nextcloud_unread(d, reread_cb, d);
+    int calls = 0;
+    db_detect_nextcloud_unread(d, count_cb, &calls);
+    assert_int_equal(calls, 0);              /* read once, never again */
+    db_findings_t *f = NULL;
+    assert_int_equal(db_detect_finish(d, NULL, &f), OK);
+    assert_non_null(strstr(nc_evidence(f), "\"resolved\":\"this unit\""));
+    db_findings_free(f);
+    db_detect_free(d);
+    /* Inert without a detector or a reader. */
+    db_detect_nextcloud_unread(NULL, count_cb, &calls);
+    db_detect_unit(NULL, &t.p);
+    assert_int_equal(calls, 0);
+}
+
 /* Entries arriving out of order and far apart merge into one directory. */
 static void test_merge_order(void **state)
 {
@@ -726,6 +1083,11 @@ int main(void)
         cmocka_unit_test(test_carry),
         cmocka_unit_test(test_heads_read),
         cmocka_unit_test(test_merge_order),
+        cmocka_unit_test(test_engine_maps),
+        cmocka_unit_test_setup_teardown(test_probe_liveness, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_probe_hints, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_nextcloud_link, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_nextcloud_unread, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
