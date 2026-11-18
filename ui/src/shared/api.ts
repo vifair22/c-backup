@@ -126,6 +126,16 @@ export type ApiRequest =
   | { kind: 'tagRemove'; repoId: number; name: string }
   | { kind: 'journal'; repoId: number; limit?: number; result?: string }
 
+  /* --- database detection (docs/db-detection.md 7.4), read-only for now.
+   * scope is exact: "unit:<provider>:<unit>" or "source:<path>". coverage
+   * takes the section 5 names, or "none" for a finding nothing assessed. */
+  | { kind: 'dbList'; repoId: number; scope?: string; engine?: string
+      coverage?: string; state?: string; limit?: number; offset?: number }
+  | { kind: 'dbShow'; repoId: number; findingId: number }
+  /* Detection now, without a backup: a job. unit may itself hold ':'
+   * (compose:immich), which is why provider and unit travel apart. */
+  | { kind: 'unitDetect'; repoId: number; provider: string; unit: string }
+
   /* --- schedules --- */
   | { kind: 'scheduleList'; repoId: number }
   | { kind: 'scheduleAdd'; repoId: number; action: string

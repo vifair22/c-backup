@@ -275,3 +275,73 @@ export interface WireVerifyFinding {
   affected_snapshot_count: number
   snapshots_truncated: boolean
 }
+
+/* ---------------------------------------------------------------- */
+/* Database detection (docs/db-detection.md)                          */
+/* ---------------------------------------------------------------- */
+
+export type DbConfidence = 'live' | 'dormant' | 'hint'
+
+/* Section 5. null on a finding nothing has assessed: a dormant or hint
+ * finding, which the coverage filter calls "none". */
+export type DbCoverage =
+  | 'covered-crash' | 'covered-quiesced' | 'covered-application'
+  | 'engine-unsafe' | 'split' | 'uncovered'
+
+export type DbMethod = 'snapshot' | 'paused-read' | 'live-read'
+
+export type DbSuggestion =
+  | 'pg-dumpall' | 'mariadb-dump' | 'redis-rdb' | 'mongodump' | 'sqlite-backup'
+  | 'influx2-backup' | 'prometheus-snapshot' | 'exclude-rebuild' | 'pause-always'
+  | 'source-snapshot' | 'group-units'
+
+export type DbState = 'new' | 'suggested' | 'enabled' | 'dismissed'
+
+/*
+ * One row of db_findings. scope is "unit:<provider>:<unit>" or
+ * "source:<path>". A hint finding has path "" and its evidence names the
+ * container, image, ports or processes that suggested it. evidence is an
+ * open object: the keys the UI knows are listed in shared/databases.ts and
+ * anything else is shown as it came.
+ */
+export interface WireDbFinding {
+  id: number
+  scope: string
+  engine: string
+  version: string | null
+  path: string
+  confidence: DbConfidence
+  coverage: DbCoverage | null
+  coverage_why: string | null
+  method: DbMethod | null
+  suggestion: DbSuggestion | null
+  optional: DbSuggestion | null
+  state: DbState
+  evidence: Record<string, unknown> | null
+  first_seen: number
+  last_seen: number
+  last_snap_id: number | null
+  alerted_at: number | null
+  template: string | null
+  params: Record<string, unknown> | null
+  decided_by: string | null
+  decided_at: number | null
+  reason: string | null
+}
+
+export interface WireDbFindingPage {
+  findings: WireDbFinding[]
+  total: number
+}
+
+/* A detect job's result. listed is how many findings the result carries,
+ * total how many detection made; sqlite_small counts dormant SQLite files
+ * under db_detect.sqlite_min_kb, which are not listed. */
+export interface WireDbDetectResult {
+  databases?: {
+    findings?: WireDbFinding[]
+    listed?: number
+    total?: number
+    sqlite_small?: number
+  }
+}
