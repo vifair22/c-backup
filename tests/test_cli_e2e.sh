@@ -901,6 +901,17 @@ if [ -n "$LOSS_DAT" ]; then
         *'"status":"unwalkable pack"'*) bad "with no unwalkable pack" "none" "$OUT" ;;
         *)                              ok  "with no unwalkable pack" ;;
     esac
+    # Data loss is ERR_CORRUPT, and its one alert goes at priority high.
+    LJ=$(cb jobs --limit 1 | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    N=0
+    for _ in $(seq 1 100); do
+        N=$(grep -c "failure notification for job $LJ not sent" "$WORK/daemon.log")
+        [ "$N" -ge 1 ] && break
+        sleep 0.1
+    done
+    check    "a verify finding loss alerts once" 1 "$N"
+    contains "at priority high" "(priority high: damage beyond repair)" \
+        "$(grep "failure notification for job $LJ not sent" "$WORK/daemon.log")"
     contains "verify show reads the failed run back" '"findings"' \
         "$(cb verify show "$LOSS_ID" "$(printf '%s' "$OUT" | sed -n 's/.*"runs":\[{"id":\([0-9]*\),.*/\1/p')")"
     # A failed run is still a completed walk, and the gauge reads those.
@@ -1641,6 +1652,8 @@ if damage_beyond_parity "$WORK/dmgsrc/lost.bin" "$DMG_DAT"; then
     DJ=$(job_of "$ERR")
     if [ -n "$DJ" ] && alerted "$DJ"; then ok "the failure alert was composed, and not claimed as sent"
     else bad "the failure alert was composed, and not claimed as sent" "a notification for job '$DJ'" "none"; fi
+    check    "once, at priority high" 1 \
+        "$(grep -c "failure notification for job $DJ not sent.*(priority high: damage beyond repair)" "$WORK/daemon.log")"
 else
     bad "damage fixture" "the file's bytes in the pack" "not found"
 fi
@@ -1668,6 +1681,8 @@ if [ -n "$GCD_DAT" ] && damage_beyond_parity "$WORK/gcdsrc/keep.bin" "$GCD_DAT";
     GJ=$(job_of "$ERR")
     if [ -n "$GJ" ] && alerted "$GJ"; then ok "the gc failure alert was composed, and not claimed as sent"
     else bad "the gc failure alert was composed, and not claimed as sent" "a notification for job '$GJ'" "none"; fi
+    check    "once, at priority high" 1 \
+        "$(grep -c "failure notification for job $GJ not sent.*(priority high: damage beyond repair)" "$WORK/daemon.log")"
 else
     bad "gc damage fixture" "the file's bytes in the pack" "not found"
 fi

@@ -1942,6 +1942,117 @@ static void test_journalled_warnings_are_bounded(void **state)
     assert_non_null(strstr(got, "(and "));
 }
 
+/*
+ * ALERT-PRIO: an ERR_CORRUPT end (damage beyond repair: verify loss, gc or
+ * replicate damage past parity, unwalkable packs) alerts once at Pushover
+ * priority 1; any other failure and any warning stays normal. A fake
+ * Pushover records what would have been sent.
+ */
+static pthread_mutex_t g_push_mu = PTHREAD_MUTEX_INITIALIZER;
+static int  g_push_n;
+static int  g_push_pri[16];
+static char g_push_title[16][256];
+
+static int fake_push(const push_opts_t *o)
+{
+    pthread_mutex_lock(&g_push_mu);
+    if (g_push_n < 16) {
+        g_push_pri[g_push_n] = o->priority;
+        snprintf(g_push_title[g_push_n], sizeof(g_push_title[0]), "%s", o->title ? o->title : "");
+    }
+    g_push_n++;
+    pthread_mutex_unlock(&g_push_mu);
+    return 0;
+}
+
+typedef struct { status_t st; const char *msg; const char *warning; } prio_spec_t;
+
+static status_t prio_job(void *arg, atomic_int *cancel,
+                         void (*progress)(const char *, uint64_t, uint64_t, void *),
+                         void *progress_ctx)
+{
+    (void)cancel; (void)progress;
+    const prio_spec_t *sp = arg;
+    if (sp->warning) job_set_warning(progress_ctx, sp->warning);
+    if (sp->st == OK) return OK;
+    return set_error(sp->st, "%s", sp->msg);
+}
+
+/* Run one job to its end and return how many alerts it sent and the
+ * priority of the last one. */
+static int alerts_for(const char *action, const prio_spec_t *sp, int *pri)
+{
+    pthread_mutex_lock(&g_push_mu);
+    g_push_n = 0;
+    pthread_mutex_unlock(&g_push_mu);
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 3, action, NULL, prio_job, (void *)sp, NULL, &id), OK);
+    char sql[128];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM jobs WHERE id = %lld"
+             " AND state IN ('completed','failed')", (long long)id);
+    assert_int_equal(wait_db_count(sql, 1), 1);
+    /* The alert follows the state; wait for it, then for any second one. */
+    int n = 0;
+    for (int i = 0; i < 400 && n == 0; i++) {
+        pthread_mutex_lock(&g_push_mu);
+        n = g_push_n;
+        pthread_mutex_unlock(&g_push_mu);
+        if (n == 0) usleep(5000);
+    }
+    usleep(100000);
+    pthread_mutex_lock(&g_push_mu);
+    n = g_push_n;
+    *pri = n > 0 ? g_push_pri[n - 1 < 16 ? n - 1 : 15] : -99;
+    pthread_mutex_unlock(&g_push_mu);
+    return n;
+}
+
+static void test_damage_beyond_repair_alerts_at_high_priority(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, label, added_at)"
+        " VALUES (3, 'u-3', '/srv/repos/docs', 'docs', 0)", NULL, NULL), 0);
+    job_manager_set_push(jm, fake_push);
+    job_manager_set_alerts(jm, 1);
+    int pri = 0;
+
+    static const struct { const char *action; prio_spec_t sp; } corrupt[] = {
+        { "verify",    { ERR_CORRUPT, "verify run 4 found data loss: 9 of 10 checked ok, "
+                                      "1 unrecoverable and 0 missing", NULL } },
+        { "verify",    { ERR_CORRUPT, "verify run 5 found 1 pack(s) that cannot be walked", NULL } },
+        { "gc",        { ERR_CORRUPT, "gc: 3 pack entries damaged beyond parity were copied "
+                                      "as damaged", NULL } },
+        { "gc",        { ERR_CORRUPT, "gc: 2 pack(s) could not be walked and were left", NULL } },
+        { "replicate", { ERR_CORRUPT, "replicated with 2 object(s) damaged beyond parity; "
+                                      "the replica holds them as damaged", NULL } },
+    };
+    for (size_t i = 0; i < sizeof(corrupt) / sizeof(corrupt[0]); i++) {
+        assert_int_equal(alerts_for(corrupt[i].action, &corrupt[i].sp, &pri), 1);
+        assert_int_equal(pri, PUSH_PRIORITY_HIGH);
+    }
+    assert_int_equal(job_alert_priority(ERR_CORRUPT), 1);
+
+    /* An ordinary failure: one alert, normal. */
+    prio_spec_t io = { ERR_IO, "backup: storing /d/x: No space left on device", NULL };
+    assert_int_equal(alerts_for("backup", &io, &pri), 1);
+    assert_int_equal(pri, PUSH_PRIORITY_NORMAL);
+    /* The text does not decide it: a failure that only mentions damage. */
+    prio_spec_t words = { ERR_IO, "damaged beyond parity, unrecoverable", NULL };
+    assert_int_equal(alerts_for("gc", &words, &pri), 1);
+    assert_int_equal(pri, PUSH_PRIORITY_NORMAL);
+    /* A warning: one alert, normal. */
+    prio_spec_t warn = { OK, NULL, "verify run 6 found 1 recoverable item(s)" };
+    assert_int_equal(alerts_for("verify", &warn, &pri), 1);
+    assert_int_equal(pri, PUSH_PRIORITY_NORMAL);
+    /* A clean run alerts nobody. */
+    prio_spec_t clean = { OK, NULL, NULL };
+    assert_int_equal(alerts_for("verify", &clean, &pri), 0);
+
+    job_manager_set_alerts(jm, 0);
+    job_manager_set_push(jm, NULL);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1964,6 +2075,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_alert_names_repository_and_error, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_warning_is_alerted_and_the_job_completes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_warning_alert_text, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_damage_beyond_repair_alerts_at_high_priority, setup, teardown),
         cmocka_unit_test_setup_teardown(test_warnings_are_journalled, setup, teardown),
         cmocka_unit_test_setup_teardown(test_warnings_reach_the_result, setup, teardown),
         cmocka_unit_test_setup_teardown(test_journalled_warnings_are_bounded, setup, teardown),

@@ -17,6 +17,7 @@
 #include "error.h"
 
 #include <cutils/db.h>
+#include <cutils/push.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -40,6 +41,16 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
  * default; it decides only whether a failed job's log line says the alert
  * is being sent or that it is not. */
 void     job_manager_set_alerts(job_manager_t *jm, int enabled);
+
+/* Where a job's alert is sent: push_send_opts unless set. For tests, a
+ * fake Pushover that records each alert and its priority. */
+typedef int (*job_push_fn)(const push_opts_t *opts);
+void     job_manager_set_push(job_manager_t *jm, job_push_fn fn);
+
+/* The Pushover priority of a job's alert, by how it ended: PUSH_PRIORITY_HIGH
+ * (1) for ERR_CORRUPT, damage beyond repair; PUSH_PRIORITY_NORMAL for every
+ * other failure and for warnings. */
+int      job_alert_priority(status_t st);
 
 /* Shut down: every queued job is recorded cancelled without starting, every
  * running job is asked to stop, and this returns once the workers have

@@ -2326,6 +2326,22 @@ Job 120 (backup) completed with a warning: 1 file(s) were still changing and are
 
 A clean backup sends nothing.
 
+Every job sends at most one notification, whatever it found: counts and the
+first item, never one per file or object.
+
+**Priority.** A job that failed because it found damage nothing can repair
+(status `ERR_CORRUPT`) sends its notification at Pushover priority 1
+(high), which sounds through the recipient's quiet hours. That covers a
+verify that finds unrecoverable or missing data or a pack it cannot walk,
+a gc that copies pack entries damaged beyond parity or cannot walk a pack,
+and a replication that sends objects damaged beyond parity; any other job
+that stops on corrupt repository data (a restore reading a damaged pack,
+say) ends the same way and alerts the same. The status decides it, never
+the wording of the error. Every other notification, other failures and
+all warnings, goes at normal priority (0). Priority 1 needs nothing more
+from Pushover; emergency priority (2), which repeats until acknowledged,
+is not used.
+
 A notification that cannot be delivered is retried for 24 hours unless
 Pushover rejects it outright (a wrong token or user key), in which case it is
 dropped at once. Either way the journal has a line naming the notification,
@@ -2341,7 +2357,8 @@ counter: an alert path that has stopped working is otherwise silent.
 The daemon log has one line per failed job either way: `sending failure
 notification for job N: <title>: <body>` with credentials set, and
 `failure notification for job N not sent, Pushover is not configured:
-<title>: <body>` without them.
+<title>: <body>` without them. A priority 1 notification has `(priority
+high: damage beyond repair)` after its title in both.
 A backup that completed with skipped files logs the same pair at
 `warning` level: `sending warning notification for job N: <title>: <body>`
 with credentials, `warning notification for job N not sent, Pushover is not
