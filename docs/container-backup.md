@@ -904,7 +904,12 @@ reason. A bind source under `target_root` does not exist yet when the
 define check runs, so its block-device test uses the original it stands in
 for, the recorded mount at the same container path or the path with
 `target_root` taken off, resolved on the host (B210): a device node inside
-an include root is refused before the restore writes it. Paths are
+an include root is refused before the restore writes it. When neither
+exists on the host, the daemon's `recorded_types` decides: the type of each
+copy source's entry in the manifest of the snapshot being restored
+(`blk`, `chr`, `dir`, `reg`, `lnk`, `link`, `fifo`, or `missing`). `blk`
+is refused; `missing`, `lnk`, `link` or no record at all is refused as
+"cannot verify", since nothing then says what the restore would write. Paths are
 resolved in the host's tree one component at a time, so
 a restored symlink cannot point a data bind out of `target_root` either. It refuses otherwise, in the
 define check too, so before the daemon writes anything. After the create

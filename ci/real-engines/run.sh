@@ -758,6 +758,16 @@ if have_snap "the in-root block-device backup" "$SNAP_BLKIN"; then
     contains "the refusal names the bind and why" "$TRBI$APPS/cbk-uat-blkin/dev/disk -> /disk: a block device" "$OUT_N"
     check "no in-root copy was created" "" "$(docker ps -aq --filter name=cbk-uat-blkin2)"
     check "nothing was written under the in-root target root" no "$([ -e "$TRBI" ] && echo yes || echo no)"
+    # The original gone from the host after the backup: the host cannot
+    # say, and the snapshot's recorded type of the node decides.
+    rm -f "$APPS/cbk-uat-blkin/dev/disk"
+    TRBI2="$APPS/restored-blkin2"
+    OUT_N=$(cb unit restore 1 "$SNAP_BLKIN" --define --name cbk-uat-blkin3 --target-root "$TRBI2" 2>&1)
+    contains "with the original gone, the copy is still refused" '"state":"failed"' "$OUT_N"
+    contains "by the check, from the snapshot's record" "refused, nothing written" "$OUT_N"
+    contains "the refusal says the snapshot records a block device" "/disk: a block device, as the snapshot records it" "$OUT_N"
+    check "no copy was created with the original gone" "" "$(docker ps -aq --filter name=cbk-uat-blkin3)"
+    check "nothing was written under that target root" no "$([ -e "$TRBI2" ] && echo yes || echo no)"
 fi
 docker rm -f cbk-uat-blkin >/dev/null 2>&1
 rm -f "$APPS/cbk-uat-blkin/dev/disk"

@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include <cmocka.h>
@@ -448,6 +449,38 @@ static void test_dumps_through_helper(void **state)
     assert_int_equal(helper_server_holds(srv), 0);
 }
 
+
+/*
+ * B210: the type each entry of a unit snapshot was recorded with, which the
+ * daemon hands the helper's define check for a copy whose original is gone
+ * from the host. A block device node is made only as root (CI); the rest
+ * runs anywhere.
+ */
+static void test_entry_type(void **state)
+{
+    (void)state;
+    int blk = mknod(HF_SNAP "/disk0", S_IFBLK | 0600, makedev(7, 250)) == 0;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    uint8_t type = 0;
+    assert_int_equal(unit_entry_type(store, db, repo_id, snap, HF_MOUNT, &type), OK);
+    assert_int_equal(type, NODE_TYPE_DIR);
+    assert_int_equal(unit_entry_type(store, db, repo_id, snap, HF_MOUNT "/a.txt", &type), OK);
+    assert_int_equal(type, NODE_TYPE_REG);
+    assert_int_equal(unit_entry_type(store, db, repo_id, snap, HF_MOUNT "/no-such", &type), ERR_NOT_FOUND);
+    err_clear();
+    assert_int_equal(unit_entry_type(store, db, repo_id, snap, HF_MOUNT "/a.txt/below", &type), ERR_NOT_FOUND);
+    err_clear();
+    if (blk) {
+        assert_int_equal(unit_entry_type(store, db, repo_id, snap, HF_MOUNT "/disk0", &type), OK);
+        assert_int_equal(type, NODE_TYPE_BLK);
+        assert_int_equal(unlink(HF_SNAP "/disk0"), 0);
+    } else {
+        print_message("not root: no block device node, that case is not run\n");
+    }
+}
 
 /* mode unit: the refusals, a new name under target_root that leaves the
  * original untouched, and in place with replace through stage and swap. */
@@ -1151,6 +1184,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_large_blob, setup, teardown),
         cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
         cmocka_unit_test_setup_teardown(test_unit_restore, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_entry_type, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_define_refused_first, setup, teardown),
         cmocka_unit_test_setup_teardown(test_in_place_needs_restore, setup_define_norestore, teardown),
         cmocka_unit_test_setup_teardown(test_define_fails_rolls_back, setup_define, teardown),

@@ -62,3 +62,8 @@ status_t unit_define_build(store_t *store, cutils_db_t *db, int64_t repo_id, int
  * most max bytes. ERR_NOT_FOUND when it is not there. */
 status_t unit_read_file(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                         const char *rel, size_t max, char **data, size_t *len);
+
+/* The recorded type (NODE_TYPE_*) of the entry at rel in the snapshot.
+ * ERR_NOT_FOUND when there is none. */
+status_t unit_entry_type(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                         const char *rel, uint8_t *type);

@@ -1700,14 +1700,14 @@ static host_bind_t host_bind_class(const host_tools_t *t, const char *p, const s
 
 /*
  * Whether the original a copy's bind stands in for is a block device on
- * the host (B210). A define check runs before the restore writes
- * target_root, so the copy's own source does not exist yet and its
- * st_mode says nothing; the restore would then write the device node
- * there and only the real define, after the data, refused it. The
- * original is the recorded mount at the same container path, and the
- * path the remap put under troot with troot taken off; either resolving
- * to a block device decides it. One that no longer exists on the host
- * cannot say, and copy_created_ok still stats the created copy's binds.
+ * the host (B210): 1 if it is, 0 if it is there and is not, -1 when the
+ * host cannot say (nothing of it is there any more). A define check runs
+ * before the restore writes target_root, so the copy's own source does not
+ * exist yet and its st_mode says nothing; the restore would then write the
+ * device node there and only the real define, after the data, refused it.
+ * The original is the recorded mount at the same container path, and the
+ * path the remap put under troot with troot taken off; either resolving to
+ * a block device decides it.
  */
 static int orig_is_block(const struct sp_ctx *c, const cJSON *orig, const char *src, const char *dst,
                          const char *troot)
@@ -1721,13 +1721,39 @@ static int orig_is_block(const struct sp_ctx *c, const cJSON *orig, const char *
         if (dst[0] && os[0] == '/' && strcmp(jstr(m, "Destination"), dst) == 0 &&
             (strcmp(jstr(m, "Type"), "bind") == 0 || strcmp(jstr(m, "Type"), "volume") == 0)) { cand[1] = os; break; }
     }
+    int seen = 0;
     for (size_t i = 0; i < 2; i++) {
         char real[PATH_MAX];
         struct stat sb;
-        if (cand[i] && resolve_host(&c->tools, cand[i], real, sizeof(real)) == 0 &&
-            host_stat(&c->tools, real, &sb) == 0 && S_ISBLK(sb.st_mode)) return 1;
+        if (!cand[i] || resolve_host(&c->tools, cand[i], real, sizeof(real)) != 0 ||
+            host_stat(&c->tools, real, &sb) != 0) continue;
+        if (S_ISBLK(sb.st_mode)) return 1;
+        seen = 1;
     }
-    return 0;
+    return seen ? 0 : -1;
+}
+
+/*
+ * With the original gone from the host, the snapshot decides: the daemon
+ * records each copy bind source's entry type from the manifest of the
+ * snapshot being restored (recorded_types). A block device is refused; so
+ * is a source it has no entry for, or one recorded as a link whose target
+ * cannot be judged before it is written, since nothing then says what the
+ * restore would put there. NULL when the type allows it, else the reason.
+ */
+static const char *recorded_refusal(const cJSON *rec, const char *src)
+{
+    const char *t = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(rec, src));
+    if (!t) return "cannot verify it is not a block device: the original is gone from the host and "
+                   "the snapshot's record of it was not given";
+    if (strcmp(t, "blk") == 0) return "a block device, as the snapshot records it";
+    if (strcmp(t, "missing") == 0)
+        return "cannot verify it is not a block device: the original is gone from the host and the "
+               "snapshot has no entry for it";
+    if (strcmp(t, "lnk") == 0 || strcmp(t, "link") == 0)
+        return "cannot verify it is not a block device: the original is gone from the host and the "
+               "snapshot records a link, whose target cannot be judged before it is written";
+    return NULL;
 }
 
 /*
@@ -1737,10 +1763,13 @@ static int orig_is_block(const struct sp_ctx *c, const cJSON *orig, const char *
  * Resolved on the host where it exists: a block device behind a by-id or
  * mapper link is still one, and a restored symlink cannot point a data
  * bind out of target_root. orig: the original's Mounts; troot NULL to
- * classify a host facility alone.
+ * classify a host facility alone. rec: the snapshot's recorded types of
+ * the copy's sources (recorded_types), consulted when neither the source
+ * nor its original exists on the host; NULL after the create, where the
+ * source exists.
  */
-static host_bind_t copy_bind(const struct sp_ctx *c, const cJSON *orig, const char *src, const char *dst,
-                             const char *troot, char *why, size_t wsz)
+static host_bind_t copy_bind(const struct sp_ctx *c, const cJSON *orig, const cJSON *rec, const char *src,
+                             const char *dst, const char *troot, char *why, size_t wsz)
 {
     char real[PATH_MAX], r1[300] = "", r2[300] = "";
     struct stat sb;
@@ -1751,8 +1780,12 @@ static host_bind_t copy_bind(const struct sp_ctx *c, const cJSON *orig, const ch
         fmt_why(why, wsz, "%.300s%s%.300s%s -> %.300s: %s", src, shown ? " (" : "", shown ? shown : "", \
                  shown ? ")" : "", dst[0] ? dst : "?", rr_); return HB_REFUSE; } while (0)
     if (st_ok && S_ISBLK(sb.st_mode)) REFUSE_BIND("a block device");
-    if (!st_ok && troot && orig_is_block(c, orig, src, dst, troot))
-        REFUSE_BIND("a block device, as the original's bind of it is");
+    if (!st_ok && troot) {
+        int ob = orig_is_block(c, orig, src, dst, troot);
+        const char *rr = ob < 0 && rec ? recorded_refusal(rec, src) : NULL;
+        if (ob > 0) REFUSE_BIND("a block device, as the original's bind of it is");
+        if (rr) REFUSE_BIND("%s", rr);
+    }
     host_bind_t f1 = host_bind_class(&c->tools, src, st_ok ? &sb : NULL, r1, sizeof(r1));
     host_bind_t f2 = have ? host_bind_class(&c->tools, real, st_ok ? &sb : NULL, r2, sizeof(r2)) : f1;
     if (f1 == HB_REFUSE) REFUSE_BIND("%s", r1);
@@ -1795,9 +1828,20 @@ static const char *copy_device_bad(const struct sp_ctx *c, const cJSON *hc, char
     return NULL;
 }
 
+/* A definition without recorded_types: every lookup in it finds nothing,
+ * so a source the host cannot judge is refused (B210). */
+static const cJSON k_no_record;
+
+static const cJSON *recorded_types(const cJSON *d)
+{
+    const cJSON *r = cJSON_GetObjectItemCaseSensitive(d, "recorded_types");
+    return cJSON_IsObject(r) ? r : &k_no_record;
+}
+
 /* The copy's HostConfig against the rule above; orig is the original's
- * Mounts as recorded. */
-static status_t copy_definition_ok(const struct sp_ctx *c, const cJSON *orig, const cJSON *hc, const char *troot)
+ * Mounts as recorded, rec the snapshot's types of the copy's sources. */
+static status_t copy_definition_ok(const struct sp_ctx *c, const cJSON *orig, const cJSON *rec, const cJSON *hc,
+                                   const char *troot)
 {
     char why[1200], src[PATH_MAX], dst[PATH_MAX];
     if (troot[0] != '/' || !helper_path_clean(troot))
@@ -1814,7 +1858,7 @@ static status_t copy_definition_ok(const struct sp_ctx *c, const cJSON *orig, co
         if (src[0] != '/')
             return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would mount the "
                              "volume %.200s, not a restored copy", src);
-        if (copy_bind(c, orig, src, dst, troot, why, sizeof(why)) == HB_REFUSE)
+        if (copy_bind(c, orig, rec, src, dst, troot, why, sizeof(why)) == HB_REFUSE)
             return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would bind %s", why);
     }
     cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Mounts")) {
@@ -1822,7 +1866,7 @@ static status_t copy_definition_ok(const struct sp_ctx *c, const cJSON *orig, co
         if (strcmp(type, "volume") == 0)
             return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would mount the "
                              "volume %.200s, not a restored copy", ms[0] ? ms : "(anonymous)");
-        if (strcmp(type, "bind") == 0 && copy_bind(c, orig, ms, jstr(b, "Target"), troot, why, sizeof(why)) == HB_REFUSE)
+        if (strcmp(type, "bind") == 0 && copy_bind(c, orig, rec, ms, jstr(b, "Target"), troot, why, sizeof(why)) == HB_REFUSE)
             return set_error(ERR_INVALID, "docker: refused, nothing created: the copy would bind %s", why);
     }
     if (copy_device_bad(c, hc, why, sizeof(why)))
@@ -1835,7 +1879,7 @@ static status_t copy_definition_ok(const struct sp_ctx *c, const cJSON *orig, co
         const char *type = jstr(m, "Type"), *os = jstr(m, "Source"), *od = jstr(m, "Destination");
         if (!od[0] || (strcmp(type, "bind") != 0 && strcmp(type, "volume") != 0)) continue;
         char w[300];
-        if (strcmp(type, "bind") == 0 && copy_bind(c, orig, os, od, NULL, w, sizeof(w)) == HB_KEEP) continue;
+        if (strcmp(type, "bind") == 0 && copy_bind(c, orig, NULL, os, od, NULL, w, sizeof(w)) == HB_KEEP) continue;
         int covered = 0;
         cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Binds")) {
             const char *v = cJSON_GetStringValue(b);
@@ -1895,7 +1939,7 @@ static status_t copy_created_ok(struct sp_ctx *c, const char *cid, const cJSON *
                      "restore", name, jstr(m, "Destination"));
         } else if (strcmp(type, "bind") == 0) {
             char w2[1100];
-            if (copy_bind(c, orig, ms, jstr(m, "Destination"), troot, w2, sizeof(w2)) == HB_REFUSE)
+            if (copy_bind(c, orig, NULL, ms, jstr(m, "Destination"), troot, w2, sizeof(w2)) == HB_REFUSE)
                 snprintf(why, sizeof(why), "it binds %s", w2);
         }
     }
@@ -1988,7 +2032,8 @@ static status_t solo_refusals(const struct sp_ctx *c, const cJSON *d, const help
     /* A copy beside the original mounts nothing of the original's (B188);
      * first, so its refusal names the bind and why. */
     if (*copy) {
-        status_t st = copy_definition_ok(c, cJSON_GetObjectItemCaseSensitive(in, "Mounts"), hc, jstr(d, "target_root"));
+        status_t st = copy_definition_ok(c, cJSON_GetObjectItemCaseSensitive(in, "Mounts"), recorded_types(d), hc,
+                                         jstr(d, "target_root"));
         if (st != OK) return st;
     }
     const char *why = privileged_reason(hc);
@@ -2218,7 +2263,7 @@ static cJSON *compose_orig_mounts(const cJSON *cp)
 /* A compose copy (B188): each service's volumes are binds under the target
  * root, inside nothing the original mounts, and replace every mount the
  * service had (compose merges volumes by container path). */
-static status_t compose_copy_ok(const struct sp_ctx *c, const cJSON *cp, const char *troot)
+static status_t compose_copy_ok(const struct sp_ctx *c, const cJSON *cp, const cJSON *rec, const char *troot)
 {
     cJSON *orig = compose_orig_mounts(cp);
     if (!orig) return set_error(ERR_NOMEM, "docker: define");
@@ -2238,7 +2283,7 @@ static status_t compose_copy_ok(const struct sp_ctx *c, const cJSON *cp, const c
                                "mount the volume %.200s, not a restored copy", sname, src);
                 break;
             }
-            if (copy_bind(c, orig, src, dst, troot, why, sizeof(why)) == HB_REFUSE) {
+            if (copy_bind(c, orig, rec, src, dst, troot, why, sizeof(why)) == HB_REFUSE) {
                 st = set_error(ERR_INVALID, "docker: refused, nothing created: service %.64s of the copy "
                                "would bind %s", sname, why);
                 break;
@@ -2251,7 +2296,7 @@ static status_t compose_copy_ok(const struct sp_ctx *c, const cJSON *cp, const c
             /* A host path the compose file binds stays in the copy unless
              * replaced: kept if a facility, refused if a forbidden one. */
             if (strcmp(type, "bind") == 0) {
-                host_bind_t hb = copy_bind(c, orig, os, od, NULL, why, sizeof(why));
+                host_bind_t hb = copy_bind(c, orig, NULL, os, od, NULL, why, sizeof(why));
                 if (hb == HB_KEEP) continue;
                 if (hb == HB_REFUSE) {
                     st = set_error(ERR_INVALID, "docker: refused, nothing created: service %.64s of the copy "
@@ -2338,7 +2383,7 @@ static status_t compose_refusals(const struct sp_ctx *c, const char *unit_id, co
                 return set_error(ERR_INVALID, "docker: a bind of %.200s outside the include roots", src);
         }
     }
-    return *new_name ? compose_copy_ok(c, cp, troot) : OK;
+    return *new_name ? compose_copy_ok(c, cp, recorded_types(d), troot) : OK;
 }
 
 __attribute__((noinline))

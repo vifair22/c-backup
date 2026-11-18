@@ -4104,8 +4104,13 @@ the copy's bind of it is rewritten under `DIR`. The check runs before the
 restore writes anything, when that path does not exist yet, so it judges
 the original the bind stands in for (the recorded mount at the same
 container path, resolved on the host) and refuses before the data or the
-node is written (B210). An original no longer on the host cannot say; the
-check of the created container still finds the node and removes the copy.
+node is written (B210). When the original is no longer on the host, the
+snapshot being restored decides: the daemon passes the type each copy
+source was recorded with, and a block device is refused. So is a source
+the snapshot has no entry for, or one recorded as a link (its target
+cannot be judged before it is written): `cannot verify it is not a block
+device`, again before anything is written. The check of the created
+container still runs as well.
 
 Anything else refuses the restore before the container is created, with
 `refused, nothing created` naming the bind (`<host path> -> <container
