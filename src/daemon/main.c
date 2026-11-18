@@ -214,12 +214,13 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
         /* vm-backup.md 5.8: the checkpoints the tokens name, put back
          * before the scheduler starts. A helper that is not up yet does
          * the same at its own start, and every session checks again. */
-        unsigned n = 0, redone = 0, refused = 0;
-        if (unit_checkpoints_redefine(db, &n, &redone, &refused) != OK) {
+        unsigned n = 0, redone = 0, refused = 0, kept = 0;
+        if (unit_checkpoints_redefine(db, &n, &redone, &refused, &kept) != OK) {
             log_warn("units: checkpoint redefine: %s", err_msg());
             err_clear();
-        } else if (n) {
-            log_info("units: %u checkpoint(s) checked, %u redefined, %u could not be", n, redone, refused);
+        } else if (n || kept) {
+            log_info("units: %u checkpoint(s) checked, %u redefined, %u could not be; %u of removed "
+                     "units kept", n, redone, refused, kept);
         }
     }
 

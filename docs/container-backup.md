@@ -907,8 +907,11 @@ for, the recorded mount at the same container path or the path with
 an include root is refused before the restore writes it. When neither
 exists on the host, the daemon's `recorded_types` decides: the type of each
 copy source's entry in the manifest of the snapshot being restored
-(`blk`, `chr`, `dir`, `reg`, `lnk`, `link`, `fifo`, or `missing`). `blk`
-is refused; `missing`, `lnk`, `link` or no record at all is refused as
+(`blk`, `chr`, `dir`, `reg`, `lnk`, `link`, `fifo`, `sock` for an entry
+the scan recorded unclassified (a socket; NIT-44), `other`, or
+`missing`). `blk` is refused; `sock` is refused because a restore never
+recreates a socket, so the copy would bind nothing; `missing`, `other`,
+`lnk`, `link` or no record at all is refused as
 "cannot verify", since nothing then says what the restore would write,
 and the refusal names the alternative: the files restored to a path
 (`c-backup restore <repo> <snapshot> <dir> --subpath <path>`, or `c-backup

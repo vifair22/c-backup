@@ -1165,7 +1165,12 @@ it, and puts back any that libvirt has lost (redefine, with libvirt checking
 the bitmap is present and consistent) when it starts, when the daemon
 starts, and before every backup. A checkpoint that cannot be put back costs
 its disks one full read. If the helper's state directory is lost too, the
-next backup of every VM reads in full.
+next backup of every VM reads in full. At daemon start, the checkpoints of
+a VM the helper no longer lists (deleted, or taken out of its policy) are
+not asked about: their tokens are kept, since the VM can come back, and the
+start-up line counts them (`N of removed units kept`), with one debug line
+per such VM (NIT-45). They used to log a "not in the policy" warning per
+checkpoint at every start.
 
 **Audits.** Every `vm.audit_days`, and whenever an incremental would cost
 too much, a disk is read in full while the dirty bitmap is still asked for:
@@ -4149,7 +4154,12 @@ device`, again before anything is written. That refusal names the way
 round it: restore the files to a path instead, `c-backup restore <repo>
 <snapshot> <dir> --subpath <the bind's recorded path>` for that bind or
 `c-backup unit restore <repo> <snapshot> <dir>` for the whole unit
-(22.7.1), and create the container by hand. The check of the created
+(22.7.1), and create the container by hand. A source the snapshot
+records as a socket is refused for what it is: a restore never recreates a
+socket (the program serving it makes it), so the copy would bind nothing
+there (NIT-44); the refusal names the same way round. A fifo is restored
+and passes. The refusal reaches the job's error whole, up to 2 KiB, and
+one longer is cut with a visible `...` (B223). The check of the created
 container still runs as well.
 
 Anything else refuses the restore before the container is created, with
