@@ -3,6 +3,7 @@ import type { MaintenanceOp } from '../shared/api'
 import type { WireSnapshot, WireSummary, WireTypeStat } from '../shared/wire'
 import { StatCard } from './StatCard'
 import { ContextMenu } from './ContextMenu'
+import { useUncoveredDatabases } from './DatabasesView'
 import {
   fmtSize, fmtNum, relativeTime, absoluteTime, gfsBadges, OBJECT_TYPE_NAMES,
   GFS_DAILY, GFS_WEEKLY, GFS_MONTHLY, GFS_YEARLY,
@@ -56,6 +57,7 @@ interface Props {
   onViewSchedules?: () => void
   onViewVerify?: () => void
   onViewEncryption?: () => void
+  onViewDatabases?: () => void
   onViewGrep?: () => void
   onRunBackup?: () => void
   onRunOperation?: (command: MaintenanceOp) => void
@@ -65,13 +67,14 @@ interface Props {
   onPackBrowser?: () => void
 }
 
-export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onViewSchedules, onViewVerify, onViewEncryption, onViewGrep, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onViewSchedules, onViewVerify, onViewEncryption, onViewDatabases, onViewGrep, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
   const [summary, setSummary] = useState<Summary | null>(null)
   const [opsMenu, setOpsMenu] = useState<{ x: number; y: number } | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
   const [repoStats, setRepoStats] = useState<RepoStats | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const uncoveredDbs = useUncoveredDatabases(connName, Number(repoPath))
 
   useEffect(() => {
     let cancelled = false
@@ -215,6 +218,19 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
         {onViewSchedules && <QBtn onClick={onViewSchedules}>Schedules</QBtn>}
         {onViewVerify && <QBtn onClick={onViewVerify}>Integrity</QBtn>}
         {onViewEncryption && <QBtn onClick={onViewEncryption}>Encryption</QBtn>}
+        {onViewDatabases && (
+          <QBtn onClick={onViewDatabases}>
+            Databases
+            {/* Section 7.3: an uncovered live database stays visible until
+              * it is fixed or dismissed, and this is where it is seen. */}
+            {uncoveredDbs && uncoveredDbs.count > 0 && (
+              <span title="live databases captured uncovered"
+                className="ml-1.5 inline-block px-1.5 rounded-full bg-status-error text-white text-[10px] font-semibold">
+                {uncoveredDbs.count}{uncoveredDbs.more ? '+' : ''}
+              </span>
+            )}
+          </QBtn>
+        )}
 
         <div className="border-l border-border-default h-4 mx-0.5" />
 
