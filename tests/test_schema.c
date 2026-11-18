@@ -331,7 +331,10 @@ static void test_one_baseline_migration(void **state)
      * (db-detection.md 7.1). */
     assert_non_null(app_migrations[9].name);
     assert_string_equal(app_migrations[9].name, "011_db_findings.sql");
-    assert_null(app_migrations[10].name);
+    /* Their coverage in words, method and optional suggestion (7.4). */
+    assert_non_null(app_migrations[10].name);
+    assert_string_equal(app_migrations[10].name, "012_db_findings_detail.sql");
+    assert_null(app_migrations[11].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */

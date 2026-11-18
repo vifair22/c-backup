@@ -119,6 +119,9 @@ static status_t record_one(cutils_db_t *db, const char *repo, const char *snap, 
     const char *conf = db_confidence_name(f->confidence);
     const char *cov = db_coverage_name(f->coverage);
     const char *sugg = f->suggestion ? f->suggestion : "";
+    const char *why = f->coverage != DB_COV_NONE && f->coverage_why ? f->coverage_why : "";
+    const char *method = f->method ? f->method : "";
+    const char *opt = f->optional ? f->optional : "";
     int live = f->confidence == DB_CONF_LIVE;
     int uncovered = live && f->coverage == DB_COV_UNCOVERED;
     char what[PATH_MAX + 128];
@@ -140,12 +143,13 @@ static status_t record_one(cutils_db_t *db, const char *repo, const char *snap, 
         db_result_t *ir = NULL;
         if (db_execute(db, "INSERT INTO db_findings (repo_id, scope, engine, path, version,"
                            " confidence, coverage, suggestion, state, evidence, first_seen,"
-                           " last_seen, last_snap_id, alerted_at)"
+                           " last_seen, last_snap_id, alerted_at, coverage_why, method, optional)"
                            " VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''),"
-                           " ?, ?, ?, ?, ?, NULLIF(?, '')) RETURNING id",
+                           " ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),"
+                           " NULLIF(?, ''), NULLIF(?, '')) RETURNING id",
                        (const char *[]){ repo, scope, engine, f->path, f->version, conf, cov,
                                          sugg, state, f->evidence, now, now, snap,
-                                         alert ? now : "", NULL }, &ir) != 0 ||
+                                         alert ? now : "", why, method, opt, NULL }, &ir) != 0 ||
             !ir || ir->nrows != 1) {
             db_result_free(ir);
             return set_error(ERR_IO, "db findings: cannot record %s", f->path);
@@ -186,15 +190,21 @@ static status_t record_one(cutils_db_t *db, const char *repo, const char *snap, 
     int alert = uncovered && notify && !alerted && strcmp(state, "dismissed") != 0;
     char id_s[32];
     snprintf(id_s, sizeof(id_s), "%lld", (long long)id);
+    /* A detection run that made no snapshot (snap "") leaves the last
+     * snapshot the finding was seen in as it was. */
     if (db_execute_non_query(db, "UPDATE db_findings SET version = NULLIF(?, ''), confidence = ?,"
                                  " coverage = NULLIF(?, ''), suggestion = NULLIF(?, ''), state = ?,"
-                                 " evidence = ?, last_seen = ?, last_snap_id = ?,"
+                                 " evidence = ?, last_seen = ?,"
+                                 " last_snap_id = COALESCE(NULLIF(?, ''), last_snap_id),"
                                  " alerted_at = CASE WHEN ? = '1' THEN ?"
-                                 "                   WHEN ? = '1' THEN alerted_at ELSE NULL END"
+                                 "                   WHEN ? = '1' THEN alerted_at ELSE NULL END,"
+                                 " coverage_why = NULLIF(?, ''), method = NULLIF(?, ''),"
+                                 " optional = NULLIF(?, '')"
                                  " WHERE id = ?",
                              (const char *[]){ f->version, conf, cov, sugg, state, f->evidence,
                                                now, snap, alert ? "1" : "0", now,
-                                               alerted ? "1" : "0", id_s, NULL }, NULL) != 0)
+                                               alerted ? "1" : "0", why, method, opt, id_s,
+                                               NULL }, NULL) != 0)
         return set_error(ERR_IO, "db findings: cannot update finding %lld", (long long)id);
     if (strcmp(state, "dismissed") == 0) return OK;
     if (live && cov_changed)
@@ -207,7 +217,9 @@ static status_t record_one(cutils_db_t *db, const char *repo, const char *snap, 
     return OK;
 }
 
-status_t db_findings_record(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+/* snap_id 0: a detection run with no snapshot (db_findings_record_detect),
+ * which never alerts and tells its own rows by last_seen. */
+static status_t record_impl(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                             const db_findings_t *f,
                             const char *const *root_scopes, size_t n_root_scopes,
                             const char *scope, db_record_result_t *out)
@@ -216,11 +228,14 @@ status_t db_findings_record(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
     if (!db || !f) return set_error(ERR_INVALID, "db findings: nothing to record");
     if (f->n && !(out->ids = calloc(f->n, sizeof(*out->ids))))
         return set_error(ERR_NOMEM, "db findings");
-    char repo[32], snap[32], now[32];
+    char repo[32], snap[32] = "", now[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    if (snap_id > 0) snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
     snprintf(now, sizeof(now), "%lld", (long long)time(NULL));
-    int notify = db_detect_settings().notify_uncovered;
+    /* A detection run predicts the capture rather than making one, so its
+     * coverage is not what the alert is about (7.3): the next backup that
+     * captures the database uncovered alerts. */
+    int notify = snap_id > 0 && db_detect_settings().notify_uncovered;
 
     if (db_txn_begin(db) != OK) {
         db_record_result_free(out);
@@ -238,10 +253,15 @@ status_t db_findings_record(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
     for (size_t i = 0; i < n_sc && st == OK; i++) {
         const char *sc = root_scopes ? root_scopes[i] : scope;
         if (!sc) continue;
-        if (db_execute_non_query(db, "DELETE FROM db_findings WHERE repo_id = ? AND scope = ?"
-                                     " AND state IN ('new', 'suggested')"
-                                     " AND (last_snap_id IS NULL OR last_snap_id <> ?)",
-                                 (const char *[]){ repo, sc, snap, NULL }, NULL) != 0)
+        int rc = snap_id > 0
+            ? db_execute_non_query(db, "DELETE FROM db_findings WHERE repo_id = ? AND scope = ?"
+                                       " AND state IN ('new', 'suggested')"
+                                       " AND (last_snap_id IS NULL OR last_snap_id <> ?)",
+                                   (const char *[]){ repo, sc, snap, NULL }, NULL)
+            : db_execute_non_query(db, "DELETE FROM db_findings WHERE repo_id = ? AND scope = ?"
+                                       " AND state IN ('new', 'suggested') AND last_seen <> ?",
+                                   (const char *[]){ repo, sc, now, NULL }, NULL);
+        if (rc != 0)
             st = set_error(ERR_IO, "db findings: cannot drop stale findings for %s", sc);
     }
     if (st != OK) {
@@ -256,6 +276,130 @@ status_t db_findings_record(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
         return set_error_wrap(ERR_IO, "db findings: cannot commit");
     }
     return OK;
+}
+
+status_t db_findings_record(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                            const db_findings_t *f,
+                            const char *const *root_scopes, size_t n_root_scopes,
+                            const char *scope, db_record_result_t *out)
+{
+    if (snap_id <= 0) {
+        memset(out, 0, sizeof(*out));
+        return set_error(ERR_INVALID, "db findings: no snapshot to record against");
+    }
+    return record_impl(db, repo_id, snap_id, f, root_scopes, n_root_scopes, scope, out);
+}
+
+status_t db_findings_record_detect(cutils_db_t *db, int64_t repo_id, const db_findings_t *f,
+                                   const char *scope, db_record_result_t *out)
+{
+    return record_impl(db, repo_id, 0, f, NULL, 0, scope, out);
+}
+
+/* ------------------------------------------------------------------ */
+/* Nextcloud links                                                      */
+/* ------------------------------------------------------------------ */
+
+/* capture.group of a unit, "" when it has none. */
+static void unit_group(cutils_db_t *db, const char *repo, const char *unit_key, char *buf, size_t sz)
+{
+    buf[0] = '\0';
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT value FROM unit_policy WHERE repo_id = ? AND unit_key = ?"
+                       " AND key = 'capture.group'",
+                   (const char *[]){ repo, unit_key, NULL }, &r) == 0 && r && r->nrows == 1)
+        snprintf(buf, sz, "%s", r->rows[0][0]);
+    db_result_free(r);
+}
+
+static int names_have(const cJSON *ev, const char *name)
+{
+    const cJSON *it = NULL;
+    cJSON_ArrayForEach(it, cJSON_GetObjectItemCaseSensitive(ev, "unit_names")) {
+        const char *v = cJSON_GetStringValue(it);
+        if (v && strcmp(v, name) == 0) return 1;
+    }
+    return 0;
+}
+
+/* The unit whose recorded findings say it answers to host, with an engine
+ * row of that name; 1 with scope_out set. */
+static int find_db_unit(cutils_db_t *db, const char *repo, const char *own_scope,
+                        const char *engine, const char *host, char *scope_out, size_t sz)
+{
+    /* A prefilter only; the JSON decides. host is made of the characters
+     * nextcloud_dbhost allows, of which only '_' is special to LIKE. */
+    char pat[600];
+    size_t o = 0;
+    pat[o++] = '%';
+    pat[o++] = '"';
+    for (const char *c = host; *c && o + 4 < sizeof(pat); c++) {
+        if (*c == '_' || *c == '%' || *c == '\\') pat[o++] = '\\';
+        pat[o++] = *c;
+    }
+    pat[o++] = '"';
+    pat[o++] = '%';
+    pat[o] = '\0';
+    db_result_t *r = NULL;
+    int found = 0;
+    if (db_execute(db, "SELECT scope, evidence FROM db_findings WHERE repo_id = ? AND scope <> ?"
+                       " AND engine = ? AND scope LIKE 'unit:%' AND evidence LIKE ? ESCAPE '\\'"
+                       " ORDER BY id",
+                   (const char *[]){ repo, own_scope, engine, pat, NULL }, &r) == 0) {
+        for (int i = 0; r && i < r->nrows && !found; i++) {
+            cJSON *ev = cJSON_Parse(r->rows[i][1]);
+            if (ev && names_have(ev, host)) {
+                snprintf(scope_out, sz, "%s", r->rows[i][0]);
+                found = 1;
+            }
+            cJSON_Delete(ev);
+        }
+    }
+    db_result_free(r);
+    return found;
+}
+
+void db_findings_link_nextcloud(cutils_db_t *db, int64_t repo_id, const char *scope,
+                                db_findings_t *f)
+{
+    if (!db || !f || !scope) return;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    for (size_t i = 0; i < f->n; i++) {
+        db_finding_t *x = &f->v[i];
+        if (x->engine != DB_ENGINE_NEXTCLOUD || !x->evidence) continue;
+        cJSON *ev = cJSON_Parse(x->evidence);
+        cJSON *link = ev ? cJSON_GetObjectItemCaseSensitive(ev, "link") : NULL;
+        const char *host = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(link, "host"));
+        const cJSON *res = cJSON_GetObjectItemCaseSensitive(link, "resolved");
+        if (!host || !*host || !cJSON_IsNull(res)) { cJSON_Delete(ev); continue; }
+        const char *engine = strcmp(x->version, "pgsql") == 0 ? "postgres" : "mysql";
+        char other[600];
+        if (!find_db_unit(db, repo, scope, engine, host, other, sizeof(other))) {
+            char note[400];
+            snprintf(note, sizeof(note), "no unit backed up into this repository answers to %.200s", host);
+            cJSON_DeleteItemFromObjectCaseSensitive(link, "note");
+            cJSON_AddStringToObject(link, "note", note);
+        } else {
+            /* Two units are two captures unless they share a capture
+             * group (container-backup.md 6.2). */
+            char g1[256], g2[256];
+            unit_group(db, repo, strncmp(scope, "unit:", 5) == 0 ? scope + 5 : scope, g1, sizeof(g1));
+            unit_group(db, repo, other + 5, g2, sizeof(g2));
+            int grouped = g1[0] && strcmp(g1, g2) == 0;
+            cJSON_ReplaceItemInObjectCaseSensitive(link, "resolved", cJSON_CreateString(other));
+            cJSON_AddBoolToObject(link, "consistent", grouped);
+            cJSON_AddStringToObject(link, "note", grouped
+                ? "its database is in another unit of the same capture group: one capture"
+                : "its database is in another unit, captured at a different instant");
+            if (!grouped) x->suggestion = "group-units";
+        }
+        char *txt = cJSON_PrintUnformatted(ev);
+        char *dup = txt ? strdup(txt) : NULL;
+        cJSON_free(txt);
+        if (dup) { free(x->evidence); x->evidence = dup; }
+        cJSON_Delete(ev);
+    }
 }
 
 /* ------------------------------------------------------------------ */

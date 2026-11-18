@@ -19,6 +19,7 @@
  */
 
 #include "error.h"
+#include "provider.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -126,6 +127,37 @@ int  db_detect_cached(db_detector_t *d, const char *path, uint64_t size);
 void db_detect_carry_add(db_detector_t *d, const char *path, uint32_t code);
 /* A file still changing on the last read (OWN-45): liveness. */
 void db_detect_unsettled(db_detector_t *d, const char *path);
+
+/* ------------------------------------------------------------------ */
+/* Units (D1)                                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * What units.probe saw running in the unit (section 2, 8.1). Files open
+ * for writing under a finding are strong liveness and engine processes are
+ * liveness (section 2.1); an image, a listening port or an engine process
+ * with no signature anywhere in the included mounts makes a hint finding
+ * (path ""), one per engine. The container names and aliases resolve a
+ * Nextcloud dbhost within the unit. NULL, or never calling it, leaves the
+ * file signals alone deciding, as for a file source. Copies what it needs.
+ */
+void db_detect_unit(db_detector_t *d, const sp_unit_probe_t *probe);
+
+/*
+ * Nextcloud config.php files whose head was not read this run (the cache
+ * vouched for them), so the dbhost a link needs is unknown: fn is called
+ * with each recorded path, and may read the file's first
+ * DB_HEAD_MORE_BYTES and hand them to db_detect_head. One small read per
+ * Nextcloud, never a scan.
+ */
+void db_detect_nextcloud_unread(db_detector_t *d,
+                                void (*fn)(void *ctx, const char *path), void *ctx);
+
+/* The engines a process, an image reference or a port suggests, as a mask
+ * of (1u << db_engine_t). Pure; exposed for the tests. */
+uint32_t db_detect_process_engines(const char *comm, const char *args);
+uint32_t db_detect_image_engines(const char *image);
+uint32_t db_detect_port_engines(unsigned port);
 
 /* Every file classified from its head this run (not carried), for the
  * backup to keep in the file cache. */
