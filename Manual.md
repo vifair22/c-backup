@@ -1018,7 +1018,9 @@ it is storing, the next directory tree, or the next row of the snapshot's
 node index, which it writes last. A write that is waiting goes before the
 backup's next batch, and before every other bulk write that is waiting too
 (the backup's pack commits, a reindex, gc): it waits for the one transaction
-holding the lock and no more. That transaction is itself bounded: every bulk
+holding the lock and no more. That priority is bounded, so a steady stream
+of edits cannot stall a backup: a bulk write that has waited 150 ms, or
+seen eight edits go first, is served next. That transaction is itself bounded: every bulk
 transaction ends once it has written about as many database pages as the
 disk under `state.db` takes in 150 ms, learnt from the commits before it,
 and never more than 256. A backup nobody interrupts commits once per 2,000

@@ -81,6 +81,11 @@ status_t db_txn_begin_bulk(cutils_db_t *db);
  * one (B193). */
 unsigned long db_txn_bulk_count(void);
 
+/* The bound on that priority: a waiting bulk writer is served next once it
+ * has waited this long or seen this many priority writers go first. */
+#define DB_TXN_BULK_DUE_MS  DB_TXN_COMMIT_BUDGET_MS
+#define DB_TXN_PRI_STREAK   8
+
 /* Commit and release the lock. Releases the lock even when the commit fails:
  * there is nothing the caller can do about it and holding it would wedge every
  * other writer. */

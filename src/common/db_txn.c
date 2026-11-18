@@ -44,13 +44,29 @@ static pthread_cond_t  g_ticket_cv = PTHREAD_COND_INITIALIZER;
  * bulk one. On FS2 a tag and a note waited 13-16 s behind bulk commits that
  * had queued before them; now a request waits for at most the transaction
  * holding the lock, which the commit budget bounds and which ends early
- * once anybody is waiting (db_txn_waiters). A steady stream of priority
- * writers could hold bulk writers back, and that is the right way round:
- * the daemon's edits are few and short.
+ * once anybody is waiting (db_txn_waiters).
+ *
+ * Priority is bounded, so a steady stream of priority writers (log rows,
+ * job progress, a client polling edits) cannot hold a bulk writer back for
+ * ever: once a bulk writer has waited DB_TXN_BULK_DUE_MS, or seen
+ * DB_TXN_PRI_STREAK priority writers served in a row ahead of it, it is
+ * served next, and the priority writers then waiting go after it. So a
+ * bulk writer waits at most about one budget's worth, and a request at
+ * most one bulk transaction more than before.
  */
 static int             g_held;
 static uint64_t        g_pri_next, g_pri_serving;
 static uint64_t        g_bulk_next, g_bulk_serving;
+static unsigned        g_pri_streak;      /* priority grants since a bulk one */
+static uint64_t        g_bulk_head_since; /* when the oldest bulk waiter queued */
+
+/* Under g_ticket_mu: whether a waiting bulk writer is owed the next turn. */
+static int bulk_due(void)
+{
+    if (g_bulk_next == g_bulk_serving) return 0;
+    return g_pri_streak >= DB_TXN_PRI_STREAK ||
+           phase_now() - g_bulk_head_since >= (uint64_t)DB_TXN_BULK_DUE_MS * 1000000ULL;
+}
 static atomic_ulong    g_bulk_txns;    /* bulk transactions begun, for tests */
 
 /* Threads inside write_lock that have not been served yet. Written under
@@ -247,24 +263,33 @@ static void write_lock_as(int bulk)
 {
     pthread_mutex_lock(&g_ticket_mu);
     if (bulk) {
+        if (g_bulk_next == g_bulk_serving) g_bulk_head_since = phase_now();
         uint64_t mine = g_bulk_next++;
-        if (g_held || mine != g_bulk_serving || g_pri_next != g_pri_serving) {
+#define BULK_WAITS (g_held || mine != g_bulk_serving || \
+                    (g_pri_next != g_pri_serving && !bulk_due()))
+        if (BULK_WAITS) {
             atomic_fetch_add_explicit(&g_waiting, 1, memory_order_relaxed);
-            while (g_held || mine != g_bulk_serving || g_pri_next != g_pri_serving)
+            while (BULK_WAITS)
                 pthread_cond_wait(&g_ticket_cv, &g_ticket_mu);
             atomic_fetch_sub_explicit(&g_waiting, 1, memory_order_relaxed);
         }
+#undef BULK_WAITS
         g_bulk_serving++;
+        g_pri_streak = 0;
+        g_bulk_head_since = phase_now();   /* the next bulk waiter's turn starts now */
         atomic_fetch_add_explicit(&g_bulk_txns, 1, memory_order_relaxed);
     } else {
         uint64_t mine = g_pri_next++;
-        if (g_held || mine != g_pri_serving) {
+#define PRI_WAITS (g_held || mine != g_pri_serving || bulk_due())
+        if (PRI_WAITS) {
             atomic_fetch_add_explicit(&g_waiting, 1, memory_order_relaxed);
-            while (g_held || mine != g_pri_serving)
+            while (PRI_WAITS)
                 pthread_cond_wait(&g_ticket_cv, &g_ticket_mu);
             atomic_fetch_sub_explicit(&g_waiting, 1, memory_order_relaxed);
         }
+#undef PRI_WAITS
         g_pri_serving++;
+        if (g_bulk_next != g_bulk_serving) g_pri_streak++;
     }
     g_held = 1;
     pthread_mutex_unlock(&g_ticket_mu);
