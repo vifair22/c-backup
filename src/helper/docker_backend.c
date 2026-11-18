@@ -5,8 +5,10 @@
 #include "helper_proto.h"
 #include "hooklog.h"
 #include "mounts.h"
+#include "proc_probe.h"
 #include "snap.h"
 #include "thread_name.h"
+#include "unit_probe.h"
 
 #include <cutils/log.h>
 
@@ -363,17 +365,44 @@ static void suggest(struct sp_ctx *c, const mount_class_t *mc, cJSON *out)
     }
 }
 
+/* A member's inspect, verbatim and parsed. On OK the caller owns both. */
+static status_t inspect_member(struct sp_ctx *c, const member_t *m, char **raw, size_t *rlen, cJSON **in)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/containers/%.79s/json", m->id);
+    *raw = NULL;
+    *in = NULL;
+    status_t st = docker_get_raw(&c->api, path, raw, rlen);
+    if (st != OK) return st;
+    if (!(*in = cJSON_ParseWithLength(*raw, *rlen))) {
+        free(*raw);
+        *raw = NULL;
+        return set_error(ERR_IO, "docker: inspect of %s is not JSON", m->name);
+    }
+    return OK;
+}
+
+/* One entry of an inspect's Mounts, classified as describe and probe both
+ * see it. ERR_NOT_FOUND naming the container when it cannot be. */
+static status_t classify_mount(struct sp_ctx *c, const member_t *m, const cJSON *mnt, mount_class_t *mc)
+{
+    if (mount_classify(&c->mounts, jstr(mnt, "Type"), jstr(mnt, "Source"), jstr(mnt, "Driver"), mc) == OK)
+        return OK;
+    char why[400];
+    snprintf(why, sizeof(why), "%.390s", err_msg());
+    err_clear();
+    return set_error(ERR_NOT_FOUND, "docker: %s: %s", m->name, why);
+}
+
 static status_t describe_member(struct sp_ctx *c, dbuild_t *b, const char *unit, const member_t *m,
                                 cJSON *mounts_out, cJSON *suggest_out, int *compose_done)
 {
     char path[256], id[SP_ITEM_ID_MAX], tp[PATH_MAX];
-    snprintf(path, sizeof(path), "/containers/%.79s/json", m->id);
     char *raw = NULL;
     size_t rlen = 0;
-    status_t st = docker_get_raw(&c->api, path, &raw, &rlen);
+    cJSON *in = NULL;
+    status_t st = inspect_member(c, m, &raw, &rlen, &in);
     if (st != OK) return st;
-    cJSON *in = cJSON_ParseWithLength(raw, rlen);
-    if (!in) { free(raw); return set_error(ERR_IO, "docker: inspect of %s is not JSON", m->name); }
     /* Verbatim: backup never mutates what it captures (4.1). */
     item_id(id, sizeof(id), "inspect:", m->name);
     snprintf(tp, sizeof(tp), CFG_DIR "/containers/%s/inspect.json", m->name);
@@ -459,13 +488,7 @@ static status_t describe_member(struct sp_ctx *c, dbuild_t *b, const char *unit,
     const cJSON *mnt;
     cJSON_ArrayForEach(mnt, cJSON_GetObjectItemCaseSensitive(in, "Mounts")) {
         mount_class_t mc;
-        if ((st = mount_classify(&c->mounts, jstr(mnt, "Type"), jstr(mnt, "Source"), jstr(mnt, "Driver"), &mc)) != OK) {
-            char why[400];
-            snprintf(why, sizeof(why), "%.390s", err_msg());
-            err_clear();
-            st = set_error(ERR_NOT_FOUND, "docker: %s: %s", m->name, why);
-            goto out;
-        }
+        if ((st = classify_mount(c, m, mnt, &mc)) != OK) goto out;
         char outcome[64];
         snap_dom_t dom;
         memset(&dom, 0, sizeof(dom));
@@ -1441,13 +1464,107 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
     return OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* units.probe                                                         */
+/* ------------------------------------------------------------------ */
+
+static void probe_alias(sp_probe_container_t *pc, const char *a, int *truncated)
+{
+    if (!a || !a[0] || !helper_str_ok(a, SP_PROBE_NAME_MAX - 1)) return;
+    for (size_t i = 0; i < pc->n_aliases; i++) if (strcmp(pc->aliases[i], a) == 0) return;
+    if (pc->n_aliases == SP_PROBE_ALIASES_MAX) { *truncated = 1; return; }
+    memcpy(pc->aliases[pc->n_aliases++], a, strlen(a) + 1);   /* length checked above */
+}
+
+/*
+ * One member, from its inspect: the names it answers to on its networks,
+ * its image as configured, and what /proc says runs in it, with its mounts
+ * classified exactly as describe classifies them. A mount that cannot be
+ * classified now (its source gone) is treated as excluded: describe would
+ * fail the unit, a probe only says less.
+ */
+static status_t probe_member(struct sp_ctx *c, const member_t *m, sp_probe_container_t *pc, int *truncated)
+{
+    snprintf(pc->name, sizeof(pc->name), "%.127s", helper_str_ok(m->name, sizeof(pc->name) - 1) ? m->name : m->id);
+    char *raw = NULL;
+    size_t rlen = 0;
+    cJSON *in = NULL;
+    status_t st = inspect_member(c, m, &raw, &rlen, &in);
+    if (st != OK) return st;
+    free(raw);
+    const cJSON *cfg = cJSON_GetObjectItemCaseSensitive(in, "Config");
+    const char *image = jstr(cfg, "Image");
+    if (helper_str_ok(image, sizeof(pc->image) - 1)) snprintf(pc->image, sizeof(pc->image), "%s", image);
+    probe_alias(pc, pc->name, truncated);
+    const cJSON *net;
+    cJSON_ArrayForEach(net, cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(in, "NetworkSettings"),
+                                                             "Networks")) {
+        const cJSON *a;
+        cJSON_ArrayForEach(a, cJSON_GetObjectItemCaseSensitive(net, "Aliases")) probe_alias(pc, cJSON_GetStringValue(a), truncated);
+    }
+    probe_alias(pc, label(cfg, "com.docker.compose.service"), truncated);
+
+    const cJSON *state = cJSON_GetObjectItemCaseSensitive(in, "State");
+    const cJSON *jpid = cJSON_GetObjectItemCaseSensitive(state, "Pid");
+    double dpid = cJSON_IsNumber(jpid) ? jpid->valuedouble : 0;
+    int pid = dpid >= 1 && dpid <= 4194304 ? (int)dpid : 0;
+    pc->running = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(state, "Running")) && pid > 0;
+
+    const cJSON *mounts = cJSON_GetObjectItemCaseSensitive(in, "Mounts");
+    size_t nm = (size_t)cJSON_GetArraySize(mounts), k = 0;
+    proc_mount_t *pm = calloc(nm ? nm : 1, sizeof(*pm));
+    char (*rec)[PATH_MAX] = calloc(nm ? nm : 1, sizeof(*rec));
+    mount_class_t *mc = malloc(sizeof(*mc));
+    if (!pm || !rec || !mc) st = set_error(ERR_NOMEM, "docker: probe");
+    const cJSON *mnt;
+    cJSON_ArrayForEach(mnt, mounts) {
+        if (st != OK || !pc->running) break;
+        const char *dest = jstr(mnt, "Destination");
+        if (!helper_path_clean(dest)) continue;
+        pm[k].dest = dest;
+        if (classify_mount(c, m, mnt, mc) == OK && mc->verdict == MOUNT_INCLUDED) {
+            snprintf(rec[k], PATH_MAX, "%s", mc->recorded);
+            pm[k].recorded = rec[k];
+        }
+        err_clear();
+        k++;
+    }
+    if (st == OK && pc->running) {
+        st = proc_probe_container(c->pol->proc_root, pid, pm, k, pc, truncated);
+        if (st == ERR_NOT_FOUND) { pc->running = 0; err_clear(); st = OK; }  /* stopped meanwhile */
+    }
+    free(mc);
+    free(rec);
+    free(pm);
+    cJSON_Delete(in);
+    return st;
+}
+
+static status_t d_unit_probe(sp_ctx_t *c, const char *unit_id, sp_unit_probe_t **out)
+{
+    *out = NULL;
+    member_t m[MEMBERS_MAX];
+    size_t n = 0;
+    status_t st = members_of(c, unit_id, m, &n);
+    if (st != OK) return st;
+    sp_unit_probe_t *p = sp_unit_probe_new();
+    if (!p || !(p->v = calloc(n, sizeof(*p->v)))) { sp_unit_probe_free(p); return set_error(ERR_NOMEM, "docker: probe"); }
+    for (size_t i = 0; st == OK && i < n && i < SP_PROBE_CONTAINERS_MAX; i++) {
+        p->n = i + 1;
+        st = probe_member(c, &m[i], &p->v[i], &p->truncated);
+    }
+    if (st != OK) { sp_unit_probe_free(p); return st; }
+    *out = p;
+    return OK;
+}
+
 static const sp_provider_ops_t k_docker_ops = {
     .name = "docker", .abi = SP_ABI_VERSION,
     .init = d_init, .fini = d_fini, .probe = d_probe, .list_units = d_list,
     .describe = d_describe, .desc_free = sp_unit_desc_free, .begin = d_begin,
     .blob_read = d_blob_read, .tree_root = d_tree_root, .end = d_end, .sweep = d_sweep,
     .stream_open = d_stream_open, .stream_close = d_stream_close, .release = d_release,
-    .begin_group = d_begin_group,
+    .begin_group = d_begin_group, .unit_probe = d_unit_probe,
 };
 
 /* ------------------------------------------------------------------ */

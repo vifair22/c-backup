@@ -6,6 +6,7 @@
 #include "helper_backend.h"
 #include "helper_proto.h"
 #include "hooklog.h"
+#include "unit_probe.h"
 
 #include <sys/mman.h>
 
@@ -678,6 +679,29 @@ static char *op_units_describe(helper_server_t *s, const helper_req_t *r, int *p
         cJSON_AddNumberToObject(res, "blob_bytes", (double)boff);
         *pass_fd = bfd;
     }
+    return resp_ok(r->id, res);
+}
+
+/* units.probe (db-detection.md 8.1): read-only, gated like describe. The
+ * answer is cut to fit one packet with its envelope, never refused for
+ * size. */
+static char *op_units_probe(helper_server_t *s, const helper_req_t *r)
+{
+    char why[256];
+    helper_err_t e = unit_allowed(s, r->unit, why, sizeof(why));
+    if (e != HELPER_OK) return resp_error(r->id, e, "%s", why);
+    const char *uid = NULL;
+    const helper_backend_t *b = NULL;
+    if ((e = backend_for(s, r->unit, &uid, &b, why, sizeof(why))) != HELPER_OK)
+        return resp_error(r->id, e, "%s", why);
+    if (!b->ops->unit_probe)
+        return resp_error(r->id, HELPER_E_UNSUPPORTED, "provider %s cannot probe its units", b->name);
+    sp_unit_probe_t *p = NULL;
+    if (b->ops->unit_probe(b->ctx, uid, &p) != OK)
+        return resp_error(r->id, HELPER_E_FAILED, "%s", err_msg());
+    /* {"id":<up to 2^53>,"ok":true,"result":...} around it. */
+    cJSON *res = sp_unit_probe_to_json(p, HELPER_PACKET_MAX - 64);
+    sp_unit_probe_free(p);
     return resp_ok(r->id, res);
 }
 
@@ -2436,6 +2460,7 @@ static char *dispatch(helper_server_t *s, const helper_req_t *r, int *pass_fd, i
     case HOP_UNIT_DEFINE:            return op_unit_define(s, r, in_fd);
     case HOP_LEASE_RELEASE:          return op_lease_release(s, r);
     case HOP_SWEEP:                  return op_sweep(s, r);
+    case HOP_UNITS_PROBE:            return op_units_probe(s, r);
     case HOP_COUNT:                  break;
     }
     return resp_error(r->id, HELPER_E_DENIED, "operation does not exist");

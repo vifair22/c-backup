@@ -69,6 +69,7 @@ typedef enum {
     HOP_UNIT_DEFINE,
     HOP_LEASE_RELEASE,
     HOP_SWEEP,
+    HOP_UNITS_PROBE,     /* db-detection.md 8.1; last, so no number above moves */
     HOP_COUNT
 } helper_op_t;
 

@@ -6,6 +6,7 @@
 #include "fake_provider.h"
 #include "helper_proto.h"
 #include "registry.h"
+#include "unit_probe.h"
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
@@ -392,6 +393,18 @@ static status_t r_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
 }
 
 static void r_desc_free(sp_unit_desc_t *d) { sp_unit_desc_free(d); }
+
+/* The helper's answer is held to the same validation as anything else
+ * read from it: a bad one is ERR_INVALID naming the field. */
+static status_t r_unit_probe(sp_ctx_t *c, const char *unit_id, sp_unit_probe_t **out)
+{
+    *out = NULL;
+    cJSON *res = NULL;
+    status_t st = rcall(c->socket, "units.probe", args_unit(c, unit_id), &res);
+    if (st == OK) st = sp_unit_probe_from_json(res, out);
+    cJSON_Delete(res);
+    return st;
+}
 
 static void session_free(struct sp_session *s)
 {
@@ -942,6 +955,9 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
             .end = r_end, .sweep = r_sweep,
             .stream_open = r_stream_open, .stream_close = r_stream_close, .release = r_release,
             .begin_group = r_begin_group,
+            /* A VM shows no processes or files to the host (db-detection.md
+             * 10), so the daemon is never told it could ask. */
+            .unit_probe = strcmp(p->valuestring, "libvirt") == 0 ? NULL : r_unit_probe,
         };
         st = sp_registry_add(o, c);
         if (st != OK) { free(c); break; }
