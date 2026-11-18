@@ -2945,16 +2945,16 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
          * truth. Reported as what it is rather than as "no snapshot",
          * which the next start's reconcile would contradict by indexing it.
          *
-         * Reconcile looks only above the highest indexed id, so a later
-         * backup indexed before the next start hides this one from it;
-         * a reindex finds it either way.
+         * Reconcile lists every record the index lacks, wherever its id
+         * falls, and gc indexes any such record before it marks (B200), so
+         * nothing this snapshot alone holds can be swept meanwhile.
          */
         char cause[2048];
         snprintf(cause, sizeof(cause), "%s", err_msg());
         set_error(st, "%s; snapshot %lld was written to the repository but its "
                   "index did not commit: the next daemon start indexes it "
-                  "(reconcile) unless a later snapshot of this repository is "
-                  "indexed first, and `c-backup reindex %lld` indexes it now",
+                  "(reconcile), as does the next gc before it sweeps, and "
+                  "`c-backup reindex %lld` indexes it now",
                   cause, (long long)snap_id, (long long)repo_id);
         log_warn("backup: %s", err_msg());
         if (out) {

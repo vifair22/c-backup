@@ -851,14 +851,14 @@ flowchart TD
    before it. A backup whose index rows then fail to commit (a full
    `state.db` filesystem, say) fails, but its error says so, naming the
    snapshot: `...; snapshot 12 was written to the repository but its index
-   did not commit: the next daemon start indexes it (reconcile) unless a
-   later snapshot of this repository is indexed first, and c-backup reindex
-   3 indexes it now`, and the job's `result` is `{"snapshot_id":12,
-   "indexed":false}`. The snapshot is not deleted, and it is not missing
-   either: the next start's reconcile (section 17.5) reindexes it like any
-   record whose rows a power cut took, as long as no later backup of the
-   repository has been indexed by then, since reconcile looks only above
-   the highest indexed id; `c-backup reindex` finds it in every case.
+   did not commit: the next daemon start indexes it (reconcile), as does the
+   next gc before it sweeps, and c-backup reindex 3 indexes it now`, and the
+   job's `result` is `{"snapshot_id":12, "indexed":false}`. The snapshot is
+   not deleted, and it is not lost either: the next start's reconcile
+   (section 17.5) finds every record the index lacks, wherever its id
+   falls, and reindexes it, and gc (section 12) indexes any such record
+   before it decides what is unreferenced, so nothing only that snapshot
+   holds can be swept in the meantime.
 
 There is no pack step afterwards and nothing to run by hand: a backup leaves
 no loose objects because none exist. Merging the small trailing packs
@@ -1766,6 +1766,16 @@ would do:
  "tmp_files_removed":0,"tmp_bytes_removed":0}
 ```
 
+Before it marks anything, gc lists the repository's `snapshots/` and
+indexes every snapshot record the index lacks (a backup whose index did not
+commit, section 6.3 step 5), since what is unreferenced is decided from the
+index and a snapshot it does not list would lose everything only it holds.
+The result counts them in `snapshots_indexed`, and the log names them. A
+record that cannot be read or indexed, or an encrypted repository without
+its key loaded, makes gc refuse, naming the snapshot, rather than mark
+around it; `gc --dry-run`, which changes nothing, refuses while any such
+record is present.
+
 `objects_swept` is how many unreachable objects were removed from the index,
 and `bytes_freed` the stored bytes compaction then removed from the packs
 (dead entries included that an earlier run swept and could not reclaim, and
@@ -1964,6 +1974,11 @@ restored from.
 - **Snapshot ids stay ahead.** The target's `snapshot-ids` is raised before
   each snapshot record is written, and at the end of a run to at least the
   source's mark, so a replica never numbers below its source.
+- **Every snapshot the source holds.** What to send is chosen from the
+  index, so a snapshot record the index lacks (a backup whose index did not
+  commit, section 6.3 step 5) is indexed first, as gc does (section 12); one
+  that cannot be indexed fails the job, naming it, rather than leave the
+  replica silently without it.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
 - **Whole snapshots only.** Each snapshot's new objects are written into
@@ -2436,15 +2451,18 @@ Where each kind of state lives decides what such a loss can cost:
 The index itself - snapshots, browse and search rows, the object and pack
 tables - is in `state.db` too, and a backup's index rows are its last
 commits, so they are what a power cut takes. **The daemon puts them back on
-its own.** At every start it compares, for each registered repository, the
-highest snapshot id in the index with the repository's snapshot-id mark,
-and looks for snapshot records above the index's highest one; this costs a
-query and a small file read per repository when nothing is missing. For a
-repository with missing snapshots it logs a warning naming the repository
-and the count:
+its own.** At every start it lists, for each registered repository, the
+snapshot records in `snapshots/` and compares them with the ids the index
+holds; any record without a row is missing, whatever its id, so a backup
+whose index failed to commit after its record was written (section 6.3,
+step 5) is found even when later backups were indexed after it. This costs
+one directory listing and one query per repository. A record whose
+removal by a prune was interrupted is finished off first, not brought
+back. For a repository with missing snapshots it logs a warning naming the
+repository and the count:
 
 ```
-reconcile: repo 1 (/srv/backup/main) has 1 snapshot(s) missing from the index, most likely lost with the last moments before a power cut or crash; reindexing it as job 41
+reconcile: repo 1 (/srv/backup/main) has 1 snapshot(s) missing from the index, lost with the last moments before a power cut or crash, or left by a backup whose index did not commit; reindexing it as job 41
 ```
 
 and queues a reindex job, which runs like any other: under the repository's

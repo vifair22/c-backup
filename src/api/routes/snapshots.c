@@ -1104,7 +1104,8 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              "\"packs_deleted\":%u,\"packs_coalesced\":%u,"
              "\"packs_removed_by_coalesce\":%u,\"tmp_files_removed\":%u,"
              "\"tmp_bytes_removed\":%llu,\"content_missing\":%llu,"
-             "\"dups_dropped\":%llu,\"dups_kept\":%llu,\"index_relocated\":%llu",
+             "\"dups_dropped\":%llu,\"dups_kept\":%llu,\"index_relocated\":%llu,"
+             "\"snapshots_indexed\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
              (unsigned long long)gr->swept,
@@ -1118,7 +1119,8 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              (unsigned long long)gr->content_missing,
              (unsigned long long)gr->dups_dropped,
              (unsigned long long)gr->dups_kept,
-             (unsigned long long)gr->index_relocated);
+             (unsigned long long)gr->index_relocated,
+             (unsigned long long)gr->snapshots_indexed);
     /* Packs compaction could not walk, each with why. Reasons are built by
      * the pack layer from fixed text and numbers, so need no escaping. */
     size_t n = jn > 0 ? (size_t)jn : 0;

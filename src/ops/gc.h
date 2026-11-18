@@ -69,6 +69,8 @@ typedef struct {
     uint64_t dups_dropped;
     uint64_t dups_kept;
     uint64_t index_relocated;
+    /* Snapshot records the index lacked, indexed before marking (B200). */
+    uint64_t snapshots_indexed;
 } gc_result_t;
 
 /*
