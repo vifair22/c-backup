@@ -112,7 +112,10 @@ const remote_hello_t *remote_last_hello(void) { return &g_hello; }
 
 int remote_template_allowed(const char *name, char *allowed, size_t asz)
 {
-    remote_hello_t h = g_hello;
+    /* The link's copy, under its lock: g_hello is the link thread's. */
+    remote_link_info_t li;
+    remote_link_info(&li);
+    const remote_hello_t h = li.hello;
     if (allowed && asz) snprintf(allowed, asz, "%s", h.templates);
     if (!h.have_templates) return -1;
     size_t n = strlen(name);

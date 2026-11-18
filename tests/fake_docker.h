@@ -39,6 +39,7 @@ typedef struct {
     int  n;
     int  pauses, unpauses, starts, stops, execs;
     char exec_cmd[16][256];
+    char exec_user[16][64];    /* each exec's User, "" when it named none */
     int  n_exec;
     int  digest_gone;          /* image pulls by digest fail, as a registry that dropped it */
     int  lose_pause;           /* a pause is undone at once, as a watchdog's unpause would */
@@ -211,7 +212,9 @@ static void fd_serve(fake_docker_t *f, int fd)
     } else if (fd_route(p, "/containers/", "/exec", id, sizeof(id))) {
         cJSON *b = cJSON_Parse(body);
         const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(b, "Cmd");
-        char line[256] = "";
+        const char *user = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(b, "User"));
+        char line[256] = "", who[64];
+        snprintf(who, sizeof(who), "%s", user ? user : "");
         const cJSON *x;
         cJSON_ArrayForEach(x, cmd) {
             size_t l = strlen(line);
@@ -220,6 +223,7 @@ static void fd_serve(fake_docker_t *f, int fd)
         cJSON_Delete(b);
         int k = f->n_exec < 16 ? f->n_exec++ : 15;
         snprintf(f->exec_cmd[k], sizeof(f->exec_cmd[k]), "%s", line);
+        snprintf(f->exec_user[k], sizeof(f->exec_user[k]), "%s", who);
         f->execs++;
         snprintf(out, sizeof(out), "{\"Id\":\"%02x%062d\"}", k, 0);
         fd_reply(fd, 201, out);
