@@ -1502,8 +1502,37 @@ static status_t detect_job_run(void *arg, atomic_int *cancel,
     return OK;
 }
 
-static api_response_t unit_detect_post(int64_t repo_id, const char *prov, const char *unit)
+/* detect takes no fields: no body, or an empty object. Anything else is
+ * refused naming what was not understood, as an unknown config key is,
+ * rather than run as if it had been. 0, or -1 with *bad set. */
+static int detect_body_ok(const api_request_t *req, api_response_t *bad)
 {
+    if (!req->body || req->body_len == 0) return 0;
+    char *txt = strndup(req->body, req->body_len);
+    cJSON *o = txt ? cJSON_Parse(txt) : NULL;
+    free(txt);
+    if (!o || !cJSON_IsObject(o)) {
+        cJSON_Delete(o);
+        *bad = api_error(400, "body must be a JSON object; detect takes no fields");
+        return -1;
+    }
+    if (o->child) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "unknown key '%.80s'; detect takes no fields",
+                 o->child->string ? o->child->string : "");
+        cJSON_Delete(o);
+        *bad = api_error(400, msg);
+        return -1;
+    }
+    cJSON_Delete(o);
+    return 0;
+}
+
+static api_response_t unit_detect_post(const api_request_t *req, int64_t repo_id,
+                                       const char *prov, const char *unit)
+{
+    api_response_t bad;
+    if (detect_body_ok(req, &bad) != 0) return bad;
     if (!db_detect_settings().enabled)
         return api_error(409, "database detection is off (db_detect.enabled = 0)");
     char why[512];
@@ -1553,7 +1582,7 @@ api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const
     const char *suffix = NULL;
     if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) &&
         strcmp(suffix, "detect") == 0)
-        return unit_detect_post(repo_id, prov, unit);
+        return unit_detect_post(req, repo_id, prov, unit);
     if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) &&
         strcmp(suffix, "reset-incremental") == 0) {
         char why[768];

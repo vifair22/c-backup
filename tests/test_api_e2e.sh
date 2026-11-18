@@ -49,6 +49,7 @@ check() {  # check <name> <expected> <actual>
     if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi
 }
 
+lacks()    { case "$3" in *"$2"*) bad "$1" "no '$2'" "$3" ;; *) ok "$1" ;; esac; }
 contains() {  # contains <name> <needle> <haystack>
     case "$3" in
         *"$2"*) ok "$1" ;;
@@ -2363,6 +2364,15 @@ check "paging is checked" 400 "$(sock_code "/repos/$DB_ID/databases?limit=0")"
 FP=$(sock_body "/repos/$DB_ID/databases?offset=1")
 contains "a page past the rows is empty, total kept" '{"findings":[],"total":1}' "$FP"
 check "an unknown repository is a 404" 404 "$(sock_code "/repos/9999/databases")"
+# A detection run takes no fields: an empty object or no body, and any key
+# is refused by name before anything else is looked at.
+OUT=$(sock_send POST "/repos/$DB_ID/units/docker/somewhere/detect" '{"paths":["/x"]}')
+contains "detect refuses an unknown key" ' 400' "$OUT"
+contains "and names it" "unknown key 'paths'" "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/units/docker/somewhere/detect" '[1]')
+contains "detect refuses a body that is not an object" ' 400' "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/units/docker/somewhere/detect" '{}')
+lacks    "an empty object is accepted as no fields" ' 400' "$OUT"
 
 echo "database finding actions"
 # D2 (db-detection.md 7.3, 7.4): preview, enable and dismiss. A file
