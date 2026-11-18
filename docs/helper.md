@@ -262,6 +262,12 @@ zfs_domains = cache/appdata, cache/Photos
 btrfs_domains =
 dir_domains =                  # directory domains (tests, begin_paths)
 
+[db]
+# The database templates hook.run may build (db-detection.md 7.2). Absent:
+# the stdout dumps. Every template's probe runs whatever this says.
+allow_templates = pg-dumpall, pg-dump, pg-basebackup, mariadb-dump, redis-rdb, sqlite-backup, influx2-backup, mongodump
+# allow_templates = ..., redis-bgsave, prometheus-snapshot, nextcloud-maintenance
+
 [hook immich-pg_dumpall]
 unit = docker:compose:immich
 kind = dump                    # dump: stdout comes back as a pipe fd; run: discarded
@@ -317,11 +323,11 @@ closed set `denied`, `invalid`, `busy`, `timeout`, `failed`, `unsupported`.
 An operation outside the list is `denied`; a request with an unknown or
 missing key, a wrong type, an out-of-range value, a malformed unit key or an
 unclean path is `invalid` before any operation sees it. The operations are
-the 19 of section 11.3 (`hello`, `units.list`, `units.describe`,
+the 20 of section 11.3 (`hello`, `units.list`, `units.describe`,
 `capture.begin`, `capture.begin_paths`, `capture.end`, `hook.run`,
 `hook.wait`, `vm.backup_begin`, `vm.backup_end`, `vm.checkpoint_redefine`,
 `vm.install_state`, `restore.stage`, `restore.swap`, `unit.stop`,
-`unit.start`, `unit.define`, `lease.release`, `sweep`).
+`unit.start`, `unit.define`, `lease.release`, `sweep`, `db.probe`).
 
 The daemon (`src/providers/remote_provider.c`) opens one connection per
 request, says hello, sends it, and closes, so concurrent jobs never queue
@@ -533,6 +539,36 @@ dump is not stored (a truncated dump looks valid); its log says why and
 the unit carries a warning. A dump runs while the unit is read, after the
 snapshot, rather than with the pre hooks: a dump is consistent at its own
 instant, and running it then lets its bytes stream with nothing held.
+
+### Database templates
+
+`hook.run` also takes `{unit, template[, params, path, phase]}`
+(`db-detection.md` 7.2, phase D2): the helper looks the template up in its
+compiled-in catalog (`src/helper/db_template.c`), refuses one its policy's
+`[db] allow_templates` does not list (`denied`, naming the key), checks the
+params against the template's typed grammar (`invalid`), and builds the argv
+itself. A parameter is never part of a script: it is an argv element of its
+own, or a positional argument after the fixed `sh -c` text. `path` is the
+finding's recorded path and only selects where the template runs: the Docker
+member whose included mount holds it, from the helper's own inspect, with a
+`sqlite-backup` database mapped to its path in that container through the
+mount's destination; for LXC, the container, and a path inside its rootfs.
+`phase` (`pre` or `post`) picks an exec template's run. A dump template's
+stdout comes back as the pipe fd a policy dump hook's does; the run is waited
+for with `hook.wait` as any other. `user` comes from the catalog
+(`nextcloud-maintenance` as `www-data`); the fake backend runs a template as
+a local process found on the helper's `PATH`, which is how the suites run
+them. A provider with no container (libvirt) refuses templates as
+`unsupported`.
+
+`db.probe {unit, template[, params, path]}` runs the template's dry run in
+the same place, whatever the policy says (a probe reads no data), with
+stdout and stderr together, at most 30 s and 64 KiB. The output comes back
+in a sealed memfd (`output_bytes`, `truncated`), with `exit`, `timed_out`,
+the `container` and `user`, `allowed` by the policy, and the argv the run
+(`argv`) and post run (`post_argv`) would use, for a preview. `hello`
+answers `templates`, the allowed list, so the daemon can say which policy
+line to add before an operator enables one the helper would refuse.
 
 ### Exclusions
 

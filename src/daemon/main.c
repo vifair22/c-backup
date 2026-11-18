@@ -569,6 +569,7 @@ int main(int argc, char *argv[])
         goto out_jm;
     }
     routes_units_init(db, jm);
+    routes_db_actions_init(db);
 
     /*
      * The scheduler submits work through the job manager rather than running

@@ -22,6 +22,8 @@
  *               staging_root
  *   [hook NAME] unit, kind (dump|run), phase (pre|post), container,
  *               argv.0 .. argv.N, timeout_s, on_fail (continue|fail)
+ *   [db]        allow_templates (template names, db_template.h; absent:
+ *               the stdout dumps, db_template_default_allow)
  *
  * The file must be a regular file nobody but its owner can write, owned by
  * root (or by the helper's own uid, for tests); anything else, an unknown
@@ -44,6 +46,9 @@ typedef struct {
     int    dump;                 /* kind = dump: stdout comes back as a pipe */
     int    pre;                  /* phase */
     char   container[129];
+    /* Exec as this user; "" the container's default. Only templates set
+     * it (nextcloud-maintenance); a policy hook has no key for it. */
+    char   user[33];
     char  *argv[POLICY_ARGV_MAX + 1];
     int    argc;
     unsigned timeout_s;
@@ -121,6 +126,14 @@ typedef struct {
     policy_hook_t hooks[POLICY_HOOKS_MAX];
     size_t   n_hooks;
 
+    /* [db] allow_templates: the database templates hook.run may build
+     * (db-detection.md 7.2). Set from the key, or from the default list
+     * when the policy does not have it. Probes are allowed whatever it
+     * says. */
+    char    *db_allow[POLICY_LIST_MAX];
+    size_t   n_db_allow;
+    int      db_allow_set;       /* the key was there, even empty */
+
     char     digest[65];         /* SHA-256 of the file, hex */
 } helper_policy_t;
 
@@ -139,3 +152,6 @@ int helper_policy_unit_allowed(const helper_policy_t *p, const char *unit_key,
 const char *helper_policy_dir_domain(const helper_policy_t *p, const char *path);
 
 const policy_hook_t *helper_policy_hook(const helper_policy_t *p, const char *name);
+
+/* Whether hook.run may build the database template (db-detection.md 7.2). */
+int helper_policy_template_allowed(const helper_policy_t *p, const char *name);
