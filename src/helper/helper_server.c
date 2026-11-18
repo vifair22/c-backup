@@ -2139,7 +2139,10 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd
      * leaving its data swapped in; it learns here too whether it may
      * stage and swap, and whether the unit runs. */
     if (check) {
+        status_t cst = b->define_check
+                     ? b->define_check(b->ctx, uid, passed ? passed : "{}", s->pol) : OK;
         free(passed);
+        if (cst != OK) return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
         cJSON *cr = cJSON_CreateObject();
         if (cr) {
             cJSON_AddBoolToObject(cr, "checked", 1);

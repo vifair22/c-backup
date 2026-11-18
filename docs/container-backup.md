@@ -868,6 +868,33 @@ user decides; running both means keeping its downtime meanwhile.
      the user runs compose.
 5. **Start** only if asked (`start: true`).
 
+**A copy under a new name mounts nothing of the original's (B188).** The
+recorded definition names the original's volumes and bind paths; created
+from it as recorded, a copy mounted the original's live volume, so a
+restore meant as a look at old data wrote to, and served, production, and
+an anonymous volume came back empty with the restored data unattached.
+The daemon rewrites every mount (`HostConfig.Binds`, `HostConfig.Mounts`,
+and each volume of the inspect's `Mounts`, anonymous ones included) to a
+bind of its restored copy under `target_root`, and passes `target_root`
+with the definition (for compose, each service's recorded `mounts` too).
+The helper creates the container, so it holds the rule itself: every bind
+source under `target_root` and inside none of the original's mounts, no
+volume by name, no `VolumesFrom`, every recorded mount replaced. Host
+binds follow a fixed rule: `/proc`, `/sys`, `/etc/localtime`,
+`/etc/timezone`, the Docker socket and `/dev` character devices (or a
+`/dev` directory with no block device in it) are kept as recorded; a
+block device anywhere, judged by `S_ISBLK` on the host path after
+following links (by-id, mapper), as a bind or in `Devices`, and anything
+else under `/etc`, under `/run` or `/var/run`, or under `/boot`, is
+refused, the error naming `<host path> -> <container path>` and the
+reason. Paths are resolved in the host's tree one component at a time, so
+a restored symlink cannot point a data bind out of `target_root` either. It refuses otherwise, in the
+define check too, so before the daemon writes anything. After the create
+and before any start it inspects what Docker made and removes a container
+that mounts a volume that existed before the restore or a bind outside
+`target_root` (a compose copy is created `--no-start`, checked, then
+started), which covers mounts the definition does not show.
+
 `define` for LXC: write `config` and the rootfs to `<lxcpath>/<name or new
 name>/`, rewriting `lxc.rootfs.path` and `lxc.uts.name`, and regenerating
 `lxc.net.*.hwaddr` unless `keep_macs`; ownership is restored numerically, so

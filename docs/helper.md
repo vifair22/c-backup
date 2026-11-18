@@ -605,8 +605,10 @@ The daemon's side is `mode: unit` (`c-backup unit restore <repo> <snap>
   helper as a check (`unit.define` with `check`) before anything is
   written: a policy without `allow_define`, a privileged definition
   without `allow_privileged_define`, a provider not behind the helper, an
-  in-place restore without `allow_restore`, or a VM still running for an
-  in-place restore, is refused with the unit untouched.
+  in-place restore without `allow_restore`, a VM still running for an
+  in-place restore, or anything the provider's own define would refuse
+  (for Docker under a new name, a mount of the original's data, B188), is
+  refused with the unit untouched.
 - **In place** needs `--replace`: the unit is stopped, each mount staged,
   restored and swapped in, the old data left at `<mount>.cbackup-old-<job>`,
   then the definition applied with replace. The mount root takes the
