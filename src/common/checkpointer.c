@@ -476,6 +476,35 @@ status_t checkpointer_open(const char *db_path)
     return st;
 }
 
+/*
+ * The WAL file's size on disk follows its contents only if the connection
+ * that restarts it carries journal_size_limit: SQLite trims the file at the
+ * first commit after a restart, to that connection's limit. Since B144-REST
+ * and B201 the restart is this connection's (pre_restart), and it carried
+ * none, so the file stayed at its high-water mark however short the WAL
+ * was. The trim is an ftruncate of the open file, never a new file, so the
+ * root-owned -wal stays root's and every connection keeps its descriptor
+ * (B215 follow-up). Under g_mu.
+ */
+static status_t limit_wal_locked(int threshold_pages)
+{
+    sqlite3_stmt *st = NULL;
+    long long page = 0;
+    if (sqlite3_prepare_v2(g_ck, "PRAGMA page_size", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW)
+        page = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (page <= 0) page = 4096;
+    char sql[80];
+    snprintf(sql, sizeof(sql), "PRAGMA journal_size_limit=%lld",
+             (long long)threshold_pages * CKPT_CAP_FACTOR * page);
+    int rc = sqlite3_exec(g_ck, sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK)
+        return set_error(ERR_IO, "state.db: cannot set the checkpoint connection's "
+                         "journal_size_limit: %s (SQLite code %d)", sqlite3_errmsg(g_ck), rc);
+    return OK;
+}
+
 status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned interval_ms)
 {
     if (!db_path || !*db_path || threshold_pages <= 0 || interval_ms == 0)
@@ -485,7 +514,7 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
         pthread_mutex_unlock(&g_mu);
         return set_error(ERR_BUSY, "state.db checkpointer already running");
     }
-    if (open_locked(db_path) != OK) {
+    if (open_locked(db_path) != OK || limit_wal_locked(threshold_pages) != OK) {
         pthread_mutex_unlock(&g_mu);
         return ERR_IO;
     }
