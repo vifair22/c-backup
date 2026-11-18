@@ -35,6 +35,7 @@
 #include <cutils/log.h>
 
 #include "job_manager.h"
+#include "store.h"
 #include "lock.h"
 #include "test_tmp.h"
 #include "full_vfs.h"
@@ -937,6 +938,75 @@ static void test_shutdown_never_starts_a_queued_job(void **state)
     snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)a);
     assert_int_equal(db_text(q, st, sizeof(st)), 0);
     assert_string_equal(st, "cancelled");
+}
+
+/*
+ * B218: the stop's wait for running jobs is bounded. A job that does not
+ * stop in time is named and the stop returns, leaving the manager to it;
+ * a later stop finishes once it has gone. The cancel says it is the
+ * daemon stopping, not a user.
+ */
+static atomic_int g_stubborn_release;
+static atomic_int g_stubborn_saw;
+
+static status_t stubborn_job(void *arg, atomic_int *cancel,
+                             void (*progress)(const char *, uint64_t, uint64_t, void *),
+                             void *progress_ctx)
+{
+    (void)arg; (void)progress; (void)progress_ctx;
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    do {
+        int c = atomic_load(cancel);
+        if (c) atomic_store(&g_stubborn_saw, c);
+        if (atomic_load(&g_stubborn_release)) return set_error(ERR_IO, "cancelled");
+        usleep(5000);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    } while (now.tv_sec - t0.tv_sec < 120);
+    return set_error(ERR_IO, "stubborn_job: never released");
+}
+
+static void test_the_stop_does_not_wait_for_ever(void **state)
+{
+    (void)state;
+    atomic_store(&g_stubborn_release, 0);
+    atomic_store(&g_stubborn_saw, 0);
+    int64_t a = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, stubborn_job, NULL, NULL, &a), OK);
+    for (int i = 0; i < 400 && db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'") != 1; i++)
+        usleep(5000);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'"), 1);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    assert_int_equal(job_manager_stop_within(jm, 300), ERR_BUSY);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    assert_true(ms >= 250 && ms < 3000);
+    assert_non_null(strstr(err_msg(), "did not stop within 0.3 s"));
+    assert_int_equal(atomic_load(&g_stubborn_saw), CANCEL_SHUTDOWN);
+
+    atomic_store(&g_stubborn_release, 1);
+    assert_int_equal(job_manager_stop_within(jm, 0), OK);
+    jm = NULL;
+    char q[96], st[32];
+    snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)a);
+    assert_int_equal(db_text(q, st, sizeof(st)), 0);
+    assert_string_equal(st, "cancelled");
+}
+
+/* And a job that stops in time is waited for as before: OK, freed. */
+static void test_the_stop_waits_for_a_job_that_stops(void **state)
+{
+    (void)state;
+    g_polling_runs = 0;
+    int64_t a = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, polling_job, NULL, NULL, &a), OK);
+    for (int i = 0; i < 400 && db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'") != 1; i++)
+        usleep(5000);
+    assert_int_equal(job_manager_stop_within(jm, 5000), OK);
+    jm = NULL;
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'cancelled'"), 1);
 }
 
 /*
@@ -2071,6 +2141,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_job_ids_survive_concurrent_inserts, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancelling_a_queued_job_is_immediate, setup, teardown),
         cmocka_unit_test_setup_teardown(test_shutdown_never_starts_a_queued_job, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_the_stop_does_not_wait_for_ever, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_the_stop_waits_for_a_job_that_stops, setup, teardown),
         cmocka_unit_test_setup_teardown(test_full_queue_refuses_and_spares_running_jobs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_alert_names_repository_and_error, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_warning_is_alerted_and_the_job_completes, setup, teardown),

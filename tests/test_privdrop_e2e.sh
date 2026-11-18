@@ -88,6 +88,7 @@ ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n       expected: %s\n       got:      %s\n' "$1" "$2" "$3"; }
 check()    { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
 contains() { case "$3" in *"$2"*) ok "$1" ;; *) bad "$1" "contains '$2'" "$3" ;; esac; }
+lacks()    { case "$3" in *"$2"*) bad "$1" "no '$2'" "$3" ;; *) ok "$1" ;; esac; }
 
 cb()     { "$CLI" --socket "$SOCK" "$@"; }
 get()    { curl -s --unix-socket "$SOCK" "http://localhost$1"; }
@@ -291,6 +292,89 @@ contains "/readyz is ready" '"status":"ready"' "$(get /readyz)"
 check    "no checkpoint failures counted" "0" "$(metric cbackup_checkpoint_failures_total)"
 stop_daemon
 check "the restarted daemon stops cleanly" "0" "$?"
+
+# B218: a stop with a large WAL and a running job, as uid 990. The stop
+# took 53 s on a test server, past Docker's 10 s grace: the last connection's
+# close copied the whole WAL back into state.db first. The stop now leaves a
+# WAL too large to copy for the next start, and does not wait on the job.
+# The threshold is raised to the most the config takes, so the checkpointer
+# leaves the WAL alone; a fake unit's disk, 256 GiB of one byte, keeps a job
+# reading for as long as the stop needs, reading nothing from disk and
+# storing almost nothing, since every chunk is the same.
+echo "a stop with a large WAL and a running job"
+if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "  (skipped: no sqlite3 to grow the WAL with)"
+else
+    cat > "$WORK/units.json" <<EOF
+{"units":[{"id":"m10","name":"cbk-m10","state":"running","caps":["quiesce"],
+  "blobs":[{"id":"cfg","path":".cbackup-unit/config/x","text":"m10"}],
+  "disks":[{"id":"vda","size":274877906944,"alloc":"exact",
+            "runs":[{"off":0,"len":274877906944,"kind":"fill","seed":90}]}]}]}
+EOF
+    sed -i "s/^  wal_autocheckpoint: .*/  wal_autocheckpoint: 1048576/" "$WORK/c.yaml"
+    printf 'units:\n  allow: cbk-m10\n  fake_spec: %s\n' "$WORK/units.json" >> "$WORK/c.yaml"
+    start_daemon
+    check "the daemon is listening" "yes" "$([ -S "$SOCK" ] && echo yes || echo no)"
+    SNAPS0=$(cb snapshots 1 | grep -o '"id":[0-9]*,' | wc -l)
+    # About 300 MiB of WAL: a 512 KiB row rewritten 600 times, each its own
+    # commit, then a marker the next start must still have.
+    { echo "PRAGMA busy_timeout=10000; PRAGMA wal_autocheckpoint=0;"
+      for _ in $(seq 600); do
+          echo "INSERT INTO daemon_state (key, value) VALUES ('m10_filler', hex(randomblob(262144)))" \
+               "ON CONFLICT(key) DO UPDATE SET value = excluded.value;"
+      done
+      echo "DELETE FROM daemon_state WHERE key = 'm10_filler';"
+      echo "INSERT INTO daemon_state (key, value) VALUES ('m10_marker', 'kept');"
+    } | sqlite3 "$WORK/state/state.db" > /dev/null
+    WALSZ=$(stat -c %s "$WAL")
+    echo "  WAL $WALSZ bytes, $(shm_u32 16) frames ($(shm_u32 96) copied)"
+    check "the WAL is a few hundred MB" "yes" \
+          "$([ "$WALSZ" -gt 200000000 ] && [ "$WALSZ" -lt 600000000 ] && echo yes || echo "no: $WALSZ")"
+    JOB=$(cb unit backup 1 --provider fake cbk-m10 --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+    J=""
+    for _ in $(seq 200); do
+        J=$(cb jobs "$JOB")
+        case "$J" in *'"state":"running"'*'"bytes_done":'[1-9]*) break ;; esac
+        sleep 0.05
+    done
+    contains "a unit backup is running" '"state":"running"' "$J"
+    T0=$(date +%s%N)
+    stop_daemon
+    RC=$?
+    MS=$(( ($(date +%s%N) - T0) / 1000000 ))
+    echo "  stopped in $MS ms"
+    check "the daemon stops cleanly" "0" "$RC"
+    check "within 8 s, well inside Docker's 10" "yes" \
+          "$([ "$MS" -lt 8000 ] && echo yes || echo "no: $MS ms")"
+    contains "the job was cancelled" "job $JOB cancelled" "$(cat "$WORK/d.log")"
+    lacks    "not abandoned" "did not stop within" "$(cat "$WORK/d.log")"
+    contains "the WAL was left for the next start" "WAL frames" "$(grep 'for the next start' "$WORK/d.log")"
+    check    "it is still there" "yes" "$([ -s "$WAL" ] && echo yes || echo no)"
+    check    "and still root's" "0" "$(stat -c %u "$WAL")"
+
+    # The next start reads the WAL back, quickly, and nothing is missing.
+    sed -i "s/^  wal_autocheckpoint: .*/  wal_autocheckpoint: $THRESHOLD/" "$WORK/c.yaml"
+    DB0=$(stat -c %s "$WORK/state/state.db")
+    T0=$(date +%s%N)
+    start_daemon
+    MS=$(( ($(date +%s%N) - T0) / 1000000 ))
+    echo "  listening again in $MS ms"
+    check "the next start is listening" "yes" "$([ -S "$SOCK" ] && echo yes || echo no)"
+    check "within 5 s" "yes" "$([ "$MS" -lt 5000 ] && echo yes || echo "no: $MS ms")"
+    check "every snapshot is still there" "$SNAPS0" "$(cb snapshots 1 | grep -o '"id":[0-9]*,' | wc -l)"
+    contains "the job is recorded cancelled" '"state":"cancelled"' "$(cb jobs "$JOB")"
+    lacks    "not interrupted" "interrupted by daemon restart" "$(cb jobs "$JOB")"
+    check    "the last write before the stop survived" "kept" \
+             "$(sqlite3 -cmd ".timeout 10000" "$WORK/state/state.db" \
+                "SELECT value FROM daemon_state WHERE key = 'm10_marker'")"
+    wait_backfilled "$DB0"
+    check "the WAL was copied back and restarted" "yes" \
+          "$([ "${F:-99999}" -lt "$THRESHOLD" ] && echo yes || echo "no: $F frames")"
+    contains "/readyz is ready" '"status":"ready"' "$(get /readyz)"
+    check    "no checkpoint failures counted" "0" "$(metric cbackup_checkpoint_failures_total)"
+    stop_daemon
+    check "and that daemon stops cleanly too" "0" "$?"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
