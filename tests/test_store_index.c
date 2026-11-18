@@ -874,7 +874,18 @@ static void test_cut_between_marker_parts_leaves_everything_readable(void **stat
  * part is a few rows. A tag-style write (db_txn_begin) that queues while
  * they run waits for the part holding the lock and nothing else: no bulk
  * transaction begins between its queueing and its turn, though three bulk
- * writers are waiting.
+ * writers are waiting - except one the priority bound owes the turn.
+ *
+ * The count comes from the ticket, which records it from the moment the
+ * request takes its ticket and knows why each bulk grant ahead of it was
+ * made (FLAKE-27). Counting db_txn_bulk_count around db_txn_begin also
+ * counted bulk parts the bound let go first, and any that began between
+ * reading the count and taking the ticket. A stall of the whole runner
+ * while a part holds the lock (a VM descheduled, a slow fsync) makes the
+ * next bulk writer's wait exceed DB_TXN_BULK_DUE_MS, and the ticket then
+ * rightly serves it before the request: one bulk transaction ahead after a
+ * wait of a few ms, which is how CI failed. Under SIGSTOP pulses it was 202
+ * of 1,168 requests, every one owed by the bound.
  */
 typedef struct {
     capture_t *cap;
@@ -909,21 +920,23 @@ static void test_a_request_goes_before_waiting_bulk_commits(void **state)
         struct timespec ts = { 0, 1000000L };
         nanosleep(&ts, NULL);
     }
-    int checks = 0, worst_between = 0;
+    int checks = 0;
+    unsigned long ahead = 0, owed = 0, out_of_order = 0;
     double worst_ms = 0;
     for (int t = 0; t < 20; t++) {
-        unsigned long before = db_txn_bulk_count();
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         assert_int_equal(db_txn_begin(db), OK);
-        unsigned long after = db_txn_bulk_count();
         clock_gettime(CLOCK_MONOTONIC, &t1);
+        db_txn_wait_t w;
+        db_txn_last_wait(&w);
         assert_int_equal(db_write(db, "INSERT OR REPLACE INTO config (key, value)"
                                       " VALUES ('b193tag', '1')", NULL, NULL), 0);
         assert_int_equal(db_txn_commit(db), OK);
-        int between = (int)(after - before);
+        ahead += w.bulk_ahead;
+        owed  += w.bulk_ahead_due;
+        out_of_order += w.bulk_ahead - w.bulk_ahead_due;
         double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
-        if (between > worst_between) worst_between = between;
         if (ms > worst_ms) worst_ms = ms;
         checks++;
         struct timespec ts = { 0, 5 * 1000000L };
@@ -936,10 +949,11 @@ static void test_a_request_goes_before_waiting_bulk_commits(void **state)
     }
     db_txn_commit_stats_t cs;
     db_txn_commit_stats(&cs);
-    print_message("  %d request writes: worst lock wait %.1f ms, at most %d bulk transactions "
-                  "begun meanwhile; bulk commits wrote at most %u WAL pages, %lu ended by the "
-                  "budget\n", checks, worst_ms, worst_between, cs.max_frames, cs.capped);
-    assert_int_equal(worst_between, 0);
+    print_message("  %d request writes: worst lock wait %.1f ms, %lu bulk transactions served "
+                  "ahead (%lu owed by the bound); bulk commits wrote at most %u WAL pages, %lu "
+                  "ended by the budget\n", checks, worst_ms, ahead, owed, cs.max_frames,
+                  cs.capped);
+    assert_int_equal(out_of_order, 0);
     assert_true(cs.max_frames <= DB_TXN_COMMIT_PAGES_MIN * 4);
     assert_int_equal(count("SELECT COUNT(*) FROM packs WHERE repo_id = ?"), 3);
     for (size_t i = 0; i < nobj; i++) assert_true(readable(i));

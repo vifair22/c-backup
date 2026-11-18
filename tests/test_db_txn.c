@@ -1044,6 +1044,79 @@ static void test_priority_writers_cannot_starve_a_bulk_writer(void **state)
     assert_true(worst < DB_TXN_BULK_DUE_MS * 4);
 }
 
+/*
+ * FLAKE-27: the ticket says what a priority writer waited behind, and which
+ * of those bulk grants the bound owed. A test counting db_txn_bulk_count
+ * around db_txn_begin also counts bulk writers that began before the
+ * request took its ticket, so it cannot tell an ordering bug from a slow
+ * runner; this is what lets it.
+ */
+typedef struct {
+    int           bulk;
+    status_t      st;
+    db_txn_wait_t wait;
+} queued_t;
+
+static void *queued_main(void *arg)
+{
+    queued_t *q = arg;
+    q->st = q->bulk ? db_txn_begin_bulk(db) : db_txn_begin(db);
+    if (q->st != OK) return NULL;
+    db_txn_last_wait(&q->wait);
+    q->st = db_txn_commit(db);
+    return NULL;
+}
+
+/* Bounded at 10 s, like wait_for_waiter. */
+static void wait_for_waiters(unsigned n)
+{
+    int seen = 0;
+    for (int i = 0; i < 5000 && !seen; i++) {
+        if (db_txn_waiters() >= n) { seen = 1; break; }
+        struct timespec ts = { 0, 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    assert_true(seen);
+}
+
+/* A bulk writer and then a request queue behind a holder; the holder lets
+ * go after sleep_ms. Returns what the request waited behind. */
+static db_txn_wait_t request_behind_bulk(long sleep_ms)
+{
+    queued_t b = { .bulk = 1, .st = ERR_IO }, p = { .bulk = 0, .st = ERR_IO };
+    pthread_t bt, pt;
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(pthread_create(&bt, NULL, queued_main, &b), 0);
+    wait_for_waiters(1);
+    struct timespec ts = { sleep_ms / 1000, (sleep_ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+    assert_int_equal(pthread_create(&pt, NULL, queued_main, &p), 0);
+    wait_for_waiters(2);
+    assert_int_equal(db_txn_commit(db), OK);
+    assert_int_equal(pthread_join(bt, NULL), 0);
+    assert_int_equal(pthread_join(pt, NULL), 0);
+    assert_int_equal(b.st, OK);
+    assert_int_equal(p.st, OK);
+    return p.wait;
+}
+
+static void test_the_ticket_reports_what_a_request_waited_behind(void **state)
+{
+    (void)state;
+    /* Released at once: the request goes first. Only a runner stalled past
+     * the bound between the two queueings can owe the bulk writer the turn,
+     * and then the ticket must say so. */
+    db_txn_wait_t w = request_behind_bulk(0);
+    assert_true(w.bulk_ahead <= 1);
+    assert_int_equal(w.bulk_ahead, w.bulk_ahead_due);
+
+    /* The bulk writer has waited past DB_TXN_BULK_DUE_MS when the request
+     * queues, so it goes first, and that grant is reported as owed. */
+    w = request_behind_bulk(DB_TXN_BULK_DUE_MS + 50);
+    assert_int_equal(w.bulk_ahead, 1);
+    assert_int_equal(w.bulk_ahead_due, 1);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1067,6 +1140,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_batch_ends_at_the_commit_budget, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_page_ceiling_bounds_every_commit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_no_tracking_means_no_cap, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_the_ticket_reports_what_a_request_waited_behind,
+                                        setup, teardown),
         cmocka_unit_test_setup_teardown(test_priority_writers_cannot_starve_a_bulk_writer,
                                         setup, teardown),
     };

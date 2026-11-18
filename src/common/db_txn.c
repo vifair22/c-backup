@@ -69,6 +69,18 @@ static int bulk_due(void)
 }
 static atomic_ulong    g_bulk_txns;    /* bulk transactions begun, for tests */
 
+/*
+ * Bulk grants made under the bound above while a priority writer waited,
+ * and what this thread's last priority grant waited behind (db_txn_last_wait).
+ * Counted where the decision is made, under g_ticket_mu, so a test can tell
+ * a grant the bound owed from one that broke the order (FLAKE-27).
+ * Counting db_txn_bulk_count around a db_txn_begin call cannot: it also
+ * counts a bulk writer that began before the request queued, and a stalled
+ * runner makes the bound owe grants that look like violations from outside.
+ */
+static unsigned long   g_bulk_due_grants;
+static _Thread_local db_txn_wait_t tls_last_wait;
+
 /* Threads inside write_lock that have not been served yet. Written under
  * g_ticket_mu, read without it by db_txn_waiters. */
 static atomic_uint     g_waiting;
@@ -278,12 +290,15 @@ static void write_lock_as(int bulk)
             atomic_fetch_sub_explicit(&g_waiting, 1, memory_order_relaxed);
         }
 #undef BULK_WAITS
+        if (g_pri_next != g_pri_serving && bulk_due()) g_bulk_due_grants++;
         g_bulk_serving++;
         g_pri_streak = 0;
         g_bulk_head_since = phase_now();   /* the next bulk waiter's turn starts now */
         atomic_fetch_add_explicit(&g_bulk_txns, 1, memory_order_relaxed);
     } else {
         uint64_t mine = g_pri_next++;
+        unsigned long bulk0 = atomic_load_explicit(&g_bulk_txns, memory_order_relaxed);
+        unsigned long due0 = g_bulk_due_grants;
 #define PRI_WAITS (g_held || mine != g_pri_serving || bulk_due())
         if (PRI_WAITS) {
             atomic_fetch_add_explicit(&g_waiting, 1, memory_order_relaxed);
@@ -294,6 +309,9 @@ static void write_lock_as(int bulk)
 #undef PRI_WAITS
         g_pri_serving++;
         if (g_bulk_next != g_bulk_serving) g_pri_streak++;
+        tls_last_wait.bulk_ahead =
+            atomic_load_explicit(&g_bulk_txns, memory_order_relaxed) - bulk0;
+        tls_last_wait.bulk_ahead_due = g_bulk_due_grants - due0;
     }
     g_held = 1;
     pthread_mutex_unlock(&g_ticket_mu);
@@ -393,6 +411,11 @@ status_t db_txn_begin(cutils_db_t *db)
 unsigned long db_txn_bulk_count(void)
 {
     return atomic_load_explicit(&g_bulk_txns, memory_order_relaxed);
+}
+
+void db_txn_last_wait(db_txn_wait_t *out)
+{
+    if (out) *out = tls_last_wait;
 }
 
 status_t db_txn_begin_bulk(cutils_db_t *db)
