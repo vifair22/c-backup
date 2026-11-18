@@ -316,11 +316,12 @@ closed set `denied`, `invalid`, `busy`, `timeout`, `failed`, `unsupported`.
 An operation outside the list is `denied`; a request with an unknown or
 missing key, a wrong type, an out-of-range value, a malformed unit key or an
 unclean path is `invalid` before any operation sees it. The operations are
-the 19 of section 11.3 (`hello`, `units.list`, `units.describe`,
-`capture.begin`, `capture.begin_paths`, `capture.end`, `hook.run`,
-`hook.wait`, `vm.backup_begin`, `vm.backup_end`, `vm.checkpoint_redefine`,
-`vm.install_state`, `restore.stage`, `restore.swap`, `unit.stop`,
-`unit.start`, `unit.define`, `lease.release`, `sweep`).
+the 20 of section 11.3 (`hello`, `units.list`, `units.describe`,
+`units.probe`, `capture.begin`, `capture.begin_paths`, `capture.end`,
+`hook.run`, `hook.wait`, `vm.backup_begin`, `vm.backup_end`,
+`vm.checkpoint_redefine`, `vm.install_state`, `restore.stage`,
+`restore.swap`, `unit.stop`, `unit.start`, `unit.define`, `lease.release`,
+`sweep`).
 
 The daemon (`src/providers/remote_provider.c`) opens one connection per
 request, says hello, sends it, and closes, so concurrent jobs never queue
@@ -337,6 +338,56 @@ journalled and open; `GET /providers` adds the helper's holds to
 `holds_open` and shows both under `helper`. Data never crosses the
 socket: the daemon reads trees through the read roots the helper returns,
 and disks through its own mounts (for the fake, its run map).
+
+## What runs in a unit: units.probe
+
+`units.probe {unit}` tells database detection (`db-detection.md` 8.1)
+what runs in a container unit now. It is read-only and gated exactly as
+`units.describe`: a unit key of the provider's grammar, allowed by the
+policy. Docker, LXC and the fake provider answer it; libvirt answers
+`unsupported`, and the daemon never asks it.
+
+The helper finds each member as describe does (Docker by compose project
+or name, LXC by name) and its init process (`State.Pid`, `lxc-info -p`).
+It runs with the host's pid namespace, so it reads `/proc` (`[host] proc`,
+default `/proc`) for:
+
+- **processes**: every process whose cgroup is the init process's or
+  below it (its descendants instead when that cgroup is the root);
+  `comm` and the first 256 bytes of `cmdline`, NULs as spaces and bytes
+  outside printable ASCII as `?`;
+- **ports**: LISTEN rows of the init process's `net/tcp` and `net/tcp6`,
+  which show its own network namespace;
+- **files open for writing**: fds whose `fdinfo` flags hold `O_WRONLY` or
+  `O_RDWR`, whose link is under one of the unit's mounts, and whose
+  `mnt_id` names a mount at or under that mount's destination in the
+  process's own `mountinfo`. The mounts are classified exactly as describe
+  classifies them; a file is named only under a mount describe includes,
+  as recorded path plus the rest of the link, and never under a mount it
+  excludes, a kernel filesystem (a tmpfs over `/dev/shm`) or anything
+  else.
+
+It never returns a path outside the unit's included mounts, never an
+environment variable or an fd's contents, and never opens what an fd
+points to: only regular files under `/proc` are read, without following
+links or blocking, and a process that exits mid-scan is skipped. Each
+container lists at most 32 processes, 32 ports, 8 aliases and 128 open
+files; a unit at most 32 containers. Past a bound, or past what fits in
+one packet, the answer is cut (open files from the end first, then
+processes) and `truncated` is true.
+
+```json
+{"containers":[{"name":"pg","image":"postgres:16","running":true,
+                "aliases":["pg","db"],
+                "processes":[{"comm":"postgres","args":"postgres -D /data"}],
+                "ports":[5432],
+                "open_write":[{"path":"/mnt/cache/appdata/pg/base/1/2619","comm":"postgres"}]}],
+ "truncated":false}
+```
+
+The fake provider answers each unit's spec `"probe"` in this shape (an
+empty probe without one), and fails it with `"probe_fail": true` or
+`FAKE_FAIL_PROBE`.
 
 ## What a compromised daemon gets
 
@@ -375,6 +426,7 @@ host_root = /proc/1/root   ; how the helper reads host paths itself
 ; boot_config = /boot/config (all defaults)
 ; mountinfo = /proc/1/mountinfo   ; the host's mount table (default: this
 ;                                 ; with host_root set, else /proc/self/mountinfo)
+; proc = /proc                    ; the host's /proc, for units.probe
 
 [docker]
 enabled = 1

@@ -26,8 +26,10 @@
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
 
+#include "helper_backend.h"
 #include "helper_fixture.h"
 #include "helper_proto.h"
+#include "unit_probe.h"
 
 static sp_ctx_t        *fk;
 static helper_policy_t  pol;
@@ -297,6 +299,11 @@ static void test_malformed(void **state)
         { "{\"v\":1,\"id\":1,\"op\":\"units.list\",\"args\":{\"provider\":\"podman\"}}", "invalid" },
         { "{\"v\":1,\"id\":1,\"op\":\"units.describe\",\"args\":{\"unit\":\"fake:../x\"}}", "invalid" },
         { "{\"v\":1,\"id\":1,\"op\":\"units.describe\",\"args\":{\"unit\":\"fake:a\\u0001b\"}}", "invalid" },
+        { "{\"v\":1,\"id\":1,\"op\":\"units.probe\",\"args\":{}}", "invalid" },
+        { "{\"v\":1,\"id\":1,\"op\":\"units.probe\",\"args\":{\"unit\":\"fake:u1\",\"pid\":1}}", "invalid" },
+        { "{\"v\":1,\"id\":1,\"op\":\"units.probe\",\"args\":{\"unit\":\"fake:../x\"}}", "invalid" },
+        { "{\"v\":1,\"id\":1,\"op\":\"units.probe\",\"args\":{\"unit\":7}}", "invalid" },
+        { "{\"v\":1,\"id\":1,\"op\":\"units.probe\",\"args\":{\"unit\":\"docker:-bad\"}}", "invalid" },
         { "{\"v\":1,\"id\":1,\"op\":\"capture.begin\",\"args\":{\"units\":[],\"pause\":false}}", "invalid" },
         { "{\"v\":1,\"id\":1,\"op\":\"capture.begin\",\"args\":{\"units\":[\"fake:u1\",\"fake:u1\"],\"pause\":false}}", "invalid" },
         { "{\"v\":1,\"id\":1,\"op\":\"capture.begin\",\"args\":{\"units\":[\"fake:u1\"],\"pause\":0}}", "invalid" },
@@ -354,6 +361,7 @@ static void test_fuzz_requests(void **state)
         "{\"v\":1,\"id\":1,\"op\":\"hello\",\"args\":{\"client_version\":1}}",
         "{\"v\":1,\"id\":2,\"op\":\"units.list\",\"args\":{\"provider\":\"fake\"}}",
         "{\"v\":1,\"id\":3,\"op\":\"units.describe\",\"args\":{\"unit\":\"fake:u1\"}}",
+        "{\"v\":1,\"id\":8,\"op\":\"units.probe\",\"args\":{\"unit\":\"fake:u1\"}}",
         "{\"v\":1,\"id\":4,\"op\":\"capture.begin_paths\",\"args\":{\"paths\":[\"" HF_POOL "/app\"]}}",
         "{\"v\":1,\"id\":5,\"op\":\"vm.backup_begin\",\"args\":{\"unit\":\"libvirt:5c1fb2a4-0e8d-4a3f-9d2e-1b2c3d4e5f60\",\"disks\":[{\"target\":\"vda\",\"mode\":\"full\"}],\"base\":null,\"freeze\":\"auto\"}}",
         "{\"v\":1,\"id\":6,\"op\":\"restore.stage\",\"args\":{\"unit\":\"fake:u1\",\"mount\":\"" HF_MOUNT "\",\"job\":3}}",
@@ -424,10 +432,14 @@ static void test_compromised_daemon(void **state)
     free(t);
     cJSON_Delete(o);
     expect(req("units.describe", "{\"unit\":\"fake:u1\"}"), "ok");
+    expect(req("units.probe", "{\"unit\":\"fake:u1\"}"), "ok");
 
     /* What it may not. */
     expect(req("units.describe", "{\"unit\":\"fake:prod\"}"), "denied");
     expect(req("units.describe", "{\"unit\":\"fake:nonexistent\"}"), "denied");
+    expect(req("units.probe", "{\"unit\":\"fake:prod\"}"), "denied");
+    expect(req("units.probe", "{\"unit\":\"fake:nonexistent\"}"), "denied");
+    expect(req("units.probe", "{\"unit\":\"docker:prod\"}"), "denied");
     expect(req("capture.begin", "{\"units\":[\"fake:u1\",\"fake:prod\"],\"pause\":true}"), "denied");
     expect(req("capture.begin_paths", "{\"paths\":[\"/etc\"]}"), "denied");
     expect(req("capture.begin_paths", "{\"paths\":[\"" HF_DIR "/poolx\"]}"), "denied");
@@ -478,6 +490,95 @@ static const char *msg_of(const cJSON *o)
     const char *m = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
         cJSON_GetObjectItemCaseSensitive(o, "error"), "msg"));
     return m ? m : "";
+}
+
+/*
+ * units.probe (db-detection.md 8.1): the backend's answer as the wire
+ * shape, its failure as `failed`, a provider without probes `unsupported`,
+ * and an answer too big for a packet cut to fit rather than refused.
+ */
+static void test_units_probe(void **state)
+{
+    (void)state;
+    /* A second backend over the same fake units whose provider cannot
+     * probe, as libvirt cannot. */
+    sp_provider_ops_t noprobe = fake_provider_ops;
+    noprobe.unit_probe = NULL;
+    noprobe.name = "lxc";
+    helper_backend_t extra;
+    helper_backend_fake(&extra, fk);
+    extra.name = "lxc";
+    extra.ops = &noprobe;
+    char text[8192];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
+    char *a = strstr(text, "allow = fake:cbk-*");
+    assert_non_null(a);
+    char rest[8192];
+    snprintf(rest, sizeof(rest), "%s", a + strlen("allow = "));
+    snprintf(a, sizeof(text) - (size_t)(a - text), "allow = lxc:cbk-*, %s", rest);
+    assert_int_equal(helper_policy_parse(text, &pol), OK);
+    helper_server_cfg_t cfg = { &pol, fk, 0, 50, &extra, 1 };
+    assert_int_equal(helper_server_start(&cfg, &srv), OK);
+
+    /* Nothing set: an empty probe. */
+    cJSON *o = call(req("units.probe", "{\"unit\":\"fake:u1\"}"), NULL);
+    char *t = cJSON_PrintUnformatted(cJSON_GetObjectItemCaseSensitive(o, "result"));
+    assert_string_equal(t, "{\"containers\":[],\"truncated\":false}");
+    free(t);
+    cJSON_Delete(o);
+
+    assert_int_equal(fake_unit_set_probe(fk, "u1",
+        "{\"containers\":[{\"name\":\"pg\",\"image\":\"postgres:16\",\"running\":true,\"aliases\":[\"db\"],"
+        "\"processes\":[{\"comm\":\"postgres\",\"args\":\"postgres\"}],\"ports\":[5432],"
+        "\"open_write\":[{\"path\":\"" HF_MOUNT "/base/1\",\"comm\":\"postgres\"}]}]}", 0), OK);
+    o = call(req("units.probe", "{\"unit\":\"fake:u1\"}"), NULL);
+    assert_string_equal(code_of(o), "ok");
+    sp_unit_probe_t *p = NULL;
+    assert_int_equal(sp_unit_probe_from_json(cJSON_GetObjectItemCaseSensitive(o, "result"), &p), OK);
+    assert_int_equal(p->n, 1);
+    assert_string_equal(p->v[0].image, "postgres:16");
+    assert_int_equal(p->v[0].ports[0], 5432);
+    assert_string_equal(p->v[0].open[0].path, HF_MOUNT "/base/1");
+    sp_unit_probe_free(p);
+    cJSON_Delete(o);
+
+    /* The backend failing. */
+    fake_fail_set(fk, "u1", FAKE_FAIL_PROBE, 0);
+    o = call(req("units.probe", "{\"unit\":\"fake:u1\"}"), NULL);
+    assert_string_equal(code_of(o), "failed");
+    assert_non_null(strstr(msg_of(o), "injected"));
+    cJSON_Delete(o);
+    fake_fail_clear(fk);
+
+    /* A provider with no probe. */
+    o = call(req("units.probe", "{\"unit\":\"lxc:u1\"}"), NULL);
+    assert_string_equal(code_of(o), "unsupported");
+    assert_non_null(strstr(msg_of(o), "lxc"));
+    cJSON_Delete(o);
+
+    /* Bigger than a packet: cut, marked, and still one packet. */
+    size_t cap = 1 << 20, n = 0;
+    char *big = malloc(cap);
+    n += (size_t)snprintf(big + n, cap - n, "{\"containers\":[");
+    for (int c = 0; c < 32; c++) {
+        n += (size_t)snprintf(big + n, cap - n, "%s{\"name\":\"c%d\",\"running\":true,\"open_write\":[", c ? "," : "", c);
+        for (int f = 0; f < 128; f++)
+            n += (size_t)snprintf(big + n, cap - n, "%s{\"path\":\"/mnt/cache/appdata/c%d/some/long/directory/file-%d\",\"comm\":\"x\"}",
+                                  f ? "," : "", c, f);
+        n += (size_t)snprintf(big + n, cap - n, "]}");
+    }
+    snprintf(big + n, cap - n, "]}");
+    assert_int_equal(fake_unit_set_probe(fk, "u1", big, 0), OK);
+    free(big);
+    o = call(req("units.probe", "{\"unit\":\"fake:u1\"}"), NULL);   /* call asserts the packet bound */
+    assert_string_equal(code_of(o), "ok");
+    const cJSON *res = cJSON_GetObjectItemCaseSensitive(o, "result");
+    assert_true(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "truncated")));
+    assert_int_equal(sp_unit_probe_from_json(res, &p), OK);
+    assert_int_equal(p->n, 32);
+    sp_unit_probe_free(p);
+    cJSON_Delete(o);
+    hstop();
 }
 
 /*
@@ -1229,6 +1330,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_malformed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_fuzz_requests, setup, teardown),
         cmocka_unit_test_setup_teardown(test_compromised_daemon, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_units_probe, setup, teardown),
         cmocka_unit_test_setup_teardown(test_capture_lifecycle, setup, teardown),
         cmocka_unit_test_setup_teardown(test_leases_and_rate, setup, teardown),
         cmocka_unit_test_setup_teardown(test_watchdog, setup, teardown),
