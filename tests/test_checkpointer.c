@@ -370,8 +370,9 @@ static void test_only_bulk_writers_wait_at_the_hard_cap(void **state)
     (void)state;
     assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
     checkpointer_set_test_idle(1);
-    /* Past the cap with plain writes, which nothing holds back. */
-    while (wal_frames() <= (uint32_t)THRESHOLD * CKPT_HARD_FACTOR)
+    /* Past the ceiling (the hard cap plus an eighth, where pacing becomes
+     * a hard stop; B216) with plain writes, which nothing holds back. */
+    while (wal_frames() <= (uint32_t)THRESHOLD * CKPT_HARD_FACTOR * 9 / 8)
         assert_int_equal(commit_rows_with(db_txn_begin, 8), 0);
     sleep_ms(10);                     /* past the writers' probe interval */
 
@@ -771,9 +772,36 @@ static void test_an_unreadable_shm_is_reported_and_recovers(void **state)
     assert_true(wal_health_failures() >= n);
 }
 
+/*
+ * B216: a bulk writer's sleep rises with the WAL's distance behind, from
+ * nothing at half the hard cap to its maximum under the ceiling, and is a
+ * hard stop at the ceiling. A fully copied WAL is never paced: the next
+ * writer restarts it.
+ */
+static void test_pacing_rises_with_the_backlog(void **state)
+{
+    (void)state;
+    const uint32_t thr = 1000, hard = thr * CKPT_HARD_FACTOR, ceiling = hard + hard / 8;
+    assert_int_equal(checkpointer_pace_ns(hard - hard / 4, 0, thr), 0);
+    assert_int_equal(checkpointer_pace_ns(hard, hard, thr), 0);       /* all copied */
+    assert_int_equal(checkpointer_pace_ns(ceiling + 5, ceiling + 5, thr), 0);
+    uint64_t prev = 0;
+    for (uint32_t f = hard - hard / 4 + 1; f < ceiling; f += 97) {
+        uint64_t p = checkpointer_pace_ns(f, 0, thr);
+        assert_true(p >= prev);
+        assert_true(p <= 200ull * 1000000ull);
+        prev = p;
+    }
+    assert_true(prev > 150ull * 1000000ull);                          /* near the max */
+    assert_true(checkpointer_pace_ns(hard, 0, thr) < prev);
+    assert_true(checkpointer_pace_ns(ceiling, 0, thr) == UINT64_MAX);
+    assert_true(checkpointer_pace_ns(ceiling * 4, 0, thr) == UINT64_MAX);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_pacing_rises_with_the_backlog),
         cmocka_unit_test_setup_teardown(test_no_commit_checkpoints, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_stays_near_the_cap_under_a_long_writer, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_is_bounded_under_a_writer_faster_than_checkpoints, setup, teardown),

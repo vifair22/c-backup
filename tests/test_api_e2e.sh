@@ -444,6 +444,7 @@ for name in 'cbackup_db_txn_wait_seconds_total{queue="priority"}' cbackup_db_txn
             cbackup_db_txn_commit_frames_total 'cbackup_checkpoint_rounds_total{locked="yes"}' \
             cbackup_checkpoint_lock_seconds_total cbackup_checkpoint_lock_max_seconds \
             cbackup_checkpoint_frames_copied_total cbackup_checkpoint_throttle_waits_total \
+            cbackup_checkpoint_throttle_stops_total cbackup_checkpoint_presync_seconds_total \
             cbackup_checkpoint_throttle_timeouts_total cbackup_checkpoint_throttle_seconds_total \
             cbackup_wal_frames_max; do
     contains "metric $name" "

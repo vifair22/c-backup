@@ -200,12 +200,16 @@ static void emit_txn_metrics(mbuf_t *m)
                "# TYPE cbackup_checkpoint_frames_copied_total counter\n"
                "cbackup_checkpoint_frames_copied_total %llu\n",
             (unsigned long long)c.frames_copied);
-    mb_addf(m, "# HELP cbackup_checkpoint_throttle_waits_total Bulk writers held before their "
-               "transaction because the WAL was past its hard cap.\n"
+    mb_addf(m, "# HELP cbackup_checkpoint_throttle_waits_total Bulk writers slowed before their "
+               "transaction because the WAL was behind (past half its hard cap).\n"
                "# TYPE cbackup_checkpoint_throttle_waits_total counter\n"
                "cbackup_checkpoint_throttle_waits_total %lu\n", c.throttled);
-    mb_addf(m, "# HELP cbackup_checkpoint_throttle_timeouts_total Of those waits, the ones "
-               "that ended at the time limit rather than on a completed copy.\n"
+    mb_addf(m, "# HELP cbackup_checkpoint_throttle_stops_total Of those waits, hard stops "
+               "at the ceiling (the hard cap plus an eighth) until the copy completed.\n"
+               "# TYPE cbackup_checkpoint_throttle_stops_total counter\n"
+               "cbackup_checkpoint_throttle_stops_total %lu\n", c.throttle_stops);
+    mb_addf(m, "# HELP cbackup_checkpoint_throttle_timeouts_total Hard stops that ended at "
+               "the time limit rather than on a completed copy.\n"
                "# TYPE cbackup_checkpoint_throttle_timeouts_total counter\n"
                "cbackup_checkpoint_throttle_timeouts_total %lu\n", c.throttle_timeouts);
     mb_addf(m, "# HELP cbackup_checkpoint_throttle_seconds_total Time bulk writers spent "

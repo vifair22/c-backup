@@ -49,15 +49,20 @@
  *   it. Both are there so that no WAL backlog is written out under the
  *   lock (B216): a PASSIVE starts by syncing the WAL, and at the cap the
  *   backlog is up to the whole cap's worth of page cache, which the lock
- *   used to make every writer wait for. Bulk writers help: each one (db_txn_begin_bulk), before it queues for
- *   the write lock, looks at
- *   the WAL (at most every 5 ms across all writers) and, past the cap and
- *   not fully copied, wakes the thread and waits, holding no lock, until
- *   the copy is complete. On a slow device the thread alone let a writer
- *   that never syncs run the WAL to 5.6 times the cap (50 ms syncs) while
- *   its unlocked rounds ran. A writer waits at most 2 s, and not at all for
- *   a second after a copy that could not complete (a reader holding an old
- *   snapshot), since holding writers back cannot help that. *
+ *   used to make every writer wait for.
+ *
+ *   Bulk writers help, by pacing (B216; checkpointer_throttle has the
+ *   design). Each one (db_txn_begin_bulk, db_write_batch), before it
+ *   queues for the write lock, sleeps in proportion to how far the WAL is
+ *   behind: nothing below half the hard cap, rising with the square of the
+ *   distance to 200 ms at the ceiling (the hard cap plus an eighth), and a
+ *   hard stop there until the copy completes. On a slow device the thread
+ *   alone let a writer that never syncs run the WAL to 5.6 times the cap
+ *   (50 ms syncs) while its unlocked rounds ran. The hard stop gives way
+ *   for a second after a copy that could not complete (a reader holding an
+ *   old snapshot, which holding writers back cannot help), and after 60 s
+ *   whatever happens.
+ *
  *   Nothing here blocks indefinitely: PASSIVE does not wait for anything,
  *   and the connection's busy timeout is 50 ms. A checkpoint that cannot
  *   start is retried next tick. A reader pinning an old snapshot (none in
@@ -111,7 +116,8 @@ typedef struct {
     uint64_t      lock_ns;          /* the write lock held by those rounds */
     uint64_t      frames_copied;    /* WAL frames copied into the database */
     uint64_t      throttle_ns;      /* writers' total wait at the hard cap */
-    unsigned long throttle_timeouts; /* waits that ended at the time limit */
+    unsigned long throttle_stops;   /* of those, hard stops at the ceiling (B216) */
+    unsigned long throttle_timeouts; /* hard stops that ended at the time limit */
     unsigned long presyncs;         /* WAL syncs made before taking the lock (B216) */
     uint64_t      presync_ns;       /* and their total time */
 } checkpointer_stats_t;
@@ -145,6 +151,11 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
 void checkpointer_stop(void);
 
 void checkpointer_stats(checkpointer_stats_t *out);
+
+/* The sleep a bulk writer is given before its transaction with the WAL at
+ * frames, backfilled of them copied, for a checkpoint threshold (B216):
+ * 0 when none, UINT64_MAX for a hard stop at the ceiling. For tests. */
+uint64_t checkpointer_pace_ns(uint32_t frames, uint32_t backfilled, uint32_t threshold);
 
 /* Called by db_txn_begin_bulk before it queues for the write lock: past the
  * hard cap, wait for the checkpointer to complete a copy (B181; the design

@@ -147,7 +147,8 @@ typedef struct { uint32_t left; int rc; } locked_arg_t;
 #define CKPT_UNLOCKED_ROUNDS 4
 #define CKPT_SMALL_FRAMES  1024     /* 4 MiB: always small enough to copy under the lock */
 #define CKPT_PROBE_NS        (5ull * 1000000ull)      /* writers look at most this often */
-#define CKPT_THROTTLE_MAX_NS (2000ull * 1000000ull)   /* and never wait longer */
+#define CKPT_PACE_MAX_NS     (200ull * 1000000ull)    /* a writer's sleep just under the ceiling */
+#define CKPT_STOP_MAX_NS     (60000ull * 1000000ull)  /* the longest hard stop at the ceiling */
 #define CKPT_BLOCKED_NS      (1000ull * 1000000ull)   /* after a copy that could not finish */
 #define CKPT_LOCK_BUDGET_NS (200ull * 1000000ull)
 
@@ -387,57 +388,114 @@ locked:;
 }
 
 /*
- * Writers' half of the hard cap (B181). The checkpointer alone cannot hold
- * the WAL to the cap on a slow device: between two of its looks a writer
- * that never syncs appends tens of thousands of frames. So every bulk
- * writer, before it queues for the write lock (db_txn_begin_bulk, and each
- * db_write_batch), looks at the WAL -
- * at most every CKPT_PROBE_NS across all writers, a stat and a pread - and
- * once it is past the hard cap and not fully copied, wakes the
- * checkpointer and waits for the copy to complete. Holding no lock while
- * it waits, it cannot hold up the checkpoint it waits for. It stops
- * waiting when the copy is complete (the first writer after it restarts
- * the WAL), when the checkpointer has found it cannot complete one
- * (g_blocked_until_ns), or after CKPT_THROTTLE_MAX_NS whatever happens.
+ * Writers' half of the hard cap (B181), as pacing (B216). The checkpointer
+ * alone cannot hold the WAL to the cap on a slow device: between two of its
+ * looks a writer that never syncs appends tens of thousands of frames. So
+ * every bulk writer, before it queues for the write lock
+ * (db_txn_begin_bulk, and each db_write_batch), is slowed in proportion to
+ * how far the WAL is behind.
+ *
+ * It used to sleep and poll, up to 2 s, once the WAL was past the hard cap,
+ * waiting for the copy to complete. On a slow device the copy takes longer
+ * than that, so every wait ran to the 2 s limit (all of them, in the B216
+ * model), and the writer then queued behind the round it had been waiting
+ * for: a burst stopped dead, restarted, and stopped again. Pacing spreads
+ * the burst over the copy instead:
+ *
+ *   - below half the hard cap, nothing;
+ *   - from there to the ceiling (the hard cap plus an eighth), a sleep
+ *     before each transaction rising with the square of the distance, to
+ *     CKPT_PACE_MAX_NS at the ceiling; past the hard cap the checkpointer
+ *     is woken too;
+ *   - at the ceiling, a hard stop: the writer waits for the copy to
+ *     complete (the first writer after it restarts the WAL) or the WAL to
+ *     restart, so the WAL never runs past the ceiling by more than the
+ *     batches already in flight.
+ *
+ * Nothing waits while the WAL is fully copied, since the next writer
+ * restarts it. The hard stop gives way, as the old wait did, when the
+ * checkpointer has found it cannot complete a copy (g_blocked_until_ns: a
+ * reader holding an old snapshot, which holding writers back cannot help),
+ * when it is not running, and after CKPT_STOP_MAX_NS whatever happens, so a
+ * stuck checkpointer degrades to one transaction per that interval rather
+ * than a hung backup; those are counted as timeouts.
+ *
+ * The wal-index is read at most every CKPT_PROBE_NS across all writers (a
+ * pread); the others pace on the last reading.
  *
  * Only bulk writers: a request's write (db_txn_begin, db_write) never
  * waits here. Those writes are a few pages each and cannot carry the WAL
  * past the cap; the writers that can are the ones that write without
  * pause, and holding them is enough.
  */
+static atomic_uint g_seen_frames, g_seen_backfilled;
+
+static void probe(uint64_t now, uint32_t *f, uint32_t *b)
+{
+    uint64_t last = atomic_load_explicit(&g_last_probe_ns, memory_order_relaxed);
+    if (now - last >= CKPT_PROBE_NS) {
+        atomic_store_explicit(&g_last_probe_ns, now, memory_order_relaxed);
+        uint32_t nf = 0, nb = 0;
+        if (checkpointer_wal_frames(g_path, &nf, &nb) == 0) {
+            atomic_store_explicit(&g_seen_frames, nf, memory_order_relaxed);
+            atomic_store_explicit(&g_seen_backfilled, nb, memory_order_relaxed);
+        }
+    }
+    *f = atomic_load_explicit(&g_seen_frames, memory_order_relaxed);
+    *b = atomic_load_explicit(&g_seen_backfilled, memory_order_relaxed);
+}
+
+uint64_t checkpointer_pace_ns(uint32_t frames, uint32_t backfilled, uint32_t threshold)
+{
+    uint64_t hard = (uint64_t)threshold * CKPT_HARD_FACTOR;
+    uint64_t start = hard - hard / 4, ceiling = hard + hard / 8;
+    if (frames <= start || frames == backfilled) return 0;
+    if (frames >= ceiling) return UINT64_MAX;
+    double x = (double)(frames - start) / (double)(ceiling - start);
+    return (uint64_t)(x * x * (double)CKPT_PACE_MAX_NS);
+}
+
+static void wake_checkpointer(void)
+{
+    pthread_mutex_lock(&g_mu);
+    pthread_cond_signal(&g_cv);
+    pthread_mutex_unlock(&g_mu);
+}
+
 void checkpointer_throttle(void)
 {
     if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return;
     uint64_t now = now_ns();
-    uint64_t last = atomic_load_explicit(&g_last_probe_ns, memory_order_relaxed);
-    if (now - last < CKPT_PROBE_NS) return;
-    atomic_store_explicit(&g_last_probe_ns, now, memory_order_relaxed);
     if (now < atomic_load(&g_blocked_until_ns)) return;
-    uint64_t hard = (uint64_t)g_threshold * CKPT_HARD_FACTOR;
     uint32_t f = 0, b = 0;
-    if (checkpointer_wal_frames(g_path, &f, &b) != 0 || f <= hard || f == b) return;
+    probe(now, &f, &b);
+    uint64_t pace = checkpointer_pace_ns(f, b, g_threshold);
+    if (pace == 0) return;
+    if (f > (uint64_t)g_threshold * CKPT_HARD_FACTOR) wake_checkpointer();
 
-    pthread_mutex_lock(&g_mu);
-    pthread_cond_signal(&g_cv);
-    pthread_mutex_unlock(&g_mu);
     uint64_t t0 = now;
     int timed_out = 0;
-    for (;;) {
-        struct timespec ts = { 0, 2 * 1000000L };
+    if (pace != UINT64_MAX) {
+        struct timespec ts = { (time_t)(pace / 1000000000ull), (long)(pace % 1000000000ull) };
         nanosleep(&ts, NULL);
-        uint64_t t = now_ns();
-        if (!atomic_load(&g_active) || t < atomic_load(&g_blocked_until_ns) ||
-            t - t0 > CKPT_THROTTLE_MAX_NS) {
-            timed_out = t - t0 > CKPT_THROTTLE_MAX_NS;
-            break;
+    } else {
+        /* The ceiling: the hard stop. */
+        for (;;) {
+            struct timespec ts = { 0, 2 * 1000000L };
+            nanosleep(&ts, NULL);
+            uint64_t t = now_ns();
+            if (!atomic_load(&g_active) || t < atomic_load(&g_blocked_until_ns)) break;
+            if (t - t0 > CKPT_STOP_MAX_NS) { timed_out = 1; break; }
+            probe(t, &f, &b);
+            if (checkpointer_pace_ns(f, b, g_threshold) != UINT64_MAX) break;
         }
-        if (checkpointer_wal_frames(g_path, &f, &b) != 0 || f <= hard || f == b) break;
     }
     uint64_t waited = now_ns() - t0;
     pthread_mutex_lock(&g_mu);
     g_stats.throttled++;
     if (waited > g_stats.max_throttle_ns) g_stats.max_throttle_ns = waited;
     g_stats.throttle_ns += waited;
+    if (pace == UINT64_MAX) g_stats.throttle_stops++;
     if (timed_out) g_stats.throttle_timeouts++;
     pthread_mutex_unlock(&g_mu);
 }
