@@ -73,6 +73,14 @@ typedef struct helper_backend {
      * NULL: the provider refuses only in define itself. */
     status_t (*define_check)(sp_ctx_t *c, const char *unit_id, const char *definition,
                              const helper_policy_t *pol);
+    /* Where a database template runs (db-detection.md 7.2): the member
+     * whose mount holds path (a recorded path, as a finding names it),
+     * from the backend's own inspect, and path as that container sees it.
+     * path NULL: the unit's only member, or ERR_INVALID when it has
+     * several. ERR_NOT_FOUND when no member's mount holds path. NULL:
+     * there is no container to enter (the fake), and paths stay as given. */
+    status_t (*db_target)(sp_ctx_t *c, const char *unit_id, const char *path,
+                          char *container, size_t csz, char *cpath, size_t psz);
 } helper_backend_t;
 
 /* The fake provider as a backend, over ctx. */

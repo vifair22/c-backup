@@ -69,6 +69,7 @@ typedef enum {
     HOP_UNIT_DEFINE,
     HOP_LEASE_RELEASE,
     HOP_SWEEP,
+    HOP_DB_PROBE,          /* db-detection.md 8.1 */
     HOP_COUNT
 } helper_op_t;
 
@@ -112,8 +113,16 @@ typedef struct {
     size_t      n_paths;
     /* tokens: capture, run, session, staging */
     char        token[HELPER_TOKEN_HEX + 1];
-    /* hook.run */
+    /* hook.run: a policy hook by name, or a database template */
     char        hook[HELPER_NAME_MAX + 1];
+    /* hook.run's template form and db.probe (db-detection.md 7.2, 8.1):
+     * the template, its params as JSON text (checked against the catalog
+     * by the server, not here), the finding's recorded path, which picks
+     * the container, and for an exec template which run (post: 1). */
+    char        tmpl[HELPER_NAME_MAX + 1];
+    char       *params;
+    char        dbpath[HELPER_PATH_MAX + 1];
+    int         post;
     /* vm.backup_begin */
     helper_disk_arg_t disks[HELPER_DISKS_MAX];
     size_t      n_disks;
