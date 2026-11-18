@@ -19,7 +19,7 @@
 #include <unistd.h>
 #include <acl/libacl.h>
 
-static uint64_t inode_identity(dev_t dev, ino_t ino) {
+uint64_t scan_inode_identity(dev_t dev, ino_t ino) {
     uint64_t h = 1469598103934665603ULL;
     uint64_t d = (uint64_t)dev;
     uint64_t i = (uint64_t)ino;
@@ -497,6 +497,19 @@ status_t scan_entry_collect_metadata(scan_entry_t *e) {
 static _Thread_local const char *tl_top_read;
 
 /*
+ * A snapshot read's device remap (scan_tree_as): entries on the read root's
+ * device are given the record root's live device for their hard-link
+ * identity and their file cache key. A btrfs or ZFS snapshot has a new
+ * device number every capture, and the identity hashes the device, so
+ * without this every snapshot read wrote a whole new set of trees, none of
+ * which matched a live read's (B229). Entries on any other device inside
+ * the read tree (a nested mount) keep their own. Thread-local around one
+ * walk, like tl_top_read.
+ */
+static _Thread_local int   tl_remap;
+static _Thread_local dev_t tl_remap_from, tl_remap_to;
+
+/*
  * The walk is relative to directory fds, never by path below a source root.
  *
  * By path, a directory swapped for a symlink between its lstat and its
@@ -552,9 +565,15 @@ static status_t scan_entry_at(int dirfd, const char *name, const char *path,
     e.strip_prefix_len = strip_prefix_len;
     e.st               = st;
 
+    e.rec_dev          = st.st_dev;
+    if (tl_remap && st.st_dev == tl_remap_from) {
+        e.rec_dev      = tl_remap_to;
+        e.dev_remapped = 1;
+    }
+
     node_t *nd = &e.node;
     nd->node_id        = imap->next_node_id++;
-    nd->inode_identity = inode_identity(st.st_dev, st.st_ino);
+    nd->inode_identity = scan_inode_identity(e.rec_dev, st.st_ino);
     nd->type           = stat_to_node_type(&st);
     nd->mode           = (uint32_t)st.st_mode;
     nd->uid            = (uint32_t)st.st_uid;
@@ -926,10 +945,11 @@ static status_t scan_tree_impl(const char *root, const char *record,
             e.parent_node_id = root_parent_id;
             e.strip_prefix_len = 1;
             e.st = st;
+            e.rec_dev = st.st_dev;
 
             node_t *nd = &e.node;
             nd->node_id        = imap->next_node_id++;
-            nd->inode_identity = inode_identity(st.st_dev, st.st_ino);
+            nd->inode_identity = scan_inode_identity(st.st_dev, st.st_ino);
             nd->type           = NODE_TYPE_DIR;
             nd->mode           = (uint32_t)st.st_mode;
             nd->uid            = (uint32_t)st.st_uid;
@@ -975,11 +995,27 @@ static status_t scan_tree_impl(const char *root, const char *record,
 
     uint32_t before = res->count;
     const char *prev_top = tl_top_read;
+    int prev_remap = tl_remap;
+    dev_t prev_from = tl_remap_from, prev_to = tl_remap_to;
     tl_top_read = strcmp(record, "/") == 0 ? root : NULL;
+    if (as) {
+        /* A record root that does not exist here (the data was read from
+         * somewhere else entirely) gets device 0: made up, the same every
+         * time, like its synthesised ancestors. */
+        struct stat rec_st;
+        tl_remap = 1;
+        tl_remap_from = root_st.st_dev;
+        tl_remap_to = lstat(record, &rec_st) == 0 ? rec_st.st_dev : 0;
+    } else {
+        tl_remap = 0;
+    }
     status_t st = scan_entry_at(AT_FDCWD, root, root, root_parent_id,
                                 strip_prefix_len, imap, opts,
                                 root_dev, res);
     tl_top_read = prev_top;
+    tl_remap = prev_remap;
+    tl_remap_from = prev_from;
+    tl_remap_to = prev_to;
     if (st != OK) { scan_result_free(res); return st; }
     res->root_entries = res->count - before;
     /* Every path below was built as root + "/" + name..., so the root is
