@@ -1807,6 +1807,62 @@ static void test_warnings_are_journalled(void **state)
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE result = 'success'"), 1);
 }
 
+/* A job's result as stored, by id, into out. */
+static void result_of(int64_t id, char *out, size_t cap)
+{
+    char q[128];
+    snprintf(q, sizeof(q), "SELECT COALESCE(result, '') FROM jobs WHERE id = %lld", (long long)id);
+    assert_int_equal(db_text(q, out, cap), 0);
+}
+
+static status_t result_warned_job(void *arg, atomic_int *cancel,
+                                  void (*progress)(const char *, uint64_t, uint64_t, void *),
+                                  void *progress_ctx)
+{
+    (void)cancel; (void)progress;
+    job_set_result(progress_ctx, "{\"units\":[],\"ok\":1}");
+    return warned_job(arg, cancel, progress, progress_ctx);
+}
+
+/*
+ * B211: a job's warnings are in its result, which GET /jobs/<id> and the
+ * list serve, not only in the journal: "warning" the line the journal has,
+ * "warnings" each one. A result the job set keeps its own fields; a job
+ * with none gets one; a clean job's result is untouched.
+ */
+static void test_warnings_reach_the_result(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, label, added_at)"
+        " VALUES (3, 'u-3', '/srv/repos/docs', 'docs', 0)", NULL, NULL), 0);
+    char got[4096];
+    int64_t id = 0;
+
+    static const char *const two[] = { "hold 4 on unit x not released: EBUSY", "unit y: thawed" };
+    warned_spec_t w2 = { "fake: 1 unit(s) backed up", 2, two };
+    assert_int_equal(job_submit(jm, 3, "backup", NULL, result_warned_job, (void *)&w2, NULL, &id), OK);
+    wait_ended(id);
+    result_of(id, got, sizeof(got));
+    assert_string_equal(got, "{\"units\":[],\"ok\":1,\"warning\":\"2 warnings: hold 4 on unit x not "
+                             "released: EBUSY; unit y: thawed\",\"warnings\":[\"hold 4 on unit x not "
+                             "released: EBUSY\",\"unit y: thawed\"]}");
+
+    static const char *const one[] = { "unit vm1: released by the watchdog" };
+    warned_spec_t w1 = { NULL, 1, one };
+    assert_int_equal(job_submit(jm, 3, "backup", NULL, warned_job, (void *)&w1, NULL, &id), OK);
+    wait_ended(id);
+    result_of(id, got, sizeof(got));
+    assert_string_equal(got, "{\"warning\":\"unit vm1: released by the watchdog\","
+                             "\"warnings\":[\"unit vm1: released by the watchdog\"]}");
+
+    warned_spec_t clean = { "snapshot 4: 10 files", 0, NULL };
+    assert_int_equal(job_submit(jm, 3, "backup", NULL, warned_job, (void *)&clean, NULL, &id), OK);
+    wait_ended(id);
+    result_of(id, got, sizeof(got));
+    assert_string_equal(got, "");
+}
+
 /* Several warnings, one alert: the count and the list, never one per item. */
 static void test_several_warnings_alert_once(void **state)
 {
@@ -1899,6 +1955,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_warning_is_alerted_and_the_job_completes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_warning_alert_text, setup, teardown),
         cmocka_unit_test_setup_teardown(test_warnings_are_journalled, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_warnings_reach_the_result, setup, teardown),
         cmocka_unit_test_setup_teardown(test_journalled_warnings_are_bounded, setup, teardown),
         cmocka_unit_test_setup_teardown(test_several_warnings_alert_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_job_waits_for_a_request_holding_the_repo, setup, teardown),

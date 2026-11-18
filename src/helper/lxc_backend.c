@@ -576,6 +576,22 @@ static status_t x_define(sp_ctx_t *c, const char *unit_id, const char *definitio
     struct stat sb;
     /* Where the old config went, so a failed write can put it back. */
     char ha[PATH_MAX + HOST_TOOL_PATH_MAX + 64] = "";
+    /* The config's mode (B212): it can hold secrets (a hook's
+     * environment, a key path), and fopen's 0666 under the helper's umask
+     * wrote it 0644 where LXC keeps 0640. The snapshot records the config
+     * as a blob without its mode, so the original's on the host decides:
+     * the one replaced, else (a copy) the original unit's, never wider than
+     * it was; 0640 when there is neither. */
+    mode_t cmode = 0640;
+    {
+        char oc[PATH_MAX + 16], oh[PATH_MAX + HOST_TOOL_PATH_MAX + 16];
+        struct stat ob;
+        snprintf(oc, sizeof(oc), "%.3900s/%s/config", c->pol->lxc_path, valid_name(unit_id) ? unit_id : name);
+        if (st == OK && host_path(&c->tools, conf, oh, sizeof(oh)) == 0 && lstat(oh, &ob) == 0 && S_ISREG(ob.st_mode))
+            cmode = ob.st_mode & 0777;
+        else if (st == OK && host_path(&c->tools, oc, oh, sizeof(oh)) == 0 && lstat(oh, &ob) == 0 && S_ISREG(ob.st_mode))
+            cmode = ob.st_mode & 0777;
+    }
     if (st == OK && host_path(&c->tools, conf, hp, sizeof(hp)) == 0 && lstat(hp, &sb) == 0) {
         int state = state_of(c, name);
         if (!replace) st = set_error(ERR_BUSY, "lxc: a container named %s exists; pass replace, or a new name", name);
@@ -633,7 +649,7 @@ static status_t x_define(sp_ctx_t *c, const char *unit_id, const char *definitio
             host_path(&c->tools, conf, hp, sizeof(hp)) != 0)
             st = set_error_errno(ERR_IO, "lxc: creating %s", dir);
     }
-    if (st == OK) st = host_write_new_file(hp, conf, out, o, ha);
+    if (st == OK) st = host_write_new_file_mode(hp, conf, out, o, ha, cmode);
     free(out);
     if (st == OK && start) st = lxc(c, "lxc-start", name, NULL, NULL);
     if (st == OK) {

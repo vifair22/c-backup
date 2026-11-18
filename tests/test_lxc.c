@@ -232,9 +232,16 @@ static void test_define(void **state)
     snprintf(buf, sizeof(buf), def, ",\"replace\":true");
     assert_int_not_equal(be.define(be.ctx, "DevBox", buf, &pol, &res), OK);   /* running */
     err_clear();
+    /* B212: the config keeps the original's mode, never the umask's
+     * 0644 for a 0640 original. */
+    mode_t um = umask(022);
+    assert_int_equal(chmod(LXCP "/DevBox/config", 0640), 0);
     snprintf(buf, sizeof(buf), def, ",\"name\":\"devbox2\"");
     assert_int_equal(be.define(be.ctx, "DevBox", buf, &pol, &res), OK);
     cJSON_Delete(res);
+    struct stat sb;
+    assert_int_equal(stat(LXCP "/devbox2/config", &sb), 0);
+    assert_int_equal(sb.st_mode & 07777, 0640);
     FILE *f = fopen(LXCP "/devbox2/config", "r");
     assert_non_null(f);
     char cfg[1024];
@@ -252,6 +259,36 @@ static void test_define(void **state)
     assert_int_equal(be.define(be.ctx, "Parked", buf, &pol, &res), OK);
     assert_non_null(strstr(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "previous_config")), "config.cbackup-old-"));
     cJSON_Delete(res);
+    umask(um);
+}
+
+/* B212: the config's mode is the original's, the one replaced or (a copy)
+ * the original unit's, so never wider than it was; 0640, LXC's own, when
+ * no original is on the host. Never the umask's 0644. */
+static void test_define_config_mode(void **state)
+{
+    (void)state;
+    const char *def = "{\"config\":\"lxc.uts.name = X\\nlxc.rootfs.path = dir:/old/rootfs\\n\"%s}";
+    char buf[1024];
+    cJSON *res = NULL;
+    struct stat sb;
+    mode_t um = umask(022);
+    /* Replacing: the replaced config's 0600 stays 0600. */
+    put(STATE "/lxc-Parked", "STOPPED\n");
+    assert_int_equal(chmod(LXCP "/Parked/config", 0600), 0);
+    snprintf(buf, sizeof(buf), def, ",\"replace\":true");
+    assert_int_equal(be.define(be.ctx, "Parked", buf, &pol, &res), OK);
+    cJSON_Delete(res);
+    res = NULL;
+    assert_int_equal(stat(LXCP "/Parked/config", &sb), 0);
+    assert_int_equal(sb.st_mode & 07777, 0600);
+    /* A copy of a unit no longer on the host: 0640. */
+    snprintf(buf, sizeof(buf), def, ",\"name\":\"gone2\"");
+    assert_int_equal(be.define(be.ctx, "Gone", buf, &pol, &res), OK);
+    cJSON_Delete(res);
+    assert_int_equal(stat(LXCP "/gone2/config", &sb), 0);
+    assert_int_equal(sb.st_mode & 07777, 0640);
+    umask(um);
 }
 
 /* The suite's scratch goes with it: tests/scratch-guard.sh fails a suite
@@ -319,6 +356,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_freeze_lost, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_thaws, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_config_mode, setup, teardown),
         cmocka_unit_test_setup_teardown(test_host_namespaces, setup, teardown),
         cmocka_unit_test_setup_teardown(test_mount_root, setup, teardown),
     };

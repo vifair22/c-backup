@@ -1105,7 +1105,9 @@ repository registration queues (`POST /repos`).
 is, then a frame whenever it changes, and the same frame again every 5 seconds
 while it does not, so a watcher can tell a busy job from a dead stream. The
 stream ends after the frame with a terminal state. A frame is
-`{"id","state","phase","current","total","bytes_done","bytes_total","error"}`.
+`{"id","state","phase","current","total","bytes_done","bytes_total","error"}`,
+and the last frame of a job that completed with warnings adds `"warning"`,
+the same line as its `result`'s (below).
 `bytes_done` advances inside a file as backup and restore read and write it,
 not only between files, so a job spending minutes on one large file still
 sends a changed frame a few times a second.
@@ -1120,7 +1122,12 @@ permanent record of what ran is each repository's journal
 (`GET /repos/<id>/journal`). A job that completed with warnings is
 journalled with `result` `warning` rather than `success`, its message the
 job's summary followed by the warnings (Manual section 12), so they outlive
-the job row. A job left running or queued by a daemon that
+the job row. While the row lasts its `result` carries them too, in
+`/jobs/<id>` and `/jobs` alike (B211): `"warning"`, that same line (the
+text itself for one, `"N warnings: a; b"` for more, with how many did not
+fit), and `"warnings"`, each one shown in it. A job that set no result has
+one with just those two; a result that names either key itself keeps its
+own. A job left running or queued by a daemon that
 stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it, and journalled then with that message:
 a daemon that was killed had no chance to journal it itself.

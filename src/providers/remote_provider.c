@@ -849,7 +849,7 @@ static status_t r_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
             const char *unit = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(h, "unit"));
             const char *err = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(h, "error"));
             snprintf(out->stuck, sizeof(out->stuck),
-                     "the helper cannot release %s on %s after %d tries (%.200s)%s; it keeps retrying",
+                     "the helper cannot release %s on %s after %d tries (%.1024s)%s; it keeps retrying",
                      kind ? kind : "?", unit ? unit : "?", (int)num(h, "tries"), err ? err : "",
                      n > 1 ? ", and other holds" : "");
             log_error("units: %s", out->stuck);

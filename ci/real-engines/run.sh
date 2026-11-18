@@ -732,6 +732,46 @@ check "no copy was created" "" "$(docker ps -aq --filter name=cbk-uat-blk2)"
 check "nothing was written under the target root" no "$([ -e "$TRB" ] && echo yes || echo no)"
 docker rm -f cbk-uat-blk >/dev/null 2>&1
 leftovers "after the block-device refusal"
+
+# B210: the device node is inside an include root, so it is data the backup
+# captures and the copy's bind is rewritten under the target root. The
+# define check runs before the restore writes anything, when that path does
+# not exist yet; it must judge the original, or the restore writes the data
+# and the node there and only the real define refuses.
+log "docker: cbk-uat-blkin, a block device node inside an include root"
+# Two binds that do not nest: a backup refuses items that overlap.
+mkdir -p "$APPS/cbk-uat-blkin/data" "$APPS/cbk-uat-blkin/dev"
+echo blkin-data > "$APPS/cbk-uat-blkin/data/f"
+LOOPMM=$(stat -L -c '%t %T' "$LOOPDEV")
+mknod "$APPS/cbk-uat-blkin/dev/disk" b $((16#${LOOPMM% *})) $((16#${LOOPMM#* }))
+docker run -d --name cbk-uat-blkin --network none -v "$APPS/cbk-uat-blkin/data:/data" \
+    -v "$APPS/cbk-uat-blkin/dev/disk:/disk" "$IMG" \
+    sh -c 'trap "exit 0" TERM; while :; do sleep 1; done' >/dev/null || { bad "cbk-uat-blkin starts" started failed; return 0; }
+OUT_B=$(cb unit backup 1 --provider docker cbk-uat-blkin 2>&1)
+job_ok "unit backup of a container with a block device node in an include root" "$OUT_B"
+SNAP_BLKIN=$(snap_of "$OUT_B")
+if have_snap "the in-root block-device backup" "$SNAP_BLKIN"; then
+    TRBI="$APPS/restored-blkin"
+    OUT_N=$(cb unit restore 1 "$SNAP_BLKIN" --define --name cbk-uat-blkin2 --target-root "$TRBI" 2>&1)
+    contains "a copy binding an in-root block device is refused" '"state":"failed"' "$OUT_N"
+    contains "the refusal is the check's, before anything is written" "refused, nothing written" "$OUT_N"
+    contains "the refusal names the bind and why" "$TRBI$APPS/cbk-uat-blkin/dev/disk -> /disk: a block device" "$OUT_N"
+    check "no in-root copy was created" "" "$(docker ps -aq --filter name=cbk-uat-blkin2)"
+    check "nothing was written under the in-root target root" no "$([ -e "$TRBI" ] && echo yes || echo no)"
+    # The original gone from the host after the backup: the host cannot
+    # say, and the snapshot's recorded type of the node decides.
+    rm -f "$APPS/cbk-uat-blkin/dev/disk"
+    TRBI2="$APPS/restored-blkin2"
+    OUT_N=$(cb unit restore 1 "$SNAP_BLKIN" --define --name cbk-uat-blkin3 --target-root "$TRBI2" 2>&1)
+    contains "with the original gone, the copy is still refused" '"state":"failed"' "$OUT_N"
+    contains "by the check, from the snapshot's record" "refused, nothing written" "$OUT_N"
+    contains "the refusal says the snapshot records a block device" "/disk: a block device, as the snapshot records it" "$OUT_N"
+    check "no copy was created with the original gone" "" "$(docker ps -aq --filter name=cbk-uat-blkin3)"
+    check "nothing was written under that target root" no "$([ -e "$TRBI2" ] && echo yes || echo no)"
+fi
+docker rm -f cbk-uat-blkin >/dev/null 2>&1
+rm -f "$APPS/cbk-uat-blkin/dev/disk"
+leftovers "after the in-root block-device refusal"
 }
 test_blk
 

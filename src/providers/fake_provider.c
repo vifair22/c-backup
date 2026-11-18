@@ -540,8 +540,8 @@ static status_t hold_release(sp_ctx_t *c, size_t idx, fake_fail_t fail)
     fhold_t *h = &c->holds[idx];
     if (!h->held) return OK;
     if (fail == FAKE_FAIL_RELEASE)
-        return set_error(ERR_IO, "fake: cannot release %s on %s (injected)",
-                         h->kind, h->unit_id);
+        return set_error(ERR_IO, "fake: cannot release %s on %s, held as %s (injected)",
+                         h->kind, h->unit_id, h->detail);
     h->held = 0;
     c->st.holds_now--;
     c->st.releases++;
@@ -1617,7 +1617,7 @@ static status_t f_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
             found = 1;
             if (hold_release(c, i, fail) != OK) {
                 ok = 0;
-                if (!out->stuck[0]) snprintf(out->stuck, sizeof(out->stuck), "%.390s", err_msg());
+                if (!out->stuck[0]) snprintf(out->stuck, sizeof(out->stuck), "%.1024s", err_msg());
                 err_clear();
             }
             else out->released++;

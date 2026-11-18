@@ -505,6 +505,11 @@ static const char *k_copy =
     "{\"Type\":\"volume\",\"Name\":\"solodata\",\"Source\":\"/var/lib/docker/volumes/solodata/_data\",\"Destination\":\"/v\"},"
     "{\"Type\":\"volume\",\"Name\":\"9e1d\",\"Source\":\"/var/lib/docker/volumes/9e1d/_data\",\"Destination\":\"/anon\"},"
     "{\"Type\":\"tmpfs\",\"Source\":\"\",\"Destination\":\"/tmp\"}]},"
+    /* As the daemon records them from the snapshot (B210): the volumes'
+     * originals are not on this host, so these are what vouch for them. */
+    "\"recorded_types\":{\"" APPS "/r" APPS "/web/www\":\"dir\","
+    "\"" APPS "/r/var/lib/docker/volumes/solodata/_data\":\"dir\","
+    "\"" APPS "/r/var/lib/docker/volumes/9e1d/_data\":\"dir\"},"
     "\"image\":{\"RepoTags\":[\"alpine:3\"]},\"name\":\"%s\"%s}";
 
 #define TR APPS "/r"
@@ -695,6 +700,97 @@ static void test_define_copy_host_binds(void **state)
     cpol = &pol;
 }
 
+/*
+ * B210: a copy of a container whose bind, under an include root, is a
+ * block device. The check runs before the restore writes target_root, so
+ * the copy's own source does not exist and its st_mode says nothing; the
+ * original's does. Refused by the check with nothing created and nothing
+ * under the target root, and the same original as a plain file passes.
+ */
+static void test_define_copy_block_original(void **state)
+{
+    (void)state;
+    char blk[PATH_MAX];
+    if (!block_device(blk, sizeof(blk))) { print_message("no block device to bind here; not run\n"); return; }
+    assert_int_equal(symlink(blk, APPS "/web/disk"), 0);
+    static const char *k_blk =
+        "{\"inspect\":{\"Name\":\"/solo\",\"Config\":{\"Image\":\"alpine:3\"},"
+        "\"HostConfig\":{\"Binds\":[\"" TR APPS "/web/%s:/disk\"]},"
+        "\"Mounts\":[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/%s\",\"Destination\":\"/disk\"}]},"
+        "\"image\":{\"RepoTags\":[\"alpine:3\"]},\"name\":\"solocopy\",\"target_root\":\"" TR "\"}";
+    char def[2048];
+    snprintf(def, sizeof(def), k_blk, "disk", "disk");
+    int n0 = fdk.n;
+    cJSON *res = NULL;
+    struct stat sb;
+    for (int check = 1; check >= 0; check--) {
+        status_t st = check ? be.define_check(be.ctx, "solo", def, &pol) : be.define(be.ctx, "solo", def, &pol, &res);
+        assert_int_not_equal(st, OK);
+        const char *m = err_msg();
+        if (!strstr(m, "a block device") || !strstr(m, "nothing created") || !strstr(m, TR APPS "/web/disk -> /disk"))
+            fail_msg("check %d: %s", check, m);
+        err_clear();
+        assert_int_equal(fdk.n, n0);
+        assert_int_not_equal(lstat(TR APPS "/web/disk", &sb), 0);
+    }
+    /* The same bind of a plain file: the check lets it through. */
+    put(APPS "/web/plain", "x");
+    snprintf(def, sizeof(def), k_blk, "plain", "plain");
+    assert_int_equal(be.define_check(be.ctx, "solo", def, &pol), OK);
+    assert_int_equal(fdk.n, n0);
+}
+
+/*
+ * B210, the original gone from the host after the backup: the snapshot's
+ * recorded type of the source decides. A block device is refused; so is a
+ * source it has no entry for, one recorded as a link, or a definition with
+ * no record at all, since nothing then says what the restore would write.
+ * A recorded directory passes. Every refusal is the check's, with nothing
+ * created and nothing under the target root.
+ */
+static void test_define_copy_recorded_type(void **state)
+{
+    (void)state;
+    static const char *k_gone =
+        "{\"inspect\":{\"Name\":\"/solo\",\"Config\":{\"Image\":\"alpine:3\"},"
+        "\"HostConfig\":{\"Binds\":[\"" TR APPS "/web/gone:/disk\"]},"
+        "\"Mounts\":[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/gone\",\"Destination\":\"/disk\"}]},"
+        "%s\"image\":{\"RepoTags\":[\"alpine:3\"]},\"name\":\"solocopy\",\"target_root\":\"" TR "\"}";
+    static const struct { const char *rec, *why; } refused[] = {
+        { "\"recorded_types\":{\"" TR APPS "/web/gone\":\"blk\"},", "a block device, as the snapshot records it" },
+        { "\"recorded_types\":{\"" TR APPS "/web/gone\":\"missing\"},", "the snapshot has no entry for it" },
+        { "\"recorded_types\":{\"" TR APPS "/web/gone\":\"lnk\"},", "the snapshot records a link" },
+        { "\"recorded_types\":{},", "the snapshot's record of it was not given" },
+        { "", "the snapshot's record of it was not given" },
+    };
+    struct stat sb;
+    assert_int_not_equal(lstat(APPS "/web/gone", &sb), 0);
+    int n0 = fdk.n;
+    char def[2048];
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        snprintf(def, sizeof(def), k_gone, refused[i].rec);
+        assert_int_not_equal(be.define_check(be.ctx, "solo", def, &pol), OK);
+        const char *m = err_msg();
+        if (!strstr(m, refused[i].why) || !strstr(m, "nothing created") || !strstr(m, TR APPS "/web/gone -> /disk"))
+            fail_msg("case %zu: %s", i, m);
+        /* A "cannot verify" names the way round it, whole: the files
+         * restored to a path, with the real CLI syntax, and the container
+         * made by hand. */
+        if (i > 0 && (!strstr(m, "cannot verify") ||
+                      !strstr(m, "restore the files to a path instead (c-backup restore <repo> <snapshot> <dir> "
+                                 "--subpath " APPS "/web/gone, or c-backup unit restore <repo> <snapshot> <dir> "
+                                 "for the whole unit) and create the container by hand")))
+            fail_msg("case %zu: %s", i, m);
+        if (i == 0 && strstr(m, "restore the files")) fail_msg("case %zu: %s", i, m);
+        err_clear();
+        assert_int_equal(fdk.n, n0);
+        assert_int_not_equal(lstat(TR APPS "/web/gone", &sb), 0);
+    }
+    snprintf(def, sizeof(def), k_gone, "\"recorded_types\":{\"" TR APPS "/web/gone\":\"dir\"},");
+    assert_int_equal(be.define_check(be.ctx, "solo", def, &pol), OK);
+    assert_int_equal(fdk.n, n0);
+}
+
 /* B188 for compose: a service volume naming a volume, or a recorded mount
  * with no restored copy, is refused before anything is written. */
 static void test_define_compose_copy(void **state)
@@ -706,6 +802,7 @@ static void test_define_compose_copy(void **state)
         "\"image\":{\"RepoTags\":[\"postgres:16\"]},\"volumes\":[%s],"
         "\"mounts\":[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/db\",\"Destination\":\"/var/lib/pg\"},"
         "{\"Type\":\"volume\",\"Name\":\"web_wal\",\"Source\":\"/var/lib/docker/volumes/web_wal/_data\",\"Destination\":\"/wal\"}]}]},"
+        "\"recorded_types\":{\"" TR APPS "/web/db\":\"dir\",\"" TR "/var/lib/docker/volumes/web_wal/_data\":\"dir\"},"
         "\"name\":\"webcopy\",\"target_root\":\"" TR "\"}";
     static const struct { const char *vols, *why; } refused[] = {
         { "\"" TR APPS "/web/db:/var/lib/pg\"", "volume at /wal has no restored copy" },
@@ -1173,6 +1270,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_in_place_volumes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_copy_host_binds, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_copy_block_original, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_copy_recorded_type, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_compose_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pause_read, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_scope_job, setup_units, teardown_units),

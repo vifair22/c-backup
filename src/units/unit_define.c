@@ -321,6 +321,64 @@ static status_t compose_definition(store_t *store, cutils_db_t *db, int64_t repo
     return st;
 }
 
+/*
+ * A copy's bind source under target_root, as the snapshot records it, into
+ * rec (B210): "blk", "chr", "dir", "reg", "lnk", "link", "fifo" or
+ * "missing". The helper's define check runs before the restore writes
+ * target_root, so the source does not exist yet and only the original can
+ * say what it is; with the original gone from the host, this is what the
+ * helper has left. Reading the manifest changes nothing in the format.
+ */
+static void record_one(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                       const char *troot, const char *src, cJSON *rec)
+{
+    size_t tl = strlen(troot);
+    if (!src || strncmp(src, troot, tl) != 0 || src[tl] != '/' || cJSON_GetObjectItemCaseSensitive(rec, src)) return;
+    uint8_t type = 0;
+    const char *name = "missing";
+    if (unit_entry_type(store, db, repo_id, snap_id, src + tl, &type) == OK) {
+        switch (type) {
+        case NODE_TYPE_REG:      name = "reg";  break;
+        case NODE_TYPE_DIR:      name = "dir";  break;
+        case NODE_TYPE_SYMLINK:  name = "lnk";  break;
+        case NODE_TYPE_HARDLINK: name = "link"; break;
+        case NODE_TYPE_FIFO:     name = "fifo"; break;
+        case NODE_TYPE_CHR:      name = "chr";  break;
+        case NODE_TYPE_BLK:      name = "blk";  break;
+        default:                 name = "missing"; break;
+        }
+    } else {
+        err_clear();
+    }
+    cJSON_AddStringToObject(rec, src, name);
+}
+
+static void bind_src_record(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                            const char *troot, const char *bind, cJSON *rec)
+{
+    if (!bind || bind[0] != '/') return;
+    char src[PATH_MAX];
+    snprintf(src, sizeof(src), "%.*s", (int)strcspn(bind, ":"), bind);
+    record_one(store, db, repo_id, snap_id, troot, src, rec);
+}
+
+static void add_recorded_types(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                               const char *troot, cJSON *d)
+{
+    cJSON *rec = cJSON_AddObjectToObject(d, "recorded_types");
+    if (!rec) return;
+    const cJSON *x, *y;
+    const cJSON *hc = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(d, "inspect"), "HostConfig");
+    cJSON_ArrayForEach(x, cJSON_GetObjectItemCaseSensitive(hc, "Binds"))
+        bind_src_record(store, db, repo_id, snap_id, troot, cJSON_GetStringValue(x), rec);
+    cJSON_ArrayForEach(x, cJSON_GetObjectItemCaseSensitive(hc, "Mounts"))
+        record_one(store, db, repo_id, snap_id, troot,
+                   cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(x, "Source")), rec);
+    cJSON_ArrayForEach(x, cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(d, "compose"), "services"))
+        cJSON_ArrayForEach(y, cJSON_GetObjectItemCaseSensitive(x, "volumes"))
+            bind_src_record(store, db, repo_id, snap_id, troot, cJSON_GetStringValue(y), rec);
+}
+
 /* The provider's definition, from the snapshot's .cbackup-unit/config. */
 static status_t build_definition(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                                  const char *prov, const char *unit, const unit_define_opts_t *o,
@@ -382,6 +440,8 @@ static status_t build_definition(store_t *store, cutils_db_t *db, int64_t repo_i
         for (size_t i = 0; mm && new_name && i < n; i++) cJSON_AddStringToObject(mm, t[i].path, t[i].dest);
     }
 common:
+    if (st == OK && new_name && strcmp(prov, "docker") == 0 && o->target_root)
+        add_recorded_types(store, db, repo_id, snap_id, o->target_root, d);
     if (st == OK) {
         cJSON_AddStringToObject(d, "name", new_name ? o->name : "");
         cJSON_AddBoolToObject(d, "replace", !new_name && o->replace);
@@ -538,8 +598,8 @@ static status_t define_check(const char *prov, const char *unit, const char *txt
     }
     cJSON_Delete(cr);
     if (st != OK) {
-        char why[600];
-        snprintf(why, sizeof(why), "%.590s", err_msg());
+        char why[2048];
+        snprintf(why, sizeof(why), "%.2040s", err_msg());
         return set_error(st, "unit restore refused, nothing written: %s", why);
     }
     return OK;

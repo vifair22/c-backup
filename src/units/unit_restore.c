@@ -213,6 +213,16 @@ status_t unit_item_content(store_t *store, cutils_db_t *db, int64_t repo_id, int
     return OK;
 }
 
+status_t unit_entry_type(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                         const char *rel, uint8_t *type)
+{
+    uint8_t root[OBJECT_HASH_SIZE], target[OBJECT_HASH_SIZE];
+    uint64_t size = 0;
+    *type = 0;
+    status_t st = root_of(db, repo_id, snap_id, root);
+    return st == OK ? walk(store, root, rel, type, &size, target) : st;
+}
+
 status_t unit_read_file(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                         const char *rel, size_t max, char **data, size_t *len)
 {
