@@ -20,7 +20,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
-#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1131,19 +1130,15 @@ static uint64_t ms_since(const struct timespec *t0)
  * The deadline is fixed by the caller, on the monotonic clock, at the
  * moment the freeze is asked for: computed here, it started whenever this
  * thread first ran, which under heavy load is late, and on the wall clock
- * it moved with any clock step. The thread asks for real-time priority,
- * which the helper (root) gets and a test run as a user does not, so a
- * busy host does not delay the thaw either. What it cannot do is jump a
- * freeze still pending in the guest agent: libvirt serialises agent
- * commands, so a thaw sent while the freeze call runs is answered after
- * it; sent_ms and done_ms say so.
+ * it moved with any clock step. What it cannot do is jump a freeze still
+ * pending in the guest agent: libvirt serialises agent commands, so a thaw
+ * sent while the freeze call runs is answered after it; sent_ms and
+ * done_ms say so.
  */
 static void *freeze_watchdog(void *arg)
 {
     thread_name("cbh-freeze-wd");
     freeze_wd_t *w = arg;
-    struct sched_param sp = { .sched_priority = 1 };
-    (void)pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
     pthread_mutex_lock(&w->mu);
     while (!w->done)
         if (pthread_cond_timedwait(&w->cv, &w->mu, &w->deadline) != 0) break;
