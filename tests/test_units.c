@@ -835,6 +835,22 @@ static void test_watchdog_waits_for_take(void **state)
     assert_int_equal(units_intents_open(db, NULL), 0);
 }
 
+/* B202: a unit's result keeps every warning, not just the first. */
+static void test_all_warnings_kept(void **state)
+{
+    (void)state;
+    fake_fail_set(fk, "u1", FAKE_WARN, 3);
+    const char *names[] = { "cbk-uat-one" };
+    unit_backup_result_t res;
+    assert_int_equal(run_units(names, 1, 0, &res), OK);
+    fake_fail_clear(fk);
+    assert_int_equal(res.units[0].n_warnings, 3);
+    assert_string_equal(res.units[0].warning, "fake warning 1 of 3");
+    assert_string_equal(res.units[0].warnings[0], "fake warning 1 of 3");
+    assert_string_equal(res.units[0].warnings[2], "fake warning 3 of 3");
+    unit_backup_result_free(&res);
+}
+
 static void test_daemon_id(void **state)
 {
     (void)state;
@@ -879,6 +895,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_watchdog_bounds_freeze, setup, teardown),
         cmocka_unit_test_setup_teardown(test_watchdog_bounds_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_watchdog_waits_for_take, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_all_warnings_kept, setup, teardown),
         cmocka_unit_test_setup_teardown(test_daemon_id, setup, teardown),
     };
     return cmocka_run_group_tests(tests, group_setup, group_teardown);

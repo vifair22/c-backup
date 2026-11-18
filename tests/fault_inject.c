@@ -71,6 +71,7 @@ volatile int fault_full_errno = 0;
 volatile int fault_full_skip = 0;
 volatile int fault_full_count = -1;
 volatile int fault_full_hits = 0;
+volatile int fault_full_devfull = 0;
 
 void fault_full_arm(const char *prefix, unsigned ops, int skip, int count)
 {
@@ -87,6 +88,7 @@ void fault_full_disarm(void)
 {
     __atomic_store_n(&fault_full_prefix, NULL, __ATOMIC_SEQ_CST);
     fault_full_ops = 0;
+    fault_full_devfull = 0;
 }
 
 static int full_path_matches(const char *path)
@@ -208,7 +210,19 @@ size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 }
 
 size_t __wrap_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
-    if (full_fd(FAULT_FULL_WRITE, fileno(stream))) return 0;
+    if (full_fd(FAULT_FULL_WRITE, fileno(stream))) {
+        if (!fault_full_devfull) return 0;
+        /* The real thing (fault_inject.h): the stream's descriptor now
+         * writes to /dev/full, and glibc meets ENOSPC as it would on a full
+         * disk, buffer and all. Its path no longer matches the prefix, so
+         * every later call goes straight through. */
+        int fd = open("/dev/full", O_WRONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            (void)dup2(fd, fileno(stream));
+            (void)__real_close(fd);
+        }
+        return __real_fwrite(ptr, size, nmemb, stream);
+    }
     int (*h)(int) = fault_write_hook;
     if (h && h(fileno(stream)) != FAULT_FS_PASS) return 0;
     if (fault_fwrite_bytes_left >= 0) {

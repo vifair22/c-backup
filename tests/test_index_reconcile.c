@@ -17,6 +17,7 @@
  */
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <setjmp.h>
 #include <time.h>
 #include <stdarg.h>
@@ -43,6 +44,7 @@
 #include "store.h"
 #include "store_index.h"
 #include "test_tmp.h"
+#include "full_vfs.h"
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_index_reconcile"
 #define TEST_DB   TEST_DIR "/state.db"
@@ -214,6 +216,107 @@ static void test_lost_tail_is_found_and_reindex_puts_it_back(void **state)
     /* And the next backup numbers past it, not onto it. */
     backup_once("four\n");
     assert_int_equal(scalar("SELECT MAX(id) FROM snapshots WHERE repo_id = ?"), 4);
+}
+
+/*
+ * B195: a backup whose index cannot commit, state.db's filesystem being
+ * full, after its snapshot record reached the repository. The record is
+ * complete and stays; the run fails saying which snapshot was written and
+ * how its index comes back, and reconcile does find it.
+ *
+ * The disk fills the moment index_nodes prepares its first node insert (an
+ * authorizer on the connection sees it), which is where UAT met it.
+ */
+static atomic_int fill_on_nodes;
+
+static int fill_authorizer(void *arg, int action, const char *a1, const char *a2,
+                           const char *a3, const char *a4)
+{
+    (void)arg; (void)a2; (void)a3; (void)a4;
+    if (action == SQLITE_INSERT && a1 && strcmp(a1, "nodes") == 0 &&
+        atomic_load(&fill_on_nodes))
+        full_vfs_arm(1);
+    return SQLITE_OK;
+}
+
+static int fill_ext(sqlite3 *conn, char **err, const sqlite3_api_routines *api)
+{
+    (void)err; (void)api;
+    sqlite3_set_authorizer(conn, fill_authorizer, NULL);
+    return SQLITE_OK;
+}
+
+static void check_unindexed_snapshot(const backup_result_t *res, status_t st)
+{
+    print_message("backup: %s\n", err_msg());
+    assert_int_not_equal(st, OK);
+    assert_non_null(strstr(err_msg(), "database or disk is full"));
+    assert_non_null(strstr(err_msg(), "snapshot 1 was written to the repository"));
+    assert_non_null(strstr(err_msg(), "c-backup reindex"));
+    assert_int_equal(res->snapshot_id, 1);
+    assert_int_equal(res->snapshot_unindexed, 1);
+
+    /* The record is there, whole; the index has no snapshot. */
+    struct stat sb;
+    assert_int_equal(stat(TEST_REPO "/snapshots/1", &sb), 0);
+    assert_true(sb.st_size > 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
+
+    /* What the next start does with it. */
+    uint64_t missing = 0;
+    assert_int_equal(index_reconcile_count(db, repo_id, TEST_REPO, &missing), OK);
+    assert_int_equal(missing, 1);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 1);
+    assert_true(scalar("SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = 1") > 0);
+}
+
+static void test_a_full_disk_in_index_nodes_reports_the_written_snapshot(void **state)
+{
+    (void)state;
+    write_file(TEST_SRC "/a.txt", "full\n");
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    err_clear();
+    atomic_store(&fill_on_nodes, 1);
+    status_t st = backup_run(store, db, repo_id, &o, &res);
+    atomic_store(&fill_on_nodes, 0);
+    full_vfs_arm(0);
+    check_unindexed_snapshot(&res, st);
+    backup_result_free(&res);
+}
+
+/* The same when it is the snapshot row's commit that fails. */
+static status_t fill_hook(void *ctx, cutils_db_t *hdb, int64_t snap_id)
+{
+    (void)ctx; (void)hdb; (void)snap_id;
+    full_vfs_arm(1);
+    return OK;
+}
+
+static void test_a_full_disk_at_the_snapshot_row_reports_the_written_snapshot(void **state)
+{
+    (void)state;
+    write_file(TEST_SRC "/a.txt", "full\n");
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.index_hook = fill_hook;
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    err_clear();
+    status_t st = backup_run(store, db, repo_id, &o, &res);
+    full_vfs_arm(0);
+    check_unindexed_snapshot(&res, st);
+    backup_result_free(&res);
 }
 
 /* Several lost, and a power cut that also took the newest snapshot rows of
@@ -516,6 +619,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_complete_index_submits_nothing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_lost_tail_is_found_and_reindex_puts_it_back, setup, teardown),
         cmocka_unit_test_setup_teardown(test_several_lost, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_full_disk_in_index_nodes_reports_the_written_snapshot, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_full_disk_at_the_snapshot_row_reports_the_written_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pruned_top_is_not_missing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_mark_falls_back_to_listing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unreadable_repo_is_skipped, setup, teardown),
@@ -525,5 +630,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_tag_file_tracks_every_edit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_database_tag_wins, setup, teardown),
     };
+    if (full_vfs_install() != 0) return 1;
+    if (sqlite3_auto_extension((void (*)(void))fill_ext) != SQLITE_OK) return 1;
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

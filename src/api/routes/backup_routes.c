@@ -368,8 +368,18 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     st = backup_run(store, j->db, j->repo_id, &o, &res);
 
     /* What the backup did, on the job record: the log line had it, the job
-     * did not, so a client saw only "completed". Every field is numeric. */
-    if (res.snapshot_id > 0) {
+     * did not, so a client saw only "completed". Every field is numeric.
+     *
+     * A failed run whose snapshot record reached the repository while its
+     * index did not commit (B195) names the snapshot too, flagged as not
+     * indexed, so a client can find it once reconcile or a reindex has
+     * indexed it. The error says the same in words. */
+    if (st != OK && res.snapshot_unindexed && res.snapshot_id > 0) {
+        char rj[96];
+        snprintf(rj, sizeof(rj), "{\"snapshot_id\":%lld,\"indexed\":false}",
+                 (long long)res.snapshot_id);
+        job_set_result(progress_ctx, rj);
+    } else if (res.snapshot_id > 0) {
         const uint64_t *w = res.written.bytes;
         char rj[1024];
         snprintf(rj, sizeof(rj),
@@ -665,35 +675,47 @@ status_t routes_submit_backup(job_manager_t *jm, int64_t repo_id,
     "       COALESCE(origin,'api'), COALESCE(schedule_id, 0)" \
     "  FROM jobs"
 
-static cJSON *job_json(char **row)
+static cJSON *job_json(cutils_db_t *db, char **row)
 {
     cJSON *o = cJSON_CreateObject();
     if (!o) return NULL;
+    int64_t job_id = strtoll(row[0], NULL, 10);
+    /* An end the table does not have yet, held in memory (B196): the row
+     * still says running, and the end is what the client must see. */
+    job_end_view_t ev;
+    int unrec = job_end_unrecorded(db, job_id, &ev);
+    const char *state = unrec ? ev.state : row[3];
+    const char *error = unrec ? ev.error : row[11];
+    const char *phase = unrec && ev.has_progress ? ev.phase : row[6];
     long long started = strtoll(row[4], NULL, 10);
-    long long ended   = strtoll(row[5], NULL, 10);
-    unsigned long long bdone = strtoull(row[9], NULL, 10);
+    long long ended   = unrec ? (long long)ev.ended : strtoll(row[5], NULL, 10);
+    unsigned long long cur   = unrec && ev.has_progress ? ev.done : strtoull(row[7], NULL, 10);
+    unsigned long long tot   = unrec && ev.has_progress ? ev.total : strtoull(row[8], NULL, 10);
+    unsigned long long bdone = unrec && ev.has_progress ? ev.bytes_done : strtoull(row[9], NULL, 10);
+    unsigned long long btot  = unrec && ev.has_progress ? ev.bytes_total : strtoull(row[10], NULL, 10);
+    const char *result = unrec ? (ev.result ? ev.result : "") : row[12];
     long long now = (long long)time(NULL);
     long long elapsed = started > 0 ? ((ended > 0 ? ended : now) - started) : 0;
     if (elapsed < 0) elapsed = 0;
 
-    cJSON_AddNumberToObject(o, "id",      (double)strtoll(row[0], NULL, 10));
+    cJSON_AddNumberToObject(o, "id",      (double)job_id);
     cJSON_AddNumberToObject(o, "repo_id", (double)strtoll(row[1], NULL, 10));
     cJSON_AddStringToObject(o, "action",  row[2]);
-    cJSON_AddStringToObject(o, "state",   row[3]);
+    cJSON_AddStringToObject(o, "state",   state);
     if (started > 0) cJSON_AddNumberToObject(o, "started", (double)started);
     else             cJSON_AddNullToObject(o, "started");
     if (ended > 0)   cJSON_AddNumberToObject(o, "ended", (double)ended);
     else             cJSON_AddNullToObject(o, "ended");
     cJSON_AddNumberToObject(o, "elapsed_s", (double)elapsed);
-    cJSON_AddStringToObject(o, "phase",   row[6]);
-    cJSON_AddNumberToObject(o, "current", (double)strtoull(row[7], NULL, 10));
-    cJSON_AddNumberToObject(o, "total",   (double)strtoull(row[8], NULL, 10));
+    cJSON_AddStringToObject(o, "phase",   phase);
+    cJSON_AddNumberToObject(o, "current", (double)cur);
+    cJSON_AddNumberToObject(o, "total",   (double)tot);
     cJSON_AddNumberToObject(o, "bytes_done",  (double)bdone);
-    cJSON_AddNumberToObject(o, "bytes_total", (double)strtoull(row[10], NULL, 10));
+    cJSON_AddNumberToObject(o, "bytes_total", (double)btot);
     cJSON_AddNumberToObject(o, "rate_bytes_per_s",
                             elapsed > 0 ? (double)(bdone / (unsigned long long)elapsed) : 0.0);
-    cJSON_AddStringToObject(o, "error",   row[11]);
-    cJSON *res = row[12][0] ? cJSON_Parse(row[12]) : NULL;
+    cJSON_AddStringToObject(o, "error",   error);
+    cJSON *res = result[0] ? cJSON_Parse(result) : NULL;
     if (res) cJSON_AddItemToObject(o, "result", res);
     else     cJSON_AddNullToObject(o, "result");
     /* Who asked: "api", "schedule" (and which), or "startup" for a job the
@@ -702,6 +724,10 @@ static cJSON *job_json(char **row)
     long long sched = strtoll(row[14], NULL, 10);
     if (sched > 0) cJSON_AddNumberToObject(o, "schedule_id", (double)sched);
     else           cJSON_AddNullToObject(o, "schedule_id");
+    /* Present only while the end is held in memory, so a client can tell
+     * the table does not have it yet. */
+    if (unrec) cJSON_AddBoolToObject(o, "end_unrecorded", 1);
+    if (unrec) free(ev.result);
     return o;
 }
 
@@ -737,7 +763,7 @@ static api_response_t list_jobs(const api_request_t *req, void *ud)
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = root ? cJSON_AddArrayToObject(root, "jobs") : NULL;
     for (int i = 0; arr && i < (r ? r->nrows : 0); i++) {
-        cJSON *j = job_json(r->rows[i]);
+        cJSON *j = job_json(ctx->db, r->rows[i]);
         if (j) cJSON_AddItemToArray(arr, j);
     }
     db_result_free(r);
@@ -792,7 +818,7 @@ static api_response_t get_job(const api_request_t *req, void *ud)
         db_result_free(r);
         return api_error(404, "no such job");
     }
-    cJSON *j = job_json(r->rows[0]);
+    cJSON *j = job_json(ctx->db, r->rows[0]);
     db_result_free(r);
     return json_out(j);
 }
@@ -822,7 +848,7 @@ static api_response_t cancel_job(const api_request_t *req, void *ud)
     cJSON *j = NULL;
     if (db_execute(ctx->db, JOB_COLUMNS " WHERE id = ?",
                    (const char *[]){ idbuf, NULL }, &r) == 0 && r && r->nrows == 1)
-        j = job_json(r->rows[0]);
+        j = job_json(ctx->db, r->rows[0]);
     db_result_free(r);
     if (!j) j = cJSON_CreateObject();
     if (j) cJSON_AddBoolToObject(j, "cancel_requested", 1);
