@@ -183,7 +183,29 @@ static status_t add_item(sp_unit_desc_t *d, size_t *cap, sp_item_kind_t kind, co
     return OK;
 }
 
-static status_t add_tree(struct sp_ctx *c, sp_unit_desc_t *d, size_t *cap, const char *id, const char *src)
+/* B231: what a snapshot of the domain would show empty below real makes
+ * it read live, as a mount on no domain is; *nested says so. The rootfs of
+ * an LXC container on btrfs is often a subvolume with others inside. */
+static status_t nested_below(snap_probe_t *probe, const snap_dom_t *d, const char *real,
+                             sp_session_info_t *info, int *nested)
+{
+    size_t n = 0;
+    char names[1024];
+    *nested = 0;
+    status_t st = snap_probe_below(probe, d, real, &n, names, sizeof(names));
+    if (st != OK || !n) return st;
+    *nested = 1;
+    log_warn("lxc: %s has %zu mount(s) or btrfs subvolume(s) below it (%s%s), which its snapshot would "
+             "show empty; read live instead", real, n, names, n > 3 ? ", ..." : "");
+    if (info)
+        (void)sp_session_info_warn(info, "%.300s has %zu mount(s) or btrfs subvolume(s) below it (%.400s%s), "
+                                   "which its snapshot would show empty: read live (fallback-live)", real, n,
+                                   names, n > 3 ? ", ..." : "");
+    return OK;
+}
+
+static status_t add_tree(struct sp_ctx *c, snap_probe_t *probe, sp_unit_desc_t *d, size_t *cap, const char *id,
+                         const char *src)
 {
     mount_class_t mc;
     status_t st = mount_classify(&c->mounts, "bind", src, NULL, &mc);
@@ -199,6 +221,9 @@ static status_t add_tree(struct sp_ctx *c, sp_unit_desc_t *d, size_t *cap, const
     }
     snap_dom_t dom;
     if ((st = snap_domain_of(&c->snap, mc.real, &dom)) != OK) return st;
+    int nested = 0;
+    if (dom.kind != SNAP_NONE && (st = nested_below(probe, &dom, mc.real, NULL, &nested)) != OK) return st;
+    if (nested) dom.kind = SNAP_NONE;
     return add_item(d, cap, SP_ITEM_TREE, id, mc.recorded, mc.real, 0, dom.kind != SNAP_NONE ? SP_CAP_SNAPSHOT : 0);
 }
 
@@ -218,6 +243,8 @@ static status_t x_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
     d->state = s < 0 ? SP_STATE_UNKNOWN : s;
     d->caps = SP_CAP_PAUSE;
     st = add_item(d, &cap, SP_ITEM_BLOB, "config", ".cbackup-unit/config/lxc/config", NULL, clen, 0);
+    snap_probe_t *probe = NULL;
+    if (st == OK) st = snap_probe_new(&c->snap, c->mounts.mountinfo, &probe);
     char *save = NULL;
     int nmount = 0;
     for (char *l = strtok_r(cfg, "\n", &save); l && st == OK; l = strtok_r(NULL, "\n", &save)) {
@@ -228,16 +255,17 @@ static status_t x_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
         if (strcmp(k, "lxc.rootfs.path") == 0) {
             if (strncmp(v, "dir:", 4) == 0) v += 4;
             if (v[0] != '/' || !helper_path_clean(v)) { st = set_error(ERR_INVALID, "lxc: %s: unsupported rootfs %s", unit_id, v); break; }
-            st = add_tree(c, d, &cap, "rootfs", v);
+            st = add_tree(c, probe, d, &cap, "rootfs", v);
         } else if (strcmp(k, "lxc.mount.entry") == 0) {
             /* <source> <target> <type> <options>: bind sources only. */
             char src[PATH_MAX];
             if (sscanf(v, "%4095s", src) != 1 || src[0] != '/' || !strstr(v, "bind")) continue;
             char id[SP_ITEM_ID_MAX];
             snprintf(id, sizeof(id), "mount:%d", nmount++);
-            st = add_tree(c, d, &cap, id, src);
+            st = add_tree(c, probe, d, &cap, id, src);
         }
     }
+    snap_probe_free(probe);
     free(cfg);
     if (st != OK) { sp_unit_desc_free(d); return st; }
     *out = d;
@@ -291,6 +319,8 @@ static status_t x_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     s->items = calloc(unit->n_items ? unit->n_items : 1, sizeof(*s->items));
     status_t st = s->items ? read_config(c, s->name, &s->config, &s->config_len) : set_error(ERR_NOMEM, "lxc: session");
     size_t fallback = 0;
+    snap_probe_t *probe = NULL;
+    if (st == OK) st = snap_probe_new(&c->snap, c->mounts.mountinfo, &probe);
     for (size_t i = 0; st == OK && i < unit->n_items; i++) {
         const sp_item_desc_t *it = &unit->items[i];
         if (it->kind != SP_ITEM_TREE || !it->source) continue;
@@ -299,9 +329,13 @@ static status_t x_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(x->real, sizeof(x->real), "%s", it->source);
         snap_dom_t d;
         if ((st = snap_domain_of(&c->snap, x->real, &d)) != OK) break;
+        int nested = 0;
+        if (d.kind != SNAP_NONE && (st = nested_below(probe, &d, x->real, &s->info, &nested)) != OK) break;
+        if (nested) d.kind = SNAP_NONE;
         if (d.kind == SNAP_NONE) { x->live = 1; fallback++; continue; }
         st = snap_set_add(&s->snaps, &d);
     }
+    snap_probe_free(probe);
     if (st != OK) { session_free(s); return st; }
     int before = state_of(c, s->name);
     int running = before == SP_STATE_RUNNING;

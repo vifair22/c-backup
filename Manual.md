@@ -3232,6 +3232,25 @@ capture cannot reach that level fails before anything is read, with
 snapshotted, or a `pause = never` unit with more than one snapshot instant,
 needs `--require inconsistent` to be backed up at all.
 
+**When a mount drops to the fallback.** A mount is read from the
+snapshot only when its snapshot holds all of it. It drops to the fallback
+(`fallback-live`, 22.5.6) when it is on no snapshot domain of the helper's
+policy (an array disk, a share split across devices, a dataset or pool the
+policy does not list), and also when anything lies below it that its
+snapshot would show as an empty directory: another filesystem mounted
+inside it (a ZFS child dataset, as `/mnt/cache/domains` has one per VM on
+FS1, a tmpfs, a disk) or a btrfs subvolume inside it (an LXC rootfs on
+btrfs often holds several). Reading such a mount from the snapshot would
+store those directories empty and say nothing (B231); reading it through
+the fallback stores their contents, and the unit's warnings name the mount,
+the first three things below it and how many there are
+(`<mount> has 4 mount(s) or btrfs subvolume(s) below it (...), which its
+snapshot would show empty: read live (fallback-live)`). `mounts.json` in the
+snapshot says the same per mount (`nested`). The level that follows is the
+fallback's (22.5.6): `crash` when the two-pass read finishes inside the
+pause, otherwise `inconsistent`. A pool whose subvolumes cannot be listed
+is not trusted at all: the unit fails rather than guessing.
+
 **Reserved names.** Two top-level names belong to the daemon in every
 snapshot root:
 
@@ -4088,7 +4107,12 @@ finding a member already unpaused, not only by the clock, since the
 watchdog measures from the hold's journal entry, a little before the
 pause. A `pause = never` unit, a stopped unit, and a unit captured in a
 group (22.6.1) read fallback mounts live and are flagged. Remember that
-such a unit needs `--require inconsistent` (22.1).
+such a unit needs `--require inconsistent` (22.1). This applies equally to
+a mount that drops to the fallback because something lies below it (22.1,
+"When a mount drops to the fallback"): never paused, it is read live and
+the unit is `inconsistent`, but its contents are stored, never an empty
+directory. An LXC unit has no second pass: its fallback mounts are read
+live after the freeze and the unit is `inconsistent`.
 
 #### 22.5.7 Exclusions
 
