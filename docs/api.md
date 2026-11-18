@@ -245,7 +245,7 @@ disk (Manual section 6.4 has the numbers measured during a backup).
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/healthz` | Liveness: the process answers; `storage_sync` is `ok` or `failed`, `repos_sync_failed` a count |
-| GET | `/readyz` | Readiness: the database is open and its syncs have not failed (503 if they have); `"status":"degraded"` with `repos_sync_failed` listed when only repositories' have |
+| GET | `/readyz` | Readiness: the database is open and its syncs have not failed (503 if they have); `"status":"degraded"` with `repos_sync_failed` listed when only repositories' have, and with `"state_db_checkpoint":"failing"`, `state_db_checkpoint_error` and `state_db_checkpoint_failing_since` (unix time) while `state.db`'s WAL is not being checkpointed |
 | GET | `/metrics` | Prometheus text exposition |
 | GET | `/api/auth/setup` | Is an admin password configured? |
 

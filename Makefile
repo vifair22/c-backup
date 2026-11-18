@@ -449,6 +449,7 @@ test-cli: all $(FREE_PORT)
 test-units: all
 	@$(SCRATCH_GUARD) test_units_e2e.sh ./$(TESTS)/test_units_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 	@$(SCRATCH_GUARD) test_helper_e2e.sh ./$(TESTS)/test_helper_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/c-backup-helper
+	@$(SCRATCH_GUARD) test_privdrop_e2e.sh ./$(TESTS)/test_privdrop_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 
 # The shell suites each start a daemon and poll jobs on a wall-clock budget,
 # so anything running beside them under -j competes for CPU and disk and makes
@@ -1063,6 +1064,7 @@ coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI) $(FREE_PORT)
 	run test_api_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_api_e2e.sh $(COV_DAEMON); \
 	run test_cli_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI); \
 	run test_units_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_units_e2e.sh $(COV_DAEMON) $(COV_CLI); \
+	run test_privdrop_e2e.sh timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_privdrop_e2e.sh $(COV_DAEMON) $(COV_CLI); \
 	if [ $$over -ne 0 ]; then echo "coverage: a suite went over its scratch budget" >&2; exit 1; fi
 	@gcovr $(GCOVR_FLAGS) -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="

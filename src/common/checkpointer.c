@@ -6,9 +6,10 @@
 #include "db_readers.h"
 #include "thread_name.h"
 #include "walidx.h"
+#include "wal_health.h"
 
-#include <cutils/db.h>
 #include <cutils/log.h>
+#include <sqlite3.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -30,7 +31,8 @@
 int checkpointer_wal_frames(const char *db_path, uint32_t *frames, uint32_t *backfilled)
 {
     walidx_t w;
-    if (walidx_read(db_path, &w) != 0) return -1;
+    int rc = walidx_read(db_path, &w);
+    if (rc != 0) return rc;
     if (frames) *frames = w.frames;
     if (backfilled) *backfilled = w.backfilled;
     return 0;
@@ -48,7 +50,7 @@ static int             g_stop;
 static unsigned        g_interval_ms;
 static uint32_t        g_threshold;
 static char            g_path[PATH_MAX];
-static cutils_db_t    *g_ck;
+static sqlite3        *g_ck;          /* opened by checkpointer_open, before the drop */
 static checkpointer_stats_t g_stats;
 
 static uint64_t now_ns(void)
@@ -77,6 +79,16 @@ void checkpointer_set_test_pause_ms(unsigned ms)
     atomic_store(&g_test_pause_ms, ms);
 }
 
+static void report_sqlite_failure(const char *what, int rc)
+{
+    int ext = sqlite3_extended_errcode(g_ck);
+    pthread_mutex_lock(&g_mu);
+    g_stats.failed++;
+    pthread_mutex_unlock(&g_mu);
+    wal_health_fail(WAL_HEALTH_CHECKPOINT, "%s of %s refused: %s (SQLite code %d, extended %d)",
+                    what, g_path, sqlite3_errmsg(g_ck), rc, ext);
+}
+
 static int passive(uint32_t *left)
 {
     unsigned pause = atomic_load(&g_test_pause_ms);
@@ -84,19 +96,38 @@ static int passive(uint32_t *left)
         struct timespec ts = { (time_t)(pause / 1000), (long)(pause % 1000) * 1000000L };
         nanosleep(&ts, NULL);
     }
-    db_result_t *r = NULL;
-    int rc = db_execute(g_ck, "PRAGMA wal_checkpoint(PASSIVE)", NULL, &r);
-    int ok = rc == 0 && r && r->nrows == 1 && r->ncols >= 3;
-    long long busy = ok ? strtoll(r->rows[0][0], NULL, 10) : 1;
-    long long log  = ok ? strtoll(r->rows[0][1], NULL, 10) : 0;
-    long long done = ok ? strtoll(r->rows[0][2], NULL, 10) : 0;
-    db_result_free(r);
-    if (!ok || busy) {
+    int log = 0, done = 0;
+    /* What was copied before, so the round's own copy can be counted
+     * (B216). A restart in between leaves fewer backfilled frames than
+     * before; then everything copied since counts. */
+    uint32_t b0 = 0;
+    if (checkpointer_wal_frames(g_path, NULL, &b0) != 0) b0 = 0;
+    int rc = sqlite3_wal_checkpoint_v2(g_ck, NULL, SQLITE_CHECKPOINT_PASSIVE, &log, &done);
+    if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
+        /* Not a checkpoint that could not start but one SQLite refused:
+         * SQLITE_READONLY from a connection that could open the database
+         * only read-only, an I/O error. It used to be counted as busy and
+         * retried every tick, silently, for ever (B215). */
+        report_sqlite_failure("PASSIVE checkpoint", rc);
+        return -1;
+    }
+    if (rc != SQLITE_OK) {
         pthread_mutex_lock(&g_mu);
         g_stats.busy++;
         pthread_mutex_unlock(&g_mu);
         return -1;
     }
+    if (log < 0) {
+        /* SQLITE_OK with -1: the connection is not in WAL mode, so nothing
+         * was copied and nothing ever will be. */
+        report_sqlite_failure("PASSIVE checkpoint (the connection is not in WAL mode)", rc);
+        return -1;
+    }
+    wal_health_ok(WAL_HEALTH_CHECKPOINT);
+    uint32_t copied = (uint32_t)done >= b0 ? (uint32_t)done - b0 : (uint32_t)done;
+    pthread_mutex_lock(&g_mu);
+    g_stats.frames_copied += copied;
+    pthread_mutex_unlock(&g_mu);
     *left = log > done ? (uint32_t)(log - done) : 0;
     return 0;
 }
@@ -147,12 +178,10 @@ typedef struct { uint32_t left; int rc; } locked_arg_t;
  */
 static void pre_restart(void)
 {
-    db_result_t *r = NULL;
-    int rc = db_execute(g_ck, "PRAGMA wal_checkpoint(RESTART)", NULL, &r);
-    int reset = rc == 0 && r && r->nrows == 1 && r->ncols >= 3 &&
-                strcmp(r->rows[0][0], "0") == 0;
-    db_result_free(r);
-    if (!reset) {
+    int rc = sqlite3_wal_checkpoint_v2(g_ck, NULL, SQLITE_CHECKPOINT_RESTART, NULL, NULL);
+    if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED)
+        report_sqlite_failure("RESTART checkpoint", rc);
+    if (rc != SQLITE_OK) {
         pthread_mutex_lock(&g_mu);
         g_stats.pre_restart_misses++;
         pthread_mutex_unlock(&g_mu);
@@ -164,13 +193,18 @@ static void pre_restart(void)
     char v[32];
     snprintf(v, sizeof(v), "%lu", g_stats.pre_restarts + g_stats.pre_restart_misses + 1);
     uint64_t t0 = now_ns();
-    rc = db_execute_non_query(g_ck,
+    sqlite3_stmt *st = NULL;
+    rc = sqlite3_prepare_v2(g_ck,
             "INSERT INTO daemon_state (key, value) VALUES ('wal_restart', ?)"
-            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (const char *[]){ v, NULL }, NULL);
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, v, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : sqlite3_errcode(g_ck);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED)
+        report_sqlite_failure("the WAL restart write", rc);
     uint64_t took = now_ns() - t0;
     uint32_t f = 0, b = 0;
-    int restarted = rc == 0 && checkpointer_wal_frames(g_path, &f, &b) == 0 && f <= 8;
+    int restarted = rc == SQLITE_OK && checkpointer_wal_frames(g_path, &f, &b) == 0 && f <= 8;
     pthread_mutex_lock(&g_mu);
     if (restarted) {
         g_stats.pre_restarts++;
@@ -204,8 +238,14 @@ status_t checkpointer_force(void)
 {
     if (!g_ck) return set_error(ERR_INVALID, "checkpointer_force: not running");
     locked_arg_t a = { 0, -1 };
+    uint64_t t0 = now_ns();
     status_t st = db_txn_exclusive(locked_passive, &a);
     if (st != OK) return st;
+    uint64_t held = now_ns() - t0;
+    pthread_mutex_lock(&g_mu);
+    g_stats.forced++;
+    g_stats.lock_ns += held;
+    pthread_mutex_unlock(&g_mu);
     return a.rc == 0 ? OK : set_error(ERR_BUSY, "checkpointer_force: the copy did not complete");
 }
 
@@ -213,7 +253,21 @@ static void tick(void)
 {
     if (atomic_load(&g_test_idle)) return;
     uint32_t frames = 0, backfilled = 0;
-    if (checkpointer_wal_frames(g_path, &frames, &backfilled) != 0) return;
+    int wrc = checkpointer_wal_frames(g_path, &frames, &backfilled);
+    if (wrc == -2) {
+        /* -shm is there and this process cannot read it: without the
+         * header the thread never sees the WAL grow, so it would never
+         * checkpoint at all (B215). */
+        int e = errno;
+        pthread_mutex_lock(&g_mu);
+        g_stats.failed++;
+        pthread_mutex_unlock(&g_mu);
+        wal_health_fail(WAL_HEALTH_WALIDX, "cannot read %s-shm: %s (errno %d)", g_path,
+                        strerror(e), e);
+        return;
+    }
+    if (wrc != 0) return;
+    wal_health_ok(WAL_HEALTH_WALIDX);
     pthread_mutex_lock(&g_mu);
     g_stats.ticks++;
     if (frames > g_stats.max_wal_frames) g_stats.max_wal_frames = frames;
@@ -274,6 +328,8 @@ locked:;
     pthread_mutex_lock(&g_mu);
     if (a.rc == 0) g_stats.escalations++;
     if (held > g_stats.max_lock_ns) g_stats.max_lock_ns = held;
+    g_stats.forced++;
+    g_stats.lock_ns += held;
     pthread_mutex_unlock(&g_mu);
     /* A copy that could not complete under the lock (a reader holding an
      * old snapshot) cannot be helped by holding writers back: let them
@@ -330,18 +386,24 @@ void checkpointer_throttle(void)
     pthread_cond_signal(&g_cv);
     pthread_mutex_unlock(&g_mu);
     uint64_t t0 = now;
+    int timed_out = 0;
     for (;;) {
         struct timespec ts = { 0, 2 * 1000000L };
         nanosleep(&ts, NULL);
         uint64_t t = now_ns();
         if (!atomic_load(&g_active) || t < atomic_load(&g_blocked_until_ns) ||
-            t - t0 > CKPT_THROTTLE_MAX_NS) break;
+            t - t0 > CKPT_THROTTLE_MAX_NS) {
+            timed_out = t - t0 > CKPT_THROTTLE_MAX_NS;
+            break;
+        }
         if (checkpointer_wal_frames(g_path, &f, &b) != 0 || f <= hard || f == b) break;
     }
     uint64_t waited = now_ns() - t0;
     pthread_mutex_lock(&g_mu);
     g_stats.throttled++;
     if (waited > g_stats.max_throttle_ns) g_stats.max_throttle_ns = waited;
+    g_stats.throttle_ns += waited;
+    if (timed_out) g_stats.throttle_timeouts++;
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -366,6 +428,77 @@ static void *main_loop(void *arg)
     return NULL;
 }
 
+/*
+ * Its own connection: a checkpoint on the shared handle would hold that
+ * handle's mutex, and every statement in the daemon, for the copy. Short
+ * busy timeout, no automatic checkpoint of its own, and the daemon's sync
+ * level, under which a checkpoint syncs the WAL before copying and the
+ * database after.
+ *
+ * A raw SQLite handle rather than a c-utils one, for the result codes: a
+ * refused checkpoint has to be told apart from a busy one and reported
+ * with its code (B215).
+ *
+ * Read-write or not at all. SQLite falls back to a read-only open, without
+ * an error, when the file cannot be opened for writing, and every
+ * checkpoint on such a connection fails with SQLITE_READONLY. That was
+ * B215: the daemon opened this connection after dropping to its run_as uid,
+ * state.db was root's (AppGuard creates it before the drop), and the WAL
+ * grew without bound while nothing said a word. Under g_mu.
+ */
+static status_t open_locked(const char *db_path)
+{
+    if (g_ck) {
+        if (strcmp(g_path, db_path) == 0) return OK;
+        return set_error(ERR_BUSY, "state.db checkpointer already open on %s", g_path);
+    }
+    if (snprintf(g_path, sizeof(g_path), "%s", db_path) >= (int)sizeof(g_path))
+        return set_error(ERR_INVALID, "state.db path too long");
+    sqlite3 *h = NULL;
+    int rc = sqlite3_open_v2(db_path, &h, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL);
+    if (rc != SQLITE_OK) {
+        status_t st = set_error(ERR_IO, "state.db: cannot open the checkpoint connection to %s: "
+                                "%s (SQLite code %d)", db_path,
+                                h ? sqlite3_errmsg(h) : sqlite3_errstr(rc), rc);
+        sqlite3_close(h);
+        wal_health_fail(WAL_HEALTH_CHECKPOINT, "%s", err_msg());
+        return st;
+    }
+    if (sqlite3_db_readonly(h, "main") == 1) {
+        sqlite3_close(h);
+        status_t st = set_error(ERR_IO, "state.db: the checkpoint connection could open %s "
+                                "only read-only (uid %u cannot write it), so the WAL would "
+                                "never be copied back; give the file to the daemon's uid",
+                                db_path, (unsigned)geteuid());
+        wal_health_fail(WAL_HEALTH_CHECKPOINT, "%s", err_msg());
+        return st;
+    }
+    /* journal_mode=WAL also reads the database, which is what attaches the
+     * connection to the WAL: until then a checkpoint on it succeeds with
+     * -1 frames and copies nothing. */
+    char pragmas[128];
+    snprintf(pragmas, sizeof(pragmas), "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=%d; "
+             "PRAGMA wal_autocheckpoint=0;", CKPT_BUSY_MS);
+    rc = sqlite3_exec(h, pragmas, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        status_t st = set_error(ERR_IO, "state.db: cannot set up the checkpoint connection: "
+                                "%s (SQLite code %d)", sqlite3_errmsg(h), rc);
+        sqlite3_close(h);
+        return st;
+    }
+    g_ck = h;
+    return OK;
+}
+
+status_t checkpointer_open(const char *db_path)
+{
+    if (!db_path || !*db_path) return set_error(ERR_INVALID, "checkpointer_open: no path");
+    pthread_mutex_lock(&g_mu);
+    status_t st = open_locked(db_path);
+    pthread_mutex_unlock(&g_mu);
+    return st;
+}
+
 status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned interval_ms)
 {
     if (!db_path || !*db_path || threshold_pages <= 0 || interval_ms == 0)
@@ -375,25 +508,9 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
         pthread_mutex_unlock(&g_mu);
         return set_error(ERR_BUSY, "state.db checkpointer already running");
     }
-    if (snprintf(g_path, sizeof(g_path), "%s", db_path) >= (int)sizeof(g_path)) {
+    if (open_locked(db_path) != OK) {
         pthread_mutex_unlock(&g_mu);
-        return set_error(ERR_INVALID, "state.db path too long");
-    }
-    /*
-     * Its own connection: a checkpoint on the shared handle would hold
-     * that handle's mutex, and every statement in the daemon, for the copy.
-     * Short busy timeout, no automatic checkpoint of its own, and the
-     * daemon's sync level, under which a checkpoint syncs the WAL before
-     * copying and the database after.
-     */
-    char pragmas[96];
-    snprintf(pragmas, sizeof(pragmas), "PRAGMA busy_timeout=%d; PRAGMA wal_autocheckpoint=0;",
-             CKPT_BUSY_MS);
-    if (db_open(&g_ck, db_path) != 0 || db_exec_raw(g_ck, pragmas) != 0) {
-        if (g_ck) db_close(g_ck);
-        g_ck = NULL;
-        pthread_mutex_unlock(&g_mu);
-        return set_error(ERR_IO, "cannot open a checkpoint connection to %s", db_path);
+        return ERR_IO;
     }
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
@@ -406,7 +523,7 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
     memset(&g_stats, 0, sizeof(g_stats));
     if (pthread_create(&g_th, NULL, main_loop, NULL) != 0) {
         pthread_cond_destroy(&g_cv);
-        db_close(g_ck);
+        sqlite3_close(g_ck);
         g_ck = NULL;
         pthread_mutex_unlock(&g_mu);
         return set_error(ERR_IO, "cannot start the state.db checkpointer");
@@ -421,7 +538,14 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
 void checkpointer_stop(void)
 {
     pthread_mutex_lock(&g_mu);
-    if (!g_running) { pthread_mutex_unlock(&g_mu); return; }
+    if (!g_running) {
+        /* Opened before the drop and never started: a startup that failed
+         * in between. */
+        if (g_ck) sqlite3_close(g_ck);
+        g_ck = NULL;
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
     atomic_store(&g_active, 0);
     g_stop = 1;
     pthread_cond_signal(&g_cv);
@@ -429,7 +553,7 @@ void checkpointer_stop(void)
     pthread_join(g_th, NULL);
     pthread_mutex_lock(&g_mu);
     pthread_cond_destroy(&g_cv);
-    db_close(g_ck);
+    sqlite3_close(g_ck);
     g_ck = NULL;
     g_running = 0;
     pthread_mutex_unlock(&g_mu);
