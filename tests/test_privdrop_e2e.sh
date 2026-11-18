@@ -27,6 +27,9 @@ export C_BACKUP_TXN_GUARD=abort
 TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
 mkdir -p "$TEST_ROOT"
 THRESHOLD=1000
+# journal_size_limit: the WAL file is trimmed to this at the first commit
+# after a restart (4 x the threshold, 4 KiB pages; checkpointer.h).
+LIMIT=$((THRESHOLD * 4 * 4096))
 
 cap_bnd_has() {   # cap_bnd_has <bit>: in this process's bounding set
     local hex
@@ -98,7 +101,7 @@ mkdir -p "$WORK/state" "$WORK/run" "$WORK/repo" "$WORK/src"
 chown 990:990 "$WORK/state" "$WORK/run" "$WORK/repo"
 chmod 0700 "$WORK/state"
 chmod 0755 "$WORK"
-for d in $(seq 1 15); do
+for d in $(seq 1 30); do
     mkdir -p "$WORK/src/d$d"
     for f in $(seq 1 200); do printf '%s %s %s\n' "$d" "$f" "$RANDOM" > "$WORK/src/d$d/f$f"; done
 done
@@ -116,13 +119,47 @@ security:
 EOF
 chmod 600 "$WORK/c.yaml"
 
-C_BACKUP_CONFIG_PATH="$WORK/c.yaml" "$DAEMON" > "$WORK/d.log" 2>&1 &
-DAEMON_PID=$!
-for _ in $(seq 100); do
-    [ -S "$SOCK" ] && break
-    kill -0 "$DAEMON_PID" 2>/dev/null || break
-    sleep 0.1
-done
+start_daemon() {
+    C_BACKUP_CONFIG_PATH="$WORK/c.yaml" "$DAEMON" >> "$WORK/d.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 100); do
+        [ -S "$SOCK" ] && break
+        kill -0 "$DAEMON_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+}
+stop_daemon() {
+    kill "$DAEMON_PID"
+    wait "$DAEMON_PID"
+    local rc=$?
+    DAEMON_PID=
+    return $rc
+}
+# Changed files, then a backup, n times.
+backups() {
+    local i OUT
+    for i in $(seq 1 "$1"); do
+        find "$WORK/src" -type f -name 'f1*' -exec sh -c 'echo "$RANDOM" >> "$1"' _ {} \;
+        OUT=$(cb backup 1 "$WORK/src" 2>&1)
+        contains "$2: backup $i completes" '"state":"completed"' "$OUT"
+    done
+}
+# Until state.db is past $1 bytes and the WAL has restarted below the
+# threshold, ten seconds at most; then say where they are.
+wait_backfilled() {
+    local db f
+    for _ in $(seq 100); do
+        db=$(stat -c %s "$WORK/state/state.db")
+        f=$(shm_u32 16)
+        [ "$db" -gt "$1" ] && [ "${f:-0}" -lt "$THRESHOLD" ] && break
+        sleep 0.1
+    done
+    DB=$(stat -c %s "$WORK/state/state.db")
+    F=$(shm_u32 16)
+    echo "  state.db $DB bytes, WAL at $F frames ($(shm_u32 96) copied), file $(stat -c %s "$WORK/state/state.db-wal") bytes"
+}
+
+start_daemon
 if grep -q "CAP_DAC_READ_SEARCH is not available" "$WORK/d.log"; then
     echo "privilege drop e2e: skipped (CAP_DAC_READ_SEARCH is not available to keep here)"
     exit 0
@@ -139,22 +176,8 @@ check    "and so is its -shm" "0" "$(stat -c %u "$WORK/state/state.db-shm")"
 
 echo "the WAL is checkpointed after the drop"
 check "repo add" '{"id":1}' "$(cb repo add "$WORK/repo" main)"
-for i in 1 2; do
-    find "$WORK/src" -type f -name 'f1*' -exec sh -c 'echo "$RANDOM" >> "$1"' _ {} \;
-    OUT=$(cb backup 1 "$WORK/src" 2>&1)
-    contains "backup $i completes" '"state":"completed"' "$OUT"
-done
-MAX_SEEN=0
-for _ in $(seq 100); do
-    F=$(shm_u32 16)
-    [ "${F:-0}" -gt "$MAX_SEEN" ] && MAX_SEEN=$F
-    DB=$(stat -c %s "$WORK/state/state.db")
-    [ "$DB" -gt 1048576 ] && [ "${F:-0}" -lt "$THRESHOLD" ] && break
-    sleep 0.1
-done
-DB=$(stat -c %s "$WORK/state/state.db")
-F=$(shm_u32 16)
-echo "  state.db $DB bytes, WAL at $F frames ($(shm_u32 96) copied)"
+backups 2 "first run"
+wait_backfilled 1048576
 check "state.db was written back (it stayed 4096 bytes in B215)" "yes" \
       "$([ "$DB" -gt 1048576 ] && echo yes || echo "no: $DB bytes")"
 check "the WAL restarted below the threshold" "yes" \
@@ -162,6 +185,47 @@ check "the WAL restarted below the threshold" "yes" \
 contains "/readyz is ready" '"status":"ready"' "$(get /readyz)"
 check    "no checkpoint failures counted" "0" "$(metric cbackup_checkpoint_failures_total)"
 check    "and none in progress" "0" "$(metric cbackup_checkpoint_failing)"
+
+# Every path that could replace -wal or -shm while the daemon runs keeps the
+# file instead (checkpointer.h): a restart rewrites the header in place, the
+# trim to journal_size_limit is an ftruncate, a RESTART checkpoint writes
+# only the header. Were one to create a new file, it would be created by
+# uid 990 for connections that hold the old one, or be root's and unwritable
+# by any connection opened after the drop. So: the WAL grows past the limit,
+# is checkpointed, restarted and trimmed back under it, and is the same file
+# throughout, still root's, with nothing failing.
+echo "the WAL is trimmed in place, never recreated"
+WAL="$WORK/state/state.db-wal"
+WAL_INO=$(stat -c %i "$WAL")
+SHM_INO=$(stat -c %i "$WORK/state/state.db-shm")
+DB0=$(stat -c %s "$WORK/state/state.db")
+echo 0 > "$WORK/walpeak"
+( peak=0
+  while :; do
+      sz=$(stat -c %s "$WAL" 2>/dev/null || echo 0)
+      [ "$sz" -gt "$peak" ] && { peak=$sz; echo "$peak" > "$WORK/walpeak"; }
+      sleep 0.005
+  done ) &
+PEAK_PID=$!
+backups 3 "trim"
+kill "$PEAK_PID"; wait "$PEAK_PID" 2>/dev/null
+PEAK=$(cat "$WORK/walpeak")
+for _ in $(seq 100); do
+    [ "$(stat -c %s "$WAL")" -le "$LIMIT" ] && [ "$(shm_u32 16)" -lt "$THRESHOLD" ] && break
+    sleep 0.1
+done
+wait_backfilled "$DB0"
+check "the WAL file grew past journal_size_limit" "yes" \
+      "$([ "$PEAK" -gt "$LIMIT" ] && echo yes || echo "no: peak $PEAK, limit $LIMIT")"
+check "and was trimmed back to it" "yes" \
+      "$([ "$(stat -c %s "$WAL")" -le "$LIMIT" ] && echo yes || echo "no: $(stat -c %s "$WAL") bytes")"
+check "state.db took the new frames" "yes" "$([ "$DB" -gt "$DB0" ] && echo yes || echo "no: $DB0 -> $DB")"
+check "the WAL restarted below the threshold" "yes" \
+      "$([ "${F:-99999}" -lt "$THRESHOLD" ] && echo yes || echo "no: $F frames")"
+check "-wal is the same file" "$WAL_INO" "$(stat -c %i "$WAL")"
+check "-shm is the same file" "$SHM_INO" "$(stat -c %i "$WORK/state/state.db-shm")"
+check "-wal is still root's" "0" "$(stat -c %u "$WAL")"
+check "no checkpoint failures counted" "0" "$(metric cbackup_checkpoint_failures_total)"
 
 echo "a WAL index the daemon cannot read is loud"
 # A symlink loop in place of -shm fails the daemon's open of it the way a
@@ -201,10 +265,32 @@ contains "put back, /readyz is ready again" '"status":"ready"' "$R"
 check    "nothing in progress" "0" "$(metric cbackup_checkpoint_failing)"
 contains "and the log says it recovered" "wal-index reader recovered" "$(cat "$WORK/d.log")"
 
-kill "$DAEMON_PID"
-wait "$DAEMON_PID"
+stop_daemon
 check "the daemon stops cleanly" "0" "$?"
-DAEMON_PID=
+
+# The other way -wal and -shm are made anew: the last connection closing
+# deletes them, which is shutdown, and the next start creates them again
+# as root, before the drop, on a state.db that is root's from the first
+# start. Everything is opened before the drop again, so checkpoints work
+# exactly as on a fresh start.
+echo "a restart on root-owned state files"
+check "state.db stayed root's" "0" "$(stat -c %u "$WORK/state/state.db")"
+check "the clean stop removed the WAL" "no" "$([ -e "$WAL" ] && echo yes || echo no)"
+DB0=$(stat -c %s "$WORK/state/state.db")
+start_daemon
+check    "the daemon is listening again" "yes" "$([ -S "$SOCK" ] && echo yes || echo no)"
+check    "it dropped to uid 990 again" "2" "$(grep -c "running as uid 990" "$WORK/d.log")"
+check    "the new -wal is root's" "0" "$(stat -c %u "$WAL" 2>/dev/null || echo missing)"
+check    "the new -shm is root's" "0" "$(stat -c %u "$WORK/state/state.db-shm" 2>/dev/null || echo missing)"
+backups 2 "after the restart"
+wait_backfilled "$DB0"
+check "state.db took the new frames" "yes" "$([ "$DB" -gt "$DB0" ] && echo yes || echo "no: $DB0 -> $DB")"
+check "the WAL restarted below the threshold" "yes" \
+      "$([ "${F:-99999}" -lt "$THRESHOLD" ] && echo yes || echo "no: $F frames")"
+contains "/readyz is ready" '"status":"ready"' "$(get /readyz)"
+check    "no checkpoint failures counted" "0" "$(metric cbackup_checkpoint_failures_total)"
+stop_daemon
+check "the restarted daemon stops cleanly" "0" "$?"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
