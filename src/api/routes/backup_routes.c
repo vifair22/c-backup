@@ -329,6 +329,8 @@ static char *file_backup_databases(backup_job_t *j, db_detector_t *d, int64_t sn
         log_warn("backup: database detection skipped: %s", err_msg());
         err_clear();
     } else {
+        /* An engine copy made is what covers its database (14.5, B242). */
+        db_captures_judge(keep ? keep->caps : NULL, f);
         db_detect_count_uncovered(f);
         db_record_result_t rr;
         memset(&rr, 0, sizeof(rr));
