@@ -14,7 +14,7 @@
  * rather than a backup.
  */
 
-import type { ApiRequest } from '../shared/api'
+import type { ApiRequest, UnitRestore } from '../shared/api'
 
 export interface Endpoint {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE'
@@ -47,6 +47,30 @@ function qs(params: Record<string, string | number | boolean | undefined>): stri
  */
 function unhandled(req: never): never {
   throw new Error(`unhandled request: ${JSON.stringify(req)}`)
+}
+
+/*
+ * The body `c-backup unit restore` sends for each mode: an item always as
+ * raw (the only format this build writes), and the define options only
+ * when set, so an absent one is the daemon's default rather than false.
+ */
+export function unitRestoreBody(r: UnitRestore): Record<string, unknown> {
+  switch (r.mode) {
+    case 'files':
+      return r.overwrite ? { mode: 'files', dest: r.dest, overwrite: true } : { mode: 'files', dest: r.dest }
+    case 'item':
+      return { mode: 'item', format: 'raw', item: r.item, dest: r.dest }
+    case 'unit': {
+      const b: Record<string, unknown> = { mode: 'unit' }
+      if (r.name) b.name = r.name
+      if (r.targetRoot) b.target_root = r.targetRoot
+      if (r.replace) b.replace = true
+      if (r.pinDigest) b.pin_digest = true
+      if (r.start) b.start = true
+      if (r.keepMacs) b.keep_macs = true
+      return b
+    }
+  }
 }
 
 export function toEndpoint(req: ApiRequest): Endpoint {
@@ -336,6 +360,27 @@ export function toEndpoint(req: ApiRequest): Endpoint {
           ...(req.pauseScope ? { pause_scope: req.pauseScope } : {}),
         },
       }
+
+    case 'unitRestore':
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/snapshots/${req.snapshotId}/unit/restore`,
+        body: unitRestoreBody(req.restore),
+      }
+
+    /* --- NBD exports --- */
+    case 'exportCreate':
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/snapshots/${req.snapshotId}/unit/export`,
+        body: req.ttlS === undefined ? { item: req.item } : { item: req.item, ttl_s: req.ttlS },
+      }
+    case 'exportList':
+      return { method: 'GET', path: '/exports' }
+    case 'exportShow':
+      return { method: 'GET', path: `/exports/${req.exportId}` }
+    case 'exportRevoke':
+      return { method: 'DELETE', path: `/exports/${req.exportId}` }
 
     /* --- schedules --- */
     case 'scheduleList':
