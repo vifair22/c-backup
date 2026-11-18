@@ -160,6 +160,55 @@ static void remap_docker(cJSON *inspect, const tree_t *t, size_t n)
         char to[PATH_MAX * 2];
         if (cJSON_IsString(s) && remap(t, n, s->valuestring, to, sizeof(to))) cJSON_SetValuestring(s, to);
     }
+    /*
+     * Volumes, named and anonymous (B188). A volume is named in Binds
+     * ("name:/dst") or HostConfig.Mounts, or not at all (an anonymous one,
+     * from the image's VOLUME), and the copy re-created from that kept the
+     * original's volume or got an empty new one. Its data was backed up
+     * from where the volume lives (the inspect's Mounts[].Source), which
+     * the restore wrote under target_root: the copy binds that instead.
+     * A volume with no restored copy (a remote driver's, excluded) is left
+     * as recorded, and the helper refuses the define over it.
+     */
+    if (!cJSON_IsObject(hc)) return;
+    cJSON *binds = cJSON_GetObjectItemCaseSensitive(hc, "Binds");
+    if (!cJSON_IsArray(binds)) {
+        cJSON_DeleteItemFromObjectCaseSensitive(hc, "Binds");
+        binds = cJSON_AddArrayToObject(hc, "Binds");
+        if (!binds) return;
+    }
+    cJSON_ArrayForEach(m, cJSON_GetObjectItemCaseSensitive(inspect, "Mounts")) {
+        const char *type = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "Type"));
+        const char *name = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "Name"));
+        const char *src = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "Source"));
+        const char *dst = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "Destination"));
+        char to[PATH_MAX * 2];
+        if (!type || strcmp(type, "volume") != 0 || !src || !dst || !remap(t, n, src, to, sizeof(to))) continue;
+        /* Whatever named this volume or its destination goes. */
+        for (int i = cJSON_GetArraySize(binds); i-- > 0;) {
+            const char *v = cJSON_GetStringValue(cJSON_GetArrayItem(binds, i));
+            if (!v) continue;
+            size_t sl = strcspn(v, ":");
+            const char *d = v[sl] ? v + sl + 1 : "";
+            size_t dl = strcspn(d, ":");
+            if ((name && strlen(name) == sl && strncmp(v, name, sl) == 0) || (strlen(dst) == dl && strncmp(d, dst, dl) == 0))
+                cJSON_DeleteItemFromArray(binds, i);
+        }
+        cJSON *hm = cJSON_GetObjectItemCaseSensitive(hc, "Mounts");
+        for (int i = cJSON_GetArraySize(hm); i-- > 0;) {
+            const cJSON *x = cJSON_GetArrayItem(hm, i);
+            const char *xt = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(x, "Target"));
+            const char *xs = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(x, "Source"));
+            if ((xt && strcmp(xt, dst) == 0) || (xs && name && strcmp(xs, name) == 0)) cJSON_DeleteItemFromArray(hm, i);
+        }
+        int ro = cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(m, "RW"));
+        size_t need = strlen(to) + strlen(dst) + 6;
+        char *nv = malloc(need);
+        if (!nv) continue;
+        snprintf(nv, need, "%s:%s%s", to, dst, ro ? ":ro" : "");
+        cJSON_AddItemToArray(binds, cJSON_CreateString(nv));
+        free(nv);
+    }
 }
 
 static status_t sealed_memfd(const char *text, int *out)
@@ -245,18 +294,27 @@ static status_t compose_definition(store_t *store, cutils_db_t *db, int64_t repo
         } else {
             err_clear();
         }
+        /* Every mount the service had, bind or volume, named or anonymous,
+         * onto its restored copy (B188). These come from the recorded
+         * Mounts, not HostConfig.Binds: compose gives long-syntax binds
+         * and every volume through HostConfig.Mounts, and the copy kept
+         * those on the original's paths and volumes. One with no restored
+         * copy is left out, and the helper refuses the define over it. */
         cJSON *vols = cJSON_AddArrayToObject(o, "volumes");
-        const cJSON *b;
-        cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(in, "HostConfig"), "Binds")) {
-            const char *v = cJSON_GetStringValue(b);
-            if (!new_name || !v || v[0] != '/' || !vols) continue;
-            size_t sl = strcspn(v, ":");
-            char src[PATH_MAX], to[PATH_MAX * 2], full[PATH_MAX * 3];
-            snprintf(src, sizeof(src), "%.*s", (int)sl, v);
-            if (!remap(t, n, src, to, sizeof(to))) continue;
-            snprintf(full, sizeof(full), "%s%s", to, v + sl);
+        const cJSON *mt;
+        cJSON_ArrayForEach(mt, cJSON_GetObjectItemCaseSensitive(in, "Mounts")) {
+            const char *type = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(mt, "Type"));
+            const char *src = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(mt, "Source"));
+            const char *dst = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(mt, "Destination"));
+            char to[PATH_MAX * 2], full[PATH_MAX * 3];
+            if (!new_name || !vols || !type || (strcmp(type, "volume") != 0 && strcmp(type, "bind") != 0) ||
+                !src || !dst || !remap(t, n, src, to, sizeof(to))) continue;
+            snprintf(full, sizeof(full), "%s:%s%s", to, dst,
+                     cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(mt, "RW")) ? ":ro" : "");
             cJSON_AddItemToArray(vols, cJSON_CreateString(full));
         }
+        const cJSON *rec = cJSON_GetObjectItemCaseSensitive(in, "Mounts");
+        if (new_name && cJSON_IsArray(rec)) cJSON_AddItemToObject(o, "mounts", cJSON_Duplicate(rec, 1));
         cJSON_Delete(in);
     }
     db_result_free(r);
@@ -289,6 +347,7 @@ static status_t build_definition(store_t *store, cutils_db_t *db, int64_t repo_i
         if (st == OK) {
             if (new_name) remap_docker(in, t, n);
             cJSON_AddItemToObject(d, "inspect", in);
+            if (new_name) cJSON_AddStringToObject(d, "target_root", o->target_root);
             snprintf(rel, sizeof(rel), ".cbackup-unit/config/containers/%s/image.json", unit);
             if (unit_read_file(store, db, repo_id, snap_id, rel, DEF_FILE_MAX, &data, &len) == OK) {
                 cJSON *im = cJSON_ParseWithLength(data, len);

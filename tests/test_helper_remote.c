@@ -27,6 +27,9 @@
 #include <stdatomic.h>
 
 #include "helper_fixture.h"
+
+#define CUTILS_CJSON_ALLOW
+#include "cJSON.h"
 #include "registry.h"
 #include "remote_provider.h"
 #include "repo.h"
@@ -748,7 +751,11 @@ static void test_compose_definition(void **state)
     static const char inspect[] =
         "{\"Name\":\"/web-db\",\"Config\":{\"Labels\":{\"com.docker.compose.service\":\"db\","
         "\"com.docker.compose.project.working_dir\":\"" HF_POOL "/proj\"}},"
-        "\"HostConfig\":{\"Binds\":[\"" HF_MOUNT "/pg:/var/lib/pg:rw\",\"/etc/localtime:/etc/localtime:ro\"]}}";
+        "\"HostConfig\":{\"Binds\":[\"" HF_MOUNT "/pg:/var/lib/pg:rw\",\"/etc/localtime:/etc/localtime:ro\"]},"
+        "\"Mounts\":[{\"Type\":\"bind\",\"Source\":\"" HF_MOUNT "/pg\",\"Destination\":\"/var/lib/pg\",\"RW\":true},"
+        "{\"Type\":\"bind\",\"Source\":\"/etc/localtime\",\"Destination\":\"/etc/localtime\",\"RW\":false},"
+        "{\"Type\":\"volume\",\"Name\":\"pgwal\",\"Source\":\"" HF_MOUNT "/v/pgwal/_data\",\"Destination\":\"/wal\",\"RW\":true},"
+        "{\"Type\":\"volume\",\"Name\":\"0f3c9a\",\"Source\":\"" HF_MOUNT "/v/0f3c9a/_data\",\"Destination\":\"/anon\",\"RW\":false}]}";
     static const char image[] = "{\"RepoDigests\":[\"postgres@sha256:feed\"],\"RepoTags\":[\"postgres:16\"]}";
     assert_int_equal(fake_blob_add(fk, "u1", "c1", ".cbackup-unit/config/compose/compose.yaml", "services: {}\n", 13), OK);
     assert_int_equal(fake_blob_add(fk, "u1", "c2", ".cbackup-unit/config/compose/.env", "A=1\n", 4), OK);
@@ -771,10 +778,58 @@ static void test_compose_definition(void **state)
     assert_non_null(strstr(txt, "\"working_dir\":\"" HF_POOL "/proj\""));
     assert_non_null(strstr(txt, "\"service\":\"db\""));
     assert_non_null(strstr(txt, "postgres@sha256:feed"));
-    assert_non_null(strstr(txt, "/restore" HF_MOUNT "/pg:/var/lib/pg:rw"));
+    assert_non_null(strstr(txt, "\"/restore" HF_MOUNT "/pg:/var/lib/pg\""));
     assert_null(strstr(txt, "/restore/etc/localtime"));     /* in no tree: not remapped */
     assert_non_null(strstr(txt, "\"target_root\":\"/restore\""));
+    /* B188: the named and the anonymous volume onto their restored copies,
+     * and the recorded mounts passed for the helper to check against. */
+    assert_non_null(strstr(txt, "\"/restore" HF_MOUNT "/v/pgwal/_data:/wal\""));
+    assert_non_null(strstr(txt, "\"/restore" HF_MOUNT "/v/0f3c9a/_data:/anon:ro\""));
+    assert_non_null(strstr(txt, "\"mounts\":[{\"Type\":\"bind\""));
     free(txt);
+}
+
+/* A standalone container's definition under a new name (B188): every bind
+ * and volume, named in Binds or HostConfig.Mounts or anonymous, rewritten
+ * onto its restored copy under the target root, so nothing the copy is
+ * created with names the original's data. */
+static void test_docker_copy_definition(void **state)
+{
+    (void)state;
+    static const char inspect[] =
+        "{\"Name\":\"/solo\",\"Config\":{\"Image\":\"x\",\"Volumes\":{\"/anon\":{}}},"
+        "\"HostConfig\":{\"Binds\":[\"" HF_MOUNT "/www:/www:rw\",\"pgwal:/wal\"],"
+        "\"Mounts\":[{\"Type\":\"volume\",\"Source\":\"logs\",\"Target\":\"/logs\"}]},"
+        "\"Mounts\":[{\"Type\":\"bind\",\"Source\":\"" HF_MOUNT "/www\",\"Destination\":\"/www\",\"RW\":true},"
+        "{\"Type\":\"volume\",\"Name\":\"pgwal\",\"Source\":\"" HF_MOUNT "/v/pgwal/_data\",\"Destination\":\"/wal\",\"RW\":true},"
+        "{\"Type\":\"volume\",\"Name\":\"logs\",\"Source\":\"" HF_MOUNT "/v/logs/_data\",\"Destination\":\"/logs\",\"RW\":true},"
+        "{\"Type\":\"volume\",\"Name\":\"0f3c9a\",\"Source\":\"" HF_MOUNT "/v/0f3c9a/_data\",\"Destination\":\"/anon\",\"RW\":true}]}";
+    assert_int_equal(fake_blob_add(fk, "u1", "s1", ".cbackup-unit/config/containers/solo/inspect.json",
+                                   inspect, strlen(inspect)), OK);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.name = "solocopy";
+    o.target_root = "/restore";
+    char *txt = NULL;
+    assert_int_equal(unit_define_build(store, db, repo_id, snap, "docker", "solo", &o, &txt), OK);
+    cJSON *d = cJSON_Parse(txt);
+    free(txt);
+    assert_non_null(d);
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(d, "target_root")), "/restore");
+    const cJSON *hc = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(d, "inspect"), "HostConfig");
+    char *b = cJSON_PrintUnformatted(cJSON_GetObjectItemCaseSensitive(hc, "Binds"));
+    assert_non_null(b);
+    assert_string_equal(b, "[\"/restore" HF_MOUNT "/www:/www:rw\","
+                           "\"/restore" HF_MOUNT "/v/pgwal/_data:/wal\","
+                           "\"/restore" HF_MOUNT "/v/logs/_data:/logs\","
+                           "\"/restore" HF_MOUNT "/v/0f3c9a/_data:/anon\"]");
+    free(b);
+    assert_int_equal(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(hc, "Mounts")), 0);
+    cJSON_Delete(d);
 }
 
 /* pause_scope job through the helper: one capture for both units, each
@@ -995,6 +1050,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_id_mismatch_said_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_bytes_over_mounts, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_compose_definition, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_docker_copy_definition, setup, teardown),
         cmocka_unit_test_setup_teardown(test_group_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),

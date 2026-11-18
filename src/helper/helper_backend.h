@@ -68,6 +68,11 @@ typedef struct helper_backend {
      * hypervisor no longer has it. *result says whether it was present,
      * redefined, or refused and dropped. NULL: no checkpoints. */
     status_t (*redefine)(sp_ctx_t *c, const char *unit_id, const char *checkpoint, cJSON **result);
+    /* unit.define's check (B167): every refusal define would make, with
+     * no change made anywhere, so a restore is refused before it writes.
+     * NULL: the provider refuses only in define itself. */
+    status_t (*define_check)(sp_ctx_t *c, const char *unit_id, const char *definition,
+                             const helper_policy_t *pol);
 } helper_backend_t;
 
 /* The fake provider as a backend, over ctx. */

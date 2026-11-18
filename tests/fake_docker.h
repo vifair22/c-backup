@@ -44,6 +44,9 @@ typedef struct {
     int  lose_pause;           /* a pause is undone at once, as a watchdog's unpause would */
     char pulled[512];          /* the last fromImage */
     char created_body[8192];   /* the last create body */
+    char volumes[1024];        /* GET /volumes's Volumes array; "" is [] */
+    char create_mounts[1024];  /* Mounts of a created container; "" derives them from its Binds */
+    int  deletes;              /* containers removed */
 } fake_docker_t;
 
 static void fake_docker_add(fake_docker_t *f, const char *id, const char *name, const char *state,
@@ -113,13 +116,45 @@ static void fd_serve(fake_docker_t *f, int fd)
         snprintf(f->pulled, sizeof(f->pulled), "%s", p + 25);
         if (f->digest_gone && strstr(p, "%40sha256")) fd_reply(fd, 404, "{\"message\":\"manifest unknown\"}");
         else fd_reply(fd, 200, "{\"status\":\"Pulling\"}\n{\"status\":\"Done\"}");
+    } else if (strcmp(method, "DELETE") == 0 && fd_route(p, "/containers/", "", id, sizeof(id))) {
+        fd_container_t *c = fd_find(f, id);
+        if (!c) fd_reply(fd, 404, "{\"message\":\"No such container\"}");
+        else {
+            int k = (int)(c - f->c);
+            memmove(&f->c[k], &f->c[k + 1], (size_t)(f->n - k - 1) * sizeof(f->c[0]));
+            f->n--;
+            f->deletes++;
+            fd_reply(fd, 204, "");
+        }
+    } else if (strcmp(p, "/volumes") == 0) {
+        snprintf(out, sizeof(out), "{\"Volumes\":%s,\"Warnings\":[]}", f->volumes[0] ? f->volumes : "[]");
+        fd_reply(fd, 200, out);
     } else if (strncmp(p, "/containers/create?name=", 24) == 0) {
         if (fd_find(f, p + 24)) fd_reply(fd, 409, "{\"message\":\"Conflict. The name is already in use\"}");
         else {
             snprintf(f->created_body, sizeof(f->created_body), "%s", body);
-            char nid[32];
+            char nid[32], mounts[2048] = "[";
             snprintf(nid, sizeof(nid), "beef%02d", f->n);
-            fake_docker_add(f, nid, p + 24, "created", NULL, "[]");
+            /* What Docker would mount: each bind as given, a name as a volume. */
+            cJSON *cb = cJSON_Parse(body);
+            const cJSON *b;
+            cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(cb, "HostConfig"), "Binds")) {
+                const char *v = cJSON_GetStringValue(b);
+                if (!v) continue;
+                size_t sl = strcspn(v, ":"), l = strlen(mounts);
+                const char *dst = v[sl] ? v + sl + 1 : "";
+                if (v[0] == '/')
+                    snprintf(mounts + l, sizeof(mounts) - l, "%s{\"Type\":\"bind\",\"Source\":\"%.*s\",\"Destination\":\"%.*s\"}",
+                             l > 1 ? "," : "", (int)sl, v, (int)strcspn(dst, ":"), dst);
+                else
+                    snprintf(mounts + l, sizeof(mounts) - l, "%s{\"Type\":\"volume\",\"Name\":\"%.*s\",\"Source\":"
+                             "\"/var/lib/docker/volumes/%.*s/_data\",\"Destination\":\"%.*s\"}",
+                             l > 1 ? "," : "", (int)sl, v, (int)sl, v, (int)strcspn(dst, ":"), dst);
+            }
+            cJSON_Delete(cb);
+            size_t ml = strlen(mounts);
+            snprintf(mounts + ml, sizeof(mounts) - ml, "]");
+            fake_docker_add(f, nid, p + 24, "created", NULL, f->create_mounts[0] ? f->create_mounts : mounts);
             snprintf(out, sizeof(out), "{\"Id\":\"%s\",\"Warnings\":[]}", nid);
             fd_reply(fd, 201, out);
         }
