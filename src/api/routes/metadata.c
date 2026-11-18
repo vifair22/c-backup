@@ -984,17 +984,28 @@ int journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
                    const char *operation, const char *result,
                    int64_t duration_ms, const char *message)
 {
-    char repo[32], dur[32];
+    return journal_record_at(db, repo_id, 0, source, operation, result, duration_ms,
+                             message);
+}
+
+int journal_record_at(cutils_db_t *db, int64_t repo_id, int64_t ts, const char *source,
+                      const char *operation, const char *result,
+                      int64_t duration_ms, const char *message)
+{
+    char repo[32], dur[32], when[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(dur,  sizeof(dur),  "%lld", (long long)duration_ms);
+    /* "" is now: c-utils binds no NULL, and the INSERT reads it back. */
+    if (ts > 0) snprintf(when, sizeof(when), "%lld", (long long)ts);
+    else        when[0] = '\0';
 
     /*
-     * Journal ids are per repo, so the sequence is derived rather than a
-     * global rowid. Derived inside the INSERT itself: it used to be a
-     * SELECT MAX and then a separate INSERT, and two threads journalling
-     * for one repository between them took the same id, so the second
-     * insert hit the primary key and that entry was lost with a warning
-     * (OWN-18). One statement runs whole under the handle's lock. It goes
+     * The id is AUTOINCREMENT, one sequence across repositories (B217,
+     * migration 009): it used to be MAX(id) + 1 per repository, which a
+     * power cut taking back the newest entries handed out again. The
+     * reserved marks (id_reserve.h) keep it unissued across a cut. Before
+     * that it was a SELECT MAX and a separate INSERT, which two threads
+     * journalling at once turned into one lost entry (OWN-18). It goes
      * through db_write (B157): some callers already hold a db_txn
      * transaction and it joins theirs, and the rest get one of their own
      * rather than landing in another thread's.
@@ -1002,13 +1013,12 @@ int journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
     /* Best effort: failing to journal must never fail the operation being
      * journalled. */
     if (db_write(db,
-            "INSERT INTO journal (repo_id, id, ts, source, operation, result,"
+            "INSERT INTO journal (repo_id, ts, source, operation, result,"
             " duration_ms, message)"
-            " SELECT ?1, COALESCE(MAX(id), 0) + 1, strftime('%s','now'),"
-            "        ?2, ?3, ?4, ?5, ?6"
-            "   FROM journal WHERE repo_id = ?1",
+            " VALUES (?1, COALESCE(CAST(NULLIF(?7, '') AS INTEGER), strftime('%s','now')),"
+            "         ?2, ?3, ?4, ?5, ?6)",
             (const char *[]){ repo, source, operation, result, dur,
-                  message ? message : "", NULL }, NULL) != 0) {
+                  message ? message : "", when, NULL }, NULL) != 0) {
         log_warn("journal: cannot record %s/%s: %s", operation, result, err_msg());
         return -1;
     }

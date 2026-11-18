@@ -105,8 +105,8 @@ static int64_t repo_with_history(const char *name)
         "INSERT INTO tags (repo_id, name, snap_id, created_at) VALUES (?, 'keep', 1, 0)",
         "INSERT INTO notes (repo_id, snap_id, body, updated_at) VALUES (?, 1, 'n', 0)",
         "INSERT INTO policy_values (repo_id, key, value) VALUES (?, 'retention.keep_daily', '3')",
-        "INSERT INTO journal (repo_id, id, ts, source, operation, result, duration_ms, message)"
-        " VALUES (?, 1, 0, 'api', 'backup', 'ok', 0, '')",
+        "INSERT INTO journal (repo_id, ts, source, operation, result, duration_ms, message)"
+        " VALUES (?, 0, 'api', 'backup', 'ok', 0, '')",
         "INSERT INTO repo_backup_paths (repo_id, kind, value) VALUES (?, 'source', '/x')",
         "INSERT INTO grep_runs (repo_id, snap_id, pattern, started_at) VALUES (?, 1, 'a', 0)",
         "INSERT INTO verify_runs (repo_id, started_at, level) VALUES (?, 0, 'index')",

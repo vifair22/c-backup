@@ -39,6 +39,7 @@
 #include "settle.h"
 #include "index_reconcile.h"
 #include "index_startup.h"
+#include "id_reserve.h"
 #include "phase_timer.h"
 #include "job_manager.h"
 #include "lock.h"
@@ -488,6 +489,15 @@ int main(int argc, char *argv[])
         goto out_guard;
     }
 
+    /* Before anything can insert a row whose id a client sees: no id
+     * handed out before a power cut is issued again after it (B217,
+     * id_reserve.h). Not fatal: on failure the first id in each table
+     * waits for a sync instead. */
+    if (id_reserve_open(db, ID_RESERVE_BLOCK) != OK) {
+        log_warn("%s", err_msg());
+        err_clear();
+    }
+
     if (auth_init(db) != 0) {
         log_error("cannot initialise auth");
         goto out_locks;
@@ -744,6 +754,12 @@ out_purge:
     repo_purge_stop();
 out_locks:
     repo_locks_shutdown();
+    /* Every writer of a table with client-visible ids has stopped: the
+     * marks come down to what was issued, so a clean restart skips none
+     * (B217). First, and cheap: one short transaction of a row per table
+     * and one WAL sync, a priority writer the hard cap never holds. */
+    id_reserve_close(db);
+    shutdown_step("trimming the id reservations", &t_step);
     /* After every writer has stopped, the thread goes, a copy in progress
      * interrupted rather than waited for (B218); a no-op when it never
      * started. The flusher's stop then syncs the WAL a last time. */
