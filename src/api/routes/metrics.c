@@ -191,6 +191,10 @@ static void emit_txn_metrics(mbuf_t *m)
                "write lock by a checkpoint round since start.\n"
                "# TYPE cbackup_checkpoint_lock_max_seconds gauge\n"
                "cbackup_checkpoint_lock_max_seconds %.6f\n", (double)c.max_lock_ns / 1e9);
+    mb_addf(m, "# HELP cbackup_checkpoint_presync_seconds_total Time spent syncing the WAL "
+               "just before a locked round, without the lock, so the round's own sync is "
+               "short.\n# TYPE cbackup_checkpoint_presync_seconds_total counter\n"
+               "cbackup_checkpoint_presync_seconds_total %.6f\n", (double)c.presync_ns / 1e9);
     mb_addf(m, "# HELP cbackup_checkpoint_frames_copied_total WAL frames copied back into "
                "state.db; over cbackup_checkpoint_rounds_total, frames per checkpoint.\n"
                "# TYPE cbackup_checkpoint_frames_copied_total counter\n"
