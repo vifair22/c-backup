@@ -74,17 +74,20 @@ static int count(const char *path, const char *needle)
     return n;
 }
 
+/* daemon_uid is fixed, never the test's own: requests go straight to the
+ * server, no peer is checked, and the helper refuses uid 0, which is what a
+ * CI job runs as. */
 static void hstart(unsigned capture_s, unsigned per_hour)
 {
     char text[16384];
     snprintf(text, sizeof(text),
-        "[helper]\ndaemon_uid = %u\ndaemon_id = 0badf00d\nstate_dir = " HSTATE "\n"
+        "[helper]\ndaemon_uid = 1000\ndaemon_id = 0badf00d\nstate_dir = " HSTATE "\n"
         "capture_max_s = %u\nmax_captures_per_hour = %u\n"
         "[snapshot]\nzfs_domains = cache/appdata, cache/Photos\n"
         "btrfs_domains = " POOL "\n"
         "[host]\nnsenter = 0\nhost_root =\nzfs = %s/zfs\nbtrfs = %s/btrfs\n"
         "realpath = /usr/bin/realpath\nmountinfo = " MINFO "\n",
-        (unsigned)getuid(), capture_s, per_hour, fake_dir, fake_dir);
+        capture_s, per_hour, fake_dir, fake_dir);
     assert_int_equal(helper_policy_parse(text, &pol), OK);
     assert_int_equal(paths_backend_init(&pol, &pb), OK);
     helper_server_cfg_t cfg = { &pol, NULL, 0, 50, &pb, 1 };
