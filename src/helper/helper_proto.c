@@ -84,6 +84,8 @@ static int str_ok(const char *s, size_t max)
     return 1;
 }
 
+int helper_str_ok(const char *s, size_t max) { return s && str_ok(s, max); }
+
 /* An identifier: [A-Za-z0-9][A-Za-z0-9_.:-]{0,max-1}. */
 static int ident_ok(const char *s, size_t max, const char *extra)
 {

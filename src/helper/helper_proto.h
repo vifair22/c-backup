@@ -152,6 +152,10 @@ int helper_unit_key_ok(const char *key, char *provider, size_t psz,
 /* A clean absolute path: no "//", ".", "..", trailing "/", control bytes. */
 int helper_path_clean(const char *p);
 
+/* Valid UTF-8, no control character, at most max bytes: the rule every
+ * string on the wire is held to (11.4). */
+int helper_str_ok(const char *s, size_t max);
+
 /* ---- transport ---- */
 
 /* The largest configuration blob units.describe passes in its sealed memfd
