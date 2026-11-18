@@ -70,7 +70,8 @@ static status_t ids_from_db(cutils_db_t *db, const char *sql, const char *repo,
         }
     }
     db_result_free(r);
-    qsort(*out, *out_n, sizeof(**out), id_cmp);
+    if (*out_n > 1)
+        qsort(*out, *out_n, sizeof(**out), id_cmp);
     return OK;
 }
 
@@ -133,7 +134,8 @@ status_t index_snapshot_gaps(cutils_db_t *db, int64_t repo_id, const char *repo_
         errno = rerr;
         return set_error_errno(ERR_NOT_FOUND, "cannot list %s", snap_dir);
     }
-    qsort(gaps, ngaps, sizeof(*gaps), id_cmp);
+    if (ngaps > 1)
+        qsort(gaps, ngaps, sizeof(*gaps), id_cmp);
     *out_n = ngaps;
     if (out_ids) *out_ids = gaps;
     else free(gaps);
