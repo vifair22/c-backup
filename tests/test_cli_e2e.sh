@@ -1356,6 +1356,20 @@ contains "and ran as a backup job" '"action":"backup"' "$(cb jobs)"
 SID=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":\([0-9]*\),.*/\1/p' | head -1)
 [ -n "$SID" ] && cb schedule remove 1 "$SID" >/dev/null 2>&1
 
+# B201: an idle daemon writes nothing. On FS2 an idle daemon's WAL grew about
+# four frames a second, from the checkpointer's own restart row and warning
+# line; nothing needs writing while nothing happens. Once the last job is
+# done and logged, the WAL must not change for several seconds.
+echo "idle"
+for _ in $(seq 1 120); do
+    case "$(cb jobs)" in *'"state":"running"'*|*'"state":"queued"'*) sleep 0.25 ;; *) break ;; esac
+done
+sleep 2
+W0=$(stat -c '%s %y' "$WORK/state.db-wal" 2>/dev/null)
+sleep 6
+W1=$(stat -c '%s %y' "$WORK/state.db-wal" 2>/dev/null)
+check "an idle daemon writes nothing to state.db for six seconds" "$W0" "$W1"
+
 echo "auth"
 contains "auth status before setup" '"configured":false' "$(cb auth status)"
 # Setup is socket-only, so this is the one way the first admin password gets
