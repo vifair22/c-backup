@@ -207,6 +207,38 @@ struct sp_session {
     sp_session_info_t info;
 };
 
+/*
+ * libvirt's errors into the helper's log (B214). With no handler libvirt
+ * prints every error it raises on stderr as it raises it, so a lookup that
+ * only asked whether a domain exists left a raw "libvirt: QEMU Driver
+ * error : Domain not found" in the container's output, at no level and
+ * apart from the log. The error is still the thread's last libvirt error,
+ * which is how a failing call puts it in its own message (verr) and so in
+ * the job's error; here it is only logged, at debug for the answers the
+ * provider asks for (no such domain, checkpoint or snapshot, an
+ * unsupported call it probes), at warning otherwise.
+ */
+static void verr_log(void *ud, virErrorPtr e)
+{
+    (void)ud;
+    if (!e) return;
+    const char *m = e->message ? e->message : "unknown libvirt error";
+    switch (e->code) {
+    case VIR_ERR_NO_DOMAIN:
+    case VIR_ERR_NO_DOMAIN_CHECKPOINT:
+    case VIR_ERR_NO_DOMAIN_SNAPSHOT:
+    case VIR_ERR_NO_SUPPORT:
+    case VIR_ERR_OPERATION_UNSUPPORTED:
+    case VIR_ERR_ARGUMENT_UNSUPPORTED:
+        log_debug("libvirt (code %d): %s", e->code, m);
+        return;
+    default:
+        break;
+    }
+    if (e->level == VIR_ERR_NONE) log_debug("libvirt (code %d): %s", e->code, m);
+    else log_warn("libvirt (code %d): %s", e->code, m);
+}
+
 static const char *verr(void)
 {
     const char *m = virGetLastErrorMessage();
@@ -1833,7 +1865,7 @@ static status_t v_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
         else {
             out->failed++;
             log_warn("%s", err_msg());
-            if (!out->stuck[0]) snprintf(out->stuck, sizeof(out->stuck), "%.390s", err_msg());
+            if (!out->stuck[0]) snprintf(out->stuck, sizeof(out->stuck), "%.1024s", err_msg());
             err_clear();
         }
     }
@@ -2117,6 +2149,8 @@ status_t libvirt_backend_init(const helper_policy_t *pol, helper_backend_t *out)
     struct sp_ctx *c = calloc(1, sizeof(*c));
     if (!c) return set_error(ERR_NOMEM, "libvirt: backend");
     c->pol = pol;
+    /* Process-wide, and first: before the first connect can raise one. */
+    virSetErrorFunc(NULL, verr_log);
     pthread_mutex_init(&c->mu, NULL);
     pthread_mutex_init(&c->cmu, NULL);
     snap_host_setup(pol, &c->tools, &c->snap);

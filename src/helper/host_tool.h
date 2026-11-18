@@ -14,6 +14,7 @@
 #include "error.h"
 
 #include <stddef.h>
+#include <sys/types.h>
 
 #define HOST_TOOL_PATH_MAX 256
 
@@ -44,6 +45,12 @@ int host_path(const host_tools_t *t, const char *path, char *buf, size_t sz);
  */
 status_t host_write_new_file(const char *hp, const char *shown, const char *data, size_t len,
                              const char *aside_hp);
+
+/* The same, the file created with mode exactly (umask aside);
+ * HOST_MODE_DEFAULT for 0666 under the umask, as host_write_new_file. */
+#define HOST_MODE_DEFAULT ((mode_t)~0u)
+status_t host_write_new_file_mode(const char *hp, const char *shown, const char *data, size_t len,
+                                  const char *aside_hp, mode_t mode);
 
 /* Defaults: nsenter on, /usr/bin/nsenter, /usr/sbin/zfs, /sbin/btrfs,
  * /usr/bin, host_root /proc/1/root. */

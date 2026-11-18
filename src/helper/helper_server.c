@@ -55,7 +55,7 @@ typedef struct {
      * reported to the daemon by the sweep (B175). Not persisted. */
     int     tries;
     int64_t next_ms, fail_since_ms;
-    char    last_err[200];
+    char    last_err[SP_RELEASE_ERR_MAX];
 } hold_t;
 
 struct jctx;
@@ -337,6 +337,18 @@ static const helper_backend_t *backend_of(const helper_server_t *s, const char *
     return NULL;
 }
 
+/* src into dst, ending "..." when it does not fit. */
+static void clip_copy(char *dst, size_t sz, const char *src)
+{
+    size_t n = strlen(src);
+    if (n < sz) { memcpy(dst, src, n + 1); return; }
+    size_t keep = sz - 4;
+    /* Back to a character boundary: the text is served as JSON. */
+    while (keep > 0 && ((unsigned char)src[keep] & 0xC0u) == 0x80u) keep--;
+    memcpy(dst, src, keep);
+    memcpy(dst + keep, "...", 4);
+}
+
 static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx, int keep_absent,
                               const char *why)
 {
@@ -371,9 +383,11 @@ static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx,
         memset(&rep, 0, sizeof(rep));
         status_t st = b && b->ops->sweep ? b->ops->sweep(b->ctx, &rq, &rep) : ERR_INVALID;
         int failed = !(st == OK && rel);
-        char why_failed[200];
-        snprintf(why_failed, sizeof(why_failed), "%.190s",
-                 st != OK && err_msg()[0] ? err_msg() : st == OK && rep.stuck[0] ? rep.stuck : "the release failed");
+        /* Whole, paths and errno (B213); one too long for the report is
+         * cut visibly, never silently. */
+        char why_failed[SP_RELEASE_ERR_MAX];
+        clip_copy(why_failed, sizeof(why_failed),
+                  st != OK && err_msg()[0] ? err_msg() : st == OK && rep.stuck[0] ? rep.stuck : "the release failed");
         int tries = 0;
         int64_t delay = 0;
         pthread_mutex_lock(&s->jmu);
@@ -431,7 +445,9 @@ static char *resp_error(int64_t id, helper_err_t code, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 static char *resp_error(int64_t id, helper_err_t code, const char *fmt, ...)
 {
-    char msg[512];
+    /* Room for a refusal that names its way round (B210): it was cut at
+     * 511, mid-sentence. */
+    char msg[2048];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);

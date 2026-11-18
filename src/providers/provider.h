@@ -270,6 +270,12 @@ typedef struct {
     size_t             n_live_jobs;
 } sp_sweep_req_t;
 
+/* Room for a hold that cannot be released, said whole: the provider's
+ * error (paths, errno; up to SP_RELEASE_ERR_MAX) inside a line naming the
+ * hold and its unit. It used to be clipped at 190 characters (B213). */
+#define SP_RELEASE_ERR_MAX 1024
+#define SP_STUCK_MAX       (SP_RELEASE_ERR_MAX + 512)
+
 typedef struct {
     unsigned released;       /* holds released */
     unsigned removed;        /* artefacts deleted */
@@ -277,7 +283,7 @@ typedef struct {
     unsigned failed;         /* releases or deletions that failed */
     /* Holds whose release keeps failing, said in a line for the job's
      * warning and alert; empty when none. A helper reports its own. */
-    char     stuck[400];
+    char     stuck[SP_STUCK_MAX];
 } sp_sweep_report_t;
 
 /*

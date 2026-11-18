@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -199,8 +200,31 @@ status_t host_run(const host_tools_t *t, int netns, const char *const *argv,
 status_t host_write_new_file(const char *hp, const char *shown, const char *data, size_t len,
                              const char *aside_hp)
 {
-    FILE *f = fopen(hp, "wxe");
+    return host_write_new_file_mode(hp, shown, data, len, aside_hp, HOST_MODE_DEFAULT);
+}
+
+status_t host_write_new_file_mode(const char *hp, const char *shown, const char *data, size_t len,
+                                  const char *aside_hp, mode_t mode)
+{
+    /* Created with the mode, then set to it, so neither the umask nor a
+     * default wider than the caller asked decides it. */
+    int dflt = mode == HOST_MODE_DEFAULT;
+    int fd = open(hp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, dflt ? 0666 : mode & 07777);
     int bad = 0, err = 0;
+    if (fd >= 0 && !dflt && fchmod(fd, mode & 07777) != 0) {
+        err = errno;
+        close(fd);
+        (void)unlink(hp);
+        fd = -1;
+        errno = err;
+    }
+    FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (fd >= 0 && !f) {
+        err = errno;
+        close(fd);
+        (void)unlink(hp);
+        errno = err;
+    }
     if (!f) {
         bad = 1;
         err = errno;

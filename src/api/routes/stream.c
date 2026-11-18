@@ -40,7 +40,8 @@ static cutils_db_t *g_db;
 
 typedef struct {
     int64_t job_id;
-    char    last[1024];     /* last payload sent, to suppress repeats */
+    char    last[3584];     /* last payload sent, to suppress repeats; room
+                             * for a finished job's warning (B211) */
     time_t  started;
     time_t  last_sent;      /* 0 until the first frame */
     int     finished;       /* terminal state seen; send one last event */
@@ -85,7 +86,8 @@ static ssize_t job_reader(void *cls, char *buf, size_t max)
             "       CAST(COALESCE(NULLIF(progress_total,''),0) AS INTEGER),"
             "       COALESCE(error,''),"
             "       CAST(COALESCE(NULLIF(bytes_done,''),0) AS INTEGER),"
-            "       CAST(COALESCE(NULLIF(bytes_total,''),0) AS INTEGER)"
+            "       CAST(COALESCE(NULLIF(bytes_total,''),0) AS INTEGER),"
+            "       COALESCE(result,'')"
             "  FROM jobs WHERE id = ?",
             (const char *[]){ id, NULL }, &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
@@ -99,9 +101,16 @@ static ssize_t job_reader(void *cls, char *buf, size_t max)
      * for. */
     job_end_view_t ev;
     int unrec = job_end_unrecorded(g_db, st->job_id, &ev);
-    if (unrec) free(ev.result);
     const char *state = unrec ? ev.state : r->rows[0][0];
     const char *error = unrec ? ev.error : r->rows[0][4];
+    const char *result = unrec ? (ev.result ? ev.result : "") : r->rows[0][7];
+    int terminal = strcmp(state, "completed") == 0 ||
+                   strcmp(state, "failed") == 0 ||
+                   strcmp(state, "cancelled") == 0;
+    /* The finished job's warning, as GET /jobs/<id> has it in its result
+     * (B211): the last frame is all a watcher may read. */
+    cJSON *res = terminal && result[0] ? cJSON_Parse(result) : NULL;
+    const char *warning = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "warning"));
 
     /* cJSON for the escaping: an error names paths, and a path can hold a
      * quote, which a bare %s turned into a frame no JSON reader accepts. */
@@ -117,6 +126,7 @@ static ssize_t job_reader(void *cls, char *buf, size_t max)
         cJSON_AddNumberToObject(o, "bytes_done",  (double)strtoull(r->rows[0][5], NULL, 10));
         cJSON_AddNumberToObject(o, "bytes_total", (double)strtoull(r->rows[0][6], NULL, 10));
         cJSON_AddStringToObject(o, "error", error);
+        if (warning) cJSON_AddStringToObject(o, "warning", warning);
         if (!cJSON_PrintPreallocated(o, payload, (int)sizeof(payload), 0))
             payload[0] = '\0';
         cJSON_Delete(o);
@@ -125,9 +135,8 @@ static ssize_t job_reader(void *cls, char *buf, size_t max)
         snprintf(payload, sizeof(payload), "{\"id\":%lld,\"state\":\"%s\"}",
                  (long long)st->job_id, state);
 
-    int terminal = strcmp(state, "completed") == 0 ||
-                   strcmp(state, "failed") == 0 ||
-                   strcmp(state, "cancelled") == 0;
+    cJSON_Delete(res);
+    if (unrec) free(ev.result);
     db_result_free(r);
 
     /* Suppress identical frames, up to a heartbeat. A job that sits in one
