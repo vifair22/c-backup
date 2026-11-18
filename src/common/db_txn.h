@@ -86,6 +86,17 @@ unsigned long db_txn_bulk_count(void);
 #define DB_TXN_BULK_DUE_MS  DB_TXN_COMMIT_BUDGET_MS
 #define DB_TXN_PRI_STREAK   8
 
+/* For tests: what this thread's most recent priority acquisition (any
+ * db_txn_begin, db_write, db_txn_exclusive) waited behind, counted from
+ * when it took its ticket to when it was served. bulk_ahead_due of those
+ * bulk transactions were served first because the bound above owed them
+ * the turn; any others broke the order. */
+typedef struct {
+    unsigned long bulk_ahead;
+    unsigned long bulk_ahead_due;
+} db_txn_wait_t;
+void db_txn_last_wait(db_txn_wait_t *out);
+
 /* Commit and release the lock. Releases the lock even when the commit fails:
  * there is nothing the caller can do about it and holding it would wedge every
  * other writer. A failed commit is rolled back first, should SQLite have left
