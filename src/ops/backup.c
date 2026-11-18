@@ -338,13 +338,29 @@ static void note_unsettled(pipeline_t *p, uint32_t i)
     r->unsettled[r->unsettled_listed++] = path;
 }
 
+/*
+ * The stat the file cache keys an entry on: its own, except that a snapshot
+ * read's entry carries the record root's live device in place of the
+ * snapshot's (scan.h, rec_dev). The rows a snapshot read writes then match
+ * a live read of the same files and the reverse, and the device is still
+ * compared, so a row from another filesystem is never trusted (B229).
+ */
+static const struct stat *cache_key_stat(const scan_entry_t *e, struct stat *buf)
+{
+    if (!e->dev_remapped) return &e->st;
+    *buf = e->st;
+    buf->st_dev = e->rec_dev;
+    return buf;
+}
+
 /* The cache row for a stored file, unless it never settled. */
 static void cache_put(pipeline_t *p, uint32_t i)
 {
     if (p->links[i].unsettled) return;
     scan_entry_t *e = &p->scan->entries[i];
     uint64_t _tp = phase_now();
-    file_cache_put(p->db, p->repo_id, e->path, &e->st,
+    struct stat kst;
+    file_cache_put(p->db, p->repo_id, e->path, cache_key_stat(e, &kst),
                    e->node.content_hash, p->cache_stamp);
     phase_add(p->timers, PHASE_CACHE_PUT, _tp);
 }
@@ -1801,11 +1817,21 @@ static status_t store_content_loop(pipeline_t *p)
          */
         uint64_t _tc = phase_now();
         /* Read through a filesystem snapshot: a new device number every
-         * time, the same inodes and times (source-providers.md 4.3). */
+         * time, the same inodes and times (source-providers.md 4.3). An
+         * entry on the snapshot's own device is compared on the record
+         * root's live device (cache_key_stat); one on another device inside
+         * the snapshot (a nested mount, whose number is the capture's too)
+         * is matched without its device, on inode, size and both times.
+         * Whether the live device can be compared is the record root's
+         * filesystem's question: a FUSE share's number changes at every
+         * mount, so there it is not. */
         const char *rpath = e->read_path ? e->read_path : e->path;
+        struct stat kst;
+        const struct stat *key = cache_key_stat(e, &kst);
         unsigned ignore = cache_ignore_for(p, rpath, &e->st) |
-                          (e->read_path ? FILE_CACHE_IGNORE_DEV : 0u);
-        int cache_hit = file_cache_lookup(p->db, p->repo_id, e->path, &e->st,
+                          (e->read_path && !e->dev_remapped ? FILE_CACHE_IGNORE_DEV : 0u) |
+                          (e->dev_remapped ? cache_ignore_for(p, e->path, key) & FILE_CACHE_IGNORE_DEV : 0u);
+        int cache_hit = file_cache_lookup(p->db, p->repo_id, e->path, key,
                                           ignore, e->node.content_hash);
         phase_add(p->timers, PHASE_CACHE_LOOKUP, _tc);
         if (cache_hit) {
