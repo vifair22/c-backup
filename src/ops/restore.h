@@ -25,6 +25,13 @@ typedef struct {
     /* Optional: bytes of file content restored or skipped so far, and in
      * total, called alongside progress_cb with the same context. */
     void (*bytes_cb)(void *ctx, uint64_t done, uint64_t total);
+    /*
+     * A database with an engine copy in the snapshot (db-detection.md 9.3,
+     * 9.5) is restored from the copy, at its original path, and its stale
+     * -wal, -shm and -journal are not restored: a backup-API copy is a
+     * complete database, and the old WAL beside it would corrupt it.
+     */
+    int   prefer_engine_copy;
 } restore_opts_t;
 
 typedef struct {
@@ -66,6 +73,14 @@ typedef struct {
      * failed. Every one is logged with its path and reason; the error
      * restore_run returns quotes this one. */
     char     first_failure[512];
+    /*
+     * Engine copies (db-detection.md 9.5): databases restored in scope that
+     * have one in the snapshot, those restored from it (prefer_engine_copy),
+     * and the -wal, -shm and -journal files left out beside them.
+     */
+    uint64_t engine_copies;
+    uint64_t engine_copies_used;
+    uint64_t engine_siblings_left_out;
 } restore_result_t;
 
 /*

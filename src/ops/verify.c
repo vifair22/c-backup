@@ -432,6 +432,51 @@ static uint64_t check_contentless_files(cutils_db_t *db, int64_t repo_id,
 }
 
 /*
+ * The flag explains itself when the file is a detected database
+ * (db-detection.md 9.5): each sample path that a SQLite finding names gets
+ * a notice of its own saying what it is and what gives a consistent copy.
+ * Notices, like the one they explain: nothing here is loss.
+ */
+static void note_unsettled_databases(cutils_db_t *db, int64_t repo_id, int64_t run_id,
+                                     const char *paths)
+{
+    char repo[32], run[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(run, sizeof(run), "%lld", (long long)run_id);
+    const char *p = paths;
+    while (p && *p) {
+        const char *end = strstr(p, ", ");
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%.*s", (int)len, p);
+        p = end ? end + 2 : NULL;
+        db_result_t *r = NULL;
+        if (db_execute(db, "SELECT id FROM db_findings WHERE repo_id = ? AND path = ?"
+                           " AND engine = 'sqlite' ORDER BY id DESC LIMIT 1",
+                       (const char *[]){ repo, path, NULL }, &r) != 0 || !r || r->nrows != 1) {
+            db_result_free(r);
+            continue;
+        }
+        char status[400];
+        snprintf(status, sizeof(status), VERIFY_NOTICE_PREFIX "stored while changing: live "
+                 "SQLite database. Restore it with --prefer-engine-copy from a snapshot that "
+                 "holds its engine copy, or enable \"sqlite online backup\" for its source "
+                 "for one (finding %s)", r->rows[0][0]);
+        db_result_free(r);
+        if (db_write(db,
+                "INSERT INTO verify_findings"
+                " (run_id, repo_id, hash, status, affected_files, sample_paths,"
+                "  affected_snapshots, affected_versions, affected_snapshot_count,"
+                "  snapshots_truncated)"
+                " VALUES (?, ?, '', ?, 1, ?, '', 1, 0, 0)",
+                (const char *[]){ run, repo, status, path, NULL }, NULL) != 0)
+            log_warn("verify: cannot record the finding \"%s\"", status);
+        else
+            log_warn("verify: %s: %s", path, status + strlen(VERIFY_NOTICE_PREFIX));
+    }
+}
+
+/*
  * Files stored although they never settled while the backup read them
  * (OWN-45-LIVE): their tree entries carry MANIFEST_FLAG_UNSETTLED, and the
  * index rows the flag. Nothing is lost - the stored bytes read back and
@@ -452,6 +497,7 @@ static uint64_t check_unsettled_files(cutils_db_t *db, int64_t repo_id,
                  "still changing and may not be internally consistent: %s",
                  (unsigned long long)n, n == 1 ? "y" : "ies",
                  (unsigned long long)n_snaps, n == 1 ? "was" : "were", paths);
+    if (n) note_unsettled_databases(db, repo_id, run_id, paths);
     return n;
 }
 
