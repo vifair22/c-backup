@@ -869,8 +869,8 @@ static void test_no_tracking_means_no_cap(void **state)
  * DB_TXN_BULK_DUE_MS of waiting, whichever comes first.
  */
 typedef struct {
-    atomic_int stop;
-    unsigned long writes;
+    atomic_int    stop;
+    atomic_ulong  writes;
 } hammer_t;
 
 static void *hammer_main(void *arg)
@@ -879,7 +879,7 @@ static void *hammer_main(void *arg)
     while (!atomic_load(&h->stop)) {
         if (db_write(db, "INSERT OR REPLACE INTO config (key, value) VALUES ('hammer', '1')",
                      NULL, NULL) == 0)
-            h->writes++;
+            atomic_fetch_add(&h->writes, 1);
     }
     return NULL;
 }
@@ -887,12 +887,26 @@ static void *hammer_main(void *arg)
 typedef struct {
     atomic_int done;
     double     worst_ms;
+    hammer_t  *h;
+    int        nh;
 } bulk_probe_t;
 
+static unsigned long hammer_writes(const bulk_probe_t *bp)
+{
+    unsigned long n = 0;
+    for (int k = 0; k < bp->nh; k++) n += atomic_load(&bp->h[k].writes);
+    return n;
+}
+
+/*
+ * At least ten bulk begins, and keep beginning until the priority writers
+ * have made 1000 writes around them: on a slow runner ten begins can finish
+ * before the stream has demonstrably contended, which proved nothing.
+ */
 static void *bulk_probe_main(void *arg)
 {
     bulk_probe_t *bp = arg;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 10 || (hammer_writes(bp) <= 1000 && !atomic_load(&bp->h[0].stop)); i++) {
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         if (db_txn_begin_bulk(db) != OK) break;
@@ -923,6 +937,8 @@ static void test_priority_writers_cannot_starve_a_bulk_writer(void **state)
      * one is with no bound) fails the test rather than hanging it. */
     bulk_probe_t bp;
     memset(&bp, 0, sizeof(bp));
+    bp.h  = h;
+    bp.nh = 4;
     pthread_t bt;
     assert_int_equal(pthread_create(&bt, NULL, bulk_probe_main, &bp), 0);
     for (int i = 0; i < 500 && !atomic_load(&bp.done); i++) {
@@ -934,7 +950,7 @@ static void test_priority_writers_cannot_starve_a_bulk_writer(void **state)
     pthread_join(bt, NULL);
     double worst = bp.worst_ms;
     unsigned long writes = 0;
-    for (int k = 0; k < 4; k++) { pthread_join(th[k], NULL); writes += h[k].writes; }
+    for (int k = 0; k < 4; k++) { pthread_join(th[k], NULL); writes += atomic_load(&h[k].writes); }
     if (!finished)
         fail_msg("a bulk writer was starved for 5 s by priority writers");
     print_message("  bulk begins among %lu priority writes: worst wait %.1f ms (bound %d ms "
