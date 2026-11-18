@@ -10,6 +10,7 @@
 #include "file_cache.h"
 #include "job_manager.h"
 #include "snap_record.h"
+#include "source_snapshot.h"
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
@@ -114,7 +115,10 @@ static void backup_fill_from_config(backup_job_t *j)
         const char *val  = r->rows[i][1];
         if (!val || !*val) continue;
 
+        /* Snapshot-mode rows (source_snapshot.h) mark sources; they are
+         * read where the job runs, not taken as paths. */
         int is_excl = (kind && strcmp(kind, "exclude") == 0);
+        if (!is_excl && (!kind || strcmp(kind, "source") != 0)) continue;
         if (is_excl && !want_excl) continue;
         if (!is_excl && !want_paths) continue;
 
@@ -275,7 +279,7 @@ void routes_db_detect_events(cutils_db_t *db, int64_t repo_id, const char *sourc
  * goes wrong is logged and the object is left out.
  */
 static char *file_backup_databases(backup_job_t *j, db_detector_t *d, int64_t snap_id,
-                                   void *progress_ctx)
+                                   const int *atomic, void *progress_ctx)
 {
     if (!d) return NULL;
     size_t n = (size_t)j->n_paths;
@@ -285,10 +289,12 @@ static char *file_backup_databases(backup_job_t *j, db_detector_t *d, int64_t sn
     db_findings_t *f = NULL;
     int ok = roots && scopes;
     for (size_t i = 0; ok && i < n; i++) {
-        /* A plain file source is read live (section 5): source snapshot
-         * mode (9.4) is what would make these atomic. */
+        /* A plain file source is read live (section 5), unless source
+         * snapshot mode (9.4) read it from a snapshot: atomic. Each counts
+         * as an instant of its own, which is never wrong (one ZFS pool's
+         * datasets share one, but a database spanning sources is rare). */
         roots[i].root = j->paths[i];
-        roots[i].kind = DB_CAP_LIVE;
+        roots[i].kind = atomic && atomic[i] ? DB_CAP_ATOMIC : DB_CAP_LIVE;
         roots[i].instant = (int)i;
         size_t len = strlen(j->paths[i]) + 8;
         if (!(scopes[i] = malloc(len))) { ok = 0; break; }
@@ -432,11 +438,42 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
 
     o.detect = db_detect_start();
 
+    /* Sources in snapshot mode (db-detection.md 9.4): read from the
+     * helper's snapshot and recorded at their own paths. A strict one that
+     * cannot be fails the job here, before anything is read. */
+    src_snap_t ss;
+    memset(&ss, 0, sizeof(ss));
+    int *modes = calloc((size_t)j->n_paths ? (size_t)j->n_paths : 1, sizeof(*modes));
+    st = modes ? src_snap_modes_load(j->db, j->repo_id, cpaths, (size_t)j->n_paths, modes)
+               : set_error(ERR_NOMEM, "backup job: snapshot modes");
+    if (st == OK) st = src_snap_begin(cpaths, modes, (size_t)j->n_paths, j->one_filesystem, &ss);
+    free(modes);
+    if (st != OK) {
+        db_detect_free(o.detect);
+        free(cpaths);
+        free(cexcl);
+        store_index_free(idx);
+        store_close(store);
+        return st;
+    }
+    o.read_paths = ss.read_paths;
+    o.exclude_on_record = 1;
+
     backup_result_t res;
     memset(&res, 0, sizeof(res));
     st = backup_run(store, j->db, j->repo_id, &o, &res);
+    /* The read is over, whatever its outcome (a cancel included): the
+     * snapshots go now, before anything else. */
+    src_snap_release(&ss);
+    char *ss_json = src_snap_result_json(&ss, cpaths);
+    char *ss_warn = malloc(PATH_MAX * 4);
+    if (ss_warn) src_snap_describe_live(&ss, cpaths, ss_warn, PATH_MAX * 4);
+    int *atomic = calloc((size_t)j->n_paths ? (size_t)j->n_paths : 1, sizeof(*atomic));
+    for (size_t i = 0; atomic && i < ss.n; i++) atomic[i] = ss.p[i].read_root != NULL && !ss.lease_lost;
+    src_snap_end(&ss);
     char *dbj = (st == OK && res.snapshot_id > 0)
-              ? file_backup_databases(j, o.detect, res.snapshot_id, progress_ctx) : NULL;
+              ? file_backup_databases(j, o.detect, res.snapshot_id, atomic, progress_ctx) : NULL;
+    free(atomic);
     db_detect_free(o.detect);
 
     /* What the backup did, on the job record: the log line had it, the job
@@ -476,7 +513,10 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)w[STORE_WR_PACK],
                  (unsigned long long)w[STORE_WR_PACK_PARITY],
                  (unsigned long long)res.files_skipped);
-        char *full = with_databases(with_skipped(rj, &res), dbj);
+        char *base = NULL;
+        if (asprintf(&base, "%s%s", rj, ss_json ? ss_json : "") < 0) base = NULL;
+        char *full = base ? with_databases(with_skipped(base, &res), dbj) : NULL;
+        free(base);
         if (full) {
             job_set_result(progress_ctx, full);
             free(full);
@@ -493,9 +533,15 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
          * not only in a job row deleted after 30 days. And alerted, through
          * the failure path at warning level: the job did what it could and
          * stays completed. A clean backup journals no message, as always. */
-        char *warning = malloc(PATH_MAX * 4);
+        char *warning = malloc(PATH_MAX * 8);
         if (warning) {
             routes_backup_describe_doubts(&res, warning, PATH_MAX * 4);
+            /* A source in snapshot mode read live says so, every path and
+             * why, on the job, in the journal and in the alert. */
+            if (ss_warn && ss_warn[0]) {
+                size_t wl = strlen(warning);
+                snprintf(warning + wl, PATH_MAX * 8 - wl, "%s%s", wl ? "; " : "", ss_warn);
+            }
             if (warning[0]) {
                 /* The job manager journals the warning after the summary,
                  * so the summary is only what the snapshot holds. */
@@ -510,6 +556,8 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     }
     backup_result_free(&res);
     free(dbj);
+    free(ss_json);
+    free(ss_warn);
 
     free(cpaths);
     free(cexcl);

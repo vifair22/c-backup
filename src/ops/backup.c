@@ -2731,6 +2731,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     sopts.n_exclude      = opts->n_exclude;
     sopts.collect_meta   = 1;
     sopts.one_filesystem = opts->one_filesystem;
+    sopts.exclude_on_record = opts->exclude_on_record;
     /* The scan can take minutes on a large tree, and reported nothing:
      * the job sat at an empty phase and 0/0 until the store began. */
     scan_bridge_t bridge = { opts->progress_cb, opts->progress_ctx };

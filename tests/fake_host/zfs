@@ -8,6 +8,10 @@
 #   $FAKE_HOST_STATE/snaps      "<ds>@<name>\t<owner>" per line
 #   $FAKE_HOST_STATE/zfs.log    every invocation, one per line
 #   FAKE_ZFS_FAIL=<subcommand>  that subcommand exits 1
+#   $FAKE_HOST_STATE/snapshot.sleep  seconds a snapshot command waits after
+#                               copying, with snapshot.taken touched first:
+#                               a test changes the live tree, or cancels the
+#                               job, while the capture is still being taken
 set -u
 S=${FAKE_HOST_STATE:?FAKE_HOST_STATE is not set}
 touch "$S/datasets" "$S/snaps"
@@ -39,7 +43,8 @@ snapshot)
         mkdir -p "$mp/.zfs/snapshot/$name"
         (cd "$mp" && tar cf - --exclude=./.zfs .) | (cd "$mp/.zfs/snapshot/$name" && tar xf -)
         printf '%s\t%s\n' "$t" "$owner" >> "$S/snaps"
-    done ;;
+    done
+    if [ -f "$S/snapshot.sleep" ]; then touch "$S/snapshot.taken"; sleep "$(cat "$S/snapshot.sleep")"; fi ;;
 get)
     shift
     [ "$1 $2 $3 $4" = "-H -o value com.cbackup:owner" ] || { echo "fake zfs: get $* not understood" >&2; exit 2; }

@@ -1263,6 +1263,85 @@ next backup of each VM deletes the one it had.
 
 ---
 
+### 6.6 Reading sources from a snapshot (ZFS and btrfs)
+
+A file source holding something that changes while it is read, a live
+database above all, is stored as it was read, flagged if it moved
+(`MANIFEST_FLAG_UNSETTLED`, 6.3), and may mix two versions of itself. On ZFS
+or btrfs the backup can read such a source from a snapshot instead, taken
+for the job by the helper (22.2) at one instant for everything on the same
+pool. Every file is then as it was at that instant, which a database's own
+crash recovery handles as it handles a power cut. Nothing is paused.
+
+```sh
+sudo c-backup sources set 1 /mnt/user/appdata/nextcloud /home/me \
+    --snapshot /mnt/user/appdata/nextcloud
+sudo c-backup sources list 1
+```
+
+```json
+{"sources":["/home/me","/mnt/user/appdata/nextcloud"],"exclude":[],
+ "snapshot":[{"path":"/mnt/user/appdata/nextcloud","mode":"strict"}]}
+```
+
+**Modes.** Snapshot mode is set per source, for sources already in the list:
+
+| Option | Mode | A source that cannot be read from a snapshot |
+|---|---|---|
+| `--snapshot PATH` | `strict` | fails the backup before anything is read, naming each such source and why; no snapshot is written |
+| `--snapshot-warn PATH` | `warn` | is read live, and the job says so: a warning naming the source and why (journalled, alerted as a warning), and the job result lists it under `live_sources` |
+| neither | | a `sources set` that names no mode keeps the modes of the sources that stay; `--no-snapshot` turns every one off |
+
+**Strict is the default** because a source is put in snapshot mode exactly
+when reading it live is not good enough: a backup that quietly fell back
+would look like the consistent copy it is not. `warn` is for a source where
+a possibly torn copy, said to be one, beats a failed night.
+
+**What can be snapshotted.** The helper decides, never the daemon: it
+resolves each path itself (`/mnt/user` to the one pool or disk holding it,
+symlinks, bind mounts) and snapshots only a ZFS dataset its policy lists in
+`zfs_domains` or a btrfs pool root in `btrfs_domains`. A source cannot be
+read from a snapshot when:
+
+| Reason in the warning or error | Meaning |
+|---|---|
+| `... is on no ZFS dataset or btrfs pool the helper's policy lists` | another filesystem (an Unraid array disk is xfs), or a dataset the policy does not name |
+| `is split across more than one pool or disk` | a `/mnt/user` share spread over the cache and the array |
+| `cannot be resolved on the host` | it does not exist where the helper looks |
+| `N mount(s) or btrfs subvolume(s) lie below it (a, b, c, ...)` | a snapshot shows them as empty directories (a ZFS child dataset, another filesystem mounted inside, a nested btrfs subvolume), the first three named and the count. On FS1, `/mnt/cache/domains` is this case: a child dataset per VM. Add each as a source of its own in snapshot mode; or back up with `--one-filesystem`, which leaves their contents out live as well (the snapshot read records each as an empty directory); or put the source in `warn` mode to read it live, a possibly torn copy that the job says is one |
+| `its pool's subvolumes cannot be listed` | the helper could not check for nested btrfs subvolumes, so it does not trust the snapshot |
+| `the helper took no snapshot: ...` | the helper is unreachable or the snapshot failed |
+| `no helper is configured (units.helper_socket)` | only the helper can take a snapshot |
+
+**What is recorded.** The source's own paths, exactly as a live backup
+records them; nothing of `.zfs` or the snapshot directory. Exclusions are
+written for the live paths and apply as written. The trees and the file
+cache are those of a live read (22.5.4): a source that has not changed is
+not read again, whether the previous backup read it live or from a
+snapshot, and switching a source into snapshot mode stores no new trees.
+The job result says where each source was read:
+
+```json
+"source_snapshots":{"/mnt/user/appdata/nextcloud":"zfs"},"live_sources":[]
+```
+
+**Separate instants.** Everything on one ZFS pool is snapshotted by one
+command, at one instant. Separate btrfs subvolumes, and separate pools, are
+separate snapshots, each consistent in itself; nothing is paused to tie
+them together, so keep a database and its files within one.
+
+**Lifetime.** The snapshot exists only for the job: the helper destroys it
+as soon as the read ends, whether the backup succeeded, failed or was
+cancelled. A daemon killed mid-backup has its snapshots destroyed by the
+helper at once (its session closes); a helper that died has them swept at
+its next start; and none outlives the policy's `capture_max_s` lease. A
+backup still reading when the lease runs out loses the snapshot under it:
+files read after that are skipped and listed (6.3), and the job warns that
+the lease ran out (`source_snapshot_lease_lost` in its result). Size the
+lease for the longest first backup. While
+it exists, anything that can read the dataset root (ZFS `.zfs`) or the pool's
+snapshot directory (btrfs) can read the snapshot (22.5.4).
+
 ## 7. Browsing, searching, comparing
 
 ```sh
@@ -3138,7 +3217,7 @@ lists every command with all of its arguments.
 | `repo repair <id> --accept-missing` | Accept a degraded repository's missing packs as lost (section 17.6). A job, queued behind any job holding the repository; waits for it and prints its result |
 | `repo remove <id>` | Deregister; the directory is kept |
 | `repo key export\|ack <id>`, `repo key import <id> <key-hex>` | Encryption key escrow and recovery |
-| `sources list <id>`, `sources set <id> [path...] [--exclude PAT]...` | What a repository backs up; `set` with no paths clears the list |
+| `sources list <id>`, `sources set <id> [path...] [--exclude PAT]... [--snapshot PATH]... [--snapshot-warn PATH]... [--no-snapshot]` | What a repository backs up; `set` with no paths clears the list. `--snapshot`/`--snapshot-warn` read a source from a ZFS or btrfs snapshot (6.6) |
 | `backup <id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT]` | Back up |
 | `restore <id> <snapshot> <dest> [--subpath PATH] [--overwrite]` | Restore |
 | `snapshots <id> [--limit N] [--offset N]` | List snapshots |

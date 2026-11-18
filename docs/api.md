@@ -680,7 +680,7 @@ lazily on first append, which used to leave an empty result serialising as
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/repos/<id>/backup` | `{paths:[...], label, exclude:[...], one_filesystem}`; with no `paths`, the repository's configured sources are used. `label` is at most 256 bytes of well-formed UTF-8 with no control characters (C0, DEL or C1); anything else is `400 {"error":"label must be at most 256 bytes of printable text"}` |
-| GET/PUT | `/repos/<id>/sources` | What this repository backs up: `{sources:[...], exclude:[...]}` |
+| GET/PUT | `/repos/<id>/sources` | What this repository backs up: `{sources:[...], exclude:[...], snapshot:[{path, mode}]}` |
 | POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite, subpath}` |
 | POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only. On gc, gfs and verify, `dry_run` and `repair` take `1`, `true`, `0` or `false`; any other value, empty included, is a 400 rather than read as off |
 | POST | `/repos/<id>/gfs` | Apply retention |
@@ -1004,6 +1004,25 @@ than refused, because it may be a share that is not mounted yet, and the
 warning says that a backup fails while it is missing: a backup does not skip
 a missing source, it fails the job (see above).
 
+`snapshot` is the snapshot mode of each source (`db-detection.md` 9.4,
+Manual 6.6): a list of `{"path", "mode"}`, `path` one of `sources` and
+`mode` `"strict"` (the default when left out) or `"warn"`; a source not
+listed is read live as always. `GET` always carries the list, `[]` when no
+source is in snapshot mode. On `PUT`, a `snapshot` given replaces the modes;
+left out, the modes of the sources that stay are kept, so a client that
+knows nothing of it cannot turn it off by saving its source list. A path
+that is not one of the sources, a mode other than those two, a source
+listed twice or a `snapshot` that is not a list is a 400 that changes
+nothing. The answer counts them (`"snapshot":N`) and warns when no helper
+is configured, since only the helper can take a snapshot. A backup reads
+the modes for its paths when it runs, whether its paths came from this
+list or from the request.
+
+A strict source that cannot be read from a snapshot fails the backup before
+anything is read: the job fails with `N source(s) in strict snapshot mode
+cannot be read from a snapshot, so nothing was backed up: <path>: <reason>;
+...`, and no snapshot is written.
+
 A `PUT` during a running backup returns promptly; it does not wait for the
 backup (it did, for the whole run, before B107). The new list applies to
 backups submitted after it: a backup reads the sources when it is submitted,
@@ -1235,6 +1254,8 @@ small-file workers. The job still completes (Manual section 6.3), and says so:
 | `unsettled` | The first 100 of them, each `{"path"}`; `[]` when none |
 | `unsettled_listed` | How many `unsettled` holds |
 | `databases` | What database detection found in what the backup read (`db-detection.md`): `{"findings":[...],"listed":N,"total":N,"sqlite_small":N}`. Present on every completed backup while `db_detect.enabled` is 1. Each finding has `id` (its row in `db_findings`), `engine`, `version` (when known), `path`, `confidence` (`live`, `dormant`), and for a live one `coverage` with `coverage_why`, `method` (`live-read` for a file source), `suggestion` and `optional` (template or action names, section 6 of the design), `unsettled` (files under it that changed during their read) and `evidence` (an object: the marker files, links, journal mode). At most 200 are listed; `sqlite_small` counts dormant SQLite files under `db_detect.sqlite_min_kb`, which are not listed |
+| `source_snapshots` | Present when any source is in snapshot mode (`db-detection.md` 9.4, Manual 6.6): each source read from a snapshot, with `"zfs"` or `"btrfs"` |
+| `live_sources` | With it: each source in `warn` snapshot mode that was read live, `{"path","reason"}`; `[]` when none. The job's warning and the journal name the same paths and reasons |
 
 A file is skipped for still changing on its second read only under
 `backup.unsettled: skip`; by default it is stored and counted in

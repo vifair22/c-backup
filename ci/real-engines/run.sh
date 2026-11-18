@@ -1080,6 +1080,50 @@ test_b186_layout() {
 }
 test_b186_layout
 
+# ---- D4: a file source read from a real btrfs snapshot -------------------
+# Source snapshot mode (db-detection.md 9.4) through the real helper and
+# daemon on the real pool: a live backup, then two snapshot reads of the
+# same quiescent tree store no new tree and open no file (B229: the trees
+# and cache rows are a live read's), a changed file is read again, and no
+# capture is left. The stand-ins in test_source_snapshot_e2e.sh copy, so
+# this is where identity and the cache are proven on btrfs itself.
+
+test_d4_source_snapshot() {
+    local d="$CACHE/appdata/cbk-d4" out r0 r1 r2 r3
+    log "D4: a file source in snapshot mode on btrfs"
+    mkdir -p "$d/sub"
+    for i in 1 2 3 4 5 6; do head -c 20000 /dev/urandom > "$d/f$i"; done
+    echo text > "$d/sub/t.txt"
+    ln "$d/f1" "$d/sub/f1-link"
+    chown -R "$DUID:$DUID" "$d"
+    jget() { jq -r "[.. | .$1? // empty][0] // empty" <<<"$2" 2>/dev/null; }
+    cb sources set 1 "$d" >/dev/null
+    r0=$(cb backup 1 2>&1)
+    job_ok "D4: the live backup" "$r0"
+    cb sources set 1 "$d" --snapshot "$d" >/dev/null
+    r1=$(cb backup 1 2>&1)
+    job_ok "D4: the first snapshot read" "$r1"
+    contains "D4: it was read from a btrfs snapshot" "\"$d\":\"btrfs\"" "$r1"
+    check "D4: a snapshot read of the tree a live read stored adds no tree" 0 "$(jget trees_new "$r1")"
+    check "D4: and opens no file (the live read's cache rows match)" "$(jget files "$r1")" "$(jget files_unchanged "$r1")"
+    check "D4: and stores nothing" 0 "$(jget objects_new "$r1")"
+    r2=$(cb backup 1 2>&1)
+    job_ok "D4: a second snapshot read" "$r2"
+    check "D4: a second snapshot, a new device, still adds no tree" 0 "$(jget trees_new "$r2")"
+    check "D4: and opens no file" "$(jget files "$r2")" "$(jget files_unchanged "$r2")"
+    head -c 20000 /dev/urandom > "$d/f3"
+    r3=$(cb backup 1 2>&1)
+    job_ok "D4: a snapshot read after a change" "$r3"
+    check "D4: only the changed file is read" "$(( $(jget files "$r3") - 1 ))" "$(jget files_unchanged "$r3")"
+    out="$OUT/d4"
+    cb restore 1 "$(snap_of "$r3")" "$out" >/dev/null
+    check "D4: restored at the source's own path, byte for byte" "$(manifest "$d")" "$(manifest "$out$d")"
+    leftovers "after the D4 backups"
+    cb sources set 1 >/dev/null
+    rm -r -- "$d"
+}
+test_d4_source_snapshot
+
 # ---- B229: what a btrfs snapshot keeps of a file ---------------------------
 # A snapshot read is recorded with the record root's live device in the
 # hard-link identity and the file cache key, which only gives the trees and
@@ -1125,7 +1169,7 @@ suite_root() {   # <label> <logfile> <command...>
     [ "$rc" -eq 0 ] || tail -30 "$logf"
 }
 
-log "suites as root: test_privs, test_helper, test_helper_remote, test_snapshot_read, test_helper_e2e.sh"
+log "suites as root: test_privs, test_helper, test_helper_remote, test_snapshot_read, test_helper_e2e.sh, test_source_snapshot_e2e.sh"
 TSCR="$WORK/test-scratch"
 mkdir -p "$TSCR"
 if make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic C_BACKUP_TEST_DIR="$TSCR" \
@@ -1141,6 +1185,8 @@ if make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic C_BACKUP
     check "test_snapshot_read ran its overlay cases" 0 "$(grep -c 'the overlay cases skip' "$WORK/test_snapshot_read.log")"
     suite_root test_helper_e2e.sh "$WORK/test_helper_e2e.log" \
         tests/test_helper_e2e.sh build/bins/c-backupd build/bins/c-backup build/bins/c-backup-helper
+    suite_root test_source_snapshot_e2e.sh "$WORK/test_source_snapshot_e2e.log" \
+        tests/test_source_snapshot_e2e.sh build/bins/c-backupd build/bins/c-backup build/bins/c-backup-helper
 else
     tail -40 "$WORK/build-suites.log"
     bad "the root suites build" "built" "make failed"

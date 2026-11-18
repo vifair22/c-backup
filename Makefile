@@ -449,6 +449,7 @@ test-cli: all $(FREE_PORT)
 test-units: all
 	@$(SCRATCH_GUARD) test_units_e2e.sh ./$(TESTS)/test_units_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 	@$(SCRATCH_GUARD) test_helper_e2e.sh ./$(TESTS)/test_helper_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/c-backup-helper
+	@$(SCRATCH_GUARD) test_source_snapshot_e2e.sh ./$(TESTS)/test_source_snapshot_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/c-backup-helper
 	@$(SCRATCH_GUARD) test_privdrop_e2e.sh ./$(TESTS)/test_privdrop_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 
 # The shell suites each start a daemon and poll jobs on a wall-clock budget,
@@ -564,7 +565,7 @@ _san_test: _build $(SAN_RUN_UNIT) $(FREE_PORT)
 	for t in $(SAN_RUN_UNIT); do run $$(basename $$t $(BIN_SUFFIX)) $$t; done; \
 	for s in $(call san_e2e,test_api_e2e.sh); do run $$s ./$(TESTS)/$$s $(DAEMON_TARGET); done; \
 	for s in $(call san_e2e,test_cli_e2e.sh test_units_e2e.sh); do run $$s ./$(TESTS)/$$s $(DAEMON_TARGET) $(CLI_TARGET); done; \
-	for s in $(call san_e2e,test_helper_e2e.sh); do run $$s ./$(TESTS)/$$s $(DAEMON_TARGET) $(CLI_TARGET) $(HELPER_TARGET); done; \
+	for s in $(call san_e2e,test_helper_e2e.sh test_source_snapshot_e2e.sh); do run $$s ./$(TESTS)/$$s $(DAEMON_TARGET) $(CLI_TARGET) $(HELPER_TARGET); done; \
 	if [ -n "$$fail" ]; then echo "$(BUILD_TYPE) failed:$$fail"; exit 1; fi; \
 	echo "$(BUILD_TYPE): every suite clean"
 endif
