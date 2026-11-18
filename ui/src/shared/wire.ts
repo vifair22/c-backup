@@ -380,3 +380,126 @@ export interface WireDbPreview {
   probe: WireDbProbe | null
   verified: boolean | null
 }
+
+/* ---------------------------------------------------------------- */
+/* Units (docs/api.md, Units; Manual 22)                             */
+/* ---------------------------------------------------------------- */
+
+/* GET /providers: every compiled-in provider, enabled or not. via is
+ * "in-process" or "helper"; a provider behind a helper that cannot be
+ * reached carries connection.last_error and no probe. */
+export interface WireProvider {
+  name: string
+  enabled: boolean
+  via?: 'in-process' | 'helper'
+  connection?: { state: 'connected' | 'disconnected'; since: number; socket: string; last_error?: string }
+  probe?: { available: boolean; version: string; detail: string }
+  probe_error?: string
+}
+
+export interface WireProviders {
+  providers: WireProvider[]
+  daemon_id: string
+  allow: string
+  holds_open: number
+}
+
+/* GET /providers/<p>/units: the provider's live enumeration, held to
+ * units.allow. state is running, paused, stopped, suspended or unknown. */
+export interface WireLiveUnit {
+  unit_key: string
+  unit_id: string
+  name: string
+  state: string
+}
+
+export interface WireLiveUnitPage {
+  units: WireLiveUnit[]
+  total: number
+}
+
+/* GET /providers/<p>/units/<u>: one unit described. kind is blob, block,
+ * tree or stream; a block item is a disk. */
+export interface WireUnitItemDesc {
+  id: string
+  kind: string
+  size: number
+  format?: string
+  source?: string
+  path: string
+}
+
+export interface WireUnitDesc {
+  unit_key: string
+  provider: string
+  unit_id: string
+  name: string
+  state: string
+  caps: string[]
+  items: WireUnitItemDesc[]
+}
+
+/* GET /repos/<id>/units: units with history in this repository, by
+ * name. consistency is the level the newest snapshot achieved. */
+export interface WireRepoUnit {
+  unit_key: string
+  provider: string
+  unit_id: string
+  name: string
+  last_snapshot: number
+  consistency: string
+  snapshots: number
+  last_ts: number
+}
+
+/* One item of a unit snapshot: how it was read this time. */
+export interface WireUnitSnapshotItem {
+  id: string
+  kind: string
+  path: string
+  size: number
+  read_mode: string
+  reason: string
+  bytes_read: number
+}
+
+/* GET /repos/<id>/units/<p>/<u>/snapshots, newest first. */
+export interface WireUnitSnapshot {
+  id: number
+  ts: number
+  name: string
+  consistency: string
+  files: number
+  bytes: number
+  gfs_flags: number
+  items: WireUnitSnapshotItem[]
+}
+
+export interface WireUnitHistory {
+  unit_key: string
+  snapshots: WireUnitSnapshot[]
+}
+
+/* A units job's result: one entry per unit, with its snapshot when it
+ * produced one, its level or its error, and every warning (B202). */
+export interface WireUnitOutcome {
+  unit_key: string
+  name: string
+  status: 'ok' | 'failed'
+  snapshot_id?: number
+  consistency?: string
+  bytes_read?: number
+  files?: number
+  freeze_ms?: number
+  error?: string
+  warning?: string
+  warnings?: string[]
+}
+
+export interface WireUnitBackupResult {
+  units: WireUnitOutcome[]
+  ok: number
+  failed: number
+  filtered: number
+  note?: string
+}

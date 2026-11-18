@@ -58,6 +58,7 @@ interface Props {
   onViewVerify?: () => void
   onViewEncryption?: () => void
   onViewDatabases?: () => void
+  onViewUnits?: () => void
   onViewGrep?: () => void
   onRunBackup?: () => void
   onRunOperation?: (command: MaintenanceOp) => void
@@ -67,7 +68,7 @@ interface Props {
   onPackBrowser?: () => void
 }
 
-export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onViewSchedules, onViewVerify, onViewEncryption, onViewDatabases, onViewGrep, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onViewSchedules, onViewVerify, onViewEncryption, onViewDatabases, onViewUnits, onViewGrep, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
   const [summary, setSummary] = useState<Summary | null>(null)
   const [opsMenu, setOpsMenu] = useState<{ x: number; y: number } | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
@@ -218,6 +219,7 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
         {onViewSchedules && <QBtn onClick={onViewSchedules}>Schedules</QBtn>}
         {onViewVerify && <QBtn onClick={onViewVerify}>Integrity</QBtn>}
         {onViewEncryption && <QBtn onClick={onViewEncryption}>Encryption</QBtn>}
+        {onViewUnits && <QBtn onClick={onViewUnits}>Units</QBtn>}
         {onViewDatabases && (
           <QBtn onClick={onViewDatabases}>
             Databases

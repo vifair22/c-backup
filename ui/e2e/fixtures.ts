@@ -16,7 +16,7 @@
 import { _electron as electron, expect, type ElectronApplication, type Page } from '@playwright/test'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { createServer } from 'node:net'
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -25,6 +25,7 @@ import { join, resolve } from 'node:path'
 export const REPO_ROOT = resolve(__dirname, '..', '..')
 const DAEMON = join(REPO_ROOT, 'build', 'bins', 'c-backupd')
 const CLI = join(REPO_ROOT, 'build', 'bins', 'c-backup')
+const HELPER = join(REPO_ROOT, 'build', 'bins', 'c-backup-helper')
 const APP_MAIN = join(REPO_ROOT, 'ui', 'out', 'main', 'index.js')
 
 export interface HarnessOptions {
@@ -63,6 +64,35 @@ export interface HarnessOptions {
    * to find. Real SQLite files, so an engine copy can actually be made.
    */
   databases?: boolean
+
+  /*
+   * Units through the real helper (Manual 22.2), serving the fake provider
+   * the way tests/test_helper_e2e.sh does: a VM-like unit with a disk, a
+   * container-like one with a data tree on a snapshot domain (so an
+   * in-place restore can stage and swap), and a unit outside units.allow
+   * that must never show. Behind the helper rather than in-process because
+   * a restore as a unit (define) only exists through the helper, and the
+   * helper's fake backend refuses a define check with whatever a test
+   * writes to its state directory, so a refusal travels the whole real
+   * path. Paths: unitPaths(work).
+   */
+  units?: boolean
+}
+
+/* Where the units option puts things, for specs to look at. */
+export function unitPaths(work: string) {
+  return {
+    /* The container's data as the fake provider reads it (its snapshot). */
+    lxcRead: join(work, 'lxc-read'),
+    /* The container's data where it lives, on the dir snapshot domain. */
+    lxcLive: join(work, 'pool', 'lxc', 'web', 'rootfs'),
+    pool: join(work, 'pool'),
+    helperState: join(work, 'hstate'),
+    /* Written there, the helper's fake backend refuses a define check with
+     * the file's text, as a real backend refuses. */
+    refuse: join(work, 'hstate', 'fake-define-refuse'),
+    exports: join(work, 'exports'),
+  }
 }
 
 export interface Harness {
@@ -155,6 +185,40 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     }
   }
 
+  /*
+   * The helper refuses daemon_uid 0 by design and the CI job runs as root,
+   * so there the daemon runs as a fixed non-root uid that owns the work
+   * tree, and the policy stays root's, as the helper requires.
+   */
+  const asRoot = typeof process.getuid === 'function' && process.getuid() === 0
+  const duid = asRoot ? 990 : (process.getuid?.() ?? 0)
+  const dgid = asRoot ? 990 : (process.getgid?.() ?? 0)
+  const hsock = join(work, 'h.sock')
+  if (opts.units) {
+    const u = unitPaths(work)
+    mkdirSync(join(u.lxcRead, 'etc'), { recursive: true })
+    writeFileSync(join(u.lxcRead, 'etc', 'motd'), 'restored from the snapshot\n')
+    mkdirSync(join(u.lxcLive, 'etc'), { recursive: true })
+    writeFileSync(join(u.lxcLive, 'etc', 'motd'), 'the live copy\n')
+    mkdirSync(u.helperState, { recursive: true })
+    writeFileSync(join(work, 'units.json'), JSON.stringify({ units: [
+      { id: 'vm1', name: 'cbk-uat-vm', state: 'running', caps: ['quiesce', 'snapshot'],
+        blobs: [{ id: 'definition', path: '.cbackup-unit/config/domain.xml',
+                  text: '<domain><name>cbk-uat-vm</name></domain>\n' }],
+        disks: [{ id: 'vda', size: 4194304, runs: [{ off: 0, len: 1048576, kind: 'data', seed: 3 }] }] },
+      { id: 'web', name: 'cbk-uat-web', state: 'running', caps: ['pause', 'snapshot'],
+        blobs: [{ id: 'config', path: '.cbackup-unit/config/lxc/config', text: 'lxc.uts.name = web\n' }],
+        trees: [{ id: 'rootfs', read_root: u.lxcRead, path: u.lxcLive, source: u.lxcLive }] },
+      { id: 'x', name: 'other-thing', state: 'stopped' },
+    ] }))
+    writeFileSync(join(work, 'policy.ini'),
+      `[helper]\ndaemon_uid = ${duid}\ndaemon_gid = ${dgid}\ndaemon_id = 0badf00d\n` +
+      `max_pause_s = 30\ncapture_max_s = 3600\nallow_restore = 1\nallow_define = 1\n` +
+      `state_dir = ${u.helperState}\nsocket = ${hsock}\nfake_spec = ${join(work, 'units.json')}\n\n` +
+      `[units]\nallow = fake:cbk-uat-*\n\n[snapshot]\ndir_domains = ${u.pool}\n`)
+    chmodSync(join(work, 'policy.ini'), 0o600)
+  }
+
   if (opts.databases) {
     mkdirSync(join(work, 'src', 'app'), { recursive: true })
     writeFileSync(join(work, 'src', 'app', 'live.db'), emptyWalSqlite())
@@ -174,14 +238,39 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     `http:\n  socket: ${sock}\n  port: ${port}\n  bind: 127.0.0.1\n` +
     `security:\n  key_dir: ${work}/keys\n` +
     `log:\n  level: warn\n` +
-    (opts.databases ? `units:\n  allow: cbk-uat-*\n  fake_spec: ${work}/units.json\n` : ''))
+    (opts.databases ? `units:\n  allow: cbk-uat-*\n  fake_spec: ${work}/units.json\n` : '') +
+    (opts.units ? `units:\n  allow: cbk-uat-*\n  helper_socket: ${hsock}\n` +
+                  `vm:\n  export_dir: ${unitPaths(work).exports}\n` : ''))
 
-  const daemon: ChildProcess = spawn(DAEMON, [], {
-    env: { ...process.env, C_BACKUP_CONFIG_PATH: join(work, 'config.yaml') },
-    stdio: 'ignore',
-  })
+  let helper: ChildProcess | null = null
+  if (opts.units) {
+    if (!existsSync(HELPER)) throw new Error(`build the helper first: ${HELPER}`)
+    if (asRoot) {
+      spawnSync('chown', ['-R', `${duid}:${dgid}`, work])
+      spawnSync('chown', ['0:0', join(work, 'policy.ini')])
+    }
+    helper = spawn(HELPER, ['--policy', join(work, 'policy.ini')], { stdio: 'ignore' })
+    for (let i = 0; i < 120 && !existsSync(hsock); i++) await sleep(50)
+    if (!existsSync(hsock)) throw new Error('helper did not start')
+  }
+
+  const daemon: ChildProcess = opts.units && asRoot
+    ? spawn('setpriv', [`--reuid=${duid}`, `--regid=${dgid}`, '--clear-groups', '--', DAEMON], {
+        env: { ...process.env, C_BACKUP_CONFIG_PATH: join(work, 'config.yaml') },
+        stdio: 'ignore',
+      })
+    : spawn(DAEMON, [], {
+        env: { ...process.env, C_BACKUP_CONFIG_PATH: join(work, 'config.yaml') },
+        stdio: 'ignore',
+      })
   for (let i = 0; i < 120 && !existsSync(sock); i++) await sleep(50)
   if (!existsSync(sock)) throw new Error('daemon did not start')
+  if (opts.units) {
+    /* Connected to the helper before any spec asks for a unit. */
+    for (let i = 0; i < 100 && !cli(sock, ['unit', 'providers']).includes('"state":"connected"'); i++) {
+      await sleep(100)
+    }
+  }
 
   /*
    * Two repositories, because several screens differ by encryption state:
@@ -257,6 +346,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     async close() {
       await h.app.close().catch(() => {})
       daemon.kill()
+      helper?.kill()
       await sleep(200)
       rmSync(work, { recursive: true, force: true })
     },
