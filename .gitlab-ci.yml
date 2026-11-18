@@ -255,9 +255,10 @@ ui-e2e:
     # What the daemon links against, plus what Electron needs to open a
     # window at all. Chromium's list is long and every one of them is a
     # hard requirement: a missing library shows up as the app failing to
-    # start, which reads like the suite is broken.
+    # start, which reads like the suite is broken. libvirt0 and libxml2 are
+    # the helper's: the units spec runs it, serving the fake provider.
     - apt-get install -y -qq --no-install-recommends
-        libmicrohttpd12t64 liblz4-1 libssl3t64 libacl1 libsqlite3-0 libcurl4t64
+        libmicrohttpd12t64 liblz4-1 libssl3t64 libacl1 libsqlite3-0 libcurl4t64 libvirt0 libxml2
         xvfb xauth libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2
         libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1
         libasound2t64 libpango-1.0-0 libcairo2 libgtk-3-0t64
