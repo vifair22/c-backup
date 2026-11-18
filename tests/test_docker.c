@@ -593,6 +593,29 @@ static void test_define_copy(void **state)
     fdk.volumes[0] = fdk.create_mounts[0] = '\0';
 }
 
+/* B188 in place: the re-created container gets the volumes that received
+ * the restored data, by name; an anonymous one is named nowhere but
+ * Config.Volumes and used to come back as a new, empty volume. */
+static void test_define_in_place_volumes(void **state)
+{
+    (void)state;
+    fd_container_t *solo = fd_find(&fdk, "solo");
+    assert_non_null(solo);
+    snprintf(solo->state, sizeof(solo->state), "exited");
+    cJSON *res = NULL;
+    assert_int_equal(copy_define_as("solo", "{\"Binds\":[\"" APPS "/web/www:/a\",\"solodata:/v\","
+                                    "\"/var/run/docker.sock:/var/run/docker.sock\"]}", ",\"replace\":true", 0, &res), OK);
+    cJSON_Delete(res);
+    cJSON *b = cJSON_Parse(fdk.created_body);
+    assert_non_null(b);
+    char *binds = cJSON_PrintUnformatted(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(b, "HostConfig"), "Binds"));
+    cJSON_Delete(b);
+    assert_non_null(binds);
+    assert_string_equal(binds, "[\"" APPS "/web/www:/a\",\"solodata:/v\",\"/var/run/docker.sock:/var/run/docker.sock\","
+                               "\"9e1d:/anon\"]");
+    free(binds);
+}
+
 /* A block device to bind: one made here (root), else the host's first. */
 static int block_device(char *out, size_t sz)
 {
@@ -1148,6 +1171,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_compose, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_copy, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_in_place_volumes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_copy_host_binds, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_compose_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pause_read, setup_units, teardown_units),

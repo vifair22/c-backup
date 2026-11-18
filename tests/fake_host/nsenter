@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# A stand-in for nsenter, for the helper's tests: records the namespaces it
+# was asked to enter, one invocation per line, then runs the command after
+# "--" in this namespace.
+#   $FAKE_HOST_STATE/nsenter.log   "<options> -- <command>"
+set -u
+S=${FAKE_HOST_STATE:?FAKE_HOST_STATE is not set}
+opts=()
+while [ $# -gt 0 ] && [ "$1" != "--" ]; do opts+=("$1"); shift; done
+[ "${1:-}" = "--" ] || { echo "fake nsenter: no --" >&2; exit 2; }
+shift
+echo "${opts[*]} -- $(basename "${1:-}")" >> "$S/nsenter.log"
+exec "$@"

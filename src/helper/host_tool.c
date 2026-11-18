@@ -101,7 +101,8 @@ status_t host_run(const host_tools_t *t, int netns, const char *const *argv,
         full[n++] = "-t";
         full[n++] = "1";
         full[n++] = "-m";
-        if (netns) full[n++] = "-n";
+        if (netns & HOST_NS_NET) full[n++] = "-n";
+        if (netns & HOST_NS_CGROUP) full[n++] = "-C";
         full[n++] = "--";
     }
     for (size_t i = 0; argv[i]; i++) {

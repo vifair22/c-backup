@@ -397,6 +397,7 @@ services:
     volumes:
       - ./db:/data
       - dbvol:/vol
+      - /anon
 volumes:
   dbvol:
 EOF
@@ -404,7 +405,7 @@ printf 'CBK_UAT=1\n' > "$PROJ/.env"
 docker compose -p cbk-uat-proj --project-directory "$PROJ" -f "$PROJ/compose.yaml" up -d --no-build >"$WORK/compose-up.log" 2>&1 ||
     { cat "$WORK/compose-up.log"; die "compose up failed"; }
 PROJ_VOL=cbk-uat-proj_dbvol
-docker exec cbk-uat-proj-db-1 sh -c 'echo vol-v1 > /vol/f; head -c 65536 /dev/urandom > /vol/r.bin; sync' ||
+docker exec cbk-uat-proj-db-1 sh -c 'echo vol-v1 > /vol/f; head -c 65536 /dev/urandom > /vol/r.bin; echo anon-v1 > /anon/f; sync' ||
     die "cannot fill $PROJ_VOL"
 
 # ---- helper and daemon ---------------------------------------------------
@@ -669,6 +670,20 @@ SNAP_VOLS=$(snap_of "$OUT_B")
 leftovers "after the volumes backup"
 have_snap "the volumes backup" "$SNAP_VOLS" || return 0
 
+log "docker: volumes, in place: the restored data is what the container mounts (B188)"
+docker exec cbk-uat-vols sh -c 'echo changed > /named/f; echo changed > /anon/f; sync' >/dev/null 2>&1
+docker stop -t 2 cbk-uat-vols >/dev/null 2>&1
+OUT_D=$(cb unit restore 1 "$SNAP_VOLS" --define --replace --start 2>&1)
+job_ok "in-place restore of a container with volumes" "$OUT_D"
+check "the container runs again" running "$(docker inspect -f '{{.State.Status}}' cbk-uat-vols 2>/dev/null)"
+check "it mounts the same named volume" "$VOLS_NAMED" "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/named"}}{{.Name}}{{end}}{{end}}' cbk-uat-vols 2>/dev/null)"
+check "it mounts the same anonymous volume, not a new one" "$VOLS_ANON" "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/anon"}}{{.Name}}{{end}}{{end}}' cbk-uat-vols 2>/dev/null)"
+check "the named volume holds the restored data" named-v1 "$(docker exec cbk-uat-vols cat /named/f 2>/dev/null)"
+check "the anonymous volume holds the restored data" anon-v1 "$(docker exec cbk-uat-vols cat /anon/f 2>/dev/null)"
+docker ps -aq --filter name=cbk-uat-vols.cbackup-old- | xargs -r docker rm >/dev/null 2>&1
+rm -rf "$DOCKER_ROOT"/volumes/*/_data.cbackup-old-* "$CACHE"/system/docker/volumes/*/_data.cbackup-old-*
+leftovers "after the volumes in-place define"
+
 log "docker: volumes, a restore under a new name never touches the original's (B188)"
 SUM_N=$(vol_sum "$VOLS_NAMED")
 SUM_A=$(vol_sum "$VOLS_ANON")
@@ -748,11 +763,13 @@ contains "the post hook's log is stored" "post-hook-ran" "$(cat "$R/.cbackup-uni
 check "the compose file is stored verbatim" "$COMPOSE_SUM" "$(sha256sum < "$R/.cbackup-unit/config/compose/compose.yaml" 2>/dev/null)"
 
 log "docker: compose project in place"
+docker exec cbk-uat-proj-db-1 sh -c 'echo changed > /anon/f; sync' >/dev/null 2>&1
 docker compose -p cbk-uat-proj --project-directory "$PROJ" -f "$PROJ/compose.yaml" stop >/dev/null 2>&1
 OUT_D=$(cb unit restore 1 "$SNAP_PROJ" --define --replace --start 2>&1)
 job_ok "in-place restore of the project" "$OUT_D"
 check "app is the snapshot's again" "$MAN_APP" "$(manifest "$PROJ/app")"
 check "db is the snapshot's again" "$MAN_DB" "$(manifest "$PROJ/db")"
+check "db's anonymous volume holds the restored data (B188)" anon-v1 "$(docker exec cbk-uat-proj-db-1 cat /anon/f 2>/dev/null)"
 check "the project's services run again" "running running" "$(docker inspect -f '{{.State.Status}}' cbk-uat-proj-app-1 cbk-uat-proj-db-1 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
 leftovers "after the project define"
 
@@ -796,6 +813,18 @@ if lxc-create -P "$LXCP" -n cbk-uat-lxc -f "$WORK/lxc.conf" -t busybox >"$WORK/l
         job_ok "files restore of the LXC snapshot" "$(cb unit restore 1 "$SNAP_LXC" "$R" 2>&1)"
         check "the rootfs restores byte for byte" "$MAN_LXC" "$(manifest "$R$LXCP/cbk-uat-lxc/rootfs")"
         contains "the LXC config is stored" "lxc.rootfs.path" "$(cat "$R/.cbackup-unit/config/lxc/config" 2>/dev/null)"
+
+        # B191: only Docker located a mount's snapshot domain, so an LXC
+        # restore in place was always refused.
+        log "lxc: in place, stopped"
+        echo changed >> "$LXCP/cbk-uat-lxc/rootfs/payload.bin"
+        OUT_I=$(cb unit restore 1 "$SNAP_LXC" --define --replace 2>&1)
+        job_ok "in-place restore of the stopped LXC container" "$OUT_I"
+        check "the rootfs is the snapshot's again" "$MAN_LXC" "$(manifest "$LXCP/cbk-uat-lxc/rootfs")"
+        check "the replaced rootfs was moved aside" 1 "$(ls -d "$LXCP"/cbk-uat-lxc/rootfs.cbackup-old-* 2>/dev/null | wc -l)"
+        check "it is left stopped, as it was" STOPPED "$(lxc-info -P "$LXCP" -n cbk-uat-lxc -s -H 2>/dev/null)"
+        rm -rf "$LXCP"/cbk-uat-lxc/rootfs.cbackup-old-*
+        leftovers "after the LXC in-place restore"
     fi
 
     if lxc-start -P "$LXCP" -n cbk-uat-lxc >"$WORK/lxc-start.log" 2>&1 &&
@@ -806,6 +835,32 @@ if lxc-create -P "$LXCP" -n cbk-uat-lxc -f "$WORK/lxc.conf" -t busybox >"$WORK/l
         contains "frozen around the snapshot: crash consistency" '"consistency":"crash"' "$OUT_B"
         check "and thawed after" RUNNING "$(lxc-info -P "$LXCP" -n cbk-uat-lxc -s -H 2>/dev/null)"
         leftovers "after the running LXC backup"
+        SNAP_LXC2=$(snap_of "$OUT_B")
+        PAY_SUM=$(sha256sum < "$LXCP/cbk-uat-lxc/rootfs/payload.bin")
+
+        # B189: a staging the helper refuses (here the base replaced by a
+        # symlink) is refused before the unit is stopped.
+        log "lxc: in place, refused before the stop"
+        SB="$CACHE/system/.cbackup-restore"
+        mkdir -p "$SB"
+        mv "$SB" "$SB.held"
+        ln -s "$WORK" "$SB"
+        OUT_X=$(cb unit restore 1 "$SNAP_LXC2" --define --replace --start 2>&1)
+        contains "a refused staging fails the restore" '"state":"failed"' "$OUT_X"
+        contains "and says nothing was written" "nothing written" "$OUT_X"
+        check "the container was never stopped" RUNNING "$(lxc-info -P "$LXCP" -n cbk-uat-lxc -s -H 2>/dev/null)"
+        rm -f "$SB"
+        mv "$SB.held" "$SB"
+
+        log "lxc: in place, running, started again"
+        echo changed >> "$LXCP/cbk-uat-lxc/rootfs/payload.bin"
+        OUT_I=$(cb unit restore 1 "$SNAP_LXC2" --define --replace --start 2>&1)
+        job_ok "in-place restore of the running LXC container" "$OUT_I"
+        check "the payload is the snapshot's again" "$PAY_SUM" "$(sha256sum < "$LXCP/cbk-uat-lxc/rootfs/payload.bin")"
+        lxc-wait -P "$LXCP" -n cbk-uat-lxc -s RUNNING -t 20 >/dev/null 2>&1
+        check "and it runs again" RUNNING "$(lxc-info -P "$LXCP" -n cbk-uat-lxc -s -H 2>/dev/null)"
+        rm -rf "$LXCP"/cbk-uat-lxc/rootfs.cbackup-old-*
+        leftovers "after the running LXC in-place restore"
         lxc-stop -P "$LXCP" -n cbk-uat-lxc -k >/dev/null 2>&1
     else
         log "lxc: the container would not start here; running backup not exercised"

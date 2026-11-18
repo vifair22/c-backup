@@ -480,6 +480,18 @@ static const char *abs_of(const cJSON *o, const char *k)
     return v && v[0] == '/' ? v : NULL;
 }
 
+/* Where the backup read tree id (unit.json's source), or NULL. */
+static const char *tree_source(const cJSON *uj, const char *id)
+{
+    const cJSON *it;
+    cJSON_ArrayForEach(it, cJSON_GetObjectItemCaseSensitive(uj, "items")) {
+        const char *iid = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "id"));
+        const char *kd = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "kind"));
+        if (iid && kd && strcmp(kd, "tree") == 0 && strcmp(iid, id) == 0) return abs_of(it, "source");
+    }
+    return NULL;
+}
+
 /* unit.define with the definition txt by sealed memfd; check asks for the
  * refusals only, and defines nothing. */
 static status_t define_send(const char *prov, const char *unit, const char *txt, int check, cJSON **res)
@@ -889,8 +901,31 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
                 err_clear();
             free(ujt);
         }
+        /* Every tree's staging asked first, nothing created (B189): a
+         * refusal (no snapshot domain, a staging on another mount, a path
+         * that resolves elsewhere now) used to come only once the unit was
+         * stopped, and left it stopped. */
+        for (size_t i = 0; st == OK && i < n; i++) {
+            cJSON *a = args_unit(prov, unit), *cr = NULL;
+            const char *real = tree_source(uj, t[i].id);
+            if (a) {
+                cJSON_AddStringToObject(a, "mount", t[i].path);
+                cJSON_AddNumberToObject(a, "job", (double)job_id);
+                if (real) cJSON_AddStringToObject(a, "real", real);
+                cJSON_AddBoolToObject(a, "check", 1);
+            }
+            st = remote_op(prov, "restore.stage", a, -1, &cr);
+            if (st == OK && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cr, "checked")))
+                st = set_error(ERR_IO, "the helper answered a staging check with a staging");
+            cJSON_Delete(cr);
+            if (st != OK) {
+                char cwhy[600];
+                snprintf(cwhy, sizeof(cwhy), "%.590s", err_msg());
+                st = set_error(st, "unit restore refused, nothing written, %s:%s left as it was: %s", prov, unit, cwhy);
+            }
+        }
         cJSON *sr = NULL;
-        st = remote_op(prov, "unit.stop", args_unit(prov, unit), -1, &sr);
+        if (st == OK) st = remote_op(prov, "unit.stop", args_unit(prov, unit), -1, &sr);
         if (st == OK) {
             const cJSON *wr = cJSON_GetObjectItemCaseSensitive(sr, "was_running");
             stopped = 1;
@@ -901,13 +936,7 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
         for (size_t i = 0; st == OK && i < n; i++) {
             cJSON *a = args_unit(prov, unit);
             sr = NULL;
-            const char *real = NULL;
-            const cJSON *it;
-            cJSON_ArrayForEach(it, cJSON_GetObjectItemCaseSensitive(uj, "items")) {
-                const char *id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "id"));
-                const char *kd = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "kind"));
-                if (id && kd && strcmp(kd, "tree") == 0 && strcmp(id, t[i].id) == 0) real = abs_of(it, "source");
-            }
+            const char *real = tree_source(uj, t[i].id);
             if (a) {
                 cJSON_AddStringToObject(a, "mount", t[i].path);
                 cJSON_AddNumberToObject(a, "job", (double)job_id);

@@ -1895,6 +1895,46 @@ static status_t copy_created_ok(struct sp_ctx *c, const char *cid, const cJSON *
 static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
                                const helper_policy_t *pol, cJSON **result);
 
+/*
+ * In place (B188): the volumes that received the restored data, attached
+ * again by name. A volume the recorded HostConfig names (Binds "name:/d",
+ * Mounts) is attached by that; an anonymous one is named nowhere but in
+ * Config.Volumes, so the re-created container got a new, empty volume and
+ * the restored data stayed in the old one, with the job reported
+ * completed. Each recorded volume whose destination nothing in hc covers
+ * is added to Binds by its name.
+ */
+static status_t reattach_volumes(cJSON *hc, const cJSON *orig)
+{
+    char src[PATH_MAX], dst[PATH_MAX];
+    const cJSON *m;
+    cJSON_ArrayForEach(m, orig) {
+        const char *name = jstr(m, "Name"), *od = jstr(m, "Destination");
+        if (strcmp(jstr(m, "Type"), "volume") != 0 || !name[0] || !od[0]) continue;
+        int covered = 0;
+        const cJSON *b;
+        cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Binds")) {
+            const char *v = cJSON_GetStringValue(b);
+            if (!v) continue;
+            bind_parts(v, src, sizeof(src), dst, sizeof(dst));
+            covered |= strcmp(dst, od) == 0;
+        }
+        cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(hc, "Mounts"))
+            covered |= strcmp(jstr(b, "Target"), od) == 0;
+        if (covered) continue;
+        cJSON *binds = cJSON_GetObjectItemCaseSensitive(hc, "Binds");
+        if (!cJSON_IsArray(binds)) {
+            cJSON_DeleteItemFromObjectCaseSensitive(hc, "Binds");
+            if (!(binds = cJSON_AddArrayToObject(hc, "Binds"))) return set_error(ERR_NOMEM, "docker: define");
+        }
+        char v[PATH_MAX * 2];
+        snprintf(v, sizeof(v), "%.200s:%.4000s%s", name, od,
+                 cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(m, "RW")) ? ":ro" : "");
+        cJSON_AddItemToArray(binds, cJSON_CreateString(v));
+    }
+    return OK;
+}
+
 /* Every refusal of a standalone define that needs no Docker call: the
  * name, privileged settings and binds, and for a copy the B188 rule. */
 static status_t solo_refusals(const struct sp_ctx *c, const cJSON *d, const helper_policy_t *pol,
@@ -2013,7 +2053,10 @@ static status_t d_define(sp_ctx_t *c, const char *unit_id, const char *definitio
             bc->child = NULL;
             cJSON_Delete(bc);
             for (cJSON *x = child; x; ) { cJSON *nx = x->next; x->prev = x->next = NULL; cJSON_AddItemToObject(b, x->string, x); x = nx; }
-            if (hc) cJSON_AddItemToObject(b, "HostConfig", cJSON_Duplicate(hc, 1));
+            cJSON *bhc = hc ? cJSON_Duplicate(hc, 1) : cJSON_CreateObject();
+            if (bhc && !copy && reattach_volumes(bhc, orig_mounts) != OK) { cJSON_Delete(bhc); bhc = NULL; }
+            if (!bhc) st = set_error(ERR_NOMEM, "docker: create body");
+            if (bhc) cJSON_AddItemToObject(b, "HostConfig", bhc);
             const cJSON *nets = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(in, "NetworkSettings"), "Networks");
             cJSON *ep = cJSON_CreateObject();
             const cJSON *n;
@@ -2031,7 +2074,7 @@ static status_t d_define(sp_ctx_t *c, const char *unit_id, const char *definitio
             cJSON_Delete(bc);
         }
         cJSON_Delete(b);
-        if (!body) st = set_error(ERR_NOMEM, "docker: create body");
+        if (st == OK && !body) st = set_error(ERR_NOMEM, "docker: create body");
     }
     cJSON *made = NULL, *vols_before = NULL;
     if (st == OK && copy) st = volumes_now(c, &vols_before);

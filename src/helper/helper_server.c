@@ -1601,6 +1601,82 @@ static void stage_drop(helper_server_t *s, const char *token)
         }
 }
 
+#ifndef STATX_MNT_ID
+#define STATX_MNT_ID 0x00001000U
+#endif
+
+/*
+ * Whether two directories are on one mount: the swap is a rename, which is
+ * EXDEV across a mount boundary even within one filesystem (a bind mount,
+ * as dockerd makes of a data root that is not already a mount point), and
+ * st_dev does not show that. 1 when they are, 0 when not, and 1 too where
+ * the kernel cannot say (no STATX_MNT_ID before 5.8): the swap still
+ * refuses then, only later.
+ */
+static int same_mount(int afd, const char *apath, int bfd, const char *bpath)
+{
+    struct statx a, b;
+    if (statx(afd, apath, AT_SYMLINK_NOFOLLOW | (apath[0] ? 0 : AT_EMPTY_PATH), STATX_MNT_ID, &a) != 0 ||
+        statx(bfd, bpath, AT_SYMLINK_NOFOLLOW | (bpath[0] ? 0 : AT_EMPTY_PATH), STATX_MNT_ID, &b) != 0 ||
+        !(a.stx_mask & STATX_MNT_ID) || !(b.stx_mask & STATX_MNT_ID))
+        return 1;
+    return a.stx_mnt_id == b.stx_mnt_id;
+}
+
+/* The directory holding real, for the same-filesystem checks. */
+static void parent_of(const char *real, char *parent, size_t psz)
+{
+    if (snprintf(parent, psz, "%.4000s", real) >= (int)psz) { parent[0] = '\0'; return; }
+    char *sl = strrchr(parent, '/');
+    if (sl && sl != parent) *sl = '\0';
+}
+
+/*
+ * restore.stage with check (B189): every refusal of a real stage, made
+ * before the daemon stops the unit, and nothing created. A refusal used to
+ * come only once the unit was stopped, and a restore refused for, say, no
+ * snapshot domain left the unit down. The base is walked as open_base
+ * walks it, without creating what is missing: what exists must be a
+ * directory and not a symlink, and the deepest part that exists must be on
+ * the mount's filesystem and mount.
+ */
+static char *stage_check(helper_server_t *s, const helper_req_t *r, const char *dom, const char *base,
+                         const char *real)
+{
+    (void)s;
+    char rest[PATH_MAX], at[PATH_MAX];
+    snprintf(rest, sizeof(rest), "%s", base + strlen(dom));
+    snprintf(at, sizeof(at), "%s", dom);
+    char *save = NULL;
+    for (char *c = strtok_r(rest, "/", &save); c; c = strtok_r(NULL, "/", &save)) {
+        char next[PATH_MAX];
+        if (snprintf(next, sizeof(next), "%s/%s", at, c) >= (int)sizeof(next))
+            return resp_error(r->id, HELPER_E_INVALID, "path too long");
+        struct stat sb;
+        if (lstat(next, &sb) != 0) break;            /* made at the stage */
+        if (!S_ISDIR(sb.st_mode))
+            return resp_error(r->id, HELPER_E_DENIED, "restore staging %.300s: %.100s is a symlink or not a "
+                              "directory; not followed", base, c);
+        snprintf(at, sizeof(at), "%s", next);
+    }
+    char parent[PATH_MAX];
+    parent_of(real, parent, sizeof(parent));
+    struct stat as, ps;
+    if (stat(at, &as) != 0 || stat(parent, &ps) != 0)
+        return resp_error(r->id, HELPER_E_FAILED, "cannot stat %.300s or %.300s: %s", at, parent, strerror(errno));
+    if (as.st_dev != ps.st_dev || !same_mount(AT_FDCWD, at, AT_FDCWD, parent))
+        return resp_error(r->id, HELPER_E_DENIED, "restore staging %.300s is on another filesystem or mount "
+                          "from %.300s, so the swap could not be a rename; set [snapshot] "
+                          "restore_staging_dirs to a directory on its filesystem", base, real);
+    cJSON *res = cJSON_CreateObject();
+    if (res) {
+        cJSON_AddBoolToObject(res, "checked", 1);
+        cJSON_AddStringToObject(res, "base", base);
+        cJSON_AddStringToObject(res, "real", real);
+    }
+    return resp_ok(r->id, res);
+}
+
 static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
 {
     if (!s->pol->allow_restore) return resp_error(r->id, HELPER_E_DENIED, "the policy does not allow restore");
@@ -1647,11 +1723,11 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     if (helper_random_hex(uniq, 4) != OK) return resp_error(r->id, HELPER_E_FAILED, "no randomness");
     if (staging_base(s, dom, base, sizeof(base), swhy, sizeof(swhy)) != 0)
         return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
+    if (r->check) return stage_check(s, r, dom, base, real);
     snprintf(jname, sizeof(jname), "%lld-%s", (long long)r->job, uniq);
     if (snprintf(path, sizeof(path), "%s/%s", base, jname) >= (int)sizeof(path))
         return resp_error(r->id, HELPER_E_INVALID, "path too long");
-    /* Under mu: a swap removes the base once it is empty (staging_tidy),
-     * and must not do so between opening it and making the job directory. */
+    /* Under mu, with staging_tidy removing another job's directory. */
     int bfd = -1, jfd = -1;
     pthread_mutex_lock(&s->mu);
     int ob = open_base(dom, base, &bfd, swhy, sizeof(swhy));
@@ -1677,11 +1753,9 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     int other_fs = 0;
     if (!fail) {
         char parent[PATH_MAX];
-        if (snprintf(parent, sizeof(parent), "%.4000s", real) >= (int)sizeof(parent)) parent[0] = '\0';
-        char *sl = strrchr(parent, '/');
-        if (sl && sl != parent) *sl = '\0';
+        parent_of(real, parent, sizeof(parent));
         struct stat ps;
-        other_fs = stat(parent, &ps) == 0 && ps.st_dev != js.st_dev;
+        other_fs = stat(parent, &ps) == 0 && (ps.st_dev != js.st_dev || !same_mount(jfd, "", AT_FDCWD, parent));
     }
     if (fail || other_fs) {
         if (jfd >= 0) close(jfd);
@@ -1689,7 +1763,7 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
         close(bfd);
         if (other_fs)
             return resp_error(r->id, HELPER_E_DENIED, "restore staging %.300s is on another filesystem "
-                              "from %.300s, so the swap could not be a rename; set [snapshot] "
+                              "or mount from %.300s, so the swap could not be a rename; set [snapshot] "
                               "restore_staging_dirs to a directory on its filesystem", base, real);
         return resp_error(r->id, HELPER_E_FAILED, "restore staging %s: %s", path, fail);
     }
@@ -1782,25 +1856,30 @@ static void swap_unclaim(helper_server_t *s, const char *token)
 }
 
 /*
- * After a swap, what of the staging is empty goes (B168: an empty
- * <domain>/.cbackup-restore was left at the top of the domain): the
- * staging directory of a disk image, whose image moved out of it, and the
- * base when it is the helper's own .cbackup-restore with nothing else in
- * it. An operator's restore_staging_dirs entry is theirs and stays. rmdir
- * only, so anything another restore still has there is safe, and under mu
- * against a stage making the base at the same time.
+ * After a swap, the staging directory of a disk image, which the image has
+ * moved out of, goes. Nothing else does, and never the base (B187): the
+ * base is the directory the daemon has bind-mounted (<domain>/.cbackup-restore
+ * in the deployment), and removing it once it was empty (B168) detached
+ * that bind, so every later in-place restore into the domain, and the
+ * second mount of a unit with two in one domain, failed EROFS writing into
+ * a directory that no longer existed. An empty base is left in place.
+ * What is removed is chosen by identity, not by name: the job directory
+ * pinned at stage, through the pinned base fd, and only while it is still
+ * that directory, so no spelling of a path (an operator's
+ * restore_staging_dirs entry, a symlink, a planted directory) can make the
+ * tidy remove anything it did not create. rmdir semantics, so a directory
+ * that is not empty stays. Caller holds the pinned fds open.
  */
-static void staging_tidy(helper_server_t *s, const char *dir, int file)
+static void staging_tidy(helper_server_t *s, const staging_t *st)
 {
-    char base[HELPER_PATH_MAX + 1];
-    if (snprintf(base, sizeof(base), "%s", dir) >= (int)sizeof(base)) return;
-    char *sl = strrchr(base, '/');
-    if (!sl || sl == base) return;
-    *sl = '\0';
-    const char *leaf = strrchr(base, '/');
+    if (st->file != 2 || st->base_fd < 0) return;
+    struct stat bs, js;
     pthread_mutex_lock(&s->mu);
-    if (file == 2) (void)rmdir(dir);
-    if (leaf && strcmp(leaf, "/.cbackup-restore") == 0) (void)rmdir(base);
+    if (fstat(st->base_fd, &bs) == 0 && bs.st_dev == st->base_dev && bs.st_ino == st->base_ino &&
+        fstatat(st->base_fd, st->job_name, &js, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(js.st_mode) &&
+        js.st_dev == st->job_dev && js.st_ino == st->job_ino &&
+        !(js.st_dev == bs.st_dev && js.st_ino == bs.st_ino))
+        (void)unlinkat(st->base_fd, st->job_name, AT_REMOVEDIR);
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -1842,8 +1921,8 @@ static char *swap_undo(helper_server_t *s, const helper_req_t *r, const staging_
     if (sl == parent) sl[1] = '\0'; else *sl = '\0';
     const char *on = strrchr(st->old, '/');
     snprintf(oldname, sizeof(oldname), "%s", on ? on + 1 : st->old);
-    /* The staging directory again, and its base, which the swap may have
-     * removed as empty. */
+    /* The staging directory again (a disk image's was removed at the
+     * swap), through its base opened again from the domain. */
     pthread_mutex_lock(&s->mu);
     int bad = open_base(st->dom, st->base, &bfd, why, sizeof(why)) != 0 ||
               give_base(s, bfd, st->base, why, sizeof(why)) != 0;
@@ -1927,8 +2006,6 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
     char parent[HELPER_PATH_MAX + 1], name[HELPER_PATH_MAX + 1], old[HELPER_PATH_MAX + 40], prev[HELPER_PATH_MAX + 72] = "";
     int pfd = -1, had = 0, old_aside = 1;
     struct stat sb;
-    char sdir[HELPER_PATH_MAX + 1];
-    snprintf(sdir, sizeof(sdir), "%s", st.path);
     snprintf(parent, sizeof(parent), "%s", st.real);
     char *sl = strrchr(parent, '/');
     if (!sl || !sl[1]) { snprintf(why, sizeof(why), "%.300s has no parent", st.real); code = HELPER_E_INVALID; goto refuse; }
@@ -2005,6 +2082,8 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
         snprintf(why, sizeof(why), "swap: %s", strerror(errno));
         goto refuse;
     }
+    /* The emptied staging of a disk image, through the fds still pinned. */
+    staging_tidy(s, &st);
     /* Kept for an undo (B167); the pinned fds are done with. had: 1 the
      * old data is beside the mount, -1 it stayed in the staging and an
      * undo is left to the operator. */
@@ -2018,7 +2097,6 @@ static char *op_restore_swap(helper_server_t *s, const helper_req_t *r)
             snprintf(s->stages[i].old, sizeof(s->stages[i].old), "%.*s", (int)sizeof(s->stages[i].old) - 1, prev);
         }
     pthread_mutex_unlock(&s->mu);
-    staging_tidy(s, sdir, st.file);
     /* Durable before it is reported: a power cut must not undo a swap the
      * daemon was told happened. The staging is tidied first either way. */
     {
