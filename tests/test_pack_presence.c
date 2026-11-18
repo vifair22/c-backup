@@ -33,6 +33,9 @@
  *               uuid, no repair overriding it, nothing recorded or
  *               written; the all-missing repair refused under another
  *               repository's marker
+ *   FLAKE-28    the repair route queues a job: submitted while another
+ *               job holds the repository, it waits and completes after
+ *               it, where it used to answer 503
  */
 
 #include <setjmp.h>
@@ -63,7 +66,13 @@
 #include "store.h"
 #include "store_index.h"
 #include "verify.h"
+#include "job_manager.h"
+#include "routes.h"
+#include "server.h"
 #include "test_tmp.h"
+
+#include <pthread.h>
+#include <stdatomic.h>
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_pack_presence"
 #define TEST_DB   TEST_DIR "/state.db"
@@ -1386,6 +1395,101 @@ static void test_all_missing_repair_needs_this_marker(void **state)
     assert_int_equal(pp.packs_dropped, 1);
 }
 
+/*
+ * FLAKE-28: a repair submitted while another job holds the repository.
+ * The route tried the repo lock itself and answered 503 "repository is
+ * busy" whenever anything held it - in CI, a scheduled gc. It is a job
+ * now: accepted, queued behind the holder, and run once the holder ends.
+ */
+static atomic_int g_hold_open;
+static atomic_int g_hold_running;
+
+static status_t holding_job(void *arg, atomic_int *cancel,
+                            void (*progress)(const char *, uint64_t, uint64_t, void *),
+                            void *progress_ctx)
+{
+    (void)arg; (void)cancel; (void)progress; (void)progress_ctx;
+    g_hold_running = 1;
+    for (int i = 0; i < 1000 && !g_hold_open; i++) usleep(10000);
+    return OK;
+}
+
+static int job_reaches(int64_t id, const char *want)
+{
+    char q[96];
+    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM jobs WHERE id = %lld AND state = '%s'",
+             (long long)id, want);
+    for (int i = 0; i < 1000; i++) {
+        if (scalar(q) == 1) return 1;
+        usleep(5000);
+    }
+    return 0;
+}
+
+static void test_a_repair_waits_for_the_job_holding_the_repo(void **state)
+{
+    (void)state;
+    int64_t ids[3];
+    three_packs(ids);
+    remove_pack(pack_of("c"));
+    remove_pack(pack_of("b"));       /* braked: only a repair accepts it */
+    pack_presence_t pp;
+    assert_int_equal(pack_presence_check(db, repo_id, 0, &pp), OK);
+    assert_true(pp.degraded);
+
+    job_manager_t *jm = NULL;
+    assert_int_equal(job_manager_start(db, 2, &jm), OK);
+    routes_snapshots_init(db, jm);
+    api_server_t *srv = api_server_create(0, NULL, NULL, NULL);
+    assert_non_null(srv);
+    assert_int_equal(routes_register_repos(srv, db), 0);
+
+    g_hold_open = 0;
+    g_hold_running = 0;
+    int64_t holder = 0;
+    assert_int_equal(job_submit(jm, repo_id, "gc", NULL, holding_job, NULL, NULL, &holder), OK);
+    for (int i = 0; i < 1000 && !g_hold_running; i++) usleep(5000);
+    assert_true(g_hold_running);
+
+    char url[64];
+    snprintf(url, sizeof(url), "/repos/%lld/repair", (long long)repo_id);
+    const char *body_in = "{\"accept_missing\":true}";
+    api_request_t req = { .method = API_POST, .url = url, .body = body_in,
+                          .body_len = strlen(body_in), .is_local = 1, .client_addr = "" };
+    api_response_t r = api_server_dispatch(srv, &req);
+    assert_int_equal(r.status, 202);
+    assert_non_null(r.body);
+    const char *jp = strstr(r.body, "\"job_id\":");
+    assert_non_null(jp);
+    int64_t repair = strtoll(jp + 9, NULL, 10);
+    free(r.body);
+    free(r.set_cookie);
+
+    /* Queued behind the holder, nothing accepted yet. */
+    assert_true(job_reaches(repair, "queued"));
+    usleep(200 * 1000);
+    assert_true(job_reaches(repair, "queued"));
+    assert_true(pack_presence_degraded(db, repo_id, NULL, 0));
+
+    g_hold_open = 1;
+    assert_true(job_reaches(holder, "completed"));
+    assert_true(job_reaches(repair, "completed"));
+    char q[160];
+    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM jobs a, jobs b WHERE a.id = %lld"
+             " AND b.id = %lld AND a.started >= b.ended", (long long)repair, (long long)holder);
+    assert_int_equal(scalar(q), 1);
+    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM jobs WHERE id = %lld AND result LIKE"
+             " '%%\"packs_dropped\":2,%%'", (long long)repair);
+    assert_int_equal(scalar(q), 1);
+    assert_false(pack_presence_degraded(db, repo_id, NULL, 0));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM journal WHERE repo_id = ?"
+                            " AND operation = 'repair' AND result = 'success'"), 1);
+
+    api_server_stop(srv);
+    job_manager_stop(jm);
+    routes_snapshots_init(NULL, NULL);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1415,6 +1519,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_the_tombstone_floors_a_lost_mark, setup, teardown),
         cmocka_unit_test_setup_teardown(test_swapped_roots_are_unavailable, setup, teardown),
         cmocka_unit_test_setup_teardown(test_all_missing_repair_needs_this_marker, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_repair_waits_for_the_job_holding_the_repo, setup, teardown),
     };
     return cmocka_run_group_tests_name("pack_presence", tests, NULL, NULL);
 }

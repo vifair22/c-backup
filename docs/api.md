@@ -231,7 +231,6 @@ disk (Manual section 6.4 has the numbers measured during a backup).
 | DELETE | `/repos/<id>/snapshots/<sid>` | durable | Every delete |
 | DELETE | `/repos/<id>/schedules/<sid>` | durable | Every delete |
 | DELETE | `/exports/<id>` | durable | Every delete |
-| POST | `/repos/<id>/repair` | durable | Accepts missing packs as lost: deletes index rows |
 | PUT | `/repos/<id>/sources`, `/repos/<id>/policy` | commit-only | DB-only edit; repeat it if a cut takes it |
 | POST, PUT | `/repos/<id>/schedules`, `/repos/<id>/schedules/<sid>` | commit-only | DB-only edit |
 | PUT | `/repos/<id>/snapshots/<sid>/note` | commit-only | DB-only edit |
@@ -239,7 +238,7 @@ disk (Manual section 6.4 has the numbers measured during a backup).
 | PUT | `/repos/<id>/units/<p>/<u>/policy` | commit-only | DB-only edit |
 | POST | `/repos/<id>/units/<p>/<u>/reset-incremental` | commit-only | DB-only edit; the next session reads in full either way |
 | POST | `/jobs/<id>` (cancel) | commit-only | A cut interrupts the job anyway |
-| POST | `/repos/<id>/backup`, `grep`, `verify`, `gc`, `gfs`, `reindex`, `replicate`, `snapshots/<sid>/restore`, `units/backup`, `snapshots/<sid>/unit/restore`, `snapshots/<sid>/unit/export` | commit-only | Job submissions: a job a cut catches is reported interrupted, or never started. `gc` and `gfs` delete in their jobs, which make each commit durable before removing what it describes |
+| POST | `/repos/<id>/backup`, `grep`, `verify`, `gc`, `gfs`, `reindex`, `replicate`, `repair`, `snapshots/<sid>/restore`, `units/backup`, `snapshots/<sid>/unit/restore`, `snapshots/<sid>/unit/export` | commit-only | Job submissions: a job a cut catches is reported interrupted, or never started. `gc` and `gfs` delete in their jobs, which make each commit durable before removing what it describes; `repair` makes the index rows it deletes durable before it completes |
 
 ## Public
 
@@ -349,7 +348,7 @@ host always has a way in.
 | GET | `/repos` | List, by id; `limit` (default and maximum 1000) and `offset` |
 | POST | `/repos` | Register: `{path, label}`; `label` follows the snapshot label rule (at most 256 bytes of printable UTF-8) |
 | GET | `/repos/<id>` | One repository, the same object as each entry of the list. `state` is `ok`, `degraded` or `unavailable`. `degraded` is null, or why the repository refuses backups (too many packs missing at once); `unavailable` is null, or why the repository is not there to work on (no marker, `packs/` unreadable or replaced, every pack missing), checked when asked. Manual section 17.6 |
-| POST | `/repos/<id>/repair` | `{"accept_missing":true}`: accept a degraded repository's missing packs as lost, marking their objects absent so the next backup stores them again. Without `accept_missing` a 400; 503 while a job holds the repository; 409 when the repository is unavailable (no marker, or `packs/` unreadable). Every pack missing does not stop the repair, and neither does a replaced `packs/` with packs missing from it when the root's marker is the registered one: its new device:inode is recorded (Manual section 17.6). Answers `{packs_checked, packs_missing, packs_unknown, packs_dropped, objects_absent, packs_returned, objects_restored, degraded}`, where `packs_returned` counts dropped packs that were back and indexed again |
+| POST | `/repos/<id>/repair` | `{"accept_missing":true}`: accept a degraded repository's missing packs as lost, marking their objects absent so the next backup stores them again. Without `accept_missing` a 400. Otherwise a job, answered 202 `{"job_id":N}` and queued behind any job holding the repository like every other repo-scoped job; the job fails, naming why, when the repository is unavailable (no marker, or `packs/` unreadable). Every pack missing does not stop the repair, and neither does a replaced `packs/` with packs missing from it when the root's marker is the registered one: its new device:inode is recorded (Manual section 17.6). The job's `result` is `{packs_checked, packs_missing, packs_unknown, packs_dropped, objects_absent, packs_returned, objects_restored, degraded}`, where `packs_returned` counts dropped packs that were back and indexed again |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it. `{"removed":true,"id"}` |
 
 `POST /repos` normalises the path (no `//`, `.`, `..` or trailing slash) and

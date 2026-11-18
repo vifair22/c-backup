@@ -56,8 +56,6 @@ static const decided_t DECIDED[] = {
     { API_DELETE, "/repos/1",                                 D },
     { API_POST,   "/repos/1/key/import",                      C },
     { API_POST,   "/repos/1/key/ack",                         C },
-    /* The operator accepting packs as lost: deletes index rows. */
-    { API_POST,   "/repos/1/repair",                          D },
     { API_POST,   "/repos/1/tags",                            D },
     { API_DELETE, "/repos/1/tags/keep",                       D },
     { API_POST,   "/repos/1/schedules",                       C },
@@ -76,6 +74,9 @@ static const decided_t DECIDED[] = {
     { API_POST,   "/repos/1/gfs",                             C },
     { API_POST,   "/repos/1/reindex",                         C },
     { API_POST,   "/repos/1/replicate",                       C },
+    /* The operator accepting packs as lost: a job since FLAKE-28, which
+     * makes the index rows it deletes durable before it completes. */
+    { API_POST,   "/repos/1/repair",                          C },
     { API_POST,   "/repos/1/snapshots/2/restore",             C },
     { API_POST,   "/repos/1/units/backup",                    C },
     { API_PUT,    "/repos/1/units/fake/u1/policy",            C },

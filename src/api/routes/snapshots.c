@@ -2451,3 +2451,8 @@ void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)
     g_ctx.db = db;
     g_ctx.jm = jm;
 }
+
+job_manager_t *routes_job_manager(void)
+{
+    return g_ctx.jm;
+}
