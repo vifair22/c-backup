@@ -2274,6 +2274,29 @@ sudo c-backup jobs 1                               # until "state":"completed"
 whose key was loaded after it was registered, or to rebuild again.
 
 Reindex walks every snapshot's trees, at roughly 764,000 rows per second.
+
+**A full reindex stalls edits while it runs.** Each snapshot that already
+has index rows is rebuilt in one transaction, and the pack index and the
+registry passes are long transactions of their own, so the database's write
+lock is held for seconds at a time, not for the bounded batches a backup
+holds it for (section 6.4): a tag, note, policy or sources edit issued
+during a reindex waits for the transaction in progress, and edits get
+through only between them. Measured on NVMe (Samsung 990 PRO, `state.db`
+and the repository on the same disk) with one snapshot of small files:
+
+| Files in the snapshot | Reindex, wall time | Longest wait of a `tag set` issued during it |
+|---|---|---|
+| 200,000 | 5.4 s | 4.4 s |
+| 622,000 (two runs) | 18.9 s, 19.3 s | 13.9 s, 6.1 s |
+
+Both grow about linearly with the snapshot, about 30 us per file here, and
+with every snapshot the repository holds; on slower storage under
+`state.db` they are longer. Run a reindex when nothing needs to edit the
+repository. A snapshot with no index rows yet (a database loss, a backup
+whose index did not commit) is indexed in batches and does not hold the
+lock this way; batching the rebuild of indexed snapshots is planned for
+1.1.
+
 It fails, rather than completing, if any snapshot or pack cannot be read: the
 readable snapshots are indexed, and anything unreadable keeps whatever index
 rows it already had, so a reindex never replaces a populated index with an
