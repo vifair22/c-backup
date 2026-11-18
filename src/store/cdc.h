@@ -162,7 +162,9 @@ typedef struct {
     /* Read by settle_store_fd, not the chunker: how many reads a file that
      * moves under them is given (0: the default, two). One for a database
      * with an engine copy (db-detection.md 9.5): the re-read exists to get
-     * a consistent version, which the copy now provides. */
+     * a consistent version, which the copy now provides; and such a file
+     * is stored flagged even under `backup.unsettled: skip`, since the raw
+     * file is always kept beside its copy. */
     unsigned       settle_reads;
 } cdc_opts_t;
 

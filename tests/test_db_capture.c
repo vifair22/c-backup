@@ -36,6 +36,7 @@
 #include "repo.h"
 #include "repo_key.h"
 #include "restore.h"
+#include "settle.h"
 #include "sqlite_copy.h"
 #include "store.h"
 #include "store_index.h"
@@ -299,6 +300,13 @@ static void test_raw_read_once_with_copy(void **state)
     backup_result_free(&res);
     /* With one: read once and flagged, never re-read (9.5). */
     res = run_grow(1);
+    assert_int_equal(res.changed_unsettled, 1);
+    assert_int_equal(res.files_skipped, 0);
+    backup_result_free(&res);
+    /* And kept under the skip policy too: the raw file always stays. */
+    settle_set_unsettled_policy(SETTLE_UNSETTLED_SKIP);
+    res = run_grow(1);
+    settle_set_unsettled_policy(SETTLE_UNSETTLED_STORE_FLAGGED);
     assert_int_equal(res.changed_unsettled, 1);
     assert_int_equal(res.files_skipped, 0);
     backup_result_free(&res);

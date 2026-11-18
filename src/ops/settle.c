@@ -43,9 +43,11 @@ int settle_stat_same(const struct stat *a, const struct stat *b)
  * (a file that shrank under it comes up short) produced nothing whole, so
  * there is nothing to store whatever the policy says.
  */
-static settle_outcome_t settle_on_unsettled(status_t read_st, settle_result_t *sr)
+static settle_outcome_t settle_on_unsettled(status_t read_st, settle_result_t *sr, int keep_raw)
 {
-    switch (settle_unsettled_policy()) {
+    /* A database with an engine copy keeps its raw file as read whatever
+     * the policy (db-detection.md 13): both are stored, always. */
+    switch (keep_raw ? SETTLE_UNSETTLED_STORE_FLAGGED : settle_unsettled_policy()) {
     case SETTLE_UNSETTLED_STORE_FLAGGED:
         if (read_st == OK) {
             sr->unsettled = 1;
@@ -151,7 +153,7 @@ status_t settle_store_fd(const cdc_params_t *cp, int fd, const struct stat *scan
                 sr->outcome = SETTLE_SKIP;
                 return OK;
             }
-            sr->outcome = settle_on_unsettled(st, sr);
+            sr->outcome = settle_on_unsettled(st, sr, opts && opts->settle_reads == 1);
             if (sr->outcome == SETTLE_STORED) sr->st = before;
             if (sr->outcome == SETTLE_SKIP && discard) discard(discard_ctx);
             err_clear();
