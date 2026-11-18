@@ -309,6 +309,60 @@ typedef struct {
     char unit_id[SP_UNIT_ID_MAX];
 } sp_define_result_t;
 
+/*
+ * units.probe (db-detection.md 8.1): what runs in a unit now, for database
+ * detection's liveness and hints. Per container: its name, the names it
+ * answers to on its networks (for resolving a Nextcloud dbhost), its image
+ * reference as configured, its processes (command name and the first 256
+ * bytes of the arguments, NULs as spaces; one per distinct pair), the TCP
+ * ports it listens on in its own network namespace, and the files under
+ * the unit's included mounts that a process holds open for writing, as
+ * recorded paths. Nothing outside the included mounts is ever named.
+ * Bounded: a probe that had more than fits sets truncated and lists what
+ * did. Read-only, and never a reason to fail a backup.
+ */
+#define SP_PROBE_CONTAINERS_MAX 32
+#define SP_PROBE_NAME_MAX       128   /* container name or alias, NUL included */
+#define SP_PROBE_IMAGE_MAX      256
+#define SP_PROBE_ALIASES_MAX    8
+#define SP_PROBE_COMM_MAX       16    /* /proc/<pid>/comm, NUL included */
+#define SP_PROBE_ARGS_MAX       257   /* 256 bytes of arguments, NUL included */
+#define SP_PROBE_PROCS_MAX      32    /* per container */
+#define SP_PROBE_PORTS_MAX      32    /* per container */
+#define SP_PROBE_OPEN_MAX       128   /* per container */
+
+typedef struct {
+    char comm[SP_PROBE_COMM_MAX];
+    char args[SP_PROBE_ARGS_MAX];
+} sp_probe_proc_t;
+
+typedef struct {
+    char *path;                       /* recorded path, absolute */
+    char  comm[SP_PROBE_COMM_MAX];    /* the process holding it */
+} sp_probe_open_t;
+
+typedef struct {
+    char             name[SP_PROBE_NAME_MAX];
+    char             image[SP_PROBE_IMAGE_MAX];  /* "" when none (LXC) */
+    char             aliases[SP_PROBE_ALIASES_MAX][SP_PROBE_NAME_MAX];
+    size_t           n_aliases;
+    int              running;
+    sp_probe_proc_t *procs;
+    size_t           n_procs;
+    uint16_t        *ports;
+    size_t           n_ports;
+    sp_probe_open_t *open;
+    size_t           n_open;
+} sp_probe_container_t;
+
+typedef struct {
+    sp_probe_container_t *v;
+    size_t                n;
+    int                   truncated;
+} sp_unit_probe_t;
+
+void sp_unit_probe_free(sp_unit_probe_t *p);
+
 typedef struct sp_provider_ops {
     const char *name;
     uint32_t    abi;
@@ -391,6 +445,12 @@ typedef struct sp_provider_ops {
 
     status_t (*stream_open)(sp_session_t *s, const sp_item_desc_t *item, int *fd);
     status_t (*stream_close)(sp_session_t *s, const sp_item_desc_t *item, int *ok);
+
+    /* units.probe (db-detection.md 8.1): the unit's processes, listening
+     * ports and files open for writing under its included mounts, now.
+     * Read-only, needs no session. *out freed with sp_unit_probe_free.
+     * NULL when the provider cannot say (libvirt: section 10). */
+    status_t (*unit_probe)(sp_ctx_t *ctx, const char *unit_id, sp_unit_probe_t **out);
 } sp_provider_ops_t;
 
 /* Names, for unit.json, the API and the index. NULL for a value outside

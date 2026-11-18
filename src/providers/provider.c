@@ -125,6 +125,20 @@ void sp_unit_desc_free(sp_unit_desc_t *d)
     free(d);
 }
 
+void sp_unit_probe_free(sp_unit_probe_t *p)
+{
+    if (!p) return;
+    for (size_t i = 0; i < p->n; i++) {
+        sp_probe_container_t *c = &p->v[i];
+        for (size_t k = 0; k < c->n_open; k++) free(c->open[k].path);
+        free(c->open);
+        free(c->procs);
+        free(c->ports);
+    }
+    free(p->v);
+    free(p);
+}
+
 status_t sp_unit_desc_dup(const sp_unit_desc_t *in, sp_unit_desc_t **out)
 {
     sp_unit_desc_t *d = calloc(1, sizeof(*d));
