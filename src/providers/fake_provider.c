@@ -2,6 +2,7 @@
 
 #include "fake_provider.h"
 #include "artefact.h"
+#include "unit_probe.h"
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
@@ -71,6 +72,8 @@ typedef struct {
     ftree_t *trees; size_t nt;
     char     cp[ARTEFACT_NAME_MAX];   /* the unit's checkpoint, "" for none */
     int      refuse;                  /* its bitmap is inconsistent: refused once */
+    char    *probe;                   /* units.probe's answer as JSON text, or NULL */
+    int      probe_fail;              /* units.probe fails (spec "probe_fail") */
 } funit_t;
 
 typedef struct {
@@ -175,7 +178,7 @@ static void funit_clear(funit_t *u)
     for (size_t i = 0; i < u->nb; i++) { free(u->blobs[i].path); free(u->blobs[i].data); }
     for (size_t i = 0; i < u->nd; i++) { free(u->disks[i].runs); free(u->disks[i].chg); }
     for (size_t i = 0; i < u->nt; i++) { free(u->trees[i].read_root); free(u->trees[i].path); free(u->trees[i].source); }
-    free(u->blobs); free(u->disks); free(u->trees); free(u->name);
+    free(u->blobs); free(u->disks); free(u->trees); free(u->name); free(u->probe);
     memset(u, 0, sizeof(*u));
 }
 
@@ -334,6 +337,18 @@ status_t fake_unit_set_state(sp_ctx_t *ctx, const char *unit_id, int state)
     funit_t *u = find_unit(ctx, unit_id);
     if (u) u->state = state;
     pthread_mutex_unlock(&ctx->mu);
+    return u ? OK : set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+}
+
+status_t fake_unit_set_probe(sp_ctx_t *ctx, const char *unit_id, const char *json, int fail)
+{
+    char *t = json ? strdup(json) : NULL;
+    if (json && !t) return set_error(ERR_NOMEM, "fake: probe");
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    if (u) { free(u->probe); u->probe = t; u->probe_fail = fail; t = NULL; }
+    pthread_mutex_unlock(&ctx->mu);
+    free(t);
     return u ? OK : set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
 }
 
@@ -690,6 +705,15 @@ static status_t load_unit(sp_ctx_t *ctx, const cJSON *ju)
         st = fake_tree_add(ctx, id, tid, rr, path);
         const char *src = jstr(t, "source");
         if (st == OK && src) st = fake_tree_set_source(ctx, id, tid, src);
+    }
+    /* Kept as text and read at each probe, so a malformed one reaches the
+     * probe's own validation, as a bad answer from a helper would. */
+    const cJSON *pr = cJSON_GetObjectItemCaseSensitive(ju, "probe");
+    int pfail = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ju, "probe_fail"));
+    if (st == OK && (pr || pfail)) {
+        char *txt = pr ? cJSON_PrintUnformatted(pr) : NULL;
+        st = pr && !txt ? set_error(ERR_NOMEM, "fake spec: probe") : fake_unit_set_probe(ctx, id, txt, pfail);
+        cJSON_free(txt);
     }
     return st;
 }
@@ -1662,6 +1686,37 @@ static status_t f_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
     return OK;
 }
 
+/* The unit's spec "probe", the same shape the helper answers; a unit with
+ * none answers an empty probe. */
+static status_t f_unit_probe(sp_ctx_t *c, const char *unit_id, sp_unit_probe_t **out)
+{
+    *out = NULL;
+    status_t st = maybe_reload(c);
+    char *txt = NULL;
+    pthread_mutex_lock(&c->mu);
+    funit_t *u = st == OK ? find_unit(c, unit_id) : NULL;
+    if (st != OK) {
+        /* reload failed: said already */
+    } else if (!u) {
+        st = set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+    } else if (u->probe_fail || fail_for(c, unit_id, NULL) == FAKE_FAIL_PROBE) {
+        st = set_error(ERR_IO, "fake: probe of %s failed (injected)", unit_id);
+    } else if (u->probe && !(txt = strdup(u->probe))) {
+        st = set_error(ERR_NOMEM, "fake: probe");
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (st != OK) return st;
+    if (!txt) {
+        *out = sp_unit_probe_new();
+        return *out ? OK : set_error(ERR_NOMEM, "fake: probe");
+    }
+    cJSON *o = cJSON_Parse(txt);
+    free(txt);
+    st = o ? sp_unit_probe_from_json(o, out) : set_error(ERR_INVALID, "fake: probe of %s is not JSON", unit_id);
+    cJSON_Delete(o);
+    return st;
+}
+
 const sp_provider_ops_t fake_provider_ops = {
     .name              = "fake",
     .abi               = SP_ABI_VERSION,
@@ -1681,4 +1736,5 @@ const sp_provider_ops_t fake_provider_ops = {
     .sweep             = f_sweep,
     .restore_preflight = NULL,
     .define            = NULL,
+    .unit_probe        = f_unit_probe,
 };

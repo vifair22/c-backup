@@ -12,7 +12,7 @@
  *   [units]     allow = <provider>:<glob>, ...
  *   [snapshot]  zfs_domains, btrfs_domains, dir_domains, btrfs_snapshot_dir
  *   [host]      nsenter, nsenter_bin, zfs, btrfs, realpath, docker, lxc_dir,
- *               host_root, user_root, mnt_root, boot_config
+ *               host_root, user_root, mnt_root, boot_config, mountinfo, proc
  *   [docker]    enabled, socket, include_roots, pause (auto|always|never),
  *               pause_always, never_pause (unit name globs), pause_timeout_s,
  *               templates_dir
@@ -88,6 +88,7 @@ typedef struct {
     char     host_lxc_dir[256], host_root[256];
     char     user_root[4096], mnt_root[4096], boot_config[4096];
     char     mountinfo[4096];       /* "": derived from host_root (mounts.h) */
+    char     proc_root[4096];       /* the host's /proc (units.probe); "": /proc */
 
     /* [docker] */
     int      docker_enabled;

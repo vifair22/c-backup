@@ -21,7 +21,13 @@ case "$tool" in
 lxc-ls)
     [ "${1:-}" = "--version" ] && { echo "6.0.0-fake"; exit 0; }
     for d in "$P"/*/; do [ -f "$d/config" ] && basename "$d"; done ;;
-lxc-info) echo "State:          $(st)" ;;
+# -p: as the real tool, a running container's init pid (from lxc-<name>.pid,
+# else 0) and nothing for a stopped one.
+lxc-info) if [ "${1:-}" = -p ]; then
+        [ "$(st)" = STOPPED ] || echo "PID:            $(cat "$S/lxc-$N.pid" 2>/dev/null || echo 0)"
+    else
+        echo "State:          $(st)"
+    fi ;;
 lxc-freeze) [ "$(st)" = RUNNING ] || { echo "$N is not running" >&2; exit 1; }
     # lxc-<name>.thaw: the freeze is undone at once, as a watchdog's thaw would.
     [ -e "$S/lxc-$N.thaw" ] || echo FROZEN > "$S/lxc-$N" ;;

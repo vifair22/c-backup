@@ -859,6 +859,7 @@ snapshot name, raw XML for libvirt, or a raw create body for Docker.
 | `hello` | `client_version` int; `session` token, optional; `anchor` bool, optional | handshake; answers the policy digest, daemon id, providers, and the `holds` and `captures` the helper has now. `session` names the daemon process; `anchor` keeps the connection as that session's anchor, and when its last anchor closes the helper ends the captures the session began (a daemon killed mid-backup) |
 | `units.list` | `provider` enum | enumerate, filtered by the policy's unit allowlist |
 | `units.describe` | `unit` unit key | inspect / domain XML / LXC config, templates and compose files, read by the helper and returned as data |
+| `units.probe` | `unit` unit key | read-only, gated as `units.describe` (`db-detection.md` 8.1). Per container of the unit (at most 32): name, image as configured, up to 8 network aliases, running; up to 32 processes (comm, the first 256 bytes of args, one per distinct pair) from the init process's cgroup; up to 32 TCP ports in LISTEN from its own network namespace; up to 128 files under the unit's included mounts held open for writing, as recorded paths. Past a bound, or past one packet, it is cut and `truncated` set. A provider that cannot say (libvirt) answers `unsupported` |
 | `capture.begin` | `units` 1 to 32 unit keys; `pause` bool | resolves every included mount itself, computes snapshot domains itself and intersects them with the policy's domains; pauses or freezes members if asked, `syncfs`, one atomic snapshot per pool with names it generates, unpauses; returns an opaque capture token, the read root of each mount, timings and per-member outcomes. Holds a lease with a deadline |
 | `capture.begin_paths` | `paths` 1 to 64 absolute paths | source snapshot mode for plain file sources (`db-detection.md` 9.4): resolves each path to its snapshot domain itself, checks the domains against the policy, takes one atomic snapshot per pool with names it generates, no pause; returns a capture token and a read root per path. Same lease, expiry and sweep as `capture.begin` |
 | `capture.end` | `capture` token | destroys that capture's snapshots |
@@ -889,6 +890,11 @@ Offline VM reads need no operation: the daemon spawns `qemu-nbd
   container names `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`, compose projects
   `[a-z0-9][a-z0-9_-]{0,63}`, libvirt UUIDs, LXC names), then against the
   policy's unit globs.
+- **Answers are validated too.** The daemon reads `units.probe`'s answer
+  under the same string rules (container names and aliases 127 bytes,
+  images 255, comm 15, args 256, paths clean, absolute and at most 4,096),
+  ports 1 to 65535, and the counts of 11.3; a count past its bound is cut
+  and marked truncated, anything malformed is refused naming the field.
 - **Paths** are never trusted from the daemon. Mount sources come from the
   helper's own inspect, snapshot names from its own generator, read roots
   from its own snapshots. The one path the daemon names, `restore.stage`'s

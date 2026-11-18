@@ -42,6 +42,7 @@
 #include "unit_backup.h"
 #include "unit_define.h"
 #include "unit_state.h"
+#include "unit_probe.h"
 #include "unit_tokens.h"
 
 #define DB_PATH HF_DIR "/state.db"
@@ -260,6 +261,49 @@ static void test_attach_and_list(void **state)
     /* The helper's policy holds whatever the daemon's units.allow says. */
     assert_int_not_equal(ops->describe(ctx, "prod", &d), OK);
     assert_non_null(strstr(err_msg(), "denied"));
+}
+
+/* units.probe through the helper's socket: the remote provider's answer
+ * is what the helper's backend said, validated again on this side. */
+static void test_probe_through_helper(void **state)
+{
+    (void)state;
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *ctx = NULL;
+    assert_int_equal(sp_registry_get("fake", &ops, &ctx), OK);
+    assert_non_null(ops->unit_probe);
+    sp_unit_probe_t *p = NULL;
+    assert_int_equal(ops->unit_probe(ctx, "u1", &p), OK);
+    assert_int_equal(p->n, 0);
+    sp_unit_probe_free(p);
+
+    assert_int_equal(fake_unit_set_probe(fk, "u1",
+        "{\"containers\":[{\"name\":\"mariadb\",\"image\":\"mariadb:11\",\"running\":true,"
+        "\"aliases\":[\"mariadb\",\"db\"],\"processes\":[{\"comm\":\"mariadbd\",\"args\":\"mariadbd\"}],"
+        "\"ports\":[3306],\"open_write\":[{\"path\":\"" HF_MOUNT "/ibdata1\",\"comm\":\"mariadbd\"}]}],"
+        "\"truncated\":true}", 0), OK);
+    assert_int_equal(ops->unit_probe(ctx, "u1", &p), OK);
+    assert_int_equal(p->n, 1);
+    assert_true(p->truncated);
+    assert_string_equal(p->v[0].name, "mariadb");
+    assert_int_equal(p->v[0].n_aliases, 2);
+    assert_string_equal(p->v[0].procs[0].comm, "mariadbd");
+    assert_int_equal(p->v[0].ports[0], 3306);
+    assert_string_equal(p->v[0].open[0].path, HF_MOUNT "/ibdata1");
+    sp_unit_probe_free(p);
+
+    fake_fail_set(fk, "u1", FAKE_FAIL_PROBE, 0);
+    assert_int_equal(ops->unit_probe(ctx, "u1", &p), ERR_IO);
+    assert_null(p);
+    assert_non_null(strstr(err_msg(), "helper: failed"));
+    assert_non_null(strstr(err_msg(), "injected"));
+    fake_fail_clear(fk);
+    err_clear();
+
+    /* The policy decides here as for describe. */
+    assert_int_not_equal(ops->unit_probe(ctx, "prod", &p), OK);
+    assert_non_null(strstr(err_msg(), "denied"));
+    err_clear();
 }
 
 static void test_backup_through_helper(void **state)
@@ -1337,6 +1381,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_docker_copy_definition, setup, teardown),
         cmocka_unit_test_setup_teardown(test_group_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_probe_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_stuck_hold_warns, setup, teardown),

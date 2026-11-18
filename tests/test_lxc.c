@@ -22,6 +22,7 @@
 #include <cmocka.h>
 
 #include "lxc_backend.h"
+#include "unit_probe.h"
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
@@ -86,6 +87,7 @@ static int init_with(const char *nsenter)
              "[host]\n%shost_root =\nzfs = %s/tests/fake_host/zfs\nbtrfs = %s/tests/fake_host/btrfs\n"
              "lxc_dir = %s/tests/fake_host/lxc\n"
              "user_root = " MNT "/user\nmnt_root = " MNT "\nboot_config = " D "/boot\nmountinfo = " D "/mountinfo\n"
+             "proc = " D "/proc\n"
              "[docker]\ninclude_roots = " MNT "/cache/appdata\n"
              "[lxc]\nenabled = 1\npath = " LXCP "\n", nsenter, cwd, cwd, cwd);
     memset(&pol, 0, sizeof(pol));
@@ -107,6 +109,63 @@ static status_t on_unit(void *ctx, const char *id, const char *name, int st)
     int *n = ctx;
     (*n)++;
     return strcmp(id, "DevBox") == 0 || strcmp(id, "Parked") == 0 ? OK : set_error(ERR_INVALID, "unexpected %s", id);
+}
+
+static int has_open(const sp_probe_container_t *c, const char *path)
+{
+    for (size_t i = 0; i < c->n_open; i++) if (strcmp(c->open[i].path, path) == 0) return 1;
+    return 0;
+}
+
+/* units.probe: the init pid from lxc-info -p, the rootfs and bind mounts
+ * as describe includes them, kernel mounts inside the rootfs left out. */
+static void test_unit_probe(void **state)
+{
+    (void)state;
+    if (system("mkdir -p '" D "/proc/500/fd' '" D "/proc/500/fdinfo'") != 0) fail();
+    put(D "/proc/500/cgroup", "0::/lxc.payload.DevBox\n");
+    put(D "/proc/500/comm", "systemd\n");
+    put(D "/proc/500/cmdline", "/sbin/init");
+    put(D "/proc/500/mountinfo", "40 1 0:70 /DevBox/rootfs / rw - zfs cache/lxc rw\n"
+                                 "41 40 0:5 / /proc rw - proc proc rw\n"
+                                 "43 40 0:71 /dev /srv/dev rw - zfs cache/appdata rw\n");
+    static const struct { const char *link; int mnt; } fds[] = {
+        { "/etc/hostname", 40 }, { "/srv/dev/work", 43 }, { "/proc/sys/x", 41 },
+    };
+    for (int i = 0; i < 3; i++) {
+        char p[512], info[128];
+        snprintf(p, sizeof(p), D "/proc/500/fd/%d", 3 + i);
+        if (symlink(fds[i].link, p) != 0) fail();
+        snprintf(p, sizeof(p), D "/proc/500/fdinfo/%d", 3 + i);
+        snprintf(info, sizeof(info), "flags:\t02\nmnt_id:\t%d\n", fds[i].mnt);
+        put(p, info);
+    }
+    put(STATE "/lxc-DevBox.pid", "500\n");
+    sp_unit_probe_t *p = NULL;
+    assert_non_null(be.ops->unit_probe);
+    assert_int_equal(be.ops->unit_probe(be.ctx, "DevBox", &p), OK);
+    assert_int_equal(p->n, 1);
+    const sp_probe_container_t *c = &p->v[0];
+    assert_string_equal(c->name, "DevBox");
+    assert_string_equal(c->image, "");
+    assert_int_equal(c->n_aliases, 1);
+    assert_string_equal(c->aliases[0], "DevBox");
+    assert_true(c->running);
+    assert_string_equal(c->procs[0].comm, "systemd");
+    assert_true(has_open(c, LXCP "/DevBox/rootfs/etc/hostname"));
+    assert_true(has_open(c, MNT "/cache/appdata/dev/work"));
+    assert_int_equal(c->n_open, 2);
+    sp_unit_probe_free(p);
+
+    /* Stopped: lxc-info -p prints nothing. */
+    assert_int_equal(be.ops->unit_probe(be.ctx, "Parked", &p), OK);
+    assert_false(p->v[0].running);
+    assert_int_equal(p->v[0].n_procs, 0);
+    sp_unit_probe_free(p);
+    assert_int_not_equal(be.ops->unit_probe(be.ctx, "../x", &p), OK);
+    err_clear();
+    assert_int_not_equal(be.ops->unit_probe(be.ctx, "Nobody", &p), OK);
+    err_clear();
 }
 
 static void test_capture(void **state)
@@ -428,6 +487,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_capture, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unit_probe, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nested_below, setup, teardown),
         cmocka_unit_test_setup_teardown(test_freeze_lost, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_thaws, setup, teardown),

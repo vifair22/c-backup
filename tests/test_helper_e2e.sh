@@ -68,11 +68,14 @@ cat > "$WORK/units.json" <<EOF
  {"id":"a","name":"cbk-uat-a","state":"running","caps":["quiesce","snapshot"],
   "blobs":[{"id":"domain.xml","path":".cbackup-unit/config/domain.xml","text":"<domain>a</domain>"}],
   "disks":[{"id":"vda","size":4194304,"runs":[{"off":0,"len":1048576,"kind":"data","seed":3}]}],
-  "trees":[{"id":"vol","read_root":"$WORK/snap","path":"$WORK/pool/app/a","source":"$WORK/pool/app/a"}]},
+  "trees":[{"id":"vol","read_root":"$WORK/snap","path":"$WORK/pool/app/a","source":"$WORK/pool/app/a"}],
+  "probe":{"containers":[{"name":"pg","image":"postgres:16","running":true,"aliases":["pg","db"],
+           "processes":[{"comm":"postgres","args":"postgres -D /data"}],"ports":[5432],
+           "open_write":[{"path":"$WORK/pool/app/a/base/1/2619","comm":"postgres"}]}]}},
  {"id":"k","name":"cbk-uat-k","state":"running","caps":["quiesce"],
   "disks":[{"id":"vda","size":8589934592,"runs":[{"off":0,"len":8589934592,"kind":"data","seed":9}]}]},
  {"id":"c","name":"cbk-uat-c","state":"running","caps":["quiesce"],
-  "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}]},
+  "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}],"probe_fail":true},
  {"id":"p","name":"prod-db","state":"running",
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"secret"}]}
 ]}
@@ -269,6 +272,34 @@ check    "the disk came back full size" 4194304 "$(stat -c %s "$WORK/out/.cbacku
 check    "the tree from the helper's read root" alpha "$(cat "$WORK/out$WORK/pool/app/a/a.txt")"
 check    "configuration as the helper read it" "<domain>a</domain>" "$(cat "$WORK/out/.cbackup-unit/config/domain.xml")"
 check    "no holds are left in the helper's journal" "[]" "$(cat "$WORK/hstate/holds.json")"
+
+echo "units.probe over the socket"
+# The daemon side of units.probe is not built yet, so the request goes
+# straight to the helper's socket: hello, then the probe, one packet each.
+# Perl's Socket is in perl-base, which every Debian image has.
+hcall() {
+    "${AS_DAEMON[@]}" perl -MSocket -e '
+        socket(my $s, AF_UNIX, SOCK_SEQPACKET, 0) or die "socket: $!";
+        connect($s, pack_sockaddr_un($ARGV[0])) or die "connect: $!";
+        my $r;
+        send($s, q({"v":1,"id":1,"op":"hello","args":{"client_version":1}}), 0);
+        recv($s, $r, 65536, 0);
+        send($s, $ARGV[1], 0);
+        recv($s, $r, 65536, 0);
+        print $r;' "$HSOCK" "$1"
+}
+OUT=$(hcall '{"v":1,"id":2,"op":"units.probe","args":{"unit":"fake:a"}}')
+contains "the fake provider's spec probe comes back" '"ok":true' "$OUT"
+contains "with its processes" '"comm":"postgres"' "$OUT"
+contains "its listening ports" '"ports":[5432]' "$OUT"
+contains "its files open for writing, as recorded" "\"path\":\"$WORK/pool/app/a/base/1/2619\"" "$OUT"
+contains "and whether it was cut" '"truncated":false' "$OUT"
+OUT=$(hcall '{"v":1,"id":3,"op":"units.probe","args":{"unit":"fake:c"}}')
+contains "a probe that fails says so" '"code":"failed"' "$OUT"
+OUT=$(hcall '{"v":1,"id":4,"op":"units.probe","args":{"unit":"fake:p"}}')
+contains "a unit outside the policy is denied" '"code":"denied"' "$OUT"
+OUT=$(hcall '{"v":1,"id":5,"op":"units.probe","args":{"unit":"fake:a","pid":1}}')
+contains "an argument it does not take is invalid" '"code":"invalid"' "$OUT"
 
 echo "restore as a unit"
 OUT=$(cb unit restore 1 1 --define 2>&1); RC=$?

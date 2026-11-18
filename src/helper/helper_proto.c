@@ -36,6 +36,7 @@ static const char *const k_ops[HOP_COUNT] = {
     "capture.end", "hook.run", "hook.wait", "vm.backup_begin", "vm.backup_end",
     "vm.checkpoint_redefine", "vm.install_state", "restore.stage", "restore.swap",
     "unit.stop", "unit.start", "unit.define", "lease.release", "sweep",
+    "units.probe",
 };
 
 const char *helper_op_name(helper_op_t op)
@@ -83,6 +84,8 @@ static int str_ok(const char *s, size_t max)
     }
     return 1;
 }
+
+int helper_str_ok(const char *s, size_t max) { return s && str_ok(s, max); }
 
 /* An identifier: [A-Za-z0-9][A-Za-z0-9_.:-]{0,max-1}. */
 static int ident_ok(const char *s, size_t max, const char *extra)
@@ -205,6 +208,7 @@ static const schema_t k_schema[HOP_COUNT] = {
     [HOP_UNIT_DEFINE]            = { { { "unit", A_UNIT }, { "definition", A_OBJECT } }, 2, 0 },
     [HOP_LEASE_RELEASE]          = { { { "capture", A_TOKEN }, { "session", A_TOKEN } }, 2, 1 },
     [HOP_SWEEP]                  = { { { NULL, A_INT } }, 0, 0 },
+    [HOP_UNITS_PROBE]            = { { { "unit", A_UNIT } }, 1, 0 },
 };
 
 static int name_ok(const char *s) { return str_ok(s, HELPER_NAME_MAX) && ident_ok(s, HELPER_NAME_MAX, "_.:-"); }
