@@ -1245,7 +1245,7 @@ static status_t freeze_on(struct sp_session *s, fwin_t *f)
     f->freeze_call_ms = ms_since(&f->t0);
     if (n >= 0) f->frozen = n > 0 ? 2 : 1;
     else {
-        (void)sp_session_info_warn(&s->info, "the guest agent did not freeze: %.300s", verr());
+        (void)sp_session_info_warn(&s->info, "the guest agent did not freeze: %s", verr());
         if (c->pol->vm_freeze == 2) st = set_error(ERR_IO, "libvirt: freeze is required and failed: %s", verr());
     }
     return st;
