@@ -513,6 +513,8 @@ build:image:check:
     CHECK_TAG: cbackup-mrcheck:$CI_PIPELINE_ID
   script:
     - docker build --provenance=false --sbom=false -t "$CHECK_TAG" .
+    # B205: no VOLUME, so no start leaves an anonymous volume behind.
+    - test "$(docker image inspect --format '{{json .Config.Volumes}}' "$CHECK_TAG")" = "null"
     - docker run -d --name "smoke-$CI_JOB_ID" "$CHECK_TAG"
     - sleep 5
     - docker ps --filter "name=smoke-$CI_JOB_ID" --filter status=running | grep -q "smoke-$CI_JOB_ID"

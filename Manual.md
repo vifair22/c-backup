@@ -273,6 +273,12 @@ docker run -d --name c-backupd \
 
 - `/var/lib/c-backupd` holds `state.db` and, in `keys/`, the encryption key
   of every encrypted repository. Put it on fast storage (section 18).
+  **Mount it by name** (`-v cbackup-state:...`, or a bind of a host path):
+  the image declares no `VOLUME`, so without a mount the state lives in the
+  container and goes with it. It used to declare one, and every start of a
+  container from the image, the helper's included, left an anonymous
+  volume behind that nothing removed; one left over from an older image is
+  safe to delete with `docker volume prune` once no container uses it.
 - **The keys are the one thing on that volume a reindex cannot rebuild.**
   The image sets `C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys`, so they
   survive replacing the container, but lose the volume and every `system`
