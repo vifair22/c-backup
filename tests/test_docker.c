@@ -34,6 +34,7 @@
 #include "store.h"
 #include "store_index.h"
 #include "unit_backup.h"
+#include "unit_probe.h"
 #include "unit_state.h"
 
 #include <cutils/db.h>
@@ -141,7 +142,7 @@ static int start(const char *extra_policy)
              "[units]\nallow = docker:*\n"
              "[snapshot]\nzfs_domains = cache/appdata, media\n"
              "[host]\nnsenter = 0\nhost_root =\nzfs = %s/tests/fake_host/zfs\ndocker = %s/tests/fake_host/docker\nuser_root = " MNT "/user\n"
-             "mnt_root = " MNT "\nboot_config = " D "/boot\nmountinfo = " D "/mountinfo\n"
+             "mnt_root = " MNT "\nboot_config = " D "/boot\nmountinfo = " D "/mountinfo\nproc = " D "/proc\n"
              "[docker]\nenabled = 1\nsocket = " SOCK "\ninclude_roots = " APPS ", " MNT "/media, " MNT "/disk1, "
              MNT "/user/appdata\n"
              "templates_dir = " D "/tmpl\n%s",
@@ -168,6 +169,78 @@ static int teardown(void **state)
     fake_docker_stop(&fdk);
     helper_policy_free(&pol);
     return 0;
+}
+
+/* A /proc with web-db's processes in it (pid 100), for units.probe. */
+static void probe_proc(void)
+{
+    if (system("mkdir -p '" D "/proc/100/fd' '" D "/proc/100/fdinfo' '" D "/proc/100/net' "
+               "'" D "/proc/200/fd'") != 0) fail();
+    put(D "/proc/100/cgroup", "0::/docker/aaaa01\n");
+    put(D "/proc/100/comm", "postgres\n");
+    put(D "/proc/100/cmdline", "postgres");
+    put(D "/proc/100/mountinfo", "20 1 0:50 / / rw - overlay overlay rw\n"
+                                 "30 20 0:60 /web/db /var/lib/pg rw - zfs cache/appdata rw\n"
+                                 "31 20 0:5 / /var/run/docker.sock rw - tmpfs tmpfs rw\n");
+    put(D "/proc/100/net/tcp", "  sl  local_address rem_address   st\n"
+                               "   0: 00000000:1538 00000000:0000 0A 0\n");
+    if (symlink("/var/lib/pg/base/1/2619", D "/proc/100/fd/3") != 0 ||
+        symlink("/var/run/docker.sock", D "/proc/100/fd/4") != 0) fail();
+    put(D "/proc/100/fdinfo/3", "pos:\t0\nflags:\t0100002\nmnt_id:\t30\n");
+    put(D "/proc/100/fdinfo/4", "pos:\t0\nflags:\t02\nmnt_id:\t31\n");
+    /* Another container's process, in another cgroup. */
+    put(D "/proc/200/cgroup", "0::/docker/bbbb01\n");
+    put(D "/proc/200/comm", "nginx\n");
+}
+
+static const sp_probe_container_t *probed(const sp_unit_probe_t *p, const char *name)
+{
+    for (size_t i = 0; i < p->n; i++) if (strcmp(p->v[i].name, name) == 0) return &p->v[i];
+    return NULL;
+}
+
+/* units.probe: members as describe finds them, the image as configured,
+ * names on the networks and the compose service, and /proc read with the
+ * mounts describe includes; a stopped member answers with nothing. */
+static void test_unit_probe(void **state)
+{
+    (void)state;
+    probe_proc();
+    fdk.c[0].pid = 100;
+    snprintf(fdk.c[0].aliases, sizeof(fdk.c[0].aliases), "[\"web-db\",\"postgres\",\"bad\\u0001alias\"]");
+    snprintf(fdk.c[0].service, sizeof(fdk.c[0].service), "db");
+    sp_unit_probe_t *p = NULL;
+    assert_non_null(be.ops->unit_probe);
+    assert_int_equal(be.ops->unit_probe(be.ctx, "compose:web", &p), OK);
+    assert_int_equal(p->n, 2);
+    const sp_probe_container_t *db = probed(p, "web-db"), *www = probed(p, "web-www");
+    assert_non_null(db);
+    assert_non_null(www);
+    assert_true(db->running);
+    assert_string_equal(db->image, "web-db:cfg");
+    assert_int_equal(db->n_aliases, 3);          /* its name, postgres, db; the bad one dropped */
+    assert_string_equal(db->aliases[0], "web-db");
+    assert_string_equal(db->aliases[1], "postgres");
+    assert_string_equal(db->aliases[2], "db");
+    assert_int_equal(db->n_procs, 1);
+    assert_string_equal(db->procs[0].comm, "postgres");
+    assert_int_equal(db->n_ports, 1);
+    assert_int_equal(db->ports[0], 5432);
+    /* The data file as recorded; the socket, a system mount, never. */
+    assert_int_equal(db->n_open, 1);
+    assert_string_equal(db->open[0].path, APPS "/web/db/base/1/2619");
+    /* Running by its list state, with no pid: nothing to read. */
+    assert_false(www->running);
+    assert_int_equal(www->n_procs, 0);
+    sp_unit_probe_free(p);
+
+    /* The init process gone between the inspect and the read. */
+    fdk.c[0].pid = 4242;
+    assert_int_equal(be.ops->unit_probe(be.ctx, "compose:web", &p), OK);
+    assert_false(probed(p, "web-db")->running);
+    sp_unit_probe_free(p);
+    assert_int_equal(be.ops->unit_probe(be.ctx, "nobody", &p), ERR_NOT_FOUND);
+    err_clear();
 }
 
 typedef struct { char ids[16][SP_UNIT_ID_MAX]; int st[16]; int n; } seen_t;
@@ -1398,6 +1471,7 @@ int main(void)
     signal(SIGPIPE, SIG_IGN);
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unit_probe, setup, teardown),
         cmocka_unit_test_setup_teardown(test_db_target, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nested_below_mount, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_instant_no_pause, setup, teardown),

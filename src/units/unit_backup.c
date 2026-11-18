@@ -6,6 +6,7 @@
 #include "block_source.h"
 #include "db_template.h"
 #include "db_txn.h"
+#include "unit_detect.h"
 #include "registry.h"
 #include "remote_provider.h"
 #include "reserved.h"
@@ -517,6 +518,11 @@ typedef struct {
      * built (it is stored last for that), recorded once the snapshot is. */
     db_detector_t            *detect;
     db_findings_t            *findings;
+    /* The trees' recorded paths and read roots, for detection's one
+     * re-read of a Nextcloud config the cache vouched for. */
+    const char *const        *rec_roots;
+    const char *const        *read_roots;
+    size_t                    n_roots;
     utmpl_t                  *tmpl;      /* the unit's enabled templates */
 } uctx_t;
 
@@ -646,6 +652,7 @@ static void unit_detect(uctx_t *u, unit_json_t *j)
         r->instant = one_instant ? 0 : (int)k;
     }
     db_capture_desc_t cap = { roots, k, a == SP_CONSIST_APPLICATION, a == SP_CONSIST_QUIESCED, 1, 1 };
+    unit_detect_reread(u->detect, u->rec_roots, u->read_roots, u->n_roots);
     if (db_detect_finish(u->detect, &cap, &u->findings) != OK) {
         log_warn("unit %s: database detection skipped: %s", u->key, err_msg());
         err_clear();
@@ -1091,9 +1098,7 @@ static void prog_bytes(void *ctx, uint64_t done, uint64_t total)
  * a pattern under a tree's recorded path is rewritten onto its read root.
  * Patterns without a leading '/' match anywhere and pass as they are.
  */
-#define UNIT_EXCLUDE_MAX 64
-
-static size_t unit_excludes(cutils_db_t *db, int64_t repo_id, const char *key,
+size_t unit_backup_excludes(cutils_db_t *db, int64_t repo_id, const char *key,
                             const char *const *paths, const char *const *rpaths, size_t nt,
                             char **out)
 {
@@ -1205,6 +1210,9 @@ typedef struct {
     char                     retire[UNIT_TOKEN_MAX];
     int                      audit_due;
     char                     off_why[600];   /* incrementals off for this unit, and why */
+    /* units.probe before begin, while the unit runs unpaused: liveness
+     * for detection (db-detection.md 8.1). NULL when there is none. */
+    sp_unit_probe_t         *probe;
     utmpl_t                  tmpl;           /* enabled database templates */
 } unit_prep_t;
 
@@ -1343,12 +1351,15 @@ static status_t unit_prepare(store_t *store, cutils_db_t *db, int64_t repo_id, c
     snprintf(pp->jr.unit_id, sizeof(pp->jr.unit_id), "%s", d->unit_id);
     pp->jr.job_id = o->job_id;
     pp->holds = units_journal_holds(&pp->jr);
+    pp->probe = unit_detect_probe(ops, pctx, d->unit_id, key);
     return OK;
 }
 
 /* Undo unit_prepare for a unit that never began. */
 static void unit_unprepare(const sp_provider_ops_t *ops, unit_prep_t *pp)
 {
+    sp_unit_probe_free(pp->probe);
+    pp->probe = NULL;
     bases_free(pp);
     utmpl_free(&pp->tmpl);
     if (pp->d) ops->desc_free(pp->d);
@@ -1508,7 +1519,7 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
             bo.held_done = held_done;
             bo.held_ctx = &u;
         }
-        n_excl = unit_excludes(db, repo_id, key, paths, rpaths, nt, excl);
+        n_excl = unit_backup_excludes(db, repo_id, key, paths, rpaths, nt, excl);
         if (n_excl) {
             bo.exclude = (const char **)(void *)excl;
             bo.n_exclude = (int)n_excl;
@@ -1524,6 +1535,10 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         bo.store_workers = o->store_workers;
         bo.file_cache_match = o->file_cache_match;
         u.detect = db_detect_start();
+        db_detect_unit(u.detect, pp->probe);
+        u.rec_roots = paths;
+        u.read_roots = rpaths;
+        u.n_roots = nt;
         bo.detect = u.detect;
         if (o->progress_cb) {
             bo.progress_cb = prog_cb;
@@ -1537,6 +1552,7 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
             char scope[SP_PROVIDER_MAX + SP_UNIT_ID_MAX + 8];
             snprintf(scope, sizeof(scope), "unit:%s", key);
             db_detect_count_uncovered(u.findings);
+            db_findings_link_nextcloud(db, repo_id, scope, u.findings);
             db_record_result_t rr;
             memset(&rr, 0, sizeof(rr));
             if (db_findings_record(db, repo_id, br.snapshot_id, u.findings, NULL, 0, scope, &rr) != OK) {
@@ -1672,6 +1688,8 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     free(u.uj_text);
     db_findings_free(u.findings);
     db_detect_free(u.detect);
+    sp_unit_probe_free(pp->probe);
+    pp->probe = NULL;
     free(u.parts);
     for (size_t i = 0; i < u.n_warn; i++) free(u.warn[i]);
     free(u.warn);

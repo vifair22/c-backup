@@ -66,6 +66,25 @@ status_t db_findings_record(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                             const char *scope, db_record_result_t *out);
 
 /*
+ * The same for a detection run that made no snapshot
+ * (POST /repos/<id>/units/<p>/<u>/detect): last_snap_id is left as it was,
+ * the run's own rows are told apart by last_seen, and nothing alerts,
+ * since the coverage is a prediction; the journal events still come back.
+ */
+status_t db_findings_record_detect(cutils_db_t *db, int64_t repo_id, const db_findings_t *f,
+                                   const char *scope, db_record_result_t *out);
+
+/*
+ * Resolve each Nextcloud finding's dbhost that its own unit could not
+ * (section 3) against the repository's other units: the unit whose
+ * recorded database findings answer to that name. Two units are one
+ * capture only when they share capture.group; otherwise the finding is
+ * suggested "group-units". Rewrites the findings' evidence; reads only.
+ */
+void db_findings_link_nextcloud(cutils_db_t *db, int64_t repo_id, const char *scope,
+                                db_findings_t *f);
+
+/*
  * The findings as a JSON object for a job result:
  * {"findings":[...],"listed":N,"total":N,"sqlite_small":N}, each finding
  * with its id when ids is given. At most DB_FINDINGS_LISTED_MAX listed.

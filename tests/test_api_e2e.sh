@@ -49,6 +49,7 @@ check() {  # check <name> <expected> <actual>
     if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi
 }
 
+lacks()    { case "$3" in *"$2"*) bad "$1" "no '$2'" "$3" ;; *) ok "$1" ;; esac; }
 contains() {  # contains <name> <needle> <haystack>
     case "$3" in
         *"$2"*) ok "$1" ;;
@@ -2326,6 +2327,52 @@ wait_job "$DB_JOB2"
 DB_BODY2=$(sock_body "/jobs/$DB_JOB2")
 contains "found again on the next backup" '"engine":"sqlite"' "$DB_BODY2"
 check "but alerted only once" 0 "$(printf '%s' "$DB_BODY2" | grep -c 'captured uncovered')"
+
+echo "database findings API"
+# docs/db-detection.md 7.4: the findings as db_findings keeps them, with the
+# fields a job result gives each, evidence as an object, and the history
+# and decision columns.
+FL=$(sock_body "/repos/$DB_ID/databases")
+contains "the repository's findings" '"engine":"sqlite"' "$FL"
+contains "with a total" '"total":1' "$FL"
+contains "scoped to the source" "\"scope\":\"source:$DBS\"" "$FL"
+contains "coverage in words" '"coverage_why":"read live while it was in use' "$FL"
+contains "the method" '"method":"live-read"' "$FL"
+contains "evidence as an object" '"evidence":{"markers":[' "$FL"
+contains "the last snapshot" '"last_snap_id":' "$FL"
+contains "the alert's time" '"alerted_at":1' "$FL"
+contains "and the decision columns, empty" '"template":null,"params":null,"decided_by":null,"decided_at":null,"reason":null' "$FL"
+F_ID=$(printf '%s' "$FL" | sed -n 's/.*"findings":\[{"id":\([0-9]*\).*/\1/p')
+check "a finding id" yes "$([ -n "$F_ID" ] && echo yes || echo "no: $FL")"
+F1=$(sock_body "/repos/$DB_ID/databases/$F_ID")
+contains "one finding" "{\"id\":$F_ID,\"scope\":" "$F1"
+contains "with alerted_at" '"alerted_at":' "$F1"
+check "a finding of no repository's is a 404" 404 "$(sock_code "/repos/$DB_ID/databases/99999")"
+check "nor another repository's" 404 "$(sock_code "/repos/1/databases/$F_ID")"
+check "a finding id that is not one is a 400" 400 "$(sock_code "/repos/$DB_ID/databases/abc")"
+check "findings are read-only here" 405 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" "http://localhost/repos/$DB_ID/databases")"
+contains "filtered by coverage" '"total":1' "$(sock_body "/repos/$DB_ID/databases?coverage=uncovered")"
+contains "and by the rest" '"total":0' "$(sock_body "/repos/$DB_ID/databases?coverage=covered-crash")"
+contains "none is unassessed" '"total":0' "$(sock_body "/repos/$DB_ID/databases?coverage=none")"
+contains "by engine" '"total":1' "$(sock_body "/repos/$DB_ID/databases?engine=sqlite&state=suggested")"
+contains "by scope, exactly" '"total":1' "$(sock_body "/repos/$DB_ID/databases?scope=source:$DBS")"
+contains "a scope it is not" '"total":0' "$(sock_body "/repos/$DB_ID/databases?scope=source:/nowhere")"
+check "an unknown engine is a 400" 400 "$(sock_code "/repos/$DB_ID/databases?engine=oracle")"
+check "an unknown coverage is a 400" 400 "$(sock_code "/repos/$DB_ID/databases?coverage=fine")"
+check "an unknown state is a 400" 400 "$(sock_code "/repos/$DB_ID/databases?state=gone")"
+check "paging is checked" 400 "$(sock_code "/repos/$DB_ID/databases?limit=0")"
+FP=$(sock_body "/repos/$DB_ID/databases?offset=1")
+contains "a page past the rows is empty, total kept" '{"findings":[],"total":1}' "$FP"
+check "an unknown repository is a 404" 404 "$(sock_code "/repos/9999/databases")"
+# A detection run takes no fields: an empty object or no body, and any key
+# is refused by name before anything else is looked at.
+OUT=$(sock_send POST "/repos/$DB_ID/units/docker/somewhere/detect" '{"paths":["/x"]}')
+contains "detect refuses an unknown key" ' 400' "$OUT"
+contains "and names it" "unknown key 'paths'" "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/units/docker/somewhere/detect" '[1]')
+contains "detect refuses a body that is not an object" ' 400' "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/units/docker/somewhere/detect" '{}')
+lacks    "an empty object is accepted as no fields" ' 400' "$OUT"
 
 echo "database finding actions"
 # D2 (db-detection.md 7.3, 7.4): preview, enable and dismiss. A file

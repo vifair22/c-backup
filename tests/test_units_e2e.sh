@@ -345,6 +345,55 @@ check    "unit history is rebuilt from the repository" "$BEFORE" "$(cb unit hist
 
 contains "no holds are left open" '"holds_open":0' "$(cb unit providers)"
 
+echo "database detection"
+# docs/db-detection.md 7.4, 8.1: detection on a unit without a backup, with
+# the fake provider's units.probe: a PostgreSQL data directory its process
+# makes live, a MariaDB image with nothing behind it (a hint), and the
+# findings API and CLI over what was found.
+mkdir -p "$WORK/snap-d/pg/global" "$WORK/snap-d/pg/base/1"
+printf '16\n' > "$WORK/snap-d/pg/PG_VERSION"
+: > "$WORK/snap-d/pg/global/pg_control"
+head -c 8192 /dev/zero > "$WORK/snap-d/pg/base/1/2619"
+UNIT_D=',{"id":"d","name":"cbk-uat-d","state":"running",
+  "trees":[{"id":"vol","read_root":"'"$WORK"'/snap-d","path":"'"$WORK"'/live/d","source":"'"$WORK"'/snap-d"}],
+  "probe":{"containers":[
+    {"name":"pg","image":"postgres:16","running":true,"aliases":["db"],
+     "processes":[{"comm":"postgres","args":"postgres -c fsync=on"}],"ports":[5432],
+     "open_write":[{"path":"'"$WORK"'/live/d/pg/base/1/2619","comm":"postgres"}]},
+    {"name":"client","image":"mariadb:11","running":true}]}}'
+write_spec ",{\"id\":\"c\",\"name\":\"cbk-uat-c\",\"state\":\"stopped\",\"blobs\":[{\"id\":\"x\",\"path\":\".cbackup-unit/config/x\",\"text\":\"c\"}]}$UNIT_D"
+OUT=$(cb db detect 1 cbk-uat-d --provider fake)
+contains "a detection run completes" '"state":"completed"' "$OUT"
+contains "and finds the data directory" "\"path\":\"$WORK/live/d/pg\"" "$OUT"
+contains "live by its process and open file" '"confidence":"live"' "$OUT"
+contains "with the open file as evidence" '"open_write":[{"path":' "$OUT"
+contains "the client image is a hint" '"engine":"mysql","path":"","confidence":"hint"' "$OUT"
+contains "said as information" 'the image of client suggests MySQL/MariaDB' "$OUT"
+contains "and the journal says the probe answered" 'with units.probe' "$(cb journal 1 --limit 5)"
+DL=$(cb db list 1 --unit fake:d)
+contains "the findings are listed under the unit" '"scope":"unit:fake:d"' "$DL"
+contains "both of them" '"total":2' "$DL"
+contains "no snapshot named, none was made" '"last_snap_id":null' "$DL"
+contains "a hint has no coverage" '"coverage":null' "$(cb db list 1 --unit fake:d --coverage none)"
+DID=$(printf '%s' "$DL" | grep -o '"id":[0-9]*,"scope":"unit:fake:d","engine":"postgres"' | sed 's/"id":\([0-9]*\).*/\1/')
+contains "db show shows one" '"engine":"postgres"' "$(cb db show 1 "$DID")"
+OUT=$(cb db list 1 --unit d 2>&1); RC=$?
+check    "a unit key without its provider is refused" 1 "$RC"
+OUT=$(cb db list 1 --unit fake:d --source /x 2>&1); RC=$?
+check    "a unit and a source together are refused" 1 "$RC"
+OUT=$(cb db detect 1 prod-db --provider fake 2>&1); RC=$?
+check    "a unit outside units.allow is not detected" 1 "$RC"
+contains "and says why" 'units.allow' "$OUT"
+OUT=$(cb db detect 1 nosuch --provider fake 2>&1); RC=$?
+check    "nor one that does not exist" 1 "$RC"
+check    "detect is POST only" 405 "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" http://x/repos/1/units/fake/cbk-uat-d/detect)"
+# Read live (the fake tree is on no snapshot domain), so allowed below crash.
+OUT=$(cb unit backup 1 --provider fake cbk-uat-d --require inconsistent)
+contains "a backup of it carries the same findings" '"engine":"postgres"' "$OUT"
+contains "with the probe's liveness" '"confidence":"live"' "$OUT"
+contains "and the finding now names its snapshot" '"last_snap_id":' "$(cb db show 1 "$DID")"
+lacks    "no longer null" '"last_snap_id":null' "$(cb db show 1 "$DID")"
+
 echo "removing a repository with an export open"
 # Retention has run since: unit a's newest snapshot, not snapshot 1.
 SA=$(cb unit history 1 --provider fake cbk-uat-a --limit 1 | sed -n 's/.*"snapshots":\[{"id":\([0-9]*\).*/\1/p')

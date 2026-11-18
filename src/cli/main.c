@@ -1440,6 +1440,59 @@ static void unit_path(sbuf_t *p, const char *repo, const char *prov, const char 
     sb_puts(p, suffix);
 }
 
+/*
+ * Database findings (docs/db-detection.md 7.4). A scope is named the way
+ * findings carry it: --unit with the unit key (docker:compose:immich), or
+ * --source with the source path; each is one exact scope.
+ */
+static int h_db_list(const args_t *a)
+{
+    const char *unit = args_value(a, "--unit"), *source = args_value(a, "--source");
+    if (unit && source) return refuse(a, "name a unit or a source, not both");
+    if (unit && !strchr(unit, ':'))
+        return refuse(a, "--unit takes the unit key, provider first: docker:compose:immich");
+    sbuf_t q = { 0 };
+    paging(a, &q);
+    static const char *const keys[] = { "--engine", "--coverage", "--state" };
+    static const char *const names[] = { "engine", "coverage", "state" };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const char *v = args_value(a, keys[i]);
+        if (!v) continue;
+        sb_puts(&q, q.len ? "&" : ""); sb_puts(&q, names[i]); sb_puts(&q, "=");
+        sb_query_val(&q, v);
+    }
+    if (unit || source) {
+        sb_puts(&q, q.len ? "&scope=" : "scope=");
+        sb_query_val(&q, unit ? "unit:" : "source:");
+        sb_query_val(&q, unit ? unit : source);
+    }
+    if (q.oom) { free(q.buf); return fail("request too large"); }
+    int rc = get_repo_scoped(a->pos[0], "/databases", q.buf);
+    free(q.buf);
+    return rc;
+}
+
+static int h_db_show(const args_t *a)
+{
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/databases/"); sb_path_seg(&p, a->pos[1]);
+    if (p.oom) { free(p.buf); return fail("request too large"); }
+    int rc = get_repo_scoped(a->pos[0], p.buf, NULL);
+    free(p.buf);
+    return rc;
+}
+
+/* Detection now, without a backup: a job, waited for like the others. */
+static int h_db_detect(const args_t *a)
+{
+    sbuf_t p = { 0 };
+    unit_path(&p, a->pos[0], args_value(a, "--provider"), a->pos[1], "/detect");
+    if (p.oom) { free(p.buf); return fail("request too large"); }
+    int rc = job_run("POST", p.buf, "{}", args_flag(a, "--no-wait"), 0, NULL);
+    free(p.buf);
+    return rc;
+}
+
 static int h_unit_providers(const args_t *a)
 {
     (void)a;
@@ -2051,6 +2104,16 @@ static const arg_opt_t O_DB_ENABLE[] = {
 };
 static const arg_opt_t O_DB_DISMISS[] = { { "--reason", NULL, ARG_REQUIRED, "TEXT" }, OPT_END };
 static const arg_opt_t O_ALL[] = { { "--all", NULL, ARG_FLAG, NULL }, OPT_END };
+static const arg_opt_t O_DB_LIST[] = {
+    { "--unit",     NULL, ARG_VALUE, "KEY" },
+    { "--source",   NULL, ARG_VALUE, "PATH" },
+    { "--engine",   NULL, ARG_VALUE, "ENGINE" },
+    { "--coverage", NULL, ARG_CHOICE,
+      "covered-crash|covered-quiesced|covered-application|engine-unsafe|split|uncovered|none" },
+    { "--state",    NULL, ARG_CHOICE, "new|suggested|enabled|dismissed" },
+    OPT_LIMIT, OPT_OFFSET, OPT_END,
+};
+static const arg_opt_t O_DB_DETECT[] = { { "--provider", NULL, ARG_REQUIRED, "P" }, OPT_NOWAIT, OPT_END };
 static const arg_opt_t O_ACCEPT_MISSING[] = {
     { "--accept-missing", NULL, ARG_FLAG, NULL },
     { "--timeout", NULL, ARG_VALUE, "SECONDS" }, OPT_END,
@@ -2118,6 +2181,11 @@ static const command_t COMMANDS[] = {
     { { "vm reset-incremental", P_UPOL, NULL,
         "after a failed bitmap audit: incrementals back on, the next backup a full read" },
       h_vm_reset_incremental, 0 },
+    { { "db list",         P_REPO,     O_DB_LIST,
+        "database findings; --unit takes a unit key, --source a source path" }, h_db_list, 0 },
+    { { "db show",         P_FINDING,  NULL, NULL }, h_db_show, 0 },
+    { { "db detect",       P_UPOL,     O_DB_DETECT,
+        "runs detection on a unit now, without a backup" }, h_db_detect, 0 },
     { { "snapshots",       P_REPO,     O_PAGING, NULL }, h_snapshots, 0 },
     { { "snapshot delete", P_SNAP,     O_FORCE, NULL }, h_snapshot_delete, 0 },
     { { "snapshot note",   P_NOTE,     NULL, "reads the note, or writes [text]" },

@@ -70,6 +70,7 @@ to the end visits every row once (while nothing is added or removed).
 | `/repos/<id>/schedules` | 1000 | 1000 | id |
 | `/repos/<id>/journal` | 100 | 1000 | time then id, newest first |
 | `/repos/<id>/units`, `/repos/<id>/units/<key>` | 100 | 1000 | unit name; snapshot id, newest first |
+| `/repos/<id>/databases` | 100 | 1000 | scope, path, engine, id |
 | `/providers/<p>/units` | 100 | 1000 | the provider's enumeration |
 | `/jobs` | 50 | 1000 | id, newest first |
 
@@ -1262,7 +1263,7 @@ small-file workers. The job still completes (Manual section 6.3), and says so:
 | `changed_unsettled` | Files still changing on the second read and stored as it found them, flagged as possibly torn (`backup.unsettled: store`, the default). Not in `files_changed`. Always present |
 | `unsettled` | The first 100 of them, each `{"path"}`, with `"why"` when the file is a detected database: what it is, and whether a consistent engine copy is in the snapshot (`db-detection.md` 9.5); `[]` when none |
 | `unsettled_listed` | How many `unsettled` holds |
-| `databases` | What database detection found in what the backup read (`db-detection.md`): `{"findings":[...],"listed":N,"total":N,"sqlite_small":N}`. Present on every completed backup while `db_detect.enabled` is 1. Each finding has `id` (its row in `db_findings`), `engine`, `version` (when known), `path`, `confidence` (`live`, `dormant`), and for a live one `coverage` with `coverage_why`, `method` (`live-read` for a file source), `suggestion` and `optional` (template or action names, section 6 of the design), `unsettled` (files under it that changed during their read) and `evidence` (an object: the marker files, links, journal mode). At most 200 are listed; `sqlite_small` counts dormant SQLite files under `db_detect.sqlite_min_kb`, which are not listed. When the backup made engine copies, `captures` lists each: `path`, `engine`, `method` (`sqlite-online-backup`), `finding`, `time`, `outcome` (`ok`, `refused`, `abandoned`, `failed`), `copy` (its path in the snapshot, or `null` with a `reason`), `size`, `journal_mode` and `settle` (`settled` or `unsettled`, how the raw file read) |
+| `databases` | What database detection found in what the backup read (`db-detection.md`): `{"findings":[...],"listed":N,"total":N,"sqlite_small":N}`. Present on every completed backup while `db_detect.enabled` is 1. Each finding has `id` (its row in `db_findings`), `engine`, `version` (when known), `path` (`""` for a hint), `confidence` (`live`, `dormant`, `hint`), and for a live one `coverage` with `coverage_why`, `method` (`live-read` for a file source), `suggestion` and `optional` (template or action names, section 6 of the design), `unsettled` (files under it that changed during their read) and `evidence` (an object: the marker files, links, journal mode). At most 200 are listed; `sqlite_small` counts dormant SQLite files under `db_detect.sqlite_min_kb`, which are not listed. When the backup made engine copies, `captures` lists each: `path`, `engine`, `method` (`sqlite-online-backup`), `finding`, `time`, `outcome` (`ok`, `refused`, `abandoned`, `failed`), `copy` (its path in the snapshot, or `null` with a `reason`), `size`, `journal_mode` and `settle` (`settled` or `unsettled`, how the raw file read) |
 | `source_snapshots` | Present when any source is in snapshot mode (`db-detection.md` 9.4, Manual 6.6): each source read from a snapshot, with `"zfs"` or `"btrfs"` |
 | `live_sources` | With it: each source in `warn` snapshot mode that was read live, `{"path","reason"}`; `[]` when none. The job's warning and the journal name the same paths and reasons |
 
@@ -1642,6 +1643,38 @@ action and unit set: two `units` schedules naming different units are not
 each other's overlap. From the CLI: `schedule add 1 units --every day --at
 01:00 --provider fake --all [--exclude GLOB]...` or `--unit NAME`.
 
+## Database findings
+
+What database detection found (`db-detection.md`, Manual 23): the current
+view per repository, kept in `db_findings` by every backup and detection
+run. Read-only here; enabling and dismissing a suggestion are their own
+routes.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/repos/<id>/databases` | Findings, paginated (`limit`, `offset`; 100, at most 1000), ordered by scope, path, engine and id, filtered exactly by `scope` (`unit:<unit key>` or `source:<path>`), `engine` (the vocabulary below), `coverage` (the coverage names, or `none` for not assessed) and `state` (`new`, `suggested`, `enabled`, `dismissed`). A value outside its set is a 400. Answers `{"findings":[...],"total":N}`, `total` counting every row the filters match |
+| GET | `/repos/<id>/databases/<f>` | One finding, the same fields. 404 for an id that is not this repository's |
+
+Each finding:
+
+| Field | Meaning |
+|---|---|
+| `id` | its row, never reused |
+| `scope` | `unit:<unit key>` or `source:<source path>` |
+| `engine` | `postgres`, `mysql`, `sqlite`, `redis`, `prometheus`, `influxdb1`, `influxdb2`, `mongodb`, `elasticsearch`, `leveldb`, `rocksdb`, `lmdb`, `bbolt`, `clickhouse`, `nextcloud` |
+| `version` | when the files say (`16`, `rdb 11`, Nextcloud's `dbtype`), else null |
+| `path` | the recorded path of the data directory or file; `""` for a hint |
+| `confidence` | `live`, `dormant` or `hint` |
+| `coverage`, `coverage_why` | for a live finding, how consistent the capture was, and why in a sentence; null otherwise |
+| `method` | how it was read: `snapshot`, `paused-read`, `live-read`; null for a hint |
+| `suggestion`, `optional` | a template or action name, or null (Manual 23.3) |
+| `state` | `new`, `suggested`, `enabled`, `dismissed` |
+| `evidence` | an object: `markers`, `journal_mode`, `flavour`, `unsettled`, `links`, `also`; from units.probe, `processes` and `open_write` (at most 8 each), `unit_names` (a PostgreSQL's or MySQL's unit, for resolving a Nextcloud) and Nextcloud's `link` (`dbtype`, `dbhost`, `resolved`, `consistent`, `note`); for a hint, `images`, `ports`, `processes` and a `note` |
+| `first_seen`, `last_seen` | epoch seconds |
+| `last_snap_id` | the snapshot it was last seen in; a detection run leaves it as it was, null if only detection has seen it |
+| `alerted_at` | the one alert of its uncovered spell, or null |
+| `template`, `params`, `decided_by`, `decided_at`, `reason` | what enabling chose (`params` an object) or why it was dismissed, and who and when; null until then |
+
 ## Units
 
 Virtual machines and containers backed up through a source provider
@@ -1696,6 +1729,8 @@ with the caller. The server speaks fixed newstyle with structured replies,
 `NBD_OPT_GO`/`INFO`, `base:allocation` (the snapshot's holes are holes to
 the client), `READ`, `BLOCK_STATUS` and `DISC`; writes are refused with
 `EPERM`, `NBD_OPT_LIST` with a policy error, a wrong name at `NBD_OPT_GO`.
+
+| POST | `/repos/<id>/units/<p>/<u>/detect` | Database detection on the unit now, without a backup (`db-detection.md` 7.4, Manual 23.9): units.probe, and a scan of each included mount where a live read would read it, reading only file headers. No fields: no body or `{}`, and any key is a 400 naming it. 202 with `{"job_id":N}`; the job's result is `{"databases":...}`, the object a backup's result carries, judged against the capture the next backup would make, and its findings are recorded under `unit:<key>`. It never alerts; new live findings and coverage changes are journalled. 409 while `db_detect.enabled` is 0 or the provider's helper cannot be reached, 404 for an unknown provider; a unit its provider does not list, or outside `units.allow`, fails the job |
 
 File backups refuse a source at or under `/.cbackup-unit` or
 `/.cbackup-captures`, on `POST /backup`, `PUT /sources` and backup schedules
