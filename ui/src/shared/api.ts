@@ -166,6 +166,17 @@ export type ApiRequest =
   | { kind: 'unitBackup'; repoId: number; provider: string
       units?: string[]; all?: boolean; exclude?: string[]
       require?: UnitLevel; pauseScope?: PauseScope }
+  /* `unit restore`: the whole snapshot as files under dest, one item to a
+   * new file, or the unit itself re-created (define) in place or under a
+   * new name with its data under targetRoot. */
+  | { kind: 'unitRestore'; repoId: number; snapshotId: number; restore: UnitRestore }
+
+  /* --- NBD exports of a VM disk (Manual 22.8): `vm export`, `vm exports`,
+   * `vm export-show`, `vm unexport`. ttlS is 60 s to 7 days. */
+  | { kind: 'exportCreate'; repoId: number; snapshotId: number; item: string; ttlS?: number }
+  | { kind: 'exportList' }
+  | { kind: 'exportShow'; exportId: number }
+  | { kind: 'exportRevoke'; exportId: number }
 
   /* --- schedules --- */
   | { kind: 'scheduleList'; repoId: number }
@@ -190,6 +201,13 @@ export type ApiRequest =
 /* The levels a unit capture can achieve, lowest first (Manual 22.1). */
 export type UnitLevel = 'inconsistent' | 'crash' | 'quiesced' | 'application' | 'offline'
 export type PauseScope = 'unit' | 'group' | 'job'
+
+/* The three restore modes `c-backup unit restore` builds (api.md, unit/restore). */
+export type UnitRestore =
+  | { mode: 'files'; dest: string; overwrite?: boolean }
+  | { mode: 'item'; item: string; dest: string }
+  | { mode: 'unit'; replace?: boolean; name?: string; targetRoot?: string
+      pinDigest?: boolean; start?: boolean; keepMacs?: boolean }
 
 export type ScheduleTrigger =
   | { type: 'interval'; seconds: number }

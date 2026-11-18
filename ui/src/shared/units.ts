@@ -166,3 +166,37 @@ export function mentions(text: string, word: string): boolean {
   }
   return false
 }
+
+/* ---------------------------------------------------------------- */
+/* Restore and exports                                               */
+/* ---------------------------------------------------------------- */
+
+/*
+ * An export's lifetime as `vm export --ttl` takes it: N, Ns, Nm, Nh or Nd,
+ * 60 seconds to 7 days. 0 for anything else, which the screen refuses
+ * before asking, as the CLI does. Empty is the daemon's default
+ * (vm.export_ttl_s) and is undefined here.
+ */
+export function ttlSeconds(text: string): number | undefined {
+  const t = text.trim()
+  if (t === '') return undefined
+  const m = /^([0-9]+)([smhd]?)$/.exec(t)
+  if (!m) return 0
+  const mul = { '': 1, s: 1, m: 60, h: 3600, d: 86400 }[m[2] as '' | 's' | 'm' | 'h' | 'd']
+  const v = Number(m[1]) * mul
+  return v >= 60 && v <= 604800 ? v : 0
+}
+
+/*
+ * A refusal that names restoring the files to a path as the way round it
+ * (Manual 22.7.3: "cannot verify it is not a block device", and a socket
+ * bind). The screen shows the refusal whole and offers that restore.
+ */
+export function suggestsFilesRestore(error: string): boolean {
+  return error.includes('restore the files to a path instead')
+}
+
+/* Whether the job ended refused before anything was written (B167). */
+export function refusedNothingWritten(error: string): boolean {
+  return error.includes('nothing written') || error.includes('nothing created')
+}

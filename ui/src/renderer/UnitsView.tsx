@@ -25,6 +25,7 @@ import {
 } from '../shared/units'
 import { absoluteTime, fmtNum, fmtSize } from './format'
 import { followJob, jobIdOf } from './followJob'
+import { ExportsPanel } from './ExportsPanel'
 
 const api = window.cbackup
 
@@ -388,6 +389,8 @@ export function UnitsView({ connName, repoPath, onBack, onOpenUnit, initialProvi
               </table>
             </div>
           )}
+
+          <div className="mt-4"><ExportsPanel connName={connName} repoId={repoId} /></div>
 
           {(offset > 0 || offset + PAGE < total) && (
             <div className="flex items-center gap-2 mt-3 text-xs">

@@ -11,8 +11,12 @@
 
 import React, { useCallback, useEffect, useState } from 'react'
 import type { UnitLevel } from '../shared/api'
-import type { WireJournalEntry, WireUnitDesc, WireUnitHistory, WireUnitSnapshot } from '../shared/wire'
-import { DEFAULT_LEVEL, itemKindLabel, unitJournal } from '../shared/units'
+import type {
+  WireExportCreated, WireJournalEntry, WireUnitDesc, WireUnitHistory, WireUnitSnapshot,
+} from '../shared/wire'
+import { DEFAULT_LEVEL, isDisk, itemKindLabel, unitJournal } from '../shared/units'
+import { UnitRestoreDialog } from './UnitRestoreDialog'
+import { ExportCreate, ExportCreated, ExportsPanel } from './ExportsPanel'
 import { absoluteTime, fmtNum, fmtSize, gfsBadges } from './format'
 import {
   BackupOptions, BackupResult, btnCls, primaryCls, runUnitBackup, stateClass, type BackupRun,
@@ -52,6 +56,10 @@ export function UnitDetail({ connName, repoPath, provider, unitId, name, onBack,
 
   const [level, setLevel] = useState<UnitLevel>(DEFAULT_LEVEL)
   const [run, setRun] = useState<BackupRun | null>(null)
+  const [restoring, setRestoring] = useState<WireUnitSnapshot | null>(null)
+  const [exporting, setExporting] = useState<{ snap: number; item: string } | null>(null)
+  const [created, setCreated] = useState<WireExportCreated | null>(null)
+  const [exportsRefresh, setExportsRefresh] = useState(0)
 
   const loadState = useCallback(async () => {
     try {
@@ -183,6 +191,18 @@ export function UnitDetail({ connName, repoPath, provider, unitId, name, onBack,
                           {i.reason ? ` (${i.reason})` : ''}
                           {i.bytes_read ? `, read ${fmtSize(i.bytes_read)}` : ''}
                         </span>
+                        {isDisk(i.kind) && (
+                          <button onClick={() => setExporting({ snap: s.id, item: i.id })}
+                            title="Serve this disk read-only over NBD, to mount a filesystem in it without restoring"
+                            className="ml-2 text-[11px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer p-0">
+                            Export
+                          </button>
+                        )}
+                        {exporting?.snap === s.id && exporting.item === i.id && (
+                          <ExportCreate connName={connName} repoId={repoId} snapshotId={s.id} item={i.id}
+                            onCancel={() => setExporting(null)}
+                            onCreated={e => { setCreated(e); setExporting(null); setExportsRefresh(n => n + 1) }} />
+                        )}
                       </div>
                     ))}
                   </td>
@@ -190,6 +210,7 @@ export function UnitDetail({ connName, repoPath, provider, unitId, name, onBack,
                   <td className="py-1.5 text-right">{fmtSize(s.bytes)}</td>
                   <td className="py-1.5 text-right whitespace-nowrap">
                     <button className={btnCls} onClick={() => onBrowseSnapshot(s.id)}>Browse</button>
+                    <button className={`${btnCls} ml-1`} onClick={() => setRestoring(s)}>Restore</button>
                   </td>
                 </tr>
               ))}
@@ -203,6 +224,16 @@ export function UnitDetail({ connName, repoPath, provider, unitId, name, onBack,
           </div>
         )}
       </section>
+
+      {created && <ExportCreated e={created} onDismiss={() => setCreated(null)} />}
+      <ExportsPanel connName={connName} repoId={repoId} snapshots={snapIds} refresh={exportsRefresh} />
+
+      {restoring && (
+        <UnitRestoreDialog connName={connName} repoId={repoId} snapshot={restoring}
+          unitName={desc?.name ?? name}
+          onClose={() => setRestoring(null)}
+          onDone={() => { void loadState(); void loadHistory() }} />
+      )}
 
       <section className="mb-4">
         <div className="flex items-center gap-3 mb-2">
@@ -225,7 +256,7 @@ export function UnitDetail({ connName, repoPath, provider, unitId, name, onBack,
               {shown.map(e => (
                 <tr key={e.id} className={`unit-journal border-t border-border-default ${e.names ? 'text-text-primary' : 'text-text-muted'}`}>
                   <td className="py-1 whitespace-nowrap pr-2">{absoluteTime(e.ts)}</td>
-                  <td className="py-1 pr-2 font-mono">{e.operation}</td>
+                  <td className="py-1 pr-2 font-mono whitespace-nowrap">{e.operation}</td>
                   <td className="py-1 pr-2">{e.result}</td>
                   <td className="py-1 break-words">{e.message || '-'}</td>
                 </tr>
