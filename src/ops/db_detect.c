@@ -1229,6 +1229,11 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
             const hrec_t *h = head_find(d, vp);
             if (h && DB_HEAD_KIND(h->code) == DB_HEAD_REDIS_RDB)
                 snprintf(c.version, sizeof(c.version), "rdb %u", DB_HEAD_PARAM(h->code));
+        } else if (e == DB_ENGINE_ROCKSDB && (r->m & (M_LDB | M_LOGFILE))) {
+            /* Two engines claim it; the more specific wins, and the other's
+             * evidence is kept (section 4). */
+            if ((c.also = cJSON_CreateArray()))
+                cJSON_AddItemToArray(c.also, cJSON_CreateString("leveldb: CURRENT, MANIFEST-*, *.log"));
         } else if (e == DB_ENGINE_INFLUX1) {
             snprintf(c.version, sizeof(c.version), "1");
         } else if (e == DB_ENGINE_INFLUX2) {
