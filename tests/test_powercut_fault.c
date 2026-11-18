@@ -93,6 +93,7 @@
 #include "types.h"
 #include "unit_backup.h"
 #include "unit_state.h"
+#include "verify.h"
 #include "test_tmp.h"
 
 #define H_DIR    TEST_TMP "/c_backup_test_powercut"
@@ -651,6 +652,9 @@ typedef struct scenario {
      * and again after the start (started 1), to hold the request's own
      * edit to what its durability class promises. */
     void      (*check)(int crash_at, int kept, int started);
+    /* B193: after the start's checks, a deep verify, gc's accounting of
+     * what it dropped, and one more backup that has to restore. */
+    int         deep;
 } scenario_t;
 
 /* ---- units --------------------------------------------------------- */
@@ -1384,6 +1388,105 @@ static void check_restores(store_t *st, cutils_db_t *db)
     }
 }
 
+/* B193's duplicate-pack scenario: copies written into the new pack, each
+ * one of an object a snapshot names. */
+static int      g_deep;
+static uint64_t g_dups_written;
+static uint32_t g_dup_pristine_max;   /* the highest pack before the operation */
+/* Starts by what the cut left of the duplicate pack: no packs row, the
+ * packs row with some hashes moved, the packs row with all of them. */
+static unsigned g_cut_states[3];
+
+static void classify_dup_cut(cutils_db_t *db)
+{
+    char maxp[32];
+    snprintf(maxp, sizeof(maxp), "%u", g_dup_pristine_max);
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT COUNT(*), (SELECT COUNT(*) FROM pack_objects po"
+                       "  WHERE po.pack_id = p.id) FROM packs p WHERE p.id > ?",
+                   (const char *[]){ maxp, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return;
+    }
+    long long packs = strtoll(r->rows[0][0], NULL, 10);
+    long long moved = strtoll(r->rows[0][1], NULL, 10);
+    db_result_free(r);
+    if (packs == 0) g_cut_states[0]++;
+    else if ((uint64_t)moved < g_dups_written) g_cut_states[1]++;
+    else g_cut_states[2]++;
+}
+
+/*
+ * The deeper half of the start for a duplicate pack whose commit was cut
+ * between its parts (B193). Whatever the cut left - rows without their
+ * packs row, the packs row with some hashes moved and the rest still
+ * naming the packs they came from, or everything - the start and a gc must
+ * leave a repository that verifies clean, in which gc took nothing a
+ * snapshot names and dropped nothing that was not a duplicate copy, and to
+ * which a further backup adds a snapshot that restores.
+ */
+static void deep_checks(store_t *st, cutils_db_t *db, const gc_result_t *g)
+{
+    if (g->swept || g->content_missing)
+        violation("gc after the start swept %llu objects and missed %llu: every object "
+                  "here is named by a snapshot", (unsigned long long)g->swept,
+                  (unsigned long long)g->content_missing);
+    if (g->pack_entries_dropped > g_dups_written)
+        violation("gc dropped %llu pack entries, more than the %llu duplicate copies",
+                  (unsigned long long)g->pack_entries_dropped,
+                  (unsigned long long)g_dups_written);
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    if (verify_run(st, db, g_repo_id, VERIFY_LEVEL_DEEP, 0, NULL, NULL, NULL, &vr) != OK ||
+        vr.missing || vr.unrecoverable)
+        violation("deep verify after the start: %llu missing, %llu unrecoverable (%s)",
+                  (unsigned long long)vr.missing, (unsigned long long)vr.unrecoverable,
+                  err_msg());
+    err_clear();
+
+    /* One more backup, a new version of the source, and its restore. */
+    int prev = g_ver_of[MAX_SNAPS - 1];
+    (void)prev;
+    set_source(3);
+    static const char *paths[] = { H_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.store_workers = 1;
+    backup_result_t br;
+    memset(&br, 0, sizeof(br));
+    if (backup_run(st, db, g_repo_id, &o, &br) != OK) {
+        violation("a backup after the start fails: %s", err_msg());
+        return;
+    }
+    int64_t id = br.snapshot_id;
+    backup_result_free(&br);
+    rm_tree(H_OUT);
+    assert_int_equal(__real_mkdir(H_OUT, 0700), 0);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.overwrite = 1;
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    if (restore_run(st, db, g_repo_id, id, H_OUT, &ro, &rr) != OK)
+        violation("the backup after the start does not restore: %s", err_msg());
+    else
+        check_restored((int)id, 3, 0);
+    gc_result_t g2;
+    memset(&g2, 0, sizeof(g2));
+    if (gc_run(st, db, g_repo_id, 0, NULL, &g2) != OK)
+        violation("a second gc fails: %s", err_msg());
+    if (g2.swept || g2.content_missing)
+        violation("the second gc swept %llu live objects", (unsigned long long)g2.swept);
+    /* Converged: the first gc settled every duplicate, whichever pack the
+     * cut left its hash naming, so the second finds nothing more to drop. */
+    if (g2.pack_entries_dropped || g2.dups_dropped)
+        violation("a second gc still dropped %llu entries and %llu duplicates: the first "
+                  "did not converge the cut", (unsigned long long)g2.pack_entries_dropped,
+                  (unsigned long long)g2.dups_dropped);
+}
+
 /* The daemon's start after an outage, and everything that must hold. */
 /*
  * B156: pack numbers are never issued twice. Every pack on disk, every pack
@@ -1443,6 +1546,7 @@ static void start_and_check(void)
 {
     cutils_db_t *db = NULL;
     db_open_at(H_DB, &db);
+    if (g_deep) classify_dup_cut(db);
     return_dropped_pack();
     if (store_index_drop_unannounced(db, 0) != OK)
         violation("drop_unannounced: %s", err_msg());
@@ -1502,6 +1606,7 @@ static void start_and_check(void)
     check_no_stray_packs(db, H_REPO "/packs");
     check_snapshots(db);
     check_restores(st, db);
+    if (g_deep) deep_checks(st, db, &g);
 
     if (g_units) {
         /* The session after the outage: whatever the cut left, the unit as
@@ -1655,6 +1760,7 @@ static void every_cut(const scenario_t *s)
     g_scenario = s->name;
     g_units = s->units;
     g_two = s->units == 2;
+    g_deep = s->deep;
     double t0 = now_s();
     ctx_t c;
     s->build(&c);
@@ -1682,6 +1788,7 @@ static void every_cut(const scenario_t *s)
     (void)skipped;
     g_units = 0;
     g_two = 0;
+    g_deep = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1943,6 +2050,71 @@ static status_t op_repoint(ctx_t *c, int counting)
 {
     status_t st = op_gc_run(c);
     if (counting && st == OK) assert_int_equal(g_gc.index_relocated + g_gc.dups_dropped >= 1, 1);
+    return st;
+}
+
+/*
+ * B193: a pack of duplicates, its commit's marker in parts. Every object the
+ * repository holds is written again into one new pack (the shape of FS2's
+ * 16.7 s commit: chunks another worker had already packed), so every row of
+ * its commit is set aside for the marker, and at two rows a part the
+ * marker is the packs row and then many parts. The cuts land before the
+ * packs row (its rows dropped at the start, the pack file left for gc),
+ * after it with some hashes moved, and after the last part.
+ */
+static void build_dup_pack(ctx_t *c)
+{
+    begin_build(c);
+    open_target(c);
+    g_required[backup_into(c->store, c->db, g_repo_id, 1)] = 1;
+    g_required[backup_into(c->store, c->db, g_repo_id, 2)] = 1;
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(c->db, "SELECT MAX(id) FROM packs", NULL, &r), 0);
+    g_dup_pristine_max = (uint32_t)strtoul(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    memset(g_cut_states, 0, sizeof(g_cut_states));
+    end_build(c);
+}
+
+static status_t op_dup_pack(ctx_t *c, int counting)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(c->db, "SELECT hash FROM pack_objects ORDER BY hash",
+                                NULL, &r), 0);
+    assert_true(r && r->nrows > 4);
+    g_dups_written = (uint64_t)r->nrows;
+    /* Any step here can be the cut, so failures are returned, not asserted. */
+    pack_stored_writer_t *w = NULL;
+    status_t st = pack_stored_open(c->store, &w);
+    for (int i = 0; st == OK && i < r->nrows; i++) {
+        uint8_t hash[OBJECT_HASH_SIZE];
+        hex_hash(r->rows[i][0], hash);
+        object_stored_info_t info;
+        void *payload = NULL;
+        size_t len = 0;
+        int damaged = 0;
+        st = object_read_stored(c->store, hash, &info, &payload, &len, &damaged);
+        if (st == OK)
+            st = pack_stored_add(w, hash, info.type, info.compression, info.encryption,
+                                 info.uncompressed_size, payload, len);
+        free(payload);
+    }
+    db_result_free(r);
+    if (st != OK) {
+        if (w) pack_stored_abort(w);
+        return st;
+    }
+    store_index_set_pack_batch_rows(2);
+    st = pack_stored_finish(w, NULL);
+    store_index_set_pack_batch_rows(0);
+    if (counting && st == OK) {
+        /* The whole commit landed: every hash now names the new pack. */
+        db_result_t *q = NULL;
+        assert_int_equal(db_execute(c->db, "SELECT COUNT(*) FROM pack_objects"
+                                    " WHERE pack_id = (SELECT MAX(id) FROM packs)", NULL, &q), 0);
+        assert_int_equal(strtoull(q->rows[0][0], NULL, 10), g_dups_written);
+        db_result_free(q);
+    }
     return st;
 }
 
@@ -2329,36 +2501,38 @@ static void check_api_sources(int crash_at, int kept, int started)
 }
 
 static const scenario_t S_BACKUP_FIRST = { "backup, first", build_backup_first,
-                                           op_backup_first, 0, 0, 0, NULL };
+                                           op_backup_first, 0, 0, 0, NULL, 0 };
 static const scenario_t S_BACKUP_INCR  = { "backup, incremental", build_backup_incr,
-                                           op_backup_incr, 0, 0, 0, NULL };
+                                           op_backup_incr, 0, 0, 0, NULL, 0 };
 static const scenario_t S_REPLICATE    = { "replicate-in", build_replicate, op_replicate,
-                                           1, 1, 0, NULL };
-static const scenario_t S_GC           = { "gc", build_gc, op_gc, 0, 0, 0, NULL };
-static const scenario_t S_COALESCE     = { "coalesce", build_coalesce, op_coalesce, 0, 0, 0, NULL };
-static const scenario_t S_SALVAGE      = { "salvage", build_salvage, op_salvage, 0, 0, 0, NULL };
+                                           1, 1, 0, NULL, 0 };
+static const scenario_t S_GC           = { "gc", build_gc, op_gc, 0, 0, 0, NULL, 0 };
+static const scenario_t S_COALESCE     = { "coalesce", build_coalesce, op_coalesce, 0, 0, 0, NULL, 0 };
+static const scenario_t S_SALVAGE      = { "salvage", build_salvage, op_salvage, 0, 0, 0, NULL, 0 };
 static const scenario_t S_REPOINT      = { "OWN-22 repoint", build_repoint, op_repoint,
-                                           0, 0, 0, NULL };
-static const scenario_t S_PRUNE        = { "prune", build_prune, op_prune, 0, 0, 0, NULL };
-static const scenario_t S_REINDEX      = { "reindex", build_reindex, op_reindex, 0, 0, 0, NULL };
+                                           0, 0, 0, NULL, 0 };
+static const scenario_t S_PRUNE        = { "prune", build_prune, op_prune, 0, 0, 0, NULL, 0 };
+static const scenario_t S_DUP_PACK     = { "duplicate pack (B193)", build_dup_pack,
+                                           op_dup_pack, 0, 0, 0, NULL, 1 };
+static const scenario_t S_REINDEX      = { "reindex", build_reindex, op_reindex, 0, 0, 0, NULL, 0 };
 static const scenario_t S_UNIT_FIRST   = { "unit backup, first", build_unit_first,
-                                           op_unit_first, 0, 0, 1, NULL };
+                                           op_unit_first, 0, 0, 1, NULL, 0 };
 static const scenario_t S_UNIT_SECOND  = { "unit backup, second", build_unit_second,
-                                           op_unit_second, 0, 0, 1, NULL };
+                                           op_unit_second, 0, 0, 1, NULL, 0 };
 static const scenario_t S_UNIT_TWO     = { "unit backup, two units", build_unit_two,
-                                           op_unit_two, 0, 0, 2, NULL };
+                                           op_unit_two, 0, 0, 2, NULL, 0 };
 static const scenario_t S_AFTER_DROP   = { "backup after a drop", build_backup_after_drop,
-                                           op_backup_after_drop, 0, 0, 0, NULL };
+                                           op_backup_after_drop, 0, 0, 0, NULL, 0 };
 
 static const scenario_t S_API_TAG      = { "API tag set (durable)", build_api, op_api_tag,
-                                           0, 0, 0, check_api_tag };
+                                           0, 0, 0, check_api_tag, 0 };
 static const scenario_t S_API_SCHED_DEL = { "API schedule delete (durable)", build_api,
                                             op_api_schedule_delete, 0, 0, 0,
-                                            check_api_schedule_delete };
+                                            check_api_schedule_delete, 0 };
 static const scenario_t S_API_NOTE     = { "API note (commit-only)", build_api, op_api_note,
-                                           0, 0, 0, check_api_note };
+                                           0, 0, 0, check_api_note, 0 };
 static const scenario_t S_API_SOURCES  = { "API sources (commit-only)", build_api,
-                                           op_api_sources, 0, 0, 0, check_api_sources };
+                                           op_api_sources, 0, 0, 0, check_api_sources, 0 };
 
 static void test_api_tag(void **state)        { (void)state; every_cut(&S_API_TAG); }
 static void test_api_sched_del(void **state)  { (void)state; every_cut(&S_API_SCHED_DEL); }
@@ -2372,6 +2546,17 @@ static void test_gc(void **state)            { (void)state; every_cut(&S_GC); }
 static void test_coalesce(void **state)      { (void)state; every_cut(&S_COALESCE); }
 static void test_salvage(void **state)       { (void)state; every_cut(&S_SALVAGE); }
 static void test_repoint(void **state)       { (void)state; every_cut(&S_REPOINT); }
+static void test_dup_pack(void **state)
+{
+    (void)state;
+    every_cut(&S_DUP_PACK);
+    printf("  %-22s starts after a cut before the packs row %u, between parts %u, "
+           "after the last part %u\n", "", g_cut_states[0], g_cut_states[1], g_cut_states[2]);
+    /* Each kind of cut was actually exercised. */
+    assert_true(g_cut_states[0] > 0);
+    assert_true(g_cut_states[1] > 0);
+    assert_true(g_cut_states[2] > 0);
+}
 static void test_prune(void **state)         { (void)state; every_cut(&S_PRUNE); }
 static void test_reindex(void **state)       { (void)state; every_cut(&S_REINDEX); }
 static void test_unit_first(void **state)    { (void)state; every_cut(&S_UNIT_FIRST); }
@@ -2553,6 +2738,7 @@ int main(void)
         cmocka_unit_test(test_coalesce),
         cmocka_unit_test(test_salvage),
         cmocka_unit_test(test_repoint),
+        cmocka_unit_test(test_dup_pack),
         cmocka_unit_test(test_prune),
         cmocka_unit_test(test_reindex),
         cmocka_unit_test(test_unit_first),

@@ -63,8 +63,13 @@ static status_t lxc(struct sp_ctx *c, const char *tool, const char *name, const 
     if (name) { argv[n++] = "-n"; argv[n++] = name; }
     if (extra) argv[n++] = extra;
     argv[n] = NULL;
-    /* LXC's command socket is abstract, in the host's network namespace. */
-    return host_run(&c->tools, 1, argv, LXC_TIMEOUT_S, out, 1024 * 1024);
+    /* LXC's command socket is abstract, in the host's network namespace.
+     * And the host's cgroup namespace (B190): from the helper's own,
+     * lxc-start resolves the cgroup it escapes to through the namespace's
+     * root and fails "Failed to open 10/../..: Invalid cross-device link";
+     * from the host's it places the container in the host's tree, outside
+     * the helper's container, as a start on the host would. */
+    return host_run(&c->tools, HOST_NS_NET | HOST_NS_CGROUP, argv, LXC_TIMEOUT_S, out, 1024 * 1024);
 }
 
 /* sp_state_t from lxc-info -s. */
@@ -100,7 +105,7 @@ static status_t x_probe(sp_ctx_t *c, sp_probe_t *out)
     char bin[HOST_TOOL_PATH_MAX + 16];
     snprintf(bin, sizeof(bin), "%s/lxc-ls", c->tools.lxc_dir);
     const char *argv[] = { bin, "--version", NULL };
-    if (host_run(&c->tools, 1, argv, LXC_TIMEOUT_S, &v, 256) != OK) {
+    if (host_run(&c->tools, HOST_NS_NET | HOST_NS_CGROUP, argv, LXC_TIMEOUT_S, &v, 256) != OK) {
         snprintf(out->detail, sizeof(out->detail), "%.250s", err_msg());
         err_clear();
         return OK;
@@ -504,7 +509,28 @@ static int x_unit_state(sp_ctx_t *c, const char *unit_id) { return valid_name(un
 static status_t x_set_running(sp_ctx_t *c, const char *unit_id, int run)
 {
     if (!valid_name(unit_id)) return set_error(ERR_INVALID, "lxc: bad container name");
+    /* Already so is done, as Docker's 304: lxc-stop of a stopped container
+     * fails, and an in-place restore stops the unit whatever its state. */
+    int s = state_of(c, unit_id);
+    if (run ? s == SP_STATE_RUNNING : s == SP_STATE_STOPPED) return OK;
     return lxc(c, run ? "lxc-start" : "lxc-stop", unit_id, NULL, NULL);
+}
+
+/*
+ * The snapshot domain holding a mount's bytes (B191), as Docker's: the
+ * rootfs and every bind lxc.mount.entry source, by the real path describe
+ * resolved. Without it the helper fell back to the policy's dir_domains,
+ * which name no ZFS dataset or btrfs pool, and every in-place LXC restore
+ * was refused as being in no snapshot domain.
+ */
+static status_t x_mount_root(sp_ctx_t *c, const char *mount, char *buf, size_t sz)
+{
+    snap_dom_t d;
+    status_t st = snap_domain_of(&c->snap, mount, &d);
+    if (st != OK) return st;
+    if (d.kind == SNAP_NONE) return set_error(ERR_NOT_FOUND, "lxc: %s is in no snapshot domain", mount);
+    snprintf(buf, sz, "%s", d.root);
+    return OK;
 }
 
 /*
@@ -638,7 +664,7 @@ status_t lxc_backend_init(const helper_policy_t *pol, helper_backend_t *out)
     *out = (helper_backend_t){
         .name = "lxc", .ops = &k_lxc_ops, .ctx = c,
         .blob_data = x_blob_data, .unit_state = x_unit_state, .set_running = x_set_running,
-        .hook_start = x_hook_start, .hook_poll = x_hook_poll, .hook_kill = x_hook_kill, .hook_free = x_hook_free,
+        .mount_root = x_mount_root, .hook_start = x_hook_start, .hook_poll = x_hook_poll, .hook_kill = x_hook_kill, .hook_free = x_hook_free,
         .define = x_define,
     };
     return OK;

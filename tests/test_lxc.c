@@ -53,6 +53,8 @@ static int count(const char *path, const char *needle)
     return n;
 }
 
+static int init_with(const char *nsenter);
+
 static int setup(void **state)
 {
     (void)state;
@@ -67,16 +69,22 @@ static int setup(void **state)
     put(STATE "/lxc-DevBox", "RUNNING\n");
     put(STATE "/datasets", "cache/lxc\t" LXCP "\ncache/appdata\t" MNT "/cache/appdata\n");
     setenv("FAKE_HOST_STATE", STATE, 1);
+    return init_with("nsenter = 0\n");
+}
+
+/* The backend over a policy whose [host] nsenter settings are nsenter. */
+static int init_with(const char *nsenter)
+{
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof(cwd))) return -1;
     char text[4096];
     snprintf(text, sizeof(text),
              "[helper]\ndaemon_uid = 1000\ndaemon_id = 0badf00d\nstate_dir = " STATE "\n"
              "[snapshot]\nzfs_domains = cache/lxc, cache/appdata\n"
-             "[host]\nnsenter = 0\nhost_root =\nzfs = %s/tests/fake_host/zfs\nlxc_dir = %s/tests/fake_host/lxc\n"
+             "[host]\n%shost_root =\nzfs = %s/tests/fake_host/zfs\nlxc_dir = %s/tests/fake_host/lxc\n"
              "user_root = " MNT "/user\nmnt_root = " MNT "\nboot_config = " D "/boot\n"
              "[docker]\ninclude_roots = " MNT "/cache/appdata\n"
-             "[lxc]\nenabled = 1\npath = " LXCP "\n", cwd, cwd);
+             "[lxc]\nenabled = 1\npath = " LXCP "\n", nsenter, cwd, cwd);
     memset(&pol, 0, sizeof(pol));
     if (helper_policy_parse(text, &pol) != OK) return -1;
     return lxc_backend_init(&pol, &be) == OK ? 0 : -1;
@@ -257,6 +265,53 @@ static int group_cleanup(void **state)
     return 0;
 }
 
+/*
+ * B190: lxc-* run in the host's cgroup namespace as well as its mount and
+ * network ones. From the helper's own, lxc-start failed "Failed to open
+ * 10/../..: Invalid cross-device link", so a restore could not start the
+ * container again. Starting a running container or stopping a stopped one
+ * is done, not an error, as Docker's 304.
+ */
+static void test_host_namespaces(void **state)
+{
+    (void)state;
+    lxc_backend_fini(&be);
+    helper_policy_free(&pol);
+    char cwd[PATH_MAX], ns[PATH_MAX + 64];
+    assert_non_null(getcwd(cwd, sizeof(cwd)));
+    snprintf(ns, sizeof(ns), "nsenter = 1\nnsenter_bin = %s/tests/fake_host/nsenter\n", cwd);
+    assert_int_equal(init_with(ns), 0);
+    assert_int_equal(be.set_running(be.ctx, "DevBox", 0), OK);
+    assert_int_equal(be.set_running(be.ctx, "DevBox", 0), OK);     /* already stopped */
+    assert_int_equal(count(STATE "/lxc.log", "lxc-stop"), 1);
+    assert_int_equal(be.set_running(be.ctx, "DevBox", 1), OK);
+    assert_int_equal(be.set_running(be.ctx, "DevBox", 1), OK);     /* already running */
+    assert_int_equal(count(STATE "/lxc.log", "lxc-start"), 1);
+    assert_int_equal(count(STATE "/nsenter.log", "-t 1 -m -n -C -- lxc-start"), 1);
+    assert_int_equal(count(STATE "/nsenter.log", "-t 1 -m -n -C -- lxc-stop"), 1);
+    assert_int_equal(count(STATE "/nsenter.log", "-- lxc-"), count(STATE "/nsenter.log", "-m -n -C -- lxc-"));
+}
+
+/*
+ * B191: an LXC mount's snapshot domain, which the helper stages an
+ * in-place restore in: the rootfs's dataset and a bind entry's. Only
+ * Docker located one, so every in-place LXC restore was refused.
+ */
+static void test_mount_root(void **state)
+{
+    (void)state;
+    char root[PATH_MAX];
+    assert_non_null(be.mount_root);
+    assert_int_equal(be.mount_root(be.ctx, LXCP "/DevBox/rootfs", root, sizeof(root)), OK);
+    assert_string_equal(root, LXCP);
+    assert_int_equal(be.mount_root(be.ctx, MNT "/cache/appdata/dev", root, sizeof(root)), OK);
+    assert_string_equal(root, MNT "/cache/appdata");
+    assert_int_equal(mkdir(D "/elsewhere", 0700), 0);
+    assert_int_equal(be.mount_root(be.ctx, D "/elsewhere", root, sizeof(root)), ERR_NOT_FOUND);
+    assert_non_null(strstr(err_msg(), "no snapshot domain"));
+    err_clear();
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -264,6 +319,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_freeze_lost, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_thaws, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_host_namespaces, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_mount_root, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }
