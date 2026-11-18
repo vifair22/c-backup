@@ -685,7 +685,9 @@ gives it a new one. Ids used to be reused, so the next repository added
 could take over the removed one's schedules and history.
 
 The same holds for every other id the daemon hands out: jobs, schedules,
-search and verify runs, and snapshots within a repository. Removing a
+search and verify runs, exports, journal entries, and snapshots within a
+repository. Journal entry ids are one sequence across every repository, so
+one repository's journal shows gaps where another's entries took ids. Removing a
 repository deletes its jobs, and the next job on another repository used
 to take the removed one's newest job id, so a script or log line holding
 it named an unrelated job; deleting the newest snapshot likewise gave its
@@ -696,6 +698,18 @@ ever issued in `snapshot-ids`, raised before each snapshot record is
 written, and a reindex continues above that mark, not above the highest
 snapshot still present. Pruning the newest snapshots and then rebuilding
 the index never hands their numbers out again (section 17).
+
+A power cut does not undo this either. A job submission or a new schedule
+is committed when the answer returns but reaches the disk up to a second
+later (section 6.4), so a cut in that second can lose the row itself; it
+does not free the id. The daemon reserves ids ahead in blocks of 256 per
+table and makes each reservation durable before handing out an id it
+covers, and at start it continues above the reservation. After a clean
+stop nothing is skipped. After a power cut or a crash the next ids jump
+ahead by up to 256, the log says `id reservation: the last stop was not
+clean` with the tables and where each continues, and no id that a client,
+a log line or an alert already holds is ever issued again. The cost is
+one `fdatasync` for about one row in 128 created in each table.
 
 ### 5.3 Where to put a repository
 
@@ -1063,7 +1077,8 @@ What happens after the commit depends on the edit:
   retention and the rest). A power cut within about a second of the answer
   can lose that last edit. It never corrupts anything: the daemon starts,
   the repository and its index agree, and the edit is either wholly there
-  or wholly absent, so making it again is all a lost edit costs.
+  or wholly absent, so making it again is all a lost edit costs. A lost
+  job or schedule never gives its id to the next one (section 5.2).
 
 A commit-only edit returns in well under a second however long the backup
 runs. A durable edit also waits for the database's write-ahead log to be

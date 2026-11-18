@@ -307,6 +307,16 @@ static void test_an_end_the_database_cannot_take_is_kept_and_retried(void **stat
     assert_int_equal(job_ends_unrecorded(db), 0);
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 1"
                               " AND operation = 'backup' AND result = 'failed'"), 1);
+    /* NIT-43: the journal says when the job ended, as the row does, not
+     * when the end finally went in, which was three seconds and more
+     * later. */
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM journal WHERE repo_id = 1 AND operation = 'backup'"
+             " AND result = 'failed' AND ts = %lld", (long long)ev.ended);
+    assert_int_equal(db_count(sql), 1);
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM jobs WHERE id = %lld AND ended = %lld",
+             (long long)id, (long long)ev.ended);
+    assert_int_equal(db_count(sql), 1);
 }
 
 /* The same for a job that completed with warnings: the held end keeps its
