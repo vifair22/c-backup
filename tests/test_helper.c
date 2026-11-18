@@ -515,6 +515,17 @@ static void test_restore_staging_place(void **state)
     (void)state;
     struct stat sb;
     hstart_plus(STAGE_HOST);
+    /* B189: the check makes the refusals and creates nothing. */
+    cJSON *ck = call(req("restore.stage", "{\"unit\":\"fake:u1\",\"mount\":\"" HF_MOUNT "\",\"job\":9,"
+                         "\"check\":true}"), NULL);
+    assert_string_equal(code_of(ck), "ok");
+    assert_true(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(ck, "result"), "checked")));
+    cJSON_Delete(ck);
+    assert_int_not_equal(lstat(SYS_BASE, &sb), 0);
+    ck = call(req("restore.stage", "{\"unit\":\"fake:u1\",\"mount\":\"" HF_DIR "/nope\",\"job\":9,"
+                  "\"check\":true}"), NULL);
+    assert_string_equal(code_of(ck), "denied");
+    cJSON_Delete(ck);
     stage_expect("ok", NULL);
     assert_int_not_equal(stat(HF_POOL "/.cbackup-restore", &sb), 0);
     /* Made 0700. */
@@ -532,11 +543,16 @@ static void test_restore_staging_place(void **state)
     assert_int_equal(lstat(SYS_BASE, &sb), 0);
     assert_int_equal(sb.st_mode & 07777, 0755);
 
-    /* A symlink in place of the base: never followed. */
+    /* A symlink in place of the base: never followed, by the check too. */
     hf_rmrf(SYS_BASE);
     assert_int_equal(mkdir(HF_POOL "/elsewhere", 0700), 0);
     assert_int_equal(symlink(HF_POOL "/elsewhere", SYS_BASE), 0);
     stage_expect("denied", "symlink");
+    ck = call(req("restore.stage", "{\"unit\":\"fake:u1\",\"mount\":\"" HF_MOUNT "\",\"job\":9,"
+                  "\"check\":true}"), NULL);
+    assert_string_equal(code_of(ck), "denied");
+    assert_non_null(strstr(msg_of(ck), "symlink"));
+    cJSON_Delete(ck);
     assert_int_equal(unlink(SYS_BASE), 0);
     /* A symlink further up, in place of the share directory: the same. */
     assert_int_equal(rename(HF_POOL "/system", HF_POOL "/system.real"), 0);

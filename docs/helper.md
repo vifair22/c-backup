@@ -548,7 +548,15 @@ pool's capture directory and counted as one more instant.
 
 `restore.stage` creates `<domain>/.cbackup-restore/<job>-<random>` inside
 the mount's snapshot domain and `restore.swap` puts the staged one in place
-and the old directory at `<mount>.cbackup-old-<job>`: never a delete.
+and the old directory at `<mount>.cbackup-old-<job>`: never a delete. With
+`check: true` it makes every refusal of a real stage and creates nothing,
+answering `{"checked": true}`; the daemon checks every mount this way
+before it stops the unit, so a refused restore leaves the unit as it was
+(B189). The staging must be on the mount's filesystem and mount: a rename
+across a bind mount is `EXDEV` even within one filesystem. The base is
+never removed, even empty: it is the directory the daemon has bound
+(B187). After a swap only a VM image's job directory goes, through the
+base fd pinned at stage and only while it is still the pinned directory.
 
 **The mount is swapped where its bytes are (B178).** The daemon names the
 mount by its recorded path, as the container binds it
