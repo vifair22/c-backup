@@ -1016,9 +1016,16 @@ write lock across batches of up to 2,000 files, and lets it go as soon as
 another write is queued for it: at the next file, the next read of the file
 it is storing, the next directory tree, or the next row of the snapshot's
 node index, which it writes last. A write that is waiting goes before the
-backup's next batch. A backup nobody interrupts commits once per 2,000 files
-and once per sealed pack, which matters on storage where each commit's sync
-is slow.
+backup's next batch, and before every other bulk write that is waiting too
+(the backup's pack commits, a reindex, gc): it waits for the one transaction
+holding the lock and no more. That priority is bounded, so a steady stream
+of edits cannot stall a backup: a bulk write that has waited 150 ms, or
+seen eight edits go first, is served next. That transaction is itself bounded: every bulk
+transaction ends once it has written about as many database pages as the
+disk under `state.db` takes in 150 ms, learnt from the commits before it,
+and never more than 256. A backup nobody interrupts commits once per 2,000
+files, once per sealed pack, and wherever that bound falls, which matters on
+storage where each commit's writes are slow.
 
 What happens after the commit depends on the edit:
 
@@ -1061,6 +1068,16 @@ scales these down roughly with its sync latency. Keep `state.db`
 (`db.path`) off a disk that other work saturates if tag and delete latency
 matters. Which class every API
 route has is listed in `docs/api.md`.
+
+A tag write also writes the repository's own copy of the tag list before it
+touches the database, and makes it durable there: one `fsync` of the file
+and one of the repository's directory, on the repository's storage, outside
+the database's lock. That is what a tag costs on top of any other durable
+edit, and it is the disk's cost, not a wait for the backup: on the M5 pool
+above with a backup and other load running, those two syncs took 5-7 s
+between them (image M7), while the database lock was held for at most one
+bounded transaction. A repository on a busy pool makes tags slow in exactly
+this way; nothing the daemon waits for can shorten it.
 
 A change to a repository's sources applies to backups submitted after it. A
 backup takes its sources from the configuration when it is submitted, so a

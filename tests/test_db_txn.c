@@ -799,7 +799,7 @@ static void budget_teardown(void)
 
 /*
  * A batch ends at the commit budget. At 1 ms a frame the budget is 150
- * pages, so the first batch (one frame a row assumed) holds 150 rows; the
+ * pages, so the first batch (two frames a row assumed) holds 75 rows; the
  * ones after learn what a row really costs and stay near 150 frames. At
  * 100 ms a frame the budget is the 16-page floor.
  */
@@ -815,7 +815,7 @@ static void test_a_batch_ends_at_the_commit_budget(void **state)
     print_message("  1 ms/frame: %d commits, first %d rows, then %d; max %u frames, %lu capped\n",
                   n, per[0], n > 2 ? per[2] : 0, cs.max_frames, cs.capped);
     assert_true(n >= 5);
-    assert_int_equal(per[0], 150);
+    assert_int_equal(per[0], 75);
     assert_true(cs.capped >= 5);
     assert_true(cs.max_frames <= 150 * 2);
 
@@ -861,6 +861,88 @@ static void test_no_tracking_means_no_cap(void **state)
     db_txn_set_frame_cost_ns(0);
 }
 
+/*
+ * B193: non-bulk writers go first, but not for ever. Four threads write
+ * non-bulk rows without pause - more than enough to keep a priority writer
+ * always waiting - and a bulk writer that queues among them still gets the
+ * lock within the bound: DB_TXN_PRI_STREAK priority grants or
+ * DB_TXN_BULK_DUE_MS of waiting, whichever comes first.
+ */
+typedef struct {
+    atomic_int stop;
+    unsigned long writes;
+} hammer_t;
+
+static void *hammer_main(void *arg)
+{
+    hammer_t *h = arg;
+    while (!atomic_load(&h->stop)) {
+        if (db_write(db, "INSERT OR REPLACE INTO config (key, value) VALUES ('hammer', '1')",
+                     NULL, NULL) == 0)
+            h->writes++;
+    }
+    return NULL;
+}
+
+typedef struct {
+    atomic_int done;
+    double     worst_ms;
+} bulk_probe_t;
+
+static void *bulk_probe_main(void *arg)
+{
+    bulk_probe_t *bp = arg;
+    for (int i = 0; i < 10; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (db_txn_begin_bulk(db) != OK) break;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        db_txn_commit(db);
+        double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                    (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (ms > bp->worst_ms) bp->worst_ms = ms;
+    }
+    atomic_store(&bp->done, 1);
+    return NULL;
+}
+
+static void test_priority_writers_cannot_starve_a_bulk_writer(void **state)
+{
+    (void)state;
+    /* No sync per commit, so the priority writers really never let up. */
+    assert_int_equal(db_exec_raw(db, "PRAGMA synchronous=OFF"), 0);
+    hammer_t h[4];
+    pthread_t th[4];
+    memset(h, 0, sizeof(h));
+    for (int k = 0; k < 4; k++)
+        assert_int_equal(pthread_create(&th[k], NULL, hammer_main, &h[k]), 0);
+    struct timespec ts = { 0, 50 * 1000000L };
+    nanosleep(&ts, NULL);
+
+    /* In a thread of its own, so that a bulk writer starved for good (as
+     * one is with no bound) fails the test rather than hanging it. */
+    bulk_probe_t bp;
+    memset(&bp, 0, sizeof(bp));
+    pthread_t bt;
+    assert_int_equal(pthread_create(&bt, NULL, bulk_probe_main, &bp), 0);
+    for (int i = 0; i < 500 && !atomic_load(&bp.done); i++) {
+        struct timespec w = { 0, 10 * 1000000L };
+        nanosleep(&w, NULL);
+    }
+    int finished = atomic_load(&bp.done);
+    for (int k = 0; k < 4; k++) atomic_store(&h[k].stop, 1);
+    pthread_join(bt, NULL);
+    double worst = bp.worst_ms;
+    unsigned long writes = 0;
+    for (int k = 0; k < 4; k++) { pthread_join(th[k], NULL); writes += h[k].writes; }
+    if (!finished)
+        fail_msg("a bulk writer was starved for 5 s by priority writers");
+    print_message("  bulk begins among %lu priority writes: worst wait %.1f ms (bound %d ms "
+                  "or %d grants)\n", writes, worst, DB_TXN_BULK_DUE_MS, DB_TXN_PRI_STREAK);
+    assert_true(writes > 1000);
+    assert_true(worst < DB_TXN_BULK_DUE_MS * 4);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -881,6 +963,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_batch_ends_at_the_commit_budget, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_page_ceiling_bounds_every_commit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_no_tracking_means_no_cap, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_priority_writers_cannot_starve_a_bulk_writer,
+                                        setup, teardown),
     };
     /* Before any test opens its database, so every connection is hooked.
      * The guard test counts violations rather than aborting on one, so the

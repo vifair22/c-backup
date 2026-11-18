@@ -20,8 +20,10 @@
  * turns a failure into a wait, and a wait behind a transaction spanning a whole
  * snapshot's node rows would be worse than the failure it replaced. Anything
  * writing per-entry has to commit in batches. See index_nodes, build_trees
- * and store_content, which all do. Writers are served in arrival order, so
- * one that is waiting goes before the holder's next transaction.
+ * and store_content, which all do. Writers are served in arrival order
+ * within their class, so one that is waiting goes before the holder's next
+ * transaction, and a non-bulk writer goes before every waiting bulk one
+ * (db_txn_begin_bulk, B193).
  *
  * A long-running holder asks db_txn_waiters() rather than committing on a
  * timer. B107 bounded the backup's batch by time and let go around every
@@ -72,6 +74,17 @@ status_t db_txn_begin(cutils_db_t *db);
  * did would bring back the waits B144 removed.
  */
 status_t db_txn_begin_bulk(cutils_db_t *db);
+
+/* Bulk transactions begun since the process started; for tests that count
+ * how many a priority writer waited behind. A waiting priority writer (any
+ * db_txn_begin, db_write, the checkpointer) is served before the next bulk
+ * one (B193). */
+unsigned long db_txn_bulk_count(void);
+
+/* The bound on that priority: a waiting bulk writer is served next once it
+ * has waited this long or seen this many priority writers go first. */
+#define DB_TXN_BULK_DUE_MS  DB_TXN_COMMIT_BUDGET_MS
+#define DB_TXN_PRI_STREAK   8
 
 /* Commit and release the lock. Releases the lock even when the commit fails:
  * there is nothing the caller can do about it and holding it would wedge every
@@ -143,6 +156,12 @@ status_t db_txn_install_cutils_lock(cutils_db_t *db);
 #define DB_TXN_COMMIT_PAGES_MIN   16
 #define DB_TXN_COMMIT_PAGES_MAX   256
 #define DB_TXN_COMMIT_ROWS_MIN    4
+/* Frames per row assumed at a call site's first transaction, before it has
+ * learnt its own. Two, not one: a pack commit's rows land at random places
+ * in the hash indexes, about 1.2 frames each as measured, and a first
+ * commit that overshot its budget by that much was the kind FS2 saw run to
+ * 438 pages (B193). */
+#define DB_TXN_FRAMES_PER_ROW_FIRST 2.0
 
 /* NULL stops tracking (tests that open another database). */
 void db_txn_track_wal(cutils_db_t *db);
