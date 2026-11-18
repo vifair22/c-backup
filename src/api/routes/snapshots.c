@@ -1633,6 +1633,17 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "clear_sync must be 1, true, 0 or false");
         }
         if (j->clear_sync) {
+            /* The latch lives in the repository: one that is not there
+             * (an empty mountpoint, packs/ unmounted) cannot show it, and
+             * "no failed sync" said the opposite of the truth (B204). */
+            char why[PACK_PRESENCE_WHY_MAX] = "";
+            if (pack_presence_available(j->db, j->repo_id, why, sizeof(why)) != 1) {
+                snap_job_free(j);
+                char msg[PACK_PRESENCE_WHY_MAX + 128];
+                snprintf(msg, sizeof(msg), "this repository is unavailable: %s; repair needs it present",
+                         why[0] ? why : "it cannot be read");
+                return api_error(409, msg);
+            }
             if (!sync_latch_repo_tripped(j->repo_path)) {
                 snap_job_free(j);
                 return api_error(409, "this repository has no failed sync to clear");

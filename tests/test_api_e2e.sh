@@ -1294,6 +1294,13 @@ GVB=$(sock_body "/jobs/$GV")
 contains "a verify is refused as unavailable" 'is unavailable'     "$GVB"
 case "$GVB" in *"data loss"*|*MISSING*) bad "and claims no data loss" "no loss" "$GVB" ;;
                *) ok "and claims no data loss" ;; esac
+# B204: repo repair said "no failed sync" for a repository that is not
+# there to show one.
+GR=$(curl -s -X POST --unix-socket "$SOCK" "http://localhost/repos/$GONE/verify?clear_sync=1")
+contains "a repair says the repository is unavailable" 'is unavailable' "$GR"
+contains "and why"                         '.cbackup marker'       "$GR"
+case "$GR" in *"no failed sync"*) bad "and not that there is no failed sync" "" "$GR" ;;
+              *) ok "and not that there is no failed sync" ;; esac
 check "still nothing in the mountpoint"   ""                       "$(ls -A "$WORK/gonerepo")"
 rmdir "$WORK/gonerepo"
 mv "$WORK/gonerepo.mounted" "$WORK/gonerepo"
