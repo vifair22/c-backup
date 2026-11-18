@@ -30,6 +30,10 @@ typedef struct {
     char policy[72];
     char providers[128];        /* comma separated */
     long holds, captures;       /* what the helper held when it answered */
+    /* The database templates its policy lets hook.run build, comma
+     * separated, and whether the hello said (db-detection.md 7.2). */
+    char templates[1024];
+    int  have_templates;
 } remote_hello_t;
 
 /*
@@ -87,6 +91,16 @@ status_t remote_op(const char *provider, const char *op, struct cJSON *args, int
                    struct cJSON **result);
 
 /*
+ * db.probe (db-detection.md 8.1) for a unit behind the helper: the
+ * template's dry run in the unit, and what its run would be. params is a
+ * JSON object's text, or NULL; path the finding's recorded path, or NULL.
+ * *result is the helper's answer; *output (malloc'd, NUL-terminated,
+ * *len bytes, at most 64 KiB) what the probe printed.
+ */
+status_t remote_db_probe(const char *unit_key, const char *tmpl, const char *params, const char *path,
+                         struct cJSON **result, char **output, size_t *len);
+
+/*
  * When a helper is configured and provider is not usable through it right
  * now (never offered yet, or the link is down), 1 with the reason in why,
  * naming the socket; else 0.
@@ -98,6 +112,13 @@ int      remote_unusable_for_job(const char *provider, char *why, size_t wsz);
 /* What the helper holds now (a fresh hello): its journalled holds and open
  * captures. Fails when no helper is configured or it does not answer. */
 status_t remote_helper_holds(long *holds, long *captures);
+
+/*
+ * Whether the helper's policy allows a database template, by its last
+ * hello: 1 yes, 0 no, -1 not known (no helper, or none answered yet).
+ * *allowed (may be NULL) gets the policy's list, for the line to add.
+ */
+int      remote_template_allowed(const char *name, char *allowed, size_t asz);
 
 /* The last hello, for GET /providers; empty before an attach. */
 const remote_hello_t *remote_last_hello(void);
