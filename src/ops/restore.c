@@ -1647,6 +1647,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
          */
         const cap_ent_t *ce = ntype == NODE_TYPE_REG ? cap_find(&caps, snap_rel) : NULL;
         int from_copy = 0;
+        int content_row = i;    /* the row whose content is restored */
         if (ntype == NODE_TYPE_REG && opts->prefer_engine_copy && cap_sibling(&caps, snap_rel)) {
             log_info("restore: %s left out: its database is restored from its engine copy, "
                      "which this file would corrupt", full);
@@ -1656,7 +1657,8 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         if (ce) {
             res.engine_copies++;
             if (opts->prefer_engine_copy) {
-                chash = r->rows[ce->row][7];
+                content_row = ce->row;
+                chash = r->rows[content_row][7];
                 from_copy = 1;
                 res.engine_copies_used++;
                 log_info("restore: %s restored from its engine copy (SQLite's online backup) "
@@ -1732,7 +1734,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         }
 
-        uint64_t nsize = strtoull(r->rows[from_copy ? ce->row : i][6], NULL, 10);
+        uint64_t nsize = strtoull(r->rows[content_row][6], NULL, 10);
         if (!opts->overwrite) {
             struct stat sb;
             if (fstatat(pfd, leaf, &sb, AT_SYMLINK_NOFOLLOW) == 0) {
