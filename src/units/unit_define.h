@@ -67,3 +67,8 @@ status_t unit_read_file(store_t *store, cutils_db_t *db, int64_t repo_id, int64_
  * ERR_NOT_FOUND when there is none. */
 status_t unit_entry_type(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                          const char *rel, uint8_t *type);
+
+/* The name recorded_types gives an entry (B210, NIT-44): "missing" when
+ * not found, else "reg", "dir", "lnk", "link", "fifo", "chr", "blk",
+ * "sock" for an unclassified entry (a socket) or "other". */
+const char *unit_recorded_type_name(int found, uint8_t type);

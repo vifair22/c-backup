@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "unit_define.h"
+#include "msg_clip.h"
 #include "remote_provider.h"
 #include "unit_restore.h"
 #include "snap_record.h"
@@ -321,10 +322,30 @@ static status_t compose_definition(store_t *store, cutils_db_t *db, int64_t repo
     return st;
 }
 
+const char *unit_recorded_type_name(int found, uint8_t type)
+{
+    if (!found) return "missing";
+    switch (type) {
+    case NODE_TYPE_REG:      return "reg";
+    case NODE_TYPE_DIR:      return "dir";
+    case NODE_TYPE_SYMLINK:  return "lnk";
+    case NODE_TYPE_HARDLINK: return "link";
+    case NODE_TYPE_FIFO:     return "fifo";
+    case NODE_TYPE_CHR:      return "chr";
+    case NODE_TYPE_BLK:      return "blk";
+    /* Type 0 is how a scan records what it cannot classify, a socket in
+     * practice (restore.c skips it as one); the entry is there, so not
+     * "missing" (NIT-44). */
+    case 0:                  return "sock";
+    default:                 return "other";
+    }
+}
+
 /*
  * A copy's bind source under target_root, as the snapshot records it, into
- * rec (B210): "blk", "chr", "dir", "reg", "lnk", "link", "fifo" or
- * "missing". The helper's define check runs before the restore writes
+ * rec (B210): "blk", "chr", "dir", "reg", "lnk", "link", "fifo", "sock"
+ * (unclassified, a socket in practice), "other" (a type this build does
+ * not know) or "missing". The helper's define check runs before the restore writes
  * target_root, so the source does not exist yet and only the original can
  * say what it is; with the original gone from the host, this is what the
  * helper has left. Reading the manifest changes nothing in the format.
@@ -335,21 +356,9 @@ static void record_one(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t
     size_t tl = strlen(troot);
     if (!src || strncmp(src, troot, tl) != 0 || src[tl] != '/' || cJSON_GetObjectItemCaseSensitive(rec, src)) return;
     uint8_t type = 0;
-    const char *name = "missing";
-    if (unit_entry_type(store, db, repo_id, snap_id, src + tl, &type) == OK) {
-        switch (type) {
-        case NODE_TYPE_REG:      name = "reg";  break;
-        case NODE_TYPE_DIR:      name = "dir";  break;
-        case NODE_TYPE_SYMLINK:  name = "lnk";  break;
-        case NODE_TYPE_HARDLINK: name = "link"; break;
-        case NODE_TYPE_FIFO:     name = "fifo"; break;
-        case NODE_TYPE_CHR:      name = "chr";  break;
-        case NODE_TYPE_BLK:      name = "blk";  break;
-        default:                 name = "missing"; break;
-        }
-    } else {
-        err_clear();
-    }
+    int found = unit_entry_type(store, db, repo_id, snap_id, src + tl, &type) == OK;
+    if (!found) err_clear();
+    const char *name = unit_recorded_type_name(found, type);
     cJSON_AddStringToObject(rec, src, name);
 }
 
@@ -598,8 +607,8 @@ static status_t define_check(const char *prov, const char *unit, const char *txt
     }
     cJSON_Delete(cr);
     if (st != OK) {
-        char why[2048];
-        snprintf(why, sizeof(why), "%.2040s", err_msg());
+        char why[MSG_CLIP_MAX];
+        msg_clip(why, sizeof(why), err_msg());
         return set_error(st, "unit restore refused, nothing written: %s", why);
     }
     return OK;
@@ -616,8 +625,8 @@ static status_t define_check(const char *prov, const char *unit, const char *txt
 static status_t roll_back(const char *prov, const char *unit, char (*tok)[64], size_t n,
                           int restart, status_t st)
 {
-    char why[700], fail[420] = "", copy[300] = "";
-    snprintf(why, sizeof(why), "%.690s", err_msg());
+    char why[MSG_CLIP_MAX], fail[1024] = "", copy[300] = "";
+    msg_clip(why, sizeof(why), err_msg());
     err_clear();
     size_t undone = 0;
     for (size_t i = n; i-- > 0;) {
@@ -632,14 +641,17 @@ static status_t roll_back(const char *prov, const char *unit, char (*tok)[64], s
             undone++;
             cJSON_Delete(ur);
         } else {
-            if (!fail[0]) snprintf(fail, sizeof(fail), "%.400s", err_msg());
+            if (!fail[0]) msg_clip(fail, sizeof(fail), err_msg());
             err_clear();
         }
     }
     int restarted = 0;
     if (restart && !fail[0]) {
         if (remote_op(prov, "unit.start", args_unit(prov, unit), -1, NULL) == OK) restarted = 1;
-        else { snprintf(fail, sizeof(fail), "starting it again: %.380s", err_msg()); err_clear(); }
+        else {
+            msg_clip_after(fail, sizeof(fail), snprintf(fail, sizeof(fail), "starting it again: %s", err_msg()));
+            err_clear();
+        }
     }
     if (fail[0]) {
         log_error("unit restore %s:%s: rollback incomplete (%zu of %zu swaps undone): %s", prov, unit,
@@ -662,8 +674,8 @@ static status_t roll_back(const char *prov, const char *unit, char (*tok)[64], s
  * wrote stays, and a retry is refused until it is gone. Say so. */
 static status_t left_under(const char *target_root, status_t st)
 {
-    char why[700];
-    snprintf(why, sizeof(why), "%.690s", err_msg());
+    char why[MSG_CLIP_MAX];
+    msg_clip(why, sizeof(why), err_msg());
     return set_error(st, "%s; what was restored under %s stays there: remove it, or give another "
                      "target_root, to try again", why, target_root);
 }
@@ -979,8 +991,8 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
                 st = set_error(ERR_IO, "the helper answered a staging check with a staging");
             cJSON_Delete(cr);
             if (st != OK) {
-                char cwhy[600];
-                snprintf(cwhy, sizeof(cwhy), "%.590s", err_msg());
+                char cwhy[MSG_CLIP_MAX];
+                msg_clip(cwhy, sizeof(cwhy), err_msg());
                 st = set_error(st, "unit restore refused, nothing written, %s:%s left as it was: %s", prov, unit, cwhy);
             }
         }

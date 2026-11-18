@@ -1567,7 +1567,7 @@ static void start_and_check(void)
     if (g_units) {
         units_up(db);
         unsigned checked = 0, redefined = 0, refused = 0;
-        if (unit_checkpoints_redefine(db, &checked, &redefined, &refused) != OK)
+        if (unit_checkpoints_redefine(db, &checked, &redefined, &refused, NULL) != OK)
             violation("redefining checkpoints: %s", err_msg());
         units_sweep_result_t sw;
         if (units_sweep(db, 0, &sw) != OK) violation("units sweep: %s", err_msg());

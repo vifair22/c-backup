@@ -315,7 +315,7 @@ static status_t x_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         if (lxc(c, "lxc-freeze", s->name, NULL, NULL) == OK) {
             frozen = 1;
         } else {
-            (void)sp_session_info_warn(&s->info, "lxc-freeze failed: %.300s", err_msg());
+            (void)sp_session_info_warn(&s->info, "lxc-freeze failed: %s", err_msg());
             err_clear();
             if (s->has_holds && hold && s->holds.clear(s->holds.ctx, hold) != OK) err_clear();
             hold = 0;
