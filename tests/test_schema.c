@@ -193,6 +193,67 @@ static void test_created_at_backfill(void **state)
     unlink_db();
 }
 
+/*
+ * B217: journal ids were MAX(id) + 1 per repository and are AUTOINCREMENT
+ * now. The rebuild keeps a repository's ids unless one of them is also
+ * used by a repository with a lower id; those repositories' entries move,
+ * in order, above every old id. So no id a client held names a different
+ * entry, and each repository's order holds.
+ */
+static void test_journal_ids_rebuilt_without_reuse(void **state)
+{
+    (void)state;
+    unlink_db();
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
+    db_migration_t before[9];
+    int nb = 0;
+    for (; app_migrations[nb].name &&
+           strcmp(app_migrations[nb].name, "009_journal_autoincrement.sql") != 0; nb++)
+        before[nb] = app_migrations[nb];
+    assert_int_equal(nb, 7);
+    before[nb] = (db_migration_t){ NULL, NULL };
+    assert_int_equal(db_run_compiled_migrations(db, before), CUTILS_OK);
+
+    static const char *const fill[] = {
+        "INSERT INTO repos (id, uuid, path, label, added_at) VALUES (1, 'u-1', '/a', 'a', 1)",
+        "INSERT INTO repos (id, uuid, path, label, added_at) VALUES (2, 'u-2', '/b', 'b', 1)",
+        "INSERT INTO repos (id, uuid, path, label, added_at) VALUES (3, 'u-3', '/c', 'c', 1)",
+        /* Repo 1: ids 1-3. Repo 2: 1-2, colliding, so it moves. Repo 3:
+         * 7-8, used nowhere lower, so it keeps them. */
+        "INSERT INTO journal (repo_id, id, ts, source, operation, result) VALUES (1, 1, 10, 'api', 'a1', 'success')",
+        "INSERT INTO journal (repo_id, id, ts, source, operation, result) VALUES (1, 2, 10, 'api', 'a2', 'success')",
+        "INSERT INTO journal (repo_id, id, ts, source, operation, result) VALUES (1, 3, 11, 'api', 'a3', 'success')",
+        "INSERT INTO journal (repo_id, id, ts, source, operation, result) VALUES (2, 1, 20, 'api', 'b1', 'success')",
+        "INSERT INTO journal (repo_id, id, ts, source, operation, result) VALUES (2, 2, 20, 'api', 'b2', 'success')",
+        "INSERT INTO journal (repo_id, id, ts, source, operation, result) VALUES (3, 7, 30, 'api', 'c7', 'success')",
+        "INSERT INTO journal (repo_id, id, ts, source, operation, result) VALUES (3, 8, 31, 'api', 'c8', 'success')",
+        NULL,
+    };
+    for (int i = 0; fill[i]; i++) assert_int_equal(db_exec_raw(db, fill[i]), CUTILS_OK);
+
+    assert_int_equal(db_run_compiled_migrations(db, app_migrations), CUTILS_OK);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM journal"), 7);
+    /* Kept. */
+    assert_int_equal(count_rows(db, "SELECT 1 FROM journal WHERE repo_id = 1 AND id = 1 AND operation = 'a1'"), 1);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM journal WHERE repo_id = 1 AND id = 3 AND operation = 'a3'"), 1);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM journal WHERE repo_id = 3 AND id = 7 AND operation = 'c7'"), 1);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM journal WHERE repo_id = 3 AND id = 8 AND operation = 'c8'"), 1);
+    /* Moved above every old id, in their order. */
+    assert_int_equal(count_rows(db, "SELECT 1 FROM journal WHERE repo_id = 2 AND id = 9 AND operation = 'b1'"), 1);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM journal WHERE repo_id = 2 AND id = 10 AND operation = 'b2'"), 1);
+    /* The next entry goes above them all, and the route's index is back. */
+    assert_int_equal(db_exec_raw(db, "INSERT INTO journal (repo_id, ts, source, operation, result)"
+                                     " VALUES (1, 40, 'api', 'a4', 'success')"), CUTILS_OK);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM journal WHERE id = 11 AND operation = 'a4'"), 1);
+    assert_true(object_exists(db, "index", "journal_by_ts"));
+    assert_false(object_exists(db, "table", "journal_v1"));
+    assert_false(object_exists(db, "table", "journal_mig_moved"));
+    db_close(db);
+    unlink_db();
+}
+
 static void test_one_baseline_migration(void **state)
 {
     (void)state;
@@ -216,7 +277,10 @@ static void test_one_baseline_migration(void **state)
     /* Reserved id marks (B217). */
     assert_non_null(app_migrations[6].name);
     assert_string_equal(app_migrations[6].name, "008_id_reserve.sql");
-    assert_null(app_migrations[7].name);
+    /* Journal ids never reissued (B217). */
+    assert_non_null(app_migrations[7].name);
+    assert_string_equal(app_migrations[7].name, "009_journal_autoincrement.sql");
+    assert_null(app_migrations[8].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */
@@ -679,6 +743,7 @@ int main(void)
         cmocka_unit_test(test_repo_ids_are_not_reused),
         cmocka_unit_test(test_migrations_apply),
         cmocka_unit_test(test_one_baseline_migration),
+        cmocka_unit_test(test_journal_ids_rebuilt_without_reuse),
         cmocka_unit_test(test_created_at_backfill),
         cmocka_unit_test(test_units_migration_keeps_baseline_data),
         cmocka_unit_test(test_migrations_are_idempotent),

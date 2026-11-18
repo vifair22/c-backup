@@ -685,7 +685,9 @@ gives it a new one. Ids used to be reused, so the next repository added
 could take over the removed one's schedules and history.
 
 The same holds for every other id the daemon hands out: jobs, schedules,
-search and verify runs, and snapshots within a repository. Removing a
+search and verify runs, exports, journal entries, and snapshots within a
+repository. Journal entry ids are one sequence across every repository, so
+one repository's journal shows gaps where another's entries took ids. Removing a
 repository deletes its jobs, and the next job on another repository used
 to take the removed one's newest job id, so a script or log line holding
 it named an unrelated job; deleting the newest snapshot likewise gave its

@@ -438,6 +438,11 @@ status_t db_txn_commit(cutils_db_t *db)
     /* The id marks this transaction's inserts call for go in with it
      * (B217, id_reserve.h). */
     int id_sync = id_reserve_pre_commit(db);
+    if (id_sync < 0) {
+        db_txn_rollback(db);
+        return set_error(ERR_IO, "refused: a new id cannot be made durable, because a "
+                                 "previous sync of state.db failed (restart the daemon)");
+    }
     uint64_t t0 = phase_now();
     int rc = db_exec_raw(db, "COMMIT");
     uint64_t t1 = phase_now();

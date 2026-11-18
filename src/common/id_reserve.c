@@ -4,6 +4,7 @@
 
 #include "db_txn.h"
 #include "db_write.h"
+#include "sync_latch.h"
 
 #include <cutils/log.h>
 #include <stdatomic.h>
@@ -241,7 +242,24 @@ int id_reserve_pre_commit(cutils_db_t *db)
         if (!ours || i >= n || m <= 0) continue;
         tracked_t *t = &g_t[i];
         /* Above the durable mark: not to be handed out until it is. */
-        if (m > atomic_load(&t->durable)) tls_sync = tls_need = 1;
+        if (m > atomic_load(&t->durable)) {
+            /*
+             * After a failed sync no sync is trusted again until a restart
+             * (sync_latch.h), so this id could never be covered. Refused
+             * before COMMIT, so nothing is committed: a caller that
+             * retries, a held job end (B196), does not pile up rows.
+             */
+            if (sync_latch_tripped()) {
+                /* Marks this loop already wrote go with the rollback. */
+                for (int j = 0; j < i; j++)
+                    if (tls_prev[j] >= 0) g_t[j].written = tls_prev[j];
+                memset(tls_max, 0, sizeof(tls_max));
+                tls_any = 0;
+                tls_sync = tls_need = 0;
+                return -1;
+            }
+            tls_sync = tls_need = 1;
+        }
         if (m + g_block / 2 > t->written) {
             int64_t next = m + g_block;
             if (write_mark(db, t->name, next) == 0) {

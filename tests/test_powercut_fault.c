@@ -2558,9 +2558,9 @@ static void check_api_sources(int crash_at, int kept, int started)
 #define IDS_EACH   6
 #define IDS_MAX    (IDS_EACH + 1)
 
-static int64_t    g_ids_job[IDS_MAX], g_ids_sched[IDS_MAX];
-static int        g_nids_job, g_nids_sched;
-static int        g_counted_job, g_counted_sched;   /* the run with no cut */
+static int64_t    g_ids_job[IDS_MAX], g_ids_sched[IDS_MAX], g_ids_jrnl[IDS_MAX];
+static int        g_nids_job, g_nids_sched, g_nids_jrnl;
+static int        g_counted_job, g_counted_sched, g_counted_jrnl;   /* the run with no cut */
 static atomic_int g_hold_started;
 
 /* Keeps the one worker busy, so the jobs after it stay queued and the
@@ -2607,9 +2607,22 @@ static int64_t api_new_schedule(ctx_t *c)
     return id;
 }
 
+static int64_t newest_journal_id(cutils_db_t *db)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)g_repo_id);
+    db_result_t *r = NULL;
+    int64_t id = 0;
+    if (db_execute(db, "SELECT id FROM journal WHERE repo_id = ? ORDER BY ts DESC, id DESC LIMIT 1",
+                   (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        id = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return id;
+}
+
 static status_t op_ids(ctx_t *c, int counting)
 {
-    g_nids_job = g_nids_sched = 0;
+    g_nids_job = g_nids_sched = g_nids_jrnl = 0;
     atomic_store(&g_hold_started, 0);
     /* The start, as c-backupd's: a cut can land in it too. */
     status_t st = id_reserve_open(c->db, IDS_BLOCK);
@@ -2643,6 +2656,15 @@ static status_t op_ids(ctx_t *c, int counting)
         if (sid > 0) g_ids_sched[g_nids_sched++] = sid;
         else if (counting) fail_msg("schedule create with no cut: %s", err_msg());
         err_clear();
+        /* A journal entry, and its id as GET /repos/<id>/journal serves
+         * it: the newest. */
+        if (journal_record(c->db, g_repo_id, "api", "b217", "success", 0, "entry") == 0) {
+            int64_t jid = newest_journal_id(c->db);
+            if (jid > 0) g_ids_jrnl[g_nids_jrnl++] = jid;
+        } else if (counting) {
+            fail_msg("journal entry with no cut: %s", err_msg());
+        }
+        err_clear();
     }
     /* Queued jobs cancelled here, in order, and only then the held one, so
      * the commits after the submissions do not race each other. */
@@ -2656,6 +2678,7 @@ static status_t op_ids(ctx_t *c, int counting)
     if (counting) {
         g_counted_job = g_nids_job;
         g_counted_sched = g_nids_sched;
+        g_counted_jrnl = g_nids_jrnl;
     }
     return OK;
 }
@@ -2694,10 +2717,18 @@ static void check_ids(int crash_at, int kept, int started)
             (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
         sched = strtoll(r->rows[0][0], NULL, 10);
     db_result_free(r);
+    int64_t jrnl = 0;
+    if (journal_record(db, g_repo_id, "api", "after", "success", 0, "after") == 0)
+        jrnl = newest_journal_id(db);
     id_reserve_forget();
     db_close(db);
 
     int64_t mj = max_of(g_ids_job, g_nids_job), ms = max_of(g_ids_sched, g_nids_sched);
+    int64_t mr = max_of(g_ids_jrnl, g_nids_jrnl);
+    if (jrnl <= 0) violation("cannot journal after the start: %s", err_msg());
+    else if (jrnl <= mr)
+        violation("journal id %lld issued again after the restart (handed out up to %lld)",
+                  (long long)jrnl, (long long)mr);
     if (job <= 0 || sched <= 0) violation("cannot insert after the start: %s", err_msg());
     if (job > 0 && job <= mj)
         violation("job id %lld issued again after the restart (handed out up to %lld)",
@@ -2710,7 +2741,7 @@ static void check_ids(int crash_at, int kept, int started)
 static void build_ids(ctx_t *c)
 {
     build_api(c);
-    g_nids_job = g_nids_sched = 0;
+    g_nids_job = g_nids_sched = g_nids_jrnl = 0;
 }
 
 static const scenario_t S_BACKUP_FIRST = { "backup, first", build_backup_first,
@@ -2759,6 +2790,7 @@ static void test_ids(void **state)
     /* The run handed out ids in both tables and crossed reservations. */
     assert_int_equal(g_counted_job, IDS_EACH + 1);
     assert_int_equal(g_counted_sched, IDS_EACH);
+    assert_int_equal(g_counted_jrnl, IDS_EACH);
 }
 static void test_api_tag(void **state)        { (void)state; every_cut(&S_API_TAG); }
 static void test_api_sched_del(void **state)  { (void)state; every_cut(&S_API_SCHED_DEL); }

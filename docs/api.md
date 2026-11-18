@@ -213,7 +213,8 @@ the daemon refuses to start with a write route that has neither, and
   anything: the database opens and the repository and its index agree
   after the next start, with the edit either wholly there or wholly not.
   An edit a cut takes back never gives its id to anything else: a job,
-  schedule, search or verify run, export or repository id that was in an
+  schedule, search or verify run, export, journal entry or repository id
+  that was in an
   answer is not issued again after the restart, though the row itself may
   be gone. After an unclean stop the next ids skip ahead (at most 256 per
   table) to guarantee it. About one answer in 128 that creates a row also
@@ -1349,7 +1350,7 @@ paged, so a client that does not page sees what it always did.
 | DELETE | `/repos/<id>/tags/<name>` | Remove; `{"removed":true,"name"}`, 404 if there is no such tag |
 | GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}`; 404 for a snapshot that does not exist |
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
-| GET | `/repos/<id>/journal` | Operation history, newest first: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded. `limit` (default 100, at most 1000), `offset`, and `result` |
+| GET | `/repos/<id>/journal` | Operation history, newest first: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded. `id` is unique across every repository's journal and never issued twice, so a repository's ids have gaps. `limit` (default 100, at most 1000), `offset`, and `result` |
 
 `result` filters the journal on one of the values anything journals:
 `success`, `failed` and `cancelled` for how a job ended, `warning` and

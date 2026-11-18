@@ -28,6 +28,8 @@
 #include "db_txn.h"
 #include "db_write.h"
 #include "id_reserve.h"
+#include "routes.h"
+#include "sync_latch.h"
 #include "test_tmp.h"
 
 #define TEST_DIR TEST_TMP "/c_backup_test_id_reserve"
@@ -67,6 +69,7 @@ static int teardown(void **state)
     (void)state;
     id_reserve_forget();
     db_txn_set_durable_hooks(NULL, NULL);
+    sync_latch_reset_for_test();
     db_close(db);
     db = NULL;
     rmrf(TEST_DIR);
@@ -116,7 +119,7 @@ static void test_every_autoincrement_table_is_covered(void **state)
     (void)state;
     assert_int_equal(id_reserve_open(db, BLOCK), OK);
     static const char *const tables[] = { "repos", "schedules", "jobs", "verify_runs",
-                                          "grep_runs", "exports", "unit_intents" };
+                                          "grep_runs", "exports", "unit_intents", "journal" };
     for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++)
         assert_int_equal(id_reserve_durable(tables[i]), BLOCK);
     assert_int_equal(id_reserve_durable("snapshots"), 0);
@@ -248,6 +251,59 @@ static void test_rollbacks_and_other_databases_leave_the_marks_alone(void **stat
     assert_int_equal(id_reserve_durable("jobs"), mark);
 }
 
+/* After a failed sync nothing can cover a new id, so a commit issuing one
+ * above the durable mark is rolled back rather than committed and reported
+ * failed: a held job end retried every few seconds must not pile up rows. */
+static void test_after_a_failed_sync_uncovered_ids_commit_nothing(void **state)
+{
+    (void)state;
+    assert_int_equal(id_reserve_open(db, BLOCK), OK);
+    int64_t mark = id_reserve_durable("jobs");
+    sync_latch_trip(TEST_DB "-wal", 5 /* EIO */);
+    for (int i = 0; i < 3 * BLOCK; i++) {
+        int64_t id = new_job(db);
+        if (id > 0) assert_true(id <= mark);
+        err_clear();
+    }
+    assert_int_equal(scalar(db, "SELECT COUNT(*) FROM jobs"), mark);
+    sync_latch_reset_for_test();
+}
+
+/* Journal entries (migration 009): one sequence for every repository,
+ * written through journal_record, and kept unissued across a cut. */
+static int64_t newest_entry(void)
+{
+    return scalar(db, "SELECT COALESCE(MAX(id), 0) FROM journal");
+}
+
+static void test_journal_ids_are_never_reissued(void **state)
+{
+    (void)state;
+    assert_int_equal(db_write(db, "INSERT INTO repos (uuid, path, label, added_at)"
+                                  " VALUES ('u-1', '/a', 'a', 0), ('u-2', '/b', 'b', 0)",
+                              NULL, NULL), 0);
+    assert_int_equal(id_reserve_open(db, BLOCK), OK);
+    int64_t last = 0;
+    for (int i = 0; i < 2 * BLOCK + 1; i++) {
+        assert_int_equal(journal_record(db, 1 + i % 2, "api", "t", "success", 0, "m"), 0);
+        int64_t id = newest_entry();
+        assert_true(id > last);
+        assert_true(id_reserve_durable("journal") >= id);
+        last = id;
+    }
+    /* A cut takes back the newest entries and the sequence with them. */
+    id_reserve_forget();
+    char sql[160];
+    snprintf(sql, sizeof(sql), "DELETE FROM journal WHERE id > %lld", (long long)(last - 5));
+    assert_int_equal(db_write(db, sql, NULL, NULL), 0);
+    snprintf(sql, sizeof(sql), "UPDATE sqlite_sequence SET seq = %lld WHERE name = 'journal'",
+             (long long)(last - 5));
+    assert_int_equal(db_write(db, sql, NULL, NULL), 0);
+    assert_int_equal(id_reserve_open(db, BLOCK), OK);
+    assert_int_equal(journal_record(db, 2, "api", "t", "success", 0, "after"), 0);
+    assert_true(newest_entry() > last);
+}
+
 int main(void)
 {
     /* The update hook that sees each insert, on every connection, as the
@@ -262,6 +318,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_failed_sync_hands_out_no_id, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rollbacks_and_other_databases_leave_the_marks_alone,
                                         setup, teardown),
+        cmocka_unit_test_setup_teardown(test_after_a_failed_sync_uncovered_ids_commit_nothing,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_journal_ids_are_never_reissued, setup, teardown),
     };
     return cmocka_run_group_tests_name("id_reserve", tests, NULL, NULL);
 }

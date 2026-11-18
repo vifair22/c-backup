@@ -83,7 +83,9 @@ void id_reserve_on_insert(const char *table, int64_t rowid);
 
 /* Inside the transaction, before COMMIT: write any mark this transaction's
  * inserts call for. 1 when the commit must be made durable before the ids
- * are handed out. */
+ * are handed out; -1 when it issued an id above the durable mark after a
+ * failed sync (sync_latch.h), which nothing can cover: the transaction is
+ * to be rolled back. */
 int id_reserve_pre_commit(cutils_db_t *db);
 
 /* After COMMIT, still under the lock: ok says whether it committed. */
