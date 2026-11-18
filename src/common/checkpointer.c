@@ -7,6 +7,7 @@
 #include "thread_name.h"
 #include "walidx.h"
 #include "wal_health.h"
+#include "wal_sync.h"
 
 #include <cutils/log.h>
 #include <sqlite3.h>
@@ -276,11 +277,30 @@ static void tick(void)
     uint64_t hard = (uint64_t)g_threshold * CKPT_HARD_FACTOR;
     uint32_t left = frames - backfilled;
     uint64_t round_ns = 0;
-    /* Past the hard cap: straight to the lock, no unlocked rounds first.
-     * On a slow device each unlocked PASSIVE takes two syncs and the copy,
-     * and a writer that does not sync appends far faster than that, so the
-     * rounds were where the WAL ran to several times the cap (B181). */
-    if (frames > hard) goto locked;
+    /*
+     * Past the hard cap: one unlocked PASSIVE, then the lock (B216). The
+     * lock used to come first (B181: on a slow device each unlocked round
+     * takes two syncs and the copy, and a writer that does not sync
+     * appends far faster, so several rounds let the WAL run to several
+     * times the cap). But a PASSIVE begins by syncing the WAL, and at the
+     * cap that is the whole backlog the writers left in the page cache:
+     * done under the lock, every writer waited for all of it, 5 to 25 s a
+     * round in the B216 model and most of M8's 963 s of lock wait. One
+     * round without the lock writes the backlog out and copies it while
+     * the bulk writers are held at the cap (checkpointer_throttle), so the
+     * round under the lock syncs and copies only what arrived since. The
+     * syncs SQLite needs are unchanged - WAL before the copy, database
+     * before the restart - only which of them runs while writers wait.
+     */
+    if (frames > hard) {
+        uint32_t ignored = 0;
+        if (passive(&ignored) == 0) {
+            pthread_mutex_lock(&g_mu);
+            g_stats.passive++;
+            pthread_mutex_unlock(&g_mu);
+        }
+        goto locked;
+    }
     if (left < g_threshold) return;
     uint64_t r0 = now_ns();
     if (passive(&left) != 0) return;
@@ -321,6 +341,21 @@ static void tick(void)
     if (left > small && round_ns > CKPT_LOCK_BUDGET_NS && frames <= hard) return;
 
 locked:;
+    /* And what arrived during the last unlocked round goes to disk now,
+     * before the lock, rather than in the locked PASSIVE's own WAL sync
+     * (B216). A failure latches like any other WAL sync (sync_latch.h);
+     * the round goes ahead, and its own sync fails the same way. */
+    {
+        char wal[PATH_MAX + 8];
+        snprintf(wal, sizeof(wal), "%s-wal", g_path);
+        uint64_t s0 = now_ns();
+        (void)wal_sync(wal);
+        uint64_t took = now_ns() - s0;
+        pthread_mutex_lock(&g_mu);
+        g_stats.presync_ns += took;
+        g_stats.presyncs++;
+        pthread_mutex_unlock(&g_mu);
+    }
     locked_arg_t a = { 0, -1 };
     uint64_t t0 = now_ns();
     if (db_txn_exclusive(locked_passive, &a) != OK) return;

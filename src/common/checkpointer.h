@@ -44,8 +44,12 @@
  *   next tick. So the lock is held for about one short copy.
  *
  *   The hard cap (16 x the threshold, 1 GiB by default; B181). Past it the
- *   thread goes straight to the lock, with no unlocked rounds first, and
- *   bulk writers help: each one (db_txn_begin_bulk), before it queues for
+ *   thread runs one unlocked PASSIVE and then takes the lock, with no
+ *   further unlocked rounds, and syncs the WAL itself just before taking
+ *   it. Both are there so that no WAL backlog is written out under the
+ *   lock (B216): a PASSIVE starts by syncing the WAL, and at the cap the
+ *   backlog is up to the whole cap's worth of page cache, which the lock
+ *   used to make every writer wait for. Bulk writers help: each one (db_txn_begin_bulk), before it queues for
  *   the write lock, looks at
  *   the WAL (at most every 5 ms across all writers) and, past the cap and
  *   not fully copied, wakes the thread and waits, holding no lock, until
@@ -124,6 +128,8 @@ typedef struct {
     uint64_t      frames_copied;    /* WAL frames copied into the database */
     uint64_t      throttle_ns;      /* writers' total wait at the hard cap */
     unsigned long throttle_timeouts; /* waits that ended at the time limit */
+    unsigned long presyncs;         /* WAL syncs made before taking the lock (B216) */
+    uint64_t      presync_ns;       /* and their total time */
 } checkpointer_stats_t;
 
 /*
