@@ -1131,8 +1131,15 @@ static char *op_capture_begin_paths(helper_server_t *s, const helper_req_t *r)
     int *kind = calloc(r->n_paths, sizeof(*kind));
     snap_set_t *set = calloc(1, sizeof(*set));
     jctx_t *pj = calloc(1, sizeof(*pj));
+    if (!res || !kind || !set || !pj) {
+        free(res);
+        free(kind);
+        free(set);
+        free(pj);
+        return resp_error(r->id, HELPER_E_FAILED, "out of memory");
+    }
     char fmsg[600] = "out of memory";
-    helper_err_t fail = res && kind && set && pj ? HELPER_OK : HELPER_E_FAILED;
+    helper_err_t fail = HELPER_OK;
     size_t n_snap = 0, n_dir = 0;
     snap_probe_t *probe = NULL;
     if (fail == HELPER_OK && pb && paths_backend_any_domain(pb) && paths_probe(pb, &probe) != OK) {
