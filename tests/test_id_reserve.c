@@ -120,7 +120,7 @@ static void test_every_autoincrement_table_is_covered(void **state)
     assert_int_equal(id_reserve_open(db, BLOCK), OK);
     static const char *const tables[] = { "repos", "schedules", "jobs", "verify_runs",
                                           "grep_runs", "exports", "unit_intents", "journal",
-                                          "node_gen_seq" };
+                                          "node_gen_seq", "db_findings" };
     for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++)
         assert_int_equal(id_reserve_durable(tables[i]), BLOCK);
     assert_int_equal(id_reserve_durable("snapshots"), 0);

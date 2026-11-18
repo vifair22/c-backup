@@ -28,6 +28,7 @@ static const char *const keyed_tables[] = {
     "tags", "notes", "snapshots", "policy_values", "recovery_state",
     "journal", "repo_backup_paths", "snapshot_id_seq",
     "snapshot_unit_items", "snapshot_units", "unit_policy", "node_index_gen",
+    "db_findings",
     NULL
 };
 

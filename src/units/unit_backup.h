@@ -21,6 +21,7 @@
  * unit 17 keeps units 1 to 16.
  */
 
+#include "db_findings.h"
 #include "error.h"
 #include "msg_clip.h"
 #include "provider.h"
@@ -74,6 +75,12 @@ typedef struct {
     unsigned         n_warnings;
     char             warning[MSG_CLIP_MAX];   /* the first, or the one that outranks the rest */
     char           **warnings;       /* all n_warnings of them, owned (B202) */
+    /* Database detection (docs/db-detection.md): the job result's
+     * "databases" object, and the record's events for the caller to
+     * journal and alert. Owned; NULL and 0 when detection did not run. */
+    char            *databases_json;
+    db_event_t      *db_events;
+    size_t           n_db_events;
 } unit_backup_one_t;
 
 typedef struct {

@@ -78,7 +78,7 @@ static void test_migrations_apply(void **state)
         "policy_values", "repo_backup_paths", "journal", "recovery_state",
         "file_cache", "verify_runs", "verify_findings", "grep_runs",
         "grep_hits", "snapshot_units", "snapshot_unit_items", "unit_policy",
-        "unit_intents", "daemon_state", "pack_tombstones", NULL
+        "unit_intents", "daemon_state", "pack_tombstones", "db_findings", NULL
     };
     for (int i = 0; tables[i]; i++)
         assert_true(object_exists(db, "table", tables[i]));
@@ -92,6 +92,8 @@ static void test_migrations_apply(void **state)
         assert_false(object_exists(db, "table", gone[i]));
     assert_int_equal(count_rows(db, "SELECT name FROM pragma_table_info('nodes')"
                                     " WHERE name IN ('xattr_ref','acl_ref','sparse_ref')"), 0);
+    assert_int_equal(count_rows(db, "SELECT name FROM pragma_table_info('file_cache')"
+                                    " WHERE name = 'db_head'"), 1);
 
     db_close(db);
     unlink_db();
@@ -325,7 +327,11 @@ static void test_one_baseline_migration(void **state)
     /* Node index generations. */
     assert_non_null(app_migrations[8].name);
     assert_string_equal(app_migrations[8].name, "010_node_index_gen.sql");
-    assert_null(app_migrations[9].name);
+    /* Database findings and the file cache's head classification
+     * (db-detection.md 7.1). */
+    assert_non_null(app_migrations[9].name);
+    assert_string_equal(app_migrations[9].name, "011_db_findings.sql");
+    assert_null(app_migrations[10].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */

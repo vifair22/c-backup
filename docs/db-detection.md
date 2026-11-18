@@ -1,6 +1,7 @@
 # Database detection and consistent capture
 
-Design document. Nothing here is built yet. It replaces one-off,
+Design document, being built in phases (section 8): D0 is built; section
+14 records what it settled. It replaces one-off,
 per-application hook decisions (such as an Immich `pg_dumpall`) with a
 general mechanism. c-backup recognises live databases in what it backs up,
 judges whether the capture it is already making covers them consistently,
@@ -682,3 +683,29 @@ after the provider work. Decided:
 | Raw copy alongside an engine copy | Keep both: the raw file as read, flagged if it moved, and the engine copy. No option to skip the raw copy (9.5) |
 | Templates allowed by default | Only those that write nothing inside the application's data (the stdout dumps). Anything that writes into the application's data or changes its state (`redis-bgsave`, `prometheus-snapshot`, `nextcloud-maintenance`) is opt-in per host in the helper policy (7.2) |
 | Source snapshot mode for plain file sources | In 1.0, phase D4, on the helper's ZFS/btrfs machinery after the provider slices (9.4) |
+
+## 14. As built
+
+### 14.1 D0
+
+The detector is `src/ops/db_detect.c` (signatures, confidence, coverage;
+no database access) and `src/ops/db_findings.c` (the `db_findings` rows,
+the events, the job result's JSON). Where the build settled something the
+design left open or sketched differently:
+
+| Point | As built |
+|---|---|
+| The scan hook | One call per scanned entry from the store loop (`db_detect_entry`), not one per directory with its names: the scan is a flat list, and a name check per entry sets marker bits on the directory the name is about (`PG_VERSION` on its parent, `global/pg_control` on its grandparent). Memory follows the number of database-like names, not files |
+| The read hook | One `pread` of 64 bytes at offset 0 on the store's own descriptor, on every store path (backup thread, file workers, small-file workers), rather than a tap into the chunker's first buffer: the same page, no extra device I/O, and no change to the chunker. 16 KiB for a Nextcloud `config/config.php` |
+| Unchanged files | `file_cache.db_head` (migration 011) keeps the classification of each file read; a cache hit uses it. The upsert resets it when a file changes. A file unchanged since before detection existed is not classified until it changes; directory engines are found by names regardless |
+| unit.json | Stored after the unit's trees (`backup_synth_t.late`), so `databases` can say what reading them found. Additive: version stays 1 |
+| Unit coverage | From each tree item's capabilities and the session: a snapshot-domain tree read from the snapshot is atomic; a fallback tree is paused when begin held the pause and the watchdog did not let it go, live otherwise. At `crash` or better the provider guarantees one instant; below it each tree counts as its own instant, conservative for several datasets of one pool |
+| Links in containers | A tablespace, `pg_wal` or `journal` link inside a container names a container path, not a recorded one, so in a unit it is listed `unchecked` and not judged. File sources check it: the target must be a scanned tablespace (`PG_<v>_<cat>/`), WAL (`archive_status/`) or journal (`WiredTigerLog.*`) directory under a captured root, or the finding is `split` |
+| Names only where a header is unknown | A header decides when the backup read one. Without one (the cache vouched), directory layouts are judged by names; single-file engines (SQLite, RDB, bbolt) never are. `data.mdb` and `CURRENT` that were read and are not LMDB or a MANIFEST pointer veto their directory |
+| Prometheus | `queries.active` stands in for block directories, which a server younger than two hours does not have yet |
+| MyISAM and Aria | Counted for `engine-unsafe` only outside `mysql/`, `performance_schema/` and `sys/`: MariaDB's own system tables are Aria on every install |
+| Stale findings | A `new` or `suggested` row its scope's next backup does not see is dropped; `enabled` and `dismissed` stay. A dismissal is lifted by a version change |
+| Alert and journal | The one alert is the job's warning (`job_set_warning`), which already alerts and journals; new live findings and coverage changes are `info` journal entries of operation `db-detect` |
+| Suggestions | Names from section 6 and 7.2; for file sources, `sqlite-backup` (the daemon's copy, 9.2) or `source-snapshot` (9.4) |
+| Deferred to D1 | `hint` confidence and the Nextcloud link need `units.describe`'s image, arguments and other units' names; D0 reports Nextcloud's `dbtype` only |
+| Test fixtures | Built by `tests/test_db_detect.c` into scratch, not committed under `tests/fixtures/db/`: half are binary headers, which read better as the bytes they are |

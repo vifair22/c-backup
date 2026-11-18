@@ -6,6 +6,7 @@
 #include "sync_latch.h"
 #include "wal_health.h"
 #include "checkpointer.h"
+#include "db_findings.h"
 #include "db_txn.h"
 
 #include <cutils/log.h>
@@ -143,6 +144,43 @@ static void emit_scalar(mbuf_t *m, const char *name, const char *help,
 }
 
 /*
+ * Database detection (docs/db-detection.md 12): live findings not
+ * dismissed, by coverage, every coverage always present so a series that
+ * drops to zero says so rather than vanishing.
+ */
+static void emit_db_findings(mbuf_t *m)
+{
+    static const db_coverage_t covs[] = {
+        DB_COV_COVERED_CRASH, DB_COV_COVERED_QUIESCED, DB_COV_COVERED_APPLICATION,
+        DB_COV_ENGINE_UNSAFE, DB_COV_SPLIT, DB_COV_UNCOVERED,
+    };
+    long long n[sizeof(covs) / sizeof(*covs)] = { 0 };
+    db_result_t *r = NULL;
+    if (db_execute(g_db, "SELECT coverage, COUNT(*) FROM db_findings WHERE confidence = 'live'"
+                         " AND state <> 'dismissed' AND coverage IS NOT NULL GROUP BY coverage",
+                   NULL, &r) != 0) {
+        db_result_free(r);
+        return;
+    }
+    for (int i = 0; r && i < r->nrows; i++) {
+        db_coverage_t c;
+        if (db_coverage_parse(r->rows[i][0], &c) != 0) continue;
+        for (size_t k = 0; k < sizeof(covs) / sizeof(*covs); k++)
+            if (covs[k] == c) n[k] = strtoll(r->rows[i][1], NULL, 10);
+    }
+    db_result_free(r);
+    mb_addf(m, "# HELP cbackup_db_findings Live databases found by backups, not dismissed, "
+               "by how the capture covers them.\n# TYPE cbackup_db_findings gauge\n");
+    for (size_t k = 0; k < sizeof(covs) / sizeof(*covs); k++)
+        mb_addf(m, "cbackup_db_findings{coverage=\"%s\"} %lld\n", db_coverage_name(covs[k]), n[k]);
+    mb_addf(m, "# HELP cbackup_db_uncovered_reads_total Live databases a backup captured "
+               "uncovered (read live, possibly torn), counted per backup.\n"
+               "# TYPE cbackup_db_uncovered_reads_total counter\n"
+               "cbackup_db_uncovered_reads_total %llu\n",
+            (unsigned long long)db_detect_uncovered_reads_total());
+}
+
+/*
  * The write lock and the WAL checkpointer (B216). Process state, no query
  * and no lock: a scrape during a long checkpoint must not wait for it.
  * Daemon-wide aggregates only. Seconds as fractional totals, so rate()
@@ -263,6 +301,7 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                     "# TYPE cbackup_checkpoint_failing gauge\n"
                     "cbackup_checkpoint_failing %d\n", wal_health_failing(NULL, 0, NULL));
         emit_txn_metrics(&m);
+        emit_db_findings(&m);
     }
     emit_scalar(&m, "cbackup_repos_total", "Registered repositories.", "gauge",
                 "SELECT COUNT(*) FROM repos");
