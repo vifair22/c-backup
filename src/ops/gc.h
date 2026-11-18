@@ -29,7 +29,12 @@ typedef struct {
     /* File content a tree names that the repository does not hold. Nothing
      * beneath it can be kept alive; counted so the loss is visible. */
     uint64_t content_missing;
+    /* Objects the sweep removed from the index; their bytes go when
+     * compaction rewrites the packs holding them. */
     uint64_t swept;
+    /* Stored bytes compaction removed from packs (B197): only what it
+     * finished, so a run whose compaction failed reports less than it swept.
+     * A dry run reports what sweeping would make reclaimable. */
     uint64_t bytes_freed;
     /* Pack compaction, the second half of the sweep: entries surviving a
      * pack rewrite and entries dropped by one. Both zero when no pack

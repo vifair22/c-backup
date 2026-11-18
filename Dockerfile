@@ -91,7 +91,11 @@ ENV C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys
 # which a SIGTERM stop now reaches through the daemon's own shutdown.
 ENV ASAN_OPTIONS=detect_leaks=1:print_summary=1
 EXPOSE 8765
-VOLUME ["/var/lib/c-backupd"]
+# No VOLUME: the helper runs from this image too, and a VOLUME line made
+# Docker create an anonymous volume at every helper start, which nothing
+# removed (B205). The daemon's state is a named volume or a bind the run
+# names (-v cbackup-state:/var/lib/c-backupd, Manual 2.3); an anonymous one
+# never survived replacing the container anyway.
 
 # No HEALTHCHECK curl: the slim image has no curl and adding one to run a
 # health check is more surface than the check is worth. Orchestrators can

@@ -1,11 +1,12 @@
 /*
  * A stand-in qemu-guest-agent, run as /init of a tiny initramfs booted with
  * the host's kernel, for the libvirt suites (test_virt_offline). It lives
- * under fake_host/, not tests/, because every tests/*.c is a suite. It gives a
+ * under fake_host/, not tests/, because every C file directly in tests/ is a suite. It gives a
  * guest with no OS a real agent on the virtio port libvirt talks to, whose
  * freeze can be made to hang like a slow fsfreeze hook: qga_freeze_s=N on
  * the kernel command line sleeps N seconds inside the first
- * guest-fsfreeze-freeze; later ones are immediate.
+ * guest-fsfreeze-freeze, and qga_freeze_s=A,B,C sets each in turn; later
+ * ones are immediate.
  *
  * Every freeze and thaw is written to the console (the domain's serial
  * file), so a test can see what the guest went through:
@@ -42,17 +43,31 @@ static void nap_ms(long ms)
     while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
 }
 
-static int freeze_delay(void)
+/* qga_freeze_s=A,B,C: the first freeze takes A seconds, the second B,
+ * the third C; any later one, and any not given, is immediate. */
+#define DELAYS_MAX 8
+static int g_delays[DELAYS_MAX];
+
+static void freeze_delays(void)
 {
     char buf[1024] = "";
     int fd = open("/proc/cmdline", O_RDONLY);
-    if (fd < 0) return 0;
+    if (fd < 0) return;
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
-    if (n <= 0) return 0;
+    if (n <= 0) return;
     buf[n] = '\0';
     const char *p = strstr(buf, "qga_freeze_s=");
-    return p ? atoi(p + 13) : 0;
+    if (!p) return;
+    p += 13;
+    for (int i = 0; i < DELAYS_MAX; i++) {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) break;
+        g_delays[i] = (int)v;
+        if (*end != ',') break;
+        p = end + 1;
+    }
 }
 
 /* The port named org.qemu.guest_agent.0, by its sysfs name. */
@@ -107,11 +122,12 @@ int main(void)
     mount("sysfs", "/sys", "sysfs", 0, NULL);
     int con = open("/dev/console", O_WRONLY);
     if (con >= 0) { dup2(con, 1); dup2(con, 2); }
-    int delay = freeze_delay();
+    freeze_delays();
+    int nth = 0;
     say("fake-qga: booted\n");
     int fd = open_port();
     if (fd < 0) { say("fake-qga: no agent port\n"); for (;;) pause(); }
-    say_n("ready, first freeze takes (s)", delay);
+    say_n("ready, first freeze takes (s)", g_delays[0]);
 
     char buf[8192];
     size_t have = 0;
@@ -148,8 +164,9 @@ int main(void)
                 snprintf(out, sizeof(out), "{\"return\": {}}\n");
             } else if (strstr(cmd, "\"guest-fsfreeze-freeze")) {
                 say("fake-qga: freezing\n");
+                int delay = nth < DELAYS_MAX ? g_delays[nth] : 0;
+                nth++;
                 for (int i = 0; i < delay * 10; i++) nap_ms(100);
-                delay = 0;
                 frozen = 1;
                 say("fake-qga: frozen\n");
                 snprintf(out, sizeof(out), "{\"return\": 1}\n");

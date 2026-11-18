@@ -1137,6 +1137,9 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
                                       "%llu ms; consistency is %s",
                                       su->name, (unsigned long long)ms,
                                       sp_consistency_name(in->achieved));
+        for (uint64_t k = 0; st == OK && s->fail == FAKE_WARN && k < s->fail_arg; k++)
+            st = sp_session_info_warn(in, "fake warning %llu of %llu", (unsigned long long)(k + 1),
+                                      (unsigned long long)s->fail_arg);
         if (st == OK && req && in->achieved < req->require)
             st = set_error(ERR_INVALID, "unit %s: achieved %s, below the required %s",
                            su->name, sp_consistency_name(in->achieved),
