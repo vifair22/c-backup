@@ -34,6 +34,8 @@ typedef struct {
      * separated, and whether the hello said (db-detection.md 7.2). */
     char templates[1024];
     int  have_templates;
+    int  path_snapshots;        /* capture.begin_paths can snapshot (ZFS or
+                                   btrfs domains in its policy) */
 } remote_hello_t;
 
 /*
@@ -89,6 +91,13 @@ int      remote_is_remote(const sp_provider_ops_t *ops);
 struct cJSON;
 status_t remote_op(const char *provider, const char *op, struct cJSON *args, int send_fd,
                    struct cJSON **result);
+
+/* One helper operation that belongs to no provider (capture.begin_paths,
+ * and the capture.end or lease.release of what it began), on the configured
+ * helper's socket under this daemon's session, so a capture it begins ends
+ * with the daemon (B169). args is consumed; *result (may be NULL) is the
+ * caller's. ERR_NOT_FOUND when no helper is configured. */
+status_t remote_helper_call(const char *op, struct cJSON *args, struct cJSON **result);
 
 /*
  * db.probe (db-detection.md 8.1) for a unit behind the helper: the

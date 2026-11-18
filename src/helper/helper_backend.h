@@ -81,6 +81,9 @@ typedef struct helper_backend {
      * there is no container to enter (the fake), and paths stay as given. */
     status_t (*db_target)(sp_ctx_t *c, const char *unit_id, const char *path,
                           char *container, size_t csz, char *cpath, size_t psz);
+    /* The helper's own machinery, not a provider of units: never listed
+     * in hello's providers (the paths backend, paths_backend.h). */
+    int      internal;
 } helper_backend_t;
 
 /* The fake provider as a backend, over ctx. */

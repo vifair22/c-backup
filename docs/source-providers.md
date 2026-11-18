@@ -860,7 +860,7 @@ snapshot name, raw XML for libvirt, or a raw create body for Docker.
 | `units.list` | `provider` enum | enumerate, filtered by the policy's unit allowlist |
 | `units.describe` | `unit` unit key | inspect / domain XML / LXC config, templates and compose files, read by the helper and returned as data |
 | `capture.begin` | `units` 1 to 32 unit keys; `pause` bool | resolves every included mount itself, computes snapshot domains itself and intersects them with the policy's domains; pauses or freezes members if asked, `syncfs`, one atomic snapshot per pool with names it generates, unpauses; returns an opaque capture token, the read root of each mount, timings and per-member outcomes. Holds a lease with a deadline |
-| `capture.begin_paths` | `paths` 1 to 64 absolute paths | source snapshot mode for plain file sources (`db-detection.md` 9.4): resolves each path to its snapshot domain itself, checks the domains against the policy, takes one atomic snapshot per pool with names it generates, no pause; returns a capture token and a read root per path. Same lease, expiry and sweep as `capture.begin` |
+| `capture.begin_paths` | `paths` 1 to 64 absolute paths | source snapshot mode for plain file sources (`db-detection.md` 9.4): resolves each path to its snapshot domain itself, checks the domains against the policy, takes one atomic snapshot per pool with names it generates, no pause; returns a capture token and a read root per snapshotted path, each other path with the reason it was not snapshotted (to be read live), and the mounts below each snapshotted path (empty in the snapshot). No capture when no path can be snapshotted. Same lease, expiry and sweep as `capture.begin` (`helper.md`, Source snapshot mode) |
 | `capture.end` | `capture` token | destroys that capture's snapshots |
 | `hook.run` | `unit` unit key; `hook` name; or `template` name, `params` object, `path` (the finding's recorded path), `phase` `pre`/`post`, the last three optional | runs the named hook from the policy, or builds a database template from the helper's catalog (`db-detection.md` 7.2) if the policy's `[db] allow_templates` lists it, inside the unit's container (`container-backup.md` 6.6); returns a run token and, for a dump, a pipe fd |
 | `hook.wait` | `run` token | exit status, timed-out flag, log (capped) |
@@ -892,9 +892,13 @@ Offline VM reads need no operation: the daemon spawns `qemu-nbd
   policy's unit globs.
 - **Paths** are never trusted from the daemon. Mount sources come from the
   helper's own inspect, snapshot names from its own generator, read roots
-  from its own snapshots. The one path the daemon names, `restore.stage`'s
-  `mount`, must equal a mount source of that unit in the helper's current
-  inspect.
+  from its own snapshots. The daemon names paths in two places only.
+  `restore.stage`'s `mount` must equal a mount source of that unit in the
+  helper's current inspect. `capture.begin_paths`' paths are only ever
+  inputs to a lookup: the helper resolves each itself, and a snapshot is
+  taken only of a dataset or pool the policy lists, so the most a daemon can
+  name is a snapshot of an allowed domain, which `capture.begin` could
+  already cause.
 - **Execution.** Every external tool runs through `posix_spawn` with an argv
   the helper builds (`nsenter -t 1 -m -- zfs snapshot -o
   com.cbackup:owner=<id> <ds>@<name> ...`); there is no shell anywhere.

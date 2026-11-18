@@ -2294,6 +2294,7 @@ the repository).
 | `cbackup_checkpoint_throttle_seconds_total` | counter | Time bulk writers spent so held |
 | `cbackup_wal_frames_max` | gauge | The most frames `state.db`'s log was seen holding since start; the hard cap is 16 times `db.wal_autocheckpoint` |
 | `cbackup_db_findings{coverage}` | gauge | Live database findings not dismissed, by coverage: `covered-crash`, `covered-quiesced`, `covered-application`, `engine-unsafe`, `split`, `uncovered` (chapter 23); every label always present |
+| `cbackup_db_engine_captures_total{engine,result}` | counter | Engine copies file backups tried to make (23.6), by outcome: `ok`, `refused`, `abandoned`, `failed` |
 | `cbackup_db_uncovered_reads_total` | counter | Live databases a backup captured `uncovered`, counted once per backup that did |
 | `cbackup_vm_bitmap_audit_failures_total` | counter | Audit reads that found a VM disk changed outside its dirty bitmap (section 6.5) |
 | `cbackup_vm_resync_bytes_total` | counter | Bytes incremental VM reads re-read past the changed ranges to bring the chunker back in step |
@@ -3140,7 +3141,7 @@ lists every command with all of its arguments.
 | `repo key export\|ack <id>`, `repo key import <id> <key-hex>` | Encryption key escrow and recovery |
 | `sources list <id>`, `sources set <id> [path...] [--exclude PAT]...` | What a repository backs up; `set` with no paths clears the list |
 | `backup <id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT]` | Back up |
-| `restore <id> <snapshot> <dest> [--subpath PATH] [--overwrite]` | Restore |
+| `restore <id> <snapshot> <dest> [--subpath PATH] [--overwrite] [--prefer-engine-copy]` | Restore; `--prefer-engine-copy` puts a database's engine copy in place of its raw file (23.6) |
 | `snapshots <id> [--limit N] [--offset N]` | List snapshots |
 | `snapshot delete <id> <snapshot> [--force]` | Delete one; a tagged one only with `--force` (section 12) |
 | `snapshot note <id> <snapshot> [text]` | Read or write a note |
@@ -3167,8 +3168,8 @@ lists every command with all of its arguments.
 | `unit restore <id> <snapshot> <dest> [--item ID] [--overwrite]` | A unit snapshot as files, or one disk as a sparse raw image |
 | `unit restore <id> <snapshot> --define [--replace \| --name N --target-root DIR] [--pin-digest] [--start] [--keep-macs]` | Re-create the unit (section 22.7.3) |
 | `unit policy show\|set <id> --provider P <unit> [key value]` | Per-unit retention, `capture.exclude`, `capture.group` |
-| `db preview <id> <finding> [--template NAME] [--param KEY=VALUE]...` | The exact hook a template would run for a finding, and its probe (section 23.6) |
-| `db enable <id> <finding> --template NAME [--param KEY=VALUE]...`, `db dismiss <id> <finding> --reason TEXT` | Run a template from the next backup on; stop a finding being raised (section 23.6) |
+| `db preview <id> <finding> [--template NAME] [--param KEY=VALUE]...` | The exact hook a template would run for a finding, and its probe (section 23.7) |
+| `db enable <id> <finding> --template NAME [--param KEY=VALUE]...`, `db dismiss <id> <finding> --reason TEXT` | Run a template from the next backup on; stop a finding being raised (section 23.7) |
 | `vm export <id> <snapshot> <disk> [--ttl N[s\|m\|h\|d]]`, `vm exports`, `vm export-show <export-id>`, `vm unexport <export-id>` | Read-only NBD export of a VM disk (section 22.8) |
 | `vm checkpoints <id> <vm>`, `vm reset-incremental <id> <vm>` | A VM's incremental chain; incrementals back on after a failed audit (section 6.5) |
 | `jobs [--limit N] [--offset N]`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
@@ -3622,7 +3623,7 @@ scratch_dir = /mnt/cache/system/cbackup-scratch
 # staging_root = /mnt/cache/system/cbackup-vmstate
 
 [db]
-# Database templates hook.run may build (23.6). Without the key, the stdout
+# Database templates hook.run may build (23.7). Without the key, the stdout
 # dumps, which write nothing inside an application's data; the three that
 # do are opt-in per host.
 allow_templates = pg-dumpall, pg-dump, pg-basebackup, mariadb-dump, redis-rdb, sqlite-backup, influx2-backup, mongodump
@@ -3712,6 +3713,7 @@ waiting out the backoff.
 | `allow` | the daemon's `units.allow` |
 | `holds_open` | holds journalled and not yet released, the daemon's own and the helper's together (asked of the helper when the request is made); 0 when nothing is held |
 | `helper.holds`, `helper.captures` | what the helper has journalled and open right now, when it answered |
+| `helper.path_snapshots` | whether the helper's policy lists any ZFS dataset or btrfs pool, so file sources in snapshot mode can be read from a snapshot (`capture.begin_paths`) |
 | `privileges_dropped` | whether the drop of 22.2.2 happened |
 
 ### 22.3 Configuration keys
@@ -3908,7 +3910,7 @@ units are the containers under the policy's `[lxc] path`.
 | `.cbackup-unit/config/` | each member's `docker inspect` output verbatim, its image record (`Id`, `RepoTags`, `RepoDigests`), its Unraid template (from `templates-user/my-<name>.xml`) when one exists, the project's compose files and `.env`; for LXC the container's config file |
 | `.cbackup-unit/config/mounts.json` | every mount of every member: `container`, `destination`, `source` (as the container binds it), `real` (where the bytes are), `outcome` and, for snapshotted ones, `domain`; plus `suggested_excludes` |
 | the data | every included mount, recorded at its **source path** (the path Docker binds), so a plain file restore puts it back where the container expects it |
-| `.cbackup-unit/hooks/` | `<hook>.log` for every hook, `<hook>.dump` for each dump hook (22.5.5); the same for each enabled database template, named after it (23.6) |
+| `.cbackup-unit/hooks/` | `<hook>.log` for every hook, `<hook>.dump` for each dump hook (22.5.5); the same for each enabled database template, named after it (23.7) |
 
 Definitions are stored verbatim, environment variables and template fields
 included: an unencrypted repository holds them in the clear.
@@ -4716,7 +4718,74 @@ findings that cannot be recorded, are logged and the backup carries on;
 the result then has no `databases`. `db_detect.enabled: 0` turns it off
 entirely, and a backup then reads and stores exactly as it would have.
 
-### 23.6 Enabling a suggestion
+### 23.6 Engine copies for file sources
+
+A live SQLite database in a plain file source is read while the
+application writes it, so the raw copy may be torn. When its finding's
+`sqlite-backup` is enabled (the finding's state is `enabled`, template
+`sqlite-backup`), every backup of that source also makes a consistent copy
+with SQLite's own online backup, through the daemon's library, and stores
+it beside the raw file:
+
+```
+.cbackup-captures/
+  index.json
+  mnt/cache/appdata/someapp/app.db        the online-backup copy
+```
+
+- **WAL databases only**, unless the finding's parameters say
+  `{"allow_rollback_lock":true}`: a WAL reader never blocks the
+  application's writers, while a rollback-journal database's copy holds a
+  shared lock that does, for as long as the copy takes.
+- The database is opened read-only with a 5-second busy timeout. A WAL
+  database whose `-shm` the daemon (uid 990) cannot use cannot be opened
+  read-only, and the raw read stands, with that reason.
+- A copy kept from finishing by the source three times is abandoned with a
+  warning; the raw read stands.
+- The copy is made in the repository's `tmp/`, one database at a time,
+  never in memory, and removed once stored. It carries the original's
+  owner, mode and mtime.
+- **Both are kept.** The raw file is stored as read and is read once: it is
+  not re-read when it moves (the re-read exists to get a consistent
+  version, which the copy provides), and it is flagged if it moved.
+- `index.json` (`{"format":"cbackup-captures","version":1,"captures":[...]}`)
+  lists each attempt: original path, engine, method, finding, time,
+  outcome, the copy's path or the reason there is none, journal mode, and
+  how the raw file settled. The job result's `databases.captures` says the
+  same.
+- A copy that cannot be made is not a file the backup could not read: it is
+  left out of the snapshot, said in `index.json`, the job result and the
+  log, and the backup succeeds.
+
+`/.cbackup-captures` is reserved, like `/.cbackup-unit`: a file backup
+refuses a source at or under it, and never records that name at the
+snapshot root from a source of `/`.
+
+**What an unsettled database says.** Wherever the flag appears (the job
+result's `unsettled[].why`, the restore warning, verify's notice), a
+detected database explains itself: `stored while changing: live SQLite
+database (WAL mode, held open). The bytes may mix two versions. Enable
+"sqlite online backup" for this source for a consistent copy (finding 12)`
+when there is no copy; `... A consistent copy made with SQLite's online
+backup is in this snapshot at .cbackup-captures/...` when there is; and
+`... The online backup was abandoned (...); only this possibly torn copy
+exists` when it could not be made.
+
+**Restoring.** A whole-snapshot or subtree restore puts back the raw
+files as stored, the copies under `.cbackup-captures/` too, and names each
+flagged database that has a copy. `c-backup restore ... --prefer-engine-copy`
+(`"prefer_engine_copy":true`) restores the copy at the original path
+instead and leaves that database's `-wal`, `-shm` and `-journal` out: an
+online-backup copy is a complete database, and the old WAL beside it would
+corrupt it. The result counts `engine_copies`, `engine_copies_used` and
+`engine_siblings_left_out`.
+
+Other engines in a plain file source run as host services or in containers
+c-backup does not manage, and there is no credential-free copy of them
+from the daemon: back the application up as a unit, or use source snapshot
+mode.
+
+### 23.7 Enabling a suggestion
 
 A finding is acted on only by an explicit call from an authenticated caller:
 **preview**, then **enable**, or **dismiss**. Nothing is enabled by a
@@ -4848,4 +4917,4 @@ online backup (`docs/db-detection.md` 9.2), so the only template is
 `sqlite-backup`, with one optional parameter, `allow_rollback_lock` (a
 rollback-journal database's copy holds a shared lock that blocks the
 application's writers while it runs). Enabling it records the choice; the
-file backup reads it and stores the copy under `.cbackup-captures/`.
+file backup reads it and stores the copy under `.cbackup-captures/` (23.6).

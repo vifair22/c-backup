@@ -165,6 +165,7 @@ static void store_one(small_pool_t *pool, small_file_t *f)
     /* The batch holds its slot for all of its bytes (small_batch_t.taken);
      * a second acquisition per chunk would be nested. */
     o.unbudgeted = 1;
+    if (db_detect_is_copied(pool->detect, f->entry->path)) o.settle_reads = 1;
     cdc_result_t r;
     settle_result_t sr;
     err_clear();
