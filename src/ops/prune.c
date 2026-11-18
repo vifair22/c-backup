@@ -7,6 +7,7 @@
 #include "repo_tags.h"
 #include "snap_record.h"
 #include "db_write.h"
+#include "node_gen.h"
 
 #include <cutils/log.h>
 
@@ -159,6 +160,8 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
         failed = db_write(db,
             "DELETE FROM snapshots WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
+    if (!failed)
+        failed = node_gen_drop(db, repo_id, snap_id) != 0;
     if (!failed)
         failed = db_write(db,
             "DELETE FROM tags WHERE repo_id = ? AND snap_id = ?",

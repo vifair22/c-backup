@@ -14,10 +14,11 @@
  * exists to avoid.
  */
 
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { fmtSize, fmtNum, fmtMode, absoluteTime, gfsBadges, NODE_TYPE_NAMES } from './format'
 import { ContentViewer } from './ContentViewer'
-import type { WireSnapshot, WireTreeEntry } from '../shared/wire'
+import { isIndexRebuilt, pathSegments, resolvePath, type ListDir } from '../shared/browse'
+import type { WireSnapshot, WireTreeEntry, WireTreePage } from '../shared/wire'
 
 const api = window.cbackup
 
@@ -135,21 +136,50 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
   const [noteText, setNoteText] = useState('')
   const [noteSaving, setNoteSaving] = useState(false)
   const [viewerHash, setViewerHash] = useState<{ hash: string; filename: string } | null>(null)
+  /*
+   * The index generation every node id in `tree` belongs to, sent back with
+   * each of them. A reindex of the snapshot renumbers its nodes, and the
+   * daemon answers a stale generation with a 409 rather than with whatever
+   * directory now has the id; `reresolve` is how this screen reacts: drop
+   * every id it holds and walk the path it was showing again from the root
+   * (shared/browse.ts).
+   */
+  const genRef = useRef<number | undefined>(undefined)
+  const [reresolve, setReresolve] = useState<{ snapId: number; path: string; n: number } | null>(null)
+
+  const listDir: ListDir<WireTreeEntry> = useCallback(async (
+    parent: number, gen: number | undefined, offset: number,
+  ) => {
+    const resp = await api.apiCall<WireTreePage>(connName, {
+      kind: 'snapshotTree', repoId, snapshotId: snapId,
+      parent, limit: DIR_PAGE, offset, gen,
+    })
+    return { entries: resp.entries ?? [], gen: resp.index_gen }
+  }, [connName, repoId, snapId])
 
   const readDir = useCallback(async (parentNodeId: number, offset = 0): Promise<TreeNode[]> => {
-    const resp = await api.apiCall<{ entries?: WireTreeEntry[] }>(connName, {
-      kind: 'snapshotTree', repoId, snapshotId: snapId,
-      parent: parentNodeId, limit: DIR_PAGE, offset,
-    })
-    return sortChildren((resp.entries ?? []).map(parseEntry))
-  }, [connName, repoId, snapId])
+    const page = await listDir(parentNodeId, genRef.current, offset)
+    return sortChildren(page.entries.map(parseEntry))
+  }, [listDir])
+
+  /* Nothing read under the old generation stays on screen: the tree is
+   * cleared at once and rebuilt from the path by the effect below. */
+  const recover = useCallback((path: string) => {
+    genRef.current = undefined
+    setTree(new Map())
+    setExpanded(new Set())
+    setComplete(new Set())
+    setHighlightNodeId(null)
+    setSelectedFile(null)
+    setReresolve(prev => ({ snapId, path, n: (prev?.n ?? 0) + 1 }))
+  }, [snapId])
 
   /*
    * Fetch the next page of a directory already open. The route reports no
    * total, so a full page is the only evidence there is another one - the
    * same rule every other paged screen here follows.
    */
-  const loadMore = useCallback(async (parentNodeId: number) => {
+  const loadMore = useCallback(async (parentNodeId: number, path: string) => {
     const have = tree.get(parentNodeId)?.length ?? 0
     setLoading(prev => new Set(prev).add(parentNodeId))
     try {
@@ -163,16 +193,20 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
         setComplete(prev => new Set(prev).add(parentNodeId))
       }
     } catch (err) {
-      setError(`Failed to load directory: ${err}`)
+      if (isIndexRebuilt(err)) recover(path)
+      else setError(`Failed to load directory: ${err}`)
     }
     setLoading(prev => {
       const n = new Set(prev)
       n.delete(parentNodeId)
       return n
     })
-  }, [readDir, tree])
+  }, [readDir, recover, tree])
 
-  const fetchChildren = useCallback(async (parentNodeId: number) => {
+  /* false when the index was rebuilt under it: the id is stale then, and
+   * the caller must not expand it, since it may name another directory. */
+  const fetchChildren = useCallback(async (parentNodeId: number, path: string): Promise<boolean> => {
+    let ok = true
     setLoading(prev => new Set(prev).add(parentNodeId))
     try {
       const children = await readDir(parentNodeId)
@@ -185,14 +219,16 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
         setComplete(prev => new Set(prev).add(parentNodeId))
       }
     } catch (err) {
-      setError(`Failed to load directory: ${err}`)
+      if (isIndexRebuilt(err)) { ok = false; recover(path) }
+      else setError(`Failed to load directory: ${err}`)
     }
     setLoading(prev => {
       const next = new Set(prev)
       next.delete(parentNodeId)
       return next
     })
-  }, [readDir])
+    return ok
+  }, [readDir, recover])
 
   useEffect(() => {
     let cancelled = false
@@ -213,12 +249,22 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       .then(r => { if (!cancelled) setNote(r.body || null) })
       .catch(() => { if (!cancelled) setNote(null) })
 
+    /*
+     * The path to open: the one a re-resolve is walking back to, else the
+     * one this screen was opened at. The walk reads the root without a
+     * generation, which is what makes it a fresh start after a 409, and
+     * every directory after it with the generation the root reported.
+     */
+    const rewalk = reresolve !== null && reresolve.snapId === snapId
+    const target = (rewalk ? reresolve.path : initialPath) ?? ''
+    genRef.current = undefined
+
     Promise.all([
       api.apiCall<{ snapshots?: WireSnapshot[] }>(connName, {
         kind: 'snapshotList', repoId, limit: 200,
       }),
-      readDir(0),
-    ]).then(async ([list, rootChildren]) => {
+      resolvePath(listDir, pathSegments(target), DIR_PAGE),
+    ]).then(([list, resolved]) => {
       if (cancelled) return
       const row = (list.snapshots ?? []).find(x => x.id === snapId)
       setHeader(row ? {
@@ -229,52 +275,25 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
         size: row.size ?? 0,
         gfsFlags: row.gfs_flags ?? 0,
       } : null)
+      genRef.current = resolved.gen
+      const rootChildren = sortChildren(resolved.root.map(parseEntry))
       const treeMap = new Map([[0, rootChildren]])
       const expandedSet = new Set<number>()
       const completeSet = new Set<number>()
       if (rootChildren.length < DIR_PAGE) completeSet.add(0)
 
-      // Auto-expand to initialPath if provided
-      if (initialPath) {
-        const segments = initialPath.replace(/^\/+/, '').split('/').filter(Boolean)
-        let parentId = 0
-        const crumbs: Breadcrumb[] = []
-
-        for (let i = 0; i < segments.length; i++) {
-          const seg = segments[i]
-          const children = treeMap.get(parentId)
-          if (!children) break
-
-          const match = children.find(c => c.name === seg)
-          if (!match) break
-
-          const isLast = i === segments.length - 1
-          if (isLast) {
-            setHighlightNodeId(match.nodeId)
-            if (match.type === NODE_DIR) {
-              expandedSet.add(match.nodeId)
-              crumbs.push({ nodeId: match.nodeId, name: match.name })
-              try {
-                const kids = await readDir(match.nodeId)
-                treeMap.set(match.nodeId, kids)
-                if (kids.length < DIR_PAGE) completeSet.add(match.nodeId)
-              } catch { /* the row is still highlighted; only the expansion is lost */ }
-            }
-          } else if (match.type === NODE_DIR && match.hasChildren) {
-            expandedSet.add(match.nodeId)
-            crumbs.push({ nodeId: match.nodeId, name: match.name })
-            try {
-              const kids = await readDir(match.nodeId)
-              treeMap.set(match.nodeId, kids)
-              if (kids.length < DIR_PAGE) completeSet.add(match.nodeId)
-            } catch { break }
-            parentId = match.nodeId
-          } else {
-            break
-          }
-        }
-        setBreadcrumb(crumbs)
+      const crumbs: Breadcrumb[] = []
+      for (const step of resolved.steps) {
+        if (step.entries === null) continue
+        const kids = sortChildren(step.entries.map(parseEntry))
+        treeMap.set(step.nodeId, kids)
+        expandedSet.add(step.nodeId)
+        crumbs.push({ nodeId: step.nodeId, name: step.name })
+        if (kids.length < DIR_PAGE) completeSet.add(step.nodeId)
       }
+      const last = resolved.steps[resolved.steps.length - 1]
+      if (initialPath && last && !rewalk) setHighlightNodeId(last.nodeId)
+      setBreadcrumb(crumbs)
 
       setTree(treeMap)
       setExpanded(expandedSet)
@@ -286,7 +305,7 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
     })
 
     return () => { cancelled = true }
-  }, [connName, repoId, snapId, initialPath, readDir])
+  }, [connName, repoId, snapId, initialPath, listDir, reresolve])
 
   const toggleDir = async (node: TreeNode, depth: number, parentChain: Breadcrumb[]) => {
     if (node.type !== NODE_DIR) return
@@ -302,8 +321,9 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
     }
 
     // Expand
-    if (!tree.has(node.nodeId)) {
-      await fetchChildren(node.nodeId)
+    if (!tree.has(node.nodeId) &&
+        !await fetchChildren(node.nodeId, '/' + [...parentChain.map(b => b.name), node.name].join('/'))) {
+      return
     }
     setExpanded(prev => new Set(prev).add(node.nodeId))
     setBreadcrumb(parentChain)
@@ -392,7 +412,8 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       rows.push(
         <tr key={`more-${parentId}`} className="border-t border-border-default">
           <td colSpan={4} className="py-1.5" style={{ paddingLeft: `${depth * 20 + 28}px` }}>
-            <button onClick={() => void loadMore(parentId)} disabled={busy}
+            <button onClick={() => void loadMore(parentId, '/' + parentChain.map(b => b.name).join('/'))}
+              disabled={busy}
               className="text-[11px] underline cursor-pointer bg-transparent border-none
                          text-accent p-0 disabled:opacity-50">
               {busy ? 'Loading...' : `${fmtNum(children.length)} shown, load more`}

@@ -18,6 +18,18 @@
 #define NODE_QUERIES_H
 
 /*
+ * A result column holding a row's index generation (node_gen.h), for a
+ * query whose rows carry repo_id and snap_id under the given alias. Read in
+ * the same statement as the node ids it labels, which is what keeps the two
+ * consistent: one statement holds the connection for its whole run. 0 for a
+ * snapshot with none.
+ */
+#define NODE_GEN_COL(alias) \
+    "COALESCE((SELECT g.gen FROM node_index_gen g" \
+    "           WHERE g.repo_id = " alias ".repo_id" \
+    "             AND g.snap_id = " alias ".snap_id), 0)"
+
+/*
  * Name search: repo, repo, quoted query, [snap,] limit.
  *
  * Through the trigram index, not LIKE, and ordered by the index's own rowid
@@ -28,7 +40,7 @@
  */
 #define NODE_SQL_SEARCH_ALL \
     "SELECT f.node_id, f.snap_id, f.name, n.type, n.size," \
-    "       COALESCE(n.content_hash, ''), (n.flags & 1)" \
+    "       COALESCE(n.content_hash, ''), (n.flags & 1), " NODE_GEN_COL("f") \
     "  FROM node_fts f" \
     "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id" \
     " WHERE f.repo_id = ? AND f.name MATCH ?" \
@@ -36,7 +48,7 @@
 
 #define NODE_SQL_SEARCH_SNAP_NEWEST \
     "SELECT f.node_id, f.snap_id, f.name, n.type, n.size," \
-    "       COALESCE(n.content_hash, ''), (n.flags & 1)" \
+    "       COALESCE(n.content_hash, ''), (n.flags & 1), " NODE_GEN_COL("f") \
     "  FROM node_fts f" \
     "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id" \
     " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?" \
@@ -44,14 +56,16 @@
 
 #define NODE_SQL_SEARCH_SNAP_OLDEST \
     "SELECT f.node_id, f.snap_id, f.name, n.type, n.size," \
-    "       COALESCE(n.content_hash, ''), (n.flags & 1)" \
+    "       COALESCE(n.content_hash, ''), (n.flags & 1), " NODE_GEN_COL("f") \
     "  FROM node_fts f" \
     "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id" \
     " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?" \
     " ORDER BY f.rowid ASC LIMIT ?"
 
-/* The last column of the searches and of a directory page is the entry's
- * MANIFEST_FLAG_UNSETTLED bit: stored while still changing (OWN-45-LIVE). */
+/* The seventh column of the searches and the last of a directory page is
+ * the entry's MANIFEST_FLAG_UNSETTLED bit: stored while still changing
+ * (OWN-45-LIVE). The searches' last is the row's snapshot's index
+ * generation, read in the same statement as the ids it labels. */
 
 /* One step up a search result's ancestry, to build its path: repo, node. */
 #define NODE_SQL_ANCESTOR \
