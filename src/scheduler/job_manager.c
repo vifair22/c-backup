@@ -106,6 +106,9 @@ struct job_manager {
      * user (job_manager_set_alerts). push_send accepts and drops a message
      * when it has not, so this is only what the log line may claim. */
     atomic_int      alerts;
+    /* Where alerts go: push_send_opts, or a test's fake Pushover
+     * (job_manager_set_push). NULL is push_send_opts. */
+    job_push_fn     push;
     /* Gates (job_manager_set_gate): an action that must not start on a
      * repository while something outside the job system reads it. */
     struct { const char *action; job_gate_fn fn; const char *phase; } gates[JOB_GATES_MAX];
@@ -115,6 +118,39 @@ struct job_manager {
 void job_manager_set_alerts(job_manager_t *jm, int enabled)
 {
     if (jm) atomic_store(&jm->alerts, enabled ? 1 : 0);
+}
+
+void job_manager_set_push(job_manager_t *jm, job_push_fn fn)
+{
+    if (jm) jm->push = fn;
+}
+
+/*
+ * A job that ended in ERR_CORRUPT found damage nothing can repair: a verify
+ * finding unrecoverable or missing data, a gc or a replication finding
+ * entries damaged beyond parity or packs that cannot be walked. That alert
+ * goes out at Pushover priority 1, which bypasses the recipient's quiet
+ * hours; data is already lost, and every hour it waits is an hour another
+ * copy can go too. Decided by the status, never by the message text.
+ * Priority 1 needs no other parameter; 2 (emergency) would need retry and
+ * expire and is not used. Every other alert, failure or warning, stays
+ * normal.
+ */
+int job_alert_priority(status_t st)
+{
+    return st == ERR_CORRUPT ? PUSH_PRIORITY_HIGH : PUSH_PRIORITY_NORMAL;
+}
+
+/* One alert, at a priority; nonzero when it could not be queued. */
+static int alert_send(const job_manager_t *jm, const char *title, const char *body,
+                      int priority)
+{
+    push_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.title = title;
+    o.message = body;
+    o.priority = priority;
+    return jm->push ? jm->push(&o) : push_send_opts(&o);
 }
 
 /*
@@ -1241,16 +1277,21 @@ static void *worker_main(void *arg)
              * it said. Nor does it say when it drops one for want of
              * credentials, and this line said "sending" after push_init
              * had logged that Pushover is not configured (NIT-11). */
+            /* After the title: the body spans lines, and the title is on
+             * the line a grep of the log finds. */
+            int pri = job_alert_priority(st);
+            const char *pri_note = pri == PUSH_PRIORITY_HIGH
+                                       ? " (priority high: damage beyond repair)" : "";
             if (atomic_load(&jm->alerts)) {
-                log_info("sending failure notification for job %lld: %s: %s",
-                         (long long)slot.job_id, title, body);
-                if (push_send(title, body) != 0)
+                log_info("sending failure notification for job %lld: %s%s: %s",
+                         (long long)slot.job_id, title, pri_note, body);
+                if (alert_send(jm, title, body, pri) != 0)
                     log_warn("cannot queue failure notification for job %lld",
                              (long long)slot.job_id);
             } else {
                 log_info("failure notification for job %lld not sent, Pushover "
-                         "is not configured: %s: %s",
-                         (long long)slot.job_id, title, body);
+                         "is not configured: %s%s: %s",
+                         (long long)slot.job_id, title, pri_note, body);
             }
         }
         /*
@@ -1268,7 +1309,7 @@ static void *worker_main(void *arg)
             if (atomic_load(&jm->alerts)) {
                 log_warn("sending warning notification for job %lld: %s: %s",
                          (long long)slot.job_id, title, body);
-                if (push_send(title, body) != 0)
+                if (alert_send(jm, title, body, PUSH_PRIORITY_NORMAL) != 0)
                     log_warn("cannot queue warning notification for job %lld",
                              (long long)slot.job_id);
             } else {
