@@ -2305,6 +2305,17 @@ policy, tags, journal, tasks (jobs), schedules, verify runs, encryption and
 key, object and pack introspection. The daemon status screen covers the
 daemon as a whole.
 
+**Snapshot mode in the backup dialog.** Editing the sources shows, for each
+path, a snapshot mode: Off (read live), Strict or Warn (6.6). Saving sends
+every mode, so a path set back to Off is off; the list then marks each
+source in snapshot mode (`snapshot: strict`, `snapshot: warn`). The tasks
+screen shows what the daemon decided: a backup refused because a strict
+source could not be read from a snapshot shows the daemon's error, naming
+each path and why, with what to do next; a completed backup lists the warn
+sources it read live, each with the reason, and names the sources it read
+from a snapshot. An older app that knows nothing of snapshot mode keeps the
+modes when it saves (the daemon keeps them when `snapshot` is left out).
+
 ---
 
 ## 16. Monitoring and alerting

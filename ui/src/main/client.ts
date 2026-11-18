@@ -88,7 +88,9 @@ export function toEndpoint(req: ApiRequest): Endpoint {
       return {
         method: 'PUT',
         path: `/repos/${req.repoId}/sources`,
-        body: { sources: req.sources, exclude: req.exclude ?? [] },
+        body: req.snapshot
+          ? { sources: req.sources, exclude: req.exclude ?? [], snapshot: req.snapshot }
+          : { sources: req.sources, exclude: req.exclude ?? [] },
       }
 
     /* --- backup and restore --- */
