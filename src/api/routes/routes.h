@@ -237,6 +237,14 @@ int journal_record_at(cutils_db_t *db, int64_t repo_id, int64_t ts, const char *
                       const char *operation, const char *result,
                       int64_t duration_ms, const char *message);
 
+/* Journal a database-findings record's events and send its one alert as a
+ * job warning (docs/db-detection.md 7.3). prefix (may be NULL) leads each
+ * line: "unit immich: ". */
+struct db_record_result;
+void routes_db_detect_events(cutils_db_t *db, int64_t repo_id, const char *source,
+                             const char *prefix, const struct db_record_result *rr,
+                             void *progress_ctx);
+
 /* Schedule CRUD. Repo-scoped sub-handlers, dispatched from repos.c. */
 struct scheduler;
 void routes_schedules_init(cutils_db_t *db, struct scheduler *sched);

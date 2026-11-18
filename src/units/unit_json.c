@@ -73,6 +73,24 @@ char *unit_json_encode(const unit_json_t *u, size_t *len)
     cJSON *w = ok && items ? cJSON_AddArrayToObject(o, "warnings") : NULL;
     for (size_t i = 0; w && i < u->n_warnings; i++)
         cJSON_AddItemToArray(w, cJSON_CreateString(u->warnings[i]));
+    if (ok && w && u->have_dbs) {
+        cJSON *dbs = cJSON_AddArrayToObject(o, "databases");
+        ok = dbs != NULL;
+        for (size_t i = 0; ok && i < u->n_dbs && i < UNIT_JSON_DB_MAX; i++) {
+            const unit_json_db_t *d = &u->dbs[i];
+            cJSON *x = cJSON_CreateObject();
+            if (!x) { ok = 0; break; }
+            cJSON_AddItemToArray(dbs, x);
+            ok = cJSON_AddStringToObject(x, "engine", d->engine) &&
+                 cJSON_AddStringToObject(x, "path", d->path ? d->path : "") &&
+                 cJSON_AddStringToObject(x, "confidence", d->confidence);
+            if (ok && d->version[0]) ok = cJSON_AddStringToObject(x, "version", d->version) != NULL;
+            if (ok && d->coverage[0]) ok = cJSON_AddStringToObject(x, "coverage", d->coverage) != NULL;
+            if (ok && d->method[0]) ok = cJSON_AddStringToObject(x, "method", d->method) != NULL;
+        }
+        if (ok && u->dbs_total > u->n_dbs)
+            ok = cJSON_AddNumberToObject(o, "databases_total", (double)u->dbs_total) != NULL;
+    }
     char *txt = (ok && w) ? cJSON_PrintUnformatted(o) : NULL;
     cJSON_Delete(o);
     if (!txt) { set_error(ERR_NOMEM, "unit.json: cannot serialise"); return NULL; }
@@ -111,6 +129,8 @@ void unit_json_free(unit_json_t *u)
     free(u->items);
     for (size_t i = 0; i < u->n_warnings; i++) free(u->warnings[i]);
     free(u->warnings);
+    for (size_t i = 0; i < u->n_dbs; i++) free(u->dbs[i].path);
+    free(u->dbs);
     free(u->name);
     memset(u, 0, sizeof(*u));
 }
@@ -198,6 +218,32 @@ status_t unit_json_parse(const void *buf, size_t len, unit_json_t *out)
         out->warnings = g;
         if (!(g[out->n_warnings] = strdup(w->valuestring))) { st = set_error(ERR_NOMEM, "unit.json"); break; }
         out->n_warnings++;
+    }
+    /* Informational, and optional: an entry that is not what this reader
+     * writes is skipped, never a reason to refuse the document. */
+    const cJSON *dbs = cJSON_GetObjectItemCaseSensitive(o, "databases");
+    if (st == OK && cJSON_IsArray(dbs)) {
+        out->have_dbs = 1;
+        const cJSON *x;
+        cJSON_ArrayForEach(x, dbs) {
+            const char *eng = js(x, "engine"), *path = js(x, "path"), *conf = js(x, "confidence");
+            if (!eng || !path || !conf || out->n_dbs >= UNIT_JSON_DB_MAX) continue;
+            unit_json_db_t *g = realloc(out->dbs, (out->n_dbs + 1) * sizeof(*g));
+            if (!g) { st = set_error(ERR_NOMEM, "unit.json"); break; }
+            out->dbs = g;
+            unit_json_db_t *d = &g[out->n_dbs];
+            memset(d, 0, sizeof(*d));
+            const char *v;
+            snprintf(d->engine, sizeof(d->engine), "%s", eng);
+            snprintf(d->confidence, sizeof(d->confidence), "%s", conf);
+            if ((v = js(x, "version")))  snprintf(d->version, sizeof(d->version), "%s", v);
+            if ((v = js(x, "coverage"))) snprintf(d->coverage, sizeof(d->coverage), "%s", v);
+            if ((v = js(x, "method")))   snprintf(d->method, sizeof(d->method), "%s", v);
+            if (!(d->path = strdup(path))) { st = set_error(ERR_NOMEM, "unit.json"); break; }
+            out->n_dbs++;
+        }
+        uint64_t total = jn(o, "databases_total");
+        out->dbs_total = total > out->n_dbs ? (size_t)total : out->n_dbs;
     }
     cJSON_Delete(o);
     if (st != OK) unit_json_free(out);
