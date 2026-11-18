@@ -22,6 +22,7 @@
 #include "helper_policy.h"
 #include "helper_server.h"
 #include "mounts.h"
+#include "paths_backend.h"
 
 #include <cutils/log.h>
 
@@ -122,12 +123,22 @@ int main(int argc, char **argv)
         log_warn("helper: the fake provider is enabled from %s; this is for tests", pol.fake_spec);
     }
 
-    helper_backend_t be[3];
+    helper_backend_t be[4];
     size_t nbe = 0;
     int have_docker = 0, have_lxc = 0, have_virt = 0;
+    /* capture.begin_paths over the policy's ZFS and btrfs domains, and the
+     * release of what it took; cannot fail but for memory. */
+    if (paths_backend_init(&pol, &be[nbe]) != OK) {
+        fprintf(stderr, "c-backup-helper: %s\n", err_msg());
+        if (fake) fake_provider_ops.fini(fake);
+        helper_policy_free(&pol);
+        return 1;
+    }
+    helper_backend_t *paths_be = &be[nbe++];
     if (pol.docker_enabled) {
         if (docker_backend_init(&pol, &be[nbe]) != OK) {
             fprintf(stderr, "c-backup-helper: %s\n", err_msg());
+            paths_backend_fini(paths_be);
             if (fake) fake_provider_ops.fini(fake);
             helper_policy_free(&pol);
             return 1;
@@ -139,6 +150,7 @@ int main(int argc, char **argv)
         if (lxc_backend_init(&pol, &be[nbe]) != OK) {
             fprintf(stderr, "c-backup-helper: %s\n", err_msg());
             if (have_docker) docker_backend_fini(&be[have_docker - 1]);
+            paths_backend_fini(paths_be);
             if (fake) fake_provider_ops.fini(fake);
             helper_policy_free(&pol);
             return 1;
@@ -153,6 +165,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "c-backup-helper: %s\n", err_msg());
             if (have_docker) docker_backend_fini(&be[have_docker - 1]);
             if (have_lxc) lxc_backend_fini(&be[have_lxc - 1]);
+            paths_backend_fini(paths_be);
             if (fake) fake_provider_ops.fini(fake);
             helper_policy_free(&pol);
             return 1;
@@ -163,6 +176,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "c-backup-helper: [libvirt] enabled, and this helper was built without libvirt\n");
         if (have_docker) docker_backend_fini(&be[have_docker - 1]);
         if (have_lxc) lxc_backend_fini(&be[have_lxc - 1]);
+        paths_backend_fini(paths_be);
         if (fake) fake_provider_ops.fini(fake);
         helper_policy_free(&pol);
         return 1;
@@ -175,6 +189,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "c-backup-helper: %s\n", err_msg());
         if (have_docker) docker_backend_fini(&be[have_docker - 1]);
         if (have_lxc) lxc_backend_fini(&be[have_lxc - 1]);
+        paths_backend_fini(paths_be);
         if (fake) fake_provider_ops.fini(fake);
         helper_policy_free(&pol);
         return 1;
@@ -192,6 +207,7 @@ int main(int argc, char **argv)
 #endif
     if (have_docker) docker_backend_fini(&be[have_docker - 1]);
     if (have_lxc) lxc_backend_fini(&be[have_lxc - 1]);
+    paths_backend_fini(paths_be);
     if (fake) fake_provider_ops.fini(fake);
     helper_policy_free(&pol);
     log_shutdown();

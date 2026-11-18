@@ -884,6 +884,21 @@ status_t remote_op(const char *provider, const char *op, cJSON *args, int send_f
     return rcall_full(c->socket, op, args, result, send_fd, NULL);
 }
 
+status_t remote_helper_call(const char *op, cJSON *args, cJSON **result)
+{
+    if (result) *result = NULL;
+    char sock[sizeof(g_link.info.socket)];
+    pthread_mutex_lock(&g_link.mu);
+    int configured = g_link.info.configured;
+    snprintf(sock, sizeof(sock), "%s", g_link.info.socket);
+    pthread_mutex_unlock(&g_link.mu);
+    if (!configured) {
+        cJSON_Delete(args);
+        return set_error(ERR_NOT_FOUND, "no helper is configured (units.helper_socket)");
+    }
+    return rcall(sock, op, args, result);
+}
+
 /* One hello; enable any provider offered that is not enabled yet. */
 static status_t attach_once(const char *socket_path, const char *daemon8, remote_hello_t *out)
 {
@@ -897,6 +912,7 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
     h.version = (int)num(res, "version");
     h.holds = (long)num(res, "holds");
     h.captures = (long)num(res, "captures");
+    h.path_snapshots = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "path_snapshots"));
     snprintf(h.daemon_id, sizeof(h.daemon_id), "%s", jstr(res, "daemon_id"));
     snprintf(h.policy, sizeof(h.policy), "%s", jstr(res, "policy"));
     /* Said when it is news: this ran at every health check, so a daemon id

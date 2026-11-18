@@ -10,9 +10,10 @@ none of it.
 It carries the protocol, the policy, the leases and watchdogs, the peer
 check, fd passing for dump hooks, restore staging and swap, and these
 backends, each enabled by its policy section: Docker and LXC (below),
-libvirt (`vm-backup.md`), the fake provider (tests only, `fake_spec`) and
-`dir_domains` (a directory "snapshot domain" for tests and for
-`capture.begin_paths`). A provider whose section is off answers
+libvirt (`vm-backup.md`), the fake provider (tests only, `fake_spec`),
+the paths backend for `capture.begin_paths` over the policy's ZFS and
+btrfs domains (below), and `dir_domains` (a directory "snapshot domain"
+for tests, taking no snapshot). A provider whose section is off answers
 `unsupported`.
 
 ## Deployment (Docker, Unraid)
@@ -337,6 +338,62 @@ journalled and open; `GET /providers` adds the helper's holds to
 `holds_open` and shows both under `helper`. Data never crosses the
 socket: the daemon reads trees through the read roots the helper returns,
 and disks through its own mounts (for the fake, its run map).
+
+## Source snapshot mode: `capture.begin_paths`
+
+The daemon's file sources in snapshot mode (`db-detection.md` 9.4) are read
+from a ZFS or btrfs snapshot through `capture.begin_paths {paths}`, one to
+64 absolute paths. The daemon names the paths; everything else is the
+helper's, as for `capture.begin`:
+
+- **Resolution.** Each path is resolved by the helper the way a container's
+  bind source is (`src/helper/paths_backend.c` over `mount_resolve`): a
+  `/mnt/user` path to the one pool or disk holding it, symlinks resolved in
+  the host's mount namespace, bind mounts through to their filesystem
+  (B170). A host facility (`/dev`, `/proc`, `/sys`, `/run`, `/etc`,
+  `/boot`, the Docker socket) is never snapshotted.
+- **Domains.** The resolved path's ZFS dataset (the longest mountpoint over
+  it) must be listed in `zfs_domains`, or its btrfs pool root in
+  `btrfs_domains` (the innermost nested subvolume over it, if any, is the
+  domain). A parent dataset is never snapshotted in place of an unlisted
+  child.
+- **Snapshots.** One atomic `zfs snapshot` per pool for every dataset the
+  request touches, one btrfs snapshot per domain, named
+  `cbk-<daemon id>-<capture seq>-<k>`, owned
+  (`com.cbackup:owner`) and journalled (`paths:capture` holds, kind
+  `fs_snapshot`) before each command runs. No pause: there is no unit.
+- **Answer.** `read_roots` maps each snapshotted path to where the daemon
+  reads it inside the snapshot, built by the helper; `kinds` says `zfs`,
+  `btrfs` or `dir` (a test `dir_domains` path, read in place); `live` maps
+  every path it did not snapshot to the reason (not resolvable, a host
+  facility, split across devices, on no domain the policy lists, what lies
+  below it cannot be checked); `nested` gives, per snapshotted path, how
+  many mounts and btrfs subvolumes lie below it and the first three by
+  name (`{"total","names"}`, B231's probe: the mount table and one `btrfs
+  subvolume list` per pool, the snapshot machinery left out), which the
+  snapshot shows as empty directories; `snapshots`
+  names each snapshot by domain. With at least one path snapshotted it
+  also carries `capture`, `expires` and `snapshot_ms`.
+- **No action outside the policy.** For a path it does not snapshot the
+  helper does nothing beyond placing it: resolving it and listing the
+  datasets, which names no path. Nothing is snapshotted, read or listed
+  under it (`test_begin_paths` asserts the fake tools' call logs).
+- **Nothing to snapshot.** A request where no path can be snapshotted takes
+  no capture and does not count against `max_captures_per_hour`; the answer
+  is `ok` with only `live`.
+- **Failure.** A snapshot command that fails fails the request (`failed`);
+  whatever it had already taken is destroyed, and nothing is left held.
+- **End.** `capture.end` or `lease.release` destroys the snapshots, each
+  after its ownership proof, and clears their journal rows. The same
+  lease (`capture_max_s`), session anchoring (the daemon killed: its
+  captures end at once, B169), helper stop, and start-up sweep (journalled
+  rows released, then any leftover snapshot of this daemon id in the
+  policy's domains destroyed) apply as to unit captures, with no unit
+  provider configured at all.
+
+The paths backend is internal: hello does not list it among `providers`,
+and no unit key can name it. Hello's `path_snapshots` says whether the
+policy lists any ZFS dataset or btrfs pool.
 
 ## What a compromised daemon gets
 
@@ -778,8 +835,8 @@ The unit suites run everything above against stand-ins: `tests/fake_host`
 holds scripts standing in for the host's `zfs`, `btrfs` and `lxc-*` (a
 snapshot is a copy, properties live in a state file), and
 `tests/fake_docker.h` is an Engine API on a unix socket. `test_snap`,
-`test_mounts`, `test_docker` and `test_lxc` need no privileges and run in
-the ordinary CI job.
+`test_mounts`, `test_begin_paths`, `test_docker` and `test_lxc` need no
+privileges and run in the ordinary CI job.
 
 ### The real-engines CI job
 
@@ -935,7 +992,7 @@ journal rows after every fault (`GET /providers` `holds_open` 0, helper
 ## Known limits in this build
 
 - `capture.begin_paths` and `restore.stage` over `dir_domains` take no real
-  snapshot.
+  snapshot; `dir_domains` is for tests only.
 - `pause: false` is passed to the backend as the wanted level; the fake
   pauses whenever the unit can. The Docker provider decides from its
   policy (`pause`, `pause_always`) instead.
