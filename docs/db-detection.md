@@ -520,7 +520,10 @@ its snapshot, so such a source is read from the snapshot only with
 read's (B229). The capture is ended after the read on every outcome; the
 helper ends it if the daemon dies and sweeps it at its own start. No new
 repository-writing path, so no power-cut scenario: the repository sees an
-ordinary file backup. Manual 6.6.
+ordinary file backup. Detection (D0) is told which sources were read from a
+snapshot (`DB_CAP_ATOMIC`, each its own instant), so their databases are
+judged `covered-crash` rather than `uncovered`; a lost lease drops that.
+Manual 6.6.
 
 ### 9.5 The flag explains, and restore prefers the engine copy
 

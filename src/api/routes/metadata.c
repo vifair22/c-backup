@@ -679,8 +679,8 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
      * nothing of snapshot mode (an older desktop app saving its source list)
      * does not silently turn it off.
      */
-    char *snap_path[SOURCES_MAX];
-    int   snap_mode[SOURCES_MAX];
+    char *snap_path[SOURCES_MAX] = { 0 };
+    int   snap_mode[SOURCES_MAX] = { 0 };
     int   n_snap = 0;
     int   snap_given = json_req_has(body, "snapshot");
     size_t n_snap_in = 0;

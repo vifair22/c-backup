@@ -168,15 +168,9 @@ status_t src_snap_begin(const char *const *paths, const int *modes, size_t n,
                 /* Named, the first three and how many (FS1's
                  * /mnt/cache/domains has a child dataset per VM), with
                  * what to do about it. */
-                const cJSON *ms = cJSON_GetObjectItemCaseSensitive(nested, "mounts");
                 int total = (int)cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(nested, "total"));
-                char names[1200] = "";
-                size_t nl = 0;
-                for (int k = 0; k < 3 && k < cJSON_GetArraySize(ms); k++) {
-                    const char *nm = cJSON_GetStringValue(cJSON_GetArrayItem(ms, k));
-                    int w = snprintf(names + nl, sizeof(names) - nl, "%s%s", k ? ", " : "", nm ? nm : "?");
-                    if (w > 0) nl += (size_t)w < sizeof(names) - nl ? (size_t)w : sizeof(names) - nl - 1;
-                }
+                const char *names = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(nested, "names"));
+                if (!names) names = "?";
                 (void)set_reason(p, "%d mount(s) or btrfs subvolume(s) lie below it (%s%s), which its snapshot "
                                  "shows empty. Add each as a source of its own in snapshot mode, or back up "
                                  "with one_filesystem to leave them out, or put this source in warn mode to read "

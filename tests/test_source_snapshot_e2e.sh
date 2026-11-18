@@ -74,6 +74,11 @@ S1="$DS/app"                   # on ZFS
 S2="$POOL/share"               # on btrfs
 S3="$WORK/plain"               # on no snapshot domain
 mkdir -p "$FSTATE" "$S1/cache" "$S1/sub" "$S2" "$S3" "$POOL/system"
+# The helper makes the btrfs snapshot directory 0700 when it is missing, and
+# the deployed daemon reads through it with CAP_DAC_READ_SEARCH (Manual
+# 22.2.2). As root this suite runs the daemon as a plain uid 990 with no
+# capability, so the directory is made here, readable, and the helper keeps it.
+mkdir -p -m 0755 "$SNAPDIR"
 echo v1 > "$S1/db.sqlite"
 echo conf > "$S1/conf"
 echo junk > "$S1/cache/junk"
