@@ -88,13 +88,19 @@ static int put_map(const char *file, const char *text)
     return n == (ssize_t)strlen(text) ? 0 : -1;
 }
 
-/* A user namespace mapping our uid to 0, with a mount namespace of its own,
- * so overlay mounts need no privilege and vanish with the process. Must run
- * before any thread starts. */
+/* A mount namespace of its own, so overlay mounts vanish with the process;
+ * for a non-root user, inside a user namespace mapping it to 0, so they need
+ * no privilege. Root (the real-engines sibling) needs no user namespace and
+ * stays out of one: there, a new one made the setup's files unusable. Must
+ * run before any thread starts. */
 static int enter_namespaces(void)
 {
     uid_t uid = getuid();
     gid_t gid = getgid();
+    if (geteuid() == 0) {
+        if (unshare(CLONE_NEWNS) != 0) return -1;
+        return mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    }
     if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) return -1;
     char m[64];
     snprintf(m, sizeof(m), "0 %u 1", (unsigned)uid);
