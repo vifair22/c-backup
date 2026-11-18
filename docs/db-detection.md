@@ -1,7 +1,7 @@
 # Database detection and consistent capture
 
-Design document, being built in phases (section 8): D0 is built; section
-14 records what it settled. It replaces one-off,
+Design document, being built in phases (section 8): D0 and D1 are built;
+section 14 records what they settled. It replaces one-off,
 per-application hook decisions (such as an Immich `pg_dumpall`) with a
 general mechanism. c-backup recognises live databases in what it backs up,
 judges whether the capture it is already making covers them consistently,
@@ -709,3 +709,25 @@ design left open or sketched differently:
 | Suggestions | Names from section 6 and 7.2; for file sources, `sqlite-backup` (the daemon's copy, 9.2) or `source-snapshot` (9.4) |
 | Deferred to D1 | `hint` confidence and the Nextcloud link need `units.describe`'s image, arguments and other units' names; D0 reports Nextcloud's `dbtype` only |
 | Test fixtures | Built by `tests/test_db_detect.c` into scratch, not committed under `tests/fixtures/db/`: half are binary headers, which read better as the bytes they are |
+
+### 14.2 D1
+
+`units.probe` is in the helper (`src/helper/proc_probe.c`, the Docker, LXC
+and fake backends, `src/providers/unit_probe.c` for the wire shape) and a
+provider operation (`unit_probe`); the detector takes it through
+`db_detect_unit`; `src/api/routes/databases.c` serves the findings and
+`src/units/unit_detect.c` runs detection without a backup. Where the build
+settled something the design left open:
+
+| Point | As built |
+|---|---|
+| Image and names | Come with the probe, per container, beside its processes: the daemon has the inspect only inside a capture session (the blob is passed with `capture.begin`'s describe), and a detection run has no session. The helper reads the same inspect. A probe that fails therefore costs the hints as well as the liveness, which principle 5 allows |
+| When the probe runs | Once per unit in a backup, after describe and before `capture.begin`: it never lengthens a pause, and the processes it sees are the ones that wrote what the capture then reads |
+| Process liveness | Every finding of the process's engine in the unit, until a process of that engine is seen holding files of one of them; then only those it holds, so `pgdata.bak/` beside a live cluster stays `dormant` (section 4). Library engines (SQLite, LMDB, LevelDB, RocksDB, bbolt) take liveness only from an open file |
+| Hints | One finding per engine, path `""`, evidence listing every image, port and process that suggested it and a `note`. An engine process with no signature makes a hint too (data on an excluded path is what a hint is for). Port 9000 is not a ClickHouse hint: php-fpm and MinIO use it as often |
+| Elasticsearch process | `java` with `elasticsearch` or `opensearch` in its first 256 bytes of arguments (the install path, `-Des.` properties): the bootstrap class sits at the end of the command line, past what the probe keeps |
+| InfluxDB | A process or port fits both versions and is liveness for either; a hint from them names `influxdb2`, an image tag `1*` names `influxdb1` |
+| Nextcloud link | The `dbhost` is read with the dbtype's fixed pattern into the detector (the head code has no room for it); a `config.php` the cache vouched for is re-read once, 16 KiB, through its tree's read root. Resolved in the container (localhost, loopback, socket), then the unit (container names, compose service, network aliases, from the probe), then the repository's other units by the `unit_names` their PostgreSQL and MySQL findings record. Across units it is `consistent` only within one `capture.group`, otherwise suggested `group-units` (container-backup.md 6.2) |
+| Findings detail | Migration 012 adds `coverage_why`, `method` and `optional` to `db_findings`, so the API answers a finding as the job result gave it |
+| Detection run | `POST /repos/<id>/units/<p>/<u>/detect` is a repo job (never beside a backup of the same repository), scans each tree at its host path as pause-read's first pass does, through `open_scanned`, and judges coverage against the capture the next backup would make. It records with `db_findings_record_detect`: `last_snap_id` kept, its own rows told by `last_seen`, no alert (the coverage is a prediction; the next backup alerts). It fills `file_cache.db_head` only for rows whose size, mtime and ctime still match |
+| UI | The app has no unit pages and no sources page; the Databases view is reached from the repository dashboard and grouped by scope, with Detect now on each unit, and the backup dialog marks sources with uncovered findings. The card leaves an empty actions area for D2 |
