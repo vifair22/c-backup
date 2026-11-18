@@ -225,46 +225,28 @@ static char *with_skipped(const char *base, const backup_result_t *res)
  * (B118) or kept files that never settled (OWN-45-LIVE). Empty when it did
  * neither: a clean backup journals no message and alerts nobody.
  */
-void routes_backup_describe_doubts(const backup_result_t *res, char *summary,
-                                   size_t ssz, char *warning, size_t wsz)
+void routes_backup_describe_doubts(const backup_result_t *res, char *warning, size_t wsz)
 {
-    char skip_s[PATH_MAX * 2 + 128] = "", skip_w[PATH_MAX * 2 + 160] = "";
-    char uns_s[PATH_MAX + 128] = "", uns_w[PATH_MAX + 192] = "";
-    if (res->files_skipped && res->skipped_listed) {
-        snprintf(skip_s, sizeof(skip_s), "%llu skipped (not in the snapshot); first: %s: %s",
-                 (unsigned long long)res->files_skipped,
-                 res->skipped[0].path, res->skipped[0].reason);
+    char skip_w[PATH_MAX * 2 + 160] = "";
+    char uns_w[PATH_MAX + 192] = "";
+    if (res->files_skipped && res->skipped_listed)
         snprintf(skip_w, sizeof(skip_w), "%llu file(s) could not be read and are not "
                  "in snapshot %lld; first: %s: %s",
                  (unsigned long long)res->files_skipped, (long long)res->snapshot_id,
                  res->skipped[0].path, res->skipped[0].reason);
-    } else if (res->files_skipped) {
-        snprintf(skip_s, sizeof(skip_s), "%llu skipped (not in the snapshot); see the log",
-                 (unsigned long long)res->files_skipped);
+    else if (res->files_skipped)
         snprintf(skip_w, sizeof(skip_w), "%llu file(s) could not be read and are not "
                  "in snapshot %lld; see the log",
                  (unsigned long long)res->files_skipped, (long long)res->snapshot_id);
-    }
-    if (res->changed_unsettled && res->unsettled_listed) {
-        snprintf(uns_s, sizeof(uns_s), "%llu stored while still changing (may be "
-                 "torn); first: %s",
-                 (unsigned long long)res->changed_unsettled, res->unsettled[0]);
+    if (res->changed_unsettled && res->unsettled_listed)
         snprintf(uns_w, sizeof(uns_w), "%llu file(s) were still changing and are in "
                  "snapshot %lld as read, flagged as possibly torn; first: %s",
                  (unsigned long long)res->changed_unsettled, (long long)res->snapshot_id,
                  res->unsettled[0]);
-    } else if (res->changed_unsettled) {
-        snprintf(uns_s, sizeof(uns_s), "%llu stored while still changing (may be "
-                 "torn); see the log", (unsigned long long)res->changed_unsettled);
+    else if (res->changed_unsettled)
         snprintf(uns_w, sizeof(uns_w), "%llu file(s) were still changing and are in "
                  "snapshot %lld as read, flagged as possibly torn; see the log",
                  (unsigned long long)res->changed_unsettled, (long long)res->snapshot_id);
-    }
-    summary[0] = warning[0] = '\0';
-    if (!skip_s[0] && !uns_s[0]) return;
-    snprintf(summary, ssz, "snapshot %lld: %llu files, %s%s%s",
-             (long long)res->snapshot_id, (unsigned long long)res->files,
-             skip_s, skip_s[0] && uns_s[0] ? "; " : "", uns_s);
     snprintf(warning, wsz, "%s%s%s", skip_w, skip_w[0] && uns_w[0] ? "; " : "", uns_w);
 }
 
@@ -411,15 +393,19 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
          * not only in a job row deleted after 30 days. And alerted, through
          * the failure path at warning level: the job did what it could and
          * stays completed. A clean backup journals no message, as always. */
-        char *summary = malloc(PATH_MAX * 4);
         char *warning = malloc(PATH_MAX * 4);
-        if (summary && warning) {
-            routes_backup_describe_doubts(&res, summary, PATH_MAX * 4,
-                                          warning, PATH_MAX * 4);
-            if (summary[0]) job_set_summary(progress_ctx, summary);
-            if (warning[0]) job_set_warning(progress_ctx, warning);
+        if (warning) {
+            routes_backup_describe_doubts(&res, warning, PATH_MAX * 4);
+            if (warning[0]) {
+                /* The job manager journals the warning after the summary,
+                 * so the summary is only what the snapshot holds. */
+                char summary[96];
+                snprintf(summary, sizeof(summary), "snapshot %lld: %llu files",
+                         (long long)res.snapshot_id, (unsigned long long)res.files);
+                job_set_summary(progress_ctx, summary);
+                job_set_warning(progress_ctx, warning);
+            }
         }
-        free(summary);
         free(warning);
     }
     backup_result_free(&res);

@@ -164,6 +164,8 @@ contains "repo show" '"uuid"' "$(cb repo show 1)"
 # nothing to poll and the assertion is on the outcome rather than on the
 # daemon having accepted the request.
 contains "backup waits and completes" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
+contains "a clean backup journals success" '"operation":"backup","result":"success"' \
+    "$(cb journal 1 --limit 1)"
 contains "jobs list"     '"action"'            "$(cb jobs)"
 contains "snapshots"     '"id":1,'             "$(cb snapshots 1)"
 contains "ls"            '"name"'              "$(cb ls 1 1)"
@@ -414,6 +416,23 @@ contains "and the refusal says where it is" 'already on snapshot 1' "$OUT"
 contains "--move moves it" '"ok"' "$(cb tag set 1 pinned 2 --move)"
 contains "to the new snapshot" '"snap_id":2' "$(cb tag list 1)"
 cb tag remove 1 pinned > /dev/null
+
+# A backup that leaves a file out completes, and journals "warning" with the
+# file, not "success": the job row goes after 30 days, the journal stays.
+# Root reads anything, so the unreadable file only works unprivileged.
+if [ "$(id -u)" -ne 0 ]; then
+    mkdir -p "$WORK/warnsrc"
+    echo "fine"   > "$WORK/warnsrc/fine.txt"
+    echo "secret" > "$WORK/warnsrc/secret.txt"
+    chmod 000 "$WORK/warnsrc/secret.txt"
+    contains "a backup with a skipped file completes" '"state":"completed"' \
+        "$(cb backup 1 "$WORK/warnsrc")"
+    OUT=$(cb journal 1 --result warning --limit 1)
+    contains "and journals a warning" '"operation":"backup","result":"warning"' "$OUT"
+    contains "naming the file" "could not be read and are not in snapshot" "$OUT"
+    contains "and which one" "warnsrc/secret.txt" "$OUT"
+    chmod 600 "$WORK/warnsrc/secret.txt"
+fi
 
 # Exclusions have to work from the CLI too, which is where anyone would
 # actually type them.

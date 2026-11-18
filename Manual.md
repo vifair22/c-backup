@@ -868,8 +868,9 @@ silently:
   each with its path and reason (`docs/api.md`);
 - a warning alert goes out through the failure-alert path, the log line
   and Pushover when configured (section 16.3);
-- the journal entry, the permanent record, reads `snapshot 12: 50 files, 1
-  skipped (not in the snapshot); first: /data/x: ...`.
+- the journal entry, the permanent record, has result `warning` rather
+  than `success` and reads `snapshot 12: 50 files; warning: 1 file(s) could
+  not be read and are not in snapshot 12; first: /data/x: ...`.
 
 Skipping is for the source's faults only. A write to the repository that
 fails - a full disk, an I/O error, a failed sync or close - fails the whole
@@ -916,8 +917,9 @@ A flagged file is reported everywhere it can be met:
 
 - the backup logs a `WARN` line for it, counts it in the job `result` as
   `changed_unsettled` with the first 100 in `unsettled` (each
-  `{"path"}`), journals `snapshot 12: 50 files, 1 stored while still
-  changing (may be torn); first: /data/db.sqlite`, and sends a warning
+  `{"path"}`), journals result `warning` with `snapshot 12: 50 files;
+  warning: 1 file(s) were still changing and are in snapshot 12 as read,
+  flagged as possibly torn; first: /data/db.sqlite`, and sends a warning
   alert, the same way as for skipped files (section 16.3);
 - browse and search show `"may_be_torn": true` on its entry, in the API and
   in `c-backup ls` and `c-backup search`;
@@ -1709,9 +1711,17 @@ permanent record of what ran and how it ended. A journal entry's `source`
 says who asked: `api` for a job run by hand (the CLI and the app both go
 through the API), `schedule` for one a schedule fired, with the message
 starting `schedule <id>`. Its `result` is how a job ended (`success`,
-`failed`, `cancelled`) or an advisory written beside one (`warning`, for an
-unconfirmed key escrow, a plaintext replica or a unit definition that needs
-attention; `alert`, for a missing pack). `journal --result` filters on
+`failed`, `cancelled`, or `warning` for a job that completed but raised
+warnings) or an advisory written beside one (`warning`, for an unconfirmed
+key escrow, a plaintext replica or a unit definition that needs attention;
+`alert`, for a missing pack). A job's `warning` entry has the job's action
+as its operation, its job state stays `completed`, and its message is the
+job's summary followed by the warnings: `warning: <text>` for one, `N
+warnings: <a>; <b>` for more, each cut at 1 KiB and all of them at 2 KiB
+with the rest counted (`(and N more)`). Skipped or possibly torn files, a
+unit the watchdog released, a unit backup's pause scope it could not
+honour and a session that could not be ended all journal this way, since
+the job and its `result` are deleted after 30 days. `journal --result` filters on
 exactly those five and refuses anything else, so a misspelt filter is an
 error rather than an empty history. The journal is newest first and pages
 with `--limit` (default 100, at most 1000) and `--offset`.

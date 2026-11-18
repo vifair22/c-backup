@@ -195,8 +195,14 @@ int64_t job_progress_id(void *progress_ctx);
  * `completed`, and the warning is not its error; but it goes out through
  * the alert path a failure uses, a WARN log line and a push notification
  * when Pushover is configured, so nobody has to open the job's result to
- * find it. Ignored for a job that fails or is cancelled: that one alerts as
- * a failure or not at all. The text is copied.
+ * find it. And it is journalled: the job's entry says "warning" rather than
+ * "success", with the warnings after its summary, since the job row is
+ * deleted after 30 days and the journal is the permanent record.
+ *
+ * Call it once per warning; they accumulate, "N warnings: a; b", bounded
+ * (each at 1 KiB, all at 2 KiB, the rest counted). Ignored for a job that
+ * fails or is cancelled: that one alerts as a failure or not at all. The
+ * text is copied.
  */
 void job_set_warning(void *progress_ctx, const char *text);
 

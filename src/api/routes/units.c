@@ -862,7 +862,6 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
 
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = root ? cJSON_AddArrayToObject(root, "units") : NULL;
-    char warn[600] = "";
     for (size_t i = 0; arr && i < res.n; i++) {
         const unit_backup_one_t *u = &res.units[i];
         cJSON *x = cJSON_CreateObject();
@@ -880,10 +879,7 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
         } else {
             cJSON_AddStringToObject(x, "error", u->error);
         }
-        if (u->warning[0]) {
-            cJSON_AddStringToObject(x, "warning", u->warning);
-            if (!warn[0]) snprintf(warn, sizeof(warn), "unit %.80s: %.500s", u->name, u->warning);
-        }
+        if (u->warning[0]) cJSON_AddStringToObject(x, "warning", u->warning);
     }
     if (root) {
         cJSON_AddNumberToObject(root, "ok", (double)res.ok);
@@ -898,10 +894,23 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
     snprintf(summary, sizeof(summary), "%s: %zu unit(s) backed up, %zu failed, %zu left out "
              "by units.allow", j->provider, res.ok, res.failed, res.filtered);
     job_set_summary(progress_ctx, summary);
-    if (!warn[0] && res.scope_note[0]) snprintf(warn, sizeof(warn), "%s", res.scope_note);
-    /* A hold that cannot be released outranks a unit's own warning. */
+    /* Every warning, each unit's included: they are journalled with the
+     * job, and the journal outlives the job's result. A hold that cannot be
+     * released outranks a unit's own warning, so it comes first. A unit's
+     * further warnings are in its snapshot's unit.json; the count says so. */
     if (res.warning[0]) job_set_warning(progress_ctx, res.warning);
-    else if (warn[0]) job_set_warning(progress_ctx, warn);
+    for (size_t i = 0; i < res.n; i++) {
+        const unit_backup_one_t *u = &res.units[i];
+        if (!u->warning[0]) continue;
+        char w[900];
+        if (u->n_warnings > 1)
+            snprintf(w, sizeof(w), "unit %.80s: %.500s (and %u more in its unit.json)",
+                     u->name, u->warning, u->n_warnings - 1);
+        else
+            snprintf(w, sizeof(w), "unit %.80s: %.500s", u->name, u->warning);
+        job_set_warning(progress_ctx, w);
+    }
+    if (res.scope_note[0]) job_set_warning(progress_ctx, res.scope_note);
     unit_backup_result_free(&res);
     store_index_free(idx);
     store_close(store);
