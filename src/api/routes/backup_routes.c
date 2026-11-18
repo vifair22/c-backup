@@ -6,6 +6,7 @@
 #include "json_row.h"
 
 #include "backup.h"
+#include "db_capture.h"
 #include "db_findings.h"
 #include "file_cache.h"
 #include "job_manager.h"
@@ -157,8 +158,13 @@ static void backup_job_free(void *p)
  * count. Paths go through cJSON because, unlike every other field here,
  * they are not numbers. Returns a malloc'd document, or NULL.
  */
-/* A JSON array, printed: the paths alone, or {"path"} objects. */
-static char *paths_json(char *const *paths, uint32_t n, int as_objects)
+/* Why an unsettled file is what it is, when it is a detected database
+ * (db-detection.md 9.5): 1 and the sentence in buf. */
+typedef int (*why_fn)(void *ctx, const char *path, char *buf, size_t sz);
+
+/* A JSON array, printed: the paths alone, or {"path"} objects, with a
+ * "why" from why when it has one. */
+static char *paths_json(char *const *paths, uint32_t n, int as_objects, why_fn why, void *why_ctx)
 {
     cJSON *arr = cJSON_CreateArray();
     if (!arr) return NULL;
@@ -170,6 +176,9 @@ static char *paths_json(char *const *paths, uint32_t n, int as_objects)
                 cJSON_Delete(item);
                 item = NULL;
             }
+            char w[1024];
+            if (item && why && why(why_ctx, paths[i], w, sizeof(w)))
+                cJSON_AddStringToObject(item, "why", w);
         } else {
             item = cJSON_CreateString(paths[i]);
         }
@@ -181,12 +190,13 @@ static char *paths_json(char *const *paths, uint32_t n, int as_objects)
     return out;
 }
 
-static char *with_skipped(const char *base, const backup_result_t *res)
+static char *with_skipped(const char *base, const backup_result_t *res, why_fn why, void *why_ctx)
 {
     /* Changed files (OWN-45) are stored, so they are paths alone; files
-     * that never settled (OWN-45-LIVE) are {"path"} objects. */
-    char *clist = paths_json(res->changed, res->changed_listed, 0);
-    char *ulist = paths_json(res->unsettled, res->unsettled_listed, 1);
+     * that never settled (OWN-45-LIVE) are {"path"} objects, with a "why"
+     * when the file is a detected database (db-detection.md 9.5). */
+    char *clist = paths_json(res->changed, res->changed_listed, 0, NULL, NULL);
+    char *ulist = paths_json(res->unsettled, res->unsettled_listed, 1, why, why_ctx);
 
     cJSON *arr = cJSON_CreateArray();
     char *list = NULL;
@@ -278,8 +288,21 @@ void routes_db_detect_events(cutils_db_t *db, int64_t repo_id, const char *sourc
  * the result's "databases" object. Never fails the backup: anything that
  * goes wrong is logged and the object is left out.
  */
+/* What detection leaves for the result's messages. */
+typedef struct {
+    db_findings_t      *f;
+    int64_t            *ids;
+    const db_captures_t *caps;
+} file_dbs_t;
+
+static int unsettled_why(void *ctx, const char *path, char *buf, size_t sz)
+{
+    const file_dbs_t *x = ctx;
+    return db_unsettled_why(x->f, x->ids, x->caps, path, buf, sz);
+}
+
 static char *file_backup_databases(backup_job_t *j, db_detector_t *d, int64_t snap_id,
-                                   const int *atomic, void *progress_ctx)
+                                   const int *atomic, void *progress_ctx, file_dbs_t *keep)
 {
     if (!d) return NULL;
     size_t n = (size_t)j->n_paths;
@@ -316,9 +339,29 @@ static char *file_backup_databases(backup_job_t *j, db_detector_t *d, int64_t sn
         }
         routes_db_detect_events(j->db, j->repo_id, "backup", NULL, &rr, progress_ctx);
         out = db_findings_json(f, rr.ids);
+        if (out && keep && keep->caps) {
+            /* ,"captures":[...] inside the databases object. */
+            char *cj = db_captures_json(keep->caps);
+            size_t on = strlen(out);
+            char *g = cj ? malloc(on + strlen(cj) + 16) : NULL;
+            if (g && on && out[on - 1] == '}') {
+                snprintf(g, on + strlen(cj) + 16, "%.*s,\"captures\":%s}", (int)(on - 1), out, cj);
+                free(out);
+                out = g;
+            } else {
+                free(g);
+            }
+            free(cj);
+        }
+        if (keep) {
+            keep->f = f;
+            keep->ids = rr.ids;
+            rr.ids = NULL;
+            f = NULL;
+        }
         db_record_result_free(&rr);
-        if (f->n)
-            log_info("backup: %zu database finding(s) in snapshot %lld", f->n, (long long)snap_id);
+        if (keep && keep->f && keep->f->n)
+            log_info("backup: %zu database finding(s) in snapshot %lld", keep->f->n, (long long)snap_id);
     }
     db_findings_free(f);
     for (size_t i = 0; scopes && i < n; i++) free(scopes[i]);
@@ -437,6 +480,15 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
 
 
     o.detect = db_detect_start();
+    /* Engine copies the user enabled (db-detection.md 9.2), made in the
+     * repository's tmp/. */
+    db_captures_t *caps = NULL;
+    {
+        char tmp[PATH_MAX];
+        snprintf(tmp, sizeof(tmp), "%s/tmp", store_root(store));
+        db_captures_plan(j->db, j->repo_id, cpaths, (size_t)j->n_paths, tmp, o.detect, &caps);
+        db_captures_apply(caps, &o);
+    }
 
     /* Sources in snapshot mode (db-detection.md 9.4): read from the
      * helper's snapshot and recorded at their own paths. A strict one that
@@ -450,6 +502,7 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     free(modes);
     if (st != OK) {
         db_detect_free(o.detect);
+        db_captures_free(caps);
         free(cpaths);
         free(cexcl);
         store_index_free(idx);
@@ -471,8 +524,9 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     int *atomic = calloc((size_t)j->n_paths ? (size_t)j->n_paths : 1, sizeof(*atomic));
     for (size_t i = 0; atomic && i < ss.n; i++) atomic[i] = ss.p[i].read_root != NULL && !ss.lease_lost;
     src_snap_end(&ss);
+    file_dbs_t fdb = { NULL, NULL, caps };
     char *dbj = (st == OK && res.snapshot_id > 0)
-              ? file_backup_databases(j, o.detect, res.snapshot_id, atomic, progress_ctx) : NULL;
+              ? file_backup_databases(j, o.detect, res.snapshot_id, atomic, progress_ctx, &fdb) : NULL;
     free(atomic);
     db_detect_free(o.detect);
 
@@ -515,7 +569,7 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)res.files_skipped);
         char *base = NULL;
         if (asprintf(&base, "%s%s", rj, ss_json ? ss_json : "") < 0) base = NULL;
-        char *full = base ? with_databases(with_skipped(base, &res), dbj) : NULL;
+        char *full = base ? with_databases(with_skipped(base, &res, unsettled_why, &fdb), dbj) : NULL;
         free(base);
         if (full) {
             job_set_result(progress_ctx, full);
@@ -558,6 +612,9 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     free(dbj);
     free(ss_json);
     free(ss_warn);
+    db_findings_free(fdb.f);
+    free(fdb.ids);
+    db_captures_free(caps);
 
     free(cpaths);
     free(cexcl);

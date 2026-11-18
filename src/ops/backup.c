@@ -964,6 +964,7 @@ static status_t fpool_store(void *ctx, void *wstate, store_pool_job_t *j)
         .progress_ctx = p->store,
     };
     const scan_entry_t *e = &p->scan->entries[j->index];
+    if (db_detect_is_copied(p->opts->detect, e->path)) o.settle_reads = 1;
     status_t st = settle_store_fd(cp, j->fd, &e->st, &sink, &o, NULL, NULL,
                                   &r->cr, &r->sr);
     /* A failed write is the repository's, whatever the settle made of it. */
@@ -1257,6 +1258,8 @@ static status_t store_file_cdc(pipeline_t *p, batch_t *b, int fd, uint64_t size,
     obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
     cdc_opts_t o;
     sink_begin(p, b, size, &o);
+    if (db_detect_is_copied(p->opts->detect, p->scan->entries[p->file_index].path))
+        o.settle_reads = 1;
     /* The sink writes straight into the pack, so a discarded read needs no
      * undoing: its objects get rows with the next flush, unreferenced, for
      * gc, as a failed file's always have. */
@@ -1386,7 +1389,17 @@ static status_t store_synth_all(pipeline_t *p, int late)
             e->node.size = cr.size;
             e->st.st_size = (off_t)cr.size;
         }
-        if (o->synth_ops->keep && !o->synth_ops->keep(o->synth_ops->ctx, k)) {
+        int keep = o->synth_ops->keep ? o->synth_ops->keep(o->synth_ops->ctx, k) : 1;
+        if (keep < 0) {
+            /* Left out, and the producer says why itself: not a file the
+             * backup could not read. */
+            p->links[i].skipped = 1;
+            memset(e->node.content_hash, 0, OBJECT_HASH_SIZE);
+            batch_open(p, b);
+            st = bsink_flush(p->sink, 0);
+            continue;
+        }
+        if (!keep) {
             skip_file(p, i, "its producer failed after writing it");
             batch_open(p, b);
             st = bsink_flush(p->sink, 0);
@@ -2502,19 +2515,23 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
  */
 static status_t check_sources(const backup_opts_t *opts)
 {
-    /* Synthetic entries live under the unit directory and nowhere else,
-     * and only the unit assembler may ask for them. */
-    if (opts->n_synth && (!opts->unit_snapshot || !opts->synth || !opts->synth_ops ||
-                          !opts->synth_ops->open))
-        return set_error(ERR_INVALID, "synthetic entries are for unit snapshots only");
-    static const char unit_prefix[] = "/" RESERVED_UNIT_DIR "/";
+    /* Synthetic entries live under a reserved directory and nowhere else:
+     * the unit directory, which only the unit assembler may ask for, or the
+     * engine copies' directory of a file backup (db-detection.md 9.3). */
+    if (opts->n_synth && ((!opts->unit_snapshot && !opts->captures) ||
+                          (opts->unit_snapshot && opts->captures) ||
+                          !opts->synth || !opts->synth_ops || !opts->synth_ops->open))
+        return set_error(ERR_INVALID, "synthetic entries are for unit snapshots and "
+                         "engine copies only");
+    const char *rdir = opts->captures ? RESERVED_CAPTURES_DIR : RESERVED_UNIT_DIR;
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "/%s/", rdir);
     for (size_t i = 0; i < opts->n_synth; i++)
         if (!opts->synth[i].path ||
-            strncmp(opts->synth[i].path, unit_prefix, sizeof(unit_prefix) - 1) != 0 ||
+            strncmp(opts->synth[i].path, prefix, strlen(prefix)) != 0 ||
             strstr(opts->synth[i].path, "/../") || strstr(opts->synth[i].path, "/./"))
             return set_error(ERR_INVALID, "synthetic entry %s is not under /%s",
-                             opts->synth[i].path ? opts->synth[i].path : "(null)",
-                             RESERVED_UNIT_DIR);
+                             opts->synth[i].path ? opts->synth[i].path : "(null)", rdir);
 
     for (int i = 0; i < opts->n_paths; i++) {
         const char *rec = opts->paths[i];

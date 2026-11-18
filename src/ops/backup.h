@@ -71,6 +71,8 @@ typedef struct {
      * content whose producer can fail after its bytes are all read: a dump
      * hook that exits non-zero wrote a dump that looks valid and is not.
      * open may also say CDC_SIZE_STREAM, and the size is then what stored.
+     * Below 0 leaves it out uncounted: the caller reports why itself (an
+     * engine copy that could not be made is not an unreadable file).
      */
     int      (*keep)(void *ctx, size_t index);
     /* Optional, asked after open: how to store the entry. NULL: in full. */
@@ -151,6 +153,10 @@ typedef struct {
     /* Only the unit assembler sets this; synthetic entries are refused
      * without it, so nothing else can write /.cbackup-unit. */
     int                  unit_snapshot;
+    /* A file backup's engine copies (db-detection.md 9.3): synthetic
+     * entries under /.cbackup-captures/ instead. Exclusive of
+     * unit_snapshot. */
+    int                  captures;
     /* Called inside the transaction that inserts the snapshot's row, so a
      * derived row (snapshot_units) lands with it or not at all. */
     status_t           (*index_hook)(void *ctx, cutils_db_t *db, int64_t snap_id);
