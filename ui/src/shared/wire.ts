@@ -52,6 +52,14 @@ export interface WireTreeEntry {
   has_children: boolean
 }
 
+/* One page of a directory. index_gen is the generation the entries' ids
+ * belong to, passed back as gen with any of them (docs/api.md, "Node ids
+ * and index generations"). Absent from a daemon older than it. */
+export interface WireTreePage {
+  entries?: WireTreeEntry[]
+  index_gen?: number
+}
+
 export interface WireSearchResult {
   node_id: number
   snap_id: number
@@ -61,6 +69,8 @@ export interface WireSearchResult {
   type: number
   size: number
   hash: string | null
+  /* The generation node_id belongs to; absent from an older daemon. */
+  index_gen?: number
 }
 
 export type WireLocation = 'staged' | 'absent' | 'packed'
@@ -94,6 +104,7 @@ export interface WireObjectRef {
   node_id: number
   name: string
   path: string
+  index_gen?: number
 }
 
 export interface WireObjectLayout {

@@ -27,6 +27,7 @@
 #include "tree_build.h"
 #include "reserved.h"
 #include "db_write.h"
+#include "node_gen.h"
 
 #include <cutils/log.h>
 
@@ -339,13 +340,29 @@ static void note_unsettled(pipeline_t *p, uint32_t i)
     r->unsettled[r->unsettled_listed++] = path;
 }
 
+/*
+ * The stat the file cache keys an entry on: its own, except that a snapshot
+ * read's entry carries the record root's live device in place of the
+ * snapshot's (scan.h, rec_dev). The rows a snapshot read writes then match
+ * a live read of the same files and the reverse, and the device is still
+ * compared, so a row from another filesystem is never trusted (B229).
+ */
+static const struct stat *cache_key_stat(const scan_entry_t *e, struct stat *buf)
+{
+    if (!e->dev_remapped) return &e->st;
+    *buf = e->st;
+    buf->st_dev = e->rec_dev;
+    return buf;
+}
+
 /* The cache row for a stored file, unless it never settled. */
 static void cache_put(pipeline_t *p, uint32_t i)
 {
     if (p->links[i].unsettled) return;
     scan_entry_t *e = &p->scan->entries[i];
     uint64_t _tp = phase_now();
-    file_cache_put(p->db, p->repo_id, e->path, &e->st,
+    struct stat kst;
+    file_cache_put(p->db, p->repo_id, e->path, cache_key_stat(e, &kst),
                    e->node.content_hash, p->cache_stamp);
     phase_add(p->timers, PHASE_CACHE_PUT, _tp);
 }
@@ -1810,11 +1827,21 @@ static status_t store_content_loop(pipeline_t *p)
          */
         uint64_t _tc = phase_now();
         /* Read through a filesystem snapshot: a new device number every
-         * time, the same inodes and times (source-providers.md 4.3). */
+         * time, the same inodes and times (source-providers.md 4.3). An
+         * entry on the snapshot's own device is compared on the record
+         * root's live device (cache_key_stat); one on another device inside
+         * the snapshot (a nested mount, whose number is the capture's too)
+         * is matched without its device, on inode, size and both times.
+         * Whether the live device can be compared is the record root's
+         * filesystem's question: a FUSE share's number changes at every
+         * mount, so there it is not. */
         const char *rpath = e->read_path ? e->read_path : e->path;
+        struct stat kst;
+        const struct stat *key = cache_key_stat(e, &kst);
         unsigned ignore = cache_ignore_for(p, rpath, &e->st) |
-                          (e->read_path ? FILE_CACHE_IGNORE_DEV : 0u);
-        int cache_hit = file_cache_lookup(p->db, p->repo_id, e->path, &e->st,
+                          (e->read_path && !e->dev_remapped ? FILE_CACHE_IGNORE_DEV : 0u) |
+                          (e->dev_remapped ? cache_ignore_for(p, e->path, key) & FILE_CACHE_IGNORE_DEV : 0u);
+        int cache_hit = file_cache_lookup(p->db, p->repo_id, e->path, key,
                                           ignore, e->node.content_hash);
         phase_add(p->timers, PHASE_CACHE_LOOKUP, _tc);
         if (cache_hit) {
@@ -2311,14 +2338,37 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
      * the kind above, so nothing about nodes_materialized changes.
      */
     #define NODE_BATCH 2000
+    /* The rows' generation (node_gen.h), drawn before the first batch so a
+     * failed run burns it, and set ahead of the first row. */
+    int64_t gen = 0;
+    status_t gst = node_gen_alloc(p->db, &gen);
+    if (gst != OK) return gst;
+
     batch_t nb;
     memset(&nb, 0, sizeof(nb));
     p->timers->txn_site = PHASE_COMMIT_INDEX;
     status_t bst = db_txn_begin_bulk(p->db);
     if (bst != OK) return bst;
     db_txn_batch_opened(&nb.rule);
+    if (node_gen_set(p->db, p->repo_id, snap_id, gen) != 0) {
+        db_txn_rollback(p->db);
+        return set_error_wrap(ERR_IO, "index_nodes: cannot record the index generation");
+    }
 
     for (uint32_t i = 0; i < p->count; i++) {
+        /*
+         * The daemon stopping does not wait for the index (B218): on a large
+         * tree it takes minutes, and Docker kills a stop after 10 s. The
+         * record is written, so this is the state a power cut here leaves,
+         * which the caller reports (B195) and the next start's reconcile
+         * indexes. A user's cancel still lets the index finish: the
+         * snapshot is done, and cancelling now would only make it slower to
+         * browse.
+         */
+        if (shutdown_requested(p->opts ? p->opts->cancel : NULL)) {
+            db_txn_rollback(p->db);
+            return set_error(ERR_BUSY, "backup cancelled: the daemon is stopping");
+        }
         /* In no tree, so in no index row either: the index is derived from
          * the trees, and a reindex would not bring it back. */
         if (p->links[i].skipped) continue;

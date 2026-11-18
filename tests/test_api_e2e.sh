@@ -443,6 +443,7 @@ check "commits are counted" "yes" "$([ "${COMMITS:-0}" -gt 0 ] && echo yes || ec
 for name in 'cbackup_db_txn_wait_seconds_total{queue="priority"}' cbackup_db_txn_commit_seconds_total \
             cbackup_db_txn_commit_frames_total 'cbackup_checkpoint_rounds_total{locked="yes"}' \
             cbackup_checkpoint_lock_seconds_total cbackup_checkpoint_lock_max_seconds \
+            cbackup_checkpoint_lock_wait_seconds_total cbackup_checkpoint_lock_wait_max_seconds \
             cbackup_checkpoint_frames_copied_total cbackup_checkpoint_throttle_waits_total \
             cbackup_checkpoint_throttle_timeouts_total cbackup_checkpoint_throttle_seconds_total \
             cbackup_wal_frames_max; do
@@ -1172,6 +1173,68 @@ well_formed "gc job body is well formed" "$(sock_body "/jobs/$GC_JOB")"
 well_formed "job list is well formed"    "$(sock_body /jobs)"
 sleep 1
 contains "journal readable" 'entries' "$(sock_body /repos/1/journal)"
+
+# Node ids are index handles that a reindex renumbers, so every response
+# with node ids carries the snapshot's index generation, and a node id passed
+# back with a stale one is refused rather than read as whatever now has that
+# id (node_gen.h). Without gen, the route behaves as it always did.
+echo "node index generations"
+for j in $(sock_body '/jobs?limit=50' | grep -o '"id":[0-9]*' | sed 's/"id"://'); do
+    wait_job "$j"   # nothing else holding repo 1 while the reindex below runs
+done
+NG_S=$(sock_body '/repos/1/snapshots?limit=1' | grep -oE '"id":[0-9]+' | head -1 | tr -dc '0-9')
+gen_of() { printf '%s' "$1" | sed -n 's/.*"index_gen":\([0-9]*\).*/\1/p'; }
+first_dir() { printf '%s' "$1" | grep -o '"id":[0-9]*,"name":"[^"]*","type":2' \
+                  | head -1 | sed 's/"id":\([0-9]*\).*/\1/'; }
+NG_T1=$(sock_body "/repos/1/snapshots/$NG_S/tree?parent=0")
+NG_G1=$(gen_of "$NG_T1")
+NG_D1=$(first_dir "$NG_T1")
+check "a tree page carries its index generation" 1 \
+    "$([ -n "$NG_G1" ] && [ "$NG_G1" -gt 0 ] && echo 1 || echo 0)"
+check "a node id passed back with its generation is served" 200 \
+    "$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1&gen=$NG_G1")"
+NG_SUB1=$(sock_body "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1")
+contains "a search result carries its generation" "\"index_gen\":$NG_G1" \
+    "$(sock_body "/repos/1/search?q=txt&snapshot=$NG_S")"
+contains "an object reference carries its generation" '"index_gen":' \
+    "$(sock_body "/repos/1/objects/$OBJ/refs")"
+NG_GJ=$(job_id "$(sock_send POST /repos/1/grep "{\"pattern\":\".\",\"snapshot\":$NG_S}")")
+wait_job "$NG_GJ"
+NG_RUN=$(sock_body '/repos/1/grep?limit=1' | grep -o '"id":[0-9]*' | head -1 | sed 's/"id"://')
+NG_HITS=$(sock_body "/repos/1/grep/$NG_RUN")
+contains "grep hits carry the generation they were read in" "\"index_gen\":$NG_G1" "$NG_HITS"
+contains "and name a node" '"node_id":' "$NG_HITS"
+check "a gen that is not a number is a 400" 400 \
+    "$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1&gen=x")"
+
+NG_RX=$(job_id "$(sock_send POST /repos/1/reindex)")
+wait_job "$NG_RX"
+contains "the reindex completes" '"state":"completed"' "$(sock_body "/jobs/$NG_RX")"
+NG_T2=$(sock_body "/repos/1/snapshots/$NG_S/tree?parent=0")
+NG_G2=$(gen_of "$NG_T2")
+NG_D2=$(first_dir "$NG_T2")
+check "the reindex gave the snapshot a new generation" 1 \
+    "$([ -n "$NG_G2" ] && [ "$NG_G2" != "$NG_G1" ] && echo 1 || echo 0)"
+check "and renumbered its nodes" 1 "$([ "$NG_D2" != "$NG_D1" ] && echo 1 || echo 0)"
+check "a node id with the old generation is refused" 409 \
+    "$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1&gen=$NG_G1")"
+contains "telling the client to re-resolve" '"error":"index rebuilt; re-resolve by path"' \
+    "$(sock_body "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1&gen=$NG_G1")"
+check "so is the root with the old generation" 409 \
+    "$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=0&gen=$NG_G1")"
+NG_OLD=$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1")
+check "without gen the old id is answered as before, never 409" 1 \
+    "$([ "$NG_OLD" = 200 ] || [ "$NG_OLD" = 404 ] && echo 1 || echo 0)"
+check "the new id with the new generation is served" 200 \
+    "$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=$NG_D2&gen=$NG_G2")"
+NG_SUB2=$(sock_body "/repos/1/snapshots/$NG_S/tree?parent=$NG_D2&gen=$NG_G2")
+check "and lists what the old id listed" \
+    "$(printf '%s' "$NG_SUB1" | grep -o '"name":"[^"]*"' | tr '\n' ' ')" \
+    "$(printf '%s' "$NG_SUB2" | grep -o '"name":"[^"]*"' | tr '\n' ' ')"
+contains "a search names the new generation" "\"index_gen\":$NG_G2" \
+    "$(sock_body "/repos/1/search?q=txt&snapshot=$NG_S")"
+contains "an earlier grep run keeps the generation it read" "\"index_gen\":$NG_G1" \
+    "$(sock_body "/repos/1/grep/$NG_RUN")"
 
 # Exclusions reach the engine only if the route parses them. It did not: the
 # field looked accepted and was ignored, so every backup took the whole tree.

@@ -434,7 +434,7 @@ applied (`label_updated: true`); an absent or empty one leaves it alone.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/repos/<id>/snapshots` | List, paged |
-| GET | `/repos/<id>/snapshots/<sid>/tree?parent=<node>` | One directory level |
+| GET | `/repos/<id>/snapshots/<sid>/tree?parent=<node>[&gen=<n>]` | One directory level; `index_gen` with the entries |
 | GET | `/repos/<id>/search?q=<text>[&snapshot=<sid>]` | Substring filename search |
 | DELETE | `/repos/<id>/snapshots/<sid>[?force=1]` | Delete one snapshot, synchronously; `{"removed":true,"id","tags_removed"}` |
 
@@ -461,7 +461,9 @@ snapshot of any year. A snapshot no tier elected shows 0, tagged or not.
 back in before it can be browsed.
 
 A tree entry is `{id, name, type, mode, size, mtime, mtime_nsec, hash,
-has_children, may_be_torn}`. `id` is the node id to pass back as `parent`.
+has_children, may_be_torn}`. `id` is the node id to pass back as `parent`,
+with the page's `index_gen` as `gen` (see Node ids and index generations
+below).
 `may_be_torn` is `true` for a file that was still changing on the backup's
 second read and was stored as that read found it (Manual section 6.3): its
 bytes may mix two versions of the file. It is `false` for everything else,
@@ -487,6 +489,46 @@ The same codes are `type` in search results. Object `type` (in `stats`,
 3 ACL, 5 manifest tree (a directory or one fragment of one), 6 chunk list.
 4 was the sparse-file type of format 2 and is never reused.
 
+### Node ids and index generations
+
+A node id is a handle into the daemon's index, not a name for a file. It is
+stable only within one index generation of its snapshot: a reindex of the
+snapshot (`POST /repos/<id>/reindex`), a gap filled at start, or a cold
+snapshot faulted back in rebuilds the snapshot's rows and numbers them
+afresh, so after one an id a client kept can name nothing or, worse, a
+different file of the same snapshot. Each snapshot's rows therefore carry a
+generation, an integer that changes on every rebuild and is never reused
+for that snapshot (nor any other: one sequence serves every repository, and
+a rebuild that fails burns its value rather than handing it out again).
+Deleting the snapshot removes it. A stable node id is a 1.1 candidate.
+
+Every response that carries node ids carries the generation they belong to:
+
+| Route | Node ids | Generation |
+|---|---|---|
+| `GET /repos/<id>/snapshots/<sid>/tree` | `entries[].id` | top-level `index_gen` |
+| `GET /repos/<id>/search` | `results[].node_id` | `results[].index_gen`, per result, since results span snapshots |
+| `GET /repos/<id>/objects/<hash>/refs` | `refs[].node_id` | `refs[].index_gen` |
+| `GET /repos/<id>/grep/<run-id>` | `hits[].node_id` | top-level `index_gen`, recorded when the run started; `null` for a run older than the field |
+
+The one route that takes a node id, `tree?parent=`, also takes the
+generation back as `gen`. When it is passed and is not the snapshot's
+current generation the answer is `409 {"error":"index rebuilt; re-resolve by
+path"}`, whatever the parent (the root, `parent=0`, included): the client
+should resolve the path it was showing again from the root, one component
+at a time, and continue with the ids and generation that gives it. Without
+`gen` the route behaves exactly as before, so an old client is not broken
+by this, only unprotected. `gen` other than a non-negative integer is a
+400. A snapshot never indexed reports 0.
+
+The generation and the rows of one response are read so that they agree:
+a page whose rows changed under it is read again, and after repeated
+rebuilds mid-read the route answers `503` rather than label ids with the
+wrong generation. A request made while a rebuild of that snapshot is
+running can still see the directory partly filled or missing (a 404 for a
+parent the rebuild has not reached yet), as it always could; its ids are
+labelled with the new generation and stay valid once the rebuild ends.
+
 Search goes through an FTS5 trigram index. A B-tree cannot serve
 `LIKE '%needle%'`, and scanning the node table loses to the pre-rewrite
 implementation by 2.7x; the trigram index wins by 50.9x.
@@ -499,7 +541,8 @@ pack and a clean scrub look like.
 
 Without `snapshot`, every snapshot is searched and identical copies are
 collapsed: one result per (path, content hash), carrying the newest
-snapshot it was seen in (`snap_id`, `node_id`) and how many snapshots hold
+snapshot it was seen in (`snap_id`, `node_id`, and that snapshot's
+`index_gen`) and how many snapshots hold
 it (`snapshots`). A file unchanged across thirty snapshots used to come back
 thirty times. A file whose content changed is a different hash and a
 separate result, so the versions of a file stay visible. To keep a page
@@ -786,7 +829,9 @@ in that backup", and the second silently searched the newest instead.
 
 The hits outlive the job, so they are fetched separately: `GET
 /repos/<id>/grep` lists runs newest-first and `GET /repos/<id>/grep/<run-id>`
-returns the hits. `c-backup grep` does all three steps and prints the
+returns the hits, `{path, line, excerpt, node_id}` each, with the
+`index_gen` their node ids belong to (see Node ids and index generations).
+`c-backup grep` does all three steps and prints the
 matches, so it feels like `grep(1)` despite the work happening elsewhere.
 
 Verify is the answer to "is the backup still good", which is a different
@@ -1278,7 +1323,7 @@ header_size`, which equals `phys_size`. An object that reports `phys_size`
 
 | GET | `/repos/<id>/objects` | Paginated; `?location=staged`, `?location=pack` (or `packed`), or `?location=all` |
 | GET | `/repos/<id>/objects/<hash>` | Where one object lives |
-| GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it; `limit` (default 500, at most 5000) and `offset` |
+| GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it, `{snap_id, node_id, name, path, index_gen}` each (`index_gen` as under Node ids and index generations); `limit` (default 500, at most 5000) and `offset` |
 | GET | `/repos/<id>/objects/<hash>/layout` | Header fields and on-disk footprint |
 | GET | `/repos/<id>/objects/<hash>/content` | Base64, capped at 2 MiB |
 | GET | `/repos/<id>/packs` | Pack listing with entry counts, by pack number; `limit` (default 500, at most 5000) and `offset` |

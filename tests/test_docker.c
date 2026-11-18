@@ -762,6 +762,7 @@ static void test_define_copy_recorded_type(void **state)
         { "\"recorded_types\":{\"" TR APPS "/web/gone\":\"lnk\"},", "the snapshot records a link" },
         { "\"recorded_types\":{},", "the snapshot's record of it was not given" },
         { "", "the snapshot's record of it was not given" },
+        { "\"recorded_types\":{\"" TR APPS "/web/gone\":\"other\"},", "a type this build does not know" },
     };
     struct stat sb;
     assert_int_not_equal(lstat(APPS "/web/gone", &sb), 0);
@@ -786,7 +787,22 @@ static void test_define_copy_recorded_type(void **state)
         assert_int_equal(fdk.n, n0);
         assert_int_not_equal(lstat(TR APPS "/web/gone", &sb), 0);
     }
+    /* NIT-44: a socket is in the snapshot, so never "no entry": it is
+     * refused for what it is, a path a restore leaves empty. */
+    snprintf(def, sizeof(def), k_gone, "\"recorded_types\":{\"" TR APPS "/web/gone\":\"sock\"},");
+    assert_int_not_equal(be.define_check(be.ctx, "solo", def, &pol), OK);
+    const char *m = err_msg();
+    if (!strstr(m, "a socket, as the snapshot records it, which a restore does not recreate") ||
+        strstr(m, "no entry") || strstr(m, "cannot verify") || !strstr(m, "nothing created") ||
+        !strstr(m, "c-backup restore <repo> <snapshot> <dir> --subpath " APPS "/web/gone"))
+        fail_msg("socket: %s", m);
+    err_clear();
+    assert_int_equal(fdk.n, n0);
+    assert_int_not_equal(lstat(TR APPS "/web/gone", &sb), 0);
+    /* A directory, and a fifo (which a restore recreates), pass. */
     snprintf(def, sizeof(def), k_gone, "\"recorded_types\":{\"" TR APPS "/web/gone\":\"dir\"},");
+    assert_int_equal(be.define_check(be.ctx, "solo", def, &pol), OK);
+    snprintf(def, sizeof(def), k_gone, "\"recorded_types\":{\"" TR APPS "/web/gone\":\"fifo\"},");
     assert_int_equal(be.define_check(be.ctx, "solo", def, &pol), OK);
     assert_int_equal(fdk.n, n0);
 }

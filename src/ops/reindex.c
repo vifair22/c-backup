@@ -16,6 +16,7 @@
 #include "snap_record.h"
 #include "snapshot_ids.h"
 #include "db_write.h"
+#include "node_gen.h"
 #include "pack_ids.h"
 #include "repo.h"
 
@@ -490,6 +491,15 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
         }
     }
 
+    /* The new rows' generation (node_gen.h): drawn and committed before the
+     * rebuild begins, so a rebuild that rolls back burns it. */
+    int64_t gen = 0;
+    st = node_gen_alloc(db, &gen);
+    if (st != OK) {
+        free(label);
+        return st;
+    }
+
     if (db_txn_begin_bulk(db) != OK) {
         free(label);
         return set_error(ERR_IO, "reindex: begin");
@@ -504,6 +514,10 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
         failed = db_write(db,
             "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
+    /* After the old rows go and before the first new one: no reader sees
+     * old ids under the new generation or new ids under the old. */
+    if (!failed)
+        failed = node_gen_set(db, repo_id, snap_id, gen) != 0;
 
     reindex_ctx_t ctx = { store, db, repo_id, snap_id, 0, &res, !has_row, 0, { 0, 0 } };
     if (ctx.batched) db_txn_batch_opened(&ctx.rule);

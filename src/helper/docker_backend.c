@@ -816,7 +816,7 @@ static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, struct sp_s
         if (code == 0) continue;
         failed++;
         log_warn("docker: %s hook %s on %s failed (%d): %s", pre ? "pre" : "post", h->name, unit_id, code, tail);
-        if (info) (void)sp_session_info_warn(info, "hook %s exited %d: %.300s", h->name, code, tail);
+        if (info) (void)sp_session_info_warn(info, "hook %s exited %d: %s", h->name, code, tail);
         if (h->fail_on_error) {
             set_error(ERR_IO, "docker: hook %s on %s exited %d: %.300s", h->name, unit_id, code, tail);
             return -1;
@@ -1046,7 +1046,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
      * pause runs them at release. */
     int pran = 0;
     if (!keep && running && run_hooks(c, unit->unit_id, 0, s, &pran) < 0) {
-        (void)sp_session_info_warn(&s->info, "%.400s", err_msg());
+        (void)sp_session_info_warn(&s->info, "%s", err_msg());
         err_clear();
     }
     s->post_ran = !keep;
@@ -1101,7 +1101,7 @@ static status_t d_release(sp_session_t *s, int *cap_hit)
     }
     int pran = 0;
     if (!s->post_ran && run_hooks(s->c, s->unit, 0, s, &pran) < 0) {
-        (void)sp_session_info_warn(&s->info, "%.400s", err_msg());
+        (void)sp_session_info_warn(&s->info, "%s", err_msg());
         err_clear();
     }
     s->post_ran = 1;
@@ -1349,7 +1349,7 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
         struct sp_session *s = ss[k];
         int pran = 0;
         if (running[k] && run_hooks(c, units[k]->unit_id, 0, s, &pran) < 0) {
-            (void)sp_session_info_warn(&s->info, "%.400s", err_msg());
+            (void)sp_session_info_warn(&s->info, "%s", err_msg());
             err_clear();
         }
         sp_consistency_t lvl;
@@ -1748,7 +1748,19 @@ static int recorded_refusal(const cJSON *rec, const char *src, const char *troot
     const char *t = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(rec, src));
     const char *why = NULL;
     if (t && strcmp(t, "blk") == 0) { fmt_why(out, sz, "a block device, as the snapshot records it"); return 1; }
+    /* A socket is recorded and never restored (the program serving it
+     * makes it), so nothing would be at the path: Docker would make an
+     * empty directory there instead (NIT-44). */
+    if (t && strcmp(t, "sock") == 0) {
+        fmt_why(out, sz, "a socket, as the snapshot records it, which a restore does not recreate (the program "
+                "serving it makes it), so the copy would bind nothing there; restore the files to a path instead "
+                "(c-backup restore <repo> <snapshot> <dir> --subpath %.300s, or c-backup unit restore <repo> "
+                "<snapshot> <dir> for the whole unit) and create the container by hand, with a socket of its own",
+                src + strlen(troot));
+        return 1;
+    }
     if (!t) why = "the snapshot's record of it was not given";
+    else if (strcmp(t, "other") == 0) why = "the snapshot records a type this build does not know";
     else if (strcmp(t, "missing") == 0) why = "the snapshot has no entry for it";
     else if (strcmp(t, "lnk") == 0 || strcmp(t, "link") == 0)
         why = "the snapshot records a link, whose target cannot be judged before it is written";

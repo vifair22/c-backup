@@ -925,8 +925,9 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
     for (size_t i = 0; i < res.n; i++) {
         const unit_backup_one_t *u = &res.units[i];
         for (unsigned k = 0; k < u->n_warnings; k++) {
-            char w[1200];
-            snprintf(w, sizeof(w), "unit %.80s: %.1000s", u->name, u->warnings[k]);
+            /* Whole: job_set_warning cuts one past its bound visibly (B223). */
+            char w[MSG_CLIP_MAX + 100];
+            msg_clip_after(w, sizeof(w), snprintf(w, sizeof(w), "unit %.80s: %s", u->name, u->warnings[k]));
             job_set_warning(progress_ctx, w);
         }
     }

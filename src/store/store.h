@@ -179,6 +179,21 @@ static inline int cancel_requested(atomic_int *flag)
     return flag && atomic_load_explicit(flag, memory_order_relaxed);
 }
 
+/*
+ * What set it (B218). Any nonzero value is a cancel; CANCEL_SHUTDOWN is the
+ * daemon stopping, which cannot wait for work a user's cancel lets finish:
+ * a backup whose snapshot record is already written indexes it to the end
+ * on CANCEL_USER, but stops between index rows on CANCEL_SHUTDOWN and
+ * leaves the record for the next start's reconcile, as a power cut would.
+ */
+#define CANCEL_USER     1
+#define CANCEL_SHUTDOWN 2
+
+static inline int shutdown_requested(atomic_int *flag)
+{
+    return flag && atomic_load_explicit(flag, memory_order_relaxed) == CANCEL_SHUTDOWN;
+}
+
 void store_set_cancel(store_t *st, atomic_int *cancel);
 atomic_int *store_get_cancel(const store_t *st);
 

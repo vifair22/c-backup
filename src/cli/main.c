@@ -25,7 +25,9 @@
 #include "start_advice.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +42,12 @@
 #define DEFAULT_SOCKET "/run/c-backupd/c-backupd.sock"
 
 static const char *g_socket;
+/* --timeout: seconds a command waits for its job; 0 waits until it ends. */
+static long g_wait_timeout;
+
+/* A job outlived --timeout and is still running (B220): its own status,
+ * as timeout(1) gives one, so a script can tell it from a failed job. */
+#define EXIT_WAIT_TIMEOUT 124
 
 static int fail(const char *fmt, ...)
 {
@@ -330,14 +338,27 @@ static int print_with_result(const http_response_t *runs, sbuf_t *path)
     return 0;
 }
 
+static uint64_t mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
 /*
  * Poll until the job reaches a terminal state. Returns 0 if it completed, 1
  * otherwise - and on failure prints the job record, because the daemon puts
  * the reason in its error field and that is the whole point of waiting.
+ *
+ * However long it takes, unless --timeout says otherwise (B220). The wait
+ * used to end after an hour, which a large first backup outlasts: the CLI
+ * gave up and failed while the job went on to complete. With --timeout the
+ * wait ends then, with EXIT_WAIT_TIMEOUT, and the job runs on.
  */
 static int job_wait(long job, int quiet)
 {
-    for (int i = 0; i < 36000; i++) {
+    uint64_t t0 = mono_ms();
+    for (;;) {
         http_response_t jr;
         memset(&jr, 0, sizeof(jr));
         char jpath[64];
@@ -358,10 +379,25 @@ static int job_wait(long job, int quiet)
             return ok ? 0 : 1;
         }
         http_response_free(&jr);
-        struct timespec ts = { 0, 100 * 1000 * 1000 };
+        uint64_t waited = mono_ms() - t0;
+        if (g_wait_timeout > 0 && waited >= (uint64_t)g_wait_timeout * 1000u) {
+            fprintf(stderr, "c-backup: job %ld is still running after --timeout %ld s; it "
+                    "keeps running (follow it with 'c-backup jobs watch %ld', or stop it "
+                    "with 'c-backup jobs cancel %ld')\n", job, g_wait_timeout, job, job);
+            return EXIT_WAIT_TIMEOUT;
+        }
+        /* Every tenth of a second for the first ten, so a short job is
+         * reported at once, then every second: a wait may now last as long
+         * as a backup does, and every poll is a request on the daemon's one
+         * database handle. */
+        long ms = waited < 10000 ? 100 : 1000;
+        if (g_wait_timeout > 0) {
+            uint64_t left = (uint64_t)g_wait_timeout * 1000u - waited;
+            if ((uint64_t)ms > left) ms = (long)left;
+        }
+        struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
         nanosleep(&ts, NULL);
     }
-    return fail("job %ld did not finish within an hour (see 'c-backup jobs %ld')", job, job);
 }
 
 /* Submit and wait, printing the finished job. quiet suppresses the success
@@ -1785,7 +1821,10 @@ static const char *const P_UPOL_SET[] = { "<repo-id>", "<unit>", "<key>", "<valu
 
 #define OPT_LIMIT   { "--limit",   NULL, ARG_VALUE, "N" }
 #define OPT_OFFSET  { "--offset",  NULL, ARG_VALUE, "N" }
-#define OPT_NOWAIT  { "--no-wait", NULL, ARG_FLAG,  NULL }
+/* Every command that waits for a job takes both: not waiting, or waiting at
+ * most so long (B220). */
+#define OPT_NOWAIT  { "--no-wait", NULL, ARG_FLAG,  NULL }, \
+                    { "--timeout", NULL, ARG_VALUE, "SECONDS" }
 #define OPT_DRYRUN  { "--dry-run", NULL, ARG_FLAG,  NULL }
 #define OPT_END     { NULL, NULL, ARG_FLAG, NULL }
 
@@ -1891,7 +1930,8 @@ static const arg_opt_t O_VM_EXPORT[] = { { "--ttl", NULL, ARG_VALUE, "N[s|m|h|d]
 static const arg_opt_t O_PROVIDER[] = { { "--provider", NULL, ARG_REQUIRED, "P" }, OPT_END };
 static const arg_opt_t O_ALL[] = { { "--all", NULL, ARG_FLAG, NULL }, OPT_END };
 static const arg_opt_t O_ACCEPT_MISSING[] = {
-    { "--accept-missing", NULL, ARG_FLAG, NULL }, OPT_END,
+    { "--accept-missing", NULL, ARG_FLAG, NULL },
+    { "--timeout", NULL, ARG_VALUE, "SECONDS" }, OPT_END,
 };
 
 typedef struct {
@@ -2120,6 +2160,30 @@ static int h_help(const args_t *a)
     return 0;
 }
 
+static int spec_takes(const arg_spec_t *spec, const char *name)
+{
+    for (const arg_opt_t *o = spec->opts; o && o->name; o++)
+        if (strcmp(o->name, name) == 0) return 1;
+    return 0;
+}
+
+/* --timeout SECONDS into g_wait_timeout: a whole number of seconds, at
+ * least 1. Not with --no-wait, which does not wait at all. */
+static int wait_timeout(const args_t *a)
+{
+    const char *t = args_value(a, "--timeout");
+    if (!t) return 0;
+    if (spec_takes(a->spec, "--no-wait") && args_flag(a, "--no-wait"))
+        return refuse(a, "--timeout bounds a wait, and --no-wait does not wait");
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(t, &end, 10);
+    if (errno || !end || end == t || *end || v < 1 || v > 31536000)
+        return refuse(a, "--timeout takes whole seconds from 1 to 31536000, not '%s'", t);
+    g_wait_timeout = v;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     g_socket = getenv("C_BACKUP_SOCKET");
@@ -2178,5 +2242,6 @@ int main(int argc, char **argv)
 
     args_t a;
     if (args_parse(&COMMANDS[c].spec, rest - used, rv + used, &a, stderr) != 0) return 1;
+    if (spec_takes(&COMMANDS[c].spec, "--timeout") && wait_timeout(&a) != 0) return 1;
     return COMMANDS[c].fn(&a);
 }

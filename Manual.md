@@ -216,9 +216,35 @@ waiting in the queue are never started: they are recorded `cancelled` with no
 start time, and journalled as "cancelled before it started". A job checks
 for cancellation between files and inside one: storing and restoring a file
 both stop within one object of at most 16 MiB, so a multi-gigabyte file in
-progress does not hold up the shutdown. This takes
-about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
-or SIGINT forces an immediate exit. Run the cancelled job again after the
+progress does not hold up the shutdown. A backup whose snapshot record is
+already written when the stop arrives stops indexing it too: the job ends
+`cancelled`, the log says the snapshot was written and is not yet indexed,
+and the next start's reconcile indexes it (section 17.5). A user's
+`jobs cancel` at that point lets the index finish instead, since the
+snapshot is complete.
+
+The stop is bounded, so that `docker stop`'s 10 second grace is never what
+ends it (B218; a test server's stop once took 53 s and ended in SIGKILL):
+
+- Running jobs get 6 s from the cancel. One still running then is logged
+  by id (`job manager: job N (repo R) did not stop within 6.0 s ...`), and
+  the daemon syncs the database's write-ahead log and exits with status 1
+  at once, as a kill would but saying so: the next start records the job
+  as interrupted. Nothing that has committed is lost.
+- The last copy of the write-ahead log back into `state.db` gets 1 s, and
+  is made only when the log holds at most 4,096 uncopied pages (16 MiB).
+  A larger log, or one the copy cannot finish in time, is left beside
+  `state.db`, synced, and read back by the next start like any log; the
+  log line says which (`state.db: leaving N uncopied WAL frames ... for
+  the next start`). A clean stop with a small log removes `-wal` and
+  `-shm` as before. The close used to copy the whole log, however large,
+  and that was the 53 s.
+- Any step that takes over a second is logged (`shutdown: stopping running
+  jobs took 2.7 s`), and the last line on stderr is `c-backupd stopped in
+  N s`.
+
+A clean stop normally takes a second or two. A second SIGTERM or SIGINT
+forces an immediate exit. Run the cancelled job again after the
 restart; a backup skips what it already stored, a restore skips the files it
 finished and redoes the one it was inside (a stop renames every file the
 restore has verified into place before the job ends, so finished means
@@ -310,6 +336,15 @@ docker run -d --name c-backupd \
   the C library run in UTC: the daemon warns at start and `timezone` reads
   `UTC`. Changing the zone takes effect at the next daemon start.
 - Run the CLI inside the container: `docker exec c-backupd c-backup ...`.
+- **Give it a stop timeout of 30 s**: `docker run --stop-timeout 30`, or
+  `stop_grace_period: 30s` in a compose file (Unraid: `--stop-timeout 30`
+  in Extra Parameters). The daemon bounds its own stop well under Docker's
+  default 10 s (section 2.2), but a stop past the timeout is a SIGKILL,
+  which is a crash: the running job is recorded interrupted rather than
+  cancelled, and on a slow or busy disk the final syncs of the database can
+  take seconds of their own. A failure alert being sent as the daemon
+  stops can add up to 15 s more when Pushover cannot be reached. 30 s
+  covers all of it; a stop that needs it is logged step by step.
 - Override configuration by mounting a file over
   `/etc/c-backupd/config.yaml`; a read-only mount (`:ro`) is fine. Keep the
   file 0600: the daemon warns at start if it is not and cannot fix it.
@@ -757,8 +792,11 @@ sudo c-backup backup 1                     # uses the configured sources
 sudo c-backup backup 1 /home/me/projects   # or name paths for this run
 ```
 
-A backup is a job. The CLI submits it and waits, printing the finished job;
-`--no-wait` returns the job id at once. `c-backup jobs <id>` and
+A backup is a job. The CLI submits it and waits, printing the finished job,
+for as long as the job takes, a first backup of millions of files included.
+`--timeout SECONDS` bounds the wait instead: when it runs out the CLI says
+so on stderr and exits 124, and the job keeps running. `--no-wait` returns
+the job id at once. `c-backup jobs <id>` and
 `c-backup jobs watch <id>` follow it. `watch` prints a line with the job's
 state as soon as it connects, then one per change and at least every 5
 seconds, and exits when the job ends. Each line is one JSON document and
@@ -1184,7 +1222,12 @@ it, and puts back any that libvirt has lost (redefine, with libvirt checking
 the bitmap is present and consistent) when it starts, when the daemon
 starts, and before every backup. A checkpoint that cannot be put back costs
 its disks one full read. If the helper's state directory is lost too, the
-next backup of every VM reads in full.
+next backup of every VM reads in full. At daemon start, the checkpoints of
+a VM the helper no longer lists (deleted, or taken out of its policy) are
+not asked about: their tokens are kept, since the VM can come back, and the
+start-up line counts them (`N of removed units kept`), with one debug line
+per such VM (NIT-45). They used to log a "not in the policy" warning per
+checkpoint at every start.
 
 **Audits.** Every `vm.audit_days`, and whenever an incremental would cost
 too much, a disk is read in full while the dirty bitmap is still asked for:
@@ -1233,6 +1276,16 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
 
 - Every listing pages. No request returns a whole snapshot, which is what
   keeps browsing fast at any size (section 18.4).
+- **A node id is stable only within one index generation.** The `<node-id>`
+  that `ls` takes is a handle into the index, and a reindex of the snapshot
+  (or a gap filled at start) numbers its rows afresh, so an id noted before
+  one can name a different file after it. Every response with node ids
+  carries the snapshot's `index_gen`; a client that passes it back as `gen`
+  gets `409 index rebuilt; re-resolve by path` instead of the wrong
+  directory, and the desktop app does this and re-walks the path it was
+  showing. The CLI takes ids as given, so after a reindex start again from
+  `ls 1 12`. The path is the stable name; a stable node id is a 1.1
+  candidate (docs/api.md, "Node ids and index generations").
 - **Name search** uses a trigram index: substring matches in milliseconds.
   Across all snapshots, a file kept unchanged is one result with a count of
   the snapshots holding it and the newest one's id; a file that changed
@@ -2182,7 +2235,7 @@ daemon as a whole.
 | Route | Meaning |
 |---|---|
 | `/healthz` | The process answers; says `storage_sync: failed` after a failed sync of `state.db`, and counts repositories whose own syncs failed (section 17.7) |
-| `/readyz` | The database is open and its syncs have not failed; the daemon can do work. 200 with `"status":"degraded"` and a list when only repositories' syncs have failed (section 17.7), and 200 with `"status":"degraded"`, `"state_db_checkpoint":"failing"` and the reason in `state_db_checkpoint_error` while `state.db`'s write-ahead log is not being checkpointed (section 18.2) |
+| `/readyz` | The database is open and its syncs have not failed; the daemon can do work. 200 with `"status":"degraded"` and a list when only repositories' syncs have failed (section 17.7), and 200 with `"status":"degraded"`, `"state_db_checkpoint":"failing"` and the reason in `state_db_checkpoint_error` while `state.db`'s write-ahead log is not being checkpointed (section 18.2; `state.db` and its `-wal` and `-shm` being root's, 0600, under `security.run_as_uid` is by design, section 22.2.2, and not the cause) |
 
 Both are public, on the socket and on TCP.
 
@@ -2230,8 +2283,10 @@ the repository).
 | `cbackup_db_txn_commit_seconds_total` | counter | Time spent in COMMIT, writing the log (no sync at `db.synchronous` normal) |
 | `cbackup_db_txn_commit_frames_total` | counter | Log frames (pages) those commits wrote, where measured |
 | `cbackup_checkpoint_rounds_total` | counter | Checkpoint rounds, labelled `locked="no"` (alongside writers) or `locked="yes"` (holding the write lock: past the hard cap, or the short final round that lets the log restart) |
-| `cbackup_checkpoint_lock_seconds_total` | counter | Time locked rounds held the write lock; every writer waits for it |
-| `cbackup_checkpoint_lock_max_seconds` | gauge | The longest single locked round since start |
+| `cbackup_checkpoint_lock_seconds_total` | counter | Time locked rounds held the write lock, from the moment it was granted; every writer waits for it |
+| `cbackup_checkpoint_lock_max_seconds` | gauge | The longest single hold by a locked round since start |
+| `cbackup_checkpoint_lock_wait_seconds_total` | counter | Time locked rounds spent queued for the write lock behind other writers before holding it; not part of the hold, and no writer waits for it |
+| `cbackup_checkpoint_lock_wait_max_seconds` | gauge | The longest single such wait since start |
 | `cbackup_checkpoint_presync_seconds_total` | counter | Time spent writing the log out to disk just before a locked round, without the lock, so the round itself only syncs what arrived since |
 | `cbackup_checkpoint_frames_copied_total` | counter | Log frames copied back into `state.db`; over `cbackup_checkpoint_rounds_total`, frames per round |
 | `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap |
@@ -2327,6 +2382,22 @@ Job 120 (backup) completed with a warning: 1 file(s) were still changing and are
 
 A clean backup sends nothing.
 
+Every job sends at most one notification, whatever it found: counts and the
+first item, never one per file or object.
+
+**Priority.** A job that failed because it found damage nothing can repair
+(status `ERR_CORRUPT`) sends its notification at Pushover priority 1
+(high), which sounds through the recipient's quiet hours. That covers a
+verify that finds unrecoverable or missing data or a pack it cannot walk,
+a gc that copies pack entries damaged beyond parity or cannot walk a pack,
+and a replication that sends objects damaged beyond parity; any other job
+that stops on corrupt repository data (a restore reading a damaged pack,
+say) ends the same way and alerts the same. The status decides it, never
+the wording of the error. Every other notification, other failures and
+all warnings, goes at normal priority (0). Priority 1 needs nothing more
+from Pushover; emergency priority (2), which repeats until acknowledged,
+is not used.
+
 A notification that cannot be delivered is retried for 24 hours unless
 Pushover rejects it outright (a wrong token or user key), in which case it is
 dropped at once. Either way the journal has a line naming the notification,
@@ -2342,7 +2413,8 @@ counter: an alert path that has stopped working is otherwise silent.
 The daemon log has one line per failed job either way: `sending failure
 notification for job N: <title>: <body>` with credentials set, and
 `failure notification for job N not sent, Pushover is not configured:
-<title>: <body>` without them.
+<title>: <body>` without them. A priority 1 notification has `(priority
+high: damage beyond repair)` after its title in both.
 A backup that completed with skipped files logs the same pair at
 `warning` level: `sending warning notification for job N: <title>: <body>`
 with credentials, `warning notification for job N not sent, Pushover is not
@@ -2873,12 +2945,15 @@ counted in `cbackup_checkpoint_failures_total`, and turns `/readyz` to
 `"status":"degraded"` with the reason in `state_db_checkpoint_error` until a
 checkpoint works again. Everything else carries on, but nothing is copying
 the log back, so it grows until the filesystem fills: treat it as urgent.
-The usual cause is ownership. The daemon opens `state.db`, and the
-checkpointer's own connection to it, before it drops to
-`security.run_as_uid`; the files stay root's, mode 0600, which is expected
-(section 22.2). Opened after the drop, as an earlier build did, that
-connection could only read, and every checkpoint failed without a word: the
-log reached five times its cap while `state.db` stayed 4096 bytes (B215).
+Ownership is not the cause, and changing it is not the fix: the daemon
+opens `state.db`, and the checkpointer's own connection to it, before it
+drops to `security.run_as_uid`, so `state.db`, `-wal` and `-shm` are root's,
+mode 0600, by design in 1.0 (section 22.2.2). Opened after the drop, as an
+earlier build did, that connection could only read, and every checkpoint
+failed without a word: the log reached five times its cap while `state.db`
+stayed 4096 bytes (B215). A connection that can only read is now refused
+at start, with an error naming the uid; the one way to meet it is a daemon
+started as the uid it would drop to rather than as root.
 
 **Do not hold long reads on a live `state.db`.** A checkpoint can only
 reuse the log once every reader has moved past the frames it copied, and the
@@ -3021,8 +3096,13 @@ command, or `C_BACKUP_SOCKET`, overrides the default. Output is the daemon's
 JSON, one document per command, on stdout (a remove prints what it removed,
 `{"removed":true,...}`); errors go to stderr. `jobs watch` is the one command
 that prints several: one document per line until the job ends. The exit
-status is 0 on success and 1 otherwise. Commands that start a job wait for
-it unless given `--no-wait`.
+status is 0 on success and 1 otherwise, with one exception: 124 when
+`--timeout` ran out with the job still running (the status `timeout(1)`
+uses). Commands that start a job wait for it until it ends, however long
+that is, unless given `--no-wait`, which returns the job id at once, or
+`--timeout SECONDS` (whole seconds, 1 or more), which waits at most that
+long and leaves the job running. The two cannot be combined. Before 1.0 the
+wait gave up after an hour and exited 1 while the job went on (B220).
 
 Arguments follow one set of rules for every command, checked before
 anything is sent to the daemon:
@@ -3410,10 +3490,16 @@ itself at start (`security.run_as_uid`, 990 here):
 repositories must be owned by 990: the daemon creates its keys, its
 `daemon-id`, SQLite's temporary files and everything in a repository after
 the drop. The configuration and `state.db` are opened before it, every
-connection to the database included, so a `state.db` (and `-wal`, `-shm`)
-that root created on the first start is root's, mode 0600, and that is
-fine: uid 990 never opens it again. A connection opened after the drop
-could only read it, which is what B215 was (section 18.2). What the drop
+connection to the database included, so `state.db`, `-wal` and `-shm` are
+root's, mode 0600, after the drop, and stay so: that is by design in 1.0,
+not something to correct. Root created them on the first start, uid 990
+never opens them again, and nothing replaces them while the daemon runs (a
+clean stop either removes `-wal` and `-shm` or leaves them, section 2.2,
+and the next start, as root, opens or recreates them before the drop). Do
+not `chown` them to 990; it changes nothing. A connection opened after the
+drop could only read them, which is what B215 was (section 18.2). The
+state *directory* is 990's, because of what is created in it after the
+drop. What the drop
 costs: `trusted.*` extended attributes cannot be
 read without `CAP_SYS_ADMIN` and are skipped (appdata does not use them).
 
@@ -3905,6 +3991,23 @@ exported share (the helper refuses both). On FS2 it is
 `/mnt/user/system/.cbackup-snapshots`). A file backup of a pool or a share
 therefore never reads capture snapshots.
 
+**Incrementals over snapshots.** A snapshot keeps every file's inode
+number, size and times but is given a new device number at every capture.
+Files read from one are identified by the device of the path they are
+recorded at, so a snapshot read writes the same directory trees and file
+cache rows a live read of the same files would: an unchanged unit stores no
+new trees and opens no file, and the read from a later snapshot finds the
+rows the earlier one wrote. A mount nested inside a snapshot keeps its own
+device; its files are recognised by inode, size and both times alone.
+
+Before this (B229) the device number of each snapshot was written into
+every tree, so every unit backup stored a complete new set of trees, though
+no file content. **The first unit backup after upgrading past it rewrites
+each unit's trees once and reads its files once**, because both the trees
+and the cache rows earlier backups wrote name the old snapshots' devices.
+Nothing is lost and no setting is involved; from the backup after that,
+incrementals store and read only what changed.
+
 **Who else can see a snapshot while it exists.** A container that binds a
 **dataset root** reaches `.zfs` by name: on FS1, Plex-Mover binds
 `/mnt/cache` read-write and can read `/mnt/cache/appdata/.zfs/snapshot/`
@@ -4170,7 +4273,12 @@ device`, again before anything is written. That refusal names the way
 round it: restore the files to a path instead, `c-backup restore <repo>
 <snapshot> <dir> --subpath <the bind's recorded path>` for that bind or
 `c-backup unit restore <repo> <snapshot> <dir>` for the whole unit
-(22.7.1), and create the container by hand. The check of the created
+(22.7.1), and create the container by hand. A source the snapshot
+records as a socket is refused for what it is: a restore never recreates a
+socket (the program serving it makes it), so the copy would bind nothing
+there (NIT-44); the refusal names the same way round. A fifo is restored
+and passes. The refusal reaches the job's error whole, up to 2 KiB, and
+one longer is cut with a visible `...` (B223). The check of the created
 container still runs as well.
 
 Anything else refuses the restore before the container is created, with

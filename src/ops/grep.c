@@ -580,14 +580,20 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     char started[32];
     snprintf(started, sizeof(started), "%lld", (long long)time(NULL));
+    /* The hits name nodes by id, so the run records the generation they
+     * belong to (node_gen.h). The job holds the repository, so no rebuild
+     * of this snapshot runs while it reads. */
     /* The id comes back from the INSERT itself. last_insert_rowid() is per
      * connection, and every thread shares one: another thread's insert
      * between the two statements handed this caller someone else's id. */
     db_result_t *r = NULL;
     if (db_write_returning(db,
             "INSERT INTO grep_runs (repo_id, snap_id, pattern, path_prefix,"
-            " ignore_case, started_at)"
-            " VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            " ignore_case, started_at, index_gen)"
+            " VALUES (?1, ?2, ?3, ?4, ?5, ?6,"
+            "         COALESCE((SELECT gen FROM node_index_gen"
+            "                    WHERE repo_id = ?1 AND snap_id = ?2), 0))"
+            " RETURNING id",
             (const char *[]){ repo, snap, opts->pattern,
                               opts->path_prefix ? opts->path_prefix : "",
                               opts->ignore_case ? "1" : "0", started, NULL },

@@ -1044,6 +1044,35 @@ test_b186_layout() {
 }
 test_b186_layout
 
+# ---- B229: what a btrfs snapshot keeps of a file ---------------------------
+# A snapshot read is recorded with the record root's live device in the
+# hard-link identity and the file cache key, which only gives the trees and
+# cache rows of a live read if the snapshot keeps every inode number, size,
+# mtime, ctime and link count, under a device number of its own. Checked
+# here on a real read-only snapshot of the pool's top level, the kind the
+# helper takes; test_snapshot_read proves the rest over a stand-in. ZFS
+# keeps them too (object numbers are inode numbers), checked in UAT.
+
+test_b229_snapshot_identity() {
+    local d="$CACHE/system/cbk-b229" sv="$CACHE/system/cbk-b229-snap" live snap
+    log "B229: a read-only btrfs snapshot keeps inode numbers and times"
+    mkdir -p "$d/sub"
+    head -c 65536 /dev/urandom > "$d/a.bin"
+    echo text > "$d/sub/b.txt"
+    ln "$d/a.bin" "$d/sub/a-link"
+    sleep 1   # so a ctime the snapshot rewrote could not equal the original
+    btrfs subvolume snapshot -r "$CACHE" "$sv" >/dev/null || { bad "B229: a snapshot is taken" "taken" "btrfs failed"; return 0; }
+    live=$(cd "$d" && find . -printf '%P %i %s %T@ %C@ %n\n' | sort)
+    snap=$(cd "$sv/system/cbk-b229" && find . -printf '%P %i %s %T@ %C@ %n\n' | sort)
+    check "B229: every inode number, size, mtime, ctime and link count is kept" "$live" "$snap"
+    [ "$(stat -c %d "$d/a.bin")" != "$(stat -c %d "$sv/system/cbk-b229/a.bin")" ] &&
+        ok "B229: under a device number of its own" ||
+        bad "B229: under a device number of its own" "different devices" "the same device"
+    btrfs subvolume delete "$sv" >/dev/null
+    rm -r -- "$d"
+}
+test_b229_snapshot_identity
+
 # ---- the privilege drop and the helper suites, as root -------------------
 # The CI job containers are root with Docker's default capabilities, which
 # hold no CAP_DAC_READ_SEARCH, so there test_root_drop can only check that
@@ -1060,17 +1089,20 @@ suite_root() {   # <label> <logfile> <command...>
     [ "$rc" -eq 0 ] || tail -30 "$logf"
 }
 
-log "suites as root: test_privs, test_helper, test_helper_remote, test_helper_e2e.sh"
+log "suites as root: test_privs, test_helper, test_helper_remote, test_snapshot_read, test_helper_e2e.sh"
 TSCR="$WORK/test-scratch"
 mkdir -p "$TSCR"
 if make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic C_BACKUP_TEST_DIR="$TSCR" \
         -j"$JOBS" build/bins/test_privs build/bins/test_helper build/bins/test_helper_remote \
+        build/bins/test_snapshot_read \
         >"$WORK/build-suites.log" 2>&1; then
     suite_root test_privs "$WORK/test_privs.log" build/bins/test_privs
     contains "test_root_drop ran the real drop" "[       OK ] test_root_drop" "$(cat "$WORK/test_privs.log")"
     check "and not only the refusal" 0 "$(grep -c 'the drop is not' "$WORK/test_privs.log")"
     suite_root test_helper "$WORK/test_helper.log" build/bins/test_helper
     suite_root test_helper_remote "$WORK/test_helper_remote.log" build/bins/test_helper_remote
+    suite_root test_snapshot_read "$WORK/test_snapshot_read.log" build/bins/test_snapshot_read
+    check "test_snapshot_read ran its overlay cases" 0 "$(grep -c 'the overlay cases skip' "$WORK/test_snapshot_read.log")"
     suite_root test_helper_e2e.sh "$WORK/test_helper_e2e.log" \
         tests/test_helper_e2e.sh build/bins/c-backupd build/bins/c-backup build/bins/c-backup-helper
 else
