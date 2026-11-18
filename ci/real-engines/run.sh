@@ -1012,13 +1012,15 @@ test_b231_nested_subvolume() {
     contains "B231: the job warns naming the mount and what is below it" "$n/inner" "$out"
     contains "B231: and says it was read live" "read live" "$out"
     snap=$(snap_of "$out")
+    # The fixture's own subvolume goes first: snapshots_left counts every
+    # subvolume below the pool's top level, it included.
+    docker rm -f cbk-uat-nest >/dev/null 2>&1
+    btrfs subvolume delete "$n/inner" >/dev/null 2>&1
     leftovers "after the B231 backup"
     if have_snap "B231" "$snap"; then
         cb unit restore 1 "$snap" "$r" >/dev/null 2>&1
         check "B231: the subvolume's files are in the snapshot, not an empty directory" "$man" "$(manifest "$r$n")"
     fi
-    docker rm -f cbk-uat-nest >/dev/null 2>&1
-    btrfs subvolume delete "$n/inner" >/dev/null 2>&1
     rm -r -- "$n"
 }
 test_b231_nested_subvolume
