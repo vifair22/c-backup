@@ -1148,7 +1148,7 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
                  (unsigned long long)gr->bytes_freed);
     else
         snprintf(msg, sizeof(msg),
-                 "swept %llu object%s (%llu bytes); %u pack%s rewritten, "
+                 "swept %llu object%s, %llu bytes freed; %u pack%s rewritten, "
                  "%u deleted, %u coalesced into %u; %u stale temp file%s removed",
                  (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
                  (unsigned long long)gr->bytes_freed,

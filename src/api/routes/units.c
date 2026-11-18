@@ -1335,6 +1335,30 @@ static api_response_t unit_reset_post(int64_t repo_id, const char *key)
     return json_out(root);
 }
 
+/*
+ * The unit a checkpoints or reset-incremental request names (NIT-41). Both
+ * answered for any provider and unit at all, a made-up one included, with
+ * an empty chain or a journalled "reset" of nothing. A unit with
+ * snapshots here, or with chain rows of its own, is known; anything else is
+ * held to what a policy write is (policy_unit): its provider must list it
+ * now. 0 with key set, or the HTTP status with why.
+ */
+static int chain_unit(int64_t repo_id, const char *prov, const char *unit, char *key,
+                      size_t ksz, char *why, size_t wsz)
+{
+    if (key_for(repo_id, prov, unit, key, ksz)) return 0;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int rows = db_execute(g_db,
+            "SELECT 1 FROM unit_tokens WHERE repo_id = ?1 AND unit_key = ?2"
+            " UNION ALL SELECT 1 FROM unit_incremental WHERE repo_id = ?1 AND unit_key = ?2"
+            " LIMIT 1", (const char *[]){ repo, key, NULL }, &r) == 0 && r && r->nrows > 0;
+    db_result_free(r);
+    if (rows) return 0;
+    return policy_unit(repo_id, prov, unit, key, ksz, why, wsz);
+}
+
 api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const char *rest)
 {
     if (strcmp(rest, "/units") == 0) return repo_units(req, repo_id);
@@ -1342,10 +1366,15 @@ api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const 
     const char *suffix = NULL;
     if (!split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix))
         return api_error(404, "not found");
+    if (strcmp(suffix, "reset-incremental") == 0) return api_error(405, "method not allowed");
+    if (strcmp(suffix, "checkpoints") == 0) {
+        char why[768];
+        int code = chain_unit(repo_id, prov, unit, key, sizeof(key), why, sizeof(why));
+        if (code) return api_error(code, why);
+        return unit_checkpoints_get(repo_id, key);
+    }
     (void)key_for(repo_id, prov, unit, key, sizeof(key));
     if (strcmp(suffix, "snapshots") == 0) return unit_history(req, repo_id, key);
-    if (strcmp(suffix, "checkpoints") == 0) return unit_checkpoints_get(repo_id, key);
-    if (strcmp(suffix, "reset-incremental") == 0) return api_error(405, "method not allowed");
     return unit_policy_get(repo_id, key);
 }
 
@@ -1378,7 +1407,9 @@ api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const
     const char *suffix = NULL;
     if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) &&
         strcmp(suffix, "reset-incremental") == 0) {
-        (void)key_for(repo_id, prov, unit, key, sizeof(key));
+        char why[768];
+        int code = chain_unit(repo_id, prov, unit, key, sizeof(key), why, sizeof(why));
+        if (code) return api_error(code, why);
         return unit_reset_post(repo_id, key);
     }
     if (strncmp(rest, "/snapshots/", 11) == 0) {

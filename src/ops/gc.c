@@ -428,6 +428,11 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     res.dups_dropped      = pstats.dups_dropped;
     res.dups_kept         = pstats.dups_kept;
     res.index_relocated   = pstats.index_relocated;
+    /* What compaction really removed, not what the sweep declared dead: a
+     * compaction that fails part way, a full disk say, frees only what it
+     * finished, and the result said every swept byte was freed (B197). The
+     * rest is reclaimed by the next gc, since the rows are gone. */
+    res.bytes_freed       = pstats.bytes_dropped;
     res.unwalkable_listed = pstats.unwalkable_listed;
     memcpy(res.unwalkable, pstats.unwalkable, sizeof(res.unwalkable));
     /* The sweep is committed whatever compaction did, so a caller reporting
