@@ -151,6 +151,22 @@ export type ApiRequest =
       template: string; params?: Record<string, unknown> }
   | { kind: 'dbDismiss'; repoId: number; findingId: number; reason: string }
 
+  /* --- units: VMs and containers through a source provider (Manual 22).
+   * unit is a name or an id; an id may itself hold ':' (a compose project
+   * is compose:<name>), which is why provider and unit travel apart. */
+  | { kind: 'providerList' }
+  | { kind: 'providerUnits'; provider: string; limit?: number; offset?: number }
+  | { kind: 'providerUnit'; provider: string; unit: string }
+  | { kind: 'repoUnits'; repoId: number; limit?: number; offset?: number }
+  | { kind: 'unitHistory'; repoId: number; provider: string; unit: string
+      limit?: number; offset?: number }
+  /* `unit backup`: name units, or all with optional exclude globs (the
+   * daemon refuses exclude without all, and names with all). require is a
+   * consistency level, crash by default; pauseScope unit, group or job. */
+  | { kind: 'unitBackup'; repoId: number; provider: string
+      units?: string[]; all?: boolean; exclude?: string[]
+      require?: UnitLevel; pauseScope?: PauseScope }
+
   /* --- schedules --- */
   | { kind: 'scheduleList'; repoId: number }
   | { kind: 'scheduleAdd'; repoId: number; action: string
@@ -170,6 +186,10 @@ export type ApiRequest =
   | { kind: 'authSetupState' }
   | { kind: 'authSetup'; password: string }
   | { kind: 'authLogin'; password: string }
+
+/* The levels a unit capture can achieve, lowest first (Manual 22.1). */
+export type UnitLevel = 'inconsistent' | 'crash' | 'quiesced' | 'application' | 'offline'
+export type PauseScope = 'unit' | 'group' | 'job'
 
 export type ScheduleTrigger =
   | { type: 'interval'; seconds: number }
