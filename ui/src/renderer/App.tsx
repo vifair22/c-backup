@@ -25,6 +25,8 @@ import { VerifyView } from './VerifyView'
 import { KeyView } from './KeyView'
 import { GrepView } from './GrepView'
 import { DatabasesView, useUncoveredDatabases } from './DatabasesView'
+import { UnitsView } from './UnitsView'
+import { UnitDetail } from './UnitDetail'
 import { useTheme, type ThemeMode } from './useTheme'
 
 const api = window.cbackup
@@ -71,7 +73,7 @@ export function App(): React.ReactElement {
        || activeRepo.path.split('/').pop() || activeRepo.path)
     : ''
   // Navigation history
-  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' } | { view: 'verify' } | { view: 'encryption' } | { view: 'grep'; prefix?: string } | { view: 'databases'; scope?: string }
+  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' } | { view: 'verify' } | { view: 'encryption' } | { view: 'grep'; prefix?: string } | { view: 'databases'; scope?: string } | { view: 'units'; provider?: string } | { view: 'unit'; provider: string; unitId: string; name: string }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
   /*
    * The daemon status screen is scoped to a connection, not a repository, so
@@ -752,6 +754,7 @@ export function App(): React.ReactElement {
                 onViewVerify={() => navigateTo({ view: 'verify' })}
                 onViewEncryption={() => navigateTo({ view: 'encryption' })}
                 onViewDatabases={() => navigateTo({ view: 'databases' })}
+                onViewUnits={() => navigateTo({ view: 'units' })}
                 onViewGrep={() => navigateTo({ view: 'grep' })}
                 onViewTasks={() => navigateTo({ view: 'tasks' })}
                 onHashLookup={() => navigateTo({ view: 'hash-lookup' })}
@@ -819,6 +822,25 @@ export function App(): React.ReactElement {
             {currentView.view === 'databases' && (
               <DatabasesView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 initialScope={currentView.scope}
+                onBack={navBack} />
+            )}
+            {currentView.view === 'units' && (
+              <UnitsView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
+                initialProvider={currentView.provider}
+                onOpenUnit={(provider, unitId, name) => {
+                  /* Back returns to the provider the unit was opened from. */
+                  setNavHistory(h => h.map((v, i) => i === navIndex ? { view: 'units', provider } : v))
+                  navigateTo({ view: 'unit', provider, unitId, name })
+                }}
+                onBack={navBack} />
+            )}
+            {currentView.view === 'unit' && (
+              /* Keyed by unit so another unit is a fresh page, never one
+               * showing the last unit's history under a new name. */
+              <UnitDetail key={`${activeRepo.conn}/${activeRepo.id}/${currentView.provider}/${currentView.unitId}`}
+                connName={activeRepo.conn} repoPath={String(activeRepo.id)}
+                provider={currentView.provider} unitId={currentView.unitId} name={currentView.name}
+                onBrowseSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
                 onBack={navBack} />
             )}
             {currentView.view === 'journal' && (

@@ -3,8 +3,9 @@
  *
  * docs/db-detection.md section 12 asks for three surfaces: a panel on each
  * unit page, a panel on the sources page, and a repository-wide list
- * filterable by coverage. The app has no unit pages and keeps its sources in
- * the backup dialog, so this one screen carries all three: the list is
+ * filterable by coverage. The unit pages do not carry a findings panel and
+ * the sources live in the backup dialog, so this one screen carries all
+ * three: the list is
  * grouped under headings per unit and per source, a unit's heading carries
  * its Detect now button, and the backup dialog links here with the scope
  * filter set to one source.

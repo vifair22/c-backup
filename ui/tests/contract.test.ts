@@ -202,6 +202,17 @@ const SAMPLES: Record<ApiKind, ApiRequest> = {
   dbEnable:        { kind: 'dbEnable', repoId: 1, findingId: 9999, template: 'pg-dumpall', params: {} },
   dbDismiss:       { kind: 'dbDismiss', repoId: 1, findingId: 9999, reason: 'contract probe' },
 
+  /* No provider is enabled on the contract daemon, so the provider-scoped
+   * routes answer the registry's 404, naming the provider: a handler that
+   * heard the path, never the router's bare one. */
+  providerList:    { kind: 'providerList' },
+  providerUnits:   { kind: 'providerUnits', provider: 'fake', limit: 5 },
+  providerUnit:    { kind: 'providerUnit', provider: 'docker', unit: 'compose:contract-probe' },
+  repoUnits:       { kind: 'repoUnits', repoId: 1, limit: 5 },
+  unitHistory:     { kind: 'unitHistory', repoId: 1, provider: 'docker', unit: 'compose:contract-probe' },
+  unitBackup:      { kind: 'unitBackup', repoId: 1, provider: 'fake', units: ['contract-probe'],
+                     require: 'crash', pauseScope: 'unit' },
+
   scheduleList:    { kind: 'scheduleList', repoId: 1 },
   scheduleAdd:     { kind: 'scheduleAdd', repoId: 1, action: 'verify',
                      trigger: { type: 'interval', seconds: 86400 } },

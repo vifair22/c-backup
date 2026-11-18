@@ -301,6 +301,42 @@ export function toEndpoint(req: ApiRequest): Endpoint {
         body: { reason: req.reason },
       }
 
+    /* --- units --- */
+    case 'providerList':
+      return { method: 'GET', path: '/providers' }
+    case 'providerUnits':
+      return {
+        method: 'GET',
+        path: `/providers/${seg(req.provider)}/units${qs({ limit: req.limit, offset: req.offset })}`,
+      }
+    case 'providerUnit':
+      return { method: 'GET', path: `/providers/${seg(req.provider)}/units/${seg(req.unit)}` }
+    case 'repoUnits':
+      return {
+        method: 'GET',
+        path: `/repos/${req.repoId}/units${qs({ limit: req.limit, offset: req.offset })}`,
+      }
+    case 'unitHistory':
+      return {
+        method: 'GET',
+        path: `/repos/${req.repoId}/units/${seg(req.provider)}/${seg(req.unit)}/snapshots${qs({
+          limit: req.limit, offset: req.offset })}`,
+      }
+    case 'unitBackup':
+      /* The same body `c-backup unit backup` builds: units or all, never
+       * both, and exclude only with all. Absent keys are left out rather
+       * than sent empty, so the daemon applies its own defaults. */
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/units/backup`,
+        body: {
+          provider: req.provider,
+          ...(req.all ? { all: true, exclude: req.exclude ?? [] } : { units: req.units ?? [] }),
+          ...(req.require ? { require: req.require } : {}),
+          ...(req.pauseScope ? { pause_scope: req.pauseScope } : {}),
+        },
+      }
+
     /* --- schedules --- */
     case 'scheduleList':
       return { method: 'GET', path: `/repos/${req.repoId}/schedules` }
