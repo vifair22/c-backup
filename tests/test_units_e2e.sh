@@ -369,7 +369,7 @@ contains "live by its process and open file" '"confidence":"live"' "$OUT"
 contains "with the open file as evidence" '"open_write":[{"path":' "$OUT"
 contains "the client image is a hint" '"engine":"mysql","path":"","confidence":"hint"' "$OUT"
 contains "said as information" 'the image of client suggests MySQL/MariaDB' "$OUT"
-contains "and the summary says the probe answered" 'with units.probe' "$OUT"
+contains "and the journal says the probe answered" 'with units.probe' "$(cb journal 1 --limit 5)"
 DL=$(cb db list 1 --unit fake:d)
 contains "the findings are listed under the unit" '"scope":"unit:fake:d"' "$DL"
 contains "both of them" '"total":2' "$DL"
@@ -387,7 +387,8 @@ contains "and says why" 'units.allow' "$OUT"
 OUT=$(cb db detect 1 nosuch --provider fake 2>&1); RC=$?
 check    "nor one that does not exist" 1 "$RC"
 check    "detect is POST only" 405 "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" http://x/repos/1/units/fake/cbk-uat-d/detect)"
-OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
+# Read live (the fake tree is on no snapshot domain), so allowed below crash.
+OUT=$(cb unit backup 1 --provider fake cbk-uat-d --require inconsistent)
 contains "a backup of it carries the same findings" '"engine":"postgres"' "$OUT"
 contains "with the probe's liveness" '"confidence":"live"' "$OUT"
 contains "and the finding now names its snapshot" '"last_snap_id":' "$(cb db show 1 "$DID")"
