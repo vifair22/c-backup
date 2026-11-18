@@ -1958,7 +1958,6 @@ static const char *const P_URESTORE[] = { "<repo-id>", "<snapshot-id>", "[dest]"
 static const char *const P_VM_EXPORT[] = { "<repo-id>", "<snapshot-id>", "<disk>", NULL };
 static const char *const P_EXPORT[]   = { "<export-id>", NULL };
 static const char *const P_UPOL[]     = { "<repo-id>", "<unit>", NULL };
-static const char *const P_FINDING[]  = { "<repo-id>", "<finding-id>", NULL };
 static const char *const P_UPOL_SET[] = { "<repo-id>", "<unit>", "<key>", "<value>", NULL };
 
 #define OPT_LIMIT   { "--limit",   NULL, ARG_VALUE, "N" }
