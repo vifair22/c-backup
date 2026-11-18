@@ -1388,6 +1388,22 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                          " (%llu of them pack structure%s)", (unsigned long long)ps,
                          ps == 1 ? "" : "s");
             job_set_summary(progress_ctx, vs);
+            /* Damage still in the repository, if recoverable, is a warning:
+             * journalled as one and alerted once, with the count. Damage
+             * beyond repair is not handled here: it fails the run
+             * (verify_run, ERR_CORRUPT) and alerts as a failure. */
+            if (vr.recoverable > 0) {
+                char vw[256];
+                if (j->verify_repair)
+                    snprintf(vw, sizeof(vw), "verify run %lld left %llu recoverable "
+                             "item(s) unrepaired; run verify with repair again",
+                             (long long)vr.run_id, (unsigned long long)vr.recoverable);
+                else
+                    snprintf(vw, sizeof(vw), "verify run %lld found %llu recoverable "
+                             "item(s), not repaired (check only); run verify with repair",
+                             (long long)vr.run_id, (unsigned long long)vr.recoverable);
+                job_set_warning(progress_ctx, vw);
+            }
         }
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*

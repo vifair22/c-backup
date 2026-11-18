@@ -931,12 +931,33 @@ if [ -n "$DRY_OBJ" ]; then
     check    "a dry run over recoverable damage succeeds" 0 "$RC"
     contains "and reports nothing repaired" '"repaired":0,' "$OUT"
     contains "but the damage recoverable"   '"recoverable":1,' "$OUT"
+    # Damage left in the repository is a warning: journalled as one, and
+    # alerted once, as a warning, never as a failure. verify prints its run,
+    # not its job; the newest job is this one.
+    VJ=$(cb jobs --limit 1 | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    JRN=$(cb journal "$DRY_ID" --limit 1)
+    contains "a check-only verify over recoverable damage journals a warning" \
+        '"operation":"verify","result":"warning"' "$JRN"
+    contains "with the count" "found 1 recoverable item(s), not repaired (check only)" "$JRN"
+    N=0
+    for _ in $(seq 1 100); do
+        N=$(grep -c "warning notification for job $VJ not sent" "$WORK/daemon.log")
+        [ "$N" -ge 1 ] && break
+        sleep 0.1
+    done
+    check    "and alerts once, as a warning" 1 "$N"
+    check    "and not as a failure" 0 \
+        "$(grep -c "failure notification for job $VJ[: ]" "$WORK/daemon.log")"
     check    "and leaves the repository untouched" "$DRY_BAD" "$(sha256sum < "$DRY_OBJ")"
     # --dry-run wins over a request that would otherwise repair.
     OUT=$(cb verify "$DRY_ID" --level deep --dry-run 2>&1)
     contains "even with the level named" '"repaired":0,' "$OUT"
     OUT=$(cb verify "$DRY_ID" 2>&1)
     contains "a repairing run fixes it" '"repaired":1,' "$OUT"
+    VJ=$(cb jobs --limit 1 | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    contains "and, nothing left, journals success" '"operation":"verify","result":"success"' \
+        "$(cb journal "$DRY_ID" --limit 1)"
+    check    "with no alert" 0 "$(grep -c "notification for job $VJ[: ]" "$WORK/daemon.log")"
     check    "and writes the right bytes back" "$DRY_GOOD" "$(sha256sum < "$DRY_OBJ")"
 else
     bad "dry-run repo stored the blob" "a file over 1000k" "$(find "$WORK/dryrepo" -type f | head)"

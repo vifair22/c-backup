@@ -1689,6 +1689,46 @@ static void test_warnings_are_journalled(void **state)
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE result = 'success'"), 1);
 }
 
+/* Several warnings, one alert: the count and the list, never one per item. */
+static void test_several_warnings_alert_once(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, label, added_at)"
+        " VALUES (3, 'u-3', '/srv/repos/docs', 'docs', 0)", NULL, NULL), 0);
+    g_alert_log[0] = '\0';
+    int h = log_stream_register(capture_alert, NULL);
+    assert_true(h >= 0);
+    static const char *const three[] = { "item 1 recoverable", "item 2 recoverable",
+                                         "item 3 recoverable" };
+    warned_spec_t w3 = { "verify run 9", 3, three };
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 3, "verify", NULL, warned_job, (void *)&w3, NULL, &id), OK);
+    wait_ended(id);
+    char want[96];
+    snprintf(want, sizeof(want), "warning notification for job %lld", (long long)id);
+    int seen = 0;
+    for (int i = 0; i < 200 && !seen; i++) {
+        pthread_mutex_lock(&g_alert_mu);
+        seen = strstr(g_alert_log, want) != NULL;
+        pthread_mutex_unlock(&g_alert_mu);
+        if (!seen) usleep(10000);
+    }
+    usleep(50000);
+    log_stream_unregister(h);
+    pthread_mutex_lock(&g_alert_mu);
+    int n = 0;
+    for (const char *p = g_alert_log; (p = strstr(p, "notification for job")) != NULL; p++) n++;
+    int has_all = strstr(g_alert_log, "3 warnings: item 1 recoverable; item 2 recoverable; "
+                                      "item 3 recoverable") != NULL;
+    int failure = strstr(g_alert_log, "failure notification") != NULL;
+    pthread_mutex_unlock(&g_alert_mu);
+    assert_true(seen);
+    assert_int_equal(n, 1);
+    assert_true(has_all);
+    assert_false(failure);
+}
+
 /* Bounded: one long warning is cut, and those past the total are counted. */
 static void test_journalled_warnings_are_bounded(void **state)
 {
@@ -1742,6 +1782,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_warning_alert_text, setup, teardown),
         cmocka_unit_test_setup_teardown(test_warnings_are_journalled, setup, teardown),
         cmocka_unit_test_setup_teardown(test_journalled_warnings_are_bounded, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_several_warnings_alert_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_job_waits_for_a_request_holding_the_repo, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_running_job_still_refuses_requests, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_deferred_job_can_be_cancelled, setup, teardown),

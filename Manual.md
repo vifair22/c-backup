@@ -1720,8 +1720,14 @@ job's summary followed by the warnings: `warning: <text>` for one, `N
 warnings: <a>; <b>` for more, each cut at 1 KiB and all of them at 2 KiB
 with the rest counted (`(and N more)`). Skipped or possibly torn files, a
 unit the watchdog released, a unit backup's pause scope it could not
-honour and a session that could not be ended all journal this way, since
-the job and its `result` are deleted after 30 days. `journal --result` filters on
+honour, a session that could not be ended and a verify that leaves
+recoverable damage unrepaired (check only) all journal this way, with one
+warning alert per job, since the job and its `result` are deleted after 30
+days. Damage beyond repair is not a warning: a verify that finds
+unrecoverable or missing data, a gc that copies entries damaged beyond
+parity or cannot walk a pack, and a replication that sends objects damaged
+beyond parity all fail their job, journal `failed` with the counts, and
+send one failure alert. `journal --result` filters on
 exactly those five and refuses anything else, so a misspelt filter is an
 error rather than an empty history. The journal is newest first and pages
 with `--limit` (default 100, at most 1000) and `--offset`.
