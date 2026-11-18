@@ -315,6 +315,7 @@ struct db_detector {
     VEC(lrec_t) links;
     VEC(srec_t) sibs;
     VEC(char *) unsettled;
+    VEC(char *) copies;           /* kept sorted: few, added before the run */
     VEC(crec_t) carry;            /* sorted once, on first lookup */
     int         carry_sorted;
     /* Heads arrive on store workers. Everything else is the backup
@@ -355,6 +356,8 @@ void db_detect_free(db_detector_t *d)
     for (size_t i = 0; i < d->links.n; i++) { free(d->links.v[i].dir); free(d->links.v[i].target); }
     for (size_t i = 0; i < d->sibs.n; i++) free(d->sibs.v[i].path);
     for (size_t i = 0; i < d->unsettled.n; i++) free(d->unsettled.v[i]);
+    for (size_t i = 0; i < d->copies.n; i++) free(d->copies.v[i]);
+    free(d->copies.v);
     for (size_t i = 0; i < d->carry.n; i++) free(d->carry.v[i].path);
     for (size_t i = 0; i < d->heads.n; i++) free(d->heads.v[i].path);
     free(d->dirs.v); free(d->links.v); free(d->sibs.v); free(d->unsettled.v);
@@ -672,6 +675,11 @@ void db_detect_head_fd(db_detector_t *d, const char *path, int fd, uint64_t size
     if (n > 0) db_detect_head(d, path, buf, (size_t)n, size);
 }
 
+static int str_cmp_fwd(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
 static int crec_cmp(const void *a, const void *b)
 {
     return strcmp(((const crec_t *)a)->path, ((const crec_t *)b)->path);
@@ -713,6 +721,38 @@ void db_detect_unsettled(db_detector_t *d, const char *path)
         if (d->failed) free(s);
     }
     pthread_mutex_unlock(&d->mu);
+}
+
+void db_detect_copy_add(db_detector_t *d, const char *path)
+{
+    if (!d || !path || db_detect_is_copied(d, path)) return;
+    char *s = strdup(path);
+    if (!s) { d->failed = 1; return; }
+    VEC_PUSH(d, d->copies, s);
+    if (d->failed) { free(s); return; }
+    /* Insertion into sorted order: a handful of entries. */
+    for (size_t i = d->copies.n - 1; i > 0 && strcmp(d->copies.v[i - 1], d->copies.v[i]) > 0; i--) {
+        char *t = d->copies.v[i];
+        d->copies.v[i] = d->copies.v[i - 1];
+        d->copies.v[i - 1] = t;
+    }
+}
+
+int db_detect_is_copied(const db_detector_t *d, const char *path)
+{
+    if (!d || !path || !d->copies.n) return 0;
+    const char *key = path;
+    return bsearch(&key, d->copies.v, d->copies.n, sizeof(char *), str_cmp_fwd) != NULL;
+}
+
+int db_detect_was_unsettled(db_detector_t *d, const char *path)
+{
+    if (!d || !path) return 0;
+    pthread_mutex_lock(&d->mu);
+    int hit = 0;
+    for (size_t i = 0; i < d->unsettled.n && !hit; i++) hit = strcmp(d->unsettled.v[i], path) == 0;
+    pthread_mutex_unlock(&d->mu);
+    return hit;
 }
 
 void db_detect_heads_read(const db_detector_t *d,

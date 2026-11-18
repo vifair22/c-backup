@@ -6,6 +6,7 @@
 #include "sync_latch.h"
 #include "wal_health.h"
 #include "checkpointer.h"
+#include "db_capture.h"
 #include "db_findings.h"
 #include "db_txn.h"
 
@@ -173,6 +174,14 @@ static void emit_db_findings(mbuf_t *m)
                "by how the capture covers them.\n# TYPE cbackup_db_findings gauge\n");
     for (size_t k = 0; k < sizeof(covs) / sizeof(*covs); k++)
         mb_addf(m, "cbackup_db_findings{coverage=\"%s\"} %lld\n", db_coverage_name(covs[k]), n[k]);
+    mb_addf(m, "# HELP cbackup_db_engine_captures_total Engine copies a file backup tried to "
+               "make (db-detection.md 9.2), by engine and outcome.\n"
+               "# TYPE cbackup_db_engine_captures_total counter\n");
+    static const sqlite_copy_outcome_t outs[] = { SQLITE_COPY_OK, SQLITE_COPY_REFUSED,
+                                                  SQLITE_COPY_ABANDONED, SQLITE_COPY_FAILED };
+    for (size_t k = 0; k < sizeof(outs) / sizeof(*outs); k++)
+        mb_addf(m, "cbackup_db_engine_captures_total{engine=\"sqlite\",result=\"%s\"} %llu\n",
+                sqlite_copy_outcome_name(outs[k]), (unsigned long long)db_captures_total(outs[k]));
     mb_addf(m, "# HELP cbackup_db_uncovered_reads_total Live databases a backup captured "
                "uncovered (read live, possibly torn), counted per backup.\n"
                "# TYPE cbackup_db_uncovered_reads_total counter\n"

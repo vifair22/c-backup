@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "restore.h"
+#include "reserved.h"
 #include "metablob.h"
 
 #include "manifest.h"
@@ -1131,6 +1132,97 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     return st;
 }
 
+/*
+ * The snapshot's engine copies (db-detection.md 9.3): every regular file
+ * under the top-level /.cbackup-captures, by the path of the original it
+ * mirrors. A file snapshot without the directory costs one pass over the
+ * root's rows.
+ */
+typedef struct {
+    char *orig;      /* the original's path, relative like rel */
+    int   row;
+} cap_ent_t;
+
+typedef struct {
+    cap_ent_t *v;
+    size_t     n;
+} cap_map_t;
+
+static int cap_cmp(const void *a, const void *b)
+{
+    return strcmp(((const cap_ent_t *)a)->orig, ((const cap_ent_t *)b)->orig);
+}
+
+static void cap_map_free(cap_map_t *m)
+{
+    for (size_t i = 0; i < m->n; i++) free(m->v[i].orig);
+    free(m->v);
+    memset(m, 0, sizeof(*m));
+}
+
+static void cap_map_build(cap_map_t *m, path_table_t *pt, const db_result_t *r)
+{
+    memset(m, 0, sizeof(*m));
+    int have = 0;
+    for (int i = 0; i < r->nrows && !have; i++)
+        have = strcmp(r->rows[i][COL_PARENT], "0") == 0 &&
+               strcmp(r->rows[i][1], RESERVED_CAPTURES_DIR) == 0 &&
+               strtoul(r->rows[i][8], NULL, 10) == NODE_TYPE_DIR;
+    if (!have) return;
+    static const char prefix[] = RESERVED_CAPTURES_DIR "/";
+    for (int i = 0; i < r->nrows; i++) {
+        if (strtoul(r->rows[i][8], NULL, 10) != NODE_TYPE_REG) continue;
+        char rel[PATH_MAX];
+        if (pt_rel(pt, i, rel, sizeof(rel), 0) != OK) { err_clear(); continue; }
+        if (strncmp(rel, prefix, sizeof(prefix) - 1) != 0) continue;
+        if (strcmp(rel + sizeof(prefix) - 1, "index.json") == 0) continue;
+        cap_ent_t *g = realloc(m->v, (m->n + 1) * sizeof(*g));
+        if (!g) break;
+        m->v = g;
+        if (!(g[m->n].orig = strdup(rel + sizeof(prefix) - 1))) break;
+        g[m->n].row = i;
+        m->n++;
+    }
+    if (m->n) qsort(m->v, m->n, sizeof(*m->v), cap_cmp);
+}
+
+static const cap_ent_t *cap_find(const cap_map_t *m, const char *rel)
+{
+    if (!m->n) return NULL;
+    cap_ent_t key = { (char *)(uintptr_t)rel, 0 };
+    return bsearch(&key, m->v, m->n, sizeof(*m->v), cap_cmp);
+}
+
+/* rel is <db>-wal, <db>-shm or <db>-journal of a database with a copy. */
+static int cap_sibling(const cap_map_t *m, const char *rel)
+{
+    static const char *const sfx[] = { "-wal", "-shm", "-journal" };
+    size_t n = strlen(rel);
+    for (size_t k = 0; k < 3; k++) {
+        size_t l = strlen(sfx[k]);
+        if (n <= l || strcmp(rel + n - l, sfx[k]) != 0) continue;
+        char base[PATH_MAX];
+        snprintf(base, sizeof(base), "%.*s", (int)(n - l), rel);
+        if (cap_find(m, base)) return 1;
+    }
+    return 0;
+}
+
+/* The finding that names a recorded path, if the daemon has one. */
+static int64_t finding_for(cutils_db_t *db, const char *repo, const char *rel)
+{
+    char path[PATH_MAX + 2];
+    snprintf(path, sizeof(path), "/%s", rel);
+    db_result_t *q = NULL;
+    int64_t id = 0;
+    if (db_execute(db, "SELECT id FROM db_findings WHERE repo_id = ? AND path = ?"
+                       " AND engine = 'sqlite' ORDER BY id DESC LIMIT 1",
+                   (const char *[]){ repo, path, NULL }, &q) == 0 && q && q->nrows == 1)
+        id = strtoll(q->rows[0][0], NULL, 10);
+    db_result_free(q);
+    return id;
+}
+
 static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
                                   int64_t snap_id, const char *dest, int dest_fd,
                                   const restore_opts_t *opts, restore_result_t *out)
@@ -1199,6 +1291,8 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
     /* Holds at most one fd; dropped on every return below. */
     dir_cache_t dirs;
     dir_cache_init(&dirs, dest_fd);
+    cap_map_t caps;
+    cap_map_build(&caps, &paths, r);
 
     /*
      * Resume pre-pass. A restore into a partially-populated destination
@@ -1219,6 +1313,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             pt_free(&paths);
             hardlink_map_free(&hlinks);
             db_result_free(r);
+            cap_map_free(&caps);
             return set_error(ERR_NOMEM, "restore: group counts");
         }
         for (int i = 0; i < r->nrows; i++) {
@@ -1289,6 +1384,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         pt_free(&paths);
         hardlink_map_free(&hlinks);
         db_result_free(r);
+        cap_map_free(&caps);
         return set_error(ERR_NOMEM, "restore: directory sweep map");
     }
     dir_cache_init(&batch->dirs, dest_fd);
@@ -1318,6 +1414,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         uint32_t    dminor  = (uint32_t)strtoul(r->rows[i][14], NULL, 10);
 
         char rel[PATH_MAX];
+        char snap_rel[PATH_MAX];
         if (pt_rel(&paths, i, rel, sizeof(rel), 0) != OK) {
             char what[600];
             snprintf(what, sizeof(what), "node %s (named '%s')",
@@ -1334,6 +1431,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
          * its recorded metadata, as in a whole restore, rather than a mode
          * from the daemon's 0077 umask (an item restore's parents came back
          * 0700 where a whole restore gives 0755). Not counted as matched. */
+        snprintf(snap_rel, sizeof(snap_rel), "%s", rel);
         int above = opts->subpath && ntype == NODE_TYPE_DIR && is_above_subpath(rel, opts);
         if (opts->subpath && !above && !path_within(rel, opts->subpath))
             continue;
@@ -1542,6 +1640,31 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         }
 
         /*
+         * Engine copies (db-detection.md 9.5). With prefer_engine_copy a
+         * database comes back from its consistent copy, and its old -wal,
+         * -shm and -journal stay out; without it the raw file is restored
+         * as stored and the copy is named.
+         */
+        const cap_ent_t *ce = ntype == NODE_TYPE_REG ? cap_find(&caps, snap_rel) : NULL;
+        int from_copy = 0;
+        if (ntype == NODE_TYPE_REG && opts->prefer_engine_copy && cap_sibling(&caps, snap_rel)) {
+            log_info("restore: %s left out: its database is restored from its engine copy, "
+                     "which this file would corrupt", full);
+            res.engine_siblings_left_out++;
+            continue;
+        }
+        if (ce) {
+            res.engine_copies++;
+            if (opts->prefer_engine_copy) {
+                chash = r->rows[ce->row][7];
+                from_copy = 1;
+                res.engine_copies_used++;
+                log_info("restore: %s restored from its engine copy (SQLite's online backup) "
+                         "at /%s/%s", full, RESERVED_CAPTURES_DIR, snap_rel);
+            }
+        }
+
+        /*
          * Anything sharing an inode with something already restored is
          * relinked rather than copied. Without this, 30,000 hardlinked files
          * in a source tree came back as 30,000 independent copies: the
@@ -1609,7 +1732,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             continue;
         }
 
-        uint64_t nsize = strtoull(r->rows[i][6], NULL, 10);
+        uint64_t nsize = strtoull(r->rows[from_copy ? ce->row : i][6], NULL, 10);
         if (!opts->overwrite) {
             struct stat sb;
             if (fstatat(pfd, leaf, &sb, AT_SYMLINK_NOFOLLOW) == 0) {
@@ -1694,10 +1817,22 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         }
         /* Restored as stored, and said: the file never settled while the
          * backup read it, so its bytes may mix two versions (OWN-45-LIVE). */
-        if (strtoul(r->rows[i][COL_FLAGS], NULL, 10) & MANIFEST_FLAG_UNSETTLED)
-            log_warn("restore: %s was still changing when it was backed up; "
-                     "restored as stored, and it may not be internally "
-                     "consistent", full);
+        if ((strtoul(r->rows[i][COL_FLAGS], NULL, 10) & MANIFEST_FLAG_UNSETTLED) && !from_copy) {
+            int64_t fid = ce ? 0 : finding_for(db, repo, snap_rel);
+            if (ce)
+                log_warn("restore: %s was stored while changing: live SQLite database. A "
+                         "consistent copy made with SQLite's online backup is in this snapshot "
+                         "at /%s/%s; restore with --prefer-engine-copy to put it in place "
+                         "instead", full, RESERVED_CAPTURES_DIR, snap_rel);
+            else if (fid)
+                log_warn("restore: %s was stored while changing: live SQLite database. The "
+                         "bytes may mix two versions. Enable \"sqlite online backup\" for "
+                         "its source for a consistent copy (finding %lld)", full, (long long)fid);
+            else
+                log_warn("restore: %s was still changing when it was backed up; "
+                         "restored as stored, and it may not be internally "
+                         "consistent", full);
+        }
         if (hgroup != 0) hardlink_remember(&hlinks, hgroup, rel);
     }
     /* Whatever verified before a stop is still worth keeping. */
@@ -1753,6 +1888,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         if (pfd != -1) set_times_at(pfd, leaf, full, strtoll(r->rows[i][5], NULL, 10));
     }
     dir_cache_drop(&dirs);
+    cap_map_free(&caps);
 
     if (opts->bytes_cb && st == OK)
         opts->bytes_cb(opts->progress_ctx, bytes_done + bytes_pending, bytes_total);

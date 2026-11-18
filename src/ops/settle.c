@@ -139,7 +139,8 @@ status_t settle_store_fd(const cdc_params_t *cp, int fd, const struct stat *scan
 
         /* It moved under the read. */
         sr->changed = 1;
-        if (read_no >= SETTLE_MAX_READS || !stat_ok) {
+        int max_reads = opts && opts->settle_reads ? (int)opts->settle_reads : SETTLE_MAX_READS;
+        if (read_no >= max_reads || !stat_ok) {
             add_counts(&r, out);
             *out = r;
             if (!stat_ok) {
