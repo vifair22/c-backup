@@ -1234,6 +1234,16 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
 
 - Every listing pages. No request returns a whole snapshot, which is what
   keeps browsing fast at any size (section 18.4).
+- **A node id is stable only within one index generation.** The `<node-id>`
+  that `ls` takes is a handle into the index, and a reindex of the snapshot
+  (or a gap filled at start) numbers its rows afresh, so an id noted before
+  one can name a different file after it. Every response with node ids
+  carries the snapshot's `index_gen`; a client that passes it back as `gen`
+  gets `409 index rebuilt; re-resolve by path` instead of the wrong
+  directory, and the desktop app does this and re-walks the path it was
+  showing. The CLI takes ids as given, so after a reindex start again from
+  `ls 1 12`. The path is the stable name; a stable node id is a 1.1
+  candidate (docs/api.md, "Node ids and index generations").
 - **Name search** uses a trigram index: substring matches in milliseconds.
   Across all snapshots, a file kept unchanged is one result with a count of
   the snapshots holding it and the newest one's id; a file that changed

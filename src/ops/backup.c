@@ -27,6 +27,7 @@
 #include "tree_build.h"
 #include "reserved.h"
 #include "db_write.h"
+#include "node_gen.h"
 
 #include <cutils/log.h>
 
@@ -2299,12 +2300,22 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
      * the kind above, so nothing about nodes_materialized changes.
      */
     #define NODE_BATCH 2000
+    /* The rows' generation (node_gen.h), drawn before the first batch so a
+     * failed run burns it, and set ahead of the first row. */
+    int64_t gen = 0;
+    status_t gst = node_gen_alloc(p->db, &gen);
+    if (gst != OK) return gst;
+
     batch_t nb;
     memset(&nb, 0, sizeof(nb));
     p->timers->txn_site = PHASE_COMMIT_INDEX;
     status_t bst = db_txn_begin_bulk(p->db);
     if (bst != OK) return bst;
     db_txn_batch_opened(&nb.rule);
+    if (node_gen_set(p->db, p->repo_id, snap_id, gen) != 0) {
+        db_txn_rollback(p->db);
+        return set_error_wrap(ERR_IO, "index_nodes: cannot record the index generation");
+    }
 
     for (uint32_t i = 0; i < p->count; i++) {
         /* In no tree, so in no index row either: the index is derived from
