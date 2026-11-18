@@ -26,6 +26,8 @@
 
 #include <cmocka.h>
 
+#include <cutils/log.h>
+
 #include "helper_policy.h"
 #include "helper_server.h"
 #include "libvirt_backend.h"
@@ -209,12 +211,64 @@ static void test_stale_socket_named(void **state)
     helper_policy_free(&p);
 }
 
+static char g_log[8192];
+
+static void capture_log(const char *ts, const char *level, const char *func, const char *message, void *ud)
+{
+    (void)ts; (void)func; (void)ud;
+    size_t have = strlen(g_log);
+    snprintf(g_log + have, sizeof(g_log) - have, "%s %s\n", level, message);
+}
+
+/*
+ * B214: libvirt's own errors reach the helper's log, at a level, and the
+ * failing call's error; never stderr in libvirt's raw "libvirt: ... error
+ * : ..." form, which is what its default handler printed on every one.
+ */
+static void test_errors_logged_not_printed(void **state)
+{
+    (void)state;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/stderr", D);
+    fflush(stderr);
+    int saved = dup(2);
+    assert_true(saved >= 0);
+    FILE *f = fopen(path, "w");
+    assert_non_null(f);
+    assert_true(dup2(fileno(f), 2) >= 0);
+    g_log[0] = '\0';
+    int h = log_stream_register(capture_log, NULL);
+    assert_true(h >= 0);
+    status_t st = be.ops->list_units(be.ctx, on_unit, NULL);
+    char why[1024];
+    snprintf(why, sizeof(why), "%s", err_msg());
+    err_clear();
+    log_stream_unregister(h);
+    fflush(stderr);
+    assert_true(dup2(saved, 2) >= 0);
+    close(saved);
+    fclose(f);
+    assert_int_not_equal(st, OK);
+    char err[8192] = "";
+    f = fopen(path, "r");
+    assert_non_null(f);
+    size_t n = fread(err, 1, sizeof(err) - 1, f);
+    fclose(f);
+    err[n] = '\0';
+    if (strstr(err, " error : ")) fail_msg("libvirt printed on stderr: %s", err);
+    /* In the log, with its code, at warning: a connect that failed. */
+    if (!strstr(g_log, "warning libvirt (code ")) fail_msg("not logged at warning: [%s]", g_log);
+    /* And in the call's own error, the one a job reports. */
+    assert_non_null(strstr(why, "libvirt: cannot connect to " URI));
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_sweep_keeps, setup, teardown),
         cmocka_unit_test_setup_teardown(test_helper_starts_and_sweeps, setup, teardown),
         cmocka_unit_test_setup_teardown(test_stale_socket_named, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_errors_logged_not_printed, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

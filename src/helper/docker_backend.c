@@ -1699,6 +1699,38 @@ static host_bind_t host_bind_class(const host_tools_t *t, const char *p, const s
 }
 
 /*
+ * Whether the original a copy's bind stands in for is a block device on
+ * the host (B210). A define check runs before the restore writes
+ * target_root, so the copy's own source does not exist yet and its
+ * st_mode says nothing; the restore would then write the device node
+ * there and only the real define, after the data, refused it. The
+ * original is the recorded mount at the same container path, and the
+ * path the remap put under troot with troot taken off; either resolving
+ * to a block device decides it. One that no longer exists on the host
+ * cannot say, and copy_created_ok still stats the created copy's binds.
+ */
+static int orig_is_block(const struct sp_ctx *c, const cJSON *orig, const char *src, const char *dst,
+                         const char *troot)
+{
+    size_t tl = strlen(troot);
+    if (!under_root(src, troot) || src[tl] != '/') return 0;   /* not a restored copy at all */
+    const char *cand[2] = { src + tl, NULL };
+    const cJSON *m;
+    cJSON_ArrayForEach(m, orig) {
+        const char *os = jstr(m, "Source");
+        if (dst[0] && os[0] == '/' && strcmp(jstr(m, "Destination"), dst) == 0 &&
+            (strcmp(jstr(m, "Type"), "bind") == 0 || strcmp(jstr(m, "Type"), "volume") == 0)) { cand[1] = os; break; }
+    }
+    for (size_t i = 0; i < 2; i++) {
+        char real[PATH_MAX];
+        struct stat sb;
+        if (cand[i] && resolve_host(&c->tools, cand[i], real, sizeof(real)) == 0 &&
+            host_stat(&c->tools, real, &sb) == 0 && S_ISBLK(sb.st_mode)) return 1;
+    }
+    return 0;
+}
+
+/*
  * What a copy's bind of src (to the container's dst) is: HB_KEEP, HB_DATA
  * when it is the restored copy (under target_root, inside nothing the
  * original mounts), or HB_REFUSE with why naming the bind and the reason.
@@ -1719,6 +1751,8 @@ static host_bind_t copy_bind(const struct sp_ctx *c, const cJSON *orig, const ch
         fmt_why(why, wsz, "%.300s%s%.300s%s -> %.300s: %s", src, shown ? " (" : "", shown ? shown : "", \
                  shown ? ")" : "", dst[0] ? dst : "?", rr_); return HB_REFUSE; } while (0)
     if (st_ok && S_ISBLK(sb.st_mode)) REFUSE_BIND("a block device");
+    if (!st_ok && troot && orig_is_block(c, orig, src, dst, troot))
+        REFUSE_BIND("a block device, as the original's bind of it is");
     host_bind_t f1 = host_bind_class(&c->tools, src, st_ok ? &sb : NULL, r1, sizeof(r1));
     host_bind_t f2 = have ? host_bind_class(&c->tools, real, st_ok ? &sb : NULL, r2, sizeof(r2)) : f1;
     if (f1 == HB_REFUSE) REFUSE_BIND("%s", r1);

@@ -11,6 +11,9 @@
 #include <cutils/log.h>
 #include <cutils/push.h>
 
+#define CUTILS_CJSON_ALLOW
+#include "cJSON.h"
+
 #include <pthread.h>
 #include <time.h>
 #include <stdio.h>
@@ -619,6 +622,9 @@ typedef struct {
      * reports its end repeatedly writes it once. */
     int            finished_written;
     unsigned       warnings, warnings_shown;
+    /* The same warnings one by one, as shown in the text, for the job's
+     * result (B211); NULL until the first. */
+    cJSON         *warn_list;
 } progress_ctx_t;
 
 /* How often a running job's progress reaches the database. */
@@ -742,6 +748,33 @@ void job_set_warning(void *progress_ctx, const char *text)
     snprintf(pc->warning + have, JOB_WARNINGS_MAX - have, "%s%.*s%s",
              have ? "; " : "", (int)one, text, cut ? "..." : "");
     pc->warnings_shown++;
+    if (!pc->warn_list) pc->warn_list = cJSON_CreateArray();
+    if (pc->warn_list) {
+        size_t at = have ? have + 2 : 0;
+        cJSON_AddItemToArray(pc->warn_list, cJSON_CreateString(pc->warning + at));
+    }
+}
+
+/*
+ * The job's result with its warnings in it (B211): "warning", the one line
+ * the journal records, and "warnings", each one shown in it. The warnings
+ * were journalled and nowhere else, so GET /jobs/<id> (and the list, which
+ * serves the same record) said nothing of a job that completed with one,
+ * a hold left in place included. A result that already names either key
+ * keeps its own; one that is not an object is left as it is. NULL when
+ * nothing changes (or out of memory); the caller frees it.
+ */
+static char *result_with_warnings(const char *result, const char *text, const cJSON *list)
+{
+    if (!text) return NULL;
+    cJSON *o = result ? cJSON_Parse(result) : cJSON_CreateObject();
+    if (!cJSON_IsObject(o)) { cJSON_Delete(o); return NULL; }
+    if (!cJSON_GetObjectItemCaseSensitive(o, "warning")) cJSON_AddStringToObject(o, "warning", text);
+    if (!cJSON_GetObjectItemCaseSensitive(o, "warnings"))
+        cJSON_AddItemToObject(o, "warnings", list ? cJSON_Duplicate(list, 1) : cJSON_CreateArray());
+    char *out = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    return out;
 }
 
 /*
@@ -1068,7 +1101,7 @@ static void *worker_main(void *arg)
         struct timespec began;
         clock_gettime(CLOCK_MONOTONIC, &began);
 
-        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0 };
+        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0, NULL };
         /* A lock error that is not contention (the lock table is full) fails
          * the job through the same reporting as any other failure. */
         status_t st = slot.lock_err != OK
@@ -1091,6 +1124,13 @@ static void *worker_main(void *arg)
          * that left files out, or a guest the watchdog thawed, journalled
          * as a plain success lost the warning for good. */
         char *warn_text = st == OK ? warnings_text(&pc) : NULL;
+        if (warn_text) {
+            char *wr = result_with_warnings(pc.result, warn_text, pc.warn_list);
+            if (wr) {
+                free(pc.result);
+                pc.result = wr;
+            }
+        }
         char *warn_msg = NULL;
         if (st == OK && pc.warnings > 0) {
             outcome = "warning";
@@ -1236,6 +1276,8 @@ static void *worker_main(void *arg)
         free(warn_text);
         free(pc.warning);
         pc.warning = NULL;
+        cJSON_Delete(pc.warn_list);
+        pc.warn_list = NULL;
         if (st != OK && outcome[0] == 'f') err_clear();
 
         if (slot.arg_free) slot.arg_free(slot.arg);

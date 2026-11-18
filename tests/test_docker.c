@@ -695,6 +695,46 @@ static void test_define_copy_host_binds(void **state)
     cpol = &pol;
 }
 
+/*
+ * B210: a copy of a container whose bind, under an include root, is a
+ * block device. The check runs before the restore writes target_root, so
+ * the copy's own source does not exist and its st_mode says nothing; the
+ * original's does. Refused by the check with nothing created and nothing
+ * under the target root, and the same original as a plain file passes.
+ */
+static void test_define_copy_block_original(void **state)
+{
+    (void)state;
+    char blk[PATH_MAX];
+    if (!block_device(blk, sizeof(blk))) { print_message("no block device to bind here; not run\n"); return; }
+    assert_int_equal(symlink(blk, APPS "/web/disk"), 0);
+    static const char *k_blk =
+        "{\"inspect\":{\"Name\":\"/solo\",\"Config\":{\"Image\":\"alpine:3\"},"
+        "\"HostConfig\":{\"Binds\":[\"" TR APPS "/web/%s:/disk\"]},"
+        "\"Mounts\":[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/%s\",\"Destination\":\"/disk\"}]},"
+        "\"image\":{\"RepoTags\":[\"alpine:3\"]},\"name\":\"solocopy\",\"target_root\":\"" TR "\"}";
+    char def[2048];
+    snprintf(def, sizeof(def), k_blk, "disk", "disk");
+    int n0 = fdk.n;
+    cJSON *res = NULL;
+    struct stat sb;
+    for (int check = 1; check >= 0; check--) {
+        status_t st = check ? be.define_check(be.ctx, "solo", def, &pol) : be.define(be.ctx, "solo", def, &pol, &res);
+        assert_int_not_equal(st, OK);
+        const char *m = err_msg();
+        if (!strstr(m, "a block device") || !strstr(m, "nothing created") || !strstr(m, TR APPS "/web/disk -> /disk"))
+            fail_msg("check %d: %s", check, m);
+        err_clear();
+        assert_int_equal(fdk.n, n0);
+        assert_int_not_equal(lstat(TR APPS "/web/disk", &sb), 0);
+    }
+    /* The same bind of a plain file: the check lets it through. */
+    put(APPS "/web/plain", "x");
+    snprintf(def, sizeof(def), k_blk, "plain", "plain");
+    assert_int_equal(be.define_check(be.ctx, "solo", def, &pol), OK);
+    assert_int_equal(fdk.n, n0);
+}
+
 /* B188 for compose: a service volume naming a volume, or a recorded mount
  * with no restored copy, is refused before anything is written. */
 static void test_define_compose_copy(void **state)
@@ -1173,6 +1213,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_in_place_volumes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_copy_host_binds, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_copy_block_original, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_compose_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pause_read, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_scope_job, setup_units, teardown_units),

@@ -82,7 +82,7 @@ typedef struct {
     size_t             filtered;     /* left out by units.allow under --all */
     /* The job's own warning, apart from any unit's: a hold the provider
      * cannot release (the end-of-job sweep). Empty when none. */
-    char               warning[400];
+    char               warning[SP_STUCK_MAX];
     char               scope_note[256]; /* a pause scope the provider could not honour, or "" */
 } unit_backup_result_t;
 

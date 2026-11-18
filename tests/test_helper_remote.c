@@ -348,6 +348,30 @@ static void test_stuck_hold_warns(void **state)
     assert_int_equal(helper_server_holds(srv), 1);
 }
 
+/* B213: the helper's reason reaches the job whole, past the 190
+ * characters it used to be cut at: the detail here takes the provider's
+ * error to about 260, and the end of it ("(injected)") still arrives. */
+static void test_stuck_hold_message_whole(void **state)
+{
+    (void)state;
+    char detail[180];
+    memset(detail, 'd', sizeof(detail) - 1);
+    memcpy(detail, "/mnt/cache/domains/", 19);
+    detail[sizeof(detail) - 1] = '\0';
+    assert_int_equal(helper_server_record(srv, "fake:u9", SP_HOLD_EXPORT, detail), OK);
+    assert_int_equal(fake_hold_plant(fk, "u9", SP_HOLD_EXPORT, detail), OK);
+    fake_fail_set(fk, "u9", FAKE_FAIL_RELEASE, 0);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    fake_fail_clear(fk);
+    assert_non_null(strstr(res.warning, "cannot release export on fake:u9"));
+    assert_non_null(strstr(res.warning, detail));
+    assert_non_null(strstr(res.warning, ", held as /mnt/cache/domains/"));
+    assert_non_null(strstr(res.warning, detail + 100));
+    assert_non_null(strstr(res.warning, "(injected)"));
+    unit_backup_result_free(&res);
+}
+
 /* A configuration blob far past one 64 KiB packet crosses in the describe
  * memfd and restores byte for byte. */
 static void test_large_blob(void **state)
@@ -1143,6 +1167,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_stuck_hold_warns, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_stuck_hold_message_whole, setup, teardown),
         cmocka_unit_test_setup_teardown(test_helper_killed_mid_read, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

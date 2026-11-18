@@ -900,7 +900,12 @@ block device anywhere, judged by `S_ISBLK` on the host path after
 following links (by-id, mapper), as a bind or in `Devices`, and anything
 else under `/etc`, under `/run` or `/var/run`, or under `/boot`, is
 refused, the error naming `<host path> -> <container path>` and the
-reason. Paths are resolved in the host's tree one component at a time, so
+reason. A bind source under `target_root` does not exist yet when the
+define check runs, so its block-device test uses the original it stands in
+for, the recorded mount at the same container path or the path with
+`target_root` taken off, resolved on the host (B210): a device node inside
+an include root is refused before the restore writes it. Paths are
+resolved in the host's tree one component at a time, so
 a restored symlink cannot point a data bind out of `target_root` either. It refuses otherwise, in the
 define check too, so before the daemon writes anything. After the create
 and before any start it inspects what Docker made and removes a container
@@ -912,6 +917,9 @@ started), which covers mounts the definition does not show.
 name>/`, rewriting `lxc.rootfs.path` and `lxc.uts.name`, and regenerating
 `lxc.net.*.hwaddr` unless `keep_macs`; ownership is restored numerically, so
 unprivileged containers keep their shifted ids; `lxc-start` only if asked.
+The config is written with the original's mode, never wider (B212): the
+config replaced, else the original unit's on the host, else `0640`, LXC's
+own. The snapshot holds the config as a blob without its mode.
 
 ## 12. LXC specifics
 

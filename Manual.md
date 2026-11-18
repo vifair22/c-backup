@@ -3204,6 +3204,8 @@ docker run -d --name c-backupd --restart unless-stopped \
   -v /etc/libvirt/qemu/swtpm/tpm-states:/etc/libvirt/qemu/swtpm/tpm-states:ro \
   -v /mnt/cache/system/cbackup-vmstate:/mnt/cache/system/cbackup-vmstate \
   -v /mnt/cache/appdata/.cbackup-restore:/mnt/cache/appdata/.cbackup-restore \
+  -v /mnt/cache/system/.cbackup-restore:/mnt/cache/system/.cbackup-restore \
+  -v /mnt/cache/lxc/.cbackup-restore:/mnt/cache/lxc/.cbackup-restore \
   -v /mnt/cache/appdata/c-backupd:/var/lib/c-backupd \
   -v /mnt/disk3/cbackup:/mnt/disk3/cbackup \
   -p 127.0.0.1:8765:8765 \
@@ -3227,15 +3229,20 @@ Before the first start, as root on the host:
 ```sh
 mkdir -p /mnt/cache/system/c-backup-helper /mnt/cache/appdata/c-backupd \
          /mnt/cache/system/cbackup-vmstate /run/c-backup-helper /run/c-backupd
-install -d -m 0700 /mnt/cache/appdata/.cbackup-restore
+install -d -m 0700 /mnt/cache/appdata/.cbackup-restore \
+                   /mnt/cache/system/.cbackup-restore /mnt/cache/lxc/.cbackup-restore
 chown 990:990 /mnt/cache/appdata/c-backupd \
               /mnt/cache/system/cbackup-vmstate /run/c-backupd /mnt/disk3/cbackup
 chown root:990 /run/c-backup-helper && chmod 0750 /run/c-backup-helper
 ```
 
-The helper gives it to 990 at the first restore, and makes each restore's
+The helper gives each to 990 at the first restore, and makes each restore's
 directory inside it, also owned by 990: the daemon writes there as uid 990
-(22.7.3).
+(22.7.3). FS1 needs one per snapshot domain a unit's data lives in:
+`appdata` for container binds, `system` for Docker volumes (the data root
+is `/mnt/cache/system/docker`) and `lxc` for LXC rootfs and binds, each a
+dataset of its own. Each is bound into the daemon like the appdata one,
+since its own `/mnt/cache` mount is read-only.
 
 On FS2 create `/mnt/cache/system/.cbackup-restore` the same way instead of
 the appdata one. **Restore needs writable mounts the backup does not.**
@@ -3281,6 +3288,15 @@ start. A bind source that does not exist makes `docker run` fail.
 >
 > then recreate the helper with the layout above. Repeat for any other path
 > that was bound under `/mnt/cache` beside an `rshared` bind.
+>
+> A running helper container adds 3 entries of its own to the host's
+> mountinfo, as a container does, and removes them when it stops. A check
+> that counts the whole table (`wc -l < /proc/self/mountinfo` on the host)
+> therefore never expects zero growth while the helper runs: compare the
+> count before and after a helper start or restart. With the layout above
+> it differs by those 3 at most and is the same after every restart; the
+> B186 layout grew by a doubling copy at each one. The per-path check above
+> counts only the state directory and is unaffected.
 
 What each piece is for:
 
@@ -3309,7 +3325,13 @@ The image runs the CLI inside the daemon's container:
 `docker exec c-backupd c-backup unit list docker`.
 
 The helper logs to its console (stdout, errors to stderr), where `docker
-logs c-backup-helper` and the journal find it; it keeps no log database. At
+logs c-backup-helper` and the journal find it; it keeps no log database.
+libvirt's own errors go through that log as `libvirt (code N): ...`, at
+debug for the answers the helper asks for (no such domain, checkpoint or
+snapshot, an unsupported call) and at warning otherwise, and a call that
+fails puts libvirt's message in its error, so the job's error names it.
+They are never printed raw (`libvirt: QEMU Driver error : ...`), as
+libvirt's default handler did (B214). At
 start it logs each provider it enabled, then the socket's owner, group and
 mode, and a **WARNING** when the daemon could not reach the socket: a
 directory on the way that no member of `daemon_gid` (nor `daemon_uid`) may
@@ -4077,6 +4099,14 @@ anonymous (an image's `VOLUME`), becomes a bind of its restored copy at
 | a block device, anywhere, decided by its type on the host after following links (`/dev/disk/by-id/...`, `/dev/mapper/...`), as a bind or in `Devices` | refused |
 | anything else under `/etc`, anything under `/run` (and `/var/run`), anything under `/boot` | refused |
 
+A block device inside an include root is data, captured with the rest, so
+the copy's bind of it is rewritten under `DIR`. The check runs before the
+restore writes anything, when that path does not exist yet, so it judges
+the original the bind stands in for (the recorded mount at the same
+container path, resolved on the host) and refuses before the data or the
+node is written (B210). An original no longer on the host cannot say; the
+check of the created container still finds the node and removes the copy.
+
 Anything else refuses the restore before the container is created, with
 `refused, nothing created` naming the bind (`<host path> -> <container
 path>`) and why: a host path from the table above, a mount with no
@@ -4141,7 +4171,8 @@ directory sits in the mount's own snapshot domain: the first `[snapshot]
 restore_staging_dirs` entry inside that domain; with none, for a whole-pool
 domain (FS2's `/mnt/cache`) `<pool>/system/.cbackup-restore`, beside the
 snapshot directory, and otherwise `<domain>/.cbackup-restore` (FS1:
-`/mnt/cache/appdata/.cbackup-restore`). Wherever it comes from, the helper
+`/mnt/cache/appdata/.cbackup-restore`, `/mnt/cache/system/.cbackup-restore`
+and `/mnt/cache/lxc/.cbackup-restore`, 22.2.1). Wherever it comes from, the helper
 refuses it:
 
 | Where | Why |
@@ -4218,6 +4249,11 @@ ZFS dataset or btrfs pool holding it, as for a Docker mount, B191) and
 swapped like any mount, and its
 config written back to `<[lxc] path>/<name>/config`, the old config moved
 aside to `config.cbackup-old-<time>`, never deleted.
+
+The config is written with the mode of the original's, never wider (B212):
+the config it replaces, or for a copy the original container's, or `0640`
+(LXC's own) when neither is on the host. The snapshot holds the config
+without its mode, so the original on the host is what decides.
 
 Under a new name (`--name N --target-root DIR`):
 
