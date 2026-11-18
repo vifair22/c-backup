@@ -2302,8 +2302,42 @@ the dialogs say "on <host>".
 For a repository: dashboard, snapshots and the snapshot browser (with file
 preview and restore), name search, content search, snapshot diff, retention
 policy, tags, journal, tasks (jobs), schedules, verify runs, encryption and
-key, object and pack introspection. The daemon status screen covers the
-daemon as a whole.
+key, databases, units, object and pack introspection. The daemon status
+screen covers the daemon as a whole.
+
+**Units.** The repository's **Units** screen lists the virtual machines and
+containers of one source provider at a time (section 22), chosen by the
+provider buttons; a provider behind the helper shows whether the helper is
+connected, and the last error when it is not. Each row is a unit
+`units.allow` takes (the screen shows the globs, section 22.9), with its
+state as the provider reports it now, its newest snapshot in this
+repository, the level that snapshot achieved and how many there are. A unit
+with snapshots here that its provider no longer lists stays in the list as
+`not listed`, so its snapshots stay reachable.
+
+Backing up from this screen is `c-backup unit backup` (22.6.1): tick units
+and **Back up selected**, or **Back up all**, which enumerates the provider's
+units when the job starts, less the globs typed in **Exclude** (comma
+separated; they apply only to Back up all, as `--exclude` applies only with
+`--all`). **Require** is `--require` (default `crash`) and **Pause scope** is
+`--pause-scope` (default `unit`). The job is followed to its end on the
+screen: each unit's outcome, snapshot, level, bytes read and freeze time,
+every warning, and the job's error as the daemon wrote it. A unit that
+cannot reach the required level fails on its own, in the daemon's words
+(`unit N: achieved crash, below the required quiesced`), and the others
+still produce their snapshots.
+
+Opening a unit shows its page: its state, capabilities and items as the
+provider describes them now, **Back up now** for that unit alone (with
+Require), and its snapshots in this repository, newest first, each with its
+level, files, size and every item with how it was read (`full` or
+`incremental`, the reason, and the bytes read), plus **Browse** into the
+snapshot. Below them are the journal's unit operations (`units`,
+`unit-restore`, `unit-define`, `nbd-export`, `reset-incremental`,
+`detect`). The journal records no unit key, so this is the repository's unit
+activity rather than this unit's alone: entries that name the unit, or one
+of its snapshots, are shown brighter, and a tick limits the list to them. A
+backup of several units says how many, not which, so it never names one.
 
 **Snapshot mode in the backup dialog.** Editing the sources shows, for each
 path, a snapshot mode: Off (read live), Strict or Warn (6.6). Saving sends
@@ -4252,6 +4286,8 @@ c-backup schedule add 1 units --every day --at 01:00 --provider libvirt --unit c
 c-backup unit history 1                          # units with history here
 c-backup unit history 1 --provider docker compose:immich
 ```
+
+The desktop app's **Units** screen does the same (section 15.4).
 
 A units job takes the repository like any job (section 6.4) and produces one
 snapshot per unit. A failed unit does not stop the others; the job fails
