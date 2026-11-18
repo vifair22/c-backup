@@ -34,12 +34,20 @@ COPY . /build
 # memory, and a memory error stops the daemon with a report in its log
 # rather than corrupting something quietly. The binaries keep their normal
 # names in the image either way.
+#
+# VARIANT=tsan builds with ThreadSanitizer instead (it cannot be combined
+# with ASan): data races and lock-order inversions are reported in the log
+# and the daemon keeps running, so a race on real data leaves a report with
+# both stacks rather than a corruption nobody can trace. Expect it to be
+# several times slower and to use far more memory than release.
 ARG VARIANT=release
-RUN if [ "$VARIANT" = asan ]; then \
-        make CUTILS_DIR=/c-utils MARCH=x86-64-v2 MTUNE=generic asan \
-        && mv build/bins/c-backupd-asan build/bins/c-backupd \
-        && mv build/bins/c-backup-asan build/bins/c-backup \
-        && mv build/bins/c-backup-helper-asan build/bins/c-backup-helper; \
+RUN if [ "$VARIANT" = asan ] || [ "$VARIANT" = tsan ]; then \
+        make CUTILS_DIR=/c-utils MARCH=x86-64-v2 MTUNE=generic "$VARIANT" \
+        && mv "build/bins/c-backupd-$VARIANT" build/bins/c-backupd \
+        && mv "build/bins/c-backup-$VARIANT" build/bins/c-backup \
+        && mv "build/bins/c-backup-helper-$VARIANT" build/bins/c-backup-helper; \
+    elif [ "$VARIANT" != release ]; then \
+        echo "unknown VARIANT=$VARIANT (release, asan or tsan)" >&2; exit 1; \
     else \
         make CUTILS_DIR=/c-utils MARCH=x86-64-v2 MTUNE=generic; \
     fi
@@ -90,6 +98,10 @@ ENV C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys
 # Read only by an asan build; harmless otherwise. Leak checks run at exit,
 # which a SIGTERM stop now reaches through the daemon's own shutdown.
 ENV ASAN_OPTIONS=detect_leaks=1:print_summary=1
+# Read only by a tsan build. second_deadlock_stack gives both stacks of a
+# lock-order inversion; history_size=4 keeps the other access of a race in
+# the report on a long-running daemon instead of "failed to restore stack".
+ENV TSAN_OPTIONS=second_deadlock_stack=1:history_size=4
 EXPOSE 8765
 # No VOLUME: the helper runs from this image too, and a VOLUME line made
 # Docker create an anonymous volume at every helper start, which nothing
