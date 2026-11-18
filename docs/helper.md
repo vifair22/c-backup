@@ -372,6 +372,10 @@ helper's, as for `capture.begin`:
   left out), which the snapshot shows as empty directories; `snapshots`
   names each snapshot by domain. With at least one path snapshotted it
   also carries `capture`, `expires` and `snapshot_ms`.
+- **No action outside the policy.** For a path it does not snapshot the
+  helper does nothing beyond placing it: resolving it and listing the
+  datasets, which names no path. Nothing is snapshotted, read or listed
+  under it (`test_begin_paths` asserts the fake tools' call logs).
 - **Nothing to snapshot.** A request where no path can be snapshotted takes
   no capture and does not count against `max_captures_per_hour`; the answer
   is `ok` with only `live`.

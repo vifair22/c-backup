@@ -270,20 +270,45 @@ static void test_unsnapshottable_paths_are_reported(void **state)
     assert_non_null(strstr(field(res, "live", D "/missing"), "cannot be resolved"));
     assert_non_null(strstr(field(res, "live", "/proc/self"), "host facility"));
     assert_int_equal(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(res, "live")), 3);
+    /* The snapshot command names only the one dataset in the policy. */
+    assert_int_equal(count(FSTATE "/zfs.log", CACHE "/other"), 0);
+    assert_int_equal(count(FSTATE "/zfs.log", "missing"), 0);
+    assert_int_equal(count(FSTATE "/zfs.log", "zfs snapshot"), 1);
+    assert_int_equal(count(FSTATE "/zfs.log", "cache/appdata@"), 1);
+    assert_int_equal(count(FSTATE "/zfs.log", "cache@"), 0);
     end_capture("capture.end", cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture")));
     cJSON_Delete(o);
 }
 
-/* Nothing it can snapshot: no capture, nothing taken, and the hourly
- * budget not spent on it. */
+/* Every line of a fake tool's log is one of the read-only listings domain
+ * resolution makes, none of which names a path. */
+static void only_listings(const char *log)
+{
+    char *t = slurp(log);
+    for (char *l = strtok(t, "\n"); l; l = strtok(NULL, "\n"))
+        if (strcmp(l, "zfs list -H -o name,mountpoint -t filesystem") != 0)
+            fail_msg("%s: a call beyond domain resolution: %s", log, l);
+}
+
+/*
+ * Nothing it can snapshot: no capture, nothing taken, and the hourly budget
+ * not spent on it. A path outside the policy gets no action at all: the
+ * only tool calls are the dataset listing that places it, which names no
+ * path; nothing is snapshotted, read or listed under it.
+ */
 static void test_nothing_to_snapshot_takes_no_capture(void **state)
 {
     (void)state;
     hstart(86400, 1);
+    put(FSTATE "/zfs.log", "");      /* what the start-up sweep listed */
     cJSON *o = call("capture.begin_paths", "{\"paths\":[\"" CACHE "/other\"]}");
     assert_true(ok(o));
     assert_null(cJSON_GetObjectItemCaseSensitive(result(o), "capture"));
     assert_int_equal(count(FSTATE "/zfs.log", "zfs snapshot"), 0);
+    assert_int_equal(count(FSTATE "/zfs.log", CACHE "/other"), 0);
+    only_listings(FSTATE "/zfs.log");
+    assert_int_equal(access(FSTATE "/btrfs.log", F_OK), -1);
+    assert_string_equal(slurp(FSTATE "/snaps"), "");
     cJSON_Delete(o);
     o = call("capture.begin_paths", "{\"paths\":[\"" CACHE "/Photos\"]}");
     assert_true(ok(o));
