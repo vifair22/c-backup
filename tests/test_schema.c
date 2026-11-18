@@ -213,7 +213,10 @@ static void test_one_baseline_migration(void **state)
     /* Dropped packs' numbers (B156). */
     assert_non_null(app_migrations[5].name);
     assert_string_equal(app_migrations[5].name, "007_pack_tombstones.sql");
-    assert_null(app_migrations[6].name);
+    /* Reserved id marks (B217). */
+    assert_non_null(app_migrations[6].name);
+    assert_string_equal(app_migrations[6].name, "008_id_reserve.sql");
+    assert_null(app_migrations[7].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */

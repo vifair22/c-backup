@@ -74,6 +74,8 @@
 #include "fake_provider.h"
 #include "fault_inject.h"
 #include "gc.h"
+#include "id_reserve.h"
+#include "job_manager.h"
 #include "index_reconcile.h"
 #include "object.h"
 #include "pack.h"
@@ -2538,6 +2540,179 @@ static void check_api_sources(int crash_at, int kept, int started)
     free(v);
 }
 
+/* ---- Ids handed out (B217) -------------------------------------------
+ *
+ * A job submission is commit-only, so a cut within the second after it may
+ * take the job back. What it must never do is take back the id while a
+ * client keeps it: the next job after the restart got the same one, and the
+ * CLI, the log line and the alert named an unrelated job. So the start is
+ * the daemon's (id_reserve_open), jobs go through job_submit and schedules
+ * through the route, and every id either one answered with, before the cut
+ * or after it, has to stay unissued after the restart, whichever way the
+ * index comes back.
+ *
+ * A small block, so the run crosses several reservations and a cut lands
+ * between each mark's commit and its sync.
+ */
+#define IDS_BLOCK  4
+#define IDS_EACH   6
+#define IDS_MAX    (IDS_EACH + 1)
+
+static int64_t    g_ids_job[IDS_MAX], g_ids_sched[IDS_MAX];
+static int        g_nids_job, g_nids_sched;
+static int        g_counted_job, g_counted_sched;   /* the run with no cut */
+static atomic_int g_hold_started;
+
+/* Keeps the one worker busy, so the jobs after it stay queued and the
+ * run's commits come in the order the test makes them. */
+static status_t hold_job(void *arg, atomic_int *cancel,
+                         void (*progress)(const char *, uint64_t, uint64_t, void *),
+                         void *progress_ctx)
+{
+    (void)arg; (void)progress; (void)progress_ctx;
+    atomic_store(&g_hold_started, 1);
+    while (!atomic_load(cancel)) usleep(1000);
+    return OK;
+}
+
+static status_t noop_job(void *arg, atomic_int *cancel,
+                         void (*progress)(const char *, uint64_t, uint64_t, void *),
+                         void *progress_ctx)
+{
+    (void)arg; (void)cancel; (void)progress; (void)progress_ctx;
+    return OK;
+}
+
+/* A schedule through the route; its id from the answer, 0 when refused. */
+static int64_t api_new_schedule(ctx_t *c)
+{
+    routes_metadata_init(c->db);
+    routes_schedules_init(c->db, NULL);
+    api_server_t *srv = api_server_create(0, NULL, NULL, NULL);
+    assert_non_null(srv);
+    assert_int_equal(routes_register_repos(srv, c->db), 0);
+    api_server_set_after_write(srv, api_after_write, c->db);
+    char url[160];
+    snprintf(url, sizeof(url), "/repos/%lld/schedules", (long long)g_repo_id);
+    const char *body = "{\"action\":\"gc\",\"trigger\":{\"type\":\"interval\",\"seconds\":86400}}";
+    api_request_t req = { .method = API_POST, .url = url, .body = body,
+                          .body_len = strlen(body), .is_local = 1, .client_addr = "" };
+    api_response_t r = api_server_dispatch(srv, &req);
+    int64_t id = 0;
+    const char *p = r.status == 201 && r.body ? strstr(r.body, "\"id\":") : NULL;
+    if (p) id = strtoll(p + 5, NULL, 10);
+    free(r.body);
+    free(r.set_cookie);
+    api_server_stop(srv);
+    return id;
+}
+
+static status_t op_ids(ctx_t *c, int counting)
+{
+    g_nids_job = g_nids_sched = 0;
+    atomic_store(&g_hold_started, 0);
+    /* The start, as c-backupd's: a cut can land in it too. */
+    status_t st = id_reserve_open(c->db, IDS_BLOCK);
+    if (counting && st != OK) return st;
+    err_clear();
+    job_manager_t *jm = NULL;
+    if (job_manager_start(c->db, 1, &jm) != OK) {
+        id_reserve_forget();
+        return ERR_IO;
+    }
+    int64_t id = 0;
+    if (job_submit(jm, 0, "b217-hold", NULL, hold_job, NULL, NULL, &id) == OK) {
+        g_ids_job[g_nids_job++] = id;
+        for (int i = 0; i < 20000 && !atomic_load(&g_hold_started); i++) usleep(500);
+        assert_true(atomic_load(&g_hold_started));
+    }
+    err_clear();
+    int64_t queued[IDS_EACH];
+    int nq = 0;
+    for (int k = 0; k < IDS_EACH; k++) {
+        /* Refused is allowed once the cut has come: a mark that cannot be
+         * made durable hands out no id. Before it, every call succeeds. */
+        if (job_submit(jm, 0, "b217", NULL, noop_job, NULL, NULL, &id) == OK) {
+            g_ids_job[g_nids_job++] = id;
+            queued[nq++] = id;
+        } else if (counting) {
+            fail_msg("job_submit with no cut: %s", err_msg());
+        }
+        err_clear();
+        int64_t sid = api_new_schedule(c);
+        if (sid > 0) g_ids_sched[g_nids_sched++] = sid;
+        else if (counting) fail_msg("schedule create with no cut: %s", err_msg());
+        err_clear();
+    }
+    /* Queued jobs cancelled here, in order, and only then the held one, so
+     * the commits after the submissions do not race each other. */
+    for (int k = 0; k < nq; k++) {
+        (void)job_cancel(jm, queued[k]);
+        err_clear();
+    }
+    job_manager_stop(jm);
+    /* The power goes, or the process is killed: nothing is trimmed. */
+    id_reserve_forget();
+    if (counting) {
+        g_counted_job = g_nids_job;
+        g_counted_sched = g_nids_sched;
+    }
+    return OK;
+}
+
+static int64_t max_of(const int64_t *v, int n)
+{
+    int64_t m = 0;
+    for (int i = 0; i < n; i++)
+        if (v[i] > m) m = v[i];
+    return m;
+}
+
+static void check_ids(int crash_at, int kept, int started)
+{
+    (void)crash_at; (void)kept;
+    if (!started) return;
+    /* The next start's own reservation, then a new id in each table. */
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, H_DB), 0);
+    if (id_reserve_open(db, IDS_BLOCK) != OK) violation("id reservation at start: %s", err_msg());
+    err_clear();
+    db_result_t *r = NULL;
+    int64_t job = 0, sched = 0;
+    if (db_write_returning(db, "INSERT INTO jobs (action, state, origin)"
+                               " VALUES ('after', 'queued', 'api') RETURNING id",
+                           NULL, &r) == 0 && r && r->nrows == 1)
+        job = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    r = NULL;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)g_repo_id);
+    if (db_write_returning(db,
+            "INSERT INTO schedules (repo_id, action, params, trigger_type, trigger_spec,"
+            " on_overlap, catchup, enabled, next_due_at, created_at)"
+            " VALUES (?, 'gc', '', 'interval', '86400', 'skip', 'skip', 1, 0, 0) RETURNING id",
+            (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        sched = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    id_reserve_forget();
+    db_close(db);
+
+    int64_t mj = max_of(g_ids_job, g_nids_job), ms = max_of(g_ids_sched, g_nids_sched);
+    if (job <= 0 || sched <= 0) violation("cannot insert after the start: %s", err_msg());
+    if (job > 0 && job <= mj)
+        violation("job id %lld issued again after the restart (handed out up to %lld)",
+                  (long long)job, (long long)mj);
+    if (sched > 0 && sched <= ms)
+        violation("schedule id %lld issued again after the restart (handed out up to %lld)",
+                  (long long)sched, (long long)ms);
+}
+
+static void build_ids(ctx_t *c)
+{
+    build_api(c);
+    g_nids_job = g_nids_sched = 0;
+}
+
 static const scenario_t S_BACKUP_FIRST = { "backup, first", build_backup_first,
                                            op_backup_first, 0, 0, 0, NULL, 0 };
 static const scenario_t S_BACKUP_INCR  = { "backup, incremental", build_backup_incr,
@@ -2574,6 +2749,17 @@ static const scenario_t S_API_NOTE     = { "API note (commit-only)", build_api, 
 static const scenario_t S_API_SOURCES  = { "API sources (commit-only)", build_api,
                                            op_api_sources, 0, 0, 0, check_api_sources, 0 };
 
+static const scenario_t S_IDS          = { "ids handed out (B217)", build_ids, op_ids,
+                                           0, 0, 0, check_ids, 0 };
+
+static void test_ids(void **state)
+{
+    (void)state;
+    every_cut(&S_IDS);
+    /* The run handed out ids in both tables and crossed reservations. */
+    assert_int_equal(g_counted_job, IDS_EACH + 1);
+    assert_int_equal(g_counted_sched, IDS_EACH);
+}
 static void test_api_tag(void **state)        { (void)state; every_cut(&S_API_TAG); }
 static void test_api_sched_del(void **state)  { (void)state; every_cut(&S_API_SCHED_DEL); }
 static void test_api_note(void **state)       { (void)state; every_cut(&S_API_NOTE); }
@@ -2791,6 +2977,7 @@ int main(void)
         cmocka_unit_test(test_api_sched_del),
         cmocka_unit_test(test_api_note),
         cmocka_unit_test(test_api_sources),
+        cmocka_unit_test(test_ids),
         cmocka_unit_test(test_prune_unlinks_the_record_after_the_commit_is_durable),
         cmocka_unit_test(test_start_finishes_an_interrupted_prune),
         cmocka_unit_test(test_reindex_finishes_an_interrupted_prune),

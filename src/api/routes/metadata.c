@@ -984,9 +984,20 @@ int journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
                    const char *operation, const char *result,
                    int64_t duration_ms, const char *message)
 {
-    char repo[32], dur[32];
+    return journal_record_at(db, repo_id, 0, source, operation, result, duration_ms,
+                             message);
+}
+
+int journal_record_at(cutils_db_t *db, int64_t repo_id, int64_t ts, const char *source,
+                      const char *operation, const char *result,
+                      int64_t duration_ms, const char *message)
+{
+    char repo[32], dur[32], when[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(dur,  sizeof(dur),  "%lld", (long long)duration_ms);
+    /* "" is now: c-utils binds no NULL, and the INSERT reads it back. */
+    if (ts > 0) snprintf(when, sizeof(when), "%lld", (long long)ts);
+    else        when[0] = '\0';
 
     /*
      * Journal ids are per repo, so the sequence is derived rather than a
@@ -1004,11 +1015,12 @@ int journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
     if (db_write(db,
             "INSERT INTO journal (repo_id, id, ts, source, operation, result,"
             " duration_ms, message)"
-            " SELECT ?1, COALESCE(MAX(id), 0) + 1, strftime('%s','now'),"
+            " SELECT ?1, COALESCE(MAX(id), 0) + 1,"
+            "        COALESCE(CAST(NULLIF(?7, '') AS INTEGER), strftime('%s','now')),"
             "        ?2, ?3, ?4, ?5, ?6"
             "   FROM journal WHERE repo_id = ?1",
             (const char *[]){ repo, source, operation, result, dur,
-                  message ? message : "", NULL }, NULL) != 0) {
+                  message ? message : "", when, NULL }, NULL) != 0) {
         log_warn("journal: cannot record %s/%s: %s", operation, result, err_msg());
         return -1;
     }

@@ -212,6 +212,12 @@ the daemon refuses to start with a write route that has neither, and
   a second of the answer can lose that last edit. It cannot corrupt
   anything: the database opens and the repository and its index agree
   after the next start, with the edit either wholly there or wholly not.
+  An edit a cut takes back never gives its id to anything else: a job,
+  schedule, search or verify run, export or repository id that was in an
+  answer is not issued again after the restart, though the row itself may
+  be gone. After an unclean stop the next ids skip ahead (at most 256 per
+  table) to guarantee it. About one answer in 128 that creates a row also
+  waits for one sync, which keeps that promise (B217).
 
 The sync is the only cost the durable class adds, and it depends on the
 disk under `state.db` and what else is writing to it: about 25 ms at the
