@@ -24,6 +24,7 @@ import { SchedulesView } from './SchedulesView'
 import { VerifyView } from './VerifyView'
 import { KeyView } from './KeyView'
 import { GrepView } from './GrepView'
+import { DatabasesView, useUncoveredDatabases } from './DatabasesView'
 import { useTheme, type ThemeMode } from './useTheme'
 
 const api = window.cbackup
@@ -70,7 +71,7 @@ export function App(): React.ReactElement {
        || activeRepo.path.split('/').pop() || activeRepo.path)
     : ''
   // Navigation history
-  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' } | { view: 'verify' } | { view: 'encryption' } | { view: 'grep'; prefix?: string }
+  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' } | { view: 'verify' } | { view: 'encryption' } | { view: 'grep'; prefix?: string } | { view: 'databases'; scope?: string }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
   /*
    * The daemon status screen is scoped to a connection, not a repository, so
@@ -129,6 +130,11 @@ export function App(): React.ReactElement {
   const [sourcesLoading, setSourcesLoading] = useState(false)
   const [backupVerify, setBackupVerify] = useState(false)
   const [backupStarting, setBackupStarting] = useState(false)
+  /* Asked only while the dialog is open: the sources list is the "sources
+   * page" db-detection.md section 12 means, and an uncovered database under
+   * a source is worth seeing before pressing Start. */
+  const sourceDbs = useUncoveredDatabases(
+    showBackupModal && activeRepo ? activeRepo.conn : '', activeRepo?.id ?? 0)
 
   // Dialogs
   const [showAddConnection, setShowAddConnection] = useState(false)
@@ -727,6 +733,7 @@ export function App(): React.ReactElement {
                 onViewSchedules={() => navigateTo({ view: 'schedules' })}
                 onViewVerify={() => navigateTo({ view: 'verify' })}
                 onViewEncryption={() => navigateTo({ view: 'encryption' })}
+                onViewDatabases={() => navigateTo({ view: 'databases' })}
                 onViewGrep={() => navigateTo({ view: 'grep' })}
                 onViewTasks={() => navigateTo({ view: 'tasks' })}
                 onHashLookup={() => navigateTo({ view: 'hash-lookup' })}
@@ -790,6 +797,11 @@ export function App(): React.ReactElement {
                 initialPrefix={currentView.prefix}
                 onBack={navBack}
               />
+            )}
+            {currentView.view === 'databases' && (
+              <DatabasesView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
+                initialScope={currentView.scope}
+                onBack={navBack} />
             )}
             {currentView.view === 'journal' && (
               <JournalView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
@@ -1088,7 +1100,25 @@ export function App(): React.ReactElement {
               ) : (
                 <>
                   <ul className="text-xs font-mono m-0 pl-4 text-text-primary">
-                    {sources.map(p => <li key={p} className="truncate">{p}</li>)}
+                    {sources.map(p => {
+                      const n = sourceDbs?.byScope.get(`source:${p}`) ?? 0
+                      return (
+                        <li key={p} className="truncate">
+                          {p}
+                          {n > 0 && (
+                            <button onClick={() => {
+                              setShowBackupModal(false)
+                              navigateTo({ view: 'databases', scope: `source:${p}` })
+                            }}
+                              title="live databases under this source are captured uncovered"
+                              className="ml-2 px-1.5 rounded text-[10px] font-sans font-semibold
+                                         bg-status-error text-white border-none cursor-pointer">
+                              {n} uncovered database{n === 1 ? '' : 's'}
+                            </button>
+                          )}
+                        </li>
+                      )
+                    })}
                   </ul>
                   {excludes.length > 0 && (
                     <>

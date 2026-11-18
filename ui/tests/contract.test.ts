@@ -41,7 +41,9 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import type { ApiKind, ApiRequest } from '../src/shared/api.ts'
-import type { WireRepo, WireSchedule, WireTag, WireVerifyRun } from '../src/shared/wire.ts'
+import type {
+  WireDbFinding, WireDbFindingPage, WireRepo, WireSchedule, WireTag, WireVerifyRun,
+} from '../src/shared/wire.ts'
 import { toEndpoint } from '../src/main/client.ts'
 
 const ROUTER_404 = 'not found'
@@ -188,6 +190,12 @@ const SAMPLES: Record<ApiKind, ApiRequest> = {
   tagSet:          { kind: 'tagSet', repoId: 1, name: 'contract', snapshotId: 1 },
   tagRemove:       { kind: 'tagRemove', repoId: 1, name: 'contract' },
   journal:         { kind: 'journal', repoId: 1, limit: 5 },
+
+  dbList:          { kind: 'dbList', repoId: 1, coverage: 'uncovered', limit: 5 },
+  dbShow:          { kind: 'dbShow', repoId: 1, findingId: 9999 },
+  /* A unit that does not exist, with a ':' in its name the way compose
+   * units have: the route must still be the one that answers. */
+  unitDetect:      { kind: 'unitDetect', repoId: 1, provider: 'docker', unit: 'compose:contract-probe' },
 
   scheduleList:    { kind: 'scheduleList', repoId: 1 },
   scheduleAdd:     { kind: 'scheduleAdd', repoId: 1, action: 'verify',
@@ -467,6 +475,50 @@ describe('the flows behind the buttons', () => {
      * key screen. */
     const plain = await request(toEndpoint({ kind: 'repoShow', repoId: 1 }))
     assert.equal((plain.body as { encryption?: string }).encryption, 'none')
+  })
+
+  test('databases: the list pages and filters with the pinned shape', async () => {
+    /*
+     * The Databases screen reads findings and total, groups by scope and
+     * pages by offset, and the dashboard badge reads the uncovered count.
+     * A contract fixture is a plain file with no database in it, so the
+     * list is empty; what is asserted is the envelope every one of those
+     * reads depends on, that each filter is accepted, and that a finding
+     * which does exist carries the fields the card renders.
+     */
+    const all = await request(toEndpoint({ kind: 'dbList', repoId: 1 }))
+    assert.equal(all.status, 200, `database list was refused: ${JSON.stringify(all.body)}`)
+    const page = all.body as WireDbFindingPage
+    assert.ok(Array.isArray(page.findings), 'findings is not an array')
+    assert.equal(typeof page.total, 'number')
+
+    for (const f of page.findings as WireDbFinding[]) {
+      for (const k of ['id', 'first_seen', 'last_seen'] as const) assert.equal(typeof f[k], 'number', k)
+      for (const k of ['scope', 'engine', 'path', 'confidence', 'state'] as const) {
+        assert.equal(typeof f[k], 'string', k)
+      }
+      assert.match(f.scope, /^(unit|source):/)
+      assert.ok(f.evidence === null || typeof f.evidence === 'object')
+    }
+
+    /* Every filter the screen offers, including the two that are not a
+     * coverage name: "none" for unassessed, and a scope with a ':' in it. */
+    const filters: Partial<Extract<ApiRequest, { kind: 'dbList' }>>[] = [
+      { coverage: 'uncovered' }, { coverage: 'none' }, { coverage: 'covered-crash' },
+      { engine: 'postgres' }, { state: 'dismissed' },
+      { scope: 'unit:docker:compose:contract' }, { scope: 'source:/nonexistent' },
+      { limit: 1, offset: 0 }, { limit: 1000, offset: 5 },
+    ]
+    for (const q of filters) {
+      const r = await request(toEndpoint({ kind: 'dbList', repoId: 1, ...q }))
+      assert.equal(r.status, 200, `filter ${JSON.stringify(q)} was refused: ${JSON.stringify(r.body)}`)
+      assert.ok(Array.isArray((r.body as WireDbFindingPage).findings))
+    }
+
+    /* A finding that is not there is the handler's 404, not the router's. */
+    const one = await request(toEndpoint({ kind: 'dbShow', repoId: 1, findingId: 9999 }))
+    assert.equal(one.status, 404)
+    assert.notEqual((one.body as { error?: string }).error, ROUTER_404)
   })
 
   test('the maintenance menu starts every operation it offers', async () => {
