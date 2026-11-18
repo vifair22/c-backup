@@ -739,3 +739,22 @@ build:image:uat-asan:
     - docker push "$CI_REGISTRY_IMAGE:uat-asan"
   only:
     - /^uat\//
+
+# UAT only, never merged: the same branch built with ThreadSanitizer, for
+# running on real data. Tagged :uat-tsan-<sha> and :uat-tsan. A TSan daemon
+# starts slower than the others, hence the longer wait before the check.
+build:image:uat-tsan:
+  extends: build:image
+  needs: []
+  script:
+    - docker build --provenance=false --sbom=false --build-arg VARIANT=tsan -t "$CI_REGISTRY_IMAGE:uat-tsan-$CI_COMMIT_SHORT_SHA" -t "$CI_REGISTRY_IMAGE:uat-tsan" .
+    - docker run -d --name smoke-uat-tsan "$CI_REGISTRY_IMAGE:uat-tsan-$CI_COMMIT_SHORT_SHA"
+    - sleep 12
+    - docker ps --filter name=smoke-uat-tsan --filter status=running | grep -q smoke-uat-tsan
+    - docker logs smoke-uat-tsan
+    - docker rm -f smoke-uat-tsan
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker push "$CI_REGISTRY_IMAGE:uat-tsan-$CI_COMMIT_SHORT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE:uat-tsan"
+  only:
+    - /^uat\//
