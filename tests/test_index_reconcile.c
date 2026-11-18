@@ -33,6 +33,10 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "gc.h"
+#include "prune.h"
+#include "restore.h"
+#include "verify.h"
 #include "db_txn.h"
 #include "routes.h"
 #include "index_reconcile.h"
@@ -317,6 +321,195 @@ static void test_a_full_disk_at_the_snapshot_row_reports_the_written_snapshot(vo
     full_vfs_arm(0);
     check_unindexed_snapshot(&res, st);
     backup_result_free(&res);
+}
+
+/*
+ * B200: a gap below the highest indexed id. Snapshot 1 is left unindexed
+ * the B195 way and holds a file nothing later has; later snapshots are
+ * indexed after it. Reconcile used to look only above the highest indexed
+ * id and so never saw it, and gc, which marks from the index, swept what
+ * only snapshot 1 holds.
+ */
+#define GAP_BYTES  (300u * 1024u)
+#define GAP_FILE   TEST_SRC "/only-in-one.bin"
+
+static void gap_content(uint8_t *buf, size_t n)
+{
+    uint64_t x = 0x9e3779b97f4a7c15ull;
+    for (size_t i = 0; i < n; i++) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        buf[i] = (uint8_t)x;
+    }
+}
+
+/* Snapshot 1 unindexed, holding GAP_FILE; then `later` indexed backups
+ * without it, each a small pack of its own. */
+static void make_gap(int later)
+{
+    uint8_t *buf = malloc(GAP_BYTES);
+    assert_non_null(buf);
+    gap_content(buf, GAP_BYTES);
+    FILE *f = fopen(GAP_FILE, "wb");
+    assert_non_null(f);
+    assert_int_equal(fwrite(buf, 1, GAP_BYTES, f), GAP_BYTES);
+    fclose(f);
+    free(buf);
+
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    atomic_store(&fill_on_nodes, 1);
+    status_t st = backup_run(store, db, repo_id, &o, &res);
+    atomic_store(&fill_on_nodes, 0);
+    full_vfs_arm(0);
+    assert_int_not_equal(st, OK);
+    assert_int_equal(res.snapshot_unindexed, 1);
+    assert_int_equal(res.snapshot_id, 1);
+    backup_result_free(&res);
+    err_clear();
+
+    assert_int_equal(unlink(GAP_FILE), 0);
+    for (int k = 0; k < later; k++) {
+        char c[32];
+        snprintf(c, sizeof(c), "later %d\n", k);
+        backup_once(c);
+    }
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id = 1"), 0);
+    assert_int_equal(scalar("SELECT MAX(id) FROM snapshots WHERE repo_id = ?"), later + 1);
+}
+
+/* Snapshot 1 restores byte for byte, and a deep verify of everything the
+ * index lists is clean. */
+static void gap_intact(void)
+{
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id = 1"), 1);
+    rmrf(TEST_DIR "/out");
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, 1, TEST_DIR "/out", &ro, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+
+    uint8_t *want = malloc(GAP_BYTES), *got = malloc(GAP_BYTES + 1);
+    assert_non_null(want);
+    assert_non_null(got);
+    gap_content(want, GAP_BYTES);
+    FILE *f = fopen(TEST_DIR "/out" GAP_FILE, "rb");
+    assert_non_null(f);
+    assert_int_equal(fread(got, 1, GAP_BYTES + 1, f), GAP_BYTES);
+    fclose(f);
+    assert_memory_equal(got, want, GAP_BYTES);
+    free(want);
+    free(got);
+
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &vr), OK);
+    assert_true(vr.checked > 0);
+    assert_int_equal(vr.missing, 0);
+    assert_int_equal(vr.unrecoverable, 0);
+    assert_int_equal(vr.recoverable, 0);
+}
+
+static status_t gc_once(gc_result_t *g, int dry)
+{
+    memset(g, 0, sizeof(*g));
+    return gc_run(store, db, repo_id, dry, NULL, g);
+}
+
+/* A restart finds the gap and the reindex it asks for indexes it. */
+static void test_a_gap_below_the_highest_id_is_found_at_start(void **state)
+{
+    (void)state;
+    make_gap(2);
+    uint64_t missing = 0;
+    assert_int_equal(index_reconcile_count(db, repo_id, TEST_REPO, &missing), OK);
+    assert_int_equal(missing, 1);
+    submit_log_t log = { 0, 0 };
+    reconcile_result_t rr;
+    assert_int_equal(index_reconcile(db, fake_submit, &log, &rr), OK);
+    assert_int_equal(rr.snapshots_missing, 1);
+    assert_int_equal(log.calls, 1);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(index_reconcile_count(db, repo_id, TEST_REPO, &missing), OK);
+    assert_int_equal(missing, 0);
+    gap_intact();
+}
+
+/* gc indexes the gap before it marks: nothing of snapshot 1 is swept. */
+static void test_gc_indexes_a_gap_before_it_sweeps(void **state)
+{
+    (void)state;
+    make_gap(2);
+    gc_result_t g;
+    assert_int_equal(gc_once(&g, 0), OK);
+    assert_int_equal(g.snapshots_indexed, 1);
+    gap_intact();
+    /* And again, with nothing left to index. */
+    assert_int_equal(gc_once(&g, 0), OK);
+    assert_int_equal(g.snapshots_indexed, 0);
+    gap_intact();
+}
+
+/* A prune of a later snapshot, then gc: the gap still holds. */
+static void test_prune_then_gc_keeps_a_gap(void **state)
+{
+    (void)state;
+    make_gap(3);
+    assert_int_equal(prune_snapshot(store, db, repo_id, 2), OK);
+    gc_result_t g;
+    assert_int_equal(gc_once(&g, 0), OK);
+    assert_int_equal(g.snapshots_indexed, 1);
+    assert_true(g.swept > 0);           /* snapshot 2's own content went */
+    gap_intact();
+}
+
+/* Many small packs, merged by gc's coalescing pass, the gap's among them. */
+static void test_coalescing_keeps_a_gap(void **state)
+{
+    (void)state;
+    make_gap(8);
+    gc_result_t g;
+    assert_int_equal(gc_once(&g, 0), OK);
+    assert_int_equal(g.snapshots_indexed, 1);
+    print_message("coalesced %u packs\n", g.packs_coalesced);
+    assert_true(g.packs_coalesced > 0);
+    gap_intact();
+}
+
+/* A record that cannot be indexed refuses the gc, naming it, and nothing
+ * is swept around it. A dry run refuses while any gap is there. */
+static void test_gc_refuses_a_gap_it_cannot_index(void **state)
+{
+    (void)state;
+    make_gap(1);
+    write_file(TEST_REPO "/snapshots/77", "not a snapshot record\n");
+    long long objects = scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?");
+
+    gc_result_t g;
+    err_clear();
+    assert_int_not_equal(gc_once(&g, 1), OK);
+    print_message("dry run: %s\n", err_msg());
+    assert_non_null(strstr(err_msg(), "gc --dry-run refused: snapshot 1"));
+    err_clear();
+    assert_int_not_equal(gc_once(&g, 0), OK);
+    print_message("gc: %s\n", err_msg());
+    assert_non_null(strstr(err_msg(), "gc refused: snapshot 77"));
+    assert_non_null(strstr(err_msg(), "snapshots/77"));
+    err_clear();
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?"), objects);
+
+    /* The bad record removed, gc goes through and the real gap holds. */
+    assert_int_equal(unlink(TEST_REPO "/snapshots/77"), 0);
+    assert_int_equal(gc_once(&g, 0), OK);
+    gap_intact();
 }
 
 /* Several lost, and a power cut that also took the newest snapshot rows of
@@ -619,6 +812,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_complete_index_submits_nothing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_lost_tail_is_found_and_reindex_puts_it_back, setup, teardown),
         cmocka_unit_test_setup_teardown(test_several_lost, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_gap_below_the_highest_id_is_found_at_start, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_indexes_a_gap_before_it_sweeps, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_prune_then_gc_keeps_a_gap, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_coalescing_keeps_a_gap, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_refuses_a_gap_it_cannot_index, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_full_disk_in_index_nodes_reports_the_written_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_full_disk_at_the_snapshot_row_reports_the_written_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pruned_top_is_not_missing, setup, teardown),

@@ -11,12 +11,15 @@
  * missing from every listing. A reindex puts it back, but only if somebody
  * knows to run one. This runs at every start instead.
  *
- * Cheap when nothing is missing, which is every start but the one after an
- * outage: per repository, one query for the highest snapshot id the index
- * holds and one read of the repository's snapshot-id mark. Only when the
- * mark is higher does it look for records above the index's highest id,
- * and only those ids: a mark ahead of every record is normal (the newest
- * snapshots were pruned, and ids are never reused).
+ * Per repository, one listing of snapshots/ and one query for the ids the
+ * index holds, compared in O(records): every record without a row is
+ * missing, wherever it falls (B200). It used to look only above the
+ * index's highest id, which a power cut's losses always are, but a backup
+ * whose index failed to commit after its record was written (B195) leaves
+ * a record that a later, indexed backup puts below that line - and gc,
+ * which marks from the index, would then sweep what only that snapshot
+ * holds. A record with a prune-pending marker is being removed, not
+ * missing.
  *
  * Tags too (V3-12): the repository keeps its own copy of the tag list,
  * written and synced before a tag change is answered, so a tag the
@@ -35,6 +38,7 @@
 #include "error.h"
 
 #include <cutils/db.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* Submit a reindex of repo_id. OK when queued. */
@@ -51,9 +55,17 @@ typedef struct {
 } reconcile_result_t;
 
 /*
- * Snapshot records in the repository at repo_path with an id above the
- * highest one the index holds for repo_id. *out_missing is 0 when nothing
- * is missing. ERR_NOT_FOUND when the repository cannot be read.
+ * Snapshot records in the repository at repo_path that the index holds no
+ * row for, sorted (B200): one readdir of snapshots/, records under a
+ * prune-pending marker left out. *out_ids (may be NULL) is the caller's to
+ * free. ERR_NOT_FOUND when snapshots/ cannot be listed.
+ */
+status_t index_snapshot_gaps(cutils_db_t *db, int64_t repo_id, const char *repo_path,
+                             int64_t **out_ids, size_t *out_n);
+
+/*
+ * How many records index_snapshot_gaps finds. *out_missing is 0 when
+ * nothing is missing. ERR_NOT_FOUND when the repository cannot be read.
  */
 status_t index_reconcile_count(cutils_db_t *db, int64_t repo_id, const char *repo_path,
                                uint64_t *out_missing);

@@ -69,3 +69,21 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
 /* Rebuild one snapshot, for faulting a cold snapshot back in on demand. */
 status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
                           int64_t snap_id, reindex_result_t *out);
+
+/*
+ * Index every snapshot record the repository holds and the index lacks,
+ * wherever its id falls (B200), before something that decides "unreferenced"
+ * from the index deletes. gc marks from the snapshots table: a record with
+ * no row there - a backup whose index did not commit after its record was
+ * written (B195) - has its trees unmarked, and what only it holds would be
+ * swept and compacted away. Interrupted prunes are finished first, so a
+ * record on its way out is not brought back.
+ *
+ * Call under the repository's write lock, right before deciding what is
+ * unreferenced, so no record can appear in between. what names the caller
+ * for the error ("gc"). OK with *out_indexed records indexed (0 when there
+ * were none); an error, naming the record, when one cannot be listed, read
+ * or indexed, or the key is not loaded: the caller must refuse.
+ */
+status_t reindex_gaps(store_t *store, cutils_db_t *db, int64_t repo_id,
+                      const char *what, uint64_t *out_indexed);

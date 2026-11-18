@@ -4,7 +4,6 @@
 
 #include "repo.h"
 #include "repo_tags.h"
-#include "snapshot_ids.h"
 
 #include <cutils/log.h>
 
@@ -15,13 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-
-/*
- * Past this many ids between the index's highest and the repository's mark,
- * one directory listing is cheaper than a stat per id. Normally the gap is
- * 0, or the few newest snapshots a retention pass pruned.
- */
-#define RECONCILE_STAT_MAX 4096
 
 /* A record's name is its id in decimal and nothing else; anything else in
  * snapshots/ is not a record. */
@@ -38,18 +30,113 @@ static int record_id(const char *name, int64_t *out)
     return 1;
 }
 
-static status_t count_by_listing(const char *snap_dir, int64_t above, uint64_t *out)
+static int id_cmp(const void *a, const void *b)
 {
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* Grow-and-append; -1 when out of memory. */
+static int ids_push(int64_t **v, size_t *n, size_t *cap, int64_t id)
+{
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 64;
+        int64_t *nv = realloc(*v, nc * sizeof(**v));
+        if (!nv) return -1;
+        *v = nv;
+        *cap = nc;
+    }
+    (*v)[(*n)++] = id;
+    return 0;
+}
+
+/* Every id one query lists, sorted. ERR_IO when it cannot be read. */
+static status_t ids_from_db(cutils_db_t *db, const char *sql, const char *repo,
+                            int64_t **out, size_t *out_n)
+{
+    *out = NULL;
+    *out_n = 0;
+    db_result_t *r = NULL;
+    if (db_execute(db, sql, (const char *[]){ repo, NULL }, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "snapshot gaps: cannot read the index");
+    }
+    size_t cap = 0;
+    for (int i = 0; r && i < r->nrows; i++) {
+        if (ids_push(out, out_n, &cap, strtoll(r->rows[i][0], NULL, 10)) != 0) {
+            db_result_free(r);
+            free(*out); *out = NULL; *out_n = 0;
+            return set_error(ERR_NOMEM, "snapshot gaps: out of memory");
+        }
+    }
+    db_result_free(r);
+    qsort(*out, *out_n, sizeof(**out), id_cmp);
+    return OK;
+}
+
+static int ids_has(const int64_t *v, size_t n, int64_t id)
+{
+    return n && bsearch(&id, v, n, sizeof(*v), id_cmp) != NULL;
+}
+
+status_t index_snapshot_gaps(cutils_db_t *db, int64_t repo_id, const char *repo_path,
+                             int64_t **out_ids, size_t *out_n)
+{
+    if (!db || !repo_path || !out_n)
+        return set_error(ERR_INVALID, "index_snapshot_gaps: null argument");
+    if (out_ids) *out_ids = NULL;
+    *out_n = 0;
+
+    char snap_dir[PATH_MAX];
+    if (snprintf(snap_dir, sizeof(snap_dir), "%s/snapshots", repo_path) >= (int)sizeof(snap_dir))
+        return set_error(ERR_INVALID, "repository path too long");
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    int64_t *have = NULL, *pending = NULL;
+    size_t nhave = 0, npending = 0;
+    status_t st = ids_from_db(db, "SELECT id FROM snapshots WHERE repo_id = ?",
+                              repo, &have, &nhave);
+    /* A prune that removed the rows and has not yet removed the record
+     * (B148): that record is on its way out, not missing. */
+    if (st == OK)
+        st = ids_from_db(db, "SELECT CAST(substr(key, 15) AS INTEGER) FROM recovery_state"
+                             " WHERE repo_id = ? AND key LIKE 'prune-pending-%'",
+                         repo, &pending, &npending);
+    if (st != OK) { free(have); return st; }
+
     DIR *d = opendir(snap_dir);
-    if (!d) return set_error_errno(ERR_NOT_FOUND, "cannot list %s", snap_dir);
-    uint64_t n = 0;
+    if (!d) {
+        free(have); free(pending);
+        return set_error_errno(ERR_NOT_FOUND, "cannot list %s", snap_dir);
+    }
+    int64_t *gaps = NULL;
+    size_t ngaps = 0, cap = 0;
     struct dirent *de;
+    errno = 0;
     while ((de = readdir(d)) != NULL) {
         int64_t id;
-        if (record_id(de->d_name, &id) && id > above) n++;
+        if (!record_id(de->d_name, &id)) continue;
+        if (ids_has(have, nhave, id) || ids_has(pending, npending, id)) continue;
+        if (ids_push(&gaps, &ngaps, &cap, id) != 0) {
+            closedir(d); free(have); free(pending); free(gaps);
+            return set_error(ERR_NOMEM, "snapshot gaps: out of memory");
+        }
+        errno = 0;
     }
+    int rerr = errno;
     closedir(d);
-    *out = n;
+    free(have);
+    free(pending);
+    if (rerr != 0) {
+        free(gaps);
+        errno = rerr;
+        return set_error_errno(ERR_NOT_FOUND, "cannot list %s", snap_dir);
+    }
+    qsort(gaps, ngaps, sizeof(*gaps), id_cmp);
+    *out_n = ngaps;
+    if (out_ids) *out_ids = gaps;
+    else free(gaps);
     return OK;
 }
 
@@ -59,43 +146,15 @@ status_t index_reconcile_count(cutils_db_t *db, int64_t repo_id, const char *rep
     if (!db || !repo_path || !out_missing)
         return set_error(ERR_INVALID, "index_reconcile_count: null argument");
     *out_missing = 0;
-
     char snap_dir[PATH_MAX];
     if (snprintf(snap_dir, sizeof(snap_dir), "%s/snapshots", repo_path) >= (int)sizeof(snap_dir))
         return set_error(ERR_INVALID, "repository path too long");
     struct stat sb;
     if (stat(snap_dir, &sb) != 0 || !S_ISDIR(sb.st_mode))
         return set_error_errno(ERR_NOT_FOUND, "cannot read %s", snap_dir);
-
-    char repo[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    db_result_t *r = NULL;
-    int64_t have = -1;
-    if (db_execute(db, "SELECT COALESCE(MAX(id), 0) FROM snapshots WHERE repo_id = ?",
-                   (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
-        have = strtoll(r->rows[0][0], NULL, 10);
-    db_result_free(r);
-    if (have < 0) return set_error(ERR_IO, "cannot read the index's snapshots");
-
-    int64_t mark = 0;
-    if (snapshot_ids_read_repo(repo_path, &mark) != OK) {
-        /* No usable mark (damaged, or missing on a repository a reindex
-         * has not repaired yet): the listing answers instead. */
-        log_debug("reconcile: %s: %s; listing snapshots instead", repo_path, err_msg());
-        err_clear();
-        return count_by_listing(snap_dir, have, out_missing);
-    }
-    if (mark <= have) return OK;                 /* the common case */
-    if (mark - have > RECONCILE_STAT_MAX)
-        return count_by_listing(snap_dir, have, out_missing);
-
-    uint64_t n = 0;
-    for (int64_t id = have + 1; id <= mark; id++) {
-        char path[PATH_MAX];
-        if (snprintf(path, sizeof(path), "%s/%lld", snap_dir, (long long)id) >= (int)sizeof(path))
-            continue;
-        if (lstat(path, &sb) == 0 && S_ISREG(sb.st_mode)) n++;
-    }
+    size_t n = 0;
+    status_t st = index_snapshot_gaps(db, repo_id, repo_path, NULL, &n);
+    if (st != OK) return st;
     *out_missing = n;
     return OK;
 }
@@ -182,8 +241,8 @@ status_t index_reconcile(cutils_db_t *db, reconcile_submit_fn submit, void *ctx,
         }
         out->jobs_submitted++;
         log_warn("reconcile: repo %lld (%s) has %llu snapshot(s) missing from the "
-                 "index, most likely lost with the last moments before a power cut "
-                 "or crash; reindexing it as job %lld",
+                 "index, lost with the last moments before a power cut or crash, or "
+                 "left by a backup whose index did not commit; reindexing it as job %lld",
                  (long long)repo_id, path, (unsigned long long)missing,
                  (long long)job_id);
     }

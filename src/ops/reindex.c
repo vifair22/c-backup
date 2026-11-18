@@ -5,6 +5,7 @@
 #include "reindex.h"
 #include "prune.h"
 #include "unit_index.h"
+#include "index_reconcile.h"
 
 #include "chunklist.h"
 #include "manifest.h"
@@ -1100,6 +1101,65 @@ static status_t restore_pack_mark(store_t *store, cutils_db_t *db, int64_t repo_
         total->pack_ids_repaired = 1;
     }
     total->pack_mark = now;
+    return OK;
+}
+
+status_t reindex_gaps(store_t *store, cutils_db_t *db, int64_t repo_id,
+                      const char *what, uint64_t *out_indexed)
+{
+    if (out_indexed) *out_indexed = 0;
+    if (!store || !db || !what) return set_error(ERR_INVALID, "reindex_gaps: null argument");
+    /* A record a prune had not finished removing is on its way out (B148);
+     * finishing it here means it is not listed below either. */
+    status_t st = prune_finish_pending(db, repo_id, NULL);
+    if (st != OK) return set_error_wrap(st, "%s refused: cannot finish an interrupted prune", what);
+
+    int64_t *gaps = NULL;
+    size_t n = 0;
+    st = index_snapshot_gaps(db, repo_id, store_root(store), &gaps, &n);
+    if (st != OK)
+        return set_error_wrap(st, "%s refused: cannot check the repository for "
+                              "snapshots the index lacks", what);
+    if (n == 0) return OK;
+
+    log_warn("%s: repository %lld holds %zu snapshot record(s) the index lacks "
+             "(first: %lld); indexing them before anything is swept", what,
+             (long long)repo_id, n, (long long)gaps[0]);
+    if (store_needs_key(store)) {
+        st = set_error(ERR_INVALID, "%s refused: snapshot %lld is in the repository but not "
+                       "in the index, and the repository's key is not loaded to index it; "
+                       "%s would delete what only that snapshot holds. Load the key and "
+                       "run c-backup reindex %lld", what, (long long)gaps[0], what,
+                       (long long)repo_id);
+        free(gaps);
+        return st;
+    }
+    for (size_t i = 0; i < n; i++) {
+        st = reindex_snapshot_inner(store, db, repo_id, gaps[i], 0, NULL);
+        if (st != OK) {
+            st = set_error_wrap(st, "%s refused: snapshot %lld is in the repository but "
+                                "could not be indexed, and %s would delete what only it "
+                                "holds; repair or remove its record (snapshots/%lld), "
+                                "then retry", what, (long long)gaps[i], what,
+                                (long long)gaps[i]);
+            free(gaps);
+            return st;
+        }
+    }
+    /* Every chunk a list of theirs names gets its object row: compaction
+     * keeps exactly the entries with rows (reindex_snapshot). */
+    st = reindex_lists(store, db, repo_id, 0);
+    if (st == OK) st = fill_object_sizes(store, db, repo_id);
+    if (st != OK) {
+        st = set_error_wrap(st, "%s refused: the chunk lists of the snapshots just "
+                            "indexed could not be indexed", what);
+        free(gaps);
+        return st;
+    }
+    log_warn("%s: indexed snapshot record(s) the index lacked, %zu of them (first: %lld)",
+             what, n, (long long)gaps[0]);
+    free(gaps);
+    if (out_indexed) *out_indexed = n;
     return OK;
 }
 

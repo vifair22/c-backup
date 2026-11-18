@@ -1820,6 +1820,44 @@ static status_t op_gc(ctx_t *c, int counting)
     return st;
 }
 
+/*
+ * gc with a gap (B200): snapshot 2's record is in the repository and its
+ * index rows are not, below the indexed 3, as a backup whose index did not
+ * commit leaves it (B195); 1 is pruned. gc indexes 2 before it marks, so
+ * what only 2 holds (d1/a and d2/f at version 2) is kept, and after every
+ * cut 2 still restores as it was backed up: the indexing commits may be
+ * lost, but the reconcile at the start finds the gap again.
+ */
+static void build_gc_gap(ctx_t *c)
+{
+    begin_build(c);
+    open_target(c);
+    int64_t s1 = backup_into(c->store, c->db, g_repo_id, 1);
+    int64_t s2 = backup_into(c->store, c->db, g_repo_id, 2);
+    int64_t s3 = backup_into(c->store, c->db, g_repo_id, 3);
+    assert_int_equal(prune_snapshot(c->store, c->db, g_repo_id, s1), OK);
+    char repo[32], id[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)g_repo_id);
+    snprintf(id, sizeof(id), "%lld", (long long)s2);
+    const char *p[] = { repo, id, NULL };
+    assert_int_equal(db_write(c->db, "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
+                              p, NULL), 0);
+    assert_int_equal(db_write(c->db, "DELETE FROM nodes WHERE repo_id = ? AND snap_id = ?",
+                              p, NULL), 0);
+    assert_int_equal(db_write(c->db, "DELETE FROM snapshots WHERE repo_id = ? AND id = ?",
+                              p, NULL), 0);
+    g_required[s2] = 1;
+    g_required[s3] = 1;
+    end_build(c);
+}
+
+static status_t op_gc_gap(ctx_t *c, int counting)
+{
+    status_t st = op_gc_run(c);
+    if (counting && st == OK) assert_int_equal(g_gc.snapshots_indexed, 1);
+    return st;
+}
+
 /* coalesce: ten small packs, all live, merged by gc. */
 static void build_coalesce(ctx_t *c)
 {
@@ -2335,6 +2373,7 @@ static const scenario_t S_BACKUP_INCR  = { "backup, incremental", build_backup_i
 static const scenario_t S_REPLICATE    = { "replicate-in", build_replicate, op_replicate,
                                            1, 1, 0, NULL };
 static const scenario_t S_GC           = { "gc", build_gc, op_gc, 0, 0, 0, NULL };
+static const scenario_t S_GC_GAP       = { "gc with a gap", build_gc_gap, op_gc_gap, 0, 0, 0, NULL };
 static const scenario_t S_COALESCE     = { "coalesce", build_coalesce, op_coalesce, 0, 0, 0, NULL };
 static const scenario_t S_SALVAGE      = { "salvage", build_salvage, op_salvage, 0, 0, 0, NULL };
 static const scenario_t S_REPOINT      = { "OWN-22 repoint", build_repoint, op_repoint,
@@ -2369,6 +2408,7 @@ static void test_backup_first(void **state)  { (void)state; every_cut(&S_BACKUP_
 static void test_backup_incr(void **state)   { (void)state; every_cut(&S_BACKUP_INCR); }
 static void test_replicate_in(void **state)  { (void)state; every_cut(&S_REPLICATE); }
 static void test_gc(void **state)            { (void)state; every_cut(&S_GC); }
+static void test_gc_gap(void **state)        { (void)state; every_cut(&S_GC_GAP); }
 static void test_coalesce(void **state)      { (void)state; every_cut(&S_COALESCE); }
 static void test_salvage(void **state)       { (void)state; every_cut(&S_SALVAGE); }
 static void test_repoint(void **state)       { (void)state; every_cut(&S_REPOINT); }
@@ -2550,6 +2590,7 @@ int main(void)
         cmocka_unit_test(test_backup_incr),
         cmocka_unit_test(test_replicate_in),
         cmocka_unit_test(test_gc),
+        cmocka_unit_test(test_gc_gap),
         cmocka_unit_test(test_coalesce),
         cmocka_unit_test(test_salvage),
         cmocka_unit_test(test_repoint),
