@@ -3985,6 +3985,23 @@ exported share (the helper refuses both). On FS2 it is
 `/mnt/user/system/.cbackup-snapshots`). A file backup of a pool or a share
 therefore never reads capture snapshots.
 
+**Incrementals over snapshots.** A snapshot keeps every file's inode
+number, size and times but is given a new device number at every capture.
+Files read from one are identified by the device of the path they are
+recorded at, so a snapshot read writes the same directory trees and file
+cache rows a live read of the same files would: an unchanged unit stores no
+new trees and opens no file, and the read from a later snapshot finds the
+rows the earlier one wrote. A mount nested inside a snapshot keeps its own
+device; its files are recognised by inode, size and both times alone.
+
+Before this (B229) the device number of each snapshot was written into
+every tree, so every unit backup stored a complete new set of trees, though
+no file content. **The first unit backup after upgrading past it rewrites
+each unit's trees once and reads its files once**, because both the trees
+and the cache rows earlier backups wrote name the old snapshots' devices.
+Nothing is lost and no setting is involved; from the backup after that,
+incrementals store and read only what changed.
+
 **Who else can see a snapshot while it exists.** A container that binds a
 **dataset root** reaches `.zfs` by name: on FS1, Plex-Mover binds
 `/mnt/cache` read-write and can read `/mnt/cache/appdata/.zfs/snapshot/`

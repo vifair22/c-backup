@@ -29,6 +29,15 @@ typedef struct {
      * TREE item read through a filesystem snapshot and recorded at its
      * original path (scan_tree_as). NULL for every ordinary entry. */
     char    *read_path;
+    /* The device the entry is identified by: st.st_dev, except that an
+     * entry scan_tree_as found on its read root's device (a filesystem
+     * snapshot, whose device number is new every capture) has the record
+     * root's live device instead, with dev_remapped set. The hard-link
+     * identity and the file cache key use it, so a snapshot read produces
+     * the trees and cache rows a live read of the same tree would (B229).
+     * st itself is left as found: settle compares it with fstat. */
+    dev_t    rec_dev;
+    int      dev_remapped;
     /* An entry with no file behind it (scan_add_synthetic): its content
      * comes from the caller, never from the filesystem. */
     int      synthetic;
@@ -93,8 +102,14 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
  * Each entry's path is the record path and its read_path the real one; the
  * ancestors synthesised above the root are record_root's, taken from the
  * host where they exist and made up (0755, root, mtime 0) where they do
- * not. Excludes match the paths as read. Both roots absolute.
+ * not. Excludes match the paths as read. Entries on the read root's
+ * device are identified by the record root's live device (rec_dev), so the
+ * trees match a live read's whatever device the snapshot was given. Both
+ * roots absolute.
  */
+/* The hard-link identity of an inode, as written into tree entries. */
+uint64_t scan_inode_identity(dev_t dev, ino_t ino);
+
 status_t scan_tree_as(const char *read_root, const char *record_root,
                       scan_imap_t *imap, const scan_opts_t *opts,
                       scan_result_t **out);
