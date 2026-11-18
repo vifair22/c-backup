@@ -257,6 +257,47 @@ export function toEndpoint(req: ApiRequest): Endpoint {
         path: `/repos/${req.repoId}/journal${qs({ limit: req.limit, result: req.result })}`,
       }
 
+    /* --- database detection --- */
+    case 'dbList':
+      return {
+        method: 'GET',
+        path: `/repos/${req.repoId}/databases${qs({
+          scope: req.scope, engine: req.engine, coverage: req.coverage, state: req.state,
+          limit: req.limit, offset: req.offset })}`,
+      }
+    case 'dbShow':
+      return { method: 'GET', path: `/repos/${req.repoId}/databases/${req.findingId}` }
+    case 'unitDetect':
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/units/${seg(req.provider)}/${seg(req.unit)}/detect`,
+      }
+    case 'dbPreview':
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/databases/${req.findingId}/preview`,
+        /* No body at all asks for the finding's own suggestion. */
+        body: req.template === undefined
+          ? undefined
+          /* params absent, not {}: for an enabled finding the daemon then
+           * previews the params it already runs. */
+          : req.params === undefined
+            ? { template: req.template }
+            : { template: req.template, params: req.params },
+      }
+    case 'dbEnable':
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/databases/${req.findingId}/enable`,
+        body: { template: req.template, params: req.params ?? {} },
+      }
+    case 'dbDismiss':
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/databases/${req.findingId}/dismiss`,
+        body: { reason: req.reason },
+      }
+
     /* --- schedules --- */
     case 'scheduleList':
       return { method: 'GET', path: `/repos/${req.repoId}/schedules` }

@@ -27,6 +27,9 @@
 typedef struct {
     char id[65], name[64], state[16], project[64], image[72], config_files[512], working_dir[256];
     char mounts[2048];        /* the JSON array for Mounts */
+    int  pid;                 /* State.Pid, 0 for none */
+    char aliases[256];        /* NetworkSettings.Networks.br0.Aliases, JSON; "" is null */
+    char service[64];         /* the com.docker.compose.service label, "" for none */
 } fd_container_t;
 
 typedef struct {
@@ -180,11 +183,13 @@ static void fd_serve(fake_docker_t *f, int fd)
         fd_container_t *c = fd_find(f, id);
         if (!c) fd_reply(fd, 404, "{\"message\":\"No such container\"}");
         else {
-            snprintf(out, sizeof(out), "{\"Id\":\"%s\",\"Name\":\"/%s\",\"Image\":\"%s\",\"Config\":{\"Labels\":{"
+            snprintf(out, sizeof(out), "{\"Id\":\"%s\",\"Name\":\"/%s\",\"Image\":\"%s\",\"Config\":{\"Image\":\"%s:cfg\",\"Labels\":{"
                      "\"com.docker.compose.project.config_files\":\"%s\",\"com.docker.compose.project.working_dir\":\"%s\","
-                     "\"secret\":\"kept verbatim\"}},\"State\":{\"Running\":%s},\"Mounts\":%s}",
-                     c->id, c->name, c->image, c->config_files, c->working_dir,
-                     strcmp(c->state, "running") == 0 ? "true" : "false", c->mounts[0] ? c->mounts : "[]");
+                     "\"com.docker.compose.service\":\"%s\",\"secret\":\"kept verbatim\"}},\"State\":{\"Running\":%s,\"Pid\":%d},"
+                     "\"NetworkSettings\":{\"Networks\":{\"br0\":{\"Aliases\":%s}}},\"Mounts\":%s}",
+                     c->id, c->name, c->image, c->name, c->config_files, c->working_dir, c->service,
+                     strcmp(c->state, "running") == 0 ? "true" : "false", c->pid,
+                     c->aliases[0] ? c->aliases : "null", c->mounts[0] ? c->mounts : "[]");
             fd_reply(fd, 200, out);
         }
     } else if (fd_route(p, "/images/", "/json", id, sizeof(id))) {

@@ -3,7 +3,9 @@
 #include "lxc_backend.h"
 #include "helper_proto.h"
 #include "mounts.h"
+#include "proc_probe.h"
 #include "snap.h"
+#include "unit_probe.h"
 
 #include <cutils/log.h>
 
@@ -204,27 +206,87 @@ static status_t nested_below(snap_probe_t *probe, const snap_dom_t *d, const cha
     return OK;
 }
 
+/* A source as describe classifies it: the rootfs is the unit, so always
+ * data wherever it is; any other source is data only under include_roots. */
+static status_t classify_src(struct sp_ctx *c, int rootfs, const char *src, mount_class_t *mc)
+{
+    status_t st = mount_classify(&c->mounts, "bind", src, NULL, mc);
+    if (st != OK || !rootfs || mc->verdict != MOUNT_EXCLUDED) return st;
+    mount_cfg_t all = c->mounts;
+    char root[] = "/";
+    all.include_roots[0] = root;
+    all.n_include = 1;
+    return mount_classify(&all, "bind", src, NULL, mc);
+}
+
 static status_t add_tree(struct sp_ctx *c, snap_probe_t *probe, sp_unit_desc_t *d, size_t *cap, const char *id,
                          const char *src)
 {
     mount_class_t mc;
-    status_t st = mount_classify(&c->mounts, "bind", src, NULL, &mc);
+    status_t st = classify_src(c, strcmp(id, "rootfs") == 0, src, &mc);
     if (st != OK) return st;
-    if (mc.verdict == MOUNT_EXCLUDED && strcmp(id, "rootfs") != 0) return OK;
-    if (strcmp(id, "rootfs") == 0 && mc.verdict == MOUNT_EXCLUDED) {
-        /* The rootfs is the unit: always data, wherever it is. */
-        mount_cfg_t all = c->mounts;
-        char root[] = "/";
-        all.include_roots[0] = root;
-        all.n_include = 1;
-        if ((st = mount_classify(&all, "bind", src, NULL, &mc)) != OK) return st;
-    }
+    if (mc.verdict == MOUNT_EXCLUDED) return OK;
     snap_dom_t dom;
     if ((st = snap_domain_of(&c->snap, mc.real, &dom)) != OK) return st;
     int nested = 0;
     if (dom.kind != SNAP_NONE && (st = nested_below(probe, &dom, mc.real, NULL, &nested)) != OK) return st;
     if (nested) dom.kind = SNAP_NONE;
     return add_item(d, cap, SP_ITEM_TREE, id, mc.recorded, mc.real, 0, dom.kind != SNAP_NONE ? SP_CAP_SNAPSHOT : 0);
+}
+
+/*
+ * The config's rootfs and mount entries, in order, for describe and probe:
+ * fn(ctx, src, target) with target NULL for the rootfs, whose path must be
+ * clean and absolute (ERR_INVALID otherwise). A mount entry's src and
+ * target are its first two fields as written; bind says whether its
+ * options bind it. cfg is consumed.
+ */
+typedef status_t (*cfg_fn)(void *ctx, const char *src, const char *target, int bind);
+
+static status_t walk_config(char *cfg, const char *unit_id, cfg_fn fn, void *ctx)
+{
+    status_t st = OK;
+    char *save = NULL;
+    char *src = malloc(PATH_MAX), *tgt = malloc(PATH_MAX);
+    if (!src || !tgt) st = set_error(ERR_NOMEM, "lxc: config");
+    for (char *l = strtok_r(cfg, "\n", &save); l && st == OK; l = strtok_r(NULL, "\n", &save)) {
+        char *eq = strchr(l, '=');
+        if (!eq || l[0] == '#') continue;
+        *eq = '\0';
+        char *k = trim(l), *v = trim(eq + 1);
+        if (strcmp(k, "lxc.rootfs.path") == 0) {
+            if (strncmp(v, "dir:", 4) == 0) v += 4;
+            if (v[0] != '/' || !helper_path_clean(v)) { st = set_error(ERR_INVALID, "lxc: %s: unsupported rootfs %s", unit_id, v); break; }
+            st = fn(ctx, v, NULL, 0);
+        } else if (strcmp(k, "lxc.mount.entry") == 0) {
+            /* <source> <target> <type> <options> */
+            int nf = sscanf(v, "%4095s %4095s", src, tgt);
+            if (nf < 1) continue;
+            st = fn(ctx, src, nf == 2 ? tgt : "", strstr(v, "bind") != NULL);
+        }
+    }
+    free(src);
+    free(tgt);
+    return st;
+}
+
+typedef struct {
+    struct sp_ctx *c;
+    snap_probe_t *probe;
+    sp_unit_desc_t *d;
+    size_t cap;
+    int nmount;
+} desc_walk_t;
+
+static status_t desc_entry(void *ctx, const char *src, const char *target, int bind)
+{
+    desc_walk_t *w = ctx;
+    if (!target) return add_tree(w->c, w->probe, w->d, &w->cap, "rootfs", src);
+    /* Bind sources only. */
+    if (src[0] != '/' || !bind) return OK;
+    char id[SP_ITEM_ID_MAX];
+    snprintf(id, sizeof(id), "mount:%d", w->nmount++);
+    return add_tree(w->c, w->probe, w->d, &w->cap, id, src);
 }
 
 static status_t x_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **out)
@@ -235,40 +297,106 @@ static status_t x_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
     status_t st = read_config(c, unit_id, &cfg, &clen);
     if (st != OK) return st;
     sp_unit_desc_t *d = calloc(1, sizeof(*d));
-    size_t cap = 0;
     if (!d || !(d->name = strdup(unit_id))) { free(cfg); free(d); return set_error(ERR_NOMEM, "lxc: describe"); }
     snprintf(d->provider, sizeof(d->provider), "lxc");
     snprintf(d->unit_id, sizeof(d->unit_id), "%s", unit_id);
     int s = state_of(c, unit_id);
     d->state = s < 0 ? SP_STATE_UNKNOWN : s;
     d->caps = SP_CAP_PAUSE;
-    st = add_item(d, &cap, SP_ITEM_BLOB, "config", ".cbackup-unit/config/lxc/config", NULL, clen, 0);
-    snap_probe_t *probe = NULL;
-    if (st == OK) st = snap_probe_new(&c->snap, c->mounts.mountinfo, &probe);
-    char *save = NULL;
-    int nmount = 0;
-    for (char *l = strtok_r(cfg, "\n", &save); l && st == OK; l = strtok_r(NULL, "\n", &save)) {
-        char *eq = strchr(l, '=');
-        if (!eq || l[0] == '#') continue;
-        *eq = '\0';
-        char *k = trim(l), *v = trim(eq + 1);
-        if (strcmp(k, "lxc.rootfs.path") == 0) {
-            if (strncmp(v, "dir:", 4) == 0) v += 4;
-            if (v[0] != '/' || !helper_path_clean(v)) { st = set_error(ERR_INVALID, "lxc: %s: unsupported rootfs %s", unit_id, v); break; }
-            st = add_tree(c, probe, d, &cap, "rootfs", v);
-        } else if (strcmp(k, "lxc.mount.entry") == 0) {
-            /* <source> <target> <type> <options>: bind sources only. */
-            char src[PATH_MAX];
-            if (sscanf(v, "%4095s", src) != 1 || src[0] != '/' || !strstr(v, "bind")) continue;
-            char id[SP_ITEM_ID_MAX];
-            snprintf(id, sizeof(id), "mount:%d", nmount++);
-            st = add_tree(c, probe, d, &cap, id, src);
-        }
-    }
-    snap_probe_free(probe);
+    desc_walk_t w = { c, NULL, d, 0, 0 };
+    st = add_item(d, &w.cap, SP_ITEM_BLOB, "config", ".cbackup-unit/config/lxc/config", NULL, clen, 0);
+    if (st == OK) st = snap_probe_new(&c->snap, c->mounts.mountinfo, &w.probe);
+    if (st == OK) st = walk_config(cfg, unit_id, desc_entry, &w);
+    snap_probe_free(w.probe);
     free(cfg);
     if (st != OK) { sp_unit_desc_free(d); return st; }
     *out = d;
+    return OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* units.probe                                                         */
+/* ------------------------------------------------------------------ */
+
+#define PROBE_MOUNTS_MAX 64
+
+typedef struct {
+    struct sp_ctx *c;
+    proc_mount_t   pm[PROBE_MOUNTS_MAX];
+    char          *dest[PROBE_MOUNTS_MAX];
+    char          *rec[PROBE_MOUNTS_MAX];
+    size_t         n;
+} probe_walk_t;
+
+/* Every entry with a clean target is known, so an excluded or kernel
+ * mount inside the rootfs keeps what is under it unnamed; only what
+ * describe includes maps to a recorded path. */
+static status_t probe_entry(void *ctx, const char *src, const char *target, int bind)
+{
+    probe_walk_t *w = ctx;
+    if (w->n == PROBE_MOUNTS_MAX) return OK;
+    char dest[PATH_MAX];
+    if (!target) snprintf(dest, sizeof(dest), "/");
+    else snprintf(dest, sizeof(dest), "%s%s", target[0] == '/' ? "" : "/", target);
+    if (!helper_path_clean(dest)) return OK;
+    mount_class_t *mc = malloc(sizeof(*mc));
+    if (!mc) return set_error(ERR_NOMEM, "lxc: probe");
+    int included = (target == NULL || (src[0] == '/' && bind)) &&
+                   classify_src(w->c, target == NULL, src, mc) == OK && mc->verdict == MOUNT_INCLUDED;
+    err_clear();
+    size_t i = w->n;
+    w->dest[i] = strdup(dest);
+    w->rec[i] = included ? strdup(mc->recorded) : NULL;
+    free(mc);
+    if (!w->dest[i] || (included && !w->rec[i])) { free(w->dest[i]); free(w->rec[i]); return set_error(ERR_NOMEM, "lxc: probe"); }
+    w->pm[i].dest = w->dest[i];
+    w->pm[i].recorded = w->rec[i];
+    w->n++;
+    return OK;
+}
+
+/* The init pid from lxc-info -p, 0 when it is not running. */
+static int init_pid(struct sp_ctx *c, const char *name)
+{
+    char *out = NULL;
+    if (lxc(c, "lxc-info", name, "-p", &out) != OK) { err_clear(); return 0; }
+    const char *p = strstr(out, "PID:");
+    long v = p ? strtol(p + 4, NULL, 10) : 0;
+    free(out);
+    return v > 0 && v <= 4194304 ? (int)v : 0;
+}
+
+static status_t x_unit_probe(sp_ctx_t *c, const char *unit_id, sp_unit_probe_t **out)
+{
+    *out = NULL;
+    if (!valid_name(unit_id)) return set_error(ERR_INVALID, "lxc: bad container name");
+    char *cfg = NULL;
+    size_t clen = 0;
+    status_t st = read_config(c, unit_id, &cfg, &clen);
+    if (st != OK) return st;
+    sp_unit_probe_t *p = sp_unit_probe_new();
+    probe_walk_t *w = calloc(1, sizeof(*w));
+    if (!p || !w || !(p->v = calloc(1, sizeof(*p->v)))) st = set_error(ERR_NOMEM, "lxc: probe");
+    sp_probe_container_t *pc = st == OK ? &p->v[0] : NULL;
+    if (st == OK) {
+        p->n = 1;
+        snprintf(pc->name, sizeof(pc->name), "%s", unit_id);
+        snprintf(pc->aliases[0], sizeof(pc->aliases[0]), "%s", unit_id);
+        pc->n_aliases = 1;
+        w->c = c;
+        st = walk_config(cfg, unit_id, probe_entry, w);
+    }
+    int pid = st == OK ? init_pid(c, unit_id) : 0;
+    if (pid > 0) {
+        pc->running = 1;
+        st = proc_probe_container(c->pol->proc_root, pid, w->pm, w->n, pc, &p->truncated);
+        if (st == ERR_NOT_FOUND) { pc->running = 0; err_clear(); st = OK; }  /* stopped meanwhile */
+    }
+    for (size_t i = 0; w && i < w->n; i++) { free(w->dest[i]); free(w->rec[i]); }
+    free(w);
+    free(cfg);
+    if (st != OK) { sp_unit_probe_free(p); return st; }
+    *out = p;
     return OK;
 }
 
@@ -461,6 +589,7 @@ static const sp_provider_ops_t k_lxc_ops = {
     .init = x_init, .fini = x_fini, .probe = x_probe, .list_units = x_list,
     .describe = x_describe, .desc_free = sp_unit_desc_free, .begin = x_begin,
     .blob_read = x_blob_read, .tree_root = x_tree_root, .end = x_end, .sweep = x_sweep,
+    .unit_probe = x_unit_probe,
 };
 
 /* ---- hooks: lxc-attach, in its own process group ---- */

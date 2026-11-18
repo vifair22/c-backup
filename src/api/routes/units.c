@@ -39,6 +39,7 @@
 #include "unit_define.h"
 #include "unit_state.h"
 #include "unit_tokens.h"
+#include "unit_detect.h"
 
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
@@ -407,7 +408,8 @@ static int split_unit_path(const char *rest, char *prov, size_t psz, char *unit,
     unit[ul] = '\0';
     *suffix = last + 1;
     return strcmp(*suffix, "snapshots") == 0 || strcmp(*suffix, "policy") == 0 ||
-           strcmp(*suffix, "checkpoints") == 0 || strcmp(*suffix, "reset-incremental") == 0;
+           strcmp(*suffix, "checkpoints") == 0 || strcmp(*suffix, "reset-incremental") == 0 ||
+           strcmp(*suffix, "detect") == 0;
 }
 
 /*
@@ -426,6 +428,7 @@ static const api_path_t k_unit_paths[] = {
     { "/units/<p>/<u>/checkpoints",             1,  0,    0,   0 },
     { "/units/<p>/<u>/policy",                  1,  0,    C_,  0 },
     { "/units/<p>/<u>/reset-incremental",       0,  C_,   0,   0 },
+    { "/units/<p>/<u>/detect",                  0,  C_,   0,   0 },
     { "/snapshots/<id>/unit/restore",           0,  C_,   0,   0 },
     { "/snapshots/<id>/unit/export",            0,  C_,   0,   0 },
 };
@@ -1405,7 +1408,8 @@ api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const 
     const char *suffix = NULL;
     if (!split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix))
         return api_error(404, "not found");
-    if (strcmp(suffix, "reset-incremental") == 0) return api_error(405, "method not allowed");
+    if (strcmp(suffix, "reset-incremental") == 0 || strcmp(suffix, "detect") == 0)
+        return api_error(405, "method not allowed");
     if (strcmp(suffix, "checkpoints") == 0) {
         char why[768];
         int code = chain_unit(repo_id, prov, unit, key, sizeof(key), why, sizeof(why));
@@ -1430,6 +1434,138 @@ api_response_t units_route_put(const api_request_t *req, int64_t repo_id, const 
     return unit_policy_put(req, repo_id, key);
 }
 
+/* ------------------------------------------------------------------ */
+/* Detection without a backup (db-detection.md 7.4)                    */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    cutils_db_t *db;
+    int64_t      repo_id;
+    char        *provider;
+    char        *unit;
+} detect_job_t;
+
+static void detect_job_free(void *p)
+{
+    detect_job_t *j = p;
+    if (!j) return;
+    free(j->provider);
+    free(j->unit);
+    free(j);
+}
+
+/* Scan and probe, record, and answer {"databases":<what a backup result
+ * carries>}. The repository is not opened: nothing in it is read or
+ * written, and the job holds the repo only so it never runs beside a
+ * backup reading the same files. */
+static status_t detect_job_run(void *arg, atomic_int *cancel,
+                               void (*progress)(const char *, uint64_t, uint64_t, void *),
+                               void *progress_ctx)
+{
+    detect_job_t *j = arg;
+    unit_detect_result_t res;
+    status_t st = unit_detect_run(j->db, j->repo_id, j->provider, j->unit, cancel, progress,
+                                  progress_ctx, &res);
+    if (st != OK) return st;
+    char scope[UNIT_KEY_MAX + 8];
+    snprintf(scope, sizeof(scope), "unit:%s", res.unit_key);
+    db_record_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    if (db_findings_record_detect(j->db, j->repo_id, res.findings, scope, &rr) != OK) {
+        char why[ERR_MSG_MAX];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        db_findings_free(res.findings);
+        return set_error(ERR_IO, "%s", why);
+    }
+    char *dbs = db_findings_json(res.findings, rr.ids);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *d = dbs ? cJSON_Parse(dbs) : NULL;
+    free(dbs);
+    if (root && d) {
+        cJSON_AddItemToObject(root, "databases", d);
+        d = NULL;
+        char *txt = cJSON_PrintUnformatted(root);
+        if (txt) { job_set_result(progress_ctx, txt); cJSON_free(txt); }
+    }
+    cJSON_Delete(d);
+    cJSON_Delete(root);
+    char summary[400];
+    snprintf(summary, sizeof(summary), "%s: %zu database finding(s) from %llu file head(s), %s",
+             res.unit_key, res.findings->n, (unsigned long long)res.files_read,
+             res.probed ? "with units.probe" : "without units.probe (file signals only)");
+    job_set_summary(progress_ctx, summary);
+    char prefix[300];
+    snprintf(prefix, sizeof(prefix), "detect, unit %.250s: ", res.name);
+    routes_db_detect_events(j->db, j->repo_id, "units", prefix, &rr, progress_ctx);
+    db_record_result_free(&rr);
+    db_findings_free(res.findings);
+    return OK;
+}
+
+/* detect takes no fields: no body, or an empty object. Anything else is
+ * refused naming what was not understood, as an unknown config key is,
+ * rather than run as if it had been. 0, or -1 with *bad set. */
+static int detect_body_ok(const api_request_t *req, api_response_t *bad)
+{
+    if (!req->body || req->body_len == 0) return 0;
+    char *txt = strndup(req->body, req->body_len);
+    cJSON *o = txt ? cJSON_Parse(txt) : NULL;
+    free(txt);
+    if (!o || !cJSON_IsObject(o)) {
+        cJSON_Delete(o);
+        *bad = api_error(400, "body must be a JSON object; detect takes no fields");
+        return -1;
+    }
+    if (o->child) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "unknown key '%.80s'; detect takes no fields",
+                 o->child->string ? o->child->string : "");
+        cJSON_Delete(o);
+        *bad = api_error(400, msg);
+        return -1;
+    }
+    cJSON_Delete(o);
+    return 0;
+}
+
+static api_response_t unit_detect_post(const api_request_t *req, int64_t repo_id,
+                                       const char *prov, const char *unit)
+{
+    api_response_t bad;
+    if (detect_body_ok(req, &bad) != 0) return bad;
+    if (!db_detect_settings().enabled)
+        return api_error(409, "database detection is off (db_detect.enabled = 0)");
+    char why[512];
+    if (remote_unusable(prov, why, sizeof(why))) return api_error(409, why);
+    if (sp_registry_get(prov, NULL, NULL) != OK) return api_error(404, err_msg());
+    detect_job_t *j = calloc(1, sizeof(*j));
+    if (!j) return api_error(500, "out of memory");
+    j->db = g_db;
+    j->repo_id = repo_id;
+    unit = bare_unit(prov, unit);
+    j->provider = strdup(prov);
+    j->unit = strdup(unit);
+    if (!j->provider || !j->unit) { detect_job_free(j); return api_error(500, "out of memory"); }
+    char params[SP_PROVIDER_MAX + SP_UNIT_ID_MAX + 64];
+    cJSON *pj = cJSON_CreateObject();
+    char *ptxt = NULL;
+    if (pj) {
+        cJSON_AddStringToObject(pj, "provider", prov);
+        cJSON_AddStringToObject(pj, "unit", unit);
+        ptxt = cJSON_PrintUnformatted(pj);
+        cJSON_Delete(pj);
+    }
+    snprintf(params, sizeof(params), "%s", ptxt ? ptxt : "{}");
+    cJSON_free(ptxt);
+    int64_t job = 0;
+    status_t st = job_submit(g_jm, repo_id, "detect", params, detect_job_run, j,
+                                       detect_job_free, &job);
+    if (st != OK) return api_error(st == ERR_BUSY ? 503 : 500, err_msg());
+    char *out = NULL;
+    if (asprintf(&out, "{\"job_id\":%lld}", (long long)job) < 0) return api_error(500, "out of memory");
+    return api_ok_status(202, out);
+}
+
 /* Not in units_route_get: POST-only, refused there with 405 above. */
 api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const char *rest)
 {
@@ -1444,6 +1580,9 @@ api_response_t units_route_post(const api_request_t *req, int64_t repo_id, const
     }
     char prov[SP_PROVIDER_MAX], unit[SP_UNIT_ID_MAX], key[UNIT_KEY_MAX];
     const char *suffix = NULL;
+    if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) &&
+        strcmp(suffix, "detect") == 0)
+        return unit_detect_post(req, repo_id, prov, unit);
     if (split_unit_path(rest, prov, sizeof(prov), unit, sizeof(unit), &suffix) &&
         strcmp(suffix, "reset-incremental") == 0) {
         char why[768];

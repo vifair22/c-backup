@@ -569,6 +569,7 @@ int main(int argc, char *argv[])
         goto out_jm;
     }
     routes_units_init(db, jm);
+    routes_databases_init(db);
     routes_db_actions_init(db);
 
     /*

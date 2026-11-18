@@ -227,6 +227,36 @@ static unsigned nextcloud_dbtype(const char *s, size_t len)
     return 0;
 }
 
+/* The value of 'dbhost', the same way: a quoted host, host:port, an IPv6
+ * literal or a socket path, made of the characters those use. 0 when
+ * there is none or it holds anything else. */
+static int nextcloud_dbhost(const char *s, size_t len, char *out, size_t sz)
+{
+    static const char key[] = "'dbhost'";
+    for (size_t i = 0; i + sizeof(key) - 1 < len; i++) {
+        if (memcmp(s + i, key, sizeof(key) - 1) != 0) continue;
+        size_t j = i + sizeof(key) - 1;
+        while (j < len && (s[j] == ' ' || s[j] == '\t')) j++;
+        if (j + 2 >= len || s[j] != '=' || s[j + 1] != '>') return 0;
+        j += 2;
+        while (j < len && (s[j] == ' ' || s[j] == '\t')) j++;
+        if (j >= len || (s[j] != '\'' && s[j] != '"')) return 0;
+        char q = s[j++];
+        size_t n = 0;
+        while (j < len && s[j] != q) {
+            char c = s[j++];
+            int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit(c) ||
+                     c == '.' || c == '-' || c == '_' || c == ':' || c == '/' || c == '[' || c == ']';
+            if (!ok || n + 1 >= sz) return 0;
+            out[n++] = c;
+        }
+        if (j >= len) return 0;
+        out[n] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
 uint32_t db_detect_classify(const char *name, const void *head, size_t len)
 {
     const uint8_t *h = head;
@@ -306,6 +336,15 @@ typedef struct { char *dir; char *target; link_kind_t kind; } lrec_t;
 #define SIB_JOURNAL 4u
 typedef struct { char *path; unsigned m; } srec_t;
 typedef struct { char *path; uint32_t code; } crec_t;
+/* A Nextcloud config.php's dbhost, from a head that was read. */
+typedef struct { char *path; char host[256]; } nrec_t;
+
+/* units.probe signals (D1). */
+#define NAME_SZ SP_PROBE_NAME_MAX
+typedef struct { uint32_t live; db_engine_t hint; char container[NAME_SZ]; char comm[SP_PROBE_COMM_MAX]; } psig_t;
+typedef struct { char *path; char container[NAME_SZ]; char comm[SP_PROBE_COMM_MAX]; } osig_t;
+typedef enum { HINT_IMAGE = 0, HINT_PORT, HINT_PROCESS } hint_kind_t;
+typedef struct { db_engine_t engine; hint_kind_t kind; char container[NAME_SZ]; char text[SP_PROBE_IMAGE_MAX]; } hsig_t;
 
 #define VEC(T) struct { T *v; size_t n, cap; }
 
@@ -322,7 +361,14 @@ struct db_detector {
      * thread's, until finish. */
     pthread_mutex_t mu;
     VEC(hrec_t) heads;
+    VEC(nrec_t) nchosts;          /* under mu, like heads */
     int         failed;           /* out of memory once: detection stops */
+    /* units.probe, when the run is a unit's and the probe answered. */
+    int         probed;
+    VEC(psig_t) psigs;
+    VEC(osig_t) osigs;
+    VEC(hsig_t) hsigs;
+    VEC(char *) names;            /* the unit's container names and aliases */
 };
 
 #define VEC_PUSH(d, vec, item) do {                                          \
@@ -360,8 +406,12 @@ void db_detect_free(db_detector_t *d)
     free(d->copies.v);
     for (size_t i = 0; i < d->carry.n; i++) free(d->carry.v[i].path);
     for (size_t i = 0; i < d->heads.n; i++) free(d->heads.v[i].path);
+    for (size_t i = 0; i < d->nchosts.n; i++) free(d->nchosts.v[i].path);
+    for (size_t i = 0; i < d->osigs.n; i++) free(d->osigs.v[i].path);
+    for (size_t i = 0; i < d->names.n; i++) free(d->names.v[i]);
     free(d->dirs.v); free(d->links.v); free(d->sibs.v); free(d->unsettled.v);
-    free(d->carry.v); free(d->heads.v);
+    free(d->carry.v); free(d->heads.v); free(d->nchosts.v);
+    free(d->psigs.v); free(d->osigs.v); free(d->hsigs.v); free(d->names.v);
     pthread_mutex_destroy(&d->mu);
     free(d);
 }
@@ -657,6 +707,218 @@ void db_detect_head(db_detector_t *d, const char *path, const void *head, size_t
     /* Most files classify as nothing, and they cost no lock and no copy. */
     if (code == DB_HEAD_NONE) return;
     add_head(d, path, code, size, 1);
+    /* The link (section 3) needs where Nextcloud's database is, which the
+     * head code has no room for. */
+    nrec_t r;
+    memset(&r, 0, sizeof(r));
+    if (DB_HEAD_KIND(code) != DB_HEAD_NEXTCLOUD ||
+        !nextcloud_dbhost(head, len, r.host, sizeof(r.host)))
+        return;
+    r.path = strdup(path);
+    pthread_mutex_lock(&d->mu);
+    if (!r.path) d->failed = 1;
+    else {
+        VEC_PUSH(d, d->nchosts, r);
+        if (d->failed) free(r.path);
+    }
+    pthread_mutex_unlock(&d->mu);
+}
+
+void db_detect_nextcloud_unread(db_detector_t *d,
+                                void (*fn)(void *ctx, const char *path), void *ctx)
+{
+    if (!d || !fn) return;
+    /* Collected first: fn feeds db_detect_head, which takes the lock and
+     * may move the arrays. */
+    VEC(char *) want = { NULL, 0, 0 };
+    pthread_mutex_lock(&d->mu);
+    for (size_t i = 0; i < d->heads.n && !d->failed; i++) {
+        if (DB_HEAD_KIND(d->heads.v[i].code) != DB_HEAD_NEXTCLOUD) continue;
+        int have = 0;
+        for (size_t k = 0; k < d->nchosts.n && !have; k++)
+            have = strcmp(d->nchosts.v[k].path, d->heads.v[i].path) == 0;
+        for (size_t k = 0; k < want.n && !have; k++)
+            have = strcmp(want.v[k], d->heads.v[i].path) == 0;
+        if (have) continue;
+        char *p = strdup(d->heads.v[i].path);
+        if (!p) break;
+        VEC_PUSH(d, want, p);
+        if (d->failed) free(p);
+    }
+    pthread_mutex_unlock(&d->mu);
+    for (size_t i = 0; i < want.n; i++) {
+        fn(ctx, want.v[i]);
+        free(want.v[i]);
+    }
+    free(want.v);
+}
+
+/* ------------------------------------------------------------------ */
+/* Units                                                                */
+/* ------------------------------------------------------------------ */
+
+#define EM(e) (1u << (unsigned)(e))
+
+uint32_t db_detect_process_engines(const char *comm, const char *args)
+{
+    if (!comm || !*comm) return 0;
+    if (strcmp(comm, "postgres") == 0 || strcmp(comm, "postmaster") == 0) return EM(DB_ENGINE_POSTGRES);
+    if (strcmp(comm, "mysqld") == 0 || strcmp(comm, "mariadbd") == 0) return EM(DB_ENGINE_MYSQL);
+    if (strcmp(comm, "redis-server") == 0 || strcmp(comm, "valkey-server") == 0) return EM(DB_ENGINE_REDIS);
+    if (strcmp(comm, "prometheus") == 0) return EM(DB_ENGINE_PROMETHEUS);
+    if (strcmp(comm, "influxd") == 0) return EM(DB_ENGINE_INFLUX1) | EM(DB_ENGINE_INFLUX2);
+    if (strcmp(comm, "mongod") == 0) return EM(DB_ENGINE_MONGO);
+    /* comm is cut at 15 characters. */
+    if (strncmp(comm, "clickhouse-serv", 15) == 0) return EM(DB_ENGINE_CLICKHOUSE);
+    /* The bootstrap class is at the end of a long java command line,
+     * usually past the 256 bytes the probe keeps; the install directory
+     * and the -Des./-Dopensearch. properties come first. */
+    if (strcmp(comm, "java") == 0 && args &&
+        (strstr(args, "elasticsearch") || strstr(args, "opensearch")))
+        return EM(DB_ENGINE_ELASTIC);
+    return 0;
+}
+
+static int ends_with_seg(const char *s, size_t n, const char *suffix)
+{
+    size_t b = strlen(suffix);
+    if (n < b || memcmp(s + n - b, suffix, b) != 0) return 0;
+    return n == b || s[n - b - 1] == '/';
+}
+
+uint32_t db_detect_image_engines(const char *image)
+{
+    if (!image || !*image) return 0;
+    char ref[SP_PROBE_IMAGE_MAX];
+    snprintf(ref, sizeof(ref), "%s", image);
+    char *at = strchr(ref, '@');
+    if (at) *at = '\0';
+    /* The tag is after the last ':' that follows the last '/'. */
+    char *slash = strrchr(ref, '/');
+    char *colon = strrchr(slash ? slash : ref, ':');
+    const char *tag = "";
+    if (colon) { *colon = '\0'; tag = colon + 1; }
+    /* A first component with a '.' or ':' or named localhost is a
+     * registry; library/ is Docker Hub's official namespace. */
+    char *r = ref;
+    char *first = strchr(r, '/');
+    if (first && (memchr(r, '.', (size_t)(first - r)) || memchr(r, ':', (size_t)(first - r)) ||
+                  ((size_t)(first - r) == 9 && strncmp(r, "localhost", 9) == 0)))
+        r = first + 1;
+    if (strncmp(r, "library/", 8) == 0) r += 8;
+    for (char *c = r; *c; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+    size_t n = strlen(r);
+    if (!n) return 0;
+    if (strstr(r, "postgres") || strstr(r, "postgis") || strncmp(r, "timescale/", 10) == 0 ||
+        strncmp(r, "tensorchord/", 12) == 0)
+        return EM(DB_ENGINE_POSTGRES);
+    if (ends_with_seg(r, n, "mysql") || ends_with_seg(r, n, "mariadb") ||
+        strcmp(r, "mysql/mysql-server") == 0)
+        return EM(DB_ENGINE_MYSQL);
+    if (ends_with_seg(r, n, "redis") || ends_with_seg(r, n, "valkey") || strncmp(r, "valkey/", 7) == 0)
+        return EM(DB_ENGINE_REDIS);
+    if (ends_with_seg(r, n, "prometheus")) return EM(DB_ENGINE_PROMETHEUS);
+    if (ends_with_seg(r, n, "influxdb"))
+        return tag[0] == '1' ? EM(DB_ENGINE_INFLUX1) : EM(DB_ENGINE_INFLUX2);
+    if (ends_with_seg(r, n, "mongo") || strncmp(r, "mongodb/", 8) == 0) return EM(DB_ENGINE_MONGO);
+    if (ends_with_seg(r, n, "elasticsearch") || strncmp(r, "opensearchproject/", 18) == 0)
+        return EM(DB_ENGINE_ELASTIC);
+    if (strncmp(r, "clickhouse/", 11) == 0 || ends_with_seg(r, n, "clickhouse-server"))
+        return EM(DB_ENGINE_CLICKHOUSE);
+    if (ends_with_seg(r, n, "nextcloud")) return EM(DB_ENGINE_NEXTCLOUD);
+    return 0;
+}
+
+uint32_t db_detect_port_engines(unsigned port)
+{
+    /* Not 9000: ClickHouse's native port is also php-fpm's and MinIO's,
+     * and a hint every Nextcloud carried would teach people to ignore
+     * hints. */
+    switch (port) {
+    case 5432:  return EM(DB_ENGINE_POSTGRES);
+    case 3306:  return EM(DB_ENGINE_MYSQL);
+    case 6379:  return EM(DB_ENGINE_REDIS);
+    case 9090:  return EM(DB_ENGINE_PROMETHEUS);
+    case 8086:  return EM(DB_ENGINE_INFLUX1) | EM(DB_ENGINE_INFLUX2);
+    case 27017: return EM(DB_ENGINE_MONGO);
+    case 9200:  return EM(DB_ENGINE_ELASTIC);
+    case 8123:  return EM(DB_ENGINE_CLICKHOUSE);
+    default:    return 0;
+    }
+}
+
+/* The one engine a hint names: InfluxDB 2 where a signal fits both, since
+ * nothing but an image tag tells them apart and 2 is what is current. */
+static db_engine_t hint_engine(uint32_t m)
+{
+    if (m & EM(DB_ENGINE_INFLUX2)) return DB_ENGINE_INFLUX2;
+    for (int e = 1; e < DB_ENGINE_COUNT_; e++)
+        if (m & EM(e)) return (db_engine_t)e;
+    return DB_ENGINE_NONE;
+}
+
+static void add_hint(db_detector_t *d, uint32_t m, hint_kind_t kind, const char *container,
+                     const char *text)
+{
+    db_engine_t e = hint_engine(m);
+    if (e == DB_ENGINE_NONE || d->failed) return;
+    hsig_t h;
+    memset(&h, 0, sizeof(h));
+    h.engine = e;
+    h.kind = kind;
+    snprintf(h.container, sizeof(h.container), "%s", container);
+    snprintf(h.text, sizeof(h.text), "%s", text);
+    VEC_PUSH(d, d->hsigs, h);
+}
+
+static void add_name(db_detector_t *d, const char *name)
+{
+    if (!name || !*name || d->failed) return;
+    for (size_t i = 0; i < d->names.n; i++)
+        if (strcmp(d->names.v[i], name) == 0) return;
+    char *s = strdup(name);
+    if (!s) { d->failed = 1; return; }
+    VEC_PUSH(d, d->names, s);
+    if (d->failed) free(s);
+}
+
+void db_detect_unit(db_detector_t *d, const sp_unit_probe_t *probe)
+{
+    if (!d || !probe || d->failed) return;
+    d->probed = 1;
+    for (size_t i = 0; i < probe->n && !d->failed; i++) {
+        const sp_probe_container_t *c = &probe->v[i];
+        add_name(d, c->name);
+        for (size_t k = 0; k < c->n_aliases; k++) add_name(d, c->aliases[k]);
+        add_hint(d, db_detect_image_engines(c->image), HINT_IMAGE, c->name, c->image);
+        for (size_t k = 0; k < c->n_ports; k++) {
+            char t[16];
+            snprintf(t, sizeof(t), "%u", (unsigned)c->ports[k]);
+            add_hint(d, db_detect_port_engines(c->ports[k]), HINT_PORT, c->name, t);
+        }
+        for (size_t k = 0; k < c->n_procs && !d->failed; k++) {
+            uint32_t m = db_detect_process_engines(c->procs[k].comm, c->procs[k].args);
+            if (!m) continue;
+            psig_t ps;
+            memset(&ps, 0, sizeof(ps));
+            ps.live = m;
+            ps.hint = hint_engine(m);
+            snprintf(ps.container, sizeof(ps.container), "%s", c->name);
+            snprintf(ps.comm, sizeof(ps.comm), "%s", c->procs[k].comm);
+            VEC_PUSH(d, d->psigs, ps);
+            add_hint(d, m, HINT_PROCESS, c->name, c->procs[k].comm);
+        }
+        for (size_t k = 0; k < c->n_open && !d->failed; k++) {
+            if (!c->open[k].path || c->open[k].path[0] != '/') continue;
+            osig_t o;
+            memset(&o, 0, sizeof(o));
+            if (!(o.path = strdup(c->open[k].path))) { d->failed = 1; break; }
+            snprintf(o.container, sizeof(o.container), "%s", c->name);
+            snprintf(o.comm, sizeof(o.comm), "%s", c->open[k].comm);
+            VEC_PUSH(d, d->osigs, o);
+            if (d->failed) free(o.path);
+        }
+    }
 }
 
 void db_detect_head_fd(db_detector_t *d, const char *path, int fd, uint64_t size)
@@ -898,6 +1160,11 @@ typedef struct {
     int         links_split, links_unchecked;
     int         absorbed;
     cJSON      *also;
+    /* units.probe (D1): what was held open or running, and for a hint
+     * finding (path "") what suggested it. */
+    cJSON      *opens, *procs, *hint_ev, *link;
+    int         hint;
+    char        dbhost[256];
 } cand_t;
 
 static void cand_free(cand_t *c)
@@ -905,6 +1172,10 @@ static void cand_free(cand_t *c)
     free(c->path);
     cJSON_Delete(c->links);
     cJSON_Delete(c->also);
+    cJSON_Delete(c->opens);
+    cJSON_Delete(c->procs);
+    cJSON_Delete(c->hint_ev);
+    cJSON_Delete(c->link);
 }
 
 /* Which markers an engine's evidence lists. */
@@ -1132,10 +1403,21 @@ static void judge(const db_capture_desc_t *cap, cand_t *c, db_finding_t *f,
     }
 }
 
-static char *evidence_json(const cand_t *c)
+static char *evidence_json(const db_detector_t *d, const cand_t *c)
 {
     cJSON *o = cJSON_CreateObject();
     if (!o) return NULL;
+    if (c->hint) {
+        /* A hint has no files: what suggested it is the whole story. */
+        cJSON *it = NULL;
+        cJSON_ArrayForEach(it, c->hint_ev) cJSON_AddItemReferenceToObject(o, it->string, it);
+        char *s = cJSON_PrintUnformatted(o);
+        cJSON_Delete(o);
+        if (!s) return NULL;
+        char *r = strdup(s);
+        cJSON_free(s);
+        return r;
+    }
     cJSON *mk = cJSON_AddArrayToObject(o, "markers");
     uint64_t m = c->marks & evidence_mask(c->engine);
     for (int i = 0; mk && i < 64; i++)
@@ -1154,6 +1436,17 @@ static char *evidence_json(const cand_t *c)
     if (c->unsettled) cJSON_AddNumberToObject(o, "unsettled", c->unsettled);
     if (c->links) cJSON_AddItemReferenceToObject(o, "links", c->links);
     if (c->also) cJSON_AddItemReferenceToObject(o, "also", c->also);
+    if (c->opens) cJSON_AddItemReferenceToObject(o, "open_write", c->opens);
+    if (c->procs) cJSON_AddItemReferenceToObject(o, "processes", c->procs);
+    if (c->link) cJSON_AddItemReferenceToObject(o, "link", c->link);
+    /* What a Nextcloud in another unit resolves its dbhost against
+     * (db_findings_link_nextcloud). */
+    if (d->probed && d->names.n &&
+        (c->engine == DB_ENGINE_POSTGRES || c->engine == DB_ENGINE_MYSQL)) {
+        cJSON *nm = cJSON_AddArrayToObject(o, "unit_names");
+        for (size_t i = 0; nm && i < d->names.n; i++)
+            cJSON_AddItemToArray(nm, cJSON_CreateString(d->names.v[i]));
+    }
     char *s = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!s) return NULL;
@@ -1183,6 +1476,197 @@ void db_findings_free(db_findings_t *f)
     for (size_t i = 0; i < f->n; i++) finding_release(&f->v[i]);
     free(f->v);
     free(f);
+}
+
+/* The engines whose files a process of their own holds; the rest are
+ * libraries in an application (SQLite, LMDB, ...), which only an open file
+ * ties to a process (section 3). */
+static int server_engine(db_engine_t e)
+{
+    switch (e) {
+    case DB_ENGINE_POSTGRES: case DB_ENGINE_MYSQL: case DB_ENGINE_REDIS:
+    case DB_ENGINE_PROMETHEUS: case DB_ENGINE_INFLUX1: case DB_ENGINE_INFLUX2:
+    case DB_ENGINE_MONGO: case DB_ENGINE_ELASTIC: case DB_ENGINE_CLICKHOUSE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* A file open for writing belongs to a finding: under its directory, or
+ * for a single-file engine the file itself or its journal siblings. */
+static int open_belongs(const char *p, const cand_t *c)
+{
+    if (c->engine == DB_ENGINE_SQLITE || c->engine == DB_ENGINE_BBOLT) {
+        size_t n = strlen(c->path);
+        if (strncmp(p, c->path, n) != 0) return 0;
+        return p[n] == '\0' || strcmp(p + n, "-wal") == 0 || strcmp(p + n, "-shm") == 0 ||
+               strcmp(p + n, "-journal") == 0;
+    }
+    return under(p, c->path);
+}
+
+#define EVIDENCE_LIST_MAX 8
+
+static void ev_pair(cJSON **arr, const char *k1, const char *v1, const char *k2, const char *v2)
+{
+    if (!*arr && !(*arr = cJSON_CreateArray())) return;
+    if (cJSON_GetArraySize(*arr) >= EVIDENCE_LIST_MAX) return;
+    const cJSON *it = NULL;
+    cJSON_ArrayForEach(it, *arr) {
+        const char *a = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, k1));
+        const char *b = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, k2));
+        if (a && b && strcmp(a, v1) == 0 && strcmp(b, v2) == 0) return;
+    }
+    cJSON *o = cJSON_CreateObject();
+    if (!o) return;
+    cJSON_AddStringToObject(o, k1, v1);
+    cJSON_AddStringToObject(o, k2, v2);
+    cJSON_AddItemToArray(*arr, o);
+}
+
+/* Liveness from the probe (section 2.1). A process makes every finding of
+ * its engine live, except that once a process of that engine is seen
+ * holding files of one of them, only the ones it holds: an old copy beside
+ * the live data directory stays dormant (section 4). */
+static void apply_probe(const db_detector_t *d, cand_t *v, size_t n)
+{
+    if (!d->probed) return;
+    int has_open[DB_ENGINE_COUNT_] = { 0 };
+    unsigned *nopen = calloc(n ? n : 1, sizeof(*nopen));
+    if (!nopen) return;
+    for (size_t i = 0; i < n; i++) {
+        cand_t *c = &v[i];
+        if (c->absorbed || c->hint || c->engine == DB_ENGINE_NEXTCLOUD) continue;
+        for (size_t k = 0; k < d->osigs.n; k++) {
+            const osig_t *o = &d->osigs.v[k];
+            if (!open_belongs(o->path, c)) continue;
+            nopen[i]++;
+            ev_pair(&c->opens, "path", o->path, "comm", o->comm);
+        }
+        if (nopen[i]) has_open[c->engine] = 1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        cand_t *c = &v[i];
+        if (c->absorbed || c->hint || c->engine == DB_ENGINE_NEXTCLOUD) continue;
+        if (server_engine(c->engine) && (!has_open[c->engine] || nopen[i]))
+            for (size_t k = 0; k < d->psigs.n; k++)
+                if (d->psigs.v[k].live & EM(c->engine))
+                    ev_pair(&c->procs, "container", d->psigs.v[k].container, "comm", d->psigs.v[k].comm);
+        if (nopen[i] || c->procs) c->live = 1;
+    }
+    free(nopen);
+}
+
+static const char *hint_kind_word(hint_kind_t k)
+{
+    switch (k) {
+    case HINT_PORT:    return "a listening port";
+    case HINT_PROCESS: return "a running process";
+    case HINT_IMAGE:
+    default:           return "the image";
+    }
+}
+
+/* One hint finding per engine that something in the unit suggests and no
+ * signature in its included mounts found (section 2.1): a client-only
+ * container, or data on an excluded or unmounted path. */
+static status_t make_hints(db_detector_t *d, cand_t **vp, size_t *np, size_t *capp)
+{
+    if (!d->probed || !d->hsigs.n) return OK;
+    uint32_t found = 0;
+    for (size_t i = 0; i < *np; i++) found |= EM((*vp)[i].engine);
+    if (found & (EM(DB_ENGINE_INFLUX1) | EM(DB_ENGINE_INFLUX2)))
+        found |= EM(DB_ENGINE_INFLUX1) | EM(DB_ENGINE_INFLUX2);
+    for (int e = 1; e < DB_ENGINE_COUNT_; e++) {
+        if (found & EM(e)) continue;
+        const hsig_t *first = NULL;
+        for (size_t k = 0; k < d->hsigs.n && !first; k++)
+            if (d->hsigs.v[k].engine == (db_engine_t)e) first = &d->hsigs.v[k];
+        if (!first) continue;
+        cand_t c;
+        memset(&c, 0, sizeof(c));
+        c.engine = (db_engine_t)e;
+        c.hint = 1;
+        c.path = strdup("");
+        c.hint_ev = cJSON_CreateObject();
+        if (!c.path || !c.hint_ev) { cand_free(&c); return set_error(ERR_NOMEM, "db detect"); }
+        cJSON *im = NULL, *po = NULL, *pr = NULL;
+        for (size_t k = 0; k < d->hsigs.n; k++) {
+            const hsig_t *h = &d->hsigs.v[k];
+            if (h->engine != (db_engine_t)e) continue;
+            if (h->kind == HINT_IMAGE) ev_pair(&im, "container", h->container, "image", h->text);
+            else if (h->kind == HINT_PORT) ev_pair(&po, "container", h->container, "port", h->text);
+            else ev_pair(&pr, "container", h->container, "comm", h->text);
+        }
+        if (im) cJSON_AddItemToObject(c.hint_ev, "images", im);
+        if (po) cJSON_AddItemToObject(c.hint_ev, "ports", po);
+        if (pr) cJSON_AddItemToObject(c.hint_ev, "processes", pr);
+        char note[256];
+        snprintf(note, sizeof(note), "%s of %s suggests %s; no data directory found in the "
+                 "backed-up mounts", hint_kind_word(first->kind), first->container,
+                 db_engine_title(c.engine));
+        cJSON_AddStringToObject(c.hint_ev, "note", note);
+        if (*np == *capp) {
+            size_t nc = *capp ? *capp * 2 : 16;
+            cand_t *g = realloc(*vp, nc * sizeof(*g));
+            if (!g) { cand_free(&c); return set_error(ERR_NOMEM, "db detect"); }
+            *vp = g;
+            *capp = nc;
+        }
+        (*vp)[(*np)++] = c;
+    }
+    return OK;
+}
+
+/* A dbhost's host name: "" for this container (localhost, a loopback
+ * address, a socket path), else the name with any port taken off. */
+static void dbhost_name(const char *dbhost, char *out, size_t sz)
+{
+    out[0] = '\0';
+    if (!*dbhost || strchr(dbhost, '/')) return;
+    char h[256];
+    snprintf(h, sizeof(h), "%s", dbhost);
+    if (h[0] == '[') {
+        char *e = strchr(h, ']');
+        if (e) *e = '\0';
+        if (strcmp(h + 1, "::1") == 0) return;
+        snprintf(out, sz, "%s", h + 1);
+        return;
+    }
+    char *c = strchr(h, ':');
+    if (c && !strchr(c + 1, ':')) *c = '\0';
+    if (strcmp(h, "localhost") == 0 || strncmp(h, "127.", 4) == 0 || strcmp(h, "::1") == 0) return;
+    snprintf(out, sz, "%s", h);
+}
+
+/* The Nextcloud link (section 3), as far as this unit can see it: its
+ * database in the same container or another container of the same unit
+ * is one capture. Anything else is left unresolved here, for the caller
+ * to look for among the repository's other units. */
+static void nextcloud_link(const db_detector_t *d, cand_t *c)
+{
+    if (strcmp(c->version, "sqlite3") == 0 || !c->version[0]) return;
+    if (!(c->link = cJSON_CreateObject())) return;
+    cJSON_AddStringToObject(c->link, "dbtype", c->version);
+    if (!c->dbhost[0]) {
+        cJSON_AddNullToObject(c->link, "resolved");
+        cJSON_AddStringToObject(c->link, "note", "dbhost not read");
+        return;
+    }
+    cJSON_AddStringToObject(c->link, "dbhost", c->dbhost);
+    char name[256];
+    dbhost_name(c->dbhost, name, sizeof(name));
+    int in_unit = !name[0];
+    for (size_t i = 0; !in_unit && d->probed && i < d->names.n; i++)
+        in_unit = strcmp(d->names.v[i], name) == 0;
+    if (in_unit) {
+        cJSON_AddStringToObject(c->link, "resolved", name[0] ? "this unit" : "this container");
+        cJSON_AddBoolToObject(c->link, "consistent", 1);
+        return;
+    }
+    cJSON_AddNullToObject(c->link, "resolved");
+    cJSON_AddStringToObject(c->link, "host", name);
 }
 
 status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
@@ -1281,6 +1765,9 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
             size_t n = ancestor_len(h->path, strlen(h->path), 2);
             if (n == (size_t)-1) continue;
             c.path = dup_n(h->path, n);
+            for (size_t k = 0; k < d->nchosts.n; k++)
+                if (strcmp(d->nchosts.v[k].path, h->path) == 0)
+                    snprintf(c.dbhost, sizeof(c.dbhost), "%s", d->nchosts.v[k].host);
         } else {
             c.path = strdup(h->path);
         }
@@ -1289,6 +1776,8 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
         VEC_PUSH(d, cands, c);
         if (d->failed) { cand_free(&c); st = set_error(ERR_NOMEM, "db detect"); }
     }
+
+    if (st == OK) st = make_hints(d, &cands.v, &cands.n, &cands.cap);
 
     db_findings_t *res = calloc(1, sizeof(*res));
     if (st == OK && !res) st = set_error(ERR_NOMEM, "db detect");
@@ -1318,18 +1807,23 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
         }
     }
 
+    if (st == OK) apply_probe(d, cands.v, cands.n);
+
     for (size_t i = 0; i < cands.n && st == OK; i++) {
         cand_t *c = &cands.v[i];
         if (c->absorbed) continue;
         unsigned uns = 0;
-        if (has_unsettled_under(d, c->path, &uns)) c->live = 1;
+        if (!c->hint && has_unsettled_under(d, c->path, &uns)) c->live = 1;
         c->unsettled = uns;
-        if (c->engine == DB_ENGINE_NEXTCLOUD) c->live = 0;
+        if (c->engine == DB_ENGINE_NEXTCLOUD) {
+            c->live = 0;
+            nextcloud_link(d, c);
+        }
 
         db_finding_t *f = &res->v[res->n];
         memset(f, 0, sizeof(*f));
         f->engine = c->engine;
-        f->confidence = c->live ? DB_CONF_LIVE : DB_CONF_DORMANT;
+        f->confidence = c->hint ? DB_CONF_HINT : c->live ? DB_CONF_LIVE : DB_CONF_DORMANT;
         f->unsettled = c->unsettled;
         snprintf(f->version, sizeof(f->version), "%s", c->version);
 
@@ -1343,7 +1837,7 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
         f->path = c->path;
         c->path = NULL;
         judge(cap, c, f, extra, n_extra);
-        f->evidence = evidence_json(c);
+        f->evidence = evidence_json(d, c);
         if (!f->coverage_why) f->coverage_why = strdup("");
         if (!f->evidence || !f->coverage_why) {
             finding_release(f);

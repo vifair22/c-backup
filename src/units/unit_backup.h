@@ -120,3 +120,14 @@ status_t unit_checkpoints_redefine(cutils_db_t *db, unsigned *checked, unsigned 
 /* The same for a provider by name; the daemon only ever asks libvirt. */
 status_t unit_checkpoints_redefine_for(cutils_db_t *db, const char *prov, unsigned *checked,
                                        unsigned *redefined, unsigned *refused, unsigned *kept);
+
+/*
+ * The unit's enrolled exclusions (unit_policy capture.exclude), each
+ * pattern under a tree's recorded path (paths[i]) rewritten onto its read
+ * root (rpaths[i]). Fills out (at most UNIT_EXCLUDE_MAX, malloc'd) and
+ * returns how many.
+ */
+#define UNIT_EXCLUDE_MAX 64
+size_t unit_backup_excludes(cutils_db_t *db, int64_t repo_id, const char *key,
+                            const char *const *paths, const char *const *rpaths, size_t nt,
+                            char **out);

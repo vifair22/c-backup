@@ -4732,6 +4732,15 @@ LevelDB; an InfluxDB 2's own bbolt file is part of that finding, listed in
 its evidence). An engine nested inside another's directory (GitLab's
 bundled PostgreSQL inside the GitLab mount) is a finding of its own.
 
+For a container unit, the helper's `units.probe` adds what is running
+(`docs/helper.md`): each container's processes (command name and the first
+256 bytes of the arguments), the TCP ports it listens on, its image, and
+the files under the unit's included mounts that a process holds open for
+writing, named at their recorded paths. Nothing outside the included mounts
+is ever reported. The probe runs once per unit, before the capture begins,
+so it never lengthens a pause. A probe that fails is logged and detection
+carries on with the file signals alone.
+
 A file the file cache vouches for is not read, so its header is not seen;
 the classification from the last read is kept in the cache and used
 instead. One consequence: a file unchanged since before the daemon had
@@ -4743,11 +4752,36 @@ regardless.
 
 | Confidence | Meaning |
 |---|---|
-| `live` | a signature and a sign of life: `postmaster.pid`, a MySQL `*.pid`, a SQLite `-wal`, `-shm` or hot `-journal` beside it, a non-empty `mongod.lock`, Prometheus's `lock` or `queries.active`, `node.lock`, ClickHouse's `status`, or any file of it that changed while it was being read (it was stored flagged as possibly torn, section 6.3) |
+| `live` | a signature and a sign of life: `postmaster.pid`, a MySQL `*.pid`, a SQLite `-wal`, `-shm` or hot `-journal` beside it, a non-empty `mongod.lock`, Prometheus's `lock` or `queries.active`, `node.lock`, ClickHouse's `status`, or any file of it that changed while it was being read (it was stored flagged as possibly torn, section 6.3). In a unit, also a file of it held open for writing by one of the unit's processes, or the engine's own process running in the unit |
 | `dormant` | a signature and nothing else: at rest, so any capture of it is consistent. Reported, with nothing suggested. A dormant SQLite file under `db_detect.sqlite_min_kb` is counted, not listed |
+| `hint` | in a unit, an image, a listening port or an engine process suggests an engine, and no signature of it was found in the unit's included mounts. One per engine, with an empty path, never judged and never suggested: usually a client-only container (a `postgres` image used for `pg_dump` elsewhere, adminer), or data on an excluded or unmounted path, which is worth knowing |
 
-Process lists, listening ports and files held open by a container's
-processes are the stronger signs of life and are not used yet.
+Liveness from the probe, in a unit:
+
+| Signal | What it makes live |
+|---|---|
+| a file held open for writing (`O_WRONLY` or `O_RDWR`) | the finding whose directory holds it; for SQLite and bbolt, the database file itself or its `-wal`, `-shm` or `-journal` |
+| an engine's process: `postgres`/`postmaster`, `mysqld`/`mariadbd`, `redis-server`/`valkey-server`, `prometheus`, `influxd`, `mongod`, `clickhouse-server`, `java` with `elasticsearch` or `opensearch` in its arguments | every finding of that engine in the unit, except that once the engine's process is seen holding files of one data directory, only the directories it holds: an old copy beside the live one (`pgdata.bak/`) stays dormant |
+
+SQLite, LMDB, LevelDB, RocksDB and bbolt have no process of their own (they
+are libraries inside an application), so only an open file ties them to a
+process. The hint signals are the images and ports of section 3 of the
+design: `postgres` and anything with `postgres` in its name, `timescale/*`,
+`tensorchord/*`; `mysql`, `mariadb`; `redis`, `valkey`; `prom/prometheus`;
+`influxdb:1*` (InfluxDB 1) and other `influxdb` tags (2); `mongo`,
+`mongodb/*`; `elasticsearch`, `opensearchproject/*`; `clickhouse/*`;
+`nextcloud`. Ports 5432, 3306, 6379, 9090, 8086, 27017, 9200 and 8123; not
+9000, which php-fpm and MinIO listen on as often as ClickHouse does.
+
+Nextcloud's database is linked to it (section 3 of the design): its
+`dbhost` is read from `config/config.php` with the same fixed pattern and
+resolved, in order, as the container itself (`localhost`, a loopback
+address, a socket path), another container of the same unit (by container
+name, compose service or network alias), or another unit backed up into
+the same repository whose database findings answer to that name. The
+finding's evidence says which (`link`); a database in another unit is
+`consistent` only when both units share a `capture.group`, and is otherwise
+suggested `group-units`.
 
 ### 23.3 Coverage
 
@@ -4774,7 +4808,8 @@ Each live finding carries what would help, as a name: a dump template for a
 unit (`pg-dumpall`, `mariadb-dump`, `redis-rdb`, `mongodump`, `sqlite-backup`,
 `influx2-backup`, `prometheus-snapshot`), `sqlite-backup` (an online-backup
 copy by the daemon) or `source-snapshot` for a file source, `pause-always`
-for a split unit, `exclude-rebuild` for a search index. A covered
+for a split unit, `exclude-rebuild` for a search index, `group-units` for a
+Nextcloud whose database is in another unit. A covered
 PostgreSQL, MySQL or MongoDB in a unit also names its dump as `optional`,
 for portability across major versions.
 
@@ -5008,3 +5043,52 @@ online backup (`docs/db-detection.md` 9.2), so the only template is
 rollback-journal database's copy holds a shared lock that blocks the
 application's writers while it runs). Enabling it records the choice; the
 file backup reads it and stores the copy under `.cbackup-captures/` (23.6).
+
+### 23.8 Reading the findings
+
+`db_findings` is served read-only (`docs/api.md`, Database findings):
+
+```sh
+c-backup db list 1                                  # every finding, paged
+c-backup db list 1 --coverage uncovered             # what is not consistently captured
+c-backup db list 1 --unit docker:compose:immich     # one unit's
+c-backup db list 1 --source /mnt/user/appdata --engine sqlite
+c-backup db show 1 12                               # one finding
+```
+
+Each finding has the fields a backup's result gives it (engine, version,
+path, confidence, coverage and `coverage_why`, method, suggestion,
+optional, evidence), its state, its history (`first_seen`, `last_seen`,
+`last_snap_id`, `alerted_at`) and the columns enabling and dismissing fill
+(`template`, `params`, `decided_by`, `decided_at`, `reason`), empty until
+then. The desktop app shows them as cards in a Databases view reached from
+the repository dashboard, grouped by unit and source and filterable by
+coverage, engine and state; the dashboard's button carries the number of
+uncovered findings not dismissed, and the backup dialog marks each source
+that has some. Each card offers Preview, Enable and Dismiss (23.7); a hint offers
+none.
+
+### 23.9 Detecting without a backup
+
+```sh
+c-backup db detect 1 cbk-uat-pg --provider docker
+```
+
+(`POST /repos/<id>/units/<p>/<u>/detect`, and **Detect now** in the app)
+runs detection on one unit now: units.probe, then a scan of each included
+mount where a live read would read it, reading only the first bytes of
+each regular file. No pause, no snapshot, nothing written to the
+repository. It is a job like the others, held against the repository's
+other jobs so it never reads beside a backup. Its result is
+`{"databases":...}`, the same object a backup's result carries, and its
+findings are recorded under the unit's scope.
+
+Coverage there is a prediction: the capture the unit's next backup would
+make (a mount on a snapshot domain atomic, one on no domain read with the
+unit paused when it is running, a stopped unit at rest). So a detection run
+never raises the uncovered alert; the next backup that captures the
+database uncovered does. It does journal new live findings and coverage
+changes, prefixed `detect`. A finding's `last_snap_id` is left as the last
+backup set it. Classifications the run read are kept in the file cache
+for files the cache already holds unchanged, so the next backup does not
+need to read them again.

@@ -130,6 +130,24 @@ export type ApiRequest =
   | { kind: 'tagRemove'; repoId: number; name: string }
   | { kind: 'journal'; repoId: number; limit?: number; result?: string }
 
+  /* --- database detection (docs/db-detection.md 7.4).
+   * scope is exact: "unit:<provider>:<unit>" or "source:<path>". coverage
+   * takes the section 5 names, or "none" for a finding nothing assessed. */
+  | { kind: 'dbList'; repoId: number; scope?: string; engine?: string
+      coverage?: string; state?: string; limit?: number; offset?: number }
+  | { kind: 'dbShow'; repoId: number; findingId: number }
+  /* Detection now, without a backup: a job. unit may itself hold ':'
+   * (compose:immich), which is why provider and unit travel apart. */
+  | { kind: 'unitDetect'; repoId: number; provider: string; unit: string }
+  /* Acting on a finding (D2). Nothing but these three enables a template.
+   * preview with no template asks for the finding's own suggestion; enable
+   * names one, and params are the template's, checked by the daemon. */
+  | { kind: 'dbPreview'; repoId: number; findingId: number
+      template?: string; params?: Record<string, unknown> }
+  | { kind: 'dbEnable'; repoId: number; findingId: number
+      template: string; params?: Record<string, unknown> }
+  | { kind: 'dbDismiss'; repoId: number; findingId: number; reason: string }
+
   /* --- schedules --- */
   | { kind: 'scheduleList'; repoId: number }
   | { kind: 'scheduleAdd'; repoId: number; action: string

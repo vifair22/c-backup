@@ -81,6 +81,8 @@ static const decided_t DECIDED[] = {
     { API_POST,   "/repos/1/units/backup",                    C },
     { API_PUT,    "/repos/1/units/fake/u1/policy",            C },
     { API_POST,   "/repos/1/units/fake/u1/reset-incremental", C },
+    /* A detection run is a job: commit-only, like every submission. */
+    { API_POST,   "/repos/1/units/fake/u1/detect",            C },
     { API_POST,   "/repos/1/snapshots/2/unit/restore",        C },
     { API_POST,   "/repos/1/snapshots/2/unit/export",         C },
     /* Database findings: DB-only edits; preview writes nothing. */
@@ -215,6 +217,7 @@ static void test_every_repo_path_write_resolves_to_its_decision(void **state)
     check_table(srv, t, n, seen);
     t = routes_units_paths(&n);
     check_table(srv, t, n, seen);
+    t = routes_databases_paths(&n);
     t = routes_db_actions_paths(&n);
     check_table(srv, t, n, seen);
     for (size_t i = 0; i < NDECIDED; i++) {

@@ -229,6 +229,20 @@ GFS_OUT=$(cb gfs 1 --dry-run)
 contains "gfs dry run says what it would remove" '"would_remove":[],"count":0' "$GFS_OUT"
 contains "and the retention it used" '"retention":{"keep_snaps":' "$GFS_OUT"
 contains "journal" 'entries'  "$(cb journal 1)"
+# Database findings (db-detection.md 7.4): none in this source, and the
+# filters reach the daemon, which refuses a value outside its set.
+contains "db list" '{"findings":[],"total":0}' "$(cb db list 1)"
+contains "db list with filters" '"total":0' "$(cb db list 1 --source "$WORK/src" --engine sqlite --state new --coverage none --limit 5 --offset 0)"
+OUT=$(cb db list 1 --engine oracle 2>&1); RC=$?
+check    "db list passes the daemon's refusal on" 1 "$RC"
+contains "and its words" 'engine must be one of' "$OUT"
+OUT=$(cb db list 1 --coverage fine 2>&1); RC=$?
+check    "a coverage outside the set is refused here" 1 "$RC"
+OUT=$(cb db show 1 999 2>&1); RC=$?
+check    "db show of no finding fails" 1 "$RC"
+contains "and says so" 'no such database finding' "$OUT"
+OUT=$(cb db detect 1 u1 2>&1); RC=$?
+check    "db detect needs --provider" 1 "$RC"
 
 RESTORE_OUT=$(cb restore 1 1 "$WORK/out")
 contains "restore waits and completes" '"state":"completed"' "$RESTORE_OUT"
