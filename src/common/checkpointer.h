@@ -67,9 +67,25 @@
  * not the shared handle, and the write is made holding the write lock, so
  * the db_write rule (db_write.h) is kept.
  *
- * journal_size_limit on the shared handle trims the WAL file back to 4 x
- * the threshold (CKPT_CAP_FACTOR) at each restart, so its size on disk
- * follows its contents.
+ * journal_size_limit trims the WAL file back to 4 x the threshold
+ * (CKPT_CAP_FACTOR) at the first commit after each restart, so its size on
+ * disk follows its contents. SQLite trims to the limit of the connection
+ * that restarted the WAL, which is this thread's, so this connection carries
+ * the limit as well as the shared handle; it did not until B215's follow-up,
+ * and the file stayed at its high-water mark.
+ *
+ * The files and the uid drop (B215). Every connection is opened before the
+ * daemon drops to security.run_as_uid: the shared handle, the reader pool
+ * and this one. state.db, -wal and -shm are root's, 0600, and uid 990 could
+ * open them only read-only. None is ever replaced while the daemon runs: a
+ * WAL restart rewrites the header in place, the trim above is an ftruncate
+ * of the open file, a RESTART checkpoint writes nothing but the header, and
+ * -shm is shared by every connection in the process through one descriptor.
+ * SQLite deletes -wal and -shm only when the last connection closes, which
+ * is shutdown; the next start, as root again, creates them anew before the
+ * drop. The pool's connections close only at shutdown too (db_readers.h).
+ * A new connection opened after the drop would be read-only, and
+ * checkpointer_open refuses one rather than run on it.
  *
  * Reading the WAL's state. The frame counts come from the wal-index header
  * at the start of <db>-shm, whose layout is part of SQLite's documented WAL
