@@ -384,7 +384,7 @@ are different: they live in the database and change through the policy API
 | `db.path` | none, required | The daemon database. The shipped config sets `/var/lib/c-backupd/state.db`; a file without it stops the daemon |
 | `db.synchronous` | `normal` | When a database commit reaches the disk. `normal`: the durable API edits (tags, registering or removing a repository, every delete) are synced before the API answers, and everything else - other API edits such as notes, sources, policy and schedules, and the daemon's own writes (backup index rows, job records, the journal) - once a second, so a power cut can lose about their last second, never corrupt them (sections 6.4 and 17.5); `full`: every commit is synced before it returns, as SQLite does by default, at a large cost on many small files (section 18.2). `normal` or `full` |
 | `db.cache_mb` | `64` | MiB of page cache for the database. 2 to 65536 |
-| `db.wal_autocheckpoint` | `16384` | Database pages (4 KiB) waiting in its log that start a checkpoint, each of which costs two syncs. Checkpoints run on a background thread with a connection of its own, never inside a commit, so no request waits for one; the log is restarted about once per this many pages and held under 16 times it, and its file is trimmed back to 4 times it. 1000 to 1048576 |
+| `db.wal_autocheckpoint` | `16384` | Database pages (4 KiB) waiting in its log that start a checkpoint, each of which costs two syncs. Checkpoints run on a background thread with a connection of its own, never inside a commit, so no request waits for one; the log is restarted about once per this many pages and held under 16 times it, and its file is trimmed back to 4 times it. An outside reader holding a read transaction on `state.db` (a `sqlite3` shell, say) stops every copy from completing and lets the log grow past that bound for as long as it holds it (section 18.2). 1000 to 1048576 |
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
 | `http.port` | `8765` | TCP port for remote clients, 0 to 65535. `0` disables TCP |
 | `http.bind` | `127.0.0.1` | TCP bind address, an IPv4 address (not a hostname). `0.0.0.0` for every interface |
@@ -840,6 +840,19 @@ flowchart TD
    snapshot's id, then the snapshot record goes into the repository, then
    the index rows go into the database. An interrupted backup leaves at most
    staging files and index rows that the next start and a reindex clean up.
+   Once the record is written the snapshot exists, whatever the index does:
+   the record is synced and names only packs that were sealed and synced
+   before it. A backup whose index rows then fail to commit (a full
+   `state.db` filesystem, say) fails, but its error says so, naming the
+   snapshot: `...; snapshot 12 was written to the repository but its index
+   did not commit: the next daemon start indexes it (reconcile) unless a
+   later snapshot of this repository is indexed first, and c-backup reindex
+   3 indexes it now`, and the job's `result` is `{"snapshot_id":12,
+   "indexed":false}`. The snapshot is not deleted, and it is not missing
+   either: the next start's reconcile (section 17.5) reindexes it like any
+   record whose rows a power cut took, as long as no later backup of the
+   repository has been indexed by then, since reconcile looks only above
+   the highest indexed id; `c-backup reindex` finds it in every case.
 
 There is no pack step afterwards and nothing to run by hand: a backup leaves
 no loose objects because none exist. Merging the small trailing packs
@@ -876,7 +889,10 @@ fails - a full disk, an I/O error, a failed sync or close - fails the whole
 backup, naming the file being stored and the error (`backup: storing
 /data/x: pack: write to <staging>: No space left on device`). No snapshot
 is recorded, the partly written pack is discarded, and nothing it held is
-left for a later run to trust.
+left for a later run to trust. That holds for any failure before the
+snapshot record is written, which is the last thing a backup writes to the
+repository; a failure after it, in the index, leaves the snapshot recorded
+and says so (step 5 above).
 
 **A file that changes while it is backed up.** A live filesystem changes
 under a backup, and a file can be a different size by the time it is read
@@ -1744,8 +1760,15 @@ would do:
  "tmp_files_removed":0,"tmp_bytes_removed":0}
 ```
 
-`objects_swept` and `bytes_freed` are what was swept, or on a dry run what
-would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
+`objects_swept` is how many unreachable objects were removed from the index,
+and `bytes_freed` the stored bytes compaction then removed from the packs
+(dead entries included that an earlier run swept and could not reclaim, and
+duplicate copies); a dry run reports what it would sweep and the bytes that
+would make reclaimable. The two are separate steps: the sweep commits
+first, and if compaction then fails, a full disk say, the job fails with
+the error that stopped it (`pack rewrite: write entry: No space left on
+device`), `bytes_freed` counts only what it finished, and the next gc
+reclaims the rest. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
 does not do. `packs_coalesced` is how many small packs the coalescing pass
 after compaction merged, and `packs_removed_by_coalesce` how many fewer pack
 files that left: 20 merged into 3 is 20 and 17. `tmp_files_removed` counts staging files an interrupted run left
@@ -2715,6 +2738,31 @@ parity) beat the same repository on a SATA SSD cache pool: first backup
 295 s against 391 s, an unchanged backup 2.0 s against 6.6 s. Put the
 repository wherever capacity and your own measurements say; keep `state.db`
 on fast storage.
+
+**Its write-ahead log.** `state.db-wal` beside it holds commits until the
+checkpointer copies them into the database; its size is the second thing to
+plan for. The checkpointer starts a copy once `db.wal_autocheckpoint` pages
+(64 MiB by default) wait, and holds the log under 16 times that (1 GiB) by
+making bulk writers wait for a copy (section 3). A backup is the largest
+writer: measured on a test server, an unchanged backup of 22,000 files took
+the log to about 380 MB before the next restart. Leave room for 1 GiB on
+the filesystem that holds `state.db`, and more if `db.wal_autocheckpoint` is
+raised.
+
+**Do not hold long reads on a live `state.db`.** A checkpoint can only
+reuse the log once every reader has moved past the frames it copied, and the
+daemon's own readers let go within moments; an outside one does not. A
+`sqlite3` shell left open inside a transaction, a backup tool reading the
+file, or anything else holding a read pins the log, and the cap cannot
+help, since it waits for copies and none can complete: measured, the log
+went from 26 MB to 1.04 GB while a `sqlite3` session held one read
+transaction during a backup, and shrank only once it closed. The daemon
+does not hold writers back for this (they would wait for ever), so the log
+keeps growing for as long as the read lasts. Query through the CLI or the
+API instead. To inspect the file itself, open it read-only, run what you
+need, and close the shell; for anything longer, work on a copy made with
+`sqlite3 state.db ".backup /elsewhere/copy.db"`, whose read lasts only as
+long as the copy.
 
 ### 18.3 Memory
 

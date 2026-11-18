@@ -891,20 +891,24 @@ void store_set_pack_commit_cb(store_t *st, store_pack_commit_fn cb, void *user) 
 /* Set by a commit callback that could not commit, on its own thread; the
  * callback runs synchronously inside store_emit_pack_commit. */
 static _Thread_local int tls_commit_failed;
+static _Thread_local char tls_commit_why[1024];
 
-void store_pack_commit_failed(void) {
+void store_pack_commit_failed(const char *why) {
     tls_commit_failed = 1;
+    snprintf(tls_commit_why, sizeof(tls_commit_why), "%s", why ? why : "");
 }
 
 status_t store_emit_pack_commit(store_t *st, const pack_commit_info_t *info) {
     if (!st || !info) return OK;
     if (!st->locate_cb) bidx_commit(st, info);
     tls_commit_failed = 0;
+    tls_commit_why[0] = '\0';
     if (st->commit_cb) st->commit_cb(st->commit_user, info);
     if (tls_commit_failed) {
         tls_commit_failed = 0;
-        return set_error(ERR_IO, "pack %llu: its index rows did not commit",
-                         (unsigned long long)info->pack_id);
+        return set_error(ERR_IO, "pack %llu: its index rows did not commit%s%s",
+                         (unsigned long long)info->pack_id,
+                         tls_commit_why[0] ? ": " : "", tls_commit_why);
     }
     return OK;
 }

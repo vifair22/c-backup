@@ -37,6 +37,7 @@
 #include "job_manager.h"
 #include "lock.h"
 #include "test_tmp.h"
+#include "full_vfs.h"
 
 #define TEST_DIR TEST_TMP "/c_backup_test_jobm"
 #define TEST_DB  TEST_DIR "/state.db"
@@ -234,6 +235,79 @@ static int wait_db_count(const char *sql, int want)
 }
 
 /* ------------------------------------------------------------------ */
+
+/*
+ * B196: a job whose end cannot be written, state.db's filesystem full, read
+ * "running" until the next start, and its reason was lost. Its end is kept
+ * in memory now, shown by job_end_unrecorded, retried with a backoff rather
+ * than in a loop, and written once the database takes writes again, with
+ * the time it ended and one journal entry.
+ */
+static status_t fills_the_disk_job(void *arg, atomic_int *cancel,
+                                   void (*progress)(const char *, uint64_t, uint64_t, void *),
+                                   void *progress_ctx)
+{
+    (void)arg; (void)cancel;
+    progress("work", 3, 3, progress_ctx);
+    job_set_result(progress_ctx, "{\"snapshot_id\":7,\"indexed\":false}");
+    full_vfs_arm(1);
+    atomic_store(&full_vfs_hits, 0);
+    return set_error(ERR_IO, "the job's own failure");
+}
+
+static void test_an_end_the_database_cannot_take_is_kept_and_retried(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, fills_the_disk_job, NULL, NULL, &id), OK);
+
+    job_end_view_t ev;
+    int held = 0;
+    for (int i = 0; i < 2000 && !held; i++) {
+        held = job_end_unrecorded(db, id, &ev);
+        if (!held) usleep(5000);
+    }
+    assert_true(held);
+    assert_string_equal(ev.state, "failed");
+    assert_non_null(strstr(ev.error, "the job's own failure"));
+    assert_true(ev.ended > 0);
+    assert_non_null(ev.result);
+    assert_string_equal(ev.result, "{\"snapshot_id\":7,\"indexed\":false}");
+    assert_true(ev.has_progress);
+    assert_int_equal(ev.done, 3);
+    free(ev.result);
+    assert_int_equal(job_ends_unrecorded(db), 1);
+
+    /* The table cannot have it, and the retry does not spin: over three
+     * seconds the backoff allows a handful of attempts, each a few writes. */
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM jobs WHERE id = %lld AND state = 'running'",
+             (long long)id);
+    assert_int_equal(db_count(sql), 1);
+    sleep(3);
+    int hits = atomic_load(&full_vfs_hits);
+    print_message("writes refused while full: %d\n", hits);
+    assert_true(hits > 0);
+    assert_true(hits < 40);
+    assert_int_equal(db_count(sql), 1);
+    assert_true(job_end_unrecorded(db, id, NULL));
+
+    /* Space comes back, and the next job's end, which is a write the
+     * manager makes anyway, takes the held one in first rather than leave
+     * it to the timer: it goes in, once. */
+    full_vfs_arm(0);
+    submit(2, "gc");
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM jobs WHERE id = %lld AND state = 'failed'"
+             " AND error LIKE '%%the job''s own failure%%' AND ended > 0"
+             " AND result = '{\"snapshot_id\":7,\"indexed\":false}'"
+             " AND progress_current = 3", (long long)id);
+    assert_int_equal(wait_db_count(sql, 1), 1);
+    assert_false(job_end_unrecorded(db, id, NULL));
+    assert_int_equal(job_ends_unrecorded(db), 0);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 1"
+                              " AND operation = 'backup' AND result = 'failed'"), 1);
+}
 
 /*
  * Four jobs, one repository, two workers. Before the dispatcher consulted
@@ -1653,6 +1727,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_job_waiting_on_a_set_can_be_cancelled, setup, teardown),
         cmocka_unit_test_setup_teardown(test_crossed_sets_both_complete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_stream_on_dst_cannot_starve_a_set, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_an_end_the_database_cannot_take_is_kept_and_retried, setup, teardown),
     };
+    if (full_vfs_install() != 0) return 1;
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

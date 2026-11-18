@@ -264,10 +264,21 @@ contains "gfs runs over every group" '"state":"completed"' "$(cb gfs 1)"
 check    "each unit keeps its head" 2 "$(cb unit history 1 | grep -o '"unit_key"' | wc -l)"
 
 echo "incremental chain"
-OUT=$(cb vm checkpoints 1 cbk-uat-a)
-contains "a VM's chain is shown" '"tokens":[]' "$OUT"
-contains "with whether incrementals are on" '"enabled":false' "$OUT"
-contains "reset-incremental answers for the unit" '"unit_key":"libvirt:cbk-uat-a"' "$(cb vm reset-incremental 1 cbk-uat-a)"
+if command -v curl >/dev/null 2>&1; then
+    OUT=$(curl -s --unix-socket "$SOCK" http://x/repos/1/units/fake/cbk-uat-a/checkpoints)
+    contains "a unit's chain is shown" '"tokens":[]' "$OUT"
+    contains "with whether incrementals are on" '"enabled":false' "$OUT"
+    contains "reset-incremental answers for the unit" '"unit_key":"fake:a"' \
+        "$(curl -s --unix-socket "$SOCK" -X POST http://x/repos/1/units/fake/cbk-uat-a/reset-incremental)"
+    # NIT-41: a unit nothing knows of, on a provider that is not enabled,
+    # answered both with success, the reset journalled as done.
+    check "an unknown unit's chain and reset answer 404" "404 404" "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" http://x/repos/1/units/fake/nosuch/checkpoints) $(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" -X POST http://x/repos/1/units/fake/nosuch/reset-incremental)"
+fi
+OUT=$(cb vm checkpoints 1 cbk-uat-a 2>&1); RC=$?
+check    "vm checkpoints for a VM no provider has is refused" 1 "$RC"
+contains "saying why" "libvirt" "$OUT"
+OUT=$(cb vm reset-incremental 1 cbk-uat-a 2>&1); RC=$?
+check    "and so is its reset-incremental" 1 "$RC"
 OUT=$(cb vm checkpoints 1 2>&1); RC=$?
 check    "checkpoints without a unit are refused" 1 "$RC"
 

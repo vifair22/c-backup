@@ -160,6 +160,10 @@ typedef struct {
 
 typedef struct {
     int64_t  snapshot_id;
+    /* Set, on a failed run only, with snapshot_id, when the snapshot record
+     * reached the repository and its index did not commit (B195): a real
+     * snapshot the next start's reconcile or a reindex indexes. */
+    int      snapshot_unindexed;
     uint64_t files;
     uint64_t dirs;
     uint64_t bytes_logical;
@@ -234,7 +238,9 @@ typedef struct {
 
 /*
  * On OK *out is filled and owns the skipped list; call backup_result_free
- * on it. On any other status *out is left untouched.
+ * on it. On any other status *out is left untouched, except that when the
+ * snapshot record was written and its index did not commit, snapshot_id
+ * and snapshot_unindexed are set (and the error says so).
  */
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     const backup_opts_t *opts, backup_result_t *out);

@@ -262,10 +262,13 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
 
     /* Per entry: bit 0, its pack_objects row is for the marker; bit 1, its
      * objects row is. */
+    /* So the cause reported on failure is this commit's, not a message an
+     * earlier call left on the thread. */
+    err_clear();
     uint8_t *later = calloc(info->entry_count ? info->entry_count : 1, 1);
     if (!later) {
         log_error("pack commit: out of memory for pack %s", pack);
-        store_pack_commit_failed();
+        store_pack_commit_failed("out of memory");
         return;
     }
 
@@ -391,6 +394,7 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         if (cut_before_commit()) { db_txn_rollback(idx->db); return; }
         int (*fault)(void) = g_commit_fault;
         if (fault && fault()) {
+            set_error(ERR_IO, "commit fault injected");
             failed = 1;                 /* in_txn: rolled back below */
         } else {
             if (db_txn_commit(idx->db) == OK) return;
@@ -400,17 +404,22 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
     } else if (!failed) {
         return;                         /* the last part committed in the loop */
     }
+    /* The cause, from whichever call failed (B194), before the cleanup
+     * below can replace it. */
+    char why[1024];
+    snprintf(why, sizeof(why), "%s", err_msg()[0] ? err_msg() : "no reason recorded");
     if (in_txn) db_txn_rollback(idx->db);
-    log_error("pack commit: pack %s (%u objects) did not commit%s", pack, info->entry_count,
+    log_error("pack commit: pack %s (%u objects) did not commit%s: %s", pack,
+              info->entry_count,
               marker ? " in full; it is indexed, and the objects it duplicates still "
-                       "resolve to the packs that held them" : "");
+                       "resolve to the packs that held them" : "", why);
     /* Rows without their packs row go back to the state a lost commit
      * leaves. Once the packs row is in, there is nothing to put back: the
      * pack is a readable duplicate, and gc collects what nothing names. */
     if (wrote && !marker) drop_unannounced(idx, repo, pack);
     /* The seal fails with it, so its claims are abandoned (store.h), and
      * whatever was to remove the packs it replaces does not (B185). */
-    store_pack_commit_failed();
+    store_pack_commit_failed(why);
 }
 
 /*

@@ -20,6 +20,7 @@
  * every pack at or under the seal.
  */
 
+#include <errno.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -382,6 +383,48 @@ static void test_failed_install_leaves_the_old_pack(void **state)
 }
 
 /*
+ * B197: the disk fills while compaction writes the new pack. The error
+ * said "(is the disk full?)" with no errno, and the result reported every
+ * swept byte as freed though no pack had changed. The write that failed is
+ * named with its errno now, and bytes_freed is what was really removed.
+ */
+static void test_a_full_disk_during_compaction_says_so(void **state)
+{
+    (void)state;
+    int before = pack_files();
+
+    fault_full_devfull = 1;
+    fault_full_arm(TEST_REPO "/", FAULT_FULL_WRITE, 2, -1);
+    gc_result_t g;
+    err_clear();
+    status_t st = run_gc(&g);
+    fault_full_disarm();
+    print_message("gc: %s\n", err_msg());
+    assert_int_not_equal(st, OK);
+    assert_non_null(strstr(err_msg(), strerror(ENOSPC)));
+    assert_null(strstr(err_msg(), "is the disk full?"));
+    err_clear();
+
+    /* Swept from the index, which committed; nothing freed on disk. */
+    assert_int_equal(g.swept, BIG_DEAD);
+    assert_int_equal(g.pack_entries_dropped, 0);
+    assert_int_equal(g.bytes_freed, 0);
+    assert_true(big_pack_on_disk());
+    assert_int_equal(pack_files(), before);
+    verify_clean();
+    restore_exact();
+
+    /* The next gc reclaims them, and says how much. */
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(run_gc(&g), OK);
+    assert_int_equal(g.swept, 0);
+    assert_int_equal(g.pack_entries_dropped, BIG_DEAD);
+    assert_true(g.bytes_freed >= (uint64_t)BIG_DEAD * 1024);
+    assert_false(big_pack_on_disk());
+    finish_and_check();
+}
+
+/*
  * Run gc in a child that dies at the given rename into packs/, then reopen
  * everything in the parent, as a restarted daemon would.
  */
@@ -494,6 +537,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_gc_splits_an_oversized_pack, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failed_install_leaves_the_old_pack, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_full_disk_during_compaction_says_so, setup, teardown),
         cmocka_unit_test_setup_teardown(test_killed_between_installs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_killed_before_the_marker, setup, teardown),
         cmocka_unit_test_setup_teardown(test_killed_after_the_marker, setup, teardown),

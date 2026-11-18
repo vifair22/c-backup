@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "job_manager.h"
 
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
@@ -93,6 +94,15 @@ static ssize_t job_reader(void *cls, char *buf, size_t max)
         return n > 0 ? n : -1;
     }
 
+    /* An end held in memory because the table could not take it (B196):
+     * the row still says running, and the end is what the client waits
+     * for. */
+    job_end_view_t ev;
+    int unrec = job_end_unrecorded(g_db, st->job_id, &ev);
+    if (unrec) free(ev.result);
+    const char *state = unrec ? ev.state : r->rows[0][0];
+    const char *error = unrec ? ev.error : r->rows[0][4];
+
     /* cJSON for the escaping: an error names paths, and a path can hold a
      * quote, which a bare %s turned into a frame no JSON reader accepts. */
     char payload[sizeof(st->last)];
@@ -100,24 +110,24 @@ static ssize_t job_reader(void *cls, char *buf, size_t max)
     cJSON *o = cJSON_CreateObject();
     if (o) {
         cJSON_AddNumberToObject(o, "id", (double)st->job_id);
-        cJSON_AddStringToObject(o, "state", r->rows[0][0]);
+        cJSON_AddStringToObject(o, "state", state);
         cJSON_AddStringToObject(o, "phase", r->rows[0][1]);
         cJSON_AddNumberToObject(o, "current", (double)strtoull(r->rows[0][2], NULL, 10));
         cJSON_AddNumberToObject(o, "total",   (double)strtoull(r->rows[0][3], NULL, 10));
         cJSON_AddNumberToObject(o, "bytes_done",  (double)strtoull(r->rows[0][5], NULL, 10));
         cJSON_AddNumberToObject(o, "bytes_total", (double)strtoull(r->rows[0][6], NULL, 10));
-        cJSON_AddStringToObject(o, "error", r->rows[0][4]);
+        cJSON_AddStringToObject(o, "error", error);
         if (!cJSON_PrintPreallocated(o, payload, (int)sizeof(payload), 0))
             payload[0] = '\0';
         cJSON_Delete(o);
     }
     if (!payload[0])
         snprintf(payload, sizeof(payload), "{\"id\":%lld,\"state\":\"%s\"}",
-                 (long long)st->job_id, r->rows[0][0]);
+                 (long long)st->job_id, state);
 
-    int terminal = strcmp(r->rows[0][0], "completed") == 0 ||
-                   strcmp(r->rows[0][0], "failed") == 0 ||
-                   strcmp(r->rows[0][0], "cancelled") == 0;
+    int terminal = strcmp(state, "completed") == 0 ||
+                   strcmp(state, "failed") == 0 ||
+                   strcmp(state, "cancelled") == 0;
     db_result_free(r);
 
     /* Suppress identical frames, up to a heartbeat. A job that sits in one
