@@ -42,6 +42,7 @@
 #include "index_reconcile.h"
 #include "reindex.h"
 #include "repo.h"
+#include "replicate.h"
 #include "repo_key.h"
 #include "repo_tags.h"
 #include "snapshot_ids.h"
@@ -243,10 +244,30 @@ static int fill_authorizer(void *arg, int action, const char *a1, const char *a2
     return SQLITE_OK;
 }
 
+/* Node rows changed per transaction, for the batching test: the most one
+ * transaction changed since the counters were reset. */
+static atomic_long rows_in_txn, rows_max;
+
+static void count_row(void *arg, int op, const char *dbn, const char *table, sqlite3_int64 rowid)
+{
+    (void)arg; (void)op; (void)dbn; (void)rowid;
+    if (table && strcmp(table, "nodes") == 0) atomic_fetch_add(&rows_in_txn, 1);
+}
+
+static int count_commit(void *arg)
+{
+    (void)arg;
+    long n = atomic_exchange(&rows_in_txn, 0);
+    if (n > atomic_load(&rows_max)) atomic_store(&rows_max, n);
+    return 0;
+}
+
 static int fill_ext(sqlite3 *conn, char **err, const sqlite3_api_routines *api)
 {
     (void)err; (void)api;
     sqlite3_set_authorizer(conn, fill_authorizer, NULL);
+    sqlite3_update_hook(conn, count_row, NULL);
+    sqlite3_commit_hook(conn, count_commit, NULL);
     return SQLITE_OK;
 }
 
@@ -382,17 +403,15 @@ static void make_gap(int later)
     assert_int_equal(scalar("SELECT MAX(id) FROM snapshots WHERE repo_id = ?"), later + 1);
 }
 
-/* Snapshot 1 restores byte for byte, and a deep verify of everything the
- * index lists is clean. */
-static void gap_intact(void)
+/* Snapshot 1 of the repository st/rdb/rid restores byte for byte. */
+static void gap_restores(store_t *st, cutils_db_t *rdb, int64_t rid)
 {
-    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id = 1"), 1);
     rmrf(TEST_DIR "/out");
     restore_opts_t ro;
     memset(&ro, 0, sizeof(ro));
     restore_result_t rr;
     memset(&rr, 0, sizeof(rr));
-    assert_int_equal(restore_run(store, db, repo_id, 1, TEST_DIR "/out", &ro, &rr), OK);
+    assert_int_equal(restore_run(st, rdb, rid, 1, TEST_DIR "/out", &ro, &rr), OK);
     assert_int_equal(rr.failed, 0);
 
     uint8_t *want = malloc(GAP_BYTES), *got = malloc(GAP_BYTES + 1);
@@ -406,6 +425,14 @@ static void gap_intact(void)
     assert_memory_equal(got, want, GAP_BYTES);
     free(want);
     free(got);
+}
+
+/* Snapshot 1 restores byte for byte, and a deep verify of everything the
+ * index lists is clean. */
+static void gap_intact(void)
+{
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id = 1"), 1);
+    gap_restores(store, db, repo_id);
 
     verify_result_t vr;
     memset(&vr, 0, sizeof(vr));
@@ -482,6 +509,77 @@ static void test_coalescing_keeps_a_gap(void **state)
     print_message("coalesced %u packs\n", g.packs_coalesced);
     assert_true(g.packs_coalesced > 0);
     gap_intact();
+}
+
+/* Replication chooses from the index, so it indexes the gap first: the
+ * replica holds snapshot 1, and it restores from there. */
+static void test_replication_carries_a_gap(void **state)
+{
+    (void)state;
+    make_gap(2);
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_REPO, &m), OK);
+    replica_sink_t sink;
+    assert_int_equal(replica_sink_local_open(TEST_DIR "/replica", &m, &sink), OK);
+    replicate_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    status_t st = replicate_run(store, db, repo_id, &sink, NULL, NULL, NULL, &rr);
+    sink.v->close(sink.ctx);
+    assert_int_equal(st, OK);
+    assert_int_equal(rr.snapshots_sent, 3);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id = 1"), 1);
+
+    /* The replica, as its own daemon would see it: registered in a
+     * database of its own (it shares the source's identity) and reindexed. */
+    cutils_db_t *rdb = NULL;
+    assert_int_equal(db_open(&rdb, TEST_DIR "/replica.db"), 0);
+    assert_int_equal(db_run_lib_migrations(rdb), 0);
+    assert_int_equal(db_run_compiled_migrations(rdb, app_migrations), 0);
+    int64_t rid = 0;
+    assert_int_equal(repo_register(rdb, TEST_DIR "/replica", "replica", &rid), OK);
+    store_t *rst = NULL;
+    assert_int_equal(repo_store_open(TEST_DIR "/replica", NULL, &rst), OK);
+    store_index_t *ridx = NULL;
+    assert_int_equal(store_index_bind(rst, rdb, rid, &ridx), OK);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(rst, rdb, rid, NULL, &rx), OK);
+    assert_int_equal(rx.snapshots, 3);
+    gap_restores(rst, rdb, rid);
+    store_index_free(ridx);
+    store_close(rst);
+    db_close(rdb);
+}
+
+/* Indexing a gap commits in batches (B200): a large snapshot's walk does
+ * not hold the write lock for all of it, as index_nodes does not. */
+static void test_indexing_a_gap_commits_in_batches(void **state)
+{
+    (void)state;
+    char path[256];
+    assert_int_equal(mkdir(TEST_SRC "/many", 0700), 0);
+    for (int i = 0; i < 6000; i++) {
+        snprintf(path, sizeof(path), TEST_SRC "/many/f%05d", i);
+        write_file(path, "x");
+    }
+    backup_once("big\n");
+    long long id = scalar("SELECT MAX(id) FROM snapshots WHERE repo_id = ?");
+    lose_newest_snapshot_rows();
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), id - 1);
+
+    atomic_store(&rows_in_txn, 0);
+    atomic_store(&rows_max, 0);
+    uint64_t n = 0;
+    assert_int_equal(reindex_gaps(store, db, repo_id, "test", &n), OK);
+    assert_int_equal(n, 1);
+    long mx = atomic_load(&rows_max);
+    print_message("most node rows in one transaction: %ld\n", mx);
+    /* One transaction held all 6,000; a batch holds at most 2,000. */
+    assert_true(mx > 0);
+    assert_true(mx <= 2000);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), id);
+    char sql[128];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = %lld", id);
+    assert_true(scalar(sql) >= 6000);
 }
 
 /* A record that cannot be indexed refuses the gc, naming it, and nothing
@@ -816,6 +914,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_gc_indexes_a_gap_before_it_sweeps, setup, teardown),
         cmocka_unit_test_setup_teardown(test_prune_then_gc_keeps_a_gap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_coalescing_keeps_a_gap, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_replication_carries_a_gap, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_indexing_a_gap_commits_in_batches, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_refuses_a_gap_it_cannot_index, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_full_disk_in_index_nodes_reports_the_written_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_full_disk_at_the_snapshot_row_reports_the_written_snapshot, setup, teardown),

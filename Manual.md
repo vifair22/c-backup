@@ -1951,6 +1951,11 @@ restored from.
 - **Snapshot ids stay ahead.** The target's `snapshot-ids` is raised before
   each snapshot record is written, and at the end of a run to at least the
   source's mark, so a replica never numbers below its source.
+- **Every snapshot the source holds.** What to send is chosen from the
+  index, so a snapshot record the index lacks (a backup whose index did not
+  commit, section 6.3 step 5) is indexed first, as gc does (section 12); one
+  that cannot be indexed fails the job, naming it, rather than leave the
+  replica silently without it.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
 - **Whole snapshots only.** Each snapshot's new objects are written into

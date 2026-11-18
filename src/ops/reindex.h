@@ -66,7 +66,10 @@ typedef struct {
 status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
                       atomic_int *cancel, reindex_result_t *out);
 
-/* Rebuild one snapshot, for faulting a cold snapshot back in on demand. */
+/* Rebuild one snapshot, for faulting a cold snapshot back in on demand. A
+ * snapshot with no index row is walked in batches (B200), its row written
+ * last; one that has a row is replaced in one transaction, so a walk that
+ * fails keeps the rows it had. */
 status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
                           int64_t snap_id, reindex_result_t *out);
 
