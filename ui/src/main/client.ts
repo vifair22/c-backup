@@ -111,7 +111,10 @@ export function toEndpoint(req: ApiRequest): Endpoint {
       return {
         method: 'POST',
         path: `/repos/${req.repoId}/snapshots/${req.snapshotId}/restore`,
-        body: { dest: req.dest, subpath: req.subpath, overwrite: req.overwrite ? 1 : undefined },
+        body: {
+          dest: req.dest, subpath: req.subpath, overwrite: req.overwrite ? 1 : undefined,
+          prefer_engine_copy: req.preferEngineCopy ? true : undefined,
+        },
       }
 
     /* --- snapshots and browsing --- */

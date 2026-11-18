@@ -152,7 +152,8 @@ const SAMPLES: Record<ApiKind, ApiRequest> = {
   sourcesGet:      { kind: 'sourcesGet', repoId: 1 },
   sourcesSet:      { kind: 'sourcesSet', repoId: 1, sources: ['/nonexistent/contract-probe'] },
   backup:          { kind: 'backup', repoId: 1, paths: ['/nonexistent/contract-probe'] },
-  restore:         { kind: 'restore', repoId: 1, snapshotId: 1, dest: '/nonexistent/contract-probe' },
+  restore:         { kind: 'restore', repoId: 1, snapshotId: 1, dest: '/nonexistent/contract-probe',
+                     preferEngineCopy: true },
 
   snapshotList:    { kind: 'snapshotList', repoId: 1, limit: 5 },
   snapshotDelete:  { kind: 'snapshotDelete', repoId: 1, snapshotId: 9999 },
