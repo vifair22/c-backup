@@ -422,6 +422,27 @@ it stops holding them and the log grows. The daemon's readers let go within
 moments; an outside one may not. Do not
 hold long reads on a live `state.db` (Manual section 18.2).
 
+## A full reindex holds the write lock
+
+Measured on the development machine (Samsung 990 PRO NVMe, `state.db` and
+the repository on it, the source on tmpfs): one snapshot of small files,
+already indexed, reindexed by `c-backup reindex` while a loop issued `tag
+set` one after another and timed each.
+
+| Files | Backup | Reindex | `tag set` waits during the reindex |
+|-------|--------|---------|------------------------------------|
+| 20,000 | - | 0.4 s | - |
+| 200,000 | 9.5 s | 5.4 s | 4.4 s, 0.3 s |
+| 622,000 (run 1) | 33.4 s | 18.9 s | 13.9 s, 5.0 s |
+| 622,000 (run 2) | 34.5 s | 19.3 s | 5.8 s, 6.1 s, 1.6 s |
+
+A tag set waits for the transaction holding the lock and then goes first,
+so each wait is the rest of one transaction; the longest seen was 13.9 s.
+The reindex is about 30 us per file, linear across these points. An
+already-indexed snapshot is rebuilt in one transaction (so a failed walk
+keeps the rows it had), unlike a backup's bounded batches; batching it is
+1.1 work. Manual section 17.1 carries the numbers.
+
 ## The pack ceiling, fixed and re-measured
 
 History: `repo_pack` and loose objects no longer exist in format 3. Kept
