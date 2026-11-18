@@ -163,6 +163,12 @@ static void entry_args(const pack_commit_entry_t *e, entry_args_t *a)
 #define PACK_COMMIT_BATCH UINT32_MAX
 static uint32_t g_pack_batch_rows = PACK_COMMIT_BATCH;
 static status_t (*g_commit_gate)(void);
+static void (*volatile g_row_gate)(void);
+
+void store_index_set_row_gate(void (*gate)(void))
+{
+    g_row_gate = gate;
+}
 
 void store_index_set_pack_batch_rows(uint32_t rows)
 {
@@ -322,6 +328,8 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         /* An entry with both rows set aside wrote nothing, so it does not
          * count towards a batch; a queued writer still ends one. */
         if (later[i] != 3) { wrote = 1; rows++; }
+        void (*row_gate)(void) = g_row_gate;
+        if (row_gate) row_gate();
 
         if (rows >= g_pack_batch_rows || db_txn_batch_should_end(&batch)) {
             if (cut_before_commit()) { db_txn_rollback(idx->db); free(later); return; }

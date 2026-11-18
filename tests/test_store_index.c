@@ -256,7 +256,35 @@ typedef struct {
     long long rows_in, packs_in;
     int ok;
     atomic_int stop;
+    atomic_int queueing;  /* about to call db_txn_begin */
 } writer_t;
+
+/*
+ * The precondition, established rather than hoped for (FLAKE-29): the pack
+ * commit stops after its first row, with the batch open, until the writer
+ * has seen that row and is queued for the lock. On one contended CPU the
+ * writer's poll used to run only after the commit had written all 1,500
+ * rows in its one batch, so it queued behind the marker and the test
+ * failed without anything being wrong. Bounded at 10 s, so a writer that
+ * never queues fails the test rather than hanging it.
+ */
+static writer_t *g_row_writer;
+static int       g_row_held;
+static int       g_row_queued;   /* the writer was queued when the hold ended */
+
+static void hold_for_queued_writer(void)
+{
+    if (g_row_held) return;
+    g_row_held = 1;
+    for (int i = 0; i < 5000; i++) {
+        if (atomic_load(&g_row_writer->queueing) && db_txn_waiters() >= 1) {
+            g_row_queued = 1;
+            return;
+        }
+        struct timespec ts = { 0, 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
 
 static void *writer_main(void *arg)
 {
@@ -272,6 +300,7 @@ static void *writer_main(void *arg)
         nanosleep(&ts, NULL);
     }
     if (w->saw < 0) return NULL;
+    atomic_store(&w->queueing, 1);
     if (db_txn_begin(db) != OK) return NULL;
     w->rows_in  = count("SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?");
     w->packs_in = count("SELECT COUNT(*) FROM packs WHERE repo_id = ?");
@@ -286,14 +315,19 @@ static void test_queued_writer_gets_in_before_the_marker(void **state)
     (void)state;
     writer_t w;
     memset(&w, 0, sizeof(w));
+    g_row_writer = &w;
+    g_row_held = g_row_queued = 0;
+    store_index_set_row_gate(hold_for_queued_writer);
     pthread_t thr;
     assert_int_equal(pthread_create(&thr, NULL, writer_main, &w), 0);
     pack_of(WRITER_PACK);
+    store_index_set_row_gate(NULL);
     atomic_store(&w.stop, 1);
     pthread_join(thr, NULL);
 
     fprintf(stderr, "pack commit: writer saw %d rows, got in at %lld of %d, packs rows %lld\n",
             w.saw, w.rows_in, WRITER_PACK, w.packs_in);
+    assert_true(g_row_queued);
     assert_true(w.saw > 0);
     assert_int_equal(w.ok, 1);
     /* In mid-commit: before the last rows and before the packs row. */
