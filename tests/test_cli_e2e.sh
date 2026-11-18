@@ -1925,6 +1925,9 @@ SWEEP=(
     "health|live"
     "version|"
     "help|repo add"
+    "db preview|1 1 --template pg-dumpall --param a=b"
+    "db enable|1 1 --template pg-dumpall --param a=b"
+    "db dismiss|1 1 --reason x"
 )
 # Everything a stray request could change. The newest job on repository 1
 # covers every job-starting command (a replicate schedule from an earlier
@@ -1995,6 +1998,10 @@ VALUE_SWEEP=(
     "repo add|$WORK/sweep|--passphrase"
     "backup|1 $WORK/src|--timeout"
     "reindex|1|--timeout"
+    "db preview|1 1|--template"
+    "db preview|1 1|--param"
+    "db enable|1 1|--template"
+    "db dismiss|1 1|--reason"
 )
 for row in "${VALUE_SWEEP[@]}"; do
     CMD="${row%%|*}"
