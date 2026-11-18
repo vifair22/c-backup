@@ -124,7 +124,7 @@ export function toEndpoint(req: ApiRequest): Endpoint {
       return {
         method: 'GET',
         path: `/repos/${req.repoId}/snapshots/${req.snapshotId}/tree${qs({
-          parent: req.parent, limit: req.limit, offset: req.offset })}`,
+          parent: req.parent, limit: req.limit, offset: req.offset, gen: req.gen })}`,
       }
     case 'noteGet':
       return { method: 'GET', path: `/repos/${req.repoId}/snapshots/${req.snapshotId}/note` }

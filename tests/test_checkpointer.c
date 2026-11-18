@@ -42,11 +42,13 @@
 #include "db_write.h"
 #include "state_db.h"
 #include "wal_health.h"
+#include "full_vfs.h"
 #include "test_tmp.h"
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_checkpointer"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_SHM  TEST_DB "-shm"
+#define TEST_WAL  TEST_DB "-wal"
 #define THRESHOLD 1000
 #define ROW_BYTES 16000          /* about four pages a row */
 
@@ -78,6 +80,9 @@ static int setup(void **state)
     (void)state;
     rmrf(TEST_DIR);
     if (mkdir(TEST_DIR, 0700) != 0) return -1;
+    /* Passes everything through until a case arms it (B221) or slows it
+     * down (B218). */
+    if (full_vfs_install() != 0) return -1;
     if (db_open(&db, TEST_DB) != 0) return -1;
     state_db_tuning_t t = { "normal", 8, THRESHOLD };
     if (state_db_tune(db, &t) != OK) return -1;
@@ -96,9 +101,12 @@ static int teardown(void **state)
     (void)state;
     checkpointer_set_test_idle(0);
     checkpointer_set_test_pause_ms(0);
+    full_vfs_arm(0);
+    atomic_store(&full_vfs_delay_us, 0);
     checkpointer_stop();
     db_readers_close();
-    db_close(db); db = NULL;
+    if (db) db_close(db);
+    db = NULL;
     rmrf(TEST_DIR);
     return 0;
 }
@@ -771,6 +779,207 @@ static void test_an_unreadable_shm_is_reported_and_recovers(void **state)
     assert_true(wal_health_failures() >= n);
 }
 
+/*
+ * B221: a checkpoint SQLite refuses for any reason but contention reaches
+ * wal_health and the failure count, and is not counted as busy. Before
+ * B215 every refusal was "busy" and retried each tick without a word; B215
+ * fixed it for SQLITE_READONLY, and this holds it for the rest: here a
+ * full disk under the database (SQLITE_FULL) as the copy writes its pages.
+ */
+static void test_a_refused_checkpoint_is_a_failure_not_busy(void **state)
+{
+    (void)state;
+    wal_health_reset();
+    checkpointer_set_test_idle(1);
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    assert_int_equal(commit_rows(400), 0);
+    assert_true(wal_frames() >= THRESHOLD);
+    checkpointer_stats_t st0;
+    checkpointer_stats(&st0);
+
+    full_vfs_arm(1);
+    checkpointer_set_test_idle(0);
+    char msg[512] = "";
+    int failing = 0;
+    for (int i = 0; i < 300 && !failing; i++) {
+        sleep_ms(10);
+        failing = wal_health_failing(msg, sizeof(msg), NULL);
+    }
+    checkpointer_set_test_idle(1);
+    full_vfs_arm(0);
+    assert_true(failing);
+    assert_non_null(strstr(msg, "PASSIVE checkpoint"));
+    assert_non_null(strstr(msg, "SQLite code 13"));
+    assert_non_null(strstr(msg, TEST_DB));
+    checkpointer_stats_t st;
+    checkpointer_stats(&st);
+    assert_true(st.failed > st0.failed);
+    assert_int_equal(st.busy, st0.busy);
+    assert_true(wal_health_failures() >= 1);
+
+    /* The disk has room again: the next checkpoint works and says so. */
+    checkpointer_set_test_idle(0);
+    for (int i = 0; i < 300 && failing; i++) {
+        sleep_ms(10);
+        failing = wal_health_failing(NULL, 0, NULL);
+    }
+    assert_false(failing);
+}
+
+/*
+ * B219: a locked round's wait for the write lock is not its hold. The
+ * round queues behind a writer holding the lock for 300 ms and then holds
+ * it only for a short copy; the hold used to be timed from before the
+ * queue, so it read 300 ms.
+ */
+static void *force_round(void *arg)
+{
+    *(status_t *)arg = checkpointer_force();
+    return NULL;
+}
+
+static void test_the_lock_wait_is_not_counted_as_the_hold(void **state)
+{
+    (void)state;
+    checkpointer_set_test_idle(1);
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    assert_int_equal(commit_rows(8), 0);
+    assert_int_equal(db_txn_begin(db), OK);
+    status_t fst = ERR_IO;
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, force_round, &fst), 0);
+    sleep_ms(300);
+    assert_int_equal(db_txn_commit(db), OK);
+    pthread_join(th, NULL);
+    assert_int_equal(fst, OK);
+    checkpointer_stats_t st;
+    checkpointer_stats(&st);
+    fprintf(stderr, "B219: waited %.0f ms, held %.0f ms\n", (double)st.lock_wait_ns / 1e6,
+            (double)st.lock_ns / 1e6);
+    assert_true(st.lock_wait_ns >= 250ull * 1000000ull);
+    assert_true(st.max_lock_wait_ns >= 250ull * 1000000ull);
+    assert_true(st.lock_ns < st.lock_wait_ns);
+    assert_true(st.max_lock_ns < 250ull * 1000000ull);
+}
+
+static int file_exists(const char *p)
+{
+    struct stat sb;
+    return stat(p, &sb) == 0;
+}
+
+static long rows_in_t(void)
+{
+    db_result_t *r = NULL;
+    long n = -1;
+    if (db_execute(db, "SELECT COUNT(*) FROM t", NULL, &r) == 0 && r && r->nrows == 1)
+        n = strtol(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
+/*
+ * B218: a stop does not wait for a copy. The disk is slowed so the copy of
+ * about 2,000 pages takes ten seconds; the halt interrupts it within a
+ * fraction of that, counts nothing as failed, and the bounded final copy
+ * gives up at its budget. With the shared handle closed first, the
+ * checkpointer's close is the last and leaves the WAL, synced; reopened,
+ * every row is there.
+ */
+static void test_shutdown_does_not_wait_for_a_slow_copy(void **state)
+{
+    (void)state;
+    wal_health_reset();
+    checkpointer_set_test_idle(1);
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    assert_int_equal(commit_rows(500), 0);
+    long rows = rows_in_t();
+    assert_true(rows > 0);
+    uint32_t f0 = wal_frames();
+    assert_true(f0 >= THRESHOLD && f0 <= CKPT_FINAL_FRAMES);
+
+    atomic_store(&full_vfs_slow_writes, 0);
+    atomic_store(&full_vfs_delay_us, 5000);
+    checkpointer_set_test_idle(0);
+    for (int i = 0; i < 500 && atomic_load(&full_vfs_slow_writes) < 5; i++) sleep_ms(10);
+    assert_true(atomic_load(&full_vfs_slow_writes) >= 5);   /* a copy is under way */
+
+    uint64_t t0 = now_ms();
+    checkpointer_halt();
+    uint64_t halt_ms = now_ms() - t0;
+    fprintf(stderr, "B218: halt in %llu ms\n", (unsigned long long)halt_ms);
+    assert_true(halt_ms < 2000);
+    assert_false(wal_health_failing(NULL, 0, NULL));
+    checkpointer_stats_t st;
+    checkpointer_stats(&st);
+    assert_int_equal(st.failed, 0);
+
+    t0 = now_ms();
+    assert_int_equal(checkpointer_finish(200), 0);
+    uint64_t fin_ms = now_ms() - t0;
+    fprintf(stderr, "B218: final copy gave up in %llu ms\n", (unsigned long long)fin_ms);
+    assert_true(fin_ms < 2000);
+    atomic_store(&full_vfs_delay_us, 0);
+
+    db_readers_close();
+    db_close(db);
+    db = NULL;
+    checkpointer_stop();
+    assert_true(file_exists(TEST_WAL));
+
+    assert_int_equal(db_open(&db, TEST_DB), 0);
+    assert_int_equal(rows_in_t(), rows);
+}
+
+/* And a WAL small enough is copied within the budget, so the last close
+ * removes it, as a stop always did. */
+static void test_shutdown_copies_a_small_wal_and_removes_it(void **state)
+{
+    (void)state;
+    checkpointer_set_test_idle(1);
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    assert_int_equal(commit_rows(100), 0);
+    long rows = rows_in_t();
+    assert_true(wal_frames() > 0);
+    assert_int_equal(checkpointer_finish(5000), 1);
+    uint32_t f = 0, b = 0;
+    assert_int_equal(checkpointer_wal_frames(TEST_DB, &f, &b), 0);
+    assert_int_equal(f, b);
+    db_readers_close();
+    db_close(db);
+    db = NULL;
+    checkpointer_stop();
+    assert_false(file_exists(TEST_WAL));
+    assert_int_equal(db_open(&db, TEST_DB), 0);
+    assert_int_equal(rows_in_t(), rows);
+}
+
+/* A WAL past CKPT_FINAL_FRAMES is not copied at all at shutdown, whatever
+ * the budget: the stop would wait for it on a slow disk. */
+static void test_shutdown_leaves_a_large_wal(void **state)
+{
+    (void)state;
+    checkpointer_set_test_idle(1);
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    for (int i = 0; i < 12 && wal_frames() <= CKPT_FINAL_FRAMES; i++)
+        assert_int_equal(commit_rows(100), 0);
+    assert_true(wal_frames() > CKPT_FINAL_FRAMES);
+    long rows = rows_in_t();
+    uint32_t f0 = 0, b0 = 0;
+    assert_int_equal(checkpointer_wal_frames(TEST_DB, &f0, &b0), 0);
+    assert_int_equal(checkpointer_finish(60000), 0);
+    uint32_t f = 0, b = 0;
+    assert_int_equal(checkpointer_wal_frames(TEST_DB, &f, &b), 0);
+    assert_int_equal(b, b0);                  /* nothing copied */
+    db_readers_close();
+    db_close(db);
+    db = NULL;
+    checkpointer_stop();
+    assert_true(file_exists(TEST_WAL));
+    assert_int_equal(db_open(&db, TEST_DB), 0);
+    assert_int_equal(rows_in_t(), rows);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -789,6 +998,15 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_read_only_connection_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_an_unreadable_shm_is_reported_and_recovers,
                                         setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_refused_checkpoint_is_a_failure_not_busy,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_the_lock_wait_is_not_counted_as_the_hold,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_shutdown_does_not_wait_for_a_slow_copy,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_shutdown_copies_a_small_wal_and_removes_it,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_shutdown_leaves_a_large_wal, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

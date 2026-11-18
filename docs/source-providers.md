@@ -329,12 +329,18 @@ in the existing engine are generalised for it:
 1. `backup_opts_t` gains a per-source `(read_root, record_root)` pair; the
    scanner reads under the first and emits entries under the second. Every
    other part of the pipeline sees record paths only.
-2. The file cache is looked up by record path with `FILE_CACHE_IGNORE_DEV`
-   forced on for snapshot reads. A btrfs snapshot is a new subvolume with a
-   new anonymous device number every time, and a ZFS snapshot has its own
-   `st_dev`; but both preserve inode numbers, ctime, mtime and size, so the
-   remaining fields still prove a file unchanged. Without this every
-   container incremental would re-read every file.
+2. The file cache is looked up by record path. A btrfs snapshot is a new
+   subvolume with a new anonymous device number every time, and a ZFS
+   snapshot has its own `st_dev`; but both preserve inode numbers, ctime,
+   mtime and size. An entry found on the read root's device is therefore
+   keyed, and identified in its tree entry's `inode_identity`, by the
+   record root's live device instead (B229): the trees and cache rows are
+   those a live read would write, and the device is still compared. An
+   entry on another device inside the read tree (a nested mount, whose
+   number is the capture's too) keeps its own and is matched with
+   `FILE_CACHE_IGNORE_DEV`. Without this every container incremental would
+   re-read every file, and before B229 every one wrote a full set of new
+   trees, because `inode_identity` hashed the snapshot's device.
 
 ## 5. Consistency model
 
@@ -537,6 +543,14 @@ Why each choice:
    {"id":"nvram","kind":"blob","path":".cbackup-unit/config/nvram.fd"}],
  "warnings":[]}
 ```
+
+When database detection ran for the session (`db-detection.md` 7.1),
+`unit.json` also carries `"databases":[{"engine","version","path",
+"confidence","coverage","method"}]`, at most 64 of them with
+`databases_total` when there were more: the permanent record of how each
+database was captured. It is optional and informational; no reader needs
+it, and the document stays version 1. It is why `unit.json` is stored after
+the unit's trees rather than before (`backup_synth_t.late`).
 
 Readers ignore unknown keys and refuse `version` > 1 for interpretation
 (the snapshot is then shown as an unclassified file snapshot, never

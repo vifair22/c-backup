@@ -18,7 +18,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
@@ -40,6 +42,7 @@
 #include "unit_backup.h"
 #include "unit_define.h"
 #include "unit_state.h"
+#include "unit_tokens.h"
 
 #define DB_PATH HF_DIR "/state.db"
 #define REPO    HF_DIR "/repo"
@@ -460,6 +463,19 @@ static void test_entry_type(void **state)
 {
     (void)state;
     int blk = mknod(HF_SNAP "/disk0", S_IFBLK | 0600, makedev(7, 250)) == 0;
+    /* NIT-44: a socket (recorded unclassified, type 0) and a fifo. */
+    assert_int_equal(mkfifo(HF_SNAP "/fifo0", 0600), 0);
+    int sk = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert_true(sk >= 0);
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    int have_sock = strlen(HF_SNAP "/sock0") < sizeof(sa.sun_path);
+    if (have_sock) {
+        memcpy(sa.sun_path, HF_SNAP "/sock0", strlen(HF_SNAP "/sock0") + 1);
+        have_sock = bind(sk, (struct sockaddr *)&sa, sizeof(sa)) == 0;
+    }
+    close(sk);
     unit_backup_result_t res;
     assert_int_equal(backup_one("cbk-uat-one", &res), OK);
     int64_t snap = res.units[0].snapshot_id;
@@ -473,6 +489,21 @@ static void test_entry_type(void **state)
     err_clear();
     assert_int_equal(unit_entry_type(store, db, repo_id, snap, HF_MOUNT "/a.txt/below", &type), ERR_NOT_FOUND);
     err_clear();
+    assert_string_equal(unit_recorded_type_name(1, NODE_TYPE_DIR), "dir");
+    assert_string_equal(unit_recorded_type_name(0, 0), "missing");
+    assert_string_equal(unit_recorded_type_name(1, 0), "sock");
+    assert_string_equal(unit_recorded_type_name(1, 99), "other");
+    assert_int_equal(unit_entry_type(store, db, repo_id, snap, HF_MOUNT "/fifo0", &type), OK);
+    assert_string_equal(unit_recorded_type_name(1, type), "fifo");
+    if (have_sock) {
+        /* There, so never "missing": the refusal said "no entry" for it. */
+        assert_int_equal(unit_entry_type(store, db, repo_id, snap, HF_MOUNT "/sock0", &type), OK);
+        assert_string_equal(unit_recorded_type_name(1, type), "sock");
+        assert_int_equal(unlink(HF_SNAP "/sock0"), 0);
+    } else {
+        print_message("no socket could be bound here; that case is not run\n");
+    }
+    assert_int_equal(unlink(HF_SNAP "/fifo0"), 0);
     if (blk) {
         assert_int_equal(unit_entry_type(store, db, repo_id, snap, HF_MOUNT "/disk0", &type), OK);
         assert_int_equal(type, NODE_TYPE_BLK);
@@ -480,6 +511,112 @@ static void test_entry_type(void **state)
     } else {
         print_message("not root: no block device node, that case is not run\n");
     }
+}
+
+/*
+ * B223: a define-check refusal reaches the daemon's error, the one the job
+ * records, whole: through the helper's response, the daemon's mapping of
+ * it and the restore's wrapper, each of which used to cut it at 400 to 590
+ * characters ("..., or c-b"). One longer than the 2 KiB bound arrives cut
+ * visibly, ending "...".
+ */
+static void test_refusal_reaches_whole(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    static const char tail[] =
+        "restore the files to a path instead (c-backup restore <repo> <snapshot> <dir> --subpath "
+        "/mnt/cache/appdata/x/disk, or c-backup unit restore <repo> <snapshot> <dir> for the whole unit) "
+        "and create the container by hand";
+    char text[1400];
+    int n = snprintf(text, sizeof(text), "docker: refused, nothing created: the copy would bind "
+                     "/mnt/cache/appdata/restored/mnt/cache/appdata/x/disk -> /disk: cannot verify it is "
+                     "not a block device: the original is gone from the host and the snapshot has no "
+                     "entry for it; ");
+    while (n < 700) n += snprintf(text + n, sizeof(text) - (size_t)n, "padding ");
+    snprintf(text + n, sizeof(text) - (size_t)n, "%s", tail);
+    FILE *f = fopen(HF_DIR "/state/fake-define-refuse", "w");
+    assert_non_null(f);
+    fputs(text, f);
+    fclose(f);
+
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.name = "u1-copy";
+    o.target_root = HF_DIR "/target-b223";
+    unit_define_result_t dr;
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 81, &o, &dr), OK);
+    const char *m = err_msg();
+    if (!strstr(m, "unit restore refused, nothing written") || !strstr(m, text))
+        fail_msg("cut on the way: [%s]", m);
+    err_clear();
+    struct stat sb;
+    assert_int_not_equal(lstat(HF_DIR "/target-b223", &sb), 0);
+
+    /* Past the bound: cut, and visibly. */
+    f = fopen(HF_DIR "/state/fake-define-refuse", "w");
+    assert_non_null(f);
+    for (int i = 0; i < 400; i++) fputs("long refusal ", f);
+    fclose(f);
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 82, &o, &dr), OK);
+    m = err_msg();
+    size_t ml = strlen(m);
+    assert_true(ml > 1900 && ml < 2400);
+    assert_string_equal(m + ml - 3, "...");
+    err_clear();
+    assert_int_equal(unlink(HF_DIR "/state/fake-define-refuse"), 0);
+}
+
+static char g_redef_log[8192];
+
+static void capture_redef(const char *ts, const char *level, const char *func, const char *message, void *ud)
+{
+    (void)ts; (void)func; (void)ud;
+    size_t have = strlen(g_redef_log);
+    snprintf(g_redef_log + have, sizeof(g_redef_log) - have, "%s %s\n", level, message);
+}
+
+/*
+ * NIT-45: at start the daemon asks the helper about every stored
+ * checkpoint, and one of a unit the helper no longer lists (a VM deleted,
+ * or taken out of its policy) was denied and logged at warning once per
+ * checkpoint, at every start. Now it is not asked about: its tokens stay,
+ * counted as kept, and it is said once per unit at debug. A listed unit is
+ * still asked about.
+ */
+static void test_redefine_skips_removed_units(void **state)
+{
+    (void)state;
+    uint8_t root[OBJECT_HASH_SIZE];
+    memset(root, 0, sizeof(root));
+    assert_int_equal(unit_token_put(db, repo_id, "fake:u-gone", "vda", "cbk-1-1-0", NULL, 1, root, "x"), OK);
+    assert_int_equal(unit_token_put(db, repo_id, "fake:u-gone", "vdb", "cbk-1-1-1", NULL, 1, root, "x"), OK);
+    assert_int_equal(unit_token_put(db, repo_id, "fake:u1", "vda", "cbk-1-2-0", NULL, 1, root, "x"), OK);
+    log_level_t was = log_get_level();
+    log_set_level(LOG_DEBUG);
+    g_redef_log[0] = '\0';
+    int h = log_stream_register(capture_redef, NULL);
+    assert_true(h >= 0);
+    unsigned checked = 0, redefined = 0, refused = 0, kept = 0;
+    assert_int_equal(unit_checkpoints_redefine_for(db, "fake", &checked, &redefined, &refused, &kept), OK);
+    log_stream_unregister(h);
+    log_set_level(was);
+    assert_int_equal(kept, 2);
+    assert_int_equal(checked, 1);          /* u1, asked as before */
+    if (strstr(g_redef_log, "fake:u-gone is not in the policy")) fail_msg("asked and denied: %s", g_redef_log);
+    const char *k = strstr(g_redef_log, "debug units: checkpoint of a removed unit kept: fake:u-gone");
+    assert_non_null(k);
+    if (strstr(k + 60, "removed unit kept: fake:u-gone")) fail_msg("more than once: %s", g_redef_log);
+    /* Kept, not dropped. */
+    unit_token_t t;
+    int found = 0;
+    assert_int_equal(unit_token_get(db, repo_id, "fake:u-gone", "vda", &t, &found), OK);
+    assert_int_equal(found, 1);
+    assert_int_equal(unit_token_get(db, repo_id, "fake:u-gone", "vdb", &t, &found), OK);
+    assert_int_equal(found, 1);
 }
 
 /* mode unit: the refusals, a new name under target_root that leaves the
@@ -1221,6 +1358,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
         cmocka_unit_test_setup_teardown(test_unit_restore, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_entry_type, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_refusal_reaches_whole, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_redefine_skips_removed_units, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_define_refused_first, setup, teardown),
         cmocka_unit_test_setup_teardown(test_in_place_needs_restore, setup_define_norestore, teardown),
         cmocka_unit_test_setup_teardown(test_define_fails_rolls_back, setup_define, teardown),

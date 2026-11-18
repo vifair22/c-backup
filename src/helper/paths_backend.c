@@ -76,13 +76,12 @@ const snap_ctx_t *paths_snap(const helper_backend_t *b)
     return &b->ctx->snap;
 }
 
-void paths_res_free(paths_res_t *r)
+status_t paths_probe(const helper_backend_t *b, snap_probe_t **out)
 {
-    for (size_t i = 0; i < r->n_nested; i++) free(r->nested[i]);
-    r->n_nested = 0;
+    return snap_probe_new(&b->ctx->snap, b->ctx->mounts.mountinfo, out);
 }
 
-status_t paths_resolve(const helper_backend_t *b, const char *path, paths_res_t *out)
+status_t paths_resolve(const helper_backend_t *b, snap_probe_t *probe, const char *path, paths_res_t *out)
 {
     const struct sp_ctx *c = b->ctx;
     memset(out, 0, sizeof(*out));
@@ -111,14 +110,14 @@ status_t paths_resolve(const helper_backend_t *b, const char *path, paths_res_t 
                  strcmp(mc.reason, "array") == 0 ? " (an array disk)" : "");
         return OK;
     }
-    if (c->mounts.mountinfo[0] &&
-        mount_below(c->mounts.mountinfo, mc.real, out->nested, PATHS_NESTED_MAX, &out->n_nested,
-                    &out->nested_total) != OK) {
-        /* Without the list the daemon cannot know what the snapshot hides;
-         * reading live is the safe answer. */
-        snprintf(out->reason, sizeof(out->reason), "the host's mount table cannot be read (%.200s)", err_msg());
+    if (snap_probe_below(probe, &out->dom, mc.real, &out->nested_total, out->nested, sizeof(out->nested)) != OK) {
+        /* Without knowing what lies below, the daemon cannot know what the
+         * snapshot hides; reading live is the safe answer. */
+        snprintf(out->reason, sizeof(out->reason), "what lies below it cannot be checked (%.200s)", err_msg());
         err_clear();
         memset(&out->dom, 0, sizeof(out->dom));
+        out->nested_total = 0;
+        out->nested[0] = '\0';
     }
     return OK;
 }

@@ -288,41 +288,44 @@ status_t mount_resolve(const mount_cfg_t *c, const char *path, mount_class_t *ou
 }
 
 /* A mount that is c-backup's own snapshot machinery, never data: a ZFS
- * snapshot automounted under .zfs, or anything under a btrfs snapshot
+ * snapshot automounted under .zfs, or anything in a btrfs snapshot
  * directory. The scanner never enters either. */
 static int snapshot_machinery(const char *mp)
 {
+    size_t n = strlen(mp);
     return strstr(mp, "/.zfs/") != NULL || strstr(mp, "/.cbackup-snapshots/") != NULL ||
-           (strlen(mp) >= 5 && strcmp(mp + strlen(mp) - 5, "/.zfs") == 0) ||
-           (strlen(mp) >= 19 && strcmp(mp + strlen(mp) - 19, "/.cbackup-snapshots") == 0);
+           (n >= 5 && strcmp(mp + n - 5, "/.zfs") == 0) ||
+           (n >= 19 && strcmp(mp + n - 19, "/.cbackup-snapshots") == 0);
 }
 
-status_t mount_below(const char *mountinfo, const char *path, char **out, size_t max,
-                     size_t *n_out, size_t *total)
+status_t mount_points(const char *mountinfo, char ***out, size_t *n_out)
 {
+    *out = NULL;
     *n_out = 0;
-    *total = 0;
     minfo_t *m = NULL;
     size_t n = 0;
     status_t st = minfo_read(mountinfo, &m, &n);
     if (st != OK) return st;
-    for (size_t i = 0; i < n && st == OK; i++) {
-        if (strcmp(m[i].mp, path) == 0 || !under(m[i].mp, path) || snapshot_machinery(m[i].mp)) continue;
-        int dup = 0;
-        for (size_t k = 0; k < *n_out && !dup; k++) dup = strcmp(out[k], m[i].mp) == 0;
-        if (dup) continue;
-        (*total)++;
-        if (*n_out < max) {
-            if (!(out[*n_out] = strdup(m[i].mp))) st = set_error(ERR_NOMEM, "mounts: mount list");
-            else (*n_out)++;
-        }
+    char **v = calloc(n ? n : 1, sizeof(*v));
+    if (!v) {
+        minfo_free(m, n);
+        return set_error(ERR_NOMEM, "mounts: mount points");
+    }
+    size_t k = 0;
+    for (size_t i = 0; st == OK && i < n; i++) {
+        if (snapshot_machinery(m[i].mp)) continue;
+        if (!(v[k] = strdup(m[i].mp))) { st = set_error(ERR_NOMEM, "mounts: mount points"); break; }
+        k++;
     }
     minfo_free(m, n);
     if (st != OK) {
-        for (size_t k = 0; k < *n_out; k++) free(out[k]);
-        *n_out = 0;
+        for (size_t i = 0; i < k; i++) free(v[i]);
+        free(v);
+        return st;
     }
-    return st;
+    *out = v;
+    *n_out = k;
+    return OK;
 }
 
 status_t mount_classify(const mount_cfg_t *c, const char *type, const char *source,

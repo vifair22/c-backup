@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "remote_provider.h"
+#include "msg_clip.h"
 #include "disk_stream.h"
 #include "fake_provider.h"
 #include "helper_proto.h"
@@ -147,7 +148,11 @@ static status_t map_error(const char *code, const char *msg)
     (void)helper_err_parse(code, &e);
     status_t st = e == HELPER_E_BUSY || e == HELPER_E_TIMEOUT ? ERR_BUSY
                 : e == HELPER_E_FAILED ? ERR_IO : ERR_INVALID;
-    return set_error(st, "helper: %s: %.400s", helper_err_name(e), msg ? msg : "");
+    /* Whole, or cut visibly (B223): a refusal naming its way round ran
+     * past the 400 it was cut at. */
+    char m[MSG_CLIP_MAX];
+    msg_clip(m, sizeof(m), msg);
+    return set_error(st, "helper: %s: %s", helper_err_name(e), m);
 }
 
 static status_t exchange_fd(int fd, const char *op, cJSON *args, cJSON **result, int send_fd,
@@ -245,8 +250,8 @@ static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON 
     if (st != OK && recv_fd && *recv_fd >= 0) { close(*recv_fd); *recv_fd = -1; }
     if (st != OK && transport) {
         /* Not the helper refusing: the helper gone mid-request. */
-        char why[512];
-        snprintf(why, sizeof(why), "%.400s", err_msg());
+        char why[MSG_CLIP_MAX];
+        msg_clip(why, sizeof(why), err_msg());
         link_lost(sock, why);
         set_error(st, "helper at %s: %s", sock, why);
     }
@@ -490,8 +495,8 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
                            str_or(sp_consistency_name(s->info.achieved), "?"),
                            str_or(sp_consistency_name(req->require), "?"));
         if (st != OK) {
-            char why[512];
-            snprintf(why, sizeof(why), "%.500s", err_msg());
+            char why[MSG_CLIP_MAX];
+            msg_clip(why, sizeof(why), err_msg());
             cJSON *ea = cJSON_CreateObject();
             if (ea) cJSON_AddStringToObject(ea, "capture", s->token);
             if (s->vm && ea) {
@@ -780,8 +785,8 @@ static status_t r_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
     }
     if (late >= 0) close(late);
     if (st != OK && tok && strlen(tok) == HELPER_TOKEN_HEX) {
-        char why[512];
-        snprintf(why, sizeof(why), "%.500s", err_msg());
+        char why[MSG_CLIP_MAX];
+        msg_clip(why, sizeof(why), err_msg());
         cJSON *ea = cJSON_CreateObject();
         if (ea) cJSON_AddStringToObject(ea, "capture", tok);
         (void)rcall(c->socket, "capture.end", ea, NULL);

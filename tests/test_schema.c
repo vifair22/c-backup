@@ -78,7 +78,7 @@ static void test_migrations_apply(void **state)
         "policy_values", "repo_backup_paths", "journal", "recovery_state",
         "file_cache", "verify_runs", "verify_findings", "grep_runs",
         "grep_hits", "snapshot_units", "snapshot_unit_items", "unit_policy",
-        "unit_intents", "daemon_state", "pack_tombstones", NULL
+        "unit_intents", "daemon_state", "pack_tombstones", "db_findings", NULL
     };
     for (int i = 0; tables[i]; i++)
         assert_true(object_exists(db, "table", tables[i]));
@@ -92,6 +92,8 @@ static void test_migrations_apply(void **state)
         assert_false(object_exists(db, "table", gone[i]));
     assert_int_equal(count_rows(db, "SELECT name FROM pragma_table_info('nodes')"
                                     " WHERE name IN ('xattr_ref','acl_ref','sparse_ref')"), 0);
+    assert_int_equal(count_rows(db, "SELECT name FROM pragma_table_info('file_cache')"
+                                    " WHERE name = 'db_head'"), 1);
 
     db_close(db);
     unlink_db();
@@ -254,6 +256,48 @@ static void test_journal_ids_rebuilt_without_reuse(void **state)
     unlink_db();
 }
 
+/*
+ * Node index generations: every snapshot already indexed when 010 applies
+ * gets a generation of its own, and the sequence starts above them, so the
+ * first rebuild after the upgrade draws a value no snapshot holds.
+ */
+static void test_node_index_gen_backfill(void **state)
+{
+    (void)state;
+    unlink_db();
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
+    db_migration_t before[10];
+    int nb = 0;
+    for (; app_migrations[nb].name &&
+           strcmp(app_migrations[nb].name, "010_node_index_gen.sql") != 0; nb++)
+        before[nb] = app_migrations[nb];
+    assert_int_equal(nb, 8);
+    before[nb] = (db_migration_t){ NULL, NULL };
+    assert_int_equal(db_run_compiled_migrations(db, before), CUTILS_OK);
+
+    static const char *const fill[] = {
+        "INSERT INTO repos (id, uuid, path, label, added_at) VALUES (1, 'u-1', '/a', 'a', 1)",
+        "INSERT INTO repos (id, uuid, path, label, added_at) VALUES (2, 'u-2', '/b', 'b', 1)",
+        "INSERT INTO snapshots (repo_id, id, ts, root_tree_hash) VALUES (1, 1, 1, x'00')",
+        "INSERT INTO snapshots (repo_id, id, ts, root_tree_hash) VALUES (1, 5, 1, x'00')",
+        "INSERT INTO snapshots (repo_id, id, ts, root_tree_hash) VALUES (2, 1, 1, x'00')",
+        NULL,
+    };
+    for (int i = 0; fill[i]; i++) assert_int_equal(db_exec_raw(db, fill[i]), CUTILS_OK);
+
+    assert_int_equal(db_run_compiled_migrations(db, app_migrations), CUTILS_OK);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM node_index_gen"), 3);
+    assert_int_equal(count_rows(db, "SELECT DISTINCT gen FROM node_index_gen WHERE gen > 0"), 3);
+    assert_int_equal(db_exec_raw(db, "INSERT INTO node_gen_seq DEFAULT VALUES"), CUTILS_OK);
+    assert_int_equal(count_rows(db, "SELECT 1 FROM node_gen_seq"
+                                    " WHERE gen > (SELECT MAX(gen) FROM node_index_gen)"), 1);
+    assert_true(object_exists(db, "table", "node_index_gen"));
+    db_close(db);
+    unlink_db();
+}
+
 static void test_one_baseline_migration(void **state)
 {
     (void)state;
@@ -280,7 +324,14 @@ static void test_one_baseline_migration(void **state)
     /* Journal ids never reissued (B217). */
     assert_non_null(app_migrations[7].name);
     assert_string_equal(app_migrations[7].name, "009_journal_autoincrement.sql");
-    assert_null(app_migrations[8].name);
+    /* Node index generations. */
+    assert_non_null(app_migrations[8].name);
+    assert_string_equal(app_migrations[8].name, "010_node_index_gen.sql");
+    /* Database findings and the file cache's head classification
+     * (db-detection.md 7.1). */
+    assert_non_null(app_migrations[9].name);
+    assert_string_equal(app_migrations[9].name, "011_db_findings.sql");
+    assert_null(app_migrations[10].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */
@@ -648,7 +699,10 @@ static void test_node_queries_use_their_indexes(void **state)
     seed_plan_data(db);
 
     static const char *const search_must[] = {
-        "SCAN f VIRTUAL TABLE INDEX ", "SEARCH n USING", BY_PK, NULL
+        "SCAN f VIRTUAL TABLE INDEX ", "SEARCH n USING", BY_PK,
+        /* The generation column: one primary-key lookup per row. */
+        "SEARCH g USING INDEX sqlite_autoindex_node_index_gen_1 (repo_id=? AND snap_id=?)",
+        NULL
     };
     const struct { const char *label, *q; } queries[] = {
         { "broad",  "\"txt\""    },
@@ -744,6 +798,7 @@ int main(void)
         cmocka_unit_test(test_migrations_apply),
         cmocka_unit_test(test_one_baseline_migration),
         cmocka_unit_test(test_journal_ids_rebuilt_without_reuse),
+        cmocka_unit_test(test_node_index_gen_backfill),
         cmocka_unit_test(test_created_at_backfill),
         cmocka_unit_test(test_units_migration_keeps_baseline_data),
         cmocka_unit_test(test_migrations_are_idempotent),

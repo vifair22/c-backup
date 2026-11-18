@@ -6,6 +6,7 @@
 #include "json_row.h"
 
 #include "backup.h"
+#include "db_findings.h"
 #include "file_cache.h"
 #include "job_manager.h"
 #include "snap_record.h"
@@ -250,6 +251,90 @@ void routes_backup_describe_doubts(const backup_result_t *res, char *warning, si
     snprintf(warning, wsz, "%s%s%s", skip_w, skip_w[0] && uns_w[0] ? "; " : "", uns_w);
 }
 
+/*
+ * A record's events: journalled, and the one alert of an uncovered spell
+ * sent through the job's warning, which alerts and journals it (7.3).
+ */
+void routes_db_detect_events(cutils_db_t *db, int64_t repo_id, const char *source,
+                             const char *prefix, const db_record_result_t *rr,
+                             void *progress_ctx)
+{
+    for (size_t i = 0; rr && i < rr->n_events; i++) {
+        const db_event_t *e = &rr->events[i];
+        char line[1400];
+        snprintf(line, sizeof(line), "%s%s", prefix ? prefix : "", e->text);
+        if (e->kind == DB_EVENT_ALERT) job_set_warning(progress_ctx, line);
+        else journal_record(db, repo_id, source, "db-detect", "info", 0, line);
+    }
+}
+
+/*
+ * Detection's half of a file backup (docs/db-detection.md 7.1): judge the
+ * findings against a live read of every source, record them, and return
+ * the result's "databases" object. Never fails the backup: anything that
+ * goes wrong is logged and the object is left out.
+ */
+static char *file_backup_databases(backup_job_t *j, db_detector_t *d, int64_t snap_id,
+                                   void *progress_ctx)
+{
+    if (!d) return NULL;
+    size_t n = (size_t)j->n_paths;
+    db_cap_root_t *roots = calloc(n ? n : 1, sizeof(*roots));
+    char **scopes = calloc(n ? n : 1, sizeof(*scopes));
+    char *out = NULL;
+    db_findings_t *f = NULL;
+    int ok = roots && scopes;
+    for (size_t i = 0; ok && i < n; i++) {
+        /* A plain file source is read live (section 5): source snapshot
+         * mode (9.4) is what would make these atomic. */
+        roots[i].root = j->paths[i];
+        roots[i].kind = DB_CAP_LIVE;
+        roots[i].instant = (int)i;
+        size_t len = strlen(j->paths[i]) + 8;
+        if (!(scopes[i] = malloc(len))) { ok = 0; break; }
+        snprintf(scopes[i], len, "source:%s", j->paths[i]);
+    }
+    db_capture_desc_t cap = { roots, n, 0, 0, 0, 0 };
+    if (!ok) log_warn("backup: database detection skipped: out of memory");
+    else if (db_detect_finish(d, &cap, &f) != OK) {
+        log_warn("backup: database detection skipped: %s", err_msg());
+        err_clear();
+    } else {
+        db_detect_count_uncovered(f);
+        db_record_result_t rr;
+        memset(&rr, 0, sizeof(rr));
+        if (db_findings_record(j->db, j->repo_id, snap_id, f, (const char *const *)scopes, n,
+                               NULL, &rr) != OK) {
+            log_warn("backup: database findings not recorded: %s", err_msg());
+            err_clear();
+        }
+        routes_db_detect_events(j->db, j->repo_id, "backup", NULL, &rr, progress_ctx);
+        out = db_findings_json(f, rr.ids);
+        db_record_result_free(&rr);
+        if (f->n)
+            log_info("backup: %zu database finding(s) in snapshot %lld", f->n, (long long)snap_id);
+    }
+    db_findings_free(f);
+    for (size_t i = 0; scopes && i < n; i++) free(scopes[i]);
+    free(scopes);
+    free(roots);
+    return out;
+}
+
+/* doc with ,"databases":<dbj> before its closing brace; doc is consumed. */
+static char *with_databases(char *doc, const char *dbj)
+{
+    if (!doc || !dbj) return doc;
+    size_t n = strlen(doc);
+    if (n == 0 || doc[n - 1] != '}') return doc;
+    size_t cap = n + strlen(dbj) + 32;
+    char *r = malloc(cap);
+    if (!r) return doc;
+    snprintf(r, cap, "%.*s,\"databases\":%s}", (int)(n - 1), doc, dbj);
+    free(doc);
+    return r;
+}
+
 static status_t backup_job_run(void *arg, atomic_int *cancel,
                                void (*progress)(const char *, uint64_t, uint64_t, void *),
                                void *progress_ctx)
@@ -345,9 +430,14 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     }
 
 
+    o.detect = db_detect_start();
+
     backup_result_t res;
     memset(&res, 0, sizeof(res));
     st = backup_run(store, j->db, j->repo_id, &o, &res);
+    char *dbj = (st == OK && res.snapshot_id > 0)
+              ? file_backup_databases(j, o.detect, res.snapshot_id, progress_ctx) : NULL;
+    db_detect_free(o.detect);
 
     /* What the backup did, on the job record: the log line had it, the job
      * did not, so a client saw only "completed". Every field is numeric.
@@ -386,7 +476,7 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)w[STORE_WR_PACK],
                  (unsigned long long)w[STORE_WR_PACK_PARITY],
                  (unsigned long long)res.files_skipped);
-        char *full = with_skipped(rj, &res);
+        char *full = with_databases(with_skipped(rj, &res), dbj);
         if (full) {
             job_set_result(progress_ctx, full);
             free(full);
@@ -419,6 +509,7 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
         free(warning);
     }
     backup_result_free(&res);
+    free(dbj);
 
     free(cpaths);
     free(cexcl);

@@ -526,7 +526,10 @@ with those mounts flagged `inconsistent`.
 - **Create**: one command per pool, so it is atomic across datasets:
   `zfs snapshot -o com.cbackup:owner=<daemon id> cache/appdata@cbk-<d8>-<job>-<n> cache/Photos@... cache/system@...`.
   Non-recursive: child datasets are added explicitly only when a unit's
-  path lies in them.
+  path lies in them. A child dataset mounted *below* a unit's path would
+  read as an empty directory from the parent's snapshot, so such a mount
+  is not read from the snapshot at all: it drops to the fallback (B231,
+  Manual 22.1).
 - **Read**: `<dataset mountpoint>/.zfs/snapshot/<name>/<rest>`. FS1's
   datasets have `snapdir=hidden` (survey section 7, U3): `.zfs` exists only
   at a dataset's root, is not listed, and is reachable by name. The daemon
@@ -578,7 +581,10 @@ domain is the top-level subvolume (id 5): the whole pool.
   appear, `describe` finds them (a directory whose inode is 256 on btrfs is
   a subvolume root) and snapshots each one a unit's path lies in, in the
   same pause (separate btrfs snapshots are not atomic together, which is
-  what the pause is for).
+  what the pause is for). A subvolume *below* a unit's path (found with
+  one `btrfs subvolume list` per pool) would read as an empty directory
+  from the snapshot of the one above, so that mount drops to the fallback
+  instead (B231).
 - **Where it goes** (survey section 7, U4): inside the same filesystem,
   and chosen so that nothing else picks it up.
   - **Inside an existing share**, not at the top of the pool: a dot
@@ -907,8 +913,11 @@ for, the recorded mount at the same container path or the path with
 an include root is refused before the restore writes it. When neither
 exists on the host, the daemon's `recorded_types` decides: the type of each
 copy source's entry in the manifest of the snapshot being restored
-(`blk`, `chr`, `dir`, `reg`, `lnk`, `link`, `fifo`, or `missing`). `blk`
-is refused; `missing`, `lnk`, `link` or no record at all is refused as
+(`blk`, `chr`, `dir`, `reg`, `lnk`, `link`, `fifo`, `sock` for an entry
+the scan recorded unclassified (a socket; NIT-44), `other`, or
+`missing`). `blk` is refused; `sock` is refused because a restore never
+recreates a socket, so the copy would bind nothing; `missing`, `other`,
+`lnk`, `link` or no record at all is refused as
 "cannot verify", since nothing then says what the restore would write,
 and the refusal names the alternative: the files restored to a path
 (`c-backup restore <repo> <snapshot> <dir> --subpath <path>`, or `c-backup

@@ -212,6 +212,20 @@ sleep 1.5
 OUT=$(cb jobs "$GJ")
 contains "gc waits in the queue while it is open" '"state":"queued"' "$OUT"
 contains "and says what for" 'waiting for an NBD export to close' "$OUT"
+# B220: the CLI waited at most an hour and then failed while the job ran on.
+# It now waits until the job ends; --timeout bounds the wait, with its own
+# exit status, and the job keeps its place. The open export holds this gc in
+# the queue for as long as the test needs.
+T0=$(date +%s)
+"$CLI" --socket "$SOCK" gc 1 --timeout 1 > "$WORK/to.out" 2> "$WORK/to.err"; RC=$?
+T1=$(date +%s)
+check    "a wait past --timeout exits 124" 124 "$RC"
+check    "after about the timeout" "yes" "$([ $((T1 - T0)) -le 5 ] && echo yes || echo "no: $((T1 - T0)) s")"
+contains "saying the job keeps running" "keeps running" "$(cat "$WORK/to.err")"
+TJ=$(sed -n 's/.*job \([0-9]*\) is still running.*/\1/p' "$WORK/to.err")
+check    "naming the job" "yes" "$([ -n "$TJ" ] && echo yes || echo "no: $(cat "$WORK/to.err")")"
+check    "nothing on stdout" "" "$(cat "$WORK/to.out")"
+contains "and the job is still queued" '"state":"queued"' "$(cb jobs "$TJ")"
 OUT=$(cb vm export 1 1 domain.xml 2>&1); RC=$?
 check    "only disks are exported" 1 "$RC"
 OUT=$(cb vm export 1 1 vda --ttl 10s 2>&1); RC=$?
@@ -224,6 +238,10 @@ for _ in $(seq 1 50); do
     case "$(cb jobs "$GJ")" in *'"state":"completed"'*) break ;; esac; sleep 0.1
 done
 contains "and the waiting gc runs once it closes" '"state":"completed"' "$(cb jobs "$GJ")"
+for _ in $(seq 1 50); do
+    case "$(cb jobs "$TJ")" in *'"state":"completed"'*) break ;; esac; sleep 0.1
+done
+contains "as does the one the CLI stopped waiting for" '"state":"completed"' "$(cb jobs "$TJ")"
 contains "gc runs again" '"state":"completed"' "$(cb gc 1)"
 contains "the journal has it" "nbd-export" "$(cb journal 1)"
 OUT=$(cb vm export 1 1 vda --ttl 2m)

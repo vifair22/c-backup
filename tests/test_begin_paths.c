@@ -214,8 +214,7 @@ static void test_zfs_one_instant(void **state)
                                                       CACHE "/appdata/app");
     assert_non_null(n);
     assert_int_equal((int)cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(n, "total")), 1);
-    assert_string_equal(cJSON_GetStringValue(cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(n, "mounts"), 0)),
-                        CACHE "/appdata/app/sub");
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(n, "names")), CACHE "/appdata/app/sub");
     assert_null(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(res, "nested"), CACHE "/Photos"));
 
     /* Each snapshot journalled; capture.end destroys both and clears them. */
@@ -253,6 +252,38 @@ static void test_btrfs_and_lease_release(void **state)
     snprintf(want, sizeof(want), POOL "/system/.cbackup-snapshots/%s", name);
     assert_int_equal(access(want, F_OK), -1);
     assert_int_equal(helper_server_holds(srv), 0);
+    cJSON_Delete(o);
+}
+
+/* A btrfs subvolume below a path is no mount, and the snapshot of the one
+ * above shows it empty: counted among the nested, by name, and the
+ * helper's own snapshots in the snapshot directory are not. A pool whose
+ * subvolumes cannot be listed is not snapshotted. */
+static void test_btrfs_subvolume_below(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(POOL "/appdata/vm", 0700), 0);
+    put(FSTATE "/subvol_list",
+        "ID 258 gen 9 top level 5 path appdata/vm\n"
+        "ID 259 gen 9 top level 5 path system/.cbackup-snapshots/cbk-0badf00d-1-0\n"
+        "ID 260 gen 9 top level 5 path elsewhere\n");
+    hstart(86400, 60);
+    cJSON *o = call("capture.begin_paths", "{\"paths\":[\"" POOL "/appdata\"]}");
+    assert_true(ok(o));
+    const cJSON *n = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(result(o), "nested"),
+                                                      POOL "/appdata");
+    assert_non_null(n);
+    assert_int_equal((int)cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(n, "total")), 1);
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(n, "names")), POOL "/appdata/vm");
+    end_capture("capture.end", cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(result(o), "capture")));
+    cJSON_Delete(o);
+
+    setenv("FAKE_BTRFS_FAIL", "list", 1);
+    o = call("capture.begin_paths", "{\"paths\":[\"" POOL "/appdata\"]}");
+    unsetenv("FAKE_BTRFS_FAIL");
+    assert_true(ok(o));
+    assert_null(cJSON_GetObjectItemCaseSensitive(result(o), "capture"));
+    assert_non_null(strstr(field(result(o), "live", POOL "/appdata"), "cannot be checked"));
     cJSON_Delete(o);
 }
 
@@ -399,6 +430,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_zfs_one_instant, setup, teardown),
         cmocka_unit_test_setup_teardown(test_btrfs_and_lease_release, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_btrfs_subvolume_below, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unsnapshottable_paths_are_reported, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nothing_to_snapshot_takes_no_capture, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failed_take_leaves_nothing, setup, teardown),

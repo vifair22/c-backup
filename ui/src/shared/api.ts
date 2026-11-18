@@ -83,7 +83,10 @@ export type ApiRequest =
   | { kind: 'snapshotList'; repoId: number; limit?: number; offset?: number }
   | { kind: 'snapshotDelete'; repoId: number; snapshotId: number }
   | { kind: 'snapshotTree'; repoId: number; snapshotId: number
-      parent?: number; limit?: number; offset?: number }
+      parent?: number; limit?: number; offset?: number
+      /* The index generation parent came from: a stale one is a 409
+       * rather than whatever now has that id. */
+      gen?: number }
   | { kind: 'noteGet'; repoId: number; snapshotId: number }
   | { kind: 'noteSet'; repoId: number; snapshotId: number; note: string }
   | { kind: 'search'; repoId: number; query: string; limit?: number }

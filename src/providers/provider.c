@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "provider.h"
+#include "msg_clip.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -97,11 +98,12 @@ void sp_session_info_free(sp_session_info_t *info)
 
 status_t sp_session_info_warn(sp_session_info_t *info, const char *fmt, ...)
 {
-    char buf[512];
+    char buf[MSG_CLIP_MAX];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    msg_clip_after(buf, sizeof(buf), n);
     char **grown = realloc(info->warnings, (info->n_warnings + 1) * sizeof(*grown));
     if (!grown) return set_error(ERR_NOMEM, "provider: warning");
     info->warnings = grown;

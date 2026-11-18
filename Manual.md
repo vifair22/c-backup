@@ -30,6 +30,7 @@ Contents
 20. [Limits and what is not in 1.0](#20-limits-and-what-is-not-in-10)
 21. [Command reference](#21-command-reference)
 22. [Units: virtual machines and containers](#22-units-virtual-machines-and-containers)
+23. [Databases](#23-databases)
 
 ---
 
@@ -215,9 +216,35 @@ waiting in the queue are never started: they are recorded `cancelled` with no
 start time, and journalled as "cancelled before it started". A job checks
 for cancellation between files and inside one: storing and restoring a file
 both stop within one object of at most 16 MiB, so a multi-gigabyte file in
-progress does not hold up the shutdown. This takes
-about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
-or SIGINT forces an immediate exit. Run the cancelled job again after the
+progress does not hold up the shutdown. A backup whose snapshot record is
+already written when the stop arrives stops indexing it too: the job ends
+`cancelled`, the log says the snapshot was written and is not yet indexed,
+and the next start's reconcile indexes it (section 17.5). A user's
+`jobs cancel` at that point lets the index finish instead, since the
+snapshot is complete.
+
+The stop is bounded, so that `docker stop`'s 10 second grace is never what
+ends it (B218; a test server's stop once took 53 s and ended in SIGKILL):
+
+- Running jobs get 6 s from the cancel. One still running then is logged
+  by id (`job manager: job N (repo R) did not stop within 6.0 s ...`), and
+  the daemon syncs the database's write-ahead log and exits with status 1
+  at once, as a kill would but saying so: the next start records the job
+  as interrupted. Nothing that has committed is lost.
+- The last copy of the write-ahead log back into `state.db` gets 1 s, and
+  is made only when the log holds at most 4,096 uncopied pages (16 MiB).
+  A larger log, or one the copy cannot finish in time, is left beside
+  `state.db`, synced, and read back by the next start like any log; the
+  log line says which (`state.db: leaving N uncopied WAL frames ... for
+  the next start`). A clean stop with a small log removes `-wal` and
+  `-shm` as before. The close used to copy the whole log, however large,
+  and that was the 53 s.
+- Any step that takes over a second is logged (`shutdown: stopping running
+  jobs took 2.7 s`), and the last line on stderr is `c-backupd stopped in
+  N s`.
+
+A clean stop normally takes a second or two. A second SIGTERM or SIGINT
+forces an immediate exit. Run the cancelled job again after the
 restart; a backup skips what it already stored, a restore skips the files it
 finished and redoes the one it was inside (a stop renames every file the
 restore has verified into place before the job ends, so finished means
@@ -309,6 +336,15 @@ docker run -d --name c-backupd \
   the C library run in UTC: the daemon warns at start and `timezone` reads
   `UTC`. Changing the zone takes effect at the next daemon start.
 - Run the CLI inside the container: `docker exec c-backupd c-backup ...`.
+- **Give it a stop timeout of 30 s**: `docker run --stop-timeout 30`, or
+  `stop_grace_period: 30s` in a compose file (Unraid: `--stop-timeout 30`
+  in Extra Parameters). The daemon bounds its own stop well under Docker's
+  default 10 s (section 2.2), but a stop past the timeout is a SIGKILL,
+  which is a crash: the running job is recorded interrupted rather than
+  cancelled, and on a slow or busy disk the final syncs of the database can
+  take seconds of their own. A failure alert being sent as the daemon
+  stops can add up to 15 s more when Pushover cannot be reached. 30 s
+  covers all of it; a stop that needs it is logged step by step.
 - Override configuration by mounting a file over
   `/etc/c-backupd/config.yaml`; a read-only mount (`:ro`) is fine. Keep the
   file 0600: the daemon warns at start if it is not and cannot fix it.
@@ -407,6 +443,9 @@ are different: they live in the database and change through the policy API
 | `jobs.read_budget_mb` | `256` | MiB of object and pack-writer buffers every job together may hold. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, and each backup pack writer holds about 26.3 MiB while its pack is open (section 18.3), so this caps that memory whatever runs at once. 48 to 1048576; under 48 stops the daemon at start, since one object and one writer must fit |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
+| `db_detect.enabled` | `1` | Detect databases in what each backup reads (chapter 23). Reporting only: it never changes how anything is captured. `0` or `1` |
+| `db_detect.sqlite_min_kb` | `1024` | The smallest dormant SQLite file, in KiB, listed as a finding; smaller dormant ones are counted (`sqlite_small`). A live one is always listed. 0 to 16777216 |
+| `db_detect.notify_uncovered` | `1` | One alert (the job's warning, so a push notification when Pushover is configured) when a live database is first found captured `uncovered` (23.3). `0` or `1` |
 | `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. Files of 1 MiB or less are read and prepared, many to a batch, on up to four of them. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
 | `index.missing_brake_pct` | `5` | Missing packs, as a percentage of a repository's, above which none is marked lost without `repo repair --accept-missing`; counts only from two missing (section 17.6). 0 to 100 |
 | `index.missing_brake_packs` | `10` | Missing packs above which none is marked lost without `repo repair --accept-missing` (section 17.6). 0 to 1000000 |
@@ -753,8 +792,11 @@ sudo c-backup backup 1                     # uses the configured sources
 sudo c-backup backup 1 /home/me/projects   # or name paths for this run
 ```
 
-A backup is a job. The CLI submits it and waits, printing the finished job;
-`--no-wait` returns the job id at once. `c-backup jobs <id>` and
+A backup is a job. The CLI submits it and waits, printing the finished job,
+for as long as the job takes, a first backup of millions of files included.
+`--timeout SECONDS` bounds the wait instead: when it runs out the CLI says
+so on stderr and exits 124, and the job keeps running. `--no-wait` returns
+the job id at once. `c-backup jobs <id>` and
 `c-backup jobs watch <id>` follow it. `watch` prints a line with the job's
 state as soon as it connects, then one per change and at least every 5
 seconds, and exits when the job ends. Each line is one JSON document and
@@ -1180,7 +1222,12 @@ it, and puts back any that libvirt has lost (redefine, with libvirt checking
 the bitmap is present and consistent) when it starts, when the daemon
 starts, and before every backup. A checkpoint that cannot be put back costs
 its disks one full read. If the helper's state directory is lost too, the
-next backup of every VM reads in full.
+next backup of every VM reads in full. At daemon start, the checkpoints of
+a VM the helper no longer lists (deleted, or taken out of its policy) are
+not asked about: their tokens are kept, since the VM can come back, and the
+start-up line counts them (`N of removed units kept`), with one debug line
+per such VM (NIT-45). They used to log a "not in the policy" warning per
+checkpoint at every start.
 
 **Audits.** Every `vm.audit_days`, and whenever an incremental would cost
 too much, a disk is read in full while the dirty bitmap is still asked for:
@@ -1229,6 +1276,16 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
 
 - Every listing pages. No request returns a whole snapshot, which is what
   keeps browsing fast at any size (section 18.4).
+- **A node id is stable only within one index generation.** The `<node-id>`
+  that `ls` takes is a handle into the index, and a reindex of the snapshot
+  (or a gap filled at start) numbers its rows afresh, so an id noted before
+  one can name a different file after it. Every response with node ids
+  carries the snapshot's `index_gen`; a client that passes it back as `gen`
+  gets `409 index rebuilt; re-resolve by path` instead of the wrong
+  directory, and the desktop app does this and re-walks the path it was
+  showing. The CLI takes ids as given, so after a reindex start again from
+  `ls 1 12`. The path is the stable name; a stable node id is a 1.1
+  candidate (docs/api.md, "Node ids and index generations").
 - **Name search** uses a trigram index: substring matches in milliseconds.
   Across all snapshots, a file kept unchanged is one result with a count of
   the snapshots holding it and the newest one's id; a file that changed
@@ -2178,7 +2235,7 @@ daemon as a whole.
 | Route | Meaning |
 |---|---|
 | `/healthz` | The process answers; says `storage_sync: failed` after a failed sync of `state.db`, and counts repositories whose own syncs failed (section 17.7) |
-| `/readyz` | The database is open and its syncs have not failed; the daemon can do work. 200 with `"status":"degraded"` and a list when only repositories' syncs have failed (section 17.7), and 200 with `"status":"degraded"`, `"state_db_checkpoint":"failing"` and the reason in `state_db_checkpoint_error` while `state.db`'s write-ahead log is not being checkpointed (section 18.2) |
+| `/readyz` | The database is open and its syncs have not failed; the daemon can do work. 200 with `"status":"degraded"` and a list when only repositories' syncs have failed (section 17.7), and 200 with `"status":"degraded"`, `"state_db_checkpoint":"failing"` and the reason in `state_db_checkpoint_error` while `state.db`'s write-ahead log is not being checkpointed (section 18.2; `state.db` and its `-wal` and `-shm` being root's, 0600, under `security.run_as_uid` is by design, section 22.2.2, and not the cause) |
 
 Both are public, on the socket and on TCP.
 
@@ -2226,14 +2283,18 @@ the repository).
 | `cbackup_db_txn_commit_seconds_total` | counter | Time spent in COMMIT, writing the log (no sync at `db.synchronous` normal) |
 | `cbackup_db_txn_commit_frames_total` | counter | Log frames (pages) those commits wrote, where measured |
 | `cbackup_checkpoint_rounds_total` | counter | Checkpoint rounds, labelled `locked="no"` (alongside writers) or `locked="yes"` (holding the write lock: past the hard cap, or the short final round that lets the log restart) |
-| `cbackup_checkpoint_lock_seconds_total` | counter | Time locked rounds held the write lock; every writer waits for it |
-| `cbackup_checkpoint_lock_max_seconds` | gauge | The longest single locked round since start |
+| `cbackup_checkpoint_lock_seconds_total` | counter | Time locked rounds held the write lock, from the moment it was granted; every writer waits for it |
+| `cbackup_checkpoint_lock_max_seconds` | gauge | The longest single hold by a locked round since start |
+| `cbackup_checkpoint_lock_wait_seconds_total` | counter | Time locked rounds spent queued for the write lock behind other writers before holding it; not part of the hold, and no writer waits for it |
+| `cbackup_checkpoint_lock_wait_max_seconds` | gauge | The longest single such wait since start |
 | `cbackup_checkpoint_presync_seconds_total` | counter | Time spent writing the log out to disk just before a locked round, without the lock, so the round itself only syncs what arrived since |
 | `cbackup_checkpoint_frames_copied_total` | counter | Log frames copied back into `state.db`; over `cbackup_checkpoint_rounds_total`, frames per round |
 | `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap |
 | `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy |
 | `cbackup_checkpoint_throttle_seconds_total` | counter | Time bulk writers spent so held |
 | `cbackup_wal_frames_max` | gauge | The most frames `state.db`'s log was seen holding since start; the hard cap is 16 times `db.wal_autocheckpoint` |
+| `cbackup_db_findings{coverage}` | gauge | Live database findings not dismissed, by coverage: `covered-crash`, `covered-quiesced`, `covered-application`, `engine-unsafe`, `split`, `uncovered` (chapter 23); every label always present |
+| `cbackup_db_uncovered_reads_total` | counter | Live databases a backup captured `uncovered`, counted once per backup that did |
 | `cbackup_vm_bitmap_audit_failures_total` | counter | Audit reads that found a VM disk changed outside its dirty bitmap (section 6.5) |
 | `cbackup_vm_resync_bytes_total` | counter | Bytes incremental VM reads re-read past the changed ranges to bring the chunker back in step |
 
@@ -2321,6 +2382,22 @@ Job 120 (backup) completed with a warning: 1 file(s) were still changing and are
 
 A clean backup sends nothing.
 
+Every job sends at most one notification, whatever it found: counts and the
+first item, never one per file or object.
+
+**Priority.** A job that failed because it found damage nothing can repair
+(status `ERR_CORRUPT`) sends its notification at Pushover priority 1
+(high), which sounds through the recipient's quiet hours. That covers a
+verify that finds unrecoverable or missing data or a pack it cannot walk,
+a gc that copies pack entries damaged beyond parity or cannot walk a pack,
+and a replication that sends objects damaged beyond parity; any other job
+that stops on corrupt repository data (a restore reading a damaged pack,
+say) ends the same way and alerts the same. The status decides it, never
+the wording of the error. Every other notification, other failures and
+all warnings, goes at normal priority (0). Priority 1 needs nothing more
+from Pushover; emergency priority (2), which repeats until acknowledged,
+is not used.
+
 A notification that cannot be delivered is retried for 24 hours unless
 Pushover rejects it outright (a wrong token or user key), in which case it is
 dropped at once. Either way the journal has a line naming the notification,
@@ -2336,7 +2413,8 @@ counter: an alert path that has stopped working is otherwise silent.
 The daemon log has one line per failed job either way: `sending failure
 notification for job N: <title>: <body>` with credentials set, and
 `failure notification for job N not sent, Pushover is not configured:
-<title>: <body>` without them.
+<title>: <body>` without them. A priority 1 notification has `(priority
+high: damage beyond repair)` after its title in both.
 A backup that completed with skipped files logs the same pair at
 `warning` level: `sending warning notification for job N: <title>: <body>`
 with credentials, `warning notification for job N not sent, Pushover is not
@@ -2867,12 +2945,15 @@ counted in `cbackup_checkpoint_failures_total`, and turns `/readyz` to
 `"status":"degraded"` with the reason in `state_db_checkpoint_error` until a
 checkpoint works again. Everything else carries on, but nothing is copying
 the log back, so it grows until the filesystem fills: treat it as urgent.
-The usual cause is ownership. The daemon opens `state.db`, and the
-checkpointer's own connection to it, before it drops to
-`security.run_as_uid`; the files stay root's, mode 0600, which is expected
-(section 22.2). Opened after the drop, as an earlier build did, that
-connection could only read, and every checkpoint failed without a word: the
-log reached five times its cap while `state.db` stayed 4096 bytes (B215).
+Ownership is not the cause, and changing it is not the fix: the daemon
+opens `state.db`, and the checkpointer's own connection to it, before it
+drops to `security.run_as_uid`, so `state.db`, `-wal` and `-shm` are root's,
+mode 0600, by design in 1.0 (section 22.2.2). Opened after the drop, as an
+earlier build did, that connection could only read, and every checkpoint
+failed without a word: the log reached five times its cap while `state.db`
+stayed 4096 bytes (B215). A connection that can only read is now refused
+at start, with an error naming the uid; the one way to meet it is a daemon
+started as the uid it would drop to rather than as root.
 
 **Do not hold long reads on a live `state.db`.** A checkpoint can only
 reuse the log once every reader has moved past the frames it copied, and the
@@ -3015,8 +3096,13 @@ command, or `C_BACKUP_SOCKET`, overrides the default. Output is the daemon's
 JSON, one document per command, on stdout (a remove prints what it removed,
 `{"removed":true,...}`); errors go to stderr. `jobs watch` is the one command
 that prints several: one document per line until the job ends. The exit
-status is 0 on success and 1 otherwise. Commands that start a job wait for
-it unless given `--no-wait`.
+status is 0 on success and 1 otherwise, with one exception: 124 when
+`--timeout` ran out with the job still running (the status `timeout(1)`
+uses). Commands that start a job wait for it until it ends, however long
+that is, unless given `--no-wait`, which returns the job id at once, or
+`--timeout SECONDS` (whole seconds, 1 or more), which waits at most that
+long and leaves the job running. The two cannot be combined. Before 1.0 the
+wait gave up after an hour and exited 1 while the job went on (B220).
 
 Arguments follow one set of rules for every command, checked before
 anything is sent to the daemon:
@@ -3151,6 +3237,25 @@ capture cannot reach that level fails before anything is read, with
 `achieved X, below the required crash`. A unit with mounts that cannot be
 snapshotted, or a `pause = never` unit with more than one snapshot instant,
 needs `--require inconsistent` to be backed up at all.
+
+**When a mount drops to the fallback.** A mount is read from the
+snapshot only when its snapshot holds all of it. It drops to the fallback
+(`fallback-live`, 22.5.6) when it is on no snapshot domain of the helper's
+policy (an array disk, a share split across devices, a dataset or pool the
+policy does not list), and also when anything lies below it that its
+snapshot would show as an empty directory: another filesystem mounted
+inside it (a ZFS child dataset, as `/mnt/cache/domains` has one per VM on
+FS1, a tmpfs, a disk) or a btrfs subvolume inside it (an LXC rootfs on
+btrfs often holds several). Reading such a mount from the snapshot would
+store those directories empty and say nothing (B231); reading it through
+the fallback stores their contents, and the unit's warnings name the mount,
+the first three things below it and how many there are
+(`<mount> has 4 mount(s) or btrfs subvolume(s) below it (...), which its
+snapshot would show empty: read live (fallback-live)`). `mounts.json` in the
+snapshot says the same per mount (`nested`). The level that follows is the
+fallback's (22.5.6): `crash` when the two-pass read finishes inside the
+pause, otherwise `inconsistent`. A pool whose subvolumes cannot be listed
+is not trusted at all: the unit fails rather than guessing.
 
 **Reserved names.** Two top-level names belong to the daemon in every
 snapshot root:
@@ -3404,10 +3509,16 @@ itself at start (`security.run_as_uid`, 990 here):
 repositories must be owned by 990: the daemon creates its keys, its
 `daemon-id`, SQLite's temporary files and everything in a repository after
 the drop. The configuration and `state.db` are opened before it, every
-connection to the database included, so a `state.db` (and `-wal`, `-shm`)
-that root created on the first start is root's, mode 0600, and that is
-fine: uid 990 never opens it again. A connection opened after the drop
-could only read it, which is what B215 was (section 18.2). What the drop
+connection to the database included, so `state.db`, `-wal` and `-shm` are
+root's, mode 0600, after the drop, and stay so: that is by design in 1.0,
+not something to correct. Root created them on the first start, uid 990
+never opens them again, and nothing replaces them while the daemon runs (a
+clean stop either removes `-wal` and `-shm` or leaves them, section 2.2,
+and the next start, as root, opens or recreates them before the drop). Do
+not `chown` them to 990; it changes nothing. A connection opened after the
+drop could only read them, which is what B215 was (section 18.2). The
+state *directory* is 990's, because of what is created in it after the
+drop. What the drop
 costs: `trusted.*` extended attributes cannot be
 read without `CAP_SYS_ADMIN` and are skipped (appdata does not use them).
 
@@ -3900,6 +4011,23 @@ exported share (the helper refuses both). On FS2 it is
 `/mnt/user/system/.cbackup-snapshots`). A file backup of a pool or a share
 therefore never reads capture snapshots.
 
+**Incrementals over snapshots.** A snapshot keeps every file's inode
+number, size and times but is given a new device number at every capture.
+Files read from one are identified by the device of the path they are
+recorded at, so a snapshot read writes the same directory trees and file
+cache rows a live read of the same files would: an unchanged unit stores no
+new trees and opens no file, and the read from a later snapshot finds the
+rows the earlier one wrote. A mount nested inside a snapshot keeps its own
+device; its files are recognised by inode, size and both times alone.
+
+Before this (B229) the device number of each snapshot was written into
+every tree, so every unit backup stored a complete new set of trees, though
+no file content. **The first unit backup after upgrading past it rewrites
+each unit's trees once and reads its files once**, because both the trees
+and the cache rows earlier backups wrote name the old snapshots' devices.
+Nothing is lost and no setting is involved; from the backup after that,
+incrementals store and read only what changed.
+
 **Who else can see a snapshot while it exists.** A container that binds a
 **dataset root** reaches `.zfs` by name: on FS1, Plex-Mover binds
 `/mnt/cache` read-write and can read `/mnt/cache/appdata/.zfs/snapshot/`
@@ -3986,7 +4114,12 @@ finding a member already unpaused, not only by the clock, since the
 watchdog measures from the hold's journal entry, a little before the
 pause. A `pause = never` unit, a stopped unit, and a unit captured in a
 group (22.6.1) read fallback mounts live and are flagged. Remember that
-such a unit needs `--require inconsistent` (22.1).
+such a unit needs `--require inconsistent` (22.1). This applies equally to
+a mount that drops to the fallback because something lies below it (22.1,
+"When a mount drops to the fallback"): never paused, it is read live and
+the unit is `inconsistent`, but its contents are stored, never an empty
+directory. An LXC unit has no second pass: its fallback mounts are read
+live after the freeze and the unit is `inconsistent`.
 
 #### 22.5.7 Exclusions
 
@@ -4165,7 +4298,12 @@ device`, again before anything is written. That refusal names the way
 round it: restore the files to a path instead, `c-backup restore <repo>
 <snapshot> <dir> --subpath <the bind's recorded path>` for that bind or
 `c-backup unit restore <repo> <snapshot> <dir>` for the whole unit
-(22.7.1), and create the container by hand. The check of the created
+(22.7.1), and create the container by hand. A source the snapshot
+records as a socket is refused for what it is: a restore never recreates a
+socket (the program serving it makes it), so the copy would bind nothing
+there (NIT-44); the refusal names the same way round. A fifo is restored
+and passes. The refusal reaches the job's error whole, up to 2 KiB, and
+one longer is cut with a visible `...` (B223). The check of the created
 container still runs as well.
 
 Anything else refuses the restore before the container is created, with
@@ -4454,3 +4592,118 @@ production units means changing both lists, deliberately, on the host.
 | `restore staging ... would sit at the top of a pool`, `... which the mover moves to the array` or `... on another filesystem` | the default staging directory is not usable for that domain | set `[snapshot] restore_staging_dirs` to a directory inside the domain, in a share the mover keeps on the pool, on the mount's filesystem |
 | `restore staging ... is a symlink or not a directory; not followed`, or `... was replaced or moved after it was staged; not swapped` | something put a symlink in the staging path, or replaced the staging directory between stage and swap | remove what was planted; the helper never follows or renames anything it did not make |
 | `docker run` of the daemon fails: bind source does not exist | a `/run` directory or a `.cbackup-restore` directory was not created | create them (22.2.1); `/run` is RAM on Unraid, recreate at boot |
+
+## 23. Databases
+
+Every backup looks, as it reads, for live databases in what it captures, and
+says whether the capture it made is a consistent copy of each. It is
+reporting only: nothing about how a source or unit is captured changes
+because of a finding. The design, with the reasoning behind each rule, is
+`docs/db-detection.md`.
+
+### 23.1 What detection looks for
+
+Detection uses only what the backup already has: every scanned entry's name,
+type and size, and the first 64 bytes of each file it reads (16 KiB of a
+Nextcloud `config/config.php`). It never opens a file the backup would not
+open, so its cost is a name check per entry and one 64-byte read, of the page
+the backup is about to read anyway, per file read.
+
+| Engine | Recognised by |
+|---|---|
+| PostgreSQL | a directory with `PG_VERSION` (digits: the version), `global/pg_control` and `base/` |
+| MySQL / MariaDB | `ibdata1` or `mysql.ibd`, `ib_logfile0` or `#innodb_redo/`, and `mysql/`; `aria_log_control` says MariaDB |
+| SQLite | the 16-byte `SQLite format 3` header, never the name; bytes 18 and 19 give the journal mode |
+| Redis / Valkey | `dump.rdb` starting `REDIS` and four digits, `appendonly.aof`, or `appendonlydir/` with a `*.manifest` |
+| Prometheus | `wal/`, `chunks_head/`, and block directories (ULID names with `meta.json` and `index`), or `queries.active` before the first block |
+| InfluxDB 1 / 2 | `meta/meta.db`, `data/`, `wal/`; or `influxd.bolt` with `engine/data/` and `engine/wal/` |
+| MongoDB | `WiredTiger`, `WiredTiger.turtle`, `WiredTiger.wt` and `journal/` |
+| Elasticsearch / OpenSearch | `indices/` holding Lucene `segments_N`, with `_state/` or as `nodes/0/` |
+| LevelDB / RocksDB | `CURRENT` naming a `MANIFEST-*`, with `*.ldb` or `*.log`; RocksDB adds `OPTIONS-*` and `*.sst` |
+| LMDB | `data.mdb` with the LMDB magic, and `lock.mdb` |
+| bbolt | the bbolt magic in the first meta page |
+| ClickHouse | `metadata/`, `store/`, and parts holding `columns.txt` and `checksums.txt` |
+| Nextcloud | `config/config.php` naming its `dbtype` (read with a fixed pattern, never evaluated); not an engine, reported so its database can be found |
+
+What a file's header says decides. A file called `*.db` that is not SQLite
+is not a finding; a `PG_VERSION` that is not digits makes no PostgreSQL.
+Where two engines claim one directory the more specific wins (RocksDB over
+LevelDB; an InfluxDB 2's own bbolt file is part of that finding, listed in
+its evidence). An engine nested inside another's directory (GitLab's
+bundled PostgreSQL inside the GitLab mount) is a finding of its own.
+
+A file the file cache vouches for is not read, so its header is not seen;
+the classification from the last read is kept in the cache and used
+instead. One consequence: a file unchanged since before the daemon had
+detection is not classified until it changes. A live database changes, so
+this is the dormant ones; directory engines are found by their names
+regardless.
+
+### 23.2 Confidence
+
+| Confidence | Meaning |
+|---|---|
+| `live` | a signature and a sign of life: `postmaster.pid`, a MySQL `*.pid`, a SQLite `-wal`, `-shm` or hot `-journal` beside it, a non-empty `mongod.lock`, Prometheus's `lock` or `queries.active`, `node.lock`, ClickHouse's `status`, or any file of it that changed while it was being read (it was stored flagged as possibly torn, section 6.3) |
+| `dormant` | a signature and nothing else: at rest, so any capture of it is consistent. Reported, with nothing suggested. A dormant SQLite file under `db_detect.sqlite_min_kb` is counted, not listed |
+
+Process lists, listening ports and files held open by a container's
+processes are the stronger signs of life and are not used yet.
+
+### 23.3 Coverage
+
+For each live finding, whether the capture was consistent for that engine:
+
+| Coverage | Meaning |
+|---|---|
+| `covered-crash` | every one of its files was captured at one instant (a filesystem snapshot, or a fallback mount read with the unit paused at the snapshot's instant): it restores as after a power cut, and the engine recovers |
+| `covered-quiesced` | the same, with the guest's filesystems frozen |
+| `covered-application` | the same, after a pre hook that quiesced or dumped |
+| `engine-unsafe` | one instant, but the engine does not recover from that for all of its data: MySQL or MariaDB with MyISAM or Aria tables outside the system schemas, and Elasticsearch and OpenSearch, which support only their own snapshot API |
+| `split` | its files were captured at different instants (snapshot domains taken separately with no pause, or one read live), or some are outside the capture: a PostgreSQL tablespace or relocated `pg_wal`, or a MongoDB `journal`, whose link points somewhere the backup did not read |
+| `uncovered` | read live while in use: the copy may be torn |
+
+A plain file source is read live, so every live database in one is
+`uncovered`. In a unit, a mount read from a filesystem snapshot is atomic;
+when the unit achieved `crash` or better the provider guarantees one
+instant for all of it (container-backup 6.4), and below that each mount is
+counted as its own instant. The links inside a container's data name
+container paths, not the recorded ones, so in a unit they are listed as
+`unchecked` rather than judged.
+
+Each live finding carries what would help, as a name: a dump template for a
+unit (`pg-dumpall`, `mariadb-dump`, `redis-rdb`, `mongodump`, `sqlite-backup`,
+`influx2-backup`, `prometheus-snapshot`), `sqlite-backup` (an online-backup
+copy by the daemon) or `source-snapshot` for a file source, `pause-always`
+for a split unit, `exclude-rebuild` for a search index. A covered
+PostgreSQL, MySQL or MongoDB in a unit also names its dump as `optional`,
+for portability across major versions.
+
+### 23.4 Where the results go
+
+- **The job result**, `databases` (`docs/api.md`), for every file backup;
+  each unit's entry in a units job has its own.
+- **`unit.json`**, `databases` (`docs/source-providers.md` 7.2): engine,
+  version, path, confidence, coverage, method, in the snapshot itself, so a
+  restore long after can say how each database was captured.
+- **`state.db`**, `db_findings`: the current view per repository, one row
+  per scope (`source:<path>` or `unit:<key>`), path and engine, with a state:
+  `new`, `suggested`, `enabled` or `dismissed`. A row no longer seen by its
+  scope's next backup is dropped unless it is enabled or dismissed. A
+  dismissal holds until the engine's version changes. Losing the table
+  loses only those states and the alert bookkeeping.
+- **The journal**: a live database seen for the first time, and a change in
+  a live finding's coverage, each an `info` entry of operation `db-detect`.
+- **One alert**: a live database first found `uncovered` is the job's
+  warning (logged, journalled, pushed when Pushover is configured), once.
+  It is not raised again on every backup; a finding fixed and then
+  uncovered again alerts once more. `db_detect.notify_uncovered: 0` turns
+  the alert off and leaves the rest.
+- **Metrics**: `cbackup_db_findings{coverage}` and
+  `cbackup_db_uncovered_reads_total` (16.2).
+
+### 23.5 Failure and cost
+
+Detection never fails a backup. A detector that runs out of memory, or
+findings that cannot be recorded, are logged and the backup carries on;
+the result then has no `databases`. `db_detect.enabled: 0` turns it off
+entirely, and a backup then reads and stores exactly as it would have.

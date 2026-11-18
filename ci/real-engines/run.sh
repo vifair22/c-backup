@@ -989,6 +989,42 @@ virsh -q -c "$VIRT_URI" undefine cbk-uat-vm >/dev/null 2>&1
 }
 test_vm
 
+# ---- B231: a btrfs subvolume below a container's mount --------------------
+# A snapshot of the pool shows a nested subvolume as an empty directory. A
+# mount with one below it must not be read from the snapshot (its contents
+# would be silently missing): the helper flags it, the daemon reads it
+# through the fallback, the job warns naming it, and the restore holds the
+# subvolume's files.
+
+test_b231_nested_subvolume() {
+    local n="$APPS/cbk-uat-nest" out snap r="$OUT/b231" man
+    log "B231: a container mount with a btrfs subvolume below it"
+    mkdir -p "$n"
+    echo top > "$n/top.txt"
+    btrfs subvolume create "$n/inner" >/dev/null || { bad "B231: a nested subvolume is created" "created" "btrfs failed"; return 0; }
+    head -c 65536 /dev/urandom > "$n/inner/data.bin"
+    echo inner > "$n/inner/note.txt"
+    man=$(manifest "$n")
+    docker run -d --name cbk-uat-nest --network none -v "$n:/data" "$IMG" \
+        sh -c 'trap "exit 0" TERM; while :; do sleep 1; done' >/dev/null || { bad "B231: the container starts" "started" "docker failed"; return 0; }
+    out=$(cb unit backup 1 --provider docker cbk-uat-nest 2>&1)
+    job_ok "B231: the unit backup" "$out"
+    contains "B231: the job warns naming the mount and what is below it" "$n/inner" "$out"
+    contains "B231: and says it was read live" "read live" "$out"
+    snap=$(snap_of "$out")
+    # The fixture's own subvolume goes first: snapshots_left counts every
+    # subvolume below the pool's top level, it included.
+    docker rm -f cbk-uat-nest >/dev/null 2>&1
+    btrfs subvolume delete "$n/inner" >/dev/null 2>&1
+    leftovers "after the B231 backup"
+    if have_snap "B231" "$snap"; then
+        cb unit restore 1 "$snap" "$r" >/dev/null 2>&1
+        check "B231: the subvolume's files are in the snapshot, not an empty directory" "$man" "$(manifest "$r$n")"
+    fi
+    rm -r -- "$n"
+}
+test_b231_nested_subvolume
+
 # ---- B186: the helper's container layout does not multiply host mounts ---
 # A bind under an rshared bind propagates back into the host's peer group,
 # so with the old documented layout (state_dir bound separately beside
@@ -1044,6 +1080,35 @@ test_b186_layout() {
 }
 test_b186_layout
 
+# ---- B229: what a btrfs snapshot keeps of a file ---------------------------
+# A snapshot read is recorded with the record root's live device in the
+# hard-link identity and the file cache key, which only gives the trees and
+# cache rows of a live read if the snapshot keeps every inode number, size,
+# mtime, ctime and link count, under a device number of its own. Checked
+# here on a real read-only snapshot of the pool's top level, the kind the
+# helper takes; test_snapshot_read proves the rest over a stand-in. ZFS
+# keeps them too (object numbers are inode numbers), checked in UAT.
+
+test_b229_snapshot_identity() {
+    local d="$CACHE/system/cbk-b229" sv="$CACHE/system/cbk-b229-snap" live snap
+    log "B229: a read-only btrfs snapshot keeps inode numbers and times"
+    mkdir -p "$d/sub"
+    head -c 65536 /dev/urandom > "$d/a.bin"
+    echo text > "$d/sub/b.txt"
+    ln "$d/a.bin" "$d/sub/a-link"
+    sleep 1   # so a ctime the snapshot rewrote could not equal the original
+    btrfs subvolume snapshot -r "$CACHE" "$sv" >/dev/null || { bad "B229: a snapshot is taken" "taken" "btrfs failed"; return 0; }
+    live=$(cd "$d" && find . -printf '%P %i %s %T@ %C@ %n\n' | sort)
+    snap=$(cd "$sv/system/cbk-b229" && find . -printf '%P %i %s %T@ %C@ %n\n' | sort)
+    check "B229: every inode number, size, mtime, ctime and link count is kept" "$live" "$snap"
+    [ "$(stat -c %d "$d/a.bin")" != "$(stat -c %d "$sv/system/cbk-b229/a.bin")" ] &&
+        ok "B229: under a device number of its own" ||
+        bad "B229: under a device number of its own" "different devices" "the same device"
+    btrfs subvolume delete "$sv" >/dev/null
+    rm -r -- "$d"
+}
+test_b229_snapshot_identity
+
 # ---- the privilege drop and the helper suites, as root -------------------
 # The CI job containers are root with Docker's default capabilities, which
 # hold no CAP_DAC_READ_SEARCH, so there test_root_drop can only check that
@@ -1060,17 +1125,20 @@ suite_root() {   # <label> <logfile> <command...>
     [ "$rc" -eq 0 ] || tail -30 "$logf"
 }
 
-log "suites as root: test_privs, test_helper, test_helper_remote, test_helper_e2e.sh"
+log "suites as root: test_privs, test_helper, test_helper_remote, test_snapshot_read, test_helper_e2e.sh"
 TSCR="$WORK/test-scratch"
 mkdir -p "$TSCR"
 if make -s -C "$SRC" CUTILS_DIR="$CUTILS" MARCH=x86-64-v2 MTUNE=generic C_BACKUP_TEST_DIR="$TSCR" \
         -j"$JOBS" build/bins/test_privs build/bins/test_helper build/bins/test_helper_remote \
+        build/bins/test_snapshot_read \
         >"$WORK/build-suites.log" 2>&1; then
     suite_root test_privs "$WORK/test_privs.log" build/bins/test_privs
     contains "test_root_drop ran the real drop" "[       OK ] test_root_drop" "$(cat "$WORK/test_privs.log")"
     check "and not only the refusal" 0 "$(grep -c 'the drop is not' "$WORK/test_privs.log")"
     suite_root test_helper "$WORK/test_helper.log" build/bins/test_helper
     suite_root test_helper_remote "$WORK/test_helper_remote.log" build/bins/test_helper_remote
+    suite_root test_snapshot_read "$WORK/test_snapshot_read.log" build/bins/test_snapshot_read
+    check "test_snapshot_read ran its overlay cases" 0 "$(grep -c 'the overlay cases skip' "$WORK/test_snapshot_read.log")"
     suite_root test_helper_e2e.sh "$WORK/test_helper_e2e.log" \
         tests/test_helper_e2e.sh build/bins/c-backupd build/bins/c-backup build/bins/c-backup-helper
 else

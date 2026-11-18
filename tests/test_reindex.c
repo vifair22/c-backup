@@ -39,6 +39,8 @@
 #include "replicate.h"
 #include "store.h"
 #include "store_index.h"
+#include "node_gen.h"
+#include "db_txn.h"
 #include "test_tmp.h"
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_reindex"
@@ -884,6 +886,61 @@ static void test_reindex_reads_long_records_and_signed_times(void **state)
     err_clear();
 }
 
+/* ---------- node index generations ---------- */
+
+/*
+ * Node ids are renumbered by every rebuild of a snapshot's rows, so the
+ * API labels them with the snapshot's index generation (node_gen.h). It has
+ * to change on every rebuild, never come back, stay put for a rebuild that
+ * failed, and go with the snapshot.
+ */
+static void test_index_generation_changes_on_rebuild_and_never_returns(void **state)
+{
+    (void)state;
+    backup_once();
+    write_file(TEST_SRC "/top.txt", "second version\n");
+    backup_once();
+    int64_t g1 = node_gen_get(db, repo_id, 1);
+    int64_t g2 = node_gen_get(db, repo_id, 2);
+    assert_true(g1 > 0);
+    assert_true(g2 > g1);
+    long long id1 = scalar("SELECT MIN(id) FROM nodes WHERE repo_id = ? AND snap_id = 1");
+
+    /* A reindex of snapshot 1 renumbers it and gives it a fresh value;
+     * snapshot 2's rows and generation are untouched. */
+    assert_int_equal(reindex_snapshot(store, db, repo_id, 1, NULL), OK);
+    int64_t g1b = node_gen_get(db, repo_id, 1);
+    assert_true(g1b > g2);
+    assert_int_equal(node_gen_get(db, repo_id, 2), g2);
+    assert_true(scalar("SELECT MIN(id) FROM nodes WHERE repo_id = ? AND snap_id = 1") != id1);
+
+    /* A rebuild that fails keeps the rows and the generation it had, and
+     * the value it drew is burnt: the next rebuild skips past it, so a
+     * client that saw the failed rebuild's rows cannot meet that value on
+     * different ones. */
+    write_file(TEST_REPO "/snapshots/2", "{\"id\":2,\"ts\":1,\"root\":\""
+               "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+               "\",\"label\":\"\"}\n");
+    assert_int_not_equal(reindex_snapshot(store, db, repo_id, 2, NULL), OK);
+    err_clear();
+    assert_int_equal(node_gen_get(db, repo_id, 2), g2);
+    assert_int_equal(reindex_snapshot(store, db, repo_id, 1, NULL), OK);
+    assert_true(node_gen_get(db, repo_id, 1) >= g1b + 2);
+
+    /* Drawing one inside a transaction is refused: its rollback would take
+     * the value back. */
+    assert_int_equal(db_txn_begin(db), OK);
+    int64_t g = 0;
+    assert_int_equal(node_gen_alloc(db, &g), ERR_INVALID);
+    err_clear();
+    db_txn_rollback(db);
+
+    /* Pruned with its snapshot. */
+    assert_int_equal(prune_snapshot(store, db, repo_id, 1), OK);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM node_index_gen"
+                            " WHERE repo_id = ? AND snap_id = 1"), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -893,6 +950,8 @@ int main(void)
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_unreadable_pack_keeps_its_rows, setup, teardown),
         cmocka_unit_test_setup_teardown(test_clean_reindex_reports_no_failures, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_index_generation_changes_on_rebuild_and_never_returns,
+                                        setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_keeps_gfs_flags, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_restores_size_and_file_count, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_counts_refs_and_gc_after_it_keeps_live_objects,

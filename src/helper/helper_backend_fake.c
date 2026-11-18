@@ -57,12 +57,30 @@ static status_t fk_define(sp_ctx_t *c, const char *unit_id, const char *definiti
     return r ? OK : set_error(ERR_NOMEM, "fake: define");
 }
 
+/* The define check refuses with the text of <state_dir>/fake-define-refuse
+ * when a test has written one, as a real backend refuses, so the whole
+ * helper-to-daemon path of a refusal can be checked end to end (B223). */
+static status_t fk_define_check(sp_ctx_t *c, const char *unit_id, const char *definition,
+                                const helper_policy_t *pol)
+{
+    (void)c; (void)unit_id; (void)definition;
+    char path[4200], text[8000];
+    snprintf(path, sizeof(path), "%.4000s/fake-define-refuse", pol->state_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return OK;
+    size_t n = fread(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    text[n] = '\0';
+    return set_error(ERR_INVALID, "%s", text);
+}
+
 void helper_backend_fake(helper_backend_t *out, sp_ctx_t *ctx)
 {
     *out = (helper_backend_t){
         .name = "fake", .ops = &fake_provider_ops, .ctx = ctx,
         .blob_data = fake_blob_data, .item_extra = fk_item_extra,
         .unit_state = fake_unit_state, .set_running = fk_set_running, .define = fk_define,
+        .define_check = fk_define_check,
         /* mount_root, hook_start: the policy's dir domains and a local
          * process; define: unsupported. */
     };

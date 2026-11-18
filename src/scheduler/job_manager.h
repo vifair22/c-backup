@@ -17,6 +17,7 @@
 #include "error.h"
 
 #include <cutils/db.h>
+#include <cutils/push.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -41,10 +42,28 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
  * is being sent or that it is not. */
 void     job_manager_set_alerts(job_manager_t *jm, int enabled);
 
+/* Where a job's alert is sent: push_send_opts unless set. For tests, a
+ * fake Pushover that records each alert and its priority. */
+typedef int (*job_push_fn)(const push_opts_t *opts);
+void     job_manager_set_push(job_manager_t *jm, job_push_fn fn);
+
+/* The Pushover priority of a job's alert, by how it ended: PUSH_PRIORITY_HIGH
+ * (1) for ERR_CORRUPT, damage beyond repair; PUSH_PRIORITY_NORMAL for every
+ * other failure and for warnings. */
+int      job_alert_priority(status_t st);
+
 /* Shut down: every queued job is recorded cancelled without starting, every
  * running job is asked to stop, and this returns once the workers have
  * joined. A submit racing the shutdown is refused. */
 void     job_manager_stop(job_manager_t *jm);
+
+/* job_manager_stop, waiting at most grace_ms (0: for ever) for running jobs
+ * to stop (B218); they are cancelled with CANCEL_SHUTDOWN (store.h). OK
+ * once stopped and freed. ERR_BUSY, each job still running logged by id,
+ * when one has not stopped by then: the manager is left as it is, still in
+ * use by that job, and nothing but another job_manager_stop_within (which
+ * finishes the stop) may touch it. The daemon exits instead. */
+status_t job_manager_stop_within(job_manager_t *jm, unsigned grace_ms);
 
 /*
  * How a repo-scoped job holds its repository while it runs. The job manager

@@ -287,6 +287,65 @@ static void test_one_unit_roundtrip(void **state)
     free(disk);
 }
 
+/*
+ * Database detection in a unit (docs/db-detection.md): a live SQLite in a
+ * tree read from the filesystem snapshot of a frozen unit is covered
+ * (quiesced), recorded in unit.json, which is stored after the trees to
+ * say so, in the unit's result and in db_findings under the unit's scope.
+ */
+static void test_unit_databases(void **state)
+{
+    (void)state;
+    uint8_t h[100];
+    memset(h, 0, sizeof(h));
+    memcpy(h, "SQLite format 3", 16);
+    h[16] = 0x10;
+    h[18] = 2;
+    h[19] = 2;
+    FILE *f = fopen(SNAPDIR "/app.db", "wb");
+    assert_non_null(f);
+    assert_int_equal(fwrite(h, 1, sizeof(h), f), sizeof(h));
+    fclose(f);
+    write_file(SNAPDIR "/app.db-wal", "");
+    const char *names[] = { "cbk-uat-one" };
+    unit_backup_result_t res;
+    assert_int_equal(run_units(names, 1, 0, &res), OK);
+    assert_int_equal(res.ok, 1);
+    int64_t snap = res.units[0].snapshot_id;
+    assert_non_null(res.units[0].databases_json);
+    assert_non_null(strstr(res.units[0].databases_json, "\"engine\":\"sqlite\""));
+    assert_non_null(strstr(res.units[0].databases_json, "\"path\":\"" LIVEDIR "/app.db\""));
+    assert_non_null(strstr(res.units[0].databases_json, "\"coverage\":\"covered-quiesced\""));
+    assert_non_null(strstr(res.units[0].databases_json, "\"method\":\"snapshot\""));
+    /* Covered: no alert, one journal-worthy event (a new live finding). */
+    assert_int_equal(res.units[0].n_db_events, 1);
+    assert_int_equal(res.units[0].db_events[0].kind, DB_EVENT_NEW_LIVE);
+    unit_backup_result_free(&res);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM db_findings WHERE repo_id = ?"
+                            " AND scope = 'unit:fake:u1' AND engine = 'sqlite'"
+                            " AND coverage = 'covered-quiesced'"), 1);
+
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, DEST, &ro, &rr), OK);
+    f = fopen(DEST "/.cbackup-unit/unit.json", "rb");
+    assert_non_null(f);
+    char buf[16384];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    unit_json_t uj;
+    assert_int_equal(unit_json_parse(buf, n, &uj), OK);
+    assert_int_equal(uj.have_dbs, 1);
+    assert_int_equal(uj.n_dbs, 1);
+    assert_string_equal(uj.dbs[0].engine, "sqlite");
+    assert_string_equal(uj.dbs[0].coverage, "covered-quiesced");
+    assert_string_equal(uj.dbs[0].path, LIVEDIR "/app.db");
+    /* Written after the trees, it still names every item. */
+    assert_int_equal(uj.n_items, 3);
+    unit_json_free(&uj);
+}
+
 /* Dump hooks as STREAM items: a good one stored at its real size, byte
  * for byte; a failed one never stored, and unit.json says so. */
 static void test_streams(void **state)
@@ -583,7 +642,7 @@ static void test_unknown_never_pruned(void **state)
 {
     (void)state;
     junk_done = 0;
-    backup_synth_t s = { "/.cbackup-unit/unit.json", 0600, 0, 0, 0, 0 };
+    backup_synth_t s = { "/.cbackup-unit/unit.json", 0600, 0, 0, 0, 0, 0 };
     backup_synth_ops_t ops = { bad_open, NULL, NULL, NULL, NULL };
     backup_opts_t bo;
     memset(&bo, 0, sizeof(bo));
@@ -881,6 +940,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_one_unit_roundtrip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_streams, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unit_databases, setup, teardown),
         cmocka_unit_test_setup_teardown(test_enrolled_exclusions, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_snapshot_per_unit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failures_leave_nothing, setup, teardown),

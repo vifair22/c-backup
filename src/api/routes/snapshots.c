@@ -23,6 +23,7 @@
 #include "util.h"
 #include "json_row.h"
 #include "node_queries.h"
+#include "node_gen.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -403,21 +404,17 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
     jreq_err_t je;
     if (parent && jquery_i64(parent, "parent", 0, INT64_MAX, &pid, &je) != JREQ_OK)
         return api_error(400, je.msg);
+    /* The generation the caller's node id came from, when it says (node_gen.h).
+     * Without one, a node id is taken as it is, as it always was. */
+    int64_t want_gen = 0;
+    const char *gq = api_query_param(req, "gen");
+    int have_gen = gq != NULL;
+    if (have_gen && jquery_i64(gq, "gen", 0, INT64_MAX, &want_gen, &je) != JREQ_OK)
+        return api_error(400, je.msg);
     /* Bound as the id read, not the text sent: "1e2" is node 100. */
     char pidbuf[32];
     snprintf(pidbuf, sizeof(pidbuf), "%lld", (long long)pid);
     parent = pidbuf;
-    if (pid > 0) {
-        char rb[32], sb[32];
-        snprintf(rb, sizeof(rb), "%lld", (long long)repo_id);
-        snprintf(sb, sizeof(sb), "%lld", (long long)snap_id);
-        db_result_t *pr = NULL;
-        int found = db_execute(g_ctx.db,
-                NODE_SQL_DIR_IN_SNAP,
-                (const char *[]){ rb, sb, pidbuf, NULL }, &pr) == 0 && pr && pr->nrows == 1;
-        db_result_free(pr);
-        if (!found) return api_error(404, "no such directory in this snapshot");
-    }
 
     char repo[32], snap[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -425,14 +422,42 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
     snprintf(lim,  sizeof(lim),  "%d", limit);
     snprintf(off,  sizeof(off),  "%d", offset);
 
+    /*
+     * The generation is read before and after the rows. A rebuild deletes
+     * the old rows, sets the new generation, then inserts (node_gen.h), so
+     * equal readings either side mean every row read belongs to the
+     * generation reported. Unequal means a rebuild ran in between: read
+     * again, a few times, rather than label ids with the wrong generation.
+     */
     db_result_t *r = NULL;
-    /* nodes_by_snap_parent serves the filter and the name order; see
-     * node_queries.h for why the EXISTS is not a COUNT. */
-    if (db_execute(g_ctx.db, NODE_SQL_LIST_DIR,
-            (const char *[]){ repo, snap, parent ? parent : "0", lim, off, NULL },
-            &r) != 0) {
+    int64_t gen = 0;
+    for (int attempt = 0; ; attempt++) {
+        gen = node_gen_get(g_ctx.db, repo_id, snap_id);
+        if (have_gen && want_gen != gen) return api_error(409, NODE_GEN_STALE_MSG);
+        if (pid > 0) {
+            db_result_t *pr = NULL;
+            int found = db_execute(g_ctx.db,
+                    NODE_SQL_DIR_IN_SNAP,
+                    (const char *[]){ repo, snap, pidbuf, NULL }, &pr) == 0 && pr && pr->nrows == 1;
+            db_result_free(pr);
+            if (!found) {
+                if (node_gen_get(g_ctx.db, repo_id, snap_id) != gen && attempt < 3) continue;
+                return api_error(404, "no such directory in this snapshot");
+            }
+        }
+
+        /* nodes_by_snap_parent serves the filter and the name order; see
+         * node_queries.h for why the EXISTS is not a COUNT. */
+        if (db_execute(g_ctx.db, NODE_SQL_LIST_DIR,
+                (const char *[]){ repo, snap, parent, lim, off, NULL },
+                &r) != 0) {
+            db_result_free(r);
+            return api_error(500, "cannot list directory");
+        }
+        if (node_gen_get(g_ctx.db, repo_id, snap_id) == gen) break;
         db_result_free(r);
-        return api_error(500, "cannot list directory");
+        r = NULL;
+        if (attempt >= 3) return api_error(503, "the snapshot's index is being rebuilt; retry");
     }
 
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
@@ -478,6 +503,9 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
         json_elem_commit(&e);
     }
     db_result_free(r);
+    /* What to pass back as gen with any of these ids (node_gen.h). */
+    if (json_resp_add_i64(resp, "index_gen", gen) != 0)
+        return api_error(500, "out of memory");
 
     char *body = NULL; size_t blen = 0;
     if (json_resp_finalize(resp, &body, &blen) != 0)
@@ -813,7 +841,9 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
                || jrow_elem_add(&e, "type", JCOL_INT, row[3]) != 0
                || jrow_elem_add(&e, "size", JCOL_INT, row[4]) != 0
                || jrow_elem_add(&e, "hash", JCOL_STR_NULL, row[5]) != 0
-               || jrow_elem_add(&e, "may_be_torn", JCOL_BOOL, row[6]) != 0;
+               || jrow_elem_add(&e, "may_be_torn", JCOL_BOOL, row[6]) != 0
+               /* The generation node_id belongs to, to pass back as gen. */
+               || jrow_elem_add(&e, "index_gen", JCOL_INT, row[7]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -2022,6 +2052,18 @@ static api_response_t grep_hits_get(const api_request_t *req, int64_t repo_id,
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     if (json_resp_ensure_array(resp, "hits") != 0) { /* stays absent on OOM */ }
+    /* The index generation the hits' node ids belong to, recorded when the
+     * run started (node_gen.h); null for a run older than the record. */
+    {
+        db_result_t *gr = NULL;
+        static const jcol_t gcol[] = { { "index_gen", 0, JCOL_INT } };
+        int gbad = db_execute(g_ctx.db,
+                "SELECT COALESCE(index_gen, '') FROM grep_runs WHERE repo_id = ? AND id = ?",
+                (const char *[]){ repo, run, NULL }, &gr) != 0 || !gr || gr->nrows != 1
+            || jrow_resp_add_row(resp, gcol, JROW_N(gcol), gr->rows[0]) != 0;
+        db_result_free(gr);
+        if (gbad) { db_result_free(r); return api_error(500, "cannot read search run"); }
+    }
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "hits", &e) != 0) break;

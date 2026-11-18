@@ -27,6 +27,7 @@
 #include "tree_build.h"
 #include "reserved.h"
 #include "db_write.h"
+#include "node_gen.h"
 
 #include <cutils/log.h>
 
@@ -321,6 +322,7 @@ static void note_changed(pipeline_t *p, uint32_t i)
  */
 static void note_unsettled(pipeline_t *p, uint32_t i)
 {
+    db_detect_unsettled(p->opts->detect, p->scan->entries[i].path);
     scan_entry_t *e = &p->scan->entries[i];
     e->node.flags |= MANIFEST_FLAG_UNSETTLED;
     p->links[i].unsettled = 1;
@@ -338,13 +340,29 @@ static void note_unsettled(pipeline_t *p, uint32_t i)
     r->unsettled[r->unsettled_listed++] = path;
 }
 
+/*
+ * The stat the file cache keys an entry on: its own, except that a snapshot
+ * read's entry carries the record root's live device in place of the
+ * snapshot's (scan.h, rec_dev). The rows a snapshot read writes then match
+ * a live read of the same files and the reverse, and the device is still
+ * compared, so a row from another filesystem is never trusted (B229).
+ */
+static const struct stat *cache_key_stat(const scan_entry_t *e, struct stat *buf)
+{
+    if (!e->dev_remapped) return &e->st;
+    *buf = e->st;
+    buf->st_dev = e->rec_dev;
+    return buf;
+}
+
 /* The cache row for a stored file, unless it never settled. */
 static void cache_put(pipeline_t *p, uint32_t i)
 {
     if (p->links[i].unsettled) return;
     scan_entry_t *e = &p->scan->entries[i];
     uint64_t _tp = phase_now();
-    file_cache_put(p->db, p->repo_id, e->path, &e->st,
+    struct stat kst;
+    file_cache_put(p->db, p->repo_id, e->path, cache_key_stat(e, &kst),
                    e->node.content_hash, p->cache_stamp);
     phase_add(p->timers, PHASE_CACHE_PUT, _tp);
 }
@@ -1300,7 +1318,7 @@ static status_t store_delta_cdc(pipeline_t *p, batch_t *b, const cdc_source_t *s
  * regular file: the caller's last entry (unit.json) describes what the
  * ones before it read, so it is produced after them.
  */
-static status_t store_synth_all(pipeline_t *p)
+static status_t store_synth_all(pipeline_t *p, int late)
 {
     const backup_opts_t *o = p->opts;
     if (!o->n_synth) return OK;
@@ -1314,6 +1332,7 @@ static status_t store_synth_all(pipeline_t *p)
         if (p->links[i].synth) at[p->links[i].synth - 1] = i;
     status_t st = OK;
     for (size_t k = 0; k < o->n_synth && st == OK; k++) {
+        if ((o->synth[k].late != 0) != (late != 0)) continue;
         uint32_t i = at[k];
         if (i == UINT32_MAX) { st = set_error(ERR_INVALID, "backup: synthetic entry lost"); break; }
         scan_entry_t *e = &p->scan->entries[i];
@@ -1448,6 +1467,7 @@ static status_t store_content(pipeline_t *p)
                                     p->opts ? p->opts->cancel : NULL,
                                     p->roots, p->opts->one_filesystem,
                                     &p->spool) == OK) {
+            small_pool_set_detector(p->spool, p->opts->detect);
             log_info("backup: small files stored on %u threads, up to %u to a batch",
                      sw, SMALL_BATCH_FILES);
         } else {
@@ -1519,15 +1539,17 @@ static status_t store_content(pipeline_t *p)
 
     p->timers->txn_site = PHASE_COMMIT_STORE;
     /* Under a hold the held roots' files go first and the synthetic
-     * entries (a dump among them) after it is released. */
+     * entries (a dump among them) after it is released. Late synthetic
+     * entries come after both, whatever the order. */
     status_t st;
     if (p->held_pending) {
         st = store_content_loop(p);
-        if (st == OK) st = store_synth_all(p);
+        if (st == OK) st = store_synth_all(p, 0);
     } else {
-        st = store_synth_all(p);
+        st = store_synth_all(p, 0);
         if (st == OK) st = store_content_loop(p);
     }
+    if (st == OK) st = store_synth_all(p, 1);
 
     char why[ERR_MSG_MAX];
     snprintf(why, sizeof(why), "%s", err_msg());
@@ -1749,6 +1771,10 @@ static status_t store_content_loop(pipeline_t *p)
             return mst;
         }
 
+        if (p->opts->detect)
+            db_detect_entry(p->opts->detect, e->path, e->node.type == NODE_TYPE_DIR,
+                            e->node.type == NODE_TYPE_SYMLINK, e->node.size, e->symlink_target);
+
         if (e->node.type == NODE_TYPE_DIR) { p->res->dirs++; continue; }
         if (e->node.type != NODE_TYPE_REG) continue;
 
@@ -1801,11 +1827,21 @@ static status_t store_content_loop(pipeline_t *p)
          */
         uint64_t _tc = phase_now();
         /* Read through a filesystem snapshot: a new device number every
-         * time, the same inodes and times (source-providers.md 4.3). */
+         * time, the same inodes and times (source-providers.md 4.3). An
+         * entry on the snapshot's own device is compared on the record
+         * root's live device (cache_key_stat); one on another device inside
+         * the snapshot (a nested mount, whose number is the capture's too)
+         * is matched without its device, on inode, size and both times.
+         * Whether the live device can be compared is the record root's
+         * filesystem's question: a FUSE share's number changes at every
+         * mount, so there it is not. */
         const char *rpath = e->read_path ? e->read_path : e->path;
+        struct stat kst;
+        const struct stat *key = cache_key_stat(e, &kst);
         unsigned ignore = cache_ignore_for(p, rpath, &e->st) |
-                          (e->read_path ? FILE_CACHE_IGNORE_DEV : 0u);
-        int cache_hit = file_cache_lookup(p->db, p->repo_id, e->path, &e->st,
+                          (e->read_path && !e->dev_remapped ? FILE_CACHE_IGNORE_DEV : 0u) |
+                          (e->dev_remapped ? cache_ignore_for(p, e->path, key) & FILE_CACHE_IGNORE_DEV : 0u);
+        int cache_hit = file_cache_lookup(p->db, p->repo_id, e->path, key,
                                           ignore, e->node.content_hash);
         phase_add(p->timers, PHASE_CACHE_LOOKUP, _tc);
         if (cache_hit) {
@@ -1814,6 +1850,7 @@ static status_t store_content_loop(pipeline_t *p)
             p->res->files++;
             p->res->bytes_logical += e->node.size;
             p->res->files_unchanged++;
+            db_detect_cached(p->opts->detect, e->path, e->node.size);
             continue;
         }
 
@@ -1856,6 +1893,8 @@ static status_t store_content_loop(pipeline_t *p)
         struct stat fst;
         int fd = open_for_store(p, i, &fst);
         if (fd == -1) continue;
+        /* The first page, which the read below fetches anyway. */
+        db_detect_head_fd(p->opts->detect, e->path, fd, (uint64_t)fst.st_size);
 
         if (to_pool) {
             status_t sst = store_pool_submit(p->pool, i, fd, e->node.size);
@@ -2299,14 +2338,37 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
      * the kind above, so nothing about nodes_materialized changes.
      */
     #define NODE_BATCH 2000
+    /* The rows' generation (node_gen.h), drawn before the first batch so a
+     * failed run burns it, and set ahead of the first row. */
+    int64_t gen = 0;
+    status_t gst = node_gen_alloc(p->db, &gen);
+    if (gst != OK) return gst;
+
     batch_t nb;
     memset(&nb, 0, sizeof(nb));
     p->timers->txn_site = PHASE_COMMIT_INDEX;
     status_t bst = db_txn_begin_bulk(p->db);
     if (bst != OK) return bst;
     db_txn_batch_opened(&nb.rule);
+    if (node_gen_set(p->db, p->repo_id, snap_id, gen) != 0) {
+        db_txn_rollback(p->db);
+        return set_error_wrap(ERR_IO, "index_nodes: cannot record the index generation");
+    }
 
     for (uint32_t i = 0; i < p->count; i++) {
+        /*
+         * The daemon stopping does not wait for the index (B218): on a large
+         * tree it takes minutes, and Docker kills a stop after 10 s. The
+         * record is written, so this is the state a power cut here leaves,
+         * which the caller reports (B195) and the next start's reconcile
+         * indexes. A user's cancel still lets the index finish: the
+         * snapshot is done, and cancelling now would only make it slower to
+         * browse.
+         */
+        if (shutdown_requested(p->opts ? p->opts->cancel : NULL)) {
+            db_txn_rollback(p->db);
+            return set_error(ERR_BUSY, "backup cancelled: the daemon is stopping");
+        }
         /* In no tree, so in no index row either: the index is derived from
          * the trees, and a reindex would not bring it back. */
         if (p->links[i].skipped) continue;
@@ -2565,6 +2627,75 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     return st;
 }
 
+/*
+ * Database detection's memory in the file cache (db_detect.h DB_HEAD_*).
+ * Loaded before the store phase, so a file the cache vouches for keeps its
+ * classification; written after it, for the files read this run. Neither
+ * can fail the backup: detection is reporting only, and a classification
+ * lost costs one file going undetected until it next changes.
+ */
+static void detect_load_carry(cutils_db_t *db, int64_t repo_id, db_detector_t *d)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT path, db_head FROM file_cache WHERE repo_id = ? AND db_head <> 0",
+                   (const char *[]){ repo, NULL }, &r) != 0) {
+        log_warn("backup: database detection cannot read earlier classifications: %s", err_msg());
+        err_clear();
+        db_result_free(r);
+        return;
+    }
+    for (int i = 0; r && i < r->nrows; i++)
+        db_detect_carry_add(d, r->rows[i][0], (uint32_t)strtoul(r->rows[i][1], NULL, 10));
+    db_result_free(r);
+}
+
+typedef struct { cutils_db_t *db; const char *repo; int failed; unsigned since; } head_put_t;
+
+/* Short transactions, as db_txn.h asks: a host with thousands of small
+ * SQLite caches has thousands of rows here. */
+#define HEAD_PUT_BATCH 1000u
+
+static void head_put(void *ctx, const char *path, uint32_t code)
+{
+    head_put_t *h = ctx;
+    if (h->failed) return;
+    if (h->since == HEAD_PUT_BATCH) {
+        h->since = 0;
+        if (db_txn_commit(h->db) != OK || db_txn_begin_bulk(h->db) != OK) {
+            h->failed = 2;      /* no transaction open */
+            return;
+        }
+    }
+    h->since++;
+    char c[16];
+    snprintf(c, sizeof(c), "%u", code);
+    if (db_execute_non_query(h->db, "UPDATE file_cache SET db_head = ? WHERE repo_id = ? AND path = ?",
+                             (const char *[]){ c, h->repo, path, NULL }, NULL) != 0)
+        h->failed = 1;
+}
+
+static void detect_save_heads(cutils_db_t *db, int64_t repo_id, const db_detector_t *d)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    head_put_t h = { db, repo, 0, 0 };
+    if (db_txn_begin_bulk(db) != OK) {
+        log_warn("backup: database detection cannot keep classifications: %s", err_msg());
+        err_clear();
+        return;
+    }
+    db_detect_heads_read(d, head_put, &h);
+    if (h.failed) {
+        if (h.failed == 1) db_txn_rollback(db);
+        log_warn("backup: database detection cannot keep classifications");
+    } else if (db_txn_commit(db) != OK) {
+        log_warn("backup: database detection cannot keep classifications: %s", err_msg());
+    }
+    err_clear();
+}
+
 /* One line saying where the bytes went, next to the profile saying where the
  * time went. Ratios are of bytes_logical, the regular-file content this run
  * covered, so an incremental that reads nothing new still reads sensibly. */
@@ -2744,8 +2875,10 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     uint8_t root_hash[OBJECT_HASH_SIZE];
     struct timespec t0, t1, t2, t3;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (opts->detect) detect_load_carry(db, repo_id, opts->detect);
     st = scan_roots_new(scan, &p.roots);
     if (st == OK) st = store_content(&p);
+    if (st == OK && opts->detect) detect_save_heads(db, repo_id, opts->detect);
     links = p.links;            /* the rest's scan may have grown it */
     if (p.imap) { scan_imap_free(p.imap); p.imap = NULL; }
     scan_roots_free(p.roots);

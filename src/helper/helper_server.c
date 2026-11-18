@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "helper_server.h"
+#include "msg_clip.h"
 #include "artefact.h"
 #include "helper_backend.h"
 #include "helper_proto.h"
@@ -343,18 +344,6 @@ static const helper_backend_t *backend_of(const helper_server_t *s, const char *
     return NULL;
 }
 
-/* src into dst, ending "..." when it does not fit. */
-static void clip_copy(char *dst, size_t sz, const char *src)
-{
-    size_t n = strlen(src);
-    if (n < sz) { memcpy(dst, src, n + 1); return; }
-    size_t keep = sz - 4;
-    /* Back to a character boundary: the text is served as JSON. */
-    while (keep > 0 && ((unsigned char)src[keep] & 0xC0u) == 0x80u) keep--;
-    memcpy(dst, src, keep);
-    memcpy(dst + keep, "...", 4);
-}
-
 static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx, int keep_absent,
                               const char *why)
 {
@@ -392,7 +381,7 @@ static unsigned release_holds(helper_server_t *s, hold_pick_fn pick, void *pctx,
         /* Whole, paths and errno (B213); one too long for the report is
          * cut visibly, never silently. */
         char why_failed[SP_RELEASE_ERR_MAX];
-        clip_copy(why_failed, sizeof(why_failed),
+        msg_clip(why_failed, sizeof(why_failed),
                   st != OK && err_msg()[0] ? err_msg() : st == OK && rep.stuck[0] ? rep.stuck : "the release failed");
         int tries = 0;
         int64_t delay = 0;
@@ -451,13 +440,14 @@ static char *resp_error(int64_t id, helper_err_t code, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 static char *resp_error(int64_t id, helper_err_t code, const char *fmt, ...)
 {
-    /* Room for a refusal that names its way round (B210): it was cut at
-     * 511, mid-sentence. */
-    char msg[2048];
+    /* Room for a refusal that names its way round (B210, B223): it was
+     * cut at 511, mid-sentence; one longer still is cut visibly. */
+    char msg[MSG_CLIP_MAX];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
+    int n = vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    msg_clip_after(msg, sizeof(msg), n);
     cJSON *o = cJSON_CreateObject();
     cJSON *e = o ? cJSON_CreateObject() : NULL;
     char *t = NULL;
@@ -591,7 +581,7 @@ static char *op_units_list(helper_server_t *s, const helper_req_t *r)
     list_ctx_t l = { s, arr, b->name };
     if (b->ops->list_units(b->ctx, list_cb, &l) != OK) {
         cJSON_Delete(res);
-        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
+        return resp_error(r->id, HELPER_E_FAILED, "%s", err_msg());
     }
     return resp_ok(r->id, res);
 }
@@ -631,7 +621,7 @@ static char *op_units_describe(helper_server_t *s, const helper_req_t *r, int *p
         return resp_error(r->id, e, "%s", why);
     sp_unit_desc_t *d = NULL;
     if (b->ops->describe(b->ctx, uid, &d) != OK)
-        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
+        return resp_error(r->id, HELPER_E_FAILED, "%s", err_msg());
     int bfd = -1;
     uint64_t boff = 0;
     cJSON *res = cJSON_CreateObject();
@@ -867,7 +857,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
      * error (the others take at most 500), so nothing in it is cut short. It
      * was 512, under the 563 a full-length key needs, and -Wformat-truncation
      * said so in the debug and asan builds. */
-    char fmsg[HELPER_UNIT_KEY_MAX + sizeof(": ") + 400] = "out of memory";
+    char fmsg[MSG_CLIP_MAX] = "out of memory";
     /* Several units of one backend that can capture them together: one
      * pause and one snapshot set for all (6.2), a session each. */
     sp_unit_desc_t *gd[HELPER_UNITS_MAX] = { 0 };
@@ -884,7 +874,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
             const char *uid = NULL;
             (void)backend_of(s, r->units[i], &uid);
             if (b0->ops->describe(b0->ctx, uid, &gd[i]) != OK) {
-                snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
+                msg_clip(fmsg, sizeof(fmsg), err_msg());
                 fail = HELPER_E_FAILED;
             }
         }
@@ -904,7 +894,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
             q.holds = &gh;
             q.daemon8 = s->pol->daemon_id;
             if (b0->ops->begin_group(b0->ctx, (const sp_unit_desc_t *const *)gd, r->n_units, &q, gs, gi) != OK) {
-                snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
+                msg_clip(fmsg, sizeof(fmsg), err_msg());
                 fail = HELPER_E_FAILED;
             }
         }
@@ -936,7 +926,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
             goto have_session;
         }
         if (!b || b->ops->describe(b->ctx, uid, &d) != OK) {
-            snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
+            msg_clip(fmsg, sizeof(fmsg), err_msg());
             fail = HELPER_E_FAILED;
             break;
         }
@@ -979,7 +969,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         /* The journal context outlives begin: end releases through it, so
          * it lives with the member and goes after end. */
         if (st != OK) {
-            snprintf(fmsg, sizeof(fmsg), "%s: %.400s", r->units[i], err_msg());
+            msg_clip_after(fmsg, sizeof(fmsg), snprintf(fmsg, sizeof(fmsg), "%s: %s", r->units[i], err_msg()));
             b->ops->desc_free(d);
             free(j);
             fail = HELPER_E_FAILED;
@@ -1020,7 +1010,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
             if (d->items[k].kind != SP_ITEM_TREE) continue;
             char root[PATH_MAX];
             if (b->ops->tree_root(sess, &d->items[k], root, sizeof(root)) != OK) {
-                snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
+                msg_clip(fmsg, sizeof(fmsg), err_msg());
                 fail = HELPER_E_FAILED;
                 break;
             }
@@ -1033,7 +1023,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
             cJSON *where = cJSON_CreateObject();
             if (!where) break;
             if (b->block_where(sess, &d->items[k], where) != OK) {
-                snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
+                msg_clip(fmsg, sizeof(fmsg), err_msg());
                 cJSON_Delete(where);
                 fail = HELPER_E_FAILED;
                 break;
@@ -1144,6 +1134,12 @@ static char *op_capture_begin_paths(helper_server_t *s, const helper_req_t *r)
     char fmsg[600] = "out of memory";
     helper_err_t fail = res && kind && set && pj ? HELPER_OK : HELPER_E_FAILED;
     size_t n_snap = 0, n_dir = 0;
+    snap_probe_t *probe = NULL;
+    if (fail == HELPER_OK && pb && paths_backend_any_domain(pb) && paths_probe(pb, &probe) != OK) {
+        snprintf(fmsg, sizeof(fmsg), "the host's mount table: %.500s", err_msg());
+        err_clear();
+        fail = HELPER_E_FAILED;
+    }
     for (size_t i = 0; fail == HELPER_OK && i < r->n_paths; i++) {
         for (size_t k = 0; k < i && !kind[i]; k++)
             if (strcmp(r->paths[k], r->paths[i]) == 0) kind[i] = BP_DUP;
@@ -1153,7 +1149,7 @@ static char *op_capture_begin_paths(helper_server_t *s, const helper_req_t *r)
             snprintf(res[i].reason, sizeof(res[i].reason), "the helper's policy lists no ZFS dataset or btrfs pool");
             continue;
         }
-        if (paths_resolve(pb, r->paths[i], &res[i]) != OK) {
+        if (paths_resolve(pb, probe, r->paths[i], &res[i]) != OK) {
             snprintf(fmsg, sizeof(fmsg), "%.300s: %.280s", r->paths[i], err_msg());
             err_clear();
             fail = HELPER_E_FAILED;
@@ -1248,11 +1244,9 @@ static char *op_capture_begin_paths(helper_server_t *s, const helper_req_t *r)
         cJSON_AddStringToObject(kd, p, res[i].dom.kind == SNAP_ZFS ? "zfs" : "btrfs");
         if (res[i].nested_total) {
             cJSON *o = cJSON_CreateObject();
-            cJSON *a = o ? cJSON_AddArrayToObject(o, "mounts") : NULL;
-            for (size_t k = 0; a && k < res[i].n_nested; k++)
-                cJSON_AddItemToArray(a, cJSON_CreateString(res[i].nested[k]));
             if (o) {
                 cJSON_AddNumberToObject(o, "total", (double)res[i].nested_total);
+                cJSON_AddStringToObject(o, "names", res[i].nested);
                 cJSON_AddItemToObject(ns, p, o);
             }
         }
@@ -1282,7 +1276,7 @@ static char *op_capture_begin_paths(helper_server_t *s, const helper_req_t *r)
         }
         if (fail != HELPER_OK) capture_finish(s, &c, SP_END_ABORTED);
     }
-    for (size_t i = 0; res && i < r->n_paths; i++) paths_res_free(&res[i]);
+    snap_probe_free(probe);
     free(res);
     free(kind);
     free(set);
@@ -1382,7 +1376,7 @@ static char *op_hook_run(helper_server_t *s, const helper_req_t *r, int *pass_fd
         if (hst != OK) {
             close(err[0]);
             if (h->dump) close(out[0]);
-            return resp_error(r->id, HELPER_E_FAILED, "hook %s: %.300s", r->hook, err_msg());
+            return resp_error(r->id, HELPER_E_FAILED, "hook %s: %s", r->hook, err_msg());
         }
     } else {
     /* No unit to enter (the fake): the policy's argv runs as given, with no
@@ -2305,7 +2299,7 @@ static char *op_unit_stop_start(helper_server_t *s, const helper_req_t *r, int s
     /* What it was before, so a restore that fails can put that back. */
     int was = b->unit_state ? b->unit_state(b->ctx, uid) : -1;
     if (b->set_running(b->ctx, uid, start) != OK)
-        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
+        return resp_error(r->id, HELPER_E_FAILED, "%s", err_msg());
     cJSON *res = cJSON_CreateObject();
     if (res) cJSON_AddStringToObject(res, "state", start ? "running" : "stopped");
     if (res && was >= 0) cJSON_AddBoolToObject(res, "was_running", was == SP_STATE_RUNNING || was == SP_STATE_PAUSED);
@@ -2388,7 +2382,7 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd
         status_t cst = b->define_check
                      ? b->define_check(b->ctx, uid, passed ? passed : "{}", s->pol) : OK;
         free(passed);
-        if (cst != OK) return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
+        if (cst != OK) return resp_error(r->id, HELPER_E_FAILED, "%s", err_msg());
         cJSON *cr = cJSON_CreateObject();
         if (cr) {
             cJSON_AddBoolToObject(cr, "checked", 1);
@@ -2402,7 +2396,7 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd
     free(passed);
     if (dst != OK) {
         cJSON_Delete(res);
-        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
+        return resp_error(r->id, HELPER_E_FAILED, "%s", err_msg());
     }
     return resp_ok(r->id, res ? res : cJSON_CreateObject());
 }
@@ -2429,7 +2423,7 @@ static char *op_vm_install_state(helper_server_t *s, const helper_req_t *r)
     cJSON *res = NULL;
     if (b->install_state(b->ctx, uid, st.path, st.job, &res) != OK) {
         cJSON_Delete(res);
-        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
+        return resp_error(r->id, HELPER_E_FAILED, "%s", err_msg());
     }
     pthread_mutex_lock(&s->mu);
     stage_drop(s, r->token);
@@ -2478,7 +2472,7 @@ static char *op_vm(helper_server_t *s, const helper_req_t *r)
     cJSON *res = NULL;
     if (b->redefine(b->ctx, uid, r->checkpoint, &res) != OK) {
         cJSON_Delete(res);
-        return resp_error(r->id, HELPER_E_FAILED, "%.400s", err_msg());
+        return resp_error(r->id, HELPER_E_FAILED, "%s", err_msg());
     }
     return resp_ok(r->id, res ? res : cJSON_CreateObject());
 }

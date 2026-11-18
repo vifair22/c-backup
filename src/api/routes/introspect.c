@@ -10,6 +10,7 @@
 #include "store.h"
 #include "store_index.h"
 #include "json_row.h"
+#include "node_queries.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -427,7 +428,8 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
             "   SELECT up.nid, p.parent_node_id, p.name || '/' || up.path, up.depth + 1"
             "     FROM up JOIN nodes p ON p.repo_id = ? AND p.id = up.parent"
             "    WHERE up.parent IS NOT NULL AND up.parent <> 0 AND up.depth < 256)"
-            " SELECT refs.snap_id, refs.nid, n.name, COALESCE('/' || up.path, '')"
+            " SELECT refs.snap_id, refs.nid, n.name, COALESCE('/' || up.path, ''),"
+            "        " NODE_GEN_COL("n")
             "   FROM refs"
             "   JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
             "   LEFT JOIN up ON up.nid = refs.nid"
@@ -457,6 +459,8 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
         static const jcol_t cols[] = {
             { "snap_id", 0, JCOL_INT }, { "node_id", 1, JCOL_INT },
             { "name", 2, JCOL_STR }, { "path", 3, JCOL_STR },
+            /* The generation node_id belongs to (node_gen.h). */
+            { "index_gen", 4, JCOL_INT },
         };
         int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;

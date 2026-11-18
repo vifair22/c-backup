@@ -124,6 +124,22 @@ static const config_key_t app_file_keys[] = {
       "A file that never settles while read: store (flagged) or skip",
       CFG_STORE_FILE, 0 },
 
+    /* Database detection (docs/db-detection.md 12): reporting only, it
+     * never changes how anything is captured. enabled runs the detectors
+     * during backups; sqlite_min_kb is the smallest dormant SQLite file
+     * listed as a finding (smaller ones are counted); notify_uncovered sends
+     * one alert when a live database is first found captured uncovered.
+     * Read once at start (src/ops/db_findings.c). */
+    { "db_detect.enabled", CFG_INT, "1",
+      "Detect databases during backups (reporting only): 1 on, 0 off",
+      CFG_STORE_FILE, 0 },
+    { "db_detect.sqlite_min_kb", CFG_INT, "1024",
+      "Smallest dormant SQLite file, in KiB, listed as a finding",
+      CFG_STORE_FILE, 0 },
+    { "db_detect.notify_uncovered", CFG_INT, "1",
+      "One alert when a live database is first found captured uncovered: 1 on, 0 off",
+      CFG_STORE_FILE, 0 },
+
     /* Chunk workers one backup stores files over 16 MiB on (cdc.h), a
      * quarter of which also cut whole files at once (store_pool.h). 0 sizes
      * them from the CPUs and memory available; 1 stores every chunk on the

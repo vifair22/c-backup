@@ -21,7 +21,9 @@
  * unit 17 keeps units 1 to 16.
  */
 
+#include "db_findings.h"
 #include "error.h"
+#include "msg_clip.h"
 #include "provider.h"
 #include "store.h"
 
@@ -65,14 +67,20 @@ typedef struct {
     char             name[256];
     int64_t          snapshot_id;    /* 0 when it failed */
     status_t         st;
-    char             error[512];
+    char             error[MSG_CLIP_MAX];
     sp_consistency_t achieved;
     uint64_t         bytes_read;     /* disk bytes read */
     uint64_t         files;
     uint64_t         freeze_ms;      /* how long the unit was frozen; 0 when it was not */
     unsigned         n_warnings;
-    char             warning[512];   /* the first, or the one that outranks the rest */
+    char             warning[MSG_CLIP_MAX];   /* the first, or the one that outranks the rest */
     char           **warnings;       /* all n_warnings of them, owned (B202) */
+    /* Database detection (docs/db-detection.md): the job result's
+     * "databases" object, and the record's events for the caller to
+     * journal and alert. Owned; NULL and 0 when detection did not run. */
+    char            *databases_json;
+    db_event_t      *db_events;
+    size_t           n_db_events;
 } unit_backup_one_t;
 
 typedef struct {
@@ -103,6 +111,12 @@ void     unit_backup_result_free(unit_backup_result_t *r);
  * of them at every reboot). Best effort: a checkpoint that cannot be put
  * back costs its disks one full read at their next session, which checks
  * again. *checked, *redefined and *refused (any may be NULL) count them.
+ * A checkpoint of a unit the helper no longer lists (a VM deleted, or out
+ * of its policy) is not asked about: its token is kept, counted in *kept
+ * and said once per unit at debug (NIT-45).
  */
 status_t unit_checkpoints_redefine(cutils_db_t *db, unsigned *checked, unsigned *redefined,
-                                   unsigned *refused);
+                                   unsigned *refused, unsigned *kept);
+/* The same for a provider by name; the daemon only ever asks libvirt. */
+status_t unit_checkpoints_redefine_for(cutils_db_t *db, const char *prov, unsigned *checked,
+                                       unsigned *redefined, unsigned *refused, unsigned *kept);

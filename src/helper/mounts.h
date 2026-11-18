@@ -13,6 +13,7 @@
 
 #include <limits.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 #define MOUNT_ROOTS_MAX 16
 
@@ -78,13 +79,16 @@ status_t mount_classify(const mount_cfg_t *c, const char *type, const char *sour
 status_t mount_resolve(const mount_cfg_t *c, const char *path, mount_class_t *out);
 
 /*
- * The mount points strictly below path in the host's mount table, the
- * snapshot machinery (.zfs, .cbackup-snapshots) left out: what a snapshot of
- * path's filesystem would show as empty directories. Up to max of them are
- * strdup'd into out (the caller frees them), *total counts every one.
+ * Every mount point in a mount table, leaving out c-backup's own snapshot
+ * machinery (ZFS automounts under .zfs, anything under .cbackup-snapshots).
+ * *out is malloc'd, each entry too; free with mount_points_free.
  */
-status_t mount_below(const char *mountinfo, const char *path, char **out, size_t max,
-                     size_t *n_out, size_t *total);
+status_t mount_points(const char *mountinfo, char ***out, size_t *n);
+static inline void mount_points_free(char **v, size_t n)
+{
+    for (size_t i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
 
 /*
  * The helper's own layout, checked before it starts (B186). Refused

@@ -443,6 +443,7 @@ check "commits are counted" "yes" "$([ "${COMMITS:-0}" -gt 0 ] && echo yes || ec
 for name in 'cbackup_db_txn_wait_seconds_total{queue="priority"}' cbackup_db_txn_commit_seconds_total \
             cbackup_db_txn_commit_frames_total 'cbackup_checkpoint_rounds_total{locked="yes"}' \
             cbackup_checkpoint_lock_seconds_total cbackup_checkpoint_lock_max_seconds \
+            cbackup_checkpoint_lock_wait_seconds_total cbackup_checkpoint_lock_wait_max_seconds \
             cbackup_checkpoint_frames_copied_total cbackup_checkpoint_throttle_waits_total \
             cbackup_checkpoint_throttle_timeouts_total cbackup_checkpoint_throttle_seconds_total \
             cbackup_wal_frames_max; do
@@ -468,11 +469,13 @@ check "bytes written is pack plus parity" "${BW:-none}" "$(( ${BWP:-0} + ${BWPP:
 RESULT_KEYS=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"result":{\([^}]*\)}.*/\1/p' \
               | grep -o '"[a-z_]*":' | tr -d '":' | tr '\n' ' ')
 check "the backup result carries exactly its keys" \
-    "snapshot_id files dirs files_unchanged bytes_logical objects_new bytes_stored trees_new trees_reused store_workers bytes_written bytes_written_pack bytes_written_pack_parity files_skipped skipped skipped_listed files_changed changed changed_listed changed_unsettled unsettled unsettled_listed " \
+    "snapshot_id files dirs files_unchanged bytes_logical objects_new bytes_stored trees_new trees_reused store_workers bytes_written bytes_written_pack bytes_written_pack_parity files_skipped skipped skipped_listed files_changed changed changed_listed changed_unsettled unsettled unsettled_listed databases findings listed total sqlite_small " \
     "$RESULT_KEYS"
 contains "and a clean backup left nothing out" '"files_skipped":0,"skipped":[],"skipped_listed":0,' "$JOB_BODY"
 contains "and saw nothing change under it" '"files_changed":0,"changed":[],"changed_listed":0,' "$JOB_BODY"
-contains "and kept nothing that never settled" '"changed_unsettled":0,"unsettled":[],"unsettled_listed":0}' "$JOB_BODY"
+contains "and kept nothing that never settled" '"changed_unsettled":0,"unsettled":[],"unsettled_listed":0,' "$JOB_BODY"
+# Database detection (docs/db-detection.md): reported on every backup, here none.
+contains "and found no database" '"databases":{"findings":[],"listed":0,"total":0,"sqlite_small":0}}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -1170,6 +1173,68 @@ well_formed "gc job body is well formed" "$(sock_body "/jobs/$GC_JOB")"
 well_formed "job list is well formed"    "$(sock_body /jobs)"
 sleep 1
 contains "journal readable" 'entries' "$(sock_body /repos/1/journal)"
+
+# Node ids are index handles that a reindex renumbers, so every response
+# with node ids carries the snapshot's index generation, and a node id passed
+# back with a stale one is refused rather than read as whatever now has that
+# id (node_gen.h). Without gen, the route behaves as it always did.
+echo "node index generations"
+for j in $(sock_body '/jobs?limit=50' | grep -o '"id":[0-9]*' | sed 's/"id"://'); do
+    wait_job "$j"   # nothing else holding repo 1 while the reindex below runs
+done
+NG_S=$(sock_body '/repos/1/snapshots?limit=1' | grep -oE '"id":[0-9]+' | head -1 | tr -dc '0-9')
+gen_of() { printf '%s' "$1" | sed -n 's/.*"index_gen":\([0-9]*\).*/\1/p'; }
+first_dir() { printf '%s' "$1" | grep -o '"id":[0-9]*,"name":"[^"]*","type":2' \
+                  | head -1 | sed 's/"id":\([0-9]*\).*/\1/'; }
+NG_T1=$(sock_body "/repos/1/snapshots/$NG_S/tree?parent=0")
+NG_G1=$(gen_of "$NG_T1")
+NG_D1=$(first_dir "$NG_T1")
+check "a tree page carries its index generation" 1 \
+    "$([ -n "$NG_G1" ] && [ "$NG_G1" -gt 0 ] && echo 1 || echo 0)"
+check "a node id passed back with its generation is served" 200 \
+    "$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1&gen=$NG_G1")"
+NG_SUB1=$(sock_body "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1")
+contains "a search result carries its generation" "\"index_gen\":$NG_G1" \
+    "$(sock_body "/repos/1/search?q=txt&snapshot=$NG_S")"
+contains "an object reference carries its generation" '"index_gen":' \
+    "$(sock_body "/repos/1/objects/$OBJ/refs")"
+NG_GJ=$(job_id "$(sock_send POST /repos/1/grep "{\"pattern\":\".\",\"snapshot\":$NG_S}")")
+wait_job "$NG_GJ"
+NG_RUN=$(sock_body '/repos/1/grep?limit=1' | grep -o '"id":[0-9]*' | head -1 | sed 's/"id"://')
+NG_HITS=$(sock_body "/repos/1/grep/$NG_RUN")
+contains "grep hits carry the generation they were read in" "\"index_gen\":$NG_G1" "$NG_HITS"
+contains "and name a node" '"node_id":' "$NG_HITS"
+check "a gen that is not a number is a 400" 400 \
+    "$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1&gen=x")"
+
+NG_RX=$(job_id "$(sock_send POST /repos/1/reindex)")
+wait_job "$NG_RX"
+contains "the reindex completes" '"state":"completed"' "$(sock_body "/jobs/$NG_RX")"
+NG_T2=$(sock_body "/repos/1/snapshots/$NG_S/tree?parent=0")
+NG_G2=$(gen_of "$NG_T2")
+NG_D2=$(first_dir "$NG_T2")
+check "the reindex gave the snapshot a new generation" 1 \
+    "$([ -n "$NG_G2" ] && [ "$NG_G2" != "$NG_G1" ] && echo 1 || echo 0)"
+check "and renumbered its nodes" 1 "$([ "$NG_D2" != "$NG_D1" ] && echo 1 || echo 0)"
+check "a node id with the old generation is refused" 409 \
+    "$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1&gen=$NG_G1")"
+contains "telling the client to re-resolve" '"error":"index rebuilt; re-resolve by path"' \
+    "$(sock_body "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1&gen=$NG_G1")"
+check "so is the root with the old generation" 409 \
+    "$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=0&gen=$NG_G1")"
+NG_OLD=$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=$NG_D1")
+check "without gen the old id is answered as before, never 409" 1 \
+    "$([ "$NG_OLD" = 200 ] || [ "$NG_OLD" = 404 ] && echo 1 || echo 0)"
+check "the new id with the new generation is served" 200 \
+    "$(sock_code "/repos/1/snapshots/$NG_S/tree?parent=$NG_D2&gen=$NG_G2")"
+NG_SUB2=$(sock_body "/repos/1/snapshots/$NG_S/tree?parent=$NG_D2&gen=$NG_G2")
+check "and lists what the old id listed" \
+    "$(printf '%s' "$NG_SUB1" | grep -o '"name":"[^"]*"' | tr '\n' ' ')" \
+    "$(printf '%s' "$NG_SUB2" | grep -o '"name":"[^"]*"' | tr '\n' ' ')"
+contains "a search names the new generation" "\"index_gen\":$NG_G2" \
+    "$(sock_body "/repos/1/search?q=txt&snapshot=$NG_S")"
+contains "an earlier grep run keeps the generation it read" "\"index_gen\":$NG_G1" \
+    "$(sock_body "/repos/1/grep/$NG_RUN")"
 
 # Exclusions reach the engine only if the route parses them. It did not: the
 # field looked accepted and was ignored, so every backup took the whole tree.
@@ -2229,6 +2294,38 @@ contains "unencrypted into unencrypted needs no flag" '"state":"completed"' \
     "$(sock_body "/jobs/$P2_JOB")"
 check "and is not journalled as a plaintext copy" 0 \
     "$(sock_body /repos/1/journal | grep -c 'into plaintext')"
+
+echo "database detection"
+# docs/db-detection.md, D0: a backup reports the databases it read, judges a
+# live read of one as uncovered, alerts once and journals it. A WAL-mode
+# SQLite header (the 16-byte magic, a page size, format versions 2 and 2)
+# with its -wal beside it is a live database; a text file named *.db is not.
+DBS="$R/dbsrc"
+mkdir -p "$DBS/app"
+printf 'SQLite format 3\000\020\000\002\002' > "$DBS/app/live.db"
+head -c 4096 /dev/zero >> "$DBS/app/live.db"
+: > "$DBS/app/live.db-wal"
+printf 'just text, not a database\n' > "$DBS/app/notes.db"
+DB_OUT=$(sock_send POST /repos "{\"path\":\"$R/dbrepo\",\"label\":\"db\"}")
+contains "a repository for it" ' 201' "$DB_OUT"
+DB_ID=$(printf '%s' "$DB_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+DB_JOB=$(job_id "$(sock_post "/repos/$DB_ID/backup" "{\"paths\":[\"$DBS\"]}")")
+wait_job "$DB_JOB"
+DB_BODY=$(sock_body "/jobs/$DB_JOB")
+contains "a backup reports the live database it read" '"engine":"sqlite"' "$DB_BODY"
+contains "at its path" "\"path\":\"$DBS/app/live.db\"" "$DB_BODY"
+contains "read live, so uncovered" '"coverage":"uncovered"' "$DB_BODY"
+contains "with the engine copy to enable" '"suggestion":"sqlite-backup"' "$DB_BODY"
+check "never a file only named like one" 0 "$(printf '%s' "$DB_BODY" | grep -c 'notes.db')"
+contains "alerted, as the job's warning" 'live database captured uncovered' "$DB_BODY"
+contains "and journalled" 'database found: live SQLite' "$(sock_body "/repos/$DB_ID/journal")"
+DB_UNC=$(sock_body /metrics | sed -n 's/^cbackup_db_findings{coverage="uncovered"} \([0-9]*\)$/\1/p')
+check "counted by coverage" yes "$([ "${DB_UNC:-0}" -ge 1 ] && echo yes || echo "no: $DB_UNC")"
+DB_JOB2=$(job_id "$(sock_post "/repos/$DB_ID/backup" "{\"paths\":[\"$DBS\"]}")")
+wait_job "$DB_JOB2"
+DB_BODY2=$(sock_body "/jobs/$DB_JOB2")
+contains "found again on the next backup" '"engine":"sqlite"' "$DB_BODY2"
+check "but alerted only once" 0 "$(printf '%s' "$DB_BODY2" | grep -c 'captured uncovered')"
 
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null

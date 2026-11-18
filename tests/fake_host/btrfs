@@ -5,7 +5,9 @@
 #
 #   $FAKE_HOST_STATE/subvols    "<path>\t<uuid>\t<parent uuid>\t<ro>" per line
 #   $FAKE_HOST_STATE/btrfs.log  every invocation
-#   FAKE_BTRFS_FAIL=<word>      "snapshot" or "delete" exits 1
+#   FAKE_BTRFS_FAIL=<word>      "snapshot", "delete" or "list" exits 1
+#   $FAKE_HOST_STATE/subvol_list `btrfs subvolume list` lines, printed as
+#                               they are ("ID 258 gen 9 top level 5 path a/b")
 set -u
 S=${FAKE_HOST_STATE:?FAKE_HOST_STATE is not set}
 touch "$S/subvols"
@@ -46,6 +48,8 @@ case "$1 $2" in
     [ -n "$(field "$p" 2)" ] || { echo "ERROR: Not a Btrfs subvolume: $p" >&2; exit 1; }
     rm -rf "${p:?}"
     awk -F'\t' -v p="$p" '$1 != p' "$S/subvols" > "$S/subvols.new" && mv "$S/subvols.new" "$S/subvols" ;;
+"subvolume list")
+    cat "$S/subvol_list" 2>/dev/null; exit 0 ;;
 "property get")
     [ "$3 $5" = "-ts ro" ] || { echo "fake btrfs: property get $* not understood" >&2; exit 2; }
     r=$(field "$4" 4); echo "ro=${r:-false}" ;;

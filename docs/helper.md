@@ -366,10 +366,12 @@ helper's, as for `capture.begin`:
   reads it inside the snapshot, built by the helper; `kinds` says `zfs`,
   `btrfs` or `dir` (a test `dir_domains` path, read in place); `live` maps
   every path it did not snapshot to the reason (not resolvable, a host
-  facility, split across devices, on no domain the policy lists); `nested`
-  lists, per snapshotted path, the mounts below it in the host's mount
-  table (the snapshot machinery under `.zfs` and `.cbackup-snapshots`
-  left out), which the snapshot shows as empty directories; `snapshots`
+  facility, split across devices, on no domain the policy lists, what lies
+  below it cannot be checked); `nested` gives, per snapshotted path, how
+  many mounts and btrfs subvolumes lie below it and the first three by
+  name (`{"total","names"}`, B231's probe: the mount table and one `btrfs
+  subvolume list` per pool, the snapshot machinery left out), which the
+  snapshot shows as empty directories; `snapshots`
   names each snapshot by domain. With at least one path snapshotted it
   also carries `capture`, `expires` and `snapshot_ms`.
 - **No action outside the policy.** For a path it does not snapshot the

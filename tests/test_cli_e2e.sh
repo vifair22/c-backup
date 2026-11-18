@@ -157,6 +157,9 @@ contains "and is on stderr" '"error"' "$(cb summary 99 2>&1 >/dev/null)"
 contains "command --help shows its usage" "usage: c-backup repo" "$(cb repo add --help)"
 check    "command --help exits 0" 0 "$(cb backup --help >/dev/null; echo $?)"
 contains "help <command>" "usage: c-backup restore" "$(cb help restore)"
+# B220: every command that waits for a job takes --timeout.
+contains "a waiting command offers --timeout" "[--timeout SECONDS]" "$(cb help backup)"
+contains "repo repair waits too" "[--timeout SECONDS]" "$(cb help repo repair)"
 contains "repo list" '"path"' "$(cb repo list)"
 contains "repo show" '"uuid"' "$(cb repo show 1)"
 
@@ -170,6 +173,10 @@ contains "jobs list"     '"action"'            "$(cb jobs)"
 contains "snapshots"     '"id":1,'             "$(cb snapshots 1)"
 contains "ls"            '"name"'              "$(cb ls 1 1)"
 contains "search"        'one.txt'             "$(cb search 1 txt)"
+# B220: a job that ends inside --timeout reports as it would without it.
+OUT=$(cb gc 1 --timeout 600 2>&1); RC=$?
+check    "a bounded wait on a job that ends in time exits 0" 0 "$RC"
+contains "and prints the job" '"state":"completed"' "$OUT"
 # B074: these were silently replaced by the defaults.
 # Written --limit=-1: spaced, a value starting with a dash is refused by the
 # CLI as a missing one (B127), and this checks what the daemon says.
@@ -901,6 +908,17 @@ if [ -n "$LOSS_DAT" ]; then
         *'"status":"unwalkable pack"'*) bad "with no unwalkable pack" "none" "$OUT" ;;
         *)                              ok  "with no unwalkable pack" ;;
     esac
+    # Data loss is ERR_CORRUPT, and its one alert goes at priority high.
+    LJ=$(cb jobs --limit 1 | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    N=0
+    for _ in $(seq 1 100); do
+        N=$(grep -c "failure notification for job $LJ not sent" "$WORK/daemon.log")
+        [ "$N" -ge 1 ] && break
+        sleep 0.1
+    done
+    check    "a verify finding loss alerts once" 1 "$N"
+    contains "at priority high" "(priority high: damage beyond repair)" \
+        "$(grep "failure notification for job $LJ not sent" "$WORK/daemon.log")"
     contains "verify show reads the failed run back" '"findings"' \
         "$(cb verify show "$LOSS_ID" "$(printf '%s' "$OUT" | sed -n 's/.*"runs":\[{"id":\([0-9]*\),.*/\1/p')")"
     # A failed run is still a completed walk, and the gauge reads those.
@@ -1641,6 +1659,8 @@ if damage_beyond_parity "$WORK/dmgsrc/lost.bin" "$DMG_DAT"; then
     DJ=$(job_of "$ERR")
     if [ -n "$DJ" ] && alerted "$DJ"; then ok "the failure alert was composed, and not claimed as sent"
     else bad "the failure alert was composed, and not claimed as sent" "a notification for job '$DJ'" "none"; fi
+    check    "once, at priority high" 1 \
+        "$(grep -c "failure notification for job $DJ not sent.*(priority high: damage beyond repair)" "$WORK/daemon.log")"
 else
     bad "damage fixture" "the file's bytes in the pack" "not found"
 fi
@@ -1668,6 +1688,8 @@ if [ -n "$GCD_DAT" ] && damage_beyond_parity "$WORK/gcdsrc/keep.bin" "$GCD_DAT";
     GJ=$(job_of "$ERR")
     if [ -n "$GJ" ] && alerted "$GJ"; then ok "the gc failure alert was composed, and not claimed as sent"
     else bad "the gc failure alert was composed, and not claimed as sent" "a notification for job '$GJ'" "none"; fi
+    check    "once, at priority high" 1 \
+        "$(grep -c "failure notification for job $GJ not sent.*(priority high: damage beyond repair)" "$WORK/daemon.log")"
 else
     bad "gc damage fixture" "the file's bytes in the pack" "not found"
 fi
@@ -1971,6 +1993,8 @@ VALUE_SWEEP=(
     "schedule add|1 replicate|--every"
     "repo add|$WORK/sweep|--encrypt"
     "repo add|$WORK/sweep|--passphrase"
+    "backup|1 $WORK/src|--timeout"
+    "reindex|1|--timeout"
 )
 for row in "${VALUE_SWEEP[@]}"; do
     CMD="${row%%|*}"
@@ -2011,6 +2035,11 @@ CHOICE_SWEEP=(
     "schedule add|1 backup --every year --at 01:00 --on-day 3|--every year needs --on-month N"
     "schedule add|1 backup --every month --at 01:00 --on-day 3 --on-month 2|--on-month is for --every year, not month"
     "schedule add|1 backup 60 --at 01:00|they need --every"
+    "backup|1 $WORK/src --timeout 0|--timeout takes whole seconds from 1 to 31536000, not '0'"
+    "gc|1 --timeout 1.5|--timeout takes whole seconds from 1 to 31536000, not '1.5'"
+    "verify|1 --timeout 2h|--timeout takes whole seconds from 1 to 31536000, not '2h'"
+    "repo repair|1 --timeout=-1|--timeout takes whole seconds from 1 to 31536000, not '-1'"
+    "backup|1 $WORK/src --timeout 60 --no-wait|--timeout bounds a wait, and --no-wait does not wait"
 )
 for row in "${CHOICE_SWEEP[@]}"; do
     CMD="${row%%|*}"

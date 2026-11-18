@@ -154,7 +154,7 @@ void file_cache_put(cutils_db_t *db, int64_t repo_id, const char *path,
             "   size = excluded.size, mtime_ns = excluded.mtime_ns,"
             "   ctime_ns = excluded.ctime_ns,"
             "   content_hash = excluded.content_hash,"
-            "   seen_at = excluded.seen_at",
+            "   seen_at = excluded.seen_at, db_head = 0",
             (const char *[]){ repo, path, dev, ino, size, mt, ct, hex, seen, NULL },
             NULL) != 0)
         log_warn("file cache: cannot record %s", path);
