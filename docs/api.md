@@ -713,8 +713,17 @@ A snapshot whose nodes are not resident cannot be checked up front, so for
 that one a subpath that matches nothing fails the job with the same message
 instead of reporting a restore that wrote nothing.
 
+The body may also carry `"prefer_engine_copy":true` (`db-detection.md`
+9.5): a database with an engine copy in the snapshot, under
+`/.cbackup-captures/`, is restored from the copy at its original path, and
+its `-wal`, `-shm` and `-journal` are left out, since the old WAL beside a
+complete copy would corrupt it.
+
 A restore job's `result` is `files`, `dirs`, `symlinks`, `hardlinks`,
-`specials`, `bytes`, `skipped`, `kept` and `failed`. Without `overwrite`, a
+`specials`, `bytes`, `skipped`, `kept` and `failed`, and
+`engine_copies` (databases restored that have an engine copy in the
+snapshot), `engine_copies_used` (restored from it) and
+`engine_siblings_left_out`. Without `overwrite`, a
 regular file already at its path with the snapshot's size and an mtime
 within two seconds of the snapshot's counts as `skipped` (an earlier run
 restored it); anything else there is left alone and counted as `kept`.
@@ -1232,9 +1241,9 @@ small-file workers. The job still completes (Manual section 6.3), and says so:
 | `changed` | The first 100 of them, as paths; `[]` when none |
 | `changed_listed` | How many `changed` holds |
 | `changed_unsettled` | Files still changing on the second read and stored as it found them, flagged as possibly torn (`backup.unsettled: store`, the default). Not in `files_changed`. Always present |
-| `unsettled` | The first 100 of them, each `{"path"}`; `[]` when none |
+| `unsettled` | The first 100 of them, each `{"path"}`, with `"why"` when the file is a detected database: what it is, and whether a consistent engine copy is in the snapshot (`db-detection.md` 9.5); `[]` when none |
 | `unsettled_listed` | How many `unsettled` holds |
-| `databases` | What database detection found in what the backup read (`db-detection.md`): `{"findings":[...],"listed":N,"total":N,"sqlite_small":N}`. Present on every completed backup while `db_detect.enabled` is 1. Each finding has `id` (its row in `db_findings`), `engine`, `version` (when known), `path`, `confidence` (`live`, `dormant`), and for a live one `coverage` with `coverage_why`, `method` (`live-read` for a file source), `suggestion` and `optional` (template or action names, section 6 of the design), `unsettled` (files under it that changed during their read) and `evidence` (an object: the marker files, links, journal mode). At most 200 are listed; `sqlite_small` counts dormant SQLite files under `db_detect.sqlite_min_kb`, which are not listed |
+| `databases` | What database detection found in what the backup read (`db-detection.md`): `{"findings":[...],"listed":N,"total":N,"sqlite_small":N}`. Present on every completed backup while `db_detect.enabled` is 1. Each finding has `id` (its row in `db_findings`), `engine`, `version` (when known), `path`, `confidence` (`live`, `dormant`), and for a live one `coverage` with `coverage_why`, `method` (`live-read` for a file source), `suggestion` and `optional` (template or action names, section 6 of the design), `unsettled` (files under it that changed during their read) and `evidence` (an object: the marker files, links, journal mode). At most 200 are listed; `sqlite_small` counts dormant SQLite files under `db_detect.sqlite_min_kb`, which are not listed. When the backup made engine copies, `captures` lists each: `path`, `engine`, `method` (`sqlite-online-backup`), `finding`, `time`, `outcome` (`ok`, `refused`, `abandoned`, `failed`), `copy` (its path in the snapshot, or `null` with a `reason`), `size`, `journal_mode` and `settle` (`settled` or `unsettled`, how the raw file read) |
 
 A file is skipped for still changing on its second read only under
 `backup.unsettled: skip`; by default it is stored and counted in

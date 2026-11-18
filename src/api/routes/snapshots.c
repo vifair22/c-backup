@@ -885,6 +885,7 @@ typedef struct {
     char           *dest;
     char           *subpath;
     int             overwrite;
+    int             prefer_engine_copy;
     int             dry_run;
     verify_level_t  verify_level;
     int             verify_repair;
@@ -1565,6 +1566,7 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         memset(&o, 0, sizeof(o));
         o.subpath      = j->subpath;
         o.overwrite    = j->overwrite;
+        o.prefer_engine_copy = j->prefer_engine_copy;
         o.cancel       = cancel;
         o.progress_cb  = progress;
         o.progress_ctx = progress_ctx;
@@ -1579,16 +1581,20 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         /* What was restored, on the job: the counts the Manual promises and
          * the log had, where the job showed only the snapshot's entry count.
          * Recorded on failure too, since that is when "failed" matters. */
-        char rj[384];
+        char rj[512];
         snprintf(rj, sizeof(rj),
                  "{\"files\":%llu,\"dirs\":%llu,\"symlinks\":%llu,"
                  "\"hardlinks\":%llu,\"specials\":%llu,\"bytes\":%llu,"
-                 "\"skipped\":%llu,\"kept\":%llu,\"failed\":%llu}",
+                 "\"skipped\":%llu,\"kept\":%llu,\"failed\":%llu,"
+                 "\"engine_copies\":%llu,\"engine_copies_used\":%llu,"
+                 "\"engine_siblings_left_out\":%llu}",
                  (unsigned long long)rr.files, (unsigned long long)rr.dirs,
                  (unsigned long long)rr.symlinks, (unsigned long long)rr.hardlinks,
                  (unsigned long long)rr.specials, (unsigned long long)rr.bytes,
                  (unsigned long long)rr.skipped, (unsigned long long)rr.kept,
-                 (unsigned long long)rr.failed);
+                 (unsigned long long)rr.failed, (unsigned long long)rr.engine_copies,
+                 (unsigned long long)rr.engine_copies_used,
+                 (unsigned long long)rr.engine_siblings_left_out);
         job_set_result(progress_ctx, rj);
     }
 
@@ -1859,6 +1865,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         if (jreq_flag(body, "overwrite", &j->overwrite) != 0) {
             snap_job_free(j);
             return api_error(400, "overwrite must be true or false");
+        }
+        if (jreq_flag(body, "prefer_engine_copy", &j->prefer_engine_copy) != 0) {
+            snap_job_free(j);
+            return api_error(400, "prefer_engine_copy must be true or false");
         }
         if (jreq_str(body, "subpath", &j->subpath, &je) == JREQ_BAD) {
             snap_job_free(j);

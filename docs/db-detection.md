@@ -1,7 +1,7 @@
 # Database detection and consistent capture
 
-Design document, being built in phases (section 8): D0 is built; section
-14 records what it settled. It replaces one-off,
+Design document, being built in phases (section 8): D0 and D3 are built;
+section 14 records what they settled. It replaces one-off,
 per-application hook decisions (such as an Immich `pg_dumpall`) with a
 general mechanism. c-backup recognises live databases in what it backs up,
 judges whether the capture it is already making covers them consistently,
@@ -709,3 +709,23 @@ design left open or sketched differently:
 | Suggestions | Names from section 6 and 7.2; for file sources, `sqlite-backup` (the daemon's copy, 9.2) or `source-snapshot` (9.4) |
 | Deferred to D1 | `hint` confidence and the Nextcloud link need `units.describe`'s image, arguments and other units' names; D0 reports Nextcloud's `dbtype` only |
 | Test fixtures | Built by `tests/test_db_detect.c` into scratch, not committed under `tests/fixtures/db/`: half are binary headers, which read better as the bytes they are |
+
+### 14.2 D3
+
+`src/ops/sqlite_copy.c` makes the copy; `src/ops/db_capture.c` plans the
+copies from enabled findings, supplies them to the backup as synthetic
+entries under `/.cbackup-captures/` (`backup_opts_t.captures`), writes
+`index.json` and the 9.5 messages. Restore (`prefer_engine_copy`) and
+verify read the snapshot and `db_findings`.
+
+| Point | As built |
+|---|---|
+| What enables a copy | A `db_findings` row in a `source:` scope, engine `sqlite`, state `enabled`, template `sqlite-backup`, optional params `{"allow_rollback_lock":true}`; D2's enable route writes it. Detection off means no copies: the plan needs the backup's detector, which also carries the read-once set to every store thread |
+| When the copy is made | When its synthetic entry is opened, before the content loop opens any regular file: so tmp/ holds one copy at a time, and no descriptor of the backup's is open on the database while SQLite holds its locks (POSIX locks are per process) |
+| One step | `sqlite3_backup_step(-1)` copies in one read transaction, a WAL snapshot of one commit, so writers never restart it; only a lock not got within the busy timeout makes it try again, and three such tries abandon it |
+| A copy not made | The synthetic entry's `keep` says "leave out, uncounted" (new: `keep` below 0), so it is not counted among unreadable files; `index.json`, the result and the log say why |
+| Read once | `cdc_opts_t.settle_reads`, set to 1 by every store path for a file with a copy; the flag is still set if it moved |
+| index.json | Stored last (`late`), so it can say how each raw file settled |
+| Restore | `prefer_engine_copy` swaps in the copy's content at the original path (owner, mode and mtime stay the original's), and leaves out `-wal`, `-shm` and `-journal` of a database that has a copy. A flagged database without it names the copy and the flag; one with no copy but a finding names the finding |
+| Verify | Each sample path of the unsettled notice that a SQLite finding names gets a notice of its own with the explanation and the finding id |
+| Reservation | Already in place since `reserved.h`: sources at or under `/.cbackup-captures` are refused, and a source of `/` never records the name |
