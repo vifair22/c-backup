@@ -126,6 +126,7 @@ typedef struct {
     /* restore.stage */
     char        mount[HELPER_PATH_MAX + 1];
     int64_t     job;
+    int         check;       /* restore.stage: every refusal, nothing created (B189) */
     /* Where the backup found the mount's bytes (unit.json's source), ""
      * when the daemon sent none; checked against where it is now (B178). */
     char        real[HELPER_PATH_MAX + 1];

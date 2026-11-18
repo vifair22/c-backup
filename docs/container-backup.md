@@ -702,8 +702,12 @@ docker run -d --name c-backup-helper --restart unless-stopped \
 ```
 
 It runs host tools as `nsenter -t 1 -m -- zfs ...` and
-`nsenter -t 1 -m -n -- lxc-freeze ...`, so it always uses the host's own
-`zfs` 2.4.4 and `lxc-*`, with no version skew. `--network=none` means it
+`nsenter -t 1 -m -n -C -- lxc-freeze ...`, so it always uses the host's own
+`zfs` 2.4.4 and `lxc-*`, with no version skew. `lxc-*` also enter the
+host's network namespace (LXC's command socket is abstract) and cgroup
+namespace (B190): from the helper's own, `lxc-start` fails `Failed to open
+10/../..: Invalid cross-device link`, and from the host's it puts the
+container in the host's cgroup tree, as a start on the host would. `--network=none` means it
 has no network listener at all; its only interface is the socket in
 `/run/c-backup-helper` (0660, peer uid checked). Its policy file on the
 flash names the units, snapshot domains and hooks it will act on; anything
@@ -867,6 +871,42 @@ user decides; running both means keeping its downtime meanwhile.
      override file. Without the helper, the files and data are restored and
      the user runs compose.
 5. **Start** only if asked (`start: true`).
+
+**In place, the restored volumes are attached by name (B188).** The data
+of a volume is swapped in at the volume's own directory, so the
+re-created container must mount that volume. One named in the recorded
+`HostConfig` is; an anonymous one is named only in `Config.Volumes`, and
+Docker gave the re-created container a new, empty one. The helper adds
+each recorded volume whose destination nothing in `HostConfig` covers to
+`Binds` as `<name>:<destination>`. (A compose re-create keeps a
+service's anonymous volumes itself.)
+
+**A copy under a new name mounts nothing of the original's (B188).** The
+recorded definition names the original's volumes and bind paths; created
+from it as recorded, a copy mounted the original's live volume, so a
+restore meant as a look at old data wrote to, and served, production, and
+an anonymous volume came back empty with the restored data unattached.
+The daemon rewrites every mount (`HostConfig.Binds`, `HostConfig.Mounts`,
+and each volume of the inspect's `Mounts`, anonymous ones included) to a
+bind of its restored copy under `target_root`, and passes `target_root`
+with the definition (for compose, each service's recorded `mounts` too).
+The helper creates the container, so it holds the rule itself: every bind
+source under `target_root` and inside none of the original's mounts, no
+volume by name, no `VolumesFrom`, every recorded mount replaced. Host
+binds follow a fixed rule: `/proc`, `/sys`, `/etc/localtime`,
+`/etc/timezone`, the Docker socket and `/dev` character devices (or a
+`/dev` directory with no block device in it) are kept as recorded; a
+block device anywhere, judged by `S_ISBLK` on the host path after
+following links (by-id, mapper), as a bind or in `Devices`, and anything
+else under `/etc`, under `/run` or `/var/run`, or under `/boot`, is
+refused, the error naming `<host path> -> <container path>` and the
+reason. Paths are resolved in the host's tree one component at a time, so
+a restored symlink cannot point a data bind out of `target_root` either. It refuses otherwise, in the
+define check too, so before the daemon writes anything. After the create
+and before any start it inspects what Docker made and removes a container
+that mounts a volume that existed before the restore or a bind outside
+`target_root` (a compose copy is created `--no-start`, checked, then
+started), which covers mounts the definition does not show.
 
 `define` for LXC: write `config` and the rootfs to `<lxcpath>/<name or new
 name>/`, rewriting `lxc.rootfs.path` and `lxc.uts.name`, and regenerating

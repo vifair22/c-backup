@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include <cmocka.h>
@@ -71,7 +72,7 @@ static void put(const char *path, const char *text)
 
 static int has(const char *path, const char *text)
 {
-    char buf[512] = "";
+    char buf[16384] = "";
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
@@ -459,10 +460,20 @@ static void test_define(void **state)
     /* Under a new name, the digest gone: the tag, with a warning; pinned:
      * refused. */
     fdk.digest_gone = 1;
-    assert_int_not_equal(define(",\"name\":\"solo2\",\"pin_digest\":true", &res), OK);
+    /* (A copy binds its restored data, never the original's: B188.) */
+    static const char *k_solo2 =
+        "{\"inspect\":{\"Name\":\"/solo\",\"Config\":{\"Image\":\"alpine:3\"},"
+        "\"HostConfig\":{\"Binds\":[\"" APPS "/r" APPS "/web/www:/a\"]},"
+        "\"Mounts\":[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/www\",\"Destination\":\"/a\"}]},"
+        "\"image\":{\"RepoDigests\":[\"alpine@sha256:abc123\"],\"RepoTags\":[\"alpine:3\"]},"
+        "\"name\":\"solo2\",\"target_root\":\"" APPS "/r\"%s}";
+    char cdef[2048];
+    snprintf(cdef, sizeof(cdef), k_solo2, ",\"pin_digest\":true");
+    assert_int_not_equal(be.define(be.ctx, "solo", cdef, &pol, &res), OK);
     assert_non_null(strstr(err_msg(), "no longer available"));
     err_clear();
-    assert_int_equal(define(",\"name\":\"solo2\",\"start\":true", &res), OK);
+    snprintf(cdef, sizeof(cdef), k_solo2, ",\"start\":true");
+    assert_int_equal(be.define(be.ctx, "solo", cdef, &pol, &res), OK);
     assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "image")), "alpine:3");
     const cJSON *w = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(res, "warnings"), 0);
     assert_non_null(strstr(cJSON_GetStringValue(w), "pulled tag alpine:3 instead"));
@@ -473,16 +484,254 @@ static void test_define(void **state)
     res = NULL;
     char def[2048];
     snprintf(def, sizeof(def), "{\"inspect\":{\"Name\":\"/x\",\"Config\":{},\"HostConfig\":{\"Privileged\":true}},"
-             "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"solo3\"}");
+             "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"\"}");
     assert_int_not_equal(be.define(be.ctx, "solo", def, &pol, &res), OK);
     assert_non_null(strstr(err_msg(), "Privileged"));
     err_clear();
     /* So does a bind of a host path outside the include roots. */
     snprintf(def, sizeof(def), "{\"inspect\":{\"Name\":\"/x\",\"Config\":{},\"HostConfig\":{\"Binds\":[\"/etc:/x\"]}},"
-             "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"solo4\"}");
+             "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"\"}");
     assert_int_not_equal(be.define(be.ctx, "solo", def, &pol, &res), OK);
     assert_non_null(strstr(err_msg(), "outside the include roots"));
     err_clear();
+}
+
+/* A copy's definition: the original's mounts (a bind, a named volume, an
+ * anonymous one) and the copy's HostConfig, as hc. */
+static const char *k_copy =
+    "{\"inspect\":{\"Name\":\"/solo\",\"Config\":{\"Image\":\"alpine:3\"},\"HostConfig\":%s,"
+    "\"Mounts\":[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/www\",\"Destination\":\"/a\"},"
+    "{\"Type\":\"bind\",\"Source\":\"/var/run/docker.sock\",\"Destination\":\"/var/run/docker.sock\"},"
+    "{\"Type\":\"volume\",\"Name\":\"solodata\",\"Source\":\"/var/lib/docker/volumes/solodata/_data\",\"Destination\":\"/v\"},"
+    "{\"Type\":\"volume\",\"Name\":\"9e1d\",\"Source\":\"/var/lib/docker/volumes/9e1d/_data\",\"Destination\":\"/anon\"},"
+    "{\"Type\":\"tmpfs\",\"Source\":\"\",\"Destination\":\"/tmp\"}]},"
+    "\"image\":{\"RepoTags\":[\"alpine:3\"]},\"name\":\"%s\"%s}";
+
+#define TR APPS "/r"
+#define GOOD_BINDS "\"" TR APPS "/web/www:/a\",\"" TR "/var/lib/docker/volumes/solodata/_data:/v\"," \
+                   "\"" TR "/var/lib/docker/volumes/9e1d/_data:/anon\",\"/var/run/docker.sock:/var/run/docker.sock\""
+
+static const helper_policy_t *cpol = &pol;
+
+static status_t copy_define_as(const char *name, const char *hc, const char *extra, int check, cJSON **res)
+{
+    char def[4096];
+    snprintf(def, sizeof(def), k_copy, hc, name, extra);
+    *res = NULL;
+    return check ? be.define_check(be.ctx, "solo", def, cpol) : be.define(be.ctx, "solo", def, cpol, res);
+}
+
+static status_t copy_define(const char *hc, const char *extra, int check, cJSON **res)
+{
+    return copy_define_as("solocopy", hc, extra, check, res);
+}
+
+/* B188: a restore under a new name never mounts anything of the
+ * original's. Each way the definition could reach the original's data is
+ * refused before anything is created, by define and by its check alike;
+ * the one rewritten onto the restored copies is created; and a container
+ * Docker made with a volume that existed before the restore is removed
+ * before anything starts it. */
+static void test_define_copy(void **state)
+{
+    (void)state;
+    static const struct { const char *hc, *extra, *why; } refused[] = {
+        /* no target root */
+        { "{\"Binds\":[" GOOD_BINDS "]}", "", "target_root" },
+        /* as recorded: the original's bind and its named volume */
+        { "{\"Binds\":[\"" APPS "/web/www:/a\",\"solodata:/v\"]}", ",\"target_root\":\"" TR "\"", "not under the target root" },
+        { "{\"Binds\":[\"" TR APPS "/web/www:/a\",\"solodata:/v\"]}", ",\"target_root\":\"" TR "\"", "volume solodata" },
+        /* the anonymous volume left out: Docker would give the copy an empty one */
+        { "{\"Binds\":[\"" TR APPS "/web/www:/a\",\"" TR "/var/lib/docker/volumes/solodata/_data:/v\"]}",
+          ",\"target_root\":\"" TR "\"", "volume at /anon has no restored copy" },
+        /* a target root inside the original's bind */
+        { "{\"Binds\":[\"" APPS "/web/www/r" APPS "/web/www:/a\"]}", ",\"target_root\":\"" APPS "/web/www/r\"",
+          "which the original mounts" },
+        /* a volume through HostConfig.Mounts, and another container's volumes */
+        { "{\"Binds\":[" GOOD_BINDS "],\"Mounts\":[{\"Type\":\"volume\",\"Source\":\"solodata\",\"Target\":\"/w\"}]}",
+          ",\"target_root\":\"" TR "\"", "volume solodata" },
+        { "{\"Binds\":[" GOOD_BINDS "],\"VolumesFrom\":[\"solo\"]}", ",\"target_root\":\"" TR "\"", "VolumesFrom" },
+    };
+    int n0 = fdk.n;
+    cJSON *res = NULL;
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        for (int check = 0; check <= 1; check++) {
+            assert_int_not_equal(copy_define(refused[i].hc, refused[i].extra, check, &res), OK);
+            if (!strstr(err_msg(), refused[i].why)) fail_msg("case %zu: %s", i, err_msg());
+            err_clear();
+            assert_int_equal(fdk.n, n0);
+        }
+    }
+
+    /* Rewritten onto the restored copies: checked, then created. */
+    assert_int_equal(copy_define("{\"Binds\":[" GOOD_BINDS "]}", ",\"target_root\":\"" TR "\"", 1, &res), OK);
+    assert_int_equal(fdk.n, n0);
+    assert_int_equal(copy_define("{\"Binds\":[" GOOD_BINDS "]}", ",\"target_root\":\"" TR "\"", 0, &res), OK);
+    cJSON_Delete(res);
+    assert_int_equal(fdk.n, n0 + 1);
+    assert_non_null(strstr(fdk.created_body, TR "/var/lib/docker/volumes/solodata/_data:/v"));
+    assert_null(strstr(fdk.created_body, "\"solodata:"));
+    assert_null(strstr(fdk.created_body, "\"" APPS "/web/www:"));
+
+    /* Docker gave the copy a volume that existed before (an image's
+     * VOLUME, say): removed, never started. */
+    snprintf(fdk.volumes, sizeof(fdk.volumes), "[{\"Name\":\"solodata\"},{\"Name\":\"other\"}]");
+    snprintf(fdk.create_mounts, sizeof(fdk.create_mounts),
+             "[{\"Type\":\"bind\",\"Source\":\"" TR APPS "/web/www\",\"Destination\":\"/a\"},"
+             "{\"Type\":\"volume\",\"Name\":\"solodata\",\"Source\":\"/var/lib/docker/volumes/solodata/_data\","
+             "\"Destination\":\"/extra\"}]");
+    int starts = fdk.starts, deletes = fdk.deletes;
+    assert_int_not_equal(copy_define_as("solocopy2", "{\"Binds\":[" GOOD_BINDS "]}",
+                                        ",\"target_root\":\"" TR "\",\"start\":true", 0, &res), OK);
+    assert_non_null(strstr(err_msg(), "solodata"));
+    assert_non_null(strstr(err_msg(), "existed before"));
+    assert_non_null(strstr(err_msg(), "removed before it ever started"));
+    err_clear();
+    assert_int_equal(fdk.deletes, deletes + 1);
+    assert_int_equal(fdk.starts, starts);
+    assert_null(fd_find(&fdk, "solocopy2"));
+    fdk.volumes[0] = fdk.create_mounts[0] = '\0';
+}
+
+/* B188 in place: the re-created container gets the volumes that received
+ * the restored data, by name; an anonymous one is named nowhere but
+ * Config.Volumes and used to come back as a new, empty volume. */
+static void test_define_in_place_volumes(void **state)
+{
+    (void)state;
+    fd_container_t *solo = fd_find(&fdk, "solo");
+    assert_non_null(solo);
+    snprintf(solo->state, sizeof(solo->state), "exited");
+    cJSON *res = NULL;
+    assert_int_equal(copy_define_as("solo", "{\"Binds\":[\"" APPS "/web/www:/a\",\"solodata:/v\","
+                                    "\"/var/run/docker.sock:/var/run/docker.sock\"]}", ",\"replace\":true", 0, &res), OK);
+    cJSON_Delete(res);
+    cJSON *b = cJSON_Parse(fdk.created_body);
+    assert_non_null(b);
+    char *binds = cJSON_PrintUnformatted(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(b, "HostConfig"), "Binds"));
+    cJSON_Delete(b);
+    assert_non_null(binds);
+    assert_string_equal(binds, "[\"" APPS "/web/www:/a\",\"solodata:/v\",\"/var/run/docker.sock:/var/run/docker.sock\","
+                               "\"9e1d:/anon\"]");
+    free(binds);
+}
+
+/* A block device to bind: one made here (root), else the host's first. */
+static int block_device(char *out, size_t sz)
+{
+    if (mknod(D "/blk", S_IFBLK | 0600, makedev(7, 250)) == 0) { snprintf(out, sz, D "/blk"); return 1; }
+    static const char *const cand[] = { "/dev/loop0", "/dev/sda", "/dev/vda", "/dev/nvme0n1", "/dev/dm-0", "/dev/zram0" };
+    struct stat sb;
+    for (size_t i = 0; i < sizeof(cand) / sizeof(cand[0]); i++)
+        if (stat(cand[i], &sb) == 0 && S_ISBLK(sb.st_mode)) { snprintf(out, sz, "%s", cand[i]); return 1; }
+    return 0;
+}
+
+/*
+ * B188, the host-bind rule as decided: a copy keeps /proc, /sys,
+ * /etc/localtime, /etc/timezone, the Docker socket and character devices
+ * as recorded, and is refused, before anything is created, a block
+ * device (by st_mode, through a by-id style link), anything under /run,
+ * anything else under /etc, and /boot. The refusal names the bind and
+ * why. With allow_privileged_define on, so it is this rule that decides
+ * and not the include-roots gate.
+ */
+static void test_define_copy_host_binds(void **state)
+{
+    (void)state;
+    helper_policy_t p2 = pol;
+    p2.allow_privileged_define = 1;
+    cpol = &p2;
+    char blk[PATH_MAX], hc[2048];
+    int have_blk = block_device(blk, sizeof(blk));
+    if (have_blk) assert_int_equal(symlink(blk, D "/by-id-disk"), 0);
+    else print_message("no block device to bind here; that case is not run\n");
+    static const struct { const char *bind, *why; } refused[] = {
+        { D "/by-id-disk:/disk", "a block device" },
+        { "/run/udev:/run/udev", "under /run" },
+        { "/var/run/app.pid:/x", "under /run" },
+        { "/etc/myapp:/etc/myapp", "under /etc" },
+        { "/boot/config:/cfg", "/boot" },
+    };
+    int n0 = fdk.n;
+    cJSON *res = NULL;
+    for (size_t i = have_blk ? 0 : 1; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        snprintf(hc, sizeof(hc), "{\"Binds\":[" GOOD_BINDS ",\"%s\"]}", refused[i].bind);
+        for (int check = 0; check <= 1; check++) {
+            assert_int_not_equal(copy_define(hc, ",\"target_root\":\"" TR "\"", check, &res), OK);
+            const char *m = err_msg();
+            if (!strstr(m, refused[i].why) || !strstr(m, "nothing created")) fail_msg("%s: %s", refused[i].bind, m);
+            /* The bind named, host path to container path. */
+            char named[PATH_MAX + 64];
+            snprintf(named, sizeof(named), "%.*s", (int)strcspn(refused[i].bind, ":"), refused[i].bind);
+            assert_non_null(strstr(m, named));
+            assert_non_null(strstr(m, strchr(refused[i].bind, ':') + 1));
+            err_clear();
+            assert_int_equal(fdk.n, n0);
+        }
+    }
+    /* Kept: /etc/localtime, the Docker socket, character devices. */
+    struct stat sb;
+    const char *chr = stat("/dev/fuse", &sb) == 0 && S_ISCHR(sb.st_mode) ? "/dev/fuse" : "/dev/null";
+    snprintf(hc, sizeof(hc), "{\"Binds\":[" GOOD_BINDS ",\"/etc/localtime:/etc/localtime:ro\",\"%s:%s\"]}", chr, chr);
+    assert_int_equal(copy_define(hc, ",\"target_root\":\"" TR "\"", 1, &res), OK);
+    assert_int_equal(copy_define(hc, ",\"target_root\":\"" TR "\"", 0, &res), OK);
+    cJSON_Delete(res);
+    assert_int_equal(fdk.n, n0 + 1);
+    assert_non_null(strstr(fdk.created_body, "/etc/localtime:/etc/localtime:ro"));
+    assert_non_null(strstr(fdk.created_body, chr));
+
+    /* The backstop: Docker made the copy with a forbidden bind. */
+    snprintf(fdk.create_mounts, sizeof(fdk.create_mounts),
+             "[{\"Type\":\"bind\",\"Source\":\"/etc/myapp\",\"Destination\":\"/etc/myapp\"}]");
+    int deletes = fdk.deletes;
+    snprintf(hc, sizeof(hc), "{\"Binds\":[" GOOD_BINDS "]}");
+    assert_int_not_equal(copy_define_as("solocopy3", hc, ",\"target_root\":\"" TR "\"", 0, &res), OK);
+    assert_non_null(strstr(err_msg(), "/etc/myapp -> /etc/myapp: host configuration under /etc"));
+    assert_non_null(strstr(err_msg(), "removed before it ever started"));
+    err_clear();
+    assert_int_equal(fdk.deletes, deletes + 1);
+    fdk.create_mounts[0] = '\0';
+    cpol = &pol;
+}
+
+/* B188 for compose: a service volume naming a volume, or a recorded mount
+ * with no restored copy, is refused before anything is written. */
+static void test_define_compose_copy(void **state)
+{
+    (void)state;
+    static const char *k_cc =
+        "{\"compose\":{\"files\":{\"compose.yaml\":\"services: {db: {image: postgres}}\\n\"},"
+        "\"working_dir\":\"" APPS "/web/proj\",\"services\":[{\"service\":\"db\","
+        "\"image\":{\"RepoTags\":[\"postgres:16\"]},\"volumes\":[%s],"
+        "\"mounts\":[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/db\",\"Destination\":\"/var/lib/pg\"},"
+        "{\"Type\":\"volume\",\"Name\":\"web_wal\",\"Source\":\"/var/lib/docker/volumes/web_wal/_data\",\"Destination\":\"/wal\"}]}]},"
+        "\"name\":\"webcopy\",\"target_root\":\"" TR "\"}";
+    static const struct { const char *vols, *why; } refused[] = {
+        { "\"" TR APPS "/web/db:/var/lib/pg\"", "volume at /wal has no restored copy" },
+        { "\"" TR APPS "/web/db:/var/lib/pg\",\"web_wal:/wal\"", "outside the include roots" },
+        { "\"" APPS "/web/db:/var/lib/pg\",\"" TR "/var/lib/docker/volumes/web_wal/_data:/wal\"", "not under the target root" },
+    };
+    char def[4096];
+    cJSON *res = NULL;
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        snprintf(def, sizeof(def), k_cc, refused[i].vols);
+        for (int check = 0; check <= 1; check++) {
+            status_t st = check ? be.define_check(be.ctx, "compose:web", def, &pol)
+                                : be.define(be.ctx, "compose:web", def, &pol, &res);
+            assert_int_not_equal(st, OK);
+            if (!strstr(err_msg(), refused[i].why)) fail_msg("case %zu: %s", i, err_msg());
+            err_clear();
+        }
+    }
+    assert_false(has(TR APPS "/web/proj/compose.yaml", "postgres"));
+    snprintf(def, sizeof(def), k_cc, "\"" TR APPS "/web/db:/var/lib/pg\",\"" TR "/var/lib/docker/volumes/web_wal/_data:/wal\"");
+    assert_int_equal(be.define_check(be.ctx, "compose:web", def, &pol), OK);
+    assert_int_equal(be.define(be.ctx, "compose:web", def, &pol, &res), OK);
+    cJSON_Delete(res);
+    assert_true(has(STATE "/override.yaml", TR "/var/lib/docker/volumes/web_wal/_data:/wal"));
+    /* Created without starting, checked, then started. */
+    assert_true(has(STATE "/compose.log", "--no-start"));
 }
 
 static const char *k_compose =
@@ -921,6 +1170,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_hook_logs_and_dumps, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_compose, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_copy, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_in_place_volumes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_copy_host_binds, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_compose_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pause_read, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_scope_job, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_scope_group, setup_units, teardown_units),

@@ -176,7 +176,7 @@ typedef enum {
 typedef struct { const char *key; akind_t kind; } akey_t;
 
 typedef struct {
-    akey_t keys[4];
+    akey_t keys[5];
     int    n;
     int    one_of;      /* exactly one of the keys (lease.release) */
     int    n_opt;       /* the last n_opt keys may be left out */
@@ -198,7 +198,7 @@ static const schema_t k_schema[HOP_COUNT] = {
     [HOP_VM_CHECKPOINT_REDEFINE] = { { { "unit", A_UNIT }, { "checkpoint", A_NAME } }, 2, 0 },
     [HOP_VM_INSTALL_STATE]       = { { { "unit", A_UNIT }, { "staging", A_TOKEN } }, 2, 0 },
     [HOP_RESTORE_STAGE]          = { { { "unit", A_UNIT }, { "mount", A_PATH }, { "job", A_JOB },
-                                       { "real", A_REAL } }, 4, 0, 1 },
+                                       { "real", A_REAL }, { "check", A_BOOL } }, 5, 0, 2 },
     [HOP_RESTORE_SWAP]           = { { { "staging", A_TOKEN }, { "undo", A_BOOL } }, 2, 0, 1 },
     [HOP_UNIT_STOP]              = { { { "unit", A_UNIT } }, 1, 0 },
     [HOP_UNIT_START]             = { { { "unit", A_UNIT } }, 1, 0 },
@@ -251,6 +251,7 @@ static int take_arg(helper_req_t *r, const akey_t *k, const cJSON *v, char *why,
         if (strcmp(k->key, "hold") == 0) r->hold = cJSON_IsTrue(v);
         else if (strcmp(k->key, "undo") == 0) r->undo = cJSON_IsTrue(v);
         else if (strcmp(k->key, "anchor") == 0) r->anchor = cJSON_IsTrue(v);
+        else if (strcmp(k->key, "check") == 0) r->check = cJSON_IsTrue(v);
         else r->pause = cJSON_IsTrue(v);
         return 0;
     case A_PROVIDER:

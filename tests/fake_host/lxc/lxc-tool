@@ -26,8 +26,12 @@ lxc-freeze) [ "$(st)" = RUNNING ] || { echo "$N is not running" >&2; exit 1; }
     # lxc-<name>.thaw: the freeze is undone at once, as a watchdog's thaw would.
     [ -e "$S/lxc-$N.thaw" ] || echo FROZEN > "$S/lxc-$N" ;;
 lxc-unfreeze) [ "$(st)" = FROZEN ] || { echo "$N is not frozen" >&2; exit 1; }; echo RUNNING > "$S/lxc-$N" ;;
-lxc-start) echo RUNNING > "$S/lxc-$N" ;;
-lxc-stop) echo STOPPED > "$S/lxc-$N" ;;
+# As the real tools: starting a running container, or stopping a stopped
+# one, is an error.
+lxc-start) [ "$(st)" = RUNNING ] && { echo "Container is already running" >&2; exit 1; }
+    echo RUNNING > "$S/lxc-$N" ;;
+lxc-stop) [ "$(st)" = STOPPED ] && { echo "$N is not running" >&2; exit 2; }
+    echo STOPPED > "$S/lxc-$N" ;;
 lxc-attach) exec "$@" ;;
 *) echo "fake lxc: $tool not understood" >&2; exit 2 ;;
 esac
