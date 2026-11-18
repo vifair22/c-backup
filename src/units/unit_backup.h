@@ -71,7 +71,8 @@ typedef struct {
     uint64_t         files;
     uint64_t         freeze_ms;      /* how long the unit was frozen; 0 when it was not */
     unsigned         n_warnings;
-    char             warning[512];   /* the first */
+    char             warning[512];   /* the first, or the one that outranks the rest */
+    char           **warnings;       /* all n_warnings of them, owned (B202) */
 } unit_backup_one_t;
 
 typedef struct {

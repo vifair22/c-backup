@@ -471,9 +471,21 @@ const api_path_t *routes_units_paths(size_t *n)
  * the history when it is a name. */
 /* The unit's key: the one its snapshots carry if it has any (1), else
  * prov:unit as given (0). */
+/*
+ * A unit named by its full key ("libvirt:<uuid>") under its provider's path
+ * is the unit: the bare id or name after the prefix. It was taken as an id
+ * of its own and keyed libvirt:libvirt:<uuid> (B203).
+ */
+static const char *bare_unit(const char *prov, const char *unit)
+{
+    size_t pl = strlen(prov);
+    return strncmp(unit, prov, pl) == 0 && unit[pl] == ':' && unit[pl + 1] ? unit + pl + 1 : unit;
+}
+
 static int key_for(int64_t repo_id, const char *prov, const char *unit, char *key, size_t ksz)
 {
     int found = 0;
+    unit = bare_unit(prov, unit);
     unit_key_format(key, ksz, prov, unit);
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -514,6 +526,7 @@ static status_t find_unit_cb(void *ctx, const char *id, const char *name, int st
 static int policy_unit(int64_t repo_id, const char *prov, const char *unit, char *key, size_t ksz,
                        char *why, size_t wsz)
 {
+    unit = bare_unit(prov, unit);
     if (key_for(repo_id, prov, unit, key, ksz)) return 0;
     const sp_provider_ops_t *ops = NULL;
     sp_ctx_t *ctx = NULL;
@@ -882,7 +895,17 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
         }
         if (u->warning[0]) {
             cJSON_AddStringToObject(x, "warning", u->warning);
-            if (!warn[0]) snprintf(warn, sizeof(warn), "unit %.80s: %.500s", u->name, u->warning);
+            /* Every one, not just the first (B202). */
+            cJSON *ws = cJSON_AddArrayToObject(x, "warnings");
+            for (unsigned k = 0; ws && k < u->n_warnings; k++)
+                cJSON_AddItemToArray(ws, cJSON_CreateString(u->warnings[k]));
+            if (!warn[0]) {
+                if (u->n_warnings > 1)
+                    snprintf(warn, sizeof(warn), "unit %.80s: %.450s (and %u more warning(s))", u->name,
+                             u->warning, u->n_warnings - 1);
+                else
+                    snprintf(warn, sizeof(warn), "unit %.80s: %.500s", u->name, u->warning);
+            }
         }
     }
     if (root) {
