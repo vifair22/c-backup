@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import type { Job } from '../shared/api'
-import type { MaintenanceOp } from '../shared/api'
+import type { MaintenanceOp, SnapshotMode, SourceSnapshot } from '../shared/api'
 import type { ConnectionState, ConnectionConfig, CredentialInfo } from '../shared/types'
 import { sameDaemon } from '../shared/types'
 import { AddConnectionDialog } from './AddConnectionDialog'
@@ -126,6 +126,9 @@ export function App(): React.ReactElement {
    * every save, so a save that left them out cleared them. */
   const [excludes, setExcludes] = useState<string[]>([])
   const [excludeDraft, setExcludeDraft] = useState('')
+  /* Snapshot mode per source (Manual 6.6): off when a path is absent. */
+  const [snapModes, setSnapModes] = useState<Record<string, SnapshotMode>>({})
+  const [snapDraft, setSnapDraft] = useState<Record<string, SnapshotMode>>({})
   const [editingSources, setEditingSources] = useState(false)
   const [sourcesLoading, setSourcesLoading] = useState(false)
   const [backupVerify, setBackupVerify] = useState(false)
@@ -412,12 +415,16 @@ export function App(): React.ReactElement {
     if (!activeRepo) return
     setSourcesLoading(true)
     try {
-      const r = await api.apiCall<{ sources?: string[]; exclude?: string[] }>(
+      const r = await api.apiCall<{ sources?: string[]; exclude?: string[]; snapshot?: SourceSnapshot[] }>(
         activeRepo.conn, { kind: 'sourcesGet', repoId: activeRepo.id })
       setSources(r.sources ?? [])
       setSourceDraft((r.sources ?? []).join('\n'))
       setExcludes(r.exclude ?? [])
       setExcludeDraft((r.exclude ?? []).join('\n'))
+      const modes: Record<string, SnapshotMode> = {}
+      for (const sn of r.snapshot ?? []) modes[sn.path] = sn.mode
+      setSnapModes(modes)
+      setSnapDraft(modes)
     } catch (err) {
       setError(String(err))
     }
@@ -428,14 +435,23 @@ export function App(): React.ReactElement {
     if (!activeRepo) return
     const paths = sourceDraft.split('\n').map(s => s.trim()).filter(Boolean)
     const exclude = excludeDraft.split('\n').map(s => s.trim()).filter(Boolean)
+    /* Every mode is sent, so a path set to off really is off; only paths
+     * still in the list, which the daemon requires. */
+    const snapshot: SourceSnapshot[] = paths
+      .filter(p => snapDraft[p])
+      .map(p => ({ path: p, mode: snapDraft[p] }))
     setSourcesLoading(true)
     setError(null)
     try {
       const r = await api.apiCall<{ warnings?: string[] } | null>(activeRepo.conn, {
-        kind: 'sourcesSet', repoId: activeRepo.id, sources: paths, exclude,
+        kind: 'sourcesSet', repoId: activeRepo.id, sources: paths, exclude, snapshot,
       })
       setSources(paths)
       setExcludes(exclude)
+      const kept: Record<string, SnapshotMode> = {}
+      for (const sn of snapshot) kept[sn.path] = sn.mode
+      setSnapModes(kept)
+      setSnapDraft(kept)
       setEditingSources(false)
       /* Saved, but a path the daemon cannot see yet is worth saying: it may
        * be an unmounted share, or a typo. */
@@ -1073,6 +1089,16 @@ export function App(): React.ReactElement {
                                text-text-primary border border-border-default resize-y"
                   />
                   <div className="text-xs text-text-tertiary mt-1">One pattern per line (Manual 6.2).</div>
+                  <SnapshotModes
+                    paths={sourceDraft.split('\n').map(p => p.trim()).filter(Boolean)}
+                    modes={snapDraft}
+                    onChange={(p, m) => setSnapDraft(d => {
+                      const next = { ...d }
+                      if (m) next[p] = m
+                      else delete next[p]
+                      return next
+                    })}
+                  />
                   <div className="flex gap-2 mt-2">
                     <button onClick={handleSaveSources}
                       className="px-2 py-1 text-xs cursor-pointer rounded bg-accent text-accent-text border-none">
@@ -1082,6 +1108,7 @@ export function App(): React.ReactElement {
                       setEditingSources(false)
                       setSourceDraft(sources.join('\n'))
                       setExcludeDraft(excludes.join('\n'))
+                      setSnapDraft(snapModes)
                     }}
                       className="px-2 py-1 text-xs cursor-pointer rounded bg-surface-tertiary
                                  text-text-secondary border-none">
@@ -1105,6 +1132,14 @@ export function App(): React.ReactElement {
                       return (
                         <li key={p} className="truncate">
                           {p}
+                          {snapModes[p] && (
+                            <span title={snapModes[p] === 'strict'
+                                    ? 'Read from a ZFS or btrfs snapshot; the backup fails if it cannot be'
+                                    : 'Read from a ZFS or btrfs snapshot; read live with a warning if it cannot be'}
+                              className="ml-2 text-[10px] font-sans px-1 rounded bg-surface-tertiary text-text-secondary">
+                              snapshot: {snapModes[p]}
+                            </span>
+                          )}
                           {n > 0 && (
                             <button onClick={() => {
                               setShowBackupModal(false)
@@ -1148,6 +1183,44 @@ export function App(): React.ReactElement {
           </div>
         </Overlay>
       )}
+    </div>
+  )
+}
+
+/*
+ * Snapshot mode per source (db-detection.md 9.4, Manual 6.6): read the source
+ * from a ZFS or btrfs snapshot the helper takes for the backup, so a live
+ * database in it is captured at one instant. Strict fails the backup when the
+ * source cannot be read that way; warn reads it live and the job says so.
+ */
+function SnapshotModes({ paths, modes, onChange }: {
+  paths: string[]
+  modes: Record<string, SnapshotMode>
+  onChange: (path: string, mode: SnapshotMode | null) => void
+}): React.ReactElement | null {
+  if (paths.length === 0) return null
+  return (
+    <div className="mt-2">
+      <div className="text-xs text-text-secondary mb-1.5">Read from a snapshot (ZFS or btrfs)</div>
+      <ul className="m-0 p-0 list-none space-y-1">
+        {paths.map(p => (
+          <li key={p} className="flex items-center gap-2 text-xs">
+            <span className="font-mono truncate flex-1 text-text-primary">{p}</span>
+            <select
+              aria-label={`Snapshot mode for ${p}`}
+              value={modes[p] ?? 'off'}
+              onChange={e => onChange(p, e.target.value === 'off' ? null : e.target.value as SnapshotMode)}
+              className="text-xs rounded bg-surface-tertiary text-text-primary border border-border-default px-1 py-0.5">
+              <option value="off">Off (read live)</option>
+              <option value="strict">Strict (fail if no snapshot)</option>
+              <option value="warn">Warn (read live, said)</option>
+            </select>
+          </li>
+        ))}
+      </ul>
+      <div className="text-xs text-text-tertiary mt-1">
+        For a live database: one consistent instant, no pause. Needs the helper and a dataset or pool its policy lists (Manual 6.6).
+      </div>
     </div>
   )
 }
