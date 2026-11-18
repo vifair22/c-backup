@@ -275,6 +275,18 @@ static status_t resolve(const mount_cfg_t *c, const char *source, mount_class_t 
     return OK;
 }
 
+status_t mount_resolve(const mount_cfg_t *c, const char *path, mount_class_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    snprintf(out->recorded, sizeof(out->recorded), "%s", path);
+    if (mount_is_system(path)) {
+        set(out, MOUNT_EXCLUDED, "system");
+        return OK;
+    }
+    set(out, MOUNT_INCLUDED, "");
+    return resolve(c, path, out, 0);
+}
+
 /* A mount that is c-backup's own snapshot machinery, never data: a ZFS
  * snapshot automounted under .zfs, or anything in a btrfs snapshot
  * directory. The scanner never enters either. */

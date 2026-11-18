@@ -3704,6 +3704,7 @@ waiting out the backoff.
 | `allow` | the daemon's `units.allow` |
 | `holds_open` | holds journalled and not yet released, the daemon's own and the helper's together (asked of the helper when the request is made); 0 when nothing is held |
 | `helper.holds`, `helper.captures` | what the helper has journalled and open right now, when it answered |
+| `helper.path_snapshots` | whether the helper's policy lists any ZFS dataset or btrfs pool, so file sources in snapshot mode can be read from a snapshot (`capture.begin_paths`) |
 | `privileges_dropped` | whether the drop of 22.2.2 happened |
 
 ### 22.3 Configuration keys
