@@ -1137,9 +1137,14 @@ for _ in $(seq 1 40); do
     sleep 0.25
 done
 contains "a scheduled job journals its schedule" '"message":"schedule ' "$SCHED_J"
-# Stop it before it fires again under the rest of the suite.
-SID=$(cb schedule list "$ENC_ID" 2>/dev/null | tr ',' '\n' | grep -B0 -A0 '"id"' | head -1 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+# Stop it before it fires again under the rest of the suite. By its
+# destination: the first id in the list is the hourly schedule above, and
+# removing that one left this one firing every second to the end of the
+# suite, which the idle check (B201) caught.
+SID=$(cb schedule list "$ENC_ID" 2>/dev/null | sed 's/{"id":/\n{"id":/g' | grep 'fired-replica' | sed -n 's/^{"id":\([0-9]*\),.*/\1/p' | head -1)
+check "the one-second replicate schedule is found" 1 "$([ -n "$SID" ] && echo 1 || echo 0)"
 cb schedule remove "$ENC_ID" "$SID" >/dev/null 2>&1 || true
+contains "and removed" "no such schedule" "$(cb schedule remove "$ENC_ID" "$SID" 2>&1)"
 
 # A relative path would be resolved against the daemon's working directory,
 # which is not where the operator was standing when they typed it.
@@ -1390,6 +1395,20 @@ check "a scheduled backup produces a snapshot" 1 "$FIRED"
 contains "and ran as a backup job" '"action":"backup"' "$(cb jobs)"
 SID=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":\([0-9]*\),.*/\1/p' | head -1)
 [ -n "$SID" ] && cb schedule remove 1 "$SID" >/dev/null 2>&1
+
+# B201: an idle daemon writes nothing. On FS2 an idle daemon's WAL grew about
+# four frames a second, from the checkpointer's own restart row and warning
+# line; nothing needs writing while nothing happens. Once the last job is
+# done and logged, the WAL must not change for several seconds.
+echo "idle"
+for _ in $(seq 1 120); do
+    case "$(cb jobs)" in *'"state":"running"'*|*'"state":"queued"'*) sleep 0.25 ;; *) break ;; esac
+done
+sleep 2
+W0=$(stat -c '%s %y' "$WORK/state.db-wal" 2>/dev/null)
+sleep 6
+W1=$(stat -c '%s %y' "$WORK/state.db-wal" 2>/dev/null)
+check "an idle daemon writes nothing to state.db for six seconds" "$W0" "$W1"
 
 echo "auth"
 contains "auth status before setup" '"configured":false' "$(cb auth status)"

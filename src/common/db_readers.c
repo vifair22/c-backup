@@ -28,6 +28,17 @@ static atomic_uint   g_next;
 static atomic_ulong  g_lookups;
 static atomic_uint   g_test_hold_us;
 
+/*
+ * The quiesce gate. glibc mutexes are not fair: a reader that lets its slot
+ * go and asks for one again at once takes it back before a thread blocked
+ * on it wakes, so with lookups back to back db_readers_quiesce waited 13 s
+ * on average for sixteen slots, under the write lock (B201). While the flag
+ * is up a lookup waits at the gate before it takes a slot, so the quiesce
+ * waits only for the lookups already running, one per slot at most.
+ */
+static pthread_mutex_t g_gate = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int      g_quiescing;
+
 void db_readers_set_test_hold_us(unsigned us)
 {
     atomic_store(&g_test_hold_us, us);
@@ -111,6 +122,10 @@ static slot_t *slot_take(void)
 int db_readers_locate(int64_t repo_id, const char *hex, uint64_t cols[6])
 {
     if (!atomic_load(&g_active) || !hex) return -1;
+    if (atomic_load(&g_quiescing)) {
+        pthread_mutex_lock(&g_gate);
+        pthread_mutex_unlock(&g_gate);
+    }
     slot_t *s = slot_take();
     sqlite3_stmt *st = s->locate;
     int found = -1;
@@ -152,6 +167,8 @@ int db_readers_locate(int64_t repo_id, const char *hex, uint64_t cols[6])
 void db_readers_quiesce(void)
 {
     if (!atomic_load(&g_active)) return;
+    pthread_mutex_lock(&g_gate);
+    atomic_store(&g_quiescing, 1);
     for (unsigned i = 0; i < g_n; i++) pthread_mutex_lock(&g_slots[i].mu);
 }
 
@@ -159,6 +176,8 @@ void db_readers_resume(void)
 {
     if (!atomic_load(&g_active)) return;
     for (unsigned i = g_n; i-- > 0;) pthread_mutex_unlock(&g_slots[i].mu);
+    atomic_store(&g_quiescing, 0);
+    pthread_mutex_unlock(&g_gate);
 }
 
 unsigned db_readers_audit(void)

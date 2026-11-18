@@ -491,6 +491,170 @@ static void test_pooled_readers_never_pin_the_wal(void **state)
     assert_int_equal(bad, 0);
 }
 
+/* A request reading through the shared connection, over and over: the API
+ * polled by a client, the scheduler's look at what is due. */
+typedef struct { atomic_int stop; unsigned long reads; atomic_ullong max_ms; } shared_reader_t;
+
+static void *shared_reader_main(void *arg)
+{
+    shared_reader_t *r = arg;
+    while (!atomic_load(&r->stop)) {
+        uint64_t t0 = now_ms();
+        db_result_t *res = NULL;
+        (void)db_execute(db, "SELECT COUNT(*), SUM(LENGTH(v)) FROM t", NULL, &res);
+        db_result_free(res);
+        uint64_t took = now_ms() - t0;
+        if (took > atomic_load(&r->max_ms)) atomic_store(&r->max_ms, took);
+        r->reads++;
+    }
+    return NULL;
+}
+
+/*
+ * B201's idle half. After the backup on FS2 the WAL never restarted, and the
+ * only writes left were the checkpointer's own: each tick past the hard cap
+ * wrote its restart row and its warning line, about four frames a second.
+ * What kept the restart from landing was reads on the shared connection,
+ * which take a read-mark slot like any reader and do not take the write
+ * lock: requests and the daemon's own looks at the index, back to back.
+ * The restart is now a RESTART checkpoint, which waits for the readers
+ * already inside the WAL while new ones read the database file, so with
+ * reads running without pause and nothing being written, the locked round
+ * copies the WAL and restarts it.
+ */
+static void test_reads_on_the_shared_connection_do_not_pin_the_wal(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 40; i++) assert_int_equal(commit_rows(50), 0);
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    checkpointer_set_test_idle(1);          /* the tick out of the way */
+
+    shared_reader_t sr[4];
+    pthread_t th[4];
+    memset(sr, 0, sizeof(sr));
+    for (int i = 0; i < 4; i++)
+        assert_int_equal(pthread_create(&th[i], NULL, shared_reader_main, &sr[i]), 0);
+    sleep_ms(100);
+
+    uint32_t f0 = 0, b0 = 0, f = 0, b = 0;
+    assert_int_equal(checkpointer_wal_frames(TEST_DB, &f0, &b0), 0);
+    assert_int_equal(checkpointer_force(), OK);
+    assert_int_equal(checkpointer_wal_frames(TEST_DB, &f, &b), 0);
+
+    unsigned long reads = 0;
+    for (int i = 0; i < 4; i++) {
+        atomic_store(&sr[i].stop, 1);
+        pthread_join(th[i], NULL);
+        reads += sr[i].reads;
+    }
+    fprintf(stderr, "B201 idle: %lu shared reads; WAL %u frames before the forced round, "
+            "%u after\n", reads, f0, f);
+    assert_true(reads > 10);
+    assert_true(f0 > 1000);
+    assert_true(f <= 8);
+}
+
+/*
+ * B201: and a request is not held for the round. The copy at the hard cap
+ * is the whole WAL, seconds on FS2; holding the shared connection for it
+ * would stall every request that long. The round holds only the write lock
+ * and the pooled readers, so here, with each copy slowed to 800 ms, a read
+ * on the shared connection waits for none of it, and the WAL still
+ * restarts with the reads running. One reading thread: two would wait on
+ * each other for the connection, which says nothing about the round.
+ */
+#define SLOW_COPY_MS 800
+
+static void test_a_locked_round_does_not_hold_shared_reads(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 40; i++) assert_int_equal(commit_rows(50), 0);
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    checkpointer_set_test_idle(1);
+
+    shared_reader_t sr[1];
+    pthread_t th[1];
+    memset(sr, 0, sizeof(sr));
+    for (int i = 0; i < 1; i++)
+        assert_int_equal(pthread_create(&th[i], NULL, shared_reader_main, &sr[i]), 0);
+    sleep_ms(100);
+    for (int i = 0; i < 1; i++) atomic_store(&sr[i].max_ms, 0);
+
+    checkpointer_set_test_pause_ms(SLOW_COPY_MS);
+    uint64_t t0 = now_ms();
+    assert_int_equal(checkpointer_force(), OK);
+    uint64_t round_ms = now_ms() - t0;
+    checkpointer_set_test_pause_ms(0);
+    uint32_t f = 0, b = 0;
+    assert_int_equal(checkpointer_wal_frames(TEST_DB, &f, &b), 0);
+
+    uint64_t max_ms = 0;
+    unsigned long reads = 0;
+    for (int i = 0; i < 1; i++) {
+        atomic_store(&sr[i].stop, 1);
+        pthread_join(th[i], NULL);
+        if (atomic_load(&sr[i].max_ms) > max_ms) max_ms = atomic_load(&sr[i].max_ms);
+        reads += sr[i].reads;
+    }
+    fprintf(stderr, "B201 round: held %llu ms; %lu shared reads, the longest %llu ms; "
+            "WAL %u frames after\n", (unsigned long long)round_ms, reads,
+            (unsigned long long)max_ms, f);
+    assert_true(round_ms >= SLOW_COPY_MS);
+    assert_true(max_ms < SLOW_COPY_MS / 2);
+    assert_true(f <= 8);
+}
+
+/*
+ * B201, the idle growth itself: with the WAL past the hard cap and a reader
+ * that keeps it from restarting, nothing else writing, the checkpointer
+ * used to write its restart row every tick, each one an ordinary frame
+ * when the restart missed - with its warning line, about four frames a
+ * second on FS2 for as long as the daemon ran. It now writes the row only
+ * after a RESTART checkpoint has restarted the WAL, so an idle daemon's
+ * WAL stays still; and once the reader lets go, it restarts.
+ */
+static void test_a_pinned_idle_wal_is_not_written(void **state)
+{
+    (void)state;
+    while (wal_frames() <= (uint32_t)THRESHOLD * CKPT_HARD_FACTOR)
+        assert_int_equal(commit_rows(50), 0);
+    cutils_db_t *reader = NULL;
+    assert_int_equal(db_open(&reader, TEST_DB), 0);
+    assert_int_equal(db_exec_raw(reader, "BEGIN"), 0);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(reader, "SELECT COUNT(*) FROM t", NULL, &r), 0);
+    db_result_free(r);
+
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    sleep_ms(300);                          /* copied, and the first miss */
+    uint32_t f0 = wal_frames();
+    sleep_ms(2000);                         /* a hundred ticks, idle */
+    uint32_t f1 = wal_frames();
+    checkpointer_stats_t st;
+    checkpointer_stats(&st);
+    fprintf(stderr, "B201 idle pinned: %u -> %u frames over 2 s, %lu ticks, %lu restart misses\n",
+            f0, f1, st.ticks, st.pre_restart_misses);
+    assert_true(st.ticks > 20);
+    assert_int_equal(f1, f0);
+
+    assert_int_equal(db_exec_raw(reader, "COMMIT"), 0);
+    db_close(reader);
+    /* Let go, and the next locked round restarts the WAL with nothing else
+     * written: the retry needs no write to set it off. */
+    uint32_t f = UINT32_MAX;
+    for (int i = 0; i < 300 && f > 8; i++) {
+        sleep_ms(10);
+        f = wal_frames();
+    }
+    checkpointer_stats(&st);
+    uint32_t fb = 0, bb = 0;
+    (void)checkpointer_wal_frames(TEST_DB, &fb, &bb);
+    fprintf(stderr, "B201 released: %u frames (%u copied), %lu escalations, %lu restarts, "
+            "%lu misses, %lu busy\n", fb, bb, st.escalations, st.pre_restarts,
+            st.pre_restart_misses, st.busy);
+    assert_true(f <= 8);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -501,6 +665,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_only_bulk_writers_wait_at_the_hard_cap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pinned_reader_holds_nobody_up, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pooled_readers_never_pin_the_wal, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reads_on_the_shared_connection_do_not_pin_the_wal,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_locked_round_does_not_hold_shared_reads,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_pinned_idle_wal_is_not_written, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
