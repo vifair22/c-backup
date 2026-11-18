@@ -598,8 +598,8 @@ static status_t define_check(const char *prov, const char *unit, const char *txt
     }
     cJSON_Delete(cr);
     if (st != OK) {
-        char why[600];
-        snprintf(why, sizeof(why), "%.590s", err_msg());
+        char why[2048];
+        snprintf(why, sizeof(why), "%.2040s", err_msg());
         return set_error(st, "unit restore refused, nothing written: %s", why);
     }
     return OK;

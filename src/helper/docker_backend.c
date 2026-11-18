@@ -1739,21 +1739,25 @@ static int orig_is_block(const struct sp_ctx *c, const cJSON *orig, const char *
  * snapshot being restored (recorded_types). A block device is refused; so
  * is a source it has no entry for, or one recorded as a link whose target
  * cannot be judged before it is written, since nothing then says what the
- * restore would put there. NULL when the type allows it, else the reason.
+ * restore would put there. A "cannot verify" names the way round it: the
+ * files restored to a path (Manual 22.7.1) and the container made by hand.
+ * 0 when the type allows it, else 1 with the reason in out.
  */
-static const char *recorded_refusal(const cJSON *rec, const char *src)
+static int recorded_refusal(const cJSON *rec, const char *src, const char *troot, char *out, size_t sz)
 {
     const char *t = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(rec, src));
-    if (!t) return "cannot verify it is not a block device: the original is gone from the host and "
-                   "the snapshot's record of it was not given";
-    if (strcmp(t, "blk") == 0) return "a block device, as the snapshot records it";
-    if (strcmp(t, "missing") == 0)
-        return "cannot verify it is not a block device: the original is gone from the host and the "
-               "snapshot has no entry for it";
-    if (strcmp(t, "lnk") == 0 || strcmp(t, "link") == 0)
-        return "cannot verify it is not a block device: the original is gone from the host and the "
-               "snapshot records a link, whose target cannot be judged before it is written";
-    return NULL;
+    const char *why = NULL;
+    if (t && strcmp(t, "blk") == 0) { fmt_why(out, sz, "a block device, as the snapshot records it"); return 1; }
+    if (!t) why = "the snapshot's record of it was not given";
+    else if (strcmp(t, "missing") == 0) why = "the snapshot has no entry for it";
+    else if (strcmp(t, "lnk") == 0 || strcmp(t, "link") == 0)
+        why = "the snapshot records a link, whose target cannot be judged before it is written";
+    if (!why) return 0;
+    fmt_why(out, sz, "cannot verify it is not a block device: the original is gone from the host and %s; "
+            "restore the files to a path instead (c-backup restore <repo> <snapshot> <dir> --subpath %.300s, "
+            "or c-backup unit restore <repo> <snapshot> <dir> for the whole unit) and create the container "
+            "by hand", why, src + strlen(troot));
+    return 1;
 }
 
 /*
@@ -1776,15 +1780,15 @@ static host_bind_t copy_bind(const struct sp_ctx *c, const cJSON *orig, const cJ
     int have = resolve_host(&c->tools, src, real, sizeof(real)) == 0;
     int st_ok = have && host_stat(&c->tools, real, &sb) == 0;
     const char *shown = have && strcmp(real, src) != 0 ? real : NULL;
-#define REFUSE_BIND(...) do { char rr_[400]; fmt_why(rr_, sizeof(rr_), __VA_ARGS__); \
+#define REFUSE_BIND(...) do { char rr_[900]; fmt_why(rr_, sizeof(rr_), __VA_ARGS__); \
         fmt_why(why, wsz, "%.300s%s%.300s%s -> %.300s: %s", src, shown ? " (" : "", shown ? shown : "", \
                  shown ? ")" : "", dst[0] ? dst : "?", rr_); return HB_REFUSE; } while (0)
     if (st_ok && S_ISBLK(sb.st_mode)) REFUSE_BIND("a block device");
     if (!st_ok && troot) {
         int ob = orig_is_block(c, orig, src, dst, troot);
-        const char *rr = ob < 0 && rec ? recorded_refusal(rec, src) : NULL;
+        char rr[800];
         if (ob > 0) REFUSE_BIND("a block device, as the original's bind of it is");
-        if (rr) REFUSE_BIND("%s", rr);
+        if (ob < 0 && rec && recorded_refusal(rec, src, troot, rr, sizeof(rr))) REFUSE_BIND("%s", rr);
     }
     host_bind_t f1 = host_bind_class(&c->tools, src, st_ok ? &sb : NULL, r1, sizeof(r1));
     host_bind_t f2 = have ? host_bind_class(&c->tools, real, st_ok ? &sb : NULL, r2, sizeof(r2)) : f1;
@@ -1843,7 +1847,7 @@ static const cJSON *recorded_types(const cJSON *d)
 static status_t copy_definition_ok(const struct sp_ctx *c, const cJSON *orig, const cJSON *rec, const cJSON *hc,
                                    const char *troot)
 {
-    char why[1200], src[PATH_MAX], dst[PATH_MAX];
+    char why[2048], src[PATH_MAX], dst[PATH_MAX];
     if (troot[0] != '/' || !helper_path_clean(troot))
         return set_error(ERR_INVALID, "docker: a container under a new name needs a target_root: its data "
                          "is the restored copy there, never the original's");
@@ -1926,7 +1930,7 @@ static int volume_listed(const cJSON *vols, const char *name)
 static status_t copy_created_ok(struct sp_ctx *c, const char *cid, const cJSON *before,
                                 const cJSON *orig, const char *troot)
 {
-    char path[160], why[1300] = "";
+    char path[160], why[2200] = "";
     snprintf(path, sizeof(path), "/containers/%.79s/json", cid);
     cJSON *in = NULL;
     status_t st = docker_call(&c->api, "GET", path, NULL, 0, NULL, &in);
@@ -1938,13 +1942,13 @@ static status_t copy_created_ok(struct sp_ctx *c, const char *cid, const cJSON *
             snprintf(why, sizeof(why), "it mounts the volume %.200s at %.200s, which existed before the "
                      "restore", name, jstr(m, "Destination"));
         } else if (strcmp(type, "bind") == 0) {
-            char w2[1100];
+            char w2[2048];
             if (copy_bind(c, orig, NULL, ms, jstr(m, "Destination"), troot, w2, sizeof(w2)) == HB_REFUSE)
                 snprintf(why, sizeof(why), "it binds %s", w2);
         }
     }
     if (st == OK && !why[0]) {
-        char w2[1100];
+        char w2[2048];
         if (copy_device_bad(c, cJSON_GetObjectItemCaseSensitive(in, "HostConfig"), w2, sizeof(w2)))
             snprintf(why, sizeof(why), "it gets %s", w2);
     }
@@ -2267,7 +2271,7 @@ static status_t compose_copy_ok(const struct sp_ctx *c, const cJSON *cp, const c
 {
     cJSON *orig = compose_orig_mounts(cp);
     if (!orig) return set_error(ERR_NOMEM, "docker: define");
-    char why[1200], src[PATH_MAX], dst[PATH_MAX];
+    char why[2048], src[PATH_MAX], dst[PATH_MAX];
     status_t st = OK;
     const cJSON *svc;
     cJSON_ArrayForEach(svc, cJSON_GetObjectItemCaseSensitive(cp, "services")) {

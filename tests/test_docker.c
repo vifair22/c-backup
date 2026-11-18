@@ -773,7 +773,15 @@ static void test_define_copy_recorded_type(void **state)
         const char *m = err_msg();
         if (!strstr(m, refused[i].why) || !strstr(m, "nothing created") || !strstr(m, TR APPS "/web/gone -> /disk"))
             fail_msg("case %zu: %s", i, m);
-        if (i > 0 && !strstr(m, "cannot verify")) fail_msg("case %zu: %s", i, m);
+        /* A "cannot verify" names the way round it, whole: the files
+         * restored to a path, with the real CLI syntax, and the container
+         * made by hand. */
+        if (i > 0 && (!strstr(m, "cannot verify") ||
+                      !strstr(m, "restore the files to a path instead (c-backup restore <repo> <snapshot> <dir> "
+                                 "--subpath " APPS "/web/gone, or c-backup unit restore <repo> <snapshot> <dir> "
+                                 "for the whole unit) and create the container by hand")))
+            fail_msg("case %zu: %s", i, m);
+        if (i == 0 && strstr(m, "restore the files")) fail_msg("case %zu: %s", i, m);
         err_clear();
         assert_int_equal(fdk.n, n0);
         assert_int_not_equal(lstat(TR APPS "/web/gone", &sb), 0);

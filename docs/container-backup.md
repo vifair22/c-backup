@@ -909,7 +909,10 @@ exists on the host, the daemon's `recorded_types` decides: the type of each
 copy source's entry in the manifest of the snapshot being restored
 (`blk`, `chr`, `dir`, `reg`, `lnk`, `link`, `fifo`, or `missing`). `blk`
 is refused; `missing`, `lnk`, `link` or no record at all is refused as
-"cannot verify", since nothing then says what the restore would write. Paths are
+"cannot verify", since nothing then says what the restore would write,
+and the refusal names the alternative: the files restored to a path
+(`c-backup restore <repo> <snapshot> <dir> --subpath <path>`, or `c-backup
+unit restore <repo> <snapshot> <dir>`) and the container created by hand. Paths are
 resolved in the host's tree one component at a time, so
 a restored symlink cannot point a data bind out of `target_root` either. It refuses otherwise, in the
 define check too, so before the daemon writes anything. After the create

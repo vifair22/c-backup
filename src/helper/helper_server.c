@@ -445,7 +445,9 @@ static char *resp_error(int64_t id, helper_err_t code, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 static char *resp_error(int64_t id, helper_err_t code, const char *fmt, ...)
 {
-    char msg[512];
+    /* Room for a refusal that names its way round (B210): it was cut at
+     * 511, mid-sentence. */
+    char msg[2048];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);

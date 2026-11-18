@@ -4109,7 +4109,11 @@ snapshot being restored decides: the daemon passes the type each copy
 source was recorded with, and a block device is refused. So is a source
 the snapshot has no entry for, or one recorded as a link (its target
 cannot be judged before it is written): `cannot verify it is not a block
-device`, again before anything is written. The check of the created
+device`, again before anything is written. That refusal names the way
+round it: restore the files to a path instead, `c-backup restore <repo>
+<snapshot> <dir> --subpath <the bind's recorded path>` for that bind or
+`c-backup unit restore <repo> <snapshot> <dir>` for the whole unit
+(22.7.1), and create the container by hand. The check of the created
 container still runs as well.
 
 Anything else refuses the restore before the container is created, with
