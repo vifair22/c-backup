@@ -39,6 +39,7 @@
 #include "sqlite_copy.h"
 #include "store.h"
 #include "store_index.h"
+#include "verify.h"
 #include "test_tmp.h"
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_db_capture"
@@ -303,6 +304,41 @@ static void test_raw_read_once_with_copy(void **state)
     backup_result_free(&res);
 }
 
+/* Verify's unsettled notice explains a detected database (9.5), and a
+ * restore of it names its finding. */
+static void test_verify_and_restore_explain(void **state)
+{
+    (void)state;
+    backup_result_t res = run_grow(1);
+    int64_t snap = res.snapshot_id;
+    backup_result_free(&res);
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    assert_int_equal(db_write(db, "INSERT INTO db_findings (repo_id, scope, engine, path, confidence,"
+                                  " state, evidence, first_seen, last_seen)"
+                                  " VALUES (?, 'source:" TEST_DIR "/big.db', 'sqlite', '" TEST_DIR "/big.db',"
+                                  " 'live', 'new', '{}', 1, 1)",
+                              (const char *[]){ repo, NULL }, NULL), 0);
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr), OK);
+    assert_true(vr.unsettled_files >= 1);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT sample_paths FROM verify_findings WHERE repo_id = ?"
+                                    " AND status LIKE 'notice: stored while changing: live SQLite%'",
+                                (const char *[]){ repo, NULL }, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], TEST_DIR "/big.db");
+    db_result_free(r);
+    rmrf(TEST_OUT);
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, snap, TEST_OUT, NULL, &rr), OK);
+    assert_int_equal(rr.engine_copies, 0);
+    assert_int_equal(rr.files, 1);
+}
+
 /* ------------------------------------------------------------------ */
 /* A file backup with an engine copy                                    */
 /* ------------------------------------------------------------------ */
@@ -560,6 +596,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_copy_rollback_rule, setup, teardown),
         cmocka_unit_test_setup_teardown(test_copy_abandoned, setup, teardown),
         cmocka_unit_test_setup_teardown(test_raw_read_once_with_copy, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_verify_and_restore_explain, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_with_engine_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_copy_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_no_plan, setup, teardown),
