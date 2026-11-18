@@ -17,6 +17,15 @@ const STATE_CONFIG: Record<string, { color: string; bg: string; label: string }>
   failed:    { color: 'text-red-400',   bg: 'bg-red-500/10',   label: 'Failed' },
 }
 
+/* What a backup's result says about its sources in snapshot mode (Manual
+ * 6.6): those read from a snapshot, and those in warn mode read live. */
+function snapshotReport(t: Job): { snapped: [string, string][]; live: { path: string; reason: string }[] } {
+  const r = (t.result ?? {}) as Record<string, unknown>
+  const snapped = Object.entries((r.source_snapshots ?? {}) as Record<string, string>)
+  const live = Array.isArray(r.live_sources) ? r.live_sources as { path: string; reason: string }[] : []
+  return { snapped, live }
+}
+
 interface Props {
   jobs: Job[]
   connName: string
@@ -113,6 +122,42 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
                 {t.state === 'failed' && t.error && (
                   <div className="text-xs text-status-error mb-2">{t.error}</div>
                 )}
+                {/* A strict snapshot-mode source that could not be read
+                  * from a snapshot failed the backup before anything was
+                  * read; say what the operator can do about it. */}
+                {t.state === 'failed' && t.error?.includes('strict snapshot mode') && (
+                  <div className="text-xs text-text-secondary mb-2" data-testid="snapshot-strict-hint">
+                    Nothing was backed up. Fix the reason given, or set that source to Warn in the
+                    backup dialog to read it live instead (Manual 6.6).
+                  </div>
+                )}
+                {(() => {
+                  const { snapped, live } = snapshotReport(t)
+                  return (
+                    <>
+                      {live.length > 0 && (
+                        <div className="text-xs mb-2 rounded border border-amber-500/40 bg-amber-500/10 p-2"
+                          data-testid="snapshot-live-sources">
+                          <div className="font-semibold text-amber-400 mb-1">
+                            Read live, not from a snapshot ({live.length})
+                          </div>
+                          <ul className="m-0 pl-4">
+                            {live.map(l => (
+                              <li key={l.path}>
+                                <span className="font-mono">{l.path}</span>: {l.reason}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {snapped.length > 0 && (
+                        <div className="text-[11px] text-text-muted mb-2" data-testid="snapshot-sources">
+                          Read from a snapshot: {snapped.map(([p, k]) => `${p} (${k})`).join(', ')}
+                        </div>
+                      )}
+                    </>
+                  )
+                })()}
 
                 {/* Bottom row: details + actions */}
                 <div className="flex items-center gap-3 text-[10px] text-text-muted">

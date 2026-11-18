@@ -69,7 +69,11 @@ export type ApiRequest =
 
   /* --- what a repo backs up, configured once --- */
   | { kind: 'sourcesGet'; repoId: number }
-  | { kind: 'sourcesSet'; repoId: number; sources: string[]; exclude?: string[] }
+  | { kind: 'sourcesSet'; repoId: number; sources: string[]; exclude?: string[]
+      /* Snapshot mode per source (db-detection.md 9.4, Manual 6.6). Left
+       * out, the daemon keeps the modes of sources that stay; given, it
+       * replaces them, and a source not listed is read live. */
+      snapshot?: SourceSnapshot[] }
 
   /* --- the two that matter most, and the two that were broken ---
    * paths is optional: omitted, the daemon uses the repository's own
@@ -189,6 +193,11 @@ export interface JobAccepted {
  * "started"/"ended" are epoch seconds or null; "result" is what the job
  * reported about itself when it finished, or null.
  */
+/* A source read from a ZFS or btrfs snapshot (Manual 6.6). strict: a source
+ * that cannot be fails the backup; warn: it is read live and the job says so. */
+export type SnapshotMode = 'strict' | 'warn'
+export interface SourceSnapshot { path: string; mode: SnapshotMode }
+
 export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface Job {
