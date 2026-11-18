@@ -86,8 +86,22 @@
  * of the open file, a RESTART checkpoint writes nothing but the header, and
  * -shm is shared by every connection in the process through one descriptor.
  * SQLite deletes -wal and -shm only when the last connection closes, which
- * is shutdown; the next start, as root again, creates them anew before the
+ * is shutdown, and only when that close has copied the whole WAL back
+ * (below); the next start, as root again, creates them anew before the
  * drop. The pool's connections close only at shutdown too (db_readers.h).
+ *
+ * Shutdown (B218). The last connection to close copies the whole WAL into
+ * the database before it deletes it, with nothing to bound it: on a test
+ * server a large WAL made a stop take 53 s, past Docker's 10 s grace, so
+ * the stop ended in SIGKILL. So shutdown halts the thread, interrupting a
+ * copy in progress (checkpointer_halt), then makes one bounded copy of its
+ * own once every writer has stopped (checkpointer_finish), and this
+ * connection is the last to close (checkpointer_stop after the shared
+ * handle's close, which then leaves the WAL alone because this connection
+ * still holds the database). When the bounded copy finished, that close
+ * removes the WAL as before; when it did not, the close leaves the WAL in
+ * place, synced, and the next start reads it back like any WAL. Nothing is
+ * lost either way: every commit is in the WAL, and the WAL is synced.
  * A new connection opened after the drop would be read-only, and
  * checkpointer_open refuses one rather than run on it.
  *
@@ -130,6 +144,11 @@ typedef struct {
     unsigned long throttle_timeouts; /* waits that ended at the time limit */
     unsigned long presyncs;         /* WAL syncs made before taking the lock (B216) */
     uint64_t      presync_ns;       /* and their total time */
+    /* The wait for the write lock, apart from the hold (B219): lock_ns and
+     * max_lock_ns used to include it, so a round that queued behind a
+     * batch for a second and held the lock for 5 ms read as a 1 s hold. */
+    uint64_t      lock_wait_ns;     /* time locked rounds waited for the lock */
+    uint64_t      max_lock_wait_ns; /* the longest single wait */
 } checkpointer_stats_t;
 
 /*
@@ -157,8 +176,29 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
 
 /* Stop and join the thread, and close its connection. Safe when not
  * started, and closes a connection checkpointer_open made that was never
- * started. */
+ * started. After a checkpointer_finish that left the WAL, the close leaves
+ * it too, and syncs it first; otherwise, as the last connection, the close
+ * copies what is left and removes the WAL, as SQLite does. */
 void checkpointer_stop(void);
+
+/* Shutdown, step one (B218): stop and join the thread, interrupting a copy
+ * in progress, which is then neither a failure nor counted as one. The
+ * connection stays open for checkpointer_finish and checkpointer_stop. */
+void checkpointer_halt(void);
+
+/*
+ * Shutdown, step two (B218), once every writer has stopped: copy what the
+ * WAL still holds, if that is at most CKPT_FINAL_FRAMES and the copy
+ * finishes within budget_ms (it is interrupted then). Returns 1 when the
+ * WAL is fully copied, 0 when it is left for the next start, which is
+ * logged with the reason. Halts the thread first if it runs. 1 with no
+ * connection open.
+ */
+int checkpointer_finish(unsigned budget_ms);
+
+/* Most uncopied frames shutdown copies (16 MiB); a larger WAL is left for
+ * the next start rather than copied while a stop waits. */
+#define CKPT_FINAL_FRAMES 4096
 
 void checkpointer_stats(checkpointer_stats_t *out);
 

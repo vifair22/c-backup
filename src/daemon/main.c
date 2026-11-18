@@ -9,6 +9,8 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
 #include <signal.h>
@@ -18,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cutils/appguard.h>
@@ -79,6 +82,60 @@
  * the database is still open. A second signal still forces the exit.
  */
 static atomic_int running = 1;
+
+/*
+ * Shutdown's budget (B218). Docker sends SIGKILL 10 s after SIGTERM unless
+ * told otherwise, and a stop that ends in SIGKILL is a crash: the job is
+ * recorded interrupted at the next start and whatever the WAL holds is read
+ * back then. A test server's stop took 53 s, nearly all of it the last
+ * connection's close copying a large WAL into the database. Now that copy is
+ * bounded (checkpointer_finish) and so is the wait for running jobs, and
+ * together with the rest of the ladder a stop stays well under 10 s.
+ */
+#define SHUTDOWN_JOB_GRACE_MS  6000   /* running jobs, from the cancel */
+#define SHUTDOWN_CKPT_MS       1000   /* the final checkpoint's copy */
+#define SHUTDOWN_STEP_WARN_MS  1000   /* a step slower than this is logged */
+
+static uint64_t mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
+/* So the next slow stop says where its time went. */
+static void shutdown_step(const char *what, uint64_t *t)
+{
+    uint64_t now = mono_ms();
+    /* 0: a failed startup that entered the ladder below this step. */
+    if (*t && now - *t >= SHUTDOWN_STEP_WARN_MS)
+        log_warn("shutdown: %s took %.1f s", what, (double)(now - *t) / 1000.0);
+    *t = now;
+}
+
+/*
+ * A job that did not stop within its grace is still inside the database
+ * and its repository, so the rest of the ladder cannot run under it: exit
+ * as a kill would, but say so first and make the WAL durable, which is all
+ * a kill would lose beyond what a power cut is already proven against. The
+ * next start records the job as interrupted.
+ */
+static void abandon_shutdown(const char *db_path)
+{
+    log_error("shutdown: %s; exiting now without the rest of the shutdown, as a kill would. "
+              "The next start records the job as interrupted and reads the WAL back",
+              err_msg());
+    if (db_path && *db_path) {
+        char wal[PATH_MAX + 8];
+        snprintf(wal, sizeof(wal), "%s-wal", db_path);
+        int fd = open(wal, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            if (fsync(fd) != 0) log_error("shutdown: cannot sync %s: %s", wal, strerror(errno));
+            close(fd);
+        }
+    }
+    _exit(1);
+}
 
 static void on_signal(int sig, void *ctx)
 {
@@ -301,6 +358,8 @@ int main(int argc, char *argv[])
      * so no jump passes an initialisation.
      */
     int rc = 1;
+    /* Shutdown's clock, started at the first rung it reaches. */
+    uint64_t t_stop0 = 0, t_step = 0;
     job_manager_t *jm = NULL;
     scheduler_t *sched = NULL;
     api_server_t *srv = NULL;
@@ -663,41 +722,58 @@ int main(int argc, char *argv[])
     rc = 0;
 
 out_srv:
+    t_stop0 = t_step = mono_ms();
     api_server_stop(srv);
     /* No route can open one now; close every export while the database
      * is there to record it. */
     exports_shutdown();
+    shutdown_step("stopping the API and exports", &t_step);
 out_sched:
     scheduler_stop(sched);      /* NULL when disabled by config */
 out_jm:
-    job_manager_stop(jm);
+    if (job_manager_stop_within(jm, SHUTDOWN_JOB_GRACE_MS) != OK)
+        abandon_shutdown(db_path);
+    shutdown_step("stopping running jobs", &t_step);
     /* After the jobs: none is in a session any more. Both are safe when
      * startup failed before they were set up. */
     units_shutdown();
     remote_stop();
     sp_registry_shutdown();
+    shutdown_step("closing unit sessions and providers", &t_step);
 out_purge:
     repo_purge_stop();
 out_locks:
     repo_locks_shutdown();
-    /* After every writer has stopped: one last sync of the WAL. A no-op
-     * when it was never started. */
-    checkpointer_stop();
+    /* After every writer has stopped, the thread goes, a copy in progress
+     * interrupted rather than waited for (B218); a no-op when it never
+     * started. The flusher's stop then syncs the WAL a last time. */
+    checkpointer_halt();
     sync_latch_persist_drain();
     state_db_flusher_stop();
     /* Let go of the kept WAL descriptor before the close deletes the file,
      * so the process does not pin a deleted inode on its way out. */
     wal_sync_reset();
+    shutdown_step("stopping the checkpointer and flusher", &t_step);
 out_guard:
-    /* A connection checkpointer_open made for a startup that failed before
-     * the thread started; nothing when the ladder above already closed it. */
-    checkpointer_stop();
     /* Every thread that could look an object up has stopped by here; on a
      * path that never opened them this does nothing. */
     db_readers_close();
+    /* The last copy, bounded (B218). A WAL too large to copy in the budget
+     * is left for the next start: the checkpointer's connection closes
+     * last, after the shared handle, so neither close copies it. */
+    (void)checkpointer_finish(SHUTDOWN_CKPT_MS);
     appguard_shutdown(guard);
+    checkpointer_stop();
     /* After the database is closed: closing -shm sooner would drop the
      * locks its connections hold (B173). */
     walidx_close_all();
+    {
+        uint64_t now = mono_ms();
+        if (t_step && now - t_step >= SHUTDOWN_STEP_WARN_MS)
+            fprintf(stderr, "shutdown: closing state.db took %.1f s\n",
+                    (double)(now - t_step) / 1000.0);
+        if (rc == 0)
+            fprintf(stderr, "c-backupd stopped in %.1f s\n", (double)(now - t_stop0) / 1000.0);
+    }
     return rc;
 }

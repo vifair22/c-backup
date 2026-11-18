@@ -20,9 +20,15 @@
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <time.h>
 
 static atomic_int full_vfs_armed;
 static atomic_int full_vfs_hits;
+/* A slow disk instead of a full one (B218): while non-zero, every write to
+ * a main database or WAL file waits this many microseconds first, and is
+ * counted in full_vfs_slow_writes. */
+static atomic_int full_vfs_delay_us;
+static atomic_int full_vfs_slow_writes;
 static sqlite3_vfs *full_vfs_real;
 
 typedef struct {
@@ -45,6 +51,12 @@ static int fv_write(sqlite3_file *f, const void *b, int n, sqlite3_int64 o)
     if (((full_vfs_file_t *)f)->target && atomic_load(&full_vfs_armed)) {
         atomic_fetch_add(&full_vfs_hits, 1);
         return SQLITE_FULL;
+    }
+    int us = atomic_load(&full_vfs_delay_us);
+    if (((full_vfs_file_t *)f)->target && us > 0) {
+        atomic_fetch_add(&full_vfs_slow_writes, 1);
+        struct timespec ts = { us / 1000000, (long)(us % 1000000) * 1000L };
+        nanosleep(&ts, NULL);
     }
     return FV_REAL(f)->pMethods->xWrite(FV_REAL(f), b, n, o);
 }

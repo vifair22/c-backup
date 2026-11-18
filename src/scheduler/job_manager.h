@@ -46,6 +46,14 @@ void     job_manager_set_alerts(job_manager_t *jm, int enabled);
  * joined. A submit racing the shutdown is refused. */
 void     job_manager_stop(job_manager_t *jm);
 
+/* job_manager_stop, waiting at most grace_ms (0: for ever) for running jobs
+ * to stop (B218); they are cancelled with CANCEL_SHUTDOWN (store.h). OK
+ * once stopped and freed. ERR_BUSY, each job still running logged by id,
+ * when one has not stopped by then: the manager is left as it is, still in
+ * use by that job, and nothing but another job_manager_stop_within (which
+ * finishes the stop) may touch it. The daemon exits instead. */
+status_t job_manager_stop_within(job_manager_t *jm, unsigned grace_ms);
+
 /*
  * How a repo-scoped job holds its repository while it runs. The job manager
  * takes the lock before the job starts and releases it after the job
