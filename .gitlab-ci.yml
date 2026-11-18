@@ -420,8 +420,8 @@ sanitize-units:
   script:
     - mkdir -p "$C_BACKUP_TEST_DIR"
     - make test-asan SAN_ONLY='test_helper test_helper_remote test_units test_units_incremental
-        test_docker test_lxc test_providers test_mounts test_begin_paths test_units_e2e.sh test_helper_e2e.sh
-        test_source_snapshot_e2e.sh'
+        test_docker test_lxc test_providers test_mounts test_begin_paths test_db_template test_units_e2e.sh
+        test_helper_e2e.sh test_source_snapshot_e2e.sh'
   artifacts:
     when: on_failure
     expire_in: 1 week
@@ -437,6 +437,8 @@ sanitize-units:
           - src/api/routes/units*
           - tests/*helper*
           - tests/*units*
+          - tests/test_db_template.c
+          - src/providers/remote_provider.*
 
 # real-engines with the programs built under ASan and UBSan (B192): the same
 # sibling, run.sh and teardown, with CBK_SANITIZE=1 selecting the sanitizer

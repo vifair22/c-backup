@@ -473,6 +473,9 @@ static status_t x_hook_start(sp_ctx_t *c, const char *unit_id, const policy_hook
     if (!valid_name(unit_id)) return set_error(ERR_INVALID, "lxc: bad container name");
     if (h->container[0] && strcmp(h->container, unit_id) != 0)
         return set_error(ERR_INVALID, "lxc: hook %s names %s, not %s", h->name, h->container, unit_id);
+    /* lxc-attach takes a uid, not a name the container resolves; the one
+     * template with a user (nextcloud-maintenance) is not offered here. */
+    if (h->user[0]) return set_error(ERR_INVALID, "lxc: hook %s runs as %s, which lxc-attach cannot name", h->name, h->user);
     char bin[HOST_TOOL_PATH_MAX + 16];
     snprintf(bin, sizeof(bin), "%s/lxc-attach", c->tools.lxc_dir);
     const char *argv[POLICY_ARGV_MAX + 16];
@@ -699,6 +702,36 @@ static status_t x_define(sp_ctx_t *c, const char *unit_id, const char *definitio
     return st;
 }
 
+/*
+ * Where a database template runs (db-detection.md 7.2): the container
+ * itself, and a path inside its rootfs as the container sees it. A
+ * database on a bind mount entry is not mapped: lxc.mount.entry's target
+ * is relative to the rootfs and not kept in the description.
+ */
+static status_t x_db_target(sp_ctx_t *c, const char *unit_id, const char *path, char *container,
+                            size_t csz, char *cpath, size_t psz)
+{
+    snprintf(container, csz, "%s", unit_id);
+    cpath[0] = '\0';
+    if (!path) return OK;
+    sp_unit_desc_t *d = NULL;
+    status_t st = x_describe(c, unit_id, &d);
+    if (st != OK) return st;
+    st = set_error(ERR_NOT_FOUND, "lxc: %s is not inside the rootfs of %s", path, unit_id);
+    for (size_t i = 0; i < d->n_items; i++) {
+        const sp_item_desc_t *it = &d->items[i];
+        size_t l = it->tree_path ? strlen(it->tree_path) : 0;
+        if (it->kind != SP_ITEM_TREE || strcmp(it->id, "rootfs") != 0 || !l ||
+            strncmp(path, it->tree_path, l) != 0 || (path[l] != '\0' && path[l] != '/'))
+            continue;
+        snprintf(cpath, psz, "%s", path[l] ? path + l : "/");
+        err_clear();
+        st = OK;
+    }
+    sp_unit_desc_free(d);
+    return st;
+}
+
 status_t lxc_backend_init(const helper_policy_t *pol, helper_backend_t *out)
 {
     struct sp_ctx *c = calloc(1, sizeof(*c));
@@ -715,7 +748,7 @@ status_t lxc_backend_init(const helper_policy_t *pol, helper_backend_t *out)
         .name = "lxc", .ops = &k_lxc_ops, .ctx = c,
         .blob_data = x_blob_data, .unit_state = x_unit_state, .set_running = x_set_running,
         .mount_root = x_mount_root, .hook_start = x_hook_start, .hook_poll = x_hook_poll, .hook_kill = x_hook_kill, .hook_free = x_hook_free,
-        .define = x_define,
+        .define = x_define, .db_target = x_db_target,
     };
     return OK;
 }

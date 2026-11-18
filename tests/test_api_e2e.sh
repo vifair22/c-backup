@@ -2327,6 +2327,53 @@ DB_BODY2=$(sock_body "/jobs/$DB_JOB2")
 contains "found again on the next backup" '"engine":"sqlite"' "$DB_BODY2"
 check "but alerted only once" 0 "$(printf '%s' "$DB_BODY2" | grep -c 'captured uncovered')"
 
+echo "database finding actions"
+# D2 (db-detection.md 7.3, 7.4): preview, enable and dismiss. A file
+# source's only engine copy is sqlite-backup, the daemon's own (9.2), with
+# allow_rollback_lock its one parameter; enabling only records it, for the
+# file backup (D3) to act on.
+FID=$(printf '%s' "$DB_BODY" | sed -n 's/.*"findings":\[{"id":\([0-9]*\).*/\1/p')
+check "the job result names the finding" yes "$([ -n "$FID" ] && echo yes || echo no)"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/preview")
+contains "preview of a file source's finding" ' 200' "$OUT"
+contains "is the daemon's own engine copy" '"kind":"engine-copy"' "$OUT"
+contains "and says where the copy goes" "\"output\":\".cbackup-captures$DBS/app/live.db\"" "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/enable" '{"template":"pg-dumpall"}')
+contains "a file source takes only sqlite-backup" ' 400' "$OUT"
+contains "and says so" 'takes only sqlite-backup' "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/enable" '{}')
+contains "enable names its template" ' 400' "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/enable" '{"template":"sqlite-backup","params":{"allow_rollback_lock":"yes"}}')
+contains "allow_rollback_lock is a boolean" ' 400' "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/enable" '{"template":"sqlite-backup","params":{"lock":true}}')
+contains "and the only parameter" ' 400' "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/enable" '{"template":"sqlite-backup","nope":1}')
+contains "an unknown key is refused" "unknown key 'nope'" "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/enable" '{"template":"sqlite-backup","params":{"allow_rollback_lock":true}}')
+contains "enable records the choice" ' 200' "$OUT"
+contains "the finding is enabled" '"state":"enabled"' "$OUT"
+contains "with its template" '"template":"sqlite-backup"' "$OUT"
+contains "and its params, as given" '"params":{"allow_rollback_lock":true}' "$OUT"
+contains "and who chose it" '"decided_by":"local socket"' "$OUT"
+contains "the choice is journalled with the caller" 'sqlite-backup enabled with params {\"allow_rollback_lock\":true} by local socket' \
+    "$(sock_body "/repos/$DB_ID/journal")"
+DB_JOB3=$(job_id "$(sock_post "/repos/$DB_ID/backup" "{\"paths\":[\"$DBS\"]}")")
+wait_job "$DB_JOB3"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/preview")
+contains "a backup leaves an enabled finding enabled" '"allow_rollback_lock":true' "$OUT"
+check "a finding that does not exist is a 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"reason":"x"}' "http://localhost/repos/$DB_ID/databases/999999/dismiss")"
+check "nor is GET an action" 405 "$(curl -s -o /dev/null -w '%{http_code}' \
+     --unix-socket "$SOCK" "http://localhost/repos/$DB_ID/databases/$FID/enable")"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/dismiss" '{}')
+contains "dismiss needs a reason" ' 400' "$OUT"
+OUT=$(sock_send POST "/repos/$DB_ID/databases/$FID/dismiss" '{"reason":"test data"}')
+contains "dismiss records it" '"state":"dismissed"' "$OUT"
+contains "with the reason" '"reason":"test data"' "$OUT"
+lacks    "and what was enabled stops" '"template"' "$OUT"
+contains "the dismissal is journalled" 'dismissed by local socket, which stops its sqlite-backup: test data' \
+    "$(sock_body "/repos/$DB_ID/journal")"
+
 # D3: an enabled engine copy (db-detection.md 9.2). Enabled here in
 # state.db directly; the enable route records exactly this row.
 check "a restore refuses a prefer_engine_copy that is not a boolean" \

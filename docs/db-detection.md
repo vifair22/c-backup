@@ -1,6 +1,6 @@
 # Database detection and consistent capture
 
-Design document, being built in phases (section 8): D0 and D3 are built;
+Design document, being built in phases (section 8): D0, D2 and D3 are built;
 section 14 records what they settled. It replaces one-off,
 per-application hook decisions (such as an Immich `pg_dumpall`) with a
 general mechanism. c-backup recognises live databases in what it backs up,
@@ -752,3 +752,28 @@ verify read the snapshot and `db_findings`.
 | Restore | `prefer_engine_copy` swaps in the copy's content at the original path (owner, mode and mtime stay the original's), and leaves out `-wal`, `-shm` and `-journal` of a database that has a copy. A flagged database without it names the copy and the flag; one with no copy but a finding names the finding |
 | Verify | Each sample path of the unsettled notice that a SQLite finding names gets a notice of its own with the explanation and the finding id |
 | Reservation | Already in place since `reserved.h`: sources at or under `/.cbackup-captures` are refused, and a source of `/` never records the name |
+
+### 14.3 D2
+
+The template catalog (`src/helper/db_template.c`, linked into the helper,
+which decides, and the daemon, which checks a request and describes it),
+`db.probe` and `hook.run`'s template form in the helper
+(`src/helper/helper_server.c`), the preview, enable and dismiss routes
+(`src/api/routes/db_actions.c`) and CLI, and the next backup running an
+enabled template (`src/units/unit_backup.c`, `src/providers/remote_provider.c`).
+
+| Point | As built |
+|---|---|
+| A unit's enrolment | Its enabled findings: `db_findings` rows of scope `unit:<key>`, state `enabled`, with `template` and `params`. No copy in `unit_policy` that could disagree with the finding |
+| Where a template runs | The daemon sends the finding's recorded path beside `{unit, template, params}` (`path`, in `hook.run` and `db.probe`); the helper picks the Docker member whose included mount holds it, from its own inspect, and maps `sqlite-backup`'s database through the mount's destination. LXC: the container, a path in its rootfs. No container (libvirt): `unsupported` |
+| Exec templates | Run by the daemon through `hook.run` and `hook.wait`, the pre run before `capture.begin` and the post run after it returns, or fails, so a maintenance mode is never left on. `capture.begin` is unchanged. `needs_quiesce` forces no pause: `nextcloud-maintenance`'s effect lasts until its own post run |
+| Output names | `.cbackup-unit/hooks/<template>.dump` and `.log` (pinned); a second finding of one unit enabling the same template gets `<template>-<finding>` |
+| A dump that cannot start | The helper refusing it (the policy changed since enable, the container stopped) is a failed dump, an empty stream with the reason in its log, never a failed unit |
+| Coverage | A stored dump makes a live finding `covered-application` whatever the capture was; an exec template lifts only `covered-crash` and `covered-quiesced`. The unit's own level is the helper's, unchanged |
+| unit.json | A database entry gains `template` `{name, ok, dump}`, additively (version stays 1) |
+| mariadb-dump's `lock_tables` | Replaces `--single-transaction` with `--lock-tables`: `LOCK TABLES` commits any open transaction, so the two do not combine |
+| One tool, two names | The scripts pick `mariadb-dump` or `mysqldump`, `redis-cli` or `valkey-cli`, whichever the image has; occ is looked for where the official and linuxserver images keep it |
+| Timeouts | Dumps 6 hours, exec templates 10 minutes, probes 30 s |
+| Preview's default | The finding's suggestion, else what is enabled, else the engine's first template the default policy allows (a covered finding names its dump only as `optional`) |
+| Not built | The estimated size from the engine's own size query (7.3): no probe reports one yet. The real-engines CI job has no network, so 11.2's `db-fixtures` engines are not run there; templates are tested through the fake backend with stand-in tools |
+| The UI buttons | Left to follow D1's cards |

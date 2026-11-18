@@ -3201,8 +3201,8 @@ anything is sent to the daemon:
 - An option the command does not take is refused with `unknown option`, and
   a positional past the ones it takes with `unexpected argument`:
   `grep runs 1 2` is an error, not repository 1's runs.
-- Only `--exclude` and `--source` repeat. Any other option given twice is
-  refused rather than one copy being picked.
+- Only `--exclude`, `--source` and `--param` repeat. Any other option given
+  twice is refused rather than one copy being picked.
 
 Each refusal prints the reason and the command's usage to stderr and exits
 1; nothing reaches the daemon. `c-backup <command> --help` (or `-h`, before
@@ -3247,6 +3247,8 @@ lists every command with all of its arguments.
 | `unit restore <id> <snapshot> <dest> [--item ID] [--overwrite]` | A unit snapshot as files, or one disk as a sparse raw image |
 | `unit restore <id> <snapshot> --define [--replace \| --name N --target-root DIR] [--pin-digest] [--start] [--keep-macs]` | Re-create the unit (section 22.7.3) |
 | `unit policy show\|set <id> --provider P <unit> [key value]` | Per-unit retention, `capture.exclude`, `capture.group` |
+| `db preview <id> <finding> [--template NAME] [--param KEY=VALUE]...` | The exact hook a template would run for a finding, and its probe (section 23.7) |
+| `db enable <id> <finding> --template NAME [--param KEY=VALUE]...`, `db dismiss <id> <finding> --reason TEXT` | Run a template from the next backup on; stop a finding being raised (section 23.7) |
 | `vm export <id> <snapshot> <disk> [--ttl N[s\|m\|h\|d]]`, `vm exports`, `vm export-show <export-id>`, `vm unexport <export-id>` | Read-only NBD export of a VM disk (section 22.8) |
 | `vm checkpoints <id> <vm>`, `vm reset-incremental <id> <vm>` | A VM's incremental chain; incrementals back on after a failed audit (section 6.5) |
 | `jobs [--limit N] [--offset N]`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
@@ -3699,6 +3701,13 @@ freeze_timeout_s = 20
 scratch_dir = /mnt/cache/system/cbackup-scratch
 # staging_root = /mnt/cache/system/cbackup-vmstate
 
+[db]
+# Database templates hook.run may build (23.7). Without the key, the stdout
+# dumps, which write nothing inside an application's data; the three that
+# do are opt-in per host.
+allow_templates = pg-dumpall, pg-dump, pg-basebackup, mariadb-dump, redis-rdb, sqlite-backup, influx2-backup, mongodump
+# allow_templates = pg-dumpall, pg-dump, pg-basebackup, mariadb-dump, redis-rdb, sqlite-backup, influx2-backup, mongodump, redis-bgsave, prometheus-snapshot, nextcloud-maintenance
+
 [hook immich-pg_dumpall]
 unit = docker:compose:immich
 # dump: stdout is stored as the backup; run: only its log is kept.
@@ -3980,7 +3989,7 @@ units are the containers under the policy's `[lxc] path`.
 | `.cbackup-unit/config/` | each member's `docker inspect` output verbatim, its image record (`Id`, `RepoTags`, `RepoDigests`), its Unraid template (from `templates-user/my-<name>.xml`) when one exists, the project's compose files and `.env`; for LXC the container's config file |
 | `.cbackup-unit/config/mounts.json` | every mount of every member: `container`, `destination`, `source` (as the container binds it), `real` (where the bytes are), `outcome` and, for snapshotted ones, `domain`; plus `suggested_excludes` |
 | the data | every included mount, recorded at its **source path** (the path Docker binds), so a plain file restore puts it back where the container expects it |
-| `.cbackup-unit/hooks/` | `<hook>.log` for every hook, `<hook>.dump` for each dump hook (22.5.5) |
+| `.cbackup-unit/hooks/` | `<hook>.log` for every hook, `<hook>.dump` for each dump hook (22.5.5); the same for each enabled database template, named after it (23.7) |
 
 Definitions are stored verbatim, environment variables and template fields
 included: an unencrypted repository holds them in the clear.
@@ -4854,3 +4863,137 @@ Other engines in a plain file source run as host services or in containers
 c-backup does not manage, and there is no credential-free copy of them
 from the daemon: back the application up as a unit, or use source snapshot
 mode.
+
+### 23.7 Enabling a suggestion
+
+A finding is acted on only by an explicit call from an authenticated caller:
+**preview**, then **enable**, or **dismiss**. Nothing is enabled by a
+schedule, an upgrade, a default or a detection. Every enable and dismiss is
+journalled (`source` `db`, operations `db-enable` and `db-dismiss`) with
+who made it: `local socket` for the CLI, or `tcp <address> session <id>`
+for the desktop app, where the session id is the first 16 hex digits of the
+token's SHA-256, never the token.
+
+```sh
+c-backup db preview 1 12                          # the finding's suggestion
+c-backup db preview 1 12 --template pg-dump --param user=immich --param database=immich
+c-backup db enable 1 12 --template pg-dumpall
+c-backup db dismiss 1 12 --reason "test data"
+```
+
+`--param KEY=VALUE` repeats; `true` and `false` are booleans and digits are
+numbers, as the template's typed parameters want.
+
+**Templates.** A unit's suggestion becomes a hook built from a template
+compiled into the helper: a fixed argv, or a fixed shell script written once
+in the catalog, plus typed parameters. The daemon sends only the template's
+name, its parameters and the finding's path; the helper builds the argv
+itself, and no parameter ever reaches the script text (each is an argv
+element of its own, or a positional argument after the script). Credentials
+are read inside the database's container, from its own environment
+(`$POSTGRES_USER`, `$MARIADB_ROOT_PASSWORD`, `$MONGO_INITDB_ROOT_PASSWORD`,
+`REDISCLI_AUTH`, `$DOCKER_INFLUXDB_INIT_ADMIN_TOKEN`), so c-backup neither
+stores nor sees them.
+
+| Template | Engine | Kind | Parameters | Allowed by default |
+|---|---|---|---|---|
+| `pg-dumpall` | postgres | dump | none | yes |
+| `pg-dump` | postgres | dump | `user`, `database`: `[a-z_][a-z0-9_]{0,62}`, both required | yes |
+| `pg-basebackup` | postgres | dump (a tar stream; one tablespace only) | none | yes |
+| `mariadb-dump` | mysql | dump (`mysqldump` on a MySQL image) | `lock_tables` bool: `--lock-tables` in place of `--single-transaction`, for MyISAM | yes |
+| `redis-rdb` | redis | dump (`valkey-cli` on Valkey) | none | yes |
+| `sqlite-backup` | sqlite | dump (through a file in the container's `/tmp`) | `db`: the finding's own path, filled in by the daemon | yes |
+| `influx2-backup` | influxdb2 | dump (a tar stream) | none | yes |
+| `mongodump` | mongodb | dump (`--archive`, uncompressed) | none | yes |
+| `redis-bgsave` | redis | exec, before the capture (rewrites `dump.rdb`) | none | no |
+| `prometheus-snapshot` | prometheus | exec, before and after (writes `snapshots/` in the TSDB; needs `--web.enable-admin-api`) | `port` 1 to 65535, default 9090 | no |
+| `nextcloud-maintenance` | nextcloud | exec, before and after, as `www-data` (rewrites `config.php`) | none | no |
+
+**The helper's policy has the final say.** `[db] allow_templates` in the
+policy (section 22.2.3) lists the templates `hook.run` may build. Without the
+key, the stdout dumps are allowed: the eight that write nothing inside the
+application's data. The three that write into it or change its state are
+opt-in per host and ship commented out:
+
+```ini
+[db]
+allow_templates = pg-dumpall, pg-dump, pg-basebackup, mariadb-dump, redis-rdb, sqlite-backup, influx2-backup, mongodump
+# allow_templates = pg-dumpall, pg-dump, pg-basebackup, mariadb-dump, redis-rdb, sqlite-backup, influx2-backup, mongodump, redis-bgsave, prometheus-snapshot, nextcloud-maintenance
+```
+
+The key, when present, is the whole list: a template it leaves out is
+refused. An unknown name in it refuses the helper's start. Every template's
+probe runs whatever the key says, because a probe reads no data. Enabling a
+template the policy does not allow is refused (409) with the line to add,
+built from the policy the helper last reported:
+
+```json
+{"error":"template pg-dump is not allowed by the helper's policy; add it there first: [db] allow_templates = pg-dumpall, pg-dump","policy_line":"[db] allow_templates = pg-dumpall, pg-dump"}
+```
+
+**Preview** (`POST /repos/<id>/databases/<f>/preview`) shows the exact argv
+the helper will run (`argv`, and `post_argv` for an exec template with a
+post run), the container and user it runs as, the output file, whether the
+policy allows it (with `policy_line` when it does not), and runs the
+template's probe through the helper (`db.probe`, at most 30 s, output capped
+at 64 KiB): `psql -Atc 'select version()'` for PostgreSQL, the non-InnoDB
+tables for MariaDB, `PING` for Redis, `sqlite3 -version`, the admin API's
+flags for Prometheus, `php occ status` for Nextcloud. `verified` is true when
+the probe exited 0. An unverified template still enables; the preview only
+says so. With no `--template`, a preview shows the finding's suggestion, or
+what is enabled, or for a covered finding the engine's default dump.
+
+**Enable** (`POST /repos/<id>/databases/<f>/enable`, body
+`{"template":"pg-dumpall","params":{}}`) records the template and its
+parameters on the finding (state `enabled`); the unit's next backup runs it.
+A unit's enrolment of templates is exactly its enabled findings: there is no
+second copy to disagree. One template per finding; enabling again replaces
+it. The template must be for the finding's engine, and its parameters must
+check, or the call is refused (400) naming the rule.
+
+**Dismiss** (`POST .../dismiss`, body `{"reason":"..."}`, 1 to 512 bytes)
+records the reason and stops the finding being raised again until its
+engine's version changes (23.4). A dismissed finding runs nothing: an
+enabled template stops at the next backup.
+
+**What the next backup does.** For a unit:
+
+- A **dump** template runs while the unit is read, after the snapshot, as a
+  policy dump hook does (22.5.5): its stdout streams into the snapshot at
+  `.cbackup-unit/hooks/<template>.dump`, its stderr and exit status to
+  `.cbackup-unit/hooks/<template>.log`. When two findings of one unit enable
+  the same template, the later finding's files are
+  `<template>-<finding id>.dump` and `.log`.
+- An **exec** template's pre run runs to its end before the capture begins,
+  and its post run once the capture has its point in time, or has failed (a
+  maintenance mode is never left on). Its log, both runs, is
+  `.cbackup-unit/hooks/<template>.log`.
+- The finding's coverage reflects it: a stored dump is a consistent copy at
+  its own instant, so the finding is `covered-application` whatever the
+  capture was; an exec template lifts a capture that was already one
+  instant (`covered-crash` or `covered-quiesced`) to `covered-application`,
+  and leaves `split`, `uncovered` and `engine-unsafe` as they were.
+- `unit.json`'s entry for the database says which template ran and whether
+  it succeeded, and for a stored dump where it is:
+  `"template":{"name":"pg-dumpall","ok":true,"dump":".cbackup-unit/hooks/pg-dumpall.dump"}`.
+
+A template that fails never fails the unit. A dump that exits non-zero,
+times out, or cannot start (the helper refusing it, the container not
+running) is left out of the snapshot, as a failed policy dump is (a
+truncated dump looks valid): the unit carries the warning "N dump(s) failed
+and are not in snapshot S", the log says why, and the finding keeps the
+coverage the capture itself achieved. An exec template whose pre run fails
+is a warning, and the capture goes ahead.
+
+Dumps run for at most 6 hours and exec templates for 10 minutes. Templates
+run only through the helper, inside the unit's own container (a Docker
+member whose mount holds the finding's path, or the LXC container itself;
+an LXC database must be inside its rootfs, and `nextcloud-maintenance` is
+Docker only). A VM has no container, so a VM's finding has no template.
+
+For a **file source**, the only engine copy is the daemon's own SQLite
+online backup (`docs/db-detection.md` 9.2), so the only template is
+`sqlite-backup`, with one optional parameter, `allow_rollback_lock` (a
+rollback-journal database's copy holds a shared lock that blocks the
+application's writers while it runs). Enabling it records the choice; the
+file backup reads it and stores the copy under `.cbackup-captures/` (23.6).
