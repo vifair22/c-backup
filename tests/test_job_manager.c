@@ -309,6 +309,50 @@ static void test_an_end_the_database_cannot_take_is_kept_and_retried(void **stat
                               " AND operation = 'backup' AND result = 'failed'"), 1);
 }
 
+/* The same for a job that completed with warnings: the held end keeps its
+ * "warning" result and message, and writes them when it can. */
+static status_t warned_then_full_job(void *arg, atomic_int *cancel,
+                                     void (*progress)(const char *, uint64_t, uint64_t, void *),
+                                     void *progress_ctx)
+{
+    (void)arg; (void)cancel; (void)progress;
+    job_set_summary(progress_ctx, "snapshot 8: 4 files");
+    job_set_warning(progress_ctx, "1 file(s) could not be read and are not in snapshot 8");
+    full_vfs_arm(1);
+    atomic_store(&full_vfs_hits, 0);
+    return OK;
+}
+
+static void test_a_held_end_keeps_its_warning(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, warned_then_full_job, NULL, NULL, &id), OK);
+    job_end_view_t ev;
+    int held = 0;
+    for (int i = 0; i < 2000 && !held; i++) {
+        held = job_end_unrecorded(db, id, &ev);
+        if (!held) usleep(5000);
+    }
+    assert_true(held);
+    assert_string_equal(ev.state, "completed");
+    free(ev.result);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 1"), 0);
+
+    full_vfs_arm(0);
+    submit(2, "gc");
+    char sql[160];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM jobs WHERE id = %lld AND state = 'completed'",
+             (long long)id);
+    assert_int_equal(wait_db_count(sql, 1), 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 1"
+                              " AND operation = 'backup' AND result = 'warning'"
+                              " AND message = 'snapshot 8: 4 files; warning: 1 file(s) could"
+                              " not be read and are not in snapshot 8'"), 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 1"
+                              " AND result = 'success'"), 0);
+}
+
 /*
  * Four jobs, one repository, two workers. Before the dispatcher consulted
  * repo_id this ran two at a time and half of them died on the write lock.
@@ -1693,6 +1737,145 @@ static void test_warning_alert_text(void **state)
                                  "2 file(s) could not be read"));
 }
 
+/*
+ * A job that completes with warnings journals result "warning", with the
+ * warnings after its summary, and a clean one journals "success". The job
+ * row is deleted after 30 days and the journal is the permanent record, so
+ * a warned job journalled as a plain success lost the warning for good.
+ */
+typedef struct { const char *summary; int n; const char *const *w; } warned_spec_t;
+
+static status_t warned_job(void *arg, atomic_int *cancel,
+                           void (*progress)(const char *, uint64_t, uint64_t, void *),
+                           void *progress_ctx)
+{
+    (void)cancel; (void)progress;
+    const warned_spec_t *sp = arg;
+    if (sp->summary) job_set_summary(progress_ctx, sp->summary);
+    for (int i = 0; i < sp->n; i++) job_set_warning(progress_ctx, sp->w[i]);
+    return OK;
+}
+
+/* The journal entry of a job, as "result|message", into out. */
+static void journal_of(const warned_spec_t *sp, char *out, size_t cap)
+{
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 3, "backup", NULL, warned_job, (void *)sp, NULL, &id), OK);
+    wait_ended(id);
+    char q[160];
+    snprintf(q, sizeof(q), "SELECT result || '|' || COALESCE(message, '') FROM journal"
+             " WHERE repo_id = 3 ORDER BY id DESC LIMIT 1");
+    assert_int_equal(db_text(q, out, cap), 0);
+}
+
+static void test_warnings_are_journalled(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, label, added_at)"
+        " VALUES (3, 'u-3', '/srv/repos/docs', 'docs', 0)", NULL, NULL), 0);
+    char got[4096];
+
+    /* Clean: plain success, the summary as it always was. */
+    warned_spec_t clean = { "snapshot 4: 10 files", 0, NULL };
+    journal_of(&clean, got, sizeof(got));
+    assert_string_equal(got, "success|snapshot 4: 10 files");
+
+    /* One warning, no summary: the warning alone. */
+    static const char *const one[] = { "unit vm1: released by the watchdog" };
+    warned_spec_t w1 = { NULL, 1, one };
+    journal_of(&w1, got, sizeof(got));
+    assert_string_equal(got, "warning|warning: unit vm1: released by the watchdog");
+
+    /* One warning after a summary. */
+    static const char *const skip[] = {
+        "1 file(s) could not be read and are not in snapshot 5; first: /d/x: denied" };
+    warned_spec_t ws = { "snapshot 5: 9 files", 1, skip };
+    journal_of(&ws, got, sizeof(got));
+    assert_string_equal(got, "warning|snapshot 5: 9 files; warning: 1 file(s) could not "
+                             "be read and are not in snapshot 5; first: /d/x: denied");
+
+    /* Several: counted and all listed; the job is still completed. */
+    static const char *const three[] = { "unit a: thawed", "unit b: crash", "scope note" };
+    warned_spec_t w3 = { "fake: 2 unit(s) backed up", 3, three };
+    journal_of(&w3, got, sizeof(got));
+    assert_string_equal(got, "warning|fake: 2 unit(s) backed up; 3 warnings: unit a: thawed; "
+                             "unit b: crash; scope note");
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state != 'completed'"), 0);
+    /* Filterable: --result warning finds the three, success the one. */
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE result = 'warning'"), 3);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE result = 'success'"), 1);
+}
+
+/* Several warnings, one alert: the count and the list, never one per item. */
+static void test_several_warnings_alert_once(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, label, added_at)"
+        " VALUES (3, 'u-3', '/srv/repos/docs', 'docs', 0)", NULL, NULL), 0);
+    g_alert_log[0] = '\0';
+    int h = log_stream_register(capture_alert, NULL);
+    assert_true(h >= 0);
+    static const char *const three[] = { "item 1 recoverable", "item 2 recoverable",
+                                         "item 3 recoverable" };
+    warned_spec_t w3 = { "verify run 9", 3, three };
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 3, "verify", NULL, warned_job, (void *)&w3, NULL, &id), OK);
+    wait_ended(id);
+    char want[96];
+    snprintf(want, sizeof(want), "warning notification for job %lld", (long long)id);
+    int seen = 0;
+    for (int i = 0; i < 200 && !seen; i++) {
+        pthread_mutex_lock(&g_alert_mu);
+        seen = strstr(g_alert_log, want) != NULL;
+        pthread_mutex_unlock(&g_alert_mu);
+        if (!seen) usleep(10000);
+    }
+    usleep(50000);
+    log_stream_unregister(h);
+    pthread_mutex_lock(&g_alert_mu);
+    int n = 0;
+    for (const char *p = g_alert_log; (p = strstr(p, "notification for job")) != NULL; p++) n++;
+    int has_all = strstr(g_alert_log, "3 warnings: item 1 recoverable; item 2 recoverable; "
+                                      "item 3 recoverable") != NULL;
+    int failure = strstr(g_alert_log, "failure notification") != NULL;
+    pthread_mutex_unlock(&g_alert_mu);
+    assert_true(seen);
+    assert_int_equal(n, 1);
+    assert_true(has_all);
+    assert_false(failure);
+}
+
+/* Bounded: one long warning is cut, and those past the total are counted. */
+static void test_journalled_warnings_are_bounded(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, label, added_at)"
+        " VALUES (3, 'u-3', '/srv/repos/docs', 'docs', 0)", NULL, NULL), 0);
+    static char big[3000];
+    memset(big, 'x', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    const char *many[40];
+    char small[40][64];
+    many[0] = big;
+    for (int i = 1; i < 40; i++) {
+        snprintf(small[i], sizeof(small[i]), "warning number %02d %040d", i, 0);
+        many[i] = small[i];
+    }
+    warned_spec_t w = { NULL, 40, many };
+    char got[8192];
+    journal_of(&w, got, sizeof(got));
+    assert_true(strncmp(got, "warning|40 warnings: xxx", 24) == 0);
+    assert_true(strlen(got) < 2048 + 64);
+    /* The long one is cut, and marked as cut. */
+    assert_non_null(strstr(got, "xxx...; warning number 01"));
+    assert_null(strstr(got, "warning number 39"));
+    assert_non_null(strstr(got, " more)"));
+    assert_non_null(strstr(got, "(and "));
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1715,6 +1898,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_alert_names_repository_and_error, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_warning_is_alerted_and_the_job_completes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_warning_alert_text, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_warnings_are_journalled, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_journalled_warnings_are_bounded, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_several_warnings_alert_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_job_waits_for_a_request_holding_the_repo, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_running_job_still_refuses_requests, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_deferred_job_can_be_cancelled, setup, teardown),
@@ -1728,6 +1914,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_crossed_sets_both_complete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_stream_on_dst_cannot_starve_a_set, setup, teardown),
         cmocka_unit_test_setup_teardown(test_an_end_the_database_cannot_take_is_kept_and_retried, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_held_end_keeps_its_warning, setup, teardown),
     };
     if (full_vfs_install() != 0) return 1;
     return cmocka_run_group_tests(tests, NULL, NULL);

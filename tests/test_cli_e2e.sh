@@ -164,6 +164,8 @@ contains "repo show" '"uuid"' "$(cb repo show 1)"
 # nothing to poll and the assertion is on the outcome rather than on the
 # daemon having accepted the request.
 contains "backup waits and completes" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
+contains "a clean backup journals success" '"operation":"backup","result":"success"' \
+    "$(cb journal 1 --limit 1)"
 contains "jobs list"     '"action"'            "$(cb jobs)"
 contains "snapshots"     '"id":1,'             "$(cb snapshots 1)"
 contains "ls"            '"name"'              "$(cb ls 1 1)"
@@ -414,6 +416,23 @@ contains "and the refusal says where it is" 'already on snapshot 1' "$OUT"
 contains "--move moves it" '"ok"' "$(cb tag set 1 pinned 2 --move)"
 contains "to the new snapshot" '"snap_id":2' "$(cb tag list 1)"
 cb tag remove 1 pinned > /dev/null
+
+# A backup that leaves a file out completes, and journals "warning" with the
+# file, not "success": the job row goes after 30 days, the journal stays.
+# Root reads anything, so the unreadable file only works unprivileged.
+if [ "$(id -u)" -ne 0 ]; then
+    mkdir -p "$WORK/warnsrc"
+    echo "fine"   > "$WORK/warnsrc/fine.txt"
+    echo "secret" > "$WORK/warnsrc/secret.txt"
+    chmod 000 "$WORK/warnsrc/secret.txt"
+    contains "a backup with a skipped file completes" '"state":"completed"' \
+        "$(cb backup 1 "$WORK/warnsrc")"
+    OUT=$(cb journal 1 --result warning --limit 1)
+    contains "and journals a warning" '"operation":"backup","result":"warning"' "$OUT"
+    contains "naming the file" "could not be read and are not in snapshot" "$OUT"
+    contains "and which one" "warnsrc/secret.txt" "$OUT"
+    chmod 600 "$WORK/warnsrc/secret.txt"
+fi
 
 # Exclusions have to work from the CLI too, which is where anyone would
 # actually type them.
@@ -912,12 +931,33 @@ if [ -n "$DRY_OBJ" ]; then
     check    "a dry run over recoverable damage succeeds" 0 "$RC"
     contains "and reports nothing repaired" '"repaired":0,' "$OUT"
     contains "but the damage recoverable"   '"recoverable":1,' "$OUT"
+    # Damage left in the repository is a warning: journalled as one, and
+    # alerted once, as a warning, never as a failure. verify prints its run,
+    # not its job; the newest job is this one.
+    VJ=$(cb jobs --limit 1 | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    JRN=$(cb journal "$DRY_ID" --limit 1)
+    contains "a check-only verify over recoverable damage journals a warning" \
+        '"operation":"verify","result":"warning"' "$JRN"
+    contains "with the count" "found 1 recoverable item(s), not repaired (check only)" "$JRN"
+    N=0
+    for _ in $(seq 1 100); do
+        N=$(grep -c "warning notification for job $VJ not sent" "$WORK/daemon.log")
+        [ "$N" -ge 1 ] && break
+        sleep 0.1
+    done
+    check    "and alerts once, as a warning" 1 "$N"
+    check    "and not as a failure" 0 \
+        "$(grep -c "failure notification for job $VJ[: ]" "$WORK/daemon.log")"
     check    "and leaves the repository untouched" "$DRY_BAD" "$(sha256sum < "$DRY_OBJ")"
     # --dry-run wins over a request that would otherwise repair.
     OUT=$(cb verify "$DRY_ID" --level deep --dry-run 2>&1)
     contains "even with the level named" '"repaired":0,' "$OUT"
     OUT=$(cb verify "$DRY_ID" 2>&1)
     contains "a repairing run fixes it" '"repaired":1,' "$OUT"
+    VJ=$(cb jobs --limit 1 | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    contains "and, nothing left, journals success" '"operation":"verify","result":"success"' \
+        "$(cb journal "$DRY_ID" --limit 1)"
+    check    "with no alert" 0 "$(grep -c "notification for job $VJ[: ]" "$WORK/daemon.log")"
     check    "and writes the right bytes back" "$DRY_GOOD" "$(sha256sum < "$DRY_OBJ")"
 else
     bad "dry-run repo stored the blob" "a file over 1000k" "$(find "$WORK/dryrepo" -type f | head)"

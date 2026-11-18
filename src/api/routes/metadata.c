@@ -888,7 +888,8 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
 
 /*
  * Every result anything journals: a job's outcome (success, failed,
- * cancelled), and the advisories written beside it (warning for an
+ * cancelled, or warning for one that completed with warnings), and the
+ * advisories written beside it (warning for an
  * unescrowed key, a plaintext replica or a unit definition that needed
  * attention; alert for a missing pack). The CLI's --result lists the same.
  */

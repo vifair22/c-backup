@@ -116,6 +116,8 @@ echo "backup"
 OUT=$(cb unit backup 1 --provider fake cbk-uat-a)
 contains "a unit backup completes" '"state":"completed"' "$OUT"
 contains "with the level it achieved" '"consistency":"quiesced"' "$OUT"
+contains "and journals a clean success" '"operation":"units","result":"success"' \
+    "$(cb journal 1 --limit 1)"
 OUT=$(cb unit backup 1 --provider fake prod-db 2>&1); RC=$?
 check    "a named unit outside units.allow fails" 1 "$RC"
 contains "and says why" 'units.allow' "$OUT"
@@ -139,6 +141,10 @@ check    "two of them" 2 "$(printf '%s' "$OUT" | grep -o '"name":"cbk-uat-a"' | 
 OUT=$(cb unit backup 1 --provider fake cbk-uat-a cbk-uat-b --pause-scope job)
 contains "a job scope the provider cannot honour completes" '"state":"completed"' "$OUT"
 contains "and says each unit was its own capture" "each unit was its own capture" "$OUT"
+# The warning outlives the job: the journal is the permanent record.
+OUT=$(cb journal 1 --limit 1)
+contains "and journals a warning, not a success" '"operation":"units","result":"warning"' "$OUT"
+contains "with the warning in it" "each unit was its own capture" "$OUT"
 
 echo "restore"
 OUT=$(cb unit restore 1 1 "$WORK/out")

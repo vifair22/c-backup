@@ -1118,7 +1118,10 @@ job endpoint.
 Finished jobs are kept for 30 days and then deleted, so `/jobs/<id>` answers
 404 for a job older than that. The jobs table is operational state; the
 permanent record of what ran is each repository's journal
-(`GET /repos/<id>/journal`). A job left running or queued by a daemon that
+(`GET /repos/<id>/journal`). A job that completed with warnings is
+journalled with `result` `warning` rather than `success`, its message the
+job's summary followed by the warnings (Manual section 12), so they outlive
+the job row. A job left running or queued by a daemon that
 stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it, and journalled then with that message:
 a daemon that was killed had no chance to journal it itself.

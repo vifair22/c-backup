@@ -611,11 +611,14 @@ typedef struct {
     char          *result;
     /* job_set_summary: the journal message for a job that succeeds. */
     char          *summary;
-    /* job_set_warning: alerted for a job that succeeds anyway. */
+    /* job_set_warning: every warning, joined, for a job that succeeds
+     * anyway; NULL when it raised none. warnings counts all of them and
+     * warnings_shown those that fit in the text (JOB_WARNINGS_MAX). */
     char          *warning;
     /* The phase whose done == total has been written, so a phase that
      * reports its end repeatedly writes it once. */
     int            finished_written;
+    unsigned       warnings, warnings_shown;
 } progress_ctx_t;
 
 /* How often a running job's progress reaches the database. */
@@ -710,14 +713,75 @@ void job_set_summary(void *progress_ctx, const char *text)
     pc->summary = copy;
 }
 
+/*
+ * The warnings' text is bounded: it is a journal message, kept forever, and
+ * a unit backup over many guests can raise one per guest. One warning is
+ * cut at JOB_WARNING_ONE and the whole at JOB_WARNINGS_MAX; a warning that
+ * does not fit is still counted, and the text says how many it left out.
+ */
+#define JOB_WARNINGS_MAX 2048
+#define JOB_WARNING_ONE  1024
+
 void job_set_warning(void *progress_ctx, const char *text)
 {
     progress_ctx_t *pc = progress_ctx;
-    if (!pc || !text) return;
-    char *copy = strdup(text);
-    if (!copy) return;   /* the log line and the result still say it */
-    free(pc->warning);
-    pc->warning = copy;
+    if (!pc || !text || !*text) return;
+    /* Counted first: out of memory still journals the job as warned. */
+    pc->warnings++;
+    if (!pc->warning && !(pc->warning = calloc(1, JOB_WARNINGS_MAX))) return;
+    size_t have = strlen(pc->warning);
+    size_t one = strnlen(text, JOB_WARNING_ONE + 1);
+    int cut = one > JOB_WARNING_ONE;
+    if (cut) {
+        /* Back to a character boundary: the text is served as JSON. */
+        one = JOB_WARNING_ONE - 3;
+        while (one > 0 && ((unsigned char)text[one] & 0xC0u) == 0x80u) one--;
+    }
+    size_t need = (have ? 2 : 0) + one + (cut ? 3 : 0);
+    if (have + need + 1 > JOB_WARNINGS_MAX) return;
+    snprintf(pc->warning + have, JOB_WARNINGS_MAX - have, "%s%.*s%s",
+             have ? "; " : "", (int)one, text, cut ? "..." : "");
+    pc->warnings_shown++;
+}
+
+/*
+ * A job's warnings as one line: the text itself for one, "N warnings: a;
+ * b" for more, with how many did not fit. NULL when there were none or out
+ * of memory; the caller frees it.
+ */
+static char *warnings_text(const progress_ctx_t *pc)
+{
+    if (pc->warnings == 0) return NULL;
+    const char *w = pc->warning ? pc->warning : "";
+    size_t n = strlen(w) + 96;
+    char *out = malloc(n);
+    if (!out) return NULL;
+    unsigned more = pc->warnings - pc->warnings_shown;
+    if (pc->warnings_shown == 0)
+        snprintf(out, n, "%u warning(s), text unavailable", pc->warnings);
+    else if (pc->warnings == 1)
+        snprintf(out, n, "%s", w);
+    else if (more)
+        snprintf(out, n, "%u warnings: %s (and %u more)", pc->warnings, w, more);
+    else
+        snprintf(out, n, "%u warnings: %s", pc->warnings, w);
+    return out;
+}
+
+/*
+ * The journal message for a job that completed with warnings: its summary,
+ * when it has one, then the warnings. The caller frees it; NULL out of
+ * memory, which journals the summary alone.
+ */
+static char *warned_message(const char *summary, const char *warnings, unsigned count)
+{
+    const char *s = summary ? summary : "";
+    size_t n = strlen(s) + strlen(warnings) + 32;
+    char *out = malloc(n);
+    if (!out) return NULL;
+    snprintf(out, n, "%s%s%s%s", s, *s ? "; " : "", count == 1 ? "warning: " : "",
+             warnings);
+    return out;
 }
 
 /* Whether a lock set names repo_id. */
@@ -1004,7 +1068,7 @@ static void *worker_main(void *arg)
         struct timespec began;
         clock_gettime(CLOCK_MONOTONIC, &began);
 
-        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL, NULL, 0 };
+        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0 };
         /* A lock error that is not contention (the lock table is full) fails
          * the job through the same reporting as any other failure. */
         status_t st = slot.lock_err != OK
@@ -1021,7 +1085,20 @@ static void *worker_main(void *arg)
         const char *state;
         const char *detail = NULL;
         int cancelled = atomic_load_explicit(&ws->cancel, memory_order_relaxed);
-        if (st == OK) {
+        /* A job that did what it was asked but raised warnings stays
+         * completed, and journals "warning" with them. The journal is the
+         * permanent record and the job row goes after 30 days, so a backup
+         * that left files out, or a guest the watchdog thawed, journalled
+         * as a plain success lost the warning for good. */
+        char *warn_text = st == OK ? warnings_text(&pc) : NULL;
+        char *warn_msg = NULL;
+        if (st == OK && pc.warnings > 0) {
+            outcome = "warning";
+            state   = "completed";
+            warn_msg = warned_message(pc.summary,
+                                      warn_text ? warn_text : "warnings (out of memory)",
+                                      pc.warnings);
+        } else if (st == OK) {
             outcome = "success";
             state   = "completed";
         } else if (cancelled) {
@@ -1059,11 +1136,15 @@ static void *worker_main(void *arg)
              *
              * A success journalled an empty message, so the entry for a
              * retention pass could not say what it deleted - the one thing
-             * anybody reading a journal of deletions wants.
+             * anybody reading a journal of deletions wants. A job that
+             * completed with warnings journals "warning" and its warnings;
+             * pend_new copies both, so an end held because it could not be
+             * written (B196) carries them when it finally is.
              */
             pending_end_t *e = pend_new(jm->db, slot.job_id, state, detail, slot.repo_id,
                                         slot.schedule_id, slot.origin, slot.action, outcome,
-                                        took, st == OK ? pc.summary : detail, pc.result);
+                                        took, st != OK ? detail : warn_msg ? warn_msg : pc.summary,
+                                        pc.result);
             if (e) {
                 e->has_progress = 1;
                 e->bytes_done  = pc.bytes_done;
@@ -1094,6 +1175,7 @@ static void *worker_main(void *arg)
 
         free(pc.summary);
         pc.summary = NULL;
+        free(warn_msg);
         prune_finished_jobs(jm);
 
         /*
@@ -1133,10 +1215,10 @@ static void *worker_main(void *arg)
          * but at WARN and titled as completed: the job did what it was
          * asked, and the state says so.
          */
-        if (st == OK && pc.warning) {
+        if (st == OK && warn_text) {
             char title[250], body[1024];
             job_warning_compose(jm->db, slot.repo_id, slot.job_id, slot.action,
-                                pc.warning, title, sizeof(title), body, sizeof(body));
+                                warn_text, title, sizeof(title), body, sizeof(body));
             /* Logged either way, at warning, and only called "sending"
              * when there is somewhere to send it (NIT-11). */
             if (atomic_load(&jm->alerts)) {
@@ -1151,6 +1233,7 @@ static void *worker_main(void *arg)
                          (long long)slot.job_id, title, body);
             }
         }
+        free(warn_text);
         free(pc.warning);
         pc.warning = NULL;
         if (st != OK && outcome[0] == 'f') err_clear();
