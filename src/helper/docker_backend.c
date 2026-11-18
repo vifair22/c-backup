@@ -250,7 +250,7 @@ static void item_id(char *buf, size_t sz, const char *prefix, const char *s)
         snprintf(buf, sz, "%s%016llx", prefix, (unsigned long long)fnv(s));
 }
 
-typedef struct { sp_unit_desc_t *d; size_t cap; } dbuild_t;
+typedef struct { sp_unit_desc_t *d; size_t cap; snap_probe_t *probe; } dbuild_t;
 
 static status_t add_item(dbuild_t *b, sp_item_kind_t kind, const char *id, const char *tree_path,
                          const char *source, uint64_t size, uint32_t caps)
@@ -469,10 +469,18 @@ static status_t describe_member(struct sp_ctx *c, dbuild_t *b, const char *unit,
         char outcome[64];
         snap_dom_t dom;
         memset(&dom, 0, sizeof(dom));
+        size_t n_below_out = 0;
+        char below_out[1024] = "";
         if (mc.verdict == MOUNT_EXCLUDED) {
             snprintf(outcome, sizeof(outcome), "excluded:%s", mc.reason);
         } else {
             if ((st = snap_domain_of(&c->snap, mc.real, &dom)) != OK) goto out;
+            /* What its snapshot would show empty (B231): such a mount is
+             * read live, through the fallback, never as an empty tree. */
+            if (dom.kind != SNAP_NONE &&
+                (st = snap_probe_below(b->probe, &dom, mc.real, &n_below_out, below_out, sizeof(below_out))) != OK)
+                goto out;
+            if (n_below_out) memset(&dom, 0, sizeof(dom));
             snprintf(outcome, sizeof(outcome), "%s", dom.kind != SNAP_NONE ? "snapshot" : "fallback-live");
             item_id(id, sizeof(id), "mnt:", mc.recorded);
             if ((st = add_item(b, SP_ITEM_TREE, id, mc.recorded, mc.real, 0,
@@ -488,6 +496,12 @@ static status_t describe_member(struct sp_ctx *c, dbuild_t *b, const char *unit,
         cJSON_AddStringToObject(o, "real", mc.real);
         cJSON_AddStringToObject(o, "outcome", outcome);
         if (mc.reason[0] && mc.verdict == MOUNT_INCLUDED) cJSON_AddStringToObject(o, "note", mc.reason);
+        if (n_below_out) {
+            char nb[1200];
+            snprintf(nb, sizeof(nb), "%zu mount(s) or btrfs subvolume(s) below it, which a snapshot shows "
+                     "empty: %s%s", n_below_out, below_out, n_below_out > 3 ? ", ..." : "");
+            cJSON_AddStringToObject(o, "nested", nb);
+        }
         if (dom.kind == SNAP_ZFS) cJSON_AddStringToObject(o, "domain", dom.dataset);
         else if (dom.kind == SNAP_BTRFS) cJSON_AddStringToObject(o, "domain", dom.root);
     }
@@ -509,14 +523,17 @@ static status_t d_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
     d->name = strdup(unit_id);
     d->state = unit_state(m, n);
     d->caps = SP_CAP_PAUSE;
-    dbuild_t b = { d, 0 };
+    dbuild_t b = { d, 0, NULL };
     drop_blobs(c, unit_id);
     cJSON *doc = cJSON_CreateObject();
     cJSON *mounts = doc ? cJSON_AddArrayToObject(doc, "mounts") : NULL;
     cJSON *sugg = doc ? cJSON_AddArrayToObject(doc, "suggested_excludes") : NULL;
     int compose_done = 0;
     if (!d->name || !mounts) st = set_error(ERR_NOMEM, "docker: describe");
+    if (st == OK) st = snap_probe_new(&c->snap, c->mounts.mountinfo, &b.probe);
     for (size_t i = 0; st == OK && i < n; i++) st = describe_member(c, &b, unit_id, &m[i], mounts, sugg, &compose_done);
+    snap_probe_free(b.probe);
+    b.probe = NULL;
     /* The unit's hooks: a log for each, a STREAM for each dump (6.6). Dumps
      * come before their logs, so a dump's log is read after it ends. */
     char key[HELPER_UNIT_KEY_MAX + 1];
@@ -925,6 +942,31 @@ static unsigned unpause_all(struct sp_session *s, int64_t *hold, int *paused)
     return lost;
 }
 
+/*
+ * B231: a mount with a filesystem or btrfs subvolume below it reads, from
+ * its snapshot, an empty directory where that data is. It is read live
+ * instead, through the same fallback as a mount on no snapshot domain, and
+ * the session says which mount and what lies below it (*nested = 1). An
+ * error when it could not be checked: the begin fails rather than guessing.
+ */
+static status_t nested_live(snap_probe_t *probe, const snap_dom_t *d, const char *real, sp_session_info_t *info,
+                            int *nested)
+{
+    size_t n = 0;
+    *nested = 0;
+    char names[1024];
+    status_t st = snap_probe_below(probe, d, real, &n, names, sizeof(names));
+    if (st != OK) return st;
+    if (!n) return OK;
+    log_warn("docker: %s has %zu mount(s) or btrfs subvolume(s) below it (%s%s), which its snapshot would "
+             "show empty; read live instead", real, n, names, n > 3 ? ", ..." : "");
+    (void)sp_session_info_warn(info, "%.300s has %zu mount(s) or btrfs subvolume(s) below it (%.400s%s), which "
+                               "its snapshot would show empty: read live (fallback-live)", real, n, names,
+                               n > 3 ? ", ..." : "");
+    *nested = 1;
+    return OK;
+}
+
 static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_req_t *req,
                         sp_session_t **out, const sp_session_info_t **info)
 {
@@ -937,6 +979,8 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     s->items = calloc(unit->n_items ? unit->n_items : 1, sizeof(*s->items));
     if (st == OK && !s->items) st = set_error(ERR_NOMEM, "docker: session");
     size_t fallback = 0;
+    snap_probe_t *probe = NULL;
+    if (st == OK) st = snap_probe_new(&c->snap, c->mounts.mountinfo, &probe);
     for (size_t i = 0; st == OK && i < unit->n_items; i++) {
         const sp_item_desc_t *it = &unit->items[i];
         if (it->kind != SP_ITEM_TREE || !it->source) continue;
@@ -945,9 +989,13 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(x->real, sizeof(x->real), "%s", it->source);
         snap_dom_t d;
         if ((st = snap_domain_of(&c->snap, x->real, &d)) != OK) break;
+        int nested = 0;
+        if (d.kind != SNAP_NONE && (st = nested_live(probe, &d, x->real, &s->info, &nested)) != OK) break;
+        if (nested) d.kind = SNAP_NONE;
         if (d.kind == SNAP_NONE) { x->live = 1; fallback++; continue; }
         st = snap_set_add(&s->snaps, &d);
     }
+    snap_probe_free(probe);
     if (st != OK) { session_free(s); return st; }
 
     int running = 0;
@@ -1257,7 +1305,8 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
     if (!ss || !g) { free(ss); free(g); return set_error(ERR_NOMEM, "docker: group"); }
     pthread_mutex_init(&g->mu, NULL);
     if (req->holds) { g->holds = *req->holds; g->has_holds = 1; }
-    status_t st = OK;
+    snap_probe_t *gprobe = NULL;
+    status_t st = snap_probe_new(&c->snap, c->mounts.mountinfo, &gprobe);
     size_t fallback[64] = { 0 };
     int running[64] = { 0 }, any_running = 0, mode_always = 0;
     for (size_t k = 0; st == OK && k < n; k++) {
@@ -1278,6 +1327,9 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
             snprintf(x->real, sizeof(x->real), "%s", it->source);
             snap_dom_t d;
             if ((st = snap_domain_of(&c->snap, x->real, &d)) != OK) break;
+            int nested = 0;
+            if (d.kind != SNAP_NONE && (st = nested_live(gprobe, &d, x->real, &s->info, &nested)) != OK) break;
+            if (nested) d.kind = SNAP_NONE;
             if (d.kind == SNAP_NONE) { x->live = 1; fallback[k]++; continue; }
             st = snap_set_add(&g->set, &d);
         }
@@ -1285,6 +1337,8 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
         any_running |= running[k];
         mode_always |= glob_any(c->pol->pause_always, c->pol->n_pause_always, units[k]->unit_id);
     }
+    snap_probe_free(gprobe);
+    gprobe = NULL;
     unsigned instants = st == OK ? snap_instants(g->set.doms, g->set.n) : 0;
     /* Pre hooks of every unit, live, before the pause. */
     int ran[64] = { 0 }, failed[64] = { 0 };

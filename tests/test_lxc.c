@@ -68,6 +68,8 @@ static int setup(void **state)
     put(LXCP "/Parked/config", "lxc.rootfs.path = " LXCP "/Parked/rootfs\n");
     put(STATE "/lxc-DevBox", "RUNNING\n");
     put(STATE "/datasets", "cache/lxc\t" LXCP "\ncache/appdata\t" MNT "/cache/appdata\n");
+    put(D "/mountinfo", "22 1 0:21 / / rw - ext4 /dev/sda1 rw\n");
+    unlink(STATE "/subvol_list");
     setenv("FAKE_HOST_STATE", STATE, 1);
     return init_with("nsenter = 0\n");
 }
@@ -80,11 +82,12 @@ static int init_with(const char *nsenter)
     char text[4096];
     snprintf(text, sizeof(text),
              "[helper]\ndaemon_uid = 1000\ndaemon_id = 0badf00d\nstate_dir = " STATE "\n"
-             "[snapshot]\nzfs_domains = cache/lxc, cache/appdata\n"
-             "[host]\n%shost_root =\nzfs = %s/tests/fake_host/zfs\nlxc_dir = %s/tests/fake_host/lxc\n"
-             "user_root = " MNT "/user\nmnt_root = " MNT "\nboot_config = " D "/boot\n"
+             "[snapshot]\nzfs_domains = cache/lxc, cache/appdata\nbtrfs_domains = " D "/bpool\n"
+             "[host]\n%shost_root =\nzfs = %s/tests/fake_host/zfs\nbtrfs = %s/tests/fake_host/btrfs\n"
+             "lxc_dir = %s/tests/fake_host/lxc\n"
+             "user_root = " MNT "/user\nmnt_root = " MNT "\nboot_config = " D "/boot\nmountinfo = " D "/mountinfo\n"
              "[docker]\ninclude_roots = " MNT "/cache/appdata\n"
-             "[lxc]\nenabled = 1\npath = " LXCP "\n", nsenter, cwd, cwd);
+             "[lxc]\nenabled = 1\npath = " LXCP "\n", nsenter, cwd, cwd, cwd);
     memset(&pol, 0, sizeof(pol));
     if (helper_policy_parse(text, &pol) != OK) return -1;
     return lxc_backend_init(&pol, &be) == OK ? 0 : -1;
@@ -167,6 +170,78 @@ static void test_capture(void **state)
 /* A freeze the watchdog undid before the thaw: the snapshot saw a running
  * container. One instant still makes it crash-consistent, but the flags
  * and a warning say the freeze did not last, and nothing is unfrozen. */
+/*
+ * B231: a bind mount with a child dataset below it, and a rootfs on btrfs
+ * with a subvolume inside (Docker's btrfs driver in a container makes one
+ * per layer), read empty directories from their snapshots. Both are flagged
+ * at describe, read live, warned about by name, and the level drops.
+ */
+static void test_nested_below(void **state)
+{
+    (void)state;
+    assert_int_equal(system("mkdir -p '" MNT "/cache/appdata/dev/child' '" D "/bpool/lxc/Nest/rootfs/var/lib/docker/btrfs/subvolumes/l1' "
+                            "'" LXCP "/Nest'"), 0);
+    put(LXCP "/Nest/config", "lxc.rootfs.path = dir:" D "/bpool/lxc/Nest/rootfs\n");
+    put(STATE "/lxc-Nest", "STOPPED\n");
+    put(D "/mountinfo", "22 1 0:21 / / rw - ext4 /dev/sda1 rw\n"
+                        "40 22 0:40 / " MNT "/cache/appdata/dev/child rw - zfs cache/appdata/dev/child rw\n");
+    put(STATE "/subvol_list", "ID 258 gen 9 top level 5 path lxc/Nest/rootfs/var/lib/docker/btrfs/subvolumes/l1\n"
+                              "ID 259 gen 9 top level 5 path lxc/Other\n");
+    sp_unit_desc_t *d = NULL;
+    assert_int_equal(be.ops->describe(be.ctx, "DevBox", &d), OK);
+    const sp_item_desc_t *m = NULL, *rf = NULL;
+    for (size_t i = 0; i < d->n_items; i++) {
+        if (d->items[i].source && strcmp(d->items[i].source, MNT "/cache/appdata/dev") == 0) m = &d->items[i];
+        if (strcmp(d->items[i].id, "rootfs") == 0) rf = &d->items[i];
+    }
+    assert_non_null(m);
+    assert_false(m->caps & SP_CAP_SNAPSHOT);
+    assert_true(rf->caps & SP_CAP_SNAPSHOT);      /* nothing below DevBox's rootfs */
+    sp_begin_req_t q;
+    memset(&q, 0, sizeof(q));
+    q.job_id = 7;
+    q.require = SP_CONSIST_INCONSISTENT;
+    q.daemon8 = "0badf00d";
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    assert_int_equal(be.ops->begin(be.ctx, d, &q, &s, &info), OK);
+    assert_int_equal(info->achieved, SP_CONSIST_INCONSISTENT);
+    int named = 0;
+    for (size_t i = 0; i < info->n_warnings; i++)
+        if (strstr(info->warnings[i], MNT "/cache/appdata/dev has 1 mount(s)") &&
+            strstr(info->warnings[i], "/dev/child")) named = 1;
+    assert_true(named);
+    char root[PATH_MAX];
+    assert_int_equal(be.ops->tree_root(s, m, root, sizeof(root)), OK);
+    assert_string_equal(root, MNT "/cache/appdata/dev");
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+
+    /* The btrfs rootfs with a subvolume inside it. */
+    assert_int_equal(be.ops->describe(be.ctx, "Nest", &d), OK);
+    rf = NULL;
+    for (size_t i = 0; i < d->n_items; i++) if (strcmp(d->items[i].id, "rootfs") == 0) rf = &d->items[i];
+    assert_non_null(rf);
+    assert_false(rf->caps & SP_CAP_SNAPSHOT);
+    assert_int_equal(be.ops->begin(be.ctx, d, &q, &s, &info), OK);
+    named = 0;
+    for (size_t i = 0; i < info->n_warnings; i++)
+        if (strstr(info->warnings[i], "rootfs has 1 mount(s) or btrfs subvolume(s)") &&
+            strstr(info->warnings[i], "subvolumes/l1")) named = 1;
+    assert_true(named);
+    assert_int_equal(be.ops->tree_root(s, rf, root, sizeof(root)), OK);
+    assert_string_equal(root, D "/bpool/lxc/Nest/rootfs");
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+
+    /* A pool whose subvolumes cannot be listed is not trusted: the describe
+     * fails rather than guessing. */
+    setenv("FAKE_BTRFS_FAIL", "list", 1);
+    assert_int_not_equal(be.ops->describe(be.ctx, "Nest", &d), OK);
+    unsetenv("FAKE_BTRFS_FAIL");
+    err_clear();
+}
+
 static void test_freeze_lost(void **state)
 {
     (void)state;
@@ -353,6 +428,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_capture, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_nested_below, setup, teardown),
         cmocka_unit_test_setup_teardown(test_freeze_lost, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_thaws, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
