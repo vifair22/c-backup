@@ -9,7 +9,8 @@
  * its Detect now button, and the backup dialog links here with the scope
  * filter set to one source.
  *
- * Read-only (phase D1). Enabling or dismissing a suggestion is D2's.
+ * Each card carries its own Preview, Enable and Dismiss (D2); the list
+ * reloads after either of the last two so the new state shows in place.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react'
@@ -276,7 +277,10 @@ export function DatabasesView({ connName, repoPath, initialScope, onBack }: Prop
                   </span>
                 </div>
                 <div className="space-y-2">
-                  {g.findings.map(f => <DatabaseCard key={f.id} finding={f} />)}
+                  {g.findings.map(f => (
+                    <DatabaseCard key={f.id} finding={f} connName={connName} repoId={repoId}
+                      onChanged={() => void load()} />
+                  ))}
                 </div>
               </section>
             )

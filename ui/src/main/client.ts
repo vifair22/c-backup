@@ -270,6 +270,31 @@ export function toEndpoint(req: ApiRequest): Endpoint {
         method: 'POST',
         path: `/repos/${req.repoId}/units/${seg(req.provider)}/${seg(req.unit)}/detect`,
       }
+    case 'dbPreview':
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/databases/${req.findingId}/preview`,
+        /* No body at all asks for the finding's own suggestion. */
+        body: req.template === undefined
+          ? undefined
+          /* params absent, not {}: for an enabled finding the daemon then
+           * previews the params it already runs. */
+          : req.params === undefined
+            ? { template: req.template }
+            : { template: req.template, params: req.params },
+      }
+    case 'dbEnable':
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/databases/${req.findingId}/enable`,
+        body: { template: req.template, params: req.params ?? {} },
+      }
+    case 'dbDismiss':
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/databases/${req.findingId}/dismiss`,
+        body: { reason: req.reason },
+      }
 
     /* --- schedules --- */
     case 'scheduleList':

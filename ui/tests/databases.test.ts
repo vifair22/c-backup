@@ -15,6 +15,7 @@ import {
   parseScope, scopeTitle, groupByScope, uncoveredByScope, coverageSeverity, needsAttention,
   coverageLabel, coverageWords, engineTitle, suggestionTitle, suggestionTradeoff,
   evidenceLines, compact, methodLabel, SUGGESTIONS, ENGINES,
+  canAct, policyRefusal, reasonProblem, argvLine,
 } from '../src/shared/databases.ts'
 import type { WireDbFinding } from '../src/shared/wire.ts'
 
@@ -157,4 +158,36 @@ test('unknown evidence keys still reach the screen, compactly', () => {
   /* A known key in a shape it was not expected in falls back, never throws. */
   assert.equal(evidenceLines({ processes: 'postgres' })[0].value, 'postgres')
   assert.equal(compact([{ a: 1 }, 'x']), 'a=1, x')
+})
+
+test('actions are offered only on a finding with data that is not dismissed', () => {
+  assert.equal(canAct(finding({})), true)
+  assert.equal(canAct(finding({ state: 'enabled' })), true)
+  assert.equal(canAct(finding({ confidence: 'hint', path: '' })), false)
+  assert.equal(canAct(finding({ state: 'dismissed' })), false)
+})
+
+test('the policy line is recovered from the enable refusal, and nothing else is', () => {
+  const line = '[db] allow_templates = redis-rdb, pg-dumpall'
+  const r = policyRefusal(`template pg-dumpall is not allowed by the helper's policy; add it there first: ${line}`)
+  assert.deepEqual(r, { error: "template pg-dumpall is not allowed by the helper's policy", policyLine: line })
+  assert.equal(policyRefusal('no such finding'), null)
+  assert.equal(policyRefusal('add it there first: '), null)
+})
+
+test('a dismiss reason follows the route: 1 to 512 bytes, no control characters', () => {
+  assert.equal(reasonProblem('restored from the nightly dump instead'), null)
+  assert.match(reasonProblem('   ') ?? '', /say why/)
+  assert.equal(reasonProblem('x'.repeat(512)), null)
+  assert.match(reasonProblem('x'.repeat(513)) ?? '', /512/)
+  /* Bytes, not characters: 171 three-byte characters is 513 bytes. */
+  assert.match(reasonProblem('\u20ac'.repeat(171)) ?? '', /513/)
+  assert.match(reasonProblem('two\nlines') ?? '', /control/)
+})
+
+test('an argv reads as one line with its argument boundaries visible', () => {
+  assert.equal(argvLine(['pg_dumpall', '-U', 'postgres']), 'pg_dumpall -U postgres')
+  assert.equal(argvLine(['sh', '-c', 'echo hi']), 'sh -c "echo hi"')
+  assert.equal(argvLine(['a', '']), 'a ""')
+  assert.equal(argvLine(undefined), '')
 })

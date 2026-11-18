@@ -356,3 +356,50 @@ export function evidenceLines(evidence: Record<string, unknown> | null | undefin
   }
   return out
 }
+
+/* ---------------------------------------------------------------- */
+/* Acting on a finding (D2)                                          */
+/* ---------------------------------------------------------------- */
+
+/*
+ * Whether a card offers Preview, Enable and Dismiss. A hint names no data
+ * on disk, so there is nothing to capture; a dismissed finding has been
+ * answered, and its reason is all the card shows.
+ */
+export function canAct(f: Pick<WireDbFinding, 'confidence' | 'state'>): boolean {
+  return f.confidence !== 'hint' && f.state !== 'dismissed'
+}
+
+/*
+ * The enable route's policy refusal, split back apart.
+ *
+ * The 409 carries policy_line as its own field, but only `error` crosses
+ * the IPC boundary, so the line is recovered from the message, which ends
+ * with it after a fixed marker. null for any other error.
+ */
+const POLICY_MARK = 'add it there first: '
+
+export function policyRefusal(message: string): { error: string; policyLine: string } | null {
+  const at = message.lastIndexOf(POLICY_MARK)
+  if (at < 0) return null
+  const policyLine = message.slice(at + POLICY_MARK.length).trim()
+  if (!policyLine) return null
+  return { error: message.slice(0, at).replace(/[;\s]+$/, ''), policyLine }
+}
+
+/* The dismiss route's rule (1 to 512 bytes, no control characters), checked
+ * before posting so the dialog can say so. null when the reason is fine. */
+export function reasonProblem(reason: string): string | null {
+  const bytes = new TextEncoder().encode(reason.trim()).length
+  if (bytes === 0) return 'say why: the reason is recorded in the journal'
+  if (bytes > 512) return `at most 512 bytes (this is ${bytes})`
+  if (/[\x00-\x1f\x7f]/.test(reason.trim())) return 'no line breaks or control characters'
+  return null
+}
+
+/* An argv as one readable line: arguments with spaces or quotes in them are
+ * quoted, so the boundaries the helper will pass are visible. */
+export function argvLine(argv: string[] | null | undefined): string {
+  if (!argv) return ''
+  return argv.map(a => (a === '' || /[\s'"\\$`]/.test(a) ? JSON.stringify(a) : a)).join(' ')
+}

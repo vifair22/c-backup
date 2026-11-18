@@ -196,6 +196,10 @@ const SAMPLES: Record<ApiKind, ApiRequest> = {
   /* A unit that does not exist, with a ':' in its name the way compose
    * units have: the route must still be the one that answers. */
   unitDetect:      { kind: 'unitDetect', repoId: 1, provider: 'docker', unit: 'compose:contract-probe' },
+  /* A finding that does not exist: the handler's 404, never the router's. */
+  dbPreview:       { kind: 'dbPreview', repoId: 1, findingId: 9999 },
+  dbEnable:        { kind: 'dbEnable', repoId: 1, findingId: 9999, template: 'pg-dumpall', params: {} },
+  dbDismiss:       { kind: 'dbDismiss', repoId: 1, findingId: 9999, reason: 'contract probe' },
 
   scheduleList:    { kind: 'scheduleList', repoId: 1 },
   scheduleAdd:     { kind: 'scheduleAdd', repoId: 1, action: 'verify',
@@ -519,6 +523,14 @@ describe('the flows behind the buttons', () => {
     const one = await request(toEndpoint({ kind: 'dbShow', repoId: 1, findingId: 9999 }))
     assert.equal(one.status, 404)
     assert.notEqual((one.body as { error?: string }).error, ROUTER_404)
+
+    /* The card's three actions, with well-formed bodies, reach the handler
+     * and are refused for the finding, not for their shape. */
+    for (const kind of ['dbPreview', 'dbEnable', 'dbDismiss'] as const) {
+      const r = await request(toEndpoint(SAMPLES[kind]))
+      assert.equal(r.status, 404, `${kind}: ${JSON.stringify(r.body)}`)
+      assert.notEqual((r.body as { error?: string }).error, ROUTER_404)
+    }
   })
 
   test('the maintenance menu starts every operation it offers', async () => {

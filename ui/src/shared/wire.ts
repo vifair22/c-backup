@@ -345,3 +345,38 @@ export interface WireDbDetectResult {
     sqlite_small?: number
   }
 }
+
+/* What the helper's probe of a template printed (unit findings only). */
+export interface WireDbProbe {
+  argv: string[]
+  exit: number
+  timed_out: boolean
+  output: string
+  truncated: boolean
+}
+
+/*
+ * POST .../databases/<f>/preview. A unit finding answers every field but
+ * the optional ones; a file source's is kind "engine-copy" with output, and
+ * verified and probe null. policy_line is present only when allowed is
+ * false: the line to add to the helper's policy.
+ */
+export interface WireDbPreview {
+  finding: number
+  scope: string
+  template: string
+  kind: 'dump' | 'exec' | 'engine-copy'
+  summary: string
+  params?: Record<string, unknown>
+  container?: string
+  user?: string
+  argv?: string[]
+  post_argv?: string[]
+  output?: string
+  log?: string
+  needs_quiesce?: boolean
+  allowed: boolean
+  policy_line?: string
+  probe: WireDbProbe | null
+  verified: boolean | null
+}
