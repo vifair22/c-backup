@@ -257,6 +257,143 @@ static void test_record_scopes_and_notify(void **state)
     db_detect_settings_set(&on);
 }
 
+/* The three columns the findings API answers beside coverage (7.4). */
+static void test_record_detail(void **state)
+{
+    (void)state;
+    db_findings_t *f = one(DB_ENGINE_SQLITE, "/data/app.db", DB_COV_UNCOVERED, "3");
+    f->v[0].method = "live-read";
+    f->v[0].optional = "pg-dumpall";
+    db_record_result_t r = rec(1, f);
+    db_record_result_free(&r);
+    char *v = qs("SELECT coverage_why || '|' || method || '|' || optional FROM db_findings");
+    assert_string_equal(v, "read live|live-read|pg-dumpall");
+    free(v);
+    /* Cleared with the finding's: NULL, never a stale value. */
+    f->v[0].method = NULL;
+    f->v[0].optional = NULL;
+    f->v[0].coverage = DB_COV_NONE;
+    f->v[0].confidence = DB_CONF_DORMANT;
+    r = rec(2, f);
+    db_record_result_free(&r);
+    assert_int_equal(q1("SELECT (coverage_why IS NULL) + (method IS NULL) + (optional IS NULL)"
+                        " FROM db_findings"), 3);
+    db_findings_free(f);
+}
+
+/* A detection run: no snapshot to name, no alert, its rows told by
+ * last_seen; the next backup alerts for what it captures uncovered. */
+static void test_record_detect(void **state)
+{
+    (void)state;
+    db_findings_t *f = one(DB_ENGINE_SQLITE, "/data/app.db", DB_COV_UNCOVERED, "3");
+    db_record_result_t r;
+    assert_int_equal(db_findings_record_detect(db, repo_id, f, "source:/data", &r), OK);
+    assert_int_equal(count_kind(&r, DB_EVENT_NEW_LIVE), 1);
+    assert_int_equal(count_kind(&r, DB_EVENT_ALERT), 0);
+    db_record_result_free(&r);
+    assert_int_equal(q1("SELECT last_snap_id IS NULL AND alerted_at IS NULL FROM db_findings"), 1);
+
+    r = rec(7, f);
+    assert_int_equal(count_kind(&r, DB_EVENT_ALERT), 1);
+    db_record_result_free(&r);
+    assert_int_equal(q1("SELECT last_snap_id FROM db_findings"), 7);
+
+    /* Seen again by a detection run: the snapshot it was last seen in
+     * stays, and so does the alert's mark. */
+    assert_int_equal(db_findings_record_detect(db, repo_id, f, "source:/data", &r), OK);
+    assert_int_equal(r.n_events, 0);
+    db_record_result_free(&r);
+    assert_int_equal(q1("SELECT last_snap_id FROM db_findings"), 7);
+    assert_int_equal(q1("SELECT alerted_at IS NOT NULL FROM db_findings"), 1);
+
+    /* A row the run did not see, from an earlier second, is gone; one it
+     * saw stays. */
+    db_findings_t *g = one(DB_ENGINE_REDIS, "/data/rd", DB_COV_NONE, "");
+    r = rec(8, g);
+    db_record_result_free(&r);
+    {
+        int aff = 0;
+        assert_int_equal(db_write(db, "UPDATE db_findings SET last_seen = last_seen - 10", NULL, &aff), 0);
+    }
+    assert_int_equal(db_findings_record_detect(db, repo_id, f, "source:/data", &r), OK);
+    db_record_result_free(&r);
+    assert_int_equal(q1("SELECT COUNT(*) FROM db_findings WHERE engine = 'redis'"), 0);
+    assert_int_equal(q1("SELECT COUNT(*) FROM db_findings WHERE engine = 'sqlite'"), 1);
+
+    /* A backup record needs its snapshot. */
+    assert_int_not_equal(db_findings_record(db, repo_id, 0, f, NULL, 0, "source:/data", &r), OK);
+    db_findings_free(f);
+    db_findings_free(g);
+}
+
+static db_findings_t *nextcloud(const char *dbtype, const char *link)
+{
+    db_findings_t *f = one(DB_ENGINE_NEXTCLOUD, "/u/nc", DB_COV_NONE, dbtype);
+    free(f->v[0].evidence);
+    char ev[512];
+    snprintf(ev, sizeof(ev), "{\"markers\":[],\"link\":%s}", link);
+    f->v[0].evidence = strdup(ev);
+    return f;
+}
+
+/* A Nextcloud's database in another unit (section 3): found by the names
+ * that unit's findings recorded, one capture only in a shared group. */
+static void test_link_nextcloud(void **state)
+{
+    (void)state;
+    db_findings_t *pg = one(DB_ENGINE_MYSQL, "/u/db", DB_COV_COVERED_CRASH, "");
+    free(pg->v[0].evidence);
+    pg->v[0].evidence = strdup("{\"markers\":[],\"unit_names\":[\"maria_db\",\"mariadb\"]}");
+    db_record_result_t r;
+    assert_int_equal(db_findings_record(db, repo_id, 1, pg, NULL, 0, "unit:docker:maria_db", &r), OK);
+    db_record_result_free(&r);
+
+    db_findings_t *nc = nextcloud("mysql", "{\"dbtype\":\"mysql\",\"dbhost\":\"maria_db:3306\","
+                                           "\"resolved\":null,\"host\":\"maria_db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc);
+    assert_non_null(strstr(nc->v[0].evidence, "\"resolved\":\"unit:docker:maria_db\""));
+    assert_non_null(strstr(nc->v[0].evidence, "\"consistent\":false"));
+    assert_string_equal(nc->v[0].suggestion, "group-units");
+    db_findings_free(nc);
+
+    /* Sharing a capture group, they are one capture. */
+    int aff = 0;
+    assert_int_equal(db_write(db, "INSERT INTO unit_policy (repo_id, unit_key, key, value) VALUES"
+                                  " (1, 'docker:nextcloud', 'capture.group', 'cloud'),"
+                                  " (1, 'docker:maria_db', 'capture.group', 'cloud')", NULL, &aff), 0);
+    nc = nextcloud("mysql", "{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria_db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc);
+    assert_non_null(strstr(nc->v[0].evidence, "\"consistent\":true"));
+    assert_null(nc->v[0].suggestion);
+    db_findings_free(nc);
+
+    /* A name in a LIKE wildcard's place, or no unit with it, or the wrong
+     * engine: not resolved, and said so. */
+    nc = nextcloud("mysql", "{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria%db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc);
+    assert_non_null(strstr(nc->v[0].evidence, "no unit backed up into this repository answers to"));
+    db_findings_free(nc);
+    nc = nextcloud("pgsql", "{\"dbtype\":\"pgsql\",\"resolved\":null,\"host\":\"maria_db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc);
+    assert_non_null(strstr(nc->v[0].evidence, "\"resolved\":null"));
+    db_findings_free(nc);
+    /* Its own unit is never the other one. */
+    nc = nextcloud("mysql", "{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria_db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:maria_db", nc);
+    assert_non_null(strstr(nc->v[0].evidence, "\"resolved\":null"));
+    db_findings_free(nc);
+    /* Resolved already, or no link: untouched. */
+    nc = nextcloud("mysql", "{\"dbtype\":\"mysql\",\"resolved\":\"this unit\",\"consistent\":true}");
+    char *before = strdup(nc->v[0].evidence);
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc);
+    assert_string_equal(nc->v[0].evidence, before);
+    free(before);
+    db_findings_free(nc);
+    db_findings_link_nextcloud(NULL, repo_id, "x", NULL);
+    db_findings_free(pg);
+}
+
 static void test_json(void **state)
 {
     (void)state;
@@ -471,6 +608,9 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_record_states, setup, teardown),
         cmocka_unit_test_setup_teardown(test_record_scopes_and_notify, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_record_detail, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_record_detect, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_link_nextcloud, setup, teardown),
         cmocka_unit_test(test_json),
         cmocka_unit_test(test_unit_json_databases),
         cmocka_unit_test_setup_teardown(test_backup_detects_and_carries, setup_backup, teardown_backup),
