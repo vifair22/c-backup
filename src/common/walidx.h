@@ -33,7 +33,9 @@ typedef struct {
 } walidx_t;
 
 /* 0 on a consistent read of the database at db_path's wal-index; -1 when
- * there is none, it is too short, of another version, or torn. */
+ * there is none, it is too short, of another version, or torn; -2, with
+ * errno set, when -shm exists and cannot be opened or read (B215: the
+ * checkpointer reports that rather than looking again for ever). */
 int walidx_read(const char *db_path, walidx_t *out);
 
 /* Close every kept descriptor. Only once no SQLite connection to any of

@@ -94,6 +94,7 @@ typedef struct {
     unsigned long passive;          /* PASSIVE checkpoints run without the lock */
     unsigned long escalations;      /* PASSIVE checkpoints run under the write lock */
     unsigned long busy;             /* checkpoints that could not start */
+    unsigned long failed;           /* refused by SQLite, or -shm unreadable (B215) */
     uint32_t      max_wal_frames;   /* the most frames the WAL was seen holding */
     uint64_t      max_lock_ns;      /* the longest escalation hold */
     unsigned long pre_restarts;     /* WAL restarts this thread made itself */
@@ -104,13 +105,30 @@ typedef struct {
 } checkpointer_stats_t;
 
 /*
+ * Open the thread's connection to db_path, read-write or not at all (a
+ * connection SQLite could open only read-only is refused, naming the uid).
+ * The daemon calls this before it drops to security.run_as_uid, with the
+ * main handle and the reader pool: state.db and its -wal and -shm are
+ * created by root there, mode 0600, and the uid it drops to can read them
+ * (CAP_DAC_READ_SEARCH) but not write them, so a connection opened after
+ * the drop would be read-only and no checkpoint would ever run (B215).
+ * Failures also go to wal_health.h.
+ */
+status_t checkpointer_open(const char *db_path);
+
+/*
  * Start the thread for the database at db_path, checkpointing every
- * threshold_pages uncopied frames, looking every interval_ms. Opens its own
- * connection. Only one runs per process.
+ * threshold_pages uncopied frames, looking every interval_ms. Uses the
+ * connection checkpointer_open made, or opens one now. Only one runs per
+ * process. A checkpoint SQLite refuses (as opposed to one that is merely
+ * busy), and a -shm the thread cannot read, are reported to wal_health.h:
+ * an error line, a count in cbackup_checkpoint_failures_total, and /readyz
+ * degraded.
  */
 status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned interval_ms);
 
 /* Stop and join the thread, and close its connection. Safe when not
+ * started, and closes a connection checkpointer_open made that was never
  * started. */
 void checkpointer_stop(void);
 
@@ -137,6 +155,7 @@ void checkpointer_set_test_idle(int on);
  * The WAL's frame count and how many of them are copied back, from the
  * wal-index header of the database at db_path. 0 on a consistent read; -1
  * when there is no -shm, it is too short, of another version, or the two
- * header copies disagree (a write in progress).
+ * header copies disagree (a write in progress); -2, errno set, when -shm
+ * exists and cannot be read (walidx.h).
  */
 int checkpointer_wal_frames(const char *db_path, uint32_t *frames, uint32_t *backfilled);

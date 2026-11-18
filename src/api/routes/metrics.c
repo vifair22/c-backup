@@ -4,6 +4,7 @@
 #include "routes.h"
 #include "unit_state.h"
 #include "sync_latch.h"
+#include "wal_health.h"
 
 #include <cutils/log.h>
 #include <cutils/push.h>
@@ -164,6 +165,15 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                     "and which refuse backups, gc and prune until `repo repair` passes.\n"
                     "# TYPE cbackup_repos_sync_failed gauge\n"
                     "cbackup_repos_sync_failed %u\n", sync_latch_repo_count());
+        /* B215: a checkpointer that cannot checkpoint used to be silent. */
+        mb_addf(&m, "# HELP cbackup_checkpoint_failures_total state.db WAL checkpoints SQLite "
+                    "refused, and failures to open or read the WAL or its index, since start.\n"
+                    "# TYPE cbackup_checkpoint_failures_total counter\n"
+                    "cbackup_checkpoint_failures_total %lu\n", wal_health_failures());
+        mb_addf(&m, "# HELP cbackup_checkpoint_failing 1 while the last attempt to keep "
+                    "state.db's WAL bounded failed (see /readyz for why).\n"
+                    "# TYPE cbackup_checkpoint_failing gauge\n"
+                    "cbackup_checkpoint_failing %d\n", wal_health_failing(NULL, 0, NULL));
     }
     emit_scalar(&m, "cbackup_repos_total", "Registered repositories.", "gauge",
                 "SELECT COUNT(*) FROM repos");

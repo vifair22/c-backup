@@ -2163,7 +2163,7 @@ daemon as a whole.
 | Route | Meaning |
 |---|---|
 | `/healthz` | The process answers; says `storage_sync: failed` after a failed sync of `state.db`, and counts repositories whose own syncs failed (section 17.7) |
-| `/readyz` | The database is open and its syncs have not failed; the daemon can do work. 200 with `"status":"degraded"` and a list when only repositories' syncs have failed (section 17.7) |
+| `/readyz` | The database is open and its syncs have not failed; the daemon can do work. 200 with `"status":"degraded"` and a list when only repositories' syncs have failed (section 17.7), and 200 with `"status":"degraded"`, `"state_db_checkpoint":"failing"` and the reason in `state_db_checkpoint_error` while `state.db`'s write-ahead log is not being checkpointed (section 18.2) |
 
 Both are public, on the socket and on TCP.
 
@@ -2203,6 +2203,8 @@ the repository).
 | `cbackup_storage_sync_failed` | gauge | 1 once a sync of `state.db` or the key directory has failed, until a restart (section 17.7) |
 | `cbackup_repos_sync_failed` | gauge | Repositories whose own syncs failed and which refuse backups, gc and prune until `repo repair` passes (a restart does not clear them); which ones is in `/readyz` and `repo show` (section 17.7) |
 | `cbackup_storage_sync_failed_timestamp_seconds` | gauge | Unix time of that first failure; 0 when none |
+| `cbackup_checkpoint_failures_total` | counter | Checkpoints of `state.db`'s write-ahead log SQLite refused, and failures to open or read the log or its index, since start (section 18.2) |
+| `cbackup_checkpoint_failing` | gauge | 1 while the last such attempt failed; `/readyz` says why |
 | `cbackup_vm_bitmap_audit_failures_total` | counter | Audit reads that found a VM disk changed outside its dirty bitmap (section 6.5) |
 | `cbackup_vm_resync_bytes_total` | counter | Bytes incremental VM reads re-read past the changed ranges to bring the chunker back in step |
 
@@ -2828,6 +2830,21 @@ the log to about 380 MB before the next restart. Leave room for 1 GiB on
 the filesystem that holds `state.db`, and more if `db.wal_autocheckpoint` is
 raised.
 
+**When the log is not being checkpointed, the daemon says so.** A
+checkpoint SQLite refuses (a connection that can only read the database,
+an I/O error), or a log or log index (`state.db-shm`) the daemon cannot
+open, is logged as an error naming the file and the SQLite code or errno,
+counted in `cbackup_checkpoint_failures_total`, and turns `/readyz` to
+`"status":"degraded"` with the reason in `state_db_checkpoint_error` until a
+checkpoint works again. Everything else carries on, but nothing is copying
+the log back, so it grows until the filesystem fills: treat it as urgent.
+The usual cause is ownership. The daemon opens `state.db`, and the
+checkpointer's own connection to it, before it drops to
+`security.run_as_uid`; the files stay root's, mode 0600, which is expected
+(section 22.2). Opened after the drop, as an earlier build did, that
+connection could only read, and every checkpoint failed without a word: the
+log reached five times its cap while `state.db` stayed 4096 bytes (B215).
+
 **Do not hold long reads on a live `state.db`.** A checkpoint can only
 reuse the log once every reader has moved past the frames it copied, and the
 daemon's own readers let go within moments; an outside one does not. A
@@ -3355,9 +3372,14 @@ itself at start (`security.run_as_uid`, 990 here):
 | devices, sockets | none: no Docker or libvirt socket, no `/dev/zfs` |
 
 `GET /providers` reports `privileges_dropped`. The state volume and the
-repositories must be owned by 990: the configuration and `state.db` are
-opened before the drop, so a database created as root would be unwritable
-after it. What the drop costs: `trusted.*` extended attributes cannot be
+repositories must be owned by 990: the daemon creates its keys, its
+`daemon-id`, SQLite's temporary files and everything in a repository after
+the drop. The configuration and `state.db` are opened before it, every
+connection to the database included, so a `state.db` (and `-wal`, `-shm`)
+that root created on the first start is root's, mode 0600, and that is
+fine: uid 990 never opens it again. A connection opened after the drop
+could only read it, which is what B215 was (section 18.2). What the drop
+costs: `trusted.*` extended attributes cannot be
 read without `CAP_SYS_ADMIN` and are skipped (appdata does not use them).
 
 #### 22.2.3 The policy

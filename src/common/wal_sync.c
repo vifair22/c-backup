@@ -2,6 +2,7 @@
 
 #include "wal_sync.h"
 #include "sync_latch.h"
+#include "wal_health.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -85,6 +86,8 @@ status_t wal_sync(const char *wal_path)
         forget_locked();
         pthread_mutex_unlock(&g_mu);
         if (saved == ENOENT) return OK;
+        wal_health_fail(WAL_HEALTH_WAL_SYNC, "cannot stat %s: %s (errno %d)", wal_path,
+                        strerror(saved), saved);
         errno = saved;
         return set_error_errno(ERR_IO, "state.db: cannot stat %s", wal_path);
     }
@@ -97,6 +100,8 @@ status_t wal_sync(const char *wal_path)
             if (fd >= 0) close(fd);
             pthread_mutex_unlock(&g_mu);
             if (saved == ENOENT) return OK;
+            wal_health_fail(WAL_HEALTH_WAL_SYNC, "cannot open %s to sync it: %s (errno %d)",
+                            wal_path, strerror(saved), saved);
             errno = saved;
             return set_error_errno(ERR_IO, "state.db: cannot open %s to sync it", wal_path);
         }
@@ -130,6 +135,8 @@ status_t wal_sync(const char *wal_path)
                                      "durable yet", wal_path);
     close(fd);
     if (st != OK) return st;
+    /* Open and synced: whatever wal_health had from an earlier open is over. */
+    wal_health_ok(WAL_HEALTH_WAL_SYNC);
 
     /* Still the file just synced? If the name moved on, the sync covered a
      * file that no longer holds the commits. */

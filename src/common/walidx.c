@@ -2,6 +2,7 @@
 
 #include "walidx.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
@@ -31,11 +32,14 @@ static uint32_t u32_at(const unsigned char *b, size_t off)
     return v;
 }
 
-/* The kept descriptor for shm, opened or replaced as needed. Under g_mu. */
-static int shm_fd(const char *shm)
+/* The kept descriptor for shm, opened or replaced as needed. Under g_mu.
+ * -1 with *err set to the errno of a stat or open that failed, or 0 when
+ * there is just nothing to read yet. */
+static int shm_fd(const char *shm, int *err)
 {
     struct stat ps;
-    if (stat(shm, &ps) != 0) return -1;
+    *err = 0;
+    if (stat(shm, &ps) != 0) { *err = errno; return -1; }
     int i;
     for (i = 0; i < g_nslots; i++) if (strcmp(g_slot[i].path, shm) == 0) break;
     if (i < g_nslots && g_slot[i].fd >= 0 &&
@@ -43,7 +47,7 @@ static int shm_fd(const char *shm)
         return g_slot[i].fd;
     int fd = open(shm, O_RDONLY | O_CLOEXEC);
     struct stat fs;
-    if (fd < 0) return -1;
+    if (fd < 0) { *err = errno; return -1; }
     if (fstat(fd, &fs) != 0 || fs.st_dev != ps.st_dev || fs.st_ino != ps.st_ino) {
         /* Never this file's descriptor to drop locks with: a fresh open
          * of a file that changed under us; leave it open and unused
@@ -82,10 +86,15 @@ int walidx_read(const char *db_path, walidx_t *out)
     if (!db_path || snprintf(shm, sizeof(shm), "%s-shm", db_path) >= (int)sizeof(shm))
         return -1;
     unsigned char b[WALIDX_READ];
+    int err = 0;
     pthread_mutex_lock(&g_mu);
-    int fd = shm_fd(shm);
+    int fd = shm_fd(shm, &err);
     ssize_t n = fd >= 0 ? pread(fd, b, sizeof(b), 0) : -1;
+    if (fd >= 0 && n < 0) err = errno;
     pthread_mutex_unlock(&g_mu);
+    /* No -shm yet is normal (nothing written); anything else is a reader
+     * that cannot see the WAL at all (B215). */
+    if (err && err != ENOENT) { errno = err; return -2; }
     if (n != (ssize_t)sizeof(b)) return -1;
     if (u32_at(b, 0) != WALIDX_VERSION || b[WALIDX_ISINIT] != 1) return -1;
     if (memcmp(b, b + WALIDX_HDR_SIZE, WALIDX_HDR_SIZE) != 0) return -1;

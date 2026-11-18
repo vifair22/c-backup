@@ -5,6 +5,7 @@
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
 #include "sync_latch.h"
+#include "wal_health.h"
 
 #include <cutils/db.h>
 #include <stdio.h>
@@ -69,6 +70,7 @@ static api_response_t handle_readyz(const api_request_t *req, void *userdata)
         return api_error(503, "database not responding");
     }
     db_result_free(r);
+    r = NULL;     /* the repos query below is skipped when none is latched */
 
     /*
      * A repository whose syncs failed leaves the daemon ready: "degraded",
@@ -79,13 +81,27 @@ static api_response_t handle_readyz(const api_request_t *req, void *userdata)
      * without the deep verify `repo repair` runs. state.db is different:
      * nothing works without it, so that one is 503 above.
      */
-    if (sync_latch_repo_count() > 0) {
+    /*
+     * Degraded, not 503, while state.db's WAL is not being checkpointed
+     * (wal_health.h, B215): everything still works, but the WAL grows until
+     * the volume fills, and an operator has to hear about it before then.
+     */
+    char wal_msg[600];
+    int64_t wal_since = 0;
+    int wal_bad = wal_health_failing(wal_msg, sizeof(wal_msg), &wal_since);
+    if (sync_latch_repo_count() > 0 || wal_bad) {
         cJSON *o = cJSON_CreateObject();
         cJSON *a = o ? cJSON_AddArrayToObject(o, "repos_sync_failed") : NULL;
         if (!a) { cJSON_Delete(o); return api_error(500, "out of memory"); }
         cJSON_AddStringToObject(o, "status", "degraded");
         cJSON_AddStringToObject(o, "version", VERSION_STRING);
-        if (db_execute(db, "SELECT id, path FROM repos ORDER BY id", NULL, &r) == 0 && r) {
+        if (wal_bad) {
+            cJSON_AddStringToObject(o, "state_db_checkpoint", "failing");
+            cJSON_AddStringToObject(o, "state_db_checkpoint_error", wal_msg);
+            cJSON_AddNumberToObject(o, "state_db_checkpoint_failing_since", (double)wal_since);
+        }
+        if (sync_latch_repo_count() > 0 &&
+            db_execute(db, "SELECT id, path FROM repos ORDER BY id", NULL, &r) == 0 && r) {
             for (int i = 0; i < r->nrows; i++) {
                 char m[1024];
                 int64_t at = 0;

@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 /*
  * SPEED-3: state.db's checkpoints run on their own connection, off the
@@ -29,6 +29,9 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <linux/capability.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
@@ -38,10 +41,12 @@
 #include "db_txn.h"
 #include "db_write.h"
 #include "state_db.h"
+#include "wal_health.h"
 #include "test_tmp.h"
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_checkpointer"
 #define TEST_DB   TEST_DIR "/state.db"
+#define TEST_SHM  TEST_DB "-shm"
 #define THRESHOLD 1000
 #define ROW_BYTES 16000          /* about four pages a row */
 
@@ -655,6 +660,111 @@ static void test_a_pinned_idle_wal_is_not_written(void **state)
     assert_true(f <= 8);
 }
 
+/*
+ * B215. The daemon dropped to its run_as uid and then opened this
+ * connection; state.db was root's, 0600, and SQLite quietly opened it
+ * read-only, so every checkpoint was refused and the WAL grew five times
+ * past its cap. A connection that can only read is refused at open, naming
+ * the uid, and wal_health has it.
+ *
+ * Root opens anything read-write, so as root (CI) the open is made in a
+ * child without CAP_DAC_OVERRIDE, which is what the dropped daemon lacks;
+ * the child's verdict is its exit code.
+ */
+static int drop_dac_override(void)
+{
+    struct __user_cap_header_struct h = { _LINUX_CAPABILITY_VERSION_3, 0 };
+    struct __user_cap_data_struct d[2];
+    memset(d, 0, sizeof(d));
+    if (syscall(SYS_capget, &h, d) != 0) return -1;
+    d[0].effective &= ~(1u << CAP_DAC_OVERRIDE);
+    return (int)syscall(SYS_capset, &h, d);
+}
+
+static int open_read_only_verdict(void)
+{
+    wal_health_reset();
+    if (checkpointer_open(TEST_DB) == OK) { checkpointer_stop(); return 1; }
+    if (!strstr(err_msg(), "only read-only")) return 2;
+    char msg[512];
+    if (!wal_health_failing(msg, sizeof(msg), NULL)) return 3;
+    if (!strstr(msg, "checkpointer") || !strstr(msg, TEST_DB)) return 4;
+    if (wal_health_failures() < 1) return 5;
+    return 0;
+}
+
+static void test_a_read_only_connection_is_refused(void **state)
+{
+    (void)state;
+    assert_int_equal(chmod(TEST_DB, 0444), 0);
+    int verdict;
+    if (geteuid() == 0) {
+        pid_t pid = fork();
+        assert_true(pid >= 0);
+        if (pid == 0) {
+            if (drop_dac_override() != 0) _exit(100);
+            _exit(open_read_only_verdict());
+        }
+        int ws = 0;
+        assert_int_equal(waitpid(pid, &ws, 0), pid);
+        assert_true(WIFEXITED(ws));
+        verdict = WEXITSTATUS(ws);
+    } else {
+        verdict = open_read_only_verdict();
+    }
+    assert_int_equal(chmod(TEST_DB, 0644), 0);
+    assert_int_equal(verdict, 0);
+    /* And a writable one opens, and is the one the thread then uses. */
+    wal_health_reset();
+    assert_int_equal(checkpointer_open(TEST_DB), OK);
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    assert_false(wal_health_failing(NULL, 0, NULL));
+}
+
+/*
+ * A -shm the thread cannot read meant it never saw the WAL grow and so
+ * never checkpointed, without a word. Now it is a failure the moment it
+ * happens, and a recovery when it ends. A symlink loop stands in for a
+ * file the daemon's uid may not open, because it fails for root too. The
+ * real -shm is kept by a second link and put back, so SQLite's own
+ * descriptors and locks are never disturbed.
+ */
+static void test_an_unreadable_shm_is_reported_and_recovers(void **state)
+{
+    (void)state;
+    wal_health_reset();
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    assert_int_equal(commit_rows(4), 0);
+    (void)wal_frames();
+
+    assert_int_equal(link(TEST_SHM, TEST_SHM ".keep"), 0);
+    assert_int_equal(symlink("state.db-shm", TEST_SHM ".loop"), 0);
+    assert_int_equal(rename(TEST_SHM ".loop", TEST_SHM), 0);
+    char msg[512] = "";
+    int failing = 0;
+    for (int i = 0; i < 200 && !failing; i++) {
+        sleep_ms(10);
+        failing = wal_health_failing(msg, sizeof(msg), NULL);
+    }
+    assert_true(failing);
+    assert_non_null(strstr(msg, "wal-index reader"));
+    assert_non_null(strstr(msg, TEST_SHM));
+    assert_non_null(strstr(msg, "errno"));
+    unsigned long n = wal_health_failures();
+    assert_true(n >= 1);
+    checkpointer_stats_t st;
+    checkpointer_stats(&st);
+    assert_true(st.failed >= 1);
+
+    assert_int_equal(rename(TEST_SHM ".keep", TEST_SHM), 0);
+    for (int i = 0; i < 200 && failing; i++) {
+        sleep_ms(10);
+        failing = wal_health_failing(NULL, 0, NULL);
+    }
+    assert_false(failing);
+    assert_true(wal_health_failures() >= n);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -670,6 +780,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_locked_round_does_not_hold_shared_reads,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_pinned_idle_wal_is_not_written, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_read_only_connection_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_an_unreadable_shm_is_reported_and_recovers,
+                                        setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

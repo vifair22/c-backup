@@ -20,6 +20,7 @@
 #include <cmocka.h>
 
 #include "wal_sync.h"
+#include "wal_health.h"
 #include "test_tmp.h"
 
 #define TEST_DIR TEST_TMP "/c_backup_test_wal_sync"
@@ -46,6 +47,7 @@ static int setup(void **state)
     (void)state;
     rmrf(TEST_DIR);
     wal_sync_reset();
+    wal_health_reset();
     return mkdir(TEST_DIR, 0700);
 }
 
@@ -136,6 +138,32 @@ static void test_replaced_during_the_sync_fails_loudly(void **state)
     assert_int_equal(wal_sync_dir_syncs(), d + 1);
 }
 
+/*
+ * B215: a -wal that cannot be opened is said aloud, not just returned:
+ * wal_health counts it and reports it failing until a sync works again. A
+ * symlink loop stands in for a file the daemon's uid may not open, because
+ * it fails the same way for root, which CI runs as.
+ */
+static void test_unopenable_wal_is_reported(void **state)
+{
+    (void)state;
+    assert_int_equal(symlink("state.db-wal", WAL), 0);   /* points at itself */
+    assert_int_not_equal(wal_sync(WAL), OK);
+    char msg[512];
+    assert_true(wal_health_failing(msg, sizeof(msg), NULL));
+    assert_non_null(strstr(msg, "WAL sync"));
+    assert_non_null(strstr(msg, WAL));
+    assert_non_null(strstr(msg, "errno"));
+    assert_true(wal_health_failures() >= 1);
+
+    assert_int_equal(unlink(WAL), 0);
+    write_file(WAL, "frames");
+    assert_int_equal(wal_sync(WAL), OK);
+    assert_false(wal_health_failing(NULL, 0, NULL));
+    /* The count is since start, not since the last success. */
+    assert_true(wal_health_failures() >= 1);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -143,6 +171,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_directory_synced_once_per_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replaced_between_calls_follows_the_name, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replaced_during_the_sync_fails_loudly, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unopenable_wal_is_reported, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
