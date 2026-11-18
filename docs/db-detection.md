@@ -1,6 +1,6 @@
 # Database detection and consistent capture
 
-Design document, being built in phases (section 8): D0 to D3 are built;
+Design document, built in phases (section 8): D0 to D4 are built;
 section 14 records what they settled. It replaces one-off,
 per-application hook decisions (such as an Immich `pg_dumpall`) with a
 general mechanism. c-backup recognises live databases in what it backs up,

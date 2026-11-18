@@ -4825,55 +4825,7 @@ for portability across major versions.
 - **Metrics**: `cbackup_db_findings{coverage}` and
   `cbackup_db_uncovered_reads_total` (16.2).
 
-### 23.5 Reading the findings
-
-`db_findings` is served read-only (`docs/api.md`, Database findings):
-
-```sh
-c-backup db list 1                                  # every finding, paged
-c-backup db list 1 --coverage uncovered             # what is not consistently captured
-c-backup db list 1 --unit docker:compose:immich     # one unit's
-c-backup db list 1 --source /mnt/user/appdata --engine sqlite
-c-backup db show 1 12                               # one finding
-```
-
-Each finding has the fields a backup's result gives it (engine, version,
-path, confidence, coverage and `coverage_why`, method, suggestion,
-optional, evidence), its state, its history (`first_seen`, `last_seen`,
-`last_snap_id`, `alerted_at`) and the columns enabling and dismissing fill
-(`template`, `params`, `decided_by`, `decided_at`, `reason`), empty until
-then. The desktop app shows them as cards in a Databases view reached from
-the repository dashboard, grouped by unit and source and filterable by
-coverage, engine and state; the dashboard's button carries the number of
-uncovered findings not dismissed, and the backup dialog marks each source
-that has some.
-
-### 23.6 Detecting without a backup
-
-```sh
-c-backup db detect 1 cbk-uat-pg --provider docker
-```
-
-(`POST /repos/<id>/units/<p>/<u>/detect`, and **Detect now** in the app)
-runs detection on one unit now: units.probe, then a scan of each included
-mount where a live read would read it, reading only the first bytes of
-each regular file. No pause, no snapshot, nothing written to the
-repository. It is a job like the others, held against the repository's
-other jobs so it never reads beside a backup. Its result is
-`{"databases":...}`, the same object a backup's result carries, and its
-findings are recorded under the unit's scope.
-
-Coverage there is a prediction: the capture the unit's next backup would
-make (a mount on a snapshot domain atomic, one on no domain read with the
-unit paused when it is running, a stopped unit at rest). So a detection run
-never raises the uncovered alert; the next backup that captures the
-database uncovered does. It does journal new live findings and coverage
-changes, prefixed `detect`. A finding's `last_snap_id` is left as the last
-backup set it. Classifications the run read are kept in the file cache
-for files the cache already holds unchanged, so the next backup does not
-need to read them again.
-
-### 23.7 Failure and cost
+### 23.5 Failure and cost
 
 Detection never fails a backup. A detector that runs out of memory, or
 findings that cannot be recorded, are logged and the backup carries on;
@@ -5080,3 +5032,52 @@ online backup (`docs/db-detection.md` 9.2), so the only template is
 rollback-journal database's copy holds a shared lock that blocks the
 application's writers while it runs). Enabling it records the choice; the
 file backup reads it and stores the copy under `.cbackup-captures/` (23.6).
+
+### 23.8 Reading the findings
+
+`db_findings` is served read-only (`docs/api.md`, Database findings):
+
+```sh
+c-backup db list 1                                  # every finding, paged
+c-backup db list 1 --coverage uncovered             # what is not consistently captured
+c-backup db list 1 --unit docker:compose:immich     # one unit's
+c-backup db list 1 --source /mnt/user/appdata --engine sqlite
+c-backup db show 1 12                               # one finding
+```
+
+Each finding has the fields a backup's result gives it (engine, version,
+path, confidence, coverage and `coverage_why`, method, suggestion,
+optional, evidence), its state, its history (`first_seen`, `last_seen`,
+`last_snap_id`, `alerted_at`) and the columns enabling and dismissing fill
+(`template`, `params`, `decided_by`, `decided_at`, `reason`), empty until
+then. The desktop app shows them as cards in a Databases view reached from
+the repository dashboard, grouped by unit and source and filterable by
+coverage, engine and state; the dashboard's button carries the number of
+uncovered findings not dismissed, and the backup dialog marks each source
+that has some. Each card offers Preview, Enable and Dismiss (23.7); a hint offers
+none.
+
+### 23.9 Detecting without a backup
+
+```sh
+c-backup db detect 1 cbk-uat-pg --provider docker
+```
+
+(`POST /repos/<id>/units/<p>/<u>/detect`, and **Detect now** in the app)
+runs detection on one unit now: units.probe, then a scan of each included
+mount where a live read would read it, reading only the first bytes of
+each regular file. No pause, no snapshot, nothing written to the
+repository. It is a job like the others, held against the repository's
+other jobs so it never reads beside a backup. Its result is
+`{"databases":...}`, the same object a backup's result carries, and its
+findings are recorded under the unit's scope.
+
+Coverage there is a prediction: the capture the unit's next backup would
+make (a mount on a snapshot domain atomic, one on no domain read with the
+unit paused when it is running, a stopped unit at rest). So a detection run
+never raises the uncovered alert; the next backup that captures the
+database uncovered does. It does journal new live findings and coverage
+changes, prefixed `detect`. A finding's `last_snap_id` is left as the last
+backup set it. Classifications the run read are kept in the file cache
+for files the cache already holds unchanged, so the next backup does not
+need to read them again.
