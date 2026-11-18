@@ -69,6 +69,24 @@ status_t mount_classify(const mount_cfg_t *c, const char *type, const char *sour
                         const char *driver, mount_class_t *out);
 
 /*
+ * Where a plain path's bytes are (capture.begin_paths, db-detection.md
+ * 9.4): the same resolution mount_classify gives a bind source (shfs to its
+ * one pool or disk, symlinks in the host's namespace, then bind mounts), with
+ * no include-root check. A host facility (mount_is_system) is EXCLUDED with
+ * reason "system" and not resolved. A path that does not exist is an error.
+ */
+status_t mount_resolve(const mount_cfg_t *c, const char *path, mount_class_t *out);
+
+/*
+ * The mount points strictly below path in the host's mount table, the
+ * snapshot machinery (.zfs, .cbackup-snapshots) left out: what a snapshot of
+ * path's filesystem would show as empty directories. Up to max of them are
+ * strdup'd into out (the caller frees them), *total counts every one.
+ */
+status_t mount_below(const char *mountinfo, const char *path, char **out, size_t max,
+                     size_t *n_out, size_t *total);
+
+/*
  * The helper's own layout, checked before it starts (B186). Refused
  * (ERR_INVALID, the message naming the fix and the cleanup): any of paths
  * mounted more than once, in the helper's table (self_mi) or the host's

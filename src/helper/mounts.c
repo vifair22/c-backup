@@ -275,6 +275,56 @@ static status_t resolve(const mount_cfg_t *c, const char *source, mount_class_t 
     return OK;
 }
 
+status_t mount_resolve(const mount_cfg_t *c, const char *path, mount_class_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    snprintf(out->recorded, sizeof(out->recorded), "%s", path);
+    if (mount_is_system(path)) {
+        set(out, MOUNT_EXCLUDED, "system");
+        return OK;
+    }
+    set(out, MOUNT_INCLUDED, "");
+    return resolve(c, path, out, 0);
+}
+
+/* A mount that is c-backup's own snapshot machinery, never data: a ZFS
+ * snapshot automounted under .zfs, or anything under a btrfs snapshot
+ * directory. The scanner never enters either. */
+static int snapshot_machinery(const char *mp)
+{
+    return strstr(mp, "/.zfs/") != NULL || strstr(mp, "/.cbackup-snapshots/") != NULL ||
+           (strlen(mp) >= 5 && strcmp(mp + strlen(mp) - 5, "/.zfs") == 0) ||
+           (strlen(mp) >= 19 && strcmp(mp + strlen(mp) - 19, "/.cbackup-snapshots") == 0);
+}
+
+status_t mount_below(const char *mountinfo, const char *path, char **out, size_t max,
+                     size_t *n_out, size_t *total)
+{
+    *n_out = 0;
+    *total = 0;
+    minfo_t *m = NULL;
+    size_t n = 0;
+    status_t st = minfo_read(mountinfo, &m, &n);
+    if (st != OK) return st;
+    for (size_t i = 0; i < n && st == OK; i++) {
+        if (strcmp(m[i].mp, path) == 0 || !under(m[i].mp, path) || snapshot_machinery(m[i].mp)) continue;
+        int dup = 0;
+        for (size_t k = 0; k < *n_out && !dup; k++) dup = strcmp(out[k], m[i].mp) == 0;
+        if (dup) continue;
+        (*total)++;
+        if (*n_out < max) {
+            if (!(out[*n_out] = strdup(m[i].mp))) st = set_error(ERR_NOMEM, "mounts: mount list");
+            else (*n_out)++;
+        }
+    }
+    minfo_free(m, n);
+    if (st != OK) {
+        for (size_t k = 0; k < *n_out; k++) free(out[k]);
+        *n_out = 0;
+    }
+    return st;
+}
+
 status_t mount_classify(const mount_cfg_t *c, const char *type, const char *source,
                         const char *driver, mount_class_t *out)
 {
