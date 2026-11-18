@@ -87,6 +87,12 @@ char *unit_json_encode(const unit_json_t *u, size_t *len)
             if (ok && d->version[0]) ok = cJSON_AddStringToObject(x, "version", d->version) != NULL;
             if (ok && d->coverage[0]) ok = cJSON_AddStringToObject(x, "coverage", d->coverage) != NULL;
             if (ok && d->method[0]) ok = cJSON_AddStringToObject(x, "method", d->method) != NULL;
+            if (ok && d->tmpl[0]) {
+                cJSON *t = cJSON_AddObjectToObject(x, "template");
+                ok = t && cJSON_AddStringToObject(t, "name", d->tmpl) &&
+                     cJSON_AddBoolToObject(t, "ok", d->tmpl_ok) &&
+                     (!d->dump[0] || cJSON_AddStringToObject(t, "dump", d->dump));
+            }
         }
         if (ok && u->dbs_total > u->n_dbs)
             ok = cJSON_AddNumberToObject(o, "databases_total", (double)u->dbs_total) != NULL;
@@ -239,6 +245,12 @@ status_t unit_json_parse(const void *buf, size_t len, unit_json_t *out)
             if ((v = js(x, "version")))  snprintf(d->version, sizeof(d->version), "%s", v);
             if ((v = js(x, "coverage"))) snprintf(d->coverage, sizeof(d->coverage), "%s", v);
             if ((v = js(x, "method")))   snprintf(d->method, sizeof(d->method), "%s", v);
+            const cJSON *t = cJSON_GetObjectItemCaseSensitive(x, "template");
+            if (cJSON_IsObject(t) && (v = js(t, "name"))) {
+                snprintf(d->tmpl, sizeof(d->tmpl), "%s", v);
+                d->tmpl_ok = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(t, "ok"));
+                if ((v = js(t, "dump"))) snprintf(d->dump, sizeof(d->dump), "%s", v);
+            }
             if (!(d->path = strdup(path))) { st = set_error(ERR_NOMEM, "unit.json"); break; }
             out->n_dbs++;
         }

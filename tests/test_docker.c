@@ -1330,6 +1330,64 @@ static int group_cleanup(void **state)
     return 0;
 }
 
+
+/*
+ * Where a database template runs (db-detection.md 7.2, D2): the member whose
+ * included mount holds the finding's recorded path, and that path as the
+ * member sees it, all from the backend's own inspect; and the catalog's
+ * user, passed to the exec.
+ */
+static void test_db_target(void **state)
+{
+    (void)state;
+    char c[129], p[4096];
+    assert_int_equal(be.db_target(be.ctx, "compose:web", APPS "/web/db/pgdata", c, sizeof(c), p, sizeof(p)), OK);
+    assert_string_equal(c, "web-db");
+    assert_string_equal(p, "/var/lib/pg/pgdata");
+    assert_int_equal(be.db_target(be.ctx, "compose:web", APPS "/web/db", c, sizeof(c), p, sizeof(p)), OK);
+    assert_string_equal(p, "/var/lib/pg");
+    assert_int_equal(be.db_target(be.ctx, "compose:web", APPS "/web/www/app.db", c, sizeof(c), p, sizeof(p)), OK);
+    assert_string_equal(c, "web-www");
+    assert_string_equal(p, "/www/app.db");
+    /* A name that only starts like a mount is not under it. */
+    assert_int_equal(be.db_target(be.ctx, "compose:web", APPS "/web/dbx/pg", c, sizeof(c), p, sizeof(p)),
+                     ERR_NOT_FOUND);
+    /* An excluded mount (the docker socket) runs nothing. */
+    assert_int_equal(be.db_target(be.ctx, "compose:web", "/var/run/docker.sock", c, sizeof(c), p, sizeof(p)),
+                     ERR_NOT_FOUND);
+    /* No path: the only member, or a refusal when there are several. */
+    assert_int_equal(be.db_target(be.ctx, "solo", NULL, c, sizeof(c), p, sizeof(p)), OK);
+    assert_string_equal(c, "solo");
+    assert_int_equal(be.db_target(be.ctx, "compose:web", NULL, c, sizeof(c), p, sizeof(p)), ERR_INVALID);
+    assert_int_equal(be.db_target(be.ctx, "compose:nobody", APPS "/x", c, sizeof(c), p, sizeof(p)), ERR_NOT_FOUND);
+    err_clear();
+
+    policy_hook_t h;
+    memset(&h, 0, sizeof(h));
+    snprintf(h.name, sizeof(h.name), "nextcloud-maintenance");
+    snprintf(h.unit, sizeof(h.unit), "docker:compose:web");
+    snprintf(h.container, sizeof(h.container), "web-www");
+    snprintf(h.user, sizeof(h.user), "www-data");
+    char *argv[] = { "echo", "on", NULL };
+    h.argv[0] = argv[0];
+    h.argv[1] = argv[1];
+    h.argc = 2;
+    h.timeout_s = 10;
+    int before = fdk.n_exec;
+    helper_run_t *r = NULL;
+    assert_int_equal(be.hook_start(be.ctx, "compose:web", &h, -1, -1, &r), OK);
+    int st = -1;
+    for (int i = 0; i < 500 && !be.hook_poll(r, &st); i++) {
+        struct timespec ts = { 0, 10 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    be.hook_free(r);
+    assert_int_equal(st, 0);
+    assert_int_equal(fdk.n_exec, before + 1);
+    assert_string_equal(fdk.exec_cmd[before], "echo on");
+    assert_string_equal(fdk.exec_user[before], "www-data");
+}
+
 int main(void)
 {
     /* As c-backup-helper does (helper_main.c): a write to a pipe or socket
@@ -1340,6 +1398,7 @@ int main(void)
     signal(SIGPIPE, SIG_IGN);
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_db_target, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nested_below_mount, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_instant_no_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_two_instants_pause, setup, teardown),

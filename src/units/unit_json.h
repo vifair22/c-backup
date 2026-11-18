@@ -62,6 +62,13 @@ typedef struct {
     char  confidence[12];
     char  coverage[24];
     char  method[16];
+    /* An enabled database template (db-detection.md 7.1, D2): its name,
+     * whether its run (a dump, or an exec template's pre run) succeeded
+     * this session, and for a dump stored in this snapshot, its path
+     * (.cbackup-unit/hooks/<name>.dump). Empty when none is enabled. */
+    char  tmpl[40];
+    int   tmpl_ok;
+    char  dump[96];
 } unit_json_db_t;
 
 /* At most this many are written; databases_total says how many there were. */

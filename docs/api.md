@@ -1683,3 +1683,20 @@ alike: those names are the daemon's in every snapshot root.
 A `grep` schedule searches the newest snapshot as of each fire, so it takes
 no `snapshot`. From the CLI: `schedule add 1 grep --every day --at 04:00
 --pattern 'BEGIN RSA' [--path-prefix PATH] [-i]`.
+
+## Databases
+
+Acting on what database detection found (`docs/db-detection.md` 7.3, 7.4;
+Manual 23.7). A finding is the `id` in a job result's `databases`. Each
+action is an explicit call; nothing else enables a template.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/repos/<id>/databases/<f>/preview` | Body optional: `{"template":"pg-dump","params":{...}}`; without a template, the finding's suggestion, what is enabled, or the engine's default dump. For a unit's finding: `template`, `kind` (`dump` or `exec`), `summary`, `params` (canonical, sqlite-backup's `db` filled with the finding's path), `container` and `user` it runs as, `argv` and for an exec template with a post run `post_argv` (as the helper builds them), `output` (`.cbackup-unit/hooks/<name>.dump`, dumps) and `log`, `needs_quiesce` when set, `allowed` by the helper's policy and `policy_line` when not, `probe` (`argv`, `exit`, `timed_out`, `output` at most 64 KiB, `truncated`) and `verified` (the probe exited 0). For a file source's: `kind` `engine-copy`, `output` under `.cbackup-captures/`, `verified` and `probe` null. 409 when the unit's provider is not behind the helper, 502 when the helper cannot be asked |
+| POST | `/repos/<id>/databases/<f>/enable` | `{"template":"pg-dumpall","params":{}}`, template required; any other key is refused. The template must be in the catalog and for the finding's engine, and its params must check (400 naming the rule). A file source takes only `sqlite-backup`, with `{"allow_rollback_lock":true}` its one optional parameter. For a unit, a template the helper's policy does not allow is 409 with `error` and `policy_line`, the line to add; 503 when the helper has not answered since the daemon started. Records state `enabled`, `template`, `params`, `decided_by` (the caller), `decided_at`; journalled. Answers the finding |
+| POST | `/repos/<id>/databases/<f>/dismiss` | `{"reason":"..."}`, 1 to 512 bytes, no control characters. State `dismissed`, the template cleared, `reason`, `decided_by`, `decided_at`; journalled. Answers the finding |
+
+The finding these answer: `id`, `scope`, `engine`, `path`, `version` (when
+known), `confidence`, `coverage`, `suggestion` (when any), `state`,
+`template` and `params` (when enabled), `decided_by`, `decided_at` and
+`reason` (when set). 404 for a finding the repository does not have.
