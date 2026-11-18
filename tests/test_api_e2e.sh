@@ -433,6 +433,22 @@ contains "submit" '"job_id"' "$BACKUP_RESP"
 BACKUP_JOB=$(job_id "$BACKUP_RESP")
 wait_job "$BACKUP_JOB"
 contains "job completed" '"state":"completed"' "$(sock_body "/jobs/$BACKUP_JOB")"
+# B216: the write lock and the checkpointer are measured, daemon-wide. A
+# backup takes bulk turns of the lock and commits.
+METRICS=$(sock_body /metrics)
+BULK=$(printf '%s\n' "$METRICS" | sed -n 's/^cbackup_db_txn_grants_total{queue="bulk"} \([0-9]*\)$/\1/p')
+COMMITS=$(printf '%s\n' "$METRICS" | sed -n 's/^cbackup_db_txn_commits_total \([0-9]*\)$/\1/p')
+check "backup took bulk turns of the lock" "yes" "$([ "${BULK:-0}" -gt 0 ] && echo yes || echo "no: $BULK")"
+check "commits are counted" "yes" "$([ "${COMMITS:-0}" -gt 0 ] && echo yes || echo "no: $COMMITS")"
+for name in 'cbackup_db_txn_wait_seconds_total{queue="priority"}' cbackup_db_txn_commit_seconds_total \
+            cbackup_db_txn_commit_frames_total 'cbackup_checkpoint_rounds_total{locked="yes"}' \
+            cbackup_checkpoint_lock_seconds_total cbackup_checkpoint_lock_max_seconds \
+            cbackup_checkpoint_frames_copied_total cbackup_checkpoint_throttle_waits_total \
+            cbackup_checkpoint_throttle_timeouts_total cbackup_checkpoint_throttle_seconds_total \
+            cbackup_wal_frames_max; do
+    contains "metric $name" "
+$name " "$METRICS"
+done
 # A finished job says what it did, and how big and how long. It said only
 # "completed" with the last phase's entry count.
 JOB_BODY=$(sock_body "/jobs/$BACKUP_JOB")

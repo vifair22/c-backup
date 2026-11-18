@@ -85,6 +85,21 @@ static _Thread_local db_txn_wait_t tls_last_wait;
  * g_ticket_mu, read without it by db_txn_waiters. */
 static atomic_uint     g_waiting;
 
+/* db_txn_metrics (B216). */
+static atomic_ullong   g_m_grants[2], g_m_wait_ns[2];
+static atomic_ullong   g_m_commits, g_m_commit_ns, g_m_commit_frames;
+
+void db_txn_metrics(db_txn_metrics_t *out)
+{
+    for (int i = 0; i < 2; i++) {
+        out->grants[i]  = atomic_load_explicit(&g_m_grants[i], memory_order_relaxed);
+        out->wait_ns[i] = atomic_load_explicit(&g_m_wait_ns[i], memory_order_relaxed);
+    }
+    out->commits       = atomic_load_explicit(&g_m_commits, memory_order_relaxed);
+    out->commit_ns     = atomic_load_explicit(&g_m_commit_ns, memory_order_relaxed);
+    out->commit_frames = atomic_load_explicit(&g_m_commit_frames, memory_order_relaxed);
+}
+
 /* Completed make_durable calls, for tests. */
 static atomic_ulong    g_durable;
 
@@ -214,6 +229,7 @@ static void budget_committed(uint64_t commit_ns)
     uint32_t mx = 0, salt = 0;
     if (read_walidx(&mx, &salt) != 0) return;
     uint32_t frames = salt != tls_salt0 ? mx : mx - tls_mx0;
+    atomic_fetch_add_explicit(&g_m_commit_frames, frames, memory_order_relaxed);
     g_cstats.commits++;
     if (frames > g_cstats.max_frames) g_cstats.max_frames = frames;
     if (commit_ns > g_cstats.max_commit_ns) g_cstats.max_commit_ns = commit_ns;
@@ -277,6 +293,7 @@ uint32_t db_txn_row_cap(void)
 
 static void write_lock_as(int bulk)
 {
+    uint64_t asked = phase_now();
     pthread_mutex_lock(&g_ticket_mu);
     if (bulk) {
         if (g_bulk_next == g_bulk_serving) g_bulk_head_since = phase_now();
@@ -315,6 +332,9 @@ static void write_lock_as(int bulk)
     }
     g_held = 1;
     pthread_mutex_unlock(&g_ticket_mu);
+    atomic_fetch_add_explicit(&g_m_grants[bulk ? 1 : 0], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_m_wait_ns[bulk ? 1 : 0], phase_now() - asked,
+                              memory_order_relaxed);
     tls_held = 1;
     tls_conn = NULL;
 }
@@ -435,6 +455,8 @@ status_t db_txn_commit(cutils_db_t *db)
     int rc = db_exec_raw(db, "COMMIT");
     uint64_t t1 = phase_now();
     phase_add_commit(phase_current, t0);
+    atomic_fetch_add_explicit(&g_m_commits, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_m_commit_ns, t1 - t0, memory_order_relaxed);
     if (rc == 0) budget_committed(t1 - t0);
     tls_tracked = 0;
     /* Read before the lock goes: the next holder's statements would

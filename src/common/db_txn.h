@@ -189,6 +189,25 @@ typedef struct {
 } db_txn_commit_stats_t;
 
 void db_txn_commit_stats(db_txn_commit_stats_t *out);
+
+/*
+ * Running totals for /metrics (B216), read without the write lock so a
+ * scrape never queues behind the transaction it is trying to measure.
+ * [0] is the priority queue (requests, job records, the checkpointer),
+ * [1] the bulk queue (backup batches, pack commits, reindex, gc). A grant
+ * is one turn of the lock; wait_ns runs from asking for it to getting it.
+ * Commits are every COMMIT through db_txn_commit; frames only those the
+ * commit budget could measure (db_txn_track_wal).
+ */
+typedef struct {
+    uint64_t grants[2];
+    uint64_t wait_ns[2];
+    uint64_t commits;
+    uint64_t commit_ns;
+    uint64_t commit_frames;
+} db_txn_metrics_t;
+
+void db_txn_metrics(db_txn_metrics_t *out);
 void db_txn_commit_stats_reset(void);
 /* Tests: pretend each WAL frame costs ns to write (0: measure). */
 void db_txn_set_frame_cost_ns(double ns);

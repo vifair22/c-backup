@@ -377,6 +377,21 @@ int main(int argc, char *argv[])
     }
 
     /*
+     * The checkpointer's connection too, for the same reason AppGuard's and
+     * the readers' are fine: opened here, as root, it holds state.db
+     * read-write. Its thread starts much later, after the drop. Opened after
+     * the drop it was read-only, because AppGuard created state.db and its
+     * -wal and -shm as root, 0600, and uid 990 can read them
+     * (CAP_DAC_READ_SEARCH) but not write them: every checkpoint was refused,
+     * the WAL grew to five times its cap and the database file never
+     * changed (B215). Without it nothing bounds the WAL, so it is fatal.
+     */
+    if (checkpointer_open(db_path) != OK) {
+        log_error("%s", err_msg());
+        goto out_guard;
+    }
+
+    /*
      * Down to the configured uid before anything else is opened: no repo
      * lock, job, socket or provider exists yet (source-providers.md 11.6).
      * AppGuard has the config and the database open already, which is why
@@ -674,6 +689,9 @@ out_locks:
      * so the process does not pin a deleted inode on its way out. */
     wal_sync_reset();
 out_guard:
+    /* A connection checkpointer_open made for a startup that failed before
+     * the thread started; nothing when the ladder above already closed it. */
+    checkpointer_stop();
     /* Every thread that could look an object up has stopped by here; on a
      * path that never opened them this does nothing. */
     db_readers_close();
