@@ -290,6 +290,47 @@ static void test_absent_record_root_uses_device_zero(void **state)
     scan_imap_free(im);
 }
 
+/*
+ * A file source read from elsewhere keeps the excludes written for its live
+ * paths (exclude_on_record, db-detection.md 9.4); without the option they
+ * match the paths as read, which units rely on.
+ */
+static void test_excludes_on_record(void **state)
+{
+    (void)state;
+    const char *ex[] = { TEST_REC "/dir01", "file03.txt" };
+    scan_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.exclude = ex;
+    o.n_exclude = 2;
+    o.exclude_on_record = 1;
+    scan_imap_t *im = scan_imap_new();
+    scan_result_t *r = NULL;
+    assert_int_equal(scan_tree_as(TEST_SRC, TEST_REC, im, &o, &r), OK);
+    int dir01 = 0, f03 = 0, kept = 0;
+    for (uint32_t i = 0; i < r->count; i++) {
+        if (strstr(r->entries[i].path, "/dir01")) dir01++;
+        if (strstr(r->entries[i].path, "file03.txt")) f03++;
+        if (strcmp(r->entries[i].path, TEST_REC "/dir02/file00.txt") == 0) kept++;
+    }
+    assert_int_equal(dir01, 0);
+    assert_int_equal(f03, 0);
+    assert_int_equal(kept, 1);
+    scan_result_free(r);
+    scan_imap_free(im);
+
+    /* Matched as read, the record-path pattern excludes nothing. */
+    o.exclude_on_record = 0;
+    im = scan_imap_new();
+    assert_int_equal(scan_tree_as(TEST_SRC, TEST_REC, im, &o, &r), OK);
+    dir01 = 0;
+    for (uint32_t i = 0; i < r->count; i++)
+        if (strstr(r->entries[i].path, "/dir01/")) dir01++;
+    assert_true(dir01 > 0);
+    scan_result_free(r);
+    scan_imap_free(im);
+}
+
 /* ------------------------------------------------------------------ */
 /* Through a snapshot stand-in (namespaces needed)                     */
 /* ------------------------------------------------------------------ */
@@ -444,6 +485,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_identity_uses_record_device, setup, teardown),
         cmocka_unit_test_setup_teardown(test_absent_record_root_uses_device_zero, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_excludes_on_record, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_reads_match_live, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_hardlinks, setup, teardown),
         cmocka_unit_test_setup_teardown(test_changed_file_is_reread, setup, teardown),

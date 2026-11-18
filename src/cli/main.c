@@ -640,6 +640,27 @@ static int h_sources_set(const args_t *a)
     }
     sb_puts(&b, "],\"exclude\":");
     sb_json_multi(&b, a, "--exclude");
+    /* Snapshot mode (db-detection.md 9.4): --snapshot PATH is strict (the
+     * backup fails if PATH cannot be read from a snapshot), --snapshot-warn
+     * PATH reads it live with a warning instead. Neither given keeps the
+     * modes of the sources that stay; --no-snapshot turns them all off. */
+    int ns = args_multi_count(a, "--snapshot"), nw = args_multi_count(a, "--snapshot-warn");
+    int off = args_flag(a, "--no-snapshot");
+    if (off && (ns || nw)) { free(b.buf); return fail("--no-snapshot cannot be given with --snapshot or --snapshot-warn"); }
+    if (ns || nw || off) {
+        sb_puts(&b, ",\"snapshot\":[");
+        int it = 0, n = 0;
+        for (const char *v; (v = args_multi_next(a, "--snapshot", &it)) != NULL; n++) {
+            if (n) sb_puts(&b, ",");
+            sb_puts(&b, "{\"path\":"); sb_json_str(&b, v); sb_puts(&b, ",\"mode\":\"strict\"}");
+        }
+        it = 0;
+        for (const char *v; (v = args_multi_next(a, "--snapshot-warn", &it)) != NULL; n++) {
+            if (n) sb_puts(&b, ",");
+            sb_puts(&b, "{\"path\":"); sb_json_str(&b, v); sb_puts(&b, ",\"mode\":\"warn\"}");
+        }
+        sb_puts(&b, "]");
+    }
     sb_puts(&b, "}");
 
     sbuf_t p = { 0 };
@@ -1924,7 +1945,12 @@ static const arg_opt_t O_REPO_ADD[] = {
     { "--passphrase", NULL, ARG_VALUE, "TEXT" },
     OPT_END,
 };
-static const arg_opt_t O_EXCLUDE[] = { { "--exclude", NULL, ARG_MULTI, "PAT" }, OPT_END };
+static const arg_opt_t O_SRC_SET[] = {
+    { "--exclude", NULL, ARG_MULTI, "PAT" },
+    { "--snapshot", NULL, ARG_MULTI, "PATH" },
+    { "--snapshot-warn", NULL, ARG_MULTI, "PATH" },
+    { "--no-snapshot", NULL, ARG_FLAG, NULL },
+    OPT_END };
 static const arg_opt_t O_BACKUP[] = {
     { "--exclude", NULL, ARG_MULTI, "PAT" },
     { "--one-filesystem", NULL, ARG_FLAG, NULL },
@@ -2051,7 +2077,9 @@ static const command_t COMMANDS[] = {
     { { "repo key import", P_KEY_IMP,  NULL, NULL }, h_repo_key_import, 0 },
     { { "repo key ack",    P_REPO,     NULL, NULL }, h_repo_key_ack, 0 },
     { { "sources list",    P_REPO,     NULL, NULL }, h_sources_list, 0 },
-    { { "sources set",     P_SRC_SET,  O_EXCLUDE, "replaces the list; no paths clears it" },
+    { { "sources set",     P_SRC_SET,  O_SRC_SET, "replaces the list; no paths clears it. --snapshot PATH "
+        "reads PATH from a ZFS or btrfs snapshot and fails the backup if it cannot; --snapshot-warn PATH "
+        "reads it live with a warning instead; neither keeps the modes of sources that stay" },
       h_sources_set, 0 },
     { { "backup",          P_BACKUP,   O_BACKUP, NULL }, h_backup, 0 },
     { { "restore",         P_RESTORE,  O_RESTORE, NULL }, h_restore, 0 },
