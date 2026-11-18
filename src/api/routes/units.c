@@ -212,6 +212,7 @@ static api_response_t providers_list(void)
                 cJSON_AddStringToObject(ho, "daemon_id", li.hello.daemon_id);
                 cJSON_AddStringToObject(ho, "policy", li.hello.policy);
                 cJSON_AddStringToObject(ho, "providers", li.hello.providers);
+                cJSON_AddBoolToObject(ho, "path_snapshots", li.hello.path_snapshots);
                 if (asked) {
                     cJSON_AddNumberToObject(ho, "holds", (double)hholds);
                     cJSON_AddNumberToObject(ho, "captures", (double)hcaps);

@@ -2364,6 +2364,39 @@ FP=$(sock_body "/repos/$DB_ID/databases?offset=1")
 contains "a page past the rows is empty, total kept" '{"findings":[],"total":1}' "$FP"
 check "an unknown repository is a 404" 404 "$(sock_code "/repos/9999/databases")"
 
+# D3: an enabled engine copy (db-detection.md 9.2). Enabled here in
+# state.db directly; the enable route records exactly this row.
+check "a restore refuses a prefer_engine_copy that is not a boolean" \
+    "400" "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+             -d "{\"dest\":\"$R/dbout\",\"prefer_engine_copy\":\"yes\"}" \
+             "http://localhost/repos/$DB_ID/snapshots/1/restore")"
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$DBS/app/real.db" "PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (42);" > /dev/null
+    sqlite3 -cmd ".timeout 10000" "$R/state.db" "INSERT INTO db_findings (repo_id, scope, engine, path,
+        confidence, state, evidence, first_seen, last_seen, template)
+        VALUES ($DB_ID, 'source:$DBS', 'sqlite', '$DBS/app/real.db', 'dormant', 'enabled', '{}', 1, 1,
+        'sqlite-backup')"
+    CP_JOB=$(job_id "$(sock_post "/repos/$DB_ID/backup" "{\"paths\":[\"$DBS\"]}")")
+    wait_job "$CP_JOB"
+    CP_BODY=$(sock_body "/jobs/$CP_JOB")
+    contains "an enabled engine copy is made" '"method":"sqlite-online-backup"' "$CP_BODY"
+    contains "and stored" "\"copy\":\"/.cbackup-captures$DBS/app/real.db\"" "$CP_BODY"
+    contains "with its outcome" '"outcome":"ok"' "$CP_BODY"
+    CP_SNAP=$(printf '%s' "$CP_BODY" | sed -n 's/.*"snapshot_id":\([0-9]*\).*/\1/p')
+    RS_JOB=$(job_id "$(sock_post "/repos/$DB_ID/snapshots/$CP_SNAP/restore" \
+                       "{\"dest\":\"$R/dbout\",\"prefer_engine_copy\":true}")")
+    wait_job "$RS_JOB"
+    RS_BODY=$(sock_body "/jobs/$RS_JOB")
+    contains "a restore can prefer the engine copy" '"engine_copies_used":1' "$RS_BODY"
+    check "and the copy is the database" "42" "$(sqlite3 "$R/dbout$DBS/app/real.db" 'SELECT x FROM t' 2>&1)"
+    contains "the index is in the snapshot" '"format":"cbackup-captures"' \
+        "$(cat "$R/dbout/.cbackup-captures/index.json" 2>/dev/null)"
+    contains "and counted" 'cbackup_db_engine_captures_total{engine="sqlite",result="ok"} 1' \
+        "$(sock_body /metrics)"
+else
+    ok "engine copies end to end (skipped: no sqlite3)"
+fi
+
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
 DAEMON_PID=""

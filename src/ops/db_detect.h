@@ -128,6 +128,17 @@ void db_detect_carry_add(db_detector_t *d, const char *path, uint32_t code);
 /* A file still changing on the last read (OWN-45): liveness. */
 void db_detect_unsettled(db_detector_t *d, const char *path);
 
+/*
+ * Files that have an engine copy this run (db-detection.md 9.5): read once
+ * by the store, never re-read when they move. Added before the backup
+ * starts; asked from any store thread after.
+ */
+void db_detect_copy_add(db_detector_t *d, const char *path);
+int  db_detect_is_copied(const db_detector_t *d, const char *path);
+/* Whether a file was reported unsettled this run. For after the store
+ * phase, when every store thread is done. */
+int  db_detect_was_unsettled(db_detector_t *d, const char *path);
+
 /* ------------------------------------------------------------------ */
 /* Units (D1)                                                           */
 /* ------------------------------------------------------------------ */

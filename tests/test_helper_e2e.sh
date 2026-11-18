@@ -260,6 +260,8 @@ contains "with its version" '"version":1' "$OUT"
 contains "with the daemon id it serves" '"daemon_id":"0badf00d"' "$OUT"
 contains "fake is enabled, through it" '"enabled":true' "$OUT"
 contains "and probes through the socket" "through the helper at" "$OUT"
+contains "a policy with only dir domains snapshots no path" '"path_snapshots":false' "$OUT"
+lacks    "the helper's own paths backend is no provider" 'paths' "$(printf '%s' "$OUT" | grep -o '"providers":"[^"]*"')"
 OUT=$(cb unit list fake)
 contains "enumeration crosses the helper" 'cbk-uat-a' "$OUT"
 lacks    "and the helper's policy filters it" 'prod-db' "$OUT"
@@ -397,6 +399,43 @@ kill "$HELPER_PID"; wait "$HELPER_PID" 2>/dev/null; HELPER_PID=
 OUT=$(cb unit backup 1 --provider fake cbk-uat-a 2>&1); RC=$?
 check    "a unit backup without its helper fails" 1 "$RC"
 contains "and names the helper" "helper" "$OUT"
+
+# capture.begin_paths' backend in the real binary (db-detection.md 9.4):
+# a helper whose policy lists a ZFS dataset, over the fake zfs, sweeps at
+# its start a capture snapshot of ours that a helper which died left
+# behind, with no unit provider configured, and leaves a foreign one.
+echo "paths: the start-up sweep over a ZFS domain"
+Z=$WORK/zfs
+mkdir -p "$Z/state" "$Z/ds" "$Z/hstate"
+printf 'cache/appdata\t%s\n' "$Z/ds" > "$Z/state/datasets"
+FAKE_HOST_STATE="$Z/state" tests/fake_host/zfs snapshot -o com.cbackup:owner=0badf00d cache/appdata@cbk-0badf00d-77-0
+FAKE_HOST_STATE="$Z/state" tests/fake_host/zfs snapshot -o com.cbackup:owner=feedface cache/appdata@cbk-feedface-5-0
+cat > "$Z/policy.ini" <<EOF
+[helper]
+daemon_uid = $DUID
+daemon_gid = $DGID
+daemon_id = 0badf00d
+state_dir = $Z/hstate
+socket = $Z/h.sock
+
+[snapshot]
+zfs_domains = cache/appdata
+
+[host]
+nsenter = 0
+host_root =
+zfs = $PWD/tests/fake_host/zfs
+mountinfo = /proc/self/mountinfo
+EOF
+chmod 0600 "$Z/policy.ini"
+[ "$(id -u)" = 0 ] && chown 0 "$Z/policy.ini"
+FAKE_HOST_STATE="$Z/state" "$HELPER" --policy "$Z/policy.ini" > "$Z/helper.log" 2>&1 &
+ZPID=$!
+for _ in $(seq 1 50); do [ -S "$Z/h.sock" ] && break; sleep 0.1; done
+for _ in $(seq 1 50); do grep -q "cbk-0badf00d-77-0" "$Z/state/snaps" || break; sleep 0.1; done
+lacks    "paths: our leftover capture snapshot is swept at start" "cbk-0badf00d-77-0" "$(cat "$Z/state/snaps")"
+contains "paths: another daemon's is left alone" "cbk-feedface-5-0" "$(cat "$Z/state/snaps")"
+kill "$ZPID"; wait "$ZPID" 2>/dev/null
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

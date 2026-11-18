@@ -692,6 +692,7 @@ static int h_restore(const args_t *a)
 {
     const char *subpath = args_value(a, "--subpath");
     int overwrite = args_flag(a, "--overwrite");
+    int prefer    = args_flag(a, "--prefer-engine-copy");
     int no_wait   = args_flag(a, "--no-wait");
 
     sbuf_t b = { 0 };
@@ -699,6 +700,7 @@ static int h_restore(const args_t *a)
     sb_json_str(&b, a->pos[2]);
     if (subpath) { sb_puts(&b, ",\"subpath\":"); sb_json_str(&b, subpath); }
     if (overwrite) sb_puts(&b, ",\"overwrite\":1");
+    if (prefer) sb_puts(&b, ",\"prefer_engine_copy\":true");
     sb_puts(&b, "}");
 
     sbuf_t p = { 0 };
@@ -1900,6 +1902,7 @@ static const arg_opt_t O_BACKUP[] = {
 static const arg_opt_t O_RESTORE[] = {
     { "--subpath", NULL, ARG_VALUE, "PATH" },
     { "--overwrite", NULL, ARG_FLAG, NULL },
+    { "--prefer-engine-copy", NULL, ARG_FLAG, NULL },
     OPT_NOWAIT, OPT_END,
 };
 static const arg_opt_t O_FORCE[] = { { "--force", NULL, ARG_FLAG, NULL }, OPT_END };

@@ -8,10 +8,9 @@
  * container paused, or act outside the policy.
  *
  * Backends: the fake provider (enabled by the policy's test-only
- * fake_spec) for units, and dir_domains for capture.begin_paths and
- * restore staging. libvirt, docker and lxc operations are validated and
- * policy-checked and then answered `unsupported` until their providers
- * exist.
+ * fake_spec), Docker, LXC and libvirt for units; the internal paths
+ * backend (paths_backend.h) for capture.begin_paths over ZFS and btrfs
+ * domains; dir_domains (tests) for begin_paths and restore staging.
  */
 
 #include "error.h"

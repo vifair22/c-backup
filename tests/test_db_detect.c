@@ -380,6 +380,8 @@ static void test_signatures(void **state)
     assert_non_null(find(f, DB_ENGINE_LEVELDB, "ldb"));
     assert_non_null(find(f, DB_ENGINE_ROCKSDB, "rocks"));
     assert_null(find(f, DB_ENGINE_LEVELDB, "rocks"));
+    /* The loser's evidence is kept. */
+    assert_non_null(strstr(find(f, DB_ENGINE_ROCKSDB, "rocks")->evidence, "\"also\":[\"leveldb"));
 
     assert_non_null(find(f, DB_ENGINE_LMDB, "lmdb"));
     assert_non_null(find(f, DB_ENGINE_BBOLT, "bolt/app.bolt"));

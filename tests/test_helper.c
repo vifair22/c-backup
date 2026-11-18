@@ -441,8 +441,20 @@ static void test_compromised_daemon(void **state)
     expect(req("units.probe", "{\"unit\":\"fake:nonexistent\"}"), "denied");
     expect(req("units.probe", "{\"unit\":\"docker:prod\"}"), "denied");
     expect(req("capture.begin", "{\"units\":[\"fake:u1\",\"fake:prod\"],\"pause\":true}"), "denied");
-    expect(req("capture.begin_paths", "{\"paths\":[\"/etc\"]}"), "denied");
-    expect(req("capture.begin_paths", "{\"paths\":[\"" HF_DIR "/poolx\"]}"), "denied");
+    /* A path on no domain of the policy is snapshotted by nobody: no
+     * capture, and the reason it would be read live (db-detection.md 9.4). */
+    for (int k = 0; k < 2; k++) {
+        cJSON *bp = call(req("capture.begin_paths", k ? "{\"paths\":[\"" HF_DIR "/poolx\"]}"
+                                                      : "{\"paths\":[\"/etc\"]}"), NULL);
+        assert_string_equal(code_of(bp), "ok");
+        const cJSON *res = cJSON_GetObjectItemCaseSensitive(bp, "result");
+        assert_null(cJSON_GetObjectItemCaseSensitive(res, "capture"));
+        assert_non_null(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(res, "live"),
+                                                         k ? HF_DIR "/poolx" : "/etc"));
+        assert_null(cJSON_GetObjectItemCaseSensitive(res, "read_roots")->child);
+        cJSON_Delete(bp);
+    }
+    assert_int_equal(helper_server_captures(srv), 0);
     expect(req("hook.run", "{\"unit\":\"fake:u1\",\"hook\":\"not-in-policy\"}"), "denied");
     expect(req("hook.run", "{\"unit\":\"fake:u1\",\"hook\":\"other-unit\"}"), "denied");
     expect(req("hook.run", "{\"unit\":\"fake:prod\",\"hook\":\"other-unit\"}"), "denied");

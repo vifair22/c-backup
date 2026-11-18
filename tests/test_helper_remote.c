@@ -969,6 +969,42 @@ static void test_session_end_releases(void **state)
     err_clear();
 }
 
+/*
+ * capture.begin_paths through the daemon's helper client (db-detection.md
+ * 9.4): begun under the daemon's session over a real socket, so when the
+ * daemon goes (remote_stop closes its anchor, as the kernel does for a
+ * killed daemon) the helper ends the capture at once; and an explicit end
+ * works while the daemon lives.
+ */
+static void test_begin_paths_through_client(void **state)
+{
+    (void)state;
+    cJSON *a = cJSON_CreateObject();
+    cJSON *ps = cJSON_AddArrayToObject(a, "paths");
+    cJSON_AddItemToArray(ps, cJSON_CreateString(HF_MOUNT));
+    cJSON *res = NULL;
+    assert_int_equal(remote_helper_call("capture.begin_paths", a, &res), OK);
+    const char *tok = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture"));
+    assert_non_null(tok);
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
+                            cJSON_GetObjectItemCaseSensitive(res, "kinds"), HF_MOUNT)), "dir");
+    assert_int_equal(helper_server_captures(srv), 1);
+    cJSON *e = cJSON_CreateObject();
+    cJSON_AddStringToObject(e, "capture", tok);
+    assert_int_equal(remote_helper_call("capture.end", e, NULL), OK);
+    assert_int_equal(helper_server_captures(srv), 0);
+    cJSON_Delete(res);
+
+    a = cJSON_CreateObject();
+    ps = cJSON_AddArrayToObject(a, "paths");
+    cJSON_AddItemToArray(ps, cJSON_CreateString(HF_MOUNT));
+    assert_int_equal(remote_helper_call("capture.begin_paths", a, &res), OK);
+    cJSON_Delete(res);
+    assert_int_equal(helper_server_captures(srv), 1);
+    remote_stop();
+    assert_true(helper_drained());
+}
+
 typedef struct { status_t st; char err[512]; } begin_job_t;
 
 static void *bg_begin(void *arg)
@@ -1374,6 +1410,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_staging_base_kept, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_stage_refused_before_stop, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_session_end_releases, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_begin_paths_through_client, setup, teardown),
         cmocka_unit_test_setup_teardown(test_session_end_during_begin, setup, teardown),
         cmocka_unit_test_setup_teardown(test_id_mismatch_said_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_bytes_over_mounts, setup_define, teardown),

@@ -73,6 +73,9 @@ typedef struct helper_backend {
      * NULL: the provider refuses only in define itself. */
     status_t (*define_check)(sp_ctx_t *c, const char *unit_id, const char *definition,
                              const helper_policy_t *pol);
+    /* The helper's own machinery, not a provider of units: never listed
+     * in hello's providers (the paths backend, paths_backend.h). */
+    int      internal;
 } helper_backend_t;
 
 /* The fake provider as a backend, over ctx. */

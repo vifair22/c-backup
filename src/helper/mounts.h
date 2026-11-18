@@ -70,6 +70,15 @@ status_t mount_classify(const mount_cfg_t *c, const char *type, const char *sour
                         const char *driver, mount_class_t *out);
 
 /*
+ * Where a plain path's bytes are (capture.begin_paths, db-detection.md
+ * 9.4): the same resolution mount_classify gives a bind source (shfs to its
+ * one pool or disk, symlinks in the host's namespace, then bind mounts), with
+ * no include-root check. A host facility (mount_is_system) is EXCLUDED with
+ * reason "system" and not resolved. A path that does not exist is an error.
+ */
+status_t mount_resolve(const mount_cfg_t *c, const char *path, mount_class_t *out);
+
+/*
  * Every mount point in a mount table, leaving out c-backup's own snapshot
  * machinery (ZFS automounts under .zfs, anything under .cbackup-snapshots).
  * *out is malloc'd, each entry too; free with mount_points_free.

@@ -6,6 +6,7 @@
 #include "helper_backend.h"
 #include "helper_proto.h"
 #include "hooklog.h"
+#include "paths_backend.h"
 #include "unit_probe.h"
 
 #include <sys/mman.h>
@@ -91,6 +92,11 @@ typedef struct {
      * to its lease as before. */
     char     session[HELPER_TOKEN_HEX + 1];
     int      anchored;
+    /* capture.begin_paths: the snapshots it took (NULL: none), released
+     * at its end through pj's journal, with pb's snapshot context. */
+    snap_set_t             *pset;
+    struct jctx            *pj;
+    const helper_backend_t *pb;
 } capture_t;
 
 /* A daemon session: the daemon process, by the token its hellos carry,
@@ -732,7 +738,19 @@ static capture_t *capture_find(helper_server_t *s, const char *token)
  * been taken out of the table (copied) already. */
 static void capture_finish(helper_server_t *s, capture_t *c, sp_end_outcome_t how)
 {
-    (void)s;
+    if (c->pset) {
+        /* A snapshot that will not go stays journalled: the sweep and the
+         * next start retry it (snap_release). */
+        sp_holds_t h = { j_record, j_clear, c->pj };
+        if (snap_release(paths_snap(c->pb), c->pset, s->pol->daemon_id, &h) != OK) {
+            log_warn("helper: ending a paths capture: %s; the sweep will retry", err_msg());
+            err_clear();
+        }
+        free(c->pset);
+        c->pset = NULL;
+    }
+    free(c->pj);
+    c->pj = NULL;
     for (size_t i = 0; i < c->n_members; i++) {
         if (!c->members[i].sess) continue;
         if (c->members[i].b->ops->end(c->members[i].sess, how, 0) != OK) {
@@ -1116,49 +1134,194 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
     return resp_ok(r->id, res);
 }
 
-/* Source snapshot mode for plain paths (db-detection.md 9.4), over the
- * policy's dir domains: each path resolved to its domain by the helper,
- * the domain checked against the policy, one snapshot name per domain from
- * the helper's own generator. The dir backend takes no real snapshot: the
- * read root is the path itself, which is what makes it a test backend. */
+/*
+ * Source snapshot mode for plain paths (db-detection.md 9.4). Every path is
+ * the helper's to resolve: a dir domain of the policy (tests: no snapshot,
+ * the read root is the path itself), else the ZFS dataset or btrfs pool it
+ * really lives in (paths_backend.h), checked against the policy. One
+ * snapshot per pool for all of them, named by the helper, no pause. A path
+ * that cannot be snapshotted is reported with the reason and left to the
+ * daemon to read live; a request where none can takes no capture at all.
+ * The capture has the same lease, rate limit, session anchoring, expiry
+ * and sweep as capture.begin, and its snapshots are journalled as
+ * "paths:capture" holds before they are taken.
+ */
+enum { BP_LIVE = 0, BP_DIR = 1, BP_SNAP = 2, BP_DUP = 3 };
+
 static char *op_capture_begin_paths(helper_server_t *s, const helper_req_t *r)
 {
-    for (size_t i = 0; i < r->n_paths; i++)
-        if (!helper_policy_dir_domain(s->pol, r->paths[i]))
-            return resp_error(r->id, HELPER_E_DENIED, "%.300s is in no snapshot domain of the policy", r->paths[i]);
+    const helper_backend_t *pb = backend_named(s, PATHS_BACKEND_NAME);
+    paths_res_t *res = calloc(r->n_paths, sizeof(*res));
+    int *kind = calloc(r->n_paths, sizeof(*kind));
+    snap_set_t *set = calloc(1, sizeof(*set));
+    jctx_t *pj = calloc(1, sizeof(*pj));
+    if (!res || !kind || !set || !pj) {
+        free(res);
+        free(kind);
+        free(set);
+        free(pj);
+        return resp_error(r->id, HELPER_E_FAILED, "out of memory");
+    }
+    char fmsg[600] = "out of memory";
+    helper_err_t fail = HELPER_OK;
+    size_t n_snap = 0, n_dir = 0;
+    snap_probe_t *probe = NULL;
+    if (fail == HELPER_OK && pb && paths_backend_any_domain(pb) && paths_probe(pb, &probe) != OK) {
+        snprintf(fmsg, sizeof(fmsg), "the host's mount table: %.500s", err_msg());
+        err_clear();
+        fail = HELPER_E_FAILED;
+    }
+    for (size_t i = 0; fail == HELPER_OK && i < r->n_paths; i++) {
+        for (size_t k = 0; k < i && !kind[i]; k++)
+            if (strcmp(r->paths[k], r->paths[i]) == 0) kind[i] = BP_DUP;
+        if (kind[i] == BP_DUP) continue;
+        if (helper_policy_dir_domain(s->pol, r->paths[i])) { kind[i] = BP_DIR; n_dir++; continue; }
+        if (!pb || !paths_backend_any_domain(pb)) {
+            snprintf(res[i].reason, sizeof(res[i].reason), "the helper's policy lists no ZFS dataset or btrfs pool");
+            continue;
+        }
+        if (paths_resolve(pb, probe, r->paths[i], &res[i]) != OK) {
+            snprintf(fmsg, sizeof(fmsg), "%.300s: %.280s", r->paths[i], err_msg());
+            err_clear();
+            fail = HELPER_E_FAILED;
+            break;
+        }
+        if (res[i].dom.kind == SNAP_NONE) continue;
+        if (snap_set_add(set, &res[i].dom) != OK) {
+            err_clear();
+            snprintf(res[i].reason, sizeof(res[i].reason), "more than %d snapshot domains in one capture", SNAP_DOMS_MAX);
+            continue;
+        }
+        kind[i] = BP_SNAP;
+        n_snap++;
+    }
+
     time_t now = time(NULL);
-    pthread_mutex_lock(&s->mu);
-    int ok = rate_ok(s, now);
     capture_t *slot = NULL;
-    for (size_t i = 0; ok && i < CAPTURES_MAX && !slot; i++)
-        if (!s->caps[i].used) slot = &s->caps[i];
-    int64_t seq = ++s->seq;
+    int64_t seq = 0;
+    int anchored = 0;
+    if (fail == HELPER_OK && n_snap + n_dir > 0) {
+        pthread_mutex_lock(&s->mu);
+        int ok = rate_ok(s, now);
+        for (size_t i = 0; ok && i < CAPTURES_MAX && !slot; i++)
+            if (!s->caps[i].used) slot = &s->caps[i];
+        seq = ++s->seq;
+        if (slot) {
+            memset(slot, 0, sizeof(*slot));
+            slot->used = 2;       /* reserved: not findable until filled */
+            slot->seq = seq;
+        }
+        anchored = session_anchored(s, r->conn_session);
+        pthread_mutex_unlock(&s->mu);
+        if (!ok) {
+            fail = HELPER_E_BUSY;
+            snprintf(fmsg, sizeof(fmsg), "more than %u captures in the last hour", s->pol->max_captures_per_hour);
+        } else if (!slot) {
+            fail = HELPER_E_BUSY;
+            snprintf(fmsg, sizeof(fmsg), "too many captures held");
+        }
+    }
+
+    capture_t c;
+    memset(&c, 0, sizeof(c));
+    c.seq = seq;
+    snprintf(c.session, sizeof(c.session), "%s", r->conn_session);
+    c.anchored = anchored;
+    c.pb = pb;
+    if (fail == HELPER_OK && n_snap > 0) {
+        pj->s = s;
+        snprintf(pj->unit, sizeof(pj->unit), "%s:capture", PATHS_BACKEND_NAME);
+        pj->capture = seq;
+        sp_holds_t h = { j_record, j_clear, pj };
+        if (snap_take(paths_snap(pb), set, s->pol->daemon_id, seq, &h) != OK) {
+            snprintf(fmsg, sizeof(fmsg), "taking the snapshots: %.500s", err_msg());
+            err_clear();
+            fail = HELPER_E_FAILED;
+        } else {
+            c.pset = set;
+            c.pj = pj;
+            set = NULL;
+            pj = NULL;
+        }
+    }
+
+    cJSON *out = fail == HELPER_OK ? cJSON_CreateObject() : NULL;
+    if (fail == HELPER_OK && !out) fail = HELPER_E_FAILED;
+    cJSON *rr = out ? cJSON_AddObjectToObject(out, "read_roots") : NULL;
+    cJSON *kd = out ? cJSON_AddObjectToObject(out, "kinds") : NULL;
+    cJSON *lv = out ? cJSON_AddObjectToObject(out, "live") : NULL;
+    cJSON *ns = out ? cJSON_AddObjectToObject(out, "nested") : NULL;
+    cJSON *sn = out ? cJSON_AddObjectToObject(out, "snapshots") : NULL;
+    if (out && (!rr || !kd || !lv || !ns || !sn)) fail = HELPER_E_FAILED;
+    for (size_t i = 0; fail == HELPER_OK && i < r->n_paths; i++) {
+        const char *p = r->paths[i];
+        if (kind[i] == BP_DUP) continue;
+        if (kind[i] == BP_LIVE) { cJSON_AddStringToObject(lv, p, res[i].reason); continue; }
+        if (kind[i] == BP_DIR) {
+            cJSON_AddStringToObject(rr, p, p);
+            cJSON_AddStringToObject(kd, p, "dir");
+            continue;
+        }
+        /* Read roots come from the helper's own snapshots, never from the
+         * daemon. */
+        char root[PATH_MAX];
+        if (snap_read_path(paths_snap(pb), c.pset, res[i].real, root, sizeof(root)) != OK) {
+            snprintf(fmsg, sizeof(fmsg), "%.500s", err_msg());
+            err_clear();
+            fail = HELPER_E_FAILED;
+            break;
+        }
+        cJSON_AddStringToObject(rr, p, root);
+        cJSON_AddStringToObject(kd, p, res[i].dom.kind == SNAP_ZFS ? "zfs" : "btrfs");
+        if (res[i].nested_total) {
+            cJSON *o = cJSON_CreateObject();
+            if (o) {
+                cJSON_AddNumberToObject(o, "total", (double)res[i].nested_total);
+                cJSON_AddStringToObject(o, "names", res[i].nested);
+                cJSON_AddItemToObject(ns, p, o);
+            }
+        }
+    }
+    for (size_t i = 0; fail == HELPER_OK && c.pset && i < c.pset->n; i++)
+        cJSON_AddStringToObject(sn, c.pset->doms[i].kind == SNAP_ZFS ? c.pset->doms[i].dataset : c.pset->doms[i].root,
+                                c.pset->names[i]);
+
+    if (fail == HELPER_OK && slot && helper_random_hex(c.token, 16) != OK) {
+        snprintf(fmsg, sizeof(fmsg), "no randomness for a token");
+        fail = HELPER_E_FAILED;
+    }
+    int orphan = 0;
     if (slot) {
-        memset(slot, 0, sizeof(*slot));
-        slot->seq = seq;
-        slot->deadline = now + (time_t)s->pol->capture_max_s;
-        snprintf(slot->session, sizeof(slot->session), "%s", r->conn_session);
-        slot->anchored = session_anchored(s, r->conn_session);
-        if (helper_random_hex(slot->token, 16) == OK) slot->used = 1;
-        else slot = NULL;
+        c.deadline = now + (time_t)s->pol->capture_max_s;
+        c.used = 1;
+        pthread_mutex_lock(&s->mu);
+        /* Its session may have ended while it began: nobody will end it. */
+        orphan = fail == HELPER_OK && c.anchored && !session_anchored(s, c.session);
+        if (fail != HELPER_OK || orphan) slot->used = 0;
+        else *slot = c;
+        pthread_mutex_unlock(&s->mu);
+        if (orphan) {
+            log_warn("helper: the daemon's session %.8s... ended during a paths capture's begin; ending it", c.session);
+            snprintf(fmsg, sizeof(fmsg), "the daemon's session ended during the begin");
+            fail = HELPER_E_FAILED;
+        }
+        if (fail != HELPER_OK) capture_finish(s, &c, SP_END_ABORTED);
     }
-    pthread_mutex_unlock(&s->mu);
-    if (!ok) return resp_error(r->id, HELPER_E_BUSY, "more than %u captures in the last hour",
-                               s->pol->max_captures_per_hour);
-    if (!slot) return resp_error(r->id, HELPER_E_BUSY, "too many captures held");
-    cJSON *res = cJSON_CreateObject();
-    cJSON *rr = res ? cJSON_AddObjectToObject(res, "read_roots") : NULL;
-    cJSON *sn = res ? cJSON_AddObjectToObject(res, "snapshots") : NULL;
-    for (size_t i = 0; rr && sn && i < r->n_paths; i++) {
-        const char *dom = helper_policy_dir_domain(s->pol, r->paths[i]);
-        char name[ARTEFACT_NAME_MAX];
-        if (artefact_name(name, sizeof(name), s->pol->daemon_id, seq, -1) == 0)
-            cJSON_AddStringToObject(sn, dom, name);
-        cJSON_AddStringToObject(rr, r->paths[i], r->paths[i]);
+    snap_probe_free(probe);
+    free(res);
+    free(kind);
+    free(set);
+    free(pj);
+    if (fail != HELPER_OK) {
+        cJSON_Delete(out);
+        return resp_error(r->id, fail, "%s", fmsg);
     }
-    cJSON_AddStringToObject(res, "capture", slot->token);
-    cJSON_AddNumberToObject(res, "expires", (double)slot->deadline);
-    return resp_ok(r->id, res);
+    if (slot) {
+        cJSON_AddStringToObject(out, "capture", c.token);
+        cJSON_AddNumberToObject(out, "expires", (double)c.deadline);
+        cJSON_AddNumberToObject(out, "snapshot_ms", c.pset ? (double)c.pset->snapshot_ms : 0.0);
+    }
+    return resp_ok(r->id, out);
 }
 
 /* lease.release: let go what a capture holds beyond its snapshots (a
@@ -2434,7 +2597,10 @@ static char *op_hello(helper_server_t *s, const helper_req_t *r)
     cJSON_AddNumberToObject(res, "captures", (double)helper_server_captures(s));
     cJSON *p = cJSON_AddArrayToObject(res, "providers");
     for (size_t i = 0; p && i < s->nb; i++)
-        cJSON_AddItemToArray(p, cJSON_CreateString(s->backends[i].name));
+        if (!s->backends[i].internal) cJSON_AddItemToArray(p, cJSON_CreateString(s->backends[i].name));
+    /* Whether capture.begin_paths can snapshot anything here (db-detection.md 9.4). */
+    cJSON_AddBoolToObject(res, "path_snapshots",
+                          paths_backend_any_domain(backend_named(s, PATHS_BACKEND_NAME)));
     return resp_ok(r->id, res);
 }
 
