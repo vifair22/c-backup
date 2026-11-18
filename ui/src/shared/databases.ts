@@ -120,6 +120,7 @@ export const METHOD_LABELS: Record<string, string> = {
   snapshot: 'atomic snapshot',
   'paused-read': 'read while paused',
   'live-read': 'read live',
+  'engine-copy': 'engine copy (SQLite online backup)',
 }
 
 export function methodLabel(m: string | null | undefined): string {
