@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "replicate.h"
+#include "reindex.h"
 
 #include "cdc.h"
 #include "chunklist.h"
@@ -603,6 +604,13 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    /* What is copied is chosen from the index, so a snapshot record it
+     * lacks (B195) would be left off the replica without a word. Indexed
+     * first, under the write lock the job holds (B200); one that cannot be
+     * is a refusal naming it. */
+    status_t gst = reindex_gaps(store, db, repo_id, "replicate", NULL);
+    if (gst != OK) return gst;
 
     db_result_t *snaps = NULL;
     if (db_execute(db,
