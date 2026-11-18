@@ -690,7 +690,7 @@ static void batch_close(pipeline_t *p, batch_t *b)
     if (!b->in_txn) return;
     /* db_txn attributes the commit's time (txn-commit, commit:<phase>). */
     if (db_txn_commit(p->db) != OK)
-        log_warn("backup: index batch commit failed");
+        log_warn("backup: index batch commit failed: %s", err_msg());
     b->in_txn = 0;
 }
 
@@ -749,9 +749,11 @@ static status_t bsink_flush(bsink_t *s, int own_txn)
     }
     phase_add(p->timers, PHASE_INDEX_PUT, _ti);
     if (own_txn) {
-        if (st == OK && db_txn_commit(p->db) != OK)
-            st = set_error(ERR_IO, "backup: cannot commit chunk rows");
+        /* A failed commit has already let the lock go (db_txn.h), so it is
+         * never followed by a rollback. */
         if (st != OK) db_txn_rollback(p->db);
+        else if (db_txn_commit(p->db) != OK)
+            st = set_error_wrap(ERR_IO, "backup: cannot commit chunk rows");
     }
     if (st == OK) s->n = 0;
     return st;
@@ -2143,7 +2145,7 @@ static status_t allocate_snapshot_id(cutils_db_t *db, store_t *store,
     char mark[32];
     snprintf(mark, sizeof(mark), "%lld", (long long)repo_mark);
 
-    if (db_txn_begin(db) != OK) return set_error(ERR_IO, "snapshot id: begin");
+    if (db_txn_begin(db) != OK) return set_error_wrap(ERR_IO, "snapshot id");
 
     db_result_t *r = NULL;
     int64_t next = 0;
@@ -2180,9 +2182,9 @@ static status_t allocate_snapshot_id(cutils_db_t *db, store_t *store,
             " ON CONFLICT(repo_id) DO UPDATE SET last_id = excluded.last_id",
             (const char *[]){ repo, id, NULL }, NULL) != 0) {
         db_txn_rollback(db);
-        return set_error(ERR_IO, "snapshot id: cannot record %s", id);
+        return set_error_wrap(ERR_IO, "snapshot id: cannot record %s", id);
     }
-    if (db_txn_commit(db) != OK) return set_error(ERR_IO, "snapshot id: commit");
+    if (db_txn_commit(db) != OK) return set_error_wrap(ERR_IO, "snapshot id");
 
     /* Durable in the repository before the record that uses it exists, and
      * outside the transaction: an fsync is not something to hold the one
@@ -2397,7 +2399,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                                   dmaj, dmin, nflags, NULL }, NULL);
         if (rc != 0) {
             db_txn_rollback(p->db);
-            return set_error(ERR_IO, "index_nodes: insert failed");
+            return set_error_wrap(ERR_IO, "index_nodes: insert failed");
         }
 
         if (db_write(p->db,
@@ -2405,7 +2407,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                 " VALUES (?, ?, ?, ?)",
                 (const char *[]){ name, id, snap, repo, NULL }, NULL) != 0) {
             db_txn_rollback(p->db);
-            return set_error(ERR_IO, "index_nodes: fts insert failed");
+            return set_error_wrap(ERR_IO, "index_nodes: fts insert failed");
         }
 
         if (++nb.since_commit >= NODE_BATCH || db_txn_batch_should_end(&nb.rule)) {
@@ -2824,6 +2826,9 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
 
     time_t now = time(NULL);
     if (st == OK) st = write_snapshot_record(store, snap_id, root_hash, now, opts->label);
+    /* From here the snapshot exists in the repository whatever the index
+     * does (B195). */
+    int record_written = (st == OK);
     phase_add_excl(&timers, PHASE_SNAPSHOT, _tsr, _tsrn);
     uint64_t _tin = phase_now(), _tinn = phase_nested(&timers);
     if (st == OK) st = index_nodes(&p, snap_id);
@@ -2847,7 +2852,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         int txn = 0;
         if (opts->index_hook) {
             if (db_txn_begin(db) == OK) txn = 1;
-            else st = set_error(ERR_IO, "backup_run: cannot begin the snapshot row");
+            else st = set_error_wrap(ERR_IO, "backup_run: cannot begin the snapshot row");
         }
         if (st == OK && db_write(db,
                 "INSERT INTO snapshots (repo_id, id, ts, label, file_count,"
@@ -2855,12 +2860,12 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
                 (const char *[]){ repo, snap, ts, opts->label ? opts->label : "",
                                   files, bytes, ts, rhex, NULL }, NULL) != 0)
-            st = set_error(ERR_IO, "backup_run: cannot record snapshot");
+            st = set_error_wrap(ERR_IO, "backup_run: cannot record snapshot");
         if (st == OK && txn) st = opts->index_hook(opts->index_hook_ctx, db, snap_id);
         if (txn) {
             if (st != OK) db_txn_rollback(db);
             else if (db_txn_commit(db) != OK)
-                st = set_error(ERR_IO, "backup_run: cannot commit the snapshot row");
+                st = set_error_wrap(ERR_IO, "backup_run: cannot commit the snapshot row");
         }
     }
     phase_add_excl(&timers, PHASE_SNAPSHOT, _tsr, _tsrn);
@@ -2927,6 +2932,35 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
                  (unsigned long long)res.trees_new,
                  (unsigned long long)res.trees_reused);
         log_written(&res);
+    }
+    if (st != OK && record_written) {
+        /*
+         * The record is in the repository and its index is not (B195): a
+         * full state.db, say, failed index_nodes or the snapshots row after
+         * write_snapshot_record. Not deleted: the record is complete and
+         * durable (synced, its directory synced) and names a root tree whose
+         * packs were sealed and synced before it was written, so it is a
+         * real snapshot that only lacks index rows, the state a power cut
+         * between the two leaves, and the repository is the source of
+         * truth. Reported as what it is rather than as "no snapshot",
+         * which the next start's reconcile would contradict by indexing it.
+         *
+         * Reconcile looks only above the highest indexed id, so a later
+         * backup indexed before the next start hides this one from it;
+         * a reindex finds it either way.
+         */
+        char cause[2048];
+        snprintf(cause, sizeof(cause), "%s", err_msg());
+        set_error(st, "%s; snapshot %lld was written to the repository but its "
+                  "index did not commit: the next daemon start indexes it "
+                  "(reconcile) unless a later snapshot of this repository is "
+                  "indexed first, and `c-backup reindex %lld` indexes it now",
+                  cause, (long long)snap_id, (long long)repo_id);
+        log_warn("backup: %s", err_msg());
+        if (out) {
+            out->snapshot_id = snap_id;
+            out->snapshot_unindexed = 1;
+        }
     }
     if (st == OK && out) *out = res;
     else backup_result_free(&res);

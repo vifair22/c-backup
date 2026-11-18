@@ -42,6 +42,7 @@
 #include "db_write.h"
 #include "store_index.h"
 #include "test_tmp.h"
+#include "full_vfs.h"
 
 #define TEST_DIR TEST_TMP "/c_backup_test_dbtxn"
 #define TEST_DB  TEST_DIR "/state.db"
@@ -322,6 +323,90 @@ static void test_rollback_releases_the_lock(void **state)
      * suite would hang rather than fail, which is itself the signal. */
     assert_int_equal(db_txn_begin(db), OK);
     assert_int_equal(db_txn_commit(db), OK);
+}
+
+/*
+ * B194: on a full state filesystem every write failed with "cannot commit"
+ * and nothing else. SQLite said why; this module dropped it. The reason is
+ * in the message now, with the extended code, and the failed commit leaves
+ * neither the lock nor a transaction behind.
+ */
+static int full_count(const char *table)
+{
+    char sql[128];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s", table);
+    db_result_t *r = NULL;
+    int n = -1;
+    if (db_execute(db, sql, NULL, &r) == 0 && r && r->nrows == 1)
+        n = atoi(r->rows[0][0]);
+    db_result_free(r);
+    return n;
+}
+
+static void test_a_full_disk_says_so(void **state)
+{
+    (void)state;
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE full_t (x INTEGER)"), 0);
+
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_write(db, "INSERT INTO full_t (x) VALUES (?)",
+                              (const char *[]){ "1", NULL }, NULL), 0);
+    full_vfs_arm(1);
+    err_clear();
+    assert_int_not_equal(db_txn_commit(db), OK);
+    full_vfs_arm(0);
+    print_message("commit: %s\n", err_msg());
+    assert_non_null(strstr(err_msg(), "cannot commit: database or disk is full"));
+    assert_non_null(strstr(err_msg(), "(SQLite extended code 13)"));
+
+    /* Nothing was left open: the row is not there, and the next writer
+     * neither hangs on the lock nor finds a transaction already begun. */
+    assert_int_equal(full_count("full_t"), 0);
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_write(db, "INSERT INTO full_t (x) VALUES (?)",
+                              (const char *[]){ "2", NULL }, NULL), 0);
+    assert_int_equal(db_txn_commit(db), OK);
+    assert_int_equal(full_count("full_t"), 1);
+}
+
+/* A plain write that cannot commit keeps the reason for its caller: it was
+ * logged and cleared, and callers said only "cannot record". */
+static void test_a_write_that_cannot_commit_keeps_the_reason(void **state)
+{
+    (void)state;
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE full_w (x INTEGER)"), 0);
+    full_vfs_arm(1);
+    err_clear();
+    int rc = db_write(db, "INSERT INTO full_w (x) VALUES (?)",
+                      (const char *[]){ "1", NULL }, NULL);
+    full_vfs_arm(0);
+    assert_int_equal(rc, -1);
+    assert_non_null(strstr(err_msg(), "database or disk is full"));
+    assert_int_equal(full_count("full_w"), 0);
+    assert_int_equal(db_write(db, "INSERT INTO full_w (x) VALUES (?)",
+                              (const char *[]){ "1", NULL }, NULL), 0);
+    assert_int_equal(full_count("full_w"), 1);
+}
+
+/* A rollback after a failed commit, which has already let the lock go,
+ * released it a second time: the ticket lock then served a ticket nobody
+ * held, and the next writer waited for ever. It is refused now. */
+static void test_a_rollback_after_a_failed_commit_is_refused(void **state)
+{
+    (void)state;
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE full_r (x INTEGER)"), 0);
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_write(db, "INSERT INTO full_r (x) VALUES (?)",
+                              (const char *[]){ "1", NULL }, NULL), 0);
+    full_vfs_arm(1);
+    assert_int_not_equal(db_txn_commit(db), OK);
+    full_vfs_arm(0);
+    db_txn_rollback(db);
+    /* With the double release this begin never returns. */
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_txn_commit(db), OK);
+    assert_int_equal(db_txn_begin(db), OK);
+    db_txn_rollback(db);
 }
 
 /*
@@ -869,6 +954,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_waiters_counts_queued_writers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_nested_begin_fails_instead_of_hanging, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rollback_releases_the_lock, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_full_disk_says_so, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_write_that_cannot_commit_keeps_the_reason, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_rollback_after_a_failed_commit_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repeated_cycles_do_not_leak_the_lock, setup, teardown),
         cmocka_unit_test_setup_teardown(test_make_durable_syncs_the_wal, setup, teardown),
         cmocka_unit_test_setup_teardown(test_make_durable_waits_for_the_open_transaction, setup, teardown),
@@ -888,5 +976,6 @@ int main(void)
      * environment. */
     unsetenv("C_BACKUP_TXN_GUARD");
     db_txn_guard_install();
+    if (full_vfs_install() != 0) return 1;
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

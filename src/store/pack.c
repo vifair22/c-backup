@@ -32,14 +32,27 @@
 /* On-disk structures are defined in pack.h */
 
 /* Write a full buffer to a stdio stream, handling short writes.
- * Returns 0 on success, -1 on error (errno is set). */
+ * Returns 0 on success, -1 on error (errno is set).
+ *
+ * The stream's error flag is checked after every call, not only when one
+ * wrote nothing (B197). When a flush fails, glibc can drop what was in its
+ * buffer and report a short count; retrying the rest then "succeeded" over
+ * the hole, and the loss surfaced only at the seal, as "an earlier write to
+ * the pack failed (is the disk full?)", with the errno long gone. Stopping
+ * at the call that failed keeps its errno: ENOSPC, said as such. */
 static int fwrite_full(const void *buf, size_t len, FILE *f) {
     const uint8_t *p = buf;
     while (len > 0) {
+        errno = 0;
         size_t w = fwrite(p, 1, len, f);
+        if (ferror(f)) {
+            if (errno == 0) errno = EIO;
+            return -1;
+        }
         if (w > 0) { p += w; len -= w; continue; }
-        if (ferror(f)) return -1;
-        errno = EIO;
+        /* Nothing written and no error flagged: keep a reason that was
+         * given, or say I/O error. */
+        if (errno == 0) errno = EIO;
         return -1;
     }
     return 0;
@@ -2747,7 +2760,7 @@ status_t pack_stored_add(pack_stored_writer_t *w,
     off_t at = ftello(w->dat_f);
     if (at < 0) return set_error_errno(ERR_IO, "pack_stored_add: ftello");
 
-    if (fwrite(&eh, sizeof(eh), 1, w->dat_f) != 1 ||
+    if (fwrite_full(&eh, sizeof(eh), w->dat_f) != 0 ||
         (len && fwrite_full(payload, len, w->dat_f) != 0)) {
         status_t st = set_error_errno(ERR_IO, "pack_stored_add: write entry");
         stored_entry_rollback(w, at);
@@ -3028,7 +3041,7 @@ static status_t pw_append_sealed(pack_writer_t *pw,
 
     size_t csize = (size_t)se->stored_size;
     uint64_t dat_off = sizeof(pack_dat_hdr_t) + pw->body_offset;
-    if (fwrite(&ehdr, sizeof(ehdr), 1, pw->dat_f) != 1 ||
+    if (fwrite_full(&ehdr, sizeof(ehdr), pw->dat_f) != 0 ||
         (csize && fwrite_full(se->payload, csize, pw->dat_f) != 0))
         return set_error_errno(ERR_IO, "pack: write entry to %s", pw->dat_tmp);
     stripe_enc_feed(pw->enc, &ehdr, sizeof(ehdr));
@@ -5097,9 +5110,11 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
     rw.stats = stats;
 
     uint32_t dropped = 0;
+    uint64_t dropped_bytes = 0;
     for (uint32_t i = 0; st == OK && i < count; i++) {
         if (!live_marks[i]) {
             dropped++;
+            dropped_bytes += disk_idx[i].compressed_size;
             continue;
         }
         size_t sealed = rw.nouts;
@@ -5126,6 +5141,7 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
     *out_kept = kept;
     *out_dropped = dropped;
     *out_written = (uint32_t)written;
+    stats->bytes_dropped += dropped_bytes;
     return OK;
 }
 
@@ -5320,6 +5336,8 @@ status_t pack_gc_stats_loc(store_t *store,
             store_emit_pack_removed(store, pnum);
             total_deleted += count;
             stats->packs_deleted++;
+            for (uint32_t i = 0; i < count; i++)
+                stats->bytes_dropped += disk_idx[i].compressed_size;
             free(live_marks);
             free(disk_idx);
             continue;
