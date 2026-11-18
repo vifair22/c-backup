@@ -102,6 +102,12 @@ typedef struct {
     uint64_t      max_restart_ns;   /* the longest of them (the header sync) */
     unsigned long throttled;        /* writers held at BEGIN past the hard cap (B181) */
     uint64_t      max_throttle_ns;  /* the longest of those waits */
+    /* Running totals for /metrics (B216): one series each, daemon-wide. */
+    unsigned long forced;           /* rounds that took the write lock */
+    uint64_t      lock_ns;          /* the write lock held by those rounds */
+    uint64_t      frames_copied;    /* WAL frames copied into the database */
+    uint64_t      throttle_ns;      /* writers' total wait at the hard cap */
+    unsigned long throttle_timeouts; /* waits that ended at the time limit */
 } checkpointer_stats_t;
 
 /*

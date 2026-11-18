@@ -2205,11 +2205,24 @@ the repository).
 | `cbackup_storage_sync_failed_timestamp_seconds` | gauge | Unix time of that first failure; 0 when none |
 | `cbackup_checkpoint_failures_total` | counter | Checkpoints of `state.db`'s write-ahead log SQLite refused, and failures to open or read the log or its index, since start (section 18.2) |
 | `cbackup_checkpoint_failing` | gauge | 1 while the last such attempt failed; `/readyz` says why |
+| `cbackup_db_txn_wait_seconds_total` | counter | Time writers waited for `state.db`'s write lock, labelled `queue="bulk"` (backup batches, pack commits, reindex, gc) or `queue="priority"` (requests, job records, the checkpointer) |
+| `cbackup_db_txn_grants_total` | counter | Turns of the write lock, by the same `queue` label; over the wait total, the mean wait per turn |
+| `cbackup_db_txn_commits_total` | counter | Transactions committed on `state.db` |
+| `cbackup_db_txn_commit_seconds_total` | counter | Time spent in COMMIT, writing the log (no sync at `db.synchronous` normal) |
+| `cbackup_db_txn_commit_frames_total` | counter | Log frames (pages) those commits wrote, where measured |
+| `cbackup_checkpoint_rounds_total` | counter | Checkpoint rounds, labelled `locked="no"` (alongside writers) or `locked="yes"` (holding the write lock: past the hard cap, or the short final round that lets the log restart) |
+| `cbackup_checkpoint_lock_seconds_total` | counter | Time locked rounds held the write lock; every writer waits for it |
+| `cbackup_checkpoint_lock_max_seconds` | gauge | The longest single locked round since start |
+| `cbackup_checkpoint_frames_copied_total` | counter | Log frames copied back into `state.db`; over `cbackup_checkpoint_rounds_total`, frames per round |
+| `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap |
+| `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy |
+| `cbackup_checkpoint_throttle_seconds_total` | counter | Time bulk writers spent so held |
+| `cbackup_wal_frames_max` | gauge | The most frames `state.db`'s log was seen holding since start; the hard cap is 16 times `db.wal_autocheckpoint` |
 | `cbackup_vm_bitmap_audit_failures_total` | counter | Audit reads that found a VM disk changed outside its dirty bitmap (section 6.5) |
 | `cbackup_vm_resync_bytes_total` | counter | Bytes incremental VM reads re-read past the changed ranges to bring the chunker back in step |
 
-The `cbackup_alerts_*` and `cbackup_vm_*` series count from zero each time the
-daemon starts; the alerts read zero when Pushover is not configured.
+The `cbackup_alerts_*`, `cbackup_vm_*`, `cbackup_db_txn_*` and the checkpoint
+timing series count from zero each time the daemon starts; the alerts read zero when Pushover is not configured.
 
 There are no per-repository series, by decision. A `repo` label on every
 series multiplies the series count by the number of repositories, and the

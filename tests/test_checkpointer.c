@@ -296,6 +296,12 @@ static void test_the_hard_cap_holds_on_a_slow_device(void **state)
     checkpointer_stats_t s;
     checkpointer_stats(&s);
     assert_true(s.throttled > 0);        /* writers did their half */
+    /* And /metrics' totals (B216) moved with them. */
+    assert_true(s.forced > 0);
+    assert_true(s.lock_ns >= s.max_lock_ns && s.max_lock_ns > 0);
+    assert_true(s.frames_copied > 0);
+    assert_true(s.throttle_ns >= s.max_throttle_ns && s.max_throttle_ns > 0);
+    assert_true(s.throttle_timeouts <= s.throttled);
 }
 
 /*

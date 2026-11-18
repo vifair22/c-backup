@@ -97,6 +97,11 @@ static int passive(uint32_t *left)
         nanosleep(&ts, NULL);
     }
     int log = 0, done = 0;
+    /* What was copied before, so the round's own copy can be counted
+     * (B216). A restart in between leaves fewer backfilled frames than
+     * before; then everything copied since counts. */
+    uint32_t b0 = 0;
+    if (checkpointer_wal_frames(g_path, NULL, &b0) != 0) b0 = 0;
     int rc = sqlite3_wal_checkpoint_v2(g_ck, NULL, SQLITE_CHECKPOINT_PASSIVE, &log, &done);
     if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
         /* Not a checkpoint that could not start but one SQLite refused:
@@ -119,6 +124,10 @@ static int passive(uint32_t *left)
         return -1;
     }
     wal_health_ok(WAL_HEALTH_CHECKPOINT);
+    uint32_t copied = (uint32_t)done >= b0 ? (uint32_t)done - b0 : (uint32_t)done;
+    pthread_mutex_lock(&g_mu);
+    g_stats.frames_copied += copied;
+    pthread_mutex_unlock(&g_mu);
     *left = log > done ? (uint32_t)(log - done) : 0;
     return 0;
 }
@@ -229,8 +238,14 @@ status_t checkpointer_force(void)
 {
     if (!g_ck) return set_error(ERR_INVALID, "checkpointer_force: not running");
     locked_arg_t a = { 0, -1 };
+    uint64_t t0 = now_ns();
     status_t st = db_txn_exclusive(locked_passive, &a);
     if (st != OK) return st;
+    uint64_t held = now_ns() - t0;
+    pthread_mutex_lock(&g_mu);
+    g_stats.forced++;
+    g_stats.lock_ns += held;
+    pthread_mutex_unlock(&g_mu);
     return a.rc == 0 ? OK : set_error(ERR_BUSY, "checkpointer_force: the copy did not complete");
 }
 
@@ -313,6 +328,8 @@ locked:;
     pthread_mutex_lock(&g_mu);
     if (a.rc == 0) g_stats.escalations++;
     if (held > g_stats.max_lock_ns) g_stats.max_lock_ns = held;
+    g_stats.forced++;
+    g_stats.lock_ns += held;
     pthread_mutex_unlock(&g_mu);
     /* A copy that could not complete under the lock (a reader holding an
      * old snapshot) cannot be helped by holding writers back: let them
@@ -369,18 +386,24 @@ void checkpointer_throttle(void)
     pthread_cond_signal(&g_cv);
     pthread_mutex_unlock(&g_mu);
     uint64_t t0 = now;
+    int timed_out = 0;
     for (;;) {
         struct timespec ts = { 0, 2 * 1000000L };
         nanosleep(&ts, NULL);
         uint64_t t = now_ns();
         if (!atomic_load(&g_active) || t < atomic_load(&g_blocked_until_ns) ||
-            t - t0 > CKPT_THROTTLE_MAX_NS) break;
+            t - t0 > CKPT_THROTTLE_MAX_NS) {
+            timed_out = t - t0 > CKPT_THROTTLE_MAX_NS;
+            break;
+        }
         if (checkpointer_wal_frames(g_path, &f, &b) != 0 || f <= hard || f == b) break;
     }
     uint64_t waited = now_ns() - t0;
     pthread_mutex_lock(&g_mu);
     g_stats.throttled++;
     if (waited > g_stats.max_throttle_ns) g_stats.max_throttle_ns = waited;
+    g_stats.throttle_ns += waited;
+    if (timed_out) g_stats.throttle_timeouts++;
     pthread_mutex_unlock(&g_mu);
 }
 

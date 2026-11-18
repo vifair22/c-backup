@@ -1117,6 +1117,46 @@ static void test_the_ticket_reports_what_a_request_waited_behind(void **state)
     assert_int_equal(w.bulk_ahead_due, 1);
 }
 
+/* B216: the totals /metrics exports move with the lock's use, by queue,
+ * and a writer's wait is counted on its own queue. */
+static void *bulk_waiter_main(void *arg)
+{
+    (void)arg;
+    if (db_txn_begin_bulk(db) != OK) return (void *)1;
+    return db_txn_commit(db) == OK ? NULL : (void *)1;
+}
+
+static void test_metrics_count_turns_waits_and_commits(void **state)
+{
+    (void)state;
+    db_txn_metrics_t m0, m1;
+    db_txn_metrics(&m0);
+
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_txn_commit(db), OK);
+    assert_int_equal(db_txn_begin_bulk(db), OK);
+    assert_int_equal(db_txn_commit(db), OK);
+
+    /* A bulk writer that queues behind a holder for at least 50 ms. */
+    assert_int_equal(db_txn_begin(db), OK);
+    pthread_t t;
+    assert_int_equal(pthread_create(&t, NULL, bulk_waiter_main, NULL), 0);
+    wait_for_waiter();
+    struct timespec ts = { 0, 50 * 1000000L };
+    nanosleep(&ts, NULL);
+    assert_int_equal(db_txn_commit(db), OK);
+    void *rv = (void *)1;
+    assert_int_equal(pthread_join(t, &rv), 0);
+    assert_null(rv);
+
+    db_txn_metrics(&m1);
+    assert_true(m1.grants[0] >= m0.grants[0] + 2);
+    assert_true(m1.grants[1] >= m0.grants[1] + 2);
+    assert_true(m1.commits >= m0.commits + 4);
+    assert_true(m1.commit_ns > m0.commit_ns);
+    assert_true(m1.wait_ns[1] - m0.wait_ns[1] >= 45ull * 1000000ull);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1140,6 +1180,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_batch_ends_at_the_commit_budget, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_page_ceiling_bounds_every_commit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_no_tracking_means_no_cap, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_metrics_count_turns_waits_and_commits, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_ticket_reports_what_a_request_waited_behind,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_priority_writers_cannot_starve_a_bulk_writer,

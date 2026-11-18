@@ -5,6 +5,8 @@
 #include "unit_state.h"
 #include "sync_latch.h"
 #include "wal_health.h"
+#include "checkpointer.h"
+#include "db_txn.h"
 
 #include <cutils/log.h>
 #include <cutils/push.h>
@@ -140,6 +142,78 @@ static void emit_scalar(mbuf_t *m, const char *name, const char *help,
     mb_addf(m, "# HELP %s %s\n# TYPE %s %s\n%s %lld\n", name, help, name, type, name, v);
 }
 
+/*
+ * The write lock and the WAL checkpointer (B216). Process state, no query
+ * and no lock: a scrape during a long checkpoint must not wait for it.
+ * Daemon-wide aggregates only. Seconds as fractional totals, so rate()
+ * gives the share of wall time spent waiting, holding or committing.
+ */
+static void emit_txn_metrics(mbuf_t *m)
+{
+    db_txn_metrics_t t;
+    db_txn_metrics(&t);
+    checkpointer_stats_t c;
+    checkpointer_stats(&c);
+    mb_addf(m, "# HELP cbackup_db_txn_wait_seconds_total Time writers waited for state.db's "
+               "write lock, by queue (bulk: backup batches, pack commits, reindex, gc; "
+               "priority: everything else).\n"
+               "# TYPE cbackup_db_txn_wait_seconds_total counter\n"
+               "cbackup_db_txn_wait_seconds_total{queue=\"bulk\"} %.6f\n"
+               "cbackup_db_txn_wait_seconds_total{queue=\"priority\"} %.6f\n",
+            (double)t.wait_ns[1] / 1e9, (double)t.wait_ns[0] / 1e9);
+    mb_addf(m, "# HELP cbackup_db_txn_grants_total Turns of state.db's write lock, by queue.\n"
+               "# TYPE cbackup_db_txn_grants_total counter\n"
+               "cbackup_db_txn_grants_total{queue=\"bulk\"} %llu\n"
+               "cbackup_db_txn_grants_total{queue=\"priority\"} %llu\n",
+            (unsigned long long)t.grants[1], (unsigned long long)t.grants[0]);
+    mb_addf(m, "# HELP cbackup_db_txn_commits_total Transactions committed on state.db.\n"
+               "# TYPE cbackup_db_txn_commits_total counter\n"
+               "cbackup_db_txn_commits_total %llu\n", (unsigned long long)t.commits);
+    mb_addf(m, "# HELP cbackup_db_txn_commit_seconds_total Time spent in COMMIT (writing the "
+               "WAL; no sync at the default synchronous=normal).\n"
+               "# TYPE cbackup_db_txn_commit_seconds_total counter\n"
+               "cbackup_db_txn_commit_seconds_total %.6f\n", (double)t.commit_ns / 1e9);
+    mb_addf(m, "# HELP cbackup_db_txn_commit_frames_total WAL frames written by measured "
+               "commits.\n# TYPE cbackup_db_txn_commit_frames_total counter\n"
+               "cbackup_db_txn_commit_frames_total %llu\n",
+            (unsigned long long)t.commit_frames);
+    mb_addf(m, "# HELP cbackup_checkpoint_rounds_total WAL checkpoint rounds that ran, by "
+               "whether they held the write lock.\n"
+               "# TYPE cbackup_checkpoint_rounds_total counter\n"
+               "cbackup_checkpoint_rounds_total{locked=\"no\"} %lu\n"
+               "cbackup_checkpoint_rounds_total{locked=\"yes\"} %lu\n",
+            c.passive, c.forced);
+    mb_addf(m, "# HELP cbackup_checkpoint_lock_seconds_total Time checkpoint rounds held "
+               "state.db's write lock; writers wait for all of it.\n"
+               "# TYPE cbackup_checkpoint_lock_seconds_total counter\n"
+               "cbackup_checkpoint_lock_seconds_total %.6f\n", (double)c.lock_ns / 1e9);
+    mb_addf(m, "# HELP cbackup_checkpoint_lock_max_seconds The longest single hold of the "
+               "write lock by a checkpoint round since start.\n"
+               "# TYPE cbackup_checkpoint_lock_max_seconds gauge\n"
+               "cbackup_checkpoint_lock_max_seconds %.6f\n", (double)c.max_lock_ns / 1e9);
+    mb_addf(m, "# HELP cbackup_checkpoint_frames_copied_total WAL frames copied back into "
+               "state.db; over cbackup_checkpoint_rounds_total, frames per checkpoint.\n"
+               "# TYPE cbackup_checkpoint_frames_copied_total counter\n"
+               "cbackup_checkpoint_frames_copied_total %llu\n",
+            (unsigned long long)c.frames_copied);
+    mb_addf(m, "# HELP cbackup_checkpoint_throttle_waits_total Bulk writers held before their "
+               "transaction because the WAL was past its hard cap.\n"
+               "# TYPE cbackup_checkpoint_throttle_waits_total counter\n"
+               "cbackup_checkpoint_throttle_waits_total %lu\n", c.throttled);
+    mb_addf(m, "# HELP cbackup_checkpoint_throttle_timeouts_total Of those waits, the ones "
+               "that ended at the time limit rather than on a completed copy.\n"
+               "# TYPE cbackup_checkpoint_throttle_timeouts_total counter\n"
+               "cbackup_checkpoint_throttle_timeouts_total %lu\n", c.throttle_timeouts);
+    mb_addf(m, "# HELP cbackup_checkpoint_throttle_seconds_total Time bulk writers spent "
+               "held at the hard cap.\n"
+               "# TYPE cbackup_checkpoint_throttle_seconds_total counter\n"
+               "cbackup_checkpoint_throttle_seconds_total %.6f\n",
+            (double)c.throttle_ns / 1e9);
+    mb_addf(m, "# HELP cbackup_wal_frames_max The most frames state.db's WAL was seen "
+               "holding since start.\n# TYPE cbackup_wal_frames_max gauge\n"
+               "cbackup_wal_frames_max %u\n", c.max_wal_frames);
+}
+
 static api_response_t handle_metrics(const api_request_t *req, void *ud)
 {
     (void)req; (void)ud;
@@ -174,6 +248,7 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                     "state.db's WAL bounded failed (see /readyz for why).\n"
                     "# TYPE cbackup_checkpoint_failing gauge\n"
                     "cbackup_checkpoint_failing %d\n", wal_health_failing(NULL, 0, NULL));
+        emit_txn_metrics(&m);
     }
     emit_scalar(&m, "cbackup_repos_total", "Registered repositories.", "gauge",
                 "SELECT COUNT(*) FROM repos");
