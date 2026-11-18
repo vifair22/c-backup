@@ -834,9 +834,9 @@ check "enabled string refused" 400 "$(sched_put '{"enabled":"yes"}')"
 contains "a refusal changes nothing" '"enabled":false' "$(sock_body /repos/1/schedules)"
 
 # A schedule already due must fire on the next tick and produce a real job.
-curl -s -X POST --unix-socket "$SOCK" \
+DUE_SID=$(curl -s -X POST --unix-socket "$SOCK" \
      -d '{"action":"gc","trigger":{"type":"interval","seconds":1}}' \
-     http://localhost/repos/1/schedules > /dev/null
+     http://localhost/repos/1/schedules | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
 JOBS_BEFORE=$(sock_body /jobs | grep -o '"id"' | wc -l)
 sleep 3
 JOBS_AFTER=$(sock_body /jobs | grep -o '"id"' | wc -l)
@@ -845,6 +845,16 @@ if [ "$JOBS_AFTER" -gt "$JOBS_BEFORE" ]; then
 else
     bad "due schedule submitted a job" "more than $JOBS_BEFORE jobs" "$JOBS_AFTER"
 fi
+# FLAKE-28: this schedule outlived its test. The deletes below remove
+# schedule 1, the hourly one, so a gc of repository 1 fired every second
+# for the rest of the suite and held the repository whenever a later step
+# wanted it. Delete it, then wait for the runs it already queued.
+check "delete the due schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+     --unix-socket "$SOCK" "http://localhost/repos/1/schedules/$DUE_SID")"
+for j in $(sock_body '/jobs?limit=1000' | sed 's/{"id":/\n{"id":/g' \
+           | grep "\"schedule_id\":$DUE_SID[,}]" | sed -n 's/^{"id":\([0-9]*\).*/\1/p'); do
+    wait_job "$j" || bad "the due schedule's job $j finishes" "completed" "$(sock_body "/jobs/$j")"
+done
 check "delete schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
      http://localhost/repos/1/schedules/1)"
 # B065: these answered success for a schedule that does not exist.
@@ -1263,9 +1273,24 @@ contains "a whole repository is not degraded" '"degraded":null'   "$REPO1"
 # has nothing to accept.
 check "repair without accept_missing is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' \
      -X POST --unix-socket "$SOCK" http://localhost/repos/1/repair)"
-contains "repair of a whole repository drops nothing" '"packs_missing":0' \
-    "$(curl -s -X POST --unix-socket "$SOCK" -d '{"accept_missing":true}' \
-         http://localhost/repos/1/repair)"
+# FLAKE-28: a job, queued behind whatever holds the repository, where the
+# route used to answer 503 "repository is busy" when anything did.
+REPAIR_RESP=$(curl -s -X POST --unix-socket "$SOCK" -d '{"accept_missing":true}' \
+              http://localhost/repos/1/repair)
+contains "repair is a job" '"job_id"' "$REPAIR_RESP"
+REPAIR_JOB=$(job_id "$REPAIR_RESP")
+wait_job "$REPAIR_JOB"
+REPAIR_BODY=$(sock_body "/jobs/$REPAIR_JOB")
+contains "repair of a whole repository completes" '"state":"completed"' "$REPAIR_BODY"
+contains "repair of a whole repository drops nothing" '"packs_missing":0' "$REPAIR_BODY"
+# Behind a job that holds the repository: accepted, run after it.
+HOLD_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" "http://localhost/repos/1/verify?level=deep")")
+REPAIR_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" -d '{"accept_missing":true}' \
+                       http://localhost/repos/1/repair)")
+wait_job "$HOLD_JOB"
+wait_job "$REPAIR_JOB"
+contains "a repair behind a running job completes" '"state":"completed"' \
+    "$(sock_body "/jobs/$REPAIR_JOB")"
 check "GET the repair"           "405 POST"        "$(sock_method GET /repos/1/repair)"
 contains "a whole repository's state is ok" '"state":"ok"'      "$REPO1"
 contains "and it is not unavailable"      '"unavailable":null'    "$REPO1"
@@ -1342,9 +1367,12 @@ contains "a verify of the other is refused" 'is unavailable'       "$(sock_body 
 check "a tag is refused, not written into the other" 409 \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
          -d '{"name":"swapped","snap_id":1}' "http://localhost/repos/$GONE/tags")"
-check "the repair cannot accept it"       409 \
-    "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
-         -d '{"accept_missing":true}' "http://localhost/repos/$GONE/repair")"
+GR=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
+         -d '{"accept_missing":true}' "http://localhost/repos/$GONE/repair")")
+wait_job "$GR"
+GRB=$(sock_body "/jobs/$GR")
+contains "the repair cannot accept it"    '"state":"failed"'       "$GRB"
+contains "because it is unavailable"      'is unavailable'         "$GRB"
 check "nothing written to one"            "$LIST_G" \
     "$(cd "$WORK/gonerepo" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)"
 check "nor to the other"                  "$LIST_S" \

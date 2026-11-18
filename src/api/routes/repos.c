@@ -9,6 +9,8 @@
 #include "lock.h"
 #include "pack_presence.h"
 #include "json_row.h"
+#include "job_manager.h"
+#include "db_txn.h"
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
@@ -643,7 +645,7 @@ static const api_path_t k_repo_paths[] = {
     { "/key",                        1,  0,    0,   0  },
     { "/key/import",                 0,  C_,   0,   0  },
     { "/key/ack",                    0,  C_,   0,   0  },
-    { "/repair",                     0,  D_,   0,   0  },
+    { "/repair",                     0,  C_,   0,   0  },
     { "/tags",                       1,  D_,   0,   0  },
     { "/schedules",                  1,  C_,   0,   0  },
     { "/policy",                     1,  0,    C_,  0  },
@@ -929,7 +931,53 @@ static api_response_t key_ack(const api_request_t *req, int64_t repo_id)
  * what it still finds, and backups are taken again. Only with
  * accept_missing, which is the whole point: the brake exists because a
  * wrong path looks exactly like loss.
+ *
+ * A job, like every other repo-scoped write (FLAKE-28). It used to run in
+ * the request and try the repo lock itself, answering 503 whenever anything
+ * held the repository - a scheduled gc, a reindex the start queued - so an
+ * operator's explicit acceptance failed for reasons that had nothing to do
+ * with it. Now the dispatcher takes the write lock (B123): a repair
+ * submitted behind a running job waits for it, and the job function takes
+ * no lock of its own.
  */
+typedef struct {
+    cutils_db_t *db;
+    int64_t      repo_id;
+} repair_job_t;
+
+static status_t repair_job_run(void *arg, atomic_int *cancel,
+                               void (*progress)(const char *, uint64_t, uint64_t, void *),
+                               void *progress_ctx)
+{
+    (void)cancel;
+    (void)progress;
+    const repair_job_t *j = arg;
+    pack_presence_t p;
+    status_t st = pack_presence_check(j->db, j->repo_id, 1, &p);
+    if (st != OK) return st;
+    if (p.unavailable)
+        return set_error(ERR_UNAVAILABLE, PACK_PRESENCE_UNAVAILABLE_FMT,
+                         (long long)j->repo_id, p.why);
+    /* What the route's API_DURABLE class gave it: once the job reads
+     * completed, the acceptance survives a power cut. */
+    st = db_txn_make_durable(j->db);
+    if (st != OK) return st;
+    char *body = NULL;
+    if (asprintf(&body,
+                 "{\"packs_checked\":%u,\"packs_missing\":%u,\"packs_unknown\":%u,"
+                 "\"packs_dropped\":%u,\"objects_absent\":%llu,\"packs_returned\":%u,"
+                 "\"objects_restored\":%llu,\"degraded\":%s}",
+                 p.packs_checked, p.packs_missing, p.packs_unknown, p.packs_dropped,
+                 (unsigned long long)p.objects_absent, p.packs_returned,
+                 (unsigned long long)p.objects_restored, p.degraded ? "true" : "false") < 0)
+        return set_error(ERR_NOMEM, "repair: out of memory");
+    job_set_result(progress_ctx, body);
+    free(body);
+    job_set_summary(progress_ctx, p.packs_dropped ? "missing packs accepted as lost"
+                                                  : "nothing missing");
+    return OK;
+}
+
 static api_response_t repo_repair(const api_request_t *req, int64_t repo_id)
 {
     bool accept = false;
@@ -943,29 +991,19 @@ static api_response_t repo_repair(const api_request_t *req, int64_t repo_id)
     if (!accept)
         return api_error(400, "repair marks a degraded repository's missing packs as "
                               "lost; it needs accept_missing (CLI --accept-missing)");
-    if (repo_trylock_write(repo_id) != OK)
-        return api_error(503, "repository is busy; try again when its job finishes");
-    pack_presence_t p;
-    status_t st = pack_presence_check(g_db_for_keys, repo_id, 1, &p);
-    repo_unlock(repo_id);
-    if (st != OK) return api_error(500, err_msg());
-    if (p.unavailable) {
-        char msg[sizeof(p.why) + 96];
-        snprintf(msg, sizeof(msg), PACK_PRESENCE_UNAVAILABLE_FMT, (long long)repo_id, p.why);
-        return api_error(409, msg);
-    }
-    char *body = NULL;
-    if (asprintf(&body,
-                 "{\"packs_checked\":%u,\"packs_missing\":%u,\"packs_unknown\":%u,"
-                 "\"packs_dropped\":%u,\"objects_absent\":%llu,\"packs_returned\":%u,"
-                 "\"objects_restored\":%llu,\"degraded\":%s}",
-                 p.packs_checked, p.packs_missing, p.packs_unknown, p.packs_dropped,
-                 (unsigned long long)p.objects_absent, p.packs_returned,
-                 (unsigned long long)p.objects_restored, p.degraded ? "true" : "false") < 0)
+    job_manager_t *jm = routes_job_manager();
+    if (!jm) return api_error(500, "no job manager to queue the repair on");
+    repair_job_t *j = calloc(1, sizeof(*j));
+    if (!j) return api_error(500, "out of memory");
+    j->db      = g_db_for_keys;
+    j->repo_id = repo_id;
+    int64_t job_id = 0;
+    status_t st = job_submit(jm, repo_id, "repair", NULL, repair_job_run, j, free, &job_id);
+    if (st != OK) return api_error(st == ERR_BUSY ? 503 : 500, err_msg());
+    char *out = NULL;
+    if (asprintf(&out, "{\"job_id\":%lld}", (long long)job_id) < 0)
         return api_error(500, "out of memory");
-    journal_record(g_db_for_keys, repo_id, "api", "repair", "success", 0,
-                   p.packs_dropped ? "missing packs accepted as lost" : "nothing missing");
-    return api_ok(body);
+    return api_ok_status(202, out);
 }
 
 static api_response_t repo_scoped_get(const api_request_t *req, void *ud)

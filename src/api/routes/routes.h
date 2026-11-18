@@ -184,6 +184,10 @@ status_t routes_submit_startup_reindex(struct job_manager *jm, int64_t repo_id,
  */
 status_t routes_submit_reindex(int64_t repo_id, const char *origin, int64_t *out_job_id);
 
+/* The job manager routes_snapshots_init was given, or NULL before it: for a
+ * repo-scoped route outside snapshots.c that queues a job (repair). */
+struct job_manager *routes_job_manager(void);
+
 /* Tags, notes, policy and the journal. Repo-scoped sub-handlers, dispatched
  * from repos.c like the snapshot ones. */
 void routes_metadata_init(cutils_db_t *db);
