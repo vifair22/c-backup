@@ -34,6 +34,7 @@
 #include <cutils/db.h>
 
 #include "checkpointer.h"
+#include "db_readers.h"
 #include "db_txn.h"
 #include "db_write.h"
 #include "state_db.h"
@@ -91,6 +92,7 @@ static int teardown(void **state)
     checkpointer_set_test_idle(0);
     checkpointer_set_test_pause_ms(0);
     checkpointer_stop();
+    db_readers_close();
     db_close(db); db = NULL;
     rmrf(TEST_DIR);
     return 0;
@@ -389,6 +391,106 @@ static void test_only_bulk_writers_wait_at_the_hard_cap(void **state)
     assert_true(s.throttled >= 1);
 }
 
+/* ------------------------------------------------------------------ */
+/* B201: the store's pooled readers must never pin the WAL              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    atomic_int    stop;
+    unsigned long lookups;
+    int           errors;
+} reader_t;
+
+/* A file worker asking "already stored?" for chunk after chunk, flat out. */
+static void *reader_main(void *arg)
+{
+    reader_t *r = arg;
+    unsigned k = 0;
+    while (!atomic_load(&r->stop)) {
+        char hex[65];
+        snprintf(hex, sizeof(hex), "%064x", k++ % 4096u);
+        uint64_t c[6];
+        if (db_readers_locate(1, hex, c) < 0) r->errors++;
+        r->lookups++;
+    }
+    return NULL;
+}
+
+#define N_READERS 16
+
+/*
+ * FS2 (B201): with lookups running on every pooled connection at once, the
+ * WAL reached 1.4 million frames against a 262,144-frame cap, and kept
+ * growing after the backup. Readers in WAL mode hold a read-mark slot for
+ * each read; there are only a few slots, and readers that overlap without
+ * a gap keep one held at an old mark for as long as they keep coming, which
+ * stops both the copy beyond that mark and the restart. Here sixteen
+ * threads look objects up without pause while a writer commits, and the
+ * WAL has to stay near its cap, be fully copied and restart - all while
+ * the lookups are still running.
+ */
+static void test_pooled_readers_never_pin_the_wal(void **state)
+{
+    (void)state;
+    assert_int_equal(db_exec_raw(db,
+        "CREATE TABLE packs (repo_id INTEGER, id INTEGER, version INTEGER,"
+        " PRIMARY KEY (repo_id, id));"
+        " CREATE TABLE pack_objects (repo_id INTEGER, hash BLOB, pack_id INTEGER,"
+        " offset INTEGER, comp_size INTEGER, orig_size INTEGER, entry_index INTEGER,"
+        " PRIMARY KEY (repo_id, hash));"
+        " INSERT INTO packs VALUES (1, 1, 2);"), 0);
+    for (int i = 0; i < 2048; i += 2) {
+        char hex[65], sql[256];
+        snprintf(hex, sizeof(hex), "%064x", i);
+        snprintf(sql, sizeof(sql), "INSERT INTO pack_objects VALUES (1, '%s', 1, %d, 10, 10, %d)",
+                 hex, i, i);
+        assert_int_equal(db_exec_raw(db, sql), 0);
+    }
+    assert_int_equal(db_readers_open(TEST_DB, N_READERS), OK);
+    /* Each read held for a millisecond, as on FS2's loaded disk: the reads
+     * overlap without a gap, which is what pinned a read-mark slot there. */
+    db_readers_set_test_hold_us(1000);
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+
+    reader_t rd[N_READERS];
+    pthread_t th[N_READERS];
+    memset(rd, 0, sizeof(rd));
+    for (int i = 0; i < N_READERS; i++)
+        assert_int_equal(pthread_create(&th[i], NULL, reader_main, &rd[i]), 0);
+
+    writer_t w;
+    memset(&w, 0, sizeof(w));
+    uint32_t peak = run_writer_for(&w, 3000);
+
+    /* The writer has stopped, the readers have not. A PASSIVE from outside
+     * gets only as far as their read marks; the checkpointer's locked round,
+     * which holds them out, copies everything and restarts the WAL. */
+    uint32_t f0 = 0, b0 = 0, f = 0, b = 0;
+    assert_int_equal(checkpointer_wal_frames(TEST_DB, &f0, &b0), 0);
+    /* OK only when every frame was copied (log == checkpointed); then the
+     * restart row it writes starts the WAL again from the top. */
+    assert_int_equal(checkpointer_force(), OK);
+    assert_int_equal(checkpointer_wal_frames(TEST_DB, &f, &b), 0);
+    uint32_t after = f;
+    unsigned bad = db_readers_audit();
+
+    unsigned long lookups = 0;
+    for (int i = 0; i < N_READERS; i++) {
+        atomic_store(&rd[i].stop, 1);
+        pthread_join(th[i], NULL);
+        lookups += rd[i].lookups;
+        assert_int_equal(rd[i].errors, 0);
+    }
+    db_readers_set_test_hold_us(0);
+    fprintf(stderr, "B201: %lu lookups, %lu commits, WAL peak %u frames (hard cap %u), "
+            "then %u of %u frames before the forced round, %u after it\n",
+            lookups, (unsigned long)w.commits, peak, (unsigned)THRESHOLD * CKPT_HARD_FACTOR, f0 - b0, f0, after);
+    assert_true(lookups > 10000);
+    assert_true(peak <= (uint32_t)THRESHOLD * CKPT_HARD_FACTOR * 2);
+    assert_true(after <= 8 && after < f0);
+    assert_int_equal(bad, 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -398,6 +500,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_the_hard_cap_holds_on_a_slow_device, setup, teardown),
         cmocka_unit_test_setup_teardown(test_only_bulk_writers_wait_at_the_hard_cap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pinned_reader_holds_nobody_up, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pooled_readers_never_pin_the_wal, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

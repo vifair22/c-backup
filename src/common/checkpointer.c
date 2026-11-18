@@ -3,6 +3,7 @@
 #include "checkpointer.h"
 
 #include "db_txn.h"
+#include "db_readers.h"
 #include "thread_name.h"
 #include "walidx.h"
 
@@ -156,6 +157,9 @@ static void pre_restart(void)
 static status_t locked_passive(void *arg)
 {
     locked_arg_t *a = arg;
+    /* With the readers held out as well, no read mark is in use: the copy
+     * runs to the end and the restart lands (db_readers.h, B201). */
+    db_readers_quiesce();
     for (int i = 0; i < CKPT_LOCKED_ROUNDS; i++) {
         a->rc = passive(&a->left);
         if (a->rc != 0) break;
@@ -165,7 +169,17 @@ static status_t locked_passive(void *arg)
             break;
         }
     }
+    db_readers_resume();
     return OK;
+}
+
+status_t checkpointer_force(void)
+{
+    if (!g_ck) return set_error(ERR_INVALID, "checkpointer_force: not running");
+    locked_arg_t a = { 0, -1 };
+    status_t st = db_txn_exclusive(locked_passive, &a);
+    if (st != OK) return st;
+    return a.rc == 0 ? OK : set_error(ERR_BUSY, "checkpointer_force: the copy did not complete");
 }
 
 static void tick(void)
@@ -240,9 +254,13 @@ locked:;
     uint32_t f2 = 0, b2 = 0;
     if (a.rc != 0 || (checkpointer_wal_frames(g_path, &f2, &b2) == 0 && f2 > hard && f2 != b2))
         atomic_store(&g_blocked_until_ns, now_ns() + CKPT_BLOCKED_NS);
-    if (held > 1000000000ull || frames > hard)
+    if (held > 1000000000ull || frames > hard) {
+        uint32_t f3 = 0, b3 = 0;
+        (void)checkpointer_wal_frames(g_path, &f3, &b3);
         log_warn("state.db: WAL at %u frames; checkpointed under the write lock in %.0f ms "
-                 "(%u frames were left)", frames, (double)held / 1e6, left);
+                 "(%u frames were left; now %u frames, %u copied, %u readers pinned)",
+                 frames, (double)held / 1e6, left, f3, b3, db_readers_audit());
+    }
 }
 
 /*

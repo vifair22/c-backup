@@ -125,6 +125,9 @@ void checkpointer_throttle(void);
 /* Tests: sleep this long before every PASSIVE, a device whose syncs are
  * slow. */
 void checkpointer_set_test_pause_ms(unsigned ms);
+/* For tests: one locked round now, as the tick escalates to (the write lock
+ * and the pooled readers held, copy, restart). OK when the copy completed. */
+status_t checkpointer_force(void);
 
 /* Tests: the thread does nothing at its ticks while on, so a WAL past the
  * hard cap stays uncopied for as long as a test needs. */
