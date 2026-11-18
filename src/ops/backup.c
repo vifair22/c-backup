@@ -2577,9 +2577,6 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     return st;
 }
 
-/* One line saying where the bytes went, next to the profile saying where the
- * time went. Ratios are of bytes_logical, the regular-file content this run
- * covered, so an incremental that reads nothing new still reads sensibly. */
 /*
  * Database detection's memory in the file cache (db_detect.h DB_HEAD_*).
  * Loaded before the store phase, so a file the cache vouches for keeps its
@@ -2604,12 +2601,24 @@ static void detect_load_carry(cutils_db_t *db, int64_t repo_id, db_detector_t *d
     db_result_free(r);
 }
 
-typedef struct { cutils_db_t *db; const char *repo; int failed; } head_put_t;
+typedef struct { cutils_db_t *db; const char *repo; int failed; unsigned since; } head_put_t;
+
+/* Short transactions, as db_txn.h asks: a host with thousands of small
+ * SQLite caches has thousands of rows here. */
+#define HEAD_PUT_BATCH 1000u
 
 static void head_put(void *ctx, const char *path, uint32_t code)
 {
     head_put_t *h = ctx;
     if (h->failed) return;
+    if (h->since == HEAD_PUT_BATCH) {
+        h->since = 0;
+        if (db_txn_commit(h->db) != OK || db_txn_begin_bulk(h->db) != OK) {
+            h->failed = 2;      /* no transaction open */
+            return;
+        }
+    }
+    h->since++;
     char c[16];
     snprintf(c, sizeof(c), "%u", code);
     if (db_execute_non_query(h->db, "UPDATE file_cache SET db_head = ? WHERE repo_id = ? AND path = ?",
@@ -2621,7 +2630,7 @@ static void detect_save_heads(cutils_db_t *db, int64_t repo_id, const db_detecto
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    head_put_t h = { db, repo, 0 };
+    head_put_t h = { db, repo, 0, 0 };
     if (db_txn_begin_bulk(db) != OK) {
         log_warn("backup: database detection cannot keep classifications: %s", err_msg());
         err_clear();
@@ -2629,7 +2638,7 @@ static void detect_save_heads(cutils_db_t *db, int64_t repo_id, const db_detecto
     }
     db_detect_heads_read(d, head_put, &h);
     if (h.failed) {
-        db_txn_rollback(db);
+        if (h.failed == 1) db_txn_rollback(db);
         log_warn("backup: database detection cannot keep classifications");
     } else if (db_txn_commit(db) != OK) {
         log_warn("backup: database detection cannot keep classifications: %s", err_msg());
@@ -2637,6 +2646,9 @@ static void detect_save_heads(cutils_db_t *db, int64_t repo_id, const db_detecto
     err_clear();
 }
 
+/* One line saying where the bytes went, next to the profile saying where the
+ * time went. Ratios are of bytes_logical, the regular-file content this run
+ * covered, so an incremental that reads nothing new still reads sensibly. */
 static void log_written(const backup_result_t *r)
 {
     const uint64_t *w = r->written.bytes;

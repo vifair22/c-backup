@@ -538,6 +538,14 @@ Why each choice:
  "warnings":[]}
 ```
 
+When database detection ran for the session (`db-detection.md` 7.1),
+`unit.json` also carries `"databases":[{"engine","version","path",
+"confidence","coverage","method"}]`, at most 64 of them with
+`databases_total` when there were more: the permanent record of how each
+database was captured. It is optional and informational; no reader needs
+it, and the document stays version 1. It is why `unit.json` is stored after
+the unit's trees rather than before (`backup_synth_t.late`).
+
 Readers ignore unknown keys and refuse `version` > 1 for interpretation
 (the snapshot is then shown as an unclassified file snapshot, never
 misread). The checkpoint name is informational: it is never trusted for an

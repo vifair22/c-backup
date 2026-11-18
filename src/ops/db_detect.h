@@ -78,7 +78,7 @@ int         db_coverage_parse(const char *name, db_coverage_t *out);
 #define DB_HEAD_NONE        0u
 #define DB_HEAD_SQLITE      1u   /* param: 1 rollback journal, 2 WAL */
 #define DB_HEAD_REDIS_RDB   2u   /* param: RDB format version */
-#define DB_HEAD_LMDB        3u
+#define DB_HEAD_LMDB        3u   /* param 0xffff: a data.mdb that is not */
 #define DB_HEAD_BBOLT       4u
 #define DB_HEAD_PG_VERSION  5u   /* param: major * 100 + minor */
 #define DB_HEAD_PROM_META   6u   /* a block's meta.json, "ulid" first */

@@ -254,6 +254,8 @@ uint32_t db_detect_classify(const char *name, const void *head, size_t len)
         if (m == 0xED0CDAEDu) return DB_HEAD_CODE(DB_HEAD_BBOLT, 0);
     }
     if (!name) return DB_HEAD_NONE;
+    /* A data.mdb that is not LMDB is said so, so its name cannot make one. */
+    if (strcmp(name, "data.mdb") == 0) return DB_HEAD_CODE(DB_HEAD_LMDB, 0xffffu);
     if (strcmp(name, "PG_VERSION") == 0) {
         /* "16\n", or "9.6\n" before PostgreSQL 10. Anything else is not
          * PostgreSQL's file. */
@@ -624,6 +626,8 @@ void db_detect_entry(db_detector_t *d, const char *path, int is_dir, int is_link
         if (!is_system_schema(pn)) mark_up(d, path, 2, M_MYISAM);
     } else if (ends_with(b, ".MAD") || ends_with(b, ".MAI")) {
         if (!is_system_schema(pn)) mark_up(d, path, 2, M_ARIA);
+    } else if (ends_with(b, ".manifest") && strcmp(pn, "appendonlydir") == 0) {
+        mark_up(d, path, 2, M_AOF_MANIFEST);
     } else if (ends_with(b, "-wal")) add_sibling(d, path, 4, SIB_WAL);
     else if (ends_with(b, "-shm")) add_sibling(d, path, 4, SIB_SHM);
     else if (ends_with(b, "-journal")) add_sibling(d, path, 8, SIB_JOURNAL);
@@ -790,7 +794,8 @@ static void promote(db_detector_t *d)
         case DB_HEAD_LDB_CURRENT: if (!param) mark_up(d, h->path, 1, M_CURRENT_BAD); break;
         default: break;
         }
-        if (strcmp(b, "data.mdb") == 0 && kind != DB_HEAD_LMDB) mark_up(d, h->path, 1, M_DATA_MDB_BAD);
+        if (strcmp(b, "data.mdb") == 0 && (kind != DB_HEAD_LMDB || param == 0xffffu))
+            mark_up(d, h->path, 1, M_DATA_MDB_BAD);
     }
     dirs_merge(d);
     size_t n = d->dirs.n;
@@ -1014,7 +1019,7 @@ static const char *dump_template(db_engine_t e)
 static void judge(const db_capture_desc_t *cap, cand_t *c, db_finding_t *f,
                   const int *extra, size_t n_extra)
 {
-    f->root = root_of(cap, c->path);
+    f->root = root_of(cap, f->path);
     f->method = (cap && f->root >= 0) ? method_of(cap->roots[f->root].kind) : NULL;
     if (f->confidence != DB_CONF_LIVE || !cap || c->engine == DB_ENGINE_NEXTCLOUD) {
         f->coverage = DB_COV_NONE;
@@ -1245,10 +1250,11 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
     if (st == OK && cands.n && !(res->v = calloc(cands.n, sizeof(*res->v))))
         st = set_error(ERR_NOMEM, "db detect");
 
+    /* A bbolt file that is an InfluxDB 2's own (influxd.bolt) belongs to
+     * that finding (section 4): one engine per directory. A pass of its
+     * own, before any candidate's path moves into its finding. */
     for (size_t i = 0; i < cands.n && st == OK; i++) {
         cand_t *c = &cands.v[i];
-        /* A bbolt file that is an InfluxDB 2's own (influxd.bolt) belongs
-         * to that finding (section 4): one engine per directory. */
         if (c->engine == DB_ENGINE_BBOLT) {
             size_t pl = ancestor_len(c->path, strlen(c->path), 1);
             char *parent = pl == (size_t)-1 ? NULL : dup_n(c->path, pl);
@@ -1263,8 +1269,13 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
                 }
             }
             free(parent);
-            if (owned) { c->absorbed = 1; continue; }
+            if (owned) c->absorbed = 1;
         }
+    }
+
+    for (size_t i = 0; i < cands.n && st == OK; i++) {
+        cand_t *c = &cands.v[i];
+        if (c->absorbed) continue;
         unsigned uns = 0;
         if (has_unsettled_under(d, c->path, &uns)) c->live = 1;
         c->unsettled = uns;

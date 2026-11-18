@@ -468,11 +468,13 @@ check "bytes written is pack plus parity" "${BW:-none}" "$(( ${BWP:-0} + ${BWPP:
 RESULT_KEYS=$(printf '%s' "$JOB_BODY" | sed -n 's/.*"result":{\([^}]*\)}.*/\1/p' \
               | grep -o '"[a-z_]*":' | tr -d '":' | tr '\n' ' ')
 check "the backup result carries exactly its keys" \
-    "snapshot_id files dirs files_unchanged bytes_logical objects_new bytes_stored trees_new trees_reused store_workers bytes_written bytes_written_pack bytes_written_pack_parity files_skipped skipped skipped_listed files_changed changed changed_listed changed_unsettled unsettled unsettled_listed " \
+    "snapshot_id files dirs files_unchanged bytes_logical objects_new bytes_stored trees_new trees_reused store_workers bytes_written bytes_written_pack bytes_written_pack_parity files_skipped skipped skipped_listed files_changed changed changed_listed changed_unsettled unsettled unsettled_listed databases findings listed total sqlite_small " \
     "$RESULT_KEYS"
 contains "and a clean backup left nothing out" '"files_skipped":0,"skipped":[],"skipped_listed":0,' "$JOB_BODY"
 contains "and saw nothing change under it" '"files_changed":0,"changed":[],"changed_listed":0,' "$JOB_BODY"
-contains "and kept nothing that never settled" '"changed_unsettled":0,"unsettled":[],"unsettled_listed":0}' "$JOB_BODY"
+contains "and kept nothing that never settled" '"changed_unsettled":0,"unsettled":[],"unsettled_listed":0,' "$JOB_BODY"
+# Database detection (docs/db-detection.md): reported on every backup, here none.
+contains "and found no database" '"databases":{"findings":[],"listed":0,"total":0,"sqlite_small":0}}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -2229,6 +2231,38 @@ contains "unencrypted into unencrypted needs no flag" '"state":"completed"' \
     "$(sock_body "/jobs/$P2_JOB")"
 check "and is not journalled as a plaintext copy" 0 \
     "$(sock_body /repos/1/journal | grep -c 'into plaintext')"
+
+echo "database detection"
+# docs/db-detection.md, D0: a backup reports the databases it read, judges a
+# live read of one as uncovered, alerts once and journals it. A WAL-mode
+# SQLite header (the 16-byte magic, a page size, format versions 2 and 2)
+# with its -wal beside it is a live database; a text file named *.db is not.
+DBS="$R/dbsrc"
+mkdir -p "$DBS/app"
+printf 'SQLite format 3\000\020\000\002\002' > "$DBS/app/live.db"
+head -c 4096 /dev/zero >> "$DBS/app/live.db"
+: > "$DBS/app/live.db-wal"
+printf 'just text, not a database\n' > "$DBS/app/notes.db"
+DB_OUT=$(sock_send POST /repos "{\"path\":\"$R/dbrepo\",\"label\":\"db\"}")
+contains "a repository for it" ' 201' "$DB_OUT"
+DB_ID=$(printf '%s' "$DB_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+DB_JOB=$(job_id "$(sock_post "/repos/$DB_ID/backup" "{\"paths\":[\"$DBS\"]}")")
+wait_job "$DB_JOB"
+DB_BODY=$(sock_body "/jobs/$DB_JOB")
+contains "a backup reports the live database it read" '"engine":"sqlite"' "$DB_BODY"
+contains "at its path" "\"path\":\"$DBS/app/live.db\"" "$DB_BODY"
+contains "read live, so uncovered" '"coverage":"uncovered"' "$DB_BODY"
+contains "with the engine copy to enable" '"suggestion":"sqlite-backup"' "$DB_BODY"
+check "never a file only named like one" 0 "$(printf '%s' "$DB_BODY" | grep -c 'notes.db')"
+contains "alerted, as the job's warning" 'live database captured uncovered' "$DB_BODY"
+contains "and journalled" 'database found: live SQLite' "$(sock_body "/repos/$DB_ID/journal")"
+DB_UNC=$(sock_body /metrics | sed -n 's/^cbackup_db_findings{coverage="uncovered"} \([0-9]*\)$/\1/p')
+check "counted by coverage" yes "$([ "${DB_UNC:-0}" -ge 1 ] && echo yes || echo "no: $DB_UNC")"
+DB_JOB2=$(job_id "$(sock_post "/repos/$DB_ID/backup" "{\"paths\":[\"$DBS\"]}")")
+wait_job "$DB_JOB2"
+DB_BODY2=$(sock_body "/jobs/$DB_JOB2")
+contains "found again on the next backup" '"engine":"sqlite"' "$DB_BODY2"
+check "but alerted only once" 0 "$(printf '%s' "$DB_BODY2" | grep -c 'captured uncovered')"
 
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
