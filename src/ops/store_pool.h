@@ -104,6 +104,29 @@ typedef struct {
  */
 void store_pool_plan(unsigned requested, uint64_t n_large, unsigned *out_workers);
 
+/*
+ * A backup sends files over this to the file workers, each read on a
+ * thread of its own (backup.c, store_content). SMALL_FILE_MAX is
+ * small_files.h's, expanded where the backup uses it.
+ *
+ * It was one object's bound (16 MiB), which left every file between the
+ * small-file workers' 1 MiB and 16 MiB to the backup thread: read, cut,
+ * hashed, compressed and sealed there, one at a time, while the file
+ * workers waited for the next large file. On FS2 (12 threads, a cold SSD
+ * pool) the first backup of D1, 1,605 files averaging 9.5 MB, kept 1.5
+ * cores busy against kopia's 4.3 (PERF.md, 2026-11-19).
+ */
+#define FILE_POOL_MIN SMALL_FILE_MAX
+
+/*
+ * At least this many files at once when there are that many to read. A
+ * file worker is bound by its reads, not the CPU, so its number follows
+ * what a device needs in flight rather than the core count; a quarter of
+ * the chunk workers gave FS2 two. Six reached the modelled device's limit
+ * (PERF.md, 2026-11-19); the buffer budget still caps it below.
+ */
+#define FILE_WORKERS_MIN 6
+
 /* The inputs store_pool_plan reads from the machine, for tests and logs. */
 unsigned store_pool_cpus(void);
 uint64_t store_pool_mem_budget(void);

@@ -1415,18 +1415,18 @@ static status_t store_synth_all(pipeline_t *p, int late)
  */
 static status_t store_content(pipeline_t *p)
 {
-    uint64_t n_large = 0, n_small = 0;
+    uint64_t n_large = 0, n_small = 0, pooled_bytes = 0;
     for (uint32_t i = 0; i < p->count; i++) {
         const scan_entry_t *e = &p->scan->entries[i];
         if (e->node.type != NODE_TYPE_REG) continue;
-        if (e->node.size > OBJECT_MAX_BYTES) n_large++;
+        if (e->node.size > FILE_POOL_MIN) { n_large++; pooled_bytes += e->node.size; }
         else if (e->node.size <= SMALL_FILE_MAX) n_small++;
     }
     /* Enough small files to fill a batch or two is worth threads for. */
     int small_par = n_small >= 2 * (uint64_t)SMALL_BATCH_FILES;
 
     /*
-     * Chunk workers when there are files over one object's bound. The plan
+     * Chunk workers when there are files for the file workers. The plan
      * is the one the whole-file pool used (CPUs, memory, operator's
      * number); each worker holds at most a few max-size chunk buffers.
      */
@@ -1437,7 +1437,7 @@ static status_t store_content(pipeline_t *p)
         if (cdc_workers_start(workers, &p->cdc_w) == OK) {
             log_info("backup: %llu file(s) over %llu MiB, their chunks stored "
                      "on %u threads", (unsigned long long)n_large,
-                     (unsigned long long)(OBJECT_MAX_BYTES >> 20), workers);
+                     (unsigned long long)(FILE_POOL_MIN >> 20), workers);
         } else {
             /* Slower, not wrong: every chunk can still be stored here. */
             log_warn("backup: cannot start chunk workers, storing serially: %s",
@@ -1477,10 +1477,14 @@ static status_t store_content(pipeline_t *p)
      * And files at once, when there are several large ones: one file is
      * bound by its reading thread (pread and the boundary scan), so a tree
      * of many large files needs several. A quarter of the chunk workers,
-     * at most one per large file.
+     * and never fewer than FILE_WORKERS_MIN, at most one per large file.
      */
-    unsigned fw = workers / 4;
+    unsigned fw = workers / 4 > FILE_WORKERS_MIN ? workers / 4 : FILE_WORKERS_MIN;
     if ((uint64_t)fw > n_large) fw = (unsigned)n_large;
+    /* Each file worker seals a pack of its own at the end, so a handful of
+     * files just over 1 MiB would leave six small packs: one worker per
+     * object's bound (16 MiB) of pooled content at most. */
+    if ((uint64_t)fw > pooled_bytes / OBJECT_MAX_BYTES) fw = (unsigned)(pooled_bytes / OBJECT_MAX_BYTES);
     /*
      * And no more than the buffer budget has writers for: each file worker
      * opens a pack writer of its own (about 26 MiB of parity encoder and
@@ -1860,7 +1864,7 @@ static status_t store_content_loop(pipeline_t *p)
 
         /* A large file goes to the pool once there is room for it; the
          * backup thread carries on with the entries after it. */
-        int to_pool = p->pool && e->node.size > OBJECT_MAX_BYTES;
+        int to_pool = p->pool && e->node.size > FILE_POOL_MIN;
         while (to_pool &&
                store_pool_outstanding(p->pool) >= store_pool_capacity(p->pool)) {
             status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")

@@ -586,7 +586,12 @@ static void test_same_repository_on_one_or_many_workers(void **state)
         assert_string_equal(r1->rows[i][0], r2->rows[i][0]);
         assert_string_equal(r1->rows[i][1], r2->rows[i][1]);
         assert_string_equal(r1->rows[i][2], r2->rows[i][2]);
-        assert_string_equal(r1->rows[i][3], r2->rows[i][3]);
+        /* In a pack in both, not necessarily the same one: four chunk
+         * workers now run file workers too (FILE_WORKERS_MIN), each
+         * writing packs of its own, as a larger pool always did. */
+        if (rb.file_workers == 1) assert_string_equal(r1->rows[i][3], r2->rows[i][3]);
+        assert_true(r1->rows[i][3][0] >= '0' && r1->rows[i][3][0] <= '9');
+        assert_true(r2->rows[i][3][0] >= '0' && r2->rows[i][3][0] <= '9');
     }
     db_result_free(r1);
     db_result_free(r2);
@@ -1010,6 +1015,62 @@ static void test_snapshot_record_waits_for_every_pack_commit(void **state)
     env_close(&e);
 }
 
+/*
+ * Files between the small-file workers' 1 MiB and one object's 16 MiB go
+ * to the file workers too, at least FILE_WORKERS_MIN of them when there
+ * are that many files: eight chunk workers used to give two file workers,
+ * and files of that size none at all, so a tree of them was read, cut and
+ * sealed one file at a time on the backup thread (PERF.md, 2026-11-19).
+ * The snapshot is the one a serial run makes.
+ */
+static void test_mid_size_files_are_read_in_parallel(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_SRC, 0700), 0);
+    char p[PATH_MAX];
+    for (int i = 0; i < 10; i++) {
+        snprintf(p, sizeof(p), TEST_SRC "/doc%02d.bin", i);
+        write_random(p, 9 + (unsigned)i % 4, 100 + (uint64_t)i);
+    }
+    /* And a few small-but-pooled files alone get fewer workers: one per
+     * 16 MiB of content, so six files of 2 MiB run none. */
+    assert_int_equal(mkdir(TEST_DIR "/few", 0700), 0);
+    for (int i = 0; i < 6; i++) {
+        snprintf(p, sizeof(p), TEST_DIR "/few/f%d.bin", i);
+        write_random(p, 2, 200 + (uint64_t)i);
+    }
+    write_text(TEST_SRC "/note.txt", "a small file stays on the backup thread\n");
+
+    env_t a, b;
+    env_open(&a, "serial");
+    backup_opts_t oa = opts_for(1);
+    backup_result_t ra;
+    assert_int_equal(backup_run(a.store, a.db, a.repo_id, &oa, &ra), OK);
+    assert_int_equal(ra.file_workers, 1);
+
+    env_open(&b, "eight");
+    backup_opts_t ob = opts_for(8);
+    backup_result_t rb;
+    assert_int_equal(backup_run(b.store, b.db, b.repo_id, &ob, &rb), OK);
+    assert_int_equal(rb.file_workers, 6);
+    assert_int_equal(rb.files, 11);
+
+    assert_same_snapshot(&a, ra.snapshot_id, &b, rb.snapshot_id, TEST_DIR);
+
+    env_t c;
+    env_open(&c, "few");
+    static const char *few[] = { TEST_DIR "/few" };
+    backup_opts_t oc = opts_for(8);
+    oc.paths = few;
+    backup_result_t rc;
+    assert_int_equal(backup_run(c.store, c.db, c.repo_id, &oc, &rc), OK);
+    assert_int_equal(rc.files, 6);
+    assert_int_equal(rc.file_workers, 1);
+    env_close(&a);
+    env_close(&b);
+    env_close(&c);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1020,6 +1081,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_failing_file_is_skipped_as_it_is_serially, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_stops_the_workers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_write_counters_match_the_disk, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_mid_size_files_are_read_in_parallel, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failed_seal_fails_the_run_and_leaves_nothing,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_record_waits_for_every_pack_commit,
