@@ -319,14 +319,21 @@ static status_t blob(dbuild_t *b, struct sp_ctx *c, const char *unit, const char
     return cache_blob(c, unit, id, data, len);
 }
 
-/* A host file's bytes, or ERR_NOT_FOUND. */
-static status_t host_file(struct sp_ctx *c, const char *path, char **data, size_t *len)
+/* A host file's bytes, or ERR_NOT_FOUND. *open_err, when given, is the
+ * errno of an open that failed (0 otherwise). */
+static status_t host_file_ex(struct sp_ctx *c, const char *path, char **data, size_t *len,
+                             int *open_err)
 {
+    if (open_err) *open_err = 0;
     char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
     if (host_path(&c->tools, path, hp, sizeof(hp)) != 0) return set_error(ERR_INVALID, "docker: path too long");
     FILE *f = fopen(hp, "re");
-    if (!f) return errno == ENOENT ? set_error(ERR_NOT_FOUND, "docker: %s is missing", path)
-                                   : set_error_errno(ERR_IO, "docker: %s", path);
+    if (!f) {
+        int e = errno;
+        if (open_err) *open_err = e;
+        return e == ENOENT ? set_error(ERR_NOT_FOUND, "docker: %s is missing", path)
+                           : set_error_errno(ERR_IO, "docker: %s", path);
+    }
     char *buf = NULL;
     size_t n = 0, cap = 0;
     char chunk[8192];
@@ -347,6 +354,34 @@ static status_t host_file(struct sp_ctx *c, const char *path, char **data, size_
     *data = buf;
     *len = n;
     return OK;
+}
+
+static status_t host_file(struct sp_ctx *c, const char *path, char **data, size_t *len)
+{
+    return host_file_ex(c, path, data, len, NULL);
+}
+
+/*
+ * A warning describe found, held until the unit's capture begins: describe
+ * has no channel to the job, and a session's info does (NIT-50). Kept in
+ * the blob cache under an id no item has, so it lives and is dropped with
+ * the description it came from.
+ */
+#define PENDING_WARN_ID "!warning"
+
+static void pending_warn(struct sp_ctx *c, const char *unit, const char *text)
+{
+    char *copy = strdup(text);
+    if (!copy || cache_blob(c, unit, PENDING_WARN_ID, copy, strlen(copy)) != OK) err_clear();
+}
+
+static void emit_pending_warns(struct sp_ctx *c, const char *unit, sp_session_info_t *info)
+{
+    pthread_mutex_lock(&c->mu);
+    for (size_t i = 0; i < c->nblobs; i++)
+        if (strcmp(c->blobs[i].unit, unit) == 0 && strcmp(c->blobs[i].item, PENDING_WARN_ID) == 0)
+            (void)sp_session_info_warn(info, "%s", c->blobs[i].data);
+    pthread_mutex_unlock(&c->mu);
 }
 
 /* Directories that are usually re-creatable, offered as exclusions and
@@ -441,12 +476,26 @@ static status_t describe_member(struct sp_ctx *c, dbuild_t *b, const char *unit,
         snprintf(tf, sizeof(tf), "%.3900s/my-%.128s.xml", c->pol->templates_dir, m->name);
         char *data = NULL;
         size_t len = 0;
-        st = host_file(c, tf, &data, &len);
+        int oe = 0;
+        st = host_file_ex(c, tf, &data, &len, &oe);
         if (st == OK) {
             item_id(id, sizeof(id), "template:", m->name);
             snprintf(tp, sizeof(tp), CFG_DIR "/containers/%s/unraid-template.xml", m->name);
             st = blob(b, c, unit, id, tp, data, len);
         } else if (st == ERR_NOT_FOUND) {
+            err_clear();
+            st = OK;
+        } else if (oe == EACCES || oe == EPERM || oe == ENOTDIR || oe == ELOOP) {
+            /* Optional, and not readable: the default templates_dir is
+             * Unraid's, which an unprivileged helper or a host that is not
+             * Unraid cannot reach. Failing the whole unit over it lost the
+             * data too; it is left out and the job says so. Nothing beyond
+             * the policy's own path is tried. */
+            char w[PATH_MAX + 200];
+            snprintf(w, sizeof(w), "%.80s: Unraid template not stored: %.3900s: %s",
+                     m->name, tf, strerror(oe));
+            log_warn("docker: %s", w);
+            pending_warn(c, unit, w);
             err_clear();
             st = OK;
         }
@@ -1197,6 +1246,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
                          sp_consistency_name(lvl), sp_consistency_name(req->require));
     }
     *out = s;
+    emit_pending_warns(c, s->unit, &s->info);
     *info = &s->info;
     return OK;
 }
@@ -1510,7 +1560,11 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
         free(ss);
         return set_error(ERR_IO, "%s", why);
     }
-    for (size_t k = 0; k < n; k++) { out[k] = ss[k]; infos[k] = &ss[k]->info; }
+    for (size_t k = 0; k < n; k++) {
+        emit_pending_warns(c, ss[k]->unit, &ss[k]->info);
+        out[k] = ss[k];
+        infos[k] = &ss[k]->info;
+    }
     free(ss);
     return OK;
 }
