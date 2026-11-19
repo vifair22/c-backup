@@ -166,6 +166,16 @@ export type ApiRequest =
   | { kind: 'unitBackup'; repoId: number; provider: string
       units?: string[]; all?: boolean; exclude?: string[]
       require?: UnitLevel; pauseScope?: PauseScope }
+  /* `unit policy show` and `unit policy set`: values maps a key to its
+   * new value, or to "" to drop the unit's own (the repository's applies
+   * again). Several keys in one request, which the route takes. */
+  | { kind: 'unitPolicyGet'; repoId: number; provider: string; unit: string }
+  | { kind: 'unitPolicySet'; repoId: number; provider: string; unit: string
+      values: Record<string, string> }
+  /* `vm checkpoints` and `vm reset-incremental`. The CLI names libvirt;
+   * the routes serve any provider's chain, so these take one. */
+  | { kind: 'unitCheckpoints'; repoId: number; provider: string; unit: string }
+  | { kind: 'unitResetIncremental'; repoId: number; provider: string; unit: string }
   /* `unit restore`: the whole snapshot as files under dest, one item to a
    * new file, or the unit itself re-created (define) in place or under a
    * new name with its data under targetRoot. */

@@ -145,3 +145,19 @@ test('a restore body is the one `c-backup unit restore` sends for each mode', as
   assert.deepEqual(unitRestoreBody({ mode: 'unit', name: 'n', targetRoot: '/t', start: false }),
     { mode: 'unit', name: 'n', target_root: '/t' })
 })
+
+test('a policy save sends only what changed, a cleared key as ""', async () => {
+  const { policyChanges, UNIT_POLICY_KEYS } = await import('../src/shared/units.ts')
+  assert.deepEqual([...UNIT_POLICY_KEYS], [
+    'retention.keep_snaps', 'retention.keep_daily', 'retention.keep_weekly',
+    'retention.keep_monthly', 'retention.keep_yearly', 'capture.exclude', 'capture.group',
+  ])
+  const own = { 'retention.keep_daily': '14', 'capture.exclude': '/tmp/*' }
+  assert.deepEqual(policyChanges(own, { ...own }), {}, 'nothing changed, nothing sent')
+  assert.deepEqual(policyChanges(own, { 'retention.keep_daily': '', 'capture.exclude': '/tmp/*\n' }),
+    { 'retention.keep_daily': '' }, 'cleared is dropped; a trailing newline is no change')
+  assert.deepEqual(policyChanges(own, { ...own, 'retention.keep_weekly': ' 8 ', 'capture.group': 'proxy' }),
+    { 'retention.keep_weekly': '8', 'capture.group': 'proxy' })
+  /* A bad value goes as typed, for the daemon to refuse in its own words. */
+  assert.deepEqual(policyChanges({}, { 'retention.keep_yearly': 'many' }), { 'retention.keep_yearly': 'many' })
+})

@@ -16,6 +16,8 @@ import type {
 } from '../shared/wire'
 import { DEFAULT_LEVEL, isDisk, itemKindLabel, unitJournal } from '../shared/units'
 import { UnitRestoreDialog } from './UnitRestoreDialog'
+import { UnitPolicyPanel } from './UnitPolicyPanel'
+import { UnitChainPanel } from './UnitChainPanel'
 import { ExportCreate, ExportCreated, ExportsPanel } from './ExportsPanel'
 import { absoluteTime, fmtNum, fmtSize, gfsBadges } from './format'
 import {
@@ -224,6 +226,10 @@ export function UnitDetail({ connName, repoPath, provider, unitId, name, onBack,
           </div>
         )}
       </section>
+
+      <UnitPolicyPanel connName={connName} repoId={repoId} provider={provider} unitId={unitId} />
+      <UnitChainPanel connName={connName} repoId={repoId} provider={provider} unitId={unitId}
+        onReset={() => void loadHistory()} />
 
       {created && <ExportCreated e={created} onDismiss={() => setCreated(null)} />}
       <ExportsPanel connName={connName} repoId={repoId} snapshots={snapIds} refresh={exportsRefresh} />
