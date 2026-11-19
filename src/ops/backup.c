@@ -153,14 +153,14 @@ typedef struct {
  * probe, LZ4) runs outside the lock; the lock covers dedup, encryption,
  * parity and the write.
  *
- * Every new object's index row has to exist before its pack commits: the
- * commit callback turns rows from staged to packed, and a row inserted after
- * it would stay staged, be dropped by the next backup, and leave the chunk
- * with no row - which compaction reads as dead and drops from its pack. So
- * new objects queue here as pending rows, and are written either by the
- * backup thread inside its batch once the file is stored, or here, in a
- * transaction of their own, just before a rollover seals the pack they are
- * in.
+ * A new object's index row is the pack commit's to create, as it is for
+ * the file workers: the commit inserts every row its pack's entries lack
+ * (store_index.c, db_pack_commit), in hash order. Objects met here queue
+ * as pending rows all the same, and are written either by the backup
+ * thread inside its batch once the file is stored, or here, in a
+ * transaction of their own, just before a rollover seals the pack; at
+ * that point a row is written only for an object some earlier pack holds
+ * (index_row).
  *
  * Rollover happens here only while may_rollover is set, which the backup
  * thread does for a file over OBJECT_MAX_BYTES after letting its batch
@@ -171,7 +171,6 @@ typedef struct {
 typedef struct {
     uint8_t  hash[OBJECT_HASH_SIZE];
     uint8_t  type;
-    uint64_t phys, orig;
 } pending_row_t;
 
 typedef struct bsink {
@@ -563,16 +562,20 @@ static int scan_path_cmp(const void *a, const void *b)
  * few bytes locally and remembering the answer makes repeats free.
  */
 /*
- * Record a stored object in the index: staged when it went into the open
- * pack, packed when the repository already held it. See store_index_put_staged for
- * why the difference decides whether a crash can lose data silently.
+ * Record a stored object in the index. One in the open pack gets no row
+ * here: that pack's commit creates it. It used to be written now as
+ * 'staged' and rewritten by the commit, so every new object took a random
+ * insert into the objects primary key in the backup's batches and another
+ * write at the commit; the commit's own insert, in hash order, fills each
+ * b-tree page once. On a 38,732-file first backup that was 77% of the WAL
+ * (PERF.md, 2026-11-19). An object an earlier pack holds gets its row back
+ * if the index lost it (B060).
  */
-static status_t record_object(pipeline_t *p, const uint8_t hash[OBJECT_HASH_SIZE],
-                              uint8_t type, uint64_t phys, uint64_t orig)
+static status_t index_row(pipeline_t *p, pack_backup_writer_t *pw,
+                          const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type)
 {
-    return pack_backup_holds(p->pack_w, hash)
-        ? store_index_put_staged(p->db, p->repo_id, hash, type, phys, orig)
-        : store_index_put_packed(p->db, p->repo_id, hash, type, phys, orig);
+    if (pack_backup_holds(pw, hash)) return OK;
+    return store_index_put_packed(p->db, p->repo_id, hash, type, 0, 0);
 }
 
 static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type, const char *path,
@@ -605,10 +608,9 @@ static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type, const char *pat
     }
     if (st != OK) return st;
     int is_new = ow.is_new;
-    uint64_t phys = ow.phys_bytes;
     if (is_new) {
         p->res->objects_new++;
-        st = record_object(p, out_hash, obj_type, phys, len);
+        st = index_row(p, p->pack_w, out_hash, obj_type);
         if (st != OK) return st;
     }
     hashset_add(&p->meta_seen, out_hash);
@@ -740,9 +742,7 @@ static status_t bsink_flush(bsink_t *s, int own_txn)
     uint64_t _ti = phase_now();
     for (size_t i = 0; i < s->n && st == OK; i++) {
         const pending_row_t *r = &s->rows[i];
-        st = pack_backup_holds(s->pw, r->hash)
-            ? store_index_put_staged(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig)
-            : store_index_put_packed(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig);
+        st = index_row(p, s->pw, r->hash, r->type);
     }
     phase_add(p->timers, PHASE_INDEX_PUT, _ti);
     if (own_txn) {
@@ -823,8 +823,6 @@ static status_t bsink_add_prepared(bsink_t *s, const pack_prepared_t *pp,
             pending_row_t *r = &s->rows[s->n++];
             memcpy(r->hash, pp->hash, OBJECT_HASH_SIZE);
             r->type = pp->type;
-            r->phys = phys;
-            r->orig = pp->len;
         }
     }
     if (st != OK && s->failed == OK) {

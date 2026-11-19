@@ -1976,6 +1976,68 @@ static void test_unchanged_backup_index_writes_stay_sequential(void **state)
     assert_true(frames / rows < 0.45);
 }
 
+/*
+ * A first backup's new objects get their index rows from the pack commit
+ * alone, in hash order, so each b-tree page of objects and pack_objects is
+ * written about once. The backup used to write each one first as a
+ * 'staged' row in its own batches, a random insert into the objects
+ * primary key per object, and the commit then rewrote it (PERF.md,
+ * 2026-11-19). The commit budget runs at a fixed frame cost so batch
+ * sizes do not depend on this machine's disk. And no object is left
+ * without its row.
+ */
+static void test_first_backup_index_writes_stay_sequential(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_SRC "/many", 0700), 0);
+    for (int d = 0; d < 200; d++) {
+        char path[128];
+        snprintf(path, sizeof(path), TEST_SRC "/many/d%03d", d);
+        assert_int_equal(mkdir(path, 0700), 0);
+        for (int i = 0; i < 20; i++) {
+            char body[64];
+            snprintf(path, sizeof(path), TEST_SRC "/many/d%03d/f%02d.c", d, i);
+            snprintf(body, sizeof(body), "file %d of directory %d", i, d);
+            write_file(path, body);
+        }
+    }
+    backup_opts_t o = basic_opts();
+    db_txn_set_frame_cost_ns(600000.0);   /* 250 pages a commit */
+    db_txn_track_wal(db);
+    db_txn_metrics_t m0, m1;
+    db_txn_metrics(&m0);
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    status_t st = backup_run(store, db, repo_id, &o, &res);
+    db_txn_metrics(&m1);
+    db_txn_track_wal(NULL);
+    db_txn_set_frame_cost_ns(0);
+    assert_int_equal(st, OK);
+    assert_true(res.objects_new > 4000);
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT (SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?1),"
+        "       (SELECT COUNT(*) FROM objects WHERE repo_id = ?1),"
+        "       (SELECT COUNT(*) FROM pack_objects po WHERE po.repo_id = ?1 AND NOT EXISTS"
+        "          (SELECT 1 FROM objects o WHERE o.repo_id = po.repo_id AND o.hash = po.hash"
+        "             AND o.location = CAST(po.pack_id AS TEXT)))",
+        (const char *[]){ repo, NULL }, &r), 0);
+    long long packed = atoll(r->rows[0][0]), objects = atoll(r->rows[0][1]);
+    long long rowless = atoll(r->rows[0][2]);
+    db_result_free(r);
+    double frames = (double)(m1.commit_frames - m0.commit_frames);
+    print_message("  %.0f WAL frames for %u new objects (%.2f an object)\n",
+                  frames, res.objects_new, frames / res.objects_new);
+    assert_true(packed >= (long long)res.objects_new);
+    assert_int_equal(objects, packed);
+    assert_int_equal(rowless, 0);
+    /* Staged rows measured 0.51 here; the commit's rows alone 0.28. */
+    assert_true(frames / res.objects_new < 0.40);
+}
+
 /* node_hashes holds exactly the file rows with content, of every snapshot
  * with node rows, and leaves with them: prune and reindex keep it in step. */
 static int node_hash_drift(const char *repo)
@@ -2241,6 +2303,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_cancel_lands_inside_a_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_metadata_write_is_not_held_by_a_slow_batch, setup, teardown),
         cmocka_unit_test_setup_teardown(test_no_waiter_means_no_extra_commits, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_first_backup_index_writes_stay_sequential, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_waiter_gets_in_between_trees, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_persistent_writer_does_not_cost_a_commit_per_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_writer_stops_on_the_store_flag, setup, teardown),
