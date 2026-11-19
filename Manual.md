@@ -4921,14 +4921,19 @@ A plain file source is read live, so every live database in one is
 when the unit achieved `crash` or better the provider guarantees one
 instant for all of it (container-backup 6.4), and below that each mount is
 counted as its own instant. The links inside a container's data name
-container paths, not the recorded ones, so in a unit they are listed as
+container paths; the helper's probe reports the container's mounts, so a
+link is followed to where the unit records it, and one into a mount the
+unit does not back up (an excluded bind) or into the container's own
+filesystem makes the finding `split`, with the link's `why` in its
+evidence. Only with no probe answer for the container is a link listed
 `unchecked` rather than judged.
 
 Each live finding carries what would help, as a name: a dump template for a
 unit (`pg-dumpall`, `mariadb-dump`, `redis-rdb`, `mongodump`, `sqlite-backup`,
 `influx2-backup`, `prometheus-snapshot`), `sqlite-backup` (an online-backup
 copy by the daemon) or `source-snapshot` for a file source, `pause-always`
-for a split unit, `exclude-rebuild` for a search index, `group-units` for a
+for a unit split across instants and the engine's dump for one with files
+outside the capture (a pause cannot bring them in), `exclude-rebuild` for a search index, `group-units` for a
 Nextcloud whose database is in another unit. A covered
 PostgreSQL, MySQL or MongoDB in a unit also names its dump as `optional`,
 for portability across major versions.

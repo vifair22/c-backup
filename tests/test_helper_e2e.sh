@@ -72,6 +72,13 @@ printf '42\n%s\n' "$WORK/pgsnap" > "$WORK/pgsnap/postmaster.pid"
 printf '#!/bin/sh\necho "-- fake dump as $4 ($*)"\necho "dumped" >&2\n' > "$WORK/bin/pg_dumpall"
 printf '#!/bin/sh\necho "PostgreSQL 16.4 (fake) $*"\n' > "$WORK/bin/psql"
 chmod 0755 "$WORK/bin/pg_dumpall" "$WORK/bin/psql"
+# B245's pgsplit: a live cluster whose pg_wal links to /wal, a bind the
+# unit does not back up; the probe's mounts say so.
+mkdir -p "$WORK/pgsplit/global" "$WORK/pgsplit/base/1" "$WORK/pool/app/s"
+echo 16 > "$WORK/pgsplit/PG_VERSION"
+head -c 8192 /dev/zero > "$WORK/pgsplit/global/pg_control"
+printf '42\n/var/lib/postgresql/data\n' > "$WORK/pgsplit/postmaster.pid"
+ln -s /wal "$WORK/pgsplit/pg_wal"
 # The tree root as read: a mode and a time no staging directory has (B168).
 chmod 0751 "$WORK/snap"
 touch -d @1500000000 "$WORK/snap"
@@ -90,6 +97,12 @@ cat > "$WORK/units.json" <<EOF
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}],"probe_fail":true},
  {"id":"d","name":"cbk-uat-d","state":"running","caps":["quiesce","snapshot"],
   "trees":[{"id":"pg","read_root":"$WORK/pgsnap","path":"$WORK/pool/app/d","source":"$WORK/pool/app/d"}]},
+ {"id":"s","name":"cbk-uat-s","state":"running","caps":["quiesce","snapshot"],
+  "trees":[{"id":"pg","read_root":"$WORK/pgsplit","path":"$WORK/pool/app/s","source":"$WORK/pool/app/s"}],
+  "probe":{"containers":[{"name":"pgsplit","image":"postgres:16","running":true,
+           "processes":[{"comm":"postgres","args":"postgres"}],
+           "mounts":[{"dest":"/var/lib/postgresql/data","recorded":"$WORK/pool/app/s"},
+                     {"dest":"/wal","recorded":null}]}]}},
  {"id":"p","name":"prod-db","state":"running",
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"secret"}]}
 ]}
@@ -440,6 +453,15 @@ OUT=$(cb db dismiss 1 "$FID" --reason "test data")
 contains "dismiss stops it" '"state":"dismissed"' "$OUT"
 OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
 lacks    "a dismissed finding runs nothing" 'dump(s) failed' "$OUT"
+# B245: a pg_wal on a bind the unit does not back up is split, not
+# covered-crash, and the dump is suggested.
+OUT=$(cb unit backup 1 --provider fake cbk-uat-s)
+contains "a unit with a relocated pg_wal backs up" '"engine":"postgres"' "$OUT"
+contains "and is split" '"coverage":"split"' "$OUT"
+contains "the link judged, not left unchecked" '"found":"outside the capture"' "$OUT"
+lacks    "never unchecked" '"found":"unchecked"' "$OUT"
+contains "naming pg_wal" '"kind":"pg_wal","target":"/wal"' "$OUT"
+contains "with the dump suggested" '"suggestion":"pg-dumpall"' "$OUT"
 
 echo "a daemon killed mid-backup"
 # B169: the helper held the backup's export hold until its own restart or

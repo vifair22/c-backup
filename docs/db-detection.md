@@ -723,7 +723,7 @@ design left open or sketched differently:
 | Unchanged files | `file_cache.db_head` (migration 011) keeps the classification of each file read; a cache hit uses it. The upsert resets it when a file changes. A file unchanged since before detection existed is not classified until it changes; directory engines are found by names regardless |
 | unit.json | Stored after the unit's trees (`backup_synth_t.late`), so `databases` can say what reading them found. Additive: version stays 1 |
 | Unit coverage | From each tree item's capabilities and the session: a snapshot-domain tree read from the snapshot is atomic; a fallback tree is paused when begin held the pause and the watchdog did not let it go, live otherwise. At `crash` or better the provider guarantees one instant; below it each tree counts as its own instant, conservative for several datasets of one pool |
-| Links in containers | A tablespace, `pg_wal` or `journal` link inside a container names a container path, not a recorded one, so in a unit it is listed `unchecked` and not judged. File sources check it: the target must be a scanned tablespace (`PG_<v>_<cat>/`), WAL (`archive_status/`) or journal (`WiredTigerLog.*`) directory under a captured root, or the finding is `split` |
+| Links in containers | A tablespace, `pg_wal` or `journal` link inside a container names a container path, not a recorded one; it is followed through the probe's mounts (14.7, B245), and listed `unchecked` only without them. File sources check it: the target must be a scanned tablespace (`PG_<v>_<cat>/`), WAL (`archive_status/`) or journal (`WiredTigerLog.*`) directory under a captured root, or the finding is `split` |
 | Names only where a header is unknown | A header decides when the backup read one. Without one (the cache vouched), directory layouts are judged by names; single-file engines (SQLite, RDB, bbolt) never are. `data.mdb` and `CURRENT` that were read and are not LMDB or a MANIFEST pointer veto their directory |
 | Prometheus | `queries.active` stands in for block directories, which a server younger than two hours does not have yet |
 | MyISAM and Aria | Counted for `engine-unsafe` only outside `mysql/`, `performance_schema/` and `sys/`: MariaDB's own system tables are Aria on every install |
@@ -843,3 +843,25 @@ database by its plain path, and is still a transactional copy of one commit.
 | Not from the source snapshot | A source read from a ZFS or btrfs snapshot (9.4) is already `covered-crash`; the copy still reads the live path, now without changing it |
 | Leftovers | `-wal` and `-shm` files earlier builds left are not removed: the backup does not write the source. They are read through, and go when the application next closes the database cleanly |
 | Tests | `tests/test_db_capture.c`: the source directory byte-, listing- and mtime-identical (the directory's own mtime included) around a copy of a dormant WAL database, one with leftover siblings, a rollback database, a WAL database a writer in another process holds with commits in its `-wal`, and a crashed writer's; and around two whole backups with engine copies, the second reading as many files as the first |
+
+### 14.7 Links out of a unit's capture (B245)
+
+A PostgreSQL whose `pg_wal` was a symlink to `/wal`, a bind of a disk path
+outside every include root, was judged `covered-crash` with the link
+`unchecked`: the daemon only had container paths for the link and
+recorded paths for the data. A restore of it has no WAL. Decided:
+`units.probe` carries each container's mounts, destination and recorded
+path (`null` when the unit does not back it up), and the detector follows
+the link.
+
+| Point | As built |
+|---|---|
+| The wire | `mounts:[{dest, recorded}]` per container, at most 64, built from the same mount classification the probe's open files use (Docker's inspect `Mounts`, LXC's config with the rootfs at `/`). An excluded mount's host source is never sent: only its destination, which is a container path. Listed for a stopped container too. Shed after processes when the packet is full |
+| The container | The one whose backed-up mount holds the finding's data (longest recorded prefix). The target is judged against that container's mounts only |
+| A target on a mount the unit does not back up | `split`, link `found: "outside the capture"` with `why` |
+| A target on no mount (Docker's image layers) | `split`, likewise: a container unit backs up its mounts, never its writable layer |
+| A target on a backed-up mount | Mapped to its recorded path (evidence `recorded`) and judged as a file source's link: the WAL, tablespace or journal directory must have been scanned under a root of this capture, and its root's instant counts toward `split` |
+| No mounts from the probe | `unchecked`, as before: a helper older than this, a probe that failed, or a packet that shed them. Never a guess |
+| Suggestion | A unit split by a link outside its capture suggests the engine's dump (`pg-dumpall`), not `pause-always`: a pause joins instants, it cannot add files the unit does not read (6). Split by instants alone still suggests `pause-always`. A file source keeps `source-snapshot` |
+| Tests | `tests/test_db_detect.c`: a file source's WAL on disk but outside every root; a unit's `/wal` on an excluded bind, on a backed-up mount outside the capture, inside it at one instant and at two, on no mount, and with no mounts; `tests/test_unit_probe.c`: the wire and the helper's mount list |
+

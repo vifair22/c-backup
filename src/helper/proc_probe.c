@@ -526,3 +526,18 @@ status_t proc_probe_container(const char *proc_root, int pid, const proc_mount_t
     qsort(c->ports, c->n_ports, sizeof(*c->ports), cmp_u16);
     return OK;
 }
+
+status_t probe_mounts(sp_probe_container_t *c, const proc_mount_t *mounts, size_t n, int *truncated)
+{
+    if (n > SP_PROBE_MOUNTS_MAX) { *truncated = 1; n = SP_PROBE_MOUNTS_MAX; }
+    if (!n) return OK;
+    if (!(c->mounts = calloc(n, sizeof(*c->mounts)))) return set_error(ERR_NOMEM, "units.probe");
+    for (size_t i = 0; i < n; i++) {
+        sp_probe_mount_t *m = &c->mounts[i];
+        c->n_mounts = i + 1;
+        if (!(m->dest = strdup(mounts[i].dest)) ||
+            (mounts[i].recorded && !(m->recorded = strdup(mounts[i].recorded))))
+            return set_error(ERR_NOMEM, "units.probe");
+    }
+    return OK;
+}
