@@ -27,6 +27,21 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/*
+ * A marker's hold id from its file name, "<digits>.json". The caller has
+ * already filtered the shape; this refuses an id that overflows rather than
+ * silently clamping it, so an out-of-range marker is skipped, not misread.
+ */
+static int marker_id(const char *name, int64_t *out)
+{
+    char *end = NULL;
+    errno = 0;
+    long long v = strtoll(name, &end, 10);
+    if (errno != 0 || end == name || strcmp(end, ".json") != 0 || v < 0) return -1;
+    *out = (int64_t)v;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* The hold journal, persisted                                         */
 /* ------------------------------------------------------------------ */
@@ -45,7 +60,11 @@ status_t hj_save(helper_server_t *s)
         cJSON_AddStringToObject(o, "unit", s->holds[i].unit);
         cJSON_AddStringToObject(o, "kind", s->holds[i].kind);
         cJSON_AddStringToObject(o, "detail", s->holds[i].detail);
-        cJSON_AddNumberToObject(o, "created", (double)(s->holds[i].created_ms / 1000));
+        {
+            /* Whole seconds on purpose: the journal records second resolution. */
+            int64_t created_s = s->holds[i].created_ms / 1000;
+            cJSON_AddNumberToObject(o, "created", (double)created_s);
+        }
     }
     char *txt = a ? cJSON_PrintUnformatted(a) : NULL;
     cJSON_Delete(a);
@@ -120,7 +139,9 @@ static cJSON *hold_json(const hold_t *h)
     cJSON_AddStringToObject(o, "unit", h->unit);
     cJSON_AddStringToObject(o, "kind", h->kind);
     cJSON_AddStringToObject(o, "detail", h->detail);
-    cJSON_AddNumberToObject(o, "created", (double)(h->created_ms / 1000));
+    /* Whole seconds on purpose: the journal records second resolution. */
+    int64_t created_s = h->created_ms / 1000;
+    cJSON_AddNumberToObject(o, "created", (double)created_s);
     return o;
 }
 
@@ -373,7 +394,11 @@ static int markers_read(const helper_server_t *s, holdvec_t *hv, unsigned *bad)
         cJSON *o = NULL;
         if (slurp(path, 16384, &buf, &len) == 0) o = cJSON_ParseWithLength(buf, len);
         free(buf);
-        long long want = atoll(e->d_name);
+        int64_t want = 0;
+        if (marker_id(e->d_name, &want) != 0) {
+            cJSON_Delete(o);
+            continue;
+        }
         size_t before = hv->n;
         if (!o || hold_parse(o, hv) != 0 || hv->v[hv->n - 1].id != want) {
             if (hv->n > before) hv->n = before;
@@ -403,7 +428,8 @@ static void markers_prune(helper_server_t *s, const holdvec_t *jv)
         if (nl < 6 || strcmp(e->d_name + nl - 5, ".json") != 0 ||
             strspn(e->d_name, "0123456789") != nl - 5)
             continue;
-        int64_t id = (int64_t)atoll(e->d_name);
+        int64_t id = 0;
+        if (marker_id(e->d_name, &id) != 0) continue;
         if (id > s->next_hold) s->next_hold = id;
         if (holdvec_has(jv, id)) continue;
         if (n == cap) {
