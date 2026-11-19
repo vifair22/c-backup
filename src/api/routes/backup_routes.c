@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "db_readers.h"
 #include "pack_presence.h"
 #include "json_row.h"
 
@@ -945,10 +946,12 @@ static api_response_t list_jobs(const api_request_t *req, void *ud)
     snprintf(lim, sizeof(lim), "%d", limit);
     snprintf(off, sizeof(off), "%d", offset);
 
-    db_result_t *r = NULL;
-    if (db_execute(ctx->db, JOB_COLUMNS " ORDER BY id DESC LIMIT ? OFFSET ?",
-                   (const char *[]){ lim, off, NULL }, &r) != 0) {
-        db_result_free(r);
+    /* On a reader (B269): a verify or a backup holding the shared
+     * connection kept GET /jobs waiting for minutes. */
+    db_rows_t *r = NULL;
+    if (db_read_rows(ctx->db, 0, JOB_COLUMNS " ORDER BY id DESC LIMIT ? OFFSET ?",
+                     (const char *[]){ lim, off, NULL }, &r) != 0) {
+        db_rows_free(r);
         return api_error(500, "cannot list jobs");
     }
     cJSON *root = cJSON_CreateObject();
@@ -957,7 +960,7 @@ static api_response_t list_jobs(const api_request_t *req, void *ud)
         cJSON *j = job_json(ctx->db, r->rows[i]);
         if (j) cJSON_AddItemToArray(arr, j);
     }
-    db_result_free(r);
+    db_rows_free(r);
     return json_out(root);
 }
 
@@ -1003,14 +1006,16 @@ static api_response_t get_job(const api_request_t *req, void *ud)
 
     char idbuf[32];
     snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
-    db_result_t *r = NULL;
-    if (db_execute(ctx->db, JOB_COLUMNS " WHERE id = ?",
-                   (const char *[]){ idbuf, NULL }, &r) != 0 || !r || r->nrows != 1) {
-        db_result_free(r);
+    /* On a reader (B269): GET /jobs/<id> waited over 120 s on FS1 behind
+     * a verify holding the shared connection. */
+    db_rows_t *r = NULL;
+    if (db_read_rows(ctx->db, 0, JOB_COLUMNS " WHERE id = ?",
+                     (const char *[]){ idbuf, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_rows_free(r);
         return api_error(404, "no such job");
     }
     cJSON *j = job_json(ctx->db, r->rows[0]);
-    db_result_free(r);
+    db_rows_free(r);
     return json_out(j);
 }
 
