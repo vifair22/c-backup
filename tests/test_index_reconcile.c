@@ -40,6 +40,7 @@
 #include "db_txn.h"
 #include "routes.h"
 #include "index_reconcile.h"
+#include "job_manager.h"
 #include "reindex.h"
 #include "repo.h"
 #include "replicate.h"
@@ -582,6 +583,90 @@ static void test_indexing_a_gap_commits_in_batches(void **state)
     assert_true(scalar(sql) >= 6000);
 }
 
+/*
+ * B264: the start-up reconcile's job indexes the one record the index lost
+ * and nothing else. It ran a full reindex_repo for it - every snapshot
+ * rebuilt, 1,596 s on a 91-snapshot repository, progress 0/0 - with the
+ * queued backups waiting behind it. The snapshots already indexed keep
+ * their rows untouched (a full reindex replaces them), and the job counts
+ * the snapshots it indexes.
+ */
+static status_t startup_submit(int64_t rid, void *ctx, int64_t *out_job_id)
+{
+    return routes_submit_startup_reindex(ctx, rid, out_job_id);
+}
+
+static void test_start_up_indexes_only_the_missing_snapshot(void **state)
+{
+    (void)state;
+    char content[32];
+    for (int i = 1; i <= 8; i++) {
+        snprintf(content, sizeof(content), "version %d\n", i);
+        backup_once(content);
+    }
+    /* Snapshot 4's rows lost, its record kept: a gap among indexed ones. */
+    exec_repo("DELETE FROM nodes WHERE repo_id = ? AND snap_id = 4");
+    exec_repo("DELETE FROM snapshots WHERE repo_id = ? AND id = 4");
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 7);
+    long long before = scalar("SELECT SUM(rowid) FROM nodes WHERE repo_id = ? AND snap_id <> 4");
+    long long nbefore = scalar("SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id <> 4");
+    assert_true(nbefore > 0);
+
+    job_manager_t *jm = NULL;
+    assert_int_equal(job_manager_start(db, 1, &jm), OK);
+    routes_snapshots_init(db, jm);
+    reconcile_result_t rr;
+    assert_int_equal(index_reconcile(db, startup_submit, jm, &rr), OK);
+    assert_int_equal(rr.snapshots_missing, 1);
+    assert_int_equal(rr.jobs_submitted, 1);
+    for (int i = 0; i < 6000 &&
+         scalar("SELECT COUNT(*) FROM jobs WHERE repo_id = ? AND state IN ('queued','running')") != 0; i++)
+        nanosleep(&(struct timespec){ 0, 5000000L }, NULL);
+    job_manager_stop(jm);
+    routes_snapshots_init(NULL, NULL);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT state, action, origin, COALESCE(result, ''), progress_phase,"
+        "       progress_current, progress_total FROM jobs", NULL, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    print_message("job: %s %s %s %s %s %s/%s\n", r->rows[0][0], r->rows[0][1], r->rows[0][2],
+                  r->rows[0][3], r->rows[0][4], r->rows[0][5], r->rows[0][6]);
+    assert_string_equal(r->rows[0][0], "completed");
+    assert_string_equal(r->rows[0][1], "reindex");
+    assert_string_equal(r->rows[0][2], "startup");
+    assert_string_equal(r->rows[0][3], "{\"snapshots_indexed\":1,\"gaps_only\":true}");
+    /* Real progress: the one snapshot, of one. */
+    assert_string_equal(r->rows[0][5], "1");
+    assert_string_equal(r->rows[0][6], "1");
+    db_result_free(r);
+
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 8);
+    assert_true(scalar("SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = 4") > 0);
+    /* Every other snapshot's rows are the ones it had. */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id <> 4"),
+                     nbefore);
+    assert_int_equal(scalar("SELECT SUM(rowid) FROM nodes WHERE repo_id = ? AND snap_id <> 4"),
+                     before);
+    /* And it restores. */
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.overwrite = 1;
+    restore_result_t rres;
+    memset(&rres, 0, sizeof(rres));
+    assert_int_equal(mkdir(TEST_DIR "/out", 0700), 0);
+    assert_int_equal(restore_run(store, db, repo_id, 4, TEST_DIR "/out", &ro, &rres), OK);
+    char got[64] = "";
+    char p[512];
+    snprintf(p, sizeof(p), TEST_DIR "/out%s/a.txt", TEST_SRC);
+    FILE *f = fopen(p, "r");
+    assert_non_null(f);
+    assert_non_null(fgets(got, sizeof(got), f));
+    fclose(f);
+    assert_string_equal(got, "version 4\n");
+}
+
 /* A record that cannot be indexed refuses the gc, naming it, and nothing
  * is swept around it. A dry run refuses while any gap is there. */
 static void test_gc_refuses_a_gap_it_cannot_index(void **state)
@@ -993,6 +1078,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_coalescing_keeps_a_gap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replication_carries_a_gap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_indexing_a_gap_commits_in_batches, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_start_up_indexes_only_the_missing_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_refuses_a_gap_it_cannot_index, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_full_disk_in_index_nodes_reports_the_written_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_full_disk_at_the_snapshot_row_reports_the_written_snapshot, setup, teardown),

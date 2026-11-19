@@ -244,7 +244,7 @@ status_t index_reconcile(cutils_db_t *db, reconcile_submit_fn submit, void *ctx,
         out->jobs_submitted++;
         log_warn("reconcile: repo %lld (%s) has %llu snapshot(s) missing from the "
                  "index, lost with the last moments before a power cut or crash, or "
-                 "left by a backup whose index did not commit; reindexing it as job %lld",
+                 "left by a backup whose index did not commit; indexing them as job %lld",
                  (long long)repo_id, path, (unsigned long long)missing,
                  (long long)job_id);
     }
