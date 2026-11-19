@@ -716,9 +716,9 @@ build:image:uat:
     - docker ps --filter name=smoke-uat --filter status=running | grep -q smoke-uat
     - docker logs smoke-uat
     - docker rm -f smoke-uat
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
-    - docker push "$CI_REGISTRY_IMAGE:uat-$CI_COMMIT_SHORT_SHA"
-    - docker push "$CI_REGISTRY_IMAGE:uat"
+    - retry registry_login
+    - retry docker push "$CI_REGISTRY_IMAGE:uat-$CI_COMMIT_SHORT_SHA"
+    - retry docker push "$CI_REGISTRY_IMAGE:uat"
   only:
     - /^uat\//
 
@@ -734,9 +734,9 @@ build:image:uat-asan:
     - docker ps --filter name=smoke-uat-asan --filter status=running | grep -q smoke-uat-asan
     - docker logs smoke-uat-asan
     - docker rm -f smoke-uat-asan
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
-    - docker push "$CI_REGISTRY_IMAGE:uat-asan-$CI_COMMIT_SHORT_SHA"
-    - docker push "$CI_REGISTRY_IMAGE:uat-asan"
+    - retry registry_login
+    - retry docker push "$CI_REGISTRY_IMAGE:uat-asan-$CI_COMMIT_SHORT_SHA"
+    - retry docker push "$CI_REGISTRY_IMAGE:uat-asan"
   only:
     - /^uat\//
 
@@ -753,8 +753,8 @@ build:image:uat-tsan:
     - docker ps --filter name=smoke-uat-tsan --filter status=running | grep -q smoke-uat-tsan
     - docker logs smoke-uat-tsan
     - docker rm -f smoke-uat-tsan
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
-    - docker push "$CI_REGISTRY_IMAGE:uat-tsan-$CI_COMMIT_SHORT_SHA"
-    - docker push "$CI_REGISTRY_IMAGE:uat-tsan"
+    - retry registry_login
+    - retry docker push "$CI_REGISTRY_IMAGE:uat-tsan-$CI_COMMIT_SHORT_SHA"
+    - retry docker push "$CI_REGISTRY_IMAGE:uat-tsan"
   only:
     - /^uat\//
