@@ -37,7 +37,9 @@
 
 #include <cutils/log.h>
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -45,7 +47,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -186,6 +190,51 @@ static void export_end(export_t *e, const char *reason)
     free(e);
 }
 
+/* Whether a unix socket has nobody listening on it: a connect refused. */
+static int socket_dead(const char *path)
+{
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(sa.sun_path)) return 0;
+    memcpy(sa.sun_path, path, strlen(path) + 1);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 0;
+    int dead = connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 && errno == ECONNREFUSED;
+    close(fd);
+    return dead;
+}
+
+/*
+ * The sockets a daemon killed with SIGKILL left behind (B257): it never ran
+ * nbd_server_stop, so <id>.sock stayed in export_dir through every restart
+ * after. Only this daemon's naming, only sockets, and only one nobody
+ * answers on: a second daemon pointed at the same directory by mistake
+ * keeps its live exports.
+ */
+static void sweep_stale_sockets(void)
+{
+    DIR *d = opendir(g_dir);
+    if (!d) return;                     /* not made yet: nothing left in it */
+    unsigned n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *nm = de->d_name;
+        size_t len = strlen(nm), digits = strspn(nm, "0123456789");
+        if (digits == 0 || len != digits + 5 || strcmp(nm + digits, ".sock") != 0) continue;
+        char p[PATH_MAX];
+        if (snprintf(p, sizeof(p), "%s/%s", g_dir, nm) >= (int)sizeof(p)) continue;
+        struct stat sb;
+        if (fstatat(dirfd(d), nm, &sb, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISSOCK(sb.st_mode)) continue;
+        if (!socket_dead(p)) continue;
+        if (unlinkat(dirfd(d), nm, 0) == 0) n++;
+        else log_warn("exports: cannot remove the stale socket %s: %s", p, strerror(errno));
+    }
+    closedir(d);
+    if (n) log_info("exports: removed %u stale export socket%s a previous run left in %s",
+                    n, n == 1 ? "" : "s", g_dir);
+}
+
 void routes_exports_init(cutils_db_t *db, const char *dir, unsigned ttl_s, unsigned idle_s,
                          unsigned max_conns)
 {
@@ -201,6 +250,7 @@ void routes_exports_init(cutils_db_t *db, const char *dir, unsigned ttl_s, unsig
                      " WHERE closed_at IS NULL",
                  (const char *[]){ now, NULL }, NULL) != 0)
         log_warn("exports: cannot close the rows a previous run left open");
+    sweep_stale_sockets();
 }
 
 void exports_tick(void)

@@ -459,7 +459,9 @@ Deleting a snapshot is not a job: it is a few row deletes and one unlink,
 answered in the response. GC reclaims the space later. A tagged snapshot is
 refused with `409` and an error naming its tags (`snapshot 3 is tagged
 (guard)...`) unless `force=1`, which deletes it and its tags, from the
-database and from the repository's own tag file. `tags_removed` counts
+database and from the repository's own tag file. A snapshot an open NBD
+export pins is refused with `409` naming the export (`snapshot 3 is
+exported (export 9)...`), `force=1` or not. `tags_removed` counts
 them. A snapshot that does not exist, including one already deleted, is
 `404 {"error":"no such snapshot"}`; `force` other than `1`/`true`/`0`/`false`
 is `400`; `503` while a job holds the repository. Each delete that runs is
