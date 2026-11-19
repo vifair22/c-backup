@@ -11,6 +11,7 @@
 #include "parity.h"
 #include "repo.h"
 #include "db_write.h"
+#include "db_readers.h"
 
 #include <cutils/log.h>
 
@@ -151,8 +152,8 @@ static void paths_of(cutils_db_t *db, const char *repo, const char *hex,
     size_t off = 0;
     paths[0] = '\0';
     *out_files = *out_versions = 0;
-    db_result_t *r = NULL;
-    if (db_execute(db,
+    db_rows_t *r = NULL;
+    if (db_read_rows(db, 1,
             "WITH RECURSIVE up(snap, parent, path, depth) AS ("
             "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
             "    FROM nodes n WHERE n.repo_id = ?1 AND n.content_hash = ?2"
@@ -170,7 +171,7 @@ static void paths_of(cutils_db_t *db, const char *repo, const char *hex,
             off += (size_t)w;
         }
     }
-    db_result_free(r);
+    db_rows_free(r);
 }
 
 static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
@@ -194,7 +195,7 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     char paths[FINDING_SAMPLE_PATHS * (PATH_MAX + 2)];
     uint64_t n_files = 0, n_versions = 0;
     paths_of(db, repo, hex, &n_files, &n_versions, paths, sizeof(paths));
-    db_result_t *r = NULL;
+    db_rows_t *r = NULL;
 
     /* The list is capped so the row stays readable; the count is not, and
      * the truncated flag says when the list is short of it. Silently
@@ -203,7 +204,7 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     snaps[0] = '\0';
     uint64_t n_snaps = 0;
     r = NULL;
-    if (db_execute(db,
+    if (db_read_rows(db, 1,
             "SELECT snap_id, COUNT(*) OVER () FROM"
             " (SELECT DISTINCT snap_id FROM nodes"
             "   WHERE repo_id = ? AND content_hash = ?)"
@@ -218,7 +219,7 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
             so += (size_t)w;
         }
     }
-    db_result_free(r);
+    db_rows_free(r);
 
     char nf[32], nv[32], ns[32];
     snprintf(nf, sizeof(nf), "%llu", (unsigned long long)n_files);
@@ -282,8 +283,8 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
 
-    db_result_t *r = NULL;
-    if (db_execute(db,
+    db_rows_t *r = NULL;
+    if (db_read_rows(db, 1,
             "WITH RECURSIVE lost(h) AS ("
             "  SELECT DISTINCT hash FROM verify_findings"
             "   WHERE run_id = ?2 AND status NOT IN ('repaired', 'recoverable')"
@@ -309,7 +310,7 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     } else {
         log_warn("verify: cannot total the blast radius of run %s", run);
     }
-    db_result_free(r);
+    db_rows_free(r);
 }
 
 /*
@@ -331,16 +332,16 @@ static uint64_t record_node_rule(cutils_db_t *db, int64_t repo_id, int64_t run_i
     uint64_t n_files = 0, n_versions = 0;
     char sql[2048];
 
-    db_result_t *r = NULL;
+    db_rows_t *r = NULL;
     snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM nodes n WHERE %s", cond);
-    if (db_execute(db, sql, (const char *[]){ repo, NULL }, &r) != 0 || !r ||
+    if (db_read_rows(db, 1, sql, (const char *[]){ repo, NULL }, &r) != 0 || !r ||
         r->nrows != 1) {
-        db_result_free(r);
+        db_rows_free(r);
         log_warn("verify: cannot check the index for \"%s\"", status);
         return 0;
     }
     n_versions = strtoull(r->rows[0][0], NULL, 10);
-    db_result_free(r);
+    db_rows_free(r);
     if (n_versions == 0) return 0;
 
     r = NULL;
@@ -353,7 +354,7 @@ static uint64_t record_node_rule(cutils_db_t *db, int64_t repo_id, int64_t run_i
              VERIFY_ROOTED
              " GROUP BY path ORDER BY path LIMIT " VERIFY_STR(FINDING_SAMPLE_PATHS),
              cond);
-    if (db_execute(db, sql, (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows > 0) {
+    if (db_read_rows(db, 1, sql, (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows > 0) {
         n_files = strtoull(r->rows[0][1], NULL, 10);
         for (int i = 0; i < r->nrows && i < FINDING_SAMPLE_PATHS; i++) {
             int w = snprintf(paths + off, paths_sz - off, "%s%s",
@@ -362,7 +363,7 @@ static uint64_t record_node_rule(cutils_db_t *db, int64_t repo_id, int64_t run_i
             off += (size_t)w;
         }
     }
-    db_result_free(r);
+    db_rows_free(r);
 
     char snaps[FINDING_SNAPSHOT_IDS * 24];
     snaps[0] = '\0';
@@ -372,7 +373,7 @@ static uint64_t record_node_rule(cutils_db_t *db, int64_t repo_id, int64_t run_i
              "SELECT snap_id, COUNT(*) OVER () FROM"
              " (SELECT DISTINCT n.snap_id AS snap_id FROM nodes n WHERE %s)"
              " ORDER BY snap_id LIMIT " VERIFY_STR(FINDING_SNAPSHOT_IDS), cond);
-    if (db_execute(db, sql, (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows > 0) {
+    if (db_read_rows(db, 1, sql, (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows > 0) {
         n_snaps = strtoull(r->rows[0][1], NULL, 10);
         size_t so = 0;
         for (int i = 0; i < r->nrows && i < FINDING_SNAPSHOT_IDS; i++) {
@@ -382,7 +383,7 @@ static uint64_t record_node_rule(cutils_db_t *db, int64_t repo_id, int64_t run_i
             so += (size_t)w;
         }
     }
-    db_result_free(r);
+    db_rows_free(r);
 
     char nf[32], nv[32], ns[32];
     snprintf(nf, sizeof(nf), "%llu", (unsigned long long)n_files);
@@ -668,11 +669,11 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    db_result_t *packs = NULL;
-    if (db_execute(db, "SELECT DISTINCT pack_id FROM pack_objects WHERE repo_id = ?"
+    db_rows_t *packs = NULL;
+    if (db_read_rows(db, 1, "SELECT DISTINCT pack_id FROM pack_objects WHERE repo_id = ?"
                        " ORDER BY pack_id",
                    (const char *[]){ repo, NULL }, &packs) != 0 || !packs) {
-        db_result_free(packs);
+        db_rows_free(packs);
         return set_error(ERR_IO, "verify: cannot list packs");
     }
     for (int p = 0; p < packs->nrows; p++) {
@@ -758,7 +759,7 @@ static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
                        needs_key ? "unwalkable pack: salvage needs the repository key"
                                  : "unwalkable pack");
     }
-    db_result_free(packs);
+    db_rows_free(packs);
     return OK;
 }
 
@@ -846,13 +847,13 @@ static status_t verify_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    db_result_t *roots = NULL;
-    if (db_execute(db,
+    db_rows_t *roots = NULL;
+    if (db_read_rows(db, 1,
             "SELECT DISTINCT n.content_hash FROM nodes n"
             "  JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
             " WHERE n.repo_id = ? AND o.type = 6",
             (const char *[]){ repo, NULL }, &roots) != 0) {
-        db_result_free(roots);
+        db_rows_free(roots);
         return set_error(ERR_IO, "verify: cannot list chunk lists");
     }
     if (lost->n) qsort(lost->h, lost->n, OBJECT_HASH_SIZE, hash_cmp_raw);
@@ -896,7 +897,7 @@ static status_t verify_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
         if (why) record_finding(db, repo_id, res->run_id, roots->rows[i][0], why);
     }
-    db_result_free(roots);
+    db_rows_free(roots);
     return st;
 }
 
@@ -1175,8 +1176,8 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * difference between a scrub that finishes overnight and one that does
      * not.
      */
-    db_result_t *objs = NULL;
-    if (db_execute(db,
+    db_rows_t *objs = NULL;
+    if (db_read_rows(db, 1,
             "SELECT o.hash, o.location, COALESCE(po.pack_id, -1),"
             "       COALESCE(po.offset, 0), COALESCE(o.orig_size, 0)"
             "  FROM objects o"
@@ -1186,7 +1187,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             " ORDER BY CASE WHEN po.pack_id IS NULL THEN 1 ELSE 0 END,"
             "          po.pack_id, po.offset",
             (const char *[]){ repo, NULL }, &objs) != 0 || !objs) {
-        db_result_free(objs);
+        db_rows_free(objs);
         return set_error(ERR_IO, "verify: cannot list objects");
     }
 
@@ -1323,7 +1324,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
     }
 
-    db_result_free(objs);
+    db_rows_free(objs);
 
     /* The loop reports each object before checking it, so its last report
      * is total - 1: an index verify, which has no later phase, ended every

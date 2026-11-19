@@ -70,11 +70,37 @@ int db_readers_locate(int64_t repo_id, const char *hex, uint64_t cols[6]);
  * For a check before a write that is the right answer: a repository or a
  * snapshot that is not committed does not exist yet.
  */
-#define DB_READERS_COLS 16
+#define DB_READERS_COLS 32
 int db_readers_rows(const char *sql, const char *const *params,
                     int (*fn)(void *ctx, int ncols, const char *const *cols), void *ctx);
 /* 1 when sql returns a row, 0 when it returns none, -1 as above. */
 int db_readers_exists(const char *sql, const char *const *params);
+
+/*
+ * The same on a connection for long reads, outside the pool (B269): a
+ * verify's scans of the whole index ran on the shared connection and held
+ * its mutex for minutes, so GET /jobs/<id> waited 120 s on FS1. These are
+ * never quiesced, so the checkpointer's locked round never waits for one.
+ */
+int db_readers_long_rows(const char *sql, const char *const *params,
+                         int (*fn)(void *ctx, int ncols, const char *const *cols), void *ctx);
+
+/*
+ * A whole result, laid out as c-utils' db_result_t is (rows[row][col], a
+ * NULL column as ""), but built here and freed with db_rows_free. Read on a
+ * reader - a long-read connection when long_read - unless this thread
+ * holds the write lock, and on db otherwise, or when no reader is open.
+ * 0, or -1 when the query failed.
+ */
+typedef struct {
+    char ***rows;
+    int     nrows;
+    int     ncols;
+} db_rows_t;
+struct cutils_db;
+int  db_read_rows(struct cutils_db *db, int long_read, const char *sql,
+                  const char **params, db_rows_t **out);
+void db_rows_free(db_rows_t *r);
 
 /*
  * Hold every pooled connection out of the database, and let them back in
