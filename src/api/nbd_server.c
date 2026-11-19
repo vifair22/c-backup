@@ -80,6 +80,8 @@
 #define OPT_MAX     4096u               /* longest option payload accepted */
 #define READ_MAX    (32u << 20)         /* advertised maximum block size */
 #define BS_DESC_MAX 2048u               /* block status descriptors per reply */
+#define SECTOR      512u                /* advertised minimum block size */
+#define PREF_BLOCK  4096u               /* advertised preferred block size */
 #define CONN_MAX    64u
 
 typedef struct conn conn_t;
@@ -251,8 +253,14 @@ static int info_opt(conn_t *c, uint32_t opt, const uint8_t *d, uint32_t len)
     if (opt_reply(fd, opt, REP_INFO, ex, sizeof(ex)) != 0) return -1;
     uint8_t bs[14];
     put16(bs, INFO_BLOCK_SIZE);
-    put32(bs + 2, 1);
-    put32(bs + 6, 4096);
+    /* 512, the size every disk client addresses in. Advertising 1 let QEMU
+     * take byte-granular extents at face value and round a partial-sector
+     * hole up to a whole zero sector, dropping the data that shared it
+     * (B250). An export whose size is not a multiple of 512 keeps 1: QEMU
+     * truncates the size to the minimum block, which would lose the tail.
+     * Unaligned requests are still served, not refused. */
+    put32(bs + 2, c->s->o.size % SECTOR == 0 ? SECTOR : 1u);
+    put32(bs + 6, PREF_BLOCK);
     put32(bs + 10, READ_MAX);
     if (opt_reply(fd, opt, REP_INFO, bs, sizeof(bs)) != 0) return -1;
     if (opt_reply(fd, opt, REP_ACK, NULL, 0) != 0) return -1;
@@ -375,11 +383,90 @@ static int req_error(conn_t *c, uint64_t cookie, uint32_t err, const char *msg)
 }
 
 typedef struct {
-    uint64_t off[BS_DESC_MAX];
-    uint64_t len[BS_DESC_MAX];
-    uint8_t  hole[BS_DESC_MAX];
+    uint64_t off[BS_DESC_MAX + 1];
+    uint64_t len[BS_DESC_MAX + 1];
+    uint8_t  hole[BS_DESC_MAX + 1];
     unsigned n, max;
 } runs_t;
+
+static uint64_t sector_down(uint64_t v) { return v & ~(uint64_t)(SECTOR - 1); }
+static uint64_t sector_up(uint64_t v)
+{
+    uint64_t d = sector_down(v);
+    return d == v ? v : d + SECTOR;
+}
+
+static void out_run(runs_t *o, uint64_t a, uint64_t b, int hole)
+{
+    if (b <= a) return;
+    if (o->n > 0 && o->hole[o->n - 1] == (uint8_t)hole &&
+        o->off[o->n - 1] + o->len[o->n - 1] == a) {
+        o->len[o->n - 1] += b - a;
+        return;
+    }
+    o->off[o->n] = a;
+    o->len[o->n] = b - a;
+    o->hole[o->n] = (uint8_t)hole;
+    o->n++;
+}
+
+/*
+ * Put every run boundary on a 512-byte boundary (B250). The reader reports
+ * holes at byte granularity, wherever a chunk ends, and a client working in
+ * sectors that is told a sector starts a hole treats the whole sector as
+ * zeroes: qemu-img convert dropped 2706 bytes of ext4 metadata that way and
+ * qemu-img compare still called the copy identical.
+ *
+ * So holes only shrink, to the whole sectors inside them, and the partial
+ * sectors at their edges are reported as data, which reads back as the
+ * zeroes and bytes it holds. Nothing holding data is ever called a hole;
+ * at worst a few hundred zero bytes are called data. A boundary stays
+ * unaligned only where the spec allows it: at the start of an unaligned
+ * query, at the end of the export, and at an unaligned end the caller
+ * forbids crossing (a read, or REQ_ONE). Data that ends unaligned is
+ * extended to the sector's end (or the export's), which the spec permits
+ * for the last descriptor of a block status reply.
+ *
+ * in holds runs contiguous from off; limit is where the last one may end at
+ * most. out gets at most in->n + 1 runs. A caller that may answer past an
+ * unaligned end asks the reader up to the sector boundary, so the last
+ * sector is classified from what it holds rather than called data blind.
+ */
+static void align_runs(const runs_t *in, uint64_t off, uint64_t limit, uint64_t size,
+                       runs_t *out)
+{
+    out->n = 0;
+    uint64_t cur = off, end = off;
+    for (unsigned i = 0; i < in->n; i++) {
+        uint64_t a = in->off[i], b = a + in->len[i];
+        end = b;
+        if (!in->hole[i]) continue;
+        /* One hole however many pieces the reader reported it in. */
+        while (i + 1 < in->n && in->hole[i + 1]) {
+            i++;
+            b = in->off[i] + in->len[i];
+            end = b;
+        }
+        uint64_t ha = sector_up(a);
+        if (ha < cur) ha = cur;
+        uint64_t hb = b >= size ? b : sector_down(b);
+        if (hb <= ha) continue;          /* no whole sector: stays data */
+        out_run(out, cur, ha, 0);
+        out_run(out, ha, hb, 1);
+        cur = hb;
+    }
+    if (cur < end) {
+        uint64_t e = end >= size ? end : sector_up(end);
+        if (e > size) e = size;
+        if (e > limit) e = limit;
+        if (e < end) e = end;
+        out_run(out, cur, e, 0);
+    }
+    /* Nothing past limit, holes included. */
+    while (out->n > 0 && out->off[out->n - 1] >= limit) out->n--;
+    if (out->n > 0 && out->off[out->n - 1] + out->len[out->n - 1] > limit)
+        out->len[out->n - 1] = limit - out->off[out->n - 1];
+}
 
 static int collect_run(void *ctx, uint64_t off, uint64_t len, int is_hole)
 {
@@ -393,7 +480,7 @@ static int collect_run(void *ctx, uint64_t off, uint64_t len, int is_hole)
 }
 
 static int do_read(conn_t *c, uint16_t flags, uint64_t cookie, uint64_t off, uint32_t len,
-                   uint8_t *buf, runs_t *runs)
+                   uint8_t *buf, runs_t *runs, runs_t *out)
 {
     nbd_server_t *s = c->s;
     if (len > READ_MAX) return req_error(c, cookie, E_OVERFLOW, "read over 32 MiB");
@@ -435,11 +522,13 @@ static int do_read(conn_t *c, uint16_t flags, uint64_t cookie, uint64_t off, uin
             runs->len[last] = off + len - runs->off[last];
         }
     }
-    for (unsigned i = 0; i < runs->n; i++) {
-        uint16_t done = i + 1 == runs->n ? (uint16_t)CH_FLAG_DONE : 0;
-        uint64_t ro = runs->off[i], rl = runs->len[i];
+    /* Chunks on sector boundaries as well; never past the request. */
+    align_runs(runs, off, off + len, c->size, out);
+    for (unsigned i = 0; i < out->n; i++) {
+        uint16_t done = i + 1 == out->n ? (uint16_t)CH_FLAG_DONE : 0;
+        uint64_t ro = out->off[i], rl = out->len[i];
         if (rl == 0) continue;
-        if (runs->hole[i]) {
+        if (out->hole[i]) {
             if (chunk_head(c->fd, done, CH_OFFSET_HOLE, cookie, 12) != 0) return -1;
             uint8_t p[12];
             put64(p, ro);
@@ -463,26 +552,46 @@ static int do_read(conn_t *c, uint16_t flags, uint64_t cookie, uint64_t off, uin
 }
 
 static int do_block_status(conn_t *c, uint16_t flags, uint64_t cookie, uint64_t off, uint32_t len,
-                           runs_t *runs)
+                           runs_t *runs, runs_t *out)
 {
     if (!c->structured || !c->meta)
         return req_error(c, cookie, E_INVAL, "no meta context negotiated");
     if (off > c->size || len > c->size - off || len == 0)
         return req_error(c, cookie, E_INVAL, "block status past the end");
+    /* Asked to the end of the sector holding the request's end: the reply
+     * may cover it, and the aligner then knows what that sector holds. */
+    uint64_t qend = sector_up(off + len);
+    if (qend > c->size) qend = c->size;
     runs->n = 0;
-    runs->max = (flags & CMD_FLAG_REQ_ONE) ? 1 : BS_DESC_MAX;
-    if (c->s->o.ops.extents(c->reader, off, len, collect_run, runs) != OK || runs->n == 0) {
+    /* REQ_ONE still gathers a few runs: a hole the reader reports in
+     * pieces is one descriptor, and the aligner needs to see past a
+     * partial sector to classify it. */
+    runs->max = (flags & CMD_FLAG_REQ_ONE) ? 16 : BS_DESC_MAX;
+    if (c->s->o.ops.extents(c->reader, off, qend - off, collect_run, runs) != OK || runs->n == 0) {
         log_warn("nbd export: block status at %llu: %s", (unsigned long long)off, err_msg());
         return req_error(c, cookie, E_IO, "the snapshot could not be read here; see the daemon log");
     }
-    uint32_t clen = 4u + runs->n * 8u;
+    /* Sector-aligned (B250). Without REQ_ONE the last descriptor may run
+     * past the request to the next sector boundary, as the spec allows;
+     * with it, it must not. */
+    int one = (flags & CMD_FLAG_REQ_ONE) != 0;
+    align_runs(runs, off, one ? off + len : c->size, c->size, out);
+    if (one && out->n > 1) out->n = 1;
+    for (unsigned i = 0; i < out->n; i++) {
+        /* Only a 4 GiB query extended to its sector's end can overflow a
+         * descriptor: end it on the last sector boundary that fits. */
+        if (out->len[i] > 0xffffffffu) {
+            out->len[i] = sector_down(out->off[i] + 0xffffffffu) - out->off[i];
+            out->n = i + 1;
+        }
+    }
+    uint32_t clen = 4u + out->n * 8u;
     uint8_t *p = malloc(clen);
     if (!p) return req_error(c, cookie, E_NOMEM, "out of memory");
     put32(p, META_ID);
-    for (unsigned i = 0; i < runs->n; i++) {
-        uint64_t l = runs->len[i];
-        put32(p + 4 + i * 8, (uint32_t)(l > 0xffffffffu ? 0xffffffffu : l));
-        put32(p + 8 + i * 8, runs->hole[i] ? (STATE_HOLE | STATE_ZERO) : 0);
+    for (unsigned i = 0; i < out->n; i++) {
+        put32(p + 4 + i * 8, (uint32_t)out->len[i]);
+        put32(p + 8 + i * 8, out->hole[i] ? (STATE_HOLE | STATE_ZERO) : 0);
     }
     int r = chunk_head(c->fd, CH_FLAG_DONE, CH_BLOCK_STATUS, cookie, clen);
     if (r == 0) r = wr(c->fd, p, clen);
@@ -493,7 +602,7 @@ static int do_block_status(conn_t *c, uint16_t flags, uint64_t cookie, uint64_t 
 static void transmit(conn_t *c)
 {
     uint8_t *buf = malloc(READ_MAX);
-    runs_t *runs = malloc(sizeof(*runs));
+    runs_t *runs = malloc(2 * sizeof(*runs));
     if (!buf || !runs) { free(buf); free(runs); return; }
     for (;;) {
         /* A quiet connection lets go of its cache, which holds read budget
@@ -514,9 +623,9 @@ static void transmit(conn_t *c)
         int r;
         if (type == CMD_DISC) break;
         if (type == CMD_READ) {
-            r = do_read(c, flags, cookie, off, len, buf, runs);
+            r = do_read(c, flags, cookie, off, len, buf, runs, runs + 1);
         } else if (type == CMD_BLOCK_STATUS) {
-            r = do_block_status(c, flags, cookie, off, len, runs);
+            r = do_block_status(c, flags, cookie, off, len, runs, runs + 1);
         } else if (type == 1u || type == 6u || type == 4u) {
             /* WRITE carries a payload the client already sent: drain it
              * so the stream stays in step, then refuse. */

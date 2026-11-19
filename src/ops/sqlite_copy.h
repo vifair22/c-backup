@@ -7,21 +7,25 @@
  * finding's `sqlite-backup` is enabled.
  *
  * The copy goes to a file (never memory: a database may exceed RAM), which
- * the caller stores and removes. The source is opened read-only with a
- * five-second busy timeout. Conditions, each checked and reported:
+ * the caller stores and removes. The source is read with a five-second busy
+ * timeout, and the copy creates, writes and removes nothing beside it: no
+ * -wal, no -shm (B247; how, in sqlite_copy.c). Conditions, each checked and
+ * reported:
  *
  *   - WAL databases only, unless allow_rollback_lock: a reader never blocks
  *     a WAL database's writers, while a rollback-journal database's copy
  *     holds a shared lock that does for its whole length.
- *   - The read-only open must work. A WAL database whose -shm this process
- *     cannot use (SQLite's read-only WAL access needs it) is refused, and
- *     the raw read stands.
+ *   - The read-only open must work. A WAL database with a -wal and -shm is
+ *     read through them, so the -shm must be readable; one whose -wal holds
+ *     commits and has no -shm is refused, because reading it would create
+ *     one. The raw read stands.
  *   - A copy kept from finishing by the source more than SQLITE_COPY_TRIES
  *     times is abandoned.
  *
- * The caller must hold no descriptor on the database file while this runs:
- * POSIX locks belong to the process, and closing any descriptor on the file
- * drops every lock SQLite holds on it.
+ * The caller must hold no descriptor on the database file while this runs,
+ * and no SQLite connection to it: POSIX locks belong to the process, and
+ * closing any descriptor on the file (the copy closes its own last) drops
+ * every lock the process holds on it.
  */
 
 #include "error.h"

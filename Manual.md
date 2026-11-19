@@ -256,7 +256,16 @@ and in the journal as "cancelled before it started".
 A daemon that dies without stopping (a crash, `kill -9`, `docker kill`,
 power loss) marks whatever was running as `failed: interrupted by daemon
 restart` on its next start, and journals each such job then, since the
-killed process could not. A power cut can also cost the database about its
+killed process could not. The exception is a backup that had already written
+its snapshot record into the repository: the snapshot is complete, so the job
+is recorded `completed`, its `result` `{"snapshot_id":N,"recovered":true}`,
+and journalled as a success saying the snapshot was found at start; running
+it again would only take a second snapshot of the same data. When the repository
+cannot be read at that start (an unmounted disk), the job is failed with
+`snapshot N may have been written` in its error; `c-backup snapshots <id>`
+once the disk is back says whether it was. A job's end is synced to disk
+before the CLI, the app or the API shows it, so a job seen ending never
+comes back as interrupted. A power cut can also cost the database about its
 last second of the daemon's own writes (never an edit the API had answered);
 the next start puts back any snapshot or tag that went with them on its own
 (section 17.5). Either way the repository is consistent: a backup's partial
@@ -2767,10 +2776,16 @@ reach the disk at different times:
   success, a power cut cannot take them. If the sync itself fails (a full
   or failing disk under `state.db`), the request fails with an error saying
   the change is committed but could not be made durable.
+- **A job's end** - its state, error, result and journal entry - is synced
+  before any client is shown it: until then `/jobs/<id>` and the stream
+  read `running`. A backup also records which snapshot it is writing, synced,
+  before the snapshot record exists, so a job whose end a power cut took is
+  recorded completed at the next start if its snapshot is in the
+  repository (section 2.2).
 - **Every other write** - the other API edits (a note, sources, a policy
   value, a schedule added or changed, a job submitted), and the daemon's
-  own writes (a backup's index rows, job records and progress, journal
-  entries) - is synced by a once-a-second flush (and by checkpoints and a
+  own writes (a backup's index rows, job progress, other journal entries) -
+  is synced by a once-a-second flush (and by checkpoints and a
   clean stop). A power cut can lose about the last second of them: an edit
   answered less than a second before the cut may be gone after it, whole,
   and has to be made again. Nothing is left half-written. Section 6.4 lists
@@ -3241,7 +3256,7 @@ the underlying disk.
 | `repo is busy` | Another job holds the repository | Wait, or `c-backup jobs` to see what |
 | Backup logs `key not escrowed` | System key not acknowledged | Section 13 |
 | Job `cancelled` after a restart | `systemctl stop` cancels running jobs (section 2.2) | Run it again |
-| Job `failed: interrupted by daemon restart` | The daemon died mid-job: crash, `kill -9`, power loss | Run it again; nothing partial is kept |
+| Job `failed: interrupted by daemon restart` | The daemon died mid-job: crash, `kill -9`, power loss | Run it again; nothing partial is kept. A backup whose snapshot reached the repository is recorded `completed` instead (section 2.2) |
 | `restore incomplete: N entries could not be restored` | Some entries failed | The error quotes the first, the log names each (`restore: <path> not restored: <reason>`); check permissions and space at the destination. `regular file has no content in the snapshot (written by a c-backup older than 1.0.0, ...)` is a file an older build recorded without being able to read it; verify reports the same entries |
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
@@ -4722,7 +4737,9 @@ c-backup vm unexport 9
 ```
 
 Or copy the disk out without a kernel device:
-`qemu-img convert -O raw 'nbd+unix:///8f1c...?socket=/run/c-backupd/exports/9.sock' /mnt/disk3/vda.raw`.
+`qemu-img convert -f raw -O raw 'nbd+unix:///8f1c...?socket=/run/c-backupd/exports/9.sock' /mnt/disk3/vda.raw`.
+The copy is sparse where the snapshot has holes and byte-identical to a
+`unit restore --item` of the same disk.
 
 - **Mount options.** A crash-consistent disk may hold an unreplayed journal,
   and the export refuses writes: mount ext4 with `ro,noload`, xfs with
@@ -4758,7 +4775,9 @@ Or copy the disk out without a kernel device:
   run normally.
 - **Audit.** Opening and closing are journalled with the caller; the server
   speaks `READ`, `BLOCK_STATUS` (the snapshot's holes are holes to the
-  client) and `DISC`, and refuses writes.
+  client, in whole 512-byte sectors: a sector holding any data is reported
+  as data) and `DISC`, and refuses writes. It advertises a minimum block
+  of 512 bytes and a preferred block of 4096.
 
 ### 22.9 The `units.allow` safety rail
 
@@ -4990,9 +5009,17 @@ it beside the raw file:
   `{"allow_rollback_lock":true}`: a WAL reader never blocks the
   application's writers, while a rollback-journal database's copy holds a
   shared lock that does, for as long as the copy takes.
-- The database is opened read-only with a 5-second busy timeout. A WAL
-  database whose `-shm` the daemon (uid 990) cannot use cannot be opened
-  read-only, and the raw read stands, with that reason.
+- The database is read with a 5-second busy timeout, and **the copy
+  creates, writes and removes nothing in the source directory**: no `-wal`,
+  no `-shm`, no change to a file's bytes or mtime or to the directory's.
+  A WAL database with its `-wal` and `-shm` is read through them, the
+  `-shm` read-only, so a live writer sees an ordinary reader; one with no
+  `-wal` (nothing has it open) is read from the main file under SQLite's
+  own shared lock, and the copy is retried if a connection opened
+  meanwhile. Two cases are refused, and the raw read stands, with the
+  reason: a `-shm` the daemon (uid 990) cannot read, and a `-wal` holding
+  commits with no `-shm` beside it (left by a crash), which SQLite could
+  only read by creating one.
 - A copy kept from finishing by the source three times is abandoned with a
   warning; the raw read stands.
 - The copy is made in the repository's `tmp/`, one database at a time,

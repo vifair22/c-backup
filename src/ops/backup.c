@@ -2976,6 +2976,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     st = allocate_snapshot_id(db, store, repo_id, &snap_id);
 
     time_t now = time(NULL);
+    if (st == OK && opts->record_hook) st = opts->record_hook(opts->record_hook_ctx, snap_id);
     if (st == OK) st = write_snapshot_record(store, snap_id, root_hash, now, opts->label);
     /* From here the snapshot exists in the repository whatever the index
      * does (B195). */

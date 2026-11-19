@@ -2446,6 +2446,8 @@ if command -v sqlite3 > /dev/null 2>&1; then
     contains "an enabled engine copy is made" '"method":"sqlite-online-backup"' "$CP_BODY"
     contains "and stored" "\"copy\":\"/.cbackup-captures$DBS/app/real.db\"" "$CP_BODY"
     contains "with its outcome" '"outcome":"ok"' "$CP_BODY"
+    check "and the source directory gained no -wal or -shm from it (B247)" no \
+        "$( { [ -e "$DBS/app/real.db-wal" ] || [ -e "$DBS/app/real.db-shm" ]; } && echo yes || echo no)"
     CP_SNAP=$(printf '%s' "$CP_BODY" | sed -n 's/.*"snapshot_id":\([0-9]*\).*/\1/p')
     RS_JOB=$(job_id "$(sock_post "/repos/$DB_ID/snapshots/$CP_SNAP/restore" \
                        "{\"dest\":\"$R/dbout\",\"prefer_engine_copy\":true}")")
