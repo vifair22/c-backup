@@ -1059,6 +1059,16 @@ failed restore never leaves a plausible-looking image.
    c-backup checkpoints are deleted with `VIR_DOMAIN_CHECKPOINT_DELETE_METADATA_ONLY`
    (the bitmaps belonged to the overwritten images) and its token rows
    dropped, so the next session is full. Never on a running domain.
+   The helper's `unit.define` does the delete when it replaces a domain:
+   every checkpoint of its UUID carrying this helper's description,
+   leaves first, and every record of that UUID; the result carries
+   `checkpoints_retired`, and a delete that fails is a warning, since the
+   restore has succeeded by then. The daemon then drops the unit's token
+   rows in every repository, not only the one restored from: a checkpoint
+   of any chain named a bitmap in the replaced images. Until B251 neither
+   happened, so a replaced domain kept a checkpoint whose bitmap was gone,
+   every later backup's retire failed on it, and `virsh undefine` refused
+   the domain.
 
 ### 7.3 NBD export for file-level recovery
 

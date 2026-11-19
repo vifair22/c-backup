@@ -4496,6 +4496,16 @@ c-backup unit restore 1 5120 --define --name immich-test \
 | Definition | re-applied with the same name (and for a VM the same UUID) | the name changed; bind sources, volumes, rootfs and mount entries rewritten under `DIR`; a VM's `<uuid>` removed (libvirt makes a new one), MACs regenerated unless `--keep-macs`, disks pointing at the new images, excluded passthrough disks dropped and listed |
 | Never | a delete: old data is moved aside, never removed | |
 
+**In place, a VM's incremental chains start again.** Its c-backup
+checkpoints named bitmaps in the images that were just moved aside, so the
+define deletes them from libvirt (metadata only; a checkpoint c-backup did
+not make is left alone) and drops their tokens in every repository that
+backs the VM up: `vm checkpoints` lists none, the next backup into each
+repository is a full read that starts a new chain, and `virsh undefine`
+is not refused for checkpoints c-backup left (B251). The job's result
+counts them as `checkpoints_retired`; one that cannot be deleted is a
+warning naming it.
+
 **A failure under a new name says whether it wrote anything.** A
 `--target-root` it cannot write (read-only, or not a directory) fails with
 `nothing was written under DIR`; one that fails after writing says `what

@@ -59,6 +59,9 @@ status_t unit_token_put(cutils_db_t *db, int64_t repo_id, const char *unit_key,
 
 /* Every row of the unit, or every row but those for the items listed. */
 status_t unit_tokens_drop(cutils_db_t *db, int64_t repo_id, const char *unit_key);
+/* Every row of the unit in every repository: its disks were replaced in
+ * place (B251), so no checkpoint of any chain describes them any more. */
+status_t unit_tokens_drop_everywhere(cutils_db_t *db, const char *unit_key);
 status_t unit_tokens_drop_except(cutils_db_t *db, int64_t repo_id, const char *unit_key,
                                  const char *const *keep, size_t n_keep);
 

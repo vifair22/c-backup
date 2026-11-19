@@ -4,6 +4,7 @@
 #include "msg_clip.h"
 #include "remote_provider.h"
 #include "unit_restore.h"
+#include "unit_tokens.h"
 #include "snap_record.h"
 
 #define CUTILS_CJSON_ALLOW
@@ -869,6 +870,22 @@ static status_t vm_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, 
         st = remote_op("libvirt", "vm.install_state", a, -1, &ir);
         if (st == OK && ir) cJSON_AddItemToObject(res, "state", ir);
         else cJSON_Delete(ir);
+    }
+    /* Replaced in place: the helper deleted the domain's checkpoints with the
+     * define (B251), and the tokens naming them go too, in every repository
+     * that backs it up, so each one's next session is a full read rather
+     * than a retire of a bitmap that is not in the new images. */
+    if (st == OK && !new_name) {
+        char ukey[300];
+        snprintf(ukey, sizeof(ukey), "libvirt:%.280s", unit);
+        if (unit_tokens_drop_everywhere(db, ukey) != OK) {
+            char wmsg[600];
+            snprintf(wmsg, sizeof(wmsg), "%.500s; the next backup of it may warn about its old checkpoint",
+                     err_msg());
+            err_clear();
+            if (out->n_warnings < sizeof(out->warnings) / sizeof(out->warnings[0]) &&
+                (out->warnings[out->n_warnings] = strdup(wmsg)) != NULL) out->n_warnings++;
+        }
     }
     if (st == OK && o->start) st = remote_op("libvirt", "unit.start", args_unit("libvirt", nuuid), -1, NULL);
     if (st == OK) {
