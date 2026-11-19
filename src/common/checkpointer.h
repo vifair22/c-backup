@@ -142,7 +142,8 @@ typedef struct {
     uint64_t      frames_copied;    /* WAL frames copied into the database */
     uint64_t      throttle_ns;      /* writers' total wait at the hard cap */
     unsigned long throttle_timeouts; /* waits that ended at the time limit */
-    unsigned long presyncs;         /* WAL syncs made before taking the lock (B216) */
+    unsigned long presyncs;         /* syncs of the WAL (B216) and the database (B233)
+                                     * made before taking the lock */
     uint64_t      presync_ns;       /* and their total time */
     /* The wait for the write lock, apart from the hold (B219): lock_ns and
      * max_lock_ns used to include it, so a round that queued behind a

@@ -4,6 +4,7 @@
 
 #include "db_txn.h"
 #include "db_readers.h"
+#include "sync_latch.h"
 #include "thread_name.h"
 #include "walidx.h"
 #include "wal_health.h"
@@ -52,6 +53,7 @@ static unsigned        g_interval_ms;
 static uint32_t        g_threshold;
 static char            g_path[PATH_MAX];
 static sqlite3        *g_ck;          /* opened by checkpointer_open, before the drop */
+static int             g_db_fd = -1;  /* state.db itself, for presync; opened with g_ck */
 static checkpointer_stats_t g_stats;
 
 static uint64_t now_ns(void)
@@ -236,6 +238,44 @@ static void pre_restart(void)
     pthread_mutex_unlock(&g_mu);
 }
 
+/*
+ * Write out, without the lock, what a locked round would otherwise sync
+ * holding it. A PASSIVE syncs the WAL before it copies and, when the copy
+ * completes, the database after; under the lock both are what every writer
+ * waits for.
+ *
+ *   - The WAL (B216): past the hard cap it is the whole backlog the
+ *     writers left in the page cache.
+ *   - The database (B233): an unlocked round that does not complete the
+ *     copy writes pages into state.db and syncs nothing, since SQLite syncs
+ *     the database only when the copy completes. Below the cap that is
+ *     every round during a backup, so the pages of all of them waited for
+ *     the locked round's sync: FS2 M9 R5 held the lock 23.3 s for a round
+ *     with 2,043 frames left, almost all of it in that fdatasync.
+ *
+ * The locked round's own syncs then cover only what arrived since. The
+ * syncs SQLite needs are unchanged - WAL before the copy, database before
+ * the restart - only what is still dirty when they run. A failure latches
+ * like any sync of state.db (sync_latch.h) and the round goes ahead: the
+ * descriptor here is not SQLite's, so its own sync in the round sees the
+ * same error (Linux reports a writeback error to every open file), the
+ * copy does not complete, and the WAL is not restarted over frames the
+ * database may not hold.
+ */
+static void presync(void)
+{
+    char wal[PATH_MAX + 8];
+    snprintf(wal, sizeof(wal), "%s-wal", g_path);
+    uint64_t s0 = now_ns();
+    (void)wal_sync(wal);
+    if (g_db_fd >= 0) (void)sync_latch_fdatasync(g_db_fd, g_path);
+    uint64_t took = now_ns() - s0;
+    pthread_mutex_lock(&g_mu);
+    g_stats.presync_ns += took;
+    g_stats.presyncs++;
+    pthread_mutex_unlock(&g_mu);
+}
+
 static status_t locked_passive(void *arg)
 {
     locked_arg_t *a = arg;
@@ -259,6 +299,7 @@ static status_t locked_passive(void *arg)
 status_t checkpointer_force(void)
 {
     if (!g_ck) return set_error(ERR_INVALID, "checkpointer_force: not running");
+    presync();
     locked_arg_t a = { 0, -1, 0 };
     uint64_t t0 = now_ns();
     status_t st = db_txn_exclusive(locked_passive, &a);
@@ -366,21 +407,9 @@ static void tick(void)
     if (left > small && round_ns > CKPT_LOCK_BUDGET_NS && frames <= hard) return;
 
 locked:;
-    /* And what arrived during the last unlocked round goes to disk now,
-     * before the lock, rather than in the locked PASSIVE's own WAL sync
-     * (B216). A failure latches like any other WAL sync (sync_latch.h);
-     * the round goes ahead, and its own sync fails the same way. */
-    {
-        char wal[PATH_MAX + 8];
-        snprintf(wal, sizeof(wal), "%s-wal", g_path);
-        uint64_t s0 = now_ns();
-        (void)wal_sync(wal);
-        uint64_t took = now_ns() - s0;
-        pthread_mutex_lock(&g_mu);
-        g_stats.presync_ns += took;
-        g_stats.presyncs++;
-        pthread_mutex_unlock(&g_mu);
-    }
+    /* What the unlocked rounds left dirty, the WAL's tail and the pages
+     * they copied, goes to disk now, before the lock (presync). */
+    presync();
     locked_arg_t a = { 0, -1, 0 };
     uint64_t t0 = now_ns();
     if (db_txn_exclusive(locked_passive, &a) != OK) return;
@@ -563,6 +592,13 @@ static status_t open_locked(const char *db_path)
         return st;
     }
     g_ck = h;
+    /* A descriptor of its own for presync, opened here because this runs
+     * before the privilege drop. Without one the database's sync stays in
+     * the locked round, as it was before B233. */
+    g_db_fd = open(db_path, O_RDONLY | O_CLOEXEC);
+    if (g_db_fd < 0)
+        log_warn("state.db: cannot open %s to sync it before a checkpoint takes the write "
+                 "lock: %s", db_path, strerror(errno));
     return OK;
 }
 
@@ -803,6 +839,8 @@ void checkpointer_stop(void)
         sqlite3_close(g_ck);
     }
     g_ck = NULL;
+    if (g_db_fd >= 0) close(g_db_fd);
+    g_db_fd = -1;
     g_leave_wal = 0;
     atomic_store(&g_halting, 0);
     pthread_mutex_unlock(&g_mu);

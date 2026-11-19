@@ -2498,7 +2498,7 @@ the repository).
 | `cbackup_checkpoint_lock_max_seconds` | gauge | The longest single hold by a locked round since start |
 | `cbackup_checkpoint_lock_wait_seconds_total` | counter | Time locked rounds spent queued for the write lock behind other writers before holding it; not part of the hold, and no writer waits for it |
 | `cbackup_checkpoint_lock_wait_max_seconds` | gauge | The longest single such wait since start |
-| `cbackup_checkpoint_presync_seconds_total` | counter | Time spent writing the log out to disk just before a locked round, without the lock, so the round itself only syncs what arrived since |
+| `cbackup_checkpoint_presync_seconds_total` | counter | Time spent writing the log, and the database pages earlier rounds copied, out to disk just before a locked round, without the lock, so the round itself only syncs what arrived since |
 | `cbackup_checkpoint_frames_copied_total` | counter | Log frames copied back into `state.db`; over `cbackup_checkpoint_rounds_total`, frames per round |
 | `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap |
 | `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy |
