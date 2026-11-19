@@ -1072,6 +1072,25 @@ NBD_FLAG_CAN_MULTI_CONN`, `NBD_CMD_READ`, `NBD_CMD_BLOCK_STATUS`,
 `NBD_CMD_DISC`. Writes are refused. One thread per connection; a handful
 of clients is the use case.
 
+**Sectors (B250).** `NBD_INFO_BLOCK_SIZE` advertises a minimum block of
+512 and a preferred block of 4096 (a disk whose size is not a multiple of
+512 keeps a minimum of 1, because QEMU truncates the export to the minimum
+block and would lose the tail). Unaligned requests are still served, not
+refused. The chunk list's gaps fall at byte offsets, wherever a chunk ended,
+so every block status descriptor and structured-read chunk is aligned
+before it goes out: a hole shrinks to the whole sectors inside it, and the
+partial sectors at its edges are reported as data, never the reverse.
+A boundary is unaligned only where the spec allows one: the start of an
+unaligned request, the end of the export, and an unaligned request end that
+the reply must not cross (a read, or `NBD_CMD_FLAG_REQ_ONE`). Without
+`REQ_ONE` the last descriptor may run to the end of the sector holding the
+request's end, and the reader is asked that far so the sector is
+classified from what it holds. Before this, the server advertised a
+minimum of 1 and byte-granular extents, and `qemu-img convert`, which
+rounds a zero extent up to whole sectors, zeroed the data sharing a sector
+with a hole's edge: 2706 bytes of ext4 metadata in a UAT copy-out, with
+`qemu-img compare` reporting the copy identical.
+
 **Random access.** A reader resolves an offset to a leaf by descending the
 list tree (binary search per level, at most nine levels), with a small LRU
 of parsed lists (64) and of verified leaves (16, under the read budget).
