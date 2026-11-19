@@ -450,6 +450,9 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     o.progress_cb  = progress;
     o.progress_ctx = progress_ctx;
     o.bytes_cb     = job_progress_bytes;
+    /* Which snapshot this job writes, durable before its record (B238). */
+    o.record_hook     = job_note_snapshot;
+    o.record_hook_ctx = progress_ctx;
 
     /*
      * Say it again, every backup, until someone acts on it.
@@ -868,16 +871,20 @@ static cJSON *job_json(cutils_db_t *db, char **row)
      * still says running, and the end is what the client must see. */
     job_end_view_t ev;
     int unrec = job_end_unrecorded(db, job_id, &ev);
-    const char *state = unrec ? ev.state : row[3];
-    const char *error = unrec ? ev.error : row[11];
+    /* An end in the row that is not durable yet (B238) is not shown: a
+     * power cut could still take it back. The job reads running until the
+     * sync, which is about as long as the commit took. */
+    int settling = !unrec && job_end_settling(db, job_id);
+    const char *state = unrec ? ev.state : settling ? "running" : row[3];
+    const char *error = unrec ? ev.error : settling ? "" : row[11];
     const char *phase = unrec && ev.has_progress ? ev.phase : row[6];
     long long started = strtoll(row[4], NULL, 10);
-    long long ended   = unrec ? (long long)ev.ended : strtoll(row[5], NULL, 10);
+    long long ended   = unrec ? (long long)ev.ended : settling ? 0 : strtoll(row[5], NULL, 10);
     unsigned long long cur   = unrec && ev.has_progress ? ev.done : strtoull(row[7], NULL, 10);
     unsigned long long tot   = unrec && ev.has_progress ? ev.total : strtoull(row[8], NULL, 10);
     unsigned long long bdone = unrec && ev.has_progress ? ev.bytes_done : strtoull(row[9], NULL, 10);
     unsigned long long btot  = unrec && ev.has_progress ? ev.bytes_total : strtoull(row[10], NULL, 10);
-    const char *result = unrec ? (ev.result ? ev.result : "") : row[12];
+    const char *result = unrec ? (ev.result ? ev.result : "") : settling ? "" : row[12];
     long long now = (long long)time(NULL);
     long long elapsed = started > 0 ? ((ended > 0 ? ended : now) - started) : 0;
     if (elapsed < 0) elapsed = 0;

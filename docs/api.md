@@ -1211,7 +1211,20 @@ one with just those two; a result that names either key itself keeps its
 own. A job left running or queued by a daemon that
 stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it, and journalled then with that message:
-a daemon that was killed had no chance to journal it itself.
+a daemon that was killed had no chance to journal it itself. A backup whose
+snapshot record is in the repository is the exception (B238): the backup
+records which snapshot it is writing, durably, before the record exists, and
+the next start marks it `completed` with `result`
+`{"snapshot_id":N,"recovered":true}` and journals it as a success. When the
+repository cannot be read at that start its error is `interrupted by daemon
+restart; snapshot N may have been written, and the repository could not be
+read at start: <reason>`.
+
+A job's end is made durable before it is shown: from the moment its end is
+written until the WAL holding it is synced, `/jobs`, `/jobs/<id>` and the
+stream show the job as `running`, with no `ended`, `error` or `result`. So a
+client that has read a job's end never reads a different one after a power
+cut.
 
 A job whose end cannot be written, because `state.db`'s filesystem is full,
 say, is not left reading `running`. Its end (`state`, `error`, `ended`, its

@@ -101,9 +101,12 @@ static ssize_t job_reader(void *cls, char *buf, size_t max)
      * for. */
     job_end_view_t ev;
     int unrec = job_end_unrecorded(g_db, st->job_id, &ev);
-    const char *state = unrec ? ev.state : r->rows[0][0];
-    const char *error = unrec ? ev.error : r->rows[0][4];
-    const char *result = unrec ? (ev.result ? ev.result : "") : r->rows[0][7];
+    /* Nor an end that is not durable yet (B238): asked after the read, so
+     * a row read before the sync is never sent as the job's last frame. */
+    int settling = !unrec && job_end_settling(g_db, st->job_id);
+    const char *state = unrec ? ev.state : settling ? "running" : r->rows[0][0];
+    const char *error = unrec ? ev.error : settling ? "" : r->rows[0][4];
+    const char *result = unrec ? (ev.result ? ev.result : "") : settling ? "" : r->rows[0][7];
     int terminal = strcmp(state, "completed") == 0 ||
                    strcmp(state, "failed") == 0 ||
                    strcmp(state, "cancelled") == 0;
