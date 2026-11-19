@@ -653,7 +653,18 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
             if (it->kind != SP_ITEM_BLOB || strncmp(it->id, "log:", 4) != 0) continue;
             void *data = NULL;
             size_t len = 0;
-            if (b->ops->blob_read(sess, it, &data, &len) != OK) { err_clear(); continue; }
+            if (b->ops->blob_read(sess, it, &data, &len) != OK) {
+                /* Reported, never skipped silently (B286): the empty log
+                 * describe passed would be stored as if the hook said
+                 * nothing. The unit's warning is what the job carries. */
+                char wm[384];
+                snprintf(wm, sizeof(wm), "hook log %.64s could not be read at the end of begin, so what is "
+                         "stored for it may be empty: %.200s", it->id + 4, err_msg());
+                log_warn("helper: %s: %s", r->units[i], wm);
+                if (w) cJSON_AddItemToArray(w, cJSON_CreateString(wm));
+                err_clear();
+                continue;
+            }
             uint64_t at = loff;
             int werr = len > HELPER_BLOB_MAX || helper_blob_fd_append(&lfd, &loff, data, len) != 0;
             free(data);

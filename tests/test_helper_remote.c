@@ -517,6 +517,24 @@ static void test_cancel_during_begin(void **state)
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
 }
 
+/* B286: a hook log the helper cannot read at the end of begin is reported
+ * as the unit's warning, not skipped: the empty log describe passed is what
+ * gets stored, and nothing said so. */
+static void test_unreadable_hook_log_reported(void **state)
+{
+    (void)state;
+    fake_fail_set(fk, "u1", FAKE_FAIL_BLOB, 0);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    fake_fail_clear(fk);
+    int found = 0;
+    for (unsigned i = 0; i < res.units[0].n_warnings; i++)
+        if (strstr(res.units[0].warnings[i], "hook log pgdump could not be read")) found = 1;
+    if (!found) fail_msg("no warning for the unreadable log; first: %s", res.units[0].warning);
+    unit_backup_result_free(&res);
+    assert_int_equal(helper_server_holds(srv), 0);
+}
+
 /* A hold the helper cannot release reaches the job as its warning, which
  * is what alerts (B175): the backup itself succeeds. */
 static int wait_recov(int n)
@@ -1730,6 +1748,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_during_begin, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unreadable_hook_log_reported, setup_dumps, teardown),
         cmocka_unit_test_setup_teardown(test_stuck_hold_warns, setup, teardown),
         cmocka_unit_test_setup_teardown(test_recovery_alerted_once, setup_lost_journal, teardown),
         cmocka_unit_test_setup_teardown(test_stuck_hold_message_whole, setup, teardown),
