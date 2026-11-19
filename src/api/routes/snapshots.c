@@ -2284,8 +2284,9 @@ api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,
  * it is the one maintenance action that destroys a restore point, and it
  * used to leave no record at all (B101).
  *
- * A tagged snapshot is refused with 409 naming its tags unless force=1, and
- * a snapshot that does not exist is a 404 rather than a success.
+ * A tagged snapshot is refused with 409 naming its tags unless force=1, an
+ * exported one with 409 naming the export even with force=1, and a
+ * snapshot that does not exist is a 404 rather than a success.
  */
 api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
                                       int64_t snap_id)
@@ -2325,6 +2326,8 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
 
     if (st == ERR_NOT_FOUND) return api_error(404, "no such snapshot");
     if (st == ERR_INVALID && info.ntags > 0) return api_error(409, why);
+    /* A conflict with the export's state, not a server fault (B255). */
+    if (st == ERR_BUSY && info.export_id > 0) return api_error(409, why);
 
     char msg[ERR_MSG_MAX + 64];
     if (st != OK) {
