@@ -387,6 +387,7 @@ contains "a detection run completes" '"state":"completed"' "$OUT"
 contains "and finds the data directory" "\"path\":\"$WORK/live/d/pg\"" "$OUT"
 contains "live by its process and open file" '"confidence":"live"' "$OUT"
 contains "with the open file as evidence" '"open_write":[{"path":' "$OUT"
+contains "and its listening port (B252)" '"ports":[{"container":"pg","port":"5432"}]' "$OUT"
 contains "the client image is a hint" '"engine":"mysql","path":"","confidence":"hint"' "$OUT"
 contains "said as information" 'the image of client suggests MySQL/MariaDB' "$OUT"
 contains "and the journal says the probe answered" 'with units.probe' "$(cb journal 1 --limit 5)"
@@ -413,6 +414,40 @@ contains "a backup of it carries the same findings" '"engine":"postgres"' "$OUT"
 contains "with the probe's liveness" '"confidence":"live"' "$OUT"
 contains "and the finding now names its snapshot" '"last_snap_id":' "$(cb db show 1 "$DID")"
 lacks    "no longer null" '"last_snap_id":null' "$(cb db show 1 "$DID")"
+
+echo "Nextcloud with its database in a unit not backed up here (B249)"
+# docs/db-detection.md 3 and 14.8: Nextcloud's web server makes its finding
+# live; its version is config.php's; its dbhost names a unit the host lists
+# that nothing in this repository was recorded from, which still places the
+# database in another capture, suggested group-units.
+mkdir -p "$WORK/snap-n/config"
+cat > "$WORK/snap-n/config/config.php" <<'PHP'
+<?php
+$CONFIG = array (
+  'dbtype' => 'mysql',
+  'dbhost' => 'cbk-uat-ncdb:3306',
+  'version' => '30.0.2.2',
+);
+PHP
+UNIT_N=',{"id":"n","name":"cbk-uat-nc","state":"running",
+  "trees":[{"id":"html","read_root":"'"$WORK"'/snap-n","path":"'"$WORK"'/live/n","source":"'"$WORK"'/snap-n"}],
+  "probe":{"containers":[{"name":"cbk-uat-nc","image":"nextcloud:30","running":true,
+     "processes":[{"comm":"apache2","args":"apache2 -DFOREGROUND"}],"ports":[80]}]}},
+ {"id":"m","name":"cbk-uat-ncdb","state":"running",
+  "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"m"}]}'
+write_spec ",{\"id\":\"c\",\"name\":\"cbk-uat-c\",\"state\":\"stopped\",\"blobs\":[{\"id\":\"x\",\"path\":\".cbackup-unit/config/x\",\"text\":\"c\"}]}$UNIT_D$UNIT_N"
+OUT=$(cb db detect 1 cbk-uat-nc --provider fake)
+contains "a detection run of it completes" '"state":"completed"' "$OUT"
+contains "and finds Nextcloud" '"engine":"nextcloud"' "$OUT"
+contains "at its own version, not its dbtype" '"version":"30.0.2.2"' "$OUT"
+contains "live by its web server" '"confidence":"live"' "$OUT"
+contains "with the process as evidence" '"processes":[{"container":"cbk-uat-nc","comm":"apache2"}]' "$OUT"
+contains "its database placed in the listed unit" '"resolved":"unit:fake:m"' "$OUT"
+contains "captured apart" '"consistent":false' "$OUT"
+# The fake tree is read live (no snapshot domain, no pause): uncovered, which
+# outranks split; test_db_findings covers split.
+contains "read live, it stays uncovered" '"coverage":"uncovered"' "$OUT"
+contains "and suggested to group them" '"suggestion":"group-units"' "$OUT"
 
 echo "an export of a disk with unaligned holes (B250)"
 # Holes that start and end mid-sector, one data run a single byte long, and

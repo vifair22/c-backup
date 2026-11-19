@@ -359,8 +359,25 @@ static int find_db_unit(cutils_db_t *db, const char *repo, const char *own_scope
     return found;
 }
 
+/* A live Nextcloud whose database is not in its capture: its files alone
+ * were judged, and whatever that said, the pair is not one instant. A
+ * live read stays uncovered, which is worse. */
+static void nextcloud_split(db_finding_t *x, const char *why, const char *suggestion)
+{
+    if (x->confidence != DB_CONF_LIVE || x->coverage == DB_COV_NONE ||
+        x->coverage == DB_COV_UNCOVERED)
+        return;
+    char *w = strdup(why);
+    if (!w) return;
+    free(x->coverage_why);
+    x->coverage_why = w;
+    x->coverage = DB_COV_SPLIT;
+    x->suggestion = suggestion;
+    x->optional = NULL;
+}
+
 void db_findings_link_nextcloud(cutils_db_t *db, int64_t repo_id, const char *scope,
-                                db_findings_t *f)
+                                db_findings_t *f, db_unit_lookup_fn lookup, void *lookup_ctx)
 {
     if (!db || !f || !scope) return;
     char repo[32];
@@ -373,13 +390,32 @@ void db_findings_link_nextcloud(cutils_db_t *db, int64_t repo_id, const char *sc
         const char *host = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(link, "host"));
         const cJSON *res = cJSON_GetObjectItemCaseSensitive(link, "resolved");
         if (!host || !*host || !cJSON_IsNull(res)) { cJSON_Delete(ev); continue; }
-        const char *engine = strcmp(x->version, "pgsql") == 0 ? "postgres" : "mysql";
+        /* The dbtype, not the version: the version is Nextcloud's own (B249). */
+        const char *dbtype = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(link, "dbtype"));
+        const char *engine = dbtype && strcmp(dbtype, "pgsql") == 0 ? "postgres" : "mysql";
         char other[600];
-        if (!find_db_unit(db, repo, scope, engine, host, other, sizeof(other))) {
+        /* First the units whose recorded findings answer to the name, then
+         * any unit the host has by that name, backed up here or not: the
+         * database's unit is often backed up after Nextcloud's, or never
+         * (B249). */
+        int recorded = find_db_unit(db, repo, scope, engine, host, other, sizeof(other));
+        int listed = !recorded && lookup && lookup(lookup_ctx, host, other, sizeof(other)) &&
+                     strcmp(other, strncmp(scope, "unit:", 5) == 0 ? scope + 5 : scope) != 0;
+        if (listed) {
+            /* The scope form, as a recorded one is. */
+            char k[600];
+            snprintf(k, sizeof(k), "unit:%.590s", other);
+            snprintf(other, sizeof(other), "%s", k);
+        }
+        if (!recorded && !listed) {
             char note[400];
-            snprintf(note, sizeof(note), "no unit backed up into this repository answers to %.200s", host);
+            snprintf(note, sizeof(note), "no unit on this host answers to %.200s", host);
             cJSON_DeleteItemFromObjectCaseSensitive(link, "note");
             cJSON_AddStringToObject(link, "note", note);
+            char why[400];
+            snprintf(why, sizeof(why), "its database (%.200s) is not in this capture: no unit "
+                     "on this host answers to that name", host);
+            nextcloud_split(x, why, NULL);
         } else {
             /* Two units are two captures unless they share a capture
              * group (container-backup.md 6.2). */
@@ -389,10 +425,21 @@ void db_findings_link_nextcloud(cutils_db_t *db, int64_t repo_id, const char *sc
             int grouped = g1[0] && strcmp(g1, g2) == 0;
             cJSON_ReplaceItemInObjectCaseSensitive(link, "resolved", cJSON_CreateString(other));
             cJSON_AddBoolToObject(link, "consistent", grouped);
-            cJSON_AddStringToObject(link, "note", grouped
-                ? "its database is in another unit of the same capture group: one capture"
-                : "its database is in another unit, captured at a different instant");
-            if (!grouped) x->suggestion = "group-units";
+            char note[400];
+            snprintf(note, sizeof(note), "%s%s",
+                     grouped ? "its database is in another unit of the same capture group: one capture"
+                             : "its database is in another unit, captured at a different instant",
+                     recorded ? "" : "; that unit has no database findings in this repository yet");
+            cJSON_AddStringToObject(link, "note", note);
+            if (!grouped) {
+                char why[700];
+                snprintf(why, sizeof(why), "its database is in another unit (%.600s), captured at "
+                         "a different instant", other + 5);
+                nextcloud_split(x, why, "group-units");
+                /* Dormant: at rest, nothing to suggest (section 2.1). A
+                 * live read stays uncovered, and grouping still helps. */
+                if (x->confidence == DB_CONF_LIVE) x->suggestion = "group-units";
+            }
         }
         char *txt = cJSON_PrintUnformatted(ev);
         char *dup = txt ? strdup(txt) : NULL;

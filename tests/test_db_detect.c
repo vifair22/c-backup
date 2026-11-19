@@ -305,7 +305,8 @@ static void build_all(void)
     wempty("ch/store/3f2/3f2a7c1e-0000-4000-8000-000000000001/all_1_1_0/checksums.txt");
     wempty("ch/status");
 
-    wtext("nc/config/config.php", "<?php\n$CONFIG = array (\n  'dbtype' => 'pgsql',\n  'dbhost' => 'db',\n);\n");
+    wtext("nc/config/config.php", "<?php\n$CONFIG = array (\n  'dbtype' => 'pgsql',\n  'dbhost' => 'db',\n"
+                                  "  'version' => '30.0.2.2',\n);\n");
 }
 
 static void test_signatures(void **state)
@@ -390,7 +391,9 @@ static void test_signatures(void **state)
     assert_int_equal(x->confidence, DB_CONF_LIVE);
     x = find(f, DB_ENGINE_NEXTCLOUD, "nc");
     assert_non_null(x);
-    assert_string_equal(x->version, "pgsql");
+    /* Nextcloud's own version; the dbtype is the link's (B249). */
+    assert_string_equal(x->version, "30.0.2.2");
+    assert_non_null(strstr(x->evidence, "\"dbtype\":\"pgsql\""));
     assert_int_equal(x->coverage, DB_COV_NONE);
 
     assert_int_equal(count_engine(f, DB_ENGINE_SQLITE), 2);
@@ -879,6 +882,84 @@ static void test_probe_liveness(void **state)
     db_findings_free(f);
 }
 
+/* B252: listening ports are hint evidence on the findings the engine's
+ * processes are on (section 3), never liveness, and a container with no
+ * network, which listens on nothing, loses nothing by it. A java process
+ * says which word made it Elasticsearch's or OpenSearch's. */
+static void test_probe_ports(void **state)
+{
+    (void)state;
+    wtext("pg/PG_VERSION", "16\n");
+    wempty("pg/global/pg_control");
+    wdir("pg/base/1");
+    wtext("pgdata.bak/PG_VERSION", "16\n");
+    wempty("pgdata.bak/global/pg_control");
+    wdir("pgdata.bak/base");
+    wbytes("pg/base/1/2619", "x", 1, 8192);
+    wempty("influx1/meta/meta.db");
+    wempty("influx1/data/db1/x.tsm");
+    wempty("influx1/wal/db1/x.wal");
+    wempty("es/_state/state-1.st");
+    wempty("es/indices/Zx9rT1QwS0uQhY8b/0/index/segments_3");
+    db_cap_root_t r = { TEST_DIR, DB_CAP_ATOMIC, 0 };
+    db_capture_desc_t cap = { &r, 1, 0, 0, 1, 1 };
+
+    /* --network none: processes, no ports. Live all the same. */
+    probe_t t;
+    memset(&t, 0, sizeof(t));
+    sp_probe_container_t *pg = pc(&t, "pg", "postgres:16");
+    pproc(pg, "postgres", "postgres");
+    sp_probe_container_t *ix = pc(&t, "influx", "influxdb:1.8");
+    pproc(ix, "influxd", "influxd");
+    sp_probe_container_t *os = pc(&t, "search", "opensearchproject/opensearch:2");
+    pproc(os, "java", "/usr/share/opensearch/jdk/bin/java -Xshare:auto -Dopensearch.path.home=x");
+    db_findings_t *f = detect_unit(&t.p, &cap);
+    const db_finding_t *x = find(f, DB_ENGINE_POSTGRES, "pg");
+    assert_int_equal(x->confidence, DB_CONF_LIVE);
+    assert_null(strstr(x->evidence, "\"ports\""));
+    x = find(f, DB_ENGINE_ELASTIC, "es");
+    assert_non_null(x);
+    assert_int_equal(x->confidence, DB_CONF_LIVE);
+    assert_non_null(strstr(x->evidence, "\"processes\":[{\"container\":\"search\",\"comm\":\"java\","
+                                        "\"args_match\":\"opensearch\"}]"));
+    db_findings_free(f);
+
+    /* Listening: each engine's port goes on its findings. */
+    pg->ports[pg->n_ports++] = 5432;
+    ix->ports[ix->n_ports++] = 8086;
+    ix->ports[ix->n_ports++] = 8088;
+    os->ports[os->n_ports++] = 9200;
+    f = detect_unit(&t.p, &cap);
+    x = find(f, DB_ENGINE_POSTGRES, "pg");
+    assert_non_null(strstr(x->evidence, "\"ports\":[{\"container\":\"pg\",\"port\":\"5432\"}]"));
+    x = find(f, DB_ENGINE_INFLUX1, "influx1");
+    assert_int_equal(x->confidence, DB_CONF_LIVE);
+    assert_non_null(strstr(x->evidence, "\"ports\":[{\"container\":\"influx\",\"port\":\"8086\"}]"));
+    assert_non_null(strstr(find(f, DB_ENGINE_ELASTIC, "es")->evidence, "\"port\":\"9200\""));
+    /* No hint for what a signature already found. */
+    assert_null(find_hint(f, DB_ENGINE_POSTGRES));
+    db_findings_free(f);
+
+    /* Once the process is seen holding one directory, the port goes with
+     * the process, not on the old copy beside it. */
+    popen_(pg, abs_of("pg/base/1/2619"), "postgres");
+    f = detect_unit(&t.p, &cap);
+    assert_non_null(strstr(find(f, DB_ENGINE_POSTGRES, "pg")->evidence, "\"port\":\"5432\""));
+    x = find(f, DB_ENGINE_POSTGRES, "pgdata.bak");
+    assert_int_equal(x->confidence, DB_CONF_DORMANT);
+    assert_null(strstr(x->evidence, "\"ports\""));
+    db_findings_free(f);
+
+    /* A port with no process of its engine is evidence, never liveness. */
+    pg->n_procs = 0;
+    pg->n_open = 0;
+    f = detect_unit(&t.p, &cap);
+    x = find(f, DB_ENGINE_POSTGRES, "pg");
+    assert_int_equal(x->confidence, DB_CONF_DORMANT);
+    assert_non_null(strstr(x->evidence, "\"port\":\"5432\""));
+    db_findings_free(f);
+}
+
 /* An image, port or process with no signature in the included mounts is
  * a hint, one per engine, with path "" and nothing judged. */
 static void test_probe_hints(void **state)
@@ -933,21 +1014,42 @@ static void test_probe_hints(void **state)
 static void wnextcloud(const char *dbtype, const char *dbhost)
 {
     char buf[1024];
-    snprintf(buf, sizeof(buf), "<?php\n$CONFIG = array (\n  'dbtype' => '%s',\n%s%s%s  'dbname' => 'nc',\n);\n",
+    snprintf(buf, sizeof(buf), "<?php\n$CONFIG = array (\n  'dbtype' => '%s',\n%s%s%s  'dbname' => 'nc',\n"
+             "  'version' => '30.0.2.2',\n);\n",
              dbtype, dbhost ? "  'dbhost' => '" : "", dbhost ? dbhost : "", dbhost ? "',\n" : "");
     wtext("nc/config/config.php", buf);
 }
 
-static const char *nc_evidence(const db_findings_t *f)
+static const db_finding_t *nc_of(const db_findings_t *f)
 {
     const db_finding_t *x = find(f, DB_ENGINE_NEXTCLOUD, "nc");
     assert_non_null(x);
-    return x->evidence;
+    return x;
+}
+
+static const char *nc_evidence(const db_findings_t *f)
+{
+    return nc_of(f)->evidence;
+}
+
+/* MariaDB's data directory, by its names. */
+static void wmariadb(const char *rel)
+{
+    char p[256];
+    snprintf(p, sizeof(p), "%s/ibdata1", rel);
+    wempty(p);
+    snprintf(p, sizeof(p), "%s/ib_logfile0", rel);
+    wempty(p);
+    snprintf(p, sizeof(p), "%s/mysql", rel);
+    wdir(p);
 }
 
 /* The link (section 3): a dbhost in the same container or another
- * container of the unit is one capture; anything else is left for the
- * repository's other units (db_findings_link_nextcloud). */
+ * container of the unit is in this capture, and the database's data
+ * directory found in the unit is judged with Nextcloud's files; anything
+ * else is left for the host's other units (db_findings_link_nextcloud).
+ * B249: the finding is live while Nextcloud runs, judged for coverage,
+ * suggested, and its version is Nextcloud's, not its dbtype. */
 static void test_nextcloud_link(void **state)
 {
     (void)state;
@@ -955,48 +1057,141 @@ static void test_nextcloud_link(void **state)
     memset(&t, 0, sizeof(t));
     sp_probe_container_t *c = pc(&t, "nextcloud-app-1", "nextcloud:29");
     snprintf(c->aliases[c->n_aliases++], SP_PROBE_NAME_MAX, "app");
+    pproc(c, "apache2", "apache2 -DFOREGROUND");
     sp_probe_container_t *db = pc(&t, "nextcloud-db-1", "mariadb:11");
     snprintf(db->aliases[db->n_aliases++], SP_PROBE_NAME_MAX, "db");
+    sp_probe_container_t *px = pc(&t, "proxy", "caddy:2");
+    pproc(px, "caddy", "caddy run");
     db_cap_root_t r = { TEST_DIR, DB_CAP_ATOMIC, 0 };
     db_capture_desc_t cap = { &r, 1, 0, 0, 1, 1 };
 
+    /* The database container's data directory is not in the mounts. */
     wnextcloud("mysql", "db:3306");
     db_findings_t *f = detect_unit(&t.p, &cap);
-    assert_non_null(strstr(nc_evidence(f), "\"link\":{\"dbtype\":\"mysql\",\"dbhost\":\"db:3306\","
-                                         "\"resolved\":\"this unit\",\"consistent\":true}"));
+    const db_finding_t *x = nc_of(f);
+    assert_string_equal(x->version, "30.0.2.2");
+    assert_int_equal(x->confidence, DB_CONF_LIVE);
+    /* Its web server is the liveness; the proxy beside it is not. */
+    assert_non_null(strstr(x->evidence, "\"processes\":[{\"container\":\"nextcloud-app-1\",\"comm\":\"apache2\"}]"));
+    assert_non_null(strstr(x->evidence, "\"link\":{\"dbtype\":\"mysql\",\"dbhost\":\"db:3306\","
+                                        "\"resolved\":\"this unit\",\"consistent\":false"));
+    assert_int_equal(x->coverage, DB_COV_SPLIT);
+    assert_non_null(strstr(x->coverage_why, "no data directory of it is in the captured mounts"));
+    assert_null(x->suggestion);
+    db_findings_free(f);
+
+    /* With it, and its server running: one capture of both. */
+    wmariadb("ncdb");
+    pproc(db, "mariadbd", "mariadbd");
+    f = detect_unit(&t.p, &cap);
+    x = nc_of(f);
+    assert_int_equal(x->confidence, DB_CONF_LIVE);
+    assert_non_null(strstr(x->evidence, "\"resolved\":\"this unit\",\"databases\":[\""));
+    assert_non_null(strstr(x->evidence, "\"consistent\":true"));
+    assert_int_equal(x->coverage, DB_COV_COVERED_CRASH);
+    assert_null(x->suggestion);
+    assert_string_equal(x->optional, "nextcloud-maintenance");
+    assert_string_equal(x->method, "snapshot");
+    db_findings_free(f);
+
+    /* Nextcloud stopped, its database running: the pair is still live. */
+    c->n_procs = 0;
+    f = detect_unit(&t.p, &cap);
+    assert_int_equal(nc_of(f)->confidence, DB_CONF_LIVE);
+    assert_int_equal(nc_of(f)->coverage, DB_COV_COVERED_CRASH);
+    db_findings_free(f);
+    /* Both stopped: at rest, nothing judged or suggested. */
+    db->n_procs = 0;
+    f = detect_unit(&t.p, &cap);
+    assert_int_equal(nc_of(f)->confidence, DB_CONF_DORMANT);
+    assert_int_equal(nc_of(f)->coverage, DB_COV_NONE);
+    assert_null(nc_of(f)->optional);
+    db_findings_free(f);
+    /* Without a Nextcloud image in the unit, any web server or PHP serves
+     * it. */
+    pproc(px, "php-fpm83", "php-fpm: master process");
+    snprintf(c->image, sizeof(c->image), "custom/cloud:1");
+    f = detect_unit(&t.p, &cap);
+    assert_int_equal(nc_of(f)->confidence, DB_CONF_LIVE);
+    assert_non_null(strstr(nc_evidence(f), "\"comm\":\"php-fpm83\""));
+    db_findings_free(f);
+    snprintf(c->image, sizeof(c->image), "nextcloud:29");
+    px->n_procs = 0;
+    pproc(c, "apache2", "apache2 -DFOREGROUND");
+    pproc(db, "mariadbd", "mariadbd");
+
+    /* Its files and its database at two instants: split, pause the unit. */
+    char ncroot[PATH_MAX], dbroot[PATH_MAX];
+    snprintf(ncroot, sizeof(ncroot), "%s", abs_of("nc"));
+    snprintf(dbroot, sizeof(dbroot), "%s", abs_of("ncdb"));
+    db_cap_root_t two[2] = { { ncroot, DB_CAP_ATOMIC, 0 }, { dbroot, DB_CAP_ATOMIC, 1 } };
+    db_capture_desc_t cap2 = { two, 2, 0, 0, 1, 1 };
+    f = detect_unit(&t.p, &cap2);
+    assert_int_equal(nc_of(f)->coverage, DB_COV_SPLIT);
+    assert_string_equal(nc_of(f)->suggestion, "pause-always");
+    db_findings_free(f);
+    /* Read live: uncovered, and maintenance mode is what helps. */
+    db_cap_root_t lr = { TEST_DIR, DB_CAP_LIVE, 0 };
+    db_capture_desc_t capl = { &lr, 1, 0, 0, 1, 1 };
+    f = detect_unit(&t.p, &capl);
+    assert_int_equal(nc_of(f)->coverage, DB_COV_UNCOVERED);
+    assert_string_equal(nc_of(f)->suggestion, "nextcloud-maintenance");
+    db_findings_free(f);
+    /* After a pre hook: application-consistent, nothing more to offer. */
+    db_capture_desc_t capa = { &r, 1, 1, 0, 1, 1 };
+    f = detect_unit(&t.p, &capa);
+    assert_int_equal(nc_of(f)->coverage, DB_COV_COVERED_APPLICATION);
+    assert_null(nc_of(f)->optional);
     db_findings_free(f);
 
     wnextcloud("pgsql", "localhost:/run/postgresql");
     f = detect_unit(&t.p, &cap);
     assert_non_null(strstr(nc_evidence(f), "\"resolved\":\"this container\""));
+    /* pgsql names PostgreSQL, and there is none here. */
+    assert_int_equal(nc_of(f)->coverage, DB_COV_SPLIT);
     db_findings_free(f);
 
     wnextcloud("mysql", "[::1]:3306");
     f = detect_unit(&t.p, &cap);
     assert_non_null(strstr(nc_evidence(f), "\"resolved\":\"this container\""));
+    assert_int_equal(nc_of(f)->coverage, DB_COV_COVERED_CRASH);
     db_findings_free(f);
 
+    /* Another unit's: judged on its files here, linked by the caller. */
     wnextcloud("mysql", "mariadb-shared");
     f = detect_unit(&t.p, &cap);
     assert_non_null(strstr(nc_evidence(f), "\"resolved\":null,\"host\":\"mariadb-shared\""));
+    assert_int_equal(nc_of(f)->coverage, DB_COV_COVERED_CRASH);
     db_findings_free(f);
 
-    /* Without the probe, a name cannot be found in the unit. */
+    /* Without the probe, a name cannot be found in the unit, and nothing
+     * says Nextcloud runs. */
     wnextcloud("mysql", "db:3306");
     f = detect_unit(NULL, &cap);
     assert_non_null(strstr(nc_evidence(f), "\"resolved\":null,\"host\":\"db\""));
+    assert_int_equal(nc_of(f)->confidence, DB_CONF_DORMANT);
     db_findings_free(f);
 
-    /* A dbhost with anything odd in it is not read. */
+    /* A dbhost with anything odd in it is not read, and the database
+     * cannot be placed. */
     wnextcloud("mysql", "db$(id)");
     f = detect_unit(&t.p, &cap);
     assert_non_null(strstr(nc_evidence(f), "\"note\":\"dbhost not read\""));
+    assert_int_equal(nc_of(f)->coverage, DB_COV_SPLIT);
     db_findings_free(f);
 
-    /* SQLite needs no link. */
+    /* SQLite needs no link: its database is among its files. */
     wnextcloud("sqlite3", NULL);
     f = detect_unit(&t.p, &cap);
     assert_null(strstr(nc_evidence(f), "\"link\""));
+    assert_int_equal(nc_of(f)->coverage, DB_COV_COVERED_CRASH);
+    assert_string_equal(nc_of(f)->optional, "nextcloud-maintenance");
+    db_findings_free(f);
+
+    /* A config.php without a version has none, never the dbtype. */
+    wtext("nc/config/config.php", "<?php\n$CONFIG = array (\n  'dbtype' => 'mysql',\n);\n");
+    f = detect_unit(&t.p, &cap);
+    assert_string_equal(nc_of(f)->version, "");
     db_findings_free(f);
 }
 
@@ -1088,6 +1283,7 @@ int main(void)
         cmocka_unit_test(test_engine_maps),
         cmocka_unit_test_setup_teardown(test_probe_liveness, setup, teardown),
         cmocka_unit_test_setup_teardown(test_probe_hints, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_probe_ports, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nextcloud_link, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nextcloud_unread, setup, teardown),
     };

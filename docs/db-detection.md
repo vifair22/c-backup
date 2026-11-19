@@ -842,3 +842,29 @@ database by its plain path, and is still a transactional copy of one commit.
 | Not from the source snapshot | A source read from a ZFS or btrfs snapshot (9.4) is already `covered-crash`; the copy still reads the live path, now without changing it |
 | Leftovers | `-wal` and `-shm` files earlier builds left are not removed: the backup does not write the source. They are read through, and go when the application next closes the database cleanly |
 | Tests | `tests/test_db_capture.c`: the source directory byte-, listing- and mtime-identical (the directory's own mtime included) around a copy of a dormant WAL database, one with leftover siblings, a rollback database, a WAL database a writer in another process holds with commits in its `-wal`, and a crashed writer's; and around two whole backups with engine copies, the second reading as many files as the first |
+
+### 14.7 Ports and process words as evidence (B252)
+
+The probe always reported each container's listening ports, but only hint
+findings used them, and Elasticsearch's process evidence said only `java`.
+Decided:
+
+| Point | As built |
+|---|---|
+| Ports | The probe always reported listening ports; only hint findings used them. A port is now evidence (`ports`, `{container, port}`) on the findings its engine's processes went on, or on every finding of the engine when no process of it was seen. Never liveness (section 2.1: hint). Under `--network none` a container may listen on nothing, and an absent port changes nothing |
+| Elasticsearch process | The evidence keeps `args_match`, the word in the first 256 bytes of arguments (`opensearch` or `elasticsearch`) that made `java` the engine's, rather than the arguments themselves, which can carry `-D` properties with secrets |
+
+### 14.8 Nextcloud judged (B249)
+
+D1 linked a Nextcloud to its database and stopped there: the finding was
+forced `dormant`, so it was never judged or suggested, its `version` was the
+`dbtype`, and the link looked only at units already recorded in the
+repository. Decided:
+
+| Point | As built |
+|---|---|
+| Version | `'version'` from `config.php`, read with the same fixed pattern as `dbhost` (digits and dots only); `""` when absent. The `dbtype` stays in `link`. The first backup after the change lifts a dismissal once, since the version changes |
+| Liveness | Nextcloud has no process of its own (section 3 lists none), so in a unit it is live when a web server or PHP runs (`apache2`, `httpd`, `nginx`, `lighttpd`, `caddy`, `frankenphp`, any `php*` comm, which covers `php-fpm83` and cron's `php`), counted only in containers of a `nextcloud` image when the unit has one, so a proxy beside it does not count; or when the in-unit database it names is live; or by an open file or an unsettled file under it, as for any finding |
+| Coverage | Judged like an engine over its files plus its database's data directories found in the unit (the live ones when any is), which must share one instant (section 5). A database resolved into the unit but with no data directory in the captured mounts, or a `dbhost` that could not be read, is `split` with that reason and no suggestion (there is nothing in the unit to pause). A database outside the unit is first judged on the files alone, then `db_findings_link_nextcloud` makes a covered finding `split`: suggested `group-units` when another unit answers and they share no `capture.group`, nothing when no unit answers. A live read stays `uncovered`, which outranks `split` |
+| Suggestions | Covered in a unit: `optional` `nextcloud-maintenance` (crash-consistent across both; maintenance mode makes it application-consistent), not after a pre hook already made it `covered-application`. Read live in a unit: `nextcloud-maintenance`. Split across units: `group-units` only. Section 3 also offers the maintenance hooks for two captures, but maintenance mode holds only for the duration of the Nextcloud unit's own capture, and the database's unit captured at another instant still sees changes between the two, so it is not offered as a fix for `split` |
+| Cross-unit link | After the repository's recorded findings, any unit the provider lists whose id or name is the `dbhost`'s host (`unit_detect_lookup_host`, one `list_units` per unresolved Nextcloud), so a database unit backed up after Nextcloud's, or never, still places it. The note says when that unit has no findings recorded here yet. Container names only: a compose service name in another unit is not listed by any provider |
