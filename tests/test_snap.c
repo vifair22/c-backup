@@ -21,6 +21,8 @@
 
 #include <cmocka.h>
 
+#include <cutils/log.h>
+
 #include "helper_policy.h"
 #include "host_tool.h"
 #include "snap.h"
@@ -336,6 +338,81 @@ static void test_btrfs_nested(void **state)
     assert_int_equal(holds_open, 0);
 }
 
+static char g_log[8192];
+
+static void capture_log(const char *ts, const char *level, const char *func, const char *message,
+                        void *ud)
+{
+    (void)ts; (void)func; (void)ud;
+    size_t have = strlen(g_log);
+    snprintf(g_log + have, sizeof(g_log) - have, "%s %s\n", level, message);
+}
+
+static int logged(const char *text)
+{
+    return strstr(g_log, text) != NULL;
+}
+
+/*
+ * HELPER-SNAP-POLICY: every snapshot the helper creates or destroys is one
+ * INFO line naming the snapshot and its dataset or subvolume, so an
+ * operator can see from the helper's log alone which datasets a capture
+ * touched, and for how long. A release of one already gone logs nothing.
+ */
+static void test_snapshots_are_logged(void **state)
+{
+    (void)state;
+    log_level_t was = log_get_level();
+    log_set_level(LOG_INFO);
+    g_log[0] = '\0';
+    int h = log_stream_register(capture_log, NULL);
+    assert_true(h >= 0);
+
+    snap_set_t s;
+    memset(&s, 0, sizeof(s));
+    snap_dom_t d;
+    assert_int_equal(snap_domain_of(&ctx, CACHE "/appdata/app", &d), OK);
+    assert_int_equal(snap_set_add(&s, &d), OK);
+    assert_int_equal(snap_domain_of(&ctx, POOL "/appdata/x", &d), OK);
+    assert_int_equal(snap_set_add(&s, &d), OK);
+    assert_int_equal(snap_take(&ctx, &s, "0badf00d", 40, &holds), OK);
+    char z[256], b[PATH_MAX + 128], zd[256], bd[PATH_MAX + 128];
+    snprintf(z, sizeof(z), "snap: created ZFS snapshot cache/appdata@%s of dataset cache/appdata",
+             s.names[0]);
+    snprintf(b, sizeof(b), "snap: created btrfs snapshot " POOL "/system/.cbackup-snapshots/%s "
+             "of subvolume " POOL, s.names[1]);
+    snprintf(zd, sizeof(zd), "snap: destroyed ZFS snapshot cache/appdata@%s of dataset "
+             "cache/appdata", s.names[0]);
+    snprintf(bd, sizeof(bd), "snap: destroyed btrfs snapshot " POOL "/system/.cbackup-snapshots/%s "
+             "in pool " POOL, s.names[1]);
+    if (!logged(z) || !logged(b)) fail_msg("no create lines:\n%s", g_log);
+    if (logged("snap: destroyed")) fail_msg("destroyed early:\n%s", g_log);
+    assert_int_equal(snap_release(&ctx, &s, "0badf00d", &holds), OK);
+    if (!logged(zd) || !logged(bd)) fail_msg("no destroy lines:\n%s", g_log);
+
+    /* Already gone: no line. */
+    g_log[0] = '\0';
+    char det[256];
+    snprintf(det, sizeof(det), "zfs:cache/appdata@%s", s.names[0]);
+    assert_int_equal(snap_release_detail(&ctx, det, "0badf00d"), OK);
+    if (logged("snap: destroyed")) fail_msg("a release of nothing logged:\n%s", g_log);
+
+    /* The sweep's destroys are logged the same way. */
+    snap_set_t a;
+    memset(&a, 0, sizeof(a));
+    assert_int_equal(snap_domain_of(&ctx, CACHE "/Photos", &d), OK);
+    assert_int_equal(snap_set_add(&a, &d), OK);
+    assert_int_equal(snap_take(&ctx, &a, "0badf00d", 41, NULL), OK);
+    unsigned removed = 0, foreign = 0;
+    assert_int_equal(snap_sweep(&ctx, "0badf00d", NULL, 0, &removed, &foreign), OK);
+    assert_int_equal(removed, 1);
+    snprintf(zd, sizeof(zd), "info snap: destroyed ZFS snapshot cache/Photos@%s of dataset "
+             "cache/Photos", a.names[0]);
+    log_stream_unregister(h);
+    log_set_level(was);
+    if (!logged(zd)) fail_msg("no sweep destroy line:\n%s", g_log);
+}
+
 static void test_exported_share_refused(void **state)
 {
     (void)state;
@@ -377,6 +454,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_btrfs_capture, setup, teardown),
         cmocka_unit_test_setup_teardown(test_btrfs_nested, setup, teardown),
         cmocka_unit_test_setup_teardown(test_exported_share_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_snapshots_are_logged, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }
