@@ -17,12 +17,21 @@
 # its subordinate uids (newuidmap), which is the same drop with the same
 # capability sets, as far as the files in the namespace are concerned.
 # Without either the suite is skipped, saying so.
+#
+# B244: the hardened container runs with a read-only root, so SQLite has
+# nowhere of its own to put temporary files, and the first start of M10
+# failed in migration 009. Where a private mount namespace is available the
+# whole suite runs that way: /tmp, /var/tmp and /usr/tmp read-only and the
+# working directory too, so the state volume is the only place left. It also
+# starts the daemon on a database an M9 daemon left at migration 008
+# (tests/fixtures/state-at-008.sql), as FS1's upgrade did.
 
 set -u
 
 DAEMON="$(realpath "${1:-build/bins/c-backupd}")"
 CLI="$(realpath "${2:-build/bins/c-backup}")"
 SELF="$(realpath "$0")"
+FIXTURE_008="$(realpath "$(dirname "$0")/fixtures/state-at-008.sql")"
 export C_BACKUP_TXN_GUARD=abort
 TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
 mkdir -p "$TEST_ROOT"
@@ -42,6 +51,10 @@ if [ -z "${B215_INNER:-}" ]; then
     # Real root whose bounding set still holds CAP_DAC_READ_SEARCH (2), the
     # one capability the drop keeps effective: run as is.
     if [ "$(id -u)" = 0 ] && cap_bnd_has 2; then
+        if unshare --mount --propagation private true 2>/dev/null; then
+            export B244_PRIVATE_MOUNTS=1
+            exec unshare --mount --propagation private bash "$SELF" "$DAEMON" "$CLI"
+        fi
         exec bash "$SELF" "$DAEMON" "$CLI"
     fi
     # Otherwise a user namespace. Root maps itself; anyone else maps itself
@@ -63,6 +76,11 @@ if [ -z "${B215_INNER:-}" ]; then
         echo "privilege drop e2e: skipped (user namespaces are not available here)"
         exit 0
     fi
+    if unshare "${MAP[@]}" --setuid 0 --setgid 0 --mount --propagation private true 2>/dev/null; then
+        export B244_PRIVATE_MOUNTS=1
+        exec unshare "${MAP[@]}" --setuid 0 --setgid 0 --mount --propagation private \
+             bash "$SELF" "$DAEMON" "$CLI"
+    fi
     exec unshare "${MAP[@]}" --setuid 0 --setgid 0 bash "$SELF" "$DAEMON" "$CLI"
 fi
 
@@ -76,8 +94,14 @@ FAIL=0
 cleanup() {
     [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
     wait "${DAEMON_PID:-}" 2>/dev/null
+    [ -n "${D8_PID:-}" ] && kill "$D8_PID" 2>/dev/null
+    wait "${D8_PID:-}" 2>/dev/null
     # Here, not outside: in a namespace, files uid 990 made belong to a
-    # subordinate uid the invoking user cannot remove.
+    # subordinate uid the invoking user cannot remove. The read-only working
+    # directory is a mount point (B244), so it is left and unmounted first.
+    if mountpoint -q "$WORK/ro-cwd" 2>/dev/null; then
+        cd "$WORK" && umount "$WORK/ro-cwd"
+    fi
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -160,6 +184,25 @@ wait_backfilled() {
     echo "  state.db $DB bytes, WAL at $F frames ($(shm_u32 96) copied), file $(stat -c %s "$WORK/state/state.db-wal") bytes"
 }
 
+# B244: no writable directory of SQLite's own. Each is covered by a
+# read-only tmpfs in this mount namespace only, and the working directory is
+# one too, since SQLite falls back to it last.
+NO_TMP=no
+if [ "${B244_PRIVATE_MOUNTS:-}" = 1 ]; then
+    NO_TMP=yes
+    mkdir -p "$WORK/ro-cwd"
+    for d in /tmp /var/tmp /usr/tmp "$WORK/ro-cwd"; do
+        [ -d "$d" ] || continue
+        mount -t tmpfs -o ro,size=4k tmpfs "$d" || { NO_TMP=no; break; }
+    done
+    cd "$WORK/ro-cwd" || NO_TMP=no
+fi
+if [ "$NO_TMP" = yes ]; then
+    echo "no writable temporary directory (/tmp, /var/tmp, the working directory: read-only)"
+else
+    echo "B244 read-only temporary directories: skipped (no private mount namespace here)"
+fi
+
 start_daemon
 if grep -q "CAP_DAC_READ_SEARCH is not available" "$WORK/d.log"; then
     echo "privilege drop e2e: skipped (CAP_DAC_READ_SEARCH is not available to keep here)"
@@ -169,11 +212,54 @@ fi
 echo "the drop"
 check    "the daemon is listening" "yes" "$([ -S "$SOCK" ] && echo yes || echo no)"
 contains "it dropped to uid 990" "running as uid 990" "$(cat "$WORK/d.log")"
+# B244: on fresh state every migration ran, 009 included, with no writable
+# temporary directory but the state volume.
+contains "the temporaries are in the state volume" \
+         "sqlite temporary files: $WORK/state" "$(cat "$WORK/d.log")"
+lacks    "no migration failed" "migrations failed" "$(cat "$WORK/d.log")"
 # What made B215 possible: the state files are root's, created before the
 # drop. The daemon has to cope with that, since it is how every fresh
 # deployment starts.
 check    "state.db is root's, as AppGuard made it" "0" "$(stat -c %u "$WORK/state/state.db")"
 check    "and so is its -shm" "0" "$(stat -c %u "$WORK/state/state.db-shm")"
+
+if [ "$NO_TMP" = yes ]; then
+    echo "an M9 database at migration 008 upgrades with nowhere for SQLite's temporaries"
+    mkdir -p "$WORK/state008"
+    chown 990:990 "$WORK/state008"
+    chmod 0700 "$WORK/state008"
+    sqlite3 "$WORK/state008/state.db" < "$FIXTURE_008"
+    sed -e "s#$WORK/state/#$WORK/state008/#" -e "s#$SOCK#$WORK/run/d008.sock#" \
+        "$WORK/c.yaml" > "$WORK/c008.yaml"
+    chmod 600 "$WORK/c008.yaml"
+    C_BACKUP_CONFIG_PATH="$WORK/c008.yaml" "$DAEMON" > "$WORK/d008.log" 2>&1 &
+    D8_PID=$!
+    for _ in $(seq 100); do
+        [ -S "$WORK/run/d008.sock" ] && break
+        kill -0 "$D8_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    L=$(cat "$WORK/d008.log")
+    check    "it is listening" "yes" "$([ -S "$WORK/run/d008.sock" ] && echo yes || echo no)"
+    lacks    "008 is not applied again" "applying 008_id_reserve.sql" "$L"
+    contains "009 is applied" "applying 009_journal_autoincrement.sql" "$L"
+    LAST_MIG=$(basename "$(ls "$(dirname "$SELF")"/../migrations/*.sql | tail -n 1)")
+    contains "and the last one" "applying $LAST_MIG" "$L"
+    contains "the temporaries are in the state volume" \
+             "sqlite temporary files: $WORK/state008" "$L"
+    lacks    "no migration failed" "migrations failed" "$L"
+    kill "$D8_PID"
+    wait "$D8_PID"
+    check    "it stops cleanly" "0" "$?"
+    D8_PID=
+    check    "every migration is recorded" "$(ls "$(dirname "$SELF")"/../migrations/*.sql | wc -l)" \
+             "$(sqlite3 "$WORK/state008/state.db" \
+                "SELECT COUNT(*) FROM system_migrations WHERE filename NOT LIKE '\_lib/%' ESCAPE '\'")"
+    check    "every journal entry survives, renumbered where ids collided" \
+             "1:1 1:2 1:3 3:10 3:11 2:12 2:13" \
+             "$(sqlite3 "$WORK/state008/state.db" \
+                "SELECT repo_id || ':' || id FROM journal ORDER BY id" | tr '\n' ' ' | sed 's/ $//')"
+fi
 
 echo "the WAL is checkpointed after the drop"
 check "repo add" '{"id":1}' "$(cb repo add "$WORK/repo" main)"

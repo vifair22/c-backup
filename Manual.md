@@ -191,6 +191,12 @@ unix socket and TCP listener are bound, so `systemctl start` (and
 `enable --now`) returns when the CLI can connect, and a unit ordered
 `After=c-backupd.service` starts no earlier. Startup applies any schema
 migrations first; the unit allows ten minutes for that (`TimeoutStartSec`).
+The pending migrations are applied in one transaction: a start that fails in
+any of them leaves `state.db` exactly as it was, with none applied, and logs
+`migration <name> failed (sqlite error <code>): <message>`. Fix the cause and
+start again; the next start applies the same set from the same point. A
+database that an older build migrated part of the way is equally fine: each
+applied migration is recorded with its checksum, and only the rest run.
 It then repairs whatever a crash or power cut left in the index, before the
 API binds, and logs one `start-up:` line per step with the time it took
 (`start-up: pack presence: 0.055 s`), so a slow start names the step that
@@ -393,9 +399,17 @@ the engine makes goes into the repository it is working on: packs being
 written, snapshot records, `snapshot-ids` and the tag mirror. A replication
 target's staging goes into the target's own `tmp/`. The `tmp/` directory is recreated when a repository is opened if
 someone removed it. SQLite's own temporary files (large sorts, temporary
-indices) go beside `state.db`, in the state volume, unless `SQLITE_TMPDIR`
-names somewhere else; set it only to a directory the daemon can write. The
-daemon logs the location at start (`sqlite temporary files: ...`).
+indices, a table being rebuilt) go beside `state.db`, in the state volume,
+unless `SQLITE_TMPDIR` names somewhere else; set it only to a directory the
+daemon can write. The location is fixed as `state.db` is opened, so it covers
+the schema migrations that run before anything else. Earlier builds fixed it
+only after them, so an upgrade whose migration rebuilt a table (009, the
+journal) failed on a read-only root unless `/tmp` was a tmpfs. Those files are
+deleted as they are opened, so nothing accumulates, but while they exist
+they take space in the state volume: a migration that rebuilds the journal
+needs about the journal's size again, briefly. The daemon logs the location
+at start (`sqlite temporary files: ...`), or a warning if it could not fix one
+and SQLite is left with its own defaults.
 
 ### 2.4 The desktop app
 
@@ -3587,6 +3601,10 @@ docker run -d --name c-backupd --restart unless-stopped \
   -p 127.0.0.1:8765:8765 \
   <registry>/vifair22/c-backup:<tag>
 ```
+
+No `--tmpfs /tmp`: with `--read-only` nothing in the daemon writes to `/tmp`,
+SQLite included (section 2.3). The state volume holds SQLite's temporary
+files, migrations included, so it needs that room as well as `state.db`'s.
 
 **FS2** (btrfs cache pool with no subvolumes; Docker only, no VMs): the
 same two commands without the libvirt socket, `/mnt/user/domains`, the two

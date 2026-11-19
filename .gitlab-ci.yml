@@ -515,6 +515,9 @@ build:image:
     - docker ps --filter name=smoke --filter status=running | grep -q smoke
     - docker logs smoke
     - docker rm -f smoke
+    # B244: and started the hardened way, read-only with no /tmp.
+    - apk add --no-cache bash sqlite >/dev/null
+    - tests/image_readonly_check.sh "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_JOB_ID"
     - retry registry_login
     - retry docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
   only:
@@ -533,7 +536,8 @@ build:image:check:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
-        paths: [Makefile, Dockerfile, .dockerignore, cutils_version, .gitlab-ci.yml, packaging/**/*]
+        paths: [Makefile, Dockerfile, .dockerignore, cutils_version, .gitlab-ci.yml, packaging/**/*,
+                migrations/**/*, tests/image_readonly_check.sh, tests/fixtures/**/*]
   variables:
     CHECK_TAG: cbackup-mrcheck:$CI_PIPELINE_ID
   script:
@@ -544,6 +548,11 @@ build:image:check:
     - sleep 5
     - docker ps --filter "name=smoke-$CI_JOB_ID" --filter status=running | grep -q "smoke-$CI_JOB_ID"
     - docker logs "smoke-$CI_JOB_ID"
+    # B244: Manual 22.2.1's hardened run, a read-only root and no /tmp, on
+    # fresh state and on a database at migration 008. Migration 009 needs
+    # SQLite temporaries, and M10 could not start that way.
+    - apk add --no-cache bash sqlite >/dev/null
+    - tests/image_readonly_check.sh "$CHECK_TAG" "$CI_JOB_ID"
   after_script:
     - docker rm -f "smoke-$CI_JOB_ID" >/dev/null 2>&1 || true
     - docker rmi "cbackup-mrcheck:$CI_PIPELINE_ID" >/dev/null 2>&1 || true

@@ -55,6 +55,7 @@
 #include "sync_latch.h"
 #include "walidx.h"
 #include "checkpointer.h"
+#include "sqlite_tmpdir.h"
 #include "pack_presence.h"
 #include "prune.h"
 #include "store_index.h"
@@ -300,35 +301,6 @@ static void tighten_umask(void)
     umask(0077);
 }
 
-/*
- * Where SQLite puts its own temporary files: sorts that outgrow the page
- * cache, temporary indices, spilled statement journals.
- *
- * Left alone it tries SQLITE_TMPDIR, TMPDIR, /var/tmp, /usr/tmp, /tmp and the
- * working directory, all of which are on the root filesystem in the
- * hardened container (Manual section 2.3, --read-only), and a large query
- * would then fail with an I/O error. The state database's own directory is
- * a volume that must be writable anyway, so temporaries go there unless the
- * operator chose otherwise with SQLITE_TMPDIR. SQLite unlinks each file as
- * soon as it opens it, so nothing accumulates.
- *
- * Set once, before any job thread exists; SQLite reads the pointer without
- * a lock and documents it as a startup-only setting.
- */
-static void pin_sqlite_temp_dir(const char *db_path)
-{
-    if (!db_path || !*db_path || getenv("SQLITE_TMPDIR")) return;
-
-    char buf[PATH_MAX];
-    if (snprintf(buf, sizeof(buf), "%s", db_path) >= (int)sizeof(buf)) return;
-    const char *dir = dirname(buf);
-
-    char *copy = sqlite3_mprintf("%s", dir);
-    if (!copy) return;
-    sqlite3_temp_directory = copy;
-    log_info("sqlite temporary files: %s", dir);
-}
-
 int main(int argc, char *argv[])
 {
     /* Line-buffer so log lines reach journald whole. Without this libc
@@ -344,9 +316,17 @@ int main(int argc, char *argv[])
      * hook that reports a write made outside the write lock (B157). */
     db_txn_guard_install();
 
+    /* Before AppGuard opens the database too: its migrations are the first
+     * statements on it, and one of them needs temporary files, which a
+     * read-only root has nowhere to put (B244, sqlite_tmpdir.h). */
+    if (sqlite_tmpdir_install() != 0)
+        fprintf(stderr, "c-backupd: cannot register the SQLite temporary-file hook; "
+                        "SQLite's temporary files go to its default directories\n");
+
     appguard_config_t ag_cfg = app_appguard_config();
     ag_cfg.on_signal = on_signal;
     appguard_t *guard = appguard_init(&ag_cfg);
+    sqlite_tmpdir_uninstall();
     if (!guard)
         return 1;
 
@@ -410,7 +390,18 @@ int main(int argc, char *argv[])
         goto out_guard;
     }
 
-    pin_sqlite_temp_dir(db_path);
+    {
+        const char *tmpdir = sqlite_tmpdir_chosen();
+        const char *env = getenv("SQLITE_TMPDIR");
+        if (tmpdir)
+            log_info("sqlite temporary files: %s", tmpdir);
+        else if (env && *env)
+            log_info("sqlite temporary files: %s (SQLITE_TMPDIR)", env);
+        else
+            log_warn("sqlite temporary files: SQLite's default directories (the state "
+                     "database's directory could not be taken); on a read-only root, "
+                     "set SQLITE_TMPDIR");
+    }
 
     /* Before anything writes: every statement after this runs on the
      * settings the daemon is measured and documented with (state_db.h). */
