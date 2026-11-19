@@ -2029,13 +2029,13 @@ static void test_first_backup_index_writes_stay_sequential(void **state)
     long long rowless = atoll(r->rows[0][2]);
     db_result_free(r);
     double frames = (double)(m1.commit_frames - m0.commit_frames);
-    print_message("  %.0f WAL frames for %u new objects (%.2f an object)\n",
-                  frames, res.objects_new, frames / res.objects_new);
+    print_message("  %.0f WAL frames for %llu new objects (%.2f an object)\n",
+                  frames, (unsigned long long)res.objects_new, frames / (double)res.objects_new);
     assert_true(packed >= (long long)res.objects_new);
     assert_int_equal(objects, packed);
     assert_int_equal(rowless, 0);
     /* Staged rows measured 0.51 here; the commit's rows alone 0.28. */
-    assert_true(frames / res.objects_new < 0.40);
+    assert_true(frames / (double)res.objects_new < 0.40);
 }
 
 /* node_hashes holds exactly the file rows with content, of every snapshot

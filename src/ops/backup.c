@@ -1390,8 +1390,9 @@ static status_t store_synth_all(pipeline_t *p, int late)
     }
     free(at);
     if (st != OK) {
-        /* Rows of whatever was staged go in with the trees' batch, as a
-         * failed file's do; the caller discards the pack. */
+        /* Pending rows go in with the trees' batch, as a failed file's do:
+         * only objects an earlier pack holds get one (index_row), and the
+         * caller discards the open pack, whose objects have none. */
         char why[ERR_MSG_MAX];
         snprintf(why, sizeof(why), "%s", err_msg());
         batch_close(p, b);
@@ -1579,7 +1580,7 @@ static status_t store_content(pipeline_t *p)
      * that was abandoned may have been referenced by another writer as
      * stored, so a snapshot made from this run could name a chunk that never
      * landed: the run fails instead. This thread's writer leaves the set;
-     * its own staged names are known to it, and nothing else is writing.
+     * its own names are known to it, and nothing else is writing.
      */
     if (p->claims) {
         uint64_t lost = pack_claims_abandoned(p->claims);
@@ -1602,9 +1603,10 @@ static status_t store_content(pipeline_t *p)
     }
     cdc_workers_stop(p->cdc_w);
     p->cdc_w = NULL;
-    /* Rows still pending belong to a file that failed part-way; its chunks
-     * are in the open pack, and the trees phase must not see them as
-     * someone else's. They are written, staged, with the trees' batch. */
+    /* Rows still pending belong to a file that failed part-way. They are
+     * flushed with the trees' batch: an object an earlier pack holds gets
+     * its row back, and one in the open pack gets its row when that pack
+     * commits (index_row). */
     p->sink = NULL;
     if (sink->n) {
         batch_open(p, &p->batch);
@@ -1936,8 +1938,8 @@ static status_t store_content_loop(pipeline_t *p)
                 return set_error(sfail, "backup: storing %s: %s", e->path, why);
             }
         }
-        /* Chunks a failed or discarded read staged are in the open pack;
-         * their rows go in with the next flush, unreferenced, for gc. */
+        /* Chunks a failed or discarded read put in the open pack get their
+         * rows from its commit, unreferenced, for gc. */
         p->res->objects_new  += cr.chunks_new + cr.lists.lists_new;
         p->res->bytes_stored += cr.phys_new;
         char rerr[ERR_MSG_MAX];
@@ -2082,9 +2084,10 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
     /*
      * Tree rows are written in batches, like the store phase's (batch_t).
      *
-     * Each new tree records one staged row, and these went in one statement
-     * at a time with no transaction open: a commit, and a WAL sync, per new
-     * directory. That was 9 s of a 19 s backup of 308 directories with sync
+     * Each new tree recorded a row (now only a tree an earlier pack holds
+     * does; the open pack's get theirs from its commit), and these went in
+     * one statement at a time with no transaction open: a commit, and a WAL
+     * sync, per new directory. That was 9 s of a 19 s backup of 308 directories with sync
      * at 20 ms, and 16 to 19 s per run on the UAT host (OWN-16). In a batch
      * they are one commit, and the job's progress writes in this phase join
      * it instead of syncing on their own. A writer that queues is let in
@@ -2115,8 +2118,8 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
     status_t st = tree_build(p->scan, &ops, root_hash, NULL);
 
     /* Committed on failure too, as the store phase does: the rows name
-     * objects in the open pack, and the caller drops staged rows when the
-     * pack is discarded. */
+     * objects earlier packs hold, never the open pack's, which the caller
+     * discards. */
     if (tsink->n) {
         batch_open(p, b);
         status_t fst = bsink_flush(tsink, 0);
@@ -2675,9 +2678,10 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
      * Set before setup so its transaction is counted with the rest. */
     phase_current = &timers;
 
-    /* Rows a crashed or aborted backup staged into a pack that never
-     * landed. This job holds the repository's write lock, so nothing else
-     * can be staging now. */
+    /* Staged rows a crash left: store_index_drop_unannounced turns a cut
+     * pack commit's rows back into them at start, and a daemon before
+     * index_row wrote them during every backup. This job holds the
+     * repository's write lock, so nothing else is writing rows now. */
     uint64_t _tsu = phase_now(), _tsun = phase_nested(&timers);
     st = store_index_drop_staged(db, repo_id);
     if (st == OK) st = pack_backup_open(store, &p.pack_w);
@@ -2729,11 +2733,11 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
 
     if (st != OK) {
         /*
-         * The open pack was just discarded, so rows staged into it name
-         * bytes that no longer exist. The next backup would drop them, but
-         * until then they claim objects the repository does not hold, and a
-         * cancelled backup should leave the index as it found it. The error
-         * is the backup's; a failure here is only logged.
+         * The open pack was just discarded. A backup writes no rows for its
+         * objects (index_row), so there should be no staged rows naming
+         * it; any there are would claim objects the repository does not
+         * hold, and a cancelled backup should leave the index as it found
+         * it. The error is the backup's; a failure here is only logged.
          */
         char why[ERR_MSG_MAX];
         snprintf(why, sizeof(why), "%s", err_msg());

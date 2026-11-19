@@ -259,10 +259,10 @@ in-run memo of already-ensured hashes keeps repeats from costing a
 resolver query each - a quarter-million of those per incremental would be
 the tight-loop-on-the-shared-DB-handle pattern again.
 
-Each newly stored object gets a row in `objects` with `location = 'staged'`
-while its pack is still open (`store_index_put_staged`), `phys_size` the
-stored bytes and `orig_size` the payload size. The pack-commit callback
-turns `staged` into the pack's id when the pack is installed. An object the
+A newly stored object gets no row while its pack is open: the pack-commit
+callback creates it when the pack is installed, with the pack's id as its
+location, `phys_size` the stored bytes and `orig_size` the payload size
+(`index_row` in backup.c, `db_pack_commit` in store_index.c). An object the
 repository already holds in a pack is recorded with that pack's location
 (`store_index_put_packed`). Seeing the same name twice leaves the existing
 row alone.
@@ -392,9 +392,9 @@ sidecar; a pack is one atomic rename. Only after the file is durably in
 place does the store emit `store_emit_pack_commit` with every entry's name,
 offset, sizes and `entry_index`. The daemon-side handler
 (`src/ops/store_index.c`) writes the `packs` row, all `pack_objects` rows,
-and moves each `objects` row from `staged` to the pack's id - one
-transaction per pack, serialised by a mutex because SQLite has no nested
-transactions on the shared handle. `entry_index` is the *on-disk* entry
+and the `objects` row of every entry that has none - in batches and then
+the `packs` row as the visibility marker, serialised by a mutex because
+SQLite has no nested transactions on the shared handle. `entry_index` is the *on-disk* entry
 position (the array was sorted by name first); it is what lets a reader
 find the entry's CRCs in the trailer's table.
 
@@ -404,7 +404,7 @@ commit callback, which begins one, and the write lock is not recursive. In
 
 Crash ordering is: staging file in `packs/.staging/`, install by rename, then rows,
 then the snapshot record. A crash before the rename leaves a staging file
-the next start sweeps, along with any `staged` rows; a crash after it
+the next start sweeps, and no rows name its objects; a crash after it
 leaves an installed pack the index may not know, which a reindex picks up.
 Either way no snapshot names an object the repository does not hold,
 because the record is written after every seal.
