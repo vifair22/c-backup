@@ -115,6 +115,17 @@ else
         *)           ok  "and not systemctl" ;;
     esac
 fi
+DAEMON_ABS=$(realpath "$DAEMON")
+# --version prints and exits: it used to start a whole daemon (NIT-56). An
+# unknown argument is refused, not ignored, and neither leaves a socket.
+OUT=$(cd "$WORK" && env -u C_BACKUP_CONFIG_PATH timeout 10 "$DAEMON_ABS" --version 2>&1); RC=$?
+check "c-backupd --version exits 0" "0" "$RC"
+contains "c-backupd --version prints the version" "c-backupd " "$OUT"
+OUT=$(cd "$WORK" && env -u C_BACKUP_CONFIG_PATH timeout 10 "$DAEMON_ABS" --bogus 2>&1); RC=$?
+check "c-backupd refuses an unknown argument" "2" "$RC"
+contains "c-backupd names the unknown argument" "unexpected argument '--bogus'" "$OUT"
+check "c-backupd --version starts nothing" "" "$(ls "$WORK"/config.yaml "$WORK"/*.db 2>/dev/null)"
+
 # jobs watch had its own copy of the advice, which always said systemctl.
 OUT=$(container=podman "$CLI" --socket "$WORK/absent.sock" jobs watch 1 2>&1); RC=$?
 check    "watch without a daemon exits non-zero" 1 "$RC"

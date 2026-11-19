@@ -455,6 +455,10 @@ it at `$C_BACKUP_CONFIG_PATH`, or `config.yaml` in its working directory. The
 systemd unit sets `/etc/c-backupd/config.yaml`. Keep the file 0600: it holds
 the Pushover credentials.
 
+The daemon takes no arguments other than `--version`, which prints its
+version and c-utils' and exits, and `--help`; any other argument is refused
+with exit status 2 rather than ignored.
+
 There is no API that changes configuration. Edit the file and restart:
 `systemctl restart c-backupd`. Per-repository settings (retention)
 are different: they live in the database and change through the policy API
