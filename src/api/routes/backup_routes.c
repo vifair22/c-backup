@@ -1014,6 +1014,26 @@ static api_response_t get_job(const api_request_t *req, void *ud)
     return json_out(j);
 }
 
+/* For the router, when a cancel's body has a member it does not take
+ * (NIT-52): a job with no row is a 404 before the body's 400. A finished
+ * job's URL still names it, so its body error stays the 400. */
+static const char *jobs_missing_for_url(const char *url, api_method_t method, void *ud)
+{
+    (void)method;
+    backup_ctx_t *ctx = ud;
+    if (!ctx || !ctx->db) return NULL;   /* no database: no answer */
+    int64_t id = job_path_id(url);
+    if (id < 0) return NULL;
+    if (!jobs_allow_for_url(url, NULL)) return "not found";
+    char idbuf[32];
+    snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
+    db_result_t *r = NULL;
+    int found = db_execute(ctx->db, "SELECT 1 FROM jobs WHERE id = ?",
+                           (const char *[]){ idbuf, NULL }, &r) == 0 && r && r->nrows > 0;
+    db_result_free(r);
+    return found ? NULL : "no such job";
+}
+
 static api_response_t cancel_job(const api_request_t *req, void *ud)
 {
     backup_ctx_t *ctx = ud;
@@ -1056,6 +1076,7 @@ int routes_register_jobs(api_server_t *srv, cutils_db_t *db, job_manager_t *jm)
     if (api_server_route(srv, "/jobs/*",  API_GET,  API_CLASS_NONE,  get_job,       &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/jobs/*",  API_POST, API_COMMIT_ONLY, cancel_job,    &g_ctx) != 0) return -1;
     if (api_server_route_keys(srv, "/jobs/*", API_POST, API_KEYS_NONE) != 0) return -1;
+    if (api_server_route_missing_fn(srv, "/jobs/*", jobs_missing_for_url, &g_ctx) != 0) return -1;
     if (api_server_route_allow(srv, "/jobs/*", jobs_allow_for_url, NULL) != 0) return -1;
     return 0;
 }

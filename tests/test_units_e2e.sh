@@ -234,6 +234,18 @@ OUT=$(cb vm export 1 1 domain.xml 2>&1); RC=$?
 check    "only disks are exported" 1 "$RC"
 OUT=$(cb vm export 1 1 vda --ttl 10s 2>&1); RC=$?
 check    "a ttl under a minute is refused" 1 "$RC"
+# B239 and NIT-52: a revoke takes no body. An unknown member is a 400 for an
+# export that is open, and leaves it open; for one that is not, the URL
+# names nothing and that 404 wins.
+if command -v curl >/dev/null 2>&1; then
+    check "a revoke with a member is refused" \
+        "{\"error\":\"unknown key 'zz_b239'; this request takes no fields\"} 400" \
+        "$(curl -s -w ' %{http_code}' --unix-socket "$SOCK" -X DELETE -d '{"zz_b239":1}' "http://x/exports/$EID")"
+    contains "and the export is still open" "\"id\":$EID" "$(cb vm exports)"
+    check "an unknown export with a member is a 404" \
+        '{"error":"no open export with that id"} 404' \
+        "$(curl -s -w ' %{http_code}' --unix-socket "$SOCK" -X DELETE -d '{"zz_b239":1}' http://x/exports/999999)"
+fi
 OUT=$(cb vm unexport "$EID"); RC=$?
 check    "revoking it succeeds" 0 "$RC"
 check    "and removes the socket" "no" "$([ -e "$ESOCK" ] && echo yes || echo no)"

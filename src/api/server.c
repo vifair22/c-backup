@@ -56,6 +56,12 @@ typedef struct {
 } keys_entry_t;
 
 typedef struct {
+    char           pattern[128];  /* ends in '*' */
+    api_missing_fn fn;
+    void          *userdata;
+} missing_entry_t;
+
+typedef struct {
     char          pattern[128];   /* ends in '*' */
     api_allow_fn  fn;
     void         *userdata;
@@ -84,6 +90,8 @@ struct api_server {
     int                nclass;
     keys_entry_t       keys_fns[MAX_CLASS_FNS];
     int                nkeys;
+    missing_entry_t    missing_fns[MAX_CLASS_FNS];
+    int                nmissing;
     api_auth_fn        auth_fn;
     void              *auth_ud;
     api_after_write_fn after_write_fn;
@@ -703,8 +711,22 @@ static api_response_t run_buffered(api_server_t *srv, const route_entry_t *route
          * serve: the handler answers that 404 or 405 itself. */
         const char *const *keys = route_keys(srv, route, req->url, req->method);
         char msg[768];
-        if (keys && api_body_unknown_key(req->body, req->body_len, keys, msg, sizeof(msg)))
+        if (keys && api_body_unknown_key(req->body, req->body_len, keys, msg, sizeof(msg))) {
+            /* A URL that names nothing is a 404 whatever its body holds
+             * (NIT-52). */
+            const missing_entry_t *m = NULL;
+            size_t best = 0;
+            for (int i = 0; i < srv->nmissing; i++) {
+                size_t plen = strlen(srv->missing_fns[i].pattern);
+                if (strncmp(req->url, srv->missing_fns[i].pattern, plen - 1) == 0 && plen > best) {
+                    m = &srv->missing_fns[i];
+                    best = plen;
+                }
+            }
+            const char *gone = m ? m->fn(req->url, req->method, m->userdata) : NULL;
+            if (gone) return api_error(404, gone);
             return api_error(400, msg);
+        }
     }
     if (req->method != API_GET && srv->durable_gate_fn &&
         route_class(srv, route, req->url, req->method) == API_DURABLE) {
@@ -1114,6 +1136,22 @@ int api_server_route_keys_fn(api_server_t *srv, const char *pattern,
     snprintf(k->pattern, sizeof(k->pattern), "%s", pattern);
     k->fn = fn;
     k->userdata = userdata;
+    return CUTILS_OK;
+}
+
+int api_server_route_missing_fn(api_server_t *srv, const char *pattern,
+                                api_missing_fn fn, void *userdata)
+{
+    size_t plen = strlen(pattern);
+    if (plen == 0 || pattern[plen - 1] != '*')
+        return set_error(CUTILS_ERR, "missing resolver pattern must end in '*'");
+    if (!fn) return set_error(CUTILS_ERR, "missing resolver %s: no function", pattern);
+    if (srv->nmissing >= MAX_CLASS_FNS)
+        return set_error(CUTILS_ERR, "too many missing resolvers");
+    missing_entry_t *m = &srv->missing_fns[srv->nmissing++];
+    snprintf(m->pattern, sizeof(m->pattern), "%s", pattern);
+    m->fn = fn;
+    m->userdata = userdata;
     return CUTILS_OK;
 }
 

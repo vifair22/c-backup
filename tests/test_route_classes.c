@@ -290,6 +290,19 @@ static void test_every_write_refuses_an_unknown_body_member(void **state)
         api_request_t req = { .method = m, .url = url, .client_addr = "",
                               .body = body, .body_len = sizeof(body) - 1 };
         api_response_t r = api_server_dispatch(srv, &req);
+        /* An export lives in memory and none is open here, so its URL names
+         * nothing and that 404 wins (NIT-52). Its keys must still refuse
+         * the member; test_units_e2e.sh sends the 400 to an open one. */
+        if (r.status == 404 && strncmp(url, "/exports/", 9) == 0 && r.body &&
+            strstr(r.body, "no open export with that id")) {
+            char why[256];
+            if (!api_body_unknown_key(body, sizeof(body) - 1, keys, why, sizeof(why)) ||
+                !strstr(why, "unknown key 'zz_b239'"))
+                fail_msg("%s %s does not refuse an unknown member", MNAME[m], url);
+            free(r.body);
+            free(r.set_cookie);
+            continue;
+        }
         if (r.status != 400 || !r.body || !strstr(r.body, "unknown key 'zz_b239'"))
             fail_msg("%s %s answered %d %s to an unknown member", MNAME[m], url, r.status,
                      r.body ? r.body : "");
