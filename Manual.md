@@ -4734,8 +4734,10 @@ Or copy the disk out without a kernel device:
   shows a closed one's `close_reason`: `revoked`, `expired`, `idle`,
   `repository removed`, `daemon stopped`, `daemon restarted`.
 - **Connections and memory.** `vm.export_max_conns` (default 4) caps
-  connections across every export; one past it is refused, naming the key,
-  and 0 turns exports off. Each connection holds at most one verified
+  connections across every export; one past it is refused at the NBD
+  handshake with a message naming the key (`... the limit
+  (vm.export_max_conns)`), which `qemu-img` and `qemu-nbd` print, and 0
+  turns exports off. Each connection holds at most one verified
   object, up to 16 MiB, of `jobs.read_budget_mb` while it reads, and lets it
   go after a second idle; `vm exports` shows each export's `cache_bytes`.
   The daemon refuses to start unless `jobs.read_budget_mb` >=
