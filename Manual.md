@@ -5122,7 +5122,8 @@ tables for MariaDB, `PING` for Redis, `sqlite3 -version`, the admin API's
 flags for Prometheus, `php occ status` for Nextcloud. `verified` is true when
 the probe exited 0. An unverified template still enables; the preview only
 says so. With no `--template`, a preview shows the finding's suggestion, or
-what is enabled, or for a covered finding the engine's default dump.
+what is enabled, or for a covered finding the engine's default dump; a file
+source's SQLite finding always previews `sqlite-backup`, its one engine copy.
 
 **Enable** (`POST /repos/<id>/databases/<f>/enable`, body
 `{"template":"pg-dumpall","params":{}}`) records the template and its

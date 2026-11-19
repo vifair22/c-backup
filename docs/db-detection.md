@@ -774,7 +774,7 @@ enabled template (`src/units/unit_backup.c`, `src/providers/remote_provider.c`).
 | mariadb-dump's `lock_tables` | Replaces `--single-transaction` with `--lock-tables`: `LOCK TABLES` commits any open transaction, so the two do not combine |
 | One tool, two names | The scripts pick `mariadb-dump` or `mysqldump`, `redis-cli` or `valkey-cli`, whichever the image has; occ is looked for where the official and linuxserver images keep it |
 | Timeouts | Dumps 6 hours, exec templates 10 minutes, probes 30 s |
-| Preview's default | The finding's suggestion, else what is enabled, else the engine's first template the default policy allows (a covered finding names its dump only as `optional`) |
+| Preview's default | What is enabled, else the finding's suggestion, else the engine's first template the default policy allows (a covered finding names its dump only as `optional`). A file source's SQLite finding with nothing enabled previews `sqlite-backup`, its only engine copy, whatever was suggested (B260: a dormant one, which has no suggestion, answered 400) |
 | Not built | The estimated size from the engine's own size query (7.3): no probe reports one yet. The real-engines CI job has no network, so 11.2's `db-fixtures` engines are not run there; templates are tested through the fake backend with stand-in tools |
 | The UI buttons | Left to follow D1's cards |
 
