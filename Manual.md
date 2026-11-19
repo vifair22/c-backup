@@ -1319,7 +1319,7 @@ read from a snapshot when:
 | `... is on no ZFS dataset or btrfs pool the helper's policy lists` | another filesystem (an Unraid array disk is xfs), or a dataset the policy does not name |
 | `is split across more than one pool or disk` | a `/mnt/user` share spread over the cache and the array |
 | `cannot be resolved on the host` | it does not exist where the helper looks |
-| `N mount(s) or btrfs subvolume(s) lie below it (a, b, c, ...)` | a snapshot shows them as empty directories (a ZFS child dataset, another filesystem mounted inside, a nested btrfs subvolume), the first three named and the count. On FS1, `/mnt/cache/domains` is this case: a child dataset per VM. Add each as a source of its own in snapshot mode; or back up with `--one-filesystem`, which leaves their contents out live as well (the snapshot read records each as an empty directory); or put the source in `warn` mode to read it live, a possibly torn copy that the job says is one |
+| `N mount(s) or btrfs subvolume(s) lie below it (a, b, c, ...)` | a snapshot shows them as empty directories (a ZFS child dataset, another filesystem mounted inside, a nested btrfs subvolume), the first three named and the count. On FS1, `/mnt/cache/domains` is this case: a child dataset per VM. Add each as a source of its own in snapshot mode; or back up with `--one-filesystem`, which leaves them out of a snapshot read exactly as it does live: the mount point is not recorded, not even as an empty directory, wherever the snapshot shows one (a ZFS snapshot shows a child dataset's mountpoint empty); or put the source in `warn` mode to read it live, a possibly torn copy that the job says is one |
 | `its pool's subvolumes cannot be listed` | the helper could not check for nested btrfs subvolumes, so it does not trust the snapshot |
 | `the helper took no snapshot: ...` | the helper is unreachable or the snapshot failed |
 | `no helper is configured (units.helper_socket)` | only the helper can take a snapshot |
@@ -1348,7 +1348,12 @@ helper at once (its session closes); a helper that died has them swept at
 its next start; and none outlives the policy's `capture_max_s` lease. A
 backup still reading when the lease runs out loses the snapshot under it:
 files read after that are skipped and listed (6.3), and the job warns that
-the lease ran out (`source_snapshot_lease_lost` in its result). Size the
+the lease ran out (`source_snapshot_lease_lost` in its result). A lease
+that runs out before the read reaches a source fails the job instead, as
+for any source that cannot be read, naming it and why: `source <path>
+cannot be read from its snapshot (<read path>: No such file or directory);
+no snapshot written; the helper destroyed the source snapshot before the
+read ended (its capture_max_s lease ran out)`. Size the
 lease for the longest first backup. While
 it exists, anything that can read the dataset root (ZFS `.zfs`) or the pool's
 snapshot directory (btrfs) can read the snapshot (22.5.4).

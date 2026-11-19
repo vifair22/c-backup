@@ -2544,9 +2544,15 @@ static status_t check_sources(const backup_opts_t *opts)
         char why[PATH_MAX + 160];
         if (reserved_source_refused(rec, why, sizeof(why)) != 0)
             return set_error(ERR_INVALID, "%s; no snapshot written", why);
-        if (lstat(src, &sb) != 0)
+        /* Read from a snapshot, the source is still named as the operator
+         * knows it, with where it was read from (B265). */
+        if (lstat(src, &sb) != 0) {
+            if (src != rec)
+                return set_error(ERR_INVALID, "source %s cannot be read from its snapshot (%s: %s); "
+                                 "no snapshot written", rec, src, strerror(errno));
             return set_error(ERR_INVALID, "source %s cannot be read (%s); "
                              "no snapshot written", src, strerror(errno));
+        }
         if (S_ISDIR(sb.st_mode)) {
             DIR *d = opendir(src);
             if (!d)
