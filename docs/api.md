@@ -1211,7 +1211,20 @@ one with just those two; a result that names either key itself keeps its
 own. A job left running or queued by a daemon that
 stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it, and journalled then with that message:
-a daemon that was killed had no chance to journal it itself.
+a daemon that was killed had no chance to journal it itself. A backup whose
+snapshot record is in the repository is the exception (B238): the backup
+records which snapshot it is writing, durably, before the record exists, and
+the next start marks it `completed` with `result`
+`{"snapshot_id":N,"recovered":true}` and journals it as a success. When the
+repository cannot be read at that start its error is `interrupted by daemon
+restart; snapshot N may have been written, and the repository could not be
+read at start: <reason>`.
+
+A job's end is made durable before it is shown: from the moment its end is
+written until the WAL holding it is synced, `/jobs`, `/jobs/<id>` and the
+stream show the job as `running`, with no `ended`, `error` or `result`. So a
+client that has read a job's end never reads a different one after a power
+cut.
 
 A job whose end cannot be written, because `state.db`'s filesystem is full,
 say, is not left reading `running`. Its end (`state`, `error`, `ended`, its
@@ -1726,8 +1739,9 @@ many 16 MiB chunks beside a job's 48 MiB. An export closes at its expiry,
 after `vm.export_idle_s` with no connection, when revoked, when its
 repository is removed, and when the daemon stops; the ids are `AUTOINCREMENT` and opening and closing are journalled
 with the caller. The server speaks fixed newstyle with structured replies,
-`NBD_OPT_GO`/`INFO`, `base:allocation` (the snapshot's holes are holes to
-the client), `READ`, `BLOCK_STATUS` and `DISC`; writes are refused with
+`NBD_OPT_GO`/`INFO` (minimum block 512, preferred 4096), `base:allocation`
+(the snapshot's holes are holes to the client, in whole 512-byte sectors;
+a sector holding any data is data), `READ`, `BLOCK_STATUS` and `DISC`; writes are refused with
 `EPERM`, `NBD_OPT_LIST` with a policy error, a wrong name at `NBD_OPT_GO`.
 
 | POST | `/repos/<id>/units/<p>/<u>/detect` | Database detection on the unit now, without a backup (`db-detection.md` 7.4, Manual 23.9): units.probe, and a scan of each included mount where a live read would read it, reading only file headers. No fields: no body or `{}`, and any key is a 400 naming it. 202 with `{"job_id":N}`; the job's result is `{"databases":...}`, the object a backup's result carries, judged against the capture the next backup would make, and its findings are recorded under `unit:<key>`. It never alerts; new live findings and coverage changes are journalled. 409 while `db_detect.enabled` is 0 or the provider's helper cannot be reached, 404 for an unknown provider; a unit its provider does not list, or outside `units.allow`, fails the job |

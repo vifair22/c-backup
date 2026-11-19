@@ -59,6 +59,8 @@ int      nbd_has_bitmap(const nbd_client_t *c);
 /* The server's preferred and maximum request sizes (block-size info, or
  * defaults). */
 uint32_t nbd_max_request(const nbd_client_t *c);
+/* The server's minimum block size (block-size info, or 1). */
+uint32_t nbd_min_block(const nbd_client_t *c);
 
 /* Exactly len bytes at off. Hole chunks are zero-filled. */
 status_t nbd_read(nbd_client_t *c, uint64_t off, void *buf, size_t len);

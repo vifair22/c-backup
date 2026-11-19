@@ -449,10 +449,10 @@ suggestion, the file backup adds an engine copy:
     rollback-journal database's copy takes a shared lock that blocks the
     application's writers for its duration; that is opt-in per finding
     (`allow_rollback_lock`).
-  - The read-only open must succeed. A WAL database whose `-shm` the daemon
-    cannot use (its uid 990 cannot write it, and SQLite's read-only WAL
-    support needs the `-wal` and `-shm` files present) falls back to the
-    flagged raw read, with that reason.
+  - The read-only open must succeed, and must create and change nothing
+    in the source directory (B247, 14.6). A WAL database whose `-shm` the
+    daemon cannot read, or whose `-wal` holds commits with no `-shm`,
+    falls back to the flagged raw read, with that reason.
   - The scanner's own descriptor on the file is closed before SQLite opens
     it: POSIX locks are per process, and closing any descriptor on the file
     would silently drop SQLite's locks.
@@ -820,3 +820,25 @@ is judged per backup: a later backup whose copy fails is `uncovered` again,
 a coverage change (journalled), and alerts once more (7.3). Applied in
 `db_captures_judge` (`src/ops/db_capture.c`) before the findings are
 recorded, so the job result, `db_findings`, the metrics and the app agree.
+
+### 14.6 The copy leaves the source alone (B247)
+
+A `SQLITE_OPEN_READONLY` connection is read-only towards the database, not
+towards its directory: opening a WAL database creates its `-wal` and `-shm`
+when they are missing, and a read-only connection cannot checkpoint, so it
+leaves them behind. The first copy of a dormant WAL database therefore wrote
+two files into the source, and the next backup stored them and read them as
+a sign of life (`live`, a coverage change, journalled). A backup must never
+change what it reads. Decided: the copy never lets SQLite open a WAL
+database by its plain path, and is still a transactional copy of one commit.
+
+| Point | As built |
+|---|---|
+| The lock | The copy takes SQLite's own SHARED lock on the database (the pending byte, then the shared range, as `os_unix.c` does) on a descriptor of its own, as an open-file-description lock, so SQLite closing its descriptor does not drop it. A filesystem that refuses OFD locks gets a classic one, which merges with SQLite's and lasts until its connection closes. Held, it stops the last connection closing from checkpointing and removing `-wal` and `-shm`, so what the copy sees beside the database stays there |
+| `-wal` and `-shm` both present | `mode=ro&readonly_shm=1`: SQLite's WAL read protocol with the `-shm` mapped read-only. A live writer coordinates with it as with any reader; a `-shm` nobody holds is rebuilt in SQLite's heap. Nothing is created or written. A `-shm` the daemon cannot read is refused |
+| No `-wal` (or an empty one with no `-shm`) | No WAL connection is open, so the main file is the whole database: `immutable=1`, which takes no locks and opens no siblings. A connection that opens meanwhile must create the missing file and cannot remove it while the lock is held, so the copy checks both siblings are as they were afterwards and tries again if not (a retry like a busy one, three then abandoned); only then could a checkpoint have written under it |
+| Commits in `-wal`, no `-shm` | Refused: `immutable=1` would not see them and any other read creates a `-shm`. Only a crashed writer leaves this; the raw read stands |
+| Rollback journal | Opened read-only by path as before (its readers create nothing, and SQLite's locks keep a hot journal right); a stray `-wal` beside one with no `-shm` is refused like the WAL case |
+| Not from the source snapshot | A source read from a ZFS or btrfs snapshot (9.4) is already `covered-crash`; the copy still reads the live path, now without changing it |
+| Leftovers | `-wal` and `-shm` files earlier builds left are not removed: the backup does not write the source. They are read through, and go when the application next closes the database cleanly |
+| Tests | `tests/test_db_capture.c`: the source directory byte-, listing- and mtime-identical (the directory's own mtime included) around a copy of a dormant WAL database, one with leftover siblings, a rollback database, a WAL database a writer in another process holds with commits in its `-wal`, and a crashed writer's; and around two whole backups with engine copies, the second reading as many files as the first |
