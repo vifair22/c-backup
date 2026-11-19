@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <stdarg.h>
 #include <stddef.h>
 #include <setjmp.h>
@@ -8,7 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/acl.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include "scan.h"
@@ -363,6 +365,76 @@ static void test_scan_collect_meta_off_and_collect_on_demand(void **state) {
 }
 
 /*
+ * PERF-ACL-SKIP: the scan reads a POSIX ACL only when listxattr names one.
+ * Every shape that carries an ACL must still arrive with it: an access ACL
+ * alone, an access ACL beside a user xattr, a directory's default ACL
+ * alone; and a plain file must still have none.
+ */
+static const scan_entry_t *entry_named(const scan_result_t *res, const char *path) {
+    for (uint32_t i = 0; i < res->count; i++)
+        if (strcmp(res->entries[i].path, path) == 0) return &res->entries[i];
+    fail_msg("no entry %s", path);
+    return NULL;
+}
+
+static int acl_blob_has(const scan_entry_t *e, uint8_t kind) {
+    for (size_t off = 0; e->acl_data && off + 5 <= e->acl_len;) {
+        uint8_t k = e->acl_data[off];
+        uint32_t len = (uint32_t)e->acl_data[off + 1] | (uint32_t)e->acl_data[off + 2] << 8 |
+                       (uint32_t)e->acl_data[off + 3] << 16 | (uint32_t)e->acl_data[off + 4] << 24;
+        if (k == kind) return 1;
+        off += 5 + len;
+    }
+    return 0;
+}
+
+static void test_scan_captures_acls_only_where_listed(void **state) {
+    (void)state;
+    write_file(TEST_ROOT1 "/acl_only.txt", "a");
+    write_file(TEST_ROOT1 "/acl_and_xattr.txt", "b");
+    write_file(TEST_ROOT1 "/plain.txt", "c");
+    assert_int_equal(mkdir(TEST_ROOT1 "/dflt", 0755), 0);
+    acl_t own = acl_from_text("u::rw-,g::r--,o::r--,u:1234:rw-,m::rw-");
+    acl_t dflt = acl_from_text("u::rwx,g::r-x,o::---,g:4321:r-x,m::r-x");
+    assert_non_null(own);
+    assert_non_null(dflt);
+    int rc = acl_set_file(TEST_ROOT1 "/acl_only.txt", ACL_TYPE_ACCESS, own);
+    if (rc == 0) rc = acl_set_file(TEST_ROOT1 "/acl_and_xattr.txt", ACL_TYPE_ACCESS, own);
+    if (rc == 0) rc = acl_set_file(TEST_ROOT1 "/dflt", ACL_TYPE_DEFAULT, dflt);
+    acl_free(own);
+    acl_free(dflt);
+    if (rc != 0) skip();   /* no ACL support where the tests run */
+    if (setxattr(TEST_ROOT1 "/acl_and_xattr.txt", "user.note", "v", 1, 0) != 0) skip();
+
+    scan_imap_t *imap = scan_imap_new();
+    assert_non_null(imap);
+    scan_opts_t opts = { .collect_meta = 1 };
+    scan_result_t *res = NULL;
+    assert_int_equal(scan_tree(TEST_ROOT1, imap, &opts, &res), OK);
+
+    const scan_entry_t *a = entry_named(res, TEST_ROOT1 "/acl_only.txt");
+    assert_true(acl_blob_has(a, ACL_BLOB_ACCESS));
+    assert_null(a->xattr_data);
+
+    const scan_entry_t *b = entry_named(res, TEST_ROOT1 "/acl_and_xattr.txt");
+    assert_true(acl_blob_has(b, ACL_BLOB_ACCESS));
+    assert_non_null(b->xattr_data);
+    /* The ACL travels on its own channel, never inside the xattr blob. */
+    assert_null(memmem(b->xattr_data, b->xattr_len, "posix_acl", 9));
+
+    const scan_entry_t *d = entry_named(res, TEST_ROOT1 "/dflt");
+    assert_true(acl_blob_has(d, ACL_BLOB_DEFAULT));
+    assert_false(acl_blob_has(d, ACL_BLOB_ACCESS));
+
+    const scan_entry_t *c = entry_named(res, TEST_ROOT1 "/plain.txt");
+    assert_null(c->acl_data);
+    assert_int_equal(c->acl_len, 0);
+
+    scan_result_free(res);
+    scan_imap_free(imap);
+}
+
+/*
  * B128 at the scan: a directory swapped for a symlink after its lstat and
  * before it is opened was followed by opendir(path), and the scan recorded
  * whatever the link pointed at under the source's names. The progress
@@ -544,6 +616,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_absolute_exclude_stops_at_component_boundary, setup, teardown),
         cmocka_unit_test_setup_teardown(test_absolute_exclude_is_normalised, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_root_excluded_returns_empty, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_scan_captures_acls_only_where_listed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_collect_meta_off_and_collect_on_demand, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_warns_on_unreadable_dir, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_does_not_follow_a_directory_swapped_for_a_symlink, setup, teardown),

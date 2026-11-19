@@ -386,10 +386,49 @@ api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_i
 }
 
 /*
+ * Which nodes reference an object, a page at a time, each with its full path
+ * climbed in SQL one primary-key lookup per level: a bare name
+ * ("config.yaml") does not say which of the many files of that name holds
+ * the object, which was the question. A chain that breaks before the root (a
+ * partly faulted-in snapshot) leaves the path empty rather than dropping the
+ * reference.
+ *
+ * The page comes from node_hashes, probed once per snapshot with node rows
+ * (migration 016), and only for a hash node_content says some node names. CROSS JOIN keeps that page on the outside of every join:
+ * left to choose, the planner walked every node row of the repository by
+ * repo_id and filtered it against the page, a cost that grows with snapshots
+ * times files (B268's shape; test_object_refs_do_not_walk_the_nodes holds
+ * the plan). Parameters: repo, hash, limit, offset, then repo three times.
+ */
+const char *const introspect_refs_sql =
+    "WITH RECURSIVE"
+    " refs(snap_id, nid) AS ("
+    "   SELECT h.snap_id, h.node_id FROM node_content c"
+    "    CROSS JOIN node_index_gen g CROSS JOIN node_hashes h"
+    "    WHERE c.repo_id = ?1 AND c.content_hash = ?2 AND g.repo_id = ?1 AND h.repo_id = ?1 AND h.snap_id = g.snap_id"
+    "      AND h.content_hash = ?2"
+    "    ORDER BY h.snap_id, h.node_id LIMIT ?3 OFFSET ?4),"
+    " up(nid, parent, path, depth) AS ("
+    "   SELECT n.id, n.parent_node_id, n.name, 0"
+    "     FROM refs CROSS JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
+    "   UNION ALL"
+    "   SELECT up.nid, p.parent_node_id, p.name || '/' || up.path, up.depth + 1"
+    "     FROM up JOIN nodes p ON p.repo_id = ? AND p.id = up.parent"
+    "    WHERE up.parent IS NOT NULL AND up.parent <> 0 AND up.depth < 256)"
+    " SELECT refs.snap_id, refs.nid, n.name, COALESCE('/' || up.path, ''),"
+    "        " NODE_GEN_COL("n")
+    "   FROM refs"
+    "   CROSS JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
+    "   LEFT JOIN up ON up.nid = refs.nid"
+    "             AND (up.parent IS NULL OR up.parent = 0)"
+    "  ORDER BY refs.snap_id, refs.nid";
+
+/*
  * Which snapshots and nodes reference an object.
  *
- * nodes_by_hash exists for exactly this query; without it this would be a
- * full scan of every node in the repository.
+ * node_hashes (migration 016) serves it, probed once per snapshot that has
+ * node rows (node_index_gen); without it this would be a full scan of every
+ * node in the repository.
  */
 api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
                                       const char *hex)
@@ -407,34 +446,8 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
     snprintf(lim,  sizeof(lim),  "%d", limit);
     snprintf(off,  sizeof(off),  "%d", offset);
 
-    /*
-     * The full path of each referencing node, climbed in SQL one primary-key
-     * lookup per level. A bare name ("config.yaml") does not say which of
-     * the many files of that name holds the object, which was the question.
-     * A chain that breaks before the root (a partly faulted-in snapshot)
-     * leaves the path empty rather than dropping the reference.
-     */
     db_result_t *r = NULL;
-    if (db_execute(g_db,
-            "WITH RECURSIVE"
-            " refs(snap_id, nid) AS ("
-            "   SELECT snap_id, id FROM nodes"
-            "    WHERE repo_id = ? AND content_hash = ?"
-            "    ORDER BY snap_id, id LIMIT ? OFFSET ?),"
-            " up(nid, parent, path, depth) AS ("
-            "   SELECT n.id, n.parent_node_id, n.name, 0"
-            "     FROM refs JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
-            "   UNION ALL"
-            "   SELECT up.nid, p.parent_node_id, p.name || '/' || up.path, up.depth + 1"
-            "     FROM up JOIN nodes p ON p.repo_id = ? AND p.id = up.parent"
-            "    WHERE up.parent IS NOT NULL AND up.parent <> 0 AND up.depth < 256)"
-            " SELECT refs.snap_id, refs.nid, n.name, COALESCE('/' || up.path, ''),"
-            "        " NODE_GEN_COL("n")
-            "   FROM refs"
-            "   JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
-            "   LEFT JOIN up ON up.nid = refs.nid"
-            "             AND (up.parent IS NULL OR up.parent = 0)"
-            "  ORDER BY refs.snap_id, refs.nid",
+    if (db_execute(g_db, introspect_refs_sql,
             (const char *[]){ repo, hex, lim, off, repo, repo, repo, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot read object references");

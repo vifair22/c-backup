@@ -292,6 +292,24 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
             break;
         }
 
+        /* In walk order, not hash order as a backup writes them: a rebuild
+         * is rare, and its rows still land only in this snapshot's range. */
+        if (have_target && !is_dir &&
+            db_write(ctx->db,
+                "INSERT OR REPLACE INTO node_hashes (repo_id, snap_id, content_hash, node_id)"
+                " VALUES (?, ?, ?, ?)",
+                (const char *[]){ repo, snap, thex, id, NULL }, NULL) != 0) {
+            st = set_error(ERR_IO, "reindex: cannot index content hash");
+            break;
+        }
+        if (have_target && !is_dir &&
+            db_write(ctx->db,
+                "INSERT OR IGNORE INTO node_content (repo_id, content_hash) VALUES (?, ?)",
+                (const char *[]){ repo, thex, NULL }, NULL) != 0) {
+            st = set_error(ERR_IO, "reindex: cannot record content hash");
+            break;
+        }
+
         st = batch_point(ctx);
         if (st != OK) { ctx->batched = -1; break; }
 
@@ -467,6 +485,10 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
             " WHERE repo_id = ? AND snap_id = ? LIMIT 2000)",
             "DELETE FROM node_fts WHERE rowid IN (SELECT rowid FROM node_fts"
             " WHERE repo_id = ? AND snap_id = ? LIMIT 2000)",
+            /* WITHOUT ROWID: its key stands in for the rowid. */
+            "DELETE FROM node_hashes WHERE (repo_id, snap_id, content_hash, node_id) IN"
+            " (SELECT repo_id, snap_id, content_hash, node_id FROM node_hashes"
+            "   WHERE repo_id = ? AND snap_id = ? LIMIT 2000)",
         };
         for (size_t k = 0; k < sizeof(clear) / sizeof(clear[0]); k++) {
             for (;;) {
@@ -513,6 +535,10 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
     if (!failed)
         failed = db_write(db,
             "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
+            (const char *[]){ repo, snap, NULL }, NULL) != 0;
+    if (!failed)
+        failed = db_write(db,
+            "DELETE FROM node_hashes WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     /* After the old rows go and before the first new one: no reader sees
      * old ids under the new generation or new ids under the old. */
@@ -982,6 +1008,16 @@ static status_t walk_list_inner(store_t *store, cutils_db_t *db, const char *rep
     return st;
 }
 
+/* One snapshot's file entries whose content is a chunk list, or may be one
+ * (reindex_lists). Parameters: repo, snapshot. */
+const char *const reindex_snap_lists_sql =
+    "SELECT DISTINCT n.content_hash FROM nodes n"
+    "  CROSS JOIN objects o"
+    " WHERE n.repo_id = ?1 AND n.snap_id = ?2"
+    "   AND o.repo_id = n.repo_id AND o.hash = n.content_hash"
+    "   AND n.type = 1 AND o.type IN (1, 6)"
+    "   AND (o.orig_size IS NULL OR o.orig_size != n.size OR o.type = 6)";
+
 /* only_snap > 0: that snapshot's lists alone (B264), for indexing gaps:
  * every other snapshot's were walked when it was indexed, and walking them
  * all again for one new snapshot is the whole-repository cost a gap must
@@ -993,14 +1029,24 @@ static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
 
+    /*
+     * One statement per case. The single statement with "?2 <= 0 OR
+     * n.snap_id = ?2" could not use the snapshot as a key, so a gap's
+     * walk of one snapshot read every node row of the repository (planned
+     * as a walk by repo_id with a table fetch per row), which is the cost
+     * B264 meant to avoid.
+     */
     db_result_t *r = NULL;
-    if (db_execute(db,
+    int qrc = only_snap > 0
+        ? db_execute(db, reindex_snap_lists_sql, (const char *[]){ repo, snap, NULL }, &r)
+        : db_execute(db,
             "SELECT DISTINCT n.content_hash FROM nodes n"
             "  JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
-            " WHERE n.repo_id = ?1 AND (CAST(?2 AS INTEGER) <= 0 OR n.snap_id = CAST(?2 AS INTEGER))"
+            " WHERE n.repo_id = ?1"
             "   AND n.type = 1 AND o.type IN (1, 6)"
             "   AND (o.orig_size IS NULL OR o.orig_size != n.size OR o.type = 6)",
-            (const char *[]){ repo, snap, NULL }, &r) != 0) {
+            (const char *[]){ repo, NULL }, &r);
+    if (qrc != 0) {
         db_result_free(r);
         return set_error(ERR_IO, "reindex: cannot list chunk lists");
     }
