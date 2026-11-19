@@ -258,7 +258,9 @@ socket = /run/c-backup-helper/helper.sock
 allow = docker:compose:immich, docker:cbk-uat-*, libvirt:cbk-uat-*, lxc:cbk-uat-*
 
 [snapshot]
-zfs_domains = cache/appdata, cache/Photos
+# The datasets backed up, each its own: never a pool, never all of appdata
+# ("Choosing snapshot domains" below).
+zfs_domains = cache/appdata/immich, cache/Photos
 btrfs_domains =
 dir_domains =                  # directory domains (tests, begin_paths)
 
@@ -396,6 +398,48 @@ The fake provider answers each unit's spec `"probe"` in this shape (an
 empty probe without one), and fails it with `"probe_fail": true` or
 `FAKE_FAIL_PROBE`.
 
+## Choosing snapshot domains
+
+A capture snapshots the **whole dataset** (or btrfs subvolume) that holds
+each path it reads, not the path: a unit whose bind is
+`/mnt/cache/appdata/immich` on a pool where `appdata` is one dataset takes a
+snapshot of `cache/appdata`, and with it every other application's data,
+for as long as the unit is read. Nothing outside the unit is read or
+written, but every byte of that dataset is pinned for the capture's
+lifetime, its `.zfs` directory shows it to anything that binds the dataset
+root (Manual 22.5.4), and a policy that lists `cache/appdata` or
+`cache/system` lets any allowed unit, a test fixture included, snapshot
+them. On FS1 (M6 to M9) the policy listed `cache/appdata` and
+`cache/system`, so a UAT fixture's bind snapshotted those production
+datasets, about a second each time.
+
+So list the datasets you back up, and only those:
+
+- **One dataset per thing backed up.** Give each application whose data you
+  back up its own child dataset (`zfs create cache/appdata/immich`, then
+  move its directory into it) and list that. The helper never snapshots a
+  parent in place of an unlisted child (`snap_domain_of`), so listing the
+  child is exactly as narrow as it looks. A unit's path whose dataset is
+  not listed is read by the two-pass or paused read (Manual 22.5.6), and a
+  source's is read live or refused as its snapshot mode says.
+- **Never a pool, `appdata` or `system` as a whole.** A share dataset that
+  is itself the thing backed up (`cache/Photos`) is fine; a dataset many
+  applications share is not, and neither is a pool's root dataset.
+- **btrfs.** `btrfs_domains` names a pool root, and the innermost nested
+  subvolume over a path is its domain. Without subvolumes every capture
+  snapshots the pool's whole top level (FS2's case, which has no
+  production data). On a pool with data on it, give each application its
+  own subvolume (`btrfs subvolume create`) so its captures snapshot that
+  subvolume alone.
+- **Check what a capture touched.** The helper logs every snapshot it
+  creates or destroys at INFO, naming the snapshot and its dataset or
+  subvolume (`snap: created ZFS snapshot cache/appdata/immich@cbk-... of
+  dataset cache/appdata/immich`, `snap: destroyed ...`), so its log shows
+  which datasets each capture held and for how long.
+
+The defaults are unchanged: with `[snapshot]` absent or empty the helper
+snapshots nothing, and it never adds a dataset the policy does not name.
+
 ## Source snapshot mode: `capture.begin_paths`
 
 The daemon's file sources in snapshot mode (`db-detection.md` 9.4) are read
@@ -476,8 +520,8 @@ Enabled by the policy, never by the daemon (`docs/container-backup.md`):
 
 ```ini
 [snapshot]
-zfs_domains = cache/appdata, cache/system, cache/Photos, cache/lxc
-btrfs_domains = /mnt/cache                 ; FS2: the pool's top level
+zfs_domains = cache/appdata/immich, cache/appdata/gitlab, cache/Photos   ; one per unit's data
+btrfs_domains = /mnt/cache                 ; FS2: the pool's top level (see below)
 btrfs_snapshot_dir = /mnt/cache/system/.cbackup-snapshots
 ; restore_staging_dirs = /mnt/cache/system/.cbackup-restore   ; per domain, see below
 
