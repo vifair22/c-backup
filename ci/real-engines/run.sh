@@ -545,6 +545,13 @@ units:
   helper_socket: $HSOCK
 vm:
   export_dir: $DSTATE/exports
+  # Incrementals on (default 0), so the running VM's backup makes a
+  # checkpoint and a token, and the in-place restore in test_vm has one to
+  # retire (B251). With it off the online backup made none, and the retire
+  # path ran with nothing to do. test_vm is the only libvirt section; no
+  # other section reads this key. Its first session is a full read, so the
+  # byte-for-byte checks there hold either way.
+  incremental: 1
 EOF
 chmod 0600 "$DSTATE/config.yaml"
 chown -R "$DUID:$DUID" "$DSTATE" "$REPO" "$OUT"
