@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -422,11 +423,20 @@ unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes)
         log_info("store: another writer holds %s/tmp; sweeping only staging "
                  "older than an hour", st->path);
     } else {
-        /* Held: no other handle is staging here, so a file written this
-         * very second is a dead writer's too. The callers sweep before
-         * staging anything themselves. */
-        time_t now = time(NULL);
-        if (before <= now) before = now + 1;
+        /*
+         * Held: no other handle is staging here, so every kind-1 file is a
+         * dead writer's, however new its mtime. The callers sweep before
+         * staging anything themselves. No age limit at all, rather than
+         * "now + 1": time() reads the coarse clock and a file's mtime can
+         * be a second ahead of it - tmpfs stamps fine-grained once a stat
+         * has looked (multigrain timestamps), about 1 file in 800 at a
+         * second boundary, and a clock stepped back does the same for
+         * longer - so a fresh orphan survived the sweep that promised to
+         * remove it (FLAKE-35). Kind 2 keeps the hour rule in
+         * sweep_staging_dir whatever this says.
+         */
+        _Static_assert(sizeof(time_t) == sizeof(int64_t), "time_t is 64-bit");
+        before = (time_t)INT64_MAX;
     }
     return sweep_tmp_dir(st->path, before, 1, bytes);
 }

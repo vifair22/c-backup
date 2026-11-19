@@ -171,10 +171,14 @@ static void test_no_commit_checkpoints(void **state)
 typedef struct {
     atomic_int stop;
     long       pause_us;     /* between commits; 0 for none */
-    unsigned   commits;
+    atomic_uint commits;     /* read by run_writer_until while it runs */
     uint64_t   max_ms;
-    int        failed;
+    atomic_int failed;
 } writer_t;
+
+/* Commits a case needs before its WAL is about `frames` frames: four rows a
+ * commit, each about four pages, as the cases' own assertions count them. */
+#define COMMITS_FOR(frames) ((unsigned)((frames) / (4 * 4) + 1))
 
 /* A backup's batches: commit after commit, no pause between. */
 static void *writer_main(void *arg)
@@ -182,10 +186,10 @@ static void *writer_main(void *arg)
     writer_t *w = arg;
     while (!atomic_load(&w->stop)) {
         uint64_t t0 = now_ms();
-        if (commit_rows(4) != 0) { w->failed = 1; break; }
+        if (commit_rows(4) != 0) { atomic_store(&w->failed, 1); break; }
         uint64_t took = now_ms() - t0;
         if (took > w->max_ms) w->max_ms = took;
-        w->commits++;
+        atomic_fetch_add(&w->commits, 1);
         if (w->pause_us) {
             struct timespec ts = { 0, w->pause_us * 1000L };
             nanosleep(&ts, NULL);
@@ -194,13 +198,27 @@ static void *writer_main(void *arg)
     return NULL;
 }
 
-static uint32_t run_writer_for(writer_t *w, uint64_t ms)
+/*
+ * Run the writer for at least ms, until it has made min_commits and until
+ * enough() says so, when there is one. The
+ * cases assert both what the WAL did and that enough was written for it to
+ * mean something, and a writer bounded by time alone wrote too little on a
+ * contended host (FLAKE-33: 589 commits in 6 s against the 751 asked for).
+ * Ten times ms is the backstop; a writer slower than that fails the case's
+ * own "enough written" assertion rather than passing on less.
+ */
+static uint32_t run_writer_until(writer_t *w, uint64_t ms, unsigned min_commits,
+                                 int (*enough)(void))
 {
     pthread_t th;
     assert_int_equal(pthread_create(&th, NULL, writer_main, w), 0);
     uint32_t peak = 0;
-    uint64_t end = now_ms() + ms;
-    while (now_ms() < end) {
+    uint64_t start = now_ms(), end = start + ms, backstop = start + ms * 10;
+    for (;;) {
+        uint64_t now = now_ms();
+        if (now >= backstop || atomic_load(&w->failed)) break;
+        if (now >= end && atomic_load(&w->commits) >= min_commits &&
+            (!enough || enough())) break;
         uint32_t f = 0, b = 0;
         if (checkpointer_wal_frames(TEST_DB, &f, &b) == 0 && f > peak) peak = f;
         sleep_ms(5);
@@ -217,7 +235,8 @@ static void report(const char *what, const writer_t *w, uint32_t peak)
     checkpointer_stats(&s);
     print_message("  %s: %u commits, %.1f MiB, slowest %llu ms; WAL peak %u frames "
                   "(cap %u, hard %u); %lu passive, %lu escalated, longest hold %.1f ms\n",
-                  what, w->commits, (double)w->commits * 4 * ROW_BYTES / 1048576.0,
+                  what, atomic_load(&w->commits),
+                  (double)atomic_load(&w->commits) * 4 * ROW_BYTES / 1048576.0,
                   (unsigned long long)w->max_ms, peak, THRESHOLD * CKPT_CAP_FACTOR,
                   THRESHOLD * CKPT_HARD_FACTOR, s.passive, s.escalations,
                   (double)s.max_lock_ns / 1e6);
@@ -239,7 +258,7 @@ static void test_wal_stays_near_the_cap_under_a_long_writer(void **state)
     writer_t w;
     memset(&w, 0, sizeof(w));
     w.pause_us = 5000;
-    uint32_t peak = run_writer_for(&w, 6000);
+    uint32_t peak = run_writer_until(&w, 6000, COMMITS_FOR(THRESHOLD * CKPT_CAP_FACTOR * 3), NULL);
     report("writer", &w, peak);
     checkpointer_stats_t s;
     checkpointer_stats(&s);
@@ -272,7 +291,7 @@ static void flat_out(unsigned pause_ms)
     assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
     writer_t w;
     memset(&w, 0, sizeof(w));
-    uint32_t peak = run_writer_for(&w, 4000);
+    uint32_t peak = run_writer_until(&w, 4000, COMMITS_FOR(THRESHOLD * CKPT_HARD_FACTOR * 3), NULL);
     report(pause_ms ? "flat out, slow syncs" : "flat out", &w, peak);
     checkpointer_stats_t s;
     checkpointer_stats(&s);
@@ -333,7 +352,7 @@ static void test_pinned_reader_holds_nobody_up(void **state)
     writer_t w;
     memset(&w, 0, sizeof(w));
     w.pause_us = 2000;
-    uint32_t peak = run_writer_for(&w, 2000);
+    uint32_t peak = run_writer_until(&w, 2000, COMMITS_FOR(THRESHOLD * CKPT_CAP_FACTOR * 2), NULL);
     report("pinned", &w, peak);
     assert_true(peak > THRESHOLD * CKPT_CAP_FACTOR);   /* it could not checkpoint */
     assert_true(w.max_ms < 2000);                      /* and nobody waited for it */
@@ -421,6 +440,19 @@ typedef struct {
 } reader_t;
 
 /* A file worker asking "already stored?" for chunk after chunk, flat out. */
+/*
+ * Every reader's lookups so far. The case asserts the readers made more than
+ * 10,000 while the writer ran, and a writer bounded by 3 s alone left them
+ * short on a contended host; the writer runs until they have.
+ */
+#define MIN_LOOKUPS 10000
+static atomic_ulong g_lookups;
+
+static int lookups_enough(void)
+{
+    return atomic_load(&g_lookups) > MIN_LOOKUPS;
+}
+
 static void *reader_main(void *arg)
 {
     reader_t *r = arg;
@@ -431,6 +463,7 @@ static void *reader_main(void *arg)
         uint64_t c[6];
         if (db_readers_locate(1, hex, c) < 0) r->errors++;
         r->lookups++;
+        atomic_fetch_add(&g_lookups, 1);
     }
     return NULL;
 }
@@ -471,6 +504,7 @@ static void test_pooled_readers_never_pin_the_wal(void **state)
     db_readers_set_test_hold_us(1000);
     assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
 
+    atomic_store(&g_lookups, 0);
     reader_t rd[N_READERS];
     pthread_t th[N_READERS];
     memset(rd, 0, sizeof(rd));
@@ -479,7 +513,7 @@ static void test_pooled_readers_never_pin_the_wal(void **state)
 
     writer_t w;
     memset(&w, 0, sizeof(w));
-    uint32_t peak = run_writer_for(&w, 3000);
+    uint32_t peak = run_writer_until(&w, 3000, 0, lookups_enough);
 
     /* The writer has stopped, the readers have not. A PASSIVE from outside
      * gets only as far as their read marks; the checkpointer's locked round,
@@ -503,8 +537,8 @@ static void test_pooled_readers_never_pin_the_wal(void **state)
     db_readers_set_test_hold_us(0);
     fprintf(stderr, "B201: %lu lookups, %lu commits, WAL peak %u frames (hard cap %u), "
             "then %u of %u frames before the forced round, %u after it\n",
-            lookups, (unsigned long)w.commits, peak, (unsigned)THRESHOLD * CKPT_HARD_FACTOR, f0 - b0, f0, after);
-    assert_true(lookups > 10000);
+            lookups, (unsigned long)atomic_load(&w.commits), peak, (unsigned)THRESHOLD * CKPT_HARD_FACTOR, f0 - b0, f0, after);
+    assert_true(lookups > MIN_LOOKUPS);
     assert_true(peak <= (uint32_t)THRESHOLD * CKPT_HARD_FACTOR * 2);
     assert_true(after <= 8 && after < f0);
     assert_int_equal(bad, 0);
@@ -848,6 +882,11 @@ static void test_the_lock_wait_is_not_counted_as_the_hold(void **state)
     status_t fst = ERR_IO;
     pthread_t th;
     assert_int_equal(pthread_create(&th, NULL, force_round, &fst), 0);
+    /* The 300 ms are counted from the round queueing, not from starting
+     * its thread: on a contended host the thread had not reached the lock
+     * by the end of a plain 300 ms sleep, and the wait read short. */
+    for (int i = 0; i < 6000 && db_txn_waiters() < 1; i++) sleep_ms(1);
+    assert_true(db_txn_waiters() >= 1);
     sleep_ms(300);
     assert_int_equal(db_txn_commit(db), OK);
     pthread_join(th, NULL);

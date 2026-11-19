@@ -101,7 +101,7 @@ typedef struct {
     writer_kind_t kind;
     pthread_t     thr;
     int           iters;
-    int           during;   /* writes finished before the backup did */
+    atomic_int    during;   /* writes finished before the backup did */
     int           errors;
     char          first_error[256];
     int64_t       max_wait_ms;
@@ -308,7 +308,7 @@ static void *writer_main(void *arg)
         int64_t took = now_ms() - t0;
         if (took > w->max_wait_ms) w->max_wait_ms = took;
         w->iters = i + 1;
-        if (!atomic_load(&backup_done)) w->during++;
+        if (!atomic_load(&backup_done)) atomic_fetch_add(&w->during, 1);
         struct timespec ts = { 0, 1000 * 1000 };
         nanosleep(&ts, NULL);
     }
@@ -428,6 +428,31 @@ static void *wal_sampler(void *arg)
     return NULL;
 }
 
+/*
+ * The overlap the test needs, held as a condition rather than hoped for
+ * from the backup's length. The tag writer's every write is durable, a sync
+ * of its own, so on a contended host it managed 8 writes while the backup
+ * ran against the 10 asked for (FLAKE-34). Until every writer has its
+ * MIN_DURING, each row of a pack commit - the backup's, with its batch
+ * open - waits for a writer to queue, which then gets in as it always does
+ * (the batch ends for a queued writer, B144). A row with nobody queued for
+ * 200 ms goes on regardless, so a writer that has stopped cannot hang the
+ * backup; the assertion then fails as before.
+ */
+static writer_t *g_overlap;
+
+static void hold_for_overlap(void)
+{
+    for (int t = 0; t < 100; t++) {
+        int all = 1;
+        for (int i = 0; i < 4; i++)
+            if (atomic_load(&g_overlap[i].during) < MIN_DURING) all = 0;
+        if (all || db_txn_waiters() > 0) return;
+        struct timespec ts = { 0, 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
 static void test_writes_during_a_backup_all_land(void **state)
 {
     (void)state;
@@ -456,6 +481,8 @@ static void test_writes_during_a_backup_all_land(void **state)
     w[1].kind = W_POLICY;
     w[2].kind = W_TAGS;
     w[3].kind = W_RAW;
+    g_overlap = w;
+    store_index_set_row_gate(hold_for_overlap);
     for (int i = 0; i < 4; i++)
         assert_int_equal(pthread_create(&w[i].thr, NULL, writer_main, &w[i]), 0);
     atomic_store(&g_wal_peak, 0);
@@ -472,6 +499,7 @@ static void test_writes_during_a_backup_all_land(void **state)
     memset(&res, 0, sizeof(res));
     status_t bst = backup_run(store, db, repo_id, &o2, &res);
     atomic_store(&backup_done, 1);
+    store_index_set_row_gate(NULL);
     for (int i = 0; i < 4; i++) pthread_join(w[i].thr, NULL);
     pthread_join(sampler, NULL);
 
@@ -498,13 +526,13 @@ static void test_writes_during_a_backup_all_land(void **state)
     for (int i = 0; i < 4; i++) {
         fprintf(stderr, "stress: %-7s %4d writes (%d during the backup), max wait"
                 " %lld ms, %d errors%s%s\n",
-                names[i], w[i].iters, w[i].during, (long long)w[i].max_wait_ms,
+                names[i], w[i].iters, atomic_load(&w[i].during), (long long)w[i].max_wait_ms,
                 w[i].errors,
                 w[i].errors ? ": " : "", w[i].first_error);
         assert_int_equal(w[i].errors, 0);
         assert_true(w[i].iters >= MIN_ITERS);
         /* The point of the test: the writes overlapped the backup. */
-        assert_true(w[i].during >= MIN_DURING);
+        assert_true(atomic_load(&w[i].during) >= MIN_DURING);
         assert_true(w[i].max_wait_ms <= bound);
     }
 
