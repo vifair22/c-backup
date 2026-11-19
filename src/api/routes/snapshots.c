@@ -1460,7 +1460,14 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                 st = replicate_run(store, j->db, j->repo_id, &sink, cancel,
                                    NULL, NULL, &rr);
                 sink.v->close(sink.ctx);
-                if (to_plain) {
+                /* A run that wrote nothing (the target was already up to
+                 * date) moved nothing out of encryption, and journalling
+                 * it again on every rerun buried the one entry that
+                 * mattered (NIT-51). A failed run is still recorded: what
+                 * it committed before failing is out. */
+                int wrote = rr.snapshots_sent > 0 || rr.objects_sent > 0 ||
+                            rr.objects_written > 0 || st != OK;
+                if (to_plain && wrote) {
                     /*
                      * Allowed, and on the record: the one place this
                      * repository's data leaves its encryption. Recorded
