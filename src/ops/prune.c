@@ -179,6 +179,10 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
         failed = db_write(db,
             "DELETE FROM snapshot_units WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
+    if (!failed)
+        failed = db_write(db,
+            "DELETE FROM snapshot_sources WHERE repo_id = ? AND snap_id = ?",
+            (const char *[]){ repo, snap, NULL }, NULL) != 0;
 
     if (failed) {
         db_txn_rollback(db);

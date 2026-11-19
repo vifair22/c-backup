@@ -443,7 +443,7 @@ api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
  * nothing at all: the operator was told yes and got something else. A key
  * belongs here only when something acts on it.
  */
-typedef enum { POLICY_COUNT, POLICY_BOOL } policy_kind_t;
+typedef enum { POLICY_COUNT, POLICY_BOOL, POLICY_PCT } policy_kind_t;
 
 static const struct {
     const char   *key;
@@ -454,6 +454,8 @@ static const struct {
     { "retention.keep_weekly",  POLICY_COUNT },
     { "retention.keep_monthly", POLICY_COUNT },
     { "retention.keep_yearly",  POLICY_COUNT },
+    /* B295: the source drop check's threshold, 0 (off) to 100. */
+    { "backup.source_drop_pct", POLICY_PCT },
 };
 #define N_POLICY_KEYS ((int)(sizeof(k_policy_keys) / sizeof(k_policy_keys[0])))
 
@@ -855,10 +857,11 @@ static int policy_value_add(cutils_json_elem_t *e, const char *key, const char *
 {
     for (int k = 0; k < N_POLICY_KEYS; k++) {
         if (strcmp(k_policy_keys[k].key, key) != 0) continue;
-        if (k_policy_keys[k].kind == POLICY_COUNT) {
+        if (k_policy_keys[k].kind == POLICY_COUNT || k_policy_keys[k].kind == POLICY_PCT) {
             int n = 0;
-            return routes_policy_count(text, &n) == 0
-                ? json_elem_add_i32(e, "value", n) : json_elem_add_null(e, "value");
+            int ok = routes_policy_count(text, &n) == 0 &&
+                     (k_policy_keys[k].kind != POLICY_PCT || n <= 100);
+            return ok ? json_elem_add_i32(e, "value", n) : json_elem_add_null(e, "value");
         }
         int b = policy_bool(text);
         return b >= 0 ? json_elem_add_bool(e, "value", b != 0)
@@ -922,6 +925,12 @@ api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
                    || json_elem_add_i32(&e, "value", d[i].value) != 0;
             json_elem_commit(&e);
             if (bad) break;
+        }
+        cutils_json_elem_t e;
+        if (json_resp_array_append_begin(resp, "defaults", &e) == 0) {
+            if (json_elem_add_str(&e, "key", "backup.source_drop_pct") == 0 &&
+                json_elem_add_i32(&e, "value", routes_backup_source_drop_pct()) == 0) { /* added */ }
+            json_elem_commit(&e);
         }
     }
     return finalise(resp);
@@ -1001,6 +1010,14 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
         if (routes_policy_count(value, &n) != 0) {
             char msg[160];
             snprintf(msg, sizeof(msg), "%s must be a whole number, 0 or more", key);
+            return api_error(400, msg);
+        }
+        snprintf(norm, sizeof(norm), "%d", n);
+    } else if (k_policy_keys[k].kind == POLICY_PCT) {
+        int n = 0;
+        if (routes_policy_count(value, &n) != 0 || n > 100) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "%s must be a whole number from 0 to 100", key);
             return api_error(400, msg);
         }
         snprintf(norm, sizeof(norm), "%d", n);

@@ -44,6 +44,14 @@ void routes_backup_describe_doubts(const backup_result_t *res, char *warning, si
  * Set from config at startup. */
 void routes_backup_set_store_workers(unsigned n);
 unsigned routes_backup_store_workers(void);
+/* backup.source_drop_pct (B295): the daemon's default, which a
+ * repository's policy key of the same name overrides. Set from config at
+ * startup; SOURCE_DROP_PCT_DEFAULT until then. */
+void routes_backup_set_source_drop_pct(int pct);
+int  routes_backup_source_drop_pct(void);
+/* The threshold in force for one repository: its policy value when it has
+ * a valid one, the daemon's default otherwise. */
+int  routes_backup_source_drop_pct_for(cutils_db_t *db, int64_t repo_id);
 void routes_auth_set_config(cutils_config_t *cfg);
 
 /* Backup submission and job inspection. Needs the job manager because a

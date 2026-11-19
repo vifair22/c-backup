@@ -343,7 +343,10 @@ static void test_one_baseline_migration(void **state)
     /* Every snapshot a running job writes, and how many (B267). */
     assert_non_null(app_migrations[13].name);
     assert_string_equal(app_migrations[13].name, "015_job_snapshots.sql");
-    assert_null(app_migrations[14].name);
+    /* Per-source counts for the drop check (B295). */
+    assert_non_null(app_migrations[14].name);
+    assert_string_equal(app_migrations[14].name, "017_snapshot_sources.sql");
+    assert_null(app_migrations[15].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */

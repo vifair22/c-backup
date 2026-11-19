@@ -66,6 +66,69 @@ void routes_backup_set_file_cache_match(int mode)
     g_file_cache_match = mode;
 }
 
+/* backup.source_drop_pct, read once at start (B295). */
+static int g_source_drop_pct = SOURCE_DROP_PCT_DEFAULT;
+
+void routes_backup_set_source_drop_pct(int pct)
+{
+    g_source_drop_pct = pct;
+}
+
+int routes_backup_source_drop_pct(void)
+{
+    return g_source_drop_pct;
+}
+
+int routes_backup_source_drop_pct_for(cutils_db_t *db, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int v = g_source_drop_pct;
+    if (db && db_execute(db, "SELECT value FROM policy_values WHERE repo_id = ?"
+                             " AND key = 'backup.source_drop_pct'",
+                         (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1) {
+        /* The policy route takes 0 to 100 only; anything else in an older
+         * database is ignored, as the retention keys are. */
+        int n = 0;
+        if (routes_policy_count(r->rows[0][0], &n) == 0 && n <= 100) v = n;
+        else log_warn("repo %lld: ignoring invalid backup.source_drop_pct = '%s'",
+                      (long long)repo_id, r->rows[0][0]);
+    }
+    db_result_free(r);
+    return v;
+}
+
+/* Each source as the backup found it (B295): ",\"sources\":[...]", or
+ * NULL when there is nothing to say or no memory to say it in. */
+static char *sources_json(const backup_result_t *res)
+{
+    if (!res->sources.r || res->sources.n <= 0) return NULL;
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; arr && i < res->sources.n; i++) {
+        const source_report_t *r = &res->sources.r[i];
+        cJSON *o = cJSON_CreateObject();
+        if (!o) break;
+        cJSON_AddStringToObject(o, "path", r->path);
+        cJSON_AddNumberToObject(o, "entries", (double)r->entries);
+        cJSON_AddNumberToObject(o, "files", (double)r->files);
+        cJSON_AddNumberToObject(o, "bytes", (double)r->bytes);
+        cJSON_AddStringToObject(o, "state", source_state_name(r->state));
+        if (r->state == SOURCE_DROPPED) {
+            cJSON_AddNumberToObject(o, "compared_with", (double)r->ref_snap);
+            cJSON_AddNumberToObject(o, "previous_files", (double)r->ref_files);
+            cJSON_AddNumberToObject(o, "previous_bytes", (double)r->ref_bytes);
+        }
+        cJSON_AddItemToArray(arr, o);
+    }
+    char *a = arr ? cJSON_PrintUnformatted(arr) : NULL;
+    cJSON_Delete(arr);
+    char *out = NULL;
+    if (a && asprintf(&out, ",\"sources\":%s", a) < 0) out = NULL;
+    free(a);
+    return out;
+}
+
 /* Everything one backup job needs, owned by the job manager for its lifetime. */
 typedef struct {
     cutils_db_t *db;
@@ -454,6 +517,8 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     /* Which snapshot this job writes, durable before its record (B238). */
     o.record_hook     = job_note_snapshot;
     o.record_hook_ctx = progress_ctx;
+    /* Policy over the daemon's default, read when the job runs. */
+    o.source_drop_pct = routes_backup_source_drop_pct_for(j->db, j->repo_id);
 
     /*
      * Say it again, every backup, until someone acts on it.
@@ -584,7 +649,10 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)w[STORE_WR_PACK_PARITY],
                  (unsigned long long)res.files_skipped);
         char *base = NULL;
-        if (asprintf(&base, "%s%s", rj, ss_json ? ss_json : "") < 0) base = NULL;
+        char *src_json = sources_json(&res);
+        if (asprintf(&base, "%s%s%s", rj, ss_json ? ss_json : "", src_json ? src_json : "") < 0)
+            base = NULL;
+        free(src_json);
         char *full = base ? with_databases(with_skipped(base, &res, unsettled_why, &fdb), dbj) : NULL;
         free(base);
         if (full) {
@@ -611,6 +679,13 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
             if (ss_warn && ss_warn[0]) {
                 size_t wl = strlen(warning);
                 snprintf(warning + wl, PATH_MAX * 8 - wl, "%s%s", wl ? "; " : "", ss_warn);
+            }
+            /* A source that came back empty or shrank sharply (B295) is
+             * named, so the alert says which share to go and look at. */
+            if (res.sources.warning && res.sources.warning[0]) {
+                size_t wl = strlen(warning);
+                snprintf(warning + wl, PATH_MAX * 8 - wl, "%s%s", wl ? "; " : "",
+                         res.sources.warning);
             }
             if (warning[0]) {
                 /* The job manager journals the warning after the summary,
