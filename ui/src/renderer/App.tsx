@@ -96,10 +96,14 @@ export function App(): React.ReactElement {
 
   /*
    * One poll feeds both TaskBar and TaskListView, and both are about the
-   * open repository: /jobs is daemon-wide, so the list is cut to this
-   * repository's jobs here (Demo L4). The bar has to follow the view,
-   * because clicking it opens the view, and a bar announcing another
-   * repository's failed job would open onto a list without it.
+   * open repository (Demo L4). The bar has to follow the view, because
+   * clicking it opens the view, and a bar announcing another repository's
+   * failed job would open onto a list without it.
+   *
+   * The daemon does the cut, with ?repo= (B283). Cutting the daemon-wide
+   * newest 50 here let a busy repository push every other one's jobs off
+   * the list, and could never show a replicate job under the repository
+   * it writes into, since the job's own repo_id is its source.
    */
   const [taskList, setTaskList] = useState<Job[]>([])
 
@@ -111,8 +115,9 @@ export function App(): React.ReactElement {
         /* `jobs`, not `tasks`. Reading the wrong key set the list to
          * undefined and TaskBar - which renders on every repository screen -
          * threw on it, so opening any repository blanked the window. */
-        const resp = await api.apiCall<{ jobs?: Job[] }>(activeRepo.conn, { kind: 'jobList' })
-        if (!cancelled) setTaskList((resp.jobs ?? []).filter(j => j.repo_id === activeRepo.id))
+        const resp = await api.apiCall<{ jobs?: Job[] }>(activeRepo.conn,
+                                                         { kind: 'jobList', repoId: activeRepo.id })
+        if (!cancelled) setTaskList(resp.jobs ?? [])
       } catch { /* ignore */ }
     }
     poll()

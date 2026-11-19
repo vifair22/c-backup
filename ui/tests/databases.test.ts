@@ -115,6 +115,8 @@ test('every suggestion carries a title and a one-line trade-off', () => {
     assert.ok(v.tradeoff.length > 0 && !v.tradeoff.includes('\n'), k)
     assert.equal(suggestionTitle(k), v.title)
   }
+  /* NIT-53: the Nextcloud template showed as its raw name. */
+  assert.equal(suggestionTitle('nextcloud-maintenance'), 'Nextcloud maintenance mode')
   assert.equal(suggestionTitle('something-new'), 'something-new')
   assert.equal(suggestionTradeoff('something-new'), '')
 })
