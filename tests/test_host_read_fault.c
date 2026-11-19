@@ -82,6 +82,14 @@ static int teardown(void **state)
     return 0;
 }
 
+/* The suite's directory goes with it: each setup recreates it, so nothing
+ * else removes the last one. */
+static int group_cleanup(void **state)
+{
+    (void)state;
+    return system("rm -rf '" D "'") == 0 ? 0 : -1;
+}
+
 /* ---- host_read_file ---- */
 
 static void test_a_whole_file_is_read(void **state)
@@ -288,5 +296,5 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_compose_file_read_error_fails_the_unit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_compose_file_cut_short_fails_the_unit, setup, teardown),
     };
-    return cmocka_run_group_tests(tests, NULL, NULL);
+    return cmocka_run_group_tests(tests, NULL, group_cleanup);
 }
