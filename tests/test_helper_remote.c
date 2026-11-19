@@ -209,7 +209,7 @@ static int setup_templates(void **state)
     hf_write(HF_SNAP "/base/1/1259", "page");
     hf_write(HF_SNAP "/postmaster.pid", "42\n");
     mkdir(TBIN, 0700);
-    ttool("pg_dumpall", "#!/bin/sh\necho \"-- dump as $4\"\necho dumped >&2\n");
+    ttool("pg_dumpall", "#!/bin/sh\necho \"-- dump as $5\"\necho dumped >&2\n");
     ttool("redis-cli", "#!/bin/sh\ncase \"$1\" in\n"
                        "BGSAVE) echo 'Background saving started' ;;\n"
                        "INFO) printf 'rdb_bgsave_in_progress:0\\r\\nrdb_last_bgsave_status:ok\\r\\n' ;;\n"

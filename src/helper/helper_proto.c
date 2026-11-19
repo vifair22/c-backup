@@ -198,7 +198,8 @@ static const schema_t k_schema[HOP_COUNT] = {
      * which keys go together is checked after the schema. */
     [HOP_HOOK_RUN]               = { { { "unit", A_UNIT }, { "hook", A_NAME }, { "template", A_TEMPLATE },
                                        { "params", A_PARAMS }, { "path", A_DBPATH }, { "phase", A_PHASE } }, 6, 0, 5 },
-    [HOP_HOOK_WAIT]              = { { { "run", A_TOKEN } }, 1, 0 },
+    /* kill: stop the run first (B248), for a job cancelled while it runs. */
+    [HOP_HOOK_WAIT]              = { { { "run", A_TOKEN }, { "kill", A_BOOL } }, 2, 0, 1 },
     [HOP_VM_BACKUP_BEGIN]        = { { { "unit", A_UNIT }, { "disks", A_DISKS },
                                        { "base", A_NAME_OR_NULL }, { "freeze", A_FREEZE } }, 4, 0 },
     [HOP_VM_BACKUP_END]          = { { { "session", A_TOKEN }, { "outcome", A_OUTCOME } }, 2, 0 },
@@ -262,6 +263,7 @@ static int take_arg(helper_req_t *r, const akey_t *k, const cJSON *v, char *why,
         else if (strcmp(k->key, "undo") == 0) r->undo = cJSON_IsTrue(v);
         else if (strcmp(k->key, "anchor") == 0) r->anchor = cJSON_IsTrue(v);
         else if (strcmp(k->key, "check") == 0) r->check = cJSON_IsTrue(v);
+        else if (strcmp(k->key, "kill") == 0) r->kill = cJSON_IsTrue(v);
         else r->pause = cJSON_IsTrue(v);
         return 0;
     case A_PROVIDER:

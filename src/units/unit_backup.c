@@ -24,6 +24,7 @@
 #include <fnmatch.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -193,6 +194,7 @@ typedef struct {
     uint64_t off, buf_off;
     size_t   buf_len;
     int      open, eof;
+    atomic_int *cancel;     /* the job's: a dump that sends nothing still ends (B248) */
 } pipesrc_t;
 
 static status_t pipe_piece(void *ctx, uint64_t *s, uint64_t *e, int *got, int *more)
@@ -202,6 +204,16 @@ static status_t pipe_piece(void *ctx, uint64_t *s, uint64_t *e, int *got, int *m
     if (p->eof) return OK;
     size_t n = 0;
     while (n < PIPE_BUF_BYTES) {
+        /* A dump that writes nothing (one waiting on a password, B248)
+         * would hold a plain read until its timeout: wait in slices, and
+         * give up on the job's cancel, which stream_close then turns into
+         * stopping the run. */
+        if (p->cancel) {
+            struct pollfd pf = { p->fd, POLLIN, 0 };
+            int pr = poll(&pf, 1, 200);
+            if (cancel_requested(p->cancel)) return set_error(ERR_BUSY, "unit backup: cancelled while a dump ran");
+            if (pr == 0 || (pr < 0 && errno == EINTR)) continue;
+        }
         ssize_t r = read(p->fd, p->buf + n, PIPE_BUF_BYTES - n);
         if (r < 0 && errno == EINTR) continue;
         if (r < 0) return set_error_errno(ERR_IO, "unit backup: reading a stream");
@@ -484,7 +496,11 @@ static void templates_exec(const sp_provider_ops_t *ops, sp_ctx_t *pctx, const c
             err_clear();
         }
         int ok = post ? x->post_ok : x->pre_ok;
-        if (!ok)
+        const char *hint = ok ? NULL : db_template_auth_hint(db_template_find(x->name), x->log, x->log_len);
+        if (hint)
+            utmpl_warn(t, "database template %s %s run could not authenticate and never prompts: %s; see "
+                       ".cbackup-unit/hooks/%s.log", x->hook, post ? "post" : "pre", hint, x->hook);
+        else if (!ok)
             utmpl_warn(t, "database template %s %s run failed; see .cbackup-unit/hooks/%s.log", x->hook,
                        post ? "post" : "pre", x->hook);
     }
@@ -526,6 +542,7 @@ typedef struct {
     utmpl_t                  *tmpl;      /* the unit's enabled templates */
     /* Raised to application by its templates (B246), else 0. */
     int                       app_by_templates;
+    atomic_int               *cancel;    /* the job's */
 } uctx_t;
 
 static void uwarn(uctx_t *u, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -914,6 +931,7 @@ static status_t part_open(void *ctx, size_t index, cdc_source_t *src, uint64_t *
             return set_error(ERR_INVALID, "provider %s has no streams for %s", u->desc->provider, it->id);
         memset(&p->pipe, 0, sizeof(p->pipe));
         p->pipe.fd = -1;
+        p->pipe.cancel = u->cancel;
         if (!(p->pipe.buf = malloc(PIPE_BUF_BYTES))) return set_error(ERR_NOMEM, "unit backup: stream");
         status_t st = u->ops->stream_open(u->sess, it, &p->pipe.fd);
         if (st != OK) return st;
@@ -998,7 +1016,12 @@ static void part_close(void *ctx, size_t index, status_t st, const cdc_result_t 
         /* Drain what is left so the producer is not stuck writing, then
          * ask whether it succeeded: only then is the stream kept. */
         if (p->pipe.fd >= 0) {
-            if (st != OK) { char sink[4096]; while (read(p->pipe.fd, sink, sizeof(sink)) > 0) {} }
+            /* Not on a cancel: the producer is stopped instead, and a
+             * drain would wait for a dump that may never end (B248). */
+            if (st != OK && !cancel_requested(u->cancel)) {
+                char sink[4096];
+                while (read(p->pipe.fd, sink, sizeof(sink)) > 0) {}
+            }
             close(p->pipe.fd);
             p->pipe.fd = -1;
         }
@@ -1370,6 +1393,7 @@ static status_t unit_prepare(store_t *store, cutils_db_t *db, int64_t repo_id, c
         st = bases_prepare(store, db, repo_id, pp);
     }
     if (st == OK) templates_load(db, repo_id, ops, key, d, &pp->tmpl);
+    for (size_t i = 0; st == OK && i < pp->tmpl.n; i++) pp->tmpl.runs[i].cancel = o->cancel;
     if (st != OK) {
         bases_free(pp);
         pp->d = NULL;
@@ -1463,6 +1487,7 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     u.n_bases = pp->n_bases;
     u.audit_due = pp->audit_due;
     u.tmpl = &pp->tmpl;
+    u.cancel = o->cancel;
     if (pp->off_why[0]) uwarn(&u, "%s", pp->off_why);
     for (size_t i = 0; i < pp->tmpl.n_warn; i++) one_warn(res, 0, "%s", pp->tmpl.warn[i]);
     res->achieved = u.info->achieved;
