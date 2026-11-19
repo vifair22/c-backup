@@ -1195,7 +1195,10 @@ repository registration queues (`POST /repos`).
 `/jobs/stream/<id>` sends one `data:` frame at once with the job's state as it
 is, then a frame whenever it changes, and the same frame again every 5 seconds
 while it does not, so a watcher can tell a busy job from a dead stream. The
-stream ends after the frame with a terminal state. A frame is
+stream ends after the frame with a terminal state, however long the job
+runs: there is no limit on its length (until B228 it ended after an hour
+with `event: timeout`). A client that stays connected without reading is
+dropped once nothing could be written to it for 300 s. A frame is
 `{"id","state","phase","current","total","bytes_done","bytes_total","error"}`,
 and the last frame of a job that completed with warnings adds `"warning"`,
 the same line as its `result`'s (below).

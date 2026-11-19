@@ -67,6 +67,7 @@
 #include "unit_backup.h"
 #include "unit_state.h"
 #include "tzinfo.h"
+#include "shutdown_wait.h"
 
 #ifndef VERSION_STRING
 #define VERSION_STRING "0.0.0-dev"
@@ -83,8 +84,11 @@
  * stopped, no job cancelled, no socket removed. With on_signal, the first
  * signal only ends the main loop, and teardown happens here in order while
  * the database is still open. A second signal still forces the exit.
+ *
+ * The first signal wakes the main loop at once (shutdown_wait.h, B225):
+ * it slept a second between looks at a flag, which put up to a second in
+ * front of every stop.
  */
-static atomic_int running = 1;
 
 /*
  * Shutdown's budget (B218). Docker sends SIGKILL 10 s after SIGTERM unless
@@ -98,6 +102,9 @@ static atomic_int running = 1;
 #define SHUTDOWN_JOB_GRACE_MS  6000   /* running jobs, from the cancel */
 #define SHUTDOWN_CKPT_MS       1000   /* the final checkpoint's copy */
 #define SHUTDOWN_STEP_WARN_MS  1000   /* a step slower than this is logged */
+/* Queued alerts' delivery (B226): Pushover answers in well under a second,
+ * and a send c-utils makes to an unreachable one waits 15 s per message. */
+#define SHUTDOWN_PUSH_MS       1500
 
 static uint64_t mono_ms(void)
 {
@@ -123,11 +130,8 @@ static void shutdown_step(const char *what, uint64_t *t)
  * a kill would lose beyond what a power cut is already proven against. The
  * next start records the job as interrupted.
  */
-static void abandon_shutdown(const char *db_path)
+static void sync_wal_and_exit(const char *db_path, int code)
 {
-    log_error("shutdown: %s; exiting now without the rest of the shutdown, as a kill would. "
-              "The next start records the job as interrupted and reads the WAL back",
-              err_msg());
     if (db_path && *db_path) {
         char wal[PATH_MAX + 8];
         snprintf(wal, sizeof(wal), "%s-wal", db_path);
@@ -137,14 +141,22 @@ static void abandon_shutdown(const char *db_path)
             close(fd);
         }
     }
-    _exit(1);
+    _exit(code);
+}
+
+static void abandon_shutdown(const char *db_path)
+{
+    log_error("shutdown: %s; exiting now without the rest of the shutdown, as a kill would. "
+              "The next start records the job as interrupted and reads the WAL back",
+              err_msg());
+    sync_wal_and_exit(db_path, 1);
 }
 
 static void on_signal(int sig, void *ctx)
 {
     (void)ctx;
     log_info("received %s, stopping", sig == SIGINT ? "SIGINT" : "SIGTERM");
-    atomic_store(&running, 0);
+    stop_request();
 }
 
 /*
@@ -716,11 +728,9 @@ int main(int argc, char *argv[])
     if (sd_notify_state("READY=1") != OK)
         log_warn("cannot notify the service manager: %s", err_msg());
 
-    while (atomic_load(&running)) {
-        struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
-        nanosleep(&req, NULL);
+    /* A tick a second for the exports' expiry, and out at once on a stop. */
+    while (!stop_wait(1000))
         exports_tick();
-    }
 
     /*
      * Outside in: stop taking requests, stop firing schedules, then cancel
@@ -778,6 +788,26 @@ out_guard:
     /* Every thread that could look an object up has stopped by here; on a
      * path that never opened them this does nothing. */
     db_readers_close();
+    /*
+     * Alerts queued while stopping - a cancelled job's, a storage alert -
+     * go now, while the database holds their queue. The wait for them is
+     * bounded (B226): a send to an unreachable Pushover holds the push
+     * worker up to 15 s per message, in c-utils, where nothing here can cut
+     * it short. Past the budget the worker is left sending and the database
+     * cannot be closed under it, so the stop ends as a kill would, with the
+     * WAL synced: the queue is in state.db and is sent after the next start.
+     */
+    if (guard && run_within(push_shutdown, SHUTDOWN_PUSH_MS) != 0) {
+        log_warn("shutdown: alert delivery did not finish within %.1f s (Pushover unreachable?); "
+                 "the queued alerts are kept and sent after the next start",
+                 SHUTDOWN_PUSH_MS / 1000.0);
+        (void)checkpointer_finish(SHUTDOWN_CKPT_MS);
+        log_shutdown();
+        fprintf(stderr, "c-backupd stopped in %.1f s, leaving state.db to be closed by the exit\n",
+                (double)(mono_ms() - t_stop0) / 1000.0);
+        sync_wal_and_exit(db_path, rc);
+    }
+    shutdown_step("delivering queued alerts", &t_step);
     /* The last copy, bounded (B218). A WAL too large to copy in the budget
      * is left for the next start: the checkpointer's connection closes
      * last, after the shared handle, so neither close copies it. */

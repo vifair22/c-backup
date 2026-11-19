@@ -13,7 +13,17 @@
 #include "error.h"
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
+
+/*
+ * A deadline for every request that follows, in http_mono_ms() time; 0
+ * removes it. A request still waiting on the daemon at the deadline fails
+ * with ERR_BUSY and http_timed_out() becomes true (B227).
+ */
+void     http_set_deadline(uint64_t mono_ms);
+int      http_timed_out(void);
+uint64_t http_mono_ms(void);
 
 typedef struct {
     int   status;

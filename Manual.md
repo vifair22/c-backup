@@ -247,11 +247,20 @@ ends it (B218; a test server's stop once took 53 s and ended in SIGKILL):
   the next start`). A clean stop with a small log removes `-wal` and
   `-shm` as before. The close used to copy the whole log, however large,
   and that was the 53 s.
+- Alerts queued by then (a cancelled job's, say) are handed to Pushover
+  with 1.5 s for all of them. A send to an unreachable Pushover waits 15 s
+  in the alert library, per message, and used to hold the stop for as long
+  (B226). Past the budget the daemon logs `shutdown: alert delivery did not
+  finish within 1.5 s ...`, syncs the write-ahead log and exits with status
+  0 without closing `state.db`, as a kill would; the alerts stay queued in
+  `state.db` and are sent after the next start. One whose send was in
+  flight may then arrive twice.
 - Any step that takes over a second is logged (`shutdown: stopping running
   jobs took 2.7 s`), and the last line on stderr is `c-backupd stopped in
   N s`.
 
-A clean stop normally takes a second or two. A second SIGTERM or SIGINT
+The stop begins the moment the signal arrives; the main loop used to look
+for it once a second (B225). A clean stop normally takes a second or two. A second SIGTERM or SIGINT
 forces an immediate exit. Run the cancelled job again after the
 restart; a backup skips what it already stored, a restore skips the files it
 finished and redoes the one it was inside (a stop renames every file the
@@ -840,8 +849,8 @@ at 1 of 1 rather than at the size of the snapshot.
 
 `watch` exits 0 once it has printed the job's final state, whatever that
 state is: read `state` for the outcome. It exits 1 with a message on stderr
-when there is no such job, and when the daemon stops following a job that is
-still running after an hour; watch it again to go on following.
+when there is no such job. It follows a job for as long as the job runs;
+before 1.0 the daemon stopped following after an hour (B228).
 
 `sources set` replaces the whole list. Each source must be an absolute path
 (empty or relative ones are refused, and nothing is changed). A path that
@@ -3358,6 +3367,12 @@ that is, unless given `--no-wait`, which returns the job id at once, or
 `--timeout SECONDS` (whole seconds, 1 or more), which waits at most that
 long and leaves the job running. The two cannot be combined. Before 1.0 the
 wait gave up after an hour and exited 1 while the job went on (B220).
+`--timeout` bounds the whole command, its requests to the daemon included: a
+daemon that accepts the connection and never answers ends the command 2 s
+after the timeout with status 124 and `the daemon did not answer before
+--timeout ran out` (B227). The job, if the daemon got as far as submitting
+it, may still run. Without `--timeout` a command waits for the daemon's
+answer however long it takes.
 
 Arguments follow one set of rules for every command, checked before
 anything is sent to the daemon:

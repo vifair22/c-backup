@@ -8,11 +8,104 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define READ_CHUNK 8192
+
+/*
+ * The deadline --timeout sets (B227). Without one every connect, read and
+ * write blocks for as long as it takes, which is right for a daemon that
+ * answers and meant a hung one held `--timeout 60` forever: the bound was
+ * only checked between polls of the job, and the poll itself never
+ * returned. With one, the socket is non-blocking and every wait on it is a
+ * poll that ends at the deadline.
+ */
+static uint64_t g_deadline_ms;   /* CLOCK_MONOTONIC; 0 is none */
+static int      g_timed_out;
+
+uint64_t http_mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
+void http_set_deadline(uint64_t mono_ms)
+{
+    g_deadline_ms = mono_ms;
+    g_timed_out = 0;
+}
+
+int http_timed_out(void)
+{
+    return g_timed_out;
+}
+
+static status_t deadline_passed(void)
+{
+    g_timed_out = 1;
+    return set_error(ERR_BUSY, "the daemon did not answer before --timeout ran out");
+}
+
+/* Wait until fd is ready for `ev` or the deadline passes. OK when ready,
+ * or when there is no deadline; the error is set when it passed. A poll
+ * failure other than EINTR is left for the read or write to report. */
+static status_t await_fd(int fd, short ev)
+{
+    if (!g_deadline_ms) return OK;
+    for (;;) {
+        uint64_t now = http_mono_ms();
+        if (now >= g_deadline_ms) return deadline_passed();
+        uint64_t left = g_deadline_ms - now;
+        struct pollfd p = { .fd = fd, .events = ev, .revents = 0 };
+        int n = poll(&p, 1, left > INT_MAX ? INT_MAX : (int)left);
+        if (n > 0) return OK;
+        if (n < 0 && errno != EINTR) return OK;
+    }
+}
+
+/* A connect that may wait, under the deadline. A unix socket refuses a
+ * non-blocking connect with EAGAIN while the listener's backlog is full,
+ * and offers no way to wait for room, so that case retries. */
+static int connect_bounded(int fd, const struct sockaddr *a, socklen_t len)
+{
+    if (!g_deadline_ms) return connect(fd, a, len);
+    int fl = fcntl(fd, F_GETFL);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0) return -1;
+    for (;;) {
+        if (connect(fd, a, len) == 0) return 0;
+        if (errno == EINTR) continue;
+        if (errno == EINPROGRESS) {
+            if (await_fd(fd, POLLOUT) != OK) { errno = ETIMEDOUT; return -1; }
+            int e = 0;
+            socklen_t el = sizeof(e);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &el) != 0) return -1;
+            if (e) { errno = e; return -1; }
+            return 0;
+        }
+        if (errno != EAGAIN) return -1;
+        if (http_mono_ms() >= g_deadline_ms) { errno = ETIMEDOUT; return -1; }
+        struct timespec ts = { 0, 20 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* read(2) under the deadline: -1 with errno ETIMEDOUT when it passed. */
+static ssize_t read_bounded(int fd, void *buf, size_t n)
+{
+    for (;;) {
+        if (await_fd(fd, POLLIN) != OK) { errno = ETIMEDOUT; return -1; }
+        ssize_t r = read(fd, buf, n);
+        if (r < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+        return r;
+    }
+}
 
 static status_t connect_socket(const char *path, int *out_fd)
 {
@@ -26,10 +119,11 @@ static status_t connect_socket(const char *path, int *out_fd)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd == -1) return set_error_errno(ERR_IO, "socket()");
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    if (connect_bounded(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         int e = errno;
         close(fd);
         errno = e;
+        if (e == ETIMEDOUT && g_deadline_ms) return deadline_passed();
         /* ENOENT and ECONNREFUSED both mean "nothing is listening", which is
          * the case worth reporting specially. */
         if (e == ENOENT || e == ECONNREFUSED)
@@ -43,9 +137,10 @@ static status_t connect_socket(const char *path, int *out_fd)
 static int write_all(int fd, const char *buf, size_t len)
 {
     while (len > 0) {
+        if (await_fd(fd, POLLOUT) != OK) { errno = ETIMEDOUT; return -1; }
         ssize_t n = write(fd, buf, len);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN) continue;
             return -1;
         }
         buf += n;
@@ -86,6 +181,7 @@ status_t http_request(const char *socket_path, const char *method,
     if (write_all(fd, header, (size_t)hn) != 0 ||
         (body && write_all(fd, body, strlen(body)) != 0)) {
         close(fd);
+        if (g_timed_out) return deadline_passed();
         return set_error_errno(ERR_IO, "http_request: write failed");
     }
 
@@ -98,10 +194,10 @@ status_t http_request(const char *socket_path, const char *method,
             if (!grown) { free(buf); close(fd); return set_error(ERR_NOMEM, "http_request: alloc"); }
             buf = grown;
         }
-        ssize_t n = read(fd, buf + len, READ_CHUNK);
+        ssize_t n = read_bounded(fd, buf + len, READ_CHUNK);
         if (n < 0) {
-            if (errno == EINTR) continue;
             free(buf); close(fd);
+            if (g_timed_out) return deadline_passed();
             return set_error_errno(ERR_IO, "http_request: read failed");
         }
         if (n == 0) break;
@@ -152,8 +248,7 @@ static ssize_t sr_fill(sreader_t *r)
     if (r->pos < r->len) return (ssize_t)(r->len - r->pos);
     if (r->eof) return 0;
     for (;;) {
-        ssize_t n = read(r->fd, r->buf, sizeof(r->buf));
-        if (n < 0 && errno == EINTR) continue;
+        ssize_t n = read_bounded(r->fd, r->buf, sizeof(r->buf));
         if (n < 0) return -1;
         if (n == 0) { r->eof = 1; return 0; }
         r->len = (size_t)n;
@@ -238,6 +333,7 @@ status_t http_stream(const char *socket_path, const char *path,
     }
     if (write_all(fd, header, (size_t)hn) != 0) {
         close(fd);
+        if (g_timed_out) return deadline_passed();
         return set_error_errno(ERR_IO, "http_stream: write failed");
     }
 
@@ -250,11 +346,13 @@ status_t http_stream(const char *socket_path, const char *path,
     if (sr_line(r, line, sizeof(line)) != 0 ||
         sscanf(line, "HTTP/1.%*d %d", &status) != 1) {
         free(r); close(fd);
+        if (g_timed_out) return deadline_passed();
         return set_error(ERR_CORRUPT, "http_stream: malformed response");
     }
     for (;;) {
         if (sr_line(r, line, sizeof(line)) != 0) {
             free(r); close(fd);
+            if (g_timed_out) return deadline_passed();
             return set_error(ERR_CORRUPT, "http_stream: truncated headers");
         }
         if (line[0] == '\0') break;
@@ -285,6 +383,7 @@ status_t http_stream(const char *socket_path, const char *path,
     free(r);
     close(fd);
     if (sink_st != OK) return sink_st;
+    if (rc != 0 && g_timed_out) return deadline_passed();
     if (rc != 0) return set_error(ERR_IO, "http_stream: connection ended mid-stream");
     return OK;
 }
