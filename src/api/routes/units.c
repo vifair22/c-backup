@@ -1137,6 +1137,7 @@ typedef struct {
     int          unit_mode;       /* mode unit: data, then the definition */
     char        *name, *target_root;
     int          replace, pin_digest, start, keep_macs;
+    char        *unit_key;        /* "provider:id", for the journal line */
 } urestore_job_t;
 
 static void urestore_free(void *p)
@@ -1144,7 +1145,7 @@ static void urestore_free(void *p)
     urestore_job_t *j = p;
     if (!j) return;
     free(j->repo_path); free(j->dest); free(j->item);
-    free(j->name); free(j->target_root);
+    free(j->name); free(j->target_root); free(j->unit_key);
     free(j);
 }
 
@@ -1165,6 +1166,11 @@ static status_t urestore_run(void *arg, atomic_int *cancel,
     o.progress_ctx = progress_ctx;
     o.bytes_cb = job_progress_bytes;
     char rj[512];
+    /* The journal line for a restore that succeeds (NIT-50): which unit,
+     * from which snapshot, what came back and where. It journalled no
+     * message at all, where a unit backup says what it did. */
+    char sum[2 * PATH_MAX + 256];
+    sum[0] = '\0';
     /* The restore capabilities on this thread, for as long as it writes. */
     st = privs_restore_raise();
     if (st != OK) { store_index_free(idx); store_close(store); return st; }
@@ -1190,10 +1196,22 @@ static status_t urestore_run(void *arg, atomic_int *cancel,
         if (st == OK) { uj = dr.json; dr.json = NULL; }
         unit_define_result_free(&dr);
         snprintf(rj, sizeof(rj), "{\"mode\":\"unit\"}");
+        if (j->target_root)
+            msg_clip_after(sum, sizeof(sum), snprintf(sum, sizeof(sum),
+                "unit %s from snapshot %lld: re-created%s%s under %s", j->unit_key,
+                (long long)j->snap_id, j->name ? " as " : "", j->name ? j->name : "",
+                j->target_root));
+        else
+            msg_clip_after(sum, sizeof(sum), snprintf(sum, sizeof(sum),
+                "unit %s from snapshot %lld: re-created%s%s in place", j->unit_key,
+                (long long)j->snap_id, j->name ? " as " : "", j->name ? j->name : ""));
     } else if (j->item) {
         unit_restore_item_result_t ir;
         st = unit_restore_item(store, j->db, j->repo_id, j->snap_id, j->item, j->dest, &o, &ir);
         snprintf(rj, sizeof(rj), "{\"mode\":\"item\",\"bytes\":%llu}", (unsigned long long)ir.bytes);
+        msg_clip_after(sum, sizeof(sum), snprintf(sum, sizeof(sum),
+            "unit %s from snapshot %lld: item %s (%llu bytes) restored to %s", j->unit_key,
+            (long long)j->snap_id, j->item, (unsigned long long)ir.bytes, j->dest));
     } else {
         restore_result_t rr;
         memset(&rr, 0, sizeof(rr));
@@ -1202,8 +1220,14 @@ static status_t urestore_run(void *arg, atomic_int *cancel,
                  "\"bytes\":%llu,\"failed\":%llu}", (unsigned long long)rr.files,
                  (unsigned long long)rr.dirs, (unsigned long long)rr.bytes,
                  (unsigned long long)rr.failed);
+        msg_clip_after(sum, sizeof(sum), snprintf(sum, sizeof(sum),
+            "unit %s from snapshot %lld: %llu file(s), %llu dir(s), %llu bytes restored to %s"
+            "%s%.0llu%s", j->unit_key, (long long)j->snap_id, (unsigned long long)rr.files,
+            (unsigned long long)rr.dirs, (unsigned long long)rr.bytes, j->dest,
+            rr.failed ? "; " : "", (unsigned long long)rr.failed, rr.failed ? " failed" : ""));
     }
     privs_restore_drop();
+    if (st == OK && sum[0]) job_set_summary(progress_ctx, sum);
     job_set_result(progress_ctx, uj ? uj : rj);
     free(uj);
     store_index_free(idx);
@@ -1275,6 +1299,7 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     j->item = (item_mode && item) ? strdup(item) : NULL;
     j->overwrite = ow && cJSON_IsTrue(ow);
     j->unit_mode = unit_mode;
+    j->unit_key = strdup(key);
     if (unit_mode) {
         j->name = uname ? strdup(uname) : NULL;
         j->target_root = troot ? strdup(troot) : NULL;
@@ -1285,7 +1310,7 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
         if (!j->dest) j->dest = strdup("/");
     }
     cJSON_Delete(o);
-    if (!j->repo_path || !j->dest || (item_mode && !j->item)) {
+    if (!j->repo_path || !j->dest || !j->unit_key || (item_mode && !j->item)) {
         urestore_free(j);
         return api_error(500, "out of memory");
     }
