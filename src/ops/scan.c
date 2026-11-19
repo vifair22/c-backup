@@ -508,6 +508,15 @@ static _Thread_local const char *tl_top_read;
  */
 static _Thread_local int   tl_remap;
 static _Thread_local dev_t tl_remap_from, tl_remap_to;
+/*
+ * And the read root itself is identified by the record root's live inode.
+ * ZFS keeps every inode number in a snapshot except its dataset root's,
+ * which is new at every capture (a number in the 2^48 range), so with the
+ * device remapped and nothing else, every unchanged snapshot backup still
+ * wrote the root's tree and each ancestor's again (B271). 0 when the record
+ * root does not exist here: the root keeps its own inode then, as before.
+ */
+static _Thread_local ino_t tl_remap_root_ino;
 
 /*
  * The read root and record root of a scan_tree_as walk, for one_filesystem
@@ -611,9 +620,13 @@ static status_t scan_entry_at(int dirfd, const char *name, const char *path,
         e.dev_remapped = 1;
     }
 
+    ino_t id_ino = st.st_ino;
+    if (e.dev_remapped && tl_remap_root_ino != 0 && tl_mread && strcmp(path, tl_mread) == 0)
+        id_ino = tl_remap_root_ino;
+
     node_t *nd = &e.node;
     nd->node_id        = imap->next_node_id++;
-    nd->inode_identity = scan_inode_identity(e.rec_dev, st.st_ino);
+    nd->inode_identity = scan_inode_identity(e.rec_dev, id_ino);
     nd->type           = stat_to_node_type(&st);
     nd->mode           = (uint32_t)st.st_mode;
     nd->uid            = (uint32_t)st.st_uid;
@@ -1067,6 +1080,7 @@ static status_t scan_tree_impl(const char *root, const char *record,
     const char *prev_top = tl_top_read;
     int prev_remap = tl_remap;
     dev_t prev_from = tl_remap_from, prev_to = tl_remap_to;
+    ino_t prev_root_ino = tl_remap_root_ino;
     const char *prev_mread = tl_mread, *prev_mrec = tl_mrec;
     tl_top_read = strcmp(record, "/") == 0 ? root : NULL;
     if (as) {
@@ -1076,11 +1090,14 @@ static status_t scan_tree_impl(const char *root, const char *record,
         struct stat rec_st;
         tl_remap = 1;
         tl_remap_from = root_st.st_dev;
-        tl_remap_to = lstat(record, &rec_st) == 0 ? rec_st.st_dev : 0;
+        int have_rec = lstat(record, &rec_st) == 0;
+        tl_remap_to = have_rec ? rec_st.st_dev : 0;
+        tl_remap_root_ino = have_rec ? rec_st.st_ino : 0;
         tl_mread = root;
         tl_mrec = record;
     } else {
         tl_remap = 0;
+        tl_remap_root_ino = 0;
         tl_mread = NULL;
         tl_mrec = NULL;
     }
@@ -1093,6 +1110,7 @@ static status_t scan_tree_impl(const char *root, const char *record,
     tl_remap = prev_remap;
     tl_remap_from = prev_from;
     tl_remap_to = prev_to;
+    tl_remap_root_ino = prev_root_ino;
     tl_mread = prev_mread;
     tl_mrec = prev_mrec;
     if (st != OK) { scan_result_free(res); return st; }

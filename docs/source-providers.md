@@ -340,7 +340,11 @@ in the existing engine are generalised for it:
    number is the capture's too) keeps its own and is matched with
    `FILE_CACHE_IGNORE_DEV`. Without this every container incremental would
    re-read every file, and before B229 every one wrote a full set of new
-   trees, because `inode_identity` hashed the snapshot's device.
+   trees, because `inode_identity` hashed the snapshot's device. The read
+   root itself is identified by the record root's live inode as well
+   (B271): ZFS keeps every inode number in a snapshot except its dataset
+   root's, which is new at every capture, and that one identity rewrote the
+   root's tree and every ancestor's on each unchanged backup.
 
 ## 5. Consistency model
 
