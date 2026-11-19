@@ -8,6 +8,9 @@
 #include <cutils/log.h>
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -247,6 +250,39 @@ status_t object_get_info(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
     status_t st = implicit_flush_if_holding(store, hash);
     if (st != OK) return st;
     return pack_object_get_info(store, hash, out_size, out_type);
+}
+
+int object_prefetch(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                    store_location_t *out_loc)
+{
+    if (!store || !hash || !out_loc) return 0;
+    char keep[ERR_MSG_MAX];
+    snprintf(keep, sizeof(keep), "%s", err_msg());
+    memset(out_loc, 0, sizeof(*out_loc));
+    int ok = store_locate(store, hash, out_loc) == OK && out_loc->in_pack;
+    if (ok) {
+        uint32_t pnum = (uint32_t)out_loc->pack_id;
+        FILE *f = store_dat_cache_checkout(store, pnum);
+        if (!f) {
+            char path[PATH_MAX];
+            if (pack_dat_path_resolve(path, sizeof(path), store_root(store), pnum) == 0)
+                f = fopen(path, "rb");
+        }
+        if (f) {
+            /* WILLNEED queues the read and returns: the device works on it
+             * while the caller decodes and writes what it already has. */
+            (void)posix_fadvise(fileno(f), (off_t)out_loc->offset,
+                                (off_t)(sizeof(pack_dat_entry_hdr_t) + out_loc->comp_size),
+                                POSIX_FADV_WILLNEED);
+            store_dat_cache_return(store, pnum, f);
+        } else {
+            ok = 0;
+        }
+    }
+    /* A miss here is the load's to report, if it comes to that. */
+    if (keep[0]) (void)set_error(ERR_IO, "%s", keep);
+    else err_clear();
+    return ok;
 }
 
 status_t object_physical_size(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],

@@ -317,6 +317,20 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
                                int out_fd, uint64_t *out_size, int *out_write_failed);
 
 /*
+ * Where a content restore's time goes, for a caller that wants to know:
+ * loading objects (the read, its wait on the device, decryption,
+ * decompression and the name check) against writing them out. Set on the
+ * calling thread for the duration; NULL (the default) measures nothing.
+ * Two clock reads per object, which at chunk granularity is free.
+ */
+typedef struct {
+    uint64_t load_ns, loads;
+    uint64_t write_ns, writes;
+} content_io_times_t;
+
+extern _Thread_local content_io_times_t *content_io_times;
+
+/*
  * Hand the content to emit() in order, holes as zeroes, in pieces of at most
  * one chunk. For readers that consume a stream (grep, an HTTP body). A
  * non-OK return from emit stops the walk and is returned.
