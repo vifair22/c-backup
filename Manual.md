@@ -4863,8 +4863,10 @@ The copy is sparse where the snapshot has holes and byte-identical to a
   on, and says how many in the log.
 - **Connections and memory.** `vm.export_max_conns` (default 4) caps
   connections across every export; one past it is refused at the NBD
-  handshake with a message naming the key (`... the limit
-  (vm.export_max_conns)`), which `qemu-img` and `qemu-nbd` print, and 0
+  handshake with a message naming the key (`export N: connection
+  refused: vm.export_max_conns is 4 and that many are open across every
+  export; ...`), which `qemu-img` and `qemu-nbd` print and the daemon log
+  repeats, and 0
   turns exports off. Each connection holds at most one verified
   object, up to 16 MiB, of `jobs.read_budget_mb` while it reads, and lets it
   go after a second idle; `vm exports` shows each export's `cache_bytes`.
