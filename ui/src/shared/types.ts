@@ -130,6 +130,7 @@ export const IPC = {
    * would buy the same safety for forty times the wiring.
    */
   API_CALL: 'api:call',
+  API_CALL_RESULT: 'api:call-result',
 
   // Credentials. Sign-out revokes the session on the daemon and forgets it.
   CREDENTIAL_INFO: 'credential:info',
