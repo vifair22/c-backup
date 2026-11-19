@@ -77,6 +77,12 @@ static void all_live(src_snap_t *s, const char *why)
 static void end_capture(src_snap_t *s)
 {
     if (!s->capture) return;
+    /* The read's own error is what the job reports; ending the capture
+     * after a failed read must not replace it, or clear it as the
+     * lease-lost branch below does. A read that failed because the lease
+     * ran out before it began came back as a job failed with an empty
+     * error (B265). Heap, not the 8 KiB on the stack. */
+    char *saved = strdup(err_msg());
     cJSON *a = cJSON_CreateObject();
     if (a) cJSON_AddStringToObject(a, "capture", s->capture);
     if (remote_helper_call("capture.end", a, NULL) != OK) {
@@ -89,6 +95,10 @@ static void end_capture(src_snap_t *s)
                      "and sweep destroy it", s->capture, err_msg());
         }
         err_clear();
+    }
+    if (saved) {
+        (void)set_error(OK, "%s", saved);
+        free(saved);
     }
     free(s->capture);
     s->capture = NULL;

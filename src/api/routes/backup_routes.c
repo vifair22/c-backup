@@ -524,6 +524,16 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     /* The read is over, whatever its outcome (a cancel included): the
      * snapshots go now, before anything else. */
     src_snap_release(&ss);
+    /* A read that failed after the helper destroyed the snapshot says why
+     * the snapshot was gone, not only that a path was (B265). */
+    if (st != OK && ss.lease_lost) {
+        char *why = strdup(err_msg());
+        if (why) {
+            (void)set_error(st, "%s; the helper destroyed the source snapshot before the read ended "
+                            "(its capture_max_s lease ran out)", why);
+            free(why);
+        }
+    }
     char *ss_json = src_snap_result_json(&ss, cpaths);
     char *ss_warn = malloc(PATH_MAX * 4);
     if (ss_warn) src_snap_describe_live(&ss, cpaths, ss_warn, PATH_MAX * 4);

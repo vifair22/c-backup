@@ -123,7 +123,10 @@ Each entry carries the absolute path, the `lstat` result, a scan-assigned
    at any depth (`**` lets wildcards cross `/`). Directories are tested
    before the walk descends, so an excluded directory prunes its subtree.
    `one_filesystem` compares each entry's `st_dev` against the root's and
-   skips mount crossings.
+   skips mount crossings: the mount point itself is not recorded. A read
+   through a snapshot (`scan_tree_as`) also asks the live tree, since a
+   snapshot shows a mount below it as an ordinary empty directory
+   (db-detection.md 9.4, B266).
 7. **Failures are warnings.** A file that vanishes, a directory that cannot
    be opened, a path that overflows `PATH_MAX`: each is recorded as a
    warning and skipped. A live filesystem changes underneath the scan and
