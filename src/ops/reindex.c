@@ -292,6 +292,17 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
             break;
         }
 
+        /* In walk order, not hash order as a backup writes them: a rebuild
+         * is rare, and its rows still land only in this snapshot's range. */
+        if (have_target && !is_dir &&
+            db_write(ctx->db,
+                "INSERT OR REPLACE INTO node_hashes (repo_id, snap_id, content_hash, node_id)"
+                " VALUES (?, ?, ?, ?)",
+                (const char *[]){ repo, snap, thex, id, NULL }, NULL) != 0) {
+            st = set_error(ERR_IO, "reindex: cannot index content hash");
+            break;
+        }
+
         st = batch_point(ctx);
         if (st != OK) { ctx->batched = -1; break; }
 
@@ -467,6 +478,10 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
             " WHERE repo_id = ? AND snap_id = ? LIMIT 2000)",
             "DELETE FROM node_fts WHERE rowid IN (SELECT rowid FROM node_fts"
             " WHERE repo_id = ? AND snap_id = ? LIMIT 2000)",
+            /* WITHOUT ROWID: its key stands in for the rowid. */
+            "DELETE FROM node_hashes WHERE (repo_id, snap_id, content_hash, node_id) IN"
+            " (SELECT repo_id, snap_id, content_hash, node_id FROM node_hashes"
+            "   WHERE repo_id = ? AND snap_id = ? LIMIT 2000)",
         };
         for (size_t k = 0; k < sizeof(clear) / sizeof(clear[0]); k++) {
             for (;;) {
@@ -513,6 +528,10 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
     if (!failed)
         failed = db_write(db,
             "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
+            (const char *[]){ repo, snap, NULL }, NULL) != 0;
+    if (!failed)
+        failed = db_write(db,
+            "DELETE FROM node_hashes WHERE repo_id = ? AND snap_id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     /* After the old rows go and before the first new one: no reader sees
      * old ids under the new generation or new ids under the old. */

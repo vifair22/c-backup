@@ -1834,7 +1834,7 @@ static void plan_of(const char *cond, char *out, size_t cap)
          * indexes are allowed exactly that, holding only matches. */
         size_t dl = strlen(d);
         int by_repo = dl >= 11 && strcmp(d + dl - 11, "(repo_id=?)") == 0;
-        if (by_repo && (strstr(d, "nodes_by_hash") || strstr(d, "nodes_by_snap_parent") ||
+        if (by_repo && (strstr(d, "SEARCH h ") || strstr(d, "nodes_by_snap_parent") ||
                         strstr(d, "sqlite_autoindex_nodes")))
             fail_msg("node rows walked by repo_id alone: %s", d);
         int n = snprintf(out + len, cap - len, "%s\n", d);
@@ -1852,7 +1852,8 @@ static void test_node_rules_do_not_walk_the_nodes(void **state)
     char plan[4096];
     plan_of(verify_rule_condition(VERIFY_RULE_CONTENTLESS), plan, sizeof(plan));
     assert_non_null(strstr(plan, "nodes_file_no_content"));
-    assert_non_null(strstr(plan, "nodes_by_hash (repo_id=? AND content_hash=?)"));
+    /* A probe by hash per indexed snapshot (migration 016), never a walk. */
+    assert_non_null(strstr(plan, "SEARCH h USING PRIMARY KEY (repo_id=? AND snap_id=? AND content_hash=?)"));
 
     plan_of(verify_rule_condition(VERIFY_RULE_UNSETTLED), plan, sizeof(plan));
     assert_non_null(strstr(plan, "nodes_unsettled"));

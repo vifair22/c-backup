@@ -388,8 +388,9 @@ api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_i
 /*
  * Which snapshots and nodes reference an object.
  *
- * nodes_by_hash exists for exactly this query; without it this would be a
- * full scan of every node in the repository.
+ * node_hashes (migration 016) serves it, probed once per snapshot that has
+ * node rows (node_index_gen); without it this would be a full scan of every
+ * node in the repository.
  */
 api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
                                       const char *hex)
@@ -418,9 +419,11 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
     if (db_execute(g_db,
             "WITH RECURSIVE"
             " refs(snap_id, nid) AS ("
-            "   SELECT snap_id, id FROM nodes"
-            "    WHERE repo_id = ? AND content_hash = ?"
-            "    ORDER BY snap_id, id LIMIT ? OFFSET ?),"
+            "   SELECT h.snap_id, h.node_id FROM node_index_gen g"
+            "    CROSS JOIN node_hashes h"
+            "    WHERE g.repo_id = ?1 AND h.repo_id = ?1 AND h.snap_id = g.snap_id"
+            "      AND h.content_hash = ?2"
+            "    ORDER BY h.snap_id, h.node_id LIMIT ?3 OFFSET ?4),"
             " up(nid, parent, path, depth) AS ("
             "   SELECT n.id, n.parent_node_id, n.name, 0"
             "     FROM refs JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"

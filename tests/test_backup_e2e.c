@@ -40,6 +40,7 @@
 #include "manifest.h"
 #include "pack.h"
 #include "prune.h"
+#include "reindex.h"
 #include "object.h"
 #include "repo.h"
 #include "restore.h"
@@ -1915,6 +1916,106 @@ static void test_no_waiter_means_no_extra_commits(void **state)
 }
 
 /*
+ * A no-change backup's index rows cost about a WAL page per file when the
+ * content hash index was ordered by hash across the whole repository
+ * (nodes_by_hash): each budget-sized commit put its ~200 rows on ~200
+ * different pages, so every commit rewrote pages the last one had written
+ * (perf-d2-nochange: 97 MiB of WAL per unchanged 15,000-file snapshot,
+ * 93% of it that one index). node_hashes is keyed by snapshot first and
+ * written in hash order, so a snapshot's rows append. Holds the cost per
+ * node row, with the commit budget at a fixed frame cost so the batch
+ * sizes do not depend on this machine's disk.
+ */
+static void test_unchanged_backup_index_writes_stay_sequential(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_SRC "/many", 0700), 0);
+    for (int d = 0; d < 200; d++) {
+        char path[128];
+        snprintf(path, sizeof(path), TEST_SRC "/many/d%03d", d);
+        assert_int_equal(mkdir(path, 0700), 0);
+        for (int i = 0; i < 20; i++) {
+            char body[64];
+            snprintf(path, sizeof(path), TEST_SRC "/many/d%03d/f%02d.c", d, i);
+            snprintf(body, sizeof(body), "file %d of directory %d", i, d);
+            write_file(path, body);
+        }
+    }
+    backup_opts_t o = basic_opts();
+    db_txn_set_frame_cost_ns(600000.0);   /* 250 pages a commit */
+    db_txn_track_wal(db);
+    for (int k = 0; k < 4; k++)
+        assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+
+    db_txn_metrics_t m0, m1;
+    db_txn_metrics(&m0);
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    status_t st = backup_run(store, db, repo_id, &o, &res);
+    db_txn_metrics(&m1);
+    db_txn_track_wal(NULL);
+    db_txn_set_frame_cost_ns(0);
+    assert_int_equal(st, OK);
+    assert_int_equal(res.files_unchanged, res.files);
+
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)res.snapshot_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = ?",
+        (const char *[]){ repo, snap, NULL }, &r), 0);
+    double rows = atof(r->rows[0][0]);
+    db_result_free(r);
+    double frames = (double)(m1.commit_frames - m0.commit_frames);
+    print_message("  %.0f WAL frames for %.0f node rows (%.2f a row), %u index commits\n",
+                  frames, rows, frames / rows, res.commits_index);
+    assert_true(rows > 4000);
+    /* nodes_by_hash measured 1.05 here (18 index commits); node_hashes
+     * 0.12 (5). */
+    assert_true(frames / rows < 0.45);
+}
+
+/* node_hashes holds exactly the file rows with content, of every snapshot
+ * with node rows, and leaves with them: prune and reindex keep it in step. */
+static int node_hash_drift(const char *repo)
+{
+    return scalar(
+        "SELECT (SELECT COUNT(*) FROM node_hashes h WHERE h.repo_id = ?1"
+        "          AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.repo_id = h.repo_id"
+        "            AND n.id = h.node_id AND n.snap_id = h.snap_id"
+        "            AND n.content_hash = h.content_hash))"
+        "     + (SELECT COUNT(*) FROM nodes n WHERE n.repo_id = ?1 AND n.type <> 2"
+        "          AND n.content_hash IS NOT NULL AND n.content_hash <> ''"
+        "          AND NOT EXISTS (SELECT 1 FROM node_hashes h WHERE h.repo_id = n.repo_id"
+        "            AND h.snap_id = n.snap_id AND h.content_hash = n.content_hash"
+        "            AND h.node_id = n.id))", repo);
+}
+
+static void test_node_hashes_follow_the_node_rows(void **state)
+{
+    (void)state;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+    write_file(TEST_SRC "/delta.txt", "delta content");
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM node_hashes WHERE repo_id = ?", repo), 3 + 4);
+    assert_int_equal(node_hash_drift(repo), 0);
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, 1), OK);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM node_hashes WHERE repo_id = ?", repo), 4);
+    assert_int_equal(node_hash_drift(repo), 0);
+
+    reindex_result_t rx;
+    memset(&rx, 0, sizeof(rx));
+    assert_int_equal(reindex_snapshot(store, db, repo_id, 2, &rx), OK);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM node_hashes WHERE repo_id = ?", repo), 4);
+    assert_int_equal(node_hash_drift(repo), 0);
+}
+
+/*
  * The trees phase holds a batch too (OWN-16), where it used to commit every
  * new tree on its own. A writer that queues while trees are being built gets
  * in between two trees, not after the last.
@@ -2101,6 +2202,8 @@ int main(void)
     db_txn_guard_install();
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_backup_runs, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unchanged_backup_index_writes_stay_sequential, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_node_hashes_follow_the_node_rows, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deleted_newest_snapshot_id_is_not_reused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_orphaned_snapshot_record_keeps_its_id, setup, teardown),
         cmocka_unit_test_setup_teardown(test_bytes_cover_one_large_file, setup, teardown),

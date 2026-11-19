@@ -32,15 +32,11 @@ static const char *const keyed_tables[] = {
     NULL
 };
 
-/* Delete one table's rows for a repository, a batch per transaction. */
-static status_t purge_table(cutils_db_t *db, const char *table, const char *repo,
-                            atomic_int *stop)
+/* Run a delete of at most a batch of rows, a transaction each, until it
+ * deletes nothing. */
+static status_t purge_batched(cutils_db_t *db, const char *table, const char *sql,
+                              const char *repo, atomic_int *stop)
 {
-    char sql[256];
-    snprintf(sql, sizeof(sql),
-             "DELETE FROM %s WHERE rowid IN"
-             " (SELECT rowid FROM %s WHERE repo_id = ? LIMIT " PURGE_BATCH ")",
-             table, table);
     for (;;) {
         /* stopped: not done, not failed */
         if (stop && atomic_load_explicit(stop, memory_order_relaxed)) return ERR_BUSY;
@@ -53,6 +49,18 @@ static status_t purge_table(cutils_db_t *db, const char *table, const char *repo
         if (db_txn_commit(db) != OK) return set_error(ERR_IO, "purge %s: commit", table);
         if (n == 0) return OK;
     }
+}
+
+/* Delete one table's rows for a repository, a batch per transaction. */
+static status_t purge_table(cutils_db_t *db, const char *table, const char *repo,
+                            atomic_int *stop)
+{
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "DELETE FROM %s WHERE rowid IN"
+             " (SELECT rowid FROM %s WHERE repo_id = ? LIMIT " PURGE_BATCH ")",
+             table, table);
+    return purge_batched(db, table, sql, repo, stop);
 }
 
 /* One statement, one transaction: for tables keyed some other way, and the
@@ -87,6 +95,12 @@ static status_t purge_one(cutils_db_t *db, const char *repo, atomic_int *stop)
         status_t st = purge_stmt(db, by_run[i], repo);
         if (st != OK) return st;
     }
+    /* As large as nodes, and WITHOUT ROWID: batched by its own key. */
+    status_t hst = purge_batched(db, "node_hashes",
+        "DELETE FROM node_hashes WHERE (repo_id, snap_id, content_hash, node_id) IN"
+        " (SELECT repo_id, snap_id, content_hash, node_id FROM node_hashes"
+        "   WHERE repo_id = ? LIMIT " PURGE_BATCH ")", repo, stop);
+    if (hst != OK) return hst;
     for (int i = 0; keyed_tables[i]; i++) {
         status_t st = purge_table(db, keyed_tables[i], repo, stop);
         if (st != OK) return st;

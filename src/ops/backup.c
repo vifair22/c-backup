@@ -2296,6 +2296,20 @@ static status_t write_snapshot_record(store_t *store, int64_t snap_id,
     return OK;
 }
 
+/* One file row's entry in node_hashes, sorted before it is written. */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint64_t id;
+} node_hash_ent_t;
+
+static int node_hash_cmp(const void *a, const void *b)
+{
+    const node_hash_ent_t *x = a, *y = b;
+    int c = memcmp(x->hash, y->hash, OBJECT_HASH_SIZE);
+    if (c) return c;
+    return x->id < y->id ? -1 : x->id > y->id;
+}
+
 static status_t index_nodes(pipeline_t *p, int64_t snap_id)
 {
     char repo[32], snap[32];
@@ -2495,6 +2509,51 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
             db_txn_batch_opened(&nb.rule);
         }
     }
+
+    /*
+     * The snapshot's content hashes, in hash order (node_hashes, migration
+     * 016). Sorted first so the rows arrive in key order: they all sort
+     * after every earlier snapshot's, so each commit appends to the end of
+     * one b-tree instead of touching a page per row across a whole-repo
+     * hash index (perf-d2-nochange).
+     */
+    node_hash_ent_t *hv = NULL;
+    size_t hn = 0;
+    if (p->count) {
+        hv = malloc((size_t)p->count * sizeof(*hv));
+        if (!hv) { db_txn_rollback(p->db); return set_error(ERR_NOMEM, "index_nodes: out of memory"); }
+    }
+    for (uint32_t i = 0; i < p->count; i++) {
+        if (p->links[i].skipped) continue;
+        const scan_entry_t *e = &p->scan->entries[i];
+        if (e->node.type == NODE_TYPE_DIR || hash_is_zero(e->node.content_hash)) continue;
+        memcpy(hv[hn].hash, e->node.content_hash, OBJECT_HASH_SIZE);
+        hv[hn].id = e->node.node_id + id_base;
+        hn++;
+    }
+    if (hn > 1) qsort(hv, hn, sizeof(*hv), node_hash_cmp);
+    for (size_t k = 0; k < hn; k++) {
+        char hid[32], hhex[OBJECT_HASH_SIZE * 2 + 1];
+        snprintf(hid, sizeof(hid), "%llu", (unsigned long long)hv[k].id);
+        hash_hex(hv[k].hash, hhex);
+        if (db_write(p->db,
+                "INSERT INTO node_hashes (repo_id, snap_id, content_hash, node_id)"
+                " VALUES (?, ?, ?, ?)",
+                (const char *[]){ repo, snap, hhex, hid, NULL }, NULL) != 0) {
+            free(hv);
+            db_txn_rollback(p->db);
+            return set_error_wrap(ERR_IO, "index_nodes: hash insert failed");
+        }
+        if (++nb.since_commit >= NODE_BATCH || db_txn_batch_should_end(&nb.rule)) {
+            status_t cst = db_txn_commit(p->db);
+            if (cst != OK) { free(hv); return cst; }
+            nb.since_commit = 0;
+            cst = db_txn_begin_bulk(p->db);
+            if (cst != OK) { free(hv); return cst; }
+            db_txn_batch_opened(&nb.rule);
+        }
+    }
+    free(hv);
 
     #undef NODE_BATCH
     return db_txn_commit(p->db);

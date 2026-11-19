@@ -276,6 +276,45 @@ static void test_an_upgrade_from_008_keeps_every_journal_entry(void **state)
     db_close(h);
 }
 
+/*
+ * 016 moves the content hash lookups from nodes_by_hash into node_hashes:
+ * every file row with content, of every snapshot, gets its row, and nothing
+ * else does (directories carry subtree_hash, symlinks and empty files none).
+ */
+static void test_016_carries_every_file_hash_over(void **state)
+{
+    (void)state;
+    int k = index_of("016_node_hashes.sql");
+    db_migration_t *p = prefix_of(k);
+    cutils_db_t *h = open_db(TEST_DB);
+    assert_int_equal(db_run_compiled_migrations(h, p), 0);
+    free(p);
+    assert_int_equal(db_exec_raw(h,
+        "INSERT INTO repos (id, uuid, path, added_at) VALUES (1, 'u', '/r', 0);"
+        "INSERT INTO nodes (repo_id, id, snap_id, parent_node_id, name, type, mode,"
+        "  uid, gid, mtime_ns, size, content_hash, subtree_hash) VALUES"
+        " (1, 1, 1, 0, 'd', 2, 16877, 0, 0, 0, 0, NULL, 'aa'),"
+        " (1, 2, 1, 1, 'f', 1, 33188, 0, 0, 0, 3, 'bb', NULL),"
+        " (1, 3, 1, 1, 'e', 1, 33188, 0, 0, 0, 0, NULL, NULL),"
+        " (1, 4, 1, 1, 'l', 3, 41471, 0, 0, 0, 0, NULL, NULL),"
+        " (1, 5, 2, 0, 'd', 2, 16877, 0, 0, 0, 0, NULL, 'aa'),"
+        " (1, 6, 2, 5, 'f', 1, 33188, 0, 0, 0, 3, 'bb', NULL),"
+        " (1, 7, 2, 5, 'g', 1, 33188, 0, 0, 0, 3, 'cc', NULL);"), 0);
+    assert_int_equal(db_run_compiled_migrations(h, app_migrations), 0);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(h, "SELECT snap_id, content_hash, node_id FROM node_hashes"
+                                   " ORDER BY snap_id, content_hash, node_id", NULL, &r), 0);
+    static const char *want[][3] = { { "1", "bb", "2" }, { "2", "bb", "6" }, { "2", "cc", "7" } };
+    assert_int_equal(r->nrows, 3);
+    for (int i = 0; i < 3; i++)
+        for (int c = 0; c < 3; c++)
+            assert_string_equal(r->rows[i][c], want[i][c]);
+    db_result_free(r);
+    assert_int_equal(scalar(h, "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'nodes_by_hash'"), 0);
+    db_close(h);
+}
+
 /* What the daemon does before AppGuard opens state.db. */
 static void reset_tmpdir(void)
 {
@@ -348,6 +387,7 @@ int main(void)
             test_a_failed_migration_reports_its_own_error_and_applies_nothing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_database_at_any_point_of_the_set_resumes,
                                         setup, teardown),
+        cmocka_unit_test_setup_teardown(test_016_carries_every_file_hash_over, setup, teardown),
         cmocka_unit_test_setup_teardown(test_an_upgrade_from_008_keeps_every_journal_entry,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(
