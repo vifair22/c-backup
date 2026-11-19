@@ -298,6 +298,8 @@ int store_pack_staging(const store_t *st, char *buf, size_t sz);
  * writes this repository, and the daemon is the only process that does, so
  * anything already in tmp/ when it started belongs to a writer that is gone.
  * Backup and gc call this with their own start time; nothing else should.
+ * With tmp/'s claim held, `before` is not consulted for those names: every
+ * one goes, whatever its mtime says (a file can be stamped ahead of time()).
  */
 unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes);
 

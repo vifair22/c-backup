@@ -482,6 +482,15 @@ static void test_gc_removes_stale_staging_files(void **state)
     old[1] = old[0];
     write_file(TEST_REPO "/tmp/tags.Oo55Pp", "{\"version\":1,\"tags\":[]}");
     assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/tags.Oo55Pp", old, 0), 0);
+    /* One stamped ahead of time(): tmpfs's fine-grained mtimes run up to a
+     * second ahead of the coarse clock, and a clock stepped back makes it
+     * more. gc holds the claim, so its age says nothing (FLAKE-35). */
+    struct timespec ahead[2];
+    clock_gettime(CLOCK_REALTIME, &ahead[0]);
+    ahead[0].tv_sec += 5;
+    ahead[1] = ahead[0];
+    write_file(TEST_REPO "/tmp/pack-dat.Qq66Rr", "a pack stamped ahead of the clock");
+    assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/pack-dat.Qq66Rr", ahead, 0), 0);
     write_file(TEST_REPO "/tmp/mine.txt", "somebody else's");
     assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/mine.txt", past, 0), 0);
 
@@ -492,9 +501,10 @@ static void test_gc_removes_stale_staging_files(void **state)
     assert_int_equal(stat(TEST_REPO "/tmp/pack-dat.Kk33Ll", &sb), 0);
 
     assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
-    assert_int_equal(g.tmp_files_removed, 2);
+    assert_int_equal(g.tmp_files_removed, 3);
     assert_true(g.tmp_bytes_removed > 0);
     assert_int_equal(stat(TEST_REPO "/tmp/pack-dat.Kk33Ll", &sb), -1);
+    assert_int_equal(stat(TEST_REPO "/tmp/pack-dat.Qq66Rr", &sb), -1);
     assert_int_equal(stat(TEST_REPO "/tmp/tags.Mm44Nn", &sb), 0);    /* in progress */
     assert_int_equal(stat(TEST_REPO "/tmp/tags.Oo55Pp", &sb), -1);   /* an orphan */
     assert_int_equal(stat(TEST_REPO "/tmp/mine.txt", &sb), 0);
