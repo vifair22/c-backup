@@ -24,6 +24,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
 
 #include <cmocka.h>
 
@@ -31,6 +33,7 @@
 #include "fake_index.h"
 #include "object.h"
 #include "pack.h"
+#include "pack_writeback.h"
 #include "parity.h"
 #include "store.h"
 #include "util.h"
@@ -298,6 +301,81 @@ static void test_pack_writeback_flush_fail(void **state)
     free(buf);
 }
 
+/*
+ * B232: the pack writer's early writeback must never wait on the thread
+ * that appends. A backup appends small files inside its batch transaction,
+ * so a sync_file_range there that waited for a busy device (19 s on FS2)
+ * held the write lock for the whole wait. Here the device takes 3 s to
+ * accept each range; every append still returns at once, and the range is
+ * submitted from another thread.
+ */
+static pthread_mutex_t sfr_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  sfr_cv = PTHREAD_COND_INITIALIZER;
+static int             sfr_open_gate;
+static int             sfr_calls;
+static int             sfr_on_appender;
+static pthread_t       sfr_appender;
+
+static int slow_sfr(int fd)
+{
+    (void)fd;
+    pthread_mutex_lock(&sfr_mu);
+    sfr_calls++;
+    if (pthread_equal(pthread_self(), sfr_appender)) sfr_on_appender++;
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 3;
+    while (!sfr_open_gate && pthread_cond_timedwait(&sfr_cv, &sfr_mu, &until) == 0) {}
+    pthread_mutex_unlock(&sfr_mu);
+    return FAULT_FS_PASS;
+}
+
+static double mono_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+static void test_pack_writeback_never_waits_on_the_appender(void **state)
+{
+    (void)state;
+    pack_backup_writer_t *w = NULL;
+    assert_int_equal(pack_backup_open(store, &w), OK);
+    size_t len = 65536;
+    unsigned char *buf = malloc(len);
+    assert_non_null(buf);
+    uint32_t x = 88172645u;
+    sfr_appender = pthread_self();
+    sfr_calls = sfr_on_appender = sfr_open_gate = 0;
+    fault_sfr_hook = slow_sfr;
+    double slowest = 0;
+    /* 24 MiB of incompressible entries: three writeback steps. */
+    for (int i = 0; i < 384; i++) {
+        for (size_t k = 0; k < len; k++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; buf[k] = (unsigned char)x; }
+        uint8_t h[OBJECT_HASH_SIZE];
+        int is_new = 0;
+        double t0 = mono_s();
+        assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, buf, len, h, &is_new, NULL, NULL), OK);
+        double took = mono_s() - t0;
+        if (took > slowest) slowest = took;
+    }
+    pthread_mutex_lock(&sfr_mu);
+    sfr_open_gate = 1;
+    pthread_cond_broadcast(&sfr_cv);
+    pthread_mutex_unlock(&sfr_mu);
+    pack_writeback_drain();
+    fault_sfr_hook = NULL;
+    unsigned long queued = 0, dropped = 0;
+    pack_writeback_counts(&queued, &dropped);
+    assert_true(sfr_calls >= 2);
+    assert_int_equal(sfr_on_appender, 0);
+    assert_true(queued >= 2);
+    assert_true(slowest < 1.0);
+    pack_backup_abort(w);
+    free(buf);
+}
+
 static void test_pack_finalize_fsync_fail(void **state)
 {
     (void)state;
@@ -481,6 +559,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_pack_seal_pwrite_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_finalize_fsync_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_writeback_flush_fail, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_writeback_never_waits_on_the_appender, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_gc_malloc_fail, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_backwards_parity_offsets_do_not_allocate, setup_packed, teardown),
     };
