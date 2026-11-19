@@ -170,11 +170,109 @@ static void test_checks_before_a_write_do_not_wait_for_the_shared_connection(voi
     api_server_stop(srv);
 }
 
+/*
+ * B269: read-only routes answer while a verify reads the index. A verify's
+ * scans of every node and object ran on the shared connection and held its
+ * mutex for minutes on FS1, and GET /jobs/<id> (over 120 s) and GET /repos
+ * (88 s) waited for them. Two halves: the routes read on the reader pool,
+ * so a holder of the shared connection does not stop them; and the verify
+ * reads on a long-read connection (db_read_rows), which holds neither the
+ * shared connection's mutex nor anything the checkpointer's locked round
+ * waits for (db_readers_quiesce).
+ */
+static void *slow_long_read(void *arg)
+{
+    (void)arg;
+    atomic_store(&g_slow_started, 1);
+    db_rows_t *r = NULL;
+    if (db_read_rows(db, 1, g_slow_sql, (const char *[]){ NULL }, &r) != 0) { /* timing only */ }
+    db_rows_free(r);
+    atomic_store(&g_slow_done, 1);
+    return NULL;
+}
+
+static void wait_started(void)
+{
+    while (!atomic_load(&g_slow_started)) {
+        struct timespec ts = { 0, 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    struct timespec ts = { 0, 50 * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+static void test_read_routes_answer_while_the_index_is_read(void **state)
+{
+    (void)state;
+    double slow = calibrate();
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    assert_int_equal(db_exec_raw(db, "INSERT INTO jobs (id, repo_id, action, state, origin)"
+                                     " VALUES (7, 1, 'verify', 'running', 'api')"), 0);
+    api_server_t *srv = api_server_create(0, NULL, NULL, NULL);
+    assert_non_null(srv);
+    assert_int_equal(routes_register_repos(srv, db), 0);
+    assert_int_equal(routes_register_jobs(srv, db, NULL), 0);
+    const char *urls[] = { "/repos", "/jobs/7", "/jobs" };
+
+    /* A holder of the shared connection: the routes do not wait for it. */
+    for (size_t i = 0; i < 3; i++) {
+        atomic_store(&g_slow_started, 0);
+        atomic_store(&g_slow_done, 0);
+        pthread_t th;
+        assert_int_equal(pthread_create(&th, NULL, slow_read, NULL), 0);
+        wait_started();
+        double t0 = now_s();
+        int status = dispatch(srv, API_GET, urls[i], NULL);
+        double took = now_s() - t0;
+        int overlapped = !atomic_load(&g_slow_done);
+        pthread_join(th, NULL);
+        print_message("  GET %s: %d in %.0f ms beside a %.0f ms holder of the shared "
+                      "connection\n", urls[i], status, took * 1000, slow * 1000);
+        assert_int_equal(status, 200);
+        assert_true(overlapped);
+        assert_true(took < slow / 4);
+    }
+
+    /* The verify's own long read: the shared connection stays free, and
+     * the checkpointer's quiesce does not wait for it. */
+    atomic_store(&g_slow_started, 0);
+    atomic_store(&g_slow_done, 0);
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, slow_long_read, NULL), 0);
+    wait_started();
+    double t0 = now_s();
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT count(*) FROM repos", NULL, &r), 0);
+    db_result_free(r);
+    double shared = now_s() - t0;
+    t0 = now_s();
+    db_readers_quiesce();
+    db_readers_resume();
+    double quiesce = now_s() - t0;
+    t0 = now_s();
+    int status = dispatch(srv, API_GET, "/jobs/7", NULL);
+    double route = now_s() - t0;
+    int overlapped = !atomic_load(&g_slow_done);
+    pthread_join(th, NULL);
+    print_message("  beside a %.0f ms long read: shared connection %.1f ms, quiesce %.1f ms, "
+                  "GET /jobs/7 %.1f ms\n", slow * 1000, shared * 1000, quiesce * 1000,
+                  route * 1000);
+    assert_true(overlapped);
+    assert_int_equal(status, 200);
+    assert_true(shared < slow / 4);
+    assert_true(quiesce < slow / 4);
+    assert_true(route < slow / 4);
+    api_server_stop(srv);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(
             test_checks_before_a_write_do_not_wait_for_the_shared_connection, setup, teardown),
+        cmocka_unit_test_setup_teardown(
+            test_read_routes_answer_while_the_index_is_read, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

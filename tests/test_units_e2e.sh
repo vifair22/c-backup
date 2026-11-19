@@ -149,6 +149,12 @@ contains "with the warning in it" "each unit was its own capture" "$OUT"
 echo "restore"
 OUT=$(cb unit restore 1 1 "$WORK/out")
 contains "files restore completes" '"state":"completed"' "$OUT"
+# NIT-50: a unit restore journalled no message; it says what came back.
+OUT=$(cb journal 1 --limit 1)
+contains "its journal entry is a unit-restore" '"operation":"unit-restore","result":"success"' "$OUT"
+contains "naming the unit, the snapshot and where it went" \
+    "unit fake:a from snapshot 1: " "$OUT"
+contains "and how much came back" "restored to $WORK/out" "$OUT"
 check    "the disk is its full virtual size" 8388608 "$(stat -c %s "$WORK/out/.cbackup-unit/disks/vda")"
 BLOCKS=$(stat -c %b "$WORK/out/.cbackup-unit/disks/vda")
 if [ "$BLOCKS" -lt 8192 ]; then ok "and sparse ($BLOCKS blocks)"; else bad "and sparse" "< 8192 blocks" "$BLOCKS"; fi
@@ -157,6 +163,9 @@ check    "configuration is verbatim" "<domain>a</domain>" "$(cat "$WORK/out/.cba
 contains "unit.json is there" '"format":"cbackup-unit"' "$(cat "$WORK/out/.cbackup-unit/unit.json")"
 OUT=$(cb unit restore 1 1 "$WORK/vda.raw" --item vda)
 contains "an item restore completes" '"state":"completed"' "$OUT"
+contains "an item restore journals the item and its size" \
+    "unit fake:a from snapshot 1: item vda (8388608 bytes) restored to $WORK/vda.raw" \
+    "$(cb journal 1 --limit 1)"
 if cmp -s "$WORK/vda.raw" "$WORK/out/.cbackup-unit/disks/vda"; then ok "the raw image matches"; else bad "the raw image matches" "same bytes" "differs"; fi
 check    "no partial file is left" "no" "$([ -e "$WORK/vda.raw.cbk-partial" ] && echo yes || echo no)"
 OUT=$(cb unit restore 1 1 "$WORK/vda.raw" --item vda 2>&1); RC=$?
@@ -234,6 +243,18 @@ OUT=$(cb vm export 1 1 domain.xml 2>&1); RC=$?
 check    "only disks are exported" 1 "$RC"
 OUT=$(cb vm export 1 1 vda --ttl 10s 2>&1); RC=$?
 check    "a ttl under a minute is refused" 1 "$RC"
+# B239 and NIT-52: a revoke takes no body. An unknown member is a 400 for an
+# export that is open, and leaves it open; for one that is not, the URL
+# names nothing and that 404 wins.
+if command -v curl >/dev/null 2>&1; then
+    check "a revoke with a member is refused" \
+        "{\"error\":\"unknown key 'zz_b239'; this request takes no fields\"} 400" \
+        "$(curl -s -w ' %{http_code}' --unix-socket "$SOCK" -X DELETE -d '{"zz_b239":1}' "http://x/exports/$EID")"
+    contains "and the export is still open" "\"id\":$EID" "$(cb vm exports)"
+    check "an unknown export with a member is a 404" \
+        '{"error":"no open export with that id"} 404' \
+        "$(curl -s -w ' %{http_code}' --unix-socket "$SOCK" -X DELETE -d '{"zz_b239":1}' http://x/exports/999999)"
+fi
 OUT=$(cb vm unexport "$EID"); RC=$?
 check    "revoking it succeeds" 0 "$RC"
 check    "and removes the socket" "no" "$([ -e "$ESOCK" ] && echo yes || echo no)"
@@ -294,6 +315,7 @@ contains "a unit's own retention" '"retention.keep_daily":"3"' "$OUT"
 contains "shows what is in force" '"effective"' "$(cb unit policy show 1 --provider fake cbk-uat-a)"
 OUT=$(cb unit policy set 1 --provider fake cbk-uat-a retention.bogus 3 2>&1); RC=$?
 check    "an unknown key is refused" 1 "$RC"
+contains "naming it" "unknown unit policy key 'retention.bogus'" "$OUT"
 # A policy row no backup would read was accepted for any unit.
 OUT=$(cb unit policy set 1 --provider fake prod-db retention.keep_daily 3 2>&1); RC=$?
 check    "a policy for a unit outside units.allow is refused" 1 "$RC"
@@ -355,6 +377,19 @@ check    "unit options on another action are refused" 1 "$RC"
 echo "enumerated when it runs"
 sleep 1
 write_spec ',{"id":"c","name":"cbk-uat-c","state":"stopped","blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}]}'
+# B243: a policy set by name for a unit never backed up here is stored
+# under its id, and show by name read <provider>:<name>: the policy just
+# set was absent and the repository's values were shown as in force.
+cb unit policy set 1 --provider fake cbk-uat-c retention.keep_daily 5 > /dev/null
+OUT=$(cb unit policy show 1 --provider fake cbk-uat-c)
+contains "a policy set by name reads back by name" '"unit":{"retention.keep_daily":"5"}' "$OUT"
+contains "under the unit's id" '"unit_key":"fake:c"' "$OUT"
+contains "and is in force" '"retention.keep_daily":5' "$OUT"
+check    "by id it is the same policy" "$OUT" "$(cb unit policy show 1 --provider fake c)"
+OUT=$(cb unit policy show 1 --provider fake nosuch 2>&1); RC=$?
+check    "an unknown unit's policy is not shown as the repository's" 1 "$RC"
+contains "saying why" "lists no unit nosuch" "$OUT"
+cb unit policy set 1 --provider fake cbk-uat-c retention.keep_daily "" > /dev/null
 OUT=$(cb unit backup 1 --provider fake --all)
 contains "a unit added since is included" '"ok":3' "$OUT"
 
@@ -387,6 +422,7 @@ contains "a detection run completes" '"state":"completed"' "$OUT"
 contains "and finds the data directory" "\"path\":\"$WORK/live/d/pg\"" "$OUT"
 contains "live by its process and open file" '"confidence":"live"' "$OUT"
 contains "with the open file as evidence" '"open_write":[{"path":' "$OUT"
+contains "and its listening port (B252)" '"ports":[{"container":"pg","port":"5432"}]' "$OUT"
 contains "the client image is a hint" '"engine":"mysql","path":"","confidence":"hint"' "$OUT"
 contains "said as information" 'the image of client suggests MySQL/MariaDB' "$OUT"
 contains "and the journal says the probe answered" 'with units.probe' "$(cb journal 1 --limit 5)"
@@ -413,6 +449,52 @@ contains "a backup of it carries the same findings" '"engine":"postgres"' "$OUT"
 contains "with the probe's liveness" '"confidence":"live"' "$OUT"
 contains "and the finding now names its snapshot" '"last_snap_id":' "$(cb db show 1 "$DID")"
 lacks    "no longer null" '"last_snap_id":null' "$(cb db show 1 "$DID")"
+# B254: one finding carries its history, the journal entries about it,
+# newest first; the list does not.
+cb db dismiss 1 "$DID" --reason "test data" > /dev/null
+H=$(cb db show 1 "$DID")
+contains "B254: a finding shows its history" '"history":[{"journal_id":' "$H"
+contains "B254: the dismissal is in it" "finding $DID (live PostgreSQL" "$H"
+contains "B254: as journalled" '"operation":"db-dismiss"' "$H"
+contains "B254: and whether it is all of it" '"history_truncated":false' "$H"
+FIRST_OP=$(printf '%s' "$H" | sed -n 's/.*"history":\[{[^}]*"operation":"\([a-z-]*\)".*/\1/p')
+check    "B254: the newest entry first" "db-dismiss" "$FIRST_OP"
+lacks    "B254: another finding's entries are not" "\"message\":\"finding $((DID + 1)) (" "$H"
+lacks    "B254: the list leaves history out" '"history"' "$(cb db list 1 --unit fake:d)"
+
+echo "Nextcloud with its database in a unit not backed up here (B249)"
+# docs/db-detection.md 3 and 14.12: Nextcloud's web server makes its finding
+# live; its version is config.php's; its dbhost names a unit the host lists
+# that nothing in this repository was recorded from, which still places the
+# database in another capture, suggested group-units.
+mkdir -p "$WORK/snap-n/config"
+cat > "$WORK/snap-n/config/config.php" <<'PHP'
+<?php
+$CONFIG = array (
+  'dbtype' => 'mysql',
+  'dbhost' => 'cbk-uat-ncdb:3306',
+  'version' => '30.0.2.2',
+);
+PHP
+UNIT_N=',{"id":"n","name":"cbk-uat-nc","state":"running",
+  "trees":[{"id":"html","read_root":"'"$WORK"'/snap-n","path":"'"$WORK"'/live/n","source":"'"$WORK"'/snap-n"}],
+  "probe":{"containers":[{"name":"cbk-uat-nc","image":"nextcloud:30","running":true,
+     "processes":[{"comm":"apache2","args":"apache2 -DFOREGROUND"}],"ports":[80]}]}},
+ {"id":"m","name":"cbk-uat-ncdb","state":"running",
+  "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"m"}]}'
+write_spec ",{\"id\":\"c\",\"name\":\"cbk-uat-c\",\"state\":\"stopped\",\"blobs\":[{\"id\":\"x\",\"path\":\".cbackup-unit/config/x\",\"text\":\"c\"}]}$UNIT_D$UNIT_N"
+OUT=$(cb db detect 1 cbk-uat-nc --provider fake)
+contains "a detection run of it completes" '"state":"completed"' "$OUT"
+contains "and finds Nextcloud" '"engine":"nextcloud"' "$OUT"
+contains "at its own version, not its dbtype" '"version":"30.0.2.2"' "$OUT"
+contains "live by its web server" '"confidence":"live"' "$OUT"
+contains "with the process as evidence" '"processes":[{"container":"cbk-uat-nc","comm":"apache2"}]' "$OUT"
+contains "its database placed in the listed unit" '"resolved":"unit:fake:m"' "$OUT"
+contains "captured apart" '"consistent":false' "$OUT"
+# The fake tree is read live (no snapshot domain, no pause): uncovered, which
+# outranks split; test_db_findings covers split.
+contains "read live, it stays uncovered" '"coverage":"uncovered"' "$OUT"
+contains "and suggested to group them" '"suggestion":"group-units"' "$OUT"
 
 echo "an export of a disk with unaligned holes (B250)"
 # Holes that start and end mid-sector, one data run a single byte long, and

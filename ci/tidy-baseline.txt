@@ -1,0 +1,227 @@
+# clang-tidy warnings the gate tolerates: count, file, check, message.
+# Regenerate with `make tidy-baseline` (full run). Lower is the only
+# direction it should move; a new entry is a reviewer's decision.
+# Debian LLVM version 19.1.7
+2	src/api/auth.c	bugprone-misplaced-widening-cast	either cast from 'time_t' (aka 'long') to 'long long' is ineffective, or there is loss of precision before the conversion
+1	src/api/auth.c	cert-err34-c	'sscanf' used to convert a string to an integer value, but function will not report conversion errors; consider using 'strtol' instead
+1	src/api/auth.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+2	src/api/nbd_server.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'unsigned int' is used as a pointer offset after an implicit widening conversion to type 'size_t'
+1	src/api/nbd_server.c	clang-analyzer-unix.StdCLibraryFunctions	The Nst argument to 'bind' is -N but should be >= N
+1	src/api/routes/backup_routes.c	bugprone-integer-division	result of integer division used in a floating point context; possible loss of precision
+1	src/api/routes/db_actions.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/api/routes/exports.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/api/routes/exports.c	clang-analyzer-unix.StdCLibraryFunctions	The Nst argument to 'fstatat' is between -N and -N but should be a valid file descriptor or AT_FDCWD
+1	src/api/routes/exports.c	clang-analyzer-unix.StdCLibraryFunctions	The Nst argument to 'unlinkat' is between -N and -N but should be a valid file descriptor or AT_FDCWD
+1	src/api/routes/introspect.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'size_t' (aka 'unsigned long') of a multiplication performed in type 'unsigned int'
+1	src/api/routes/introspect.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'uintN_t' (aka 'unsigned long') of a multiplication performed in type 'unsigned int'
+1	src/api/routes/introspect.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'unsigned long' of a multiplication performed in type 'int'
+1	src/api/routes/introspect.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+2	src/api/routes/introspect.c	bugprone-narrowing-conversions	narrowing conversion from 'int' to signed type 'char' is implementation-defined
+1	src/api/routes/introspect.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/api/routes/introspect.c	misc-no-recursion	function 'diff_walk' is within a recursive call chain
+1	src/api/routes/introspect.c	misc-no-recursion	function 'diff_whole_tree' is within a recursive call chain
+1	src/api/routes/metadata.c	clang-analyzer-unix.Malloc	Potential leak of memory pointed to by 'value'
+1	src/api/routes/snapshots.c	clang-analyzer-core.NullDereference	Access to field 'rows' results in a dereference of a null pointer (loaded from variable 'r')
+2	src/api/routes/units.c	bugprone-casting-through-void	do not cast 'char **' to 'const char **' through 'void *'
+1	src/api/routes/units.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'unsigned long' of a multiplication performed in type 'int'
+2	src/api/routes/units.c	cert-err34-c	'atoi' used to convert a string to an integer value, but function will not report conversion errors; consider using 'strtol' instead
+1	src/api/routes/units.c	clang-analyzer-core.NullDereference	Access to field 'name' results in a dereference of a null pointer (loaded from variable 'd')
+1	src/api/server.c	bugprone-casting-through-void	do not cast 'const struct sockaddr *' to 'const struct sockaddr_in *' through 'const void *'
+1	src/api/server.c	bugprone-casting-through-void	do not cast 'const struct sockaddr *' to 'const struct sockaddr_inN *' through 'const void *'
+2	src/api/server.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/api/server.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nst parameter expecting 'nonnull'
+1	src/cli/calendar_check.c	cert-err34-c	'sscanf' used to convert a string to an integer value, but function will not report conversion errors; consider using 'strtol' instead
+1	src/cli/http.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'size_t' (aka 'unsigned long') of a multiplication performed in type 'int'
+1	src/cli/http.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+2	src/cli/http.c	cert-err34-c	'sscanf' used to convert a string to an integer value, but function will not report conversion errors; consider using 'strtol' instead
+1	src/cli/main.c	bugprone-branch-clone	repeated branch body in conditional chain
+6	src/cli/main.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/common/error.h	bugprone-reserved-identifier	declaration uses identifier '_err_buf', which is reserved in the global namespace
+1	src/common/error.h	bugprone-reserved-identifier	declaration uses identifier '_set_error_plain', which is reserved in the global namespace
+1	src/common/error.h	bugprone-reserved-identifier	declaration uses identifier '_set_error_with_errno', which is reserved in the global namespace
+1	src/common/error.h	bugprone-reserved-identifier	declaration uses identifier '_set_error_wrap', which is reserved in the global namespace; cannot be fixed because 'set_error_wrap' would conflict with a macro definition
+1	src/common/snap_record.c	bugprone-branch-clone	repeated branch body in conditional chain
+3	src/common/snap_record.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'size_t' (aka 'unsigned long') of a multiplication performed in type 'int'
+1	src/common/snap_record.c	bugprone-not-null-terminated-result	the result from calling 'memcpy' is not null-terminated
+5	src/common/tzinfo.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+2	src/common/tzinfo.c	clang-analyzer-unix.Stream	File position of the stream might be 'indeterminate' after a failed operation. Can cause undefined behavior
+2	src/common/tzinfo.c	clang-analyzer-unix.Stream	Read function called when stream is in EOF state. Function has no effect
+1	src/common/util.h	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'size_t' (aka 'unsigned long') of a multiplication performed in type 'int'
+1	src/common/util.h	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/common/util.h	cert-err34-c	'fscanf' used to convert a string to an integer value, but function will not report conversion errors; consider using 'strtol' instead
+1	src/config/app_config.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'long' of a multiplication performed in type 'int'
+1	src/config/app_config.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/helper/docker_backend.c	bugprone-not-null-terminated-result	the result from calling 'memcpy' is not null-terminated
+3	src/helper/docker_backend.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/helper/docker_backend.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nst parameter expecting 'nonnull'
+1	src/helper/docker_backend.c	clang-analyzer-core.NullDereference	Access to field 'live' results in a dereference of a null pointer (loaded from variable 'x')
+1	src/helper/docker_backend.c	clang-analyzer-core.NullDereference	Access to field 'running' results in a dereference of a null pointer (loaded from variable 'pc')
+1	src/helper/docker_backend.c	clang-analyzer-core.NullDereference	Access to field 'status' results in a dereference of a null pointer (loaded from variable 'r')
+1	src/helper/docker_backend.c	clang-analyzer-core.NullDereference	Access to field 'verdict' results in a dereference of a null pointer (loaded from variable 'mc')
+1	src/helper/docker_backend.c	clang-analyzer-core.NullDereference	Array access (from variable 'pz') results in a null pointer dereference
+1	src/helper/docker_backend.c	clang-analyzer-core.NullDereference	Dereference of null pointer
+1	src/helper/docker_backend.c	clang-analyzer-optin.taint.TaintedAlloc	realloc is called with a tainted (potentially attacker controlled) value. Make sure the value is bound checked
+1	src/helper/docker_backend.c	clang-analyzer-unix.Malloc	Attempt to free released memory
+1	src/helper/docker_backend.c	clang-analyzer-unix.Stream	File position of the stream might be 'indeterminate' after a failed operation. Can cause undefined behavior
+1	src/helper/docker_backend.c	clang-analyzer-unix.Stream	Read function called when stream is in EOF state. Function has no effect
+1	src/helper/docker_backend.c	misc-no-recursion	function 'holds_block' is within a recursive call chain
+1	src/helper/helper_backend_fake.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/helper/helper_policy.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type '__off_t' (aka 'long') of a multiplication performed in type 'int'
+3	src/helper/helper_server.c	bugprone-integer-division	result of integer division used in a floating point context; possible loss of precision
+2	src/helper/helper_server.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/helper/helper_server.c	clang-analyzer-security.cert.env.InvalidPtr	use of invalidated pointer 'strerror(er)' in a function call
+2	src/helper/lxc_backend.c	bugprone-branch-clone	repeated branch body in conditional chain
+1	src/helper/lxc_backend.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'size_t' (aka 'unsigned long') of a multiplication performed in type 'int'
+2	src/helper/lxc_backend.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/helper/lxc_backend.c	clang-analyzer-core.NullDereference	Access to field 'c' results in a dereference of a null pointer (loaded from variable 'w')
+1	src/helper/lxc_backend.c	clang-analyzer-core.NullDereference	Access to field 'live' results in a dereference of a null pointer (loaded from variable 'x')
+1	src/helper/lxc_backend.c	clang-analyzer-core.NullDereference	Access to field 'n_aliases' results in a dereference of a null pointer (loaded from variable 'pc')
+1	src/helper/lxc_backend.c	clang-analyzer-core.NullDereference	Access to field 'n_items' results in a dereference of a null pointer (loaded from variable 'd')
+1	src/helper/lxc_backend.c	clang-analyzer-core.NullDereference	Access to field 'v' results in a dereference of a null pointer (loaded from variable 'p')
+2	src/helper/lxc_backend.c	clang-analyzer-core.NullDereference	Array access (from variable 'src') results in a null pointer dereference
+1	src/helper/lxc_backend.c	clang-analyzer-optin.portability.UnixAPI	Call to 'malloc' has an allocation size of N bytes
+1	src/helper/mounts.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/helper/mounts.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/helper/mounts.c	misc-no-recursion	function 'resolve' is within a recursive call chain
+1	src/helper/proc_probe.c	cert-err34-c	'sscanf' used to convert a string to an integer value, but function will not report conversion errors; consider using 'strtol' instead
+1	src/helper/proc_probe.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/helper/proc_probe.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nrd parameter expecting 'nonnull'
+1	src/helper/proc_probe.c	clang-analyzer-core.NullDereference	Array access (via field 'v') results in a null pointer dereference
+1	src/helper/proc_probe.c	clang-analyzer-unix.StdCLibraryFunctions	The Nst argument to 'readlinkat' is between -N and -N but should be a valid file descriptor or AT_FDCWD
+1	src/helper/snap.c	bugprone-suspicious-missing-comma	suspicious string literal, probably missing a comma
+1	src/helper/snap.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/meta/repo.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/meta/repo.c	clang-analyzer-core.uninitialized.Assign	Assigned value is garbage or undefined
+1	src/meta/repo_key.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'size_t' (aka 'unsigned long') of a multiplication performed in type 'int'
+1	src/meta/repo_key.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/meta/repo_tags.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'uintN_t' (aka 'unsigned long') of a multiplication performed in type 'unsigned int'
+3	src/meta/repo_tags.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+2	src/ops/backup.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/ops/backup.c	bugprone-misplaced-widening-cast	either cast from 'uintN_t' (aka 'unsigned long') to 'unsigned long long' is ineffective, or there is loss of precision before the conversion
+1	src/ops/backup.c	clang-analyzer-core.NullDereference	Access to field 'detect' results in a dereference of a null pointer (loaded from field 'opts')
+1	src/ops/backup.c	misc-confusable-identifiers	'_trn' is confusable with '_tm'
+1	src/ops/db_detect.c	bugprone-inc-dec-in-conditions	incrementing and referencing a variable in a complex condition can cause unintended side-effects due to C++'s order of evaluation, consider moving the modification outside of the condition to avoid misunderstandings
+1	src/ops/db_detect.c	clang-analyzer-core.NullDereference	Access to field 'n' results in a dereference of a null pointer (loaded from variable 'res')
+1	src/ops/db_detect.c	clang-analyzer-core.NullDereference	Access to field 'v' results in a dereference of a null pointer (loaded from variable 'res')
+1	src/ops/db_detect.c	clang-analyzer-deadcode.DeadStores	Value stored to 'why' during its initialization is never read
+1	src/ops/file_cache.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'unsigned long' of a multiplication performed in type 'int'
+3	src/ops/file_cache.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/ops/file_cache.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+3	src/ops/gc.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/ops/gc.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/ops/gc.c	misc-no-recursion	function 'mark_tree' is within a recursive call chain
+2	src/ops/gfs.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'long' of a multiplication performed in type 'int'
+1	src/ops/gfs.c	bugprone-switch-missing-default-case	switching on non-enum value without default case may not cover all cases
+1	src/ops/gfs.c	cert-err34-c	'atoi' used to convert a string to an integer value, but function will not report conversion errors; consider using 'strtol' instead
+1	src/ops/grep.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/ops/grep.c	bugprone-narrowing-conversions	narrowing conversion from 'int' to signed type 'char' is implementation-defined
+1	src/ops/grep.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/ops/grep.c	clang-analyzer-core.NullDereference	Dereference of null pointer (loaded from variable 'p')
+1	src/ops/pack_presence.c	bugprone-branch-clone	repeated branch body in conditional chain
+1	src/ops/reindex.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type '__off_t' (aka 'long') of a multiplication performed in type 'int'
+1	src/ops/reindex.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'unsigned long' of a multiplication performed in type 'int'
+3	src/ops/reindex.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/ops/reindex.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/ops/reindex.c	misc-no-recursion	function 'walk_tree' is within a recursive call chain
+2	src/ops/replica_local.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/ops/replica_local.c	clang-analyzer-core.NullDereference	Dereference of null pointer (loaded from field 'tcdc')
+1	src/ops/replicate.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'unsigned long' of a multiplication performed in type 'unsigned int'
+4	src/ops/replicate.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/ops/replicate.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/ops/replicate.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nst parameter expecting 'nonnull'
+1	src/ops/replicate.c	misc-no-recursion	function 'rc_memo_put' is within a recursive call chain
+1	src/ops/replicate.c	misc-no-recursion	function 'rc_tree' is within a recursive call chain
+1	src/ops/replicate.c	misc-no-recursion	function 'send_list_body' is within a recursive call chain
+1	src/ops/replicate.c	misc-no-recursion	function 'walk_tree' is within a recursive call chain
+1	src/ops/restore.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/ops/restore.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/ops/restore.c	clang-analyzer-core.UndefinedBinaryOperatorResult	The left operand of '==' is a garbage value
+1	src/ops/restore.c	clang-analyzer-core.uninitialized.Branch	Branch condition evaluates to a garbage value
+1	src/ops/restore.c	clang-analyzer-unix.StdCLibraryFunctions	The Nst argument to 'fchown' is < N but should be >= N
+1	src/ops/restore.c	misc-no-recursion	function 'pt_dir' is within a recursive call chain
+1	src/ops/restore.c	misc-no-recursion	function 'pt_rel' is within a recursive call chain
+1	src/ops/scan.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'size_t' (aka 'unsigned long') of a multiplication performed in type 'unsigned int'
+1	src/ops/scan.c	bugprone-not-null-terminated-result	the result from calling 'memcpy' is not null-terminated
+1	src/ops/scan.c	clang-analyzer-deadcode.DeadStores	Value stored to 'p' is never read
+1	src/ops/scan.c	clang-analyzer-optin.portability.UnixAPI	Call to 'calloc' has an allocation size of N bytes
+2	src/ops/scan.c	clang-analyzer-unix.Malloc	Potential leak of memory pointed to by 'e.path'
+1	src/ops/scan.c	misc-no-recursion	function 'scan_dir' is within a recursive call chain
+1	src/ops/scan.c	misc-no-recursion	function 'scan_entry_at' is within a recursive call chain
+1	src/ops/sqlite_copy.c	clang-analyzer-security.insecureAPI.strcpy	Call to function 'strcpy' is insecure as it does not provide bounding of the memory buffer. Replace unbounded copy functions with analogous functions that support length arguments such as 'strlcpy'. CWE-N
+2	src/ops/store_index.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+2	src/ops/store_index.c	clang-analyzer-deadcode.DeadStores	Value stored to 'failed' is never read
+2	src/ops/store_pool.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/ops/tree_build.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nst parameter expecting 'nonnull'
+1	src/ops/tree_build.c	clang-analyzer-core.NullDereference	Array access (from variable 'depth') results in a null pointer dereference
+1	src/ops/tree_build.c	clang-analyzer-core.NullDereference	Array access (via field 'off') results in a null pointer dereference
+1	src/ops/tree_build.c	clang-analyzer-optin.portability.UnixAPI	Call to 'malloc' has an allocation size of N bytes
+1	src/ops/verify.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/ops/verify.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/providers/fake_provider.c	bugprone-misplaced-widening-cast	either cast from 'uintN_t' (aka 'unsigned long') to 'unsigned long long' is ineffective, or there is loss of precision before the conversion
+3	src/providers/fake_provider.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/providers/fake_provider.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nnd parameter expecting 'nonnull'
+4	src/providers/fake_provider.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nst parameter expecting 'nonnull'
+1	src/providers/fake_provider.c	clang-analyzer-core.NullDereference	Access to field 'chg' results in a dereference of a null pointer (loaded from variable 'd')
+1	src/providers/fake_provider.c	clang-analyzer-core.NullDereference	Access to field 'nb' results in a dereference of a null pointer (loaded from variable 'u')
+1	src/providers/fake_provider.c	clang-analyzer-core.NullDereference	Access to field 'refuse' results in a dereference of a null pointer (loaded from variable 'u')
+1	src/providers/fake_provider.c	clang-analyzer-core.NullDereference	Access to field 'state' results in a dereference of a null pointer (loaded from variable 'su')
+1	src/providers/fake_provider.c	clang-analyzer-core.NullDereference	Array access (via field 'cp') results in a null pointer dereference
+3	src/providers/fake_provider.c	clang-analyzer-core.NullDereference	Array access (via field 'plans') results in a null pointer dereference
+2	src/providers/fake_provider.c	clang-analyzer-optin.core.EnumCastOutOfRange	The value 'N' provided to the cast expression is not in the valid range of values for the enum
+1	src/providers/fake_provider.c	clang-analyzer-unix.Stream	File position of the stream might be 'indeterminate' after a failed operation. Can cause undefined behavior
+1	src/providers/fake_provider.c	clang-analyzer-unix.Stream	Read function called when stream is in EOF state. Function has no effect
+2	src/providers/nbd_client.c	bugprone-not-null-terminated-result	the result from calling 'memcpy' is not null-terminated
+2	src/providers/nbd_client.c	clang-analyzer-core.NullDereference	Array access (from variable 'p') results in a null pointer dereference
+1	src/providers/provider.c	clang-analyzer-core.NullDereference	Dereference of null pointer
+1	src/providers/remote_provider.c	clang-analyzer-core.NullDereference	Access to field 'grp' results in a dereference of a null pointer (loaded from variable 's')
+1	src/providers/remote_provider.c	clang-analyzer-core.NullDereference	Access to field 'item_id' results in a dereference of a null pointer (loaded from variable 'x')
+4	src/providers/remote_provider.c	clang-analyzer-security.insecureAPI.strcpy	Call to function 'strcat' is insecure as it does not provide bounding of the memory buffer. Replace unbounded copy functions with analogous functions that support length arguments such as 'strlcat'. CWE-N
+1	src/providers/unit_probe.c	clang-analyzer-core.NullDereference	Access to field 'valuestring' results in a dereference of a null pointer (loaded from variable 'v')
+1	src/scheduler/job_manager.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'long long' of a multiplication performed in type 'int'
+1	src/scheduler/scheduler.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type '__syscall_slong_t' (aka 'long') of a multiplication performed in type 'int'
+3	src/scheduler/scheduler.c	cert-err34-c	'atoi' used to convert a string to an integer value, but function will not report conversion errors; consider using 'strtol' instead
+1	src/scheduler/trigger.c	cert-err34-c	'sscanf' used to convert a string to an integer value, but function will not report conversion errors; consider using 'strtol' instead
+1	src/store/cdc.c	clang-analyzer-core.BitwiseShift	Left shift by 'N' overflows the capacity of 'uintN_t'
+1	src/store/cdc.c	misc-no-recursion	function 'next_span' is within a recursive call chain
+2	src/store/chunklist.c	bugprone-branch-clone	repeated branch body in conditional chain
+1	src/store/chunklist.c	clang-analyzer-core.CallAndMessage	Nst function call argument is an uninitialized value
+1	src/store/chunklist.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nnd parameter expecting 'nonnull'
+1	src/store/chunklist.c	clang-analyzer-core.NullDereference	Access to field 'data' results in a dereference of a null pointer (loaded from variable 'f')
+1	src/store/chunklist.c	clang-analyzer-core.UndefinedBinaryOperatorResult	The left operand of '!=' is a garbage value
+1	src/store/manifest.c	clang-analyzer-core.NullDereference	Access to field 'name' results in a dereference of a null pointer (loaded from variable 'e')
+1	src/store/manifest.c	clang-analyzer-core.NullDereference	Dereference of null pointer (loaded from variable 'e')
+2	src/store/object.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/store/pack.c	bugprone-branch-clone	repeated branch body in conditional chain
+1	src/store/pack.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'uintN_t' (aka 'unsigned long') of a multiplication performed in type 'int'
+5	src/store/pack.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'uintN_t' (aka 'unsigned long') of a multiplication performed in type 'unsigned int'
+2	src/store/pack.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'unsigned long' of a multiplication performed in type 'unsigned int'
+35	src/store/pack.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/store/pack.c	cert-err34-c	'fscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/store/pack.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nth parameter expecting 'nonnull'
+1	src/store/pack.h	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'uintN_t' (aka 'unsigned long') of a multiplication performed in type 'unsigned int'
+1	src/store/pack_writeback.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'size_t' (aka 'unsigned long') of a multiplication performed in type 'int'
+3	src/store/store.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'time_t' (aka 'long') of a multiplication performed in type 'int'
+3	src/store/store.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/units/unit_backup.c	bugprone-branch-clone	repeated branch body in conditional chain
+1	src/units/unit_backup.c	bugprone-casting-through-void	do not cast 'char *[N]' to 'const char **' through 'void *'
+1	src/units/unit_backup.c	clang-analyzer-core.NullDereference	Array access (from variable 'buf') results in a null pointer dereference
+4	src/units/unit_backup.c	clang-analyzer-core.NullDereference	Dereference of null pointer
+2	src/units/unit_define.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nst parameter expecting 'nonnull'
+1	src/units/unit_index.c	bugprone-branch-clone	repeated branch body in conditional chain
+1	src/units/unit_json.c	clang-analyzer-core.NullDereference	Access to field 'size' results in a dereference of a null pointer (loaded from variable 'd')
+1	src/units/unit_restore.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'unsigned long' of a multiplication performed in type 'int'
+1	src/units/unit_restore.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/units/unit_restore.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/units/unit_restore.c	clang-analyzer-core.NullDereference	Array access (from variable 'buf') results in a null pointer dereference
+1	src/units/unit_state.c	bugprone-implicit-widening-of-multiplication-result	result of multiplication in type 'int' is used as a pointer offset after an implicit widening conversion to type 'ptrdiff_t'
+1	src/units/unit_state.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/units/unit_tokens.c	bugprone-implicit-widening-of-multiplication-result	performing an implicit widening conversion to type 'unsigned long' of a multiplication performed in type 'int'
+1	src/units/unit_tokens.c	cert-err34-c	'sscanf' used to convert a string to an unsigned integer value, but function will not report conversion errors; consider using 'strtoul' instead
+1	src/virt/libvirt_backend.c	cert-err33-c	the value returned by this function should not be disregarded; neglecting it may lead to errors
+1	src/virt/libvirt_backend.c	cert-err34-c	'atoi' used to convert a string to an integer value, but function will not report conversion errors; consider using 'strtol' instead
+5	src/virt/libvirt_backend.c	clang-analyzer-core.NonNullParamChecker	Null pointer passed to Nst parameter expecting 'nonnull'
+1	src/virt/libvirt_backend.c	clang-analyzer-core.NullDereference	Access to field 'name' results in a dereference of a null pointer (loaded from variable 'd')
+1	src/virt/libvirt_backend.c	clang-analyzer-core.NullDereference	Array access (via field 'name') results in a null pointer dereference
+1	src/virt/libvirt_backend.c	clang-analyzer-unix.StdCLibraryFunctions	The Nst argument to 'fsync' is -N but should be >= N
+1	src/virt/libvirt_backend.c	clang-analyzer-unix.Stream	File position of the stream might be 'indeterminate' after a failed operation. Can cause undefined behavior
+1	src/virt/libvirt_backend.c	clang-analyzer-unix.Stream	Read function called when stream is in EOF state. Function has no effect

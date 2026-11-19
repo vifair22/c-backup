@@ -125,6 +125,17 @@ bind of its own.
 > then recreate the helper with the layout above. Repeat for any other path
 > that was bound under `/mnt/cache` beside an `rshared` bind.
 
+**Host files are read whole or not at all (B280).** The configuration files
+a unit stores from the host (compose files and `.env`, Unraid templates, an
+LXC container's `config`, libvirt's domain and NVRAM files) are read through
+one routine, `host_read_file` in `src/helper/host_tool.c`. It returns the
+file whole, or an error and nothing: a read error, a size that changed while
+the file was read, or something other than a regular file fails the item,
+and so its unit, with the path and the reason. Each backend had its own
+loop, and those took a read error or a file that shrank for the end of the
+file and stored the part they had, which a restore would then put back as
+the original.
+
 **The start-up check (B186).** Before anything else, the helper reads its
 own mount table (`/proc/self/mountinfo`) and the host's (`[host]
 mountinfo`, by default `/proc/1/mountinfo` when `host_root` is set) and
@@ -259,7 +270,9 @@ socket = /run/c-backup-helper/helper.sock
 allow = docker:compose:immich, docker:cbk-uat-*, libvirt:cbk-uat-*, lxc:cbk-uat-*
 
 [snapshot]
-zfs_domains = cache/appdata, cache/Photos
+# The datasets backed up, each its own: never a pool, never all of appdata
+# ("Choosing snapshot domains" below).
+zfs_domains = cache/appdata/immich, cache/Photos
 btrfs_domains =
 dir_domains =                  # directory domains (tests, begin_paths)
 
@@ -404,6 +417,48 @@ first, then processes, then mounts) and `truncated` is true.
 The fake provider answers each unit's spec `"probe"` in this shape (an
 empty probe without one), and fails it with `"probe_fail": true` or
 `FAKE_FAIL_PROBE`.
+
+## Choosing snapshot domains
+
+A capture snapshots the **whole dataset** (or btrfs subvolume) that holds
+each path it reads, not the path: a unit whose bind is
+`/mnt/cache/appdata/immich` on a pool where `appdata` is one dataset takes a
+snapshot of `cache/appdata`, and with it every other application's data,
+for as long as the unit is read. Nothing outside the unit is read or
+written, but every byte of that dataset is pinned for the capture's
+lifetime, its `.zfs` directory shows it to anything that binds the dataset
+root (Manual 22.5.4), and a policy that lists `cache/appdata` or
+`cache/system` lets any allowed unit, a test fixture included, snapshot
+them. On FS1 (M6 to M9) the policy listed `cache/appdata` and
+`cache/system`, so a UAT fixture's bind snapshotted those production
+datasets, about a second each time.
+
+So list the datasets you back up, and only those:
+
+- **One dataset per thing backed up.** Give each application whose data you
+  back up its own child dataset (`zfs create cache/appdata/immich`, then
+  move its directory into it) and list that. The helper never snapshots a
+  parent in place of an unlisted child (`snap_domain_of`), so listing the
+  child is exactly as narrow as it looks. A unit's path whose dataset is
+  not listed is read by the two-pass or paused read (Manual 22.5.6), and a
+  source's is read live or refused as its snapshot mode says.
+- **Never a pool, `appdata` or `system` as a whole.** A share dataset that
+  is itself the thing backed up (`cache/Photos`) is fine; a dataset many
+  applications share is not, and neither is a pool's root dataset.
+- **btrfs.** `btrfs_domains` names a pool root, and the innermost nested
+  subvolume over a path is its domain. Without subvolumes every capture
+  snapshots the pool's whole top level (FS2's case, which has no
+  production data). On a pool with data on it, give each application its
+  own subvolume (`btrfs subvolume create`) so its captures snapshot that
+  subvolume alone.
+- **Check what a capture touched.** The helper logs every snapshot it
+  creates or destroys at INFO, naming the snapshot and its dataset or
+  subvolume (`snap: created ZFS snapshot cache/appdata/immich@cbk-... of
+  dataset cache/appdata/immich`, `snap: destroyed ...`), so its log shows
+  which datasets each capture held and for how long.
+
+The defaults are unchanged: with `[snapshot]` absent or empty the helper
+snapshots nothing, and it never adds a dataset the policy does not name.
 
 ## Source snapshot mode: `capture.begin_paths`
 
@@ -556,8 +611,8 @@ Enabled by the policy, never by the daemon (`docs/container-backup.md`):
 
 ```ini
 [snapshot]
-zfs_domains = cache/appdata, cache/system, cache/Photos, cache/lxc
-btrfs_domains = /mnt/cache                 ; FS2: the pool's top level
+zfs_domains = cache/appdata/immich, cache/appdata/gitlab, cache/Photos   ; one per unit's data
+btrfs_domains = /mnt/cache                 ; FS2: the pool's top level (see below)
 btrfs_snapshot_dir = /mnt/cache/system/.cbackup-snapshots
 ; restore_staging_dirs = /mnt/cache/system/.cbackup-restore   ; per domain, see below
 
@@ -687,7 +742,10 @@ member whose included mount holds it, from the helper's own inspect, with a
 mount's destination; for LXC, the container, and a path inside its rootfs.
 `phase` (`pre` or `post`) picks an exec template's run. A dump template's
 stdout comes back as the pipe fd a policy dump hook's does; the run is waited
-for with `hook.wait` as any other. `user` comes from the catalog
+for with `hook.wait` as any other; `hook.wait` with `kill` stops a run
+first, SIGTERM to its process group and SIGKILL 3 s later, which is how a
+cancelled job ends a dump that would otherwise run to its timeout (B248).
+No template prompts: see `db-detection.md` 14.9. `user` comes from the catalog
 (`nextcloud-maintenance` as `www-data`); the fake backend runs a template as
 a local process found on the helper's `PATH`, which is how the suites run
 them. A provider with no container (libvirt) refuses templates as
@@ -720,8 +778,12 @@ them; `null` or `""` removes them.
 ### Mounts on no snapshot domain: pause-read
 
 A mount on an array disk, an unassigned device or a split share cannot be
-snapshotted (container-backup.md section 7). For a running unit with such
-mounts the daemon makes two passes:
+snapshotted (container-backup.md section 7), and a mount in a ZFS dataset
+the policy's `zfs_domains` does not list is not. The second says so in the
+session's warnings, naming the dataset, so the job's warning shows it
+(B253; it was only in the helper's log); `capture.begin_paths` names it in
+the path's reason. For a running unit with such mounts the daemon makes
+two passes:
 
 1. **Pass 1, live**: those mounts are read with the unit running, their
    content and file cache rows stored, no snapshot written.

@@ -18,7 +18,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MSG_MAX 1024
+/* Room for a whole path and its strerror: a message cut short loses the
+ * cause, which is the half the operator needs. */
+#define MSG_MAX (PATH_MAX + 256)
 
 static atomic_int      g_tripped;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;

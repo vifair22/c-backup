@@ -13,7 +13,7 @@ import type { WireDbFinding, WireDbPreview } from '../shared/wire'
 import {
   engineTitle, coverageSeverity, coverageLabel, coverageWords, methodLabel,
   suggestionTitle, suggestionTradeoff, evidenceLines, CONFIDENCE_MEANING,
-  canAct, policyRefusal, reasonProblem, argvLine,
+  canAct, policyLineOf, ApiRefusal, reasonProblem, argvLine,
   type Severity,
 } from '../shared/databases'
 import { absoluteTime, relativeTime } from './format'
@@ -192,10 +192,13 @@ export function DatabaseCard({ finding: f, connName, repoId, onChanged, showScop
     try {
       await fn()
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      const refused = policyRefusal(msg)
-      setActionError(refused ? refused.error : msg)
-      setPolicyLine(refused ? refused.policyLine : null)
+      const line = err instanceof ApiRefusal ? policyLineOf(err.body) : null
+      /* With the line as a field, the screen says what it means in its own
+       * words and shows the line once, rather than echoing a message that
+       * already ends with it. */
+      setActionError(line ? 'The helper\'s policy does not allow this template.'
+        : err instanceof Error ? err.message : String(err))
+      setPolicyLine(line)
     }
     setBusy(null)
   }
@@ -209,10 +212,11 @@ export function DatabaseCard({ finding: f, connName, repoId, onChanged, showScop
 
   const doEnable = () => act('enable', async () => {
     if (!preview) return
-    await window.cbackup.apiCall(connName, {
+    const r = await window.cbackup.apiCallResult(connName, {
       kind: 'dbEnable', repoId, findingId: f.id, template: preview.template,
       ...(preview.params ? { params: preview.params } : {}),
     })
+    if (!r.ok) throw new ApiRefusal(r.error, r.status, r.body)
     setPreview(null)
     onChanged?.()
   })

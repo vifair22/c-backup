@@ -123,7 +123,10 @@ Each entry carries the absolute path, the `lstat` result, a scan-assigned
    at any depth (`**` lets wildcards cross `/`). Directories are tested
    before the walk descends, so an excluded directory prunes its subtree.
    `one_filesystem` compares each entry's `st_dev` against the root's and
-   skips mount crossings.
+   skips mount crossings: the mount point itself is not recorded. A read
+   through a snapshot (`scan_tree_as`) also asks the live tree, since a
+   snapshot shows a mount below it as an ordinary empty directory
+   (db-detection.md 9.4, B266).
 7. **Failures are warnings.** A file that vanishes, a directory that cannot
    be opened, a path that overflows `PATH_MAX`: each is recorded as a
    warning and skipped. A live filesystem changes underneath the scan and
@@ -725,3 +728,55 @@ cache pool, which is where the shipped deploy puts it. The repository itself is
 written in large sequential pieces and cares much less; array storage is a
 reasonable place for it.
 
+
+### 7.1 SQLite's temporary files, and schema migrations (B244)
+
+SQLite writes temporary files of its own for sorts that outgrow the page
+cache, temporary indices, `CREATE TABLE ... AS` and the ephemeral tables a
+window function uses. Left alone it looks for `SQLITE_TMPDIR`, `TMPDIR`,
+`/var/tmp`, `/usr/tmp`, `/tmp` and the working directory, every one of which
+is read-only in the hardened container (`--read-only`, Manual 2.3).
+`src/common/sqlite_tmpdir.c` points it at the directory holding `state.db`
+instead, unless the operator set `SQLITE_TMPDIR`.
+
+The location has to be fixed before the first statement on `state.db`, and
+the first statements are the schema migrations AppGuard runs inside
+`appguard_init`, before the daemon holds the path or the handle. So it is
+taken from the database itself: an SQLite auto-extension, registered before
+`appguard_init` and removed after it, runs as each connection opens and sets
+`sqlite3_temp_directory` from the first one with a file name. The daemon
+used to set it after `appguard_init`, and migration 009 (the journal rebuild)
+failed on every read-only start: SQLite rolled the transaction back on the
+temp-file error, and the ROLLBACK c-utils issued afterwards replaced the real
+error with "cannot rollback - no transaction is active" (fixed in c-utils
+1.8.1).
+
+`temp_store=MEMORY` was the other way out and is not taken: a temporary is
+as large as the table being rebuilt or sorted, the journal and the node
+index are not bounded by RAM, and design constraint 1 rules out holding them
+in memory. The cost is space: the state volume briefly needs room for the
+largest such temporary.
+
+**The migration set is one transaction.** c-utils applies every pending
+migration inside one transaction, a savepoint each, and records each one in
+`system_migrations` inside that same transaction. That is kept rather than a
+transaction per migration:
+
+- A failed start leaves `state.db` exactly as the previous build left it,
+  so the previous build can still be run against it. With a commit per
+  migration a failure part-way leaves a schema no released build was tested
+  on, which the older build may not open.
+- It is resumable anyway. A database at any recorded point of the set, from
+  an older build or from a failed start, applies only what is missing; a
+  migration is never half-applied, because its schema change and its record
+  commit together. `tests/test_migrations.c` starts from every prefix of the
+  set and checks the result matches a fresh database's schema.
+- The cost is that a long set redoes its earlier members after a failure in
+  a later one. Every migration so far takes seconds at most.
+
+FS1's M9 to M10 upgrade, reported as "008 committed, 009 not", was in fact
+untouched: the rerun with `--tmpfs /tmp` applied 008 again, which it would
+not have had 008 been recorded. `tests/fixtures/state-at-008.sql` is a
+database at that point, and `tests/test_migrations.c`,
+`tests/test_privdrop_e2e.sh` and `tests/image_readonly_check.sh` (the image
+check in CI, read-only with no `/tmp`) all start from it.

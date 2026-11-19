@@ -111,6 +111,14 @@ status_t unit_tokens_drop(cutils_db_t *db, int64_t repo_id, const char *unit_key
     return OK;
 }
 
+status_t unit_tokens_drop_everywhere(cutils_db_t *db, const char *unit_key)
+{
+    if (db_write(db, "DELETE FROM unit_tokens WHERE unit_key = ?",
+                 (const char *[]){ unit_key, NULL }, NULL) != 0)
+        return set_error(ERR_IO, "unit tokens: cannot drop those of %s", unit_key);
+    return OK;
+}
+
 status_t unit_tokens_drop_except(cutils_db_t *db, int64_t repo_id, const char *unit_key,
                                  const char *const *keep, size_t n_keep)
 {

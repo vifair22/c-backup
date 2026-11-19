@@ -670,6 +670,18 @@ static api_response_t unit_history(const api_request_t *req, int64_t repo_id,
     return json_out(root);
 }
 
+/* Whether any unit policy row is stored under key. */
+static int unit_policy_present(int64_t repo_id, const char *key)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int yes = db_execute(g_db, "SELECT 1 FROM unit_policy WHERE repo_id = ? AND unit_key = ? LIMIT 1",
+                         (const char *[]){ repo, key, NULL }, &r) == 0 && r && r->nrows > 0;
+    db_result_free(r);
+    return yes;
+}
+
 static api_response_t unit_policy_get(int64_t repo_id, const char *key)
 {
     gfs_retention_t ret;
@@ -872,6 +884,10 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
     o.progress_ctx = progress_ctx;
     o.bytes_cb = job_progress_bytes;
     o.store_workers = routes_backup_store_workers();
+    /* Which snapshots this job writes, durable before each record (B267). */
+    o.expect_hook = job_expect_snapshots;
+    o.record_hook = job_note_snapshot;
+    o.hook_ctx = progress_ctx;
     unit_backup_result_t res;
     st = unit_backup_run(store, j->db, j->repo_id, &o, &res);
     char why[ERR_MSG_MAX];
@@ -1137,6 +1153,7 @@ typedef struct {
     int          unit_mode;       /* mode unit: data, then the definition */
     char        *name, *target_root;
     int          replace, pin_digest, start, keep_macs;
+    char        *unit_key;        /* "provider:id", for the journal line */
 } urestore_job_t;
 
 static void urestore_free(void *p)
@@ -1144,7 +1161,7 @@ static void urestore_free(void *p)
     urestore_job_t *j = p;
     if (!j) return;
     free(j->repo_path); free(j->dest); free(j->item);
-    free(j->name); free(j->target_root);
+    free(j->name); free(j->target_root); free(j->unit_key);
     free(j);
 }
 
@@ -1165,6 +1182,11 @@ static status_t urestore_run(void *arg, atomic_int *cancel,
     o.progress_ctx = progress_ctx;
     o.bytes_cb = job_progress_bytes;
     char rj[512];
+    /* The journal line for a restore that succeeds (NIT-50): which unit,
+     * from which snapshot, what came back and where. It journalled no
+     * message at all, where a unit backup says what it did. */
+    char sum[2 * PATH_MAX + 256];
+    sum[0] = '\0';
     /* The restore capabilities on this thread, for as long as it writes. */
     st = privs_restore_raise();
     if (st != OK) { store_index_free(idx); store_close(store); return st; }
@@ -1190,10 +1212,22 @@ static status_t urestore_run(void *arg, atomic_int *cancel,
         if (st == OK) { uj = dr.json; dr.json = NULL; }
         unit_define_result_free(&dr);
         snprintf(rj, sizeof(rj), "{\"mode\":\"unit\"}");
+        if (j->target_root)
+            msg_clip_after(sum, sizeof(sum), snprintf(sum, sizeof(sum),
+                "unit %s from snapshot %lld: re-created%s%s under %s", j->unit_key,
+                (long long)j->snap_id, j->name ? " as " : "", j->name ? j->name : "",
+                j->target_root));
+        else
+            msg_clip_after(sum, sizeof(sum), snprintf(sum, sizeof(sum),
+                "unit %s from snapshot %lld: re-created%s%s in place", j->unit_key,
+                (long long)j->snap_id, j->name ? " as " : "", j->name ? j->name : ""));
     } else if (j->item) {
         unit_restore_item_result_t ir;
         st = unit_restore_item(store, j->db, j->repo_id, j->snap_id, j->item, j->dest, &o, &ir);
         snprintf(rj, sizeof(rj), "{\"mode\":\"item\",\"bytes\":%llu}", (unsigned long long)ir.bytes);
+        msg_clip_after(sum, sizeof(sum), snprintf(sum, sizeof(sum),
+            "unit %s from snapshot %lld: item %s (%llu bytes) restored to %s", j->unit_key,
+            (long long)j->snap_id, j->item, (unsigned long long)ir.bytes, j->dest));
     } else {
         restore_result_t rr;
         memset(&rr, 0, sizeof(rr));
@@ -1202,8 +1236,14 @@ static status_t urestore_run(void *arg, atomic_int *cancel,
                  "\"bytes\":%llu,\"failed\":%llu}", (unsigned long long)rr.files,
                  (unsigned long long)rr.dirs, (unsigned long long)rr.bytes,
                  (unsigned long long)rr.failed);
+        msg_clip_after(sum, sizeof(sum), snprintf(sum, sizeof(sum),
+            "unit %s from snapshot %lld: %llu file(s), %llu dir(s), %llu bytes restored to %s"
+            "%s%.0llu%s", j->unit_key, (long long)j->snap_id, (unsigned long long)rr.files,
+            (unsigned long long)rr.dirs, (unsigned long long)rr.bytes, j->dest,
+            rr.failed ? "; " : "", (unsigned long long)rr.failed, rr.failed ? " failed" : ""));
     }
     privs_restore_drop();
+    if (st == OK && sum[0]) job_set_summary(progress_ctx, sum);
     job_set_result(progress_ctx, uj ? uj : rj);
     free(uj);
     store_index_free(idx);
@@ -1275,6 +1315,7 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
     j->item = (item_mode && item) ? strdup(item) : NULL;
     j->overwrite = ow && cJSON_IsTrue(ow);
     j->unit_mode = unit_mode;
+    j->unit_key = strdup(key);
     if (unit_mode) {
         j->name = uname ? strdup(uname) : NULL;
         j->target_root = troot ? strdup(troot) : NULL;
@@ -1285,7 +1326,7 @@ static api_response_t unit_restore_post(const api_request_t *req, int64_t repo_i
         if (!j->dest) j->dest = strdup("/");
     }
     cJSON_Delete(o);
-    if (!j->repo_path || !j->dest || (item_mode && !j->item)) {
+    if (!j->repo_path || !j->dest || !j->unit_key || (item_mode && !j->item)) {
         urestore_free(j);
         return api_error(500, "out of memory");
     }
@@ -1416,8 +1457,22 @@ api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const 
         if (code) return api_error(code, why);
         return unit_checkpoints_get(repo_id, key);
     }
-    (void)key_for(repo_id, prov, unit, key, sizeof(key));
+    int found = key_for(repo_id, prov, unit, key, sizeof(key));
     if (strcmp(suffix, "snapshots") == 0) return unit_history(req, repo_id, key);
+    /*
+     * The key a policy is read under is the one PUT stores it under. For a
+     * unit never backed up here PUT resolves a name through the provider
+     * and stores under the id, and GET used to read <provider>:<name>
+     * instead: the policy just set was not shown, and the repository's
+     * values were, as though it were in force (B243). A policy row under
+     * the key as given still answers when the provider no longer lists the
+     * unit, so a policy set by id stays readable after the unit is gone.
+     */
+    if (!found && !unit_policy_present(repo_id, key)) {
+        char why[768];
+        int code = policy_unit(repo_id, prov, unit, key, sizeof(key), why, sizeof(why));
+        if (code) return api_error(code, why);
+    }
     return unit_policy_get(repo_id, key);
 }
 

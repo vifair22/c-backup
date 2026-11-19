@@ -25,16 +25,25 @@ WORK="$(mktemp -d "$TEST_ROOT/c_backup_cli_e2e.XXXXXX")"
 # came from the pid, skipping any `ss` showed busy, which still raced the
 # bind; the kernel chooses them now (FLAKE-13).
 . "$(dirname "$0")/free_port.sh"
-mapfile -t PORTS < <(free_ports 3 "$WORK")
-[ "${#PORTS[@]}" -eq 3 ] || { echo "cannot choose TCP ports"; exit 1; }
+mapfile -t PORTS < <(free_ports 5 "$WORK")
+[ "${#PORTS[@]}" -eq 5 ] || { echo "cannot choose TCP ports"; exit 1; }
 MAIN_PORT=${PORTS[0]}
 PORT2=${PORTS[1]}
 BINDPORT=${PORTS[2]}
+# A stopped daemon that accepts and never answers, and a daemon whose alerts
+# go to it (B226, B227).
+MUTE_PORT=${PORTS[3]}
+ALERT_PORT=${PORTS[4]}
 SOCK="$WORK/c.sock"
 PASS=0
 FAIL=0
 
 cleanup() {
+    [ -n "${ALERT_PID:-}" ] && kill -9 "$ALERT_PID" 2>/dev/null
+    wait "${ALERT_PID:-}" 2>/dev/null
+    # Stopped: SIGKILL ends it without a SIGCONT first.
+    [ -n "${MUTE_PID:-}" ] && kill -9 "$MUTE_PID" 2>/dev/null
+    wait "${MUTE_PID:-}" 2>/dev/null
     [ -n "${DAEMON2_PID:-}" ] && kill "$DAEMON2_PID" 2>/dev/null
     wait "${DAEMON2_PID:-}" 2>/dev/null
     [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
@@ -393,6 +402,64 @@ fi
 check    "jobs watch of a missing job fails" 1 "$RC"
 check    "and prints nothing on stdout" "" "$(cat "$WORK/watch.out")"
 check    "and the error is bare JSON on stderr" '{"error":"no such job"}' "$(cat "$WORK/watch.err")"
+
+# B270: the daemon stopping mid-watch ended the stream cleanly and the watch
+# exited 0, as if the job had ended. A job row nothing will finish keeps the
+# stream open until the daemon goes.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 -cmd ".timeout 10000" "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
+        progress_phase) VALUES (9998, 1, 'backup', 'running', strftime('%s','now'),
+        'store')"
+    "$CLI" --socket "$SOCK" jobs watch 9998 > "$WORK/watch.out" 2> "$WORK/watch.err" &
+    WPID=$!
+    for _ in $(seq 1 100); do
+        grep -q '"state":"running"' "$WORK/watch.out" 2>/dev/null && break
+        sleep 0.1
+    done
+    contains "a watch is following a running job" '"state":"running"' "$(cat "$WORK/watch.out")"
+    kill -TERM "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=
+    for _ in $(seq 1 100); do kill -0 "$WPID" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$WPID" 2>/dev/null; then
+        bad "the watch ends when the daemon stops" "exited" "still running"
+        kill "$WPID" 2>/dev/null
+    fi
+    wait "$WPID"; WRC=$?
+    check    "a watch whose daemon stops mid-job exits non-zero" 1 "$WRC"
+    if [ -s "$WORK/watch.err" ]; then ok "and says why on stderr"; else bad "and says why on stderr" "a message" "nothing"; fi
+    C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 1 100); do cb health 2>/dev/null | grep -q ready && break; sleep 0.1; done
+else
+    ok "a watch whose daemon stops mid-job exits non-zero (skipped: no sqlite3)"
+fi
+# Here the connection broke mid-chunk, which already failed. A stream that
+# ends cleanly with no terminal frame - a close-delimited response, as a
+# proxy in front of a stopping daemon sends - is the case that exited 0. A
+# fake daemon sends one running frame and closes.
+if command -v python3 > /dev/null 2>&1; then
+    python3 -I -c '
+import os, socket, sys
+path = sys.argv[1]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path); s.listen(1)
+open(sys.argv[2], "w").close()
+c, _ = s.accept()
+c.recv(65536)
+c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+          b"data: {\"id\":7,\"state\":\"running\",\"phase\":\"store\"}\n\n")
+c.close(); s.close(); os.unlink(path)
+' "$WORK/fake.sock" "$WORK/fake.ready" &
+    FPID=$!
+    for _ in $(seq 1 100); do [ -e "$WORK/fake.ready" ] && break; sleep 0.1; done
+    "$CLI" --socket "$WORK/fake.sock" jobs watch 7 > "$WORK/watch.out" 2> "$WORK/watch.err"; WRC=$?
+    wait "$FPID" 2>/dev/null
+    check    "a stream that ends cleanly before the job exits non-zero" 1 "$WRC"
+    contains "and printed the frame it had" '"state":"running"' "$(cat "$WORK/watch.out")"
+    contains "and says the job's outcome is unknown" "stream ended before job 7 did" \
+        "$(cat "$WORK/watch.err")"
+else
+    ok "a stream that ends cleanly before the job exits non-zero (skipped: no python3)"
+fi
 
 # B057: `jobs cancel` printed nothing. A gc queued behind a backup of a lot
 # of data is still cancellable when the request lands, whatever the machine.
@@ -2151,6 +2218,104 @@ check "schedule list --offset skips" "$(nth "$PG_SC" id 2)" \
 PG_RL=$(cb repo list)
 check "repo list --offset skips" "$(nth "$PG_RL" id 2)" "$(nth "$(cb repo list --limit 1 --offset 1)" id 1)"
 check "repo list --limit caps" 1 "$(cnt "$(cb repo list --limit 1)" uuid)"
+
+# A daemon that accepts connections and never answers: a c-backupd of its
+# own, stopped with SIGSTOP once it listens. The kernel completes connects
+# into its listen backlog, so a client gets a connection and then silence,
+# which is what a hung daemon looks like from outside.
+echo "a daemon that does not answer (B226, B227)"
+mkdir -p "$WORK/mute"
+cat > "$WORK/mute/config.yaml" <<EOF
+db:
+  path: $WORK/mute/state.db
+http:
+  socket: $WORK/mute/c.sock
+  port: $MUTE_PORT
+  bind: 127.0.0.1
+security:
+  key_dir: $WORK/mute/keys
+EOF
+C_BACKUP_CONFIG_PATH="$WORK/mute/config.yaml" "$DAEMON" > "$WORK/mute/daemon.log" 2>&1 &
+MUTE_PID=$!
+for _ in $(seq 1 100); do grep -q "c-backupd ready" "$WORK/mute/daemon.log" && break; sleep 0.1; done
+contains "the mute daemon started" "c-backupd ready" "$(cat "$WORK/mute/daemon.log")"
+kill -STOP "$MUTE_PID"
+
+# B227: --timeout bounded only the polls of a job, and the request itself
+# could wait forever. The outer timeout is the test's own backstop.
+T0=$(date +%s%N)
+OUT=$(timeout 30 "$CLI" --socket "$WORK/mute/c.sock" gc 1 --timeout 2 2>&1); RC=$?
+MS=$(( ($(date +%s%N) - T0) / 1000000 ))
+check    "--timeout ends a request the daemon never answers, exit 124" 124 "$RC"
+check    "within --timeout and its grace, not the backstop's 30 s" "yes" \
+         "$([ "$MS" -lt 10000 ] && echo yes || echo "no: $MS ms")"
+contains "and says the daemon did not answer" "did not answer before --timeout ran out" "$OUT"
+# Without --timeout a command waits as it always has; the backstop ends it.
+timeout 3 "$CLI" --socket "$WORK/mute/c.sock" repo list > /dev/null 2>&1; RC=$?
+check    "without --timeout a request still waits for the daemon" 124 "$RC"
+
+# B226: the queued alerts' delivery held a stop for up to 15 s a message
+# with Pushover unreachable. curl honours https_proxy, so pointing it at the
+# mute daemon makes every send hang the way an unreachable Pushover does,
+# with no network and no hook in the product.
+mkdir -p "$WORK/alert"
+cat > "$WORK/alert/config.yaml" <<EOF
+db:
+  path: $WORK/alert/state.db
+http:
+  socket: $WORK/alert/c.sock
+  port: $ALERT_PORT
+  bind: 127.0.0.1
+log:
+  level: info
+security:
+  key_dir: $WORK/alert/keys
+pushover:
+  token: test-token
+  user: test-user
+EOF
+https_proxy="http://127.0.0.1:$MUTE_PORT" HTTPS_PROXY="http://127.0.0.1:$MUTE_PORT" \
+    no_proxy= NO_PROXY= C_BACKUP_CONFIG_PATH="$WORK/alert/config.yaml" \
+    "$DAEMON" > "$WORK/alert/daemon.log" 2>&1 &
+ALERT_PID=$!
+for _ in $(seq 1 100); do [ -S "$WORK/alert/c.sock" ] && break; sleep 0.1; done
+acb() { "$CLI" --socket "$WORK/alert/c.sock" "$@"; }
+acb repo add "$WORK/alert/repo" alerts > /dev/null
+# A failed job queues an alert, and the push worker takes it straight into
+# a send that will not return for 15 s.
+acb backup 1 "$WORK/alert/no-such-source" > /dev/null 2>&1
+for _ in $(seq 1 100); do
+    grep -q "sending failure notification for job" "$WORK/alert/daemon.log" && break
+    sleep 0.1
+done
+contains "a failed job queued an alert" "sending failure notification for job" "$(cat "$WORK/alert/daemon.log")"
+sleep 0.5
+T0=$(date +%s%N)
+kill -TERM "$ALERT_PID"
+for _ in $(seq 1 300); do kill -0 "$ALERT_PID" 2>/dev/null || break; sleep 0.05; done
+MS=$(( ($(date +%s%N) - T0) / 1000000 ))
+if kill -0 "$ALERT_PID" 2>/dev/null; then
+    bad "the stop does not wait for an alert send" "stopped" "still running after 15 s"
+    kill -9 "$ALERT_PID" 2>/dev/null
+    wait "$ALERT_PID" 2>/dev/null
+else
+    wait "$ALERT_PID"; RC=$?
+    check "the stop still exits 0" 0 "$RC"
+fi
+ALERT_PID=""
+check    "a stop with Pushover unreachable takes seconds, not 15" "yes" \
+         "$([ "$MS" -lt 8000 ] && echo yes || echo "no: $MS ms")"
+contains "and says the alerts were left queued" "alert delivery did not finish" \
+         "$(cat "$WORK/alert/daemon.log")"
+if command -v sqlite3 > /dev/null 2>&1; then
+    QUEUED=$(sqlite3 -cmd '.timeout 10000' "$WORK/alert/state.db" \
+             'SELECT count(*) FROM push WHERE failed = 0')
+    check "the alert is still queued for the next start" "yes" \
+          "$([ "${QUEUED:-0}" -ge 1 ] && echo yes || echo "no: $QUEUED")"
+fi
+kill -9 "$MUTE_PID" 2>/dev/null
+wait "$MUTE_PID" 2>/dev/null
+MUTE_PID=""
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -257,21 +257,29 @@ leave the database's container: templates read them from that container's
 own environment at run time (`$POSTGRES_USER`, `$MARIADB_ROOT_PASSWORD`,
 `$MONGO_INITDB_ROOT_PASSWORD`), so c-backup neither stores nor sees them.
 
+A template never prompts (B248). Nobody can answer a prompt, and a dump
+waiting on one waits out its six-hour timeout: every script takes stdin
+from `/dev/null`, every PostgreSQL tool runs with `-w`, and a template that
+would give a tool half a credential (`mongodump` with a user and no
+password) is not started. A credential that is missing or wrong fails the
+run at once, and the job's warning (and a preview's `probe.credentials`)
+names the template and how to give its engine the credential (14.9).
+
 The 1.0 catalog:
 
 | Template | Kind | argv (fixed) | Params | Probe (dry run, no data) |
 |---|---|---|---|---|
-| `pg-dumpall` | dump | `sh -c 'exec pg_dumpall --clean --if-exists -U "${POSTGRES_USER:-postgres}"'` | none | `psql -U ... -Atc 'select version()'` |
-| `pg-dump` | dump | `pg_dump -Fc -Z0 -U <user> <database>` | `user` `[a-z_][a-z0-9_]{0,62}`, `database` same | as above |
-| `pg-basebackup` | dump | `sh -c 'exec pg_basebackup -D - -Ft -X fetch -U "${POSTGRES_USER:-postgres}"'` | none | `pg_basebackup --version`, single tablespace check |
+| `pg-dumpall` | dump | `sh -c 'exec pg_dumpall -w --clean --if-exists -U "${POSTGRES_USER:-postgres}"'`, with `PGPASSWORD` from `$POSTGRES_PASSWORD` when the container has no `PGPASSWORD` | none | `psql -w -U ... -Atc 'select version()'` |
+| `pg-dump` | dump | `pg_dump -w -Fc -Z0 -U <user> <database>` | `user` `[a-z_][a-z0-9_]{0,62}`, `database` same | `psql -w -U <user> -d <database> -Atc 'select version()'` |
+| `pg-basebackup` | dump | `sh -c 'exec pg_basebackup -w -D - -Ft -X fetch -U "${POSTGRES_USER:-postgres}"'`, password as `pg-dumpall` | none | `pg_basebackup --version`, single tablespace check |
 | `mariadb-dump` | dump | `sh -c 'MYSQL_PWD="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}" exec mariadb-dump --single-transaction --quick --routines --events --triggers --hex-blob --all-databases -uroot'` (`mysqldump` for MySQL images) | `lock_tables` bool (adds `--lock-tables` for MyISAM) | `SELECT` of non-InnoDB tables from `information_schema` |
-| `redis-bgsave` | exec, pre | `sh -c` script: `BGSAVE`, then poll `INFO persistence` until `rdb_bgsave_in_progress:0` and `rdb_last_bgsave_status:ok` (auth from `REDISCLI_AUTH`) | none | `redis-cli PING` |
+| `redis-bgsave` | exec, pre | `sh -c` script: `BGSAVE` (its answer must say it started), then poll `INFO persistence` until `rdb_bgsave_in_progress:0` and `rdb_last_bgsave_status:ok`, failing on any other answer (auth from `REDISCLI_AUTH`) | none | `redis-cli PING`, answered `PONG` |
 | `redis-rdb` | dump | `redis-cli --rdb -` (`valkey-cli` for Valkey) | none | CLI supports `--rdb -` |
 | `sqlite-backup` | dump | `sh -c 'f=$(mktemp) && sqlite3 "$1" ".backup $f" && cat "$f"; rc=$?; rm -f "$f"; exit $rc' sh <db>` | `db`: a detected SQLite path, mapped by the helper to the container's path | `sqlite3 -version` exists in the image (often it does not; then the snapshot covers it, or 9.2 for file sources) |
 | `prometheus-snapshot` | exec, pre and post | pre: `wget -qO- --post-data= http://localhost:9090/api/v1/admin/tsdb/snapshot`; post: `rm -rf /prometheus/snapshots/*` | `port` 1-65535 | admin API answers (`--web.enable-admin-api` in the container's args) |
 | `influx2-backup` | dump | `sh -c 'd=$(mktemp -d) && influx backup "$d" -t "$DOCKER_INFLUXDB_INIT_ADMIN_TOKEN" >&2 && tar -C "$d" -cf - .; rc=$?; rm -rf "$d"; exit $rc'` | none | `influx ping` |
-| `mongodump` | dump | `sh -c 'exec mongodump --archive --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin'` | none | `mongosh --eval 'db.runCommand({ping:1})'` |
-| `nextcloud-maintenance` | exec, pre and post, `needs_quiesce` | `php occ maintenance:mode --on` / `--off`, user `www-data` | none | `php occ status` |
+| `mongodump` | dump | `sh -c 'exec mongodump --archive --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin'`; with no user, no credential arguments; a user with no password is refused before anything starts | none | `mongosh --eval 'db.runCommand({ping:1})'`, credentials as the dump |
+| `nextcloud-maintenance` | exec, pre and post, `needs_quiesce` | `php occ -n maintenance:mode --on` / `--off`, user `www-data` | none | `php occ -n status` |
 
 Dumps are uncompressed by design (`-Z0`, no `--gzip`): c-backup compresses
 with its per-chunk probe, and compressed dumps defeat what little dedup a
@@ -340,7 +348,7 @@ flowchart LR
 | Route | Purpose |
 |---|---|
 | `GET /repos/<id>/databases` | findings, filterable by scope, engine, coverage, state; paginated |
-| `GET /repos/<id>/databases/<f>` | one finding with evidence and history |
+| `GET /repos/<id>/databases/<f>` | one finding with evidence and history (the journal entries about it, 14.10) |
 | `POST /repos/<id>/databases/<f>/preview` | generated hook and probe result |
 | `POST /repos/<id>/databases/<f>/enable` | body `{"template":"pg-dumpall","params":{}}` |
 | `POST /repos/<id>/databases/<f>/dismiss` | body `{"reason":"..."}` |
@@ -515,7 +523,24 @@ warning, and lists it in the job result's `live_sources`. The point above
 `warn` only. Paths the helper does not snapshot get no action from it at all
 beyond placing them (`helper.md`). A mount below a source shows empty in
 its snapshot, so such a source is read from the snapshot only with
-`one_filesystem`. Excludes match the recorded paths
+`one_filesystem`. With `one_filesystem` the snapshot read leaves a mount
+out exactly as a live read does, by asking the live tree (B266): a ZFS
+snapshot shows a child dataset's mountpoint as an empty directory on the
+snapshot's own device, so there was no device change inside the snapshot
+to stop at, and the read recorded an empty directory that a live read of
+the same source does not (on btrfs neither read recorded it). An entry
+whose recorded path is, live, on another device than the source root is
+left out, one lstat per entry, only for a snapshot read with
+`one_filesystem`. Absent rather than empty, both ways, because absent is
+what a live `one_filesystem` read has always recorded (data-paths.md step
+6): recording the mount point instead would have changed the trees of
+every existing one-filesystem backup, and a snapshot read is promised the
+trees of a live read (B229), so switching a source into snapshot mode
+stores no new trees. A lease lost before the read reaches a source fails
+the job as any unreadable source does, naming the source and the read
+path, with the lease named as the cause (B265; the end of the capture
+used to clear the read's error, leaving the job failed with none).
+Excludes match the recorded paths
 (`scan_opts_t.exclude_on_record`); the trees and the file cache are a live
 read's (B229). The capture is ended after the read on every outcome; the
 helper ends it if the daemon dies and sweeps it at its own start. No new
@@ -881,3 +906,63 @@ from its findings.
 | Not raised | A capture below one instant (a dump makes its own finding `covered-application` whatever the capture, but the rest of the unit's files are still torn); a live database with no template; a template that failed; `offline` and `application` are already at or above it |
 | Where | `templates_raise` in `src/units/unit_backup.c`, after the findings are judged: `unit.json`'s `consistency` (and so the snapshot's unit index) and the job result's `consistency` |
 | Tests | `tests/test_helper_e2e.sh`: `pg-dumpall` (a dump) raises `quiesced` to `application` and a failed dump does not; `prometheus-snapshot` (an exec template with a post run) raises it and a failed pre run does not |
+
+### 14.9 Templates never prompt; a cancel stops a hook (B248)
+
+`pg-basebackup` ran `pg_basebackup` without `-w`; under scram auth it
+waited on a password prompt nobody could answer, so the unit backup sat in
+`store` until the dump's six-hour timeout, and `jobs cancel` changed
+nothing: the daemon was blocked in a `read` of the dump's pipe and never
+looked at the flag.
+
+| Point | As built |
+|---|---|
+| Non-interactive | Every script starts `exec </dev/null`; `pg_dumpall`, `pg_dump`, `pg_basebackup` and `psql` run with `-w`; `occ` with `-n`. The MySQL, Redis and influx clients never prompt as the templates call them. `mongodump` and `mongosh` prompt for a password given a user without one, so the script refuses that case itself, printing `c-backup: no credential:` and what is missing |
+| PostgreSQL's password | The templates that connect as `POSTGRES_USER` (`pg-dumpall`, `pg-basebackup` and their probes) export `PGPASSWORD="$POSTGRES_PASSWORD"` when the container has a `POSTGRES_PASSWORD` and no `PGPASSWORD`: the official image's password for that user, read inside the container as 7.2 says credentials are, exactly as `mariadb-dump` reads `MARIADB_ROOT_PASSWORD`. `pg-dump` connects as the operator's role, so it takes only the container's own `PGPASSWORD`, a `.pgpass` or `pg_hba.conf` |
+| Redis answers | `redis-cli` exits 0 on a `NOAUTH` reply, so the probe requires `PONG` and `redis-bgsave` requires `BGSAVE`'s own answer and an `INFO persistence` that says where the save is; before, a refused `BGSAVE` looped for ten minutes |
+| Saying how | `db_template_auth_hint` matches a failed run's log against each engine's own words for a missing or refused credential (libpq's `no password supplied`, `Access denied for user`, `NOAUTH`, `WRONGPASS`, `Authentication failed`, `unauthorized`) and the scripts' own line, and answers one sentence naming the environment variables (or `.pgpass`, `pg_hba.conf`) that give that engine its credential. The job's warning becomes `dump template <name> could not authenticate (exit N) and never prompts; not stored: <how>`; an exec template's warning says the same; a preview whose probe failed so carries it as `probe.credentials` |
+| A cancel stops the hook | The daemon reads a dump's pipe in 200 ms polls and gives up on the job's cancel; `stream_close` then sends `hook.wait` with `kill`, which the helper answers once the run has ended. An exec template's pre run is waited for the same way; its post run always finishes, since it undoes the pre (a maintenance mode is never left on). Policy hooks run inside `capture.begin` are not reached by a cancel: they keep their own policy timeouts |
+| Stopping a run | SIGTERM to the run's process group, SIGKILL `HOOK_KILL_GRACE_S` (3 s) later, sent from the helper's polls (`run_poll`) rather than slept through under the server's lock. A local run (the fake backend) is spawned into a group of its own; a Docker exec's process leads its own session under runc, and the group is remembered once found, so a member that outlives the exec's process still gets the SIGKILL; LXC's `lxc-attach` already had its own group. When the leader dies of the SIGTERM and a member ignored it, the rest of the group is killed then, since the run is over. A timed-out run follows the same sequence; its exit status is now the real one (143 for a SIGTERM) rather than a fixed 137 |
+| A plain wait beside a kill | The daemon abandons its plain `hook.wait` when it sends the kill, but the helper's thread for it is still polling the run; a plain wait that finds a cancelled run answers `invalid` and leaves the answer to the kill |
+
+### 14.10 A finding's history (B254)
+
+7.4 promised a finding "with evidence and history" and the route answered
+the timestamps only. The history is the journal's: every event about a
+finding is already journalled and names it, detection's as
+`... (finding N)` (found, coverage changed, and the one uncovered alert,
+which reaches the journal through its job's warning) and the decisions' as
+`finding N (...)` (enabled, dismissed, with the caller).
+
+| Point | As built |
+|---|---|
+| Where it comes from | `GET /repos/<id>/databases/<f>` reads the repository's journal for entries naming the finding either way, from its `first_seen` on (so the read stays on the `(repo_id, ts)` index), newest first |
+| No second copy | No events table: the journal is the permanent record and never pruned, so a table beside it could only disagree with it. A finding deleted and re-raised gets a new id (AUTOINCREMENT), so an old id's entries never join a new finding's history |
+| Bound | At most 50 entries, `history_truncated` when there were more; the full record stays in `GET /repos/<id>/journal` |
+| Shape | `{journal_id, ts, source, operation, result, message}`, the journal's own fields. The list route leaves `history` out |
+
+### 14.11 Ports and process words as evidence (B252)
+
+The probe always reported each container's listening ports, but only hint
+findings used them, and Elasticsearch's process evidence said only `java`.
+Decided:
+
+| Point | As built |
+|---|---|
+| Ports | The probe always reported listening ports; only hint findings used them. A port is now evidence (`ports`, `{container, port}`) on the findings its engine's processes went on, or on every finding of the engine when no process of it was seen. Never liveness (section 2.1: hint). Under `--network none` a container may listen on nothing, and an absent port changes nothing |
+| Elasticsearch process | The evidence keeps `args_match`, the word in the first 256 bytes of arguments (`opensearch` or `elasticsearch`) that made `java` the engine's, rather than the arguments themselves, which can carry `-D` properties with secrets |
+
+### 14.12 Nextcloud judged (B249)
+
+D1 linked a Nextcloud to its database and stopped there: the finding was
+forced `dormant`, so it was never judged or suggested, its `version` was the
+`dbtype`, and the link looked only at units already recorded in the
+repository. Decided:
+
+| Point | As built |
+|---|---|
+| Version | `'version'` from `config.php`, read with the same fixed pattern as `dbhost` (digits and dots only); `""` when absent. The `dbtype` stays in `link`. The first backup after the change lifts a dismissal once, since the version changes |
+| Liveness | Nextcloud has no process of its own (section 3 lists none), so in a unit it is live when a web server or PHP runs (`apache2`, `httpd`, `nginx`, `lighttpd`, `caddy`, `frankenphp`, any `php*` comm, which covers `php-fpm83` and cron's `php`), counted only in containers of a `nextcloud` image when the unit has one, so a proxy beside it does not count; or when the in-unit database it names is live; or by an open file or an unsettled file under it, as for any finding |
+| Coverage | Judged like an engine over its files plus its database's data directories found in the unit (the live ones when any is), which must share one instant (section 5). A database resolved into the unit but with no data directory in the captured mounts, or a `dbhost` that could not be read, is `split` with that reason and no suggestion (there is nothing in the unit to pause). A database outside the unit is first judged on the files alone, then `db_findings_link_nextcloud` makes a covered finding `split`: suggested `group-units` when another unit answers and they share no `capture.group`, nothing when no unit answers. A live read stays `uncovered`, which outranks `split` |
+| Suggestions | Covered in a unit: `optional` `nextcloud-maintenance` (crash-consistent across both; maintenance mode makes it application-consistent), not after a pre hook already made it `covered-application`. Read live in a unit: `nextcloud-maintenance`. Split across units: `group-units` only. Section 3 also offers the maintenance hooks for two captures, but maintenance mode holds only for the duration of the Nextcloud unit's own capture, and the database's unit captured at another instant still sees changes between the two, so it is not offered as a fix for `split` |
+| Cross-unit link | After the repository's recorded findings, any unit the provider lists whose id or name is the `dbhost`'s host (`unit_detect_lookup_host`, one `list_units` per unresolved Nextcloud), so a database unit backed up after Nextcloud's, or never, still places it. The note says when that unit has no findings recorded here yet. Container names only: a compose service name in another unit is not listed by any provider |

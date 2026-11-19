@@ -177,6 +177,25 @@ field is named by its path, as in `interval trigger: trigger.seconds must
 be a number`. Integers are exact only up to 2^53, so a field whose type
 allows more is limited to that, and the range in the message says so.
 
+A member a write does not take is refused with a 400 naming it, and
+nothing is changed: `unknown key 'lable'; valid keys: label, paths,
+exclude, one_filesystem`, or `unknown key 'dry_run'; this request takes no
+fields` on a write with no body (`dry_run` on gc and gfs is a query
+parameter). Members inside a list of objects are checked the same way:
+`unknown key 'mod' in snapshot[]; valid keys: path, mode` on
+`PUT /repos/<id>/sources`. Every write used to read the members it knew
+and drop the rest, so a misspelt member, or one sent to a daemon too old
+to know it, was answered 2xx with part of the request silently ignored
+(B239). The router checks this before the handler runs, so it comes ahead
+of every other answer, except a 404 for a URL that names nothing: an
+unknown repository, snapshot, schedule, tag, job or open export is still
+`404` with the handler's own message (`no such repo`), whatever the body
+holds (NIT-52). A finished job still names itself, so a cancel of one with
+an unknown member is the 400. A schedule, a units
+job, a unit's policy and the database finding actions take members that
+depend on another member or on the provider, and refuse an unknown one in
+their own words (`unknown key 'x' in a schedule`).
+
 A NUL used to cut the string short without a word: the daemon is C, and
 `"label":"nul\u0000here"` stored the label `nul` and answered 202. No
 field in this API can hold one, so the request is refused instead.
@@ -191,7 +210,8 @@ in itself is reported first, and only a sound one goes on to errors about
 the repository: missing configured sources (400), a key that is not loaded
 (409), a busy repository (503). A malformed schedule trigger on a
 repository with no sources is reported as the trigger error. A path or id
-in the URL that names nothing is still a 404 before the body is read.
+in the URL that names nothing is still a 404 before the body is read,
+an unknown member included.
 
 ### When a write's answer comes back
 
@@ -1088,10 +1108,16 @@ true`, a JSON boolean (anything else is `allow_plaintext must be true or
 false`; with no `reencrypt` it is `allow_plaintext applies only with
 reencrypt`). The check is repeated when the job runs. An allowed run logs a
 warning and journals `replicated encrypted repo N into plaintext at <path>`
-on the source. Unencrypted into unencrypted needs no flag. Names are of the
-plaintext, so they and the trees carry over unchanged, as do snapshot ids;
-a snapshot id the destination already uses for another tree fails the run
-instead of being overwritten. The job fails, saying which, when `dest` is
+on the source, unless the run wrote nothing (a rerun into an up-to-date
+target is not journalled again). Unencrypted into unencrypted needs no flag.
+A destination under another key cuts files differently (its chunking table
+is keyed from its own key, repo-format.md), so content is re-chunked and
+trees rebuilt, and its snapshot roots differ from the source's; file
+contents and metadata, snapshot ids, times and labels carry over. In that
+mode `objects_asked` counts every object offered to the destination and
+`objects_sent` those it did not already hold. A snapshot id the destination
+already uses for a snapshot of its own fails the run instead of being
+overwritten. The job fails, saying which, when `dest` is
 not a repository, is a replica of the source, or is encrypted and its key is
 not on this host. The job's result reports `snapshots_sent`,
 `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent`,
@@ -1189,7 +1215,10 @@ repository registration queues (`POST /repos`).
 `/jobs/stream/<id>` sends one `data:` frame at once with the job's state as it
 is, then a frame whenever it changes, and the same frame again every 5 seconds
 while it does not, so a watcher can tell a busy job from a dead stream. The
-stream ends after the frame with a terminal state. A frame is
+stream ends after the frame with a terminal state, however long the job
+runs: there is no limit on its length (until B228 it ended after an hour
+with `event: timeout`). A client that stays connected without reading is
+dropped once nothing could be written to it for 300 s. A frame is
 `{"id","state","phase","current","total","bytes_done","bytes_total","error"}`,
 and the last frame of a job that completed with warnings adds `"warning"`,
 the same line as its `result`'s (below).
@@ -1222,7 +1251,12 @@ the next start marks it `completed` with `result`
 `{"snapshot_id":N,"recovered":true}` and journals it as a success. When the
 repository cannot be read at that start its error is `interrupted by daemon
 restart; snapshot N may have been written, and the repository could not be
-read at start: <reason>`.
+read at start: <reason>`. A unit backup job (`units`) notes each unit's
+snapshot the same way, and how many it means to write once its units are
+resolved (B267): with every one in the repository it is `completed` with
+`result` `{"snapshot_ids":[...],"recovered":true}`; with some, `failed` with
+`interrupted by daemon restart; snapshots A and B of the N it meant to write
+are in the repository, and the job did not finish`.
 
 A job's end is made durable before it is shown: from the moment its end is
 written until the WAL holding it is synced, `/jobs`, `/jobs/<id>` and the
@@ -1670,7 +1704,7 @@ routes.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/repos/<id>/databases` | Findings, paginated (`limit`, `offset`; 100, at most 1000), ordered by scope, path, engine and id, filtered exactly by `scope` (`unit:<unit key>` or `source:<path>`), `engine` (the vocabulary below), `coverage` (the coverage names, or `none` for not assessed) and `state` (`new`, `suggested`, `enabled`, `dismissed`). A value outside its set is a 400. Answers `{"findings":[...],"total":N}`, `total` counting every row the filters match |
-| GET | `/repos/<id>/databases/<f>` | One finding, the same fields. 404 for an id that is not this repository's |
+| GET | `/repos/<id>/databases/<f>` | One finding, the same fields, and its `history`: the journal entries about it, newest first, at most 50, each `{journal_id, ts, source, operation, result, message}` (found, coverage changed, the uncovered alert through its job's warning, enabled, dismissed), with `history_truncated` when there were more. 404 for an id that is not this repository's |
 
 Each finding:
 
@@ -1679,14 +1713,14 @@ Each finding:
 | `id` | its row, never reused |
 | `scope` | `unit:<unit key>` or `source:<source path>` |
 | `engine` | `postgres`, `mysql`, `sqlite`, `redis`, `prometheus`, `influxdb1`, `influxdb2`, `mongodb`, `elasticsearch`, `leveldb`, `rocksdb`, `lmdb`, `bbolt`, `clickhouse`, `nextcloud` |
-| `version` | when the files say (`16`, `rdb 11`, Nextcloud's `dbtype`), else null |
+| `version` | when the files say (`16`, `rdb 11`, Nextcloud's own `30.0.2.2` from `config.php`), else null |
 | `path` | the recorded path of the data directory or file; `""` for a hint |
 | `confidence` | `live`, `dormant` or `hint` |
 | `coverage`, `coverage_why` | for a live finding, how consistent the capture was, and why in a sentence; null otherwise |
 | `method` | how it was captured: `snapshot`, `paused-read`, `live-read`, or `engine-copy` for a file source's SQLite whose engine copy was made (its coverage is then `covered-application`); null for a hint |
 | `suggestion`, `optional` | a template or action name, or null (Manual 23.3) |
 | `state` | `new`, `suggested`, `enabled`, `dismissed` |
-| `evidence` | an object: `markers`, `journal_mode`, `flavour`, `unsettled`, `links`, `also`; from units.probe, `processes` and `open_write` (at most 8 each), `unit_names` (a PostgreSQL's or MySQL's unit, for resolving a Nextcloud) and Nextcloud's `link` (`dbtype`, `dbhost`, `resolved`, `consistent`, `note`); for a hint, `images`, `ports`, `processes` and a `note` |
+| `evidence` | an object: `markers`, `journal_mode`, `flavour`, `unsettled`, `links`, `also`; from units.probe, `processes` (`container`, `comm`, and for java the `args_match` that made it Elasticsearch's or OpenSearch's) and `open_write` (at most 8 each), `ports` (`container`, `port`: the engine's listening ports; none under `--network none` says nothing), `unit_names` (a PostgreSQL's or MySQL's unit, for resolving a Nextcloud) and Nextcloud's `link` (`dbtype`, `dbhost`, `resolved`, `databases` (its database's data directories in the same unit), `host`, `consistent`, `note`); for a hint, `images`, `ports`, `processes` and a `note` |
 | `first_seen`, `last_seen` | epoch seconds |
 | `last_snap_id` | the snapshot it was last seen in; a detection run leaves it as it was, null if only detection has seen it |
 | `alerted_at` | the one alert of its uncovered spell, or null |
@@ -1766,7 +1800,7 @@ action is an explicit call; nothing else enables a template.
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/repos/<id>/databases/<f>/preview` | Body optional: `{"template":"pg-dump","params":{...}}`; without a template, the finding's suggestion, what is enabled, or the engine's default dump. For a unit's finding: `template`, `kind` (`dump` or `exec`), `summary`, `params` (canonical, sqlite-backup's `db` filled with the finding's path), `container` and `user` it runs as, `argv` and for an exec template with a post run `post_argv` (as the helper builds them), `output` (`.cbackup-unit/hooks/<name>.dump`, dumps) and `log`, `needs_quiesce` when set, `allowed` by the helper's policy and `policy_line` when not, `probe` (`argv`, `exit`, `timed_out`, `output` at most 64 KiB, `truncated`) and `verified` (the probe exited 0). For a file source's: `kind` `engine-copy`, `output` under `.cbackup-captures/`, `verified` and `probe` null. 409 when the unit's provider is not behind the helper, 502 when the helper cannot be asked |
+| POST | `/repos/<id>/databases/<f>/preview` | Body optional: `{"template":"pg-dump","params":{...}}`; without a template, the finding's suggestion, what is enabled, or the engine's default dump. For a unit's finding: `template`, `kind` (`dump` or `exec`), `summary`, `params` (canonical, sqlite-backup's `db` filled with the finding's path), `container` and `user` it runs as, `argv` and for an exec template with a post run `post_argv` (as the helper builds them), `output` (`.cbackup-unit/hooks/<name>.dump`, dumps) and `log`, `needs_quiesce` when set, `allowed` by the helper's policy and `policy_line` when not, `probe` (`argv`, `exit`, `timed_out`, `output` at most 64 KiB, `truncated`, and `credentials` when it failed for want of one: how to give the engine its credential, B248) and `verified` (the probe exited 0). For a file source's: `kind` `engine-copy`, `output` under `.cbackup-captures/`, `verified` and `probe` null. 409 when the unit's provider is not behind the helper, 502 when the helper cannot be asked |
 | POST | `/repos/<id>/databases/<f>/enable` | `{"template":"pg-dumpall","params":{}}`, template required; any other key is refused. The template must be in the catalog and for the finding's engine, and its params must check (400 naming the rule). A file source takes only `sqlite-backup`, with `{"allow_rollback_lock":true}` its one optional parameter. For a unit, a template the helper's policy does not allow is 409 with `error` and `policy_line`, the line to add; 503 when the helper has not answered since the daemon started. Records state `enabled`, `template`, `params`, `decided_by` (the caller), `decided_at`; journalled. Answers the finding |
 | POST | `/repos/<id>/databases/<f>/dismiss` | `{"reason":"..."}`, 1 to 512 bytes, no control characters. State `dismissed`, the template cleared, `reason`, `decided_by`, `decided_at`; journalled. Answers the finding |
 

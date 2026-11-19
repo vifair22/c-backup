@@ -114,7 +114,7 @@ with no `docker` CLI in the image), API version negotiated via `/version`:
 |---|---|
 | `containers/<name>/inspect.json` | `GET /containers/<id>/json`, verbatim |
 | `containers/<name>/image.json` | `GET /images/<image id>/json`: `RepoTags`, `RepoDigests`, `Id` |
-| `containers/<name>/unraid-template.xml` | `/boot/config/plugins/dockerMan/templates-user/my-<name>.xml`, when it exists |
+| `containers/<name>/unraid-template.xml` | `/boot/config/plugins/dockerMan/templates-user/my-<name>.xml` (the helper's `templates_dir`), when it exists. One the helper cannot read (EACCES, EPERM, ENOTDIR or ELOOP: an unprivileged helper, or a host that is not Unraid) is left out with a warning on the unit naming it, rather than failing the unit; any other error still fails it |
 | `compose/<file>` and `compose/.env` | the files named by `com.docker.compose.project.config_files`, and `.env` in `com.docker.compose.project.working_dir` (on FS1 under `/mnt/cache/appdata/<project>`) |
 
 Secrets: the survey notes some FS1 templates carry secrets (fleet-derper,

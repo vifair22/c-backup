@@ -42,12 +42,17 @@
 #define DEFAULT_SOCKET "/run/c-backupd/c-backupd.sock"
 
 static const char *g_socket;
-/* --timeout: seconds a command waits for its job; 0 waits until it ends. */
+/* --timeout: seconds a command waits for its job; 0 waits until it ends.
+ * Counted from g_cmd_t0, when the command started, and every request to the
+ * daemon is held to the same deadline (B227). */
 static long g_wait_timeout;
+static uint64_t g_cmd_t0;
 
 /* A job outlived --timeout and is still running (B220): its own status,
  * as timeout(1) gives one, so a script can tell it from a failed job. */
 #define EXIT_WAIT_TIMEOUT 124
+/* How much longer than --timeout a request may wait for the daemon. */
+#define TIMEOUT_REQUEST_GRACE_MS 2000u
 
 static int fail(const char *fmt, ...)
 {
@@ -357,7 +362,7 @@ static uint64_t mono_ms(void)
  */
 static int job_wait(long job, int quiet)
 {
-    uint64_t t0 = mono_ms();
+    uint64_t t0 = g_wait_timeout > 0 ? g_cmd_t0 : mono_ms();
     for (;;) {
         http_response_t jr;
         memset(&jr, 0, sizeof(jr));
@@ -365,6 +370,12 @@ static int job_wait(long job, int quiet)
         snprintf(jpath, sizeof(jpath), "/jobs/%ld", job);
         if (http_request(g_socket, "GET", jpath, NULL, &jr) != OK) {
             http_response_free(&jr);
+            if (http_timed_out()) {
+                fprintf(stderr, "c-backup: the daemon did not answer before --timeout %ld s "
+                        "ran out; job %ld may still be running (look with 'c-backup jobs %ld')\n",
+                        g_wait_timeout, job, job);
+                return EXIT_WAIT_TIMEOUT;
+            }
             return fail("lost contact with the daemon while waiting for job %ld", job);
         }
         int done = jr.body && (strstr(jr.body, "\"state\":\"completed\"") ||
@@ -426,9 +437,15 @@ static int job_run(const char *method, const char *path, const char *body,
  * job outcome: "error" (no such job) carries an error document, which goes
  * to stderr like every other error, and "timeout" means the daemon stopped
  * following a job that is still running. Both make the command fail.
+ *
+ * A stream that just ends, with no terminal frame and no named event, is a
+ * daemon that went away mid-watch (stopped or restarted). That used to exit
+ * 0 as if the job had ended (B270); it fails, saying the job's outcome is
+ * unknown rather than guessing it.
  */
 typedef struct {
     int failed;
+    int ended;          /* a frame with a terminal state arrived */
 } watch_ctx_t;
 
 static status_t watch_event(void *ud, const char *event, const char *data)
@@ -436,6 +453,10 @@ static status_t watch_event(void *ud, const char *event, const char *data)
     watch_ctx_t *w = ud;
     if (event[0] == '\0' || strcmp(event, "message") == 0) {
         if (!data[0]) return OK;
+        if (strstr(data, "\"state\":\"completed\"") ||
+            strstr(data, "\"state\":\"failed\"") ||
+            strstr(data, "\"state\":\"cancelled\""))
+            w->ended = 1;
         if (fputs(data, stdout) == EOF || fputc('\n', stdout) == EOF)
             return set_error(ERR_IO, "cannot write to stdout");
         fflush(stdout);
@@ -965,6 +986,12 @@ static int h_jobs_watch(const args_t *a)
     if (st != OK) return fail("%s", err_msg());
     if (status < 200 || status >= 300) {
         fprintf(stderr, "c-backup: request failed with HTTP %d\n", status);
+        return 1;
+    }
+    if (!w.failed && !w.ended) {
+        fprintf(stderr, "c-backup: the stream ended before job %s did (the daemon "
+                        "stopped or restarted?); its outcome is unknown: check it with "
+                        "'c-backup jobs %s'\n", a->pos[0], a->pos[0]);
         return 1;
     }
     return w.failed;
@@ -2382,6 +2409,11 @@ static int wait_timeout(const args_t *a)
     if (errno || !end || end == t || *end || v < 1 || v > 31536000)
         return refuse(a, "--timeout takes whole seconds from 1 to 31536000, not '%s'", t);
     g_wait_timeout = v;
+    g_cmd_t0 = mono_ms();
+    /* A little past the wait's own end, so the last look at a job on a
+     * daemon that answers lands before it, and the job is reported as still
+     * running rather than the daemon as silent. */
+    http_set_deadline(g_cmd_t0 + (uint64_t)v * 1000u + TIMEOUT_REQUEST_GRACE_MS);
     return 0;
 }
 
@@ -2444,5 +2476,10 @@ int main(int argc, char **argv)
     args_t a;
     if (args_parse(&COMMANDS[c].spec, rest - used, rv + used, &a, stderr) != 0) return 1;
     if (spec_takes(&COMMANDS[c].spec, "--timeout") && wait_timeout(&a) != 0) return 1;
-    return COMMANDS[c].fn(&a);
+    int rc = COMMANDS[c].fn(&a);
+    /* Whatever the command made of it, a request the deadline cut short
+     * ends the command as a wait that ran out: the daemon may yet do what
+     * it was asked (B227). */
+    if (http_timed_out()) rc = EXIT_WAIT_TIMEOUT;
+    return rc;
 }

@@ -790,6 +790,107 @@ check "a duplicate backup key is named" \
 check "malformed JSON on POST /repos says invalid JSON" '{"error":"invalid JSON"} 400' \
     "$(sock_send POST /repos '{"path":')"
 
+echo "unknown body members (B239)"
+# Every write read the members it knew and dropped the rest: a PUT /sources
+# carrying "snapshot" to a build without snapshot mode replaced the sources
+# and quietly left the mode off, and {"dry_run":true} in a gc body (it is a
+# query parameter) ran the real gc. Each write now refuses a member it does
+# not take, naming it, and changes nothing. One row per write route; the
+# database finding actions have their own cases below, and the units
+# routes theirs in test_units_e2e.sh and test_helper_e2e.sh.
+SRC_BEFORE=$(sock_body /repos/1/sources)
+# Things that exist, so each refusal is for the member and not the URL: a
+# URL naming nothing is a 404 whatever the body holds (NIT-52, below).
+sock_send POST /repos/1/tags '{"name":"b239keep","snap_id":1}' > /dev/null
+B239_SCHED=$(sched '{"action":"gc","trigger":{"type":"interval","seconds":86400}}' \
+             | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+B239_JOB=$(sock_body '/jobs?limit=1' | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+check "a schedule and a job to aim at" "yes" \
+    "$([ -n "$B239_SCHED" ] && [ -n "$B239_JOB" ] && echo yes || echo "no: '$B239_SCHED' '$B239_JOB'")"
+while read -r m path; do
+    [ -n "$m" ] || continue
+    path=${path//@SCHED@/$B239_SCHED}
+    path=${path//@JOB@/$B239_JOB}
+    OUT=$(sock_send "$m" "$path" '{"zz_b239":1}')
+    contains "$m $path refuses an unknown member" "unknown key 'zz_b239'" "$OUT"
+    contains "$m $path refuses it with a 400" ' 400' "$OUT"
+done <<'ROWS'
+POST /api/auth/setup
+POST /api/auth/login
+POST /api/auth/logout
+POST /api/auth/logout-all
+POST /api/auth/password
+POST /jobs/@JOB@/cancel
+POST /repos
+DELETE /repos/1
+POST /repos/1/key/import
+POST /repos/1/key/ack
+POST /repos/1/repair
+POST /repos/1/tags
+DELETE /repos/1/tags/b239keep
+PUT /repos/1/schedules/@SCHED@
+DELETE /repos/1/schedules/@SCHED@
+PUT /repos/1/policy
+PUT /repos/1/sources
+PUT /repos/1/snapshots/1/note
+DELETE /repos/1/snapshots/1
+POST /repos/1/backup
+POST /repos/1/grep
+POST /repos/1/verify
+POST /repos/1/gc
+POST /repos/1/gfs
+POST /repos/1/reindex
+POST /repos/1/replicate
+POST /repos/1/snapshots/1/restore
+POST /repos/1/units/fake/u1/reset-incremental
+POST /repos/1/snapshots/1/unit/restore
+POST /repos/1/snapshots/1/unit/export
+ROWS
+check "repository 1 and its snapshot 1 are still there" 200 "$(sock_code '/repos/1/snapshots/1/tree?parent=0')"
+check "and its sources are as they were" "$SRC_BEFORE" "$(sock_body /repos/1/sources)"
+check "a misspelt member names the valid ones" \
+    "{\"error\":\"unknown key 'lable'; valid keys: label, paths, exclude, one_filesystem\"} 400" \
+    "$(sock_send POST /repos/1/backup '{"lable":"x"}')"
+check "a member inside a snapshot entry is checked too" \
+    "{\"error\":\"unknown key 'mod' in snapshot[]; valid keys: path, mode\"} 400" \
+    "$(sock_send PUT /repos/1/sources "{\"sources\":[\"$WORK/src\"],\"snapshot\":[{\"path\":\"$WORK/src\",\"mod\":\"warn\"}]}")"
+check "a gc body is not a way to ask for a dry run" \
+    "{\"error\":\"unknown key 'dry_run'; this request takes no fields\"} 400" \
+    "$(sock_send POST /repos/1/gc '{"dry_run":true}')"
+# A schedule's members depend on its action, so its handler checks them.
+contains "a schedule refuses an unknown member" "unknown key 'zz_b239' in a schedule" \
+    "$(sock_send POST /repos/1/schedules '{"action":"gc","trigger":{"type":"interval","seconds":60},"zz_b239":1}')"
+check "and the sources are still as they were" "$SRC_BEFORE" "$(sock_body /repos/1/sources)"
+check "the tag is still there" 1 "$(sock_body /repos/1/tags | grep -c b239keep)"
+check "and the schedule" 200 "$(sock_code /repos/1/schedules)"
+contains "listing it" "\"id\":$B239_SCHED," "$(sock_body /repos/1/schedules)"
+
+echo "a URL naming nothing is a 404, whatever its body (NIT-52)"
+# The member check runs before the handler, so these answered 400 for the
+# body where the same request without one answers 404. DELETE /exports/<id>
+# is in test_units_e2e.sh, which can open one.
+while IFS='|' read -r m path want; do
+    [ -n "$m" ] || continue
+    check "$m $path with an unknown member" "{\"error\":\"$want\"} 404" \
+        "$(sock_send "$m" "$path" '{"zz_b239":1}')"
+done <<'ROWS'
+POST|/repos/999999/backup|no such repo
+DELETE|/repos/999999|no such repo
+PUT|/repos/1/snapshots/999999/note|no such snapshot
+POST|/repos/1/snapshots/999999/restore|no such snapshot
+DELETE|/repos/1/snapshots/999999|no such snapshot
+PUT|/repos/1/schedules/999999|no such schedule in this repository
+DELETE|/repos/1/schedules/999999|no such schedule in this repository
+DELETE|/repos/1/tags/none|no such tag
+POST|/jobs/999999/cancel|no such job
+ROWS
+check "a URL that exists still answers the member" \
+    "{\"error\":\"unknown key 'zz_b239'; this request takes no fields\"} 400" \
+    "$(sock_send DELETE /repos/1/tags/b239keep '{"zz_b239":1}')"
+# Put back what the rows aimed at: a tag guards snapshot 1 from deletion.
+check "the aim tag goes" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" http://localhost/repos/1/tags/b239keep)"
+check "and the aim schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" "http://localhost/repos/1/schedules/$B239_SCHED")"
+
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
 # that fails telling the operator to reindex.
@@ -813,9 +914,10 @@ else
 fi
 
 echo "schedules"
-check "create schedule" 201 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
-     -d '{"action":"gc","trigger":{"type":"interval","seconds":3600}}' \
-     http://localhost/repos/1/schedules)"
+# Its id, not 1: ids are never reused, and the B239 rows made one before.
+SCHED_OUT=$(sock_send POST /repos/1/schedules '{"action":"gc","trigger":{"type":"interval","seconds":3600}}')
+contains "create schedule" ' 201' "$SCHED_OUT"
+SID=$(printf '%s' "$SCHED_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 # The trigger is validated at creation rather than at fire time, so a typo is
 # reported to whoever made it instead of quietly disabling the schedule later.
 check "reject bad trigger" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
@@ -835,12 +937,12 @@ case "$SL" in
     *) bad "next fire is ISO 8601 with the local offset" "...$OFF" "$SL" ;;
 esac
 check "disable schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
-     -d '{"enabled":0}' http://localhost/repos/1/schedules/1)"
+     -d '{"enabled":0}' "http://localhost/repos/1/schedules/$SID")"
 contains "schedule disabled" '"enabled":false' "$(sock_body /repos/1/schedules)"
 # B091: {"enabled":false} was refused with "enabled must be 0 or 1". JSON
 # booleans and 0/1 both work, both ways, and anything else is a 400.
 sched_put() { curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
-                   -d "$1" http://localhost/repos/1/schedules/1; }
+                   -d "$1" "http://localhost/repos/1/schedules/$SID"; }
 check "enable with true"   200 "$(sched_put '{"enabled":true}')"
 contains "enabled by true"  '"enabled":true'  "$(sock_body /repos/1/schedules)"
 check "disable with false" 200 "$(sched_put '{"enabled":false}')"
@@ -876,10 +978,10 @@ for j in $(sock_body '/jobs?limit=1000' | sed 's/{"id":/\n{"id":/g' \
     wait_job "$j" || bad "the due schedule's job $j finishes" "completed" "$(sock_body "/jobs/$j")"
 done
 check "delete schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
-     http://localhost/repos/1/schedules/1)"
+     "http://localhost/repos/1/schedules/$SID")"
 # B065: these answered success for a schedule that does not exist.
 check "delete a missing schedule" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-     --unix-socket "$SOCK" http://localhost/repos/1/schedules/1)"
+     --unix-socket "$SOCK" "http://localhost/repos/1/schedules/$SID")"
 check "disable a missing schedule" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
      --unix-socket "$SOCK" -d '{"enabled":0}' http://localhost/repos/1/schedules/999)"
 check "yearly trigger on 30 February refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' \
@@ -1492,6 +1594,34 @@ contains "empty search keeps its key" '"results"' \
     "$(sock_body '/repos/1/search?q=zzzznotathing')"
 contains "empty object refs keep their key" '"refs"' \
     "$(sock_body '/repos/1/objects/0000000000000000000000000000000000000000000000000000000000000000/refs')"
+
+# FLAKE-31: the unix socket listened with a backlog of 8, and a unix socket
+# refuses a connect outright once its backlog is full, so twelve racing
+# clients lost some requests (curl exit 7) whenever the accept thread fell
+# behind on a loaded runner. The daemon is stopped here so nothing is
+# accepted, and the burst is let go only once every client is either
+# queued (its embryo socket carries the listener's path in /proc/net/unix)
+# or has already been refused.
+echo "a burst of local clients while nothing is accepted"
+BURST=32
+BURST_BASE=$(grep -c " $SOCK\$" /proc/net/unix)
+kill -STOP "$DAEMON_PID"
+BURST_PIDS=()
+for i in $(seq 1 $BURST); do
+    curl -s -o /dev/null -w '%{http_code}\n' --max-time 60 --unix-socket "$SOCK" \
+         http://localhost/healthz > "$WORK/burst.$i" 2>/dev/null &
+    BURST_PIDS+=($!)
+done
+for _ in $(seq 1 600); do
+    queued=$(( $(grep -c " $SOCK\$" /proc/net/unix) - BURST_BASE ))
+    refused=$(cat "$WORK"/burst.* 2>/dev/null | grep -c .)
+    [ $((queued + refused)) -ge $BURST ] && break
+    sleep 0.05
+done
+kill -CONT "$DAEMON_PID"
+wait "${BURST_PIDS[@]}"
+check "every client of the burst was answered" $BURST "$(cat "$WORK"/burst.* | grep -c '^200$')"
+rm -f "$WORK"/burst.*
 
 # B123: backups submitted while snapshot deletes ran against the same
 # repository failed "repo N is busy" whenever a delete held the repo lock at
@@ -2286,6 +2416,14 @@ contains "and logs a warning" "$PT_MSG" "$(cat "$R/daemon.log")"
 check "at warning level: the info-level summary of the same run is filtered" 0 \
     "$(grep -c "replicate: repo $ENC_ID -> $R/ptarget:" "$R/daemon.log")"
 contains "and journals it" "\"message\":\"$PT_MSG\"" "$(sock_body "/repos/$ENC_ID/journal")"
+# A rerun has nothing to send, so nothing leaves encryption and it is not
+# journalled again (NIT-51).
+PT_JOB2=$(job_id "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":true}")")
+wait_job "$PT_JOB2"
+contains "a rerun completes" '"state":"completed"' "$(sock_body "/jobs/$PT_JOB2")"
+contains "and sends nothing" '"objects_sent":0' "$(sock_body "/jobs/$PT_JOB2")"
+check "a no-op rerun is not journalled as a plaintext copy again" 1 \
+    "$(sock_body "/repos/$ENC_ID/journal" | grep -o "$PT_MSG" | wc -l)"
 # Unencrypted to unencrypted drops nothing, so it needs no flag.
 P2_OUT=$(sock_send POST /repos "{\"path\":\"$R/ptarget2\",\"label\":\"pt2\"}")
 contains "a second unencrypted target" ' 201' "$P2_OUT"

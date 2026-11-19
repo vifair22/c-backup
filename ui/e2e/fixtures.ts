@@ -77,6 +77,17 @@ export interface HarnessOptions {
    * path. Paths: unitPaths(work).
    */
   units?: boolean
+
+  /*
+   * With units: a fake-provider unit `cbk-uat-pg` whose tree holds a live
+   * PostgreSQL data directory, as tests/test_helper_e2e.sh makes one, and a
+   * helper policy whose [db] leaves out pg-dumpall, the template its finding
+   * suggests. Its finding is
+   * enabled through the helper, so enabling it is refused with the policy
+   * line to add (db-detection.md 7.2). The engine's tools are fakes on the
+   * helper's PATH: the fake provider has no container to run them in.
+   */
+  unitDb?: boolean
 }
 
 /* Where the units option puts things, for specs to look at. */
@@ -210,12 +221,31 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
         blobs: [{ id: 'config', path: '.cbackup-unit/config/lxc/config', text: 'lxc.uts.name = web\n' }],
         trees: [{ id: 'rootfs', read_root: u.lxcRead, path: u.lxcLive, source: u.lxcLive }] },
       { id: 'x', name: 'other-thing', state: 'stopped' },
+      ...(opts.unitDb ? [{ id: 'pg', name: 'cbk-uat-pg', state: 'running', caps: ['quiesce', 'snapshot'],
+        trees: [{ id: 'pg', read_root: join(work, 'pgsnap'), path: join(u.pool, 'app', 'pg'),
+                  source: join(u.pool, 'app', 'pg') }] }] : []),
     ] }))
+    if (opts.unitDb) {
+      const pg = join(work, 'pgsnap')
+      mkdirSync(join(pg, 'global'), { recursive: true })
+      mkdirSync(join(pg, 'base', '1'), { recursive: true })
+      mkdirSync(join(u.pool, 'app', 'pg'), { recursive: true })
+      mkdirSync(join(work, 'bin'), { recursive: true })
+      writeFileSync(join(pg, 'PG_VERSION'), '16\n')
+      writeFileSync(join(pg, 'global', 'pg_control'), Buffer.alloc(8192))
+      writeFileSync(join(pg, 'base', '1', '1259'), Buffer.alloc(8192))
+      writeFileSync(join(pg, 'postmaster.pid'), `42\n${pg}\n`)
+      writeFileSync(join(work, 'bin', 'psql'), '#!/bin/sh\necho "PostgreSQL 16.4 (fake) $*"\n', { mode: 0o755 })
+      writeFileSync(join(work, 'bin', 'pg_dumpall'), '#!/bin/sh\necho "-- fake dump"\n', { mode: 0o755 })
+    }
     writeFileSync(join(work, 'policy.ini'),
       `[helper]\ndaemon_uid = ${duid}\ndaemon_gid = ${dgid}\ndaemon_id = 0badf00d\n` +
       `max_pause_s = 30\ncapture_max_s = 3600\nallow_restore = 1\nallow_define = 1\n` +
       `state_dir = ${u.helperState}\nsocket = ${hsock}\nfake_spec = ${join(work, 'units.json')}\n\n` +
-      `[units]\nallow = fake:cbk-uat-*\n\n[snapshot]\ndir_domains = ${u.pool}\n`)
+      `[units]\nallow = fake:cbk-uat-*\n\n[snapshot]\ndir_domains = ${u.pool}\n` +
+      /* Without [db] the stdout dumps are allowed; this leaves out the
+       * pg-dumpall the finding suggests, so enabling it is refused. */
+      (opts.unitDb ? `\n[db]\nallow_templates = pg-dump\n` : ''))
     chmodSync(join(work, 'policy.ini'), 0o600)
   }
 
@@ -249,7 +279,11 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
       spawnSync('chown', ['-R', `${duid}:${dgid}`, work])
       spawnSync('chown', ['0:0', join(work, 'policy.ini')])
     }
-    helper = spawn(HELPER, ['--policy', join(work, 'policy.ini')], { stdio: 'ignore' })
+    helper = spawn(HELPER, ['--policy', join(work, 'policy.ini')], {
+      stdio: 'ignore',
+      env: opts.unitDb ? { ...process.env, PATH: `${join(work, 'bin')}:${process.env.PATH ?? ''}` }
+                       : process.env,
+    })
     for (let i = 0; i < 120 && !existsSync(hsock); i++) await sleep(50)
     if (!existsSync(hsock)) throw new Error('helper did not start')
   }

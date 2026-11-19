@@ -56,6 +56,7 @@ struct sp_session {
     cJSON            *roots;       /* read_roots */
     cJSON            *blocks;      /* where each disk is read: a file or an NBD export */
     int               vm;          /* begun with vm.backup_begin: ended with vm.backup_end */
+    atomic_int       *cancel;      /* the job's, from begin: a dump it stops (B248) */
     sp_session_info_t info;
 };
 
@@ -182,16 +183,35 @@ static status_t map_error(const char *code, const char *msg)
 }
 
 static status_t exchange_fd(int fd, const char *op, cJSON *args, cJSON **result, int send_fd,
-                            int *recv_fd, int *transport);
+                            int *recv_fd, int *transport, atomic_int *cancel);
 
 static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, int *recv_fd,
                          int *transport)
 {
-    return exchange_fd(fd, op, args, result, -1, recv_fd, transport);
+    return exchange_fd(fd, op, args, result, -1, recv_fd, transport, NULL);
+}
+
+/* Whether the answer is there (0), *cancel was set first (1: a hook.wait
+ * the job wants stopped, B248), or the socket's receive timeout passed
+ * (-1), which bounds the wait as it bounds helper_recv's. */
+static int await_answer(int fd, atomic_int *cancel)
+{
+    if (!cancel) return 0;
+    struct timeval tv = { 0, 0 };
+    socklen_t tl = sizeof(tv);
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &tl) != 0 || tv.tv_sec <= 0) tv.tv_sec = REMOTE_TIMEOUT_S;
+    time_t until = time(NULL) + tv.tv_sec;
+    for (;;) {
+        if (atomic_load(cancel)) return 1;
+        struct pollfd pf = { fd, POLLIN, 0 };
+        int n = poll(&pf, 1, 200);
+        if (n > 0 || (n < 0 && errno != EINTR)) return 0;
+        if (time(NULL) >= until) return -1;
+    }
 }
 
 static status_t exchange_fd(int fd, const char *op, cJSON *args, cJSON **result, int send_fd,
-                            int *recv_fd, int *transport)
+                            int *recv_fd, int *transport, atomic_int *cancel)
 {
     long id = atomic_fetch_add(&g_req_id, 1) + 1;
     cJSON *o = cJSON_CreateObject();
@@ -206,6 +226,9 @@ static status_t exchange_fd(int fd, const char *op, cJSON *args, cJSON **result,
     status_t st = helper_send(fd, txt, strlen(txt), send_fd);
     cJSON_free(txt);
     if (st != OK) { *transport = 1; return st; }
+    int aw = await_answer(fd, cancel);
+    if (aw > 0) return set_error(ERR_BUSY, "helper: %s: the job was cancelled", op);
+    if (aw < 0) { *transport = 1; return set_error(ERR_BUSY, "helper: no answer in time"); }
     char *buf = malloc(HELPER_PACKET_MAX + 2);
     if (!buf) return set_error(ERR_NOMEM, "helper: response");
     size_t got = 0;
@@ -236,7 +259,7 @@ static status_t exchange_fd(int fd, const char *op, cJSON *args, cJSON **result,
 static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON **result,
                            int send_fd, int *recv_fd);
 static status_t rcall_wait(const char *sock, const char *op, cJSON *args, cJSON **result,
-                           int send_fd, int *recv_fd, unsigned timeout_s);
+                           int send_fd, int *recv_fd, unsigned timeout_s, atomic_int *cancel);
 
 static status_t rcall_fd(const char *sock, const char *op, cJSON *args, cJSON **result,
                          int *recv_fd)
@@ -247,13 +270,15 @@ static status_t rcall_fd(const char *sock, const char *op, cJSON *args, cJSON **
 static status_t rcall_full(const char *sock, const char *op, cJSON *args, cJSON **result,
                            int send_fd, int *recv_fd)
 {
-    return rcall_wait(sock, op, args, result, send_fd, recv_fd, REMOTE_TIMEOUT_S);
+    return rcall_wait(sock, op, args, result, send_fd, recv_fd, REMOTE_TIMEOUT_S, NULL);
 }
 
 /* rcall_full with its own answer timeout: hook.wait on an exec template
- * waits as long as the template may run. */
+ * waits as long as the template may run. cancel (may be NULL) ends the
+ * wait early, as ERR_BUSY with *cancel set; the request itself goes on in
+ * the helper. */
 static status_t rcall_wait(const char *sock, const char *op, cJSON *args, cJSON **result,
-                           int send_fd, int *recv_fd, unsigned timeout_s)
+                           int send_fd, int *recv_fd, unsigned timeout_s, atomic_int *cancel)
 {
     if (result) *result = NULL;
     if (recv_fd) *recv_fd = -1;
@@ -280,7 +305,7 @@ static status_t rcall_wait(const char *sock, const char *op, cJSON *args, cJSON 
     int transport = 0;
     status_t st = exchange(fd, "hello", hargs, &hres, NULL, &transport);
     cJSON_Delete(hres);
-    if (st == OK) st = exchange_fd(fd, op, args, result, send_fd, recv_fd, &transport);
+    if (st == OK) st = exchange_fd(fd, op, args, result, send_fd, recv_fd, &transport, cancel);
     else cJSON_Delete(args);
     close(fd);
     if (st != OK && recv_fd && *recv_fd >= 0) { close(*recv_fd); *recv_fd = -1; }
@@ -463,6 +488,7 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     s->ctx = c;
     s->blob_fd = -1;
     s->late_fd = -1;
+    s->cancel = req ? req->cancel : NULL;
     snprintf(s->unit_id, sizeof(s->unit_id), "%s", unit->unit_id);
     /* The configuration and data-plane facts as of now; the capture is the
      * point in time for the trees. */
@@ -486,7 +512,7 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(key, sizeof(key), "%s:%s", c->provider, unit->unit_id);
         if (u) cJSON_AddItemToArray(u, cJSON_CreateString(key));
         if (a) cJSON_AddBoolToObject(a, "pause", (unit->caps & SP_CAP_PAUSE) != 0);
-        if (a && req->hold_pause) cJSON_AddBoolToObject(a, "hold", 1);
+        if (a && req && req->hold_pause) cJSON_AddBoolToObject(a, "hold", 1);
         st = rcall_fd(c->socket, "capture.begin", a, &res, &s->late_fd);
     }
     const char *tok = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture")) : NULL;
@@ -751,6 +777,33 @@ static status_t r_tree_root(sp_session_t *s, const sp_item_desc_t *item, char *r
     return OK;
 }
 
+/*
+ * hook.wait for a run, to its end. A job cancelled before or while it waits
+ * stops the run instead: hook.wait with kill, which the helper answers once
+ * SIGTERM, and SIGKILL after its grace, have ended the run's whole process
+ * group, so a cancel never waits out a dump's six hours (B248). *stopped
+ * says which it was.
+ */
+static status_t hook_wait(const struct sp_ctx *c, const char *run, atomic_int *cancel, unsigned wait_s,
+                          cJSON **res, int *lfd, int *stopped)
+{
+    *stopped = 0;
+    if (!cancel || !atomic_load(cancel)) {
+        cJSON *a = cJSON_CreateObject();
+        if (a) cJSON_AddStringToObject(a, "run", run);
+        status_t st = rcall_wait(c->socket, "hook.wait", a, res, -1, lfd, wait_s, cancel);
+        if (st == OK || !cancel || !atomic_load(cancel)) return st;
+        err_clear();
+    }
+    *stopped = 1;
+    cJSON *a = cJSON_CreateObject();
+    if (a) {
+        cJSON_AddStringToObject(a, "run", run);
+        cJSON_AddBoolToObject(a, "kill", 1);
+    }
+    return rcall_wait(c->socket, "hook.wait", a, res, -1, lfd, HOOK_KILL_GRACE_S + REMOTE_TIMEOUT_S, NULL);
+}
+
 /* A dump hook: hook.run passes its stdout as a pipe; the helper's watchdog
  * kills it at its timeout, which ends the pipe. */
 static status_t r_stream_open(sp_session_t *s, const sp_item_desc_t *item, int *fd)
@@ -824,11 +877,9 @@ static status_t r_stream_close(sp_session_t *s, const sp_item_desc_t *item, int 
             return OK;
         }
         if (!s->dumps[i].run[0]) continue;
-        cJSON *a = cJSON_CreateObject();
-        if (a) cJSON_AddStringToObject(a, "run", s->dumps[i].run);
         cJSON *res = NULL;
-        int lfd = -1;
-        status_t st = rcall_fd(s->ctx->socket, "hook.wait", a, &res, &lfd);
+        int lfd = -1, stopped = 0;
+        status_t st = hook_wait(s->ctx, s->dumps[i].run, s->cancel, REMOTE_TIMEOUT_S, &res, &lfd, &stopped);
         s->dumps[i].run[0] = '\0';
         if (st != OK) { if (lfd >= 0) close(lfd); return st; }
         int code = (int)num(res, "exit");
@@ -842,7 +893,19 @@ static status_t r_stream_close(sp_session_t *s, const sp_item_desc_t *item, int 
             err_clear();
         }
         if (lfd >= 0) close(lfd);
-        if (!*ok) (void)sp_session_info_warn(&s->info, "dump hook %s exited %d; not stored", hk, code);
+        /* A template that could not authenticate says how to give it a
+         * credential: it never prompts for one (B248). */
+        const sp_template_run_t *t = template_of(s, item);
+        const char *hint = t && !*ok && !stopped
+                               ? db_template_auth_hint(db_template_find(t->name), s->dumps[i].log, s->dumps[i].log_len)
+                               : NULL;
+        if (stopped)
+            (void)sp_session_info_warn(&s->info, "dump hook %s stopped: the job was cancelled; not stored", hk);
+        else if (hint)
+            (void)sp_session_info_warn(&s->info, "dump template %s could not authenticate (exit %d) and never "
+                                       "prompts; not stored: %s", hk, code, hint);
+        else if (!*ok)
+            (void)sp_session_info_warn(&s->info, "dump hook %s exited %d; not stored", hk, code);
         cJSON_Delete(res);
         return OK;
     }
@@ -872,12 +935,10 @@ static status_t r_template_exec(sp_ctx_t *c, const char *unit_id, sp_template_ru
     if (st == OK) snprintf(token, sizeof(token), "%s", run);
     cJSON_Delete(res);
     res = NULL;
-    int lfd = -1;
-    if (st == OK) {
-        cJSON *a = cJSON_CreateObject();
-        if (a) cJSON_AddStringToObject(a, "run", token);
-        st = rcall_wait(c->socket, "hook.wait", a, &res, -1, &lfd, wait_s);
-    }
+    int lfd = -1, stopped = 0;
+    /* A cancel stops a pre run; a post run always finishes, since it
+     * undoes what the pre did (a maintenance mode is never left on). */
+    if (st == OK) st = hook_wait(c, token, post ? NULL : t->cancel, wait_s, &res, &lfd, &stopped);
     if (st != OK) {
         char line[MSG_CLIP_MAX + 64];
         int n = snprintf(line, sizeof(line), "c-backup: the template could not run: %s\n", err_msg());
@@ -885,7 +946,8 @@ static status_t r_template_exec(sp_ctx_t *c, const char *unit_id, sp_template_ru
         if (lfd >= 0) close(lfd);
         return st;
     }
-    *ok = (int)num(res, "exit") == 0 && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "timed_out"));
+    *ok = !stopped && (int)num(res, "exit") == 0 &&
+          !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "timed_out"));
     void *log = NULL;
     size_t len = 0;
     if (lfd >= 0 && read_passed(lfd, 0, num(res, "log_bytes"), t->name, &log, &len) == OK) {
@@ -940,6 +1002,7 @@ static status_t r_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
         s->ctx = c;
         s->blob_fd = -1;
         s->late_fd = -1;
+        s->cancel = req ? req->cancel : NULL;
         snprintf(s->unit_id, sizeof(s->unit_id), "%s", units[k]->unit_id);
         st = rcall_fd(c->socket, "units.describe", args_unit(c, units[k]->unit_id), &s->desc, &s->blob_fd);
     }
@@ -1112,7 +1175,7 @@ status_t remote_db_probe(const char *unit_key, const char *tmpl, const char *par
     else cJSON_Delete(pj);
     if (path && path[0] == '/') cJSON_AddStringToObject(a, "path", path);
     int fd = -1;
-    status_t st = rcall_wait(c->socket, "db.probe", a, result, -1, &fd, DBT_PROBE_TIMEOUT_S + 60u);
+    status_t st = rcall_wait(c->socket, "db.probe", a, result, -1, &fd, DBT_PROBE_TIMEOUT_S + 60u, NULL);
     if (st == OK) {
         uint64_t n = num(*result, "output_bytes");
         void *buf = NULL;

@@ -461,6 +461,11 @@ tree), `no-base`, `base-pruned`, `token-missing`, `token-invalid`,
 `item-new`, `item-resized`, `item-source-changed`, `unit-redefined`,
 `audit`, `delta-too-costly`, `forced`, `unchanged-offline`, `incremental`.
 
+`first` is the daemon's to give, since only it knows a unit's history: a
+disk's reason on the unit's first backup into the repository, whether
+incrementals are on or not. A provider asked for no incremental says
+`no-incremental-support`.
+
 ### 6.5 One unit, one session at a time
 
 Two repositories may back up the same unit. libvirt allows one backup job
@@ -864,7 +869,7 @@ snapshot name, raw XML for libvirt, or a raw create body for Docker.
 | `capture.begin_paths` | `paths` 1 to 64 absolute paths | source snapshot mode for plain file sources (`db-detection.md` 9.4): resolves each path to its snapshot domain itself, checks the domains against the policy, takes one atomic snapshot per pool with names it generates, no pause; returns a capture token and a read root per snapshotted path, each other path with the reason it was not snapshotted (to be read live), and the mounts below each snapshotted path (empty in the snapshot). No capture when no path can be snapshotted. Same lease, expiry and sweep as `capture.begin` (`helper.md`, Source snapshot mode) |
 | `capture.end` | `capture` token | destroys that capture's snapshots |
 | `hook.run` | `unit` unit key; `hook` name; or `template` name, `params` object, `path` (the finding's recorded path), `phase` `pre`/`post`, the last three optional | runs the named hook from the policy, or builds a database template from the helper's catalog (`db-detection.md` 7.2) if the policy's `[db] allow_templates` lists it, inside the unit's container (`container-backup.md` 6.6); returns a run token and, for a dump, a pipe fd |
-| `hook.wait` | `run` token | exit status, timed-out flag, log (capped) |
+| `hook.wait` | `run` token; `kill` bool, optional | exit status, timed-out and cancelled flags, log (capped). With `kill` (a job cancelled while the run goes on, B248) the run's whole process group gets SIGTERM, and SIGKILL 3 s later if it is still there, and the answer comes once it has ended; a plain wait on the same run then answers `invalid`, leaving the run's answer to the kill |
 | `vm.backup_begin` | `unit`; `disks` list of {`target` string, `mode` enum full/incremental}; `base` checkpoint name or null; `freeze` enum | builds the backup and checkpoint XML itself from these fields and its own configured socket and scratch paths; accepts `base` only if it is a checkpoint the helper created for this daemon id; freeze, begin, thaw with its own watchdog; returns socket, export and bitmap names, level, `freeze_ms` |
 | `vm.backup_end` | `session` token; `outcome` enum | aborts the job, settles checkpoints (keep or delete the new one, delete the retired base) |
 | `vm.checkpoint_redefine` | `unit`; `checkpoint` name | redefines from the XML the helper itself stored when it created the checkpoint. The helper also runs this for every recorded checkpoint at its own start, because Unraid keeps checkpoint metadata on the RAM rootfs (`vm-backup.md` 5.8) |

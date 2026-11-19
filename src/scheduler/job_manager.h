@@ -11,10 +11,11 @@
  *
  * Jobs that were running when the daemon died are marked failed on the next
  * start rather than left claiming to be in progress, since nothing is
- * resuming them. The exception is a backup whose snapshot record reached
- * the repository before the daemon died (job_note_snapshot): that job is
- * recorded completed, matched to the snapshot, because the repository is
- * the source of truth and its snapshot is real (B238).
+ * resuming them. The exception is a job whose snapshot records all reached
+ * the repository before the daemon died (job_note_snapshot): a backup
+ * (B238), or a unit job with one snapshot per unit (B267). It is recorded
+ * completed, matched to them, because the repository is the source of
+ * truth and its snapshots are real.
  */
 
 #include "error.h"
@@ -304,3 +305,13 @@ int      job_end_settling(cutils_db_t *db, int64_t job_id);
  * which the backup treats as a failure before anything is written.
  */
 status_t job_note_snapshot(void *progress_ctx, int64_t snap_id);
+
+/*
+ * How many snapshots the running job means to write (B267), set before the
+ * first job_note_snapshot: a unit job writes one per unit, and at the next
+ * start only a job whose noted snapshots are all in the repository, and as
+ * many as this, is completed. 0 says it cannot complete whatever it writes
+ * (a unit it names was already refused). A job that never calls this and
+ * notes a snapshot means one (a backup).
+ */
+status_t job_expect_snapshots(void *progress_ctx, int64_t n);

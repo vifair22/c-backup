@@ -123,3 +123,15 @@ status_t repo_sync_repair(store_t *store, cutils_db_t *db, int64_t repo_id, atom
 
 /* Parse a level name from the API. Unknown names return -1. */
 int verify_level_from_string(const char *s, verify_level_t *out);
+
+/*
+ * The node rules every level runs, as WHERE clauses over "nodes n" with the
+ * repo id as ?1. Exposed so a test can hold their query plans to what keeps
+ * them linear (B268): neither may visit node rows that do not match.
+ */
+typedef enum {
+    VERIFY_RULE_CONTENTLESS = 0,
+    VERIFY_RULE_UNSETTLED,
+} verify_rule_t;
+
+const char *verify_rule_condition(verify_rule_t rule);

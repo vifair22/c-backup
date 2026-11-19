@@ -29,6 +29,9 @@
  *   audit     an image written behind its bitmap while the VM is shut off:
  *             the audit fails, says where, keeps the (correct) snapshot,
  *             turns incrementals off until reset-incremental
+ *   replace   an in-place restore (--define --replace) retires the domain's
+ *             checkpoints and every repository's tokens for it (B251); the
+ *             next session is full and starts a new chain
  *
  * The VM's QEMU runs in this suite's cgroup (bench.slice when run as the
  * rules say), checked, and nothing of the user's libvirt is touched.
@@ -63,6 +66,7 @@
 #include "store_index.h"
 #include "test_tmp.h"
 #include "unit_backup.h"
+#include "unit_define.h"
 #include "unit_state.h"
 #include "unit_tokens.h"
 
@@ -356,6 +360,7 @@ static int setup(void **state)
     char text[4096];
     snprintf(text, sizeof(text),
              "[helper]\ndaemon_uid = %u\ndaemon_id = 0badf00d\nstate_dir = %s/hstate\nsocket = %s\n"
+             "allow_restore = 1\nallow_define = 1\n"
              "[units]\nallow = libvirt:cbk-uat-*\n"
              "[host]\nnsenter = 0\nhost_root =\n"
              "[libvirt]\nenabled = 1\nuri = %s\nnbd_dir = %s/nbd\ntpm_dir = %s/tpm\n"
@@ -744,6 +749,63 @@ static void test_audit_failure(void **state)
     verify(s.snap);
 }
 
+/* B251: the replace left the checkpoint in libvirt with its token usable,
+ * every later backup warned on retiring it, and virsh undefine refused the
+ * domain. */
+static void test_replace_retires(void **state)
+{
+    (void)state;
+    if (!have_vm) skip();
+    char cps[4][96];
+    guest_write(14 * M, 4096, 0x64);
+    sess_t s = backup_ok();
+    assert_int_equal(checkpoints(cps, 4), 1);
+    /* Another repository backing the same VM up holds a token too. */
+    int64_t other = 0;
+    assert_int_equal(repo_register(db, pf("%s/repo2", D), "t2", &other), OK);
+    uint8_t root[OBJECT_HASH_SIZE];
+    memset(root, 0, sizeof(root));
+    assert_int_equal(unit_token_put(db, other, KEY, "vdb", "cbk-2-1-0", NULL, 1, root, "x"), OK);
+
+    vm_stop_clean();
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.replace = 1;
+    unit_define_result_t dr;
+    if (unit_define_run(store, db, repo_id, s.snap, ++g_job, &o, &dr) != OK)
+        fail_msg("replace: %s", err_msg());
+    if (!strstr(dr.json, "\"checkpoints_retired\":1")) fail_msg("result: %s", dr.json);
+    for (size_t i = 0; i < dr.n_warnings; i++) fail_msg("warning: %s", dr.warnings[i]);
+    unit_define_result_free(&dr);
+    assert_int_equal(checkpoints(cps, 4), 0);
+    unit_token_t t;
+    int found = 1;
+    assert_int_equal(unit_token_get(db, repo_id, KEY, "vdb", &t, &found), OK);
+    assert_false(found);
+    found = 1;
+    assert_int_equal(unit_token_get(db, other, KEY, "vdb", &t, &found), OK);
+    assert_false(found);
+    /* Nor does the helper keep a record to redefine it from. */
+    SH("cat '%s/hstate/libvirt-checkpoints.json' 2>/dev/null || true", D);
+    if (strstr(g_out, UUID)) fail_msg("a record of the replaced domain is left: %s", g_out);
+
+    /* The replace brought vdb back raw (7.1): qcow2 again, under the
+     * original definition, for a chain to start on. */
+    SH("qemu-img convert -q -f raw -O qcow2 '%s/vdb.qcow2' '%s/vdb.new' && mv '%s/vdb.new' '%s/vdb.qcow2'",
+       D, D, D, D);
+    SH("%sdefine '%s/dom.xml'", VSH, D);
+    vm_start();
+    guest_write(15 * M, 4096, 0x65);
+    s = backup_ok();
+    expect(&s, "full", NULL);
+    verify(s.snap);
+    assert_int_equal(checkpoints(cps, 4), 1);
+    guest_write(16 * M, 4096, 0x66);
+    s = backup_ok();
+    expect(&s, "incremental", "incremental");
+    verify(s.snap);
+}
+
 int main(void)
 {
     run_names();
@@ -751,6 +813,7 @@ int main(void)
         cmocka_unit_test(test_chain),
         cmocka_unit_test(test_fallbacks),
         cmocka_unit_test(test_audit_failure),
+        cmocka_unit_test(test_replace_retires),
     };
     return cmocka_run_group_tests(tests, setup, teardown);
 }

@@ -1803,6 +1803,76 @@ static void test_pack_structure_damage_is_reported_and_repaired(void **state)
 }
 
 
+
+/*
+ * The node rules run at every level, over every node row of every snapshot,
+ * and once cost 18.8 s of a 22 s index verify at 656k rows against 0.08 s at
+ * 82k (B268): walking the rows through nodes_by_hash fetched each from the
+ * table at random. Timing is too noisy for CI, so this holds the plans:
+ * each rule reaches node rows only through an index whose entries are its
+ * matches, never by scanning the repository's nodes.
+ */
+static void plan_of(const char *cond, char *out, size_t cap)
+{
+    char sql[2048];
+    snprintf(sql, sizeof(sql), "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM nodes n WHERE %s",
+             cond);
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, sql, (const char *[]){ repo, NULL }, &r), 0);
+    assert_non_null(r);
+    out[0] = '\0';
+    size_t len = 0;
+    for (int i = 0; i < r->nrows; i++) {
+        const char *d = r->rows[i][r->ncols - 1];
+        /* A walk of a node table, by scan or by repo_id alone, is the bug. */
+        assert_null(strstr(d, "SCAN n"));
+        assert_null(strstr(d, "SCAN nodes"));
+        assert_null(strstr(d, "SCAN f"));
+        /* So is one by repo_id alone through a full index; the partial
+         * indexes are allowed exactly that, holding only matches. */
+        size_t dl = strlen(d);
+        int by_repo = dl >= 11 && strcmp(d + dl - 11, "(repo_id=?)") == 0;
+        if (by_repo && (strstr(d, "nodes_by_hash") || strstr(d, "nodes_by_snap_parent") ||
+                        strstr(d, "sqlite_autoindex_nodes")))
+            fail_msg("node rows walked by repo_id alone: %s", d);
+        int n = snprintf(out + len, cap - len, "%s\n", d);
+        if (n > 0 && (size_t)n < cap - len) len += (size_t)n;
+    }
+    db_result_free(r);
+}
+
+static void test_node_rules_do_not_walk_the_nodes(void **state)
+{
+    (void)state;
+    run_backup();
+    run_backup();
+
+    char plan[4096];
+    plan_of(verify_rule_condition(VERIFY_RULE_CONTENTLESS), plan, sizeof(plan));
+    assert_non_null(strstr(plan, "nodes_file_no_content"));
+    assert_non_null(strstr(plan, "nodes_by_hash (repo_id=? AND content_hash=?)"));
+
+    plan_of(verify_rule_condition(VERIFY_RULE_UNSETTLED), plan, sizeof(plan));
+    assert_non_null(strstr(plan, "nodes_unsettled"));
+}
+
+/* An empty content hash is the third shape of "names no content", the arm
+ * the partial index carries beside NULL and a non-file object. */
+static void test_empty_content_hash_is_missing(void **state)
+{
+    (void)state;
+    run_backup();
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE nodes SET content_hash = '' WHERE name = 'beta.txt'", NULL, NULL), 0);
+    verify_result_t res;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0,
+                                NULL, NULL, NULL, &res), ERR_CORRUPT);
+    assert_int_equal(res.missing, 1);
+    assert_int_equal(res.checked, res.ok + 1);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1817,6 +1887,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_structure_level_does_not_read_payloads, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_covers_packed_objects, setup, teardown),
         cmocka_unit_test_setup_teardown(test_run_is_recorded, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_node_rules_do_not_walk_the_nodes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_empty_content_hash_is_missing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_loss_fails_the_run_and_keeps_the_record, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancelled_run_is_marked_incomplete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_object_damage_is_repaired, setup, teardown),

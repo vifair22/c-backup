@@ -225,6 +225,17 @@ static void test_one_unit_roundtrip(void **state)
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshot_unit_items WHERE repo_id = ?"), 3);
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshot_unit_items WHERE repo_id = ?"
                             " AND item_id = 'vda' AND reason = 'first' AND read_mode = 'full'"), 1);
+    /* NIT-50: the next backup is not "first" again. Incrementals are off
+     * here, so the disk reads in full for the provider's reason. */
+    unit_backup_result_t res2;
+    assert_int_equal(run_units(names, 1, 0, &res2), OK);
+    assert_int_equal(res2.ok, 1);
+    unit_backup_result_free(&res2);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshot_unit_items WHERE repo_id = ?"
+                            " AND item_id = 'vda' AND reason = 'first'"), 1);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshot_unit_items WHERE repo_id = ?"
+                            " AND item_id = 'vda' AND reason = 'no-incremental-support'"
+                            " AND read_mode = 'full'"), 1);
     /* Nothing held, nothing journalled, no artefact left. */
     assert_int_equal(units_intents_open(db, NULL), 0);
     fake_stats_t fs;

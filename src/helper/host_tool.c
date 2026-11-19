@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,73 @@ int host_path(const host_tools_t *t, const char *path, char *buf, size_t sz)
 {
     int n = snprintf(buf, sz, "%s%s", t->host_root, path);
     return n < 0 || (size_t)n >= sz ? -1 : 0;
+}
+
+status_t host_read_file(const char *hp, const char *shown, size_t max, char **data, size_t *len,
+                        int *open_err)
+{
+    if (open_err) *open_err = 0;
+    *data = NULL;
+    *len = 0;
+    int fd = open(hp, O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) {
+        int e = errno;
+        if (open_err) *open_err = e;
+        if (e == ENOENT) return set_error(ERR_NOT_FOUND, "%s is missing", shown);
+        errno = e;
+        return set_error_errno(ERR_IO, "cannot open %s", shown);
+    }
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return set_error_errno(ERR_IO, "cannot stat %s", shown);
+    }
+    if (!S_ISREG(sb.st_mode)) { close(fd); return set_error(ERR_INVALID, "%s is not a regular file", shown); }
+    if (sb.st_size < 0 || (uint64_t)sb.st_size > max) {
+        close(fd);
+        return set_error(ERR_TOO_LARGE, "%s is larger than %zu bytes", shown, max);
+    }
+    size_t want = (size_t)sb.st_size;
+    char *buf = malloc(want + 1);
+    if (!buf) { close(fd); return set_error(ERR_NOMEM, "%s", shown); }
+    size_t got = 0;
+    for (;;) {
+        /* One byte past the size is asked for, so a file that grew is
+         * seen, not cut at its old length. */
+        char extra;
+        char *dst = got < want ? buf + got : &extra;
+        size_t n = got < want ? want - got : 1;
+        ssize_t r = read(fd, dst, n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) {
+            int e = errno;
+            close(fd);
+            free(buf);
+            errno = e;
+            return set_error_errno(ERR_IO, "read error in %s after %zu of %zu bytes; not stored",
+                                   shown, got, want);
+        }
+        if (r == 0) break;
+        if (got >= want) {
+            close(fd);
+            free(buf);
+            return set_error(ERR_IO, "%s grew while it was read (past %zu bytes); not stored",
+                             shown, want);
+        }
+        got += (size_t)r;
+    }
+    close(fd);
+    if (got != want) {
+        free(buf);
+        return set_error(ERR_IO, "%s shrank while it was read (%zu of %zu bytes); not stored",
+                         shown, got, want);
+    }
+    buf[got] = '\0';
+    *data = buf;
+    *len = got;
+    return OK;
 }
 
 static long ms_left(const struct timespec *end)

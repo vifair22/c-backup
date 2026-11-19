@@ -140,17 +140,9 @@ static status_t read_config(struct sp_ctx *c, const char *name, char **data, siz
     char p[PATH_MAX], hp[PATH_MAX + HOST_TOOL_PATH_MAX];
     snprintf(p, sizeof(p), "%.3900s/%.64s/config", c->pol->lxc_path, name);
     if (host_path(&c->tools, p, hp, sizeof(hp)) != 0) return set_error(ERR_INVALID, "lxc: path too long");
-    FILE *f = fopen(hp, "re");
-    if (!f) return set_error_errno(ERR_NOT_FOUND, "lxc: %s", p);
-    char *buf = malloc(CFG_MAX + 1);
-    if (!buf) { fclose(f); return set_error(ERR_NOMEM, "lxc: config"); }
-    size_t n = fread(buf, 1, CFG_MAX + 1, f);
-    fclose(f);
-    if (n > CFG_MAX) { free(buf); return set_error(ERR_TOO_LARGE, "lxc: %s is too large", p); }
-    buf[n] = '\0';
-    *data = buf;
-    *len = n;
-    return OK;
+    /* Whole or not at all (B280): fread's short count was taken as the end
+     * of the file, so a read error stored part of the config. */
+    return host_read_file(hp, p, CFG_MAX, data, len, NULL);
 }
 
 static char *trim(char *s)
@@ -458,6 +450,10 @@ static status_t x_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(x->real, sizeof(x->real), "%s", it->source);
         snap_dom_t d;
         if ((st = snap_domain_of(&c->snap, x->real, &d)) != OK) break;
+        if (d.kind == SNAP_NONE && d.unlisted[0])
+            (void)sp_session_info_warn(&s->info, "%.300s is in ZFS dataset %.200s, which the helper's policy does "
+                                       "not list in [snapshot] zfs_domains: read without a snapshot (pause-read)",
+                                       x->real, d.unlisted);
         int nested = 0;
         if (d.kind != SNAP_NONE && (st = nested_below(probe, &d, x->real, &s->info, &nested)) != OK) break;
         if (nested) d.kind = SNAP_NONE;
@@ -655,13 +651,20 @@ static void x_hook_kill(helper_run_t *r)
 {
     if (r->done) return;
     kill(-r->pid, SIGTERM);
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < HOOK_KILL_GRACE_S * 10; i++) {
         int s;
         if (x_hook_poll(r, &s)) return;
         struct timespec ts = { 0, 100 * 1000000L };
         nanosleep(&ts, NULL);
     }
     kill(-r->pid, SIGKILL);
+}
+
+/* The group outlives its leader while a member does: a stop's SIGKILL
+ * reaches what ignored the SIGTERM the leader died of. */
+static void x_hook_signal(helper_run_t *r, int sig)
+{
+    kill(-r->pid, sig);
 }
 
 static void x_hook_free(helper_run_t *r)
@@ -877,7 +880,8 @@ status_t lxc_backend_init(const helper_policy_t *pol, helper_backend_t *out)
     *out = (helper_backend_t){
         .name = "lxc", .ops = &k_lxc_ops, .ctx = c,
         .blob_data = x_blob_data, .unit_state = x_unit_state, .set_running = x_set_running,
-        .mount_root = x_mount_root, .hook_start = x_hook_start, .hook_poll = x_hook_poll, .hook_kill = x_hook_kill, .hook_free = x_hook_free,
+        .mount_root = x_mount_root, .hook_start = x_hook_start, .hook_poll = x_hook_poll, .hook_kill = x_hook_kill,
+        .hook_signal = x_hook_signal, .hook_free = x_hook_free,
         .define = x_define, .db_target = x_db_target,
     };
     return OK;
