@@ -95,7 +95,7 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
                 : null
 
             return (
-              <div key={t.id}
+              <div key={t.id} data-testid="job-card" data-job-id={t.id}
                 className={`border border-border-default rounded-lg p-3 ${cfg.bg}`}>
                 {/* Top row: command, state, time */}
                 <div className="flex items-center gap-3 mb-1">
@@ -154,9 +154,11 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
                   </div>
                 )}
 
-                {/* Error for failed tasks */}
-                {t.state === 'failed' && t.error && (
-                  <div className="text-xs text-status-error mb-2">{t.error}</div>
+                {/* The job's error, shown once and in full. Not only for
+                  * failed jobs: a cancelled one can carry one too. */}
+                {t.error && (
+                  <div className="text-xs text-status-error mb-2 break-words"
+                    data-testid="job-error">{t.error}</div>
                 )}
                 {/* A strict snapshot-mode source that could not be read
                   * from a snapshot failed the backup before anything was
@@ -209,7 +211,6 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
                   {isRunning && (t.rate_bytes_per_s ?? 0) > 0 && (
                     <span>{fmtSize(t.rate_bytes_per_s)}/s</span>
                   )}
-                  {t.error && <span className="text-status-error">{t.error}</span>}
                   {isRunning && (
                     <button onClick={() => setConfirmCancel(t.id)}
                       className="text-[10px] px-2 py-0.5 rounded bg-surface-tertiary text-status-error hover:bg-surface-hover border-none cursor-pointer ml-auto">
