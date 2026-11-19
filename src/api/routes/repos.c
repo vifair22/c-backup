@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "db_readers.h"
 #include "sync_latch.h"
 #include "repo.h"
 #include "repo_key.h"
@@ -547,6 +548,10 @@ static int repo_exists(void *ud, int64_t repo_id)
     cutils_db_t *db = ud;
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)repo_id);
+    /* Every repository route asks this first, so off the shared connection
+     * (B222, db_readers.h). */
+    int rf = db_readers_exists("SELECT 1 FROM repos WHERE id = ?", (const char *[]){ id, NULL });
+    if (rf >= 0) return rf;
     db_result_t *r = NULL;
     int found = db_execute(db, "SELECT 1 FROM repos WHERE id = ?",
                            (const char *[]){ id, NULL }, &r) == 0 && r && r->nrows == 1;

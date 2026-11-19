@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "db_readers.h"
 #include "db_txn.h"
 #include "repo.h"
 #include "repo_tags.h"
@@ -194,6 +195,11 @@ static int tag_name_valid(const char *s)
  * existed: a tag on 999 protected nothing and listed as if it did. */
 static int snapshot_exists(const char *repo, const char *sid)
 {
+    /* Before the note's or tag's write queues: off the shared connection
+     * (B222, db_readers.h). */
+    int rf = db_readers_exists("SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+                               (const char *[]){ repo, sid, NULL });
+    if (rf >= 0) return rf;
     db_result_t *r = NULL;
     int found = db_execute(g_db,
             "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
@@ -566,6 +572,31 @@ api_response_t metadata_sources_get(const api_request_t *req, int64_t repo_id)
  * last source, and "remove by sending everything except that one" is the
  * shape a form already has.
  */
+/* The snapshot modes of sources a PUT keeps, when it gives none: one row
+ * (kind, path) of repo_backup_paths at a time. */
+typedef struct {
+    char *const *paths;
+    int          n_paths;
+    char       **snap_path;
+    int         *snap_mode;
+    int          n;
+    int          max;
+    int          oom;
+} kept_modes_t;
+
+static int keep_mode(void *ctx, int ncols, const char *const *cols)
+{
+    kept_modes_t *km = ctx;
+    if (ncols < 2) return 0;
+    int stays = 0;
+    for (int q = 0; q < km->n_paths && !stays; q++) stays = strcmp(km->paths[q], cols[1]) == 0;
+    if (!stays || km->n >= km->max) return 0;
+    if (!(km->snap_path[km->n] = strdup(cols[1]))) { km->oom = 1; return 1; }
+    km->snap_mode[km->n++] = strcmp(cols[0], SRC_SNAP_KIND_STRICT) == 0 ? SRC_SNAP_STRICT
+                                                                         : SRC_SNAP_WARN;
+    return 0;
+}
+
 api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
 {
     if (!req->body || req->body_len == 0)
@@ -727,21 +758,25 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
             free(mp);
         }
     } else if (!failed && !snap_given) {
-        db_result_t *kept = NULL;
-        if (db_execute(g_db, "SELECT kind, value FROM repo_backup_paths WHERE repo_id = ?"
-                             " AND kind IN ('" SRC_SNAP_KIND_STRICT "', '" SRC_SNAP_KIND_WARN "')",
-                       (const char *[]){ repo, NULL }, &kept) != 0) {
-            bad = api_error(500, "cannot read backup sources");
-            failed = 1;
+        /* Read before the write queues, so off the shared connection
+         * (B222, db_readers.h), and on it only when there is no reader. */
+        static const char kept_sql[] =
+            "SELECT kind, value FROM repo_backup_paths WHERE repo_id = ?"
+            " AND kind IN ('" SRC_SNAP_KIND_STRICT "', '" SRC_SNAP_KIND_WARN "')";
+        kept_modes_t km = { paths, n_paths, snap_path, snap_mode, 0, SOURCES_MAX, 0 };
+        int nr = db_readers_rows(kept_sql, (const char *[]){ repo, NULL }, keep_mode, &km);
+        if (nr < 0) {
+            db_result_t *kept = NULL;
+            if (db_execute(g_db, kept_sql, (const char *[]){ repo, NULL }, &kept) != 0) {
+                bad = api_error(500, "cannot read backup sources");
+                failed = 1;
+            }
+            for (int k = 0; !failed && kept && k < kept->nrows; k++)
+                if (keep_mode(&km, 2, (const char *const *)kept->rows[k]) != 0) break;
+            db_result_free(kept);
         }
-        for (int k = 0; !failed && kept && k < kept->nrows; k++) {
-            int stays = 0;
-            for (int q = 0; q < n_paths && !stays; q++) stays = strcmp(paths[q], kept->rows[k][1]) == 0;
-            if (!stays || n_snap >= SOURCES_MAX) continue;
-            if (!(snap_path[n_snap] = strdup(kept->rows[k][1]))) { bad = api_error(500, "out of memory"); failed = 1; break; }
-            snap_mode[n_snap++] = strcmp(kept->rows[k][0], SRC_SNAP_KIND_STRICT) == 0 ? SRC_SNAP_STRICT : SRC_SNAP_WARN;
-        }
-        db_result_free(kept);
+        n_snap = km.n;
+        if (!failed && km.oom) { bad = api_error(500, "out of memory"); failed = 1; }
     }
     if (!failed && n_snap > 0) {
         remote_link_info_t li;

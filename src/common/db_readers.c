@@ -164,6 +164,52 @@ int db_readers_locate(int64_t repo_id, const char *hex, uint64_t cols[6])
     return found;
 }
 
+int db_readers_rows(const char *sql, const char *const *params,
+                    int (*fn)(void *ctx, int ncols, const char *const *cols), void *ctx)
+{
+    if (!atomic_load(&g_active) || !sql) return -1;
+    if (atomic_load(&g_quiescing)) {
+        pthread_mutex_lock(&g_gate);
+        pthread_mutex_unlock(&g_gate);
+    }
+    slot_t *s = slot_take();
+    sqlite3_stmt *st = NULL;
+    int rows = -1;
+    int rc = sqlite3_prepare_v2(s->h, sql, -1, &st, NULL);
+    for (int i = 0; rc == SQLITE_OK && params && params[i]; i++)
+        rc = sqlite3_bind_text(st, i + 1, params[i], -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK && sqlite3_column_count(st) > DB_READERS_COLS) rc = SQLITE_RANGE;
+    if (rc == SQLITE_OK) {
+        rows = 0;
+        int stop = 0;
+        while (!stop && (rc = sqlite3_step(st)) == SQLITE_ROW) {
+            rows++;
+            if (!fn) break;
+            const char *cols[DB_READERS_COLS];
+            int n = sqlite3_column_count(st);
+            for (int c = 0; c < n; c++) {
+                const unsigned char *v = sqlite3_column_text(st, c);
+                cols[c] = v ? (const char *)v : "";
+            }
+            stop = fn(ctx, n, cols);
+        }
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) rows = -1;
+    }
+    if (rows < 0) log_error("state.db reader: %s", sqlite3_errmsg(s->h));
+    /* Finalized before the slot goes: a statement left open keeps its read
+     * transaction and pins the WAL (B201). */
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&s->mu);
+    atomic_fetch_add_explicit(&g_lookups, 1, memory_order_relaxed);
+    return rows;
+}
+
+int db_readers_exists(const char *sql, const char *const *params)
+{
+    int n = db_readers_rows(sql, params, NULL, NULL);
+    return n < 0 ? -1 : n > 0;
+}
+
 void db_readers_quiesce(void)
 {
     if (!atomic_load(&g_active)) return;

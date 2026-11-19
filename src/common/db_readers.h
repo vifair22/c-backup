@@ -52,6 +52,31 @@ int      db_readers_active(void);
 int db_readers_locate(int64_t repo_id, const char *hex, uint64_t cols[6]);
 
 /*
+ * A request's read, on a pooled reader rather than the shared connection
+ * (B222). A route that checks something before it writes - does the
+ * repository exist, does the snapshot - used to read on the shared
+ * connection, whose mutex a backup's COMMIT holds for as long as its WAL
+ * writes take: up to a second on the UAT hosts, and a note that made two
+ * such reads could wait for two COMMITs before it even queued to write.
+ * A reader never waits for a writer.
+ *
+ * fn is called for each row with its columns as text, a NULL column as ""
+ * as c-utils gives them (CLAUDE.md), and returns non-zero to stop; fn may
+ * be NULL. Returns the number of rows fn saw, or -1 when the pool is not
+ * open or the statement failed (logged): the caller then runs the query
+ * on its own connection. At most DB_READERS_COLS columns.
+ *
+ * What it sees is the last commit, not another thread's open transaction.
+ * For a check before a write that is the right answer: a repository or a
+ * snapshot that is not committed does not exist yet.
+ */
+#define DB_READERS_COLS 16
+int db_readers_rows(const char *sql, const char *const *params,
+                    int (*fn)(void *ctx, int ncols, const char *const *cols), void *ctx);
+/* 1 when sql returns a row, 0 when it returns none, -1 as above. */
+int db_readers_exists(const char *sql, const char *const *params);
+
+/*
  * Hold every pooled connection out of the database, and let them back in
  * (B201). In WAL mode a reader holds a read-mark slot for each read, and
  * there are only a few; pooled readers that overlap without a gap keep one
