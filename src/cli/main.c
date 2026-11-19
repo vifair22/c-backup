@@ -426,9 +426,15 @@ static int job_run(const char *method, const char *path, const char *body,
  * job outcome: "error" (no such job) carries an error document, which goes
  * to stderr like every other error, and "timeout" means the daemon stopped
  * following a job that is still running. Both make the command fail.
+ *
+ * A stream that just ends, with no terminal frame and no named event, is a
+ * daemon that went away mid-watch (stopped or restarted). That used to exit
+ * 0 as if the job had ended (B270); it fails, saying the job's outcome is
+ * unknown rather than guessing it.
  */
 typedef struct {
     int failed;
+    int ended;          /* a frame with a terminal state arrived */
 } watch_ctx_t;
 
 static status_t watch_event(void *ud, const char *event, const char *data)
@@ -436,6 +442,10 @@ static status_t watch_event(void *ud, const char *event, const char *data)
     watch_ctx_t *w = ud;
     if (event[0] == '\0' || strcmp(event, "message") == 0) {
         if (!data[0]) return OK;
+        if (strstr(data, "\"state\":\"completed\"") ||
+            strstr(data, "\"state\":\"failed\"") ||
+            strstr(data, "\"state\":\"cancelled\""))
+            w->ended = 1;
         if (fputs(data, stdout) == EOF || fputc('\n', stdout) == EOF)
             return set_error(ERR_IO, "cannot write to stdout");
         fflush(stdout);
@@ -965,6 +975,12 @@ static int h_jobs_watch(const args_t *a)
     if (st != OK) return fail("%s", err_msg());
     if (status < 200 || status >= 300) {
         fprintf(stderr, "c-backup: request failed with HTTP %d\n", status);
+        return 1;
+    }
+    if (!w.failed && !w.ended) {
+        fprintf(stderr, "c-backup: the stream ended before job %s did (the daemon "
+                        "stopped or restarted?); its outcome is unknown: check it with "
+                        "'c-backup jobs %s'\n", a->pos[0], a->pos[0]);
         return 1;
     }
     return w.failed;
