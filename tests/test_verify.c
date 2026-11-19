@@ -1854,6 +1854,10 @@ static void test_node_rules_do_not_walk_the_nodes(void **state)
     plan_of(verify_rule_condition(VERIFY_RULE_CONTENTLESS), plan, sizeof(plan));
     assert_non_null(strstr(plan, "nodes_file_no_content"));
     /* A probe by hash per indexed snapshot (migration 016), never a walk. */
+    /* One probe of the content set per non-file object (migration 016);
+     * node_hashes only behind a hit, never a walk or a probe per snapshot
+     * for every object. */
+    assert_non_null(strstr(plan, "SEARCH c USING PRIMARY KEY (repo_id=? AND content_hash=?)"));
     assert_non_null(strstr(plan, "SEARCH h USING PRIMARY KEY (repo_id=? AND snap_id=? AND content_hash=?)"));
 
     plan_of(verify_rule_condition(VERIFY_RULE_UNSETTLED), plan, sizeof(plan));

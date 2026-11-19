@@ -394,7 +394,7 @@ api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_i
  * reference.
  *
  * The page comes from node_hashes, probed once per snapshot with node rows
- * (migration 016). CROSS JOIN keeps that page on the outside of every join:
+ * (migration 016), and only for a hash node_content says some node names. CROSS JOIN keeps that page on the outside of every join:
  * left to choose, the planner walked every node row of the repository by
  * repo_id and filtered it against the page, a cost that grows with snapshots
  * times files (B268's shape; test_object_refs_do_not_walk_the_nodes holds
@@ -403,9 +403,9 @@ api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_i
 const char *const introspect_refs_sql =
     "WITH RECURSIVE"
     " refs(snap_id, nid) AS ("
-    "   SELECT h.snap_id, h.node_id FROM node_index_gen g"
-    "    CROSS JOIN node_hashes h"
-    "    WHERE g.repo_id = ?1 AND h.repo_id = ?1 AND h.snap_id = g.snap_id"
+    "   SELECT h.snap_id, h.node_id FROM node_content c"
+    "    CROSS JOIN node_index_gen g CROSS JOIN node_hashes h"
+    "    WHERE c.repo_id = ?1 AND c.content_hash = ?2 AND g.repo_id = ?1 AND h.repo_id = ?1 AND h.snap_id = g.snap_id"
     "      AND h.content_hash = ?2"
     "    ORDER BY h.snap_id, h.node_id LIMIT ?3 OFFSET ?4),"
     " up(nid, parent, path, depth) AS ("

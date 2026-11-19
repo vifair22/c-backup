@@ -302,6 +302,13 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
             st = set_error(ERR_IO, "reindex: cannot index content hash");
             break;
         }
+        if (have_target && !is_dir &&
+            db_write(ctx->db,
+                "INSERT OR IGNORE INTO node_content (repo_id, content_hash) VALUES (?, ?)",
+                (const char *[]){ repo, thex, NULL }, NULL) != 0) {
+            st = set_error(ERR_IO, "reindex: cannot record content hash");
+            break;
+        }
 
         st = batch_point(ctx);
         if (st != OK) { ctx->batched = -1; break; }

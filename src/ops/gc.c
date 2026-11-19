@@ -388,6 +388,16 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_IO, "gc: cannot clear pack locations");
     }
 
+    /* node_content may hold more than the nodes name, never less: a hash
+     * whose object is unreachable is named by no snapshot's rows. */
+    if (db_write(db,
+            "DELETE FROM node_content WHERE repo_id = ? AND content_hash IN"
+            " (SELECT hash FROM objects WHERE repo_id = ? AND refcount = 0)",
+            (const char *[]){ repo, repo, NULL }, NULL) != 0) {
+        db_txn_rollback(db);
+        return set_error(ERR_IO, "gc: cannot clear the content set");
+    }
+
     if (db_write(db,
             "DELETE FROM objects WHERE repo_id = ? AND refcount = 0",
             (const char *[]){ repo, NULL }, NULL) != 0) {

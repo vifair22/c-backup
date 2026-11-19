@@ -261,6 +261,11 @@ status_t node_index_write(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
      * after every earlier snapshot's, so each commit appends to the end of
      * one b-tree instead of touching a page per row across a whole-repo
      * hash index (perf-d2-nochange).
+     *
+     * Each distinct hash also goes into node_content, the repository's set
+     * of hashes any node names, which a lookup by hash asks first. That set
+     * is ordered by hash across snapshots, but a hash already in it changes
+     * nothing, so an unchanged snapshot writes no page of it.
      */
     node_hash_ent_t *hv = NULL;
     size_t hn = 0;
@@ -288,6 +293,14 @@ status_t node_index_write(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
             free(hv);
             db_txn_rollback(db);
             return set_error_wrap(ERR_IO, "index_nodes: hash insert failed");
+        }
+        if ((k == 0 || memcmp(hv[k].hash, hv[k - 1].hash, OBJECT_HASH_SIZE) != 0) &&
+            db_write(db,
+                "INSERT OR IGNORE INTO node_content (repo_id, content_hash) VALUES (?, ?)",
+                (const char *[]){ repo, hhex, NULL }, NULL) != 0) {
+            free(hv);
+            db_txn_rollback(db);
+            return set_error_wrap(ERR_IO, "index_nodes: content set insert failed");
         }
         if (++nb.since_commit >= NODE_BATCH || db_txn_batch_should_end(&nb.rule)) {
             status_t cst = db_txn_commit(db);
