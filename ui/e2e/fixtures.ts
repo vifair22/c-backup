@@ -488,7 +488,8 @@ export function reportTimings(): void {
  * Walk the tree down to the fixture's source directory.
  *
  * scan_tree records absolute paths, so a snapshot of /tmp/cbackup-e2e-X/src
- * has directory entries for /tmp and for the work directory above it. The
+ * has directory entries for /tmp and for the work directory above it, and
+ * for each level above that wherever TMPDIR points. The
  * first version of this clicked "the last row that looks like a directory"
  * and slept 100 ms between levels, which passed alone and flaked under a
  * full run: a slow level meant the next click landed on the wrong row.
@@ -497,7 +498,10 @@ export function reportTimings(): void {
  * write, deterministic to run.
  */
 export async function descendTo(page: Page, work: string, ...rest: string[]): Promise<void> {
-  const segments = ['tmp', work.split('/').pop()!, 'src', ...rest]
+  /* Every component of the work directory, not a hardcoded 'tmp': TMPDIR
+   * may put it anywhere (NIT-55). As given, not resolved: the source is
+   * registered by this path, and the scan records the path it was given. */
+  const segments = [...work.split('/').filter(Boolean), 'src', ...rest]
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i]
     await page.getByText(seg, { exact: true }).first().click()
