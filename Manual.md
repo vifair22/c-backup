@@ -1346,7 +1346,12 @@ helper at once (its session closes); a helper that died has them swept at
 its next start; and none outlives the policy's `capture_max_s` lease. A
 backup still reading when the lease runs out loses the snapshot under it:
 files read after that are skipped and listed (6.3), and the job warns that
-the lease ran out (`source_snapshot_lease_lost` in its result). Size the
+the lease ran out (`source_snapshot_lease_lost` in its result). A lease
+that runs out before the read reaches a source fails the job instead, as
+for any source that cannot be read, naming it and why: `source <path>
+cannot be read from its snapshot (<read path>: No such file or directory);
+no snapshot written; the helper destroyed the source snapshot before the
+read ended (its capture_max_s lease ran out)`. Size the
 lease for the longest first backup. While
 it exists, anything that can read the dataset root (ZFS `.zfs`) or the pool's
 snapshot directory (btrfs) can read the snapshot (22.5.4).

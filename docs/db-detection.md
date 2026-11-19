@@ -515,7 +515,11 @@ warning, and lists it in the job result's `live_sources`. The point above
 `warn` only. Paths the helper does not snapshot get no action from it at all
 beyond placing them (`helper.md`). A mount below a source shows empty in
 its snapshot, so such a source is read from the snapshot only with
-`one_filesystem`. Excludes match the recorded paths
+`one_filesystem`. A lease lost before the read reaches a source fails
+the job as any unreadable source does, naming the source and the read
+path, with the lease named as the cause (B265; the end of the capture
+used to clear the read's error, leaving the job failed with none).
+Excludes match the recorded paths
 (`scan_opts_t.exclude_on_record`); the trees and the file cache are a live
 read's (B229). The capture is ended after the read on every outcome; the
 helper ends it if the daemon dies and sweeps it at its own start. No new
