@@ -870,7 +870,8 @@ status_t routes_submit_backup(job_manager_t *jm, int64_t repo_id,
     "       CAST(COALESCE(NULLIF(bytes_total,''),0) AS INTEGER)," \
     "       COALESCE(NULLIF(error,''),'')," \
     "       COALESCE(result,'')," \
-    "       COALESCE(origin,'api'), COALESCE(schedule_id, 0)" \
+    "       COALESCE(origin,'api'), COALESCE(schedule_id, 0)," \
+    "       COALESCE(dest_repo_id, 0)" \
     "  FROM jobs"
 
 static cJSON *job_json(cutils_db_t *db, char **row)
@@ -926,6 +927,11 @@ static cJSON *job_json(cutils_db_t *db, char **row)
     long long sched = strtoll(row[14], NULL, 10);
     if (sched > 0) cJSON_AddNumberToObject(o, "schedule_id", (double)sched);
     else           cJSON_AddNullToObject(o, "schedule_id");
+    /* A replicate's registered destination, which it holds and lists under
+     * as well as its source (B283); null otherwise. */
+    long long dest = strtoll(row[15], NULL, 10);
+    if (dest > 0) cJSON_AddNumberToObject(o, "dest_repo_id", (double)dest);
+    else          cJSON_AddNullToObject(o, "dest_repo_id");
     /* Present only while the end is held in memory, so a client can tell
      * the table does not have it yet. */
     if (unrec) cJSON_AddBoolToObject(o, "end_unrecorded", 1);
@@ -956,11 +962,30 @@ static api_response_t list_jobs(const api_request_t *req, void *ud)
     snprintf(lim, sizeof(lim), "%d", limit);
     snprintf(off, sizeof(off), "%d", offset);
 
+    /* ?repo=<id>: that repository's jobs, and the replicates into it
+     * (B283). Without it, a busy repository's jobs filled the newest 50 and
+     * a client paging per repository never saw the others'. */
+    int64_t repo_id = 0;
+    const char *rq = api_query_param(req, "repo");
+    if (rq) {
+        jreq_err_t je;
+        if (jquery_i64(rq, "repo", 1, INT64_C(9007199254740992), &repo_id, &je) != JREQ_OK)
+            return api_error(400, je.msg);
+    }
+    char rid[32];
+    snprintf(rid, sizeof(rid), "%lld", (long long)repo_id);
+
     /* On a reader (B269): a verify or a backup holding the shared
-     * connection kept GET /jobs waiting for minutes. */
+     * connection kept GET /jobs waiting for minutes. Two statements rather
+     * than a NULL in the list for "no filter", which would end it there. */
     db_rows_t *r = NULL;
-    if (db_read_rows(ctx->db, 0, JOB_COLUMNS " ORDER BY id DESC LIMIT ? OFFSET ?",
-                     (const char *[]){ lim, off, NULL }, &r) != 0) {
+    int rc = repo_id > 0
+        ? db_read_rows(ctx->db, 0, JOB_COLUMNS " WHERE repo_id = ?1 OR dest_repo_id = ?1"
+                       " ORDER BY id DESC LIMIT ?2 OFFSET ?3",
+                       (const char *[]){ rid, lim, off, NULL }, &r)
+        : db_read_rows(ctx->db, 0, JOB_COLUMNS " ORDER BY id DESC LIMIT ? OFFSET ?",
+                       (const char *[]){ lim, off, NULL }, &r);
+    if (rc != 0) {
         db_rows_free(r);
         return api_error(500, "cannot list jobs");
     }

@@ -1172,7 +1172,7 @@ and returned by `GET /repos/<id>/schedules`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/jobs` | Recent jobs, newest first. `limit` (default 50, at most 1000) and `offset`; a malformed one is a 400 |
+| GET | `/jobs` | Recent jobs, newest first. `limit` (default 50, at most 1000) and `offset`; a malformed one is a 400. `repo=<id>` lists only that repository's jobs and the replicates into it (a malformed id is a 400, an unknown one an empty list); each job's `dest_repo_id` is a replicate's registered destination, or null |
 | GET | `/jobs/<id>` | One job with progress |
 | GET | `/jobs/stream/<id>` | Server-sent progress events |
 | POST | `/jobs/<id>/cancel` | Request cancellation |
