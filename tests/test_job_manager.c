@@ -647,6 +647,25 @@ static void test_a_backup_whose_snapshot_is_in_the_repository_completes_at_start
     assert_int_equal(db_execute_non_query(db,
         "INSERT INTO jobs (id, repo_id, action, state, started, snapshot_id)"
         " VALUES (13, 3, 'backup', 'running', strftime('%s','now'), 2)", NULL, NULL), 0);
+    /* B267: unit jobs, one snapshot per unit. Job 14 meant two and wrote
+     * 3 only (4 is not there); job 15 meant two and wrote both, 6 and 7. */
+    for (int k = 6; k <= 7; k++) {
+        snprintf(f, sizeof(f), "%s/snapshots/%d", p1, k);
+        fp = fopen(f, "w");
+        assert_non_null(fp);
+        fputs("{}\n", fp);
+        fclose(fp);
+    }
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO jobs (id, repo_id, action, state, started, snapshots_expected)"
+        " VALUES (14, 1, 'units', 'running', strftime('%s','now'), 2),"
+        "        (15, 1, 'units', 'running', strftime('%s','now'), 2)", NULL, NULL), 0);
+    /* As job_note_snapshot leaves them, and migration 014 for 11-13. */
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO job_snapshots (job_id, snap_id) VALUES"
+        " (11, 3), (12, 5), (13, 2), (14, 3), (14, 4), (15, 6), (15, 7)", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE jobs SET snapshots_expected = 1 WHERE id IN (11, 12, 13)", NULL, NULL), 0);
     assert_int_equal(job_manager_start(db, 2, &jm), OK);
 
     char txt[1024];
@@ -658,7 +677,7 @@ static void test_a_backup_whose_snapshot_is_in_the_repository_completes_at_start
                               " AND source = 'schedule'"
                               " AND message LIKE 'schedule 7: snapshot 3; %'"), 1);
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 1"
-                              " AND result = 'failed'"), 0);
+                              " AND operation = 'backup' AND result = 'failed'"), 0);
 
     assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE id = 12 AND state = 'failed'"
                               " AND error = 'interrupted by daemon restart'"), 1);
@@ -671,10 +690,23 @@ static void test_a_backup_whose_snapshot_is_in_the_repository_completes_at_start
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 3"
                               " AND result = 'failed' AND message LIKE '%snapshot 2 may have%'"), 1);
 
+    assert_int_equal(db_text("SELECT state || '|' || error FROM jobs WHERE id = 14",
+                             txt, sizeof(txt)), 0);
+    assert_string_equal(txt, "failed|interrupted by daemon restart; snapshot 3 of the 2 it "
+                             "meant to write is in the repository, and the job did not finish");
+    assert_int_equal(db_text("SELECT state || '|' || COALESCE(error, '') || '|' || result"
+                             " FROM jobs WHERE id = 15", txt, sizeof(txt)), 0);
+    assert_string_equal(txt, "completed||{\"snapshot_ids\":[6,7],\"recovered\":true}");
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 1"
+                              " AND operation = 'units' AND result = 'success'"
+                              " AND message LIKE 'snapshots 6 and 7; %'"), 1);
+    /* The notes are gone with their jobs. */
+    assert_int_equal(db_count("SELECT COUNT(*) FROM job_snapshots"), 0);
+
     /* Once only. */
     job_manager_stop(jm); jm = NULL;
     assert_int_equal(job_manager_start(db, 2, &jm), OK);
-    assert_int_equal(db_count("SELECT COUNT(*) FROM journal"), 3);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal"), 5);
 }
 
 /* B238: an end is not shown until it is durable. */

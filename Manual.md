@@ -280,7 +280,12 @@ and journalled as a success saying the snapshot was found at start; running
 it again would only take a second snapshot of the same data. When the repository
 cannot be read at that start (an unmounted disk), the job is failed with
 `snapshot N may have been written` in its error; `c-backup snapshots <id>`
-once the disk is back says whether it was. A job's end is synced to disk
+once the disk is back says whether it was. A unit backup job, which writes
+one snapshot per unit, is the same: recorded `completed`, its `result`
+`{"snapshot_ids":[...],"recovered":true}`, when every unit's snapshot is in
+the repository. With only some of them it is failed, and its error names
+them (`snapshots 3 and 4 of the 5 it meant to write are in the repository`),
+so a retry can be limited to the units that are missing. A job's end is synced to disk
 before the CLI, the app or the API shows it, so a job seen ending never
 comes back as interrupted. A power cut can also cost the database about its
 last second of the daemon's own writes (never an edit the API had answered);
@@ -2826,10 +2831,10 @@ reach the disk at different times:
   the change is committed but could not be made durable.
 - **A job's end** - its state, error, result and journal entry - is synced
   before any client is shown it: until then `/jobs/<id>` and the stream
-  read `running`. A backup also records which snapshot it is writing, synced,
-  before the snapshot record exists, so a job whose end a power cut took is
-  recorded completed at the next start if its snapshot is in the
-  repository (section 2.2).
+  read `running`. A backup, or a unit backup for each unit, also records
+  which snapshot it is writing, synced, before the snapshot record exists,
+  so a job whose end a power cut took is recorded completed at the next
+  start if its snapshots are in the repository (section 2.2).
 - **Every other write** - the other API edits (a note, sources, a policy
   value, a schedule added or changed, a job submitted), and the daemon's
   own writes (a backup's index rows, job progress, other journal entries) -

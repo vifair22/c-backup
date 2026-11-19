@@ -1592,6 +1592,8 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
         bo.unit_snapshot = 1;
         bo.index_hook = index_hook;
         bo.index_hook_ctx = &hk;
+        bo.record_hook = o->record_hook;
+        bo.record_hook_ctx = o->hook_ctx;
         bo.cancel = o->cancel;
         bo.store_workers = o->store_workers;
         bo.file_cache_match = o->file_cache_match;
@@ -2105,6 +2107,12 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             pick[np++] = i;
         }
     }
+
+    /* How many snapshots this job means to write, before the first is
+     * noted: a unit job is complete after a restart only when every one is
+     * in the repository (B267). One refused already means it cannot be. */
+    if (st == OK && o->expect_hook)
+        st = o->expect_hook(o->hook_ctx, first_st == OK ? (int64_t)np : 0);
 
     /* Capture groups: everything under job scope, units sharing a
      * capture.group under group scope; a group of one is a unit. */
