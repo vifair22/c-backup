@@ -56,6 +56,14 @@ typedef struct {
      * of the job in one (job). Group and job need a provider with
      * begin_group; without one every unit is its own capture. */
     int          pause_scope;          /* UNIT_SCOPE_* */
+    /* The job manager's notes (B267): how many snapshots the job means to
+     * write, once the units are resolved (0 when one named was refused, so
+     * it cannot complete), and each snapshot's id before its record is
+     * written (backup_opts_t.record_hook). A non-OK answer fails the job,
+     * or the unit, with nothing written. NULL: not a job. */
+    status_t   (*expect_hook)(void *ctx, int64_t n);
+    status_t   (*record_hook)(void *ctx, int64_t snap_id);
+    void        *hook_ctx;
 } unit_backup_opts_t;
 
 #define UNIT_SCOPE_UNIT  0

@@ -1222,7 +1222,12 @@ the next start marks it `completed` with `result`
 `{"snapshot_id":N,"recovered":true}` and journals it as a success. When the
 repository cannot be read at that start its error is `interrupted by daemon
 restart; snapshot N may have been written, and the repository could not be
-read at start: <reason>`.
+read at start: <reason>`. A unit backup job (`units`) notes each unit's
+snapshot the same way, and how many it means to write once its units are
+resolved (B267): with every one in the repository it is `completed` with
+`result` `{"snapshot_ids":[...],"recovered":true}`; with some, `failed` with
+`interrupted by daemon restart; snapshots A and B of the N it meant to write
+are in the repository, and the job did not finish`.
 
 A job's end is made durable before it is shown: from the moment its end is
 written until the WAL holding it is synced, `/jobs`, `/jobs/<id>` and the

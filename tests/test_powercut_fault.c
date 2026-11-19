@@ -2789,11 +2789,14 @@ static api_response_t get_url(api_server_t *srv, const char *url)
     return api_server_dispatch(srv, &req);
 }
 
-static status_t op_backup_job(ctx_t *c, int counting)
+/* A job through a submit, watched by a client polling GET /jobs/<id>; the
+ * power goes the moment the client reads "completed". */
+typedef status_t (*job_submit_fn)(ctx_t *c, job_manager_t *jm, int64_t *out_id);
+
+static status_t run_watched_job(ctx_t *c, int counting, job_submit_fn submit, const char *what)
 {
     g_bj_id = 0;
     g_bj_saw_completed = 0;
-    set_source(1);
     status_t st = id_reserve_open(c->db, IDS_BLOCK);
     if (counting && st != OK) return st;
     err_clear();
@@ -2807,7 +2810,7 @@ static status_t op_backup_job(ctx_t *c, int counting)
     assert_int_equal(routes_register_jobs(srv, c->db, jm), 0);
     store_index_set_pack_batch_rows(2);
     int64_t id = 0;
-    st = routes_submit_backup(jm, g_repo_id, "{\"paths\":[\"" H_SRC "\"]}", 0, &id);
+    st = submit(c, jm, &id);
     if (st == OK) {
         g_bj_id = id;
         char url[64];
@@ -2838,7 +2841,7 @@ static status_t op_backup_job(ctx_t *c, int counting)
             usleep(1000);
         }
     } else if (counting) {
-        fail_msg("backup job submit with no cut: %s", err_msg());
+        fail_msg("%s submit with no cut: %s", what, err_msg());
     }
     err_clear();
     job_manager_stop(jm);
@@ -2846,8 +2849,20 @@ static status_t op_backup_job(ctx_t *c, int counting)
     store_index_set_pack_batch_rows(0);
     id_reserve_forget();
     if (counting && !g_bj_saw_completed)
-        fail_msg("the backup job did not complete with no cut");
+        fail_msg("the %s did not complete with no cut", what);
     return OK;
+}
+
+static status_t submit_backup_job(ctx_t *c, job_manager_t *jm, int64_t *out_id)
+{
+    (void)c;
+    return routes_submit_backup(jm, g_repo_id, "{\"paths\":[\"" H_SRC "\"]}", 0, out_id);
+}
+
+static status_t op_backup_job(ctx_t *c, int counting)
+{
+    set_source(1);
+    return run_watched_job(c, counting, submit_backup_job, "backup job");
 }
 
 static void check_backup_job(int crash_at, int kept, int started)
@@ -2911,6 +2926,92 @@ static void build_backup_job(ctx_t *c)
     end_build(c);
 }
 
+/* ---- A unit job's end (B267) --------------------------------------------
+ *
+ * The same for a unit job, which writes one snapshot per unit: u1 and u2
+ * under the job pause scope, through the daemon's units route and worker,
+ * after a first job of both, so this job's snapshots are 3 and 4. After
+ * the start the job is completed, naming both, exactly when both records
+ * are in the repository; with one of them it is failed and names that
+ * one; and it is completed whenever the client read it completed. A unit
+ * job that read completed came back failed, and its retry duplicated
+ * every unit's snapshot.
+ */
+static status_t submit_unit_job(ctx_t *c, job_manager_t *jm, int64_t *out_id)
+{
+    routes_units_init(c->db, jm);
+    return routes_submit_units(jm, g_repo_id,
+                               "{\"provider\":\"fake\",\"units\":[\"cbk-pc-unit\",\"cbk-pc-two\"],"
+                               "\"require\":\"inconsistent\",\"pause_scope\":\"job\"}",
+                               0, out_id);
+}
+
+static status_t op_unit_job(ctx_t *c, int counting)
+{
+    status_t st = run_watched_job(c, counting, submit_unit_job, "unit job");
+    routes_units_init(NULL, NULL);
+    return st;
+}
+
+/* At the start as the cut left it (started 0), as the daemon's own start
+ * runs the job manager first: the unit session start_and_check runs after
+ * it takes the next ids, and its records are not this job's. */
+static void check_unit_job(int crash_at, int kept, int started)
+{
+    (void)crash_at; (void)kept;
+    if (started || g_bj_id <= 0) return;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, H_DB), 0);
+    if (id_reserve_open(db, IDS_BLOCK) != OK) violation("id reservation at start: %s", err_msg());
+    err_clear();
+    job_manager_t *jm = NULL;
+    if (job_manager_start(db, 1, &jm) != OK) violation("job manager start: %s", err_msg());
+    else job_manager_stop(jm);
+    err_clear();
+    id_reserve_forget();
+
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)g_bj_id);
+    db_result_t *r = NULL;
+    char state[32] = "", result[2048] = "", error[512] = "";
+    int have = 0;
+    if (db_execute(db, "SELECT state, COALESCE(result, ''), COALESCE(error, '')"
+                       " FROM jobs WHERE id = ?",
+                   (const char *[]){ id, NULL }, &r) == 0 && r && r->nrows == 1) {
+        have = 1;
+        snprintf(state, sizeof(state), "%s", r->rows[0][0]);
+        snprintf(result, sizeof(result), "%s", r->rows[0][1]);
+        snprintf(error, sizeof(error), "%s", r->rows[0][2]);
+    }
+    db_result_free(r);
+    db_close(db);
+
+    struct stat sb;
+    int r3 = stat(H_REPO "/snapshots/3", &sb) == 0 && S_ISREG(sb.st_mode);
+    int r4 = stat(H_REPO "/snapshots/4", &sb) == 0 && S_ISREG(sb.st_mode);
+    int completed = have && strcmp(state, "completed") == 0;
+    if (g_bj_saw_completed && !completed)
+        violation("the client read unit job %s completed, and after the restart it is %s%s%s",
+                  id, have ? state : "gone", error[0] ? ": " : "", error);
+    if (r3 && r4 && !completed)
+        violation("both of unit job %s's snapshots are in the repository and it is %s%s%s",
+                  id, have ? state : "gone", error[0] ? ": " : "", error);
+    if (completed && !(r3 && r4))
+        violation("unit job %s is completed and snapshot %s is not in the repository", id,
+                  r3 ? "4" : "3");
+    /* Completed in the process ("units":[...]) or at the start
+     * ("snapshot_ids":[3,4]): either way both are named. */
+    if (completed && !(strstr(result, "\"snapshot_ids\":[3,4]") ||
+                       (strstr(result, "\"snapshot_id\":3") && strstr(result, "\"snapshot_id\":4"))))
+        violation("unit job %s is completed and its result does not name 3 and 4: %s", id, result);
+    if (have && (r3 != r4) && !completed &&
+        !strstr(error, r3 ? "snapshot 3 of the 2 it meant to write is in the repository"
+                          : "snapshot 4 of the 2 it meant to write is in the repository"))
+        violation("unit job %s wrote one of its two snapshots and does not say so: %s", id, error);
+    if (have && (strcmp(state, "running") == 0 || strcmp(state, "queued") == 0))
+        violation("unit job %s is still %s after the start", id, state);
+}
+
 static const scenario_t S_BACKUP_FIRST = { "backup, first", build_backup_first,
                                            op_backup_first, 0, 0, 0, NULL, 0 };
 static const scenario_t S_BACKUP_INCR  = { "backup, incremental", build_backup_incr,
@@ -2951,6 +3052,8 @@ static const scenario_t S_IDS          = { "ids handed out (B217)", build_ids, o
                                            0, 0, 0, check_ids, 0 };
 static const scenario_t S_BACKUP_JOB   = { "backup job's end (B238)", build_backup_job,
                                            op_backup_job, 0, 1, 0, check_backup_job, 0 };
+static const scenario_t S_UNIT_JOB     = { "unit job's end (B267)", build_unit_two,
+                                           op_unit_job, 0, 1, 2, check_unit_job, 0 };
 
 static void test_ids(void **state)
 {
@@ -2962,6 +3065,7 @@ static void test_ids(void **state)
     assert_int_equal(g_counted_jrnl, IDS_EACH);
 }
 static void test_backup_job(void **state)     { (void)state; every_cut(&S_BACKUP_JOB); }
+static void test_unit_job(void **state)       { (void)state; every_cut(&S_UNIT_JOB); }
 static void test_api_tag(void **state)        { (void)state; every_cut(&S_API_TAG); }
 static void test_api_sched_del(void **state)  { (void)state; every_cut(&S_API_SCHED_DEL); }
 static void test_api_note(void **state)       { (void)state; every_cut(&S_API_NOTE); }
@@ -3181,6 +3285,7 @@ int main(void)
         cmocka_unit_test(test_api_sources),
         cmocka_unit_test(test_ids),
         cmocka_unit_test(test_backup_job),
+        cmocka_unit_test(test_unit_job),
         cmocka_unit_test(test_prune_unlinks_the_record_after_the_commit_is_durable),
         cmocka_unit_test(test_start_finishes_an_interrupted_prune),
         cmocka_unit_test(test_reindex_finishes_an_interrupted_prune),

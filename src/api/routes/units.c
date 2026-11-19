@@ -872,6 +872,10 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
     o.progress_ctx = progress_ctx;
     o.bytes_cb = job_progress_bytes;
     o.store_workers = routes_backup_store_workers();
+    /* Which snapshots this job writes, durable before each record (B267). */
+    o.expect_hook = job_expect_snapshots;
+    o.record_hook = job_note_snapshot;
+    o.hook_ctx = progress_ctx;
     unit_backup_result_t res;
     st = unit_backup_run(store, j->db, j->repo_id, &o, &res);
     char why[ERR_MSG_MAX];
