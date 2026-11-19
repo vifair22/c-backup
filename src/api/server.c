@@ -291,7 +291,10 @@ static void keys_list(const char *const *keys, size_t nkeys, char *out, size_t s
 enum { KEYS_DEPTH = 4, KEYS_MAX = 32 };
 
 /* The first member of object o outside keys (nkeys entries), described in
- * msg; `where` names the object for a nested one ("" at the top). */
+ * msg; `where` names the object for a nested one ("" at the top).
+ * Recursive by design: one level per nested object in the route's key
+ * list, stopped at KEYS_DEPTH, so the depth never follows the body. */
+// NOLINTNEXTLINE(misc-no-recursion)
 static int object_unknown(const cJSON *o, const char *const *keys, size_t nkeys,
                           const char *where, int depth, char *msg, size_t sz)
 {
