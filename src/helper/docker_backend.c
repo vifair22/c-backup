@@ -319,34 +319,44 @@ static status_t blob(dbuild_t *b, struct sp_ctx *c, const char *unit, const char
     return cache_blob(c, unit, id, data, len);
 }
 
-/* A host file's bytes, or ERR_NOT_FOUND. */
-static status_t host_file(struct sp_ctx *c, const char *path, char **data, size_t *len)
+/* A host file's bytes, whole, or ERR_NOT_FOUND; a read error or a file
+ * that changed size while read fails rather than storing part of it
+ * (B280). *open_err, when given, is the errno of an open that failed. */
+static status_t host_file_ex(struct sp_ctx *c, const char *path, char **data, size_t *len,
+                             int *open_err)
 {
+    if (open_err) *open_err = 0;
     char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
     if (host_path(&c->tools, path, hp, sizeof(hp)) != 0) return set_error(ERR_INVALID, "docker: path too long");
-    FILE *f = fopen(hp, "re");
-    if (!f) return errno == ENOENT ? set_error(ERR_NOT_FOUND, "docker: %s is missing", path)
-                                   : set_error_errno(ERR_IO, "docker: %s", path);
-    char *buf = NULL;
-    size_t n = 0, cap = 0;
-    char chunk[8192];
-    size_t r;
-    while ((r = fread(chunk, 1, sizeof(chunk), f)) > 0) {
-        if (n + r > SP_BLOB_MAX) { fclose(f); free(buf); return set_error(ERR_TOO_LARGE, "docker: %s is too large", path); }
-        if (n + r + 1 > cap) {
-            cap = (n + r + 1) * 2;
-            char *g = realloc(buf, cap);
-            if (!g) { fclose(f); free(buf); return set_error(ERR_NOMEM, "docker: %s", path); }
-            buf = g;
-        }
-        memcpy(buf + n, chunk, r);
-        n += r;
-    }
-    fclose(f);
-    if (!buf && !(buf = calloc(1, 1))) return set_error(ERR_NOMEM, "docker: %s", path);
-    *data = buf;
-    *len = n;
-    return OK;
+    return host_read_file(hp, path, SP_BLOB_MAX, data, len, open_err);
+}
+
+static status_t host_file(struct sp_ctx *c, const char *path, char **data, size_t *len)
+{
+    return host_file_ex(c, path, data, len, NULL);
+}
+
+/*
+ * A warning describe found, held until the unit's capture begins: describe
+ * has no channel to the job, and a session's info does (NIT-50). Kept in
+ * the blob cache under an id no item has, so it lives and is dropped with
+ * the description it came from.
+ */
+#define PENDING_WARN_ID "!warning"
+
+static void pending_warn(struct sp_ctx *c, const char *unit, const char *text)
+{
+    char *copy = strdup(text);
+    if (!copy || cache_blob(c, unit, PENDING_WARN_ID, copy, strlen(copy)) != OK) err_clear();
+}
+
+static void emit_pending_warns(struct sp_ctx *c, const char *unit, sp_session_info_t *info)
+{
+    pthread_mutex_lock(&c->mu);
+    for (size_t i = 0; i < c->nblobs; i++)
+        if (strcmp(c->blobs[i].unit, unit) == 0 && strcmp(c->blobs[i].item, PENDING_WARN_ID) == 0)
+            (void)sp_session_info_warn(info, "%s", c->blobs[i].data);
+    pthread_mutex_unlock(&c->mu);
 }
 
 /* Directories that are usually re-creatable, offered as exclusions and
@@ -441,12 +451,28 @@ static status_t describe_member(struct sp_ctx *c, dbuild_t *b, const char *unit,
         snprintf(tf, sizeof(tf), "%.3900s/my-%.128s.xml", c->pol->templates_dir, m->name);
         char *data = NULL;
         size_t len = 0;
-        st = host_file(c, tf, &data, &len);
+        int oe = 0;
+        st = host_file_ex(c, tf, &data, &len, &oe);
         if (st == OK) {
             item_id(id, sizeof(id), "template:", m->name);
             snprintf(tp, sizeof(tp), CFG_DIR "/containers/%s/unraid-template.xml", m->name);
             st = blob(b, c, unit, id, tp, data, len);
         } else if (st == ERR_NOT_FOUND) {
+            err_clear();
+            st = OK;
+        } else if (oe == EACCES || oe == EPERM || oe == ENOTDIR || oe == ELOOP) {
+            /* Optional, and not readable: the default templates_dir is
+             * Unraid's, which an unprivileged helper or a host that is not
+             * Unraid cannot reach. Failing the whole unit over it lost the
+             * data too; it is left out and the job says so. Nothing beyond
+             * the policy's own path is tried. */
+            const char *en = oe == EACCES ? "EACCES" : oe == EPERM ? "EPERM"
+                           : oe == ENOTDIR ? "ENOTDIR" : "ELOOP";
+            char w[PATH_MAX + 200];
+            snprintf(w, sizeof(w), "%.80s: Unraid template not stored: %.3900s: %s (%s)",
+                     m->name, tf, strerror(oe), en);
+            log_warn("docker: %s", w);
+            pending_warn(c, unit, w);
             err_clear();
             st = OK;
         }
@@ -640,6 +666,7 @@ struct helper_run {
     atomic_int  done;
     int         status;
     int         out_fd, err_fd;
+    int         pgid;       /* the exec's process group, once a stop found it */
 };
 
 static void write_all(int fd, const unsigned char *p, size_t n)
@@ -751,9 +778,14 @@ static int d_hook_poll(helper_run_t *r, int *status)
     return 1;
 }
 
-/* The Engine API cannot kill an exec: signal its host pid (the helper runs
- * with --pid=host), SIGTERM, then SIGKILL after 10 s. */
-static void d_hook_kill(helper_run_t *r)
+/*
+ * The Engine API cannot kill an exec: signal its host pid (the helper runs
+ * with --pid=host). runc makes an exec's process the leader of a session
+ * and process group of its own, so the whole group is signalled, which is
+ * what ends a script's children too (B248). A pid that leads no group,
+ * should a runtime not do that, gets the signal alone.
+ */
+static int exec_pid(helper_run_t *r)
 {
     char path[160];
     snprintf(path, sizeof(path), "/exec/%s/json", r->exec_id);
@@ -765,14 +797,30 @@ static void d_hook_kill(helper_run_t *r)
     }
     cJSON_Delete(j);
     err_clear();
-    if (pid > 1) {
-        kill(pid, SIGTERM);
-        for (int i = 0; i < 100 && !atomic_load(&r->done); i++) {
-            struct timespec ts = { 0, 100 * 1000000L };
-            nanosleep(&ts, NULL);
-        }
-        if (!atomic_load(&r->done)) kill(pid, SIGKILL);
+    return pid;
+}
+
+static void d_hook_signal(helper_run_t *r, int sig)
+{
+    /* The group is remembered: a stop's SIGKILL reaches a member that
+     * outlived the exec's own process, which only a group id still names. */
+    if (!r->pgid && !atomic_load(&r->done)) {
+        int pid = exec_pid(r);
+        if (pid > 1 && getpgid(pid) == pid) r->pgid = pid;
+        else if (pid > 1) { kill(pid, sig); return; }
     }
+    if (r->pgid) kill(-r->pgid, sig);
+}
+
+/* SIGTERM, then SIGKILL after HOOK_KILL_GRACE_S. */
+static void d_hook_kill(helper_run_t *r)
+{
+    d_hook_signal(r, SIGTERM);
+    for (int i = 0; i < HOOK_KILL_GRACE_S * 10 && !atomic_load(&r->done); i++) {
+        struct timespec ts = { 0, 100 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    if (!atomic_load(&r->done)) d_hook_signal(r, SIGKILL);
 }
 
 static void d_hook_free(helper_run_t *r)
@@ -1063,6 +1111,10 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(x->real, sizeof(x->real), "%s", it->source);
         snap_dom_t d;
         if ((st = snap_domain_of(&c->snap, x->real, &d)) != OK) break;
+        if (d.kind == SNAP_NONE && d.unlisted[0])
+            (void)sp_session_info_warn(&s->info, "%.300s is in ZFS dataset %.200s, which the helper's policy does "
+                                       "not list in [snapshot] zfs_domains: read without a snapshot (pause-read)",
+                                       x->real, d.unlisted);
         int nested = 0;
         if (d.kind != SNAP_NONE && (st = nested_live(probe, &d, x->real, &s->info, &nested)) != OK) break;
         if (nested) d.kind = SNAP_NONE;
@@ -1197,6 +1249,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
                          sp_consistency_name(lvl), sp_consistency_name(req->require));
     }
     *out = s;
+    emit_pending_warns(c, s->unit, &s->info);
     *info = &s->info;
     return OK;
 }
@@ -1401,6 +1454,10 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
             snprintf(x->real, sizeof(x->real), "%s", it->source);
             snap_dom_t d;
             if ((st = snap_domain_of(&c->snap, x->real, &d)) != OK) break;
+            if (d.kind == SNAP_NONE && d.unlisted[0])
+                (void)sp_session_info_warn(&s->info, "%.300s is in ZFS dataset %.200s, which the helper's policy "
+                                           "does not list in [snapshot] zfs_domains: read without a snapshot",
+                                           x->real, d.unlisted);
             int nested = 0;
             if (d.kind != SNAP_NONE && (st = nested_live(gprobe, &d, x->real, &s->info, &nested)) != OK) break;
             if (nested) d.kind = SNAP_NONE;
@@ -1510,7 +1567,11 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
         free(ss);
         return set_error(ERR_IO, "%s", why);
     }
-    for (size_t k = 0; k < n; k++) { out[k] = ss[k]; infos[k] = &ss[k]->info; }
+    for (size_t k = 0; k < n; k++) {
+        emit_pending_warns(c, ss[k]->unit, &ss[k]->info);
+        out[k] = ss[k];
+        infos[k] = &ss[k]->info;
+    }
     free(ss);
     return OK;
 }
@@ -2802,7 +2863,7 @@ status_t docker_backend_init(const helper_policy_t *pol, helper_backend_t *out)
         .name = "docker", .ops = &k_docker_ops, .ctx = c,
         .blob_data = d_blob_data, .unit_state = d_unit_state, .set_running = d_set_running,
         .mount_root = d_mount_root, .hook_start = d_hook_start, .hook_poll = d_hook_poll,
-        .hook_kill = d_hook_kill, .hook_free = d_hook_free, .define = d_define,
+        .hook_kill = d_hook_kill, .hook_signal = d_hook_signal, .hook_free = d_hook_free, .define = d_define,
         .define_check = d_define_check, .db_target = d_db_target,
     };
     return OK;

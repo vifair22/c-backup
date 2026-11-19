@@ -118,6 +118,7 @@ typedef struct {
     const char *path;       /* the finding's recorded path: picks the container */
     int         dump;       /* a STREAM item; else an exec template */
     int         post;       /* exec: also runs after the capture */
+    atomic_int *cancel;     /* the job's: stops a pre run, never a post (B248) */
     /* Outputs: an exec template's runs (template_exec), the log of each
      * appended. A dump's outcome is its STREAM item's. */
     int         pre_ran, pre_ok, post_ran, post_ok;

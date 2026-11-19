@@ -10,6 +10,7 @@
  * capture left paused.
  */
 
+#include <errno.h>
 #include <limits.h>
 #include <setjmp.h>
 #include <stdarg.h>
@@ -28,7 +29,9 @@
 #include "docker_backend.h"
 #include "helper_backend.h"
 #include "helper_server.h"
+#include "job_manager.h"
 #include "registry.h"
+#include "routes.h"
 #include "repo.h"
 #include "restore.h"
 #include "store.h"
@@ -91,12 +94,13 @@ static const char *k_hooks =
 static int start(const char *extra_policy)
 {
     if (system("rm -rf '" D "' && mkdir -p '" STATE "' '" APPS "/web/db' '" APPS "/web/www' "
-               "'" MNT "/user/appdata' '" MNT "/media/lib' '" MNT "/disk1/slow' '" D "/tmpl' '" D "/proj'") != 0) return -1;
+               "'" MNT "/user/appdata' '" MNT "/media/lib' '" MNT "/disk1/slow' '" MNT "/cache/odd' '" D "/tmpl' '" D "/proj'") != 0) return -1;
     put(APPS "/web/db/pg", "db-v1");
     if (mkdir(APPS "/web/www/cache", 0700) != 0) return -1;
     put(APPS "/web/www/index", "www-v1");
     put(MNT "/media/lib/a", "media-v1");
     put(MNT "/disk1/slow/s", "slow-v1");
+    put(MNT "/cache/odd/o", "odd-v1");
     put(D "/tmpl/my-solo.xml", "<Container>solo</Container>");
     put(D "/proj/compose.yaml", "services: {}\n");
     put(D "/proj/.env", "PASSWORD=verbatim\n");
@@ -133,6 +137,9 @@ static int start(const char *extra_policy)
         "[{\"Type\":\"bind\",\"Source\":\"" MNT "/media/lib\",\"Destination\":\"/b\"}]");
     fake_docker_add(&fdk, "dddd01", "parked", "exited", NULL,
         "[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/db\",\"Destination\":\"/d\"}]");
+    /* In dataset cache, which the policy does not list (B253). */
+    fake_docker_add(&fdk, "hhhh01", "unlisted", "running", NULL,
+        "[{\"Type\":\"bind\",\"Source\":\"" MNT "/cache/odd\",\"Destination\":\"/o\"}]");
 
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof(cwd))) return -1;
@@ -144,7 +151,7 @@ static int start(const char *extra_policy)
              "[host]\nnsenter = 0\nhost_root =\nzfs = %s/tests/fake_host/zfs\ndocker = %s/tests/fake_host/docker\nuser_root = " MNT "/user\n"
              "mnt_root = " MNT "\nboot_config = " D "/boot\nmountinfo = " D "/mountinfo\nproc = " D "/proc\n"
              "[docker]\nenabled = 1\nsocket = " SOCK "\ninclude_roots = " APPS ", " MNT "/media, " MNT "/disk1, "
-             MNT "/user/appdata\n"
+             MNT "/user/appdata, " MNT "/cache/odd\n"
              "templates_dir = " D "/tmpl\n%s",
              cwd, cwd, extra_policy ? extra_policy : "");
     memset(&pol, 0, sizeof(pol));
@@ -279,7 +286,7 @@ static void test_list_and_describe(void **state)
     seen_t s;
     memset(&s, 0, sizeof(s));
     assert_int_equal(be.ops->list_units(be.ctx, on_unit, &s), OK);
-    assert_int_equal(s.n, 6);
+    assert_int_equal(s.n, 7);
     assert_string_equal(s.ids[0], "compose:web");
     assert_string_equal(s.ids[1], "solo");
     assert_int_equal(s.st[5], SP_STATE_STOPPED);
@@ -369,6 +376,57 @@ static void test_one_instant_no_pause(void **state)
     struct stat sb;
     assert_int_not_equal(stat(root, &sb), 0);
     be.ops->desc_free(d);
+}
+
+/*
+ * NIT-50: an Unraid template the helper cannot read. The default
+ * templates_dir is Unraid's; on another host, or to a helper without root,
+ * it gave EACCES or ENOTDIR rather than ENOENT, and the optional file failed
+ * the whole unit. It is left out, and the capture warns, naming it.
+ */
+static void unreadable_template(const char *why)
+{
+    sp_unit_desc_t *d = NULL;
+    assert_int_equal(be.ops->describe(be.ctx, "solo", &d), OK);
+    assert_null(item(d, ".cbackup-unit/config/containers/solo/unraid-template.xml"));
+    assert_non_null(item(d, ".cbackup-unit/config/containers/solo/inspect.json"));
+    be.ops->desc_free(d);
+    d = NULL;
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    assert_int_equal(capture("solo", SP_CONSIST_CRASH, &s, &info, &d), OK);
+    int warned = 0;
+    for (size_t i = 0; i < info->n_warnings; i++)
+        warned |= strstr(info->warnings[i], "solo: Unraid template not stored") != NULL &&
+                  strstr(info->warnings[i], why) != NULL;
+    assert_true(warned);
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+}
+
+static int setup_template_not_a_dir(void **state)
+{
+    (void)state;
+    /* After the base policy's templates_dir, in [docker]: the later wins. */
+    static char extra[4096];
+    snprintf(extra, sizeof(extra), "templates_dir = " D "/tmpl/my-solo.xml\n%s", k_hooks);
+    return start(extra);
+}
+
+static void test_template_not_a_directory(void **state)
+{
+    (void)state;
+    unreadable_template(strerror(ENOTDIR));
+    unreadable_template("(ENOTDIR)");
+}
+
+static void test_template_unreadable(void **state)
+{
+    (void)state;
+    if (geteuid() == 0) { skip(); return; }   /* root reads through mode 000 */
+    assert_int_equal(chmod(D "/tmpl/my-solo.xml", 0), 0);
+    unreadable_template(strerror(EACCES));
+    assert_int_equal(chmod(D "/tmpl/my-solo.xml", 0644), 0);
 }
 
 /* Two pools: two instants, so pause: auto pauses, around the snapshots. */
@@ -998,9 +1056,12 @@ static store_t *ustore;
 static store_index_t *uidx;
 static int64_t urepo;
 
+static const char *g_units_extra;   /* policy for setup_units, k_hooks when NULL */
+
 static int setup_units(void **state)
 {
-    if (setup(state) != 0) return -1;
+    (void)state;
+    if (start(g_units_extra ? g_units_extra : k_hooks) != 0) return -1;
     if (db_open(&udb, D "/state.db") != 0 || db_run_lib_migrations(udb) != 0 ||
         db_run_compiled_migrations(udb, app_migrations) != 0) return -1;
     if (repo_register(udb, D "/repo", "t", &urepo) != OK) return -1;
@@ -1009,6 +1070,16 @@ static int setup_units(void **state)
     units_config_t uc = { "", 2, 10, 30, 1, 0, 75, 30 };
     if (units_init(udb, NULL, &uc) != OK) return -1;
     return sp_registry_add(be.ops, be.ctx) == OK ? 0 : -1;
+}
+
+static int setup_units_template_not_a_dir(void **state)
+{
+    static char extra[4096];
+    snprintf(extra, sizeof(extra), "templates_dir = " D "/tmpl/my-solo.xml\n%s", k_hooks);
+    g_units_extra = extra;
+    int rc = setup_units(state);
+    g_units_extra = NULL;
+    return rc;
 }
 
 static int teardown_units(void **state)
@@ -1046,6 +1117,91 @@ static void test_pause_read(void **state)
     restore_result_t rr;
     assert_int_equal(restore_run(ustore, udb, urepo, snap, D "/out", &ro, &rr), OK);
     assert_true(has(D "/out" MNT "/disk1/slow/s", "slow-v1"));
+}
+
+/*
+ * B253: a mount in a ZFS dataset the policy does not list falls back to
+ * pause-read, which is right, and said so only in the helper's log. The
+ * unit's result, and so the job's warning, names the dataset and the
+ * policy key.
+ */
+static void test_unlisted_dataset_warns(void **state)
+{
+    (void)state;
+    const char *names[] = { "unlisted" };
+    unit_backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.provider = "docker";
+    o.units = names;
+    o.n_units = 1;
+    o.require = SP_CONSIST_CRASH;
+    o.job_id = 62;
+    unit_backup_result_t res;
+    assert_int_equal(unit_backup_run(ustore, udb, urepo, &o, &res), OK);
+    assert_int_equal(res.ok, 1);
+    assert_int_equal(res.units[0].achieved, SP_CONSIST_CRASH);
+    int said = 0;
+    for (unsigned i = 0; i < res.units[0].n_warnings; i++)
+        said |= strstr(res.units[0].warnings[i], MNT "/cache/odd is in ZFS dataset cache,") != NULL &&
+                strstr(res.units[0].warnings[i], "zfs_domains") != NULL;
+    if (!said) fail_msg("no warning names the unlisted dataset (%u warnings)", res.units[0].n_warnings);
+    unit_backup_result_free(&res);
+    /* A mount on no ZFS dataset at all is pause-read with nothing to say. */
+    names[0] = "slowpoke";
+    o.job_id = 63;
+    assert_int_equal(unit_backup_run(ustore, udb, urepo, &o, &res), OK);
+    for (unsigned i = 0; i < res.units[0].n_warnings; i++)
+        assert_null(strstr(res.units[0].warnings[i], "zfs_domains"));
+    unit_backup_result_free(&res);
+}
+
+/*
+ * TEMPLATE-EACCES-WARN: the template left out is the job's warning. The
+ * units job ends completed with a warning result, which is what fires the
+ * warning alert and journals "warning", naming the template's path and the
+ * errno, rather than reading as a clean success.
+ */
+static void test_unreadable_template_job_completes_with_a_warning(void **state)
+{
+    (void)state;
+    job_manager_t *jm = NULL;
+    assert_int_equal(job_manager_start(udb, 1, &jm), OK);
+    routes_units_init(udb, jm);
+    int64_t job = 0;
+    assert_int_equal(routes_submit_units(jm, urepo, "{\"provider\":\"docker\",\"units\":[\"solo\"],"
+                                         "\"require\":\"inconsistent\"}", 0, &job), OK);
+    char id[32], q[160];
+    snprintf(id, sizeof(id), "%lld", (long long)job);
+    db_result_t *r = NULL;
+    for (int i = 0; i < 600; i++) {
+        db_result_free(r);
+        r = NULL;
+        assert_int_equal(db_execute(udb, "SELECT state, COALESCE(result,''), COALESCE(error,'')"
+                                         " FROM jobs WHERE id = ?", (const char *[]){ id, NULL }, &r), 0);
+        if (r && r->nrows == 1 && strcmp(r->rows[0][0], "running") != 0 &&
+            strcmp(r->rows[0][0], "queued") != 0) break;
+        usleep(50000);
+    }
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    print_message("job %s: %s %s %s\n", id, r->rows[0][0], r->rows[0][1], r->rows[0][2]);
+    assert_string_equal(r->rows[0][0], "completed");
+    const char *res = r->rows[0][1];
+    assert_non_null(strstr(res, "\"warning\":"));
+    assert_non_null(strstr(res, "Unraid template not stored: " D "/tmpl/my-solo.xml/my-solo.xml"));
+    assert_non_null(strstr(res, "(ENOTDIR)"));
+    db_result_free(r);
+    r = NULL;
+    snprintf(q, sizeof(q), "SELECT result, message FROM journal WHERE operation = 'units'");
+    assert_int_equal(db_execute(udb, q, NULL, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "warning");
+    assert_non_null(strstr(r->rows[0][1], "my-solo.xml/my-solo.xml"));
+    assert_non_null(strstr(r->rows[0][1], "ENOTDIR"));
+    db_result_free(r);
+    job_manager_stop(jm);
+    routes_units_init(NULL, NULL);
 }
 
 static int zfs_snapshot_calls(void)
@@ -1483,6 +1639,8 @@ int main(void)
     signal(SIGPIPE, SIG_IGN);
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_template_not_a_directory, setup_template_not_a_dir, teardown),
+        cmocka_unit_test_setup_teardown(test_template_unreadable, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unit_probe, setup, teardown),
         cmocka_unit_test_setup_teardown(test_db_target, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nested_below_mount, setup, teardown),
@@ -1500,10 +1658,13 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define_copy_recorded_type, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_compose_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pause_read, setup_units, teardown_units),
+        cmocka_unit_test_setup_teardown(test_unreadable_template_job_completes_with_a_warning,
+                                        setup_units_template_not_a_dir, teardown_units),
         cmocka_unit_test_setup_teardown(test_scope_job, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_scope_group, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_pause_cap, setup_cap, teardown),
         cmocka_unit_test_setup_teardown(test_fallback_flagged, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unlisted_dataset_warns, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_failing_hook, setup_failing_hook, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_in_place_real, setup, teardown),

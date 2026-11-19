@@ -265,5 +265,40 @@ echo "the helper back: its start-up sweep finds nothing to do"
 start_helper
 leftovers "after the helper restarts"
 
+# B265: the helper's lease runs out between the snapshot and the read. The
+# daemon is stopped from the moment the snapshot is taken until the helper
+# has destroyed it, so the scan meets a source root that is gone. The job
+# used to fail with an empty error: ending the capture cleared it.
+echo "a lease lost before the read: the job fails naming the source"
+kill "$HELPER_PID"; wait "$HELPER_PID" 2>/dev/null; HELPER_PID=
+sed -i 's/^capture_max_s = .*/capture_max_s = 1/' "$WORK/policy.ini"
+start_helper
+cb sources set 1 "$S1" --snapshot "$S1" > /dev/null
+echo 2 > "$FSTATE/snapshot.sleep"
+OUT=$(cb backup 1 --no-wait)
+J=$(job_of "$OUT")
+for _ in $(seq 1 100); do [ -f "$FSTATE/snapshot.taken" ] && break; sleep 0.1; done
+kill -STOP "$DAEMON_PID"
+# Taken at the start of the 2 s take, so already past its 1 s lease when
+# the helper answers; its watchdog destroys it on the next tick.
+for _ in $(seq 1 200); do
+    [ ! -s "$FSTATE/snaps" ] && break
+    sleep 0.1
+done
+GONE=$([ -s "$FSTATE/snaps" ] && echo no || echo yes)
+kill -CONT "$DAEMON_PID"
+rm -f "$FSTATE/snapshot.sleep" "$FSTATE/snapshot.taken"
+check "the helper destroyed the snapshot while the daemon waited" yes "$GONE"
+for _ in $(seq 1 150); do
+    cb jobs "$J" | grep -Eq '"state":"(cancelled|completed|failed)"' && break
+    sleep 0.1
+done
+OUT=$(cb jobs "$J")
+contains "the job fails" '"state":"failed"' "$OUT"
+contains "naming the source that cannot be read" "source $S1 cannot be read from its snapshot" "$OUT"
+contains "and why the snapshot was gone" "capture_max_s lease ran out" "$OUT"
+contains "the journal has the same error" "source $S1 cannot be read" "$(cb journal 1 --result failed)"
+leftovers "after a lost lease"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

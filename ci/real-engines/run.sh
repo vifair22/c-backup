@@ -545,6 +545,13 @@ units:
   helper_socket: $HSOCK
 vm:
   export_dir: $DSTATE/exports
+  # Incrementals on (default 0), so the running VM's backup makes a
+  # checkpoint and a token, and the in-place restore in test_vm has one to
+  # retire (B251). With it off the online backup made none, and the retire
+  # path ran with nothing to do. test_vm is the only libvirt section; no
+  # other section reads this key. Its first session is a full read, so the
+  # byte-for-byte checks there hold either way.
+  incremental: 1
 EOF
 chmod 0600 "$DSTATE/config.yaml"
 chown -R "$DUID:$DUID" "$DSTATE" "$REPO" "$OUT"
@@ -965,6 +972,13 @@ check "its raw image is the original's bytes" "$VDA_SUM" "$(sha256sum < "$DOMS/r
 check "its qcow2 disk came back raw with the same contents" "$VDA_SUM" "$(sha256sum < "$DOMS/restored$VMD/vdb.qcow2" 2>/dev/null)"
 virsh -q -c "$VIRT_URI" undefine cbk-uat-vm2 >/dev/null 2>&1
 
+# B258: a target root it cannot write fails having written nothing, and
+# says that rather than telling the operator to remove what is not there.
+: > "$WORK/not-a-dir"
+OUT_N=$(cb unit restore 1 "$SNAP_VM" --define --name cbk-uat-vm3 --target-root "$WORK/not-a-dir/restored" 2>&1)
+contains "an unwritable target root fails saying nothing was written" "nothing was written under $WORK/not-a-dir/restored" "$OUT_N"
+lacks    "and not that something stays there" "stays there" "$OUT_N"
+
 log "libvirt: online (pull-mode backup of the running VM)"
 if virsh -q -c "$VIRT_URI" start cbk-uat-vm >"$WORK/vm-start.log" 2>&1; then
     check "the VM is running" running "$(virsh -q -c "$VIRT_URI" domstate cbk-uat-vm 2>/dev/null)"
@@ -982,10 +996,27 @@ if virsh -q -c "$VIRT_URI" start cbk-uat-vm >"$WORK/vm-start.log" 2>&1; then
     job_ok "files restore of the online snapshot" "$(cb unit restore 1 "$SNAP_VM2" "$R" 2>&1)"
     check "the raw disk read through the export is byte for byte" "$VDA_SUM" "$(sha256sum < "$R/.cbackup-unit/disks/vda" 2>/dev/null)"
     check "the qcow2 disk read through the export is its contents" "$VDA_SUM" "$(sha256sum < "$R/.cbackup-unit/disks/vdb" 2>/dev/null)"
+
+    # B251: the online backup left its checkpoint (vdb is qcow2) and a
+    # token; an in-place restore must retire both, or every later backup
+    # warns on the missing bitmap and virsh undefine is refused.
+    log "libvirt: in place over the shut-off domain"
+    check "the online backup left one checkpoint" 1 "$(virsh -q -c "$VIRT_URI" checkpoint-list --name cbk-uat-vm 2>/dev/null | grep -c .)"
+    contains "and a token" '"usable":true' "$(cb vm checkpoints 1 cbk-uat-vm 2>&1)"
+    OUT_R=$(cb unit restore 1 "$SNAP_VM2" --define --replace 2>&1)
+    job_ok "VM restore in place with define" "$OUT_R"
+    contains "it retires the domain's checkpoint" '"checkpoints_retired":1' "$OUT_R"
+    check "libvirt has no checkpoint left on the domain" 0 "$(virsh -q -c "$VIRT_URI" checkpoint-list --name cbk-uat-vm 2>/dev/null | grep -c .)"
+    lacks "nor does the daemon keep a token" '"checkpoint":' "$(cb vm checkpoints 1 cbk-uat-vm 2>&1)"
+    check "the replaced image is the snapshot's" "$VDA_SUM" "$(sha256sum < "$VMD/vda.img" 2>/dev/null)"
+    rm -f "$VMD"/*.cbackup-old-*
 else
     bad "the test VM starts ($VMTYPE)" "running" "$(tail -5 "$WORK/vm-start.log")"
 fi
-virsh -q -c "$VIRT_URI" undefine cbk-uat-vm >/dev/null 2>&1
+# No checkpoint of ours is left to refuse it (B251): a plain undefine.
+check "the domain undefines without --checkpoints-metadata" "" \
+      "$(virsh -q -c "$VIRT_URI" undefine cbk-uat-vm 2>&1 >/dev/null)"
+virsh -q -c "$VIRT_URI" undefine --checkpoints-metadata cbk-uat-vm >/dev/null 2>&1
 }
 test_vm
 

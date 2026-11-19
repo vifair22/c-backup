@@ -490,6 +490,10 @@ static api_response_t preview(const api_request_t *req, int64_t repo_id, const f
         cJSON_AddStringToObject(probe, "output", text ? text : "");
         cJSON_AddBoolToObject(probe, "truncated", cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "truncated")));
         verified = code == 0 && !tmo;
+        /* A probe refused for want of a credential says how to give one:
+         * a template never prompts (B248). */
+        const char *hint = verified || !text ? NULL : db_template_auth_hint(t, text, strlen(text));
+        if (hint) cJSON_AddStringToObject(probe, "credentials", hint);
     }
     /* Unverified still enables (7.3): the preview says so, nothing more. */
     cJSON_AddBoolToObject(o, "verified", verified);

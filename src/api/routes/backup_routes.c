@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "db_readers.h"
 #include "pack_presence.h"
 #include "json_row.h"
 
@@ -523,6 +524,16 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     /* The read is over, whatever its outcome (a cancel included): the
      * snapshots go now, before anything else. */
     src_snap_release(&ss);
+    /* A read that failed after the helper destroyed the snapshot says why
+     * the snapshot was gone, not only that a path was (B265). */
+    if (st != OK && ss.lease_lost) {
+        char *why = strdup(err_msg());
+        if (why) {
+            (void)set_error(st, "%s; the helper destroyed the source snapshot before the read ended "
+                            "(its capture_max_s lease ran out)", why);
+            free(why);
+        }
+    }
     char *ss_json = src_snap_result_json(&ss, cpaths);
     char *ss_warn = malloc(PATH_MAX * 4);
     if (ss_warn) src_snap_describe_live(&ss, cpaths, ss_warn, PATH_MAX * 4);
@@ -945,10 +956,12 @@ static api_response_t list_jobs(const api_request_t *req, void *ud)
     snprintf(lim, sizeof(lim), "%d", limit);
     snprintf(off, sizeof(off), "%d", offset);
 
-    db_result_t *r = NULL;
-    if (db_execute(ctx->db, JOB_COLUMNS " ORDER BY id DESC LIMIT ? OFFSET ?",
-                   (const char *[]){ lim, off, NULL }, &r) != 0) {
-        db_result_free(r);
+    /* On a reader (B269): a verify or a backup holding the shared
+     * connection kept GET /jobs waiting for minutes. */
+    db_rows_t *r = NULL;
+    if (db_read_rows(ctx->db, 0, JOB_COLUMNS " ORDER BY id DESC LIMIT ? OFFSET ?",
+                     (const char *[]){ lim, off, NULL }, &r) != 0) {
+        db_rows_free(r);
         return api_error(500, "cannot list jobs");
     }
     cJSON *root = cJSON_CreateObject();
@@ -957,7 +970,7 @@ static api_response_t list_jobs(const api_request_t *req, void *ud)
         cJSON *j = job_json(ctx->db, r->rows[i]);
         if (j) cJSON_AddItemToArray(arr, j);
     }
-    db_result_free(r);
+    db_rows_free(r);
     return json_out(root);
 }
 
@@ -1003,15 +1016,37 @@ static api_response_t get_job(const api_request_t *req, void *ud)
 
     char idbuf[32];
     snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
-    db_result_t *r = NULL;
-    if (db_execute(ctx->db, JOB_COLUMNS " WHERE id = ?",
-                   (const char *[]){ idbuf, NULL }, &r) != 0 || !r || r->nrows != 1) {
-        db_result_free(r);
+    /* On a reader (B269): GET /jobs/<id> waited over 120 s on FS1 behind
+     * a verify holding the shared connection. */
+    db_rows_t *r = NULL;
+    if (db_read_rows(ctx->db, 0, JOB_COLUMNS " WHERE id = ?",
+                     (const char *[]){ idbuf, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_rows_free(r);
         return api_error(404, "no such job");
     }
     cJSON *j = job_json(ctx->db, r->rows[0]);
-    db_result_free(r);
+    db_rows_free(r);
     return json_out(j);
+}
+
+/* For the router, when a cancel's body has a member it does not take
+ * (NIT-52): a job with no row is a 404 before the body's 400. A finished
+ * job's URL still names it, so its body error stays the 400. */
+static const char *jobs_missing_for_url(const char *url, api_method_t method, void *ud)
+{
+    (void)method;
+    backup_ctx_t *ctx = ud;
+    if (!ctx || !ctx->db) return NULL;   /* no database: no answer */
+    int64_t id = job_path_id(url);
+    if (id < 0) return NULL;
+    if (!jobs_allow_for_url(url, NULL)) return "not found";
+    char idbuf[32];
+    snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
+    db_result_t *r = NULL;
+    int found = db_execute(ctx->db, "SELECT 1 FROM jobs WHERE id = ?",
+                           (const char *[]){ idbuf, NULL }, &r) == 0 && r && r->nrows > 0;
+    db_result_free(r);
+    return found ? NULL : "no such job";
 }
 
 static api_response_t cancel_job(const api_request_t *req, void *ud)
@@ -1055,6 +1090,8 @@ int routes_register_jobs(api_server_t *srv, cutils_db_t *db, job_manager_t *jm)
     if (api_server_route(srv, "/jobs",    API_GET,  API_CLASS_NONE,  list_jobs,     &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/jobs/*",  API_GET,  API_CLASS_NONE,  get_job,       &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/jobs/*",  API_POST, API_COMMIT_ONLY, cancel_job,    &g_ctx) != 0) return -1;
+    if (api_server_route_keys(srv, "/jobs/*", API_POST, API_KEYS_NONE) != 0) return -1;
+    if (api_server_route_missing_fn(srv, "/jobs/*", jobs_missing_for_url, &g_ctx) != 0) return -1;
     if (api_server_route_allow(srv, "/jobs/*", jobs_allow_for_url, NULL) != 0) return -1;
     return 0;
 }

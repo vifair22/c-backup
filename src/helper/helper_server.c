@@ -117,6 +117,9 @@ typedef struct {
     int      err_fd;          /* the hook's stderr, for the log */
     time_t   deadline;
     int      done, status, timed_out;
+    int      cancelled;       /* hook.wait with kill: the daemon's job was cancelled (B248) */
+    int64_t  term_ms;         /* when SIGTERM went to its group, monotonic; 0 not yet */
+    int      killed;          /* and SIGKILL, HOOK_KILL_GRACE_S after */
     hooklog_t log;            /* stderr, head and tail kept (6.6) */
 } run_t;
 
@@ -1834,15 +1837,22 @@ static status_t hook_spawn(const helper_backend_t *b, const char *uid, const pol
     *pid = -1;
     *hr = NULL;
     if (b->hook_start) return b->hook_start(b->ctx, uid, h, out_fd, err_fd, hr);
+    /* A process group of its own, so a stop reaches whatever it started
+     * (B248), as lxc-attach's does. */
     posix_spawn_file_actions_t fa;
+    posix_spawnattr_t at;
     posix_spawn_file_actions_init(&fa);
+    posix_spawnattr_init(&at);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&at, 0);
     posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
     if (out_fd >= 0) posix_spawn_file_actions_adddup2(&fa, out_fd, 1);
     else posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
     posix_spawn_file_actions_adddup2(&fa, err_fd, 2);
-    int rc = by_path ? posix_spawnp(pid, h->argv[0], &fa, NULL, h->argv, environ)
-                     : posix_spawn(pid, h->argv[0], &fa, NULL, h->argv, environ);
+    int rc = by_path ? posix_spawnp(pid, h->argv[0], &fa, &at, h->argv, environ)
+                     : posix_spawn(pid, h->argv[0], &fa, &at, h->argv, environ);
     posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&at);
     if (rc != 0) return set_error(ERR_IO, "%s", strerror(rc));
     return OK;
 }
@@ -1912,7 +1922,7 @@ static char *op_hook_run(helper_server_t *s, const helper_req_t *r, int *pass_fd
     pthread_mutex_unlock(&s->mu);
     if (!slot) {
         if (hr) { b->hook_kill(hr); b->hook_free(hr); }
-        else { kill(pid, SIGKILL); waitpid(pid, NULL, 0); }
+        else { kill(-pid, SIGKILL); waitpid(pid, NULL, 0); }
         close(err[0]);
         if (dump) close(out[0]);
         return resp_error(r->id, HELPER_E_BUSY, "too many hook runs");
@@ -2025,7 +2035,7 @@ static char *op_db_probe(helper_server_t *s, const helper_req_t *r, int *pass_fd
         if (!done && time(NULL) >= deadline) {
             timed_out = 1;
             if (hr) b->hook_kill(hr);
-            else if (pid > 0) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); pid = -1; }
+            else if (pid > 0) { kill(-pid, SIGKILL); waitpid(pid, NULL, 0); pid = -1; }
             status = 128 + SIGKILL;
             done = 1;
         }
@@ -2082,49 +2092,76 @@ static void run_finish(run_t *x)
         waited_ms += 100;
     }
     char line[96];
-    if (x->timed_out)
+    if (x->cancelled)
+        snprintf(line, sizeof(line), "\n[c-backup: stopped, the job was cancelled; exit status %d]\n", x->status);
+    else if (x->timed_out)
         snprintf(line, sizeof(line), "\n[c-backup: killed at its timeout, exit status %d]\n", x->status);
     else
         snprintf(line, sizeof(line), "\n[c-backup: exit status %d]\n", x->status);
     (void)hooklog_append(&x->log, line, strlen(line));
 }
 
-/* Reap a run if it ended; kill it if it is past its deadline. Caller
- * holds mu. */
+static int64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* One signal to a run's whole process group. */
+static void run_signal(run_t *x, int sig)
+{
+    if (x->hr) {
+        if (x->b->hook_signal) x->b->hook_signal(x->hr, sig);
+        else if (sig == SIGKILL) x->b->hook_kill(x->hr);
+        return;
+    }
+    /* Its own group (hook_spawn): never the bare pid, which may be reaped
+     * and reused by now. */
+    if (x->pid > 0) kill(-x->pid, sig);
+}
+
+/*
+ * Reap a run if it ended. One past its deadline, or cancelled, is stopped:
+ * SIGTERM to its process group, SIGKILL HOOK_KILL_GRACE_S later, each
+ * sent from here as the polls come rather than waited out, so nothing
+ * holds mu through a grace period (B248). Caller holds mu.
+ */
 static void run_poll(run_t *x, time_t now)
 {
     if (x->done) return;
     run_drain(x);
-    int st = 0;
+    int ended = 0, code = 0;
     if (x->hr) {
-        int code = 0;
-        if (x->b->hook_poll(x->hr, &code)) {
-            x->done = 1;
-            x->status = code;
-            run_finish(x);
-        } else if (now >= x->deadline) {
-            x->b->hook_kill(x->hr);
-            x->done = 1;
-            x->timed_out = 1;
-            x->status = 128 + SIGKILL;
-            run_finish(x);
+        ended = x->b->hook_poll(x->hr, &code);
+    } else {
+        int st = 0;
+        if (waitpid(x->pid, &st, WNOHANG) == x->pid) {
+            ended = 1;
+            code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
         }
-        return;
     }
-    pid_t p = waitpid(x->pid, &st, WNOHANG);
-    if (p == x->pid) {
+    if (ended) {
+        /* A stopped run's leader can die of the SIGTERM and leave a member
+         * that ignores it; the run is over, so the rest of its group goes
+         * now rather than outliving it. */
+        if (x->term_ms && !x->killed) {
+            run_signal(x, SIGKILL);
+            x->killed = 1;
+        }
         x->done = 1;
-        x->status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+        x->status = code;
         run_finish(x);
         return;
     }
-    if (now >= x->deadline) {
-        kill(x->pid, SIGKILL);
-        waitpid(x->pid, &st, 0);
-        x->done = 1;
-        x->timed_out = 1;
-        x->status = 128 + SIGKILL;
-        run_finish(x);
+    if (!x->term_ms && (x->cancelled || now >= x->deadline)) {
+        if (!x->cancelled) x->timed_out = 1;
+        run_signal(x, SIGTERM);
+        int64_t t = mono_ms();
+        x->term_ms = t > 0 ? t : 1;
+    } else if (x->term_ms && !x->killed && mono_ms() - x->term_ms >= (int64_t)HOOK_KILL_GRACE_S * 1000) {
+        run_signal(x, SIGKILL);
+        x->killed = 1;
     }
 }
 
@@ -2139,7 +2176,16 @@ static char *op_hook_wait(helper_server_t *s, const helper_req_t *r, int *pass_f
             pthread_mutex_unlock(&s->mu);
             return resp_error(r->id, HELPER_E_INVALID, "no such run");
         }
+        /* kill: the daemon's job was cancelled; stop the run and answer
+         * as for any other end (B248). */
+        if (r->kill) x->cancelled = 1;
         run_poll(x, time(NULL));
+        /* A plain wait the daemon left when it sent the kill must not take
+         * the run's answer from the wait that did. */
+        if (x->done && x->cancelled && !r->kill) {
+            pthread_mutex_unlock(&s->mu);
+            return resp_error(r->id, HELPER_E_INVALID, "the run was stopped by a cancel; its answer is the kill's");
+        }
         if (x->done) {
             /* The whole log, up to 1 MiB, in a sealed memfd; a tail of it
              * inline for messages. */
@@ -2156,6 +2202,7 @@ static char *op_hook_wait(helper_server_t *s, const helper_req_t *r, int *pass_f
             if (res) {
                 cJSON_AddNumberToObject(res, "exit", x->status);
                 cJSON_AddBoolToObject(res, "timed_out", x->timed_out);
+                cJSON_AddBoolToObject(res, "cancelled", x->cancelled);
                 cJSON_AddStringToObject(res, "log", txt ? txt + (len > 1024 ? len - 1024 : 0) : "");
                 if (lfd >= 0) cJSON_AddNumberToObject(res, "log_bytes", (double)len);
             }
@@ -3787,7 +3834,7 @@ void helper_server_stop(helper_server_t *s)
                 if (!s->runs[i].done) s->runs[i].b->hook_kill(s->runs[i].hr);
                 s->runs[i].b->hook_free(s->runs[i].hr);
             } else if (!s->runs[i].done) {
-                kill(s->runs[i].pid, SIGKILL);
+                kill(-s->runs[i].pid, SIGKILL);
                 waitpid(s->runs[i].pid, NULL, 0);
             }
             close(s->runs[i].err_fd);

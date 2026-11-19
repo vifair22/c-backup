@@ -424,6 +424,10 @@ static status_t rc_put(void *ctx, uint8_t type, const void *data, size_t len,
     if (st != OK) return st;
     out->is_new = is_new;
     out->phys_bytes = stored;
+    /* Every put is a question the target answers (it stores the object
+     * only when it lacks it), so it is counted as one: a re-chunking run
+     * reported objects_asked 0 beside a hundred sent (B262). */
+    r->res->objects_asked++;
     /* What reached the target, counted as a copying run counts it: a
      * re-chunking run reported 0 sent while the replica gained every
      * object (B135). */

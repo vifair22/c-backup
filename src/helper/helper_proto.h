@@ -49,6 +49,11 @@ const char *helper_err_name(helper_err_t e);
 int         helper_err_parse(const char *name, helper_err_t *out);
 
 /* The complete operation list for 1.0 (11.3). Anything else is denied. */
+/* A hook being stopped (a timeout, a job's cancel) gets SIGTERM, then
+ * SIGKILL this long after: long enough for a dump tool to close its
+ * connection, short enough that a cancel ends the job promptly (B248). */
+#define HOOK_KILL_GRACE_S 3
+
 typedef enum {
     HOP_HELLO = 0,
     HOP_UNITS_LIST,
@@ -112,6 +117,7 @@ typedef struct {
     /* capture.begin_paths */
     char       *paths[HELPER_PATHS_MAX];
     size_t      n_paths;
+    int         kill;        /* hook.wait: stop the run first (B248) */
     /* tokens: capture, run, session, staging */
     char        token[HELPER_TOKEN_HEX + 1];
     /* hook.run: a policy hook by name, or a database template */

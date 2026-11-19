@@ -7,6 +7,7 @@
 #include "repo.h"
 #include "routes.h"   /* journal_record */
 #include "db_write.h"
+#include "db_readers.h"
 #include "store.h"
 
 #include <cutils/log.h>
@@ -195,12 +196,12 @@ static status_t find_strays(cutils_db_t *db, const char *repo, char (*missing)[2
 
 static int get_state(cutils_db_t *db, const char *repo, const char *key, char *out, size_t n)
 {
-    db_result_t *r = NULL;
-    int found = db_execute(db,
+    db_rows_t *r = NULL;
+    int found = db_read_rows(db, 0,
             "SELECT COALESCE(value, '') FROM recovery_state WHERE repo_id = ? AND key = ?",
             (const char *[]){ repo, key, NULL }, &r) == 0 && r && r->nrows == 1;
     if (found && out && n) snprintf(out, n, "%s", r->rows[0][0]);
-    db_result_free(r);
+    db_rows_free(r);
     return found;
 }
 
@@ -234,17 +235,17 @@ typedef struct {
 
 static status_t repo_root_of(cutils_db_t *db, const char *repo, probe_t *p)
 {
-    db_result_t *r = NULL;
-    if (db_execute(db, "SELECT path, uuid FROM repos WHERE id = ?",
-                   (const char *[]){ repo, NULL }, &r) != 0 || !r || r->nrows != 1) {
-        db_result_free(r);
+    db_rows_t *r = NULL;
+    if (db_read_rows(db, 0, "SELECT path, uuid FROM repos WHERE id = ?",
+                     (const char *[]){ repo, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_rows_free(r);
         return set_error(ERR_NOT_FOUND, "pack presence: no repository %s", repo);
     }
     int toolong = snprintf(p->root, sizeof(p->root), "%s", r->rows[0][0]) >= (int)sizeof(p->root) ||
                   snprintf(p->uuid, sizeof(p->uuid), "%s", r->rows[0][1]) >= (int)sizeof(p->uuid) ||
                   snprintf(p->packs_dir, sizeof(p->packs_dir), "%s/packs", p->root) >=
                       (int)sizeof(p->packs_dir);
-    db_result_free(r);
+    db_rows_free(r);
     if (toolong) return set_error(ERR_INVALID, "pack presence: path too long");
     return OK;
 }
@@ -255,10 +256,12 @@ static status_t count_missing(cutils_db_t *db, const char *repo, const char *roo
                               int stop_at_present, uint32_t *total, uint32_t *missing,
                               int *any_present)
 {
-    db_result_t *r = NULL;
-    if (db_execute(db, "SELECT id FROM packs WHERE repo_id = ? ORDER BY id DESC",
-                   (const char *[]){ repo, NULL }, &r) != 0) {
-        db_result_free(r);
+    /* Read on a reader (B269): GET /repos probes every repository, and on
+     * the shared connection each probe waited for whoever held it. */
+    db_rows_t *r = NULL;
+    if (db_read_rows(db, 0, "SELECT id FROM packs WHERE repo_id = ? ORDER BY id DESC",
+                     (const char *[]){ repo, NULL }, &r) != 0) {
+        db_rows_free(r);
         return set_error(ERR_IO, "pack presence: cannot list packs");
     }
     *total = r ? (uint32_t)r->nrows : 0;
@@ -275,7 +278,7 @@ static status_t count_missing(cutils_db_t *db, const char *repo, const char *roo
         *any_present = 1;
         if (stop_at_present) break;
     }
-    db_result_free(r);
+    db_rows_free(r);
     return OK;
 }
 

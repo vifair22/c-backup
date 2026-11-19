@@ -107,6 +107,21 @@ void     dbt_argv_free(dbt_argv_t *a);
 /* The argv as a JSON array of strings (previews); NULL on allocation failure. */
 cJSON   *dbt_argv_json(const dbt_argv_t *a);
 
+/*
+ * A template never prompts (B248): a credential it cannot find fails it at
+ * once. Its scripts print a line starting with DBT_NO_CREDENTIAL when they
+ * see one missing themselves.
+ */
+#define DBT_NO_CREDENTIAL "c-backup: no credential:"
+
+/*
+ * When a failed run's output (its log, len bytes, not NUL-terminated) says
+ * it could not authenticate, how to give the template's engine its
+ * credential, one static sentence; NULL when it does not, or the engine
+ * has no credential to give.
+ */
+const char *db_template_auth_hint(const db_template_t *t, const char *log, size_t len);
+
 /* The default allow list, as "a, b, c": what a policy without
  * [db] allow_templates allows. Static. */
 const char *db_template_default_allow(void);

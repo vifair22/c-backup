@@ -11,7 +11,8 @@
  * it, the evidence as the JSON object it is, and the history columns
  * (first_seen, last_seen, last_snap_id, alerted_at) and the decision
  * columns enabling and dismissing fill (template, params, decided_by,
- * decided_at, reason). Run detection without a backup with
+ * decided_at, reason). One finding also carries its history: the journal
+ * entries about it (B254). Run detection without a backup with
  * POST /repos/<id>/units/<p>/<u>/detect (units.c). The writes on findings
  * (preview, enable, dismiss) are D2's and live in their own route file.
  */
@@ -218,6 +219,51 @@ static api_response_t db_list(const api_request_t *req, int64_t repo_id)
     return json_out(root);
 }
 
+/*
+ * A finding's history (7.4, B254): the journal entries about it, newest
+ * first, at most FINDING_HISTORY_MAX. Every event names its finding the
+ * same two ways: detection's "... (finding N)" (found, coverage changed,
+ * and the one alert, which comes through the job's warning) and the
+ * decisions' "finding N (...". The journal is the permanent record, so the
+ * history is read from it rather than kept twice; nothing before the
+ * finding was first seen can be about it, which bounds the read to the
+ * (repo_id, ts) index.
+ */
+#define FINDING_HISTORY_MAX 50
+
+static int add_history(cJSON *o, const char *repo, const char *id, const char *first_seen)
+{
+    char in_text[48], leading[48], lim[16];
+    snprintf(in_text, sizeof(in_text), "%%(finding %s)%%", id);
+    snprintf(leading, sizeof(leading), "finding %s (%%", id);
+    snprintf(lim, sizeof(lim), "%d", FINDING_HISTORY_MAX + 1);
+    db_result_t *r = NULL;
+    if (db_execute(g_db, "SELECT id, ts, source, operation, result, COALESCE(message, '') FROM journal"
+                         " WHERE repo_id = ? AND ts >= ? AND (message LIKE ? OR message LIKE ?)"
+                         " ORDER BY id DESC LIMIT ?",
+                   (const char *[]){ repo, first_seen, in_text, leading, lim, NULL }, &r) != 0) {
+        db_result_free(r);
+        return -1;
+    }
+    cJSON *h = cJSON_AddArrayToObject(o, "history");
+    int n = r ? r->nrows : 0;
+    for (int i = 0; h && i < n && i < FINDING_HISTORY_MAX; i++) {
+        char *const *row = r->rows[i];
+        cJSON *e = cJSON_CreateObject();
+        if (!e) break;
+        cJSON_AddNumberToObject(e, "journal_id", (double)strtoll(row[0], NULL, 10));
+        cJSON_AddNumberToObject(e, "ts", (double)strtoll(row[1], NULL, 10));
+        cJSON_AddStringToObject(e, "source", row[2]);
+        cJSON_AddStringToObject(e, "operation", row[3]);
+        cJSON_AddStringToObject(e, "result", row[4]);
+        cJSON_AddStringToObject(e, "message", row[5]);
+        cJSON_AddItemToArray(h, e);
+    }
+    cJSON_AddBoolToObject(o, "history_truncated", n > FINDING_HISTORY_MAX);
+    db_result_free(r);
+    return h ? 0 : -1;
+}
+
 static api_response_t db_one(int64_t repo_id, int64_t fid)
 {
     char repo[32], id[32];
@@ -234,7 +280,13 @@ static api_response_t db_one(int64_t repo_id, int64_t fid)
         return api_error(404, "no such database finding in this repository");
     }
     cJSON *o = finding_json(r->rows[0]);
+    char first[32];
+    snprintf(first, sizeof(first), "%s", r->rows[0][13]);
     db_result_free(r);
+    if (o && add_history(o, repo, id, first) != 0) {
+        cJSON_Delete(o);
+        return api_error(500, "cannot read the finding's history");
+    }
     return json_out(o);
 }
 

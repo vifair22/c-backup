@@ -1602,31 +1602,55 @@ static void test_replicate_same_key_copies(void **state)
 }
 
 
-/* Where a copy of hash sits other than in pack `not`: its pack and index. */
+/* Every copy of one hash: its pack, position and offset. */
 typedef struct {
     const uint8_t *hash;
-    uint32_t       not_pack, cur, found_pack, found_index;
-    int            found;
-    uint64_t       found_offset;
-} copy_find_t;
+    uint32_t       cur, n;
+    uint32_t       pack[8], index[8];
+    uint64_t       offset[8];
+} copy_list_t;
 
-static void copy_find_entry(const pack_entry_info_t *info, void *ctx)
+static void copy_list_entry(const pack_entry_info_t *info, void *ctx)
 {
-    copy_find_t *f = ctx;
-    if (f->cur == f->not_pack || memcmp(info->hash, f->hash, OBJECT_HASH_SIZE) != 0) return;
-    f->found = 1;
-    f->found_pack = f->cur;
-    f->found_index = info->entry_index;
-    f->found_offset = info->entry_offset;
+    copy_list_t *l = ctx;
+    if (memcmp(info->hash, l->hash, OBJECT_HASH_SIZE) != 0) return;
+    assert_true(l->n < 8);
+    l->pack[l->n] = l->cur;
+    l->index[l->n] = info->entry_index;
+    l->offset[l->n] = info->entry_offset;
+    l->n++;
 }
 
-static void copy_find_pack(uint32_t num, void *ctx)
+static void copy_list_pack(uint32_t num, void *ctx)
 {
-    copy_find_t *f = ctx;
+    copy_list_t *l = ctx;
     char name[64];
     snprintf(name, sizeof(name), "pack-%010u.dat", num);
-    f->cur = num;
-    (void)pack_enumerate_dat(store, name, NULL, NULL, copy_find_entry, f);
+    l->cur = num;
+    (void)pack_enumerate_dat(store, name, NULL, NULL, copy_list_entry, l);
+}
+
+/* Read hash's stored bytes from wherever the index names and stage them. */
+static void stage_copy(pack_stored_writer_t *w, const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    object_stored_info_t info;
+    void *payload = NULL;
+    size_t len = 0;
+    int damaged = 0;
+    assert_int_equal(object_read_stored(store, hash, &info, &payload, &len, &damaged), OK);
+    assert_int_equal(damaged, 0);
+    assert_int_equal(pack_stored_add(w, hash, info.type, info.compression, info.encryption,
+                                     info.uncompressed_size, payload, len), OK);
+    free(payload);
+}
+
+static void hash_from_hex(const char *hex, uint8_t hash[OBJECT_HASH_SIZE])
+{
+    for (int k = 0; k < OBJECT_HASH_SIZE; k++) {
+        unsigned v = 0;
+        assert_int_equal(sscanf(hex + k * 2, "%2x", &v), 1);
+        hash[k] = (uint8_t)v;
+    }
 }
 
 /*
@@ -1636,6 +1660,14 @@ static void copy_find_pack(uint32_t num, void *ctx)
  * was never proven, the row stayed on the damaged copy until a rewrite
  * happened to carry the good one, and the move was neither made nor
  * counted (B138).
+ *
+ * Where the backup put one.bin in its pack cannot be the deep copy: the
+ * scan walks a directory in inode order (scan_dirent_cmp), and on a busy
+ * filesystem one.bin, created last, can still take the lowest inode and
+ * the first entry (FLAKE-32). So the deep copy is planted here, behind the
+ * six other files' objects, a second copy is planted alone for the index
+ * to name and is ruined, and the backup's own copy is ruined too, so the
+ * planted deep one is the only copy gc can prove.
  */
 static void test_gc_repoints_to_a_copy_deep_in_its_pack(void **state)
 {
@@ -1647,15 +1679,61 @@ static void test_gc_repoints_to_a_copy_deep_in_its_pack(void **state)
         write_buf(p, d, 40 * 1024);
         free(d);
     }
+    uint8_t *one = rand_buf(300 * 1024, 4610);
+    write_buf(TEST_SRC "/one.bin", one, 300 * 1024);
+    free(one);
+    backup_result_t r = backup(1);
+    (void)r;
+
+    db_result_t *q = NULL;
+    assert_int_equal(db_execute(db, "SELECT name, content_hash FROM nodes"
+                                    " WHERE name LIKE '%.bin' ORDER BY name",
+                                NULL, &q), 0);
+    assert_int_equal(q->nrows, 7);
     uint8_t hash[OBJECT_HASH_SIZE];
+    uint8_t fill[6][OBJECT_HASH_SIZE];
+    int nfill = 0;
+    for (int i = 0; i < 7; i++) {
+        if (!strcmp(q->rows[i][0], "one.bin")) hash_from_hex(q->rows[i][1], hash);
+        else if (nfill < 6) hash_from_hex(q->rows[i][1], fill[nfill++]);
+    }
+    assert_int_equal(nfill, 6);
+    db_result_free(q);
+
+    /* The deep copy: one.bin's object after the other six. */
+    pack_stored_writer_t *w = NULL;
+    assert_int_equal(pack_stored_open(store, &w), OK);
+    uint32_t deep_pack = pack_stored_pack_num(w);
+    for (int i = 0; i < 6; i++) stage_copy(w, fill[i]);
+    stage_copy(w, hash);
+    assert_int_equal(pack_stored_finish(w, NULL), OK);
+    /* And the copy the index will name, alone in its pack. */
+    assert_int_equal(pack_stored_open(store, &w), OK);
+    stage_copy(w, hash);
+    assert_int_equal(pack_stored_finish(w, NULL), OK);
+
     uint32_t pnum = 0;
     uint64_t off = 0;
-    plant_duplicate(hash, &pnum, &off);
-    copy_find_t f = { hash, pnum, 0, 0, 0, 0, 0 };
-    assert_int_equal(pack_list(store, copy_find_pack, &f), OK);
-    assert_true(f.found);
-    assert_true(f.found_index > 0);
-    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+    assert_int_equal(pack_resolve_location(store, hash, &pnum, &off), OK);
+    assert_true(pnum != deep_pack);
+    copy_list_t l;
+    memset(&l, 0, sizeof(l));
+    l.hash = hash;
+    assert_int_equal(pack_list(store, copy_list_pack, &l), OK);
+    assert_int_equal(l.n, 3);
+    uint64_t deep_off = 0;
+    int deep_seen = 0;
+    for (uint32_t i = 0; i < l.n; i++) {
+        if (l.pack[i] == deep_pack) {
+            assert_int_equal(l.index[i], 6);
+            deep_off = l.offset[i];
+            deep_seen = 1;
+        } else {
+            /* The indexed copy and the backup's: neither can be proven. */
+            ruin(l.pack[i], l.offset[i] + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+        }
+    }
+    assert_true(deep_seen);
 
     gc_result_t g;
     memset(&g, 0, sizeof(g));
@@ -1664,7 +1742,8 @@ static void test_gc_repoints_to_a_copy_deep_in_its_pack(void **state)
     uint32_t p2 = 0;
     uint64_t o2 = 0;
     assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
-    assert_true(p2 != pnum);
+    assert_true(p2 == deep_pack);
+    assert_true(o2 == deep_off);
     restore_and_diff(latest_snapshot());
 }
 
@@ -1774,11 +1853,13 @@ static void test_verify_duplicate_damaged_too_is_loss(void **state)
     uint32_t pnum = 0;
     uint64_t off = 0;
     plant_duplicate(hash, &pnum, &off);
-    copy_find_t f = { hash, pnum, 0, 0, 0, 0, 0 };
-    assert_int_equal(pack_list(store, copy_find_pack, &f), OK);
-    assert_true(f.found);
-    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
-    ruin(f.found_pack, f.found_offset + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+    copy_list_t l;
+    memset(&l, 0, sizeof(l));
+    l.hash = hash;
+    assert_int_equal(pack_list(store, copy_list_pack, &l), OK);
+    assert_int_equal(l.n, 2);
+    for (uint32_t i = 0; i < l.n; i++)
+        ruin(l.pack[i], l.offset[i] + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
 
     for (int repair = 0; repair < 2; repair++) {
         verify_result_t v;

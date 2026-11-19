@@ -5,6 +5,8 @@
 #include <cutils/config.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <sys/types.h>
+#include <time.h>
 #include "error.h"
 #include "backup.h"
 
@@ -123,6 +125,10 @@ api_response_t    db_actions_route_post(const api_request_t *req, int64_t repo_i
 /* The /repos/<id> path tables, whole, for the test that holds every write
  * in them to a durability class (tests/test_route_classes.c). */
 const api_path_t *routes_repo_paths(size_t *n);
+/* The body members a write to a /repos/<id> path table sample accepts
+ * (B239): a NULL-terminated list, API_KEYS_NONE, API_KEYS_HANDLER, or NULL
+ * when nothing is declared for it. */
+const char *const *routes_repo_keys(const char *sample, api_method_t method);
 const api_path_t *routes_units_paths(size_t *n);
 api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const char *rest);
 api_response_t units_route_put(const api_request_t *req, int64_t repo_id, const char *rest);
@@ -286,6 +292,12 @@ int routes_register_metrics(api_server_t *srv, cutils_db_t *db);
 
 /* SSE progress stream for one job. */
 int routes_register_stream(api_server_t *srv, cutils_db_t *db);
+/* For tests: /jobs/stream/<id>'s reader without a server, and the clock
+ * its heartbeat reads (NULL restores the real one). */
+void   *job_stream_open_for_test(cutils_db_t *db, int64_t job_id);
+ssize_t job_stream_read_for_test(void *st, char *buf, size_t max);
+void    job_stream_close_for_test(void *st);
+void    job_stream_set_test_clock(time_t (*now)(void));
 
 /* Introspection: objects, packs, statistics, diff. Repo-scoped sub-handlers
  * dispatched from repos.c, like the snapshot and metadata ones. */

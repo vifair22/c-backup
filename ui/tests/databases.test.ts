@@ -15,7 +15,7 @@ import {
   parseScope, scopeTitle, groupByScope, uncoveredByScope, coverageSeverity, needsAttention,
   coverageLabel, coverageWords, engineTitle, suggestionTitle, suggestionTradeoff,
   evidenceLines, compact, methodLabel, SUGGESTIONS, ENGINES,
-  canAct, policyRefusal, reasonProblem, argvLine,
+  canAct, policyLineOf, ApiRefusal, reasonProblem, argvLine,
 } from '../src/shared/databases.ts'
 import type { WireDbFinding } from '../src/shared/wire.ts'
 
@@ -167,12 +167,20 @@ test('actions are offered only on a finding with data that is not dismissed', ()
   assert.equal(canAct(finding({ state: 'dismissed' })), false)
 })
 
-test('the policy line is recovered from the enable refusal, and nothing else is', () => {
+test('the policy line is read from the refusal\'s field, never its message (B240)', () => {
   const line = '[db] allow_templates = redis-rdb, pg-dumpall'
-  const r = policyRefusal(`template pg-dumpall is not allowed by the helper's policy; add it there first: ${line}`)
-  assert.deepEqual(r, { error: "template pg-dumpall is not allowed by the helper's policy", policyLine: line })
-  assert.equal(policyRefusal('no such finding'), null)
-  assert.equal(policyRefusal('add it there first: '), null)
+  assert.equal(policyLineOf({ error: 'anything at all, reworded', policy_line: line }), line)
+  /* The message alone is not enough any more: it is free to change. */
+  assert.equal(policyLineOf({ error: `add it there first: ${line}` }), null)
+  assert.equal(policyLineOf({ error: 'x', policy_line: '  ' }), null)
+  assert.equal(policyLineOf({ error: 'x', policy_line: 7 }), null)
+  assert.equal(policyLineOf(null), null)
+  assert.equal(policyLineOf('text'), null)
+  const r = new ApiRefusal('refused', 409, { policy_line: line })
+  assert.ok(r instanceof Error)
+  assert.equal(r.message, 'refused')
+  assert.equal(r.status, 409)
+  assert.equal(policyLineOf(r.body), line)
 })
 
 test('a dismiss reason follows the route: 1 to 512 bytes, no control characters', () => {

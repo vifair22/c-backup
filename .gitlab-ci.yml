@@ -109,6 +109,56 @@ test:
     paths:
       - build/bins/
 
+# The hygiene gates (HYGIENE-1), in the first stage beside test so they add
+# no wall time: the file-size ratchet, the src/ layout check, the gates' own
+# self-tests (each must fail when it should), and clang-tidy against its
+# baseline. clang-tidy parses the sources rather than building them, so it
+# needs the headers but not a build: c-utils is cloned for its include/ and
+# not compiled. In an MR pipeline it checks only the .c files the MR changes
+# against its target (a header, .clang-tidy or baseline change runs it in
+# full); branch pipelines run it in full, about 90 s of six cores.
+lint:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+  stage: test
+  image: debian:trixie
+  tags: [docker]
+  variables:
+    # Deep enough that the MR's target commit is present for the diff. If it
+    # is not, the gate says so and runs in full rather than skipping.
+    GIT_DEPTH: "50"
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends
+        make gcc git ca-certificates pkg-config python3 clang-tidy
+        libssl-dev liblz4-dev libacl1-dev libsqlite3-dev
+        libmicrohttpd-dev libcurl4-openssl-dev libcmocka-dev
+        libvirt-dev libxml2-dev
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - |
+      for delay in 5 15 45 0; do
+        rm -rf "$CUTILS_DIR"
+        git clone -q https://git.airies.net/vifair22/c-utils.git "$CUTILS_DIR" && break
+        [ "$delay" -eq 0 ] && { echo "c-utils clone failed after 4 tries"; exit 1; }
+        echo "c-utils clone failed; retrying in ${delay}s"; sleep "$delay"
+      done
+    - git -C "$CUTILS_DIR" checkout -q "$(tr -d '[:space:]' < cutils_version)"
+  script:
+    - make size-check
+    - make layout-check
+    - mkdir -p "$C_BACKUP_TEST_DIR"
+    - TIDY_REQUIRED=1 make test-hygiene
+    - |
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        # Merged-results pipelines have the target's tip; plain MR
+        # pipelines only the merge base.
+        make tidy TIDY_CHANGED_FROM="${CI_MERGE_REQUEST_TARGET_BRANCH_SHA:-$CI_MERGE_REQUEST_DIFF_BASE_SHA}"
+      else
+        make tidy
+      fi
+
 analyze:
   rules:
     # Gate jobs: every MR and branch pipeline, never the nightly schedule.
@@ -126,6 +176,33 @@ analyze:
     # threads get 2-8 MiB stacks, so a function that quietly grows past the
     # limit is a crash waiting for a deep enough tree.
     - make analyze
+
+# Edit latency during a backup (B232, B233, B222): PUT sources timed every
+# 0.2 s while a first backup runs, on a modelled slow device
+# (bench/slow_dev.c) - no real sync, a few hundred MiB of scratch. Before
+# B232 the backup held the write lock across pack writeback and p99 was
+# about 1.3 s here (17-22 s on FS2); with it, about 50 ms. The bound is far
+# from both, so CPU noise on a shared runner does not decide it.
+edit-latency:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+  stage: analyze
+  image: debian:trixie
+  tags: [docker]
+  timeout: 20m
+  before_script:
+    - *debian_deps
+    - *fetch_cutils
+  script:
+    - mkdir -p "$C_BACKUP_TEST_DIR"
+    - make bench-edit-latency BOUND_MS=600 OUT=build/edit-latency
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - build/edit-latency/
 
 # Fuzzing, on a budget a pipeline can afford.
 #
@@ -515,6 +592,9 @@ build:image:
     - docker ps --filter name=smoke --filter status=running | grep -q smoke
     - docker logs smoke
     - docker rm -f smoke
+    # B244: and started the hardened way, read-only with no /tmp.
+    - apk add --no-cache bash sqlite >/dev/null
+    - tests/image_readonly_check.sh "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_JOB_ID"
     - retry registry_login
     - retry docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
   only:
@@ -533,7 +613,8 @@ build:image:check:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
-        paths: [Makefile, Dockerfile, .dockerignore, cutils_version, .gitlab-ci.yml, packaging/**/*]
+        paths: [Makefile, Dockerfile, .dockerignore, cutils_version, .gitlab-ci.yml, packaging/**/*,
+                migrations/**/*, tests/image_readonly_check.sh, tests/fixtures/**/*]
   variables:
     CHECK_TAG: cbackup-mrcheck:$CI_PIPELINE_ID
   script:
@@ -544,6 +625,11 @@ build:image:check:
     - sleep 5
     - docker ps --filter "name=smoke-$CI_JOB_ID" --filter status=running | grep -q "smoke-$CI_JOB_ID"
     - docker logs "smoke-$CI_JOB_ID"
+    # B244: Manual 22.2.1's hardened run, a read-only root and no /tmp, on
+    # fresh state and on a database at migration 008. Migration 009 needs
+    # SQLite temporaries, and M10 could not start that way.
+    - apk add --no-cache bash sqlite >/dev/null
+    - tests/image_readonly_check.sh "$CHECK_TAG" "$CI_JOB_ID"
   after_script:
     - docker rm -f "smoke-$CI_JOB_ID" >/dev/null 2>&1 || true
     - docker rmi "cbackup-mrcheck:$CI_PIPELINE_ID" >/dev/null 2>&1 || true

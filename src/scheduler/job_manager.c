@@ -182,79 +182,159 @@ static int journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
 }
 
 /*
- * Backups the last process left running whose snapshot it had named
- * (job_note_snapshot), and what the repository says about each (B238).
+ * Jobs the last process left running that had named the snapshots they
+ * were writing (job_note_snapshot), and what the repository says about each
+ * (B238 for a backup, B267 for a unit job's one snapshot per unit).
  *
- * A backup's end used to be a commit made after its snapshot record, and a
+ * A job's end used to be a commit made after its snapshot records, and a
  * power cut between the two, or in the second before the commit was synced,
  * brought the job back "failed: interrupted by daemon restart" with its
- * snapshot complete in the repository; the retry an operator naturally
- * makes took a second snapshot of the same data. The repository is the
- * source of truth: a record under snapshots/ is a whole snapshot (it is
- * renamed in only after its trees and packs are durable, and synced), so
- * the job that wrote it completed. The index catches up separately: start-up
- * reconcile indexes any record the index lacks.
+ * snapshots complete in the repository; the retry an operator naturally
+ * makes took a second copy of each. The repository is the source of truth:
+ * a record under snapshots/ is a whole snapshot (it is renamed in only after
+ * its trees and packs are durable, and synced). So a job whose every noted
+ * snapshot is there, as many as it meant to write (snapshots_expected),
+ * completed. One with only some of them did not finish, and says which it
+ * did write, so nobody retries blind. The index catches up separately:
+ * start-up reconcile indexes any record the index lacks.
  *
  * Looked at before the transaction that closes the interrupted jobs, so no
  * filesystem call runs holding the write lock: a repository on a hung
  * mount would otherwise hold up every writer in the daemon.
  */
 typedef struct {
-    int64_t job_id, snap_id;
-    int     found;            /* the record is there */
-    char    why[512];         /* not found: why it could not be looked at */
-} ended_backup_t;
+    int64_t  job_id;
+    int64_t  expected;        /* <= 0: the job could not have completed */
+    int64_t *ids;             /* noted, ascending */
+    int     *found;           /* per id: the record is there */
+    size_t   n, nfound;
+    char     why[512];        /* a record that could not be looked at, and why */
+} ended_job_t;
 
-static ended_backup_t *find_ended_backups(cutils_db_t *db, int *out_n)
+static void ended_free(ended_job_t *v, int n)
+{
+    for (int i = 0; v && i < n; i++) {
+        free(v[i].ids);
+        free(v[i].found);
+    }
+    free(v);
+}
+
+/* The record for one id, looked up as find_ended_jobs describes. */
+static void look_for_record(const char *repo_path, ended_job_t *b, size_t k)
+{
+    char dir[PATH_MAX], rec[PATH_MAX];
+    struct stat sb;
+    if (snprintf(dir, sizeof(dir), "%s/snapshots", repo_path) >= (int)sizeof(dir) ||
+        snprintf(rec, sizeof(rec), "%s/%lld", dir, (long long)b->ids[k]) >= (int)sizeof(rec)) {
+        snprintf(b->why, sizeof(b->why), "the repository path is too long");
+    } else if (stat(rec, &sb) == 0) {
+        b->found[k] = S_ISREG(sb.st_mode);
+        b->nfound += (size_t)b->found[k];
+    } else if (errno != ENOENT || stat(dir, &sb) != 0) {
+        /* No snapshots/ at all is a repository that is not there - an
+         * unmounted disk - rather than one without the record. */
+        snprintf(b->why, sizeof(b->why), "%.400s: %.100s", dir, strerror(errno));
+    }
+}
+
+static ended_job_t *find_ended_jobs(cutils_db_t *db, int *out_n)
 {
     *out_n = 0;
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT j.id, j.snapshot_id, r.path FROM jobs j JOIN repos r ON r.id = j.repo_id"
-            " WHERE j.state IN ('running','queued') AND j.snapshot_id IS NOT NULL"
+            "SELECT j.id, COALESCE(j.snapshots_expected, 0), r.path"
+            "  FROM jobs j JOIN repos r ON r.id = j.repo_id"
+            " WHERE j.state IN ('running','queued')"
+            "   AND EXISTS (SELECT 1 FROM job_snapshots s WHERE s.job_id = j.id)"
             " ORDER BY j.id", NULL, &r) != 0) {
         db_result_free(r);
-        log_warn("job manager: cannot list interrupted backups: %s", err_msg());
+        log_warn("job manager: cannot list interrupted jobs' snapshots: %s", err_msg());
         err_clear();
         return NULL;
     }
     int n = r ? r->nrows : 0;
-    ended_backup_t *out = n > 0 ? calloc((size_t)n, sizeof(*out)) : NULL;
-    for (int i = 0; out && i < n; i++) {
-        ended_backup_t *b = &out[i];
+    ended_job_t *out = n > 0 ? calloc((size_t)n, sizeof(*out)) : NULL;
+    int ok = n == 0 || out != NULL;
+    for (int i = 0; ok && i < n; i++) {
+        ended_job_t *b = &out[i];
         b->job_id = strtoll(r->rows[i][0], NULL, 10);
-        b->snap_id = strtoll(r->rows[i][1], NULL, 10);
-        char dir[PATH_MAX], rec[PATH_MAX];
-        struct stat sb;
-        if (snprintf(dir, sizeof(dir), "%s/snapshots", r->rows[i][2]) >= (int)sizeof(dir) ||
-            snprintf(rec, sizeof(rec), "%s/%lld", dir, (long long)b->snap_id) >= (int)sizeof(rec)) {
-            snprintf(b->why, sizeof(b->why), "the repository path is too long");
-        } else if (stat(rec, &sb) == 0) {
-            b->found = S_ISREG(sb.st_mode);
-        } else if (errno != ENOENT || stat(dir, &sb) != 0) {
-            /* No snapshots/ at all is a repository that is not there - an
-             * unmounted disk - rather than one without the record. */
-            snprintf(b->why, sizeof(b->why), "%.400s: %.100s", dir, strerror(errno));
+        b->expected = strtoll(r->rows[i][1], NULL, 10);
+        db_result_t *s = NULL;
+        if (db_execute(db, "SELECT snap_id FROM job_snapshots WHERE job_id = ? ORDER BY snap_id",
+                       (const char *[]){ r->rows[i][0], NULL }, &s) != 0 || !s) {
+            db_result_free(s);
+            err_clear();
+            continue;
         }
+        size_t m = (size_t)s->nrows;
+        b->ids = calloc(m ? m : 1, sizeof(*b->ids));
+        b->found = calloc(m ? m : 1, sizeof(*b->found));
+        if (!b->ids || !b->found) { db_result_free(s); ok = 0; break; }
+        for (size_t k = 0; k < m; k++) b->ids[k] = strtoll(s->rows[k][0], NULL, 10);
+        b->n = m;
+        db_result_free(s);
+        for (size_t k = 0; k < m; k++) look_for_record(r->rows[i][2], b, k);
     }
-    if (n > 0 && !out) log_warn("job manager: out of memory checking interrupted backups");
     db_result_free(r);
-    if (out) *out_n = n;
+    if (!ok) {
+        log_warn("job manager: out of memory checking interrupted jobs' snapshots");
+        ended_free(out, n);
+        return NULL;
+    }
+    *out_n = n;
     return out;
 }
 
-/* Inside the transaction that closes the interrupted jobs: each backup whose
- * snapshot is in the repository completed, and is journalled so. */
-static void complete_ended_backups(cutils_db_t *db, const ended_backup_t *b, int n)
+/* "3", or "3, 4 and 7"; only those found when only_found. Bounded; a list
+ * too long for buf ends ", ...". */
+static void id_list(const ended_job_t *b, int only_found, char *buf, size_t sz)
+{
+    buf[0] = '\0';
+    size_t len = 0, shown = 0, want = 0;
+    for (size_t k = 0; k < b->n; k++) want += !only_found || b->found[k];
+    for (size_t k = 0; k < b->n; k++) {
+        if (only_found && !b->found[k]) continue;
+        const char *sep = shown == 0 ? "" : shown + 1 == want ? " and " : ", ";
+        int w = snprintf(buf + len, sz - len, "%s%lld", sep, (long long)b->ids[k]);
+        if (w < 0 || (size_t)w >= sz - len - 6) {
+            snprintf(buf + len, sz - len, ", ...");
+            return;
+        }
+        len += (size_t)w;
+        shown++;
+    }
+}
+
+/* Inside the transaction that closes the interrupted jobs: each job whose
+ * snapshots are all in the repository completed, and is journalled so;
+ * one with some of them says which. */
+static void complete_ended_jobs(cutils_db_t *db, const ended_job_t *v, int n)
 {
     for (int i = 0; i < n; i++) {
-        char id[32], msg[768], result[96];
-        snprintf(id, sizeof(id), "%lld", (long long)b[i].job_id);
-        if (!b[i].found) {
-            if (!b[i].why[0]) continue;   /* no record: interrupted, as before */
-            snprintf(msg, sizeof(msg), "interrupted by daemon restart; snapshot %lld may "
-                     "have been written, and the repository could not be read at start: %s",
-                     (long long)b[i].snap_id, b[i].why);
+        const ended_job_t *b = &v[i];
+        if (b->n == 0) continue;
+        char id[32], ids[256], msg[1024];
+        snprintf(id, sizeof(id), "%lld", (long long)b->job_id);
+        int many = b->n > 1;
+        int complete = b->expected > 0 && (int64_t)b->n == b->expected && b->nfound == b->n;
+        if (!complete) {
+            if (b->nfound > 0) {
+                id_list(b, 1, ids, sizeof(ids));
+                char of[64] = "";
+                if (b->expected > 0)
+                    snprintf(of, sizeof(of), " of the %lld it meant to write", (long long)b->expected);
+                snprintf(msg, sizeof(msg), "interrupted by daemon restart; snapshot%s %s%s "
+                         "%s in the repository, and the job did not finish",
+                         b->nfound > 1 ? "s" : "", ids, of, b->nfound > 1 ? "are" : "is");
+            } else if (b->why[0]) {
+                id_list(b, 0, ids, sizeof(ids));
+                snprintf(msg, sizeof(msg), "interrupted by daemon restart; snapshot%s %s may "
+                         "have been written, and the repository could not be read at start: %s",
+                         many ? "s" : "", ids, b->why);
+            } else {
+                continue;   /* none of them written: interrupted, as before */
+            }
             if (db_write(db, "UPDATE jobs SET error = ? WHERE id = ?",
                          (const char *[]){ msg, id, NULL }, NULL) != 0) {
                 log_warn("job %s: cannot record why it is interrupted", id);
@@ -270,11 +350,22 @@ static void complete_ended_backups(cutils_db_t *db, const ended_backup_t *b, int
             err_clear();
             continue;
         }
-        snprintf(result, sizeof(result), "{\"snapshot_id\":%lld,\"recovered\":true}",
-                 (long long)b[i].snap_id);
-        snprintf(msg, sizeof(msg), "snapshot %lld; the daemon stopped before the job's end "
-                 "was recorded, and the snapshot was found in the repository at start",
-                 (long long)b[i].snap_id);
+        /* One snapshot keeps a backup's result shape (B238). */
+        char result[320];
+        id_list(b, 0, ids, sizeof(ids));
+        if (!many) {
+            snprintf(result, sizeof(result), "{\"snapshot_id\":%lld,\"recovered\":true}",
+                     (long long)b->ids[0]);
+        } else {
+            size_t len = (size_t)snprintf(result, sizeof(result), "{\"snapshot_ids\":[");
+            for (size_t k = 0; k < b->n && len < sizeof(result) - 40; k++)
+                len += (size_t)snprintf(result + len, sizeof(result) - len, "%s%lld",
+                                        k ? "," : "", (long long)b->ids[k]);
+            snprintf(result + len, sizeof(result) - len, "],\"recovered\":true}");
+        }
+        snprintf(msg, sizeof(msg), "snapshot%s %s; the daemon stopped before the job's end "
+                 "was recorded, and %s found in the repository at start",
+                 many ? "s" : "", ids, many ? "every one was" : "the snapshot was");
         int ok = journal_job(db, strtoll(r->rows[0][0], NULL, 10),
                              strtoll(r->rows[0][2], NULL, 10), r->rows[0][3],
                              r->rows[0][1], "success", 0, msg, 0) == 0 &&
@@ -284,8 +375,8 @@ static void complete_ended_backups(cutils_db_t *db, const ended_backup_t *b, int
                           (const char *[]){ result, id, NULL }, NULL) == 0;
         db_result_free(r);
         if (ok)
-            log_info("job %s: completed, snapshot %lld found in the repository after a restart",
-                     id, (long long)b[i].snap_id);
+            log_info("job %s: completed, snapshot%s %s found in the repository after a restart",
+                     id, many ? "s" : "", ids);
         else {
             log_warn("job %s: cannot record it completed: %s", id, err_msg());
             err_clear();
@@ -839,6 +930,11 @@ static void prune_finished_jobs(job_manager_t *jm)
             " AND ended IS NOT NULL AND ended < ?",
             (const char *[]){ cutoff, NULL }, NULL) != 0)
         log_warn("job manager: cannot prune finished jobs");
+    /* Notes are for a running job's next start only (B267). */
+    if (db_write(jm->db,
+            "DELETE FROM job_snapshots WHERE job_id NOT IN"
+            " (SELECT id FROM jobs WHERE state IN ('running','queued'))", NULL, NULL) != 0)
+        log_warn("job manager: cannot drop finished jobs' snapshot notes");
 }
 
 typedef struct {
@@ -958,6 +1054,22 @@ int64_t job_progress_id(void *progress_ctx)
  * in the following second would keep the snapshot and lose which job made
  * it - the job back as interrupted and the retry a duplicate (B238).
  */
+/* Commit-only: the first job_note_snapshot's sync makes it durable with
+ * the note, before any record exists. */
+status_t job_expect_snapshots(void *progress_ctx, int64_t n)
+{
+    const progress_ctx_t *pc = progress_ctx;
+    if (!pc) return OK;
+    char id[32], cnt[32];
+    snprintf(id, sizeof(id), "%lld", (long long)pc->job_id);
+    snprintf(cnt, sizeof(cnt), "%lld", (long long)(n > 0 ? n : 0));
+    if (db_write(pc->jm->db, "UPDATE jobs SET snapshots_expected = ? WHERE id = ?",
+                 (const char *[]){ cnt, id, NULL }, NULL) != 0)
+        return set_error(ERR_IO, "cannot record how many snapshots job %lld writes: %s",
+                         (long long)pc->job_id, err_msg());
+    return OK;
+}
+
 status_t job_note_snapshot(void *progress_ctx, int64_t snap_id)
 {
     const progress_ctx_t *pc = progress_ctx;
@@ -965,8 +1077,23 @@ status_t job_note_snapshot(void *progress_ctx, int64_t snap_id)
     char id[32], snap[32];
     snprintf(id, sizeof(id), "%lld", (long long)pc->job_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-    if (db_write(pc->jm->db, "UPDATE jobs SET snapshot_id = ? WHERE id = ?",
-                 (const char *[]){ snap, id, NULL }, NULL) != 0)
+    /* A job that said nothing of how many it writes writes one: a backup. */
+    cutils_db_t *db = pc->jm->db;
+    if (db_txn_begin(db) != OK)
+        return set_error(ERR_IO, "cannot record snapshot %lld on job %lld: %s",
+                         (long long)snap_id, (long long)pc->job_id, err_msg());
+    if (db_write(db, "INSERT OR IGNORE INTO job_snapshots (job_id, snap_id) VALUES (?, ?)",
+                 (const char *[]){ id, snap, NULL }, NULL) != 0 ||
+        db_write(db, "UPDATE jobs SET snapshot_id = ?,"
+                     " snapshots_expected = COALESCE(snapshots_expected, 1) WHERE id = ?",
+                 (const char *[]){ snap, id, NULL }, NULL) != 0) {
+        char why[512];
+        snprintf(why, sizeof(why), "%.500s", err_msg());
+        db_txn_rollback(db);
+        return set_error(ERR_IO, "cannot record snapshot %lld on job %lld: %s",
+                         (long long)snap_id, (long long)pc->job_id, why);
+    }
+    if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "cannot record snapshot %lld on job %lld: %s",
                          (long long)snap_id, (long long)pc->job_id, err_msg());
     if (db_txn_make_durable(pc->jm->db) != OK)
@@ -1616,15 +1743,15 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
      * leave the jobs marked failed and unjournalled, or journalled and still
      * running, to be journalled again at the next start. */
     int nended = 0;
-    ended_backup_t *ended = find_ended_backups(db, &nended);
+    ended_job_t *ended = find_ended_jobs(db, &nended);
     int txn = db_txn_begin(db) == OK;
     if (!txn) {
         log_warn("job manager: cannot open a transaction to close interrupted jobs: %s",
                  err_msg());
         err_clear();
     }
-    complete_ended_backups(db, ended, nended);
-    free(ended);
+    complete_ended_jobs(db, ended, nended);
+    ended_free(ended, nended);
     journal_interrupted(db);
     /* An error already set says more (complete_ended_backups). */
     if (db_write(db,

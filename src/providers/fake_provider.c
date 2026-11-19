@@ -1196,9 +1196,12 @@ static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
                 any = 1;
                 if (base_ok) { mode = SP_READ_INCREMENTAL; why = "incremental"; }
                 else why = !base ? "no-base" : "token-invalid";
-            } else if (!req || !req->n_bases) {
-                why = "first";
             }
+            /* A disk asked for no incremental reads in full as
+             * "no-incremental-support", as the libvirt provider says it.
+             * It said "first" on every such backup, the tenth as much as the
+             * first (NIT-50): whether a unit was seen before is the
+             * daemon's to know (unit_backup.c), not a provider's. */
             s->info.plans[s->info.n_plans++] = (sp_item_plan_t){ su->disks[i].id, mode, why };
         }
         if (st == OK && base && su->refuse)

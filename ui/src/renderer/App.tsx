@@ -32,7 +32,7 @@ import { useTheme, type ThemeMode } from './useTheme'
 const api = window.cbackup
 
 if (!api) {
-  console.error('window.cbackup is undefined — preload script may not have loaded')
+  console.error('window.cbackup is undefined; the preload script may not have loaded')
 }
 
 export function App(): React.ReactElement {
@@ -94,7 +94,13 @@ export function App(): React.ReactElement {
 
   const [error, setError] = useState<string | null>(null)
 
-  // Shared task state — single poll shared by TaskBar + TaskListView
+  /*
+   * One poll feeds both TaskBar and TaskListView, and both are about the
+   * open repository: /jobs is daemon-wide, so the list is cut to this
+   * repository's jobs here (Demo L4). The bar has to follow the view,
+   * because clicking it opens the view, and a bar announcing another
+   * repository's failed job would open onto a list without it.
+   */
   const [taskList, setTaskList] = useState<Job[]>([])
 
   useEffect(() => {
@@ -106,7 +112,7 @@ export function App(): React.ReactElement {
          * undefined and TaskBar - which renders on every repository screen -
          * threw on it, so opening any repository blanked the window. */
         const resp = await api.apiCall<{ jobs?: Job[] }>(activeRepo.conn, { kind: 'jobList' })
-        if (!cancelled) setTaskList(resp.jobs ?? [])
+        if (!cancelled) setTaskList((resp.jobs ?? []).filter(j => j.repo_id === activeRepo.id))
       } catch { /* ignore */ }
     }
     poll()
@@ -1045,7 +1051,7 @@ export function App(): React.ReactElement {
             </h3>
             <div className="text-xs text-text-muted mb-3">
               Snapshot #{restoreModal.snapId}
-              {restoreModal.filePath && <span className="font-mono ml-1">— {restoreModal.filePath}</span>}
+              {restoreModal.filePath && <>: <span className="font-mono">{restoreModal.filePath}</span></>}
             </div>
             <div className="mb-3">
               <label className="block text-xs font-medium text-text-secondary mb-1">{activeRepo ? pathLabel(activeRepo.conn, 'Destination path') : 'Destination path'}</label>
@@ -1162,13 +1168,18 @@ export function App(): React.ReactElement {
                     {sources.map(p => {
                       const n = sourceDbs?.byScope.get(`source:${p}`) ?? 0
                       return (
-                        <li key={p} className="truncate">
-                          {p}
+                        /* The path gives way, never the badges after it
+                         * (Demo L2): the whole row used to truncate, so a
+                         * path of 40 characters cut "snapshot: strict" to
+                         * "sna...". The title keeps the full path reachable. */
+                        <li key={p} className="flex items-center min-w-0" data-testid="backup-source">
+                          <span className="truncate min-w-0" title={p} data-testid="backup-source-path">{p}</span>
                           {snapModes[p] && (
                             <span title={snapModes[p] === 'strict'
                                     ? 'Read from a ZFS or btrfs snapshot; the backup fails if it cannot be'
                                     : 'Read from a ZFS or btrfs snapshot; read live with a warning if it cannot be'}
-                              className="ml-2 text-[10px] font-sans px-1 rounded bg-surface-tertiary text-text-secondary">
+                              data-testid="backup-source-snapshot"
+                              className="ml-2 shrink-0 whitespace-nowrap text-[10px] font-sans px-1 rounded bg-surface-tertiary text-text-secondary">
                               snapshot: {snapModes[p]}
                             </span>
                           )}
@@ -1178,7 +1189,7 @@ export function App(): React.ReactElement {
                               navigateTo({ view: 'databases', scope: `source:${p}` })
                             }}
                               title="live databases under this source are captured uncovered"
-                              className="ml-2 px-1.5 rounded text-[10px] font-sans font-semibold
+                              className="ml-2 shrink-0 whitespace-nowrap px-1.5 rounded text-[10px] font-sans font-semibold
                                          bg-status-error text-white border-none cursor-pointer">
                               {n} uncovered database{n === 1 ? '' : 's'}
                             </button>

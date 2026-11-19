@@ -46,6 +46,23 @@ int host_path(const host_tools_t *t, const char *path, char *buf, size_t sz);
 status_t host_write_new_file(const char *hp, const char *shown, const char *data, size_t len,
                              const char *aside_hp);
 
+/*
+ * A host file's bytes, whole or not at all (B280). hp is the host path
+ * (host_path's result), shown the path for messages. Into a malloc'd,
+ * NUL-terminated *data of *len bytes. ERR_NOT_FOUND when it does not
+ * exist; ERR_INVALID when it is not a regular file; ERR_TOO_LARGE past
+ * max; ERR_IO for any other open failure, a read error, or a size that
+ * changed while it was read. *open_err, when given, is the errno of a
+ * failed open, 0 otherwise.
+ *
+ * Every reader of a host file the backup stores goes through this. The
+ * backends' own loops treated a read error, or a file that shrank, as end
+ * of file and stored what they had: a short or empty config that a restore
+ * would then put back as though it were the original, with nothing said.
+ */
+status_t host_read_file(const char *hp, const char *shown, size_t max, char **data, size_t *len,
+                        int *open_err);
+
 /* The same, the file created with mode exactly (umask aside);
  * HOST_MODE_DEFAULT for 0666 under the umask, as host_write_new_file. */
 #define HOST_MODE_DEFAULT ((mode_t)~0u)

@@ -300,7 +300,9 @@ static void test_unsnapshottable_paths_are_reported(void **state)
     const cJSON *res = result(o);
     assert_non_null(cJSON_GetObjectItemCaseSensitive(res, "capture"));
     assert_int_equal(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(res, "read_roots")), 1);
-    assert_non_null(strstr(field(res, "live", CACHE "/other"), "no ZFS dataset or btrfs pool"));
+    /* In the pool's root dataset, which the policy does not list: named (B253). */
+    assert_non_null(strstr(field(res, "live", CACHE "/other"), "is in ZFS dataset cache, which the helper's policy "
+                                                                "does not list"));
     assert_non_null(strstr(field(res, "live", D "/missing"), "cannot be resolved"));
     assert_non_null(strstr(field(res, "live", "/proc/self"), "host facility"));
     assert_int_equal(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(res, "live")), 3);

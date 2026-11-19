@@ -1,3 +1,65 @@
+# clang-tidy for c-backup, enforced by `make tidy` and the CI lint job
+# (ci/tidy_gate.py) against the recorded baseline ci/tidy-baseline.txt:
+# existing warnings are tolerated, new ones fail.
+#
+# The families: bugprone-*, cert-* (only the C checks ever fire on C),
+# clang-analyzer-*, misc-*. Every check switched off below says why. The
+# measure for switching one off was "would fixing the warnings it raises
+# make the code better, or only different": a check that is right about
+# real bugs stays on even with a long baseline.
+#
+# The baseline must be regenerated with the clang-tidy the CI image ships
+# (Debian trixie, clang-tidy 19): another version reports a different set.
 Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
   clang-analyzer-*,
-  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+  misc-*,
+  -misc-include-cleaner,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp
+
+# Why each is off:
+#
+# misc-include-cleaner: include-what-you-use. 2,751 warnings, about headers
+#   included transitively; no behaviour changes by fixing them, and it wants
+#   IWYU pragmas throughout c-utils' umbrella headers.
+# clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling:
+#   flags every memcpy, memset and snprintf as wanting the C11 Annex K _s
+#   variant, which glibc does not provide. 2,547 warnings, none actionable.
+# bugprone-easily-swappable-parameters: a style opinion about any two
+#   adjacent parameters of one type (357 warnings: (buf, len), (src, dst)).
+# bugprone-assignment-in-if-condition: forbids `if ((n = read(...)) < 0)`,
+#   the idiomatic C syscall check used throughout (233 warnings). gcc's
+#   -Wparentheses already catches the accidental `if (a = b)`.
+# bugprone-multi-level-implicit-pointer-conversion: wants a cast on every
+#   `free(argv)` and `char **v = malloc(...)` (153 warnings). The cast it asks
+#   for would trip -Wcast-qual on const arrays and hide nothing.
+# cert-dcl37-c, cert-dcl51-cpp: aliases of bugprone-reserved-identifier,
+#   which stays on; with them on every finding is reported three times.
+#
+# Narrowed, not off:
+#
+# bugprone-reserved-identifier allows the feature-test macros. Defining
+#   _GNU_SOURCE or _POSIX_C_SOURCE before the first include is how a C file
+#   asks for POSIX; they are the only reserved names the tree defines.
+# cert-err33-c (unchecked return values) is held to the calls where ignoring
+#   the result loses data or memory: allocation, closing or flushing a stream
+#   that was written, positioning, reading and writing, and renaming or
+#   removing a file. Its default list is every stdio function, printf family
+#   included, which raised 1,854 warnings about log lines.
+CheckOptions:
+  - key: bugprone-reserved-identifier.AllowedIdentifiers
+    value: '_GNU_SOURCE;_POSIX_C_SOURCE;_XOPEN_SOURCE;_DEFAULT_SOURCE;_FILE_OFFSET_BITS'
+  - key: cert-err33-c.CheckedFunctions
+    value: '::aligned_alloc;::calloc;::malloc;::realloc;::fopen;::freopen;::fdopen;::tmpfile;::fclose;::fflush;::fread;::fwrite;::fseek;::fseeko;::ftell;::ftello;::fgetpos;::fsetpos;::remove;::rename'
+
+# Diagnostics in headers are wanted only from this tree; c-utils and system
+# headers are someone else's.
+HeaderFilterRegex: '^src/'
+WarningsAsErrors: ''

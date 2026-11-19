@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { IPC } from '../shared/types'
 import type { ConnectionConfig, ConnectionState, ConnectResult, CredentialInfo } from '../shared/types'
-import type { ApiRequest } from '../shared/api'
+import type { ApiCallResult, ApiRequest } from '../shared/api'
 
 export interface CBackupApi {
   // Connection management
@@ -30,6 +30,9 @@ export interface CBackupApi {
    * the contract suite.
    */
   apiCall<T = unknown>(connectionName: string, req: ApiRequest): Promise<T>
+  /* The same, with a refusal returned rather than thrown, so its fields
+   * survive the IPC boundary that keeps only an error's message. */
+  apiCallResult<T = unknown>(connectionName: string, req: ApiRequest): Promise<ApiCallResult<T>>
 
 
   // Whether stored tokens are encrypted, so the sign-in dialog can say so.
@@ -65,6 +68,7 @@ const api: CBackupApi = {
   repoRemove: (conn, repoId) => ipcRenderer.invoke(IPC.REPO_REMOVE, conn, repoId),
 
   apiCall: (conn, req) => ipcRenderer.invoke(IPC.API_CALL, conn, req).catch(unwrap),
+  apiCallResult: (conn, req) => ipcRenderer.invoke(IPC.API_CALL_RESULT, conn, req).catch(unwrap),
 
   credentialInfo: () => ipcRenderer.invoke(IPC.CREDENTIAL_INFO),
 }
