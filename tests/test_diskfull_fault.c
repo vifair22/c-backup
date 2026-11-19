@@ -36,6 +36,7 @@
 #include "fault_inject.h"
 #include "backup.h"
 #include "object.h"
+#include "pack.h"
 #include "pack_ids.h"
 #include "repo.h"
 #include "repo_key.h"
@@ -131,6 +132,7 @@ static int teardown(void **state)
 {
     (void)state;
     fault_full_disarm();
+    pack_test_set_seal(0);
     sync_latch_reset_for_test();
     sync_latch_set_db(NULL);
     fault_reset_all();
@@ -273,6 +275,63 @@ static void test_pack_flush_on_a_pool_worker_fails_the_backup(void **state)
     expect_msg("No space left on device");
     backup_result_free(&res);
     expect_backup_left_nothing(2, 5);
+}
+
+/*
+ * Nothing in the index names an object that is not in a sealed pack: no
+ * objects or pack_objects row for a pack without its packs row, and no
+ * file-cache row a later run could trust for content with no packed row.
+ */
+static void expect_no_unsealed_references(void)
+{
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects o WHERE o.location NOT IN"
+                            " ('staged', 'absent') AND NOT EXISTS (SELECT 1 FROM packs p"
+                            " WHERE p.repo_id = o.repo_id AND CAST(p.id AS TEXT) = o.location)"), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM pack_objects po WHERE NOT EXISTS"
+                            " (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id"
+                            " AND p.id = po.pack_id)"), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM file_cache f WHERE NOT EXISTS"
+                            " (SELECT 1 FROM objects o WHERE o.repo_id = f.repo_id"
+                            " AND o.hash = f.content_hash AND o.location NOT IN ('staged', 'absent'))"), 0);
+}
+
+/*
+ * A file worker's pack write refused mid-pack while the other writers
+ * deduplicate against its objects: four identical 20 MiB files on four
+ * file workers, with a 2 MiB seal so every writer seals and reopens many
+ * times and meets the others' chunks while their packs are still open.
+ * The run fails, and nothing references a chunk that never reached a
+ * sealed pack, neither in the index nor in a snapshot; the next run stores
+ * everything and restores whole.
+ */
+static void test_worker_write_failure_while_twins_dedup(void **state)
+{
+    (void)state;
+    char p[PATH_MAX];
+    for (int i = 0; i < 4; i++) {
+        snprintf(p, sizeof(p), TEST_SRC "/twin%d.bin", i);
+        write_file(p, 20, 'T');
+    }
+    write_file(TEST_SRC "/other.bin", 20, 'O');
+    pack_test_set_seal(2u * MIB);
+    /* Well past the first entries, so several packs are open and some
+     * sealed, and twins have been claimed, when it fails. */
+    fault_full_arm(STAGING, FAULT_FULL_WRITE, 40, 1);
+    backup_result_t res;
+    status_t st = run_backup(4, &res);
+    int hits = fault_full_hits;
+    fault_full_disarm();
+    sync_latch_reset_for_test();
+    assert_int_equal(hits, 1);
+    /* The run logs "up to 5 large files stored at once"; a failed run's
+     * result is cleared, so the count is not asserted here. */
+    assert_int_not_equal(st, OK);
+    expect_msg("No space left on device");
+    backup_result_free(&res);
+    expect_no_unsealed_references();
+    expect_backup_left_nothing(4, 8);
+    expect_no_unsealed_references();
+    pack_test_set_seal(0);
 }
 
 /* Fails on the old code: the seal's fsync failed with no message at all. */
@@ -1016,6 +1075,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_pack_write_fails_the_backup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_flush_on_a_pool_worker_fails_the_backup, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_worker_write_failure_while_twins_dedup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_sync_failure_is_named, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_close_failure_fails_the_backup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_record_failures_fail_the_backup, setup, teardown),

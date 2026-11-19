@@ -446,7 +446,8 @@ test-cli: all $(FREE_PORT)
 # Units through the API and the CLI, with the fake provider enabled by its
 # test-only config key: routes, the job, units.allow, restore, schedules.
 .PHONY: test-units
-test-units: all
+test-units: all $(BINS)/slow_dev.so
+	@$(SCRATCH_GUARD) test_gc_during_backup_e2e.sh ./$(TESTS)/test_gc_during_backup_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/slow_dev.so
 	@$(SCRATCH_GUARD) test_units_e2e.sh ./$(TESTS)/test_units_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 	@$(SCRATCH_GUARD) test_helper_e2e.sh ./$(TESTS)/test_helper_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/c-backup-helper
 	@$(SCRATCH_GUARD) test_source_snapshot_e2e.sh ./$(TESTS)/test_source_snapshot_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/c-backup-helper
@@ -490,6 +491,9 @@ test-ui: all
 
 test: all $(TEST_BINS) $(FAULT_BINS) analyze test-hygiene test-api test-cli test-units test-ui
 	@for t in $(TEST_BINS) $(FAULT_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
+	@# Every power-cut scenario again with several writers: eight chunk
+	@# workers and every file on the file workers (test_powercut_fault.c).
+	@PC_FILE_WORKERS=1 $(SCRATCH_GUARD) test_powercut_fault $(BINS)/test_powercut_fault
 
 # ---- Sanitizer tests --------------------------------------------------
 #

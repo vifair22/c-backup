@@ -1402,6 +1402,15 @@ static status_t store_synth_all(pipeline_t *p, int late)
     return OK;
 }
 
+/* Tests: what goes to the file workers and how much each needs (0: the
+ * defaults), so a harness with small files can run them. */
+static uint64_t g_pool_min = FILE_POOL_MIN, g_pool_per_worker = OBJECT_MAX_BYTES;
+void backup_test_set_file_pool(uint64_t min_bytes, uint64_t per_worker)
+{
+    g_pool_min = min_bytes ? min_bytes : FILE_POOL_MIN;
+    g_pool_per_worker = per_worker ? per_worker : OBJECT_MAX_BYTES;
+}
+
 /*
  * Content (format 3): every regular file cut into content-defined chunks
  * straight into the backup pack, with the chunks of a large file named and
@@ -1417,7 +1426,7 @@ static status_t store_content(pipeline_t *p)
     for (uint32_t i = 0; i < p->count; i++) {
         const scan_entry_t *e = &p->scan->entries[i];
         if (e->node.type != NODE_TYPE_REG) continue;
-        if (e->node.size > FILE_POOL_MIN) { n_large++; pooled_bytes += e->node.size; }
+        if (e->node.size > g_pool_min) { n_large++; pooled_bytes += e->node.size; }
         else if (e->node.size <= SMALL_FILE_MAX) n_small++;
     }
     /* Enough small files to fill a batch or two is worth threads for. */
@@ -1435,7 +1444,7 @@ static status_t store_content(pipeline_t *p)
         if (cdc_workers_start(workers, &p->cdc_w) == OK) {
             log_info("backup: %llu file(s) over %llu MiB, their chunks stored "
                      "on %u threads", (unsigned long long)n_large,
-                     (unsigned long long)(FILE_POOL_MIN >> 20), workers);
+                     (unsigned long long)(g_pool_min >> 20), workers);
         } else {
             /* Slower, not wrong: every chunk can still be stored here. */
             log_warn("backup: cannot start chunk workers, storing serially: %s",
@@ -1482,7 +1491,7 @@ static status_t store_content(pipeline_t *p)
     /* Each file worker seals a pack of its own at the end, so a handful of
      * files just over 1 MiB would leave six small packs: one worker per
      * object's bound (16 MiB) of pooled content at most. */
-    if ((uint64_t)fw > pooled_bytes / OBJECT_MAX_BYTES) fw = (unsigned)(pooled_bytes / OBJECT_MAX_BYTES);
+    if ((uint64_t)fw > pooled_bytes / g_pool_per_worker) fw = (unsigned)(pooled_bytes / g_pool_per_worker);
     /*
      * And no more than the buffer budget has writers for: each file worker
      * opens a pack writer of its own (about 26 MiB of parity encoder and
@@ -1862,7 +1871,7 @@ static status_t store_content_loop(pipeline_t *p)
 
         /* A large file goes to the pool once there is room for it; the
          * backup thread carries on with the entries after it. */
-        int to_pool = p->pool && e->node.size > FILE_POOL_MIN;
+        int to_pool = p->pool && e->node.size > g_pool_min;
         while (to_pool &&
                store_pool_outstanding(p->pool) >= store_pool_capacity(p->pool)) {
             status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")

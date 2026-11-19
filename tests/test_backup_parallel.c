@@ -967,6 +967,61 @@ static void test_failed_seal_fails_the_run_and_leaves_nothing(void **state)
     env_close(&e);
 }
 
+/*
+ * A cancel lands while the file workers are mid-pack and deduplicating
+ * against each other's open packs (twins on four workers, a 2 MiB seal).
+ * Nothing in the index names an object outside a sealed pack, no file-cache
+ * row vouches for content that has none, no snapshot exists, and the next
+ * run completes and verifies.
+ */
+static void test_cancel_mid_pack_leaves_no_unsealed_reference(void **state)
+{
+    (void)state;
+    twins_source();
+    env_t e;
+    env_open(&e, "cancelmid");
+    char tmp[PATH_MAX + 32];
+    snprintf(tmp, sizeof(tmp), "%s/repo/" STORE_PACK_STAGING, e.dir);
+    atomic_int cancel = 0;
+    canceller_t c = { &cancel, tmp, 0 };
+    backup_opts_t o = opts_for(4);
+    o.cancel = &cancel;
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, canceller, &c), 0);
+    status_t st = backup_run(e.store, e.db, e.repo_id, &o, NULL);
+    __atomic_store_n(&c.done, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    assert_int_equal(st, ERR_BUSY);
+    err_clear();
+
+    assert_int_equal(q1(&e, "SELECT COUNT(*) FROM objects o WHERE o.repo_id = ?"
+                            " AND o.location NOT IN ('staged', 'absent') AND NOT EXISTS"
+                            " (SELECT 1 FROM packs p WHERE p.repo_id = o.repo_id"
+                            " AND CAST(p.id AS TEXT) = o.location)"), 0);
+    assert_int_equal(q1(&e, "SELECT COUNT(*) FROM pack_objects po WHERE po.repo_id = ?"
+                            " AND NOT EXISTS (SELECT 1 FROM packs p WHERE p.repo_id = po.repo_id"
+                            " AND p.id = po.pack_id)"), 0);
+    assert_int_equal(q1(&e, "SELECT COUNT(*) FROM file_cache f WHERE f.repo_id = ?"
+                            " AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.repo_id = f.repo_id"
+                            " AND o.hash = f.content_hash AND o.location NOT IN ('staged', 'absent'))"), 0);
+    assert_int_equal(q1(&e, "SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
+    assert_int_equal(snapshot_records(&e), 0);
+
+    backup_opts_t o2 = opts_for(4);
+    backup_result_t r;
+    memset(&r, 0, sizeof(r));
+    assert_int_equal(backup_run(e.store, e.db, e.repo_id, &o2, &r), OK);
+    assert_true(r.file_workers >= 2);
+    backup_result_free(&r);
+    verify_result_t v;
+    memset(&v, 0, sizeof(v));
+    assert_int_equal(verify_run(e.store, e.db, e.repo_id, VERIFY_LEVEL_DEEP, 0, NULL,
+                                NULL, NULL, &v), OK);
+    assert_int_equal(v.missing, 0);
+    assert_int_equal(v.unrecoverable, 0);
+    env_close(&e);
+}
+
 /* Each pack commit waits here before its COMMIT, the first few for long
  * enough that a snapshot record written early would land meanwhile, and
  * checks that none has been written yet. */
@@ -1083,6 +1138,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_write_counters_match_the_disk, setup, teardown),
         cmocka_unit_test_setup_teardown(test_mid_size_files_are_read_in_parallel, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failed_seal_fails_the_run_and_leaves_nothing,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_cancel_mid_pack_leaves_no_unsealed_reference,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_record_waits_for_every_pack_commit,
                                         setup, teardown),
