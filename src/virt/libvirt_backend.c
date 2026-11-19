@@ -2130,6 +2130,44 @@ static int v_unit_state(sp_ctx_t *c, const char *unit_id)
     return s;
 }
 
+/*
+ * A lost journal's recovery (B285): a running guest's filesystems are
+ * thawed through its agent. A frozen guest is taken as c-backup's: nothing
+ * else on these hosts freezes one and leaves it, and a thaw of a guest that
+ * is not frozen does nothing. A guest with no agent configured cannot have
+ * been frozen; any other failure is named, since that guest may still be.
+ */
+static status_t v_recover(sp_ctx_t *c, const char *unit_id,
+                          void (*cb)(void *cbctx, int released, const char *line), void *cbctx)
+{
+    char line[1024];
+    virDomainPtr dom = NULL;
+    status_t st = domain(c, unit_id, &dom);
+    if (st == ERR_NOT_FOUND) { err_clear(); return OK; }
+    if (st != OK) {
+        snprintf(line, sizeof(line), "libvirt:%.64s: could not be checked for a freeze (%.300s)", unit_id, err_msg());
+        err_clear();
+        cb(cbctx, 0, line);
+        return OK;
+    }
+    const char *name = virDomainGetName(dom);
+    if (dom_state(dom) == SP_STATE_RUNNING) {
+        int t = virDomainFSThaw(dom, NULL, 0, 0);
+        int code = t < 0 ? virGetLastErrorCode() : 0;
+        if (t > 0) {
+            snprintf(line, sizeof(line), "libvirt:%.64s (%.64s): %d frozen guest filesystem(s) thawed", unit_id,
+                     name ? name : "?", t);
+            cb(cbctx, 1, line);
+        } else if (t < 0 && code != VIR_ERR_ARGUMENT_UNSUPPORTED) {
+            snprintf(line, sizeof(line), "libvirt:%.64s (%.64s): the guest agent did not answer a thaw (%.300s); "
+                     "if the guest is frozen it still is", unit_id, name ? name : "?", verr());
+            cb(cbctx, 0, line);
+        }
+    }
+    virDomainFree(dom);
+    return OK;
+}
+
 static status_t v_set_running(sp_ctx_t *c, const char *unit_id, int run)
 {
     virDomainPtr dom = NULL;
@@ -2172,7 +2210,7 @@ status_t libvirt_backend_init(const helper_policy_t *pol, helper_backend_t *out)
         .name = "libvirt", .ops = &k_libvirt_ops, .ctx = c,
         .blob_data = v_blob_data, .unit_state = v_unit_state, .set_running = v_set_running,
         .block_where = v_block_where, .mount_root = v_mount_root, .define = v_define,
-        .install_state = v_install_state, .redefine = v_redefine,
+        .install_state = v_install_state, .redefine = v_redefine, .recover = v_recover,
     };
     return OK;
 }

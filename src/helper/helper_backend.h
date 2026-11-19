@@ -84,6 +84,15 @@ typedef struct helper_backend {
     /* The helper's own machinery, not a provider of units: never listed
      * in hello's providers (the paths backend, paths_backend.h). */
     int      internal;
+    /* Recovery from a lost hold journal (B285, docs/helper.md "When the
+     * hold journal is lost"): on unit_id, which the policy allows, release
+     * what the backend can tie to c-backup with no record of it, and name
+     * what it cannot, each through cb (released 1: let go; 0: left as it
+     * is, for the alert). A guest's frozen filesystems are thawed; a pause
+     * is never let go on this evidence. NULL: the server reports a unit
+     * whose unit_state is SP_STATE_PAUSED and touches nothing. */
+    status_t (*recover)(sp_ctx_t *c, const char *unit_id,
+                        void (*cb)(void *cbctx, int released, const char *line), void *cbctx);
 } helper_backend_t;
 
 /* The fake provider as a backend, over ctx. */
