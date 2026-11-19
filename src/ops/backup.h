@@ -161,6 +161,12 @@ typedef struct {
      * derived row (snapshot_units) lands with it or not at all. */
     status_t           (*index_hook)(void *ctx, cutils_db_t *db, int64_t snap_id);
     void                *index_hook_ctx;
+    /* Called with the snapshot's id after it is allocated and before its
+     * record is written, holding no lock; a non-OK answer fails the backup
+     * with nothing written. The job manager records which job is writing
+     * which snapshot here (job_note_snapshot, B238). */
+    status_t           (*record_hook)(void *ctx, int64_t snap_id);
+    void                *record_hook_ctx;
 
     /*
      * Database detection (docs/db-detection.md), reporting only: fed every

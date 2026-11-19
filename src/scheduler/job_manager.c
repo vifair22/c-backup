@@ -16,7 +16,9 @@
 #include "cJSON.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -179,6 +181,118 @@ static int journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
     return journal_record_at(db, repo_id, ended, "schedule", action, outcome, took_ms, msg);
 }
 
+/*
+ * Backups the last process left running whose snapshot it had named
+ * (job_note_snapshot), and what the repository says about each (B238).
+ *
+ * A backup's end used to be a commit made after its snapshot record, and a
+ * power cut between the two, or in the second before the commit was synced,
+ * brought the job back "failed: interrupted by daemon restart" with its
+ * snapshot complete in the repository; the retry an operator naturally
+ * makes took a second snapshot of the same data. The repository is the
+ * source of truth: a record under snapshots/ is a whole snapshot (it is
+ * renamed in only after its trees and packs are durable, and synced), so
+ * the job that wrote it completed. The index catches up separately: start-up
+ * reconcile indexes any record the index lacks.
+ *
+ * Looked at before the transaction that closes the interrupted jobs, so no
+ * filesystem call runs holding the write lock: a repository on a hung
+ * mount would otherwise hold up every writer in the daemon.
+ */
+typedef struct {
+    int64_t job_id, snap_id;
+    int     found;            /* the record is there */
+    char    why[512];         /* not found: why it could not be looked at */
+} ended_backup_t;
+
+static ended_backup_t *find_ended_backups(cutils_db_t *db, int *out_n)
+{
+    *out_n = 0;
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT j.id, j.snapshot_id, r.path FROM jobs j JOIN repos r ON r.id = j.repo_id"
+            " WHERE j.state IN ('running','queued') AND j.snapshot_id IS NOT NULL"
+            " ORDER BY j.id", NULL, &r) != 0) {
+        db_result_free(r);
+        log_warn("job manager: cannot list interrupted backups: %s", err_msg());
+        err_clear();
+        return NULL;
+    }
+    int n = r ? r->nrows : 0;
+    ended_backup_t *out = n > 0 ? calloc((size_t)n, sizeof(*out)) : NULL;
+    for (int i = 0; out && i < n; i++) {
+        ended_backup_t *b = &out[i];
+        b->job_id = strtoll(r->rows[i][0], NULL, 10);
+        b->snap_id = strtoll(r->rows[i][1], NULL, 10);
+        char dir[PATH_MAX], rec[PATH_MAX];
+        struct stat sb;
+        if (snprintf(dir, sizeof(dir), "%s/snapshots", r->rows[i][2]) >= (int)sizeof(dir) ||
+            snprintf(rec, sizeof(rec), "%s/%lld", dir, (long long)b->snap_id) >= (int)sizeof(rec)) {
+            snprintf(b->why, sizeof(b->why), "the repository path is too long");
+        } else if (stat(rec, &sb) == 0) {
+            b->found = S_ISREG(sb.st_mode);
+        } else if (errno != ENOENT || stat(dir, &sb) != 0) {
+            /* No snapshots/ at all is a repository that is not there - an
+             * unmounted disk - rather than one without the record. */
+            snprintf(b->why, sizeof(b->why), "%.400s: %.100s", dir, strerror(errno));
+        }
+    }
+    if (n > 0 && !out) log_warn("job manager: out of memory checking interrupted backups");
+    db_result_free(r);
+    if (out) *out_n = n;
+    return out;
+}
+
+/* Inside the transaction that closes the interrupted jobs: each backup whose
+ * snapshot is in the repository completed, and is journalled so. */
+static void complete_ended_backups(cutils_db_t *db, const ended_backup_t *b, int n)
+{
+    for (int i = 0; i < n; i++) {
+        char id[32], msg[768], result[96];
+        snprintf(id, sizeof(id), "%lld", (long long)b[i].job_id);
+        if (!b[i].found) {
+            if (!b[i].why[0]) continue;   /* no record: interrupted, as before */
+            snprintf(msg, sizeof(msg), "interrupted by daemon restart; snapshot %lld may "
+                     "have been written, and the repository could not be read at start: %s",
+                     (long long)b[i].snap_id, b[i].why);
+            if (db_write(db, "UPDATE jobs SET error = ? WHERE id = ?",
+                         (const char *[]){ msg, id, NULL }, NULL) != 0) {
+                log_warn("job %s: cannot record why it is interrupted", id);
+                err_clear();
+            }
+            continue;
+        }
+        db_result_t *r = NULL;
+        if (db_execute(db, "SELECT COALESCE(repo_id, 0), action, COALESCE(schedule_id, 0),"
+                           " COALESCE(origin, 'api') FROM jobs WHERE id = ?",
+                       (const char *[]){ id, NULL }, &r) != 0 || !r || r->nrows != 1) {
+            db_result_free(r);
+            err_clear();
+            continue;
+        }
+        snprintf(result, sizeof(result), "{\"snapshot_id\":%lld,\"recovered\":true}",
+                 (long long)b[i].snap_id);
+        snprintf(msg, sizeof(msg), "snapshot %lld; the daemon stopped before the job's end "
+                 "was recorded, and the snapshot was found in the repository at start",
+                 (long long)b[i].snap_id);
+        int ok = journal_job(db, strtoll(r->rows[0][0], NULL, 10),
+                             strtoll(r->rows[0][2], NULL, 10), r->rows[0][3],
+                             r->rows[0][1], "success", 0, msg, 0) == 0 &&
+                 db_write(db, "UPDATE jobs SET state = 'completed',"
+                              " ended = strftime('%s','now'), error = NULL, result = ?"
+                              " WHERE id = ?",
+                          (const char *[]){ result, id, NULL }, NULL) == 0;
+        db_result_free(r);
+        if (ok)
+            log_info("job %s: completed, snapshot %lld found in the repository after a restart",
+                     id, (long long)b[i].snap_id);
+        else {
+            log_warn("job %s: cannot record it completed: %s", id, err_msg());
+            err_clear();
+        }
+    }
+}
+
 /* See job_manager_start. Runs before any worker exists, so nothing else is
  * writing the jobs table or the journal. */
 static void journal_interrupted(cutils_db_t *db)
@@ -186,7 +300,8 @@ static void journal_interrupted(cutils_db_t *db)
     db_result_t *r = NULL;
     if (db_execute(db,
             "SELECT COALESCE(repo_id, 0), action, COALESCE(schedule_id, 0),"
-            "       COALESCE(origin, 'api')"
+            "       COALESCE(origin, 'api'),"
+            "       COALESCE(NULLIF(error, ''), 'interrupted by daemon restart')"
             "  FROM jobs WHERE state IN ('running','queued') ORDER BY id",
             NULL, &r) != 0) {
         db_result_free(r);
@@ -199,8 +314,7 @@ static void journal_interrupted(cutils_db_t *db)
         /* Duration 0: when the process died is not known, and the time
          * since the job started would count the downtime as work. */
         journal_job(db, repo_id, strtoll(r->rows[i][2], NULL, 10),
-                    r->rows[i][3], r->rows[i][1], "failed", 0, "interrupted by daemon restart",
-                    0);
+                    r->rows[i][3], r->rows[i][1], "failed", 0, r->rows[i][4], 0);
     }
     if (r && r->nrows > 0)
         log_warn("job manager: %d job(s) were interrupted by the last shutdown "
@@ -354,6 +468,10 @@ typedef struct pending_end {
     char        *action, *error, *message, *result;
     int64_t      took_ms;
     time_t       ended;
+    /* Shown only once durable, by a caller that settles it and syncs once
+     * for a batch of ends (job_manager_stop_within); 0: write_end_durable
+     * does both. */
+    int          settled_by_caller;
     /* The final progress, written with the end when has_progress. */
     int          has_progress;
     uint64_t     bytes_done, bytes_total, done, total;
@@ -371,6 +489,16 @@ static pending_end_t  *g_pend;
 static int64_t         g_pend_due_ms;      /* next retry, mono_ms; 0 now */
 static int             g_pend_backoff_ms;
 static int             g_pend_flushing;
+
+/* Ends being written and not yet durable (job_end_settling, B238), under
+ * g_pend_mu like the held ends. A job is in here from before its end is
+ * written until the WAL holding it is synced. */
+typedef struct settling {
+    struct settling *next;
+    cutils_db_t     *db;
+    int64_t          job_id;
+} settling_t;
+static settling_t *g_settling;
 
 #define PEND_BACKOFF_MIN_MS 1000
 #define PEND_BACKOFF_MAX_MS 30000
@@ -485,6 +613,7 @@ static void pend_flush(cutils_db_t *db, int force)
         return;
     }
     g_pend_flushing = 1;
+    int wrote = 0;
     for (;;) {
         /* The oldest for this handle: the list is newest first. */
         pending_end_t *e = NULL;
@@ -495,6 +624,7 @@ static void pend_flush(cutils_db_t *db, int force)
         int rc = write_end(e);
         char why[1024];
         if (rc != 0) snprintf(why, sizeof(why), "%.1000s", err_msg());
+        else wrote++;
         err_clear();
         pthread_mutex_lock(&g_pend_mu);
         if (rc != 0) {
@@ -515,6 +645,14 @@ static void pend_flush(cutils_db_t *db, int force)
     }
     g_pend_flushing = 0;
     pthread_mutex_unlock(&g_pend_mu);
+    /* Shown from memory all along, so nothing to settle; made durable all
+     * the same, once for every end written, so a cut cannot take back an
+     * end a client has already read (B238). */
+    if (wrote > 0 && db_txn_make_durable(db) != OK) {
+        log_error("job manager: %d held end(s) recorded but not made durable: %s",
+                  wrote, err_msg());
+        err_clear();
+    }
 }
 
 /* When the next retry for db is due (mono_ms), or 0 when nothing waits. */
@@ -526,6 +664,65 @@ static int64_t pend_due(cutils_db_t *db)
         if (p->db == db) { due = g_pend_due_ms > 0 ? g_pend_due_ms : 1; break; }
     pthread_mutex_unlock(&g_pend_mu);
     return due;
+}
+
+static void settle_begin(settling_t *s, cutils_db_t *db, int64_t job_id)
+{
+    s->db = db;
+    s->job_id = job_id;
+    pthread_mutex_lock(&g_pend_mu);
+    s->next = g_settling;
+    g_settling = s;
+    pthread_mutex_unlock(&g_pend_mu);
+}
+
+static void settle_end(settling_t *s)
+{
+    pthread_mutex_lock(&g_pend_mu);
+    for (settling_t **pp = &g_settling; *pp; pp = &(*pp)->next)
+        if (*pp == s) { *pp = s->next; break; }
+    pthread_mutex_unlock(&g_pend_mu);
+}
+
+int job_end_settling(cutils_db_t *db, int64_t job_id)
+{
+    int found = 0;
+    pthread_mutex_lock(&g_pend_mu);
+    for (const settling_t *s = g_settling; s && !found; s = s->next)
+        found = s->db == db && s->job_id == job_id;
+    pthread_mutex_unlock(&g_pend_mu);
+    return found;
+}
+
+/*
+ * The end, written and then made durable before anyone is shown it (B238).
+ *
+ * Every end, not only a success: a client that saw "failed: <reason>" and
+ * then read "failed: interrupted by daemon restart" lost the reason, and a
+ * cancelled job coming back failed is as wrong as a completed one. One
+ * fdatasync of the WAL per job end, with no lock held (db_txn_make_durable),
+ * is nothing beside the job.
+ *
+ * When the sync fails the end is shown anyway: the daemon-wide sync latch
+ * has tripped (sync_latch.h), /readyz says so, and no commit is promised
+ * durable until a restart. Hiding the end would leave a client waiting on a
+ * job that is over, for nothing a restart would not settle; a backup's
+ * snapshot is still matched to its job at the next start
+ * (job_note_snapshot).
+ */
+static int write_end_durable(const pending_end_t *e)
+{
+    if (e->settled_by_caller) return write_end(e);
+    settling_t s;
+    settle_begin(&s, e->db, e->job_id);
+    int rc = write_end(e);
+    if (rc == 0 && db_txn_make_durable(e->db) != OK) {
+        log_error("job %lld: its end (%s) is recorded but cannot be made durable: %s",
+                  (long long)e->job_id, e->state, err_msg());
+        err_clear();
+    }
+    settle_end(&s);
+    return rc;
 }
 
 /* Record an end, or keep it to retry; takes e. */
@@ -540,7 +737,7 @@ static void end_record(pending_end_t *e)
         pend_flush(e->db, 1);
         queued = pend_due(e->db) != 0;
     }
-    if (!queued && write_end(e) == 0) {
+    if (!queued && write_end_durable(e) == 0) {
         pend_free(e);
         return;
     }
@@ -599,14 +796,16 @@ unsigned job_ends_unrecorded(cutils_db_t *db)
     return n;
 }
 
-/* An end with no progress or result to go with it: a job that never ran. */
+/* An end with no progress or result to go with it: a job that never ran.
+ * settled: the caller settles the job and makes the end durable. */
 static void finish_job(job_manager_t *jm, int64_t job_id, const char *state,
                        const char *error, int64_t repo_id, int64_t schedule_id,
                        const char *origin, const char *action, const char *outcome,
-                       int64_t took_ms, const char *message)
+                       int64_t took_ms, const char *message, int settled)
 {
     pending_end_t *e = pend_new(jm->db, job_id, state, error, repo_id, schedule_id,
                                 origin, action, outcome, took_ms, message, NULL);
+    if (e) e->settled_by_caller = settled;
     if (!e) {
         log_error("job %lld: out of memory recording its end (%s); the next start "
                   "records it as interrupted", (long long)job_id, state);
@@ -750,6 +949,30 @@ int64_t job_progress_id(void *progress_ctx)
 {
     const progress_ctx_t *pc = progress_ctx;
     return pc ? pc->job_id : 0;
+}
+
+/*
+ * The row first, then the sync: the record the backup writes next is
+ * durable the moment its directory is synced, so the link to it has to be
+ * durable before. A plain commit would be in the WAL only, and a power cut
+ * in the following second would keep the snapshot and lose which job made
+ * it - the job back as interrupted and the retry a duplicate (B238).
+ */
+status_t job_note_snapshot(void *progress_ctx, int64_t snap_id)
+{
+    const progress_ctx_t *pc = progress_ctx;
+    if (!pc || snap_id <= 0) return OK;
+    char id[32], snap[32];
+    snprintf(id, sizeof(id), "%lld", (long long)pc->job_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    if (db_write(pc->jm->db, "UPDATE jobs SET snapshot_id = ? WHERE id = ?",
+                 (const char *[]){ snap, id, NULL }, NULL) != 0)
+        return set_error(ERR_IO, "cannot record snapshot %lld on job %lld: %s",
+                         (long long)snap_id, (long long)pc->job_id, err_msg());
+    if (db_txn_make_durable(pc->jm->db) != OK)
+        return set_error(ERR_IO, "cannot make snapshot %lld's job record durable: %s",
+                         (long long)snap_id, err_msg());
+    return OK;
 }
 
 void job_set_summary(void *progress_ctx, const char *text)
@@ -1386,16 +1609,21 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
     /* Entries and states in one transaction (B159), so a crash here cannot
      * leave the jobs marked failed and unjournalled, or journalled and still
      * running, to be journalled again at the next start. */
+    int nended = 0;
+    ended_backup_t *ended = find_ended_backups(db, &nended);
     int txn = db_txn_begin(db) == OK;
     if (!txn) {
         log_warn("job manager: cannot open a transaction to close interrupted jobs: %s",
                  err_msg());
         err_clear();
     }
+    complete_ended_backups(db, ended, nended);
+    free(ended);
     journal_interrupted(db);
+    /* An error already set says more (complete_ended_backups). */
     if (db_write(db,
             "UPDATE jobs SET state = 'failed', ended = strftime('%s','now'),"
-            " error = 'interrupted by daemon restart'"
+            " error = COALESCE(NULLIF(error, ''), 'interrupted by daemon restart')"
             " WHERE state IN ('running','queued')", NULL, NULL) != 0)
         log_warn("job manager: cannot clear stale jobs");
     if (txn && db_txn_commit(db) != OK) {
@@ -1438,10 +1666,11 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
  * cancelled in the jobs table and the journal, its argument released. The
  * slot is a copy the caller owns; nothing else can reach it any more.
  */
-static void finish_unstarted(job_manager_t *jm, job_slot_t *taken)
+static void finish_unstarted(job_manager_t *jm, job_slot_t *taken, int settled)
 {
     finish_job(jm, taken->job_id, "cancelled", NULL, taken->repo_id, taken->schedule_id,
-               taken->origin, taken->action, "cancelled", 0, "cancelled before it started");
+               taken->origin, taken->action, "cancelled", 0, "cancelled before it started",
+               settled);
     log_info("job %lld cancelled before it started: %s, repo %lld",
              (long long)taken->job_id, taken->action, (long long)taken->repo_id);
     if (taken->arg_free) taken->arg_free(taken->arg);
@@ -1513,14 +1742,35 @@ status_t job_manager_stop_within(job_manager_t *jm, unsigned grace_ms)
     pthread_cond_broadcast(&jm->cv);
     pthread_mutex_unlock(&jm->mu);
 
+    /* Each shown cancelled only once durable (B238), as every end is, but
+     * with one sync for the lot: a sync per job, up to JOB_QUEUE_MAX of
+     * them, could outlast the stop's deadline on slow storage. Without the
+     * memory for that, each end syncs on its own. */
+    pthread_mutex_lock(&jm->mu);
+    int nqueued = jm->count;
+    pthread_mutex_unlock(&jm->mu);
+    settling_t *held = nqueued > 0 ? calloc((size_t)nqueued, sizeof(*held)) : NULL;
     int ntaken = 0;
     for (;;) {
         pthread_mutex_lock(&jm->mu);
         if (jm->count == 0) { pthread_mutex_unlock(&jm->mu); break; }
         job_slot_t taken = dequeue_at(jm, 0);
         pthread_mutex_unlock(&jm->mu);
-        finish_unstarted(jm, &taken);
+        /* Nothing refills the queue once stopping is set, so it never
+         * holds more than it did above. */
+        int settled = held && ntaken < nqueued;
+        if (settled) settle_begin(&held[ntaken], jm->db, taken.job_id);
+        finish_unstarted(jm, &taken, settled);
         ntaken++;
+    }
+    if (held) {
+        if (ntaken > 0 && db_txn_make_durable(jm->db) != OK) {
+            log_error("job manager: the queued jobs cancelled by shutdown cannot be "
+                      "made durable: %s", err_msg());
+            err_clear();
+        }
+        for (int i = 0; i < ntaken && i < nqueued; i++) settle_end(&held[i]);
+        free(held);
     }
     if (ntaken > 0)
         log_info("job manager: %d queued job(s) cancelled by shutdown", ntaken);
@@ -1780,6 +2030,6 @@ status_t job_cancel(job_manager_t *jm, int64_t job_id)
     if (!dequeued)
         return set_error(ERR_NOT_FOUND, "job %lld is not running", (long long)job_id);
 
-    finish_unstarted(jm, &taken);
+    finish_unstarted(jm, &taken, 0);
     return OK;
 }
