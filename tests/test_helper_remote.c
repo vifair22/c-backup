@@ -264,6 +264,28 @@ static int setup_define_norestore(void **state)
     return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
 }
 
+/* B285: a helper that started without a usable hold journal. */
+static atomic_int g_recov_n;
+static char       g_recov_msg[4096];
+
+static void recov_alert(const char *msg)
+{
+    snprintf(g_recov_msg, sizeof(g_recov_msg), "%s", msg);
+    atomic_fetch_add(&g_recov_n, 1);
+}
+
+static int setup_lost_journal(void **state)
+{
+    (void)state;
+    if (setup_base() != 0) return -1;
+    mkdir(HF_DIR "/state", 0700);
+    hf_write(HF_DIR "/state/holds.json", "[{\"id\":");
+    if (helper_up() != 0) return -1;
+    atomic_store(&g_recov_n, 0);
+    remote_set_recovery_alert(recov_alert);
+    return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
+}
+
 static int teardown(void **state)
 {
     (void)state;
@@ -437,6 +459,40 @@ static void test_failure_through_helper(void **state)
 
 /* A hold the helper cannot release reaches the job as its warning, which
  * is what alerts (B175): the backup itself succeeds. */
+static int wait_recov(int n)
+{
+    for (int i = 0; i < 100 && atomic_load(&g_recov_n) < n; i++) {
+        struct timespec ts = { 0, 50 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return atomic_load(&g_recov_n);
+}
+
+/* The daemon alerts once per recovery the helper reports, with its
+ * report, not at every hello, and again for a new one (B285). */
+static void test_recovery_alerted_once(void **state)
+{
+    (void)state;
+    assert_int_equal(wait_recov(1), 1);
+    assert_non_null(strstr(g_recov_msg, "without a usable hold journal"));
+    assert_non_null(strstr(g_recov_msg, "holds.json.bad-"));
+    /* Health checks say hello every 200 ms here: still one. */
+    struct timespec ts = { 0, 700 * 1000000L };
+    nanosleep(&ts, NULL);
+    assert_int_equal(atomic_load(&g_recov_n), 1);
+    /* A restart over the good journal it left: nothing to alert. */
+    helper_down();
+    assert_int_equal(helper_up(), 0);
+    nanosleep(&ts, NULL);
+    assert_int_equal(atomic_load(&g_recov_n), 1);
+    /* Lost again: a new recovery, a new alert. */
+    helper_down();
+    hf_write(HF_DIR "/state/holds.json", "garbage");
+    assert_int_equal(helper_up(), 0);
+    assert_int_equal(wait_recov(2), 2);
+    remote_set_recovery_alert(NULL);
+}
+
 static void test_stuck_hold_warns(void **state)
 {
     (void)state;
@@ -1573,6 +1629,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_stuck_hold_warns, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_recovery_alerted_once, setup_lost_journal, teardown),
         cmocka_unit_test_setup_teardown(test_stuck_hold_message_whole, setup, teardown),
         cmocka_unit_test_setup_teardown(test_helper_killed_mid_read, setup, teardown),
     };

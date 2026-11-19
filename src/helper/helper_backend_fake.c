@@ -74,13 +74,48 @@ static status_t fk_define_check(sp_ctx_t *c, const char *unit_id, const char *de
     return set_error(ERR_INVALID, "%s", text);
 }
 
+/* A lost journal's recovery, as the real backends do it (B285): the
+ * unit's guest freeze ("agent:<id>", as begin takes it) is thawed through
+ * the provider's own sweep, and a pause is only named. */
+static status_t fk_recover(sp_ctx_t *c, const char *unit_id,
+                           void (*cb)(void *cbctx, int released, const char *line), void *cbctx)
+{
+    char line[512];
+    if (fake_hold_held(c, unit_id, SP_HOLD_FREEZE, NULL)) {
+        char detail[192];
+        snprintf(detail, sizeof(detail), "agent:%.180s", unit_id);
+        sp_intent_t in = { 0, unit_id, SP_HOLD_FREEZE, detail, 0 };
+        int rel = 0, absent = 0;
+        sp_sweep_req_t rq = { 0 };
+        rq.intents = &in;
+        rq.n_intents = 1;
+        rq.released = &rel;
+        rq.absent = &absent;
+        sp_sweep_report_t rep;
+        status_t st = fake_provider_ops.sweep(c, &rq, &rep);
+        if (st == OK && rel && !absent)
+            snprintf(line, sizeof(line), "fake:%.120s: the guest's filesystems were frozen; thawed", unit_id);
+        else
+            snprintf(line, sizeof(line), "fake:%.120s: frozen, and the thaw failed (%.100s)", unit_id,
+                     rep.stuck[0] ? rep.stuck : "no answer");
+        cb(cbctx, st == OK && rel && !absent, line);
+        err_clear();
+    }
+    if (fake_hold_held(c, unit_id, SP_HOLD_PAUSE, NULL)) {
+        snprintf(line, sizeof(line), "fake:%.120s is paused and nothing proves c-backup paused it; left paused",
+                 unit_id);
+        cb(cbctx, 0, line);
+    }
+    return OK;
+}
+
 void helper_backend_fake(helper_backend_t *out, sp_ctx_t *ctx)
 {
     *out = (helper_backend_t){
         .name = "fake", .ops = &fake_provider_ops, .ctx = ctx,
         .blob_data = fake_blob_data, .item_extra = fk_item_extra,
         .unit_state = fake_unit_state, .set_running = fk_set_running, .define = fk_define,
-        .define_check = fk_define_check,
+        .define_check = fk_define_check, .recover = fk_recover,
         /* mount_root, hook_start: the policy's dir domains and a local
          * process; define: unsupported. */
     };
