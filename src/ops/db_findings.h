@@ -75,14 +75,25 @@ status_t db_findings_record_detect(cutils_db_t *db, int64_t repo_id, const db_fi
                                    const char *scope, db_record_result_t *out);
 
 /*
+ * A unit of the host that answers to host (a container name), as a unit
+ * key "<provider>:<unit id>" into key; 1 when there is one. For
+ * db_findings_link_nextcloud, which asks only for a name no recorded
+ * finding answers to.
+ */
+typedef int (*db_unit_lookup_fn)(void *ctx, const char *host, char *key, size_t sz);
+
+/*
  * Resolve each Nextcloud finding's dbhost that its own unit could not
- * (section 3) against the repository's other units: the unit whose
- * recorded database findings answer to that name. Two units are one
- * capture only when they share capture.group; otherwise the finding is
- * suggested "group-units". Rewrites the findings' evidence; reads only.
+ * (section 3): first against the repository's other units whose recorded
+ * database findings answer to that name, then through lookup (may be
+ * NULL) against every unit the host has, backed up here or not. Two units
+ * are one capture only when they share capture.group; otherwise the
+ * finding is suggested "group-units", and a live one judged covered on its
+ * files alone becomes split, as does one whose database no unit answers
+ * for. Rewrites the findings' evidence and coverage; reads only.
  */
 void db_findings_link_nextcloud(cutils_db_t *db, int64_t repo_id, const char *scope,
-                                db_findings_t *f);
+                                db_findings_t *f, db_unit_lookup_fn lookup, void *lookup_ctx);
 
 /*
  * The findings as a JSON object for a job result:

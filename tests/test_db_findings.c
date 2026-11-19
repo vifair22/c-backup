@@ -327,9 +327,12 @@ static void test_record_detect(void **state)
     db_findings_free(g);
 }
 
-static db_findings_t *nextcloud(const char *dbtype, const char *link)
+/* A live Nextcloud judged covered on its files alone, as the detector
+ * leaves one whose database is elsewhere. The version is its own. */
+static db_findings_t *nextcloud(const char *link)
 {
-    db_findings_t *f = one(DB_ENGINE_NEXTCLOUD, "/u/nc", DB_COV_NONE, dbtype);
+    db_findings_t *f = one(DB_ENGINE_NEXTCLOUD, "/u/nc", DB_COV_COVERED_CRASH, "30.0.2.2");
+    f->v[0].optional = "nextcloud-maintenance";
     free(f->v[0].evidence);
     char ev[512];
     snprintf(ev, sizeof(ev), "{\"markers\":[],\"link\":%s}", link);
@@ -337,8 +340,20 @@ static db_findings_t *nextcloud(const char *dbtype, const char *link)
     return f;
 }
 
+/* A host with a unit of its own that nothing was recorded from. */
+static int lookups;
+static int lookup_host(void *ctx, const char *host, char *key, size_t sz)
+{
+    lookups++;
+    const char *want = ctx;
+    if (strcmp(host, want) != 0) return 0;
+    snprintf(key, sz, "docker:%s", host);
+    return 1;
+}
+
 /* A Nextcloud's database in another unit (section 3): found by the names
- * that unit's findings recorded, one capture only in a shared group. */
+ * that unit's findings recorded, or by the host's own unit list, one
+ * capture only in a shared group; split otherwise (B249). */
 static void test_link_nextcloud(void **state)
 {
     (void)state;
@@ -349,48 +364,96 @@ static void test_link_nextcloud(void **state)
     assert_int_equal(db_findings_record(db, repo_id, 1, pg, NULL, 0, "unit:docker:maria_db", &r), OK);
     db_record_result_free(&r);
 
-    db_findings_t *nc = nextcloud("mysql", "{\"dbtype\":\"mysql\",\"dbhost\":\"maria_db:3306\","
-                                           "\"resolved\":null,\"host\":\"maria_db\"}");
-    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc);
+    db_findings_t *nc = nextcloud("{\"dbtype\":\"mysql\",\"dbhost\":\"maria_db:3306\","
+                                  "\"resolved\":null,\"host\":\"maria_db\"}");
+    lookups = 0;
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc, lookup_host, "other");
+    assert_int_equal(lookups, 0);            /* the recorded unit answered */
     assert_non_null(strstr(nc->v[0].evidence, "\"resolved\":\"unit:docker:maria_db\""));
     assert_non_null(strstr(nc->v[0].evidence, "\"consistent\":false"));
     assert_string_equal(nc->v[0].suggestion, "group-units");
+    assert_int_equal(nc->v[0].coverage, DB_COV_SPLIT);
+    assert_non_null(strstr(nc->v[0].coverage_why, "another unit (docker:maria_db)"));
+    assert_null(nc->v[0].optional);
+    assert_string_equal(nc->v[0].version, "30.0.2.2");
+    db_findings_free(nc);
+
+    /* A unit not backed up here yet, found through the host's list. */
+    nc = nextcloud("{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"fresh_db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc, lookup_host, "fresh_db");
+    assert_non_null(strstr(nc->v[0].evidence, "\"resolved\":\"unit:docker:fresh_db\""));
+    assert_non_null(strstr(nc->v[0].evidence, "no database findings in this repository yet"));
+    assert_int_equal(nc->v[0].coverage, DB_COV_SPLIT);
+    assert_string_equal(nc->v[0].suggestion, "group-units");
+    db_findings_free(nc);
+    /* Its own unit, by the list, is not the other one. */
+    nc = nextcloud("{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"nextcloud\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc, lookup_host, "nextcloud");
+    assert_non_null(strstr(nc->v[0].evidence, "\"resolved\":null"));
     db_findings_free(nc);
 
     /* Sharing a capture group, they are one capture. */
     int aff = 0;
     assert_int_equal(db_write(db, "INSERT INTO unit_policy (repo_id, unit_key, key, value) VALUES"
                                   " (1, 'docker:nextcloud', 'capture.group', 'cloud'),"
-                                  " (1, 'docker:maria_db', 'capture.group', 'cloud')", NULL, &aff), 0);
-    nc = nextcloud("mysql", "{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria_db\"}");
-    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc);
+                                  " (1, 'docker:maria_db', 'capture.group', 'cloud'),"
+                                  " (1, 'docker:fresh_db', 'capture.group', 'cloud')", NULL, &aff), 0);
+    nc = nextcloud("{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria_db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc, NULL, NULL);
     assert_non_null(strstr(nc->v[0].evidence, "\"consistent\":true"));
     assert_null(nc->v[0].suggestion);
+    assert_int_equal(nc->v[0].coverage, DB_COV_COVERED_CRASH);
+    assert_string_equal(nc->v[0].optional, "nextcloud-maintenance");
+    db_findings_free(nc);
+    nc = nextcloud("{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"fresh_db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc, lookup_host, "fresh_db");
+    assert_non_null(strstr(nc->v[0].evidence, "\"consistent\":true"));
+    assert_int_equal(nc->v[0].coverage, DB_COV_COVERED_CRASH);
     db_findings_free(nc);
 
     /* A name in a LIKE wildcard's place, or no unit with it, or the wrong
-     * engine: not resolved, and said so. */
-    nc = nextcloud("mysql", "{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria%db\"}");
-    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc);
-    assert_non_null(strstr(nc->v[0].evidence, "no unit backed up into this repository answers to"));
+     * engine: not resolved, said so, and not one capture. */
+    nc = nextcloud("{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria%db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc, lookup_host, "other");
+    assert_non_null(strstr(nc->v[0].evidence, "no unit on this host answers to"));
+    assert_int_equal(nc->v[0].coverage, DB_COV_SPLIT);
+    assert_null(nc->v[0].suggestion);
     db_findings_free(nc);
-    nc = nextcloud("pgsql", "{\"dbtype\":\"pgsql\",\"resolved\":null,\"host\":\"maria_db\"}");
-    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc);
+    /* The engine comes from the dbtype, not the version. */
+    nc = nextcloud("{\"dbtype\":\"pgsql\",\"resolved\":null,\"host\":\"maria_db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc, NULL, NULL);
     assert_non_null(strstr(nc->v[0].evidence, "\"resolved\":null"));
     db_findings_free(nc);
     /* Its own unit is never the other one. */
-    nc = nextcloud("mysql", "{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria_db\"}");
-    db_findings_link_nextcloud(db, repo_id, "unit:docker:maria_db", nc);
+    nc = nextcloud("{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria_db\"}");
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:maria_db", nc, NULL, NULL);
     assert_non_null(strstr(nc->v[0].evidence, "\"resolved\":null"));
     db_findings_free(nc);
+    /* A live read stays uncovered; a dormant one gets no suggestion. */
+    assert_int_equal(db_write(db, "DELETE FROM unit_policy", NULL, &aff), 0);
+    nc = nextcloud("{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria_db\"}");
+    nc->v[0].coverage = DB_COV_UNCOVERED;
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc, NULL, NULL);
+    assert_int_equal(nc->v[0].coverage, DB_COV_UNCOVERED);
+    assert_string_equal(nc->v[0].suggestion, "group-units");
+    db_findings_free(nc);
+    nc = nextcloud("{\"dbtype\":\"mysql\",\"resolved\":null,\"host\":\"maria_db\"}");
+    nc->v[0].confidence = DB_CONF_DORMANT;
+    nc->v[0].coverage = DB_COV_NONE;
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc, NULL, NULL);
+    assert_non_null(strstr(nc->v[0].evidence, "\"resolved\":\"unit:docker:maria_db\""));
+    assert_int_equal(nc->v[0].coverage, DB_COV_NONE);
+    assert_null(nc->v[0].suggestion);
+    db_findings_free(nc);
     /* Resolved already, or no link: untouched. */
-    nc = nextcloud("mysql", "{\"dbtype\":\"mysql\",\"resolved\":\"this unit\",\"consistent\":true}");
+    nc = nextcloud("{\"dbtype\":\"mysql\",\"resolved\":\"this unit\",\"consistent\":true}");
     char *before = strdup(nc->v[0].evidence);
-    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc);
+    db_findings_link_nextcloud(db, repo_id, "unit:docker:nextcloud", nc, lookup_host, "x");
     assert_string_equal(nc->v[0].evidence, before);
+    assert_int_equal(nc->v[0].coverage, DB_COV_COVERED_CRASH);
     free(before);
     db_findings_free(nc);
-    db_findings_link_nextcloud(NULL, repo_id, "x", NULL);
+    db_findings_link_nextcloud(NULL, repo_id, "x", NULL, NULL, NULL);
     db_findings_free(pg);
 }
 

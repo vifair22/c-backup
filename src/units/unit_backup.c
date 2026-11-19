@@ -1609,7 +1609,8 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
             char scope[SP_PROVIDER_MAX + SP_UNIT_ID_MAX + 8];
             snprintf(scope, sizeof(scope), "unit:%s", key);
             db_detect_count_uncovered(u.findings);
-            db_findings_link_nextcloud(db, repo_id, scope, u.findings);
+            db_findings_link_nextcloud(db, repo_id, scope, u.findings, unit_detect_lookup_host,
+                                       (void *)(uintptr_t)ops->name);
             db_record_result_t rr;
             memset(&rr, 0, sizeof(rr));
             if (db_findings_record(db, repo_id, br.snapshot_id, u.findings, NULL, 0, scope, &rr) != OK) {
