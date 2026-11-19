@@ -165,40 +165,34 @@ static int path_cmp(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-void file_cache_sweep(cutils_db_t *db, int64_t repo_id,
-                      const char *const *paths, size_t n_paths)
+/*
+ * The sweep reads the cache a page at a time, in key order (B222 R3). It
+ * read every row of the repository in one statement, which holds the shared
+ * connection's mutex while it materialises them: 100 ms for 50,000 rows,
+ * about 1.2 s at 622,000, during which every request that read or wrote on
+ * that connection waited, and a copy of every path held in memory against
+ * the millions-of-files constraint. A page is one short statement the
+ * (repo_id, path) key serves without a sort; the deletes for a page are
+ * made before the next is read, and only paths past the last one seen are
+ * read next, so the deletes cannot shift the walk.
+ */
+#define SWEEP_PAGE 2000
+
+static int sweep_page(cutils_db_t *db, const char *repo, const db_result_t *r,
+                      const char *const *paths, size_t n_paths, int *removed)
 {
-    if (!db) return;
-
-    char repo[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-
-    db_result_t *r = NULL;
-    if (db_execute(db, "SELECT path FROM file_cache WHERE repo_id = ?",
-                   (const char *[]){ repo, NULL }, &r) != 0) {
-        db_result_free(r);
-        log_warn("file cache: cannot list entries to sweep");
-        return;
-    }
-
-    /* Collect first, delete after: deleting while holding the result set
-     * open would invalidate what we are iterating. The deletes are batched
-     * (B157): each used to be a plain statement, which on the shared
-     * connection joined whatever transaction another thread had open. */
-    int removed = 0;
     db_write_batch_t wb;
     int open = 0;
-    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+    for (int i = 0; i < r->nrows; i++) {
         const char *path = r->rows[i][0];
-        if (!path) continue;
+        if (!path[0]) continue;
         if (paths && n_paths &&
             bsearch(&path, paths, n_paths, sizeof(*paths), path_cmp))
             continue;
-
         if (!open) {
             if (db_write_batch_open(&wb, db) != 0) {
                 log_warn("file cache: cannot begin the sweep");
-                break;
+                return -1;
             }
             open = 1;
         }
@@ -207,16 +201,46 @@ void file_cache_sweep(cutils_db_t *db, int64_t repo_id,
                 (const char *[]){ repo, path, NULL }, NULL) != 0)
             log_warn("file cache: cannot drop %s", path);
         else
-            removed++;
+            (*removed)++;
         if (db_write_batch_next(&wb) != 0) {
-            open = 0;
             log_warn("file cache: cannot commit the sweep");
-            break;
+            return -1;
         }
     }
-    if (open && db_write_batch_close(&wb, 1) != 0)
+    if (open && db_write_batch_close(&wb, 1) != 0) {
         log_warn("file cache: cannot commit the sweep");
-    db_result_free(r);
+        return -1;
+    }
+    return 0;
+}
+
+void file_cache_sweep(cutils_db_t *db, int64_t repo_id,
+                      const char *const *paths, size_t n_paths)
+{
+    if (!db) return;
+
+    char repo[32], page[16];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(page, sizeof(page), "%u", (unsigned)SWEEP_PAGE);
+
+    int removed = 0;
+    char *after = strdup("");
+    while (after) {
+        db_result_t *r = NULL;
+        if (db_execute(db, "SELECT path FROM file_cache WHERE repo_id = ? AND path > ?"
+                           " ORDER BY path LIMIT ?",
+                       (const char *[]){ repo, after, page, NULL }, &r) != 0) {
+            db_result_free(r);
+            log_warn("file cache: cannot list entries to sweep");
+            break;
+        }
+        int n = r ? r->nrows : 0;
+        int rc = n ? sweep_page(db, repo, r, paths, n_paths, &removed) : 0;
+        free(after);
+        after = rc == 0 && n == SWEEP_PAGE ? strdup(r->rows[n - 1][0]) : NULL;
+        db_result_free(r);
+    }
+    free(after);
     if (removed > 0)
         log_info("file cache: dropped %d entry(ies) for paths no longer present",
                  removed);
