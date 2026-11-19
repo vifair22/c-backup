@@ -2378,6 +2378,43 @@ page, each with its socket, expiry, connections and bytes served;
 screen then shows the reason the daemon recorded (`revoked`, as `vm
 export-show` reports it).
 
+**Providers and the helper.** **Providers and helper** on the Units screen
+is `c-backup unit providers` (22.2.4): every provider compiled into the
+daemon, enabled or not, how it is reached (in-process or through the
+helper, and whether that connection is up, with its last error), and what
+its probe says; the daemon's id, `units.allow`, the holds open; and the
+helper as its hello described it: its socket and state, protocol version,
+the providers it offers, the daemon id in its policy (marked when it is not
+this daemon's), its policy digest, whether it can snapshot paths, and the
+holds and captures it has open. With no provider enabled the panel is open
+on its own, since it is the answer to an empty Units screen.
+
+**Unit policy.** The unit page's **Policy** section is `c-backup unit policy
+show` and `set` (22.6.2). Each retention count shows the unit's own value,
+or `repository's` when it has none, beside the count in force;
+`capture.exclude` (patterns on recorded paths, one per line) and
+`capture.group` (units captured together under pause scope `group`) show
+the unit's values. **Edit** makes them fields; **Save policy** sends only the
+keys that changed, and an emptied field drops the unit's own value so the
+repository's applies again (`set ... KEY ""`). A value the daemon refuses
+is shown in its words, and nothing is stored. A unit never backed up here
+takes a policy too, as `set` does, if its provider lists it now and
+`units.allow` takes it; the app addresses the unit by its id, which is
+where the daemon stores it.
+
+**Incremental chain.** The unit page's **Incremental chain** section is `c-backup
+vm checkpoints` and `vm reset-incremental` (6.5): whether incrementals are
+on for the unit, and when a failed bitmap audit turned them off, why and
+since when; the audit interval and the delta threshold; and one checkpoint
+per disk with the snapshot it describes and whether it is usable. A unit
+with no checkpoint says its next backup reads in full. **Reset
+incrementals**, after a confirmation, turns them back on and makes every
+checkpoint unusable, so the next backup reads in full under a new one; it
+says whether a failed audit had turned them off, and the reset is
+journalled (`reset-incremental`, shown in the page's journal). The CLI
+names these for VMs; the daemon answers them for any provider's unit, so
+the section is on every unit's page.
+
 **Snapshot mode in the backup dialog.** Editing the sources shows, for each
 path, a snapshot mode: Off (read live), Strict or Warn (6.6). Saving sends
 every mode, so a path set back to Off is off; the list then marks each
@@ -3816,6 +3853,9 @@ restarting the helper, which the daemon notices on its own (22.2.4).
 
 #### 22.2.4 Reconnecting, and `GET /providers`
 
+The desktop app shows the same under **Providers and helper** on the Units
+screen (section 15.4).
+
 The daemon opens one connection to the helper per request, so concurrent
 jobs never wait for each other and a helper restart costs nothing beyond
 the requests in flight. It also keeps one connection open for as long as
@@ -4373,6 +4413,8 @@ A units job body or schedule body with a key it does not know is refused
 (`unknown key '...'`), rather than the key being dropped.
 
 #### 22.6.2 Retention per unit
+
+The desktop app shows and sets a unit's policy on its page (section 15.4).
 
 A retention pass (`c-backup gfs <id>`, section 9) runs once per **retention
 group**: the repository's file snapshots, then each unit, each judged by its

@@ -200,3 +200,35 @@ export function suggestsFilesRestore(error: string): boolean {
 export function refusedNothingWritten(error: string): boolean {
   return error.includes('nothing written') || error.includes('nothing created')
 }
+
+/* ---------------------------------------------------------------- */
+/* Unit policy                                                       */
+/* ---------------------------------------------------------------- */
+
+/* The retention keys a unit can set over the repository's (Manual 22.6.2). */
+export const RETENTION_KEYS = [
+  'retention.keep_snaps', 'retention.keep_daily', 'retention.keep_weekly',
+  'retention.keep_monthly', 'retention.keep_yearly',
+] as const
+
+/* Every key the policy route takes; anything else it refuses by name. */
+export const UNIT_POLICY_KEYS = [...RETENTION_KEYS, 'capture.exclude', 'capture.group'] as const
+
+/*
+ * The body of a policy save: each key whose draft differs from the unit's
+ * own value, a cleared one as "" (which drops it, so the repository's
+ * applies again). Values are sent as typed, so the daemon's refusal of a
+ * bad one is its own words; only a trailing newline on the exclusions is
+ * dropped, which would otherwise read as a change. Empty when nothing
+ * changed, and the screen then sends nothing.
+ */
+export function policyChanges(own: Record<string, string>, draft: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const k of UNIT_POLICY_KEYS) {
+    let d = draft[k] ?? ''
+    if (k === 'capture.exclude') d = d.replace(/\n+$/, '')
+    else d = d.trim()
+    if (d !== (own[k] ?? '')) out[k] = d
+  }
+  return out
+}

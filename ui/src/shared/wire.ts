@@ -402,6 +402,23 @@ export interface WireProviders {
   daemon_id: string
   allow: string
   holds_open: number
+  /* The helper as its hello said (source-providers.md 11.2), when
+   * units.helper_socket is set. holds and captures only when it answered. */
+  helper?: {
+    socket: string
+    state: 'never-connected' | 'connected' | 'disconnected'
+    since: number
+    last_error: string
+    reconnects: number
+    version: number
+    daemon_id: string
+    policy: string
+    providers: string
+    path_snapshots: boolean
+    holds?: number
+    captures?: number
+  }
+  privileges_dropped?: boolean
 }
 
 /* GET /providers/<p>/units: the provider's live enumeration, held to
@@ -549,4 +566,40 @@ export interface WireExport {
   connections?: number
   bytes_served?: number
   cache_bytes?: number
+}
+
+/* GET/PUT /repos/<id>/units/<p>/<u>/policy. unit holds the unit's own
+ * values as stored (strings); effective the retention in force, the
+ * unit's over the repository's. */
+export interface WireUnitPolicy {
+  unit_key: string
+  effective: Record<string, number>
+  unit: Record<string, string>
+}
+
+/* GET /repos/<id>/units/<p>/<u>/checkpoints (vm-backup.md 5.8). */
+export interface WireUnitChain {
+  unit_key: string
+  incremental: {
+    enabled: boolean
+    disabled_reason: string
+    disabled_at: number
+    last_audit_at: number
+    audit_days: number
+    delta_full_pct: number
+  }
+  tokens: Array<{
+    item: string
+    checkpoint: string
+    snapshot: number
+    usable: boolean
+    identity: string
+    created_at: number
+  }>
+}
+
+/* POST .../reset-incremental: was_disabled is why they were off, or "". */
+export interface WireUnitReset {
+  unit_key: string
+  was_disabled: string
 }
