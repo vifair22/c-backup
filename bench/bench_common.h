@@ -27,6 +27,7 @@
 
 #include <cutils/db.h>
 
+#include "db_write.h"
 #include "error.h"
 #include "repo.h"
 #include "repo_key.h"
@@ -110,6 +111,16 @@ static inline int bench_env_open(bench_env_t *e, const char *dir)
     snprintf(dbp, sizeof(dbp), "%s/state.db", dir);
     snprintf(repop, sizeof(repop), "%s/repo", dir);
 
+    /*
+     * The daemon installs the write guard before it opens state.db
+     * (daemon/main.c), and the guard's update hook is what arms the commit
+     * budget (db_txn.h, B144-REST): without it every batch ran to its own
+     * row cap, so a benchmark measured commits the daemon never makes.
+     * index_nodes on a no-change backup wrote about 2,000 rows a commit
+     * here against the daemon's 256-page budget, which hid that the
+     * daemon's WAL volume is set by that budget (PERF.md, 2026-11-19).
+     */
+    db_txn_guard_install();
     if (db_open(&e->db, dbp) != 0) {
         fprintf(stderr, "bench: cannot open %s\n", dbp);
         return -1;

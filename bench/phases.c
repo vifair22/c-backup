@@ -57,6 +57,10 @@
  *                          reused, so runs under different conditions back
  *                          up the same bytes and `cp` can copy them too
  *     -R, --no-restore     skip the restore step
+ *     -I, --incrementals N no-change incrementals after the first backup,
+ *                          each followed by state.db and WAL sizes, so the
+ *                          index's growth per unchanged snapshot shows
+ *                                                          (BENCH_INCREMENTALS, 1)
  *
  * The working directory is DIR/c_backup_bench_phases and is removed at the
  * end unless --keep. On tmpfs (the default /tmp here) every number is a CPU
@@ -93,6 +97,7 @@ typedef struct {
     int      cold;
     int      keep;
     int      no_restore;
+    uint64_t incrementals;   /* no-change incrementals after the first backup */
     char     source[3072];   /* back up this tree instead of generating one */
 } opts_t;
 
@@ -528,7 +533,8 @@ static void usage(FILE *f)
         "  -c, --cold           evict the source before each backup, sync in timings\n"
         "  -k, --keep           keep the working directory\n"
         "  -S, --source DIR     back up DIR instead of generating a tree\n"
-        "  -R, --no-restore     skip the restore step\n");
+        "  -R, --no-restore     skip the restore step\n"
+        "  -I, --incrementals N no-change incrementals (BENCH_INCREMENTALS, 1)\n");
 }
 
 static void parse(int argc, char **argv, opts_t *o)
@@ -546,6 +552,7 @@ static void parse(int argc, char **argv, opts_t *o)
     o->workers     = w > 64 ? 64u : (unsigned)w;
     o->per_dir     = bench_env_u64("BENCH_PER_DIR", 100);
     o->job_progress = bench_env_u64("BENCH_JOB_PROGRESS", 0) != 0;
+    o->incrementals = bench_env_u64("BENCH_INCREMENTALS", 1);
 
     static const struct option lo[] = {
         { "dir",         required_argument, NULL, 'd' },
@@ -564,11 +571,12 @@ static void parse(int argc, char **argv, opts_t *o)
         { "keep",        no_argument,       NULL, 'k' },
         { "source",      required_argument, NULL, 'S' },
         { "no-restore",  no_argument,       NULL, 'R' },
+        { "incrementals", required_argument, NULL, 'I' },
         { "help",        no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "d:n:s:l:t:T:H:m:w:p:D:jckS:Rh", lo, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "d:n:s:l:t:T:H:m:w:p:D:jckS:RI:h", lo, NULL)) != -1) {
         switch (c) {
         case 'd': snprintf(o->parent, sizeof(o->parent), "%s", optarg); break;
         case 'n': o->small_files = bench_parse_u64("--small", optarg); break;
@@ -602,6 +610,7 @@ static void parse(int argc, char **argv, opts_t *o)
         case 'k': o->keep = 1; break;
         case 'S': snprintf(o->source, sizeof(o->source), "%s", optarg); break;
         case 'R': o->no_restore = 1; break;
+        case 'I': o->incrementals = bench_parse_u64("--incrementals", optarg); break;
         case 'h': usage(stdout); exit(0);
         default:  usage(stderr); exit(2);
         }
@@ -621,6 +630,21 @@ static void parse(int argc, char **argv, opts_t *o)
         exit(2);
     }
     snprintf(o->work, sizeof(o->work), "%s/c_backup_bench_phases", o->parent);
+}
+
+/* state.db and its WAL as they stand: the index's growth per snapshot. */
+static void db_sizes(const char *work)
+{
+    static const char *const sfx[] = { "", "-wal" };
+    printf("      state.db");
+    for (size_t i = 0; i < 2; i++) {
+        char path[3400];
+        struct stat sb;
+        snprintf(path, sizeof(path), "%s/state.db%s", work, sfx[i]);
+        printf("%s %s %.1f MiB", i ? "," : "", i ? "wal" : "main",
+               stat(path, &sb) == 0 ? (double)sb.st_size / 1048576.0 : 0.0);
+    }
+    printf("\n");
 }
 
 static tree_stats_t g_walk;
@@ -700,11 +724,19 @@ int main(int argc, char **argv)
 
     backup_result_t first, incr;
     if (timed_backup(&o, &e, src, "first backup", &first) != 0) goto out;
-    if (timed_backup(&o, &e, src, "incremental, no change", &incr) != 0) goto out;
-    if (incr.files_unchanged != incr.files)
-        printf("  warning: %" PRIu64 " of %" PRIu64 " files were re-read by the incremental\n",
-               incr.files - incr.files_unchanged, incr.files);
-    if (!o.no_restore && timed_restore(&o, &e, incr.snapshot_id, dst, &ts) != 0) goto out;
+    db_sizes(o.work);
+    memset(&incr, 0, sizeof(incr));
+    for (uint64_t k = 0; k < o.incrementals; k++) {
+        char label[64];
+        if (k == 0) snprintf(label, sizeof(label), "incremental, no change");
+        else snprintf(label, sizeof(label), "incremental, no change #%" PRIu64, k + 1);
+        if (timed_backup(&o, &e, src, label, &incr) != 0) goto out;
+        if (incr.files_unchanged != incr.files)
+            printf("  warning: %" PRIu64 " of %" PRIu64 " files were re-read by the incremental\n",
+                   incr.files - incr.files_unchanged, incr.files);
+        db_sizes(o.work);
+    }
+    if (!o.no_restore && incr.snapshot_id && timed_restore(&o, &e, incr.snapshot_id, dst, &ts) != 0) goto out;
     rc = 0;
 
 out:

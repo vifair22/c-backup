@@ -514,10 +514,11 @@ static void record_shared_paths(grep_ctx_t *g, const char *repo, const char *sna
                 (const char *[]){ scope_id, repo, snap, repo, snap, hex,
                                   first_node, lim, NULL }, &r)
             : db_execute(g->db,
-                "SELECT id FROM nodes"
-                " WHERE repo_id = ? AND content_hash = ? AND snap_id = ?"
-                "   AND type = 1 AND id != ?"
-                " ORDER BY id LIMIT ?",
+                "SELECT h.node_id FROM node_hashes h"
+                "  JOIN nodes n ON n.repo_id = h.repo_id AND n.id = h.node_id"
+                " WHERE h.repo_id = ? AND h.content_hash = ? AND h.snap_id = ?"
+                "   AND n.type = 1 AND h.node_id != ?"
+                " ORDER BY h.node_id LIMIT ?",
                 (const char *[]){ repo, hex, snap, first_node, lim, NULL }, &r);
         if (qrc != 0 || !r) {
             db_result_free(r);
