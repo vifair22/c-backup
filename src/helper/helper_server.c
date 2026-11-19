@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "helper_internal.h"
+#include "helper_fd.h"
 #include "helper_journal.h"
 #include "msg_clip.h"
 #include "artefact.h"
@@ -194,30 +195,6 @@ static char *op_units_list(helper_server_t *s, const helper_req_t *r)
     return resp_ok(r->id, res);
 }
 
-/*
- * Configuration blobs travel in one sealed memfd passed with the response,
- * each item naming its offset and length in it: a container's inspect JSON
- * or an LXC config can exceed what a 64 KiB packet holds, and the daemon
- * reads sealed bytes that cannot change under it.
- */
-static int blob_fd_append(int *fd, uint64_t *off, const void *data, size_t len)
-{
-    if (*fd < 0) {
-        *fd = memfd_create("cbk-blobs", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-        if (*fd < 0) return -1;
-    }
-    const char *p = data;
-    size_t done = 0;
-    while (done < len) {
-        ssize_t w = pwrite(*fd, p + done, len - done, (off_t)(*off + done));
-        if (w < 0 && errno == EINTR) continue;
-        if (w <= 0) return -1;
-        done += (size_t)w;
-    }
-    *off += len;
-    return 0;
-}
-
 static char *op_units_describe(helper_server_t *s, const helper_req_t *r, int *pass_fd)
 {
     char why[256];
@@ -265,7 +242,7 @@ static char *op_units_describe(helper_server_t *s, const helper_req_t *r, int *p
                 break;
             }
             uint64_t at = boff;
-            int werr = len > HELPER_BLOB_MAX || blob_fd_append(&bfd, &boff, data, len) != 0;
+            int werr = len > HELPER_BLOB_MAX || helper_blob_fd_append(&bfd, &boff, data, len) != 0;
             free(data);
             if (werr) { bad = 3; break; }
             cJSON_AddNumberToObject(o, "data_off", (double)at);
@@ -474,6 +451,12 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
                                s->pol->max_captures_per_hour);
     if (!slot) return resp_error(r->id, HELPER_E_BUSY, "too many captures held");
 
+    /* The daemon closing the connection is its job's cancel (B278): the
+     * backend's pre hooks stop on it, and the begin fails rather than
+     * leave a capture nobody waits for. */
+    atomic_int gone = 0;
+    conn_watch_t cw;
+    conn_watch_start(&cw, r->conn_fd, &gone);
     capture_t c;
     memset(&c, 0, sizeof(c));
     c.seq = seq;
@@ -523,6 +506,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
             q.freeze_timeout_s = s->pol->max_pause_s;
             q.pause_max_s = s->pol->max_pause_s;
             q.holds = &gh;
+            q.cancel = &gone;
             q.daemon8 = s->pol->daemon_id;
             if (b0->ops->begin_group(b0->ctx, (const sp_unit_desc_t *const *)gd, r->n_units, &q, gs, gi) != OK) {
                 msg_clip(fmsg, sizeof(fmsg), err_msg());
@@ -575,6 +559,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         q.freeze_timeout_s = s->pol->max_pause_s;
         q.pause_max_s = s->pol->max_pause_s;
         q.holds = &holds;
+        q.cancel = &gone;
         q.daemon8 = s->pol->daemon_id;
         /* pause: a pause may be held for the daemon's second pass over
          * mounts on no snapshot domain, released with lease.release. */
@@ -670,7 +655,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
             size_t len = 0;
             if (b->ops->blob_read(sess, it, &data, &len) != OK) { err_clear(); continue; }
             uint64_t at = loff;
-            int werr = len > HELPER_BLOB_MAX || blob_fd_append(&lfd, &loff, data, len) != 0;
+            int werr = len > HELPER_BLOB_MAX || helper_blob_fd_append(&lfd, &loff, data, len) != 0;
             free(data);
             if (werr) { snprintf(fmsg, sizeof(fmsg), "cannot pass the hook logs"); fail = HELPER_E_FAILED; break; }
             cJSON *pair = cJSON_CreateArray();
@@ -680,6 +665,11 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
             cJSON_AddItemToObject(late, it->id, pair);
         }
         b->ops->desc_free(d);
+    }
+    conn_watch_stop(&cw);
+    if (fail == HELPER_OK && atomic_load(&gone)) {
+        snprintf(fmsg, sizeof(fmsg), "the daemon stopped waiting for the begin (its job was cancelled)");
+        fail = HELPER_E_FAILED;
     }
     if (fail == HELPER_OK && lfd >= 0 &&
         fcntl(lfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) != 0) {
@@ -1285,7 +1275,7 @@ static char *op_db_probe(helper_server_t *s, const helper_req_t *r, int *pass_fd
     cJSON_AddBoolToObject(res, "truncated", total > got);
     int lfd = -1;
     uint64_t loff = 0;
-    if (out && got && (blob_fd_append(&lfd, &loff, out, got) != 0 ||
+    if (out && got && (helper_blob_fd_append(&lfd, &loff, out, got) != 0 ||
                        fcntl(lfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) != 0)) {
         if (lfd >= 0) close(lfd);
         lfd = -1;
@@ -1430,7 +1420,7 @@ static char *op_hook_wait(helper_server_t *s, const helper_req_t *r, int *pass_f
             char *txt = hooklog_render(&x->log, &len);
             int lfd = -1;
             uint64_t loff = 0;
-            if (txt && (blob_fd_append(&lfd, &loff, txt, len) != 0 ||
+            if (txt && (helper_blob_fd_append(&lfd, &loff, txt, len) != 0 ||
                         fcntl(lfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) != 0)) {
                 if (lfd >= 0) close(lfd);
                 lfd = -1;
@@ -2212,33 +2202,6 @@ static char *op_unit_stop_start(helper_server_t *s, const helper_req_t *r, int s
 /* The helper parses a definition field by field and serialises its own;
  * none of the daemon's bytes would pass through. No backend here defines
  * units yet, so after the policy's checks the answer is unsupported. */
-/* A definition passed as a sealed memfd with the request ({"memfd": true}
- * in place of the object): no 64 KiB limit, and bytes that cannot change
- * while the helper reads them. */
-static char *read_sealed(int fd, size_t max, size_t *len, char *why, size_t wsz)
-{
-    struct stat sb;
-    int seals = fcntl(fd, F_GET_SEALS);
-    int need = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
-    if (fstat(fd, &sb) != 0 || seals < 0 || (seals & need) != need) {
-        snprintf(why, wsz, "the definition must be a sealed memfd");
-        return NULL;
-    }
-    if ((uint64_t)sb.st_size > max) { snprintf(why, wsz, "the definition is over %zu bytes", max); return NULL; }
-    char *buf = malloc((size_t)sb.st_size + 1);
-    if (!buf) { snprintf(why, wsz, "out of memory"); return NULL; }
-    size_t done = 0;
-    while (done < (size_t)sb.st_size) {
-        ssize_t n = pread(fd, buf + done, (size_t)sb.st_size - done, (off_t)done);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { free(buf); snprintf(why, wsz, "cannot read the definition"); return NULL; }
-        done += (size_t)n;
-    }
-    buf[done] = '\0';
-    *len = done;
-    return buf;
-}
-
 static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd)
 {
     if (!s->pol->allow_define) return resp_error(r->id, HELPER_E_DENIED, "the policy does not allow define");
@@ -2255,7 +2218,7 @@ static char *op_unit_define(helper_server_t *s, const helper_req_t *r, int in_fd
         size_t plen = 0;
         char fwhy[160];
         if (in_fd < 0) return resp_error(r->id, HELPER_E_INVALID, "the definition is said to be passed, and no fd came");
-        if (!(passed = read_sealed(in_fd, HELPER_BLOB_MAX, &plen, fwhy, sizeof(fwhy))))
+        if (!(passed = helper_read_sealed(in_fd, HELPER_BLOB_MAX, &plen, fwhy, sizeof(fwhy))))
             return resp_error(r->id, HELPER_E_INVALID, "%s", fwhy);
         cJSON *pd = cJSON_Parse(passed);
         if (!cJSON_IsObject(pd)) { cJSON_Delete(pd); free(passed); return resp_error(r->id, HELPER_E_INVALID, "the passed definition is not a JSON object"); }
@@ -2531,13 +2494,14 @@ void helper_server_handle(helper_server_t *s, const char *req, size_t len,
 
 /* One request on a connection whose hello named session ("" for none). */
 static void handle_in_session(helper_server_t *s, const char *req, size_t len, int in_fd,
-                              const char *session, char **resp, int *pass_fd)
+                              const char *session, int conn_fd, char **resp, int *pass_fd)
 {
     *pass_fd = -1;
     helper_req_t r;
     char why[512];
     helper_err_t e = helper_request_parse(req, len, &r, why, sizeof(why));
     snprintf(r.conn_session, sizeof(r.conn_session), "%s", session);
+    r.conn_fd = conn_fd;
     *resp = e == HELPER_OK ? dispatch(s, &r, pass_fd, in_fd) : resp_error(r.id, e, "%s", why);
     helper_req_free(&r);
     err_clear();
@@ -2546,7 +2510,7 @@ static void handle_in_session(helper_server_t *s, const char *req, size_t len, i
 void helper_server_handle_fd(helper_server_t *s, const char *req, size_t len, int in_fd,
                              char **resp, int *pass_fd)
 {
-    handle_in_session(s, req, len, in_fd, "", resp, pass_fd);
+    handle_in_session(s, req, len, in_fd, "", -1, resp, pass_fd);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2593,7 +2557,7 @@ static void *conn_main(void *arg)
             }
             helper_req_free(&r);
         } else {
-            handle_in_session(s, buf, got, rfd, session, &resp, &pfd);
+            handle_in_session(s, buf, got, rfd, session, c->fd, &resp, &pfd);
         }
         if (rfd >= 0) close(rfd);
         if (resp) (void)helper_send(c->fd, resp, strlen(resp), pfd);

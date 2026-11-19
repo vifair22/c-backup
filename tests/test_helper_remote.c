@@ -457,6 +457,66 @@ static void test_failure_through_helper(void **state)
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
 }
 
+/* B278: a job cancelled while the helper's begin is still running (its
+ * pre hooks, here a freeze held up to 20 s) stops the daemon's wait at
+ * once, and the closed connection stops the begin in the helper: its
+ * holds are released, and no capture is left for nobody to end. Before,
+ * the daemon waited out the whole begin and the cancel did nothing. */
+static atomic_int g_begin_cancel;
+
+static void *cancel_soon(void *arg)
+{
+    (void)arg;
+    struct timespec ts = { 0, 300 * 1000000L };
+    nanosleep(&ts, NULL);
+    atomic_store(&g_begin_cancel, 1);
+    return NULL;
+}
+
+static int64_t mono_ms_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void test_cancel_during_begin(void **state)
+{
+    (void)state;
+    fake_fail_set(fk, "u1", FAKE_HANG_IN_HOLD, 20000);
+    atomic_store(&g_begin_cancel, 0);
+    const char *names[] = { "cbk-uat-one" };
+    unit_backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.provider = "fake";
+    o.units = names;
+    o.n_units = 1;
+    o.require = SP_CONSIST_CRASH;
+    o.job_id = 9;
+    o.cancel = &g_begin_cancel;
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, cancel_soon, NULL), 0);
+    int64_t t0 = mono_ms_now();
+    unit_backup_result_t res;
+    status_t st = unit_backup_run(store, db, repo_id, &o, &res);
+    int64_t waited = mono_ms_now() - t0;
+    pthread_join(th, NULL);
+    unit_backup_result_free(&res);
+    err_clear();
+    assert_int_not_equal(st, OK);
+    if (waited > 8000) fail_msg("the daemon waited %lld ms for a cancelled begin", (long long)waited);
+    /* The helper's side: the freeze goes well before the 20 s hang ends. */
+    for (int i = 0; i < 160 && helper_server_holds(srv) > 0; i++) {
+        struct timespec ts = { 0, 50 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    waited = mono_ms_now() - t0;
+    assert_int_equal(helper_server_holds(srv), 0);
+    if (waited > 12000) fail_msg("the helper held the begin %lld ms after the cancel", (long long)waited);
+    fake_fail_clear(fk);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
+}
+
 /* A hold the helper cannot release reaches the job as its warning, which
  * is what alerts (B175): the backup itself succeeds. */
 static int wait_recov(int n)
@@ -1669,6 +1729,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_probe_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_cancel_during_begin, setup, teardown),
         cmocka_unit_test_setup_teardown(test_stuck_hold_warns, setup, teardown),
         cmocka_unit_test_setup_teardown(test_recovery_alerted_once, setup_lost_journal, teardown),
         cmocka_unit_test_setup_teardown(test_stuck_hold_message_whole, setup, teardown),
