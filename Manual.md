@@ -2811,13 +2811,18 @@ back. For a repository with missing snapshots it logs a warning naming the
 repository and the count:
 
 ```
-reconcile: repo 1 (/srv/backup/main) has 1 snapshot(s) missing from the index, lost with the last moments before a power cut or crash, or left by a backup whose index did not commit; reindexing it as job 41
+reconcile: repo 1 (/srv/backup/main) has 1 snapshot(s) missing from the index, lost with the last moments before a power cut or crash, or left by a backup whose index did not commit; indexing them as job 41
 ```
 
-and queues a reindex job, which runs like any other: under the repository's
-lock, in `c-backup jobs` with origin `startup`, and in the journal with
-source `startup`. Until it finishes the missing snapshots are not listed;
-backups queued for that repository wait for it. An encrypted repository
+and queues a `reindex` job, which runs like any other: under the
+repository's lock, in `c-backup jobs` with origin `startup`, and in the
+journal with source `startup`. It indexes the missing records and nothing
+else, taking about as long as indexing those snapshots did when they were
+taken: its progress counts them (`index snapshot <id>`, done of total), and
+its `result` is `{"snapshots_indexed":N,"gaps_only":true}`. The snapshots
+already indexed are left as they are; a full rebuild is `c-backup reindex
+<id>`. Until it finishes the missing snapshots are not listed; backups
+queued for that repository wait for it. An encrypted repository
 whose key is not on the host cannot be reindexed; its warning says to load
 the key and run `c-backup reindex <id>`. A repository that cannot be read
 at start (an unmounted disk) is skipped with a warning and checked again at
