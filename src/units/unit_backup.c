@@ -1397,6 +1397,10 @@ static status_t unit_prepare(store_t *store, cutils_db_t *db, int64_t repo_id, c
         st = bases_prepare(store, db, repo_id, pp);
     }
     if (st == OK) templates_load(db, repo_id, ops, key, d, &pp->tmpl);
+    /* clang-analyzer-unix.Malloc reports runs used after templates_load's
+     * allocation-failure path freed it, but utmpl_free zeroes n with runs
+     * and the analyzer does not follow the memset. */
+    // NOLINTNEXTLINE(clang-analyzer-unix.Malloc)
     for (size_t i = 0; st == OK && i < pp->tmpl.n; i++) pp->tmpl.runs[i].cancel = o->cancel;
     if (st != OK) {
         bases_free(pp);
