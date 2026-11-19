@@ -243,7 +243,8 @@ ends it (B218; a test server's stop once took 53 s and ended in SIGKILL):
   jobs took 2.7 s`), and the last line on stderr is `c-backupd stopped in
   N s`.
 
-A clean stop normally takes a second or two. A second SIGTERM or SIGINT
+The stop begins the moment the signal arrives; the main loop used to look
+for it once a second (B225). A clean stop normally takes a second or two. A second SIGTERM or SIGINT
 forces an immediate exit. Run the cancelled job again after the
 restart; a backup skips what it already stored, a restore skips the files it
 finished and redoes the one it was inside (a stop renames every file the

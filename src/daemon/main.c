@@ -66,6 +66,7 @@
 #include "unit_backup.h"
 #include "unit_state.h"
 #include "tzinfo.h"
+#include "shutdown_wait.h"
 
 #ifndef VERSION_STRING
 #define VERSION_STRING "0.0.0-dev"
@@ -82,8 +83,11 @@
  * stopped, no job cancelled, no socket removed. With on_signal, the first
  * signal only ends the main loop, and teardown happens here in order while
  * the database is still open. A second signal still forces the exit.
+ *
+ * The first signal wakes the main loop at once (shutdown_wait.h, B225):
+ * it slept a second between looks at a flag, which put up to a second in
+ * front of every stop.
  */
-static atomic_int running = 1;
 
 /*
  * Shutdown's budget (B218). Docker sends SIGKILL 10 s after SIGTERM unless
@@ -143,7 +147,7 @@ static void on_signal(int sig, void *ctx)
 {
     (void)ctx;
     log_info("received %s, stopping", sig == SIGINT ? "SIGINT" : "SIGTERM");
-    atomic_store(&running, 0);
+    stop_request();
 }
 
 /*
@@ -725,11 +729,9 @@ int main(int argc, char *argv[])
     if (sd_notify_state("READY=1") != OK)
         log_warn("cannot notify the service manager: %s", err_msg());
 
-    while (atomic_load(&running)) {
-        struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
-        nanosleep(&req, NULL);
+    /* A tick a second for the exports' expiry, and out at once on a stop. */
+    while (!stop_wait(1000))
         exports_tick();
-    }
 
     /*
      * Outside in: stop taking requests, stop firing schedules, then cancel
