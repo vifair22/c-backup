@@ -4986,9 +4986,17 @@ it beside the raw file:
   `{"allow_rollback_lock":true}`: a WAL reader never blocks the
   application's writers, while a rollback-journal database's copy holds a
   shared lock that does, for as long as the copy takes.
-- The database is opened read-only with a 5-second busy timeout. A WAL
-  database whose `-shm` the daemon (uid 990) cannot use cannot be opened
-  read-only, and the raw read stands, with that reason.
+- The database is read with a 5-second busy timeout, and **the copy
+  creates, writes and removes nothing in the source directory**: no `-wal`,
+  no `-shm`, no change to a file's bytes or mtime or to the directory's.
+  A WAL database with its `-wal` and `-shm` is read through them, the
+  `-shm` read-only, so a live writer sees an ordinary reader; one with no
+  `-wal` (nothing has it open) is read from the main file under SQLite's
+  own shared lock, and the copy is retried if a connection opened
+  meanwhile. Two cases are refused, and the raw read stands, with the
+  reason: a `-shm` the daemon (uid 990) cannot read, and a `-wal` holding
+  commits with no `-shm` beside it (left by a crash), which SQLite could
+  only read by creating one.
 - A copy kept from finishing by the source three times is abandoned with a
   warning; the raw read stands.
 - The copy is made in the repository's `tmp/`, one database at a time,
