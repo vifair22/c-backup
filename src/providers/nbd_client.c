@@ -305,6 +305,7 @@ uint64_t nbd_size(const nbd_client_t *c) { return c->size; }
 int      nbd_read_only(const nbd_client_t *c) { return (c->tflags & TF_READ_ONLY) != 0; }
 int      nbd_has_bitmap(const nbd_client_t *c) { return c->have_bitmap; }
 uint32_t nbd_max_request(const nbd_client_t *c) { return c->bs_max; }
+uint32_t nbd_min_block(const nbd_client_t *c) { return c->bs_min; }
 
 /* ---- transmission ---- */
 

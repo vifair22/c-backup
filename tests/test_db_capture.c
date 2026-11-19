@@ -23,7 +23,10 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <dirent.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
@@ -229,6 +232,236 @@ static void test_copy_abandoned(void **state)
         assert_non_null(strstr(r.reason, "abandoned"));
     }
     assert_int_equal(access(TEST_TMPD "/b.copy", F_OK), -1);
+}
+
+/* ------------------------------------------------------------------ */
+/* The source is left alone (B247)                                      */
+/* ------------------------------------------------------------------ */
+
+/* Everything a copy could change in a directory: its own mtime, and each
+ * entry's name, size, mtime and bytes. */
+typedef struct {
+    char    name[64];
+    off_t   size;
+    struct timespec mtime;
+    char   *bytes;
+} ent_t;
+
+typedef struct {
+    struct timespec mtime;
+    ent_t  e[32];
+    size_t n;
+} dirstate_t;
+
+static int ent_cmp(const void *a, const void *b)
+{
+    return strcmp(((const ent_t *)a)->name, ((const ent_t *)b)->name);
+}
+
+static void dir_state(const char *dir, dirstate_t *st)
+{
+    memset(st, 0, sizeof(*st));
+    struct stat sb;
+    assert_int_equal(stat(dir, &sb), 0);
+    st->mtime = sb.st_mtim;
+    DIR *d = opendir(dir);
+    assert_non_null(d);
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        assert_true(st->n < 32);
+        ent_t *e = &st->e[st->n++];
+        snprintf(e->name, sizeof(e->name), "%s", de->d_name);
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+        assert_int_equal(lstat(p, &sb), 0);
+        e->size = sb.st_size;
+        e->mtime = sb.st_mtim;
+        e->bytes = malloc((size_t)sb.st_size + 1);
+        assert_non_null(e->bytes);
+        int fd = open(p, O_RDONLY);
+        assert_true(fd >= 0);
+        assert_int_equal(pread(fd, e->bytes, (size_t)sb.st_size, 0), sb.st_size);
+        close(fd);
+    }
+    closedir(d);
+    qsort(st->e, st->n, sizeof(st->e[0]), ent_cmp);
+}
+
+static void dir_state_free(dirstate_t *st)
+{
+    for (size_t i = 0; i < st->n; i++) free(st->e[i].bytes);
+    st->n = 0;
+}
+
+/* Byte-, listing- and mtime-identical, the directory's own mtime included. */
+static void assert_dir_same(const dirstate_t *a, const dirstate_t *b)
+{
+    assert_int_equal(a->mtime.tv_sec, b->mtime.tv_sec);
+    assert_int_equal(a->mtime.tv_nsec, b->mtime.tv_nsec);
+    if (a->n != b->n) {
+        for (size_t i = 0; i < b->n; i++) print_message("after: %s\n", b->e[i].name);
+    }
+    assert_int_equal(a->n, b->n);
+    for (size_t i = 0; i < a->n; i++) {
+        assert_string_equal(a->e[i].name, b->e[i].name);
+        assert_int_equal(a->e[i].size, b->e[i].size);
+        assert_int_equal(a->e[i].mtime.tv_sec, b->e[i].mtime.tv_sec);
+        assert_int_equal(a->e[i].mtime.tv_nsec, b->e[i].mtime.tv_nsec);
+        assert_memory_equal(a->e[i].bytes, b->e[i].bytes, (size_t)a->e[i].size);
+    }
+}
+
+/* A writer in another process, as an application is: POSIX locks are per
+ * process, so one in this process would not be a real second party.
+ * `busy` keeps committing; otherwise it commits `rows` rows with
+ * checkpoints off, so they sit in the -wal, reports the last id and waits. */
+typedef struct {
+    pid_t pid;
+    int   go;          /* write end: closing it lets the child finish */
+    long long top;     /* last id committed before it reported */
+} child_t;
+
+static void child_start(const char *path, int rows, int busy, child_t *c)
+{
+    int up[2], down[2];
+    assert_int_equal(pipe(up), 0);
+    assert_int_equal(pipe(down), 0);
+    pid_t pid = fork();
+    assert_true(pid >= 0);
+    if (pid == 0) {
+        close(up[0]);
+        close(down[1]);
+        sqlite3 *h = NULL;
+        if (sqlite3_open(path, &h) != SQLITE_OK) _exit(2);
+        sqlite3_busy_timeout(h, 5000);
+        sqlite3_exec(h, "PRAGMA wal_autocheckpoint=0", NULL, NULL, NULL);
+        long long top = 0;
+        for (int i = 0; i < rows; i++) {
+            if (sqlite3_exec(h, "INSERT INTO ledger(pad) VALUES (randomblob(4000))", NULL, NULL, NULL) != SQLITE_OK)
+                _exit(3);
+            top = sqlite3_last_insert_rowid(h);
+        }
+        if (write(up[1], &top, sizeof(top)) != (ssize_t)sizeof(top)) _exit(4);
+        if (busy) {
+            int fl = fcntl(down[0], F_GETFL);
+            fcntl(down[0], F_SETFL, fl | O_NONBLOCK);
+            char ch;
+            while (read(down[0], &ch, 1) < 0)
+                sqlite3_exec(h, "INSERT INTO ledger(pad) VALUES (randomblob(4000))", NULL, NULL, NULL);
+        } else {
+            char ch;
+            while (read(down[0], &ch, 1) < 0) {}
+        }
+        sqlite3_close(h);
+        _exit(0);
+    }
+    close(up[1]);
+    close(down[0]);
+    c->pid = pid;
+    c->go = down[1];
+    assert_int_equal(read(up[0], &c->top, sizeof(c->top)), (ssize_t)sizeof(c->top));
+    close(up[0]);
+}
+
+static void child_stop(child_t *c)
+{
+    close(c->go);
+    int st = 0;
+    assert_int_equal(waitpid(c->pid, &st, 0), c->pid);
+    assert_true(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+/* Copies a database with the source directory checked around it. */
+static sqlite_copy_result_t copy_untouched(const char *src, const char *dst, int allow)
+{
+    dirstate_t a, b;
+    dir_state(TEST_SRC, &a);
+    sqlite_copy_result_t r;
+    sqlite_copy(src, dst, allow, &r);
+    dir_state(TEST_SRC, &b);
+    assert_dir_same(&a, &b);
+    dir_state_free(&a);
+    dir_state_free(&b);
+    return r;
+}
+
+static void test_copy_leaves_source_alone(void **state)
+{
+    (void)state;
+    sqlite_copy_result_t r;
+
+    /* A dormant WAL database, no -wal or -shm: the case that grew both. */
+    sqlite3_close(make_db(TEST_SRC "/d.db", 1));
+    assert_int_equal(access(TEST_SRC "/d.db-wal", F_OK), -1);
+    r = copy_untouched(TEST_SRC "/d.db", TEST_TMPD "/d.copy", 0);
+    assert_int_equal(r.outcome, SQLITE_COPY_OK);
+    assert_int_equal(r.wal, 1);
+    assert_int_equal(check_db(TEST_TMPD "/d.copy"), 1);
+
+    /* The leftovers that copy used to leave, an empty -wal and a -shm
+     * nobody holds: read through them, still changing nothing. */
+    sqlite3 *h = NULL;
+    assert_int_equal(sqlite3_open_v2(TEST_SRC "/d.db", &h, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    exec_ok(h, "SELECT COUNT(*) FROM ledger");
+    sqlite3_close(h);
+    assert_int_equal(access(TEST_SRC "/d.db-shm", F_OK), 0);
+    r = copy_untouched(TEST_SRC "/d.db", TEST_TMPD "/d.copy", 0);
+    assert_int_equal(r.outcome, SQLITE_COPY_OK);
+    assert_int_equal(check_db(TEST_TMPD "/d.copy"), 1);
+
+    /* A rollback-journal database, refused and allowed. */
+    sqlite3_close(make_db(TEST_SRC "/r.db", 0));
+    r = copy_untouched(TEST_SRC "/r.db", TEST_TMPD "/r.copy", 0);
+    assert_int_equal(r.outcome, SQLITE_COPY_REFUSED);
+    assert_int_equal(r.wal, 0);
+    r = copy_untouched(TEST_SRC "/r.db", TEST_TMPD "/r.copy", 1);
+    assert_int_equal(r.outcome, SQLITE_COPY_OK);
+    assert_int_equal(check_db(TEST_TMPD "/r.copy"), 1);
+
+    /* A live writer holding commits in its -wal, idle while the copy runs:
+     * every one of them is in the copy, and nothing changed. */
+    sqlite3_close(make_db(TEST_SRC "/w.db", 1));
+    child_t c;
+    child_start(TEST_SRC "/w.db", 40, 0, &c);
+    assert_int_equal(c.top, 41);
+    r = copy_untouched(TEST_SRC "/w.db", TEST_TMPD "/w.copy", 0);
+    assert_int_equal(r.outcome, SQLITE_COPY_OK);
+    assert_int_equal(r.wal, 1);
+    assert_int_equal(check_db(TEST_TMPD "/w.copy"), c.top);
+    child_stop(&c);
+
+    /* A writer that keeps committing: a whole commit, and no new names. */
+    child_start(TEST_SRC "/w.db", 1, 1, &c);
+    for (int k = 0; k < 3; k++) {
+        sqlite_copy(TEST_SRC "/w.db", TEST_TMPD "/w.copy", 0, &r);
+        assert_int_equal(r.outcome, SQLITE_COPY_OK);
+        assert_true(check_db(TEST_TMPD "/w.copy") >= c.top);
+    }
+    child_stop(&c);
+
+    /* A crashed writer's commits in the -wal with its -shm gone: reading
+     * them would create a -shm, so refused, and said to be WAL (B259). */
+    child_start(TEST_SRC "/w.db", 5, 0, &c);
+    assert_int_equal(kill(c.pid, SIGKILL), 0);
+    int st = 0;
+    assert_int_equal(waitpid(c.pid, &st, 0), c.pid);
+    close(c.go);
+    assert_int_equal(unlink(TEST_SRC "/w.db-shm"), 0);
+    r = copy_untouched(TEST_SRC "/w.db", TEST_TMPD "/w.copy", 0);
+    assert_int_equal(r.outcome, SQLITE_COPY_REFUSED);
+    assert_int_equal(r.wal, 1);
+    assert_non_null(strstr(r.reason, "-shm"));
+    assert_int_equal(access(TEST_TMPD "/w.copy", F_OK), -1);
+
+    /* A directory the daemon cannot write: no longer refused for want of
+     * a -shm it could create. Root writes anyway, so only as a user. */
+    if (geteuid() != 0) {
+        assert_int_equal(chmod(TEST_SRC, 0555), 0);
+        r = copy_untouched(TEST_SRC "/d.db", TEST_TMPD "/d.copy", 0);
+        assert_int_equal(chmod(TEST_SRC, 0755), 0);
+        assert_int_equal(r.outcome, SQLITE_COPY_OK);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -550,6 +783,46 @@ static void test_backup_copy_refused(void **state)
     assert_true(db_captures_total(SQLITE_COPY_REFUSED) >= 1);
 }
 
+/* A backup with engine copies of a dormant WAL database, a rollback one
+ * and one a live writer holds changes nothing in the source, and the next
+ * backup reads the same files (B247: it read the copy's own -wal and -shm
+ * as a sign of life). */
+static void test_backup_leaves_source_alone(void **state)
+{
+    (void)state;
+    sqlite3_close(make_db(TEST_SRC "/d.db", 1));
+    sqlite3_close(make_db(TEST_SRC "/r.db", 0));
+    sqlite3_close(make_db(TEST_SRC "/w.db", 1));
+    write_rand(TEST_SRC "/plain.bin", 10000, 7, "wb");
+    enable_copy(TEST_SRC "/d.db", NULL);
+    enable_copy(TEST_SRC "/r.db", "{\"allow_rollback_lock\":true}");
+    enable_copy(TEST_SRC "/w.db", NULL);
+    child_t c;
+    child_start(TEST_SRC "/w.db", 10, 0, &c);
+
+    dirstate_t a, b;
+    dir_state(TEST_SRC, &a);
+    run_t r = run_file_backup(0);
+    dir_state(TEST_SRC, &b);
+    assert_dir_same(&a, &b);
+    assert_non_null(r.caps_json);
+    size_t ok = 0;
+    for (const char *p = r.caps_json; (p = strstr(p, "\"outcome\":\"ok\"")); p++) ok++;
+    assert_int_equal(ok, 3);
+    uint64_t files = r.res.files;
+    run_free(&r);
+
+    r = run_file_backup(0);
+    dir_state_free(&b);
+    dir_state(TEST_SRC, &b);
+    assert_dir_same(&a, &b);
+    assert_int_equal(r.res.files, files);
+    run_free(&r);
+    dir_state_free(&a);
+    dir_state_free(&b);
+    child_stop(&c);
+}
+
 /* Nothing enabled, or detection off: no plan, no reserved directory. */
 static void test_no_plan(void **state)
 {
@@ -634,10 +907,12 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_copy_wal_under_writer, setup, teardown),
         cmocka_unit_test_setup_teardown(test_copy_rollback_rule, setup, teardown),
         cmocka_unit_test_setup_teardown(test_copy_abandoned, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_copy_leaves_source_alone, setup, teardown),
         cmocka_unit_test_setup_teardown(test_raw_read_once_with_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_and_restore_explain, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_with_engine_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_copy_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_backup_leaves_source_alone, setup, teardown),
         cmocka_unit_test_setup_teardown(test_no_plan, setup, teardown),
         cmocka_unit_test(test_messages),
     };

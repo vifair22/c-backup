@@ -610,7 +610,7 @@ stdout comes back as the pipe fd a policy dump hook's does; the run is waited
 for with `hook.wait` as any other; `hook.wait` with `kill` stops a run
 first, SIGTERM to its process group and SIGKILL 3 s later, which is how a
 cancelled job ends a dump that would otherwise run to its timeout (B248).
-No template prompts: see `db-detection.md` 14.6. `user` comes from the catalog
+No template prompts: see `db-detection.md` 14.7. `user` comes from the catalog
 (`nextcloud-maintenance` as `www-data`); the fake backend runs a template as
 a local process found on the helper's `PATH`, which is how the suites run
 them. A provider with no container (libvirt) refuses templates as
