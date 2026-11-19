@@ -99,6 +99,8 @@ static const char *const call_names[C__COUNT] = {
 
 static _Atomic uint64_t g_calls[C__COUNT];
 static _Atomic uint64_t g_ns[C__COUNT];
+/* Bytes moved, for the calls that move them (read, pread, write, pwrite). */
+static _Atomic uint64_t g_bytes[C__COUNT];
 
 static inline uint64_t now_ns(void)
 {
@@ -147,6 +149,7 @@ static char     g_mark_label[MAX_MARKS][64];
 static uint64_t g_mark_ns[MAX_MARKS];
 static uint64_t g_mark_calls[MAX_MARKS][C__COUNT];
 static uint64_t g_mark_cns[MAX_MARKS][C__COUNT];
+static uint64_t g_mark_bytes[MAX_MARKS][C__COUNT];
 static unsigned g_nmarks;
 
 static void on_tick(int sig, siginfo_t *si, void *uc)
@@ -179,6 +182,7 @@ static void snapshot_mark(const char *label)
     for (int c = 0; c < C__COUNT; c++) {
         g_mark_calls[m][c] = atomic_load(&g_calls[c]);
         g_mark_cns[m][c]   = atomic_load(&g_ns[c]);
+        g_mark_bytes[m][c] = atomic_load(&g_bytes[c]);
     }
 }
 
@@ -245,14 +249,16 @@ static void write_counters(FILE *f)
     for (unsigned m = 0; m + 1 < g_nmarks; m++) {
         double secs = (double)(g_mark_ns[m + 1] - g_mark_ns[m]) / 1e9;
         fprintf(f, "== segment %u: %s (%.3f s)\n", m, g_mark_label[m], secs);
-        fprintf(f, "   %-16s %12s %12s %10s\n", "call", "count", "total ms", "us/call");
+        fprintf(f, "   %-16s %12s %12s %10s %14s\n", "call", "count", "total ms", "us/call",
+                "bytes");
         for (int c = 0; c < C__COUNT; c++) {
             uint64_t n  = g_mark_calls[m + 1][c] - g_mark_calls[m][c];
             uint64_t ns = g_mark_cns[m + 1][c] - g_mark_cns[m][c];
             if (!n) continue;
-            fprintf(f, "   %-16s %12llu %12.1f %10.2f\n", call_names[c],
+            uint64_t by = g_mark_bytes[m + 1][c] - g_mark_bytes[m][c];
+            fprintf(f, "   %-16s %12llu %12.1f %10.2f %14llu\n", call_names[c],
                     (unsigned long long)n, (double)ns / 1e6,
-                    (double)ns / 1e3 / (double)n);
+                    (double)ns / 1e3 / (double)n, (unsigned long long)by);
         }
     }
     write_sql(f);
@@ -310,6 +316,18 @@ static void prof_fini(void)
 /* ---------------------------------------------------------------- */
 /* Wrappers                                                          */
 /* ---------------------------------------------------------------- */
+
+/* WRAP, also counting the bytes a successful call moved. */
+#define WRAPB(ret, name, C, params, args) \
+    ret name params { \
+        static ret (*real) params; \
+        RESOLVE(real, #name); \
+        uint64_t t0 = now_ns(); \
+        ret r = real args; \
+        account(C, t0); \
+        if (r > 0) atomic_fetch_add_explicit(&g_bytes[C], (uint64_t)r, memory_order_relaxed); \
+        return r; \
+    }
 
 #define WRAP(ret, name, C, params, args) \
     ret name params { \
@@ -380,12 +398,12 @@ int fcntl64(int fd, int cmd, ...)
 }
 
 WRAP(int, close, C_close, (int fd), (fd))
-WRAP(ssize_t, read, C_read, (int fd, void *b, size_t n), (fd, b, n))
-WRAP(ssize_t, pread, C_pread, (int fd, void *b, size_t n, off_t o), (fd, b, n, o))
-WRAP(ssize_t, pread64, C_pread, (int fd, void *b, size_t n, off_t o), (fd, b, n, o))
-WRAP(ssize_t, write, C_write, (int fd, const void *b, size_t n), (fd, b, n))
-WRAP(ssize_t, pwrite, C_pwrite, (int fd, const void *b, size_t n, off_t o), (fd, b, n, o))
-WRAP(ssize_t, pwrite64, C_pwrite, (int fd, const void *b, size_t n, off_t o), (fd, b, n, o))
+WRAPB(ssize_t, read, C_read, (int fd, void *b, size_t n), (fd, b, n))
+WRAPB(ssize_t, pread, C_pread, (int fd, void *b, size_t n, off_t o), (fd, b, n, o))
+WRAPB(ssize_t, pread64, C_pread, (int fd, void *b, size_t n, off_t o), (fd, b, n, o))
+WRAPB(ssize_t, write, C_write, (int fd, const void *b, size_t n), (fd, b, n))
+WRAPB(ssize_t, pwrite, C_pwrite, (int fd, const void *b, size_t n, off_t o), (fd, b, n, o))
+WRAPB(ssize_t, pwrite64, C_pwrite, (int fd, const void *b, size_t n, off_t o), (fd, b, n, o))
 WRAP(int, fstat, C_fstat, (int fd, struct stat *s), (fd, s))
 WRAP(int, fstat64, C_fstat, (int fd, struct stat64 *s), (fd, s))
 WRAP(int, stat, C_stat, (const char *p, struct stat *s), (p, s))
