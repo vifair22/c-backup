@@ -660,7 +660,7 @@ static void test_a_backup_whose_snapshot_is_in_the_repository_completes_at_start
         "INSERT INTO jobs (id, repo_id, action, state, started, snapshots_expected)"
         " VALUES (14, 1, 'units', 'running', strftime('%s','now'), 2),"
         "        (15, 1, 'units', 'running', strftime('%s','now'), 2)", NULL, NULL), 0);
-    /* As job_note_snapshot leaves them, and migration 014 for 11-13. */
+    /* As job_note_snapshot leaves them, and migration 015 for 11-13. */
     assert_int_equal(db_execute_non_query(db,
         "INSERT INTO job_snapshots (job_id, snap_id) VALUES"
         " (11, 3), (12, 5), (13, 2), (14, 3), (14, 4), (15, 6), (15, 7)", NULL, NULL), 0);

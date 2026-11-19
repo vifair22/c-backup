@@ -337,12 +337,12 @@ static void test_one_baseline_migration(void **state)
     /* The snapshot a running backup is writing (B238). */
     assert_non_null(app_migrations[11].name);
     assert_string_equal(app_migrations[11].name, "013_job_snapshot.sql");
-    /* Every snapshot a running job writes, and how many (B267). */
-    assert_non_null(app_migrations[12].name);
-    assert_string_equal(app_migrations[12].name, "014_job_snapshots.sql");
     /* Partial indexes for verify's node rules (B268). */
+    assert_non_null(app_migrations[12].name);
+    assert_string_equal(app_migrations[12].name, "014_verify_node_rules.sql");
+    /* Every snapshot a running job writes, and how many (B267). */
     assert_non_null(app_migrations[13].name);
-    assert_string_equal(app_migrations[13].name, "014_verify_node_rules.sql");
+    assert_string_equal(app_migrations[13].name, "015_job_snapshots.sql");
     assert_null(app_migrations[14].name);
 
     /* A database written before the baseline already has its tables, so
