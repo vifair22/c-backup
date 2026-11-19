@@ -10,6 +10,7 @@
 #include "progress.h"
 #include "util.h"
 #include "thread_name.h"
+#include "pack_writeback.h"
 #include <cutils/log.h>
 
 #include <dirent.h>
@@ -2895,6 +2896,11 @@ typedef struct {
  * backup of large files half as fast as the 1.0 writer, which started
  * writeback as it went. Asking early keeps the disk busy from the first
  * chunk; the seal's fsync still decides durability.
+ *
+ * Asked on the writeback thread, never here (B232): submitting the range
+ * waits in the block layer's throttle on a busy device, 19 s on FS2, and
+ * the backup appends inside its batch transaction, so every writer in the
+ * daemon waited with it. See pack_writeback.h.
  */
 #define PACK_WB_STEP ((uint64_t)8 * 1024 * 1024)
 
@@ -2912,8 +2918,7 @@ static status_t pw_writeback(pack_writer_t *pw)
     if (!pw->dat_f || end < pw->wb_done + PACK_WB_STEP) return OK;
 #ifdef __linux__
     if (fflush(pw->dat_f) != 0) return set_error_errno(ERR_IO, "pack: write to %s", pw->dat_tmp);
-    (void)sync_file_range(fileno(pw->dat_f), (off_t)pw->wb_done,
-                          (off_t)(end - pw->wb_done), SYNC_FILE_RANGE_WRITE);
+    pack_writeback_start(fileno(pw->dat_f), pw->wb_done, end - pw->wb_done);
 #endif
     pw->wb_done = end;
     return OK;

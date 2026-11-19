@@ -80,6 +80,10 @@ extern ssize_t __real_pwrite(int, const void *, size_t, off_t);
 extern int (*volatile fault_rename_hook)(const char *from, const char *to);
 extern int (*volatile fault_unlink_hook)(const char *path);
 extern int (*volatile fault_sync_hook)(int fd, int data_only);
+/* sync_file_range(2) asks this first; FAULT_FS_PASS hands the call on.
+ * A hook may block, to stand in for a device that is slow to take the
+ * range (B232). */
+extern int (*volatile fault_sfr_hook)(int fd);
 extern int __real_unlink(const char *);
 
 /* Every write(2), pwrite(2) and fwrite(3) asks this first with the
