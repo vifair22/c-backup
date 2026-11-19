@@ -26,6 +26,7 @@ import {
 import { absoluteTime, fmtNum, fmtSize } from './format'
 import { followJob, jobIdOf } from './followJob'
 import { ExportsPanel } from './ExportsPanel'
+import { ProvidersPanel } from './ProvidersPanel'
 
 const api = window.cbackup
 
@@ -187,6 +188,8 @@ export function UnitsView({ connName, repoPath, onBack, onOpenUnit, initialProvi
   const [allow, setAllow] = useState('')
   const [provider, setProvider] = useState<string | undefined>(initialProvider)
   const [providersError, setProvidersError] = useState<string | null>(null)
+  const [providersData, setProvidersData] = useState<WireProviders | null>(null)
+  const [showProviders, setShowProviders] = useState(false)
 
   const [rows, setRows] = useState<UnitRow[]>([])
   const [total, setTotal] = useState(0)
@@ -209,6 +212,7 @@ export function UnitsView({ connName, repoPath, onBack, onOpenUnit, initialProvi
       const list = r.providers ?? []
       setProviders(list)
       setAllow(r.allow ?? '')
+      setProvidersData({ daemon_id: '', allow: '', holds_open: 0, ...r, providers: list })
       setProvider(p => p ?? list.find(x => x.enabled)?.name)
     }).catch(err => { if (!cancelled) setProvidersError(String(err instanceof Error ? err.message : err)) })
     return () => { cancelled = true }
@@ -282,6 +286,23 @@ export function UnitsView({ connName, repoPath, onBack, onOpenUnit, initialProvi
       </div>
 
       {providersError && <div className="text-status-error text-sm mb-3">{providersError}</div>}
+
+      {providersData && (
+        <div className="mb-3">
+          {/* With no provider enabled the panel is the answer, always open. */}
+          {enabled.length > 0 && (
+            <button onClick={() => setShowProviders(v => !v)} aria-expanded={showProviders}
+              className="text-[11px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer p-0">
+              {showProviders ? 'Hide providers and helper' : 'Providers and helper'}
+            </button>
+          )}
+          {(showProviders || enabled.length === 0) && (
+            <div className="mt-2 p-2 rounded border border-border-default">
+              <ProvidersPanel data={providersData} />
+            </div>
+          )}
+        </div>
+      )}
 
       {providers !== null && enabled.length === 0 ? (
         <div className="text-text-muted text-sm">

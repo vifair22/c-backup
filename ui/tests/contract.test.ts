@@ -215,6 +215,13 @@ const SAMPLES: Record<ApiKind, ApiRequest> = {
 
   /* Snapshot 1 is a file snapshot, not a unit's: the handlers refuse it
    * by name, and an export id nothing issued is the handler's 404. */
+  /* No provider on the contract daemon: the policy write and the chain
+   * routes are refused for the unit, by the handler. */
+  unitPolicyGet:   { kind: 'unitPolicyGet', repoId: 1, provider: 'fake', unit: 'contract-probe' },
+  unitPolicySet:   { kind: 'unitPolicySet', repoId: 1, provider: 'fake', unit: 'contract-probe',
+                     values: { 'retention.keep_daily': '7' } },
+  unitCheckpoints: { kind: 'unitCheckpoints', repoId: 1, provider: 'libvirt', unit: 'contract-probe' },
+  unitResetIncremental: { kind: 'unitResetIncremental', repoId: 1, provider: 'libvirt', unit: 'contract-probe' },
   unitRestore:     { kind: 'unitRestore', repoId: 1, snapshotId: 1,
                      restore: { mode: 'files', dest: '/nonexistent/contract-probe' } },
   exportCreate:    { kind: 'exportCreate', repoId: 1, snapshotId: 1, item: 'vda', ttlS: 600 },

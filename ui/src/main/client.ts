@@ -361,6 +361,21 @@ export function toEndpoint(req: ApiRequest): Endpoint {
         },
       }
 
+    case 'unitPolicyGet':
+      return { method: 'GET', path: `/repos/${req.repoId}/units/${seg(req.provider)}/${seg(req.unit)}/policy` }
+    case 'unitPolicySet':
+      return {
+        method: 'PUT',
+        path: `/repos/${req.repoId}/units/${seg(req.provider)}/${seg(req.unit)}/policy`,
+        body: req.values,
+      }
+    case 'unitCheckpoints':
+      return { method: 'GET', path: `/repos/${req.repoId}/units/${seg(req.provider)}/${seg(req.unit)}/checkpoints` }
+    case 'unitResetIncremental':
+      return {
+        method: 'POST',
+        path: `/repos/${req.repoId}/units/${seg(req.provider)}/${seg(req.unit)}/reset-incremental`,
+      }
     case 'unitRestore':
       return {
         method: 'POST',
