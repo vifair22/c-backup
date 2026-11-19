@@ -11,7 +11,10 @@
  *
  * Jobs that were running when the daemon died are marked failed on the next
  * start rather than left claiming to be in progress, since nothing is
- * resuming them.
+ * resuming them. The exception is a backup whose snapshot record reached
+ * the repository before the daemon died (job_note_snapshot): that job is
+ * recorded completed, matched to the snapshot, because the repository is
+ * the source of truth and its snapshot is real (B238).
  */
 
 #include "error.h"
@@ -273,3 +276,31 @@ typedef struct {
 int      job_end_unrecorded(cutils_db_t *db, int64_t job_id, job_end_view_t *out);
 /* How many ends on db are held in memory. */
 unsigned job_ends_unrecorded(cutils_db_t *db);
+
+/*
+ * 1 while job_id's end is being written and is not durable yet (B238).
+ *
+ * state.db runs synchronous=NORMAL, and every thread reads through the one
+ * connection that writes, so a job's end is readable the moment its
+ * transaction writes it, a second or so before the WAL holding it is
+ * synced. A client that saw "completed" in that window and then lost the
+ * power got the job back as "failed: interrupted by daemon restart", and
+ * the natural retry made a second snapshot. The worker now makes every end
+ * durable before it is shown: anything showing a job asks this after
+ * reading the row and, when it answers 1, shows the job as still running.
+ * Asked after the read, so a row read before the end was durable is never
+ * shown as ended.
+ */
+int      job_end_settling(cutils_db_t *db, int64_t job_id);
+
+/*
+ * The snapshot a running job is about to write (B238), recorded on its row
+ * and made durable before the snapshot record can exist. The next start
+ * uses it to tell a job that died before its snapshot from one that died
+ * after: the second is completed, matched to its snapshot, because the
+ * repository says it is. Called by the backup between allocating the
+ * snapshot id and writing its record (backup_opts_t.record_hook); not
+ * while holding the write lock. ERR_IO when it could not be made durable,
+ * which the backup treats as a failure before anything is written.
+ */
+status_t job_note_snapshot(void *progress_ctx, int64_t snap_id);
