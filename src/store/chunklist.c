@@ -675,9 +675,11 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
             io_add(1, t0);
             if (st != OK) *wf = 1;
         }
-        if (st == OK) store_io_progress(store, len);
         free(data);
         read_budget_release(taken);
+        /* After the release: the callback may load (restore's read-ahead
+         * opens chunk lists), and read_budget.h forbids nesting. */
+        if (st == OK) store_io_progress(store, len);
         if (st == OK && out_size) *out_size = len;
         return st;
     }
