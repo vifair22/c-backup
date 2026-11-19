@@ -103,5 +103,31 @@ void file_cache_put(cutils_db_t *db, int64_t repo_id, const char *path,
  */
 void file_cache_forget_run(cutils_db_t *db, int64_t repo_id, int64_t seen_at);
 
+/*
+ * Provisional rows (B293). A run whose writers share chunk claims writes
+ * its rows with seen_at = -stamp, which file_cache_lookup never trusts, and
+ * confirms them once every writer of the run has committed. A file's
+ * content can be a chunk list in one writer's pack naming a chunk another
+ * writer is still storing; that pack can commit first, and a power cut
+ * there kept the list's row and the file's cache row and lost the chunk.
+ * The next run reused the list unread, and with the chunk's own file gone
+ * by then nothing stored it again: a snapshot naming bytes the repository
+ * did not hold. A crashed run's provisional rows are never confirmed, so
+ * its files are read again; the next run's rows replace them. forget_run
+ * drops both kinds. Best effort, logged on failure.
+ */
+void file_cache_confirm_run(cutils_db_t *db, int64_t repo_id, int64_t stamp);
+
+/*
+ * The stat the file cache keys an entry on: its own, except that a snapshot
+ * read's entry carries the record root's live device in place of the
+ * snapshot's (scan.h, rec_dev). The rows a snapshot read writes then match
+ * a live read of the same files and the reverse, and the device is still
+ * compared, so a row from another filesystem is never trusted (B229). buf
+ * holds the copy when one is needed.
+ */
+struct scan_entry;
+const struct stat *file_cache_key_stat(const struct scan_entry *e, struct stat *buf);
+
 void file_cache_sweep(cutils_db_t *db, int64_t repo_id,
                       const char *const *paths, size_t n_paths);
