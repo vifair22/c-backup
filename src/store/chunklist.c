@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "chunklist.h"
+#include "pack_writeback.h"
 #include "object.h"
 #include "read_budget.h"
 #include "util.h"
@@ -646,6 +647,24 @@ static void io_add(int write, uint64_t t0)
     else       { t->load_ns += d;  t->loads++; }
 }
 
+/*
+ * Writeback of restored content starts as it is written, on the shared
+ * writeback thread (pack_writeback.h), every RESTORE_WB_STEP and at the end
+ * of anything past RESTORE_WB_MIN.
+ *
+ * Restore makes its files durable in batches with one syncfs (restore.c),
+ * and with the kernel's default ratios a batch of 1 GiB sits far under the
+ * background dirty threshold of a host with tens of GiB of memory, so
+ * nothing reached the device until that syncfs: the restore read and decoded a gigabyte with
+ * the disk idle for writes, then waited with the disk busy and nothing
+ * being read. Starting writeback here lets the two overlap; the syncfs
+ * still decides durability and still comes before any rename, so what a
+ * crash can leave is unchanged. Small files are left to the syncfs: a
+ * request each would cost more than it saves.
+ */
+#define RESTORE_WB_STEP ((uint64_t)8 * 1024 * 1024)
+#define RESTORE_WB_MIN  ((uint64_t)1024 * 1024)
+
 status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                                int out_fd, uint64_t *out_size, int *out_write_failed)
 {
@@ -674,6 +693,7 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
             st = pwrite_full(out_fd, data, len, 0);
             io_add(1, t0);
             if (st != OK) *wf = 1;
+            else if (len >= RESTORE_WB_MIN) pack_writeback_start(out_fd, 0, len);
         }
         free(data);
         read_budget_release(taken);
@@ -693,6 +713,7 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
     if (st != OK) return st;
     /* The length from the iterator, which holds the root header it checked. */
     uint64_t total = chunklist_iter_total(it);
+    uint64_t wb_done = 0, wb_end = 0;   /* hinted, and written, up to */
     for (;;) {
         chunklist_item_t x;
         int done = 0;
@@ -709,10 +730,17 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
         io_add(1, t0);
         leaf_free(data, x.length);
         if (st != OK) { *wf = 1; break; }
+        if (x.offset + x.length > wb_end) wb_end = x.offset + x.length;
+        if (wb_end - wb_done >= RESTORE_WB_STEP) {
+            pack_writeback_start(out_fd, wb_done, wb_end - wb_done);
+            wb_done = wb_end;
+        }
         store_io_progress(store, x.length);
     }
     chunklist_iter_close(it);
     if (st != OK) return st;
+    if (wb_end > wb_done && wb_end >= RESTORE_WB_MIN)
+        pack_writeback_start(out_fd, wb_done, wb_end - wb_done);
     /* Extends over any trailing hole, and leaves interior gaps unwritten,
      * which on a fresh file is what makes them holes. */
     if (ftruncate(out_fd, (off_t)total) != 0) {

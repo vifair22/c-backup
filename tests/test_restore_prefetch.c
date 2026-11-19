@@ -2,14 +2,16 @@
 
 /*
  * Restore keeps the device busy: it asks for the next objects' reads before
- * it needs them (restore_prefetch.h).
+ * it needs them (restore_prefetch.h) and starts writeback of what it has
+ * written before its batch sync (chunklist.c, RESTORE_WB_STEP).
  *
- * A hint leaves nothing in a restored tree to say whether it ran; on a
- * developer's tmpfs it costs and saves nothing. What the suite checks is the
- * calls themselves, caught by defining posix_fadvise in this executable,
- * which the library objects linked into it then call: the read-ahead covers
- * the content of every file large enough to get it, and a resumed restore
- * asks for nothing it is going to skip. The restored tree
+ * Both are hints, so nothing in a restored tree says whether they ran; on a
+ * developer's tmpfs they cost and save nothing. What the suite checks is the
+ * calls themselves, caught by defining posix_fadvise and sync_file_range in
+ * this executable, which the library objects linked into it then call: the
+ * read-ahead covers the content of every file large enough to get it, a
+ * resumed restore asks for nothing it is going to skip, and writeback is
+ * started for every restored file large enough to get it. The restored tree
  * is compared byte for byte throughout, since a hint must never change what
  * lands.
  */
@@ -32,6 +34,7 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "pack_writeback.h"
 #include "repo.h"
 #include "restore.h"
 #include "store.h"
@@ -55,6 +58,7 @@ static int64_t        repo_id;
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_willneed, g_willneed_bytes;
+static uint64_t g_sfr, g_sfr_bytes;
 
 int posix_fadvise(int fd, off_t off, off_t len, int advice)
 {
@@ -72,10 +76,25 @@ int posix_fadvise(int fd, off_t off, off_t len, int advice)
     return real ? real(fd, off, len, advice) : 0;
 }
 
+int sync_file_range(int fd, off_t off, off_t len, unsigned int flags)
+{
+    static int (*real)(int, off_t, off_t, unsigned int);
+    if (!real) {
+        void *p = dlsym(RTLD_NEXT, "sync_file_range");
+        memcpy(&real, &p, sizeof(p));
+    }
+    pthread_mutex_lock(&g_mu);
+    g_sfr++;
+    g_sfr_bytes += (uint64_t)len;
+    pthread_mutex_unlock(&g_mu);
+    return real ? real(fd, off, len, flags) : 0;
+}
+
 static void counts_reset(void)
 {
+    pack_writeback_drain();
     pthread_mutex_lock(&g_mu);
-    g_willneed = g_willneed_bytes = 0;
+    g_willneed = g_willneed_bytes = g_sfr = g_sfr_bytes = 0;
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -228,12 +247,34 @@ static void test_subpath_restore_asks_only_for_its_files(void **state)
     assert_true(g_willneed_bytes < BIG_B + MID_C + BIG_A);
 }
 
+/*
+ * Writeback starts for every restored file of 1 MiB or more, all of it,
+ * before the batch sync would have started it; the smaller ones are left
+ * to that sync.
+ */
+static void test_restore_starts_writeback_of_large_files(void **state)
+{
+    (void)state;
+    int64_t snap = backup_src();
+    counts_reset();
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, TEST_DST, NULL, &rr), OK);
+    assert_int_equal(trees_differ(), 0);
+    pack_writeback_drain();
+
+    assert_true(g_sfr >= 2);
+    assert_true(g_sfr_bytes >= BIG_A + BIG_B);
+    assert_true(g_sfr_bytes < BIG_A + BIG_B + MID_C);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_restore_asks_for_reads_ahead, setup, teardown),
         cmocka_unit_test_setup_teardown(test_resumed_restore_asks_for_nothing_it_skips, setup, teardown),
         cmocka_unit_test_setup_teardown(test_subpath_restore_asks_only_for_its_files, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_starts_writeback_of_large_files, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
