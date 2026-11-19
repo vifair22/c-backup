@@ -10,6 +10,7 @@
 
 #include "error.h"
 #include "helper_policy.h"
+#include "helper_proto.h"
 #include "provider.h"
 
 #define CUTILS_CJSON_ALLOW
@@ -45,6 +46,9 @@ typedef struct helper_backend {
     /* 1 when finished, with *status the exit status (128+sig for a signal). */
     int      (*hook_poll)(helper_run_t *r, int *status);
     void     (*hook_kill)(helper_run_t *r);
+    /* One signal to the run's whole process group, without waiting: the
+     * server's TERM, grace, KILL sequence (B248). NULL: hook_kill alone. */
+    void     (*hook_signal)(helper_run_t *r, int sig);
     void     (*hook_free)(helper_run_t *r);
     /* Re-create the unit from a definition the helper parses field by field.
      * *result is a JSON object for the response (warnings, the image pulled).

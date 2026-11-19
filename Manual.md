@@ -5110,7 +5110,20 @@ element of its own, or a positional argument after the script). Credentials
 are read inside the database's container, from its own environment
 (`$POSTGRES_USER`, `$MARIADB_ROOT_PASSWORD`, `$MONGO_INITDB_ROOT_PASSWORD`,
 `REDISCLI_AUTH`, `$DOCKER_INFLUXDB_INIT_ADMIN_TOKEN`), so c-backup neither
-stores nor sees them.
+stores nor sees them. The PostgreSQL templates that connect as
+`POSTGRES_USER` use `$POSTGRES_PASSWORD` when the container has no
+`PGPASSWORD` of its own.
+
+A template never prompts: nobody could answer, and a dump waiting on a
+prompt would wait out its six-hour timeout. The PostgreSQL tools run with
+`-w`, every script reads stdin from `/dev/null`, and `mongodump` given a user
+with no password is not started. A missing or refused credential fails the
+template at once, and the job's warning names the template and how to give
+its engine the credential, for example:
+
+```
+dump template pg-basebackup could not authenticate (exit 1) and never prompts; not stored: PostgreSQL wants a password: give the container PGPASSWORD (or POSTGRES_PASSWORD, for POSTGRES_USER) in its environment, a ~/.pgpass for the user the tool runs as, or a trust or peer line for local connections in pg_hba.conf
+```
 
 | Template | Engine | Kind | Parameters | Allowed by default |
 |---|---|---|---|---|
@@ -5156,10 +5169,12 @@ template's probe through the helper (`db.probe`, at most 30 s, output capped
 at 64 KiB): `psql -Atc 'select version()'` for PostgreSQL, the non-InnoDB
 tables for MariaDB, `PING` for Redis, `sqlite3 -version`, the admin API's
 flags for Prometheus, `php occ status` for Nextcloud. `verified` is true when
-the probe exited 0. An unverified template still enables; the preview only
-says so. With no `--template`, a preview shows the finding's suggestion, or
-what is enabled, or for a covered finding the engine's default dump; a file
-source's SQLite finding always previews `sqlite-backup`, its one engine copy.
+the probe exited 0. A probe that failed for want of a credential carries
+`probe.credentials`, the same sentence a backup's warning would. An
+unverified template still enables; the preview only says so. With no
+`--template`, a preview shows the finding's suggestion, or what is enabled,
+or for a covered finding the engine's default dump; a file source's SQLite
+finding always previews `sqlite-backup`, its one engine copy.
 
 **Enable** (`POST /repos/<id>/databases/<f>/enable`, body
 `{"template":"pg-dumpall","params":{}}`) records the template and its
@@ -5186,6 +5201,10 @@ enabled template stops at the next backup.
   and its post run once the capture has its point in time, or has failed (a
   maintenance mode is never left on). Its log, both runs, is
   `.cbackup-unit/hooks/<template>.log`.
+- `c-backup jobs cancel` stops a running dump, or an exec template's pre
+  run: SIGTERM to its whole process group, SIGKILL 3 seconds later, and the
+  job ends cancelled within seconds; the dump is not stored. A post run is
+  never stopped, since it undoes the pre run.
 - The finding's coverage reflects it: a stored dump is a consistent copy at
   its own instant, so the finding is `covered-application` whatever the
   capture was; an exec template lifts a capture that was already one
