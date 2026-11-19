@@ -914,6 +914,16 @@ static void test_restore_define(void **state)
     assert_int_equal(stat(pf("%s/vda.img.cbackup-old-502", D), &sb), 0);
     assert_int_equal(stat(pf("%s/tpm-states/" UUID ".cbackup-old-502", D), &sb), 0);
     assert_true(file_is(pf("%s/tpm-states/" UUID "/tpm2-00.permall", D), "TPM-STATE", 9));
+    /* B258: a target root that cannot be written (under a regular file)
+     * fails having written nothing, and says so rather than "remove it". */
+    put(pf("%s/notadir", D), "x", 1);
+    memset(&o, 0, sizeof(o));
+    o.name = "cbk-uat-v1-b258";
+    o.target_root = pf("%s/notadir/restored", D);
+    assert_int_not_equal(unit_define_run(store, db, repo_id, offline_snap, 504, &o, &dr), OK);
+    if (!strstr(err_msg(), "nothing was written under") || strstr(err_msg(), "stays there"))
+        fail_msg("unwritable target root: %s", err_msg());
+    err_clear();
     /* A new name without a target root, and in place without replace. */
     memset(&o, 0, sizeof(o));
     o.name = "other";

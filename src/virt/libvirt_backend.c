@@ -714,6 +714,62 @@ static status_t cp_delete(struct sp_ctx *c, virDomainPtr dom, const char *uuid, 
     return cp_delete_ex(c, dom, uuid, name, 0);
 }
 
+/*
+ * A domain replaced in place (7.2 step 6, B251): every checkpoint of ours on
+ * it deleted as metadata only, leaves first, and every record of its UUID
+ * dropped. The bitmaps they name were in the images the restore just moved
+ * aside, so none can be a base again, and one left behind made every later
+ * backup's retire fail on the missing bitmap and kept `virsh undefine`
+ * refusing the domain. A foreign checkpoint is left alone. Returns how many
+ * were deleted; *fail gets the first failure, for a warning: the restore
+ * itself has succeeded by now.
+ */
+static unsigned cp_retire_domain(struct sp_ctx *c, virDomainPtr dom, const char *uuid,
+                                 char *fail, size_t fsz)
+{
+    fail[0] = '\0';
+    virDomainCheckpointPtr *cps = NULL;
+    int n = virDomainListAllCheckpoints(dom, &cps, VIR_DOMAIN_CHECKPOINT_LIST_TOPOLOGICAL);
+    if (n < 0) {
+        snprintf(fail, fsz, "listing its checkpoints: %.300s", verr());
+        err_clear();
+        n = 0;
+    }
+    unsigned gone = 0;
+    /* Topological lists parents first: backwards, a child goes before its
+     * parent. */
+    for (int i = n - 1; i >= 0; i--) {
+        if (cp_ours(c, cps[i])) {
+            const char *nm = virDomainCheckpointGetName(cps[i]);
+            if (virDomainCheckpointDelete(cps[i], VIR_DOMAIN_CHECKPOINT_DELETE_METADATA_ONLY) == 0) {
+                if (nm) rec_drop(c, uuid, nm);
+                gone++;
+            } else {
+                if (!fail[0]) snprintf(fail, fsz, "checkpoint %.100s: %.300s", nm ? nm : "?", verr());
+                err_clear();
+            }
+        }
+        virDomainCheckpointFree(cps[i]);
+    }
+    free(cps);
+    /* Records whose checkpoint libvirt had already lost: nothing to redefine
+     * them onto any more. */
+    pthread_mutex_lock(&c->cmu);
+    size_t w = 0;
+    for (size_t i = 0; i < c->ncps; i++) {
+        if (strcmp(c->cps[i].uuid, uuid) == 0) { free(c->cps[i].xml); continue; }
+        if (w != i) c->cps[w] = c->cps[i];
+        w++;
+    }
+    if (w != c->ncps) {
+        c->ncps = w;
+        if (rec_save(c) != OK) { log_warn("libvirt: %s", err_msg()); err_clear(); }
+    }
+    pthread_mutex_unlock(&c->cmu);
+    if (gone) log_info("libvirt: %u checkpoint(s) of the replaced domain %s deleted (metadata only)", gone, uuid);
+    return gone;
+}
+
 /* A disk of the record, by target. Caller holds cmu. */
 static int rec_covers(const cprec_t *r, const char *target)
 {
@@ -2034,6 +2090,17 @@ static status_t v_define(sp_ctx_t *c, const char *unit_id, const char *definitio
         cJSON_AddStringToObject(res, "uuid", uuid);
         cJSON_AddStringToObject(res, "name", name);
         cJSON_AddBoolToObject(res, "replaced", !new_name);
+        if (!new_name && uuid[0]) {
+            char fail[480];
+            unsigned gone = cp_retire_domain(c, def, uuid, fail, sizeof(fail));
+            cJSON_AddNumberToObject(res, "checkpoints_retired", gone);
+            if (fail[0]) {
+                char wmsg[640];
+                snprintf(wmsg, sizeof(wmsg), "libvirt: a checkpoint of the replaced domain could not be "
+                         "deleted (%s); remove it with virsh checkpoint-delete --metadata", fail);
+                cJSON_AddItemToArray(warn, cJSON_CreateString(wmsg));
+            }
+        }
         virDomainFree(def);
         *result = res;
         res = NULL;
