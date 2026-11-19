@@ -207,6 +207,10 @@ lacks    "without its name" "$ENAME" "$OUT"
 OUT=$(cb snapshot delete 1 1 --force 2>&1); RC=$?
 check    "the exported snapshot cannot be deleted, even forced" 1 "$RC"
 contains "and says why" "is exported" "$OUT"
+# B255: a conflict with the export, not a server fault.
+check    "the refusal is a 409" 409 \
+         "$(curl -s -o "$WORK/del.out" -w '%{http_code}' --unix-socket "$SOCK" -X DELETE 'http://x/repos/1/snapshots/1?force=1')"
+contains "naming the export" "(export $EID)" "$(cat "$WORK/del.out")"
 GJ=$(cb gc 1 --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
 sleep 1.5
 OUT=$(cb jobs "$GJ")

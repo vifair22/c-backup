@@ -82,12 +82,12 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
 {
     /* A prune deletes on the strength of a durable commit, which a latched
      * daemon cannot make (sync_latch.h). */
+    if (info) memset(info, 0, sizeof(*info));
     status_t lst = sync_latch_repo_check(store_root(store), "prune");
     if (lst != OK) return lst;
     char repo[32], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-    if (info) memset(info, 0, sizeof(*info));
 
     if (db_txn_begin_bulk(db) != OK)
         return set_error(ERR_IO, "prune: begin");
@@ -119,6 +119,7 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
         db_result_free(r);
         if (pinned) {
             db_txn_rollback(db);
+            if (info) info->export_id = strtoll(eid, NULL, 10);
             return set_error(ERR_BUSY, "snapshot %lld is exported (export %s); revoke the "
                              "export first (DELETE /exports/%s)", (long long)snap_id, eid, eid);
         }
