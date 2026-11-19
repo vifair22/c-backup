@@ -975,6 +975,12 @@ bench-edit-latency: all $(BINS)/slow_dev.so
 $(BINS)/prof_shim.so: $(BENCH)/prof_shim.c | $(BINS)
 	$(CC) -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -pthread -lrt
 
+# Bytes and syncs per destination, WAL frames per page, and an optional
+# source read model, for the first-backup investigation. See bench/io_count.c
+# and bench/first_backup_model.sh.
+$(BINS)/io_count.so: $(BENCH)/io_count.c | $(BINS)
+	$(CC) -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -pthread
+
 bench: $(BINS)/bench_micro $(BINS)/bench_phases $(BINS)/bench_browse $(BINS)/bench_verify $(BINS)/slow_sync.so
 	@echo "=== micro ===" && $(BINS)/bench_micro
 	@echo "=== phases ===" && $(BINS)/bench_phases
