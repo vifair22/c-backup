@@ -18,6 +18,8 @@ set -u
 IMAGE="$1"
 SFX="$2"
 FIXTURE="$(dirname "$0")/fixtures/state-at-008.sql"
+# The newest migration in this checkout, which the image was built from.
+LAST_MIG=$(basename "$(ls "$(dirname "$0")"/../migrations/*.sql | tail -n 1)")
 FAIL=0
 NAMES=()
 VOLS=()
@@ -98,7 +100,7 @@ sqlite3 "state-at-008.$SFX.db" < "$FIXTURE" || exit 1
 make_volume "cbk-ro-008-$SFX" "state-at-008.$SFX.db" || exit 1
 run_hardened "cbk-ro-008-$SFX" "cbk-ro-008-$SFX" || exit 1
 check_started "cbk-ro-008-$SFX" "from 008" "applying 009_journal_autoincrement.sql" \
-              "applying 012_db_findings_detail.sql"
+              "applying $LAST_MIG"
 case "$(docker logs "cbk-ro-008-$SFX" 2>&1)" in
     *"applying 008_id_reserve.sql"*) bad "from 008: 008 not applied again" ;;
     *) ok "from 008: 008 not applied again" ;;

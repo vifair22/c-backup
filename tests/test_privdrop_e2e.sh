@@ -243,7 +243,8 @@ if [ "$NO_TMP" = yes ]; then
     check    "it is listening" "yes" "$([ -S "$WORK/run/d008.sock" ] && echo yes || echo no)"
     lacks    "008 is not applied again" "applying 008_id_reserve.sql" "$L"
     contains "009 is applied" "applying 009_journal_autoincrement.sql" "$L"
-    contains "and the last one" "applying 012_db_findings_detail.sql" "$L"
+    LAST_MIG=$(basename "$(ls "$(dirname "$SELF")"/../migrations/*.sql | tail -n 1)")
+    contains "and the last one" "applying $LAST_MIG" "$L"
     contains "the temporaries are in the state volume" \
              "sqlite temporary files: $WORK/state008" "$L"
     lacks    "no migration failed" "migrations failed" "$L"
