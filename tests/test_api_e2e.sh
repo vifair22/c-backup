@@ -2286,6 +2286,14 @@ contains "and logs a warning" "$PT_MSG" "$(cat "$R/daemon.log")"
 check "at warning level: the info-level summary of the same run is filtered" 0 \
     "$(grep -c "replicate: repo $ENC_ID -> $R/ptarget:" "$R/daemon.log")"
 contains "and journals it" "\"message\":\"$PT_MSG\"" "$(sock_body "/repos/$ENC_ID/journal")"
+# A rerun has nothing to send, so nothing leaves encryption and it is not
+# journalled again (NIT-51).
+PT_JOB2=$(job_id "$(rp_enc "{\"dest\":\"$R/ptarget\",\"reencrypt\":true,\"allow_plaintext\":true}")")
+wait_job "$PT_JOB2"
+contains "a rerun completes" '"state":"completed"' "$(sock_body "/jobs/$PT_JOB2")"
+contains "and sends nothing" '"objects_sent":0' "$(sock_body "/jobs/$PT_JOB2")"
+check "a no-op rerun is not journalled as a plaintext copy again" 1 \
+    "$(sock_body "/repos/$ENC_ID/journal" | grep -o "$PT_MSG" | wc -l)"
 # Unencrypted to unencrypted drops nothing, so it needs no flag.
 P2_OUT=$(sock_send POST /repos "{\"path\":\"$R/ptarget2\",\"label\":\"pt2\"}")
 contains "a second unencrypted target" ' 201' "$P2_OUT"

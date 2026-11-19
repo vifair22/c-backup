@@ -2193,13 +2193,29 @@ sudo c-backup reindex 2
 
 The destination must already be a repository, created with the encryption
 you want; `--reencrypt` will not create one, so its mode is always chosen on
-purpose. It keeps its own UUID and key. Each object is decrypted with the
-source key and encrypted under the destination's (or written plaintext into
-an unencrypted destination) as it crosses, each object authenticated whole
-under the source key first; compression is untouched, and names are of the
-plaintext, so they, the trees and deduplication carry over unchanged. Snapshot ids carry over too, so the destination must hold no
-backups of its own: a snapshot number it already uses for a different tree
-fails the run rather than being overwritten.
+purpose. It keeps its own UUID and key. Every object is read and
+authenticated whole under the source key, and what the destination stores is
+written under its own key (or plaintext into an unencrypted destination).
+
+**The content is re-chunked, so the destination's objects are not the
+source's.** Where files are cut into chunks depends on the repository's key
+(section 13): an encrypted repository's cut points are keyed so that they
+reveal nothing about known content. A destination with a different key
+therefore cuts differently, so each file is reassembled from the source and
+cut again with the destination's own parameters, its trees are rebuilt over
+the new chunks, and its snapshot roots differ from the source's. The daemon
+logs `the target's chunking differs from the source's ...` when this
+happens. What carries over unchanged is what a restore sees: every file's
+bytes, metadata, xattrs and ACLs, and the snapshots' ids, times and labels.
+Deduplication is the destination's own: the copy dedups within itself, and
+later runs and backups into it dedup against it, but its object names and
+pack layout are not the source's. Only unencrypted into unencrypted, where
+neither side's cut points are keyed, copies stored objects as they are.
+
+Snapshot ids carry over, so the destination must hold no backups of its
+own: a snapshot number it already uses for a snapshot of its own fails the
+run rather than being overwritten. A rerun recognises the snapshots it
+already sent by id and time, since their roots differ from the source's.
 
 **Removing encryption has to be asked for.** Copying an encrypted repository
 into an unencrypted one writes every file out in plaintext, so it is refused
@@ -2214,7 +2230,9 @@ sudo c-backup replicate 1 /srv/backup/plain --reencrypt --to-plaintext
 Without it the run is refused before anything is written, naming the flag.
 With it, the daemon logs a warning and journals `replicated encrypted repo
 N into plaintext at <path>` on the source repository, so the one place its
-data leaves its encryption is on the record. Copying an unencrypted
+data leaves its encryption is on the record. A rerun that finds the target
+already up to date writes nothing and is not journalled again; a run that
+fails part way is, since what it committed is out. Copying an unencrypted
 repository into another unencrypted one drops nothing and needs no flag.
 `--to-plaintext` without `--reencrypt` is refused, since a plain replica
 keeps the source's encryption.
