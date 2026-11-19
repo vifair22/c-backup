@@ -42,4 +42,8 @@ typedef struct {
 } conn_watch_t;
 
 void conn_watch_start(conn_watch_t *w, int fd, atomic_int *gone);
-void conn_watch_stop(conn_watch_t *w);
+/* Stop the watch; when it saw the hang-up, say so in the log with the
+ * daemon's session: a daemon killed while the request ran otherwise left
+ * its holds released and no line saying why, since no capture remained
+ * for the session's end to report. */
+void conn_watch_stop(conn_watch_t *w, const char *session);

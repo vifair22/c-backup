@@ -677,7 +677,7 @@ static char *op_capture_begin(helper_server_t *s, const helper_req_t *r, int *pa
         }
         b->ops->desc_free(d);
     }
-    conn_watch_stop(&cw);
+    conn_watch_stop(&cw, r->conn_session);
     if (fail == HELPER_OK && atomic_load(&gone)) {
         snprintf(fmsg, sizeof(fmsg), "the daemon stopped waiting for the begin (its job was cancelled)");
         fail = HELPER_E_FAILED;

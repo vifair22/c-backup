@@ -3,6 +3,8 @@
 #include "helper_fd.h"
 #include "thread_name.h"
 
+#include <cutils/log.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -82,10 +84,14 @@ void conn_watch_start(conn_watch_t *w, int fd, atomic_int *gone)
     w->on = fd >= 0 && pthread_create(&w->th, NULL, watch_main, w) == 0;
 }
 
-void conn_watch_stop(conn_watch_t *w)
+void conn_watch_stop(conn_watch_t *w, const char *session)
 {
     if (!w->on) return;
     atomic_store(&w->stop, 1);
     pthread_join(w->th, NULL);
     w->on = 0;
+    if (atomic_load(w->gone))
+        log_warn("helper: the daemon's session %.8s... ended (its connection closed) during "
+                 "capture.begin (a cancelled job or a stopped daemon); abandoning the begin "
+                 "and releasing its holds", session && session[0] ? session : "(none)");
 }
