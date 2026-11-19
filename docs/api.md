@@ -1181,7 +1181,9 @@ A job record carries `origin`, who asked for it: `api` for anything submitted
 over the API (the CLI and the app both are), `schedule` for the scheduler, with
 `schedule_id` naming the schedule (null otherwise), `startup` for a reindex
 the daemon queued itself at start because the index had lost snapshots the
-repository holds (Manual section 17.5), or `register` for the reindex a
+repository holds (Manual section 17.5; it indexes only those, reports
+`index snapshot <id>` progress over them and answers `result`
+`{"snapshots_indexed":N,"gaps_only":true}`, B264), or `register` for the reindex a
 repository registration queues (`POST /repos`).
 
 `/jobs/stream/<id>` sends one `data:` frame at once with the job's state as it

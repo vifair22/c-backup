@@ -185,9 +185,10 @@ status_t routes_submit_scheduled(struct job_manager *jm, int64_t repo_id,
                                  int64_t schedule_id, int64_t *out_job_id);
 
 /* A reindex the daemon queues for itself at start, for a repository whose
- * index lost snapshots the repository still holds (index_reconcile.h). The
- * same job a POST /repos/<id>/reindex runs, with origin "startup". Needs
- * routes_snapshots_init first. */
+ * index lost snapshots the repository still holds (index_reconcile.h).
+ * Action "reindex", origin "startup", but it indexes only the records the
+ * index lacks (reindex_gaps_run, B264), never the whole repository as a
+ * POST /repos/<id>/reindex does. Needs routes_snapshots_init first. */
 status_t routes_submit_startup_reindex(struct job_manager *jm, int64_t repo_id,
                                        int64_t *out_job_id);
 /*

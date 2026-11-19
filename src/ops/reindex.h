@@ -17,6 +17,7 @@
 #include "store.h"
 
 #include <cutils/db.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 typedef struct {
@@ -90,3 +91,15 @@ status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
  */
 status_t reindex_gaps(store_t *store, cutils_db_t *db, int64_t repo_id,
                       const char *what, uint64_t *out_indexed);
+
+/*
+ * reindex_gaps with a cancel checked between snapshots and progress
+ * reported per snapshot ("index snapshot <id>", i of n). The start-up
+ * reconcile's job (B264): a record the index lost is indexed on its own,
+ * never by rebuilding the whole repository. A cancel returns ERR_BUSY with
+ * *out_indexed those finished; the rest are found at the next start.
+ */
+status_t reindex_gaps_run(store_t *store, cutils_db_t *db, int64_t repo_id,
+                          const char *what, atomic_int *cancel,
+                          void (*progress)(const char *, uint64_t, uint64_t, void *),
+                          void *progress_ctx, uint64_t *out_indexed);
