@@ -53,3 +53,10 @@ typedef struct {
  */
 status_t proc_probe_container(const char *proc_root, int pid, const proc_mount_t *mounts,
                               size_t n_mounts, sp_probe_container_t *c, int *truncated);
+
+/*
+ * The container's mounts into c->mounts (db-detection.md 14.7): each
+ * destination, with its recorded path when the unit backs it up, NULL when
+ * it does not. Past SP_PROBE_MOUNTS_MAX, truncated. ERR_NOMEM only.
+ */
+status_t probe_mounts(sp_probe_container_t *c, const proc_mount_t *mounts, size_t n, int *truncated);

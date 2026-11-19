@@ -288,10 +288,17 @@ static void test_pack_sync_failure_is_named(void **state)
     /* That repository's latch, not the daemon's. */
     assert_true(sync_latch_repo_tripped(TEST_REPO));
     assert_false(sync_latch_tripped());
+    /* Naming the file, as Manual 17.7 promises: it said "a staging pack"
+     * (B263). */
+    char latched[1024];
+    int64_t at = 0;
+    assert_true(sync_latch_repo_info(TEST_REPO, latched, sizeof(latched), &at));
+    if (!strstr(latched, STAGING "."))
+        fail_msg("the latch does not name the staging pack: %s", latched);
     sync_latch_reset_for_test();
     assert_int_equal(hits, 1);
     assert_int_not_equal(st, OK);
-    expect_msg("sync the pack");
+    expect_msg("pack seal: sync " STAGING ".");
     expect_msg("Input/output error");
     backup_result_free(&res);
     expect_backup_left_nothing(1, 3);

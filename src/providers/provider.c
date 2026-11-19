@@ -132,6 +132,8 @@ void sp_unit_probe_free(sp_unit_probe_t *p)
         sp_probe_container_t *c = &p->v[i];
         for (size_t k = 0; k < c->n_open; k++) free(c->open[k].path);
         free(c->open);
+        for (size_t k = 0; k < c->n_mounts; k++) { free(c->mounts[k].dest); free(c->mounts[k].recorded); }
+        free(c->mounts);
         free(c->procs);
         free(c->ports);
     }

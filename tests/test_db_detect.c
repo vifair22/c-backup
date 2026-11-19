@@ -626,6 +626,19 @@ static void test_coverage_pg_wal(void **state)
     assert_int_equal(x->coverage, DB_COV_COVERED_CRASH);
     assert_non_null(strstr(x->evidence, "pg_wal"));
     db_findings_free(f);
+    /* B245, a file source: the WAL is on disk, but outside every root
+     * the backup reads. */
+    char ra[PATH_MAX];
+    snprintf(ra, sizeof(ra), "%s", abs_of("a"));
+    db_cap_root_t ar = { ra, DB_CAP_ATOMIC, 0 };
+    db_capture_desc_t only_a = { &ar, 1, 0, 0, 0, 0 };
+    f = detect(TEST_DIR, &only_a, NULL);
+    x = find(f, DB_ENGINE_POSTGRES, "a/pg");
+    assert_int_equal(x->coverage, DB_COV_SPLIT);
+    assert_string_equal(x->suggestion, "source-snapshot");
+    assert_non_null(strstr(x->evidence, "\"kind\":\"pg_wal\""));
+    assert_non_null(strstr(x->evidence, "\"found\":\"outside the capture\""));
+    db_findings_free(f);
     rmrf(abs_of("w"));
     f = detect(TEST_DIR, &cap, NULL);
     assert_int_equal(find(f, DB_ENGINE_POSTGRES, "a/pg")->coverage, DB_COV_SPLIT);
@@ -804,6 +817,92 @@ static db_findings_t *detect_unit(const sp_unit_probe_t *p, const db_capture_des
     assert_int_equal(db_detect_finish(d, cap, &f), OK);
     db_detect_free(d);
     return f;
+}
+
+/* B245, a unit: pg_wal links to /wal, a container path. The probe's
+ * mounts say where /wal is recorded, if anywhere, and the finding is split
+ * when it is not in the capture, with the dump suggested: a pause cannot
+ * bring in files the unit does not read. */
+static void test_coverage_pg_wal_unit(void **state)
+{
+    (void)state;
+    wtext("a/pg/PG_VERSION", "16\n");
+    wempty("a/pg/global/pg_control");
+    wdir("a/pg/base");
+    wtext("a/pg/postmaster.pid", "1\n");
+    wdir("w/archive_status");
+    wlink("a/pg/pg_wal", "/wal");
+    char ra[PATH_MAX], rw[PATH_MAX], data[PATH_MAX];
+    snprintf(ra, sizeof(ra), "%s", abs_of("a"));
+    snprintf(rw, sizeof(rw), "%s", abs_of("w"));
+    snprintf(data, sizeof(data), "%s", abs_of("a/pg"));
+    db_cap_root_t roots[2] = { { ra, DB_CAP_ATOMIC, 0 }, { rw, DB_CAP_ATOMIC, 0 } };
+    db_capture_desc_t cap = { roots, 1, 0, 0, 1, 1 };
+
+    probe_t t;
+    memset(&t, 0, sizeof(t));
+    sp_probe_container_t *c = pc(&t, "pg", "postgres:16");
+    sp_probe_mount_t mounts[2] = {
+        { (char *)(uintptr_t)"/var/lib/postgresql/data", data },
+        { (char *)(uintptr_t)"/wal", NULL },    /* an excluded bind */
+    };
+    c->mounts = mounts;
+    c->n_mounts = 2;
+
+    /* The bind holding /wal is not backed up: split, the dump suggested. */
+    db_findings_t *f = detect_unit(&t.p, &cap);
+    const db_finding_t *x = find(f, DB_ENGINE_POSTGRES, "a/pg");
+    assert_non_null(x);
+    assert_int_equal(x->coverage, DB_COV_SPLIT);
+    assert_string_equal(x->suggestion, "pg-dumpall");
+    assert_non_null(strstr(x->evidence, "\"target\":\"/wal\""));
+    assert_non_null(strstr(x->evidence, "\"found\":\"outside the capture\""));
+    assert_non_null(strstr(x->evidence, "does not back up"));
+    assert_null(strstr(x->evidence, "unchecked"));
+    db_findings_free(f);
+
+    /* Backed up, recorded at w, but w is no root this capture read. */
+    mounts[1].recorded = rw;
+    f = detect_unit(&t.p, &cap);
+    x = find(f, DB_ENGINE_POSTGRES, "a/pg");
+    assert_int_equal(x->coverage, DB_COV_SPLIT);
+    assert_non_null(strstr(x->evidence, "outside the capture"));
+    db_findings_free(f);
+
+    /* Read with the data, at the same instant: covered, and the recorded
+     * path named. */
+    cap.n_roots = 2;
+    f = detect_unit(&t.p, &cap);
+    x = find(f, DB_ENGINE_POSTGRES, "a/pg");
+    assert_int_equal(x->coverage, DB_COV_COVERED_CRASH);
+    assert_non_null(strstr(x->evidence, "\"found\":\"in the capture\""));
+    assert_non_null(strstr(x->evidence, "\"recorded\":\""));
+    db_findings_free(f);
+    /* At another instant: split, and a pause is what joins them. */
+    roots[1].instant = 1;
+    f = detect_unit(&t.p, &cap);
+    x = find(f, DB_ENGINE_POSTGRES, "a/pg");
+    assert_int_equal(x->coverage, DB_COV_SPLIT);
+    assert_string_equal(x->suggestion, "pause-always");
+    db_findings_free(f);
+    roots[1].instant = 0;
+    cap.n_roots = 1;
+
+    /* No mount at /wal: the container's own filesystem, never backed up. */
+    c->n_mounts = 1;
+    f = detect_unit(&t.p, &cap);
+    x = find(f, DB_ENGINE_POSTGRES, "a/pg");
+    assert_int_equal(x->coverage, DB_COV_SPLIT);
+    assert_non_null(strstr(x->evidence, "own filesystem"));
+    db_findings_free(f);
+
+    /* No mounts at all (an older helper): unchecked, as before. */
+    c->n_mounts = 0;
+    f = detect_unit(&t.p, &cap);
+    x = find(f, DB_ENGINE_POSTGRES, "a/pg");
+    assert_int_equal(x->coverage, DB_COV_COVERED_CRASH);
+    assert_non_null(strstr(x->evidence, "unchecked"));
+    db_findings_free(f);
 }
 
 static const db_finding_t *find_hint(const db_findings_t *f, db_engine_t e)
@@ -1082,6 +1181,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_unsettled_liveness, setup, teardown),
         cmocka_unit_test_setup_teardown(test_coverage_split, setup, teardown),
         cmocka_unit_test_setup_teardown(test_coverage_pg_wal, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_coverage_pg_wal_unit, setup, teardown),
         cmocka_unit_test(test_carry),
         cmocka_unit_test(test_heads_read),
         cmocka_unit_test(test_merge_order),
