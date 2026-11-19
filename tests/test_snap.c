@@ -151,11 +151,13 @@ static void test_domains(void **state)
      * parent, nothing at all. */
     assert_int_equal(snap_domain_of(&ctx, CACHE "/other", &d), OK);
     assert_int_equal(d.kind, SNAP_NONE);
+    assert_string_equal(d.unlisted, "cache");     /* named, for the job's warning (B253) */
     assert_int_equal(snap_domain_of(&ctx, POOL "/appdata/x", &d), OK);
     assert_int_equal(d.kind, SNAP_BTRFS);
     assert_string_equal(d.root, POOL);
     assert_int_equal(snap_domain_of(&ctx, "/elsewhere", &d), OK);
     assert_int_equal(d.kind, SNAP_NONE);
+    assert_string_equal(d.unlisted, "");
 
     snap_dom_t ds[3];
     assert_int_equal(snap_domain_of(&ctx, CACHE "/appdata", &ds[0]), OK);

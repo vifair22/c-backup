@@ -114,6 +114,7 @@ status_t snap_domain_of(const snap_ctx_t *c, const char *real_path, snap_dom_t *
     if (zbest_ds[0] && zbest >= best) {
         if (!zfs_allowed(c->pol, zbest_ds)) {
             memset(out, 0, sizeof(*out));
+            snprintf(out->unlisted, sizeof(out->unlisted), "%s", zbest_ds);
             log_info("snap: %s is in dataset %s, which the policy does not list", real_path, zbest_ds);
             return OK;
         }

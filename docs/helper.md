@@ -640,8 +640,12 @@ them; `null` or `""` removes them.
 ### Mounts on no snapshot domain: pause-read
 
 A mount on an array disk, an unassigned device or a split share cannot be
-snapshotted (container-backup.md section 7). For a running unit with such
-mounts the daemon makes two passes:
+snapshotted (container-backup.md section 7), and a mount in a ZFS dataset
+the policy's `zfs_domains` does not list is not. The second says so in the
+session's warnings, naming the dataset, so the job's warning shows it
+(B253; it was only in the helper's log); `capture.begin_paths` names it in
+the path's reason. For a running unit with such mounts the daemon makes
+two passes:
 
 1. **Pass 1, live**: those mounts are read with the unit running, their
    content and file cache rows stored, no snapshot written.
