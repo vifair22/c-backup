@@ -4732,7 +4732,10 @@ Or copy the disk out without a kernel device:
   disconnects every client; removing the repository (`repo remove`) revokes
   its exports first; a daemon stop closes all. `vm export-show <id>`
   shows a closed one's `close_reason`: `revoked`, `expired`, `idle`,
-  `repository removed`, `daemon stopped`, `daemon restarted`.
+  `repository removed`, `daemon stopped`, `daemon restarted`. A daemon
+  killed outright (SIGKILL, a crash) cannot remove its sockets; the next
+  start removes every `<id>.sock` in `vm.export_dir` that nothing answers
+  on, and says how many in the log.
 - **Connections and memory.** `vm.export_max_conns` (default 4) caps
   connections across every export; one past it is refused at the NBD
   handshake with a message naming the key (`... the limit
