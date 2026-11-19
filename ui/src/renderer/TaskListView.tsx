@@ -13,7 +13,11 @@ function fmtElapsed(seconds: number): string {
 }
 
 const STATE_CONFIG: Record<string, { color: string; bg: string; label: string }> = {
+  /* A queued job is waiting, not working, and a cancelled one is over;
+   * both used to fall through to the blue "Running" card (B282). */
+  queued:    { color: 'text-slate-400', bg: 'bg-slate-500/10', label: 'Queued' },
   running:   { color: 'text-blue-400',  bg: 'bg-blue-500/10',  label: 'Running' },
+  cancelled: { color: 'text-text-muted', bg: 'bg-surface-tertiary/40', label: 'Cancelled' },
   completed: { color: 'text-green-400', bg: 'bg-green-500/10', label: 'Completed' },
   warning:   { color: 'text-amber-400', bg: 'bg-amber-500/10', label: 'Completed with warnings' },
   failed:    { color: 'text-red-400',   bg: 'bg-red-500/10',   label: 'Failed' },
@@ -58,12 +62,9 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
   const list = jobs ?? []
   const hasRunning = list.some(j => j.state === 'running')
 
-  /* Running first, then newest; ids are handed out in order. */
-  const sorted = [...list].sort((a, b) => {
-    if (a.state === 'running' && b.state !== 'running') return -1
-    if (a.state !== 'running' && b.state === 'running') return 1
-    return b.id - a.id
-  })
+  /* Running first, then queued, then newest; ids are handed out in order. */
+  const rank = (s: string) => (s === 'running' ? 0 : s === 'queued' ? 1 : 2)
+  const sorted = [...list].sort((a, b) => rank(a.state) - rank(b.state) || b.id - a.id)
 
   return (
     <div>
@@ -86,6 +87,9 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
             const warnings = t.state === 'completed' ? jobWarnings(t) : []
             const allShown = openWarnings.has(t.id)
             const isRunning = t.state === 'running'
+            /* The daemon takes a queued job out of the queue on cancel, so
+             * it is cancellable exactly like a running one (B282). */
+            const cancellable = isRunning || t.state === 'queued'
             /* Bytes when the job reports them: entry counts crawl through
              * large files and say little about how far along it is. */
             const pct = (t.bytes_total ?? 0) > 0
@@ -95,12 +99,13 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
                 : null
 
             return (
-              <div key={t.id} data-testid="job-card" data-job-id={t.id}
+              <div key={t.id} data-testid="job-card" data-job-id={t.id} data-state={t.state}
                 className={`border border-border-default rounded-lg p-3 ${cfg.bg}`}>
                 {/* Top row: command, state, time */}
                 <div className="flex items-center gap-3 mb-1">
                   <span className="text-sm font-semibold text-text-primary capitalize">{t.action}</span>
-                  <span className={`text-[10px] font-semibold ${cfg.color}`}>{cfg.label}</span>
+                  <span className={`text-[10px] font-semibold ${cfg.color}`}
+                    data-testid="job-state">{cfg.label}</span>
                   <span className="text-[11px] text-text-muted ml-auto">
                     job {t.id}
                     {t.started ? `, started ${absoluteTime(t.started)}` : ''}
@@ -211,7 +216,7 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
                   {isRunning && (t.rate_bytes_per_s ?? 0) > 0 && (
                     <span>{fmtSize(t.rate_bytes_per_s)}/s</span>
                   )}
-                  {isRunning && (
+                  {cancellable && (
                     <button onClick={() => setConfirmCancel(t.id)}
                       className="text-[10px] px-2 py-0.5 rounded bg-surface-tertiary text-status-error hover:bg-surface-hover border-none cursor-pointer ml-auto">
                       Cancel

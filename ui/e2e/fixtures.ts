@@ -119,6 +119,11 @@ export interface Harness {
   userData: string
   /** Kill the daemon, to see what the app does without one. */
   killDaemon(): void
+  /** With units: stop and continue the helper (SIGSTOP, SIGCONT). A unit
+   * job waits on a stopped helper as on a stuck one, holding its
+   * repository, so whatever is submitted behind it stays queued. */
+  pauseHelper(): void
+  resumeHelper(): void
   /** Close the app and start it again on the same userData, as a user
    * quitting and reopening it would. The daemon keeps running. */
   relaunch(): Promise<Page>
@@ -370,6 +375,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     app: first.app, page: first.page, work, sock, port, userData,
     repos: { plain, encrypted },
     killDaemon() { daemon.kill('SIGKILL') },
+    pauseHelper() { if (!helper) throw new Error('no helper: start with units'); helper.kill('SIGSTOP') },
+    resumeHelper() { helper?.kill('SIGCONT') },
     async relaunch() {
       await h.app.close().catch(() => {})
       const next = await launch()
@@ -379,6 +386,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     },
     async close() {
       await h.app.close().catch(() => {})
+      /* A stopped helper would hold the daemon's shutdown on its unit job. */
+      helper?.kill('SIGCONT')
       daemon.kill()
       helper?.kill()
       await sleep(200)
