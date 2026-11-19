@@ -264,7 +264,7 @@ $(eval $(call stamp_rule,$(OBJ_DIR),FLAGS_SIG))
 TEST_HDRS := $(wildcard $(TESTS)/*.h)
 
 # ---- Phony targets ----------------------------------------------------
-.PHONY: all static asan tsan debug clean test bench bench-micro bench-phases bench-browse bench-nbd analyze lint check-conflict-markers
+.PHONY: all static asan tsan debug clean test bench bench-micro bench-phases bench-browse bench-nbd bench-edit-latency analyze lint check-conflict-markers
 
 # In the top-level make, which is the release build unless told otherwise,
 # `all` is built here rather than by a sub-make (BUILD-1). The test binaries
@@ -894,6 +894,17 @@ bench-nbd: $(BINS)/bench_nbd
 # bench/slow_sync.c.
 $(BINS)/slow_sync.so: $(BENCH)/slow_sync.c | $(BINS)
 	$(CC) -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -pthread
+
+# A modelled slow device for the edit-latency harness: no real sync reaches
+# the disk (bench/slow_dev.c, bench/edit_latency.sh).
+$(BINS)/slow_dev.so: $(BENCH)/slow_dev.c | $(BINS)
+	$(CC) -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -pthread
+
+# PUT sources p50/p99 during a backup on the modelled device. BOUND_MS=<ms>
+# fails the run above that p99, OUT=<dir> keeps the samples. See
+# bench/edit_latency.sh for the device and workload knobs.
+bench-edit-latency: all $(BINS)/slow_dev.so
+	BOUND_MS='$(BOUND_MS)' OUT='$(OUT)' ./$(BENCH)/edit_latency.sh $(BINS)/c-backupd $(BINS)/slow_dev.so
 
 # Another LD_PRELOAD shim: counts and times libc calls and samples the main
 # thread's stack, for profiling where perf and strace are unavailable. See

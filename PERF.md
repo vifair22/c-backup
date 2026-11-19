@@ -6,6 +6,40 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-18 - Edit latency during a backup (B232, B233, B222)
+
+`make bench-edit-latency` (`bench/edit_latency.sh`, `bench/slow_dev.c`):
+PUT /repos/<id>/sources every 0.2 s while a first backup runs, on a modelled
+device (one FIFO queue, 6 MiB/s, 20 ms per sync, no real sync reaches the
+disk). vfairfield-dt, bench.slice at nice 19. ms; n is the number of edits.
+
+Config A, the default: 6,000 files of 4-16 KiB, source opens paced at 20 ms
+(the pack writeback path).
+
+| build | n | p50 | p90 | p99 | max | backup s |
+|-------|--:|----:|----:|----:|----:|---------:|
+| v3 0b3537e | 117 | 0 | 0 | 1,265 / 1,261 | 1,275 / 1,272 | 33.4 / 33.3 |
+| + B232 (writeback thread) | 158 | 0 | 0 | 298 (49 in an earlier run) | 340 | 34.0 |
+| + B233 (database presync) alone | 118 | 0 | 0 | 1,286 | 1,316 | 33.3 |
+| + B222 (reader-pool checks) alone | 114 | 0 | 3 | 1,276 | 1,285 | 33.4 |
+| all three | 168 | 0 | 0 | 41 / 47 | 84 / 48 | 35.5 / 35.6 |
+
+Config B: 20,000 files of 0.5-2 KiB, opens paced at 6 ms (`FILES=20000
+SIZE_MIN=512 SIZE_MAX=2048 OPEN_MS=6`): WAL-bound, the checkpointer's
+locked rounds dominate.
+
+| build | n | p90 | p99 | max | backup s | locked rounds, longest hold |
+|-------|--:|----:|----:|----:|---------:|----------------------------:|
+| v3 0b3537e | 222 / 216 | 1 / 16 | 1,240 / 1,300 | 2,454 / 2,530 | 57.8 / 56.6 | 7, 2.58 s |
+| all three | 259 / 244 | 4 / 12 | 1,235 / 1,072 | 2,719 / 1,383 | 63.6 / 57.1 | 8, 2.84 s |
+| all three + no lock below the hard cap (not merged) | 191 / 188 | 8 / 22 | 69 / 64 | 132 / 123 | 40.7 / 40.7 | 3, 0.14 s |
+
+What is left in config B after the three fixes is locked rounds below the
+hard cap holding the lock 1.2-2.8 s for remainders of 6-18 frames: each of
+their small syncs waits for the whole device queue. The model is
+pessimistic there (a real fdatasync of an almost clean file need not wait
+for unrelated writeback), which is what FS2 has to settle.
+
 ## 2026-11-16 - NBD reads: pipelining and request size (VM disks)
 
 `make bench-nbd` (`bench/nbd.c`): qemu-nbd 11.1.3 over a 1 GiB image of
