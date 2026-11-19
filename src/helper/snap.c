@@ -244,8 +244,13 @@ status_t snap_take(const snap_ctx_t *c, snap_set_t *s, const char *daemon8, int6
         argv[n] = NULL;
         if (st == OK) st = host_run(c->tools, 0, argv, SNAP_TOOL_TIMEOUT_S, NULL, 0);
         for (size_t m = 0; m < nm; m++) {
-            if (st == OK) s->taken[members[m]] = 1;
-            else unjournal(holds, &s->hold[members[m]]);
+            if (st == OK) {
+                s->taken[members[m]] = 1;
+                log_info("snap: created ZFS snapshot %s of dataset %s", targets[m],
+                         s->doms[members[m]].dataset);
+            } else {
+                unjournal(holds, &s->hold[members[m]]);
+            }
         }
     }
     for (size_t i = 0; i < s->n && st == OK; i++) {
@@ -264,8 +269,12 @@ status_t snap_take(const snap_ctx_t *c, snap_set_t *s, const char *daemon8, int6
         if ((st = journal(holds, detail, &s->hold[i])) != OK) break;
         const char *argv[] = { c->tools->btrfs, "subvolume", "snapshot", "-r", s->doms[i].root, dst, NULL };
         st = host_run(c->tools, 0, argv, SNAP_TOOL_TIMEOUT_S, NULL, 0);
-        if (st == OK) s->taken[i] = 1;
-        else unjournal(holds, &s->hold[i]);
+        if (st == OK) {
+            s->taken[i] = 1;
+            log_info("snap: created btrfs snapshot %s of subvolume %s", dst, s->doms[i].root);
+        } else {
+            unjournal(holds, &s->hold[i]);
+        }
     }
     s->snapshot_ms = now_ms() - t0;
     if (st != OK) {
@@ -330,7 +339,9 @@ static status_t zfs_destroy(const snap_ctx_t *c, const char *target, const char 
     free(val);
     if (!mine) return set_error(ERR_INVALID, "snap: %s is not owned by this daemon; left alone", target);
     const char *d[] = { c->tools->zfs, "destroy", target, NULL };
-    return host_run(c->tools, 0, d, SNAP_TOOL_TIMEOUT_S, NULL, 0);
+    if ((st = host_run(c->tools, 0, d, SNAP_TOOL_TIMEOUT_S, NULL, 0)) != OK) return st;
+    log_info("snap: destroyed ZFS snapshot %s of dataset %.*s", target, (int)(at - target), target);
+    return OK;
 }
 
 static void line_value(const char *txt, const char *key, char *buf, size_t sz)
@@ -401,7 +412,9 @@ static status_t btrfs_destroy(const snap_ctx_t *c, const char *path, const char 
         return set_error(ERR_INVALID, "snap: %s is not a snapshot of a subvolume of %s (parent %s); left alone",
                          path, root, parent[0] ? parent : "none");
     const char *del[] = { c->tools->btrfs, "subvolume", "delete", path, NULL };
-    return host_run(c->tools, 0, del, SNAP_TOOL_TIMEOUT_S, NULL, 0);
+    if ((st = host_run(c->tools, 0, del, SNAP_TOOL_TIMEOUT_S, NULL, 0)) != OK) return st;
+    log_info("snap: destroyed btrfs snapshot %s in pool %s", path, root);
+    return OK;
 }
 
 status_t snap_release_detail(const snap_ctx_t *c, const char *detail, const char *daemon8)

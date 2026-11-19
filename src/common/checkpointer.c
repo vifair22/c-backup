@@ -74,6 +74,11 @@ static atomic_int    g_test_idle;
 /* Shutdown has begun (B218): no new checkpoint starts, and one interrupted
  * by checkpointer_halt is not a failure. */
 static atomic_int    g_halting;
+/* The WAL's high-water mark as commits saw it (B236), merged into
+ * max_wal_frames by checkpointer_stats. */
+static atomic_uint   g_wal_peak;
+/* A locked round has asked for the write lock or holds it (B234). */
+static atomic_int    g_round_queued;
 /* checkpointer_finish left the WAL: the close must not copy it. */
 static int           g_leave_wal;
 
@@ -302,7 +307,9 @@ status_t checkpointer_force(void)
     presync();
     locked_arg_t a = { 0, -1, 0 };
     uint64_t t0 = now_ns();
+    atomic_fetch_add(&g_round_queued, 1);
     status_t st = db_txn_exclusive(locked_passive, &a);
+    atomic_fetch_sub(&g_round_queued, 1);
     if (st != OK) return st;
     uint64_t held = now_ns() - a.t_locked;
     uint64_t waited = a.t_locked - t0;
@@ -412,7 +419,10 @@ locked:;
     presync();
     locked_arg_t a = { 0, -1, 0 };
     uint64_t t0 = now_ns();
-    if (db_txn_exclusive(locked_passive, &a) != OK) return;
+    atomic_fetch_add(&g_round_queued, 1);
+    status_t lst = db_txn_exclusive(locked_passive, &a);
+    atomic_fetch_sub(&g_round_queued, 1);
+    if (lst != OK) return;
     /* The hold is from the grant; the time before it was spent queued for
      * the lock behind writers, which the hold used to include (B219). */
     uint64_t held = now_ns() - a.t_locked;
@@ -459,7 +469,22 @@ locked:;
  * it waits, it cannot hold up the checkpoint it waits for. It stops
  * waiting when the copy is complete (the first writer after it restarts
  * the WAL), when the checkpointer has found it cannot complete one
- * (g_blocked_until_ns), or after CKPT_THROTTLE_MAX_NS whatever happens.
+ * (g_blocked_until_ns), when its locked round has queued for the write
+ * lock, or after CKPT_THROTTLE_MAX_NS whatever happens.
+ *
+ * The locked round is where the wait ends in practice (B234). A copy
+ * outside the lock never finds the WAL complete while anything else
+ * writes - a request, the log writer, a batch already holding the lock -
+ * and the round that would complete it waits for that lock like everyone
+ * else, behind whoever holds it. Polling for a complete copy then only
+ * ran out the time limit: on FS2, 81 of 82 waits ended at the 2 s limit,
+ * 163 s of a backup. Once the round has queued, the write lock's own
+ * queue does the holding instead: a bulk writer queues behind the round's
+ * priority ticket (db_txn.c), so it is let in when the round has copied
+ * and restarted the WAL, rather than after the limit on top of that. The
+ * queue's fairness bound may serve one bulk transaction ahead of the round
+ * (DB_TXN_BULK_DUE_MS); a wait that ran out the limit let the same one
+ * through, two seconds later.
  *
  * Only bulk writers: a request's write (db_txn_begin, db_write) never
  * waits here. Those writes are a few pages each and cannot carry the WAL
@@ -474,6 +499,7 @@ void checkpointer_throttle(void)
     if (now - last < CKPT_PROBE_NS) return;
     atomic_store_explicit(&g_last_probe_ns, now, memory_order_relaxed);
     if (now < atomic_load(&g_blocked_until_ns)) return;
+    if (atomic_load(&g_round_queued)) return;
     uint64_t hard = (uint64_t)g_threshold * CKPT_HARD_FACTOR;
     uint32_t f = 0, b = 0;
     if (checkpointer_wal_frames(g_path, &f, &b) != 0 || f <= hard || f == b) return;
@@ -488,7 +514,7 @@ void checkpointer_throttle(void)
         nanosleep(&ts, NULL);
         uint64_t t = now_ns();
         if (!atomic_load(&g_active) || t < atomic_load(&g_blocked_until_ns) ||
-            t - t0 > CKPT_THROTTLE_MAX_NS) {
+            atomic_load(&g_round_queued) || t - t0 > CKPT_THROTTLE_MAX_NS) {
             timed_out = t - t0 > CKPT_THROTTLE_MAX_NS;
             break;
         }
@@ -663,6 +689,7 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
     g_stop = 0;
     atomic_store(&g_halting, 0);
     memset(&g_stats, 0, sizeof(g_stats));
+    atomic_store(&g_wal_peak, 0);
     if (pthread_create(&g_th, NULL, main_loop, NULL) != 0) {
         pthread_cond_destroy(&g_cv);
         sqlite3_close(g_ck);
@@ -846,9 +873,19 @@ void checkpointer_stop(void)
     pthread_mutex_unlock(&g_mu);
 }
 
+void checkpointer_note_wal_frames(uint32_t frames)
+{
+    unsigned cur = atomic_load_explicit(&g_wal_peak, memory_order_relaxed);
+    while (frames > cur &&
+           !atomic_compare_exchange_weak_explicit(&g_wal_peak, &cur, frames,
+                                                  memory_order_relaxed, memory_order_relaxed)) {}
+}
+
 void checkpointer_stats(checkpointer_stats_t *out)
 {
     pthread_mutex_lock(&g_mu);
     *out = g_stats;
     pthread_mutex_unlock(&g_mu);
+    uint32_t peak = atomic_load_explicit(&g_wal_peak, memory_order_relaxed);
+    if (peak > out->max_wal_frames) out->max_wal_frames = peak;
 }

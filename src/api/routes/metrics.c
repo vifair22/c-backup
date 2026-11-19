@@ -262,7 +262,8 @@ static void emit_txn_metrics(mbuf_t *m)
                "# TYPE cbackup_checkpoint_throttle_waits_total counter\n"
                "cbackup_checkpoint_throttle_waits_total %lu\n", c.throttled);
     mb_addf(m, "# HELP cbackup_checkpoint_throttle_timeouts_total Of those waits, the ones "
-               "that ended at the time limit rather than on a completed copy.\n"
+               "that ended at the time limit rather than on a completed copy or the locked "
+               "round queueing for the write lock.\n"
                "# TYPE cbackup_checkpoint_throttle_timeouts_total counter\n"
                "cbackup_checkpoint_throttle_timeouts_total %lu\n", c.throttle_timeouts);
     mb_addf(m, "# HELP cbackup_checkpoint_throttle_seconds_total Time bulk writers spent "
@@ -270,8 +271,8 @@ static void emit_txn_metrics(mbuf_t *m)
                "# TYPE cbackup_checkpoint_throttle_seconds_total counter\n"
                "cbackup_checkpoint_throttle_seconds_total %.6f\n",
             (double)c.throttle_ns / 1e9);
-    mb_addf(m, "# HELP cbackup_wal_frames_max The most frames state.db's WAL was seen "
-               "holding since start.\n# TYPE cbackup_wal_frames_max gauge\n"
+    mb_addf(m, "# HELP cbackup_wal_frames_max The most frames state.db's WAL held "
+               "since start, read after every commit.\n# TYPE cbackup_wal_frames_max gauge\n"
                "cbackup_wal_frames_max %u\n", c.max_wal_frames);
 }
 

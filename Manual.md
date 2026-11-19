@@ -2500,10 +2500,10 @@ the repository).
 | `cbackup_checkpoint_lock_wait_max_seconds` | gauge | The longest single such wait since start |
 | `cbackup_checkpoint_presync_seconds_total` | counter | Time spent writing the log, and the database pages earlier rounds copied, out to disk just before a locked round, without the lock, so the round itself only syncs what arrived since |
 | `cbackup_checkpoint_frames_copied_total` | counter | Log frames copied back into `state.db`; over `cbackup_checkpoint_rounds_total`, frames per round |
-| `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap |
-| `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy |
+| `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap, until the copy completes or the locked round that completes it has queued for the write lock |
+| `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy or on the locked checkpoint round queueing for the write lock, after which the lock's own queue holds the writer |
 | `cbackup_checkpoint_throttle_seconds_total` | counter | Time bulk writers spent so held |
-| `cbackup_wal_frames_max` | gauge | The most frames `state.db`'s log was seen holding since start; the hard cap is 16 times `db.wal_autocheckpoint` |
+| `cbackup_wal_frames_max` | gauge | The most frames `state.db`'s log held since start, read after every commit; the hard cap is 16 times `db.wal_autocheckpoint` |
 | `cbackup_db_findings{coverage}` | gauge | Live database findings not dismissed, by coverage: `covered-crash`, `covered-quiesced`, `covered-application`, `engine-unsafe`, `split`, `uncovered` (chapter 23); every label always present |
 | `cbackup_db_engine_captures_total{engine,result}` | counter | Engine copies file backups tried to make (23.6), by outcome: `ok`, `refused`, `abandoned`, `failed` |
 | `cbackup_db_uncovered_reads_total` | counter | Live databases a backup captured `uncovered`, counted once per backup that did |
@@ -3804,7 +3804,10 @@ allow = docker:cbk-uat-*, docker:compose:cbk-uat-*, libvirt:cbk-uat-*, lxc:cbk-u
 
 [snapshot]
 # ZFS datasets the helper may snapshot, by name (never a parent of these).
-zfs_domains = cache/appdata, cache/system, cache/Photos, cache/lxc
+# A capture snapshots the whole dataset holding what it reads: list the
+# datasets you back up, one per application, never a pool or all of
+# appdata or system (below the example).
+zfs_domains = cache/appdata/immich, cache/Photos
 # btrfs pool roots (FS2: /mnt/cache) and where their snapshots go.
 btrfs_domains =
 # btrfs_snapshot_dir = /mnt/cache/system/.cbackup-snapshots
@@ -3867,6 +3870,18 @@ timeout_s = 900
 # continue: warn and carry on; fail: fail the unit before anything is held.
 on_fail = continue
 ```
+
+**Snapshot domains: keep them narrow.** A capture snapshots the whole
+dataset or btrfs subvolume holding each path it reads. With `cache/appdata`
+listed, backing up one container snapshots every application's data in
+that dataset for as long as the unit is read, and any allowed unit,
+including a test one, can cause that. Give each application you back up
+its own dataset (`zfs create cache/appdata/<app>`, then move its data in)
+or btrfs subvolume, and list only those; the helper never snapshots a
+parent in place of an unlisted child. The helper logs each snapshot it
+creates or destroys at INFO with its dataset or subvolume, so its log
+shows what every capture touched. `docs/helper.md` ("Choosing snapshot
+domains") has the reasoning.
 
 Every key, its range and its default are listed in `docs/helper.md`
 ("The policy", "Docker and LXC providers", "Libvirt provider"). The daemon
