@@ -223,6 +223,16 @@ static void sync_latch_alert(const char *msg)
         log_warn("alert: could not queue the storage sync alert");
 }
 
+/* The helper started without a usable hold journal and recovered (B285):
+ * once per recovery, with what it released and what it left for an
+ * operator (a paused container nothing proves c-backup paused). */
+static void helper_recovery_alert(const char *msg)
+{
+    log_error("alert: c-backup-helper lost its hold journal: %s", msg);
+    if (atomic_load(&g_alerts_on) && push_send("c-backup-helper: hold journal lost", msg) != 0)
+        log_warn("alert: could not queue the helper recovery alert");
+}
+
 /*
  * Daemon id, unit settings, providers and the start-up sweep. The fake
  * provider is enabled only by units.fake_spec, which only the end-to-end
@@ -558,6 +568,7 @@ int main(int argc, char *argv[])
         atomic_store(&g_alerts_on, tok && tok[0] && usr && usr[0]);
     }
     sync_latch_set_alert(sync_latch_alert);
+    remote_set_recovery_alert(helper_recovery_alert);
 
     /*
      * Units (source-providers.md): the daemon id, the providers, then the

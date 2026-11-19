@@ -82,6 +82,11 @@ void     remote_stop(void);
 status_t remote_attach(const char *socket_path, const char *daemon8, remote_hello_t *out);
 
 void     remote_link_info(remote_link_info_t *out);
+
+/* Called once per helper recovery (B285: a helper that started without a
+ * usable hold journal, and what it released and left), with the helper's
+ * report, from the link's thread: the daemon's alert. NULL for none. */
+void     remote_set_recovery_alert(void (*fn)(const char *msg));
 /* Whether ops is a provider behind the helper. */
 int      remote_is_remote(const sp_provider_ops_t *ops);
 

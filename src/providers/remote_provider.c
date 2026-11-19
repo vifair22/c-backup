@@ -1143,6 +1143,30 @@ status_t remote_helper_call(const char *op, cJSON *args, cJSON **result)
     return rcall(sock, op, args, result);
 }
 
+static void (*volatile g_recovery_alert)(const char *msg);
+static char g_recovery_seen[96];   /* the last recovery alerted; the link thread's */
+static pthread_mutex_t g_recovery_mu = PTHREAD_MUTEX_INITIALIZER;
+
+void remote_set_recovery_alert(void (*fn)(const char *msg)) { g_recovery_alert = fn; }
+
+/* A helper that recovered from a lost hold journal says so in every hello
+ * for the rest of its life; one alert per recovery it names. */
+static void recovery_note(const cJSON *res)
+{
+    const cJSON *rc = cJSON_GetObjectItemCaseSensitive(res, "recovery");
+    const char *id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(rc, "id"));
+    const char *msg = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(rc, "msg"));
+    if (!id || !msg || !*id) return;
+    pthread_mutex_lock(&g_recovery_mu);
+    int news = strcmp(g_recovery_seen, id) != 0;
+    if (news) snprintf(g_recovery_seen, sizeof(g_recovery_seen), "%s", id);
+    pthread_mutex_unlock(&g_recovery_mu);
+    if (!news) return;
+    void (*fn)(const char *) = g_recovery_alert;
+    if (fn) fn(msg);
+    else log_error("helper: %s", msg);
+}
+
 /* One hello; enable any provider offered that is not enabled yet. */
 static status_t attach_once(const char *socket_path, const char *daemon8, remote_hello_t *out)
 {
@@ -1159,6 +1183,7 @@ static status_t attach_once(const char *socket_path, const char *daemon8, remote
     h.path_snapshots = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "path_snapshots"));
     snprintf(h.daemon_id, sizeof(h.daemon_id), "%s", jstr(res, "daemon_id"));
     snprintf(h.policy, sizeof(h.policy), "%s", jstr(res, "policy"));
+    recovery_note(res);
     /* Said when it is news: this ran at every health check, so a daemon id
      * that differs from the helper's was warned about every 15 s. */
     int news = strcmp(g_hello.daemon_id, h.daemon_id) != 0 || strcmp(g_hello.policy, h.policy) != 0 ||
