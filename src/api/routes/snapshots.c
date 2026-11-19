@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "db_readers.h"
 #include "sync_latch.h"
 #include "pack_presence.h"
 
@@ -322,19 +323,21 @@ static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
     snprintf(lim,  sizeof(lim),  "%d", limit);
     snprintf(off,  sizeof(off),  "%d", offset);
 
-    db_result_t *r = NULL;
-    if (db_execute(g_ctx.db,
+    /* On a reader (B273): on the shared connection the listing queued
+     * behind every COMMIT a running backup made. */
+    db_rows_t *r = NULL;
+    if (db_read_rows(g_ctx.db, 0,
             "SELECT id, ts, label, file_count, total_size, nodes_materialized,"
             "       gfs_flags"
             "  FROM snapshots WHERE repo_id = ?"
             " ORDER BY id DESC LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r) != 0) {
-        db_result_free(r);
+        db_rows_free(r);
         return api_error(500, "cannot list snapshots");
     }
 
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
-    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
+    if (json_resp_new(&resp) != 0) { db_rows_free(r); return api_error(500, "out of memory"); }
     /* Create the array up front. json_resp_array_append_begin makes it
      * lazily on first append, so a query with no rows omitted the key
      * entirely and the response came back as {} - a second shape every
@@ -371,7 +374,7 @@ static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
         if (bad) break;
         json_elem_commit(&e);
     }
-    db_result_free(r);
+    db_rows_free(r);
 
     char *body = NULL; size_t blen = 0;
     if (json_resp_finalize(resp, &body, &blen) != 0)

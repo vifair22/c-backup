@@ -8,6 +8,7 @@
 #include "checkpointer.h"
 #include "db_capture.h"
 #include "db_findings.h"
+#include "db_readers.h"
 #include "db_txn.h"
 
 #include <cutils/log.h>
@@ -105,9 +106,9 @@ static char *label_escape(const char *s)
 static void emit_stalest_info(mbuf_t *m, const char *name, const char *help,
                               const char *sql)
 {
-    db_result_t *r = NULL;
-    if (db_execute(g_db, sql, NULL, &r) != 0 || !r || r->nrows != 1) {
-        db_result_free(r);
+    db_rows_t *r = NULL;
+    if (db_read_rows(g_db, 0, sql, NULL, &r) != 0 || !r || r->nrows != 1) {
+        db_rows_free(r);
         return;
     }
     char *label = label_escape(r->rows[0][1] ? r->rows[0][1] : "");
@@ -116,7 +117,7 @@ static void emit_stalest_info(mbuf_t *m, const char *name, const char *help,
                 name, help, name, name, strtoll(r->rows[0][0], NULL, 10), label);
         free(label);
     }
-    db_result_free(r);
+    db_rows_free(r);
 }
 
 /* Single-value query; -1 when it cannot be answered, including a NULL
@@ -125,14 +126,14 @@ static void emit_stalest_info(mbuf_t *m, const char *name, const char *help,
  * to parse as 0 and report "just now" for something that never happened. */
 static long long scalar(const char *sql)
 {
-    db_result_t *r = NULL;
-    if (db_execute(g_db, sql, NULL, &r) != 0 || !r || r->nrows != 1 ||
+    db_rows_t *r = NULL;
+    if (db_read_rows(g_db, 0, sql, NULL, &r) != 0 || !r || r->nrows != 1 ||
         !r->rows[0][0] || !r->rows[0][0][0]) {
-        db_result_free(r);
+        db_rows_free(r);
         return -1;
     }
     long long v = strtoll(r->rows[0][0], NULL, 10);
-    db_result_free(r);
+    db_rows_free(r);
     return v;
 }
 
@@ -156,11 +157,11 @@ static void emit_db_findings(mbuf_t *m)
         DB_COV_ENGINE_UNSAFE, DB_COV_SPLIT, DB_COV_UNCOVERED,
     };
     long long n[sizeof(covs) / sizeof(*covs)] = { 0 };
-    db_result_t *r = NULL;
-    if (db_execute(g_db, "SELECT coverage, COUNT(*) FROM db_findings WHERE confidence = 'live'"
-                         " AND state <> 'dismissed' AND coverage IS NOT NULL GROUP BY coverage",
-                   NULL, &r) != 0) {
-        db_result_free(r);
+    db_rows_t *r = NULL;
+    if (db_read_rows(g_db, 0, "SELECT coverage, COUNT(*) FROM db_findings WHERE confidence = 'live'"
+                              " AND state <> 'dismissed' AND coverage IS NOT NULL GROUP BY coverage",
+                     NULL, &r) != 0) {
+        db_rows_free(r);
         return;
     }
     for (int i = 0; r && i < r->nrows; i++) {
@@ -169,7 +170,7 @@ static void emit_db_findings(mbuf_t *m)
         for (size_t k = 0; k < sizeof(covs) / sizeof(*covs); k++)
             if (covs[k] == c) n[k] = strtoll(r->rows[i][1], NULL, 10);
     }
-    db_result_free(r);
+    db_rows_free(r);
     mb_addf(m, "# HELP cbackup_db_findings Live databases found by backups, not dismissed, "
                "by how the capture covers them.\n# TYPE cbackup_db_findings gauge\n");
     for (size_t k = 0; k < sizeof(covs) / sizeof(*covs); k++)

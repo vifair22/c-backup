@@ -6,6 +6,7 @@
 #include "db_txn.h"
 #include "registry.h"
 #include "db_write.h"
+#include "db_readers.h"
 #include "thread_name.h"
 
 #include <cutils/log.h>
@@ -443,27 +444,35 @@ status_t units_watchdog_tick(cutils_db_t *db, int64_t now_ms, unsigned *released
     char f[32], pz[32];
     snprintf(f, sizeof(f), "%lld", (long long)(now_ms - (int64_t)g_cfg.freeze_timeout_s * 1000));
     snprintf(pz, sizeof(pz), "%lld", (long long)(now_ms - (int64_t)g_cfg.max_pause_s * 1000));
-    db_result_t *r = NULL;
-    if (db_execute(db,
+    /* On a reader (B273): the tick ran every second on the shared
+     * connection, so it queued behind every COMMIT, and a hold past its
+     * limit waited for a backup's batch before it was even looked at. What
+     * it sees is the last commit, which is the journal: a hold not yet
+     * committed is not past any limit. */
+    db_rows_t *rr = NULL;
+    if (db_read_rows(db, 0,
             "SELECT id, provider, unit_id, kind, detail, COALESCE(job_id, 0)"
             "  FROM unit_intents"
             " WHERE (kind = 'freeze' AND created_at <= ?)"
             "    OR (kind = 'pause' AND created_at <= ?) ORDER BY id",
-            (const char *[]){ f, pz, NULL }, &r) != 0) {
-        db_result_free(r);
+            (const char *[]){ f, pz, NULL }, &rr) != 0) {
+        db_rows_free(rr);
         return set_error(ERR_IO, "units: watchdog cannot read the hold journal");
     }
+    /* The sweep reads rows and nrows only, which db_rows_t lays out as
+     * db_result_t does. */
+    db_result_t view = { rr ? rr->rows : NULL, rr ? rr->nrows : 0, rr ? rr->ncols : 0, NULL };
     units_sweep_result_t res;
     memset(&res, 0, sizeof(res));
-    if (r && r->nrows > 0) {
+    if (view.nrows > 0) {
         for (size_t p = 0; p < sp_registry_count(); p++) {
             const sp_provider_ops_t *ops = NULL;
             sp_ctx_t *ctx = NULL;
             sp_registry_at(p, &ops, &ctx);
-            if (ops) (void)sweep_provider(db, ops, ctx, r, NULL, 0, 0, 1, &res, "watchdog");
+            if (ops) (void)sweep_provider(db, ops, ctx, &view, NULL, 0, 0, 1, &res, "watchdog");
         }
     }
-    db_result_free(r);
+    db_rows_free(rr);
     if (released) *released = res.released;
     return OK;
 }
