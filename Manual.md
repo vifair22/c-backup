@@ -2498,8 +2498,8 @@ the repository).
 | `cbackup_checkpoint_lock_wait_max_seconds` | gauge | The longest single such wait since start |
 | `cbackup_checkpoint_presync_seconds_total` | counter | Time spent writing the log out to disk just before a locked round, without the lock, so the round itself only syncs what arrived since |
 | `cbackup_checkpoint_frames_copied_total` | counter | Log frames copied back into `state.db`; over `cbackup_checkpoint_rounds_total`, frames per round |
-| `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap |
-| `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy |
+| `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap, until the copy completes or the locked round that completes it has queued for the write lock |
+| `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy or on the locked checkpoint round queueing for the write lock, after which the lock's own queue holds the writer |
 | `cbackup_checkpoint_throttle_seconds_total` | counter | Time bulk writers spent so held |
 | `cbackup_wal_frames_max` | gauge | The most frames `state.db`'s log held since start, read after every commit; the hard cap is 16 times `db.wal_autocheckpoint` |
 | `cbackup_db_findings{coverage}` | gauge | Live database findings not dismissed, by coverage: `covered-crash`, `covered-quiesced`, `covered-application`, `engine-unsafe`, `split`, `uncovered` (chapter 23); every label always present |

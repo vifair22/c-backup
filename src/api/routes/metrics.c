@@ -262,7 +262,8 @@ static void emit_txn_metrics(mbuf_t *m)
                "# TYPE cbackup_checkpoint_throttle_waits_total counter\n"
                "cbackup_checkpoint_throttle_waits_total %lu\n", c.throttled);
     mb_addf(m, "# HELP cbackup_checkpoint_throttle_timeouts_total Of those waits, the ones "
-               "that ended at the time limit rather than on a completed copy.\n"
+               "that ended at the time limit rather than on a completed copy or the locked "
+               "round queueing for the write lock.\n"
                "# TYPE cbackup_checkpoint_throttle_timeouts_total counter\n"
                "cbackup_checkpoint_throttle_timeouts_total %lu\n", c.throttle_timeouts);
     mb_addf(m, "# HELP cbackup_checkpoint_throttle_seconds_total Time bulk writers spent "
