@@ -2558,6 +2558,7 @@ the repository).
 | `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap, until the copy completes or the locked round that completes it has queued for the write lock |
 | `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy or on the locked checkpoint round queueing for the write lock, after which the lock's own queue holds the writer |
 | `cbackup_checkpoint_throttle_seconds_total` | counter | Time bulk writers spent so held |
+| `cbackup_checkpoint_quiesce_misses_total` | counter | Locked rounds that waited 100 ms for a slow read on the daemon's pooled read connections and then copied without holding them out, so the writers waiting on the round did not wait for that read; such a round cannot restart the log, and after four in a row one waits for the reads however long they take |
 | `cbackup_wal_frames_max` | gauge | The most frames `state.db`'s log held since start, read after every commit; the hard cap is 16 times `db.wal_autocheckpoint` |
 | `cbackup_db_findings{coverage}` | gauge | Live database findings not dismissed, by coverage: `covered-crash`, `covered-quiesced`, `covered-application`, `engine-unsafe`, `split`, `uncovered` (chapter 23); every label always present |
 | `cbackup_db_engine_captures_total{engine,result}` | counter | Engine copies file backups tried to make (23.6), by outcome: `ok`, `refused`, `abandoned`, `failed` |

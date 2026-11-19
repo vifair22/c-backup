@@ -266,6 +266,11 @@ static void emit_txn_metrics(mbuf_t *m)
                "round queueing for the write lock.\n"
                "# TYPE cbackup_checkpoint_throttle_timeouts_total counter\n"
                "cbackup_checkpoint_throttle_timeouts_total %lu\n", c.throttle_timeouts);
+    mb_addf(m, "# HELP cbackup_checkpoint_quiesce_misses_total Locked rounds that stopped "
+               "waiting for a slow pooled read after 100 ms and copied without holding the "
+               "readers out, so their writers did not wait for it.\n"
+               "# TYPE cbackup_checkpoint_quiesce_misses_total counter\n"
+               "cbackup_checkpoint_quiesce_misses_total %lu\n", c.quiesce_misses);
     mb_addf(m, "# HELP cbackup_checkpoint_throttle_seconds_total Time bulk writers spent "
                "held at the hard cap.\n"
                "# TYPE cbackup_checkpoint_throttle_seconds_total counter\n"
