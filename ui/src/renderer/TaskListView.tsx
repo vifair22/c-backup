@@ -104,6 +104,13 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
                 {/* Top row: command, state, time */}
                 <div className="flex items-center gap-3 mb-1">
                   <span className="text-sm font-semibold text-text-primary capitalize">{t.action}</span>
+                  {/* A replicate listed under the repository it writes
+                    * into (B283): its own repo_id is the source. */}
+                  {t.dest_repo_id != null && t.dest_repo_id === Number(repoPath) && t.repo_id !== t.dest_repo_id && (
+                    <span className="text-[11px] text-text-muted" data-testid="job-from">
+                      into this repository from repository {t.repo_id}
+                    </span>
+                  )}
                   <span className={`text-[10px] font-semibold ${cfg.color}`}
                     data-testid="job-state">{cfg.label}</span>
                   <span className="text-[11px] text-text-muted ml-auto">
