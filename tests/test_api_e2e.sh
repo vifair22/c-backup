@@ -1493,6 +1493,34 @@ contains "empty search keeps its key" '"results"' \
 contains "empty object refs keep their key" '"refs"' \
     "$(sock_body '/repos/1/objects/0000000000000000000000000000000000000000000000000000000000000000/refs')"
 
+# FLAKE-31: the unix socket listened with a backlog of 8, and a unix socket
+# refuses a connect outright once its backlog is full, so twelve racing
+# clients lost some requests (curl exit 7) whenever the accept thread fell
+# behind on a loaded runner. The daemon is stopped here so nothing is
+# accepted, and the burst is let go only once every client is either
+# queued (its embryo socket carries the listener's path in /proc/net/unix)
+# or has already been refused.
+echo "a burst of local clients while nothing is accepted"
+BURST=32
+BURST_BASE=$(grep -c " $SOCK\$" /proc/net/unix)
+kill -STOP "$DAEMON_PID"
+BURST_PIDS=()
+for i in $(seq 1 $BURST); do
+    curl -s -o /dev/null -w '%{http_code}\n' --max-time 60 --unix-socket "$SOCK" \
+         http://localhost/healthz > "$WORK/burst.$i" 2>/dev/null &
+    BURST_PIDS+=($!)
+done
+for _ in $(seq 1 600); do
+    queued=$(( $(grep -c " $SOCK\$" /proc/net/unix) - BURST_BASE ))
+    refused=$(cat "$WORK"/burst.* 2>/dev/null | grep -c .)
+    [ $((queued + refused)) -ge $BURST ] && break
+    sleep 0.05
+done
+kill -CONT "$DAEMON_PID"
+wait "${BURST_PIDS[@]}"
+check "every client of the burst was answered" $BURST "$(cat "$WORK"/burst.* | grep -c '^200$')"
+rm -f "$WORK"/burst.*
+
 # B123: backups submitted while snapshot deletes ran against the same
 # repository failed "repo N is busy" whenever a delete held the repo lock at
 # the moment the job was dispatched, each with a failure alert. The UAT

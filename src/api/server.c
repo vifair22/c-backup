@@ -1125,7 +1125,16 @@ int api_server_start(api_server_t *srv)
             return rc;
         }
         srv->unix_bound = 1;
-        if (listen(sock, 8) < 0) {
+        /*
+         * The kernel's full backlog, not a handful. A unix socket refuses a
+         * connect outright once its backlog is full (curl exit 7, the UI's
+         * request fails), where TCP would retry the SYN. With a backlog of
+         * 8, twelve local clients at once - the CLI, the app and a script -
+         * lost some of their requests whenever the accept thread fell
+         * behind on a busy host (FLAKE-31). MHD's TCP listener already uses
+         * SOMAXCONN.
+         */
+        if (listen(sock, SOMAXCONN) < 0) {
             int rc = set_error_errno(CUTILS_ERR, "cannot listen on the unix socket at %s",
                                      path);
             close(sock);
