@@ -34,16 +34,19 @@ trap cleanup EXIT
 ok()  { printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; }
 
-# A state volume owned by 990, holding the given database if any.
+# A state volume owned by 990, holding the given database if any. Mounted
+# where the daemon will mount it: Docker fills an empty named volume from
+# the image's directory at its first mount, owner and mode included (root,
+# 0700), so a chown made at any other path is undone by the daemon's mount.
 make_volume() {
-    local vol="$1" db="${2:-}"
+    local vol="$1" db="${2:-}" s=/var/lib/c-backupd
     docker volume create "$vol" >/dev/null || return 1
     VOLS+=("$vol")
     if [ -n "$db" ]; then
-        docker run --rm -i -v "$vol:/s" --entrypoint sh "$IMAGE" \
-            -c 'cat > /s/state.db && chown -R 990:990 /s' < "$db"
+        docker run --rm -i -v "$vol:$s" --entrypoint sh "$IMAGE" \
+            -c "cat > $s/state.db && chown -R 990:990 $s" < "$db"
     else
-        docker run --rm -v "$vol:/s" --entrypoint chown "$IMAGE" -R 990:990 /s
+        docker run --rm -v "$vol:$s" --entrypoint chown "$IMAGE" -R 990:990 "$s"
     fi
 }
 
