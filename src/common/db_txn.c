@@ -222,13 +222,13 @@ static void budget_open(uintptr_t caller)
             : rows > (double)UINT32_MAX ? UINT32_MAX : (uint32_t)rows;
 }
 
-/* Under the lock, after COMMIT. */
-static void budget_committed(uint64_t commit_ns)
+/* Under the lock, after COMMIT, with the wal-index read after it (have 0
+ * when it could not be). */
+static void budget_committed(uint64_t commit_ns, int have, uint32_t mx, uint32_t salt)
 {
     if (!tls_tracked) return;
     tls_tracked = 0;
-    uint32_t mx = 0, salt = 0;
-    if (read_walidx(&mx, &salt) != 0) return;
+    if (!have) return;
     uint32_t frames = salt != tls_salt0 ? mx : mx - tls_mx0;
     atomic_fetch_add_explicit(&g_m_commit_frames, frames, memory_order_relaxed);
     g_cstats.commits++;
@@ -469,7 +469,15 @@ status_t db_txn_commit(cutils_db_t *db)
     phase_add_commit(phase_current, t0);
     atomic_fetch_add_explicit(&g_m_commits, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_m_commit_ns, t1 - t0, memory_order_relaxed);
-    if (rc == 0) budget_committed(t1 - t0);
+    if (rc == 0) {
+        /* The WAL grows only at a commit, so its peak is seen here, every
+         * time, rather than by the checkpointer's once-a-second look,
+         * which missed most of them (B236). */
+        uint32_t mx = 0, salt = 0;
+        int have = read_walidx(&mx, &salt) == 0;
+        if (have) checkpointer_note_wal_frames(mx);
+        budget_committed(t1 - t0, have, mx, salt);
+    }
     tls_tracked = 0;
     /* Read before the lock goes: the next holder's statements would
      * replace the connection's code. */

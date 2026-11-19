@@ -862,6 +862,87 @@ static void test_the_lock_wait_is_not_counted_as_the_hold(void **state)
     assert_true(st.max_lock_ns < 250ull * 1000000ull);
 }
 
+/*
+ * B234: a bulk writer held at the hard cap is let go once the locked round
+ * has queued for the write lock, and the lock's queue holds it from there.
+ * Here the copy cannot complete outside the lock (a reader pins it short
+ * of the last frame) and the round queues behind a writer holding the lock
+ * for 2.5 s. The throttle used to poll for a complete copy until its 2 s
+ * limit, which on FS2 was how 81 of 82 waits ended.
+ */
+static void test_a_queued_round_ends_the_throttle(void **state)
+{
+    (void)state;
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    checkpointer_set_test_idle(1);
+    while (wal_frames() <= (uint32_t)THRESHOLD * CKPT_HARD_FACTOR)
+        assert_int_equal(commit_rows_with(db_txn_begin, 8), 0);
+    cutils_db_t *reader = NULL;
+    assert_int_equal(db_open(&reader, TEST_DB), 0);
+    assert_int_equal(db_exec_raw(reader, "BEGIN"), 0);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(reader, "SELECT COUNT(*) FROM t", NULL, &r), 0);
+    db_result_free(r);
+    assert_int_equal(commit_rows_with(db_txn_begin, 1), 0);   /* past the reader's mark */
+
+    assert_int_equal(db_txn_begin(db), OK);                   /* the lock, held */
+    checkpointer_set_test_idle(0);
+    /* The tick's unlocked copy has run; its locked round then queues. */
+    checkpointer_stats_t s;
+    for (int i = 0; i < 1000; i++) {
+        checkpointer_stats(&s);
+        if (s.passive > 0) break;
+        sleep_ms(10);
+    }
+    assert_true(s.passive > 0);
+    sleep_ms(200);
+
+    bulk_t b;
+    memset(&b, 0, sizeof(b));
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, bulk_main, &b), 0);
+    sleep_ms(2500);
+    assert_int_equal(atomic_load(&b.done), 0);    /* queued behind the lock */
+    assert_int_equal(db_txn_commit(db), OK);
+    pthread_join(th, NULL);
+    assert_int_equal(b.rc, 0);
+    checkpointer_stats(&s);
+    print_message("  bulk writer waited %llu ms in all; throttle waits %lu, timeouts %lu, "
+                  "longest %.0f ms\n", (unsigned long long)b.waited_ms, s.throttled,
+                  s.throttle_timeouts, (double)s.max_throttle_ns / 1e6);
+    assert_int_equal(s.throttle_timeouts, 0);
+    assert_true(s.max_throttle_ns < 500ull * 1000000ull);
+    assert_int_equal(db_exec_raw(reader, "COMMIT"), 0);
+    db_close(reader);
+}
+
+/*
+ * B236: cbackup_wal_frames_max is the WAL's real peak, not what a tick
+ * happened to see. With no tick at all (the interval is a minute) the
+ * peak reached by commits is reported, and a restart and a smaller WAL
+ * after it do not lower it.
+ */
+static void test_the_wal_peak_is_seen_at_every_commit(void **state)
+{
+    (void)state;
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 60000), OK);
+    for (int i = 0; i < 40; i++) assert_int_equal(commit_rows(10), 0);
+    uint32_t peak = wal_frames();
+    assert_true(peak > THRESHOLD);
+    checkpointer_stats_t s;
+    checkpointer_stats(&s);
+    print_message("  WAL at %u frames; reported peak %u, ticks %lu\n", peak,
+                  s.max_wal_frames, s.ticks);
+    assert_int_equal(s.ticks, 0);
+    assert_int_equal(s.max_wal_frames, peak);
+
+    assert_int_equal(checkpointer_force(), OK);           /* copy and restart */
+    assert_int_equal(commit_rows(1), 0);
+    assert_true(wal_frames() < peak);
+    checkpointer_stats(&s);
+    assert_int_equal(s.max_wal_frames, peak);
+}
+
 static int file_exists(const char *p)
 {
     struct stat sb;
@@ -1001,6 +1082,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_refused_checkpoint_is_a_failure_not_busy,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_lock_wait_is_not_counted_as_the_hold,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_queued_round_ends_the_throttle,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_the_wal_peak_is_seen_at_every_commit,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_shutdown_does_not_wait_for_a_slow_copy,
                                         setup, teardown),
