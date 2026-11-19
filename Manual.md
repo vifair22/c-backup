@@ -5333,7 +5333,9 @@ enabled template stops at the next backup.
 - `c-backup jobs cancel` stops a running dump, or an exec template's pre
   run: SIGTERM to its whole process group, SIGKILL 3 seconds later, and the
   job ends cancelled within seconds; the dump is not stored. A post run is
-  never stopped, since it undoes the pre run.
+  never stopped, since it undoes the pre run. A policy pre hook (a
+  `[hook]` in the helper's policy) is stopped the same way when the job is
+  cancelled while the capture begins, and the unit ends with nothing held.
 - The finding's coverage reflects it: a stored dump is a consistent copy at
   its own instant, so the finding is `covered-application` whatever the
   capture was; an exec template lifts a capture that was already one
