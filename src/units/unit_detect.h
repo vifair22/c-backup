@@ -42,6 +42,13 @@ sp_unit_probe_t *unit_detect_probe(const sp_provider_ops_t *ops, sp_ctx_t *ctx,
 void unit_detect_reread(db_detector_t *d, const char *const *rec, const char *const *rd,
                         size_t n);
 
+/*
+ * db_unit_lookup_fn over a provider's unit list: ctx is the provider's
+ * name. A unit whose id or name is host, as "<provider>:<unit id>". A list
+ * that fails is no answer, logged at debug.
+ */
+int unit_detect_lookup_host(void *ctx, const char *host, char *key, size_t sz);
+
 typedef struct {
     char             unit_key[SP_PROVIDER_MAX + SP_UNIT_ID_MAX + 2];
     char             name[256];

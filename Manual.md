@@ -4882,6 +4882,7 @@ Liveness from the probe, in a unit:
 |---|---|
 | a file held open for writing (`O_WRONLY` or `O_RDWR`) | the finding whose directory holds it; for SQLite and bbolt, the database file itself or its `-wal`, `-shm` or `-journal` |
 | an engine's process: `postgres`/`postmaster`, `mysqld`/`mariadbd`, `redis-server`/`valkey-server`, `prometheus`, `influxd`, `mongod`, `clickhouse-server`, `java` with `elasticsearch` or `opensearch` in its arguments (the evidence says which, `args_match`) | every finding of that engine in the unit, except that once the engine's process is seen holding files of one data directory, only the directories it holds: an old copy beside the live one (`pgdata.bak/`) stays dormant |
+| for Nextcloud, a web server or PHP (`apache2`, `httpd`, `nginx`, `lighttpd`, `caddy`, `frankenphp`, `php*`) in a container of the unit running a `nextcloud` image, or in any container when none does; or the database it names, in the same unit, being live | the Nextcloud finding |
 
 The engine's listening ports are listed in a finding's evidence (`ports`)
 beside its processes. They are hint evidence only, never liveness: a
@@ -4902,11 +4903,24 @@ Nextcloud's database is linked to it (section 3 of the design): its
 `dbhost` is read from `config/config.php` with the same fixed pattern and
 resolved, in order, as the container itself (`localhost`, a loopback
 address, a socket path), another container of the same unit (by container
-name, compose service or network alias), or another unit backed up into
-the same repository whose database findings answer to that name. The
-finding's evidence says which (`link`); a database in another unit is
-`consistent` only when both units share a `capture.group`, and is otherwise
-suggested `group-units`.
+name, compose service or network alias), another unit backed up into the
+same repository whose database findings answer to that name, or any unit
+the provider lists by that name, backed up here or not. The finding's
+evidence says which (`link`). A Nextcloud's `version` is its own, from
+`config.php`; the `dbtype` is in the link.
+
+A live Nextcloud is judged like an engine, over its files and its
+database's together. In one unit, with its database's data directory in the
+captured mounts, it is covered when both were captured at one instant, and
+`split` (suggested `pause-always`) when they were not; a database named in
+the unit whose data directory is not in the captured mounts, or a `dbhost`
+that could not be read, makes it `split`. A database in another unit is
+`consistent` only when both units share a `capture.group`; otherwise the
+finding is `split` and suggested `group-units`, and so is one whose
+database no unit answers to (with nothing to suggest). A covered Nextcloud
+in a unit names `nextcloud-maintenance` as `optional` (maintenance mode
+around the capture makes it application-consistent), and one read live is
+suggested it.
 
 ### 23.3 Coverage
 
@@ -4934,9 +4948,11 @@ unit (`pg-dumpall`, `mariadb-dump`, `redis-rdb`, `mongodump`, `sqlite-backup`,
 `influx2-backup`, `prometheus-snapshot`), `sqlite-backup` (an online-backup
 copy by the daemon) or `source-snapshot` for a file source, `pause-always`
 for a split unit, `exclude-rebuild` for a search index, `group-units` for a
-Nextcloud whose database is in another unit. A covered
+Nextcloud whose database is in another unit, `nextcloud-maintenance` for a
+Nextcloud read live. A covered
 PostgreSQL, MySQL or MongoDB in a unit also names its dump as `optional`,
-for portability across major versions.
+for portability across major versions, and a covered Nextcloud names
+`nextcloud-maintenance`.
 
 ### 23.4 Where the results go
 

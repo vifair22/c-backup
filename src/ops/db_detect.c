@@ -227,15 +227,15 @@ static unsigned nextcloud_dbtype(const char *s, size_t len)
     return 0;
 }
 
-/* The value of 'dbhost', the same way: a quoted host, host:port, an IPv6
- * literal or a socket path, made of the characters those use. 0 when
- * there is none or it holds anything else. */
-static int nextcloud_dbhost(const char *s, size_t len, char *out, size_t sz)
+/* A quoted value of key, the same way, made only of characters ok
+ * accepts. 0 when there is none or it holds anything else. */
+static int php_value(const char *s, size_t len, const char *key, int (*ok)(char),
+                     char *out, size_t sz)
 {
-    static const char key[] = "'dbhost'";
-    for (size_t i = 0; i + sizeof(key) - 1 < len; i++) {
-        if (memcmp(s + i, key, sizeof(key) - 1) != 0) continue;
-        size_t j = i + sizeof(key) - 1;
+    size_t kl = strlen(key);
+    for (size_t i = 0; i + kl < len; i++) {
+        if (memcmp(s + i, key, kl) != 0) continue;
+        size_t j = i + kl;
         while (j < len && (s[j] == ' ' || s[j] == '\t')) j++;
         if (j + 2 >= len || s[j] != '=' || s[j + 1] != '>') return 0;
         j += 2;
@@ -245,9 +245,7 @@ static int nextcloud_dbhost(const char *s, size_t len, char *out, size_t sz)
         size_t n = 0;
         while (j < len && s[j] != q) {
             char c = s[j++];
-            int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit(c) ||
-                     c == '.' || c == '-' || c == '_' || c == ':' || c == '/' || c == '[' || c == ']';
-            if (!ok || n + 1 >= sz) return 0;
+            if (!ok(c) || n + 1 >= sz) return 0;
             out[n++] = c;
         }
         if (j >= len) return 0;
@@ -255,6 +253,31 @@ static int nextcloud_dbhost(const char *s, size_t len, char *out, size_t sz)
         return 1;
     }
     return 0;
+}
+
+/* A host, host:port, an IPv6 literal or a socket path. */
+static int dbhost_char(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit(c) ||
+           c == '.' || c == '-' || c == '_' || c == ':' || c == '/' || c == '[' || c == ']';
+}
+
+static int version_char(char c)
+{
+    return is_digit(c) || c == '.';
+}
+
+/* The value of 'dbhost'. */
+static int nextcloud_dbhost(const char *s, size_t len, char *out, size_t sz)
+{
+    return php_value(s, len, "'dbhost'", dbhost_char, out, sz);
+}
+
+/* The value of 'version': Nextcloud's own, "30.0.2.2". The dbtype is not a
+ * version (B249); it stays in the finding's link. */
+static int nextcloud_version(const char *s, size_t len, char *out, size_t sz)
+{
+    return php_value(s, len, "'version'", version_char, out, sz) && out[0];
 }
 
 uint32_t db_detect_classify(const char *name, const void *head, size_t len)
@@ -336,8 +359,9 @@ typedef struct { char *dir; char *target; link_kind_t kind; } lrec_t;
 #define SIB_JOURNAL 4u
 typedef struct { char *path; unsigned m; } srec_t;
 typedef struct { char *path; uint32_t code; } crec_t;
-/* A Nextcloud config.php's dbhost, from a head that was read. */
-typedef struct { char *path; char host[256]; } nrec_t;
+/* A Nextcloud config.php's dbhost and version, from a head that was read;
+ * either is "" when it was not there or not readable. */
+typedef struct { char *path; char host[256]; char version[32]; } nrec_t;
 
 /* units.probe signals (D1). */
 #define NAME_SZ SP_PROBE_NAME_MAX
@@ -350,6 +374,9 @@ typedef enum { HINT_IMAGE = 0, HINT_PORT, HINT_PROCESS } hint_kind_t;
 /* mask: every engine the signal fits; engine: the one a hint names. */
 typedef struct { db_engine_t engine; uint32_t mask; hint_kind_t kind; char container[NAME_SZ];
                  char text[SP_PROBE_IMAGE_MAX]; } hsig_t;
+/* A web server or PHP process, which is what runs Nextcloud; nc_image when
+ * its container's image is a Nextcloud image. */
+typedef struct { char container[NAME_SZ]; char comm[SP_PROBE_COMM_MAX]; int nc_image; } asig_t;
 
 #define VEC(T) struct { T *v; size_t n, cap; }
 
@@ -373,6 +400,8 @@ struct db_detector {
     VEC(psig_t) psigs;
     VEC(osig_t) osigs;
     VEC(hsig_t) hsigs;
+    VEC(asig_t) asigs;
+    int         nc_image;         /* a container of the unit runs a Nextcloud image */
     VEC(char *) names;            /* the unit's container names and aliases */
 };
 
@@ -416,7 +445,7 @@ void db_detect_free(db_detector_t *d)
     for (size_t i = 0; i < d->names.n; i++) free(d->names.v[i]);
     free(d->dirs.v); free(d->links.v); free(d->sibs.v); free(d->unsettled.v);
     free(d->carry.v); free(d->heads.v); free(d->nchosts.v);
-    free(d->psigs.v); free(d->osigs.v); free(d->hsigs.v); free(d->names.v);
+    free(d->psigs.v); free(d->osigs.v); free(d->hsigs.v); free(d->asigs.v); free(d->names.v);
     pthread_mutex_destroy(&d->mu);
     free(d);
 }
@@ -712,13 +741,13 @@ void db_detect_head(db_detector_t *d, const char *path, const void *head, size_t
     /* Most files classify as nothing, and they cost no lock and no copy. */
     if (code == DB_HEAD_NONE) return;
     add_head(d, path, code, size, 1);
-    /* The link (section 3) needs where Nextcloud's database is, which the
-     * head code has no room for. */
+    /* The link (section 3) needs where Nextcloud's database is, and the
+     * finding its version, which the head code has no room for. */
+    if (DB_HEAD_KIND(code) != DB_HEAD_NEXTCLOUD) return;
     nrec_t r;
     memset(&r, 0, sizeof(r));
-    if (DB_HEAD_KIND(code) != DB_HEAD_NEXTCLOUD ||
-        !nextcloud_dbhost(head, len, r.host, sizeof(r.host)))
-        return;
+    if (!nextcloud_dbhost(head, len, r.host, sizeof(r.host))) r.host[0] = '\0';
+    if (!nextcloud_version(head, len, r.version, sizeof(r.version))) r.version[0] = '\0';
     r.path = strdup(path);
     pthread_mutex_lock(&d->mu);
     if (!r.path) d->failed = 1;
@@ -793,6 +822,18 @@ static const char *process_match(const char *comm, const char *args)
     if (strstr(args, "opensearch")) return "opensearch";
     if (strstr(args, "elasticsearch")) return "elasticsearch";
     return "";
+}
+
+/* What serves Nextcloud: a web server, or PHP itself (php-fpm under any
+ * version suffix, the php running cron.php or occ). Nextcloud has no
+ * process of its own, so these are its liveness in a unit. */
+static int app_process(const char *comm)
+{
+    if (!comm || !*comm) return 0;
+    return strcmp(comm, "apache2") == 0 || strcmp(comm, "httpd") == 0 ||
+           strcmp(comm, "nginx") == 0 || strcmp(comm, "lighttpd") == 0 ||
+           strcmp(comm, "caddy") == 0 || strcmp(comm, "frankenphp") == 0 ||
+           strncmp(comm, "php", 3) == 0;
 }
 
 static int ends_with_seg(const char *s, size_t n, const char *suffix)
@@ -907,13 +948,24 @@ void db_detect_unit(db_detector_t *d, const sp_unit_probe_t *probe)
         const sp_probe_container_t *c = &probe->v[i];
         add_name(d, c->name);
         for (size_t k = 0; k < c->n_aliases; k++) add_name(d, c->aliases[k]);
-        add_hint(d, db_detect_image_engines(c->image), HINT_IMAGE, c->name, c->image);
+        uint32_t im = db_detect_image_engines(c->image);
+        add_hint(d, im, HINT_IMAGE, c->name, c->image);
+        if (im & EM(DB_ENGINE_NEXTCLOUD)) d->nc_image = 1;
         for (size_t k = 0; k < c->n_ports; k++) {
             char t[16];
             snprintf(t, sizeof(t), "%u", (unsigned)c->ports[k]);
             add_hint(d, db_detect_port_engines(c->ports[k]), HINT_PORT, c->name, t);
         }
         for (size_t k = 0; k < c->n_procs && !d->failed; k++) {
+            if (app_process(c->procs[k].comm)) {
+                asig_t a;
+                memset(&a, 0, sizeof(a));
+                snprintf(a.container, sizeof(a.container), "%s", c->name);
+                snprintf(a.comm, sizeof(a.comm), "%s", c->procs[k].comm);
+                a.nc_image = (im & EM(DB_ENGINE_NEXTCLOUD)) != 0;
+                VEC_PUSH(d, d->asigs, a);
+                continue;
+            }
             uint32_t m = db_detect_process_engines(c->procs[k].comm, c->procs[k].args);
             if (!m) continue;
             psig_t ps;
@@ -1183,6 +1235,13 @@ typedef struct {
     cJSON      *opens, *procs, *hint_ev, *link, *ports;
     int         hint;
     char        dbhost[256];
+    /* Nextcloud: its dbtype (the version is its own), the data directories
+     * of the database it names found in this unit, and when that database
+     * cannot be placed in this capture, why. */
+    char        dbtype[16];
+    char       *nc_dbs[4];
+    size_t      n_nc_dbs;
+    const char *nc_missing;
 } cand_t;
 
 static void cand_free(cand_t *c)
@@ -1195,6 +1254,7 @@ static void cand_free(cand_t *c)
     cJSON_Delete(c->hint_ev);
     cJSON_Delete(c->link);
     cJSON_Delete(c->ports);
+    for (size_t i = 0; i < c->n_nc_dbs; i++) free(c->nc_dbs[i]);
 }
 
 /* Which markers an engine's evidence lists. */
@@ -1351,7 +1411,7 @@ static void judge(const db_capture_desc_t *cap, cand_t *c, db_finding_t *f,
 {
     f->root = root_of(cap, f->path);
     f->method = (cap && f->root >= 0) ? method_of(cap->roots[f->root].kind) : NULL;
-    if (f->confidence != DB_CONF_LIVE || !cap || c->engine == DB_ENGINE_NEXTCLOUD) {
+    if (f->confidence != DB_CONF_LIVE || !cap) {
         f->coverage = DB_COV_NONE;
         return;
     }
@@ -1374,9 +1434,10 @@ static void judge(const db_capture_desc_t *cap, cand_t *c, db_finding_t *f,
     } else if (live && !held) {
         f->coverage = DB_COV_UNCOVERED;
         why = "read live while it was in use; the copy may be torn";
-    } else if (c->links_split || (live && held) || instants_differ) {
+    } else if (c->links_split || c->nc_missing || (live && held) || instants_differ) {
         f->coverage = DB_COV_SPLIT;
         why = c->links_split ? "some of its files are outside the capture"
+            : c->nc_missing ? c->nc_missing
             : "its files were captured at different instants";
     } else if ((c->engine == DB_ENGINE_MYSQL && (c->marks & (M_MYISAM | M_ARIA))) ||
                c->engine == DB_ENGINE_ELASTIC) {
@@ -1404,16 +1465,25 @@ static void judge(const db_capture_desc_t *cap, cand_t *c, db_finding_t *f,
         if (cap->unit && (c->engine == DB_ENGINE_POSTGRES || c->engine == DB_ENGINE_MYSQL ||
                           c->engine == DB_ENGINE_MONGO))
             f->optional = dump_template(c->engine);
+        /* One capture of Nextcloud and its database restores like a power
+         * cut across both; maintenance mode around it is what makes it
+         * application-consistent (section 6). */
+        else if (cap->unit && c->engine == DB_ENGINE_NEXTCLOUD &&
+                 f->coverage != DB_COV_COVERED_APPLICATION)
+            f->optional = "nextcloud-maintenance";
         break;
     case DB_COV_ENGINE_UNSAFE:
         f->suggestion = c->engine == DB_ENGINE_ELASTIC ? "exclude-rebuild"
                       : cap->unit ? "mariadb-dump" : "source-snapshot";
         break;
     case DB_COV_SPLIT:
-        f->suggestion = cap->unit ? "pause-always" : "source-snapshot";
+        /* A Nextcloud whose database is not in this capture has nothing
+         * here to pause; the reason says where it is not. */
+        if (!c->nc_missing) f->suggestion = cap->unit ? "pause-always" : "source-snapshot";
         break;
     case DB_COV_UNCOVERED:
         if (!cap->unit) f->suggestion = c->engine == DB_ENGINE_SQLITE ? "sqlite-backup" : "source-snapshot";
+        else if (c->engine == DB_ENGINE_NEXTCLOUD) f->suggestion = "nextcloud-maintenance";
         else f->suggestion = dump_template(c->engine);
         break;
     case DB_COV_NONE:
@@ -1592,7 +1662,7 @@ static void apply_probe(const db_detector_t *d, cand_t *v, size_t n)
     if (!nopen) return;
     for (size_t i = 0; i < n; i++) {
         cand_t *c = &v[i];
-        if (c->absorbed || c->hint || c->engine == DB_ENGINE_NEXTCLOUD) continue;
+        if (c->absorbed || c->hint) continue;
         for (size_t k = 0; k < d->osigs.n; k++) {
             const osig_t *o = &d->osigs.v[k];
             if (!open_belongs(o->path, c)) continue;
@@ -1603,7 +1673,17 @@ static void apply_probe(const db_detector_t *d, cand_t *v, size_t n)
     }
     for (size_t i = 0; i < n; i++) {
         cand_t *c = &v[i];
-        if (c->absorbed || c->hint || c->engine == DB_ENGINE_NEXTCLOUD) continue;
+        if (c->absorbed || c->hint) continue;
+        if (c->engine == DB_ENGINE_NEXTCLOUD) {
+            /* Its web server or PHP; only those in a Nextcloud image's
+             * container when the unit has one, so a proxy or another
+             * application beside it does not count. */
+            for (size_t k = 0; k < d->asigs.n; k++)
+                if (!d->nc_image || d->asigs.v[k].nc_image)
+                    ev_pair(&c->procs, "container", d->asigs.v[k].container, "comm", d->asigs.v[k].comm);
+            if (nopen[i] || c->procs) c->live = 1;
+            continue;
+        }
         if (server_engine(c->engine) && (!has_open[c->engine] || nopen[i]))
             for (size_t k = 0; k < d->psigs.n; k++)
                 if (d->psigs.v[k].live & EM(c->engine)) ev_proc(&c->procs, &d->psigs.v[k]);
@@ -1700,18 +1780,32 @@ static void dbhost_name(const char *dbhost, char *out, size_t sz)
     snprintf(out, sz, "%s", h);
 }
 
+/* The engine a Nextcloud dbtype names. */
+static db_engine_t dbtype_engine(const char *dbtype)
+{
+    if (strcmp(dbtype, "mysql") == 0) return DB_ENGINE_MYSQL;
+    if (strcmp(dbtype, "pgsql") == 0) return DB_ENGINE_POSTGRES;
+    return DB_ENGINE_NONE;
+}
+
 /* The Nextcloud link (section 3), as far as this unit can see it: its
  * database in the same container or another container of the same unit
- * is one capture. Anything else is left unresolved here, for the caller
- * to look for among the repository's other units. */
-static void nextcloud_link(const db_detector_t *d, cand_t *c)
+ * is in this capture, and the data directories of that engine found in
+ * the unit are judged with it (the finding is live when they are, and its
+ * coverage spans them). Anything else is left unresolved here, for the
+ * caller to look for among the host's other units
+ * (db_findings_link_nextcloud). */
+static void nextcloud_link(const db_detector_t *d, cand_t *v, size_t n, cand_t *c)
 {
-    if (strcmp(c->version, "sqlite3") == 0 || !c->version[0]) return;
+    db_engine_t e = dbtype_engine(c->dbtype);
+    if (e == DB_ENGINE_NONE) return;
     if (!(c->link = cJSON_CreateObject())) return;
-    cJSON_AddStringToObject(c->link, "dbtype", c->version);
+    cJSON_AddStringToObject(c->link, "dbtype", c->dbtype);
     if (!c->dbhost[0]) {
         cJSON_AddNullToObject(c->link, "resolved");
         cJSON_AddStringToObject(c->link, "note", "dbhost not read");
+        c->nc_missing = "its config.php names no database host that could be read, so its "
+                        "database cannot be placed in this capture";
         return;
     }
     cJSON_AddStringToObject(c->link, "dbhost", c->dbhost);
@@ -1720,13 +1814,37 @@ static void nextcloud_link(const db_detector_t *d, cand_t *c)
     int in_unit = !name[0];
     for (size_t i = 0; !in_unit && d->probed && i < d->names.n; i++)
         in_unit = strcmp(d->names.v[i], name) == 0;
-    if (in_unit) {
-        cJSON_AddStringToObject(c->link, "resolved", name[0] ? "this unit" : "this container");
-        cJSON_AddBoolToObject(c->link, "consistent", 1);
+    if (!in_unit) {
+        cJSON_AddNullToObject(c->link, "resolved");
+        cJSON_AddStringToObject(c->link, "host", name);
         return;
     }
-    cJSON_AddNullToObject(c->link, "resolved");
-    cJSON_AddStringToObject(c->link, "host", name);
+    cJSON_AddStringToObject(c->link, "resolved", name[0] ? "this unit" : "this container");
+    /* Its data directories in the unit: the live ones when any is, so an
+     * old copy beside the database does not decide (section 4). */
+    int any_live = 0;
+    for (size_t i = 0; i < n; i++)
+        if (!v[i].absorbed && !v[i].hint && v[i].engine == e && v[i].live) any_live = 1;
+    cJSON *dbs = NULL;
+    for (size_t i = 0; i < n && c->n_nc_dbs < sizeof(c->nc_dbs) / sizeof(*c->nc_dbs); i++) {
+        const cand_t *x = &v[i];
+        if (x->absorbed || x->hint || x->engine != e || (any_live && !x->live) || !x->path) continue;
+        char *p = strdup(x->path);
+        if (!p) break;
+        c->nc_dbs[c->n_nc_dbs++] = p;
+        if (!dbs) dbs = cJSON_AddArrayToObject(c->link, "databases");
+        if (dbs) cJSON_AddItemToArray(dbs, cJSON_CreateString(p));
+    }
+    if (any_live) c->live = 1;
+    if (!c->n_nc_dbs) {
+        cJSON_AddBoolToObject(c->link, "consistent", 0);
+        cJSON_AddStringToObject(c->link, "note", "no data directory of its database in the "
+                                "unit's captured mounts");
+        c->nc_missing = "its database is in this unit, but no data directory of it is in the "
+                        "captured mounts";
+        return;
+    }
+    cJSON_AddBoolToObject(c->link, "consistent", 1);
 }
 
 status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
@@ -1817,7 +1935,7 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
             c.engine = DB_ENGINE_NEXTCLOUD;
             static const char *const types[] = { "", "sqlite3", "mysql", "pgsql" };
             unsigned t = DB_HEAD_PARAM(h->code);
-            snprintf(c.version, sizeof(c.version), "%s", t < 4 ? types[t] : "");
+            snprintf(c.dbtype, sizeof(c.dbtype), "%s", t < 4 ? types[t] : "");
         } else {
             continue;
         }
@@ -1826,8 +1944,10 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
             if (n == (size_t)-1) continue;
             c.path = dup_n(h->path, n);
             for (size_t k = 0; k < d->nchosts.n; k++)
-                if (strcmp(d->nchosts.v[k].path, h->path) == 0)
+                if (strcmp(d->nchosts.v[k].path, h->path) == 0) {
                     snprintf(c.dbhost, sizeof(c.dbhost), "%s", d->nchosts.v[k].host);
+                    snprintf(c.version, sizeof(c.version), "%s", d->nchosts.v[k].version);
+                }
         } else {
             c.path = strdup(h->path);
         }
@@ -1869,16 +1989,22 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
 
     if (st == OK) apply_probe(d, cands.v, cands.n);
 
+    /* Every engine's liveness before Nextcloud's, which follows its
+     * database's. */
     for (size_t i = 0; i < cands.n && st == OK; i++) {
         cand_t *c = &cands.v[i];
         if (c->absorbed) continue;
         unsigned uns = 0;
         if (!c->hint && has_unsettled_under(d, c->path, &uns)) c->live = 1;
         c->unsettled = uns;
-        if (c->engine == DB_ENGINE_NEXTCLOUD) {
-            c->live = 0;
-            nextcloud_link(d, c);
-        }
+    }
+    for (size_t i = 0; i < cands.n && st == OK; i++)
+        if (!cands.v[i].absorbed && cands.v[i].engine == DB_ENGINE_NEXTCLOUD)
+            nextcloud_link(d, cands.v, cands.n, &cands.v[i]);
+
+    for (size_t i = 0; i < cands.n && st == OK; i++) {
+        cand_t *c = &cands.v[i];
+        if (c->absorbed) continue;
 
         db_finding_t *f = &res->v[res->n];
         memset(f, 0, sizeof(*f));
@@ -1894,6 +2020,12 @@ status_t db_detect_finish(db_detector_t *d, const db_capture_desc_t *cap,
         int extra[16];
         size_t n_extra = 0;
         check_links(d, cap, c, extra, &n_extra, 16);
+        /* Nextcloud's database is part of what has to be in one capture. */
+        for (size_t k = 0; k < c->n_nc_dbs && n_extra < 16; k++) {
+            int r = root_of(cap, c->nc_dbs[k]);
+            if (r >= 0) extra[n_extra++] = r;
+            else if (cap) c->nc_missing = "its database's data directory is not under any captured root";
+        }
         f->path = c->path;
         c->path = NULL;
         judge(cap, c, f, extra, n_extra);

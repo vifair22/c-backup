@@ -93,6 +93,29 @@ static status_t find_cb(void *ctx, const char *id, const char *name, int state)
     return OK;
 }
 
+int unit_detect_lookup_host(void *ctx, const char *host, char *key, size_t sz)
+{
+    const char *prov = ctx;
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *pctx = NULL;
+    if (!prov || !host || !*host || sp_registry_get(prov, &ops, &pctx) != OK) {
+        err_clear();
+        return 0;
+    }
+    find_t f;
+    memset(&f, 0, sizeof(f));
+    f.want = host;
+    if (!ops->list_units || ops->list_units(pctx, find_cb, &f) != OK) {
+        log_debug("units: %s: cannot list provider %s to place a Nextcloud's database: %s",
+                  host, prov, err_msg());
+        err_clear();
+        return 0;
+    }
+    if (!f.hit) return 0;
+    unit_key_format(key, sz, prov, f.id);
+    return 1;
+}
+
 /* A classification kept for the next backup, only for a file the cache
  * row still describes: a file changed since is read by the backup anyway,
  * and a row for it must not vouch for a head it never had. */
@@ -289,7 +312,8 @@ status_t unit_detect_run(cutils_db_t *db, int64_t repo_id, const char *prov, con
     if (st == OK) {
         char scope[UNIT_KEY_MAX + 8];
         snprintf(scope, sizeof(scope), "unit:%s", key);
-        db_findings_link_nextcloud(db, repo_id, scope, out->findings);
+        db_findings_link_nextcloud(db, repo_id, scope, out->findings, unit_detect_lookup_host,
+                                   (void *)(uintptr_t)prov);
         keep_heads(db, repo_id, d, rec, rd, nt, &out->heads_kept);
     }
     for (size_t i = 0; i < n_excl; i++) free(excl[i]);
