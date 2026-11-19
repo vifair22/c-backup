@@ -2744,6 +2744,149 @@ static void build_ids(ctx_t *c)
     g_nids_job = g_nids_sched = g_nids_jrnl = 0;
 }
 
+/* ---- A backup job's end (B238) -----------------------------------------
+ *
+ * A backup job through the daemon's own route, worker and job routes, with
+ * a client polling GET /jobs/<id>. The power goes at every step and, in the
+ * run with no cut, the moment the client first reads "completed". After the
+ * start (job_manager_start is the daemon's) the job must say what the
+ * repository says: completed, matched to its snapshot, exactly when the
+ * snapshot record is there, and completed whenever the client was told it
+ * was. It came back "failed: interrupted by daemon restart" with the
+ * snapshot intact, and the retry duplicated it.
+ */
+static int64_t g_bj_id;
+static int     g_bj_saw_completed;
+
+static api_response_t get_url(api_server_t *srv, const char *url)
+{
+    api_request_t req = { .method = API_GET, .url = url, .body = NULL, .body_len = 0,
+                          .is_local = 1, .client_addr = "" };
+    return api_server_dispatch(srv, &req);
+}
+
+static status_t op_backup_job(ctx_t *c, int counting)
+{
+    g_bj_id = 0;
+    g_bj_saw_completed = 0;
+    set_source(1);
+    status_t st = id_reserve_open(c->db, IDS_BLOCK);
+    if (counting && st != OK) return st;
+    err_clear();
+    job_manager_t *jm = NULL;
+    if (job_manager_start(c->db, 1, &jm) != OK) {
+        id_reserve_forget();
+        return ERR_IO;
+    }
+    api_server_t *srv = api_server_create(0, NULL, NULL, NULL);
+    assert_non_null(srv);
+    assert_int_equal(routes_register_jobs(srv, c->db, jm), 0);
+    store_index_set_pack_batch_rows(2);
+    int64_t id = 0;
+    st = routes_submit_backup(jm, g_repo_id, "{\"paths\":[\"" H_SRC "\"]}", 0, &id);
+    if (st == OK) {
+        g_bj_id = id;
+        char url[64];
+        snprintf(url, sizeof(url), "/jobs/%lld", (long long)id);
+        for (int i = 0; i < 60000; i++) {
+            api_response_t r = get_url(srv, url);
+            int done = 0;
+            if (r.status == 200 && r.body) {
+                if (strstr(r.body, "\"state\":\"completed\"")) {
+                    /* Told the client, then the power went: what it was told
+                     * has to survive. Only a reading before any cut counts;
+                     * after one, the process is a dead machine's. */
+                    pthread_mutex_lock(&g_mu);
+                    if (!g_crashed) {
+                        g_bj_saw_completed = 1;
+                        g_crashed = 1;
+                    }
+                    pthread_mutex_unlock(&g_mu);
+                    done = 1;
+                } else if (strstr(r.body, "\"state\":\"failed\"") ||
+                           strstr(r.body, "\"state\":\"cancelled\"")) {
+                    done = 1;
+                }
+            }
+            free(r.body);
+            free(r.set_cookie);
+            if (done) break;
+            usleep(1000);
+        }
+    } else if (counting) {
+        fail_msg("backup job submit with no cut: %s", err_msg());
+    }
+    err_clear();
+    job_manager_stop(jm);
+    api_server_stop(srv);
+    store_index_set_pack_batch_rows(0);
+    id_reserve_forget();
+    if (counting && !g_bj_saw_completed)
+        fail_msg("the backup job did not complete with no cut");
+    return OK;
+}
+
+static void check_backup_job(int crash_at, int kept, int started)
+{
+    (void)crash_at; (void)kept;
+    if (!started || g_bj_id <= 0) return;
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, H_DB), 0);
+    if (id_reserve_open(db, IDS_BLOCK) != OK) violation("id reservation at start: %s", err_msg());
+    err_clear();
+    job_manager_t *jm = NULL;
+    if (job_manager_start(db, 1, &jm) != OK) violation("job manager start: %s", err_msg());
+    else job_manager_stop(jm);
+    err_clear();
+    id_reserve_forget();
+
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)g_bj_id);
+    db_result_t *r = NULL;
+    char state[32] = "", result[256] = "", error[256] = "";
+    int have = 0;
+    if (db_execute(db, "SELECT state, COALESCE(result, ''), COALESCE(error, '')"
+                       " FROM jobs WHERE id = ?",
+                   (const char *[]){ id, NULL }, &r) == 0 && r && r->nrows == 1) {
+        have = 1;
+        snprintf(state, sizeof(state), "%s", r->rows[0][0]);
+        snprintf(result, sizeof(result), "%s", r->rows[0][1]);
+        snprintf(error, sizeof(error), "%s", r->rows[0][2]);
+    }
+    db_result_free(r);
+    long long failed_entries = count_of(db,
+        "SELECT COUNT(*) FROM journal WHERE repo_id = ? AND operation = 'backup'"
+        " AND result = 'failed'");
+    db_close(db);
+
+    struct stat sb;
+    int rec = stat(H_REPO "/snapshots/1", &sb) == 0 && S_ISREG(sb.st_mode);
+    int completed = have && strcmp(state, "completed") == 0;
+    if (g_bj_saw_completed && !completed)
+        violation("the client read job %s completed, and after the restart it is %s%s%s",
+                  id, have ? state : "gone", error[0] ? ": " : "", error);
+    if (rec && !completed)
+        violation("snapshot 1 is in the repository and its job %s is %s%s%s", id,
+                  have ? state : "gone", error[0] ? ": " : "", error);
+    if (completed && !rec)
+        violation("job %s is completed and its snapshot is not in the repository", id);
+    if (completed && !strstr(result, "\"snapshot_id\":1"))
+        violation("job %s is completed and its result names no snapshot 1: %s", id, result);
+    if (completed && failed_entries != 0)
+        violation("job %s is completed and the journal has %lld failed backup(s)", id,
+                  failed_entries);
+    if (have && (strcmp(state, "running") == 0 || strcmp(state, "queued") == 0))
+        violation("job %s is still %s after the start", id, state);
+}
+
+static void build_backup_job(ctx_t *c)
+{
+    begin_build(c);
+    open_target(c);
+    g_ver_of[1] = 1;
+    end_build(c);
+}
+
 static const scenario_t S_BACKUP_FIRST = { "backup, first", build_backup_first,
                                            op_backup_first, 0, 0, 0, NULL, 0 };
 static const scenario_t S_BACKUP_INCR  = { "backup, incremental", build_backup_incr,
@@ -2782,6 +2925,8 @@ static const scenario_t S_API_SOURCES  = { "API sources (commit-only)", build_ap
 
 static const scenario_t S_IDS          = { "ids handed out (B217)", build_ids, op_ids,
                                            0, 0, 0, check_ids, 0 };
+static const scenario_t S_BACKUP_JOB   = { "backup job's end (B238)", build_backup_job,
+                                           op_backup_job, 0, 1, 0, check_backup_job, 0 };
 
 static void test_ids(void **state)
 {
@@ -2792,6 +2937,7 @@ static void test_ids(void **state)
     assert_int_equal(g_counted_sched, IDS_EACH);
     assert_int_equal(g_counted_jrnl, IDS_EACH);
 }
+static void test_backup_job(void **state)     { (void)state; every_cut(&S_BACKUP_JOB); }
 static void test_api_tag(void **state)        { (void)state; every_cut(&S_API_TAG); }
 static void test_api_sched_del(void **state)  { (void)state; every_cut(&S_API_SCHED_DEL); }
 static void test_api_note(void **state)       { (void)state; every_cut(&S_API_NOTE); }
@@ -3010,6 +3156,7 @@ int main(void)
         cmocka_unit_test(test_api_note),
         cmocka_unit_test(test_api_sources),
         cmocka_unit_test(test_ids),
+        cmocka_unit_test(test_backup_job),
         cmocka_unit_test(test_prune_unlinks_the_record_after_the_commit_is_durable),
         cmocka_unit_test(test_start_finishes_an_interrupted_prune),
         cmocka_unit_test(test_reindex_finishes_an_interrupted_prune),

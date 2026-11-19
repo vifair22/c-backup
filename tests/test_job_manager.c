@@ -20,6 +20,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -34,6 +35,7 @@
 #include <cutils/db.h>
 #include <cutils/log.h>
 
+#include "db_txn.h"
 #include "job_manager.h"
 #include "store.h"
 #include "lock.h"
@@ -597,6 +599,120 @@ static void test_interrupted_jobs_are_journalled_at_start(void **state)
     job_manager_stop(jm); jm = NULL;
     assert_int_equal(job_manager_start(db, 2, &jm), OK);
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal"), 2);
+}
+
+/*
+ * B238: a backup that wrote its snapshot record and died before its end was
+ * durable came back "failed: interrupted by daemon restart", and the retry
+ * duplicated the snapshot. The job names its snapshot before the record is
+ * written (job_note_snapshot); the start completes it when the repository
+ * has the record, leaves it interrupted when it does not, and says the
+ * snapshot may exist when the repository cannot be read.
+ */
+static void test_a_backup_whose_snapshot_is_in_the_repository_completes_at_start(void **state)
+{
+    (void)state;
+    job_manager_stop(jm); jm = NULL;
+    /* Repo 1 has snapshot 3's record; repo 2 has a snapshots/ without
+     * snapshot 5's; repo 3 is not there at all (an unmounted disk). */
+    char p1[PATH_MAX], p2[PATH_MAX], p3[PATH_MAX], f[PATH_MAX];
+    snprintf(p1, sizeof(p1), TEST_DIR "/r1");
+    snprintf(p2, sizeof(p2), TEST_DIR "/r2");
+    snprintf(p3, sizeof(p3), TEST_DIR "/r3");
+    assert_int_equal(mkdir(p1, 0700), 0);
+    assert_int_equal(mkdir(TEST_DIR "/r1/snapshots", 0700), 0);
+    assert_int_equal(mkdir(p2, 0700), 0);
+    assert_int_equal(mkdir(TEST_DIR "/r2/snapshots", 0700), 0);
+    snprintf(f, sizeof(f), "%s/snapshots/3", p1);
+    FILE *fp = fopen(f, "w");
+    assert_non_null(fp);
+    fputs("{\"id\":3,\"ts\":1,\"root\":\"00\",\"label\":\"\"}\n", fp);
+    fclose(fp);
+    const char *paths[] = { p1, p2, p3 };
+    for (int i = 0; i < 3; i++) {
+        char id[8], uuid[16];
+        snprintf(id, sizeof(id), "%d", i + 1);
+        snprintf(uuid, sizeof(uuid), "u%d", i + 1);
+        assert_int_equal(db_execute_non_query(db,
+            "INSERT INTO repos (id, uuid, path, added_at) VALUES (?, ?, ?, 0)",
+            (const char *[]){ id, uuid, paths[i], NULL }, NULL), 0);
+    }
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO jobs (id, repo_id, action, state, started, origin, schedule_id, snapshot_id)"
+        " VALUES (11, 1, 'backup', 'running', strftime('%s','now'), 'schedule', 7, 3)",
+        NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO jobs (id, repo_id, action, state, started, snapshot_id)"
+        " VALUES (12, 2, 'backup', 'running', strftime('%s','now'), 5)", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO jobs (id, repo_id, action, state, started, snapshot_id)"
+        " VALUES (13, 3, 'backup', 'running', strftime('%s','now'), 2)", NULL, NULL), 0);
+    assert_int_equal(job_manager_start(db, 2, &jm), OK);
+
+    char txt[1024];
+    assert_int_equal(db_text("SELECT state || '|' || COALESCE(error, '') || '|' || result"
+                             " FROM jobs WHERE id = 11", txt, sizeof(txt)), 0);
+    assert_string_equal(txt, "completed||{\"snapshot_id\":3,\"recovered\":true}");
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 1"
+                              " AND operation = 'backup' AND result = 'success'"
+                              " AND source = 'schedule'"
+                              " AND message LIKE 'schedule 7: snapshot 3; %'"), 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 1"
+                              " AND result = 'failed'"), 0);
+
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE id = 12 AND state = 'failed'"
+                              " AND error = 'interrupted by daemon restart'"), 1);
+
+    assert_int_equal(db_text("SELECT state || '|' || error FROM jobs WHERE id = 13",
+                             txt, sizeof(txt)), 0);
+    assert_non_null(strstr(txt, "failed|interrupted by daemon restart; snapshot 2 may have "
+                                "been written"));
+    assert_non_null(strstr(txt, "/r3/snapshots: No such file or directory"));
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 3"
+                              " AND result = 'failed' AND message LIKE '%snapshot 2 may have%'"), 1);
+
+    /* Once only. */
+    job_manager_stop(jm); jm = NULL;
+    assert_int_equal(job_manager_start(db, 2, &jm), OK);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal"), 3);
+}
+
+/* B238: an end is not shown until it is durable. */
+static atomic_int g_settle_seen;
+static _Atomic int64_t g_settle_id;
+static cutils_db_t *g_settle_db;
+
+static status_t settle_gate(void)
+{
+    if (job_end_settling(g_settle_db, atomic_load(&g_settle_id))) atomic_store(&g_settle_seen, 1);
+    return OK;
+}
+
+static void test_an_end_settles_until_it_is_durable(void **state)
+{
+    (void)state;
+    g_settle_db = db;
+    atomic_store(&g_settle_seen, 0);
+    int64_t id = 0;
+    /* The gate runs inside the end's make_durable: the job must be settling
+     * there, and not after. Its id is known before it can end: the probe
+     * sleeps 120 ms. */
+    atomic_store(&g_settle_id, -1);
+    db_txn_set_durable_hooks(settle_gate, NULL);
+    assert_int_equal(job_submit(jm, 1, "probe", NULL, probe_job, NULL, NULL, &id), OK);
+    atomic_store(&g_settle_id, id);
+    int ok = wait_db_count("SELECT COUNT(*) FROM jobs WHERE state = 'completed'", 1) == 1;
+    /* The row is readable from the commit; the end stops settling once
+     * the sync is over. */
+    int settled = 0;
+    for (int i = 0; i < 2000 && !settled; i++) {
+        settled = !job_end_settling(db, id);
+        if (!settled) usleep(1000);
+    }
+    db_txn_set_durable_hooks(NULL, NULL);
+    assert_true(ok);
+    assert_true(atomic_load(&g_settle_seen));
+    assert_true(settled);
 }
 
 /*
@@ -2136,6 +2252,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_throttled_progress_keeps_the_last_tick, setup, teardown),
         cmocka_unit_test_setup_teardown(test_final_progress_is_the_last_report, setup, teardown),
         cmocka_unit_test_setup_teardown(test_interrupted_jobs_are_journalled_at_start, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_backup_whose_snapshot_is_in_the_repository_completes_at_start, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_an_end_settles_until_it_is_durable, setup, teardown),
         cmocka_unit_test_setup_teardown(test_journal_source_says_who_asked, setup, teardown),
         cmocka_unit_test_setup_teardown(test_startup_jobs_say_startup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_job_ids_survive_concurrent_inserts, setup, teardown),
