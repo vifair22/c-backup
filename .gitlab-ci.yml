@@ -109,6 +109,56 @@ test:
     paths:
       - build/bins/
 
+# The hygiene gates (HYGIENE-1), in the first stage beside test so they add
+# no wall time: the file-size ratchet, the src/ layout check, the gates' own
+# self-tests (each must fail when it should), and clang-tidy against its
+# baseline. clang-tidy parses the sources rather than building them, so it
+# needs the headers but not a build: c-utils is cloned for its include/ and
+# not compiled. In an MR pipeline it checks only the .c files the MR changes
+# against its target (a header, .clang-tidy or baseline change runs it in
+# full); branch pipelines run it in full, about 90 s of six cores.
+lint:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+  stage: test
+  image: debian:trixie
+  tags: [docker]
+  variables:
+    # Deep enough that the MR's target commit is present for the diff. If it
+    # is not, the gate says so and runs in full rather than skipping.
+    GIT_DEPTH: "50"
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends
+        make gcc git ca-certificates pkg-config python3 clang-tidy
+        libssl-dev liblz4-dev libacl1-dev libsqlite3-dev
+        libmicrohttpd-dev libcurl4-openssl-dev libcmocka-dev
+        libvirt-dev libxml2-dev
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - |
+      for delay in 5 15 45 0; do
+        rm -rf "$CUTILS_DIR"
+        git clone -q https://git.airies.net/vifair22/c-utils.git "$CUTILS_DIR" && break
+        [ "$delay" -eq 0 ] && { echo "c-utils clone failed after 4 tries"; exit 1; }
+        echo "c-utils clone failed; retrying in ${delay}s"; sleep "$delay"
+      done
+    - git -C "$CUTILS_DIR" checkout -q "$(tr -d '[:space:]' < cutils_version)"
+  script:
+    - make size-check
+    - make layout-check
+    - mkdir -p "$C_BACKUP_TEST_DIR"
+    - TIDY_REQUIRED=1 make test-hygiene
+    - |
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        # Merged-results pipelines have the target's tip; plain MR
+        # pipelines only the merge base.
+        make tidy TIDY_CHANGED_FROM="${CI_MERGE_REQUEST_TARGET_BRANCH_SHA:-$CI_MERGE_REQUEST_DIFF_BASE_SHA}"
+      else
+        make tidy
+      fi
+
 analyze:
   rules:
     # Gate jobs: every MR and branch pipeline, never the nightly schedule.
