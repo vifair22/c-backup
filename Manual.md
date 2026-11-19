@@ -833,8 +833,8 @@ at 1 of 1 rather than at the size of the snapshot.
 
 `watch` exits 0 once it has printed the job's final state, whatever that
 state is: read `state` for the outcome. It exits 1 with a message on stderr
-when there is no such job, and when the daemon stops following a job that is
-still running after an hour; watch it again to go on following.
+when there is no such job. It follows a job for as long as the job runs;
+before 1.0 the daemon stopped following after an hour (B228).
 
 `sources set` replaces the whole list. Each source must be an absolute path
 (empty or relative ones are refused, and nothing is changed). A path that

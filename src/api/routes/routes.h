@@ -5,6 +5,8 @@
 #include <cutils/config.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <sys/types.h>
+#include <time.h>
 #include "error.h"
 #include "backup.h"
 
@@ -285,6 +287,12 @@ int routes_register_metrics(api_server_t *srv, cutils_db_t *db);
 
 /* SSE progress stream for one job. */
 int routes_register_stream(api_server_t *srv, cutils_db_t *db);
+/* For tests: /jobs/stream/<id>'s reader without a server, and the clock
+ * its heartbeat reads (NULL restores the real one). */
+void   *job_stream_open_for_test(cutils_db_t *db, int64_t job_id);
+ssize_t job_stream_read_for_test(void *st, char *buf, size_t max);
+void    job_stream_close_for_test(void *st);
+void    job_stream_set_test_clock(time_t (*now)(void));
 
 /* Introspection: objects, packs, statistics, diff. Repo-scoped sub-handlers
  * dispatched from repos.c, like the snapshot and metadata ones. */

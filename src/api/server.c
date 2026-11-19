@@ -392,6 +392,8 @@ static void stream_cleanup_adapter(void *cls)
     free(w);
 }
 
+#define STREAM_IDLE_TIMEOUT_S 300
+
 static enum MHD_Result send_streaming_response(
     struct MHD_Connection *conn, const api_stream_response_t *sresp)
 {
@@ -434,6 +436,17 @@ static enum MHD_Result send_streaming_response(
                 MHD_add_response_header(resp, h->name, h->value);
         }
     }
+
+    /*
+     * A stream lasts as long as its job (B228), so a client that stays
+     * connected and stops reading is dropped by inactivity instead: once
+     * its socket buffer is full no write succeeds, and after this long MHD
+     * closes the connection. A reader gets a frame at least every 5 s, so
+     * a live one never comes near it. Connections that are not streams
+     * keep MHD's default, no timeout, as before.
+     */
+    (void)MHD_set_connection_option(conn, MHD_CONNECTION_OPTION_TIMEOUT,
+                              (unsigned int)STREAM_IDLE_TIMEOUT_S);
 
     int status = sresp->status > 0 ? sresp->status : 200;
     enum MHD_Result ret = MHD_queue_response(conn, (unsigned int)status, resp);
