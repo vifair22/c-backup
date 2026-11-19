@@ -1726,8 +1726,9 @@ many 16 MiB chunks beside a job's 48 MiB. An export closes at its expiry,
 after `vm.export_idle_s` with no connection, when revoked, when its
 repository is removed, and when the daemon stops; the ids are `AUTOINCREMENT` and opening and closing are journalled
 with the caller. The server speaks fixed newstyle with structured replies,
-`NBD_OPT_GO`/`INFO`, `base:allocation` (the snapshot's holes are holes to
-the client), `READ`, `BLOCK_STATUS` and `DISC`; writes are refused with
+`NBD_OPT_GO`/`INFO` (minimum block 512, preferred 4096), `base:allocation`
+(the snapshot's holes are holes to the client, in whole 512-byte sectors;
+a sector holding any data is data), `READ`, `BLOCK_STATUS` and `DISC`; writes are refused with
 `EPERM`, `NBD_OPT_LIST` with a policy error, a wrong name at `NBD_OPT_GO`.
 
 | POST | `/repos/<id>/units/<p>/<u>/detect` | Database detection on the unit now, without a backup (`db-detection.md` 7.4, Manual 23.9): units.probe, and a scan of each included mount where a live read would read it, reading only file headers. No fields: no body or `{}`, and any key is a 400 naming it. 202 with `{"job_id":N}`; the job's result is `{"databases":...}`, the object a backup's result carries, judged against the capture the next backup would make, and its findings are recorded under `unit:<key>`. It never alerts; new live findings and coverage changes are journalled. 409 while `db_detect.enabled` is 0 or the provider's helper cannot be reached, 404 for an unknown provider; a unit its provider does not list, or outside `units.allow`, fails the job |

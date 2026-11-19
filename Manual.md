@@ -4714,7 +4714,9 @@ c-backup vm unexport 9
 ```
 
 Or copy the disk out without a kernel device:
-`qemu-img convert -O raw 'nbd+unix:///8f1c...?socket=/run/c-backupd/exports/9.sock' /mnt/disk3/vda.raw`.
+`qemu-img convert -f raw -O raw 'nbd+unix:///8f1c...?socket=/run/c-backupd/exports/9.sock' /mnt/disk3/vda.raw`.
+The copy is sparse where the snapshot has holes and byte-identical to a
+`unit restore --item` of the same disk.
 
 - **Mount options.** A crash-consistent disk may hold an unreplayed journal,
   and the export refuses writes: mount ext4 with `ro,noload`, xfs with
@@ -4750,7 +4752,9 @@ Or copy the disk out without a kernel device:
   run normally.
 - **Audit.** Opening and closing are journalled with the caller; the server
   speaks `READ`, `BLOCK_STATUS` (the snapshot's holes are holes to the
-  client) and `DISC`, and refuses writes.
+  client, in whole 512-byte sectors: a sector holding any data is reported
+  as data) and `DISC`, and refuses writes. It advertises a minimum block
+  of 512 bytes and a preferred block of 4096.
 
 ### 22.9 The `units.allow` safety rail
 

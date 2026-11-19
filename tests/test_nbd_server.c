@@ -179,6 +179,157 @@ static void test_memory_export(void **state)
     assert_int_not_equal(stat(SOCK, &sb), 0);
 }
 
+/* ------------------------------------------------------------------ */
+/* An image whose holes start and end mid-sector (B250)                */
+/* ------------------------------------------------------------------ */
+
+#define UA_SIZE (4 * MiB)
+#define UA_RUNS 600
+static uint8_t *ua;                       /* holes are zero, data never is */
+static uint64_t ua_off[UA_RUNS + 1];      /* run i is [ua_off[i], ua_off[i+1]) */
+static int      ua_hole[UA_RUNS];
+
+static void ua_fill(void)
+{
+    ua = calloc(1, UA_SIZE);
+    assert_non_null(ua);
+    uint64_t x = 0x9E3779B97F4A7C15ull, pos = 0;
+    for (unsigned i = 0; i < UA_RUNS; i++) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        ua_off[i] = pos;
+        ua_hole[i] = i % 2 == 1;
+        /* Mostly under a sector or a few sectors, never a multiple of 512,
+         * so most boundaries fall mid-sector; the last hole runs to the end. */
+        uint64_t len = i + 1 == UA_RUNS ? UA_SIZE - pos : 1 + x % 9000;
+        if (len % 512 == 0) len++;
+        if (pos + len > UA_SIZE || i + 1 == UA_RUNS) len = UA_SIZE - pos;
+        if (!ua_hole[i])
+            for (uint64_t k = 0; k < len; k++) {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                ua[pos + k] = (uint8_t)(x | 1);
+            }
+        pos += len;
+    }
+    ua_off[UA_RUNS] = UA_SIZE;
+    assert_true(ua_hole[UA_RUNS - 1]);
+}
+
+static status_t ua_open(void *ctx, void **reader, uint64_t *size)
+{
+    (void)ctx;
+    *reader = ua;
+    *size = UA_SIZE;
+    return OK;
+}
+
+/* Byte-granular runs, as the chunk list gives them; every hole comes in
+ * two pieces, as a hole spanning chunk-list levels does. */
+static status_t ua_extents(void *reader, uint64_t off, uint64_t len, nbd_extent_fn fn, void *fctx)
+{
+    (void)reader;
+    uint64_t end = off + len;
+    for (unsigned i = 0; i < UA_RUNS && off < end; i++) {
+        if (ua_off[i + 1] <= off) continue;
+        uint64_t e = ua_off[i + 1] < end ? ua_off[i + 1] : end;
+        if (ua_hole[i] && e - off > 1) {
+            uint64_t mid = off + (e - off) / 2;
+            if (fn(fctx, off, mid - off, 1) != 0) return OK;
+            off = mid;
+        }
+        if (fn(fctx, off, e - off, ua_hole[i]) != 0) return OK;
+        off = e;
+    }
+    return OK;
+}
+
+/* Whether [a, b) lies wholly inside the image's holes. */
+static int ua_all_hole(uint64_t a, uint64_t b)
+{
+    for (uint64_t k = a; k < b; k++) if (ua[k]) return 0;
+    return 1;
+}
+
+/* Every extent on a sector boundary, no data inside a hole, and every
+ * whole sector of hole reported as one: the exact cover, at 512. */
+static void ua_check_extents(nbd_client_t *c, uint64_t off, uint64_t len)
+{
+    nbd_extent_t *ext = calloc(4096, sizeof(*ext));
+    assert_non_null(ext);
+    uint64_t pos = off, end = off + len;
+    while (pos < end) {
+        size_t n = 0;
+        assert_int_equal(nbd_block_status(c, pos, end - pos, 0, ext, 4096, &n), OK);
+        assert_true(n > 0);
+        for (size_t i = 0; i < n; i++) {
+            uint64_t a = pos, b = pos + ext[i].len;
+            /* Only the first descriptor of an unaligned query may start
+             * unaligned, and only the export's end may end so. */
+            if (a != off) assert_int_equal(a % 512, 0);
+            if (b != UA_SIZE) assert_int_equal(b % 512, 0);
+            assert_true(b <= UA_SIZE);
+            if (ext[i].flags & 1u) {
+                assert_true(ua_all_hole(a, b));
+            } else {
+                for (uint64_t sct = (a + 511) / 512 * 512; sct + 512 <= b; sct += 512)
+                    assert_false(ua_all_hole(sct, sct + 512));
+            }
+            pos = b;
+        }
+    }
+    free(ext);
+}
+
+static void test_unaligned_holes(void **state)
+{
+    (void)state;
+    ua_fill();
+    unlink(SOCK);
+    nbd_server_opts_t o = { SOCK, NAME, UA_SIZE,
+                            { ua_open, mem_read, ua_extents, mem_close, NULL, NULL }, 0 };
+    nbd_server_t *s = NULL;
+    assert_int_equal(nbd_server_start(&o, &s), OK);
+    nbd_client_t *c = connect_as(NAME, 4);
+    assert_non_null(c);
+    /* A disk's minimum block: 512, not 1. */
+    assert_int_equal(nbd_min_block(c), 512);
+
+    ua_check_extents(c, 0, UA_SIZE);
+    ua_check_extents(c, 4096, 64 * 1024);           /* aligned, mid-image */
+    ua_check_extents(c, 1000, 77777);               /* unaligned both ends */
+    ua_check_extents(c, UA_SIZE - 3000, 3000);      /* into the trailing hole */
+
+    /* Reads stay byte-exact through the hole chunks, aligned or not. */
+    uint8_t *got = malloc(UA_SIZE);
+    assert_non_null(got);
+    memset(got, 0xAA, UA_SIZE);
+    assert_int_equal(nbd_read(c, 0, got, UA_SIZE), OK);
+    assert_memory_equal(got, ua, UA_SIZE);
+    assert_int_equal(nbd_read(c, 1001, got, 50001), OK);
+    assert_memory_equal(got, ua + 1001, 50001);
+    nbd_close(c);
+
+    /* QEMU's client, which addresses in sectors and asks with REQ_ONE: the
+     * copy that lost 2706 bytes before the fix. */
+    if (system("command -v qemu-img >/dev/null 2>&1") == 0) {
+        unlink(ROOT "/ua.img");
+        int rc = system("qemu-img convert -q -f raw -O raw 'nbd+unix:///" NAME "?socket=" SOCK "' '"
+                        ROOT "/ua.img'");
+        assert_int_equal(rc, 0);
+        int fd = open(ROOT "/ua.img", O_RDONLY);
+        assert_true(fd >= 0);
+        memset(got, 0xAA, UA_SIZE);
+        assert_int_equal(pread(fd, got, UA_SIZE, 0), (ssize_t)UA_SIZE);
+        close(fd);
+        assert_memory_equal(got, ua, UA_SIZE);
+    } else {
+        print_message("qemu-img not installed: QEMU copy-out not checked\n");
+    }
+    free(got);
+    nbd_server_stop(s);
+    free(ua);
+    ua = NULL;
+}
+
 static void put32be(uint8_t *p, uint32_t v)
 {
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
@@ -473,6 +624,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_memory_export),
+        cmocka_unit_test(test_unaligned_holes),
         cmocka_unit_test(test_refusals),
         cmocka_unit_test(test_limits_and_stop),
         cmocka_unit_test(test_content_reader),

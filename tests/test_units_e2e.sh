@@ -394,6 +394,44 @@ contains "with the probe's liveness" '"confidence":"live"' "$OUT"
 contains "and the finding now names its snapshot" '"last_snap_id":' "$(cb db show 1 "$DID")"
 lacks    "no longer null" '"last_snap_id":null' "$(cb db show 1 "$DID")"
 
+echo "an export of a disk with unaligned holes (B250)"
+# Holes that start and end mid-sector, one data run a single byte long, and
+# a trailing hole. The export once reported them at byte offsets with a
+# minimum block of 1, and qemu-img convert, working in sectors, zeroed
+# every partial sector at a hole's edge while qemu-img compare called the
+# copy identical. The unit restore of the same snapshot is the reference.
+UNIT_E=',{"id":"e","name":"cbk-uat-e","state":"stopped",
+  "disks":[{"id":"vde","size":4194304,"runs":[
+     {"off":0,"len":1000,"kind":"data","seed":11},
+     {"off":5000,"len":3000,"kind":"data","seed":12},
+     {"off":70001,"len":131071,"kind":"data","seed":13},
+     {"off":1048577,"len":1,"kind":"data","seed":14},
+     {"off":2097000,"len":700,"kind":"data","seed":15},
+     {"off":4193000,"len":100,"kind":"data","seed":16}]}]}'
+write_spec ",{\"id\":\"c\",\"name\":\"cbk-uat-c\",\"state\":\"stopped\",\"blobs\":[{\"id\":\"x\",\"path\":\".cbackup-unit/config/x\",\"text\":\"c\"}]}$UNIT_D$UNIT_E"
+OUT=$(cb unit backup 1 --provider fake cbk-uat-e)
+contains "the unit backs up" '"state":"completed"' "$OUT"
+SE=$(cb unit history 1 --provider fake cbk-uat-e --limit 1 | sed -n 's/.*"snapshots":\[{"id":\([0-9]*\).*/\1/p')
+OUT=$(cb unit restore 1 "$SE" "$WORK/vde.raw" --item vde)
+contains "its disk restores" '"state":"completed"' "$OUT"
+EX=$(cb vm export 1 "$SE" vde)
+EIDE=$(printf '%s' "$EX" | jget export_id)
+ESOCKE=$(printf '%s' "$EX" | jget socket)
+ENAMEE=$(printf '%s' "$EX" | jget name)
+if command -v qemu-img >/dev/null 2>&1; then
+    URI="nbd+unix:///$ENAMEE?socket=$ESOCKE"
+    qemu-img convert -q -f raw -O raw "$URI" "$WORK/vde.nbd" 2>"$WORK/qe.err"
+    check "QEMU's copy-out equals the unit restore" \
+          "$(sha256sum < "$WORK/vde.raw")" "$(sha256sum < "$WORK/vde.nbd" 2>/dev/null)"
+    MAP=$(qemu-img map --output=json -f raw "$URI" 2>&1)
+    contains "QEMU sees holes in it" '"data": false' "$MAP"
+    UNAL=$(printf '%s\n' "$MAP" | grep -o '"\(start\|length\)": [0-9]*' | awk '$2 % 512 != 0' | head -3)
+    check "and every extent it sees is sector-aligned" "" "$UNAL"
+else
+    echo "  (qemu-img not installed: copy-out through QEMU not checked)"
+fi
+cb vm unexport "$EIDE" >/dev/null
+
 echo "removing a repository with an export open"
 # Retention has run since: unit a's newest snapshot, not snapshot 1.
 SA=$(cb unit history 1 --provider fake cbk-uat-a --limit 1 | sed -n 's/.*"snapshots":\[{"id":\([0-9]*\).*/\1/p')
