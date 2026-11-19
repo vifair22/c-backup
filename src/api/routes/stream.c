@@ -31,9 +31,21 @@
  */
 
 static cutils_db_t *g_db;
+static time_t wall_now(void) { return time(NULL); }
+/* The heartbeat's clock; a test moves it (job_stream_set_test_clock). */
+static time_t (*g_now)(void) = wall_now;
 
 #define POLL_INTERVAL_US 500000     /* 2 Hz: fast enough to feel live */
-#define MAX_STREAM_SEC   3600       /* stop following a job after an hour */
+/*
+ * No limit on how long a job is followed (B228). There was an hour, so
+ * `jobs watch` on a long backup gave up while the job ran on, and B220 had
+ * already removed the same limit from the CLI's own wait. The limit was
+ * there for a client that stops reading, and it was the wrong bound for
+ * that: a stream ends when its job does, a client that goes away ends it
+ * at the next frame's failed write, and one that stays connected without
+ * reading is dropped by the server's inactivity timeout once its socket
+ * buffer is full (server.c, send_streaming_response).
+ */
 /* An unchanged job is still re-sent this often, so a watcher can tell a job
  * that is busy in one phase from a stream that has died. */
 #define HEARTBEAT_SEC    5
@@ -42,7 +54,6 @@ typedef struct {
     int64_t job_id;
     char    last[3584];     /* last payload sent, to suppress repeats; room
                              * for a finished job's warning (B211) */
-    time_t  started;
     time_t  last_sent;      /* 0 until the first frame */
     int     finished;       /* terminal state seen; send one last event */
 } job_stream_t;
@@ -58,14 +69,6 @@ static ssize_t job_reader(void *cls, char *buf, size_t max)
     job_stream_t *st = cls;
 
     if (st->finished) return -1;   /* end of stream */
-
-    if (time(NULL) - st->started > MAX_STREAM_SEC) {
-        /* A client that stops reading would otherwise hold a connection and a
-         * database handle indefinitely. */
-        int n = snprintf(buf, max, "event: timeout\ndata: {}\n\n");
-        st->finished = 1;
-        return n > 0 ? n : -1;
-    }
 
     /*
      * The first frame goes out at once: the job's state as it is now.
@@ -145,7 +148,7 @@ static ssize_t job_reader(void *cls, char *buf, size_t max)
     /* Suppress identical frames, up to a heartbeat. A job that sits in one
      * phase for minutes should not generate hundreds of identical events,
      * nor go silent for minutes either. */
-    time_t now = time(NULL);
+    time_t now = g_now();
     if (!terminal && st->last_sent != 0 && strcmp(payload, st->last) == 0 &&
         now - st->last_sent < HEARTBEAT_SEC)
         return 0;
@@ -189,7 +192,6 @@ static api_stream_response_t handle_job_stream(const api_request_t *req, void *u
         return resp;
     }
     st->job_id = id;
-    st->started = time(NULL);
 
     /* no-cache matters: a proxy buffering an event stream turns live progress
      * into one delivery at the end. */
@@ -216,4 +218,27 @@ int routes_register_stream(api_server_t *srv, cutils_db_t *db)
      * which registers first. */
     return api_server_route_streaming(srv, "/jobs/stream/*", API_GET,
                                       handle_job_stream, NULL) == 0 ? 0 : -1;
+}
+
+void *job_stream_open_for_test(cutils_db_t *db, int64_t job_id)
+{
+    g_db = db;
+    job_stream_t *st = calloc(1, sizeof(*st));
+    if (st) st->job_id = job_id;
+    return st;
+}
+
+ssize_t job_stream_read_for_test(void *st, char *buf, size_t max)
+{
+    return job_reader(st, buf, max);
+}
+
+void job_stream_close_for_test(void *st)
+{
+    job_cleanup(st);
+}
+
+void job_stream_set_test_clock(time_t (*now)(void))
+{
+    g_now = now ? now : wall_now;
 }
