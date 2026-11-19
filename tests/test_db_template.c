@@ -10,7 +10,10 @@
  * fake backend, where a template runs as a local process.
  */
 
+#include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <time.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -131,10 +134,10 @@ static void test_argv_from_params(void **state)
     dbt_argv_t a;
     cJSON *p = P("{\"user\":\"immich\",\"database\":\"immich_db\"}");
     assert_int_equal(db_template_argv(db_template_find("pg-dump"), DBT_PHASE_RUN, p, NULL, &a), OK);
-    argv_is(&a, (const char *const[]){ "pg_dump", "-Fc", "-Z0", "-U", "immich", "immich_db", NULL });
+    argv_is(&a, (const char *const[]){ "pg_dump", "-w", "-Fc", "-Z0", "-U", "immich", "immich_db", NULL });
     dbt_argv_free(&a);
     assert_int_equal(db_template_argv(db_template_find("pg-dump"), DBT_PHASE_PROBE, p, NULL, &a), OK);
-    argv_is(&a, (const char *const[]){ "psql", "-U", "immich", "-d", "immich_db", "-Atc", "select version()", NULL });
+    argv_is(&a, (const char *const[]){ "psql", "-w", "-U", "immich", "-d", "immich_db", "-Atc", "select version()", NULL });
     dbt_argv_free(&a);
     cJSON_Delete(p);
 
@@ -274,6 +277,91 @@ static status_t parse_with(const char *db, helper_policy_t *out)
     hf_policy_text(text, sizeof(text), 990, 30, 86400, 60, 1);
     if (db) strncat(text, db, sizeof(text) - strlen(text) - 1);
     return helper_policy_parse(text, out);
+}
+
+/*
+ * B248: no template may wait on a prompt. Every script reads stdin from
+ * /dev/null, and every PostgreSQL tool runs with -w, in every phase,
+ * whether it is a script's or an argv of its own.
+ */
+static void no_prompt_in(const char *tname, const char *text)
+{
+    static const char *const pg[] = { "pg_dumpall", "pg_basebackup", "pg_dump", "psql" };
+    for (size_t k = 0; k < sizeof(pg) / sizeof(pg[0]); k++) {
+        size_t l = strlen(pg[k]);
+        for (const char *p = strstr(text, pg[k]); p; p = strstr(p + l, pg[k])) {
+            /* The tool as a command: at a word start, followed by a space. */
+            if ((p != text && p[-1] != ' ' && p[-1] != '\n' && p[-1] != '(') || p[l] != ' ') continue;
+            if (strncmp(p + l, " -w ", 4) != 0 && strncmp(p + l, " --version", 10) != 0)
+                fail_msg("%s: %s without -w in: %s", tname, pg[k], text);
+        }
+    }
+}
+
+static void test_templates_never_prompt(void **state)
+{
+    (void)state;
+    for (size_t i = 0; i < db_template_count(); i++) {
+        const db_template_t *t = db_template_at(i);
+        cJSON *p = P(strcmp(t->name, "pg-dump") == 0 ? "{\"user\":\"a\",\"database\":\"b\"}"
+                     : strcmp(t->name, "sqlite-backup") == 0 ? "{\"db\":\"/x/a.db\"}" : "{}");
+        for (int ph = DBT_PHASE_RUN; ph <= DBT_PHASE_PROBE; ph++) {
+            if (ph == DBT_PHASE_POST && !t->post) continue;
+            dbt_argv_t a;
+            assert_int_equal(db_template_argv(t, (dbt_phase_t)ph, p, NULL, &a), OK);
+            if (strcmp(a.argv[0], "sh") == 0) {
+                if (strncmp(a.argv[2], "exec </dev/null\n", 16) != 0)
+                    fail_msg("%s phase %d: the script does not start with stdin from /dev/null", t->name, ph);
+                no_prompt_in(t->name, a.argv[2]);
+            } else {
+                char joined[1024] = "";
+                for (int k = 0; k < a.argc; k++) {
+                    strncat(joined, a.argv[k], sizeof(joined) - strlen(joined) - 2);
+                    strcat(joined, " ");
+                }
+                no_prompt_in(t->name, joined);
+            }
+            dbt_argv_free(&a);
+        }
+        cJSON_Delete(p);
+    }
+    /* The superuser templates take the image's own password when the
+     * container has no PGPASSWORD; pg-dump's role is the operator's. */
+    dbt_argv_t a;
+    assert_int_equal(db_template_argv(db_template_find("pg-basebackup"), DBT_PHASE_RUN, NULL, NULL, &a), OK);
+    assert_non_null(strstr(a.argv[2], "export PGPASSWORD=\"$POSTGRES_PASSWORD\""));
+    dbt_argv_free(&a);
+}
+
+/* What a failed run said, turned into how to give the engine its credential. */
+static void test_auth_hint(void **state)
+{
+    (void)state;
+    const db_template_t *bb = db_template_find("pg-basebackup");
+    static const char pg[] = "pg_basebackup: error: connection to server on socket \"/var/run/postgresql/.s.PGSQL"
+                             ".5432\" failed: fe_sendauth: no password supplied\n";
+    const char *h = db_template_auth_hint(bb, pg, sizeof(pg) - 1);
+    assert_non_null(h);
+    assert_non_null(strstr(h, "PGPASSWORD"));
+    assert_non_null(strstr(h, "pg_hba.conf"));
+    /* Not NUL-terminated: the length decides. */
+    assert_null(db_template_auth_hint(bb, pg, 20));
+    assert_null(db_template_auth_hint(bb, "could not connect: connection refused", 37));
+    static const struct { const char *t, *log, *word; } c[] = {
+        { "mariadb-dump", "mysqldump: Got error: 1045: Access denied for user 'root'@'localhost'", "MARIADB_ROOT_PASSWORD" },
+        { "redis-rdb", "NOAUTH Authentication required.", "REDISCLI_AUTH" },
+        { "redis-bgsave", "WRONGPASS invalid username-password pair", "REDISCLI_AUTH" },
+        { "mongodump", DBT_NO_CREDENTIAL " MONGO_INITDB_ROOT_USERNAME is set", "MONGO_INITDB_ROOT_PASSWORD" },
+        { "mongodump", "Failed: error connecting to db server: Authentication failed.", "MONGO_INITDB_ROOT_USERNAME" },
+        { "influx2-backup", "Error: failed to backup: 401 Unauthorized: unauthorized access", "DOCKER_INFLUXDB_INIT_ADMIN_TOKEN" },
+    };
+    for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        h = db_template_auth_hint(db_template_find(c[i].t), c[i].log, strlen(c[i].log));
+        if (!h || !strstr(h, c[i].word)) fail_msg("%s: '%s' gave %s", c[i].t, c[i].log, h ? h : "nothing");
+    }
+    /* An engine with no credential to give has no hint. */
+    assert_null(db_template_auth_hint(db_template_find("sqlite-backup"), "NOAUTH", 6));
+    assert_null(db_template_auth_hint(NULL, "NOAUTH", 6));
 }
 
 static void test_policy_allow_templates(void **state)
@@ -511,7 +599,7 @@ static void test_dump_template_through_hook_run(void **state)
     read_all(pfd, out, sizeof(out));
     close(pfd);
     /* The script's own argv, with the image's superuser default. */
-    assert_string_equal(out, "-- dump --clean --if-exists -U postgres\n");
+    assert_string_equal(out, "-- dump -w --clean --if-exists -U postgres\n");
     char log[4096];
     assert_int_equal(wait_run(o, log, sizeof(log)), 0);
     assert_non_null(strstr(log, "to-the-log"));
@@ -637,6 +725,156 @@ static void test_probe_output_capped(void **state)
     cJSON_Delete(o);
 }
 
+static double now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* hook.run of a dump template, its pipe read to the end, then hook.wait. */
+static int run_dump(const char *args, char *log, size_t lsz, double *secs)
+{
+    double t0 = now_s();
+    int pfd = -1;
+    cJSON *o = call("hook.run", args, &pfd);
+    if (strcmp(code_of(o), "ok") != 0) fail_msg("%s", msg_of(o));
+    assert_true(pfd >= 0);
+    char out[4096];
+    read_all(pfd, out, sizeof(out));
+    close(pfd);
+    int code = wait_run(o, log, lsz);
+    cJSON_Delete(o);
+    *secs = now_s() - t0;
+    return code;
+}
+
+/*
+ * B248: pg_basebackup without -w waited on a password prompt until the
+ * dump's six-hour timeout. This one behaves as the real tool does: with -w
+ * it fails at once saying no password was supplied; without, it waits.
+ * The run ends in well under the time it would wait, and the log says how
+ * to give the engine its credential.
+ */
+static void test_prompting_tool_fails_fast(void **state)
+{
+    (void)state;
+    tool("pg_basebackup", "#!/bin/sh\ncase \" $* \" in\n"
+                          "*' -w '*) echo 'pg_basebackup: error: connection to server failed:"
+                          " fe_sendauth: no password supplied' >&2; exit 1 ;;\n"
+                          "esac\nexec sleep 20\n");
+    hstart(NULL);
+    char log[8192];
+    double secs = 0;
+    int code = run_dump("{\"unit\":\"fake:u1\",\"template\":\"pg-basebackup\"}", log, sizeof(log), &secs);
+    if (secs > 5) fail_msg("pg-basebackup took %.1f s: it waited on a prompt", secs);
+    assert_int_equal(code, 1);
+    assert_non_null(db_template_auth_hint(db_template_find("pg-basebackup"), log, strlen(log)));
+
+    /* mongodump, given a user and no password, would prompt; it is not
+     * started, and the script says what is missing. */
+    tool("mongodump", "#!/bin/sh\nexec sleep 20\n");
+    setenv("MONGO_INITDB_ROOT_USERNAME", "root", 1);
+    unsetenv("MONGO_INITDB_ROOT_PASSWORD");
+    code = run_dump("{\"unit\":\"fake:u1\",\"template\":\"mongodump\"}", log, sizeof(log), &secs);
+    unsetenv("MONGO_INITDB_ROOT_USERNAME");
+    if (secs > 5) fail_msg("mongodump took %.1f s", secs);
+    assert_int_equal(code, 1);
+    assert_non_null(strstr(log, DBT_NO_CREDENTIAL));
+    assert_non_null(db_template_auth_hint(db_template_find("mongodump"), log, strlen(log)));
+
+    /* redis-cli exits 0 on a NOAUTH answer: the probe looks at the answer. */
+    tool("redis-cli", "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'redis-cli 7.4'; exit 0; }\n"
+                      "echo 'NOAUTH Authentication required.'\n");
+    int fd = -1;
+    cJSON *o = call("db.probe", "{\"unit\":\"fake:u1\",\"template\":\"redis-rdb\"}", &fd);
+    assert_string_equal(code_of(o), "ok");
+    assert_int_not_equal((int)cJSON_GetObjectItemCaseSensitive(res_of(o), "exit")->valuedouble, 0);
+    if (fd >= 0) close(fd);
+    cJSON_Delete(o);
+}
+
+/* The pids a tool wrote, one per line, into BIN/pids. */
+static size_t read_pids(pid_t *pids, size_t max)
+{
+    FILE *f = fopen(BIN "/pids", "r");
+    size_t n = 0;
+    long v;
+    while (f && n < max && fscanf(f, "%ld", &v) == 1) pids[n++] = (pid_t)v;
+    if (f) fclose(f);
+    return n;
+}
+
+static int all_gone(const pid_t *pids, size_t n)
+{
+    for (int tries = 0; tries < 50; tries++) {
+        int left = 0;
+        for (size_t i = 0; i < n; i++) left |= kill(pids[i], 0) == 0 || errno != ESRCH;
+        if (!left) return 1;
+        struct timespec ts = { 0, 100 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+/*
+ * B248: hook.wait with kill stops the run's whole process group: SIGTERM,
+ * and SIGKILL HOOK_KILL_GRACE_S later when the run ignores it. A member
+ * that ignores it while the script itself dies goes when the run ends.
+ * Nothing the dump started is left behind, and the answer says it was
+ * cancelled. Variants: 0 nothing ignores SIGTERM, 1 the child does, 2 the
+ * whole run does.
+ */
+static void test_kill_stops_process_group(void **state)
+{
+    (void)state;
+    for (int stubborn = 0; stubborn <= 2; stubborn++) {
+        char body[512];
+        snprintf(body, sizeof(body),
+                 "#!/bin/sh\n%secho $$ > " BIN "/pids\n%s &\necho $! >> " BIN "/pids\necho started\nwait\n",
+                 stubborn == 2 ? "trap '' TERM\n" : "",
+                 stubborn == 1 ? "(trap '' TERM; exec sleep 300)" : "sleep 300");
+        unlink(BIN "/pids");
+        tool("pg_dumpall", body);
+        if (!srv) hstart(NULL);
+        int pfd = -1;
+        cJSON *o = call("hook.run", "{\"unit\":\"fake:u1\",\"template\":\"pg-dumpall\"}", &pfd);
+        if (strcmp(code_of(o), "ok") != 0) fail_msg("%s", msg_of(o));
+        char line[64];
+        assert_true(read(pfd, line, sizeof(line)) > 0);    /* "started": both pids written */
+        pid_t pids[4];
+        assert_int_equal(read_pids(pids, 4), 2);
+        const char *tok = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res_of(o), "run"));
+        char args[160];
+        snprintf(args, sizeof(args), "{\"run\":\"%s\",\"kill\":true}", tok);
+        double t0 = now_s();
+        int lfd = -1;
+        cJSON *w = call("hook.wait", args, &lfd);
+        double secs = now_s() - t0;
+        if (strcmp(code_of(w), "ok") != 0) fail_msg("%s", msg_of(w));
+        assert_true(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res_of(w), "cancelled")));
+        assert_false(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res_of(w), "timed_out")));
+        if (stubborn == 2) {
+            if (secs < HOOK_KILL_GRACE_S - 0.5 || secs > HOOK_KILL_GRACE_S + 3)
+                fail_msg("a TERM-proof run ended after %.1f s, not at the grace", secs);
+        } else if (secs > 2) {
+            fail_msg("SIGTERM took %.1f s to end the run (variant %d)", secs, stubborn);
+        }
+        if (!all_gone(pids, 2)) fail_msg("a process of the stopped dump is still running (stubborn %d)", stubborn);
+        char log[4096];
+        log[0] = '\0';
+        if (lfd >= 0) { (void)lseek(lfd, 0, SEEK_SET); read_all(lfd, log, sizeof(log)); close(lfd); }
+        assert_non_null(strstr(log, "the job was cancelled"));
+        close(pfd);
+        cJSON_Delete(w);
+        cJSON_Delete(o);
+    }
+    /* kill takes a boolean. */
+    cJSON *o = call("hook.wait", "{\"run\":\"0123456789abcdef0123456789abcdef\",\"kill\":1}", NULL);
+    assert_string_equal(code_of(o), "invalid");
+    cJSON_Delete(o);
+}
+
 /* The hello names the templates the policy allows, for the daemon. */
 static void test_hello_names_templates(void **state)
 {
@@ -659,6 +897,8 @@ int main(void)
         cmocka_unit_test(test_every_phase_builds),
         cmocka_unit_test(test_argv_from_params),
         cmocka_unit_test(test_invalid_params_refused),
+        cmocka_unit_test(test_templates_never_prompt),
+        cmocka_unit_test(test_auth_hint),
         cmocka_unit_test(test_policy_allow_templates),
         cmocka_unit_test(test_protocol_forms),
         cmocka_unit_test_setup_teardown(test_dump_template_through_hook_run, setup, teardown),
@@ -666,6 +906,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_refusals_before_anything_runs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_probe_output_capped, setup, teardown),
         cmocka_unit_test_setup_teardown(test_hello_names_templates, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_prompting_tool_fails_fast, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_kill_stops_process_group, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

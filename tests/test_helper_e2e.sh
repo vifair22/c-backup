@@ -69,7 +69,7 @@ echo 16 > "$WORK/pgsnap/PG_VERSION"
 head -c 8192 /dev/zero > "$WORK/pgsnap/global/pg_control"
 head -c 8192 /dev/zero > "$WORK/pgsnap/base/1/1259"
 printf '42\n%s\n' "$WORK/pgsnap" > "$WORK/pgsnap/postmaster.pid"
-printf '#!/bin/sh\necho "-- fake dump as $4 ($*)"\necho "dumped" >&2\n' > "$WORK/bin/pg_dumpall"
+printf '#!/bin/sh\necho "-- fake dump as $5 ($*)"\necho "dumped" >&2\n' > "$WORK/bin/pg_dumpall"
 printf '#!/bin/sh\necho "PostgreSQL 16.4 (fake) $*"\n' > "$WORK/bin/psql"
 chmod 0755 "$WORK/bin/pg_dumpall" "$WORK/bin/psql"
 # The tree root as read: a mode and a time no staging directory has (B168).
@@ -397,15 +397,23 @@ FID=$(printf '%s' "$OUT" | sed -n 's/.*"findings":\[{"id":\([0-9]*\).*/\1/p')
 check "with its id" yes "$([ -n "$FID" ] && echo yes || echo no)"
 OUT=$(cb db preview 1 "$FID")
 contains "preview names the template" '"template":"pg-dumpall"' "$OUT"
-contains "the exact argv the helper builds" 'exec pg_dumpall --clean --if-exists -U' "$OUT"
+contains "the exact argv the helper builds" 'exec pg_dumpall -w --clean --if-exists -U' "$OUT"
 contains "where its output goes" '"output":".cbackup-unit/hooks/pg-dumpall.dump"' "$OUT"
 contains "the probe ran in the helper" 'PostgreSQL 16.4 (fake)' "$OUT"
 contains "and verified it" '"verified":true' "$OUT"
 contains "the policy allows it" '"allowed":true' "$OUT"
+# B248: a probe refused for want of a password says how to give one.
+mv "$WORK/bin/psql" "$WORK/bin/psql.ok"
+printf '#!/bin/sh\necho "psql: error: connection to server failed: fe_sendauth: no password supplied" >&2\nexit 2\n' > "$WORK/bin/psql"
+chmod 0755 "$WORK/bin/psql"
+OUT=$(cb db preview 1 "$FID")
+contains "B248: a probe without its password is not verified" '"verified":false' "$OUT"
+contains "B248: and the preview says how to give the credential" '"credentials":"PostgreSQL wants a password' "$OUT"
+mv "$WORK/bin/psql.ok" "$WORK/bin/psql"
 OUT=$(cb db preview 1 "$FID" --template pg-dump --param user=postgres --param database=app)
 contains "another template previews, though the policy would refuse it" '"allowed":false' "$OUT"
 contains "with the line to add" '"policy_line":"[db] allow_templates = pg-dumpall, pg-dump"' "$OUT"
-contains "and the argv from its params" '"argv":["pg_dump","-Fc","-Z0","-U","postgres","app"]' "$OUT"
+contains "and the argv from its params" '"argv":["pg_dump","-w","-Fc","-Z0","-U","postgres","app"]' "$OUT"
 OUT=$(cb db enable 1 "$FID" --template pg-dump --param user=postgres --param database=app 2>&1); RC=$?
 check    "enabling what the policy refuses fails" 1 "$RC"
 contains "and returns the policy line instead" '[db] allow_templates = pg-dumpall, pg-dump' "$OUT"
@@ -436,6 +444,41 @@ OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
 contains "a failed dump does not fail the unit" '"state":"completed"' "$OUT"
 contains "it is named as a failed dump" 'dump(s) failed' "$OUT"
 contains "and the coverage is the capture's" '"coverage":"covered-quiesced"' "$OUT"
+# B248: a dump waiting on something that never comes (pg_basebackup on a
+# password prompt) held the job until the dump's six-hour timeout, and a
+# cancel did nothing. Now a cancel stops the dump's whole process group,
+# SIGTERM then SIGKILL, and the job ends within seconds. This dump's child
+# ignores SIGTERM, so the SIGKILL after the grace is what ends it.
+cat > "$WORK/bin/pg_dumpall" <<SH
+#!/bin/sh
+echo \$\$ > "$WORK/dump.pids"
+(trap '' TERM; exec sleep 300) &
+echo \$! >> "$WORK/dump.pids"
+wait
+SH
+chmod 0755 "$WORK/bin/pg_dumpall"
+rm -f "$WORK/dump.pids"
+JID=$(cb unit backup 1 --provider fake cbk-uat-d --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 100); do [ "$(wc -l < "$WORK/dump.pids" 2>/dev/null)" = 2 ] && break; sleep 0.1; done
+check    "B248: the hanging dump is running" 2 "$(wc -l < "$WORK/dump.pids" 2>/dev/null)"
+T0=$(date +%s)
+cb jobs cancel "$JID" > /dev/null
+for _ in $(seq 1 300); do
+    cb jobs "$JID" | grep -Eq '"state":"(cancelled|failed|completed)"' && break
+    sleep 0.1
+done
+T1=$(date +%s)
+contains "B248: the cancel ends the job" '"state":"cancelled"' "$(cb jobs "$JID")"
+if [ $((T1 - T0)) -le 10 ]; then ok "B248: within seconds ($((T1 - T0)) s)"; else bad "B248: within seconds" "<= 10 s" "$((T1 - T0)) s"; fi
+LEFT=""
+for _ in $(seq 1 30); do
+    LEFT=""
+    for p in $(cat "$WORK/dump.pids"); do kill -0 "$p" 2>/dev/null && LEFT="$LEFT $p"; done
+    [ -z "$LEFT" ] && break
+    sleep 0.1
+done
+check    "B248: and no process of the dump is left" "" "$LEFT"
+for p in $LEFT; do kill -9 "$p" 2>/dev/null; done
 OUT=$(cb db dismiss 1 "$FID" --reason "test data")
 contains "dismiss stops it" '"state":"dismissed"' "$OUT"
 OUT=$(cb unit backup 1 --provider fake cbk-uat-d)

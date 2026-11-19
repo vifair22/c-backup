@@ -654,13 +654,20 @@ static void x_hook_kill(helper_run_t *r)
 {
     if (r->done) return;
     kill(-r->pid, SIGTERM);
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < HOOK_KILL_GRACE_S * 10; i++) {
         int s;
         if (x_hook_poll(r, &s)) return;
         struct timespec ts = { 0, 100 * 1000000L };
         nanosleep(&ts, NULL);
     }
     kill(-r->pid, SIGKILL);
+}
+
+/* The group outlives its leader while a member does: a stop's SIGKILL
+ * reaches what ignored the SIGTERM the leader died of. */
+static void x_hook_signal(helper_run_t *r, int sig)
+{
+    kill(-r->pid, sig);
 }
 
 static void x_hook_free(helper_run_t *r)
@@ -876,7 +883,8 @@ status_t lxc_backend_init(const helper_policy_t *pol, helper_backend_t *out)
     *out = (helper_backend_t){
         .name = "lxc", .ops = &k_lxc_ops, .ctx = c,
         .blob_data = x_blob_data, .unit_state = x_unit_state, .set_running = x_set_running,
-        .mount_root = x_mount_root, .hook_start = x_hook_start, .hook_poll = x_hook_poll, .hook_kill = x_hook_kill, .hook_free = x_hook_free,
+        .mount_root = x_mount_root, .hook_start = x_hook_start, .hook_poll = x_hook_poll, .hook_kill = x_hook_kill,
+        .hook_signal = x_hook_signal, .hook_free = x_hook_free,
         .define = x_define, .db_target = x_db_target,
     };
     return OK;

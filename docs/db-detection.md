@@ -257,21 +257,29 @@ leave the database's container: templates read them from that container's
 own environment at run time (`$POSTGRES_USER`, `$MARIADB_ROOT_PASSWORD`,
 `$MONGO_INITDB_ROOT_PASSWORD`), so c-backup neither stores nor sees them.
 
+A template never prompts (B248). Nobody can answer a prompt, and a dump
+waiting on one waits out its six-hour timeout: every script takes stdin
+from `/dev/null`, every PostgreSQL tool runs with `-w`, and a template that
+would give a tool half a credential (`mongodump` with a user and no
+password) is not started. A credential that is missing or wrong fails the
+run at once, and the job's warning (and a preview's `probe.credentials`)
+names the template and how to give its engine the credential (14.6).
+
 The 1.0 catalog:
 
 | Template | Kind | argv (fixed) | Params | Probe (dry run, no data) |
 |---|---|---|---|---|
-| `pg-dumpall` | dump | `sh -c 'exec pg_dumpall --clean --if-exists -U "${POSTGRES_USER:-postgres}"'` | none | `psql -U ... -Atc 'select version()'` |
-| `pg-dump` | dump | `pg_dump -Fc -Z0 -U <user> <database>` | `user` `[a-z_][a-z0-9_]{0,62}`, `database` same | as above |
-| `pg-basebackup` | dump | `sh -c 'exec pg_basebackup -D - -Ft -X fetch -U "${POSTGRES_USER:-postgres}"'` | none | `pg_basebackup --version`, single tablespace check |
+| `pg-dumpall` | dump | `sh -c 'exec pg_dumpall -w --clean --if-exists -U "${POSTGRES_USER:-postgres}"'`, with `PGPASSWORD` from `$POSTGRES_PASSWORD` when the container has no `PGPASSWORD` | none | `psql -w -U ... -Atc 'select version()'` |
+| `pg-dump` | dump | `pg_dump -w -Fc -Z0 -U <user> <database>` | `user` `[a-z_][a-z0-9_]{0,62}`, `database` same | `psql -w -U <user> -d <database> -Atc 'select version()'` |
+| `pg-basebackup` | dump | `sh -c 'exec pg_basebackup -w -D - -Ft -X fetch -U "${POSTGRES_USER:-postgres}"'`, password as `pg-dumpall` | none | `pg_basebackup --version`, single tablespace check |
 | `mariadb-dump` | dump | `sh -c 'MYSQL_PWD="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}" exec mariadb-dump --single-transaction --quick --routines --events --triggers --hex-blob --all-databases -uroot'` (`mysqldump` for MySQL images) | `lock_tables` bool (adds `--lock-tables` for MyISAM) | `SELECT` of non-InnoDB tables from `information_schema` |
-| `redis-bgsave` | exec, pre | `sh -c` script: `BGSAVE`, then poll `INFO persistence` until `rdb_bgsave_in_progress:0` and `rdb_last_bgsave_status:ok` (auth from `REDISCLI_AUTH`) | none | `redis-cli PING` |
+| `redis-bgsave` | exec, pre | `sh -c` script: `BGSAVE` (its answer must say it started), then poll `INFO persistence` until `rdb_bgsave_in_progress:0` and `rdb_last_bgsave_status:ok`, failing on any other answer (auth from `REDISCLI_AUTH`) | none | `redis-cli PING`, answered `PONG` |
 | `redis-rdb` | dump | `redis-cli --rdb -` (`valkey-cli` for Valkey) | none | CLI supports `--rdb -` |
 | `sqlite-backup` | dump | `sh -c 'f=$(mktemp) && sqlite3 "$1" ".backup $f" && cat "$f"; rc=$?; rm -f "$f"; exit $rc' sh <db>` | `db`: a detected SQLite path, mapped by the helper to the container's path | `sqlite3 -version` exists in the image (often it does not; then the snapshot covers it, or 9.2 for file sources) |
 | `prometheus-snapshot` | exec, pre and post | pre: `wget -qO- --post-data= http://localhost:9090/api/v1/admin/tsdb/snapshot`; post: `rm -rf /prometheus/snapshots/*` | `port` 1-65535 | admin API answers (`--web.enable-admin-api` in the container's args) |
 | `influx2-backup` | dump | `sh -c 'd=$(mktemp -d) && influx backup "$d" -t "$DOCKER_INFLUXDB_INIT_ADMIN_TOKEN" >&2 && tar -C "$d" -cf - .; rc=$?; rm -rf "$d"; exit $rc'` | none | `influx ping` |
-| `mongodump` | dump | `sh -c 'exec mongodump --archive --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin'` | none | `mongosh --eval 'db.runCommand({ping:1})'` |
-| `nextcloud-maintenance` | exec, pre and post, `needs_quiesce` | `php occ maintenance:mode --on` / `--off`, user `www-data` | none | `php occ status` |
+| `mongodump` | dump | `sh -c 'exec mongodump --archive --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin'`; with no user, no credential arguments; a user with no password is refused before anything starts | none | `mongosh --eval 'db.runCommand({ping:1})'`, credentials as the dump |
+| `nextcloud-maintenance` | exec, pre and post, `needs_quiesce` | `php occ -n maintenance:mode --on` / `--off`, user `www-data` | none | `php occ -n status` |
 
 Dumps are uncompressed by design (`-Z0`, no `--gzip`): c-backup compresses
 with its per-chunk probe, and compressed dumps defeat what little dedup a
@@ -820,3 +828,21 @@ is judged per backup: a later backup whose copy fails is `uncovered` again,
 a coverage change (journalled), and alerts once more (7.3). Applied in
 `db_captures_judge` (`src/ops/db_capture.c`) before the findings are
 recorded, so the job result, `db_findings`, the metrics and the app agree.
+
+### 14.6 Templates never prompt; a cancel stops a hook (B248)
+
+`pg-basebackup` ran `pg_basebackup` without `-w`; under scram auth it
+waited on a password prompt nobody could answer, so the unit backup sat in
+`store` until the dump's six-hour timeout, and `jobs cancel` changed
+nothing: the daemon was blocked in a `read` of the dump's pipe and never
+looked at the flag.
+
+| Point | As built |
+|---|---|
+| Non-interactive | Every script starts `exec </dev/null`; `pg_dumpall`, `pg_dump`, `pg_basebackup` and `psql` run with `-w`; `occ` with `-n`. The MySQL, Redis and influx clients never prompt as the templates call them. `mongodump` and `mongosh` prompt for a password given a user without one, so the script refuses that case itself, printing `c-backup: no credential:` and what is missing |
+| PostgreSQL's password | The templates that connect as `POSTGRES_USER` (`pg-dumpall`, `pg-basebackup` and their probes) export `PGPASSWORD="$POSTGRES_PASSWORD"` when the container has a `POSTGRES_PASSWORD` and no `PGPASSWORD`: the official image's password for that user, read inside the container as 7.2 says credentials are, exactly as `mariadb-dump` reads `MARIADB_ROOT_PASSWORD`. `pg-dump` connects as the operator's role, so it takes only the container's own `PGPASSWORD`, a `.pgpass` or `pg_hba.conf` |
+| Redis answers | `redis-cli` exits 0 on a `NOAUTH` reply, so the probe requires `PONG` and `redis-bgsave` requires `BGSAVE`'s own answer and an `INFO persistence` that says where the save is; before, a refused `BGSAVE` looped for ten minutes |
+| Saying how | `db_template_auth_hint` matches a failed run's log against each engine's own words for a missing or refused credential (libpq's `no password supplied`, `Access denied for user`, `NOAUTH`, `WRONGPASS`, `Authentication failed`, `unauthorized`) and the scripts' own line, and answers one sentence naming the environment variables (or `.pgpass`, `pg_hba.conf`) that give that engine its credential. The job's warning becomes `dump template <name> could not authenticate (exit N) and never prompts; not stored: <how>`; an exec template's warning says the same; a preview whose probe failed so carries it as `probe.credentials` |
+| A cancel stops the hook | The daemon reads a dump's pipe in 200 ms polls and gives up on the job's cancel; `stream_close` then sends `hook.wait` with `kill`, which the helper answers once the run has ended. An exec template's pre run is waited for the same way; its post run always finishes, since it undoes the pre (a maintenance mode is never left on). Policy hooks run inside `capture.begin` are not reached by a cancel: they keep their own policy timeouts |
+| Stopping a run | SIGTERM to the run's process group, SIGKILL `HOOK_KILL_GRACE_S` (3 s) later, sent from the helper's polls (`run_poll`) rather than slept through under the server's lock. A local run (the fake backend) is spawned into a group of its own; a Docker exec's process leads its own session under runc, and the group is remembered once found, so a member that outlives the exec's process still gets the SIGKILL; LXC's `lxc-attach` already had its own group. When the leader dies of the SIGTERM and a member ignored it, the rest of the group is killed then, since the run is over. A timed-out run follows the same sequence; its exit status is now the real one (143 for a SIGTERM) rather than a fixed 137 |
+| A plain wait beside a kill | The daemon abandons its plain `hook.wait` when it sends the kill, but the helper's thread for it is still polling the run; a plain wait that finds a cancelled run answers `invalid` and leaves the answer to the kill |

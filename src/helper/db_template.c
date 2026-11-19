@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include "db_template.h"
 
@@ -58,29 +58,52 @@ static const db_template_t k_templates[] = {
 
 /* ---- the fixed scripts ------------------------------------------------ */
 
+/*
+ * Never interactive (B248). A template runs with nobody to answer it: a
+ * tool that prompts for a password waits until the dump timeout, six
+ * hours, and pg_basebackup without -w did exactly that under scram auth.
+ * So every script starts with stdin from /dev/null, every PostgreSQL tool
+ * runs with -w (fail rather than prompt), and a tool that would prompt for
+ * a missing half of a credential (mongodump, mongosh: a user and no
+ * password) is not started; the script says what is missing instead. The
+ * line it prints starts with DBT_NO_CREDENTIAL, which the daemon looks for
+ * (db_template_auth_hint) along with each engine's own words.
+ */
+#define NOIN "exec </dev/null\n"
+
 #define PG_USER "\"${POSTGRES_USER:-postgres}\""
+/* The image's password for POSTGRES_USER, from its own environment, when
+ * the container has no PGPASSWORD of its own. Only for the templates that
+ * connect as POSTGRES_USER: pg-dump's role is the operator's. */
+#define PG_PASS                                                                        \
+    "[ -n \"${PGPASSWORD:-}\" ] || [ -z \"${POSTGRES_PASSWORD:-}\" ] ||"               \
+    " export PGPASSWORD=\"$POSTGRES_PASSWORD\"\n"
 
 static const char k_pg_dumpall[] =
-    "exec pg_dumpall --clean --if-exists -U " PG_USER;
+    NOIN PG_PASS "exec pg_dumpall -w --clean --if-exists -U " PG_USER;
 static const char k_pg_version[] =
-    "exec psql -U " PG_USER " -d postgres -Atc 'select version()'";
+    NOIN PG_PASS "exec psql -w -U " PG_USER " -d postgres -Atc 'select version()'";
 static const char k_pg_basebackup[] =
-    "exec pg_basebackup -D - -Ft -X fetch -U " PG_USER;
+    NOIN PG_PASS "exec pg_basebackup -w -D - -Ft -X fetch -U " PG_USER;
 /* pg_basebackup -Ft to stdout handles one tablespace only. */
 static const char k_pg_basebackup_probe[] =
+    NOIN PG_PASS
     "pg_basebackup --version || exit 1\n"
-    "n=$(psql -U " PG_USER " -d postgres -Atc \"select count(*) from pg_tablespace"
+    "n=$(psql -w -U " PG_USER " -d postgres -Atc \"select count(*) from pg_tablespace"
     " where spcname not in ('pg_default', 'pg_global')\") || exit 1\n"
     "echo \"tablespaces besides the default: $n\"\n"
     "[ \"$n\" = 0 ]";
 
 /* "$@" is --single-transaction or --lock-tables, from the template's own
- * table, never from a caller. */
+ * table, never from a caller. The clients never prompt unless given -p
+ * with no value; without a password they are refused at once. */
 static const char k_mariadb_dump[] =
+    NOIN
     "d=mariadb-dump; command -v mariadb-dump >/dev/null 2>&1 || d=mysqldump\n"
     "export MYSQL_PWD=\"${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}\"\n"
     "exec \"$d\" --quick --routines --events --triggers --hex-blob --all-databases -uroot \"$@\"";
 static const char k_mariadb_probe[] =
+    NOIN
     "c=mariadb; command -v mariadb >/dev/null 2>&1 || c=mysql\n"
     "export MYSQL_PWD=\"${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}\"\n"
     "\"$c\" -uroot -N -e 'select version()' || exit 1\n"
@@ -89,24 +112,35 @@ static const char k_mariadb_probe[] =
     " where engine is not null and engine <> 'InnoDB' and table_schema not in"
     " ('mysql', 'information_schema', 'performance_schema', 'sys')\"";
 
-#define REDIS_CLI "c=redis-cli; command -v redis-cli >/dev/null 2>&1 || c=valkey-cli\n"
-static const char k_redis_rdb[] = REDIS_CLI "exec \"$c\" --rdb -";
-static const char k_redis_rdb_probe[] = REDIS_CLI "\"$c\" --version || exit 1\nexec \"$c\" PING";
-static const char k_redis_ping[] = REDIS_CLI "exec \"$c\" PING";
 /* Auth comes from REDISCLI_AUTH in the container's environment, which the
- * CLI reads itself. */
+ * CLI reads itself; it never prompts. It does exit 0 on a NOAUTH answer to
+ * a command, so a script checks what came back rather than the status. */
+#define REDIS_CLI NOIN "c=redis-cli; command -v redis-cli >/dev/null 2>&1 || c=valkey-cli\n"
+static const char k_redis_rdb[] = REDIS_CLI "exec \"$c\" --rdb -";
+static const char k_redis_ping[] =
+    REDIS_CLI "o=$(\"$c\" PING 2>&1); rc=$?; echo \"$o\"; [ \"$rc\" = 0 ] && [ \"$o\" = PONG ]";
+static const char k_redis_rdb_probe[] =
+    REDIS_CLI "\"$c\" --version || exit 1\n"
+    "o=$(\"$c\" PING 2>&1); rc=$?; echo \"$o\"; [ \"$rc\" = 0 ] && [ \"$o\" = PONG ]";
 static const char k_redis_bgsave[] =
     REDIS_CLI
-    "\"$c\" BGSAVE >&2 || exit 1\n"
+    "o=$(\"$c\" BGSAVE 2>&1) || { echo \"$o\" >&2; exit 1; }\n"
+    "echo \"$o\" >&2\n"
+    "case \"$o\" in\n"
+    "*'Background saving started'*|*'already in progress'*) ;;\n"
+    "*) exit 1 ;;\n"
+    "esac\n"
     "i=0\n"
     "while [ \"$i\" -lt 590 ]; do\n"
-    "  s=$(\"$c\" INFO persistence) || exit 1\n"
+    "  s=$(\"$c\" INFO persistence 2>&1) || { echo \"$s\" >&2; exit 1; }\n"
     "  case \"$s\" in\n"
     "  *rdb_bgsave_in_progress:0*)\n"
     "    case \"$s\" in\n"
     "    *rdb_last_bgsave_status:ok*) echo 'BGSAVE finished' >&2; exit 0 ;;\n"
     "    *) echo 'BGSAVE failed' >&2; exit 1 ;;\n"
     "    esac ;;\n"
+    "  *rdb_bgsave_in_progress:1*) ;;\n"
+    "  *) echo \"$s\" >&2; exit 1 ;;\n"
     "  esac\n"
     "  sleep 1\n"
     "  i=$((i + 1))\n"
@@ -116,31 +150,49 @@ static const char k_redis_bgsave[] =
 
 /* "$1" is the database's path inside the container. */
 static const char k_sqlite_backup[] =
-    "f=$(mktemp) && sqlite3 \"$1\" \".backup $f\" && cat \"$f\"; rc=$?; rm -f \"$f\"; exit $rc";
+    NOIN "f=$(mktemp) && sqlite3 \"$1\" \".backup $f\" && cat \"$f\"; rc=$?; rm -f \"$f\"; exit $rc";
 
 /* "$1" is the port, an integer the catalog checked. */
 static const char k_prom_probe[] =
+    NOIN
     "o=$(wget -qO- \"http://localhost:$1/api/v1/status/flags\") || exit 1\n"
     "case \"$o\" in\n"
     "*'\"web.enable-admin-api\":\"true\"'*) echo 'admin API enabled'; exit 0 ;;\n"
     "*) echo 'admin API disabled: the container needs --web.enable-admin-api'; exit 1 ;;\n"
     "esac";
-static const char k_prom_post[] = "rm -rf /prometheus/snapshots/*";
+static const char k_prom_post[] = NOIN "rm -rf /prometheus/snapshots/*";
 
+/* The influx CLI takes the token from -t, or from its active config when
+ * -t is empty; it never prompts. */
 static const char k_influx2_backup[] =
+    NOIN
     "d=$(mktemp -d) && influx backup \"$d\" -t \"$DOCKER_INFLUXDB_INIT_ADMIN_TOKEN\" >&2"
     " && tar -C \"$d\" -cf - .; rc=$?; rm -rf \"$d\"; exit $rc";
 
-#define MONGO_AUTH "--username \"$MONGO_INITDB_ROOT_USERNAME\" --password \"$MONGO_INITDB_ROOT_PASSWORD\"" \
-                   " --authenticationDatabase admin"
-static const char k_mongodump[] = "exec mongodump --archive " MONGO_AUTH;
-static const char k_mongo_probe[] = "exec mongosh --quiet " MONGO_AUTH " --eval 'db.runCommand({ping:1})'";
+/* mongodump and mongosh prompt for a password when given a user and no
+ * password, so a user without one is refused here; with neither, they
+ * connect without authenticating, which an image without auth accepts. */
+#define MONGO_AUTH                                                                                   \
+    NOIN                                                                                             \
+    "set --\n"                                                                                       \
+    "if [ -n \"${MONGO_INITDB_ROOT_USERNAME:-}\" ]; then\n"                                          \
+    "  if [ -z \"${MONGO_INITDB_ROOT_PASSWORD:-}\" ]; then\n"                                        \
+    "    echo '" DBT_NO_CREDENTIAL " MONGO_INITDB_ROOT_USERNAME is set and MONGO_INITDB_ROOT_PASSWORD" \
+    " is not' >&2\n"                                                                                 \
+    "    exit 1\n"                                                                                   \
+    "  fi\n"                                                                                         \
+    "  set -- --username \"$MONGO_INITDB_ROOT_USERNAME\" --password \"$MONGO_INITDB_ROOT_PASSWORD\""   \
+    " --authenticationDatabase admin\n"                                                              \
+    "fi\n"
+static const char k_mongodump[] = MONGO_AUTH "exec mongodump --archive \"$@\"";
+static const char k_mongo_probe[] = MONGO_AUTH "exec mongosh --quiet \"$@\" --eval 'db.runCommand({ping:1})'";
 
 /* occ is where the official image keeps it, or linuxserver's. "$@" is the
- * occ command, from this table. */
+ * occ command, from this table; -n: occ never asks a question. */
 static const char k_occ[] =
+    NOIN
     "for d in /var/www/html /app/www/public /config/www/nextcloud; do\n"
-    "  [ -f \"$d/occ\" ] && exec php \"$d/occ\" \"$@\"\n"
+    "  [ -f \"$d/occ\" ] && exec php \"$d/occ\" -n \"$@\"\n"
     "done\n"
     "echo 'occ not found' >&2\n"
     "exit 127";
@@ -162,6 +214,49 @@ const char *db_template_default_allow(void)
 {
     return "pg-dumpall, pg-dump, pg-basebackup, mariadb-dump, redis-rdb, sqlite-backup, "
            "influx2-backup, mongodump";
+}
+
+/* ---- credentials ---------------------------------------------------- */
+
+/* What each engine's tools say when a credential is missing or wrong, as
+ * they print it (libpq, the MySQL and MariaDB clients, redis-cli, the
+ * MongoDB tools, the influx CLI). */
+static const char *const k_auth_words[] = {
+    DBT_NO_CREDENTIAL,
+    "no password supplied",               /* libpq, -w and none to send */
+    "password authentication failed",
+    "Access denied for user",             /* mysql, mariadb */
+    "NOAUTH",                              /* redis, valkey */
+    "WRONGPASS",
+    "Authentication failed",              /* mongodump, mongosh */
+    "requires authentication",
+    "unauthorized",                        /* influx */
+    "Unauthorized",
+};
+
+const char *db_template_auth_hint(const db_template_t *t, const char *log, size_t len)
+{
+    if (!t || !log) return NULL;
+    int said = 0;
+    for (size_t i = 0; !said && i < sizeof(k_auth_words) / sizeof(k_auth_words[0]); i++)
+        said = memmem(log, len, k_auth_words[i], strlen(k_auth_words[i])) != NULL;
+    if (!said) return NULL;
+    const char *e = t->engine;
+    if (strcmp(e, "postgres") == 0)
+        return "PostgreSQL wants a password: give the container PGPASSWORD (or POSTGRES_PASSWORD, for "
+               "POSTGRES_USER) in its environment, a ~/.pgpass for the user the tool runs as, or a "
+               "trust or peer line for local connections in pg_hba.conf";
+    if (strcmp(e, "mysql") == 0)
+        return "the server refused root: set MARIADB_ROOT_PASSWORD or MYSQL_ROOT_PASSWORD in the "
+               "container's environment";
+    if (strcmp(e, "redis") == 0)
+        return "the server wants a password: set REDISCLI_AUTH in the container's environment";
+    if (strcmp(e, "mongodb") == 0)
+        return "set MONGO_INITDB_ROOT_USERNAME and MONGO_INITDB_ROOT_PASSWORD in the container's environment";
+    if (strcmp(e, "influxdb2") == 0)
+        return "set DOCKER_INFLUXDB_INIT_ADMIN_TOKEN in the container's environment, or give the influx "
+               "CLI an active config with an operator token";
+    return NULL;
 }
 
 /* ---- parameters ------------------------------------------------------- */
@@ -287,10 +382,10 @@ static int argv_of(const db_template_t *t, dbt_phase_t ph, const cJSON *params, 
         const char *user = db_template_param_str(params, "user");
         const char *db = db_template_param_str(params, "database");
         if (ph == DBT_PHASE_PROBE)
-            return push(a, "psql") || push(a, "-U") || push(a, user) || push(a, "-d") || push(a, db) ||
-                   push(a, "-Atc") || push(a, "select version()") ? -1 : 0;
-        return push(a, "pg_dump") || push(a, "-Fc") || push(a, "-Z0") || push(a, "-U") || push(a, user) ||
-               push(a, db) ? -1 : 0;
+            return push(a, "psql") || push(a, "-w") || push(a, "-U") || push(a, user) || push(a, "-d") ||
+                   push(a, db) || push(a, "-Atc") || push(a, "select version()") ? -1 : 0;
+        return push(a, "pg_dump") || push(a, "-w") || push(a, "-Fc") || push(a, "-Z0") || push(a, "-U") ||
+               push(a, user) || push(a, db) ? -1 : 0;
     }
     if (strcmp(n, "pg-basebackup") == 0)
         return shell(a, ph == DBT_PHASE_PROBE ? k_pg_basebackup_probe : k_pg_basebackup);
