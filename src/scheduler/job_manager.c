@@ -1201,6 +1201,12 @@ static void worker_loop(job_manager_t *jm)
         } else if (cancelled) {
             outcome = "cancelled";
             state   = "cancelled";
+            /* What the job said about stopping, when it said anything: a
+             * backup the daemon's stop cancelled after its snapshot record
+             * was written names the snapshot and says the next start
+             * indexes it. The error was empty, and that was only in the
+             * daemon's log (B224). */
+            if (err_msg()[0]) detail = err_msg();
         } else {
             outcome = "failed";
             state   = "failed";

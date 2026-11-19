@@ -995,6 +995,43 @@ static void test_the_stop_does_not_wait_for_ever(void **state)
     assert_string_equal(st, "cancelled");
 }
 
+/*
+ * B224: a backup the stop cancelled after its snapshot record was written
+ * ended "cancelled" with an empty error, and that the snapshot was written
+ * and is indexed at the next start was only in the daemon's log. The job's
+ * own message is its error and its journal entry now.
+ */
+static status_t written_then_stopped_job(void *arg, atomic_int *cancel,
+                                         void (*progress)(const char *, uint64_t, uint64_t, void *),
+                                         void *progress_ctx)
+{
+    (void)arg; (void)progress; (void)progress_ctx;
+    for (int i = 0; i < 24000 && !atomic_load(cancel); i++) usleep(5000);
+    return set_error(ERR_BUSY, "backup cancelled: the daemon is stopping; snapshot 4 was "
+                     "written to the repository but its index did not commit: the next "
+                     "daemon start indexes it");
+}
+
+static void test_a_stopped_job_keeps_what_it_said(void **state)
+{
+    (void)state;
+    int64_t a = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, written_then_stopped_job, NULL, NULL, &a),
+                     OK);
+    for (int i = 0; i < 400 && db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'") != 1; i++)
+        usleep(5000);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'"), 1);
+    assert_int_equal(job_manager_stop_within(jm, 0), OK);
+    jm = NULL;
+    char q[128], txt[512];
+    snprintf(q, sizeof(q), "SELECT state || '|' || error FROM jobs WHERE id = %lld", (long long)a);
+    assert_int_equal(db_text(q, txt, sizeof(txt)), 0);
+    assert_non_null(strstr(txt, "cancelled|backup cancelled: the daemon is stopping; snapshot 4 "
+                                "was written"));
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE result = 'cancelled'"
+                              " AND message LIKE '%snapshot 4 was written%'"), 1);
+}
+
 /* And a job that stops in time is waited for as before: OK, freed. */
 static void test_the_stop_waits_for_a_job_that_stops(void **state)
 {
@@ -2142,6 +2179,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_cancelling_a_queued_job_is_immediate, setup, teardown),
         cmocka_unit_test_setup_teardown(test_shutdown_never_starts_a_queued_job, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_stop_does_not_wait_for_ever, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_stopped_job_keeps_what_it_said, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_stop_waits_for_a_job_that_stops, setup, teardown),
         cmocka_unit_test_setup_teardown(test_full_queue_refuses_and_spares_running_jobs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_alert_names_repository_and_error, setup, teardown),
