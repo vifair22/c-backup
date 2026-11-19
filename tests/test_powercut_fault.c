@@ -75,6 +75,7 @@
 #include "db_write.h"
 #include "fake_provider.h"
 #include "fault_inject.h"
+#include "file_cache.h"
 #include "gc.h"
 #include "id_reserve.h"
 #include "job_manager.h"
@@ -107,6 +108,9 @@
 #define H_REPO   H_DIR "/repo"
 #define H_SREPO  H_DIR "/srepo"
 #define H_OUT    H_DIR "/out"
+/* B293's source, and the "version" its snapshots are of (g_ver_of). */
+#define TWIN_DIR H_DIR "/twins"
+#define TWIN_VER 99
 #define H_KEEP   TEST_TMP "/c_backup_test_powercut_keep"
 #define H_VER    H_KEEP "/ver"
 #define PRISTINE H_KEEP "/pristine"
@@ -660,6 +664,11 @@ typedef struct scenario {
      * what it dropped, and one more backup that has to restore. */
     int         deep;
 } scenario_t;
+
+/* Cut only at index commits and make_durables, for a scenario whose data is
+ * large enough that a trial per filesystem step would cost more than it
+ * shows (B293). Set around one every_cut. */
+static int g_commits_only;
 
 /* ---- units --------------------------------------------------------- */
 
@@ -1364,6 +1373,7 @@ static void check_unit2_items(int id, int ver)
 static void check_restored(int id, int ver, int unit)
 {
     if (g_units && unit == 2) { check_unit2_items(id, ver); return; }
+    if (ver == TWIN_VER) { compare_trees(TWIN_DIR, H_OUT TWIN_DIR); return; }
     char want[PATH_MAX], got[PATH_MAX];
     snprintf(want, sizeof(want), H_VER "/%d", ver);
     snprintf(got, sizeof(got), H_OUT "%s", H_SRC);
@@ -1810,6 +1820,10 @@ static void every_cut(const scenario_t *s)
     for (int k = 1; k <= total; k++) {
         /* After a staging write the disk is what it was before it. */
         if (k > 1 && kinds[k - 1] == K_SCRATCH) { skipped++; continue; }
+        if (g_commits_only && kinds[k] != K_COMMIT && kinds[k] != K_DURABLE) {
+            skipped++;
+            continue;
+        }
         (void)trial(s, k, total, 0, &t);
     }
     free(kinds);
@@ -2814,6 +2828,8 @@ static const scenario_t S_API_SOURCES  = { "API sources (commit-only)", build_ap
 
 static const scenario_t S_IDS          = { "ids handed out (B217)", build_ids, op_ids,
                                            0, 0, 0, check_ids, 0 };
+static const scenario_t S_TWINS        = { "twins on two file workers (B293)", build_twins,
+                                           op_twins, 0, 0, 0, check_twins, 0 };
 static const scenario_t S_BACKUP_JOB   = { "backup job's end (B238)", build_backup_job,
                                            op_backup_job, 0, 1, 0, check_backup_job, 0 };
 static const scenario_t S_UNIT_JOB     = { "unit job's end (B267)", build_unit_two,
@@ -2829,6 +2845,13 @@ static void test_ids(void **state)
     assert_int_equal(g_counted_jrnl, IDS_EACH);
 }
 static void test_backup_job(void **state)     { (void)state; every_cut(&S_BACKUP_JOB); }
+static void test_twins(void **state)
+{
+    (void)state;
+    g_commits_only = 1;
+    every_cut(&S_TWINS);
+    g_commits_only = 0;
+}
 static void test_unit_job(void **state)       { (void)state; every_cut(&S_UNIT_JOB); }
 static void test_api_tag(void **state)        { (void)state; every_cut(&S_API_TAG); }
 static void test_api_sched_del(void **state)  { (void)state; every_cut(&S_API_SCHED_DEL); }
@@ -3049,6 +3072,7 @@ int main(void)
         cmocka_unit_test(test_api_sources),
         cmocka_unit_test(test_ids),
         cmocka_unit_test(test_backup_job),
+        cmocka_unit_test(test_twins),
         cmocka_unit_test(test_unit_job),
         cmocka_unit_test(test_prune_unlinks_the_record_after_the_commit_is_durable),
         cmocka_unit_test(test_start_finishes_an_interrupted_prune),

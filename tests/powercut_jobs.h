@@ -2,7 +2,8 @@
 
 /*
  * Scenarios of tests/test_powercut_fault.c that run a job end to end: a
- * backup job (B238) and a unit job (B267). Included by that file, once, where its harness, its operations
+ * backup job (B238), a unit job (B267) and twins on two file workers
+ * (B293). Included by that file, once, where its harness, its operations
  * and its checks are all defined; it uses them directly. A file of its own
  * because the suite is past the size ceiling (ci/size_check.py) and may
  * not grow.
@@ -250,4 +251,144 @@ static void check_unit_job(int crash_at, int kept, int started)
         violation("unit job %s wrote one of its two snapshots and does not say so: %s", id, error);
     if (have && (strcmp(state, "running") == 0 || strcmp(state, "queued") == 0))
         violation("unit job %s is still %s after the start", id, state);
+}
+
+/* ---- Twins on two file workers (B293) ------------------------------------
+ *
+ * Two files over one object's bound, so each goes to a pool worker with a
+ * pack writer of its own, and nearly every chunk of the one is a chunk of
+ * the other: one writer stores a shared chunk and the other, finding it
+ * claimed, references it and stores nothing (pack_claims_t). A writer's
+ * pack, chunk list included, can commit while the owner of one of its
+ * chunks has not. A cut then keeps the list and loses the chunk, and the
+ * file cache row for the first file, which checks only the list's row,
+ * would let the next backup reuse the list unread. With the second file
+ * gone by then nothing stores the chunk again, and that snapshot names
+ * bytes the repository does not hold.
+ *
+ * So after each cut the start's recovery runs, the second file is removed,
+ * a backup is taken with the cache matching as it does on a share (no
+ * device, inode or ctime: the harness copies the source each trial), and
+ * the first file has to restore byte for byte. The index and repository go
+ * back to the cut's afterwards, for the usual start and checks.
+ */
+#define TWIN_BYTES ((size_t)OBJECT_MAX_BYTES + 3 * 1024 * 1024)
+
+static void twin_fill(uint8_t *b, size_t n)
+{
+    uint64_t x = 0x9e3779b97f4a7c15ULL;
+    for (size_t i = 0; i < n; i++) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        b[i] = (uint8_t)(x >> 24);
+    }
+}
+
+static void twin_write(const char *path, size_t extra)
+{
+    uint8_t *b = malloc(TWIN_BYTES + extra);
+    assert_non_null(b);
+    twin_fill(b, TWIN_BYTES);
+    for (size_t i = 0; i < extra; i++) b[TWIN_BYTES + i] = (uint8_t)(0xa5 ^ i);
+    FILE *f = fopen(path, "wb");
+    assert_non_null(f);
+    assert_int_equal(fwrite(b, 1, TWIN_BYTES + extra, f), TWIN_BYTES + extra);
+    fclose(f);
+    free(b);
+}
+
+static status_t twin_backup(store_t *st, cutils_db_t *db, int64_t *out_snap,
+                            unsigned *out_files_at_once)
+{
+    static const char *paths[] = { TWIN_DIR };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.store_workers = 8;
+    o.file_cache_match = FILE_CACHE_MATCH_RELAXED;
+    backup_result_t br;
+    memset(&br, 0, sizeof(br));
+    status_t rs = backup_run(st, db, g_repo_id, &o, &br);
+    if (out_snap) *out_snap = br.snapshot_id;
+    if (out_files_at_once) *out_files_at_once = br.file_workers;
+    backup_result_free(&br);
+    return rs;
+}
+
+static void build_twins(ctx_t *c)
+{
+    begin_build(c);
+    open_target(c);
+    assert_int_equal(__real_mkdir(TWIN_DIR, 0700), 0);
+    twin_write(TWIN_DIR "/a.bin", 0);
+    twin_write(TWIN_DIR "/b.bin", 4096);
+    g_ver_of[1] = TWIN_VER;
+    end_build(c);
+}
+
+static status_t op_twins(ctx_t *c, int counting)
+{
+    unsigned at_once = 0;
+    store_index_set_pack_batch_rows(2);
+    status_t st = twin_backup(c->store, c->db, NULL, &at_once);
+    store_index_set_pack_batch_rows(0);
+    if (counting && st == OK && at_once < 2)
+        fail_msg("twins: the backup stored %u file(s) at once, not 2", at_once);
+    return st;
+}
+
+static void check_twins(int crash_at, int kept, int started)
+{
+    (void)crash_at;
+    if (started) return;
+    cutils_db_t *db = NULL;
+    db_open_at(H_DB, &db);
+    /* The daemon's start, as start_and_check runs it, then the next
+     * backup with the second file gone. */
+    if (store_index_drop_unannounced(db, 0) != OK ||
+        store_index_drop_staged(db, 0) != OK ||
+        store_index_drop_vanished_packs(db, 0) != OK ||
+        pack_presence_check_all(db) != OK ||
+        store_index_fix_absent(db, 0) != OK ||
+        prune_finish_pending(db, 0, NULL) != OK)
+        violation("twins: the start's recovery fails: %s", err_msg());
+    store_t *st = NULL;
+    store_index_t *idx = NULL;
+    assert_int_equal(repo_store_open(H_REPO, NULL, &st), OK);
+    assert_int_equal(store_index_bind(st, db, g_repo_id, &idx), OK);
+    uint64_t indexed = 0;
+    if (reindex_gaps_run(st, db, g_repo_id, "reindex", NULL, NULL, NULL, &indexed) != OK)
+        violation("twins: the start-up indexing fails: %s", err_msg());
+    err_clear();
+    assert_int_equal(rename(TWIN_DIR "/b.bin", H_DIR "/b.gone"), 0);
+    int64_t snap = 0;
+    if (twin_backup(st, db, &snap, NULL) != OK) {
+        violation("twins: the next backup fails: %s", err_msg());
+    } else {
+        rm_tree(H_OUT);
+        assert_int_equal(__real_mkdir(H_OUT, 0700), 0);
+        restore_opts_t ro;
+        memset(&ro, 0, sizeof(ro));
+        ro.overwrite = 1;
+        restore_result_t rr;
+        memset(&rr, 0, sizeof(rr));
+        char got[PATH_MAX];
+        snprintf(got, sizeof(got), H_OUT "%s/a.bin", TWIN_DIR);
+        uint64_t n0 = 0, n1 = 0;
+        if (restore_run(st, db, g_repo_id, snap, H_OUT, &ro, &rr) != OK)
+            violation("twins: the next backup's snapshot %lld does not restore: %s",
+                      (long long)snap, err_msg());
+        else if (file_sum(TWIN_DIR "/a.bin", &n0) != file_sum(got, &n1) || n0 != n1)
+            violation("twins: a.bin in the next backup's snapshot %lld is not the file",
+                      (long long)snap);
+        err_clear();
+    }
+    assert_int_equal(rename(H_DIR "/b.gone", TWIN_DIR "/b.bin"), 0);
+    store_index_free(idx);
+    store_close(st);
+    db_close(db);
+    /* Back to what the cut left, for the start and its checks. */
+    rm_tree(H_REPO);
+    copy_tree(CRASHED, H_REPO);
+    install_index(kept);
 }

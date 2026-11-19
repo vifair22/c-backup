@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "file_cache.h"
+#include "scan.h"
 #include "util.h"
 #include "db_write.h"
 
@@ -77,7 +78,7 @@ int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
     db_result_t *r = NULL;
     if (db_execute(db,
             "SELECT dev, inode, size, mtime_ns, ctime_ns, content_hash"
-            "  FROM file_cache WHERE repo_id = ? AND path = ?",
+            "  FROM file_cache WHERE repo_id = ? AND path = ? AND seen_at >= 0",
             (const char *[]){ repo, path, NULL }, &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
         return 0;
@@ -253,10 +254,30 @@ void file_cache_forget_run(cutils_db_t *db, int64_t repo_id, int64_t seen_at)
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(seen, sizeof(seen), "%lld", (long long)seen_at);
     int n = 0;
-    if (db_write(db, "DELETE FROM file_cache WHERE repo_id = ? AND seen_at = ?",
+    if (db_write(db, "DELETE FROM file_cache WHERE repo_id = ?1 AND seen_at IN (?2, -?2)",
                  (const char *[]){ repo, seen, NULL }, &n) != 0)
         log_warn("file cache: cannot drop the rows of a failed run; its files are "
                  "read again only when they change");
     else if (n > 0)
         log_info("file cache: dropped %d row(s) a failed run wrote", n);
+}
+
+void file_cache_confirm_run(cutils_db_t *db, int64_t repo_id, int64_t stamp)
+{
+    if (!db) return;
+    char repo[32], seen[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(seen, sizeof(seen), "%lld", (long long)stamp);
+    if (db_write(db, "UPDATE file_cache SET seen_at = ?2 WHERE repo_id = ?1 AND seen_at = -?2",
+                 (const char *[]){ repo, seen, NULL }, NULL) != 0)
+        log_warn("file cache: cannot confirm this run's rows; its files are read again "
+                 "next time");
+}
+
+const struct stat *file_cache_key_stat(const struct scan_entry *e, struct stat *buf)
+{
+    if (!e->dev_remapped) return &e->st;
+    *buf = e->st;
+    buf->st_dev = e->rec_dev;
+    return buf;
 }
