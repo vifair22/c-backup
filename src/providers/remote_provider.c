@@ -512,7 +512,7 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(key, sizeof(key), "%s:%s", c->provider, unit->unit_id);
         if (u) cJSON_AddItemToArray(u, cJSON_CreateString(key));
         if (a) cJSON_AddBoolToObject(a, "pause", (unit->caps & SP_CAP_PAUSE) != 0);
-        if (a && req->hold_pause) cJSON_AddBoolToObject(a, "hold", 1);
+        if (a && req && req->hold_pause) cJSON_AddBoolToObject(a, "hold", 1);
         st = rcall_fd(c->socket, "capture.begin", a, &res, &s->late_fd);
     }
     const char *tok = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture")) : NULL;
