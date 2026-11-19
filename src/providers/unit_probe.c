@@ -69,9 +69,10 @@ static status_t container_from(const cJSON *jc, size_t idx, sp_probe_container_t
     if (!cJSON_IsBool(run)) return bad(&w, "running", "must be true or false");
     c->running = cJSON_IsTrue(run);
 
-    const cJSON *al = NULL, *pr = NULL, *po = NULL, *ow = NULL;
+    const cJSON *al = NULL, *pr = NULL, *po = NULL, *ow = NULL, *mo = NULL;
     if ((st = take_arr(&w, jc, "aliases", &al)) != OK || (st = take_arr(&w, jc, "processes", &pr)) != OK ||
-        (st = take_arr(&w, jc, "ports", &po)) != OK || (st = take_arr(&w, jc, "open_write", &ow)) != OK)
+        (st = take_arr(&w, jc, "ports", &po)) != OK || (st = take_arr(&w, jc, "open_write", &ow)) != OK ||
+        (st = take_arr(&w, jc, "mounts", &mo)) != OK)
         return st;
 
     /* Duplicates are dropped rather than refused: the reader of a probe
@@ -139,6 +140,29 @@ static status_t container_from(const cJSON *jc, size_t idx, sp_probe_container_t
         if (!(f->path = strdup(jp->valuestring))) return set_error(ERR_NOMEM, "units.probe");
         c->n_open = ++k;
     }
+
+    /* Mounts: a destination, and a recorded path or null. A mount list
+     * cut short only ever leaves a link unchecked, never misjudged. */
+    size_t nm = arr_cap(mo, SP_PROBE_MOUNTS_MAX, truncated);
+    if (nm && !(c->mounts = calloc(nm, sizeof(*c->mounts)))) return set_error(ERR_NOMEM, "units.probe");
+    k = 0;
+    cJSON_ArrayForEach(e, mo) {
+        if (k == nm) break;
+        where_t wm;
+        snprintf(wm.at, sizeof(wm.at), "%.40s.mounts[%zu]", w.at, k);
+        if (!cJSON_IsObject(e)) return set_error(ERR_INVALID, "units.probe: %s must be an object", wm.at);
+        const cJSON *jd = cJSON_GetObjectItemCaseSensitive(e, "dest");
+        const cJSON *jr = cJSON_GetObjectItemCaseSensitive(e, "recorded");
+        if (!cJSON_IsString(jd) || !helper_path_clean(jd->valuestring))
+            return bad(&wm, "dest", "must be a clean absolute path");
+        if (!cJSON_IsNull(jr) && (!cJSON_IsString(jr) || !helper_path_clean(jr->valuestring)))
+            return bad(&wm, "recorded", "must be a clean absolute path or null");
+        sp_probe_mount_t *m = &c->mounts[k];
+        c->n_mounts = ++k;
+        if (!(m->dest = strdup(jd->valuestring)) ||
+            (cJSON_IsString(jr) && !(m->recorded = strdup(jr->valuestring))))
+            return set_error(ERR_NOMEM, "units.probe");
+    }
     return OK;
 }
 
@@ -179,11 +203,19 @@ static cJSON *container_to(const sp_probe_container_t *c)
 {
     cJSON *o = cJSON_CreateObject();
     if (!o) return NULL;
-    cJSON *al = NULL, *pr = NULL, *po = NULL, *ow = NULL;
+    cJSON *al = NULL, *pr = NULL, *po = NULL, *ow = NULL, *mo = NULL;
     int ok = cJSON_AddStringToObject(o, "name", c->name) && cJSON_AddStringToObject(o, "image", c->image) &&
              cJSON_AddBoolToObject(o, "running", c->running) &&
              (al = cJSON_AddArrayToObject(o, "aliases")) && (pr = cJSON_AddArrayToObject(o, "processes")) &&
-             (po = cJSON_AddArrayToObject(o, "ports")) && (ow = cJSON_AddArrayToObject(o, "open_write"));
+             (po = cJSON_AddArrayToObject(o, "ports")) && (ow = cJSON_AddArrayToObject(o, "open_write")) &&
+             (mo = cJSON_AddArrayToObject(o, "mounts"));
+    for (size_t i = 0; ok && i < c->n_mounts; i++) {
+        cJSON *x = cJSON_CreateObject();
+        ok = x && cJSON_AddItemToArray(mo, x) &&
+             cJSON_AddStringToObject(x, "dest", c->mounts[i].dest ? c->mounts[i].dest : "/") &&
+             (c->mounts[i].recorded ? cJSON_AddStringToObject(x, "recorded", c->mounts[i].recorded) != NULL
+                                    : cJSON_AddNullToObject(x, "recorded") != NULL);
+    }
     for (size_t i = 0; ok && i < c->n_aliases; i++) {
         cJSON *s = cJSON_CreateString(c->aliases[i]);
         ok = s && cJSON_AddItemToArray(al, s);
@@ -246,13 +278,13 @@ cJSON *sp_unit_probe_to_json(const sp_unit_probe_t *p, size_t budget)
     /* Present while measuring, so the count includes it. */
     if (!cJSON_AddBoolToObject(o, "truncated", p->truncated)) { cJSON_Delete(o); return NULL; }
     /*
-     * Over budget: shed open files, then processes, then whole containers,
-     * from the end, each element measured once on its own rather than the
-     * document printed again per element (128 open files in each of 32
-     * containers would otherwise print a 64 KiB document thousands of
-     * times). The reprint after each pass is the exact check.
+     * Over budget: shed open files, then processes, then mounts, then
+     * whole containers, from the end, each element measured once on its
+     * own rather than the document printed again per element (128 open
+     * files in each of 32 containers would otherwise print a 64 KiB
+     * document thousands of times). The reprint after each pass is the exact check.
      */
-    static const char *const order[] = { "open_write", "processes", NULL };
+    static const char *const order[] = { "open_write", "processes", "mounts", NULL };
     for (size_t len = printed_len(o); len != (size_t)-1 && len > budget; len = printed_len(o)) {
         cJSON *t = cJSON_CreateTrue();
         if (!t || !cJSON_ReplaceItemInObjectCaseSensitive(o, "truncated", t)) {

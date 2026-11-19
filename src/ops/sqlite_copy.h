@@ -44,7 +44,7 @@ typedef enum {
 
 typedef struct {
     sqlite_copy_outcome_t outcome;
-    int      wal;            /* the source is in WAL mode */
+    int      wal;            /* 1 WAL mode, 0 rollback journal, -1 not known */
     unsigned tries;          /* attempts made */
     uint64_t bytes;          /* size of the copy */
     char     reason[256];    /* why, when not OK */
@@ -56,6 +56,9 @@ void sqlite_copy(const char *src, const char *dst, int allow_rollback_lock,
                  sqlite_copy_result_t *out);
 
 const char *sqlite_copy_outcome_name(sqlite_copy_outcome_t o);
+
+/* "wal", "rollback" or "unknown", for a result's wal. */
+const char *sqlite_copy_journal_name(int wal);
 
 /* The busy timeout, SQLITE_COPY_BUSY_MS unless set (tests). */
 void sqlite_copy_set_busy_ms(unsigned ms);
