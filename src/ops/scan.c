@@ -510,6 +510,43 @@ static _Thread_local int   tl_remap;
 static _Thread_local dev_t tl_remap_from, tl_remap_to;
 
 /*
+ * The read root and record root of a scan_tree_as walk, for one_filesystem
+ * (B266). A snapshot does not see the mounts below its source: a ZFS child
+ * dataset's mountpoint is an empty directory on the snapshot's own device,
+ * so comparing devices inside the snapshot finds no boundary, and the read
+ * recorded an empty directory where a live one_filesystem read of the same
+ * source records nothing. The boundary is the live tree's, so it is asked
+ * of the live tree: an entry whose recorded path is, live, on a device
+ * other than the record root's is left out as a live read leaves it out.
+ * Thread-local around one walk, like tl_remap.
+ */
+static _Thread_local const char *tl_mread, *tl_mrec;
+
+/* 1 when path (as read) is recorded at a path that is, live, on another
+ * device than the record root: a mount point the live read would not
+ * cross. Its own frame, so the PATH_MAX buffer is not on the recursion's. */
+__attribute__((noinline))
+static int live_crosses_mount(const char *path, scan_result_t *res)
+{
+    if (!tl_mread || !tl_mrec || tl_remap_to == 0) return 0;
+    size_t rl = strlen(tl_mread);
+    if (strncmp(path, tl_mread, rl) != 0 || path[rl] != '/') return 0;
+    const char *tail = path + rl;
+    char rec[PATH_MAX];
+    int n = strcmp(tl_mrec, "/") == 0 ? snprintf(rec, sizeof(rec), "%s", tail)
+                                      : snprintf(rec, sizeof(rec), "%s%s", tl_mrec, tail);
+    if (n < 0 || (size_t)n >= sizeof(rec)) return 0;
+    struct stat ls;
+    /* Gone live since the snapshot: no mount there now, recorded as read. */
+    if (lstat(rec, &ls) != 0 || ls.st_dev == tl_remap_to) return 0;
+    char msg[PATH_MAX + 96];
+    snprintf(msg, sizeof(msg), "skipping mount point: %s (different device)", rec);
+    scan_warn(res, msg);
+    log_warn("%s", msg);
+    return 1;
+}
+
+/*
  * The walk is relative to directory fds, never by path below a source root.
  *
  * By path, a directory swapped for a symlink between its lstat and its
@@ -557,6 +594,9 @@ static status_t scan_entry_at(int dirfd, const char *name, const char *path,
         log_warn("%s", msg);
         return OK;
     }
+    /* The same boundary for a snapshot read, taken from the live tree. */
+    if (opts && opts->one_filesystem && tl_remap && live_crosses_mount(path, res))
+        return OK;
 
     scan_entry_t e = {0};
     e.path             = strdup(path);
@@ -1027,6 +1067,7 @@ static status_t scan_tree_impl(const char *root, const char *record,
     const char *prev_top = tl_top_read;
     int prev_remap = tl_remap;
     dev_t prev_from = tl_remap_from, prev_to = tl_remap_to;
+    const char *prev_mread = tl_mread, *prev_mrec = tl_mrec;
     tl_top_read = strcmp(record, "/") == 0 ? root : NULL;
     if (as) {
         /* A record root that does not exist here (the data was read from
@@ -1036,8 +1077,12 @@ static status_t scan_tree_impl(const char *root, const char *record,
         tl_remap = 1;
         tl_remap_from = root_st.st_dev;
         tl_remap_to = lstat(record, &rec_st) == 0 ? rec_st.st_dev : 0;
+        tl_mread = root;
+        tl_mrec = record;
     } else {
         tl_remap = 0;
+        tl_mread = NULL;
+        tl_mrec = NULL;
     }
     status_t st = scan_entry_at(AT_FDCWD, root, root, root_parent_id,
                                 strip_prefix_len, imap, opts,
@@ -1048,6 +1093,8 @@ static status_t scan_tree_impl(const char *root, const char *record,
     tl_remap = prev_remap;
     tl_remap_from = prev_from;
     tl_remap_to = prev_to;
+    tl_mread = prev_mread;
+    tl_mrec = prev_mrec;
     if (st != OK) { scan_result_free(res); return st; }
     res->root_entries = res->count - before;
     /* Every path below was built as root + "/" + name..., so the root is

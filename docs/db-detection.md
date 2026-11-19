@@ -515,7 +515,20 @@ warning, and lists it in the job result's `live_sources`. The point above
 `warn` only. Paths the helper does not snapshot get no action from it at all
 beyond placing them (`helper.md`). A mount below a source shows empty in
 its snapshot, so such a source is read from the snapshot only with
-`one_filesystem`. A lease lost before the read reaches a source fails
+`one_filesystem`. With `one_filesystem` the snapshot read leaves a mount
+out exactly as a live read does, by asking the live tree (B266): a ZFS
+snapshot shows a child dataset's mountpoint as an empty directory on the
+snapshot's own device, so there was no device change inside the snapshot
+to stop at, and the read recorded an empty directory that a live read of
+the same source does not (on btrfs neither read recorded it). An entry
+whose recorded path is, live, on another device than the source root is
+left out, one lstat per entry, only for a snapshot read with
+`one_filesystem`. Absent rather than empty, both ways, because absent is
+what a live `one_filesystem` read has always recorded (data-paths.md step
+6): recording the mount point instead would have changed the trees of
+every existing one-filesystem backup, and a snapshot read is promised the
+trees of a live read (B229), so switching a source into snapshot mode
+stores no new trees. A lease lost before the read reaches a source fails
 the job as any unreadable source does, naming the source and the read
 path, with the lease named as the cause (B265; the end of the capture
 used to clear the read's error, leaving the job failed with none).

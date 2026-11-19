@@ -476,6 +476,65 @@ static void test_nested_mount_keeps_its_device(void **state)
     snap_umount();
 }
 
+static int has_entry(const scan_result_t *r, const char *path)
+{
+    for (uint32_t i = 0; i < r->count; i++)
+        if (strcmp(r->entries[i].path, path) == 0) return 1;
+    return 0;
+}
+
+/*
+ * one_filesystem: a snapshot read leaves out what a live read leaves out
+ * (B266). A ZFS child dataset mounted below a source shows in the parent's
+ * snapshot as an empty directory on the snapshot's own device, so there is
+ * no device change inside the snapshot to stop at, and the read recorded
+ * the empty directory where a live read records nothing. The stand-in:
+ * a tmpfs mounted live below the source, and a plain copy of the source
+ * as the snapshot, the mount point an empty directory in it.
+ */
+static void test_one_filesystem_snapshot_matches_live(void **state)
+{
+    (void)state;
+    NEED_NS();
+    const char *zsnap = TEST_DIR "/zsnap";
+    assert_int_equal(mkdir(zsnap, 0700), 0);
+    assert_int_equal(mkdir(TEST_DIR "/zsnap/dir03", 0700), 0);
+    assert_int_equal(mkdir(TEST_DIR "/zsnap/dir05", 0700), 0);
+    write_file(TEST_DIR "/zsnap/dir05/file00.txt", "content of dir 5 file 0");
+    assert_int_equal(mount("tmpfs", TEST_SRC "/dir03", "tmpfs", 0, "size=1m"), 0);
+    write_file(TEST_SRC "/dir03/child.txt", "in the child dataset");
+
+    scan_opts_t so;
+    memset(&so, 0, sizeof(so));
+    so.one_filesystem = 1;
+
+    scan_imap_t *im = scan_imap_new();
+    scan_result_t *live = NULL, *snap = NULL;
+    assert_int_equal(scan_tree(TEST_SRC, im, &so, &live), OK);
+    assert_int_equal(scan_tree_as(zsnap, TEST_SRC, im, &so, &snap), OK);
+
+    assert_false(has_entry(live, TEST_SRC "/dir03"));
+    assert_false(has_entry(live, TEST_SRC "/dir03/child.txt"));
+    assert_false(has_entry(snap, TEST_SRC "/dir03"));
+    /* The rest of the snapshot is read as before. */
+    assert_true(has_entry(snap, TEST_SRC "/dir05/file00.txt"));
+    int warned = 0;
+    for (uint32_t i = 0; i < snap->warn_count; i++)
+        warned |= strstr(snap->warnings[i], "skipping mount point: " TEST_SRC "/dir03") != NULL;
+    assert_true(warned);
+    scan_result_free(live);
+    scan_result_free(snap);
+
+    /* Without one_filesystem the snapshot's empty directory is recorded,
+     * as it always was. */
+    so.one_filesystem = 0;
+    assert_int_equal(scan_tree_as(zsnap, TEST_SRC, im, &so, &snap), OK);
+    assert_true(has_entry(snap, TEST_SRC "/dir03"));
+    scan_result_free(snap);
+    scan_imap_free(im);
+    assert_int_equal(umount2(TEST_SRC "/dir03", MNT_DETACH), 0);
+}
+
 int main(void)
 {
     have_ns = enter_namespaces() == 0;
@@ -490,6 +549,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_snapshot_hardlinks, setup, teardown),
         cmocka_unit_test_setup_teardown(test_changed_file_is_reread, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nested_mount_keeps_its_device, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_one_filesystem_snapshot_matches_live, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
