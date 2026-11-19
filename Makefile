@@ -488,7 +488,7 @@ test-ui: all
 	    echo "ui contract: skipped (no node)"; \
 	fi
 
-test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli test-units test-ui
+test: all $(TEST_BINS) $(FAULT_BINS) analyze test-hygiene test-api test-cli test-units test-ui
 	@for t in $(TEST_BINS) $(FAULT_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
 
 # ---- Sanitizer tests --------------------------------------------------
@@ -807,7 +807,7 @@ check-conflict-markers:
 	    echo "conflict markers: FAIL"; exit 1; fi
 	@echo "conflict markers: OK"
 
-analyze: check-conflict-markers | $(BUILD)
+analyze: check-conflict-markers size-check layout-check | $(BUILD)
 	@echo "=== stack-usage ==="
 	@mkdir -p $(BUILD)/analyze
 	@for f in $(SRCS); do \
@@ -857,10 +857,54 @@ analyze: check-conflict-markers | $(BUILD)
 	    --quiet $(SRC_INCLUDES) -DHAVE_LIBVIRT $(SRCS) $(VIRT_SRCS)
 	@echo "cppcheck: OK"
 
-lint:
+# ---- Hygiene gates (HYGIENE-1) ----------------------------------------
+#
+# size-check: no C file under src/, tests/ or bench/ past 2,000 code lines,
+# and the files already past it (ci/size-baseline.txt) may not grow.
+# size-ratchet lowers that baseline after a file shrinks; it never raises it.
+# layout-check: every directory under src/ has a row in docs/layout.md.
+# Both are cheap and run as part of analyze.
+#
+# tidy: clang-tidy with .clang-tidy over src/, failing only on warnings the
+# baseline (ci/tidy-baseline.txt) does not hold. TIDY_CHANGED_FROM=<ref>
+# checks only the .c files changed since ref (the CI lint job passes the MR's
+# target). The baseline belongs to the CI image's clang-tidy (Debian trixie,
+# 19); a different version reports a different set, so regenerate it there
+# (tidy-baseline) rather than with whatever the desktop has.
+PYTHON          ?= python3
+CLANG_TIDY      ?= clang-tidy
+TIDY_JOBS       ?= $(shell nproc)
+TIDY_CHANGED_FROM ?=
+export TIDY_FLAGS      := -std=c11 -pthread $(SRC_INCLUDES) -DVERSION_STRING='"0"' -DCUTILS_VERSION_STRING='"0"'
+export TIDY_VIRT_FLAGS := $(VIRT_CFLAGS)
+export CLANG_TIDY
+
+.PHONY: size-check size-ratchet layout-check tidy tidy-baseline test-hygiene
+size-check:
+	@echo "=== file size ==="
+	@$(PYTHON) ci/size_check.py --report
+
+size-ratchet:
+	@$(PYTHON) ci/size_check.py --update
+
+layout-check:
+	@echo "=== src layout ==="
+	@$(PYTHON) ci/layout_check.py
+
+tidy:
 	@echo "=== clang-tidy ==="
-	@clang-tidy $(SRCS) -- -std=c11 -pthread $(SRC_INCLUDES) 2>&1 | \
-	    grep -E "warning:|error:" || echo "clang-tidy: OK"
+	@$(PYTHON) ci/tidy_gate.py --tidy $(CLANG_TIDY) --jobs $(TIDY_JOBS) \
+	    $(if $(TIDY_CHANGED_FROM),--changed-from $(TIDY_CHANGED_FROM))
+
+tidy-baseline:
+	@$(PYTHON) ci/tidy_gate.py --tidy $(CLANG_TIDY) --jobs $(TIDY_JOBS) --update
+
+# The gates' own tests: each must fail when it should.
+test-hygiene:
+	@./ci/test_hygiene.sh
+
+# Kept as the name people remember; the gate is `make tidy`.
+lint: tidy
 
 # ---- Editor index -----------------------------------------------------
 #

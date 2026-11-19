@@ -1,0 +1,8 @@
+# Files over the code-line ceiling and the count each may not exceed.
+# Lower only: `make size-ratchet` rewrites this after a file shrinks.
+# See ci/size_check.py for how lines are counted.
+2387 src/helper/docker_backend.c
+2768 src/helper/helper_server.c
+2071 src/ops/backup.c
+3970 src/store/pack.c
+2616 tests/test_powercut_fault.c
