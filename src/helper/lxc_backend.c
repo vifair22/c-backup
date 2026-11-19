@@ -458,6 +458,10 @@ static status_t x_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         snprintf(x->real, sizeof(x->real), "%s", it->source);
         snap_dom_t d;
         if ((st = snap_domain_of(&c->snap, x->real, &d)) != OK) break;
+        if (d.kind == SNAP_NONE && d.unlisted[0])
+            (void)sp_session_info_warn(&s->info, "%.300s is in ZFS dataset %.200s, which the helper's policy does "
+                                       "not list in [snapshot] zfs_domains: read without a snapshot (pause-read)",
+                                       x->real, d.unlisted);
         int nested = 0;
         if (d.kind != SNAP_NONE && (st = nested_below(probe, &d, x->real, &s->info, &nested)) != OK) break;
         if (nested) d.kind = SNAP_NONE;

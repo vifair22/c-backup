@@ -104,6 +104,12 @@ status_t paths_resolve(const helper_backend_t *b, snap_probe_t *probe, const cha
         return OK;
     }
     if ((st = snap_domain_of(&c->snap, mc.real, &out->dom)) != OK) return st;
+    if (out->dom.kind == SNAP_NONE && out->dom.unlisted[0]) {
+        snprintf(out->reason, sizeof(out->reason), "%s%.120s is in ZFS dataset %.64s, which the helper's policy "
+                 "does not list in [snapshot] zfs_domains", strcmp(mc.real, path) ? "resolved to " : "", mc.real,
+                 out->dom.unlisted);
+        return OK;
+    }
     if (out->dom.kind == SNAP_NONE) {
         snprintf(out->reason, sizeof(out->reason), "%s%.200s is on no ZFS dataset or btrfs pool the helper's "
                  "policy lists%s", strcmp(mc.real, path) ? "resolved to " : "", mc.real,

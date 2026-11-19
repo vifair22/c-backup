@@ -348,7 +348,7 @@ flowchart LR
 | Route | Purpose |
 |---|---|
 | `GET /repos/<id>/databases` | findings, filterable by scope, engine, coverage, state; paginated |
-| `GET /repos/<id>/databases/<f>` | one finding with evidence and history |
+| `GET /repos/<id>/databases/<f>` | one finding with evidence and history (the journal entries about it, 14.10) |
 | `POST /repos/<id>/databases/<f>/preview` | generated hook and probe result |
 | `POST /repos/<id>/databases/<f>/enable` | body `{"template":"pg-dumpall","params":{}}` |
 | `POST /repos/<id>/databases/<f>/dismiss` | body `{"reason":"..."}` |
@@ -924,3 +924,19 @@ looked at the flag.
 | A cancel stops the hook | The daemon reads a dump's pipe in 200 ms polls and gives up on the job's cancel; `stream_close` then sends `hook.wait` with `kill`, which the helper answers once the run has ended. An exec template's pre run is waited for the same way; its post run always finishes, since it undoes the pre (a maintenance mode is never left on). Policy hooks run inside `capture.begin` are not reached by a cancel: they keep their own policy timeouts |
 | Stopping a run | SIGTERM to the run's process group, SIGKILL `HOOK_KILL_GRACE_S` (3 s) later, sent from the helper's polls (`run_poll`) rather than slept through under the server's lock. A local run (the fake backend) is spawned into a group of its own; a Docker exec's process leads its own session under runc, and the group is remembered once found, so a member that outlives the exec's process still gets the SIGKILL; LXC's `lxc-attach` already had its own group. When the leader dies of the SIGTERM and a member ignored it, the rest of the group is killed then, since the run is over. A timed-out run follows the same sequence; its exit status is now the real one (143 for a SIGTERM) rather than a fixed 137 |
 | A plain wait beside a kill | The daemon abandons its plain `hook.wait` when it sends the kill, but the helper's thread for it is still polling the run; a plain wait that finds a cancelled run answers `invalid` and leaves the answer to the kill |
+
+### 14.10 A finding's history (B254)
+
+7.4 promised a finding "with evidence and history" and the route answered
+the timestamps only. The history is the journal's: every event about a
+finding is already journalled and names it, detection's as
+`... (finding N)` (found, coverage changed, and the one uncovered alert,
+which reaches the journal through its job's warning) and the decisions' as
+`finding N (...)` (enabled, dismissed, with the caller).
+
+| Point | As built |
+|---|---|
+| Where it comes from | `GET /repos/<id>/databases/<f>` reads the repository's journal for entries naming the finding either way, from its `first_seen` on (so the read stays on the `(repo_id, ts)` index), newest first |
+| No second copy | No events table: the journal is the permanent record and never pruned, so a table beside it could only disagree with it. A finding deleted and re-raised gets a new id (AUTOINCREMENT), so an old id's entries never join a new finding's history |
+| Bound | At most 50 entries, `history_truncated` when there were more; the full record stays in `GET /repos/<id>/journal` |
+| Shape | `{journal_id, ts, source, operation, result, message}`, the journal's own fields. The list route leaves `history` out |

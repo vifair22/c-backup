@@ -4385,7 +4385,15 @@ deduplicates.
 
 #### 22.5.6 Mounts on no snapshot domain: the two-pass read
 
-A running unit with `fallback-live` mounts is read in two passes:
+A running unit with `fallback-live` mounts is read in two passes. A mount
+in a ZFS dataset the helper's policy does not list in `zfs_domains` is one
+of them, and since that is usually a line missing from the policy rather
+than a mount that cannot be snapshotted, the unit's result and the job's
+warning name it:
+
+```
+unit immich: /mnt/cache/system/docker/volumes/pgdata/_data is in ZFS dataset cache/system, which the helper's policy does not list in [snapshot] zfs_domains: read without a snapshot (pause-read)
+```
 
 ```mermaid
 sequenceDiagram
@@ -5340,7 +5348,10 @@ path, confidence, coverage and `coverage_why`, method, suggestion,
 optional, evidence), its state, its history (`first_seen`, `last_seen`,
 `last_snap_id`, `alerted_at`) and the columns enabling and dismissing fill
 (`template`, `params`, `decided_by`, `decided_at`, `reason`), empty until
-then. The desktop app shows them as cards in a Databases view reached from
+then. `db show` adds `history`: the journal entries about the finding,
+newest first, at most 50 (`history_truncated` says when there were more):
+when it was found, each change of its coverage, its uncovered alert, and
+each enable and dismiss with who made it. The desktop app shows them as cards in a Databases view reached from
 the repository dashboard, grouped by unit and source and filterable by
 coverage, engine and state; the dashboard's button carries the number of
 uncovered findings not dismissed, and the backup dialog marks each source

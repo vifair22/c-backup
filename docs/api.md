@@ -1695,7 +1695,7 @@ routes.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/repos/<id>/databases` | Findings, paginated (`limit`, `offset`; 100, at most 1000), ordered by scope, path, engine and id, filtered exactly by `scope` (`unit:<unit key>` or `source:<path>`), `engine` (the vocabulary below), `coverage` (the coverage names, or `none` for not assessed) and `state` (`new`, `suggested`, `enabled`, `dismissed`). A value outside its set is a 400. Answers `{"findings":[...],"total":N}`, `total` counting every row the filters match |
-| GET | `/repos/<id>/databases/<f>` | One finding, the same fields. 404 for an id that is not this repository's |
+| GET | `/repos/<id>/databases/<f>` | One finding, the same fields, and its `history`: the journal entries about it, newest first, at most 50, each `{journal_id, ts, source, operation, result, message}` (found, coverage changed, the uncovered alert through its job's warning, enabled, dismissed), with `history_truncated` when there were more. 404 for an id that is not this repository's |
 
 Each finding:
 
