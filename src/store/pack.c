@@ -2346,7 +2346,7 @@ static int idx_offset_cmp(const void *a, const void *b) {
  * see it. Sorts idx_entries by hash afterwards; entry_index keeps the on-disk
  * order, which is what the parity trailer is indexed by.
  */
-static status_t seal_pack_file(store_t *store, FILE **dat_f,
+static status_t seal_pack_file(store_t *store, FILE **dat_f, const char *dat_tmp,
                                pack_dat_hdr_t *dat_hdr,
                                pack_idx_disk_entry_t *idx_entries,
                                uint32_t packed, stripe_enc_t *enc,
@@ -2389,7 +2389,9 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
         *out_size = (uint64_t)body_end + tsize;
     }
 
-    if (sync_latch_repo_fsync(store_root(store), fileno(*dat_f), "a staging pack") != 0) { st = set_error_errno(ERR_IO, "pack seal: sync the pack"); goto fail; }
+    /* Named, in the error and in the latch: Manual 17.7 promises the file,
+     * and "a staging pack" left an operator nothing to look at (B263). */
+    if (sync_latch_repo_fsync(store_root(store), fileno(*dat_f), dat_tmp) != 0) { st = set_error_errno(ERR_IO, "pack seal: sync %s", dat_tmp); goto fail; }
     /* A filesystem that defers write errors (NFS, FUSE) reports them here,
      * and a pack whose close failed is not known to hold its bytes. */
     {
@@ -2509,7 +2511,7 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
     status_t lst = sync_latch_repo_check(store_root(store), "pack seal");
     if (lst != OK) { unlink(dat_tmp); return lst; }
     uint64_t dat_size = 0;
-    status_t st = seal_pack_file(store, dat_f, dat_hdr, idx_entries,
+    status_t st = seal_pack_file(store, dat_f, dat_tmp, dat_hdr, idx_entries,
                                  packed, enc, &dat_size);
     if (st == OK) st = install_pack_file(store, dat_tmp, pack_num, &dat_size);
     if (st != OK) { unlink(dat_tmp); return st; }
@@ -4237,7 +4239,7 @@ static status_t pack_rw_seal(pack_rw_t *rw)
     }
     uint64_t size = 0;
     err_clear();   /* so a failure with no message of its own is told apart */
-    status_t st = seal_pack_file(rw->store, &rw->cur, &rw->hdr,
+    status_t st = seal_pack_file(rw->store, &rw->cur, rw->cur_tmp, &rw->hdr,
                                  rw->ents + rw->cur_first, rw->cur_n, NULL, &size);
     if (st != OK) {
         if (!err_msg()[0]) set_error(st, "pack rewrite: cannot seal an output");
