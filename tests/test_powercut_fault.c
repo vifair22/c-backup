@@ -1544,6 +1544,28 @@ static void return_dropped_pack(void)
     copy_file(DROPPED, p);
 }
 
+/*
+ * Nothing a dead writer staged is left once gc has run: gc holds the
+ * repository's write lock and tmp/'s claim, so whatever the cut left in
+ * the staging directories is a dead writer's, and its age-free sweep is
+ * the cleanup. A power cut while coalescing left tmp/packids.* behind that
+ * no gc removed (B237). tags.* is the tag mirror's, written under neither
+ * lock, so only the hour rule may remove it.
+ */
+static void check_no_staging_left(const char *sub)
+{
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), H_REPO "/%s", sub);
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.' || strncmp(e->d_name, "tags.", 5) == 0) continue;
+        violation("%s/%s is left after gc", sub, e->d_name);
+    }
+    closedir(d);
+}
+
 static void start_and_check(void)
 {
     cutils_db_t *db = NULL;
@@ -1606,6 +1628,8 @@ static void start_and_check(void)
         violation("gc after the start fails: %s", err_msg());
     check_rows(db, 1);
     check_no_stray_packs(db, H_REPO "/packs");
+    check_no_staging_left("tmp");
+    check_no_staging_left(STORE_PACK_STAGING);
     check_snapshots(db);
     check_restores(st, db);
     if (g_deep) deep_checks(st, db, &g);
