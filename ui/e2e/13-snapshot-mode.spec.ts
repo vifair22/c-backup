@@ -39,7 +39,7 @@ test('backup dialog: a source set to strict snapshot mode is saved and shown', a
   await expect(h.page.getByText('snapshot: strict').first()).toBeVisible()
   const listed = JSON.parse(cli(h.sock, ['sources', 'list', String(h.repos.plain)]))
   expect(listed.snapshot).toEqual([{ path: source, mode: 'strict' }])
-  await h.page.screenshot({ path: 'test-results/11-snapshot-strict-dialog.png', fullPage: true })
+  await h.page.screenshot({ path: 'test-results/13-snapshot-strict-dialog.png', fullPage: true })
 })
 
 test('job view: a strict source with no snapshot fails the backup and says what to do', async () => {
@@ -47,7 +47,7 @@ test('job view: a strict source with no snapshot fails the backup and says what 
   await expect(h.page.getByText('strict snapshot mode', { exact: false }).first()).toBeVisible({ timeout: 20_000 })
   await expect(h.page.getByText('no helper is configured', { exact: false }).first()).toBeVisible()
   await expect(h.page.getByTestId('snapshot-strict-hint').first()).toBeVisible()
-  await h.page.screenshot({ path: 'test-results/11-snapshot-strict-refusal.png', fullPage: true })
+  await h.page.screenshot({ path: 'test-results/13-snapshot-strict-refusal.png', fullPage: true })
   await h.page.getByRole('button', { name: /back/i }).first().click()
 })
 
@@ -59,7 +59,7 @@ test('job view: a warn source is read live and the job lists it with the reason'
   await expect(panel).toBeVisible({ timeout: 20_000 })
   await expect(panel).toContainText(source)
   await expect(panel).toContainText('no helper is configured')
-  await h.page.screenshot({ path: 'test-results/11-snapshot-warn-live.png', fullPage: true })
+  await h.page.screenshot({ path: 'test-results/13-snapshot-warn-live.png', fullPage: true })
   await h.page.getByRole('button', { name: /back/i }).first().click()
 })
 
@@ -106,6 +106,6 @@ test('backup dialog: a long source path gives way to its snapshot badge (Demo L2
   await expect(longPath).toHaveAttribute('title', long)
   expect(await longPath.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true)
   expect(await longPath.evaluate(el => getComputedStyle(el).textOverflow)).toBe('ellipsis')
-  await h.page.screenshot({ path: 'test-results/11-snapshot-long-source.png', fullPage: true })
+  await h.page.screenshot({ path: 'test-results/13-snapshot-long-source.png', fullPage: true })
   await h.page.getByRole('button', { name: /^cancel$/i }).first().click()
 })
