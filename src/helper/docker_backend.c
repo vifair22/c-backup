@@ -1591,7 +1591,7 @@ static status_t probe_member(struct sp_ctx *c, const member_t *m, sp_probe_conta
     if (!pm || !rec || !mc) st = set_error(ERR_NOMEM, "docker: probe");
     const cJSON *mnt;
     cJSON_ArrayForEach(mnt, mounts) {
-        if (st != OK || !pc->running) break;
+        if (st != OK) break;
         const char *dest = jstr(mnt, "Destination");
         if (!helper_path_clean(dest)) continue;
         pm[k].dest = dest;
@@ -1602,6 +1602,7 @@ static status_t probe_member(struct sp_ctx *c, const member_t *m, sp_probe_conta
         err_clear();
         k++;
     }
+    if (st == OK) st = probe_mounts(pc, pm, k, truncated);
     if (st == OK && pc->running) {
         st = proc_probe_container(c->pol->proc_root, pid, pm, k, pc, truncated);
         if (st == ERR_NOT_FOUND) { pc->running = 0; err_clear(); st = OK; }  /* stopped meanwhile */

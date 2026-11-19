@@ -126,7 +126,9 @@ static cJSON *captures_array(const db_captures_t *c)
             cJSON_AddStringToObject(o, "reason", x->info.res.reason[0] ? x->info.res.reason
                                                                        : "not attempted");
         }
-        cJSON_AddStringToObject(o, "journal_mode", x->info.res.wal ? "wal" : "rollback");
+        cJSON_AddStringToObject(o, "journal_mode", x->info.attempted
+                                                        ? sqlite_copy_journal_name(x->info.res.wal)
+                                                        : "unknown");
         cJSON_AddStringToObject(o, "settle",
                                 db_detect_was_unsettled(c->detect, x->path) ? "unsettled" : "settled");
     }

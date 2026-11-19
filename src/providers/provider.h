@@ -343,6 +343,10 @@ typedef struct {
  * ports it listens on in its own network namespace, and the files under
  * the unit's included mounts that a process holds open for writing, as
  * recorded paths. Nothing outside the included mounts is ever named.
+ * And its mounts as the container sees them: each destination, with the
+ * path the unit records it at, or none for a mount the unit does not back
+ * up, so a link inside the data that names a container path can be judged
+ * (db-detection.md 14.7). An excluded mount's host source is never sent.
  * Bounded: a probe that had more than fits sets truncated and lists what
  * did. Read-only, and never a reason to fail a backup.
  */
@@ -355,6 +359,7 @@ typedef struct {
 #define SP_PROBE_PROCS_MAX      32    /* per container */
 #define SP_PROBE_PORTS_MAX      32    /* per container */
 #define SP_PROBE_OPEN_MAX       128   /* per container */
+#define SP_PROBE_MOUNTS_MAX     64    /* per container */
 
 typedef struct {
     char comm[SP_PROBE_COMM_MAX];
@@ -365,6 +370,11 @@ typedef struct {
     char *path;                       /* recorded path, absolute */
     char  comm[SP_PROBE_COMM_MAX];    /* the process holding it */
 } sp_probe_open_t;
+
+typedef struct {
+    char *dest;                       /* where the container sees it */
+    char *recorded;                   /* where the unit records it; NULL: not backed up */
+} sp_probe_mount_t;
 
 typedef struct {
     char             name[SP_PROBE_NAME_MAX];
@@ -378,6 +388,8 @@ typedef struct {
     size_t           n_ports;
     sp_probe_open_t *open;
     size_t           n_open;
+    sp_probe_mount_t *mounts;
+    size_t           n_mounts;
 } sp_probe_container_t;
 
 typedef struct {

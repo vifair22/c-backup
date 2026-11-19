@@ -427,6 +427,41 @@ static void test_refusals(void **state)
     nbd_server_stop(s);
 }
 
+/* A reader refused by a limit (B256): the client is told which key, as
+ * Manual 22.8 says; any other open failure stays in the daemon log. */
+static status_t open_status = OK;
+static status_t gated_open(void *ctx, void **reader, uint64_t *size)
+{
+    if (open_status == ERR_BUSY)
+        return set_error(ERR_BUSY, "export 7: 4 connections are open across every export, "
+                         "the limit (vm.export_max_conns)");
+    if (open_status != OK)
+        return set_error(open_status, "export 7: cannot open /secret/repo/path");
+    return mem_open(ctx, reader, size);
+}
+
+static void test_open_refusal(void **state)
+{
+    (void)state;
+    unlink(SOCK);
+    nbd_server_opts_t o = { SOCK, NAME, MEM_SIZE,
+                            { gated_open, mem_read, mem_extents, mem_close, NULL, NULL }, 0 };
+    nbd_server_t *s = NULL;
+    assert_int_equal(nbd_server_start(&o, &s), OK);
+    open_status = ERR_BUSY;
+    assert_null(connect_as(NAME, 1));
+    assert_non_null(strstr(err_msg(), "vm.export_max_conns"));
+    open_status = ERR_CORRUPT;
+    assert_null(connect_as(NAME, 1));
+    assert_non_null(strstr(err_msg(), "see the daemon log"));
+    assert_null(strstr(err_msg(), "/secret"));
+    open_status = OK;
+    nbd_client_t *c = connect_as(NAME, 1);
+    assert_non_null(c);
+    nbd_close(c);
+    nbd_server_stop(s);
+}
+
 /* The connection cap, and stopping with clients still connected. */
 static void test_limits_and_stop(void **state)
 {
@@ -627,6 +662,7 @@ int main(void)
         cmocka_unit_test(test_unaligned_holes),
         cmocka_unit_test(test_refusals),
         cmocka_unit_test(test_limits_and_stop),
+        cmocka_unit_test(test_open_refusal),
         cmocka_unit_test(test_content_reader),
     };
     return cmocka_run_group_tests_name("nbd_server", tests, setup, teardown);

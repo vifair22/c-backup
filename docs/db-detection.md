@@ -263,7 +263,7 @@ from `/dev/null`, every PostgreSQL tool runs with `-w`, and a template that
 would give a tool half a credential (`mongodump` with a user and no
 password) is not started. A credential that is missing or wrong fails the
 run at once, and the job's warning (and a preview's `probe.credentials`)
-names the template and how to give its engine the credential (14.7).
+names the template and how to give its engine the credential (14.9).
 
 The 1.0 catalog:
 
@@ -731,7 +731,7 @@ design left open or sketched differently:
 | Unchanged files | `file_cache.db_head` (migration 011) keeps the classification of each file read; a cache hit uses it. The upsert resets it when a file changes. A file unchanged since before detection existed is not classified until it changes; directory engines are found by names regardless |
 | unit.json | Stored after the unit's trees (`backup_synth_t.late`), so `databases` can say what reading them found. Additive: version stays 1 |
 | Unit coverage | From each tree item's capabilities and the session: a snapshot-domain tree read from the snapshot is atomic; a fallback tree is paused when begin held the pause and the watchdog did not let it go, live otherwise. At `crash` or better the provider guarantees one instant; below it each tree counts as its own instant, conservative for several datasets of one pool |
-| Links in containers | A tablespace, `pg_wal` or `journal` link inside a container names a container path, not a recorded one, so in a unit it is listed `unchecked` and not judged. File sources check it: the target must be a scanned tablespace (`PG_<v>_<cat>/`), WAL (`archive_status/`) or journal (`WiredTigerLog.*`) directory under a captured root, or the finding is `split` |
+| Links in containers | A tablespace, `pg_wal` or `journal` link inside a container names a container path, not a recorded one; it is followed through the probe's mounts (14.7, B245), and listed `unchecked` only without them. File sources check it: the target must be a scanned tablespace (`PG_<v>_<cat>/`), WAL (`archive_status/`) or journal (`WiredTigerLog.*`) directory under a captured root, or the finding is `split` |
 | Names only where a header is unknown | A header decides when the backup read one. Without one (the cache vouched), directory layouts are judged by names; single-file engines (SQLite, RDB, bbolt) never are. `data.mdb` and `CURRENT` that were read and are not LMDB or a MANIFEST pointer veto their directory |
 | Prometheus | `queries.active` stands in for block directories, which a server younger than two hours does not have yet |
 | MyISAM and Aria | Counted for `engine-unsafe` only outside `mysql/`, `performance_schema/` and `sys/`: MariaDB's own system tables are Aria on every install |
@@ -777,12 +777,12 @@ enabled template (`src/units/unit_backup.c`, `src/providers/remote_provider.c`).
 | Exec templates | Run by the daemon through `hook.run` and `hook.wait`, the pre run before `capture.begin` and the post run after it returns, or fails, so a maintenance mode is never left on. `capture.begin` is unchanged. `needs_quiesce` forces no pause: `nextcloud-maintenance`'s effect lasts until its own post run |
 | Output names | `.cbackup-unit/hooks/<template>.dump` and `.log` (pinned); a second finding of one unit enabling the same template gets `<template>-<finding>` |
 | A dump that cannot start | The helper refusing it (the policy changed since enable, the container stopped) is a failed dump, an empty stream with the reason in its log, never a failed unit |
-| Coverage | A stored dump makes a live finding `covered-application` whatever the capture was; an exec template lifts only `covered-crash` and `covered-quiesced`. The unit's own level is the helper's, unchanged |
+| Coverage | A stored dump makes a live finding `covered-application` whatever the capture was; an exec template lifts only `covered-crash` and `covered-quiesced`. The unit's own level follows its findings (14.8, B246) |
 | unit.json | A database entry gains `template` `{name, ok, dump}`, additively (version stays 1) |
 | mariadb-dump's `lock_tables` | Replaces `--single-transaction` with `--lock-tables`: `LOCK TABLES` commits any open transaction, so the two do not combine |
 | One tool, two names | The scripts pick `mariadb-dump` or `mysqldump`, `redis-cli` or `valkey-cli`, whichever the image has; occ is looked for where the official and linuxserver images keep it |
 | Timeouts | Dumps 6 hours, exec templates 10 minutes, probes 30 s |
-| Preview's default | The finding's suggestion, else what is enabled, else the engine's first template the default policy allows (a covered finding names its dump only as `optional`) |
+| Preview's default | What is enabled, else the finding's suggestion, else the engine's first template the default policy allows (a covered finding names its dump only as `optional`). A file source's SQLite finding with nothing enabled previews `sqlite-backup`, its only engine copy, whatever was suggested (B260: a dormant one, which has no suggestion, answered 400) |
 | Not built | The estimated size from the engine's own size query (7.3): no probe reports one yet. The real-engines CI job has no network, so 11.2's `db-fixtures` engines are not run there; templates are tested through the fake backend with stand-in tools |
 | The UI buttons | Left to follow D1's cards |
 
@@ -847,11 +847,50 @@ database by its plain path, and is still a transactional copy of one commit.
 | No `-wal` (or an empty one with no `-shm`) | No WAL connection is open, so the main file is the whole database: `immutable=1`, which takes no locks and opens no siblings. A connection that opens meanwhile must create the missing file and cannot remove it while the lock is held, so the copy checks both siblings are as they were afterwards and tries again if not (a retry like a busy one, three then abandoned); only then could a checkpoint have written under it |
 | Commits in `-wal`, no `-shm` | Refused: `immutable=1` would not see them and any other read creates a `-shm`. Only a crashed writer leaves this; the raw read stands |
 | Rollback journal | Opened read-only by path as before (its readers create nothing, and SQLite's locks keep a hot journal right); a stray `-wal` beside one with no `-shm` is refused like the WAL case |
+| The journal mode reported | Read from the database header before anything else, so a refused copy says `wal` or `rollback` as the header does, and `unknown` for a file with no SQLite header or none read (B259: a refused WAL copy said `rollback`) |
 | Not from the source snapshot | A source read from a ZFS or btrfs snapshot (9.4) is already `covered-crash`; the copy still reads the live path, now without changing it |
 | Leftovers | `-wal` and `-shm` files earlier builds left are not removed: the backup does not write the source. They are read through, and go when the application next closes the database cleanly |
 | Tests | `tests/test_db_capture.c`: the source directory byte-, listing- and mtime-identical (the directory's own mtime included) around a copy of a dormant WAL database, one with leftover siblings, a rollback database, a WAL database a writer in another process holds with commits in its `-wal`, and a crashed writer's; and around two whole backups with engine copies, the second reading as many files as the first |
 
-### 14.7 Templates never prompt; a cancel stops a hook (B248)
+### 14.7 Links out of a unit's capture (B245)
+
+A PostgreSQL whose `pg_wal` was a symlink to `/wal`, a bind of a disk path
+outside every include root, was judged `covered-crash` with the link
+`unchecked`: the daemon only had container paths for the link and
+recorded paths for the data. A restore of it has no WAL. Decided:
+`units.probe` carries each container's mounts, destination and recorded
+path (`null` when the unit does not back it up), and the detector follows
+the link.
+
+| Point | As built |
+|---|---|
+| The wire | `mounts:[{dest, recorded}]` per container, at most 64, built from the same mount classification the probe's open files use (Docker's inspect `Mounts`, LXC's config with the rootfs at `/`). An excluded mount's host source is never sent: only its destination, which is a container path. Listed for a stopped container too. Shed after processes when the packet is full |
+| The container | The one whose backed-up mount holds the finding's data (longest recorded prefix). The target is judged against that container's mounts only |
+| A target on a mount the unit does not back up | `split`, link `found: "outside the capture"` with `why` |
+| A target on no mount (Docker's image layers) | `split`, likewise: a container unit backs up its mounts, never its writable layer |
+| A target on a backed-up mount | Mapped to its recorded path (evidence `recorded`) and judged as a file source's link: the WAL, tablespace or journal directory must have been scanned under a root of this capture, and its root's instant counts toward `split` |
+| No mounts from the probe | `unchecked`, as before: a helper older than this, a probe that failed, or a packet that shed them. Never a guess |
+| Suggestion | A unit split by a link outside its capture suggests the engine's dump (`pg-dumpall`), not `pause-always`: a pause joins instants, it cannot add files the unit does not read (6). Split by instants alone still suggests `pause-always`. A file source keeps `source-snapshot` |
+| Tests | `tests/test_db_detect.c`: a file source's WAL on disk but outside every root; a unit's `/wal` on an excluded bind, on a backed-up mount outside the capture, inside it at one instant and at two, on no mount, and with no mounts; `tests/test_unit_probe.c`: the wire and the helper's mount list |
+
+### 14.8 A unit's level from its templates (B246)
+
+The templates were run by the daemon, outside the helper's capture, so the
+unit's level stayed the helper's: a unit whose `pg-dumpall`,
+`prometheus-snapshot` or `nextcloud-maintenance` ran and covered its
+database stayed `crash`, though the Manual says pre hooks that all exit 0
+make a container unit `application`. Decided: a template is the
+application taking part, as a pre hook is, and the unit's level is derived
+from its findings.
+
+| Point | As built |
+|---|---|
+| The rule | The capture reached one instant (`crash` or `quiesced`); the unit has at least one live finding; every live finding is `covered-application` by its own enabled template, which did its part (the dump stored, or the exec template's pre run exited 0). Then `application` |
+| Not raised | A capture below one instant (a dump makes its own finding `covered-application` whatever the capture, but the rest of the unit's files are still torn); a live database with no template; a template that failed; `offline` and `application` are already at or above it |
+| Where | `templates_raise` in `src/units/unit_backup.c`, after the findings are judged: `unit.json`'s `consistency` (and so the snapshot's unit index) and the job result's `consistency` |
+| Tests | `tests/test_helper_e2e.sh`: `pg-dumpall` (a dump) raises `quiesced` to `application` and a failed dump does not; `prometheus-snapshot` (an exec template with a post run) raises it and a failed pre run does not |
+
+### 14.9 Templates never prompt; a cancel stops a hook (B248)
 
 `pg-basebackup` ran `pg_basebackup` without `-w`; under scram auth it
 waited on a password prompt nobody could answer, so the unit backup sat in

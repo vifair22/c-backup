@@ -94,7 +94,9 @@ static const char *k_full =
     "{\"name\":\"pg\",\"image\":\"postgres:16\",\"running\":true,\"aliases\":[\"pg\",\"db\",\"pg\"],"
     "\"processes\":[{\"comm\":\"postgres\",\"args\":\"postgres -c x=1\"},{\"comm\":\"sh\",\"args\":\"\"}],"
     "\"ports\":[5432,8080,5432],"
-    "\"open_write\":[{\"path\":\"/mnt/cache/appdata/pg/base/1/2619\",\"comm\":\"postgres\"}]},"
+    "\"open_write\":[{\"path\":\"/mnt/cache/appdata/pg/base/1/2619\",\"comm\":\"postgres\"}],"
+    "\"mounts\":[{\"dest\":\"/var/lib/postgresql/data\",\"recorded\":\"/mnt/cache/appdata/pg\"},"
+    "{\"dest\":\"/wal\",\"recorded\":null}]},"
     "{\"name\":\"web\",\"running\":false}"
     "],\"truncated\":false}";
 
@@ -117,10 +119,17 @@ static void test_round_trip(void **state)
     assert_int_equal(c->ports[1], 8080);
     assert_int_equal(c->n_open, 1);
     assert_string_equal(c->open[0].comm, "postgres");
+    /* Mounts (B245): a destination, and where it is recorded or null. */
+    assert_int_equal(c->n_mounts, 2);
+    assert_string_equal(c->mounts[0].dest, "/var/lib/postgresql/data");
+    assert_string_equal(c->mounts[0].recorded, "/mnt/cache/appdata/pg");
+    assert_string_equal(c->mounts[1].dest, "/wal");
+    assert_null(c->mounts[1].recorded);
     /* Optional keys absent: empty. */
     assert_string_equal(p->v[1].image, "");
     assert_false(p->v[1].running);
-    assert_int_equal(p->v[1].n_procs + p->v[1].n_ports + p->v[1].n_open + p->v[1].n_aliases, 0);
+    assert_int_equal(p->v[1].n_procs + p->v[1].n_ports + p->v[1].n_open + p->v[1].n_aliases +
+                     p->v[1].n_mounts, 0);
 
     cJSON *o = sp_unit_probe_to_json(p, 65536);
     assert_non_null(o);
@@ -185,6 +194,13 @@ static void test_refusals(void **state)
         { "{\"containers\":[{\"name\":\"x\",\"running\":true,\"open_write\":[{\"path\":\"/a/\"}]}]}", "open_write[0].path" },
         { "{\"containers\":[{\"name\":\"x\",\"running\":true,\"open_write\":[\"/a\"]}]}", "open_write[0]" },
         { "{\"containers\":[{\"name\":\"x\",\"running\":true,\"open_write\":[{\"path\":\"/a\",\"comm\":7}]}]}", "open_write[0].comm" },
+        { "{\"containers\":[{\"name\":\"x\",\"running\":true,\"mounts\":{}}]}", "containers[0].mounts" },
+        { "{\"containers\":[{\"name\":\"x\",\"running\":true,\"mounts\":[\"/a\"]}]}", "mounts[0]" },
+        { "{\"containers\":[{\"name\":\"x\",\"running\":true,\"mounts\":[{\"recorded\":null}]}]}", "mounts[0].dest" },
+        { "{\"containers\":[{\"name\":\"x\",\"running\":true,\"mounts\":[{\"dest\":\"/a/../b\",\"recorded\":null}]}]}", "mounts[0].dest" },
+        { "{\"containers\":[{\"name\":\"x\",\"running\":true,\"mounts\":[{\"dest\":\"/a\",\"recorded\":\"rel\"}]}]}", "mounts[0].recorded" },
+        { "{\"containers\":[{\"name\":\"x\",\"running\":true,\"mounts\":[{\"dest\":\"/a\",\"recorded\":1}]}]}", "mounts[0].recorded" },
+        { "{\"containers\":[{\"name\":\"x\",\"running\":true,\"mounts\":[{\"dest\":\"/a\"}]}]}", "mounts[0].recorded" },
         { b1, "containers[0].name" },
         { b2, "containers[0].image" },
         { b3, "processes[0].comm" },
@@ -454,6 +470,16 @@ static void test_proc_synthetic(void **state)
     assert_int_equal(proc_probe_container(PROC, 0, k_mounts, 3, &g, &truncated), ERR_INVALID);
     err_clear();
 
+    /* The mounts as the container sees them, an excluded one with no
+     * recorded path and never its host source (B245). */
+    assert_int_equal(probe_mounts(&c, k_mounts, 3, &truncated), OK);
+    assert_int_equal(c.n_mounts, 3);
+    assert_string_equal(c.mounts[0].dest, DATA);
+    assert_string_equal(c.mounts[0].recorded, "/mnt/cache/appdata/pg");
+    assert_string_equal(c.mounts[1].dest, DATA "/excl");
+    assert_null(c.mounts[1].recorded);
+    assert_false(truncated);
+
     /* What the helper answers from it parses on the daemon's side (the
      * backend names the container). */
     snprintf(c.name, sizeof(c.name), "pg");
@@ -465,6 +491,8 @@ static void test_proc_synthetic(void **state)
     sp_unit_probe_t *back = NULL;
     assert_int_equal(sp_unit_probe_from_json(o, &back), OK);
     assert_int_equal(back->v[0].n_open, 5);
+    assert_int_equal(back->v[0].n_mounts, 3);
+    assert_null(back->v[0].mounts[2].recorded);
     cJSON_Delete(o);
     sp_unit_probe_free(back);
     sp_unit_probe_free(pw);

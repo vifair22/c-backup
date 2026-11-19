@@ -379,16 +379,23 @@ environment variable or an fd's contents, and never opens what an fd
 points to: only regular files under `/proc` are read, without following
 links or blocking, and a process that exits mid-scan is skipped. Each
 container lists at most 32 processes, 32 ports, 8 aliases and 128 open
-files; a unit at most 32 containers. Past a bound, or past what fits in
-one packet, the answer is cut (open files from the end first, then
-processes) and `truncated` is true.
+files; a unit at most 32 containers. Each container also lists its mounts
+as it sees them, at most 64: the destination, and the path the unit
+records it at, or `null` for a mount the unit does not back up (an
+excluded mount's host source is never sent), so the daemon can follow a
+`pg_wal`, tablespace or journal link inside the data (`db-detection.md`
+14.7). A stopped container lists its mounts too. Past a bound, or past
+what fits in one packet, the answer is cut (open files from the end
+first, then processes, then mounts) and `truncated` is true.
 
 ```json
 {"containers":[{"name":"pg","image":"postgres:16","running":true,
                 "aliases":["pg","db"],
                 "processes":[{"comm":"postgres","args":"postgres -D /data"}],
                 "ports":[5432],
-                "open_write":[{"path":"/mnt/cache/appdata/pg/base/1/2619","comm":"postgres"}]}],
+                "open_write":[{"path":"/mnt/cache/appdata/pg/base/1/2619","comm":"postgres"}],
+                "mounts":[{"dest":"/var/lib/postgresql/data","recorded":"/mnt/cache/appdata/pg"},
+                          {"dest":"/wal","recorded":null}]}],
  "truncated":false}
 ```
 
@@ -610,7 +617,7 @@ stdout comes back as the pipe fd a policy dump hook's does; the run is waited
 for with `hook.wait` as any other; `hook.wait` with `kill` stops a run
 first, SIGTERM to its process group and SIGKILL 3 s later, which is how a
 cancelled job ends a dump that would otherwise run to its timeout (B248).
-No template prompts: see `db-detection.md` 14.7. `user` comes from the catalog
+No template prompts: see `db-detection.md` 14.9. `user` comes from the catalog
 (`nextcloud-maintenance` as `www-data`); the fake backend runs a template as
 a local process found on the helper's `PATH`, which is how the suites run
 them. A provider with no container (libvirt) refuses templates as
