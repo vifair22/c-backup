@@ -385,6 +385,7 @@ static status_t x_unit_probe(sp_ctx_t *c, const char *unit_id, sp_unit_probe_t *
         pc->n_aliases = 1;
         w->c = c;
         st = walk_config(cfg, unit_id, probe_entry, w);
+        if (st == OK) st = probe_mounts(pc, w->pm, w->n, &p->truncated);
     }
     int pid = st == OK ? init_pid(c, unit_id) : 0;
     if (pid > 0) {

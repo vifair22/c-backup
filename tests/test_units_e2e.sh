@@ -207,6 +207,10 @@ lacks    "without its name" "$ENAME" "$OUT"
 OUT=$(cb snapshot delete 1 1 --force 2>&1); RC=$?
 check    "the exported snapshot cannot be deleted, even forced" 1 "$RC"
 contains "and says why" "is exported" "$OUT"
+# B255: a conflict with the export, not a server fault.
+check    "the refusal is a 409" 409 \
+         "$(curl -s -o "$WORK/del.out" -w '%{http_code}' --unix-socket "$SOCK" -X DELETE 'http://x/repos/1/snapshots/1?force=1')"
+contains "naming the export" "(export $EID)" "$(cat "$WORK/del.out")"
 GJ=$(cb gc 1 --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
 sleep 1.5
 OUT=$(cb jobs "$GJ")
@@ -256,6 +260,22 @@ contains "an export ends with the daemon" '"close_reason":"daemon stopped"' "$(c
 EID3=$(cb vm export 1 1 vda | jget export_id)
 sleep 4
 contains "an export nobody uses closes when idle" '"close_reason":"idle"' "$(cb vm export-show "$EID3")"
+# B257: a daemon killed outright never unlinks its sockets; the next start
+# removes them, and only them.
+EID5=$(cb vm export 1 1 vda | jget export_id)
+check    "an export's socket is there" "yes" "$([ -S "$WORK/ex/$EID5.sock" ] && echo yes || echo no)"
+kill -9 "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null
+check    "a SIGKILL leaves it behind" "yes" "$([ -S "$WORK/ex/$EID5.sock" ] && echo yes || echo no)"
+: > "$WORK/ex/998.sock"
+# Its API socket is left too, and start_daemon waits for that path to be a
+# socket: without this it would return before the new daemon is up.
+rm -f "$SOCK"
+start_daemon
+check    "the next start removes the stale socket" "no" "$([ -e "$WORK/ex/$EID5.sock" ] && echo yes || echo no)"
+check    "and leaves what is not a socket" "yes" "$([ -f "$WORK/ex/998.sock" ] && echo yes || echo no)"
+contains "the export is closed as restarted" '"close_reason":"daemon restarted"' "$(cb vm export-show "$EID5")"
+contains "and the start says what it swept" "removed 1 stale export socket" "$(cat "$WORK/daemon.log")"
+rm -f "$WORK/ex/998.sock"
 
 echo "reserved names"
 OUT=$(cb backup 1 /.cbackup-unit 2>&1); RC=$?

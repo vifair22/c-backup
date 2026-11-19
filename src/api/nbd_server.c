@@ -185,14 +185,17 @@ static int name_ok(const nbd_server_t *s, const uint8_t *name, uint32_t n)
     return diff == 0;
 }
 
+/* -1: cannot be read, the reason in the log only; -2: refused by a limit,
+ * whose message (it names the key) is the client's to see. */
 static int open_reader(conn_t *c)
 {
     if (c->reader) return 0;
     uint64_t size = 0;
-    if (c->s->o.ops.open(c->s->o.ops.ctx, &c->reader, &size) != OK) {
+    status_t st = c->s->o.ops.open(c->s->o.ops.ctx, &c->reader, &size);
+    if (st != OK) {
         log_warn("nbd export: cannot open the snapshot's disk: %s", err_msg());
         c->reader = NULL;
-        return -1;
+        return st == ERR_BUSY ? -2 : -1;
     }
     c->size = size;
     return 0;
@@ -244,8 +247,14 @@ static int info_opt(conn_t *c, uint32_t opt, const uint8_t *d, uint32_t len)
     uint16_t ni = get16(d + 4 + nl);
     if ((uint32_t)ni * 2u != len - 6 - nl) return opt_error(fd, opt, REP_ERR_INVALID, "bad info list");
     if (!name_ok(c->s, d + 4, nl)) return opt_error(fd, opt, REP_ERR_UNKNOWN, "no such export");
-    if (opt == OPT_GO && open_reader(c) != 0)
-        return opt_error(fd, opt, REP_ERR_INVALID, "the export cannot be read; see the daemon log");
+    if (opt == OPT_GO) {
+        /* A limit's refusal says which key it is (B256); anything else
+         * may name repository paths, so it stays in the daemon log. */
+        int o = open_reader(c);
+        if (o == -2) return opt_error(fd, opt, REP_ERR_POLICY, err_msg());
+        if (o != 0)
+            return opt_error(fd, opt, REP_ERR_INVALID, "the export cannot be read; see the daemon log");
+    }
     uint8_t ex[12];
     put16(ex, INFO_EXPORT);
     put64(ex + 2, c->s->o.size);

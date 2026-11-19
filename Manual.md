@@ -218,8 +218,10 @@ for cancellation between files and inside one: storing and restoring a file
 both stop within one object of at most 16 MiB, so a multi-gigabyte file in
 progress does not hold up the shutdown. A backup whose snapshot record is
 already written when the stop arrives stops indexing it too: the job ends
-`cancelled`, the log says the snapshot was written and is not yet indexed,
-and the next start's reconcile indexes it (section 17.5). A user's
+`cancelled`, its error and journal entry say which snapshot was written and
+that the next start indexes it, its `result` is
+`{"snapshot_id":N,"indexed":false}`, and the next start's reconcile indexes
+it (section 17.5). A user's
 `jobs cancel` at that point lets the index finish instead, since the
 snapshot is complete.
 
@@ -4757,10 +4759,15 @@ The copy is sparse where the snapshot has holes and byte-identical to a
   disconnects every client; removing the repository (`repo remove`) revokes
   its exports first; a daemon stop closes all. `vm export-show <id>`
   shows a closed one's `close_reason`: `revoked`, `expired`, `idle`,
-  `repository removed`, `daemon stopped`, `daemon restarted`.
+  `repository removed`, `daemon stopped`, `daemon restarted`. A daemon
+  killed outright (SIGKILL, a crash) cannot remove its sockets; the next
+  start removes every `<id>.sock` in `vm.export_dir` that nothing answers
+  on, and says how many in the log.
 - **Connections and memory.** `vm.export_max_conns` (default 4) caps
-  connections across every export; one past it is refused, naming the key,
-  and 0 turns exports off. Each connection holds at most one verified
+  connections across every export; one past it is refused at the NBD
+  handshake with a message naming the key (`... the limit
+  (vm.export_max_conns)`), which `qemu-img` and `qemu-nbd` print, and 0
+  turns exports off. Each connection holds at most one verified
   object, up to 16 MiB, of `jobs.read_budget_mb` while it reads, and lets it
   go after a second idle; `vm exports` shows each export's `cache_bytes`.
   The daemon refuses to start unless `jobs.read_budget_mb` >=
@@ -4948,14 +4955,19 @@ A plain file source is read live, so every live database in one is
 when the unit achieved `crash` or better the provider guarantees one
 instant for all of it (container-backup 6.4), and below that each mount is
 counted as its own instant. The links inside a container's data name
-container paths, not the recorded ones, so in a unit they are listed as
+container paths; the helper's probe reports the container's mounts, so a
+link is followed to where the unit records it, and one into a mount the
+unit does not back up (an excluded bind) or into the container's own
+filesystem makes the finding `split`, with the link's `why` in its
+evidence. Only with no probe answer for the container is a link listed
 `unchecked` rather than judged.
 
 Each live finding carries what would help, as a name: a dump template for a
 unit (`pg-dumpall`, `mariadb-dump`, `redis-rdb`, `mongodump`, `sqlite-backup`,
 `influx2-backup`, `prometheus-snapshot`), `sqlite-backup` (an online-backup
 copy by the daemon) or `source-snapshot` for a file source, `pause-always`
-for a split unit, `exclude-rebuild` for a search index, `group-units` for a
+for a unit split across instants and the engine's dump for one with files
+outside the capture (a pause cannot bring them in), `exclude-rebuild` for a search index, `group-units` for a
 Nextcloud whose database is in another unit. A covered
 PostgreSQL, MySQL or MongoDB in a unit also names its dump as `optional`,
 for portability across major versions.
@@ -5149,7 +5161,8 @@ tables for MariaDB, `PING` for Redis, `sqlite3 -version`, the admin API's
 flags for Prometheus, `php occ status` for Nextcloud. `verified` is true when
 the probe exited 0. An unverified template still enables; the preview only
 says so. With no `--template`, a preview shows the finding's suggestion, or
-what is enabled, or for a covered finding the engine's default dump.
+what is enabled, or for a covered finding the engine's default dump; a file
+source's SQLite finding always previews `sqlite-backup`, its one engine copy.
 
 **Enable** (`POST /repos/<id>/databases/<f>/enable`, body
 `{"template":"pg-dumpall","params":{}}`) records the template and its
