@@ -769,7 +769,7 @@ enabled template (`src/units/unit_backup.c`, `src/providers/remote_provider.c`).
 | Exec templates | Run by the daemon through `hook.run` and `hook.wait`, the pre run before `capture.begin` and the post run after it returns, or fails, so a maintenance mode is never left on. `capture.begin` is unchanged. `needs_quiesce` forces no pause: `nextcloud-maintenance`'s effect lasts until its own post run |
 | Output names | `.cbackup-unit/hooks/<template>.dump` and `.log` (pinned); a second finding of one unit enabling the same template gets `<template>-<finding>` |
 | A dump that cannot start | The helper refusing it (the policy changed since enable, the container stopped) is a failed dump, an empty stream with the reason in its log, never a failed unit |
-| Coverage | A stored dump makes a live finding `covered-application` whatever the capture was; an exec template lifts only `covered-crash` and `covered-quiesced`. The unit's own level is the helper's, unchanged |
+| Coverage | A stored dump makes a live finding `covered-application` whatever the capture was; an exec template lifts only `covered-crash` and `covered-quiesced`. The unit's own level follows its findings (14.8, B246) |
 | unit.json | A database entry gains `template` `{name, ok, dump}`, additively (version stays 1) |
 | mariadb-dump's `lock_tables` | Replaces `--single-transaction` with `--lock-tables`: `LOCK TABLES` commits any open transaction, so the two do not combine |
 | One tool, two names | The scripts pick `mariadb-dump` or `mysqldump`, `redis-cli` or `valkey-cli`, whichever the image has; occ is looked for where the official and linuxserver images keep it |
@@ -865,3 +865,19 @@ the link.
 | Suggestion | A unit split by a link outside its capture suggests the engine's dump (`pg-dumpall`), not `pause-always`: a pause joins instants, it cannot add files the unit does not read (6). Split by instants alone still suggests `pause-always`. A file source keeps `source-snapshot` |
 | Tests | `tests/test_db_detect.c`: a file source's WAL on disk but outside every root; a unit's `/wal` on an excluded bind, on a backed-up mount outside the capture, inside it at one instant and at two, on no mount, and with no mounts; `tests/test_unit_probe.c`: the wire and the helper's mount list |
 
+### 14.8 A unit's level from its templates (B246)
+
+The templates were run by the daemon, outside the helper's capture, so the
+unit's level stayed the helper's: a unit whose `pg-dumpall`,
+`prometheus-snapshot` or `nextcloud-maintenance` ran and covered its
+database stayed `crash`, though the Manual says pre hooks that all exit 0
+make a container unit `application`. Decided: a template is the
+application taking part, as a pre hook is, and the unit's level is derived
+from its findings.
+
+| Point | As built |
+|---|---|
+| The rule | The capture reached one instant (`crash` or `quiesced`); the unit has at least one live finding; every live finding is `covered-application` by its own enabled template, which did its part (the dump stored, or the exec template's pre run exited 0). Then `application` |
+| Not raised | A capture below one instant (a dump makes its own finding `covered-application` whatever the capture, but the rest of the unit's files are still torn); a live database with no template; a template that failed; `offline` and `application` are already at or above it |
+| Where | `templates_raise` in `src/units/unit_backup.c`, after the findings are judged: `unit.json`'s `consistency` (and so the snapshot's unit index) and the job result's `consistency` |
+| Tests | `tests/test_helper_e2e.sh`: `pg-dumpall` (a dump) raises `quiesced` to `application` and a failed dump does not; `prometheus-snapshot` (an exec template with a post run) raises it and a failed pre run does not |

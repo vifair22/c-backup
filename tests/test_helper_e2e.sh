@@ -79,6 +79,15 @@ echo 16 > "$WORK/pgsplit/PG_VERSION"
 head -c 8192 /dev/zero > "$WORK/pgsplit/global/pg_control"
 printf '42\n/var/lib/postgresql/data\n' > "$WORK/pgsplit/postmaster.pid"
 ln -s /wal "$WORK/pgsplit/pg_wal"
+# A live Prometheus TSDB (wal/, chunks_head/, queries.active, lock) for an
+# exec template, prometheus-snapshot, whose admin API call is a stand-in
+# wget; its post run removes /prometheus/snapshots/*, absent here.
+mkdir -p "$WORK/promsnap/wal" "$WORK/promsnap/chunks_head" "$WORK/pool/app/e"
+head -c 4096 /dev/zero > "$WORK/promsnap/wal/00000000"
+: > "$WORK/promsnap/queries.active"
+: > "$WORK/promsnap/lock"
+printf '#!/bin/sh\necho "{\\"status\\":\\"success\\"}"\n' > "$WORK/bin/wget"
+chmod 0755 "$WORK/bin/wget"
 # The tree root as read: a mode and a time no staging directory has (B168).
 chmod 0751 "$WORK/snap"
 touch -d @1500000000 "$WORK/snap"
@@ -103,6 +112,8 @@ cat > "$WORK/units.json" <<EOF
            "processes":[{"comm":"postgres","args":"postgres"}],
            "mounts":[{"dest":"/var/lib/postgresql/data","recorded":"$WORK/pool/app/s"},
                      {"dest":"/wal","recorded":null}]}]}},
+ {"id":"e","name":"cbk-uat-e","state":"running","caps":["quiesce","snapshot"],
+  "trees":[{"id":"prom","read_root":"$WORK/promsnap","path":"$WORK/pool/app/e","source":"$WORK/pool/app/e"}]},
  {"id":"p","name":"prod-db","state":"running",
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"secret"}]}
 ]}
@@ -142,7 +153,7 @@ allow = fake:cbk-uat-*
 dir_domains = $WORK/pool
 
 [db]
-allow_templates = pg-dumpall
+allow_templates = pg-dumpall, prometheus-snapshot
 EOF
 
 echo "policy"
@@ -406,6 +417,7 @@ OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
 contains "a unit with a live PostgreSQL backs up" '"state":"completed"' "$OUT"
 contains "and the finding is reported" '"engine":"postgres"' "$OUT"
 contains "captured from a snapshot" '"coverage":"covered-quiesced"' "$OUT"
+contains "the unit at the level its capture reached" '"consistency":"quiesced"' "$OUT"
 FID=$(printf '%s' "$OUT" | sed -n 's/.*"findings":\[{"id":\([0-9]*\).*/\1/p')
 check "with its id" yes "$([ -n "$FID" ] && echo yes || echo no)"
 OUT=$(cb db preview 1 "$FID")
@@ -417,11 +429,11 @@ contains "and verified it" '"verified":true' "$OUT"
 contains "the policy allows it" '"allowed":true' "$OUT"
 OUT=$(cb db preview 1 "$FID" --template pg-dump --param user=postgres --param database=app)
 contains "another template previews, though the policy would refuse it" '"allowed":false' "$OUT"
-contains "with the line to add" '"policy_line":"[db] allow_templates = pg-dumpall, pg-dump"' "$OUT"
+contains "with the line to add" '"policy_line":"[db] allow_templates = pg-dumpall, prometheus-snapshot, pg-dump"' "$OUT"
 contains "and the argv from its params" '"argv":["pg_dump","-Fc","-Z0","-U","postgres","app"]' "$OUT"
 OUT=$(cb db enable 1 "$FID" --template pg-dump --param user=postgres --param database=app 2>&1); RC=$?
 check    "enabling what the policy refuses fails" 1 "$RC"
-contains "and returns the policy line instead" '[db] allow_templates = pg-dumpall, pg-dump' "$OUT"
+contains "and returns the policy line instead" '[db] allow_templates = pg-dumpall, prometheus-snapshot, pg-dump' "$OUT"
 OUT=$(cb db enable 1 "$FID" --template pg-dump --param user=Robert --param database=app 2>&1); RC=$?
 check    "a parameter outside its grammar is refused" 1 "$RC"
 contains "naming the grammar" '[a-z_][a-z0-9_]{0,62}' "$OUT"
@@ -433,6 +445,8 @@ contains "and who chose it" '"decided_by":"local socket"' "$OUT"
 OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
 contains "the next backup runs it" '"state":"completed"' "$OUT"
 contains "and the finding is covered by it" '"coverage":"covered-application"' "$OUT"
+contains "and the unit with it: its dump is the application taking part (B246)" \
+    '"consistency":"application"' "$OUT"
 SNAP=$(printf '%s' "$OUT" | sed -n 's/.*"snapshot_id":\([0-9]*\).*/\1/p')
 OUT=$(cb unit restore 1 "$SNAP" "$WORK/outd")
 contains "the unit snapshot restores" '"state":"completed"' "$OUT"
@@ -449,6 +463,7 @@ OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
 contains "a failed dump does not fail the unit" '"state":"completed"' "$OUT"
 contains "it is named as a failed dump" 'dump(s) failed' "$OUT"
 contains "and the coverage is the capture's" '"coverage":"covered-quiesced"' "$OUT"
+contains "and so is the unit's level" '"consistency":"quiesced"' "$OUT"
 OUT=$(cb db dismiss 1 "$FID" --reason "test data")
 contains "dismiss stops it" '"state":"dismissed"' "$OUT"
 OUT=$(cb unit backup 1 --provider fake cbk-uat-d)
@@ -462,6 +477,23 @@ contains "the link judged, not left unchecked" '"found":"outside the capture"' "
 lacks    "never unchecked" '"found":"unchecked"' "$OUT"
 contains "naming pg_wal" '"kind":"pg_wal","target":"/wal"' "$OUT"
 contains "with the dump suggested" '"suggestion":"pg-dumpall"' "$OUT"
+# An exec template (B246): prometheus-snapshot lifts the covered-quiesced
+# finding, and the unit's level with it.
+OUT=$(cb unit backup 1 --provider fake cbk-uat-e)
+contains "a unit with a live Prometheus backs up" '"engine":"prometheus"' "$OUT"
+contains "at its capture's level" '"consistency":"quiesced"' "$OUT"
+PFID=$(printf '%s' "$OUT" | sed -n 's/.*"findings":\[{"id":\([0-9]*\).*/\1/p')
+OUT=$(cb db enable 1 "$PFID" --template prometheus-snapshot)
+contains "an exec template enables" '"state":"enabled"' "$OUT"
+OUT=$(cb unit backup 1 --provider fake cbk-uat-e)
+contains "the next backup runs it" '"state":"completed"' "$OUT"
+contains "and it covers the finding" '"coverage":"covered-application"' "$OUT"
+contains "and raises the unit to application" '"consistency":"application"' "$OUT"
+printf '#!/bin/sh\necho "connection refused" >&2\nexit 4\n' > "$WORK/bin/wget"
+OUT=$(cb unit backup 1 --provider fake cbk-uat-e)
+contains "an exec template that fails leaves the finding as captured" '"coverage":"covered-quiesced"' "$OUT"
+contains "and the unit too" '"consistency":"quiesced"' "$OUT"
+cb db dismiss 1 "$PFID" --reason "test data" > /dev/null
 
 echo "a daemon killed mid-backup"
 # B169: the helper held the backup's export hold until its own restart or
