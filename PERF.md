@@ -6,6 +6,41 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-19 - Verify and lookups against snapshot count; ACL read skip
+
+`bench_verify -n 10000 -L 1,10,50,100 index structure` (new `--at-snaps`:
+one repository, measured as its history reaches each count; 40 files a
+directory, 10% churn per snapshot), on a private tmpfs. Before is v3 with
+the bench added; after is fix/perf-d2-nochange with node_hashes and
+node_content.
+
+| snapshots | 1 | 10 | 50 | 100 |
+|---|---:|---:|---:|---:|
+| index verify, us/entry, before | 5.80 | 6.33 | 6.47 | 7.74 |
+| index verify, us/entry, after | 5.73 | 6.14 | (noisy) | 6.75 |
+| structure verify, us/entry, before | 9.07 | 11.48 | 12.81 | 13.48 |
+| structure verify, us/entry, after | 8.60 | 9.05 | (noisy) | 9.73 |
+| contentless rule, us/non-file object, before | 1.90 | 2.16 | 1.94 | 2.36 |
+| contentless rule, node_hashes alone | 2.04 | 7.01 | 36.81 | 129.62 |
+| contentless rule, with node_content | 1.87 | 1.82 | (noisy) | 1.79 |
+| object refs, per lookup, before | 2.5 ms | 36 ms | 620 ms | 4.69 s |
+| object refs, per lookup, after | 99 us | 181 us | 507 us | 532 us |
+
+node_hashes alone brought back B268's growth in the contentless rule (one
+probe per snapshot for every non-file object); node_content, the set of
+hashes any node names, puts it back to one probe per object. Object
+references were already broken on v3: the planner served the page from
+nodes_by_snap_parent by repo_id and seeded the path climb by walking an
+index by repo_id, so every lookup read every node row (CROSS JOIN fix).
+verify's chunk-list pass also walked the node rows; it is now driven from
+the type-6 objects. The 50-snapshot row of the after run was 2x on every
+column including fixed-cost ones, so it was a contended machine, not the
+code.
+
+ACL read skip (PERF-ACL-SKIP), `bench_phases -n 15000 -I 2` with the
+prof_shim counters, no-change incremental: getxattr 17,004 -> 0, fstatat
+33,006 -> 16,002 (the stat libacl makes), scan phase 61 ms -> 38 ms.
+
 ## 2026-11-19 - No-change backup WAL: node_hashes (BENCH M10 D2)
 
 BENCH M10 on FS2: a no-change backup of D2 (95,979 files, 6,286 dirs) took
