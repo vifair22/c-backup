@@ -83,8 +83,7 @@ static const char *level_name(verify_level_t l)
 /*
  * Regular-file node rows that name no file content: a file the snapshot
  * claims and no restore can produce. "?1" is the repo id. Directories and
- * symlinks have a NULL content_hash too, so the type is what decides; the
- * (repo_id, content_hash) index serves the NULL lookup.
+ * symlinks have a NULL content_hash too, so the type is what decides.
  *
  * In format 3 a file's content is a FILE object or a CHUNKLIST, an empty
  * file included (the chunker stores an empty FILE object for it), so a
@@ -92,18 +91,40 @@ static const char *level_name(verify_level_t l)
  * blob - is as unrestorable as one naming nothing, and is counted with
  * them. An object the index does not have at all is not this check's: the
  * object walk and gc's content_missing see those.
+ *
+ * Shaped so it never visits a node row that does not match (B268). The
+ * plain form - every file row, its type and an object probe each - walked
+ * the node rows in content_hash order and fetched each from the table at
+ * random, and once the rows outgrew the page cache that grew far faster
+ * than the index: 18.8 s of a 22 s index verify at 656k node rows, against
+ * 0.08 s at 82k. Instead the ids come from two sides that are empty on a
+ * healthy repository: the partial index nodes_file_no_content (migration
+ * 014; its condition must stay these exact terms or SQLite will not use
+ * it), and the objects that are neither a FILE nor a CHUNKLIST, each
+ * probed against nodes_by_hash. CROSS JOIN keeps objects on the outside,
+ * so the cost follows the non-file objects, never the node count.
  */
 #define VERIFY_CONTENTLESS                                                  \
-    "n.repo_id = ?1 AND n.type = 1"                                         \
-    " AND (n.content_hash IS NULL OR n.content_hash = ''"                   \
-    "      OR EXISTS (SELECT 1 FROM objects o WHERE o.repo_id = ?1"         \
-    "                 AND o.hash = n.content_hash AND o.type NOT IN (1, 6)))"
+    "n.repo_id = ?1 AND n.type = 1 AND n.id IN ("                           \
+    "  SELECT id FROM nodes WHERE repo_id = ?1 AND type = 1"                \
+    "     AND (content_hash IS NULL OR content_hash = '')"                  \
+    "  UNION ALL"                                                           \
+    "  SELECT f.id FROM objects o CROSS JOIN nodes f"                       \
+    "   WHERE o.repo_id = ?1 AND o.type NOT IN (1, 6)"                      \
+    "     AND f.repo_id = ?1 AND f.content_hash = o.hash AND f.type = 1)"
 
 /* The status a contentless file entry is recorded under, hash empty. */
 #define VERIFY_CONTENTLESS_STATUS "missing: file entry has no content"
 
-/* File entries flagged as never settled while read (OWN-45-LIVE). */
+/* File entries flagged as never settled while read (OWN-45-LIVE). Served
+ * by the partial index nodes_unsettled (migration 014, B268), whose
+ * condition is these terms: change one and change the other. */
 #define VERIFY_UNSETTLED "n.repo_id = ?1 AND n.type = 1 AND (n.flags & 1) != 0"
+
+const char *verify_rule_condition(verify_rule_t rule)
+{
+    return rule == VERIFY_RULE_CONTENTLESS ? VERIFY_CONTENTLESS : VERIFY_UNSETTLED;
+}
 
 /*
  * A notice is a finding that is not damage: it is listed with the rest and

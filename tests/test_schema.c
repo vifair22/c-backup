@@ -337,7 +337,10 @@ static void test_one_baseline_migration(void **state)
     /* The snapshot a running backup is writing (B238). */
     assert_non_null(app_migrations[11].name);
     assert_string_equal(app_migrations[11].name, "013_job_snapshot.sql");
-    assert_null(app_migrations[12].name);
+    /* Partial indexes for verify's node rules (B268). */
+    assert_non_null(app_migrations[12].name);
+    assert_string_equal(app_migrations[12].name, "014_verify_node_rules.sql");
+    assert_null(app_migrations[13].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */

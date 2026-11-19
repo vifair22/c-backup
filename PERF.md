@@ -6,6 +6,58 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-19 - Verify against index size (B268)
+
+`make bench-verify` (`bench/verify.c`): tiny files of unique content, 40 to
+a directory, backed up 4 times with 10% of the files rewritten between
+snapshots, then `verify_run` at index level through the daemon's engine and
+index. Per-entry cost is the run's wall time over `checked`; linear work
+keeps it flat as the size grows. vfairfield-dt, bench.slice at nice 19,
+with other agents loading the box (load average noted), so read the ratios
+rather than the absolute times.
+
+The bug: on FS1 the index verify took 290, 350, 426, 519, 756, 938 s from
+256k to 364k entries, and 2185 s at 404k (1.58x the entries, 7.5x the
+time). The contentless-file rule walked every node row through
+`nodes_by_hash` and fetched each from the table in hash order, a random
+read per node row once the node table outgrew the page cache. Fixed by the
+partial indexes of migration 014 and a contentless rule driven from them
+and from the non-file objects.
+
+Phase split, default cache (64 MiB), load about 10:
+
+| files | objects | node rows | before total | before contentless | after total | after contentless |
+|------:|--------:|----------:|-------------:|-------------------:|------------:|------------------:|
+| 20,000  | 26,682  | 82,028  | 0.44 s (16.3 us/entry) | 0.084 s | 0.20 s (7.6 us/entry) | 0.002 s |
+| 160,000 | 213,237 | 656,028 | 22.3 s (104.6 us/entry) | 18.8 s | 1.68 s (7.9 us/entry) | 0.019 s |
+
+Per-entry ratio 160k/20k: before x6.41, after x1.03.
+
+Three scales, uninstrumented, default cache, load 32 falling to 20:
+
+| files | before us/entry | after us/entry |
+|------:|----------------:|---------------:|
+| 20,000  | 16.40 | 6.19 |
+| 80,000  | 14.05 | 7.18 |
+| 160,000 | 21.71 | 8.72 |
+
+The same with `BENCH_DB_PRAGMAS="PRAGMA cache_size=-4000"`, which puts the
+index well past the cache at these sizes, as FS1's is at its own:
+
+| files | before us/entry | after us/entry |
+|------:|----------------:|---------------:|
+| 20,000  | 15.36 | 6.69 |
+| 80,000  | 29.62 | 12.13 |
+| 160,000 | 41.69 | 17.39 |
+
+What still rises in the small-cache run is the object list and the walk
+(0.18 s to 3.5 s together for 8x the objects): the list reaches objects
+through `objects_by_type` and probes `pack_objects` by hash, and the walk
+resolves every object again through `db_locate`. Each is a bounded number
+of random index reads per object, so it is linear in reads but degrades as
+the hit rate falls; it does not scale with node rows. Recorded as a
+follow-up, not fixed here.
+
 ## 2026-11-18 - Edit latency during a backup (B232, B233, B222)
 
 `make bench-edit-latency` (`bench/edit_latency.sh`, `bench/slow_dev.c`):
