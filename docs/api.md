@@ -1088,10 +1088,16 @@ true`, a JSON boolean (anything else is `allow_plaintext must be true or
 false`; with no `reencrypt` it is `allow_plaintext applies only with
 reencrypt`). The check is repeated when the job runs. An allowed run logs a
 warning and journals `replicated encrypted repo N into plaintext at <path>`
-on the source. Unencrypted into unencrypted needs no flag. Names are of the
-plaintext, so they and the trees carry over unchanged, as do snapshot ids;
-a snapshot id the destination already uses for another tree fails the run
-instead of being overwritten. The job fails, saying which, when `dest` is
+on the source, unless the run wrote nothing (a rerun into an up-to-date
+target is not journalled again). Unencrypted into unencrypted needs no flag.
+A destination under another key cuts files differently (its chunking table
+is keyed from its own key, repo-format.md), so content is re-chunked and
+trees rebuilt, and its snapshot roots differ from the source's; file
+contents and metadata, snapshot ids, times and labels carry over. In that
+mode `objects_asked` counts every object offered to the destination and
+`objects_sent` those it did not already hold. A snapshot id the destination
+already uses for a snapshot of its own fails the run instead of being
+overwritten. The job fails, saying which, when `dest` is
 not a repository, is a replica of the source, or is encrypted and its key is
 not on this host. The job's result reports `snapshots_sent`,
 `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent`,

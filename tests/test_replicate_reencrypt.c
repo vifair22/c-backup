@@ -137,6 +137,10 @@ static void replicate_reencrypt(void)
     sink.v->close(sink.ctx);
     assert_int_equal(st, OK);
     assert_int_equal(rr.snapshots_sent, 1);
+    /* Every object sent was asked about first, as in a copying run
+     * (B262: a re-chunking run reported 0 asked). */
+    assert_true(rr.objects_sent > 0);
+    assert_true(rr.objects_asked >= rr.objects_sent);
 }
 
 /* Reindex the destination from nothing and restore from it. */
