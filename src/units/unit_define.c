@@ -4,6 +4,7 @@
 #include "msg_clip.h"
 #include "remote_provider.h"
 #include "unit_restore.h"
+#include "unit_tokens.h"
 #include "snap_record.h"
 
 #define CUTILS_CJSON_ALLOW
@@ -100,17 +101,30 @@ static status_t trees_of(cutils_db_t *db, int64_t repo_id, int64_t snap_id, tree
     return OK;
 }
 
-static status_t mkdir_p(const char *path)
+/* The directories above path. *made is set when one was created, so a
+ * failure can tell whether it left anything behind (B258). */
+static status_t mkdir_p(const char *path, int *made)
 {
     char p[PATH_MAX + 8];
     snprintf(p, sizeof(p), "%s", path);
     for (char *s = p + 1; *s; s++) {
         if (*s != '/') continue;
         *s = '\0';
-        if (mkdir(p, 0755) != 0 && errno != EEXIST) return set_error_errno(ERR_IO, "unit restore: mkdir %s", p);
+        if (mkdir(p, 0755) == 0) *made = 1;
+        else if (errno != EEXIST) return set_error_errno(ERR_IO, "unit restore: mkdir %s", p);
         *s = '/';
     }
     return OK;
+}
+
+/* Whether a disk restore that failed left its file or its scratch
+ * directory (restore_file). */
+static int left_disk(const char *dest)
+{
+    char tmp[PATH_MAX + 32];
+    struct stat sb;
+    snprintf(tmp, sizeof(tmp), "%.4000s.cbk-restore", dest);
+    return lstat(dest, &sb) == 0 || lstat(tmp, &sb) == 0;
 }
 
 /* The tree whose recorded path is p, or holds it; NULL if none. */
@@ -680,6 +694,15 @@ static status_t left_under(const char *target_root, status_t st)
                      "target_root, to try again", why, target_root);
 }
 
+/* One that failed before writing anything there (B258): nothing to remove,
+ * and saying otherwise sent an operator looking for files that never were. */
+static status_t nothing_under(const char *target_root, status_t st)
+{
+    char why[MSG_CLIP_MAX];
+    msg_clip(why, sizeof(why), err_msg());
+    return set_error(st, "%s; nothing was written under %s", why, target_root);
+}
+
 #define VM_DISKS_MAX 64
 
 /*
@@ -765,10 +788,15 @@ static status_t vm_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, 
 
     /* The disks. */
     size_t nstaged = 0, nswapped = 0;
-    int began = st == OK && nd > 0;
+    /* Something exists under target_root that this restore put there: only
+     * then does a failure tell the operator to remove it (B258). */
+    int began = 0, tried = st == OK && nd > 0;
     for (size_t i = 0; st == OK && i < nd; i++) {
         if (new_name) {
-            if ((st = mkdir_p(ddest[i])) == OK) st = restore_file(store, db, repo_id, snap_id, o, drel[i], ddest[i]);
+            if ((st = mkdir_p(ddest[i], &began)) == OK) {
+                st = restore_file(store, db, repo_id, snap_id, o, drel[i], ddest[i]);
+                if (st == OK || left_disk(ddest[i])) began = 1;
+            }
         } else {
             cJSON *a = args_unit("libvirt", unit), *sr = NULL;
             if (a) { cJSON_AddStringToObject(a, "mount", dsrc[i]); cJSON_AddNumberToObject(a, "job", (double)job_id); }
@@ -835,12 +863,29 @@ static status_t vm_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, 
     if (st == OK && !nuuid) st = set_error(ERR_IO, "unit restore: the define returned no uuid");
     if (st != OK && !new_name && nswapped > 0) st = roll_back("libvirt", unit, tok, nswapped, 0, st);
     else if (st != OK && new_name && began) st = left_under(o->target_root, st);
+    else if (st != OK && new_name && tried) st = nothing_under(o->target_root, st);
     if (st == OK && state_tok[0]) {
         cJSON *a = args_unit("libvirt", nuuid), *ir = NULL;
         if (a) cJSON_AddStringToObject(a, "staging", state_tok);
         st = remote_op("libvirt", "vm.install_state", a, -1, &ir);
         if (st == OK && ir) cJSON_AddItemToObject(res, "state", ir);
         else cJSON_Delete(ir);
+    }
+    /* Replaced in place: the helper deleted the domain's checkpoints with the
+     * define (B251), and the tokens naming them go too, in every repository
+     * that backs it up, so each one's next session is a full read rather
+     * than a retire of a bitmap that is not in the new images. */
+    if (st == OK && !new_name) {
+        char ukey[300];
+        snprintf(ukey, sizeof(ukey), "libvirt:%.280s", unit);
+        if (unit_tokens_drop_everywhere(db, ukey) != OK) {
+            char wmsg[600];
+            snprintf(wmsg, sizeof(wmsg), "%.500s; the next backup of it may warn about its old checkpoint",
+                     err_msg());
+            err_clear();
+            if (out->n_warnings < sizeof(out->warnings) / sizeof(out->warnings[0]) &&
+                (out->warnings[out->n_warnings] = strdup(wmsg)) != NULL) out->n_warnings++;
+        }
     }
     if (st == OK && o->start) st = remote_op("libvirt", "unit.start", args_unit("libvirt", nuuid), -1, NULL);
     if (st == OK) {
@@ -938,10 +983,11 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
     char (*tok)[64] = calloc(TREES_MAX, sizeof(*tok));
     if (st == OK && !tok) st = set_error(ERR_NOMEM, "unit restore");
     size_t nswapped = 0;
-    int stopped = 0, was_running = 0, rolled = 0, wrote = 0;
+    int stopped = 0, was_running = 0, rolled = 0, wrote = 0, tried = 0;
     if (st == OK && new_name) {
+        tried = n > 0;
         for (size_t i = 0; st == OK && i < n; i++) {
-            if ((st = mkdir_p(t[i].dest)) != OK) break;
+            if ((st = mkdir_p(t[i].dest, &wrote)) != OK) break;
             /* The tree lands at target_root/<its path>. */
             restore_opts_t ro = o->ropts;
             ro.subpath = t[i].path;
@@ -1054,6 +1100,7 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
     if (st == OK) st = define_send(prov, unit, txt, 0, &dr);
     if (st != OK && stopped && !rolled) st = roll_back(prov, unit, tok, nswapped, was_running, st);
     else if (st != OK && new_name && wrote) st = left_under(o->target_root, st);
+    else if (st != OK && new_name && tried) st = nothing_under(o->target_root, st);
     free(txt);
     free(tok);
     if (st == OK) {
