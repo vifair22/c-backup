@@ -177,6 +177,21 @@ field is named by its path, as in `interval trigger: trigger.seconds must
 be a number`. Integers are exact only up to 2^53, so a field whose type
 allows more is limited to that, and the range in the message says so.
 
+A member a write does not take is refused with a 400 naming it, and
+nothing is changed: `unknown key 'lable'; valid keys: label, paths,
+exclude, one_filesystem`, or `unknown key 'dry_run'; this request takes no
+fields` on a write with no body (`dry_run` on gc and gfs is a query
+parameter). Members inside a list of objects are checked the same way:
+`unknown key 'mod' in snapshot[]; valid keys: path, mode` on
+`PUT /repos/<id>/sources`. Every write used to read the members it knew
+and drop the rest, so a misspelt member, or one sent to a daemon too old
+to know it, was answered 2xx with part of the request silently ignored
+(B239). The router checks this before the handler runs, so it comes ahead
+of every other answer, a 404 for the URL included. A schedule, a units
+job, a unit's policy and the database finding actions take members that
+depend on another member or on the provider, and refuse an unknown one in
+their own words (`unknown key 'x' in a schedule`).
+
 A NUL used to cut the string short without a word: the daemon is C, and
 `"label":"nul\u0000here"` stored the label `nul` and answered 202. No
 field in this API can hold one, so the request is refused instead.
@@ -191,7 +206,8 @@ in itself is reported first, and only a sound one goes on to errors about
 the repository: missing configured sources (400), a key that is not loaded
 (409), a busy repository (503). A malformed schedule trigger on a
 repository with no sources is reported as the trigger error. A path or id
-in the URL that names nothing is still a 404 before the body is read.
+in the URL that names nothing is still a 404 before the body is read,
+except for an unknown member, which the router refuses first.
 
 ### When a write's answer comes back
 

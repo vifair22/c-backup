@@ -1055,6 +1055,7 @@ int routes_register_jobs(api_server_t *srv, cutils_db_t *db, job_manager_t *jm)
     if (api_server_route(srv, "/jobs",    API_GET,  API_CLASS_NONE,  list_jobs,     &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/jobs/*",  API_GET,  API_CLASS_NONE,  get_job,       &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/jobs/*",  API_POST, API_COMMIT_ONLY, cancel_job,    &g_ctx) != 0) return -1;
+    if (api_server_route_keys(srv, "/jobs/*", API_POST, API_KEYS_NONE) != 0) return -1;
     if (api_server_route_allow(srv, "/jobs/*", jobs_allow_for_url, NULL) != 0) return -1;
     return 0;
 }
