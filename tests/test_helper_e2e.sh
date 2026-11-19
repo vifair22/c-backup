@@ -447,8 +447,11 @@ echo "a daemon killed mid-backup"
 # closes with it, and the helper ends the capture at once.
 cb unit backup 1 --provider fake cbk-uat-k > /dev/null 2>&1 &
 BG=$!
-for _ in $(seq 1 100); do
-    [ "$(cat "$WORK/hstate/holds.json" 2>/dev/null)" != "[]" ] && break; sleep 0.1
+# The export hold specifically: the unit's freeze hold is journalled first,
+# so waiting for any hold read holds.json while only the freeze was held
+# (FLAKE-30). The 8 GiB disk keeps the export open long after this.
+for _ in $(seq 1 600); do
+    grep -q '"kind":"export"' "$WORK/hstate/holds.json" 2>/dev/null && break; sleep 0.1
 done
 contains "the helper journals the running backup's hold" '"kind":"export"' "$(cat "$WORK/hstate/holds.json")"
 OUT=$(cb unit providers)
