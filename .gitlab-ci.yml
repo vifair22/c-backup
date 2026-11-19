@@ -480,6 +480,27 @@ build:image:
   stage: build
   image: docker:cli
   tags: [docker, unraid]
+  # The registry sits behind a proxy whose idle backend connections go
+  # stale, and a push's parallel requests that land on one get an instant
+  # 502 (or a 401 at login). Retrying the same push gets through, so login
+  # and push are retried with a backoff (10, 20, 30, 40 s) rather than
+  # failing a cut whose build and smoke run already passed. The jobs that
+  # extend this one keep the helpers: before_script and script run in one
+  # shell.
+  before_script:
+    - |
+      retry() {
+        n=1
+        while ! "$@"; do
+          if [ "$n" -ge 5 ]; then echo "failed after $n attempts: $*" >&2; return 1; fi
+          echo "attempt $n failed, retrying in $((n * 10)) s: $*" >&2
+          sleep $((n * 10))
+          n=$((n + 1))
+        done
+      }
+      registry_login() {
+        echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+      }
   script:
     # --provenance=false --sbom=false: a plain single manifest. Docker 29
     # attaches attestations by default, which makes the image an index, and
@@ -494,8 +515,8 @@ build:image:
     - docker ps --filter name=smoke --filter status=running | grep -q smoke
     - docker logs smoke
     - docker rm -f smoke
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
-    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - retry registry_login
+    - retry docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
   only:
     - master
 
