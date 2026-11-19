@@ -23,7 +23,18 @@
  *     -r, --max-ratio X  fail if the per-entry cost of the largest scale
  *                        exceeds X times the smallest's (0: report only)
  *     -k, --keep         leave the working directory behind
+ *     -L, --at-snaps LIST  comma-separated snapshot counts: one repository at
+ *                        the first --files size, verified (and probed, below)
+ *                        each time its history reaches a count in LIST, so a
+ *                        cost that grows with the number of snapshots shows
+ *                        at a fixed file count (BENCH_VERIFY_AT_SNAPS, unset)
  *   level is index, structure or deep; default index and structure.
+ *
+ * With --at-snaps each step also times what depends on the snapshot count
+ * rather than the file count: verify's contentless rule on its own (the
+ * query verify_rule_condition gives, non-file objects probed against the
+ * content hash lookup), and object references (introspect_object_refs,
+ * GET /repos/<id>/objects/<hash>/refs) for a sample of file objects.
  */
 
 #define _GNU_SOURCE
@@ -36,11 +47,14 @@
 #include <cutils/log.h>
 
 #include "backup.h"
+#include "routes.h"
 #include "verify.h"
 
 #define FANOUT     40
 #define MAX_SCALES 8
 #define MAX_LEVELS 3
+#define MAX_STEPS  16
+#define REF_SAMPLE 200
 
 typedef struct {
     char     parent[3072];
@@ -53,6 +67,8 @@ typedef struct {
     int      keep;
     verify_level_t levels[MAX_LEVELS];
     int      n_levels;
+    uint64_t at[MAX_STEPS];
+    int      n_at;
 } opts_t;
 
 static opts_t g_o;
@@ -126,6 +142,100 @@ static const char *lname(verify_level_t l)
 /* Per-entry microseconds of each level at each scale, for the ratio check. */
 static double g_us[MAX_SCALES][MAX_LEVELS];
 
+/* Seconds for one statement, its first column read as a count. */
+static double timed_count(bench_env_t *e, const char *sql, int64_t *out)
+{
+    double t0 = bench_now();
+    *out = scalar(e, sql);
+    return bench_now() - t0;
+}
+
+/*
+ * What a step of --at-snaps measures beyond verify: the contentless rule
+ * alone, and object references for REF_SAMPLE file objects spread over the
+ * hash space, through the route's own handler.
+ */
+static int probe_step(bench_env_t *e)
+{
+    char sql[2048];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM nodes n WHERE %s",
+             verify_rule_condition(VERIFY_RULE_CONTENTLESS));
+    int64_t hits = 0;
+    double rule = timed_count(e, sql, &hits);
+    int64_t nonfile = scalar(e, "SELECT COUNT(*) FROM objects WHERE repo_id = ?"
+                                " AND type NOT IN (1, 6)");
+    if (hits != 0) {
+        fprintf(stderr, "bench: contentless rule matched %lld rows\n", (long long)hits);
+        return -1;
+    }
+
+    db_result_t *r = NULL;
+    if (db_execute(e->db,
+            "SELECT lower(hex(hash)), hash FROM objects WHERE repo_id = ? AND type = 1"
+            " ORDER BY hash", (const char *[]){ e->repo_id_s, NULL }, &r) != 0 || !r) {
+        db_result_free(r);
+        return -1;
+    }
+    int n = r->nrows, step = n > REF_SAMPLE ? n / REF_SAMPLE : 1, done = 0;
+    uint64_t refs = 0;
+    routes_introspect_init(e->db);
+    api_request_t req;
+    memset(&req, 0, sizeof(req));
+    req.method = API_GET;
+    double t0 = bench_now();
+    for (int i = 0; i < n && done < REF_SAMPLE; i += step, done++) {
+        /* hash is stored as hex text; hex() of it is not the hash */
+        const char *h = r->rows[i][1];
+        api_response_t resp = introspect_object_refs(&req, e->repo_id, h);
+        if (resp.status != 200) {
+            fprintf(stderr, "bench: refs %s: %d %s\n", h, resp.status,
+                    resp.body ? resp.body : "");
+            free(resp.body);
+            free(resp.set_cookie);
+            db_result_free(r);
+            return -1;
+        }
+        for (const char *q = resp.body; q && (q = strstr(q, "\"snap_id\"")); q++) refs++;
+        free(resp.body);
+        free(resp.set_cookie);
+    }
+    double refsecs = bench_now() - t0;
+    db_result_free(r);
+    printf("    contentless rule  %8.3fs  (%lld non-file objects, %.2f us each)\n",
+           rule, (long long)nonfile, nonfile ? rule * 1e6 / (double)nonfile : 0.0);
+    printf("    object refs       %8.3fs  %d lookups, %.1f us each, %.1f refs each\n",
+           refsecs, done, done ? refsecs * 1e6 / done : 0.0,
+           done ? (double)refs / done : 0.0);
+    return 0;
+}
+
+/* Every requested level once, recording per-entry microseconds in row s. */
+static int verify_levels(bench_env_t *ep, uint64_t files, int s)
+{
+    (void)files;
+    log_level_t lvl = log_get_level();
+    for (int l = 0; l < g_o.n_levels; l++) {
+        verify_result_t vr;
+        log_set_level(LOG_WARNING);
+        double v0 = bench_now();
+        status_t st = verify_run(ep->store, ep->db, ep->repo_id, g_o.levels[l], 0, NULL,
+                                 NULL, NULL, &vr);
+        double secs = bench_now() - v0;
+        log_set_level(lvl);
+        if (st != OK || vr.ok != vr.checked) {
+            fprintf(stderr, "bench: verify %s: %s (checked %" PRIu64 ", ok %" PRIu64 ")\n",
+                    lname(g_o.levels[l]), st != OK ? err_msg() : "not clean",
+                    vr.checked, vr.ok);
+            return -1;
+        }
+        double us = vr.checked ? secs * 1e6 / (double)vr.checked : 0.0;
+        g_us[s][l] = us;
+        printf("    verify %-9s %9" PRIu64 " checked  %8.3fs  %8.2f us/entry\n",
+               lname(g_o.levels[l]), vr.checked, secs, us);
+    }
+    return 0;
+}
+
 static int run_scale(int s)
 {
     uint64_t files = g_o.files[s];
@@ -149,7 +259,9 @@ static int run_scale(int s)
 
     log_level_t lvl = log_get_level();
     log_set_level(LOG_WARNING);
-    for (uint64_t g = 0; g < g_o.snaps; g++) {
+    uint64_t total = g_o.n_at ? g_o.at[g_o.n_at - 1] : g_o.snaps;
+    int next_at = 0;
+    for (uint64_t g = 0; g < total; g++) {
         if (g > 0 && churn(src, files, g) != 0) { log_set_level(lvl); goto out; }
         backup_result_t res;
         if (backup_run(e.store, e.db, e.repo_id, &bo, &res) != OK) {
@@ -157,8 +269,17 @@ static int run_scale(int s)
             fprintf(stderr, "bench: backup failed: %s\n", err_msg());
             goto out;
         }
+        if (next_at < g_o.n_at && g + 1 == g_o.at[next_at]) {
+            log_set_level(lvl);
+            printf("  %" PRIu64 " snapshot(s):\n", g + 1);
+            if (verify_levels(&e, files, next_at) != 0 || probe_step(&e) != 0) goto out;
+            fflush(stdout);
+            next_at++;
+            log_set_level(LOG_WARNING);
+        }
     }
     log_set_level(lvl);
+    if (g_o.n_at) { rc = 0; goto out; }
     double built = bench_now() - t0;
 
     int64_t objs  = scalar(&e, "SELECT COUNT(*) FROM objects WHERE repo_id = ?");
@@ -167,25 +288,7 @@ static int run_scale(int s)
     printf("  scale %" PRIu64 " files: built in %.1fs; %lld objects, %lld node rows, "
            "%lld packs\n", files, built, (long long)objs, (long long)nodes, (long long)packs);
 
-    for (int l = 0; l < g_o.n_levels; l++) {
-        verify_result_t vr;
-        log_set_level(LOG_WARNING);
-        double v0 = bench_now();
-        status_t st = verify_run(e.store, e.db, e.repo_id, g_o.levels[l], 0, NULL,
-                                 NULL, NULL, &vr);
-        double secs = bench_now() - v0;
-        log_set_level(lvl);
-        if (st != OK || vr.ok != vr.checked) {
-            fprintf(stderr, "bench: verify %s: %s (checked %" PRIu64 ", ok %" PRIu64 ")\n",
-                    lname(g_o.levels[l]), st != OK ? err_msg() : "not clean",
-                    vr.checked, vr.ok);
-            goto out;
-        }
-        double us = vr.checked ? secs * 1e6 / (double)vr.checked : 0.0;
-        g_us[s][l] = us;
-        printf("    verify %-9s %9" PRIu64 " checked  %8.3fs  %8.2f us/entry\n",
-               lname(g_o.levels[l]), vr.checked, secs, us);
-    }
+    if (verify_levels(&e, files, s) != 0) goto out;
     rc = 0;
 out:
     bench_env_close(&e);
@@ -208,6 +311,23 @@ static void parse_files(const char *s)
     }
 }
 
+static void parse_at(const char *s)
+{
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", s);
+    g_o.n_at = 0;
+    char *save = NULL;
+    uint64_t prev = 0;
+    for (char *t = strtok_r(buf, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+        uint64_t v = bench_parse_u64("--at-snaps", t);
+        if (g_o.n_at == MAX_STEPS || v <= prev) {
+            fprintf(stderr, "bench: --at-snaps takes at most %d rising counts\n", MAX_STEPS);
+            exit(2);
+        }
+        g_o.at[g_o.n_at++] = prev = v;
+    }
+}
+
 static void usage(FILE *f)
 {
     fprintf(f,
@@ -218,7 +338,8 @@ static void usage(FILE *f)
         "  -S, --snaps N      snapshots per scale (BENCH_VERIFY_SNAPS, 4)\n"
         "  -c, --churn PCT    files rewritten per snapshot (BENCH_VERIFY_CHURN, 10)\n"
         "  -r, --max-ratio X  fail if largest/smallest per-entry cost exceeds X\n"
-        "  -k, --keep         keep the working directory\n");
+        "  -k, --keep         keep the working directory\n"
+        "  -L, --at-snaps LIST  verify one repository at these snapshot counts\n");
 }
 
 int main(int argc, char **argv)
@@ -229,6 +350,8 @@ int main(int argc, char **argv)
     parse_files((fl && *fl) ? fl : "20000,40000,80000");
     g_o.snaps = bench_env_u64("BENCH_VERIFY_SNAPS", 4);
     g_o.churn = bench_env_u64("BENCH_VERIFY_CHURN", 10);
+    const char *at = getenv("BENCH_VERIFY_AT_SNAPS");
+    if (at && *at) parse_at(at);
 
     static const struct option lo[] = {
         { "dir",       required_argument, NULL, 'd' },
@@ -237,11 +360,12 @@ int main(int argc, char **argv)
         { "churn",     required_argument, NULL, 'c' },
         { "max-ratio", required_argument, NULL, 'r' },
         { "keep",      no_argument,       NULL, 'k' },
+        { "at-snaps",  required_argument, NULL, 'L' },
         { "help",      no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "d:n:S:c:r:kh", lo, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "d:n:S:c:r:kL:h", lo, NULL)) != -1) {
         switch (c) {
         case 'd': snprintf(g_o.parent, sizeof(g_o.parent), "%s", optarg); break;
         case 'n': parse_files(optarg); break;
@@ -249,6 +373,7 @@ int main(int argc, char **argv)
         case 'c': g_o.churn = bench_parse_u64("--churn", optarg); break;
         case 'r': g_o.max_ratio = strtod(optarg, NULL); break;
         case 'k': g_o.keep = 1; break;
+        case 'L': parse_at(optarg); break;
         case 'h': usage(stdout); return 0;
         default:  usage(stderr); return 2;
         }
@@ -275,6 +400,10 @@ int main(int argc, char **argv)
            g_o.work, g_o.snaps, g_o.churn);
 
     int rc = 0;
+    if (g_o.n_at) {
+        g_o.n_scales = 1;
+        if (g_o.n_at > MAX_SCALES) { fprintf(stderr, "bench: at most %d steps\n", MAX_SCALES); return 2; }
+    }
     for (int s = 0; s < g_o.n_scales && rc == 0; s++)
         if (run_scale(s) != 0) rc = 1;
 
