@@ -294,6 +294,7 @@ contains "a unit's own retention" '"retention.keep_daily":"3"' "$OUT"
 contains "shows what is in force" '"effective"' "$(cb unit policy show 1 --provider fake cbk-uat-a)"
 OUT=$(cb unit policy set 1 --provider fake cbk-uat-a retention.bogus 3 2>&1); RC=$?
 check    "an unknown key is refused" 1 "$RC"
+contains "naming it" "unknown unit policy key 'retention.bogus'" "$OUT"
 # A policy row no backup would read was accepted for any unit.
 OUT=$(cb unit policy set 1 --provider fake prod-db retention.keep_daily 3 2>&1); RC=$?
 check    "a policy for a unit outside units.allow is refused" 1 "$RC"
@@ -355,6 +356,19 @@ check    "unit options on another action are refused" 1 "$RC"
 echo "enumerated when it runs"
 sleep 1
 write_spec ',{"id":"c","name":"cbk-uat-c","state":"stopped","blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}]}'
+# B243: a policy set by name for a unit never backed up here is stored
+# under its id, and show by name read <provider>:<name>: the policy just
+# set was absent and the repository's values were shown as in force.
+cb unit policy set 1 --provider fake cbk-uat-c retention.keep_daily 5 > /dev/null
+OUT=$(cb unit policy show 1 --provider fake cbk-uat-c)
+contains "a policy set by name reads back by name" '"unit":{"retention.keep_daily":"5"}' "$OUT"
+contains "under the unit's id" '"unit_key":"fake:c"' "$OUT"
+contains "and is in force" '"retention.keep_daily":5' "$OUT"
+check    "by id it is the same policy" "$OUT" "$(cb unit policy show 1 --provider fake c)"
+OUT=$(cb unit policy show 1 --provider fake nosuch 2>&1); RC=$?
+check    "an unknown unit's policy is not shown as the repository's" 1 "$RC"
+contains "saying why" "lists no unit nosuch" "$OUT"
+cb unit policy set 1 --provider fake cbk-uat-c retention.keep_daily "" > /dev/null
 OUT=$(cb unit backup 1 --provider fake --all)
 contains "a unit added since is included" '"ok":3' "$OUT"
 

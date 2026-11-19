@@ -434,6 +434,15 @@ contains "and the argv from its params" '"argv":["pg_dump","-Fc","-Z0","-U","pos
 OUT=$(cb db enable 1 "$FID" --template pg-dump --param user=postgres --param database=app 2>&1); RC=$?
 check    "enabling what the policy refuses fails" 1 "$RC"
 contains "and returns the policy line instead" '[db] allow_templates = pg-dumpall, prometheus-snapshot, pg-dump' "$OUT"
+if command -v curl >/dev/null 2>&1; then
+    # B240: the line is a field of the 409, which the desktop app reads; it
+    # used to cut it out of the message's text.
+    OUT=$(curl -s -w ' %{http_code}' --unix-socket "$SOCK" -X POST \
+          -d '{"template":"pg-dump","params":{"user":"postgres","database":"app"}}' \
+          "http://x/repos/1/databases/$FID/enable")
+    contains "the refusal is a 409" ' 409' "$OUT"
+    contains "with the line as its own field" '"policy_line":"[db] allow_templates = pg-dumpall, prometheus-snapshot, pg-dump"' "$OUT"
+fi
 OUT=$(cb db enable 1 "$FID" --template pg-dump --param user=Robert --param database=app 2>&1); RC=$?
 check    "a parameter outside its grammar is refused" 1 "$RC"
 contains "naming the grammar" '[a-z_][a-z0-9_]{0,62}' "$OUT"

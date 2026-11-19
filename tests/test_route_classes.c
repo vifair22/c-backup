@@ -240,6 +240,65 @@ static void test_every_repo_path_write_resolves_to_its_decision(void **state)
     api_server_stop(srv);
 }
 
+/*
+ * B239: every write declares its body members, and the router refuses one
+ * it did not declare with 400 naming it, before the handler runs. Table
+ * driven over DECIDED, which test_every_registered_write_has_a_class holds
+ * to being every write the daemon serves, so a new write cannot be added
+ * without deciding this too. The handler is never reached on a refusal, so
+ * no database is needed here.
+ *
+ * The routes whose handler checks its own members, because which ones are
+ * valid depends on another member or on the provider, are listed here so
+ * that a list turning into API_KEYS_HANDLER is a decision, and each has an
+ * end-to-end case of its own refusal: tests/test_api_e2e.sh "unknown body
+ * members" (schedules), "database detection" and "database finding
+ * actions"; tests/test_helper_e2e.sh (a units job); tests/test_units_e2e.sh
+ * (unit policy).
+ */
+static const char *const OWN_CHECK[] = {
+    "/repos/1/schedules", "/repos/1/units/backup", "/repos/1/units/fake/u1/policy",
+    "/repos/1/units/fake/u1/detect", "/repos/1/databases/2/preview",
+    "/repos/1/databases/2/enable", "/repos/1/databases/2/dismiss",
+};
+
+static int own_check(const char *url)
+{
+    for (size_t i = 0; i < sizeof(OWN_CHECK) / sizeof(OWN_CHECK[0]); i++)
+        if (strcmp(OWN_CHECK[i], url) == 0) return 1;
+    return 0;
+}
+
+static void test_every_write_refuses_an_unknown_body_member(void **state)
+{
+    (void)state;
+    api_server_t *srv = every_route();
+    static const char body[] = "{\"zz_b239\":1}";
+    for (size_t i = 0; i < NDECIDED; i++) {
+        const char *url = DECIDED[i].url;
+        api_method_t m = DECIDED[i].method;
+        const char *const *keys = api_server_keys_for(srv, url, m);
+        if (!keys) fail_msg("%s %s declares no body keys", MNAME[m], url);
+        if (keys == API_KEYS_HANDLER) {
+            if (!own_check(url))
+                fail_msg("%s %s leaves its body to the handler: list it in OWN_CHECK "
+                         "with the test of its refusal", MNAME[m], url);
+            continue;
+        }
+        if (own_check(url))
+            fail_msg("%s %s is in OWN_CHECK but declares its keys", MNAME[m], url);
+        api_request_t req = { .method = m, .url = url, .client_addr = "",
+                              .body = body, .body_len = sizeof(body) - 1 };
+        api_response_t r = api_server_dispatch(srv, &req);
+        if (r.status != 400 || !r.body || !strstr(r.body, "unknown key 'zz_b239'"))
+            fail_msg("%s %s answered %d %s to an unknown member", MNAME[m], url, r.status,
+                     r.body ? r.body : "");
+        free(r.body);
+        free(r.set_cookie);
+    }
+    api_server_stop(srv);
+}
+
 /* The Allow header a table entry produces is the one the old strings gave. */
 static void test_path_allow_strings(void **state)
 {
@@ -262,6 +321,7 @@ int main(void)
         cmocka_unit_test(test_every_registered_write_has_a_class),
         cmocka_unit_test(test_every_repo_path_write_resolves_to_its_decision),
         cmocka_unit_test(test_path_allow_strings),
+        cmocka_unit_test(test_every_write_refuses_an_unknown_body_member),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

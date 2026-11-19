@@ -219,6 +219,58 @@ int api_server_route(api_server_t *srv, const char *pattern,
 int api_server_route_class(api_server_t *srv, const char *pattern,
                            api_class_fn fn, void *userdata);
 
+/*
+ * The body members a write accepts (B239).
+ *
+ * Every route read the members it knew and ignored the rest, so a client
+ * that misspelled one, or sent a member its daemon was too old to know,
+ * was answered 2xx having had part of its request silently dropped: a
+ * PUT /sources carrying "snapshot" to a build without snapshot mode
+ * replaced the sources and quietly turned the mode off. The router now
+ * refuses, with 400 naming it, any member of an object body that the
+ * route has not declared, before the handler runs.
+ *
+ * A list is NULL-terminated. An entry is a member name, or a path into a
+ * member: "snapshot[].mode" says "snapshot" is accepted and, when it is an
+ * array, each object in it may hold "mode"; "trigger.kind" the same for an
+ * object member. A member with no path entries is not looked inside.
+ *
+ * API_KEYS_NONE: the route takes no body members at all.
+ * API_KEYS_HANDLER: the handler checks its own members and refuses an
+ * unknown one itself, because they are open-ended (policy keys) or depend
+ * on another member (a schedule's action).
+ *
+ * Like the class, there is no default: api_server_start refuses a write
+ * whose keys were never declared, and a per-path route without a resolver.
+ * A body that is not a JSON object is left to the handler to refuse.
+ */
+extern const char *const API_KEYS_NONE[];
+extern const char *const API_KEYS_HANDLER[];
+
+typedef const char *const *(*api_keys_fn)(const char *url, api_method_t method,
+                                          void *userdata);
+
+/* Declare the members of a fixed (non-wildcard) write route. */
+int api_server_route_keys(api_server_t *srv, const char *pattern,
+                          api_method_t method, const char *const *keys);
+
+/* The resolver for routes under `pattern` (ending in '*') registered
+ * API_CLASS_BY_PATH. It returns NULL only for a path and method the
+ * handler does not serve, which then answers its own 404 or 405. */
+int api_server_route_keys_fn(api_server_t *srv, const char *pattern,
+                             api_keys_fn fn, void *userdata);
+
+/* The first member of body (len bytes) outside keys, as a 400 message in
+ * msg: 1 when there is one, 0 when every member is declared, the body is
+ * empty or not a JSON object, or keys is API_KEYS_HANDLER. */
+int api_body_unknown_key(const char *body, size_t len, const char *const *keys,
+                         char *msg, size_t msg_sz);
+
+/* The keys a write to `url` would be held to, resolved as a request is:
+ * NULL for a GET, when no route matches, or when none was declared. */
+const char *const *api_server_keys_for(const api_server_t *srv, const char *url,
+                                       api_method_t method);
+
 /* The class a 2xx answer to `method` on `url` would wait for, resolved as a
  * request is: API_CLASS_NONE for a GET or when no route matches. */
 api_write_class_t api_server_class_for(const api_server_t *srv, const char *url,

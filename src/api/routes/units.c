@@ -670,6 +670,18 @@ static api_response_t unit_history(const api_request_t *req, int64_t repo_id,
     return json_out(root);
 }
 
+/* Whether any unit policy row is stored under key. */
+static int unit_policy_present(int64_t repo_id, const char *key)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int yes = db_execute(g_db, "SELECT 1 FROM unit_policy WHERE repo_id = ? AND unit_key = ? LIMIT 1",
+                         (const char *[]){ repo, key, NULL }, &r) == 0 && r && r->nrows > 0;
+    db_result_free(r);
+    return yes;
+}
+
 static api_response_t unit_policy_get(int64_t repo_id, const char *key)
 {
     gfs_retention_t ret;
@@ -1416,8 +1428,22 @@ api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const 
         if (code) return api_error(code, why);
         return unit_checkpoints_get(repo_id, key);
     }
-    (void)key_for(repo_id, prov, unit, key, sizeof(key));
+    int found = key_for(repo_id, prov, unit, key, sizeof(key));
     if (strcmp(suffix, "snapshots") == 0) return unit_history(req, repo_id, key);
+    /*
+     * The key a policy is read under is the one PUT stores it under. For a
+     * unit never backed up here PUT resolves a name through the provider
+     * and stores under the id, and GET used to read <provider>:<name>
+     * instead: the policy just set was not shown, and the repository's
+     * values were, as though it were in force (B243). A policy row under
+     * the key as given still answers when the provider no longer lists the
+     * unit, so a policy set by id stays readable after the unit is gone.
+     */
+    if (!found && !unit_policy_present(repo_id, key)) {
+        char why[768];
+        int code = policy_unit(repo_id, prov, unit, key, sizeof(key), why, sizeof(why));
+        if (code) return api_error(code, why);
+    }
     return unit_policy_get(repo_id, key);
 }
 

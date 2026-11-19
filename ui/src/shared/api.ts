@@ -209,6 +209,15 @@ export type ApiRequest =
   | { kind: 'authLogin'; password: string }
 
 /* The levels a unit capture can achieve, lowest first (Manual 22.1). */
+/*
+ * A call answered either way: the body on success, or the daemon's refusal
+ * with its status and the whole body, for a refusal that carries fields
+ * beyond its message (B240).
+ */
+export type ApiCallResult<T = unknown> =
+  | { ok: true; body: T }
+  | { ok: false; status: number; error: string; body: unknown }
+
 export type UnitLevel = 'inconsistent' | 'crash' | 'quiesced' | 'application' | 'offline'
 export type PauseScope = 'unit' | 'group' | 'job'
 

@@ -372,20 +372,28 @@ export function canAct(f: Pick<WireDbFinding, 'confidence' | 'state'>): boolean 
 }
 
 /*
- * The enable route's policy refusal, split back apart.
- *
- * The 409 carries policy_line as its own field, but only `error` crosses
- * the IPC boundary, so the line is recovered from the message, which ends
- * with it after a fixed marker. null for any other error.
+ * The policy line from the enable route's 409, which carries it as a field
+ * of its own: the line to add to the helper's policy. null for any other
+ * refusal. The screen used to cut it out of the message after a fixed
+ * phrase, so rewording the message would have lost it (B240).
  */
-const POLICY_MARK = 'add it there first: '
+export function policyLineOf(body: unknown): string | null {
+  if (!body || typeof body !== 'object') return null
+  const line = (body as { policy_line?: unknown }).policy_line
+  return typeof line === 'string' && line.trim() ? line.trim() : null
+}
 
-export function policyRefusal(message: string): { error: string; policyLine: string } | null {
-  const at = message.lastIndexOf(POLICY_MARK)
-  if (at < 0) return null
-  const policyLine = message.slice(at + POLICY_MARK.length).trim()
-  if (!policyLine) return null
-  return { error: message.slice(0, at).replace(/[;\s]+$/, ''), policyLine }
+/* A refusal from apiCallResult, thrown in the renderer, where it keeps its
+ * body: an Error crossing IPC would keep only its message. */
+export class ApiRefusal extends Error {
+  readonly status: number
+  readonly body: unknown
+  constructor(error: string, status: number, body: unknown) {
+    super(error)
+    this.name = 'ApiRefusal'
+    this.status = status
+    this.body = body
+  }
 }
 
 /* The dismiss route's rule (1 to 512 bytes, no control characters), checked

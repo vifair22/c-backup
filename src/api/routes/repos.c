@@ -788,6 +788,93 @@ static api_write_class_t repo_class_for_url(const char *url, api_method_t method
     return api_path_class(repo_path_entry(rest), method);
 }
 
+/*
+ * The body members each write under /repos/<id> accepts (B239), by the
+ * path table's sample. The router refuses any other member with 400 before
+ * the handler runs; a write the tables serve with no entry here is refused
+ * the same way, so it cannot go unchecked (test_route_classes holds every
+ * write to having one). API_KEYS_HANDLER: the handler refuses its own.
+ */
+static const char *const K_KEY_IMPORT[] = { "key", NULL };
+static const char *const K_REPAIR[]     = { "accept_missing", NULL };
+static const char *const K_TAG[]        = { "name", "snap_id", "move", NULL };
+static const char *const K_GREP[]       = { "pattern", "path_prefix", "ignore_case", "max_files",
+                                            "max_hits_per_file", "max_hits", "snapshot", NULL };
+static const char *const K_BACKUP[]     = { "label", "paths", "exclude", "one_filesystem", NULL };
+static const char *const K_REPLICATE[]  = { "dest", "reencrypt", "allow_plaintext", NULL };
+static const char *const K_RESTORE[]    = { "dest", "overwrite", "prefer_engine_copy", "subpath", NULL };
+static const char *const K_SOURCES[]    = { "sources", "exclude", "snapshot[].path",
+                                            "snapshot[].mode", NULL };
+static const char *const K_SCHED_PUT[]  = { "enabled", NULL };
+static const char *const K_NOTE[]       = { "body", NULL };
+static const char *const K_POLICY[]     = { "key", "value", NULL };
+static const char *const K_UNIT_RESTORE[] = { "mode", "dest", "item", "format", "overwrite", "name",
+                                              "target_root", "replace", "pin_digest", "start",
+                                              "keep_macs", NULL };
+static const char *const K_UNIT_EXPORT[] = { "item", "ttl_s", NULL };
+
+static const struct {
+    const char        *path;
+    api_method_t       method;
+    const char *const *keys;
+} k_repo_keys[] = {
+    { "",                                  API_DELETE, API_KEYS_NONE },
+    { "/key/import",                       API_POST,   K_KEY_IMPORT },
+    { "/key/ack",                          API_POST,   API_KEYS_NONE },
+    { "/repair",                           API_POST,   K_REPAIR },
+    { "/tags",                             API_POST,   K_TAG },
+    { "/tags/<name>",                      API_DELETE, API_KEYS_NONE },
+    /* Which members a schedule takes depends on its action. */
+    { "/schedules",                        API_POST,   API_KEYS_HANDLER },
+    { "/schedules/<id>",                   API_PUT,    K_SCHED_PUT },
+    { "/schedules/<id>",                   API_DELETE, API_KEYS_NONE },
+    { "/policy",                           API_PUT,    K_POLICY },
+    { "/sources",                          API_PUT,    K_SOURCES },
+    { "/grep",                             API_POST,   K_GREP },
+    { "/verify",                           API_POST,   API_KEYS_NONE },
+    { "/backup",                           API_POST,   K_BACKUP },
+    { "/gc",                               API_POST,   API_KEYS_NONE },
+    { "/gfs",                              API_POST,   API_KEYS_NONE },
+    { "/reindex",                          API_POST,   API_KEYS_NONE },
+    { "/replicate",                        API_POST,   K_REPLICATE },
+    { "/snapshots/<id>",                   API_DELETE, API_KEYS_NONE },
+    { "/snapshots/<id>/note",              API_PUT,    K_NOTE },
+    { "/snapshots/<id>/restore",           API_POST,   K_RESTORE },
+    /* A units job checks its own, as its schedule params are the same. */
+    { "/units/backup",                     API_POST,   API_KEYS_HANDLER },
+    { "/units/<p>/<u>/policy",             API_PUT,    API_KEYS_HANDLER },
+    { "/units/<p>/<u>/reset-incremental",  API_POST,   API_KEYS_NONE },
+    { "/units/<p>/<u>/detect",             API_POST,   API_KEYS_HANDLER },
+    { "/snapshots/<id>/unit/restore",      API_POST,   K_UNIT_RESTORE },
+    { "/snapshots/<id>/unit/export",       API_POST,   K_UNIT_EXPORT },
+    /* Database findings refused unknown members from the start. */
+    { "/databases/<id>/preview",           API_POST,   API_KEYS_HANDLER },
+    { "/databases/<id>/enable",            API_POST,   API_KEYS_HANDLER },
+    { "/databases/<id>/dismiss",           API_POST,   API_KEYS_HANDLER },
+};
+
+const char *const *routes_repo_keys(const char *sample, api_method_t method)
+{
+    for (size_t i = 0; i < sizeof(k_repo_keys) / sizeof(k_repo_keys[0]); i++)
+        if (k_repo_keys[i].method == method && strcmp(k_repo_keys[i].path, sample) == 0)
+            return k_repo_keys[i].keys;
+    return NULL;
+}
+
+static const char *const *repo_keys_for_url(const char *url, api_method_t method, void *ud)
+{
+    (void)ud;
+    const char *rest = NULL;
+    if (split_repo_url(url, &rest) < 0) return NULL;
+    const api_path_t *p = repo_path_entry(rest);
+    if (api_path_class(p, method) == API_CLASS_NONE) return NULL;
+    const char *const *k = routes_repo_keys(p->path, method);
+    if (k) return k;
+    /* Served but undeclared: refuse every member rather than drop them. */
+    log_error("api: %s under /repos has no declared body keys", p->path);
+    return API_KEYS_NONE;
+}
+
 /* For the router: a method no handler is registered for (PATCH, OPTIONS). */
 static const char *repo_allow_for_url(const char *url, void *ud)
 {
@@ -1150,6 +1237,9 @@ int routes_register_repos(api_server_t *srv, cutils_db_t *db)
     if (api_server_route(srv, "/repos/*", API_DELETE, API_CLASS_BY_PATH, repo_scoped_delete, db) != 0) return -1;
     if (api_server_route_allow(srv, "/repos/*", repo_allow_for_url, db) != 0) return -1;
     if (api_server_route_class(srv, "/repos/*", repo_class_for_url, db) != 0) return -1;
+    static const char *const k_create[] = { "path", "label", "encrypt", "passphrase", NULL };
+    if (api_server_route_keys(srv, "/repos", API_POST, k_create) != 0) return -1;
+    if (api_server_route_keys_fn(srv, "/repos/*", repo_keys_for_url, db) != 0) return -1;
     return 0;
 }
 
