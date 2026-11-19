@@ -270,8 +270,8 @@ static void emit_txn_metrics(mbuf_t *m)
                "# TYPE cbackup_checkpoint_throttle_seconds_total counter\n"
                "cbackup_checkpoint_throttle_seconds_total %.6f\n",
             (double)c.throttle_ns / 1e9);
-    mb_addf(m, "# HELP cbackup_wal_frames_max The most frames state.db's WAL was seen "
-               "holding since start.\n# TYPE cbackup_wal_frames_max gauge\n"
+    mb_addf(m, "# HELP cbackup_wal_frames_max The most frames state.db's WAL held "
+               "since start, read after every commit.\n# TYPE cbackup_wal_frames_max gauge\n"
                "cbackup_wal_frames_max %u\n", c.max_wal_frames);
 }
 

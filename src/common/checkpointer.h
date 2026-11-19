@@ -129,7 +129,11 @@ typedef struct {
     unsigned long escalations;      /* PASSIVE checkpoints run under the write lock */
     unsigned long busy;             /* checkpoints that could not start */
     unsigned long failed;           /* refused by SQLite, or -shm unreadable (B215) */
-    uint32_t      max_wal_frames;   /* the most frames the WAL was seen holding */
+    /* The most frames the WAL held since start: seen by the thread's ticks
+     * and by every db_txn commit (checkpointer_note_wal_frames), since the
+     * WAL grows only at a commit and a tick once a second saw too few of
+     * its peaks (B236). */
+    uint32_t      max_wal_frames;
     uint64_t      max_lock_ns;      /* the longest escalation hold */
     unsigned long pre_restarts;     /* WAL restarts this thread made itself */
     unsigned long pre_restart_misses; /* restart writes that did not restart */
@@ -201,6 +205,12 @@ int checkpointer_finish(unsigned budget_ms);
 #define CKPT_FINAL_FRAMES 4096
 
 void checkpointer_stats(checkpointer_stats_t *out);
+
+/* A commit left the WAL holding this many frames (db_txn_commit, read from
+ * the wal-index). Raises max_wal_frames; a single atomic, so any thread
+ * calls it, with or without the write lock, and before start too (the
+ * value then belongs to whatever start follows). */
+void checkpointer_note_wal_frames(uint32_t frames);
 
 /* Called by db_txn_begin_bulk before it queues for the write lock: past the
  * hard cap, wait for the checkpointer to complete a copy (B181; the design

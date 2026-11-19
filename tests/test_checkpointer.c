@@ -862,6 +862,33 @@ static void test_the_lock_wait_is_not_counted_as_the_hold(void **state)
     assert_true(st.max_lock_ns < 250ull * 1000000ull);
 }
 
+/*
+ * B236: cbackup_wal_frames_max is the WAL's real peak, not what a tick
+ * happened to see. With no tick at all (the interval is a minute) the
+ * peak reached by commits is reported, and a restart and a smaller WAL
+ * after it do not lower it.
+ */
+static void test_the_wal_peak_is_seen_at_every_commit(void **state)
+{
+    (void)state;
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 60000), OK);
+    for (int i = 0; i < 40; i++) assert_int_equal(commit_rows(10), 0);
+    uint32_t peak = wal_frames();
+    assert_true(peak > THRESHOLD);
+    checkpointer_stats_t s;
+    checkpointer_stats(&s);
+    print_message("  WAL at %u frames; reported peak %u, ticks %lu\n", peak,
+                  s.max_wal_frames, s.ticks);
+    assert_int_equal(s.ticks, 0);
+    assert_int_equal(s.max_wal_frames, peak);
+
+    assert_int_equal(checkpointer_force(), OK);           /* copy and restart */
+    assert_int_equal(commit_rows(1), 0);
+    assert_true(wal_frames() < peak);
+    checkpointer_stats(&s);
+    assert_int_equal(s.max_wal_frames, peak);
+}
+
 static int file_exists(const char *p)
 {
     struct stat sb;
@@ -1001,6 +1028,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_refused_checkpoint_is_a_failure_not_busy,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_lock_wait_is_not_counted_as_the_hold,
+                                        setup, teardown),
+        cmocka_unit_test_setup_teardown(test_the_wal_peak_is_seen_at_every_commit,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_shutdown_does_not_wait_for_a_slow_copy,
                                         setup, teardown),

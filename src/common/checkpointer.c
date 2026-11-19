@@ -72,6 +72,9 @@ static atomic_int    g_test_idle;
 /* Shutdown has begun (B218): no new checkpoint starts, and one interrupted
  * by checkpointer_halt is not a failure. */
 static atomic_int    g_halting;
+/* The WAL's high-water mark as commits saw it (B236), merged into
+ * max_wal_frames by checkpointer_stats. */
+static atomic_uint   g_wal_peak;
 /* checkpointer_finish left the WAL: the close must not copy it. */
 static int           g_leave_wal;
 
@@ -627,6 +630,7 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
     g_stop = 0;
     atomic_store(&g_halting, 0);
     memset(&g_stats, 0, sizeof(g_stats));
+    atomic_store(&g_wal_peak, 0);
     if (pthread_create(&g_th, NULL, main_loop, NULL) != 0) {
         pthread_cond_destroy(&g_cv);
         sqlite3_close(g_ck);
@@ -808,9 +812,19 @@ void checkpointer_stop(void)
     pthread_mutex_unlock(&g_mu);
 }
 
+void checkpointer_note_wal_frames(uint32_t frames)
+{
+    unsigned cur = atomic_load_explicit(&g_wal_peak, memory_order_relaxed);
+    while (frames > cur &&
+           !atomic_compare_exchange_weak_explicit(&g_wal_peak, &cur, frames,
+                                                  memory_order_relaxed, memory_order_relaxed)) {}
+}
+
 void checkpointer_stats(checkpointer_stats_t *out)
 {
     pthread_mutex_lock(&g_mu);
     *out = g_stats;
     pthread_mutex_unlock(&g_mu);
+    uint32_t peak = atomic_load_explicit(&g_wal_peak, memory_order_relaxed);
+    if (peak > out->max_wal_frames) out->max_wal_frames = peak;
 }
