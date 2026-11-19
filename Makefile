@@ -788,6 +788,12 @@ fuzz-regress: fuzz
 	exit $$rc
 
 # ---- Static analysis --------------------------------------------------
+# Every source compiled with $(1) and -Werror, in parallel, objects thrown
+# away (the warnings step of analyze).
+define WARN_CHECK
+printf '%s\n' $(SRCS) | xargs -P $$(nproc) -I{} $(CC) $(1) -Werror -c {} -o /dev/null && \
+	for f in $(VIRT_SRCS); do $(CC) $(1) $(VIRT_CFLAGS) -Werror -c $$f -o /dev/null || exit 1; done
+endef
 ANALYZE_CFLAGS := -std=c11 -pthread -Wall -Wextra -O2 -march=$(MARCH) $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
 STACK_LIMIT    := 65536
 
@@ -821,6 +827,16 @@ analyze: check-conflict-markers | $(BUILD)
 	rm -rf $(BUILD)/analyze; \
 	if [ $$fail -ne 0 ]; then echo "stack-usage: FAIL"; exit 1; fi
 	@echo "stack-usage: OK"
+	@# Some warnings, -Wformat-truncation among them, come from the
+	@# optimiser's range analysis, so they appear at one -O level and not
+	@# another: the -O3 -flto release build was clean while debug and asan
+	@# warned (B230). Every variant's flags are checked, with -Werror, so a
+	@# warning in any of them fails here rather than scrolling past a build.
+	@echo "=== warnings (release, debug, asan flags) ==="
+	@$(call WARN_CHECK,$(RELEASE_CFLAGS))
+	@$(call WARN_CHECK,$(DEBUG_CFLAGS))
+	@$(call WARN_CHECK,$(ASAN_CFLAGS))
+	@echo "warnings: OK"
 	@echo "=== gcc-fanalyzer ==="
 	@for f in $(SRCS); do \
 	    $(CC) $(ANALYZE_CFLAGS) -fanalyzer -fsyntax-only $$f 2>&1; \

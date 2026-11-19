@@ -28,6 +28,7 @@
 #include "reserved.h"
 #include "db_write.h"
 #include "node_gen.h"
+#include "msg_clip.h"
 
 #include <cutils/log.h>
 
@@ -3101,8 +3102,10 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
          * falls, and gc indexes any such record before it marks (B200), so
          * nothing this snapshot alone holds can be swept meanwhile.
          */
-        char cause[2048];
-        snprintf(cause, sizeof(cause), "%s", err_msg());
+        /* Bounded below the error buffer so the guidance after it always
+         * fits; a longer cause says it was cut. */
+        char cause[MSG_CLIP_MAX];
+        msg_clip(cause, sizeof(cause), err_msg());
         set_error(st, "%s; snapshot %lld was written to the repository but its "
                   "index did not commit: the next daemon start indexes it "
                   "(reconcile), as does the next gc before it sweeps, and "

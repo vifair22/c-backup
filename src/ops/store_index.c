@@ -6,6 +6,7 @@
 #include "db_txn.h"
 #include "db_write.h"
 #include "db_readers.h"
+#include "msg_clip.h"
 
 #include <cutils/log.h>
 
@@ -415,7 +416,7 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
     /* The cause, from whichever call failed (B194), before the cleanup
      * below can replace it. */
     char why[1024];
-    snprintf(why, sizeof(why), "%s", err_msg()[0] ? err_msg() : "no reason recorded");
+    msg_clip(why, sizeof(why), err_msg()[0] ? err_msg() : "no reason recorded");
     if (in_txn) db_txn_rollback(idx->db);
     log_error("pack commit: pack %s (%u objects) did not commit%s: %s", pack,
               info->entry_count,

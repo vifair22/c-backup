@@ -741,6 +741,31 @@ static int restart_latches(void)
 }
 
 /*
+ * B230: a latch on a file with a long path keeps the cause. The message
+ * held a 1024-byte "<file>: <strerror>", so a path past that lost the
+ * strerror, live and in the copy state.db brings back after a restart.
+ */
+static void test_a_long_path_keeps_the_latch_cause(void **state)
+{
+    (void)state;
+    char file[2100];
+    memset(file, 'p', sizeof(file) - 1);
+    file[0] = '/';
+    file[sizeof(file) - 1] = '\0';
+    sync_latch_repo_trip(TEST_REPO, file, EIO);
+
+    char want[256], msg[ERR_MSG_MAX];
+    snprintf(want, sizeof(want), ": %s", strerror(EIO));
+    for (int pass = 0; pass < 2; pass++) {
+        assert_int_equal(sync_latch_repo_info(TEST_REPO, msg, sizeof(msg), NULL), 1);
+        size_t n = strlen(msg), w = strlen(want);
+        assert_true(n == strlen(file) + w);
+        assert_string_equal(msg + n - w, want);
+        if (pass == 0) assert_int_equal(restart_latches(), 1);
+    }
+}
+
+/*
  * Two repositories, as on separate disks. One EIO on a pack seal's fsync
  * in the first latches that repository and nothing else: it refuses
  * backup, gc, compaction, prune and its durable routes, and shows
@@ -996,6 +1021,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_sync_failure_installs_nothing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_sync_failure_latches_durable_writes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_sync_failure_latches_only_its_repo, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_long_path_keeps_the_latch_cause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_sync_repair_waits_for_the_job_holding_the_repo, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
