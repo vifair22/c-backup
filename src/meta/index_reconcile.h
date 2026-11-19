@@ -30,9 +30,12 @@
  *
  * It finds and reports; it does not reindex inline. For each repository
  * with missing snapshots it calls submit, which the daemon points at the
- * job manager, so the reindex runs as an ordinary job: under the
+ * job manager, so the indexing runs as an ordinary job: under the
  * repository's write lock, serialised with anything else for that
- * repository, visible in the job list and the journal.
+ * repository, visible in the job list and the journal. That job indexes
+ * the missing records alone (reindex_gaps_run), never the whole
+ * repository: a full rebuild for one lost snapshot took 1,596 s on a
+ * 91-snapshot repository with backups queued behind it (B264).
  */
 
 #include "error.h"

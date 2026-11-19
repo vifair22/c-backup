@@ -345,6 +345,9 @@ typedef struct { uint32_t live; db_engine_t hint; char container[NAME_SZ]; char 
 typedef struct { char *path; char container[NAME_SZ]; char comm[SP_PROBE_COMM_MAX]; } osig_t;
 typedef enum { HINT_IMAGE = 0, HINT_PORT, HINT_PROCESS } hint_kind_t;
 typedef struct { db_engine_t engine; hint_kind_t kind; char container[NAME_SZ]; char text[SP_PROBE_IMAGE_MAX]; } hsig_t;
+/* A container's mount: where it sees it, and where the unit records it
+ * (NULL: not backed up). */
+typedef struct { char container[NAME_SZ]; char *dest; char *recorded; } mrec_t;
 
 #define VEC(T) struct { T *v; size_t n, cap; }
 
@@ -369,6 +372,7 @@ struct db_detector {
     VEC(osig_t) osigs;
     VEC(hsig_t) hsigs;
     VEC(char *) names;            /* the unit's container names and aliases */
+    VEC(mrec_t) mounts;           /* every container's, from the probe */
 };
 
 #define VEC_PUSH(d, vec, item) do {                                          \
@@ -409,6 +413,8 @@ void db_detect_free(db_detector_t *d)
     for (size_t i = 0; i < d->nchosts.n; i++) free(d->nchosts.v[i].path);
     for (size_t i = 0; i < d->osigs.n; i++) free(d->osigs.v[i].path);
     for (size_t i = 0; i < d->names.n; i++) free(d->names.v[i]);
+    for (size_t i = 0; i < d->mounts.n; i++) { free(d->mounts.v[i].dest); free(d->mounts.v[i].recorded); }
+    free(d->mounts.v);
     free(d->dirs.v); free(d->links.v); free(d->sibs.v); free(d->unsettled.v);
     free(d->carry.v); free(d->heads.v); free(d->nchosts.v);
     free(d->psigs.v); free(d->osigs.v); free(d->hsigs.v); free(d->names.v);
@@ -908,6 +914,18 @@ void db_detect_unit(db_detector_t *d, const sp_unit_probe_t *probe)
             VEC_PUSH(d, d->psigs, ps);
             add_hint(d, m, HINT_PROCESS, c->name, c->procs[k].comm);
         }
+        for (size_t k = 0; k < c->n_mounts && !d->failed; k++) {
+            const sp_probe_mount_t *pm = &c->mounts[k];
+            if (!pm->dest || pm->dest[0] != '/') continue;
+            mrec_t m;
+            memset(&m, 0, sizeof(m));
+            snprintf(m.container, sizeof(m.container), "%s", c->name);
+            m.dest = strdup(pm->dest);
+            m.recorded = pm->recorded ? strdup(pm->recorded) : NULL;
+            if (!m.dest || (pm->recorded && !m.recorded)) { free(m.dest); free(m.recorded); d->failed = 1; break; }
+            VEC_PUSH(d, d->mounts, m);
+            if (d->failed) { free(m.dest); free(m.recorded); }
+        }
         for (size_t k = 0; k < c->n_open && !d->failed; k++) {
             if (!c->open[k].path || c->open[k].path[0] != '/') continue;
             osig_t o;
@@ -1264,6 +1282,47 @@ static int has_unsettled_under(const db_detector_t *d, const char *path, unsigne
     return n > 0;
 }
 
+/*
+ * Where a link target inside a container's data is recorded (B245). The
+ * container is the one whose backed-up mount holds the data; its nearest
+ * mount at or above the target decides. Without a probe's mounts for that
+ * container nothing can be said (CT_UNKNOWN), as before the probe sent
+ * them. *out is the recorded path, malloc'd, for CT_MAPPED.
+ */
+enum { CT_UNKNOWN = 0, CT_MAPPED, CT_EXCLUDED, CT_UNMOUNTED };
+
+static int container_target(const db_detector_t *d, const char *data, const char *target, char **out)
+{
+    *out = NULL;
+    const mrec_t *home = NULL;
+    size_t hl = 0;
+    for (size_t i = 0; i < d->mounts.n; i++) {
+        const mrec_t *m = &d->mounts.v[i];
+        if (!m->recorded || !under(data, m->recorded)) continue;
+        size_t l = strlen(m->recorded);
+        if (!home || l > hl) { home = m; hl = l; }
+    }
+    if (!home) return CT_UNKNOWN;
+    const mrec_t *best = NULL;
+    size_t bl = 0;
+    for (size_t i = 0; i < d->mounts.n; i++) {
+        const mrec_t *m = &d->mounts.v[i];
+        if (strcmp(m->container, home->container) != 0 || !under(target, m->dest)) continue;
+        size_t l = strlen(m->dest);
+        if (!best || l > bl) { best = m; bl = l; }
+    }
+    if (!best) return CT_UNMOUNTED;
+    if (!best->recorded) return CT_EXCLUDED;
+    const char *rest = strcmp(best->dest, "/") == 0 ? target : target + strlen(best->dest);
+    size_t n = strlen(best->recorded) + strlen(rest) + 1;
+    char *p = malloc(n);
+    if (!p) return CT_MAPPED;
+    if (strcmp(best->recorded, "/") == 0 && rest[0]) snprintf(p, n, "%s", rest);
+    else snprintf(p, n, "%s%s", best->recorded, rest);
+    *out = p;
+    return CT_MAPPED;
+}
+
 static void check_links(const db_detector_t *d, const db_capture_desc_t *cap, cand_t *c,
                         int *extra_roots, size_t *n_extra, size_t max_extra)
 {
@@ -1281,17 +1340,38 @@ static void check_links(const db_detector_t *d, const db_capture_desc_t *cap, ca
         cJSON_AddStringToObject(o, "kind", l->kind == LINK_TBLSPC ? "tablespace"
                                          : l->kind == LINK_PG_WAL ? "pg_wal" : "journal");
         cJSON_AddStringToObject(o, "target", l->target);
+        char *mapped = NULL;
+        const char *target = l->target;
         if (cap && cap->container_paths) {
-            /* The target is a path in the container, the data is recorded
-             * at host paths: nothing here can say where it is. */
-            cJSON_AddStringToObject(o, "found", "unchecked");
-            c->links_unchecked++;
-            continue;
+            /* The target is a path in the container; the probe's mounts
+             * say where that is recorded, if anywhere (B245). */
+            int how = container_target(d, c->path, l->target, &mapped);
+            if (how == CT_UNKNOWN) {
+                cJSON_AddStringToObject(o, "found", "unchecked");
+                c->links_unchecked++;
+                continue;
+            }
+            if (how != CT_MAPPED) {
+                cJSON_AddStringToObject(o, "found", "outside the capture");
+                cJSON_AddStringToObject(o, "why", how == CT_EXCLUDED
+                                        ? "on a mount of the container the unit does not back up"
+                                        : "in the container's own filesystem, which the unit does not back up");
+                c->links_split++;
+                continue;
+            }
+            if (!mapped) {
+                cJSON_AddStringToObject(o, "found", "unchecked");
+                c->links_unchecked++;
+                continue;
+            }
+            cJSON_AddStringToObject(o, "recorded", mapped);
+            target = mapped;
         }
         uint64_t want_m = l->kind == LINK_TBLSPC ? M_TS_ROOT
                         : l->kind == LINK_PG_WAL ? M_WAL_DIR : M_WT_LOGDIR;
-        int seen = (dir_marks(d, l->target) & want_m) != 0;
-        int r = seen ? root_of(cap, l->target) : -1;
+        int seen = (dir_marks(d, target) & want_m) != 0;
+        int r = seen ? root_of(cap, target) : -1;
+        free(mapped);
         if (!seen || (cap && r < 0)) {
             cJSON_AddStringToObject(o, "found", "outside the capture");
             c->links_split++;
@@ -1391,7 +1471,10 @@ static void judge(const db_capture_desc_t *cap, cand_t *c, db_finding_t *f,
                       : cap->unit ? "mariadb-dump" : "source-snapshot";
         break;
     case DB_COV_SPLIT:
-        f->suggestion = cap->unit ? "pause-always" : "source-snapshot";
+        /* A pause or a grouping joins instants; it cannot bring in files
+         * the unit does not read. Then the dump (section 6). */
+        if (cap->unit && c->links_split) f->suggestion = dump_template(c->engine);
+        else f->suggestion = cap->unit ? "pause-always" : "source-snapshot";
         break;
     case DB_COV_UNCOVERED:
         if (!cap->unit) f->suggestion = c->engine == DB_ENGINE_SQLITE ? "sqlite-backup" : "source-snapshot";

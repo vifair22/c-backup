@@ -34,6 +34,11 @@ const char *sqlite_copy_outcome_name(sqlite_copy_outcome_t o)
     }
 }
 
+const char *sqlite_copy_journal_name(int wal)
+{
+    return wal > 0 ? "wal" : wal == 0 ? "rollback" : "unknown";
+}
+
 static void pause_ms(long ms)
 {
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
@@ -257,6 +262,7 @@ void sqlite_copy(const char *src, const char *dst, int allow_rollback_lock,
                  sqlite_copy_result_t *out)
 {
     memset(out, 0, sizeof(*out));
+    out->wal = -1;
     int fd = open(src, O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
         say(out, SQLITE_COPY_REFUSED, "the read-only open failed: %s", strerror(errno));
@@ -272,7 +278,6 @@ void sqlite_copy(const char *src, const char *dst, int allow_rollback_lock,
      * even briefly; read again under the lock, where it cannot change. */
     out->wal = header_wal(fd);
     if (out->wal < 0) {
-        out->wal = 0;
         say(out, SQLITE_COPY_REFUSED, "not a SQLite database (no SQLite header)");
         close(fd);
         return;

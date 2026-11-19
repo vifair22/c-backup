@@ -281,7 +281,11 @@ int __wrap_fdatasync(int fd) {
     return __real_fdatasync(fd);
 }
 
+int (*volatile fault_sfr_hook)(int fd) = NULL;
+
 int __wrap_sync_file_range(int fd, off_t offset, off_t nbytes, unsigned int flags) {
+    int (*h)(int) = fault_sfr_hook;
+    if (h) { int r = h(fd); if (r != FAULT_FS_PASS) return r; }
     /* When fsync fault is armed, fail sync_file_range but DON'T consume the
      * counter — let the fdatasync fallback in async_writeback() also fail. */
     if (fault_fsync_at >= 0) { errno = EIO; return -1; }

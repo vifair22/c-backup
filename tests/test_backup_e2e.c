@@ -1577,8 +1577,10 @@ static void test_object_left_by_an_interrupted_run_keeps_its_size(void **state)
 static void test_backup_removes_staging_files_left_by_a_killed_run(void **state)
 {
     (void)state;
+    /* packids.: B237. */
     const char *stale[] = { TEST_REPO "/tmp/snapids.Ab12Cd", TEST_REPO "/tmp/pack-dat.Zz99Yy",
-                            TEST_REPO "/tmp/snap.Qq11Ww", TEST_REPO "/tmp/deleting.Rr22Tt" };
+                            TEST_REPO "/tmp/snap.Qq11Ww", TEST_REPO "/tmp/deleting.Rr22Tt",
+                            TEST_REPO "/tmp/packids.Pp33Kk" };
     struct timespec past[2];
     clock_gettime(CLOCK_REALTIME, &past[0]);
     past[0].tv_sec -= 30;

@@ -251,6 +251,10 @@ static int choose(const finding_t *f, const char *want, const cJSON *params, con
     *params_out = NULL;
     char msg[512];
     const char *name = want ? want : f->tmpl[0] ? f->tmpl : f->suggestion;
+    /* A file source's SQLite finding has one engine copy, whatever was
+     * suggested (nothing when dormant or covered, source-snapshot when a
+     * snapshot is the better fix): preview it (B260). */
+    if (!want && !f->tmpl[0] && is_source(f) && strcmp(f->engine, "sqlite") == 0) name = "sqlite-backup";
     /* Nothing named or suggested (a covered finding, whose dump is only
      * optional): the engine's own, the first the default policy allows. */
     if (!name[0] && is_unit(f)) {

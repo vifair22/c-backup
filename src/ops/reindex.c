@@ -403,7 +403,7 @@ static status_t read_snapshot_record(store_t *store, int64_t snap_id,
 }
 
 static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
-                              int count);
+                              int count, int64_t only_snap);
 
 static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
                                        int64_t snap_id, int lists,
@@ -587,7 +587,7 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
      * no-op, because it only touches rows still missing their sizes. */
     status_t fst = fill_object_sizes(store, db, repo_id);
     if (fst == OK && lists) {
-        fst = reindex_lists(store, db, repo_id, 0);
+        fst = reindex_lists(store, db, repo_id, 0, snap_id);
         if (fst == OK) fst = fill_object_sizes(store, db, repo_id);
     }
     if (fst != OK) return fst;
@@ -982,19 +982,25 @@ static status_t walk_list_inner(store_t *store, cutils_db_t *db, const char *rep
     return st;
 }
 
+/* only_snap > 0: that snapshot's lists alone (B264), for indexing gaps:
+ * every other snapshot's were walked when it was indexed, and walking them
+ * all again for one new snapshot is the whole-repository cost a gap must
+ * not pay. */
 static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
-                              int count)
+                              int count, int64_t only_snap)
 {
-    char repo[32];
+    char repo[32], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
 
     db_result_t *r = NULL;
     if (db_execute(db,
             "SELECT DISTINCT n.content_hash FROM nodes n"
             "  JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
-            " WHERE n.repo_id = ? AND n.type = 1 AND o.type IN (1, 6)"
+            " WHERE n.repo_id = ?1 AND (CAST(?2 AS INTEGER) <= 0 OR n.snap_id = CAST(?2 AS INTEGER))"
+            "   AND n.type = 1 AND o.type IN (1, 6)"
             "   AND (o.orig_size IS NULL OR o.orig_size != n.size OR o.type = 6)",
-            (const char *[]){ repo, NULL }, &r) != 0) {
+            (const char *[]){ repo, snap, NULL }, &r) != 0) {
         db_result_free(r);
         return set_error(ERR_IO, "reindex: cannot list chunk lists");
     }
@@ -1208,6 +1214,14 @@ static status_t restore_pack_mark(store_t *store, cutils_db_t *db, int64_t repo_
 status_t reindex_gaps(store_t *store, cutils_db_t *db, int64_t repo_id,
                       const char *what, uint64_t *out_indexed)
 {
+    return reindex_gaps_run(store, db, repo_id, what, NULL, NULL, NULL, out_indexed);
+}
+
+status_t reindex_gaps_run(store_t *store, cutils_db_t *db, int64_t repo_id,
+                          const char *what, atomic_int *cancel,
+                          void (*progress)(const char *, uint64_t, uint64_t, void *),
+                          void *progress_ctx, uint64_t *out_indexed)
+{
     if (out_indexed) *out_indexed = 0;
     if (!store || !db || !what) return set_error(ERR_INVALID, "reindex_gaps: null argument");
     /* A record a prune had not finished removing is on its way out (B148);
@@ -1236,7 +1250,25 @@ status_t reindex_gaps(store_t *store, cutils_db_t *db, int64_t repo_id,
         return st;
     }
     for (size_t i = 0; i < n; i++) {
+        /* Between snapshots: each is indexed whole or not at all (its row
+         * last), so a cancel leaves the rest for the next start. */
+        if (cancel_requested(cancel)) {
+            st = set_error(ERR_BUSY, "%s cancelled after %zu of %zu snapshot(s) the "
+                           "index lacked", what, i, n);
+            free(gaps);
+            if (out_indexed) *out_indexed = i;
+            return st;
+        }
+        if (progress) {
+            char phase[64];
+            snprintf(phase, sizeof(phase), "index snapshot %lld", (long long)gaps[i]);
+            progress(phase, i, n, progress_ctx);
+        }
+        /* Sized as it is indexed, then its chunk lists alone (B264): every
+         * chunk a list names gets its object row, which compaction keeps
+         * exactly (reindex_snapshot). */
         st = reindex_snapshot_inner(store, db, repo_id, gaps[i], 0, NULL);
+        if (st == OK) st = reindex_lists(store, db, repo_id, 0, gaps[i]);
         if (st != OK) {
             st = set_error_wrap(st, "%s refused: snapshot %lld is in the repository but "
                                 "could not be indexed, and %s would delete what only it "
@@ -1247,16 +1279,14 @@ status_t reindex_gaps(store_t *store, cutils_db_t *db, int64_t repo_id,
             return st;
         }
     }
-    /* Every chunk a list of theirs names gets its object row: compaction
-     * keeps exactly the entries with rows (reindex_snapshot). */
-    st = reindex_lists(store, db, repo_id, 0);
-    if (st == OK) st = fill_object_sizes(store, db, repo_id);
+    st = fill_object_sizes(store, db, repo_id);
     if (st != OK) {
         st = set_error_wrap(st, "%s refused: the chunk lists of the snapshots just "
-                            "indexed could not be indexed", what);
+                            "indexed could not be sized", what);
         free(gaps);
         return st;
     }
+    if (progress) progress("index snapshots", n, n, progress_ctx);
     log_warn("%s: indexed snapshot record(s) the index lacked, %zu of them (first: %lld)",
              what, n, (long long)gaps[0]);
     free(gaps);
@@ -1352,7 +1382,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st != OK) return st;
     /* Chunk lists need sizes to be found and refcounts to add to; what they
      * name was just recorded, so it is sized in a second, small pass. */
-    st = reindex_lists(store, db, repo_id, 1);
+    st = reindex_lists(store, db, repo_id, 1, 0);
     if (st == OK) st = fill_object_sizes(store, db, repo_id);
     if (st == OK) st = restore_snapshot_mark(store, db, repo_id, highest_record, &total);
     if (st == OK) st = restore_pack_mark(store, db, repo_id, &total);

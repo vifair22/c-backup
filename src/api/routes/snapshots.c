@@ -890,6 +890,7 @@ typedef struct {
     verify_level_t  verify_level;
     int             verify_repair;
     int             clear_sync;   /* repo repair: clear a sync latch if clean */
+    int             gaps_only;    /* reindex: only records the index lacks (B264) */
     char           *pattern;
     char           *path_prefix;
     int             ignore_case;
@@ -1292,7 +1293,25 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
      * object checks this; see store_set_cancel. */
     store_set_cancel(store, cancel);
 
-    if (j->kind == SNAP_JOB_REINDEX) {
+    if (j->kind == SNAP_JOB_REINDEX && j->gaps_only) {
+        /*
+         * The start-up reconcile's job: index the records the index lacks,
+         * one by one, with progress, and nothing else (B264). It ran a full
+         * reindex_repo for one missing snapshot - 91 snapshots and 1.96M
+         * node rows rebuilt over 1,596 s at 100% CPU, reporting 0/0, with
+         * every queued backup waiting behind it. Tags were already put back
+         * inline by the reconcile, and the snapshot-id and pack-id marks are
+         * written ahead of anything that uses them, so nothing else a full
+         * reindex does is owed here.
+         */
+        uint64_t indexed = 0;
+        st = reindex_gaps_run(store, j->db, j->repo_id, "reindex", cancel,
+                              progress, progress_ctx, &indexed);
+        char rj[96];
+        snprintf(rj, sizeof(rj), "{\"snapshots_indexed\":%llu,\"gaps_only\":true}",
+                 (unsigned long long)indexed);
+        job_set_result(progress_ctx, rj);
+    } else if (j->kind == SNAP_JOB_REINDEX) {
         reindex_result_t rx;
         memset(&rx, 0, sizeof(rx));
         st = reindex_repo(store, j->db, j->repo_id, cancel, &rx);
@@ -2482,6 +2501,7 @@ status_t routes_submit_startup_reindex(job_manager_t *jm, int64_t repo_id,
     j->repo_id = repo_id;
     j->repo_path = repo_path;
     j->kind = SNAP_JOB_REINDEX;
+    j->gaps_only = 1;
     return snap_job_submit_as(jm ? jm : g_ctx.jm, repo_id, j, "reindex", 0, 1,
                               out_job_id);
 }
