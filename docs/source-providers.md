@@ -461,6 +461,11 @@ tree), `no-base`, `base-pruned`, `token-missing`, `token-invalid`,
 `item-new`, `item-resized`, `item-source-changed`, `unit-redefined`,
 `audit`, `delta-too-costly`, `forced`, `unchanged-offline`, `incremental`.
 
+`first` is the daemon's to give, since only it knows a unit's history: a
+disk's reason on the unit's first backup into the repository, whether
+incrementals are on or not. A provider asked for no incremental says
+`no-incremental-support`.
+
 ### 6.5 One unit, one session at a time
 
 Two repositories may back up the same unit. libvirt allows one backup job

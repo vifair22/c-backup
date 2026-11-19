@@ -5,6 +5,7 @@
 #include "object_crypt.h"
 #include "pack.h"
 #include "pack_ids.h"
+#include "msg_clip.h"
 
 #include <openssl/crypto.h>
 #include <cutils/log.h>
@@ -903,7 +904,7 @@ static _Thread_local char tls_commit_why[1024];
 
 void store_pack_commit_failed(const char *why) {
     tls_commit_failed = 1;
-    snprintf(tls_commit_why, sizeof(tls_commit_why), "%s", why ? why : "");
+    msg_clip(tls_commit_why, sizeof(tls_commit_why), why);
 }
 
 status_t store_emit_pack_commit(store_t *st, const pack_commit_info_t *info) {

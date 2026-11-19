@@ -403,6 +403,64 @@ check    "jobs watch of a missing job fails" 1 "$RC"
 check    "and prints nothing on stdout" "" "$(cat "$WORK/watch.out")"
 check    "and the error is bare JSON on stderr" '{"error":"no such job"}' "$(cat "$WORK/watch.err")"
 
+# B270: the daemon stopping mid-watch ended the stream cleanly and the watch
+# exited 0, as if the job had ended. A job row nothing will finish keeps the
+# stream open until the daemon goes.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 -cmd ".timeout 10000" "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
+        progress_phase) VALUES (9998, 1, 'backup', 'running', strftime('%s','now'),
+        'store')"
+    "$CLI" --socket "$SOCK" jobs watch 9998 > "$WORK/watch.out" 2> "$WORK/watch.err" &
+    WPID=$!
+    for _ in $(seq 1 100); do
+        grep -q '"state":"running"' "$WORK/watch.out" 2>/dev/null && break
+        sleep 0.1
+    done
+    contains "a watch is following a running job" '"state":"running"' "$(cat "$WORK/watch.out")"
+    kill -TERM "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=
+    for _ in $(seq 1 100); do kill -0 "$WPID" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$WPID" 2>/dev/null; then
+        bad "the watch ends when the daemon stops" "exited" "still running"
+        kill "$WPID" 2>/dev/null
+    fi
+    wait "$WPID"; WRC=$?
+    check    "a watch whose daemon stops mid-job exits non-zero" 1 "$WRC"
+    if [ -s "$WORK/watch.err" ]; then ok "and says why on stderr"; else bad "and says why on stderr" "a message" "nothing"; fi
+    C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 1 100); do cb health 2>/dev/null | grep -q ready && break; sleep 0.1; done
+else
+    ok "a watch whose daemon stops mid-job exits non-zero (skipped: no sqlite3)"
+fi
+# Here the connection broke mid-chunk, which already failed. A stream that
+# ends cleanly with no terminal frame - a close-delimited response, as a
+# proxy in front of a stopping daemon sends - is the case that exited 0. A
+# fake daemon sends one running frame and closes.
+if command -v python3 > /dev/null 2>&1; then
+    python3 -I -c '
+import os, socket, sys
+path = sys.argv[1]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path); s.listen(1)
+open(sys.argv[2], "w").close()
+c, _ = s.accept()
+c.recv(65536)
+c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+          b"data: {\"id\":7,\"state\":\"running\",\"phase\":\"store\"}\n\n")
+c.close(); s.close(); os.unlink(path)
+' "$WORK/fake.sock" "$WORK/fake.ready" &
+    FPID=$!
+    for _ in $(seq 1 100); do [ -e "$WORK/fake.ready" ] && break; sleep 0.1; done
+    "$CLI" --socket "$WORK/fake.sock" jobs watch 7 > "$WORK/watch.out" 2> "$WORK/watch.err"; WRC=$?
+    wait "$FPID" 2>/dev/null
+    check    "a stream that ends cleanly before the job exits non-zero" 1 "$WRC"
+    contains "and printed the frame it had" '"state":"running"' "$(cat "$WORK/watch.out")"
+    contains "and says the job's outcome is unknown" "stream ended before job 7 did" \
+        "$(cat "$WORK/watch.err")"
+else
+    ok "a stream that ends cleanly before the job exits non-zero (skipped: no python3)"
+fi
+
 # B057: `jobs cancel` printed nothing. A gc queued behind a backup of a lot
 # of data is still cancellable when the request lands, whatever the machine.
 # 512 MiB, in 32 files of 16 MiB.

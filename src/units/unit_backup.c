@@ -1324,7 +1324,11 @@ static status_t bases_prepare(store_t *store, cutils_db_t *db, int64_t repo_id, 
             if (!chain[0]) snprintf(chain, sizeof(chain), "%s", vb->t.token);
             else if (strcmp(chain, vb->t.token) != 0) mixed = 1;
         }
-        if (!on) { vb->reason = pp->off_why[0] ? "forced" : NULL; continue; }
+        /* Off, a disk's reason is the provider's ("no-incremental-support"
+         * from libvirt), except on the unit's first backup here, which is
+         * "first" whatever the setting: the daemon is the one that knows
+         * (NIT-50; the fake provider claimed it on every backup). */
+        if (!on) { vb->reason = pp->off_why[0] ? "forced" : seen ? NULL : "first"; continue; }
         if (!(it->caps & SP_CAP_INCREMENTAL)) { vb->reason = "no-incremental-support"; continue; }
         vb->covered = 1;
         if (!vb->found) { vb->reason = seen ? "no-base" : "first"; continue; }

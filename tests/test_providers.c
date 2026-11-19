@@ -255,7 +255,9 @@ static void test_lifecycle(void **state)
     assert_int_equal(info->achieved, SP_CONSIST_QUIESCED);
     assert_true(info->consist_flags & SP_CF_FROZEN);
     assert_int_equal(info->n_plans, 2);
-    assert_string_equal(info->plans[0].reason, "first");
+    /* Asked for no incremental: not "first", which only the daemon can
+     * know (NIT-50). */
+    assert_string_equal(info->plans[0].reason, "no-incremental-support");
     for (size_t i = 0; i < info->n_plans; i++) assert_true(sp_reason_known(info->plans[i].reason));
     /* Freeze journalled then cleared inside begin; the snapshot and the
      * export stay journalled and held until end. */

@@ -149,6 +149,12 @@ contains "with the warning in it" "each unit was its own capture" "$OUT"
 echo "restore"
 OUT=$(cb unit restore 1 1 "$WORK/out")
 contains "files restore completes" '"state":"completed"' "$OUT"
+# NIT-50: a unit restore journalled no message; it says what came back.
+OUT=$(cb journal 1 --limit 1)
+contains "its journal entry is a unit-restore" '"operation":"unit-restore","result":"success"' "$OUT"
+contains "naming the unit, the snapshot and where it went" \
+    "unit fake:a from snapshot 1: " "$OUT"
+contains "and how much came back" "restored to $WORK/out" "$OUT"
 check    "the disk is its full virtual size" 8388608 "$(stat -c %s "$WORK/out/.cbackup-unit/disks/vda")"
 BLOCKS=$(stat -c %b "$WORK/out/.cbackup-unit/disks/vda")
 if [ "$BLOCKS" -lt 8192 ]; then ok "and sparse ($BLOCKS blocks)"; else bad "and sparse" "< 8192 blocks" "$BLOCKS"; fi
@@ -157,6 +163,9 @@ check    "configuration is verbatim" "<domain>a</domain>" "$(cat "$WORK/out/.cba
 contains "unit.json is there" '"format":"cbackup-unit"' "$(cat "$WORK/out/.cbackup-unit/unit.json")"
 OUT=$(cb unit restore 1 1 "$WORK/vda.raw" --item vda)
 contains "an item restore completes" '"state":"completed"' "$OUT"
+contains "an item restore journals the item and its size" \
+    "unit fake:a from snapshot 1: item vda (8388608 bytes) restored to $WORK/vda.raw" \
+    "$(cb journal 1 --limit 1)"
 if cmp -s "$WORK/vda.raw" "$WORK/out/.cbackup-unit/disks/vda"; then ok "the raw image matches"; else bad "the raw image matches" "same bytes" "differs"; fi
 check    "no partial file is left" "no" "$([ -e "$WORK/vda.raw.cbk-partial" ] && echo yes || echo no)"
 OUT=$(cb unit restore 1 1 "$WORK/vda.raw" --item vda 2>&1); RC=$?

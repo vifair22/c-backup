@@ -10,6 +10,7 @@
  * capture left paused.
  */
 
+#include <errno.h>
 #include <limits.h>
 #include <setjmp.h>
 #include <stdarg.h>
@@ -373,6 +374,56 @@ static void test_one_instant_no_pause(void **state)
     struct stat sb;
     assert_int_not_equal(stat(root, &sb), 0);
     be.ops->desc_free(d);
+}
+
+/*
+ * NIT-50: an Unraid template the helper cannot read. The default
+ * templates_dir is Unraid's; on another host, or to a helper without root,
+ * it gave EACCES or ENOTDIR rather than ENOENT, and the optional file failed
+ * the whole unit. It is left out, and the capture warns, naming it.
+ */
+static void unreadable_template(const char *why)
+{
+    sp_unit_desc_t *d = NULL;
+    assert_int_equal(be.ops->describe(be.ctx, "solo", &d), OK);
+    assert_null(item(d, ".cbackup-unit/config/containers/solo/unraid-template.xml"));
+    assert_non_null(item(d, ".cbackup-unit/config/containers/solo/inspect.json"));
+    be.ops->desc_free(d);
+    d = NULL;
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    assert_int_equal(capture("solo", SP_CONSIST_CRASH, &s, &info, &d), OK);
+    int warned = 0;
+    for (size_t i = 0; i < info->n_warnings; i++)
+        warned |= strstr(info->warnings[i], "solo: Unraid template not stored") != NULL &&
+                  strstr(info->warnings[i], why) != NULL;
+    assert_true(warned);
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+}
+
+static int setup_template_not_a_dir(void **state)
+{
+    (void)state;
+    /* After the base policy's templates_dir, in [docker]: the later wins. */
+    static char extra[4096];
+    snprintf(extra, sizeof(extra), "templates_dir = " D "/tmpl/my-solo.xml\n%s", k_hooks);
+    return start(extra);
+}
+
+static void test_template_not_a_directory(void **state)
+{
+    (void)state;
+    unreadable_template(strerror(ENOTDIR));
+}
+
+static void test_template_unreadable(void **state)
+{
+    (void)state;
+    if (geteuid() == 0) { skip(); return; }   /* root reads through mode 000 */
+    assert_int_equal(chmod(D "/tmpl/my-solo.xml", 0), 0);
+    unreadable_template(strerror(EACCES));
+    assert_int_equal(chmod(D "/tmpl/my-solo.xml", 0644), 0);
 }
 
 /* Two pools: two instants, so pause: auto pauses, around the snapshots. */
@@ -1523,6 +1574,8 @@ int main(void)
     signal(SIGPIPE, SIG_IGN);
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_template_not_a_directory, setup_template_not_a_dir, teardown),
+        cmocka_unit_test_setup_teardown(test_template_unreadable, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unit_probe, setup, teardown),
         cmocka_unit_test_setup_teardown(test_db_target, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nested_below_mount, setup, teardown),
