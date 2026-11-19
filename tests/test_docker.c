@@ -29,7 +29,9 @@
 #include "docker_backend.h"
 #include "helper_backend.h"
 #include "helper_server.h"
+#include "job_manager.h"
 #include "registry.h"
+#include "routes.h"
 #include "repo.h"
 #include "restore.h"
 #include "store.h"
@@ -411,6 +413,7 @@ static void test_template_not_a_directory(void **state)
 {
     (void)state;
     unreadable_template(strerror(ENOTDIR));
+    unreadable_template("(ENOTDIR)");
 }
 
 static void test_template_unreadable(void **state)
@@ -1049,9 +1052,12 @@ static store_t *ustore;
 static store_index_t *uidx;
 static int64_t urepo;
 
+static const char *g_units_extra;   /* policy for setup_units, k_hooks when NULL */
+
 static int setup_units(void **state)
 {
-    if (setup(state) != 0) return -1;
+    (void)state;
+    if (start(g_units_extra ? g_units_extra : k_hooks) != 0) return -1;
     if (db_open(&udb, D "/state.db") != 0 || db_run_lib_migrations(udb) != 0 ||
         db_run_compiled_migrations(udb, app_migrations) != 0) return -1;
     if (repo_register(udb, D "/repo", "t", &urepo) != OK) return -1;
@@ -1060,6 +1066,16 @@ static int setup_units(void **state)
     units_config_t uc = { "", 2, 10, 30, 1, 0, 75, 30 };
     if (units_init(udb, NULL, &uc) != OK) return -1;
     return sp_registry_add(be.ops, be.ctx) == OK ? 0 : -1;
+}
+
+static int setup_units_template_not_a_dir(void **state)
+{
+    static char extra[4096];
+    snprintf(extra, sizeof(extra), "templates_dir = " D "/tmpl/my-solo.xml\n%s", k_hooks);
+    g_units_extra = extra;
+    int rc = setup_units(state);
+    g_units_extra = NULL;
+    return rc;
 }
 
 static int teardown_units(void **state)
@@ -1097,6 +1113,55 @@ static void test_pause_read(void **state)
     restore_result_t rr;
     assert_int_equal(restore_run(ustore, udb, urepo, snap, D "/out", &ro, &rr), OK);
     assert_true(has(D "/out" MNT "/disk1/slow/s", "slow-v1"));
+}
+
+/*
+ * TEMPLATE-EACCES-WARN: the template left out is the job's warning. The
+ * units job ends completed with a warning result, which is what fires the
+ * warning alert and journals "warning", naming the template's path and the
+ * errno, rather than reading as a clean success.
+ */
+static void test_unreadable_template_job_completes_with_a_warning(void **state)
+{
+    (void)state;
+    job_manager_t *jm = NULL;
+    assert_int_equal(job_manager_start(udb, 1, &jm), OK);
+    routes_units_init(udb, jm);
+    int64_t job = 0;
+    assert_int_equal(routes_submit_units(jm, urepo, "{\"provider\":\"docker\",\"units\":[\"solo\"],"
+                                         "\"require\":\"inconsistent\"}", 0, &job), OK);
+    char id[32], q[160];
+    snprintf(id, sizeof(id), "%lld", (long long)job);
+    db_result_t *r = NULL;
+    for (int i = 0; i < 600; i++) {
+        db_result_free(r);
+        r = NULL;
+        assert_int_equal(db_execute(udb, "SELECT state, COALESCE(result,''), COALESCE(error,'')"
+                                         " FROM jobs WHERE id = ?", (const char *[]){ id, NULL }, &r), 0);
+        if (r && r->nrows == 1 && strcmp(r->rows[0][0], "running") != 0 &&
+            strcmp(r->rows[0][0], "queued") != 0) break;
+        usleep(50000);
+    }
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    print_message("job %s: %s %s %s\n", id, r->rows[0][0], r->rows[0][1], r->rows[0][2]);
+    assert_string_equal(r->rows[0][0], "completed");
+    const char *res = r->rows[0][1];
+    assert_non_null(strstr(res, "\"warning\":"));
+    assert_non_null(strstr(res, "Unraid template not stored: " D "/tmpl/my-solo.xml/my-solo.xml"));
+    assert_non_null(strstr(res, "(ENOTDIR)"));
+    db_result_free(r);
+    r = NULL;
+    snprintf(q, sizeof(q), "SELECT result, message FROM journal WHERE operation = 'units'");
+    assert_int_equal(db_execute(udb, q, NULL, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "warning");
+    assert_non_null(strstr(r->rows[0][1], "my-solo.xml/my-solo.xml"));
+    assert_non_null(strstr(r->rows[0][1], "ENOTDIR"));
+    db_result_free(r);
+    job_manager_stop(jm);
+    routes_units_init(NULL, NULL);
 }
 
 static int zfs_snapshot_calls(void)
@@ -1553,6 +1618,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define_copy_recorded_type, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define_compose_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pause_read, setup_units, teardown_units),
+        cmocka_unit_test_setup_teardown(test_unreadable_template_job_completes_with_a_warning,
+                                        setup_units_template_not_a_dir, teardown_units),
         cmocka_unit_test_setup_teardown(test_scope_job, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_scope_group, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_pause_cap, setup_cap, teardown),

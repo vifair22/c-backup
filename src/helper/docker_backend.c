@@ -491,9 +491,11 @@ static status_t describe_member(struct sp_ctx *c, dbuild_t *b, const char *unit,
              * Unraid cannot reach. Failing the whole unit over it lost the
              * data too; it is left out and the job says so. Nothing beyond
              * the policy's own path is tried. */
+            const char *en = oe == EACCES ? "EACCES" : oe == EPERM ? "EPERM"
+                           : oe == ENOTDIR ? "ENOTDIR" : "ELOOP";
             char w[PATH_MAX + 200];
-            snprintf(w, sizeof(w), "%.80s: Unraid template not stored: %.3900s: %s",
-                     m->name, tf, strerror(oe));
+            snprintf(w, sizeof(w), "%.80s: Unraid template not stored: %.3900s: %s (%s)",
+                     m->name, tf, strerror(oe), en);
             log_warn("docker: %s", w);
             pending_warn(c, unit, w);
             err_clear();
