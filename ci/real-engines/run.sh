@@ -965,6 +965,13 @@ check "its raw image is the original's bytes" "$VDA_SUM" "$(sha256sum < "$DOMS/r
 check "its qcow2 disk came back raw with the same contents" "$VDA_SUM" "$(sha256sum < "$DOMS/restored$VMD/vdb.qcow2" 2>/dev/null)"
 virsh -q -c "$VIRT_URI" undefine cbk-uat-vm2 >/dev/null 2>&1
 
+# B258: a target root it cannot write fails having written nothing, and
+# says that rather than telling the operator to remove what is not there.
+: > "$WORK/not-a-dir"
+OUT_N=$(cb unit restore 1 "$SNAP_VM" --define --name cbk-uat-vm3 --target-root "$WORK/not-a-dir/restored" 2>&1)
+contains "an unwritable target root fails saying nothing was written" "nothing was written under $WORK/not-a-dir/restored" "$OUT_N"
+lacks    "and not that something stays there" "stays there" "$OUT_N"
+
 log "libvirt: online (pull-mode backup of the running VM)"
 if virsh -q -c "$VIRT_URI" start cbk-uat-vm >"$WORK/vm-start.log" 2>&1; then
     check "the VM is running" running "$(virsh -q -c "$VIRT_URI" domstate cbk-uat-vm 2>/dev/null)"

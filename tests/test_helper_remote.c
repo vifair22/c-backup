@@ -1027,6 +1027,46 @@ static void test_in_place_needs_restore(void **state)
     assert_int_equal(fake_unit_state(fk, "u1"), SP_STATE_RUNNING);
 }
 
+/* B258: a new-name restore whose target root cannot be written says it
+ * wrote nothing there, not "remove it"; one that wrote and then failed
+ * still says what it left. */
+static void test_target_root_failures(void **state)
+{
+    (void)state;
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    FILE *f = fopen(HF_DIR "/notadir", "w");
+    assert_non_null(f);
+    fclose(f);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.name = "u1-copy";
+    o.target_root = HF_DIR "/notadir/target";
+    unit_define_result_t dr;
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 46, &o, &dr), OK);
+    const char *m = err_msg();
+    if (!strstr(m, "nothing was written under " HF_DIR "/notadir/target") || strstr(m, "stays there"))
+        fail_msg("unwritable target root: [%s]", m);
+    err_clear();
+
+    /* Written, then the define fails: what it wrote is named. */
+    assert_int_equal(mkdir(HF_DIR "/state/fake-define-u1.json", 0700), 0);
+    assert_int_equal(mkdir(HF_DIR "/state/fake-define-u1-copy.json", 0700), 0);
+    o.target_root = HF_DIR "/target-b258";
+    assert_int_not_equal(unit_define_run(store, db, repo_id, snap, 47, &o, &dr), OK);
+    m = err_msg();
+    if (!strstr(m, "what was restored under " HF_DIR "/target-b258 stays there") ||
+        strstr(m, "nothing was written"))
+        fail_msg("written, then failed: [%s]", m);
+    err_clear();
+    struct stat sb;
+    assert_int_equal(stat(HF_DIR "/target-b258", &sb), 0);
+    assert_int_equal(rmdir(HF_DIR "/state/fake-define-u1.json"), 0);
+    assert_int_equal(rmdir(HF_DIR "/state/fake-define-u1-copy.json"), 0);
+}
+
 /* B167: a define that fails after the swap (here the fake cannot write
  * its record) puts the original data back and starts the unit again. */
 static void test_define_fails_rolls_back(void **state)
@@ -1558,6 +1598,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_define_refused_first, setup, teardown),
         cmocka_unit_test_setup_teardown(test_in_place_needs_restore, setup_define_norestore, teardown),
         cmocka_unit_test_setup_teardown(test_define_fails_rolls_back, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_target_root_failures, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_staging_base_kept, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_stage_refused_before_stop, setup_define, teardown),
         cmocka_unit_test_setup_teardown(test_session_end_releases, setup, teardown),

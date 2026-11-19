@@ -4496,6 +4496,13 @@ c-backup unit restore 1 5120 --define --name immich-test \
 | Definition | re-applied with the same name (and for a VM the same UUID) | the name changed; bind sources, volumes, rootfs and mount entries rewritten under `DIR`; a VM's `<uuid>` removed (libvirt makes a new one), MACs regenerated unless `--keep-macs`, disks pointing at the new images, excluded passthrough disks dropped and listed |
 | Never | a delete: old data is moved aside, never removed | |
 
+**A failure under a new name says whether it wrote anything.** A
+`--target-root` it cannot write (read-only, or not a directory) fails with
+`nothing was written under DIR`; one that fails after writing says `what
+was restored under DIR stays there: remove it, or give another
+target_root, to try again`, because a retry is refused while it is there
+(B258).
+
 **In place, the container gets back the volumes that were restored.** A
 volume's data is swapped in where the volume lives, and the re-created
 container is given that same volume by name, an anonymous one included
