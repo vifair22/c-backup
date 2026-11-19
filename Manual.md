@@ -3328,6 +3328,12 @@ that is, unless given `--no-wait`, which returns the job id at once, or
 `--timeout SECONDS` (whole seconds, 1 or more), which waits at most that
 long and leaves the job running. The two cannot be combined. Before 1.0 the
 wait gave up after an hour and exited 1 while the job went on (B220).
+`--timeout` bounds the whole command, its requests to the daemon included: a
+daemon that accepts the connection and never answers ends the command 2 s
+after the timeout with status 124 and `the daemon did not answer before
+--timeout ran out` (B227). The job, if the daemon got as far as submitting
+it, may still run. Without `--timeout` a command waits for the daemon's
+answer however long it takes.
 
 Arguments follow one set of rules for every command, checked before
 anything is sent to the daemon:

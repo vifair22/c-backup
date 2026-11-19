@@ -31,7 +31,7 @@ MAIN_PORT=${PORTS[0]}
 PORT2=${PORTS[1]}
 BINDPORT=${PORTS[2]}
 # A stopped daemon that accepts and never answers, and a daemon whose alerts
-# go to it (B226).
+# go to it (B226, B227).
 MUTE_PORT=${PORTS[3]}
 ALERT_PORT=${PORTS[4]}
 SOCK="$WORK/c.sock"
@@ -2165,7 +2165,7 @@ check "repo list --limit caps" 1 "$(cnt "$(cb repo list --limit 1)" uuid)"
 # own, stopped with SIGSTOP once it listens. The kernel completes connects
 # into its listen backlog, so a client gets a connection and then silence,
 # which is what a hung daemon looks like from outside.
-echo "a daemon that does not answer (B226)"
+echo "a daemon that does not answer (B226, B227)"
 mkdir -p "$WORK/mute"
 cat > "$WORK/mute/config.yaml" <<EOF
 db:
@@ -2182,6 +2182,19 @@ MUTE_PID=$!
 for _ in $(seq 1 100); do grep -q "c-backupd ready" "$WORK/mute/daemon.log" && break; sleep 0.1; done
 contains "the mute daemon started" "c-backupd ready" "$(cat "$WORK/mute/daemon.log")"
 kill -STOP "$MUTE_PID"
+
+# B227: --timeout bounded only the polls of a job, and the request itself
+# could wait forever. The outer timeout is the test's own backstop.
+T0=$(date +%s%N)
+OUT=$(timeout 30 "$CLI" --socket "$WORK/mute/c.sock" gc 1 --timeout 2 2>&1); RC=$?
+MS=$(( ($(date +%s%N) - T0) / 1000000 ))
+check    "--timeout ends a request the daemon never answers, exit 124" 124 "$RC"
+check    "within --timeout and its grace, not the backstop's 30 s" "yes" \
+         "$([ "$MS" -lt 10000 ] && echo yes || echo "no: $MS ms")"
+contains "and says the daemon did not answer" "did not answer before --timeout ran out" "$OUT"
+# Without --timeout a command waits as it always has; the backstop ends it.
+timeout 3 "$CLI" --socket "$WORK/mute/c.sock" repo list > /dev/null 2>&1; RC=$?
+check    "without --timeout a request still waits for the daemon" 124 "$RC"
 
 # B226: the queued alerts' delivery held a stop for up to 15 s a message
 # with Pushover unreachable. curl honours https_proxy, so pointing it at the
