@@ -26,11 +26,11 @@ static int hash_is_zero(const uint8_t h[OBJECT_HASH_SIZE])
 static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
 {
     static const char *d = "0123456789abcdef";
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
+    for (size_t i = 0; i < OBJECT_HASH_SIZE; i++) {
         out[i * 2]     = d[(h[i] >> 4) & 0xF];
         out[i * 2 + 1] = d[h[i] & 0xF];
     }
-    out[OBJECT_HASH_SIZE * 2] = '\0';
+    out[(size_t)OBJECT_HASH_SIZE * 2] = '\0';
 }
 
 /* The last path component; what the entry is called inside its parent. */
@@ -152,7 +152,7 @@ status_t node_index_write(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
         /* Both offset, and together: parent_node_id refers to one of these
          * ids. A root's parent stays 0, which is not an id. */
         snprintf(id,     sizeof(id),     "%llu",
-                 (unsigned long long)(e->node.node_id + id_base));
+                 (unsigned long long)e->node.node_id + (unsigned long long)id_base);
         snprintf(parent, sizeof(parent), "%llu",
                  (unsigned long long)(links[i].parent_id
                                       ? links[i].parent_id + id_base : 0));
