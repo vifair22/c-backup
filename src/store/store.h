@@ -290,7 +290,7 @@ int store_pack_staging(const store_t *st, char *buf, size_t sz);
 /*
  * Remove staging files in tmp/ and packs/.staging last modified before
  * `before`, limited to the names the engine itself creates (pack-dat.*,
- * snap.*, snapids.*, deleting.*, and tags.* by the hour rule). Returns how
+ * snap.*, snapids.*, packids.*, deleting.*, and tags.* by the hour rule). Returns how
  * many were removed and adds their size to *bytes when that is not NULL.
  *
  * store_open sweeps with an hour's margin because it cannot know who else is
@@ -313,7 +313,7 @@ unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes);
  *
  * The invariant: an age-free sweep removes only staging whose every writer
  * holds this claim or the repository's write lock (pack-dat., snap.,
- * snapids., deleting.). The tag mirror's tags.* staging is written under
+ * snapids., packids., deleting.). The tag mirror's tags.* staging is written under
  * neither, so it is removed by the hour rule alone.
  */
 int store_claim_tmp(store_t *st);

@@ -218,8 +218,10 @@ for cancellation between files and inside one: storing and restoring a file
 both stop within one object of at most 16 MiB, so a multi-gigabyte file in
 progress does not hold up the shutdown. A backup whose snapshot record is
 already written when the stop arrives stops indexing it too: the job ends
-`cancelled`, the log says the snapshot was written and is not yet indexed,
-and the next start's reconcile indexes it (section 17.5). A user's
+`cancelled`, its error and journal entry say which snapshot was written and
+that the next start indexes it, its `result` is
+`{"snapshot_id":N,"indexed":false}`, and the next start's reconcile indexes
+it (section 17.5). A user's
 `jobs cancel` at that point lets the index finish instead, since the
 snapshot is complete.
 

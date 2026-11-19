@@ -276,13 +276,21 @@ done:
  * 1: staging only a holder of tmp/'s claim or of the repository's write
  * lock ever writes - pack-dat. (every pack writer takes the claim), snap.
  * and snapids. (backup, a replica sink, reindex and snapshot delete, all
- * under one or the other), deleting. (gc). 2: staging written under
- * neither - tags., the tag mirror's, which a tag route writes while a
- * backup or gc may be running. 0: not the engine's.
+ * under one or the other), packids. (the pack-number mark, raised by
+ * whatever issues pack numbers, which the write lock serialises, and
+ * written fresh when a repository or a replica is created, before anything
+ * else can reach it), deleting. (gc). 2: staging written under neither -
+ * tags., the tag mirror's, which a tag route writes while a backup or gc
+ * may be running. 0: not the engine's.
+ *
+ * packids. was missing (B237): a power cut while coalescing raised the
+ * mark left one behind that no gc, recovery or repairing verify removed,
+ * only the hour rule at some later open.
  */
 static int engine_tmp_kind(const char *name)
 {
-    static const char *const owned[] = { "pack-dat.", "snap.", "snapids.", "deleting." };
+    static const char *const owned[] = { "pack-dat.", "snap.", "snapids.", "packids.",
+                                         "deleting." };
     for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++)
         if (strncmp(name, owned[i], strlen(owned[i])) == 0) return 1;
     if (strncmp(name, "tags.", 5) == 0) return 2;
