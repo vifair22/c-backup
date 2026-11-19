@@ -524,6 +524,8 @@ typedef struct {
     const char *const        *read_roots;
     size_t                    n_roots;
     utmpl_t                  *tmpl;      /* the unit's enabled templates */
+    /* Raised to application by its templates (B246), else 0. */
+    int                       app_by_templates;
 } uctx_t;
 
 static void uwarn(uctx_t *u, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -626,6 +628,30 @@ static void templates_cover(const uctx_t *u, db_findings_t *fs)
     }
 }
 
+/*
+ * The unit's own level, from its findings (B246). A template is the unit's
+ * application taking part, as a container's own pre hook is, so it raises a
+ * capture of one instant (crash or quiesced) to application when it did
+ * that for every live database in the unit: each one covered-application
+ * by its enabled template, which did its part. A database left without one
+ * keeps the unit where the capture put it, and nothing raises a capture
+ * that was not one instant, whatever a dump made of its own finding.
+ */
+static int templates_raise(const uctx_t *u, sp_consistency_t a, const db_findings_t *fs)
+{
+    if (a != SP_CONSIST_CRASH && a != SP_CONSIST_QUIESCED) return 0;
+    size_t live = 0;
+    for (size_t i = 0; i < fs->n; i++) {
+        const db_finding_t *f = &fs->v[i];
+        if (f->confidence != DB_CONF_LIVE || f->coverage == DB_COV_NONE) continue;
+        size_t ti = 0;
+        if (f->coverage != DB_COV_COVERED_APPLICATION || !template_for(u, f, &ti) || !template_ok(u, ti))
+            return 0;
+        live++;
+    }
+    return live > 0;
+}
+
 static void unit_detect(uctx_t *u, unit_json_t *j)
 {
     if (!u->detect || u->findings) return;
@@ -661,6 +687,12 @@ static void unit_detect(uctx_t *u, unit_json_t *j)
     free(roots);
     if (!u->findings) return;
     templates_cover(u, u->findings);
+    if (templates_raise(u, a, u->findings)) {
+        u->app_by_templates = 1;
+        j->consistency = SP_CONSIST_APPLICATION;
+        log_info("unit %s: application, from %s: its enabled database templates covered every live "
+                 "database", u->key, sp_consistency_name(a));
+    }
     j->have_dbs = 1;
     j->dbs_total = u->findings->n;
     size_t m = u->findings->n < UNIT_JSON_DB_MAX ? u->findings->n : UNIT_JSON_DB_MAX;
@@ -1679,6 +1711,7 @@ static status_t unit_store(store_t *store, cutils_db_t *db, int64_t repo_id,
     res->snapshot_id = snap;
     res->freeze_ms = freeze_ms;
     if (u.cap_hit) res->achieved = SP_CONSIST_INCONSISTENT;
+    else if (u.app_by_templates) res->achieved = SP_CONSIST_APPLICATION;
     res->bytes_read = u.bytes_read;
     if (st == OK)
         log_info("unit %s: snapshot %lld, %s, %llu disk bytes read", key, (long long)snap,

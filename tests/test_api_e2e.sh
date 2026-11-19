@@ -2487,6 +2487,17 @@ if command -v sqlite3 > /dev/null 2>&1; then
         "$(cat "$R/dbout/.cbackup-captures/index.json" 2>/dev/null)"
     contains "and counted" 'cbackup_db_engine_captures_total{engine="sqlite",result="ok"} 1' \
         "$(sock_body /metrics)"
+    # B260: with no template named, a file source's SQLite finding previews
+    # its one engine copy even when nothing was suggested (a dormant one).
+    sqlite3 -cmd ".timeout 10000" "$R/state.db" "INSERT INTO db_findings (repo_id, scope, engine, path,
+        confidence, state, evidence, first_seen, last_seen)
+        VALUES ($DB_ID, 'source:$DBS', 'sqlite', '$DBS/app/idle.db', 'dormant', 'new', '{}', 1, 1)"
+    IDLE_FID=$(sqlite3 -cmd ".timeout 10000" "$R/state.db" "SELECT id FROM db_findings
+        WHERE path = '$DBS/app/idle.db'")
+    OUT=$(sock_send POST "/repos/$DB_ID/databases/$IDLE_FID/preview")
+    contains "a file source's finding with no suggestion previews" ' 200' "$OUT"
+    contains "its engine copy" '"kind":"engine-copy"' "$OUT"
+    contains "as sqlite-backup" '"template":"sqlite-backup"' "$OUT"
 else
     ok "engine copies end to end (skipped: no sqlite3)"
 fi

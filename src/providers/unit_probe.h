@@ -10,7 +10,10 @@
  *                   "processes":[{"comm":"postgres","args":"postgres -c ..."}],
  *                   "ports":[5432],
  *                   "open_write":[{"path":"/mnt/cache/appdata/pg/base/1/2619",
- *                                  "comm":"postgres"}]}],
+ *                                  "comm":"postgres"}],
+ *                   "mounts":[{"dest":"/var/lib/postgresql/data",
+ *                              "recorded":"/mnt/cache/appdata/pg"},
+ *                             {"dest":"/wal","recorded":null}]}],
  *    "truncated":false}
  *
  * Reading validates as the helper's own requests are validated: bounded

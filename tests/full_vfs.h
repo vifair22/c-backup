@@ -30,11 +30,20 @@ static atomic_int full_vfs_hits;
 static atomic_int full_vfs_delay_us;
 static atomic_int full_vfs_slow_writes;
 static sqlite3_vfs *full_vfs_real;
+/* Bytes written to a main database file since it was last synced, and a
+ * hook told that count by every sync of one, before it is cleared (B233).
+ * A test that syncs the database by other means clears the count itself. */
+static atomic_ullong full_vfs_db_dirty;
+static void (*volatile full_vfs_db_sync_hook)(unsigned long long dirty);
+/* And one told of every write to a main database file, on the writing
+ * thread. */
+static void (*volatile full_vfs_db_write_hook)(int n);
 
 typedef struct {
     sqlite3_file  base;
     sqlite3_file *real;
     int           target;       /* main database or WAL: writes can fail */
+    int           main_db;      /* the main database file itself */
 } full_vfs_file_t;
 
 #define FV_REAL(f) (((full_vfs_file_t *)(f))->real)
@@ -58,12 +67,24 @@ static int fv_write(sqlite3_file *f, const void *b, int n, sqlite3_int64 o)
         struct timespec ts = { us / 1000000, (long)(us % 1000000) * 1000L };
         nanosleep(&ts, NULL);
     }
+    if (((full_vfs_file_t *)f)->main_db) {
+        atomic_fetch_add(&full_vfs_db_dirty, (unsigned long long)n);
+        void (*wh)(int) = full_vfs_db_write_hook;
+        if (wh) wh(n);
+    }
     return FV_REAL(f)->pMethods->xWrite(FV_REAL(f), b, n, o);
 }
 static int fv_truncate(sqlite3_file *f, sqlite3_int64 s)
 { return FV_REAL(f)->pMethods->xTruncate(FV_REAL(f), s); }
 static int fv_sync(sqlite3_file *f, int fl)
-{ return FV_REAL(f)->pMethods->xSync(FV_REAL(f), fl); }
+{
+    if (((full_vfs_file_t *)f)->main_db) {
+        unsigned long long d = atomic_exchange(&full_vfs_db_dirty, 0);
+        void (*h)(unsigned long long) = full_vfs_db_sync_hook;
+        if (h) h(d);
+    }
+    return FV_REAL(f)->pMethods->xSync(FV_REAL(f), fl);
+}
 static int fv_size(sqlite3_file *f, sqlite3_int64 *s)
 { return FV_REAL(f)->pMethods->xFileSize(FV_REAL(f), s); }
 static int fv_lock(sqlite3_file *f, int l)
@@ -104,6 +125,7 @@ static int fv_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *f, int flag
     full_vfs_file_t *ff = (full_vfs_file_t *)f;
     ff->real = (sqlite3_file *)&ff[1];
     ff->target = (flags & (SQLITE_OPEN_MAIN_DB | SQLITE_OPEN_WAL)) != 0;
+    ff->main_db = (flags & SQLITE_OPEN_MAIN_DB) != 0;
     int rc = full_vfs_real->xOpen(full_vfs_real, name, ff->real, flags, out_flags);
     /* A failed open leaves pMethods NULL, and SQLite then never calls
      * xClose; one that opened must be closed through the shim. */

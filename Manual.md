@@ -218,8 +218,10 @@ for cancellation between files and inside one: storing and restoring a file
 both stop within one object of at most 16 MiB, so a multi-gigabyte file in
 progress does not hold up the shutdown. A backup whose snapshot record is
 already written when the stop arrives stops indexing it too: the job ends
-`cancelled`, the log says the snapshot was written and is not yet indexed,
-and the next start's reconcile indexes it (section 17.5). A user's
+`cancelled`, its error and journal entry say which snapshot was written and
+that the next start indexes it, its `result` is
+`{"snapshot_id":N,"indexed":false}`, and the next start's reconcile indexes
+it (section 17.5). A user's
 `jobs cancel` at that point lets the index finish instead, since the
 snapshot is complete.
 
@@ -2496,7 +2498,7 @@ the repository).
 | `cbackup_checkpoint_lock_max_seconds` | gauge | The longest single hold by a locked round since start |
 | `cbackup_checkpoint_lock_wait_seconds_total` | counter | Time locked rounds spent queued for the write lock behind other writers before holding it; not part of the hold, and no writer waits for it |
 | `cbackup_checkpoint_lock_wait_max_seconds` | gauge | The longest single such wait since start |
-| `cbackup_checkpoint_presync_seconds_total` | counter | Time spent writing the log out to disk just before a locked round, without the lock, so the round itself only syncs what arrived since |
+| `cbackup_checkpoint_presync_seconds_total` | counter | Time spent writing the log, and the database pages earlier rounds copied, out to disk just before a locked round, without the lock, so the round itself only syncs what arrived since |
 | `cbackup_checkpoint_frames_copied_total` | counter | Log frames copied back into `state.db`; over `cbackup_checkpoint_rounds_total`, frames per round |
 | `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap |
 | `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy |
@@ -4945,14 +4947,19 @@ A plain file source is read live, so every live database in one is
 when the unit achieved `crash` or better the provider guarantees one
 instant for all of it (container-backup 6.4), and below that each mount is
 counted as its own instant. The links inside a container's data name
-container paths, not the recorded ones, so in a unit they are listed as
+container paths; the helper's probe reports the container's mounts, so a
+link is followed to where the unit records it, and one into a mount the
+unit does not back up (an excluded bind) or into the container's own
+filesystem makes the finding `split`, with the link's `why` in its
+evidence. Only with no probe answer for the container is a link listed
 `unchecked` rather than judged.
 
 Each live finding carries what would help, as a name: a dump template for a
 unit (`pg-dumpall`, `mariadb-dump`, `redis-rdb`, `mongodump`, `sqlite-backup`,
 `influx2-backup`, `prometheus-snapshot`), `sqlite-backup` (an online-backup
 copy by the daemon) or `source-snapshot` for a file source, `pause-always`
-for a split unit, `exclude-rebuild` for a search index, `group-units` for a
+for a unit split across instants and the engine's dump for one with files
+outside the capture (a pause cannot bring them in), `exclude-rebuild` for a search index, `group-units` for a
 Nextcloud whose database is in another unit. A covered
 PostgreSQL, MySQL or MongoDB in a unit also names its dump as `optional`,
 for portability across major versions.
@@ -5146,7 +5153,8 @@ tables for MariaDB, `PING` for Redis, `sqlite3 -version`, the admin API's
 flags for Prometheus, `php occ status` for Nextcloud. `verified` is true when
 the probe exited 0. An unverified template still enables; the preview only
 says so. With no `--template`, a preview shows the finding's suggestion, or
-what is enabled, or for a covered finding the engine's default dump.
+what is enabled, or for a covered finding the engine's default dump; a file
+source's SQLite finding always previews `sqlite-backup`, its one engine copy.
 
 **Enable** (`POST /repos/<id>/databases/<f>/enable`, body
 `{"template":"pg-dumpall","params":{}}`) records the template and its
