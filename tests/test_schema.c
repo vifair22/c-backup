@@ -345,7 +345,7 @@ static void test_one_baseline_migration(void **state)
     assert_string_equal(app_migrations[13].name, "015_job_snapshots.sql");
     /* A replicate's registered destination, for /jobs?repo= (B283). */
     assert_non_null(app_migrations[14].name);
-    assert_string_equal(app_migrations[14].name, "016_job_dest_repo.sql");
+    assert_string_equal(app_migrations[14].name, "017_job_dest_repo.sql");
     assert_null(app_migrations[15].name);
 
     /* A database written before the baseline already has its tables, so
