@@ -264,7 +264,7 @@ $(eval $(call stamp_rule,$(OBJ_DIR),FLAGS_SIG))
 TEST_HDRS := $(wildcard $(TESTS)/*.h)
 
 # ---- Phony targets ----------------------------------------------------
-.PHONY: all static asan tsan debug clean test bench bench-micro bench-phases bench-browse bench-nbd analyze lint check-conflict-markers
+.PHONY: all static asan tsan debug clean test bench bench-micro bench-phases bench-browse bench-verify bench-nbd analyze lint check-conflict-markers
 
 # In the top-level make, which is the release build unless told otherwise,
 # `all` is built here rather than by a sub-make (BUILD-1). The test binaries
@@ -882,6 +882,9 @@ $(BINS)/bench_phases: $(BENCH)/phases.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) 
 $(BINS)/bench_browse: $(BENCH)/browse.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $(filter %.c %.o,$^) -o $@ -flto=auto $(LDFLAGS)
 
+$(BINS)/bench_verify: $(BENCH)/verify.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) | $(BINS)
+	$(CC) $(BENCH_CFLAGS) $(filter %.c %.o,$^) -o $@ -flto=auto $(LDFLAGS)
+
 $(BINS)/bench_nbd: $(BENCH)/nbd.c $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS)
 
@@ -901,10 +904,11 @@ $(BINS)/slow_sync.so: $(BENCH)/slow_sync.c | $(BINS)
 $(BINS)/prof_shim.so: $(BENCH)/prof_shim.c | $(BINS)
 	$(CC) -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -pthread -lrt
 
-bench: $(BINS)/bench_micro $(BINS)/bench_phases $(BINS)/bench_browse $(BINS)/slow_sync.so
+bench: $(BINS)/bench_micro $(BINS)/bench_phases $(BINS)/bench_browse $(BINS)/bench_verify $(BINS)/slow_sync.so
 	@echo "=== micro ===" && $(BINS)/bench_micro
 	@echo "=== phases ===" && $(BINS)/bench_phases
 	@echo "=== browse ===" && $(BINS)/bench_browse
+	@echo "=== verify ===" && $(BINS)/bench_verify
 
 bench-micro: $(BINS)/bench_micro
 	$(BINS)/bench_micro
@@ -914,6 +918,10 @@ bench-phases: $(BINS)/bench_phases
 
 bench-browse: $(BINS)/bench_browse
 	$(BINS)/bench_browse
+
+# Verify's per-entry cost at three index sizes (B268); flat means linear.
+bench-verify: $(BINS)/bench_verify
+	$(BINS)/bench_verify
 
 # ---- Coverage ---------------------------------------------------------
 COV_DIR     := $(BUILD)/coverage
