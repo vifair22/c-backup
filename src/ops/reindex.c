@@ -1008,6 +1008,16 @@ static status_t walk_list_inner(store_t *store, cutils_db_t *db, const char *rep
     return st;
 }
 
+/* One snapshot's file entries whose content is a chunk list, or may be one
+ * (reindex_lists). Parameters: repo, snapshot. */
+const char *const reindex_snap_lists_sql =
+    "SELECT DISTINCT n.content_hash FROM nodes n"
+    "  CROSS JOIN objects o"
+    " WHERE n.repo_id = ?1 AND n.snap_id = ?2"
+    "   AND o.repo_id = n.repo_id AND o.hash = n.content_hash"
+    "   AND n.type = 1 AND o.type IN (1, 6)"
+    "   AND (o.orig_size IS NULL OR o.orig_size != n.size OR o.type = 6)";
+
 /* only_snap > 0: that snapshot's lists alone (B264), for indexing gaps:
  * every other snapshot's were walked when it was indexed, and walking them
  * all again for one new snapshot is the whole-repository cost a gap must
@@ -1019,14 +1029,24 @@ static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
 
+    /*
+     * One statement per case. The single statement with "?2 <= 0 OR
+     * n.snap_id = ?2" could not use the snapshot as a key, so a gap's
+     * walk of one snapshot read every node row of the repository (planned
+     * as a walk by repo_id with a table fetch per row), which is the cost
+     * B264 meant to avoid.
+     */
     db_result_t *r = NULL;
-    if (db_execute(db,
+    int qrc = only_snap > 0
+        ? db_execute(db, reindex_snap_lists_sql, (const char *[]){ repo, snap, NULL }, &r)
+        : db_execute(db,
             "SELECT DISTINCT n.content_hash FROM nodes n"
             "  JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
-            " WHERE n.repo_id = ?1 AND (CAST(?2 AS INTEGER) <= 0 OR n.snap_id = CAST(?2 AS INTEGER))"
+            " WHERE n.repo_id = ?1"
             "   AND n.type = 1 AND o.type IN (1, 6)"
             "   AND (o.orig_size IS NULL OR o.orig_size != n.size OR o.type = 6)",
-            (const char *[]){ repo, snap, NULL }, &r) != 0) {
+            (const char *[]){ repo, NULL }, &r);
+    if (qrc != 0) {
         db_result_free(r);
         return set_error(ERR_IO, "reindex: cannot list chunk lists");
     }
