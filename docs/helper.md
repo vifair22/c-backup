@@ -143,7 +143,8 @@ and are not mounts (a `.zfs` snapshot directory is automounted on access
 and expires by itself); `qemu-nbd` serves a socket; staging and swaps are
 directories and renames. So there is nothing for it to unmount at exit or
 after a crash; its snapshots and holds are released by the start-up sweep
-(`holds.json`).
+(`holds.json`, and its markers when the journal is lost: "When the hold
+journal is lost", below).
 
 Notes that matter:
 
@@ -341,7 +342,8 @@ aborted, releasing their pauses, freezes, exports and snapshots then rather
 than at `capture_max_s`. A capture still in its begin ends itself when it
 finds its session gone, so a hold is never released from outside before
 it is taken. `hello` answers `holds` and `captures`, what the helper has
-journalled and open; `GET /providers` adds the helper's holds to
+journalled and open, and `recovery` when this process started without a
+usable hold journal; `GET /providers` adds the helper's holds to
 `holds_open` and shows both under `helper`. Data never crosses the
 socket: the daemon reads trees through the read roots the helper returns,
 and disks through its own mounts (for the fake, its run map).
@@ -458,6 +460,77 @@ helper's, as for `capture.begin`:
 The paths backend is internal: hello does not list it among `providers`,
 and no unit key can name it. Hello's `path_snapshots` says whether the
 policy lists any ZFS dataset or btrfs pool.
+
+## When the hold journal is lost
+
+`<state_dir>/holds.json` is the helper's record of every freeze, pause,
+export and snapshot it holds, written whole and synced before each hold is
+taken; the next process releases what it lists. Beside it, from B285, each
+hold also has a **marker**, `<state_dir>/holds.d/<id>.json`, holding that
+hold alone. A marker is written and synced (file and directory) before the
+journal row, and removed after the release clears the row. A hold whose
+marker cannot be written is not taken, as one the journal cannot keep is
+not.
+
+**At start.** The journal is read whole, with no size limit, and every
+read error is an error. It is the record when it reads and parses as a
+list of holds this helper could have written. Markers it does not name are
+holds never taken (or released a moment before a crash) and are removed;
+a hold it names with no marker (a journal from before markers) gets one.
+It is **lost** when it exists and cannot be read, does not parse, holds an
+entry with a field missing or too long, or lists more holds than the 256
+the helper keeps (which it never writes), and also when it is missing while
+markers remain. Then, before the helper serves anything:
+
+1. The journal is **kept aside** as `holds.json.bad-<UTC time>` (a `-N`
+   suffix if that exists; renamed with `RENAME_NOREPLACE`, never replaced
+   or deleted) and the path goes in the log and the alert.
+2. Every hold a marker names, then every hold a readable journal entry
+   names, is loaded and released through the backends as a journalled
+   one would be, and journalled again at once. A release that fails stays
+   and is retried by the watchdog, as always.
+3. **The backends are asked**, for every unit the policy allows and no
+   other, what a lost record could have left held. A unit that still has a
+   loaded hold is left to that hold's retries.
+4. Leftover snapshots of this daemon id on the policy's domains go by the
+   sweep's own proof (the `cbk-<daemon id>-` name, the owner property, the
+   btrfs parent uuid), as at every start; that needs no journal.
+5. One report, logged at ERROR, goes in `hello`'s `recovery` (`id`,
+   `msg`) for this process's life. The daemon alerts once per `id`
+   (`push`, and `alert:` at ERROR in its log): what was wrong, where the
+   journal was kept, how many holds were released from records, what was
+   released without one, how many snapshots went, and what was left for an
+   operator.
+
+A start that serves meanwhile would let a new capture's freeze be thawed
+or its pause reported by step 3, so a recovering start waits for the whole
+sweep; a thaw blocked behind libvirt can make that 30 s.
+
+**What is ours without a record.** Decided for B285:
+
+| Held | Released without a record? | Why |
+|------|----------------------------|-----|
+| A guest's frozen filesystems (libvirt, through the agent) | Yes: `virDomainFSThaw` on every running domain the policy allows | Nothing else on these hosts freezes a guest and leaves it frozen, and a thaw of a guest that is not frozen does nothing. A guest with no agent configured cannot have been frozen and is skipped; any other thaw failure is named in the alert, since that guest may still be frozen |
+| A paused Docker container, a frozen LXC container | **No**: named in the alert as "nothing proves c-backup paused it; left paused" | A container its owner paused looks exactly like one c-backup paused. Docker labels cannot be added to a running container, and neither engine records who paused one, so the only proof is c-backup's own: the marker. With the marker the pause is released in step 2 |
+| A `cbk-<daemon id>-...` ZFS or btrfs snapshot | Yes, by the sweep's ownership proof | The proof is on the snapshot itself |
+| A libvirt backup job, a checkpoint, a `qemu-nbd` | Only from a marker | Aborting a job the helper cannot tie to itself could abort someone else's (a migration). The markers record them like any other hold |
+
+Markers live beside the journal, so a disk that loses both loses the
+proof; the paused containers are then all named and none is unpaused. No
+new privilege is involved: the helper thaws and lists only units it was
+already allowed to act on, and the markers are files in its own state
+directory.
+
+`tests/test_helper_journal_fault.c` covers EIO reading the journal, a
+truncated journal, garbage, an entry that is not a hold, more holds than
+the helper keeps, a 2 MiB journal (read whole and trusted), a missing
+journal with markers, a loss of every record, markers kept in step with a
+good journal, and a marker that cannot be written. In every lost case a
+recorded freeze and pause, a freeze with no record and both kinds of
+snapshot are released through the fake backend, while a container paused
+by someone else and a frozen and paused unit outside the policy are left
+alone. `tests/test_helper_remote.c` checks the daemon alerts once per
+recovery.
 
 ## What a compromised daemon gets
 

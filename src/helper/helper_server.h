@@ -41,7 +41,11 @@ typedef struct {
 /*
  * Start: read the state directory's records, release every hold they name
  * and sweep this daemon id's leftover artefacts, then listen and run the
- * watchdog. Holds and leases are recorded in <state_dir>/holds.json.
+ * watchdog. Holds and leases are recorded in <state_dir>/holds.json, and
+ * each hold also in a marker of its own under <state_dir>/holds.d/. A
+ * journal that cannot be used is kept aside and recovered from the markers
+ * and the backends before anything is served, and hello reports it (B285,
+ * docs/helper.md "When the hold journal is lost").
  */
 status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **out);
 void     helper_server_stop(helper_server_t *s);
