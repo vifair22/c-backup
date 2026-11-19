@@ -40,6 +40,9 @@ typedef struct {
     char        root[PATH_MAX];       /* the domain's mountpoint, pool root or
                                          nested subvolume */
     char        pool[PATH_MAX];       /* btrfs: the policy's pool root holding it */
+    /* SNAP_NONE because the path is in a ZFS dataset the policy does not
+     * list: that dataset, for the job's warning (B253); else "". */
+    char        unlisted[256];
 } snap_dom_t;
 
 typedef struct snap_ctx {

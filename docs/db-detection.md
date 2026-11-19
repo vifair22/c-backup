@@ -340,7 +340,7 @@ flowchart LR
 | Route | Purpose |
 |---|---|
 | `GET /repos/<id>/databases` | findings, filterable by scope, engine, coverage, state; paginated |
-| `GET /repos/<id>/databases/<f>` | one finding with evidence and history |
+| `GET /repos/<id>/databases/<f>` | one finding with evidence and history (the journal entries about it, 14.10) |
 | `POST /repos/<id>/databases/<f>/preview` | generated hook and probe result |
 | `POST /repos/<id>/databases/<f>/enable` | body `{"template":"pg-dumpall","params":{}}` |
 | `POST /repos/<id>/databases/<f>/dismiss` | body `{"reason":"..."}` |
@@ -881,3 +881,19 @@ from its findings.
 | Not raised | A capture below one instant (a dump makes its own finding `covered-application` whatever the capture, but the rest of the unit's files are still torn); a live database with no template; a template that failed; `offline` and `application` are already at or above it |
 | Where | `templates_raise` in `src/units/unit_backup.c`, after the findings are judged: `unit.json`'s `consistency` (and so the snapshot's unit index) and the job result's `consistency` |
 | Tests | `tests/test_helper_e2e.sh`: `pg-dumpall` (a dump) raises `quiesced` to `application` and a failed dump does not; `prometheus-snapshot` (an exec template with a post run) raises it and a failed pre run does not |
+
+### 14.10 A finding's history (B254)
+
+7.4 promised a finding "with evidence and history" and the route answered
+the timestamps only. The history is the journal's: every event about a
+finding is already journalled and names it, detection's as
+`... (finding N)` (found, coverage changed, and the one uncovered alert,
+which reaches the journal through its job's warning) and the decisions' as
+`finding N (...)` (enabled, dismissed, with the caller).
+
+| Point | As built |
+|---|---|
+| Where it comes from | `GET /repos/<id>/databases/<f>` reads the repository's journal for entries naming the finding either way, from its `first_seen` on (so the read stays on the `(repo_id, ts)` index), newest first |
+| No second copy | No events table: the journal is the permanent record and never pruned, so a table beside it could only disagree with it. A finding deleted and re-raised gets a new id (AUTOINCREMENT), so an old id's entries never join a new finding's history |
+| Bound | At most 50 entries, `history_truncated` when there were more; the full record stays in `GET /repos/<id>/journal` |
+| Shape | `{journal_id, ts, source, operation, result, message}`, the journal's own fields. The list route leaves `history` out |

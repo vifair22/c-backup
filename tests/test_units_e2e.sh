@@ -413,6 +413,18 @@ contains "a backup of it carries the same findings" '"engine":"postgres"' "$OUT"
 contains "with the probe's liveness" '"confidence":"live"' "$OUT"
 contains "and the finding now names its snapshot" '"last_snap_id":' "$(cb db show 1 "$DID")"
 lacks    "no longer null" '"last_snap_id":null' "$(cb db show 1 "$DID")"
+# B254: one finding carries its history, the journal entries about it,
+# newest first; the list does not.
+cb db dismiss 1 "$DID" --reason "test data" > /dev/null
+H=$(cb db show 1 "$DID")
+contains "B254: a finding shows its history" '"history":[{"journal_id":' "$H"
+contains "B254: the dismissal is in it" "finding $DID (live PostgreSQL" "$H"
+contains "B254: as journalled" '"operation":"db-dismiss"' "$H"
+contains "B254: and whether it is all of it" '"history_truncated":false' "$H"
+FIRST_OP=$(printf '%s' "$H" | sed -n 's/.*"history":\[{[^}]*"operation":"\([a-z-]*\)".*/\1/p')
+check    "B254: the newest entry first" "db-dismiss" "$FIRST_OP"
+lacks    "B254: another finding's entries are not" "\"message\":\"finding $((DID + 1)) (" "$H"
+lacks    "B254: the list leaves history out" '"history"' "$(cb db list 1 --unit fake:d)"
 
 echo "an export of a disk with unaligned holes (B250)"
 # Holes that start and end mid-sector, one data run a single byte long, and

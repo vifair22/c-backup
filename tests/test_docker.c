@@ -91,12 +91,13 @@ static const char *k_hooks =
 static int start(const char *extra_policy)
 {
     if (system("rm -rf '" D "' && mkdir -p '" STATE "' '" APPS "/web/db' '" APPS "/web/www' "
-               "'" MNT "/user/appdata' '" MNT "/media/lib' '" MNT "/disk1/slow' '" D "/tmpl' '" D "/proj'") != 0) return -1;
+               "'" MNT "/user/appdata' '" MNT "/media/lib' '" MNT "/disk1/slow' '" MNT "/cache/odd' '" D "/tmpl' '" D "/proj'") != 0) return -1;
     put(APPS "/web/db/pg", "db-v1");
     if (mkdir(APPS "/web/www/cache", 0700) != 0) return -1;
     put(APPS "/web/www/index", "www-v1");
     put(MNT "/media/lib/a", "media-v1");
     put(MNT "/disk1/slow/s", "slow-v1");
+    put(MNT "/cache/odd/o", "odd-v1");
     put(D "/tmpl/my-solo.xml", "<Container>solo</Container>");
     put(D "/proj/compose.yaml", "services: {}\n");
     put(D "/proj/.env", "PASSWORD=verbatim\n");
@@ -133,6 +134,9 @@ static int start(const char *extra_policy)
         "[{\"Type\":\"bind\",\"Source\":\"" MNT "/media/lib\",\"Destination\":\"/b\"}]");
     fake_docker_add(&fdk, "dddd01", "parked", "exited", NULL,
         "[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/db\",\"Destination\":\"/d\"}]");
+    /* In dataset cache, which the policy does not list (B253). */
+    fake_docker_add(&fdk, "hhhh01", "unlisted", "running", NULL,
+        "[{\"Type\":\"bind\",\"Source\":\"" MNT "/cache/odd\",\"Destination\":\"/o\"}]");
 
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof(cwd))) return -1;
@@ -144,7 +148,7 @@ static int start(const char *extra_policy)
              "[host]\nnsenter = 0\nhost_root =\nzfs = %s/tests/fake_host/zfs\ndocker = %s/tests/fake_host/docker\nuser_root = " MNT "/user\n"
              "mnt_root = " MNT "\nboot_config = " D "/boot\nmountinfo = " D "/mountinfo\nproc = " D "/proc\n"
              "[docker]\nenabled = 1\nsocket = " SOCK "\ninclude_roots = " APPS ", " MNT "/media, " MNT "/disk1, "
-             MNT "/user/appdata\n"
+             MNT "/user/appdata, " MNT "/cache/odd\n"
              "templates_dir = " D "/tmpl\n%s",
              cwd, cwd, extra_policy ? extra_policy : "");
     memset(&pol, 0, sizeof(pol));
@@ -279,7 +283,7 @@ static void test_list_and_describe(void **state)
     seen_t s;
     memset(&s, 0, sizeof(s));
     assert_int_equal(be.ops->list_units(be.ctx, on_unit, &s), OK);
-    assert_int_equal(s.n, 6);
+    assert_int_equal(s.n, 7);
     assert_string_equal(s.ids[0], "compose:web");
     assert_string_equal(s.ids[1], "solo");
     assert_int_equal(s.st[5], SP_STATE_STOPPED);
@@ -1048,6 +1052,42 @@ static void test_pause_read(void **state)
     assert_true(has(D "/out" MNT "/disk1/slow/s", "slow-v1"));
 }
 
+/*
+ * B253: a mount in a ZFS dataset the policy does not list falls back to
+ * pause-read, which is right, and said so only in the helper's log. The
+ * unit's result, and so the job's warning, names the dataset and the
+ * policy key.
+ */
+static void test_unlisted_dataset_warns(void **state)
+{
+    (void)state;
+    const char *names[] = { "unlisted" };
+    unit_backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.provider = "docker";
+    o.units = names;
+    o.n_units = 1;
+    o.require = SP_CONSIST_CRASH;
+    o.job_id = 62;
+    unit_backup_result_t res;
+    assert_int_equal(unit_backup_run(ustore, udb, urepo, &o, &res), OK);
+    assert_int_equal(res.ok, 1);
+    assert_int_equal(res.units[0].achieved, SP_CONSIST_CRASH);
+    int said = 0;
+    for (unsigned i = 0; i < res.units[0].n_warnings; i++)
+        said |= strstr(res.units[0].warnings[i], MNT "/cache/odd is in ZFS dataset cache,") != NULL &&
+                strstr(res.units[0].warnings[i], "zfs_domains") != NULL;
+    if (!said) fail_msg("no warning names the unlisted dataset (%u warnings)", res.units[0].n_warnings);
+    unit_backup_result_free(&res);
+    /* A mount on no ZFS dataset at all is pause-read with nothing to say. */
+    names[0] = "slowpoke";
+    o.job_id = 63;
+    assert_int_equal(unit_backup_run(ustore, udb, urepo, &o, &res), OK);
+    for (unsigned i = 0; i < res.units[0].n_warnings; i++)
+        assert_null(strstr(res.units[0].warnings[i], "zfs_domains"));
+    unit_backup_result_free(&res);
+}
+
 static int zfs_snapshot_calls(void)
 {
     FILE *f = fopen(STATE "/zfs.log", "r");
@@ -1504,6 +1544,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_scope_group, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_pause_cap, setup_cap, teardown),
         cmocka_unit_test_setup_teardown(test_fallback_flagged, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unlisted_dataset_warns, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_failing_hook, setup_failing_hook, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_in_place_real, setup, teardown),
