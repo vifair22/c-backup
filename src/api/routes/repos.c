@@ -120,17 +120,19 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
     snprintf(lim, sizeof(lim), "%d", limit);
     snprintf(off, sizeof(off), "%d", offset);
 
-    db_result_t *r = NULL;
-    if (db_execute(db,
-            REPO_COLUMNS " ORDER BY id LIMIT ? OFFSET ?",
+    /* On a reader (B269): GET /repos waited 88 s on FS1 behind a verify
+     * holding the shared connection. */
+    db_rows_t *r = NULL;
+    if (db_read_rows(db,
+            0, REPO_COLUMNS " ORDER BY id LIMIT ? OFFSET ?",
             (const char *[]){ lim, off, NULL }, &r) != 0) {
-        db_result_free(r);
+        db_rows_free(r);
         return api_error(500, "cannot list repos");
     }
 
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) {
-        db_result_free(r);
+        db_rows_free(r);
         return api_error(500, "out of memory");
     }
 
@@ -165,7 +167,7 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
         if (bad) break;
         json_elem_commit(&e);
     }
-    db_result_free(r);
+    db_rows_free(r);
 
     char *body = NULL; size_t blen = 0;
     if (json_resp_finalize(resp, &body, &blen) != 0)
