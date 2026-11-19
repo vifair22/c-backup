@@ -288,6 +288,13 @@ int routes_register_auth(api_server_t *srv, cutils_db_t *db)
     if (api_server_route(srv, "/api/auth/logout",   API_POST, API_DURABLE,     handle_logout,     &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/api/auth/logout-all", API_POST, API_DURABLE,   handle_logout_all, &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/api/auth/password", API_POST, API_DURABLE,     handle_password,   &g_ctx) != 0) return -1;
+    static const char *const k_password[] = { "password", NULL };
+    static const char *const k_change[]   = { "current", "new", NULL };
+    if (api_server_route_keys(srv, "/api/auth/setup", API_POST, k_password) != 0 ||
+        api_server_route_keys(srv, "/api/auth/login", API_POST, k_password) != 0 ||
+        api_server_route_keys(srv, "/api/auth/logout", API_POST, API_KEYS_NONE) != 0 ||
+        api_server_route_keys(srv, "/api/auth/logout-all", API_POST, API_KEYS_NONE) != 0 ||
+        api_server_route_keys(srv, "/api/auth/password", API_POST, k_change) != 0) return -1;
     return 0;
 }
 

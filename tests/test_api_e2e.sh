@@ -790,6 +790,69 @@ check "a duplicate backup key is named" \
 check "malformed JSON on POST /repos says invalid JSON" '{"error":"invalid JSON"} 400' \
     "$(sock_send POST /repos '{"path":')"
 
+echo "unknown body members (B239)"
+# Every write read the members it knew and dropped the rest: a PUT /sources
+# carrying "snapshot" to a build without snapshot mode replaced the sources
+# and quietly left the mode off, and {"dry_run":true} in a gc body (it is a
+# query parameter) ran the real gc. Each write now refuses a member it does
+# not take, naming it, and changes nothing. One row per write route; the
+# database finding actions have their own cases below, and the units
+# routes theirs in test_units_e2e.sh and test_helper_e2e.sh.
+SRC_BEFORE=$(sock_body /repos/1/sources)
+while read -r m path; do
+    [ -n "$m" ] || continue
+    OUT=$(sock_send "$m" "$path" '{"zz_b239":1}')
+    contains "$m $path refuses an unknown member" "unknown key 'zz_b239'" "$OUT"
+    contains "$m $path refuses it with a 400" ' 400' "$OUT"
+done <<'ROWS'
+POST /api/auth/setup
+POST /api/auth/login
+POST /api/auth/logout
+POST /api/auth/logout-all
+POST /api/auth/password
+POST /jobs/999999/cancel
+DELETE /exports/999999
+POST /repos
+DELETE /repos/1
+POST /repos/1/key/import
+POST /repos/1/key/ack
+POST /repos/1/repair
+POST /repos/1/tags
+DELETE /repos/1/tags/none
+PUT /repos/1/schedules/999999
+DELETE /repos/1/schedules/999999
+PUT /repos/1/policy
+PUT /repos/1/sources
+PUT /repos/1/snapshots/1/note
+DELETE /repos/1/snapshots/1
+POST /repos/1/backup
+POST /repos/1/grep
+POST /repos/1/verify
+POST /repos/1/gc
+POST /repos/1/gfs
+POST /repos/1/reindex
+POST /repos/1/replicate
+POST /repos/1/snapshots/1/restore
+POST /repos/1/units/fake/u1/reset-incremental
+POST /repos/1/snapshots/1/unit/restore
+POST /repos/1/snapshots/1/unit/export
+ROWS
+check "repository 1 and its snapshot 1 are still there" 200 "$(sock_code '/repos/1/snapshots/1/tree?parent=0')"
+check "and its sources are as they were" "$SRC_BEFORE" "$(sock_body /repos/1/sources)"
+check "a misspelt member names the valid ones" \
+    "{\"error\":\"unknown key 'lable'; valid keys: label, paths, exclude, one_filesystem\"} 400" \
+    "$(sock_send POST /repos/1/backup '{"lable":"x"}')"
+check "a member inside a snapshot entry is checked too" \
+    "{\"error\":\"unknown key 'mod' in snapshot[]; valid keys: path, mode\"} 400" \
+    "$(sock_send PUT /repos/1/sources "{\"sources\":[\"$WORK/src\"],\"snapshot\":[{\"path\":\"$WORK/src\",\"mod\":\"warn\"}]}")"
+check "a gc body is not a way to ask for a dry run" \
+    "{\"error\":\"unknown key 'dry_run'; this request takes no fields\"} 400" \
+    "$(sock_send POST /repos/1/gc '{"dry_run":true}')"
+# A schedule's members depend on its action, so its handler checks them.
+contains "a schedule refuses an unknown member" "unknown key 'zz_b239' in a schedule" \
+    "$(sock_send POST /repos/1/schedules '{"action":"gc","trigger":{"type":"interval","seconds":60},"zz_b239":1}')"
+check "and the sources are still as they were" "$SRC_BEFORE" "$(sock_body /repos/1/sources)"
+
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
 # that fails telling the operator to reindex.

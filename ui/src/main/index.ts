@@ -129,4 +129,8 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC.API_CALL, async (_e, connectionName: string, req: ApiRequest) => {
     return connectionManager.apiCall(connectionName, req)
   })
+
+  ipcMain.handle(IPC.API_CALL_RESULT, async (_e, connectionName: string, req: ApiRequest) => {
+    return connectionManager.apiCallResult(connectionName, req)
+  })
 }

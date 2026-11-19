@@ -22,7 +22,7 @@ import { EventEmitter } from 'node:events'
 import { DaemonClient, DaemonUnreachableError, notConfiguredMessage } from './rpc-session.ts'
 import { toEndpoint } from './client.ts'
 import { sameDaemon } from '../shared/types.ts'
-import type { ApiRequest } from '../shared/api'
+import type { ApiCallResult, ApiRequest } from '../shared/api'
 import type { WireRepo } from '../shared/wire'
 import type {
   ConnectionConfig,
@@ -399,6 +399,18 @@ export class ConnectionManager extends EventEmitter {
    * the daemon rather than remembering the last time it was asked.
    */
   async apiCall<T = unknown>(name: string, req: ApiRequest): Promise<T> {
+    const r = await this.apiCallResult<T>(name, req)
+    if (!r.ok) throw new Error(r.error)
+    return r.body
+  }
+
+  /*
+   * The same call, with a refusal answered rather than thrown. Only an
+   * Error's message crosses the IPC boundary, so a refusal that carries
+   * more than its words (the enable route's policy_line, B240) has to
+   * come back as a value for the screen to read it as a field.
+   */
+  async apiCallResult<T = unknown>(name: string, req: ApiRequest): Promise<ApiCallResult<T>> {
     const entry = this.entries.get(name)
     if (!entry) throw new Error(`no connection '${name}'`)
     if (entry.status !== 'connected') throw new Error(`'${name}' is not connected`)
@@ -415,9 +427,9 @@ export class ConnectionManager extends EventEmitter {
     if (res.status === 401 && entry.config.type === 'remote') throw this.sessionEnded(entry)
     if (res.status >= 400) {
       const body = res.body as { error?: string } | undefined
-      throw new Error(body?.error ?? `HTTP ${res.status}`)
+      return { ok: false, status: res.status, error: body?.error ?? `HTTP ${res.status}`, body: res.body }
     }
-    return res.body
+    return { ok: true, body: res.body }
   }
 
   /* ---------------------------------------------------------------- */

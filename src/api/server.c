@@ -1,9 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
+/* For the body-member check (B239), which walks the parsed body. */
+#define CUTILS_CJSON_ALLOW
 #include "server.h"
 #include <cutils/log.h>
 #include <cutils/error.h>
 #include <cutils/json.h>
 #include <cutils/mem.h>
+#include "cJSON.h"
 
 #include <microhttpd.h>
 #include <stdio.h>
@@ -34,6 +37,7 @@ typedef struct {
         api_stream_handler_fn streaming;
     } handler;
     void           *userdata;
+    const char *const *keys;   /* fixed writes: the body members (B239) */
 } route_entry_t;
 
 #define MAX_ALLOW_FNS 8
@@ -44,6 +48,12 @@ typedef struct {
     api_class_fn  fn;
     void         *userdata;
 } class_entry_t;
+
+typedef struct {
+    char          pattern[128];   /* ends in '*' */
+    api_keys_fn   fn;
+    void         *userdata;
+} keys_entry_t;
 
 typedef struct {
     char          pattern[128];   /* ends in '*' */
@@ -72,6 +82,8 @@ struct api_server {
     int                nallow;
     class_entry_t      class_fns[MAX_CLASS_FNS];
     int                nclass;
+    keys_entry_t       keys_fns[MAX_CLASS_FNS];
+    int                nkeys;
     api_auth_fn        auth_fn;
     void              *auth_ud;
     api_after_write_fn after_write_fn;
@@ -206,6 +218,126 @@ static api_write_class_t route_class(const api_server_t *srv, const route_entry_
     log_error("api: %s %s has no durability class; syncing it as durable",
               METHOD_NAMES[method], url);
     return API_DURABLE;
+}
+
+/* --- Body members (B239) --- */
+
+const char *const API_KEYS_NONE[] = { NULL };
+const char *const API_KEYS_HANDLER[] = { "\x01handler", NULL };
+
+static const keys_entry_t *keys_fn_for(const api_server_t *srv, const char *url)
+{
+    const keys_entry_t *best = NULL;
+    size_t best_len = 0;
+    for (int i = 0; i < srv->nkeys; i++) {
+        const char *pat = srv->keys_fns[i].pattern;
+        size_t plen = strlen(pat);
+        if (strncmp(url, pat, plen - 1) != 0) continue;
+        if (!best || plen > best_len) { best = &srv->keys_fns[i]; best_len = plen; }
+    }
+    return best;
+}
+
+static const char *const *route_keys(const api_server_t *srv, const route_entry_t *route,
+                                     const char *url, api_method_t method)
+{
+    if (method == API_GET) return NULL;
+    if (route->cls != API_CLASS_BY_PATH) return route->keys;
+    const keys_entry_t *k = keys_fn_for(srv, url);
+    return k ? k->fn(url, method, k->userdata) : NULL;
+}
+
+/* Whether `name` is the member an entry is about: the whole entry, or the
+ * part before a '.' or "[]." path. *sub is set to what follows the path
+ * marker, or NULL when the entry names the member alone. *arr says which
+ * marker it was. */
+static int key_entry_is(const char *entry, const char *name, const char **sub, int *arr)
+{
+    size_t n = strlen(name);
+    *sub = NULL;
+    *arr = 0;
+    if (strncmp(entry, name, n) != 0) return 0;
+    if (entry[n] == '\0') return 1;
+    if (entry[n] == '.') { *sub = entry + n + 1; return 1; }
+    if (strncmp(entry + n, "[].", 3) == 0) { *sub = entry + n + 3; *arr = 1; return 1; }
+    return 0;
+}
+
+/* The member names in keys at this level, deduplicated, for a message. */
+static void keys_list(const char *const *keys, size_t nkeys, char *out, size_t sz)
+{
+    size_t o = 0;
+    out[0] = '\0';
+    for (size_t i = 0; i < nkeys; i++) {
+        size_t len = strcspn(keys[i], ".[");
+        int dup = 0;
+        for (size_t j = 0; j < i && !dup; j++)
+            dup = strcspn(keys[j], ".[") == len && strncmp(keys[j], keys[i], len) == 0;
+        if (dup) continue;
+        int w = snprintf(out + o, o < sz ? sz - o : 0, "%s%.*s", o ? ", " : "", (int)len, keys[i]);
+        if (w < 0 || (size_t)w >= sz - o) break;
+        o += (size_t)w;
+    }
+}
+
+enum { KEYS_DEPTH = 4, KEYS_MAX = 32 };
+
+/* The first member of object o outside keys (nkeys entries), described in
+ * msg; `where` names the object for a nested one ("" at the top). */
+static int object_unknown(const cJSON *o, const char *const *keys, size_t nkeys,
+                          const char *where, int depth, char *msg, size_t sz)
+{
+    const cJSON *m;
+    cJSON_ArrayForEach(m, o) {
+        const char *name = m->string ? m->string : "";
+        const char *sub[KEYS_MAX];
+        size_t nsub = 0;
+        int known = 0, sub_arr = 0;
+        for (size_t i = 0; i < nkeys; i++) {
+            const char *s = NULL;
+            int arr = 0;
+            if (!key_entry_is(keys[i], name, &s, &arr)) continue;
+            known = 1;
+            if (s && nsub < KEYS_MAX) { sub[nsub++] = s; sub_arr = arr; }
+        }
+        if (!known) {
+            char valid[512];
+            keys_list(keys, nkeys, valid, sizeof(valid));
+            if (!nkeys)
+                snprintf(msg, sz, "unknown key '%.80s'; this request takes no fields", name);
+            else if (where[0])
+                snprintf(msg, sz, "unknown key '%.80s' in %s; valid keys: %s", name, where, valid);
+            else
+                snprintf(msg, sz, "unknown key '%.80s'; valid keys: %s", name, valid);
+            return 1;
+        }
+        if (!nsub || depth >= KEYS_DEPTH) continue;
+        char inner[160];
+        snprintf(inner, sizeof(inner), "%s%s%.80s%s", where, where[0] ? "." : "", name,
+                 sub_arr ? "[]" : "");
+        if (!sub_arr && cJSON_IsObject(m) &&
+            object_unknown(m, sub, nsub, inner, depth + 1, msg, sz)) return 1;
+        if (sub_arr && cJSON_IsArray(m)) {
+            const cJSON *el;
+            cJSON_ArrayForEach(el, m)
+                if (cJSON_IsObject(el) &&
+                    object_unknown(el, sub, nsub, inner, depth + 1, msg, sz)) return 1;
+        }
+    }
+    return 0;
+}
+
+int api_body_unknown_key(const char *body, size_t len, const char *const *keys,
+                         char *msg, size_t msg_sz)
+{
+    if (msg_sz) msg[0] = '\0';
+    if (!body || !len || !keys || keys == API_KEYS_HANDLER) return 0;
+    cJSON *o = cJSON_ParseWithLength(body, len);
+    size_t n = 0;
+    while (keys[n]) n++;
+    int bad = cJSON_IsObject(o) && object_unknown(o, keys, n, "", 0, msg, msg_sz);
+    cJSON_Delete(o);
+    return bad;
 }
 
 static const char *get_header(struct MHD_Connection *conn, const char *name)
@@ -566,6 +698,14 @@ static enum MHD_Result try_serve_static(struct MHD_Connection *conn,
 static api_response_t run_buffered(api_server_t *srv, const route_entry_t *route,
                                    const api_request_t *req)
 {
+    if (req->method != API_GET) {
+        /* NULL only from a per-path resolver, for a path it does not
+         * serve: the handler answers that 404 or 405 itself. */
+        const char *const *keys = route_keys(srv, route, req->url, req->method);
+        char msg[768];
+        if (keys && api_body_unknown_key(req->body, req->body_len, keys, msg, sizeof(msg)))
+            return api_error(400, msg);
+    }
     if (req->method != API_GET && srv->durable_gate_fn &&
         route_class(srv, route, req->url, req->method) == API_DURABLE) {
         char why[1024] = "";
@@ -946,6 +1086,45 @@ int api_server_route_class(api_server_t *srv, const char *pattern,
     return CUTILS_OK;
 }
 
+int api_server_route_keys(api_server_t *srv, const char *pattern,
+                          api_method_t method, const char *const *keys)
+{
+    if (!keys) return set_error(CUTILS_ERR, "route %s: no keys given", pattern);
+    for (int i = 0; i < srv->nroutes; i++) {
+        route_entry_t *r = &srv->routes[i];
+        if (r->method != method || strcmp(r->pattern, pattern) != 0) continue;
+        if (method == API_GET || r->cls == API_CLASS_BY_PATH)
+            return set_error(CUTILS_ERR, "route %s %s: keys are for a fixed write",
+                             METHOD_NAMES[method], pattern);
+        r->keys = keys;
+        return CUTILS_OK;
+    }
+    return set_error(CUTILS_ERR, "route %s: not registered", pattern);
+}
+
+int api_server_route_keys_fn(api_server_t *srv, const char *pattern,
+                             api_keys_fn fn, void *userdata)
+{
+    size_t plen = strlen(pattern);
+    if (plen == 0 || pattern[plen - 1] != '*')
+        return set_error(CUTILS_ERR, "keys resolver pattern must end in '*'");
+    if (srv->nkeys >= MAX_CLASS_FNS)
+        return set_error(CUTILS_ERR, "too many keys resolvers");
+    keys_entry_t *k = &srv->keys_fns[srv->nkeys++];
+    snprintf(k->pattern, sizeof(k->pattern), "%s", pattern);
+    k->fn = fn;
+    k->userdata = userdata;
+    return CUTILS_OK;
+}
+
+const char *const *api_server_keys_for(const api_server_t *srv, const char *url,
+                                       api_method_t method)
+{
+    if (method <= API_GET || method > API_DELETE) return NULL;
+    const route_entry_t *r = find_route(srv, url, method);
+    return r ? route_keys(srv, r, url, method) : NULL;
+}
+
 api_write_class_t api_server_class_for(const api_server_t *srv, const char *url,
                                        api_method_t method)
 {
@@ -1052,6 +1231,15 @@ int api_server_start(api_server_t *srv)
             !class_fn_for(srv, srv->routes[i].pattern))
             return set_error(CUTILS_ERR, "route %s %s: per-path class with no resolver",
                              METHOD_NAMES[srv->routes[i].method], srv->routes[i].pattern);
+
+    /* Nor may a write start without saying what its body holds (B239). */
+    for (int i = 0; i < srv->nroutes; i++) {
+        const route_entry_t *r = &srv->routes[i];
+        if (r->method == API_GET) continue;
+        if (r->cls == API_CLASS_BY_PATH ? !keys_fn_for(srv, r->pattern) : !r->keys)
+            return set_error(CUTILS_ERR, "route %s %s: body keys not declared",
+                             METHOD_NAMES[r->method], r->pattern);
+    }
 
     if (srv->tcp_port > 0) {
         if (!tcp_cls)

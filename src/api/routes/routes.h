@@ -123,6 +123,10 @@ api_response_t    db_actions_route_post(const api_request_t *req, int64_t repo_i
 /* The /repos/<id> path tables, whole, for the test that holds every write
  * in them to a durability class (tests/test_route_classes.c). */
 const api_path_t *routes_repo_paths(size_t *n);
+/* The body members a write to a /repos/<id> path table sample accepts
+ * (B239): a NULL-terminated list, API_KEYS_NONE, API_KEYS_HANDLER, or NULL
+ * when nothing is declared for it. */
+const char *const *routes_repo_keys(const char *sample, api_method_t method);
 const api_path_t *routes_units_paths(size_t *n);
 api_response_t units_route_get(const api_request_t *req, int64_t repo_id, const char *rest);
 api_response_t units_route_put(const api_request_t *req, int64_t repo_id, const char *rest);

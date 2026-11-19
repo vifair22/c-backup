@@ -305,6 +305,10 @@ static void test_after_write_runs_for_durable_writes_only(void **state)
     assert_int_equal(api_server_route(srv, "/thing", API_PUT, API_COMMIT_ONLY, ok_handler, NULL), 0);
     assert_int_equal(api_server_route(srv, "/thing", API_DELETE, API_DURABLE, ok_handler, NULL), 0);
     assert_int_equal(api_server_route(srv, "/bad", API_POST, API_DURABLE, fail_handler, NULL), 0);
+    assert_int_equal(api_server_route_keys(srv, "/thing", API_POST, API_KEYS_NONE), 0);
+    assert_int_equal(api_server_route_keys(srv, "/thing", API_PUT, API_KEYS_NONE), 0);
+    assert_int_equal(api_server_route_keys(srv, "/thing", API_DELETE, API_KEYS_NONE), 0);
+    assert_int_equal(api_server_route_keys(srv, "/bad", API_POST, API_KEYS_NONE), 0);
     g_after_writes = 0;
     api_server_set_after_write(srv, count_after_write, NULL);
     assert_int_equal(api_server_start(srv), 0);
@@ -343,6 +347,8 @@ static void test_after_write_failure_is_not_answered_2xx(void **state)
     assert_non_null(srv);
     assert_int_equal(api_server_route(srv, "/thing", API_POST, API_DURABLE, ok_handler, NULL), 0);
     assert_int_equal(api_server_route(srv, "/thing", API_PUT, API_COMMIT_ONLY, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route_keys(srv, "/thing", API_POST, API_KEYS_NONE), 0);
+    assert_int_equal(api_server_route_keys(srv, "/thing", API_PUT, API_KEYS_NONE), 0);
     g_after_writes = 0;
     api_server_set_after_write(srv, failing_after_write, NULL);
     assert_int_equal(api_server_start(srv), 0);
@@ -365,6 +371,12 @@ static api_write_class_t by_path(const char *url, api_method_t method, void *ud)
     return API_CLASS_NONE;
 }
 
+static const char *const *any_keys(const char *url, api_method_t method, void *ud)
+{
+    (void)url; (void)method; (void)ud;
+    return API_KEYS_HANDLER;
+}
+
 static void test_after_write_follows_a_per_path_class(void **state)
 {
     (void)state;
@@ -375,6 +387,9 @@ static void test_after_write_follows_a_per_path_class(void **state)
     /* No resolver yet: start refuses rather than syncing everything. */
     assert_int_not_equal(api_server_start(srv), 0);
     assert_int_equal(api_server_route_class(srv, "/w/*", by_path, NULL), 0);
+    /* Nor without a body-keys resolver (B239). */
+    assert_int_not_equal(api_server_start(srv), 0);
+    assert_int_equal(api_server_route_keys_fn(srv, "/w/*", any_keys, NULL), 0);
     g_after_writes = 0;
     api_server_set_after_write(srv, count_after_write, NULL);
     assert_int_equal(api_server_start(srv), 0);
@@ -424,6 +439,8 @@ static void test_dispatch_runs_the_hook_by_class(void **state)
     assert_non_null(srv);
     assert_int_equal(api_server_route(srv, "/d", API_POST, API_DURABLE, ok_handler, NULL), 0);
     assert_int_equal(api_server_route(srv, "/c", API_POST, API_COMMIT_ONLY, ok_handler, NULL), 0);
+    assert_int_equal(api_server_route_keys(srv, "/d", API_POST, API_KEYS_NONE), 0);
+    assert_int_equal(api_server_route_keys(srv, "/c", API_POST, API_KEYS_NONE), 0);
     g_after_writes = 0;
     api_server_set_after_write(srv, count_after_write, NULL);
     api_request_t req = { .method = API_POST, .url = "/c", .client_addr = "" };
@@ -443,6 +460,84 @@ static void test_dispatch_runs_the_hook_by_class(void **state)
     api_server_stop(srv);
 }
 
+/*
+ * B239: a write's body may hold only the members its route declared. The
+ * router refuses anything else with 400 naming the member, before the
+ * handler runs, at the top level and inside a declared path.
+ */
+static int g_handled;
+static api_response_t counting_handler(const api_request_t *req, void *ud)
+{
+    (void)req; (void)ud;
+    g_handled++;
+    return api_ok(strdup("{}"));
+}
+
+static api_response_t post_body(api_server_t *srv, const char *url, const char *body)
+{
+    api_request_t req = { .method = API_POST, .url = url, .client_addr = "",
+                          .body = body, .body_len = body ? strlen(body) : 0 };
+    return api_server_dispatch(srv, &req);
+}
+
+static void expect(api_server_t *srv, const char *url, const char *body, int status,
+                   const char *says)
+{
+    int before = g_handled;
+    api_response_t r = post_body(srv, url, body);
+    if (r.status != status || (says && (!r.body || !strstr(r.body, says))))
+        fail_msg("POST %s %s: %d %s (wanted %d naming %s)", url, body ? body : "(none)",
+                 r.status, r.body ? r.body : "", status, says ? says : "-");
+    /* A refusal never reaches the handler. */
+    assert_int_equal(g_handled - before, status == 400 ? 0 : 1);
+    free(r.body);
+}
+
+static void test_unknown_body_keys_are_refused(void **state)
+{
+    (void)state;
+    static const char *const keys[] = { "name", "list[].path", "list[].mode",
+                                         "opt.depth", NULL };
+    api_server_t *srv = api_server_create(0, NULL, NULL, NULL);
+    assert_non_null(srv);
+    assert_int_equal(api_server_route(srv, "/k", API_POST, API_COMMIT_ONLY, counting_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/n", API_POST, API_COMMIT_ONLY, counting_handler, NULL), 0);
+    assert_int_equal(api_server_route(srv, "/h", API_POST, API_COMMIT_ONLY, counting_handler, NULL), 0);
+    /* Undeclared: refused at start, as a missing class is. */
+    assert_int_not_equal(api_server_start(srv), 0);
+    assert_int_equal(api_server_route_keys(srv, "/k", API_POST, keys), 0);
+    assert_int_equal(api_server_route_keys(srv, "/n", API_POST, API_KEYS_NONE), 0);
+    assert_int_equal(api_server_route_keys(srv, "/h", API_POST, API_KEYS_HANDLER), 0);
+    /* Only a fixed write takes a list. */
+    assert_int_not_equal(api_server_route_keys(srv, "/nope", API_POST, API_KEYS_NONE), 0);
+    assert_ptr_equal(api_server_keys_for(srv, "/k", API_POST), keys);
+    assert_null(api_server_keys_for(srv, "/k", API_GET));
+
+    g_handled = 0;
+    expect(srv, "/k", NULL, 200, NULL);
+    expect(srv, "/k", "{}", 200, NULL);
+    expect(srv, "/k", "{\"name\":\"a\",\"list\":[{\"path\":\"/x\",\"mode\":\"warn\"}],"
+                      "\"opt\":{\"depth\":1}}", 200, NULL);
+    expect(srv, "/k", "{\"name\":\"a\",\"nmae\":\"b\"}", 400,
+           "unknown key 'nmae'; valid keys: name, list, opt");
+    expect(srv, "/k", "{\"list\":[{\"path\":\"/x\"},{\"path\":\"/y\",\"mod\":\"warn\"}]}", 400,
+           "unknown key 'mod' in list[]; valid keys: path, mode");
+    expect(srv, "/k", "{\"opt\":{\"dpeth\":2}}", 400, "unknown key 'dpeth' in opt");
+    /* Not an object, or not JSON: the handler's to refuse in its words. */
+    expect(srv, "/k", "[1,2]", 200, NULL);
+    expect(srv, "/k", "{nope", 200, NULL);
+    expect(srv, "/n", "{}", 200, NULL);
+    expect(srv, "/n", "{\"dry_run\":true}", 400,
+           "unknown key 'dry_run'; this request takes no fields");
+    expect(srv, "/h", "{\"anything\":1}", 200, NULL);
+    api_server_stop(srv);
+
+    char msg[256];
+    assert_int_equal(api_body_unknown_key("{\"a\":1}", 7, API_KEYS_NONE, msg, sizeof(msg)), 1);
+    assert_int_equal(api_body_unknown_key("{\"a\":1}", 7, API_KEYS_HANDLER, msg, sizeof(msg)), 0);
+    assert_int_equal(api_body_unknown_key(NULL, 0, API_KEYS_NONE, msg, sizeof(msg)), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -458,6 +553,7 @@ int main(void)
         cmocka_unit_test_setup(test_after_write_follows_a_per_path_class, fresh_port),
         cmocka_unit_test(test_a_write_needs_a_class),
         cmocka_unit_test(test_dispatch_runs_the_hook_by_class),
+        cmocka_unit_test(test_unknown_body_keys_are_refused),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
