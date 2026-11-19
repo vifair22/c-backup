@@ -100,6 +100,17 @@ int object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 /* Hex-encode a hash.  buf must be at least OBJECT_HASH_SIZE*2+1 bytes. */
 void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf);
 
+/*
+ * Ask the kernel to start reading an object's stored bytes now, ahead of the
+ * load that will want them (restore's read-ahead, restore_prefetch.h). A
+ * hint and nothing more: it reads no bytes into the caller, never fails it,
+ * and leaves the error buffer as it found it. On success *out_loc is where
+ * the object lives (orig_size and comp_size are what a caller sizes its
+ * window by); returns 0 when the object could not be located.
+ */
+int object_prefetch(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                    store_location_t *out_loc);
+
 /* Size and type from the entry header, without loading the payload. */
 status_t object_get_info(store_t *store,
                          const uint8_t hash[OBJECT_HASH_SIZE],
