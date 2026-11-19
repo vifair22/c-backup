@@ -441,7 +441,7 @@ static void test_copy_leaves_source_alone(void **state)
     child_stop(&c);
 
     /* A crashed writer's commits in the -wal with its -shm gone: reading
-     * them would create a -shm, so refused, and said to be WAL (B259). */
+     * them would create a -shm, so refused, and said to be WAL. */
     child_start(TEST_SRC "/w.db", 5, 0, &c);
     assert_int_equal(kill(c.pid, SIGKILL), 0);
     int st = 0;
@@ -823,6 +823,43 @@ static void test_backup_leaves_source_alone(void **state)
     child_stop(&c);
 }
 
+/* A refused copy reports the journal mode the database has, and none it
+ * cannot know (B259: a refused WAL copy said "rollback"). */
+static void test_refused_journal_mode(void **state)
+{
+    (void)state;
+    sqlite3_close(make_db(TEST_SRC "/w.db", 1));
+    child_t c;
+    child_start(TEST_SRC "/w.db", 5, 0, &c);
+    assert_int_equal(kill(c.pid, SIGKILL), 0);
+    int st = 0;
+    assert_int_equal(waitpid(c.pid, &st, 0), c.pid);
+    close(c.go);
+    assert_int_equal(unlink(TEST_SRC "/w.db-shm"), 0);
+    FILE *f = fopen(TEST_SRC "/notes.db", "w");
+    assert_non_null(f);
+    fputs("a text file, not a database, despite the name", f);
+    fclose(f);
+    enable_copy(TEST_SRC "/w.db", NULL);
+    enable_copy(TEST_SRC "/notes.db", NULL);
+    run_t r = run_file_backup(0);
+    assert_non_null(r.caps_json);
+    print_message("captures: %s\n", r.caps_json);
+    const char *w = strstr(r.caps_json, "\"path\":\"" TEST_SRC "/w.db\"");
+    const char *n = strstr(r.caps_json, "\"path\":\"" TEST_SRC "/notes.db\"");
+    assert_non_null(w);
+    assert_non_null(n);
+    /* Each capture's fields run up to the next capture's path. */
+    const char *w_end = n > w ? n : w + strlen(w);
+    const char *n_end = w > n ? w : n + strlen(n);
+    const char *jw = strstr(w, "\"journal_mode\":\"wal\"");
+    const char *jn = strstr(n, "\"journal_mode\":\"unknown\"");
+    assert_true(jw && jw < w_end);
+    assert_true(jn && jn < n_end);
+    assert_null(strstr(r.caps_json, "\"journal_mode\":\"rollback\""));
+    run_free(&r);
+}
+
 /* Nothing enabled, or detection off: no plan, no reserved directory. */
 static void test_no_plan(void **state)
 {
@@ -913,6 +950,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_backup_with_engine_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_copy_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_leaves_source_alone, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_refused_journal_mode, setup, teardown),
         cmocka_unit_test_setup_teardown(test_no_plan, setup, teardown),
         cmocka_unit_test(test_messages),
     };

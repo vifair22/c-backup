@@ -229,9 +229,21 @@ static void test_unit_probe(void **state)
     /* The data file as recorded; the socket, a system mount, never. */
     assert_int_equal(db->n_open, 1);
     assert_string_equal(db->open[0].path, APPS "/web/db/base/1/2619");
-    /* Running by its list state, with no pid: nothing to read. */
+    /* Its mounts as it sees them (B245): the data with its recorded path,
+     * the socket and the tmpfs with none, and no host source for them. */
+    assert_int_equal(db->n_mounts, 3);
+    assert_string_equal(db->mounts[0].dest, "/var/lib/pg");
+    assert_string_equal(db->mounts[0].recorded, APPS "/web/db");
+    assert_string_equal(db->mounts[1].dest, "/var/run/docker.sock");
+    assert_null(db->mounts[1].recorded);
+    assert_string_equal(db->mounts[2].dest, "/tmp");
+    assert_null(db->mounts[2].recorded);
+    /* Running by its list state, with no pid: nothing to read, but its
+     * mounts still listed. */
     assert_false(www->running);
     assert_int_equal(www->n_procs, 0);
+    assert_true(www->n_mounts >= 1);
+    assert_string_equal(www->mounts[0].dest, "/www");
     sp_unit_probe_free(p);
 
     /* The init process gone between the inspect and the read. */
