@@ -31,6 +31,7 @@ status_t prune_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
 typedef struct {
     unsigned ntags;
     char     tags[512];   /* names, comma separated, cut with "..." */
+    int64_t  export_id;   /* refused: this open NBD export pins it; else 0 */
 } prune_info_t;
 
 /*
@@ -38,8 +39,9 @@ typedef struct {
  * no such snapshot. A tagged snapshot is refused with ERR_INVALID and
  * out->ntags set unless force is non-zero: a tag is how an operator marks a
  * snapshot as one to keep, and a delete used to remove it and its tags
- * without a word. The check runs in the deleting transaction. out may be
- * NULL.
+ * without a word. A snapshot an open NBD export pins is refused with
+ * ERR_BUSY and out->export_id set, force or not. The check runs in the
+ * deleting transaction. out may be NULL.
  */
 status_t prune_snapshot_checked(store_t *store, cutils_db_t *db, int64_t repo_id,
                                 int64_t snap_id, int force, prune_info_t *out);
