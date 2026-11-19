@@ -38,8 +38,15 @@
 
 #include <cutils/db.h>
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* The longest message the latch keeps: a whole path and its strerror, since
+ * a message cut short loses the cause, which is the half the operator needs.
+ * A caller's buffer for sync_latch_info or sync_latch_repo_info is this size
+ * or the message is truncated (B287). */
+#define SYNC_LATCH_MSG_MAX (PATH_MAX + 256)
 
 /* ---- daemon-wide (state.db, the key directory) ---- */
 
