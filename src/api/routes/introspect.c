@@ -118,33 +118,32 @@ static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
 /* ---------- statistics ---------- */
 
 /*
- * Per-type counts and sizes. `?scope=staged` narrows to objects staged in a
- * pack a running backup has not sealed yet; the default covers everything.
+ * Per-type counts and sizes over every object.
+ *
+ * `?scope=staged` used to narrow this to objects in a pack a running backup
+ * had not sealed. A backup no longer records those (backup.c, index_row):
+ * a pack's rows land when it commits, so the scope would always answer
+ * empty, and a view that is accepted and shows nothing reads as "nothing
+ * is happening" in the middle of a backup. Any scope is refused, by name.
  */
 api_response_t introspect_stats(const api_request_t *req, int64_t repo_id)
 {
     const char *scope = api_query_param(req, "scope");
-    /* Any other scope is refused rather than answered unscoped: a filter
-     * that silently filters nothing reads as an empty answer. */
-    if (scope && strcmp(scope, "staged") != 0)
-        return api_error(400, "scope must be staged");
-    int staged_only = scope != NULL;
+    if (scope) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "scope '%.64s' is not supported: statistics cover every "
+                 "object, and objects are indexed when their pack is sealed", scope);
+        return api_error(400, msg);
+    }
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
     db_result_t *r = NULL;
-    int rc = staged_only
-        ? db_execute(g_db,
-            "SELECT type, COUNT(*), COALESCE(SUM(phys_size),0), COALESCE(SUM(orig_size),0)"
-            "  FROM objects WHERE repo_id = ? AND location = 'staged'"
-            " GROUP BY type ORDER BY type",
-            (const char *[]){ repo, NULL }, &r)
-        : db_execute(g_db,
+    if (db_execute(g_db,
             "SELECT type, COUNT(*), COALESCE(SUM(phys_size),0), COALESCE(SUM(orig_size),0)"
             "  FROM objects WHERE repo_id = ? GROUP BY type ORDER BY type",
-            (const char *[]){ repo, NULL }, &r);
-    if (rc != 0) {
+            (const char *[]){ repo, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot read object statistics");
     }
@@ -192,7 +191,7 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
     /*
      * One pass over objects, not four.
      *
-     * The count, both size sums and the staged count were four separate
+     * The count and both size sums were separate
      * subqueries against the same rows, so drawing a dashboard scanned the
      * objects table four times. On a repository of 159k objects that measured
      * 366 ms - the slowest interactive call in the whole surface, and the
@@ -205,15 +204,13 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
             "WITH o AS ("
             "  SELECT COUNT(*) AS n,"
             "         COALESCE(SUM(phys_size),0) AS phys,"
-            "         COALESCE(SUM(orig_size),0) AS orig,"
-            "         COALESCE(SUM(location = 'staged'),0) AS staged"
+            "         COALESCE(SUM(orig_size),0) AS orig"
             "    FROM objects WHERE repo_id = ?"
             ")"
             "SELECT"
             " (SELECT COUNT(*) FROM snapshots WHERE repo_id = ?),"
             " o.n, o.phys, o.orig,"
             " (SELECT COUNT(*) FROM packs      WHERE repo_id = ?),"
-            " o.staged,"
             " (SELECT COUNT(*) FROM tags       WHERE repo_id = ?),"
             " (SELECT MAX(ts) FROM snapshots WHERE repo_id = ?)"
             "  FROM o",
@@ -228,8 +225,8 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
     static const jcol_t cols[] = {
         { "snapshots", 0, JCOL_INT }, { "objects", 1, JCOL_INT },
         { "phys_size", 2, JCOL_INT }, { "orig_size", 3, JCOL_INT },
-        { "packs", 4, JCOL_INT }, { "staged", 5, JCOL_INT },
-        { "tags", 6, JCOL_INT }, { "last_snapshot_ts", 7, JCOL_INT },
+        { "packs", 4, JCOL_INT }, { "tags", 5, JCOL_INT },
+        { "last_snapshot_ts", 6, JCOL_INT },
     };
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     int bad = json_resp_new(&resp) != 0
@@ -260,7 +257,8 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
     "      ELSE CAST(location AS INTEGER) END"
 
 /*
- * Paginated object listing. `?location=staged` or `?location=pack` narrows it.
+ * Paginated object listing. `?location=pack` (or `packed`) narrows it to
+ * objects in a pack; `staged` is refused like stats' scope.
  *
  * This is what replaces loose_list, global_pack_index and all_pack_entries:
  * three actions that each read a different part of the .idx sidecar are one
@@ -272,9 +270,13 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
     /* Anything else used to fall through to the unfiltered listing, so
      * `--location nowhere` answered with every object: a filter that
      * silently filtered nothing. */
-    if (loc && strcmp(loc, "staged") != 0 && strcmp(loc, "pack") != 0 &&
-        strcmp(loc, "packed") != 0 && strcmp(loc, "all") != 0)
-        return api_error(400, "location must be staged, pack (or packed), or all");
+    if (loc && strcmp(loc, "pack") != 0 && strcmp(loc, "packed") != 0 &&
+        strcmp(loc, "all") != 0) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "location '%.64s' is not supported: it must be pack "
+                 "(or packed) or all", loc);
+        return api_error(400, msg);
+    }
     int limit = 0, offset = 0;
     api_response_t page_err;
     if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
@@ -285,18 +287,11 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
 
     db_result_t *r = NULL;
     int rc;
-    if (loc && strcmp(loc, "staged") == 0) {
-        rc = db_execute(g_db,
-            "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
-            "       " OBJ_LOCATION_COLS " FROM objects"
-            " WHERE repo_id = ? AND location = 'staged'"
-            " ORDER BY hash LIMIT ? OFFSET ?",
-            (const char *[]){ repo, lim, off, NULL }, &r);
     /* Both spellings. The CLI's own help says "packed" and the route only
      * ever matched "pack", so `objects --location packed` fell through to
      * the unfiltered branch and listed everything - a filter that silently
      * did nothing. */
-    } else if (loc && (strcmp(loc, "pack") == 0 || strcmp(loc, "packed") == 0)) {
+    if (loc && (strcmp(loc, "pack") == 0 || strcmp(loc, "packed") == 0)) {
         rc = db_execute(g_db,
             "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       " OBJ_LOCATION_COLS " FROM objects"

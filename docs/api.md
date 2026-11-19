@@ -41,9 +41,10 @@ however many digits it has; an `offset` past the last row is an empty page,
 up to 2^53 (9007199254740992); a number past that cannot be represented
 exactly (`99999999999999999999`, `1e999`) and is out of range, as it is
 everywhere else. The same goes for filters with a
-fixed set of values: `objects?location=` takes `staged`, `pack` (or
-`packed`) or `all`, and anything else (`loose` included, which format 3 no
-longer has) is a 400 rather than an unfiltered listing.
+fixed set of values: `objects?location=` takes `pack` (or `packed`) or
+`all`, and anything else (`loose` included, which format 3 no longer has,
+and `staged`, which the index no longer records) is a 400 rather than an
+unfiltered listing.
 
 Directory listings are ordered by name because the index carries `name` as its
 trailing column, making the query a range scan rather than a sort of every
@@ -1181,7 +1182,8 @@ Cancellation is cooperative: the flag is set and the job stops at its next
 check. Those sit between files and also inside one file - between reads
 while storing it and between objects while restoring it - so a cancel lands
 within one object (at most 16 MiB of I/O), not at the end of a large file. A cancelled backup
-discards its open pack, the index rows staged into it and its staging files.
+discards its open pack and its staging files; no index row names the open
+pack's objects, which get their rows only when a pack commits.
 
 `POST /jobs/<id>/cancel` answers 200 with the job record, as `/jobs/<id>`
 returns it, plus `"cancel_requested":true`. A queued job is taken out of the
@@ -1379,11 +1381,12 @@ What is actually inside a repository, as opposed to what it can do.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/repos/<id>/summary` | Dashboard aggregate in one request |
-| GET | `/repos/<id>/stats` | Object counts and sizes by type; `?scope=staged` narrows to objects in a pack a running backup has not sealed yet |
+| GET | `/repos/<id>/stats` | Object counts and sizes by type, over every object; any `scope` is refused with a 400 naming it |
 
 `/summary` carries `snapshots`, `objects`, `phys_size`, `orig_size`,
-`packs`, `staged` (objects in packs not yet sealed: 0 unless a backup is
-running) and `tags`, plus `last_snapshot_ts`.
+`packs` and `tags`, plus `last_snapshot_ts`. There is no staged count: a
+backup's objects are indexed when their pack is sealed, so nothing short of
+a pack is in the index to count.
 
 Size fields on the object endpoints are `orig_size`, the logical bytes that
 went in, and `phys_size`, the bytes the object itself is charged for: the
@@ -1403,7 +1406,7 @@ in the pack trailer not counted. `payload_size` is `physical_size -
 header_size`, which equals `phys_size`. An object that reports `phys_size`
 5242880 and `physical_size` 5242931 is consistent: 5242931 - 51 = 5242880.
 
-| GET | `/repos/<id>/objects` | Paginated; `?location=staged`, `?location=pack` (or `packed`), or `?location=all` |
+| GET | `/repos/<id>/objects` | Paginated; `?location=pack` (or `packed`) or `?location=all`; any other location, `staged` included, is a 400 naming it |
 | GET | `/repos/<id>/objects/<hash>` | Where one object lives |
 | GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it, `{snap_id, node_id, name, path, index_gen}` each (`index_gen` as under Node ids and index generations); `limit` (default 500, at most 5000) and `offset` |
 | GET | `/repos/<id>/objects/<hash>/layout` | Header fields and on-disk footprint |
@@ -1425,8 +1428,7 @@ live answer for one object. Keeping it exact through every backup and
 prune would mean adjusting it on every path that adds or drops a
 reference, which is the drift mark-and-sweep exists to avoid (`gc.h`).
 
-An object's `location` is `packed`, `staged` (in a pack a running backup
-has not sealed yet) or `absent` (named by a snapshot's trees but held by no
+An object's `location` is `packed` or `absent` (named by a snapshot's trees but held by no
 pack, as a reindex found it; verify reports it `missing`), and `pack_id` is
 the pack's number or `null`. The index stores the pack number in place of
 the location, and serving it as stored made `location` a word for some

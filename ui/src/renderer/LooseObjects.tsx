@@ -2,10 +2,11 @@
  * The object store, by object.
  *
  * Migrated off the action bridge, and widened to match `c-backup objects`,
- * which takes a location: every object lives in a pack, staged ones only
- * until a backup seals its pack, and having no way to look at a packed
- * one from here meant dropping into the pack browser to answer a question
- * about a single hash.
+ * which takes a location: every object lives in a pack, and having no way
+ * to look at a packed one from here meant dropping into the pack browser
+ * to answer a question about a single hash. There is no Staged view: a
+ * backup's objects are indexed when their pack is sealed, so it was always
+ * empty, and said "Nothing is staged" in the middle of a backup.
  *
  * What the bridge fed this was a different response entirely. It read
  * `uncompressed_size`, `compressed_size`, `compression` and `pack_skip_ver`
@@ -29,7 +30,7 @@ const api = window.cbackup
 
 const PAGE_SIZE = 200
 
-type Location = 'staged' | 'packed' | 'all'
+type Location = 'packed' | 'all'
 
 interface StoreObject {
   hash: string
@@ -72,12 +73,10 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
   /* Totals come from a GROUP BY on the daemon side, so the header can say
    * how much is there without paging through all of it. */
   useEffect(() => {
-    api.apiCall<{ per_type?: WireTypeStat[] }>(connName, {
-      kind: 'stats', repoId, ...(location === 'staged' ? { scope: 'staged' } : {}),
-    })
+    api.apiCall<{ per_type?: WireTypeStat[] }>(connName, { kind: 'stats', repoId })
       .then(r => setPerType(r.per_type ?? []))
       .catch(() => setPerType([]))
-  }, [connName, repoId, location])
+  }, [connName, repoId])
 
   const fetchPage = useCallback(async (pageOffset: number, loc: Location) => {
     setLoading(true)
@@ -112,7 +111,6 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
   const totalPhys  = perType.reduce((a, t) => a + t.phys_size, 0)
 
   const LOCATIONS: { key: Location; label: string }[] = [
-    { key: 'staged', label: 'Staged' },
     { key: 'packed', label: 'Packed' },
     { key: 'all',   label: 'All' },
   ]
@@ -141,28 +139,9 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
             {l.label}
           </button>
         ))}
-        {location === 'staged' && (
-          <span className="text-xs text-text-muted ml-2">
-            Staged objects are in the pack a running backup has not sealed yet;
-            every object lives in a pack once it is.
-          </span>
-        )}
       </div>
 
       {error && <div className="text-status-error text-sm mb-3">{error}</div>}
-
-      {perType.length > 0 && location === 'staged' && (
-        <div className="flex flex-wrap gap-3 mb-4">
-          {perType.filter(t => t.count > 0).map(t => (
-            <div key={t.type} className="bg-surface-secondary border border-border-default rounded-lg px-3 py-2 text-xs">
-              <span className="font-semibold">{OBJECT_TYPE_NAMES[t.type] ?? `type-${t.type}`}</span>
-              <span className="text-text-muted ml-2">
-                {fmtNum(t.count)} ({fmtSize(t.orig_size)})
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
 
       {objects.length > 0 && (
         <div className="bg-surface-secondary border border-border-default rounded-lg overflow-hidden">
@@ -207,9 +186,7 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
       {loading && <div className="text-text-muted text-sm mt-3">Loading...</div>}
       {!loading && objects.length === 0 && !error && (
         <div className="text-text-muted text-sm">
-          {location === 'staged'
-            ? 'Nothing is staged. Every object is in an installed pack.'
-            : 'No objects.'}
+          No objects.
         </div>
       )}
 
