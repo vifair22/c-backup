@@ -178,7 +178,14 @@ test('browse: walking into a directory and opening a file', async () => {
   await h.page.getByText('notes.txt', { exact: true }).click()
   await expect(h.page.getByText('View Content')).toBeVisible()
   await h.page.screenshot({ path: 'test-results/snapshot-file-detail.png' })
-  await h.page.getByRole('button', { name: 'Close' }).click()
+
+  /* Restoring the one file names it after the snapshot, in plain ASCII
+   * (NIT-49: it was set off with an em-dash). */
+  await h.page.getByRole('button', { name: 'Restore File' }).click()
+  await expect(h.page.getByRole('heading', { name: 'Restore File' })).toBeVisible()
+  await expect(h.page.getByText(/^Snapshot #2: \S*\/src\/notes\.txt$/)).toBeVisible()
+  await h.page.getByRole('button', { name: /^cancel$/i }).click()
+  await expect(h.page.getByRole('heading', { name: 'Restore File' })).toHaveCount(0)
 })
 
 test('search: a name, with the path it lives at', async () => {

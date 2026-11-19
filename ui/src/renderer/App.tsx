@@ -32,7 +32,7 @@ import { useTheme, type ThemeMode } from './useTheme'
 const api = window.cbackup
 
 if (!api) {
-  console.error('window.cbackup is undefined — preload script may not have loaded')
+  console.error('window.cbackup is undefined; the preload script may not have loaded')
 }
 
 export function App(): React.ReactElement {
@@ -94,7 +94,7 @@ export function App(): React.ReactElement {
 
   const [error, setError] = useState<string | null>(null)
 
-  // Shared task state — single poll shared by TaskBar + TaskListView
+  // One poll feeds both TaskBar and TaskListView
   const [taskList, setTaskList] = useState<Job[]>([])
 
   useEffect(() => {
@@ -1045,7 +1045,7 @@ export function App(): React.ReactElement {
             </h3>
             <div className="text-xs text-text-muted mb-3">
               Snapshot #{restoreModal.snapId}
-              {restoreModal.filePath && <span className="font-mono ml-1">— {restoreModal.filePath}</span>}
+              {restoreModal.filePath && <>: <span className="font-mono">{restoreModal.filePath}</span></>}
             </div>
             <div className="mb-3">
               <label className="block text-xs font-medium text-text-secondary mb-1">{activeRepo ? pathLabel(activeRepo.conn, 'Destination path') : 'Destination path'}</label>
