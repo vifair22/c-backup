@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------------ */
@@ -626,6 +627,25 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
     return content_restore_fd_ex(store, hash, out_fd, out_size, NULL);
 }
 
+_Thread_local content_io_times_t *content_io_times;
+
+static uint64_t io_now(void)
+{
+    if (!content_io_times) return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void io_add(int write, uint64_t t0)
+{
+    content_io_times_t *t = content_io_times;
+    if (!t) return;
+    uint64_t d = io_now() - t0;
+    if (write) { t->write_ns += d; t->writes++; }
+    else       { t->load_ns += d;  t->loads++; }
+}
+
 status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                                int out_fd, uint64_t *out_size, int *out_write_failed)
 {
@@ -634,7 +654,9 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
     *wf = 0;
     uint64_t size = 0;
     uint8_t type = 0;
+    uint64_t ti = io_now();
     status_t st = object_get_info(store, hash, &size, &type);
+    io_add(0, ti);
     if (st != OK) return st;
     if (type == OBJECT_TYPE_FILE) {
         /* Loaded, decrypted and checked whole before a byte is written. */
@@ -642,11 +664,15 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
         size_t   len = 0;
         uint8_t  otype = 0;
         uint64_t taken = 0;
+        uint64_t t0 = io_now();
         st = object_load_budgeted(store, hash, &data, &len, &otype, &taken);
+        io_add(0, t0);
         if (st == OK && otype != OBJECT_TYPE_FILE)
             st = set_error(ERR_CORRUPT, "object is of type %u, not file content", otype);
         if (st == OK && len) {
+            t0 = io_now();
             st = pwrite_full(out_fd, data, len, 0);
+            io_add(1, t0);
             if (st != OK) *wf = 1;
         }
         if (st == OK) store_io_progress(store, len);
@@ -672,9 +698,13 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
         if (st != OK || done) break;
         if (store_cancelled(store)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
         void *data = NULL;
+        uint64_t t0 = io_now();
         st = load_leaf(store, &x, OBJECT_TYPE_FILE, &data);
+        io_add(0, t0);
         if (st != OK) break;
+        t0 = io_now();
         st = pwrite_full(out_fd, data, (size_t)x.length, x.offset);
+        io_add(1, t0);
         leaf_free(data, x.length);
         if (st != OK) { *wf = 1; break; }
         store_io_progress(store, x.length);

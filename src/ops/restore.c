@@ -30,6 +30,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -387,6 +388,28 @@ static const char *parent_reason(int err)
     return strerror(err);
 }
 
+/*
+ * Where a restore's time goes, logged at its end: the content's loads and
+ * writes (content_io_times_t), the metadata applied to each file, and the
+ * batch syncs and renames. Restore had no profile, so its cost on a
+ * deployment could only be argued about; this is the restore's counterpart
+ * of backup's phase report, and as cheap: a clock pair per object and per
+ * file. One restore per thread at a time, so a thread-local is enough.
+ */
+typedef struct {
+    content_io_times_t io;
+    uint64_t meta_ns, sync_ns, syncs, rename_ns;
+} restore_prof_t;
+
+static _Thread_local restore_prof_t *restore_prof;
+
+static uint64_t prof_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 static void set_times_at(int pfd, const char *leaf, const char *shown, int64_t mtime_ns)
 {
     struct timespec times[2];
@@ -696,6 +719,7 @@ static void restore_bytes(uint64_t bytes, void *ctx)
     report(io->opts, "restore", io->index, io->count);
 }
 
+
 /*
  * Every node's path, built from the rows the restore has already read.
  *
@@ -971,11 +995,13 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
      * it has its name: the resume rule relies on the mtime being right.
      * Through the fd: the file is never looked up by name again. */
     if (st == OK) {
+        uint64_t t0 = prof_now();
         meta_target_t t = { fd, NULL, 0, full };
         clear_acls(&t, 0);
         apply_metadata_fd(fd, full, mode, uid, gid, mtime);
         apply_xattrs(store, &t, xhash);
         apply_acls(store, &t, ahash, 0);
+        if (restore_prof) restore_prof->meta_ns += prof_now() - t0;
     }
     if (close(fd) != 0 && st == OK) {
         st = set_error_errno(ERR_IO, "restore: cannot close %s", full);
@@ -1040,8 +1066,10 @@ static void batch_flush(rename_batch_t *b, restore_result_t *res)
     int synced = 0;
     const char *leaf;
     int pfd = dest_parent(&b->dirs, b->items[0].rel, &leaf, 0);
+    uint64_t t0 = prof_now();
     if (pfd != -1) {
         synced = syncfs(pfd) == 0;
+        if (restore_prof) { restore_prof->sync_ns += prof_now() - t0; restore_prof->syncs++; }
         if (!synced)
             log_warn("restore: cannot sync %u restored file(s) to disk: %s",
                      b->n, strerror(errno));
@@ -1049,6 +1077,7 @@ static void batch_flush(rename_batch_t *b, restore_result_t *res)
         log_warn("restore: cannot open the directory of %s to sync it: %s",
                  b->items[0].full, strerror(errno));
     }
+    uint64_t t1 = prof_now();
     for (uint32_t i = 0; i < b->n; i++) {
         pending_file_t *p = &b->items[i];
         pfd = dest_parent(&b->dirs, p->rel, &leaf, 0);
@@ -1076,6 +1105,7 @@ static void batch_flush(rename_batch_t *b, restore_result_t *res)
         free(p->tmp);
         free(p->full);
     }
+    if (restore_prof) restore_prof->rename_ns += prof_now() - t1;
     b->n = 0;
     b->bytes = 0;
 }
@@ -1388,6 +1418,14 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         return set_error(ERR_NOMEM, "restore: directory sweep map");
     }
     dir_cache_init(&batch->dirs, dest_fd);
+
+    restore_prof_t prof;
+    memset(&prof, 0, sizeof(prof));
+    restore_prof_t *prev_prof = restore_prof;
+    content_io_times_t *prev_io_times = content_io_times;
+    restore_prof = &prof;
+    content_io_times = &prof.io;
+    uint64_t prof_t0 = prof_now();
 
     for (int i = 0; i < r->nrows && st == OK; i++) {
         if (cancelled(opts)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
@@ -1839,6 +1877,21 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
     }
     /* Whatever verified before a stop is still worth keeping. */
     batch_flush(batch, &res);
+    {
+        double wall = (double)(prof_now() - prof_t0) / 1e9;
+        double load = (double)prof.io.load_ns / 1e9, wr = (double)prof.io.write_ns / 1e9;
+        double meta = (double)prof.meta_ns / 1e9, sy = (double)prof.sync_ns / 1e9;
+        double rn = (double)prof.rename_ns / 1e9;
+        log_info("restore: profile %.2f s: load %.2f s (%llu objects), write %.2f s "
+                 "(%llu), metadata %.2f s, sync %.2f s (%llu syncfs), rename %.2f s, "
+                 "elsewhere %.2f s",
+                 wall, load, (unsigned long long)prof.io.loads, wr,
+                 (unsigned long long)prof.io.writes, meta, sy,
+                 (unsigned long long)prof.syncs, rn,
+                 wall - load - wr - meta - sy - rn);
+    }
+    restore_prof = prev_prof;
+    content_io_times = prev_io_times;
     dir_cache_drop(&batch->dirs);
     free(batch);
     free(swept);
