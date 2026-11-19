@@ -1168,13 +1168,18 @@ export function App(): React.ReactElement {
                     {sources.map(p => {
                       const n = sourceDbs?.byScope.get(`source:${p}`) ?? 0
                       return (
-                        <li key={p} className="truncate">
-                          {p}
+                        /* The path gives way, never the badges after it
+                         * (Demo L2): the whole row used to truncate, so a
+                         * path of 40 characters cut "snapshot: strict" to
+                         * "sna...". The title keeps the full path reachable. */
+                        <li key={p} className="flex items-center min-w-0" data-testid="backup-source">
+                          <span className="truncate min-w-0" title={p} data-testid="backup-source-path">{p}</span>
                           {snapModes[p] && (
                             <span title={snapModes[p] === 'strict'
                                     ? 'Read from a ZFS or btrfs snapshot; the backup fails if it cannot be'
                                     : 'Read from a ZFS or btrfs snapshot; read live with a warning if it cannot be'}
-                              className="ml-2 text-[10px] font-sans px-1 rounded bg-surface-tertiary text-text-secondary">
+                              data-testid="backup-source-snapshot"
+                              className="ml-2 shrink-0 whitespace-nowrap text-[10px] font-sans px-1 rounded bg-surface-tertiary text-text-secondary">
                               snapshot: {snapModes[p]}
                             </span>
                           )}
@@ -1184,7 +1189,7 @@ export function App(): React.ReactElement {
                               navigateTo({ view: 'databases', scope: `source:${p}` })
                             }}
                               title="live databases under this source are captured uncovered"
-                              className="ml-2 px-1.5 rounded text-[10px] font-sans font-semibold
+                              className="ml-2 shrink-0 whitespace-nowrap px-1.5 rounded text-[10px] font-sans font-semibold
                                          bg-status-error text-white border-none cursor-pointer">
                               {n} uncovered database{n === 1 ? '' : 's'}
                             </button>
