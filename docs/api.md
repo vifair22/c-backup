@@ -1669,7 +1669,7 @@ Each finding:
 | `method` | how it was captured: `snapshot`, `paused-read`, `live-read`, or `engine-copy` for a file source's SQLite whose engine copy was made (its coverage is then `covered-application`); null for a hint |
 | `suggestion`, `optional` | a template or action name, or null (Manual 23.3) |
 | `state` | `new`, `suggested`, `enabled`, `dismissed` |
-| `evidence` | an object: `markers`, `journal_mode`, `flavour`, `unsettled`, `links`, `also`; from units.probe, `processes` and `open_write` (at most 8 each), `unit_names` (a PostgreSQL's or MySQL's unit, for resolving a Nextcloud) and Nextcloud's `link` (`dbtype`, `dbhost`, `resolved`, `consistent`, `note`); for a hint, `images`, `ports`, `processes` and a `note` |
+| `evidence` | an object: `markers`, `journal_mode`, `flavour`, `unsettled`, `links`, `also`; from units.probe, `processes` (`container`, `comm`, and for java the `args_match` that made it Elasticsearch's or OpenSearch's) and `open_write` (at most 8 each), `ports` (`container`, `port`: the engine's listening ports; none under `--network none` says nothing), `unit_names` (a PostgreSQL's or MySQL's unit, for resolving a Nextcloud) and Nextcloud's `link` (`dbtype`, `dbhost`, `resolved`, `consistent`, `note`); for a hint, `images`, `ports`, `processes` and a `note` |
 | `first_seen`, `last_seen` | epoch seconds |
 | `last_snap_id` | the snapshot it was last seen in; a detection run leaves it as it was, null if only detection has seen it |
 | `alerted_at` | the one alert of its uncovered spell, or null |

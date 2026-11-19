@@ -879,6 +879,84 @@ static void test_probe_liveness(void **state)
     db_findings_free(f);
 }
 
+/* B252: listening ports are hint evidence on the findings the engine's
+ * processes are on (section 3), never liveness, and a container with no
+ * network, which listens on nothing, loses nothing by it. A java process
+ * says which word made it Elasticsearch's or OpenSearch's. */
+static void test_probe_ports(void **state)
+{
+    (void)state;
+    wtext("pg/PG_VERSION", "16\n");
+    wempty("pg/global/pg_control");
+    wdir("pg/base/1");
+    wtext("pgdata.bak/PG_VERSION", "16\n");
+    wempty("pgdata.bak/global/pg_control");
+    wdir("pgdata.bak/base");
+    wbytes("pg/base/1/2619", "x", 1, 8192);
+    wempty("influx1/meta/meta.db");
+    wempty("influx1/data/db1/x.tsm");
+    wempty("influx1/wal/db1/x.wal");
+    wempty("es/_state/state-1.st");
+    wempty("es/indices/Zx9rT1QwS0uQhY8b/0/index/segments_3");
+    db_cap_root_t r = { TEST_DIR, DB_CAP_ATOMIC, 0 };
+    db_capture_desc_t cap = { &r, 1, 0, 0, 1, 1 };
+
+    /* --network none: processes, no ports. Live all the same. */
+    probe_t t;
+    memset(&t, 0, sizeof(t));
+    sp_probe_container_t *pg = pc(&t, "pg", "postgres:16");
+    pproc(pg, "postgres", "postgres");
+    sp_probe_container_t *ix = pc(&t, "influx", "influxdb:1.8");
+    pproc(ix, "influxd", "influxd");
+    sp_probe_container_t *os = pc(&t, "search", "opensearchproject/opensearch:2");
+    pproc(os, "java", "/usr/share/opensearch/jdk/bin/java -Xshare:auto -Dopensearch.path.home=x");
+    db_findings_t *f = detect_unit(&t.p, &cap);
+    const db_finding_t *x = find(f, DB_ENGINE_POSTGRES, "pg");
+    assert_int_equal(x->confidence, DB_CONF_LIVE);
+    assert_null(strstr(x->evidence, "\"ports\""));
+    x = find(f, DB_ENGINE_ELASTIC, "es");
+    assert_non_null(x);
+    assert_int_equal(x->confidence, DB_CONF_LIVE);
+    assert_non_null(strstr(x->evidence, "\"processes\":[{\"container\":\"search\",\"comm\":\"java\","
+                                        "\"args_match\":\"opensearch\"}]"));
+    db_findings_free(f);
+
+    /* Listening: each engine's port goes on its findings. */
+    pg->ports[pg->n_ports++] = 5432;
+    ix->ports[ix->n_ports++] = 8086;
+    ix->ports[ix->n_ports++] = 8088;
+    os->ports[os->n_ports++] = 9200;
+    f = detect_unit(&t.p, &cap);
+    x = find(f, DB_ENGINE_POSTGRES, "pg");
+    assert_non_null(strstr(x->evidence, "\"ports\":[{\"container\":\"pg\",\"port\":\"5432\"}]"));
+    x = find(f, DB_ENGINE_INFLUX1, "influx1");
+    assert_int_equal(x->confidence, DB_CONF_LIVE);
+    assert_non_null(strstr(x->evidence, "\"ports\":[{\"container\":\"influx\",\"port\":\"8086\"}]"));
+    assert_non_null(strstr(find(f, DB_ENGINE_ELASTIC, "es")->evidence, "\"port\":\"9200\""));
+    /* No hint for what a signature already found. */
+    assert_null(find_hint(f, DB_ENGINE_POSTGRES));
+    db_findings_free(f);
+
+    /* Once the process is seen holding one directory, the port goes with
+     * the process, not on the old copy beside it. */
+    popen_(pg, abs_of("pg/base/1/2619"), "postgres");
+    f = detect_unit(&t.p, &cap);
+    assert_non_null(strstr(find(f, DB_ENGINE_POSTGRES, "pg")->evidence, "\"port\":\"5432\""));
+    x = find(f, DB_ENGINE_POSTGRES, "pgdata.bak");
+    assert_int_equal(x->confidence, DB_CONF_DORMANT);
+    assert_null(strstr(x->evidence, "\"ports\""));
+    db_findings_free(f);
+
+    /* A port with no process of its engine is evidence, never liveness. */
+    pg->n_procs = 0;
+    pg->n_open = 0;
+    f = detect_unit(&t.p, &cap);
+    x = find(f, DB_ENGINE_POSTGRES, "pg");
+    assert_int_equal(x->confidence, DB_CONF_DORMANT);
+    assert_non_null(strstr(x->evidence, "\"port\":\"5432\""));
+    db_findings_free(f);
+}
+
 /* An image, port or process with no signature in the included mounts is
  * a hint, one per engine, with path "" and nothing judged. */
 static void test_probe_hints(void **state)
@@ -1088,6 +1166,7 @@ int main(void)
         cmocka_unit_test(test_engine_maps),
         cmocka_unit_test_setup_teardown(test_probe_liveness, setup, teardown),
         cmocka_unit_test_setup_teardown(test_probe_hints, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_probe_ports, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nextcloud_link, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nextcloud_unread, setup, teardown),
     };

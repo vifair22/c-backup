@@ -4881,7 +4881,12 @@ Liveness from the probe, in a unit:
 | Signal | What it makes live |
 |---|---|
 | a file held open for writing (`O_WRONLY` or `O_RDWR`) | the finding whose directory holds it; for SQLite and bbolt, the database file itself or its `-wal`, `-shm` or `-journal` |
-| an engine's process: `postgres`/`postmaster`, `mysqld`/`mariadbd`, `redis-server`/`valkey-server`, `prometheus`, `influxd`, `mongod`, `clickhouse-server`, `java` with `elasticsearch` or `opensearch` in its arguments | every finding of that engine in the unit, except that once the engine's process is seen holding files of one data directory, only the directories it holds: an old copy beside the live one (`pgdata.bak/`) stays dormant |
+| an engine's process: `postgres`/`postmaster`, `mysqld`/`mariadbd`, `redis-server`/`valkey-server`, `prometheus`, `influxd`, `mongod`, `clickhouse-server`, `java` with `elasticsearch` or `opensearch` in its arguments (the evidence says which, `args_match`) | every finding of that engine in the unit, except that once the engine's process is seen holding files of one data directory, only the directories it holds: an old copy beside the live one (`pgdata.bak/`) stays dormant |
+
+The engine's listening ports are listed in a finding's evidence (`ports`)
+beside its processes. They are hint evidence only, never liveness: a
+container started with `--network none` listens on nothing, and that says
+nothing about the database in it.
 
 SQLite, LMDB, LevelDB, RocksDB and bbolt have no process of their own (they
 are libraries inside an application), so only an open file ties them to a

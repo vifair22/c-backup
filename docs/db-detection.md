@@ -820,3 +820,14 @@ is judged per backup: a later backup whose copy fails is `uncovered` again,
 a coverage change (journalled), and alerts once more (7.3). Applied in
 `db_captures_judge` (`src/ops/db_capture.c`) before the findings are
 recorded, so the job result, `db_findings`, the metrics and the app agree.
+
+### 14.6 Ports and process words as evidence (B252)
+
+The probe always reported each container's listening ports, but only hint
+findings used them, and Elasticsearch's process evidence said only `java`.
+Decided:
+
+| Point | As built |
+|---|---|
+| Ports | The probe always reported listening ports; only hint findings used them. A port is now evidence (`ports`, `{container, port}`) on the findings its engine's processes went on, or on every finding of the engine when no process of it was seen. Never liveness (section 2.1: hint). Under `--network none` a container may listen on nothing, and an absent port changes nothing |
+| Elasticsearch process | The evidence keeps `args_match`, the word in the first 256 bytes of arguments (`opensearch` or `elasticsearch`) that made `java` the engine's, rather than the arguments themselves, which can carry `-D` properties with secrets |

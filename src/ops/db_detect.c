@@ -341,10 +341,15 @@ typedef struct { char *path; char host[256]; } nrec_t;
 
 /* units.probe signals (D1). */
 #define NAME_SZ SP_PROBE_NAME_MAX
-typedef struct { uint32_t live; db_engine_t hint; char container[NAME_SZ]; char comm[SP_PROBE_COMM_MAX]; } psig_t;
+/* match: the word in the arguments that made the process an engine's, for
+ * a comm that does not say it alone (java). */
+typedef struct { uint32_t live; db_engine_t hint; char container[NAME_SZ]; char comm[SP_PROBE_COMM_MAX];
+                 char match[16]; } psig_t;
 typedef struct { char *path; char container[NAME_SZ]; char comm[SP_PROBE_COMM_MAX]; } osig_t;
 typedef enum { HINT_IMAGE = 0, HINT_PORT, HINT_PROCESS } hint_kind_t;
-typedef struct { db_engine_t engine; hint_kind_t kind; char container[NAME_SZ]; char text[SP_PROBE_IMAGE_MAX]; } hsig_t;
+/* mask: every engine the signal fits; engine: the one a hint names. */
+typedef struct { db_engine_t engine; uint32_t mask; hint_kind_t kind; char container[NAME_SZ];
+                 char text[SP_PROBE_IMAGE_MAX]; } hsig_t;
 
 #define VEC(T) struct { T *v; size_t n, cap; }
 
@@ -779,6 +784,17 @@ uint32_t db_detect_process_engines(const char *comm, const char *args)
     return 0;
 }
 
+/* The word that made a java process Elasticsearch's or OpenSearch's, for
+ * the evidence: "java" alone says nothing (B252). OpenSearch first, since
+ * its arguments can name the Elasticsearch compatibility it keeps. */
+static const char *process_match(const char *comm, const char *args)
+{
+    if (!comm || strcmp(comm, "java") != 0 || !args) return "";
+    if (strstr(args, "opensearch")) return "opensearch";
+    if (strstr(args, "elasticsearch")) return "elasticsearch";
+    return "";
+}
+
 static int ends_with_seg(const char *s, size_t n, const char *suffix)
 {
     size_t b = strlen(suffix);
@@ -865,6 +881,7 @@ static void add_hint(db_detector_t *d, uint32_t m, hint_kind_t kind, const char 
     hsig_t h;
     memset(&h, 0, sizeof(h));
     h.engine = e;
+    h.mask = m;
     h.kind = kind;
     snprintf(h.container, sizeof(h.container), "%s", container);
     snprintf(h.text, sizeof(h.text), "%s", text);
@@ -905,6 +922,7 @@ void db_detect_unit(db_detector_t *d, const sp_unit_probe_t *probe)
             ps.hint = hint_engine(m);
             snprintf(ps.container, sizeof(ps.container), "%s", c->name);
             snprintf(ps.comm, sizeof(ps.comm), "%s", c->procs[k].comm);
+            snprintf(ps.match, sizeof(ps.match), "%s", process_match(c->procs[k].comm, c->procs[k].args));
             VEC_PUSH(d, d->psigs, ps);
             add_hint(d, m, HINT_PROCESS, c->name, c->procs[k].comm);
         }
@@ -1162,7 +1180,7 @@ typedef struct {
     cJSON      *also;
     /* units.probe (D1): what was held open or running, and for a hint
      * finding (path "") what suggested it. */
-    cJSON      *opens, *procs, *hint_ev, *link;
+    cJSON      *opens, *procs, *hint_ev, *link, *ports;
     int         hint;
     char        dbhost[256];
 } cand_t;
@@ -1176,6 +1194,7 @@ static void cand_free(cand_t *c)
     cJSON_Delete(c->procs);
     cJSON_Delete(c->hint_ev);
     cJSON_Delete(c->link);
+    cJSON_Delete(c->ports);
 }
 
 /* Which markers an engine's evidence lists. */
@@ -1438,6 +1457,7 @@ static char *evidence_json(const db_detector_t *d, const cand_t *c)
     if (c->also) cJSON_AddItemReferenceToObject(o, "also", c->also);
     if (c->opens) cJSON_AddItemReferenceToObject(o, "open_write", c->opens);
     if (c->procs) cJSON_AddItemReferenceToObject(o, "processes", c->procs);
+    if (c->ports) cJSON_AddItemReferenceToObject(o, "ports", c->ports);
     if (c->link) cJSON_AddItemReferenceToObject(o, "link", c->link);
     /* What a Nextcloud in another unit resolves its dbhost against
      * (db_findings_link_nextcloud). */
@@ -1525,14 +1545,49 @@ static void ev_pair(cJSON **arr, const char *k1, const char *v1, const char *k2,
     cJSON_AddItemToArray(*arr, o);
 }
 
+/* A process, and for java the word in its arguments that made it the
+ * engine's. */
+static void ev_proc(cJSON **arr, const psig_t *p)
+{
+    if (!p->match[0]) {
+        ev_pair(arr, "container", p->container, "comm", p->comm);
+        return;
+    }
+    if (!*arr && !(*arr = cJSON_CreateArray())) return;
+    if (cJSON_GetArraySize(*arr) >= EVIDENCE_LIST_MAX) return;
+    const cJSON *it = NULL;
+    cJSON_ArrayForEach(it, *arr) {
+        const char *a = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "container"));
+        const char *b = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "comm"));
+        const char *m = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "args_match"));
+        if (a && b && m && strcmp(a, p->container) == 0 && strcmp(b, p->comm) == 0 &&
+            strcmp(m, p->match) == 0)
+            return;
+    }
+    cJSON *o = cJSON_CreateObject();
+    if (!o) return;
+    cJSON_AddStringToObject(o, "container", p->container);
+    cJSON_AddStringToObject(o, "comm", p->comm);
+    cJSON_AddStringToObject(o, "args_match", p->match);
+    cJSON_AddItemToArray(*arr, o);
+}
+
 /* Liveness from the probe (section 2.1). A process makes every finding of
  * its engine live, except that once a process of that engine is seen
  * holding files of one of them, only the ones it holds: an old copy beside
- * the live data directory stays dormant (section 4). */
+ * the live data directory stays dormant (section 4).
+ *
+ * Listening ports are hint evidence (section 3), never liveness: they go
+ * on the findings the engine's processes went on, or on every finding of
+ * the engine when no process of it was seen. A container with no network
+ * (`--network none`) may listen on nothing, so a port missing says
+ * nothing (B252). */
 static void apply_probe(const db_detector_t *d, cand_t *v, size_t n)
 {
     if (!d->probed) return;
     int has_open[DB_ENGINE_COUNT_] = { 0 };
+    uint32_t has_proc = 0;
+    for (size_t k = 0; k < d->psigs.n; k++) has_proc |= d->psigs.v[k].live;
     unsigned *nopen = calloc(n ? n : 1, sizeof(*nopen));
     if (!nopen) return;
     for (size_t i = 0; i < n; i++) {
@@ -1551,8 +1606,13 @@ static void apply_probe(const db_detector_t *d, cand_t *v, size_t n)
         if (c->absorbed || c->hint || c->engine == DB_ENGINE_NEXTCLOUD) continue;
         if (server_engine(c->engine) && (!has_open[c->engine] || nopen[i]))
             for (size_t k = 0; k < d->psigs.n; k++)
-                if (d->psigs.v[k].live & EM(c->engine))
-                    ev_pair(&c->procs, "container", d->psigs.v[k].container, "comm", d->psigs.v[k].comm);
+                if (d->psigs.v[k].live & EM(c->engine)) ev_proc(&c->procs, &d->psigs.v[k]);
+        if (server_engine(c->engine) && (c->procs || !(has_proc & EM(c->engine))))
+            for (size_t k = 0; k < d->hsigs.n; k++) {
+                const hsig_t *h = &d->hsigs.v[k];
+                if (h->kind == HINT_PORT && (h->mask & EM(c->engine)))
+                    ev_pair(&c->ports, "container", h->container, "port", h->text);
+            }
         if (nopen[i] || c->procs) c->live = 1;
     }
     free(nopen);
