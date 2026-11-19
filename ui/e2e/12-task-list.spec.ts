@@ -53,3 +53,35 @@ test('task list: a failed job shows its error once (NIT-47)', async () => {
   await expect(card.getByText(failed.error, { exact: true })).toHaveCount(1)
   await h.page.screenshot({ path: 'test-results/12-task-failed.png', fullPage: true })
 })
+
+test("task list: a repository's view lists only that repository's jobs (Demo L4)", async () => {
+  const all = jobs()
+  const mine = all.filter(j => j.repo_id === h.repos.plain)
+  const theirs = all.filter(j => j.repo_id !== h.repos.plain)
+  expect(mine.length).toBeGreaterThan(0)
+  expect(theirs.map(j => j.id)).toContain(failed.id)
+
+  await openTasks('Documents')
+  const cards = h.page.locator('[data-testid="job-card"]')
+  await expect(cards).toHaveCount(mine.length, { timeout: 10_000 })
+  for (const j of mine) {
+    await expect(h.page.locator(`[data-testid="job-card"][data-job-id="${j.id}"]`)).toBeVisible()
+  }
+  /* Photos' failed backup is not Documents' business: neither its card
+   * nor the task bar's failed-job notice. */
+  for (const j of theirs) {
+    await expect(h.page.locator(`[data-testid="job-card"][data-job-id="${j.id}"]`)).toHaveCount(0)
+  }
+  await expect(h.page.getByText(/failed job.*click to view/)).toHaveCount(0)
+  await h.page.screenshot({ path: 'test-results/12-task-list-scoped.png', fullPage: true })
+
+  /* And the other way round. */
+  await openTasks('Photos')
+  await expect(cards).toHaveCount(theirs.filter(j => j.repo_id === h.repos.encrypted).length,
+                                  { timeout: 10_000 })
+  await expect(h.page.locator(`[data-testid="job-card"][data-job-id="${failed.id}"]`)).toBeVisible()
+  for (const j of mine) {
+    await expect(h.page.locator(`[data-testid="job-card"][data-job-id="${j.id}"]`)).toHaveCount(0)
+  }
+  await expect(h.page.getByText(/1 failed job - click to view/)).toBeVisible()
+})

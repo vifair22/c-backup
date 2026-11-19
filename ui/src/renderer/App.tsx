@@ -94,7 +94,13 @@ export function App(): React.ReactElement {
 
   const [error, setError] = useState<string | null>(null)
 
-  // One poll feeds both TaskBar and TaskListView
+  /*
+   * One poll feeds both TaskBar and TaskListView, and both are about the
+   * open repository: /jobs is daemon-wide, so the list is cut to this
+   * repository's jobs here (Demo L4). The bar has to follow the view,
+   * because clicking it opens the view, and a bar announcing another
+   * repository's failed job would open onto a list without it.
+   */
   const [taskList, setTaskList] = useState<Job[]>([])
 
   useEffect(() => {
@@ -106,7 +112,7 @@ export function App(): React.ReactElement {
          * undefined and TaskBar - which renders on every repository screen -
          * threw on it, so opening any repository blanked the window. */
         const resp = await api.apiCall<{ jobs?: Job[] }>(activeRepo.conn, { kind: 'jobList' })
-        if (!cancelled) setTaskList(resp.jobs ?? [])
+        if (!cancelled) setTaskList((resp.jobs ?? []).filter(j => j.repo_id === activeRepo.id))
       } catch { /* ignore */ }
     }
     poll()
