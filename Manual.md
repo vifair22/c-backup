@@ -239,6 +239,14 @@ ends it (B218; a test server's stop once took 53 s and ended in SIGKILL):
   the next start`). A clean stop with a small log removes `-wal` and
   `-shm` as before. The close used to copy the whole log, however large,
   and that was the 53 s.
+- Alerts queued by then (a cancelled job's, say) are handed to Pushover
+  with 1.5 s for all of them. A send to an unreachable Pushover waits 15 s
+  in the alert library, per message, and used to hold the stop for as long
+  (B226). Past the budget the daemon logs `shutdown: alert delivery did not
+  finish within 1.5 s ...`, syncs the write-ahead log and exits with status
+  0 without closing `state.db`, as a kill would; the alerts stay queued in
+  `state.db` and are sent after the next start. One whose send was in
+  flight may then arrive twice.
 - Any step that takes over a second is logged (`shutdown: stopping running
   jobs took 2.7 s`), and the last line on stderr is `c-backupd stopped in
   N s`.
