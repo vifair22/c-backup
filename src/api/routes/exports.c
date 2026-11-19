@@ -603,6 +603,23 @@ static api_response_t exports_delete(const api_request_t *req, void *ud)
     return api_no_content();
 }
 
+/* For the router, when a revoke's body has a member it does not take
+ * (NIT-52): no open export with the id is the handler's 404, ahead of the
+ * body's 400. */
+static const char *exports_missing(const char *url, api_method_t method, void *ud)
+{
+    (void)method; (void)ud;
+    int64_t id = 0;
+    const char *end = NULL;
+    if (strncmp(url, "/exports/", 9) != 0 || routes_path_id(url + 9, 1, &id, &end) != 1 || *end)
+        return "not found";
+    pthread_mutex_lock(&g_mu);
+    const export_t *e = g_list;
+    while (e && e->id != id) e = e->next;
+    pthread_mutex_unlock(&g_mu);
+    return e ? NULL : "no open export with that id";
+}
+
 static const char *exports_allow(const char *url, void *ud)
 {
     (void)ud;
@@ -621,6 +638,7 @@ int routes_register_exports(api_server_t *srv)
     /* Every delete is durable (B144): the revocation is journalled. */
     if (api_server_route(srv, "/exports/*", API_DELETE, API_DURABLE, exports_delete, NULL) != 0) return -1;
     if (api_server_route_keys(srv, "/exports/*", API_DELETE, API_KEYS_NONE) != 0) return -1;
+    if (api_server_route_missing_fn(srv, "/exports/*", exports_missing, NULL) != 0) return -1;
     if (api_server_route_allow(srv, "/exports*", exports_allow, NULL) != 0) return -1;
     return 0;
 }

@@ -875,6 +875,50 @@ static const char *const *repo_keys_for_url(const char *url, api_method_t method
     return API_KEYS_NONE;
 }
 
+/* SELECT 1 with two parameters: whether it found a row. */
+static int row_exists(cutils_db_t *db, const char *sql, const char *a, const char *b)
+{
+    db_result_t *r = NULL;
+    int found = db_execute(db, sql, (const char *[]){ a, b, NULL }, &r) == 0 && r && r->nrows > 0;
+    db_result_free(r);
+    return found;
+}
+
+/*
+ * For the router, asked only when a write's body has a member it does not
+ * take (NIT-52): the 404 the handler would give when the URL names nothing,
+ * or NULL when it names something. The repository, then the snapshot,
+ * schedule or tag the path names, in the handlers' own words. A malformed
+ * id stays the body's 400: it names nothing either way, and both are 400s.
+ */
+static const char *repo_missing_for_url(const char *url, api_method_t method, void *ud)
+{
+    (void)method;
+    if (!ud) return NULL;          /* no database (a router-only test): no answer */
+    const char *rest = NULL;
+    int64_t repo_id = split_repo_url(url, &rest);
+    if (repo_id < 0) return NULL;
+    if (!repo_exists(ud, repo_id)) return "no such repo";
+    char repo[32], id[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    int64_t n = 0;
+    const char *end = NULL;
+    if (strncmp(rest, "/snapshots/", 11) == 0 && routes_path_id(rest + 11, 1, &n, &end) == 1) {
+        snprintf(id, sizeof(id), "%lld", (long long)n);
+        if (!row_exists(ud, "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?", repo, id))
+            return "no such snapshot";
+    } else if (strncmp(rest, "/schedules/", 11) == 0 &&
+               routes_path_id(rest + 11, 1, &n, &end) == 1 && *end == '\0') {
+        snprintf(id, sizeof(id), "%lld", (long long)n);
+        if (!row_exists(ud, "SELECT 1 FROM schedules WHERE repo_id = ? AND id = ?", repo, id))
+            return "no such schedule in this repository";
+    } else if (strncmp(rest, "/tags/", 6) == 0 && rest[6]) {
+        if (!row_exists(ud, "SELECT 1 FROM tags WHERE repo_id = ? AND name = ?", repo, rest + 6))
+            return "no such tag";
+    }
+    return NULL;
+}
+
 /* For the router: a method no handler is registered for (PATCH, OPTIONS). */
 static const char *repo_allow_for_url(const char *url, void *ud)
 {
@@ -1240,6 +1284,7 @@ int routes_register_repos(api_server_t *srv, cutils_db_t *db)
     static const char *const k_create[] = { "path", "label", "encrypt", "passphrase", NULL };
     if (api_server_route_keys(srv, "/repos", API_POST, k_create) != 0) return -1;
     if (api_server_route_keys_fn(srv, "/repos/*", repo_keys_for_url, db) != 0) return -1;
+    if (api_server_route_missing_fn(srv, "/repos/*", repo_missing_for_url, db) != 0) return -1;
     return 0;
 }
 

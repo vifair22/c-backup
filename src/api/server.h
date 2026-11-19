@@ -260,6 +260,20 @@ int api_server_route_keys(api_server_t *srv, const char *pattern,
 int api_server_route_keys_fn(api_server_t *srv, const char *pattern,
                              api_keys_fn fn, void *userdata);
 
+/*
+ * Whether a write's URL names something that exists, asked only when its
+ * body has a member the route does not take (NIT-52). The member check runs
+ * before the handler, so without this a URL naming nothing answered 400 for
+ * the body, where every other request to it answers 404. The resolver
+ * returns NULL when the URL's resource exists, or the 404's message when it
+ * does not. The longest pattern (ending in '*') that matches wins. Asked on
+ * that path alone, so a sound request pays no lookup for it.
+ */
+typedef const char *(*api_missing_fn)(const char *url, api_method_t method, void *userdata);
+
+int api_server_route_missing_fn(api_server_t *srv, const char *pattern,
+                                api_missing_fn fn, void *userdata);
+
 /* The first member of body (len bytes) outside keys, as a 400 message in
  * msg: 1 when there is one, 0 when every member is declared, the body is
  * empty or not a JSON object, or keys is API_KEYS_HANDLER. */

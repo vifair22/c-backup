@@ -187,7 +187,11 @@ parameter). Members inside a list of objects are checked the same way:
 and drop the rest, so a misspelt member, or one sent to a daemon too old
 to know it, was answered 2xx with part of the request silently ignored
 (B239). The router checks this before the handler runs, so it comes ahead
-of every other answer, a 404 for the URL included. A schedule, a units
+of every other answer, except a 404 for a URL that names nothing: an
+unknown repository, snapshot, schedule, tag, job or open export is still
+`404` with the handler's own message (`no such repo`), whatever the body
+holds (NIT-52). A finished job still names itself, so a cancel of one with
+an unknown member is the 400. A schedule, a units
 job, a unit's policy and the database finding actions take members that
 depend on another member or on the provider, and refuse an unknown one in
 their own words (`unknown key 'x' in a schedule`).
@@ -207,7 +211,7 @@ the repository: missing configured sources (400), a key that is not loaded
 (409), a busy repository (503). A malformed schedule trigger on a
 repository with no sources is reported as the trigger error. A path or id
 in the URL that names nothing is still a 404 before the body is read,
-except for an unknown member, which the router refuses first.
+an unknown member included.
 
 ### When a write's answer comes back
 

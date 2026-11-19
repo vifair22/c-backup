@@ -799,8 +799,18 @@ echo "unknown body members (B239)"
 # database finding actions have their own cases below, and the units
 # routes theirs in test_units_e2e.sh and test_helper_e2e.sh.
 SRC_BEFORE=$(sock_body /repos/1/sources)
+# Things that exist, so each refusal is for the member and not the URL: a
+# URL naming nothing is a 404 whatever the body holds (NIT-52, below).
+sock_send POST /repos/1/tags '{"name":"b239keep","snap_id":1}' > /dev/null
+B239_SCHED=$(sched '{"action":"gc","trigger":{"type":"interval","seconds":86400}}' \
+             | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+B239_JOB=$(sock_body '/jobs?limit=1' | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+check "a schedule and a job to aim at" "yes" \
+    "$([ -n "$B239_SCHED" ] && [ -n "$B239_JOB" ] && echo yes || echo "no: '$B239_SCHED' '$B239_JOB'")"
 while read -r m path; do
     [ -n "$m" ] || continue
+    path=${path//@SCHED@/$B239_SCHED}
+    path=${path//@JOB@/$B239_JOB}
     OUT=$(sock_send "$m" "$path" '{"zz_b239":1}')
     contains "$m $path refuses an unknown member" "unknown key 'zz_b239'" "$OUT"
     contains "$m $path refuses it with a 400" ' 400' "$OUT"
@@ -810,17 +820,16 @@ POST /api/auth/login
 POST /api/auth/logout
 POST /api/auth/logout-all
 POST /api/auth/password
-POST /jobs/999999/cancel
-DELETE /exports/999999
+POST /jobs/@JOB@/cancel
 POST /repos
 DELETE /repos/1
 POST /repos/1/key/import
 POST /repos/1/key/ack
 POST /repos/1/repair
 POST /repos/1/tags
-DELETE /repos/1/tags/none
-PUT /repos/1/schedules/999999
-DELETE /repos/1/schedules/999999
+DELETE /repos/1/tags/b239keep
+PUT /repos/1/schedules/@SCHED@
+DELETE /repos/1/schedules/@SCHED@
 PUT /repos/1/policy
 PUT /repos/1/sources
 PUT /repos/1/snapshots/1/note
@@ -852,6 +861,35 @@ check "a gc body is not a way to ask for a dry run" \
 contains "a schedule refuses an unknown member" "unknown key 'zz_b239' in a schedule" \
     "$(sock_send POST /repos/1/schedules '{"action":"gc","trigger":{"type":"interval","seconds":60},"zz_b239":1}')"
 check "and the sources are still as they were" "$SRC_BEFORE" "$(sock_body /repos/1/sources)"
+check "the tag is still there" 1 "$(sock_body /repos/1/tags | grep -c b239keep)"
+check "and the schedule" 200 "$(sock_code /repos/1/schedules)"
+contains "listing it" "\"id\":$B239_SCHED," "$(sock_body /repos/1/schedules)"
+
+echo "a URL naming nothing is a 404, whatever its body (NIT-52)"
+# The member check runs before the handler, so these answered 400 for the
+# body where the same request without one answers 404. DELETE /exports/<id>
+# is in test_units_e2e.sh, which can open one.
+while IFS='|' read -r m path want; do
+    [ -n "$m" ] || continue
+    check "$m $path with an unknown member" "{\"error\":\"$want\"} 404" \
+        "$(sock_send "$m" "$path" '{"zz_b239":1}')"
+done <<'ROWS'
+POST|/repos/999999/backup|no such repo
+DELETE|/repos/999999|no such repo
+PUT|/repos/1/snapshots/999999/note|no such snapshot
+POST|/repos/1/snapshots/999999/restore|no such snapshot
+DELETE|/repos/1/snapshots/999999|no such snapshot
+PUT|/repos/1/schedules/999999|no such schedule in this repository
+DELETE|/repos/1/schedules/999999|no such schedule in this repository
+DELETE|/repos/1/tags/none|no such tag
+POST|/jobs/999999/cancel|no such job
+ROWS
+check "a URL that exists still answers the member" \
+    "{\"error\":\"unknown key 'zz_b239'; this request takes no fields\"} 400" \
+    "$(sock_send DELETE /repos/1/tags/b239keep '{"zz_b239":1}')"
+# Put back what the rows aimed at: a tag guards snapshot 1 from deletion.
+check "the aim tag goes" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" http://localhost/repos/1/tags/b239keep)"
+check "and the aim schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" "http://localhost/repos/1/schedules/$B239_SCHED")"
 
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
@@ -876,9 +914,10 @@ else
 fi
 
 echo "schedules"
-check "create schedule" 201 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
-     -d '{"action":"gc","trigger":{"type":"interval","seconds":3600}}' \
-     http://localhost/repos/1/schedules)"
+# Its id, not 1: ids are never reused, and the B239 rows made one before.
+SCHED_OUT=$(sock_send POST /repos/1/schedules '{"action":"gc","trigger":{"type":"interval","seconds":3600}}')
+contains "create schedule" ' 201' "$SCHED_OUT"
+SID=$(printf '%s' "$SCHED_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 # The trigger is validated at creation rather than at fire time, so a typo is
 # reported to whoever made it instead of quietly disabling the schedule later.
 check "reject bad trigger" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
@@ -898,12 +937,12 @@ case "$SL" in
     *) bad "next fire is ISO 8601 with the local offset" "...$OFF" "$SL" ;;
 esac
 check "disable schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
-     -d '{"enabled":0}' http://localhost/repos/1/schedules/1)"
+     -d '{"enabled":0}' "http://localhost/repos/1/schedules/$SID")"
 contains "schedule disabled" '"enabled":false' "$(sock_body /repos/1/schedules)"
 # B091: {"enabled":false} was refused with "enabled must be 0 or 1". JSON
 # booleans and 0/1 both work, both ways, and anything else is a 400.
 sched_put() { curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
-                   -d "$1" http://localhost/repos/1/schedules/1; }
+                   -d "$1" "http://localhost/repos/1/schedules/$SID"; }
 check "enable with true"   200 "$(sched_put '{"enabled":true}')"
 contains "enabled by true"  '"enabled":true'  "$(sock_body /repos/1/schedules)"
 check "disable with false" 200 "$(sched_put '{"enabled":false}')"
@@ -939,10 +978,10 @@ for j in $(sock_body '/jobs?limit=1000' | sed 's/{"id":/\n{"id":/g' \
     wait_job "$j" || bad "the due schedule's job $j finishes" "completed" "$(sock_body "/jobs/$j")"
 done
 check "delete schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
-     http://localhost/repos/1/schedules/1)"
+     "http://localhost/repos/1/schedules/$SID")"
 # B065: these answered success for a schedule that does not exist.
 check "delete a missing schedule" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-     --unix-socket "$SOCK" http://localhost/repos/1/schedules/1)"
+     --unix-socket "$SOCK" "http://localhost/repos/1/schedules/$SID")"
 check "disable a missing schedule" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
      --unix-socket "$SOCK" -d '{"enabled":0}' http://localhost/repos/1/schedules/999)"
 check "yearly trigger on 30 February refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' \
