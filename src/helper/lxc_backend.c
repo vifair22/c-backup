@@ -140,17 +140,9 @@ static status_t read_config(struct sp_ctx *c, const char *name, char **data, siz
     char p[PATH_MAX], hp[PATH_MAX + HOST_TOOL_PATH_MAX];
     snprintf(p, sizeof(p), "%.3900s/%.64s/config", c->pol->lxc_path, name);
     if (host_path(&c->tools, p, hp, sizeof(hp)) != 0) return set_error(ERR_INVALID, "lxc: path too long");
-    FILE *f = fopen(hp, "re");
-    if (!f) return set_error_errno(ERR_NOT_FOUND, "lxc: %s", p);
-    char *buf = malloc(CFG_MAX + 1);
-    if (!buf) { fclose(f); return set_error(ERR_NOMEM, "lxc: config"); }
-    size_t n = fread(buf, 1, CFG_MAX + 1, f);
-    fclose(f);
-    if (n > CFG_MAX) { free(buf); return set_error(ERR_TOO_LARGE, "lxc: %s is too large", p); }
-    buf[n] = '\0';
-    *data = buf;
-    *len = n;
-    return OK;
+    /* Whole or not at all (B280): fread's short count was taken as the end
+     * of the file, so a read error stored part of the config. */
+    return host_read_file(hp, p, CFG_MAX, data, len, NULL);
 }
 
 static char *trim(char *s)

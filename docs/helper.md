@@ -125,6 +125,17 @@ bind of its own.
 > then recreate the helper with the layout above. Repeat for any other path
 > that was bound under `/mnt/cache` beside an `rshared` bind.
 
+**Host files are read whole or not at all (B280).** The configuration files
+a unit stores from the host (compose files and `.env`, Unraid templates, an
+LXC container's `config`, libvirt's domain and NVRAM files) are read through
+one routine, `host_read_file` in `src/helper/host_tool.c`. It returns the
+file whole, or an error and nothing: a read error, a size that changed while
+the file was read, or something other than a regular file fails the item,
+and so its unit, with the path and the reason. Each backend had its own
+loop, and those took a read error or a file that shrank for the end of the
+file and stored the part they had, which a restore would then put back as
+the original.
+
 **The start-up check (B186).** Before anything else, the helper reads its
 own mount table (`/proc/self/mountinfo`) and the host's (`[host]
 mountinfo`, by default `/proc/1/mountinfo` when `host_root` is set) and

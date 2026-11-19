@@ -319,34 +319,21 @@ static status_t blob(dbuild_t *b, struct sp_ctx *c, const char *unit, const char
     return cache_blob(c, unit, id, data, len);
 }
 
-/* A host file's bytes, or ERR_NOT_FOUND. */
-static status_t host_file(struct sp_ctx *c, const char *path, char **data, size_t *len)
+/* A host file's bytes, whole, or ERR_NOT_FOUND; a read error or a file
+ * that changed size while read fails rather than storing part of it
+ * (B280). *open_err, when given, is the errno of an open that failed. */
+static status_t host_file_ex(struct sp_ctx *c, const char *path, char **data, size_t *len,
+                             int *open_err)
 {
+    if (open_err) *open_err = 0;
     char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
     if (host_path(&c->tools, path, hp, sizeof(hp)) != 0) return set_error(ERR_INVALID, "docker: path too long");
-    FILE *f = fopen(hp, "re");
-    if (!f) return errno == ENOENT ? set_error(ERR_NOT_FOUND, "docker: %s is missing", path)
-                                   : set_error_errno(ERR_IO, "docker: %s", path);
-    char *buf = NULL;
-    size_t n = 0, cap = 0;
-    char chunk[8192];
-    size_t r;
-    while ((r = fread(chunk, 1, sizeof(chunk), f)) > 0) {
-        if (n + r > SP_BLOB_MAX) { fclose(f); free(buf); return set_error(ERR_TOO_LARGE, "docker: %s is too large", path); }
-        if (n + r + 1 > cap) {
-            cap = (n + r + 1) * 2;
-            char *g = realloc(buf, cap);
-            if (!g) { fclose(f); free(buf); return set_error(ERR_NOMEM, "docker: %s", path); }
-            buf = g;
-        }
-        memcpy(buf + n, chunk, r);
-        n += r;
-    }
-    fclose(f);
-    if (!buf && !(buf = calloc(1, 1))) return set_error(ERR_NOMEM, "docker: %s", path);
-    *data = buf;
-    *len = n;
-    return OK;
+    return host_read_file(hp, path, SP_BLOB_MAX, data, len, open_err);
+}
+
+static status_t host_file(struct sp_ctx *c, const char *path, char **data, size_t *len)
+{
+    return host_file_ex(c, path, data, len, NULL);
 }
 
 /* Directories that are usually re-creatable, offered as exclusions and

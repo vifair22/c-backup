@@ -354,32 +354,14 @@ static int dom_state(virDomainPtr d)
     }
 }
 
-/* A host file into memory, at most max bytes. */
+/* A host file into memory, at most max bytes, whole or not at all (B280):
+ * a read error, or a file that shrank, used to end the loop and store what
+ * had been read. */
 static status_t host_file(struct sp_ctx *c, const char *path, size_t max, char **data, size_t *len)
 {
     char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
     if (host_path(&c->tools, path, hp, sizeof(hp)) != 0) return set_error(ERR_INVALID, "libvirt: path too long");
-    int fd = open(hp, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return set_error_errno(errno == ENOENT ? ERR_NOT_FOUND : ERR_IO, "libvirt: %s", path);
-    struct stat sb;
-    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode) || (size_t)sb.st_size > max) {
-        close(fd);
-        return set_error(ERR_INVALID, "libvirt: %s is not a regular file under %zu bytes", path, max);
-    }
-    char *buf = malloc((size_t)sb.st_size + 1);
-    if (!buf) { close(fd); return set_error(ERR_NOMEM, "libvirt: %s", path); }
-    size_t done = 0;
-    while (done < (size_t)sb.st_size) {
-        ssize_t r = read(fd, buf + done, (size_t)sb.st_size - done);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) break;
-        done += (size_t)r;
-    }
-    close(fd);
-    buf[done] = '\0';
-    *data = buf;
-    *len = done;
-    return OK;
+    return host_read_file(hp, path, max, data, len, NULL);
 }
 
 static void cache_drop(struct sp_ctx *c, const char *unit)
