@@ -770,6 +770,11 @@ temp-file error, and the ROLLBACK c-utils issued afterwards replaced the real
 error with "cannot rollback - no transaction is active" (fixed in c-utils
 1.8.1).
 
+A failure outside one migration's own SQL, such as the batch COMMIT running
+out of disk, used to come back as the bare "exec: ..." of the failing call;
+since c-utils 1.8.2 it reads "migrations commit failed, last applied <name>
+(sqlite error N): ..." (B288).
+
 `temp_store=MEMORY` was the other way out and is not taken: a temporary is
 as large as the table being rebuilt or sorted, the journal and the node
 index are not bounded by RAM, and design constraint 1 rules out holding them
