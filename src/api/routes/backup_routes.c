@@ -649,12 +649,25 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)w[STORE_WR_PACK_PARITY],
                  (unsigned long long)res.files_skipped);
         char *base = NULL;
-        char *src_json = sources_json(&res);
-        if (asprintf(&base, "%s%s%s", rj, ss_json ? ss_json : "", src_json ? src_json : "") < 0)
+        if (asprintf(&base, "%s%s", rj, ss_json ? ss_json : "") < 0)
             base = NULL;
-        free(src_json);
         char *full = base ? with_databases(with_skipped(base, &res, unsettled_why, &fdb), dbj) : NULL;
         free(base);
+        /* The sources (B295) go last, after every key a client already
+         * reads, so the document's earlier members keep their order. */
+        char *src_json = full ? sources_json(&res) : NULL;
+        if (src_json) {
+            size_t fl = strlen(full);
+            char *grown = (fl && full[fl - 1] == '}') ? malloc(fl + strlen(src_json) + 1) : NULL;
+            if (grown) {
+                memcpy(grown, full, fl - 1);
+                strcpy(grown + fl - 1, src_json);
+                strcat(grown, "}");
+                free(full);
+                full = grown;
+            }
+        }
+        free(src_json);
         if (full) {
             job_set_result(progress_ctx, full);
             free(full);

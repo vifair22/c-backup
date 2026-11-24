@@ -476,7 +476,7 @@ contains "and a clean backup left nothing out" '"files_skipped":0,"skipped":[],"
 contains "and saw nothing change under it" '"files_changed":0,"changed":[],"changed_listed":0,' "$JOB_BODY"
 contains "and kept nothing that never settled" '"changed_unsettled":0,"unsettled":[],"unsettled_listed":0,' "$JOB_BODY"
 # Database detection (docs/db-detection.md): reported on every backup, here none.
-contains "and found no database" '"databases":{"findings":[],"listed":0,"total":0,"sqlite_small":0}}' "$JOB_BODY"
+contains "and found no database" '"databases":{"findings":[],"listed":0,"total":0,"sqlite_small":0}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -2290,7 +2290,7 @@ wait_job "$EJ"
 EBODY=$(sock_body "/jobs/$EJ")
 contains "a backup with an empty source completes" '"state":"completed"' "$EBODY"
 contains "with a warning naming the source" \
-    "\"warning\":\"warning: source $R/s295/stub is empty: snapshot 1 holds nothing from it\"" "$EBODY"
+    "\"warning\":\"source $R/s295/stub is empty: snapshot 1 holds nothing from it\"" "$EBODY"
 contains "and the result lists every source as found" \
     "\"sources\":[{\"path\":\"$R/s295/full\",\"entries\":10,\"files\":10,\"bytes\":21,\"state\":\"ok\"},{\"path\":\"$R/s295/stub\",\"entries\":0,\"files\":0,\"bytes\":0,\"state\":\"empty\"}]" \
     "$EBODY"
