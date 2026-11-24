@@ -155,6 +155,8 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
     for (int i = 0; retention[i]; i++)
         config_check_int_range(chk, retention[i], 0, INT_MAX);
 
+    config_check_int_range(chk, "backup.source_drop_pct", 0, 100);
+
     static const char *const modes[] = { "auto", "strict", "relaxed", NULL };
     config_check_one_of(chk, "backup.file_cache_match", modes);
     static const char *const unsettled[] = { "store", "skip", NULL };

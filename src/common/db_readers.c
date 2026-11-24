@@ -11,6 +11,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  * A slot is a connection, its prepared statement and the mutex that makes
@@ -163,7 +164,7 @@ int db_readers_locate(int64_t repo_id, const char *hex, uint64_t cols[6])
         int rc = sqlite3_step(st);
         unsigned hold = atomic_load_explicit(&g_test_hold_us, memory_order_relaxed);
         if (hold) {
-            struct timespec ts = { 0, (long)hold * 1000L };
+            struct timespec ts = { (time_t)(hold / 1000000u), (long)(hold % 1000000u) * 1000L };
             nanosleep(&ts, NULL);
         }
         if (rc == SQLITE_ROW) {
@@ -343,10 +344,36 @@ int db_readers_exists(const char *sql, const char *const *params)
 
 void db_readers_quiesce(void)
 {
-    if (!atomic_load(&g_active)) return;
+    (void)db_readers_quiesce_for(0);
+}
+
+int db_readers_quiesce_for(unsigned max_ms)
+{
+    if (!atomic_load(&g_active)) return 1;
     pthread_mutex_lock(&g_gate);
     atomic_store(&g_quiescing, 1);
-    for (unsigned i = 0; i < g_n; i++) pthread_mutex_lock(&g_slots[i].mu);
+    if (max_ms == 0) {
+        for (unsigned i = 0; i < g_n; i++) pthread_mutex_lock(&g_slots[i].mu);
+        return 1;
+    }
+    /* CLOCK_REALTIME, as pthread_mutex_timedlock wants: a clock step moves
+     * this one deadline, which only changes how long one round waits. */
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec  += (time_t)(max_ms / 1000u);
+    dl.tv_nsec += (long)(max_ms % 1000u) * 1000000L;
+    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+    for (unsigned i = 0; i < g_n; i++) {
+        if (pthread_mutex_timedlock(&g_slots[i].mu, &dl) == 0) continue;
+        /* A read outlasted the budget: let go of everything, so the caller
+         * goes on without the readers held rather than keeping its writers
+         * waiting for that read (B274). */
+        while (i-- > 0) pthread_mutex_unlock(&g_slots[i].mu);
+        atomic_store(&g_quiescing, 0);
+        pthread_mutex_unlock(&g_gate);
+        return 0;
+    }
+    return 1;
 }
 
 void db_readers_resume(void)

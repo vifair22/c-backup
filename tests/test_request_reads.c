@@ -36,6 +36,7 @@
 #include "repo.h"
 #include "routes.h"
 #include "server.h"
+#include "unit_state.h"
 #include "test_tmp.h"
 
 #define TEST_DIR  TEST_TMP "/c_backup_test_request_reads"
@@ -266,6 +267,49 @@ static void test_read_routes_answer_while_the_index_is_read(void **state)
     api_server_stop(srv);
 }
 
+/*
+ * B273, the rest of B222's report: GET /metrics, the snapshot listing and
+ * the hold watchdog's tick read on the shared connection, so each waited
+ * for whatever held it - a COMMIT, here a long read standing in for one.
+ */
+static void test_metrics_listing_and_watchdog_do_not_wait_for_the_shared_connection(
+    void **state)
+{
+    (void)state;
+    double slow = calibrate();
+    routes_snapshots_init(db, NULL);
+    api_server_t *srv = api_server_create(0, NULL, NULL, NULL);
+    assert_non_null(srv);
+    assert_int_equal(routes_register_repos(srv, db), 0);
+    assert_int_equal(routes_register_metrics(srv, db), 0);
+    char snaps[64];
+    snprintf(snaps, sizeof(snaps), "/repos/%lld/snapshots", (long long)repo_id);
+    const char *urls[] = { "/metrics", snaps, NULL };
+
+    for (size_t i = 0; i < sizeof(urls) / sizeof(urls[0]); i++) {
+        atomic_store(&g_slow_started, 0);
+        atomic_store(&g_slow_done, 0);
+        pthread_t th;
+        assert_int_equal(pthread_create(&th, NULL, slow_read, NULL), 0);
+        wait_started();
+        double t0 = now_s();
+        int status = 200;
+        unsigned released = 0;
+        if (urls[i]) status = dispatch(srv, API_GET, urls[i], NULL);
+        else assert_int_equal(units_watchdog_tick(db, (int64_t)time(NULL) * 1000, &released), OK);
+        double took = now_s() - t0;
+        int overlapped = !atomic_load(&g_slow_done);
+        pthread_join(th, NULL);
+        print_message("  %s: %d in %.0f ms beside a %.0f ms holder of the shared "
+                      "connection\n", urls[i] ? urls[i] : "units_watchdog_tick", status,
+                      took * 1000, slow * 1000);
+        assert_int_equal(status, 200);
+        assert_true(overlapped);
+        assert_true(took < slow / 4);
+    }
+    api_server_stop(srv);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -273,6 +317,9 @@ int main(void)
             test_checks_before_a_write_do_not_wait_for_the_shared_connection, setup, teardown),
         cmocka_unit_test_setup_teardown(
             test_read_routes_answer_while_the_index_is_read, setup, teardown),
+        cmocka_unit_test_setup_teardown(
+            test_metrics_listing_and_watchdog_do_not_wait_for_the_shared_connection,
+            setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

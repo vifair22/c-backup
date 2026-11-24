@@ -1,6 +1,7 @@
 #pragma once
 
 #include "error.h"
+#include "source_check.h"
 #include "store.h"
 /* Retention counters, formerly the relevant slice of policy_t from the
  * deleted policy.h. Phase 6 sources these from policy_values rows in the
@@ -64,6 +65,14 @@ typedef struct {
 typedef struct {
     uint32_t  pruned;
     uint32_t *ids;
+    /*
+     * The file group's guard (B295, source_check.h): for each configured
+     * source, the newest snapshot in which it is not empty, kept whatever
+     * keep_snaps and the tiers say; held marks the ones only the guard
+     * kept. Unit groups have none.
+     */
+    source_guard_t *guards;
+    uint32_t        n_guards;
 } gfs_result_t;
 
 void gfs_result_free(gfs_result_t *r);

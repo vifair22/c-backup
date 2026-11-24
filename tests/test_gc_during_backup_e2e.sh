@@ -38,7 +38,7 @@ check()    { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
 contains() { case "$3" in *"$2"*) ok "$1" ;; *) bad "$1" "contains '$2'" "$3" ;; esac; }
 cb() { "$CLI" --socket "$SOCK" "$@"; }
 field() { printf '%s' "$1" | sed -n "s/.*\"$2\":\\([0-9]*\\).*/\\1/p" | head -1; }
-state() { cb jobs "$1" 2>/dev/null | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' | head -1; }
+state() { cb jobs "$1" 2>/dev/null | grep -o '"state":"[a-z]*"' | head -1 | cut -d'"' -f4; }
 
 # Four 12 MiB files for the file workers (48 MiB: three of them) and 60
 # small files, every open paced at 120 ms: the store phase lasts seconds.

@@ -81,7 +81,7 @@ static int repo_row_add(cutils_db_t *db, cutils_json_elem_t *e, cutils_json_resp
     if (avail == 1) why[0] = '\0';
     /* A failed sync in this repository (sync_latch.h) wins over the rest:
      * it refuses backups, gc and prune until a repair or a restart. */
-    char sync_err[1024] = "", sync_at[32] = "";
+    char sync_err[SYNC_LATCH_MSG_MAX] = "", sync_at[32] = "";
     int64_t at = 0;
     int synced_bad = sync_latch_repo_info(row[2], sync_err, sizeof(sync_err), &at);
     if (synced_bad) snprintf(sync_at, sizeof(sync_at), "%lld", (long long)at);

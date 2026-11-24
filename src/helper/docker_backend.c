@@ -879,9 +879,11 @@ static status_t d_db_target(sp_ctx_t *c, const char *unit_id, const char *path, 
     return OK;
 }
 
-/* Run one policy hook to its end, keeping the tail of its output. */
+/* Run one policy hook to its end, keeping the tail of its output. A set
+ * *cancel (the daemon gave up on the begin, B278) stops it as its timeout
+ * does: SIGTERM to its group, SIGKILL after the grace. */
 static int run_hook(struct sp_ctx *c, const char *unit_id, const policy_hook_t *h, char *tail, size_t tsz,
-                    hooklog_t *log)
+                    hooklog_t *log, atomic_int *cancel)
 {
     tail[0] = '\0';
     int p[2];
@@ -913,20 +915,24 @@ static int run_hook(struct sp_ctx *c, const char *unit_id, const policy_hook_t *
             tail[tl] = '\0';
         }
         if (d_hook_poll(r, &status)) break;
-        if (time(NULL) >= deadline) { timed_out = 1; d_hook_kill(r); }
+        if (time(NULL) >= deadline || (cancel && atomic_load(cancel))) { timed_out = 1; d_hook_kill(r); }
         struct timespec ts = { 0, 20 * 1000000L };
         nanosleep(&ts, NULL);
         if (timed_out && d_hook_poll(r, &status)) break;
     }
     close(p[0]);
     d_hook_free(r);
-    if (timed_out) { snprintf(tail + tl, tsz - tl, "%s", tl ? " [timed out]" : "timed out"); return 128 + SIGKILL; }
+    const char *why = cancel && atomic_load(cancel) ? "stopped, the job was cancelled" : "timed out";
+    if (timed_out) { snprintf(tail + tl, tsz - tl, "%s%s%s", tl ? " [" : "", why, tl ? "]" : ""); return 128 + SIGKILL; }
     return status;
 }
 
 /* Every policy hook for this unit in a phase. Returns -1 when one with
- * on_fail = fail failed (the unit fails), else how many failed. */
-static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, struct sp_session *sess, int *ran)
+ * on_fail = fail failed, or one was stopped by cancel (the unit fails),
+ * else how many failed. cancel: pre hooks only; a post run always
+ * finishes, as an exec template's does (B248). */
+static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, struct sp_session *sess, int *ran,
+                     atomic_int *cancel)
 {
     sp_session_info_t *info = sess ? &sess->info : NULL;
     char key[HELPER_UNIT_KEY_MAX + 1];
@@ -938,9 +944,8 @@ static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, struct sp_s
         if (strcmp(h->unit, key) != 0 || h->pre != pre || h->dump) continue;
         (*ran)++;
         char tail[HOOK_TAIL];
-        hooklog_t log;
-        memset(&log, 0, sizeof(log));
-        int code = run_hook(c, unit_id, h, tail, sizeof(tail), &log);
+        hooklog_t log = { 0 };
+        int code = run_hook(c, unit_id, h, tail, sizeof(tail), &log, cancel);
         /* Always, 0 included, as the LXC and dump hooks do: a run hook that
          * succeeded silently left an empty log, where the Manual promises
          * one that is never empty (B174). */
@@ -956,7 +961,7 @@ static int run_hooks(struct sp_ctx *c, const char *unit_id, int pre, struct sp_s
         failed++;
         log_warn("docker: %s hook %s on %s failed (%d): %s", pre ? "pre" : "post", h->name, unit_id, code, tail);
         if (info) (void)sp_session_info_warn(info, "hook %s exited %d: %s", h->name, code, tail);
-        if (h->fail_on_error) {
+        if (h->fail_on_error || (cancel && atomic_load(cancel))) {
             set_error(ERR_IO, "docker: hook %s on %s exited %d: %.300s", h->name, unit_id, code, tail);
             return -1;
         }
@@ -1129,7 +1134,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     unsigned instants = snap_instants(s->snaps.doms, s->snaps.n);
 
     /* Pre hooks, live, before any pause (6.6). */
-    int ran = 0, failed = running ? run_hooks(c, unit->unit_id, 1, s, &ran) : 0;
+    int ran = 0, failed = running ? run_hooks(c, unit->unit_id, 1, s, &ran, req->cancel) : 0;
     if (failed < 0) { session_free(s); return ERR_IO; }
 
     /* pause: auto pauses only when more than one instant would otherwise
@@ -1219,7 +1224,7 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     /* Post hooks run after the unpause and the snapshot (6.6); a held
      * pause runs them at release. */
     int pran = 0;
-    if (!keep && running && run_hooks(c, unit->unit_id, 0, s, &pran) < 0) {
+    if (!keep && running && run_hooks(c, unit->unit_id, 0, s, &pran, NULL) < 0) {
         (void)sp_session_info_warn(&s->info, "%s", err_msg());
         err_clear();
     }
@@ -1275,7 +1280,7 @@ static status_t d_release(sp_session_t *s, int *cap_hit)
                                    "were partly read live", s->c->pol->max_pause_s);
     }
     int pran = 0;
-    if (!s->post_ran && run_hooks(s->c, s->unit, 0, s, &pran) < 0) {
+    if (!s->post_ran && run_hooks(s->c, s->unit, 0, s, &pran, NULL) < 0) {
         (void)sp_session_info_warn(&s->info, "%s", err_msg());
         err_clear();
     }
@@ -1393,8 +1398,7 @@ static status_t d_stream_close(sp_session_t *s, const sp_item_desc_t *item, int 
         }
         d_hook_free(s->streams[i].run);
         s->streams[i].run = NULL;
-        hooklog_t log;
-        memset(&log, 0, sizeof(log));
+        hooklog_t log = { 0 };
         char buf[8192];
         ssize_t n;
         off_t off = 0;
@@ -1474,7 +1478,7 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
     /* Pre hooks of every unit, live, before the pause. */
     int ran[64] = { 0 }, failed[64] = { 0 };
     for (size_t k = 0; st == OK && k < n; k++) {
-        failed[k] = running[k] ? run_hooks(c, units[k]->unit_id, 1, ss[k], &ran[k]) : 0;
+        failed[k] = running[k] ? run_hooks(c, units[k]->unit_id, 1, ss[k], &ran[k], req->cancel) : 0;
         if (failed[k] < 0) st = ERR_IO;
     }
     int mode = mode_always ? 1 : c->pol->docker_pause;
@@ -1533,7 +1537,7 @@ static status_t d_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
     for (size_t k = 0; st == OK && k < n; k++) {
         struct sp_session *s = ss[k];
         int pran = 0;
-        if (running[k] && run_hooks(c, units[k]->unit_id, 0, s, &pran) < 0) {
+        if (running[k] && run_hooks(c, units[k]->unit_id, 0, s, &pran, NULL) < 0) {
             (void)sp_session_info_warn(&s->info, "%s", err_msg());
             err_clear();
         }

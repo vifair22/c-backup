@@ -441,11 +441,13 @@ static int job_run(const char *method, const char *path, const char *body,
  * A stream that just ends, with no terminal frame and no named event, is a
  * daemon that went away mid-watch (stopped or restarted). That used to exit
  * 0 as if the job had ended (B270); it fails, saying the job's outcome is
- * unknown rather than guessing it.
+ * unknown rather than guessing it. A job that ends failed or cancelled fails
+ * the command too: 0 means the job completed.
  */
 typedef struct {
     int failed;
     int ended;          /* a frame with a terminal state arrived */
+    int succeeded;      /* and that state was completed */
 } watch_ctx_t;
 
 static status_t watch_event(void *ud, const char *event, const char *data)
@@ -453,10 +455,12 @@ static status_t watch_event(void *ud, const char *event, const char *data)
     watch_ctx_t *w = ud;
     if (event[0] == '\0' || strcmp(event, "message") == 0) {
         if (!data[0]) return OK;
-        if (strstr(data, "\"state\":\"completed\"") ||
-            strstr(data, "\"state\":\"failed\"") ||
-            strstr(data, "\"state\":\"cancelled\""))
+        int ok = strstr(data, "\"state\":\"completed\"") != NULL;
+        if (ok || strstr(data, "\"state\":\"failed\"") ||
+            strstr(data, "\"state\":\"cancelled\"")) {
             w->ended = 1;
+            w->succeeded = ok;
+        }
         if (fputs(data, stdout) == EOF || fputc('\n', stdout) == EOF)
             return set_error(ERR_IO, "cannot write to stdout");
         fflush(stdout);
@@ -994,7 +998,9 @@ static int h_jobs_watch(const args_t *a)
                         "'c-backup jobs %s'\n", a->pos[0], a->pos[0]);
         return 1;
     }
-    return w.failed;
+    /* 0 only for a job that completed (Manual 21), as job_run does: a job
+     * that ended failed or cancelled exited 0 here (B281). */
+    return w.failed || !w.succeeded;
 }
 
 /* Maintenance actions share a shape: POST /repos/<id>/<action>. */

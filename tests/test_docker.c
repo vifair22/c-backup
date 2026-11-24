@@ -17,6 +17,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1425,6 +1428,69 @@ static void test_failing_hook(void **state)
     assert_int_equal(snaps, 0);
 }
 
+/* B278: a pre hook that would run to its 20 s timeout, under on_fail =
+ * continue, is stopped by the begin's cancel (the daemon giving up), and
+ * the unit fails at once with nothing held and no snapshot taken. Before,
+ * the cancel was not looked at: the hook ran to its timeout and the begin
+ * went on and succeeded. */
+static int setup_hanging_hook(void **state)
+{
+    (void)state;
+    return start("[hook stall]\nunit = docker:compose:web\ncontainer = web-db\nargv.0 = hang\ntimeout_s = 20\n");
+}
+
+static atomic_int g_hook_cancel;
+
+static void *hook_cancel_soon(void *arg)
+{
+    (void)arg;
+    struct timespec ts = { 0, 300 * 1000000L };
+    nanosleep(&ts, NULL);
+    atomic_store(&g_hook_cancel, 1);
+    return NULL;
+}
+
+static void test_cancel_stops_pre_hook(void **state)
+{
+    (void)state;
+    sp_unit_desc_t *d = NULL;
+    assert_int_equal(be.ops->describe(be.ctx, "compose:web", &d), OK);
+    sp_begin_req_t q;
+    memset(&q, 0, sizeof(q));
+    q.job_id = 41;
+    q.require = SP_CONSIST_CRASH;
+    q.holds = &holds;
+    q.daemon8 = "0badf00d";
+    q.cancel = &g_hook_cancel;
+    atomic_store(&g_hook_cancel, 0);
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, hook_cancel_soon, NULL), 0);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    status_t st = be.ops->begin(be.ctx, d, &q, &s, &info);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    pthread_join(th, NULL);
+    be.ops->desc_free(d);
+    long ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+    assert_int_not_equal(st, OK);
+    if (!strstr(err_msg(), "cancelled")) fail_msg("error: %s", err_msg());
+    err_clear();
+    if (ms > 8000) fail_msg("the cancelled begin took %ld ms", ms);
+    assert_int_equal(holds_open, 0);
+    /* The hook's own process went, not just the provider's wait for it. */
+    int pid = 0;
+    for (int i = 0; i < fdk.n_exec && i < 16; i++) if (fdk.exec_pid[i]) pid = fdk.exec_pid[i];
+    assert_true(pid < 0);
+    FILE *f = fopen(STATE "/zfs.log", "r");
+    char line[512];
+    int snaps = 0;
+    while (f && fgets(line, sizeof(line), f)) if (strstr(line, "zfs snapshot")) snaps++;
+    if (f) fclose(f);
+    assert_int_equal(snaps, 0);
+}
+
 /* A pause a dead capture left: the sweep releases it. */
 static void test_sweep_unpauses(void **state)
 {
@@ -1666,6 +1732,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_fallback_flagged, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unlisted_dataset_warns, setup_units, teardown_units),
         cmocka_unit_test_setup_teardown(test_failing_hook, setup_failing_hook, teardown),
+        cmocka_unit_test_setup_teardown(test_cancel_stops_pre_hook, setup_hanging_hook, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_in_place_real, setup, teardown),
         cmocka_unit_test(test_demux),

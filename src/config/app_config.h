@@ -148,6 +148,15 @@ static const config_key_t app_file_keys[] = {
       "Chunk workers for large files: 0 automatic, 1 serial, up to 64",
       CFG_STORE_FILE, 0 },
 
+    /* A source holding more than this per cent fewer files or bytes than
+     * the newest earlier snapshot that held something from it completes
+     * the backup with a warning (B295, source_check.h). 0 turns the drop
+     * check off; an empty source warns whatever this says. A repository's
+     * policy key of the same name overrides it. */
+    { "backup.source_drop_pct", CFG_INT, "50",
+      "Warn when a source shrinks by more than this per cent since its last backup: 0 off, 1 to 100",
+      CFG_STORE_FILE, 0 },
+
     /*
      * How state.db trades durability of the newest edits for speed
      * (src/common/state_db.h). The defaults are what the daemon is measured

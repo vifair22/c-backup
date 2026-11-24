@@ -349,6 +349,20 @@ $(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) $(CUTILS_ARCHIVE) $(FLAGS_STAMP) | $(BINS)
 $(HELPER_TARGET): $(LIB_OBJS) $(VIRT_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) $(FLAGS_STAMP) | $(BINS)
 	$(CC) $(TYPE_CFLAGS) $(filter %.o %.a,$^) -o $@ $(TYPE_LDFLAGS) $(VIRT_LIBS)
 
+# The release link again, with -Werror and the output thrown away, for
+# analyze. The real link stays without -Werror: a newer compiler's new
+# warning should fail the gate, not a user's build.
+.PHONY: lto-warn-check
+lto-warn-check: $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ) $(VIRT_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) $(FLAGS_STAMP)
+	@mkdir -p $(BUILD)/lto-warn-check
+	@$(CC) $(TYPE_CFLAGS) -Werror $(LIB_OBJS) $(DAEMON_OBJ) $(CUTILS_ARCHIVE) \
+	    -o $(BUILD)/lto-warn-check/c-backupd $(TYPE_LDFLAGS)
+	@$(CC) $(TYPE_CFLAGS) -Werror $(LIB_OBJS) $(CLI_OBJ) $(CUTILS_ARCHIVE) \
+	    -o $(BUILD)/lto-warn-check/c-backup $(TYPE_LDFLAGS)
+	@$(CC) $(TYPE_CFLAGS) -Werror $(LIB_OBJS) $(VIRT_OBJS) $(HELPER_OBJ) $(CUTILS_ARCHIVE) \
+	    -o $(BUILD)/lto-warn-check/c-backup-helper $(TYPE_LDFLAGS) $(VIRT_LIBS)
+	@rm -rf $(BUILD)/lto-warn-check
+
 # ---- Tests (link against release lib objects) -------------------------
 REL_OBJ_DIR := $(BUILD)/release
 REL_LIB_OBJS = $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
@@ -840,6 +854,13 @@ analyze: check-conflict-markers size-check layout-check | $(BUILD)
 	@$(call WARN_CHECK,$(RELEASE_CFLAGS))
 	@$(call WARN_CHECK,$(DEBUG_CFLAGS))
 	@$(call WARN_CHECK,$(ASAN_CFLAGS))
+	@# A warning from an inlining across files exists only at the -flto
+	@# link, which the per-file compiles above never reach: a 1024-byte
+	@# buffer in health.c met sync_latch.c's 4352-byte message there, and
+	@# only the release link printed it (B287). So the release binaries are
+	@# linked again here with -Werror.
+	@echo "=== warnings (release -flto link) ==="
+	@$(MAKE) --no-print-directory BUILD_TYPE=release lto-warn-check
 	@echo "warnings: OK"
 	@echo "=== gcc-fanalyzer ==="
 	@for f in $(SRCS); do \

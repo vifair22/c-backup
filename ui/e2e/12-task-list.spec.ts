@@ -13,7 +13,7 @@ import { startHarness, openRepo, cli, type Harness } from './fixtures'
  * whose error the daemon wrote, on a repository of its own.
  */
 
-interface WireJob { id: number; repo_id: number; state: string; error: string }
+interface WireJob { id: number; repo_id: number; dest_repo_id?: number | null; action: string; state: string; error: string }
 
 let h: Harness
 let failed: WireJob
@@ -84,4 +84,28 @@ test("task list: a repository's view lists only that repository's jobs (Demo L4)
     await expect(h.page.locator(`[data-testid="job-card"][data-job-id="${j.id}"]`)).toHaveCount(0)
   }
   await expect(h.page.getByText(/1 failed job - click to view/)).toBeVisible()
+})
+
+test('task list: a replicate is listed under the repository it writes into (B283)', async () => {
+  /* The app cut the daemon-wide list to repo_id itself, so a replicate,
+   * whose repo_id is its source, could never show under its destination.
+   * It asks the daemon for ?repo=<id> now, which lists both. */
+  const out = cli(h.sock, ['repo', 'add', join(h.work, 'replica'), 'Replica'])
+  const dest = Number(/"id":(\d+)/.exec(out)?.[1])
+  if (!dest) throw new Error(`repo add failed: ${out}`)
+  cli(h.sock, ['replicate', String(h.repos.plain), join(h.work, 'replica'), '--reencrypt'])
+  const rep = jobs().find(j => j.action === 'replicate' && j.dest_repo_id === dest)
+  if (!rep || rep.state !== 'completed') throw new Error(`no completed replicate into ${dest}: ${JSON.stringify(rep)}`)
+
+  /* The sidebar lists repositories as the app found them at start. */
+  await h.relaunch()
+  await openTasks('Replica')
+  const card = h.page.locator(`[data-testid="job-card"][data-job-id="${rep.id}"]`)
+  await expect(card).toBeVisible({ timeout: 10_000 })
+  await expect(card.getByTestId('job-from')).toHaveText(`into this repository from repository ${h.repos.plain}`)
+  /* Under its source too, without the destination's note. */
+  await openTasks('Documents')
+  await expect(h.page.locator(`[data-testid="job-card"][data-job-id="${rep.id}"]`)).toBeVisible({ timeout: 10_000 })
+  await expect(h.page.locator(`[data-testid="job-card"][data-job-id="${rep.id}"]`).getByTestId('job-from')).toHaveCount(0)
+  await h.page.screenshot({ path: 'test-results/12-task-list-replicate.png', fullPage: true })
 })

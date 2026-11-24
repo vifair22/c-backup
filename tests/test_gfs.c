@@ -279,7 +279,7 @@ static void test_dry_run_prunes_nothing(void **state)
     int before = snapshot_count();
 
     gfs_retention_t ret = { 3, 2, 1, 1, 1 };
-    gfs_result_t gr = { 0, NULL };
+    gfs_result_t gr = { 0 };
     assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 1, 1, &gr), OK);
 
     assert_true(gr.pruned > 0);
@@ -295,7 +295,7 @@ static void test_prune_removes_expired_snapshots(void **state)
     int before = snapshot_count();
 
     gfs_retention_t ret = { 3, 2, 1, 1, 1 };
-    gfs_result_t gr = { 0, NULL };
+    gfs_result_t gr = { 0 };
     assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, &gr), OK);
 
     assert_true(gr.pruned > 0);
@@ -423,7 +423,7 @@ static void test_zero_retention_keeps_everything(void **state)
     int before = snapshot_count();
 
     gfs_retention_t ret = { 0, 0, 0, 0, 0 };
-    gfs_result_t gr = { 0, NULL };
+    gfs_result_t gr = { 0 };
     assert_int_equal(gfs_run(store, db, repo_id, &ret, 15, 0, 1, &gr), OK);
 
     assert_int_equal(gr.pruned, 0);
@@ -447,7 +447,7 @@ static void test_shipped_defaults_prune(void **state)
         add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
 
     gfs_retention_t ret = { 0, 7, 4, 12, 3 };
-    gfs_result_t gr = { 0, NULL };
+    gfs_result_t gr = { 0 };
     assert_int_equal(gfs_run(store, db, repo_id, &ret, 90, 0, 1, &gr), OK);
 
     assert_true(gr.pruned > 45);
@@ -474,7 +474,7 @@ static void test_result_names_the_pruned_snapshots(void **state)
         add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
 
     gfs_retention_t ret = { 3, 2, 1, 1, 1 };
-    gfs_result_t dry = { 0, NULL };
+    gfs_result_t dry = { 0 };
     assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 1, 1, &dry), OK);
     assert_true(dry.pruned > 0);
     assert_non_null(dry.ids);
@@ -484,7 +484,7 @@ static void test_result_names_the_pruned_snapshots(void **state)
         if (i) assert_true(dry.ids[i] > dry.ids[i - 1]);
     }
 
-    gfs_result_t real = { 0, NULL };
+    gfs_result_t real = { 0 };
     assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, &real), OK);
     assert_int_equal(real.pruned, dry.pruned);
     for (uint32_t i = 0; i < real.pruned; i++) {
