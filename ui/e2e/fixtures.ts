@@ -119,6 +119,11 @@ export interface Harness {
   userData: string
   /** Kill the daemon, to see what the app does without one. */
   killDaemon(): void
+  /** With units: stop and continue the helper (SIGSTOP, SIGCONT). A unit
+   * job waits on a stopped helper as on a stuck one, holding its
+   * repository, so whatever is submitted behind it stays queued. */
+  pauseHelper(): void
+  resumeHelper(): void
   /** Close the app and start it again on the same userData, as a user
    * quitting and reopening it would. The daemon keeps running. */
   relaunch(): Promise<Page>
@@ -370,6 +375,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     app: first.app, page: first.page, work, sock, port, userData,
     repos: { plain, encrypted },
     killDaemon() { daemon.kill('SIGKILL') },
+    pauseHelper() { if (!helper) throw new Error('no helper: start with units'); helper.kill('SIGSTOP') },
+    resumeHelper() { helper?.kill('SIGCONT') },
     async relaunch() {
       await h.app.close().catch(() => {})
       const next = await launch()
@@ -379,6 +386,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     },
     async close() {
       await h.app.close().catch(() => {})
+      /* A stopped helper would hold the daemon's shutdown on its unit job. */
+      helper?.kill('SIGCONT')
       daemon.kill()
       helper?.kill()
       await sleep(200)
@@ -488,7 +497,8 @@ export function reportTimings(): void {
  * Walk the tree down to the fixture's source directory.
  *
  * scan_tree records absolute paths, so a snapshot of /tmp/cbackup-e2e-X/src
- * has directory entries for /tmp and for the work directory above it. The
+ * has directory entries for /tmp and for the work directory above it, and
+ * for each level above that wherever TMPDIR points. The
  * first version of this clicked "the last row that looks like a directory"
  * and slept 100 ms between levels, which passed alone and flaked under a
  * full run: a slow level meant the next click landed on the wrong row.
@@ -497,7 +507,10 @@ export function reportTimings(): void {
  * write, deterministic to run.
  */
 export async function descendTo(page: Page, work: string, ...rest: string[]): Promise<void> {
-  const segments = ['tmp', work.split('/').pop()!, 'src', ...rest]
+  /* Every component of the work directory, not a hardcoded 'tmp': TMPDIR
+   * may put it anywhere (NIT-55). As given, not resolved: the source is
+   * registered by this path, and the scan records the path it was given. */
+  const segments = [...work.split('/').filter(Boolean), 'src', ...rest]
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i]
     await page.getByText(seg, { exact: true }).first().click()

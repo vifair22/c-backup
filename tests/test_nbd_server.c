@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -29,6 +30,8 @@
 #include "object.h"
 #include "store.h"
 #include "test_tmp.h"
+
+#include <cutils/log.h>
 
 #define ROOT  TEST_TMP "/c_backup_test_nbd_server"
 #define REPO  ROOT "/repo"
@@ -433,16 +436,40 @@ static status_t open_status = OK;
 static status_t gated_open(void *ctx, void **reader, uint64_t *size)
 {
     if (open_status == ERR_BUSY)
-        return set_error(ERR_BUSY, "export 7: 4 connections are open across every export, "
-                         "the limit (vm.export_max_conns)");
+        return set_error(ERR_BUSY, "export 7: connection refused: vm.export_max_conns is 4 "
+                         "and that many are open across every export");
     if (open_status != OK)
         return set_error(open_status, "export 7: cannot open /secret/repo/path");
     return mem_open(ctx, reader, size);
 }
 
+/* What the server logged, to tell a limit's refusal from an unreadable disk
+ * (NIT-57). The server logs before it answers, so the line is here by the
+ * time the client sees the refusal. */
+static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_log[2048];
+static void capture_log(const char *ts, const char *lvl, const char *fn, const char *msg,
+                        void *ud)
+{
+    (void)ts; (void)lvl; (void)fn; (void)ud;
+    pthread_mutex_lock(&g_log_mu);
+    size_t n = strlen(g_log);
+    snprintf(g_log + n, sizeof(g_log) - n, "%s\n", msg);
+    pthread_mutex_unlock(&g_log_mu);
+}
+
+static int log_has(const char *needle)
+{
+    pthread_mutex_lock(&g_log_mu);
+    int r = strstr(g_log, needle) != NULL;
+    pthread_mutex_unlock(&g_log_mu);
+    return r;
+}
+
 static void test_open_refusal(void **state)
 {
     (void)state;
+    int h = log_stream_register(capture_log, NULL);
     unlink(SOCK);
     nbd_server_opts_t o = { SOCK, NAME, MEM_SIZE,
                             { gated_open, mem_read, mem_extents, mem_close, NULL, NULL }, 0 };
@@ -451,10 +478,16 @@ static void test_open_refusal(void **state)
     open_status = ERR_BUSY;
     assert_null(connect_as(NAME, 1));
     assert_non_null(strstr(err_msg(), "vm.export_max_conns"));
+    /* The log names the key too, and does not call a full cap a disk that
+     * cannot be opened. */
+    assert_true(log_has("connection refused: vm.export_max_conns"));
+    assert_false(log_has("cannot open the snapshot's disk"));
     open_status = ERR_CORRUPT;
     assert_null(connect_as(NAME, 1));
     assert_non_null(strstr(err_msg(), "see the daemon log"));
     assert_null(strstr(err_msg(), "/secret"));
+    assert_true(log_has("cannot open the snapshot's disk"));
+    log_stream_unregister(h);
     open_status = OK;
     nbd_client_t *c = connect_as(NAME, 1);
     assert_non_null(c);

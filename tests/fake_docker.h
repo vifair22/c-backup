@@ -6,7 +6,10 @@
  * Containers are set up by the test; pause, unpause, start and stop change
  * their state and are counted; an exec of ["echo", ...] writes its words
  * to stdout and exits 0, ["fail"] writes "boom" to stderr and exits 3,
- * anything else exits 0 silently. Exec output uses Docker's multiplexed
+ * ["hang"] is a real `sleep 60` leading its own process group, holding the
+ * exec's stream open until it is signalled, as runc's exec process is (its
+ * Pid is in /exec/<id>/json, so the provider's stop reaches it), anything
+ * else exits 0 silently. Exec output uses Docker's multiplexed
  * framing, split at odd boundaries to exercise the parser.
  */
 
@@ -19,7 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <signal.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define FD_MAX 16
@@ -44,6 +49,7 @@ typedef struct {
     char exec_cmd[16][256];
     char exec_user[16][64];    /* each exec's User, "" when it named none */
     int  n_exec;
+    int  exec_pid[16];         /* a "hang" exec's sleep, 0 for none */
     int  digest_gone;          /* image pulls by digest fail, as a registry that dropped it */
     int  lose_pause;           /* a pause is undone at once, as a watchdog's unpause would */
     char pulled[512];          /* the last fromImage */
@@ -239,10 +245,35 @@ static void fd_serve(fake_docker_t *f, int fd)
         if (write(fd, h, strlen(h)) < 0) { pthread_mutex_unlock(&f->mu); return; }
         if (strncmp(cmd, "echo ", 5) == 0) { snprintf(out, sizeof(out), "%s\n", cmd + 5); fd_frames(fd, 1, out); }
         else if (strcmp(cmd, "fail") == 0) fd_frames(fd, 2, "boom\n");
+        else if (strcmp(cmd, "hang") == 0 && k < 16) {
+            /* The child keeps this connection, so the stream ends only
+             * when it dies; the server goes on serving meanwhile. */
+            pid_t pid = fork();
+            if (pid == 0) {
+                setpgid(0, 0);
+                execlp("sleep", "sleep", "60", (char *)NULL);
+                _exit(127);
+            }
+            if (pid > 0) setpgid(pid, pid);
+            f->exec_pid[k] = pid > 0 ? pid : 0;
+        }
     } else if (fd_route(p, "/exec/", "/json", id, sizeof(id))) {
         int k = (int)strtol((char[3]){ id[0], id[1], 0 }, NULL, 16);
         const char *cmd = k < 16 ? f->exec_cmd[k] : "";
-        snprintf(out, sizeof(out), "{\"ExitCode\":%d,\"Pid\":0,\"Running\":false}", strcmp(cmd, "fail") == 0 ? 3 : 0);
+        int pid = k < 16 ? f->exec_pid[k] : 0, st = 0, running = 0, code = strcmp(cmd, "fail") == 0 ? 3 : 0;
+        if (pid > 0) {
+            /* The stream ends as the process exits, a moment before it
+             * can be reaped: give it that moment rather than say 0. */
+            pid_t w = waitpid(pid, &st, WNOHANG);
+            for (int i = 0; w == 0 && i < 20; i++) { usleep(10000); w = waitpid(pid, &st, WNOHANG); }
+            running = w == 0;
+            if (w == pid) code = WIFSIGNALED(st) ? 128 + WTERMSIG(st) : WEXITSTATUS(st);
+            if (w != 0) f->exec_pid[k] = -pid;    /* reaped; the pid stays readable for the test */
+        } else if (pid < 0) {
+            code = 128 + SIGTERM;
+        }
+        snprintf(out, sizeof(out), "{\"ExitCode\":%d,\"Pid\":%d,\"Running\":%s}", code, running ? pid : 0,
+                 running ? "true" : "false");
         fd_reply(fd, 200, out);
     } else {
         fd_reply(fd, 404, "{\"message\":\"fake docker: not handled\"}");
@@ -289,6 +320,8 @@ static void fake_docker_stop(fake_docker_t *f)
     snprintf(a.sun_path, sizeof(a.sun_path), "%s", f->sock);
     if (fd >= 0) { (void)connect(fd, (struct sockaddr *)&a, sizeof(a)); close(fd); }
     pthread_join(f->th, NULL);
+    for (int i = 0; i < 16; i++)
+        if (f->exec_pid[i] > 0) { kill(-f->exec_pid[i], SIGKILL); waitpid(f->exec_pid[i], NULL, 0); }
     close(f->lfd);
     unlink(f->sock);
 }

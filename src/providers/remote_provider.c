@@ -513,7 +513,9 @@ static status_t r_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
         if (u) cJSON_AddItemToArray(u, cJSON_CreateString(key));
         if (a) cJSON_AddBoolToObject(a, "pause", (unit->caps & SP_CAP_PAUSE) != 0);
         if (a && req && req->hold_pause) cJSON_AddBoolToObject(a, "hold", 1);
-        st = rcall_fd(c->socket, "capture.begin", a, &res, &s->late_fd);
+        /* A job cancelled while the helper runs the unit's pre hooks stops
+         * waiting, and the closed connection stops the hooks (B278). */
+        st = rcall_wait(c->socket, "capture.begin", a, &res, -1, &s->late_fd, REMOTE_TIMEOUT_S, s->cancel);
     }
     const char *tok = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture")) : NULL;
     const cJSON *m = st == OK ? cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(res, "members"), 0) : NULL;
@@ -1017,7 +1019,8 @@ static status_t r_begin_group(sp_ctx_t *c, const sp_unit_desc_t *const *units, s
             cJSON_AddItemToArray(u, cJSON_CreateString(key));
         }
         if (a) cJSON_AddBoolToObject(a, "pause", (units[0]->caps & SP_CAP_PAUSE) != 0);
-        st = rcall_fd(c->socket, "capture.begin", a, &res, &late);
+        st = rcall_wait(c->socket, "capture.begin", a, &res, -1, &late, REMOTE_TIMEOUT_S,
+                        req ? req->cancel : NULL);
     }
     const char *tok = st == OK ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "capture")) : NULL;
     const cJSON *mem = cJSON_GetObjectItemCaseSensitive(res, "members");

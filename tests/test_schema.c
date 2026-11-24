@@ -346,7 +346,10 @@ static void test_one_baseline_migration(void **state)
     /* Content hash lookups keyed by snapshot (perf-d2-nochange). */
     assert_non_null(app_migrations[14].name);
     assert_string_equal(app_migrations[14].name, "016_node_hashes.sql");
-    assert_null(app_migrations[15].name);
+    /* A replicate's registered destination, for /jobs?repo= (B283). */
+    assert_non_null(app_migrations[15].name);
+    assert_string_equal(app_migrations[15].name, "017_job_dest_repo.sql");
+    assert_null(app_migrations[16].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */

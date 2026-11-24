@@ -23,7 +23,7 @@ static api_response_t handle_healthz(const api_request_t *req, void *userdata)
     (void)req; (void)userdata;
     /* Still alive after a failed storage sync, and still answering reads,
      * but it says so: restarting it is what clears the state. */
-    char msg[1024];
+    char msg[SYNC_LATCH_MSG_MAX];
     int64_t at = 0;
     if (sync_latch_info(msg, sizeof(msg), &at)) {
         cJSON *o = cJSON_CreateObject();
@@ -56,9 +56,9 @@ static api_response_t handle_readyz(const api_request_t *req, void *userdata)
     if (!db) return api_error(503, "database not open");
     /* Not ready: durable writes and the jobs that need them are refused
      * until a restart (sync_latch.h). */
-    char msg[1024];
+    char msg[SYNC_LATCH_MSG_MAX];
     if (sync_latch_info(msg, sizeof(msg), NULL)) {
-        char why[1200];
+        char why[SYNC_LATCH_MSG_MAX + 128];
         snprintf(why, sizeof(why), "not ready: a storage sync failed (%s); restart the "
                  "daemon to re-read from disk", msg);
         return api_error(503, why);
@@ -103,7 +103,7 @@ static api_response_t handle_readyz(const api_request_t *req, void *userdata)
         if (sync_latch_repo_count() > 0 &&
             db_execute(db, "SELECT id, path FROM repos ORDER BY id", NULL, &r) == 0 && r) {
             for (int i = 0; i < r->nrows; i++) {
-                char m[1024];
+                char m[SYNC_LATCH_MSG_MAX];
                 int64_t at = 0;
                 if (!sync_latch_repo_info(r->rows[i][1], m, sizeof(m), &at)) continue;
                 cJSON *e = cJSON_CreateObject();

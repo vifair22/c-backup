@@ -115,6 +115,17 @@ else
         *)           ok  "and not systemctl" ;;
     esac
 fi
+DAEMON_ABS=$(realpath "$DAEMON")
+# --version prints and exits: it used to start a whole daemon (NIT-56). An
+# unknown argument is refused, not ignored, and neither leaves a socket.
+OUT=$(cd "$WORK" && env -u C_BACKUP_CONFIG_PATH timeout 10 "$DAEMON_ABS" --version 2>&1); RC=$?
+check "c-backupd --version exits 0" "0" "$RC"
+contains "c-backupd --version prints the version" "c-backupd " "$OUT"
+OUT=$(cd "$WORK" && env -u C_BACKUP_CONFIG_PATH timeout 10 "$DAEMON_ABS" --bogus 2>&1); RC=$?
+check "c-backupd refuses an unknown argument" "2" "$RC"
+contains "c-backupd names the unknown argument" "unexpected argument '--bogus'" "$OUT"
+check "c-backupd --version starts nothing" "" "$(ls "$WORK"/config.yaml "$WORK"/*.db 2>/dev/null)"
+
 # jobs watch had its own copy of the advice, which always said systemctl.
 OUT=$(container=podman "$CLI" --socket "$WORK/absent.sock" jobs watch 1 2>&1); RC=$?
 check    "watch without a daemon exits non-zero" 1 "$RC"
@@ -402,6 +413,22 @@ fi
 check    "jobs watch of a missing job fails" 1 "$RC"
 check    "and prints nothing on stdout" "" "$(cat "$WORK/watch.out")"
 check    "and the error is bare JSON on stderr" '{"error":"no such job"}' "$(cat "$WORK/watch.err")"
+
+# B281: a job that ended failed or cancelled exited 0; Manual 21 says 0 only
+# on success.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 -cmd ".timeout 10000" "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state,
+        started, ended, error) VALUES (9997, 1, 'backup', 'failed', strftime('%s','now'),
+        strftime('%s','now'), 'synthetic failure'), (9996, 1, 'backup', 'cancelled',
+        strftime('%s','now'), strftime('%s','now'), '')"
+    timeout 20 "$CLI" --socket "$SOCK" jobs watch 9997 > "$WORK/watch.out" 2> "$WORK/watch.err"; RC=$?
+    check    "jobs watch of a failed job exits 1" 1 "$RC"
+    contains "and prints how it ended" '"state":"failed"' "$(cat "$WORK/watch.out")"
+    timeout 20 "$CLI" --socket "$SOCK" jobs watch 9996 > "$WORK/watch.out" 2> "$WORK/watch.err"; RC=$?
+    check    "jobs watch of a cancelled job exits 1" 1 "$RC"
+else
+    ok "jobs watch of a failed job exits 1 (skipped: no sqlite3)"
+fi
 
 # B270: the daemon stopping mid-watch ended the stream cleanly and the watch
 # exited 0, as if the job had ended. A job row nothing will finish keeps the

@@ -187,6 +187,30 @@ edit-latency:
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
+    # In a merge request, only when the daemon or the bench can have
+    # changed: the CLI, the helper and src/virt (helper only) are other
+    # binaries, and docs, the app and the tests do not reach the daemon's
+    # write path. Every branch pipeline (v3, master, uat/*) still runs it.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths:
+          - src/ops/**/*
+          - src/store/**/*
+          - src/common/**/*
+          - src/api/**/*
+          - src/scheduler/**/*
+          - src/meta/**/*
+          - src/daemon/**/*
+          - src/config/**/*
+          - src/units/**/*
+          - src/providers/**/*
+          - bench/**/*
+          - migrations/**/*
+          - Makefile
+          - cutils_version
+          - .gitlab-ci.yml
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
     - when: on_success
   stage: analyze
   image: debian:trixie
@@ -268,8 +292,20 @@ fuzz:
 # to keep in step with a lockfile.
 ui:
   rules:
-    # Gate jobs: every MR and branch pipeline, never the nightly schedule.
+    # Every branch pipeline, never the nightly schedule. In a merge request
+    # only when the app or the API it is a contract for can have changed:
+    # the routes, the schema their rows come from, and this file.
     - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths:
+          - ui/**/*
+          - src/api/**/*
+          - migrations/**/*
+          - docs/api.md
+          - .gitlab-ci.yml
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       when: never
     - when: on_success
   stage: analyze

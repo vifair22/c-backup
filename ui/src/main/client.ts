@@ -422,7 +422,7 @@ export function toEndpoint(req: ApiRequest): Endpoint {
 
     /* --- jobs --- */
     case 'jobList':
-      return { method: 'GET', path: '/jobs' }
+      return { method: 'GET', path: req.repoId !== undefined ? `/jobs?repo=${req.repoId}` : '/jobs' }
     case 'jobGet':
       return { method: 'GET', path: `/jobs/${req.jobId}` }
     case 'jobCancel':

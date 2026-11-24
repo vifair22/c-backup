@@ -196,7 +196,9 @@ export type ApiRequest =
   | { kind: 'scheduleRemove'; repoId: number; scheduleId: number }
 
   /* --- jobs --- */
-  | { kind: 'jobList' }
+  /* repoId: that repository's jobs, and replicate jobs into it (B283);
+   * absent: the newest jobs daemon-wide. */
+  | { kind: 'jobList'; repoId?: number }
   | { kind: 'jobGet'; jobId: number }
   | { kind: 'jobCancel'; jobId: number }
 
@@ -281,6 +283,9 @@ export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelle
 export interface Job {
   id: number
   repo_id?: number
+  /* A replicate job's destination, when it is a registered repository;
+   * null otherwise (B283). */
+  dest_repo_id?: number | null
   action: string
   state: JobState
   started?: number | null

@@ -2434,6 +2434,29 @@ contains "unencrypted into unencrypted needs no flag" '"state":"completed"' \
 check "and is not journalled as a plaintext copy" 0 \
     "$(sock_body /repos/1/journal | grep -c 'into plaintext')"
 
+echo "jobs per repository"
+# B283: /jobs was the daemon's newest 50 with no filter, so a busy
+# repository pushed the others' jobs off the page, and a replicate showed
+# under its source only. ?repo=<id> lists that repository's jobs and the
+# replicates into it.
+P2_ID=$(printf '%s' "$P2_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+PJ=$(sock_body "/jobs?repo=$P2_ID&limit=1000")
+contains "the replicate is listed under its destination" "\"id\":$P2_JOB," "$PJ"
+contains "naming the destination" "\"dest_repo_id\":$P2_ID" "$(sock_body "/jobs/$P2_JOB")"
+contains "and under its source" "\"id\":$P2_JOB," "$(sock_body '/jobs?repo=1&limit=1000')"
+check "the destination's list holds nothing of another repository's" "" \
+    "$(printf '%s' "$PJ" | sed 's/{"id":/\n{"id":/g' | grep '^{"id"' \
+       | grep -v "\"repo_id\":$P2_ID,\|\"dest_repo_id\":$P2_ID[,}]")"
+check "nor the encrypted repository's jobs" "" \
+    "$(printf '%s' "$PJ" | grep -o "\"id\":$PT_JOB,")"
+check "the source's list omits another repository's jobs" "" \
+    "$(sock_body '/jobs?repo=1&limit=1000' | grep -o "\"id\":$PT_JOB,")"
+check "a job with no destination says null" "null" \
+    "$(sock_body "/jobs/$BACKUP_JOB" | sed -n 's/.*"dest_repo_id":\([a-z0-9]*\).*/\1/p')"
+check "?repo=0 is a 400" 400 "$(sock_code '/jobs?repo=0')"
+check "?repo=x is a 400" 400 "$(sock_code '/jobs?repo=x')"
+check "an unknown repository lists nothing" '{"jobs":[]}' "$(sock_body '/jobs?repo=987654')"
+
 echo "database detection"
 # docs/db-detection.md, D0: a backup reports the databases it read, judges a
 # live read of one as uncovered, alerts once and journals it. A WAL-mode

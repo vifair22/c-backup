@@ -1191,15 +1191,43 @@ static void test_unwalkable_pack_is_reported_until_repaired(void **state)
 }
 
 /*
- * The source tree the salvage tests share: UNW_FILES small files, the
- * first UNW_DELETED of them gone in the second snapshot.
+ * The source tree the salvage tests share: UNW_FILES small files, of which
+ * UNW_DELETED are gone in the second snapshot, and unw_target names the one
+ * whose parity group the tests wipe.
+ *
+ * Which files die is chosen from where snapshot 1 put them, not by name.
+ * The tests need one group holding many dead entries ahead of live ones, so
+ * that the dead headers alone stay beyond parity once the index has rebuilt
+ * the live ones. Pack order follows the scan, and the scan visits a
+ * directory in inode order (scan.c, for the HDD case). Inodes follow
+ * creation order only on a filesystem that never reuses them: on a CI
+ * runner's ext4, where concurrent jobs free and take inodes, f049 once
+ * landed in the next group beside two dead entries, the residual damage was
+ * within parity, the pack was restored rather than salvaged and its payload
+ * corrected, and the test failed (FLAKE-36). Choosing by layout gives every
+ * filesystem the geometry this one gets.
  */
+static int  unw_dead[UNW_FILES];
+static char unw_target[16];
+
+typedef struct { uint64_t off; int idx; } unw_pos_t;
+
+static int unw_pos_cmp(const void *a, const void *b)
+{
+    const unw_pos_t *x = a, *y = b;
+    return (x->off > y->off) - (x->off < y->off);
+}
+
 static void unw_two_snapshots(int64_t *s1, int64_t *s2)
 {
     char dir[PATH_MAX];
     snprintf(dir, sizeof(dir), "%s/many", TEST_SRC);
     assert_int_equal(mkdir(dir, 0700), 0);
-    for (int i = 0; i < UNW_FILES; i++) {
+    /* Created in the order CI's inodes once gave them: f048 and f049 after
+     * seventy later files, which puts them in the second group with no
+     * other early file. A choice by name fails on this order everywhere. */
+    for (int k = 0; k < UNW_FILES; k++) {
+        int i = k < 48 ? k : k < 118 ? k + 2 : k < 120 ? k - 70 : k;
         char p[PATH_MAX + 32], body[200];
         snprintf(p, sizeof(p), "%s/f%03d", dir, i);
         int n = snprintf(body, sizeof(body), "file %03d:", i);
@@ -1212,7 +1240,46 @@ static void unw_two_snapshots(int64_t *s1, int64_t *s2)
         write_file(p, body);
     }
     *s1 = run_backup();
-    for (int i = 0; i < UNW_DELETED; i++) {
+
+    /* Every file's entry, in pack order. */
+    unw_pos_t pos[UNW_FILES];
+    uint32_t pack0 = UINT32_MAX;
+    for (int i = 0; i < UNW_FILES; i++) {
+        char name[16], hex[OBJECT_HASH_SIZE * 2 + 1];
+        snprintf(name, sizeof(name), "f%03d", i);
+        content_hash_of(name, hex);
+        uint8_t h[OBJECT_HASH_SIZE];
+        hash_of_hex(hex, h);
+        uint32_t pnum = 0;
+        assert_int_equal(pack_resolve_location(store, h, &pnum, &pos[i].off), OK);
+        if (pack0 == UINT32_MAX) pack0 = pnum;
+        assert_int_equal(pnum, pack0);
+        pos[i].idx = i;
+    }
+    qsort(pos, UNW_FILES, sizeof(pos[0]), unw_pos_cmp);
+
+    /* The group holding the most of them; its first UNW_DELETED die. */
+    uint64_t best_g = 0;
+    int best_n = 0;
+    for (int i = 0; i < UNW_FILES;) {
+        uint64_t g = pos[i].off / PARITY_GROUP_DATA;
+        int j = i;
+        while (j < UNW_FILES && pos[j].off / PARITY_GROUP_DATA == g) j++;
+        if (j - i > best_n) { best_n = j - i; best_g = g; }
+        i = j;
+    }
+    /* Room for the dead ones and for live ones after the last of them. */
+    assert_true(best_n >= UNW_DELETED + 2);
+    memset(unw_dead, 0, sizeof(unw_dead));
+    int marked = 0;
+    for (int i = 0; i < UNW_FILES && marked < UNW_DELETED; i++) {
+        if (pos[i].off / PARITY_GROUP_DATA != best_g) continue;
+        unw_dead[pos[i].idx] = 1;
+        snprintf(unw_target, sizeof(unw_target), "f%03d", pos[i].idx);
+        marked++;
+    }
+    for (int i = 0; i < UNW_FILES; i++) {
+        if (!unw_dead[i]) continue;
         char p[PATH_MAX + 32];
         snprintf(p, sizeof(p), "%s/f%03d", dir, i);
         assert_int_equal(unlink(p), 0);
@@ -1290,7 +1357,8 @@ static void unw_assert_restores(int64_t s2, const char *skip_hex)
         assert_int_equal(st, OK);
     }
     int compared = 0;
-    for (int i = UNW_DELETED; i < UNW_FILES; i++) {
+    for (int i = 0; i < UNW_FILES; i++) {
+        if (unw_dead[i]) continue;
         char src[PATH_MAX + 32], out[2 * PATH_MAX + 32];
         snprintf(src, sizeof(src), "%s/many/f%03d", TEST_SRC, i);
         snprintf(out, sizeof(out), "%s%s/many/f%03d", dst, TEST_SRC, i);
@@ -1330,7 +1398,7 @@ static void test_unwalkable_pack_with_swept_headers_is_salvaged(void **state)
     int dead = 0, live = 0;
     char live_hex[OBJECT_HASH_SIZE * 2 + 1];
     entry_at_t live_at;
-    uint32_t pnum = unw_wipe_group_of("f049", s2, &dead, &live, live_hex, &live_at);
+    uint32_t pnum = unw_wipe_group_of(unw_target, s2, &dead, &live, live_hex, &live_at);
     assert_true(dead >= 1);
     assert_true(live >= 1);
     assert_true((dead + live) * (int)sizeof(pack_dat_entry_hdr_t) > 2048);
@@ -1392,7 +1460,7 @@ static void test_salvage_carries_a_damaged_live_entry_and_reports_its_loss(void 
     int dead = 0, live = 0;
     char live_hex[OBJECT_HASH_SIZE * 2 + 1];
     entry_at_t live_at;
-    uint32_t pnum = unw_wipe_group_of("f049", s2, &dead, &live, live_hex, &live_at);
+    uint32_t pnum = unw_wipe_group_of(unw_target, s2, &dead, &live, live_hex, &live_at);
     assert_true(dead >= 1);
     assert_true(live_hex[0] != '\0');
     flip_byte(live_at.path, (off_t)(live_at.payload + 3));
@@ -1453,7 +1521,7 @@ static void test_salvage_without_a_trailer_verifies_by_name(void **state)
     int dead = 0, live = 0;
     char live_hex[OBJECT_HASH_SIZE * 2 + 1];
     entry_at_t live_at;
-    uint32_t pnum = unw_wipe_group_of("f049", s2, &dead, &live, live_hex, &live_at);
+    uint32_t pnum = unw_wipe_group_of(unw_target, s2, &dead, &live, live_hex, &live_at);
     assert_true(dead >= 1);
     assert_true(live_hex[0] != '\0');
     flip_byte(live_at.path, (off_t)(live_at.payload + 3));
