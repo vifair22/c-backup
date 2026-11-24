@@ -340,10 +340,17 @@ every earlier snapshot's and its commits append to one end of one b-tree.
 It replaced `nodes_by_hash`, an index on `(repo_id, content_hash)` across
 every snapshot, whose entries for a new snapshot landed at random places:
 under the commit budget (about 200 rows a commit) nearly every row cost a
-4 KiB WAL page, 93% of the WAL a no-change backup wrote. A lookup by hash
-across the repository (object references, verify's affected files) now
-probes once per snapshot that has node rows (`node_index_gen`). Reindex,
-prune and repository purge keep it in step with `nodes`.
+4 KiB WAL page, 93% of the WAL a no-change backup wrote. Each distinct
+hash also goes into `node_content`, the repository's set of hashes any node
+names; a hash already there writes nothing, so an unchanged snapshot adds no
+page to it. A lookup by hash across the repository (object references,
+verify's contentless rule, affected files and chunk lists) asks
+`node_content` first and probes `node_hashes` once per snapshot with node
+rows (`node_index_gen`) only on a hit, so verify stays one probe per
+non-file object whatever the snapshot count. `node_content` is a superset:
+gc removes the hashes of the objects it deletes and prune leaves it alone.
+Reindex, prune and repository purge keep `node_hashes` in step with
+`nodes`.
 
 Node ids are an index artifact: nothing in the repository refers to them,
 which is what lets reindex rebuild the database without preserving them.

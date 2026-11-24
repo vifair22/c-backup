@@ -101,18 +101,22 @@ static const char *level_name(verify_level_t l)
  * healthy repository: the partial index nodes_file_no_content (migration
  * 014; its condition must stay these exact terms or SQLite will not use
  * it), and the objects that are neither a FILE nor a CHUNKLIST, each
- * probed against node_hashes once per indexed snapshot (migration 016).
- * CROSS JOIN keeps objects on the outside, so the cost follows the
- * non-file objects times the snapshots, never the node count.
+ * probed against node_content, the set of hashes any node names
+ * (migration 016), and only on a hit against node_hashes once per indexed
+ * snapshot. CROSS JOIN keeps objects on the outside, so on a healthy
+ * repository the cost is one probe per non-file object, never the node
+ * count or the snapshot count.
  */
 #define VERIFY_CONTENTLESS                                                  \
     "n.repo_id = ?1 AND n.type = 1 AND n.id IN ("                           \
     "  SELECT id FROM nodes WHERE repo_id = ?1 AND type = 1"                \
     "     AND (content_hash IS NULL OR content_hash = '')"                  \
     "  UNION ALL"                                                           \
-    "  SELECT f.id FROM objects o CROSS JOIN node_index_gen g"              \
-    "    CROSS JOIN node_hashes h CROSS JOIN nodes f"                       \
+    "  SELECT f.id FROM objects o CROSS JOIN node_content c"                \
+    "    CROSS JOIN node_index_gen g CROSS JOIN node_hashes h"              \
+    "    CROSS JOIN nodes f"                                                \
     "   WHERE o.repo_id = ?1 AND o.type NOT IN (1, 6)"                      \
+    "     AND c.repo_id = ?1 AND c.content_hash = o.hash"                   \
     "     AND g.repo_id = ?1 AND h.repo_id = ?1 AND h.snap_id = g.snap_id"  \
     "     AND h.content_hash = o.hash"                                      \
     "     AND f.repo_id = ?1 AND f.id = h.node_id AND f.type = 1)"
@@ -181,8 +185,10 @@ static void paths_of(cutils_db_t *db, const char *repo, const char *hex,
     if (db_read_rows(db, 1,
             "WITH RECURSIVE up(snap, parent, path, depth) AS ("
             "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
-            "    FROM node_index_gen g CROSS JOIN node_hashes h CROSS JOIN nodes n"
-            "   WHERE g.repo_id = ?1 AND h.repo_id = ?1 AND h.snap_id = g.snap_id"
+            "    FROM node_content c CROSS JOIN node_index_gen g"
+            "    CROSS JOIN node_hashes h CROSS JOIN nodes n"
+            "   WHERE c.repo_id = ?1 AND c.content_hash = ?2"
+            "     AND g.repo_id = ?1 AND h.repo_id = ?1 AND h.snap_id = g.snap_id"
             "     AND h.content_hash = ?2 AND n.repo_id = ?1 AND n.id = h.node_id"
             VERIFY_PATH_WALK
             " SELECT path, COUNT(*) OVER (), SUM(COUNT(*)) OVER ()"
@@ -233,8 +239,9 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     r = NULL;
     if (db_read_rows(db, 1,
             "SELECT snap_id, COUNT(*) OVER () FROM"
-            " (SELECT g.snap_id FROM node_index_gen g"
-            "   WHERE g.repo_id = ?1 AND EXISTS (SELECT 1 FROM node_hashes h"
+            " (SELECT g.snap_id FROM node_content c CROSS JOIN node_index_gen g"
+            "   WHERE c.repo_id = ?1 AND c.content_hash = ?2"
+            "     AND g.repo_id = ?1 AND EXISTS (SELECT 1 FROM node_hashes h"
             "     WHERE h.repo_id = ?1 AND h.snap_id = g.snap_id AND h.content_hash = ?2))"
             " ORDER BY snap_id LIMIT " VERIFY_STR(FINDING_SNAPSHOT_IDS),
             (const char *[]){ repo, hex, NULL }, &r) == 0 && r && r->nrows > 0) {
@@ -319,9 +326,9 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
             "     AND status NOT LIKE '" VERIFY_NOTICE_PREFIX "%'),"
             " up(snap, parent, path, depth) AS ("
             "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
-            "    FROM lost CROSS JOIN node_index_gen g CROSS JOIN node_hashes h"
-            "    CROSS JOIN nodes n"
-            "   WHERE g.repo_id = ?1 AND h.repo_id = ?1 AND h.snap_id = g.snap_id"
+            "    FROM lost CROSS JOIN node_content c CROSS JOIN node_index_gen g"
+            "    CROSS JOIN node_hashes h CROSS JOIN nodes n"
+            "   WHERE c.repo_id = ?1 AND c.content_hash = lost.h AND g.repo_id = ?1 AND h.repo_id = ?1 AND h.snap_id = g.snap_id"
             "     AND h.content_hash = lost.h AND n.repo_id = ?1 AND n.id = h.node_id"
             /* Contentless file entries are loss too, with no hash to join
              * on; they are seeded only when this run recorded them. */
@@ -880,9 +887,13 @@ static status_t verify_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     db_rows_t *roots = NULL;
     if (db_read_rows(db, 1,
-            "SELECT DISTINCT n.content_hash FROM nodes n"
-            "  JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
-            " WHERE n.repo_id = ? AND o.type = 6",
+            /* From the chunk lists, each probed in the content set
+             * (migration 016): a walk of the node rows grew with snapshots
+             * times files. node_content may name a list no node does any
+             * more until gc runs; checking it as well is harmless. */
+            "SELECT o.hash FROM objects o CROSS JOIN node_content c"
+            " WHERE o.repo_id = ?1 AND o.type = 6"
+            "   AND c.repo_id = ?1 AND c.content_hash = o.hash",
             (const char *[]){ repo, NULL }, &roots) != 0) {
         db_rows_free(roots);
         return set_error(ERR_IO, "verify: cannot list chunk lists");

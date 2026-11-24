@@ -103,3 +103,6 @@ status_t reindex_gaps_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                           const char *what, atomic_int *cancel,
                           void (*progress)(const char *, uint64_t, uint64_t, void *),
                           void *progress_ctx, uint64_t *out_indexed);
+
+/* The statement a gap's chunk-list pass runs, for tests to read its plan. */
+extern const char *const reindex_snap_lists_sql;

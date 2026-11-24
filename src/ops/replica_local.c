@@ -485,6 +485,15 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
      * one. */
     status_t mst = snapshot_ids_raise(c->root, c->uuid, snap->snapshot_id, NULL, NULL);
     if (mst != OK) return mst;
+    /* The packs' index commits durable before the record that needs them
+     * (B292): a record is durable the moment its directory is synced, and
+     * one kept by a cut whose packs' rows were lost names trees the index
+     * cannot locate. */
+    mst = store_emit_index_sync(c->store);
+    if (mst != OK)
+        return set_error_wrap(mst, "replica: the index of snapshot %lld's packs is not "
+                              "durable, so its record was not written",
+                              (long long)snap->snapshot_id);
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_hex(snap->root_tree_hash, hex);

@@ -41,6 +41,7 @@
 #include "store.h"
 #include "restore.h"
 #include "store_index.h"
+#include "routes.h"
 #include "verify.h"
 #include "test_tmp.h"
 
@@ -1853,10 +1854,50 @@ static void test_node_rules_do_not_walk_the_nodes(void **state)
     plan_of(verify_rule_condition(VERIFY_RULE_CONTENTLESS), plan, sizeof(plan));
     assert_non_null(strstr(plan, "nodes_file_no_content"));
     /* A probe by hash per indexed snapshot (migration 016), never a walk. */
+    /* One probe of the content set per non-file object (migration 016);
+     * node_hashes only behind a hit, never a walk or a probe per snapshot
+     * for every object. */
+    assert_non_null(strstr(plan, "SEARCH c USING PRIMARY KEY (repo_id=? AND content_hash=?)"));
     assert_non_null(strstr(plan, "SEARCH h USING PRIMARY KEY (repo_id=? AND snap_id=? AND content_hash=?)"));
 
     plan_of(verify_rule_condition(VERIFY_RULE_UNSETTLED), plan, sizeof(plan));
     assert_non_null(strstr(plan, "nodes_unsettled"));
+}
+
+/*
+ * Object references (introspect_object_refs) once walked every node row of
+ * the repository: the planner served the page from nodes_by_snap_parent by
+ * repo_id alone, and seeded the path climb by walking an index by repo_id
+ * and filtering against the page. Both grow with snapshots times files.
+ * Every node access must be keyed by more than the repository.
+ */
+static void test_object_refs_do_not_walk_the_nodes(void **state)
+{
+    (void)state;
+    run_backup();
+    run_backup();
+    char sql[4096];
+    snprintf(sql, sizeof(sql), "EXPLAIN QUERY PLAN %s", introspect_refs_sql);
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, sql, (const char *[]){ repo, "00", "50", "0",
+                                                           repo, repo, repo, NULL }, &r), 0);
+    assert_non_null(r);
+    int probed = 0;
+    for (int i = 0; i < r->nrows; i++) {
+        const char *d = r->rows[i][r->ncols - 1];
+        size_t dl = strlen(d);
+        int by_repo = dl >= 11 && strcmp(d + dl - 11, "(repo_id=?)") == 0;
+        if (strstr(d, "SCAN n") || strstr(d, "SCAN p") || strstr(d, "SCAN nodes") ||
+            strstr(d, "SCAN h") ||
+            (by_repo && !strstr(d, "node_index_gen")))
+            fail_msg("object refs walk the node rows: %s", d);
+        if (strstr(d, "SEARCH h USING PRIMARY KEY (repo_id=? AND snap_id=? AND content_hash=?)"))
+            probed = 1;
+    }
+    db_result_free(r);
+    assert_true(probed);
 }
 
 /* An empty content hash is the third shape of "names no content", the arm
@@ -1888,6 +1929,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_structure_level_does_not_read_payloads, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_covers_packed_objects, setup, teardown),
         cmocka_unit_test_setup_teardown(test_run_is_recorded, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_object_refs_do_not_walk_the_nodes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_node_rules_do_not_walk_the_nodes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_empty_content_hash_is_missing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_loss_fails_the_run_and_keeps_the_record, setup, teardown),

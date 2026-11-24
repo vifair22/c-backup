@@ -312,6 +312,9 @@ static void test_016_carries_every_file_hash_over(void **state)
             assert_string_equal(r->rows[i][c], want[i][c]);
     db_result_free(r);
     assert_int_equal(scalar(h, "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'nodes_by_hash'"), 0);
+    /* The content set: each distinct hash once. */
+    assert_int_equal(scalar(h, "SELECT COUNT(*) FROM node_content"), 2);
+    assert_int_equal(scalar(h, "SELECT COUNT(*) FROM node_content WHERE content_hash IN ('bb', 'cc')"), 2);
     db_close(h);
 }
 

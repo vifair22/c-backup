@@ -39,6 +39,7 @@
 #include "db_write.h"
 #include "manifest.h"
 #include "pack.h"
+#include "gc.h"
 #include "prune.h"
 #include "reindex.h"
 #include "object.h"
@@ -2054,6 +2055,15 @@ static int node_hash_drift(const char *repo)
         "            AND h.node_id = n.id))", repo);
 }
 
+/* Hashes node rows name that node_content lacks: a lookup would miss them. */
+static int node_content_missing(const char *repo)
+{
+    return scalar(
+        "SELECT COUNT(*) FROM node_hashes h WHERE h.repo_id = ?1"
+        "   AND NOT EXISTS (SELECT 1 FROM node_content c WHERE c.repo_id = h.repo_id"
+        "                     AND c.content_hash = h.content_hash)", repo);
+}
+
 static void test_node_hashes_follow_the_node_rows(void **state)
 {
     (void)state;
@@ -2075,6 +2085,18 @@ static void test_node_hashes_follow_the_node_rows(void **state)
     assert_int_equal(reindex_snapshot(store, db, repo_id, 2, &rx), OK);
     assert_int_equal(scalar("SELECT COUNT(*) FROM node_hashes WHERE repo_id = ?", repo), 4);
     assert_int_equal(node_hash_drift(repo), 0);
+    assert_int_equal(node_content_missing(repo), 0);
+
+    /* node_content keeps a pruned file's hash until gc deletes its object. */
+    assert_int_equal(unlink(TEST_SRC "/delta.txt"), 0);
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+    assert_int_equal(prune_snapshot(store, db, repo_id, 2), OK);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM node_content WHERE repo_id = ?", repo), 4);
+    gc_result_t gr;
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), OK);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM node_content WHERE repo_id = ?", repo), 3);
+    assert_int_equal(node_content_missing(repo), 0);
 }
 
 /*

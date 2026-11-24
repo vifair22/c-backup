@@ -302,6 +302,13 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
             st = set_error(ERR_IO, "reindex: cannot index content hash");
             break;
         }
+        if (have_target && !is_dir &&
+            db_write(ctx->db,
+                "INSERT OR IGNORE INTO node_content (repo_id, content_hash) VALUES (?, ?)",
+                (const char *[]){ repo, thex, NULL }, NULL) != 0) {
+            st = set_error(ERR_IO, "reindex: cannot record content hash");
+            break;
+        }
 
         st = batch_point(ctx);
         if (st != OK) { ctx->batched = -1; break; }
@@ -668,12 +675,23 @@ typedef struct {
     uint64_t     unreadable;  /* packs on disk that could not be read */
     uint32_t    *seen;        /* every pack number on disk, readable or not */
     size_t       nseen, capseen;
+    /* Packs to leave as they are (index_unindexed_packs): sorted. */
+    const uint32_t *skip;
+    size_t       nskip;
 } pack_scan_ctx_t;
+
+static int u32_cmp(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
 
 static void pack_num_seen(uint32_t pack_num, void *vctx)
 {
     pack_scan_ctx_t *c = vctx;
     if (c->failed) return;
+    if (c->nskip && bsearch(&pack_num, c->skip, c->nskip, sizeof(*c->skip), u32_cmp))
+        return;
 
     if (c->nseen == c->capseen) {
         size_t ncap = c->capseen ? c->capseen * 2 : 64;
@@ -1001,6 +1019,16 @@ static status_t walk_list_inner(store_t *store, cutils_db_t *db, const char *rep
     return st;
 }
 
+/* One snapshot's file entries whose content is a chunk list, or may be one
+ * (reindex_lists). Parameters: repo, snapshot. */
+const char *const reindex_snap_lists_sql =
+    "SELECT DISTINCT n.content_hash FROM nodes n"
+    "  CROSS JOIN objects o"
+    " WHERE n.repo_id = ?1 AND n.snap_id = ?2"
+    "   AND o.repo_id = n.repo_id AND o.hash = n.content_hash"
+    "   AND n.type = 1 AND o.type IN (1, 6)"
+    "   AND (o.orig_size IS NULL OR o.orig_size != n.size OR o.type = 6)";
+
 /* only_snap > 0: that snapshot's lists alone (B264), for indexing gaps:
  * every other snapshot's were walked when it was indexed, and walking them
  * all again for one new snapshot is the whole-repository cost a gap must
@@ -1012,14 +1040,24 @@ static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
 
+    /*
+     * One statement per case. The single statement with "?2 <= 0 OR
+     * n.snap_id = ?2" could not use the snapshot as a key, so a gap's
+     * walk of one snapshot read every node row of the repository (planned
+     * as a walk by repo_id with a table fetch per row), which is the cost
+     * B264 meant to avoid.
+     */
     db_result_t *r = NULL;
-    if (db_execute(db,
+    int qrc = only_snap > 0
+        ? db_execute(db, reindex_snap_lists_sql, (const char *[]){ repo, snap, NULL }, &r)
+        : db_execute(db,
             "SELECT DISTINCT n.content_hash FROM nodes n"
             "  JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
-            " WHERE n.repo_id = ?1 AND (CAST(?2 AS INTEGER) <= 0 OR n.snap_id = CAST(?2 AS INTEGER))"
+            " WHERE n.repo_id = ?1"
             "   AND n.type = 1 AND o.type IN (1, 6)"
             "   AND (o.orig_size IS NULL OR o.orig_size != n.size OR o.type = 6)",
-            (const char *[]){ repo, snap, NULL }, &r) != 0) {
+            (const char *[]){ repo, NULL }, &r);
+    if (qrc != 0) {
         db_result_free(r);
         return set_error(ERR_IO, "reindex: cannot list chunk lists");
     }
@@ -1230,6 +1268,79 @@ static status_t restore_pack_mark(store_t *store, cutils_db_t *db, int64_t repo_
     return OK;
 }
 
+/*
+ * Index the packs on disk the index has no packs row for, and only those
+ * (B292): a pack installed and synced whose commit a power cut took. The
+ * gaps-only pass (B264) indexes a lost snapshot by walking its trees, which
+ * resolve through pack_objects, so a snapshot whose packs' rows went with
+ * the cut could not be indexed at all: the start-up job failed with "object
+ * not in any pack", and gc and prune refused until a full reindex. A full
+ * reindex reads every pack; this reads only the ones the index lacks, after
+ * one listing of packs/. Interrupted pack removals are finished first, as
+ * rebuild_pack_index does, so a pack being replaced is not indexed beside
+ * its replacement.
+ */
+static status_t index_unindexed_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                      uint64_t *out_packs)
+{
+    *out_packs = 0;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    pack_resume_removals(store);
+
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT id FROM packs WHERE repo_id = ? ORDER BY id",
+                   (const char *[]){ repo, NULL }, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "reindex: cannot list indexed packs");
+    }
+    size_t n = r ? (size_t)r->nrows : 0;
+    uint32_t *have = calloc(n ? n : 1, sizeof(*have));
+    if (!have) { db_result_free(r); return set_error(ERR_NOMEM, "reindex: indexed packs"); }
+    for (size_t i = 0; i < n; i++) have[i] = (uint32_t)strtoul(r->rows[i][0], NULL, 10);
+    db_result_free(r);
+    qsort(have, n, sizeof(*have), u32_cmp);
+
+    if (db_txn_begin_bulk(db) != OK) {
+        free(have);
+        return set_error(ERR_IO, "reindex: cannot begin indexing unindexed packs");
+    }
+    pack_scan_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.store = store;
+    c.db    = db;
+    c.repo  = repo;
+    c.skip  = have;
+    c.nskip = n;
+    status_t st = pack_list(store, pack_num_seen, &c);
+    /* An object a pack just indexed also holds - the copy gc or coalescing
+     * wrote before the cut took its commit - now has its pack_objects row
+     * there; its objects row follows, as rebuild_pack_index has it. */
+    if (st == OK && !c.failed && c.packs > 0 &&
+        db_write(db,
+            "UPDATE objects SET location ="
+            " (SELECT CAST(po.pack_id AS TEXT) FROM pack_objects po"
+            "   WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)"
+            " WHERE repo_id = ? AND location NOT IN ('absent', 'staged') AND EXISTS"
+            " (SELECT 1 FROM pack_objects po WHERE po.repo_id = objects.repo_id"
+            "   AND po.hash = objects.hash AND CAST(po.pack_id AS TEXT) <> objects.location)",
+            (const char *[]){ repo, NULL }, NULL) != 0)
+        c.failed = 1;
+    free(c.seen);
+    free(have);
+    if (st != OK || c.failed) {
+        db_txn_rollback(db);
+        return st != OK ? st : set_error(ERR_IO, "reindex: cannot index unindexed packs");
+    }
+    if (db_txn_commit(db) != OK)
+        return set_error(ERR_IO, "reindex: cannot commit unindexed packs");
+    if (c.packs)
+        log_warn("reindex: indexed %llu pack(s) on disk the index had no rows for "
+                 "(a commit lost to a power cut)", (unsigned long long)c.packs);
+    *out_packs = c.packs;
+    return OK;
+}
+
 status_t reindex_gaps(store_t *store, cutils_db_t *db, int64_t repo_id,
                       const char *what, uint64_t *out_indexed)
 {
@@ -1265,6 +1376,14 @@ status_t reindex_gaps_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                        "%s would delete what only that snapshot holds. Load the key and "
                        "run c-backup reindex %lld", what, (long long)gaps[0], what,
                        (long long)repo_id);
+        free(gaps);
+        return st;
+    }
+    /* What the lost snapshots' trees resolve through, first (B292). */
+    uint64_t packs_indexed = 0;
+    st = index_unindexed_packs(store, db, repo_id, &packs_indexed);
+    if (st != OK) {
+        st = set_error_wrap(st, "%s refused: cannot index the packs the index lacks", what);
         free(gaps);
         return st;
     }

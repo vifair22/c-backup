@@ -11,7 +11,7 @@
  * scan_entry_t – in-memory representation of one filesystem object
  * collected during the scan phase.
  */
-typedef struct {
+typedef struct scan_entry {
     char    *path;              /* full absolute path */
     uint64_t parent_node_id;   /* node_id of parent dir; 0 for source root */
     size_t   strip_prefix_len; /* bytes to strip from path to get repo-relative path */

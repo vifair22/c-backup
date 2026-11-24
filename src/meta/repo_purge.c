@@ -101,6 +101,11 @@ static status_t purge_one(cutils_db_t *db, const char *repo, atomic_int *stop)
         " (SELECT repo_id, snap_id, content_hash, node_id FROM node_hashes"
         "   WHERE repo_id = ? LIMIT " PURGE_BATCH ")", repo, stop);
     if (hst != OK) return hst;
+    hst = purge_batched(db, "node_content",
+        "DELETE FROM node_content WHERE (repo_id, content_hash) IN"
+        " (SELECT repo_id, content_hash FROM node_content"
+        "   WHERE repo_id = ? LIMIT " PURGE_BATCH ")", repo, stop);
+    if (hst != OK) return hst;
     for (int i = 0; keyed_tables[i]; i++) {
         status_t st = purge_table(db, keyed_tables[i], repo, stop);
         if (st != OK) return st;

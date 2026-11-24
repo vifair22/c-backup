@@ -26,11 +26,11 @@ static int hash_is_zero(const uint8_t h[OBJECT_HASH_SIZE])
 static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
 {
     static const char *d = "0123456789abcdef";
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
+    for (size_t i = 0; i < OBJECT_HASH_SIZE; i++) {
         out[i * 2]     = d[(h[i] >> 4) & 0xF];
         out[i * 2 + 1] = d[h[i] & 0xF];
     }
-    out[OBJECT_HASH_SIZE * 2] = '\0';
+    out[(size_t)OBJECT_HASH_SIZE * 2] = '\0';
 }
 
 /* The last path component; what the entry is called inside its parent. */
@@ -152,7 +152,7 @@ status_t node_index_write(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
         /* Both offset, and together: parent_node_id refers to one of these
          * ids. A root's parent stays 0, which is not an id. */
         snprintf(id,     sizeof(id),     "%llu",
-                 (unsigned long long)(e->node.node_id + id_base));
+                 (unsigned long long)e->node.node_id + (unsigned long long)id_base);
         snprintf(parent, sizeof(parent), "%llu",
                  (unsigned long long)(links[i].parent_id
                                       ? links[i].parent_id + id_base : 0));
@@ -261,6 +261,11 @@ status_t node_index_write(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
      * after every earlier snapshot's, so each commit appends to the end of
      * one b-tree instead of touching a page per row across a whole-repo
      * hash index (perf-d2-nochange).
+     *
+     * Each distinct hash also goes into node_content, the repository's set
+     * of hashes any node names, which a lookup by hash asks first. That set
+     * is ordered by hash across snapshots, but a hash already in it changes
+     * nothing, so an unchanged snapshot writes no page of it.
      */
     node_hash_ent_t *hv = NULL;
     size_t hn = 0;
@@ -288,6 +293,14 @@ status_t node_index_write(cutils_db_t *db, int64_t repo_id, int64_t snap_id,
             free(hv);
             db_txn_rollback(db);
             return set_error_wrap(ERR_IO, "index_nodes: hash insert failed");
+        }
+        if ((k == 0 || memcmp(hv[k].hash, hv[k - 1].hash, OBJECT_HASH_SIZE) != 0) &&
+            db_write(db,
+                "INSERT OR IGNORE INTO node_content (repo_id, content_hash) VALUES (?, ?)",
+                (const char *[]){ repo, hhex, NULL }, NULL) != 0) {
+            free(hv);
+            db_txn_rollback(db);
+            return set_error_wrap(ERR_IO, "index_nodes: content set insert failed");
         }
         if (++nb.since_commit >= NODE_BATCH || db_txn_batch_should_end(&nb.rule)) {
             status_t cst = db_txn_commit(db);

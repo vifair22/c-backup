@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "chunklist.h"
+#include "pack_writeback.h"
 #include "object.h"
 #include "read_budget.h"
 #include "util.h"
@@ -9,6 +10,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------------ */
@@ -626,6 +628,43 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
     return content_restore_fd_ex(store, hash, out_fd, out_size, NULL);
 }
 
+_Thread_local content_io_times_t *content_io_times;
+
+static uint64_t io_now(void)
+{
+    if (!content_io_times) return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void io_add(int write, uint64_t t0)
+{
+    content_io_times_t *t = content_io_times;
+    if (!t) return;
+    uint64_t d = io_now() - t0;
+    if (write) { t->write_ns += d; t->writes++; }
+    else       { t->load_ns += d;  t->loads++; }
+}
+
+/*
+ * Writeback of restored content starts as it is written, on the shared
+ * writeback thread (pack_writeback.h), every RESTORE_WB_STEP and at the end
+ * of anything past RESTORE_WB_MIN.
+ *
+ * Restore makes its files durable in batches with one syncfs (restore.c),
+ * and with the kernel's default ratios a batch of 1 GiB sits far under the
+ * background dirty threshold of a host with tens of GiB of memory, so
+ * nothing reached the device until that syncfs: the restore read and decoded a gigabyte with
+ * the disk idle for writes, then waited with the disk busy and nothing
+ * being read. Starting writeback here lets the two overlap; the syncfs
+ * still decides durability and still comes before any rename, so what a
+ * crash can leave is unchanged. Small files are left to the syncfs: a
+ * request each would cost more than it saves.
+ */
+#define RESTORE_WB_STEP ((uint64_t)8 * 1024 * 1024)
+#define RESTORE_WB_MIN  ((uint64_t)1024 * 1024)
+
 status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                                int out_fd, uint64_t *out_size, int *out_write_failed)
 {
@@ -634,7 +673,9 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
     *wf = 0;
     uint64_t size = 0;
     uint8_t type = 0;
+    uint64_t ti = io_now();
     status_t st = object_get_info(store, hash, &size, &type);
+    io_add(0, ti);
     if (st != OK) return st;
     if (type == OBJECT_TYPE_FILE) {
         /* Loaded, decrypted and checked whole before a byte is written. */
@@ -642,16 +683,23 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
         size_t   len = 0;
         uint8_t  otype = 0;
         uint64_t taken = 0;
+        uint64_t t0 = io_now();
         st = object_load_budgeted(store, hash, &data, &len, &otype, &taken);
+        io_add(0, t0);
         if (st == OK && otype != OBJECT_TYPE_FILE)
             st = set_error(ERR_CORRUPT, "object is of type %u, not file content", otype);
         if (st == OK && len) {
+            t0 = io_now();
             st = pwrite_full(out_fd, data, len, 0);
+            io_add(1, t0);
             if (st != OK) *wf = 1;
+            else if (len >= RESTORE_WB_MIN) pack_writeback_start(out_fd, 0, len);
         }
-        if (st == OK) store_io_progress(store, len);
         free(data);
         read_budget_release(taken);
+        /* After the release: the callback may load (restore's read-ahead
+         * opens chunk lists), and read_budget.h forbids nesting. */
+        if (st == OK) store_io_progress(store, len);
         if (st == OK && out_size) *out_size = len;
         return st;
     }
@@ -665,6 +713,7 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
     if (st != OK) return st;
     /* The length from the iterator, which holds the root header it checked. */
     uint64_t total = chunklist_iter_total(it);
+    uint64_t wb_done = 0, wb_end = 0;   /* hinted, and written, up to */
     for (;;) {
         chunklist_item_t x;
         int done = 0;
@@ -672,15 +721,26 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
         if (st != OK || done) break;
         if (store_cancelled(store)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
         void *data = NULL;
+        uint64_t t0 = io_now();
         st = load_leaf(store, &x, OBJECT_TYPE_FILE, &data);
+        io_add(0, t0);
         if (st != OK) break;
+        t0 = io_now();
         st = pwrite_full(out_fd, data, (size_t)x.length, x.offset);
+        io_add(1, t0);
         leaf_free(data, x.length);
         if (st != OK) { *wf = 1; break; }
+        if (x.offset + x.length > wb_end) wb_end = x.offset + x.length;
+        if (wb_end - wb_done >= RESTORE_WB_STEP) {
+            pack_writeback_start(out_fd, wb_done, wb_end - wb_done);
+            wb_done = wb_end;
+        }
         store_io_progress(store, x.length);
     }
     chunklist_iter_close(it);
     if (st != OK) return st;
+    if (wb_end > wb_done && wb_end >= RESTORE_WB_MIN)
+        pack_writeback_start(out_fd, wb_done, wb_end - wb_done);
     /* Extends over any trailing hole, and leaves interior gaps unwritten,
      * which on a fresh file is what makes them holes. */
     if (ftruncate(out_fd, (off_t)total) != 0) {

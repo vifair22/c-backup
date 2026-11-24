@@ -30,4 +30,23 @@ INSERT INTO node_hashes (repo_id, snap_id, content_hash, node_id)
      WHERE type <> 2 AND content_hash IS NOT NULL AND content_hash <> ''
      ORDER BY repo_id, snap_id, content_hash, id;
 
+-- Every content hash any node row names, once per repository: the filter
+-- a lookup by hash asks before probing node_hashes snapshot by snapshot.
+-- Without it verify's contentless rule probed every non-file object once
+-- per snapshot, 130 us an object at 100 snapshots against 2 us at one,
+-- the growth B268 removed. A superset, never a subset: a backup and a
+-- reindex add to it, gc removes the hashes of the objects it deletes, and
+-- prune leaves it alone, so a hash in it may be named by no node, and a
+-- probe that finds it still confirms in node_hashes. A hash a backup
+-- already recorded changes nothing, so an unchanged snapshot writes none.
+CREATE TABLE node_content (
+    repo_id      INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    content_hash TEXT NOT NULL,
+    PRIMARY KEY (repo_id, content_hash)
+) WITHOUT ROWID;
+
+INSERT INTO node_content (repo_id, content_hash)
+    SELECT DISTINCT repo_id, content_hash FROM node_hashes
+     ORDER BY repo_id, content_hash;
+
 DROP INDEX nodes_by_hash;
