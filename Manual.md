@@ -482,6 +482,7 @@ are different: they live in the database and change through the policy API
 | `jobs.read_budget_mb` | `256` | MiB of object and pack-writer buffers every job together may hold. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, and each backup pack writer holds about 26.3 MiB while its pack is open (section 18.3), so this caps that memory whatever runs at once. 48 to 1048576; under 48 stops the daemon at start, since one object and one writer must fit |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
+| `backup.source_drop_pct` | `50` | A source whose files or bytes fall by more than this per cent since the last snapshot that held it makes the backup complete with a warning (section 6.7). `0` turns the drop check off; empty sources still warn. 0 to 100; a repository can set its own with `policy set` |
 | `db_detect.enabled` | `1` | Detect databases in what each backup reads (chapter 23). Reporting only: it never changes how anything is captured. `0` or `1` |
 | `db_detect.sqlite_min_kb` | `1024` | The smallest dormant SQLite file, in KiB, listed as a finding; smaller dormant ones are counted (`sqlite_small`). A live one is always listed. 0 to 16777216 |
 | `db_detect.notify_uncovered` | `1` | One alert (the job's warning, so a push notification when Pushover is configured) when a live database is first found captured `uncovered` (23.3). `0` or `1` |
@@ -1386,6 +1387,33 @@ lease for the longest first backup. While
 it exists, anything that can read the dataset root (ZFS `.zfs`) or the pool's
 snapshot directory (btrfs) can read the snapshot (22.5.4).
 
+### 6.7 Empty and shrinking sources
+
+A source that is empty, or much smaller than last time, is backed up as it
+is, and the job completes with a warning naming the source, so the warning
+alert fires (section 16). The usual cause is a share that was not mounted:
+the source path is then an empty directory, and without the warning every
+nightly job would report success while backing up nothing.
+
+| Finding | Warning says |
+|---|---|
+| The source root holds nothing | `source PATH is empty` |
+| It is empty and is a mount point in `/etc/fstab` with nothing mounted | `... the mount is missing` |
+| It is an empty mount point (a bind of a share not mounted on the host) | `source PATH is an empty mount point` |
+| Its files or bytes fell by more than `backup.source_drop_pct` per cent (default 50) since the last snapshot that held it | `source PATH shrank since snapshot N`, with both counts |
+
+The job result lists every source with its `entries`, `files`, `bytes` and
+`state` (`ok`, `empty`, `unmounted`, `empty_mount` or `dropped`).
+
+Fix the mount, then back up again. For a source that legitimately shrinks a
+lot, raise `backup.source_drop_pct` for its repository (`policy set <id>
+backup.source_drop_pct 80`), or set `0` to turn the drop check off. An empty
+source always warns.
+
+Retention keeps the newest snapshot in which each source still held
+something, whatever the policy says (section 9.1), so a run of empty nights
+cannot age out the last good backup.
+
 ## 7. Browsing, searching, comparing
 
 ```sh
@@ -1589,6 +1617,12 @@ A snapshot is kept if any of these holds:
    only: `keep_daily` 7 keeps the newest seven snapshots whose highest tier
    is daily.
 3. It is tagged. Any tag protects a snapshot from retention, whatever its age.
+4. It is the newest snapshot in which one of the repository's sources is
+   not empty. Emptiness is read from the snapshot's own tree, so it holds
+   after a reindex. This keeps at most one extra snapshot per source, and
+   only while newer snapshots of that source are empty (section 6.7). The
+   job result's `kept_for_sources` names these snapshots, and the journal
+   line says when this rule alone kept one.
 
 Everything else is pruned. A tier count of `0` keeps every snapshot of that
 tier.
@@ -1643,6 +1677,7 @@ kind, is refused with a message listing what is valid:
 | Key | Accepts |
 |---|---|
 | `retention.keep_snaps`, `retention.keep_daily`, `retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly` | a whole number, 0 or more, digits only |
+| `backup.source_drop_pct` | a whole number from 0 to 100 (section 6.7) |
 
 `maintenance.auto_pack` existed while backups ended with a pack pass; format
 3 has none, and the key is refused like any other.

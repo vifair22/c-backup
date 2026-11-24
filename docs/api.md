@@ -1295,6 +1295,13 @@ one that wrote its snapshot record and then could not commit the index
 rows: `{"snapshot_id":12,"indexed":false}`, with an error naming the
 snapshot and how it gets indexed (Manual section 6.3, step 5).
 
+It also has `sources`: one entry per source root with `path`, `entries`,
+`files`, `bytes` and `state` (`ok`, `empty`, `unmounted`, `empty_mount` or
+`dropped`; a dropped one also has `compared_with`, the snapshot it was
+compared with).
+Any state but `ok` makes the backup complete with a warning naming the
+source (B295, Manual section 6.7).
+
 A regular file the scan found and the store could not read is left out of
 the snapshot entirely: not in its trees, not in the index, not in `files`.
 That is a file that vanished before it was read, one the daemon may not
@@ -1568,8 +1575,13 @@ A retention job's `result` says what it did, and on a dry run
 
 ```json
 {"dry_run":true,"would_remove":[1,2],"count":2,
- "retention":{"keep_snaps":2,"keep_daily":7,"keep_weekly":4,"keep_monthly":12,"keep_yearly":3}}
+ "retention":{"keep_snaps":2,"keep_daily":7,"keep_weekly":4,"keep_monthly":12,"keep_yearly":3},
+ "kept_for_sources":[{"source":"/mnt/share","snapshot_id":3,"held":true,
+   "reason":"the newest snapshot in which this source is not empty; kept beyond the policy"}]}
 ```
+
+`kept_for_sources` names each configured source's newest snapshot in which
+it is not empty (B295); `held` is `true` when only that rule kept it.
 
 A real pass names `removed` instead of `would_remove`, listing only the
 snapshots it actually deleted. `retention` is what the pass applied: the
