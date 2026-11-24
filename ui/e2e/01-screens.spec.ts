@@ -291,8 +291,10 @@ test('objects: the store, by object', async () => {
   await h.page.getByRole('button', { name: /loose|objects/i }).first().click()
   await expect(h.page.getByRole('heading', { name: 'Objects' })).toBeVisible()
 
-  /* The fixture packs on backup completion, so the interesting rows are
-   * under Packed rather than Loose. */
+  /* Packed and All, and no Staged: a backup's objects are indexed when their
+   * pack seals, so a Staged tab was always empty and said "Nothing is
+   * staged" in the middle of a backup. */
+  await expect(h.page.getByRole('button', { name: /^staged$/i })).toHaveCount(0)
   await h.page.getByRole('button', { name: /^packed$/i }).click()
   const row = h.page.locator('tbody tr').first()
   await expect(row).toBeVisible()

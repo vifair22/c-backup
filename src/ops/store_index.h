@@ -40,6 +40,13 @@ void     store_index_free(store_index_t *idx);
  * A staged row can outlive its pack only through a crash or an aborted
  * backup, so they are dropped at daemon start and at the start of every
  * backup, which holds the repository's write lock.
+ *
+ * A backup no longer writes them: a pack's commit creates the rows of the
+ * objects it installs, in hash order, which writes each b-tree page about
+ * once where a staged row per object wrote one at random (backup.c,
+ * index_row). They still come from store_index_drop_unannounced, which
+ * turns the rows of a pack whose commit was cut back into staged ones
+ * for the drop.
  */
 status_t store_index_put_staged(cutils_db_t *db, int64_t repo_id,
                                 const uint8_t hash[OBJECT_HASH_SIZE],
