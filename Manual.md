@@ -455,6 +455,10 @@ it at `$C_BACKUP_CONFIG_PATH`, or `config.yaml` in its working directory. The
 systemd unit sets `/etc/c-backupd/config.yaml`. Keep the file 0600: it holds
 the Pushover credentials.
 
+The daemon takes no arguments other than `--version`, which prints its
+version and c-utils' and exits, and `--help`; any other argument is refused
+with exit status 2 rather than ignored.
+
 There is no API that changes configuration. Edit the file and restart:
 `systemctl restart c-backupd`. Per-repository settings (retention)
 are different: they live in the database and change through the policy API
@@ -2554,6 +2558,7 @@ the repository).
 | `cbackup_checkpoint_throttle_waits_total` | counter | Bulk writers held before their transaction because the log was past its hard cap, until the copy completes or the locked round that completes it has queued for the write lock |
 | `cbackup_checkpoint_throttle_timeouts_total` | counter | Of those, waits that ended at the time limit rather than on a completed copy or on the locked checkpoint round queueing for the write lock, after which the lock's own queue holds the writer |
 | `cbackup_checkpoint_throttle_seconds_total` | counter | Time bulk writers spent so held |
+| `cbackup_checkpoint_quiesce_misses_total` | counter | Locked rounds that waited 100 ms for a slow read on the daemon's pooled read connections and then copied without holding them out, so the writers waiting on the round did not wait for that read; such a round cannot restart the log, and after four in a row one waits for the reads however long they take |
 | `cbackup_wal_frames_max` | gauge | The most frames `state.db`'s log held since start, read after every commit; the hard cap is 16 times `db.wal_autocheckpoint` |
 | `cbackup_db_findings{coverage}` | gauge | Live database findings not dismissed, by coverage: `covered-crash`, `covered-quiesced`, `covered-application`, `engine-unsafe`, `split`, `uncovered` (chapter 23); every label always present |
 | `cbackup_db_engine_captures_total{engine,result}` | counter | Engine copies file backups tried to make (23.6), by outcome: `ok`, `refused`, `abandoned`, `failed` |
@@ -4863,8 +4868,10 @@ The copy is sparse where the snapshot has holes and byte-identical to a
   on, and says how many in the log.
 - **Connections and memory.** `vm.export_max_conns` (default 4) caps
   connections across every export; one past it is refused at the NBD
-  handshake with a message naming the key (`... the limit
-  (vm.export_max_conns)`), which `qemu-img` and `qemu-nbd` print, and 0
+  handshake with a message naming the key (`export N: connection
+  refused: vm.export_max_conns is 4 and that many are open across every
+  export; ...`), which `qemu-img` and `qemu-nbd` print and the daemon log
+  repeats, and 0
   turns exports off. Each connection holds at most one verified
   object, up to 16 MiB, of `jobs.read_budget_mb` while it reads, and lets it
   go after a second idle; `vm exports` shows each export's `cache_bytes`.
@@ -5326,7 +5333,9 @@ enabled template stops at the next backup.
 - `c-backup jobs cancel` stops a running dump, or an exec template's pre
   run: SIGTERM to its whole process group, SIGKILL 3 seconds later, and the
   job ends cancelled within seconds; the dump is not stored. A post run is
-  never stopped, since it undoes the pre run.
+  never stopped, since it undoes the pre run. A policy pre hook (a
+  `[hook]` in the helper's policy) is stopped the same way when the job is
+  cancelled while the capture begins, and the unit ends with nothing held.
 - The finding's coverage reflects it: a stored dump is a consistent copy at
   its own instant, so the finding is `covered-application` whatever the
   capture was; an exec template lifts a capture that was already one

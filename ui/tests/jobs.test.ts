@@ -30,3 +30,11 @@ test('a completed job with warnings is its own state', () => {
   assert.equal(jobDisplayState({ state: 'failed', result: { warnings: ['x'] } }), 'failed')
   assert.equal(jobDisplayState({ state: 'running', result: null }), 'running')
 })
+
+/* B283: the per-repository task list asks the daemon for that repository's
+ * jobs instead of cutting the daemon-wide newest 50 itself. */
+test('a repository-scoped job list carries ?repo=', async () => {
+  const { toEndpoint } = await import('../src/main/client.ts')
+  assert.equal(toEndpoint({ kind: 'jobList', repoId: 7 }).path, '/jobs?repo=7')
+  assert.equal(toEndpoint({ kind: 'jobList' }).path, '/jobs')
+})

@@ -25,6 +25,8 @@
 #include <cmocka.h>
 
 #include "db_findings.h"
+#include "registry.h"
+#include "unit_probe.h"
 #include "unit_detect.h"
 #include "test_tmp.h"
 
@@ -135,11 +137,95 @@ static void test_reread(void **state)
     (void)rc;
 }
 
+/*
+ * B279: a Nextcloud's dbhost that is a compose service or network alias in
+ * another unit, not that unit's id or name. A stand-in provider lists three
+ * units; each container answers to the names its probe gives. The lookup
+ * places a name exactly one unit answers to, leaves a name two units answer
+ * to unresolved, and probes nothing for a literal address.
+ */
+static int lk_probes;
+
+static status_t lk_list(sp_ctx_t *ctx, sp_unit_cb cb, void *cbctx)
+{
+    (void)ctx;
+    status_t st = cb(cbctx, "compose:nc", "compose:nc", 1);
+    if (st == OK) st = cb(cbctx, "compose:dbstack", "compose:dbstack", 1);
+    if (st == OK) st = cb(cbctx, "compose:blog", "compose:blog", 1);
+    return st;
+}
+
+static status_t lk_probe(sp_ctx_t *ctx, const char *unit_id, sp_unit_probe_t **out)
+{
+    (void)ctx;
+    lk_probes++;
+    sp_unit_probe_t *p = sp_unit_probe_new();
+    if (!p || !(p->v = calloc(1, sizeof(*p->v)))) { sp_unit_probe_free(p); return set_error(ERR_NOMEM, "probe"); }
+    p->n = 1;
+    sp_probe_container_t *c = &p->v[0];
+    /* Each container answers to its name and, as compose sets up, its
+     * service name; both stacks call their database service "db". */
+    if (strcmp(unit_id, "compose:dbstack") == 0) {
+        snprintf(c->name, sizeof(c->name), "dbstack-mariadb-1");
+        snprintf(c->aliases[0], sizeof(c->aliases[0]), "mariadb");
+        snprintf(c->aliases[1], sizeof(c->aliases[1]), "db");
+        c->n_aliases = 2;
+    } else if (strcmp(unit_id, "compose:blog") == 0) {
+        snprintf(c->name, sizeof(c->name), "blog-db-1");
+        snprintf(c->aliases[0], sizeof(c->aliases[0]), "db");
+        c->n_aliases = 1;
+    } else {
+        snprintf(c->name, sizeof(c->name), "nc-app-1");
+        snprintf(c->aliases[0], sizeof(c->aliases[0]), "app");
+        c->n_aliases = 1;
+    }
+    *out = p;
+    return OK;
+}
+
+static void test_lookup_by_service_name(void **state)
+{
+    (void)state;
+    static sp_provider_ops_t ops;
+    memset(&ops, 0, sizeof(ops));
+    ops.abi = SP_ABI_VERSION;
+    ops.name = "lkstub";
+    ops.list_units = lk_list;
+    ops.unit_probe = lk_probe;
+    assert_int_equal(sp_registry_add(&ops, NULL), OK);
+    char key[600];
+
+    /* A unit id still answers from the list alone, with no probe. */
+    lk_probes = 0;
+    assert_int_equal(unit_detect_lookup_host("lkstub", "compose:dbstack", key, sizeof(key)), 1);
+    assert_string_equal(key, "lkstub:compose:dbstack");
+    assert_int_equal(lk_probes, 0);
+
+    /* A compose service of another unit, and a container name. */
+    assert_int_equal(unit_detect_lookup_host("lkstub", "mariadb", key, sizeof(key)), 1);
+    assert_string_equal(key, "lkstub:compose:dbstack");
+    assert_int_equal(unit_detect_lookup_host("lkstub", "blog-db-1", key, sizeof(key)), 1);
+    assert_string_equal(key, "lkstub:compose:blog");
+
+    /* Two units answer to "db": not guessed. */
+    assert_int_equal(unit_detect_lookup_host("lkstub", "db", key, sizeof(key)), 0);
+    /* Nobody answers. */
+    assert_int_equal(unit_detect_lookup_host("lkstub", "postgres", key, sizeof(key)), 0);
+
+    /* An address is not a unit: nothing probed. */
+    lk_probes = 0;
+    assert_int_equal(unit_detect_lookup_host("lkstub", "10.0.0.5", key, sizeof(key)), 0);
+    assert_int_equal(unit_detect_lookup_host("lkstub", "fd00::5", key, sizeof(key)), 0);
+    assert_int_equal(lk_probes, 0);
+    assert_int_equal(err_msg()[0], '\0');
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_probe_for_detection),
         cmocka_unit_test(test_reread),
+        cmocka_unit_test(test_lookup_by_service_name),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

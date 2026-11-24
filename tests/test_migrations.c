@@ -126,6 +126,40 @@ static void test_a_failed_migration_reports_its_own_error_and_applies_nothing(vo
     db_close(h);
 }
 
+/*
+ * A migration whose SQL runs cleanly but whose writes fail at COMMIT (B288):
+ * a deferred foreign key is only checked when the batch commits, as
+ * SQLITE_FULL on the commit was on FS1. c-utils 1.8.2 reports the batch's
+ * COMMIT with its own context, naming the last migration applied, instead
+ * of the bare "exec: ..." of the failing call.
+ */
+static void test_a_failed_commit_names_the_last_migration_applied(void **state)
+{
+    (void)state;
+    static const db_migration_t bad[] = {
+        { "b288_parent.sql", "CREATE TABLE b288_p (id INTEGER PRIMARY KEY);" },
+        { "b288_child.sql",
+          "CREATE TABLE b288_c (pid INTEGER REFERENCES b288_p(id)"
+          " DEFERRABLE INITIALLY DEFERRED);"
+          "INSERT INTO b288_c VALUES (7);" },
+        { NULL, NULL },
+    };
+    cutils_db_t *h = open_db(TEST_DB);
+    assert_int_equal(db_exec_raw(h, "PRAGMA foreign_keys=ON"), 0);
+
+    assert_int_not_equal(db_run_compiled_migrations(h, bad), 0);
+    const char *err = cutils_get_error();
+    assert_non_null(strstr(err, "migrations commit failed, last applied b288_child.sql"));
+    assert_non_null(strstr(err, "(sqlite error 787)"));   /* SQLITE_CONSTRAINT_FOREIGNKEY */
+    assert_null(strstr(err, "no transaction is active"));
+
+    /* The whole batch rolled back, and the handle is usable. */
+    assert_int_equal(app_recorded(h), 0);
+    assert_int_equal(scalar(h, "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'b288%'"), 0);
+    assert_int_equal(db_run_compiled_migrations(h, app_migrations), 0);
+    db_close(h);
+}
+
 static int count_app_migrations(void)
 {
     int n = 0;
@@ -388,6 +422,8 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(
             test_a_failed_migration_reports_its_own_error_and_applies_nothing, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_failed_commit_names_the_last_migration_applied,
+                                        setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_database_at_any_point_of_the_set_resumes,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_016_carries_every_file_hash_over, setup, teardown),

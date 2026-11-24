@@ -323,8 +323,32 @@ static void tighten_umask(void)
     umask(0077);
 }
 
+/* The daemon is configured by its file and environment, not by arguments,
+ * so the only ones it takes are the two that must not start it: --version
+ * started a whole daemon on a probe and left it running (NIT-56). Anything
+ * else is refused for the same reason, rather than ignored. -1 to carry on,
+ * otherwise the exit status. */
+static int handle_args(int argc, char *argv[])
+{
+    if (argc < 2) return -1;
+    if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
+        printf("c-backupd %s\nc-utils %s\n", VERSION_STRING, cutils_version());
+        return 0;
+    }
+    int help = argc == 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0);
+    FILE *out = help ? stdout : stderr;
+    if (!help) fprintf(out, "c-backupd: unexpected argument '%s'\n", argv[1]);
+    fprintf(out, "usage: c-backupd [--version | --help]\n"
+                 "Runs the daemon, configured by the YAML file at $C_BACKUP_CONFIG_PATH, "
+                 "or config.yaml in the working directory (Manual section 3).\n");
+    return help ? 0 : 2;
+}
+
 int main(int argc, char *argv[])
 {
+    int arc = handle_args(argc, argv);
+    if (arc >= 0) return arc;
+
     /* Line-buffer so log lines reach journald whole. Without this libc
      * block-buffers when stdout is a pipe and journald flushes partial
      * lines as binary blobs. Must precede any output. */
@@ -629,6 +653,11 @@ int main(int argc, char *argv[])
         /* Range-checked to 0..APP_MAX_STORE_WORKERS during config init. */
         int sw = config_get_int(cfg, "backup.store_workers", 0);
         routes_backup_set_store_workers(sw > 0 ? (unsigned)sw : 0u);
+        /* Range-checked to 0..100 during config init. */
+        int dp = config_get_int(cfg, "backup.source_drop_pct", SOURCE_DROP_PCT_DEFAULT);
+        routes_backup_set_source_drop_pct(dp);
+        if (dp != SOURCE_DROP_PCT_DEFAULT)
+            log_info("backup.source_drop_pct: %d%s", dp, dp == 0 ? " (drop check off)" : "");
         if (sw > 0)
             log_info("backup.store_workers: %d", sw);
         if (mode != FILE_CACHE_MATCH_AUTO)

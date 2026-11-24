@@ -256,6 +256,20 @@ static void test_identity_uses_record_device(void **state)
     assert_true(f->node.inode_identity == scan_inode_identity(rec, ino_of(TEST_SRC "/dir01/file02.txt")));
     assert_string_equal(f->read_path, TEST_SRC "/dir01/file02.txt");
 
+    /* The read root is identified by the record root's inode as well as
+     * its device: a ZFS snapshot's dataset root has a new inode number at
+     * every capture, and the root's identity kept its tree and every
+     * ancestor's changing (B271). Here the read root is another directory
+     * altogether, so its inode differs from the record root's as a ZFS
+     * snapshot root's does from the live dataset's. */
+    assert_true(ino_of(TEST_SRC) != ino_of(TEST_REC));
+    const scan_entry_t *root = entry(r, TEST_REC);
+    assert_true(root->dev_remapped);
+    assert_true(root->node.inode_identity == scan_inode_identity(rec, ino_of(TEST_REC)));
+    /* Everything below the root keeps its own inode: only the root moves. */
+    const scan_entry_t *d = entry(r, TEST_REC "/dir01");
+    assert_true(d->node.inode_identity == scan_inode_identity(rec, ino_of(TEST_SRC "/dir01")));
+
     const scan_entry_t *a = entry(r, TEST_REC "/linked");
     const scan_entry_t *b = entry(r, TEST_REC "/dir00/linked-too");
     assert_true(a->node.inode_identity == b->node.inode_identity);
@@ -388,6 +402,82 @@ static void test_snapshot_reads_match_live(void **state)
     backup_result_free(&r0);
     backup_result_free(&r1);
     backup_result_free(&r2);
+}
+
+/*
+ * B271: a ZFS snapshot keeps every inode number but its dataset root's,
+ * which is new at every capture. The stand-in is an overlay whose upper
+ * lower layer holds hard links to every file of a files-only source: the
+ * merged root takes that layer's inode, while each name resolves to the
+ * same file inode, and the layer is given the root's mode and times and
+ * has the same names (a btrfs directory's size counts them), so only the
+ * root's inode differs, as on ZFS. An unchanged backup through it stores no
+ * new tree.
+ */
+#define TEST_ZSRC TEST_DIR "/zsrc"
+#define TEST_ZTOP TEST_DIR "/ztop"
+
+static int zsrc_tree_versions(void)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(DISTINCT hex(subtree_hash) || '/' || size || '/' || mtime_ns)"
+        "  FROM nodes WHERE name = 'zsrc'", NULL, &r), 0);
+    int v = atoi(r->rows[0][0]);
+    db_result_free(r);
+    return v;
+}
+
+static void test_snapshot_root_with_a_new_inode_matches_live(void **state)
+{
+    (void)state;
+    NEED_NS();
+    assert_int_equal(mkdir(TEST_ZSRC, 0750), 0);
+    assert_int_equal(mkdir(TEST_ZTOP, 0700), 0);
+    for (int f = 0; f < 5; f++) {
+        char a[256], b[256], content[64];
+        snprintf(a, sizeof(a), "%s/file%02d.txt", TEST_ZSRC, f);
+        snprintf(b, sizeof(b), "%s/file%02d.txt", TEST_ZTOP, f);
+        snprintf(content, sizeof(content), "zfs-like file %d", f);
+        write_file(a, content);
+        assert_int_equal(link(a, b), 0);
+    }
+    struct stat ss;
+    assert_int_equal(stat(TEST_ZSRC, &ss), 0);
+    assert_int_equal(chmod(TEST_ZTOP, ss.st_mode & 07777), 0);
+    const struct timespec tm[2] = { ss.st_atim, ss.st_mtim };
+    assert_int_equal(utimensat(AT_FDCWD, TEST_ZTOP, tm, 0), 0);
+
+    const char *paths[] = { TEST_ZSRC };
+    const char *reads[] = { TEST_SNAP };
+    scratch_ancestors_t before, after;
+    scratch_ancestors_read(TEST_ZSRC, &before);
+    backup_opts_t live = opts_for(paths, NULL);
+    backup_result_t r0, r1;
+    assert_int_equal(backup_run(store, db, repo_id, &live, &r0), OK);
+
+    assert_int_equal(mount("overlay", TEST_SNAP, "overlay", MS_RDONLY,
+                           "lowerdir=" TEST_ZTOP ":" TEST_ZSRC), 0);
+    mounted = 1;
+    struct stat ms;
+    assert_int_equal(stat(TEST_SNAP, &ms), 0);
+    assert_true(ms.st_dev != ss.st_dev);
+    assert_true(ms.st_ino != ss.st_ino);
+    assert_true(ms.st_size == ss.st_size);
+    assert_true(ms.st_mtim.tv_sec == ss.st_mtim.tv_sec && ms.st_mtim.tv_nsec == ss.st_mtim.tv_nsec);
+    assert_true(ino_of(TEST_SNAP "/file03.txt") == ino_of(TEST_ZSRC "/file03.txt"));
+    backup_opts_t snap = opts_for(paths, reads);
+    assert_int_equal(backup_run(store, db, repo_id, &snap, &r1), OK);
+    snap_umount();
+    scratch_ancestors_read(TEST_ZSRC, &after);
+
+    assert_int_equal(zsrc_tree_versions(), 1);
+    assert_int_equal(r1.objects_new, 0);
+    assert_int_equal(r1.files_unchanged, r1.files);
+    if (!scratch_ancestors_moved(&before, &after))
+        assert_int_equal(r1.trees_new, 0);
+    backup_result_free(&r0);
+    backup_result_free(&r1);
 }
 
 /* Hard links read through the snapshot: one identity, one primary, and the
@@ -546,6 +636,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_absent_record_root_uses_device_zero, setup, teardown),
         cmocka_unit_test_setup_teardown(test_excludes_on_record, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_reads_match_live, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_snapshot_root_with_a_new_inode_matches_live,
+                                        setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_hardlinks, setup, teardown),
         cmocka_unit_test_setup_teardown(test_changed_file_is_reread, setup, teardown),
         cmocka_unit_test_setup_teardown(test_nested_mount_keeps_its_device, setup, teardown),

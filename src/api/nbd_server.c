@@ -193,7 +193,10 @@ static int open_reader(conn_t *c)
     uint64_t size = 0;
     status_t st = c->s->o.ops.open(c->s->o.ops.ctx, &c->reader, &size);
     if (st != OK) {
-        log_warn("nbd export: cannot open the snapshot's disk: %s", err_msg());
+        /* A limit refusing a connection is not a disk that cannot be
+         * opened, and its message already says which key (NIT-57). */
+        if (st == ERR_BUSY) log_warn("nbd %s", err_msg());
+        else log_warn("nbd export: cannot open the snapshot's disk: %s", err_msg());
         c->reader = NULL;
         return st == ERR_BUSY ? -2 : -1;
     }

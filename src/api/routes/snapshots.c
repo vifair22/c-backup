@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "db_readers.h"
 #include "sync_latch.h"
 #include "pack_presence.h"
 
@@ -24,6 +25,10 @@
 #include "json_row.h"
 #include "node_queries.h"
 #include "node_gen.h"
+/* Raw cJSON for the retention guard's list (B295), whose source paths need
+ * escaping. */
+#define CUTILS_CJSON_ALLOW
+#include "cJSON.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -322,19 +327,21 @@ static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
     snprintf(lim,  sizeof(lim),  "%d", limit);
     snprintf(off,  sizeof(off),  "%d", offset);
 
-    db_result_t *r = NULL;
-    if (db_execute(g_ctx.db,
+    /* On a reader (B273): on the shared connection the listing queued
+     * behind every COMMIT a running backup made. */
+    db_rows_t *r = NULL;
+    if (db_read_rows(g_ctx.db, 0,
             "SELECT id, ts, label, file_count, total_size, nodes_materialized,"
             "       gfs_flags"
             "  FROM snapshots WHERE repo_id = ?"
             " ORDER BY id DESC LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r) != 0) {
-        db_result_free(r);
+        db_rows_free(r);
         return api_error(500, "cannot list snapshots");
     }
 
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
-    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
+    if (json_resp_new(&resp) != 0) { db_rows_free(r); return api_error(500, "out of memory"); }
     /* Create the array up front. json_resp_array_append_begin makes it
      * lazily on first append, so a query with no rows omitted the key
      * entirely and the response came back as {} - a second shape every
@@ -371,7 +378,7 @@ static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
         if (bad) break;
         json_elem_commit(&e);
     }
-    db_result_free(r);
+    db_rows_free(r);
 
     char *body = NULL; size_t blen = 0;
     if (json_resp_finalize(resp, &body, &blen) != 0)
@@ -932,8 +939,30 @@ static void snap_job_free(void *p)
 static void gfs_report(void *progress_ctx, int dry_run,
                        const gfs_retention_t *ret, const gfs_result_t *gr)
 {
+    /*
+     * The guard (B295): every configured source's newest non-empty
+     * snapshot, and whether only the guard kept it, so a pass that keeps
+     * more than the policy says says why.
+     */
+    char *guards = NULL;
+    {
+        cJSON *arr = cJSON_CreateArray();
+        for (uint32_t i = 0; arr && i < gr->n_guards; i++) {
+            cJSON *o = cJSON_CreateObject();
+            if (!o) break;
+            cJSON_AddStringToObject(o, "source", gr->guards[i].source);
+            cJSON_AddNumberToObject(o, "snapshot_id", gr->guards[i].snap_id);
+            cJSON_AddBoolToObject(o, "held", gr->guards[i].held != 0);
+            cJSON_AddStringToObject(o, "reason", gr->guards[i].held
+                ? "the newest snapshot in which this source is not empty; kept beyond the policy"
+                : "the newest snapshot in which this source is not empty; the policy keeps it");
+            cJSON_AddItemToArray(arr, o);
+        }
+        guards = arr ? cJSON_PrintUnformatted(arr) : NULL;
+        cJSON_Delete(arr);
+    }
     /* 11 bytes per id covers ten digits and a comma. */
-    size_t cap = 320 + (size_t)gr->pruned * 11;
+    size_t cap = 320 + (size_t)gr->pruned * 11 + (guards ? strlen(guards) : 0);
     char *js = malloc(cap);
     if (js) {
         size_t off = (size_t)snprintf(js, cap, "{\"dry_run\":%s,\"%s\":[",
@@ -945,9 +974,11 @@ static void gfs_report(void *progress_ctx, int dry_run,
             snprintf(js + off, cap - off,
                      "],\"count\":%u,\"retention\":{\"keep_snaps\":%d,"
                      "\"keep_daily\":%d,\"keep_weekly\":%d,"
-                     "\"keep_monthly\":%d,\"keep_yearly\":%d}}",
+                     "\"keep_monthly\":%d,\"keep_yearly\":%d},"
+                     "\"kept_for_sources\":%s}",
                      gr->pruned, ret->keep_snaps, ret->keep_daily,
-                     ret->keep_weekly, ret->keep_monthly, ret->keep_yearly);
+                     ret->keep_weekly, ret->keep_monthly, ret->keep_yearly,
+                     guards ? guards : "[]");
         job_set_result(progress_ctx, js);
         free(js);
     }
@@ -965,8 +996,15 @@ static void gfs_report(void *progress_ctx, int dry_run,
             off += (size_t)snprintf(msg + off, sizeof(msg) - off, "%s %u",
                                     i ? "," : "", gr->ids[i]);
         if (gr->pruned > shown && off < sizeof(msg))
-            snprintf(msg + off, sizeof(msg) - off, " and %u more", gr->pruned - shown);
+            off += (size_t)snprintf(msg + off, sizeof(msg) - off, " and %u more",
+                                    gr->pruned - shown);
     }
+    for (uint32_t i = 0; i < gr->n_guards && off < sizeof(msg); i++)
+        if (gr->guards[i].held)
+            off += (size_t)snprintf(msg + off, sizeof(msg) - off,
+                                    "; kept snapshot %u, the newest in which %s is not empty",
+                                    gr->guards[i].snap_id, gr->guards[i].source);
+    free(guards);
     job_set_summary(progress_ctx, msg);
 }
 
@@ -1560,7 +1598,7 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
          * unit's, each with its own head that is never pruned and its own
          * policy - the unit's unit_policy rows over the repository's.
          */
-        gfs_result_t gr = { 0, NULL };
+        gfs_result_t gr = { 0 };
         st = gfs_run_group(store, j->db, j->repo_id, &ret, NULL, j->dry_run, 1, &gr);
         db_result_t *groups = NULL;
         if (st == OK && db_execute(j->db,
@@ -1570,7 +1608,7 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         for (int g = 0; st == OK && groups && g < groups->nrows; g++) {
             gfs_retention_t ur = ret;
             routes_unit_policy(j->db, j->repo_id, groups->rows[g][0], &ur);
-            gfs_result_t one = { 0, NULL };
+            gfs_result_t one = { 0 };
             st = gfs_run_group(store, j->db, j->repo_id, &ur, groups->rows[g][0],
                                j->dry_run, 1, &one);
             if (st == OK && one.pruned) {

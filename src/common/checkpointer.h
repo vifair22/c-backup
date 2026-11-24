@@ -154,6 +154,9 @@ typedef struct {
      * batch for a second and held the lock for 5 ms read as a 1 s hold. */
     uint64_t      lock_wait_ns;     /* time locked rounds waited for the lock */
     uint64_t      max_lock_wait_ns; /* the longest single wait */
+    /* Locked rounds that gave up waiting for a pooled read and copied
+     * without holding the readers out (B274). */
+    unsigned long quiesce_misses;
 } checkpointer_stats_t;
 
 /*

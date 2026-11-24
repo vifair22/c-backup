@@ -93,6 +93,77 @@ static status_t find_cb(void *ctx, const char *id, const char *name, int state)
     return OK;
 }
 
+/* The units a lookup probes, collected first: list_units is not re-entered
+ * from its own callback. */
+typedef struct { char (*ids)[SP_UNIT_ID_MAX]; size_t n; int over; } ids_t;
+
+static status_t collect_cb(void *ctx, const char *id, const char *name, int state)
+{
+    (void)name; (void)state;
+    ids_t *v = ctx;
+    if (v->n == UNIT_LOOKUP_PROBE_MAX) { v->over = 1; return OK; }
+    snprintf(v->ids[v->n++], SP_UNIT_ID_MAX, "%s", id);
+    return OK;
+}
+
+/* Whether any container of a probe answers to host on its networks: its
+ * name, a network alias, or its compose service (all among the aliases,
+ * docker_backend.c probe_member). */
+static int probe_answers(const sp_unit_probe_t *p, const char *host)
+{
+    for (size_t i = 0; p && i < p->n; i++) {
+        if (strcmp(p->v[i].name, host) == 0) return 1;
+        for (size_t k = 0; k < p->v[i].n_aliases; k++)
+            if (strcmp(p->v[i].aliases[k], host) == 0) return 1;
+    }
+    return 0;
+}
+
+/* A literal address (IPv4 digits and dots, or anything with a ':') names no
+ * unit, and is not worth a probe of every one. */
+static int host_is_address(const char *h)
+{
+    return strchr(h, ':') != NULL || strspn(h, "0123456789.") == strlen(h);
+}
+
+/*
+ * B279: a name only the containers know, a compose service or a network
+ * alias in another unit ("db" in compose:dbstack, whose container is
+ * dbstack-db-1), is not a unit id or name, so the list alone missed it.
+ * Each listed unit is probed (units.probe, read-only) and matched on what
+ * its containers answer to. Only an unambiguous answer counts: two units
+ * that both answer (two compose projects each with a service "db") would
+ * be a guess, and is left unresolved with the reason logged.
+ */
+static int lookup_by_probe(const sp_provider_ops_t *ops, sp_ctx_t *pctx, const char *prov,
+                           const char *host, char *key, size_t sz)
+{
+    if (!ops->unit_probe || host_is_address(host)) return 0;
+    ids_t v = { calloc(UNIT_LOOKUP_PROBE_MAX, SP_UNIT_ID_MAX), 0, 0 };
+    if (!v.ids) return 0;
+    char hit[SP_UNIT_ID_MAX] = "";
+    unsigned hits = 0;
+    if (ops->list_units(pctx, collect_cb, &v) == OK) {
+        for (size_t i = 0; i < v.n && hits < 2; i++) {
+            sp_unit_probe_t *p = NULL;
+            if (ops->unit_probe(pctx, v.ids[i], &p) != OK) { err_clear(); continue; }
+            if (probe_answers(p, host) && hits++ == 0) snprintf(hit, sizeof(hit), "%s", v.ids[i]);
+            sp_unit_probe_free(p);
+        }
+    }
+    err_clear();
+    if (v.over)
+        log_debug("units: %s: more than %u units on %s; only the first were probed for it",
+                  host, (unsigned)UNIT_LOOKUP_PROBE_MAX, prov);
+    free(v.ids);
+    if (hits > 1)
+        log_info("units: %s answers in more than one unit of %s; a Nextcloud naming it is left "
+                 "unresolved rather than guessed", host, prov);
+    if (hits != 1) return 0;
+    unit_key_format(key, sz, prov, hit);
+    return 1;
+}
+
 int unit_detect_lookup_host(void *ctx, const char *host, char *key, size_t sz)
 {
     const char *prov = ctx;
@@ -111,7 +182,7 @@ int unit_detect_lookup_host(void *ctx, const char *host, char *key, size_t sz)
         err_clear();
         return 0;
     }
-    if (!f.hit) return 0;
+    if (!f.hit) return lookup_by_probe(ops, pctx, prov, host, key, sz);
     unit_key_format(key, sz, prov, f.id);
     return 1;
 }

@@ -105,6 +105,9 @@ typedef struct {
     /* Not parsed: the session the connection's hello named, set by the
      * server for every request on it ("" for none). */
     char        conn_session[HELPER_TOKEN_HEX + 1];
+    /* Not parsed either: the connection it came on, -1 for none; a
+     * capture.begin watches it for the daemon giving up (B278). */
+    int         conn_fd;
     /* units.list */
     char        provider[16];
     /* unit, units */

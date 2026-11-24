@@ -271,7 +271,7 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
                  gfs_result_t *out) {
-    if (out) { out->pruned = 0; out->ids = NULL; }
+    if (out) memset(out, 0, sizeof(*out));
     if (new_snap_id == 0) return OK;
     return gfs_group(store, db, repo_id, policy, NULL, new_snap_id, dry_run, quiet, out);
 }
@@ -279,7 +279,7 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 status_t gfs_run_group(store_t *store, cutils_db_t *db, int64_t repo_id,
                        const gfs_retention_t *policy, const char *group,
                        int dry_run, int quiet, gfs_result_t *out) {
-    if (out) { out->pruned = 0; out->ids = NULL; }
+    if (out) memset(out, 0, sizeof(*out));
     /* A snapshot nothing can classify must not be judged by any group's
      * calendar: its group is never pruned. */
     if (group && strncmp(group, "unknown:", 8) == 0) {
@@ -296,7 +296,7 @@ static status_t gfs_group(store_t *store, cutils_db_t *db, int64_t repo_id,
                           gfs_result_t *out) {
     /* Empty before any early return, so a caller can always report and
      * free it. */
-    if (out) { out->pruned = 0; out->ids = NULL; }
+    if (out) memset(out, 0, sizeof(*out));
 
     gfs_snap_info_t *snaps = NULL;
     uint32_t n = 0;
@@ -446,12 +446,41 @@ static status_t gfs_group(store_t *store, cutils_db_t *db, int64_t repo_id,
     uint32_t window_from = n > snap_window ? n - snap_window : 0;
     uint32_t pruned_snaps = 0;
 
+    /*
+     * The file group's guard (B295): each configured source keeps the
+     * newest snapshot in which it is not empty, so a run of empty backups
+     * of a share that was not mounted can never push the last good one
+     * out, however many there are. Read from the repository's trees, so a
+     * reindex does not lose it; at most one extra snapshot per source.
+     */
+    source_guard_t *guards = NULL;
+    uint32_t n_guards = 0;
+    if (!group) {
+        uint32_t *gids = calloc(n, sizeof(*gids));
+        if (!gids) st = set_error(ERR_NOMEM, "gfs_run: alloc guard ids failed");
+        for (uint32_t i = 0; gids && i < n; i++) gids[i] = snaps[i].id;
+        if (st == OK) st = source_guard_find(store, db, repo_id, gids, n, &guards, &n_guards);
+        free(gids);
+        if (st != OK) {
+            free(ids); free(tier_expired); free(orig_flags); free(snaps);
+            return st;
+        }
+    }
+
     for (uint32_t i = 0; i < n; i++) {
         uint32_t id = snaps[i].id;
         if (id == new_snap_id)                            continue;
         if (snaps[i].gfs_flags != 0 && !tier_expired[i]) continue;
         if (i >= window_from)                             continue;
         if (snaps[i].preserved)                           continue;
+        int guarded = 0;
+        for (uint32_t g = 0; g < n_guards; g++)
+            if (guards[g].snap_id == id) { guards[g].held = 1; guarded = 1; }
+        if (guarded) {
+            if (!quiet || dry_run)
+                log_info("gfs: keeping snapshot %u, the newest in which a source is not empty", id);
+            continue;
+        }
 
         if (dry_run) {
             log_info("gfs: would remove snapshot %u", id);
@@ -478,7 +507,14 @@ static status_t gfs_group(store_t *store, cutils_db_t *db, int64_t repo_id,
     free(orig_flags);
     free(snaps);
 
-    if (out) { out->pruned = pruned_snaps; out->ids = ids; }
+    if (out) {
+        out->pruned = pruned_snaps;
+        out->ids = ids;
+        out->guards = guards;
+        out->n_guards = n_guards;
+    } else {
+        source_guards_free(guards, n_guards);
+    }
 
     return st;
 }
@@ -488,4 +524,7 @@ void gfs_result_free(gfs_result_t *r) {
     free(r->ids);
     r->ids = NULL;
     r->pruned = 0;
+    source_guards_free(r->guards, r->n_guards);
+    r->guards = NULL;
+    r->n_guards = 0;
 }

@@ -192,6 +192,13 @@ export const SUGGESTIONS: Record<DbSuggestion, { title: string; tradeoff: string
     title: 'Group the units',
     tradeoff: 'captured together as one instant; every grouped unit pauses together',
   },
+  /* db-detection.md 14: offered for a Nextcloud unit, as the fix when it
+   * is read live and as optional when it is crash-consistent. It showed as
+   * its raw template name (NIT-53). */
+  'nextcloud-maintenance': {
+    title: 'Nextcloud maintenance mode',
+    tradeoff: 'application-consistent: maintenance mode for the capture; Nextcloud is offline meanwhile',
+  },
 }
 
 export function suggestionTitle(s: string): string {

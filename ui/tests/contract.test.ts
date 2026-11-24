@@ -255,7 +255,7 @@ const SAMPLES: Record<ApiKind, ApiRequest> = {
  * string of nothing but digits is what that looked like. Hex fields are the
  * exception: a hash prefix or a short key id can be all decimal digits.
  */
-const HEX_FIELDS = new Set(['prefix', 'hash', 'old_hash', 'new_hash', 'key', 'key_id', 'token'])
+const HEX_FIELDS = new Set(['prefix', 'hash', 'old_hash', 'new_hash', 'key', 'key_id', 'token', 'daemon_id'])
 
 function quotedNumbers(v: unknown, path = ''): string[] {
   if (Array.isArray(v)) return v.flatMap((x, i) => quotedNumbers(x, `${path}[${i}]`))

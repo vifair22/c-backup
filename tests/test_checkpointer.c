@@ -544,6 +544,72 @@ static void test_pooled_readers_never_pin_the_wal(void **state)
     assert_int_equal(bad, 0);
 }
 
+/* One lookup that holds its pooled connection for the test hold. */
+static void *slow_lookup_main(void *arg)
+{
+    atomic_int *done = arg;
+    uint64_t c[6];
+    (void)db_readers_locate(1, "00", c);
+    atomic_store(done, 1);
+    return NULL;
+}
+
+/*
+ * B274: the locked round quiesced the pooled readers under the write lock
+ * and waited for every read already running, so one slow pooled read held
+ * every writer for as long as it took. The wait is bounded now: a read that
+ * outlasts it is left running, the round copies without the readers held,
+ * and the miss is counted.
+ */
+static void test_a_slow_pooled_read_does_not_hold_the_locked_round(void **state)
+{
+    (void)state;
+    assert_int_equal(db_exec_raw(db,
+        "CREATE TABLE packs (repo_id INTEGER, id INTEGER, version INTEGER,"
+        " PRIMARY KEY (repo_id, id));"
+        " CREATE TABLE pack_objects (repo_id INTEGER, hash BLOB, pack_id INTEGER,"
+        " offset INTEGER, comp_size INTEGER, orig_size INTEGER, entry_index INTEGER,"
+        " PRIMARY KEY (repo_id, hash));"), 0);
+    for (int i = 0; i < 20; i++) assert_int_equal(commit_rows(20), 0);
+    assert_int_equal(db_readers_open(TEST_DB, 2), OK);
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    checkpointer_set_test_idle(1);
+    checkpointer_stats_t s0;
+    checkpointer_stats(&s0);
+
+    /* A read that holds its connection for 3 s, as one on a stalled device
+     * does. */
+    db_readers_set_test_hold_us(3000000);
+    atomic_int done = 0;
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, slow_lookup_main, &done), 0);
+    sleep_ms(200);
+    db_readers_set_test_hold_us(0);
+    assert_int_equal(atomic_load(&done), 0);
+
+    uint64_t t0 = now_ms();
+    (void)checkpointer_force();
+    uint64_t round_ms = now_ms() - t0;
+    int read_still_running = !atomic_load(&done);
+    checkpointer_stats_t s1;
+    checkpointer_stats(&s1);
+    pthread_join(th, NULL);
+
+    /* Without the reader in the way, the next round holds them and copies
+     * everything. */
+    assert_int_equal(commit_rows(5), 0);
+    assert_int_equal(checkpointer_force(), OK);
+    checkpointer_stats_t s2;
+    checkpointer_stats(&s2);
+    fprintf(stderr, "B274: round with a 3 s pooled read in flight held %llu ms; "
+            "misses %lu -> %lu -> %lu\n", (unsigned long long)round_ms,
+            s0.quiesce_misses, s1.quiesce_misses, s2.quiesce_misses);
+    assert_true(read_still_running);
+    assert_true(round_ms < 1500);
+    assert_int_equal(s1.quiesce_misses, s0.quiesce_misses + 1);
+    assert_int_equal(s2.quiesce_misses, s1.quiesce_misses);
+}
+
 /* A request reading through the shared connection, over and over: the API
  * polled by a client, the scheduler's look at what is due. */
 typedef struct { atomic_int stop; unsigned long reads; atomic_ullong max_ms; } shared_reader_t;
@@ -1110,6 +1176,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_only_bulk_writers_wait_at_the_hard_cap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pinned_reader_holds_nobody_up, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pooled_readers_never_pin_the_wal, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_slow_pooled_read_does_not_hold_the_locked_round,
+                                        setup, teardown),
         cmocka_unit_test_setup_teardown(test_reads_on_the_shared_connection_do_not_pin_the_wal,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_locked_round_does_not_hold_shared_reads,

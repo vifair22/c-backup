@@ -117,8 +117,9 @@ static status_t cr_open(void *ctx, void **reader, uint64_t *size)
     *reader = NULL;
     if (atomic_fetch_add(&g_conns, 1) >= g_max_conns) {
         atomic_fetch_sub(&g_conns, 1);
-        return set_error(ERR_BUSY, "export %lld: %u connections are open across every export, "
-                         "the limit (vm.export_max_conns)", (long long)e->id, g_max_conns);
+        return set_error(ERR_BUSY, "export %lld: connection refused: vm.export_max_conns is %u "
+                         "and that many are open across every export; close one or raise "
+                         "vm.export_max_conns", (long long)e->id, g_max_conns);
     }
     conn_reader_t *c = calloc(1, sizeof(*c));
     if (!c) { atomic_fetch_sub(&g_conns, 1); return set_error(ERR_NOMEM, "export reader"); }

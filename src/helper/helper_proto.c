@@ -414,6 +414,7 @@ helper_err_t helper_request_parse(const void *buf, size_t len, helper_req_t *req
                                   char *why, size_t wsz)
 {
     memset(req, 0, sizeof(*req));
+    req->conn_fd = -1;
     why[0] = '\0';
     if (!buf || len == 0 || len > HELPER_PACKET_MAX) {
         snprintf(why, wsz, "a request is one JSON object of 1 to 65536 bytes");

@@ -126,6 +126,22 @@ void db_readers_quiesce(void);
 void db_readers_resume(void);
 
 /*
+ * db_readers_quiesce, waiting at most max_ms (0: without a bound) for the
+ * reads already running. 1 with every pooled connection held, to be let go
+ * with db_readers_resume; 0 when a read outlasted the budget, with nothing
+ * held and the gate open again, and no resume to call.
+ *
+ * The checkpointer quiesces under the write lock, so an unbounded quiesce
+ * made every writer wait for the slowest pooled read in flight (B274). The
+ * locked round now gives them a budget and, when one misses it, runs its
+ * copy without them: that copy stops at the slow reader's mark and the WAL
+ * does not restart that round, which the next one makes up. Only after
+ * several misses in a row does a round wait without a bound, so a pooled
+ * read that is always slow cannot keep the WAL from restarting (B201).
+ */
+int db_readers_quiesce_for(unsigned max_ms);
+
+/*
  * Pooled connections caught inside a read transaction between lookups
  * (a statement not reset, or autocommit off), each logged. Every lookup
  * resets its statement before it lets its slot go, so this is 0; anything
