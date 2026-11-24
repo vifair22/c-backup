@@ -349,7 +349,10 @@ static void test_one_baseline_migration(void **state)
     /* A replicate's registered destination, for /jobs?repo= (B283). */
     assert_non_null(app_migrations[15].name);
     assert_string_equal(app_migrations[15].name, "017_job_dest_repo.sql");
-    assert_null(app_migrations[16].name);
+    /* Per-source counts for the drop check (B295). */
+    assert_non_null(app_migrations[16].name);
+    assert_string_equal(app_migrations[16].name, "018_snapshot_sources.sql");
+    assert_null(app_migrations[17].name);
 
     /* A database written before the baseline already has its tables, so
      * opening it fails rather than running on a schema it does not know. */

@@ -12,6 +12,7 @@
 #include "cdc.h"
 #include "db_detect.h"
 #include "error.h"
+#include "source_check.h"
 #include "store.h"
 
 #include <cutils/db.h>
@@ -175,6 +176,16 @@ typedef struct {
      * NULL changes nothing. The caller owns it and calls db_detect_finish.
      */
     db_detector_t       *detect;
+
+    /*
+     * Sources that came back empty or much smaller (B295, source_check.h).
+     * A file backup's roots are always checked for being empty; a root
+     * holding more than this per cent fewer files or bytes than the newest
+     * earlier snapshot that held something from it is flagged too. 0 turns
+     * the drop check off (the route passes backup.source_drop_pct, 50 by
+     * default). Unit snapshots are not checked.
+     */
+    int                  source_drop_pct;
 } backup_opts_t;
 
 /* One file the backup left out, and why. */
@@ -262,6 +273,12 @@ typedef struct {
     uint64_t       changed_unsettled;
     char         **unsettled;
     uint32_t       unsettled_listed;
+    /*
+     * Each source root of a file backup, counted and judged (B295,
+     * source_check.h), in backup order, with the warning for those
+     * flagged; empty for a unit snapshot. backup_result_free releases it.
+     */
+    source_findings_t sources;
 } backup_result_t;
 
 /*

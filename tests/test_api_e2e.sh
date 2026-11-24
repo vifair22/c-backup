@@ -575,9 +575,9 @@ case "$POL" in *keep_hourly*|*auto_pack*) bad "an unknown key is not stored" "ab
                *) ok "an unknown key is not stored" ;; esac
 
 # B040: the defaults list every key in force where a repository has not set
-# it, which with auto_pack gone is exactly the retention keys.
-check "policy defaults are the retention keys" \
-    '"defaults":[{"key":"retention.keep_snaps","value":1},{"key":"retention.keep_daily","value":7},{"key":"retention.keep_weekly","value":4},{"key":"retention.keep_monthly","value":12},{"key":"retention.keep_yearly","value":3}]}' \
+# it: the retention keys, then the source drop threshold (B295).
+check "policy defaults are the retention keys and the drop threshold" \
+    '"defaults":[{"key":"retention.keep_snaps","value":1},{"key":"retention.keep_daily","value":7},{"key":"retention.keep_weekly","value":4},{"key":"retention.keep_monthly","value":12},{"key":"retention.keep_yearly","value":3},{"key":"backup.source_drop_pct","value":50}]}' \
     "$(sock_body /repos/1/policy | sed -n 's/.*\("defaults":.*\)/\1/p')"
 
 # B008: values are typed, so the PUT takes them as the GET serves them.
@@ -2275,6 +2275,81 @@ fi
 # A clean backup alerts nobody: the label backup above skipped nothing.
 check "a clean backup sends no warning" 0 \
     "$(grep -c "warning notification for job $LJ" "$R/daemon.log")"
+
+echo "empty and shrinking sources (B295)"
+# FS2 backed up a stub NFS mountpoint, an empty directory, every day, and
+# every job said completed. Now an empty source completes with a warning
+# naming it, alerted and journalled; a source that shrinks past
+# backup.source_drop_pct (50 by default) does the same; and retention
+# keeps the newest snapshot in which each configured source held anything.
+mkdir -p "$R/s295/full" "$R/s295/stub"
+for i in 1 2 3 4 5 6 7 8 9 10; do echo "$i" > "$R/s295/full/f$i"; done
+RID=$(sock_post /repos "{\"path\":\"$R/repo295\",\"label\":\"b295\"}" | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
+contains "the sources are set" ' 200' \
+    "$(sock_send PUT "/repos/$RID/sources" "{\"sources\":[\"$R/s295/full\",\"$R/s295/stub\"]}")"
+EJ=$(job_id "$(sock_post "/repos/$RID/backup")")
+wait_job "$EJ"
+EBODY=$(sock_body "/jobs/$EJ")
+contains "a backup with an empty source completes" '"state":"completed"' "$EBODY"
+contains "with a warning naming the source" \
+    "\"warning\":\"warning: source $R/s295/stub is empty: snapshot 1 holds nothing from it\"" "$EBODY"
+contains "and the result lists every source as found" \
+    "\"sources\":[{\"path\":\"$R/s295/full\",\"entries\":10,\"files\":10,\"bytes\":21,\"state\":\"ok\"},{\"path\":\"$R/s295/stub\",\"entries\":0,\"files\":0,\"bytes\":0,\"state\":\"empty\"}]" \
+    "$EBODY"
+contains "the journal records it as a warning" \
+    "\"operation\":\"backup\",\"result\":\"warning\"" "$(sock_body "/repos/$RID/journal?limit=1")"
+WLINE="warning notification for job $EJ not sent, Pushover is not configured: "
+for _ in $(seq 1 100); do
+    grep -q "$WLINE" "$R/daemon.log" && break
+    sleep 0.1
+done
+contains "and the warning alert fires, naming the source" \
+    "completed with a warning: source $R/s295/stub is empty" \
+    "$(grep -A1 "$WLINE" "$R/daemon.log")"
+
+# Seven of ten files gone: 70% fewer, past the default 50.
+rm -f "$R/s295/full/f"[1-7]
+echo back > "$R/s295/stub/a"
+DJ=$(job_id "$(sock_post "/repos/$RID/backup")")
+wait_job "$DJ"
+DBODY=$(sock_body "/jobs/$DJ")
+contains "a sharp drop warns, naming the source and the counts" \
+    "source $R/s295/full shrank since snapshot 1: 3 files (7 B) from 10 (21 B), 70% fewer files" \
+    "$DBODY"
+contains "and marks it dropped" "\"state\":\"dropped\",\"compared_with\":1,\"previous_files\":10" "$DBODY"
+
+# The repository's own threshold: 0 to 100, and 0 turns the check off.
+check "a threshold over 100 is refused" \
+    '{"error":"backup.source_drop_pct must be a whole number from 0 to 100"} 400' \
+    "$(sock_send PUT "/repos/$RID/policy" '{"key":"backup.source_drop_pct","value":101}')"
+check "0 is accepted" '{"ok":true} 200' \
+    "$(sock_send PUT "/repos/$RID/policy" '{"key":"backup.source_drop_pct","value":0}')"
+contains "and reads back typed" '"key":"backup.source_drop_pct","value":0' \
+    "$(sock_body "/repos/$RID/policy")"
+rm -f "$R/s295/full/f8" "$R/s295/full/f9"
+OJ=$(job_id "$(sock_post "/repos/$RID/backup")")
+wait_job "$OJ"
+OBODY=$(sock_body "/jobs/$OJ")
+contains "with the check off, two thirds fewer is not flagged" \
+    "{\"path\":\"$R/s295/full\",\"entries\":1,\"files\":1,\"bytes\":3,\"state\":\"ok\"}" "$OBODY"
+case "$OBODY" in *'"warning"'*) bad "and the job carries no warning" "none" "$OBODY" ;;
+                 *) ok "and the job carries no warning" ;; esac
+
+# Two empty nights of the full source. keep_snaps is 2 and every snapshot
+# is from today, so the policy keeps 4 and 5; snapshot 3 is the newest in
+# which the source held anything, and retention keeps it and says why.
+rm -f "$R/s295/full/f10"
+for _ in 1 2; do wait_job "$(job_id "$(sock_post "/repos/$RID/backup")")"; done
+GJ=$(job_id "$(sock_post "/repos/$RID/gfs?dry_run=1")")
+wait_job "$GJ"
+GBODY=$(sock_body "/jobs/$GJ")
+contains "retention keeps the last non-empty snapshot of each source" \
+    '"would_remove":[1,2],"count":2,' "$GBODY"
+contains "and says why, for the one only the guard kept" \
+    "{\"source\":\"$R/s295/full\",\"snapshot_id\":3,\"held\":true,\"reason\":\"the newest snapshot in which this source is not empty; kept beyond the policy\"}" \
+    "$GBODY"
+contains "and for the one the policy keeps anyway" \
+    "{\"source\":\"$R/s295/stub\",\"snapshot_id\":5,\"held\":false," "$GBODY"
 
 # A backup schedule carries its label, checked when it is made.
 SCH=$(sock_send POST /repos/1/schedules \

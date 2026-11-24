@@ -653,6 +653,11 @@ int main(int argc, char *argv[])
         /* Range-checked to 0..APP_MAX_STORE_WORKERS during config init. */
         int sw = config_get_int(cfg, "backup.store_workers", 0);
         routes_backup_set_store_workers(sw > 0 ? (unsigned)sw : 0u);
+        /* Range-checked to 0..100 during config init. */
+        int dp = config_get_int(cfg, "backup.source_drop_pct", SOURCE_DROP_PCT_DEFAULT);
+        routes_backup_set_source_drop_pct(dp);
+        if (dp != SOURCE_DROP_PCT_DEFAULT)
+            log_info("backup.source_drop_pct: %d%s", dp, dp == 0 ? " (drop check off)" : "");
         if (sw > 0)
             log_info("backup.store_workers: %d", sw);
         if (mode != FILE_CACHE_MATCH_AUTO)

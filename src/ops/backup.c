@@ -7,18 +7,15 @@
 #include "read_budget.h"
 
 #include "file_cache.h"
-#include "cdc.h"
 #include "chunklist.h"
 #include "manifest.h"
 #include "object.h"
-#include "scan.h"
 #include "store_index.h"
 #include "pack_presence.h"
 #include "store_pool.h"
 #include "small_files.h"
 #include "settle.h"
 #include "open_scanned.h"
-#include "read_budget.h"
 #include "db_txn.h"
 #include "phase_timer.h"
 #include "pack.h"
@@ -44,7 +41,6 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
-#include <time.h>
 #include <unistd.h>
 
 /*
@@ -262,6 +258,7 @@ void backup_result_free(backup_result_t *r)
     free(r->unsettled);
     r->unsettled = NULL;
     r->unsettled_listed = 0;
+    source_findings_free(&r->sources);
 }
 
 /*
@@ -2794,6 +2791,17 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         }
     }
     phase_add_excl(&timers, PHASE_SNAPSHOT, _tsr, _tsrn);
+
+    /*
+     * Each source root, counted and judged against its own history (B295):
+     * a stub mountpoint backed up as an empty directory every day completed
+     * every time and nothing said so. After the snapshot row, since the
+     * judgement is advisory and must never fail a backup that stored
+     * everything; the warning goes out on the job (backup_routes.c).
+     */
+    if (st == OK) source_check_backup(db, repo_id, snap_id, scan, opts->paths,
+                                      opts->unit_snapshot ? 0 : opts->n_paths,
+                                      opts->source_drop_pct, &res.sources);
 
     /* Paths the scan no longer sees keep their cache rows otherwise, and the
      * cache would grow for every file that ever existed under this repo.
