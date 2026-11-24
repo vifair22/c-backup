@@ -9,6 +9,7 @@
 #include "object.h"
 #include "chunklist.h"
 #include "read_budget.h"
+#include "restore_prefetch.h"
 #include "util.h"
 
 #include <cutils/log.h>
@@ -30,6 +31,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -387,6 +389,28 @@ static const char *parent_reason(int err)
     return strerror(err);
 }
 
+/*
+ * Where a restore's time goes, logged at its end: the content's loads and
+ * writes (content_io_times_t), the metadata applied to each file, and the
+ * batch syncs and renames. Restore had no profile, so its cost on a
+ * deployment could only be argued about; this is the restore's counterpart
+ * of backup's phase report, and as cheap: a clock pair per object and per
+ * file. One restore per thread at a time, so a thread-local is enough.
+ */
+typedef struct {
+    content_io_times_t io;
+    uint64_t meta_ns, sync_ns, syncs, rename_ns;
+} restore_prof_t;
+
+static _Thread_local restore_prof_t *restore_prof;
+
+static uint64_t prof_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 static void set_times_at(int pfd, const char *leaf, const char *shown, int64_t mtime_ns)
 {
     struct timespec times[2];
@@ -684,17 +708,20 @@ typedef struct {
     uint64_t base, total;     /* bytes finished before this file, and all */
     uint64_t size, written;   /* this file */
     uint64_t index, count;    /* entry being restored, for the count */
+    restore_prefetch_t *rp;   /* read-ahead, told as content is written */
 } restore_io_t;
 
 static void restore_bytes(uint64_t bytes, void *ctx)
 {
     restore_io_t *io = ctx;
+    restore_prefetch_wrote(io->rp, bytes);
     io->written += bytes;
     if (io->written > io->size) io->written = io->size;
     if (io->opts->bytes_cb)
         io->opts->bytes_cb(io->opts->progress_ctx, io->base + io->written, io->total);
     report(io->opts, "restore", io->index, io->count);
 }
+
 
 /*
  * Every node's path, built from the rows the restore has already read.
@@ -798,6 +825,42 @@ static status_t pt_rel(path_table_t *pt, int i, char *out, size_t outsz, int dep
     }
     if (w < 0 || (size_t)w >= outsz) return set_error(ERR_IO, "restore: path too long");
     return OK;
+}
+
+/*
+ * Which rows the read-ahead (restore_prefetch.h) should fetch: the regular
+ * files with content that this run would restore, judged the way the main
+ * loop judges them as far as is cheap - in scope, and nothing at the path
+ * already, since an existing file is skipped or kept and never read. Its
+ * own directory cache, so it never disturbs the main loop's.
+ */
+typedef struct {
+    const db_result_t     *r;
+    path_table_t          *pt;
+    const restore_opts_t  *opts;
+    dir_cache_t            dirs;
+} prefetch_ctx_t;
+
+static int prefetch_target(void *vctx, int row, uint8_t hash[OBJECT_HASH_SIZE],
+                           uint64_t *size)
+{
+    prefetch_ctx_t *c = vctx;
+    const char *const *rw = (const char *const *)c->r->rows[row];
+    if ((uint32_t)strtoul(rw[8], NULL, 10) != NODE_TYPE_REG) return 0;
+    if (!rw[7][0] || hash_is_zero_hex(rw[7])) return 0;
+    char rel[PATH_MAX];
+    if (pt_rel(c->pt, row, rel, sizeof(rel), 0) != OK) { err_clear(); return 0; }
+    if (c->opts->subpath && !path_within(rel, c->opts->subpath)) return 0;
+    if (strip_rel(rel, c->opts)) return 0;
+    if (!c->opts->overwrite) {
+        const char *leaf;
+        struct stat sb;
+        int pfd = dest_parent(&c->dirs, rel, &leaf, 0);
+        if (pfd != -1 && fstatat(pfd, leaf, &sb, AT_SYMLINK_NOFOLLOW) == 0) return 0;
+    }
+    hex_to_hash(rw[7], hash);
+    *size = strtoull(rw[6], NULL, 10);
+    return 1;
 }
 
 /*
@@ -971,11 +1034,13 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
      * it has its name: the resume rule relies on the mtime being right.
      * Through the fd: the file is never looked up by name again. */
     if (st == OK) {
+        uint64_t t0 = prof_now();
         meta_target_t t = { fd, NULL, 0, full };
         clear_acls(&t, 0);
         apply_metadata_fd(fd, full, mode, uid, gid, mtime);
         apply_xattrs(store, &t, xhash);
         apply_acls(store, &t, ahash, 0);
+        if (restore_prof) restore_prof->meta_ns += prof_now() - t0;
     }
     if (close(fd) != 0 && st == OK) {
         st = set_error_errno(ERR_IO, "restore: cannot close %s", full);
@@ -1040,8 +1105,10 @@ static void batch_flush(rename_batch_t *b, restore_result_t *res)
     int synced = 0;
     const char *leaf;
     int pfd = dest_parent(&b->dirs, b->items[0].rel, &leaf, 0);
+    uint64_t t0 = prof_now();
     if (pfd != -1) {
         synced = syncfs(pfd) == 0;
+        if (restore_prof) { restore_prof->sync_ns += prof_now() - t0; restore_prof->syncs++; }
         if (!synced)
             log_warn("restore: cannot sync %u restored file(s) to disk: %s",
                      b->n, strerror(errno));
@@ -1049,6 +1116,7 @@ static void batch_flush(rename_batch_t *b, restore_result_t *res)
         log_warn("restore: cannot open the directory of %s to sync it: %s",
                  b->items[0].full, strerror(errno));
     }
+    uint64_t t1 = prof_now();
     for (uint32_t i = 0; i < b->n; i++) {
         pending_file_t *p = &b->items[i];
         pfd = dest_parent(&b->dirs, p->rel, &leaf, 0);
@@ -1076,6 +1144,7 @@ static void batch_flush(rename_batch_t *b, restore_result_t *res)
         free(p->tmp);
         free(p->full);
     }
+    if (restore_prof) restore_prof->rename_ns += prof_now() - t1;
     b->n = 0;
     b->bytes = 0;
 }
@@ -1388,6 +1457,18 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         return set_error(ERR_NOMEM, "restore: directory sweep map");
     }
     dir_cache_init(&batch->dirs, dest_fd);
+
+    /* Without it (no memory) the restore is the same, only slower. */
+    prefetch_ctx_t pctx = { r, &paths, opts, { -1, -1, "" } };
+    dir_cache_init(&pctx.dirs, dest_fd);
+    restore_prefetch_t *rp = restore_prefetch_new(store, r->nrows, prefetch_target, &pctx);
+    restore_prof_t prof;
+    memset(&prof, 0, sizeof(prof));
+    restore_prof_t *prev_prof = restore_prof;
+    content_io_times_t *prev_io_times = content_io_times;
+    restore_prof = &prof;
+    content_io_times = &prof.io;
+    uint64_t prof_t0 = prof_now();
 
     for (int i = 0; i < r->nrows && st == OK; i++) {
         if (cancelled(opts)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
@@ -1773,12 +1854,14 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         char     tmp[NAME_MAX + 1];
         err_clear();    /* so a reason below cannot be left over from before */
         restore_io_t io = { opts, bytes_done, bytes_total, nsize, 0,
-                            matched - 1, work_total };
+                            matched - 1, work_total, rp };
         store_io_fn prev_io;
         void *prev_io_ctx;
         store_get_io_progress(store, &prev_io, &prev_io_ctx);
-        if (opts->bytes_cb || opts->progress_cb)
-            store_set_io_progress(store, restore_bytes, &io);
+        /* Always: the read-ahead moves with the bytes written, progress
+         * reporting or not. */
+        store_set_io_progress(store, restore_bytes, &io);
+        restore_prefetch_at(rp, i);
         int dest_err = 0;
         status_t lst = restore_file(store, chash, pfd, full, nsize, mode, uid, gid,
                                     mtime, xhash, ahash, tmp, sizeof(tmp), &sz, &dest_err);
@@ -1839,6 +1922,26 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
     }
     /* Whatever verified before a stop is still worth keeping. */
     batch_flush(batch, &res);
+    {
+        uint64_t hints = 0, hinted = 0;
+        restore_prefetch_counts(rp, &hints, &hinted);
+        double wall = (double)(prof_now() - prof_t0) / 1e9;
+        double load = (double)prof.io.load_ns / 1e9, wr = (double)prof.io.write_ns / 1e9;
+        double meta = (double)prof.meta_ns / 1e9, sy = (double)prof.sync_ns / 1e9;
+        double rn = (double)prof.rename_ns / 1e9;
+        log_info("restore: profile %.2f s: load %.2f s (%llu objects), write %.2f s "
+                 "(%llu), metadata %.2f s, sync %.2f s (%llu syncfs), rename %.2f s, "
+                 "elsewhere %.2f s; read-ahead %llu hints for %.1f MiB",
+                 wall, load, (unsigned long long)prof.io.loads, wr,
+                 (unsigned long long)prof.io.writes, meta, sy,
+                 (unsigned long long)prof.syncs, rn,
+                 wall - load - wr - meta - sy - rn,
+                 (unsigned long long)hints, (double)hinted / 1048576.0);
+    }
+    restore_prof = prev_prof;
+    content_io_times = prev_io_times;
+    restore_prefetch_free(rp);
+    dir_cache_drop(&pctx.dirs);
     dir_cache_drop(&batch->dirs);
     free(batch);
     free(swept);

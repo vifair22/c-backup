@@ -241,11 +241,23 @@ static ssize_t xget(const char *path, const char *name, void *buf, size_t sz,
     return follow ? getxattr(path, name, buf, sz) : lgetxattr(path, name, buf, sz);
 }
 
-/* shown is the path for messages; path may be a /proc/self/fd one. */
+/*
+ * shown is the path for messages; path may be a /proc/self/fd one.
+ *
+ * *acl_listed says whether the ACL read can be skipped (PERF-ACL-SKIP): 0
+ * when the name list was read and holds no system.posix_acl_* name, or the
+ * filesystem has no extended attributes at all, so it has no POSIX ACL
+ * either and acl_get_file could only synthesise the mode; 1 when an ACL
+ * name is listed, or when the list could not be read and nothing is known.
+ * Skipping saves a getxattr and the stat libacl makes per entry, two of a
+ * clean entry's seven system calls.
+ */
 static status_t collect_xattrs(const char *path, int follow, const char *shown,
-                              uint8_t **out, size_t *out_len) {
+                              uint8_t **out, size_t *out_len, int *acl_listed) {
     *out = NULL; *out_len = 0;
+    *acl_listed = 1;
     ssize_t list_sz_s = xlist(path, NULL, 0, follow);
+    if (list_sz_s == 0 || (list_sz_s < 0 && errno == ENOTSUP)) *acl_listed = 0;
     if (list_sz_s <= 0) return OK;
     size_t list_sz = (size_t)list_sz_s;
 
@@ -254,9 +266,12 @@ static status_t collect_xattrs(const char *path, int follow, const char *shown,
     if (xlist(path, names, list_sz, follow) < 0) { free(names); return set_error_errno(ERR_IO, "listxattr(%s)", shown); }
 
     /* Collect name pointers, dropping the excluded ones, then sort. */
-    size_t attr_count = 0;
-    for (char *n = names; n < names + list_sz; n += strlen(n) + 1)
+    size_t attr_count = 0, acl_names = 0;
+    for (char *n = names; n < names + list_sz; n += strlen(n) + 1) {
         if (!xattr_name_excluded(n)) attr_count++;
+        else acl_names++;
+    }
+    *acl_listed = acl_names > 0;
     if (attr_count == 0) { free(names); return OK; }
 
     const char **attrs = malloc(attr_count * sizeof(*attrs));
@@ -457,10 +472,12 @@ static status_t meta_at(int dirfd, const char *name, const char *path,
         }
     }
 
-    status_t rc = collect_xattrs(use, follow, path, xd, xl);
+    int acl_listed = 1;
+    status_t rc = collect_xattrs(use, follow, path, xd, xl, &acl_listed);
     /* No ACL for symlinks: acl_get_file follows the link, so what it returns
-     * is the target's ACL wearing the symlink's name. */
-    if (rc == OK && type != NODE_TYPE_SYMLINK) {
+     * is the target's ACL wearing the symlink's name. None either where the
+     * name list shows the file has none (collect_xattrs). */
+    if (rc == OK && type != NODE_TYPE_SYMLINK && acl_listed) {
         rc = collect_acl(use, type == NODE_TYPE_DIR, ad, al);
         if (rc != OK) {
             free(*xd);

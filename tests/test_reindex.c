@@ -140,6 +140,33 @@ static void backup_once(void)
     assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
 }
 
+/* A gap's chunk-list pass reads its own snapshot's rows only (B264): the
+ * statement it ran for both cases, with "?2 <= 0 OR snap_id = ?2", was
+ * planned as a walk of every node row by repo_id. */
+static void test_gap_list_pass_is_keyed_by_its_snapshot(void **state)
+{
+    (void)state;
+    backup_once();
+    backup_once();
+    char sql[2048], repo[32];
+    snprintf(sql, sizeof(sql), "EXPLAIN QUERY PLAN %s", reindex_snap_lists_sql);
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, sql, (const char *[]){ repo, "2", NULL }, &r), 0);
+    assert_non_null(r);
+    int keyed = 0;
+    for (int i = 0; i < r->nrows; i++) {
+        const char *d = r->rows[i][r->ncols - 1];
+        size_t dl = strlen(d);
+        if (strstr(d, "SCAN n") || (dl >= 11 && strcmp(d + dl - 11, "(repo_id=?)") == 0))
+            fail_msg("the gap's list pass walks the repository: %s", d);
+        if (strstr(d, "SEARCH n USING INDEX nodes_by_snap_parent (repo_id=? AND snap_id=?)"))
+            keyed = 1;
+    }
+    db_result_free(r);
+    assert_true(keyed);
+}
+
 /* ---------- B043 ---------- */
 
 /*
@@ -970,6 +997,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_record_at_the_label_limit_is_exact_on_disk,
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_refuses_a_bad_label, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gap_list_pass_is_keyed_by_its_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_reads_long_records_and_signed_times,
                                         setup, teardown),
     };

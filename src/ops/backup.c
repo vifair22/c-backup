@@ -27,7 +27,7 @@
 #include "tree_build.h"
 #include "reserved.h"
 #include "db_write.h"
-#include "node_gen.h"
+#include "node_index.h"
 #include "msg_clip.h"
 
 #include <cutils/log.h>
@@ -58,21 +58,6 @@
  * child hash is known, so the only workable order is deepest-first.
  */
 
-typedef struct {
-    uint64_t node_id;         /* scan-assigned, never written into a tree */
-    uint64_t parent_id;
-    uint32_t scan_index;
-    uint8_t  tree_hash[OBJECT_HASH_SIZE];   /* directories only */
-    int      hash_ready;
-    /* A regular file the store could not read, or that never settled. It
-     * is left out of the trees and the index entirely; see skip_file. */
-    int      skipped;
-    /* Stored although it never settled (OWN-45-LIVE): flagged in the tree,
-     * and given no file cache row, so the next backup reads it again. */
-    int      unsettled;
-    /* opts->synth index + 1 for a synthetic entry, else 0. */
-    size_t   synth;
-} node_link_t;
 
 /*
  * Hashes already ensured present this run. Open addressing over full 32-byte
@@ -341,21 +326,6 @@ static void note_unsettled(pipeline_t *p, uint32_t i)
     r->unsettled[r->unsettled_listed++] = path;
 }
 
-/*
- * The stat the file cache keys an entry on: its own, except that a snapshot
- * read's entry carries the record root's live device in place of the
- * snapshot's (scan.h, rec_dev). The rows a snapshot read writes then match
- * a live read of the same files and the reverse, and the device is still
- * compared, so a row from another filesystem is never trusted (B229).
- */
-static const struct stat *cache_key_stat(const scan_entry_t *e, struct stat *buf)
-{
-    if (!e->dev_remapped) return &e->st;
-    *buf = e->st;
-    buf->st_dev = e->rec_dev;
-    return buf;
-}
-
 /* The cache row for a stored file, unless it never settled. */
 static void cache_put(pipeline_t *p, uint32_t i)
 {
@@ -363,8 +333,10 @@ static void cache_put(pipeline_t *p, uint32_t i)
     scan_entry_t *e = &p->scan->entries[i];
     uint64_t _tp = phase_now();
     struct stat kst;
-    file_cache_put(p->db, p->repo_id, e->path, cache_key_stat(e, &kst),
-                   e->node.content_hash, p->cache_stamp);
+    /* Provisional while other writers share the run's claims (B293): see
+     * file_cache_confirm_run, after the last pack commit. */
+    file_cache_put(p->db, p->repo_id, e->path, file_cache_key_stat(e, &kst),
+                   e->node.content_hash, p->claims ? -p->cache_stamp : p->cache_stamp);
     phase_add(p->timers, PHASE_CACHE_PUT, _tp);
 }
 
@@ -554,13 +526,6 @@ static void store_bytes(uint64_t bytes, void *ctx)
     /* Called per read, so a writer that queues while a large file is being
      * read waits for one read rather than for the file. */
     batch_yield(p, &p->batch);
-}
-
-/* The last path component; what the entry is called inside its parent. */
-static const char *basename_of(const char *path)
-{
-    const char *slash = strrchr(path, '/');
-    return slash ? slash + 1 : path;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1843,7 +1808,7 @@ static status_t store_content_loop(pipeline_t *p)
         /* Read through a filesystem snapshot: a new device number every
          * time, the same inodes and times (source-providers.md 4.3). An
          * entry on the snapshot's own device is compared on the record
-         * root's live device (cache_key_stat); one on another device inside
+         * root's live device (file_cache_key_stat); one on another device inside
          * the snapshot (a nested mount, whose number is the capture's too)
          * is matched without its device, on inode, size and both times.
          * Whether the live device can be compared is the record root's
@@ -1851,7 +1816,7 @@ static status_t store_content_loop(pipeline_t *p)
          * mount, so there it is not. */
         const char *rpath = e->read_path ? e->read_path : e->path;
         struct stat kst;
-        const struct stat *key = cache_key_stat(e, &kst);
+        const struct stat *key = file_cache_key_stat(e, &kst);
         unsigned ignore = cache_ignore_for(p, rpath, &e->st) |
                           (e->read_path && !e->dev_remapped ? FILE_CACHE_IGNORE_DEV : 0u) |
                           (e->dev_remapped ? cache_ignore_for(p, e->path, key) & FILE_CACHE_IGNORE_DEV : 0u);
@@ -2143,12 +2108,6 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
 /* Phase 3: snapshot record + index                                    */
 /* ------------------------------------------------------------------ */
 
-static int hash_is_zero(const uint8_t h[OBJECT_HASH_SIZE])
-{
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) if (h[i]) return 0;
-    return 1;
-}
-
 static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
 {
     static const char *d = "0123456789abcdef";
@@ -2296,208 +2255,12 @@ static status_t write_snapshot_record(store_t *store, int64_t snap_id,
     return OK;
 }
 
+/* The snapshot's node rows; node_index.c has the rules they follow. */
 static status_t index_nodes(pipeline_t *p, int64_t snap_id)
 {
-    char repo[32], snap[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)p->repo_id);
-    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-
-    /*
-     * Node ids are unique per repository, and there are two things that
-     * allocate them: this, from the scan's own numbering, and reindex, from
-     * MAX(id) in the table. They disagreed, and the insert below was INSERT
-     * OR REPLACE, so a backup after a reindex quietly overwrote an older
-     * snapshot's rows with its own - that snapshot kept nodes_materialized=1
-     * and had nothing left to browse or restore. The manifest trees were
-     * fine, so nothing was lost that a reindex could not rebuild, and nothing
-     * said a word.
-     *
-     * Starting past whatever the repository already holds makes the two
-     * agree. They are an index artifact: nothing in the repo refers to them,
-     * which is what lets the database be rebuilt without preserving them.
-     */
-    uint64_t id_base = 0;
-    {
-        db_result_t *r = NULL;
-        if (db_execute(p->db, "SELECT COALESCE(MAX(id), 0) FROM nodes WHERE repo_id = ?",
-                       (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
-            id_base = strtoull(r->rows[0][0], NULL, 10);
-        db_result_free(r);
-    }
-
-    /*
-     * Committed in batches, for the same reason store_content is.
-     *
-     * This used to be one transaction spanning every node and its FTS row -
-     * 1.2M inserts on a 622,000-file tree, minutes of wall clock. That was
-     * survivable while writers raced, because a writer that could not begin
-     * failed instead of waiting. Now they queue behind the write lock, and a
-     * lock held for minutes would block every tag, note, policy and sources
-     * write for the length of a backup: a worse bug than the one it replaced.
-     *
-     * Splitting it is safe here. The authoritative snapshot record is already
-     * in the repository, written by write_snapshot_record before this runs,
-     * and the snapshots row that marks nodes_materialized is not inserted
-     * until every batch has landed. An interrupted run therefore leaves node
-     * rows that no snapshot claims - index garbage a reindex rebuilds, which
-     * is the state eviction already produces deliberately.
-     *
-     * And it yields to a queued writer by the rule every batch uses
-     * (db_txn_batch_should_end), at every row (B144). It only ended at
-     * NODE_BATCH rows, so a tag or sources write that queued during
-     * indexing waited for up to 2,000 node and FTS inserts: about 80 ms
-     * on an idle host, 700 ms with the CPU contended,
-     * and past the 2 s test bound under disk pressure, against Manual 6.3's
-     * "well under a second". Each extra commit is one more batch boundary of
-     * the kind above, so nothing about nodes_materialized changes.
-     */
-    #define NODE_BATCH 2000
-    /* The rows' generation (node_gen.h), drawn before the first batch so a
-     * failed run burns it, and set ahead of the first row. */
-    int64_t gen = 0;
-    status_t gst = node_gen_alloc(p->db, &gen);
-    if (gst != OK) return gst;
-
-    batch_t nb;
-    memset(&nb, 0, sizeof(nb));
     p->timers->txn_site = PHASE_COMMIT_INDEX;
-    status_t bst = db_txn_begin_bulk(p->db);
-    if (bst != OK) return bst;
-    db_txn_batch_opened(&nb.rule);
-    if (node_gen_set(p->db, p->repo_id, snap_id, gen) != 0) {
-        db_txn_rollback(p->db);
-        return set_error_wrap(ERR_IO, "index_nodes: cannot record the index generation");
-    }
-
-    for (uint32_t i = 0; i < p->count; i++) {
-        /*
-         * The daemon stopping does not wait for the index (B218): on a large
-         * tree it takes minutes, and Docker kills a stop after 10 s. The
-         * record is written, so this is the state a power cut here leaves,
-         * which the caller reports (B195) and the next start's reconcile
-         * indexes. A user's cancel still lets the index finish: the
-         * snapshot is done, and cancelling now would only make it slower to
-         * browse.
-         */
-        if (shutdown_requested(p->opts ? p->opts->cancel : NULL)) {
-            db_txn_rollback(p->db);
-            return set_error(ERR_BUSY, "backup cancelled: the daemon is stopping");
-        }
-        /* In no tree, so in no index row either: the index is derived from
-         * the trees, and a reindex would not bring it back. */
-        if (p->links[i].skipped) continue;
-        scan_entry_t *e = &p->scan->entries[i];
-        const char *name = basename_of(e->path);
-
-        char id[32], parent[32], mode[16], uid[16], gid[16], mtime[32], size[32];
-        /* Both offset, and together: parent_node_id refers to one of these
-         * ids. A root's parent stays 0, which is not an id. */
-        snprintf(id,     sizeof(id),     "%llu",
-                 (unsigned long long)(e->node.node_id + id_base));
-        snprintf(parent, sizeof(parent), "%llu",
-                 (unsigned long long)(p->links[i].parent_id
-                                      ? p->links[i].parent_id + id_base : 0));
-        snprintf(mode,   sizeof(mode),   "%u",   e->node.mode);
-        snprintf(uid,    sizeof(uid),    "%u",   e->node.uid);
-        snprintf(gid,    sizeof(gid),    "%u",   e->node.gid);
-        snprintf(mtime,  sizeof(mtime),  "%lld",
-                 (long long)time_to_ns(e->node.mtime_sec,
-                                       (int64_t)e->node.mtime_nsec));
-        snprintf(size,   sizeof(size),   "%llu", (unsigned long long)e->node.size);
-
-        char chex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(e->node.content_hash, chex);
-        char shex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(p->links[i].tree_hash, shex);
-        char xhex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(e->node.xattr_hash, xhex);
-        char ahex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(e->node.acl_hash, ahex);
-        int is_dir = (e->node.type == NODE_TYPE_DIR);
-
-        char ntype[8];
-        snprintf(ntype, sizeof(ntype), "%u", e->node.type);
-
-        /*
-         * One statement with every column bound, "" standing for absent and
-         * NULLIF turning it back into a real NULL in the row.
-         *
-         * The arity has to be fixed because the params array is
-         * NULL-terminated: a conditional NULL value silently truncates the
-         * list and unbinds every column after it. But the stored value has to
-         * be NULL rather than "", because queries elsewhere ask
-         * "content_hash IS NOT NULL" to mean "this node has content", and an
-         * empty string satisfies that while matching no object.
-         */
-        const char *ltarget = e->symlink_target ? e->symlink_target : "";
-        /*
-         * Signed, deliberately. inode_identity is a 64-bit hash, so about
-         * half of all values exceed INT64_MAX; written as unsigned decimal
-         * SQLite cannot fit them in an INTEGER column and falls back to REAL,
-         * which loses precision and collapses distinct inodes onto the same
-         * value. Restoring then hardlinked unrelated files together. The bit
-         * pattern round-trips through int64 exactly, so signed is lossless.
-         */
-        char hgroup[32];
-        snprintf(hgroup, sizeof(hgroup), "%lld",
-                 (long long)e->node.inode_identity);
-
-        /* Union again: only a device node has a device pair. */
-        int is_dev = (e->node.type == NODE_TYPE_CHR || e->node.type == NODE_TYPE_BLK);
-        char dmaj[16], dmin[16], nflags[8];
-        snprintf(nflags, sizeof(nflags), "%u", (unsigned)e->node.flags);
-        snprintf(dmaj, sizeof(dmaj), "%u", is_dev ? e->node.device.major : 0u);
-        snprintf(dmin, sizeof(dmin), "%u", is_dev ? e->node.device.minor : 0u);
-
-        int rc = db_write(p->db,
-                "INSERT INTO nodes"
-                " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
-                "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
-                "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor,"
-                "  flags)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?,"
-                "         NULLIF(?,''), NULLIF(?,''), ?, ?, ?)",
-                (const char *[]){ repo, id, snap, parent, name, ntype, mode, uid,
-                                  gid, mtime, size,
-                                  /* A symlink or device node has no content
-                                   * object, so its hash is zero. Storing that
-                                   * rather than NULL leaves a row claiming
-                                   * content that matches no object, which is
-                                   * exactly what an index consistency check
-                                   * is looking for. */
-                                  (is_dir || hash_is_zero(e->node.content_hash))
-                          ? "" : chex,
-                                  is_dir ? shex : "",
-                                  ltarget, hgroup,
-                                  hash_is_zero(e->node.xattr_hash) ? "" : xhex,
-                                  hash_is_zero(e->node.acl_hash)   ? "" : ahex,
-                                  dmaj, dmin, nflags, NULL }, NULL);
-        if (rc != 0) {
-            db_txn_rollback(p->db);
-            return set_error_wrap(ERR_IO, "index_nodes: insert failed");
-        }
-
-        if (db_write(p->db,
-                "INSERT INTO node_fts (name, node_id, snap_id, repo_id)"
-                " VALUES (?, ?, ?, ?)",
-                (const char *[]){ name, id, snap, repo, NULL }, NULL) != 0) {
-            db_txn_rollback(p->db);
-            return set_error_wrap(ERR_IO, "index_nodes: fts insert failed");
-        }
-
-        if (++nb.since_commit >= NODE_BATCH || db_txn_batch_should_end(&nb.rule)) {
-            status_t cst = db_txn_commit(p->db);
-            if (cst != OK) return cst;
-            nb.since_commit = 0;
-            cst = db_txn_begin_bulk(p->db);
-            if (cst != OK) return cst;
-            db_txn_batch_opened(&nb.rule);
-        }
-    }
-
-    #undef NODE_BATCH
-    return db_txn_commit(p->db);
+    return node_index_write(p->db, p->repo_id, snap_id, p->scan, p->links, p->count,
+                            p->opts ? p->opts->cancel : NULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2937,6 +2700,9 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         p.pack_w = NULL;
         if (st == OK && staged)
             log_info("backup: staged %u object(s) directly into pack files", staged);
+        /* Every writer of the run has committed: its provisional cache rows
+         * name only content that is all in the repository now (B293). */
+        if (st == OK) file_cache_confirm_run(db, repo_id, p.cache_stamp);
     }
     if (p.pack_w) { pack_backup_abort(p.pack_w); p.pack_w = NULL; }
 

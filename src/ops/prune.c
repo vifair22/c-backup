@@ -159,6 +159,10 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
         failed = db_write(db,
+            "DELETE FROM node_hashes WHERE repo_id = ? AND snap_id = ?",
+            (const char *[]){ repo, snap, NULL }, NULL) != 0;
+    if (!failed)
+        failed = db_write(db,
             "DELETE FROM snapshots WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)

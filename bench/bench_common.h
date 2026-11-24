@@ -27,8 +27,10 @@
 
 #include <cutils/db.h>
 
+#include "db_write.h"
 #include "error.h"
 #include "repo.h"
+#include "repo_key.h"
 #include "state_db.h"
 #include "store.h"
 #include "store_index.h"
@@ -109,6 +111,16 @@ static inline int bench_env_open(bench_env_t *e, const char *dir)
     snprintf(dbp, sizeof(dbp), "%s/state.db", dir);
     snprintf(repop, sizeof(repop), "%s/repo", dir);
 
+    /*
+     * The daemon installs the write guard before it opens state.db
+     * (daemon/main.c), and the guard's update hook is what arms the commit
+     * budget (db_txn.h, B144-REST): without it every batch ran to its own
+     * row cap, so a benchmark measured commits the daemon never makes.
+     * index_nodes on a no-change backup wrote about 2,000 rows a commit
+     * here against the daemon's 256-page budget, which hid that the
+     * daemon's WAL volume is set by that budget (PERF.md, 2026-11-19).
+     */
+    db_txn_guard_install();
     if (db_open(&e->db, dbp) != 0) {
         fprintf(stderr, "bench: cannot open %s\n", dbp);
         return -1;
@@ -154,8 +166,23 @@ static inline int bench_env_open(bench_env_t *e, const char *dir)
     repo_enc_request_t enc;
     memset(&enc, 0, sizeof(enc));
     enc.mode = REPO_ENC_NONE;
+    /*
+     * BENCH_ENCRYPT=1: a system-key repository, as the daemon's deployments
+     * and BENCH M10 run, so decryption is in the profile. The key goes to
+     * DIR/keys and is read back from there.
+     */
+    const char *encv = getenv("BENCH_ENCRYPT");
+    char keyd[480];
+    snprintf(keyd, sizeof(keyd), "%s/keys", dir);
+    if (encv && strcmp(encv, "1") == 0) {
+        enc.mode = REPO_ENC_SYSTEM;
+        enc.mode_given = 1;
+        enc.key_dir = keyd;
+        repo_key_dir_set(keyd);
+        printf("  repository: encrypted (system key)\n");
+    }
     if (repo_register_ex(e->db, repop, "bench", &enc, &e->repo_id) != OK ||
-        repo_store_open(repop, NULL, &e->store) != OK ||
+        repo_store_open_keyed(repop, NULL, &e->store) != OK ||
         store_index_bind(e->store, e->db, e->repo_id, &e->idx) != OK) {
         fprintf(stderr, "bench: repository setup failed: %s\n", err_msg());
         return -1;

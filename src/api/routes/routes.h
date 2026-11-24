@@ -309,6 +309,8 @@ api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_i
                                         const char *hex);
 api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
                                       const char *hex);
+/* The statement introspect_object_refs runs, for tests to read its plan. */
+extern const char *const introspect_refs_sql;
 api_response_t introspect_object_layout(const api_request_t *req, int64_t repo_id,
                                         const char *hex);
 api_response_t introspect_object_content(const api_request_t *req, int64_t repo_id,

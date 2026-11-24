@@ -6,6 +6,83 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-19 - Verify and lookups against snapshot count; ACL read skip
+
+`bench_verify -n 10000 -L 1,10,50,100 index structure` (new `--at-snaps`:
+one repository, measured as its history reaches each count; 40 files a
+directory, 10% churn per snapshot), on a private tmpfs. Before is v3 with
+the bench added; after is fix/perf-d2-nochange with node_hashes and
+node_content.
+
+| snapshots | 1 | 10 | 50 | 100 |
+|---|---:|---:|---:|---:|
+| index verify, us/entry, before | 5.80 | 6.33 | 6.47 | 7.74 |
+| index verify, us/entry, after | 5.73 | 6.14 | (noisy) | 6.75 |
+| structure verify, us/entry, before | 9.07 | 11.48 | 12.81 | 13.48 |
+| structure verify, us/entry, after | 8.60 | 9.05 | (noisy) | 9.73 |
+| contentless rule, us/non-file object, before | 1.90 | 2.16 | 1.94 | 2.36 |
+| contentless rule, node_hashes alone | 2.04 | 7.01 | 36.81 | 129.62 |
+| contentless rule, with node_content | 1.87 | 1.82 | (noisy) | 1.79 |
+| object refs, per lookup, before | 2.5 ms | 36 ms | 620 ms | 4.69 s |
+| object refs, per lookup, after | 99 us | 181 us | 507 us | 532 us |
+
+node_hashes alone brought back B268's growth in the contentless rule (one
+probe per snapshot for every non-file object); node_content, the set of
+hashes any node names, puts it back to one probe per object. Object
+references were already broken on v3: the planner served the page from
+nodes_by_snap_parent by repo_id and seeded the path climb by walking an
+index by repo_id, so every lookup read every node row (CROSS JOIN fix).
+verify's chunk-list pass also walked the node rows; it is now driven from
+the type-6 objects. The 50-snapshot row of the after run was 2x on every
+column including fixed-cost ones, so it was a contended machine, not the
+code.
+
+ACL read skip (PERF-ACL-SKIP), `bench_phases -n 15000 -I 2` with the
+prof_shim counters, no-change incremental: getxattr 17,004 -> 0, fstatat
+33,006 -> 16,002 (the stat libacl makes), scan phase 61 ms -> 38 ms.
+
+## 2026-11-19 - No-change backup WAL: node_hashes (BENCH M10 D2)
+
+BENCH M10 on FS2: a no-change backup of D2 (95,979 files, 6,286 dirs) took
+18.2 s median against kopia's 1.4 s, burning ~13 s of CPU (9-10 s sys) and
+writing 0.8-1.1 GB to the device with no repository bytes.
+
+`bench_phases -n N -s 1024 -l 0 -t 0 -D 15 -I 3 -R` on a private tmpfs, so
+every number is a CPU or byte count, not a device time. WAL frames were
+attributed to b-trees by reading the frame headers and mapping page numbers
+through `dbstat`. Two corrections to the harness came first: bench_phases
+now installs the write guard before opening state.db, as the daemon does,
+because without its update hook the commit budget (256 pages a commit)
+never armed and every earlier bench ran 2,000-row batches the daemon never
+makes; and `-I N` runs N no-change incrementals with state.db and WAL sizes
+after each.
+
+Before (v3 d52e67d), 15,000 files, ninth snapshot: 24,738 WAL frames
+(97 MiB) for 16,008 node rows, 99 commits. `nodes_by_hash` alone wrote
+21,129 of them, rewriting each of its 2,800 touched pages 7.5 times: a
+hash-ordered index over every snapshot's rows takes a new snapshot's rows at
+random places, and a commit of ~200 rows dirties ~200 pages. Dropping the
+index left 6.5 MiB a snapshot.
+
+After (`node_hashes`, migration 016: keyed (repo, snapshot, hash, node),
+written sorted after the node rows):
+
+| 96,000 files (102,400 rows) | before | after |
+|---|---:|---:|
+| WAL per no-change backup | 653 / 661 / 675 MiB | 60 / 56 / 57 MiB |
+| commits per no-change backup | 694 / 704 / 713 | 162 / 161 / 160 |
+| txn-commit (tmpfs) | 0.77 / 0.46 / 0.48 s | 0.16 / 0.13 / 0.14 s |
+| wall (tmpfs) | 2.70 / 2.36 / 2.43 s | 2.08 / 2.00 / 2.05 s |
+| first backup WAL | 2,449 MiB | 1,993 MiB |
+
+The database itself grows the same ~325 bytes per file per unchanged
+snapshot either way (nodes 129, node_hashes or nodes_by_hash 78, FTS 73,
+nodes_by_snap_parent 30, nodes key 14): the same pairs, now written
+sequentially. That growth is the per-snapshot node index, not this bug.
+`tests/test_backup_e2e.c` holds the frames per row of a no-change backup
+under a fixed frame cost: 1.05 before, 0.12 after. The FS2 confirmation run
+is requested separately.
+
 ## 2026-11-19 - Verify against index size (B268)
 
 `make bench-verify` (`bench/verify.c`): tiny files of unique content, 40 to

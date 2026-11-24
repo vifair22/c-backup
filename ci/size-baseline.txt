@@ -3,6 +3,5 @@
 # See ci/size_check.py for how lines are counted.
 2421 src/helper/docker_backend.c
 2467 src/helper/helper_server.c
-2076 src/ops/backup.c
 3970 src/store/pack.c
 2695 tests/test_powercut_fault.c
