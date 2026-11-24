@@ -666,7 +666,12 @@ What a capture of one unit does, in order:
    policy lists it (never a parent dataset), or a btrfs pool root. A mount
    in no domain is read live and the unit's level is `inconsistent`.
 3. Pre hooks run through `docker exec` (`lxc-attach` for LXC), live, one
-   at a time; `on_fail = fail` fails the unit before anything is held.
+   at a time; `on_fail = fail` fails the unit before anything is held. A
+   job cancelled meanwhile closes the daemon's connection, which the
+   helper watches for the length of the begin: the running hook is
+   stopped (SIGTERM to its group, SIGKILL 3 s later) and the unit fails
+   whatever its `on_fail`, with nothing held (B278). Post hooks are never
+   stopped, since they undo the pre hooks.
 4. Docker: a pause only when it adds something, which under `pause = auto`
    means more than one snapshot instant (several pools, several btrfs
    domains); `pause_always` units always; never the helper or daemon

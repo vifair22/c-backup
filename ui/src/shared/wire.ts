@@ -293,7 +293,7 @@ export type DbMethod = 'snapshot' | 'paused-read' | 'live-read'
 export type DbSuggestion =
   | 'pg-dumpall' | 'mariadb-dump' | 'redis-rdb' | 'mongodump' | 'sqlite-backup'
   | 'influx2-backup' | 'prometheus-snapshot' | 'exclude-rebuild' | 'pause-always'
-  | 'source-snapshot' | 'group-units'
+  | 'source-snapshot' | 'group-units' | 'nextcloud-maintenance'
 
 export type DbState = 'new' | 'suggested' | 'enabled' | 'dismissed'
 

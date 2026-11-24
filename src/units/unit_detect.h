@@ -44,9 +44,14 @@ void unit_detect_reread(db_detector_t *d, const char *const *rec, const char *co
 
 /*
  * db_unit_lookup_fn over a provider's unit list: ctx is the provider's
- * name. A unit whose id or name is host, as "<provider>:<unit id>". A list
- * that fails is no answer, logged at debug.
+ * name. A unit whose id or name is host, as "<provider>:<unit id>"; failing
+ * that, the one unit whose probe has a container answering to host (its
+ * name, a network alias or its compose service, B279), at most
+ * UNIT_LOOKUP_PROBE_MAX units probed, and none for a literal address. Two
+ * units answering is no answer. A list that fails is no answer, logged at
+ * debug.
  */
+#define UNIT_LOOKUP_PROBE_MAX 128
 int unit_detect_lookup_host(void *ctx, const char *host, char *key, size_t sz);
 
 typedef struct {

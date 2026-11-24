@@ -169,6 +169,11 @@ typedef struct { uint32_t left; int rc; uint64_t t_locked; } locked_arg_t;
 #define CKPT_THROTTLE_MAX_NS (2000ull * 1000000ull)   /* and never wait longer */
 #define CKPT_BLOCKED_NS      (1000ull * 1000000ull)   /* after a copy that could not finish */
 #define CKPT_LOCK_BUDGET_NS (200ull * 1000000ull)
+/* How long a locked round waits for pooled reads already running before it
+ * copies without holding the readers out, and how many rounds in a row may
+ * do that before one waits for them however long they take (B274). */
+#define CKPT_QUIESCE_MS        100u
+#define CKPT_QUIESCE_MISS_MAX  4u
 
 /*
  * The WAL restart itself, done here rather than by whoever writes next
@@ -286,8 +291,17 @@ static status_t locked_passive(void *arg)
     locked_arg_t *a = arg;
     a->t_locked = now_ns();
     /* With the pooled readers held out, none pins an old read mark: the
-     * copy runs to the end and the restart lands (db_readers.h, B201). */
-    db_readers_quiesce();
+     * copy runs to the end and the restart lands (db_readers.h, B201). The
+     * wait for them is bounded, since every writer waits with this round
+     * (B274); after CKPT_QUIESCE_MISS_MAX misses in a row it is not. */
+    static unsigned misses;     /* under the write lock, as every locked round is */
+    int held = db_readers_quiesce_for(misses >= CKPT_QUIESCE_MISS_MAX ? 0 : CKPT_QUIESCE_MS);
+    misses = held ? 0 : misses + 1;
+    if (!held) {
+        pthread_mutex_lock(&g_mu);
+        g_stats.quiesce_misses++;
+        pthread_mutex_unlock(&g_mu);
+    }
     for (int i = 0; i < CKPT_LOCKED_ROUNDS; i++) {
         a->rc = passive(&a->left);
         if (a->rc != 0) break;
@@ -297,7 +311,7 @@ static status_t locked_passive(void *arg)
             break;
         }
     }
-    db_readers_resume();
+    if (held) db_readers_resume();
     return OK;
 }
 

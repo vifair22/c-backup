@@ -2034,9 +2034,12 @@ static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
         }
     }
 
-    char repo[32], sched[32];
+    char repo[32], sched[32], dest[32] = "";
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(sched, sizeof(sched), "%lld", (long long)schedule_id);
+    /* The second member of the set, a replicate's destination, is recorded
+     * so the job lists under that repository too (B283). */
+    if (nrepos > 1) snprintf(dest, sizeof(dest), "%lld", (long long)repos[1]);
 
     /*
      * Two statements rather than a NULL in the parameter list for an API
@@ -2056,16 +2059,18 @@ static status_t submit_slot(job_manager_t *jm, int64_t repo_id, job_lock_t lock,
     int rc;
     if (schedule_id > 0)
         rc = db_write_returning(jm->db,
-            "INSERT INTO jobs (repo_id, action, params, state, origin, schedule_id)"
-            " VALUES (NULLIF(?, ''), ?, ?, 'queued', 'schedule', ?) RETURNING id",
+            "INSERT INTO jobs (repo_id, action, params, state, origin, schedule_id,"
+            "                  dest_repo_id)"
+            " VALUES (NULLIF(?, ''), ?, ?, 'queued', 'schedule', ?, NULLIF(?, ''))"
+            " RETURNING id",
             (const char *[]){ repo_id > 0 ? repo : "", action,
-                              params_json ? params_json : "", sched, NULL }, &r);
+                              params_json ? params_json : "", sched, dest, NULL }, &r);
     else
         rc = db_write_returning(jm->db,
-            "INSERT INTO jobs (repo_id, action, params, state, origin)"
-            " VALUES (NULLIF(?, ''), ?, ?, 'queued', ?) RETURNING id",
+            "INSERT INTO jobs (repo_id, action, params, state, origin, dest_repo_id)"
+            " VALUES (NULLIF(?, ''), ?, ?, 'queued', ?, NULLIF(?, '')) RETURNING id",
             (const char *[]){ repo_id > 0 ? repo : "", action,
-                              params_json ? params_json : "", origin, NULL }, &r);
+                              params_json ? params_json : "", origin, dest, NULL }, &r);
     int64_t job_id = 0;
     if (rc == 0 && r && r->nrows == 1)
         job_id = strtoll(r->rows[0][0], NULL, 10);
