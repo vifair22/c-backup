@@ -658,11 +658,13 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
         char *src_json = full ? sources_json(&res) : NULL;
         if (src_json) {
             size_t fl = strlen(full);
-            char *grown = (fl && full[fl - 1] == '}') ? malloc(fl + strlen(src_json) + 1) : NULL;
+            size_t sl = strlen(src_json);
+            char *grown = (fl && full[fl - 1] == '}') ? malloc(fl + sl + 1) : NULL;
             if (grown) {
                 memcpy(grown, full, fl - 1);
-                strcpy(grown + fl - 1, src_json);
-                strcat(grown, "}");
+                memcpy(grown + fl - 1, src_json, sl);
+                grown[fl - 1 + sl] = '}';
+                grown[fl + sl] = '\0';
                 free(full);
                 full = grown;
             }

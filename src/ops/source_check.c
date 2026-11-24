@@ -183,7 +183,7 @@ static int file_lists_path(const char *file, int field, const char *path)
         size_t n = root_len_of(tok);
         found = strlen(path) == n && strncmp(tok, path, n) == 0;
     }
-    fclose(f);
+    (void)fclose(f);   /* read-only: nothing to lose on close */
     return found;
 }
 
@@ -358,7 +358,7 @@ int source_check_describe(const source_report_t *r, int n, int64_t snap_id, int 
         }
         flagged++;
         int w = snprintf(buf + off, sz - off, "%s%s", off ? "; " : "", one);
-        if (w < 0 || (size_t)w >= sz - off) { off = sz - 1; break; }
+        if (w < 0 || (size_t)w >= sz - off) break;   /* buf holds what fitted */
         off += (size_t)w;
     }
     return flagged;
@@ -464,7 +464,7 @@ static int index_path_state(cutils_db_t *db, const char *repo, const char *snap,
         }
         if (!r || r->nrows != 1) { db_result_free(r); return PATH_ABSENT; }
         snprintf(cur, sizeof(cur), "%s", r->rows[0][0]);
-        is_dir = atoi(r->rows[0][1]) == NODE_TYPE_DIR;
+        is_dir = strtol(r->rows[0][1], NULL, 10) == NODE_TYPE_DIR;
         db_result_free(r);
         p += clen;
         while (*p == '/') p++;
