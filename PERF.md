@@ -6,6 +6,148 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-19 - First backup: where M10's gap to kopia goes
+
+BENCH M10 (FS2: btrfs RAID10 on dm-crypt over four BX500) put c-backup's
+first backup at 76.8 s for D1-local against kopia-zstd's 25.1 s (3.1x) and
+50.1 s for D2 against 10.3 s (4.9x). The two gaps have different causes,
+and neither is the one the device-bytes column first suggests.
+
+### What M10's own columns say
+
+| | c-backup | kopia-zstd | difference |
+|---|---:|---:|---|
+| D1 written, logical (device / 2, RAID10) | 7.07 GB | 6.38 GB | 0.44 GB RS parity, about 0.22 GB LZ4 against zstd, the rest state.db |
+| D1 CPU, user + sys | 97 s | 103 s | none |
+| D1 busy cores (CPU / wall) | 1.3-1.6 | 4.3 | the gap |
+| D2 written, logical | 3.2 GB | 0.40 GB | 0.26 GB packs (parity, LZ4), about 2.6 GB state.db and the filesystem |
+| D2 CPU, user + sys | 39 s | 43 s | none |
+
+D1 is a concurrency problem; D2 is a bytes problem, and the bytes are
+state.db's WAL.
+
+### Method
+
+Nothing timed on a local disk. `bench/first_backup_model.sh` runs a fresh
+daemon and repository on tmpfs with `bench/io_count.c` preloaded, which
+counts bytes and syncs per destination and decodes every WAL frame header,
+so the WAL can be charged to b-trees through dbstat. For D1, the same shim
+paces source reads as a device with a per-stream and a total rate
+(`IOC_STREAM_MBS`, `IOC_DEV_MBS`): 150 MB/s and 660 MB/s, the latter
+kopia's measured D1 read rate, the former a guess that the FS2 request
+(`perf-first-backup-fs2.md`) measures. FS2's planner was reproduced with
+`backup.store_workers: 8` (12 threads: two thirds).
+
+D2 model: `/usr/include`, 38,732 files, 412 MB, page cache warm. D1 model:
+87 files, 128 KiB to 200 MiB log-uniform, 1.84 GB, 40% random and 60% real
+text and binaries.
+
+### D1: files of 1-16 MiB on one thread
+
+Files over one object's bound (16 MiB) went to the file workers, a quarter
+of the chunk workers of them: two on FS2. Every file from 1 MiB to 16 MiB
+was read, cut, hashed, compressed and sealed on the backup thread, without
+even the chunk workers (`sink_begin` hands them only large content). With
+a device that needs several reads in flight:
+
+| Build (8 chunk workers) | File workers | Wall, 3 rounds | cb-job CPU | file-wait |
+|---|---:|---|---:|---:|
+| v3 | 2 | 7.23 / 6.63 / 7.15 s | 0.52 s | 4.8 s |
+| at least 4 file workers | 4 | 4.02 / 3.92 / 3.92 s | | |
+| ... and files over 1 MiB to them | 4 | 3.82 / 3.72 / 3.72 s | | |
+| ... at least 6 | 6 | 3.02 / 3.12 / 3.02 s | 0.02 s | 2.7 s |
+| this branch against its base, rounds 2-3 | 2 / 6 | 6.63 / 6.63 s against 3.02 / 3.02 s | | |
+
+The device's limit for 1.84 GB is 2.8 s. Scaled to D1's 15.24 GB, the v3
+row is 60 s, against M10's 62-133 s (median 76.8); the branch's row is
+25 s. CPU per run is unchanged (3.6-4.2 s user). Without pacing, on tmpfs,
+the same tree takes 0.9 s on 21 chunk workers: the code is not the limit,
+the number of reads in flight is.
+
+### D2: the WAL writes every page 18.6 times
+
+Per backup of the D2 model, v3 (d52e67d):
+
+| Destination | Bytes written | Syncs |
+|---|---:|---|
+| packs (staging, then renamed) | 165 MB (10.7 MB parity) | 1 fsync, 2 directory fsyncs |
+| state.db-wal | 739 MB (358,689 pwrites) | 8 fdatasync |
+| state.db (checkpoints) | 43 MB | 2 fdatasync |
+| snapshots, tmp, ids | 356 B | 6 fsync |
+
+The database ends at 37 MB (9,585 pages); its WAL received 178,615
+frames, in 747 commits of about 240: DB_TXN_COMMIT_PAGES_MAX (256) is the
+cap they meet, and a row whose key is random lands on a page of its own in
+each b-tree it touches. WAL frames by b-tree, each build on the previous:
+
+| b-tree | v3 | node_hashes (fix/perf-d2-nochange) | no staged rows (this branch) |
+|---|---:|---:|---:|
+| objects_by_type | 40,443 | 40,766 | 6,934 |
+| objects (table) | 38,908 | 38,881 | 980 |
+| objects primary key | 33,740 | 33,441 | 1,214 |
+| nodes_by_hash / node_hashes | 29,202 | 1,174 | 1,174 |
+| pack_objects_by_pack | 19,824 | 19,873 | 6,586 |
+| file_cache, both b-trees | 4,737 | 4,760 | 3,004 |
+| pack_objects primary key | 2,439 | 2,452 | 1,214 |
+| total | 179,739 | 148,895 | 27,207 |
+| WAL bytes | 739 MB | 613 MB | 112 MB |
+
+77% of the WAL on node_hashes' base was the objects table and its two
+indexes. Every new object was written twice: first as a 'staged' row in
+the backup's own batches, a random insert into the primary key and into
+objects_by_type, and then by the pack commit, which rewrote the row in
+hash order against rowids assigned in file order. The pack commit already
+creates any row its entries lack, which is all the file workers ever
+relied on; now the backup's own writer relies on it too, and the commit's
+inserts, in hash order, fill each page once.
+
+Tried on the way and not kept: walking the commit in pack-entry order
+(-19% on v3, since the objects table and pack_objects_by_pack go front to
+back, but pack_objects' primary key then goes random), and setting only
+the location in the commit's upsert (-16% more, objects_by_type no longer
+moves). Neither matters once there are no staged rows to update.
+
+What is left is about three frames per database page, near the floor for
+a WAL. Two b-trees still take a frame for most rows, by design:
+
+- objects_by_type keys on (type, phys_size, orig_size) so introspection's
+  per-type sums need no table rows. Keyed on type alone it appends (with
+  pack_objects_by_pack also changed, 13,266 frames, 55 MB); the sums would
+  then read the table, in rowid order. A schema change, not made.
+- pack_objects_by_pack keys on the pack's offsets, which arrive in hash
+  order. Its order serves the paginated pack listing and verify's walk of
+  a pack, so it stays.
+
+The commit cap itself is the multiplier behind all of this: on v3 with the
+cap at 1,024 pages the same run wrote 32,798 frames. It bounds how long a
+bulk commit holds the write lock (B144, B193) and was left alone.
+
+Scaled by files to D2 (95,979): about 1.8 GB of WAL on v3, 1.5 GB with
+node_hashes, 0.28 GB with this branch.
+
+### Syncs
+
+Neither data set is sync-bound by count. D2 model: 10 fdatasyncs on the WAL
+and database (the once-a-second flusher, two at job milestones, the
+checkpointer), 9 fsyncs for the pack, snapshot record and ids. D1 model: per
+pack, one fsync of the file, one of its shard directory and one of
+`packs/`; per 256 MiB pack, about 28 on D1. The `packs/` sync is needed only
+when the shard directory was just created (one pack in 256); skipping it
+otherwise saves one directory fsync per pack, which on D1 is about a
+second at most, and was left alone. wal_sync syncs the WAL's directory
+only once per WAL file. No sync is repeated.
+
+### Per small file (D2 model, v3)
+
+Per file: 1.1 opens on the source (directories included), 2 reads, 2.1
+stdio writes into the pack, 9.3 WAL pwrites (4.6 frames, 19 KB), and rows
+in nodes, node_fts (with its FTS5 shadow tables), file_cache, objects
+(written twice: staged, then at the pack commit) and pack_objects. On tmpfs
+the whole backup takes 1.6 s, 1.47 s of it the backup thread (cb-job),
+0.88 s across four small-file workers: per file, the code costs about
+40 us; on FS2 it is about 520 us, the WAL. With this branch a file's WAL falls
+from 19 KB to 2.9 KB.
+
 ## 2026-11-19 - Verify and lookups against snapshot count; ACL read skip
 
 `bench_verify -n 10000 -L 1,10,50,100 index structure` (new `--at-snaps`:

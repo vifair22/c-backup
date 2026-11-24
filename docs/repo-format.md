@@ -984,12 +984,12 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
    more than one worker.
 5. Index rows. A pack's commit creates the object row of every entry that
    has none (`db_pack_commit` upserts with the entry's type), in the same
-   transaction as the pack's own rows, so no writer races its own seal: a
-   row written after the commit would stay staged, be dropped by the next
-   backup, and leave a chunk compaction reads as dead. File workers write no
-   rows of their own. The backup thread's sink still records a staged row
-   for every object a smaller file meets, new or already present, so an
-   index that lost a chunk's row gets it back.
+   transaction as the pack's own rows and in hash order, so each b-tree
+   page is written about once. No writer records rows for the objects of
+   its own open pack, the backup thread included (`index_row`); they exist
+   from the moment the pack is sealed and committed, and never before.
+   The backup thread still records a row for an object an earlier pack
+   holds, so an index that lost a chunk's row gets it back.
 6. Sealing on the backup thread happens mid-file only when the open pack
    cannot take the file, with the batch let go first (sealing begins a
    transaction and the write lock is not recursive). A file that fits keeps
@@ -1000,8 +1000,8 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
    fragmenting above 256 KiB serialised. The tree phase never seals.
 
 Crash safety is the backup pack's, unchanged: staging in `packs/.staging/`, install by
-rename, rows with or after install, sweep of staging and staged rows at the
-next start. Nothing is written loose and the pack pass finds nothing to do.
+rename, rows only from the pack's commit after install, sweep of staging
+at the next start. Nothing is written loose and the pack pass finds nothing to do.
 
 ### Readers
 

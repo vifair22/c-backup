@@ -275,3 +275,7 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
 /* Release what a result owns. Safe on a zeroed or already-freed result. */
 void backup_result_free(backup_result_t *r);
+
+/* Tests: send files over min_bytes to the file workers, one worker per
+ * per_worker bytes of them at most; 0 restores each default. */
+void backup_test_set_file_pool(uint64_t min_bytes, uint64_t per_worker);

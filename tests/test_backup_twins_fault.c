@@ -188,6 +188,10 @@ static void test_twins_stored_once_counted_once(void **state)
     backup_opts_t o;
     memset(&o, 0, sizeof(o));
     o.n_paths = 1;
+    /* The backup's own writer: files of a few MiB now go to the file
+     * workers when there are workers, whose twins the claims set dedups
+     * (test_cdc_backup.c, test_file_workers_do_not_store_twins_twice). */
+    o.store_workers = 1;
 
     env_t a;
     env_open(&a, "solo");

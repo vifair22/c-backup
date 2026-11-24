@@ -270,9 +270,8 @@ contains "stats"    '"per_type"' "$(cb stats 1)"
 contains "summary"  '"'          "$(cb summary 1)"
 contains "objects"  '"'          "$(cb objects 1 --limit 5)"
 contains "objects filtered by location" '"objects"' "$(cb objects 1 --location packed --limit 5)"
-# Nothing is staged once a backup has sealed its pack, so this is empty.
-contains "empty location filter keeps its key" '"objects":[]' \
-    "$(cb objects 1 --location staged --limit 5)"
+# staged is gone: objects are indexed when their pack is sealed.
+check "objects --location staged fails" 1 "$(cb objects 1 --location staged >/dev/null 2>&1; echo $?)"
 # There are no loose objects; the daemon refuses the old location.
 check "objects --location loose fails" 1 "$(cb objects 1 --location loose >/dev/null 2>&1; echo $?)"
 contains "packs"    '"'          "$(cb packs 1)"
@@ -281,8 +280,7 @@ check "packs on a missing pack fails"      1 "$(cb packs 1 99999 >/dev/null 2>&1
 check "ls on a missing snapshot fails"     1 "$(cb ls 1 99999 >/dev/null 2>&1; echo $?)"
 check "verify show on a missing run fails" 1 "$(cb verify show 1 99999 >/dev/null 2>&1; echo $?)"
 # The B084 audit: routes and parameters with no command or flag.
-contains "stats --scope staged" '"per_type"' "$(cb stats 1 --scope staged)"
-check "stats --scope takes only staged" 1 "$(cb stats 1 --scope packed >/dev/null 2>&1; echo $?)"
+check "stats takes no --scope" 1 "$(cb stats 1 --scope staged >/dev/null 2>&1; echo $?)"
 check "and not loose any more" 1 "$(cb stats 1 --scope loose >/dev/null 2>&1; echo $?)"
 check "jobs --limit pages" 1 "$(cb jobs --limit 1 | grep -o '"action":' | wc -l | tr -d ' ')"
 # A bad offset reaching the daemon's 400 proves the flag is sent at all.
@@ -1075,8 +1073,6 @@ AP_ID=$(cb repo add "$WORK/aprepo" ap | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 check "auto_pack is no longer a policy key" 1 \
     "$(cb policy set "$AP_ID" maintenance.auto_pack false > /dev/null 2>&1; echo $?)"
 cb backup "$AP_ID" "$WORK/apsrc" > /dev/null
-check "nothing is left staged after the backup" 0 \
-    "$(cb objects "$AP_ID" --location staged --limit 100 | grep -o '"hash"' | wc -l | tr -d ' ')"
 check "every object is in a pack, the sparse file's too" 17 \
     "$(cb objects "$AP_ID" --location packed --limit 100 | grep -o '"type":1,' | wc -l | tr -d ' ')"
 cb restore "$AP_ID" 1 "$WORK/apout" > /dev/null
@@ -2069,7 +2065,6 @@ VALUE_SWEEP=(
     "grep|1 pat|--max-hits"
     "grep|1 pat|--max-hits-per-file"
     "verify|1|--level"
-    "stats|1|--scope"
     "objects|1|--location"
     "journal|1|--result"
     "schedule add|1 backup 60|--on-overlap"
@@ -2100,12 +2095,11 @@ check "and the state still did not move" "$STATE_BEFORE" "$(b127_state 2>&1)"
 # NIT-26: a value outside an option's fixed set, and a calendar missing what
 # its period needs or carrying what it would drop. `verify --level bogus`,
 # `objects --location bogus` and `--every day` without --at were sent and
-# refused by the daemon, unlike `stats --scope bogus`.
+# refused by the daemon.
 SWEEP_BAD=0
 CHOICE_SWEEP=(
     "verify|1 --level bogus|option '--level' takes index, structure or deep, not 'bogus'"
-    "objects|1 --location bogus|option '--location' takes staged, packed or all, not 'bogus'"
-    "stats|1 --scope bogus|option '--scope' takes staged, not 'bogus'"
+    "objects|1 --location bogus|option '--location' takes packed or all, not 'bogus'"
     "journal|1 --result bogus|option '--result' takes success, failed, cancelled, warning or alert, not 'bogus'"
     "journal|1 --result completed|option '--result' takes success, failed, cancelled, warning or alert, not 'completed'"
     "repo add|$WORK/sweep --encrypt SYSTEM|option '--encrypt' takes system, passphrase or none"

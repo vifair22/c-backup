@@ -138,7 +138,6 @@ export interface WireSummary {
   phys_size: number
   orig_size: number
   packs: number
-  staged: number
   tags: number
   last_snapshot_ts: number | null
 }

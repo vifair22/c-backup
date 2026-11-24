@@ -686,6 +686,10 @@ static int64_t g_repo_id;
 
 static sp_ctx_t *g_fk;
 static int       g_units;        /* the scenario's world has units */
+/* 1, or more with PC_FILE_WORKERS set: then every backup runs eight chunk
+ * workers and sends every file over 1,000 bytes to the file workers, so
+ * each scenario's packs are written by several writers at once. */
+static unsigned  g_store_workers = 1;
 static char      g_unit_cp[128]; /* u1's checkpoint as the pristine state left it */
 static int       g_unit_ver;     /* what u1 shows now */
 static int64_t   g_unit_job = 1000;
@@ -764,7 +768,7 @@ static status_t unit_backup_job(store_t *st, cutils_db_t *db, int64_t snaps[2], 
     o.pause_scope = g_two ? UNIT_SCOPE_JOB : UNIT_SCOPE_UNIT;
     o.require = SP_CONSIST_INCONSISTENT;
     o.job_id = ++g_unit_job;
-    o.store_workers = 1;
+    o.store_workers = g_store_workers;
     unit_backup_result_t res;
     memset(&res, 0, sizeof(res));
     status_t s = unit_backup_run(st, db, g_repo_id, &o, &res);
@@ -962,7 +966,7 @@ static int64_t backup_into(store_t *st, cutils_db_t *db, int64_t repo_id, int ve
     memset(&o, 0, sizeof(o));
     o.paths = paths;
     o.n_paths = 1;
-    o.store_workers = 1;
+    o.store_workers = g_store_workers;
     backup_result_t br;
     memset(&br, 0, sizeof(br));
     status_t s = backup_run(st, db, repo_id, &o, &br);
@@ -1467,7 +1471,7 @@ static void deep_checks(store_t *st, cutils_db_t *db, const gc_result_t *g)
     memset(&o, 0, sizeof(o));
     o.paths = paths;
     o.n_paths = 1;
-    o.store_workers = 1;
+    o.store_workers = g_store_workers;
     backup_result_t br;
     memset(&br, 0, sizeof(br));
     if (backup_run(st, db, g_repo_id, &o, &br) != OK) {
@@ -1850,13 +1854,14 @@ static status_t op_backup(ctx_t *c, int counting, int ver, int64_t want_id)
     memset(&o, 0, sizeof(o));
     o.paths = paths;
     o.n_paths = 1;
-    o.store_workers = 1;
+    o.store_workers = g_store_workers;
     backup_result_t br;
     memset(&br, 0, sizeof(br));
     store_index_set_pack_batch_rows(2);
     status_t st = backup_run(c->store, c->db, g_repo_id, &o, &br);
     store_index_set_pack_batch_rows(0);
     if (counting && st == OK) assert_int_equal(br.snapshot_id, want_id);
+    if (counting && st == OK && g_store_workers > 1) assert_true(br.file_workers >= 2);
     backup_result_free(&br);
     return st;
 }
@@ -1967,7 +1972,9 @@ static status_t op_gc(ctx_t *c, int counting)
 {
     status_t st = op_gc_run(c);
     if (counting && st == OK) {
-        assert_true(g_gc.packs_rewritten >= 1);
+        /* With file workers each file of backup 1 has a pack of its own,
+         * so none is part live: deleting is all there is to cut. */
+        if (g_store_workers == 1) assert_true(g_gc.packs_rewritten >= 1);
         assert_true(g_gc.packs_deleted >= 1);
     }
     return st;
@@ -3040,6 +3047,10 @@ int main(void)
     /* Thousands of runs of each operation; their own logs say nothing here. */
     if (!getenv("PC_DEBUG")) log_set_level((log_level_t)(LOG_ERROR + 1));
     if (getenv("PC_FILTER")) cmocka_set_test_filter(getenv("PC_FILTER"));
+    if (getenv("PC_FILE_WORKERS")) {
+        g_store_workers = 8;
+        backup_test_set_file_pool(1000, 1);
+    }
     /*
      * The commit budget (B144-REST) splits a batch wherever its rows reach
      * the budget, so every operation here runs with it on and at its floor
