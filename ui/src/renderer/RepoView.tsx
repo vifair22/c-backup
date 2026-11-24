@@ -146,12 +146,9 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
   const compressionRatio = totalUncomp > 0 ? totalComp / totalUncomp : 1
   const spaceSaved = totalUncomp - totalComp
 
-  // Storage bar percentages
-  const stagedBytes = 0 /* the daemon reports staged objects as a count, not bytes */
+  /* Every stored byte is in a pack: a backup's objects are indexed when
+   * their pack is sealed, so there is no staged share to draw. */
   const packBytes = summary?.phys_size ?? 0
-  const totalBytes = summary?.phys_size ?? 1
-  const stagedPct = Math.round((stagedBytes / totalBytes) * 100)
-  const packPct = 100 - stagedPct
 
   const QBtn = ({ onClick, children }: { onClick: () => void; children: React.ReactNode }) => (
     <button onClick={onClick}
@@ -188,12 +185,10 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
           value={fmtSize(summary?.phys_size ?? 0)}
         >
           <div className="flex h-1.5 rounded-full overflow-hidden mt-2 bg-surface-tertiary">
-            {packPct > 0 && <div className="bg-accent" style={{ width: `${packPct}%` }} />}
-            {stagedPct > 0 && <div className="bg-status-warning" style={{ width: `${stagedPct}%` }} />}
+            {packBytes > 0 && <div className="bg-accent" style={{ width: '100%' }} />}
           </div>
           <div className="flex justify-between text-[10px] text-text-muted mt-1">
             <span>Packed {fmtSize(packBytes)}</span>
-            <span>Staged {fmtSize(stagedBytes)}</span>
           </div>
         </StatCard>
         <StatCard
@@ -280,9 +275,7 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
          * there is no bucket breakdown to read, so the panel is the parts
          * that are real rather than the old layout with invented numbers.
          */
-        const packedCount = Math.max(0, summary.objects - summary.staged)
-        const stagedCount = summary.staged
-        const totalObjCount = packedCount + stagedCount
+        const packedCount = summary.objects
         const typeBytes = repoStats.per_type.reduce((a, t) => a + t.orig_size, 0)
         const typeColors: Record<number, string> = {
           1: 'bg-blue-500', 2: 'bg-orange-500', 3: 'bg-green-500',
@@ -318,21 +311,12 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
             <div className="bg-surface-secondary rounded-lg p-3">
               <div className="text-xs text-text-secondary mb-2">Objects</div>
               <div className="h-2 rounded-full bg-surface-tertiary overflow-hidden flex mb-2">
-                {packedCount > 0 && (
-                  <div className="bg-accent" style={{ width: `${pct(packedCount, totalObjCount)}%` }} />
-                )}
-                {stagedCount > 0 && (
-                  <div className="bg-status-warning" style={{ width: `${pct(stagedCount, totalObjCount)}%` }} />
-                )}
+                {packedCount > 0 && <div className="bg-accent" style={{ width: '100%' }} />}
               </div>
               <div className="flex gap-3 text-xs text-text-muted">
                 <span>
                   <span className="inline-block w-2 h-2 rounded-full bg-accent mr-1" />
                   Packed {fmtNum(packedCount)}
-                </span>
-                <span>
-                  <span className="inline-block w-2 h-2 rounded-full bg-status-warning mr-1" />
-                  Staged {fmtNum(stagedCount)}
                 </span>
                 <span className="ml-auto">{fmtNum(summary.packs)} pack files</span>
               </div>

@@ -460,7 +460,8 @@ test-cli: all $(FREE_PORT)
 # Units through the API and the CLI, with the fake provider enabled by its
 # test-only config key: routes, the job, units.allow, restore, schedules.
 .PHONY: test-units
-test-units: all
+test-units: all $(BINS)/slow_dev.so
+	@$(SCRATCH_GUARD) test_gc_during_backup_e2e.sh ./$(TESTS)/test_gc_during_backup_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/slow_dev.so
 	@$(SCRATCH_GUARD) test_units_e2e.sh ./$(TESTS)/test_units_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 	@$(SCRATCH_GUARD) test_helper_e2e.sh ./$(TESTS)/test_helper_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/c-backup-helper
 	@$(SCRATCH_GUARD) test_source_snapshot_e2e.sh ./$(TESTS)/test_source_snapshot_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup $(BINS)/c-backup-helper
@@ -504,6 +505,9 @@ test-ui: all
 
 test: all $(TEST_BINS) $(FAULT_BINS) analyze test-hygiene test-api test-cli test-units test-ui
 	@for t in $(TEST_BINS) $(FAULT_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
+	@# Every power-cut scenario again with several writers: eight chunk
+	@# workers and every file on the file workers (test_powercut_fault.c).
+	@PC_FILE_WORKERS=1 $(SCRATCH_GUARD) test_powercut_fault $(BINS)/test_powercut_fault
 
 # ---- Sanitizer tests --------------------------------------------------
 #
@@ -995,6 +999,12 @@ bench-edit-latency: all $(BINS)/slow_dev.so
 # bench/prof_shim.c; bench/prof_report.py reads what it writes.
 $(BINS)/prof_shim.so: $(BENCH)/prof_shim.c | $(BINS)
 	$(CC) -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -pthread -lrt
+
+# Bytes and syncs per destination, WAL frames per page, and an optional
+# source read model, for the first-backup investigation. See bench/io_count.c
+# and bench/first_backup_model.sh.
+$(BINS)/io_count.so: $(BENCH)/io_count.c | $(BINS)
+	$(CC) -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -pthread
 
 bench: $(BINS)/bench_micro $(BINS)/bench_phases $(BINS)/bench_browse $(BINS)/bench_verify $(BINS)/slow_sync.so
 	@echo "=== micro ===" && $(BINS)/bench_micro

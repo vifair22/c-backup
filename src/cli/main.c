@@ -1175,11 +1175,7 @@ static int h_verify(const args_t *a)
 
 static int h_stats(const args_t *a)
 {
-    /* Only "staged" (objects in a pack a running backup has not sealed)
-     * narrows; format 3 has no loose objects. The spec refuses anything
-     * else rather than send it to be silently ignored. */
-    const char *scope = args_value(a, "--scope");
-    return get_repo_scoped(a->pos[0], "/stats", scope ? "scope=staged" : NULL);
+    return get_repo_scoped(a->pos[0], "/stats", NULL);
 }
 
 static int h_summary(const args_t *a)
@@ -2072,9 +2068,8 @@ static const arg_opt_t O_REPLICATE[] = {
     { "--to-plaintext", NULL, ARG_FLAG, NULL },
     OPT_NOWAIT, OPT_END,
 };
-static const arg_opt_t O_STATS[] = { { "--scope", NULL, ARG_CHOICE, "staged" }, OPT_END };
 static const arg_opt_t O_OBJECTS[] = {
-    { "--location", NULL, ARG_CHOICE, "staged|packed|all" }, OPT_LIMIT, OPT_OFFSET, OPT_END,
+    { "--location", NULL, ARG_CHOICE, "packed|all" }, OPT_LIMIT, OPT_OFFSET, OPT_END,
 };
 static const arg_opt_t O_MOVE[] = { { "--move", NULL, ARG_FLAG, NULL }, OPT_END };
 static const arg_opt_t O_JOURNAL[] = {
@@ -2241,7 +2236,7 @@ static const command_t COMMANDS[] = {
     { { "gfs",             P_REPO,     O_DRY_NOWAIT, NULL }, h_gfs, 0 },
     { { "replicate",       P_REPLICATE, O_REPLICATE, NULL }, h_replicate, 0 },
     { { "reindex",         P_REPO,     O_NOWAIT, NULL }, h_reindex, 0 },
-    { { "stats",           P_REPO,     O_STATS, NULL }, h_stats, 0 },
+    { { "stats",           P_REPO,     NULL, NULL }, h_stats, 0 },
     { { "summary",         P_REPO,     NULL, NULL }, h_summary, 0 },
     { { "objects",         P_REPO,     O_OBJECTS, NULL }, h_objects, 0 },
     { { "object",          P_OBJECT,   O_PAGING, "--limit and --offset page refs" }, h_object, 0 },

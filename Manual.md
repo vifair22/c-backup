@@ -291,8 +291,8 @@ comes back as interrupted. A power cut can also cost the database about its
 last second of the daemon's own writes (never an edit the API had answered);
 the next start puts back any snapshot or tag that went with them on its own
 (section 17.5). Either way the repository is consistent: a backup's partial
-pack and the index rows staged into it are discarded, and the next backup
-stores those files again. Staging files a killed writer left in the
+pack is discarded (no index row names its objects until a pack is sealed),
+and the next backup stores those files again. Staging files a killed writer left in the
 repository's `tmp/`, or in `packs/.staging/` where packs are staged, are
 removed by the next backup, gc or reindex, by registering the repository,
 and in a replica by the next replicate into it. Each of these first takes an
@@ -1713,7 +1713,7 @@ So is the reverse: `--every` always needs `--at`, `week` needs `--on`,
 `month` needs `--on-day` and `year` needs `--on-day` and `--on-month`, and a
 field the period does not use (`--on` with `--every day`) is refused rather
 than ignored. Every option with a fixed set of values (`--every`, `--level`,
-`--location`, `--encrypt`, `--on-overlap`, `--catchup`, `--scope`) refuses
+`--location`, `--encrypt`, `--on-overlap`, `--catchup`) refuses
 anything else before a request is sent.
 
 **Interval** triggers anchor to the schedule's last fire, not to wall-clock
@@ -3439,8 +3439,8 @@ lists every command with all of its arguments.
 | `gfs <id> [--dry-run]` | Retention |
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt] [--to-plaintext]` | Copy into another directory; `--reencrypt` into another repository under its own encryption; `--to-plaintext` to allow that repository to be unencrypted (section 14.1) |
-| `stats <id> [--scope staged]`, `summary <id>`, `fanout <id>` | Repository statistics; `staged` is objects in packs a running backup has not sealed |
-| `objects <id> [--location staged\|packed\|all] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content] [--limit N] [--offset N]` | Objects; `--limit` and `--offset` page `refs` and are refused for the other views. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
+| `stats <id>`, `summary <id>`, `fanout <id>` | Repository statistics |
+| `objects <id> [--location packed\|all] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content] [--limit N] [--offset N]` | Objects; `--limit` and `--offset` page `refs` and are refused for the other views. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
 | `packs <id> [pack-id] [--limit N] [--offset N]` | Packs, or one pack's entries |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id> [--limit N] [--offset N]`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |

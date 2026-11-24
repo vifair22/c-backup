@@ -992,18 +992,16 @@ check "yearly trigger on 30 February refused" 400 "$(curl -s -o /dev/null -w '%{
 echo "introspection"
 SUMMARY=$(sock_body /repos/1/summary)
 contains "summary"      '"snapshots"'  "$SUMMARY"
-# There are no loose objects any more. What a client can see short of a
-# sealed pack is the staged count, which is zero once a backup has finished.
-contains "summary counts staged objects" '"staged":0' "$SUMMARY"
-case "$SUMMARY" in *'"loose"'*) bad "summary has no loose count" "absent" "$SUMMARY" ;;
-                   *) ok "summary has no loose count" ;; esac
+# Neither a loose nor a staged count: objects are indexed when their pack
+# is sealed, so there is nothing short of a pack to count.
+case "$SUMMARY" in *'"loose"'*|*'"staged"'*) bad "summary has no loose or staged count" "absent" "$SUMMARY" ;;
+                   *) ok "summary has no loose or staged count" ;; esac
 contains "stats"        '"per_type"'   "$(sock_body /repos/1/stats)"
-# The staged scope is legitimately empty here, every backup having sealed its
-# pack. What matters is that the scoped query answers rather than errors.
-well_formed "staged stats scope answers" "$(sock_body '/repos/1/stats?scope=staged')"
-contains "and narrows to nothing" '"per_type":[]' "$(sock_body '/repos/1/stats?scope=staged')"
-# loose is not a scope now; like any unknown scope it is refused rather
-# than answered unscoped.
+# No scope narrows statistics: staged would always be empty (a backup's
+# objects are indexed when their pack seals), and an accepted filter that
+# shows nothing reads as an answer. Every scope is refused, by name.
+check "the staged scope is refused" 400 "$(sock_code '/repos/1/stats?scope=staged')"
+contains "naming it" "scope 'staged' is not supported" "$(sock_body '/repos/1/stats?scope=staged')"
 check "the loose scope is refused" 400 "$(sock_code '/repos/1/stats?scope=loose')"
 contains "objects"      '"hash"'       "$(sock_body '/repos/1/objects?limit=2')"
 contains "packs"        '{'            "$(sock_body /repos/1/packs)"
@@ -1011,10 +1009,10 @@ contains "packs"        '{'            "$(sock_body /repos/1/packs)"
 # came back as though the request had been understood.
 check "unknown object location is a 400" 400 "$(sock_code '/repos/1/objects?location=nowhere')"
 check "location=all is accepted"         200 "$(sock_code '/repos/1/objects?location=all')"
-check "location=staged is accepted"      200 "$(sock_code '/repos/1/objects?location=staged')"
+check "location=staged is a 400 now"     400 "$(sock_code '/repos/1/objects?location=staged')"
 check "location=packed is accepted"      200 "$(sock_code '/repos/1/objects?location=packed')"
 check "location=loose is a 400 now"      400 "$(sock_code '/repos/1/objects?location=loose')"
-contains "nothing is staged after a backup" '"objects":[]' \
+contains "naming it" "location 'staged' is not supported" \
     "$(sock_body '/repos/1/objects?location=staged')"
 check "negative limit is a 400"          400 "$(sock_code '/repos/1/snapshots?limit=-1')"
 check "zero limit is a 400"              400 "$(sock_code '/repos/1/snapshots?limit=0')"

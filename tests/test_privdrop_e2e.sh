@@ -160,11 +160,11 @@ stop_daemon() {
     DAEMON_PID=
     return $rc
 }
-# Changed files, then a backup, n times.
+# Changed files (those matching $3, f1* by default), then a backup, n times.
 backups() {
     local i OUT
     for i in $(seq 1 "$1"); do
-        find "$WORK/src" -type f -name 'f1*' -exec sh -c 'echo "$RANDOM" >> "$1"' _ {} \;
+        find "$WORK/src" -type f -name "${3:-f1*}" -exec sh -c 'echo "$RANDOM" >> "$1"' _ {} \;
         OUT=$(cb backup 1 "$WORK/src" 2>&1)
         contains "$2: backup $i completes" '"state":"completed"' "$OUT"
     done
@@ -294,7 +294,15 @@ echo 0 > "$WORK/walpeak"
       sleep 0.005
   done ) &
 PEAK_PID=$!
-backups 3 "trim"
+# Twice the tree, every file changed: a backup's index writes are compact
+# enough now (the pack commit writes each new object's row once, in hash
+# order) that changing a third of 6,000 files no longer carried the WAL
+# past the limit.
+for d in $(seq 31 60); do
+    mkdir -p "$WORK/src/d$d"
+    for f in $(seq 1 200); do printf '%s %s %s\n' "$d" "$f" "$RANDOM" > "$WORK/src/d$d/f$f"; done
+done
+backups 3 "trim" 'f*'
 kill "$PEAK_PID"; wait "$PEAK_PID" 2>/dev/null
 PEAK=$(cat "$WORK/walpeak")
 for _ in $(seq 100); do

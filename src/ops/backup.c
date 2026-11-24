@@ -149,14 +149,14 @@ typedef struct {
  * probe, LZ4) runs outside the lock; the lock covers dedup, encryption,
  * parity and the write.
  *
- * Every new object's index row has to exist before its pack commits: the
- * commit callback turns rows from staged to packed, and a row inserted after
- * it would stay staged, be dropped by the next backup, and leave the chunk
- * with no row - which compaction reads as dead and drops from its pack. So
- * new objects queue here as pending rows, and are written either by the
- * backup thread inside its batch once the file is stored, or here, in a
- * transaction of their own, just before a rollover seals the pack they are
- * in.
+ * A new object's index row is the pack commit's to create, as it is for
+ * the file workers: the commit inserts every row its pack's entries lack
+ * (store_index.c, db_pack_commit), in hash order. Objects met here queue
+ * as pending rows all the same, and are written either by the backup
+ * thread inside its batch once the file is stored, or here, in a
+ * transaction of their own, just before a rollover seals the pack; at
+ * that point a row is written only for an object some earlier pack holds
+ * (index_row).
  *
  * Rollover happens here only while may_rollover is set, which the backup
  * thread does for a file over OBJECT_MAX_BYTES after letting its batch
@@ -167,7 +167,6 @@ typedef struct {
 typedef struct {
     uint8_t  hash[OBJECT_HASH_SIZE];
     uint8_t  type;
-    uint64_t phys, orig;
 } pending_row_t;
 
 typedef struct bsink {
@@ -547,16 +546,20 @@ static int scan_path_cmp(const void *a, const void *b)
  * few bytes locally and remembering the answer makes repeats free.
  */
 /*
- * Record a stored object in the index: staged when it went into the open
- * pack, packed when the repository already held it. See store_index_put_staged for
- * why the difference decides whether a crash can lose data silently.
+ * Record a stored object in the index. One in the open pack gets no row
+ * here: that pack's commit creates it. It used to be written now as
+ * 'staged' and rewritten by the commit, so every new object took a random
+ * insert into the objects primary key in the backup's batches and another
+ * write at the commit; the commit's own insert, in hash order, fills each
+ * b-tree page once. On a 38,732-file first backup that was 77% of the WAL
+ * (PERF.md, 2026-11-19). An object an earlier pack holds gets its row back
+ * if the index lost it (B060).
  */
-static status_t record_object(pipeline_t *p, const uint8_t hash[OBJECT_HASH_SIZE],
-                              uint8_t type, uint64_t phys, uint64_t orig)
+static status_t index_row(pipeline_t *p, pack_backup_writer_t *pw,
+                          const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type)
 {
-    return pack_backup_holds(p->pack_w, hash)
-        ? store_index_put_staged(p->db, p->repo_id, hash, type, phys, orig)
-        : store_index_put_packed(p->db, p->repo_id, hash, type, phys, orig);
+    if (pack_backup_holds(pw, hash)) return OK;
+    return store_index_put_packed(p->db, p->repo_id, hash, type, 0, 0);
 }
 
 static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type, const char *path,
@@ -589,10 +592,9 @@ static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type, const char *pat
     }
     if (st != OK) return st;
     int is_new = ow.is_new;
-    uint64_t phys = ow.phys_bytes;
     if (is_new) {
         p->res->objects_new++;
-        st = record_object(p, out_hash, obj_type, phys, len);
+        st = index_row(p, p->pack_w, out_hash, obj_type);
         if (st != OK) return st;
     }
     hashset_add(&p->meta_seen, out_hash);
@@ -724,9 +726,7 @@ static status_t bsink_flush(bsink_t *s, int own_txn)
     uint64_t _ti = phase_now();
     for (size_t i = 0; i < s->n && st == OK; i++) {
         const pending_row_t *r = &s->rows[i];
-        st = pack_backup_holds(s->pw, r->hash)
-            ? store_index_put_staged(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig)
-            : store_index_put_packed(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig);
+        st = index_row(p, s->pw, r->hash, r->type);
     }
     phase_add(p->timers, PHASE_INDEX_PUT, _ti);
     if (own_txn) {
@@ -807,8 +807,6 @@ static status_t bsink_add_prepared(bsink_t *s, const pack_prepared_t *pp,
             pending_row_t *r = &s->rows[s->n++];
             memcpy(r->hash, pp->hash, OBJECT_HASH_SIZE);
             r->type = pp->type;
-            r->phys = phys;
-            r->orig = pp->len;
         }
     }
     if (st != OK && s->failed == OK) {
@@ -1376,8 +1374,9 @@ static status_t store_synth_all(pipeline_t *p, int late)
     }
     free(at);
     if (st != OK) {
-        /* Rows of whatever was staged go in with the trees' batch, as a
-         * failed file's do; the caller discards the pack. */
+        /* Pending rows go in with the trees' batch, as a failed file's do:
+         * only objects an earlier pack holds get one (index_row), and the
+         * caller discards the open pack, whose objects have none. */
         char why[ERR_MSG_MAX];
         snprintf(why, sizeof(why), "%s", err_msg());
         batch_close(p, b);
@@ -1386,6 +1385,15 @@ static status_t store_synth_all(pipeline_t *p, int late)
     }
     batch_close(p, b);
     return OK;
+}
+
+/* Tests: what goes to the file workers and how much each needs (0: the
+ * defaults), so a harness with small files can run them. */
+static uint64_t g_pool_min = FILE_POOL_MIN, g_pool_per_worker = OBJECT_MAX_BYTES;
+void backup_test_set_file_pool(uint64_t min_bytes, uint64_t per_worker)
+{
+    g_pool_min = min_bytes ? min_bytes : FILE_POOL_MIN;
+    g_pool_per_worker = per_worker ? per_worker : OBJECT_MAX_BYTES;
 }
 
 /*
@@ -1399,18 +1407,18 @@ static status_t store_synth_all(pipeline_t *p, int late)
  */
 static status_t store_content(pipeline_t *p)
 {
-    uint64_t n_large = 0, n_small = 0;
+    uint64_t n_large = 0, n_small = 0, pooled_bytes = 0;
     for (uint32_t i = 0; i < p->count; i++) {
         const scan_entry_t *e = &p->scan->entries[i];
         if (e->node.type != NODE_TYPE_REG) continue;
-        if (e->node.size > OBJECT_MAX_BYTES) n_large++;
+        if (e->node.size > g_pool_min) { n_large++; pooled_bytes += e->node.size; }
         else if (e->node.size <= SMALL_FILE_MAX) n_small++;
     }
     /* Enough small files to fill a batch or two is worth threads for. */
     int small_par = n_small >= 2 * (uint64_t)SMALL_BATCH_FILES;
 
     /*
-     * Chunk workers when there are files over one object's bound. The plan
+     * Chunk workers when there are files for the file workers. The plan
      * is the one the whole-file pool used (CPUs, memory, operator's
      * number); each worker holds at most a few max-size chunk buffers.
      */
@@ -1421,7 +1429,7 @@ static status_t store_content(pipeline_t *p)
         if (cdc_workers_start(workers, &p->cdc_w) == OK) {
             log_info("backup: %llu file(s) over %llu MiB, their chunks stored "
                      "on %u threads", (unsigned long long)n_large,
-                     (unsigned long long)(OBJECT_MAX_BYTES >> 20), workers);
+                     (unsigned long long)(g_pool_min >> 20), workers);
         } else {
             /* Slower, not wrong: every chunk can still be stored here. */
             log_warn("backup: cannot start chunk workers, storing serially: %s",
@@ -1461,10 +1469,14 @@ static status_t store_content(pipeline_t *p)
      * And files at once, when there are several large ones: one file is
      * bound by its reading thread (pread and the boundary scan), so a tree
      * of many large files needs several. A quarter of the chunk workers,
-     * at most one per large file.
+     * and never fewer than FILE_WORKERS_MIN, at most one per large file.
      */
-    unsigned fw = workers / 4;
+    unsigned fw = workers / 4 > FILE_WORKERS_MIN ? workers / 4 : FILE_WORKERS_MIN;
     if ((uint64_t)fw > n_large) fw = (unsigned)n_large;
+    /* Each file worker seals a pack of its own at the end, so a handful of
+     * files just over 1 MiB would leave six small packs: one worker per
+     * object's bound (16 MiB) of pooled content at most. */
+    if ((uint64_t)fw > pooled_bytes / g_pool_per_worker) fw = (unsigned)(pooled_bytes / g_pool_per_worker);
     /*
      * And no more than the buffer budget has writers for: each file worker
      * opens a pack writer of its own (about 26 MiB of parity encoder and
@@ -1552,7 +1564,7 @@ static status_t store_content(pipeline_t *p)
      * that was abandoned may have been referenced by another writer as
      * stored, so a snapshot made from this run could name a chunk that never
      * landed: the run fails instead. This thread's writer leaves the set;
-     * its own staged names are known to it, and nothing else is writing.
+     * its own names are known to it, and nothing else is writing.
      */
     if (p->claims) {
         uint64_t lost = pack_claims_abandoned(p->claims);
@@ -1575,9 +1587,10 @@ static status_t store_content(pipeline_t *p)
     }
     cdc_workers_stop(p->cdc_w);
     p->cdc_w = NULL;
-    /* Rows still pending belong to a file that failed part-way; its chunks
-     * are in the open pack, and the trees phase must not see them as
-     * someone else's. They are written, staged, with the trees' batch. */
+    /* Rows still pending belong to a file that failed part-way. They are
+     * flushed with the trees' batch: an object an earlier pack holds gets
+     * its row back, and one in the open pack gets its row when that pack
+     * commits (index_row). */
     p->sink = NULL;
     if (sink->n) {
         batch_open(p, &p->batch);
@@ -1844,7 +1857,7 @@ static status_t store_content_loop(pipeline_t *p)
 
         /* A large file goes to the pool once there is room for it; the
          * backup thread carries on with the entries after it. */
-        int to_pool = p->pool && e->node.size > OBJECT_MAX_BYTES;
+        int to_pool = p->pool && e->node.size > g_pool_min;
         while (to_pool &&
                store_pool_outstanding(p->pool) >= store_pool_capacity(p->pool)) {
             status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
@@ -1909,8 +1922,8 @@ static status_t store_content_loop(pipeline_t *p)
                 return set_error(sfail, "backup: storing %s: %s", e->path, why);
             }
         }
-        /* Chunks a failed or discarded read staged are in the open pack;
-         * their rows go in with the next flush, unreferenced, for gc. */
+        /* Chunks a failed or discarded read put in the open pack get their
+         * rows from its commit, unreferenced, for gc. */
         p->res->objects_new  += cr.chunks_new + cr.lists.lists_new;
         p->res->bytes_stored += cr.phys_new;
         char rerr[ERR_MSG_MAX];
@@ -2055,9 +2068,10 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
     /*
      * Tree rows are written in batches, like the store phase's (batch_t).
      *
-     * Each new tree records one staged row, and these went in one statement
-     * at a time with no transaction open: a commit, and a WAL sync, per new
-     * directory. That was 9 s of a 19 s backup of 308 directories with sync
+     * Each new tree recorded a row (now only a tree an earlier pack holds
+     * does; the open pack's get theirs from its commit), and these went in
+     * one statement at a time with no transaction open: a commit, and a WAL
+     * sync, per new directory. That was 9 s of a 19 s backup of 308 directories with sync
      * at 20 ms, and 16 to 19 s per run on the UAT host (OWN-16). In a batch
      * they are one commit, and the job's progress writes in this phase join
      * it instead of syncing on their own. A writer that queues is let in
@@ -2088,8 +2102,8 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
     status_t st = tree_build(p->scan, &ops, root_hash, NULL);
 
     /* Committed on failure too, as the store phase does: the rows name
-     * objects in the open pack, and the caller drops staged rows when the
-     * pack is discarded. */
+     * objects earlier packs hold, never the open pack's, which the caller
+     * discards. */
     if (tsink->n) {
         batch_open(p, b);
         status_t fst = bsink_flush(tsink, 0);
@@ -2648,9 +2662,10 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
      * Set before setup so its transaction is counted with the rest. */
     phase_current = &timers;
 
-    /* Rows a crashed or aborted backup staged into a pack that never
-     * landed. This job holds the repository's write lock, so nothing else
-     * can be staging now. */
+    /* Staged rows a crash left: store_index_drop_unannounced turns a cut
+     * pack commit's rows back into them at start, and a daemon before
+     * index_row wrote them during every backup. This job holds the
+     * repository's write lock, so nothing else is writing rows now. */
     uint64_t _tsu = phase_now(), _tsun = phase_nested(&timers);
     st = store_index_drop_staged(db, repo_id);
     if (st == OK) st = pack_backup_open(store, &p.pack_w);
@@ -2705,11 +2720,11 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
 
     if (st != OK) {
         /*
-         * The open pack was just discarded, so rows staged into it name
-         * bytes that no longer exist. The next backup would drop them, but
-         * until then they claim objects the repository does not hold, and a
-         * cancelled backup should leave the index as it found it. The error
-         * is the backup's; a failure here is only logged.
+         * The open pack was just discarded. A backup writes no rows for its
+         * objects (index_row), so there should be no staged rows naming
+         * it; any there are would claim objects the repository does not
+         * hold, and a cancelled backup should leave the index as it found
+         * it. The error is the backup's; a failure here is only logged.
          */
         char why[ERR_MSG_MAX];
         snprintf(why, sizeof(why), "%s", err_msg());

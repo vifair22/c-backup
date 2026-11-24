@@ -52,7 +52,7 @@ export type VerifyLevel = 'index' | 'structure' | 'deep'
  * reaches a real route.
  */
 export type MaintenanceOp = 'verify' | 'gc' | 'gfs' | 'reindex'
-export type ObjectLocation = 'staged' | 'packed'
+export type ObjectLocation = 'packed'
 
 export type ApiRequest =
   /* --- repositories --- */
