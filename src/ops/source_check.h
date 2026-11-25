@@ -117,8 +117,10 @@ source_state_t source_mount_state(const char *path);
 void source_check_set_mount_files(const char *fstab, const char *mountinfo);
 
 /*
- * Retention's guard. For every source configured on the repository, the
- * newest of the snapshots `ids` (ascending, one retention group) in which
+ * Retention's guard. For every source root of the group (configured on the
+ * repository, recorded by a backup in snapshot_sources, or implied by the
+ * tree of a snapshot with no recorded roots), the newest of the snapshots
+ * `ids` (ascending, one retention group) in which
  * the source's path is a directory holding at least one entry, or any
  * non-directory. A snapshot whose tree cannot be read counts as non-empty:
  * the guard keeps what it cannot judge. A source no snapshot holds, or holds

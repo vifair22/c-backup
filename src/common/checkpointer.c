@@ -164,11 +164,15 @@ typedef struct { uint32_t left; int rc; uint64_t t_locked; } locked_arg_t;
  */
 #define CKPT_LOCKED_ROUNDS 4
 #define CKPT_UNLOCKED_ROUNDS 4
-#define CKPT_SMALL_FRAMES  1024     /* 4 MiB: always small enough to copy under the lock */
+#define CKPT_SMALL_FRAMES  1024     /* 4 MiB: close enough behind the writers */
 #define CKPT_PROBE_NS        (5ull * 1000000ull)      /* writers look at most this often */
 #define CKPT_THROTTLE_MAX_NS (2000ull * 1000000ull)   /* and never wait longer */
 #define CKPT_BLOCKED_NS      (1000ull * 1000000ull)   /* after a copy that could not finish */
-#define CKPT_LOCK_BUDGET_NS (200ull * 1000000ull)
+#define CKPT_IDLE_NS         (5000ull * 1000000ull)   /* WAL unchanged this long: restart it */
+/* The idle restart's view: the WAL's size when last seen to change, and
+ * when. The checkpointer thread's own; reset at start. */
+static uint32_t idle_frames;
+static uint64_t idle_since;
 /* How long a locked round waits for pooled reads already running before it
  * copies without holding the readers out, and how many rounds in a row may
  * do that before one waits for them however long they take (B274). */
@@ -363,7 +367,6 @@ static void tick(void)
 
     uint64_t hard = (uint64_t)g_threshold * CKPT_HARD_FACTOR;
     uint32_t left = frames - backfilled;
-    uint64_t round_ns = 0;
     /*
      * Past the hard cap: one unlocked PASSIVE, then the lock (B216). The
      * lock used to come first (B181: on a slow device each unlocked round
@@ -388,44 +391,62 @@ static void tick(void)
         }
         goto locked;
     }
-    if (left < g_threshold) return;
-    uint64_t r0 = now_ns();
+    /* Below the cap a copy left short is finished at the next tick, not
+     * only once a threshold's worth is uncopied: the WAL restarts only
+     * when a writer begins on a complete copy, and nothing else here
+     * completes it now. */
+    /*
+     * The idle restart. Below the cap a writer that begins on a complete
+     * copy restarts the WAL, but an idle daemon may not write at all, and
+     * a WAL of up to the hard cap, fully copied, would stay as long as it
+     * stays idle. Once the WAL has not grown for CKPT_IDLE_NS the locked
+     * round restarts it: nothing is writing, so nobody waits for its syncs.
+     */
+    uint64_t t_now = now_ns();
+    if (frames != idle_frames) { idle_frames = frames; idle_since = t_now; }
+    if (frames >= g_threshold && left == 0) {
+        if (t_now - idle_since < CKPT_IDLE_NS) return;
+        idle_since = t_now;   /* one try per idle period, should it miss */
+        goto locked;
+    }
+    if (frames < g_threshold || left == 0) return;
     if (passive(&left) != 0) return;
-    round_ns = now_ns() - r0;
     pthread_mutex_lock(&g_mu);
     g_stats.passive++;
     pthread_mutex_unlock(&g_mu);
 
     /*
-     * Copied, but a copy is only half of bounding the WAL: the next writer
-     * restarts it only if that writer's snapshot began after the copy
-     * completed, and a backup's batch began long before. One more PASSIVE
-     * under the write lock settles it: the batch commits to let the lock
-     * go, the remainder copied is small, and the next db_txn writer begins
-     * on a complete copy and restarts the WAL. A large remainder waits for
-     * the next tick, unless the WAL is past the hard cap.
+     * Below the hard cap the thread never takes the write lock (B233). It
+     * used to: once a round left a small remainder it copied the rest
+     * holding the lock, so the next writer began on a complete copy and
+     * restarted the WAL, about once per threshold. But a round under the
+     * lock syncs whatever it copies and the restart's header, and on a busy
+     * device every sync waits for the device's queue, not for its own few
+     * pages: FS2 M9 R5 held the lock 23.3 s for 2,043 frames, and with the
+     * database presynced the edit-latency model still held it 1.2 to 2.8 s
+     * for a remainder of 6 to 18 frames, each second a request's wait.
+     *
+     * So below the cap the copy is all unlocked. Each further round copies
+     * only what arrived during the last, which keeps the copy close behind
+     * the writers; the WAL restarts when a writer begins on a complete copy
+     * (between a backup's batches, or the first write after it), and past
+     * the hard cap the locked round below bounds it as before. A backup
+     * that writes the WAL faster than one restart a threshold lets it grow
+     * to the hard cap instead of four thresholds: the price of no request
+     * ever waiting for a checkpoint's sync below it.
      */
     uint32_t small = g_threshold / 4 < CKPT_SMALL_FRAMES ? g_threshold / 4 : CKPT_SMALL_FRAMES;
-    for (int round = 0; ; round++) {
+    for (int round = 0; round < CKPT_UNLOCKED_ROUNDS; round++) {
         if (checkpointer_wal_frames(g_path, &frames, &backfilled) != 0) return;
         left = frames - backfilled;
-        if (frames < g_threshold) return;                   /* restarted meanwhile */
+        if (frames < g_threshold || left <= small) return;  /* restarted, or caught up */
         if (frames > hard) goto locked;
-        if (left <= small || round >= CKPT_UNLOCKED_ROUNDS) break;
-        /* Each round copies only what arrived during the last, so the
-         * remainder shrinks quickly unless writers outpace the copy. */
-        r0 = now_ns();
         if (passive(&left) != 0) return;
-        round_ns = now_ns() - r0;
         pthread_mutex_lock(&g_mu);
         g_stats.passive++;
         pthread_mutex_unlock(&g_mu);
     }
-    /* What is left is about what arrived during the last round, so copying
-     * it under the lock takes about as long as that round did: escalate if
-     * that is within budget, even when writers are too fast for the
-     * remainder to shrink below small. */
-    if (left > small && round_ns > CKPT_LOCK_BUDGET_NS && frames <= hard) return;
+    return;
 
 locked:;
     /* What the unlocked rounds left dirty, the WAL's tail and the pages
@@ -693,6 +714,8 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
         pthread_mutex_unlock(&g_mu);
         return ERR_IO;
     }
+    idle_frames = 0;
+    idle_since = now_ns();
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);

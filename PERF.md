@@ -6,6 +6,61 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-25 - D2 against kopia and restic on M12: what is left, and why
+
+M12 on FS2 (btrfs RAID10 on dm-crypt over four BX500; every run starts
+after `drop_caches`, so metadata and state.db are cold). Medians of three
+rounds. The breakdowns are the daemon's own phase profiles from round 1
+(`bench12/cap/*/daemon-lines.txt`) and device counts from the 1 s
+diskstats beside them. No new runs were made for this entry.
+
+| Run | c-backup M12 | Comparator |
+|---|---:|---:|
+| D2 first backup | 39.5 s | kopia 12.8 s |
+| D2 no-change | 9.6 s | kopia 1.6 s |
+| D2 changed | 12.2 s | restic 5.3 s |
+
+### No-change (8.9 s profiled)
+
+| Part | Time | Verdict |
+|---|---:|---|
+| scan | 4.86 s | **Bug (B296).** A serial walk over cold metadata: 13,247 device reads at 6% device utilisation, against kopia's 3,624 reads with directories walked in parallel. Warm, the same scan takes 0.32 s for 102k entries on the dev box (3.1 us an entry, 1.6 us without xattrs), so it is the read latency, one inode at a time, not the work |
+| index-nodes | 1.47 s | Justified, the browse and search index: every snapshot gets its node rows. Lazy materialisation is DEC-LAZY-NODES, after 1.0 |
+| cache-lookup | 1.02 s | Part of B296: 10.6 us a file is a cold state.db page per lookup, one at a time. Same remedy, reads ahead of the walk |
+| commit:index | 0.79 s | Justified: the index commits durably |
+| trees, setup, sweep | 0.44 s | Justified: deterministic trees, all reused |
+
+### Changed (12.3 s profiled)
+
+| Part | Time | Verdict |
+|---|---:|---|
+| scan | 4.99 s | B296, as above |
+| commit:index | 2.65 s | Justified, the index: node rows and content rows for 288 new trees and 181 new objects, 21 ms a commit on the cold, busy device |
+| index-nodes | 1.51 s | Justified, as above |
+| cache-lookup | 1.08 s | B296 |
+| store (wall) | 2.4 s | Justified: 71.7 MiB written, 4.5 MiB of it RS parity, each pack synced before its rows |
+
+### First backup (44.8 s profiled)
+
+| Part | Time | Verdict |
+|---|---:|---|
+| store (wall) | 30.7 s | **Unexplained (B297).** The main thread waits 23.2 s on the file workers, yet the run uses about 27 s of CPU in 47 s and the device sits at 32% utilisation (kopia: 35%, 80k reads in 13 s). Neither bound, so something serialises the workers; the next step is a profile of their waits |
+| index | 9.4 s | Mostly justified: pack commits 4.5 s (one per pack, after its sync), node index 1.2 s, snapshot record 0.9 s; the share above that is part of B297 |
+| scan | 4.5 s | B296 |
+| pack-seal | 1.6 s | Justified: durability, one fdatasync per pack |
+| parity | 36.1 MiB of 563 MiB written | Justified: RS parity |
+
+### Restore, for the record
+
+The D2 restore regression (M12 62.2 s against P1 39.2 s) was the early
+writeback, not the device: every image wrote the same 4.3 GB in the same
+IOs, but with per-file writeback requests the write phase took 3.9-7.9 s
+against 3.5 s and the syncfs calls 13-35 s against 13-21 s. Round 3 gates
+it to batches of 128 MiB or more (restore.c, BATCH_EARLY_WB_BYTES); D1's
+gain came from 1 GiB batches, which still get it.
+
+---
+
 ## 2026-11-19 - First backup: where M10's gap to kopia goes
 
 BENCH M10 (FS2: btrfs RAID10 on dm-crypt over four BX500) put c-backup's

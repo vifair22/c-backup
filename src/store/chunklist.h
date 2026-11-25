@@ -331,6 +331,13 @@ typedef struct {
 extern _Thread_local content_io_times_t *content_io_times;
 
 /*
+ * Whether a content restore on this thread starts writeback as it writes
+ * (chunklist.c, RESTORE_WB_STEP). On by default, which disk images want; a
+ * file restore turns it off for a batch too small for it to pay (restore.c).
+ */
+extern _Thread_local int content_restore_early_wb;
+
+/*
  * Hand the content to emit() in order, holes as zeroes, in pieces of at most
  * one chunk. For readers that consume a stream (grep, an HTTP body). A
  * non-OK return from emit stops the walk and is returned.

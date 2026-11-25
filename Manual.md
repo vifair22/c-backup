@@ -469,7 +469,7 @@ are different: they live in the database and change through the policy API
 | `db.path` | none, required | The daemon database. The shipped config sets `/var/lib/c-backupd/state.db`; a file without it stops the daemon |
 | `db.synchronous` | `normal` | When a database commit reaches the disk. `normal`: the durable API edits (tags, registering or removing a repository, every delete) are synced before the API answers, and everything else - other API edits such as notes, sources, policy and schedules, and the daemon's own writes (backup index rows, job records, the journal) - once a second, so a power cut can lose about their last second, never corrupt them (sections 6.4 and 17.5); `full`: every commit is synced before it returns, as SQLite does by default, at a large cost on many small files (section 18.2). `normal` or `full` |
 | `db.cache_mb` | `64` | MiB of page cache for the database. 2 to 65536 |
-| `db.wal_autocheckpoint` | `16384` | Database pages (4 KiB) waiting in its log that start a checkpoint, each of which costs two syncs. Checkpoints run on a background thread with a connection of its own, never inside a commit, so no request waits for one; the log is restarted about once per this many pages and held under 16 times it, and its file is trimmed back to 4 times it. An outside reader holding a read transaction on `state.db` (a `sqlite3` shell, say) stops every copy from completing and lets the log grow past that bound for as long as it holds it (section 18.2). 1000 to 1048576 |
+| `db.wal_autocheckpoint` | `16384` | Database pages (4 KiB) waiting in its log that start a checkpoint, each of which costs two syncs. Checkpoints run on a background thread with a connection of its own, never inside a commit, so no request waits for one; during a backup the log restarts whenever a writer begins on a complete copy and is held under 16 times this many pages, after 5 s idle it is restarted, and its file is trimmed back to 4 times it. An outside reader holding a read transaction on `state.db` (a `sqlite3` shell, say) stops every copy from completing and lets the log grow past that bound for as long as it holds it (section 18.2). 1000 to 1048576 |
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
 | `http.port` | `8765` | TCP port for remote clients, 0 to 65535. `0` disables TCP |
 | `http.bind` | `127.0.0.1` | TCP bind address, an IPv4 address (not a hostname). `0.0.0.0` for every interface |
@@ -486,6 +486,7 @@ are different: they live in the database and change through the policy API
 | `jobs.read_budget_mb` | `256` | MiB of object and pack-writer buffers every job together may hold. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, and each backup pack writer holds about 26.3 MiB while its pack is open (section 18.3), so this caps that memory whatever runs at once. 48 to 1048576; under 48 stops the daemon at start, since one object and one writer must fit |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
+| `backup.source_drop_pct` | `50` | A source whose files or bytes fall by more than this per cent since the last snapshot that held it makes the backup complete with a warning (section 6.7). `0` turns the drop check off; empty sources still warn. 0 to 100; a repository can set its own with `policy set` |
 | `db_detect.enabled` | `1` | Detect databases in what each backup reads (chapter 23). Reporting only: it never changes how anything is captured. `0` or `1` |
 | `db_detect.sqlite_min_kb` | `1024` | The smallest dormant SQLite file, in KiB, listed as a finding; smaller dormant ones are counted (`sqlite_small`). A live one is always listed. 0 to 16777216 |
 | `db_detect.notify_uncovered` | `1` | One alert (the job's warning, so a push notification when Pushover is configured) when a live database is first found captured `uncovered` (23.3). `0` or `1` |
@@ -1390,6 +1391,33 @@ lease for the longest first backup. While
 it exists, anything that can read the dataset root (ZFS `.zfs`) or the pool's
 snapshot directory (btrfs) can read the snapshot (22.5.4).
 
+### 6.7 Empty and shrinking sources
+
+A source that is empty, or much smaller than last time, is backed up as it
+is, and the job completes with a warning naming the source, so the warning
+alert fires (section 16). The usual cause is a share that was not mounted:
+the source path is then an empty directory, and without the warning every
+nightly job would report success while backing up nothing.
+
+| Finding | Warning says |
+|---|---|
+| The source root holds nothing | `source PATH is empty` |
+| It is empty and is a mount point in `/etc/fstab` with nothing mounted | `... the mount is missing` |
+| It is an empty mount point (a bind of a share not mounted on the host) | `source PATH is an empty mount point` |
+| Its files or bytes fell by more than `backup.source_drop_pct` per cent (default 50) since the last snapshot that held it | `source PATH shrank since snapshot N`, with both counts |
+
+The job result lists every source with its `entries`, `files`, `bytes` and
+`state` (`ok`, `empty`, `unmounted`, `empty_mount` or `dropped`).
+
+Fix the mount, then back up again. For a source that legitimately shrinks a
+lot, raise `backup.source_drop_pct` for its repository (`policy set <id>
+backup.source_drop_pct 80`), or set `0` to turn the drop check off. An empty
+source always warns.
+
+Retention keeps the newest snapshot in which each source still held
+something, whatever the policy says (section 9.1), so a run of empty nights
+cannot age out the last good backup.
+
 ## 7. Browsing, searching, comparing
 
 ```sh
@@ -1593,6 +1621,14 @@ A snapshot is kept if any of these holds:
    only: `keep_daily` 7 keeps the newest seven snapshots whose highest tier
    is daily.
 3. It is tagged. Any tag protects a snapshot from retention, whatever its age.
+4. It is the newest snapshot in which one of the repository's sources is
+   not empty. A source here is any path a backup of the repository read,
+   configured or given to an ad-hoc `c-backup backup <id> <path>`.
+   Emptiness is read from the snapshot's own tree, so it holds
+   after a reindex. This keeps at most one extra snapshot per source, and
+   only while newer snapshots of that source are empty (section 6.7). The
+   job result's `kept_for_sources` names these snapshots, and the journal
+   line says when this rule alone kept one.
 
 Everything else is pruned. A tier count of `0` keeps every snapshot of that
 tier.
@@ -1647,6 +1683,7 @@ kind, is refused with a message listing what is valid:
 | Key | Accepts |
 |---|---|
 | `retention.keep_snaps`, `retention.keep_daily`, `retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly` | a whole number, 0 or more, digits only |
+| `backup.source_drop_pct` | a whole number from 0 to 100 (section 6.7) |
 
 `maintenance.auto_pack` existed while backups ended with a pack pass; format
 3 has none, and the key is refused like any other.
@@ -2548,7 +2585,7 @@ the repository).
 | `cbackup_db_txn_commits_total` | counter | Transactions committed on `state.db` |
 | `cbackup_db_txn_commit_seconds_total` | counter | Time spent in COMMIT, writing the log (no sync at `db.synchronous` normal) |
 | `cbackup_db_txn_commit_frames_total` | counter | Log frames (pages) those commits wrote, where measured |
-| `cbackup_checkpoint_rounds_total` | counter | Checkpoint rounds, labelled `locked="no"` (alongside writers) or `locked="yes"` (holding the write lock: past the hard cap, or the short final round that lets the log restart) |
+| `cbackup_checkpoint_rounds_total` | counter | Checkpoint rounds, labelled `locked="no"` (alongside writers) or `locked="yes"` (holding the write lock: past the hard cap, or once the log has been idle for 5 s, to restart it) |
 | `cbackup_checkpoint_lock_seconds_total` | counter | Time locked rounds held the write lock, from the moment it was granted; every writer waits for it |
 | `cbackup_checkpoint_lock_max_seconds` | gauge | The longest single hold by a locked round since start |
 | `cbackup_checkpoint_lock_wait_seconds_total` | counter | Time locked rounds spent queued for the write lock behind other writers before holding it; not part of the hold, and no writer waits for it |
