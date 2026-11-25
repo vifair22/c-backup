@@ -168,6 +168,7 @@ typedef struct { uint32_t left; int rc; uint64_t t_locked; } locked_arg_t;
 #define CKPT_PROBE_NS        (5ull * 1000000ull)      /* writers look at most this often */
 #define CKPT_THROTTLE_MAX_NS (2000ull * 1000000ull)   /* and never wait longer */
 #define CKPT_BLOCKED_NS      (1000ull * 1000000ull)   /* after a copy that could not finish */
+#define CKPT_IDLE_NS         (5000ull * 1000000ull)   /* WAL unchanged this long: restart it */
 /* How long a locked round waits for pooled reads already running before it
  * copies without holding the readers out, and how many rounds in a row may
  * do that before one waits for them however long they take (B274). */
@@ -390,6 +391,22 @@ static void tick(void)
      * only once a threshold's worth is uncopied: the WAL restarts only
      * when a writer begins on a complete copy, and nothing else here
      * completes it now. */
+    /*
+     * The idle restart. Below the cap a writer that begins on a complete
+     * copy restarts the WAL, but an idle daemon may not write at all, and
+     * a WAL of up to the hard cap, fully copied, would stay as long as it
+     * stays idle. Once the WAL has not grown for CKPT_IDLE_NS the locked
+     * round restarts it: nothing is writing, so nobody waits for its syncs.
+     */
+    static uint32_t idle_frames;
+    static uint64_t idle_since;
+    uint64_t t_now = now_ns();
+    if (frames != idle_frames) { idle_frames = frames; idle_since = t_now; }
+    if (frames >= g_threshold && left == 0) {
+        if (t_now - idle_since < CKPT_IDLE_NS) return;
+        idle_since = t_now;   /* one try per idle period, should it miss */
+        goto locked;
+    }
     if (frames < g_threshold || left == 0) return;
     if (passive(&left) != 0) return;
     pthread_mutex_lock(&g_mu);

@@ -311,6 +311,34 @@ static void test_no_lock_below_the_hard_cap(void **state)
 }
 
 /*
+ * An idle daemon may write nothing at all after a backup, so no writer
+ * begins on the complete copy to restart the WAL; the idle round does,
+ * once, and only after the WAL has stopped growing.
+ */
+static void test_idle_wal_restarts_without_writers(void **state)
+{
+    (void)state;
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    while (wal_frames() < THRESHOLD * 4) {
+        assert_int_equal(commit_rows(4), 0);
+        sleep_ms(2);
+    }
+    checkpointer_stats_t s;
+    checkpointer_stats(&s);
+    unsigned long forced0 = s.forced;
+    /* No writes from here. */
+    uint32_t f = UINT32_MAX;
+    for (int i = 0; i < 400 && f > THRESHOLD; i++) {
+        sleep_ms(25);
+        f = wal_frames();
+    }
+    checkpointer_stats(&s);
+    print_message("  idle: %u frames, %lu locked rounds\n", f, s.forced - forced0);
+    assert_true(f <= THRESHOLD);
+    assert_int_equal(s.forced - forced0, 1);
+}
+
+/*
  * A writer faster than a checkpoint can copy (no pause at all, a few
  * hundred MiB a second into the page cache), on a fast device and on one
  * whose syncs take 50 ms: the WAL holds to the hard cap (B181). What it
@@ -1208,6 +1236,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_no_commit_checkpoints, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_stays_near_the_cap_under_a_long_writer, setup, teardown),
         cmocka_unit_test_setup_teardown(test_no_lock_below_the_hard_cap, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_idle_wal_restarts_without_writers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_is_bounded_under_a_writer_faster_than_checkpoints, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_hard_cap_holds_on_a_slow_device, setup, teardown),
         cmocka_unit_test_setup_teardown(test_only_bulk_writers_wait_at_the_hard_cap, setup, teardown),
