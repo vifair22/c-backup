@@ -1091,7 +1091,11 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
  * threshold. A batch cut at BATCH_FILES small files holds a few tens of MiB,
  * and on M12's D2 (96,000 files, 25 MB a batch) the per-file requests made
  * each write and each syncfs slower on btrfs: 62 s against 39 s without them.
- * So a file is hinted only once its batch, counting the file, reaches this.
+ * So a batch is hinted only when it will reach this size, decided by
+ * looking ahead at the files it will hold. Deciding from what the batch held
+ * so far left the first 128 MiB of every 1 GiB batch unhinted, and M13's D1
+ * restore (1,605 files, about 4 MB each) spent 61-83 s writing against
+ * M12's 44-58 s.
  */
 #define BATCH_EARLY_WB_BYTES ((uint64_t)128 * 1024 * 1024)
 static uint64_t g_early_wb_bytes = BATCH_EARLY_WB_BYTES;
@@ -1099,6 +1103,27 @@ static uint64_t g_early_wb_bytes = BATCH_EARLY_WB_BYTES;
 void restore_set_early_wb_bytes(uint64_t bytes)
 {
     g_early_wb_bytes = bytes ? bytes : BATCH_EARLY_WB_BYTES;
+}
+
+/*
+ * Whether the regular files from row `from` reach `want` bytes within one
+ * batch's worth of files. *end is the row after the last one looked at;
+ * the caller looks again only past it, so the restore reads each row here
+ * at most once.
+ */
+static int batch_ahead_is_large(const db_result_t *r, int from, uint64_t want, int *end)
+{
+    uint64_t sum = 0;
+    uint32_t files = 0;
+    int i = from;
+    for (; i < r->nrows && files < BATCH_FILES; i++) {
+        if ((uint32_t)strtoul(r->rows[i][8], NULL, 10) != NODE_TYPE_REG) continue;
+        sum += strtoull(r->rows[i][6], NULL, 10);
+        files++;
+        if (sum >= want) { *end = i + 1; return 1; }
+    }
+    *end = i;
+    return 0;
 }
 
 typedef struct {
@@ -1463,6 +1488,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
      * run has swept it for partial files yet. */
     char *swept = calloc((size_t)r->nrows + 1, 1);
     rename_batch_t *batch = calloc(1, sizeof(*batch));
+    int wb_large = 0, wb_seen = 0;    /* early writeback: see BATCH_EARLY_WB_BYTES */
     if (!swept || !batch) {
         free(swept);
         free(batch);
@@ -1880,7 +1906,8 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         store_set_io_progress(store, restore_bytes, &io);
         restore_prefetch_at(rp, i);
         int dest_err = 0;
-        content_restore_early_wb = batch->bytes + nsize >= g_early_wb_bytes;
+        if (batch->n == 0 && i >= wb_seen) wb_large = batch_ahead_is_large(r, i, g_early_wb_bytes, &wb_seen);
+        content_restore_early_wb = wb_large || batch->bytes + nsize >= g_early_wb_bytes;
         status_t lst = restore_file(store, chash, pfd, full, nsize, mode, uid, gid,
                                     mtime, xhash, ahash, tmp, sizeof(tmp), &sz, &dest_err);
         content_restore_early_wb = 1;

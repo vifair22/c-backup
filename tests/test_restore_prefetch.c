@@ -303,6 +303,26 @@ static void test_a_large_file_is_hinted_in_any_batch(void **state)
     restore_set_early_wb_bytes(0);
 }
 
+/*
+ * A batch of files each below the size, that together reach it, is hinted
+ * from its first file: M13 left the first 128 MiB of every D1 batch to the
+ * sync, and its restores were slower than M12's in every round.
+ */
+static void test_a_large_batch_is_hinted_from_its_first_file(void **state)
+{
+    (void)state;
+    int64_t snap = backup_src();
+    counts_reset();
+    restore_set_early_wb_bytes(BIG_A + BIG_B);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, TEST_DST, NULL, &rr), OK);
+    assert_int_equal(trees_differ(), 0);
+    pack_writeback_drain();
+    assert_true(g_sfr_bytes >= BIG_A + BIG_B);
+    restore_set_early_wb_bytes(0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -312,6 +332,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_starts_writeback_of_large_files, setup, teardown),
         cmocka_unit_test_setup_teardown(test_small_batches_leave_writeback_to_the_sync, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_large_file_is_hinted_in_any_batch, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_large_batch_is_hinted_from_its_first_file, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
