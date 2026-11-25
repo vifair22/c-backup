@@ -245,9 +245,11 @@ static void report(const char *what, const writer_t *w, uint32_t peak)
 /*
  * The WAL stays bounded under a writer that keeps committing, as a long
  * backup does. Frames arrive while every PASSIVE runs, so PASSIVE alone
- * rarely finds the copy complete at a BEGIN; the escalation (one more
- * PASSIVE with the write lock held, over a small remainder) is what lets
- * the WAL restart, and it stays near the cap.
+ * rarely finds the copy complete at a BEGIN, and below the hard cap the
+ * thread no longer takes the write lock to finish it (B233): the WAL runs
+ * to the hard cap, and the locked round there restarts it. Before B233 it
+ * escalated below the cap and the WAL stayed under three thresholds, at
+ * the cost of a request waiting for each escalation's syncs.
  */
 static void test_wal_stays_near_the_cap_under_a_long_writer(void **state)
 {
@@ -263,8 +265,8 @@ static void test_wal_stays_near_the_cap_under_a_long_writer(void **state)
     checkpointer_stats_t s;
     checkpointer_stats(&s);
     /* Enough written that an unbounded WAL would be several caps over. */
-    assert_true((uint64_t)w.commits * 4 * 4 > (uint64_t)THRESHOLD * CKPT_CAP_FACTOR * 3);
-    assert_true(peak < THRESHOLD * 3);
+    assert_true((uint64_t)w.commits * 4 * 4 > (uint64_t)THRESHOLD * CKPT_HARD_FACTOR);
+    assert_true(peak < THRESHOLD * CKPT_HARD_FACTOR + THRESHOLD * CKPT_HARD_FACTOR / 4);
     assert_true(s.passive > 0);
     /* The restarts were the checkpointer's own: the header sync landed on
      * its thread, not on the writer's next commit. */
@@ -272,6 +274,40 @@ static void test_wal_stays_near_the_cap_under_a_long_writer(void **state)
                   s.pre_restarts, s.pre_restart_misses, (double)s.max_restart_ns / 1e6);
     assert_true(s.pre_restarts > 0);
     assert_true(w.max_ms < 2000);
+}
+
+/*
+ * Below the hard cap no round takes the write lock (B233), however far
+ * past the threshold the WAL goes, and once the writer pauses the next
+ * commit begins on a complete copy and restarts the WAL.
+ */
+static void test_no_lock_below_the_hard_cap(void **state)
+{
+    (void)state;
+    assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
+    uint32_t peak = 0;
+    while (peak < THRESHOLD * 8) {
+        assert_int_equal(commit_rows(4), 0);
+        uint32_t f = wal_frames();
+        if (f > peak) peak = f;
+        sleep_ms(2);
+    }
+    checkpointer_stats_t s;
+    checkpointer_stats(&s);
+    assert_true(s.passive > 0);
+    assert_int_equal(s.forced, 0);
+    /* Idle: the copy completes, and the next writer restarts the WAL. */
+    uint32_t f = UINT32_MAX;
+    for (int i = 0; i < 300 && f > THRESHOLD; i++) {
+        sleep_ms(20);
+        assert_int_equal(commit_rows(1), 0);
+        f = wal_frames();
+    }
+    print_message("  WAL peak %u frames; %lu unlocked rounds, %lu locked; %u frames after a pause\n",
+                  peak, s.passive, s.forced, f);
+    assert_true(f <= THRESHOLD);
+    checkpointer_stats(&s);
+    assert_int_equal(s.forced, 0);
 }
 
 /*
@@ -1171,6 +1207,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_no_commit_checkpoints, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_stays_near_the_cap_under_a_long_writer, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_no_lock_below_the_hard_cap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_wal_is_bounded_under_a_writer_faster_than_checkpoints, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_hard_cap_holds_on_a_slow_device, setup, teardown),
         cmocka_unit_test_setup_teardown(test_only_bulk_writers_wait_at_the_hard_cap, setup, teardown),

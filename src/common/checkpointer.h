@@ -26,22 +26,18 @@
  *   as long as the backup lasts. Measured: past 20,000 frames on a
  *   1,000-frame threshold in test_db_stress, every PASSIVE complete.
  *
- *   Escalation. After a PASSIVE, once the WAL holds at least the threshold,
- *   the thread runs further unlocked PASSIVEs (up to four), each copying
- *   only what arrived during the last, until what is left uncopied is
- *   small (a quarter of the threshold, at most 1,024 frames, 4 MiB). Then
- *   it takes the db_txn write lock and copies the rest: the batch holder
- *   commits to let the lock go, and the next db_txn writer begins on a
- *   complete copy and restarts the WAL. A write issued outside db_txn can
- *   still land during that copy, so under the lock it copies again until
- *   the wal-index shows nothing left (four rounds at most). So the WAL
- *   restarts about once per threshold. Writers faster than the copy keep
- *   the remainder from shrinking (test_db_stress on NVMe: 1,000 to 2,000
- *   frames a round), but what is left is then about what arrived during
- *   the last round, so copying it under the lock takes about as long as
- *   that round did: the thread escalates when the remainder is small or
- *   the last round took no more than 200 ms, and otherwise waits for the
- *   next tick. So the lock is held for about one short copy.
+ *   No lock below the hard cap (B233). After a PASSIVE the thread runs
+ *   further unlocked PASSIVEs (up to four), each copying only what arrived
+ *   during the last, until what is left uncopied is small (a quarter of the
+ *   threshold, at most 1,024 frames). It does not take the write lock to
+ *   finish the copy, as it did until B233: a round under the lock syncs
+ *   what it copies and the restart's header, and on a busy device each
+ *   sync waits for the device's whole queue however few its own pages, so
+ *   requests waited seconds (23.3 s on FS2) for remainders of a few frames.
+ *   The WAL restarts when a writer begins on a complete copy, which an
+ *   idle moment or a gap between a backup's batches gives; under a backup
+ *   that leaves none, the WAL grows to the hard cap and the locked round
+ *   there restarts it.
  *
  *   The hard cap (16 x the threshold, 1 GiB by default; B181). Past it the
  *   thread runs one unlocked PASSIVE and then takes the lock, with no
