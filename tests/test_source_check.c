@@ -629,6 +629,49 @@ static void test_guard_edges(void **state)
     source_guards_free(g, ng);
 }
 
+/*
+ * A source's parent holding nothing but the directories down to an empty
+ * stub holds nothing: an ad-hoc backup of the stub records the parent too,
+ * and M13's retM run on FS2 reported such a parent "not empty" at a snapshot
+ * with 0 files. Judged the same from the tree and from the node index.
+ */
+static void test_a_parent_of_an_empty_stub_is_empty(void **state)
+{
+    (void)state;
+    backup_result_t res;
+    fill(TEST_SRC, 3, 100);
+    backup1(TEST_SRC, SOURCE_DROP_PCT_DEFAULT, &res);
+    backup_result_free(&res);
+    rmrf(TEST_SRC);
+    assert_int_equal(mkdir(TEST_SRC, 0700), 0);
+    assert_int_equal(mkdir(TEST_SRC "/a", 0700), 0);
+    assert_int_equal(mkdir(TEST_SRC "/a/stub", 0700), 0);
+    backup1(TEST_SRC "/a/stub", SOURCE_DROP_PCT_DEFAULT, &res);
+    backup_result_free(&res);
+
+    uint32_t ids[] = { 1, 2 };
+    source_guard_t *g = NULL;
+    uint32_t ng = 0;
+    assert_int_equal(source_guard_find(store, db, repo_id, ids, 2, &g, &ng), OK);
+    assert_int_equal(ng, 1);
+    assert_string_equal(g[0].source, TEST_SRC);
+    assert_int_equal(g[0].snap_id, 1);
+    source_guards_free(g, ng);
+
+    /* Trees that cannot be read: the node index answers the same. */
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    assert_int_equal(db_write(db, "UPDATE snapshots SET root_tree_hash = ? WHERE repo_id = ?",
+                              (const char *[]){ "00000000000000000000000000000000"
+                                                "00000000000000000000000000000000",
+                                                repo, NULL }, NULL), 0);
+    assert_int_equal(source_guard_find(store, db, repo_id, ids, 2, &g, &ng), OK);
+    assert_int_equal(ng, 1);
+    assert_string_equal(g[0].source, TEST_SRC);
+    assert_int_equal(g[0].snap_id, 1);
+    source_guards_free(g, ng);
+}
+
 int main(void)
 {
     setenv("TZ", "UTC", 1);
@@ -648,6 +691,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_guard_edges, setup, teardown),
         cmocka_unit_test_setup_teardown(test_adhoc_backups_are_guarded, setup, teardown),
         cmocka_unit_test_setup_teardown(test_adhoc_guard_survives_lost_roots, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_parent_of_an_empty_stub_is_empty, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
