@@ -169,6 +169,10 @@ typedef struct { uint32_t left; int rc; uint64_t t_locked; } locked_arg_t;
 #define CKPT_THROTTLE_MAX_NS (2000ull * 1000000ull)   /* and never wait longer */
 #define CKPT_BLOCKED_NS      (1000ull * 1000000ull)   /* after a copy that could not finish */
 #define CKPT_IDLE_NS         (5000ull * 1000000ull)   /* WAL unchanged this long: restart it */
+/* The idle restart's view: the WAL's size when last seen to change, and
+ * when. The checkpointer thread's own; reset at start. */
+static uint32_t idle_frames;
+static uint64_t idle_since;
 /* How long a locked round waits for pooled reads already running before it
  * copies without holding the readers out, and how many rounds in a row may
  * do that before one waits for them however long they take (B274). */
@@ -398,8 +402,6 @@ static void tick(void)
      * stays idle. Once the WAL has not grown for CKPT_IDLE_NS the locked
      * round restarts it: nothing is writing, so nobody waits for its syncs.
      */
-    static uint32_t idle_frames;
-    static uint64_t idle_since;
     uint64_t t_now = now_ns();
     if (frames != idle_frames) { idle_frames = frames; idle_since = t_now; }
     if (frames >= g_threshold && left == 0) {
@@ -712,6 +714,8 @@ status_t checkpointer_start(const char *db_path, int threshold_pages, unsigned i
         pthread_mutex_unlock(&g_mu);
         return ERR_IO;
     }
+    idle_frames = 0;
+    idle_since = now_ns();
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
