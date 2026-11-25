@@ -1084,6 +1084,23 @@ static status_t restore_file(store_t *store, const char *chash, int pfd,
 #define BATCH_FILES 4096u
 #define BATCH_BYTES ((uint64_t)1024 * 1024 * 1024)
 
+/*
+ * Early writeback (chunklist.c) pays only when a batch holds enough dirty
+ * data for the syncfs to wait long on it: a 1 GiB batch of large files,
+ * which nothing flushes before the syncfs on a host with a large dirty
+ * threshold. A batch cut at BATCH_FILES small files holds a few tens of MiB,
+ * and on M12's D2 (96,000 files, 25 MB a batch) the per-file requests made
+ * each write and each syncfs slower on btrfs: 62 s against 39 s without them.
+ * So a file is hinted only once its batch, counting the file, reaches this.
+ */
+#define BATCH_EARLY_WB_BYTES ((uint64_t)128 * 1024 * 1024)
+static uint64_t g_early_wb_bytes = BATCH_EARLY_WB_BYTES;
+
+void restore_set_early_wb_bytes(uint64_t bytes)
+{
+    g_early_wb_bytes = bytes ? bytes : BATCH_EARLY_WB_BYTES;
+}
+
 typedef struct {
     char    *rel;      /* the final entry, relative to the destination */
     char    *tmp;      /* the temporary file's name in the same directory */
@@ -1863,8 +1880,10 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         store_set_io_progress(store, restore_bytes, &io);
         restore_prefetch_at(rp, i);
         int dest_err = 0;
+        content_restore_early_wb = batch->bytes + nsize >= g_early_wb_bytes;
         status_t lst = restore_file(store, chash, pfd, full, nsize, mode, uid, gid,
                                     mtime, xhash, ahash, tmp, sizeof(tmp), &sz, &dest_err);
+        content_restore_early_wb = 1;
         store_set_io_progress(store, prev_io, prev_io_ctx);
 
         if (lst != OK && cancelled(opts)) {

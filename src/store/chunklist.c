@@ -665,6 +665,8 @@ static void io_add(int write, uint64_t t0)
 #define RESTORE_WB_STEP ((uint64_t)8 * 1024 * 1024)
 #define RESTORE_WB_MIN  ((uint64_t)1024 * 1024)
 
+_Thread_local int content_restore_early_wb = 1;
+
 status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                                int out_fd, uint64_t *out_size, int *out_write_failed)
 {
@@ -693,7 +695,7 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
             st = pwrite_full(out_fd, data, len, 0);
             io_add(1, t0);
             if (st != OK) *wf = 1;
-            else if (len >= RESTORE_WB_MIN) pack_writeback_start(out_fd, 0, len);
+            else if (content_restore_early_wb && len >= RESTORE_WB_MIN) pack_writeback_start(out_fd, 0, len);
         }
         free(data);
         read_budget_release(taken);
@@ -731,7 +733,7 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
         leaf_free(data, x.length);
         if (st != OK) { *wf = 1; break; }
         if (x.offset + x.length > wb_end) wb_end = x.offset + x.length;
-        if (wb_end - wb_done >= RESTORE_WB_STEP) {
+        if (content_restore_early_wb && wb_end - wb_done >= RESTORE_WB_STEP) {
             pack_writeback_start(out_fd, wb_done, wb_end - wb_done);
             wb_done = wb_end;
         }
@@ -739,7 +741,7 @@ status_t content_restore_fd_ex(store_t *store, const uint8_t hash[OBJECT_HASH_SI
     }
     chunklist_iter_close(it);
     if (st != OK) return st;
-    if (wb_end > wb_done && wb_end >= RESTORE_WB_MIN)
+    if (content_restore_early_wb && wb_end > wb_done && wb_end >= RESTORE_WB_MIN)
         pack_writeback_start(out_fd, wb_done, wb_end - wb_done);
     /* Extends over any trailing hole, and leaves interior gaps unwritten,
      * which on a fresh file is what makes them holes. */

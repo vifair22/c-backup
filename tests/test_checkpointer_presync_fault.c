@@ -171,15 +171,13 @@ static void test_a_locked_round_syncs_only_its_own_copy(void **state)
     full_vfs_db_sync_hook = on_db_sync;
     fault_sync_hook = on_libc_sync;
     assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
-    /* Below the hard cap: a writer with a pause, as a backup is between
-     * batches, so every escalation is the below-cap kind B233 was. */
-    uint64_t end = now_ms() + 4000;
+    /* A writer that never pauses: since B233 the locked rounds are the
+     * ones at the hard cap, which this reaches many times. */
+    uint64_t end = now_ms() + 6000;
     unsigned commits = 0;
     while (now_ms() < end) {
         assert_int_equal(commit_rows(4), 0);
         commits++;
-        struct timespec ts = { 0, 2 * 1000000L };
-        nanosleep(&ts, NULL);
     }
     checkpointer_stop();
     checkpointer_stats_t s;
@@ -195,10 +193,8 @@ static void test_a_locked_round_syncs_only_its_own_copy(void **state)
      * completed the copy. */
     assert_true(s.passive > 0);
     assert_true(atomic_load(&g_locked_syncs) > 0);
-    assert_true(s.max_wal_frames < THRESHOLD * CKPT_HARD_FACTOR);
     /* Every sync under the lock wrote out that round's copy and nothing
-     * else. Before B233 nearly every one also carried the unlocked rounds'
-     * pages: 4.7 MiB here, 23 s on FS2. */
+     * else: the unlocked round before it was presynced. */
     assert_int_equal(atomic_load(&g_carried), 0);
     assert_true(atomic_load(&g_presyncs) >= s.forced);
 }

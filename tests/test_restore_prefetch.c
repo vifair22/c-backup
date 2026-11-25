@@ -248,15 +248,16 @@ static void test_subpath_restore_asks_only_for_its_files(void **state)
 }
 
 /*
- * Writeback starts for every restored file of 1 MiB or more, all of it,
- * before the batch sync would have started it; the smaller ones are left
- * to that sync.
+ * In a batch large enough for it (here any), writeback starts for every
+ * restored file of 1 MiB or more, all of it, before the batch sync would
+ * have started it; the smaller ones are left to that sync.
  */
 static void test_restore_starts_writeback_of_large_files(void **state)
 {
     (void)state;
     int64_t snap = backup_src();
     counts_reset();
+    restore_set_early_wb_bytes(1);
 
     restore_result_t rr;
     assert_int_equal(restore_run(store, db, repo_id, snap, TEST_DST, NULL, &rr), OK);
@@ -266,6 +267,40 @@ static void test_restore_starts_writeback_of_large_files(void **state)
     assert_true(g_sfr >= 2);
     assert_true(g_sfr_bytes >= BIG_A + BIG_B);
     assert_true(g_sfr_bytes < BIG_A + BIG_B + MID_C);
+    restore_set_early_wb_bytes(0);
+}
+
+/*
+ * A batch far below the early-writeback size, as every batch of small files
+ * is (M12's D2): no request at all; the batch sync writes it out.
+ */
+static void test_small_batches_leave_writeback_to_the_sync(void **state)
+{
+    (void)state;
+    int64_t snap = backup_src();
+    counts_reset();
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, TEST_DST, NULL, &rr), OK);
+    assert_int_equal(trees_differ(), 0);
+    pack_writeback_drain();
+    assert_int_equal(g_sfr, 0);
+}
+
+/* A file that reaches the size by itself is hinted whatever its batch. */
+static void test_a_large_file_is_hinted_in_any_batch(void **state)
+{
+    (void)state;
+    int64_t snap = backup_src();
+    counts_reset();
+    restore_set_early_wb_bytes(BIG_B);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, TEST_DST, NULL, &rr), OK);
+    assert_int_equal(trees_differ(), 0);
+    pack_writeback_drain();
+    assert_true(g_sfr_bytes >= BIG_B);
+    restore_set_early_wb_bytes(0);
 }
 
 int main(void)
@@ -275,6 +310,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_resumed_restore_asks_for_nothing_it_skips, setup, teardown),
         cmocka_unit_test_setup_teardown(test_subpath_restore_asks_only_for_its_files, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_starts_writeback_of_large_files, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_small_batches_leave_writeback_to_the_sync, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_large_file_is_hinted_in_any_batch, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
