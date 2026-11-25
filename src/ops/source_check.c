@@ -370,10 +370,49 @@ int source_check_describe(const source_report_t *r, int n, int64_t snap_id, int 
 
 enum { PATH_ABSENT = 0, PATH_EMPTY = 1, PATH_FULL = 2 };
 
+/* PATH_FULL if anything but a directory is below the tree `dir`, else
+ * PATH_EMPTY. Stops at the first such entry. */
+static status_t tree_holds_files(obj_loader_t *ld, const uint8_t dir[OBJECT_HASH_SIZE], int *out)
+{
+    uint8_t (*stack)[OBJECT_HASH_SIZE] = malloc((size_t)OBJECT_HASH_SIZE * 16);
+    size_t n = 0, cap = 16;
+    if (!stack) return set_error(ERR_NOMEM, "out of memory");
+    memcpy(stack[n++], dir, OBJECT_HASH_SIZE);
+    status_t st = OK;
+    *out = PATH_EMPTY;
+    while (n && st == OK && *out == PATH_EMPTY) {
+        uint8_t cur[OBJECT_HASH_SIZE];
+        memcpy(cur, stack[--n], sizeof(cur));
+        manifest_iter_t *it = NULL;
+        st = manifest_iter_open(ld, cur, NULL, NULL, &it);
+        if (st != OK) break;
+        for (;;) {
+            const manifest_entry_t *me = NULL;
+            int done = 0;
+            st = manifest_iter_next(it, &me, &done);
+            if (st != OK || done || !me) break;
+            if (me->type != NODE_TYPE_DIR) { *out = PATH_FULL; break; }
+            if (n == cap) {
+                void *g = realloc(stack, (size_t)OBJECT_HASH_SIZE * cap * 2);
+                if (!g) { st = set_error(ERR_NOMEM, "out of memory"); break; }
+                stack = g;
+                cap *= 2;
+            }
+            memcpy(stack[n++], me->target_hash, OBJECT_HASH_SIZE);
+        }
+        manifest_iter_close(it);
+    }
+    free(stack);
+    return st;
+}
+
 /*
  * What the snapshot whose root tree is `root` holds at `path`: absent, an
- * empty directory, or something. One tree read per component, then one for
- * the directory itself, which is abandoned at its first entry.
+ * empty directory, or something. Empty means nothing but directories below
+ * it: an ad-hoc backup of /a/b/c records /a and /a/b too, and /a/b holding
+ * only an empty c holds nothing (FS2's M13 retM run reported such a parent
+ * "not empty"). One tree read per component, then the directory's subtree,
+ * abandoned at its first entry that is not a directory.
  */
 static status_t tree_path_state(store_t *store, const uint8_t root[OBJECT_HASH_SIZE],
                                 const char *path, int *out)
@@ -414,16 +453,7 @@ static status_t tree_path_state(store_t *store, const uint8_t root[OBJECT_HASH_S
             return OK;
         }
     }
-    manifest_iter_t *it = NULL;
-    status_t st = manifest_iter_open(&ld, cur, NULL, NULL, &it);
-    if (st != OK) return st;
-    const manifest_entry_t *me = NULL;
-    int done = 0;
-    st = manifest_iter_next(it, &me, &done);
-    manifest_iter_close(it);
-    if (st != OK) return st;
-    *out = done ? PATH_EMPTY : PATH_FULL;
-    return OK;
+    return tree_holds_files(&ld, cur, out);
 }
 
 /*
@@ -470,16 +500,47 @@ static int index_path_state(cutils_db_t *db, const char *repo, const char *snap,
         while (*p == '/') p++;
     }
     if (!is_dir) return PATH_FULL;
-    r = NULL;
-    if (db_execute(db, "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ?"
-                       " AND parent_node_id = ? LIMIT 1",
-                   (const char *[]){ repo, snap, cur, NULL }, &r) != 0) {
+    /* As tree_holds_files: empty unless something not a directory is below. */
+    char dirtype[8];
+    snprintf(dirtype, sizeof(dirtype), "%d", NODE_TYPE_DIR);
+    char **stack = malloc(16 * sizeof(*stack));
+    size_t n = 0, cap = 16;
+    int state = PATH_EMPTY;
+    if (!stack || !(stack[n++] = strdup(cur))) { free(stack); return -1; }
+    while (n && state == PATH_EMPTY) {
+        char *id = stack[--n];
+        r = NULL;
+        if (db_execute(db, "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ?"
+                           " AND parent_node_id = ? AND type != ? LIMIT 1",
+                       (const char *[]){ repo, snap, id, dirtype, NULL }, &r) != 0) {
+            state = -1;
+        } else if (r && r->nrows > 0) {
+            state = PATH_FULL;
+        } else {
+            db_result_free(r);
+            r = NULL;
+            if (db_execute(db, "SELECT id FROM nodes WHERE repo_id = ? AND snap_id = ?"
+                               " AND parent_node_id = ? AND type = ?",
+                           (const char *[]){ repo, snap, id, dirtype, NULL }, &r) != 0) {
+                state = -1;
+            }
+            for (int k = 0; state == PATH_EMPTY && r && k < r->nrows; k++) {
+                if (n == cap) {
+                    char **g = realloc(stack, cap * 2 * sizeof(*stack));
+                    if (!g) { state = -1; break; }
+                    stack = g;
+                    cap *= 2;
+                }
+                if (!(stack[n] = strdup(r->rows[k][0]))) { state = -1; break; }
+                n++;
+            }
+        }
         db_result_free(r);
-        return -1;
+        free(id);
     }
-    int full = r && r->nrows > 0;
-    db_result_free(r);
-    return full ? PATH_FULL : PATH_EMPTY;
+    while (n) free(stack[--n]);
+    free(stack);
+    return state;
 }
 
 void source_guards_free(source_guard_t *g, uint32_t n)

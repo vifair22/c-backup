@@ -1624,6 +1624,7 @@ A snapshot is kept if any of these holds:
 4. It is the newest snapshot in which one of the repository's sources is
    not empty. A source here is any path a backup of the repository read,
    configured or given to an ad-hoc `c-backup backup <id> <path>`.
+   A source holding nothing but empty directories counts as empty.
    Emptiness is read from the snapshot's own tree, so it holds
    after a reindex. This keeps at most one extra snapshot per source, and
    only while newer snapshots of that source are empty (section 6.7). The
