@@ -374,7 +374,7 @@ enum { PATH_ABSENT = 0, PATH_EMPTY = 1, PATH_FULL = 2 };
  * PATH_EMPTY. Stops at the first such entry. */
 static status_t tree_holds_files(obj_loader_t *ld, const uint8_t dir[OBJECT_HASH_SIZE], int *out)
 {
-    uint8_t (*stack)[OBJECT_HASH_SIZE] = malloc(OBJECT_HASH_SIZE * 16);
+    uint8_t (*stack)[OBJECT_HASH_SIZE] = malloc((size_t)OBJECT_HASH_SIZE * 16);
     size_t n = 0, cap = 16;
     if (!stack) return set_error(ERR_NOMEM, "out of memory");
     memcpy(stack[n++], dir, OBJECT_HASH_SIZE);
@@ -390,10 +390,10 @@ static status_t tree_holds_files(obj_loader_t *ld, const uint8_t dir[OBJECT_HASH
             const manifest_entry_t *me = NULL;
             int done = 0;
             st = manifest_iter_next(it, &me, &done);
-            if (st != OK || done) break;
+            if (st != OK || done || !me) break;
             if (me->type != NODE_TYPE_DIR) { *out = PATH_FULL; break; }
             if (n == cap) {
-                void *g = realloc(stack, OBJECT_HASH_SIZE * cap * 2);
+                void *g = realloc(stack, (size_t)OBJECT_HASH_SIZE * cap * 2);
                 if (!g) { st = set_error(ERR_NOMEM, "out of memory"); break; }
                 stack = g;
                 cap *= 2;
