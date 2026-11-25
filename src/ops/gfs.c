@@ -447,11 +447,12 @@ static status_t gfs_group(store_t *store, cutils_db_t *db, int64_t repo_id,
     uint32_t pruned_snaps = 0;
 
     /*
-     * The file group's guard (B295): each configured source keeps the
-     * newest snapshot in which it is not empty, so a run of empty backups
-     * of a share that was not mounted can never push the last good one
-     * out, however many there are. Read from the repository's trees, so a
-     * reindex does not lose it; at most one extra snapshot per source.
+     * The file group's guard (B295): each source root, configured or used
+     * by an ad-hoc backup, keeps the newest snapshot in which it is not
+     * empty, so a run of empty backups of a share that was not mounted can
+     * never push the last good one out, however many there are. Emptiness
+     * is read from the repository's trees, so a reindex does not lose it;
+     * at most one extra snapshot per root.
      */
     source_guard_t *guards = NULL;
     uint32_t n_guards = 0;

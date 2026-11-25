@@ -349,7 +349,7 @@ static void test_per_source_history(void **state)
  * empty 3 (against which 61 would look like growth): 63% fewer files,
  * past the default 50, so it warns too.
  */
-static void build_fs2_shape(void)
+static void build_fs2_shape_as(int configured)
 {
     backup_result_t res;
     fill(TEST_SRC, 164, 64);
@@ -376,9 +376,70 @@ static void build_fs2_shape(void)
                            "63% fewer files"));
     backup_result_free(&res);
 
-    configure_source(TEST_SRC);
+    if (configured) configure_source(TEST_SRC);
     /* One day, so only the newest holds a tier. */
     for (int64_t s = 1; s <= 4; s++) set_ts(s, SUNDAY_2024_01_07 + s * 60);
+}
+
+static void build_fs2_shape(void) { build_fs2_shape_as(1); }
+
+/*
+ * M12's A4 case: ad-hoc `backup <id> <path>` with no configured source,
+ * then the stub for two more nights, then a real pass at keep_snaps 1 and
+ * every tier 1. The root is the one each backup recorded, and snapshot 4
+ * survives beyond the policy.
+ */
+static void adhoc_then_empty_nights(void)
+{
+    build_fs2_shape_as(0);
+    rmrf(TEST_SRC);
+    assert_int_equal(mkdir(TEST_SRC, 0700), 0);
+    backup_result_t res;
+    for (int i = 0; i < 2; i++) {
+        backup1(TEST_SRC, SOURCE_DROP_PCT_DEFAULT, &res);
+        backup_result_free(&res);
+    }
+    set_ts(5, SUNDAY_2024_01_07 + 5 * 60);
+    set_ts(6, SUNDAY_2024_01_07 + 6 * 60);
+}
+
+static void assert_adhoc_pass_keeps_4(void)
+{
+    gfs_retention_t ret = { 1, 1, 1, 1, 1 };
+    gfs_result_t gr = { 0 };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 6, 0, 1, &gr), OK);
+    assert_int_equal(gr.pruned, 4);   /* 1, 2, 3, 5 */
+    assert_false(pruned_has(&gr, 4));
+    assert_false(pruned_has(&gr, 6));
+    assert_int_equal(gr.n_guards, 1);
+    assert_string_equal(gr.guards[0].source, TEST_SRC);
+    assert_int_equal(gr.guards[0].snap_id, 4);
+    assert_int_equal(gr.guards[0].held, 1);
+    gfs_result_free(&gr);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/snapshots/4", TEST_REPO);
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+}
+
+static void test_adhoc_backups_are_guarded(void **state)
+{
+    (void)state;
+    adhoc_then_empty_nights();
+    assert_adhoc_pass_keeps_4();
+}
+
+/* The same after a reindex dropped the recorded roots: each snapshot's
+ * tree implies its root. */
+static void test_adhoc_guard_survives_lost_roots(void **state)
+{
+    (void)state;
+    adhoc_then_empty_nights();
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    assert_int_equal(db_write(db, "DELETE FROM snapshot_sources WHERE repo_id = ?",
+                              (const char *[]){ repo, NULL }, NULL), 0);
+    assert_adhoc_pass_keeps_4();
 }
 
 static void test_fs2_shape_dry_run(void **state)
@@ -444,8 +505,8 @@ static void test_fs2_shape_then_empty_nights(void **state)
 
 /*
  * The shipped defaults, over forty days of empty backups after one good
- * one, the shape test_gfs.c uses: without the guard the good one has aged
- * past every tier and goes; with it, it stays, and only it.
+ * one, the shape test_gfs.c uses: the good one has aged past every tier,
+ * and the guard alone keeps it (held).
  */
 static void test_shipped_defaults_keep_the_last_good(void **state)
 {
@@ -466,17 +527,20 @@ static void test_shipped_defaults_keep_the_last_good(void **state)
     gfs_retention_t ret = { 1, 7, 4, 12, 3 };   /* config.yaml's defaults */
     gfs_result_t gr = { 0 };
 
-    /* Control: no configured source, no guard, and snapshot 1 goes. */
+    /* Ad-hoc backups, no configured source: the recorded root guards it
+     * all the same (M12 A4). */
     assert_int_equal(gfs_run(store, db, repo_id, &ret, (uint32_t)empties + 1, 1, 1, &gr), OK);
-    assert_true(pruned_has(&gr, 1));
-    assert_int_equal(gr.n_guards, 0);
-    uint32_t control = gr.pruned;
+    assert_false(pruned_has(&gr, 1));
+    assert_int_equal(gr.n_guards, 1);
+    assert_int_equal(gr.guards[0].held, 1);
+    uint32_t adhoc = gr.pruned;
     gfs_result_free(&gr);
 
+    /* Configuring the same path changes nothing: one root, one guard. */
     configure_source(TEST_SRC);
     assert_int_equal(gfs_run(store, db, repo_id, &ret, (uint32_t)empties + 1, 0, 1, &gr), OK);
     assert_false(pruned_has(&gr, 1));
-    assert_int_equal(gr.pruned, control - 1);
+    assert_int_equal(gr.pruned, adhoc);
     assert_int_equal(gr.n_guards, 1);
     assert_int_equal(gr.guards[0].snap_id, 1);
     assert_int_equal(gr.guards[0].held, 1);
@@ -582,6 +646,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_shipped_defaults_keep_the_last_good, setup, teardown),
         cmocka_unit_test_setup_teardown(test_guard_reads_the_repository, setup, teardown),
         cmocka_unit_test_setup_teardown(test_guard_edges, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_adhoc_backups_are_guarded, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_adhoc_guard_survives_lost_roots, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

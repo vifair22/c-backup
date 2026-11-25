@@ -489,6 +489,168 @@ void source_guards_free(source_guard_t *g, uint32_t n)
     free(g);
 }
 
+/* A path set with no repeats; NULL on allocation failure. */
+typedef struct { char **v; uint32_t n, cap; } path_set_t;
+
+static int path_set_add(path_set_t *ps, const char *path, size_t len)
+{
+    for (uint32_t i = 0; i < ps->n; i++)
+        if (strlen(ps->v[i]) == len && memcmp(ps->v[i], path, len) == 0) return 0;
+    if (ps->n == ps->cap) {
+        uint32_t cap = ps->cap ? ps->cap * 2 : 8;
+        char **v = realloc(ps->v, cap * sizeof(*v));
+        if (!v) return -1;
+        ps->v = v;
+        ps->cap = cap;
+    }
+    char *c = malloc(len + 1);
+    if (!c) return -1;
+    memcpy(c, path, len);
+    c[len] = '\0';
+    ps->v[ps->n++] = c;
+    return 0;
+}
+
+static void path_set_free(path_set_t *ps)
+{
+    for (uint32_t i = 0; i < ps->n; i++) free(ps->v[i]);
+    free(ps->v);
+}
+
+/*
+ * The source root a snapshot's tree implies, for a snapshot with no
+ * recorded roots (taken before snapshot_sources existed, or after a reindex
+ * dropped its rows): scan_tree records absolute paths, so the tree is a
+ * chain of one-directory levels down to the root. Stops at the first level
+ * that is not exactly one directory. "/" (several sources, or none) yields
+ * nothing; the head is kept by the policy anyway.
+ */
+static status_t tree_spine(store_t *store, const uint8_t root[OBJECT_HASH_SIZE],
+                           char *out, size_t sz)
+{
+    obj_loader_t ld = obj_loader_store(store);
+    uint8_t cur[OBJECT_HASH_SIZE];
+    memcpy(cur, root, sizeof(cur));
+    size_t off = 0;
+    out[0] = '\0';
+    for (int depth = 0; depth < 64; depth++) {
+        manifest_iter_t *it = NULL;
+        status_t st = manifest_iter_open(&ld, cur, NULL, NULL, &it);
+        if (st != OK) return st;
+        const manifest_entry_t *me = NULL;
+        int done = 0, single_dir = 0;
+        char name[256];
+        size_t nl = 0;
+        uint8_t next[OBJECT_HASH_SIZE];
+        st = manifest_iter_next(it, &me, &done);
+        if (st == OK && !done && me->type == NODE_TYPE_DIR && me->name_len < sizeof(name)) {
+            nl = me->name_len;
+            memcpy(name, me->name, nl);
+            memcpy(next, me->target_hash, sizeof(next));
+            st = manifest_iter_next(it, &me, &done);
+            single_dir = st == OK && done;
+        }
+        manifest_iter_close(it);
+        if (st != OK) return st;
+        if (!single_dir || off + 1 + nl >= sz) break;
+        out[off++] = '/';
+        memcpy(out + off, name, nl);
+        off += nl;
+        out[off] = '\0';
+        memcpy(cur, next, sizeof(cur));
+    }
+    return OK;
+}
+
+static int id_in(const uint32_t *ids, uint32_t n, uint32_t id)
+{
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (ids[mid] == id) return 1;
+        if (ids[mid] < id) lo = mid + 1; else hi = mid;
+    }
+    return 0;
+}
+
+/* The snapshot's root tree hash from the index; 0 when it has none. */
+static int snap_root(cutils_db_t *db, const char *repo, const char *sid,
+                     uint8_t root[OBJECT_HASH_SIZE])
+{
+    db_result_t *rr = NULL;
+    int rc = db_execute(db, "SELECT root_tree_hash FROM snapshots WHERE repo_id = ? AND id = ?",
+                        (const char *[]){ repo, sid, NULL }, &rr);
+    int have = rc == 0 && rr && rr->nrows == 1 && rr->rows[0][0] &&
+               hex_decode(rr->rows[0][0], strlen(rr->rows[0][0]), root) == 0;
+    db_result_free(rr);
+    return have;
+}
+
+/*
+ * Every path that was a source root of a snapshot in the group: the
+ * repository's configured sources, the roots each backup recorded (an
+ * ad-hoc `backup <id> <path>` has no configured source, and its root is
+ * only there, B295 on M12), and for a snapshot with no recorded roots the
+ * root its tree implies. More paths can only keep more.
+ */
+static status_t guard_paths(store_t *store, cutils_db_t *db, const char *repo,
+                            const uint32_t *ids, uint32_t n, path_set_t *ps)
+{
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT value FROM repo_backup_paths WHERE repo_id = ?"
+                       " AND kind = 'source' ORDER BY value",
+                   (const char *[]){ repo, NULL }, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "retention: cannot read the repository's sources");
+    }
+    for (int i = 0; r && i < r->nrows; i++) {
+        const char *p = r->rows[i][0];
+        if (p[0] == '/' && path_set_add(ps, p, strlen(p)) != 0) {
+            db_result_free(r);
+            return set_error(ERR_NOMEM, "retention: source guard");
+        }
+    }
+    db_result_free(r);
+
+    r = NULL;
+    if (db_execute(db, "SELECT snap_id, path FROM snapshot_sources WHERE repo_id = ?"
+                       " ORDER BY snap_id",
+                   (const char *[]){ repo, NULL }, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "retention: cannot read the recorded source roots");
+    }
+    uint8_t *recorded = calloc(n, 1);
+    if (!recorded) { db_result_free(r); return set_error(ERR_NOMEM, "retention: source guard"); }
+    status_t st = OK;
+    for (int i = 0; r && i < r->nrows; i++) {
+        uint32_t sid = (uint32_t)strtoul(r->rows[i][0], NULL, 10);
+        if (!id_in(ids, n, sid)) continue;
+        for (uint32_t k = 0; k < n; k++) if (ids[k] == sid) { recorded[k] = 1; break; }
+        const char *p = r->rows[i][1];
+        if (p[0] == '/' && path_set_add(ps, p, strlen(p)) != 0) {
+            st = set_error(ERR_NOMEM, "retention: source guard");
+            break;
+        }
+    }
+    db_result_free(r);
+
+    for (uint32_t k = 0; st == OK && k < n; k++) {
+        if (recorded[k]) continue;
+        char sid[32];
+        snprintf(sid, sizeof(sid), "%u", ids[k]);
+        uint8_t root[OBJECT_HASH_SIZE];
+        char spine[PATH_MAX];
+        if (!snap_root(db, repo, sid, root) || tree_spine(store, root, spine, sizeof(spine)) != OK) {
+            err_clear();
+            continue;   /* configured and recorded roots still apply */
+        }
+        if (spine[0] && path_set_add(ps, spine, strlen(spine)) != 0)
+            st = set_error(ERR_NOMEM, "retention: source guard");
+    }
+    free(recorded);
+    return st;
+}
+
 status_t source_guard_find(store_t *store, cutils_db_t *db, int64_t repo_id,
                            const uint32_t *ids, uint32_t n,
                            source_guard_t **out, uint32_t *n_out)
@@ -499,35 +661,22 @@ status_t source_guard_find(store_t *store, cutils_db_t *db, int64_t repo_id,
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
-    db_result_t *src = NULL;
-    if (db_execute(db, "SELECT value FROM repo_backup_paths WHERE repo_id = ?"
-                       " AND kind = 'source' ORDER BY value",
-                   (const char *[]){ repo, NULL }, &src) != 0) {
-        db_result_free(src);
-        return set_error(ERR_IO, "retention: cannot read the repository's sources");
-    }
-    if (!src || src->nrows == 0) { db_result_free(src); return OK; }
+    path_set_t ps = { 0 };
+    status_t st = guard_paths(store, db, repo, ids, n, &ps);
+    if (st != OK || ps.n == 0) { path_set_free(&ps); return st; }
 
-    source_guard_t *g = calloc((size_t)src->nrows, sizeof(*g));
-    if (!g) { db_result_free(src); return set_error(ERR_NOMEM, "retention: source guard"); }
+    source_guard_t *g = calloc(ps.n, sizeof(*g));
+    if (!g) { path_set_free(&ps); return set_error(ERR_NOMEM, "retention: source guard"); }
     uint32_t ng = 0;
-    status_t st = OK;
-    for (int s = 0; st == OK && s < src->nrows; s++) {
-        const char *path = src->rows[s][0];
-        if (!path || path[0] != '/') continue;
+    for (uint32_t s = 0; st == OK && s < ps.n; s++) {
+        const char *path = ps.v[s];
         /* Newest first: in the common case the head holds the source and
          * one path walk answers it. */
         for (uint32_t k = n; k-- > 0;) {
             char sid[32];
             snprintf(sid, sizeof(sid), "%u", ids[k]);
-            db_result_t *rr = NULL;
-            int rc = db_execute(db, "SELECT root_tree_hash FROM snapshots"
-                                    " WHERE repo_id = ? AND id = ?",
-                                (const char *[]){ repo, sid, NULL }, &rr);
             uint8_t root[OBJECT_HASH_SIZE];
-            int have = rc == 0 && rr && rr->nrows == 1 && rr->rows[0][0] &&
-                       hex_decode(rr->rows[0][0], strlen(rr->rows[0][0]), root) == 0;
-            db_result_free(rr);
+            int have = snap_root(db, repo, sid, root);
             int state = PATH_FULL;
             if (!have || tree_path_state(store, root, path, &state) != OK) {
                 char why[256];
@@ -549,7 +698,7 @@ status_t source_guard_find(store_t *store, cutils_db_t *db, int64_t repo_id,
             break;
         }
     }
-    db_result_free(src);
+    path_set_free(&ps);
     if (st != OK) { source_guards_free(g, ng); return st; }
     *out = g;
     *n_out = ng;

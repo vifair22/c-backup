@@ -1622,7 +1622,9 @@ A snapshot is kept if any of these holds:
    is daily.
 3. It is tagged. Any tag protects a snapshot from retention, whatever its age.
 4. It is the newest snapshot in which one of the repository's sources is
-   not empty. Emptiness is read from the snapshot's own tree, so it holds
+   not empty. A source here is any path a backup of the repository read,
+   configured or given to an ad-hoc `c-backup backup <id> <path>`.
+   Emptiness is read from the snapshot's own tree, so it holds
    after a reindex. This keeps at most one extra snapshot per source, and
    only while newer snapshots of that source are empty (section 6.7). The
    job result's `kept_for_sources` names these snapshots, and the journal
