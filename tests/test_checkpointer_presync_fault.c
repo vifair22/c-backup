@@ -172,10 +172,17 @@ static void test_a_locked_round_syncs_only_its_own_copy(void **state)
     fault_sync_hook = on_libc_sync;
     assert_int_equal(checkpointer_start(TEST_DB, THRESHOLD, 20), OK);
     /* A writer that never pauses: since B233 the locked rounds are the
-     * ones at the hard cap, which this reaches many times. */
-    uint64_t end = now_ms() + 6000;
+     * ones at the hard cap, which this reaches many times. Most of them
+     * find the copy already complete, since the presync's unlocked copy
+     * just ran; about one in thirty has frames left for the lock to copy,
+     * which is the case. So the writer runs until it has seen one, for
+     * at least 6 s and at most 30. */
+    uint64_t start = now_ms();
     unsigned commits = 0;
-    while (now_ms() < end) {
+    for (;;) {
+        uint64_t t = now_ms();
+        if (t - start >= 30000) break;
+        if (t - start >= 6000 && atomic_load(&g_locked_syncs) > 0) break;
         assert_int_equal(commit_rows(4), 0);
         commits++;
     }
