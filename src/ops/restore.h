@@ -95,3 +95,7 @@ typedef struct {
 status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                      int64_t snap_id, const char *dest,
                      const restore_opts_t *opts, restore_result_t *out);
+
+/* The batch size from which restored files get early writeback
+ * (restore.c, BATCH_EARLY_WB_BYTES); 0 puts the default back. Tests only. */
+void restore_set_early_wb_bytes(uint64_t bytes);
