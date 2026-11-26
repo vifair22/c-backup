@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define PEERS_MAX 4
-#define READ_MAX  (256 * 1024)
+#define READ_MAX  ((size_t)256 * 1024)
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static int  g_loaded;
@@ -94,7 +94,7 @@ static char *slurp(const char *path)
     if (!f) return NULL;
     char *b = malloc(READ_MAX + 1);
     size_t n = b ? fread(b, 1, READ_MAX, f) : 0;
-    fclose(f);
+    (void)fclose(f);   /* read-only: nothing to lose on close */
     if (b) b[n] = '\0';
     return b;
 }
