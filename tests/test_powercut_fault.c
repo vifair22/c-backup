@@ -434,6 +434,10 @@ static int hook_sync(int fd, int data_only)
         if (g_active) {
             if (!step_locked(K_FS)) { pthread_mutex_unlock(&g_mu); errno = EIO; return -1; }
             g_wal_dir_synced = 1;
+            /* The repository's own entry lives here too: a mkdir of H_REPO
+             * is durable once this is synced, as repo.c now does. */
+            for (size_t i = 0; i < g_ndops; i++)
+                if (strcmp(g_dops[i].dir, p) == 0) g_dops[i].durable = 1;
         }
         pthread_mutex_unlock(&g_mu);
         return FAULT_FS_PASS;

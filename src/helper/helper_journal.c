@@ -131,6 +131,18 @@ static int sync_dir(const char *dir)
     return rc;
 }
 
+int hj_mkdir_synced(const char *dir)
+{
+    if (mkdir(dir, 0700) != 0) return errno == EEXIST ? 0 : -1;
+    char parent[PATH_MAX];
+    snprintf(parent, sizeof(parent), "%s", dir);
+    char *slash = strrchr(parent, '/');
+    if (!slash) snprintf(parent, sizeof(parent), ".");
+    else if (slash == parent) slash[1] = '\0';
+    else *slash = '\0';
+    return sync_dir(parent);
+}
+
 static cJSON *hold_json(const hold_t *h)
 {
     cJSON *o = cJSON_CreateObject();
