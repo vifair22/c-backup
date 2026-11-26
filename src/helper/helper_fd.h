@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 /*
  * Configuration blobs travel in one sealed memfd passed with the response,
@@ -47,3 +48,11 @@ void conn_watch_start(conn_watch_t *w, int fd, atomic_int *gone);
  * its holds released and no line saying why, since no capture remained
  * for the session's end to report. */
 void conn_watch_stop(conn_watch_t *w, const char *session);
+
+/*
+ * A new connection's peer: 1 when it is uid want_uid, else 0 with a warning
+ * naming it. An accepted peer's container is noted (self_container.h),
+ * read from proc_root by its SO_PEERCRED pid and never taken from anything
+ * the daemon says, so units --all can leave the daemon out (SOAK14-SELF).
+ */
+int helper_peer_accept(int fd, uid_t want_uid, const char *proc_root);

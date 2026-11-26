@@ -9,6 +9,9 @@
 #include "cJSON.h"
 
 #include <microhttpd.h>
+
+#define API_MHD_FLAGS (MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION | \
+                   MHD_USE_POLL)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1295,6 +1298,17 @@ int api_server_start(api_server_t *srv)
                              METHOD_NAMES[r->method], r->pattern);
     }
 
+    /*
+     * poll(), never select(). MHD's default wait is select(), which cannot
+     * watch a descriptor numbered 1024 or above: MHD closes such a
+     * connection the moment it accepts it. Once a job held enough pack
+     * handles to push new descriptors past 1024, every request failed with
+     * no response and nothing in the log (SOAK14-FD).
+     */
+    if (MHD_is_feature_supported(MHD_FEATURE_POLL) != MHD_YES)
+        return set_error(CUTILS_ERR, "this libmicrohttpd was built without poll() "
+                         "support; rebuild it with poll enabled");
+
     if (srv->tcp_port > 0) {
         if (!tcp_cls)
             return set_error(CUTILS_ERR, "out of memory");
@@ -1305,7 +1319,7 @@ int api_server_start(api_server_t *srv)
              * block parked the entire MHD daemon thread for up to one
              * heartbeat interval. Each connection now has its own worker
              * thread, so the SSE block is local to that thread. */
-            MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
+            API_MHD_FLAGS,
             (uint16_t)srv->tcp_port,
             NULL, NULL,
             request_handler, tcp_cls,
@@ -1385,7 +1399,7 @@ int api_server_start(api_server_t *srv)
         }
 
         srv->unix_daemon = MHD_start_daemon(
-            MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
+            API_MHD_FLAGS,
             0,  /* port ignored for pre-bound socket */
             NULL, NULL,
             request_handler, unix_cls,

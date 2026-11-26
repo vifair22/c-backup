@@ -211,6 +211,14 @@ Notes that matter:
   helper reads `SO_PEERCRED` and refuses any uid but the policy's
   `daemon_uid`, so the socket is safe to bind-mount into the daemon and
   nowhere else.
+- **Its own containers.** The helper reads its own container id from
+  `/proc/self/mountinfo`. It reads the daemon's from
+  `<proc_root>/<pid>/mountinfo` for the pid `SO_PEERCRED` reports, which
+  `--pid=host` makes the daemon's host pid. The id is the directory Docker
+  or Podman binds `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf`
+  from; the cgroup path is the fallback. The helper never takes the id from
+  anything the daemon says. `units.list` marks a unit that holds either
+  container `"self":true`, and `--all` leaves it out (SOAK14-SELF).
 - **Why SETUID, SETGID and SETPCAP on the daemon.** Docker gives a non-root
   `--user` none of the capabilities added with `--cap-add`, so the daemon
   starts as root and drops itself (`security.run_as_uid`). The drop needs

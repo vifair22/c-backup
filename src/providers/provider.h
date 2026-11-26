@@ -253,10 +253,14 @@ typedef struct {
     char detail[256];
 } sp_probe_t;
 
-/* list_units callback: unit id, display name, sp_state_t. Anything but OK
- * stops the enumeration and is what list_units returns. */
+/* list_units callback flag: the unit holds c-backup's own daemon or helper
+ * container (self_container.h); units --all leaves it out (SOAK14-SELF). */
+#define SP_UNIT_SELF 0x1u
+
+/* list_units callback: unit id, display name, sp_state_t, SP_UNIT_* flags.
+ * Anything but OK stops the enumeration and is what list_units returns. */
 typedef status_t (*sp_unit_cb)(void *cbctx, const char *unit_id,
-                               const char *name, int state);
+                               const char *name, int state, unsigned flags);
 
 /* One unit_intents row, as sweep is given it. */
 typedef struct {

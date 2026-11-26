@@ -230,7 +230,7 @@ typedef struct {
     int         skip, take, total;
 } enum_ctx_t;
 
-static status_t enum_cb(void *ctx, const char *id, const char *name, int state)
+static status_t enum_cb(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
     enum_ctx_t *e = ctx;
     if (!units_allowed(e->provider, id, name)) return OK;
@@ -245,6 +245,7 @@ static status_t enum_cb(void *ctx, const char *id, const char *name, int state)
     cJSON_AddStringToObject(o, "unit_id", id);
     cJSON_AddStringToObject(o, "name", name);
     cJSON_AddStringToObject(o, "state", sp_state_name(state));
+    if (flags & SP_UNIT_SELF) cJSON_AddBoolToObject(o, "self", 1);
     return OK;
 }
 
@@ -307,8 +308,9 @@ static cJSON *desc_json(const sp_unit_desc_t *d)
  * the allow list does not leak what lies outside it. */
 typedef struct { const char *want; char id[SP_UNIT_ID_MAX]; int found; } find_t;
 
-static status_t find_cb(void *ctx, const char *id, const char *name, int state)
+static status_t find_cb(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
+    (void)flags;
     (void)state;
     find_t *f = ctx;
     if (!f->found && (strcmp(name, f->want) == 0 || strcmp(id, f->want) == 0)) {
@@ -507,8 +509,9 @@ static int key_for(int64_t repo_id, const char *prov, const char *unit, char *ke
 
 typedef struct { const char *want; char id[SP_UNIT_ID_MAX]; char name[256]; int hit; } find_unit_t;
 
-static status_t find_unit_cb(void *ctx, const char *id, const char *name, int state)
+static status_t find_unit_cb(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
+    (void)flags;
     (void)state;
     find_unit_t *f = ctx;
     if (f->hit || (strcmp(id, f->want) != 0 && strcmp(name, f->want) != 0)) return OK;
@@ -902,9 +905,11 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
         cJSON_AddItemToArray(arr, x);
         cJSON_AddStringToObject(x, "unit_key", u->unit_key);
         cJSON_AddStringToObject(x, "name", u->name);
-        cJSON_AddStringToObject(x, "status", u->st == OK ? "ok" : "failed");
+        cJSON_AddStringToObject(x, "status", u->skipped ? "skipped" : u->st == OK ? "ok" : "failed");
         if (u->snapshot_id > 0) cJSON_AddNumberToObject(x, "snapshot_id", (double)u->snapshot_id);
-        if (u->st == OK) {
+        if (u->skipped) {
+            cJSON_AddStringToObject(x, "reason", u->error);
+        } else if (u->st == OK) {
             cJSON_AddStringToObject(x, "consistency", sp_consistency_name(u->achieved));
             cJSON_AddNumberToObject(x, "bytes_read", (double)u->bytes_read);
             cJSON_AddNumberToObject(x, "files", (double)u->files);
@@ -928,14 +933,18 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
         cJSON_AddNumberToObject(root, "ok", (double)res.ok);
         cJSON_AddNumberToObject(root, "failed", (double)res.failed);
         cJSON_AddNumberToObject(root, "filtered", (double)res.filtered);
+        cJSON_AddNumberToObject(root, "skipped", (double)res.skipped);
         if (res.scope_note[0]) cJSON_AddStringToObject(root, "note", res.scope_note);
         char *txt = cJSON_PrintUnformatted(root);
         if (txt) { job_set_result(progress_ctx, txt); cJSON_free(txt); }
         cJSON_Delete(root);
     }
     char summary[256];
-    snprintf(summary, sizeof(summary), "%s: %zu unit(s) backed up, %zu failed, %zu left out "
-             "by units.allow", j->provider, res.ok, res.failed, res.filtered);
+    int sn = snprintf(summary, sizeof(summary), "%s: %zu unit(s) backed up, %zu failed, %zu left out "
+                      "by units.allow", j->provider, res.ok, res.failed, res.filtered);
+    if (res.skipped && sn > 0 && (size_t)sn < sizeof(summary))
+        snprintf(summary + sn, sizeof(summary) - (size_t)sn, ", %zu skipped as c-backup's own",
+                 res.skipped);
     job_set_summary(progress_ctx, summary);
     /* Every warning, each unit's included (B202 keeps them all): they are
      * journalled with the job, and the journal outlives the job's result.

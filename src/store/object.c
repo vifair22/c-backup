@@ -266,7 +266,7 @@ int object_prefetch(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
         if (!f) {
             char path[PATH_MAX];
             if (pack_dat_path_resolve(path, sizeof(path), store_root(store), pnum) == 0)
-                f = fopen(path, "rb");
+                f = fopen(path, "rbe");
         }
         if (f) {
             /* WILLNEED queues the read and returns: the device works on it

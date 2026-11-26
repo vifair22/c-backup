@@ -501,13 +501,15 @@ export interface WireUnitHistory {
 export interface WireUnitOutcome {
   unit_key: string
   name: string
-  status: 'ok' | 'failed'
+  status: 'ok' | 'failed' | 'skipped'
   snapshot_id?: number
   consistency?: string
   bytes_read?: number
   files?: number
   freeze_ms?: number
   error?: string
+  /* Why a unit was skipped: c-backup's own daemon or helper container. */
+  reason?: string
   warning?: string
   warnings?: string[]
 }
@@ -517,6 +519,7 @@ export interface WireUnitBackupResult {
   ok: number
   failed: number
   filtered: number
+  skipped?: number
   note?: string
 }
 

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "db_txn.h"
+#include "io_stall.h"
 #include "db_write.h"
 
 #include "phase_timer.h"
@@ -611,6 +612,7 @@ status_t db_txn_make_durable(cutils_db_t *db)
      */
     write_lock();
     write_unlock();
+    io_stall_add(IO_STALL_DURABLE_BARRIER, t0);
 
     char wal[PATH_MAX];
     if (db_txn_wal_path(db, wal, sizeof(wal)) != 0)
@@ -620,7 +622,9 @@ status_t db_txn_make_durable(cutils_db_t *db)
      * the directory the first time a given -wal is made durable, and checks
      * it syncs the live file (wal_sync.h). */
     if (wal[0]) {
+        uint64_t t_sync = phase_now();
         status_t st = wal_sync(wal);
+        io_stall_add(IO_STALL_DURABLE_SYNC, t_sync);
         if (st != OK) return st;
     }
     phase_add_commit(phase_current, t0);

@@ -52,6 +52,7 @@ extern const db_migration_t app_migrations[];
 #define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
 #include "test_tmp.h"
+#include "self_container.h"
 
 #define D      TEST_TMP "/c_backup_test_docker"
 #define STATE  D "/state"
@@ -267,8 +268,9 @@ static void test_unit_probe(void **state)
 
 typedef struct { char ids[16][SP_UNIT_ID_MAX]; int st[16]; int n; } seen_t;
 
-static status_t on_unit(void *ctx, const char *id, const char *name, int state)
+static status_t on_unit(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
+    (void)flags;
     (void)name;
     seen_t *s = ctx;
     snprintf(s->ids[s->n], sizeof(s->ids[s->n]), "%s", id);
@@ -281,6 +283,58 @@ static const sp_item_desc_t *item(const sp_unit_desc_t *d, const char *tree_path
     for (size_t i = 0; i < d->n_items; i++)
         if (strcmp(d->items[i].tree_path, tree_path) == 0) return &d->items[i];
     return NULL;
+}
+
+typedef struct { char ids[16][SP_UNIT_ID_MAX]; unsigned flags[16]; int n; } seen_flags_t;
+
+static status_t on_unit_flags(void *ctx, const char *id, const char *name, int state, unsigned flags)
+{
+    (void)name; (void)state;
+    seen_flags_t *s = ctx;
+    snprintf(s->ids[s->n], sizeof(s->ids[s->n]), "%s", id);
+    s->flags[s->n++] = flags;
+    return OK;
+}
+
+static unsigned flags_of(const seen_flags_t *s, const char *id)
+{
+    for (int i = 0; i < s->n; i++) if (strcmp(s->ids[i], id) == 0) return s->flags[i];
+    return 0xffu;
+}
+
+/*
+ * SOAK14-SELF: a unit holding the helper's or the daemon's own container is
+ * listed with SP_UNIT_SELF, a compose project as a whole when one member is
+ * ours, and nothing else is.
+ */
+static void test_list_marks_our_own_containers(void **state)
+{
+    (void)state;
+    static const char helper_id[] = "aaaa0100000000000000000000000000000000000000000000000000000000ff";
+    static const char daemon_id[] = "bbbb0100000000000000000000000000000000000000000000000000000000ff";
+    char keep0[sizeof(fdk.c[0].id)], keep2[sizeof(fdk.c[2].id)];
+    memcpy(keep0, fdk.c[0].id, sizeof(keep0));
+    memcpy(keep2, fdk.c[2].id, sizeof(keep2));
+    snprintf(fdk.c[0].id, sizeof(fdk.c[0].id), "%s", helper_id);   /* web-db, in compose:web */
+    snprintf(fdk.c[2].id, sizeof(fdk.c[2].id), "%s", daemon_id);   /* solo */
+
+    seen_flags_t s;
+    memset(&s, 0, sizeof(s));
+    self_container_reset_for_test("");
+    assert_int_equal(be.ops->list_units(be.ctx, on_unit_flags, &s), OK);
+    for (int i = 0; i < s.n; i++) assert_int_equal(s.flags[i], 0);
+
+    memset(&s, 0, sizeof(s));
+    self_container_reset_for_test(helper_id);
+    self_container_note_peer(daemon_id);
+    assert_int_equal(be.ops->list_units(be.ctx, on_unit_flags, &s), OK);
+    assert_int_equal(flags_of(&s, "compose:web"), SP_UNIT_SELF);
+    assert_int_equal(flags_of(&s, "solo"), SP_UNIT_SELF);
+    assert_int_equal(flags_of(&s, "slowpoke"), 0);
+
+    self_container_reset_for_test("");
+    memcpy(fdk.c[0].id, keep0, sizeof(keep0));
+    memcpy(fdk.c[2].id, keep2, sizeof(keep2));
 }
 
 static void test_list_and_describe(void **state)
@@ -1705,6 +1759,7 @@ int main(void)
     signal(SIGPIPE, SIG_IGN);
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_list_marks_our_own_containers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_template_not_a_directory, setup_template_not_a_dir, teardown),
         cmocka_unit_test_setup_teardown(test_template_unreadable, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unit_probe, setup, teardown),

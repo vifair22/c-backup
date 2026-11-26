@@ -1203,6 +1203,8 @@ above with a backup and other load running, those two syncs took 5-7 s
 between them (image M7), while the database lock was held for at most one
 bounded transaction. A repository on a busy pool makes tags slow in exactly
 this way; nothing the daemon waits for can shorten it.
+`cbackup_sync_wait_max_seconds` and the `slow sync` log line (section 16)
+say which of a slow tag write's syncs waited.
 
 A change to a repository's sources applies to backups submitted after it. A
 backup takes its sources from the configuration when it is submitted, so a
@@ -1730,7 +1732,8 @@ manager as everything else.
 ```sh
 sudo c-backup schedule add 1 backup 14400                          # every 4 hours
 sudo c-backup schedule add 1 backup --every day --at 02:00
-sudo c-backup schedule add 1 verify --every week --on sunday --at 03:00
+sudo c-backup schedule add 1 verify --every week --on sunday --at 03:00 --level structure
+sudo c-backup schedule add 1 verify --every month --on-day 1 --at 04:00   # deep, repairing
 sudo c-backup schedule add 1 gc --every month --on-day 1 --at 05:00
 sudo c-backup schedule add 1 replicate --every day --at 03:30 --dest /mnt/nas/main
 sudo c-backup schedule list 1
@@ -1809,11 +1812,18 @@ A `backup` schedule uses the repository's sources unless it names
 `--source` paths. A `replicate` schedule needs `--dest`, an absolute path. A
 `grep` schedule needs `--pattern` (an extended regular expression, checked
 when the schedule is created) and takes `--path-prefix` and `-i`; it searches
-the newest snapshot each time it fires. An option that belongs to a
+the newest snapshot each time it fires. A `verify` schedule takes `--level`
+and `--no-repair` as `verify` does (section 11); with neither, each run is a
+deep verify that repairs what it finds. `schedule list` shows the level and
+repair setting under `params`. An option that belongs to a
 different action, such as `--dest` on a `gc` schedule, is refused rather than
 stored and ignored.
 
 `scheduler.enabled: 0` in `config.yaml` stops every schedule.
+
+A `verify` schedule made before it could take a level carries none, so it
+now runs deep and repairing; before, it ran at index level and never read a
+payload. Give it `--level` by deleting it and adding it again.
 
 **Schedules from older builds.** Each rule above was added at some point, and
 a schedule stored before its rule existed is still in the database after an
@@ -1840,7 +1850,7 @@ A suggested set for one repository:
 | `backup` | daily, or every few hours |
 | `gfs` | daily, after the backup |
 | `gc` | weekly, after retention |
-| `verify` | weekly or monthly (deep verify reads everything) |
+| `verify` | `--level structure` weekly, deep monthly (deep reads everything) |
 | `replicate` | daily, to another disk or machine |
 
 ---
@@ -2582,6 +2592,9 @@ the repository).
 | `cbackup_checkpoint_failures_total` | counter | Checkpoints of `state.db`'s write-ahead log SQLite refused, and failures to open or read the log or its index, since start (section 18.2) |
 | `cbackup_checkpoint_failing` | gauge | 1 while the last such attempt failed; `/readyz` says why |
 | `cbackup_db_txn_wait_seconds_total` | counter | Time writers waited for `state.db`'s write lock, labelled `queue="bulk"` (backup batches, pack commits, reindex, gc) or `queue="priority"` (requests, job records, the checkpointer) |
+| `cbackup_sync_wait_seconds_total` | counter | Time spent in each sync a write waits for, labelled `step`: `tag_write`, `tag_file_sync` and `tag_dir_sync` for the repository's tag file, `durable_barrier` and `durable_sync` for making `state.db` durable (durable requests, job ends, gc, retention) |
+| `cbackup_sync_wait_max_seconds` | gauge | The longest single wait of each `step` since start; a wait over 1 s is also logged as `slow sync: <step> waited <s> s` |
+| `cbackup_sync_waits_total` | counter | Waits counted in each `step` |
 | `cbackup_db_txn_grants_total` | counter | Turns of the write lock, by the same `queue` label; over the wait total, the mean wait per turn |
 | `cbackup_db_txn_commits_total` | counter | Transactions committed on `state.db` |
 | `cbackup_db_txn_commit_seconds_total` | counter | Time spent in COMMIT, writing the log (no sync at `db.synchronous` normal) |
@@ -3483,7 +3496,7 @@ lists every command with all of its arguments.
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id> [--limit N] [--offset N]`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--offset N] [--result success\|failed\|cancelled\|warning\|alert]` | Operation history, newest first; any other `--result` is refused |
-| `schedule list <id> [--limit N] [--offset N]`, `schedule add\|remove\|enable\|disable <id> ...` | Schedules (section 10); `add <id> units ... --provider P (--all [--exclude GLOB]... \| --unit NAME...) [--require LEVEL] [--pause-scope unit\|group\|job]` for units (section 22.6) |
+| `schedule list <id> [--limit N] [--offset N]`, `schedule add\|remove\|enable\|disable <id> ...` | Schedules (section 10); `add <id> units ... --provider P (--all [--exclude GLOB]... \| --unit NAME...) [--require LEVEL] [--pause-scope unit\|group\|job]` for units (section 22.6); `add <id> verify ... [--level index\|structure\|deep] [--no-repair]` |
 | `unit providers`, `unit list <provider> [--limit N] [--offset N]`, `unit show <provider> <unit>` | Providers and the helper link; live units; one unit's items (section 22) |
 | `unit backup <id> --provider P (<unit>... \| --all [--exclude GLOB]...) [--require LEVEL] [--pause-scope unit\|group\|job]` | Back up units, one snapshot each; `--pause-scope` shares one capture across units (section 22.6.1) |
 | `unit history <id> [--provider P <unit>] [--limit N] [--offset N]` | Units with history here, or one unit's snapshots |
@@ -4527,6 +4540,13 @@ turns: the second waits up to `units.unit_wait_s`.
 schedule with `--all` enumerates them each time it fires, so a container
 added last week is included. `--exclude` globs match unit names. A units
 schedule's overlap is keyed by repository, action and unit set.
+
+`--all` always leaves out c-backup's own daemon and helper containers, and
+any compose project that holds one. The job result lists each as
+`"status":"skipped"` with the reason, counts them under `"skipped"`, and they
+are not failures. Naming one is refused. `unit list` marks them `"self":true`.
+This works for Docker and Podman containers, which the helper identifies by
+container id.
 
 **Pause scope.** By default each unit is its own capture (`pause_scope:
 unit`). `--pause-scope` on `unit backup` and `schedule add ... units`

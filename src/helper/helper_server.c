@@ -128,8 +128,9 @@ static const helper_backend_t *backend_named(const helper_server_t *s, const cha
 
 typedef struct { const char *id; char name[256]; int found; } name_find_t;
 
-static status_t find_name(void *ctx, const char *id, const char *name, int state)
+static status_t find_name(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
+    (void)flags;
     (void)state;
     name_find_t *f = ctx;
     if (!f->found && strcmp(id, f->id) == 0) {
@@ -163,7 +164,7 @@ static helper_err_t unit_allowed(helper_server_t *s, const char *key, char *why,
 
 typedef struct { helper_server_t *s; cJSON *arr; const char *prov; } list_ctx_t;
 
-static status_t list_cb(void *ctx, const char *id, const char *name, int state)
+static status_t list_cb(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
     list_ctx_t *l = ctx;
     char key[HELPER_UNIT_KEY_MAX + 24];
@@ -176,6 +177,7 @@ static status_t list_cb(void *ctx, const char *id, const char *name, int state)
     cJSON_AddStringToObject(o, "unit_id", id);
     cJSON_AddStringToObject(o, "name", name);
     cJSON_AddNumberToObject(o, "state", state);
+    if (flags & SP_UNIT_SELF) cJSON_AddBoolToObject(o, "self", 1);
     return OK;
 }
 
@@ -2602,14 +2604,7 @@ static void *accept_main(void *arg)
         int stop = s->stop;
         pthread_mutex_unlock(&s->cmu);
         if (stop) { close(fd); break; }
-        struct ucred cr;
-        socklen_t cl = sizeof(cr);
-        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cl) != 0 || cr.uid != s->pol->daemon_uid) {
-            log_warn("helper: refused a connection from uid %u (pid %d): only uid %u may connect",
-                     (unsigned)cr.uid, (int)cr.pid, (unsigned)s->pol->daemon_uid);
-            close(fd);
-            continue;
-        }
+        if (!helper_peer_accept(fd, s->pol->daemon_uid, s->pol->proc_root)) { close(fd); continue; }
         /* A request with no answer in a minute is a stuck peer. */
         struct timeval tv = { 60, 0 };
         (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include "self_container.h"
 #include "docker_backend.h"
 #include "docker_api.h"
 #include "helper_proto.h"
@@ -206,32 +207,31 @@ static status_t d_list(sp_ctx_t *c, sp_unit_cb cb, void *cbctx)
     cJSON *all = NULL;
     status_t st = list_all(c, &all);
     if (st != OK) return st;
-    /* One callback per unit, with the unit's state over its members. */
-    size_t n = (size_t)cJSON_GetArraySize(all);
-    char (*seen)[SP_UNIT_ID_MAX] = calloc(n ? n : 1, sizeof(*seen));
-    if (!seen) { cJSON_Delete(all); return set_error(ERR_NOMEM, "docker: list"); }
-    size_t ns = 0;
-    const cJSON *x;
+    /* One callback per unit, at its first member, with the unit's state
+     * over its members. */
+    const cJSON *x, *y;
     cJSON_ArrayForEach(x, all) {
         if (st != OK) break;
-        char u[SP_UNIT_ID_MAX];
+        char u[SP_UNIT_ID_MAX], v[SP_UNIT_ID_MAX];
         unit_of(x, u, sizeof(u));
-        int dup = 0;
-        for (size_t i = 0; i < ns && !dup; i++) dup = strcmp(seen[i], u) == 0;
-        if (dup || !u[0]) continue;
-        memcpy(seen[ns++], u, sizeof(u));
-        int run = 0, paused = 0;
-        const cJSON *y;
+        int earlier = 0, run = 0, paused = 0;
+        unsigned fl = 0;
+        for (y = all->child; y != x && !earlier; y = y->next) {
+            unit_of(y, v, sizeof(v));
+            earlier = strcmp(u, v) == 0;
+        }
+        if (earlier || !u[0]) continue;
         cJSON_ArrayForEach(y, all) {
-            char v[SP_UNIT_ID_MAX];
             unit_of(y, v, sizeof(v));
             if (strcmp(u, v) != 0) continue;
             run |= strcmp(jstr(y, "State"), "running") == 0;
             paused |= strcmp(jstr(y, "State"), "paused") == 0;
+            /* The helper's or the daemon's own container, or a compose
+             * project holding one: --all leaves it out (SOAK14-SELF). */
+            if (self_container_is_ours(jstr(y, "Id"))) fl = SP_UNIT_SELF;
         }
-        st = cb(cbctx, u, u, paused ? SP_STATE_PAUSED : run ? SP_STATE_RUNNING : SP_STATE_STOPPED);
+        st = cb(cbctx, u, u, paused ? SP_STATE_PAUSED : run ? SP_STATE_RUNNING : SP_STATE_STOPPED, fl);
     }
-    free(seen);
     cJSON_Delete(all);
     return st;
 }
