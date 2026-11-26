@@ -27,6 +27,14 @@ status_t hj_clear(void *ctx, int64_t id);
  * that cannot be used sets s->recovering (boot_main recovers). */
 void hj_load(helper_server_t *s);
 
+/* mkdir, and a directory made here synced into its parent; 0 when it
+ * exists, made or not. The journal's and the markers' syncs cover what is
+ * inside the state directory and holds.d, never their own entries, so on a
+ * first start a power cut could take the journal and every marker with
+ * them, and a VM frozen or a container paused would never be released
+ * (B285). */
+int hj_mkdir_synced(const char *dir);
+
 /* The backend a unit key's provider names; *uid points past the colon. */
 const helper_backend_t *hj_backend_of(const helper_server_t *s, const char *key, const char **uid);
 

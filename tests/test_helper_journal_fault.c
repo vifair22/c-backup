@@ -20,6 +20,8 @@
  */
 
 #include <dirent.h>
+#include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <stdarg.h>
@@ -458,10 +460,77 @@ static void test_marker_write_fails(void **state)
     hstop();
 }
 
+/*
+ * A first start makes the state directory and holds.d, and syncs each into
+ * its parent: the journal's and markers' syncs cover what is inside them,
+ * never their own entries, so a power cut could take every record of a
+ * hold and leave a VM frozen (B285's class).
+ */
+#define MK_MAX 32
+static struct { char path[PATH_MAX]; int seq; } mk_made[MK_MAX], mk_synced[MK_MAX * 4];
+static size_t mk_nmade, mk_nsynced;
+static int    mk_seq;
+
+static int mk_hook_mkdir(const char *path, mode_t mode)
+{
+    int r = __real_mkdir(path, mode);
+    int err = errno;
+    if (r == 0 && mk_nmade < MK_MAX) {
+        snprintf(mk_made[mk_nmade].path, PATH_MAX, "%s", path);
+        mk_made[mk_nmade++].seq = mk_seq++;
+    }
+    errno = err;
+    return r;
+}
+
+static int mk_hook_sync(int fd, int data_only)
+{
+    (void)data_only;
+    struct stat sb;
+    char link[64], p[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, p, sizeof(p) - 1);
+    if (n > 0 && fstat(fd, &sb) == 0 && S_ISDIR(sb.st_mode) && mk_nsynced < MK_MAX * 4) {
+        p[n] = '\0';
+        snprintf(mk_synced[mk_nsynced].path, PATH_MAX, "%s", p);
+        mk_synced[mk_nsynced++].seq = mk_seq++;
+    }
+    return FAULT_FS_PASS;
+}
+
+static void test_first_start_syncs_the_directories_it_makes(void **state)
+{
+    (void)state;
+    mk_nmade = mk_nsynced = 0;
+    fault_mkdir_hook = mk_hook_mkdir;
+    fault_sync_hook = mk_hook_sync;
+    hstart();
+    fault_mkdir_hook = NULL;
+    fault_sync_hook = NULL;
+    hstop();
+
+    const char *want[] = { STATE, MARKERS };
+    for (size_t w = 0; w < 2; w++) {
+        int made = -1;
+        for (size_t i = 0; i < mk_nmade && made < 0; i++)
+            if (strcmp(mk_made[i].path, want[w]) == 0) made = mk_made[i].seq;
+        if (made < 0) fail_msg("%s was not made by the start", want[w]);
+        char parent[PATH_MAX], real[PATH_MAX];
+        snprintf(parent, sizeof(parent), "%s", want[w]);
+        *strrchr(parent, '/') = '\0';
+        if (!realpath(parent, real)) snprintf(real, sizeof(real), "%s", parent);
+        int ok = 0;
+        for (size_t j = 0; j < mk_nsynced && !ok; j++)
+            ok = mk_synced[j].seq > made && strcmp(mk_synced[j].path, real) == 0;
+        if (!ok) fail_msg("%s was made and %s never synced after it", want[w], real);
+    }
+}
+
 int main(void)
 {
     if (hf_unroot() != 0) { perror("cannot leave root for the helper suites"); return 1; }
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_first_start_syncs_the_directories_it_makes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_read_eio, setup, teardown),
         cmocka_unit_test_setup_teardown(test_truncated, setup, teardown),
         cmocka_unit_test_setup_teardown(test_corrupt, setup, teardown),
