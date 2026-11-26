@@ -646,6 +646,11 @@ static status_t mkdir_error(const char *what)
  * named, and only the repository holds backup data. A repository at
  * /srv/backup/main on a fresh disk used to fail with ENOENT until somebody
  * created /srv/backup by hand, which nothing told them to do.
+ *
+ * Each directory made is synced into its parent. The marker's sync covers
+ * what is inside the repository, never the repository's own entry, so a
+ * power cut soon after creation could take the whole directory, with every
+ * backup in it, while state.db kept it registered.
  */
 static status_t mkdir_parents(const char *path)
 {
@@ -662,6 +667,8 @@ static status_t mkdir_parents(const char *path)
                 errno = ENOTDIR;
                 return mkdir_error(buf);
             }
+        } else if (snapshot_fsync_parent(buf) != 0) {
+            return set_error_errno(ERR_IO, "cannot sync the directory holding %s", buf);
         }
         if (leaf) break;
         *p = '/';

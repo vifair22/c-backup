@@ -164,9 +164,16 @@ static int keyfile_path(char *buf, size_t sz, const char *dir, const char *uuid)
     return (n < 0 || (size_t)n >= sz) ? -1 : 0;
 }
 
+/* A new key directory is synced into its parent: in system mode the key
+ * file is the only copy, and the directory lost to a power cut would lock
+ * the repository out as surely as the file (B182). */
 static status_t ensure_dir(const char *dir)
 {
-    if (mkdir(dir, 0700) == 0) return OK;
+    if (mkdir(dir, 0700) == 0) {
+        if (snapshot_fsync_parent(dir) != 0)
+            return set_error_errno(ERR_IO, "cannot sync the directory holding %s", dir);
+        return OK;
+    }
     if (errno == EEXIST) return OK;
     return set_error_errno(ERR_IO, "cannot create key directory %s", dir);
 }

@@ -6,6 +6,7 @@
 #include "pack.h"
 #include "pack_ids.h"
 #include "msg_clip.h"
+#include "snap_record.h"
 
 #include <openssl/crypto.h>
 #include <cutils/log.h>
@@ -219,6 +220,10 @@ status_t store_init_dirs(const char *path) {
             return set_error_errno(ERR_IO, "cannot stat '%s'", path);
         if (mkdir(path, 0755) == -1)
             return set_error_errno(ERR_IO, "cannot create directory '%s'", path);
+        /* Its entry durable in the parent, as repo.c's mkdir_parents does:
+         * nothing written inside it later syncs that. */
+        if (snapshot_fsync_parent(path) != 0)
+            return set_error_errno(ERR_IO, "cannot sync the directory holding '%s'", path);
     }
 
     int repofd = open(path, O_RDONLY | O_DIRECTORY);

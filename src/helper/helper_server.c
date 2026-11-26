@@ -2825,7 +2825,7 @@ status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **o
     pthread_mutex_init(&s->jmu, NULL);
     pthread_mutex_init(&s->cmu, NULL);
     pthread_cond_init(&s->wcv, NULL);
-    if (mkdir(s->pol->state_dir, 0700) != 0 && errno != EEXIST) {
+    if (hj_mkdir_synced(s->pol->state_dir) != 0) {
         status_t st = set_error_errno(ERR_IO, "helper: state directory %s", s->pol->state_dir);
         helper_server_stop(s);
         return st;
@@ -2840,7 +2840,7 @@ status_t helper_server_start(const helper_server_cfg_t *cfg, helper_server_t **o
      * meanwhile would be among what they find. */
     char mdir[PATH_MAX + 32];
     snprintf(mdir, sizeof(mdir), "%s/" MARKER_DIR, s->pol->state_dir);
-    if (mkdir(mdir, 0700) != 0 && errno != EEXIST)
+    if (hj_mkdir_synced(mdir) != 0)
         log_error("helper: cannot make %s: %s; no hold can be taken until it exists", mdir, strerror(errno));
     hj_load(s);
     if (pthread_create(&s->boot_th, NULL, boot_main, s) == 0) {
