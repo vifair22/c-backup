@@ -20,6 +20,10 @@
 #                        keeps it busy with this workload, as FS2 was
 #   WAL_PAGES [1000]     db.wal_autocheckpoint (the hard cap is 16 x this)
 #   INTERVAL [0.2]       seconds between edits
+#   EDIT_KIND [sources]  sources: PUT sources (commit-only, database only).
+#                        tag: move a tag between two earlier snapshots, a
+#                        durable route that also rewrites and syncs the
+#                        repository's tag file
 #   BOUND_MS             exit 1 when p99 is above this
 #   KEEP                 keep the scratch directory
 #   OUT                  also write the samples, metrics and device report here
@@ -40,6 +44,8 @@ LAT_MS="${LAT_MS:-20}"
 FLOCK="${FLOCK:-0}"
 WAL_PAGES="${WAL_PAGES:-1000}"
 INTERVAL="${INTERVAL:-0.2}"
+EDIT_KIND="${EDIT_KIND:-sources}"
+case "$EDIT_KIND" in sources|tag) ;; *) echo "edit_latency: EDIT_KIND is sources or tag" >&2; exit 2 ;; esac
 BOUND_MS="${BOUND_MS:-}"
 
 [ -x "$BIN" ] || { echo "edit_latency: no daemon at $BIN" >&2; exit 2; }
@@ -104,6 +110,22 @@ REPO=$(printf '%s' "$R" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 [ -n "$REPO" ] || { echo "edit_latency: repo add failed: $R" >&2; exit 2; }
 EDIT="{\"sources\":[\"$WORK/src\"],\"exclude\":[\"*.tmp\"]}"
 api PUT "/repos/$REPO/sources" "$EDIT" > /dev/null
+if [ "$EDIT_KIND" = tag ]; then
+    # Two small snapshots to move the tag between, taken before the backup
+    # being measured so the moves land while it writes.
+    mkdir -p "$WORK/tiny"
+    echo one > "$WORK/tiny/a"
+    for n in 1 2; do
+        echo "$n" >> "$WORK/tiny/a"
+        R=$(api POST "/repos/$REPO/backup" "{\"paths\":[\"$WORK/tiny\"]}")
+        J=$(printf '%s' "$R" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+        for _ in $(seq 1 300); do
+            case "$(api GET "/jobs/$J")" in *'"state":"completed"'*) break ;; *'"state":"failed"'*) echo "edit_latency: tiny backup failed" >&2; exit 2 ;; esac
+            sleep 0.1
+        done
+    done
+    api POST "/repos/$REPO/tags" '{"name":"bench","snap_id":1}' > /dev/null
+fi
 
 R=$(api POST "/repos/$REPO/backup" "{\"paths\":[\"$WORK/src\"]}")
 JOB=$(printf '%s' "$R" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
@@ -113,8 +135,14 @@ JOB=$(printf '%s' "$R" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
 T0=$(date +%s.%N)
 STATE=""
 while :; do
-    t=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' -X PUT --unix-socket "$SOCK" \
-             -d "$EDIT" "http://localhost/repos/$REPO/sources")
+    if [ "$EDIT_KIND" = tag ]; then
+        TSNAP=$((3 - ${TSNAP:-1}))
+        t=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' -X POST --unix-socket "$SOCK" \
+                 -d "{\"name\":\"bench\",\"snap_id\":$TSNAP,\"move\":true}" "http://localhost/repos/$REPO/tags")
+    else
+        t=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' -X PUT --unix-socket "$SOCK" \
+                 -d "$EDIT" "http://localhost/repos/$REPO/sources")
+    fi
     echo "$(awk -v a="$(date +%s.%N)" -v b="$T0" 'BEGIN{printf "%.2f", a-b}') $t" >> "$WORK/samples.txt"
     case "$(api GET "/jobs/$JOB")" in
         *'"state":"completed"'*) STATE=completed; break ;;
@@ -134,8 +162,8 @@ SUMMARY=$(awk '{print $3 * 1000}' "$WORK/samples.txt" | sort -n | awk '
     function q(p,  i) { i = int(p * NR + 0.999999); if (i < 1) i = 1; if (i > NR) i = NR; return v[i] }
     END { if (NR == 0) { print "n=0"; exit }
           printf "n=%d p50=%.0f p90=%.0f p99=%.0f max=%.0f", NR, q(0.50), q(0.90), q(0.99), v[NR] }')
-echo "edit-latency $SUMMARY ms (backup $STATE, ${WALL} s, non-200: $BAD)"
-grep -E '^cbackup_(db_txn_(wait_seconds_total|grants_total)|checkpoint_(lock_max_seconds|lock_seconds_total|presync_seconds_total|rounds_total|throttle_seconds_total)|wal_frames_max)' \
+echo "edit-latency ($EDIT_KIND) $SUMMARY ms (backup $STATE, ${WALL} s, non-200: $BAD)"
+grep -E '^cbackup_(db_txn_(wait_seconds_total|grants_total)|checkpoint_(lock_max_seconds|lock_seconds_total|presync_seconds_total|rounds_total|throttle_seconds_total)|wal_frames_max|sync_wait_(seconds_total|max_seconds))' \
     "$WORK/metrics.txt" | sed 's/^/  /'
 grep -E 'checkpointed holding' "$WORK/daemon.log" | sed 's/^/  log: /' | tail -5
 sed 's/^/  device: /' "$WORK/device.txt" 2>/dev/null

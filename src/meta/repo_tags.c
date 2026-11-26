@@ -2,6 +2,8 @@
 
 #include "repo_tags.h"
 #include "sync_latch.h"
+#include "io_stall.h"
+#include "phase_timer.h"
 
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
@@ -131,6 +133,7 @@ status_t repo_tags_save_with(cutils_db_t *db, int64_t repo_id, const char *repo_
 
     /* Whole-file replace, so a crash leaves the old list or the new one and
      * never half of either. */
+    uint64_t t_io = phase_now();
     int fd = mkstemp(tmp);
     if (fd == -1) {
         free(body);
@@ -143,8 +146,13 @@ status_t repo_tags_save_with(cutils_db_t *db, int64_t repo_id, const char *repo_
     if (fchmod(fd, 0600) != 0 ||
         snapshot_write_all(fd, body, len) != 0 || snapshot_write_all(fd, "\n", 1) != 0)
         st = set_error_errno(ERR_IO, "cannot write %s", tmp);
-    else if (sync_latch_repo_fsync(repo_path, fd, tmp) != 0)
-        st = set_error_errno(ERR_IO, "cannot flush %s", tmp);
+    io_stall_add(IO_STALL_TAG_WRITE, t_io);
+    if (st == OK) {
+        uint64_t t_sync = phase_now();
+        if (sync_latch_repo_fsync(repo_path, fd, tmp) != 0)
+            st = set_error_errno(ERR_IO, "cannot flush %s", tmp);
+        io_stall_add(IO_STALL_TAG_FILE_SYNC, t_sync);
+    }
     if (close(fd) != 0 && st == OK)
         st = set_error_errno(ERR_IO, "cannot close %s", tmp);
     free(body);
@@ -161,7 +169,9 @@ status_t repo_tags_save_with(cutils_db_t *db, int64_t repo_id, const char *repo_
      */
     int dfd = open(repo_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dfd < 0) return set_error_errno(ERR_IO, "cannot open %s to sync it", repo_path);
+    uint64_t t_dir = phase_now();
     if (sync_latch_repo_fsync(repo_path, dfd, repo_path) != 0) st = set_error_errno(ERR_IO, "cannot sync %s", repo_path);
+    io_stall_add(IO_STALL_TAG_DIR_SYNC, t_dir);
     close(dfd);
     return st;
 }

@@ -10,6 +10,7 @@
 #include "db_findings.h"
 #include "db_readers.h"
 #include "db_txn.h"
+#include "io_stall.h"
 
 #include <cutils/log.h>
 #include <cutils/push.h>
@@ -225,6 +226,32 @@ static void emit_txn_metrics(mbuf_t *m)
                "commits.\n# TYPE cbackup_db_txn_commit_frames_total counter\n"
                "cbackup_db_txn_commit_frames_total %llu\n",
             (unsigned long long)t.commit_frames);
+    mb_addf(m, "# HELP cbackup_sync_wait_seconds_total Time spent in each step of a "
+               "write that waits for a sync: the repository tag file (write, file sync, "
+               "directory sync) and making state.db durable (barrier, WAL sync).\n"
+               "# TYPE cbackup_sync_wait_seconds_total counter\n");
+    for (int i = 0; i < IO_STALL_STEPS; i++) {
+        io_stall_stat_t st;
+        io_stall_get((io_stall_step_t)i, &st);
+        mb_addf(m, "cbackup_sync_wait_seconds_total{step=\"%s\"} %.6f\n",
+                io_stall_name((io_stall_step_t)i), (double)st.total_ns / 1e9);
+    }
+    mb_addf(m, "# HELP cbackup_sync_wait_max_seconds The longest single wait of each step "
+               "since start.\n# TYPE cbackup_sync_wait_max_seconds gauge\n");
+    for (int i = 0; i < IO_STALL_STEPS; i++) {
+        io_stall_stat_t st;
+        io_stall_get((io_stall_step_t)i, &st);
+        mb_addf(m, "cbackup_sync_wait_max_seconds{step=\"%s\"} %.6f\n",
+                io_stall_name((io_stall_step_t)i), (double)st.max_ns / 1e9);
+    }
+    mb_addf(m, "# HELP cbackup_sync_waits_total Waits counted in each step.\n"
+               "# TYPE cbackup_sync_waits_total counter\n");
+    for (int i = 0; i < IO_STALL_STEPS; i++) {
+        io_stall_stat_t st;
+        io_stall_get((io_stall_step_t)i, &st);
+        mb_addf(m, "cbackup_sync_waits_total{step=\"%s\"} %llu\n",
+                io_stall_name((io_stall_step_t)i), (unsigned long long)st.count);
+    }
     mb_addf(m, "# HELP cbackup_checkpoint_rounds_total WAL checkpoint rounds that ran, by "
                "whether they held the write lock.\n"
                "# TYPE cbackup_checkpoint_rounds_total counter\n"

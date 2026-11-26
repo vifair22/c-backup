@@ -1203,6 +1203,8 @@ above with a backup and other load running, those two syncs took 5-7 s
 between them (image M7), while the database lock was held for at most one
 bounded transaction. A repository on a busy pool makes tags slow in exactly
 this way; nothing the daemon waits for can shorten it.
+`cbackup_sync_wait_max_seconds` and the `slow sync` log line (section 16)
+say which of a slow tag write's syncs waited.
 
 A change to a repository's sources applies to backups submitted after it. A
 backup takes its sources from the configuration when it is submitted, so a
@@ -2590,6 +2592,9 @@ the repository).
 | `cbackup_checkpoint_failures_total` | counter | Checkpoints of `state.db`'s write-ahead log SQLite refused, and failures to open or read the log or its index, since start (section 18.2) |
 | `cbackup_checkpoint_failing` | gauge | 1 while the last such attempt failed; `/readyz` says why |
 | `cbackup_db_txn_wait_seconds_total` | counter | Time writers waited for `state.db`'s write lock, labelled `queue="bulk"` (backup batches, pack commits, reindex, gc) or `queue="priority"` (requests, job records, the checkpointer) |
+| `cbackup_sync_wait_seconds_total` | counter | Time spent in each sync a write waits for, labelled `step`: `tag_write`, `tag_file_sync` and `tag_dir_sync` for the repository's tag file, `durable_barrier` and `durable_sync` for making `state.db` durable (durable requests, job ends, gc, retention) |
+| `cbackup_sync_wait_max_seconds` | gauge | The longest single wait of each `step` since start; a wait over 1 s is also logged as `slow sync: <step> waited <s> s` |
+| `cbackup_sync_waits_total` | counter | Waits counted in each `step` |
 | `cbackup_db_txn_grants_total` | counter | Turns of the write lock, by the same `queue` label; over the wait total, the mean wait per turn |
 | `cbackup_db_txn_commits_total` | counter | Transactions committed on `state.db` |
 | `cbackup_db_txn_commit_seconds_total` | counter | Time spent in COMMIT, writing the log (no sync at `db.synchronous` normal) |

@@ -207,6 +207,14 @@ OUT=$(cb objects 1 --location nowhere 2>&1); RC=$?
 check    "objects --location nowhere fails" 1 "$RC"
 
 contains "tag set"    '"ok"'      "$(cb tag set 1 keeper 1)"
+# Each sync a tag write waits for is counted, so a slow one can be told
+# apart afterwards (tag_file_sync, tag_dir_sync, durable_sync).
+MET=$(curl -s --unix-socket "$SOCK" http://localhost/metrics)
+for step in tag_write tag_file_sync tag_dir_sync durable_sync; do
+    check "a tag write counts its $step" 1 \
+        "$(printf '%s\n' "$MET" | grep -q "^cbackup_sync_waits_total{step=\"$step\"} [1-9]" && echo 1 || echo 0)"
+done
+contains "and keeps the longest wait" 'cbackup_sync_wait_max_seconds{step="tag_dir_sync"}' "$MET"
 contains "tag list"   'keeper'    "$(cb tag list 1)"
 # B095: the removes printed nothing on success, against the contract of one
 # JSON document per command.

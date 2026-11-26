@@ -6,6 +6,29 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-26 - Tag moves during a backup: where the time goes
+
+The FS2 soak stopped on one tag move that took 2.344 s during a backup of the
+same repository, with db_txn waits near zero. `bench/edit_latency.sh` gained
+`EDIT_KIND=tag`: it moves a tag between two earlier snapshots while the first
+backup runs, on the modelled slow device (6 MiB/s, 20 ms per sync), with the new
+`cbackup_sync_wait_*` metrics. Desktop, bench.slice, one run each:
+
+| Edit | n | p50 | p90 | p99 | max |
+|------|--:|----:|----:|----:|----:|
+| PUT sources (commit-only) | 163 | 0 ms | 0 ms | 48 ms | 49 ms |
+| Tag move (durable, repository copy) | 64 | 46 ms | 689 ms | 7417 ms | 7417 ms |
+
+Longest single wait of each step during the tag run: tag_write 5.93 s,
+tag_file_sync 1.92 s, tag_dir_sync 1.22 s, durable_barrier 0.02 s,
+durable_sync 1.42 s. The barrier (the write-lock queue) is negligible, as on
+FS2. The modelled syncs (the tag file's and the WAL's) queue behind the
+backup's pack writeback on the one device. The directory sync and the file
+create are real calls on the desktop's btrfs; their stalls are the real file
+system's while the backup writes. So a durable tag write pays three syncs in
+series, each behind the backup's writes. That is the cost Manual 6.3 records
+for the M5 pool (p90 2.24 s, worst 9.1 s), not a wait in the daemon.
+
 ## 2026-11-25 - D2 against kopia and restic on M12: what is left, and why
 
 M12 on FS2 (btrfs RAID10 on dm-crypt over four BX500; every run starts
