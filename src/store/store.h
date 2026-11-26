@@ -451,7 +451,9 @@ typedef void (*store_index_add_fn)(void *ctx, const uint8_t hash[OBJECT_HASH_SIZ
                                    const store_location_t *loc);
 status_t store_scan_packs(store_t *st, store_index_add_fn add, void *ctx);
 
-/* Pack .dat handle cache; avoids repeated open/close on bulk lookups. */
-FILE *store_dat_cache_checkout(store_t *st, uint32_t pack_num);
-void  store_dat_cache_return(store_t *st, uint32_t pack_num, FILE *fp);
-void  store_dat_cache_flush(store_t *st);
+/* Pack .dat handle cache; avoids repeated open/close on bulk lookups. It
+ * holds at most 64 handles, so returning one may close another. */
+FILE  *store_dat_cache_checkout(store_t *st, uint32_t pack_num);
+void   store_dat_cache_return(store_t *st, uint32_t pack_num, FILE *fp);
+void   store_dat_cache_flush(store_t *st);
+size_t store_dat_cache_open(const store_t *st);

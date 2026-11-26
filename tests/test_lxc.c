@@ -103,8 +103,9 @@ static int teardown(void **state)
     return 0;
 }
 
-static status_t on_unit(void *ctx, const char *id, const char *name, int st)
+static status_t on_unit(void *ctx, const char *id, const char *name, int st, unsigned flags)
 {
+    (void)flags;
     (void)name; (void)st;
     int *n = ctx;
     (*n)++;

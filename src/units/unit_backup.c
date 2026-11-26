@@ -38,8 +38,9 @@
 
 typedef struct {
     char  id[SP_UNIT_ID_MAX];
-    char *name;
-    int   state;
+    char    *name;
+    int      state;
+    unsigned flags;     /* SP_UNIT_* */
 } listed_t;
 
 typedef struct {
@@ -47,7 +48,7 @@ typedef struct {
     size_t    n, cap;
 } listing_t;
 
-static status_t listing_add(void *ctx, const char *id, const char *name, int state)
+static status_t listing_add(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
     listing_t *l = ctx;
     if (!id || !*id || strlen(id) >= SP_UNIT_ID_MAX)
@@ -63,6 +64,7 @@ static status_t listing_add(void *ctx, const char *id, const char *name, int sta
     snprintf(u->id, sizeof(u->id), "%s", id);
     if (!(u->name = strdup(name ? name : id))) return set_error(ERR_NOMEM, "units: listing");
     u->state = state;
+    u->flags = flags;
     l->n++;
     return OK;
 }
@@ -1830,8 +1832,9 @@ typedef struct {
     const char *prov;
 } redef_t;
 
-static status_t listed_cb(void *ctx, const char *id, const char *name, int state)
+static status_t listed_cb(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
+    (void)flags;
     (void)name; (void)state;
     redef_t *r = ctx;
     char **g = realloc(r->ids, (r->n_ids + 1) * sizeof(*g));
@@ -2081,6 +2084,20 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         for (size_t i = 0; i < l.n; i++) {
             if (excluded(o, l.v[i].name)) continue;
             if (!units_allowed(ops->name, l.v[i].id, l.v[i].name)) { out->filtered++; continue; }
+            /* c-backup's own daemon or helper: capturing either is circular,
+             * so --all leaves it out and says so (SOAK14-SELF). */
+            if (l.v[i].flags & SP_UNIT_SELF) {
+                unit_backup_one_t *r = result_add(out);
+                if (!r) { st = set_error(ERR_NOMEM, "unit backup"); break; }
+                snprintf(r->name, sizeof(r->name), "%s", l.v[i].name);
+                snprintf(r->unit_key, sizeof(r->unit_key), "%s:%s", ops->name, l.v[i].id);
+                r->skipped = 1;
+                snprintf(r->error, sizeof(r->error), "unit %s holds c-backup's own daemon or helper "
+                         "container; skipped", l.v[i].name);
+                log_info("unit backup: %s", r->error);
+                out->skipped++;
+                continue;
+            }
             pick[np++] = i;
         }
     } else {
@@ -2095,6 +2112,8 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             const char *why = NULL;
             if (i == l.n) why = "is not listed by the provider";
             else if (!units_allowed(ops->name, l.v[i].id, l.v[i].name)) why = "is not in units.allow";
+            else if (l.v[i].flags & SP_UNIT_SELF)
+                why = "holds c-backup's own daemon or helper container and cannot back itself up";
             if (why) {
                 unit_backup_one_t *r = result_add(out);
                 if (!r) { st = set_error(ERR_NOMEM, "unit backup"); break; }

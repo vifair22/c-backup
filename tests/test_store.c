@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -772,38 +773,65 @@ static void test_dat_cache_checkout_is_a_handoff(void **state)
     done(st);
 }
 
-static void test_dat_cache_survives_growing(void **state)
+static unsigned open_fds(void)
+{
+    unsigned n = 0;
+    DIR *d = opendir("/proc/self/fd");
+    assert_non_null(d);
+    while (readdir(d)) n++;
+    closedir(d);
+    return n;
+}
+
+static void test_dat_cache_is_bounded(void **state)
 {
     (void)state;
     store_t *st = fresh_store();
 
     /*
-     * Doubling at 75% load with a rehash. A dropped entry here leaks a
-     * FILE handle rather than losing data, which on a repository with
-     * thousands of packs is a descriptor exhaustion that looks like an
-     * unrelated failure much later.
+     * A replicate or grep reads from thousands of packs. Every handle the
+     * cache keeps is a descriptor, and past 1024 of them the daemon's HTTP
+     * server stopped answering (SOAK14-FD). Returning more handles than the
+     * cache holds must close the oldest, and the process must end up with
+     * no more descriptors than the cache's bound.
      */
-    enum { N = 400 };
+    enum { N = 400, BOUND = 64 };
+    unsigned before = open_fds();
     FILE *handles[N];
     for (unsigned i = 0; i < N; i++) {
         char name[64];
         snprintf(name, sizeof(name), "pack-%u", i);
         handles[i] = scratch_file(name);
         store_dat_cache_return(st, i, handles[i]);
+        assert_true(store_dat_cache_open(st) <= BOUND);
     }
-    for (unsigned i = 0; i < N; i++) {
+    assert_int_equal(store_dat_cache_open(st), BOUND);
+    assert_true(open_fds() <= before + BOUND);
+
+    /* The most recently returned are kept; the rest were closed. */
+    for (unsigned i = N - BOUND; i < N; i++) {
         FILE *got = store_dat_cache_checkout(st, i);
         assert_ptr_equal(got, handles[i]);
         store_dat_cache_return(st, i, got);
     }
+    for (unsigned i = 0; i < N - BOUND; i++)
+        assert_null(store_dat_cache_checkout(st, i));
+
+    /* A handle used again is kept over one returned once, longer ago. */
+    FILE *hot = store_dat_cache_checkout(st, N - BOUND);
+    store_dat_cache_return(st, N - BOUND, hot);
+    FILE *extra = scratch_file("pack-extra");
+    store_dat_cache_return(st, N + 5, extra);
+    assert_ptr_equal(store_dat_cache_checkout(st, N - BOUND), hot);
+    store_dat_cache_return(st, N - BOUND, hot);
+    assert_null(store_dat_cache_checkout(st, N - BOUND + 1));
 
     /* A pack that was never cached is a miss, not a wrong handle. */
     assert_null(store_dat_cache_checkout(st, N + 1));
 
     store_dat_cache_flush(st);
-    /* Everything is closed and gone; a checkout after a flush is a miss. */
-    for (unsigned i = 0; i < N; i++)
-        assert_null(store_dat_cache_checkout(st, i));
+    assert_int_equal(store_dat_cache_open(st), 0);
+    assert_true(open_fds() <= before);
     /* Flushing an already-flushed cache is not a double fclose. */
     store_dat_cache_flush(st);
 
@@ -899,7 +927,7 @@ int main(void)
         cmocka_unit_test(test_reserve_pack_num_never_repeats),
         cmocka_unit_test(test_two_writers_on_one_handle_get_distinct_packs),
         cmocka_unit_test(test_dat_cache_checkout_is_a_handoff),
-        cmocka_unit_test(test_dat_cache_survives_growing),
+        cmocka_unit_test(test_dat_cache_is_bounded),
         cmocka_unit_test(test_dat_cache_return_ignores_null),
         cmocka_unit_test(test_open_sweeps_stale_staging_files),
     };

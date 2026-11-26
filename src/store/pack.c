@@ -497,7 +497,7 @@ static FILE *dat_open_or_checkout(store_t *store, uint32_t pack_num) {
     if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
                               store_root(store), pack_num) != 0)
         return NULL;
-    return fopen(dat_path, "rb");
+    return fopen(dat_path, "rbe");
 }
 
 static void dat_return_or_close(store_t *store, uint32_t pack_num, FILE *f) {
@@ -3962,7 +3962,7 @@ static status_t collect_pack_meta(store_t *store,
         /* Object count and format version both come from the .dat header.
          * This used to read the .idx header for the same two fields, which
          * was the only reason coalesce planning needed the sidecar at all. */
-        FILE *datf = fopen(dat_path, "rb");
+        FILE *datf = fopen(dat_path, "rbe");
         if (!datf) continue;
         pack_dat_hdr_t dhdr;
         if (pack_hdr_read_file(datf, &dhdr) != 0) {

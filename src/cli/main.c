@@ -1334,6 +1334,8 @@ static int h_schedule_add(const args_t *a)
     const char *dest     = args_value(a, "--dest");
     const char *pattern  = args_value(a, "--pattern");
     const char *gprefix  = args_value(a, "--path-prefix");
+    const char *vlevel   = args_value(a, "--level");
+    int vnorepair = args_flag(a, "--no-repair");
     int gicase = args_flag(a, "-i");
     /* A units schedule: a provider, and --all (enumerated when it fires,
      * less --exclude globs) or each --unit by name. */
@@ -1390,6 +1392,8 @@ static int h_schedule_add(const args_t *a)
     if (pattern) { sb_puts(&b, ",\"pattern\":");     sb_json_str(&b, pattern); }
     if (gprefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, gprefix); }
     if (gicase)  sb_puts(&b, ",\"ignore_case\":true");
+    if (vlevel)  { sb_puts(&b, ",\"level\":");       sb_json_str(&b, vlevel); }
+    if (vnorepair) sb_puts(&b, ",\"repair\":false");
     if (uprov) { sb_puts(&b, ",\"provider\":"); sb_json_str(&b, uprov); }
     if (ureq)  { sb_puts(&b, ",\"require\":");  sb_json_str(&b, ureq); }
     if (uscope) { sb_puts(&b, ",\"pause_scope\":"); sb_json_str(&b, uscope); }
@@ -2091,6 +2095,8 @@ static const arg_opt_t O_SCHED_ADD[] = {
     { "--pattern",     NULL, ARG_VALUE, "REGEX" },
     { "--path-prefix", NULL, ARG_VALUE, "PATH" },
     { "-i", "--ignore-case", ARG_FLAG, NULL },
+    { "--level",       NULL, ARG_CHOICE, "index|structure|deep" },
+    { "--no-repair",   NULL, ARG_FLAG,  NULL },
     { "--provider",    NULL, ARG_VALUE, "P" },
     { "--all",         NULL, ARG_FLAG,  NULL },
     { "--unit",        NULL, ARG_MULTI, "NAME" },

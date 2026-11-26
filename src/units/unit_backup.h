@@ -75,6 +75,7 @@ typedef struct {
     char             name[256];
     int64_t          snapshot_id;    /* 0 when it failed */
     status_t         st;
+    int              skipped;        /* left out, with the reason in error; st is OK */
     char             error[MSG_CLIP_MAX];
     sp_consistency_t achieved;
     uint64_t         bytes_read;     /* disk bytes read */
@@ -96,6 +97,7 @@ typedef struct {
     size_t             n;
     size_t             ok, failed;
     size_t             filtered;     /* left out by units.allow under --all */
+    size_t             skipped;      /* c-backup's own containers, left out under --all */
     /* The job's own warning, apart from any unit's: a hold the provider
      * cannot release (the end-of-job sweep). Empty when none. */
     char               warning[SP_STUCK_MAX];

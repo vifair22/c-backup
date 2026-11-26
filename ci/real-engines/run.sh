@@ -255,7 +255,12 @@ fi
 for b in c-backupd c-backup c-backup-helper; do
     [ -x "$SRC/build/bins/$b" ] || die "build produced no $b"
 done
-ldd "$SRC/build/bins/c-backup-helper" | grep -q libvirt || die "the helper was built without libvirt"
+if ! ldd "$SRC/build/bins/c-backup-helper" | grep -q libvirt; then
+    # FLAKE-RE-LIBVIRT: say what make's pkg-config probe would have seen.
+    log "pkg-config libvirt libxml-2.0: $(pkg-config --modversion libvirt libxml-2.0 2>&1 | tr '\n' ' ')"
+    log "libvirt_backend objects: $(find "$SRC/build" -name 'libvirt_backend*.o' 2>/dev/null | tr '\n' ' ')"
+    die "the helper was built without libvirt"
+fi
 log "build: done"
 
 # ---- the btrfs pool ------------------------------------------------------

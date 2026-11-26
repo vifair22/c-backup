@@ -168,8 +168,9 @@ static void test_registry(void **state)
 
 typedef struct { int n; char names[8][32]; } list_t;
 
-static status_t collect(void *ctx, const char *id, const char *name, int state)
+static status_t collect(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
+    (void)flags;
     (void)id; (void)state;
     list_t *l = ctx;
     snprintf(l->names[l->n++], 32, "%s", name);

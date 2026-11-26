@@ -82,8 +82,9 @@ void unit_detect_reread(db_detector_t *d, const char *const *rec, const char *co
 
 typedef struct { const char *want; char id[SP_UNIT_ID_MAX]; char name[256]; int hit; } find_t;
 
-static status_t find_cb(void *ctx, const char *id, const char *name, int state)
+static status_t find_cb(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
+    (void)flags;
     (void)state;
     find_t *f = ctx;
     if (f->hit || (strcmp(id, f->want) != 0 && strcmp(name, f->want) != 0)) return OK;
@@ -97,8 +98,9 @@ static status_t find_cb(void *ctx, const char *id, const char *name, int state)
  * from its own callback. */
 typedef struct { char (*ids)[SP_UNIT_ID_MAX]; size_t n; int over; } ids_t;
 
-static status_t collect_cb(void *ctx, const char *id, const char *name, int state)
+static status_t collect_cb(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
+    (void)flags;
     (void)name; (void)state;
     ids_t *v = ctx;
     if (v->n == UNIT_LOOKUP_PROBE_MAX) { v->over = 1; return OK; }

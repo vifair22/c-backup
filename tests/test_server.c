@@ -23,6 +23,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/select.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 
 #include <cmocka.h>
@@ -285,6 +288,79 @@ static int unix_request(const char *method, const char *path)
     if (got <= 12) return -1;
     buf[got] = '\0';
     return atoi(buf + 9);
+}
+
+/* One GET over TCP to 127.0.0.1:port; the status code, or -1. */
+static int tcp_get(int port, const char *path)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return -1; }
+    char req[256];
+    int n = snprintf(req, sizeof(req),
+                     "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", path);
+    if (write(fd, req, (size_t)n) != n) { close(fd); return -1; }
+    char buf[512];
+    ssize_t got = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (got <= 12) return -1;
+    buf[got] = '\0';
+    return atoi(buf + 9);
+}
+
+/*
+ * SOAK14-FD: with more than 1024 descriptors open, every request failed
+ * with no answer. MHD waited with select(), which cannot watch a descriptor
+ * numbered FD_SETSIZE or above, and closed each such connection as it
+ * accepted it. Fill the low descriptors so every connection the server
+ * accepts lands above 1024, then ask on both listeners.
+ */
+static void test_serves_with_descriptors_above_fd_setsize(void **state)
+{
+    (void)state;
+    enum { FILL_TO = FD_SETSIZE + 64 };
+    struct rlimit old;
+    assert_int_equal(getrlimit(RLIMIT_NOFILE, &old), 0);
+    if (old.rlim_max != RLIM_INFINITY && old.rlim_max < (rlim_t)FILL_TO + 64) {
+        print_message("hard RLIMIT_NOFILE %llu is below %d; skipped\n",
+                      (unsigned long long)old.rlim_max, FILL_TO + 64);
+        skip();
+    }
+    struct rlimit raised = old;
+    if (raised.rlim_cur != RLIM_INFINITY && raised.rlim_cur < (rlim_t)FILL_TO + 64)
+        raised.rlim_cur = (rlim_t)FILL_TO + 64;
+    assert_int_equal(setrlimit(RLIMIT_NOFILE, &raised), 0);
+
+    unlink(TEST_SOCK);
+    api_server_t *srv = api_server_create(g_port, "127.0.0.1", TEST_SOCK, NULL);
+    assert_non_null(srv);
+    assert_int_equal(api_server_route(srv, "/thing", API_GET, API_CLASS_NONE, ok_handler, NULL), 0);
+    assert_int_equal(api_server_start(srv), 0);
+
+    int *fill = calloc(FILL_TO, sizeof(*fill));
+    assert_non_null(fill);
+    int nfill = 0, top = -1;
+    while (top < FILL_TO) {
+        int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        assert_true(fd >= 0);
+        fill[nfill++] = fd;
+        top = fd;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        assert_int_equal(unix_request("GET", "/thing"), 200);
+        assert_int_equal(tcp_get(g_port, "/thing"), 200);
+    }
+
+    api_server_stop(srv);
+    for (int i = 0; i < nfill; i++) close(fill[i]);
+    free(fill);
+    assert_int_equal(setrlimit(RLIMIT_NOFILE, &old), 0);
 }
 
 /*
@@ -551,6 +627,7 @@ int main(void)
         cmocka_unit_test_setup(test_after_write_runs_for_durable_writes_only, fresh_port),
         cmocka_unit_test_setup(test_after_write_failure_is_not_answered_2xx, fresh_port),
         cmocka_unit_test_setup(test_after_write_follows_a_per_path_class, fresh_port),
+        cmocka_unit_test_setup(test_serves_with_descriptors_above_fd_setsize, fresh_port),
         cmocka_unit_test(test_a_write_needs_a_class),
         cmocka_unit_test(test_dispatch_runs_the_hook_by_class),
         cmocka_unit_test(test_unknown_body_keys_are_refused),

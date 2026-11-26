@@ -73,6 +73,7 @@ typedef struct {
     char     cp[ARTEFACT_NAME_MAX];   /* the unit's checkpoint, "" for none */
     int      refuse;                  /* its bitmap is inconsistent: refused once */
     char    *probe;                   /* units.probe's answer as JSON text, or NULL */
+    int      self;                    /* listed as c-backup's own (SP_UNIT_SELF) */
     int      probe_fail;              /* units.probe fails (spec "probe_fail") */
 } funit_t;
 
@@ -655,6 +656,12 @@ static status_t load_unit(sp_ctx_t *ctx, const cJSON *ju)
         if (strcmp(c->valuestring, "snapshot") == 0) caps |= SP_CAP_SNAPSHOT;
     }
     status_t st = fake_unit_add(ctx, id, name ? name : id, state, caps);
+    if (st == OK) {
+        pthread_mutex_lock(&ctx->mu);
+        funit_t *u = find_unit(ctx, id);
+        if (u) u->self = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ju, "self"));
+        pthread_mutex_unlock(&ctx->mu);
+    }
     const cJSON *b;
     cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(ju, "blobs")) {
         if (st != OK) break;
@@ -827,7 +834,7 @@ static status_t f_probe(sp_ctx_t *c, sp_probe_t *out)
     return OK;
 }
 
-typedef struct { char id[SP_UNIT_ID_MAX]; char *name; int state; } fl_t;
+typedef struct { char id[SP_UNIT_ID_MAX]; char *name; int state; int self; } fl_t;
 
 static int fl_cmp(const void *a, const void *b)
 {
@@ -846,11 +853,12 @@ static status_t f_list(sp_ctx_t *c, sp_unit_cb cb, void *cbctx)
     for (size_t i = 0; st == OK && i < c->nu; i++, n++) {
         memcpy(l[i].id, c->units[i].id, sizeof(l[i].id));
         l[i].state = c->units[i].state;
+        l[i].self = c->units[i].self;
         if (!(l[i].name = strdup(c->units[i].name))) st = set_error(ERR_NOMEM, "fake: list");
     }
     pthread_mutex_unlock(&c->mu);
     if (st == OK) qsort(l, n, sizeof(*l), fl_cmp);
-    for (size_t i = 0; st == OK && i < n; i++) st = cb(cbctx, l[i].id, l[i].name, l[i].state);
+    for (size_t i = 0; st == OK && i < n; i++) st = cb(cbctx, l[i].id, l[i].name, l[i].state, l[i].self ? SP_UNIT_SELF : 0u);
     for (size_t i = 0; l && i < n; i++) free(l[i].name);
     free(l);
     return st;

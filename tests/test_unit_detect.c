@@ -149,9 +149,9 @@ static int lk_probes;
 static status_t lk_list(sp_ctx_t *ctx, sp_unit_cb cb, void *cbctx)
 {
     (void)ctx;
-    status_t st = cb(cbctx, "compose:nc", "compose:nc", 1);
-    if (st == OK) st = cb(cbctx, "compose:dbstack", "compose:dbstack", 1);
-    if (st == OK) st = cb(cbctx, "compose:blog", "compose:blog", 1);
+    status_t st = cb(cbctx, "compose:nc", "compose:nc", 1, 0);
+    if (st == OK) st = cb(cbctx, "compose:dbstack", "compose:dbstack", 1, 0);
+    if (st == OK) st = cb(cbctx, "compose:blog", "compose:blog", 1, 0);
     return st;
 }
 

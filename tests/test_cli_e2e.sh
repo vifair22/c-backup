@@ -207,6 +207,14 @@ OUT=$(cb objects 1 --location nowhere 2>&1); RC=$?
 check    "objects --location nowhere fails" 1 "$RC"
 
 contains "tag set"    '"ok"'      "$(cb tag set 1 keeper 1)"
+# Each sync a tag write waits for is counted, so a slow one can be told
+# apart afterwards (tag_file_sync, tag_dir_sync, durable_sync).
+MET=$(curl -s --unix-socket "$SOCK" http://localhost/metrics)
+for step in tag_write tag_file_sync tag_dir_sync durable_sync; do
+    check "a tag write counts its $step" 1 \
+        "$(printf '%s\n' "$MET" | grep -q "^cbackup_sync_waits_total{step=\"$step\"} [1-9]" && echo 1 || echo 0)"
+done
+contains "and keeps the longest wait" 'cbackup_sync_wait_max_seconds{step="tag_dir_sync"}' "$MET"
 contains "tag list"   'keeper'    "$(cb tag list 1)"
 # B095: the removes printed nothing on success, against the contract of one
 # JSON document per command.
@@ -726,6 +734,54 @@ for _ in $(seq 1 50); do
 done
 check "a scheduled grep runs with its pattern" 1 "$FIRED"
 cb schedule remove 1 "$GSID" >/dev/null 2>&1
+# B298: a verify schedule takes a level and a repair setting. The job used to
+# be zero-filled, so every scheduled verify ran at index level, repair off,
+# and never read a payload. One without either now runs as `verify` does.
+sched_job() {   # the newest finished job of schedule $1, one JSON object
+    curl -s --unix-socket "$SOCK" 'http://localhost/jobs?limit=50' |
+        sed 's/{"id":/\n{"id":/g' | grep "\"schedule_id\":$1[,}]" | grep '"state":"completed"' | head -1
+}
+OUT=$(cb schedule add 1 gc 3600 --level index 2>&1); RC=$?
+check    "a level on a gc schedule is refused" 1 "$RC"
+contains "and says it is a verify setting" "level applies only to a verify" "$OUT"
+OUT=$(cb schedule add 1 verify 3600 --level shallow 2>&1); RC=$?
+check    "an unknown verify level is refused" 1 "$RC"
+OUT=$(curl -s --unix-socket "$SOCK" -X POST -d '{"action":"verify","trigger":{"type":"interval","seconds":3600},"level":"shallow"}' \
+      http://localhost/repos/1/schedules)
+contains "and by the daemon" "level must be index, structure or deep" "$OUT"
+OUT=$(curl -s --unix-socket "$SOCK" -X POST -d '{"action":"verify","trigger":{"type":"interval","seconds":3600},"repair":"no"}' \
+      http://localhost/repos/1/schedules)
+contains "repair must be a boolean" "repair must be true or false" "$OUT"
+SVSID=$(cb schedule add 1 verify 1 --level structure --no-repair | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "a verify schedule stores its level" '"params":{"level":"structure","repair":false}' "$(cb schedule list 1)"
+JOB=""
+for _ in $(seq 1 100); do JOB=$(sched_job "$SVSID"); [ -n "$JOB" ] && break; sleep 0.2; done
+cb schedule remove 1 "$SVSID" >/dev/null 2>&1
+contains "a scheduled structure verify runs at structure, check only" \
+    '"level":"structure","repair":false,' "$JOB"
+DVSID=$(cb schedule add 1 verify 1 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "a verify schedule with no level stores deep, repairing" '"params":{"level":"deep","repair":true}' "$(cb schedule list 1)"
+JOB=""
+for _ in $(seq 1 100); do JOB=$(sched_job "$DVSID"); [ -n "$JOB" ] && break; sleep 0.2; done
+cb schedule remove 1 "$DVSID" >/dev/null 2>&1
+contains "and runs deep, repairing" '"level":"deep","repair":true,' "$JOB"
+# A verify schedule stored before these settings has empty params; it runs
+# as `verify` does too. Written straight into the database, disabled, since
+# the route now always stores both.
+if command -v sqlite3 > /dev/null 2>&1; then
+    OVSID=$(cb schedule add 1 verify 3600 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+    cb schedule disable 1 "$OVSID" >/dev/null 2>&1
+    sqlite3 -cmd ".timeout 10000" "$WORK/state.db" "UPDATE schedules SET params = '',
+        trigger_spec = '{\"type\":\"interval\",\"seconds\":1}' WHERE id = $OVSID"
+    cb schedule enable 1 "$OVSID" >/dev/null 2>&1
+    JOB=""
+    for _ in $(seq 1 100); do JOB=$(sched_job "$OVSID"); [ -n "$JOB" ] && break; sleep 0.2; done
+    cb schedule remove 1 "$OVSID" >/dev/null 2>&1
+    contains "an older verify schedule with no params runs deep, repairing" \
+        '"level":"deep","repair":true,' "$JOB"
+else
+    ok "an older verify schedule with no params runs deep, repairing (skipped: no sqlite3)"
+fi
 # NIT-1: ignore_case was stored as the number 1; every other flag is a
 # boolean. A schedule made before the change, holding 1, still reads.
 ISID=$(cb schedule add 1 grep 3600 --pattern 'case test' -i | sed -n 's/.*"id":\([0-9]*\).*/\1/p')

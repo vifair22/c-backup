@@ -44,7 +44,7 @@ int verify_level_from_string(const char *s, verify_level_t *out)
     return -1;
 }
 
-static const char *level_name(verify_level_t l)
+const char *verify_level_name(verify_level_t l)
 {
     switch (l) {
     case VERIFY_LEVEL_INDEX:     return "index";
@@ -1165,7 +1165,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (db_write_returning(db,
             "INSERT INTO verify_runs (repo_id, started_at, level)"
             " VALUES (?, ?, ?) RETURNING id",
-            (const char *[]){ repo, started_s, level_name(level), NULL }, &r) != 0 ||
+            (const char *[]){ repo, started_s, verify_level_name(level), NULL }, &r) != 0 ||
         !r || r->nrows != 1) {
         db_result_free(r);
         return set_error(ERR_IO, "verify: cannot open run record");
@@ -1246,7 +1246,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     for (int i = 0; i < objs->nrows; i++) {
         if (cancel_requested(cancel)) { st = set_error(ERR_BUSY, "verify cancelled"); break; }
         if (progress && (i % 256 == 0 || i + 1 == objs->nrows))
-            progress(level_name(level), (uint64_t)i, total, progress_ctx);
+            progress(verify_level_name(level), (uint64_t)i, total, progress_ctx);
 
         const char *hex     = objs->rows[i][0];
         int64_t     pack_id = strtoll(objs->rows[i][2], NULL, 10);
@@ -1371,7 +1371,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* The loop reports each object before checking it, so its last report
      * is total - 1: an index verify, which has no later phase, ended every
      * job one short (NIT-33, as restore once did). Say the walk finished. */
-    if (st == OK && progress) progress(level_name(level), total, total, progress_ctx);
+    if (st == OK && progress) progress(verify_level_name(level), total, total, progress_ctx);
 
     /* Before the lists, which ask what was lost. A cancelled walk reports
      * what it held back as it found it, without the search. */
@@ -1445,13 +1445,13 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     if (res.packs_unwalkable)
         log_error("verify (%s%s): %llu pack(s) cannot be walked",
-                  level_name(level), repair ? "" : ", check only",
+                  verify_level_name(level), repair ? "" : ", check only",
                   (unsigned long long)res.packs_unwalkable);
     if (res.unrecoverable || res.missing)
         log_error("verify (%s%s) FAILED: %llu checked, %llu ok, %llu repaired, "
                   "%llu recoverable, %llu UNRECOVERABLE, %llu MISSING, affecting "
                   "%llu file(s)",
-                  level_name(level), repair ? "" : ", check only",
+                  verify_level_name(level), repair ? "" : ", check only",
                   (unsigned long long)res.checked,
                   (unsigned long long)res.ok,
                   (unsigned long long)res.repaired,
@@ -1462,7 +1462,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     else
         log_info("verify (%s%s): %llu checked, %llu ok, %llu repaired, %llu recoverable, "
                  "%llu bytes read",
-                 level_name(level), repair ? "" : ", check only",
+                 verify_level_name(level), repair ? "" : ", check only",
                  (unsigned long long)res.checked,
                  (unsigned long long)res.ok, (unsigned long long)res.repaired,
                  (unsigned long long)res.recoverable,

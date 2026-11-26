@@ -45,14 +45,21 @@
  * Uses atomic tmp+rename for safety. Errors are silently ignored
  * since this is best-effort housekeeping. */
 
-/* Dynamic open-addressing hash table for .dat FILE* handles.
- * No eviction — all handles stay open until store_close() or flush.
- * Grows at 75% load factor.  Minimum 128 slots. */
-#define DAT_CACHE_MIN_SLOTS 128
+/*
+ * Open .dat handles kept between reads, at most DAT_CACHE_SLOTS of them,
+ * the least recently returned closed first. The cache used to grow without
+ * bound and close nothing until store_close: a replicate or grep over a
+ * repository with thousands of packs held one descriptor per pack it had
+ * read, and once the daemon's descriptors passed 1024 its HTTP server
+ * stopped answering (SOAK14-FD). A linear scan over 64 slots costs nothing
+ * next to the read it saves.
+ */
+#define DAT_CACHE_SLOTS 64
 
 typedef struct {
-    uint32_t pack_num;   /* 0 = empty slot (pack_num 0 is valid but rare) */
+    uint32_t pack_num;
     FILE    *fp;         /* NULL = empty slot */
+    uint64_t used;       /* dat_cache_tick when returned */
 } dat_cache_slot_t;
 
 typedef struct {
@@ -68,10 +75,9 @@ struct store {
      * stages into tmp/ or sweeps it until store_close; -1 when not held.
      * See store_claim_tmp. */
     int     tmp_lock_fd;
-    /* Dynamic .dat file handle cache (open-addressing hash table) */
-    dat_cache_slot_t *dat_cache;
-    uint32_t          dat_cache_mask;   /* power-of-2 - 1 */
-    uint32_t          dat_cache_count;  /* occupied slots */
+    /* Bounded .dat handle cache; one thread reads through a store_t. */
+    dat_cache_slot_t  dat_cache[DAT_CACHE_SLOTS];
+    uint64_t          dat_cache_tick;
 
     /* Built-in index, used only without a resolver (store_scan_packs). */
     bidx_slot_t     *bidx;
@@ -554,13 +560,6 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     if (!r->path) { close(fd); free(r); return set_error(ERR_NOMEM, "store_open: strdup failed"); }
     r->dirfd          = fd;
     r->tmp_lock_fd    = -1;     /* calloc'd: 0 would be stdin */
-    r->dat_cache       = calloc(DAT_CACHE_MIN_SLOTS, sizeof(dat_cache_slot_t));
-    r->dat_cache_mask  = DAT_CACHE_MIN_SLOTS - 1;
-    r->dat_cache_count = 0;
-    if (!r->dat_cache) {
-        close(fd); free(r->path); free(r);
-        return set_error(ERR_NOMEM, "store_open: dat_cache alloc failed");
-    }
     r->cfg             = cfg ? *cfg : (store_config_t){ 0 };
     r->locate_cb       = NULL;
     r->locate_user     = NULL;
@@ -613,8 +612,6 @@ void store_close(store_t *st) {
     }
 
     store_dat_cache_flush(st);
-    free(st->dat_cache);
-    st->dat_cache = NULL;
     if (st->tmp_lock_fd >= 0) close(st->tmp_lock_fd);    /* releases the claim */
     close(st->dirfd);
     free(st->path);
@@ -784,97 +781,49 @@ const char *store_root(const store_t *st) {
     return st->path;
 }
 
-static inline uint32_t dat_cache_hash(uint32_t pack_num) {
-    /* Knuth multiplicative hash */
-    return pack_num * 2654435761u;
-}
-
-static void dat_cache_grow(store_t *st) {
-    uint32_t old_cap = st->dat_cache_mask + 1;
-    uint32_t new_cap = old_cap * 2;
-    dat_cache_slot_t *new_tbl = calloc(new_cap, sizeof(dat_cache_slot_t));
-    if (!new_tbl) return;  /* best effort — keep old table */
-
-    uint32_t new_mask = new_cap - 1;
-    for (uint32_t i = 0; i < old_cap; i++) {
-        if (!st->dat_cache[i].fp) continue;
-        uint32_t idx = dat_cache_hash(st->dat_cache[i].pack_num) & new_mask;
-        while (new_tbl[idx].fp)
-            idx = (idx + 1) & new_mask;
-        new_tbl[idx] = st->dat_cache[i];
-    }
-
-    free(st->dat_cache);
-    st->dat_cache      = new_tbl;
-    st->dat_cache_mask = new_mask;
-}
-
 FILE *store_dat_cache_checkout(store_t *st, uint32_t pack_num) {
-    if (!st->dat_cache) return NULL;
-    uint32_t mask = st->dat_cache_mask;
-    uint32_t cap  = mask + 1;
-    uint32_t idx  = dat_cache_hash(pack_num) & mask;
-    /* Bounded for the same reason the return path is: an empty slot ends the
-     * probe, and a table with no empty slot in it never reaches one. */
-    for (uint32_t i = 0; i < cap; i++) {
-        dat_cache_slot_t *s = &st->dat_cache[idx];
-        if (!s->fp) return NULL;  /* empty slot means miss */
-        if (s->pack_num == pack_num) {
+    if (!st) return NULL;
+    for (int i = 0; i < DAT_CACHE_SLOTS; i++) {
+        dat_cache_slot_t *s = &st->dat_cache[i];
+        if (s->fp && s->pack_num == pack_num) {
             FILE *fp = s->fp;
             s->fp = NULL;
-            st->dat_cache_count--;
             return fp;
         }
-        idx = (idx + 1) & mask;
     }
     return NULL;
 }
 
 void store_dat_cache_return(store_t *st, uint32_t pack_num, FILE *fp) {
     if (!fp) return;
-    if (!st->dat_cache) { fclose(fp); return; }
-
-    /* Grow at 75% load factor */
-    uint32_t cap = st->dat_cache_mask + 1, mask;
-    if (st->dat_cache_count * 4 >= cap * 3)
-        dat_cache_grow(st);
-
-    /*
-     * Bounded. The grow above
-     * guarantees a free slot - but only when it succeeds, and it returns
-     * silently on an allocation failure by design ("best effort - keep old
-     * table"). With a full table and no room to grow, an unbounded probe
-     * walks a table with no empty slot forever: a hang rather than a fault,
-     * in a cache whose whole purpose is to be optional.
-     *
-     * Nothing is lost by giving up. A returned handle that will not fit is
-     * closed instead of cached, which costs one reopen later.
-     */
-    mask = st->dat_cache_mask;
-    cap  = mask + 1;
-    uint32_t idx = dat_cache_hash(pack_num) & mask;
-    for (uint32_t i = 0; i < cap; i++) {
-        if (!st->dat_cache[idx].fp) {
-            st->dat_cache[idx].fp       = fp;
-            st->dat_cache[idx].pack_num = pack_num;
-            st->dat_cache_count++;
-            return;
-        }
-        idx = (idx + 1) & mask;
+    if (!st) { fclose(fp); return; }
+    dat_cache_slot_t *victim = &st->dat_cache[0];
+    for (int i = 0; i < DAT_CACHE_SLOTS; i++) {
+        dat_cache_slot_t *s = &st->dat_cache[i];
+        if (!s->fp) { victim = s; break; }
+        if (s->used < victim->used) victim = s;
     }
-    fclose(fp);
+    if (victim->fp) fclose(victim->fp);
+    victim->fp       = fp;
+    victim->pack_num = pack_num;
+    victim->used     = ++st->dat_cache_tick;
+}
+
+size_t store_dat_cache_open(const store_t *st) {
+    size_t n = 0;
+    if (!st) return 0;
+    for (int i = 0; i < DAT_CACHE_SLOTS; i++) n += st->dat_cache[i].fp != NULL;
+    return n;
 }
 
 void store_dat_cache_flush(store_t *st) {
-    if (!st || !st->dat_cache) return;
-    uint32_t cap = st->dat_cache_mask + 1;
-    for (uint32_t i = 0; i < cap; i++) {
+    if (!st) return;
+    for (int i = 0; i < DAT_CACHE_SLOTS; i++) {
         if (st->dat_cache[i].fp) {
             fclose(st->dat_cache[i].fp);
             st->dat_cache[i].fp = NULL;
         }
     }
-    st->dat_cache_count = 0;
 }
 
 /* ------------------------------------------------------------------ */

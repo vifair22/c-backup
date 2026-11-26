@@ -129,7 +129,7 @@ static status_t x_list(sp_ctx_t *c, sp_unit_cb cb, void *cbctx)
     for (char *l = strtok_r(out, "\n", &save); l && st == OK; l = strtok_r(NULL, "\n", &save)) {
         if (!valid_name(l)) continue;
         int s = state_of(c, l);
-        st = cb(cbctx, l, l, s < 0 ? SP_STATE_UNKNOWN : s);
+        st = cb(cbctx, l, l, s < 0 ? SP_STATE_UNKNOWN : s, 0);
     }
     free(out);
     return st;

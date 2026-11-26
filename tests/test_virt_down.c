@@ -159,8 +159,9 @@ static void dead_socket(const char *path)
     close(fd);
 }
 
-static status_t on_unit(void *ctx, const char *id, const char *name, int st)
+static status_t on_unit(void *ctx, const char *id, const char *name, int st, unsigned flags)
 {
+    (void)flags;
     (void)ctx; (void)id; (void)name; (void)st;
     return OK;
 }

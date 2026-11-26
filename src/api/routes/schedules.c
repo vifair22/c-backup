@@ -11,6 +11,7 @@
 #include "json_row.h"
 #include "snap_record.h"
 #include "tzinfo.h"
+#include "verify.h"
 
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
@@ -238,6 +239,8 @@ static const struct {
     { "label",       "backup"    },
     { "dest",        "replicate" },
     { "pattern",     "grep"      },
+    { "level",       "verify"    },
+    { "repair",      "verify"    },
     { "path_prefix", "grep"      },
     { "ignore_case", "grep"      },
     { "max_files",   "grep"      },
@@ -308,6 +311,44 @@ static char *grep_schedule_params(const cutils_json_req_t *body, api_response_t 
         (prefix && *prefix && json_resp_add_str(pr, "path_prefix", prefix) != 0) ||
         json_resp_add_bool(pr, "ignore_case", ic != 0) != 0 ||
         json_resp_add_u32(pr, "max_files", mf) != 0 ||
+        json_resp_finalize(pr, &pbuf, &plen) != 0) {
+        *bad = api_error(500, "cannot encode schedule parameters");
+        return NULL;
+    }
+    return pbuf;
+}
+
+/*
+ * A verify schedule's level and repair setting, always stored in full so the
+ * listing says what each run will do. Absent means what an ad-hoc verify
+ * does: deep, repairing. Before these existed every scheduled verify ran at
+ * index level and never read a payload (B298).
+ */
+static char *verify_schedule_params(const cutils_json_req_t *body, api_response_t *bad)
+{
+    CUTILS_AUTOFREE char *level = NULL;
+    jreq_err_t je;
+    if (jreq_str(body, "level", &level, &je) == JREQ_BAD) {
+        *bad = api_error(400, je.msg);
+        return NULL;
+    }
+    verify_level_t lv = VERIFY_LEVEL_DEEP;
+    if (level && verify_level_from_string(level, &lv) != 0) {
+        *bad = api_error(400, "level must be index, structure or deep");
+        return NULL;
+    }
+    int repair = 1;
+    if (json_req_has(body, "repair") && jreq_flag(body, "repair", &repair) != 0) {
+        *bad = api_error(400, "repair must be true or false");
+        return NULL;
+    }
+
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *pr = NULL;
+    char  *pbuf = NULL;
+    size_t plen = 0;
+    if (json_resp_new(&pr) != 0 ||
+        json_resp_add_str(pr, "level", verify_level_name(lv)) != 0 ||
+        json_resp_add_bool(pr, "repair", repair != 0) != 0 ||
         json_resp_finalize(pr, &pbuf, &plen) != 0) {
         *bad = api_error(500, "cannot encode schedule parameters");
         return NULL;
@@ -547,6 +588,12 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     if (strcmp(action, "grep") == 0) {
         api_response_t bad = { 0 };
         params = grep_schedule_params(body, &bad);
+        if (!params) return bad;
+    }
+
+    if (strcmp(action, "verify") == 0) {
+        api_response_t bad = { 0 };
+        params = verify_schedule_params(body, &bad);
         if (!params) return bad;
     }
 

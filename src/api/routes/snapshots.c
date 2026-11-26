@@ -2502,6 +2502,33 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
     }
 
     /*
+     * A verify schedule's level and repair setting (B298). The job used to
+     * be zero-filled, which is index level with repair off, so a scheduled
+     * verify never read a payload. Schedules from before these were stored
+     * carry no params and get what an ad-hoc verify gets: deep, repairing.
+     */
+    if (kind == SNAP_JOB_VERIFY) {
+        j->verify_level  = VERIFY_LEVEL_DEEP;
+        j->verify_repair = 1;
+        if (params && *params) {
+            CUTILS_AUTO_JSON_REQ cutils_json_req_t *p = NULL;
+            char *lvl = NULL;
+            int bad = json_req_parse(params, strlen(params), &p) != 0 ||
+                      json_req_get_str_opt(p, "level", &lvl) != 0 ||
+                      (lvl && verify_level_from_string(lvl, &j->verify_level) != 0) ||
+                      (json_req_has(p, "repair") &&
+                       jreq_flag(p, "repair", &j->verify_repair) != 0);
+            free(lvl);
+            if (bad) {
+                snap_job_free(j);
+                return set_error(ERR_INVALID,
+                                 "verify schedule for repo %lld has unreadable settings: %.200s",
+                                 (long long)repo_id, params);
+            }
+        }
+    }
+
+    /*
      * A scheduled grep searches the newest snapshot as of when it fires,
      * which is what a recurring "is this still in the backup" means. It ran
      * with no pattern and no snapshot at all, because neither reached here.
