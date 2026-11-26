@@ -1730,7 +1730,8 @@ manager as everything else.
 ```sh
 sudo c-backup schedule add 1 backup 14400                          # every 4 hours
 sudo c-backup schedule add 1 backup --every day --at 02:00
-sudo c-backup schedule add 1 verify --every week --on sunday --at 03:00
+sudo c-backup schedule add 1 verify --every week --on sunday --at 03:00 --level structure
+sudo c-backup schedule add 1 verify --every month --on-day 1 --at 04:00   # deep, repairing
 sudo c-backup schedule add 1 gc --every month --on-day 1 --at 05:00
 sudo c-backup schedule add 1 replicate --every day --at 03:30 --dest /mnt/nas/main
 sudo c-backup schedule list 1
@@ -1809,11 +1810,18 @@ A `backup` schedule uses the repository's sources unless it names
 `--source` paths. A `replicate` schedule needs `--dest`, an absolute path. A
 `grep` schedule needs `--pattern` (an extended regular expression, checked
 when the schedule is created) and takes `--path-prefix` and `-i`; it searches
-the newest snapshot each time it fires. An option that belongs to a
+the newest snapshot each time it fires. A `verify` schedule takes `--level`
+and `--no-repair` as `verify` does (section 11); with neither, each run is a
+deep verify that repairs what it finds. `schedule list` shows the level and
+repair setting under `params`. An option that belongs to a
 different action, such as `--dest` on a `gc` schedule, is refused rather than
 stored and ignored.
 
 `scheduler.enabled: 0` in `config.yaml` stops every schedule.
+
+A `verify` schedule made before it could take a level carries none, so it
+now runs deep and repairing; before, it ran at index level and never read a
+payload. Give it `--level` by deleting it and adding it again.
 
 **Schedules from older builds.** Each rule above was added at some point, and
 a schedule stored before its rule existed is still in the database after an
@@ -1840,7 +1848,7 @@ A suggested set for one repository:
 | `backup` | daily, or every few hours |
 | `gfs` | daily, after the backup |
 | `gc` | weekly, after retention |
-| `verify` | weekly or monthly (deep verify reads everything) |
+| `verify` | `--level structure` weekly, deep monthly (deep reads everything) |
 | `replicate` | daily, to another disk or machine |
 
 ---
@@ -3483,7 +3491,7 @@ lists every command with all of its arguments.
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id> [--limit N] [--offset N]`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--offset N] [--result success\|failed\|cancelled\|warning\|alert]` | Operation history, newest first; any other `--result` is refused |
-| `schedule list <id> [--limit N] [--offset N]`, `schedule add\|remove\|enable\|disable <id> ...` | Schedules (section 10); `add <id> units ... --provider P (--all [--exclude GLOB]... \| --unit NAME...) [--require LEVEL] [--pause-scope unit\|group\|job]` for units (section 22.6) |
+| `schedule list <id> [--limit N] [--offset N]`, `schedule add\|remove\|enable\|disable <id> ...` | Schedules (section 10); `add <id> units ... --provider P (--all [--exclude GLOB]... \| --unit NAME...) [--require LEVEL] [--pause-scope unit\|group\|job]` for units (section 22.6); `add <id> verify ... [--level index\|structure\|deep] [--no-repair]` |
 | `unit providers`, `unit list <provider> [--limit N] [--offset N]`, `unit show <provider> <unit>` | Providers and the helper link; live units; one unit's items (section 22) |
 | `unit backup <id> --provider P (<unit>... \| --all [--exclude GLOB]...) [--require LEVEL] [--pause-scope unit\|group\|job]` | Back up units, one snapshot each; `--pause-scope` shares one capture across units (section 22.6.1) |
 | `unit history <id> [--provider P <unit>] [--limit N] [--offset N]` | Units with history here, or one unit's snapshots |
