@@ -707,8 +707,9 @@ typedef struct {
     size_t n, cap;
 } allowed_t;
 
-static status_t allowed_cb(void *ctx, const char *id, const char *name, int state)
+static status_t allowed_cb(void *ctx, const char *id, const char *name, int state, unsigned flags)
 {
+    (void)flags;
     (void)state;
     allowed_t *a = ctx;
     char key[HELPER_UNIT_KEY_MAX + 24];

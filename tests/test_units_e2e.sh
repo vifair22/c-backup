@@ -128,6 +128,21 @@ contains "with one snapshot per unit" '"ok":2' "$OUT"
 OUT=$(cb unit backup 1 --provider fake cbk-uat-a --all 2>&1); RC=$?
 check    "units and --all together are refused" 1 "$RC"
 
+echo "c-backup's own containers (SOAK14-SELF)"
+write_spec ',{"id":"s","name":"cbk-uat-self","state":"running","self":true,"blobs":[{"id":"cfg","path":".cbackup-unit/config/x","text":"s"}]}'
+contains "the listing marks c-backup's own container" '"self":true' "$(cb unit list fake)"
+# a and b excluded, so the later per-unit snapshot counts stand.
+OUT=$(cb unit backup 1 --provider fake --all --exclude 'cbk-uat-[ab]')
+contains "--all still completes" '"state":"completed"' "$OUT"
+contains "and fails nothing" '"failed":0' "$OUT"
+contains "it skips c-backup's own container" '"skipped":1' "$OUT"
+contains "listing it as skipped" '"status":"skipped"' "$OUT"
+contains "with the reason" "holds c-backup's own daemon or helper container; skipped" "$OUT"
+OUT=$(cb unit backup 1 --provider fake cbk-uat-self 2>&1); RC=$?
+check    "naming it is refused" 1 "$RC"
+contains "and says why" "cannot back itself up" "$OUT"
+write_spec ""
+
 echo "history"
 OUT=$(cb unit history 1)
 contains "units with history" '"unit_key":"fake:a"' "$OUT"

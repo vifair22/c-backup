@@ -4541,6 +4541,13 @@ schedule with `--all` enumerates them each time it fires, so a container
 added last week is included. `--exclude` globs match unit names. A units
 schedule's overlap is keyed by repository, action and unit set.
 
+`--all` always leaves out c-backup's own daemon and helper containers, and
+any compose project that holds one. The job result lists each as
+`"status":"skipped"` with the reason, counts them under `"skipped"`, and they
+are not failures. Naming one is refused. `unit list` marks them `"self":true`.
+This works for Docker and Podman containers, which the helper identifies by
+container id.
+
 **Pause scope.** By default each unit is its own capture (`pause_scope:
 unit`). `--pause-scope` on `unit backup` and `schedule add ... units`
 (`"pause_scope"` in `POST /repos/<id>/units/backup` and in a schedule's

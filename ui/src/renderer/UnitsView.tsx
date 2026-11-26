@@ -123,6 +123,7 @@ export function BackupResult({ run, onOpenSnapshot }: {
           <span className="text-text-muted ml-2">
             {fmtNum(res.ok)} backed up, {fmtNum(res.failed ?? 0)} failed
             {res.filtered ? `, ${fmtNum(res.filtered)} left out by units.allow` : ''}
+            {res.skipped ? `, ${fmtNum(res.skipped)} skipped as c-backup's own` : ''}
           </span>
         )}
       </div>
@@ -133,6 +134,8 @@ export function BackupResult({ run, onOpenSnapshot }: {
           <span className="font-mono">{u.name}</span>{' '}
           {u.status === 'ok' ? (
             <span className="text-status-connected">ok</span>
+          ) : u.status === 'skipped' ? (
+            <span className="text-text-muted">skipped</span>
           ) : (
             <span className="text-status-error">failed</span>
           )}
@@ -148,6 +151,7 @@ export function BackupResult({ run, onOpenSnapshot }: {
           {u.bytes_read !== undefined && <span className="ml-2 text-text-muted">read {fmtSize(u.bytes_read)}</span>}
           {u.freeze_ms !== undefined && <span className="ml-2 text-text-muted">frozen {fmtNum(u.freeze_ms)} ms</span>}
           {u.error && <div className="text-status-error whitespace-pre-wrap break-words">{u.error}</div>}
+          {u.reason && <div className="text-text-muted whitespace-pre-wrap break-words">{u.reason}</div>}
           {(u.warnings ?? (u.warning ? [u.warning] : [])).map((w, i) => (
             <div key={i} className="text-status-warning whitespace-pre-wrap break-words">{w}</div>
           ))}

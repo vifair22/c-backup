@@ -858,7 +858,7 @@ static status_t v_list(sp_ctx_t *c, sp_unit_cb cb, void *cbctx)
         if (st == OK && virDomainGetUUIDString(doms[i], uuid) == 0) {
             const char *nm = virDomainGetName(doms[i]);
             int s = dom_state(doms[i]);
-            st = cb(cbctx, uuid, nm ? nm : uuid, s < 0 ? SP_STATE_UNKNOWN : s);
+            st = cb(cbctx, uuid, nm ? nm : uuid, s < 0 ? SP_STATE_UNKNOWN : s, 0);
         }
         virDomainFree(doms[i]);
     }

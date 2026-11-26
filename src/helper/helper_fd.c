@@ -2,6 +2,7 @@
 
 #include "helper_fd.h"
 #include "thread_name.h"
+#include "self_container.h"
 
 #include <cutils/log.h>
 
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -94,4 +96,17 @@ void conn_watch_stop(conn_watch_t *w, const char *session)
         log_warn("helper: the daemon's session %.8s... ended (its connection closed) during "
                  "capture.begin (a cancelled job or a stopped daemon); abandoning the begin "
                  "and releasing its holds", session && session[0] ? session : "(none)");
+}
+
+int helper_peer_accept(int fd, uid_t want_uid, const char *proc_root)
+{
+    struct ucred cr = { 0, (uid_t)-1, (gid_t)-1 };
+    socklen_t cl = sizeof(cr);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cl) != 0 || cr.uid != want_uid) {
+        log_warn("helper: refused a connection from uid %u (pid %d): only uid %u may connect",
+                 (unsigned)cr.uid, (int)cr.pid, (unsigned)want_uid);
+        return 0;
+    }
+    self_container_note_pid(proc_root, (int)cr.pid);
+    return 1;
 }

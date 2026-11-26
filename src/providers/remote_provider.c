@@ -390,7 +390,8 @@ static status_t r_list(sp_ctx_t *c, sp_unit_cb cb, void *cbctx)
         if (st != OK) break;
         const char *id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(u, "unit_id"));
         const char *nm = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(u, "name"));
-        if (id) st = cb(cbctx, id, nm ? nm : id, (int)num(u, "state"));
+        if (id) st = cb(cbctx, id, nm ? nm : id, (int)num(u, "state"),
+                       cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(u, "self")) ? SP_UNIT_SELF : 0u);
     }
     cJSON_Delete(res);
     return st;
